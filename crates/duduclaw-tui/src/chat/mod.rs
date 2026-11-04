@@ -32,6 +32,8 @@ pub struct Frame {
     pub stopped: Option<serde_json::Value>,
     pub still_stopping: Option<serde_json::Value>,
     pub phase: Option<String>,
+    pub depth: Option<usize>,
+    pub ts: Option<u64>,
     pub tool: Option<String>,
     pub summary: Option<String>,
     pub line: Option<String>,
@@ -106,6 +108,7 @@ struct DownstreamOffer {
 #[derive(Clone)]
 pub struct ChatState {
     pub lines: VecDeque<TerminalText>,
+    pub(crate) activity: crate::ui::timeline::ChatActivity,
     pub(crate) revision: u64,
     transcript_bytes: usize,
     pub status: TerminalText,
@@ -126,6 +129,7 @@ impl Default for ChatState {
     fn default() -> Self {
         Self {
             lines: VecDeque::new(),
+            activity: crate::ui::timeline::ChatActivity::default(),
             revision: 0,
             transcript_bytes: 0,
             status: TerminalText::new(strings::CONNECTING.into()),
@@ -197,6 +201,7 @@ impl ChatState {
         if self.running {
             return Err(crate::Error::Busy);
         }
+        self.activity.begin_turn();
         if self.agent.as_deref() != Some(&input.agent) {
             self.conv = nonce();
             self.session_id = None;
@@ -331,6 +336,7 @@ impl ChatState {
         // into a resume request for a session that does not exist yet.
         let admission_error = frame.kind == "error"
             && matches!(frame.code.as_deref(), Some("turn_limit" | "duplicate_message"));
+        self.activity.record(&frame);
         if !admission_error && let Some(sid) = frame.session_id {
             self.session_id = Some(sid);
         }

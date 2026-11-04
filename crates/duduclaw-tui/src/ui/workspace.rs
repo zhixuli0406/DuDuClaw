@@ -127,21 +127,25 @@ impl App {
     pub(super) fn workspace_key(&mut self, key: KeyEvent, model: &Model) -> bool {
         match key.code {
             KeyCode::Char('I') => {
+                self.zoomed = false;
                 self.main_view = MainView::Inbox;
                 self.selected = Some(model.inbox.items.first().map(|i| Selection::Inbox(i.key())).unwrap_or(Selection::InboxEntry));
                 self.detail_open = false;
             }
             KeyCode::Char('S') if super::m2::manager(model) => {
+                self.zoomed = false;
                 self.main_view = MainView::Schedules;
                 self.selected = Some(model.schedules.items.first().map(|s| Selection::Schedule(s.id.clone())).unwrap_or(Selection::ScheduleEntry));
                 self.detail_open = false;
             }
             KeyCode::Enter if self.selected == Some(Selection::InboxEntry) => {
+                self.zoomed = false;
                 self.main_view = MainView::Inbox;
                 self.selected = Some(model.inbox.items.first().map(|i| Selection::Inbox(i.key())).unwrap_or(Selection::InboxEntry));
             }
             KeyCode::Enter if self.selected == Some(Selection::ScheduleEntry) => {
                 if super::m2::manager(model) {
+                    self.zoomed = false;
                     self.main_view = MainView::Schedules;
                     self.selected = Some(model.schedules.items.first().map(|s| Selection::Schedule(s.id.clone())).unwrap_or(Selection::ScheduleEntry));
                 }

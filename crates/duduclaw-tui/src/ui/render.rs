@@ -37,7 +37,7 @@ pub fn draw(
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(if app.zoomed { 0 } else { 1 }),
             Constraint::Min(6),
             Constraint::Length(footer_height),
         ])
@@ -47,11 +47,11 @@ pub fn draw(
         ConnectionState::Disconnected | ConnectionState::LoginRequired(_) => (strings::DISCONNECTED, None, false),
         ConnectionState::Connected(info) => (strings::CONNECTED, info.version.as_ref().map(TerminalText::plain), true),
     };
-    header(frame, parts[0], model, status, version, connected, home, settings);
-    let sidebar_width = if area.width < 100 { (area.width / 4).clamp(12, 22) } else { (area.width / 4).clamp(28, 34) };
+    if !app.zoomed { header(frame, parts[0], model, status, version, connected, home, settings); }
+    let sidebar_width = if app.zoomed { 0 } else if area.width < 100 { (area.width / 4).clamp(12, 22) } else { (area.width / 4).clamp(28, 34) };
     let columns = Layout::default().direction(Direction::Horizontal)
         .constraints([Constraint::Length(sidebar_width), Constraint::Min(1)]).split(parts[1]);
-    super::panels::draw(frame, columns[0], model, app, settings);
+    if !app.zoomed { super::panels::draw(frame, columns[0], model, app, settings); }
     let stale_inbox = model.inbox.count().is_none();
     let stale_employees = model.employees.count().is_none() || stale_inbox;
     let stale_schedules = model.schedules.count().is_none();
@@ -67,10 +67,14 @@ pub fn draw(
     let showing_inbox = app.main_view == super::workspace::MainView::Inbox;
     let showing_schedule = app.main_view == super::workspace::MainView::Schedules;
     // Overlays and input retain their existing focused block and key guards.
-    if showing_inbox && !app.help && app.focus != crate::chat::Focus::Input && !app.pty_focus {
+    if app.mailbox.is_some() {
+        super::notices::mailbox(frame, main, app, settings);
+    } else if showing_inbox && !app.help && app.focus != crate::chat::Focus::Input && !app.pty_focus {
         super::panels::inbox(frame, main, model, app, settings);
     } else if showing_schedule && !app.help && app.focus != crate::chat::Focus::Input && !app.pty_focus {
         super::panels::schedules(frame, main, model, app, settings);
+    } else if app.zoomed {
+        super::block_render::draw(frame, main, model, app, settings, detail_stale);
     } else {
         super::panels::tabs(frame, Rect::new(main.x, main.y, main.width, 1), model, app, settings);
         super::block_render::draw(frame, Rect::new(main.x, main.y + 1, main.width, main.height.saturating_sub(1)), model, app, settings, detail_stale);
@@ -80,7 +84,8 @@ pub fn draw(
         frame,
         Rect::new(footer.x, footer.y, footer.width, 1),
         TerminalText::new(format!(
-            "[{}]{}{}{}",
+            "{}[{}]{}{}{}",
+            if app.zoomed { "放大中 · z 還原  " } else { "" },
             app.focus_label(),
             if app.focus == crate::chat::Focus::List && app.card.is_none() && app.control_card.is_none() && app.palette.is_none() {
                 let name = match &app.selected {
@@ -125,7 +130,7 @@ pub fn draw(
     super::widgets::key_hints(
         frame,
         Rect::new(footer.x, footer.y + 1, footer.width, footer.height.saturating_sub(if app.notice.is_some() { 3 } else { 1 }).min(2)),
-        TerminalText::new((if app.pty_confirm.is_some() { strings::PTY_CONFIRM } else if app.pty_focus { strings::PTY_KEYS } else if app.palette.is_some() { strings::PALETTE_KEYS } else if app.control_card.is_some() { strings::CONTROL_KEY_HINTS } else if app.card.is_some() { strings::CARD_KEY_HINTS } else if app.help { strings::HELP_KEY_HINTS } else if !app.list_view() && app.blocks.active == crate::blocks::Block::Pty { strings::PTY_LIST_KEYS } else { app.context_hints(model) }).to_string() + if app.card.is_none() && app.control_card.is_none() && app.palette.is_none() && !app.pty_focus && !app.help && app.context_hints(model) != strings::LIST_KEY_HINTS { strings::GLOBAL_HINT_SUFFIX } else { "" }),
+        TerminalText::new((if app.pty_confirm.is_some() { strings::PTY_CONFIRM } else if app.pty_focus { strings::PTY_KEYS } else if app.palette.is_some() { strings::PALETTE_KEYS } else if app.control_card.is_some() { strings::CONTROL_KEY_HINTS } else if app.card.is_some() { strings::CARD_KEY_HINTS } else if app.mailbox.is_some() { super::notices::MAIL_KEYS } else if app.toast_focus.is_some() { super::notices::TOAST_KEYS } else if app.help { strings::HELP_KEY_HINTS } else if !app.list_view() && app.blocks.active == crate::blocks::Block::Pty { strings::PTY_LIST_KEYS } else { app.context_hints(model) }).to_string() + if app.card.is_none() && app.control_card.is_none() && app.palette.is_none() && !app.pty_focus && !app.help && app.context_hints(model) != strings::LIST_KEY_HINTS { strings::GLOBAL_HINT_SUFFIX } else { "" }),
         settings,
     );
     }
@@ -139,6 +144,7 @@ pub fn draw(
             true,
         );
     }
+    super::notices::toasts(frame, main, app, settings, std::time::Instant::now());
     if let Some(card) = &mut app.card {
         super::card_render::draw(frame, columns[1], card, settings,
             !stale_inbox && app.waiting_refresh.is_none() && (!app.task_card || !app.blocks.panes[app.blocks.focused].data.stale));

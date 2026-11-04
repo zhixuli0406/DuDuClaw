@@ -19,6 +19,22 @@ Heartbeat times appear on employee cards. `S` or the sidebar's schedule entry op
 The one-line header shows connection, version and available cost. Dollars use two decimals, or four for nonzero amounts below $0.01. A custom home is shortened to fit; `?` shows the full home, including the default. The minimum remains 24×12. Snapshots cover 80×24, 100×30, 140×40 and 200×50 in Unicode and ASCII; these are rendering checks, not new native-terminal acceptance.
 
 
+## Toasts, notification mailbox and zoom
+
+In-app toasts appear at the bottom right of the main area, at most two at a time with the newest above the older one. `完成`, `需要你` and `錯誤` use the theme's success, warning and danger colors. Their text contains fixed wording and a sanitized employee display name only; messages, tool output and task contents are excluded. Completed and failed runs come from the existing `runs.list` snapshots refreshed after events; approvals and goals use the existing inbox snapshots. Breaker toasts use Admin-only `budget.breaker_open` / `autopilot.breaker_open` events, deduplicated by event sequence. No extra RPC is added, and `agent.turn_finished` alone does not establish success or failure. On legacy events without a sequence, repeated breaker events with the same key cannot be distinguished from replay.
+
+`完成` and `錯誤` disappear after about six seconds. `需要你` stays until the related inbox item is seen, you open the mailbox, or you dismiss the toast. Toasts do not take keyboard focus and are hidden while a decision card is open. To dismiss one explicitly, press `F8` to focus toasts, use the arrows to select one, then `x`; `Esc` returns to the workspace. Outside toast focus, `x` retains its split-block action.
+
+Press `M` to open the notification mailbox in the main area. `N` remains **create autonomous goal**, so the mailbox uses the free `M` key. The mailbox retains the last 100 notifications for this process only; its history and unread flags are not written to `read_state.rs` files. `Tab` cycles `全部 / 未讀 / 錯誤`, arrows move selection, and `Enter` jumps to the related employee or inbox item without making a decision. `Esc` closes the mailbox. Opening it marks the current notifications read and dismisses their toasts; notifications arriving afterward remain unread until you press `Enter` on that notification, open its related inbox decision card or mark that inbox item read, or close and reopen the mailbox. These read flags do not resolve gateway requests or replace the inbox's existing local read marks.
+
+Press `z` in control-room focus to enlarge the focused main-area block. The sidebar and header are hidden; the footer shows `放大中 · z 還原`. Press `z` again to restore the split layout. Resizing uses the current terminal dimensions. Decision cards and `Ctrl-P` still work, and their keyboard guards remain unchanged. While typing a chat message, `z` is text; while a PTY has input focus, it goes to the child.
+
+## Activity timeline
+
+The `紀錄` tab and compact activity lines in `對話` show each available tool step and round result as one line: local human-readable time, symbol, verb, target and result (`✓ / ✕ / ⋯`, with ASCII equivalents). Targets are sanitized and truncated by display width, respecting `ambiguous_width`; an unknown result remains pending/unknown rather than being inferred from a turn ending.
+
+Press `t` to focus the timeline, use arrows to select a line, then `Enter` to expand the existing detail or collapse it again. `PgUp` / `PgDn` scroll expanded details; `Esc` leaves timeline focus. The timeline uses only already received data. Run content previews retain the existing `c` consent flow; expansion does not enable content on its own. `tui watch` keeps its plain-output behavior.
+
 ## Start
 
 Start the gateway, then run one of these commands on the same host:
@@ -88,6 +104,10 @@ Channel codes are requested for the entered account email and delivered through 
 | `Enter` | Open the sidebar entry, details or a decision card |
 | `I` / `S` | Open inbox / schedule list; `Esc` returns to the sidebar |
 | `Tab` / `Shift-Tab` | Next / previous employee tab (`[` / `]` still switch records) |
+| `M` | Open notification mailbox; its `Tab` cycles all / unread / errors (`N` still creates a goal) |
+| `F8` | Focus toasts; arrows select, `x` dismisses, `Esc` leaves |
+| `z` | Enlarge / restore the focused main-area block |
+| `t` | Focus activity timeline; arrows select, `Enter` expands / collapses, `PgUp` / `PgDn` scroll details, `Esc` leaves |
 | `r` | Mark this item or identified completed run as read on this client |
 | `PgUp` / `PgDn` | Scroll details |
 | `?` / `F1` | Toggle help |
@@ -169,7 +189,7 @@ By default, output contains metadata only (time, status, agent, step kind or too
 
 ## Terminal notifications
 
-Notifications are off by default, including under `SSH_CONNECTION`. Explicit `notifications = true` in `tui.toml` opts in. An increased fresh inbox count while the terminal is unfocused emits OSC 777 for VTE/rxvt-unicode terminals, otherwise OSC 9, with only `DuDuClaw：N 項需要你處理`; employee names, task titles, and tool content never enter it. Focus events are used when available; otherwise the terminal is treated as unfocused. At most one notification is emitted per minute; suppressed rises are not queued. Inside tmux, passthrough is used only if `tmux show-option -gv allow-passthrough` returns `on` or `all`; otherwise notifications are skipped. Connection errors also use fixed text, `DuDuClaw：連線中斷，請檢查控制室`, sharing the focus checks and one-minute rate limit. Actual display depends on the terminal.
+Desktop terminal notifications are separate from in-app toasts and the mailbox. They are off by default, including under `SSH_CONNECTION`. Explicit `notifications = true` in `tui.toml` opts in. An increased fresh inbox count while the terminal is unfocused emits OSC 777 for VTE/rxvt-unicode terminals, otherwise OSC 9, with only `DuDuClaw：N 項需要你處理`; employee names, task titles, and tool content never enter it. Focus events are used when available; otherwise the terminal is treated as unfocused. At most one notification is emitted per minute; suppressed rises are not queued. Inside tmux, passthrough is used only if `tmux show-option -gv allow-passthrough` returns `on` or `all`; otherwise notifications are skipped. Connection errors also use fixed text, `DuDuClaw：連線中斷，請檢查控制室`, sharing the focus checks and one-minute rate limit. Actual display depends on the terminal.
 
 ## Decision cards
 

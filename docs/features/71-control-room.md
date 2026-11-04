@@ -12,7 +12,7 @@ Employees work on goals, schedules and responsibilities without anyone asking. T
 
 | Question | Where |
 |---|---|
-| What needs me? | The inbox: approvals and goals waiting for a reply, each saying who raised it and why. Breaker notices appear there as information; they do not count as needing you and do not trigger a notification. |
+| What needs me? | The inbox: approvals and goals waiting for a reply, each saying who raised it and why. Breaker notices appear there as information; they do not count as needing you or trigger a desktop notification. They can raise an in-app error toast. |
 | What is running? | Employee list, run and task blocks, next scheduled runs, `duduclaw tui watch`. |
 | How do I stop it? | `p` pauses autonomous work for the selected employee, `u` resumes. Admin can pause everyone from the palette. |
 
@@ -37,7 +37,7 @@ The status line shows who is paused. If the pause state cannot be read, the gate
 
 ## Trust boundaries
 
-Text from employees is untrusted. Names, task titles, tool output and chat replies are cleaned of terminal control sequences before they are drawn, and links are not made clickable. Notifications carry fixed text and a number, never a name or content, and they are off by default.
+Text from employees is untrusted. Names, task titles, tool output and chat replies are cleaned of terminal control sequences before they are drawn, and links are not made clickable. Desktop notifications carry fixed text and a number, never a name or content, and are off by default. In-app toasts and the notification mailbox use fixed wording plus a sanitized employee display name only; they never contain message, task or tool content.
 
 The embedded terminal block belongs to you and does not pass through the gateway. A "waiting for you" marker from it is display only: it authorizes nothing and answers nothing. It is not available on Windows.
 
@@ -48,6 +48,12 @@ Run the room on the gateway host, over SSH if remote. Do not forward the gateway
 The room uses a sidebar workspace. Employee cards sort by needs-you, error, working, idle, then paused, and show the most useful available context: a waiting item, a goal round, the next heartbeat or a pause reason. Unread inbox items get an accent rail; the selected card gets a filled background. Below 100 columns, cards become a symbol and short name. `I` opens the sidebar inbox in the main area; Manager/Admin can open the full schedule list with `S`. Inbox counts include informational rows, which remain separate from actionable counts.
 
 The main area has chat, task and record tabs (`Tab` / `Shift-Tab`); `[` / `]` keep their record-navigation meaning. Existing splits, PTYs, decision cards and autonomous-work blocks remain available. The one-line header shows connection, version and cost (two decimals, four only for nonzero amounts below $0.01); help includes the full home path. Schedules that have never run say `尚未執行`. Light/dark palettes, status colors, focused borders and readable local times remain in use.
+
+In-app toasts show `完成`, `需要你` or `錯誤` in success, warning or danger colors at the main area's bottom right. At most two are visible, newest on top. Completion and error notices expire after about six seconds; needs-you notices remain until seen or dismissed. They never take focus or cover a decision card. `F8` explicitly focuses toasts; arrows select and `x` dismisses.
+
+`M` opens a mailbox of the process's last 100 notifications. `N` remains goal creation. `Tab` filters all, unread or errors; arrows select, `Enter` jumps to the employee or inbox item and `Esc` closes. Opening the mailbox marks current notices read and dismisses their toasts; new arrivals remain unread until their notification is opened with `Enter`, their related inbox item is opened or marked read, or the mailbox is closed and reopened. History and unread state stay in memory and do not change gateway requests.
+
+`z` enlarges the focused block, hides the sidebar and header, and keeps a restore hint in the footer. Press it again to restore the layout. Decision cards and the palette remain usable. Chat and record tabs show compact activity timelines: each available tool step or round result occupies one line. Use `t`, arrows and `Enter` to focus, select and expand/collapse existing details. All text remains sanitized and width-aware, and run content still requires the existing `c` consent. These views reuse already received data without new RPCs; `tui watch` is unchanged.
 
 `theme = 'auto'` is the default in `tui.toml`: startup tries OSC 11 with an approximately 150 ms timeout, then `COLORFGBG`, then dark. Choose `light` or `dark` explicitly to skip detection. Colors adapt to truecolor, 256-color or 16-color terminals. Any `NO_COLOR` value, including an empty value, disables color while keeping bold and reverse-video cues.
 

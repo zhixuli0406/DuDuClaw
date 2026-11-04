@@ -7,6 +7,8 @@ mod block_render;
 mod pty_render;
 mod m2;
 mod navigate;
+mod notices;
+pub(crate) mod timeline;
 mod palette;
 mod exit_summary;
 mod card_render;
@@ -122,6 +124,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                     _ => break,
                 };
                 if block_cursor.observe(&event) { app.blocks.invalidate(); app.logs.lost = true; }
+                app.notices.event(&event, &model, std::time::Instant::now());
                 match event.name.as_str() {
                     "logs.entry" if m2::manager(&model) && app.blocks.panes.iter().any(|p| p.kind == crate::blocks::Block::Log) => app.logs.push(&event.payload),
                     "events_lost" => { app.blocks.invalidate(); app.logs.lost = true; },
@@ -154,6 +157,7 @@ pub async fn run_control_room(options: ControlRoomOptions) -> Result<()> {
                 }
             }
             app.refresh(&model);
+            app.observe_notices(&model, std::time::Instant::now());
             chat.retain(app.blocks.chat_ids());
             if chat_state.has_changed().unwrap_or(false) {
                 app.sync_chats(&chat_state.borrow_and_update());

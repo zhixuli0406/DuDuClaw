@@ -585,7 +585,7 @@ fn chat_block_snapshots() {
     assert!(progress.contains(strings::INPUT_FOCUS));
     assert!(!progress.contains(strings::LIST_FOCUS));
     insta::assert_snapshot!("chat_progress", progress);
-    app.chat.apply(Frame::parse(r#"{"type":"assistant_done","content":"已完成第一輪檢查。\n下一步：確認使用者回覆。","tokens_used":20}"#).unwrap());
+    app.chat.apply(Frame::parse(r#"{"type":"assistant_done","ts":1793764780000,"content":"已完成第一輪檢查。\n下一步：確認使用者回覆。","tokens_used":20}"#).unwrap());
     insta::assert_snapshot!("chat_finished", screen(&empty(), &app, &Settings::test_defaults(), 100, 24));
     app.chat.disconnected();
     insta::assert_snapshot!("chat_stale", screen(&empty(), &app, &Settings::test_defaults(), 100, 24));
@@ -1116,7 +1116,7 @@ fn downstream_app(now: std::time::Instant) -> App {
     app.chat.stale = false;
     app.chat.running = true;
     app.chat.apply_at(crate::chat::Frame::parse(
-        r#"{"type":"error","code":"cancelled","downstream_running":2,"downstream_ref":"opaque-never-render"}"#
+        r#"{"type":"error","ts":1793764780000,"code":"cancelled","downstream_running":2,"downstream_ref":"opaque-never-render"}"#
     ).unwrap(), now);
     app
 }
@@ -1526,7 +1526,7 @@ fn concurrent_chat_real_keys_keep_drafts_scrollback_cancel_and_prompt_in_own_pan
     app.key(key('1'), &model);
     assert_eq!(app.input, "draft A"); assert_eq!(app.chat_scroll, 7);
     assert_eq!(app.key(key('X'), &model), Action::CancelChat);
-    rooms.apply(Frame::parse(&json!({"type":"error","code":"cancelled","conv":a["conv"],"msg_id":a["msg_id"],"downstream_ref":"private-reference","downstream_running":2}).to_string()).unwrap());
+    rooms.apply(Frame::parse(&json!({"type":"error","ts":1793764780000_i64,"code":"cancelled","conv":a["conv"],"msg_id":a["msg_id"],"downstream_ref":"private-reference","downstream_running":2}).to_string()).unwrap());
     app.sync_chats(&rooms);
     assert_eq!(app.blocks.focused, 0);
     assert!(app.downstream_prompt(std::time::Instant::now()).is_some());
@@ -2038,3 +2038,6 @@ fn round2_removed_employee_waits_for_help_or_palette_to_close() {
         assert_eq!(app.blocks.panes[app.blocks.focused].agent.as_deref(), Some("b"));
     }
 }
+
+#[path = "round3_tests.rs"]
+mod round3;

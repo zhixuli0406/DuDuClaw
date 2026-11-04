@@ -253,7 +253,7 @@ pub(super) fn draw(
     detail_stale: bool,
 ) {
     for pane in &mut app.blocks.panes { pane.pty_area = Rect::default(); }
-    let (regions, hidden) = app.blocks.areas(area);
+    let (regions, hidden) = if app.zoomed { (vec![(app.blocks.focused, area)], 0) } else { app.blocks.areas(area) };
     let content_area = if hidden > 0 {
         text(
             frame,
@@ -309,7 +309,7 @@ pub(super) fn draw(
             } else {
                 let current = app.chat_view();
                 app.set_chat_view(app.blocks.panes[index].chat_view.clone());
-                super::chat_render::draw(frame, region, app, settings, &title);
+                super::chat_render::draw_pane(frame, region, app, settings, &title, index);
                 app.blocks.panes[index].chat_view = app.chat_view();
                 app.set_chat_view(current);
             }
@@ -328,6 +328,11 @@ pub(super) fn draw(
             pane.data.stale
         };
         let inner = panel_focus(frame, region, &title, settings, stale, index == app.blocks.focused);
+        if kind == Block::Run && !(app.help && index == app.blocks.focused) {
+            super::timeline::draw_run(frame, inner, &mut app.blocks.panes[index], settings, index == app.blocks.focused);
+            continue;
+        }
+        let pane = &app.blocks.panes[index];
         let body = if app.help && index == app.blocks.focused {
             app.help_text()
         } else if kind == Block::Detail {

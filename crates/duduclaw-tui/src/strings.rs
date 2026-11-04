@@ -83,8 +83,8 @@ pub fn autonomy_refusal(reason: &str) -> String {
     format!("自主工作操作遭拒：{explanation}（{reason}）")
 }
 pub const LIST_FOCUS: &str = "焦點：清單";
-pub const LIST_KEY_HINTS: &str = "Enter 開啟  Tab 分頁  I 收件匣  Ctrl-P 命令  ? 說明  q 離開";
-pub const HELP: &str = "操作說明\nTab / Shift-Tab：對話／任務／紀錄分頁\nI：收件匣；S：下次自主執行；Esc 返回側欄\ni / /：輸入訊息；Esc 返回清單\n1–4：區塊焦點；v/x：左右／上下分割；Ctrl-W：關閉\nD/C/R/T/L：詳情／對話／執行／任務／日誌\n[ / ]：前後紀錄；b：任務／責任\np/u：立即暫停／恢復選取員工的自主工作\np：責任或 cron 暫停；n：cron／心跳執行（確認卡）\nCtrl-P：全部自主工作暫停／恢復（Admin）；員工狀態操作（確認卡）\nX：取消回覆（需閘道支援）\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：任務區塊停止；其他區塊為本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nCtrl-P：命令面板（Ctrl-K 保留）\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；待核准計畫須捲到底並輸入確認碼；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。\nW 流程；A 自動規則；E 演化；B 預算；G 摘要；N 建立目標\nP：本機終端；Enter / i：輸入；Ctrl-\\ / F12 返回控制室\n本機終端清單焦點：PgUp / PgDn 捲動（最多 5,000 行）\n關閉區塊或控制室會停止本機終端行程。";
+pub const LIST_KEY_HINTS: &str = "Enter 開啟  Tab 分頁  I 收件匣  M 通知  z 放大  Ctrl-P 命令  ? 說明  q 離開";
+pub const HELP: &str = "操作說明\nTab / Shift-Tab：對話／任務／紀錄分頁\nI：收件匣；M：通知信箱；S：下次自主執行；Esc 返回側欄\n信箱 Tab：全部／未讀／錯誤；方向鍵選取；Enter 前往\nF8：選取通知；x 關閉；Esc 返回\nz：放大目前區塊／還原\nt：時間軸焦點；方向鍵選取；Enter 展開／收合；Esc 返回\ni / /：輸入訊息；Esc 返回清單\n1–4：區塊焦點；v/x：左右／上下分割；Ctrl-W：關閉\nD/C/R/T/L：詳情／對話／執行／任務／日誌\n[ / ]：前後紀錄；b：任務／責任\np/u：立即暫停／恢復選取員工的自主工作\np：責任或 cron 暫停；n：cron／心跳執行（確認卡）\nCtrl-P：全部自主工作暫停／恢復（Admin）；員工狀態操作（確認卡）\nX：取消回覆（需閘道支援）\n方向鍵 / j k：移動選取\nEnter：開啟詳情或決策卡\nr：標為此客戶端已讀\ns：任務區塊停止；其他區塊為本機稍後提醒（最多十分鐘）\n? / F1：開關說明\nPgUp / PgDn：捲動詳情\nCtrl-P：命令面板（Ctrl-K 保留）\nq / Ctrl-C：離開\n\n卡片開啟後一秒內忽略按鍵。\n核准：輸入兩位確認碼後按 Enter；n 拒絕。\n高風險卡須先捲到底部。\n目標：r 重試；待核准計畫須捲到底並輸入確認碼；a 中止、d 完成、t 接手須連按兩次。\nEsc：關卡。新項目不會移動焦點。\n關閉控制室不會停止員工。\nW 流程；A 自動規則；E 演化；B 預算；G 摘要；N 建立目標\nP：本機終端；Enter / i：輸入；Ctrl-\\ / F12 返回控制室\n本機終端清單焦點：PgUp / PgDn 捲動（最多 5,000 行）\n關閉區塊或控制室會停止本機終端行程。";
 pub const SETTINGS_NOTICE: &str = "設定無法讀取或有無效值，已採用預設值";
 pub const READ_STATE_NOTICE: &str = "已讀紀錄無法讀取，從空白紀錄開始";
 pub const SAVED: &str = "已標為已讀";

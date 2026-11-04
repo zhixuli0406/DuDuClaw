@@ -142,6 +142,10 @@ pub struct ChatView {
 #[derive(Default, Clone)]
 pub struct App {
     pub home: TerminalText,
+    pub(super) zoomed: bool,
+    pub(super) notices: super::notices::Notices,
+    pub(super) mailbox: Option<super::notices::Mailbox>,
+    pub(super) toast_focus: Option<u64>,
     pub(super) main_view: super::workspace::MainView,
     pub(super) workspace_initialized: bool,
     pub pty_focus: bool,
@@ -250,6 +254,8 @@ impl App {
         else if self.pty_focus { strings::PTY_FOCUS }
         else if self.palette.is_some() { strings::PALETTE_FOCUS }
         else if self.card.is_some() || self.control_card.is_some() { strings::CARD_FOCUS }
+        else if self.mailbox.is_some() { "焦點：通知信箱" }
+        else if self.toast_focus.is_some() { "焦點：通知" }
         else if self.help { strings::HELP_FOCUS }
         else if self.focus == crate::chat::Focus::Input { strings::INPUT_FOCUS }
         else { strings::LIST_FOCUS }
@@ -455,6 +461,13 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
+        if self.mailbox.is_some() || self.toast_focus.is_some() {
+            self.notices_key(key, model, now);
+            return Action::None;
+        }
+        if !self.help && !self.list_view() && self.blocks.panes[self.blocks.focused].timeline.focused
+            && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            && super::timeline::key(self, key) { return Action::None; }
         if !self.help && !self.list_view() && self.blocks.active == crate::chat::Block::Chat && key.modifiers.is_empty()
             && let Some(reference) = self.downstream_reference(now).map(str::to_owned)
         {
@@ -488,6 +501,13 @@ impl App {
         {
             return Action::None;
         }
+        if !self.help && self.notices_key(key, model, now) { return Action::None; }
+        if !self.help && key.code == KeyCode::Char('z') {
+            self.zoomed = !self.zoomed;
+            self.leave_list();
+            return Action::None;
+        }
+        if !self.help && !self.list_view() && super::timeline::key(self, key) { return Action::None; }
         if !self.help && (!self.list_view() || key.code == KeyCode::Char('P')) && self.blocks.active == crate::blocks::Block::Pty {
             match key.code {
                 KeyCode::Char('i' | 'P') | KeyCode::Enter => {
@@ -559,6 +579,7 @@ impl App {
                         self.blocks.panes[self.blocks.focused].agent = None;
                         return Action::None;
                     }
+                    self.notices.seen(&item.key());
                     self.card = Some(super::card::Card::open(item.clone(), model, now, &mut self.codes));
                     if self.read.resurfaced(item, epoch) {
                         self.card.as_mut().expect("just opened").hint = Some(strings::RESURFACED);

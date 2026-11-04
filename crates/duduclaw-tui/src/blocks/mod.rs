@@ -74,6 +74,7 @@ pub struct Pane {
     pub content: bool,
     pub responsibilities: bool,
     pub data: Data,
+    pub(crate) timeline: crate::ui::timeline::View,
 }
 impl Pane {
     fn new(kind: Block) -> Self {
@@ -92,6 +93,7 @@ impl Pane {
             content: false,
             responsibilities: false,
             data: Data::default(),
+            timeline: crate::ui::timeline::View::default(),
         }
     }
 }
@@ -234,13 +236,13 @@ impl Blocks {
                 }
                 // Keep only the known wire fields, with the same bounded preview as history.
                 let mut event = serde_json::Map::new();
-                for key in ["kind", "ts", "agent_id", "status", "tool", "preview", "seq"] {
+                for key in ["kind", "ts", "agent_id", "status", "tool", "label", "preview", "seq", "ok"] {
                     if let Some(v) = payload.get(key) {
                         event.insert(
                             key.into(),
                             if let Some(s) = v.as_str() {
                                 Value::String(s.chars().take(2048).collect())
-                            } else if v.is_number() {
+                            } else if v.is_number() || v.is_boolean() {
                                 v.clone()
                             } else {
                                 Value::Null

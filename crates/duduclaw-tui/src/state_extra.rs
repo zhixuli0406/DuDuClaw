@@ -25,6 +25,8 @@ pub struct Activity {
     pub turns: Vec<Turn>,
     pub error: bool,
     pub completed_id: Option<String>,
+    /// Terminal results already fetched by the existing runs.list poll.
+    pub finished_runs: Vec<(String, bool)>,
 }
 /// Turn events have no run ID or outcome. Preserve only currently observed turns.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,6 +143,12 @@ fn activity_from_runs(agent: &str, response: &Value) -> Result<Activity> {
             .get("status")
             .and_then(Value::as_str)
             .ok_or(Error::Protocol)?;
+        if matches!(status, "completed" | "error" | "failed") {
+            let id = row.get("id").and_then(Value::as_str).ok_or(Error::Protocol)?;
+            if activity.finished_runs.len() < 50 {
+                activity.finished_runs.push((format!("run:{agent}:{id}"), status != "completed"));
+            }
+        }
         if index == 0 {
             activity.error = status == "error";
         }

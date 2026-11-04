@@ -44,6 +44,10 @@ impl TranscriptCache {
 }
 
 pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App, settings: &Settings, title: &str) {
+    draw_pane(frame, area, app, settings, title, app.blocks.focused);
+}
+
+pub(super) fn draw_pane(frame: &mut Frame, area: Rect, app: &mut App, settings: &Settings, title: &str, pane_index: usize) {
     let inside = panel_focus(frame, area, title, settings, app.chat.stale, title.starts_with("> "));
     if inside.is_empty() {
         return;
@@ -86,12 +90,25 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App, settings: &Sett
             visible: false, wrap: true, scroll: 0, style: style(settings, false) },
             Rect::new(inside.x, inside.y + 1, inside.width, prompt_rows));
     }
-    let body = Rect::new(
+    let mut body = Rect::new(
         inside.x,
         inside.y + 1 + prompt_rows,
         inside.width,
         inside.height.saturating_sub(2 + prompt_rows),
     );
+    let timeline_rows = if app.chat.activity.is_empty() { 0 } else {
+        let view = &app.blocks.panes[pane_index].timeline;
+        if view.focused && pane_index == app.blocks.focused { body.height / 2 } else { 3.min(body.height / 3) }
+    };
+    let activity_area = Rect::new(body.x + 2.min(body.width), body.bottom().saturating_sub(timeline_rows), body.width.saturating_sub(2), timeline_rows);
+    body.height = body.height.saturating_sub(timeline_rows);
+    if timeline_rows > 0 {
+        for y in activity_area.y..activity_area.bottom() {
+            text(frame, Rect::new(body.x, y, 2.min(body.width), 1), TerminalText::new(strings::CHAT_GUTTER.into()), settings, app.chat.stale, false);
+        }
+        super::timeline::draw_chat(frame, activity_area, &app.chat.activity, &mut app.blocks.panes[pane_index].timeline,
+            settings, pane_index == app.blocks.focused, app.chat.stale);
+    }
     // Reserve real terminal columns for the gutter; content never renders there,
     // including continuation lines and text that imitates a decision card.
     let gutter = 2.min(body.width);
