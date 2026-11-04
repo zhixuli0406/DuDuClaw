@@ -1004,9 +1004,14 @@ if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
                 if [[ -n "$PRO_BIN_CID" ]]; then
                     mkdir -p "$PRO_BIN_TMP/linux-x64"
                     if docker cp "$PRO_BIN_CID:/usr/local/bin/duduclaw-pro" "$PRO_BIN_TMP/linux-x64/duduclaw-pro" 2>/dev/null; then
-                        if package_and_upload_pro_bin linux-x64 "$PRO_BIN_TMP" "$NEW_VERSION"; then
-                            PRO_BIN_UPLOADED=1
-                            PRO_BIN_LINUX_OK=1
+                        if python3 "$(dirname "$0")/check_glibc.py" "$PRO_BIN_TMP/linux-x64/duduclaw-pro"; then
+                            if package_and_upload_pro_bin linux-x64 "$PRO_BIN_TMP" "$NEW_VERSION"; then
+                                PRO_BIN_UPLOADED=1
+                                PRO_BIN_LINUX_OK=1
+                            fi
+                        else
+                            echo "  ERROR: linux-x64 duduclaw-pro failed the GLIBC_2.31 baseline check — skipping upload."
+                            PRO_GAPS+=("pro-bin-linux v$NEW_VERSION failed the GLIBC_2.31 baseline check — not uploaded")
                         fi
                     else
                         echo "  WARNING: docker cp from duduclaw-pro image failed — skipping linux-x64."
