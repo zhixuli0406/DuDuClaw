@@ -114,6 +114,85 @@ fn atomic_install(path: &str, mode: u32, write: impl FnOnce(&mut fs::File) -> Re
 const VERSION_FLOOR: &str = "/var/lib/duduclaw-protected/version-floor";
 const VERSION_PENDING: &str = "/var/lib/duduclaw-protected/version-pending";
 
+const SPAWND_BINARY: &str = "/usr/lib/duduclaw/duduclaw-spawnd";
+const RUN_BINARY: &str = "/usr/lib/duduclaw/duduclaw-run";
+const SPAWND_UNITS: &[(&str, &str)] = &[
+    ("duduclaw-spawnd.service", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-spawnd.service")),
+    ("duduclaw-spawnd.socket", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-spawnd.socket")),
+    ("duduclaw.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw.slice")),
+    ("duduclaw-tcb.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-tcb.slice")),
+    ("duduclaw-employees.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-employees.slice")),
+];
+
+// F/G publish the signature-verified binaries first. This hook stages support
+// only: it cannot declare readiness or enable a partial isolation generation.
+fn install_spawnd_support_if_published() -> Result<()> {
+    let present = [SPAWND_BINARY, RUN_BINARY].map(|path| fs::symlink_metadata(path));
+    if present.iter().all(|entry| entry.as_ref().is_err_and(|error|
+        error.kind() == std::io::ErrorKind::NotFound)) { return Ok(()); }
+    for path in [SPAWND_BINARY, RUN_BINARY] {
+        parents(Path::new(path))?;
+        trusted(Path::new(path), false)?;
+        let metadata = fs::metadata(path)?;
+        if metadata.mode() & 0o7000 != 0 || metadata.mode() & 0o111 == 0 || metadata.nlink() != 1 {
+            return Err(refused("unsafe isolation component"));
+        }
+    }
+    let query = command("getent", &["passwd", "duduclaw-runsup"])?;
+    match query.status.code() {
+        Some(2) => {
+            checked("useradd", &["--system", "--user-group", "--no-create-home",
+                "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin",
+                "--password", "!*", "--expiredate", "1970-01-02", "duduclaw-runsup"])?;
+        }
+        Some(0) => (),
+        _ => return Err(refused("cannot query run supervisor account")),
+    }
+    let passwd = checked("getent", &["passwd", "duduclaw-runsup"])?;
+    let passwd = String::from_utf8(passwd.stdout).map_err(|_| refused("invalid supervisor account"))?;
+    let fields: Vec<_> = passwd.trim_end_matches('\n').split(':').collect();
+    if fields.len() != 7 || fields[0] != "duduclaw-runsup" || fields[5] != "/nonexistent"
+        || fields[6] != "/usr/sbin/nologin" { return Err(refused("unsafe supervisor account")); }
+    let uid: u32 = fields[2].parse().map_err(|_| refused("invalid supervisor uid"))?;
+    let gid: u32 = fields[3].parse().map_err(|_| refused("invalid supervisor gid"))?;
+    let defs = fs::read_to_string("/etc/login.defs")?;
+    let mut sys_max = None;
+    for line in defs.lines() {
+        let values: Vec<_> = line.split('#').next().unwrap_or("").split_whitespace().collect();
+        if values.first() == Some(&"SYS_UID_MAX") {
+            if values.len() != 2 || sys_max.is_some() { return Err(refused("invalid system uid range")); }
+            sys_max = Some(values[1].parse::<u32>().map_err(|_| refused("invalid system uid range"))?);
+        }
+    }
+    let max = sys_max.ok_or_else(|| refused("system uid range unavailable"))?;
+    if uid == 0 || gid == 0 || uid >= max || (61184..=65519).contains(&uid)
+        || (61184..=65519).contains(&gid) { return Err(refused("supervisor must be a static system account")); }
+    let groups = checked("id", &["-G", "duduclaw-runsup"])?;
+    let groups = String::from_utf8(groups.stdout).map_err(|_| refused("invalid supervisor groups"))?;
+    if groups.split_whitespace().collect::<Vec<_>>() != vec![fields[3]] {
+        return Err(refused("supervisor has supplementary groups"));
+    }
+    let shadow = checked("getent", &["shadow", "duduclaw-runsup"])?;
+    let shadow = String::from_utf8(shadow.stdout).map_err(|_| refused("invalid supervisor lockdown"))?;
+    let shadow: Vec<_> = shadow.trim_end_matches('\n').split(':').collect();
+    if shadow.len() != 9 || shadow[0] != "duduclaw-runsup" || shadow[1] != "!*" || shadow[7] != "1" {
+        return Err(refused("supervisor account lockdown mismatch"));
+    }
+    checked("loginctl", &["disable-linger", "duduclaw-runsup"])?;
+    match fs::symlink_metadata("/var/lib/systemd/linger/duduclaw-runsup") {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        _ => return Err(refused("supervisor linger remains enabled")),
+    }
+    mkdir("/var/lib/duduclaw-spawnd", 0o700)?;
+    mkdir("/var/lib/duduclaw-spawnd/etc", 0o700)?;
+    mkdir("/var/log/duduclaw-spawnd", 0o700)?;
+    for (name, text) in SPAWND_UNITS {
+        atomic_install(&format!("/etc/systemd/system/{name}"), 0o644,
+            |file| { file.write_all(text.as_bytes())?; Ok(()) })?;
+    }
+    Ok(())
+}
+
 // Serialize binary and floor changes across install, upgrade and uninstall.
 // This file remains after uninstall so waiters always lock the same inode.
 fn version_lock() -> Result<fs::File> {
@@ -220,6 +299,7 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
     })?;
     atomic_install(LAUNCHER, 0o755, |file| { file.write_all(LAUNCHER_TEXT.as_bytes())?; Ok(()) })?;
     atomic_install(UNIT_PATH, 0o644, |file| { file.write_all(unit_text().as_bytes())?; Ok(()) })?;
+    install_spawnd_support_if_published()?;
     record_floor(version)?;
     checked("systemctl", &["daemon-reload"])?;
     if was_active { checked("systemctl", &["restart", UNIT])?; }
@@ -304,4 +384,27 @@ pub(super) async fn upgrade(version: Option<&str>) -> Result<()> {
     if was_active { checked("systemctl", &["restart", UNIT])?; }
     println!("已驗證並安裝官方版本 {version}。現有資料與根金鑰保留。");
     Ok(())
+}
+
+#[cfg(test)]
+mod spawnd_install_tests {
+    use super::*;
+
+    #[test]
+    fn spawnd_templates_use_fixed_root_seqpacket_and_bounded_hierarchy() {
+        let lookup = |name| SPAWND_UNITS.iter().find(|(unit, _)| *unit == name).unwrap().1;
+        let socket = lookup("duduclaw-spawnd.socket");
+        assert!(socket.lines().any(|line| line == "ListenSequentialPacket=/run/duduclaw-spawnd/control.sock"));
+        assert!(socket.lines().any(|line| line == "SocketUser=root"));
+        assert!(socket.lines().any(|line| line == "SocketGroup=duduclaw"));
+        assert!(socket.lines().any(|line| line == "SocketMode=0660"));
+        let service = lookup("duduclaw-spawnd.service");
+        assert!(service.lines().any(|line| line == format!("ExecStart={SPAWND_BINARY}")));
+        assert!(service.lines().any(|line| line == "StandardOutput=null"));
+        assert!(service.lines().any(|line| line == "StandardError=null"));
+        assert!(service.lines().any(|line| line == "Slice=duduclaw-tcb.slice"));
+        assert!(service.lines().any(|line| line == "ReadWritePaths=/var/lib/duduclaw-spawnd /var/log/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger"));
+        assert!(lookup("duduclaw-employees.slice").lines().any(|line| line == "TasksMax=1024"));
+        assert!(lookup("duduclaw.slice").lines().any(|line| line == "MemoryMin=512M"));
+    }
 }

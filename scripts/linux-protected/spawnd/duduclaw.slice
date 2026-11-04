@@ -1,0 +1,6 @@
+[Unit]
+Description=DuDuClaw resource hierarchy
+
+[Slice]
+MemoryAccounting=yes
+MemoryMin=512M
