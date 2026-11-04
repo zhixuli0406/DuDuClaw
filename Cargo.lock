@@ -2154,6 +2154,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-isolation"
+version = "1.79.3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "duduclaw-knowledge"
 version = "1.79.3"
 dependencies = [

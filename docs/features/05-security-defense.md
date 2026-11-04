@@ -1,5 +1,10 @@
 # Security Defense
 
+## Planned native Linux isolation contracts
+
+The unreleased `duduclaw-isolation` crate defines shared contracts for per-employee execution, MCP capabilities, egress, isolated parsing, signed updates and migration confirmation. This phase adds types, bounded message formats and lifecycle checks only. The gateway does not use them yet; no new isolation guarantee is active, and existing installations behave as before. Native Linux enforcement, signature verification, migration and three-distribution acceptance remain separate delivery requirements.
+
+
 Enterprise [team-history API](68-manager-team-history.md) (v1.76.0): live reporting-line checks are independent of ordinary agent access; external transcripts require read-time masking and every disclosure requires a durable chained audit. A disabled setting, uncertain origin, installed-model failure or audit failure cannot return transcript content. Regex-only operation explicitly reports `ner: false` and can leave names/addresses visible. Direct host/database access remains outside this product boundary.
 
 > Four live guards, where each one runs, and what none of them covers.

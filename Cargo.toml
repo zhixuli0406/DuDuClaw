@@ -16,6 +16,7 @@ exclude = [
 ]
 members = [
     "crates/duduclaw-core",
+    "crates/duduclaw-isolation",
     "crates/duduclaw-auth",
     "crates/duduclaw-gateway",
     "crates/duduclaw-security",
@@ -127,6 +128,7 @@ reqwest = { version = "0.12", features = ["json"] }
 mdns-sd = "0.20"
 
 # Internal crates
+duduclaw-isolation = { path = "crates/duduclaw-isolation" }
 duduclaw-core = { path = "crates/duduclaw-core" }
 duduclaw-inference = { path = "crates/duduclaw-inference", default-features = false }
 duduclaw-gateway = { path = "crates/duduclaw-gateway", default-features = false }
