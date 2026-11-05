@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- 新增 AI 員工失敗時改為顯示實際原因.
+
 ### Added
 
 - Google Chat 新增 Pub/Sub 連線模式，共用與員工專屬應用程式可透過向外拉取通知收訊，不需公開 HTTPS gateway；支援 CLI／Cloud Shell 建立與匯入，Google 設定頁仍需手動儲存與實測。
