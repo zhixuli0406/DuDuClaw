@@ -1,0 +1,12 @@
+[Unit]
+Description=DuDuClaw employee aggregate resource ceiling
+
+[Slice]
+MemoryAccounting=yes
+MemoryMax=4G
+MemorySwapMax=0
+CPUAccounting=yes
+CPUQuota=200%
+TasksAccounting=yes
+TasksMax=1024
+IOAccounting=yes

@@ -2464,6 +2464,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-spawnd"
+version = "1.79.3"
+dependencies = [
+ "duduclaw-isolation",
+ "fs2",
+ "libc",
+ "nix 0.29.0",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "zbus",
+]
+
+[[package]]
 name = "duduclaw-sysd"
 version = "1.79.3"
 dependencies = [
