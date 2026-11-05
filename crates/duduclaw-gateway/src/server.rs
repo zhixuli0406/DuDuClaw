@@ -2434,16 +2434,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                                     if result.needs_restart {
                                         // Graceful shutdown after 3s to let WebSocket
                                         // clients receive the notification. The
-                                        // restart flag makes the post-shutdown hook
-                                        // re-exec the new binary (works with or
-                                        // without launchd/systemd supervision).
+                                        // restart dispatcher uses a separate launchd job
+                                        // on macOS; other installs use graceful exec.
                                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                                         info!(
                                             "Auto-update: restarting for v{}",
                                             info.latest_version
                                         );
-                                        duduclaw_core::platform::request_restart_after_shutdown();
-                                        duduclaw_core::platform::self_interrupt();
+                                        crate::updater::restart_after_update().await;
                                     }
                                 }
                                 Ok(result) => {
@@ -3449,8 +3447,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Self-update installed a new binary during this run: re-exec into it
     // now that the graceful shutdown sequence (prediction flush → worker
     // supervisor SIGTERM chain → axum drain) has completed. exec() keeps
-    // the PID on Unix, so launchd/systemd supervision is undisturbed; it
-    // also covers unsupervised foreground runs (npm wrapper, `duduclaw run`).
+    // the PID on Unix for systemd and foreground runs (npm wrapper,
+    // `duduclaw run`). Updated launchd jobs use the independent helper instead.
     if duduclaw_core::platform::restart_requested() {
         if duduclaw_core::root_key::is_held() {
             // Re-exec would reset dumpability and lose the one-shot key. PID 1

@@ -64,7 +64,7 @@
 //!    and stops, with none of `handlers.rs`'s `system.apply_update` RPC
 //!    path's broadcast-then-schedule-restart logic). The fix: this sweep —
 //!    which DOES run inside the gateway process — is the one that actually
-//!    calls `request_restart_after_shutdown()` + `self_interrupt()`, the
+//!    calls the install-mode-aware `updater::restart_after_update()`, the
 //!    first tick it notices `restart_triggered == false` for a `system`
 //!    entry. `pending_update_report` doubles as the cross-process signal
 //!    (the MCP subprocess can't reach into the gateway's memory, but it CAN
@@ -268,8 +268,7 @@ async fn reconcile_system(
                 );
                 tokio::spawn(async {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    duduclaw_core::platform::request_restart_after_shutdown();
-                    duduclaw_core::platform::self_interrupt();
+                    crate::updater::restart_after_update().await;
                 });
             }
             Ok(Err(e)) => {

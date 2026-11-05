@@ -3669,7 +3669,11 @@ enum ServiceCommands {
     Stop,
 
     /// Restart the background service
-    Restart,
+    Restart {
+        /// Internal one-shot launchd update helper
+        #[arg(long, hide = true)]
+        from_updater: Option<String>,
+    },
 
     /// Show service status
     Status,
@@ -5577,7 +5581,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             }
             ServiceCommands::Start => service::handle_service(service::ServiceAction::Start).await,
             ServiceCommands::Stop => service::handle_service(service::ServiceAction::Stop).await,
-            ServiceCommands::Restart => service::handle_service(service::ServiceAction::Restart).await,
+            ServiceCommands::Restart { from_updater } => {
+                service::handle_service(service::ServiceAction::Restart { from_updater }).await
+            },
             ServiceCommands::Status => {
                 service::handle_service(service::ServiceAction::Status).await
             }
