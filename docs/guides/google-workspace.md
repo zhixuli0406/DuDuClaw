@@ -72,7 +72,7 @@ which is why they are served natively here.
 
 `google_chat_messages` reads recent messages from a strict `spaces/...` resource name, newest first. `limit` defaults to 30 (1–100); optional `since` must be RFC3339 and `thread` must be a thread resource within that space. Each message includes its sender, creation time, text (at most 2,000 characters), thread and attachment names. Attachments are never downloaded. Sender names use Google's returned display name or the `users/...` resource; no People API or extra membership permission is used. The complete returned content is capped at 30,000 characters.
 
-1. An administrator enables **Google Chat read** on the Google connection page (`[google] chat_read = true`, default false).
+1. An administrator enables **Google Chat read** in the dashboard under Manage → Integrations → Google (`[google] chat_read = true`, default false).
 2. The user reconnects their own Google account in **My connections** and selects both Chat read permissions. The optional scopes are `https://www.googleapis.com/auth/chat.spaces.readonly` and `https://www.googleapis.com/auth/chat.messages.readonly`; existing users are not asked for them while the switch is off.
 3. In the OAuth client's Google Cloud project, enable **Google Chat API** and configure a **Chat app**, even for user authentication. A Workspace administrator may also need to allow the OAuth app.
 

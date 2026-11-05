@@ -205,4 +205,4 @@ sudo duduclaw service protected-linux policy engine-socket revoke
 auto_recover = false
 ```
 
-新版安裝的 unit 在 `Restart=on-failure` 外另有 `RestartForceExitStatus=75`，並於 `[Unit]` 設定上述兩項啟動限制。現行受保護升級指令只替換執行檔，**不會**重寫啟動器或 unit；未修改的舊版 unit 已可透過 `Restart=on-failure` 重啟退出碼 75，但只升級執行檔不會取得新的每小時限制，須更新 unit 才生效。主機管理員可重設 systemd 計數，修改 home JSON 則不能。驗證並安裝新版後，主機管理員可執行 `sudo /opt/duduclaw/bin/duduclaw service install --protected-linux` 更新內嵌啟動器與 unit。這會保留資料與根金鑰、重新載入 systemd，並重啟原本執行中的 gateway；如有本機 unit 覆寫設定，也請一併確認。
+新版安裝的 unit 在 `Restart=on-failure` 外另有 `RestartForceExitStatus=75`，並於 `[Unit]` 設定上述兩項啟動限制。`service upgrade --protected-linux` 寫入的 unit 與啟動器範本，來自**執行升級的那個版本**。從 v1.79.3 第一次升級時，執行的是舊版程式，只會替換執行檔，不會取得新 unit；舊版 unit 已可透過 `Restart=on-failure` 重啟退出碼 75，但沒有新的每小時限制，自動恢復也會維持關閉。升級完成後再執行一次下方的 `service install --protected-linux`，才會寫入新版 unit 與啟動器並啟用自動恢復；之後的升級會在內容不同時自動更新。主機管理員可重設 systemd 計數，修改 home JSON 則不能。驗證並安裝新版後，主機管理員可執行 `sudo /opt/duduclaw/bin/duduclaw service install --protected-linux` 更新內嵌啟動器與 unit。這會保留資料與根金鑰、重新載入 systemd，並重啟原本執行中的 gateway；如有本機 unit 覆寫設定，也請一併確認。

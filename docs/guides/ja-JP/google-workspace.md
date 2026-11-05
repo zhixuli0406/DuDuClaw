@@ -75,7 +75,7 @@ MCPツールです。
 
 `google_chat_messages` は厳密に検証した `spaces/...` の最近のメッセージを新しい順に読みます。`limit` は既定 30（1–100）、任意の `since` は RFC3339、`thread` は同じスペース内のスレッドリソース名です。送信者、作成時刻、本文（1件最大 2,000 文字）、スレッド、添付ファイル名を返し、添付はダウンロードしません。表示名がない送信者は `users/...` で示し、People API や追加のメンバー権限は使用しません。応答全体は最大 30,000 文字です。
 
-1. 管理者が Google 接続画面で **Google Chat 読み取り**を有効にします（`[google] chat_read = true`、既定 false）。
+1. 管理者がダッシュボードの「管理 → 連携 → Google」タブで **Google Chat 読み取り**を有効にします（`[google] chat_read = true`、既定 false）。
 2. ユーザーは「自分の接続」から自分の Google アカウントを再接続し、Chat の読み取り権限を両方選択します。追加スコープは `https://www.googleapis.com/auth/chat.spaces.readonly` と `https://www.googleapis.com/auth/chat.messages.readonly`。無効時は既存ユーザーに追加同意を求めません。
 3. OAuth クライアントの Google Cloud プロジェクトで **Google Chat API** を有効化し、**Chat アプリ**を構成します。ユーザー認証でも必要です。Workspace 管理者によるアプリ許可が必要な場合もあります。
 

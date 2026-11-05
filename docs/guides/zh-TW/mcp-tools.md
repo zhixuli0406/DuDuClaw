@@ -371,7 +371,7 @@ Read 防護會拒絕讀取 `<home>/secrets`。這不是對 Bash 的隔離：員�
 
 `google_chat_messages` 以嚴格驗證的 `spaces/...` 資源名稱讀取近期訊息，從新到舊排列。`limit` 預設 30，範圍 1–100；選填 `since` 必須是 RFC3339 時間，`thread` 必須是該聊天室內的討論串資源名稱。回傳發送者、建立時間、文字（每則最多 2,000 字元）、討論串及附件名稱，不下載附件。發送者名稱採 Google 回傳的顯示名稱，缺少時顯示 `users/...`；不呼叫 People API，也不另索取會員權限。整份回覆最多 30,000 字元。
 
-1. 管理員在 Google 連線頁啟用「Google Chat 讀取」（`[google] chat_read = true`，預設 false）。
+1. 管理員在儀表板「管理 → 整合 → Google」分頁啟用「Google Chat 讀取」（`[google] chat_read = true`，預設 false）。
 2. 使用者到「我的連線」重新連結自己的 Google 帳號，勾選兩項 Chat 讀取權限。額外 scope 為 `https://www.googleapis.com/auth/chat.spaces.readonly` 與 `https://www.googleapis.com/auth/chat.messages.readonly`；開關關閉時不會要求既有使用者追加同意。
 3. 在 OAuth 用戶端所屬的 Google Cloud 專案啟用 **Google Chat API**，並完成 **Chat 應用程式設定**，即使使用個人帳號授權也需要。Workspace 管理員可能還需允許這個 OAuth 應用程式。
 
