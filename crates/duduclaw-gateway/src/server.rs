@@ -2650,6 +2650,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         state.jwt_config.clone(),
         state.user_db.clone(),
     ));
+    let ag_ui_router = crate::webchat::ag_ui::router(webchat_state.clone());
     let webchat_router = Router::new()
         .route("/ws/chat", get(crate::webchat::ws_chat_handler))
         .with_state(webchat_state);
@@ -3105,7 +3106,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         )
         .with_state(state)
         .merge(auth_router)
-        .merge(webchat_router);
+        .merge(webchat_router)
+        .merge(ag_ui_router);
 
     // Wiki trust federation inbound endpoint — only mounted when the trust
     // store is initialised. Fails closed by returning 503 from a stub when

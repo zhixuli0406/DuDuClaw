@@ -3837,6 +3837,7 @@ pub(super) async fn build_reply_with_session_inner(
     let reason = failure.reason();
     let diagnostic = failure.audit();
     let err_str = diagnostic.to_string();
+    super::failure::mark_runtime_failure();
     warn!(
         agent = %name,
         reason = ?reason,

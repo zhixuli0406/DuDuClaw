@@ -457,3 +457,11 @@ Read 防護會拒絕讀取 `<home>/secrets`。這不是對 Bash 的隔離：員�
 `computer_login` 只接受標籤。Gateway 用已驗證的員工身分比對非空的 `allowed_agents` 清單，再執行該工具獨立的工具與 session 閘門。Gateway 先透過既有導覽檢查開啟保存的登入網址。秘密只透過 stdin 送入容器 helper，不放在命令列參數或模型結果。Helper 填寫前須符合確切來源與登入路徑；只有送出第一步後到達、且有可見密碼欄位的第二步才能使用 `allowed_paths`。填寫前、同步 input/change 事件後及 submit 事件後都要求有效提交方式為 POST；原生 `requestSubmit` 與備援路徑都會檢查實際選用送出按鈕的 `formmethod`。網路層也會拒絕查詢參數解碼後的值等於完整帳號或密碼的非 POST 請求。CDP Fetch 會中止每個來源不符的請求與轉址，登入期間也會略過 service worker。解除攔截前，helper 會追蹤 `Network.requestWillBeSent`、`Network.loadingFinished` 與 `Network.loadingFailed`，確認請求已結束。最多等待 3 秒，且須連續兩次命令往返都沒有新請求活動或待完成請求。若無法確認完成，回傳 `failed_uncleared`，在 Fetch 攔截仍啟用時呼叫 `Browser.close`，再由 Gateway 移除 session 與容器。執行期間暫停截圖；若無法確認欄位已清除，Gateway 會停止並移除 session 與容器，要求重新啟動 session。
 
 這項保護無法阻止同來源 JavaScript 讀取已填入的欄位，也不提供對同一 OS 使用者程序的檔案隔離，更不取代網路白名單。登入僅限保存的 HTTPS 來源與允許的登入路徑，localhost 也必須使用 HTTPS。雙因素驗證與驗證碼須由人員透過既有接手流程處理。須重建電腦操作映像以安裝 `duduclaw-fill-login`。結果定義與設定方式見[瀏覽器自動化](08-browser-automation.md)。
+
+## AG-UI 外部前端
+
+[AG-UI HTTP/SSE 端點](74-ag-ui.md)只接受儀表板 access JWT，沿用即時帳號／雙因子檢查與 WebChat 員工授權；非 Admin 呼叫者須有綁定或有效團隊授權，不能存取主要／預設員工。伺服器對話識別隔離呼叫者、員工與 thread，使用 WebChat 所有者命名空間內的獨立 AG-UI 區段；`/ws/chat` 不能續接。只有最後一則 user 文字會進入既有受保護的回覆管線；client history、tools、context、state 與 forwarded properties 不會增加權限，也不能執行前端自訂工具。
+
+核准中斷依 broker 持久保存的對話／回合來源關聯判斷。只有有效 Admin 可在此決定一般、未綁定特定執行身分的 `mcp_call` 或 `mcp_install`，並檢查到期、所有權、限定儀表板與 `forbid_self_approval` 政策。其他種類只通知，限定儀表板的要求不能在此決定；顯示用 metadata 不具授權效力。請求大小、同時執行、生命週期及事件佇列都有上限；斷線會中止進行中的交付並撤回該回合待核准要求。正常送出 interrupt 後只在期限內保留回合。核准紀錄可跨重啟保留，記憶體中的 runtime 續跑狀態不能。SQLite 准入紀錄阻止 24 小時內重複 run ID，最多保留 4,096 筆。重啟後，未完成 thread 在原本 15 分鐘期限內仍被擋住；之後的新 run 須先撤回舊回合待核准要求。同一 process 內的 resume 收據不會重跑工具，也不證明執行成功。本入口仍待遠端建置／測試、真實驗收及Daybreak 複審。
+
+同一次 resume 的決定改為原子提交，任一卡片衝突就回滾整批。原介面已同意或拒絕的卡片，可由仍有員工存取權的呼叫者（包含非 Admin）在新連線確認相同結果後續跑；重新核對原始要求與回合來源，保留外部決定者。未知的孤立 resume 不會新增准入紀錄。每帳號跨員工與 thread 合計最多保留 256 筆 run／thread 紀錄、滾動 60 秒最多准入 32 次，收據請求也計入；配額跨重啟保留，超限回 HTTP 429。未知 JSON 欄位只在 debug 記錄數量，每個 gateway process 最多每分鐘一次，不記名稱或值。第一輪 Daybreak 的四項問題已有修補，遠端測試與 Daybreak 複審仍待完成。
