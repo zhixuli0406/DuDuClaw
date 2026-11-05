@@ -479,29 +479,186 @@ fn claim_delegation_context_with(
     if let Err(error) = builder.create(&directory) {
         if error.kind() != std::io::ErrorKind::AlreadyExists { return false; }
     }
-    let Ok(metadata) = std::fs::symlink_metadata(&directory) else { return false; };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() { return false; }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.permissions().mode() & 0o777 != 0o700
-        {
-            return false;
-        }
+    let Ok(directory) = ClaimDirectory::open(&directory) else { return false; };
+    // Serialize cleanup/count/create across processes so concurrent claims cannot
+    // exceed the cap. The Unix lock is held on the verified directory inode.
+    if fs2::FileExt::lock_exclusive(&directory.lock).is_err() { return false; }
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    if !maintain_delegation_claims(&directory, now.as_secs(), MAX_DELEGATION_CLAIMS) {
+        return false;
     }
-    let Ok(mut file) = open_private(&directory.join(&context.nonce), true, true) else {
+    let Ok(mut file) = directory.file(std::ffi::OsStr::new(&context.nonce), true) else {
         return false;
     };
     if writeln!(file, "{}", context.expires_at).is_err() || file.sync_all().is_err() {
         return false;
     }
     #[cfg(unix)]
-    if std::fs::File::open(&directory).and_then(|file| file.sync_all()).is_err() {
-        return false;
-    }
+    if directory.lock.sync_all().is_err() { return false; }
     claims.insert(cache_key);
     true
+}
+
+// At most 10,001 entries are inspected per claim, even for an oversized registry.
+const MAX_DELEGATION_CLAIMS: usize = 10_000;
+const CLAIM_SCAN_LIMIT: usize = MAX_DELEGATION_CLAIMS + 1;
+const CLAIM_CLOCK_SKEW_SECS: u64 = 60;
+
+struct ClaimDirectory {
+    lock: std::fs::File,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+impl ClaimDirectory {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, MetadataExt};
+            let lock = std::fs::OpenOptions::new().read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)?;
+            let metadata = lock.metadata()?;
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != 0o700 {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            Ok(Self { lock })
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if metadata.file_attributes() & 0x400 != 0 { // FILE_ATTRIBUTE_REPARSE_POINT
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+            }
+            // Windows still uses paths after this check; replacement of the
+            // directory between validation and creation remains a limitation.
+            let lock_path = path.join(".claim-lock");
+            let lock = match open_private(&lock_path, true, true) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                    open_private(&lock_path, true, false)?,
+                Err(error) => return Err(error),
+            };
+            Ok(Self { lock, path: path.to_owned() })
+        }
+    }
+
+    fn file(&self, name: &std::ffi::OsStr, create: bool) -> std::io::Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            use std::os::{fd::{AsRawFd, FromRawFd}, unix::ffi::OsStrExt};
+            let name = std::ffi::CString::new(name.as_bytes())?;
+            let flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+                | if create { libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY } else { libc::O_RDONLY };
+            let fd = unsafe { libc::openat(self.lock.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+            if fd < 0 { return Err(std::io::Error::last_os_error()); }
+            // SAFETY: openat returned a fresh owned fd.
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata()?;
+            validate_unix_owner_links(metadata.uid(), metadata.nlink(), unsafe { libc::geteuid() })?;
+            if !metadata.is_file() || metadata.mode() & 0o7777 != 0o600 {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        { open_private(&self.path.join(name), create, create) }
+    }
+
+    fn names(&self) -> std::io::Result<Vec<std::ffi::OsString>> {
+        #[cfg(unix)]
+        {
+            use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+            // Open a new directory description so each scan starts at offset 0.
+            let fd = unsafe { libc::openat(self.lock.as_raw_fd(), c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+            if fd < 0 { return Err(std::io::Error::last_os_error()); }
+            let stream = unsafe { libc::fdopendir(fd) };
+            if stream.is_null() {
+                unsafe { libc::close(fd); }
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut names = Vec::new();
+            while names.len() < CLAIM_SCAN_LIMIT {
+                // Clear errno to distinguish end-of-directory from an I/O error.
+                #[cfg(target_os = "linux")]
+                unsafe { *libc::__errno_location() = 0; }
+                #[cfg(target_os = "macos")]
+                unsafe { *libc::__error() = 0; }
+                let entry = unsafe { libc::readdir(stream) };
+                if entry.is_null() {
+                    let error = std::io::Error::last_os_error();
+                    unsafe { libc::closedir(stream); }
+                    if error.raw_os_error().unwrap_or(0) != 0 { return Err(error); }
+                    return Ok(names);
+                }
+                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+                if name != b"." && name != b".." {
+                    names.push(std::ffi::OsStr::from_bytes(name).to_owned());
+                }
+            }
+            unsafe { libc::closedir(stream); }
+            Ok(names)
+        }
+        #[cfg(not(unix))]
+        {
+            // Include room for the one reserved lock file while bounding even
+            // malformed directory entries and I/O errors.
+            std::fs::read_dir(&self.path)?.take(CLAIM_SCAN_LIMIT + 1)
+                .filter_map(|entry| match entry {
+                    Ok(entry) if entry.file_name() == ".claim-lock" => None,
+                    other => Some(other.map(|entry| entry.file_name())),
+                }).take(CLAIM_SCAN_LIMIT).collect()
+        }
+    }
+
+    fn remove(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+            let name = std::ffi::CString::new(name.as_bytes())?;
+            if unsafe { libc::unlinkat(self.lock.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        { std::fs::remove_file(self.path.join(name)) }
+    }
+}
+
+fn maintain_delegation_claims(directory: &ClaimDirectory, now: u64, cap: usize) -> bool {
+    use std::io::Read;
+    let Ok(names) = directory.names() else { return false; };
+    let scan_complete = names.len() < CLAIM_SCAN_LIMIT;
+    let mut count = 0;
+    for name in names {
+        // Unknown files count toward the cap but are never removed. Only nonce
+        // files with a valid expiry are eligible; never follow links or specials.
+        let nonce = name.to_string_lossy();
+        let expired = nonce.len() == 64
+            && nonce.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && directory.file(&name, false).ok().is_some_and(|file| {
+                if !file.metadata().is_ok_and(|m| m.is_file()) { return false; }
+                let mut expiry = String::new();
+                file.take(32).read_to_string(&mut expiry).is_ok()
+                    && expiry.trim().parse::<u64>().ok().is_some_and(|expiry|
+                        now > expiry.saturating_add(CLAIM_CLOCK_SKEW_SECS))
+            });
+        // The recorded expiry already includes the context's entire lifetime;
+        // retaining it through clock skew prevents replay during cleanup.
+        if !expired || directory.remove(&name).is_err() { count += 1; }
+    }
+    scan_complete && count < cap
 }
 
 // ── Signed internal requests ─────────────────────────────────────────────────
@@ -952,6 +1109,96 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(!claim_delegation_context(home.path(), &context));
+    }
+
+    fn claim_test_directory(home: &Path) -> ClaimDirectory {
+        let path = home.join("delegation-context-claims");
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        ClaimDirectory::open(&path).unwrap()
+    }
+
+    #[test]
+    fn delegation_claim_cleanup_keeps_live_and_skew_protected_claims() {
+        use std::io::Write;
+        let home = TempDir::new().unwrap();
+        let directory = claim_test_directory(home.path());
+        for (name, expiry) in [('a', 100), ('b', 200), ('c', 300)] {
+            let name = name.to_string().repeat(64);
+            writeln!(directory.file(std::ffi::OsStr::new(&name), true).unwrap(), "{expiry}").unwrap();
+        }
+        assert!(maintain_delegation_claims(&directory, 260, 10));
+        assert!(directory.file(std::ffi::OsStr::new(&"a".repeat(64)), false).is_err());
+        assert!(directory.file(std::ffi::OsStr::new(&"b".repeat(64)), false).is_ok());
+        assert!(directory.file(std::ffi::OsStr::new(&"c".repeat(64)), false).is_ok());
+        assert!(maintain_delegation_claims(&directory, 261, 10));
+        assert!(directory.file(std::ffi::OsStr::new(&"b".repeat(64)), false).is_err());
+    }
+
+    #[test]
+    fn delegation_claim_capacity_fails_closed_and_cleanup_recovers_space() {
+        use std::io::Write;
+        let home = TempDir::new().unwrap();
+        let directory = claim_test_directory(home.path());
+        for n in 0..MAX_DELEGATION_CLAIMS {
+            writeln!(directory.file(std::ffi::OsStr::new(&format!("{n:064x}")), true).unwrap(), "100").unwrap();
+        }
+        assert!(!maintain_delegation_claims(&directory, 160, MAX_DELEGATION_CLAIMS));
+        assert!(maintain_delegation_claims(&directory, 161, MAX_DELEGATION_CLAIMS));
+        for n in 0..MAX_DELEGATION_CLAIMS {
+            directory.file(std::ffi::OsStr::new(&format!("{n:064x}")), true).unwrap();
+        }
+        let token = mint_delegation_context(&key(), "worker", "sender", "origin", 0, None, u64::MAX).unwrap();
+        let context = verify_delegation_context(&key(), "worker", None, &token, 0).unwrap();
+        // Keep all claims live at wall-clock time and exercise the actual entry point.
+        for n in 0..MAX_DELEGATION_CLAIMS {
+            let mut file = std::fs::OpenOptions::new().write(true).truncate(true)
+                .open(home.path().join("delegation-context-claims").join(format!("{n:064x}"))).unwrap();
+            writeln!(file, "{}", u64::MAX).unwrap();
+        }
+        assert!(!claim_delegation_context(home.path(), &context));
+        assert!(!home.path().join("delegation-context-claims").join(&context.nonce).exists());
+        // A later maintenance pass can reclaim expired entries and allow claims.
+        assert!(!maintain_delegation_claims(&directory, u64::MAX, MAX_DELEGATION_CLAIMS));
+        directory.remove(std::ffi::OsStr::new(&format!("{:064x}", 0))).unwrap();
+        assert!(claim_delegation_context(home.path(), &context));
+    }
+
+    #[test]
+    fn delegation_claim_scan_is_bounded_even_for_oversized_registry() {
+        let home = TempDir::new().unwrap();
+        let directory = claim_test_directory(home.path());
+        for n in 0..CLAIM_SCAN_LIMIT + 2 {
+            directory.file(std::ffi::OsStr::new(&format!("unknown-{n}")), true).unwrap();
+        }
+        assert_eq!(directory.names().unwrap().len(), CLAIM_SCAN_LIMIT);
+        assert!(!maintain_delegation_claims(&directory, u64::MAX, MAX_DELEGATION_CLAIMS));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delegation_claim_directory_fd_survives_path_replacement() {
+        use std::os::unix::fs::symlink;
+        let home = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let directory = claim_test_directory(home.path());
+        let path = home.path().join("delegation-context-claims");
+        let moved = home.path().join("original-claims");
+        std::fs::rename(&path, &moved).unwrap();
+        symlink(other.path(), &path).unwrap();
+        let nonce = "a".repeat(64);
+        directory.file(std::ffi::OsStr::new(&nonce), true).unwrap();
+        assert!(moved.join(&nonce).exists());
+        assert!(!other.path().join(&nonce).exists());
+        assert!(directory.file(std::ffi::OsStr::new(&nonce), true).is_err());
+        symlink(other.path().join("victim"), moved.join("b".repeat(64))).unwrap();
+        assert!(directory.file(std::ffi::OsStr::new(&"b".repeat(64)), false).is_err());
+        assert!(maintain_delegation_claims(&directory, u64::MAX, 10));
+        assert!(ClaimDirectory::open(&path).is_err());
     }
 
     /// RFC 4231 test case 1 — a fixed vector proves this is real HMAC-SHA256

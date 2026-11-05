@@ -619,8 +619,9 @@ impl GenericCliRuntime {
                 duduclaw_core::ENV_TRUST_TURN_ID] {
                 cmd.env_remove(name);
             }
-            cmd.envs(crate::claude_runner::delegation_context_env(&context.home_dir, &context.agent_id,
-                crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref())));
+            // Generic CLIs cannot isolate each third-party MCP child's env.
+            // Do not mint delegation authority here: ordinary worker tools still
+            // authenticate, but delegation must fail closed for these runtimes.
             // P2-B N4: the turn/run source identity, same channel as the id.
             // N13: this CLI inherits the gateway's environment, so a
             // `DUDUCLAW_UPSTREAM_UNKNOWN` the operator happened to export
@@ -632,6 +633,13 @@ impl GenericCliRuntime {
                 cmd.env(k, v);
             }
         }
+
+        // Strip ambient and explicitly configured variants, including future names.
+        let delegation_names: Vec<_> = std::env::vars_os().map(|(k, _)| k)
+            .chain(cmd.as_std().get_envs().map(|(k, _)| k.to_owned()))
+            .filter(|k| k.to_string_lossy().to_ascii_uppercase().starts_with("DUDUCLAW_DELEGATION_"))
+            .collect();
+        for name in delegation_names { cmd.env_remove(name); }
 
         let stdin_prompt = self.spec.headless.prompt_via_stdin();
         cmd.stdin(if stdin_prompt {
@@ -1094,6 +1102,22 @@ mod tests {
         let fut = duduclaw_memory::feedback::CURRENT_TURN_ID.scope(Some("t-77".into()), fut);
         let resp = fut.await.unwrap();
         assert_eq!(resp.content, "t-77|telegram:9|abc123");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegation_authority_is_absent_from_generic_cli_spawn_env() {
+        let dir = tempfile::tempdir().unwrap();
+        duduclaw_core::ensure_identity_key(dir.path()).unwrap();
+        let bin = fake_bin(dir.path(), "copilot",
+            "if env | /usr/bin/grep -qi '^DUDUCLAW_DELEGATION_'; then echo leaked; else echo clean; fi");
+        let mut spec = *spec_for("copilot").unwrap();
+        spec.headless.extra_env = &[
+            ("DUDUCLAW_DELEGATION_CONTEXT", "must-not-leak"),
+            ("dUdUcLaW_dElEgAtIoN_FUTURE_SUFFIX", "must-not-leak"),
+        ];
+        let rt = GenericCliRuntime::with_program(Box::leak(Box::new(spec)), bin.to_string_lossy());
+        assert_eq!(rt.execute("hi", &ctx(dir.path())).await.unwrap().content, "clean");
     }
 
     #[cfg(unix)]

@@ -152,6 +152,7 @@ pub fn is_proxy_private_env_key(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
     name.starts_with("DUDUCLAW_MCP_PROXY_ENV")
         || name.starts_with("DUDUCLAW_AGENT_")
+        || name.starts_with("DUDUCLAW_DELEGATION_")
         || name == "DUDUCLAW_ON_BEHALF_OF"
 }
 

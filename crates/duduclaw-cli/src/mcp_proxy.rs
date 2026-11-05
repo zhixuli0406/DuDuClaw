@@ -128,6 +128,11 @@ pub const PROXY_PRIVATE_ENV: &[&str] = &[
 
 ];
 
+fn is_private_upstream_env(name: &str) -> bool {
+    duduclaw_core::mcp_proxy_rewrite::is_proxy_private_env_key(name)
+        || PROXY_PRIVATE_ENV.iter().any(|private| private.eq_ignore_ascii_case(name))
+}
+
 // ── Pure frame helpers (unit-tested without any process) ────────────────────
 
 /// Parse one newline-delimited frame. `None` ⇒ the line is **not** JSON and
@@ -337,7 +342,7 @@ pub fn upstream_env(
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = inherited
         .into_iter()
-        .filter(|(k, _)| !PROXY_PRIVATE_ENV.iter().any(|private| private.eq_ignore_ascii_case(k)))
+        .filter(|(k, _)| !is_private_upstream_env(k))
         .collect();
 
     let declared: Vec<(String, String)> = encoded
@@ -351,7 +356,7 @@ pub fn upstream_env(
         .unwrap_or_default();
 
     for (k, v) in declared {
-        if PROXY_PRIVATE_ENV.iter().any(|private| private.eq_ignore_ascii_case(&k)) { continue; }
+        if is_private_upstream_env(&k) { continue; }
         match out.iter_mut().find(|(ek, _)| *ek == k) {
             Some(slot) => slot.1 = v,
             None => out.push((k, v)),
@@ -1545,6 +1550,9 @@ mod tests {
     #[test]
     fn upstream_env_never_contains_delegation_proof_or_metadata() {
         let names = [
+            "DUDUCLAW_DELEGATION_",
+            "dUdUcLaW_dElEgAtIoN_CONTEXT_SUFFIX",
+            "DUDUCLAW_DELEGATION_FUTURE",
             duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN,
             duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT,
             duduclaw_core::ENV_DELEGATION_SENDER,
@@ -1554,6 +1562,13 @@ mod tests {
         let variants: Vec<String> = names.iter().flat_map(|name| [
             name.to_string(), name.to_ascii_lowercase(), name.replacen("DUDUCLAW", "DuDuClaw", 1),
         ]).collect();
+        for name in &variants {
+            let raw = serde_json::json!({"mcpServers": {"third-party": {
+                "command": "server", "env": {name: "private"}
+            }}});
+            assert!(duduclaw_core::mcp_proxy_rewrite::validate_raw_mcp_config(
+                &raw, Path::new("/duduclaw"), &serde_json::json!({})).is_err());
+        }
         let inherited = variants.iter().map(|name| (name.clone(), "private".to_string()));
         let declared: serde_json::Map<String, Value> = variants.iter()
             .map(|name| (name.clone(), Value::String("declared-secret".into()))).collect();
