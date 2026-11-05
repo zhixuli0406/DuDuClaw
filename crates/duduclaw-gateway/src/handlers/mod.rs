@@ -102,10 +102,13 @@ pub(crate) use shared_wiki_rpc::SharedWikiReader;
 mod search_rpc;
 mod skills_rpc;
 mod skills_list_rpc;
+mod skills_recent_rpc;
 mod skills_manage_rpc;
 mod skills_install_request;
 mod skills_custom;
 mod cron_rpc;
+mod cron_scoped_rpc;
+mod dashboard_scope;
 mod about_rpc;
 mod data_exports_rpc;
 mod compliance_rpc;
@@ -617,6 +620,15 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return boxed_frame(|| self.dispatch_system(method, params, ctx, conn)).await;
+        }
+
+        // Apply the employee-dashboard namespace floor before an extension
+        // can handle a method. Unregistered methods in these namespaces are
+        // Admin-only; the normal handlers retain all record-level checks.
+        if let Some(role) = dashboard_scope::minimum_role(method) {
+            if let Err(e) = acl::require_role(ctx, role) {
+                return WsFrame::error_response("", &e);
+            }
         }
 
         if let Some(request) = credential_request {

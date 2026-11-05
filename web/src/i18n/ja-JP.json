@@ -10135,5 +10135,13 @@
   "templates.removeMember": "メンバーと配下を削除",
   "templates.reviewWarning": "削除されるのは指定された構造化フィールドのみです。既知の形式の認証情報はマスクされますが、先頭と末尾の文字が残る場合があります。自由記述のパスワード、個人情報、宛先識別情報は残る可能性があります。以下の全文を確認し、必要に応じて元の内容を修正してから続行してください。",
   "templates.reviewed": "全文を確認し、個人情報や秘密を含まず、再利用できることを確認しました。",
-  "templates.templateChanged": "作成中にテンプレートが変更されました。ここに表示された従業員は作成済みで、残りは作成されていません。最新のテンプレートを再読み込みして確認してください。"
+  "templates.templateChanged": "作成中にテンプレートが変更されました。ここに表示された従業員は作成済みで、残りは作成されていません。最新のテンプレートを再読み込みして確認してください。",
+  "nav.automations": "自動化",
+  "nav.automations.desc": "自分の予約とリマインダーを管理",
+  "routines.reminders": "リマインダー",
+  "routines.remindersEmpty": "リマインダーはありません",
+  "routines.cancelReminder": "リマインダーをキャンセル",
+  "routines.reminderCancelFailed": "キャンセルできませんでした。再読み込みしてお試しください。",
+  "assign.skill.runnerMultiple": "送信後、選択したすべてのスキルを実行できる AI スタッフが選ばれます。",
+  "assign.skill.error.noCommonRunner": "選択したすべてのスキルを実行できる、依頼可能な AI スタッフがいません。別々に依頼するか、選択を変更してください。"
 }

@@ -10135,5 +10135,13 @@
   "templates.removeMember": "Remove member and reports",
   "templates.reviewWarning": "Only selected structured fields are removed. Known credential formats are masked and may retain leading and trailing characters. Passwords, personal data and recipient identifiers in free text may remain. Review all text below and correct the source before continuing.",
   "templates.reviewed": "I reviewed all text and confirmed it can be reused without private data or secrets.",
-  "templates.templateChanged": "The template changed during creation. The employees listed here were created; the remaining employees were not created. Reload and review the current template."
+  "templates.templateChanged": "The template changed during creation. The employees listed here were created; the remaining employees were not created. Reload and review the current template.",
+  "nav.automations": "Automations",
+  "nav.automations.desc": "Manage your schedules and reminders",
+  "routines.reminders": "Reminders",
+  "routines.remindersEmpty": "No reminders yet",
+  "routines.cancelReminder": "Cancel reminder",
+  "routines.reminderCancelFailed": "Could not cancel the reminder. Refresh and try again.",
+  "assign.skill.runnerMultiple": "After you submit, an AI employee who can run all selected skills will be chosen.",
+  "assign.skill.error.noCommonRunner": "No AI employee you can assign to can run all selected skills. Assign them separately or change your selection."
 }

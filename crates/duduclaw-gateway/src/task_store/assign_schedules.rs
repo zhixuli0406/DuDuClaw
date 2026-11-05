@@ -291,6 +291,20 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// Filter the caller's accessible schedules before limiting, never after.
+    pub(crate) async fn list_bound_assign_schedules(&self, user: &str, agents: &[String]) -> Result<Vec<AssignScheduleRow>, String> {
+        let conn = self.conn.lock().await;
+        let bindings = serde_json::to_string(agents).map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM assign_schedules WHERE status <> 'removed'
+             AND (creator_user_id=?1 OR agent_id IN (SELECT value FROM json_each(?2)))
+             ORDER BY CASE WHEN status IN ({}) THEN 0 ELSE 1 END,created_at DESC LIMIT 500", live_status_list()
+        )).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![user,bindings], row_to_schedule).map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
     /// Active schedules whose next fire is at or before `now`, oldest first
     /// (at most `limit`).
     pub async fn due_assign_schedules(

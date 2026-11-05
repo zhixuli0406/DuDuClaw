@@ -1,3 +1,4 @@
+import { useConnectionStore } from '@/stores/connection-store';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, fireEvent, act, waitFor } from '@testing-library/react';
 import '@/test/mocks';
@@ -17,6 +18,7 @@ import { useBrandStore } from '@/stores/brand-store';
 import { stashChatAttachments } from '@/lib/chat-handoff';
 
 beforeEach(() => {
+  useConnectionStore.setState({ state: 'authenticated' });
   vi.clearAllMocks();
   useBrandStore.getState().setBrand(null);
   useAuthStore.setState({ user: { id: 'admin', display_name: 'Boss', role: 'admin' } as never, bindings: [] });
@@ -37,6 +39,23 @@ beforeEach(() => {
 });
 
 describe('WebChatPage', () => {
+  it('offers recent skills to an employee on a new chat without sending on selection', async () => {
+    useAuthStore.setState({ user: { id: 'employee-a', role: 'employee' } as never });
+    useChatStore.setState({ selectedAgentId: 'sales', resolvedAgent: { id: 'sales', name: 'Sales', icon: '' } });
+    const send = vi.spyOn(useChatStore.getState(), 'send').mockImplementation(() => {});
+    const recent = vi.spyOn(api.skills, 'recent').mockResolvedValue({ skills: [
+      { name: 'quote', display_name: 'Quote', description: 'Prepare a quote' },
+      { name: 'pdf', display_name: 'PDF', description: 'Read a PDF' },
+    ] });
+    renderWithProviders(<WebChatPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Quote Prepare a quote' }));
+    fireEvent.click(screen.getByRole('button', { name: 'PDF Read a PDF' }));
+    expect(screen.getByRole('combobox')).toHaveValue('/quote /pdf ');
+    expect(send).not.toHaveBeenCalled();
+    recent.mockRestore();
+    send.mockRestore();
+  });
+
   it('uses the verified product name for the default partner header and heading', () => {
     useBrandStore.getState().setBrand({ product_name: '晨光智能', logo_light: 'data:image/png;base64,iVBORw0KGgo=' });
     useChatStore.setState({ selectedAgentId: null, agentName: 'DuDuClaw' });

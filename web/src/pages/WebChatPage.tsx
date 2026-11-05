@@ -1,3 +1,4 @@
+import { RecentSkillChips } from '@/components/skills/RecentSkillChips';
 import { ChatWaitingNotice } from '@/components/chat/ChatWaitingNotice';
 import { ReadOnlyHistoryView } from '@/components/chat/ReadOnlyHistoryView';
 import { DataExportButton } from '@/components/DataExportButton';
@@ -632,6 +633,9 @@ function InteractiveWebChatPage() {
                   {assignmentBlocked ? assignmentMessage : intl.formatMessage({ id: 'webchat.welcome', defaultMessage: 'Hi! How can I help you today?' })}
                 </p>
               </div>
+              {!assignmentBlocked && <RecentSkillChips value={input} onChange={setInput}
+                agentId={historyAgentId ?? undefined} disabled={connectionState !== 'connected'}
+                onPick={() => inputRef.current?.focus()} />}
               <div className="flex flex-wrap justify-center gap-2">
                 {!assignmentBlocked && suggestions.map((s) => (
                   <button

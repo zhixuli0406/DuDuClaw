@@ -131,6 +131,133 @@ fn listed_agents(frame: &WsFrame) -> Vec<String> {
 
 // ── live ACL ─────────────────────────────────────────────────────────
 
+fn org_agent_fields(home: &std::path::Path, name: &str, department: &str, parent: &str) {
+    let path = home.join("agents").join(name).join("agent.toml");
+    let content = std::fs::read_to_string(&path).unwrap()
+        .replace("reports_to = \"\"", &format!("reports_to = \"{parent}\"\ndepartment = \"{department}\""));
+    std::fs::write(path, content).unwrap();
+}
+
+#[tokio::test]
+async fn org_chart_unbound_employee_without_department_sees_no_agents() {
+    let f = fixture().await;
+    let emp = person(&f.db, "org-reader", UserRole::Employee);
+    let ctx = handshake_ctx(&emp, UserRole::Employee, &[]);
+    let frame = f.handler.handle("agents.org_chart", json!({ "department": "finance" }), &ctx).await;
+    assert!(listed_agents(&frame).is_empty());
+    assert!(listed_agents(&f.handler.handle("agents.list", json!({}), &ctx).await).is_empty());
+    for method in ["agents.inspect", "agents.status", "agents.pause"] {
+        let denied = f.handler.handle(method, json!({ "agent_id": "finance" }), &ctx).await;
+        assert!(matches!(denied, WsFrame::Response { ok: false, .. }), "{method}: {denied:?}");
+    }
+}
+
+#[tokio::test]
+async fn org_chart_live_department_and_bindings_define_full_rows() {
+    let f = fixture().await;
+    org_agent_fields(f.home.path(), "sales", "sales", "");
+    org_agent_fields(f.home.path(), "hr", "hr", "");
+    let emp = person(&f.db, "org-reader", UserRole::Employee);
+    f.db.set_department(&emp, Some("sales")).unwrap();
+    f.db.bind_agent(&emp, "finance", AccessLevel::Viewer).unwrap();
+    let ctx = handshake_ctx(&emp, UserRole::Employee, &[]);
+    let frame = f.handler.handle("agents.org_chart", json!({}), &ctx).await;
+    assert_eq!(listed_agents(&frame), vec!["finance", "sales"]);
+    for node in ok_payload(&frame)["agents"].as_array().unwrap() {
+        let mut fields: Vec<_> = node.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort();
+        assert_eq!(fields, vec!["department", "display_name", "icon", "name", "reports_to", "role", "status"]);
+    }
+    // Department membership grants structure only, not agent configuration.
+    assert!(matches!(f.handler.handle("agents.inspect", json!({"agent_id": "sales"}), &ctx).await,
+        WsFrame::Response { ok: false, .. }));
+    f.db.set_department(&emp, Some("hr")).unwrap();
+    f.db.unbind_agent(&emp, "finance").unwrap();
+    assert_eq!(listed_agents(&f.handler.handle("agents.org_chart", json!({}), &ctx).await), vec!["hr"]);
+    f.db.set_department(&emp, None).unwrap();
+    assert!(listed_agents(&f.handler.handle("agents.org_chart", json!({}), &ctx).await).is_empty());
+}
+
+#[tokio::test]
+async fn org_chart_ancestors_are_minimal_and_cycles_do_not_leak_siblings() {
+    let f = fixture().await;
+    seed_agent(f.home.path(), "unrelated");
+    org_agent_fields(f.home.path(), "sales", "sales", "finance");
+    org_agent_fields(f.home.path(), "finance", "secret-finance", "hr");
+    org_agent_fields(f.home.path(), "hr", "secret-hr", "finance");
+    org_agent_fields(f.home.path(), "unrelated", "secret-finance", "finance");
+    let emp = person(&f.db, "org-reader", UserRole::Employee);
+    f.db.bind_agent(&emp, "sales", AccessLevel::Viewer).unwrap();
+    let ctx = handshake_ctx(&emp, UserRole::Employee, &[]);
+    let frame = f.handler.handle("agents.org_chart", json!({}), &ctx).await;
+    assert_eq!(listed_agents(&frame), vec!["finance", "hr", "sales"]);
+    let payload = ok_payload(&frame);
+    for node in payload["agents"].as_array().unwrap().iter().filter(|a| a["name"] != "sales") {
+        assert_eq!(node, &json!({"name": node["name"], "role": "specialist"}));
+    }
+    assert!(!payload.to_string().contains("secret-"));
+    f.db.unbind_agent(&emp, "sales").unwrap();
+    assert!(listed_agents(&f.handler.handle("agents.org_chart", json!({}), &ctx).await).is_empty());
+}
+
+#[tokio::test]
+async fn org_chart_admin_sees_all_but_manager_has_no_company_wide_grant() {
+    let f = fixture().await;
+    let admin = handshake_ctx(&person(&f.db, "admin", UserRole::Admin), UserRole::Admin, &[]);
+    let manager_id = person(&f.db, "manager", UserRole::Manager);
+    let manager = handshake_ctx(&manager_id, UserRole::Manager, &[]);
+    let employee = person(&f.db, "report", UserRole::Employee);
+    f.db.set_manager(&employee, Some(&manager_id)).unwrap();
+    f.db.bind_agent(&employee, "finance", AccessLevel::Owner).unwrap();
+    assert_eq!(listed_agents(&f.handler.handle("agents.org_chart", json!({}), &admin).await),
+        vec!["finance", "hr", "sales"]);
+    assert!(listed_agents(&f.handler.handle("agents.org_chart", json!({}), &manager).await).is_empty());
+    f.db.bind_agent(&manager_id, "hr", AccessLevel::Viewer).unwrap();
+    assert_eq!(listed_agents(&f.handler.handle("agents.org_chart", json!({}), &manager).await), vec!["hr"]);
+}
+
+#[tokio::test]
+async fn org_chart_hides_archived_nodes_and_their_parent_references() {
+    let f = fixture().await;
+    let archived = f.home.path().join("agents/finance/agent.toml");
+    let content = std::fs::read_to_string(&archived).unwrap().replace("status = \"active\"", "status = \"archived\"");
+    std::fs::write(archived, content).unwrap();
+    let child = f.home.path().join("agents/sales/agent.toml");
+    let content = std::fs::read_to_string(&child).unwrap().replace("reports_to = \"\"", "reports_to = \"finance\"");
+    std::fs::write(child, content).unwrap();
+    let emp = person(&f.db, "org-reader", UserRole::Employee);
+    let ctx = handshake_ctx(&emp, UserRole::Employee, &[]);
+    f.db.bind_agent(&emp, "sales", AccessLevel::Viewer).unwrap();
+    f.db.bind_agent(&emp, "finance", AccessLevel::Viewer).unwrap();
+    let frame = f.handler.handle("agents.org_chart", json!({ "include_archived": true }), &ctx).await;
+    assert_eq!(listed_agents(&frame), vec!["sales"]);
+    let payload = ok_payload(&frame);
+    let sales = payload["agents"].as_array().unwrap().iter().find(|a| a["name"] == "sales").unwrap();
+    assert_eq!(sales["reports_to"], "");
+}
+
+#[tokio::test]
+async fn org_chart_refuses_suspended_account_on_existing_connection() {
+    let f = fixture().await;
+    let emp = person(&f.db, "org-reader", UserRole::Employee);
+    let ctx = handshake_ctx(&emp, UserRole::Employee, &[]);
+    ok_payload(&f.handler.handle("agents.org_chart", json!({}), &ctx).await);
+    f.db.set_user_status(&emp, duduclaw_auth::UserStatus::Suspended).unwrap();
+    assert_eq!(error_of(&f.handler.handle("agents.org_chart", json!({}), &ctx).await),
+        json!("account is suspended or offboarded"));
+}
+
+#[tokio::test]
+async fn org_chart_unreadable_registry_refuses_stale_structure() {
+    let f = fixture().await;
+    let emp = person(&f.db, "org-reader", UserRole::Employee);
+    let ctx = handshake_ctx(&emp, UserRole::Employee, &[]);
+    ok_payload(&f.handler.handle("agents.org_chart", json!({}), &ctx).await);
+    std::fs::rename(f.home.path().join("agents"), f.home.path().join("unavailable-agents")).unwrap();
+    let frame = f.handler.handle("agents.org_chart", json!({}), &ctx).await;
+    assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{frame:?}");
+}
+
 #[tokio::test]
 async fn unbinding_reaches_an_open_connection_on_the_next_rpc() {
     let f = fixture().await;

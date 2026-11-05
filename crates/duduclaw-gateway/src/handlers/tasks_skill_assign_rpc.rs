@@ -178,6 +178,19 @@ impl MethodHandler {
                 &format!("note_too_long: at most {MAX_NOTE_CHARS} characters"),
             );
         }
+        let mut requested = vec![skill_name.to_string()];
+        if let Some(extra) = params.get("skill_names") {
+            let Some(extra) = extra.as_array().filter(|a| a.len() <= 5) else {
+                return WsFrame::error_response("", "skill_names must contain at most five names");
+            };
+            for name in extra {
+                let Some(name) = name.as_str().filter(|n| duduclaw_agent::skill_state::validate_skill_name(n).is_ok()) else {
+                    return WsFrame::error_response("", "valid skill_names are required");
+                };
+                if !requested.iter().any(|n| n == name) { requested.push(name.to_string()); }
+            }
+            if requested.len() > 5 { return WsFrame::error_response("", "at most five skills may be assigned together"); }
+        }
         let fresh =
             match crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx) {
                 Ok(f) => f,
@@ -206,14 +219,29 @@ impl MethodHandler {
             }
             holdings = eligible;
         }
+        if !holdings.iter().any(|h| fresh.can_assign_to(&h.agent_id)) {
+            return WsFrame::error_response("", "permission denied");
+        }
+        holdings.retain(|h| fresh.can_assign_to(&h.agent_id));
+        // Multiple chips must all be executable by the same authorized runner.
+        // Inline every selected skill: goal rounds do not always load skills.
+        for name in requested.iter().skip(1) {
+            let (extras, _) = self.skill_holdings(&fresh, name).await;
+            holdings.retain_mut(|h| {
+                let Some(extra) = extras.iter().find(|e| e.agent_id == h.agent_id && e.enabled && !e.security_failed) else { return false; };
+                h.content.push_str(&format!("\n\n## /{name}\n{}", extra.content));
+                true
+            });
+        }
         let Some(runner) = pick_skill_runner(&holdings).cloned() else {
             return WsFrame::error_response(
                 "",
-                "skill_not_enabled: no AI employee has this skill switched on",
+                if requested.len() > 1 { "skills_no_common_runner: no authorized AI employee can run all selected skills" }
+                else { "skill_not_enabled: no AI employee has this skill switched on" },
             );
         };
         // The same right `tasks.goal_create` asks for, on the runner.
-        if !ctx.can_assign_to(&runner.agent_id) {
+        if !fresh.can_assign_to(&runner.agent_id) {
             return WsFrame::error_response("", "permission denied");
         }
         // Files are decoded only once the caller may assign to the runner,
@@ -294,6 +322,9 @@ impl MethodHandler {
                     return WsFrame::error_response("", &e);
                 }
             };
+        if let Err(error) = crate::recent_skills::record(&self.home_dir, &fresh.user_id, &runner.agent_id, &requested) {
+            warn!(%error, "recent skill history could not be saved");
+        }
         // A skill handed over from the 一般 tab counts as a use: the tab
         // orders skills by `last_used_at`, which only `skill_activate` rows
         // feed. A distinct trigger keeps these apart from the evolution

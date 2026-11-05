@@ -251,11 +251,20 @@ pub async fn manage(
     action: ManageAction,
     now: DateTime<Utc>,
 ) -> Result<AssignScheduleRow, ManageError> {
+    manage_with_binding(home, store, actor, id, action, now, None).await
+}
+
+/// The dashboard can additionally authorize one immutable agent binding.
+/// It passes the agent id it checked; re-reading the row cannot widen that grant.
+pub(crate) async fn manage_with_binding(
+    home: &Path, store: &TaskStore, actor: &Creator, id: &str,
+    action: ManageAction, now: DateTime<Utc>, bound_agent: Option<&str>,
+) -> Result<AssignScheduleRow, ManageError> {
     let row = store
         .get_assign_schedule(id)
         .await
         .map_err(ManageError::Store)?
-        .filter(|r| r.status != "removed" && may_manage(actor, r))
+        .filter(|r| r.status != "removed" && (may_manage(actor, r) || bound_agent == Some(r.agent_id.as_str())))
         .ok_or(ManageError::NotFound)?;
     let changed = match action {
         ManageAction::Pause => store.pause_assign_schedule(id, "by_user", now).await,

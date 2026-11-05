@@ -1,5 +1,6 @@
 import { useCompanyStore } from '@/stores/company-store';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { useLocation } from 'react-router';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
@@ -42,6 +43,7 @@ beforeEach(() => {
   localStorage.clear();
   useBrandStore.setState({ brand: null });
   useCompanyStore.getState().setCompany(null);
+  vi.spyOn(api.about, 'get').mockResolvedValue({} as never);
   useAuthStore.setState({
     user: { display_name: 'Boss', role: 'admin' } as never,
     bindings: [],
@@ -346,7 +348,7 @@ describe('employee sidebar', () => {
     expect(screen.getByRole('link', { name: /Inbox/i })).toHaveAttribute('href', '/inbox');
     expect(screen.queryByRole('button', { name: /Workspace/i })).not.toBeInTheDocument();
     expect(screen.getByText('Sales')).toBeInTheDocument();
-    expect(screen.getAllByRole('link').slice(0, 5).map(link => link.getAttribute('href'))).toEqual(['/', '/inbox', '/skills', '/memory', '/world']);
+    expect(screen.getAllByRole('link').slice(0, 7).map(link => link.getAttribute('href'))).toEqual(['/', '/inbox', '/routines', '/skills', '/memory', '/world', '/org']);
     expect(precedes(screen.getByRole('button', { name: /Command palette/i }), screen.getByRole('button', { name: /New chat/i }))).toBe(true);
     expect(screen.queryByRole('link', { name: /Task Board/i })).not.toBeInTheDocument();
     await waitFor(() => expect(api.personalGoogle.status).toHaveBeenCalledTimes(1));
@@ -362,7 +364,8 @@ describe('employee sidebar', () => {
     for (const name of ['My connections', 'Settings', 'Appearance', 'Get help']) {
       expect(screen.getByRole('menuitem', { name: new RegExp(name, 'i') })).toBeInTheDocument();
     }
-    expect(screen.getByText('Switch language')).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: 'Switch language' })).toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: '日本語' })).not.toBeInTheDocument();
     expect(screen.getByRole('menuitem', { name: /Sign Out/i })).toBeInTheDocument();
     await waitFor(() => expect(api.personalGoogle.status).toHaveBeenCalledTimes(2));
     expect(screen.queryByRole('img', { name: 'Connection needed' })).not.toBeInTheDocument();
@@ -445,7 +448,7 @@ describe('employee sidebar', () => {
 });
 
 
-it('shows the connection dot and hides help for an active distributor brand', async () => {
+it('shows help even when a distributor brand has no support notice', async () => {
   useAuthStore.setState({ user: { display_name: 'Alice', role: 'employee' } as never });
   useBrandStore.setState({ brand: { product_name: 'Partner', logo_light: '' } });
   vi.spyOn(api.personalGoogle, 'status').mockResolvedValue({
@@ -455,7 +458,7 @@ it('shows the connection dot and hides help for an active distributor brand', as
   renderSidebar();
   await user.click(screen.getByRole('button', { name: 'Alice' }));
   expect(await screen.findByRole('img', { name: 'Connection needed' })).toBeInTheDocument();
-  expect(screen.queryByRole('menuitem', { name: 'Get help' })).not.toBeInTheDocument();
+  expect(screen.getByRole('menuitem', { name: 'Get help' })).toBeInTheDocument();
 });
 
 
@@ -468,4 +471,33 @@ describe('single desktop new-conversation entry', () => {
     expect(screen.queryByRole('link', { name: 'New chat' })).not.toBeInTheDocument();
     expect(container.querySelector('a[href="/tasks"], a[href="/goals"], a[href="/assign"]')).toBeNull();
   });
+});
+
+function MenuLocation() {
+  const location = useLocation();
+  return <output data-testid="menu-location">{location.pathname}{location.hash}</output>;
+}
+
+it('opens the distributor support entry when the server provides a notice', async () => {
+  useAuthStore.setState({ user: { id: 'employee', display_name: 'Alice', role: 'employee' } as never });
+  vi.spyOn(api.personalGoogle, 'status').mockRejectedValue(new Error('offline'));
+  vi.spyOn(api.about, 'get').mockResolvedValue({ distributor_notice: '<p>Support</p>' } as never);
+  const user = userEvent.setup();
+  renderWithProviders(<SidebarProvider><AppSidebar /><MenuLocation /></SidebarProvider>);
+  await waitFor(() => expect(api.about.get).toHaveBeenCalled());
+  await user.click(screen.getByRole('button', { name: 'Alice' }));
+  await user.click(screen.getByRole('menuitem', { name: 'Get help' }));
+  expect(screen.getByTestId('menu-location')).toHaveTextContent('/about#distributor-support');
+});
+
+it('opens language settings from the employee menu and keeps the version out of the rail', async () => {
+  useAuthStore.setState({ user: { id: 'employee', display_name: 'Alice', role: 'employee' } as never });
+  useSystemStore.setState({ status: { edition_profile: 'enterprise', version: '1.80.0' } as never });
+  vi.spyOn(api.personalGoogle, 'status').mockRejectedValue(new Error('offline'));
+  const user = userEvent.setup();
+  renderWithProviders(<SidebarProvider><AppSidebar /><MenuLocation /></SidebarProvider>);
+  expect(screen.queryByText('v1.80.0')).not.toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Alice' }));
+  await user.click(screen.getByRole('menuitem', { name: 'Switch language' }));
+  expect(screen.getByTestId('menu-location')).toHaveTextContent('/me/account#language');
 });

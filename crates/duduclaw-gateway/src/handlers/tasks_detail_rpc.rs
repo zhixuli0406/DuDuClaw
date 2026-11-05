@@ -512,6 +512,8 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
         };
+        crate::recent_skills::record_chat(&self.home_dir, &self.registry,
+            &ctx.user_id, agent_id, params.get("description").and_then(Value::as_str).unwrap_or("")).await;
         let task = created.task;
         let plan_first = created.plan_first;
         let cap = crate::goal_loop::GoalLoopConfig::from_home(&self.home_dir).iteration_cap;

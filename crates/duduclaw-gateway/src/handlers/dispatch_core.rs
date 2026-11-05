@@ -53,6 +53,12 @@ impl MethodHandler {
 
             // ── Agent methods (filtered by binding) ──────────
             "agents.list" => boxed_frame(|| self.handle_agents_list_filtered(ctx, params)).await,
+            "agents.org_chart" => {
+                if let Err(e) = acl::require_role(ctx, UserRole::Employee) {
+                    return WsFrame::error_response("", &e);
+                }
+                boxed_frame(|| self.handle_agents_org_chart(ctx)).await
+            }
             // The WebChat `@` list / staff picker: what the caller may call,
             // including a Manager's team (`agents_callable_rpc.rs`). Any
             // signed-in account, both editions.

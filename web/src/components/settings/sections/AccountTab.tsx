@@ -1,4 +1,5 @@
 import { SignedInDevices } from '@/components/mfa/SignedInDevices';
+import { useLocaleStore, localeNames } from '@/i18n';
 import { AccountMfa } from '@/components/mfa/AccountMfa';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -43,6 +44,8 @@ export function AccountTab() {
   const mustChangePassword = useConnectionStore((s) => s.mustChangePassword);
   const connectWithAuth = useConnectionStore((s) => s.connectWithAuth);
   const disconnectWs = useConnectionStore((s) => s.disconnect);
+  const locale = useLocaleStore(s => s.locale);
+  const setLocale = useLocaleStore(s => s.setLocale);
   const location = useLocation();
   const navigate = useNavigate();
   const [current, setCurrent] = useState('');
@@ -142,6 +145,15 @@ export function AccountTab() {
 
   return (
     <div className="space-y-8">
+      <div id="language" className="scroll-mt-6">
+        <label htmlFor="account-language" className="mb-2 block text-sm font-medium">
+          {intl.formatMessage({ id: 'header.language' })}
+        </label>
+        <select id="account-language" value={locale} onChange={event => setLocale(event.target.value)}
+          className="rounded-lg border border-input bg-background px-3 py-2 text-sm">
+          {Object.entries(localeNames).map(([code, name]) => <option key={code} value={code}>{name}</option>)}
+        </select>
+      </div>
       <AccountMfa />
       <SignedInDevices />
       {mustChangePassword && (

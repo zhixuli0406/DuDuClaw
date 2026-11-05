@@ -110,6 +110,59 @@ fn entry<'a>(skills: &'a [Value], name: &str) -> &'a Value {
 }
 
 #[tokio::test]
+async fn recent_skills_filter_other_users_disabled_skills_and_live_bindings() {
+    let f = fixture().await;
+    crate::recent_skills::record(&f.home, &f.owner_a.user_id, "a1", &["tone".into(), "pdf".into()]).unwrap();
+    assert_eq!(ok(&f.call("skills.recent", json!({ "user_id": f.owner_a.user_id }), &f.viewer_a).await)["skills"], json!([]));
+    let p = ok(&f.call("skills.recent", json!({ "agent_id": "a1", "assigning": true }), &f.owner_a).await);
+    assert_eq!(p["skills"][0]["name"], "tone");
+    assert_eq!(p["skills"][1]["name"], "pdf");
+    assert!(p["skills"][0].get("content").is_none());
+    duduclaw_agent::skill_state::set_disabled(&f.home, "a1", &["tone".into()], true).unwrap();
+    let p = ok(&f.call("skills.recent", json!({ "agent_id": "a1" }), &f.owner_a).await);
+    assert_eq!(p["skills"].as_array().unwrap().len(), 1);
+    assert_eq!(p["skills"][0]["name"], "pdf");
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap()
+        .execute("DELETE FROM user_agent_bindings WHERE user_id=?1", [&f.owner_a.user_id]).unwrap();
+    assert_eq!(ok(&f.call("skills.recent", json!({}), &f.owner_a).await)["skills"], json!([]));
+    assert_eq!(err(&f.call("skills.recent", json!({ "agent_id": "a1" }), &f.owner_a).await), "permission denied");
+}
+
+#[tokio::test]
+async fn recent_skills_viewer_can_reuse_in_chat_but_not_assign() {
+    let f = fixture().await;
+    crate::recent_skills::record(&f.home, &f.viewer_a.user_id, "a1", &["tone".into()]).unwrap();
+    let p = ok(&f.call("skills.recent", json!({ "agent_id": "a1" }), &f.viewer_a).await);
+    assert_eq!(p["skills"][0]["name"], "tone");
+    assert_eq!(ok(&f.call("skills.recent", json!({ "assigning": true }), &f.viewer_a).await)["skills"], json!([]));
+}
+
+#[tokio::test]
+async fn recent_skills_returns_at_most_five_accessible_names() {
+    let f = fixture().await;
+    let mut names = Vec::new();
+    for n in 0..7 {
+        let name = format!("recent-{n}");
+        std::fs::write(f.home.join(format!("skills/{name}.md")), format!("---\nname: {name}\ndescription: short description\n---\nWork." )).unwrap();
+        names.push(name);
+    }
+    crate::recent_skills::record(&f.home, &f.owner_a.user_id, "a1", &names).unwrap();
+    let p = ok(&f.call("skills.recent", json!({}), &f.owner_a).await);
+    assert_eq!(p["skills"].as_array().unwrap().len(), 5);
+    assert_eq!(p["skills"][0]["name"], "recent-0");
+    assert_eq!(p["skills"][4]["name"], "recent-4");
+}
+
+#[tokio::test]
+async fn recent_skills_chat_records_only_loaded_enabled_skill_tokens() {
+    let f = fixture().await;
+    duduclaw_agent::skill_state::set_disabled(&f.home, "a1", &["pdf".into()], true).unwrap();
+    crate::recent_skills::record_chat(&f.home, &f.h.registry, &f.owner_a.user_id, "a1",
+        "/tone /pdf /not-installed extra details").await;
+    assert_eq!(crate::recent_skills::list(&f.home, &f.owner_a.user_id).unwrap(), vec![("a1".into(), "tone".into())]);
+}
+
+#[tokio::test]
 async fn switching_off_narrows_one_employee_only() {
     let f = fixture().await;
     assert!(f.loaded("a1").await.contains(&"pdf".to_string()));

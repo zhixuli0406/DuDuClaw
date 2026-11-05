@@ -679,3 +679,29 @@ Gateway 分別保存基本服務、會議錄影與員工 Drive 工具的本機�
 `user.google_connect` 稽核記錄授權用途、回傳範圍集合的雜湊摘要及非預期範圍；Drive／Meet 清單讀取與早期拒絕也會記錄。這些事件不保存權杖與檔案內容，匯入識別碼使用雜湊。
 
 已匯入副本及完成的逐字稿與 Google 連線分開，不會因斷線自動撤回。Google 端撤銷透過 API 拒絕或更新後的權限資訊偵測，不是即時推播。這是產品入口授權，不是對與 gateway 同 OS 使用者、且不受限制的程序提供隔離。真實 OAuth／Picker 與供應商處理仍須另行驗收。詳見[會議逐字稿](73-meeting-transcripts.md)及[個人連線設定](../../guides/zh-TW/google-personal-connections.md)。
+## 一般同仁自動化與最近技能權限（v1.80.0）
+
+Dashboard RPC 最低角色由 `handlers/dashboard_scope.rs` 在 extension 分派之前執行，與 MCP scope 表分開。本輪方法逐一登記；未登記的 `cron.*`、`reminders.*`、`assign_schedules.*`、`agents.org_chart.*`、`skills.recent.*` 預設需要 Admin，其餘既有命名空間仍走原分派權限。逐筆處理器保留 Viewer／Operator 與建立者檢查。每次請求重新讀取帳號狀態及直接綁定；無法確認授權時拒絕。
+
+| Dashboard RPC | 範圍 |
+| --- | --- |
+| `agents.org_chart` | Admin 看全部可列示員工；其餘只看直接 Viewer 以上綁定與 users.db 中本人目前部門的員工。範圍外 reports_to 上級僅含 name、role；隱藏員工仍隱藏，不含聯絡或能力設定，不增加操作權限。 |
+| `skills.recent` | 目前登入帳號自己的最多五個不重複技能；須仍可呼叫、已啟用並通過既有技能檢查，不接受客戶端指定其他使用者。 |
+| `cron.list` | Admin 保留完整列表；其他帳號僅本人建立或直接 Viewer 以上綁定 AI 員工的紀錄。 |
+| `cron.add`、`cron.update`、`cron.resume`、`cron.run_now` | 非 Admin 僅時間型提示排程，須直接 Operator 以上綁定目標；仍檢查主代理、機器員工與執行身分。 |
+| `cron.pause`、`cron.remove` | 建立者或直接 Operator；綁定工作流程的紀錄仍受保護。 |
+| `cron.templates` | 已登入帳號可讀取內建範本。 |
+| `reminders.list`、`reminders.cancel` | 本人提醒或直接綁定目標：Viewer 查看、Operator 取消。不開放客戶端自訂通知路由或建立提醒。 |
+| `assign_schedules.list`（`scope: accessible`）、`assign_schedules.pause`、`assign_schedules.resume`、`assign_schedules.remove` | 建立者或直接綁定目標（讀取需 Viewer，修改需 Operator）；恢復時也重新檢查原建立者。 |
+
+最近技能只保存帳號、目標 AI 員工與技能名稱，每帳號最多保留一百筆，不保存訊息或技能內容。紀錄在送出受理後產生，點標籤不會紀錄，也不代表執行成功。組織圖的結構可見性不會放寬對話與設定存取。員工自動化編輯不開放 shell 指令、條件腳本、任意通知目的地或工作流程管理。舊紀錄若沒有可驗證的建立者，只透過既有綁定授權。
+
+Cron admission 是所有帶 `on_behalf_of`、`created_by_user_id` 或 `scoped_by_user_id` 紀錄的共用 store 限制，包含 MCP 新增、更新與恢復。檢查和寫入在同一個 `BEGIN IMMEDIATE` 交易內：每個歸屬人最多 20 筆啟用排程，每位 AI 員工最多 50 筆（包含既有 Admin 排程），Dashboard 與 MCP 紀錄合併計數。每人滾動一小時最多建立或新接管 20 筆，receipt 不受刪除排程或重啟影響；一般修改不再消耗建立次數。單純暫停與刪除仍可執行。沒有來源標記的 Admin 排程維持原行為；MCP 帶人類來源時，即使該帳號是 Admin 仍受限制。最低間隔 15 分鐘，以一天內所有時點及跨午夜間距驗證，保守視選定日期為連續日。Scheduler 載入與執行前重讀都會跳過不合規紀錄，日誌只記錄數量。
+
+員工 `cron.run_now` 在 spawn 前檢查：滑動 10 分鐘內每筆排程最多 3 次、每人最多 10 次受理；每人最多 2 件、全域最多 4 件未完成工作。Semaphore 無可用席位就回覆忙碌，不建立排隊 task。拒絕不消耗次數；已受理但後續失敗仍計次，完成、取消與 panic 都會釋放 outstanding。Admission 資料有容量上限，保存在程序記憶體，gateway 重啟會重置；鎖不可用時拒絕執行。員工 cron 表達式在正規化與解析前限制 256 bytes，store／runtime 驗證也適用。
+
+非 Admin 新增／更新會對完整結果 name＋task 模型提示呼叫 `scan_input_with_audit`，使用對話相同門檻；命中時不寫排程，並寫入 `security_audit.jsonl`。恢復／手動執行也掃描舊 task，不允許更換 agent_id。H2 採限制主機執行對象：員工只能對存在且 `[container] sandbox_enabled = false` 的代理新增、編輯、恢復或手動執行；registry 與磁碟上的有效型別設定都須允許，無法讀取設定則拒絕。執行時依保存的 `created_by_user_id`／`scoped_by_user_id` 及手動呼叫人重新檢查，呼叫 runtime 前再次檢查；目標啟用任務沙箱或不可用時暫停排程並記錄 skipped。既有 host runner 保留代理的 runtime、capabilities 與 native sandbox 設定，本次未實作容器化 cron；未帶員工標記的既有 Admin 排程仍在 host 執行。與一般 runtime 設定載入相同，設定讀取並非涵蓋程序啟動的原子鎖。
+
+員工 cron 僅支援 UTC（含零時差 UTC／GMT 別名）。舊紀錄若指定其他時區，編輯、恢復與手動執行會拒絕，避免日光節約時間縮短實際間隔；仍可讀取，有權限者仍可暫停／刪除，時區排程由 Admin 管理。
+
+帶人類來源的 MCP 新增排程預設 UTC；未帶來源標記的 Admin／背景排程保留本地時區偵測。

@@ -481,3 +481,135 @@ async fn cron_update_stamps_host_origin_and_background_edits_do_not_erase_it() {
     assert_ne!(result["isError"], true, "{result}");
     assert_eq!(store.get(&row.id).await.unwrap().unwrap().on_behalf_of.as_deref(), Some(principal.as_str()));
 }
+
+#[tokio::test]
+async fn mcp_cron_caps_expression_bytes_before_parsing_add_and_update() {
+    let _lock = OBO_LOCK.lock().await;
+    let tmp = home_with_queue();
+    let home = tmp.path();
+    let store = duduclaw_gateway::cron_store::CronStore::open(home).unwrap();
+    let row = duduclaw_gateway::cron_store::CronTaskRow::new("byte-cap".into(), "Cap".into(),
+        "worker".into(), "0 9 * * *".into(), "report".into());
+    store.insert(&row).await.unwrap();
+    let limit = duduclaw_gateway::cron_store::MAX_CRON_BYTES;
+    // Invalid at the boundary reaches the parser; over-limit input must not.
+    for (expression, message) in [("x".repeat(limit), "invalid cron expression"),
+        ("x".repeat(limit + 1), "exceeds 256 bytes"),
+        ("é".repeat(limit / 2 + 1), "exceeds 256 bytes")] {
+        let added = handle_schedule_task(&serde_json::json!({
+            "agent_id":"worker", "cron":expression, "task":"report"
+        }), home, "worker").await;
+        let updated = handle_update_cron_task(&serde_json::json!({
+            "id":row.id, "cron":expression
+        }), home, RecordActor::Agent("worker")).await;
+        for result in [added, updated] {
+            assert_eq!(result["isError"], true, "{result}");
+            assert!(result["content"][0]["text"].as_str().unwrap().contains(message), "{result}");
+        }
+        assert_eq!(store.list_all().await.unwrap().len(), 1);
+        assert_eq!(store.get(&row.id).await.unwrap().unwrap().cron, row.cron);
+    }
+}
+
+#[tokio::test]
+async fn mcp_cron_shared_admission_rejects_fast_insert_update_and_resume() {
+    let _lock = OBO_LOCK.lock().await;
+    let tmp = home_with_queue();
+    let home = tmp.path();
+    let principal = account_principal(home, "cron-owner", duduclaw_auth::UserRole::Employee);
+    let store = duduclaw_gateway::cron_store::CronStore::open(home).unwrap();
+    {
+        let _host = HostPrincipal::set(&principal);
+        let bad = handle_schedule_task(&serde_json::json!({
+            "agent_id":"worker", "cron":"* * * * *", "task":"report"
+        }), home, "worker").await;
+        assert_eq!(bad["isError"], true, "{bad}");
+        assert!(store.list_all().await.unwrap().is_empty());
+        let good = handle_schedule_task(&serde_json::json!({
+            "agent_id":"worker", "cron":"*/15 * * * *", "task":"report"
+        }), home, "worker").await;
+        assert_ne!(good["isError"], true, "{good}");
+    }
+    let row = store.list_all().await.unwrap().remove(0);
+    assert_eq!(row.cron_timezone.as_deref(), Some("UTC"));
+    assert_eq!(row.on_behalf_of.as_deref(), Some(principal.as_str()));
+    // An autonomous MCP edit still inherits the persisted human-origin limits.
+    let bad = handle_update_cron_task(&serde_json::json!({"id":row.id, "cron":"* * * * *", "task":"changed"}),
+        home, RecordActor::Agent("worker")).await;
+    assert_eq!(bad["isError"], true, "{bad}");
+    assert_eq!(store.get(&row.id).await.unwrap().unwrap().task, "report");
+    let good = handle_update_cron_task(&serde_json::json!({"id":row.id, "cron":"*/30 * * * *"}),
+        home, RecordActor::Agent("worker")).await;
+    assert_ne!(good["isError"], true, "{good}");
+    // Simulate a legacy pre-fix row. Pause works; MCP resume cannot re-arm it.
+    rusqlite::Connection::open(home.join("cron_tasks.db")).unwrap()
+        .execute("UPDATE cron_tasks SET cron='* * * * *' WHERE id=?1", [&row.id]).unwrap();
+    let paused = handle_pause_cron_task(&serde_json::json!({"id":row.id, "enabled":false}),
+        home, RecordActor::Agent("worker")).await;
+    assert_ne!(paused["isError"], true, "{paused}");
+    let resumed = handle_pause_cron_task(&serde_json::json!({"id":row.id, "enabled":true}),
+        home, RecordActor::Agent("worker")).await;
+    assert_eq!(resumed["isError"], true, "{resumed}");
+    assert!(!store.get(&row.id).await.unwrap().unwrap().enabled);
+}
+
+#[tokio::test]
+async fn mcp_cron_shared_admission_caps_creation_and_keeps_receipts_after_deletion() {
+    let _lock = OBO_LOCK.lock().await;
+    let tmp = home_with_queue();
+    let home = tmp.path();
+    let principal = account_principal(home, "cron-owner", duduclaw_auth::UserRole::Employee);
+    let _host = HostPrincipal::set(&principal);
+    let args = serde_json::json!({"agent_id":"worker", "cron":"0 9 * * *", "task":"report"});
+    for _ in 0..20 {
+        let result = handle_schedule_task(&args, home, "worker").await;
+        assert_ne!(result["isError"], true, "{result}");
+    }
+    let refused = handle_schedule_task(&args, home, "worker").await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(refused.to_string().contains("for user"));
+    let store = duduclaw_gateway::cron_store::CronStore::open(home).unwrap();
+    assert_eq!(store.list_all().await.unwrap().len(), 20);
+    for row in store.list_all().await.unwrap() {
+        let result = handle_delete_cron_task(&serde_json::json!({"id":row.id}), home, RecordActor::Agent("worker")).await;
+        assert_ne!(result["isError"], true, "{result}");
+    }
+    // Each MCP call opens a fresh connection; receipts outlive rows/connections.
+    let refused = handle_schedule_task(&args, home, "worker").await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(refused.to_string().contains("per hour"));
+    assert!(store.list_all().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn mcp_cron_shared_admission_checks_update_and_resume_adoption_at_caps() {
+    let _lock = OBO_LOCK.lock().await;
+    let tmp = home_with_queue();
+    let home = tmp.path();
+    let principal = account_principal(home, "cron-owner", duduclaw_auth::UserRole::Employee);
+    let store = duduclaw_gateway::cron_store::CronStore::open(home).unwrap();
+    for i in 0..20 {
+        let mut row = duduclaw_gateway::cron_store::CronTaskRow::new(format!("seed{i}"), "seed".into(),
+            "worker".into(), "0 9 * * *".into(), "report".into());
+        // Dashboard-marked records count against the same MCP user cap.
+        row.created_by_user_id = principal.strip_prefix("user:").map(str::to_owned);
+        store.insert(&row).await.unwrap();
+    }
+    let mut legacy = duduclaw_gateway::cron_store::CronTaskRow::new("adopt".into(), "adopt".into(),
+        "worker".into(), "0 9 * * *".into(), "original".into());
+    legacy.enabled = false;
+    store.insert(&legacy).await.unwrap();
+    let _host = HostPrincipal::set(&principal);
+    let resumed = handle_pause_cron_task(&serde_json::json!({"id":"adopt", "enabled":true}),
+        home, RecordActor::Agent("worker")).await;
+    assert_eq!(resumed["isError"], true, "{resumed}");
+    assert!(resumed.to_string().contains("for user"));
+    let updated = handle_update_cron_task(&serde_json::json!({"id":"adopt", "task":"changed"}),
+        home, RecordActor::Agent("worker")).await;
+    assert_eq!(updated["isError"], true, "{updated}");
+    assert!(updated.to_string().contains("per hour"));
+    let saved = store.get("adopt").await.unwrap().unwrap();
+    assert!(saved.on_behalf_of.is_none());
+    assert_eq!(saved.task, "original");
+    assert!(!saved.enabled);
+}

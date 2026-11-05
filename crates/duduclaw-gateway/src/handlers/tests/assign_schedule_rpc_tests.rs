@@ -194,3 +194,27 @@ async fn schedules_are_listed_and_controlled_by_their_creator_or_an_admin() {
     );
     assert!(after["schedules"].as_array().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn accessible_schedules_filter_bindings_and_enforce_viewer_read_only() {
+    let f = fixture().await;
+    let creator = jwt_ctx(&f.mgr, UserRole::Manager);
+    let created = ok_payload(&f.handler.handle("tasks.goal_create", weekly("sales"), &creator).await);
+    let id = created["schedule"]["id"].as_str().unwrap();
+    f.db.bind_agent(&f.emp2, "sales", AccessLevel::Viewer).unwrap();
+    let viewer = jwt_ctx(&f.emp2, UserRole::Employee);
+    let listed = ok_payload(&f.handler.handle("assign_schedules.list", json!({"scope":"accessible"}), &viewer).await);
+    assert_eq!(listed["schedules"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["schedules"][0]["can_manage"], false);
+    assert!(listed["schedules"][0]["creator_user_id"].is_null());
+    for method in ["assign_schedules.pause", "assign_schedules.resume", "assign_schedules.remove"] {
+        err_text(&f.handler.handle(method, json!({"id":id}), &viewer).await);
+    }
+    let stranger = jwt_ctx(&f.other, UserRole::Employee);
+    let hidden = ok_payload(&f.handler.handle("assign_schedules.list", json!({"scope":"accessible"}), &stranger).await);
+    assert_eq!(hidden["schedules"].as_array().unwrap().len(), 0);
+    let operator = jwt_ctx(&f.emp1, UserRole::Employee);
+    ok_payload(&f.handler.handle("assign_schedules.pause", json!({"id":id}), &operator).await);
+    ok_payload(&f.handler.handle("assign_schedules.resume", json!({"id":id}), &operator).await);
+    ok_payload(&f.handler.handle("assign_schedules.remove", json!({"id":id}), &operator).await);
+}

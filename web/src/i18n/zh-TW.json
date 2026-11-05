@@ -10135,5 +10135,13 @@
   "templates.removeMember": "移除成員與下屬",
   "templates.reviewWarning": "系統只移除指定的結構欄位，並遮罩已知格式的憑證，部分前後字元仍會保留。自由文字中的密碼、個資與收件者識別資料可能仍存在。請審閱以下全文，有問題時先修正來源再繼續。",
   "templates.reviewed": "我已審閱全部內容，確認可重複使用，且不含私人資料或秘密。",
-  "templates.templateChanged": "範本在建立途中變更。下列員工已建立，其餘員工尚未建立。請重新載入並審閱目前的範本。"
+  "templates.templateChanged": "範本在建立途中變更。下列員工已建立，其餘員工尚未建立。請重新載入並審閱目前的範本。",
+  "nav.automations": "自動化",
+  "nav.automations.desc": "管理自己的排程與提醒",
+  "routines.reminders": "提醒",
+  "routines.remindersEmpty": "目前沒有提醒",
+  "routines.cancelReminder": "取消提醒",
+  "routines.reminderCancelFailed": "無法取消提醒，請重新整理後再試。",
+  "assign.skill.runnerMultiple": "送出後，系統會選擇能執行全部所選技能的 AI 員工。",
+  "assign.skill.error.noCommonRunner": "目前沒有你可交辦的 AI 員工能執行全部所選技能，請分開交辦或調整選擇。"
 }

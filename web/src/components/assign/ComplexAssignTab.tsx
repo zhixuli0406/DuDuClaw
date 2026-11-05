@@ -1,3 +1,4 @@
+import { RecentSkillChips } from '@/components/skills/RecentSkillChips';
 import { useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -257,6 +258,8 @@ export function ComplexAssignTab({
 
         {/* 目標 — free text first, everything else optional. */}
         <section className="space-y-2">
+          <RecentSkillChips value={description} onChange={setDescription} agentId={agentId || undefined}
+            assigning={mode !== 'ask'} disabled={submitting} />
           <PromptBar
             id="assign-goal"
             value={description}

@@ -135,6 +135,10 @@ export interface CallableAgent {
   selectable: boolean;
 }
 
+/** Structural directory data only; listing a node grants no agent access. */
+export type OrgChartAgent = Pick<AgentInfo, 'name' | 'role'> & Partial<Pick<AgentInfo,
+  'display_name' | 'status' | 'icon' | 'reports_to' | 'department'>>;
+
 export interface AgentDetail extends AgentInfo {
   budget: AgentBudget;
   model: AgentModel;
@@ -630,6 +634,13 @@ export interface SkillScanPath {
   count: number;
 }
 
+/** One skill in the current account's recent submitted skills. */
+export interface RecentSkill {
+  name: string;
+  display_name: string;
+  description: string;
+}
+
 /** Aggregate (`skills.list` with no `agent_id`) — every layer, every staffer. */
 export interface SkillsListAll {
   global_skills: SkillInfo[];
@@ -998,6 +1009,7 @@ export type AssignScheduleSpec =
 
 /** One scheduled assignment. Every fire re-checks the creator's right. */
 export interface AssignScheduleInfo {
+  can_manage?: boolean;
   id: string;
   agent_id: string;
   kind: 'task' | 'goal';
@@ -6329,6 +6341,7 @@ export const api = {
       }) as Promise<ChatSessionHistory>,
   },
   agents: {
+    orgChart: () => client.call('agents.org_chart', {}) as Promise<{ agents: OrgChartAgent[] }>,
     exportProfile: (agentId: string, format: AgentProfileFormat, includeUser = false) =>
       client.call('agents.export_profile', { agent_id: agentId, format, include_user: includeUser }) as Promise<AgentProfileExport>,
     /** WP4 — pass `include_archived: true` to also list archived AI staff
@@ -7195,6 +7208,8 @@ export const api = {
       client.call('shared_wiki.stats') as Promise<SharedWikiStats>,
   },
   skills: {
+    recent: (agentId?: string, assigning = false) =>
+      client.call('skills.recent', { agent_id: agentId, assigning }) as Promise<{ skills: RecentSkill[] }>,
     list: (agentId: string) =>
       client.call('skills.list', { agent_id: agentId }) as Promise<SkillsListOne>,
     /** Aggregate across every layer and every staffer (no `agent_id`). */
@@ -8251,7 +8266,7 @@ export const api = {
   /** Scheduled assignments: the caller's own; `scope: 'all'` lists
    *  everyone's for an Admin. */
   assignSchedules: {
-    list: (scope: 'mine' | 'all' = 'mine') =>
+    list: (scope: 'mine' | 'all' | 'accessible' = 'mine') =>
       client.call('assign_schedules.list', { scope }) as Promise<{
         schedules: AssignScheduleInfo[];
         max_active: number | null;
@@ -8371,6 +8386,7 @@ export const api = {
      *  that employee. Same response shape as `goalCreate`, plus who runs it. */
     skillAssign: (params: {
       skill_name: string;
+      skill_names?: string[];
       note?: string;
       attachments?: TaskAttachmentInput[];
     }) =>

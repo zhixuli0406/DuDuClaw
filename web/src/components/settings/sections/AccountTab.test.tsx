@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '@/test/render';
+import { useLocaleStore } from '@/i18n';
 import { AccountTab } from './AccountTab';
 import { api } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
@@ -168,4 +169,15 @@ describe('<AccountTab> — Personal owner sets a password', () => {
 
     await waitFor(() => expect(api.users.changePassword).toHaveBeenCalledWith('', 'chosen-pw-1'));
   });
+});
+
+it('lets an employee choose a language in account settings', async () => {
+  useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never });
+  useLocaleStore.setState({ locale: 'en' });
+  const user = userEvent.setup();
+  renderWithProviders(<AccountTab />);
+  await user.selectOptions(screen.getByRole('combobox', { name: 'Switch language' }), 'zh-TW');
+  expect(useLocaleStore.getState().locale).toBe('zh-TW');
+  expect(localStorage.getItem('duduclaw-locale')).toBe('zh-TW');
+  useLocaleStore.setState({ locale: 'en' });
 });

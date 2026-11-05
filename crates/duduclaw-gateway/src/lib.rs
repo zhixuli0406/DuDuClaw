@@ -497,6 +497,7 @@ pub mod night_llm;
 // record shape + window filter, used by both `dispatch_engine` (judge
 // evidence block) and `prediction::task_observe` (A3 observation layer).
 pub mod recent_actions;
+pub(crate) mod recent_skills;
 pub mod tool_activity;
 
 // WP-F (P2-c): durable per-task file-change evidence behind the dashboard's

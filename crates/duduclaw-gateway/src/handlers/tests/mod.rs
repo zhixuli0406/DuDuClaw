@@ -108,3 +108,5 @@ mod agents_main_commit_tests;
 
 mod mcp_oauth_grants_rpc_tests;
 mod templates_library_tests;
+mod cron_scoped_rpc_tests;
+mod dashboard_scope_tests;

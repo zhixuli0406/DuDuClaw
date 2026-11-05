@@ -186,6 +186,32 @@ async fn never_run_goes_to_the_first_enabled_holder_with_the_skill_text() {
 }
 
 #[tokio::test]
+async fn recent_skills_record_only_successful_assignments_for_the_caller() {
+    let f = fixture().await;
+    let _ = err(&assign(&f, json!({ "skill_name": SKILL }), &f.viewer_a).await);
+    assert!(crate::recent_skills::list(&f.home, &f.viewer_a.user_id).unwrap().is_empty());
+    ok(&assign(&f, json!({ "skill_name": SKILL }), &f.owner_a).await);
+    assert_eq!(crate::recent_skills::list(&f.home, &f.owner_a.user_id).unwrap(), vec![("a1".into(), SKILL.into())]);
+    assert!(crate::recent_skills::list(&f.home, &f.admin.user_id).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn recent_skills_multiple_selection_inlines_every_skill_on_one_authorized_runner() {
+    let f = fixture().await;
+    std::fs::write(f.home.join("agents/a1/SKILLS/zzsa-check.md"),
+        "---\nname: zzsa-check\ndescription: Check totals\n---\nVerify each total twice.").unwrap();
+    let p = ok(&assign(&f, json!({ "skill_name": SKILL, "skill_names": [SKILL, "zzsa-check"],
+        "note": "/zzsa-quote /zzsa-check extra details" }), &f.owner_a).await);
+    let task = f.store.get_task(p["task"]["id"].as_str().unwrap()).await.unwrap().unwrap();
+    assert!(task.description.contains("照公司格式做報價單"));
+    assert!(task.description.contains("Verify each total twice."));
+    assert_eq!(crate::recent_skills::list(&f.home, &f.owner_a.user_id).unwrap().len(), 2);
+    let _ = err(&assign(&f, json!({ "skill_name": SKILL, "skill_names": ["zzsa-check"] }), &f.operator_b).await);
+    assert!(crate::recent_skills::list(&f.home, &f.operator_b.user_id).unwrap().is_empty());
+    assert_eq!(task_count(&f).await, 1);
+}
+
+#[tokio::test]
 async fn a_switched_off_holder_is_skipped_and_nobody_enabled_is_refused() {
     let f = fixture().await;
     disable(&f, "a1");
