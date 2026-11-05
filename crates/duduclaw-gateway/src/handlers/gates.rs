@@ -240,13 +240,15 @@ pub(crate) fn setup_token_error_frame(
     code: crate::setup_token_wizard::SetupTokenErrorCode,
     message: &str,
 ) -> WsFrame {
+    let protected_missing = code.as_str() == "not_installed" && crate::runtime_readiness::is_protected_linux();
+    let protected_message = protected_missing.then(|| crate::runtime_readiness::protected_runtime_guidance("claude"));
     WsFrame::Response {
         id: String::new(),
         ok: false,
         payload: None,
         error: Some(json!({
-            "code": code.as_str(),
-            "message": message,
+            "code": if protected_missing { "protected_runtime_missing" } else { code.as_str() },
+            "message": protected_message.as_deref().unwrap_or(message),
         })),
     }
 }

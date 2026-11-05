@@ -46,6 +46,23 @@ sudo journalctl -u duduclaw-gateway.service -n 100 --no-pager
 
 root 所有の実行ファイルは `/opt/duduclaw/bin/duduclaw`、組み込みランチャーの配置先は `/usr/local/libexec/duduclaw/protected-launcher`、ユニットは `/etc/systemd/system/duduclaw-gateway.service` です。データは `/var/lib/duduclaw/.duduclaw`、ルートキーは `/var/lib/duduclaw-protected/root.key`（root:root、0400、リンク数 1、32 バイト）に置きます。ユニットは `KillMode=control-group` を使用し、システムを読み取り専用にしてデータと鍵のディレクトリだけを書き込み可能にします。
 
+## サービスアカウント用の AI CLI をインストールする
+
+サービスは `duduclaw` アカウントで動作し、`HOME=/var/lib/duduclaw`、`PATH=/usr/sbin:/usr/bin:/sbin:/bin` を使用します。AI CLI はこれらのシステム PATH ディレクトリのいずれかにインストールし、サービスアカウントが読み取り・実行できる必要があります。`ProtectHome=yes` は `/home`、`/root`、`/run/user` を隠します。root が `/home/operator/.local/bin/claude` を見つけてもサービスからは利用できません。システムディレクトリから隠されたホームへのシンボリックリンクも使えません。
+
+Claude Code では、実行前に `<ver>` をインストールするバージョンに置き換えてください。
+
+```sh
+cd / && sudo -H npm install -g --prefix /usr @anthropic-ai/claude-code@<ver>
+sudo -u duduclaw -H claude auth login
+```
+
+`-H` と `--prefix /usr` は両方必要です。省略すると、元ユーザーの `~/.npmrc` の prefix 設定により CLI が再びユーザーのホームにインストールされる場合があります。Codex、Grok、AGY、Gemini を設定している場合も、サービスから読める同じシステム PATH にインストールし、各 CLI の手順でサービスアカウントとしてログインしてください。
+
+`service install --protected-linux` と `service upgrade --protected-linux` の最後に、設定された主要推論 runtime と各社員の `agent.toml` が選択する runtime を検査します。移行時は移行先の設定を読みます。サービスアカウントとサービス PATH で実行権限を確認し、隠されたパスを除外します。元ユーザーのホームにしかない CLI はサービスで利用できないと表示します。主要 runtime がない場合は警告を表示し、非ゼロで終了します。後で runtime を設定する場合に限り、どちらのコマンドにも `--allow-missing-runtime` を指定できます。このフラグは CLI のインストールやログインを行いません。検査の失敗は、すでに行ったインストールやアップグレードを元に戻しません。
+
+移行でコピーするのは `.duduclaw` のデータだけで、**AI CLI 本体やログイン認証情報は移行しません**。Claude があってもサービスアカウントが未ログインの場合、インストール時に上記のログインコマンドを表示します。元ユーザーのホームから認証情報をコピーせず、個別にログインしてください。gateway の起動時に設定された推論バイナリが見つからない場合は、修復手順を含む ERROR を記録します。runtime の状態と doctor にも保護サービス用の手順を表示します。
+
 ## ユーザーインストールから移行する
 
 旧データをバックアップし、旧 gateway を停止します。旧ユーザーサービスの所有者として実行してください。

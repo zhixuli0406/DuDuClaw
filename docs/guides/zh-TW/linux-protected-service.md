@@ -46,6 +46,23 @@ sudo journalctl -u duduclaw-gateway.service -n 100 --no-pager
 
 root 擁有的程式放在 `/opt/duduclaw/bin/duduclaw`，內嵌的啟動腳本安裝到 `/usr/local/libexec/duduclaw/protected-launcher`，服務檔是 `/etc/systemd/system/duduclaw-gateway.service`。資料位於 `/var/lib/duduclaw/.duduclaw`，根金鑰位於 `/var/lib/duduclaw-protected/root.key`（root:root、0400、一個連結、32 位元組）。服務使用 `KillMode=control-group`，系統檔案唯讀，只開放資料與金鑰目錄寫入。
 
+## 為服務帳號安裝 AI CLI
+
+服務以 `duduclaw` 帳號執行，`HOME=/var/lib/duduclaw`、`PATH=/usr/sbin:/usr/bin:/sbin:/bin`。AI CLI 必須安裝在這些系統 PATH 目錄之一，且服務帳號必須有讀取與執行權限。`ProtectHome=yes` 會隱藏 `/home`、`/root` 與 `/run/user`；即使 root 找得到 `/home/operator/.local/bin/claude`，服務也無法使用。在系統目錄放一個指向隱藏家目錄的符號連結也無效。
+
+Claude Code 請先把 `<ver>` 換成要安裝的版本，再執行：
+
+```sh
+cd / && sudo -H npm install -g --prefix /usr @anthropic-ai/claude-code@<ver>
+sudo -u duduclaw -H claude auth login
+```
+
+`-H` 與 `--prefix /usr` 都要保留，否則原使用者的 `~/.npmrc` prefix 設定可能讓 npm 又把 CLI 裝回使用者家目錄。若設定使用 Codex、Grok、AGY 或 Gemini，也要安裝到相同的服務可讀系統 PATH，並依各 CLI 的登入方式替服務帳號登入。
+
+`service install --protected-linux` 與 `service upgrade --protected-linux` 結尾會檢查設定中的主要推論 runtime，以及各員工 `agent.toml` 選用的 runtime；有遷移時讀取遷移後的目的地設定。檢查以服務帳號及服務 PATH 確認執行權限，並排除被隱藏的路徑。只安裝在原使用者家目錄的 CLI 會明確標示為服務無法使用。主要 runtime 缺少時會印出警告，並以非零狀態結束。只有刻意稍後才設定 runtime 時，才在上述任一指令加上 `--allow-missing-runtime`；此旗標不會代為安裝或登入。檢查失敗不會撤回已執行的安裝或升級。
+
+遷移只複製 `.duduclaw` 資料，**不會搬移 AI CLI 或其登入憑證**。Claude 已安裝但服務帳號尚未登入時，安裝流程會顯示上面的服務帳號登入指令。請另行登入，不要複製原使用者家目錄的憑證。Gateway 啟動時若找不到設定的推論執行檔，會記錄 ERROR 與修復方式；runtime 狀態與 doctor 也會顯示受保護服務專用的指引。
+
 ## 從使用者安裝遷移
 
 先備份舊資料並停止舊 gateway。由原本的使用者服務擁有者執行：
