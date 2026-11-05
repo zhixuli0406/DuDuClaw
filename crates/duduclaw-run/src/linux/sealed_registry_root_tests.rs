@@ -18,7 +18,7 @@ fn plan() -> TrustedRun {
     let seccomp = RuntimeProfile { allowed_syscalls: vec![libc::SYS_read as u32, libc::SYS_write as u32,
         libc::SYS_execveat as u32, libc::SYS_exit_group as u32] };
     let seccomp_digest = seccomp.digest(Architecture::native().unwrap()).unwrap();
-    TrustedRun {
+    TrustedRun { pty_size: None,
         root: RootConfig { employee_uid: 70000, employee_gid: 70000, pty: false, pty_limit: 1,
             work_noexec: true, tmp_noexec: true, tmpfs_bytes: 1024 * 1024, tmpfs_inodes: 64 },
         mounts: [MountIdentity { mount: 17, fs_type: TMPFS_MAGIC }; 5],

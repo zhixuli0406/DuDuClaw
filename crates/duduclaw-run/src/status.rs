@@ -9,6 +9,8 @@ pub enum StatusRecord {
     /// This privilege receipt precedes Landlock enforcement, not proof of exec.
     EmployeeReady { landlock_abi: u32 },
     Pty,
+    /// Root-only receipt: exact statx mount ID of this run's fresh devpts.
+    PtyIdentity { mount_id: u64 },
     ChildrenForked,
     Exited(u8),
     Signalled(u8),
@@ -22,6 +24,11 @@ impl StatusRecord {
     /// The caller must own/close all received rights even if decoding fails.
     /// PTY identity still requires B1's independent devpts/statx readback.
     pub fn decode(packet: &[u8], fd_count: usize) -> Result<Self> {
+        if packet.len() == 20 && &packet[..8] == b"DCR1\x08\0\0\0"
+            && packet[8..12] == [0; 4] && fd_count == 1 {
+            let mount_id = u64::from_be_bytes(packet[12..20].try_into().map_err(|_| Error::Status)?);
+            return if mount_id != 0 { Ok(Self::PtyIdentity { mount_id }) } else { Err(Error::Status) };
+        }
         if packet.len() != 12 || &packet[..4] != b"DCR1" || packet[6..8] != [0, 0] {
             return Err(Error::Status);
         }
@@ -44,11 +51,18 @@ impl StatusRecord {
         }
     }
 
-    pub fn encode(self) -> Result<[u8; 12]> {
+    pub fn encode(self) -> Result<Vec<u8>> {
+        if let Self::PtyIdentity { mount_id } = self {
+            if mount_id == 0 { return Err(Error::Status); }
+            let mut bytes = b"DCR1\x08\0\0\0\0\0\0\0".to_vec();
+            bytes.extend_from_slice(&mount_id.to_be_bytes());
+            return Ok(bytes);
+        }
         let (kind, code, value) = match self {
             Self::Error(code) => (0, code, 0),
             Self::EmployeeReady { landlock_abi } => (1, 0, landlock_abi),
             Self::Pty => (2, 0, 0),
+            Self::PtyIdentity { .. } => return Err(Error::Status),
             Self::ChildrenForked => (3, 0, 0),
             Self::Exited(code) => (4, 0, u32::from(code)),
             Self::Signalled(signal) => (5, 0, u32::from(signal)),
@@ -60,7 +74,7 @@ impl StatusRecord {
         bytes[4] = kind; bytes[5] = code;
         bytes[8..].copy_from_slice(&value.to_be_bytes());
         Self::decode(&bytes, usize::from(kind == 2))?;
-        Ok(bytes)
+        Ok(bytes.to_vec())
     }
 }
 
@@ -71,10 +85,10 @@ mod tests {
     #[test]
     fn status_roundtrip_and_exact_ancillary_counts() {
         for record in [StatusRecord::Error(16), StatusRecord::EmployeeReady { landlock_abi: 1 },
-            StatusRecord::Pty, StatusRecord::ChildrenForked, StatusRecord::Exited(255),
+            StatusRecord::Pty, StatusRecord::PtyIdentity { mount_id: u64::MAX }, StatusRecord::ChildrenForked, StatusRecord::Exited(255),
             StatusRecord::Signalled(64), StatusRecord::SupervisorReady, StatusRecord::IsolationReady] {
             let packet = record.encode().unwrap();
-            let fds = usize::from(record == StatusRecord::Pty);
+            let fds = usize::from(matches!(record, StatusRecord::Pty | StatusRecord::PtyIdentity { .. }));
             assert_eq!(StatusRecord::decode(&packet, fds), Ok(record));
             assert_eq!(StatusRecord::decode(&packet, 1 - fds), Err(Error::Status));
             assert_eq!(StatusRecord::decode(&packet, 2), Err(Error::Status));
@@ -82,10 +96,24 @@ mod tests {
     }
 
     #[test]
+    fn pty_identity_has_exact_u64_mount_and_no_legacy_fallback() {
+        let record = StatusRecord::PtyIdentity { mount_id: 1u64 << 40 };
+        let bytes = record.encode().unwrap(); assert_eq!(bytes.len(), 20);
+        for size in 0..20 { assert!(StatusRecord::decode(&bytes[..size], 1).is_err()); }
+        for index in 5..12 {
+            let mut bad = bytes.clone(); bad[index] = 1;
+            assert!(StatusRecord::decode(&bad, 1).is_err());
+        }
+        let mut trailing = bytes; trailing.push(0);
+        assert!(StatusRecord::decode(&trailing, 1).is_err());
+        assert!(StatusRecord::PtyIdentity { mount_id: 0 }.encode().is_err());
+    }
+
+    #[test]
     fn status_rejects_noncanonical_and_out_of_range_records() {
         let packet = StatusRecord::SupervisorReady.encode().unwrap();
         for index in 0..12 {
-            let mut invalid = packet;
+            let mut invalid = packet.clone();
             invalid[index] = 255;
             assert_eq!(StatusRecord::decode(&invalid, 0), Err(Error::Status));
         }

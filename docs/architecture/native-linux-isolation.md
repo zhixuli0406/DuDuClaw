@@ -5992,3 +5992,166 @@ remote full-package compatibility/tests; formal security review; signed provider
 home provisioning and root/provider acceptance. Background authority and egress
 alias propagation no longer remain wholly unimplemented, but live acceptance is
 still a separate unfinished gate.
+## Package I1e — PTY through A/B1/B2 (2026-11-05)
+
+This section supersedes the earlier round notes' **native PTY refusal** only.
+It does not close I1a/I1b/I1c/I1d, enable protected TEAM admission, or establish
+Grok/provider acceptance. Gateway runtime/boot/ingress files were not changed.
+
+### Implemented path
+
+- A's protected PTY facade calls `SpawndBackend::configure_pty` before StartRun.
+  B1 accepts a bounded Resize on the original unused reservation, stores the
+  dimensions, refuses a subsequent non-PTY StartRun, and freezes configuration
+  once queued. Direct backend callers that do not configure get 24×80.
+- B1 carries the validated dimensions through LaunchPolicy, BootstrapPlan and
+  sealed TrustedRun. B2 sets **and reads back** the size before fork/exec; later
+  resize uses the retained master, TIOCSWINSZ and TIOCGWINSZ. A retries bounded
+  asynchronous NotReady resize replies instead of failing the first worker turn.
+- B2 allocates only in its per-run devpts, still uses **fchmod before fchown**
+  (R7-M1), and sends the master plus the exact u64 devpts mount ID on the private,
+  nonce-authenticated root bootstrap channel. B1 verifies statx mount/dev
+  identities, devpts type/flags, root master, UNIX98 PTY number zero, the
+  TIOCGPTPEER-opened slave, employee UID, 0620 mode and CLOEXEC. Duplicate receipts
+  and mount IDs already retained by another run refuse. Legacy bare PTY receipts
+  are decoded for compatibility tests but never accepted by NativeTrampoline.
+- Running requires all existing privilege/isolation receipts **and** a validated
+  master. TakeIo delivers the same real master to A exactly once; B1 retains a
+  duplicate solely for resize and bounded lifecycle cleanup, never reads bytes
+  behind A, and never allocates a second/host PTY. PTY plans carry no stdin pipe.
+- Successful nonempty reads/writes on A's actual master notify root. Empty I/O,
+  EOF, Status and Resize do not renew idle. Root owns the clock, checks the
+  original connection/Running/PTY/TakeIo binding, and rejects activity after an
+  already-expired idle deadline. Runtime/startup caps remain root-owned.
+- Idle expiry/cancellation use existing revocation, control-group kill and
+  retirement readbacks (inactive unit, empty cgroup, no employee-UID process).
+  A successful byte transfer remains successful if root returns **NotReady**
+  while retiring; this prevents losing tail output or inviting input replay.
+  Other root/transport/protocol errors remain errors. No local execution fallback.
+
+### CONTRACT CHANGE
+
+The shared crate adds only fd-free `SpawnRequest::PtyActivity { run }`, with the
+existing Ack response. Existing message encodings, canonical capability bytes,
+versions and hard limits are unchanged. Resize has additive reserved-state
+semantics for initial dimensions. An older B1 rejects these operations, so A/B1/B2
+must update together; A does not silently omit activity or initial dimensions.
+The private root B1/B2 protocol adds a 20-byte kind-8 PTY identity receipt (u64
+mount ID, exactly one right) and an optional validated size in TrustedRun.
+Existing non-PTY private records retain their exact 12-byte encoding.
+
+The activity report trusts A/gateway, already part of the design's TCB; it is not
+independent kernel telemetry. Bytes queued in the terminal but not consumed by
+A do not count as activity, so an unread/full terminal can still time out. One
+bounded control request per successful transfer adds latency; a future bounded
+aggregation must retain real-byte semantics and may not become a heartbeat.
+No new dependencies were added.
+
+### Native acceptance added, not executed here
+
+`tests/pty_chain.rs` has three ignored outer tests:
+
+- `iso_root_pty_allocation_streaming_and_resize`
+- `iso_root_pty_idle_timeout_and_activity`
+- `iso_root_pty_cancellation_and_retirement`
+
+They re-exec their driver as the actual gateway UID, use installed signed root
+publication and the production SpawndBackend/daemon/systemd/B2, and independently
+check the signed fixture process, terminal descriptors/namespaces and final
+unit/cgroup/UID retirement. The debug-only `iso-pty-fixture-v1` is explicitly
+signed/entitled on a disposable VM; its first TIOCGWINSZ must observe 31×113,
+then dynamic resize must observe 37×93. The idle test exchanges actual bytes past
+the original deadline, then ceases activity and expects IdleTimeout. Root cleanup
+on a test failure also waits with a finite retirement-readback deadline. These
+are fixture transport tests, not Grok or authenticated product-ingress tests.
+Exact prerequisites/build/runner commands are in
+`crates/duduclaw-spawnd/tests/README.md`.
+
+### Validation and remote filters
+
+All commands below ran with `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and offline:
+
+| Command | Actual result |
+| --- | --- |
+| `cargo test -p duduclaw-isolation --offline` | 33 passed, 0 failed; `iso-i1e-contract-tests.log` |
+| `cargo test -p duduclaw-run --lib --offline` | 21 passed, 0 failed; `iso-i1e-run-tests.log` |
+| `cargo test -p duduclaw-spawnd --lib --offline` | 80 passed, 0 failed; `iso-i1e-spawnd-tests.log` |
+| `cargo test -p duduclaw-execution --lib --offline` | 32 passed, 0 failed; `iso-i1e-execution-tests.log` |
+| Linux `cargo check --target x86_64-unknown-linux-gnu -p duduclaw-spawnd -p duduclaw-execution -p duduclaw-run --all-targets --features duduclaw-spawnd/root-test-fixture,duduclaw-run/root-test-fixture --offline` | Passed, compile only; `iso-i1e-linux-check.log` |
+| Windows `cargo check --target x86_64-pc-windows-gnu -p duduclaw-execution -p duduclaw-spawnd -p duduclaw-run --all-targets --offline` | Passed, compile only; `iso-i1e-windows-check.log` |
+| `git diff --check` | Passed |
+
+Logs are in `/private/tmp/`. The first Linux check failed because
+`x86_64-linux-gnu-gcc` was absent. The successful check used the existing Zig C/AR
+wrappers, `CC_x86_64_unknown_linux_gnu=/private/tmp/iso-i1-zig-cc`,
+`AR_x86_64_unknown_linux_gnu=/private/tmp/iso-zig-ar`, and this task's own
+`ZIG_GLOBAL_CACHE_DIR=/private/tmp/iso-i1e-zig-global` /
+`ZIG_LOCAL_CACHE_DIR=/private/tmp/iso-i1e-zig-local`.
+
+macOS tests above do **not** execute Linux-only A transport, native master or
+B2 launch code. On the Linux builder run:
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-execution --lib spawnd:: --offline
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-spawnd --lib --offline
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-run --lib --offline
+# After the signed disposable-host setup in tests/README.md:
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --features root-test-fixture --test pty_chain iso_root_pty_ -- --ignored --test-threads=1 --nocapture
+# Existing B2 root regression:
+cargo test -p duduclaw-run --features root-test-fixture --test root iso_root_full_launch_pty_control_terminal -- --ignored --exact --test-threads=1 --nocapture
+```
+
+An independent read-only code review found the tail-I/O race and initial-size
+ordering gap; both were fixed and re-reviewed. No remaining CRITICAL/HIGH issue
+was identified in that static review. It was ordinary review, **not Daybreak**.
+No gateway/CLI/workspace builds, cargo fmt, commits, merges, releases, worktree
+creation/removal, signed installation changes or live-provider calls were made.
+
+### Changed files (one responsibility per file)
+
+| File | Change |
+| --- | --- |
+| `duduclaw-execution/src/command.rs` | Configure initial dimensions before protected StartRun. |
+| `duduclaw-execution/src/spawnd.rs` | Initial-size API, byte-activity adapters, bounded resize retry and regressions. |
+| `duduclaw-execution/src/spawnd/transport.rs` | Validate Activity Ack and preserve the exact root NotReady code. |
+| `duduclaw-isolation/src/ipc.rs` | Add narrow activity request, initial Resize semantics and contract test. |
+| `duduclaw-run/src/status.rs` | Strict u64-mount PTY receipt and decoder tests. |
+| `duduclaw-run/src/linux/runner.rs` | Initial dimensions/readback and authenticated master identity receipt. |
+| `duduclaw-run/src/linux/mounts.rs` | Finite default terminal dimensions; preserve chmod/chown order. |
+| `duduclaw-run/src/linux/sealed_registry_root_tests.rs` | Explicit no-PTY initial-size fixture field. |
+| `duduclaw-run/src/bin/root-fixture/launch.rs` | Carry initial size and recognize the new master receipt. |
+| `duduclaw-spawnd/src/native_pty.rs` | Validate master/peer provenance, one-shot handoff and actual resize. |
+| `duduclaw-spawnd/src/native_trampoline.rs` | Enable checked native PTY bootstrap/status/ownership. |
+| `duduclaw-spawnd/src/lib.rs` | Register Linux-only master validator. |
+| `duduclaw-spawnd/src/bootstrap.rs` | Root-owned validated initial dimensions. |
+| `duduclaw-spawnd/src/policy.rs` | Derive the finite default initial PTY size. |
+| `duduclaw-spawnd/src/admission.rs` | Reservation dimensions, root idle clock/activity fence and lease retention. |
+| `duduclaw-spawnd/src/admission_tests.rs` | Initial dimensions, activity/idle/cancel/retirement regressions. |
+| `duduclaw-spawnd/src/host.rs` | Carry admitted initial dimensions into the sealed bootstrap plan. |
+| `duduclaw-spawnd/src/host_worker_tests.rs` | Explicit no-PTY dimensions in existing worker fixture. |
+| `duduclaw-spawnd/src/server.rs` | Dispatch authenticated activity using root time. |
+| `duduclaw-spawnd/src/bin/pty-fixture.rs` | Debug-only signed raw-terminal payload. |
+| `duduclaw-spawnd/tests/pty_chain.rs` | Three installed native root chain tests and gateway-UID child driver. |
+| `duduclaw-spawnd/Cargo.toml` | Feature-gated PTY fixture binary, no dependencies. |
+| `duduclaw-spawnd/tests/README.md` | Exact signed prerequisites and native test commands. |
+| `duduclaw-execution/README.md` | PTY API, size ordering and activity/lifetime semantics. |
+| `duduclaw-isolation/README.md` | Additive compatibility and TCB boundary. |
+| `docs/features/{,zh-TW/,ja-JP/}05-security-defense.md` | Three-language development status without an isolation/provider claim. |
+| `CHANGELOG.md` | Self-contained unreleased PTY entry. |
+| `docs/architecture/native-linux-isolation.md` | This implementation/validation/handoff record. |
+
+### Remaining work / handoff for I1e
+
+1. Run Linux-only unit tests and all three **native root** chain tests on Ubuntu
+   22.04, Ubuntu 24.04 and Debian 12 with signed exact fixture/profile, real
+   services, confirmed idle employee and actual storage/readiness. Compilation
+   is not evidence of TIOCGPTPEER, master statx, unit policy or retirement behavior.
+2. I1d must consume A's existing `spawn_pty` path with the real protected Grok/
+   TTY runtime plan, signed HOME/config projections and authenticated I1a launch
+   authorization. This change provides the transport; it deliberately does not
+   remove the gateway runtime refusal or invent vendor credentials/configuration.
+   Exercise real runtime startup, input/output, SIGWINCH, idle and cancellation
+   through product ingress after those packages merge. Provider acceptance remains open.
+3. Obtain the required formal Daybreak security review of the new activity TCB
+   boundary, reserved Resize semantics, private master provenance and teardown.
+   Keep full readiness and missing-factory gates fail closed throughout integration.

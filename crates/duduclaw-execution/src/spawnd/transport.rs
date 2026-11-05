@@ -192,6 +192,20 @@ impl Connection {
     }
 
     pub async fn request(&self, request: SpawnRequest, input_fds: &[OwnedFd]) -> Result<Packet, BackendError> {
+        let packet = self.request_packet(request, input_fds).await?;
+        if let SpawnResponse::Error { code } = packet.response { return Err(map_error(code)); }
+        Ok(packet)
+    }
+
+    pub(super) async fn pty_activity(&self, run: duduclaw_isolation::execution::RunHandle) -> Result<(), BackendError> {
+        match self.request_packet(SpawnRequest::PtyActivity { run }, &[]).await?.response {
+            SpawnResponse::Ack | SpawnResponse::Error { code: ErrorCode::NotReady } => Ok(()),
+            SpawnResponse::Error { code } => Err(map_error(code)),
+            _ => Err(BackendError::Protocol),
+        }
+    }
+
+    async fn request_packet(&self, request: SpawnRequest, input_fds: &[OwnedFd]) -> Result<Packet, BackendError> {
         let roles = request.fd_plan().map_err(|_| BackendError::Denied)?;
         if roles.len() != input_fds.len() { return Err(BackendError::Protocol); }
         let inputs = input_fds.iter().map(|fd| fd.try_clone().map_err(|_| BackendError::Io))
@@ -204,9 +218,7 @@ impl Connection {
         let result = tokio::task::spawn_blocking(move || io.transact(request, inputs, deadline))
             .await.map_err(|_| BackendError::Unavailable)?;
         cancellation.0 = None;
-        let packet = result?;
-        if let SpawnResponse::Error { code } = packet.response { return Err(map_error(code)); }
-        Ok(packet)
+        result
     }
 }
 impl Drop for Connection {
@@ -254,7 +266,7 @@ fn validate_response(request: &SpawnRequest, response: &SpawnResponse) -> Result
             run == actual && !matches!(status, RunStatus::Reserved { .. }),
         (SpawnRequest::Status { run } | SpawnRequest::Wait { run, .. }, SpawnResponse::Status { run: actual, .. }) => run == actual,
         (SpawnRequest::TakeIo { run }, SpawnResponse::Io { run: actual, .. }) => run == actual,
-        (SpawnRequest::Cancel { .. } | SpawnRequest::Resize { .. }, SpawnResponse::Ack) => true,
+        (SpawnRequest::Cancel { .. } | SpawnRequest::Resize { .. } | SpawnRequest::PtyActivity { .. }, SpawnResponse::Ack) => true,
         _ => false,
     };
     if valid { Ok(()) } else { Err(BackendError::Protocol) }

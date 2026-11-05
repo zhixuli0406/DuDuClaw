@@ -42,6 +42,8 @@ pub struct TrustedRun {
     pub proc_subset_pid: bool,
     #[serde(default)]
     pub stdin: bool,
+    #[serde(default)]
+    pub pty_size: Option<duduclaw_isolation::execution::PtySize>,
 }
 impl TrustedRun {
     pub fn expected_fd_count(&self) -> usize {
@@ -50,6 +52,9 @@ impl TrustedRun {
     }
     pub fn validate(&self) -> Result<()> {
         self.root.validate().map_err(|_| Error::Mount)?;
+        if self.pty_size.is_some() != self.root.pty || self.pty_size.is_some_and(|size| size.validate().is_err()) {
+            return Err(Error::Descriptors);
+        }
         if self.stdin && self.root.pty { return Err(Error::Descriptors); }
         let uid = self.root.employee_uid;
         let gid = self.root.employee_gid;
@@ -207,8 +212,14 @@ fn launch(plan: TrustedRun, fds: Vec<OwnedFd>, ready: probe::Readiness, mut mach
     let mut root = mounts::build_root(mount_inputs, &plan.root).map_err(|_| Error::Mount)?;
     let pty = root.take_pty();
     let slave = if let Some(pty) = pty {
+        let size = plan.pty_size.ok_or(Error::Descriptors)?;
+        let value = libc::winsize { ws_row: size.rows, ws_col: size.columns, ws_xpixel: 0, ws_ypixel: 0 };
+        let mut actual: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(pty.master.as_raw_fd(), libc::TIOCSWINSZ, &value) } != 0
+            || unsafe { libc::ioctl(pty.master.as_raw_fd(), libc::TIOCGWINSZ, &mut actual) } != 0
+            || actual.ws_row != size.rows || actual.ws_col != size.columns { return Err(Error::Descriptors); }
         validation::validate(fd::observe(pty.slave.as_raw_fd())?, Expected::Pty { mount: pty.mount_id })?;
-        bootstrap::send_packet(0, &bootstrap::status(2, 0, 0), Some(pty.master.as_raw_fd()))?;
+        bootstrap::send_packet(0, &crate::status::StatusRecord::PtyIdentity { mount_id: pty.mount_id }.encode()?, Some(pty.master.as_raw_fd()))?;
         drop(pty.master); Some(pty.slave)
     } else { None };
     machine.advance(Stage::RootBuilt)?;

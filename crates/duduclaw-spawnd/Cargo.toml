@@ -38,3 +38,8 @@ root-test-fixture = []
 name = "duduclaw-spawnd-d8-fixture"
 path = "src/bin/d8-fixture.rs"
 required-features = ["root-test-fixture"]
+
+[[bin]]
+name = "duduclaw-spawnd-pty-fixture"
+path = "src/bin/pty-fixture.rs"
+required-features = ["root-test-fixture"]

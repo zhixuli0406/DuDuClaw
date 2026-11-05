@@ -481,7 +481,7 @@ impl Host for Core {
         Ok(self.policy.as_ref().ok_or_else(unavailable)?.derive(employee, runtime, pty)?.1)
     }
     fn cleanup(&mut self, employee: EmployeeId, previous: Option<RunHandle>) -> Result<CleanupReadback> { self.cleanup_run(employee, previous) }
-    fn start(&mut self, run: RunHandle, employee: EmployeeId, request: &SpawnRequest, _: &LaunchPolicy, inputs: Self::Inputs) -> Result<()> {
+    fn start(&mut self, run: RunHandle, employee: EmployeeId, request: &SpawnRequest, launch_policy: &LaunchPolicy, inputs: Self::Inputs) -> Result<()> {
         self.monitor.check_run(run)?;
         self.ready(employee)?;
         if !self.cleanup_run(employee, None)?.complete() { return Err(unavailable()); }
@@ -523,8 +523,10 @@ impl Host for Core {
         };
         let (supervisor_uid, supervisor_gid) = self.components.publication.supervisor_identity()?;
         let mut nonce = [0; 32]; nonce[..16].copy_from_slice(&os(crate::server::random_id())?); nonce[16..].copy_from_slice(&os(crate::server::random_id())?);
-        let plan = BootstrapPlan::from_runtime(run, employee, account.uid, account.gid, supervisor_uid, supervisor_gid,
+        let mut plan = BootstrapPlan::from_runtime(run, employee, account.uid, account.gid, supervisor_uid, supervisor_gid,
             nonce, &runtime, *pty, *prompt_bytes, input_fds.as_slice(), if matches!(runtime.network, NetworkPolicy::Egress(_)) { Some(18080) } else { None })?;
+        plan.pty_size = launch_policy.pty_size;
+        plan.validate()?;
         let entry = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
         entry.gateway_io = Some(gateway_io); entry.relays = vec![out, err]; entry.revokers = revokers.clone();
         self.monitor.set_run(employee, Some(run.0), None, revokers.clone())?;

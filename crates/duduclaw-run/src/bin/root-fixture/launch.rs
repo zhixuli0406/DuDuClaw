@@ -95,7 +95,7 @@ fn prepare(root: &Path, scenario: &str) -> (TrustedRun,Vec<OwnedFd>,OwnedFd,Opti
         "launch-pty"=>"pty", "launch-teardown"=>"orphan", "launch-script"=>"script",
         "launch-fast-exit"=>"fast", _=>"normal",
     };
-    let plan=TrustedRun {stdin:false,root:mounts::RootConfig {employee_uid:EMPLOYEE,employee_gid:EMPLOYEE,
+    let plan=TrustedRun {pty_size:(scenario=="launch-pty").then_some(duduclaw_isolation::execution::PtySize { rows: 24, columns: 80 }),stdin:false,root:mounts::RootConfig {employee_uid:EMPLOYEE,employee_gid:EMPLOYEE,
         pty:scenario=="launch-pty",pty_limit:2,work_noexec:true,tmp_noexec:true,
         tmpfs_bytes:4*1024*1024,tmpfs_inodes:256},mounts:identities.try_into().ok().unwrap(),
         supervisor_uid:SUPERVISOR,supervisor_gid:SUPERVISOR,gateway_uid:998,gateway_mount:0,
@@ -209,7 +209,7 @@ pub(super) fn run(root: &Path, scenario: &str) {
             let kind=packet[4]; let code=packet[5];
             let value=u32::from_be_bytes(packet[8..12].try_into().unwrap());
             records.push((kind,code,value));
-            if kind==2 {
+            if kind==8 {
                 assert_eq!(rights.len(),1); assert!(pty.is_none());
                 let master=rights.pop().unwrap();
                 let observed=fd::observe(master.as_raw_fd()).unwrap();

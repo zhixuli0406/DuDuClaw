@@ -25,7 +25,7 @@ impl Host for FakeHost {
     fn policy(&mut self, _: EmployeeId, runtime: &RuntimeKind, pty: bool) -> Result<LaunchPolicy> {
         Ok(LaunchPolicy { queue_class: if *runtime == RuntimeKind::Codex { QueueClass::Interactive } else { QueueClass::Background },
             queue_ms: 10_000, startup_ms: 1000, runtime_ms: 5000, pty_idle_ms: pty.then_some(2000),
-            ptys: if pty { 16 } else { 0 }, delivery: IoDelivery { mcp: true, pty } })
+            ptys: if pty { 16 } else { 0 }, pty_size: pty.then_some(PtySize { rows: 24, columns: 80 }), delivery: IoDelivery { mcp: true, pty } })
     }
     fn cleanup(&mut self, _: EmployeeId, _: Option<RunHandle>) -> Result<CleanupReadback> { Ok(self.proof) }
     fn start(&mut self, run: RunHandle, _: EmployeeId, _: &SpawnRequest, _: &LaunchPolicy, _: ()) -> Result<()> {
@@ -222,4 +222,86 @@ fn asynchronous_poll_keeps_lease_and_shutdown_cancels_the_queue() {
     assert!(!c.has_active_runs());
     assert_eq!(c.host.starts, vec![run(1)]);
     assert!(matches!(c.status(run(2), conn()).unwrap(), RunStatus::Ended(RunOutcome::Cancelled)));
+}
+
+fn running_pty() -> Coordinator<FakeHost> {
+    let mut c = Coordinator::new(FakeHost::default(), Limits::default()).unwrap();
+    c.reserve(conn(), employee(1), run(1), 100).unwrap();
+    let mut q = request(1, 1, RuntimeKind::Grok);
+    if let SpawnRequest::StartRun { pty, .. } = &mut q { *pty = true; }
+    c.start(conn(), q, (), 100).unwrap();
+    c.tick(100).unwrap(); c.tick(101).unwrap();
+    c
+}
+
+#[test]
+fn pty_activity_requires_original_connection_running_pty_and_taken_io() {
+    let mut c = running_pty();
+    assert_eq!(c.pty_activity(run(1), conn(), 102), Err(ErrorCode::NotReady));
+    c.take_io(run(1), conn()).unwrap();
+    assert_eq!(c.pty_activity(run(1), ControlConnectionId([9; 16]), 103), Err(ErrorCode::NotFound));
+    c.pty_activity(run(1), conn(), 104).unwrap();
+    assert_eq!(c.entries[&run(1).0].pty_activity_ms, 104);
+    c.cancel(run(1), conn(), 105).unwrap();
+    assert_eq!(c.pty_activity(run(1), conn(), 106), Err(ErrorCode::NotReady));
+    let mut c = Coordinator::new(FakeHost::default(), Limits::default()).unwrap();
+    queue(&mut c, 1, 1, RuntimeKind::Codex); c.tick(100).unwrap(); c.tick(101).unwrap();
+    c.take_io(run(1), conn()).unwrap();
+    assert_eq!(c.pty_activity(run(1), conn(), 102), Err(ErrorCode::NotReady));
+}
+
+#[test]
+fn pty_bytes_extend_idle_but_status_and_resize_do_not() {
+    let mut c = running_pty(); c.take_io(run(1), conn()).unwrap();
+    c.pty_activity(run(1), conn(), 1500).unwrap();
+    c.tick(2101).unwrap();
+    assert_eq!(c.status(run(1), conn()), Ok(RunStatus::Running));
+    c.resize(run(1), conn(), PtySize { rows: 37, columns: 93 }).unwrap();
+    c.tick(3500).unwrap();
+    assert_eq!(c.status(run(1), conn()), Ok(RunStatus::Ended(RunOutcome::IdleTimeout)));
+    assert!(c.host.revoked.contains(&run(1)) && c.host.killed.contains(&run(1)));
+}
+
+#[test]
+fn pty_late_activity_cannot_revive_expired_deadline() {
+    let mut c = running_pty(); c.take_io(run(1), conn()).unwrap();
+    assert_eq!(c.pty_activity(run(1), conn(), 2101), Err(ErrorCode::NotReady));
+    assert_eq!(c.entries[&run(1).0].state, AdmissionState::Draining);
+    c.tick(2102).unwrap();
+    assert_eq!(c.status(run(1), conn()), Ok(RunStatus::Ended(RunOutcome::IdleTimeout)));
+}
+
+#[test]
+fn pty_cancel_keeps_lease_until_all_retirement_readbacks_succeed() {
+    let mut c = running_pty(); c.take_io(run(1), conn()).unwrap();
+    // Queue the same employee while the PTY is still live.
+    c.reserve(conn(), employee(1), run(2), 102).unwrap();
+    c.start(conn(), request(2, 1, RuntimeKind::Grok), (), 102).unwrap();
+    c.host.proof.cgroup_empty = false;
+    c.cancel(run(1), conn(), 103).unwrap(); c.tick(104).unwrap();
+    assert_eq!(c.entries[&run(1).0].state, AdmissionState::Draining);
+    assert!(matches!(c.status(run(2), conn()), Ok(RunStatus::Queued(_))));
+    assert_eq!(c.pty_activity(run(1), conn(), 105), Err(ErrorCode::NotReady));
+    c.host.proof.cgroup_empty = true; c.tick(106).unwrap();
+    assert_eq!(c.status(run(1), conn()), Ok(RunStatus::Ended(RunOutcome::Cancelled)));
+    assert_eq!(c.host.starts, vec![run(1), run(2)]);
+}
+
+#[test]
+fn initial_pty_size_is_bound_before_start_and_cannot_reconfigure_a_queued_run() {
+    let mut c = Coordinator::new(FakeHost::default(), Limits::default()).unwrap();
+    c.reserve(conn(), employee(1), run(1), 100).unwrap();
+    let size = PtySize { rows: 31, columns: 113 };
+    assert_eq!(c.resize(run(1), ControlConnectionId([9; 16]), size), Err(ErrorCode::NotFound));
+    assert!(c.resize(run(1), conn(), PtySize { rows: 0, columns: 113 }).is_err());
+    c.resize(run(1), conn(), size).unwrap();
+    assert!(c.start(conn(), request(1, 1, RuntimeKind::Grok), (), 101).is_err(), "configured PTY reservation cannot become a pipe run");
+    let mut q = request(1, 1, RuntimeKind::Grok);
+    if let SpawnRequest::StartRun { pty, .. } = &mut q { *pty = true; }
+    c.start(conn(), q, (), 101).unwrap();
+    assert_eq!(c.entries[&run(1).0].policy.as_ref().unwrap().pty_size, Some(size));
+    assert_eq!(c.resize(run(1), conn(), size), Err(ErrorCode::NotReady));
+    c.reserve(conn(), employee(2), run(2), 102).unwrap();
+    c.tick(30_102).unwrap();
+    assert_eq!(c.resize(run(2), conn(), size), Err(ErrorCode::NotReady));
 }

@@ -62,6 +62,7 @@ pub struct BootstrapPlan {
     pub memfd_total_bytes: u64,
     pub pty: bool,
     pub max_ptys: u16,
+    pub pty_size: Option<duduclaw_isolation::execution::PtySize>,
     pub mcp: bool,
     pub egress: bool,
 }
@@ -86,7 +87,7 @@ impl BootstrapPlan {
             environment: runtime_environment(&runtime.network, proxy_port)?, input_fds: input_fds.to_vec(),
             prompt_bytes, descriptors: Vec::new(), open_files: runtime.resources.open_files,
             memfd_total_bytes: runtime.resources.memfd_total_bytes,
-            pty, max_ptys: runtime.resources.ptys, mcp: runtime.mcp, egress };
+            pty, max_ptys: runtime.resources.ptys, pty_size: pty.then_some(duduclaw_isolation::execution::PtySize { rows: 24, columns: 80 }), mcp: runtime.mcp, egress };
         if pty && !runtime.pty_allowed { return Err(ErrorCode::RuntimeDenied); }
         plan.descriptors = plan.expected_descriptors();
         plan.validate()?;
@@ -107,6 +108,9 @@ impl BootstrapPlan {
             DescriptorPlan { index: index as u16, role, runtime_fd }).collect()
     }
     pub fn validate(&self) -> Result<()> {
+        if self.pty_size.is_some() != self.pty || self.pty_size.is_some_and(|size| size.validate().is_err()) {
+            return Err(ErrorCode::InvalidRequest);
+        }
         if self.domain != BOOTSTRAP_DOMAIN || self.version != BOOTSTRAP_VERSION
             || !crate::storage::valid_employee_uid(self.uid) || self.gid != self.uid
             || self.supervisor_uid == 0 || self.supervisor_uid >= 1000 || self.supervisor_gid == 0 || self.supervisor_gid >= 1000

@@ -83,7 +83,7 @@ fn run(byte: u8) -> RunHandle { RunHandle(RunId([byte; 16])) }
 fn employee() -> EmployeeId { EmployeeId([3; 16]) }
 fn policy() -> LaunchPolicy {
     LaunchPolicy { queue_class: QueueClass::Interactive, queue_ms: 1000, startup_ms: 1000,
-        runtime_ms: 5000, pty_idle_ms: None, ptys: 0, delivery: IoDelivery { mcp: false, pty: false } }
+        runtime_ms: 5000, pty_idle_ms: None, ptys: 0, pty_size: None, delivery: IoDelivery { mcp: false, pty: false } }
 }
 fn request() -> SpawnRequest {
     SpawnRequest::StartRun { run: run(1), employee_id: employee(), runtime_request: RuntimeKind::Codex,

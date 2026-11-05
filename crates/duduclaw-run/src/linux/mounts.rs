@@ -321,6 +321,8 @@ fn allocate_pty(dev: RawFd, uid: u32, mount_id: u64) -> Result<PtyPair, MountErr
         cvt(libc::fchmod(slave.as_raw_fd(), 0o620), MountError::Pty)?;
         cvt(libc::fchown(slave.as_raw_fd(), uid, !0 as libc::gid_t), MountError::Pty)?;
     }
+    let size = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+    unsafe { cvt(libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size), MountError::Pty)?; }
     let stat = statx(slave.as_raw_fd())?;
     if stat.stx_mode as u32 & libc::S_IFMT != libc::S_IFCHR
         || !(136..=143).contains(&stat.stx_rdev_major) || stat.stx_mnt_id != mount_id

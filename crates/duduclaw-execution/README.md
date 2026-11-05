@@ -43,6 +43,17 @@ constitute Windows Job, Linux namespace, root-daemon or provider acceptance.
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-execution
 ```
 
+Protected PTYs bind the requested initial size to the reservation with
+`configure_pty` before StartRun. B2 sets and reads back that size before forking
+the runtime; direct backend callers that omit configuration get 24×80. A real
+master is allocated inside B2's per-run devpts.
+Successful nonempty reads/writes notify B1 with the additive `PtyActivity` RPC on
+the same authenticated run control connection. The root service supplies the
+idle clock; polling, resizing, empty transfers and EOF do not renew it. The
+protocol notification must be supported by both A and B1 in the same release.
+Resize retries bounded asynchronous `NotReady` replies. B1 retains a master
+only for resize/retirement; it never consumes bytes behind A's reader.
+
 ## License
 
 Apache-2.0.
