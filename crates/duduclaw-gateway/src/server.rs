@@ -5,6 +5,8 @@ mod server_invites;
 mod data_exports_http_tests;
 #[cfg(test)]
 mod task_rpc_http_tests;
+#[cfg(test)]
+mod extension_http_tests;
 
 use axum::body::Bytes;
 use axum::{
@@ -2644,6 +2646,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // WebChat endpoint — C5: now requires JWT auth (in-band) + Origin check,
     // mirroring the main /ws gate instead of being unauthenticated.
     let meeting_auth_state = state.clone();
+    let extension_auth_state = state.clone();
     let knowledge_users = state.user_db.clone();
     let webchat_state = Arc::new(crate::webchat::WebChatState::new(
         webchat_ctx,
@@ -3262,15 +3265,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     app = app.merge(crate::webhook_slots::router(webhook_slots));
     app = app.merge(googlechat_agents_router);
 
-    // Merge plugin extension routes (if any)
-    if let Some(extra) = extension.extra_routes() {
-        app = app.merge(extra);
-    }
-
     #[cfg(feature = "dashboard")]
     {
         app = app.merge(duduclaw_dashboard::dashboard_router());
     }
+
+    // Validate against the completed core router before opening the listener.
+    app = crate::extension::merge_routes(app, extension.as_ref(), Arc::new(move |headers, minimum_role| {
+        extension_caller(&extension_auth_state, headers, minimum_role)
+    })).map_err(|error| {
+        tracing::error!(%error, "extension HTTP registration refused");
+        duduclaw_core::error::DuDuClawError::Gateway(error)
+    })?;
 
     // ── Decision Lab kill switch (audit X1, 方案 6) ────────────────
     // `config.toml [decision] enabled` (default true — the line stays mounted).
@@ -15167,6 +15173,20 @@ fn knowledge_caller(
             .into_response()
     })?;
     require_password_changed(&ctx)?;
+    Ok(ctx)
+}
+
+/// Extension handlers receive current authority, never the role/bindings cached
+/// in a JWT. Reuse the core token/epoch/account/password checks first.
+fn extension_caller(state: &AppState, headers: &axum::http::HeaderMap, minimum_role: duduclaw_auth::UserRole) -> Result<UserContext, axum::response::Response> {
+    let identity = knowledge_caller(state, headers)?;
+    let ctx = crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &identity.user_id)
+        .map_err(|_| axum::http::StatusCode::UNAUTHORIZED.into_response())?
+        .ok_or_else(|| axum::http::StatusCode::UNAUTHORIZED.into_response())?;
+    require_password_changed(&ctx)?;
+    if !ctx.has_role(minimum_role) {
+        return Err(axum::http::StatusCode::FORBIDDEN.into_response());
+    }
     Ok(ctx)
 }
 

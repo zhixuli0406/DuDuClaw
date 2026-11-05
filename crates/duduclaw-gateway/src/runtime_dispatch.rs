@@ -217,7 +217,7 @@ async fn run_agent_prompt_inner(
     crate::product_policy::require_runtime(req.home_dir, provider.as_str()).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),req.model,RuntimePreflightKind::Policy,error))?;
     if in_utility_call() && !crate::runtime_config::utility_profile_supported(provider) {
         return Err(RuntimeDispatchFailure::preflight(Some(provider), req.model,
-            RuntimePreflightKind::Config, format!("utility runtime {} has no supported utility profile", provider.as_str())));
+            RuntimePreflightKind::Config, crate::runtime_config::utility_profile_refusal(provider)));
     }
     let fallback = if in_utility_call() { None } else { settings.fallback };
 
@@ -1462,11 +1462,11 @@ mod utility_policy_tests {
 
     #[async_trait::async_trait]
     impl crate::runtime::AgentRuntime for PartialRuntime {
-        fn name(&self) -> &str { "codex" }
+        fn name(&self) -> &str { "openai_compat" }
         async fn is_available(&self) -> bool { panic!("fixture must not probe a CLI") }
         async fn execute(&self, _: &str, _: &RuntimeContext) -> Result<RuntimeResponse, String> {
             Ok(RuntimeResponse {
-                content: "PASS".into(), runtime_name: "codex".into(),
+                content: "PASS".into(), runtime_name: "openai_compat".into(),
                 model_used: "gpt-5.4".into(), partial_timeout_secs: Some(37), ..Default::default()
             })
         }
@@ -1475,7 +1475,7 @@ mod utility_policy_tests {
     fn partial_request(home: &Path) -> AgentPrompt<'_> {
         AgentPrompt {
             agent_dir: None, home_dir: home, agent_id: "", prompt: "judge", system_prompt: "",
-            model: "gpt-5.4", max_tokens: 16, provider_override: Some(RuntimeType::Codex),
+            model: "gpt-5.4", max_tokens: 16, provider_override: Some(RuntimeType::OpenAiCompat),
             conversation_history: &[], request_type: RequestType::Chat, runtime_settings: None,
             effort: None, allow_cross_family_failover: false,
         }
@@ -1486,9 +1486,9 @@ mod utility_policy_tests {
         for lane in ["utility", "text", "detailed", "nested-utility", "nested-text"] {
             let home = tempfile::tempdir().unwrap();
             std::fs::write(home.path().join("config.toml"),
-                "[runtime]\nutility_provider='codex'\nutility_model='gpt-5.4'\n").unwrap();
+                "[runtime]\nutility_provider='openai_compat'\nutility_model='gpt-5.4'\n").unwrap();
             let mut runtimes: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
-            runtimes.insert(RuntimeType::Codex, Box::new(PartialRuntime));
+            runtimes.insert(RuntimeType::OpenAiCompat, Box::new(PartialRuntime));
             let _registry = testing::RegistryGuard::install(home.path(), RuntimeRegistry::with_runtimes(runtimes)).await;
             // Utility lanes declare global maintenance, as host callers must.
             let global = || UtilityContext::Autonomous { target: "", callers: &[] };
@@ -1502,7 +1502,7 @@ mod utility_policy_tests {
                 "text" => run_agent_prompt_text(partial_request(home.path())).await.unwrap_err(),
                 _ => run_agent_prompt(partial_request(home.path())).await.unwrap_err(),
             };
-            assert!(error.contains("codex CLI hard timeout after 37s (partial output discarded)"), "{lane}: {error}");
+            assert!(error.contains("openai_compat CLI hard timeout after 37s (partial output discarded)"), "{lane}: {error}");
             assert!(!error.contains("PASS"), "partial verdict must not leak into errors");
             let reply = CHANNEL_REPLY_PARTIAL.scope((),
                 run_agent_prompt_detailed(partial_request(home.path()))).await.unwrap();

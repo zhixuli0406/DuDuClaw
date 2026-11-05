@@ -480,9 +480,8 @@ pub fn load_action_rules(agent_dir: &Path) -> crate::tool_effect::ActionRules {
 /// mcp-remote-bridge`).
 ///
 /// The rules are read exactly like [`load_action_rules`] (fail closed). The
-/// trusted-server list is read from the same file: anything other than an
-/// array of non-empty strings trusts no server, so a typo can only make
-/// tools stricter.
+/// legacy trusted-server list is parsed for compatibility only; annotations
+/// never lower the default Modify classification.
 pub fn load_third_party_policy(agent_dir: &Path) -> crate::tool_effect::ThirdPartyPolicy {
     let rules = load_action_rules(agent_dir);
     let text = match resolved_override_path(agent_dir).map(|p| std::fs::read_to_string(&p)) {
@@ -601,7 +600,8 @@ mod tests {
         )
         .unwrap();
         let p = load_third_party_policy(dir.path());
-        assert!(p.trusts_read_hint("github") && !p.trusts_read_hint("git"));
+        assert!(!p.trusts_read_hint("github") && !p.trusts_read_hint("git"));
+        assert_eq!(p.effect("github", &crate::tool_effect::ToolAnnotations { read_only: Some(true), ..Default::default() }), ToolEffect::Modify);
         assert!(!third_party_gate_needed(dir.path(), false));
         assert!(third_party_gate_needed(dir.path(), true));
         std::fs::write(

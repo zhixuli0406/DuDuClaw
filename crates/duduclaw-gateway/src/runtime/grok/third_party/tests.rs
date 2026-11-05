@@ -141,13 +141,33 @@ async fn a_third_party_server_is_registered_behind_a_spawn_scoped_proxy() {
 }
 
 #[tokio::test]
+async fn commandless_entry_refuses_spawn_without_runtime_config() {
+    let body = json!({"mcpServers": {
+        "no_command": {"args": ["x"]},
+        "valid": {"command": "python3", "args": ["-m", "m"]}
+    }}).to_string();
+    let (home, dir) = employee(Some(&body));
+    let error = prepare_for(&dir, home.path()).await.unwrap_err();
+    assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{error}");
+    assert!(error.contains("no_command") && error.contains("unsupported or ambiguous stdio transport"), "{error}");
+    // The spawn gate may repair the host-owned duduclaw entry first.
+    // Invalid third-party input is retained for the operator to correct.
+    let after: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
+    let before: serde_json::Value = serde_json::from_str(&body).unwrap();
+    for name in ["no_command", "valid"] {
+        assert_eq!(after["mcpServers"][name], before["mcpServers"][name]);
+    }
+    assert!(!dir.join(".grok").exists());
+}
+
+#[tokio::test]
 async fn ungateable_names_are_shadowed_disabled_never_live() {
     let body = json!({ "mcpServers": {
         "duduclaw": { "command": "duduclaw", "args": [] },
         "duduclaw-pro": { "command": "/tmp/evil", "args": [] },
         "remote_erp": { "type": "http", "url": "https://erp.example.com/mcp" },
         "bad name": { "command": "npx", "args": [] },
-        "no_command": { "args": ["x"] },
         "masterlink": { "command": "python3", "args": ["-m", "m"] }
     }})
     .to_string();
@@ -155,7 +175,7 @@ async fn ungateable_names_are_shadowed_disabled_never_live() {
     prepare_for(&dir, home.path()).await.unwrap();
     let (raw, cfg) = config(&dir);
     let servers = cfg["mcp_servers"].as_table().unwrap();
-    for shadowed in ["duduclaw-pro", "remote_erp", "bad name", "no_command"] {
+    for shadowed in ["duduclaw-pro", "remote_erp", "bad name"] {
         let e = &servers[shadowed];
         assert_eq!(e["enabled"].as_bool(), Some(false), "{shadowed}");
         assert!(
@@ -355,11 +375,6 @@ async fn concurrent_spawns_keep_their_own_env_dirs() {
 async fn a_server_removed_from_mcp_json_is_pruned_from_its_own_dir() {
     let (home, dir) = employee(Some(broker_mcp_json().as_str()));
     prepare_for(&dir, home.path()).await.unwrap();
-    // An operator's own hand-written entry is never touched.
-    let path = dir.join(".grok").join("config.toml");
-    let mut raw = std::fs::read_to_string(&path).unwrap();
-    raw.push_str("\n[mcp_servers.handmade]\ncommand = \"/usr/bin/true\"\nargs = []\n");
-    std::fs::write(&path, raw).unwrap();
     // masterlink renamed to broker2.
     let renamed = broker_mcp_json().replace("masterlink\":", "broker2\":");
     std::fs::write(dir.join(".mcp.json"), renamed).unwrap();
@@ -368,7 +383,6 @@ async fn a_server_removed_from_mcp_json_is_pruned_from_its_own_dir() {
     let servers = cfg["mcp_servers"].as_table().unwrap();
     assert!(servers.get("masterlink").is_none(), "{servers:?}");
     assert!(servers.contains_key("broker2"));
-    assert!(servers.contains_key("handmade"));
 }
 
 /// A borrowed work root (a role member in the employee's workspace): its own
@@ -714,4 +728,53 @@ async fn rotated_production_entry_takes_managed_spawn_with_shadow() {
             String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     }
     assert!(home.path().join("rotation-verified").exists(), "child test must actually run");
+}
+
+#[tokio::test]
+async fn pl0_grok_refuses_unmanaged_project_entries_without_modifying_them() {
+    for raw_mcp in [None, Some(broker_mcp_json())] {
+        let (home, dir) = employee(raw_mcp.as_deref());
+        std::fs::create_dir_all(dir.join(".grok")).unwrap();
+        let path = dir.join(".grok/config.toml");
+        let raw = "[mcp_servers.manual]\nurl='https://example.invalid/mcp'\n";
+        std::fs::write(&path, raw).unwrap();
+        let error = prepare_for(&dir, home.path()).await.unwrap_err();
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+        assert!(!error.contains("example.invalid"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+    }
+}
+
+#[test]
+fn pl0_grok_refuses_global_mcp_sources_and_honors_home_override() {
+    let home = tempfile::tempdir().unwrap();
+    let alt = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".grok")).unwrap();
+    assert!(refuse_global_sources(home.path(), None).is_ok());
+    for (user, override_path) in [(home.path(), Some("relative-config")), (Path::new("relative-home"), None)] {
+        let error = refuse_global_sources(user, override_path).unwrap_err();
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+    }
+    let raw = "[mcp_servers.remote]\nurl='https://example.invalid/mcp'\n";
+    std::fs::write(home.path().join(".grok/config.toml"), raw).unwrap();
+    assert!(refuse_global_sources(home.path(), None).is_err());
+    assert!(refuse_global_sources(home.path(), alt.path().to_str()).is_ok());
+    std::fs::write(alt.path().join("config.toml"), raw).unwrap();
+    assert!(refuse_global_sources(home.path(), alt.path().to_str()).is_err());
+    std::fs::write(alt.path().join("config.toml"), "[malformed").unwrap();
+    assert!(refuse_global_sources(home.path(), alt.path().to_str()).is_err());
+}
+
+#[tokio::test]
+async fn pl0_grok_canonicalizes_borrowed_root_builtin_slot() {
+    let (home, dir) = employee(None);
+    let root = home.path().join("borrowed");
+    std::fs::create_dir_all(root.join(".grok")).unwrap();
+    std::fs::write(root.join(".grok/config.toml"), "[mcp_servers.duduclaw]\ncommand='third-party-mcp'\n").unwrap();
+    let prepared = prepare(Some(&dir), Some(&root), "trader", home.path(), false).await.unwrap();
+    assert!(prepared.managed);
+    let (_, effective) = config(&root);
+    assert_eq!(effective["mcp_servers"]["duduclaw"]["command"].as_str(),
+        Some(duduclaw_core::resolve_duduclaw_bin().to_str().unwrap()));
+    assert_eq!(effective["mcp_servers"]["duduclaw"]["args"][0].as_str(), Some("mcp-server"));
 }

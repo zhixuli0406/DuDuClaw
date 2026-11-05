@@ -245,10 +245,11 @@ impl ProxyPurpose {
 /// Rewrite every third-party **stdio** server so it launches through
 /// `duduclaw mcp-proxy` for `purpose`.
 ///
-/// Built-in slots are replaced with `own_server`. Left untouched: `type` /
-/// `url` entries (no child
-/// process to wrap), entries with no `command`, and, when redaction is not a purpose, remote
-/// bridge entries. The original `env` map rides along in
+/// Built-in slots are replaced with `own_server`. With the tool gate enabled,
+/// known direct remote entries are removed and unknown transport shapes refuse
+/// the spawn. Without the tool gate, legacy non-stdio entries may remain. Managed
+/// remote bridges gate themselves unless another purpose requires wrapping.
+/// The original `env` map rides along in
 /// [`PROXY_UPSTREAM_ENV_VAR`] rather than in argv.
 pub fn rewrite_mcp_config_for_proxy_with(json: &Value, self_exe: &Path, purpose: ProxyPurpose, own_server: &Value) -> Result<Value, String> {
     Ok(rewrite_mcp_config_for_gate(json, self_exe, purpose, own_server)?.config)
@@ -294,10 +295,48 @@ pub fn rewrite_mcp_config_for_runtime_gate(json: &Value, self_exe: &Path, purpos
     rewrite_mcp_config_with_slots(json, self_exe, purpose, own_server, false)
 }
 
+/// Classify only supported transport shapes before delegating to a native CLI.
+/// Unknown fields on stdio could select a future transport; never pass them through.
+fn classify_gated_transport(def: &Value) -> Result<bool, &'static str> {
+    let object = def.as_object().ok_or("definition must be an object")?;
+    let kind = match object.get("type") {
+        None => None,
+        Some(Value::String(kind)) => Some(kind.as_str()),
+        Some(_) => return Err("transport type must be a string"),
+    };
+    if object.contains_key("url") || matches!(kind, Some("http" | "sse" | "streamable-http")) {
+        if !matches!(kind, None | Some("http" | "sse" | "streamable-http"))
+            || object.contains_key("command")
+            || !object.get("url").and_then(Value::as_str)
+                .is_some_and(|url| url.starts_with("https://") || url.starts_with("http://"))
+        {
+            return Err("unsupported or ambiguous remote transport");
+        }
+        return Ok(true);
+    }
+    if !matches!(kind, None | Some("stdio"))
+        || !object.get("command").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty())
+        || object.keys().any(|key| !matches!(key.as_str(), "command" | "args" | "env" | "type"))
+    {
+        return Err("unsupported or ambiguous stdio transport");
+    }
+    if object.get("args").is_some_and(|args| !args.as_array().is_some_and(|args| args.iter().all(Value::is_string)))
+        || object.get("env").is_some_and(|env| !env.as_object().is_some_and(|env| env.values().all(Value::is_string)))
+    {
+        return Err("stdio args and env must contain only strings");
+    }
+    Ok(false)
+}
+
 fn rewrite_mcp_config_with_slots(json: &Value, self_exe: &Path, purpose: ProxyPurpose, own_server: &Value, replace_builtin_slots: bool) -> Result<ProxyRewrite, String> {
     // The caller supplies the host's canonical definition, never one read out
     // of the raw file. This API accepts raw input only, even with no purpose.
     validate_raw_mcp_config(json, self_exe, own_server)?;
+    if purpose.tool_gate && (!json.is_object()
+        || json.get("mcpServers").is_some_and(|servers| !servers.is_object()))
+    {
+        return Err("MCP configuration must contain an object server map; spawn refused".into());
+    }
     let mut out = json.clone();
     let mut dropped_remote = Vec::new();
     let exe = self_exe.to_string_lossy().into_owned();
@@ -333,7 +372,12 @@ fn rewrite_mcp_config_with_slots(json: &Value, self_exe: &Path, purpose: ProxyPu
         if purpose.none() {
             continue;
         }
-        if is_direct_remote_entry(&def) {
+        let remote = if purpose.tool_gate {
+            classify_gated_transport(&def).map_err(|reason| format!("MCP server '{name}': {reason}; spawn refused"))?
+        } else {
+            is_direct_remote_entry(&def)
+        };
+        if remote {
             if purpose.tool_gate || (purpose.secret_env && server_has_secret_refs(&def)) {
                 tracing::warn!(
                     server = %name,
@@ -432,6 +476,38 @@ mod tests {
         assert_eq!(red["mcpServers"]["zap"]["args"][0], "mcp-proxy");
         let none = rewrite_mcp_config_for_proxy_with(&cfg(exe), p, ProxyPurpose { redaction: false, tool_gate: false, secret_env: false }, &cfg(exe)["mcpServers"]["duduclaw"]).unwrap();
         assert_eq!(none, cfg(exe));
+    }
+
+    #[test]
+    fn gate_refuses_unclassified_transport_shapes_in_both_runtime_paths() {
+        let exe = Path::new("/opt/duduclaw");
+        let purpose = ProxyPurpose { redaction: false, tool_gate: true, secret_env: false };
+        let own = cfg("/opt/duduclaw")["mcpServers"]["duduclaw"].clone();
+        for entry in [
+            json!(null), json!([]), json!({}), json!({"command": 3}),
+            json!({"command": ""}), json!({"endpoint": "https://example.com/mcp"}),
+            json!({"type": "websocket", "url": "https://example.com/mcp"}),
+            json!({"type": "future", "command": "server"}),
+            json!({"type": 3, "command": "server"}),
+            json!({"type": "sse"}), json!({"url": 3}),
+            json!({"command": "server", "url": "https://example.com/mcp"}),
+            json!({"command": "server", "transport": "future"}),
+            json!({"command": "server", "args": [3]}),
+            json!({"command": "server", "env": {"KEY": 3}}),
+        ] {
+            let config = json!({"mcpServers": {"unknown": entry}});
+            for rewrite in [rewrite_mcp_config_for_gate, rewrite_mcp_config_for_runtime_gate] {
+                let error = rewrite(&config, exe, purpose, &own).err().expect("unclassified transport must refuse spawn");
+                assert!(error.contains("unknown") && error.contains("spawn refused"), "{error}");
+            }
+        }
+        for config in [json!(null), json!([]), json!({"mcpServers": []})] {
+            assert!(rewrite_mcp_config_for_gate(&config, exe, purpose, &own).is_err());
+        }
+        let config = json!({"mcpServers": {"stdio": {"type": "stdio", "command": "server", "args": ["--stdio"], "env": {"KEY": "value"}}}});
+        let result = rewrite_mcp_config_for_gate(&config, exe, purpose, &own).unwrap();
+        assert_eq!(result.config["mcpServers"]["stdio"]["args"][0], "mcp-proxy");
+        assert_eq!(result.config["mcpServers"]["stdio"]["args"][4], "server");
     }
 
     #[test]

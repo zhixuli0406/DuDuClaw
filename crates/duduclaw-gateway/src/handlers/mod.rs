@@ -563,15 +563,8 @@ impl MethodHandler {
             return boxed_frame(|| self.handle_website_credentials(method, params, ctx)).await;
         }
 
-        // ── Plugin extension dispatch ──────
-        // Try extension first; if it returns Some, the method is handled.
-        if let Some(frame) = self
-            .extension
-            .handle_method(method, params.clone(), ctx)
-            .await
-        {
-            return frame;
-        }
+        // Core dispatch always runs first. Only the terminal unknown-method
+        // arm may consult the registered extension, without cloning secrets.
         if let Some(frame) = boxed_frame(|| self.dispatch_kb(method, &params, ctx)).await {
             return frame;
         }

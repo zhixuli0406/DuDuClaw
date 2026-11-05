@@ -6,6 +6,12 @@ external server's tools without a hand-written Rust connector. This is how you
 wire Plane, Chatwoot, Invoice Ninja, Gmail/Calendar, WooCommerce, and any other
 MCP server into an agent.
 
+## Third-party tool checks (unreleased)
+
+Both stdio and Streamable HTTP `[[mcp.external]]` mounts use the same annotation-based `ThirdPartyGate` as managed MCP proxies. The server's tool allowlist/denylist still narrows its tools; employee name restrictions, effect rules and approval requirements also apply to listing and calling them. Annotations can only raise the Modify default to Delete; read-only claims never lower risk, even with the legacy server trust setting. A tool refused by the gate is not exposed to the model.
+
+Direct URL/type entries in an employee's `.mcp.json` are refused by managed spawn paths. Configure a managed remote MCP connection instead; this restriction does not remove the HTTP `url` support in `[[mcp.external]]`. See [extension boundaries](../architecture/extension-gates.md).
+
 ## When to use this vs a native connector
 
 - **MCP Bridge** (this page): the SaaS already ships (or the community ships) an
@@ -100,8 +106,8 @@ Field reference:
   hidden. Combine with `denied_tools` to blocklist specific dangerous tools.
 - For write/irreversible tools (billing, deletes), also list them in the agent's
   `[capabilities] approval_required_tools` so they route through the HITL
-  `ApprovalBroker` — the MCP Bridge controls *visibility*, approvals control
-  *execution*.
+  `ApprovalBroker`. The registry gate checks both visibility and execution;
+  filtering a tool from the listing is not the only authorization check.
 
 ## Live-verification runbook
 

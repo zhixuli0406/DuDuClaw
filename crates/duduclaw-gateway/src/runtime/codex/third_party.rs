@@ -14,9 +14,9 @@
 //! third-party tool gate always on): stdio servers run through `duduclaw
 //! mcp-proxy` (classification from annotations, `action_rules`, explore
 //! lane, approvals; redaction when active), DuDuClaw's remote bridges gate
-//! themselves, and direct URL entries are removed. Anything else the rewrite
-//! leaves behind (an entry without a command, a name that is not a bare TOML
-//! key) is dropped, never handed to Codex unproxied.
+//! themselves, and direct URL entries are removed. Unknown transports, including
+//! entries without a command or URL, refuse the spawn. Valid transports with a
+//! name that is not a bare TOML key are dropped, never handed to Codex unproxied.
 //!
 //! Codex runs with `approval_policy=never`, so each of these servers is
 //! registered with `default_tools_approval_mode = "auto"`, like the duduclaw

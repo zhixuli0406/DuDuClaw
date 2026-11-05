@@ -1885,9 +1885,9 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
     // a server with an unresolvable credential is dropped fail-safe.
     let home_dir = home_dir.to_path_buf();
     let agent_dir = home_dir.join("agents").join(agent_id);
-    // In the explore lane no third-party server is mounted: nothing here
-    // would hold it to read-only tools (`crate::explore_lane`).
-    let externals = if crate::explore_lane::in_explore() {
+    // Preserve the narrower explore surface; utility calls also get no
+    // external tools. Normal calls use an annotation-aware ThirdPartyGate.
+    let externals = if crate::runtime_dispatch::in_utility_call() || crate::explore_lane::in_explore() {
         Vec::new()
     } else {
         crate::mcp_external::load_external_mcp_servers_resolved(&agent_dir, &home_dir).await
@@ -1972,7 +1972,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
                 .await
             }
             None => {
-                duduclaw_llm::McpClient::connect(
+                duduclaw_llm::McpClient::connect_scrubbed(
                     &ext.command,
                     &ext.args,
                     &ext.env,
@@ -2025,19 +2025,20 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
         }
     }
 
-    let registry = match duduclaw_llm::ToolRegistry::from_client_slots_named(clients, filters).await
-    {
+    let boundaries = external_boundaries.into_iter().map(|(client, server)| {
+        let boundary: std::sync::Arc<dyn duduclaw_llm::ClientCallBoundary> = std::sync::Arc::new(
+            crate::egress_registry::RegistryBoundary::new(&home_dir, agent_id, &server),
+        );
+        (client, boundary)
+    }).collect();
+    let registry = match duduclaw_llm::ToolRegistry::from_client_slots_named_with_boundaries(
+        clients, filters, boundaries,
+    ).await {
         Ok(mut reg) => {
             for client in credential_observers {
                 let observer = crate::credential_declaration::ToolObservation::new(&home_dir, agent_id);
                 if reg.register_client_boundary(client, std::sync::Arc::new(observer)).is_err() {
                     warn!("credential observation unavailable for a proxied MCP client");
-                }
-            }
-            for (client, server) in external_boundaries {
-                let boundary = crate::egress_registry::RegistryBoundary::new(&home_dir, agent_id, &server);
-                if reg.register_client_boundary(client, std::sync::Arc::new(boundary)).is_err() {
-                    return Err("external MCP egress boundary unavailable".into());
                 }
             }
             for (client, guard) in google_guards {
@@ -4030,24 +4031,11 @@ tokio::task_local! {
 ///
 /// When `capabilities` is provided, high-risk tools not explicitly enabled
 /// are added to `--disallowedTools` (deny-by-default security posture).
-/// RFC-23 §13.6: compute this spawn's `--mcp-config` override.
-///
-/// Unlike `channel_reply.rs`, this path deliberately passes **no**
-/// `--mcp-config` at all — the CLI auto-discovers `<work_dir>/.mcp.json`
-/// from the working directory. That auto-discovery is exactly what lets a
-/// customer's external MCP servers run unproxied on every dispatch / cron /
-/// heartbeat / goal-loop turn, so when redaction is active we take the
-/// discovery over: rewrite the config (external stdio servers routed through
-/// `duduclaw mcp-proxy`) into a per-spawn temp file and point the CLI at it.
-///
-/// `None` ⇒ nothing is added and the command line stays byte-identical to
-/// the pre-RFC-23 behaviour (no `--mcp-config`, no `--strict-mcp-config`,
-/// auto-discovery unchanged). `--strict-mcp-config` is only ever added
-/// together with the rewritten file — it is what stops the CLI from ALSO
-/// merging the ambient/global config once we start naming one explicitly.
-///
-/// `Err` ⇒ the third-party tool gate is needed and its config could not be
-/// produced; the spawn must be refused (2026-10-08 close-out).
+/// Pin a managed Claude spawn to its frozen MCP config. Every third-party
+/// server crosses the tool gate; built-in-only and missing files also get
+/// strict config flags so ambient sources cannot add ungated servers.
+/// A missing work directory means this is not an employee-config spawn.
+/// Any failure to produce the copy refuses the spawn.
 pub(crate) fn mcp_proxy_cli_args(
     home_dir: &Path,
     work_dir: Option<&Path>,
@@ -4056,9 +4044,6 @@ pub(crate) fn mcp_proxy_cli_args(
         return Ok(None);
     };
     let mcp_json = work_dir.join(".mcp.json");
-    if !mcp_json.exists() {
-        return Ok(None);
-    }
     let Some(proxied) = crate::redaction_proxy::maybe_proxy_mcp_config_in_lane(
         home_dir,
         &mcp_json,
@@ -4079,7 +4064,7 @@ pub(crate) fn mcp_proxy_cli_args(
 /// config source that overrides cwd auto-discovery.
 ///
 /// `explicit = None` ⇒ exactly [`mcp_proxy_cli_args`], i.e. the pre-existing
-/// behaviour (nothing added unless redaction or a third-party gate needs a rewrite).
+/// behaviour (every configured working directory uses a frozen strict config).
 ///
 /// `explicit = Some(path)` is the Team-as-Agent case (design §4.3 E3). A role
 /// member's cwd is the *employee's* workspace, and the Claude CLI would
@@ -4090,9 +4075,8 @@ pub(crate) fn mcp_proxy_cli_args(
 /// `--strict-mcp-config` (which stops the CLI from ALSO merging the ambient
 /// and cwd configs) is what keeps cwd and identity independent.
 ///
-/// The explicit file still goes through the RFC-23 redaction rewrite when
-/// redaction is active, so a role member's external MCP servers are proxied
-/// exactly like anybody else's.
+/// The explicit file goes through the mandatory tool gate and optional
+/// redaction, so role members receive the same protections.
 ///
 /// A requested-but-missing explicit file still names that file with
 /// `--strict-mcp-config` (and logs a `warn`), so the CLI fails to start
@@ -4156,7 +4140,7 @@ fn mcp_config_cli_args(
 pub(crate) struct ClaudeCmdGuards {
     /// `--system-prompt-file` temp file (BE-C1).
     prompt: Option<tempfile::TempPath>,
-    /// RFC-23 §13.6 `--mcp-config` rewritten config, when redaction is active.
+    /// Frozen `--mcp-config` copy, held through child exit.
     mcp_proxy: Option<tempfile::TempPath>,
     /// `(agent, turn) → reply channel` registration for the computer-use
     /// route's confirmations; lives as long as the spawned CLI.
@@ -4253,7 +4237,7 @@ fn prepare_claude_cmd(
         cmd.current_dir(dir);
     }
     // RFC-23 §13.6: override that auto-discovery with a proxied copy when
-    // redaction is active (see `mcp_proxy_cli_args`). `None` ⇒ no flags at
+    // the managed MCP gate runs (see `mcp_proxy_cli_args`). `None` ⇒ no flags at
     // all, auto-discovery unchanged.
     let mcp_proxy_guard = match mcp_config_cli_args(home_dir, work_dir, identity.mcp_config)? {
         Some((args, guard)) => {
@@ -5570,17 +5554,18 @@ mod redaction_proxy_cli_args_tests {
     }
 
     #[test]
-    fn redaction_off_and_egress_off_add_no_mcp_flags_at_all() {
-        // With no gate active, preserve CLI auto-discovery byte for byte:
-        // neither --mcp-config nor --strict-mcp-config may be added.
+    fn redaction_off_and_egress_off_still_add_third_party_gate_flags() {
+        // ThirdPartyGate is mandatory independently of the other guards.
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = agent_dir_with_mcp_json(tmp.path());
         std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
-        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none());
+        let (args, _guard) = mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().unwrap();
+        assert_eq!(args[0], "--mcp-config");
+        assert_eq!(args[2], "--strict-mcp-config");
     }
 
     #[test]
-    fn redaction_off_without_third_party_servers_adds_no_mcp_flags_in_any_egress_mode() {
+    fn builtin_only_spawns_pin_strict_config_in_every_egress_mode() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = agent_dir_with_mcp_json(tmp.path());
         let path = dir.join(".mcp.json");
@@ -5590,7 +5575,7 @@ mod redaction_proxy_cli_args_tests {
         std::fs::write(&path, &original).unwrap();
         for mode in ["off", "shadow", "ask", "block"] {
             std::fs::write(tmp.path().join("config.toml"), format!("[security]\negress_guard='{mode}'\n")).unwrap();
-            assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_none(), "{mode}");
+            assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap().is_some(), "{mode}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         }
     }
@@ -5627,7 +5612,7 @@ mod redaction_proxy_cli_args_tests {
         assert!(
             mcp_proxy_cli_args(tmp.path(), Some(&dir))
                 .unwrap()
-                .is_none()
+                .is_some()
         );
         let (args, _guard) = crate::explore_lane::EXPLORE
             .sync_scope(true, || mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap())
@@ -5646,9 +5631,7 @@ mod redaction_proxy_cli_args_tests {
         );
     }
 
-    /// 2026-10-08 close-out: when the gate is needed and the gated copy
-    /// cannot be produced, the spawn is refused instead of falling back to
-    /// the ungated file; redaction alone keeps the old fallback.
+    /// A malformed config is refused in every guard mode.
     #[test]
     fn an_unproducible_gated_config_refuses_egress_explore_and_action_rules_spawns() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5664,18 +5647,16 @@ mod redaction_proxy_cli_args_tests {
             assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&err), "{mode}: {err}");
         }
         std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
-        // Nothing needs gating ⇒ untouched.
+        // The mandatory third-party gate still refuses.
         assert!(
             mcp_proxy_cli_args(tmp.path(), Some(&dir))
-                .unwrap()
-                .is_none()
+                .is_err()
         );
-        // Redaction only with egress explicitly off retains the old fallback.
+        // Redaction cannot restore the ungated fallback.
         std::fs::write(tmp.path().join("config.toml"), "[security]\negress_guard='off'\n[redaction]\nenabled=true\nprofiles=['general']\n").unwrap();
         assert!(
             mcp_proxy_cli_args(tmp.path(), Some(&dir))
-                .unwrap()
-                .is_none()
+                .is_err()
         );
         // Explore lane ⇒ refused with the spawn-gate marker and audited.
         let err = crate::explore_lane::EXPLORE
@@ -5765,7 +5746,7 @@ mod redaction_proxy_cli_args_tests {
     }
 
     #[test]
-    fn no_work_dir_or_no_mcp_json_is_a_no_op() {
+    fn no_work_dir_is_noop_but_missing_mcp_json_pins_empty_config() {
         let tmp = tempfile::TempDir::new().unwrap();
         enable_redaction(tmp.path());
         assert!(mcp_proxy_cli_args(tmp.path(), None).unwrap().is_none());
@@ -5775,14 +5756,13 @@ mod redaction_proxy_cli_args_tests {
         assert!(
             mcp_proxy_cli_args(tmp.path(), Some(&bare))
                 .unwrap()
-                .is_none()
+                .is_some()
         );
     }
 
     #[test]
-    fn a_config_with_only_the_builtin_server_is_a_no_op() {
-        // Nothing to proxy ⇒ no flags, so auto-discovery (and the ambient
-        // config) keep working exactly as before.
+    fn a_config_with_only_the_builtin_server_still_disables_ambient_sources() {
+        // Even a built-in-only file must disable ambient MCP discovery.
         let tmp = tempfile::TempDir::new().unwrap();
         enable_redaction(tmp.path());
         let dir = tmp.path().join("agents").join("solo");
@@ -5796,7 +5776,7 @@ mod redaction_proxy_cli_args_tests {
         assert!(
             mcp_proxy_cli_args(tmp.path(), Some(&dir))
                 .unwrap()
-                .is_none()
+                .is_some()
         );
     }
 
@@ -5851,16 +5831,14 @@ mod redaction_proxy_cli_args_tests {
             .unwrap()
             .unwrap();
         assert_eq!(args[0], "--mcp-config");
-        assert_eq!(args[1], member_mcp.to_string_lossy());
+        assert_eq!(args[1], guard.as_ref().unwrap().to_string_lossy());
         assert_eq!(args[2], "--strict-mcp-config");
         assert_eq!(args.len(), 3);
-        // Redaction is off in this temp home, so nothing is rewritten and no
-        // temp file needs to outlive the child.
-        assert!(guard.is_none(), "unexpected rewritten temp config");
+        assert!(guard.is_some(), "explicit identity is frozen in the gated temp config");
     }
 
     #[test]
-    fn no_explicit_mcp_config_keeps_the_pre_existing_behaviour() {
+    fn no_explicit_mcp_config_still_pins_managed_config() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("agents").join("agnes");
         std::fs::create_dir_all(&dir).unwrap();
@@ -5870,11 +5848,11 @@ mod redaction_proxy_cli_args_tests {
                 .to_string(),
         )
         .unwrap();
-        // Redaction inactive ⇒ no flags at all, auto-discovery untouched.
+        // The mandatory gate pins the managed config even with redaction off.
         assert!(
             mcp_config_cli_args(tmp.path(), Some(&dir), None)
                 .unwrap()
-                .is_none()
+                .is_some()
         );
     }
 

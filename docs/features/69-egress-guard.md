@@ -1,5 +1,7 @@
 # Outgoing data guard
 
+**Codex external configuration gate (unreleased):** Employees, Explore, utility, Task Sandbox and Discovery may run when external layers are absent or define no MCP servers; detected MCP or unreadable/unparseable existing layers refuse launch with the source named. A refused explicit Codex judge fails acceptance without retrying the default judge. This checks a local/cache snapshot before launch, not complete isolation from subsequent cloud refresh. See [checked sources and limits](../architecture/extension-gates.md).
+
 Available from v1.77.0. The guard tracks private reads during an AI employee's turn and checks later outgoing MCP calls before execution, outside the model.
 
 ## Choose a mode
@@ -137,7 +139,7 @@ This guard protects product paths; it does not isolate a process with unrestrict
 
 ## Known limitations
 
-Direct `[[mcp.external]]` mounts in the API tool loop (stdio, HTTP and the Google closed bridge) also pass the guard. Their tool registry does not retain MCP annotations, so these calls are conservatively classified as **Modify**, even when the server describes them as read-only; exact per-tool action rules still apply. The MCP proxy and remote bridge retain their annotation-based decisions with `trusted_read_hint_servers`. A tainted direct-mounted read can therefore require outgoing approval.
+Direct `[[mcp.external]]` mounts in the API tool loop (stdio, HTTP and the Google closed bridge) also pass the guard and preserve annotations. All third-party paths default to **Modify**, including tools claiming `readOnlyHint`; `destructiveHint` raises the effect to **Delete**. The legacy `trusted_read_hint_servers` setting cannot lower risk or skip sink leases. Exact per-tool action rules still apply.
 
 Taint is tracked per turn; active sink fences apply per employee. This guard does not provide a network sandbox or a runtime-wide network boundary. Private data supplied in prompts or read outside the covered MCP routes is not automatically classified. A new turn has a new ledger key; the guard does not follow information copied across turns. Turn taint is not durable across gateway restarts; active sink leases are persisted separately. Observation mode allows outgoing calls and only records what would require approval.
 

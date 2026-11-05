@@ -127,6 +127,8 @@ pub struct McpToolDef {
     pub description: String,
     /// JSON Schema for the tool input (`inputSchema` on the wire).
     pub input_schema: Value,
+    /// Upstream claims retained for the host gate, never provider authority.
+    pub annotations: duduclaw_core::ToolAnnotations,
 }
 
 impl McpToolDef {
@@ -330,6 +332,7 @@ pub fn parse_tools_list_response(frame: &Value) -> Result<Vec<McpToolDef>, McpEr
             name,
             description,
             input_schema,
+            annotations: duduclaw_core::ToolAnnotations::from_tool(t),
         });
     }
     Ok(out)
@@ -1244,6 +1247,9 @@ pub trait ClientCallLease: Send + Sync {
 /// Admission sees final arguments; completion is based on model-visible payload.
 #[async_trait]
 pub trait ClientCallBoundary: Send + Sync {
+    /// Runs before collision resolution and model exposure. The same boundary
+    /// owns call admission; a failed listing must never produce an ungated slot.
+    fn filter_tools(&self, _tools: &mut Vec<McpToolDef>) -> Result<(), String> { Ok(()) }
     async fn before_call(&self, tool: &str, args: &Value) -> Result<(), String>;
     async fn after_success(&self, tool: &str) -> Result<(), String>;
     async fn begin_call(&self, tool: &str, args: &Value) -> Result<Option<String>, String> {
@@ -1417,9 +1423,22 @@ impl ToolRegistry {
     /// actual index before any credential-bearing discovery request; neither
     /// remote tool metadata nor a colliding logical name can replace it.
     pub async fn from_client_slots_named(
-        mut clients: Vec<(String, RegistryClient)>,
+        clients: Vec<(String, RegistryClient)>,
         filters: Vec<ToolFilter>,
     ) -> Result<Self, McpError> {
+        Self::from_client_slots_named_with_boundaries(clients, filters, HashMap::new()).await
+    }
+
+    /// Install host boundaries before discovery so annotations and visibility
+    /// are gated by the same object that checks each subsequent call.
+    pub async fn from_client_slots_named_with_boundaries(
+        mut clients: Vec<(String, RegistryClient)>,
+        filters: Vec<ToolFilter>,
+        client_boundaries: HashMap<usize, Arc<dyn ClientCallBoundary>>,
+    ) -> Result<Self, McpError> {
+        if client_boundaries.keys().any(|index| *index >= clients.len()) {
+            return Err(McpError::Spawn("MCP discovery boundary slot unavailable".into()));
+        }
         let mut client_interceptors = HashMap::new();
         let mut scoped_operation_timeouts = HashMap::new();
         let mut closed_client_indices = HashSet::new();
@@ -1458,6 +1477,11 @@ impl ToolRegistry {
                 per_client[*index].clear();
             }
         }
+        for (index, tools) in per_client.iter_mut().enumerate() {
+            if let Some(boundary) = client_boundaries.get(&index) {
+                boundary.filter_tools(tools).map_err(McpError::Spawn)?;
+            }
+        }
         let (routes, defs) = build_routes_filtered(&per_client, &filters);
         let (server_names, clients): (Vec<_>, Vec<_>) = clients.into_iter().unzip();
         let registry = Self {
@@ -1469,7 +1493,7 @@ impl ToolRegistry {
             source_attestation_required: HashSet::new(),
             ccr_disabled_tools: HashSet::new(),
             client_interceptors,
-            client_boundaries: HashMap::new(),
+            client_boundaries,
             client_notices: HashMap::new(),
             scoped_operation_timeouts,
             closed_client_indices,
@@ -2048,6 +2072,7 @@ pathlib.Path(sys.argv[1]).write_text('guarded')
             "result": {
                 "tools": [
                     { "name": "search", "description": "web search",
+                      "annotations": {"readOnlyHint": true, "destructiveHint": false},
                       "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}} },
                     { "name": "noschema" }
                 ]
@@ -2057,6 +2082,9 @@ pathlib.Path(sys.argv[1]).write_text('guarded')
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].name, "search");
         assert_eq!(tools[0].description, "web search");
+        assert_eq!(tools[0].annotations.read_only, Some(true));
+        assert_eq!(tools[0].annotations.destructive, Some(false));
+        assert_eq!(tools[1].annotations, duduclaw_core::ToolAnnotations::default());
         assert_eq!(tools[0].input_schema["properties"]["q"]["type"], "string");
         // Missing description/inputSchema default gracefully.
         assert_eq!(tools[1].description, "");
@@ -2479,11 +2507,13 @@ pathlib.Path(sys.argv[1]).write_text('guarded')
     fn build_routes_first_wins_on_collision() {
         let client_a = vec![
             McpToolDef {
+                annotations: Default::default(),
                 name: "search".into(),
                 description: "A search".into(),
                 input_schema: json!({}),
             },
             McpToolDef {
+                annotations: Default::default(),
                 name: "fetch".into(),
                 description: "A fetch".into(),
                 input_schema: json!({}),
@@ -2492,11 +2522,13 @@ pathlib.Path(sys.argv[1]).write_text('guarded')
         let client_b = vec![
             // Collides with client_a's "search" — must be ignored.
             McpToolDef {
+                annotations: Default::default(),
                 name: "search".into(),
                 description: "B search".into(),
                 input_schema: json!({}),
             },
             McpToolDef {
+                annotations: Default::default(),
                 name: "write".into(),
                 description: "B write".into(),
                 input_schema: json!({}),
@@ -2546,17 +2578,20 @@ pathlib.Path(sys.argv[1]).write_text('guarded')
     #[test]
     fn build_routes_filtered_applies_per_client_filter() {
         let internal = vec![McpToolDef {
+            annotations: Default::default(),
             name: "memory_search".into(),
             description: "".into(),
             input_schema: json!({}),
         }];
         let external = vec![
             McpToolDef {
+                annotations: Default::default(),
                 name: "crm_list".into(),
                 description: "".into(),
                 input_schema: json!({}),
             },
             McpToolDef {
+                annotations: Default::default(),
                 name: "crm_delete".into(),
                 description: "".into(),
                 input_schema: json!({}),
@@ -2728,6 +2763,26 @@ mod http_transport_tests {
             .expect("tools/call");
         assert_eq!(result.content, "echoed!");
         assert!(!result.is_error);
+
+        struct HideHttpTools;
+        #[async_trait]
+        impl ClientCallBoundary for HideHttpTools {
+            fn filter_tools(&self, tools: &mut Vec<McpToolDef>) -> Result<(), String> {
+                assert_eq!(tools[0].name, "echo");
+                tools.clear();
+                Ok(())
+            }
+            async fn before_call(&self, _: &str, _: &Value) -> Result<(), String> { Err("hidden".into()) }
+            async fn after_success(&self, _: &str) -> Result<(), String> { Ok(()) }
+        }
+        let gated_http = McpClient::connect_http(&url, &[], Duration::from_secs(5)).await.unwrap();
+        let boundaries: HashMap<usize, Arc<dyn ClientCallBoundary>> = [(0, Arc::new(HideHttpTools) as Arc<dyn ClientCallBoundary>)].into();
+        let gated_registry = ToolRegistry::from_client_slots_named_with_boundaries(
+            vec![("http".into(), RegistryClient::Persistent(gated_http))], vec![], boundaries,
+        ).await.unwrap();
+        assert!(gated_registry.tool_defs().is_empty());
+        assert!(gated_registry.call("echo", json!({})).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "hidden HTTP tool never dispatches");
 
         struct LiveGuard(Arc<AtomicBool>);
         impl ToolInterceptor for LiveGuard {

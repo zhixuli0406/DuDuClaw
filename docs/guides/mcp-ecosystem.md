@@ -1,5 +1,7 @@
 # More MCP tools: the MCP Registry, remote servers and app aggregators
 
+**Codex external configuration gate (unreleased):** Employees, Explore, utility, Task Sandbox and Discovery may run when external layers are absent or define no MCP servers; detected MCP or unreadable/unparseable existing layers refuse launch with the source named. A refused explicit Codex judge fails acceptance without retrying the default judge. This checks a local/cache snapshot before launch, not complete isolation from subsequent cloud refresh. See [checked sources and limits](../architecture/extension-gates.md).
+
 DuDuClaw employees use tools through MCP servers listed in their own
 `.mcp.json`. Besides the built-in catalogue (Playwright, Browserbase,
 Filesystem, Memory) and "Import from URL", the dashboard can now:
@@ -281,30 +283,20 @@ tool in `tools/list`:
 | Annotation | Kind |
 |------------|------|
 | `destructiveHint: true` | `delete` |
-| `readOnlyHint: true`, server listed in `trusted_read_hint_servers` | `read` |
-| `readOnlyHint: true`, server not listed | `modify` |
+| `readOnlyHint: true`, with or without legacy server trust | `modify` |
 | anything else, including no annotations | `modify` |
 
-Annotations are what the server says about itself; nothing checks them. A
-`destructiveHint` is believed from every server (it can only make a tool
-stricter). A `readOnlyHint` is believed only for servers an administrator
-lists:
+Annotations are untrusted server claims and may only raise risk. `destructiveHint` raises the default Modify to Delete. `readOnlyHint` cannot lower it; the legacy `trusted_read_hint_servers` list no longer grants read access.
 
 ```toml
 [capabilities]
-trusted_read_hint_servers = ["github"]   # .mcp.json server names
 action_rules = [
   { effect = "modify", verdict = "ask" },
   { tool = "github.delete_repository", verdict = "block" },   # or "mcp__github__delete_repository"
 ]
 ```
 
-The cost of the default: a malicious server could label a tool that deletes
-things `readOnlyHint: true`; believed, it would pass every `read` rule and the
-read-only lane. Not believed, a genuinely read-only tool of an unlisted server
-is treated like a change (asked, blocked or hidden wherever `modify` is). A
-tool the employee calls before the server listed it has no annotations and is
-`modify`.
+Read-only third-party tools also retain the Modify default. They remain subject to Modify action rules and sink leases, and are unavailable in Explore. Tools called before listing have no annotations and also default to Modify.
 
 **Enforcement** in the proxy and the bridge, with the employee's
 `action_rules` (re-read for every listing and call, same rules as for
@@ -317,14 +309,12 @@ DuDuClaw's tools; a `tool` rule names `<server>.<tool>` or
 - `ask` — the call waits for an ApprovalBroker decision (`mcp_call` card,
   5 minutes); a denial, an expiry or an unavailable approval store refuses it
   (audit `third_party_tool_approval`).
-- **Read-only lane** (`DUDUCLAW_LANE=explore`, the heartbeat proactive check
-  and work started by MCP Events): only tools classed `read` are listed and
-  callable, so every tool of an unlisted server is hidden.
+- **Read-only lane** (`DUDUCLAW_LANE=explore`): third-party tools are hidden and refused because their minimum classification is Modify; no host-owned read exception is implemented.
 
-No `action_rules` key and the normal lane: nothing changes. The proxy is put
-in front of `.mcp.json` stdio servers when redaction is active, when the
-employee has an `action_rules` key, or when the spawn runs in the read-only
-lane; remote servers always go through the bridge.
+Every managed spawn puts the proxy in front of `.mcp.json` stdio servers,
+regardless of redaction, `action_rules` or lane. Managed remote servers use
+the bridge. `[[mcp.external]]` mounts also apply `ThirdPartyGate` through the
+in-process registry; utility and explore-lane calls do not mount them.
 
 **Dashboard**: `MCP → Remote servers → Third-party tools and what they do`
 shows, per employee, each server's tools as last listed through the proxy or
@@ -350,12 +340,13 @@ reads the working directory's `.mcp.json` by itself; every name there is
 now overridden in `.grok/config.toml` (gated, or disabled), where before
 Grok started those servers ungated. Details: `docs/features/13-multi-runtime.md`.
 `url` / `type` entries in `.mcp.json` (the CLI
-talks to them directly) cannot be gated, so a spawn that is gated (an
-`action_rules` key, or the read-only lane) removes them from the config it
+talks to them directly) cannot be gated, so every managed spawn removes them from the config it
 hands the CLI (audit `third_party_remote_entry_dropped`; `duduclaw doctor`
 says so); connect them as remote servers instead. If the gated copy of
 `.mcp.json` cannot be built, that spawn is refused (audit
 `third_party_gate_config_unavailable`) rather than started ungated.
+
+Managed Claude spawns use only a temporary, strict MCP configuration, even when it contains only built-in tools. Managed Grok spawns refuse unmanaged project MCP entries and global MCP definitions under the actual `HOME` or `GROK_HOME`; unreadable configurations also refuse the spawn. The effective Grok configuration root must be absolute; correct a relative `HOME` or `GROK_HOME` before retrying. Existing files are preserved: move the server definitions into the employee MCP configuration before retrying. Standalone CLI runs and native tools remain outside this boundary.
 
 ## 5. Events from remote servers (MCP Events)
 
@@ -543,3 +534,5 @@ bridge entries with their host and connection state.
   Bash.
 - Pending sign-ins live in gateway memory: a gateway restart during a sign-in
   means starting it again.
+
+With the third-party gate enabled, unknown or conflicting MCP transport shapes refuse the spawn; only classified stdio entries and managed remote bridges can reach a runtime.

@@ -1,5 +1,7 @@
 # ダッシュボード設定の対応表（v1.68.0）
 
+**Codex の外部設定検査（未リリース）：** 外部設定がないか MCP を定義していなければ、通常の社員、Explore、utility、Task Sandbox、Discovery は実行できます。MCP の検出、既存設定の読み取り・解析失敗ではソース名を示して拒否します。明示した Codex judge の拒否は判定失敗となり、既定の judge では再試行しません。起動前のローカル／キャッシュのスナップショット検査であり、その後のクラウド更新を完全に隔離する保証はありません。[検査対象と制限](../../architecture/extension-gates.md)。
+
 ダッシュボードをパスのプレフィックス配下で公開する場合は、`config.toml` に `[dashboard] public_url = "https://host/agents"` を設定し、パスも含めてください。nginx の例：`location /agents/ { proxy_pass http://127.0.0.1:18889/; }`。Google Cloud には `https://host/agents/api/me/google/callback` を登録します（リモート MCP は `https://host/agents/oauth/mcp/callback`）。公開 URL とブラウザーの検証済みダッシュボード origin が一致する場合だけ、このプレフィックスを OAuth に使用します。LAN アクセスと URL の貼り付けフローの動作は変わりません。修正を含むバージョンへの更新と登録済みコールバック URL の変更後は、v1.79.1 用に追加したプレフィックスなしの `/api/me/google/callback` と `/me/connections` の nginx 回避ルールを削除できます。
 
 Enterprise設定（v1.76.0、ユーザー管理 → 組織の設定）：`users.org_settings.get/update` が `[people] manager_team_history`（有効な設定では既定オン）を管理します。即時反映され、再有効化で期間をリセット。詳細エディターでも監査対象の保護キーです。有効にする前に職員へ通知してください。[チーム会話の閲覧](../../features/ja-JP/68-manager-team-history.md)を参照。

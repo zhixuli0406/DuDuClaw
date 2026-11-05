@@ -135,3 +135,56 @@ for line in sys.stdin:
         assert_eq!(boundary.released.load(Ordering::SeqCst), usize::from(matches!(case, "success" | "error")), "{case}");
     }
 }
+
+/// One object must see upstream annotations and govern the eventual route.
+struct DiscoveryProbe {
+    denied: AtomicBool,
+    observed: AtomicUsize,
+}
+
+#[async_trait]
+impl ClientCallBoundary for DiscoveryProbe {
+    fn filter_tools(&self, tools: &mut Vec<McpToolDef>) -> Result<(), String> {
+        self.observed.fetch_add(tools.len(), Ordering::SeqCst);
+        tools.retain(|tool| tool.annotations.read_only == Some(true));
+        Ok(())
+    }
+    async fn before_call(&self, _: &str, _: &Value) -> Result<(), String> {
+        if self.denied.load(Ordering::SeqCst) { Err("revoked".into()) } else { Ok(()) }
+    }
+    async fn after_success(&self, _: &str) -> Result<(), String> { Ok(()) }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn discovery_boundary_filters_stdio_before_routing_and_rechecks_calls() {
+    let script = r#"
+import json, sys
+for line in sys.stdin:
+    req = json.loads(line)
+    if 'id' not in req: continue
+    method = req.get('method')
+    if method == 'initialize':
+        result = {'protocolVersion':'2025-06-18','capabilities':{'tools':{}},'serverInfo':{'name':'test','version':'1'}}
+    elif method == 'tools/list':
+        result = {'tools':[{'name':'get','annotations':{'readOnlyHint':True}},{'name':'put'}]}
+    else:
+        result = {'content':[{'type':'text','text':'called'}]}
+    print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}), flush=True)
+"#;
+    let client = McpClient::connect(
+        python3_interpreter(), &["-u".into(), "-c".into(), script.into()], &[], Duration::from_secs(10),
+    ).await.unwrap();
+    let boundary = Arc::new(DiscoveryProbe { denied: AtomicBool::new(false), observed: AtomicUsize::new(0) });
+    let boundaries: HashMap<usize, Arc<dyn ClientCallBoundary>> = [(0, boundary.clone() as Arc<dyn ClientCallBoundary>)].into();
+    let registry = ToolRegistry::from_client_slots_named_with_boundaries(
+        vec![("stdio".into(), RegistryClient::Persistent(client))], vec![], boundaries,
+    ).await.unwrap();
+    assert_eq!(boundary.observed.load(Ordering::SeqCst), 2);
+    assert_eq!(registry.tool_defs().iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), ["get"]);
+    assert!(registry.call("put", json!({})).await.is_err());
+    assert_eq!(registry.call("get", json!({})).await.unwrap().content, "called");
+    boundary.denied.store(true, Ordering::SeqCst);
+    let blocked = registry.call("get", json!({})).await;
+    assert!(blocked.is_err() || blocked.unwrap().is_error);
+}

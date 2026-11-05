@@ -1,10 +1,24 @@
 # セキュリティ防御
 
+**Codex の外部設定検査（未リリース）：** 外部設定がないか MCP を定義していなければ、通常の社員、Explore、utility、Task Sandbox、Discovery は実行できます。MCP の検出、既存設定の読み取り・解析失敗ではソース名を示して拒否します。明示した Codex judge の拒否は判定失敗となり、既定の judge では再試行しません。起動前のローカル／キャッシュのスナップショット検査であり、その後のクラウド更新を完全に隔離する保証はありません。[検査対象と制限](../../architecture/extension-gates.md)。
+
 Enterprise [チーム履歴 API](68-manager-team-history.md)（v1.76.0）は、既存のスタッフ権限とは独立して現在の報告関係を確認します。外部本文は閲覧時にマスクし、開示ごとに永続的なハッシュチェーン監査が必要です。設定オフ、出所不明、導入済みモデルの故障、監査失敗では本文を返しません。regex のみなら `ner: false` を明示し、氏名や住所が残る場合があります。ホスト／DB への直接アクセスは製品経路の保護対象外です。
 
 > 稼働中の4つのガード、それぞれがどこで動くか、そしてどれもカバーしないもの。
 
 ---
+
+## 拡張機能と外部ツールの権限境界（未リリース）
+
+コア RPC は常にコアのディスパッチャーが処理します。拡張は `ext.<extension-id>.<method>` の名前空間でメソッドを宣言する必要があります。名前の衝突、重複、不正な登録がある場合、その拡張の RPC 登録を無効にして警告を記録します。未宣言のメソッドは拡張へ渡しません。
+
+拡張 HTTP ルートは `/ext/<extension-id>/…` 配下で明示的に宣言します。リテラルパスのみを受け付け、コアのパスを捕捉できません。認証、Origin 検査、2 MiB のリクエスト本文の上限は拡張ハンドラーの外側で適用します。すべてのルートは認証と最低ロールの宣言が必要です。`ExtensionRoute::new` の既定は Admin です。コアは現在の DB ロールを確認し、JWT 発行後の降格も反映します。Public モードは削除されました。 従来の不透明な `extra_routes()` は起動時に拒否されるため、拡張の作者はアップグレード前に移行する必要があります。
+
+管理対象の外部 MCP ツールには、`[[mcp.external]]` の stdio／HTTP マウントを含めて `ThirdPartyGate` を適用します。ツールの宣言は既定の Modify を Delete に引き上げる場合だけ採用し、読み取り専用の自己申告では分類を下げません。既存の名前制限と承認規則は一覧と呼び出しの両方に適用されます。スタッフの `.mcp.json` に直接指定した URL/type エントリーは拒否されます。管理対象のリモート MCP 接続へ移行してください。この境界はネイティブ拡張コードのサンドボックスではなく、操作者が単独で起動する CLI も対象外です。
+
+管理対象の Claude 起動は、内蔵ツールだけの場合も一時的な厳格 MCP 設定のみを使い、ほかの MCP 読み込み元を追加しません。Grok 起動は、プロジェクトの管理外 MCP エントリーと、実際の `HOME` または `GROK_HOME` にあるグローバル MCP 定義を拒否します。設定を読めない場合も起動しません。Grok が実際に使う設定ルートは絶対パスである必要があります。`HOME` または `GROK_HOME` が相対パスなら修正してから再試行してください。既存ファイルは保持するため、サーバー定義をスタッフの MCP 設定へ移してから再試行してください。単独で起動する CLI とネイティブツールはこの境界の対象外です。
+
+今回、全機能に共通するモジュールスイッチは追加していません。Odoo Live Chat のポーリング、音声 HTTP、チャネル音声、会議ジョブ、操作者コマンドは既存の個別ガードを使います。[入口一覧](../../architecture/extension-gates.md) にコードの位置、移行要件、検証の限界を記載しています。
 
 ## マシン操作と指示する人
 
@@ -201,11 +215,11 @@ action_rules = [
 
 補助処理と内部 runtime 呼び出しはタイムアウトした部分出力を拒否し、先に出力された `PASS` を評価結果にしません。完了済みの部分本文を表示できるのはチャネル返信だけです。Claude 補助プロセスは共通環境許可リストと既存の Anthropic 認証情報取得を使い、他社のキーやプラットフォームの社員／MCP token を継承しません。Windows の管理対象 CLI は停止状態の子を再開する前に Job Object に追加し、親の終了後もツリー全体を終了できます。Windows のネイティブ実行動作は保証されません。
 
-**Codex に残るリスク。** このモードはすべての内蔵ツールの除去を保証しません。読み取り可能な内蔵ツールが残る場合があり、プロンプトインジェクションを受けた補助呼び出しが OS ユーザーの読めるローカルファイルを読み、その内容を出力する可能性があります。Codex のソースでは読み取り専用ポリシーがツールコマンドのネットワークを無効にします。プロバイダーへのモデルリクエストは別で、ネイティブ OS による強制は保証されません。`--ignore-user-config` はユーザー設定を省略し、空の作業ディレクトリは社員のプロジェクト設定を避けますが、システムや組織管理設定から MCP サーバーが読み込まれる可能性は排除できていません。CLI help とソースの確認は、 検証元: [tool registry](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/core/src/tools/spec_plan.rs#L1425-L1428), [read-only network policy](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/protocol/src/protocol.rs#L1315-L1319), [system config loader](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/config/src/loader/mod.rs#L274-L293).
+**Codex に残るリスク。** このモードはすべての内蔵ツールの除去を保証しません。読み取り可能な内蔵ツールが残る場合があり、プロンプトインジェクションを受けた補助呼び出しが OS ユーザーの読めるローカルファイルを読み、その内容を出力する可能性があります。Codex のソースでは読み取り専用ポリシーがツールコマンドのネットワークを無効にします。プロバイダーへのモデルリクエストは別で、ネイティブ OS による強制は保証されません。`--ignore-user-config` はユーザー設定を省略し、空の作業ディレクトリは社員のプロジェクト設定を避けます。外部設定検査は MCP サーバーを含む設定と、既存の読み取り・解析不能な設定を拒否します。CLI help とソースの確認は、 検証元: [tool registry](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/core/src/tools/spec_plan.rs#L1425-L1428), [read-only network policy](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/protocol/src/protocol.rs#L1315-L1319), [system config loader](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/config/src/loader/mod.rs#L274-L293).
 
 **操作レビュー。** `config.toml [action_review] mode = "off" | "shadow" | "enforce"`、既定は `off` で、呼び出しのたびに読み直します（`system.update_config` は `action_review.mode` を受け付け、変更を保護キーとして監査します）。すべての静的ゲートが自動実行と判定し、かつツールに副作用がある場合だけ適用されます。レビュー担当はクローズドな選択肢の `decide()`（`duduclaw-gateway/src/decide.rs`）を通した utility モデルです。応答は厳密な JSON 契約のもとで `{"choice":"allow"|"ask"|"block"}` そのものでなければならず、それ以外は判定なしとして扱います。入力は構造化された情報だけです：ツール名、種類、引数のキー（識別子らしくないキーは数だけ）、ActionGuard のクローズドな finding トークン、社員の `CONTRACT.toml` の `must_not`。引数の値はプロンプトに入りません。`shadow` は結果を変えず、`tool_calls.jsonl` に `action_review` が判定または `unavailable` の行を追加します。`enforce` は `block` なら拒否し、`ask` または判定がない場合は ApprovalBroker で人に確認します。未知の mode 値や、存在するのに読めない・解析できない `config.toml` は `enforce` として扱います。2026-10-08 の仕上げ以降、レビューは OS 操作ツール（状況分類器が実行を許したあと）、`skill_hub_install`（セキュリティスキャン後の独自のインストール承認の手前）、そして gateway のコンピューター操作ルートで承認リストが人に回さなかった `computer_*`／`computer_workspace_*` ツールにも適用されます。それ以外は同じです（構造化された入力のみ、`shadow` は記録だけ、`enforce` は `block` で拒否しそれ以外は人に確認）。固定のレビュー回答（block、ask のあと承認、ask のあと拒否、判定なし）で、実際のプロセス内承認ストアに対して `enforce` を通しで動かす dispatcher テストがあります。
 
-**サードパーティの MCP ツール（2026-10-08）。** 社員のほかの MCP サーバーのツールは、DuDuClaw がその経路上にある場所で分類されます：`duduclaw mcp-proxy`（`.mcp.json` から起動するサーバー）と `duduclaw mcp-remote-bridge`（リモートサーバー）で、どちらも `duduclaw-gateway/src/third_party_tools.rs` を通ります。種類はサーバーの `tools/list` の `annotations` から決まります：`destructiveHint: true` ⇒ `delete`、`readOnlyHint: true` はサーバーが `[capabilities] trusted_read_hint_servers` にある場合だけ `read`、それ以外は `modify`、そのほか（アノテーションなしを含む）⇒ `modify`。サーバーは自分のツールについて何でも主張できるため、読み取り専用の主張は管理者がサーバーごとに指定した場合だけ信じます。信じれば嘘をつくサーバーの削除ツールがすべての `read` ルールと探索レーンを通り、信じなければ列挙されていないサーバーの本当に読み取り専用のツールも変更として扱われます。`action_rules` は DuDuClaw 自身のツールと同じく適用されます（ツールルールは `<サーバー>.<ツール>`、`mcp__<サーバー>__<ツール>`、`<サーバー>.*`）。`block` は社員が見る一覧からツールを隠し、呼び出しはサーバーに届く前に `-32003` で返します（監査 `third_party_tool_refused`）。`ask` は ApprovalBroker の判断まで呼び出しを保留し、承認ストアの停止、申請の失敗、拒否、期限切れはすべて拒否です（監査 `third_party_tool_approval`）。探索レーンでは `read` のツールだけを一覧化・呼び出しできます。起動時の書き換えは、秘匿化が有効なとき、社員に `action_rules` キーがあるとき、探索レーン（ハートビートの能動チェックと MCP Events で始まる作業）のときに stdio サーバーの前にプロキシを置きます。リモートサーバーは常にブリッジを通り、ブリッジ自身が制御します。`.mcp.json` のサーバーを起動するのは Claude CLI だけなので関係するランタイムはそれだけです。CLI が直接つなぐ `url`／`type` 項目は対象外です。ダッシュボード（`mcp.tool_effects`）は、サーバーごとの最後の一覧を現在の設定で再計算した種類と判断付きで表示します。ガイド：`docs/guides/mcp-ecosystem.md` 第 4 節。
+**サードパーティの MCP ツール（2026-10-08）。** 社員のほかの MCP サーバーのツールは、DuDuClaw がその経路上にある場所で分類されます：`duduclaw mcp-proxy`（`.mcp.json` から起動するサーバー）と `duduclaw mcp-remote-bridge`（リモートサーバー）で、どちらも `duduclaw-gateway/src/third_party_tools.rs` を通ります。分類の既定は `modify` で、`destructiveHint: true` は `delete` に引き上げます。上流の `readOnlyHint` はリスクを下げません。旧 `trusted_read_hint_servers` 設定も分類に影響しません。ホスト管理の読み取り例外は未実装で、探索レーンではサードパーティツールを利用できません。`action_rules` は DuDuClaw 自身のツールと同じく適用されます（ツールルールは `<サーバー>.<ツール>`、`mcp__<サーバー>__<ツール>`、`<サーバー>.*`）。`block` は社員が見る一覧からツールを隠し、呼び出しはサーバーに届く前に `-32003` で返します（監査 `third_party_tool_refused`）。`ask` は ApprovalBroker の判断まで呼び出しを保留し、承認ストアの停止、申請の失敗、拒否、期限切れはすべて拒否です（監査 `third_party_tool_approval`）。探索レーンでは `read` のツールだけを一覧化・呼び出しできます。管理対象の全ランタイムは、秘匿化や `action_rules` の有無にかかわらず `.mcp.json` の stdio サーバーをプロキシに通します。管理対象のリモート接続はブリッジを使い、直接の `url`／`type` エントリーは拒否します。`[[mcp.external]]` の stdio／HTTP マウントはプロセス内レジストリで同じゲートを使い、annotations を保持して一覧と実行を検査します。utility と探索レーンでは従来どおり `[[mcp.external]]` をマウントしません。ダッシュボード（`mcp.tool_effects`）は、サーバーごとの最後の一覧を現在の設定で再計算した種類と判断付きで表示します。ガイド：`docs/guides/mcp-ecosystem.md` 第 4 節。
 
 **対象外。** 他の MCP サーバーのツールはプロキシとブリッジを通る場合だけ分類されます（上記）。組み込みツールのルールは、DuDuClaw のツールフラグ付きで Claude CLI を起動する場所でだけ効きます。他のランタイムには Claude Code の組み込みツールはありません。分類はツール名単位なので、引数で効果が変わるツールは常に厳しいほうの種類になります。どのレイヤーも
 

@@ -1,10 +1,24 @@
 # 安全防線
 
+**Codex 外部設定檢查（尚未發佈）：** 外部設定不存在或未定義 MCP 時，一般員工、Explore、utility、Task Sandbox 與 Discovery 可執行；偵測到 MCP 或既有設定無法讀取／解析時，回報來源並拒絕。明確指定的 Codex 判官遭拒時，驗收失敗，不改用預設判官。這是啟動前的本機／快取快照檢查，無法保證後續雲端更新的完整隔離；[來源範圍與限制](../../architecture/extension-gates.md)。
+
 企業版[團隊對話 API](68-manager-team-history.md)（v1.76.0）以即時報告線獨立判斷，不放寬原本的員工存取權。外部文字在讀取時遮蔽，每次揭露都要完成雜湊鏈稽核；設定關閉、來源不明、已裝模型故障或稽核失敗都不回對話內容。只跑 regex 時會明示 `ner: false`，姓名與地址仍可能漏遮。直接主機／資料庫存取仍在產品入口保護範圍外。
 
 > 四道現役守衛、各自跑在哪裡，以及它們都擋不住什麼。
 
 ---
+
+## 擴充功能與第三方工具的權限邊界（尚未發佈）
+
+核心 RPC 一律由核心處理。擴充功能必須列出自己提供的方法，且名稱位於 `ext.<extension-id>.<method>`；註冊名稱衝突、重複或不合法時，會停用該擴充功能的 RPC 註冊並記錄警告。未宣告的方法不會交給擴充功能。
+
+擴充 HTTP 路由必須明確宣告，且位於 `/ext/<extension-id>/…`；只接受字面路徑，不得攔截核心路徑。認證、來源檢查與 2 MiB 的請求本文硬上限由擴充處理程式外層執行。所有路由皆須登入並宣告最低角色；`ExtensionRoute::new` 預設要求 Admin。核心以資料庫目前角色判斷，JWT 核發後降權立即生效。已移除 Public 模式。 舊的 `extra_routes()` 不透明路由會在啟動時遭拒，擴充作者須先遷移再升級。
+
+受管理的第三方 MCP 工具都經過 `ThirdPartyGate`，包含 `[[mcp.external]]` 的 stdio 與 HTTP 掛載。工具宣告只能將預設 Modify 提高為 Delete，唯讀宣稱不得降低分類；原有名稱限制與審批規則同時套用於工具清單和呼叫。員工 `.mcp.json` 中直接指定 URL/type 的項目會遭拒，請改用受管理的遠端 MCP 連線。這些限制不構成原生擴充程式碼的沙箱，也不涵蓋操作者自行啟動的獨立 CLI。
+
+受管理的 Claude 啟動一律使用暫存的嚴格 MCP 設定，即使只有內建工具也不讀取其他 MCP 來源。Grok 啟動會拒絕專案內未受管理的 MCP 項目，以及實際 `HOME` 或 `GROK_HOME` 下的全域 MCP 定義；設定讀不到時也不啟動。Grok 實際使用的設定根目錄必須是絕對路徑；`HOME` 或 `GROK_HOME` 若填相對路徑，請先修正再重試。原檔保留，請先將伺服器定義移到員工 MCP 設定再重試。手動執行的獨立 CLI 與原生工具仍在這道邊界之外。
+
+此次未新增全域功能模組開關。Odoo 線上客服輪詢、語音 HTTP 端點、通道音訊、會議背景工作與操作者指令仍各自使用既有防護。[入口盤點](../../architecture/extension-gates.md) 列出程式位置、遷移要求與驗證限制。
 
 ## 機器操作與下指令的人
 
@@ -201,11 +215,11 @@ action_rules = [
 
 輔助與其他內部 runtime 呼叫拒收逾時的部分輸出，提前輸出的 `PASS` 不會成為評審結果；只有頻道回覆可顯示已完成的部分文字。Claude 輔助行程套用共用環境白名單及既有 Anthropic 憑證查詢，不繼承其他廠商金鑰或平台員工／MCP token。Windows 受管理 CLI 在暫停的子行程繼續執行前加入 Job Object，主行程退出後仍保有整樹清理能力；Windows 原生執行行為沒有保證。
 
-**Codex 剩餘風險。** 此模式不能證明所有內建工具都已移除。內建讀取工具可能仍存在，因此遭提示注入的輔助呼叫可能讀取 OS 使用者有權讀取的本機檔案，並將內容寫進輸出。Codex 原始碼的唯讀政策停用工具指令網路；供應商模型請求另計，原生 OS 強制效果沒有保證。`--ignore-user-config` 略過使用者設定，空白工作目錄避開員工專案設定，但系統或組織管理設定仍可能載入 MCP server，尚不能保證排除。 查證來源: [tool registry](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/core/src/tools/spec_plan.rs#L1425-L1428), [read-only network policy](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/protocol/src/protocol.rs#L1315-L1319), [system config loader](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/config/src/loader/mod.rs#L274-L293).
+**Codex 剩餘風險。** 此模式不能證明所有內建工具都已移除。內建讀取工具可能仍存在，因此遭提示注入的輔助呼叫可能讀取 OS 使用者有權讀取的本機檔案，並將內容寫進輸出。Codex 原始碼的唯讀政策停用工具指令網路；供應商模型請求另計，原生 OS 強制效果沒有保證。`--ignore-user-config` 略過使用者設定，空白工作目錄避開員工專案設定，外部設定檢查會拒絕含原生 MCP 的設定，以及無法讀取或解析的既有設定。 查證來源: [tool registry](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/core/src/tools/spec_plan.rs#L1425-L1428), [read-only network policy](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/protocol/src/protocol.rs#L1315-L1319), [system config loader](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/config/src/loader/mod.rs#L274-L293).
 
 **動作審查。** `config.toml [action_review] mode = "off" | "shadow" | "enforce"`，預設 `off`，每次呼叫都重讀（`system.update_config` 接受 `action_review.mode`，變更記為受保護鍵）。只在所有靜態閘門都判定可自動執行、且工具有副作用時才審查。審查者是 utility 模型，透過封閉選項的 `decide()`（`duduclaw-gateway/src/decide.rs`）：回覆必須剛好是 `{"choice":"allow"|"ask"|"block"}` 並符合嚴格 JSON 契約，其他一律視為沒有判定。輸入只有結構化資料：工具名稱、類型、參數的鍵（不像識別字的鍵只計數）、ActionGuard 的封閉 finding token，以及員工 `CONTRACT.toml` 的 `must_not`。參數值不會進入提示。`shadow` 不改變結果，只在 `tool_calls.jsonl` 寫一列，`action_review` 欄位是判定或 `unavailable`。`enforce` 遇到 `block` 拒絕，遇到 `ask` 或沒有判定時透過 ApprovalBroker 問人。不認得的 mode 值，或 `config.toml` 存在但讀不到、無法解析時，視為 `enforce`。2026-10-08 收尾起，審查也會對 OS 動作工具（情境分類器放行之後）、`skill_hub_install`（在它安全掃描後的安裝核准之前），以及 gateway 電腦操作路由中沒有被任何核准清單送去問人的 `computer_*`、`computer_workspace_*` 工具執行；其餘不變（只有結構化輸入、`shadow` 只記錄、`enforce` 遇到 `block` 拒絕，其他問人）。有一個 dispatcher 測試以固定的審查回答（block、ask 後核准、ask 後拒絕、沒有判定）對真實的行程內核准資料庫跑完整流程。
 
-**第三方 MCP 工具（2026-10-08）。** 員工其他 MCP 伺服器的工具，在 DuDuClaw 位於其路徑上的地方分類：`duduclaw mcp-proxy`（`.mcp.json` 啟動的伺服器）與 `duduclaw mcp-remote-bridge`（遠端伺服器），兩者都經 `duduclaw-gateway/src/third_party_tools.rs`。類型取自伺服器 `tools/list` 中的 `annotations`：`destructiveHint: true` ⇒ `delete`；`readOnlyHint: true` 只有在伺服器列入 `[capabilities] trusted_read_hint_servers` 時才是 `read`，否則 `modify`；其他情況（包括沒有標記）⇒ `modify`。伺服器可以對自己的工具任意宣稱，所以唯讀宣稱只依管理員逐一指定的伺服器採信：若採信，說謊伺服器的刪除工具會通過所有 `read` 規則與探索通道；若不採信，未列入伺服器中真正唯讀的工具會被當成修改。`action_rules` 與 DuDuClaw 自己的工具同樣適用（工具規則寫 `<伺服器>.<工具>`、`mcp__<伺服器>__<工具>` 或 `<伺服器>.*`）：`block` 會從員工看到的清單隱藏該工具，呼叫在送到伺服器前以 `-32003` 回覆（稽核 `third_party_tool_refused`）；`ask` 讓呼叫等待 ApprovalBroker 決定，核准系統無法使用、請求失敗、被拒或逾時都會拒絕（稽核 `third_party_tool_approval`）。探索通道中只列出、只能呼叫 `read` 工具。啟動時的改寫在遮蔽啟用、員工有 `action_rules` 鍵、或處於探索通道（心跳主動檢查與 MCP Events 啟動的工作）時，讓 stdio 伺服器經過 proxy；遠端伺服器一律經過橋接，由橋接自行管制。只有 Claude CLI 會啟動 `.mcp.json` 的伺服器，所以只牽涉它；CLI 直接連線的 `url`／`type` 項目不涵蓋。儀表板（`mcp.tool_effects`）依目前設定重新計算，顯示每個伺服器最近一次列出的工具與類型、決定。說明：`docs/guides/mcp-ecosystem.md` 第 4 節。
+**第三方 MCP 工具（2026-10-08）。** 員工其他 MCP 伺服器的工具，在 DuDuClaw 位於其路徑上的地方分類：`duduclaw mcp-proxy`（`.mcp.json` 啟動的伺服器）與 `duduclaw mcp-remote-bridge`（遠端伺服器），兩者都經 `duduclaw-gateway/src/third_party_tools.rs`。分類預設為 `modify`；`destructiveHint: true` 提高為 `delete`。上游 `readOnlyHint` 不得降低風險，即使伺服器列在舊的 `trusted_read_hint_servers` 設定中也一樣；該設定不再影響分類。目前沒有主機管理的唯讀例外，探索通道不開放第三方工具。`action_rules` 與 DuDuClaw 自己的工具同樣適用（工具規則寫 `<伺服器>.<工具>`、`mcp__<伺服器>__<工具>` 或 `<伺服器>.*`）：`block` 會從員工看到的清單隱藏該工具，呼叫在送到伺服器前以 `-32003` 回覆（稽核 `third_party_tool_refused`）；`ask` 讓呼叫等待 ApprovalBroker 決定，核准系統無法使用、請求失敗、被拒或逾時都會拒絕（稽核 `third_party_tool_approval`）。探索通道中只列出、只能呼叫 `read` 工具。所有受管理的 runtime 都讓 `.mcp.json` 的 stdio 伺服器經過 proxy，不受遮蔽或 `action_rules` 是否啟用影響；受管理的遠端連線走橋接。直接 `url`／`type` 項目遭拒。`[[mcp.external]]` 的 stdio 與 HTTP 掛載透過行程內工具註冊表使用同一閘門，保留 annotations 並檢查清單與執行；utility 與探索通道維持不掛載 `[[mcp.external]]` 伺服器。儀表板（`mcp.tool_effects`）依目前設定重新計算，顯示每個伺服器最近一次列出的工具與類型、決定。說明：`docs/guides/mcp-ecosystem.md` 第 4 節。
 
 **涵蓋範圍。** 其他 MCP server 的工具只經 proxy 與橋接分類（見上）。內建工具的規則只在以 DuDuClaw 工具旗標啟動 Claude CLI 的地方生效；其他 runtime 沒有 Claude Code 內建工具。分類以工具名稱為準，所以效果隨參數改變的工具一律取較嚴格的類型。這幾層都還沒在真的 gateway 與真的模型上跑過，目前只有單元測試與 dispatcher 層級的測試。
 
