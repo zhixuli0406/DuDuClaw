@@ -387,6 +387,8 @@ async fn isolated_round5_workflow_session_is_host_only_and_bound_to_one_run() {
     let mut record = context().record().clone();
     record.lane = Lane::Standard;
     record.tools = List::new(vec![Text::new("plan_start".into()).unwrap()]).unwrap();
+    // plan_start requires the caller employee grant before workflow validation.
+    record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee }]).unwrap();
     let secret = "ab".repeat(32);
     let adapter = adapter.with_workflow_session(record.run, "host-session".into(), secret.clone()).unwrap();
     let request = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
@@ -396,14 +398,25 @@ async fn isolated_round5_workflow_session_is_host_only_and_bound_to_one_run() {
             "session_id":"different-session", "expires_at":"2099-01-01T00:00:00Z", "mac":"invalid"
         }}}
     }});
+    for resources in [vec![], vec![ResourceGrant::Employee { id: EmployeeId([8; 16]) }]] {
+        let mut denied_record = record.clone();
+        denied_record.resources = List::new(resources).unwrap();
+        let denied = adapter.dispatch(live_context(denied_record), "main", request.clone())
+            .await.unwrap().unwrap();
+        assert_eq!(denied["error"]["code"], -32003);
+        assert_eq!(denied["error"]["message"], "隔離執行不允許此工具或參數，或所需服務尚未就緒。");
+        assert!(!denied.to_string().contains(&secret));
+    }
     let matching = adapter.dispatch(live_context(record.clone()), "main", request.clone())
         .await.unwrap().unwrap();
-    assert!(matching.to_string().contains("workflow session mismatch"), "{matching}");
+    assert_eq!(matching["error"]["code"], -32003);
+    assert_eq!(matching["error"]["message"], "workflow session mismatch");
     assert!(!matching.to_string().contains(&secret));
     record.run = RunId([9; 16]);
     let other = adapter.dispatch(live_context(record), "main", request)
         .await.unwrap().unwrap();
-    assert!(other.to_string().contains("workflow extension unavailable"), "{other}");
+    assert_eq!(other["error"]["code"], -32003);
+    assert_eq!(other["error"]["message"], "workflow extension unavailable on this transport/session");
     assert!(!other.to_string().contains(&secret));
 }
 

@@ -533,7 +533,7 @@ fn publish_extraction(home: &std::path::Path, agent: &str, name: &str,
     use duduclaw_isolation::capability::ResourceGrant;
     use std::os::unix::fs::OpenOptionsExt;
     let namespace = format!("agent:{agent}");
-    if !context.record().resources.as_slice().iter().any(|r| matches!(r, ResourceGrant::Wiki { namespace: n } if n.as_str() == namespace)) {
+    if !context.record().io_resources().any(|r| matches!(r, ResourceGrant::Wiki { namespace: n } if n.as_str() == namespace)) {
         return Err(VerificationError::BindingMismatch);
     }
     validate_skill_pages(name, concepts, entities, pages)?;

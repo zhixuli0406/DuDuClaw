@@ -218,11 +218,15 @@ enabled = true
         ResourceGrant::Employee { id: record.employee },
         ResourceGrant::Workspace { handle: Text::new("work".into()).unwrap() },
         ResourceGrant::EmployeeScope { id: record.employee },
+        // EmployeeScope keeps producer output grants explicitly confined.
+        ResourceGrant::Confined { resource: Box::new(ResourceGrant::Wiki {
+            namespace: Text::new("agent:main".into()).unwrap() }) },
         ResourceGrant::UrlOrigin { origin: Text::new("https://example.com".into()).unwrap() },
     ]).unwrap();
     for resource in record.resources.as_slice() {
         duduclaw_mcp_boundary::tool_policy::validate_resource(resource).unwrap();
     }
+    record.canonical_bytes().expect("fixture must be a signable capability, including its resource mode");
     let context = live_context(record);
     let mut bindings = duduclaw_mcp_boundary::bindings::BindingStore::new(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
     bindings.register_principal(&context.record().principal).unwrap();
@@ -279,12 +283,27 @@ async fn employee_tool_parity(home: &std::path::Path) {
     let (dispatcher, context) = fixture(home);
     assert_eq!(crate::mcp_namespace::verified_employee_from_env(home).as_deref(), Some("main"));
     dispatcher.require_complete_services().unwrap();
+    dispatcher.require_context_services(&context).unwrap();
     let host = documented_refusals();
-    for extra in ["", "denied_tools = [\"odoo_search\", \"wiki_write\", \"send_to_agent\"]\naction_rules = [{tool=\"plan_start\", verdict=\"block\"}]"] {
+    // Missing producer authority must narrow discovery, not become a transport exception.
+    let mut without_wiki = context.record().clone();
+    without_wiki.resources = List::new(without_wiki.resources.as_slice().iter()
+        .filter(|grant| !matches!(grant, ResourceGrant::Confined { resource }
+            if matches!(resource.as_ref(), ResourceGrant::Wiki { .. }))).cloned().collect()).unwrap();
+    let without_wiki = live_context(without_wiki);
+    dispatcher.require_context_services(&without_wiki).unwrap();
+    let limited = names(&dispatcher.dispatch(without_wiki, "main", json!({
+        "jsonrpc":"2.0", "id":1, "method":"tools/list"})).await.unwrap().unwrap());
+    assert!(limited.contains("plan_start"), "missing Wiki must not invalidate unrelated tools");
+    for tool in ["knowledge_add_source", "skill_extract"] {
+        assert!(!limited.contains(tool), "{tool} requires employee wiki authority");
+    }
+    for extra in ["", "denied_tools = [\"odoo_search\", \"wiki_write\", \"send_to_agent\", \"knowledge_add_source\", \"skill_extract\"]\naction_rules = [{tool=\"plan_start\", verdict=\"block\"}]"] {
         std::fs::write(home.join("agents/main/agent.toml"), employee_config(extra)).unwrap();
         let ordinary = names(&crate::mcp::handle_tools_list_for_agent(&json!(1), &dispatcher.principal, home, "main").await);
         let isolated = names(&dispatcher.dispatch(context.clone(), "main", json!({"jsonrpc":"2.0", "id":1,
             "method":"tools/list"})).await.unwrap().unwrap());
+        assert!(!isolated.is_empty(), "valid fixture unexpectedly lost every tool");
         let expected = ordinary.difference(&host).cloned().collect::<BTreeSet<_>>();
         assert_eq!(isolated, expected, "transport must preserve existing employee gates");
         for tool in ["fork_run", "merge_or_select", "terminate_branch"] {
@@ -304,7 +323,7 @@ async fn employee_tool_parity(home: &std::path::Path) {
                 assert!(isolated.contains(tool), "production employee lost {tool}");
             }
         } else {
-            for tool in ["odoo_search", "wiki_write", "send_to_agent", "plan_start"] {
+            for tool in ["odoo_search", "wiki_write", "send_to_agent", "plan_start", "knowledge_add_source", "skill_extract"] {
                 assert!(!isolated.contains(tool), "existing policy was bypassed for {tool}");
             }
         }
@@ -379,7 +398,7 @@ async fn isolated_round5_background_memory_store_reuses_handler_with_dispatch_pr
 }
 
 #[test]
-fn every_connector_requires_an_installed_executor_at_boot() {
+fn every_connector_checks_executor_for_its_effective_route() {
     let home = tempfile::tempdir().unwrap();
     let (mut dispatcher, _) = fixture(home.path());
     assert!(dispatcher.require_complete_services().is_ok());
@@ -399,9 +418,16 @@ fn every_connector_requires_an_installed_executor_at_boot() {
     for policy in connectors {
         assert!(duduclaw_gateway::isolation_connectors::provider_for_tool(policy.name).is_some(), "{}", policy.name);
         dispatcher.services = Some(Arc::new(WithoutOne { omitted: policy.name, inner: complete.clone() }));
-        assert!(dispatcher.require_complete_services().is_err(), "{}", policy.name);
-        assert_eq!(dispatcher.service_manifest().iter().find(|(n, _)| *n == policy.name).unwrap().1,
-            ServiceState::MissingFactory);
+        let state = dispatcher.service_manifest().iter().find(|(n, _)| *n == policy.name).unwrap().1;
+        if cfg!(target_os = "linux") && matches!(policy.name, "model_search" | "model_recommend") {
+            assert!(matches!(boundary_route(policy.name), Some(BoundaryRoute::GatewayHandler(_))), "{}", policy.name);
+            assert_eq!(state, ServiceState::Ready, "bundled catalog needs no connector executor: {}", policy.name);
+            dispatcher.require_complete_services().unwrap();
+        } else {
+            assert_eq!(boundary_route(policy.name), Some(BoundaryRoute::Resource), "{}", policy.name);
+            assert_eq!(dispatcher.require_complete_services(), Err(VerificationError::Unavailable), "{}", policy.name);
+            assert_eq!(state, ServiceState::MissingFactory, "{}", policy.name);
+        }
     }
 }
 
@@ -412,6 +438,10 @@ fn startup_readiness_checks_finite_adapter_coverage_for_the_actual_capability_mo
     let (dispatcher, scope) = fixture(home.path());
     assert!(dispatcher.require_complete_services().is_ok());
     assert!(dispatcher.require_context_services(&scope).is_ok());
+    let mut ambiguous = scope.record().clone();
+    ambiguous.resources = List::new(scope.record().io_resources().cloned().collect()).unwrap();
+    assert!(ambiguous.canonical_bytes().is_err(), "top-level Wiki cannot mix with EmployeeScope");
+    assert_eq!(dispatcher.require_context_services(&live_context(ambiguous)), Err(VerificationError::Invalid));
     for name in ["tasks_list", "activity_list", "tasks_update", "goals_list", "list_cron_tasks", "list_reminders", "responsibility_get", "db_query"] {
         let mut record = scope.record().clone();
         record.tools = List::new(vec![Text::new(name.into()).unwrap()]).unwrap();

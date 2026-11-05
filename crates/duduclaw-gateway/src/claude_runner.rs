@@ -1109,7 +1109,8 @@ async fn call_claude_for_agent_impl(
             Some(s) => std::borrow::Cow::Owned(format!("{system_prompt}\n\n---\n\n{s}")),
             None => std::borrow::Cow::Borrowed(system_prompt.as_str()),
         };
-        return crate::runtime_dispatch::run_agent_prompt_text(
+        // Keep the multi-runtime dispatch state off the caller future.
+        return Box::pin(crate::runtime_dispatch::run_agent_prompt_text(
             crate::runtime_dispatch::AgentPrompt {
                 agent_dir: Some(&agent_dir),
                 home_dir,
@@ -1137,7 +1138,7 @@ async fn call_claude_for_agent_impl(
                 // codex; the round degrades explicitly instead.
                 allow_cross_family_failover: overrides.allow_cross_family_failover,
             },
-        )
+        ))
         .await;
     }
 
@@ -3721,7 +3722,7 @@ async fn call_claude_streaming(
     let mut child = if let Some((agent_dir, prompt, system_prompt, model)) = protected_input {
         #[cfg(target_os = "linux")]
         {
-            let (child, writer) = crate::isolation_mcp::runtime::spawn_claude(agent_dir, prompt, system_prompt, model).await?;
+            let (child, writer) = Box::pin(crate::isolation_mcp::runtime::spawn_claude(agent_dir, prompt, system_prompt, model)).await?;
             prompt_writer = Some(writer);
             child
         }

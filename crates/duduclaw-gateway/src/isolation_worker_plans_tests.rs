@@ -191,6 +191,50 @@ fn i1c_extraction_rejects_foreign_paths_duplicates_forged_summary_and_related_pa
 
 #[cfg(target_os = "linux")]
 #[test]
+fn i1c_extraction_publishes_only_with_own_finite_or_confined_wiki_grant() {
+    use duduclaw_isolation::{capability::{CapabilityRecord, ResourceGrant}, worker::SkillPage};
+    use duduclaw_mcp_boundary::{RequestContext, resources::ResourceRoots};
+    struct Live;
+    impl duduclaw_isolation::capability::LiveRequestVerifier for Live {
+        fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> { Ok(()) }
+    }
+    let page = SkillPage { path: Text::new("sources/skill-notes.md".into()).unwrap(),
+        content: Text::new("# Notes\n\nExtracted skill summary.\n".into()).unwrap(),
+        rationale: Text::new("extracted".into()).unwrap(), related: List::new(vec![]).unwrap() };
+    for (scoped, namespace, allowed) in [(false, Some("agent:alice"), true),
+        (true, Some("agent:alice"), true), (true, None, false), (true, Some("agent:bob"), false)] {
+        let home = tempfile::tempdir().unwrap();
+        let wiki = home.path().join("agents/alice/wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+        let mut record = media_call("web_extract", args()).context().record().clone();
+        record.tools = List::new(vec![Text::new("skill_extract".into()).unwrap()]).unwrap();
+        let mut resources = vec![ResourceGrant::Employee { id: record.employee },
+            ResourceGrant::Workspace { handle: Text::new("work".into()).unwrap() }];
+        if scoped { resources.push(ResourceGrant::EmployeeScope { id: record.employee }); }
+        if let Some(namespace) = namespace {
+            let grant = ResourceGrant::Wiki { namespace: Text::new(namespace.into()).unwrap() };
+            resources.push(if scoped { ResourceGrant::Confined { resource: Box::new(grant) } } else { grant });
+        }
+        record.resources = List::new(resources).unwrap();
+        record.canonical_bytes().unwrap();
+        let mut roots = ResourceRoots::default();
+        roots.insert_wiki("agent:alice".into(), record.employee, File::open(&wiki).unwrap()).unwrap();
+        let context = RequestContext::with_live_verifier(record, Arc::new(Live));
+        let result = publish_extraction(home.path(), "alice", "notes", &context, &roots,
+            0, 0, std::slice::from_ref(&page));
+        if allowed {
+            let output = result.unwrap();
+            assert!(output["content"][0]["text"].as_str().unwrap().contains("1 total pages written"));
+            assert_eq!(std::fs::read_to_string(wiki.join("sources/skill-notes.md")).unwrap(), page.content.as_str());
+        } else {
+            assert_eq!(result, Err(VerificationError::BindingMismatch));
+            assert_eq!(std::fs::read_dir(&wiki).unwrap().count(), 0, "denied publication must not scaffold or write");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn i1c_skill_publication_uses_snapshot_digest_and_refuses_destination_overwrite() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("shared/skills")).unwrap();

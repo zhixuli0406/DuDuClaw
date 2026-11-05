@@ -105,7 +105,7 @@ Operator/user messages follow `[general] default_language`:
 | `odoo_partner_search` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
 | `odoo_schema_overview` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
 | `odoo_schema_fields` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `skill_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
+| `skill_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; own Wiki output grant required (Confined Wiki under EmployeeScope), rechecked at publication |
 | `execute_program` | A ExecutionBackend + ExecutionPlanFactory |
 | `office_script` | A ExecutionBackend + ExecutionPlanFactory |
 | `skill_bank_feedback` | Resource → AuthorizedToolCall → original live employee handler |
@@ -248,7 +248,7 @@ Operator/user messages follow `[general] default_language`:
 | `knowledge_search` | Resource → AuthorizedToolCall → original live employee handler |
 | `knowledge_get_passage` | Resource → AuthorizedToolCall → original live employee handler |
 | `knowledge_list_collections` | Resource → AuthorizedToolCall → original live employee handler |
-| `knowledge_add_source` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
+| `knowledge_add_source` | Resource → AuthorizedToolCall → original live employee proposal handler; own Wiki grant required (Confined Wiki under EmployeeScope); text/URL only, local paths refused |
 | `wiki_ls` | Resource → AuthorizedToolCall → original live employee handler |
 | `wiki_read` | Resource → AuthorizedToolCall → original live employee handler |
 | `wiki_write` | Resource → AuthorizedToolCall → original live employee handler |

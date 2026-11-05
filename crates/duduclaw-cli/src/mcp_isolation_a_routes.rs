@@ -198,7 +198,9 @@ mod tests {
                     crate::mcp_fork::handle_merge_or_select(&args, home.path(), "caller").await,
                     crate::mcp_fork::handle_terminate_branch(&args, home.path(), "caller").await] {
                     assert_eq!(result["isError"], true);
-                    assert_eq!(text(&result), duduclaw_mcp_boundary::fork_policy::message(Some(language)));
+                    // Fork handlers retain their existing error envelope, including the prefix.
+                    assert_eq!(text(&result), format!("Error: {}",
+                        duduclaw_mcp_boundary::fork_policy::message(Some(language))));
                 }
                 assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1, "only config exists");
             }

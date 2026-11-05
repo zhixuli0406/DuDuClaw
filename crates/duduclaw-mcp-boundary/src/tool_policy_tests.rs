@@ -361,6 +361,33 @@ fn i1c_source_proposals_are_host_control_and_skill_extraction_requires_own_wiki_
 }
 
 #[test]
+fn source_and_skill_producers_require_finite_wiki_authority_in_employee_scope() {
+    let wiki = ResourceGrant::Wiki { namespace: text("agent:alice") };
+    let base = vec![ResourceGrant::EmployeeScope { id: EmployeeId([2; 16]) },
+        employee(), ResourceGrant::Workspace { handle: text("work") }];
+    for name in ["knowledge_add_source", "skill_extract"] {
+        let missing = context(name, base.clone());
+        assert!(missing.record().canonical_bytes().is_ok());
+        assert!(!eligible(&missing, name));
+        let mut ambiguous = base.clone();
+        ambiguous.push(wiki.clone());
+        let ambiguous = context(name, ambiguous);
+        assert!(ambiguous.record().canonical_bytes().is_err());
+        assert!(!eligible(&ambiguous, name));
+        let mut confined = base.clone();
+        confined.push(ResourceGrant::Confined { resource: Box::new(wiki.clone()) });
+        let confined = context(name, confined);
+        confined.record().canonical_bytes().unwrap();
+        assert!(eligible(&confined, name));
+        let selected = vec![employee(), base[2].clone(), wiki.clone()];
+        assert!(authorize(&confined, name, &json!({}), &Fixed(selected.clone())).is_ok());
+        assert!(authorize(&missing, name, &json!({}), &Fixed(selected)).is_err());
+        assert!(authorize(&confined, name, &json!({}), &Fixed(vec![employee(), base[2].clone(),
+            ResourceGrant::Wiki { namespace: text("agent:other") }])).is_err());
+    }
+}
+
+#[test]
 fn i1c_host_controls_keep_real_worker_stages_and_original_resource_grants() {
     for name in ["skill_from_recording", "skill_hub_install", "meeting_transcribe", "skill_curator_status", "skill_synthesis_run"] {
         assert_eq!(policy(name).unwrap().route, Route::Service);
