@@ -38,11 +38,12 @@ pub struct TranscriptionConfig {
     pub staging_quota_bytes: u64,
     pub max_concurrent_jobs: u8,
     pub media_memory_limit_bytes: u64,
+    pub google_stt: GoogleSttConfig,
 }
 
 impl Default for TranscriptionConfig {
     fn default() -> Self {
-        Self { engine: EngineKind::Gemini, model: None, max_bytes: 4 * 1024 * 1024 * 1024, staging_quota_bytes: 10 * 1024 * 1024 * 1024, max_concurrent_jobs: 1, media_memory_limit_bytes: super::pipeline::DEFAULT_MEDIA_MEMORY_LIMIT_BYTES }
+        Self { engine: EngineKind::Gemini, model: None, max_bytes: 4 * 1024 * 1024 * 1024, staging_quota_bytes: 10 * 1024 * 1024 * 1024, max_concurrent_jobs: 1, media_memory_limit_bytes: super::pipeline::DEFAULT_MEDIA_MEMORY_LIMIT_BYTES, google_stt: GoogleSttConfig::default() }
     }
 }
 
@@ -77,6 +78,7 @@ impl TranscriptionConfig {
             || !m.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))) {
             return Err("會議轉錄模型名稱格式錯誤".into());
         }
+        if self.engine == EngineKind::GoogleStt { self.google_stt.validate()?; }
         Ok(())
     }
     /// Employees cannot switch the destination provider selected by an operator.
@@ -86,6 +88,46 @@ impl TranscriptionConfig {
             return Err("請由管理員變更會議轉錄引擎；本次要求與核准的引擎不同".into());
         }
         Ok(selected)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GoogleSttConfig {
+    pub project_id: String,
+    pub location: String,
+    pub bucket: String,
+    pub language: String,
+    pub model: String,
+    pub diarization: bool,
+}
+
+impl Default for GoogleSttConfig {
+    fn default() -> Self {
+        Self { project_id: String::new(), location: "asia-southeast1".into(), bucket: String::new(),
+            language: "cmn-Hant-TW".into(), model: "chirp_2".into(), diarization: false }
+    }
+}
+
+impl GoogleSttConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let identifier = |s: &str| !s.is_empty() && s.len() <= 63
+            && s.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+            && s.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+            && s.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric);
+        if !identifier(&self.project_id) || !identifier(&self.bucket) || self.bucket.len() < 3 {
+            return Err("請設定有效的 Google Cloud 專案與專用儲存桶名稱（小寫英數字與連字號）。".into());
+        }
+        if !matches!(self.location.as_str(), "asia-southeast1" | "us-central1" | "europe-west4") {
+            return Err("請選擇支援 Chirp 2 的轉錄區域。".into());
+        }
+        if self.model != "chirp_2" || self.language != "cmn-Hant-TW" {
+            return Err("Google Cloud 會議轉錄目前支援 chirp_2 與 cmn-Hant-TW。".into());
+        }
+        if self.diarization {
+            return Err("Chirp 2 不支援講者分離，請關閉此選項。".into());
+        }
+        Ok(())
     }
 }
 
@@ -136,6 +178,24 @@ mod memory_limit_tests {
         assert_eq!(TranscriptionConfig::from_toml("[transcription]\nmedia_memory_limit_bytes=1048576").unwrap().media_memory_limit_bytes, 1048576);
         for value in ["0", "-1", "'unbounded'"] {
             assert!(TranscriptionConfig::from_toml(&format!("[transcription]\nmedia_memory_limit_bytes={value}")).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod google_stt_tests {
+    use super::*;
+    #[test]
+    fn transcription_google_stt_config_defaults_and_fails_closed() {
+        let raw = "[transcription]\nengine='google_stt'\n[transcription.google_stt]\nproject_id='meeting-project'\nbucket='meeting-audio'";
+        let cfg = TranscriptionConfig::from_toml(raw).unwrap();
+        assert_eq!(cfg.google_stt.language, "cmn-Hant-TW");
+        assert_eq!(cfg.google_stt.location, "asia-southeast1");
+        assert_eq!(cfg.google_stt.model, "chirp_2");
+        assert!(!cfg.google_stt.diarization);
+        assert!(TranscriptionConfig::from_toml("[transcription]\nengine='google_stt'").is_err());
+        for extra in ["\ndiarization=true", "\nmodel='long'", "\nlanguage='en-US'", "\napi_key='must-not-be-config'", "\nlocation='evil.test'"] {
+            assert!(TranscriptionConfig::from_toml(&format!("{raw}{extra}")).is_err());
         }
     }
 }

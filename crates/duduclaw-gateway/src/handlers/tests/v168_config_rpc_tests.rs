@@ -230,6 +230,10 @@ async fn tick_sources_crud_hides_header_values() {
 #[tokio::test]
 async fn raw_editor_masks_restores_backs_up_and_audits() {
     let home = tempfile::tempdir().unwrap();
+    let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+    let user = db.create_user("admin@example.invalid", "Admin", "test-password", UserRole::Admin).unwrap();
+    rusqlite::Connection::open(home.path().join("users.db")).unwrap()
+        .execute("UPDATE users SET id='admin-1' WHERE id=?1", [&user.id]).unwrap();
     let original = "[gateway]\nbind = \"127.0.0.1\"\nauth_token_enc = \"ENCRYPTED\"\n\n[acp]\ntrusted = false\n";
     std::fs::write(home.path().join("config.toml"), original).unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
@@ -726,6 +730,10 @@ async fn tick_source_upsert_appends_without_touching_other_tables() {
 #[tokio::test]
 async fn raw_editor_cannot_forge_or_change_the_embedding_disclosure_record() {
     let home = tempfile::tempdir().unwrap();
+    let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+    let user = db.create_user("admin@example.invalid", "Admin", "test-password", UserRole::Admin).unwrap();
+    rusqlite::Connection::open(home.path().join("users.db")).unwrap()
+        .execute("UPDATE users SET id='admin-1' WHERE id=?1", [&user.id]).unwrap();
     let ack = "[knowledge.embedding]\nprovider = \"openai\"\n\n[knowledge.embedding.cloud_disclosure_ack]\nby = \"admin-1\"\nat = \"2026-10-22T00:00:00Z\"\nprovider = \"openai\"\nhost = \"api.openai.com\"\nmodel = \"text-embedding-3-small\"\n";
     std::fs::write(home.path().join("config.toml"), "[general]\nname = \"x\"\n").unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
