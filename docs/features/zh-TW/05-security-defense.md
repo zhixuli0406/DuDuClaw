@@ -12,6 +12,9 @@
 
 此變更的 gateway 測試與真實瀏覽器／寄信驗收仍需在指定建置、測試環境執行；程式實作不代表已通過平台或外部服務驗收。
 所有建置的管理功能版本以有效授權為上限。`DUDUCLAW_EDITION` 與嵌入主程式的版本設定都只能縮限權限；要求升級時會忽略該值，每個來源每個行程警告一次。沒有有效授權時使用個人版，`users.*`、`departments.*` 等管理介面也依此拒絕存取。正式判定流程一律禁止升級，即使啟用 Debug assertions 也一樣。獨立測試 API 必須同時啟用非預設的 `test-edition-override` feature 與 Debug assertions；release 建置拒絕該 feature。
+官方 GitHub 更新會精確核對 minisign 簽章註解 `duduclaw v{版本} {封存檔名}`，包含平台與架構；Pro 更新則使用 `duduclaw-pro` 及該管道自己的固定公鑰。封存檔簽章與涵蓋註解的全域簽章都必須通過。所有封存檔安裝路徑都必須提供驗證器產生的 `VerifiedReleaseIdentity`，綁定封存檔摘要、版本、檔名與簽章註解，僅通過完整性檢查不能安裝。換檔前還會確認執行檔版本。Linux 受保護升級只讀取編譯時的固定格式標記，不以 root 執行下載的程式：標記必須恰有一筆，header 為 `NUL + DUDUCLAW_RELEASE_ID:V1:`，接穩定版 `X.Y.Z`，suffix 為 `NUL + DUDUCLAW_RELEASE_END + NUL`。每個 `DUDUCLAW_RELEASE_ID` 都必須構成完整標記，缺少、畸形、重複或衝突一律拒絕；沒有標記的舊版封存檔也不接受。發版流程會在簽章前解析實際封存檔內的執行檔，確認標記與 tag 相同，Pro 打包也適用。一般更新則核對 `version` 輸出。任何不符都會在換檔及寫入受保護版本意圖／下限前中止。這些檢查適用於已包含修補的更新程式；舊更新程式仍需先由管理員審查並手動更新。
+
+Provider 整合需改用 `verify_release_archive_with_pubkey(bytes, checksum, signature, pinned_key, expected_version, expected_file)`，並把結果傳給 `install_verified_binary(bytes, &identity)`。預期版本與檔名必須來自選定的發行資訊，不能直接從下載的簽章取值；原本只有一個參數的安裝 API 已移除。
 
 企業版[團隊對話 API](68-manager-team-history.md)（v1.76.0）以即時報告線獨立判斷，不放寬原本的員工存取權。外部文字在讀取時遮蔽，每次揭露都要完成雜湊鏈稽核；設定關閉、來源不明、已裝模型故障或稽核失敗都不回對話內容。只跑 regex 時會明示 `ner: false`，姓名與地址仍可能漏遮。直接主機／資料庫存取仍在產品入口保護範圍外。
 

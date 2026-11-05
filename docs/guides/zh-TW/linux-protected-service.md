@@ -83,6 +83,10 @@ sudo /opt/duduclaw/bin/duduclaw service uninstall --protected-linux
 
 升級只接受比目前執行版本新的穩定 semver `X.Y.Z`。安裝與升級也拒絕低於 `/var/lib/duduclaw-protected/version-floor` 的版本；此檔案由 root:root 擁有、權限為 0600，在執行檔替換成功後原子寫入最高已安裝版本。檔案不存在時以目前版本為下限，內容損壞則拒絕操作。升級沒有回退選項。緊急回退必須由 root 刻意解除安裝（會移除版本下限），再用舊版封存檔執行上方驗簽後首次安裝流程；資料與根金鑰仍保留。 替換中斷時，root-only 的寫入意圖（`version-pending`）也會保留已驗證目標的下限；請以該版本或較新版重做驗簽安裝，或刻意解除安裝後清除。
 
+官方 GitHub 更新會精確核對 minisign 簽章註解 `duduclaw v{版本} {封存檔名}`，包含平台與架構；Pro 更新則使用 `duduclaw-pro` 及該管道自己的固定公鑰。封存檔簽章與涵蓋註解的全域簽章都必須通過。所有封存檔安裝路徑都必須提供驗證器產生的 `VerifiedReleaseIdentity`，綁定封存檔摘要、版本、檔名與簽章註解，僅通過完整性檢查不能安裝。換檔前還會確認執行檔版本。Linux 受保護升級只讀取編譯時的固定格式標記，不以 root 執行下載的程式：標記必須恰有一筆，header 為 `NUL + DUDUCLAW_RELEASE_ID:V1:`，接穩定版 `X.Y.Z`，suffix 為 `NUL + DUDUCLAW_RELEASE_END + NUL`。每個 `DUDUCLAW_RELEASE_ID` 都必須構成完整標記，缺少、畸形、重複或衝突一律拒絕；沒有標記的舊版封存檔也不接受。發版流程會在簽章前解析實際封存檔內的執行檔，確認標記與 tag 相同，Pro 打包也適用。一般更新則核對 `version` 輸出。任何不符都會在換檔及寫入受保護版本意圖／下限前中止。這些檢查適用於已包含修補的更新程式；舊更新程式仍需先由管理員審查並手動更新。
+
+Provider 整合需改用 `verify_release_archive_with_pubkey(bytes, checksum, signature, pinned_key, expected_version, expected_file)`，並把結果傳給 `install_verified_binary(bytes, &identity)`。預期版本與檔名必須來自選定的發行資訊，不能直接從下載的簽章取值；原本只有一個參數的安裝 API 已移除。
+
 ## 自動升級（選用）
 
 `scripts/linux-protected/auto-upgrade/` 在 v1.79.3 之後的原始碼才加入，目前尚無已發布標籤包含它。第一個包含它的版本發布前，請從固定的完整 commit SHA（下方以 `<commit>` 表示，請換成你審閱過的那一筆）取得並審閱，不要使用會移動的 `main`（[原始碼位置](https://github.com/zhixuli0406/DuDuClaw/tree/<commit>/scripts/linux-protected/auto-upgrade)）；Linux 發行封存檔也不含 `scripts/`。它只呼叫既有的 `service upgrade --protected-linux --version`，因此可搭配 v1.79.3 受保護安裝。

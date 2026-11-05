@@ -7,7 +7,15 @@ pub fn failure_kind(detail: &str) -> &'static str {
     else if text.starts_with("update download failed:")
         || ["failed to read update archive:", "failed to read checksum file:", "failed to read signature file:"]
             .iter().any(|prefix| text.starts_with(prefix)) { "download" }
-    else if text.starts_with("update verification failed:") { "verify" }
+    else if text.starts_with("update verification failed:")
+        || ["verified release identity", "invalid expected release version",
+            "release file must match", "invalid expected binary version",
+            "new binary version mismatch", "extracted binary version mismatch",
+            "extracted binary has no release version marker", "duplicate binary release marker",
+            "malformed binary release marker", "unterminated binary release marker",
+            "invalid binary version marker", "cannot seek staged binary:",
+            "cannot read staged binary:"]
+            .iter().any(|prefix| text.starts_with(prefix)) { "verify" }
     else if text.starts_with("failed to prepare binary replacement:") { "write" }
     else if text.contains("staging write failed") || text.contains("failed to stage") || text.contains("failed to sync") || text.contains("failed to set permissions") { "write" }
     else if text.starts_with("update extraction failed:") { "extract" }
@@ -168,6 +176,21 @@ mod tests {
             ("Failed to read Checksum file: reset", "download"),
             ("Failed to read Signature file: reset", "download"),
             ("Update verification failed: SHA-256 checksum mismatch", "verify"),
+            ("Verified release identity belongs to a different archive", "verify"),
+            ("Release signature identity mismatch", "verify"),
+            ("Invalid expected release version", "verify"),
+            ("Release file must match this platform and edition", "verify"),
+            ("Invalid expected binary version", "verify"),
+            ("New binary version mismatch", "verify"),
+            ("Extracted binary version mismatch", "verify"),
+            ("Extracted binary has no release version marker — refusing update", "verify"),
+            ("Duplicate binary release marker", "verify"),
+            ("Malformed binary release marker header", "verify"),
+            ("Malformed binary release marker suffix", "verify"),
+            ("Unterminated binary release marker", "verify"),
+            ("Invalid binary version marker", "verify"),
+            ("Cannot seek staged binary: denied", "verify"),
+            ("Cannot read staged binary: denied", "verify"),
             ("Update extraction failed: Extracted binary exceeds size limit", "size"),
             ("Update extraction failed: Archive read failed: corrupt gzip", "extract"),
             ("Update extraction failed: Staging write failed: disk full", "write"),

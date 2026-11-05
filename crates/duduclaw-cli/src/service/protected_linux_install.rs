@@ -281,7 +281,7 @@ pub(super) async fn upgrade(version: Option<&str>) -> Result<()> {
     fs::set_permissions(staging.path(), fs::Permissions::from_mode(0o700))?;
     trusted(staging.path(), true)?;
     let extracted = staging.path().join("duduclaw");
-    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&extracted)?;
+    let mut file = fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&extracted)?;
     let (version, _, _) = duduclaw_gateway::updater::download_protected_release(version, &mut file)
         .await.map_err(refused)?;
     check_floor(&version, true)?;

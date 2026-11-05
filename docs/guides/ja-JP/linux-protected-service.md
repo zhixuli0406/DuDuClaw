@@ -83,6 +83,10 @@ sudo /opt/duduclaw/bin/duduclaw service uninstall --protected-linux
 
 更新は実行中のバージョンより新しい安定版 semver `X.Y.Z` のみ許可します。インストールと更新では `/var/lib/duduclaw-protected/version-floor` を下回るバージョンも拒否します。このファイルは root:root 所有、0600 で、実行ファイルの置き換え後に最高のインストール済みバージョンを原子的に記録します。ファイルがなければ実行中のバージョンを下限とし、不正な内容は拒否します。更新にロールバックオプションはありません。緊急時のロールバックは root が意図的にアンインストール（下限ファイルも削除）した後、古いアーカイブを使って上記の署名検証付き初回インストールを行います。データとルートキーは残ります。 置き換えが中断した場合も、root 専用の書き込み意図（`version-pending`）で検証済みの更新先を下限として保持します。同じ版か新しい版で署名検証付きインストールを再実行するか、意図的にアンインストールして解除してください。
 
+公式 GitHub 更新は minisign の trusted comment `duduclaw v{version} {archive-file-name}` をプラットフォーム・アーキテクチャまで厳密に照合します。Pro 更新は `duduclaw-pro` と独自の固定公開鍵を使います。ペイロード署名とコメントを保護する global signature の両方が必要です。すべてのアーカイブ導入経路で、検証器が生成した `VerifiedReleaseIdentity` が必須となり、アーカイブのダイジェスト、版、ファイル名、署名済みコメントを結び付けます。整合性確認だけでは導入できません。置換前に実行ファイルの版も確認します。保護アップグレードでは root でダウンロードしたコードを実行せず、ビルド時の固定形式レコードを読みます。ヘッダー `NUL + DUDUCLAW_RELEASE_ID:V1:`、安定版 `X.Y.Z`、末尾 `NUL + DUDUCLAW_RELEASE_END + NUL` の完全なレコードが正確に一つ必要です。すべての `DUDUCLAW_RELEASE_ID` がこの形式に一致しなければなりません。欠落、不正、重複、競合、マーカーのない旧版は拒否します。署名前に実際のアーカイブ内の実行ファイルを解析し、tag と照合します。Pro のパッケージ作成にも適用します。通常更新は `version` 出力を確認します。不一致は置換および保護版の intent/floor 更新前に中止します。この検査には修正済みの更新プログラムが必要です。旧版の更新プログラムは管理者が確認した手動導入で先に更新してください。
+
+Provider は `verify_release_archive_with_pubkey(bytes, checksum, signature, pinned_key, expected_version, expected_file)` の結果を `install_verified_binary(bytes, &identity)` に渡してください。期待する版とファイル名は選択したリリース情報から取得し、ダウンロードした署名から流用しないでください。旧来の一引数の導入 API は廃止しました。
+
 ## 自動更新（任意）
 
 `scripts/linux-protected/auto-upgrade/` は v1.79.3 より後のソースに追加された任意の夜間更新スクリプトです。既存の `service upgrade --protected-linux --version` だけを呼び出すため、v1.79.3 の保護インストールでも使えます。ホストの現地時刻で毎日 03:30 に、最大 20 分のランダムな遅延を加えて実行します。既存の署名検証付き更新コマンドで、新しい公式署名済みリリースだけをインストールし、稼働中の gateway を再起動します。作業のない時間に設定してください。`Persistent=false` により、朝の起動後に夜間の未実行分を補って営業時間中に再起動することはありません。ダッシュボードは v1.80.0 まで手動コマンドを表示します。未導入時は手動更新のままです。

@@ -923,6 +923,10 @@ package_and_upload_pro_bin() {
         echo "  WARNING: sha256 failed for $tar_name — skipping."
         return 1
     fi
+    if ! python3 scripts/verify_release_marker.py --tag "v$version" --archive "$tar_path"; then
+        echo "  WARNING: release identity check failed for $tar_name — refusing signing/upload."
+        return 1
+    fi
     if ! minisign -S -s "$PRO_BIN_KEY" -m "$tar_path" -t "duduclaw-pro v$version $tar_name"; then
         echo "  WARNING: minisign failed for $tar_name — skipping upload."
         return 1
