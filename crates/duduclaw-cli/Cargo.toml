@@ -12,6 +12,7 @@ name = "duduclaw"
 path = "src/bin/duduclaw.rs"
 
 [dependencies]
+semver = "1"
 duduclaw-parse-worker = { workspace = true }
 duduclaw-core = { workspace = true }
 duduclaw-isolation = { workspace = true }

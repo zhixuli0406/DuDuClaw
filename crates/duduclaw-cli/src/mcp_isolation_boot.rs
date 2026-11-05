@@ -4,12 +4,17 @@ use std::{path::PathBuf, sync::Arc};
 use duduclaw_isolation::ids::EmployeeId;
 use duduclaw_mcp_boundary::resources::ResourceRoots;
 use duduclaw_gateway::{isolation_connector_boot::InstalledConnectorProviders,
-    isolation_connectors::{BoundConnectorExecutor, LiveConnectorSelectionPolicy},
     isolation_execution::GatewayFactories};
 use crate::{mcp_auth::Principal, mcp_isolation::IsolationDispatcher};
-use duduclaw_gateway::isolation_mcp::{DispatcherFactory, DispatcherInput, Dispatcher, VerificationError};
+#[cfg(target_os = "linux")]
+use duduclaw_gateway::isolation_connectors::{BoundConnectorExecutor, LiveConnectorSelectionPolicy};
+#[cfg(target_os = "linux")]
+use duduclaw_gateway::isolation_mcp::{DispatcherFactory, DispatcherInput, Dispatcher};
+use duduclaw_gateway::isolation_mcp::VerificationError;
 
+#[cfg(target_os = "linux")]
 struct CliDispatcherFactory;
+#[cfg(target_os = "linux")]
 impl DispatcherFactory for CliDispatcherFactory {
     fn verify_producers(&self, execution: &dyn duduclaw_mcp_boundary::execution::ExecutionPlanFactory,
         worker: &dyn duduclaw_mcp_boundary::worker_execution::WorkerPlanFactory,
@@ -78,6 +83,7 @@ impl DispatcherFactory for CliDispatcherFactory {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn install() -> Result<(), VerificationError> {
     duduclaw_gateway::isolation_mcp::install_dispatcher_factory(Arc::new(CliDispatcherFactory))
 }

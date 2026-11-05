@@ -1878,6 +1878,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "scraper",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",

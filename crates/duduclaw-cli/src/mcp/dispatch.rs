@@ -358,7 +358,7 @@ struct GatewayHandler<'a> {
     google_caller: &'a super::google_identity_client::GoogleCaller,
 }
 impl GatewayHandler<'_> {
-    async fn execute(&self, call: duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall) -> Result<Value, Value> {
+    async fn execute(&self, call: duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall) -> std::result::Result<Value, Value> {
         let valid = crate::mcp_isolation::current().is_some_and(|current|
             current.context.record() == call.context().record() && current.agent == self.default_agent
             && current.home == self.home_dir && crate::mcp_isolation::legacy_resource_handler(call.name()));
@@ -372,7 +372,7 @@ impl GatewayHandler<'_> {
         }).await
     }
 
-    async fn invoke(&self, tool_name: &str, arguments: &Value) -> Result<Value, Value> {
+    async fn invoke(&self, tool_name: &str, arguments: &Value) -> std::result::Result<Value, Value> {
         // A connector can never reach an ambient credential selector in isolation.
         if crate::mcp_isolation::current().is_some()
             && duduclaw_mcp_boundary::tool_policy::policy(tool_name)
@@ -935,33 +935,33 @@ impl GatewayHandler<'_> {
                 .execute_dedicated(home_dir, name, &arguments)
                 .await
         }
-        "google_status" => handle_google_status(home_dir, &google_caller).await,
-        "gmail_search" => handle_gmail_search(&arguments, home_dir, &google_caller).await,
-        "gmail_read" => handle_gmail_read(&arguments, home_dir, &google_caller).await,
+        "google_status" => handle_google_status(home_dir, google_caller).await,
+        "gmail_search" => handle_gmail_search(&arguments, home_dir, google_caller).await,
+        "gmail_read" => handle_gmail_read(&arguments, home_dir, google_caller).await,
         "gmail_create_draft" => {
-            handle_gmail_create_draft(&arguments, home_dir, &google_caller).await
+            handle_gmail_create_draft(&arguments, home_dir, google_caller).await
         }
         "calendar_list_events" => {
-            handle_calendar_list_events(&arguments, home_dir, &google_caller).await
+            handle_calendar_list_events(&arguments, home_dir, google_caller).await
         }
         "calendar_create_event" => {
-            handle_calendar_create_event(&arguments, home_dir, &google_caller).await
+            handle_calendar_create_event(&arguments, home_dir, google_caller).await
         }
-        "sheets_read" => handle_sheets_read(&arguments, home_dir, &google_caller).await,
-        "sheets_append" => handle_sheets_append(&arguments, home_dir, &google_caller).await,
-        "forms_get" => handle_forms_get(&arguments, home_dir, &google_caller).await,
+        "sheets_read" => handle_sheets_read(&arguments, home_dir, google_caller).await,
+        "sheets_append" => handle_sheets_append(&arguments, home_dir, google_caller).await,
+        "forms_get" => handle_forms_get(&arguments, home_dir, google_caller).await,
         "forms_list_responses" => {
-            handle_forms_list_responses(&arguments, home_dir, &google_caller).await
+            handle_forms_list_responses(&arguments, home_dir, google_caller).await
         }
-        "gtasks_lists" => handle_gtasks_lists(home_dir, &google_caller).await,
-        "gtasks_list" => handle_gtasks_list(&arguments, home_dir, &google_caller).await,
-        "gtasks_create" => handle_gtasks_create(&arguments, home_dir, &google_caller).await,
-        "gtasks_complete" => handle_gtasks_complete(&arguments, home_dir, &google_caller).await,
-        "drive_search" => handle_drive_search(&arguments, home_dir, &google_caller).await,
-        "drive_read" => handle_drive_read(&arguments, home_dir, &google_caller).await,
-        "docs_read" => handle_docs_read(&arguments, home_dir, &google_caller).await,
-        "docs_append" => handle_docs_append(&arguments, home_dir, &google_caller).await,
-        "slides_read" => handle_slides_read(&arguments, home_dir, &google_caller).await,
+        "gtasks_lists" => handle_gtasks_lists(home_dir, google_caller).await,
+        "gtasks_list" => handle_gtasks_list(&arguments, home_dir, google_caller).await,
+        "gtasks_create" => handle_gtasks_create(&arguments, home_dir, google_caller).await,
+        "gtasks_complete" => handle_gtasks_complete(&arguments, home_dir, google_caller).await,
+        "drive_search" => handle_drive_search(&arguments, home_dir, google_caller).await,
+        "drive_read" => handle_drive_read(&arguments, home_dir, google_caller).await,
+        "docs_read" => handle_docs_read(&arguments, home_dir, google_caller).await,
+        "docs_append" => handle_docs_append(&arguments, home_dir, google_caller).await,
+        "slides_read" => handle_slides_read(&arguments, home_dir, google_caller).await,
         "notion_status" => handle_notion_status(home_dir).await,
         "notion_search" => handle_notion_search(&arguments, home_dir).await,
         "notion_page_read" => handle_notion_page_read(&arguments, home_dir).await,

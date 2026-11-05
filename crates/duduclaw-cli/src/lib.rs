@@ -58,8 +58,6 @@ pub mod mcp_db; // §13.7 WP-D: read-only SQL data-source MCP tools
 pub mod mcp_dispatch; // W20-P1 Phase 2A: transport-agnostic dispatcher
 mod mcp_isolation_identity;
 pub mod mcp_isolation; // Native Linux connection-bound adapter, sharing the existing gates.
-#[cfg(target_os = "linux")]
-mod mcp_isolation_boot;
 pub mod mcp_isolation_execution;
 pub mod mcp_isolation_disposition;
 pub mod mcp_isolation_resources;

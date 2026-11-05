@@ -9,7 +9,7 @@ struct Live {
     admitted: Mutex<Option<mpsc::Sender<()>>>,
 }
 impl LiveRequestVerifier for Live {
-    fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> {
+    fn verify_live(&self, _: &CapabilityRecord, _: u64) -> std::result::Result<(), VerificationError> {
         let allowed = self.active.load(Ordering::SeqCst);
         if let Some(sender) = self.admitted.lock().unwrap().take() { sender.send(()).unwrap(); }
         if allowed { Ok(()) } else { Err(VerificationError::Revoked) }
