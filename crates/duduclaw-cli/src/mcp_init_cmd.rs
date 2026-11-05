@@ -326,6 +326,7 @@ pub(crate) fn prepare(
     // Operator-only initialization provisions the same signed identity that
     // strict MCP startup verifies; never repair or replace an existing key.
     let identity_key = duduclaw_core::identity_token::ensure_key(home)
+        .map(zeroize::Zeroizing::new)
         .map_err(|e| DuDuClawError::Config(format!("initialize MCP identity failed: {e}")))?;
     // This reserved API-client identity can never be an employee or bridge
     // identity; stdio verifies it together with its matching external API key.

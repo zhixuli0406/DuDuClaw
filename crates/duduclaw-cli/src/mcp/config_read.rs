@@ -348,6 +348,9 @@ fn audit_system_sender_identity_once(home_dir: &Path, claimed: &str, source: &st
 /// site; both are cheap file reads and `get_default_agent` runs a handful of
 /// times per process, not per tool call.
 pub fn caller_identity_verdict(home_dir: &Path) -> duduclaw_core::IdentityVerdict {
+    // Authenticate before interpreting the untrusted claim. External clients
+    // must never inherit an employee identity through the grace-period path.
+    let principal = crate::mcp_auth::authenticate_from_env(home_dir);
     let require = match duduclaw_core::require_identity_token_from_home(home_dir) {
         Ok(require) => require,
         Err(error) => {
@@ -357,22 +360,31 @@ pub fn caller_identity_verdict(home_dir: &Path) -> duduclaw_core::IdentityVerdic
     };
     let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
     let claimed = claimed.trim();
-    if claimed.starts_with(duduclaw_core::STANDALONE_CLIENT_PREFIX) {
+    if let Ok(principal) = principal
+        && principal.is_external
+    {
         // Standalone transport identities occupy the reserved API-client
         // namespace, never the employee/remote-bridge namespace. Require both
         // live external API authentication for this exact client and a valid
         // host signature, even during an employee-token grace period.
-        let authenticated = crate::mcp_auth::authenticate_from_env(home_dir)
-            .is_ok_and(|principal| principal.is_external && principal.client_id == claimed);
+        if !principal.client_id.starts_with(duduclaw_core::STANDALONE_CLIENT_PREFIX)
+            || claimed != principal.client_id
+        {
+            return duduclaw_core::IdentityVerdict::Rejected;
+        }
         let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
         let signed = duduclaw_core::is_valid_agent_id(claimed)
             && duduclaw_core::load_identity_key(home_dir)
+                .map(zeroize::Zeroizing::new)
                 .is_some_and(|key| duduclaw_core::verify_identity_token(&key, claimed, &token));
-        return if authenticated && signed {
+        return if signed {
             duduclaw_core::IdentityVerdict::Verified
         } else {
             duduclaw_core::IdentityVerdict::Rejected
         };
+    }
+    if claimed.starts_with(duduclaw_core::STANDALONE_CLIENT_PREFIX) {
+        return duduclaw_core::IdentityVerdict::Rejected;
     }
     duduclaw_core::verify_env_identity(home_dir, require)
 }

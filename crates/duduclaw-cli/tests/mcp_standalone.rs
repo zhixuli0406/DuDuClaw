@@ -308,6 +308,51 @@ fn standalone_api_key_does_not_bypass_strict_identity() {
 }
 
 #[test]
+fn external_api_key_cannot_claim_employee_during_identity_grace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = home.join(".duduclaw");
+    let env = init_env(&home, &data);
+    let api_key = "ddc_dev_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4";
+    std::fs::write(data.join("config.toml"), format!(
+        "[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n\
+         [mcp_keys.{api_key}]\nclient_id = 'external-client'\nis_external = true\n\
+         scopes = ['memory:read']\ncreated_at = {:?}\n",
+        (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
+        chrono::Utc::now().to_rfc3339(),
+    )).unwrap();
+    assert!(!duduclaw_core::require_identity_token_from_home(&data).unwrap());
+    let key = zeroize::Zeroizing::new(duduclaw_core::load_identity_key(&data).unwrap());
+    for client in ["standalone-print", "external-client"] {
+        for case in ["original_token", "missing_token", "signed_employee", "missing_claim"] {
+            let mut cmd = base_command(&home, &data);
+            cmd.envs(env.iter().cloned());
+            if client == "external-client" {
+                cmd.env("DUDUCLAW_MCP_API_KEY", api_key);
+            }
+            cmd.env(duduclaw_core::ENV_AGENT_ID, "sales");
+            match case {
+                "missing_token" => { cmd.env_remove(duduclaw_core::ENV_AGENT_TOKEN); }
+                "signed_employee" => {
+                    cmd.env(duduclaw_core::ENV_AGENT_TOKEN,
+                        duduclaw_core::mint_identity_token(&key, "sales"));
+                }
+                "missing_claim" => {
+                    cmd.env_remove(duduclaw_core::ENV_AGENT_ID);
+                    cmd.env_remove(duduclaw_core::ENV_AGENT_TOKEN);
+                }
+                _ => {}
+            }
+            let out = cmd.arg("mcp-server").stdin(Stdio::null()).output().unwrap();
+            assert!(!out.status.success(), "{client}/{case}");
+            assert!(String::from_utf8_lossy(&out.stderr)
+                .contains("MCP caller identity rejected"), "{client}/{case}");
+        }
+    }
+    assert!(!data.join("memory.db").exists(), "reject before serving tools");
+}
+
+#[test]
 fn mcp_server_without_key_names_the_init_command() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
