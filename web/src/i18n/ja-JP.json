@@ -1,4 +1,13 @@
 {
+  "settings.update.failure.download": "更新をダウンロードできません。接続を確認し、更新を再確認してください。",
+  "settings.update.failure.verify": "更新ファイルの検証に失敗したため、インストールを停止しました。公式版を再ダウンロードしてください。",
+  "settings.update.failure.extract": "更新ファイルを展開できません。公式版を再ダウンロードしてください。",
+  "settings.update.failure.size": "更新ファイルが現在のバージョンのサイズ上限を超えています。アップグレードガイドに従って手動で更新してください。",
+  "settings.update.failure.write": "更新ファイルを書き込めません。空き容量とインストール先の権限を確認してください。",
+  "settings.update.failure.swap": "実行ファイルを置き換えられません。技術的な詳細と現在のインストール状態を確認してください。",
+  "settings.update.failure.rollback": "更新と復元の両方に失敗しました。技術的な詳細にあるバックアップ先から手動で復元してください。",
+  "settings.update.failure.unknown": "更新が完了しませんでした。技術的な詳細を確認するか、ガイドに従って手動で更新してください。",
+  "settings.update.failure.details": "技術的な詳細",
   "invite.title": "招待を受ける",
   "invite.loading": "招待を確認中…",
   "invite.invalid": "この招待は利用できません。管理者に新しい招待を依頼してください。",

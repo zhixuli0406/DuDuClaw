@@ -447,6 +447,18 @@ pub fn filter_push_event(home: &Path, ctx: &UserContext, line: &str) -> Option<S
 #[cfg(test)]
 mod live_event_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn update_failure_details_are_admin_only() {
+        let f = crate::handlers::task_privacy_tests::fixture().await;
+        let admin = crate::handlers::task_privacy_tests::admin(&f);
+        let line = serde_json::to_string(&WsFrame::event("system.update_failed",
+            crate::updater::failure_payload("rollback failed: /private/backup"))).unwrap();
+        assert!(PushGate::new(&f.home, &admin, true).filter(&line).is_none());
+        assert!(PushGate::new(&f.home, &f.bob, false).filter_live(&line, &f.handler).await.is_none());
+        assert!(PushGate::new(&f.home, &admin, false).filter_live(&line, &f.handler).await.is_some());
+    }
+
     #[tokio::test]
     async fn turn_task_ids_require_audience_and_live_employee_access() {
         use crate::handlers::task_privacy_tests::{admin, fixture, OPEN, PRIVATE};

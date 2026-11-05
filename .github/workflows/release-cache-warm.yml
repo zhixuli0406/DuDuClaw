@@ -47,6 +47,9 @@ jobs:
     needs: decide
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.decide.outputs.run != 'false' }}
     runs-on: ${{ matrix.os }}
+    env:
+      # MSVC symbols live in separate PDBs; retain the existing Windows output.
+      CARGO_PROFILE_RELEASE_STRIP: ${{ startsWith(matrix.os, 'windows') && 'none' || 'symbols' }}
     strategy:
       fail-fast: false
       matrix:
@@ -107,6 +110,9 @@ jobs:
     needs: decide
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.decide.outputs.run != 'false' }}
     runs-on: ${{ matrix.os }}
+    env:
+      # MSVC symbols live in separate PDBs; retain the existing Windows output.
+      CARGO_PROFILE_RELEASE_STRIP: ${{ startsWith(matrix.os, 'windows') && 'none' || 'symbols' }}
     strategy:
       fail-fast: false
       matrix:

@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api } from '@/lib/api';
 import { client } from '@/lib/ws-client';
+import { updateFailure } from '@/lib/update-failure';
 import { toast, formatError } from '@/lib/toast';
 import {
   Button,
@@ -75,7 +76,9 @@ export function UpdateTab() {
   const intl = useIntl();
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
-  const [error, setError] = useState('');
+  const [error, setError] = useState<ReturnType<typeof updateFailure> | null>(null);
+  const failure = error;
+  const showFailure = useCallback((value: unknown) => setError(updateFailure(value)), []);
   /** Non-null only while the gateway is on a RETRY (attempt ≥ 2). */
   const [retry, setRetry] = useState<RetryState | null>(null);
   const [installed, setInstalled] = useState(false);
@@ -186,10 +189,14 @@ export function UpdateTab() {
     }),
   []);
 
+  useEffect(() => client.subscribe('system.update_failed', (payload) => {
+    setError(updateFailure(payload));
+  }), []);
+
   const handleCheck = useCallback(async () => {
     if (installingRef.current) return; // [R2:NM4] block check during install
     setChecking(true);
-    setError('');
+    setError(null);
     setRetry(null);
     setInstalled(false);
     setUpdateInfo(null); // [R2:NL3] clear stale data immediately
@@ -199,12 +206,11 @@ export function UpdateTab() {
     } catch (err) {
       // Surface the server's reason — a bare 「更新失敗」 hid the actual
       // cause (e.g. GitHub API rate limit) from the 2026-07-29 field report.
-      const msg = err instanceof Error ? err.message : String(err ?? '');
-      setError(`${intl.formatMessage({ id: 'settings.update.failed' })}${msg ? `: ${msg}` : ''}`);
+      showFailure(err);
     } finally {
       setChecking(false);
     }
-  }, [intl]);
+  }, [showFailure]);
 
   // [M2] applyUpdate no longer sends URL — server uses cached URL from check_update
   // One button, one order: the gateway step first (install, or restart onto
@@ -215,7 +221,7 @@ export function UpdateTab() {
     if (installingRef.current || !plan) return;
     installingRef.current = true;
     setInstalling(true);
-    setError('');
+    setError(null);
     setRetry(null);
     try {
       if (plan.gatewayStep === 'none') {
@@ -233,12 +239,11 @@ export function UpdateTab() {
         if (!result.needs_restart) takeDesktopResume();
       } else {
         takeDesktopResume();
-        setError('message' in result ? result.message : '');
+        showFailure('message' in result ? result.message : undefined);
       }
     } catch (err) {
       takeDesktopResume();
-      const msg = err instanceof Error ? err.message : '';
-      setError(`${intl.formatMessage({ id: 'settings.update.failed' })}${msg ? `: ${msg}` : ''}`);
+      showFailure(err);
     } finally {
       setInstalling(false);
       setRetry(null);
@@ -400,12 +405,20 @@ export function UpdateTab() {
         <div className="rounded-lg bg-destructive/10 p-4 ring-1 ring-inset ring-destructive/20">
           <div className="flex items-center gap-2">
             <XCircle className="h-5 w-5 shrink-0 text-destructive" />
-            <span className="text-sm text-destructive">{error}</span>
+            <span className="text-sm text-destructive">
+              {intl.formatMessage({ id: `settings.update.failure.${failure?.kind ?? 'unknown'}` })}
+            </span>
           </div>
+          {failure?.detail && (
+            <details className="mt-2 pl-7 text-xs text-destructive/80">
+              <summary className="cursor-pointer">{intl.formatMessage({ id: 'settings.update.failure.details' })}</summary>
+              <p className="mt-2 whitespace-pre-wrap break-words">{failure.detail}</p>
+            </details>
+          )}
           {/* The gateway already retried twice before this landed. Say what the
               remaining likely cause is — but never on an integrity failure,
               where "try again later" would be the wrong thing to do. */}
-          {showsNetworkHint(error) && (
+          {showsNetworkHint(failure?.detail ?? '') && (
             <p className="mt-2 pl-7 text-xs text-destructive/80">
               {intl.formatMessage({ id: 'settings.update.failedHint' })}
             </p>

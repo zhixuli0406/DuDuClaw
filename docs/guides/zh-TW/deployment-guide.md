@@ -361,6 +361,53 @@ auto_update = true   # default: false — dashboard notification only
 | Homebrew（已停止維護） | 拒絕自我更新；這個 tap 已經停用，不會再收到新版本，請改用 npm 或桌面應用程式重新安裝 |
 | 原始碼（`cargo`/`target/`） | 允許自我更新，但重新編譯會覆蓋掉它 |
 
+### 疑難排解：從 v1.79.2 或更舊版以儀表板更新至 v1.79.3 失敗
+
+macOS Apple Silicon 原始的 v1.79.3 執行檔為 210,561,920 bytes（200.8 MiB），
+超過 v1.79.2 與更舊版更新器的解壓縮上限 200 MiB（209,715,200 bytes），因此重試
+也會失敗。舊版儀表板可能只顯示「更新失敗」。新版提高上限，無法改變目前還在執行的
+舊版更新器。後續發版會移除符號並檢查更新包中的執行檔大小，維持舊更新器的相容性。
+
+一般獨立安裝可手動替換一次執行檔：
+
+1. 從 [GitHub Releases](https://github.com/zhixuli0406/DuDuClaw/releases)
+   下載目標版本、作業系統與 CPU 對應的壓縮檔，以及同名的 `.sha256` 與 `.minisig`。
+   如尚未安裝 `minisign`，請先安裝。以下以 macOS Apple Silicon 的 v1.79.3 為例：
+
+```sh
+version=1.79.3
+asset=duduclaw-darwin-arm64.tar.gz
+stage=$(mktemp -d)
+cd "$stage"
+base="https://github.com/zhixuli0406/DuDuClaw/releases/download/v$version"
+curl -fL "$base/$asset" -o "$asset"
+curl -fL "$base/$asset.sha256" -o "$asset.sha256"
+curl -fL "$base/$asset.minisig" -o "$asset.minisig"
+shasum -a 256 -c "$asset.sha256" &&
+  minisign -Vm "$asset" -x "$asset.minisig" \
+    -P 'RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh'
+```
+
+2. **兩項驗證都成功**才繼續。上述公鑰是更新器內建的官方發版公鑰，不要改用與壓縮檔
+   一起下載的未知公鑰。執行 `tar -xzf "$asset" duduclaw` 解壓縮，再用
+   `./duduclaw version` 確認版本。
+3. 從第 7 節的 launchd plist 或 systemd unit 確認服務實際使用的執行檔路徑，並解析
+   符號連結。npm 的 `duduclaw` 指令可能指向 JavaScript 包裝程式，不能用原生執行檔
+   覆蓋它。先將實際執行檔另存一份，例如 `<binary>.pre-upgrade`。
+4. 停止服務並確認已停止：macOS 使用已安裝執行檔的 `service stop`；Linux 使用
+   `systemctl --user stop duduclaw`。若在前景執行，回原終端停止該行程。
+   將已驗證的 `./duduclaw` 複製到實際執行檔路徑，並恢復執行權限
+   （`chmod 755 <binary>`）；保留原資料目錄。
+5. 啟動原服務：macOS 執行 `<binary> service restart`，重新載入已註冊的
+   LaunchAgent；Linux 執行 `systemctl --user start duduclaw`。前景安裝則使用
+   原本的啟動指令。確認服務狀態與儀表板版本；若啟動失敗，先停止、還原備份的執行檔，
+   再啟動。驗證成功前保留備份。
+
+Linux 壓縮檔名稱為 `duduclaw-linux-x64.tar.gz` 或 `duduclaw-linux-arm64.tar.gz`；
+沒有 `shasum` 時可用 `sha256sum -c`。以上適用一般安裝；桌面應用程式使用應用程式
+更新器，受保護 Linux 服務請依[專用升級步驟](linux-protected-service.md)操作。
+
+
 ---
 
 ## 9. Prometheus + Grafana 監控

@@ -37,6 +37,8 @@ const GITHUB_REPO: &str = "zhixuli0406/DuDuClaw";
 pub(crate) const UPDATE_PUBKEY: &str = duduclaw_core::publishers::OFFICIAL_PUBLISHER_KEY;
 #[path = "updater/protected_release.rs"]
 mod protected_release;
+mod failure;
+pub use failure::{failure_kind, failure_payload, failure_response, sanitize_failure_detail};
 pub use protected_release::download_protected_release;
 
 /// Current version: prefers build-time `DUDUCLAW_VERSION` env (set by Pro build script),
@@ -969,7 +971,8 @@ async fn install_archive_bytes(
     // Stream into a private, exclusively created staging file; never buffer the binary.
     let mut staged = tempfile::Builder::new().prefix(".duduclaw-update-")
         .tempfile_in(exe_dir).map_err(|e| format!("Failed to stage binary: {e}"))?;
-    extract_binary_to(archive_bytes, archive_binary_name(current_exe), staged.as_file_mut())?;
+    extract_binary_to(archive_bytes, archive_binary_name(current_exe), staged.as_file_mut())
+        .map_err(|e| format!("Update extraction failed: {e}"))?;
     staged.as_file().sync_all().map_err(|e| format!("Failed to sync binary: {e}"))?;
     let tmp_path = staged.into_temp_path();
 
@@ -1146,7 +1149,8 @@ async fn download_and_verify_once(
     let sig_bytes = fetch_asset_bytes(client, signature_url, "Signature file").await?;
     let sig_text = String::from_utf8_lossy(&sig_bytes).into_owned();
 
-    verify_archive_integrity(&bytes, &checksum_text, &sig_text)?;
+    verify_archive_integrity(&bytes, &checksum_text, &sig_text)
+        .map_err(|e| StageError::fatal(format!("Update verification failed: {}", e.message)))?;
     Ok(bytes)
 }
 
@@ -1810,6 +1814,40 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
             let mut budget = ArchiveBudget { reader: bytes.as_slice(), remaining: 8 };
             assert_eq!(budget.read_to_end(&mut Vec::new()).is_ok(), len <= 8);
         }
+    }
+
+    #[tokio::test]
+    async fn updater_install_failure_reaches_dashboard_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("duduclaw");
+        let error = install_archive_bytes(b"not a gzip archive", &target, dir.path())
+            .await.unwrap_err();
+        let payload = failure_payload(&error);
+        assert_eq!(payload["kind"], "extract");
+        assert_eq!(payload["detail"], error);
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let missing_dir = dir.path().join("missing");
+        let error = install_archive_bytes(b"", &target, &missing_dir).await.unwrap_err();
+        assert_eq!(failure_payload(&error)["kind"], "write");
+        assert!(error.starts_with("Failed to stage binary:"));
+    }
+
+    #[test]
+    fn updater_write_failure_reaches_dashboard_payload() {
+        struct DiskFull;
+        impl std::io::Write for DiskFull {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let error = copy_binary(&mut b"binary".as_slice(), &mut DiskFull, 100).unwrap_err();
+        assert_eq!(failure_payload(&error)["kind"], "write");
+        assert!(failure_payload(&error)["detail"].as_str().unwrap().contains("disk full"));
+        let size_error = copy_binary(&mut b"binary".as_slice(), &mut Vec::new(), 1).unwrap_err();
+        assert_eq!(failure_payload(&size_error)["kind"], "size");
     }
 
     #[test]

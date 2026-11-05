@@ -156,7 +156,13 @@ duduclaw-db = { path = "crates/duduclaw-db" }
 duduclaw-knowledge = { path = "crates/duduclaw-knowledge" }
 duduclaw-onnx = { path = "crates/duduclaw-onnx", default-features = false }
 
-# Debug builds only (the release profile is untouched). The workflow MCP path
+# Published CE binaries and desktop gateway sidecars share this profile.
+# Keep panic messages and source locations; only symbol tables are removed.
+# Windows release jobs override this to "none" to preserve separate PDBs.
+[profile.release]
+strip = "symbols"
+
+# Debug builds only. The workflow MCP path
 # hashes the whole running CLI binary (~336 MB in a debug build) with SHA-256
 # on every workflow tool call to detect environment drift. Unoptimized `sha2`
 # takes 13-19 s per hash, which made every debug workflow call (and every

@@ -80,3 +80,8 @@ custom-protocol = ["tauri/custom-protocol"]
 # Manifest-only security patch: use fixed ZIP extraction in the Windows updater.
 tauri-plugin-updater = { path = "vendor/tauri-plugin-updater" }
 glib = { path = "vendor/glib" }
+
+# Detached workspace: match the published gateway's symbol stripping.
+# Panic messages / source locations remain; Windows jobs preserve separate PDBs.
+[profile.release]
+strip = "symbols"

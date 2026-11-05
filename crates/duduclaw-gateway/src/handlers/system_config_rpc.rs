@@ -366,6 +366,11 @@ impl MethodHandler {
             }
         };
         match apply_result {
+            Ok(result) if !result.success => {
+                *self.pending_update.write().await = None;
+                tracing::warn!(error = %crate::updater::sanitize_failure_detail(&result.message), "Dashboard update was not applied");
+                crate::updater::failure_response(&result.message)
+            }
             Ok(result) => {
                 *self.pending_update.write().await = None;
 
@@ -398,8 +403,8 @@ impl MethodHandler {
                 // [R2:NM5] Clear stale pending on failure so user must re-check
                 *self.pending_update.write().await = None;
 
-                // [R2:NM3] Sanitize error for audit log (strip ANSI/newlines)
-                let sanitized = e.replace('\n', " ").replace('\r', "").replace('\x1b', "");
+                // Share the same bounded diagnostics as the RPC and push payloads.
+                let sanitized = crate::updater::sanitize_failure_detail(&e);
                 crate::security_autopilot::audit_and_emit(
                     &self.home_dir,
                     &duduclaw_security::audit::AuditEvent::new(
@@ -409,7 +414,8 @@ impl MethodHandler {
                         json!({ "error": sanitized }),
                     ),
                 );
-                WsFrame::error_response("", &format!("Update failed: {e}"))
+                tracing::warn!(error = %sanitized, kind = crate::updater::failure_kind(&e), "Dashboard update failed");
+                crate::updater::failure_response(&e)
             }
         }
     }
