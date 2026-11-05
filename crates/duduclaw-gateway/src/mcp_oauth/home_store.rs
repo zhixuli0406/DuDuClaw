@@ -238,6 +238,13 @@ pub(crate) fn publish_unrelated_source(
     publication::ensure_unblocked(g.home())?;
     write.publish(g.home())
 }
+pub(crate) fn publish_unrelated_source_observed(
+    g:&SourceGuard,write:publication::PreparedSourceWrite,
+    observer:&mut dyn FnMut(&std::fs::File)->Result<()>,
+)->Result<()> {
+    publication::ensure_unblocked(g.home())?;
+    write.publish_observed(g.home(),Some(observer))
+}
 pub(crate) fn wall_time_now(home: &Path) -> u64 {
     publication::host_now(home)
 }

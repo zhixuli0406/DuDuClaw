@@ -393,6 +393,14 @@ async fn write_grant(
 ) -> Result<(), String> {
     let source = source.to_string();
     crate::channel_reply::update_agent_toml_with(registry, agent_id, move |table| {
+        apply_grant_to_table(table,&source,grant)
+    })
+    .await
+    .map(|_| ())
+}
+
+/// Shared normal grant mutation; callers validate the source before granting.
+pub(crate) fn apply_grant_to_table(table:&mut toml::Table,source:&str,grant:bool)->Result<(),String> {
         let section = table
             .entry("capabilities")
             .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
@@ -400,11 +408,11 @@ async fn write_grant(
             .ok_or_else(|| "agent.toml 的 [capabilities] 不是一個表格".to_string())?;
         let mut list = read_grant_array(section);
         if grant {
-            if !list.iter().any(|g| g == &source) {
-                list.push(source.clone());
+            if !list.iter().any(|g| g == source) {
+                list.push(source.to_string());
             }
         } else {
-            list.retain(|g| g != &source);
+            list.retain(|g| g != source);
         }
         if list.is_empty() {
             section.remove(GRANT_KEY);
@@ -415,9 +423,6 @@ async fn write_grant(
             );
         }
         Ok(())
-    })
-    .await
-    .map(|_| ())
 }
 
 /// Read `[capabilities] db_sources` out of a raw table, tolerating the same

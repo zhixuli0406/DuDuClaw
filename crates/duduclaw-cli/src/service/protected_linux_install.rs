@@ -157,6 +157,12 @@ fn read_version_file(path: &str) -> Result<Option<String>> {
 
 fn check_floor(target: &str, upgrade: bool) -> Result<()> {
     let floor = read_version_file(VERSION_FLOOR)?;
+    require_isolation_migration(floor.as_deref(), target)?;
+    if upgrade {
+        // A newer floor can survive an interrupted upgrade while the old
+        // executable still runs; both must authorize the migration boundary.
+        require_isolation_migration(Some(duduclaw_gateway::updater::current_version()), target)?;
+    }
     // The atomic writer uses one version without whitespace. Do not normalize
     // malformed existing files into an accepted floor.
     duduclaw_core::root_key::check_protected_version(target,
@@ -166,6 +172,39 @@ fn check_floor(target: &str, upgrade: bool) -> Result<()> {
             duduclaw_gateway::updater::current_version(), Some(&pending), upgrade).map_err(refused)?;
     }
     Ok(())
+}
+
+// The old single-binary updater cannot establish D9's independent bootstrap
+// trust or quarantine authority. Never cross that boundary by replacing bytes.
+fn require_isolation_migration(installed: Option<&str>, target: &str) -> Result<()> {
+    let target = semver::Version::parse(target).map_err(|_| refused("invalid target version"))?;
+    if installed.is_none() && (target.major, target.minor) >= (1, 80) {
+        return Err(refused("無法確認這個安裝是否已完成資料遷移，已停止升級。請使用官方遷移流程。"));
+    }
+    if let Some(installed) = installed {
+        let installed = semver::Version::parse(installed).map_err(|_| refused("invalid installed version"))?;
+        if (installed.major, installed.minor) < (1, 80) && (target.major, target.minor) >= (1, 80) {
+            return Err(refused("此安裝需要先完成經獨立驗證的資料遷移，不能直接替換程式升級。請使用已驗證的新版安裝套件執行 duduclaw-migrate run --plan，完成後再升級。"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod isolation_migration_tests {
+    use super::require_isolation_migration;
+
+    #[test]
+    fn legacy_protected_upgrade_cannot_bypass_migration() {
+        for target in ["1.80.0", "1.80.0-rc.1", "1.80.1", "2.0.0"] {
+            assert!(require_isolation_migration(Some("1.79.3"), target).is_err());
+        }
+        assert!(require_isolation_migration(Some("1.79.3"), "1.79.4").is_ok());
+        assert!(require_isolation_migration(Some("1.80.0"), "1.80.1").is_ok());
+        assert!(require_isolation_migration(Some("invalid"), "1.80.0").is_err());
+        assert!(require_isolation_migration(None, "1.80.0").is_err());
+        assert!(require_isolation_migration(None, "1.79.3").is_ok());
+    }
 }
 
 fn prepare_version(version: &str) -> Result<()> {

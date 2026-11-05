@@ -158,7 +158,7 @@ fn current_contract(home: &Path, agent_id: &str) -> rules::ContractBounds {
 }
 
 fn ai_applies(key: &FileKey, source: &str) -> bool {
-    key.text_editable() && matches!(source, "dashboard" | "rollback" | "contract.update")
+    key.text_editable() && matches!(source, "dashboard" | "rollback" | "contract.update" | "migration" | "migration.rollback")
 }
 
 /// The red-team coverage of a contract, without calling a model: how many
@@ -476,11 +476,15 @@ async fn apply(
     meta.basis = Some(analysis.basis);
     meta.reason_categories = verdict::categories(&analysis.reasons);
     meta.confirm_reason = confirm_reason;
+    // This source is constructed only by the internal migration adapter after
+    // its separate Admin decision. It is not deserialized from RPC input.
+    if matches!(input.source,"migration"|"migration.rollback") {meta.approval_id=Some(input.reason.clone());}
     meta.severity = severity;
     let home = c.home.to_path_buf();
     let session = c.session.clone();
     let agent = input.agent_id.clone();
     let content = input.content.clone();
+    let migration_rollback=if input.source=="migration.rollback" {Some((input.reason.clone(),input.key.clone(),input.base_hash.clone()))}else{None};
     let result = writer::commit(
         c.registry,
         Commit {
@@ -493,6 +497,11 @@ async fn apply(
         },
         move |_| Ok(content),
         move || {
+            if let Some((receipt,key,expected))=&migration_rollback {
+                if !super::history::last(&home,&agent,key).is_some_and(|entry|entry.approval_id.as_deref()==Some(receipt.as_str()) && entry.sha256==*expected) {
+                    return Err("migration profile ownership changed".into());
+                }
+            }
             let live = require_live_agent_access(&home, &session, &agent, AccessLevel::Owner)?;
             if need_admin && !live.is_admin() {
                 return Err("permission denied".into());

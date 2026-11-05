@@ -30,6 +30,9 @@
 #![allow(clippy::sliced_string_as_bytes)]
 #![allow(clippy::if_same_then_else)]
 
+pub mod migration_import;
+pub mod migration_startup;
+
 // The live-test seams (in-memory credential protection, Google REST base
 // override) must never reach a shipped binary.
 #[cfg(all(feature = "live-test-mocks", not(debug_assertions)))]

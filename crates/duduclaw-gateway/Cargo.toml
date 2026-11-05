@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+duduclaw-migration = { path = "../duduclaw-migration" }
 # H4/H5 (WP-B goal loop hardening): gap-fingerprint path:line extraction +
 # the bail-pattern regex panel. Already a direct dependency elsewhere in the
 # workspace (duduclaw-cli, duduclaw-security, duduclaw-redaction), so no new
@@ -232,6 +233,7 @@ url = "2"
 libc = "0.2"
 
 [dev-dependencies]
+duduclaw-import = { path = "../duduclaw-import" }
 # Deterministic per-test Home deadline checks; production Tokio features stay unchanged.
 tokio = { workspace = true, features = ["test-util"] }
 # D1 composed CLI HTTP tests: dev-cycle only, no new production dependency.

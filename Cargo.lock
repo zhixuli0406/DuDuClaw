@@ -2032,11 +2032,13 @@ dependencies = [
  "duduclaw-db",
  "duduclaw-fork",
  "duduclaw-identity",
+ "duduclaw-import",
  "duduclaw-inference",
  "duduclaw-knowledge",
  "duduclaw-license",
  "duduclaw-llm",
  "duduclaw-memory",
+ "duduclaw-migration",
  "duduclaw-odoo",
  "duduclaw-onnx",
  "duduclaw-os",
@@ -2117,6 +2119,22 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "duduclaw-import"
+version = "1.79.3"
+dependencies = [
+ "duduclaw-isolation",
+ "libc",
+ "rusqlite",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]
@@ -2277,6 +2295,26 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "uuid",
+]
+
+[[package]]
+name = "duduclaw-migration"
+version = "1.79.3"
+dependencies = [
+ "chacha20poly1305",
+ "chrono",
+ "duduclaw-import",
+ "duduclaw-isolation",
+ "hmac",
+ "libc",
+ "rand 0.8.6",
+ "rusqlite",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

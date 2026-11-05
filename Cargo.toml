@@ -17,6 +17,8 @@ exclude = [
 members = [
     "crates/duduclaw-core",
     "crates/duduclaw-isolation",
+    "crates/duduclaw-migration",
+    "crates/duduclaw-import",
     "crates/duduclaw-auth",
     "crates/duduclaw-gateway",
     "crates/duduclaw-security",

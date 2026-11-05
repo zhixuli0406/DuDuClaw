@@ -89,6 +89,8 @@ function renderGateAt(initialPath: string) {
             <Route index element={<div>DASHBOARD</div>} />
             <Route path="/license" element={<div>LICENSE (legacy)</div>} />
             <Route path="/app/system/license" element={<div>LICENSE (canonical)</div>} />
+            <Route path="/app/system/migration" element={<div>MIGRATION</div>} />
+            <Route path="/me/account" element={<div>ACCOUNT SECURITY</div>} />
           </Route>
           <Route path="/welcome" element={<div>WELCOME</div>} />
         </Routes>
@@ -113,4 +115,16 @@ describe('FirstRunGate — license exemption (N-3)', () => {
     expect(screen.getByText('LICENSE (legacy)')).toBeInTheDocument();
     expect(screen.queryByText('WELCOME')).not.toBeInTheDocument();
   });
+});
+
+
+describe('FirstRunGate — migration bootstrap', () => {
+  it.each([['/app/system/migration', 'MIGRATION'], ['/me/account', 'ACCOUNT SECURITY']])(
+    'allows %s before any employee has been confirmed', (path, title) => {
+      useAgentsStore.setState({ loaded: true, loading: false, agents: [] });
+      renderGateAt(path);
+      expect(screen.getByText(title)).toBeInTheDocument();
+      expect(screen.queryByText('WELCOME')).not.toBeInTheDocument();
+    },
+  );
 });

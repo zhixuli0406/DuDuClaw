@@ -75,6 +75,12 @@ pub(crate) fn migrate(conn: &Connection, enforced: bool) -> Result<()> {
         verified INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS mfa_enrollment_codes (
         user_id TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS migration_dashboard_proofs (
+        user_id TEXT NOT NULL, session_hash TEXT NOT NULL, epoch INTEGER NOT NULL,
+        verified_at INTEGER NOT NULL, csrf BLOB NOT NULL,
+        PRIMARY KEY(user_id,session_hash));
+        CREATE TABLE IF NOT EXISTS migration_step_up_attempts (
+        user_id TEXT PRIMARY KEY, window INTEGER NOT NULL, attempts INTEGER NOT NULL);
         UPDATE users SET credential_epoch=1 WHERE credential_epoch=0
             AND EXISTS(SELECT 1 FROM mfa_credentials WHERE user_id=users.id);
         CREATE TRIGGER IF NOT EXISTS mfa_password_epoch AFTER UPDATE OF password_hash ON users
@@ -710,6 +716,8 @@ fn clear(tx: &Connection, user: &str) -> Result<()> {
 }
 
 mod enrollment;
+mod migration;
+pub use migration::MigrationConfirmationSession;
 use enrollment::proof_verified;
 
 #[cfg(test)]

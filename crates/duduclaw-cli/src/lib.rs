@@ -4152,6 +4152,23 @@ pub fn entry_point_blocking() {
 
 pub async fn entry_point() {
     let cli = Cli::parse();
+    // Import must precede even CLI logging/OTLP and redaction initialization.
+    // An explicit import environment never falls through to another command.
+    let import_requested = std::env::var_os(duduclaw_gateway::migration_startup::IMPORT_ONLY_ENV).is_some();
+    if import_requested && (!matches!(&cli.command, Commands::Run { .. }) || cli.force_disable_redaction) {
+        eprintln!("Error: migration import startup refused");
+        std::process::exit(1);
+    }
+    if matches!(&cli.command, Commands::Run { .. }) {
+        match duduclaw_gateway::migration_startup::maybe_run(&duduclaw_home()).await {
+            Ok(true) => return,
+            Ok(false) => {},
+            Err(_) => {
+                eprintln!("Error: migration import startup refused");
+                std::process::exit(1);
+            }
+        }
+    }
     if let Commands::Tooling(ToolingCommands::NsGuardExec { command }) = &cli.command {
         // Must run before logging, banners or any other stdout initialization.
         #[cfg(unix)]
@@ -8953,6 +8970,7 @@ mod admin_auth_token_tests {
 }
 
 async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
+    if duduclaw_gateway::migration_startup::maybe_run(&duduclaw_home()).await? { return Ok(()); }
     if let Err(error) = duduclaw_core::ns_guard::harden_gateway_process() {
         eprintln!("ERROR: 無法啟用容器 gateway 行程保護，拒絕啟動：{error}");
         std::process::exit(1);

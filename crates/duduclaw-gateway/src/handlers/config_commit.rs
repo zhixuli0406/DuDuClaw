@@ -234,6 +234,29 @@ pub(crate) fn commit_text_locked(path: &Path, expected_hash: &str, new_content: 
     commit_rendered_locked(path, expected_hash, |_| Ok(new_content.to_string()))
 }
 
+/// Same policy/Google-source/MFA/CAS path, with a durable producer receipt
+/// recorded from the prepared file before publication. Unrelated config only.
+pub(crate) fn commit_text_observed(
+    path:&Path,expected_hash:&str,new_content:&str,
+    observer:&mut dyn FnMut(&std::fs::File)->Result<(),String>,
+)->Result<(),String> {
+    commit_text_observed_guarded(path,expected_hash,new_content,||Ok(()),observer)
+}
+pub(crate) fn commit_text_observed_guarded(
+    path:&Path,expected_hash:&str,new_content:&str,
+    guard:impl FnOnce()->Result<(),String>,
+    observer:&mut dyn FnMut(&std::fs::File)->Result<(),String>,
+)->Result<(),String> {
+    let render=|_:&str|{guard()?;Ok(new_content.to_owned())};
+    if path.file_name().and_then(|n|n.to_str())==Some("config.toml") {
+        let home=path.parent().ok_or("config.toml has no parent")?;
+        return crate::google_identity::home_source::with_source_guard(home,|g|Ok(
+            commit_rendered_inner(path,expected_hash,render,true,Some(g),None,Some(observer))
+        )).map_err(|e|e.to_string())?;
+    }
+    commit_rendered_inner(path,expected_hash,render,true,None,None,Some(observer))
+}
+
 pub(crate) fn commit_text_locked_with_guard(
     path: &Path, expected_hash: &str, new_content: &str,
     guard: impl FnOnce() -> Result<(), String>,
@@ -334,12 +357,12 @@ pub(crate) fn commit_local_config_rendered(
 fn commit_rendered_policy(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,mfa_actor:Option<&str>)->Result<(),String> {
     if path.file_name().and_then(|n|n.to_str())==Some("config.toml") {
         let home=path.parent().ok_or("config.toml has no parent")?;
-        return crate::google_identity::home_source::with_source_guard(home,|g|Ok(commit_rendered_inner(path,expected_hash,render,dashboard_policy,Some(g),mfa_actor)))
+        return crate::google_identity::home_source::with_source_guard(home,|g|Ok(commit_rendered_inner(path,expected_hash,render,dashboard_policy,Some(g),mfa_actor,None)))
             .map_err(|e|e.to_string())?;
     }
-    commit_rendered_inner(path,expected_hash,render,dashboard_policy,None,mfa_actor)
+    commit_rendered_inner(path,expected_hash,render,dashboard_policy,None,mfa_actor,None)
 }
-fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>)->Result<(),String> {
+fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>)->Result<(),String> {
     let outcome = duduclaw_core::with_file_lock(path, || {
         let current = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -353,6 +376,11 @@ fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)-
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
+        if observer.is_some() && source.is_some() {
+            if let Err(error)=crate::google_identity::home_source::require_unrelated_config(&current,&new_content) {
+                return Ok(Err(error.to_string()));
+            }
+        }
         if dashboard_policy && matches!(path.file_name().and_then(|n| n.to_str()), Some("config.toml" | "agent.toml" | "inference.toml")) {
             let home = if path.file_name().and_then(|n| n.to_str()) == Some("agent.toml") {
                 path.parent().and_then(Path::parent).and_then(Path::parent)
@@ -386,10 +414,21 @@ fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)-
                 });
             }
             if let Some(g) = source {
-                crate::google_identity::home_source::commit_google_config_under_guard(g, &current, &new_content)
-                    .map_err(|e| e.to_string())
+                if let Some(observer)=observer {
+                    crate::google_identity::home_source::commit_unrelated_config_observed(g,&current,&new_content,observer).map_err(|e|e.to_string())
+                } else {
+                    crate::google_identity::home_source::commit_google_config_under_guard(g, &current, &new_content).map_err(|e|e.to_string())
+                }
             } else {
-                replace_owner_only(path, &new_content).map_err(|e| e.to_string())
+                if let Some(observer)=observer {
+                    use std::io::Write;
+                    let parent=path.parent().ok_or("config path missing parent")?;
+                    let mut temporary=tempfile::NamedTempFile::new_in(parent).map_err(|e|e.to_string())?;
+                    temporary.write_all(new_content.as_bytes()).and_then(|_|temporary.as_file().sync_all()).map_err(|e|e.to_string())?;
+                    observer(temporary.as_file())?;
+                    temporary.persist(path).map_err(|e|e.to_string())?;
+                    std::fs::File::open(parent).and_then(|f|f.sync_all()).map_err(|e|e.to_string())
+                } else {replace_owner_only(path, &new_content).map_err(|e| e.to_string())}
             }
         };
         if let Some(actor) = mfa_actor {

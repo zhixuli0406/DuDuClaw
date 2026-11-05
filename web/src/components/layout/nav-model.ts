@@ -421,6 +421,7 @@ export const navGroups: NavGroup[] = [
       { to: '/me/account', icon: KeyRound, label: 'nav.account', desc: 'nav.account.desc', ownScope: true, newIn: '1.78.0' },
       { to: '/my/history-views', icon: Eye, label: 'nav.myHistoryViews', desc: 'nav.myHistoryViews.desc', ownScope: true, enterprise: true, newIn: '1.76.0' },
       manageEntry,
+      { to: '/app/system/migration', icon: Shield, label: 'migrationConfirm.title', desc: 'migrationConfirm.description', minRole: 'admin', newIn: '1.80.0' },
       // 關於 — brand info + fixed upstream-vendor block. Open to every user.
       { to: '/about', icon: Info, label: 'nav.about', desc: 'nav.about.desc' },
     ],

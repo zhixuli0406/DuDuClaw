@@ -59,7 +59,11 @@ export function FirstRunGate() {
     agents.length === 0 &&
     location.pathname !== '/welcome' &&
     location.pathname !== '/license' &&
-    location.pathname !== '/app/system/license'
+    location.pathname !== '/app/system/license' &&
+    // Migration deliberately has no active employees until approval. Account
+    // security must remain reachable so the first admin can enroll MFA.
+    location.pathname !== '/app/system/migration' &&
+    location.pathname !== '/me/account'
   ) {
     return <Navigate to="/welcome" replace />;
   }

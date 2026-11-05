@@ -133,6 +133,19 @@ impl UserDb {
         )
         .map_err(|e| format!("failed to create auth tables: {e}"))?;
 
+        // Old setup tokens have no purpose binding; invalidate them during upgrade.
+        if !has_column(&conn, "setup_tokens", "recovery")? {
+            conn.execute_batch("BEGIN IMMEDIATE;
+                ALTER TABLE setup_tokens ADD COLUMN recovery INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE setup_tokens ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+                UPDATE setup_tokens SET consumed = 1;
+                COMMIT;").map_err(|e| format!("setup token migration failed: {e}"))?;
+        }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS setup_claim_rate (
+            id INTEGER PRIMARY KEY CHECK(id = 1), window_start INTEGER NOT NULL,
+            attempts INTEGER NOT NULL
+        );").map_err(|e| format!("setup rate table failed: {e}"))?;
+
         crate::google_identity::migrate(&conn)?;
         crate::mfa::migrate(&conn, enforced)?;
         crate::user_invites::migrate(&conn)?;
@@ -582,29 +595,7 @@ impl UserDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("bind error: {e}"))?;
-        if access_level == AccessLevel::Owner {
-            let owners: Vec<String> = {
-                let mut statement = tx.prepare("SELECT user_id FROM user_agent_bindings WHERE agent_name = ?1 AND access_level = 'owner' AND user_id != ?2")
-                    .map_err(|e| e.to_string())?;
-                statement.query_map(params![agent_name, user_id], |row| row.get(0)).map_err(|e| e.to_string())?
-                    .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
-            };
-            if let [previous] = owners.as_slice() {
-                let updated = tx.execute("UPDATE user_agent_bindings SET is_primary = 1 WHERE agent_name = ?1 AND user_id = ?2 AND NOT EXISTS(SELECT 1 FROM user_agent_bindings WHERE agent_name = ?1 AND is_primary = 1)", params![agent_name, previous]).map_err(|e| e.to_string())?;
-                if updated > 0 {
-                    tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp) VALUES(NULL, 'agent.primary_owner_auto', ?1, ?2, ?3)",
-                        params![agent_name, serde_json::json!({"primary_user_id": previous}).to_string(), now]).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-        tx.execute(
-            "INSERT INTO user_agent_bindings (user_id, agent_name, access_level, bound_at) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(user_id, agent_name) DO UPDATE SET access_level = excluded.access_level, bound_at = excluded.bound_at,
-             is_primary = CASE WHEN excluded.access_level = 'owner' THEN user_agent_bindings.is_primary ELSE 0 END",
-            params![user_id, agent_name, access_level.to_string(), now],
-        )
-        .map_err(|e| format!("bind error: {e}"))?;
-        bump_acl_generation(&tx).map_err(|e| format!("bind error: {e}"))?;
+        bind_agent_in_transaction(&tx, user_id, agent_name, access_level, &now)?;
         tx.commit().map_err(|e| format!("bind error: {e}"))
     }
 
@@ -1269,4 +1260,35 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].action, "agent.create"); // DESC order
     }
+}
+
+/// Shared ordinary/migration writer; caller owns the immediate transaction.
+pub(crate) fn bind_agent_in_transaction(
+    tx: &rusqlite::Transaction<'_>, user_id: &str, agent_name: &str,
+    access_level: AccessLevel, now: &str,
+) -> Result<(), String> {
+        if access_level == AccessLevel::Owner {
+            let owners: Vec<String> = {
+                let mut statement = tx.prepare("SELECT user_id FROM user_agent_bindings WHERE agent_name = ?1 AND access_level = 'owner' AND user_id != ?2")
+                    .map_err(|e| e.to_string())?;
+                statement.query_map(params![agent_name, user_id], |row| row.get(0)).map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            };
+            if let [previous] = owners.as_slice() {
+                let updated = tx.execute("UPDATE user_agent_bindings SET is_primary = 1 WHERE agent_name = ?1 AND user_id = ?2 AND NOT EXISTS(SELECT 1 FROM user_agent_bindings WHERE agent_name = ?1 AND is_primary = 1)", params![agent_name, previous]).map_err(|e| e.to_string())?;
+                if updated > 0 {
+                    tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp) VALUES(NULL, 'agent.primary_owner_auto', ?1, ?2, ?3)",
+                        params![agent_name, serde_json::json!({"primary_user_id": previous}).to_string(), now]).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        tx.execute(
+            "INSERT INTO user_agent_bindings (user_id, agent_name, access_level, bound_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_id, agent_name) DO UPDATE SET access_level = excluded.access_level, bound_at = excluded.bound_at,
+             is_primary = CASE WHEN excluded.access_level = 'owner' THEN user_agent_bindings.is_primary ELSE 0 END",
+            params![user_id, agent_name, access_level.to_string(), now],
+        )
+        .map_err(|e| format!("bind error: {e}"))?;
+        bump_acl_generation(&tx).map_err(|e| format!("bind error: {e}"))?;
+    Ok(())
 }
