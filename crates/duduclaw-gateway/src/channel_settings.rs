@@ -105,6 +105,16 @@ pub const MCP_ACCESS_KEYS: &[&str] = &[
     keys::BLOCKED_USERS,
 ];
 
+/// Status reports describe presentation and guild identity only. They do not
+/// enumerate access lists, employee routing, or private administrative settings.
+pub const MCP_STATUS_KEYS: &[&str] = &[
+    keys::GUILD_NAME,
+    keys::MENTION_ONLY,
+    keys::AUTO_THREAD,
+    keys::RESPONSE_MODE,
+    keys::THREAD_ARCHIVE_MINUTES,
+];
+
 /// Access-control keys the dashboard (admin-only, human-operated GUI) may
 /// read/write (E2). Superset of [`MCP_ACCESS_KEYS`]: `admin_users` decides who
 /// can press `!STOP` in-channel — a GUI-only write per the D-C1 "channel-side
@@ -544,6 +554,20 @@ impl ChannelSettingsManager {
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
+    }
+
+    /// Read only keys exposed by the MCP channel_config contract.
+    pub async fn get_mcp_config(&self, channel_type: &str, scope_id: &str) -> Vec<(String, String)> {
+        self.get_all(channel_type, scope_id).await.into_iter()
+            .filter(|(key, _)| CONFIG_KEYS.contains(&key.as_str()) || MCP_ACCESS_KEYS.contains(&key.as_str()))
+            .collect()
+    }
+
+    /// Read the narrower status-report projection; unknown future keys stay private.
+    pub async fn get_mcp_status(&self, channel_type: &str, scope_id: &str) -> Vec<(String, String)> {
+        self.get_all(channel_type, scope_id).await.into_iter()
+            .filter(|(key, _)| MCP_STATUS_KEYS.contains(&key.as_str()))
+            .collect()
     }
 
     /// Check if a channel_id is allowed for a given scope.
@@ -998,6 +1022,25 @@ mod tests {
             .unwrap();
         let all = mgr.get_all("discord", "guild1").await;
         assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_settings_projections_exclude_private_and_unknown_keys() {
+        let (_tmp, mgr) = temp_db();
+        for key in CONFIG_KEYS.iter().chain(MCP_ACCESS_KEYS).chain(MCP_STATUS_KEYS)
+            .chain([keys::ADMIN_USERS, keys::GROUP_CONTEXT, keys::DISCORD_AGENT_CHOICES,
+                keys::SHARED_BOT_BINDING, "future_private_key"].iter()) {
+            mgr.set("discord", "guild1", key, "canary").await.unwrap();
+        }
+        let config: std::collections::BTreeSet<_> = mgr.get_mcp_config("discord", "guild1").await
+            .into_iter().map(|(key, _)| key).collect();
+        let expected: std::collections::BTreeSet<_> = CONFIG_KEYS.iter().chain(MCP_ACCESS_KEYS)
+            .map(|key| (*key).to_owned()).collect();
+        assert_eq!(config, expected);
+        let status: std::collections::BTreeSet<_> = mgr.get_mcp_status("discord", "guild1").await
+            .into_iter().map(|(key, _)| key).collect();
+        assert_eq!(status, MCP_STATUS_KEYS.iter().map(|key| (*key).to_owned()).collect());
+        assert!(mgr.get_all("discord", "guild1").await.iter().any(|(key, _)| key == keys::ADMIN_USERS));
     }
 
     #[tokio::test]

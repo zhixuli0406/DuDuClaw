@@ -254,14 +254,7 @@ pub(crate) async fn authorize_current(agent_dir: &Path, principal_context: Optio
             crate::isolation_mcp::HostTurn { identity: crate::isolation_egress::RunTurnIdentity {
                 turn, approval_session: session }, metadata: Some(metadata), principal_context,
                 egress_turn, background: Some(receipt.clone()) }, Some(receipt.expires_at))?;
-        auth.grant.task = task.map(duduclaw_isolation::bounded::Text::new).transpose()
-            .map_err(|_| VerificationError::Invalid)?;
-        if let Some(task) = &auth.grant.task {
-            let mut resources = auth.grant.resources.as_slice().to_vec();
-            resources.push(duduclaw_isolation::capability::ResourceGrant::Task { id: task.clone() });
-            auth.grant.resources = duduclaw_isolation::bounded::List::new(resources)
-                .map_err(|_| VerificationError::Invalid)?;
-        }
+        if let Some(task) = task { auth.limit_to_task(task)?; }
         // Queue consumers are detached host waiters. The initiating employee
         // and run remain in the receipt; treating them as a synchronous waiter
         // would deadlock/refuse a valid self-delegation after its parent exits.

@@ -14,6 +14,30 @@ pub struct RuntimeAuthorization {
     pub turn: Option<super::HostTurn>,
     pub authenticated_epoch: Option<u64>,
 }
+impl RuntimeAuthorization {
+    /// A task-limited background run must not retain broad employee authority.
+    /// Confined IO inputs become exact finite grants; no new service authority
+    /// is inferred from the task or from a background/system sender name.
+    pub fn limit_to_task(&mut self, task: String) -> Result<(), super::VerificationError> {
+        use duduclaw_isolation::{bounded::{List, Text}, capability::ResourceGrant};
+        let task = Text::new(task).map_err(|_| super::VerificationError::Invalid)?;
+        let selected = ResourceGrant::Task { id: task.clone() };
+        duduclaw_mcp_boundary::tool_policy::validate_resource(&selected)?;
+        if self.grant.task.as_ref().is_some_and(|current| current != &task) {
+            return Err(super::VerificationError::BindingMismatch);
+        }
+        let mut resources: Vec<_> = self.grant.resources.as_slice().iter().filter_map(|grant| match grant {
+            ResourceGrant::EmployeeScope { .. } => None,
+            ResourceGrant::Confined { resource } => Some(resource.as_ref().clone()),
+            _ => Some(grant.clone()),
+        }).collect();
+        if !resources.contains(&selected) { resources.push(selected); }
+        let resources = List::new(resources).map_err(|_| super::VerificationError::Invalid)?;
+        self.grant.task = Some(task);
+        self.grant.resources = resources;
+        Ok(())
+    }
+}
 tokio::task_local! { static AUTHORIZATION: Mutex<Option<RuntimeAuthorization>>; }
 
 /// Only authenticated host ingress/dispatch may call this. It has no serde,

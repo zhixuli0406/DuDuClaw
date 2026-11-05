@@ -102,7 +102,7 @@ pub(super) async fn authorize_current(agent_dir: &Path, principal_context: Optio
                 crate::trigger_route::access::verified_user_for_channel_sender(&human.home, channel, sender).as_deref())?,
         }
         let expiry = match &human.source { Source::Web(claims) => Some(claims.exp), _ => None };
-        super::boot::human_authorization(human.home, agent, human.user, human.epoch, lane,
+        super::boot::record_authorization(human.home, agent, human.user, human.epoch, lane,
             super::HostTurn { identity: crate::isolation_egress::RunTurnIdentity {
                 turn, approval_session: Some(session) }, metadata: Some(metadata), principal_context,
                 egress_turn, background: None }, expiry)

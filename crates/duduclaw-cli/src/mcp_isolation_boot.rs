@@ -13,7 +13,7 @@ use duduclaw_gateway::isolation_mcp::{DispatcherFactory, DispatcherInput, Dispat
 use duduclaw_gateway::isolation_mcp::VerificationError;
 
 #[cfg(target_os = "linux")]
-struct CliDispatcherFactory;
+pub(crate) struct CliDispatcherFactory;
 #[cfg(target_os = "linux")]
 impl DispatcherFactory for CliDispatcherFactory {
     fn verify_producers(&self, execution: &dyn duduclaw_mcp_boundary::execution::ExecutionPlanFactory,

@@ -125,9 +125,9 @@ pub(crate) mod runtime;
 #[cfg(target_os = "linux")]
 pub use runtime::{RuntimeAuthorization, with_runtime_authorization};
 #[cfg(target_os = "linux")]
-pub(crate) use boot::{human_authorization as record_authorization, delegation_source};
+pub(crate) use boot::{record_authorization, delegation_source};
 #[cfg(target_os = "linux")]
-pub use boot::{BootSources, BootStatus, MissingProducer, DispatcherFactory, DispatcherInput, LaunchInput,
+pub use boot::{human_authorization, BootSources, BootStatus, MissingProducer, DispatcherFactory, DispatcherInput, LaunchInput,
     install_boot_sources, install_dispatcher_factory, boot_protected, boot_status, prepare_launch};
 #[cfg(not(target_os = "linux"))]
 pub async fn boot_protected(_: &std::path::Path, _: std::sync::Arc<duduclaw_auth::UserDb>,

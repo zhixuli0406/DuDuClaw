@@ -283,13 +283,11 @@ impl crate::isolation_readiness::IntegrationProbe for BoundaryReadiness {
     }
 }
 
-/// Only the authenticated ingress module calls this after consuming its proof.
-/// Gateway-owned namespaces are finite grants. Workspace/connector/recipient
-/// grants require their own authenticated host selectors and are not inferred.
-pub(crate) fn human_authorization(home: PathBuf, agent: String, user: String, epoch: u64,
+/// Authenticated ingress and approved background records share this issuer.
+/// The wrapper owns live store reads; construction below never invents IO selectors.
+pub(crate) fn record_authorization(home: PathBuf, agent: String, user: String, epoch: u64,
     lane: duduclaw_isolation::capability::Lane, turn: super::HostTurn, credential_expiry: Option<u64>)
     -> Result<super::RuntimeAuthorization, VerificationError> {
-    use duduclaw_isolation::{bounded::{List, Text}, capability::{EmployeeBinding, Principal, ResourceGrant}};
     let owner = OWNER.get().ok_or(VerificationError::Unavailable)?;
     if owner.home != home || !owner.boundary.healthy() { return Err(VerificationError::Unavailable); }
     let authority = owner.product_authority.as_ref().ok_or(VerificationError::Unavailable)?;
@@ -301,20 +299,8 @@ pub(crate) fn human_authorization(home: PathBuf, agent: String, user: String, ep
     let policy = crate::approval::strict_policy_revision(&home, &agent)
         .map_err(|_| VerificationError::Unavailable)?;
     let tools = DISPATCHER.get().ok_or(VerificationError::Unavailable)?.ingress_tools(&home, &agent, lane)?;
-    let text = |value| Text::new(value).map_err(|_| VerificationError::Invalid);
-    let namespace = format!("agent:{agent}");
-    let mut resources = vec![ResourceGrant::Employee { id: receipt.employee },
-        ResourceGrant::Mailbox { id: text(namespace.clone())? }];
-    for table in ["working_state", "beliefs", "user_profile", "decisions", "memory"] {
-        resources.push(ResourceGrant::DatabaseTable { database: text(namespace.clone())?, table: text(table.into())? });
-    }
-    let mut roots = ResourceRoots::default();
-    // These directories live in gateway-private state, never the writable
-    // employee mount. Walk from a trusted home fd without following symlinks.
-    if let Some(wiki) = super::ingress::own_wiki_root(&home, &agent)? {
-        roots.insert_wiki(namespace.clone(), receipt.employee, wiki)?;
-        resources.push(ResourceGrant::Wiki { namespace: text(namespace)? });
-    }
+    let authorization = human_authorization(home.clone(), agent.clone(), receipt.employee,
+        user.clone(), epoch, lane, &current, tools, turn, credential_expiry)?;
     let after = authority.ingress_snapshot(&user, &agent)?;
     if current.acl_generation != after.acl_generation || current.policy_epoch != after.policy_epoch
         || current.tenant_id != after.tenant_id
@@ -322,13 +308,49 @@ pub(crate) fn human_authorization(home: PathBuf, agent: String, user: String, ep
         || crate::approval::strict_policy_revision(&home, &agent).ok().as_deref() != Some(policy.as_str()) {
         return Err(VerificationError::Revoked);
     }
+    Ok(authorization)
+}
+
+/// Production capability construction from authenticated host facts. Callers
+/// must authenticate these facts and recheck their store versions after I/O, as
+/// record_authorization does. No MCP, environment or deserialization entry point.
+/// Inventory tests call this exact constructor, never append resource grants.
+pub fn human_authorization(home: PathBuf, agent: String, employee: EmployeeId,
+    user: String, epoch: u64, lane: duduclaw_isolation::capability::Lane,
+    current: &duduclaw_auth::IsolationAuthoritySnapshot,
+    tools: duduclaw_isolation::bounded::List<duduclaw_isolation::bounded::Text<128>, 256>,
+    turn: super::HostTurn, credential_expiry: Option<u64>)
+    -> Result<super::RuntimeAuthorization, VerificationError> {
+    use duduclaw_isolation::{bounded::{List, Text}, capability::{EmployeeBinding, Principal, ResourceGrant}};
+    if current.human.as_ref().is_none_or(|human| human.user_id != user
+        || human.credential_epoch != epoch || human.must_change_password
+        || !human.can_assign_to(&agent)) {
+        return Err(VerificationError::Revoked);
+    }
+    let text = |value| Text::new(value).map_err(|_| VerificationError::Invalid);
+    let namespace = format!("agent:{agent}");
+    let confined = |resource| ResourceGrant::Confined { resource: Box::new(resource) };
+    let mut resources = vec![ResourceGrant::Employee { id: employee },
+        ResourceGrant::EmployeeScope { id: employee },
+        confined(ResourceGrant::Mailbox { id: text(namespace.clone())? })];
+    for table in ["working_state", "beliefs", "user_profile", "decisions", "memory"] {
+        resources.push(confined(ResourceGrant::DatabaseTable {
+            database: text(namespace.clone())?, table: text(table.into())? }));
+    }
+    let mut roots = ResourceRoots::default();
+    // These directories live in gateway-private state, never the writable
+    // employee mount. Walk from a trusted home fd without following symlinks.
+    if let Some(wiki) = super::ingress::own_wiki_root(&home, &agent)? {
+        roots.insert_wiki(namespace.clone(), employee, wiki)?;
+        resources.push(confined(ResourceGrant::Wiki { namespace: text(namespace)? }));
+    }
     let now = duduclaw_mcp_boundary::authority::now_seconds()?;
     let expires_at = now.checked_add(30 * 60).ok_or(VerificationError::InvalidTime)?
         .min(credential_expiry.unwrap_or(u64::MAX));
     if expires_at <= now { return Err(VerificationError::InvalidTime); }
     Ok(super::RuntimeAuthorization { home, agent, grant: GrantPolicy {
         task: None, principal: Principal::Human { user_id: text(user)?, generation: current.acl_generation },
-        binding: EmployeeBinding::Shared(text(current.tenant_id)?), lane, tools,
+        binding: EmployeeBinding::Shared(text(current.tenant_id.clone())?), lane, tools,
         resources: List::new(resources).map_err(|_| VerificationError::Invalid)?,
         policy_revision: current.policy_epoch, not_before: now, expires_at }, roots: Arc::new(roots),
         origin: WaitOrigin::Gateway, caller: None, turn: Some(turn), authenticated_epoch: Some(epoch) })
@@ -469,6 +491,10 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
     #[cfg(not(feature = "isolation-worker-integration"))]
     Err(VerificationError::Unavailable)
 }
+
+#[cfg(test)]
+#[path = "authorization_tests.rs"]
+mod authorization_tests;
 
 #[cfg(test)]
 mod tests {

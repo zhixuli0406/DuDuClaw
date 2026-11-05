@@ -57,6 +57,7 @@ struct Backend {
     collecting: bool,
     io_attempts: AtomicUsize,
     stop_bytes: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
+    cancel_wait: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 impl ExecutionBackend for Backend {
     fn supports_authorized_workspace(&self) -> bool { !self.legacy_only }
@@ -93,6 +94,17 @@ impl ExecutionBackend for Backend {
         Box::pin(async move {
             assert_eq!(run, RunHandle(RunId([9; 16])));
             self.killed.fetch_add(1, Ordering::SeqCst); Ok(())
+        })
+    }
+    fn kill_authorized(&self, run: RunHandle, authority: Arc<dyn CancelAuthority>) -> BackendFuture<'_, ()> {
+        Box::pin(async move {
+            authority.verify_cancel(EmployeeId([2; 16]), run)?;
+            if let Some((started, release)) = &self.cancel_wait {
+                started.notify_one();
+                release.notified().await;
+            }
+            authority.verify_cancel(EmployeeId([2; 16]), run)?;
+            self.kill(run).await
         })
     }
     fn take_stdio(&self, _: RunHandle) -> BackendFuture<'_, RunStdio> {
@@ -605,4 +617,47 @@ async fn isolated_recording_collector_delivers_persisted_stop_and_only_then_coll
     }).await.unwrap();
     assert_eq!(*bytes.lock().unwrap(), b"stop\n");
     assert_eq!(backend.killed.load(Ordering::SeqCst), 0);
+}
+
+
+#[cfg(feature = "binding-store")]
+#[tokio::test]
+async fn isolated_execution_cancel_rechecks_live_authority_after_backend_wait() {
+    use crate::execution_jobs::{ExecutionJobs, SqliteExecutionJobs};
+    struct Live(Arc<AtomicBool>);
+    impl duduclaw_isolation::capability::LiveRequestVerifier for Live {
+        fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> {
+            if self.0.load(Ordering::SeqCst) { Ok(()) } else { Err(VerificationError::Revoked) }
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let jobs = SqliteExecutionJobs::open(&home.path().join("jobs.db")).unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let backend = Arc::new(Backend { cancel_wait: Some((started.clone(), release.clone())), ..Default::default() });
+    let bridge = Arc::new(ExecutionToolBridge::new(backend.clone(),
+        Arc::new(Factory { collects: true, ..Default::default() }), Arc::new(Resolver)).with_jobs(jobs.clone()));
+    let live = Arc::new(AtomicBool::new(true));
+    let owner = RequestContext::with_live_verifier(context("execute_program").record().clone(), Arc::new(Live(live.clone())));
+    let run = RunHandle(RunId([9; 16]));
+    jobs.insert(&owner, "execute_program", run).unwrap();
+    let caller = owner.clone();
+    let request = tokio::spawn(async move {
+        bridge.execute(&caller, "execute_program", &json!({"action":"cancel", "job":"09".repeat(16)})).await
+    });
+    tokio::time::timeout(Duration::from_secs(2), started.notified()).await.unwrap();
+    live.store(false, Ordering::SeqCst);
+    release.notify_one();
+    assert_eq!(request.await.unwrap()["isError"], true);
+    assert_eq!(backend.killed.load(Ordering::SeqCst), 0);
+    assert_eq!(jobs.read(&owner, "execute_program", run).unwrap()["status"], "pending");
+}
+
+#[test]
+fn isolated_execution_cancel_authority_binds_target_and_employee() {
+    let run = RunHandle(RunId([9; 16]));
+    let authority = JobCancelAuthority { context: context("execute_program"), run };
+    assert!(authority.verify_cancel(EmployeeId([2; 16]), run).is_ok());
+    assert!(authority.verify_cancel(EmployeeId([8; 16]), run).is_err());
+    assert!(authority.verify_cancel(EmployeeId([2; 16]), RunHandle(RunId([8; 16]))).is_err());
 }

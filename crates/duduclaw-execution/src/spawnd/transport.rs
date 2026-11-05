@@ -87,17 +87,18 @@ impl ControlIo {
                 .ok_or(BackendError::Timeout)?;
             if !*busy {
                 *busy = true;
-                return Ok(Transaction { io: self, completed: false });
+                return Ok(Transaction { io: self, completed: false, cancel: None });
             }
             let (next, _) = self.available.wait_timeout(busy, remaining).map_err(|_| BackendError::Unavailable)?;
             busy = next;
         }
     }
-    fn transact(&self, request: SpawnRequest, input_fds: Vec<OwnedFd>, deadline: std::time::Instant, check: &LiveCheck)
-        -> Result<Packet, BackendError> {
+    fn transact<'a>(&'a self, request: SpawnRequest, input_fds: Vec<OwnedFd>, deadline: std::time::Instant, check: &LiveCheck,
+        cancel: Option<&'a CancelControl>) -> Result<Packet, BackendError> {
         let result = (|| {
             let mut transaction = self.acquire(deadline)?;
-            check()?;
+            transaction.cancel = cancel;
+            match cancel { Some(control) => control.verify()?, None => check()? };
             let request_id = RequestId(*uuid::Uuid::new_v4().as_bytes());
             let frame = ipc::encode(&Envelope { version: ipc::PROTOCOL_VERSION, request_id, message: &request })
                 .map_err(|_| BackendError::Protocol)?;
@@ -106,9 +107,13 @@ impl ControlIo {
             loop {
                 if self.closed.load(Ordering::Acquire) { return Err(BackendError::Unavailable); }
                 if std::time::Instant::now() >= deadline { return Err(BackendError::Timeout); }
-                check()?;
-                match socket::sendmsg::<UnixAddr>(self.fd.as_raw_fd(), &[IoSlice::new(&frame)], &controls,
-                    MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT, None) {
+                let send = || socket::sendmsg::<UnixAddr>(self.fd.as_raw_fd(), &[IoSlice::new(&frame)], &controls,
+                    MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT, None);
+                let sent = match cancel {
+                    Some(control) => control.send(send)?,
+                    None => { check()?; send() },
+                };
+                match sent {
                     Ok(bytes) if bytes == frame.len() => break,
                     Ok(_) => return Err(BackendError::Protocol),
                     Err(nix::errno::Errno::EINTR) => continue,
@@ -134,21 +139,61 @@ impl ControlIo {
             transaction.completed = true;
             Ok(Packet { response: envelope.message, fds })
         })();
-        if result.is_err() { self.close(); }
+        if result.is_err() && !cancel.is_some_and(CancelControl::preserve_connection) { self.close(); }
         result
     }
 }
-struct Transaction<'a> { io: &'a ControlIo, completed: bool }
+struct Transaction<'a> { io: &'a ControlIo, completed: bool, cancel: Option<&'a CancelControl> }
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         // Fence failure before releasing the gate; no waiter can send a new
         // packet in the gap between a bad response and shutdown.
-        if !self.completed { self.io.close(); }
+        if !self.completed && !self.cancel.is_some_and(CancelControl::preserve_connection) { self.io.close(); }
         let mut busy = self.io.busy.lock().unwrap_or_else(|error| error.into_inner());
         *busy = false;
         self.io.available.notify_all();
     }
 }
+// Cancelling a request to cancel another job is different from abandoning a
+// spawn: refusal before send must not terminate that job through control EOF.
+// One mutex orders caller abandonment against the actual nonblocking send.
+#[derive(Default)]
+struct CancelState { abandoned: bool, rejected: bool, sent: bool }
+struct CancelControl { state: Mutex<CancelState>, check: Arc<LiveCheck> }
+impl CancelControl {
+    fn verify_locked(&self, state: &mut CancelState) -> Result<(), BackendError> {
+        if state.abandoned || state.rejected { return Err(BackendError::Denied); }
+        if let Err(error) = (self.check)() { state.rejected = true; return Err(error); }
+        Ok(())
+    }
+    fn verify(&self) -> Result<(), BackendError> {
+        let mut state = self.state.lock().map_err(|_| BackendError::Unavailable)?;
+        self.verify_locked(&mut state)
+    }
+    fn send(&self, send: impl FnOnce() -> Result<usize, nix::errno::Errno>)
+        -> Result<Result<usize, nix::errno::Errno>, BackendError> {
+        let mut state = self.state.lock().map_err(|_| BackendError::Unavailable)?;
+        self.verify_locked(&mut state)?;
+        let result = send();
+        if result.is_ok() { state.sent = true; }
+        Ok(result)
+    }
+    fn preserve_connection(&self) -> bool {
+        self.state.lock().is_ok_and(|state| !state.sent)
+    }
+}
+struct CancelControlGuard { io: Arc<ControlIo>, control: Arc<CancelControl>, completed: bool }
+impl Drop for CancelControlGuard {
+    fn drop(&mut self) {
+        if self.completed { return; }
+        let sent = match self.control.state.lock() {
+            Ok(mut state) => { state.abandoned = true; state.sent },
+            Err(_) => true,
+        };
+        if sent { self.io.close(); }
+    }
+}
+
 struct CancelTransaction(Option<Arc<ControlIo>>);
 impl Drop for CancelTransaction {
     fn drop(&mut self) { if let Some(io) = &self.0 { io.close(); } }
@@ -179,7 +224,7 @@ impl Connection {
     pub(super) fn live_status(&self, run: duduclaw_isolation::execution::RunHandle,
         reservation_expiry: u64) -> Result<RunStatus, BackendError> {
         let packet = self.io.transact(SpawnRequest::Status { run }, vec![],
-            std::time::Instant::now() + Duration::from_millis(250), &|| Ok(()))?;
+            std::time::Instant::now() + Duration::from_millis(250), &|| Ok(()), None)?;
         let result = match packet.response {
             SpawnResponse::Status { status, .. } => {
                 if let RunStatus::Reserved { expires_at_unix_ms } = status {
@@ -212,6 +257,28 @@ impl Connection {
         Ok(packet)
     }
 
+    /// A refused or abandoned Cancel that sent no bytes leaves the existing
+    /// job's connection intact. Once sent, uncertainty still closes it.
+    pub(super) async fn cancel_checked(&self, run: duduclaw_isolation::execution::RunHandle,
+        check: Arc<LiveCheck>) -> Result<(), BackendError> {
+        let control = Arc::new(CancelControl { state: Mutex::new(CancelState::default()), check });
+        control.verify()?;
+        let mut guard = CancelControlGuard { io: self.io.clone(), control: control.clone(), completed: false };
+        let io = self.io.clone();
+        let pending = control.clone();
+        let deadline = std::time::Instant::now() + Duration::from_millis(ipc::CONTROL_TIMEOUT_MS);
+        let packet = tokio::task::spawn_blocking(move || io.transact(SpawnRequest::Cancel { run }, vec![],
+            deadline, pending.check.as_ref(), Some(pending.as_ref())))
+            .await.map_err(|_| BackendError::Unavailable)??;
+        control.verify()?;
+        guard.completed = true;
+        match packet.response {
+            SpawnResponse::Ack => Ok(()),
+            SpawnResponse::Error { code } => Err(map_error(code)),
+            _ => Err(BackendError::Protocol),
+        }
+    }
+
     pub(super) async fn pty_activity(&self, run: duduclaw_isolation::execution::RunHandle) -> Result<(), BackendError> {
         match self.request_packet(SpawnRequest::PtyActivity { run }, &[], Arc::new(|| Ok(()))).await?.response {
             SpawnResponse::Ack | SpawnResponse::Error { code: ErrorCode::NotReady } => Ok(()),
@@ -232,7 +299,7 @@ impl Connection {
         // while its blocking task is queued or waiting for the transaction gate.
         let mut cancellation = CancelTransaction(Some(io.clone()));
         let transaction_check = check.clone();
-        let result = tokio::task::spawn_blocking(move || io.transact(request, inputs, deadline, transaction_check.as_ref()))
+        let result = tokio::task::spawn_blocking(move || io.transact(request, inputs, deadline, transaction_check.as_ref(), None))
             .await.map_err(|_| BackendError::Unavailable)?;
         check()?;
         cancellation.0 = None;
@@ -676,6 +743,46 @@ mod tests {
         let check: Arc<LiveCheck> = Arc::new(move || if live.load(Ordering::SeqCst) { Ok(()) } else { Err(BackendError::Denied) });
         let request = SpawnRequest::ReserveRun { employee_id: duduclaw_isolation::ids::EmployeeId([1; 16]) };
         assert!(matches!(connection.request_checked(request, &[], check).await, Err(BackendError::Denied)));
+        assert!(connection.is_closed());
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn checked_cancel_timeout_before_send_keeps_target_connection() {
+        let (connection, root) = Connection::test_pair();
+        let mut lock = connection.io.acquire(std::time::Instant::now() + Duration::from_secs(1)).unwrap();
+        let io = connection.io.clone();
+        let pending = std::thread::spawn(move || {
+            let control = CancelControl { state: Mutex::new(CancelState::default()), check: Arc::new(|| Ok(())) };
+            io.transact(SpawnRequest::Cancel { run: duduclaw_isolation::execution::RunHandle(
+                duduclaw_isolation::ids::RunId([1; 16])) }, vec![],
+                std::time::Instant::now() + Duration::from_millis(10), control.check.as_ref(), Some(&control))
+        });
+        assert!(matches!(pending.join().unwrap(), Err(BackendError::Timeout)));
+        assert!(!connection.is_closed());
+        let mut bytes = [0; 16];
+        assert_eq!(socket::recv(root.as_raw_fd(), &mut bytes, MsgFlags::MSG_DONTWAIT), Err(nix::errno::Errno::EAGAIN));
+        lock.completed = true;
+    }
+
+    #[tokio::test]
+    async fn checked_cancel_revoked_after_send_still_fences_uncertainty() {
+        let (connection, root) = Connection::test_pair();
+        let live = Arc::new(AtomicBool::new(true));
+        let verifier = live.clone();
+        let server = tokio::spawn(async move {
+            let root = AsyncFd::new(root).unwrap();
+            let (bytes, _) = receive(&root).await.unwrap();
+            let request: Envelope<SpawnRequest> = ipc::decode(&bytes).unwrap();
+            assert!(matches!(request.message, SpawnRequest::Cancel { .. }));
+            live.store(false, Ordering::SeqCst);
+            let response = Envelope { version: ipc::PROTOCOL_VERSION, request_id: request.request_id,
+                message: SpawnResponse::Ack };
+            send_checked(&root, &ipc::encode(&response).unwrap(), &[], &|| Ok(())).await.unwrap();
+        });
+        let check: Arc<LiveCheck> = Arc::new(move || if verifier.load(Ordering::SeqCst) { Ok(()) } else { Err(BackendError::Denied) });
+        let run = duduclaw_isolation::execution::RunHandle(duduclaw_isolation::ids::RunId([1; 16]));
+        assert_eq!(connection.cancel_checked(run, check).await, Err(BackendError::Denied));
         assert!(connection.is_closed());
         server.await.unwrap();
     }

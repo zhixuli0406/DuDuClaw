@@ -48,10 +48,14 @@ async fn channel_config_exact_scope_and_pairing_list_do_not_disclose_other_subje
     let f=Fixture::new();let provider=f.channels("chat");
     let mgr=crate::channel_settings::ChannelSettingsManager::new(&f.home.path().join("sessions.db")).unwrap();
     mgr.set("discord","other","guild_name","PRIVATE-OTHER").await.unwrap();
+    for key in ["admin_users", "shared_bot_binding", "discord_agent_choices", "group_context", "future_private_key"] {
+        mgr.set("discord","chat",key,"PRIVATE-SETTING").await.unwrap();
+    }
+    mgr.set("discord","chat","require_pairing","true").await.unwrap();
     let (selected,call)=f.call(provider.clone(),"channel_config",json!({"channel":"discord","scope_id":"chat","key":"mention_only","value":"true"}));
     assert!(provider.execute(selected,call).await.unwrap()["isError"].is_null());
     let (selected,call)=f.call(provider.clone(),"channel_config_list",json!({"channel":"discord","scope_id":"chat"}));
-    let result=provider.execute(selected,call).await.unwrap().to_string();assert!(result.contains("mention_only"));assert!(!result.contains("PRIVATE-OTHER"));assert!(!result.contains("TOKEN-CANARY"));
+    let result=provider.execute(selected,call).await.unwrap().to_string();assert!(result.contains("mention_only"));assert!(!result.contains("PRIVATE-OTHER"));assert!(!result.contains("TOKEN-CANARY"));assert!(!result.contains("PRIVATE-SETTING"));assert!(result.contains("require_pairing"));
     let ctrl=crate::access_control::AccessController::with_persistence(f.home.path().join("access_control.json"));ctrl.approve_user("PRIVATE-OTHER").await;
     let (selected,call)=f.call(provider.clone(),"pairing_manage",json!({"action":"approve","subject":"chat"}));provider.execute(selected,call).await.unwrap();
     let (selected,call)=f.call(provider.clone(),"pairing_manage",json!({"action":"list"}));let result=provider.execute(selected,call).await.unwrap().to_string();assert!(result.contains("chat"));assert!(!result.contains("PRIVATE-OTHER"));
@@ -69,9 +73,14 @@ async fn channel_status_is_bounded_to_selected_label_and_session_scope(){
     let f=Fixture::new();let provider=f.channels("chat");
     std::fs::write(f.home.path().join("channel_status.json"),json!({"channels":{"discord:alice":{"connected":true},"discord:bob":{"note":"PRIVATE-OTHER"}},"updated_at":"now"}).to_string()).unwrap();
     let db=rusqlite::Connection::open(f.home.path().join("sessions.db")).unwrap();db.execute_batch("CREATE TABLE sessions(id TEXT,last_active TEXT);INSERT INTO sessions VALUES('discord:chat','2026-01-01T00:00:00Z'),('discord:other','2026-01-01T00:00:00Z');").unwrap();drop(db);
-    let _mgr=crate::channel_settings::ChannelSettingsManager::new(&f.home.path().join("sessions.db")).unwrap();
+    let mgr=crate::channel_settings::ChannelSettingsManager::new(&f.home.path().join("sessions.db")).unwrap();
+    mgr.set("discord","chat","guild_name","Selected Guild").await.unwrap();
+    mgr.set("discord","chat","mention_only","true").await.unwrap();
+    for key in ["admin_users", "allowed_users", "blocked_users", "agent_override", "allowed_channels", "shared_bot_binding", "future_private_key"] {
+        mgr.set("discord","chat",key,"PRIVATE-SETTING").await.unwrap();
+    }
     let(selected,call)=f.call(provider.clone(),"channel_status",json!({"channel":"discord"}));let result=provider.execute(selected,call).await.unwrap();let text=result["content"][0]["text"].as_str().unwrap();
-    assert!(!text.contains("PRIVATE-OTHER"));let payload:Value=serde_json::from_str(text).unwrap();assert_eq!(payload["sessions"]["discord"]["total_sessions"],1);
+    assert!(!text.contains("PRIVATE-OTHER"));assert!(!text.contains("PRIVATE-SETTING"));assert!(text.contains("Selected Guild"));assert!(text.contains("mention_only"));let payload:Value=serde_json::from_str(text).unwrap();assert_eq!(payload["sessions"]["discord"]["total_sessions"],1);
 }
 #[test]
 fn self_configuring_senders_cannot_substitute_home_credentials_for_personal_accounts(){

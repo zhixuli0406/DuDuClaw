@@ -231,9 +231,20 @@ pub trait ExecutionBackend: Send + Sync {
         -> BackendFuture<'_, RunHandle> { Box::pin(async { Err(BackendError::Denied) }) }
     fn wait(&self, run: RunHandle, origin: WaitOrigin) -> BackendFuture<'_, RunOutcome>;
     fn kill(&self, run: RunHandle) -> BackendFuture<'_, ()>;
+    /// Employee-requested cancellation must recheck the target and live authority
+    /// after all admission/transport waits, immediately before sending Cancel.
+    /// Host cleanup keeps using `kill`, including cleanup after revocation.
+    fn kill_authorized(&self, _run: RunHandle, _authority: std::sync::Arc<dyn CancelAuthority>)
+        -> BackendFuture<'_, ()> { Box::pin(async { Err(BackendError::Denied) }) }
     fn take_stdio(&self, run: RunHandle) -> BackendFuture<'_, RunStdio>;
     fn take_pty(&self, run: RunHandle) -> BackendFuture<'_, RunPty>;
     fn resize(&self, run: RunHandle, size: PtySize) -> BackendFuture<'_, ()>;
+}
+
+/// An in-process control token, bound to an already ownership-checked job.
+/// No serialized handle or employee input can construct this authority.
+pub trait CancelAuthority: Send + Sync {
+    fn verify_cancel(&self, employee: EmployeeId, run: RunHandle) -> Result<(), BackendError>;
 }
 
 /// Boundary-owned selection token passed intact to a protected tool backend.

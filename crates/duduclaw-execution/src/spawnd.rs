@@ -418,6 +418,19 @@ impl ExecutionBackend for SpawndBackend {
         })
     }
 
+    fn kill_authorized(&self, run: RunHandle, authority: Arc<dyn CancelAuthority>) -> BackendFuture<'_, ()> {
+        Box::pin(async move {
+            let entry = self.entry(run)?;
+            let employee = entry.employee;
+            // The transport invokes this again under its transaction lock and
+            // immediately before send, including a queued spawn_blocking task.
+            entry.connection.cancel_checked(run,
+                Arc::new(move || authority.verify_cancel(employee, run))).await?;
+            entry.state.lock().await.mcp_fd.take();
+            Ok(())
+        })
+    }
+
     fn take_stdio(&self, run: RunHandle) -> BackendFuture<'_, RunStdio> {
         Box::pin(async move {
             let entry = self.entry(run)?;

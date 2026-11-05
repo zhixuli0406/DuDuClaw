@@ -320,3 +320,33 @@ async fn i1c_skill_publication_carries_live_authority_into_blocking_commit() {
     assert!(!home.path().join("graduation_log.jsonl").exists());
     assert_eq!(std::fs::read(home.path().join("shared/skills/notes.md")).unwrap(), source);
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn i1c_graduation_revoked_after_registration_compensates_before_retry() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use duduclaw_isolation::capability::{CapabilityRecord, LiveRequestVerifier};
+    struct Live(Arc<AtomicBool>);
+    impl LiveRequestVerifier for Live {
+        fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> {
+            if self.0.load(Ordering::SeqCst) { Ok(()) } else { Err(VerificationError::Revoked) }
+        }
+    }
+    for revoke_at in ["log", "rename", "directory_sync", "receipt"] {
+        let home = tempfile::tempdir().unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let call = media_call("skill_graduate", json!({"skill_name":"notes","agent_id":"alice"}));
+        let context = duduclaw_mcp_boundary::RequestContext::with_live_verifier(
+            call.context().record().clone(), Arc::new(Live(live.clone())));
+        let result = duduclaw_mcp_boundary::io_authority::scope(context, async {
+            skill_publication::publish_checked(home.path(), "alice", "notes", "source", b"scanned", |point| {
+                if point == revoke_at { live.store(false, Ordering::SeqCst); }
+                Ok(())
+            })
+        }).await;
+        assert!(result.is_err(), "{revoke_at}");
+        assert!(!home.path().join("skills/notes.md").exists());
+        assert!(std::fs::read_to_string(home.path().join("graduation_log.jsonl")).unwrap().is_empty());
+        skill_publication::publish(home.path(), "alice", "notes", "source", b"scanned").unwrap();
+    }
+}

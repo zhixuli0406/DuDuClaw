@@ -214,10 +214,23 @@ impl ExecutionToolBridge {
         if action == "status" || result["status"] == "complete" { return result_envelope(result); }
         // A Cancel acknowledgement means requested, never retired. The host
         // collector alone publishes the terminal outcome after wait and EOF.
-        if self.backend.kill(run).await.is_err() { return uncertain(); }
+        let authority = Arc::new(JobCancelAuthority { context: context.clone(), run });
+        if self.backend.kill_authorized(run, authority).await.is_err() { return uncertain(); }
         let (store, ctx, tool) = (jobs.clone(), context.clone(), name.to_owned());
         if crate::authority::verify_blocking(move || store.cancel_requested(&ctx, &tool, run)).await.is_err() { return uncertain(); }
         result_envelope(json!({"job":crate::execution_jobs::handle_text(run), "status":"cancel_requested"}))
+    }
+}
+
+/// Constructed only after the job store checked employee/principal/binding/tool.
+struct JobCancelAuthority { context: RequestContext, run: RunHandle }
+impl duduclaw_isolation::execution::CancelAuthority for JobCancelAuthority {
+    fn verify_cancel(&self, employee: duduclaw_isolation::ids::EmployeeId, run: RunHandle)
+        -> Result<(), duduclaw_isolation::execution::BackendError> {
+        use duduclaw_isolation::execution::BackendError;
+        if run != self.run || employee != self.context.record().employee { return Err(BackendError::Denied); }
+        let now = crate::authority::now_seconds().map_err(|_| BackendError::Denied)?;
+        self.context.verify_live(now).map_err(|_| BackendError::Denied)
     }
 }
 

@@ -160,7 +160,7 @@ impl ChannelConnectorProvider {
                         .map_err(|_| VerificationError::Unavailable)?;
                     if call.name() == "channel_config_list" {
                         selected.recheck()?;
-                        let values = mgr.get_all(&route.channel,&route.scope).await;
+                        let values = mgr.get_mcp_config(&route.channel,&route.scope).await;
                         values.into_iter().map(|(k,v)|format!("{k} = {v}")).collect::<Vec<_>>().join("\n")
                     } else {
                         let key = args.get("key").and_then(Value::as_str).ok_or(VerificationError::Invalid)?;
@@ -224,7 +224,7 @@ impl ChannelConnectorProvider {
                     let mut guilds=Vec::new();
                     if route.channel=="discord" && route.scope!="dm" {
                         let mgr=crate::channel_settings::ChannelSettingsManager::from_session_db(&self.home.join("sessions.db")).map_err(|_|VerificationError::Unavailable)?;
-                        let settings:serde_json::Map<String,Value>=mgr.get_all("discord",&route.scope).await.into_iter().map(|(k,v)|(k,Value::String(v))).collect();
+                        let settings:serde_json::Map<String,Value>=mgr.get_mcp_status("discord",&route.scope).await.into_iter().map(|(k,v)|(k,Value::String(v))).collect();
                         guilds.push(json!({"guild_id":route.scope,"settings":settings}));
                     }
                     json!({"connections":{"channels":{route.status_label.clone():status.get("channels").and_then(|s|s.get(&route.status_label))},

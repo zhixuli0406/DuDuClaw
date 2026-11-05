@@ -303,6 +303,10 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/ci -p 'test_spawn_inventory.py' -v
           python3 scripts/ci/check_spawn_inventory.py --require-migrated
+      - name: Isolation tool matrix
+        run: |
+          python3 -m unittest discover -s scripts/ci -p 'test_isolation_tool_matrix.py' -v
+          python3 scripts/ci/check_isolation_tool_matrix.py
       - name: Test
         run: |
           if [ -n "$(find tests/python -name 'test_*.py' 2>/dev/null)" ]; then

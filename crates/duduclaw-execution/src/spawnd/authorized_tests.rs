@@ -110,3 +110,70 @@ async fn authorized_spawn_holds_live_authority_and_cancels_queued_run_on_revoke(
     assert!(matches!(backend.take_stdio(run).await, Err(BackendError::Denied)));
     server.await.unwrap();
 }
+
+struct Cancel { live: Arc<AtomicBool> }
+impl CancelAuthority for Cancel {
+    fn verify_cancel(&self, employee: EmployeeId, run: RunHandle) -> Result<(), BackendError> {
+        if employee == policy().employee && run == policy().run && self.live.load(Ordering::SeqCst) {
+            Ok(())
+        } else { Err(BackendError::Denied) }
+    }
+}
+
+#[tokio::test]
+async fn authorized_cancel_rechecks_revocation_after_transport_wait() {
+    let (backend, root) = fixture(None).await;
+    let backend = Arc::new(backend);
+    let busy = backend.clone();
+    let status = tokio::spawn(async move { busy.status(policy().run).await });
+    let request = receive(&root).await;
+    assert!(matches!(request.message, SpawnRequest::Status { .. }));
+    let live = Arc::new(AtomicBool::new(true));
+    let cancel = backend.kill_authorized(policy().run, Arc::new(Cancel { live: live.clone() }));
+    tokio::pin!(cancel);
+    assert!(tokio::time::timeout(Duration::from_millis(10), &mut cancel).await.is_err());
+    live.store(false, Ordering::SeqCst);
+    respond(&root, request.request_id, SpawnResponse::Status { run: policy().run, status: RunStatus::Running });
+    assert_eq!(status.await.unwrap(), Ok(RunStatus::Running));
+    assert_eq!(cancel.await, Err(BackendError::Denied));
+    // Refusal sent no Cancel and must not cancel the target through EOF.
+    let mut bytes = [0; 16];
+    assert_eq!(socket::recv(root.as_raw_fd(), &mut bytes, MsgFlags::MSG_DONTWAIT), Err(nix::errno::Errno::EAGAIN));
+}
+
+#[tokio::test]
+async fn authorized_cancel_sends_only_for_live_bound_authority() {
+    let (backend, root) = fixture(None).await;
+    let server = tokio::spawn(async move {
+        let request = receive(&root).await;
+        assert!(matches!(request.message, SpawnRequest::Cancel { run } if run == policy().run));
+        respond(&root, request.request_id, SpawnResponse::Ack);
+    });
+    backend.kill_authorized(policy().run, Arc::new(Cancel { live: Arc::new(AtomicBool::new(true)) })).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn authorized_cancel_abandoned_before_send_preserves_target_connection() {
+    let (backend, root) = fixture(None).await;
+    let backend = Arc::new(backend);
+    let busy = backend.clone();
+    let status = tokio::spawn(async move { busy.status(policy().run).await });
+    let request = receive(&root).await;
+    let pending = backend.clone();
+    let cancel = tokio::spawn(async move {
+        pending.kill_authorized(policy().run, Arc::new(Cancel { live: Arc::new(AtomicBool::new(true)) })).await
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    cancel.abort();
+    assert!(cancel.await.unwrap_err().is_cancelled());
+    respond(&root, request.request_id, SpawnResponse::Status { run: policy().run, status: RunStatus::Running });
+    assert_eq!(status.await.unwrap(), Ok(RunStatus::Running));
+    // The abandoned blocking closure cannot send after acquiring the lock.
+    let query = backend.clone();
+    let status = tokio::spawn(async move { query.status(policy().run).await });
+    let request = receive(&root).await;
+    assert!(matches!(request.message, SpawnRequest::Status { .. }));
+    respond(&root, request.request_id, SpawnResponse::Status { run: policy().run, status: RunStatus::Running });
+    assert_eq!(status.await.unwrap(), Ok(RunStatus::Running));
+}

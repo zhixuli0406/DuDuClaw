@@ -11,6 +11,10 @@ use serde_json::{Value, json};
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "linux")]
+#[path = "isolation_skill_publication.rs"]
+mod skill_publication;
+
 const BODY_CAP_CHARS: usize = 60_000;
 
 pub struct GatewayWorkerPlans {
@@ -21,6 +25,8 @@ pub struct GatewayWorkerPlans {
 impl GatewayWorkerPlans {
     pub fn new(home: PathBuf) -> Result<Self, VerificationError> {
         if !home.is_absolute() { return Err(VerificationError::Invalid); }
+        #[cfg(target_os = "linux")]
+        skill_publication::recover(&home)?;
         Ok(Self { home, employee: None, roots: None })
     }
 
@@ -453,19 +459,11 @@ fn publish_skill(home: &std::path::Path, agent: &str, name: &str, tool: &str, st
                 write_host_file(home, &["agents", agent, "SKILLS"], &filename, content.as_bytes())?;
                 Ok(json!({"content":[{"type":"text","text":json!({"success":true,"skill":name,"adopted_to":agent,"shared_metadata_updated":false}).to_string()}]}))
             } else {
-                write_host_file(home, &["skills"], &filename, content.as_bytes())?;
-                let record = crate::skill_lifecycle::graduation::GraduationRecord {
-                    skill_name: name.to_owned(), source_agent: agent.to_owned(), graduated_at: chrono::Utc::now(), lift: 0.0, load_count: 0,
-                };
-                let log = home.join("graduation_log.jsonl");
-                duduclaw_core::with_file_lock(&log, || {
-                    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(std::io::Error::other)?;
-                    let mut output = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
-                    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(std::io::Error::other)?;
-                    serde_json::to_writer(&mut output, &record).map_err(std::io::Error::other)?;
-                    output.write_all(b"\n")?;
-                    output.sync_all()
-                }).map_err(|_| VerificationError::Unavailable)?;
+                #[cfg(target_os = "linux")]
+                skill_publication::publish(home, agent, name,
+                    state["sha256"].as_str().ok_or(VerificationError::Invalid)?, content.as_bytes())?;
+                #[cfg(not(target_os = "linux"))]
+                return Err(VerificationError::Unavailable);
                 Ok(json!({"content":[{"type":"text","text":format!("Skill '{name}' graduated from agent '{agent}' to global scope.")}]}))
             }
         })();

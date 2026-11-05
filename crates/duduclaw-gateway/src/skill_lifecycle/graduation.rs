@@ -159,19 +159,14 @@ pub(crate) fn graduate_to_global_blocking(
 /// When calling from an async context, wrap in `tokio::task::spawn_blocking`.
 pub fn append_graduation_log(record: &GraduationRecord, home_dir: &Path) {
     let log_path = home_dir.join("graduation_log.jsonl");
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        Ok(mut f) => {
-            if let Ok(json) = serde_json::to_string(record) {
-                let _ = writeln!(f, "{json}");
-            }
-        }
-        Err(e) => {
-            warn!("Failed to write graduation log: {e}");
-        }
+    // Share the lock with protected publication's atomic log update/rollback.
+    if let Err(error) = duduclaw_core::with_file_lock(&log_path, || {
+        let mut output = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+        serde_json::to_writer(&mut output, record).map_err(std::io::Error::other)?;
+        output.write_all(b"\n")?;
+        output.sync_all()
+    }) {
+        warn!("Failed to write graduation log: {error}");
     }
 }
 

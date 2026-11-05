@@ -60,6 +60,23 @@ impl SqliteExecutionJobs {
         transaction.commit().map_err(|_| VerificationError::Unavailable)?;
         Ok(json!({"job":handle_text(run),"status":state,"result":result}))
     }
+    fn request_state(&self, context: &RequestContext, tool: &str, run: RunHandle, state: &str)
+        -> Result<(), VerificationError> {
+        let (principal, binding) = identity(context)?;
+        let mut connection = self.connection.lock().map_err(|_| VerificationError::Unavailable)?;
+        let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|_| VerificationError::Unavailable)?;
+        // Ownership and authority belong to this transaction. A blocking task
+        // can outlive its caller while waiting for either DB lock.
+        transaction.query_row("SELECT 1 FROM execution_jobs WHERE run=?1 AND employee=?2 AND principal=?3 AND binding=?4 AND tool=?5",
+            rusqlite::params![handle_text(run), context.record().employee.0.as_slice(), principal, binding, tool],
+            |_| Ok(())).map_err(|_| VerificationError::Invalid)?;
+        context.verify_live(crate::authority::now_seconds()?)?;
+        transaction.execute("UPDATE execution_jobs SET state=?2,updated=unixepoch() WHERE run=?1 AND state='pending'",
+            rusqlite::params![handle_text(run), state]).map_err(|_| VerificationError::Unavailable)?;
+        transaction.commit().map_err(|_| VerificationError::Unavailable)
+    }
+
     pub fn open(path: &Path) -> Result<Arc<Self>, VerificationError> {
         let connection = rusqlite::Connection::open(path).map_err(|_| VerificationError::Unavailable)?;
         connection.busy_timeout(std::time::Duration::from_secs(2)).map_err(|_| VerificationError::Unavailable)?;
@@ -125,11 +142,7 @@ impl ExecutionJobs for SqliteExecutionJobs {
         Ok(())
     }
     fn request_stop(&self, context: &RequestContext, tool: &str, run: RunHandle) -> Result<(), VerificationError> {
-        self.read(context, tool, run)?;
-        let connection = self.connection.lock().map_err(|_| VerificationError::Unavailable)?;
-        connection.execute("UPDATE execution_jobs SET state='stop_requested',updated=unixepoch() WHERE run=?1 AND state='pending'",
-            [handle_text(run)]).map_err(|_| VerificationError::Unavailable)?;
-        Ok(())
+        self.request_state(context, tool, run, "stop_requested")
     }
     fn stop_requested(&self, run: RunHandle) -> Result<bool, VerificationError> {
         let connection = self.connection.lock().map_err(|_| VerificationError::Unavailable)?;
@@ -137,11 +150,7 @@ impl ExecutionJobs for SqliteExecutionJobs {
             |row| row.get(0)).map_err(|_| VerificationError::Unavailable)
     }
     fn cancel_requested(&self, context: &RequestContext, tool: &str, run: RunHandle) -> Result<(), VerificationError> {
-        self.read(context, tool, run)?;
-        let connection = self.connection.lock().map_err(|_| VerificationError::Unavailable)?;
-        connection.execute("UPDATE execution_jobs SET state='cancel_requested',updated=unixepoch() WHERE run=?1 AND state='pending'",
-            [handle_text(run)]).map_err(|_| VerificationError::Unavailable)?;
-        Ok(())
+        self.request_state(context, tool, run, "cancel_requested")
     }
 }
 
@@ -151,17 +160,21 @@ mod tests {
     use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord,
         EmployeeBinding, Lane, Principal, ResourceGrant}, ids::{EmployeeId, RunId, Sha256Digest}};
 
+    struct Live;
+    impl duduclaw_isolation::capability::LiveRequestVerifier for Live {
+        fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> { Ok(()) }
+    }
     pub(super) fn context() -> RequestContext {
-        RequestContext::from_verified_record(CapabilityRecord {
+        RequestContext::with_live_verifier(CapabilityRecord {
             id: CapabilityId(Sha256Digest([1; 32])), employee: EmployeeId([2; 16]), run: RunId([3; 16]),
             task: None, principal: Principal::Human { user_id: Text::new("owner".into()).unwrap(), generation: 1 },
             employee_binding: EmployeeBinding::Personal(Text::new("owner".into()).unwrap()), lane: Lane::Standard,
             tools: List::new(vec![Text::new("execute_program".into()).unwrap()]).unwrap(),
             resources: List::new(vec![ResourceGrant::Employee { id: EmployeeId([2; 16]) },
                 ResourceGrant::Workspace { handle: Text::new("work".into()).unwrap() }]).unwrap(),
-            policy_revision: 1, gateway_epoch: [4; 16], issued_at: 1, not_before: 1, expires_at: 2,
+            policy_revision: 1, gateway_epoch: [4; 16], issued_at: 1, not_before: 1, expires_at: u64::MAX - 1,
             nonce: [5; 32], jti: [6; 16],
-        })
+        }, Arc::new(Live))
     }
 
     pub(super) fn run() -> RunHandle { RunHandle(RunId([9; 16])) }
@@ -368,5 +381,60 @@ mod recording_admin_tests {
         assert!(jobs.admin_recording_control(program, false).is_err());
         assert!(jobs.admin_recording_control(program, true).is_err());
         assert_eq!(jobs.read(&owner, "execute_program", program).unwrap()["status"], "pending");
+    }
+}
+
+#[cfg(all(test, feature = "binding-store"))]
+mod revocation_race_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Live(Arc<AtomicBool>);
+    impl duduclaw_isolation::capability::LiveRequestVerifier for Live {
+        fn verify_live(&self, _: &duduclaw_isolation::capability::CapabilityRecord, _: u64)
+            -> Result<(), VerificationError> {
+            if self.0.load(Ordering::SeqCst) { Ok(()) } else { Err(VerificationError::Revoked) }
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_jobs_queued_stop_and_cancel_recheck_after_db_lock() {
+        for stop in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            let jobs = SqliteExecutionJobs::open(&home.path().join("jobs.db")).unwrap();
+            let run = super::tests::run();
+            let live = Arc::new(AtomicBool::new(true));
+            let owner = RequestContext::with_live_verifier(super::tests::context().record().clone(), Arc::new(Live(live.clone())));
+            jobs.insert(&owner, "browser_record_start", run).unwrap();
+            owner.verify_live(crate::authority::now_seconds().unwrap()).unwrap();
+            let lock = jobs.connection.lock().unwrap();
+            let (started, waiting) = tokio::sync::oneshot::channel();
+            let store = jobs.clone();
+            let caller = owner.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                if stop { store.request_stop(&caller, "browser_record_start", run) }
+                else { store.cancel_requested(&caller, "browser_record_start", run) }
+            });
+            waiting.await.unwrap();
+            // Cancellation of the request's async wrapper cannot stop the
+            // already queued blocking operation. Its retained context must.
+            live.store(false, Ordering::SeqCst);
+            drop(lock);
+            assert_eq!(task.await.unwrap(), Err(VerificationError::Revoked));
+            assert_eq!(jobs.read(&owner, "browser_record_start", run).unwrap()["status"], "pending");
+        }
+    }
+
+    #[test]
+    fn execution_jobs_record_only_control_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let jobs = SqliteExecutionJobs::open(&home.path().join("jobs.db")).unwrap();
+        let owner = super::tests::context();
+        let run = super::tests::run();
+        jobs.insert(&owner, "browser_record_start", run).unwrap();
+        let record_only = RequestContext::from_verified_record(owner.record().clone());
+        assert!(jobs.request_stop(&record_only, "browser_record_start", run).is_err());
+        assert!(jobs.cancel_requested(&record_only, "browser_record_start", run).is_err());
+        assert_eq!(jobs.read(&owner, "browser_record_start", run).unwrap()["status"], "pending");
     }
 }
