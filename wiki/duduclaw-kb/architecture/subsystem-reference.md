@@ -224,3 +224,11 @@ fragment; mismatched stored credentials require reconnection.
 Public configuration and limitations are in `docs/guides/mcp-tools.md`.
 Local llm compilation and offline/stdio tests are separate from gateway/CLI build,
 HTTP mock execution and real-provider acceptance; see the implementation handoff.
+
+## RM-025: Dashboard template library (unreleased v1.80.0)
+
+`handlers/templates_library.rs` exposes Admin-only `templates.catalog/get/copy/save/apply`; the same dispatch/live-identity gate covers both editions. Built-in free template files are embedded; industry teams and roles retain the premium gate. Apply uses `templates_create.rs`'s existing commit path, with portable skills/disabled switches before the registry-visible config. Team member ids are prefixed and workers report to the new front desk; partial batches return committed ids instead of implying rollback. Bindings use the existing Operator-level user binding handler and the company-edition gate.
+
+`company_templates.rs` stores strict versioned JSON with atomic saves and update locks. Export resolves presets, excludes memory/history/channel files and runtime credential fields, drops `[fork]`, clears structured recipients/data-source grants, disables git credentials and forces recipient guard `ask`. Known-format credentials in retained prose are partially masked; arbitrary secrets/PII or recipient ids in prose are not reliably stripped. Full SOUL/CONTRACT/skill review is mandatory (`reviewed: true`); copy preview binds confirmation to a content digest. Every raw document is scanned at save and apply, failing closed. Team apply reloads revision before each employee and returns committed ids on change. Unix reads use O_NOFOLLOW plus same-descriptor metadata; ancestor path replacement remains outside this fix. Company team copy/edit is supported, including hierarchy and per-member narrowing. Arbitrary custom assets and company-copy knowledge/evaluation extras remain excluded.
+
+Validation and exact remaining gates: [security follow-up handoff](../../reports/RM-025-template-library-handoff.md).

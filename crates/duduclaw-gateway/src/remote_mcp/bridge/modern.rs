@@ -449,6 +449,8 @@ mod tests {
         let app = axum::Router::new().route("/mcp", axum::routing::post(mock_post)).with_state(state.clone());
         let server_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let home = tempfile::tempdir().unwrap();
+        let key = duduclaw_core::ensure_identity_key(home.path()).unwrap();
+        let agent_token = duduclaw_core::mint_identity_token(&key, "a1");
         let agent = home.path().join("agents/a1");
         std::fs::create_dir_all(&agent).unwrap();
         std::fs::write(agent.join("agent.toml"), "").unwrap();
@@ -463,13 +465,14 @@ mod tests {
         super::super::super::store::upsert(home.path(), record).unwrap();
         let (out, receiver) = mpsc::unbounded_channel();
         let bridge = Bridge {
-            home:home.path().to_path_buf(), agent_id:"a1".into(), server:"mock".into(),
+            home:home.path().to_path_buf(), agent_id:"a1".into(), agent_token, server:"mock".into(),
             session:Mutex::new(Session { session_id:None, protocol_version:None, discovery:None, requires_restart:false, downstream_capabilities:json!({}), legacy_endpoint:None, legacy_source:None }),
             clients:Mutex::new(ClientCache { client:None }), negotiation:Mutex::new(()),
             schemas:Mutex::new(std::collections::HashMap::new()), effect_annotations:Mutex::new(std::collections::HashMap::new()), legacy_stream:Mutex::new(None),
             last_auth:Mutex::new(None), out,
             gate:crate::third_party_tools::ThirdPartyGate::new(home.path(), "a1", "mock", "bridge"), server_stream:false,
         };
+        assert!(bridge.verify_identity().is_ok());
         (bridge, receiver, state, home, server_task)
     }
 

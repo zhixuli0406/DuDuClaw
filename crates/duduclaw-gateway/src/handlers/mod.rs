@@ -67,6 +67,7 @@ mod agents_create;
 mod templates_util;
 mod templates_rpc;
 mod templates_create;
+mod templates_library;
 mod agents_ops;
 mod main_agent_access;
 mod autonomy_rpc;

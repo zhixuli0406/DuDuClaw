@@ -377,6 +377,7 @@ export const navGroups: NavGroup[] = [
       // wiki tab of 記憶 (App.tsx) — this page lives at `/knowledge-base`.
       { to: '/knowledge-base', icon: Library, label: 'nav.knowledgeBase', desc: 'nav.knowledgeBase.desc', newIn: '1.76.0' },
       staffEntry,
+      { to: '/templates', icon: Library, label: 'nav.templates', desc: 'nav.templates.desc', minRole: 'admin', newIn: '1.80.0' },
       { to: '/world', icon: Globe2, label: 'nav.world', desc: 'nav.world.desc', ownScope: true },
       // 成長 lifted above the occasional rows (WP-NAV, 2026-08-12): the matrix
       // (10-ia-scatter-audit.md §4) grades it 高頻・低重要 — people open it
@@ -525,6 +526,7 @@ export const personalPrimaryItems: NavItem[] = pickItems([
   // leaving it in both places would render the row twice). 22 ready-made
   // industry teams were previously undiscoverable on Personal: admin-gated
   // AND buried at the bottom of a collapsed group (design doc walkthrough 5).
+  '/templates',
   '/experts',
   // 靈感畫廊 (P2-b, curated MVP, 2026-08-15) — right after 「AI 團隊」 on Personal
   // too, same pairing rationale as the Enterprise 公司 group above.
