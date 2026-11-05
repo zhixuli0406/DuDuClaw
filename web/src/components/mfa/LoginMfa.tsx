@@ -1,3 +1,4 @@
+import { DisabledFactorExplanation } from './DisabledFactorExplanation';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useIntl } from 'react-intl';
 import { Button, Input } from '@/components/mds';
@@ -60,9 +61,9 @@ export function LoginMfa({ challenge, onComplete, onCancel }: { challenge: Login
       <option value="email" disabled={!challenge.email_available}>{t('mfa.factor.email')}</option>
       <option value="passkey" disabled={!passkeyAvailable()}>{t('mfa.factor.passkey')}</option>
     </select></label>
-    {!challenge.email_available && <p className="text-sm">{t('mfa.email.unavailable')}</p>}
-    {!passkeyAvailable() && <p className="text-sm">{t('mfa.passkey.unavailable')}</p>}
-    {enrollFactor !== 'totp' ? <AlternativeEnrollment factor={enrollFactor} enrollmentToken={challenge.enrollment_token} challengeRef={challenge.challenge_ref} onComplete={finish} onCancel={onCancel} /> : <>
+    {!challenge.email_available && <DisabledFactorExplanation factor="email" reason={challenge.email_unavailable_reason} />}
+    {!passkeyAvailable() && <DisabledFactorExplanation factor="passkey" />}
+    {enrollFactor !== 'totp' ? <AlternativeEnrollment factor={enrollFactor} enrollmentToken={challenge.enrollment_token} challengeRef={challenge.challenge_ref} emailAvailable={challenge.email_available} emailUnavailableReason={challenge.email_unavailable_reason} onComplete={finish} onCancel={onCancel} /> : <>
     {error && <p role="alert" className="text-destructive">{error}</p>}
     <MfaEnrollment initial={{ enrollment_token: challenge.enrollment_token, challenge_ref: challenge.challenge_ref, proof_required: true }}
       begin={async input => ({ ...await mfaApi.httpBegin(input), enrollment_token: challenge.enrollment_token })}
@@ -83,9 +84,9 @@ export function LoginMfa({ challenge, onComplete, onCancel }: { challenge: Login
     {factor === 'email' && !recovery && <>
       <Button type="button" variant="outline" disabled={busy || challenge.email_available === false || clock < resendAt} onClick={() => void sendEmail()}>{t(sent ? 'mfa.email.resend' : 'mfa.email.send')}{clock < resendAt ? ` (${Math.ceil((resendAt - clock) / 1000)})` : ''}</Button>
       {sent && <p role="status">{t('mfa.email.sent')}</p>}
-      {challenge.email_available === false && <p role="status">{t('mfa.email.unavailable')}</p>}
+      {challenge.email_available === false && <DisabledFactorExplanation factor="email" reason={challenge.email_unavailable_reason} />}
     </>}
-    {factor === 'passkey' && !recovery && !passkeyAvailable() && <p role="status">{t('mfa.passkey.unavailable')}</p>}
+    {factor === 'passkey' && !recovery && !passkeyAvailable() && <DisabledFactorExplanation factor="passkey" />}
     {error && <p role="alert" className="text-destructive">{error}</p>}
     {(recovery || factor !== 'passkey') && <label className="block space-y-2">{t(recovery ? 'mfa.recovery.code' : factor === 'email' ? 'mfa.factor.email' : 'mfa.code')}
       <Input value={code} onChange={e => setCode(recovery ? e.target.value : e.target.value.replace(/\D/g, '').slice(0, 6))} required autoComplete={recovery ? 'off' : 'one-time-code'} inputMode={recovery ? 'text' : 'numeric'} />

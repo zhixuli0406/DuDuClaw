@@ -30,6 +30,7 @@ export interface FactorAvailability {
   factors?: { totp: boolean; email: boolean; passkey: boolean };
   last_used?: 'totp' | 'email' | 'passkey';
   email_available?: boolean;
+  email_unavailable_reason?: string | null;
 }
 export type LoginChallenge = FactorAvailability & (
   | { mfa_required: true; challenge_id: string }

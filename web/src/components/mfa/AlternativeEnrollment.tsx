@@ -1,3 +1,4 @@
+import { DisabledFactorExplanation } from './DisabledFactorExplanation';
 import { useState, type FormEvent } from 'react';
 import { useIntl } from 'react-intl';
 import { Button, Input } from '@/components/mds';
@@ -6,8 +7,8 @@ import { mfaApi, mfaErrorId } from '@/lib/mfa-api';
 import { createPasskey, passkeyAvailable, type CreationOptionsJSON } from '@/lib/passkey';
 import { RecoveryCodes } from './MfaEnrollment';
 
-export function AlternativeEnrollment({ factor, enrollmentToken, challengeRef, onComplete, onCancel }: {
-  factor: 'email' | 'passkey'; enrollmentToken: string; challengeRef?: string;
+export function AlternativeEnrollment({ factor, enrollmentToken, challengeRef, emailAvailable, emailUnavailableReason, onComplete, onCancel }: {
+  factor: 'email' | 'passkey'; enrollmentToken: string; challengeRef?: string; emailAvailable?: boolean; emailUnavailableReason?: string | null;
   onComplete: (tokens: SessionTokens) => Promise<void>; onCancel: () => void;
 }) {
   const intl = useIntl();
@@ -43,15 +44,16 @@ export function AlternativeEnrollment({ factor, enrollmentToken, challengeRef, o
     <label className="block space-y-2">{t('mfa.password')}<Input type="password" autoComplete="current-password" maxLength={4096} value={password} onChange={e => setPassword(e.target.value)} required /></label>
     {factor === 'email' ? <>
       <p className="text-sm">{t('mfa.email.enrollHint')}</p>
+      {emailAvailable === false && <DisabledFactorExplanation factor="email" reason={emailUnavailableReason} />}
       {sent && <label className="block space-y-2">{t('mfa.factor.email')}<Input autoComplete="one-time-code" inputMode="numeric" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} required pattern="[0-9]{6}" /></label>}
     </> : <>
       <p className="text-sm">{t('mfa.proof.hint')}</p>
       {challengeRef && <p className="break-all text-sm">{t('mfa.challengeRef')}: <code>{challengeRef}</code></p>}
       <label className="block space-y-2">{t('mfa.proof')}<Input autoComplete="off" value={proof} onChange={e => setProof(e.target.value)} required /></label>
       <label className="block space-y-2">{t('mfa.passkey.name')}<Input value={name} maxLength={80} onChange={e => setName(e.target.value)} required /></label>
-      {!passkeyAvailable() && <p role="status">{t('mfa.passkey.unavailable')}</p>}
+      {!passkeyAvailable() && <DisabledFactorExplanation factor="passkey" />}
     </>}
-    <Button type="submit" variant="brand" disabled={busy || (factor === 'passkey' && !passkeyAvailable())}>{t(busy ? 'mfa.working' : factor === 'email' && !sent ? 'mfa.email.send' : 'mfa.confirm')}</Button>
+    <Button type="submit" variant="brand" disabled={busy || (factor === 'email' && emailAvailable === false) || (factor === 'passkey' && !passkeyAvailable())}>{t(busy ? 'mfa.working' : factor === 'email' && !sent ? 'mfa.email.send' : 'mfa.confirm')}</Button>
     <Button type="button" variant="outline" disabled={busy} onClick={onCancel}>{t('mfa.cancel')}</Button>
   </form>;
 }

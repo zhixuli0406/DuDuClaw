@@ -95,6 +95,22 @@ impl UserDb {
         Ok(token)
     }
 
+    /// Authenticate the HTTP capability before exposing mail availability. This
+    /// never issues a code, consumes an attempt, or changes the resend quota.
+    pub fn mfa_email_http_capability(&self, token: &str, enrollment: bool, password: Option<&str>, now: i64) -> Result<()> {
+        if token.len() != 64 { return Err(DENIED.into()); }
+        if enrollment { self.mfa_http_enrollment(token, password, now)?; }
+        let conn = self.conn();
+        let user = challenge_user(&conn, token, if enrollment {"enroll"} else {"login"}, now)?;
+        active_user(&conn, &user)?;
+        if !enrollment {
+            let verified: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM mfa_email_credentials e JOIN users u ON u.id=e.user_id WHERE e.user_id=?1 AND e.email=u.email)",
+                [&user], |r| r.get(0)).map_err(|e| e.to_string())?;
+            if !verified { return Err(DENIED.into()); }
+        }
+        Ok(())
+    }
+
     /// Returns private delivery data; callers must never include the code in HTTP/RPC output.
     pub fn mfa_email_send(&self, token: &str, enrollment: bool, now: i64) -> Result<(String,String)> {
         let mut conn=self.conn();

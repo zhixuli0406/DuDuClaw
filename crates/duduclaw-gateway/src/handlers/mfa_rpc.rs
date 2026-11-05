@@ -64,8 +64,10 @@ impl MethodHandler {
                     let mut value=db.mfa_factors(&id)?;
                     value["enabled"]=json!(db.mfa_active(&id)?);
                     value["enforced"]=json!(required);
-                    value["email_available"]=json!(crate::mfa_email::available(&home));
-                    value["email_hint"]=json!(if crate::mfa_email::available(&home) {None} else {Some(crate::mfa_email::UNAVAILABLE)});
+                    let reason=crate::mfa_email::unavailable_reason(&home);
+                    value["email_available"]=json!(reason.is_none());
+                    value["email_unavailable_reason"]=json!(reason);
+                    value["email_hint"]=json!(reason.map(|_|crate::mfa_email::UNAVAILABLE));
                     Ok(value)
                 },
                 "mfa.email_begin"=> {

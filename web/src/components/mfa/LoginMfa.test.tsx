@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, screen, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 import { useAuthStore, ApiError } from '@/stores/auth-store';
@@ -6,6 +6,7 @@ import { mfaApi } from '@/lib/mfa-api';
 import { LoginMfa } from './LoginMfa';
 
 beforeEach(() => { vi.restoreAllMocks(); });
+afterEach(() => { vi.unstubAllGlobals(); });
 const challenge = { mfa_required: true as const, challenge_id: 'challenge' };
 const tokens = { access_token: 'access', refresh_token: 'refresh' };
 
@@ -119,4 +120,13 @@ it('cannot invoke email delivery when the server reports unavailable SMTP', asyn
   renderWithProviders(<LoginMfa challenge={{ ...challenge, factors: { totp: true, email: true, passkey: false }, last_used: 'email', email_available: false }} onComplete={vi.fn()} onCancel={vi.fn()} />);
   expect(screen.getByRole('button', { name: 'Send code' })).toBeDisabled();
   expect(send).not.toHaveBeenCalled();
+});
+
+it('explains disabled email and passkey enrollment choices on an insecure connection', () => {
+  vi.stubGlobal('isSecureContext', false);
+  renderWithProviders(<LoginMfa challenge={{ mfa_enrollment_required: true, enrollment_token: 'enroll', challenge_ref: 'ref', email_available: false, email_unavailable_reason: 'no_smtp' }} onComplete={vi.fn()} onCancel={vi.fn()} />);
+  expect(screen.getByRole('option', { name: 'Email verification code' })).toBeDisabled();
+  expect(screen.getByRole('option', { name: 'Passkey' })).toBeDisabled();
+  expect(screen.getByText(/server has no outgoing email/)).toHaveTextContent('SMTP');
+  expect(screen.getByText(/Passkeys require HTTPS or localhost/)).toHaveTextContent('http://');
 });
