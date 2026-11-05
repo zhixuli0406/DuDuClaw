@@ -41,7 +41,8 @@ beforeEach(() => {
 describe('WebChatPage', () => {
   it('offers recent skills to an employee on a new chat without sending on selection', async () => {
     useAuthStore.setState({ user: { id: 'employee-a', role: 'employee' } as never });
-    useChatStore.setState({ selectedAgentId: 'sales', resolvedAgent: { id: 'sales', name: 'Sales', icon: '' } });
+    // Changing accounts disconnects chat; seed the completed employee handshake.
+    useChatStore.setState({ connectionState: 'connected', selectedAgentId: 'sales', resolvedAgent: { id: 'sales', name: 'Sales', icon: '' } });
     const send = vi.spyOn(useChatStore.getState(), 'send').mockImplementation(() => {});
     const recent = vi.spyOn(api.skills, 'recent').mockResolvedValue({ skills: [
       { name: 'quote', display_name: 'Quote', description: 'Prepare a quote' },
@@ -49,6 +50,7 @@ describe('WebChatPage', () => {
     ] });
     renderWithProviders(<WebChatPage />);
     fireEvent.click(await screen.findByRole('button', { name: 'Quote Prepare a quote' }));
+    expect(recent).toHaveBeenCalledWith('sales', false);
     fireEvent.click(screen.getByRole('button', { name: 'PDF Read a PDF' }));
     expect(screen.getByRole('combobox')).toHaveValue('/quote /pdf ');
     expect(send).not.toHaveBeenCalled();
