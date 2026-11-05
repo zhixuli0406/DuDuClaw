@@ -3148,7 +3148,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 jobs.spawn();
                 match crate::meeting_uploads::Service::open(jobs.clone()) {
                     Ok(uploads) => {
-                        app=app.merge(crate::meeting_uploads::router(uploads.clone(),Arc::new(move |headers|knowledge_caller(&meeting_auth_state,headers))));
+                        let meeting_users=meeting_auth_state.user_db.clone();
+                        app=app.merge(crate::meeting_uploads::router_with_google(uploads.clone(),Arc::new(move |headers|knowledge_caller(&meeting_auth_state,headers)),meeting_users));
                         match crate::meeting_links::router(uploads) {Ok(router)=>app=app.merge(router),Err(error)=>tracing::error!(%error,"meeting upload links unavailable")}
                     }
                     Err(error)=>tracing::error!(%error,"meeting uploads unavailable"),
@@ -17483,6 +17484,9 @@ mod personal_google_callback_tests {
                 client_secret: "secret".into(),
                 epoch: 1,
                 google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
+                meeting_recordings: false,
+                drive_tools: false,
+                expected_connection: None,
                 created: std::time::Instant::now(),
                 code: None,
             });
@@ -17517,6 +17521,9 @@ mod personal_google_callback_tests {
                 client_secret: "SECRET_MUST_NOT_LEAK".into(),
                 epoch: 1,
                 google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
+                meeting_recordings: false,
+                drive_tools: false,
+                expected_connection: None,
                 created: std::time::Instant::now(),
                 code: None,
             });

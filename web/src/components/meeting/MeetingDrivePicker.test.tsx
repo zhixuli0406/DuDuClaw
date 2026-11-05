@@ -1,0 +1,108 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, screen, waitFor } from '@testing-library/react';
+import '@/test/mocks';
+import { renderWithProviders } from '@/test/render';
+import { MeetingDrivePicker } from './MeetingDrivePicker';
+import { meetingDriveApi, type MeetingDriveStatus } from '@/lib/meeting/drive';
+import { pickGoogleRecording } from '@/lib/meeting/picker';
+vi.mock('@/lib/meeting/drive', () => ({ meetingDriveApi: { status: vi.fn(), files: vi.fn(), recordings: vi.fn(), registerSelection: vi.fn(), import: vi.fn() } }));
+vi.mock('@/lib/meeting/picker', () => ({ prepareGooglePicker: vi.fn().mockResolvedValue(undefined), pickGoogleRecording: vi.fn() }));
+const status: MeetingDriveStatus = { connected: true, authorized: true, picker_configured: true, client_id: 'client', developer_key: 'public-key', app_id: '123', account_email: 'owner@example.com' };
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(pickGoogleRecording).mockResolvedValue({ id: 'abcdefghij123', name: 'Team meeting.mp4' });
+  vi.mocked(meetingDriveApi.registerSelection).mockResolvedValue({ selection_receipt: 'selection-receipt', expires_in: 300 });
+  vi.mocked(meetingDriveApi.status).mockResolvedValue(status);
+  vi.mocked(meetingDriveApi.files).mockResolvedValue({ files: [{ id: 'abcdefghij123', name: 'Team meeting.mp4', mime_type: 'video/mp4', size: 1024 }] });
+  vi.mocked(meetingDriveApi.recordings).mockResolvedValue({ recordings: [{ file_id: 'meetabcdefghij', start_time: '2026-11-01T00:00:00Z', conference: 'conferenceRecords/example' }], truncated: false });
+  vi.mocked(meetingDriveApi.import).mockResolvedValue({ job_id: 'job-one', state: 'queued', chunk: 0, chunks: 0, created_at: 1 });
+});
+function renderPicker(onImported = vi.fn()) { return renderWithProviders(<MeetingDrivePicker agent="alice" agentName="Alice" disabled={false} onBusy={vi.fn()} onImported={onImported} />); }
+describe('dashboard Drive recording selection', () => {
+  it('does not browse automatically and requires selection plus explicit import confirmation', async () => {
+    const done = vi.fn(); renderPicker(done);
+    expect(meetingDriveApi.status).not.toHaveBeenCalled();
+    expect(meetingDriveApi.files).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Choose from Google Drive' }));
+    const file = await screen.findByRole('button', { name: /Team meeting.mp4/ });
+    await waitFor(() => expect(file).toBeEnabled()); fireEvent.click(file);
+    expect(meetingDriveApi.import).not.toHaveBeenCalled();
+    expect(await screen.findByText(/People who can use this employee may see the transcript/)).toBeInTheDocument();
+    expect(pickGoogleRecording).toHaveBeenCalledWith(status, 'en', expect.any(AbortSignal), 'abcdefghij123');
+    expect(meetingDriveApi.registerSelection).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm import and transcribe' }));
+    await waitFor(() => expect(meetingDriveApi.import).toHaveBeenCalledWith('alice', 'abcdefghij123', 'selection-receipt', expect.any(AbortSignal)));
+    expect(meetingDriveApi.registerSelection).toHaveBeenCalledWith('alice', 'abcdefghij123', expect.any(AbortSignal));
+    expect(vi.mocked(meetingDriveApi.registerSelection).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(meetingDriveApi.import).mock.invocationCallOrder[0]);
+    await waitFor(() => expect(done).toHaveBeenCalledOnce());
+  });
+  it('requires separate authorization before listing files or Meet records', async () => {
+    vi.mocked(meetingDriveApi.status).mockResolvedValue({ ...status, authorized: false });
+    renderPicker(); fireEvent.click(screen.getByRole('button', { name: 'Choose from Google Drive' }));
+    expect(await screen.findByRole('link', { name: 'My connections' })).toHaveAttribute('href', '/me/connections');
+    expect(meetingDriveApi.files).not.toHaveBeenCalled(); expect(meetingDriveApi.recordings).not.toHaveBeenCalled();
+  });
+  it('opens a recent Meet file in Google Picker before offering import', async () => {
+    vi.mocked(pickGoogleRecording).mockResolvedValue({ id: 'meetabcdefghij', name: 'Meet recording.mp4' });
+    renderPicker(); fireEvent.click(screen.getByRole('button', { name: 'Choose from Google Drive' }));
+    const recent = await screen.findByRole('button', { name: /Meet recording ·/ });
+    await waitFor(() => expect(recent).toBeEnabled()); fireEvent.click(recent);
+    await screen.findByRole('heading', { name: 'Meet recording.mp4' });
+    expect(pickGoogleRecording).toHaveBeenCalledWith(status, 'en', expect.any(AbortSignal), 'meetabcdefghij');
+    expect(meetingDriveApi.import).not.toHaveBeenCalled();
+  });
+  it('aborts a pending Picker and ignores its selection after unmount', async () => {
+    let resolve!: (value: { id: string; name: string }) => void;
+    vi.mocked(pickGoogleRecording).mockImplementation(() => new Promise(done => { resolve = done; }));
+    const { unmount } = renderPicker(); fireEvent.click(screen.getByRole('button', { name: 'Choose from Google Drive' }));
+    const browse = await screen.findByRole('button', { name: 'Open Google file picker' });
+    await waitFor(() => expect(browse).toBeEnabled()); fireEvent.click(browse);
+    await waitFor(() => expect(pickGoogleRecording).toHaveBeenCalledOnce());
+    const signal = vi.mocked(pickGoogleRecording).mock.calls[0][2];
+    unmount(); expect(signal.aborted).toBe(true);
+    resolve({ id: 'abcdefghij123', name: 'Late result.mp4' });
+    expect(meetingDriveApi.import).not.toHaveBeenCalled();
+  });
+  it('clears an unconfirmed selection without registering or importing it', async () => {
+    renderPicker(); fireEvent.click(screen.getByRole('button', { name: 'Choose from Google Drive' }));
+    const browse = await screen.findByRole('button', { name: 'Open Google file picker' });
+    await waitFor(() => expect(browse).toBeEnabled()); fireEvent.click(browse);
+    const clear = await screen.findByRole('button', { name: 'Clear selection' });
+    await waitFor(() => expect(clear).toBeEnabled()); fireEvent.click(clear);
+    expect(screen.queryByRole('button', { name: 'Confirm import and transcribe' })).not.toBeInTheDocument();
+    expect(meetingDriveApi.registerSelection).not.toHaveBeenCalled();
+    expect(meetingDriveApi.import).not.toHaveBeenCalled();
+  });
+  it('does not import when unmounted while confirmation registration is pending', async () => {
+    let resolve!: (value: { selection_receipt: string; expires_in: number }) => void;
+    vi.mocked(meetingDriveApi.registerSelection).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    const { unmount } = renderPicker(); fireEvent.click(screen.getByRole('button', { name: 'Choose from Google Drive' }));
+    const browse = await screen.findByRole('button', { name: 'Open Google file picker' });
+    await waitFor(() => expect(browse).toBeEnabled()); fireEvent.click(browse);
+    const confirm = await screen.findByRole('button', { name: 'Confirm import and transcribe' });
+    await waitFor(() => expect(confirm).toBeEnabled()); fireEvent.click(confirm);
+    await waitFor(() => expect(meetingDriveApi.registerSelection).toHaveBeenCalledOnce());
+    const signal = vi.mocked(meetingDriveApi.registerSelection).mock.calls[0][2];
+    unmount(); expect(signal?.aborted).toBe(true);
+    resolve({ selection_receipt: 'late-receipt', expires_in: 300 });
+    await Promise.resolve();
+    expect(meetingDriveApi.import).not.toHaveBeenCalled();
+  });
+  it('offers no import when registration fails, and never registers a cancelled Picker', async () => {
+    vi.mocked(meetingDriveApi.registerSelection).mockRejectedValueOnce(new Error('Selection registration failed'));
+    renderPicker(); fireEvent.click(screen.getByRole('button', { name: 'Choose from Google Drive' }));
+    const browse = await screen.findByRole('button', { name: 'Open Google file picker' });
+    await waitFor(() => expect(browse).toBeEnabled()); fireEvent.click(browse);
+    const confirm = await screen.findByRole('button', { name: 'Confirm import and transcribe' });
+    await waitFor(() => expect(confirm).toBeEnabled());
+    expect(meetingDriveApi.registerSelection).not.toHaveBeenCalled();
+    fireEvent.click(confirm);
+    expect(await screen.findByRole('alert')).toHaveTextContent('Selection registration failed');
+    expect(screen.queryByRole('button', { name: 'Confirm import and transcribe' })).not.toBeInTheDocument();
+    vi.mocked(pickGoogleRecording).mockResolvedValueOnce(null);
+    await waitFor(() => expect(browse).toBeEnabled()); fireEvent.click(browse);
+    await waitFor(() => expect(pickGoogleRecording).toHaveBeenCalledTimes(2));
+    expect(meetingDriveApi.registerSelection).toHaveBeenCalledOnce();
+    expect(meetingDriveApi.import).not.toHaveBeenCalled();
+  });
+});

@@ -20,6 +20,7 @@ fn metadata(user: &str) -> Metadata {
         account_email: "alice@c.test".into(),
         google_sub: "google-person-1".into(),
         hosted_domain: Some("c.test".into()),
+        local_purposes: vec!["base".into(), "drive_tools".into()],
         granted_scopes: vec!["openid".into(), "email".into()],
         status: Status::Connected,
         status_before_suspension: None,
@@ -391,4 +392,46 @@ fn metadata_resume_authorization_is_rechecked_inside_cas_before_write() {
         .is_err()
     );
     assert!(before == std::fs::read(path(home.path())).unwrap());
+}
+
+#[test]
+fn local_purpose_consent_is_sealed_and_missing_legacy_consent_fails_closed() {
+    let (home, key) = fixture();
+    let mut meta = metadata("user-a");
+    meta.local_purposes = vec!["base".into()];
+    meta.granted_scopes.push("https://www.googleapis.com/auth/drive.readonly".into());
+    let epoch = begin_connection(home.path(), "user-a").unwrap();
+    connect(home.path(), &key, meta, &secret(), epoch).unwrap();
+    let mut record = get(home.path(), "user-a").unwrap().unwrap();
+    assert!(!crate::google_personal::scopes::permitted_for("drive_read", &record.metadata));
+    record.metadata.local_purposes.push("drive_tools".into());
+    assert!(unseal(&key, &record).is_err(), "clear metadata cannot invent local consent");
+    let mut legacy = serde_json::to_value(&record.metadata).unwrap();
+    legacy.as_object_mut().unwrap().remove("local_purposes");
+    let legacy: Metadata = serde_json::from_value(legacy).unwrap();
+    assert!(legacy.local_purposes.is_empty());
+    assert!(!crate::google_personal::scopes::permitted_for("drive_read", &legacy));
+}
+
+#[test]
+fn incremental_publication_rejects_downgrade_and_concurrent_refresh() {
+    let (home, key) = fixture();
+    let epoch = begin_connection(home.path(), "user-a").unwrap();
+    connect(home.path(), &key, metadata("user-a"), &secret(), epoch).unwrap();
+    let old = get(home.path(), "user-a").unwrap().unwrap().metadata;
+    let epoch = begin_connection(home.path(), "user-a").unwrap();
+    let before = std::fs::read(path(home.path())).unwrap();
+    let mut next = old.clone();
+    next.credential_id = uuid::Uuid::new_v4().to_string();
+    next.granted_scopes.retain(|scope| scope != "email");
+    assert!(connect_with_previous(home.path(), &key, next, &secret(), epoch, Some(&old)).is_err());
+    assert_eq!(std::fs::read(path(home.path())).unwrap(), before);
+    // Refresh changes the credential revision without changing the grant epoch.
+    assert!(finish_refresh(home.path(), &key, &old, &secret()).unwrap());
+    let refreshed = std::fs::read(path(home.path())).unwrap();
+    let mut next = old.clone();
+    next.credential_id = uuid::Uuid::new_v4().to_string();
+    next.local_purposes.push("meeting_recordings".into());
+    assert!(connect_with_previous(home.path(), &key, next, &secret(), epoch, Some(&old)).is_err());
+    assert_eq!(std::fs::read(path(home.path())).unwrap(), refreshed);
 }

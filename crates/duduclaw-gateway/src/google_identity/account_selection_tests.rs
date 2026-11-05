@@ -48,7 +48,7 @@ impl Fixture {
         std::fs::write(home.join("person_credentials/store.json"),serde_json::to_vec(&json!({"version":1,"epochs":{(user.id.clone()):1},"records":[{
             "owner_kind":"user","owner_id":user.id,"provider":"google","credential_id":uuid::Uuid::new_v4().to_string(),"revision":1,
             "account_email":"alice-google@unit.test","google_sub":"unit-alice-sub","hosted_domain":null,
-            "granted_scopes":["https://www.googleapis.com/auth/gmail.readonly"],"status":"connected","connected_at":chrono::Utc::now().to_rfc3339(),
+            "local_purposes":["base","drive_tools"],"granted_scopes":["https://www.googleapis.com/auth/gmail.readonly"],"status":"connected","connected_at":chrono::Utc::now().to_rfc3339(),
             "last_refresh_at":null,"oauth_client_id":"unit-client","google_data_consent":google_data_consent,
             "secret":"pk:v1:unusable-no-key-exists"}]})).unwrap()).unwrap();
         std::fs::write(home.join("mcp-oauth-configs.json"),serde_json::to_vec(&json!([{"provider_id":"google","client_id":"unit-client","client_secret":"unit-not-for-output"}])).unwrap()).unwrap();

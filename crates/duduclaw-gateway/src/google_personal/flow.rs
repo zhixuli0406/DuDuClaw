@@ -27,6 +27,48 @@ pub async fn start(
     allowed: &[String],
     acknowledge_google_data: bool,
 ) -> Result<Value, String> {
+    start_with_meetings(home, db, user, session, origin, allowed, acknowledge_google_data, false).await
+}
+
+pub async fn start_with_meetings(
+    home: &Path,
+    db: &UserDb,
+    user: &str,
+    session: &str,
+    origin: &str,
+    allowed: &[String],
+    acknowledge_google_data: bool,
+    meeting_recordings: bool,
+) -> Result<Value, String> {
+    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, meeting_recordings, false).await
+}
+
+pub async fn start_drive_tools(
+    home: &Path,
+    db: &UserDb,
+    user: &str,
+    session: &str,
+    origin: &str,
+    allowed: &[String],
+    acknowledge_google_data: bool,
+) -> Result<Value, String> {
+    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, false, true).await
+}
+
+async fn start_consent(
+    home: &Path,
+    db: &UserDb,
+    user: &str,
+    session: &str,
+    origin: &str,
+    allowed: &[String],
+    acknowledge_google_data: bool,
+    meeting_recordings: bool,
+    drive_tools: bool,
+) -> Result<Value, String> {
+    if meeting_recordings && drive_tools {
+        return Err("請每次選擇一項 Google 額外服務。".into());
+    }
     if !acknowledge_google_data {
         return Err("請先閱讀並確認 Google 資料的存取、分享、保存與刪除說明。".into());
     }
@@ -47,6 +89,15 @@ pub async fn start(
     let redirect_uri = plan.redirect_uri().to_string();
     let verifier = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    // Incremental consent extends this person's existing Google account;
+    // choosing another account cannot silently replace it.
+    let expected_connection = if drive_tools {
+        Some(vault::get(home, user)?.ok_or("請先連結自己的 Google 帳號，再開放雲端硬碟工具。")?.metadata)
+    } else if meeting_recordings {
+        Some(vault::get(home, user)?.ok_or("請先連結自己的 Google 帳號，再開放會議錄影。")?.metadata)
+    } else {
+        None
+    };
     let epoch = vault::begin_connection(home, user)?;
     let google_data_consent = crate::google_data_consent::Evidence::issue(user)?;
     pending::cancel_user(home, user);
@@ -61,12 +112,18 @@ pub async fn start(
         client_id: client.client_id.clone(),
         client_secret: client.client_secret,
         epoch,
+        meeting_recordings,
+        drive_tools,
+        expected_connection,
         google_data_consent,
         created: Instant::now(),
         code: None,
     });
-    let authorization_url =
-        oauth::authorization_url(&client.client_id, &redirect_uri, &state, &challenge)?;
+    let authorization_url = if drive_tools {
+        oauth::authorization_url_with_drive_tools(&client.client_id, &redirect_uri, &state, &challenge)?
+    } else {
+        oauth::authorization_url_with_meetings(&client.client_id, &redirect_uri, &state, &challenge, meeting_recordings)?
+    };
     Ok(
         json!({ "authorization_url": authorization_url, "state": state, "completion": if paste { "paste" } else { "redirect" }, "redirect_uri": redirect_uri, "expires_in": 600 }),
     )
@@ -98,6 +155,43 @@ pub async fn finish(
     let scopes = tokens
         .granted_scopes
         .ok_or("Google 沒有回傳實際授權範圍，請重新連結。")?;
+    if pending.expected_connection.as_ref().is_some_and(|old| old.google_sub != info.sub) {
+        return Err("請使用原本連結的 Google 帳號開放額外服務。這次沒有取代既有連線。".into());
+    }
+    if pending.meeting_recordings && !super::meeting_access::has_scopes(&scopes) {
+        return Err("尚未開放所選雲端硬碟檔案及 Meet 錄影的讀取權限，這次沒有變更連線。".into());
+    }
+    if pending.drive_tools && !scopes.iter().any(|scope| scope == oauth::DRIVE_TOOLS_SCOPE) {
+        return Err("尚未開放雲端硬碟唯讀權限，這次沒有變更連線。".into());
+    }
+    if pending.expected_connection.as_ref().is_some_and(|old| {
+        !old.granted_scopes.iter().all(|scope| scopes.contains(scope))
+    }) {
+        return Err("Google 未保留原有授權範圍，這次沒有取代既有憑證。請重新開始。".into());
+    }
+    let purpose = if pending.drive_tools { "drive_tools" }
+        else if pending.meeting_recordings { "meeting_recordings" } else { "base" };
+    let mut local_purposes = pending.expected_connection.as_ref()
+        .map(|old| old.local_purposes.clone()).unwrap_or_default();
+    if !local_purposes.iter().any(|p| p == purpose) {
+        local_purposes.push(purpose.into());
+    }
+    local_purposes.sort();
+    local_purposes.dedup();
+    let mut expected_scopes = oauth::requested_scopes(pending.meeting_recordings, pending.drive_tools)
+        .into_iter().map(str::to_string).collect::<Vec<_>>();
+    // Previously returned but locally unconsented scopes remain unexpected
+    // on later flows; receiving them once must not bless them in the audit.
+    for granted_purpose in &local_purposes {
+        expected_scopes.extend(oauth::requested_scopes(
+            granted_purpose == "meeting_recordings", granted_purpose == "drive_tools",
+        ).into_iter().map(str::to_string));
+    }
+    let mut unexpected_scopes: Vec<_> = scopes.iter()
+        .filter(|scope| !expected_scopes.contains(scope)).cloned().collect();
+    unexpected_scopes.sort();
+    unexpected_scopes.dedup();
+    let scope_digest = scope_digest(&scopes);
     let metadata = Metadata {
         owner_kind: "user".into(),
         owner_id: user.into(),
@@ -108,6 +202,7 @@ pub async fn finish(
         google_sub: info.sub,
         hosted_domain: info.hd,
         granted_scopes: scopes,
+        local_purposes,
         status: Status::Connected,
         status_before_suspension: None,
         connected_at: chrono::Utc::now().to_rfc3339(),
@@ -140,10 +235,13 @@ pub async fn finish(
     if !access::domain_allowed(home, &metadata)? {
         return Err("管理員已變更允許的 Google 網域，請重新開始。".into());
     }
-    vault::connect(home, &key, metadata.clone(), &tokens.secret, pending.epoch)?;
+    vault::connect_with_previous(home, &key, metadata.clone(), &tokens.secret, pending.epoch, pending.expected_connection.as_ref())?;
     let detail = json!({
         "google_email": metadata.account_email,
         "scope_count": metadata.granted_scopes.len(),
+        "purpose": purpose,
+        "scope_digest": scope_digest,
+        "unexpected_scopes": unexpected_scopes,
         "google_data_consent": metadata.google_data_consent,
     })
     .to_string();
@@ -155,4 +253,17 @@ pub async fn finish(
         None,
     );
     Ok(json!({"connection": metadata}))
+}
+
+/// Stable set digest: ordering and duplicate provider entries do not affect it.
+fn scope_digest(scopes: &[String]) -> String {
+    let mut scopes = scopes.to_vec();
+    scopes.sort();
+    scopes.dedup();
+    let mut digest = Sha256::new();
+    for scope in scopes {
+        digest.update((scope.len() as u64).to_be_bytes());
+        digest.update(scope.as_bytes());
+    }
+    hex::encode(digest.finalize())
 }

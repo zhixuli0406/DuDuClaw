@@ -10,6 +10,7 @@ pub const AUTHORIZE: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const TOKEN: &str = "https://oauth2.googleapis.com/token";
 pub const USERINFO: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 pub const REVOKE: &str = "https://oauth2.googleapis.com/revoke";
+pub(crate) const DRIVE_TOOLS_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
 const MAX_RESPONSE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +73,7 @@ fn client() -> Result<reqwest::Client, Error> {
 /// The ordinary OAuth client retains its existing transport policy.
 enum ScopedRefreshPolicy<'a> {
     Legacy,
+    Meeting,
     Closed {
         home: &'a std::path::Path,
         deadline: tokio::time::Instant,
@@ -89,7 +91,7 @@ impl ScopedRefreshPolicy<'_> {
     async fn wait<F: std::future::Future>(&self, future: F) -> Result<F::Output, Error> {
         self.check()?;
         let value = match self {
-            Self::Legacy => future.await,
+            Self::Legacy | Self::Meeting => future.await,
             Self::Closed { deadline, .. } => tokio::time::timeout_at(*deadline, future)
                 .await
                 .map_err(|_| Error::Unavailable)?,
@@ -100,6 +102,15 @@ impl ScopedRefreshPolicy<'_> {
     fn endpoint(&self) -> Result<String, Error> {
         match self {
             Self::Legacy => Ok(endpoint(TOKEN)),
+            Self::Meeting => {
+                #[cfg(test)]
+                {
+                    return test_base().get().map(|base| format!("{}/oauth2.googleapis.com/token", base.trim_end_matches('/')))
+                        .ok_or(Error::Unavailable);
+                }
+                #[cfg(not(test))]
+                Ok(TOKEN.to_owned())
+            }
             Self::Closed { home, .. } => {
                 #[cfg(test)]
                 {
@@ -117,7 +128,7 @@ impl ScopedRefreshPolicy<'_> {
 fn scoped_refresh_client(policy: &ScopedRefreshPolicy<'_>) -> Result<reqwest::Client, Error> {
     let builder = match policy {
         ScopedRefreshPolicy::Legacy => reqwest::Client::builder(),
-        ScopedRefreshPolicy::Closed { .. } => reqwest::Client::builder().no_proxy(),
+        ScopedRefreshPolicy::Meeting | ScopedRefreshPolicy::Closed { .. } => reqwest::Client::builder().no_proxy(),
     };
     builder
         .timeout(Duration::from_secs(20))
@@ -262,6 +273,13 @@ pub(crate) async fn refresh_scoped(
     )
     .await
 }
+pub(crate) async fn refresh_meeting(
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<Tokens, Error> {
+    refresh_scoped_core(client_id, client_secret, refresh_token, ScopedRefreshPolicy::Meeting).await
+}
 pub(crate) async fn refresh_mcp(
     home: &std::path::Path,
     client_id: &str,
@@ -350,9 +368,38 @@ pub fn authorization_url(
     state: &str,
     challenge: &str,
 ) -> Result<String, String> {
+    authorization_url_with_meetings(client_id, redirect, state, challenge, false)
+}
+
+pub fn authorization_url_with_meetings(
+    client_id: &str,
+    redirect: &str,
+    state: &str,
+    challenge: &str,
+    meeting_recordings: bool,
+) -> Result<String, String> {
+    authorization_url_for(client_id, redirect, state, challenge, meeting_recordings, false)
+}
+
+pub fn authorization_url_with_drive_tools(
+    client_id: &str,
+    redirect: &str,
+    state: &str,
+    challenge: &str,
+) -> Result<String, String> {
+    authorization_url_for(client_id, redirect, state, challenge, false, true)
+}
+
+fn authorization_url_for(
+    client_id: &str,
+    redirect: &str,
+    state: &str,
+    challenge: &str,
+    meeting_recordings: bool,
+    drive_tools: bool,
+) -> Result<String, String> {
     let mut url = url::Url::parse(&endpoint(AUTHORIZE)).map_err(|_| "Google 連結網址無法建立。")?;
-    let mut scopes: Vec<&str> = crate::google_workspace::REQUIRED_SCOPES.to_vec();
-    scopes.extend(["openid", "email"]);
+    let scopes = requested_scopes(meeting_recordings, drive_tools);
     url.query_pairs_mut().extend_pairs([
         ("response_type", "code"),
         ("client_id", client_id),
@@ -366,6 +413,20 @@ pub fn authorization_url(
         ("include_granted_scopes", "true"),
     ]);
     Ok(url.into())
+}
+
+pub(crate) fn requested_scopes(meeting_recordings: bool, drive_tools: bool) -> Vec<&'static str> {
+    let mut scopes: Vec<&str> = if drive_tools {
+        vec![DRIVE_TOOLS_SCOPE]
+    } else if meeting_recordings {
+        vec![super::meeting_access::DRIVE_SCOPE, super::meeting_access::MEET_SCOPE]
+    } else {
+        crate::google_workspace::REQUIRED_SCOPES.iter().copied()
+            .filter(|scope| *scope != DRIVE_TOOLS_SCOPE)
+            .collect()
+    };
+    scopes.extend(["openid", "email"]);
+    scopes
 }
 
 #[cfg(test)]
@@ -406,6 +467,31 @@ mod tests {
             assert_eq!(q.get(key).unwrap(), value);
         }
         assert!(q["scope"].split_ascii_whitespace().any(|s| s == "openid"));
+    }
+
+    #[test]
+    fn meeting_consent_is_incremental_and_not_part_of_initial_connect() {
+        let initial = authorization_url("client", "https://dashboard.example/callback", "state", "challenge").unwrap();
+        let incremental = authorization_url_with_meetings("client", "https://dashboard.example/callback", "state", "challenge", true).unwrap();
+        let drive_tools = authorization_url_with_drive_tools("client", "https://dashboard.example/callback", "state", "challenge").unwrap();
+        let scopes = |raw: &str| {
+            url::Url::parse(raw).unwrap().query_pairs().find(|(key, _)| key == "scope")
+                .unwrap().1.split_ascii_whitespace().map(str::to_owned).collect::<Vec<_>>()
+        };
+        let initial_scopes = scopes(&initial);
+        for withheld in [super::super::meeting_access::DRIVE_SCOPE, super::super::meeting_access::MEET_SCOPE, "https://www.googleapis.com/auth/drive.readonly"] {
+            assert!(!initial_scopes.iter().any(|s| s == withheld));
+        }
+        let incremental_scopes = scopes(&incremental);
+        assert_eq!(incremental_scopes.len(), 4);
+        assert!(super::super::meeting_access::has_scopes(&incremental_scopes));
+        assert!(!incremental_scopes.iter().any(|scope| scope == DRIVE_TOOLS_SCOPE));
+        let drive_scopes = scopes(&drive_tools);
+        assert_eq!(drive_scopes.len(), 3);
+        assert!(drive_scopes.iter().any(|scope| scope == DRIVE_TOOLS_SCOPE));
+        assert!(!drive_scopes.iter().any(|scope| scope == super::super::meeting_access::DRIVE_SCOPE || scope == super::super::meeting_access::MEET_SCOPE));
+        assert!(url::Url::parse(&drive_tools).unwrap().query_pairs().any(|(key, value)| key == "include_granted_scopes" && value == "true"));
+        assert!(url::Url::parse(&incremental).unwrap().query_pairs().any(|(key, value)| key == "include_granted_scopes" && value == "true"));
     }
 }
 

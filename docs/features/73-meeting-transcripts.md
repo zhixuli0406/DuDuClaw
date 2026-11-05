@@ -2,7 +2,7 @@
 
 [繁體中文](zh-TW/73-meeting-transcripts.md) · [日本語](ja-JP/73-meeting-transcripts.md)
 
-Convert downloaded Meet, Zoom or Teams recordings into Taiwan Traditional Chinese Markdown and JSON, with timestamps and optional speaker labels. This processes completed files; it does not join live meetings or download Drive recordings. No OAuth scopes are added.
+Convert completed Meet, Zoom or Teams recordings into Taiwan Traditional Chinese Markdown and JSON, with timestamps and optional speaker labels. Upload a local file or, in Enterprise, select a file from your personal Google Drive connection. This does not join or record live meetings.
 
 ## Upload and follow progress
 
@@ -11,6 +11,35 @@ Open **Meeting transcripts**, choose an employee you may use, and select audio o
 When WebCodecs supports the recording, the browser attempts to extract MP4/MOV AAC-LC audio and encode mono AAC at about 48 kbps. WebM, unsupported codecs or any conversion error fall back to the original file. The page reports the selected path. The demuxer is an exact-pinned mp4box.js release under BSD-3-Clause. Browser conversion is best effort.
 
 The job list shows queued, preparing, transcribing with chunk progress, done, failed or cancelled. Download Markdown and JSON after completion. Cancellation prevents subsequent chunks; an already submitted provider request finishes and records its available usage. Cancellation cannot undo provider charges.
+
+## Import from Google Drive and Meet (Enterprise)
+
+In **My connections**, enable meeting-recording access for your own Google connection and accept the separate consent step. Initial personal connection does not request Drive or Meet access. The extra scopes are:
+
+- `https://www.googleapis.com/auth/drive.file`: access files you select or share with the app through Google Picker. Google also permits creation and modification within this scope; this feature uses read requests only.
+- `https://www.googleapis.com/auth/meetings.space.readonly`: list recent conferences and their recording references.
+
+The gateway records local consent separately for basic services, meeting recordings and employee Drive tools, and binds it to the sealed credential and its authority record. A capability needs both the provider scope and the matching local purpose consent. Extra `drive.readonly` or `drive` scopes returned during meeting consent cannot enable employee Drive tools. Incremental consent preserves earlier local purposes and must retain every previously held provider scope; publication also checks the original credential revision. Missing scopes or a concurrent credential change leave the old credential unchanged. Records without local purpose consent require reconnection. Reconnecting basic services resets local purposes to basic services, so recording access and employee Drive tools must then be enabled separately again.
+
+Open **Meeting transcripts**, select the employee, and choose **Choose from Google Drive**. Recent Meet recordings come from the Meet API; select a recording in Google Picker to grant file access. You can also search audio/video files already shared with the app, or open Google Picker to choose another recording. Review the selected file and employee before confirming import. The audio is sent to the administrator's configured transcription provider under the same privacy and outgoing-data checks as uploads.
+
+Every import requires a server-issued confirmation receipt. It proves that a dashboard user authenticated by JWT explicitly registered and confirmed this exact Drive file ID for this exact receiving employee within the last five minutes. Employee/MCP tokens cannot register it. The receipt is single use and bound to that user, employee and file ID; a new confirmation for the same user and employee replaces the previous receipt. The dashboard registers the file only when the user confirms the import. Missing, expired, reused or mismatched receipts are rejected. An admitted import attempt consumes the receipt even if later checks fail, so retry with a new confirmation. The server additionally checks Drive metadata for `isAppAuthorized=true` under that user's Google connection. Neither the receipt nor this Google flag proves a click in Google Picker: a dashboard caller can explicitly confirm a previously app-authorized file by its known ID.
+
+The dashboard-only `POST /api/meeting-drive/selection` requires `agent_id`, `file_id` and `confirm: true`, and returns `selection_receipt` with `expires_in`. Registration is limited to 20 requests per user per minute, with at most eight unexpired receipts per user. `POST /api/meeting-drive/import` must submit that receipt.
+
+`google_status` reads account, status and purpose-filtered scope metadata only: it does not unseal credentials, refresh tokens or return a bearer. The token endpoint accepts an explicit tool allowlist and requires both the matching local purpose and provider scope for personal credentials; status requests and unknown tools cannot obtain a bearer.
+
+Meet recordings usually live in the organizer's **Meet Recordings** folder (the name may be localized). A conference reference does not guarantee access to its Drive file. The recent list reads up to ten conferences per page and five recordings per conference; use the next page when available. A limited-results notice means the list may omit recordings; use Google Picker to find the desired file.
+
+The gateway downloads the original file into the existing upload storage in bounded 8 MiB chunks. Upload size, staging quota, media-type validation and duration limits still apply; browser audio conversion is not used for Drive imports. Downloads have a 30-minute total limit and require an average of 32 KiB/s per 30-second window. Leaving the page or breaking the browser HTTP connection does not guarantee the server stops importing. Check the job list afterwards and cancel the job there if needed. A server refusal or cancelled import task triggers temporary-file cleanup; after a gateway crash, the ordinary two-hour upload idle expiry reclaims incomplete imports.
+
+The feature adds no employee tool for browsing or fetching your Drive. It requires your dashboard session, current personal connection and explicit file selection. Disconnecting, a detected revoked permission, or a changed local access policy stops further access; it does not recall copies already imported or completed transcripts. Existing broader Google grants are not automatically revoked when upgrading. See [personal Google connection setup](../guides/google-personal-connections.md) for Picker configuration and revocation details.
+
+The local Drive source record contains the selecting account, Google email, file ID and version. Cancellation, failure and upload expiry remove this record in the same database transaction as the corresponding state change. Other source records, including successful imports, have a 30-day retention period from `imported_at`, then are removed by the existing cleanup sweep every 60 seconds while the gateway is running; after downtime, cleanup occurs on the next sweep. Transcript files and audit logs have separate retention rules and are not deleted by this source-metadata cleanup.
+
+`user.google_connect` audits include the consent purpose, a digest of the returned scope set and unexpected scopes. Drive/Meet list reads and early refusals are also audited. These events omit tokens and file contents; import identifiers are hashed.
+
+Real Google OAuth/Picker behavior, Drive/Meet access and provider transcription require separate acceptance. Mock results and source inspection do not establish those outcomes.
 
 ## Chat tools
 

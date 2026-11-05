@@ -111,10 +111,19 @@ async fn token(
                 .ends_with(flow::CALLBACK_PATH)
         );
     }
+    let (account, scope) = match who {
+        "meeting-downgrade" => ("alice", format!("openid email {} {}", meeting_access::DRIVE_SCOPE, meeting_access::MEET_SCOPE)),
+        "meeting-extra-drive" => ("alice", format!("openid email https://www.googleapis.com/auth/gmail.readonly {} {} {}", meeting_access::DRIVE_SCOPE, meeting_access::MEET_SCOPE, oauth::DRIVE_TOOLS_SCOPE)),
+        "meeting-alice" => ("alice", format!("openid email https://www.googleapis.com/auth/gmail.readonly {} {}", meeting_access::DRIVE_SCOPE, meeting_access::MEET_SCOPE)),
+        "meeting-bob" => ("bob", format!("openid email {} {}", meeting_access::DRIVE_SCOPE, meeting_access::MEET_SCOPE)),
+        "drive-alice" => ("alice", format!("openid email https://www.googleapis.com/auth/gmail.readonly {}", oauth::DRIVE_TOOLS_SCOPE)),
+        "drive-bob" => ("bob", format!("openid email {}", oauth::DRIVE_TOOLS_SCOPE)),
+        _ => (who, "openid email https://www.googleapis.com/auth/gmail.readonly".into()),
+    };
     (
         StatusCode::OK,
         Json(
-            json!({"access_token":format!("access-{who}"),"refresh_token":format!("refresh-{who}"),"token_type":"Bearer","expires_in":3600,"scope":"openid email https://www.googleapis.com/auth/gmail.readonly"}),
+            json!({"access_token":format!("access-{account}"),"refresh_token":format!("refresh-{account}"),"token_type":"Bearer","expires_in":3600,"scope":scope}),
         ),
     )
 }
@@ -1019,4 +1028,190 @@ async fn actual_legacy_home_grant_still_requires_readable_distinct_account_befor
         assert_eq!(std::fs::read(&path).unwrap(), before, "{kind}");
         delays().lock().unwrap().remove(&code);
     }
+}
+
+#[tokio::test]
+async fn meeting_incremental_consent_binds_account_and_requires_both_granted_scopes() {
+    let f = Fixture::new();
+    assert!(flow::start_with_meetings(&f.home, &f.db, &f.alice.id, "meeting-login", "http://127.0.0.1:18889", &[], true, true).await.is_err());
+    assert!(vault::get(&f.home, &f.alice.id).unwrap().is_none());
+    f.connect().await;
+    let original = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+    for (code, allowed) in [("alice", false), ("meeting-bob", false), ("meeting-downgrade", false), ("meeting-alice", true)] {
+        let start = flow::start_with_meetings(&f.home, &f.db, &f.alice.id, "meeting-login", "http://127.0.0.1:18889", &[], true, true).await.unwrap();
+        let state = start["state"].as_str().unwrap();
+        pending::receive_code(&f.home, state, code).unwrap();
+        let result = flow::finish(&f.home, &f.db, &f.alice.id, "meeting-login", state).await;
+        assert_eq!(result.is_ok(), allowed, "{code}: {result:?}");
+        let record = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+        assert_eq!(record.metadata.google_sub, original.metadata.google_sub);
+        if !allowed {
+            assert_eq!(record.metadata.credential_id, original.metadata.credential_id);
+        } else {
+            assert!(meeting_access::has_scopes(&record.metadata.granted_scopes));
+            assert!(original.metadata.granted_scopes.iter().all(|scope| record.metadata.granted_scopes.contains(scope)));
+            assert!(record.metadata.local_purposes.iter().any(|p| p == "meeting_recordings"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn drive_tools_incremental_consent_requires_existing_account_and_actual_readonly_scope() {
+    let f = Fixture::new();
+    assert!(flow::start_drive_tools(&f.home, &f.db, &f.alice.id, "drive-login", "http://127.0.0.1:18889", &[], true).await.is_err());
+    assert!(vault::get(&f.home, &f.alice.id).unwrap().is_none());
+    f.connect().await;
+    let original = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+    for (code, allowed) in [("alice", false), ("meeting-alice", false), ("drive-bob", false), ("drive-alice", true)] {
+        let start = flow::start_drive_tools(&f.home, &f.db, &f.alice.id, "drive-login", "http://127.0.0.1:18889", &[], true).await.unwrap();
+        let state = start["state"].as_str().unwrap();
+        pending::receive_code(&f.home, state, code).unwrap();
+        let result = flow::finish(&f.home, &f.db, &f.alice.id, "drive-login", state).await;
+        assert_eq!(result.is_ok(), allowed, "{code}: {result:?}");
+        let record = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+        assert_eq!(record.metadata.google_sub, original.metadata.google_sub);
+        if !allowed {
+            assert_eq!(record.metadata.credential_id, original.metadata.credential_id);
+        } else {
+            assert!(scopes::permitted_for("drive_search", &record.metadata));
+            assert!(scopes::permitted_for("drive_read", &record.metadata));
+        }
+    }
+}
+
+#[tokio::test]
+async fn meeting_extra_provider_drive_scope_never_grants_employee_drive_tools() {
+    let f = Fixture::new();
+    f.connect().await;
+    f.db.set_google_consent(&f.alice.id, "bot", true, &f.alice.id).unwrap();
+    let start = flow::start_with_meetings(&f.home, &f.db, &f.alice.id, "meeting-login", "http://127.0.0.1:18889", &[], true, true).await.unwrap();
+    let state = start["state"].as_str().unwrap();
+    pending::receive_code(&f.home, state, "meeting-extra-drive").unwrap();
+    flow::finish(&f.home, &f.db, &f.alice.id, "meeting-login", state).await.unwrap();
+    let record = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+    assert!(record.metadata.granted_scopes.iter().any(|s| s == oauth::DRIVE_TOOLS_SCOPE));
+    assert!(!scopes::permitted_for("drive_search", &record.metadata));
+    assert!(!scopes::permitted_for("drive_read", &record.metadata));
+    assert!(!scopes::permitted_for("google_remote_mcp", &record.metadata));
+    assert!(scopes::permitted_for("gmail_read", &record.metadata));
+    meeting_access::check_metadata(&f.home, &f.db, &f.alice.id, &record.metadata).unwrap();
+    let people = crate::google_identity::requester_gate::UserDbPeople(f.db.clone());
+    for tool in ["drive_search", "drive_read"] {
+        assert!(authority::PersonalSelection::capture(&f.home, "bot", &RequesterIdentity::Unknown, &people, tool).is_err());
+    }
+    let audit = f.db.query_audit_log(Some(&f.alice.id), Some("user.google_connect"), 10).unwrap();
+    let details: Vec<Value> = audit.iter().map(|row| serde_json::from_str(row.detail.as_deref().unwrap()).unwrap()).collect();
+    let meeting = details.iter().find(|detail| detail["purpose"] == "meeting_recordings").unwrap();
+    assert_eq!(meeting["scope_digest"].as_str().unwrap().len(), 64);
+    assert_eq!(meeting["unexpected_scopes"], json!([oauth::DRIVE_TOOLS_SCOPE]));
+    let encoded = serde_json::to_string(&details).unwrap();
+    assert!(!encoded.contains("access-alice") && !encoded.contains("refresh-alice"));
+}
+
+#[tokio::test]
+async fn incremental_scope_downgrade_preserves_the_old_sealed_credential() {
+    let f = Fixture::new();
+    f.connect().await;
+    let start = flow::start_with_meetings(&f.home, &f.db, &f.alice.id, "meeting-login", "http://127.0.0.1:18889", &[], true, true).await.unwrap();
+    let before = std::fs::read(vault::path(&f.home)).unwrap();
+    let state = start["state"].as_str().unwrap();
+    pending::receive_code(&f.home, state, "meeting-downgrade").unwrap();
+    assert!(flow::finish(&f.home, &f.db, &f.alice.id, "meeting-login", state).await.is_err());
+    assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(), before);
+}
+
+#[tokio::test]
+async fn incremental_meetings_preserve_explicit_drive_purpose_but_base_reconnect_resets_it() {
+    let f = Fixture::new();
+    f.connect().await;
+    let start = flow::start_drive_tools(&f.home, &f.db, &f.alice.id, "login", "http://127.0.0.1:18889", &[], true).await.unwrap();
+    let state = start["state"].as_str().unwrap();
+    pending::receive_code(&f.home, state, "drive-alice").unwrap();
+    flow::finish(&f.home, &f.db, &f.alice.id, "login", state).await.unwrap();
+    let start = flow::start_with_meetings(&f.home, &f.db, &f.alice.id, "login", "http://127.0.0.1:18889", &[], true, true).await.unwrap();
+    let state = start["state"].as_str().unwrap();
+    pending::receive_code(&f.home, state, "meeting-extra-drive").unwrap();
+    flow::finish(&f.home, &f.db, &f.alice.id, "login", state).await.unwrap();
+    let record = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+    assert!(scopes::permitted_for("drive_read", &record.metadata));
+    meeting_access::check_metadata(&f.home, &f.db, &f.alice.id, &record.metadata).unwrap();
+    let start = flow::start(&f.home, &f.db, &f.alice.id, "login", "http://127.0.0.1:18889", &[], true).await.unwrap();
+    let state = start["state"].as_str().unwrap();
+    pending::receive_code(&f.home, state, "meeting-extra-drive").unwrap();
+    flow::finish(&f.home, &f.db, &f.alice.id, "login", state).await.unwrap();
+    let record = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+    assert_eq!(record.metadata.local_purposes, ["base"]);
+    assert!(!scopes::permitted_for("drive_read", &record.metadata));
+    assert!(meeting_access::check_metadata(&f.home, &f.db, &f.alice.id, &record.metadata).is_err());
+}
+
+#[tokio::test]
+async fn status_is_metadata_only_and_token_broker_denies_legacy_and_meeting_only_grants() {
+    use crate::google_identity::route::{self, GoogleTokenRouteState};
+    for purposes in [vec![], vec!["meeting_recordings".to_string()]] {
+        let f = Fixture::new();
+        f.connect().await;
+        f.db.set_google_consent(&f.alice.id, "bot", true, &f.alice.id).unwrap();
+        let key = crate::google_identity::protection_gate(&f.home).unwrap();
+        let record = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+        let mut metadata = record.metadata.clone();
+        metadata.local_purposes = purposes.clone();
+        // Broad provider scopes cannot substitute for a local purpose grant.
+        metadata.granted_scopes = crate::google_workspace::REQUIRED_SCOPES.iter().map(|s| s.to_string()).collect();
+        metadata.granted_scopes.extend([meeting_access::DRIVE_SCOPE.into(), meeting_access::MEET_SCOPE.into()]);
+        let secret = vault::Secret {
+            access_token: "must-never-leave-gateway".into(), refresh_token: Some("must-not-refresh".into()),
+            expires_at: Some(0),
+        };
+        let epoch = vault::begin_connection(&f.home, &f.alice.id).unwrap();
+        vault::connect(&f.home, &key, metadata, &secret, epoch).unwrap();
+        let state = GoogleTokenRouteState::new(f.home.clone(), Some(f.db.clone()));
+        let requester = RequesterIdentity::DashboardUser { user_id: f.alice.id.clone() };
+        let before = std::fs::read(vault::path(&f.home)).unwrap();
+        if purposes.is_empty() {
+            let stored: Value = serde_json::from_slice(&before).unwrap();
+            assert!(stored["records"][0].get("local_purposes").is_none(), "exercise legacy missing field");
+        }
+        let probe = crate::google_identity::route_test_probe::Guard::install(&f.home);
+        let value = route::serve(&state, "bot", "google_status", &requester).await.unwrap();
+        assert_eq!(probe.counts(), [0, 0], "status must bypass all token work");
+        drop(probe);
+        assert_eq!(value["mode"], "metadata");
+        assert_eq!(value["status"], "connected");
+        assert_eq!(value["account_email"], "alice@c.test");
+        let expected = if purposes.is_empty() { json!([]) }
+            else { json!([meeting_access::DRIVE_SCOPE, meeting_access::MEET_SCOPE]) };
+        assert_eq!(value["granted_scopes"], expected);
+        assert!(value.get("access_token").is_none());
+        assert!(value.get("refresh_token").is_none());
+        assert!(!value.to_string().contains("must-never-leave-gateway"));
+        assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(), before, "no refresh or status mutation");
+        for tool in scopes::TOKEN_TOOLS.iter().copied().chain(["unknown_google_tool", "meeting_recordings", "Google_status"]) {
+            let error = route::serve(&state, "bot", tool, &requester).await.unwrap_err();
+            assert_eq!(error.code, "scope_missing", "{tool} must refuse before unseal/refresh");
+        }
+        let audit = std::fs::read_to_string(f.home.join("tool_calls.jsonl")).unwrap();
+        assert!(audit.contains("metadata_only") && audit.contains("unknown_google_tool"));
+        assert!(!audit.contains("must-never-leave-gateway") && !audit.contains("must-not-refresh"));
+        let people = crate::google_identity::requester_gate::UserDbPeople(f.db.clone());
+        let error = crate::google_identity::resolve::resolve_person_for_tool(
+            &f.home, "bot", &requester, &people, "google_status",
+        ).await.unwrap_err();
+        assert_eq!(error.code, "scope_missing", "a direct token resolver must also refuse status");
+        // An unreadable ciphertext still permits metadata status, proving the
+        // successful path does not depend on unsealing the credential.
+        let mut stored: Value = serde_json::from_slice(&before).unwrap();
+        stored["records"][0]["secret"] = json!("pk:v1:invalid-ciphertext");
+        std::fs::write(vault::path(&f.home), serde_json::to_vec(&stored).unwrap()).unwrap();
+        assert!(route::serve(&state, "bot", "google_status", &requester).await.is_ok());
+        f.db.set_google_consent(&f.alice.id, "bot", false, &f.alice.id).unwrap();
+        assert!(route::serve(&state, "bot", "google_status", &requester).await.is_err());
+    }
+}
+
+#[test]
+fn token_allowlist_excludes_status_and_unknown_tools() {
+    assert!(!scopes::token_tool("google_status"));
+    assert!(!scopes::permitted("google_status", &[]));
+    assert!(!scopes::token_tool("arbitrary_tool"));
 }

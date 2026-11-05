@@ -438,7 +438,6 @@ Admin 在「使用者 → 雙因素登入管理」查看註冊狀態與通道驗
 
 呼叫端連線會在註冊／停用的成功回應取得新權杖，並在一般送出檢查前完成身分交接；HTTP 註冊也在註冊交易提交前簽發權杖。發版驗收仍須完成真實瀏覽器／WebSocket 驗證，包括跨過心跳後復原碼仍可見，以及另一工作階段失效；行程內 handler 與前端單元測試不能代表這些驗收通過。
 
-
 ## 第三方 MCP 環境變數憑證
 
 第三方 MCP 金鑰會移出員工的設定檔。`.mcp.json` 只保留 `secret://mcp/<server>/<ENV_NAME>` 參照，實際值使用既有 `.keyfile` 加密，存於 `<home>/secrets/mcp/<agent_id>.enc`。第三方伺服器的所有 `env` 項目都存入憑證庫，例外只有 `PATH`、`HOME`、`NODE_ENV`、`LOG_LEVEL` 與既有 `secret://` 參照。DuDuClaw 自身的伺服器項目與其中的 `DUDUCLAW_*` 變數維持不變。
@@ -457,3 +456,25 @@ Read 防護會拒絕讀取 `<home>/secrets`。這不是對 Bash 的隔離：員�
 `computer_login` 只接受標籤。Gateway 用已驗證的員工身分比對非空的 `allowed_agents` 清單，再執行該工具獨立的工具與 session 閘門。Gateway 先透過既有導覽檢查開啟保存的登入網址。秘密只透過 stdin 送入容器 helper，不放在命令列參數或模型結果。Helper 填寫前須符合確切來源與登入路徑；只有送出第一步後到達、且有可見密碼欄位的第二步才能使用 `allowed_paths`。填寫前、同步 input/change 事件後及 submit 事件後都要求有效提交方式為 POST；原生 `requestSubmit` 與備援路徑都會檢查實際選用送出按鈕的 `formmethod`。網路層也會拒絕查詢參數解碼後的值等於完整帳號或密碼的非 POST 請求。CDP Fetch 會中止每個來源不符的請求與轉址，登入期間也會略過 service worker。解除攔截前，helper 會追蹤 `Network.requestWillBeSent`、`Network.loadingFinished` 與 `Network.loadingFailed`，確認請求已結束。最多等待 3 秒，且須連續兩次命令往返都沒有新請求活動或待完成請求。若無法確認完成，回傳 `failed_uncleared`，在 Fetch 攔截仍啟用時呼叫 `Browser.close`，再由 Gateway 移除 session 與容器。執行期間暫停截圖；若無法確認欄位已清除，Gateway 會停止並移除 session 與容器，要求重新啟動 session。
 
 這項保護無法阻止同來源 JavaScript 讀取已填入的欄位，也不提供對同一 OS 使用者程序的檔案隔離，更不取代網路白名單。登入僅限保存的 HTTPS 來源與允許的登入路徑，localhost 也必須使用 HTTPS。雙因素驗證與驗證碼須由人員透過既有接手流程處理。須重建電腦操作映像以安裝 `duduclaw-fill-login`。結果定義與設定方式見[瀏覽器自動化](08-browser-automation.md)。
+
+## 個人 Drive 錄影匯入
+
+Enterprise 會議頁只接受已登入控制台的本人，使用自己的個人 Google 連線，在明確選檔並確認後匯入。員工 MCP 權杖與公開上傳連結不能呼叫這個入口，也沒有新增瀏覽 Drive 或匯入的 MCP 工具。接收員工仍須通過既有上傳的即時授權、工具、核准、資料外送及隱私檢查；需要額外核准的政策仍會拒絕控制台匯入。
+
+Drive／Meet 採增量授權：本人啟用錄影存取時，才要求 `https://www.googleapis.com/auth/drive.file` 與 `https://www.googleapis.com/auth/meetings.space.readonly`；一般初次連線不要求 Drive／Meet 權限。既有較廣的授權會保留至撤銷為止；另外的「啟用員工的 Drive 工具」同意步驟可為既有員工工具與 Google 遠端 MCP 加上 `https://www.googleapis.com/auth/drive.readonly`，仍保留員工使用同意與角色檢查，錄影匯入不需要這個較廣選項。尚未分享給應用程式的檔案由 Google Picker 選取；`drive.file` 本身也允許寫入選取的檔案，但匯入只執行 GET。瀏覽器另外取得短期且僅含 `drive.file` 的 Picker 權杖，不合併先前的範圍、不持久化；gateway 憑證留在受保護的個人憑證庫。
+
+Gateway 驗證檔案 ID，即使連線已有較廣的舊授權，仍要求 Drive 回傳 `isAppAuthorized=true`。這個 Google 旗標可能來自先前授權，不能證明當次 Picker 點擊；匯入另須持有下述綁定使用者、員工與檔案的確認收據。請求使用固定的官方 Google API 位址，拒絕轉址。中繼資料回應有大小上限，媒體沿用既有分段上傳儲存及檔案大小、暫存配額、長度限制。傳輸期間及建立工作前會重查連線本人、實際授權範圍與本機權限；斷線或偵測到撤銷後停止後續存取。本機來源紀錄將上傳連到選取者、Google 帳號、Drive 檔案 ID 與版本；稽核使用雜湊識別，不保存權杖、檔案內容與敏感名稱。
+
+Gateway 分別保存基本服務、會議錄影與員工 Drive 工具的本機用途同意，並綁定封存憑證及其授權紀錄。每項能力都必須同時符合 Google 實際範圍與本機用途同意；會議授權額外回傳 `drive.readonly` 或 `drive`，也不會啟用員工 Drive 工具。增量授權保留先前用途，但必須完整保留舊有 Google 範圍，保存時也會比對原憑證版本；缺少範圍或憑證已被其他操作更新，就拒絕取代舊憑證。沒有本機用途同意的舊紀錄須重新連結。重新連結基本服務會將本機用途重設為基本服務，之後須另行開啟會議錄影與員工 Drive 工具。
+
+每次匯入都需要伺服器簽發的確認收據。它證明經 JWT 驗證的控制台使用者，在最近五分鐘內明確登記並確認將這個確切的 Drive 檔案 ID 交給這位接收員工；員工／MCP 權杖不能登記收據。收據限用一次，綁定該使用者、員工與檔案 ID；同一使用者對同一員工的新確認會取代上一張收據。控制台只在使用者確認匯入時登記檔案。缺少、過期、已用過或綁定不符的收據會遭拒。進入匯入程序後，即使後續檢查失敗也會用掉收據，重試須重新確認。伺服器另以該使用者的 Google 連線檢查 Drive 中繼資料，要求 `isAppAuthorized=true`。收據與這個 Google 旗標都不能證明曾在 Google Picker 點擊；控制台呼叫者可用已知 ID 明確確認先前已授權給應用程式的檔案。
+
+僅供控制台使用的 `POST /api/meeting-drive/selection` 必須提供 `agent_id`、`file_id` 與 `confirm: true`，回傳 `selection_receipt` 及 `expires_in`。每位使用者每分鐘最多登記請求 20 次，最多保留八張未過期收據；`POST /api/meeting-drive/import` 必須附上該收據。
+
+`google_status` 只讀取帳號、狀態與依本機用途篩選的範圍中繼資料，不解封憑證、不更新權杖，也不回傳 bearer。Token 端點使用明確的工具允許清單，個人憑證須同時符合對應本機用途與 Google 範圍；狀態查詢與未知工具不能取得 bearer。
+
+本機 Drive 來源紀錄含選取帳號、Google 信箱、檔案 ID 與版本。取消、失敗及上傳過期時，來源紀錄會與對應狀態變更在同一資料庫交易內刪除。其餘來源紀錄（含成功匯入）自 `imported_at` 起保留 30 天，期限到後由 gateway 執行期間每 60 秒的既有清理程序刪除；停機後於下一輪清理執行。逐字稿檔案與稽核日誌有各自的保存規則，不會隨這項來源中繼資料清理一併刪除。
+
+`user.google_connect` 稽核記錄授權用途、回傳範圍集合的雜湊摘要及非預期範圍；Drive／Meet 清單讀取與早期拒絕也會記錄。這些事件不保存權杖與檔案內容，匯入識別碼使用雜湊。
+
+已匯入副本及完成的逐字稿與 Google 連線分開，不會因斷線自動撤回。Google 端撤銷透過 API 拒絕或更新後的權限資訊偵測，不是即時推播。這是產品入口授權，不是對與 gateway 同 OS 使用者、且不受限制的程序提供隔離。真實 OAuth／Picker 與供應商處理仍須另行驗收。詳見[會議逐字稿](73-meeting-transcripts.md)及[個人連線設定](../../guides/zh-TW/google-personal-connections.md)。

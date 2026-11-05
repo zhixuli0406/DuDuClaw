@@ -6,6 +6,8 @@ import { api, type CallableAgent } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
 import { meetingApi, uploadMeeting, type MeetingJob } from '@/lib/meeting/api';
 import { prepareMeetingAudio } from '@/lib/meeting/audio';
+import { MeetingDrivePicker } from '@/components/meeting/MeetingDrivePicker';
+import { useSystemStore } from '@/stores/system-store';
 
 export function MeetingTranscriptsPage() {
   const intl = useIntl();
@@ -21,13 +23,15 @@ export function MeetingTranscriptsPage() {
   const [path, setPath] = useState<'audio' | 'original' | null>(null);
   const [progress, setProgress] = useState(0);
   const [revision, setRevision] = useState(0);
+  const [driveBusy, setDriveBusy] = useState(false);
+  const isPersonal = useSystemStore(s => s.status?.edition_profile) === 'personal';
   const controller = useRef<AbortController | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
-  const active = phase !== 'idle';
+  const active = phase !== 'idle' || (!isPersonal && driveBusy);
   const showError = (e: unknown) => setError(e instanceof Error ? (e.message.startsWith('meeting.') ? t(e.message) : e.message) : t('meeting.requestFailed'));
   useEffect(() => {
     let alive = true;
-    setAgents([]); setAgent(''); setJobs([]);
+    setAgents([]); setAgent(''); setJobs([]); setDriveBusy(false);
     api.agents.callable().then(result => {
       if (!alive) return;
       const allowed = result.agents.filter(item => user?.role === 'admin' || (item.via === 'binding' && item.selectable && (item.level === 'operator' || item.level === 'owner') && item.role !== 'main' && item.name !== result.default_agent));
@@ -88,15 +92,16 @@ export function MeetingTranscriptsPage() {
         <p className="text-xs leading-5 text-muted-foreground">{t('meeting.limit', { size: (maxBytes / 1024 ** 3).toFixed(1) })}</p>
         {path && <p role="status" className="text-sm text-muted-foreground">{t(`meeting.path.${path}`)}</p>}
       </div>
-      {active && <div className="space-y-2" aria-live="polite">
+      {phase !== 'idle' && <div className="space-y-2" aria-live="polite">
         <p className="text-sm">{t(phase === 'preparing' ? 'meeting.preparingAudio' : 'meeting.uploadProgress', { progress: Math.round(progress * 100) })}</p>
         {phase === 'uploading' && <progress aria-label={t('meeting.uploadProgressLabel')} value={progress} max={1} className="h-2 w-full accent-primary" />}
       </div>}
       <div className="flex flex-wrap items-center gap-3">
         <Button size="lg" disabled={!agent || !file || active} onClick={() => void submit()}>{t('meeting.start')}</Button>
-        {active && <Button variant="ghost" onClick={() => controller.current?.abort()}>{t('meeting.pauseUpload')}</Button>}
+        {phase !== 'idle' && <Button variant="ghost" onClick={() => controller.current?.abort()}>{t('meeting.pauseUpload')}</Button>}
         <span className="text-xs text-muted-foreground">{t('meeting.resumeHint')}</span>
       </div>
+      {!isPersonal && user && <MeetingDrivePicker key={`${user.id}:${agent}`} agent={agent} agentName={agents.find(item => item.name === agent)?.display_name || agent} disabled={phase !== 'idle'} onBusy={setDriveBusy} onImported={() => setRevision(value => value + 1)} />}
     </section>
     <section aria-labelledby="meeting-jobs-title" className="space-y-3">
       <div className="flex items-center justify-between gap-3">

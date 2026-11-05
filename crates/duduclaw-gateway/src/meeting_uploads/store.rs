@@ -5,6 +5,8 @@ use serde_json::{Value,json};
 pub const CHUNK_SIZE:u64=8*1024*1024;
 pub const CHUNK_RESERVE:u64=64*1024;
 const IDLE_SECONDS:i64=2*3600;
+// Maximum lifetime of successful import provenance, measured from acquisition.
+const DRIVE_SOURCE_RETENTION_SECONDS:i64=30*24*3600;
 pub const NOT_FOUND:&str="找不到這次上傳，可能已過期。";
 const IO:&str="無法讀取上傳進度，請稍後再試。";
 #[derive(Clone)]
@@ -33,6 +35,7 @@ impl Store {
         let now=chrono::Utc::now().timestamp();
         // Expiration releases reservations in this same admission transaction.
         tx.execute("UPDATE meeting_uploads SET reserved=0 WHERE expires<=?1 AND job_id IS NULL",[now]).map_err(|_|IO)?;
+        tx.execute("DELETE FROM meeting_drive_sources WHERE upload_id IN (SELECT id FROM meeting_uploads WHERE expires<=?1 AND job_id IS NULL)",[now]).map_err(|_|IO)?;
         let reserved=size.checked_add(CHUNK_RESERVE).ok_or("檔案過大。")?;
         for (column,value) in [("owner",owner),("agent",agent)] {
             let (count,bytes):(u64,u64)=tx.query_row(&format!("SELECT COUNT(*),COALESCE(SUM(reserved),0) FROM meeting_uploads WHERE {column}=?1 AND expires>?2 AND state IN ('uploading','completing')"),params![value,now],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|IO)?;
@@ -49,6 +52,13 @@ impl Store {
         if uuid::Uuid::parse_str(id).is_err(){return Err(NOT_FOUND.into());}
         let c=self.0.lock().map_err(|_|IO)?;
         c.query_row("SELECT id,agent,owner,size,expires,state,extension,job_id FROM meeting_uploads WHERE id=?1 AND owner=?2 AND expires>?3 AND state IN ('uploading','completing','done')",params![id,owner,chrono::Utc::now().timestamp()],|r|Ok(Upload{id:r.get(0)?,agent:r.get(1)?,owner:r.get(2)?,size:r.get(3)?,expires:r.get(4)?,state:r.get(5)?,extension:r.get(6)?,job_id:r.get(7)?})).optional().map_err(|_|IO)?.ok_or_else(||NOT_FOUND.into())
+    }
+    pub(super) fn record_drive_source(&self,id:&str,owner:&str,account:&str,file:&str,version:&str)->Result<(),String>{
+        let c=self.0.lock().map_err(|_|IO)?;
+        let changed=c.execute("INSERT INTO meeting_drive_sources(upload_id,owner,google_account,drive_file_id,drive_version,imported_at)
+            SELECT id,owner,?3,?4,?5,?6 FROM meeting_uploads WHERE id=?1 AND owner=?2 AND state='uploading' AND job_id IS NULL",
+            params![id,owner,account,file,version,chrono::Utc::now().timestamp()]).map_err(|_|IO)?;
+        if changed!=1{return Err(IO.into());}Ok(())
     }
     pub fn received(&self,id:&str)->Result<Vec<u64>,String>{
         let c=self.0.lock().map_err(|_|IO)?;
@@ -87,6 +97,14 @@ impl Store {
     }
     pub fn expired(&self)->Result<Vec<Upload>,String>{
         let c=self.0.lock().map_err(|_|IO)?;
+        let now=chrono::Utc::now().timestamp();
+        // Runs at startup and in the existing minute sweep. Also repairs rows
+        // left by older versions, including removed uploads or terminal jobs.
+        c.execute("DELETE FROM meeting_drive_sources WHERE imported_at<=?1
+            OR NOT EXISTS (SELECT 1 FROM meeting_uploads u WHERE u.id=meeting_drive_sources.upload_id)
+            OR upload_id IN (SELECT u.id FROM meeting_uploads u LEFT JOIN meeting_jobs j ON j.id=u.job_id
+                WHERE u.state IN ('expired','expired_cleaned') OR j.state IN ('failed','cancelled'))",
+            [now-DRIVE_SOURCE_RETENTION_SECONDS]).map_err(|_|IO)?;
         let mut q=c.prepare("SELECT id,agent,owner,size,expires,state,extension,job_id FROM meeting_uploads WHERE expires<=?1 AND state NOT IN ('done','expired_cleaned')").map_err(|_|IO)?;
         let rows=q.query_map([chrono::Utc::now().timestamp()],|r|Ok(Upload{id:r.get(0)?,agent:r.get(1)?,owner:r.get(2)?,size:r.get(3)?,expires:r.get(4)?,state:r.get(5)?,extension:r.get(6)?,job_id:r.get(7)?})).map_err(|_|IO)?;
         rows.collect::<Result<Vec<_>,_>>().map_err(|_|IO.into())
@@ -99,6 +117,7 @@ impl Store {
         let tx=c.transaction().map_err(|_|IO)?;
         tx.execute("UPDATE meeting_uploads SET state='expired',reserved=0,expires=0 WHERE id=?1 AND job_id IS NULL",[id]).map_err(|_|IO)?;
         tx.execute("DELETE FROM meeting_upload_chunks WHERE upload_id=?1",[id]).map_err(|_|IO)?;
+        tx.execute("DELETE FROM meeting_drive_sources WHERE upload_id=?1 AND EXISTS (SELECT 1 FROM meeting_uploads WHERE id=?1 AND job_id IS NULL)",[id]).map_err(|_|IO)?;
         tx.commit().map_err(|_|IO.into())
     }
 }
@@ -126,10 +145,47 @@ impl Store {
     #[test]fn expired_rows_release_quota_inside_admission_transaction(){
         let (_h,s)=setup();let quota=4*CHUNK_RESERVE;
         let old=s.create("alice","one",1,quota).unwrap();
+        s.record_drive_source(&old.id,"one","person@example.test","file","1").unwrap();
         s.0.lock().unwrap().execute("UPDATE meeting_uploads SET expires=0 WHERE id=?1",[&old.id]).unwrap();
         assert!(s.create("alice","one",1,quota).is_ok());
         let reserved:u64=s.0.lock().unwrap().query_row("SELECT reserved FROM meeting_uploads WHERE id=?1",[&old.id],|r|r.get(0)).unwrap();
         assert_eq!(reserved,0);
+        assert_eq!(source_count(&s),0);
+    }
+    fn source_count(s:&Store)->u64{
+        s.0.lock().unwrap().query_row("SELECT COUNT(*) FROM meeting_drive_sources",[],|r|r.get(0)).unwrap()
+    }
+    #[test]fn cancellation_failure_and_expiry_delete_source_in_the_state_transaction(){
+        let (_h,s)=setup();
+        let u=s.create("alice","one",1,1024*1024).unwrap();
+        s.record_drive_source(&u.id,"one","person@example.test","file","1").unwrap();
+        s.record_chunk(&u.id,0,"hash",None).unwrap();
+        // Simulate a failed provenance deletion: neither state nor chunks may
+        // commit separately from the private source cleanup.
+        s.0.lock().unwrap().execute_batch("CREATE TRIGGER deny_source_delete BEFORE DELETE ON meeting_drive_sources BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        assert!(s.expire(&u.id).is_err());
+        assert_eq!(s.get(&u.id,"one").unwrap().state,"uploading");
+        assert_eq!(s.received(&u.id).unwrap(),vec![0]);
+        assert_eq!(source_count(&s),1);
+        s.0.lock().unwrap().execute_batch("DROP TRIGGER deny_source_delete;").unwrap();
+        s.expire(&u.id).unwrap();
+        assert!(s.get(&u.id,"one").is_err());
+        assert!(s.received(&u.id).unwrap().is_empty());
+        assert_eq!(source_count(&s),0);
+    }
+    #[test]fn successful_source_retention_expires_at_thirty_days_from_import(){
+        let (_h,s)=setup();
+        let old=s.create("alice","one",1,1024*1024).unwrap();
+        let recent=s.create("bob","two",1,1024*1024).unwrap();
+        for u in [&old,&recent]{
+            s.record_drive_source(&u.id,&u.owner,"person@example.test","file","1").unwrap();
+            s.0.lock().unwrap().execute("UPDATE meeting_uploads SET state='done',job_id='completed-job' WHERE id=?1",[&u.id]).unwrap();
+        }
+        s.0.lock().unwrap().execute("UPDATE meeting_drive_sources SET imported_at=?2 WHERE upload_id=?1",params![old.id,chrono::Utc::now().timestamp()-DRIVE_SOURCE_RETENTION_SECONDS]).unwrap();
+        s.expired().unwrap();
+        assert_eq!(source_count(&s),1);
+        let remaining:String=s.0.lock().unwrap().query_row("SELECT upload_id FROM meeting_drive_sources",[],|r|r.get(0)).unwrap();
+        assert_eq!(remaining,recent.id);
     }
     #[test]fn idle_expiry_refreshes_only_after_a_verified_chunk(){
         let (_h,s)=setup();let u=s.create("alice","one",1,1024*1024).unwrap();
