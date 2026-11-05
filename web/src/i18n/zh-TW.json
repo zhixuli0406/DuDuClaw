@@ -1568,6 +1568,7 @@
   "license.customerId": "客戶 ID",
   "license.subscriptionId": "訂閱 ID",
   "license.lastPhoneHome": "上次回報",
+  "license.identity.instance": "雲端／容器識別",
   "license.fingerprintMatch": "機器綁定",
   "license.fingerprintMatch.yes": "✓ 與目前機器相符",
   "license.fingerprintMatch.no": "✗ 與目前機器不符",

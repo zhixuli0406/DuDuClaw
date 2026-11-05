@@ -48,6 +48,9 @@ impl MethodHandler {
         if duduclaw_license::fingerprint_hardware_unavailable() {
             return WsFrame::error_response("", "無法讀取此 Mac 的硬體識別，已停止產生新授權指紋。請重新啟動服務後再試。");
         }
+        if duduclaw_license::fingerprint_is_hostname_only() {
+            return WsFrame::error_response("", "無法取得有效的本機識別，已停止產生新授權指紋。");
+        }
         let strong = crate::license_runtime::strong_fingerprint();
         let effective = crate::license_runtime::cached_fingerprint();
         WsFrame::ok_response(
@@ -56,6 +59,7 @@ impl MethodHandler {
                 "fingerprint": strong,
                 "effective": effective,
                 "legacy_binding": effective != strong,
+                "fingerprint_strength": crate::license_runtime::cached_candidates().first().map(|c| c.strength()),
             }),
         )
     }
@@ -103,6 +107,7 @@ impl MethodHandler {
                 last_phone_home: None,
                 days_since_phone_home: None,
                 fingerprint_match: None,
+                fingerprint_strength: crate::license_runtime::cached_candidates().first().map(|c| c.strength()),
                 max_agents: None,
                 nfr: false,
             },

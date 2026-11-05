@@ -2,7 +2,8 @@
 //!
 //! macOS uses a versioned UUID-only fingerprint; other platforms retain
 //! hostname + MAC. Globally-administered unicast MACs remain hardware binding
-//! evidence; unusable MACs are weak migration candidates only.
+//! evidence; instance-unique local MACs support cloud/container bindings, while
+//! shared or invalid MACs are weak migration candidates only.
 //!
 //! ## What changed in v1.66.1
 //!
@@ -29,9 +30,9 @@
 //!   read via `ioreg` — which an ordinary process *can* read. Other platforms
 //!   are untouched.
 //! - [`select_primary_mac`] filters the MAC enumeration on every platform, so a
-//!   placeholder / all-zero / multicast / locally-administered address never
+//!   placeholder / all-zero / multicast address never
 //!   becomes the selected identity. Real globally-administered unicast MACs
-//!   remain hardware binding evidence for existing paid licenses.
+//!   remain preferred over locally-administered instance identities.
 //! - [`fingerprint_candidates`] reproduces the values older builds computed on
 //!   this machine, retaining their strength classification. Weak historical
 //!   matches are isolated until the account holder approves a re-bind.
@@ -60,10 +61,13 @@ const LEGACY_ABSENT_MAC: &str = "00:00:00:00:00:00";
 /// values even in the impossible case that the two sources agreed.
 const UUID_IDENTITY_PREFIX: &str = "ioplatformuuid:";
 
-/// Hardware evidence behind a locally generated fingerprint candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Locally observed identity evidence behind a locally generated fingerprint candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FingerprintStrength {
     Hardware,
+    /// Locally-administered unicast MAC, excluding known shared placeholders.
+    Instance,
     Weak,
 }
 
@@ -175,16 +179,10 @@ fn is_uuid_identity(identity: &str) -> bool {
 }
 
 fn identity_strength(identity: &str) -> FingerprintStrength {
-    // Keep real globally-administered unicast MACs as hardware evidence.
-    // Reuse selection's filter so historical placeholders, multicast and
-    // locally-administered MACs cannot bypass it through legacy candidates.
-    let usable_mac = identity.parse::<mac_address::MacAddress>()
-        .is_ok_and(|mac| is_usable_mac(&mac.bytes()));
-    if is_uuid_identity(identity) || usable_mac {
-        FingerprintStrength::Hardware
-    } else {
-        FingerprintStrength::Weak
-    }
+    if is_uuid_identity(identity) { return FingerprintStrength::Hardware; }
+    identity.parse::<mac_address::MacAddress>()
+        .map(|mac| mac_strength(&mac.bytes()))
+        .unwrap_or(FingerprintStrength::Weak)
 }
 
 /// macOS failed to read its UUID after bounded retries. Do not treat a MAC
@@ -202,18 +200,24 @@ fn has_hardware_uuid(identity: &Identity) -> bool {
 /// binding as the request identity. A proposal takes effect only after the
 /// account holder approves the re-bind in the console; a fingerprint is not
 /// proof of account ownership.
-/// Never propose a MAC when the macOS UUID probe failed. Other platforms and
-/// deliberately unbound OEM licenses retain their existing wire identity.
+/// Never propose a Weak candidate or a MAC when the macOS UUID probe failed.
+/// Other platforms keep accepted bindings; unbound OEM licenses stay unbound.
 pub fn refresh_fingerprint(installed: &str) -> crate::Result<String> {
     refresh_fingerprint_for(installed, cfg!(target_os = "macos"),
-        fingerprint_hardware_unavailable(), || generate_fingerprint())
+        fingerprint_hardware_unavailable(), &fingerprint_candidates())
 }
 
 fn refresh_fingerprint_for(installed: &str, macos: bool, unavailable: bool,
-    strong: impl FnOnce() -> String) -> crate::Result<String> {
-    if installed.is_empty() || !macos { return Ok(installed.to_string()); }
-    if unavailable { return Err(crate::LicenseError::HardwareIdentityUnavailable); }
-    Ok(strong())
+    candidates: &[FingerprintCandidate]) -> crate::Result<String> {
+    if installed.is_empty() { return Ok(String::new()); }
+    if macos && unavailable { return Err(crate::LicenseError::HardwareIdentityUnavailable); }
+    // Keep an existing non-macOS binding, including accepted legacy Instance
+    // candidates. A weak or foreign binding needs the preferred valid identity.
+    let candidate = (!macos).then(|| candidates.iter().find(|c|
+        c.fingerprint() == installed && c.strength() != FingerprintStrength::Weak)).flatten()
+        .or_else(|| candidates.iter().find(|c| c.strength() != FingerprintStrength::Weak))
+        .ok_or(crate::LicenseError::WeakFingerprint)?;
+    Ok(candidate.fingerprint.clone())
 }
 
 /// `true` when neither a platform UUID nor a usable MAC address could be read,
@@ -253,8 +257,8 @@ fn push_unique(out: &mut Vec<String>, value: String) {
 struct Identity {
     /// Identity strings, strongest first, deduplicated. Never empty.
     candidates: Vec<String>,
-    /// `true` when `candidates[0]` has a platform UUID or a usable MAC rather
-    /// than a placeholder fallback. This is not a binding-strength decision.
+    /// `true` when `candidates[0]` has a platform UUID or a usable Hardware or
+    /// Instance MAC rather than a placeholder fallback.
     hardware_bound: bool,
 }
 
@@ -431,35 +435,29 @@ fn platform_uuid_source() -> Option<String> {
 
 // ── Hardware identity: MAC addresses ──────────────────────────
 
-/// Pick the first *usable* MAC address out of an interface enumeration.
-///
-/// A MAC is unusable when it carries no identifying information:
-///
-/// - all-zero (`00:00:00:00:00:00`) — the "no address" placeholder;
-/// - `02:00:00:00:00:00` — the placeholder macOS hands to non-entitled
-///   processes, identical on every machine running that OS;
-/// - multicast (low bit of the first octet set) — never a real interface
-///   identity, and some virtual adapters expose one.
-/// - locally-administered (bit 0x02 of the first octet set) — software-settable.
-///
-/// Returns `None` when every candidate is unusable, so the caller can decide
-/// how to degrade rather than silently adopting a shared constant.
+/// Prefer the first Hardware MAC, then the first Instance MAC. Shared,
+/// all-zero, broadcast and multicast values never become the primary identity.
 pub fn select_primary_mac(candidates: impl IntoIterator<Item = [u8; 6]>) -> Option<[u8; 6]> {
-    candidates.into_iter().find(is_usable_mac)
+    let mut instance = None;
+    for mac in candidates {
+        match mac_strength(&mac) {
+            FingerprintStrength::Hardware => return Some(mac),
+            FingerprintStrength::Instance => { instance.get_or_insert(mac); }
+            FingerprintStrength::Weak => {}
+        }
+    }
+    instance
+}
+
+fn mac_strength(mac: &[u8; 6]) -> FingerprintStrength {
+    if mac.iter().all(|b| *b == 0) || *mac == PLACEHOLDER_MAC || mac[0] & 0x01 != 0 {
+        return FingerprintStrength::Weak;
+    }
+    if mac[0] & 0x02 != 0 { FingerprintStrength::Instance } else { FingerprintStrength::Hardware }
 }
 
 fn is_usable_mac(mac: &[u8; 6]) -> bool {
-    if mac.iter().all(|b| *b == 0) {
-        return false;
-    }
-    if *mac == PLACEHOLDER_MAC {
-        return false;
-    }
-    // Reject both multicast and locally-administered addresses.
-    if mac[0] & 0x03 != 0 {
-        return false;
-    }
-    true
+    mac_strength(mac) != FingerprintStrength::Weak
 }
 
 /// Render a MAC exactly as `mac_address::MacAddress`'s `Display` does.
@@ -578,8 +576,7 @@ mod tests {
     #[test]
     fn absent_mac_and_unusable_first_candidates_are_weak() {
         for legacy in [None, Some(LEGACY_ABSENT_MAC), Some("02:00:00:00:00:00"),
-            Some("FF:FF:FF:FF:FF:FF"), Some("01:00:5E:00:00:01"),
-            Some("02:11:22:33:44:55")]
+            Some("FF:FF:FF:FF:FF:FF"), Some("01:00:5E:00:00:01")]
         {
             let identity = Identity {
                 candidates: build_identity_candidates(None, None, legacy.map(str::to_string)),
@@ -597,7 +594,7 @@ mod tests {
     #[test]
     fn weak_macs_cannot_bind_on_another_host() {
         for mac in [LEGACY_ABSENT_MAC, "02:00:00:00:00:00",
-            "FF:FF:FF:FF:FF:FF", "01:00:5E:00:00:01", "02:11:22:33:44:55"] {
+            "FF:FF:FF:FF:FF:FF", "01:00:5E:00:00:01"] {
             let owner = Identity {
                 candidates: build_identity_candidates(
                     Some("ioplatformuuid:11111111-2222-3333-4444-555555555555".into()),
@@ -631,6 +628,46 @@ mod tests {
                     assert_eq!(matched.strength, FingerprintStrength::Weak);
                     assert!(matches!(license.validate_any(candidates, 7, 14),
                         Err(crate::LicenseError::WeakFingerprint)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cloud_macs_validate_paid_bindings_and_preserve_legacy_candidates() {
+        for hostname in ["linux-cloud", "WINDOWS-VM"] {
+            for mac in ["42:01:0A:80:00:02", "02:11:22:33:44:55",
+                "06:11:22:33:44:55", "0A:11:22:33:44:55", "02:42:AC:11:00:02"]
+            {
+                let bytes = mac.parse::<mac_address::MacAddress>().unwrap().bytes();
+                assert_eq!(select_primary_mac([bytes]), Some(bytes));
+                // A newly selected instance identity keeps the old hash byte-for-byte.
+                let identity = Identity {
+                    candidates: build_identity_candidates(None, Some(mac.into()), Some(mac.into())),
+                    hardware_bound: true,
+                };
+                let candidates = build_fingerprint_candidates(hostname, &identity);
+                assert_eq!(candidates[0].strength(), FingerprintStrength::Instance);
+                let fingerprint = compute_fingerprint(&format!("{hostname}::{mac}"));
+                assert_eq!(candidates[0].fingerprint(), fingerprint);
+                // A later hardware NIC must not invalidate the historical instance binding.
+                let upgraded = Identity {
+                    candidates: build_identity_candidates(None, Some("D0:11:E5:DB:58:67".into()), Some(mac.into())),
+                    hardware_bound: true,
+                };
+                let upgraded = build_fingerprint_candidates(hostname, &upgraded);
+                assert_eq!(upgraded[0].strength(), FingerprintStrength::Hardware);
+                assert_eq!(upgraded[1].strength(), FingerprintStrength::Instance);
+                assert_eq!(upgraded[2].strength(), FingerprintStrength::Weak);
+                for tier in [crate::LicenseTier::Hobby, crate::LicenseTier::Solo,
+                    crate::LicenseTier::Studio, crate::LicenseTier::Business,
+                    crate::LicenseTier::Partner, crate::LicenseTier::PersonalProSelfHost,
+                    crate::LicenseTier::SelfHostPro, crate::LicenseTier::Oem]
+                {
+                    let license = crate::License::new("sub", "customer", tier,
+                        &fingerprint, chrono::Duration::days(30), "test");
+                    assert!(!license.validate_any(&candidates, 7, 14).unwrap().legacy);
+                    assert!(license.validate_any(&upgraded, 7, 14).unwrap().legacy);
                 }
             }
         }
@@ -671,18 +708,31 @@ mod tests {
         assert_eq!(identity_strength(&identity.candidates[0]), FingerprintStrength::Hardware);
         assert!(!has_hardware_uuid(&identity));
         assert!(matches!(refresh_fingerprint_for("installed", true,
-            !has_hardware_uuid(&identity), || panic!("no MAC proposal")),
+            !has_hardware_uuid(&identity), &build_fingerprint_candidates("host", &identity)),
             Err(crate::LicenseError::HardwareIdentityUnavailable)));
         assert!(has_hardware_uuid(&sample_identity(true)));
     }
 
     #[test]
-    fn refresh_only_proposes_macos_uuid_and_preserves_unbound_and_other_platforms() {
-        assert_eq!(refresh_fingerprint_for("old", true, false, || "new".into()).unwrap(), "new");
-        assert!(matches!(refresh_fingerprint_for("old", true, true, || panic!("no MAC fallback")),
+    fn refresh_proposes_only_valid_candidates_and_preserves_unbound() {
+        let hardware = FingerprintCandidate::for_test("hardware", FingerprintStrength::Hardware);
+        let instance = FingerprintCandidate::for_test("instance", FingerprintStrength::Instance);
+        let weak = FingerprintCandidate::for_test("weak", FingerprintStrength::Weak);
+        for candidates in [vec![instance.clone(), weak.clone()], vec![hardware.clone(), instance.clone(), weak.clone()]] {
+            for installed in ["old", "weak"] {
+                let proposed = refresh_fingerprint_for(installed, false, false, &candidates).unwrap();
+                assert_eq!(proposed, candidates[0].fingerprint());
+            }
+            assert_eq!(refresh_fingerprint_for("instance", false, false, &candidates).unwrap(), "instance");
+        }
+        assert_eq!(refresh_fingerprint_for("old", true, false, &[hardware]).unwrap(), "hardware");
+        assert!(matches!(refresh_fingerprint_for("old", true, true, &[instance]),
             Err(crate::LicenseError::HardwareIdentityUnavailable)));
-        assert_eq!(refresh_fingerprint_for("old", false, false, || panic!("no change")).unwrap(), "old");
-        assert_eq!(refresh_fingerprint_for("", true, true, || panic!("unbound")).unwrap(), "");
+        assert!(matches!(refresh_fingerprint_for("weak", false, false, &[weak]),
+            Err(crate::LicenseError::WeakFingerprint)));
+        assert!(matches!(refresh_fingerprint_for("old", false, false, &[]),
+            Err(crate::LicenseError::WeakFingerprint)));
+        assert_eq!(refresh_fingerprint_for("", true, true, &[]).unwrap(), "");
     }
 
     #[test]
@@ -790,14 +840,24 @@ mod tests {
     }
 
     #[test]
-    fn select_primary_mac_rejects_locally_administered_addresses() {
+    fn select_primary_mac_classifies_local_unicast_and_prefers_hardware() {
         for first in (0u8..=255).filter(|first| first & 0x02 != 0) {
             let local = [first, 0x11, 0x22, 0x33, 0x44, 0x55];
-            assert_eq!(select_primary_mac([local]), None);
-            assert_eq!(identity_strength(&format_mac(&local)), FingerprintStrength::Weak);
+            let unicast = first & 0x01 == 0;
+            assert_eq!(select_primary_mac([local]), unicast.then_some(local));
+            assert_eq!(identity_strength(&format_mac(&local)),
+                if unicast { FingerprintStrength::Instance } else { FingerprintStrength::Weak });
             let global = [0xd0, 0x11, 0xe5, 0xdb, 0x58, 0x67];
             assert_eq!(select_primary_mac([local, global]), Some(global));
         }
+    }
+
+    #[test]
+    fn select_primary_mac_keeps_first_instance_when_no_hardware_exists() {
+        let gcp = [0x42, 0x01, 0x0a, 0x80, 0x00, 0x02];
+        let docker = [0x02, 0x42, 0xac, 0x11, 0x00, 0x02];
+        assert_eq!(select_primary_mac([PLACEHOLDER_MAC, gcp, docker]), Some(gcp));
+        assert_eq!(select_primary_mac([docker, gcp, PLACEHOLDER_MAC]), Some(docker));
     }
 
     #[test]

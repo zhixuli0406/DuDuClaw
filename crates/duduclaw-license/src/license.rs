@@ -219,8 +219,8 @@ impl License {
     /// current (strong) fingerprint and the rest reproduce what older DuDuClaw
     /// builds computed on the same machine — see
     /// [`crate::fingerprint::fingerprint_candidates`]. A license bound to a
-    /// legacy hardware value keeps working (`legacy = true`). A match backed
-    /// only by a weak identity (such as a placeholder, absent, locally-administered
+    /// legacy Hardware or Instance value keeps working (`legacy = true`). A match backed
+    /// only by a weak identity (such as a placeholder, absent, broadcast
     /// or multicast MAC) returns `WeakFingerprint`: callers
     /// must isolate it as OpenSource until an account-approved re-bind.
     ///

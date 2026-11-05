@@ -599,6 +599,8 @@ pub struct LicenseSnapshot {
     pub last_phone_home: Option<chrono::DateTime<Utc>>,
     pub days_since_phone_home: Option<i64>,
     pub fingerprint_match: Option<bool>,
+    /// Informational identity class, independent of paid-tier validation warnings.
+    pub fingerprint_strength: Option<duduclaw_license::FingerprintStrength>,
     /// P-License: the active license's signed per-license agent-count quota, if
     /// any. `None` = no override → the tier default applies. Surfaced so the
     /// enforcement path can detect an explicit issuer-set limit (`is_some()`)
@@ -639,6 +641,9 @@ impl LicenseSnapshot {
             last_phone_home: license.map(|l| l.last_phone_home),
             days_since_phone_home: license.map(|l| l.days_since_phone_home()),
             fingerprint_match: license.map(|l| l.is_valid_for_machine(&current_fp)),
+            fingerprint_strength: cached_candidates().iter()
+                .find(|c| c.fingerprint() == current_fp)
+                .map(|c| c.strength()),
             max_agents: license.and_then(|l| l.max_agents),
             nfr: license.is_some_and(|l| l.nfr),
         }

@@ -1569,6 +1569,7 @@
   "license.customerId": "Customer ID",
   "license.subscriptionId": "Subscription ID",
   "license.lastPhoneHome": "Last phone-home",
+  "license.identity.instance": "cloud/container identity",
   "license.fingerprintMatch": "Machine binding",
   "license.fingerprintMatch.yes": "✓ Matches this machine",
   "license.fingerprintMatch.no": "✗ Bound to a different machine",

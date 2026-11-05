@@ -107,7 +107,7 @@ API 用戶端的 MRTR 輸入須符合 host 宣告的能力，不會自動代替�
 
 ## 授權綁定與更新
 
-所有 MAC 候選都視為 Weak，僅供遷移辨識，包含全球管理的 MAC：主機名稱與 MAC 都能在另一台機器重現。MAC 第一個位元組的 `0x02` 位元為 1 時，也不納入主要 MAC 選擇。只靠 MAC 證據，即使與已簽章授權相符，也不啟用綁定機器的付費功能；目前 Linux／Windows 的 hostname + MAC 路徑同樣受影響，須等到支援強身分的核准遷移可用前，都維持 OpenSource。舊 UUID 綁定與刻意不綁機器的 OEM 保留既有規則。換綁需要帳號持有人在控制台核准；待核准回應不替換授權。
+MAC 衍生識別分為三種強度。**Hardware** 是全球管理的單播 MAC。**Instance** 是非已知共用占位值的本機管理單播 MAC，包含 GCP、AWS 與 Docker 網卡；狀態顯示「雲端／容器識別」。兩者都可驗證既有付費綁定，也可用於新啟用與經核准的換綁。主要 MAC 優先選 Hardware，其次 Instance。**Weak** 包含未取得或全零 MAC、共用 `02:00:00:00:00:00`、廣播 `FF:FF:FF:FF:FF:FF`、多播 MAC 與占位 UUID；即使相符，仍維持 OpenSource 直到核准換綁，也不會用於新綁定提案。Linux／Windows 保留舊版 hostname + MAC 雜湊，歷史 Instance 候選仍可驗證（非主要候選時 `legacy = true`）。作業系統管理員仍能複製這些識別；Instance 表示本機取得的識別證據，不代表硬體證明。macOS UUID v2 指紋與 UUID 讀取失敗時的限制維持不變。
 
 為相容既有格式，授權簽章仍不涵蓋 `control_url`，因此它只是未受信任的端點提示。Gateway／CLI 的 refresh、換綁、status、CRL、經銷商品牌與公告請求，送出前都須經共用傳輸層檢查：僅限 HTTPS、443 埠、不得包含使用者資訊／query／fragment，主機名稱必須完整符合固定清單 `api.duduclaw.dudustudio.monster`。自訂簽發端須在客戶端本機明確設定環境變數 `DUDUCLAW_CONTROL_URL=https://issuer.example.com`；只在授權檔內放自訂網址不會獲得允許。此設定只允許該 origin，不放寬 HTTPS、埠、IP literal、localhost 或 DNS 限制。所有 DNS 回傳位址都必須是公開位址，連線固定使用已檢查的結果；停用重新導向與自動代理。驗證失敗不送出授權請求。Owner gateway 在同一個 SQLite `BEGIN IMMEDIATE` 交易內讀取授權狀態並簽署授權與第 2 版回應：撤銷先提交就回 revoked，簽署先取得鎖則撤銷須等待簽署交易完成；交易提交後的網路送達時間不在此保證範圍。
 
