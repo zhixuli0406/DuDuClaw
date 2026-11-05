@@ -4,6 +4,7 @@ Requires=duduclaw-egress.socket
 After=duduclaw-egress.socket
 
 [Service]
+Slice=duduclaw-tcb.slice
 ExecStart=/opt/duduclaw/bin/duduclaw-egress
 User=duduclaw-egress
 Group=duduclaw-egress

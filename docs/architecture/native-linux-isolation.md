@@ -2306,3 +2306,77 @@ Reference syscall semantics:
 [dmsetup(8)](https://man7.org/linux/man-pages/man8/dmsetup.8.html),
 [Linux 5.15 loop UAPI](https://raw.githubusercontent.com/torvalds/linux/v5.15/include/uapi/linux/loop.h),
 [ext4 resize ioctl](https://raw.githubusercontent.com/torvalds/linux/v5.15/fs/ext4/ioctl.c).
+
+## Linux root acceptance record (2026-11-05)
+
+Disposable GCP VMs (asia-east1-b, c2d-standard-4), test binaries built on a
+separate Ubuntu 22.04 builder and copied to identical paths. Every `iso_root_`
+test ran as root, one process per test, `--test-threads=1`. This record covers
+the package-level root tests only; it is not a protected-mode, migration,
+live-provider or release acceptance.
+
+| VM | Kernel | systemd | Landlock ABI | Final result |
+| --- | --- | --- | --- | --- |
+| Ubuntu 22.04 | 5.15.0-1120-gcp (design target) | 249.11 | 1 | 66/66 pass |
+| Ubuntu 22.04 | 6.8.0-1070-gcp (GCP image default, HWE) | 249.11 | 4 | 66/66 pass |
+| Ubuntu 24.04 | 6.8.0-1071-gcp (design target) | 255.4 | 4 | 66/66 pass |
+| Ubuntu 24.04 | 7.0.0-1014-gcp (GCP image default) | 255.4 | 8 | 50/66; all 16 B2 refused with `UnsupportedKernel` |
+| Debian 12 | 6.1.0-54-cloud-amd64 | 252.39 | 2 | 66/66 pass |
+
+Per package: B1 spawnd 13, B2 run 16, C egress 8, E parse worker 7, F updated 11,
+H storage 11 root tests. C ran with a public operator-controlled TCP echo
+fixture and both `example.com` and the CNAME name `www.github.com`.
+
+Defects found by the root runs and fixed in this round:
+
+- B1: account checks required `/usr/bin/userdbctl`, which no stock image ships
+  (Ubuntu 22.04 has no package for it). spawnd now queries the userdb Varlink
+  sockets directly, keeps provider attribution, refuses reserved uid/gid/name or
+  alias claims from non-NSS providers (enumeration plus named and numeric
+  lookups), and fails closed when no provider was completely enumerated.
+- B1: on systemd 249 a second reference to the same unit from one D-Bus
+  connection (AddRef at start, RefUnit during inspection), released while the unit
+  was inactive, left PID 1 busy-looping and unresponsive to every D-Bus call until
+  a reset. spawnd now holds at most one reference per unit per connection.
+- B1: cleanup treated a cgroup removed before `inactive` as an error; it now
+  retries and accepts absence only after an inactive readback.
+- B1/C/F/gateway: `resources_ready` requires the gateway, spawnd, updated and
+  egress units in `duduclaw-tcb.slice`; only spawnd had it. The egress and
+  updated units and the generated gateway unit now set the slice.
+- E: `TemporaryFileSystem=/` is overridden by `ProtectSystem=strict`, which
+  `DynamicUser=yes` implies, so the worker saw the whole host root including
+  `/etc/shadow`. The unit now uses an empty `RootDirectory` plus a read-only
+  skeleton; `/tmp` and `/var/tmp` are the same bounded tmpfs (PrivateTmp's
+  host-disk `/var/tmp` bind is replaced). `/sys` remains a read-only sysfs
+  that systemd forces. The installer must create `/usr/lib/duduclaw/parse-root`
+  and `/usr/lib/duduclaw/parse-root-tree` (see the crate README).
+- F: the execveat fixture ran from `/run`, which Debian mounts `noexec`
+  (test-only change; production staging is under `/opt/duduclaw-isolated`).
+- H: LOOP_CONFIGURE kept the operation's flocked file description, so every
+  later operation on an attached image returned Busy; detach did not wait for
+  asynchronous AUTOCLEAR; online grow (and in-image discards) punch holes in the
+  backing file, after which the image was refused as UnsafeBacking. The loop now
+  gets its own identity-checked description, detach waits up to 3 s, and root
+  re-allocates a sparse image after grow and on re-attach with capacity admission.
+  Holes punched while mounted can still release host blocks until re-attach.
+- C: the DNS broker refused NODATA reached through a CNAME (for example
+  `www.github.com` AAAA), making IPv4-only aliased names unresolvable. A
+  consistent alias chain with NOERROR, TC clear and a covering SOA is now an empty
+  result for that family; both families empty still fails.
+- Caller build: `duduclaw-inference` stopped being `Send` after the backend
+  child migration (`LlamafileManager` now uses a tokio Mutex), and `duduclaw-cli`
+  needed `recursion_limit = "512"`. Gateway and CLI with tests then type-check on
+  Linux.
+
+Design limitation confirmed, not changed: B2 refuses Landlock ABIs above 7
+(`UnsupportedKernel` from the readiness probe). The current GCP Ubuntu 24.04
+image boots kernel 7.0 with ABI 8, so every B2 launch test fails there with that
+readiness error. Accepting newer ABIs needs an owner decision.
+
+Daybreak security review of these fixes: three rounds; the reported MEDIUM and
+LOW findings in the userdb client were fixed and the final pass reported no
+finding. Not covered by any root test yet: live SSH/su/cron/at login attempts
+against employee accounts, spawnd-to-B2 end-to-end launch through a real
+transient unit, D8 queued admission across two runs, resource exhaustion (fork
+bomb, PTY/fd exhaustion, unbounded output), btrfs/LVM-thin/dm-crypt backing
+refusal, A/B update power-cut, migration (G) and MCP boundary (D).

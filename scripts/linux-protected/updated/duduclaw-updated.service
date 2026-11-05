@@ -7,6 +7,7 @@ StartLimitIntervalSec=60
 StartLimitBurst=3
 
 [Service]
+Slice=duduclaw-tcb.slice
 Type=simple
 User=root
 Group=root

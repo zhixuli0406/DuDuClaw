@@ -155,29 +155,9 @@ impl InstallationEvidence for MissingInstallationEvidence {
     fn ssh_public_key_and_forwarding_denied(&self, _: &str) -> io::Result<()> { Err(denied()) }
 }
 
-/// systemd versions expose either a record array or a stream of JSON records.
-/// Both are parsed structurally; empty output and mixed/scalar shapes fail closed.
-pub fn parse_userdb_records(text: &str, id_key: &str, name_key: &str) -> io::Result<Vec<(u32, String)>> {
-    let mut documents = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
-    let first = documents.next().ok_or_else(denied)?.map_err(|_| denied())?;
-    let values = match first {
-        serde_json::Value::Array(values) => {
-            if documents.next().is_some() { return Err(denied()); }
-            values
-        }
-        serde_json::Value::Object(_) => {
-            let mut values = vec![first];
-            for value in documents { values.push(value.map_err(|_| denied())?); }
-            values
-        }
-        _ => return Err(denied()),
-    };
-    values.into_iter().map(|value| {
-        let id = value.get(id_key).and_then(|id| id.as_u64()).ok_or_else(denied)?.try_into().map_err(|_| denied())?;
-        let name = value.get(name_key).and_then(|name| name.as_str()).filter(|name| !name.is_empty()).ok_or_else(denied)?;
-        Ok((id, name.to_owned()))
-    }).collect()
-}
+#[cfg(any(target_os = "linux", test))]
+#[path = "accounts_userdb.rs"]
+mod userdb;
 
 /// All four credential IDs matter: a different effective uid does not make a
 /// process with the employee's saved uid safe to ignore.
@@ -232,8 +212,7 @@ mod linux {
     use std::{fs::{self, File, OpenOptions}, io::{Read, Write}, os::{fd::OwnedFd, unix::{fs::OpenOptionsExt, net::UnixStream}},
         path::Path, process::{Command, Stdio}, time::{Duration, Instant}};
 
-    const MAX_HOST_BYTES: u64 = 8 * 1024 * 1024;
-    const COMMAND_SECONDS: u64 = 5;
+    use super::userdb::{MAX_HOST_BYTES, COMMAND_SECONDS};
     const SSH_DROPIN: &str = "DenyUsers duduclaw-emp-* duduclaw duduclaw-runsup duduclaw-egress duduclaw-dl\nMatch User duduclaw-emp-*\n    DisableForwarding yes\n    PermitTTY no\nMatch all\n";
 
     fn host_text(path: &Path) -> io::Result<String> {
@@ -318,7 +297,8 @@ mod linux {
             let local = partial_identity(account, &parse_passwd(&host_text(Path::new("/etc/passwd"))?)?,
                 &parse_group(&host_text(Path::new("/etc/group"))?)?)?;
             if nss != local { return Err(denied()); }
-            for records in self.userdb_identities()? {
+            let ranges = [registry.range, UidRange { first: account.uid, last: account.uid }];
+            for records in self.userdb_identities(&ranges, &[(account.uid, account.gid)])? {
                 let name = account_name(account.uid);
                 let mut matched = false;
                 for (id, actual) in records {
@@ -379,23 +359,23 @@ mod linux {
             self.install_login_barriers(&name)
         }
 
-        fn userdb_identities(&self) -> io::Result<Vec<Vec<(u32, String)>>> {
+        fn userdb_identities(&self, ranges: &[UidRange], employees: &[(u32, u32)]) -> io::Result<Vec<Vec<(u32, String)>>> {
             match fs::symlink_metadata("/run/systemd/userdb") {
                 Ok(_) => root_path(Path::new("/run/systemd/userdb"), true)?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
                 Err(error) => return Err(error),
             }
-            let mut records = Vec::new();
-            // systemd's JSON user/group records are authoritative in addition to NSS.
-            for (verb, id_key, name_key) in [("user", "uid", "userName"), ("group", "gid", "groupName")] {
-                let text = success("/usr/bin/userdbctl", &["--no-pager", "--json=short", verb])?;
-                records.push(parse_userdb_records(&text, id_key, name_key)?);
-            }
-            Ok(records)
+            let users = parse_passwd(&host_text(Path::new("/etc/passwd"))?)?;
+            let groups = parse_group(&host_text(Path::new("/etc/group"))?)?;
+            let shadow = host_text(Path::new("/etc/shadow"))?;
+            userdb::identities(Path::new("/run/systemd/userdb"), &userdb::LocalIdentity {
+                ranges, users: &users, groups: &groups, shadow: &shadow,
+            }, employees)
         }
 
         fn userdb(&self, registry: &Registry) -> io::Result<()> {
-            for values in self.userdb_identities()? {
+            for values in self.userdb_identities(&[registry.range],
+                &registry.employees.iter().map(|entry| (entry.uid, entry.gid)).collect::<Vec<_>>())? {
                 let mut seen = std::collections::BTreeSet::new();
                 for (id, name) in values {
                     if id >= registry.range.first && id <= registry.range.last
@@ -703,16 +683,6 @@ mod tests {
         let occupied_name = parse_passwd("duduclaw-emp-70000:x:1234:1234::/:/bin/sh\n").unwrap();
         assert!(partial_identity(&account, &occupied_name, &group).is_err());
         assert!(partial_identity(&account, &[], &parse_group("duduclaw-emp-70000:x:70000:foreign\n").unwrap()).is_err());
-    }
-    #[test]
-    fn userdb_arrays_and_record_streams_are_structurally_checked() {
-        for text in [r#"[{"uid":70000,"userName":"employee"}]"#, r#"{"uid":70000,"userName":"employee"}"#] {
-            assert_eq!(parse_userdb_records(text, "uid", "userName").unwrap(), vec![(70000, "employee".into())]);
-        }
-        assert_eq!(parse_userdb_records("{\"uid\":1,\"userName\":\"a\"}\n{\"uid\":2,\"userName\":\"b\"}", "uid", "userName").unwrap().len(), 2);
-        for text in ["", "null", "[] {}", "[null]", "{\"uid\":-1,\"userName\":\"a\"}", "{\"uid\":1}"] {
-            assert!(parse_userdb_records(text, "uid", "userName").is_err());
-        }
     }
     #[test]
     fn process_identity_and_cgroup_require_exact_components() {

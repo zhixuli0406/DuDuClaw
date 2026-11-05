@@ -333,11 +333,23 @@ mod tests {
         root.remove_artifact_directory("pending-generation").unwrap();
     }
     #[test]
-    #[ignore = "Requires root Linux execveat; executes a copied trusted /usr/bin/true only"]
+    #[ignore = "Requires root Linux execveat and exec-capable /root; executes a copied trusted /usr/bin/true only"]
     fn iso_root_same_verified_fd_exec_survives_path_replacement() {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
-        let temp = tempfile::Builder::new().prefix("updated-fd-").tempdir_in("/run").unwrap();
+        assert_eq!(nix::unistd::geteuid().as_raw(), 0, "requires root");
+        // /run may be noexec (Debian 12). Use a trusted parent that also passes
+        // Directory::open's ancestor checks; sticky /var/tmp does not qualify.
+        let parent = Directory::open(Path::new("/root")).expect("requires a root-owned, non-writable /root");
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: the directory fd is live and the successful call initializes
+        // the output before assume_init reads it.
+        assert_eq!(unsafe { libc::fstatvfs(parent.raw_fd(), stat.as_mut_ptr()) }, 0,
+            "cannot check /root mount flags: {}", std::io::Error::last_os_error());
+        let stat = unsafe { stat.assume_init() };
+        assert_eq!(stat.f_flag & libc::ST_NOEXEC, 0,
+            "execveat fixture requires an exec-capable /root filesystem (ST_NOEXEC is set)");
+        let temp = tempfile::Builder::new().prefix("updated-fd-").tempdir_in("/root").unwrap();
         let dir = Directory::open(temp.path()).unwrap();
         let mut source = File::open("/usr/bin/true").unwrap();
         let mut copied = dir.create("verified").unwrap();

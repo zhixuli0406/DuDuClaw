@@ -4,7 +4,7 @@ use super::*;
 fn service_protected_unit_has_fixed_root_launcher_and_hardening() {
     let unit = unit_text();
     let lines: Vec<_> = unit.lines().collect();
-    for required in ["Type=simple", "ExecStart=/usr/local/libexec/duduclaw/protected-launcher /opt/duduclaw/bin/duduclaw run --yes",
+    for required in ["Slice=duduclaw-tcb.slice", "Type=simple", "ExecStart=/usr/local/libexec/duduclaw/protected-launcher /opt/duduclaw/bin/duduclaw run --yes",
         "KillMode=control-group", "Restart=on-failure", "ProtectSystem=strict",
         "ReadWritePaths=/var/lib/duduclaw /var/lib/duduclaw-protected", "ProtectHome=yes", "PrivateTmp=yes", "UMask=0077",
         "PrivateDevices=yes", "ProtectKernelTunables=yes", "ProtectKernelModules=yes",

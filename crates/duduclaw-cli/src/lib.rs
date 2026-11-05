@@ -1,3 +1,5 @@
+// ExecutionBackend async futures need a deeper Send proof than the default recursion limit.
+#![recursion_limit = "512"]
 #![allow(clippy::empty_line_after_doc_comments)]
 #![allow(clippy::format_in_format_args)]
 #![allow(clippy::ptr_arg)]

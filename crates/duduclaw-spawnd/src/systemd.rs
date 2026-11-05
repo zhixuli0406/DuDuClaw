@@ -132,6 +132,51 @@ pub fn cgroup_empty(events: &str) -> io::Result<bool> {
     populated.map(|value| !value).ok_or_else(invalid)
 }
 
+// A failed D-Bus reply may still have changed PID 1's reference count. Keep
+// that unit quarantined on this connection until disconnect, rather than retry
+// an acquire and risk the systemd 249 duplicate-reference busy loop.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy)]
+enum ReferenceState { Held, Uncertain }
+#[cfg(any(target_os = "linux", test))]
+#[derive(Default)]
+struct UnitReferences { units: BTreeMap<String, ReferenceState> }
+#[cfg(any(target_os = "linux", test))]
+impl UnitReferences {
+    fn acquire(&mut self, name: &str, reuse: bool, operation: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        match self.units.get(name) {
+            Some(ReferenceState::Held) if reuse => return Ok(()),
+            Some(_) => return Err(invalid()),
+            None => {},
+        }
+        self.units.insert(name.into(), ReferenceState::Uncertain);
+        operation()?;
+        self.units.insert(name.into(), ReferenceState::Held);
+        Ok(())
+    }
+    fn release(&mut self, name: &str, operation: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        match self.units.get(name) {
+            None => return Ok(()),
+            Some(ReferenceState::Uncertain) => return Err(invalid()),
+            Some(ReferenceState::Held) => {},
+        }
+        self.units.insert(name.into(), ReferenceState::Uncertain);
+        operation()?;
+        self.units.remove(name);
+        Ok(())
+    }
+}
+#[cfg(any(target_os = "linux", test))]
+fn cleanup_cgroup_empty(events: io::Result<String>, inactive: bool) -> io::Result<bool> {
+    match events {
+        Ok(events) => cgroup_empty(&events),
+        // During deactivation the kernel may remove the cgroup before PID 1
+        // publishes inactive. Retry; absence alone is not cleanup proof.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(inactive),
+        Err(error) => Err(error),
+    }
+}
+
 /// Non-initial devpts instances share this budget; retain ten percent headroom.
 pub fn pty_budget(maximum: &str, reserved: &str) -> io::Result<u32> {
     let parse = |text: &str| -> io::Result<u32> {
@@ -148,7 +193,7 @@ pub fn pty_budget(maximum: &str, reserved: &str) -> io::Result<u32> {
 #[cfg(target_os = "linux")]
 pub mod linux {
     use super::*;
-    use std::{os::fd::BorrowedFd, path::{Component, Path, PathBuf}, time::{Duration, Instant}};
+    use std::{os::fd::BorrowedFd, path::{Component, Path, PathBuf}, sync::Mutex, time::{Duration, Instant}};
     use zbus::{blocking::{connection::Builder, Connection, Proxy}, zvariant::{Fd, OwnedObjectPath, OwnedValue, Value}};
     const BUS: &str = "org.freedesktop.systemd1";
     const MANAGER: &str = "org.freedesktop.systemd1.Manager";
@@ -169,17 +214,31 @@ pub mod linux {
             Property::DeviceAccess(v) => Value::from(v.iter().map(|(path, access)| (path.as_str(), access.as_str())).collect::<Vec<_>>()),
         }
     }
-    pub struct Systemd { connection: Connection }
+    pub struct Systemd { connection: Connection, references: Mutex<UnitReferences> }
     /// A host-only receipt; no cgroup paths or PIDs go back over gateway IPC.
     pub struct StartedUnit { pub name: String, path: OwnedObjectPath, pub cgroup: PathBuf }
     impl Systemd {
         pub fn connect() -> io::Result<Self> {
             let connection = Builder::system().map_err(bus_error)?
                 .method_timeout(Duration::from_secs(5)).build().map_err(bus_error)?;
-            Ok(Self { connection })
+            Ok(Self { connection, references: Mutex::new(UnitReferences::default()) })
         }
         fn manager(&self) -> io::Result<Proxy<'_>> {
             Proxy::new(&self.connection, BUS, "/org/freedesktop/systemd1", MANAGER).map_err(bus_error)
+        }
+        fn start_referenced(&self, name: &str, mut properties: Vec<(&str, Value<'_>)>) -> io::Result<()> {
+            if properties.iter().any(|(key, _)| *key == "AddRef") { return Err(invalid()); }
+            // AddRef is atomic with creation: even an immediately exited unit
+            // survives until readback. All reference RPCs share this lock.
+            properties.push(("AddRef", Value::from(true)));
+            let manager = self.manager()?;
+            let mut references = self.references.lock().map_err(|_| invalid())?;
+            references.acquire(name, false, || {
+                let aux: Vec<(&str, Vec<(&str, Value<'_>)>)> = Vec::new();
+                let _: OwnedObjectPath = manager.call("StartTransientUnit",
+                    &(name, "fail", properties, aux)).map_err(bus_error)?;
+                Ok(())
+            })
         }
         /// Enumerate only exact daemon-generated names, including inactive units.
         /// Callers must reconcile this inventory before admitting a fresh run.
@@ -193,33 +252,31 @@ pub mod linux {
             if runs.len() > 1024 { return Err(invalid()); }
             Ok(runs)
         }
-        /// Recover a receipt after a failed launch or daemon restart. Missing or
-        /// unprovable cgroups deny cleanup; absence is never synthesized as empty.
+        /// Recover a receipt after a failed launch or daemon restart. Missing
+        /// cgroups are only cleanup proof after an inactive readback.
         pub fn inspect_run(&self, run: RunId) -> io::Result<StartedUnit> {
             let name = run_unit(run);
             let manager = self.manager()?;
-            let _: () = manager.call("RefUnit", &(name.as_str(),)).map_err(bus_error)?;
-            let result = (|| {
+            self.references.lock().map_err(|_| invalid())?.acquire(&name, true, || {
+                manager.call::<_, _, ()>("RefUnit", &(name.as_str(),)).map_err(bus_error)
+            })?;
+            // Failed readback is uncertain cleanup, so keep our one reference.
+            (|| {
                 let path: OwnedObjectPath = manager.call("GetUnit", &(name.as_str(),)).map_err(bus_error)?;
                 let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").map_err(bus_error)?;
                 let actual_name: String = unit.get_property("Id").map_err(bus_error)?;
                 if actual_name != name { return Err(invalid()); }
                 let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
                 let path_text: String = service.get_property("ControlGroup").map_err(bus_error)?;
-                let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
-                // Stopped/failed units may have released their cgroup already.
-                // An empty path is never used as a filesystem root in cleanup.
-                let cgroup = if path_text.is_empty() && matches!(state.as_str(), "inactive" | "failed") {
-                    PathBuf::new()
-                } else { checked_cgroup_with_missing(&path_text, matches!(state.as_str(), "inactive" | "failed"))? };
+                // Cgroup removal can precede inactive, including during restart
+                // inspection. Cleanup separately waits for inactive; an empty
+                // path is never used as a filesystem root.
+                let cgroup = if path_text.is_empty() { PathBuf::new() }
+                    else { checked_cgroup_with_missing(&path_text, true)? };
                 drop(service);
                 drop(unit);
                 Ok(StartedUnit { name: name.clone(), path, cgroup })
-            })();
-            if result.is_err() {
-                let _: zbus::Result<()> = manager.call("UnrefUnit", &(name.as_str(),));
-            }
-            result
+            })()
         }
         /// Cancellation remains available even when no launch receipt was returned.
         pub fn kill_run(&self, run: RunId) -> io::Result<()> { self.kill_name(&run_unit(run)) }
@@ -231,17 +288,12 @@ pub mod linux {
             self.ensure_employee_slice(policy)?;
             let mut properties: Vec<(&str, Value<'_>)> = policy.properties.iter()
                 .map(|(key, property)| (*key, value(property))).collect();
-            // Retain before PID 1 starts the job; a short-lived trampoline must
-            // not disappear between StartTransientUnit and RefUnit.
-            properties.push(("AddRef", Value::from(true)));
             properties.push(("ExecStart", Value::from(vec![(TRAMPOLINE, vec![TRAMPOLINE], false)])));
             properties.push(("StandardInputFileDescriptor", Value::from(Fd::from(bootstrap))));
             properties.push(("StandardOutputFileDescriptor", Value::from(Fd::from(stdout))));
             properties.push(("StandardErrorFileDescriptor", Value::from(Fd::from(stderr))));
-            let aux: Vec<(&str, Vec<(&str, Value<'_>)>)> = Vec::new();
+            self.start_referenced(&policy.name, properties)?;
             let manager = self.manager()?;
-            let _: OwnedObjectPath = manager.call("StartTransientUnit",
-                &(policy.name.as_str(), "fail", properties, aux)).map_err(bus_error)?;
             let result = (|| {
                 let path: OwnedObjectPath = manager.call("GetUnit", &(policy.name.as_str(),)).map_err(bus_error)?;
                 let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
@@ -324,8 +376,10 @@ pub mod linux {
         pub fn kill(&self, run: &StartedUnit) -> io::Result<()> { self.kill_name(&run.name) }
         /// Call only after all three cleanup readbacks, including the UID scan.
         pub fn release_reference(&self, run: &StartedUnit) -> io::Result<()> {
-            let _: () = self.manager()?.call("UnrefUnit", &(run.name.as_str(),)).map_err(bus_error)?;
-            Ok(())
+            let manager = self.manager()?;
+            self.references.lock().map_err(|_| invalid())?.release(&run.name, || {
+                manager.call::<_, _, ()>("UnrefUnit", &(run.name.as_str(),)).map_err(bus_error)
+            })
         }
         /// Caller combines this with a fresh root /proc UID scan before admission.
         pub fn cleanup(&self, run: &StartedUnit) -> io::Result<(bool, bool)> {
@@ -341,11 +395,8 @@ pub mod linux {
                 let current: String = service.get_property("ControlGroup").map_err(bus_error)?;
                 return Ok((inactive, inactive && current.is_empty()));
             }
-            let empty = match std::fs::read_to_string(run.cgroup.join("cgroup.events")) {
-                Ok(events) => cgroup_empty(&events)?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound && inactive => true,
-                Err(error) => return Err(error),
-            };
+            let empty = cleanup_cgroup_empty(
+                std::fs::read_to_string(run.cgroup.join("cgroup.events")), inactive)?;
             Ok((inactive, empty))
         }
 
@@ -542,7 +593,7 @@ pub mod linux {
             args: Vec<&'static str>, input: BorrowedFd<'_>, output: BorrowedFd<'_>) {
             assert!(matches!(executable, "/usr/bin/cat" | "/usr/bin/sleep" | "/usr/bin/false"));
             let properties: Vec<(&str, Value<'_>)> = vec![
-                ("AddRef", Value::from(true)), ("Type", Value::from("exec")),
+                ("Type", Value::from("exec")),
                 ("KillMode", Value::from("control-group")),
                 ("RuntimeMaxUSec", Value::from(10_000_000u64)),
                 ("StandardInput", Value::from("null")),
@@ -553,9 +604,7 @@ pub mod linux {
                 ("StandardOutputFileDescriptor", Value::from(Fd::from(output))),
                 ("StandardErrorFileDescriptor", Value::from(Fd::from(output))),
             ];
-            let aux: Vec<(&str, Vec<(&str, Value<'_>)>)> = vec![];
-            let _: OwnedObjectPath = systemd.manager().unwrap().call("StartTransientUnit",
-                &(run_unit(run), "fail", properties, aux)).unwrap();
+            systemd.start_referenced(&run_unit(run), properties).unwrap();
         }
         struct TestRun(RunId);
         impl Drop for TestRun {
@@ -563,8 +612,14 @@ pub mod linux {
                 if let Ok(systemd) = Systemd::connect() {
                     let _ = systemd.kill_run(self.0);
                     if let Ok(run) = systemd.inspect_run(self.0) {
-                        let _ = systemd.cleanup(&run);
-                        let _ = systemd.release_reference(&run);
+                        let until = Instant::now() + Duration::from_secs(5);
+                        while Instant::now() < until {
+                            match systemd.cleanup(&run) {
+                                Ok((true, true)) => { let _ = systemd.release_reference(&run); break; },
+                                Ok(_) => std::thread::sleep(Duration::from_millis(25)),
+                                Err(_) => break,
+                            }
+                        }
                     }
                 }
             }
@@ -595,7 +650,13 @@ pub mod linux {
                 std::thread::sleep(Duration::from_millis(25));
             }
             assert_eq!(bytes, b"b1-fd-delivery\n");
+            // Repeated inspection must reuse this connection's AddRef. On
+            // systemd 249 an extra RefUnit here can wedge PID 1 at release.
+            systemd.inspect_run(cat.0).unwrap();
+            systemd.inspect_run(cat.0).unwrap();
+            assert_eq!(systemd.references.lock().unwrap().units.len(), 1);
             assert_eq!(systemd.reconcile_all().unwrap(), 1);
+            assert!(systemd.references.lock().unwrap().units.is_empty());
             drop(systemd);
             drop(cat);
 
@@ -695,6 +756,50 @@ mod tests {
         for text in ["", "populated 00", "populated 0\npopulated 0", "populated 0 extra"] {
             assert!(cgroup_empty(text).is_err());
         }
+    }
+    #[test]
+    fn references_are_single_per_connection_and_release_is_exact() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let mut references = UnitReferences::default();
+        let acquire = || { calls.set(calls.get() + 1); Ok(()) };
+        references.acquire("run", false, acquire).unwrap();
+        for _ in 0..3 { references.acquire("run", true, acquire).unwrap(); }
+        assert!(references.acquire("run", false, acquire).is_err());
+        assert_eq!(calls.get(), 1);
+        references.release("run", acquire).unwrap();
+        references.release("run", acquire).unwrap();
+        assert_eq!(calls.get(), 2);
+        assert!(references.units.is_empty());
+        // A new connection has no ledger entry and must acquire its own ref.
+        UnitReferences::default().acquire("run", true, acquire).unwrap();
+        assert_eq!(calls.get(), 3);
+    }
+    #[test]
+    fn uncertain_reference_rpc_is_never_retried_on_same_connection() {
+        for failed_acquire in [true, false] {
+            let mut references = UnitReferences::default();
+            if failed_acquire {
+                assert!(references.acquire("run", false, || Err(io::ErrorKind::TimedOut.into())).is_err());
+            } else {
+                references.acquire("run", false, || Ok(())).unwrap();
+                assert!(references.release("run", || Err(io::ErrorKind::TimedOut.into())).is_err());
+            }
+            assert!(references.acquire("run", true, || panic!("duplicate reference")).is_err());
+            assert!(references.acquire("run", false, || panic!("duplicate AddRef")).is_err());
+            assert!(references.release("run", || panic!("uncertain UnrefUnit retry")).is_err());
+            assert_eq!(references.units.len(), 1);
+        }
+    }
+    #[test]
+    fn missing_cgroup_waits_for_inactive_and_other_errors_deny() {
+        for inactive in [false, true] {
+            assert_eq!(cleanup_cgroup_empty(Err(io::ErrorKind::NotFound.into()), inactive).unwrap(), inactive);
+            assert!(cleanup_cgroup_empty(Err(io::ErrorKind::PermissionDenied.into()), inactive).is_err());
+            assert!(cleanup_cgroup_empty(Ok("invalid".into()), inactive).is_err());
+            assert!(!cleanup_cgroup_empty(Ok("populated 1\n".into()), inactive).unwrap());
+        }
+        assert!(cleanup_cgroup_empty(Ok("populated 0\n".into()), true).unwrap());
     }
     #[test]
     fn pty_budget_reserves_host_capacity_and_rounds_down() {

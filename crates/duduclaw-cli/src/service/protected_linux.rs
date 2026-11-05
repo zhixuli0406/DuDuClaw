@@ -71,6 +71,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Slice=duduclaw-tcb.slice
 Type=simple
 ExecStart={LAUNCHER} {BINARY} run --yes
 # Stop every descendant before a fresh key handoff.

@@ -28,6 +28,16 @@ fixture requirements are documented in the implementation note.
 See [implementation notes](../../docs/architecture/native-linux-isolation.md)
 for deployment prerequisites, API seams and unverified acceptance gates.
 
+The dedicated DNS broker sends exactly one A and one AAAA query to its fixed
+upstream over TCP; it never follows aliases with extra queries. Each supplied
+CNAME/DNAME chain must start at the requested name and remain consistent.
+An alias chain without an address of the queried type is accepted as an empty
+family result only for NOERROR with TC clear and a valid IN SOA in AUTHORITY
+whose owner equals or is an ancestor of the final alias target. Alias-only
+answers without that SOA, unrelated SOAs, malformed replies and NXDOMAIN are
+refused. Both families empty still fails; addresses remain subject to the
+existing downstream public-IP policy.
+
 ## License
 
 Apache-2.0, as declared by the workspace.

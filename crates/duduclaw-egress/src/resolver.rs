@@ -334,4 +334,54 @@ mod tests {
         assert_eq!(client.read_u8().await.unwrap_err().kind(),std::io::ErrorKind::UnexpectedEof);
     }
 
+    #[tokio::test]
+    async fn broker_alias_nodata_accepts_one_family_but_not_both_empty() {
+        for populated in [Some(1u16), Some(28), None] {
+            let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let dns = tokio::spawn(async move {
+                for kind in [1, 28] {
+                    let (mut tcp, _) = upstream.accept().await.unwrap();
+                    let length = tcp.read_u16().await.unwrap();
+                    let mut packet = vec![0; length as usize];
+                    tcp.read_exact(&mut packet).await.unwrap();
+                    assert_eq!(packet, dns_wire::query("www.github.com", kind).unwrap());
+                    packet[2] = 0x81; packet[3] = 0x80;
+                    packet[7] = if populated == Some(kind) { 2 } else { 1 };
+                    // www.github.com CNAME github.com, using question-label pointers.
+                    packet.extend_from_slice(&[0xc0,12,0,5,0,1,0,0,0,60,0,2,0xc0,16]);
+                    if populated == Some(kind) {
+                        packet.extend_from_slice(&[0xc0,16]);
+                        packet.extend_from_slice(&kind.to_be_bytes());
+                        packet.extend_from_slice(&[0,1,0,0,0,60]);
+                        let ip = if kind == 1 { vec![8,8,8,8] } else { "2606:4700::1111".parse::<Ipv6Addr>().unwrap().octets().to_vec() };
+                        packet.extend_from_slice(&(ip.len() as u16).to_be_bytes());
+                        packet.extend(ip);
+                    } else {
+                        packet[9] = 1;
+                        packet.extend_from_slice(&[0xc0,16,0,6,0,1,0,0,0,60,0,24,0xc0,16,0xc0,16]);
+                        packet.extend_from_slice(&[0; 20]);
+                    }
+                    tcp.write_u16(packet.len() as u16).await.unwrap();
+                    tcp.write_all(&packet).await.unwrap();
+                }
+            });
+            let (mut client, server) = UnixStream::pair().unwrap();
+            write_json(&mut client, &ResolveRequest { method: RESOLVE_METHOD.into(), parameters: ResolveParameters {
+                name: Text::new("www.github.com".into()).unwrap(), family: 0, flags: RESOLVE_FLAGS,
+            }}).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(2), broker_request(server, address)).await.unwrap();
+            if let Some(kind) = populated {
+                assert_eq!(result, Ok(()));
+                let bytes = read_json(&mut client, MAX_DNS_RESPONSE_BYTES).await.unwrap();
+                let expected = if kind == 1 { "8.8.8.8" } else { "2606:4700::1111" };
+                assert_eq!(decode_response(&bytes).unwrap(), vec![expected.parse::<IpAddr>().unwrap()]);
+            } else {
+                assert_eq!(result, Err(EgressError::Unavailable));
+                assert_eq!(client.read_u8().await.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+            }
+            dns.await.unwrap();
+        }
+    }
+
 }

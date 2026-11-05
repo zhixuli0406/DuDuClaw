@@ -60,7 +60,22 @@ fn await_worker(previous: &[String]) -> (String, u32) {
         for unit in worker_units() {
             if previous.contains(&unit) { continue; }
             if let Ok(pid) = property(&unit, "MainPID").parse::<u32>() {
-                if pid != 0 { return (unit, pid); }
+                if pid == 0 { continue; }
+                let exec_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let exe_path = format!("/proc/{pid}/exe");
+                while std::time::Instant::now() < exec_deadline {
+                    match std::fs::read_link(&exe_path) {
+                        Ok(exe) if exe.file_name() == Some(std::ffi::OsStr::new("duduclaw-parse-worker")) => {
+                            return (unit, pid);
+                        }
+                        Ok(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            panic!("worker process {pid} exited before execing duduclaw-parse-worker: {error}");
+                        }
+                        Err(error) => panic!("cannot inspect {exe_path} while waiting for worker exec: {error}"),
+                    }
+                }
+                panic!("worker process {pid} did not exec duduclaw-parse-worker within 5 seconds");
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -81,6 +96,50 @@ fn await_cleanup(unit: &str, pid: u32, cgroup: &str) {
     panic!("worker unit/cgroup/process did not retire");
 }
 
+// Mount options before " - " describe this mount, unlike the superblock
+// options after it: a read-only bind can have a writable backing superblock.
+fn check_mountinfo(mountinfo: &str) -> Result<(), String> {
+    let mut saw_sys = false;
+    for line in mountinfo.lines() {
+        let (mount, filesystem) = line.split_once(" - ").ok_or_else(|| format!("invalid mountinfo: {line}"))?;
+        let fields: Vec<_> = mount.split_whitespace().collect();
+        let fs_fields: Vec<_> = filesystem.split_whitespace().collect();
+        if fields.len() < 6 || fs_fields.len() < 3 {
+            return Err(format!("invalid mountinfo: {line}"));
+        }
+        let destination = fields[4];
+        let read_only = fields[5].split(',').any(|option| option == "ro");
+        let api_filesystem = matches!(fs_fields[0], "tmpfs" | "proc" | "sysfs" | "devpts"
+            | "mqueue" | "hugetlbfs" | "securityfs" | "cgroup2" | "bpf" | "pstore"
+            | "debugfs" | "tracefs" | "fusectl" | "configfs" | "efivarfs");
+        if !api_filesystem && !read_only {
+            return Err(format!("writable host filesystem: {line}"));
+        }
+        saw_sys |= destination == "/sys";
+        if (destination == "/sys" || destination.starts_with("/sys/")) && !read_only {
+            return Err(format!("writable /sys projection: {line}"));
+        }
+    }
+    if !saw_sys { return Err("missing /sys projection".to_owned()); }
+    Ok(())
+}
+
+#[test]
+fn mountinfo_rejects_writable_disk_and_sys_mounts() {
+    let sys = "1 0 0:1 / /sys ro,nosuid - sysfs sysfs ro\n";
+    // Optional fields, escaped paths and rw superblocks must not confuse the
+    // per-mount read-only check. Unknown filesystem types fail closed.
+    let readonly = "2 1 8:1 / /usr\\040files ro,relatime shared:1 - ext4 /dev/root rw\n";
+    assert!(check_mountinfo(&format!("{sys}{readonly}")).is_ok());
+    for fs in ["ext4", "xfs", "btrfs", "vfat", "overlay", "unknownfs"] {
+        assert!(check_mountinfo(&format!("{sys}2 1 8:1 / /var/tmp rw - {fs} source rw")).is_err());
+    }
+    assert!(check_mountinfo(&sys.replace("/sys ro,", "/sys rw,")).is_err());
+    assert!(check_mountinfo(&format!("{sys}2 1 0:2 / /sys/fs/cgroup rw - cgroup2 cgroup rw")).is_err());
+    assert!(check_mountinfo(&format!("{sys}malformed")).is_err());
+    assert!(check_mountinfo("").is_err());
+}
+
 #[test]
 #[ignore = "requires root, cgroup v2, systemd and installed Package E units/binary"]
 fn iso_root_systemd_identity_namespaces_limits_and_disconnect_cleanup() {
@@ -92,6 +151,8 @@ fn iso_root_systemd_identity_namespaces_limits_and_disconnect_cleanup() {
     let cgroup = property(&unit, "ControlGroup");
     assert!(!cgroup.is_empty());
     assert_eq!(property(&unit, "DynamicUser"), "yes");
+    assert_eq!(property(&unit, "RootDirectory"), "/usr/lib/duduclaw/parse-root");
+    assert_eq!(property(&unit, "ProtectSystem"), "strict");
     assert_eq!(property(&unit, "PrivateNetwork"), "yes");
     assert_eq!(property(&unit, "NoNewPrivileges"), "yes");
     assert_eq!(property(&unit, "MemoryMax"), (512 * 1024 * 1024u64).to_string());
@@ -107,9 +168,61 @@ fn iso_root_systemd_identity_namespaces_limits_and_disconnect_cleanup() {
         assert_ne!(std::fs::read_link(format!("/proc/{pid}/ns/{namespace}")).unwrap(),
             std::fs::read_link(format!("/proc/self/ns/{namespace}")).unwrap());
     }
-    for hidden in ["etc/shadow", "var/lib/duduclaw", "run/dbus/system_bus_socket", "run/docker.sock"] {
-        assert!(!std::path::Path::new(&format!("/proc/{pid}/root/{hidden}")).exists(), "visible {hidden}");
+    let worker_root = std::path::PathBuf::from(format!("/proc/{pid}/root"));
+    for hidden in ["etc", "etc/shadow", "etc/passwd", "home", "root", "var/lib/duduclaw",
+        "run/dbus", "run/dbus/system_bus_socket", "run/docker.sock"] {
+        let error = std::fs::symlink_metadata(worker_root.join(hidden)).expect_err(&format!("visible {hidden}"));
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "cannot inspect {hidden}: {error}");
     }
+    // These must be real, usable mounts; permission errors must not masquerade
+    // as an empty root. /tmp is a bind alias of this instance's bounded tmpfs.
+    assert!(worker_root.join("usr/libexec/duduclaw/duduclaw-parse-worker").is_file());
+    assert!(worker_root.join("proc/self").exists());
+    assert!(worker_root.join("dev/null").exists());
+    // systemd 249 keeps its empty mount-propagation endpoint even in a private
+    // /run. Permit that exact skeleton and only the bounded tmp mountpoint
+    // under /var, never host runtime files or sockets.
+    for (directory, allowed) in [("var", "tmp"), ("run", "systemd"), ("run/systemd", "incoming")] {
+        for entry in std::fs::read_dir(worker_root.join(directory)).unwrap() {
+            let entry = entry.unwrap();
+            assert_eq!(entry.file_name(), std::ffi::OsStr::new(allowed));
+            assert!(entry.file_type().unwrap().is_dir());
+        }
+    }
+    assert_eq!(std::fs::read_dir(worker_root.join("run/systemd/incoming")).unwrap().count(), 0);
+    use std::os::unix::fs::MetadataExt;
+    let scratch = std::fs::metadata(worker_root.join(".tmp")).unwrap();
+    for suffix in ["tmp", "var/tmp"] {
+        let tmp = std::fs::metadata(worker_root.join(suffix)).unwrap();
+        assert_eq!((tmp.dev(), tmp.ino()), (scratch.dev(), scratch.ino()), "different /{suffix}");
+    }
+    let filesystem = |suffix: &str| {
+        let path = std::ffi::CString::new(format!("/proc/{pid}/root/{suffix}")).unwrap();
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: the path is NUL-terminated, the output is writable, and a
+        // successful statvfs initializes the structure before it is read.
+        assert_eq!(unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) }, 0);
+        unsafe { stat.assume_init() }
+    };
+    for suffix in ["", "usr", "run"] {
+        assert_ne!(filesystem(suffix).f_flag & libc::ST_RDONLY, 0, "writable /{suffix}");
+    }
+    for suffix in ["tmp", "var/tmp"] {
+        let stat = filesystem(suffix);
+        assert_eq!(stat.f_blocks as u64 * stat.f_frsize as u64, 8 * 1024 * 1024);
+        assert_eq!(stat.f_files, 1024);
+        let flags = libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC;
+        assert_eq!(stat.f_flag & flags, flags);
+        assert_eq!(stat.f_flag & libc::ST_RDONLY, 0);
+        let path = std::ffi::CString::new(format!("/proc/{pid}/root/{suffix}")).unwrap();
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: the path is NUL-terminated and stat is writable; success
+        // initializes the structure before assume_init reads it.
+        assert_eq!(unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { stat.assume_init() }.f_type, libc::TMPFS_MAGIC);
+    }
+    let mountinfo = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).unwrap();
+    check_mountinfo(&mountinfo).unwrap();
     assert_eq!(std::fs::read_to_string(format!("/sys/fs/cgroup{cgroup}/memory.max")).unwrap().trim(),
         (512 * 1024 * 1024u64).to_string());
     assert_eq!(std::fs::read_to_string(format!("/sys/fs/cgroup{cgroup}/pids.max")).unwrap().trim(), "1");

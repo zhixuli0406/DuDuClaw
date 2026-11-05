@@ -33,12 +33,27 @@ SystemCallArchitectures=native
 # smaller BPF allowlist before parsing (no opens, exec, clone, socket or connect).
 SystemCallFilter=read write close ftruncate pread64 readv writev lseek fstat newfstatat statx openat access faccessat readlink readlinkat mmap mprotect munmap mremap brk madvise futex clock_gettime clock_nanosleep nanosleep rt_sigaction rt_sigprocmask rt_sigreturn sigaltstack getrandom getpid gettid getuid geteuid getgid getegid getresuid getresgid sched_yield restart_syscall sendmsg recvmsg ppoll poll exit exit_group execve arch_prctl set_tid_address set_robust_list rseq prlimit64 setrlimit getrlimit prctl seccomp fcntl fstatfs getsockopt close_range alarm setitimer
 SystemCallErrorNumber=EPERM
-# Hide all persistent application state and host IPC endpoints. Only runtime
-# libraries and the fixed executable are projected into the otherwise empty root.
-TemporaryFileSystem=/:ro
-BindReadOnlyPaths=/usr
-BindReadOnlyPaths=-/lib -/lib64
-TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size=8M,nr_inodes=1024,mode=0700
+# v249 gives ProtectSystem's READONLY / priority over TMPFS /. RootDirectory
+# is the staging mountpoint; the separate skeleton hides the base directories
+# systemd creates there. /var is recreated for /var/tmp. Both roots are root:root 0755.
+RootDirectory=/usr/lib/duduclaw/parse-root
+# ProtectProc/ProcSubset and kernel protections still require private API VFS.
+# Explicit no suppresses v255's automatic host os-release projection into /run.
+MountAPIVFS=no
+BindReadOnlyPaths=/usr/lib/duduclaw/parse-root-tree:/:norbind
+# Nonrecursive projections avoid importing mounts below the host's /usr.
+# Bind sources follow host symlinks, including merged-/usr lib and lib64.
+BindReadOnlyPaths=/usr:/usr:norbind
+BindReadOnlyPaths=-/lib:/lib:norbind -/lib64:/lib64:norbind
+# DynamicUser forces PrivateTmp. Higher-priority binds at both /tmp and
+# /var/tmp replace its host-disk directories with the same bounded tmpfs.
+# Mounts sort by destination: /.tmp exists before the bind sources are resolved
+# through the staging path, before systemd pivots into the new root.
+# Kernel protections force a read-only /sys projection; hide module aliases.
+InaccessiblePaths=-/lib/modules -/lib64/modules
+TemporaryFileSystem=/.tmp:rw,nosuid,nodev,noexec,size=8M,nr_inodes=1024,mode=0700
+BindPaths=/usr/lib/duduclaw/parse-root/.tmp:/tmp:norbind
+BindPaths=/usr/lib/duduclaw/parse-root/.tmp:/var/tmp:norbind
 TemporaryFileSystem=/run:ro
 TemporaryFileSystem=/dev/shm:ro
 MemoryMax=512M

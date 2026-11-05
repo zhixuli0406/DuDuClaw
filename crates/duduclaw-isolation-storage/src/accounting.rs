@@ -21,6 +21,11 @@ impl Capacity {
         }
         Ok(())
     }
+    /// Refill physical blocks already included in the full logical charge.
+    pub fn admit_refill(self, existing: impl IntoIterator<Item = u64>, missing: u64) -> Result<()> {
+        self.admit(existing, 0)?;
+        self.admit([], missing)
+    }
 }
 
 #[cfg(test)]
@@ -54,5 +59,13 @@ mod tests {
     fn startup_and_runtime_keep_reserve_even_without_new_image() {
         let capacity = Capacity { total: 100 * G, available: 20 * G - 1 };
         assert_eq!(capacity.admit([50 * G], 0), Err(Error::Capacity));
+    }
+    #[test]
+    fn refill_checks_free_space_without_double_charging_existing_images() {
+        let capacity = Capacity { total: 100 * G, available: 30 * G };
+        assert_eq!(capacity.admit_refill([80 * G], 10 * G), Ok(()));
+        assert_eq!(capacity.admit_refill([80 * G], 10 * G + 1), Err(Error::Capacity));
+        assert_eq!(capacity.admit_refill([80 * G + 1], 0), Err(Error::Capacity));
+        assert_eq!(capacity.admit_refill([80 * G], u64::MAX), Err(Error::Capacity));
     }
 }

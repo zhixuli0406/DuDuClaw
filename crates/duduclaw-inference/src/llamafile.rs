@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::error::{InferenceError, Result};
@@ -76,7 +76,8 @@ enum ServerState {
 pub struct LlamafileManager {
     config: LlamafileConfig,
     state: RwLock<ServerState>,
-    child: RwLock<Option<duduclaw_core::execution_gate::Child>>,
+    // Backend streams and pending I/O futures are Send, but need not be Sync.
+    child: Mutex<Option<duduclaw_core::execution_gate::Child>>,
     client: reqwest::Client,
     /// L6: serializes `start()` so concurrent callers cannot each spawn a
     /// process through the check-then-set TOCTOU window.
@@ -93,7 +94,7 @@ impl LlamafileManager {
         Self {
             config,
             state: RwLock::new(ServerState::Stopped),
-            child: RwLock::new(None),
+            child: Mutex::new(None),
             client,
             start_lock: tokio::sync::Mutex::new(()),
         }
@@ -202,7 +203,7 @@ impl LlamafileManager {
             InferenceError::GenerationFailed(msg)
         })?;
 
-        *self.child.write().await = Some(child);
+        *self.child.lock().await = Some(child);
 
         // Wait for server to become ready (poll health endpoint)
         let ready = self.wait_for_ready(Duration::from_secs(30)).await;
@@ -220,7 +221,7 @@ impl LlamafileManager {
 
     /// Stop the llamafile server.
     pub async fn stop(&self) {
-        let mut child_guard = self.child.write().await;
+        let mut child_guard = self.child.lock().await;
         if let Some(ref mut child) = *child_guard {
             let _ = child.kill().await;
             let _ = child.wait().await; // Prevent zombie
@@ -275,7 +276,7 @@ impl LlamafileManager {
 
             // Check if process is still alive
             {
-                let mut child_guard = self.child.write().await;
+                let mut child_guard = self.child.lock().await;
                 if let Some(ref mut child) = *child_guard
                     && let Ok(Some(status)) = child.try_wait() {
                         warn!(exit_code = ?status.code(), "llamafile exited prematurely");
@@ -289,6 +290,21 @@ impl LlamafileManager {
                 }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_child_keeps_inference_shareable_across_tasks() {
+        fn assert_send<T: Send>() {}
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send::<duduclaw_core::execution_gate::Child>();
+        assert_send_sync::<LlamafileManager>();
+        assert_send_sync::<crate::engine::InferenceEngine>();
     }
 }
 

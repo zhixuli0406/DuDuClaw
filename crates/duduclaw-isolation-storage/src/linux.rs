@@ -14,6 +14,8 @@ const RESOLVE: ResolveFlags = ResolveFlags::BENEATH.union(ResolveFlags::NO_SYMLI
     .union(ResolveFlags::NO_MAGICLINKS).union(ResolveFlags::NO_XDEV);
 const FILE_MODE: Mode = Mode::from_raw_mode(0o600);
 const DIR_MODE: Mode = Mode::from_raw_mode(0o700);
+const LOOP_RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
+const LOOP_RELEASE_POLL: Duration = Duration::from_millis(20);
 
 // linux/uapi/linux/loop.h. ioctl_read_bad/write_ptr_bad encode legacy ioctl
 // numbers verbatim, unlike _IOR/_IOW. No pointer or process-local fd is persisted.
@@ -164,13 +166,19 @@ impl Storage {
         if number < 0 { return Err(Error::Io); }
         let loop_path = PathBuf::from(format!("/dev/loop{number}"));
         let loop_fd = open_device(&loop_path, true, Some(DeviceId { major: 7, minor: number as u32 }))?;
-        let config = LoopConfig { fd: image.as_raw_fd() as u32, block_size: 4096,
+        // LOOP_CONFIGURE retains the open file description until detach. Giving
+        // it `image` (or a dup/try_clone of it) would retain our operation flock
+        // for that entire lifetime and make every later operation return Busy.
+        // Reopen beneath the trusted dirfd and bind it to the locked inode.
+        let backing = reopen_same_image(&self.root, &format!("{}.img", employee_key(employee)), &image)?;
+        check_regular(&backing, Some(entry.quota.bytes))?;
+        let config = LoopConfig { fd: backing.as_raw_fd() as u32, block_size: 4096,
             info: LoopInfo { flags: AUTO_CLEAR, ..LoopInfo::default() }, reserved: [0; 8] };
         // SAFETY: kernel copies a correctly laid-out initialized loop_config.
         unsafe { loop_configure(loop_fd.as_raw_fd(), &config) }.map_err(|_| Error::Busy)?;
         let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
         if noexec { flags |= MsFlags::MS_NOEXEC; }
-        if mount(Some(&loop_path), &target, Some("ext4"), flags, Some("errors=remount-ro")).is_err() {
+        if mount(Some(&loop_path), &target, Some("ext4"), flags, Some("errors=remount-ro,nodiscard")).is_err() {
             self.quarantine(employee)?;
             return Err(Error::Quarantined); // AUTOCLEAR releases on last close.
         }
@@ -221,9 +229,11 @@ impl Storage {
             self.verify_mount_identity(&image, &mounted)?;
             umount(&target).map_err(|_| Error::Busy)?;
         }
-        // AUTOCLEAR is asynchronous. Active detached mounts keep the device
-        // configured, which is an explicit refusal to release capacity/delete.
-        if mounted_at(&target)?.is_some() || !matching_loops(&image)?.is_empty() { return Err(Error::Busy); }
+        // AUTOCLEAR can lag a successful unmount. Each scan closes its loop
+        // descriptors before sleeping so our observation cannot pin release.
+        // Also wait on retries with no host mount: detached clones may remain.
+        wait_for_release(LOOP_RELEASE_TIMEOUT, || Ok(matching_loops(&image)?.is_empty()))?;
+        if mounted_at(&target)?.is_some() { return Err(Error::Busy); }
         Ok(())
     }
 
@@ -296,6 +306,11 @@ impl Storage {
             unsafe { ext4_resize(dir.as_raw_fd(), &blocks) }.map_err(|_| Error::Io)?;
             rfs::syncfs(&dir).map_err(|_| Error::Io)?;
             checkpoint(ResizeStep::Grown)?;
+            // Online ext4 growth can zero through the loop device, punching
+            // holes even with nodiscard. Keep Resizing and the full charge
+            // until allocation is restored, durable, and verified.
+            restore_allocation(&image, quota.bytes)?;
+            checkpoint(ResizeStep::Reallocated)?;
             let mut grown = entry.clone(); grown.quota = quota;
             let mounted = mounted_at(&target)?.ok_or(Error::RecoveryRequired)?;
             self.verify_mount(&grown, &image, &mounted, true)?;
@@ -306,7 +321,16 @@ impl Storage {
         // Resizing survives process death; errors quarantine the charged target.
         if let Err(error) = result { self.quarantine(employee)?; return Err(error); }
         drop(dir); drop(loop_fd); drop(image);
-        self.detach(employee)?;
+        let finish = (|| {
+            self.detach(employee)?;
+            // Unmount can flush more filesystem writes. Recheck allocation
+            // after AUTOCLEAR as well, before publishing a usable image.
+            let pending = self.state.image(employee)?;
+            let image = self.open_image_identity(pending)?;
+            rfs::flock(&image, FlockOperation::NonBlockingLockExclusive).map_err(|_| Error::Busy)?;
+            restore_allocation(&image, quota.bytes)
+        })();
+        if let Err(error) = finish { self.quarantine(employee)?; return Err(error); }
         self.state.images.iter_mut().find(|image| image.employee == employee).ok_or(Error::NotFound)?.phase = Phase::Ready;
         self.persist()
     }
@@ -336,6 +360,26 @@ impl Storage {
         if image.phase == Phase::Quarantined { return Err(Error::Quarantined); }
         if image.phase != Phase::Ready { return Err(Error::RecoveryRequired); }
         let file = self.open_image_identity(image)?;
+        let missing = allocation_missing(&file, image.quota.bytes)?;
+        if missing != 0 {
+            // Kernel loop zero/discard requests can deallocate host blocks.
+            // Repair only a detached, unchanged image under the operation lock;
+            // never race an employee or a pinned loop still writing to it.
+            rfs::flock(&file, FlockOperation::NonBlockingLockExclusive).map_err(|_| Error::Busy)?;
+            if mounted_at(&self.mount_path(image.employee))?.is_some() || !matching_loops(&file)?.is_empty() {
+                return Err(Error::Busy);
+            }
+            self.healthy()?;
+            if backing_graph(&self.root)? != self.state.backing { return Err(Error::UnsafeBacking); }
+            require_private_mount(&self.path)?;
+            self.capacity()?.admit_refill(self.state.charge(), missing)?;
+            // No new logical charge: this image is already charged in full.
+            // Allocation failures leave it retryable, without exposing a mount.
+            restore_allocation(&file, image.quota.bytes)?;
+            self.capacity()?.admit(self.state.charge(), 0)?;
+            // Callers take their own operation flock; do not return it held.
+            rfs::flock(&file, FlockOperation::Unlock).map_err(|_| Error::Io)?;
+        }
         check_regular(&file, Some(image.quota.bytes))?;
         Ok(file)
     }
@@ -405,6 +449,16 @@ fn open_file(root: &File, name: &str, flags: OFlags) -> Result<File> {
         if flags.contains(OFlags::CREATE) { FILE_MODE } else { Mode::empty() }, RESOLVE).map_err(io_error)?;
     Ok(File::from(fd))
 }
+/// A new open file description, never a duplicate of the operation's locked fd.
+fn reopen_same_image(root: &File, name: &str, locked: &File) -> Result<File> {
+    let file = open_file(root, name, OFlags::RDWR)?;
+    let expected = locked.metadata().map_err(|_| Error::Io)?;
+    let actual = file.metadata().map_err(|_| Error::Io)?;
+    if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+        return Err(Error::RecoveryRequired);
+    }
+    Ok(file)
+}
 fn check_regular(file: &File, size: Option<u64>) -> Result<()> {
     let meta = file.metadata().map_err(|_| Error::Io)?;
     if !meta.is_file() || meta.uid() != 0 || meta.gid() != 0 || meta.nlink() != 1 || meta.mode() & 0o7777 != 0o600 {
@@ -416,6 +470,21 @@ fn check_regular(file: &File, size: Option<u64>) -> Result<()> {
         }
     }
     Ok(())
+}
+fn allocation_missing(file: &File, size: u64) -> Result<u64> {
+    check_regular(file, None)?;
+    let meta = file.metadata().map_err(|_| Error::Io)?;
+    // A changed length is not sparse-file recovery and must never be repaired.
+    if meta.len() != size { return Err(Error::UnsafeBacking); }
+    Ok(size.saturating_sub(meta.blocks().checked_mul(512).ok_or(Error::UnsafeBacking)?))
+}
+fn restore_allocation(file: &File, size: u64) -> Result<()> {
+    allocation_missing(file, size)?;
+    rfs::fallocate(file, FallocateFlags::empty(), 0, size).map_err(|error| {
+        if error == rustix::io::Errno::NOSPC { Error::Capacity } else { Error::UnsafeBacking }
+    })?;
+    file.sync_all().map_err(|_| Error::Io)?;
+    check_regular(file, Some(size))
 }
 fn check_directory(file: &File, private: bool) -> Result<()> {
     let meta = file.metadata().map_err(|_| Error::Io)?;
@@ -449,7 +518,7 @@ fn open_mount_directory(path: &Path) -> Result<File> {
         Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS).map_err(io_error)?))
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResizeStep { Reserved, Allocated, Grown }
+enum ResizeStep { Reserved, Allocated, Grown, Reallocated }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublishStep { Written, FileSynced, Renamed, DirectorySynced }
 fn atomic_state(root: &File, state: &Registry) -> Result<()> {
@@ -568,6 +637,16 @@ fn matching_loops(image: &File) -> Result<Vec<DeviceId>> {
         }
     }
     Ok(found)
+}
+
+fn wait_for_release(timeout: Duration, mut released: impl FnMut() -> Result<bool>) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if released()? { return Ok(()); }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { return Err(Error::Busy); }
+        std::thread::sleep(LOOP_RELEASE_POLL.min(remaining));
+    }
 }
 
 fn check_ext4(image: &File, quota: Quota) -> Result<()> {
@@ -700,10 +779,63 @@ mod tests {
     use std::os::unix::fs::DirBuilderExt;
 
     #[test]
+    fn loop_release_wait_observes_release_and_fails_closed() {
+        assert_eq!(wait_for_release(Duration::ZERO, || Ok(true)), Ok(()));
+        assert_eq!(wait_for_release(Duration::ZERO, || Ok(false)), Err(Error::Busy));
+        let mut scans = 0;
+        assert_eq!(wait_for_release(Duration::from_secs(1), || {
+            scans += 1;
+            Ok(scans == 3)
+        }), Ok(()));
+        assert_eq!(scans, 3);
+        let start = Instant::now();
+        assert_eq!(wait_for_release(Duration::from_millis(25), || Ok(false)), Err(Error::Busy));
+        assert!(start.elapsed() >= Duration::from_millis(25));
+        assert_eq!(wait_for_release(Duration::from_secs(1), || Err(Error::Io)), Err(Error::Io));
+        assert_eq!(wait_for_release(Duration::from_secs(1), || Err(Error::RecoveryRequired)), Err(Error::RecoveryRequired));
+    }
+
+    #[test]
     fn loop_uapi_layout_matches_kernel() {
         assert_eq!(std::mem::size_of::<LoopInfo>(), 232);
         assert_eq!(std::mem::size_of::<LoopConfig>(), 304);
         assert_eq!(std::mem::offset_of!(LoopConfig, info), 8);
+    }
+    #[test]
+    fn retained_backing_description_does_not_retain_operation_lock() {
+        // No root, mount or loop device needed: a duplicate models the kernel
+        // retaining the backing open file description after LOOP_CONFIGURE.
+        let path = std::env::temp_dir().join(format!("duduclaw-storage-lock-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for name in ["image", "held"] { let _ = fs::remove_file(self.0.join(name)); }
+                let _ = fs::remove_dir(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path.clone());
+        let root = File::open(&path).unwrap();
+        let locked = open_file(&root, "image", OFlags::RDWR | OFlags::CREATE | OFlags::EXCL).unwrap();
+        rfs::flock(&locked, FlockOperation::NonBlockingLockExclusive).unwrap();
+        let backing = reopen_same_image(&root, "image", &locked).unwrap();
+        let retained = backing.try_clone().unwrap();
+        drop(backing);
+        let next = open_file(&root, "image", OFlags::RDWR).unwrap();
+        assert_eq!(rfs::flock(&next, FlockOperation::NonBlockingLockExclusive), Err(rustix::io::Errno::WOULDBLOCK));
+        drop(locked);
+        rfs::flock(&next, FlockOperation::NonBlockingLockExclusive).unwrap();
+        // The operation lock is still exclusive even with a live backing fd.
+        assert_eq!(rfs::flock(&retained, FlockOperation::NonBlockingLockExclusive), Err(rustix::io::Errno::WOULDBLOCK));
+        drop(next);
+        rfs::flock(&retained, FlockOperation::NonBlockingLockExclusive).unwrap();
+        fs::rename(path.join("image"), path.join("held")).unwrap();
+        let replacement = open_file(&root, "image", OFlags::RDWR | OFlags::CREATE | OFlags::EXCL).unwrap();
+        assert_eq!(reopen_same_image(&root, "image", &retained).unwrap_err(), Error::RecoveryRequired);
+        drop(replacement);
+        fs::remove_file(path.join("image")).unwrap();
+        std::os::unix::fs::symlink("held", path.join("image")).unwrap();
+        assert_eq!(reopen_same_image(&root, "image", &retained).unwrap_err(), Error::Io);
     }
     #[test]
     fn sysfs_device_names_are_anchored() {
@@ -751,6 +883,8 @@ mod tests {
         storage.provision(employee, 70000, quota).unwrap();
         assert_eq!(storage.resize(employee, Quota { bytes: quota.bytes / 2, ..quota }), Err(Error::ResizeUnsupported));
         let anchor = storage.attach(employee, true).unwrap();
+        assert_eq!(storage.attach(employee, true).unwrap().path, anchor.path);
+        assert!(matches!(Storage::open(&path), Err(Error::Busy)));
         assert_eq!(storage.attach(employee, false).unwrap_err(), Error::RecoveryRequired);
         let usage = storage.usage(employee).unwrap();
         assert!(usage.capacity_bytes <= quota.bytes && usage.capacity_inodes <= quota.inodes);
@@ -758,6 +892,8 @@ mod tests {
         assert_eq!(home.uid(), 70000); assert_eq!(home.mode() & 0o777, 0o700);
         let image = storage.image_file(storage.state.image(employee).unwrap()).unwrap();
         assert_eq!(matching_loops(&image).unwrap().len(), 1);
+        rfs::flock(&image, FlockOperation::NonBlockingLockExclusive).unwrap();
+        assert_eq!(storage.detach(employee), Err(Error::Busy));
         // Boundaries are actual kernel mount flags, not only intended policy.
         let mounted = mounted_at(&anchor.path).unwrap().unwrap();
         assert!(mounted.noexec && mounted.nosuid && mounted.nodev && !mounted.readonly);
@@ -814,8 +950,16 @@ mod tests {
         fs::write(anchor.path.join("work/retained"), b"retained across grow").unwrap();
         assert_eq!(storage.resize(employee, target), Err(Error::Busy));
         storage.detach(employee).unwrap();
+        let image = storage.image_file(storage.state.image(employee).unwrap()).unwrap();
+        assert!(matching_loops(&image).unwrap().is_empty());
+        drop(image);
         storage.resize(employee, target).unwrap();
         assert!(mounted_at(&anchor.path).unwrap().is_none());
+        // Inspect without image_file's detached repair: resize itself must
+        // publish a fully allocated image, including after unmount writes.
+        let grown = storage.open_image_identity(storage.state.image(employee).unwrap()).unwrap();
+        check_regular(&grown, Some(target.bytes)).unwrap();
+        drop(grown);
         storage.resize(employee, target).unwrap();
         let anchor = storage.attach(employee, true).unwrap();
         assert_eq!(fs::read(anchor.path.join("work/retained")).unwrap(), b"retained across grow");
@@ -832,9 +976,92 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "root, private mount tree and real supported backing required"]
+    fn iso_root_runtime_hole_punch_refills_before_reattach() {
+        let path = test_path("runtime-holes");
+        let mut storage = Storage::open(&path).unwrap();
+        let employee = EmployeeId([10; 16]);
+        let quota = Quota { bytes: 64 * 1024 * 1024, inodes: 1024 };
+        storage.provision(employee, 70008, quota).unwrap();
+        let anchor = storage.attach(employee, true).unwrap();
+        // Enable discard only in this test to deterministically reproduce the
+        // same loop PUNCH_HOLE used by kernel zeroout, on every target kernel.
+        mount(None::<&str>, &anchor.path, None::<&str>, MsFlags::MS_REMOUNT
+            | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+            Some("errors=remount-ro,discard")).unwrap();
+        let data_path = anchor.path.join("work/punched");
+        let mut data = File::create(&data_path).unwrap();
+        rfs::fchown(&data, Some(rustix::process::Uid::from_raw(70008)),
+            Some(rustix::process::Gid::from_raw(70008))).unwrap();
+        let block = [0x5au8; 64 * 1024];
+        for _ in 0..256 { data.write_all(&block).unwrap(); }
+        data.sync_all().unwrap();
+        rfs::fallocate(&data, FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE,
+            4 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+        data.sync_all().unwrap();
+        drop(data);
+        let dir = open_mount_directory(&anchor.path).unwrap();
+        rfs::syncfs(&dir).unwrap(); drop(dir);
+        let entry = storage.state.image(employee).unwrap().clone();
+        let image = storage.open_image_identity(&entry).unwrap();
+        assert!(allocation_missing(&image, quota.bytes).unwrap() > 0);
+        assert_eq!(storage.image_file(&entry).unwrap_err(), Error::Busy);
+        assert_eq!(storage.state.image(employee).unwrap().phase, Phase::Ready);
+        storage.detach(employee).unwrap();
+        assert!(matching_loops(&image).unwrap().is_empty());
+        // A changed length must not be mistaken for kernel hole punching.
+        image.set_len(quota.bytes + 4096).unwrap();
+        assert_eq!(storage.attach(employee, true).unwrap_err(), Error::UnsafeBacking);
+        image.set_len(quota.bytes).unwrap();
+        drop(image);
+        // Exercise recovery after reopening the registry, not only one process.
+        drop(storage);
+        let mut storage = Storage::open(&path).unwrap();
+        let anchor = storage.attach(employee, true).unwrap();
+        let image = storage.open_image_identity(storage.state.image(employee).unwrap()).unwrap();
+        check_regular(&image, Some(quota.bytes)).unwrap();
+        assert_eq!(storage.state.charge().sum::<u64>(), quota.bytes);
+        let data = fs::read(anchor.path.join("work/punched")).unwrap();
+        assert!(data[..4 * 1024 * 1024].iter().all(|byte| *byte == 0x5a));
+        assert!(data[4 * 1024 * 1024..12 * 1024 * 1024].iter().all(|byte| *byte == 0));
+        assert!(data[12 * 1024 * 1024..].iter().all(|byte| *byte == 0x5a));
+        drop(image);
+        storage.detach(employee).unwrap();
+        storage.destroy(employee).unwrap();
+        drop(storage); remove_test_state(&path);
+    }
+
+    #[test]
+    #[ignore = "root, private mount tree and real supported backing required"]
+    fn iso_root_detach_waits_but_refuses_a_pinned_loop() {
+        let path = test_path("detach-pinned-loop");
+        let mut storage = Storage::open(&path).unwrap();
+        let employee = EmployeeId([6; 16]);
+        let quota = Quota { bytes: 64 * 1024 * 1024, inodes: 1024 };
+        storage.provision(employee, 70004, quota).unwrap();
+        let anchor = storage.attach(employee, true).unwrap();
+        let mounted = mounted_at(&anchor.path).unwrap().unwrap();
+        let loop_fd = open_device(format!("/dev/loop{}", mounted.device.minor), true, Some(mounted.device)).unwrap();
+        let start = Instant::now();
+        assert_eq!(storage.detach(employee), Err(Error::Busy));
+        assert!(start.elapsed() >= LOOP_RELEASE_TIMEOUT);
+        assert!(mounted_at(&anchor.path).unwrap().is_none());
+        let image = storage.image_file(storage.state.image(employee).unwrap()).unwrap();
+        assert_eq!(matching_loops(&image).unwrap(), vec![mounted.device]);
+        assert_eq!(storage.destroy(employee), Err(Error::Busy));
+        drop(loop_fd);
+        // Retry after the host mount is gone must still wait for AUTOCLEAR.
+        storage.detach(employee).unwrap();
+        assert!(matching_loops(&image).unwrap().is_empty());
+        drop(image);
+        storage.destroy(employee).unwrap();
+        drop(storage); remove_test_state(&path);
+    }
+
+    #[test]
     #[ignore = "root required; interrupts real allocation/kernel growth at durable checkpoints"]
     fn iso_root_resize_interruption_keeps_full_charge_and_refuses_attach() {
-        for stage in [ResizeStep::Reserved, ResizeStep::Allocated, ResizeStep::Grown] {
+        for stage in [ResizeStep::Reserved, ResizeStep::Allocated, ResizeStep::Grown, ResizeStep::Reallocated] {
             let path = test_path(&format!("grow-crash-{stage:?}"));
             let mut storage = Storage::open(&path).unwrap();
             let employee = EmployeeId([6; 16]);
@@ -878,6 +1105,33 @@ mod tests {
         drop(storage);
         let mut storage = Storage::open(&path).unwrap();
         assert_eq!(storage.readiness(), Err(Error::Quarantined));
+        storage.detach(employee).unwrap(); storage.destroy(employee).unwrap();
+        drop(storage); remove_test_state(&path);
+    }
+
+    #[test]
+    #[ignore = "root required; injects a post-grow allocation validation failure"]
+    fn iso_root_resize_allocation_failure_quarantines_full_target() {
+        let path = test_path("grow-allocation-error");
+        let mut storage = Storage::open(&path).unwrap();
+        let employee = EmployeeId([11; 16]);
+        let old = Quota { bytes: 64 * 1024 * 1024, inodes: 1024 };
+        let target = Quota { bytes: 256 * 1024 * 1024, inodes: 4096 };
+        storage.provision(employee, 70009, old).unwrap();
+        let image = storage.open_image_identity(storage.state.image(employee).unwrap()).unwrap();
+        assert_eq!(storage.resize_steps(employee, target, |stage| {
+            // Simulate an unexpected length change immediately before refill.
+            // The allocation barrier must reject it without publishing Ready.
+            if stage == ResizeStep::Grown { image.set_len(target.bytes + 4096).unwrap(); }
+            Ok(())
+        }), Err(Error::UnsafeBacking));
+        assert_eq!(storage.state.image(employee).unwrap().phase, Phase::Quarantined);
+        assert_eq!(storage.state.charge().sum::<u64>(), target.bytes);
+        assert_eq!(storage.attach(employee, true).unwrap_err(), Error::Quarantined);
+        drop(image); drop(storage);
+        let mut storage = Storage::open(&path).unwrap();
+        assert_eq!(storage.readiness(), Err(Error::Quarantined));
+        assert_eq!(storage.state.charge().sum::<u64>(), target.bytes);
         storage.detach(employee).unwrap(); storage.destroy(employee).unwrap();
         drop(storage); remove_test_state(&path);
     }
