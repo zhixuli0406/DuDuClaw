@@ -107,6 +107,7 @@ mod skills_custom;
 mod cron_rpc;
 mod about_rpc;
 mod data_exports_rpc;
+mod compliance_rpc;
 mod distributor_rpc;
 mod cli_login_rpc;
 mod setup_token_rpc;
@@ -592,6 +593,15 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return boxed_frame(|| self.handle_website_credentials(method, params, ctx)).await;
+        }
+
+        // Compliance exports are gateway-owned. An extension must never
+        // replace their Admin checks or receive report parameters.
+        if method == "compliance.generate" {
+            if let Err(e) = acl::require_role(ctx, UserRole::Admin) {
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.dispatch_system(method, params, ctx, conn)).await;
         }
 
         // ── Plugin extension dispatch ──────
