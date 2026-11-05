@@ -100,7 +100,7 @@ Admin は「管理 → 統合 → MCP API キー」で、有効な OAuth 認可�
 
 クライアントは HTTPS の `POST /oauth/revoke` に、`application/x-www-form-urlencoded` で `client_id`、`token`、任意の `token_type_hint` を送信できます。公開クライアントのみをサポートし、認証方式は token endpoint と同じ `none` です。トークンのクライアント紐づけを確認し、access token と refresh token のどちらでもファミリー全体を取り消します。不明なトークンや別クライアントのトークンには HTTP 200 を返し、他の認可は変更しません。client ID または token の欠落は拒否します。hint は無視される場合があります。メタデータには `revocation_endpoint` と `revocation_endpoint_auth_methods_supported` を公開します。[RFC 7009](https://www.rfc-editor.org/rfc/rfc7009) を参照してください。
 
-**アップグレード時：**同意キーとファミリー情報のない旧 OAuth コード・トークンは拒否されます。アプリで接続を再認可してください。共通ストアは読み取り・更新・保存の全体をロックし、同時更新や登録、ダッシュボードからの取り消しで失効済み認可が復元されることを防ぎます。ストアの破損や読み取り失敗時は拒否します。
+**アップグレード時**：同意キーとファミリー情報のない旧 OAuth コード・トークンは拒否されます。アプリで接続を再認可してください。共通ストアは読み取り・更新・保存の全体をロックし、同時更新や登録、ダッシュボードからの取り消しで失効済み認可が復元されることを防ぎます。ストアの破損や読み取り失敗時は拒否します。
 
 `duduclaw mcp issue-refresh-token` が発行する `ddc_refresh_*` は、`duduclaw mcp-server` の **stdio 専用**認証情報です。発行時に警告し、HTTP Bearer と SSE のクエリ認証では用途を説明して拒否します。`http-server` では静的 MCP API キーまたは OAuth を使い、既存の認証経路を維持します。CLI の更新用認証情報は `/oauth/token` では交換できません。stdio は呼び出しごとにスコープ、期限、失効を検証します。
 

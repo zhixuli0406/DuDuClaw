@@ -40,7 +40,7 @@ updaterのエンドポイントはGitHub上の`latest.json`です（設定済み
 [`scripts/desktop/sign-notarize-macos.sh`](../../../scripts/desktop/sign-notarize-macos.sh)
 を使います。
 
-**受け入れ基準（§D4.1）：**その証明書に一度も触れたことのないマシンで
+**受け入れ基準（§D4.1）**：その証明書に一度も触れたことのないマシンで
 `.dmg`をダウンロードし、Gatekeeperの「開発元が未確認」という警告なし
 に開けること。
 
@@ -49,7 +49,7 @@ updaterのエンドポイントはGitHub上の`latest.json`です（設定済み
 必要なsecretsは`WINDOWS_CERT_PFX_BASE64` ／ `WINDOWS_CERT_PASSWORD`で
 す。workflowは
 [`scripts/desktop/sign-windows.ps1`](../../../scripts/desktop/sign-windows.ps1)
-経由で`.msi`に署名します。**受け入れ基準（§D4.2）：**SmartScreenにブ
+経由で`.msi`に署名します。**受け入れ基準（§D4.2）**：SmartScreenにブ
 ロックされないこと（EV証明書 = 即時信頼）。
 
 ## 4. Linux
