@@ -145,7 +145,8 @@ async fn mfa_password_and_channel_otp_return_no_token_in_entire_body() {
     let codes = enroll(&state, &user);
     let (status, response) = login(&state, 180).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(response.as_object().unwrap().len(), 2);
+    assert_eq!(response["factors"]["totp"], true);
+    assert_eq!(response["last_used"], "totp");
     assert_eq!(response["mfa_required"], true);
     assert!(!response.to_string().contains("token"));
     let id = response["challenge_id"].as_str().unwrap().to_owned();
@@ -205,7 +206,11 @@ async fn mfa_password_and_channel_otp_return_no_token_in_entire_body() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(response.as_object().unwrap().len(), 2);
+    assert_eq!(response.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["challenge_id", "email_available", "factors", "last_used", "mfa_required"]);
+    assert_eq!(response["factors"], json!({"totp":true,"email":false,"passkey":false}));
+    assert_eq!(response["last_used"], "totp");
+    assert_eq!(response["email_available"], false);
     assert_eq!(response["mfa_required"], true);
     assert!(!response.to_string().contains("token"));
 }
@@ -237,7 +242,9 @@ async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
     let (_dir, state, user) = fixture(false, true).await;
     let old = state.jwt_config.issue_session_tokens(&user, &[]).unwrap();
     let (_, response) = login(&state, 184).await;
-    assert_eq!(response.as_object().unwrap().len(), 3);
+    assert_eq!(response.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["challenge_ref", "email_available", "enrollment_token", "mfa_enrollment_required"]);
+    assert_eq!(response["email_available"], false);
     assert_eq!(response["mfa_enrollment_required"], true);
     assert!(response.get("access_token").is_none() && response.get("refresh_token").is_none());
     let token = response["enrollment_token"].as_str().unwrap().to_owned();
@@ -904,4 +911,50 @@ async fn mfa_personal_strict_restore_config_keeps_local_auto_login_personal_only
         assert_eq!(handle_local_session(State(state.clone()), ConnectInfo(local), headers)
             .await.into_response().status(), StatusCode::FORBIDDEN);
     }
+}
+
+#[tokio::test]
+async fn mfa_email_http_unconfigured_is_unavailable_without_sending_or_enabling() {
+    let (_dir,state,user)=fixture(false,false).await;
+    let token=state.user_db.mfa_challenge(&user.id,duduclaw_auth::mfa::FirstFactor::Password,true,chrono::Utc::now().timestamp()).unwrap();
+    let payload=serde_json::from_value(json!({"enrollment_token":token})).unwrap();
+    let (status,_)=body(super::super::server_mfa_email::send(State(state.clone()),ConnectInfo(peer(230)),Json(payload)).await).await;
+    assert_eq!(status,StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!state.user_db.mfa_active(&user.id).unwrap());
+}
+
+#[tokio::test]
+async fn mfa_email_http_login_uses_verified_address_and_consumes_challenge() {
+    let (dir,state,user)=fixture(false,false).await;
+    std::fs::write(dir.path().join("config.toml"),"[auth]\nmfa_enforced=false\n[channels.email]\nsmtp_host='127.0.0.1'\nsmtp_port=9\nfrom_addr='sender@example.test'\nsmtp_tls='none'\n").unwrap();
+    let now=chrono::Utc::now().timestamp();
+    let token=state.user_db.mfa_factor_password_challenge(&user.id,"correct horse battery","session",now).unwrap();
+    let (_,code)=state.user_db.mfa_email_send(&token,true,now).unwrap();
+    state.user_db.mfa_email_verify_and_issue(&token,&code,true,now,|_,_,_|Ok(())).unwrap();
+    let token=state.user_db.mfa_challenge(&user.id,duduclaw_auth::mfa::FirstFactor::Password,false,now+60).unwrap();
+    let (_,code)=state.user_db.mfa_email_send(&token,false,now+60).unwrap();
+    let payload=||serde_json::from_value(json!({"challenge_id":token,"code":code})).unwrap();
+    let (status,value)=body(super::super::server_mfa_email::verify(State(state.clone()),ConnectInfo(peer(231)),Json(payload())).await).await;
+    assert_eq!(status,StatusCode::OK);
+    assert!(state.jwt_config.verify_access_token(value["access_token"].as_str().unwrap()).is_ok());
+    let (status,_)=body(super::super::server_mfa_email::verify(State(state),ConnectInfo(peer(231)),Json(payload())).await).await;
+    assert_eq!(status,StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn mfa_enforced_email_user_can_add_totp_without_another_proof() {
+    let (_dir,state,user)=fixture(false,true).await;
+    let now=chrono::Utc::now().timestamp();
+    let token=state.user_db.mfa_factor_password_challenge(&user.id,"correct horse battery","setup",now).unwrap();
+    let (_,code)=state.user_db.mfa_email_send(&token,true,now).unwrap();
+    state.user_db.mfa_email_verify_and_issue(&token,&code,true,now,|_,_,_|Ok(())).unwrap();
+    let user=state.user_db.get_user(&user.id).unwrap().unwrap();
+    let access=state.jwt_config.issue_access_token(&user,&[]).unwrap();
+    let ctx=authenticate_jwt(&state,&access).unwrap();
+    let session=state.jwt_config.verify_access_token(&access).unwrap().jti.unwrap();
+    let response=crate::google_personal::DASHBOARD_SESSION.scope(Some((user.id,session)),
+        state.handler.handle("mfa.enroll_begin",json!({"password":"correct horse battery"}),&ctx)).await;
+    let WsFrame::Response{ok:true,payload:Some(value),..}=response else {panic!("begin failed")};
+    assert!(value["secret"].is_string());
+    assert!(value.get("proof_required").is_none());
 }

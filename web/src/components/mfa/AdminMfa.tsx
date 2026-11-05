@@ -24,6 +24,7 @@ export function AdminMfaPanel({ actor }: { actor: string }) {
   const [target, setTarget] = useState<string | null>(null);
   const [action, setAction] = useState<'reset' | 'issue' | null>(null);
   const [factor, setFactor] = useState('');
+  const [resetProof, setResetProof] = useState<'code' | 'password'>('code');
   const [reference, setReference] = useState('');
   const [issued, setIssued] = useState<{ enrollment_code: string; expires_in: number } | null>(null);
   const [confirmPolicy, setConfirmPolicy] = useState<{ expected_state: boolean; desired_state: boolean } | null>(null);
@@ -80,18 +81,21 @@ export function AdminMfaPanel({ actor }: { actor: string }) {
             {binding.channel} · {t('mfa.boundAt')}: {binding.verified && binding.verified_at ? intl.formatDate(binding.verified_at / 1000, { dateStyle: 'medium', timeStyle: 'short' }) : t('mfa.unknownTime')}
           </p>)}
           <div className="flex flex-wrap gap-2">
-            <Button variant="destructive" disabled={busy || row.user_id === actor || !row.enabled} title={row.user_id === actor ? t('mfa.selfReset') : undefined} onClick={() => { setTarget(row.user_id); setAction('reset'); setFactor(''); setIssued(null); }}>{t('mfa.reset')}</Button>
+            <Button variant="destructive" disabled={busy || row.user_id === actor || !row.enabled} title={row.user_id === actor ? t('mfa.selfReset') : undefined} onClick={() => { setTarget(row.user_id); setAction('reset'); setResetProof('code'); setFactor(''); setIssued(null); }}>{t('mfa.reset')}</Button>
             <Button variant="outline" disabled={busy || row.enabled || row.user_id === actor} onClick={() => { setTarget(row.user_id); setAction('issue'); setReference(''); setIssued(null); }}>{t('mfa.issue')}</Button>
           </div>
           {target === row.user_id && action && <form className="space-y-3" onSubmit={e => {
             e.preventDefault();
             if (action === 'reset') {
               if (target === actor) return;
-              void run(async () => { await mfaApi.reset(actor, target, factor); setFactor(''); setAction(null); await load(); setNotice(t('mfa.updated')); });
+              void run(async () => { if (resetProof === 'password') await mfaApi.resetPassword(actor, target, factor); else await mfaApi.reset(actor, target, factor); setFactor(''); setAction(null); await load(); setNotice(t('mfa.updated')); });
             } else void run(async () => { setIssued(await mfaApi.issueCode(target, reference)); setReference(''); });
           }}>
-            <label className="block space-y-2">{t(action === 'reset' ? 'mfa.freshFactor' : 'mfa.challengeRef')}
-              <Input autoComplete="off" pattern={action === 'issue' ? '[0-9a-fA-F]{12}' : undefined} maxLength={action === 'issue' ? 12 : 128} value={action === 'reset' ? factor : reference} onChange={e => action === 'reset' ? setFactor(e.target.value) : setReference(e.target.value)} required />
+            {action === 'reset' && <label className="block space-y-2">{t('mfa.admin.confirmWith')}<select aria-label={t('mfa.admin.confirmWith')} className="w-full rounded-lg border bg-background p-2" disabled={busy} value={resetProof} onChange={e => { setResetProof(e.target.value as typeof resetProof); setFactor(''); }}>
+              <option value="code">{t('mfa.freshFactor')}</option><option value="password">{t('mfa.password')}</option>
+            </select></label>}
+            <label className="block space-y-2">{t(action === 'reset' ? resetProof === 'password' ? 'mfa.password' : 'mfa.freshFactor' : 'mfa.challengeRef')}
+              <Input type={action === 'reset' && resetProof === 'password' ? 'password' : 'text'} autoComplete={action === 'reset' && resetProof === 'password' ? 'current-password' : 'off'} pattern={action === 'issue' ? '[0-9a-fA-F]{12}' : undefined} maxLength={action === 'issue' ? 12 : resetProof === 'password' ? 4096 : 128} value={action === 'reset' ? factor : reference} onChange={e => action === 'reset' ? setFactor(e.target.value) : setReference(e.target.value)} required />
             </label>
             <Button type="submit" disabled={busy || (action === 'reset' ? !factor.trim() : !reference.trim())}>{t('mfa.confirm')}</Button>
             <Button type="button" variant="outline" disabled={busy} onClick={() => { setAction(null); setIssued(null); setFactor(''); setReference(''); }}>{t('mfa.close')}</Button>

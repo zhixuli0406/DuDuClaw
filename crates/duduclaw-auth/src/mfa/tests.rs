@@ -1,5 +1,5 @@
 use super::*;
-struct Cipher;
+pub(super) struct Cipher;
 impl MfaCipher for Cipher {
     fn encrypt(&self, s: &str) -> Result<String> {
         Ok(format!("sealed:{s}"))
@@ -19,7 +19,7 @@ impl MfaCipher for Broken {
         Err(DENIED.into())
     }
 }
-fn setup() -> (tempfile::TempDir, UserDb, String) {
+pub(super) fn setup() -> (tempfile::TempDir, UserDb, String) {
     let dir = tempfile::tempdir().unwrap();
     let db = UserDb::new(&dir.path().join("users.db")).unwrap();
     let user = db
@@ -27,7 +27,7 @@ fn setup() -> (tempfile::TempDir, UserDb, String) {
         .unwrap();
     (dir, db, user.id)
 }
-fn enroll(db: &UserDb, id: &str) -> (String, Vec<String>) {
+pub(super) fn enroll(db: &UserDb, id: &str) -> (String, Vec<String>) {
     assert!(db.mfa_begin(id,None,&Cipher,3000).is_err());
     let token=db.mfa_password_challenge(id,"password-test","test-session",3000).unwrap();
     db.mfa_prepare_enrollment(&token,false,3000).unwrap();
@@ -272,13 +272,13 @@ fn mfa_cross_connection_recovery_race_has_one_winner() {
 fn mfa_legacy_token_issuer_is_not_called_after_activation() {
     let (_dir, db, id) = setup();
     assert_eq!(
-        db.mfa_issue_if_unenrolled(&id, || Ok("legacy")).unwrap(),
+        db.mfa_issue_if_unenrolled(&id, 0, false, |_, _| Ok("legacy")).unwrap(),
         "legacy"
     );
     enroll(&db, &id);
     let called = std::cell::Cell::new(false);
     assert!(
-        db.mfa_issue_if_unenrolled(&id, || {
+        db.mfa_issue_if_unenrolled(&id, 0, false, |_, _| {
             called.set(true);
             Ok(())
         })

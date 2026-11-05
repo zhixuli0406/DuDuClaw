@@ -53,8 +53,14 @@ pub(super) async fn after_first_factor(
                     return Some(denied());
                 }
             }
-            Ok(Some(if active { serde_json::json!({"mfa_required":true,"challenge_id":challenge}) }
-                else { serde_json::json!({"mfa_enrollment_required":true,"enrollment_token":challenge,"challenge_ref":duduclaw_auth::mfa::enrollment_challenge_ref(&challenge)}) }))
+            let mut payload=if active {
+                let mut factors=match state.user_db.mfa_factors(&user.id) {Ok(v)=>v,Err(_)=>return Some(denied())};
+                factors["mfa_required"]=serde_json::json!(true);
+                factors["challenge_id"]=serde_json::json!(challenge);
+                factors
+            } else {serde_json::json!({"mfa_enrollment_required":true,"enrollment_token":challenge,"challenge_ref":duduclaw_auth::mfa::enrollment_challenge_ref(&challenge)})};
+            payload["email_available"]=serde_json::json!(crate::mfa_email::available(&state.home_dir));
+            Ok(Some(payload))
         }
         Ok(Ok(None)) => Ok(None),
         _ => Err(()),
@@ -122,7 +128,8 @@ async fn socket_expired(state: &AppState, ctx: &UserContext, expires: Option<u64
 /// Only these two short local operations must exclude interleaved socket
 /// gates between their commit and handover. Long-running RPCs stay spawned.
 pub(super) fn is_session_handover(method: &str) -> bool {
-    matches!(method, "mfa.enroll_confirm" | "mfa.disable")
+    matches!(method, "mfa.enroll_confirm" | "mfa.disable" | "mfa.email_confirm" | "mfa.email_remove"
+        | "mfa.passkey_register_finish" | "mfa.passkey_delete")
 }
 
 pub(super) struct MfaRpcResult {
@@ -343,6 +350,9 @@ async fn enroll(
                     .and_then(serde_json::Value::as_str)
                 {
                     reset_login_rate_limit(addr.ip(), email);
+                }
+                if let Some(id)=body.get("user").and_then(|u|u.get("id")).and_then(serde_json::Value::as_str) {
+                    crate::mfa_email::notify_change(&state.home_dir,&state.user_db,id,"新增驗證器");
                 }
             }
             json_response(body)

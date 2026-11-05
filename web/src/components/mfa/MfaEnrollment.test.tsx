@@ -79,3 +79,13 @@ it('handles unavailable clipboard without losing recovery codes', async () => {
   expect(await screen.findByText(/Could not copy/)).toBeInTheDocument();
   expect(screen.getByLabelText('Recovery codes')).toBeInTheDocument();
 });
+
+it('continues without an empty recovery acknowledgement when an existing factor keeps its codes', async () => {
+  const saved = vi.fn();
+  renderWithProviders(<MfaEnrollment initial={{ enrollment_token: 'add-totp', secret: 'SECRET' }}
+    begin={vi.fn()} confirm={vi.fn().mockResolvedValue({ recovery_codes: [] })} onSaved={saved} onCancel={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText('Authenticator code'), { target: { value: '123456' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+  await waitFor(() => expect(saved).toHaveBeenCalledOnce());
+  expect(screen.queryByLabelText('Recovery codes')).toBeNull();
+});

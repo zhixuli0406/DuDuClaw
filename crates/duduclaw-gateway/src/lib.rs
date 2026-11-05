@@ -409,6 +409,7 @@ pub mod search_index;
 pub mod secret_redact;
 pub mod server;
 mod mfa;
+mod mfa_email;
 pub mod session;
 pub mod session_origin;
 pub mod session_portability;

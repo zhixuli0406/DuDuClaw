@@ -14,6 +14,7 @@ import { CredentialInventoryPanel } from '@/components/CredentialInventoryPanel'
 import { CredentialProtectionPanel } from '@/components/CredentialProtectionPanel';
 import { WebsiteCredentialsPanel } from '@/components/WebsiteCredentialsPanel';
 import { ForgetReceiptsPanel } from '@/components/ForgetReceiptsPanel';
+import { RememberedSessionPolicy } from '@/components/mfa/RememberedSessionPolicy';
 import { toast, formatError } from '@/lib/toast';
 import {
   TRIGGER_KEYS,
@@ -146,6 +147,7 @@ export function SecurityPage() {
           single-owner Personal install as to an Enterprise one, so unlike the
           cards below it does not fold behind the Personal AdvancedSection. */}
       <CredentialHygienePanel onGoToAccounts={() => navigate('/app/system/accounts')} />
+      <RememberedSessionPolicy />
 
       {/* Credential inventory (WP-H1 P1) — sits directly under hygiene because
           the two answer adjacent questions: hygiene says what is wrong, the

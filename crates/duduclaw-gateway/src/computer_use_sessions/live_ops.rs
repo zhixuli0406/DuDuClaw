@@ -311,6 +311,7 @@ impl ComputerUseSessions {
                 ctx: ctx.clone(),
                 expires: now + ttl,
                 access_expires,
+                dashboard_session: crate::google_personal::session_for(&ctx.user_id).ok(),
             },
             now,
         );

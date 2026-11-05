@@ -95,3 +95,16 @@ it('clears typed confirmation on refresh before the opposite policy action', asy
   fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
   await waitFor(() => expect(update).toHaveBeenCalledWith({ 'auth.mfa_enforced': false, expected_state: true }));
 });
+
+it('lets a passkey-only admin confirm a reset with their current password', async () => {
+  await expect(mfaApi.resetPassword('admin', 'admin', 'secret')).rejects.toThrow('MFA_SELF_RESET');
+  expect(mockWsClient.call).not.toHaveBeenCalledWith('users.mfa_reset', expect.anything());
+  const reset = vi.spyOn(mfaApi, 'resetPassword').mockResolvedValue({ reset: true });
+  renderWithProviders(<AdminMfaPanel actor="admin" />);
+  const row = (await screen.findByText(/other@example.com/)).closest('li')!;
+  fireEvent.click(within(row).getByRole('button', { name: 'Reset two-factor setup' }));
+  fireEvent.change(within(row).getByLabelText('Confirm administrator identity with'), { target: { value: 'password' } });
+  fireEvent.change(within(row).getByLabelText('Current password'), { target: { value: 'admin-password' } });
+  fireEvent.click(within(row).getByRole('button', { name: 'Confirm' }));
+  await waitFor(() => expect(reset).toHaveBeenCalledWith('admin', 'other', 'admin-password'));
+});

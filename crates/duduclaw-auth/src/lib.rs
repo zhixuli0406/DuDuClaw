@@ -21,3 +21,5 @@ pub use otp::{ChannelIdentity, OtpChallenge, OtpError};
 pub use user_update::{NewUser, UserUpdate, UserWriteError};
 
 pub mod mfa;
+
+pub mod remembered_sessions;

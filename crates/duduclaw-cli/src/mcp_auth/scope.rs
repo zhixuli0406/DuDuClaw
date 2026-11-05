@@ -245,6 +245,8 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         });
     }
     match tool_name {
+        // Dashboard session administration stays explicitly Admin-only.
+        "sessions.policy" | "sessions.policy_update" | "users.revoke_sessions" => Some(Scope::Admin),
         "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_artifact" | "discovery_cancel" => Some(Scope::DiscoveryExecute),
         // Document knowledge base — read-only, ACL enforced by the gateway.
         "knowledge_search" | "knowledge_get_passage" | "knowledge_list_collections" => Some(Scope::KnowledgeRead),

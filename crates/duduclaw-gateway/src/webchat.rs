@@ -546,7 +546,7 @@ impl WebChatState {
         let live = tokio::task::spawn_blocking(move ||
             crate::handlers::live_context::resolve_socket_context(&db, &cache, &ctx, heartbeat)).await;
         match live {
-            Ok(Ok(live)) => if webchat_credential_valid(&self.ctx.home_dir, claims, &live, chrono::Utc::now().timestamp().max(0) as u64) {
+            Ok(Ok(live)) => if webchat_credential_valid(&self.ctx.home_dir, &self.user_db, claims, &live, chrono::Utc::now().timestamp().max(0) as u64) {
                 SocketValidity::Valid
             } else { SocketValidity::Revoked },
             Ok(Err(e)) => SocketValidity::from_error(&e),
@@ -704,6 +704,9 @@ fn authenticate_with(
     let claims = jwt_config
         .verify_access_token(token)
         .map_err(|e| format!("invalid token: {e}"))?;
+    if !user_db.remember_session_valid(claims.jti.as_deref(), &claims.sub, chrono::Utc::now().timestamp())? {
+        return Err("登入裝置已登出，請重新登入。".into());
+    }
     match user_db.get_user(&claims.sub) {
         Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active && duduclaw_auth::mfa::credential_epoch_matches(claims.credential_epoch, u.credential_epoch) => {
             Ok((claims.sub, u.must_change_password))
@@ -714,9 +717,11 @@ fn authenticate_with(
     }
 }
 
-fn webchat_credential_valid(home: &std::path::Path, claims: &duduclaw_auth::jwt::Claims,
+fn webchat_credential_valid(home: &std::path::Path, user_db: &UserDb, claims: &duduclaw_auth::jwt::Claims,
     live: &duduclaw_auth::UserContext, now: u64) -> bool {
-    if !duduclaw_auth::mfa::credential_epoch_matches(claims.credential_epoch, live.credential_epoch) { return false; }
+    if !duduclaw_auth::remembered_sessions::socket_age_valid(now.saturating_sub(claims.iat))
+        || !duduclaw_auth::mfa::credential_epoch_matches(claims.credential_epoch, live.credential_epoch)
+        || !user_db.remember_session_valid(claims.jti.as_deref(), &claims.sub, i64::try_from(now).unwrap_or(i64::MAX)).unwrap_or(false) { return false; }
     let personal = !crate::team_edition::team_grants_enabled(home);
     match crate::mfa::enforced(home, personal) {
         Ok(required) => !(required || (!personal && live.credential_epoch > 0)) || now < claims.exp,
@@ -2699,6 +2704,28 @@ mod tests {
 mod mfa_tests {
     use super::*;
     #[test]
+    fn remembered_webchat_rejects_revoked_family_at_connect_and_during_personal_socket() {
+        let home=tempfile::tempdir().unwrap();
+        let db=UserDb::new(&home.path().join("users.db")).unwrap();
+        let user=db.create_user("remember-chat@example.test","Chat","password-test",duduclaw_auth::UserRole::Admin).unwrap();
+        let jwt=JwtConfig::new(b"remember-webchat-long-enough-test-secret");
+        let now=chrono::Utc::now().timestamp();
+        let session=uuid::Uuid::new_v4().to_string();
+        let (token,_,_)=db.remember_create(&user.id,0,&session,"Browser",None,180,now,false,
+            |user,access,id|jwt.issue_access_token_in_session(user,access,Some(id))).unwrap();
+        let claims=jwt.verify_access_token(&token).unwrap();
+        let ctx=duduclaw_auth::UserContext::from_claims(&claims,false).unwrap();
+        crate::team_edition::record(home.path(),duduclaw_core::EditionProfile::Personal);
+        assert!(authenticate_with(&jwt,&db,&token).is_ok());
+        assert!(webchat_credential_valid(home.path(),&db,&claims,&ctx,claims.exp));
+        assert!(webchat_credential_valid(home.path(),&db,&claims,&ctx,claims.iat+86399));
+        assert!(!webchat_credential_valid(home.path(),&db,&claims,&ctx,claims.iat+86400));
+        db.remember_revoke(&user.id,Some(&session)).unwrap();
+        assert!(authenticate_with(&jwt,&db,&token).is_err());
+        assert!(!webchat_credential_valid(home.path(),&db,&claims,&ctx,claims.iat));
+        assert!(!webchat_credential_valid(home.path(),&db,&claims,&ctx,claims.exp));
+    }
+    #[test]
     fn webchat_mfa_rechecks_expiry_epoch_and_preserves_legacy_off() {
         let home=tempfile::tempdir().unwrap();
         let db=UserDb::new(&home.path().join("users.db")).unwrap();
@@ -2712,13 +2739,13 @@ mod mfa_tests {
         crate::team_edition::record(home.path(),duduclaw_core::EditionProfile::Enterprise);
         std::fs::write(home.path().join("config.toml"),"[auth]\nmfa_enforced=false").unwrap();
         crate::mfa::reload_policy(home.path());
-        assert!(webchat_credential_valid(home.path(),&claims,&live,claims.exp));
+        assert!(webchat_credential_valid(home.path(),&db,&claims,&live,claims.exp));
         std::fs::write(home.path().join("config.toml"),"[auth]\nmfa_enforced=true").unwrap();
         crate::mfa::reload_policy(home.path());
-        assert!(webchat_credential_valid(home.path(),&claims,&live,claims.exp-1));
-        assert!(!webchat_credential_valid(home.path(),&claims,&live,claims.exp));
+        assert!(webchat_credential_valid(home.path(),&db,&claims,&live,claims.exp-1));
+        assert!(!webchat_credential_valid(home.path(),&db,&claims,&live,claims.exp));
         claims.credential_epoch+=1;
-        assert!(!webchat_credential_valid(home.path(),&claims,&live,0));
+        assert!(!webchat_credential_valid(home.path(),&db,&claims,&live,0));
         db.mfa_operator_reset(&user.email).unwrap();
         // Heartbeat bypasses the short socket cache and observes retirement.
         assert!(crate::handlers::live_context::resolve_socket_context(&db,&cache,&ctx,true).is_err());

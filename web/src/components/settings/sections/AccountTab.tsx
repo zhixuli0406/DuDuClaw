@@ -1,3 +1,4 @@
+import { SignedInDevices } from '@/components/mfa/SignedInDevices';
 import { AccountMfa } from '@/components/mfa/AccountMfa';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -142,6 +143,7 @@ export function AccountTab() {
   return (
     <div className="space-y-8">
       <AccountMfa />
+      <SignedInDevices />
       {mustChangePassword && (
         <div
           role="status"

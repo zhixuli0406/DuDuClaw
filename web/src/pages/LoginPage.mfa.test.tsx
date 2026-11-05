@@ -14,7 +14,7 @@ it('keeps the unenrolled password form and forwards credentials unchanged', asyn
   fireEvent.change(await screen.findByLabelText('Email'), { target: { value: 'user@example.com' } });
   fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'password' } });
   fireEvent.click(screen.getByRole('button', { name: 'Sign In' }));
-  await waitFor(() => expect(login).toHaveBeenCalledWith('user@example.com', 'password'));
+  await waitFor(() => expect(login).toHaveBeenCalledWith('user@example.com', 'password', false));
   expect(screen.queryByText('Verify your sign-in')).toBeNull();
 });
 it('moves password login to the MFA code step and supports restarting', async () => {

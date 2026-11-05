@@ -528,6 +528,16 @@ impl MethodHandler {
             return enterprise_only_reject_frame();
         }
 
+        // Session administration cannot be replaced by an extension. The
+        // handler rechecks the explicit Admin role in the DB transaction so
+        // denied requests are audited together with their target.
+        if method.starts_with("sessions.") || method == "users.revoke_sessions" {
+            if session_policy_rpc::minimum_role(method) != Some(UserRole::Admin) {
+                return WsFrame::error_response("", "不允許此操作。");
+            }
+            return self.handle_session_policy_rpc(method, params, ctx).await;
+        }
+
         // MFA is a gateway-owned authentication namespace, never delegated to
         // plugins. Every allowed method has an explicit authorization entry.
         if method.split('.').next() == Some("mfa") || matches!(method, "users.mfa_reset" | "users.mfa_enrollment_code") {
@@ -586,3 +596,4 @@ impl MethodHandler {
 }
 
 mod mfa_rpc;
+mod session_policy_rpc;

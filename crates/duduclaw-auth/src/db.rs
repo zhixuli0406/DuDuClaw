@@ -18,6 +18,7 @@ use crate::user_row::{
 /// SQLite-backed user database with connection pool.
 pub struct UserDb {
     pool: Vec<Mutex<Connection>>,
+    pub(crate) remember_key: ring::hmac::Key,
 }
 
 const POOL_SIZE: usize = 2;
@@ -39,7 +40,8 @@ impl UserDb {
                 .map_err(|e| format!("failed to set pragmas: {e}"))?;
             pool.push(Mutex::new(conn));
         }
-        let db = Self { pool };
+        let remember_key = crate::remembered_sessions::load_key(db_path, &pool[0].lock().unwrap())?;
+        let db = Self { pool, remember_key };
         db.init_tables(enforced)?;
         Ok(db)
     }
@@ -135,6 +137,7 @@ impl UserDb {
 
         crate::google_identity::migrate(&conn)?;
         crate::mfa::migrate(&conn, enforced)?;
+        crate::remembered_sessions::migrate(&conn)?;
         crate::user_invites::migrate(&conn)?;
 
         // Idempotent migrations: ADD COLUMN errors if the column is already
