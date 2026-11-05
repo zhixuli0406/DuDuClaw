@@ -2384,6 +2384,8 @@ export interface LicenseSnapshot {
   days_since_phone_home?: number | null;
   /** `true` when the license fingerprint matches the current machine. */
   fingerprint_match?: boolean | null;
+  /** Informational identity evidence, independent of validation failures. */
+  fingerprint_strength?: 'hardware' | 'instance' | 'weak' | null;
   /** Admin-only validation failure reason; absent for a healthy or unlicensed host. */
   validation_warning?: string | null;
   /**

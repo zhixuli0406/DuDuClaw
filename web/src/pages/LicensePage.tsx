@@ -336,6 +336,11 @@ export function LicensePage() {
                     : intl.formatMessage({ id: 'license.fingerprintMatch.no' })}
               </span>
             </SettingsRow>
+            {snapshot.fingerprint_strength === 'instance' && (
+              <SettingsRow label={intl.formatMessage({ id: 'license.fingerprint' })}>
+                <span className="text-sm">{intl.formatMessage({ id: 'license.identity.instance' })}</span>
+              </SettingsRow>
+            )}
           </SettingsCard>
 
           <Card>

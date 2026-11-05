@@ -297,14 +297,18 @@ fn apply_revoked_response(path: &std::path::Path, snapshot: &storage::LicenseSna
         .map_err(|e| DuDuClawError::License(format!("persist revocation: {e}")))
 }
 
-/// Warn (on stderr, so stdout stays machine-readable) when this host could not
-/// produce a hardware-bound fingerprint at all.
-///
-/// Saying so out loud beats letting a weak binding pass for a strong one.
-fn warn_if_hostname_only() {
+/// Report identity evidence on stderr, keeping fingerprint stdout machine-readable.
+/// Instance is informational; missing usable evidence remains a warning.
+fn warn_if_hostname_only(installed: Option<&str>) {
     if duduclaw_license::fingerprint_hardware_unavailable() {
         eprintln!("⚠️  無法讀取本機硬體 UUID；只保留舊版指紋驗證，暫停新授權簽發與重新綁定。請稍後再試。");
         return;
+    }
+    let candidates = fingerprint_candidates();
+    let observed = installed.and_then(|fp| candidates.iter().find(|c| c.fingerprint() == fp))
+        .or_else(|| candidates.first());
+    if observed.is_some_and(|c| c.strength() == FingerprintStrength::Instance) {
+        eprintln!("Identity: 雲端／容器識別 (cloud/container identity)");
     }
     if fingerprint_is_hostname_only() {
         eprintln!(
@@ -577,6 +581,7 @@ async fn cmd_status() -> Result<()> {
         Ok(license) => print_status(&license, warning),
         Err(LicenseError::FileNotFound(_)) => {
             print_opensource_status();
+            warn_if_hostname_only(None);
             Ok(())
         }
         Err(_) if warning.is_some() => Ok(()),
@@ -694,7 +699,7 @@ fn print_status(license: &License, warning: Option<&str>) -> Result<()> {
         println!("Fingerprint binding: {}", binding_label(&binding));
     }
 
-    warn_if_hostname_only();
+    warn_if_hostname_only(Some(&license.machine_fingerprint));
 
     // Phone-home freshness
     let days_since_ph = license.days_since_phone_home();
@@ -988,7 +993,12 @@ async fn cmd_fingerprint(all: bool) -> Result<()> {
             "無法讀取本機硬體 UUID；不提供 MAC 指紋供新授權簽發。請稍後再試。".into(),
         ));
     }
-    // Line 1 is ALWAYS the strong fingerprint — this is the value a customer
+    if fingerprint_is_hostname_only() {
+        return Err(DuDuClawError::License(
+            "無法取得有效的本機識別；不提供弱指紋供新授權簽發。".into(),
+        ));
+    }
+    // Line 1 is ALWAYS the preferred Hardware or Instance fingerprint — this is the value a customer
     // reports and a new license is issued against. `--all` appends the
     // historical values for diagnosis. Weak candidates never activate a paid tier.
     let mut candidates = fingerprint_candidates();
@@ -999,7 +1009,7 @@ async fn cmd_fingerprint(all: bool) -> Result<()> {
     if all && candidates.len() == 1 {
         eprintln!("(no legacy fingerprints — this machine accepts only the value above)");
     }
-    warn_if_hostname_only();
+    warn_if_hostname_only(None);
     Ok(())
 }
 

@@ -1568,6 +1568,7 @@
   "license.customerId": "顧客 ID",
   "license.subscriptionId": "サブスクリプション ID",
   "license.lastPhoneHome": "最終通信",
+  "license.identity.instance": "クラウド／コンテナー識別",
   "license.fingerprintMatch": "マシン紐付け",
   "license.fingerprintMatch.yes": "✓ このマシンと一致",
   "license.fingerprintMatch.no": "✗ 別マシンに紐付けされています",

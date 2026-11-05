@@ -50,13 +50,15 @@ duduclaw start
 
 ## macOS 授權指紋與重新綁定
 
-macOS 新指紋採 `macos-uuid-v2:<32 個十六進位字元>`，由 `IOPlatformUUID` 衍生，不包含主機名稱。`duduclaw license fingerprint`、儀表板啟用授權卡與重新綁定請求都使用此穩定值。啟用授權是安裝已簽章的授權，不會自行向控制平面要求簽發。原有「主機名稱 + UUID」候選值仍可驗證，並標示為舊版綁定。真實的全球管理單播 MAC 候選值仍視為 Hardware，可作為付費授權的硬體綁定依據。本機管理、多播、無 MAC、全零、共用 `02:00:00:00:00:00` 與廣播 `FF:FF:FF:FF:FF:FF` MAC 候選值則視為 Weak，僅供遷移辨識；即使吻合也只以 OpenSource 隔離運作，管理員會看到需要核准換綁的警告。占位 UUID 同樣視為 Weak。不過無法反推出過去的主機名稱：舊授權若已不符，請聯絡簽發者，待簽發端支援新格式後執行 `duduclaw license rebind`。
+macOS 新指紋使用 `macos-uuid-v2:<32 位十六進位字元>`，只由 `IOPlatformUUID` 產生，不包含主機名稱。`duduclaw license fingerprint`、Dashboard 啟用卡與換綁申請都使用此值。啟用只安裝已簽章授權，不會自行要求簽發。舊版 hostname + UUID 候選仍可驗證並標示 legacy；過去的主機名稱無法從雜湊還原，若舊綁定不再相符，請聯絡簽發端支援新格式後執行 `duduclaw license rebind`。
+
+MAC 衍生識別分為三種強度。**Hardware** 是全球管理的單播 MAC。**Instance** 是 Linux／Windows 上非已知共用占位值的本機管理單播 MAC，包含 GCP、AWS 與 Docker 網卡；狀態顯示「雲端／容器識別」。兩者都可驗證既有付費綁定，也可用於新啟用與經核准的換綁。主要 MAC 優先選 Hardware，其次 Instance。**Weak** 包含未取得或全零 MAC、共用 `02:00:00:00:00:00` 與 Npcap／KM-TEST `02:00:4C:4F:4F:50`、廣播 `FF:FF:FF:FF:FF:FF`、多播 MAC 與占位 UUID；即使相符，仍維持 OpenSource 直到核准換綁，也不會用於新綁定提案。Linux／Windows 保留舊版 hostname + MAC 雜湊，歷史 Instance 候選仍可驗證（非主要候選時 `legacy = true`）。作業系統管理員仍能複製這些識別；Instance 表示本機取得的識別證據，不代表硬體證明。macOS 歷史本機管理 MAC 在 UUID 可讀或不可讀時都維持 Weak。Windows 選取主要介面時另排除軟體迴路、軟體虛擬及隧道介面類型與已知迴路描述。macOS UUID v2 指紋與 UUID 讀取失敗時的限制維持不變。
 
 重新綁定為新格式後，舊版程式無法驗證該授權。請先升級所有會讀取這份授權的程序；需要降版時，須先請簽發者安排相容的重新綁定。
 
 UUID 最多讀取三次，每次逾時五秒。仍讀不到時，不會用 MAC 候選放行綁定 UUID 的授權；CLI 與儀表板也會拒絕提供新簽發用的指紋，待 UUID 可讀取後再試。本次不建立 UUID 磁碟快取：即使檔案僅擁有者可讀寫，同一帳號執行的其他程式仍可竄改，無法證明 UUID 確實來自本機。Linux／Windows 保留「主機名稱 + MAC」綁定：真實的全球管理單播 MAC 仍視為 Hardware，可繼續驗證綁定機器的付費授權，不需遷移。已安裝授權失效時，核心功能維持 OpenSource；管理員的儀表板顯示警示，`duduclaw license status` 與 `duduclaw doctor` 也會列出原因。
 
-**控制平面相容性：** refresh 的 `machine_fingerprint` 保留已安裝授權的綁定；不同的 macOS 穩定 UUID 透過 `new_fingerprint` 提案，**只有帳號持有人在控制台核准換綁後才生效**。rebind 傳送 `old_fingerprint`、`new_fingerprint` 與新的 nonce。指紋是公開識別值，不能當成所有權證明。已驗簽的 `status: "pending"` 會保留原授權並提示等待控制台核准；HTTP 202 也必須附上此已簽章本文，空白或未通過驗證的回應一律拒絕。Linux／Windows 與未綁定 OEM 的 refresh 綁定不變；macOS 讀不到 UUID 時，已綁定授權的 refresh／rebind 停止，不提案改綁 MAC。
+**控制平面相容性：** refresh 的 `machine_fingerprint` 保留已安裝授權的綁定；不同的 macOS 穩定 UUID 透過 `new_fingerprint` 提案，**只有帳號持有人在控制台核准換綁後才生效**。rebind 傳送 `old_fingerprint`、`new_fingerprint` 與新的 nonce。指紋是公開識別值，不能當成所有權證明。已驗簽的 `status: "pending"` 會保留原授權並提示等待控制台核准；HTTP 202 也必須附上此已簽章本文，空白或未通過驗證的回應一律拒絕。Linux／Windows 的 refresh 保留相符的 Hardware 或 Instance 綁定，否則提出本機優先的非 Weak 候選；未綁定 OEM 的 refresh 綁定不變；macOS 讀不到 UUID 時，已綁定授權的 refresh／rebind 停止，不提案改綁 MAC。
 
 接受 active 回應前，Gateway 與 CLI 會驗證授權與回應兩份簽章、完全相同的 nonce 與原訂閱，以及等於原綁定或提案綁定的回傳指紋（明確 rebind 必須等於提案）；另檢查期限、候選強度、離線寬限及方案／部署型態。active、revoked 與 pending 都必須使用 v2 簽章封套。撤銷回應必須通過驗簽且 `effective_from` 已到期，才會持久保存撤銷標記並移除已安裝授權；偽造或過時的回應不會改動授權或標記。
 

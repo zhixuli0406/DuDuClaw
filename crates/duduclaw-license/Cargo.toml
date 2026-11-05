@@ -43,6 +43,9 @@ dirs = "5"
 fs2 = "0.4"
 tempfile = "3"
 
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["iphlpapi", "iptypes", "ws2def", "winerror"] }
+
 [dev-dependencies]
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
 rand = "0.8"
