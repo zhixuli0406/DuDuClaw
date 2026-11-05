@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod gemini;
+pub mod google_stt;
 pub mod pipeline;
 pub mod whisper;
 
@@ -10,6 +11,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 pub use gemini::GeminiEngine;
+pub use google_stt::GoogleSttEngine;
 pub use whisper::WhisperEngine;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,7 +51,7 @@ pub(crate) fn bounded_usage(item: &TranscriptionUsage, duration_ms: Option<u64>)
     let mut usage = item.clone();
     let seconds = duration_ms.unwrap_or(pipeline::CHUNK_SECONDS * 1000).saturating_add(999) / 1000;
     let seconds = seconds.min(pipeline::CHUNK_SECONDS);
-    if item.model == "openai/whisper-1" {
+    if matches!(item.model.as_str(), "openai/whisper-1" | "google-stt/chirp_2") {
         let local_seconds = duration_ms.map_or(seconds as f64, |ms| ms.min(pipeline::CHUNK_SECONDS * 1000) as f64 / 1000.0);
         // Provider duration is untrusted, including plausible but tiny values.
         // Always price the audio measured locally (or the fallback ceiling).
@@ -115,22 +117,6 @@ pub trait TranscriptionEngine: Send + Sync {
         language_hint: &str,
         speaker_context: &[String],
     ) -> Result<TranscriptionResult, TranscriptionError>;
-}
-
-/// BatchRecognize accepts GCS input, even when its *results* are inline.
-/// Personal Workspace OAuth credentials do not grant Cloud Speech/GCS access.
-pub struct GoogleSttEngine;
-
-#[async_trait]
-impl TranscriptionEngine for GoogleSttEngine {
-    async fn transcribe(
-        &self,
-        _audio_path: &Path,
-        _language_hint: &str,
-        _speaker_context: &[String],
-    ) -> Result<TranscriptionResult, TranscriptionError> {
-        Err(TranscriptionError::new("Unsupported：目前尚未支援 Google Cloud 語音轉錄。長錄音需要另設 Cloud 憑證與儲存空間，請選擇 Gemini 或 Whisper。"))
-    }
 }
 
 pub(crate) fn audio_mime(path: &Path) -> Result<&'static str, TranscriptionError> {

@@ -1,5 +1,9 @@
 # Security Defense
 
+Google Cloud meeting transcription uses a separate operator-installed, encrypted service-account key; it does not inherit employee or Workspace credentials. Credential set/clear RPCs verify the live Admin identity before extension dispatch; generic config updates reject these fields, and the raw editor only preserves masks or clears them. Audio is uploaded to the configured GCS bucket after a locked durable cleanup record is written. Failed deletions use bounded backoff and remain pending for startup and periodic reconciliation until success or HTTP 404. Cleanup requires valid credentials and bucket permissions; lifecycle expiry provides an additional backstop. Raw audio is not redacted before upload. See [meeting transcripts](73-meeting-transcripts.md).
+
+Transcription settings and raw-config writes recheck live Admin authority under the commit lock and refuse writes when the user database is unavailable. Credential set/clear attempts record the actor, action and result without secrets. Cleanup only deletes from the currently configured bucket; mismatched records are retained with count-only warnings. Unix cleanup directories use 0700 and regular journal/lock files use 0600 with no-follow opens. OAuth token responses use typed zeroizing storage and wipe owned response buffers.
+
 Enterprise [team-history API](68-manager-team-history.md) (v1.76.0): live reporting-line checks are independent of ordinary agent access; external transcripts require read-time masking and every disclosure requires a durable chained audit. A disabled setting, uncertain origin, installed-model failure or audit failure cannot return transcript content. Regex-only operation explicitly reports `ner: false` and can leave names/addresses visible. Direct host/database access remains outside this product boundary.
 
 > Four live guards, where each one runs, and what none of them covers.

@@ -7438,7 +7438,7 @@ export const api = {
         /** Global utility provider, canonicalized; removed providers are retained for explicit repair. */
         utility_provider?: string;
         voice?: Partial<VoiceSettings> | null;
-        transcription?: { engine: 'gemini' | 'google_stt' | 'whisper'; model: string | null; max_bytes: number } | null;
+        transcription?: { engine: 'gemini' | 'google_stt' | 'whisper'; model: string | null; max_bytes: number; google_stt?: { project_id: string; location: string; bucket: string; language: string; model: string; diarization: boolean } } | null;
         transcription_error?: string | null;
         // Structured [gateway] allowed_origins for the remote-access allowlist UI.
         allowed_origins?: string[];
@@ -7455,6 +7455,10 @@ export const api = {
         daily_digest_enabled?: boolean;
         daily_digest_at?: string;
       }>,
+    setTranscriptionCredential: (googleSttKey: string) =>
+      client.call('transcription_credentials.set', { google_stt_key: googleSttKey }) as Promise<{ success: boolean }>,
+    clearTranscriptionCredential: () =>
+      client.call('transcription_credentials.clear', {}) as Promise<{ success: boolean }>,
     updateConfig: (fields: Record<string, unknown>) =>
       client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[]; applied?: boolean; hot_reloaded?: string[]; /** v1.68: keys that only apply after a gateway restart. */ restart_required?: string[] }>,
     checkUpdate: () =>

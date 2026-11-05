@@ -3143,6 +3143,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     app = app.merge(crate::license_serve::router(home_dir.clone()));
 
     if duduclaw_core::gateway_instance::held(&home_dir) {
+        crate::meeting_transcription::spawn_google_stt_cleanup(home_dir.clone());
         match crate::meeting_jobs::Manager::open(home_dir.clone()) {
             Ok(jobs) => {
                 jobs.spawn();

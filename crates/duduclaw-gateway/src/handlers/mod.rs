@@ -119,6 +119,7 @@ mod security_rpc;
 mod credential_audit_rpc;
 pub(crate) mod credential_protection_rpc;
 mod website_credentials_rpc;
+mod transcription_credentials_rpc;
 mod analytics_rpc;
 mod evolution_rpc;
 mod playbook_rpc;
@@ -456,6 +457,17 @@ impl MethodHandler {
         ctx: &UserContext,
         conn: crate::power_local::RpcConnInfo,
     ) -> WsFrame {
+        // Move the credential into a zeroizing owner before any early-return
+        // gate. Secret-bearing requests never reach the extension clone.
+        let mut params = params;
+        let credential_request = if method.split('.').next() == Some("transcription_credentials") {
+            Some(transcription_credentials_rpc::Request::take(method, params.take()))
+        } else { None };
+        if method == "system.update_config"
+            && transcription_credentials_rpc::reject_generic_credentials(&mut params) {
+            return WsFrame::error_response("", "請使用專用的會議轉錄憑證設定操作。");
+        }
+
         // ── Pre-auth connection gate (appliance lock screen) ─────────────
         // Runs before EVERY other gate, including the forced-password-change
         // and edition gates below: those two answer "may this identity do
@@ -561,6 +573,23 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return boxed_frame(|| self.handle_website_credentials(method, params, ctx)).await;
+        }
+
+        if let Some(request) = credential_request {
+            if let Err(e) = acl::require_role(ctx, UserRole::Admin) {
+                request.audit(&self.home_dir, &ctx.user_id, "refused");
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.handle_transcription_credentials(request, ctx)).await;
+        }
+
+        // Raw TOML submissions may contain rejected credential values too.
+        // Keep validation and the Admin gate ahead of extension dispatch.
+        if method == "config.raw.set" {
+            if let Err(e) = acl::require_role(ctx, UserRole::Admin) {
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.handle_config_raw_set(params, ctx)).await;
         }
 
         // ── Plugin extension dispatch ──────
