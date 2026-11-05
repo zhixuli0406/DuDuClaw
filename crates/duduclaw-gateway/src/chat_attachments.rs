@@ -148,18 +148,18 @@ mod tests;
 pub(crate) fn history_rows(home: &Path, session: &str, limit: usize) -> Result<Vec<crate::session::WebChatHistoryMessage>, String> {
     use rusqlite::params;
     let c = crate::history_privacy::read::open(home)?;
-    let mut stmt = c.prepare("SELECT id,role,CASE WHEN length(CAST(content AS BLOB))<=?3 THEN content ELSE NULL END,tokens,timestamp,notice_kind FROM session_messages WHERE session_id=?1 AND undone_at IS NULL AND (hidden=0 OR notice_kind='turn_failure') ORDER BY id DESC LIMIT ?2").map_err(|_| "history unavailable")?;
+    let mut stmt = c.prepare("SELECT id,role,CASE WHEN length(CAST(content AS BLOB))<=?3 THEN content ELSE NULL END,tokens,timestamp,notice_kind,client_msg_id FROM session_messages WHERE session_id=?1 AND undone_at IS NULL AND (hidden=0 OR notice_kind='turn_failure') ORDER BY id DESC LIMIT ?2").map_err(|_| "history unavailable")?;
     let rows = stmt.query_map(params![session, limit.min(2000) as i64, limits::MAX_MESSAGE as i64], |r| {
-        Ok((r.get::<_,i64>(0)?, r.get::<_,String>(1)?, r.get::<_,Option<String>>(2)?, r.get::<_,u32>(3)?, r.get::<_,String>(4)?, r.get::<_,Option<String>>(5)?))
+        Ok((r.get::<_,i64>(0)?, r.get::<_,String>(1)?, r.get::<_,Option<String>>(2)?, r.get::<_,u32>(3)?, r.get::<_,String>(4)?, r.get::<_,Option<String>>(5)?, r.get::<_,Option<String>>(6)?))
     }).map_err(|_| "history unavailable")?;
     let mut result = Vec::new();
     let mut bytes = 0;
     for row in rows {
-        let (id, role, content, tokens, timestamp, notice_kind) = row.map_err(|_| "history unavailable")?;
+        let (id, role, content, tokens, timestamp, notice_kind, client_msg_id) = row.map_err(|_| "history unavailable")?;
         let content = content.ok_or("history message too large")?;
         bytes += content.len();
         if bytes > limits::MAX_HISTORY_BYTES { break; }
-        result.push(crate::session::WebChatHistoryMessage { id, message: crate::session::SessionMessage { role, content, tokens, timestamp }, notice_kind });
+        result.push(crate::session::WebChatHistoryMessage { id, message: crate::session::SessionMessage { role, content, tokens, timestamp }, notice_kind, client_msg_id });
     }
     result.reverse();
     Ok(result)

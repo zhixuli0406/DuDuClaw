@@ -547,7 +547,7 @@ async fn revoked_or_unavailable_identity_withholds_queued_frames_and_rejects_ack
         });
         let mut writer = BoundedSocketSink(Box::pin(accepting));
         let (ack, received) = oneshot::channel();
-        let frame = Outbound { identity_notice: None, message: Message::Text("sensitive".into()), ack: Some(ack),
+        let frame = Outbound { route: None, identity_notice: None, message: Message::Text("sensitive".into()), ack: Some(ack),
             deadline: Some(tokio::time::Instant::now() + SEND_TIMEOUT) };
         let mut recovery = SocketRecovery::default();
         let result = frame.deliver_authorized(validity, &mut recovery, &mut writer).await;
@@ -556,7 +556,7 @@ async fn revoked_or_unavailable_identity_withholds_queued_frames_and_rejects_ack
         assert_eq!(recovery.closed(), validity == SocketValidity::Revoked);
         assert_eq!(result.is_err(), validity == SocketValidity::Revoked);
         if validity == SocketValidity::Unavailable {
-            Outbound { identity_notice: None, message: Message::Text("recovered".into()), ack: None, deadline: None }
+            Outbound { route: None, identity_notice: None, message: Message::Text("recovered".into()), ack: None, deadline: None }
                 .deliver_authorized(SocketValidity::Valid, &mut recovery, &mut writer).await.unwrap();
             assert!(matches!(&sent.lock().unwrap()[0], Message::Text(text) if text.as_str() == "recovered"));
         }
@@ -987,7 +987,7 @@ async fn webchat_downstream_outage_notice_is_content_free_and_retryable() {
     });
     let mut sink = BoundedSocketSink(Box::pin(writer));
     let notice = IdentityUnavailable::downstream(Some("request".into()));
-    let frame = Outbound { message: Message::Text("secret content must never escape".into()),
+    let frame = Outbound { route: None, message: Message::Text("secret content must never escape".into()),
         ack: None, deadline: None, identity_notice: Some(notice) };
     frame.deliver_authorized(crate::handlers::live_context::SocketValidity::Unavailable,
         &mut crate::handlers::live_context::SocketRecovery::default(), &mut sink).await.unwrap();
@@ -1028,4 +1028,37 @@ async fn webchat_widget_credential_cancel_uses_real_lineage_not_ip_quota() {
     let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(frame["code"], "cancelled");
     assert!(frame.get("downstream_ref").is_none());
+}
+
+#[test]
+fn logout_revokes_only_the_origin_connection_including_delivery() {
+    let registry = Arc::new(Registry::default());
+    let own = registry.admit("alice", "s1", None, "m1", 3, 10).unwrap();
+    own.set_origin("dudu", "tab-1");
+    let other_tab = registry.admit("alice", "s2", None, "m2", 3, 10).unwrap();
+    other_tab.set_origin("dudu", "tab-2");
+    let other_user = registry.admit("bob", "s3", None, "m3", 3, 10).unwrap();
+    other_user.set_origin("dudu", "tab-1");
+    assert!(own.begin_delivery());
+    registry.logout_origin("alice", "tab-1", &[]);
+    assert!(own.delivery_cancel.is_cancelled());
+    assert!(!own.cancel.is_cancelled(), "delivery must finish persistence before rollback");
+    assert!(!other_tab.cancel.is_cancelled());
+    assert!(!other_user.cancel.is_cancelled());
+}
+
+
+#[test]
+fn logout_after_reconnect_matches_owned_original_conversation_nonce() {
+    let registry = Arc::new(Registry::default());
+    let own = registry.admit("alice", "s1", Some("original".into()), "m1", 3, 10).unwrap();
+    own.set_origin("dudu", "old-socket");
+    let other = registry.admit("alice", "s1", Some("other-tab".into()), "m2", 3, 10).unwrap();
+    other.set_origin("dudu", "other-socket");
+    let foreign = registry.admit("bob", "s1", Some("original".into()), "m3", 3, 10).unwrap();
+    foreign.set_origin("dudu", "foreign-socket");
+    registry.logout_origin("alice", "new-socket", &[("s1".into(), Some("original".into()))]);
+    assert!(own.cancel.is_cancelled());
+    assert!(!other.cancel.is_cancelled());
+    assert!(!foreign.cancel.is_cancelled());
 }

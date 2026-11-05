@@ -165,6 +165,14 @@ pub(super) async fn execute(
     let pipeline = Box::pin(crate::channel_reply::build_guarded_reply_for_agent(text, &state.chat.ctx, agent, sid, &caller, Some(callback)));
     let pipeline = Box::pin(crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(user.to_string(), pipeline));
     let pipeline = Box::pin(super::super::turns::TURN_ID.scope(turn.to_string(), pipeline));
+    // Use the same hidden assistant rows, live commit checks and durable
+    // retraction path as WebChat, including early knowledge-only replies.
+    let (accepted_tx, _accepted_rx) = mpsc::channel(1);
+    let delivery = crate::channel_reply::WebChatTurnDelivery {
+        state: state.chat.clone(), user: user.to_owned(), client_msg_id: turn.to_owned(), accepted: accepted_tx,
+        refused: Arc::new(AtomicBool::new(false)),
+    };
+    let pipeline = crate::channel_reply::WEBCHAT_TURN_DELIVERY.scope(delivery.clone(), pipeline);
     let pipeline = crate::approval::scope_turn(sid, turn, crate::channel_reply::track_failure(pipeline));
     tokio::pin!(pipeline);
     let mut reply = None;
@@ -289,15 +297,9 @@ pub(super) async fn execute(
                 let _ = send(&connection, failure("reply_unavailable")).await;
                 return false;
             }
-            let message = uuid::Uuid::new_v4().to_string();
-            let delivered = guarded.confirm_send(async {
-                send(&connection, json!({"type":"TEXT_MESSAGE_START", "messageId":message,"role":"assistant"})).await?;
-                if !guarded.still_valid().await || !authorized(state, user, agent, &connection).await
-                    || crate::approval::is_turn_cancelled(&state.chat.ctx.home_dir, sid, turn).await != Ok(false) { return Err(()); }
-                send(&connection, json!({"type":"TEXT_MESSAGE_CONTENT", "messageId":message,"delta":guarded.text})).await?;
-                send(&connection, json!({"type":"TEXT_MESSAGE_END", "messageId":message})).await?;
-                send(&connection, finished(&connection.input, json!({"type":"success"}))).await
-            }).await.is_ok();
+            let delivered = !delivery.refused.load(Ordering::SeqCst)
+                && super::delivery::reply(state, user, agent, sid, turn, &connection, &guarded).await.is_ok();
+            if !delivered { guarded.refuse_delivery(); }
             if delivered && !receipt.is_empty() {
                 if let Ok(mut receipts) = state.receipts.lock() {
                     receipts.retain(|_, (at, _)| at.elapsed() < RUN_LIFETIME);

@@ -74,3 +74,27 @@ describe('live-event reconciliation metadata', () => {
     expect(client.state).toBe('authenticated');
   });
 });
+
+it('reconnects immediately on foreground and ignores callbacks from the replaced socket', async () => {
+  vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+  const old = await handshake('boot-a');
+  const event = vi.fn();
+  client.subscribe('private', event);
+  document.dispatchEvent(new Event('visibilitychange'));
+  expect(Socket.instances).toHaveLength(2);
+  const next = Socket.instances.at(-1)!;
+  const opened = next.onopen?.();
+  await Promise.resolve();
+  const request = next.sent.find(frame => frame.type === 'req' && frame.method === 'connect');
+  if (!request || request.type !== 'req') throw new Error('Missing connect request');
+  next.receive({ type: 'res', id: request.id, ok: true, payload: { boot_id: 'boot-a' } });
+  await opened;
+  old.receive({ type: 'event', event: 'private', payload: 'previous socket' });
+  old.onclose?.();
+  expect(event).not.toHaveBeenCalled();
+  expect(client.state).toBe('authenticated');
+  client.disconnect();
+  document.dispatchEvent(new Event('visibilitychange'));
+  expect(Socket.instances).toHaveLength(2);
+  vi.restoreAllMocks();
+});

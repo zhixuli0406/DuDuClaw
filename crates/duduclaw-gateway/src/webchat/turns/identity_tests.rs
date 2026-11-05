@@ -99,7 +99,7 @@ async fn expired_or_abandoned_reply_has_no_late_identity_notice() {
         let (ack, received) = oneshot::channel();
         let deadline = tokio::time::Instant::now() + SEND_TIMEOUT;
         let notice = IdentityUnavailable::new("session", Some("c".into()), "m", false);
-        let frame = Outbound { message: Message::Text("SECRET".into()), ack: Some(ack),
+        let frame = Outbound { route: None, message: Message::Text("SECRET".into()), ack: Some(ack),
             deadline: Some(deadline), identity_notice: Some(notice) };
         if closed {
             drop(received);

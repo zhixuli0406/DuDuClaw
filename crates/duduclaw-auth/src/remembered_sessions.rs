@@ -54,6 +54,18 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             UPDATE remembered_families SET revoked=1;
             DELETE FROM remembered_tokens;").map_err(|e|e.to_string())?;
     }
+    // Final delivery holds an ACL-generation lease. Device revocation must
+    // invalidate that lease too, including logout and refresh-reuse detection.
+    conn.execute_batch("CREATE TRIGGER IF NOT EXISTS remembered_delivery_change
+        AFTER UPDATE OF revoked,epoch,user_id,expires_at ON remembered_families
+        WHEN OLD.revoked != NEW.revoked OR OLD.epoch != NEW.epoch
+            OR OLD.user_id != NEW.user_id OR NEW.expires_at < OLD.expires_at
+        BEGIN INSERT INTO auth_meta(key,value) VALUES('acl_generation',2)
+            ON CONFLICT(key) DO UPDATE SET value=value+1; END;
+        CREATE TRIGGER IF NOT EXISTS remembered_delivery_delete AFTER DELETE ON remembered_families
+        BEGIN INSERT INTO auth_meta(key,value) VALUES('acl_generation',2)
+            ON CONFLICT(key) DO UPDATE SET value=value+1; END;")
+        .map_err(|e|e.to_string())?;
     Ok(())
 }
 fn hash(secret: &str) -> String {

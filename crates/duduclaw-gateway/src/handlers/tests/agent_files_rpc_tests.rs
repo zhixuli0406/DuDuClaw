@@ -65,6 +65,7 @@ pub(super) struct Fx {
 pub(super) async fn fixture() -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().canonicalize().unwrap();
+    duduclaw_core::write_minimal_config(&home, "127.0.0.1", 18889).unwrap();
     let h = MethodHandler::new(home.clone()).await;
     let system = UserContext::admin_fallback();
     for (id, name) in [("a1", "Alice"), ("b1", "Bob")] {

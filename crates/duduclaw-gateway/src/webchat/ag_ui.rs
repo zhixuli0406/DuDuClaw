@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::{collections::HashMap, convert::Infallible, sync::{Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
+mod delivery;
 mod input;
 mod run;
 mod store;
@@ -36,7 +37,13 @@ struct Connection {
     claims: duduclaw_auth::jwt::Claims,
     output: mpsc::Sender<Frame>,
 }
-struct Frame { value: Value, ack: oneshot::Sender<()> }
+struct Frame { value: Value, ack: oneshot::Sender<()>, permit: Option<delivery::Permit> }
+impl Frame {
+    fn event(&self) -> Result<Event, ()> {
+        let event = || Event::default().data(self.value.to_string());
+        match &self.permit { Some(permit) => permit.with_current(event), None => Ok(event()) }
+    }
+}
 struct StreamLease { state: Arc<AgUiState>, user: String }
 impl Drop for StreamLease {
     fn drop(&mut self) {
@@ -205,17 +212,23 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
     // body drops the receiver and cancels an active run, including slow readers.
     let stream = futures_util::stream::unfold((receiver, None::<oneshot::Sender<()>>, stream_lease), |(mut receiver, ack, lease)| async move {
         if let Some(ack) = ack { let _ = ack.send(()); }
-        receiver.recv().await.map(|frame| {
-            (Ok::<_, Infallible>(Event::default().data(frame.value.to_string())), (receiver, Some(frame.ack), lease))
-        })
+        let frame = receiver.recv().await?;
+        // Check below the channel buffer, at the SSE body emission boundary.
+        // A refused frame drops its acknowledgement and terminates the stream.
+        let event = frame.event().ok()?;
+        Some((Ok::<_, Infallible>(event), (receiver, Some(frame.ack), lease)))
     });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keep-alive")).into_response()
 }
 
 async fn send(connection: &Connection, value: Value) -> Result<(), ()> {
+    send_frame(connection, value, None).await
+}
+
+async fn send_frame(connection: &Connection, value: Value, permit: Option<delivery::Permit>) -> Result<(), ()> {
     let (ack, received) = oneshot::channel();
     tokio::time::timeout(SEND_TIMEOUT, async {
-        connection.output.send(Frame { value, ack }).await.map_err(|_| ())?;
+        connection.output.send(Frame { value, ack, permit }).await.map_err(|_| ())?;
         received.await.map_err(|_| ())
     }).await.map_err(|_| ())?
 }

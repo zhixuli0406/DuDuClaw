@@ -117,11 +117,14 @@ async fn chat_attachment_history_reads_sql_tail_and_caps_total_message_bytes() {
         for i in 0..2001 {
             c.execute("INSERT INTO session_messages(session_id,role,content,timestamp) VALUES ('tail','user',?1,'2026-11-05')", [format!("message-{i}")]).unwrap();
         }
+        c.execute("UPDATE session_messages SET client_msg_id='lost-ack' WHERE content='message-2000'", []).unwrap();
     }
     let tail = history_rows(home.path(), "tail", 2).unwrap();
     assert_eq!(tail.len(), 2);
     assert_eq!(tail[0].message.content, "message-1999");
     assert_eq!(tail[1].message.content, "message-2000");
+    assert_eq!(tail[1].client_msg_id.as_deref(), Some("lost-ack"));
+    assert!(tail[0].client_msg_id.is_none());
     {
         let c = sessions.acquire().await;
         for _ in 0..3 {

@@ -1,17 +1,15 @@
 //! WebChat heartbeat liveness (B10).
 //!
-//! The connection loop answers one message at a time and does not read the
-//! socket while a turn runs, so the browser's pongs pile up unread. The old
-//! check ("no pong read for 60 s") therefore closed the socket right after
-//! any turn longer than a minute (or two queued turns adding up to one),
-//! and messages the visitor had already sent were lost with it. Now every
-//! frame read counts as a sign of life, and so does finishing a turn: the
-//! 60 s limit only measures time the loop was actually free to read.
+//! The reader runs independently of model turns. Protocol pong frames and
+//! incoming application frames both count as liveness; browser JS timers are
+//! not required. Time spent handling an inbound control frame is excluded.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// No frame for longer than this while idle closes the connection.
+pub(super) const PING_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const IDLE_LIMIT: Duration = Duration::from_secs(60);
 
 /// When the connection last showed it was alive.
@@ -82,5 +80,24 @@ mod tests {
         let live = Liveness::new();
         assert!(!live.timed_out());
         assert!(live.idle_at(Instant::now() + Duration::from_secs(61)) > IDLE_LIMIT);
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn protocol_pongs_keep_background_client_alive_and_silence_expires() {
+        let live = Liveness::new();
+        assert!(PING_INTERVAL < IDLE_LIMIT);
+        for _ in 0..8 {
+            tokio::time::advance(PING_INTERVAL).await;
+            assert!(!live.timed_out());
+            // Same path used by Message::Pong in the real reader.
+            { let _pong = live.busy(); }
+        }
+        tokio::time::advance(IDLE_LIMIT + Duration::from_secs(1)).await;
+        assert!(live.timed_out());
     }
 }

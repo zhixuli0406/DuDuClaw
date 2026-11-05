@@ -24,6 +24,30 @@ pub struct UserDb {
 const POOL_SIZE: usize = 2;
 
 impl UserDb {
+    /// Linearize a nonblocking delivery with every ACL writer, including other
+    /// processes. A WAL read transaction alone would not exclude revocation.
+    /// The callback must not await, block, or re-enter this database.
+    pub fn with_acl_generation<T>(&self, expected: u64, deliver: impl FnOnce() -> T) -> Result<T, String> {
+        let mut conn = self.pool.iter().find_map(|slot| slot.try_lock().ok())
+            .ok_or_else(|| "ACL delivery connection busy".to_string())?;
+        conn.busy_timeout(std::time::Duration::ZERO).map_err(|e| e.to_string())?;
+        let result = (|| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+            if crate::user_row::read_acl_generation(&tx)? != expected {
+                return Err("ACL changed before delivery".into());
+            }
+            // No database mutation: dropping the transaction releases the
+            // writer reservation only after the synchronous delivery decision.
+            Ok(deliver())
+        })();
+        let restored = conn.busy_timeout(std::time::Duration::from_secs(5));
+        // The callback may already have sent bytes; never disguise its result
+        // as a refusal because restoring the connection's timeout failed.
+        if let Err(error) = restored { warn!(%error, "ACL connection timeout restore failed"); }
+        result
+    }
+
     /// Open (or create) the user database at the given path.
     pub fn new(db_path: &Path) -> Result<Self, String> {
         Self::new_with_mfa_default(db_path, false)
@@ -951,6 +975,36 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let db = UserDb::new(tmp.path()).unwrap();
         (db, tmp)
+    }
+
+    #[test]
+    fn acl_delivery_generation_orders_cross_connection_writes() {
+        let (db, tmp) = test_db();
+        let other = Connection::open(tmp.path()).unwrap();
+        other.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let generation = db.acl_generation().unwrap();
+        let mut delivered = 0;
+        db.with_acl_generation(generation, || {
+            assert!(other.execute("UPDATE auth_meta SET value=value+1 WHERE key='acl_generation'", []).is_err());
+            delivered += 1;
+        }).unwrap();
+        assert_eq!(delivered, 1);
+        other.execute("UPDATE auth_meta SET value=value+1 WHERE key='acl_generation'", []).unwrap();
+        assert!(db.with_acl_generation(generation, || delivered += 1).is_err());
+        assert_eq!(delivered, 1, "stale generations must never enter the writer callback");
+    }
+
+    #[test]
+    fn acl_delivery_generation_fails_closed_on_busy_and_unreadable_store() {
+        let (db, tmp) = test_db();
+        let other = Connection::open(tmp.path()).unwrap();
+        let generation = db.acl_generation().unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(db.with_acl_generation(generation, || panic!("busy must deny")).is_err());
+        other.execute_batch("ROLLBACK; DELETE FROM auth_meta").unwrap();
+        assert!(db.with_acl_generation(generation, || panic!("missing generation must deny")).is_err());
+        other.execute_batch("DROP TABLE auth_meta").unwrap();
+        assert!(db.with_acl_generation(generation, || panic!("unreadable generation must deny")).is_err());
     }
 
     #[test]

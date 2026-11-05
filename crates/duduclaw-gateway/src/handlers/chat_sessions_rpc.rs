@@ -171,6 +171,7 @@ impl MethodHandler {
                         "tokens": m.tokens, "attachments": attachments, "id": entry.id,
                     });
                     if let Some(a) = artifact { row["artifact"] = a; }
+                    if let Some(id) = &entry.client_msg_id { row["client_msg_id"] = json!(id); }
                     if let Some(kind) = &entry.notice_kind { row["notice_kind"] = json!(kind); }
                     messages.push(row);
                 }

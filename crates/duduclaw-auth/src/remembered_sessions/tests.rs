@@ -8,6 +8,32 @@ fn setup() -> (tempfile::TempDir,UserDb,String) {
 }
 
 #[test]
+fn remembered_device_revocation_fences_pending_delivery_across_connections() {
+    for action in ["revoke", "logout", "reuse", "shorten", "delete"] {
+        let (dir, db, user) = setup();
+        let (family, secret, _) = create(&db, &user);
+        let writer = UserDb::new(&dir.path().join("users.db")).unwrap();
+        let generation = db.acl_generation().unwrap();
+        assert!(db.with_acl_generation(generation, || ()).is_ok());
+        match action {
+            "revoke" => writer.remember_revoke(&user, Some(&family)).unwrap(),
+            "logout" => writer.remember_logout(&secret).unwrap(),
+            "reuse" => {
+                writer.remember_rotate(&secret, 1001, false, |_, _, _| Ok(())).unwrap();
+                assert!(writer.remember_rotate(&secret, 1002, false, |_, _, _| Ok(())).is_err());
+            }
+            "shorten" => { writer.conn().execute("UPDATE remembered_families SET expires_at=1001 WHERE id=?1", [&family]).unwrap(); }
+            "delete" => {
+                writer.conn().execute("DELETE FROM remembered_tokens WHERE family=?1", [&family]).unwrap();
+                writer.conn().execute("DELETE FROM remembered_families WHERE id=?1", [&family]).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(db.with_acl_generation(generation, || panic!("revoked device delivered")).is_err(), "{action}");
+    }
+}
+
+#[test]
 fn sliding_expiry_uses_current_durable_policy_and_clamps_existing_families() {
     let (dir,db,id)=setup();
     assert_eq!(db.remember_days(),180);

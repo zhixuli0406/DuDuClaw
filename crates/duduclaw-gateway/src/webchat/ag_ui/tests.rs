@@ -38,6 +38,7 @@ impl Fixture {
 }
 async fn frame(rx: &mut mpsc::Receiver<Frame>) -> Value {
     let frame = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await.unwrap().unwrap();
+    frame.event().expect("SSE frame must pass its final delivery fence");
     let _ = frame.ack.send(());
     frame.value
 }
@@ -66,9 +67,120 @@ async fn unbound_employee_refused_before_stream() {
 }
 
 #[tokio::test]
-async fn normal_run_event_order_uses_guarded_pipeline() {
+async fn viewer_cannot_start_an_ag_ui_run() {
     let f = Fixture::new(UserRole::Employee).await;
     f.chat.user_db.bind_agent(&f.user, "worker", AccessLevel::Viewer).unwrap();
+    let response = router(f.chat.clone()).oneshot(f.request(Some(&f.token), serde_json::to_value(f.input()).unwrap())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn queued_sse_frame_rechecks_acl_generation_and_edition_at_emission() {
+    for change in ["unchanged", "unbind", "generation", "edition", "edition_roundtrip"] {
+        let f = Fixture::new(if change.starts_with("edition") { UserRole::Manager } else { UserRole::Employee }).await;
+        crate::team_edition::record(f.home.path(), duduclaw_core::EditionProfile::Enterprise);
+        if change.starts_with("edition") {
+            let report = f.chat.user_db.create_user("report@example.test", "Report", "AGUI-report-password-123", UserRole::Employee).unwrap();
+            f.chat.user_db.bind_agent(&report.id, "worker", AccessLevel::Owner).unwrap();
+            f.chat.user_db.set_manager(&report.id, Some(&f.user)).unwrap();
+            assert!(f.chat.user_db.effective_access(&f.user).unwrap().unwrap().direct.is_empty());
+        } else {
+            f.chat.user_db.bind_agent(&f.user, "worker", AccessLevel::Operator).unwrap();
+        }
+        let state = f.state();
+        let (connection, _rx) = f.connection(f.input());
+        let source = crate::channel_reply::ReplyDeliveryFence::test_live();
+        let permit = delivery::Permit::capture(&state, &f.user, "worker", &connection, source.clone()).await.unwrap();
+        let (ack, _received) = oneshot::channel();
+        let frame = Frame { value: json!({"type":"TEXT_MESSAGE_CONTENT", "delta":"protected"}), ack, permit: Some(permit) };
+        match change {
+            "unbind" => f.chat.user_db.unbind_agent(&f.user, "worker").unwrap(),
+            "generation" => f.chat.user_db.bind_agent(&f.user, "unrelated", AccessLevel::Owner).unwrap(),
+            "edition" | "edition_roundtrip" => {
+                crate::team_edition::record(f.home.path(), duduclaw_core::EditionProfile::Personal);
+                if change == "edition_roundtrip" { crate::team_edition::record(f.home.path(), duduclaw_core::EditionProfile::Enterprise); }
+            }
+            _ => (),
+        }
+        assert_eq!(frame.event().is_ok(), change == "unchanged", "{change}");
+        assert_eq!(source.latched_valid(), change == "unchanged", "{change}");
+    }
+}
+
+#[tokio::test]
+async fn acl_loss_after_staging_refuses_sse_content_and_retracts_history() {
+    let f = Fixture::new(UserRole::Employee).await;
+    f.chat.user_db.bind_agent(&f.user, "worker", AccessLevel::Operator).unwrap();
+    let state = f.state();
+    let broker = state.chat.approvals.clone().unwrap();
+    let sid = session_id(&f.user, "worker", "thread");
+    let mut seam = crate::agent_channels::e2e_seam::arm_waiting(f.home.path());
+    let (connection, mut rx) = f.connection(f.input());
+    let (_incoming_tx, incoming) = mpsc::channel(1);
+    let lease = RunLease { state: state.clone(), sid: sid.clone() };
+    let worker = tokio::spawn(run::start(state, broker, lease, f.user.clone(), "worker".into(), sid.clone(),
+        "host-turn".into(), format!("user:{}", f.user), "hello".into(), connection, incoming, Arc::new(AtomicBool::new(false))));
+    assert_eq!(frame(&mut rx).await["type"], "RUN_STARTED");
+    let turn = tokio::time::timeout(Duration::from_secs(30), seam.entered.recv()).await.unwrap().unwrap();
+    turn.release.send(()).unwrap();
+    assert_eq!(frame(&mut rx).await["type"], "TEXT_MESSAGE_START");
+    let pending = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await.unwrap().unwrap();
+    assert_eq!(pending.value["type"], "TEXT_MESSAGE_CONTENT");
+    assert!(f.chat.ctx.session_manager.webchat_history(&sid).await.unwrap().iter().all(|row| row.message.role != "assistant"));
+    f.chat.user_db.unbind_agent(&f.user, "worker").unwrap();
+    assert!(pending.event().is_err(), "revocation after enqueue must suppress the buffered content");
+    drop(pending);
+    drop(rx);
+    tokio::time::timeout(Duration::from_secs(30), worker).await.unwrap().unwrap();
+    assert!(f.chat.ctx.session_manager.webchat_history(&sid).await.unwrap().iter().all(|row| row.message.role != "assistant"));
+}
+
+#[tokio::test]
+async fn final_delivery_checks_actual_answering_employee() {
+    let f = Fixture::new(UserRole::Employee).await;
+    f.chat.user_db.bind_agent(&f.user, "worker", AccessLevel::Operator).unwrap();
+    crate::trigger_route::tests::write_agent(&f.home.path().join("agents"), "other", "Other", "@other", "specialist", "");
+    f.chat.ctx.registry.write().await.scan().await.unwrap();
+    let state = f.state();
+    let sid = session_id(&f.user, "worker", "thread");
+    let mut seam = crate::agent_channels::e2e_seam::arm_waiting(f.home.path());
+    let release = tokio::spawn(async move {
+        let turn = tokio::time::timeout(Duration::from_secs(30), seam.entered.recv()).await.unwrap().unwrap();
+        turn.release.send(()).unwrap();
+    });
+    let (connection, mut rx) = f.connection(f.input());
+    let receiver = tokio::spawn(async move {
+        let mut count = 0;
+        while let Some(frame) = rx.recv().await {
+            frame.event().unwrap();
+            count += 1;
+            let _ = frame.ack.send(());
+        }
+        count
+    });
+    let (result, cleanup) = crate::channel_reply::with_delivery_cleanup(async {
+        let mut guarded = crate::channel_reply::build_guarded_reply_for_agent(
+            "hello", &f.chat.ctx, "worker", &sid, &f.user, None,
+        ).await;
+        // Admission was to worker; a trigger resolved the actual answer to
+        // another loaded employee for which this account has no grant.
+        guarded.answered_by = Some(crate::trigger_route::AnsweredBy {
+            id: "other".into(), display_name: "Other".into(), via_trigger: true, session_id: sid.clone(),
+        });
+        delivery::reply(&state, &f.user, "worker", &sid, "host-turn", &connection, &guarded).await
+    }).await;
+    cleanup.unwrap();
+    release.await.unwrap();
+    drop(connection);
+    assert!(result.is_err());
+    assert_eq!(receiver.await.unwrap(), 0);
+    assert!(f.chat.ctx.session_manager.webchat_history(&sid).await.unwrap().iter().all(|row| row.message.role != "assistant"));
+}
+
+#[tokio::test]
+async fn normal_run_event_order_uses_guarded_pipeline() {
+    let f = Fixture::new(UserRole::Employee).await;
+    f.chat.user_db.bind_agent(&f.user, "worker", AccessLevel::Operator).unwrap();
     let _seam = crate::agent_channels::e2e_seam::arm_waiting(f.home.path());
     // arm_waiting permits explicit control without ever invoking a provider.
     let mut seam = _seam;
@@ -86,6 +198,8 @@ async fn normal_run_event_order_uses_guarded_pipeline() {
     assert_eq!(output[0]["protocolVersion"], "1.0");
     assert!(output[2]["delta"].as_str().unwrap().contains("OWN_BOT_REPLY"));
     assert_eq!(output[4]["outcome"]["type"], "success");
+    let history = f.chat.ctx.session_manager.webchat_history(&session_id(&f.user, "worker", "thread")).await.unwrap();
+    assert_eq!(history.iter().filter(|row| row.message.role == "assistant" && row.message.content.contains("OWN_BOT_REPLY")).count(), 1);
     let duplicate = app.oneshot(f.request(Some(&f.token), serde_json::to_value(f.input()).unwrap())).await.unwrap();
     assert_eq!(duplicate.status(), StatusCode::CONFLICT);
 }
@@ -136,7 +250,7 @@ async fn externally_decided_interrupt_survives_original_card_deadline() {
 
 async fn approval_resume_case(role: UserRole, kind: &str, external: bool, approve: bool, after_expiry: bool) {
     let f = Fixture::new(role).await;
-    f.chat.user_db.bind_agent(&f.user, "worker", AccessLevel::Viewer).unwrap();
+    f.chat.user_db.bind_agent(&f.user, "worker", AccessLevel::Operator).unwrap();
     let state = f.state();
     let broker = state.chat.approvals.clone().unwrap();
     let sid = session_id(&f.user, "worker", "thread");
@@ -158,7 +272,11 @@ async fn approval_resume_case(role: UserRole, kind: &str, external: bool, approv
     let sid_worker = sid.clone();
     let broker_worker = broker.clone();
     let worker = tokio::spawn(async move {
-        run::execute(&state, &broker_worker, &user, "worker", &sid_worker, "host-turn", "hello", connection, &mut incoming_rx, &waiting_worker).await
+        let (result, cleanup) = crate::channel_reply::with_delivery_cleanup(
+            run::execute(&state, &broker_worker, &user, "worker", &sid_worker, "host-turn", "hello", connection, &mut incoming_rx, &waiting_worker),
+        ).await;
+        cleanup.unwrap();
+        result
     });
     assert_eq!(frame(&mut rx).await["type"], "RUN_STARTED");
     assert_eq!(frame(&mut rx).await["type"], "STATE_SNAPSHOT");
@@ -308,7 +426,7 @@ mod admission;
 #[tokio::test]
 async fn external_confirmation_requires_matching_result_origin_and_live_access() {
     let f = Fixture::new(UserRole::Employee).await;
-    f.chat.user_db.bind_agent(&f.user, "worker", AccessLevel::Viewer).unwrap();
+    f.chat.user_db.bind_agent(&f.user, "worker", AccessLevel::Operator).unwrap();
     let state = f.state();
     let broker = state.chat.approvals.clone().unwrap();
     let id = crate::approval::scope_turn("resume-session", "resume-turn",

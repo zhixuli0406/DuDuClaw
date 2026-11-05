@@ -9,7 +9,7 @@ fn journal_rows(home: &std::path::Path) -> i64 {
 #[tokio::test]
 async fn orphan_resume_flood_cannot_allocate_journal_rows() {
     let f = Fixture::new(UserRole::Employee).await;
-    f.chat.user_db.bind_agent(&f.user, "worker", AccessLevel::Viewer).unwrap();
+    f.chat.user_db.bind_agent(&f.user, "worker", AccessLevel::Operator).unwrap();
     let state = f.state();
     let app = Router::new().route("/api/ag-ui/agents/{agent_id}/runs", post(handle)).with_state(state);
     for i in 0..4096 {
@@ -32,7 +32,7 @@ async fn orphan_resume_flood_cannot_allocate_journal_rows() {
 #[tokio::test]
 async fn matching_receipts_remain_deduplicated_and_rate_limited() {
     let f = Fixture::new(UserRole::Employee).await;
-    f.chat.user_db.bind_agent(&f.user, "worker", AccessLevel::Viewer).unwrap();
+    f.chat.user_db.bind_agent(&f.user, "worker", AccessLevel::Operator).unwrap();
     let state = f.state();
     let sid = session_id(&f.user, "worker", "thread");
     let mut input = f.input();

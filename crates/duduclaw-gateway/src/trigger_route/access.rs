@@ -198,7 +198,7 @@ pub fn for_dashboard_user(home: &Path, db: &UserDb, user_id: &str) -> SenderAcce
 const LOOKUP_TTL: Duration = Duration::from_secs(5);
 const LOOKUP_MAX: usize = 4_096;
 
-type LookupCache = HashMap<(PathBuf, String, String), (SenderAccess, Instant, u64)>;
+type LookupCache = HashMap<(PathBuf, String, String), (SenderAccess, Instant, u64, crate::team_edition::EditionSnapshot)>;
 
 fn lookup_cache() -> std::sync::MutexGuard<'static, LookupCache> {
     static CACHE: OnceLock<Mutex<LookupCache>> = OnceLock::new();
@@ -258,25 +258,27 @@ pub fn for_channel_sender(home: &Path, channel: &str, channel_user_id: &str) -> 
     );
     let now = Instant::now();
     let generation = read_generation(home);
+    let Ok(edition) = crate::team_edition::snapshot(home) else { return SenderAccess::unmapped(); };
     if let Some(g) = generation {
-        if let Some((access, at, cached_gen)) = lookup_cache().get(&key) {
-            if *cached_gen == g && now.saturating_duration_since(*at) < LOOKUP_TTL {
+        if let Some((access, at, cached_gen, cached_edition)) = lookup_cache().get(&key) {
+            if *cached_gen == g && cached_edition.is_current() && now.saturating_duration_since(*at) < LOOKUP_TTL {
                 return access.clone();
             }
         }
     }
     let access = lookup_channel_sender(home, channel, channel_user_id);
+    if !edition.is_current() { return SenderAccess::unmapped(); }
     // Cache only under a generation read before the lookup: a write in
     // between bumps it, so the entry is unreachable rather than stale.
     if let Some(g) = generation {
         let mut cache = lookup_cache();
         if cache.len() >= LOOKUP_MAX {
-            cache.retain(|_, (_, at, cg)| *cg == g && now.saturating_duration_since(*at) < LOOKUP_TTL);
+            cache.retain(|_, (_, at, cg, ce)| *cg == g && ce.is_current() && now.saturating_duration_since(*at) < LOOKUP_TTL);
             if cache.len() >= LOOKUP_MAX {
                 cache.clear();
             }
         }
-        cache.insert(key, (access.clone(), now, g));
+        cache.insert(key, (access.clone(), now, g, edition));
     }
     access
 }
@@ -329,9 +331,20 @@ pub(crate) fn load_account(
     db: &UserDb,
     user_id: &str,
 ) -> Result<Option<Arc<EffectiveAccess>>, String> {
-    Ok(db
-        .effective_access(user_id)?
-        .map(|a| Arc::new(crate::team_edition::gate_access(home, a))))
+    load_account_with_edition(home, db, user_id).map(|(access, _)| access)
+}
+
+/// The edition lease and team filtering must come from the same observation.
+/// Reading a fresh epoch after gating could bless an old Enterprise grant.
+pub(crate) fn load_account_with_edition(
+    home: &Path,
+    db: &UserDb,
+    user_id: &str,
+) -> Result<(Option<Arc<EffectiveAccess>>, crate::team_edition::EditionSnapshot), String> {
+    let access = db.effective_access(user_id)?;
+    let edition = crate::team_edition::snapshot(home)?;
+    let access = access.map(|a| Arc::new(edition.gate_access(a)));
+    Ok((access, edition))
 }
 
 /// An inactive account's access at `generation`: nothing but what everyone
@@ -411,4 +424,37 @@ pub(crate) fn private_view_key(home: &Path, viewer: &str) -> Result<[u8; 32], St
     mac.update(b"private_history_view_v1\0");
     mac.update(viewer.as_bytes());
     Ok(mac.finalize().into_bytes().into())
+}
+
+
+#[cfg(test)]
+mod edition_cache_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn edition_downgrade_invalidates_channel_acl_cache_without_generation_change() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let home = tempfile::tempdir().unwrap();
+            let db = UserDb::new(&home.path().join("users.db")).unwrap();
+            let manager = db.create_user("manager@edition.test", "Manager", "Manager-Test-12345", UserRole::Manager).unwrap();
+            let report = db.create_user("report@edition.test", "Report", "Report-Test-12345", UserRole::Employee).unwrap();
+            db.set_manager(&report.id, Some(&manager.id)).unwrap();
+            db.bind_agent(&report.id, "finance", duduclaw_auth::AccessLevel::Owner).unwrap();
+            db.bind_channel_identity(&manager.id, "line", "edition-manager", true).unwrap();
+            crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
+            let before = for_channel_sender(home.path(), "line", "edition-manager");
+            let Sender::Account { access, .. } = before.sender else { panic!("expected manager"); };
+            assert!(access.direct.is_empty());
+            assert!(access.may_call("finance"));
+            let key = (home.path().to_path_buf(), "line".to_owned(), "edition-manager".to_owned());
+            assert!(lookup_cache().contains_key(&key), "warm cache required");
+            let generation = db.acl_generation().unwrap();
+            crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Personal);
+            assert_eq!(db.acl_generation().unwrap(), generation);
+            let after = for_channel_sender(home.path(), "line", "edition-manager");
+            let Sender::Account { access, .. } = after.sender else { panic!("expected manager"); };
+            assert!(access.team.is_empty());
+            assert!(!access.may_call("finance"));
+        }).await.expect("channel edition cache test timed out");
+    }
 }

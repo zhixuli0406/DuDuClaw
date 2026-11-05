@@ -5976,6 +5976,8 @@ export interface ChatSessionSummary {
 
 export interface ChatSessionMessage {
   attachments?: unknown;
+  /** Original user-message id for exact recovery after a lost acknowledgement. */
+  client_msg_id?: string | null;
   notice_kind?: string | null;
   sender_label?: string;
   parts?: TeamHistoryPart[];
