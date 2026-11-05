@@ -651,16 +651,23 @@ async fn dispatch_cron_task_with_slot(
             return;
         }
     }
-    crate::on_behalf_of::scope_first(principal, crate::autonomous_runtime::scope(
+    let material = crate::isolation_background::material::cron(&task);
+    crate::on_behalf_of::scope_first(principal, crate::isolation_background::scope_record(
+        home_dir, "cron", &effective_task.id, &effective_task.agent_id,
+        effective_task.on_behalf_of.as_deref(), &material, crate::autonomous_runtime::scope(
         home_dir, &effective_task.agent_id, &[],
         dispatch_effective_cron_task(home_dir, store, registry, &effective_task, invoker, slot),
-    )).await;
+    ))).await;
 }
 
 async fn dispatch_effective_cron_task(
     home_dir: &Path, store: &Arc<CronStore>, registry: &Arc<RwLock<AgentRegistry>>,
     task: &CronTaskRow, invoker: &dyn AgentInvoker, slot: Option<String>,
 ) {
+    if crate::isolation_background::approval_pending() {
+        let _ = store.record_autonomy_skip(&task.id, "背景工作正在等候管理員核准。").await;
+        return;
+    }
     if !cron_principal_allowed(home_dir, store, registry, task).await {
         return;
     }

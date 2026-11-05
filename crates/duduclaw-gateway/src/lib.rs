@@ -31,6 +31,7 @@
 #![allow(clippy::if_same_then_else)]
 
 pub mod isolation_mcp;
+pub mod isolation_background;
 pub mod isolation_egress;
 pub mod isolation_resources;
 pub mod isolation_connectors;

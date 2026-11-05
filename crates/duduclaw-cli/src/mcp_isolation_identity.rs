@@ -57,7 +57,7 @@ pub(crate) fn var(key: impl AsRef<OsStr>) -> Result<String, VarError> {
             duduclaw_gateway::isolation_egress::resolved_identity()
                 .and_then(|(turn, session)| session.map(|_| turn)),
         Some(duduclaw_core::egress_guard::ENV_TURN_ALIAS) =>
-            duduclaw_gateway::isolation_egress::resolved_identity().map(|(turn, _)| turn),
+            duduclaw_gateway::isolation_egress::execution_turn(),
         Some(duduclaw_core::ENV_TRUST_SESSION_ID) =>
             duduclaw_gateway::isolation_egress::resolved_identity().and_then(|(_, session)| session),
         Some(duduclaw_core::ENV_DISPATCH_SESSION) =>
@@ -208,6 +208,9 @@ mod tests {
             fn metadata(&self, _: &RequestContext) -> Result<Option<RunMetadata>, duduclaw_mcp_boundary::VerificationError> {
                 Ok(Some(self.metadata.clone()))
             }
+            fn egress_turn(&self, _: &RequestContext) -> Result<Option<String>, duduclaw_mcp_boundary::VerificationError> {
+                Ok(Some("host-execution".into()))
+            }
         }
         let home = tempfile::tempdir().unwrap();
         let mut call = call(home.path(), "one");
@@ -223,7 +226,7 @@ mod tests {
                 assert_eq!(host_principal_checked().unwrap(), None);
                 assert_eq!(var(duduclaw_core::ENV_TRUST_TURN_ID), Err(VarError::NotPresent));
                 assert_eq!(var(duduclaw_core::ENV_TRUST_SESSION_ID), Err(VarError::NotPresent));
-                assert_eq!(var(duduclaw_core::egress_guard::ENV_TURN_ALIAS).unwrap(), "host-turn");
+                assert_eq!(var(duduclaw_core::egress_guard::ENV_TURN_ALIAS).unwrap(), "host-execution");
                 assert_eq!(var(duduclaw_core::ENV_DISPATCH_SESSION).unwrap(), "cron:one");
                 assert_eq!(var(duduclaw_core::ENV_DISPATCH_RUN_ID).unwrap(), "registered-run");
                 assert_eq!(var(duduclaw_core::ENV_UPSTREAM_UNKNOWN).unwrap(), "1");
@@ -237,6 +240,7 @@ mod tests {
         duduclaw_gateway::isolation_egress::scope(home.path(), "one", &context, Some(Arc::new(resolver.clone())),
             ISOLATED_CALL.scope(call.clone(), async {
                 assert_eq!(var(duduclaw_core::ENV_TRUST_TURN_ID).unwrap(), "host-turn");
+                assert_eq!(var(duduclaw_core::egress_guard::ENV_TURN_ALIAS).unwrap(), "host-execution");
                 assert_eq!(var(duduclaw_core::ENV_TRUST_SESSION_ID).unwrap(), "conversation");
                 assert_eq!(var(duduclaw_core::ENV_TURN_USER_MESSAGE_SEQ).unwrap(), "7");
                 assert_eq!(var(duduclaw_core::ENV_TURN_USER_MESSAGE_AT).unwrap(), "2026-11-05T00:00:00Z");

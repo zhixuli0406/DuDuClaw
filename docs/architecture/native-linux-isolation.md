@@ -5589,3 +5589,406 @@ bash scripts/release.sh linux-assets --target aarch64-unknown-linux-gnu --output
 | `docs/features/ja-JP/05-security-defense.md` | Align Japanese security description |
 | `CHANGELOG.md` | User-facing v1.80 preparation and changed timer/legacy-operation behavior |
 | `docs/architecture/native-linux-isolation.md` | This evidence, exact implementation gaps and remote handoff |
+
+## Package I1a — round 1: authenticated ingress, composite readiness and production Claude acceptance (2026-11-05)
+
+### Status and scope
+
+**Historical round-1 status; superseded by the round-2 section below.** Protected TEAM remains unavailable. This worktree connects an actual
+human WebChat/channel turn to the existing one-use Claude authorization and adds
+independent readiness proof interfaces. It also adds an ignored production-provider
+acceptance fixture. It does not complete approved background/delegation authority,
+E/runtime readiness producers, or root/provider acceptance. No gateway-UID fallback,
+fake producer, reduced advertised service manifest, or ready override was added.
+Changes are uncommitted on `feat/iso-i1a-20261105`.
+
+### Human ingress and authority
+
+`webchat/turns/run.rs` scopes the original `TurnInput` Claims only after the queued
+turn's existing authentication check. `channel_reply/guarded.rs` captures a human
+credential epoch before routing/model work. `isolation_mcp/ingress.rs` keeps this
+in a private, consumed-once task-local: nested scopes cannot replace it and a
+`tokio::spawn` does not inherit it. The existing WebChat queue already carries the
+original Claims across its spawn; no credential is reconstructed from an employee
+name or environment variable. An unavailable, consumed or unmapped identity is a
+refusal, not an implicit background grant.
+
+At Claude launch the original user must still match `on_behalf_of`, the channel
+mapping must still resolve to that user, the original credential epoch must match
+the live user record, and the final routed employee/turn must retain an attended
+proof. Web access-token type, subject and expiry are checked again. Dispatch-run,
+goal-round and delegation contexts cannot enter through this human route.
+The host preserves the original turn, approval session, triggering user message
+and reply metadata. Its principal context guard remains alive through the actual
+runtime/output lifetime. Root human calls use `WaitOrigin::Gateway`, no caller and
+no task; these values are never invented for queued/delegated work.
+
+`boot::human_authorization` requires the genuine product authority, confirmed
+employee binding and current live policy. It uses the CLI's actual tool inventory,
+allow/deny settings and process lane. Grants are limited to the employee, its own
+mailbox, five own database tables and its own existing wiki. Wiki roots are opened
+component-by-component from `/` with `O_NOFOLLOW` directory descriptors. No workspace,
+shared wiki, connector, recipient or arbitrary task selector is inferred. ACL,
+policy and credential epochs are rechecked around construction; `authority::prepare`
+also rejects a durable policy epoch change between ingress and run admission.
+The capability expires within 30 minutes and never after the original web token.
+Original CLI dispatcher checks and approval/resource checks still apply.
+
+### Interfaces for sibling packages
+
+- `isolation_readiness::install_integration_probe(component, Arc<dyn IntegrationProbe>)`
+  independently registers `ParseWorker`, `McpBoundary` or `RuntimeAdapters` once.
+  There is no mutable ready flag. `verify_producers` must validate the actual
+  complete production inventory; `verify_service(expected_generation)` must return
+  authenticated evidence with the timestamp taken **before** service readback.
+  Cached observations retain that original timestamp and must clear on failure.
+  Methods run during admission/status and must stay bounded; slow I/O belongs in
+  the owning package's background observer. Never recursively call the composite gate.
+- Missing registration stays `PendingIntegration`; failed producer checks, missing
+  F evidence, mismatched generation and observations older than two seconds or
+  from the future become `Unavailable`. All observations are rechecked at a common
+  final time. F generation and B1's shorter-lived receipt are re-read after the
+  integration probes; a rotation/expiry cannot reuse the earlier ready result.
+- D registers `BoundaryReadiness` only after successful real boot composition.
+  It requires the genuine product authority, live boundary, identical installed
+  backend, captured boot generation, and matching root runtime publication.
+  `DispatcherFactory::verify_producers` defaults to refusal. The actual CLI
+  implementation checks every product tool route against the real A/E factories;
+  existing intentional platform exclusions are unchanged. `require_complete_services`
+  remains enforced at dispatcher creation.
+- `DispatcherFactory::ingress_tools` also defaults to refusal. The CLI implementation
+  derives the original tool set from real employee configuration; overflow refuses
+  rather than truncating the capability or changing the service manifest.
+- I1b/I1c must still install their genuine `BootSources` factories before boot.
+  I1c must supply the ParseWorker probe with fresh containment/retirement evidence.
+  I1d/I1e must supply the RuntimeAdapters probe for actual configured runtimes,
+  accepted signed input protocol and PTY support. This package deliberately installs
+  neither of those missing probes. Boot owners are tied to the observed F generation;
+  switching generations requires new boot composition/restart.
+
+**CONTRACT CHANGE: none.** No shared wire format, canonical bytes, hard limit or
+Cargo dependency changed. `GrantPolicy.policy_revision` on the internal ingress
+handoff now must be the authenticated durable policy epoch; `prepare` validates it
+before substituting the boundary's monotonic revision. Any future background
+producer must supply the original epoch, not refresh it at dispatch.
+
+### Production acceptance fixture
+
+`crates/duduclaw-cli/tests/isolation_product_chain.rs` adds Linux-only ignored
+`iso_root_e2e_claude_production_ingress_product_tool`. Its companion `.md` describes
+pre-provisioning, private input, exact invocation, cleanup and evidence limits.
+It starts an initially inactive installed systemd gateway, logs in via the real TUI
+REST API, opens the authenticated product sockets and sends a WebChat task request.
+It requires full readiness, observes real Claude/bridge executable digests and
+isolated process identity, then checks the actual task, original-user session,
+original tool stream and returned product UUID. It never injects authorization,
+replaces factories or invokes a handler directly. Missing prerequisites fail.
+Provider credentials must already reside in the employee's isolated home through
+the approved provisioning flow; gateway credentials/environment are not copied.
+
+Use only an exclusive disposable VM with `Restart=no`. The cleanup guard is armed
+before start and stops only the observed new systemd InvocationID; uncertain or
+changed ownership refuses cleanup. Normal completion/panic returns the service to
+inactive, but SIGKILL/abort or unreadable service state requires disposal/inspection.
+Task/session evidence is retained. The fixture has **not** been typechecked as part
+of the CLI or executed against systemd/a provider; a standalone Rust syntax parse
+is the only fixture-specific check completed here.
+
+### Actual validation in this worktree
+
+No local gateway, CLI or workspace build/test and no `cargo fmt` was run. Small
+standalone harnesses compile actual selected source files against real isolation,
+auth/core/execution/MCP/spawnd/worker/updater crates; unrelated gateway APIs use
+facades. They do not establish full-package type compatibility or live acceptance.
+
+| Check | Actual result |
+| --- | --- |
+| Runtime/ingress direct-source harness | 11 passed, 0 failed (6 ingress, 5 existing runtime) |
+| Readiness integration direct-source harness | 5 passed, 0 failed |
+| Linux boot/authority/runtime/ingress/readiness source harness, all targets | passed, worker feature enabled |
+| Same Linux harness with `--no-default-features` | passed |
+| Readiness harness Linux cross-check, all targets | passed |
+| Production fixture standalone Rust syntax parse | 1 file parsed; not typechecked |
+| Spawn inventory `--require-migrated` | 498 functions classified; 0 pending |
+| `git diff --check` | passed |
+| Ordinary code review | stale B1 receipt and failed-start cleanup findings corrected; final review found no concrete remaining HIGH/CRITICAL issue |
+| Required `gpt-daybreak-blue-latest` formal security review | unavailable in this session; pending |
+| Root services, provider, full gateway/CLI, Windows | not run |
+
+Exact successful local commands (temporary harnesses are local evidence, not new
+workspace packages):
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/iso-i1-r3-target cargo test --manifest-path /private/tmp/iso-i1a-runtime-tests/Cargo.toml --offline --lib
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/iso-i1a-readiness-target cargo test --manifest-path /private/tmp/iso-i1a-readiness-harness/Cargo.toml --offline --lib
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/iso-i1a-readiness-target cargo check --manifest-path /private/tmp/iso-i1a-readiness-harness/Cargo.toml --offline --all-targets --target x86_64-unknown-linux-gnu
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CC_x86_64_unknown_linux_gnu=/private/tmp/iso-i1-zig-cc AR_x86_64_unknown_linux_gnu=/private/tmp/iso-zig-ar ZIG_GLOBAL_CACHE_DIR=/private/tmp/iso-i1-zig-global ZIG_LOCAL_CACHE_DIR=/private/tmp/iso-i1-zig-local CARGO_TARGET_DIR=/private/tmp/iso-i1-r3-target cargo check --manifest-path /private/tmp/iso-i1a-boot-check/Cargo.toml --offline --all-targets --target x86_64-unknown-linux-gnu
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CC_x86_64_unknown_linux_gnu=/private/tmp/iso-i1-zig-cc AR_x86_64_unknown_linux_gnu=/private/tmp/iso-zig-ar ZIG_GLOBAL_CACHE_DIR=/private/tmp/iso-i1-zig-global ZIG_LOCAL_CACHE_DIR=/private/tmp/iso-i1-zig-local CARGO_TARGET_DIR=/private/tmp/iso-i1-r3-target cargo check --manifest-path /private/tmp/iso-i1a-boot-check/Cargo.toml --offline --all-targets --no-default-features --target x86_64-unknown-linux-gnu
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/iso-a-syntax-target cargo run --quiet --offline --manifest-path /private/tmp/iso-a-syntax/Cargo.toml -- crates/duduclaw-cli/tests/isolation_product_chain.rs
+python3 scripts/ci/check_spawn_inventory.py --require-migrated
+git diff --check
+```
+
+The expanded runtime harness initially lacked its own `serde_json` test dependency;
+adding that dependency to the temporary harness fixed the check (no product Cargo
+change). Final Linux logs are `/private/tmp/iso-i1a-boot-check.log` and
+`/private/tmp/iso-i1a-boot-no-worker-check.log`.
+
+Remote Linux builder checks still required (require nonzero matched test counts):
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib isolation_mcp::ingress::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib isolation_mcp::runtime::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib isolation_mcp::authority::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib isolation_mcp::boot::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib isolation_readiness::
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-cli --test isolation_product_chain --no-run
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo check -p duduclaw-gateway --no-default-features
+```
+
+Then use the companion fixture guide to run exactly one ignored root/provider test
+on the disposable VM. Merely compiling it or reporting it ignored is not acceptance.
+
+### Remaining work, in dependency order
+
+1. Connect I1b/I1c actual execution/worker producers and E/runtime proof producers.
+   Without them the boot owner or composite admission remains unavailable.
+2. Add an authenticated durable authorization carrier for approved background
+   triggers and delegation across queue/task/spawn boundaries, including original
+   epoch, caller, WaitOrigin, resource grants and turn metadata. Existing queue rows
+   and `on_behalf_of` strings alone are not such a credential. Do not mint a new
+   credential epoch at dispatch or turn missing human identity into background.
+3. Complete explicit host resource selectors/dirfds for workspace/shared wiki,
+   connector/recipient and task-scoped grants. Current own-resource grants are not
+   a full-product authority implementation.
+4. Reconcile the original approval/provenance turn with the separately registered
+   runtime egress alias. Preserve attended approvals and original conversation
+   attribution; do not replace the original turn with the alias. This package does
+   not prove full egress-taint attribution for the product chain.
+5. Run remote full-package compilation and targeted tests, formal Daybreak review,
+   signed/provider-home provisioning and the actual root Claude fixture. Add live
+   cancellation/revocation/provider-failure acceptance once the positive chain runs.
+
+### Changed files
+
+| File (relative to repository root) | Change |
+| --- | --- |
+| `crates/duduclaw-gateway/src/isolation_mcp/ingress.rs` | New private one-use authenticated human carrier, safe wiki root opening, six tests |
+| `crates/duduclaw-gateway/src/isolation_mcp.rs` | Linux ingress module registration |
+| `crates/duduclaw-gateway/src/webchat/turns/run.rs` | Original queued Claims scope |
+| `crates/duduclaw-gateway/src/channel_reply/guarded.rs` | Early requester/epoch capture |
+| `crates/duduclaw-gateway/src/isolation_mcp/runtime.rs` | Consume ingress authorization and retain principal guard |
+| `crates/duduclaw-gateway/src/isolation_mcp/authority.rs` | Live ingress snapshot and durable policy epoch recheck |
+| `crates/duduclaw-gateway/src/isolation_mcp/boot.rs` | Human grant derivation, factory seams, generation-bound D readiness |
+| `crates/duduclaw-gateway/src/isolation_readiness.rs` | Composite proof integration and final B1/F freshness rechecks |
+| `crates/duduclaw-gateway/src/isolation_readiness/integration.rs` | Immutable independent proof hooks and five tests |
+| `crates/duduclaw-cli/src/mcp_isolation_boot.rs` | Original inventory completeness and per-employee tool derivation |
+| `crates/duduclaw-cli/tests/isolation_product_chain.rs` | Ignored real systemd/login/Claude/product-tool fixture |
+| `crates/duduclaw-cli/tests/isolation_product_chain.md` | Fixture provisioning, invocation and evidence boundaries |
+| `docs/features/05-security-defense.md` and its `zh-TW` / `ja-JP` counterparts | Current refusal/authentication behavior and incomplete acceptance |
+| `CHANGELOG.md` | Self-contained unreleased security entry |
+| `docs/architecture/native-linux-isolation.md` | This self-contained I1a handoff |
+
+## Package I1a — round 2: approved background authority, sibling readiness hooks and run egress (2026-11-05)
+
+### Current status
+
+This section supersedes the round-1 remaining list above. The three round-2 code
+paths are connected: record-bound background/delegated authorization, independent
+readiness hooks including PTY, and separate execution/approval turn mapping. The
+working tree remains uncommitted. **Protected TEAM is still unavailable until the
+sibling packages install genuine producers and the full product chain passes
+remote compilation and native Linux acceptance.** No ready override, anonymous
+principal, reduced tool inventory or gateway-UID fallback was added.
+
+**CONTRACT CHANGE: none.** No isolation wire format, canonical bytes, hard limit,
+Cargo dependency or public eight-component readiness response changed.
+
+### Background and delegated authorization
+
+`isolation_background::{request_record,scope_record}` stores host-private receipts
+in `isolation_background.db`. A legacy record's `on_behalf_of` is only a claimed
+owner. Its first protected fire submits a new `isolation_background_execution`
+ApprovalBroker card; only an Admin dashboard decision authorizes it. The card
+binds the original human credential epoch, ACL generation, durable policy epoch,
+policy digest, confirmed immutable EmployeeId, exact work/recipient/owner material
+and expiry. The principal remains that human; no anonymous background principal is
+minted. The administrator has 24 hours to decide; authority expires at most 30 days
+after capture. Approval is reusable only for this unchanged recurring contract,
+not as approval for individual tool actions, which retain their existing gates.
+
+Every runtime launch and subsequent MCP recheck reads back the current record,
+receipt, owner authority, target identity and decision. Editing/removing/cancelling
+the record, changing credentials/ACL/policy, expiry or recreating an employee under
+the same name refuses execution. Runtime counters do not alter approval material.
+A completed parent may leave previously delegated work alive; a failed/cancelled
+or edited parent cannot. Source/receipt reads and recursive authorization checks
+run on the bounded blocking verifier. Receipts are capped at 64 KiB and 10,000
+rows; expired entries are reclaimed on writes. Failed enqueues can leave unused
+unexpired receipts until reclamation; they cannot create executable queue work.
+
+| Product path | Authority and pending behavior |
+| --- | --- |
+| Cron | Re-read actual cron row; bind original contract and resolved employee. Waiting for approval records an autonomy skip without model invocation or failure count. |
+| Goal-loop / heartbeat task-board wakes | Only trusted system senders resolve anchored task IDs. Current task owner and assignee must match the queue row; pending uses existing queue deferral. |
+| TaskSpec dispatcher | Bind owner, entire step plan and selected step. Pending restores Planned without consuming retries; changed/terminal source refuses. |
+| AgentCallback reminder | Bind stored prompt, delivery destination, owner and resolved employee. Pending keeps the reminder Pending. Direct reminders retain their existing path. |
+| Proactive heartbeat | Agent scheduler calls the installed gateway invoker. Authenticated proactive settings saves identify the owner and submit a card; legacy ownerless heartbeats refuse. Settings saves may submit a **new** approval after expiry/revocation, including stale pending cards. Polling never renews epochs or authority. |
+| `send_to_agent` | After existing admission, D reads the original live run authority and seals the exact queue material before insert. Recipient access, confirmed target, original sender EmployeeId, policy, lane and expiry are retained/rechecked. No new approval can silently replace the original run authority. |
+| `spawn_agent` / `spawn_ephemeral` bus | Same live authority before append, exact enqueue/dequeue material, no protected message coalescing. The bus is drained under its existing lock, so its immutable receipt replaces active-row readback. Missing confirmed target allocation refuses; ephemeral scaffold is rolled back if this pre-enqueue check fails. Ephemeral provisioning itself is not implemented here. |
+
+The original session/turn, user-message provenance, dispatch attribution, reply
+metadata and delegation depth are preserved. Queue consumers use
+`WaitOrigin::Gateway` with no synchronous caller, because the host is the detached
+waiter; original caller EmployeeId and parent RunHandle remain in the receipt.
+The one-use task-local does not cross an arbitrary `tokio::spawn`. Existing turn
+cancellation wraps dequeue and execution, including the post-registration race
+check; detached bus cancellation requires its original session/turn pair. A
+background record without a conversation has its own generated background turn,
+not an invented attended conversation. Background tasks add their actual task ID
+to the grant; existing budget and stop fences still apply.
+
+Unchanged expired/rejected cron/task/reminder contracts do not automatically
+resubmit: an explicit record edit is required for a new card. Heartbeat has the
+explicit authenticated settings-save renewal path. Missing owner, missing proof,
+unknown target or an unavailable store refuses. Approval capacity is bounded (20
+pending cards); this round does not add a bulk renewal/migration UI.
+
+### Readiness hooks for I1b–I1e
+
+`isolation_readiness` exports `IntegrationProbe`, `IntegrationComponent`,
+`ServiceObservation`, `ServiceObservationCache`, `PtyRequirement` and
+`install_integration_probe`. Each sibling registers its own real probe exactly
+once; it cannot overwrite another probe or toggle a Boolean to ready.
+
+- I1b supplies actual A factories through `BootSources`; D's existing factory
+  inventory check must pass after composition.
+- I1c registers `ParseWorker`, verifying complete E operation routes plus fresh
+  authenticated containment/retirement evidence.
+- I1d registers `RuntimeAdapters`. It must return
+  `ServiceObservation::checked_runtime(generation, observed_at, pty_requirement)`
+  from its authenticated complete runtime publication; generic `checked` does not
+  establish that PTY is unnecessary and is refused for runtime readiness.
+- I1e registers `PtyTransport` for allocation, descriptor transport, resize,
+  cancellation and retirement. `Required` combines both independent proofs;
+  `NotRequired` is accepted only as I1d's authenticated runtime conclusion.
+- `ServiceObservationCache::record(Err(_))` clears evidence. `read` preserves the
+  original pre-readback timestamp; wrong generation, future time or age over two
+  seconds refuses. Complete producer checks remain independent of the cache.
+
+The external RuntimeAdapters state includes PTY readiness without introducing a
+ninth public component. Missing required hooks remain PendingIntegration; failures
+are Unavailable. Common final-time freshness and final B1/F rechecks from round 1
+remain in place. This worktree intentionally does not install fake E/runtime/PTY
+producers; each sibling owns its actual proof.
+
+### Egress lifecycle and per-turn attribution
+
+The existing B1 host path already sends C `Register { run_id, profile_id }` with
+one proxy descriptor before starting the forwarder. The profile comes from the
+root-selected runtime policy, never a model request. Its completion, failed-start,
+cancellation and drain paths call `Unregister`; uncertainty refuses retirement.
+Round 2 reuses that contract and adds Linux socket tests for the exact run/profile,
+descriptor counts, acknowledgements and refusal on mismatched/disconnected peers.
+
+The missing product mapping was the runtime alias: `HostTurn`, D's live resolver
+and `isolation_egress::ResolvedRunTurn` now carry `egress_turn` separately from the
+original approval/provenance identity. `mcp_isolation_identity` uses that execution
+alias for the taint ledger while retaining original memory/session variables.
+Missing mappings remain an unknown isolated run; they never create a clean ledger
+or fall back to an unrelated original-turn key. B1/C wire formats are unchanged.
+Actual root forwarding, teardown and taint policy still require live acceptance.
+
+### Round-2 validation and remote handoff
+
+No local gateway/CLI/workspace build, `cargo fmt`, commit, merge, deployment or
+provider call was performed. Small harnesses use actual selected source plus
+facades for unrelated gateway APIs; they are **not** full-package compile evidence.
+The acceptance fixture from round 1 remains unexecuted.
+
+| Check | Result |
+| --- | --- |
+| Background/material/store direct-source harness | 15 passed, 0 failed |
+| Material + source-extracted spawn material helper harness | 10 passed, 0 failed; includes 8 overlapping material tests |
+| Runtime/ingress source harness | 11 passed, 0 failed |
+| Readiness integration source harness | 9 passed, 0 failed |
+| Egress source harness | 8 passed, 0 failed |
+| Linux boot/authority/runtime/readiness/background source harness | all-targets check passed, with and without default worker feature |
+| Linux readiness source harness | all-targets cross-check passed |
+| `duduclaw-spawnd` Linux `--tests` check | passed; new Linux socket tests typechecked, not executed |
+| Rust syntax / spawn inventory / diff check | 28 changed Rust files parsed, 0 syntax errors (not typechecked); 498 spawn functions classified, 0 pending; diff check passed |
+| Ordinary code review | blocking readback, early-return side effects, stale pending renewal and same-name sender reuse findings fixed; final static review found no concrete remaining P1/P2 |
+| Full gateway/CLI, root services, real Claude, formal Daybreak review | not run; pending |
+
+Additional local commands (round-1 harness commands remain above):
+
+```sh
+python3 /private/tmp/iso-i1a-background-harness/refresh.py
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/iso-i1-r3-target cargo test --manifest-path /private/tmp/iso-i1a-background-harness/Cargo.toml --offline --lib
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/iso-i1-r3-target cargo test --manifest-path /private/tmp/iso-i1a-background-material-tests/Cargo.toml --offline --lib
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/private/tmp/iso-i1-r3-target cargo test --manifest-path /private/tmp/iso-i1a-egress-harness/Cargo.toml --offline --lib isolation_egress::tests > /private/tmp/iso-i1a-egress-harness.log 2>&1
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CC_x86_64_unknown_linux_gnu=/private/tmp/iso-i1-zig-cc AR_x86_64_unknown_linux_gnu=/private/tmp/iso-zig-ar ZIG_GLOBAL_CACHE_DIR=/private/tmp/iso-i1-zig-global ZIG_LOCAL_CACHE_DIR=/private/tmp/iso-i1-zig-local CARGO_TARGET_DIR=/private/tmp/iso-i1-r3-target cargo check -p duduclaw-spawnd --offline --tests --target x86_64-unknown-linux-gnu
+```
+
+Latest logs: `/private/tmp/iso-i1a-background-round2-test.log`,
+`/private/tmp/iso-i1a-runtime-round2-test.log`,
+`/private/tmp/iso-i1a-boot-round2-check.log`,
+`/private/tmp/iso-i1a-boot-round2-no-worker-check.log` and
+`/private/tmp/iso-i1a-egress-harness.log`. Temporary harnesses are local evidence,
+not repository packages or delivery artifacts.
+
+Remote builder: run the round-1 commands, plus the following; require nonzero test
+counts (do not count filtered-out or ignored tests as passes):
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib isolation_background::
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib isolation_egress::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib isolation_readiness::integration::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-cli --lib isolated_spawn_material
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-cli --lib mcp_isolation_identity::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-spawnd --lib egress::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo check -p duduclaw-gateway -p duduclaw-cli
+```
+
+Then run the ignored production Claude fixture on the exclusive disposable native
+Linux VM per its companion guide. Add live positive/negative checks for each
+background source, pending deferral, owner/ACL/policy changes, record edits and
+cancellation, approved/rejected/expired renewal, both delegation transports,
+immutable sender/recipient replacement, per-run taint mapping and C revocation.
+Run the required `gpt-daybreak-blue-latest` security review; ordinary static review
+here is not that sign-off.
+
+### Round-2 files and remaining scope
+
+| File(s), relative to repository root | Round-2 change |
+| --- | --- |
+| `crates/duduclaw-gateway/src/isolation_background.rs` | New durable owner/approval authority, one-use scopes, live delegation derivation and revalidation |
+| `crates/duduclaw-gateway/src/isolation_background/store.rs` | Bounded receipt store, exact dashboard decision validation and tests |
+| `crates/duduclaw-gateway/src/isolation_background/material.rs` | Stable source contracts, bounded current/ancestor readback and tests |
+| `crates/duduclaw-gateway/src/lib.rs` | Register background authority module |
+| `crates/duduclaw-gateway/src/approval/operator_cli_gate.rs` | Register dashboard/Admin-only approval kind |
+| `crates/duduclaw-gateway/src/cron_scheduler.rs`, `cron_store.rs` | Protected cron scope, pending deferral, shared row decoder |
+| `crates/duduclaw-gateway/src/dispatcher.rs` | Goal/heartbeat/task-step/SQLite/bus scopes, pending deferral, no protected coalescing |
+| `crates/duduclaw-gateway/src/reminder_scheduler.rs` | Callback approval scope and Pending preservation |
+| `crates/duduclaw-agent/src/heartbeat.rs` | Trusted protected proactive invoker hook |
+| `crates/duduclaw-gateway/src/server.rs` | Install gateway proactive authority/runtime callback |
+| `crates/duduclaw-gateway/src/handlers/agents_update.rs` | Authenticated proactive owner capture and explicit new-approval renewal |
+| `crates/duduclaw-cli/src/mcp/delegation.rs`, `mcp/spawn.rs` | Seal live original authority before both queue transports publish |
+| `crates/duduclaw-gateway/src/isolation_mcp.rs`, `isolation_mcp/boot.rs` | Internal record authorization and live delegation seams |
+| `crates/duduclaw-gateway/src/isolation_mcp/authority.rs` | Record recheck and original live run/owner/egress capture |
+| `crates/duduclaw-gateway/src/isolation_mcp/runtime.rs` | Select background one-use authority without human fallback |
+| `crates/duduclaw-gateway/src/isolation_mcp/ingress.rs` | Preserve runtime egress alias beside attended identity |
+| `crates/duduclaw-gateway/src/isolation_readiness.rs`, `isolation_readiness/integration.rs` | PTY dependency, expiring observation cache and sibling hooks |
+| `crates/duduclaw-gateway/src/isolation_egress.rs` | Separate live execution alias from original turn and test missing mappings |
+| `crates/duduclaw-cli/src/mcp_isolation_identity.rs` | Set execution alias without replacing provenance variables |
+| `crates/duduclaw-spawnd/src/egress.rs` | Linux control lifecycle wire/descriptor refusal tests |
+| `CHANGELOG.md`, three `docs/features/05-security-defense.md` variants | Current protected behavior and acceptance limits |
+| `docs/architecture/native-linux-isolation.md` | This round-2 handoff |
+
+Remaining: genuine sibling producer registration; explicit broader resource
+selectors/dirfds for workspace/shared wiki/connectors/recipients (existing own
+resource grants are not full product coverage); protected ephemeral provisioning;
+remote full-package compatibility/tests; formal security review; signed provider
+home provisioning and root/provider acceptance. Background authority and egress
+alias propagation no longer remain wholly unimplemented, but live acceptance is
+still a separate unfinished gate.

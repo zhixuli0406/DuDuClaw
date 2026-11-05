@@ -32,13 +32,16 @@ fn refusal() -> String {
 
 /// The writer drains concurrently with runtime output. Its error must be
 /// observed before accepting a successful result; drop cancels pending input.
-pub(crate) struct PromptWriter(tokio::task::JoinHandle<Result<(), String>>);
+pub(crate) struct PromptWriter {
+    task: tokio::task::JoinHandle<Result<(), String>>,
+    _principal_context: Option<crate::on_behalf_of::context::ContextGuard>,
+}
 impl PromptWriter {
     pub(crate) async fn finish(&mut self) -> Result<(), String> {
-        (&mut self.0).await.map_err(|_| refusal())?
+        (&mut self.task).await.map_err(|_| refusal())?
     }
 }
-impl Drop for PromptWriter { fn drop(&mut self) { self.0.abort(); } }
+impl Drop for PromptWriter { fn drop(&mut self) { self.task.abort(); } }
 
 async fn write_prompt<W: tokio::io::AsyncWrite + Unpin>(mut stdin: W, bytes: &[u8], deadline: Duration)
     -> Result<(), String> {
@@ -63,7 +66,19 @@ fn take_authorization(agent_dir: &std::path::Path) -> Result<RuntimeAuthorizatio
 
 pub(crate) async fn spawn_claude(agent_dir: &std::path::Path, prompt: &str, system_prompt: &str, model: &str)
     -> Result<(crate::process_group::BackendChild, PromptWriter), String> {
-    let authorization = take_authorization(agent_dir)?;
+    let (authorization, principal_context) = if AUTHORIZATION.try_with(|_| ()).is_ok() {
+        (take_authorization(agent_dir)?, None)
+    } else {
+        let agent = agent_dir.file_name().and_then(|name| name.to_str()).ok_or_else(refusal)?;
+        let home = agent_dir.parent().and_then(|path| path.parent()).ok_or_else(refusal)?;
+        let guard = crate::on_behalf_of::context::register(home, agent).ok_or_else(refusal)?;
+        let authorization = if crate::isolation_background::has_scope() {
+            crate::isolation_background::authorize_current(agent_dir, Some(guard.reference().into())).await
+        } else {
+            super::ingress::authorize_current(agent_dir, Some(guard.reference().into())).await
+        }.map_err(|_| refusal())?;
+        (authorization, Some(guard))
+    };
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
     let plan = super::boot::claude_plan(authorization.home, authorization.agent.clone(), class,
         prompt.as_bytes().to_vec(), system_prompt.as_bytes().to_vec(), model.into()).await.map_err(|_| refusal())?;
@@ -93,7 +108,7 @@ pub(crate) async fn spawn_claude(agent_dir: &std::path::Path, prompt: &str, syst
         }
         Ok(())
     });
-    Ok((child, PromptWriter(writer)))
+    Ok((child, PromptWriter { task: writer, _principal_context: principal_context }))
 }
 
 #[cfg(test)]

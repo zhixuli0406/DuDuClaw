@@ -14,6 +14,14 @@ use crate::{isolation_connectors::{BoundConnectorExecutor, ConnectorCatalog},
 /// the adapter must authenticate its original dispatcher and check completeness.
 pub trait DispatcherFactory: Send + Sync {
     fn create(&self, input: DispatcherInput) -> Result<Arc<dyn Dispatcher>, VerificationError>;
+    fn verify_producers(&self, _execution: &dyn ExecutionPlanFactory, _worker: &dyn WorkerPlanFactory)
+        -> Result<(), VerificationError> { Err(VerificationError::Unavailable) }
+    /// Snapshot the real product catalog under the employee's current policy.
+    /// Completeness is still checked independently when creating a dispatcher.
+    fn ingress_tools(&self, _home: &Path, _agent: &str, _lane: duduclaw_isolation::capability::Lane)
+        -> Result<duduclaw_isolation::bounded::List<duduclaw_isolation::bounded::Text<128>, 256>, VerificationError> {
+        Err(VerificationError::Unavailable)
+    }
 }
 pub struct DispatcherInput {
     pub home: PathBuf,
@@ -34,6 +42,7 @@ pub struct DispatcherInput {
 #[derive(Default)]
 pub struct BootSources {
     product_authority: Option<Arc<super::authority::GatewayAuthority>>,
+    installed_generation: Option<duduclaw_isolation::ids::Sha256Digest>,
     pub authority: Option<Arc<dyn LiveAuthority>>,
     pub bindings: Option<Arc<dyn BindingAuthority>>,
     pub runtime_registry: Option<Arc<dyn RuntimeBridgeRegistry>>,
@@ -75,8 +84,10 @@ pub fn install_boot_sources(sources: BootSources) -> Result<(), VerificationErro
     Ok(())
 }
 fn fill_installed_sources(sources: &mut BootSources) {
+    let generation = crate::isolation_readiness::verified_generation();
+    sources.installed_generation = generation;
     if sources.main_plans.is_none() {
-        if let Some(generation) = crate::isolation_readiness::verified_generation() {
+        if let Some(generation) = generation {
             if let Ok(factory) = duduclaw_spawnd::gateway_plan::InstalledMainPlanFactory::new(
                 generation, nix::unistd::getegid().as_raw()) {
                 sources.main_plans = Some(Arc::new(factory));
@@ -84,7 +95,7 @@ fn fill_installed_sources(sources: &mut BootSources) {
         }
     }
     if sources.runtime_registry.is_none() {
-        if let Some(generation) = crate::isolation_readiness::verified_generation() {
+        if let Some(generation) = generation {
             if let Ok(registry) = duduclaw_spawnd::gateway_mcp::InstalledRuntimeRegistry::new(
                 generation, nix::unistd::getegid().as_raw()) {
                 sources.runtime_registry = Some(Arc::new(registry));
@@ -156,6 +167,10 @@ pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agen
             Ok(owner) => {
                 if OWNER.set(Arc::new(owner)).is_ok() {
                     let _ = STATUS.set(BootStatus { constructed: true, missing: vec![] });
+                    if crate::isolation_readiness::install_integration_probe(
+                        crate::isolation_readiness::IntegrationComponent::McpBoundary, Arc::new(BoundaryReadiness)).is_err() {
+                        tracing::error!("隔離工具服務的狀態檢查無法註冊，團隊執行維持暫停。");
+                    }
                 }
             }
             Err(_) => {
@@ -187,6 +202,7 @@ pub struct LaunchInput {
     pub authenticated_epoch: Option<u64>,
 }
 struct BootOwner {
+    generation: duduclaw_isolation::ids::Sha256Digest,
     product_authority: Option<Arc<super::authority::GatewayAuthority>>,
     home: PathBuf,
     backend: Arc<duduclaw_execution::SpawndBackend>,
@@ -202,6 +218,96 @@ struct BootOwner {
     catalog: Option<Arc<ConnectorCatalog>>,
     connectors: Option<Arc<dyn BoundConnectorExecutor>>,
 }
+
+/// D proves its live owner and the binary's actual complete routing inventory.
+/// E's containment and all configured runtimes have separate mandatory probes.
+struct BoundaryReadiness;
+impl crate::isolation_readiness::IntegrationProbe for BoundaryReadiness {
+    fn verify_producers(&self) -> Result<(), crate::isolation_readiness::ProbeError> {
+        use crate::isolation_readiness::ProbeError;
+        let owner = OWNER.get().ok_or(ProbeError::Unavailable)?;
+        if owner.product_authority.is_none() || !cfg!(feature = "isolation-worker-integration") {
+            return Err(ProbeError::Unavailable);
+        }
+        DISPATCHER.get().ok_or(ProbeError::Unavailable)?.verify_producers(
+            owner.execution_plans.as_ref(), owner.worker_plans.as_ref()).map_err(|_| ProbeError::Unavailable)
+    }
+    fn verify_service(&self, generation: duduclaw_isolation::ids::Sha256Digest)
+        -> Result<crate::isolation_readiness::ServiceObservation, crate::isolation_readiness::ProbeError> {
+        use crate::isolation_readiness::{ProbeError, ServiceObservation};
+        let started = std::time::Instant::now();
+        let owner = OWNER.get().ok_or(ProbeError::Unavailable)?;
+        if !owner.boundary.healthy() || owner.generation != generation { return Err(ProbeError::Unavailable); }
+        let backend = duduclaw_execution::selection::protected_backend_for_boot().map_err(|_| ProbeError::Unavailable)?;
+        if !Arc::ptr_eq(&owner.backend, &backend) { return Err(ProbeError::Unavailable); }
+        let publication = duduclaw_spawnd::installed::GatewayPublication::read(nix::unistd::getegid().as_raw())
+            .map_err(|_| ProbeError::Unavailable)?;
+        if publication.generation != generation { return Err(ProbeError::Unavailable); }
+        // B1's authenticated receipt is independently required by the composite
+        // gate. This proof adds the exact owner/control instance and D lifetime.
+        Ok(ServiceObservation::checked(publication.generation, started))
+    }
+}
+
+/// Only the authenticated ingress module calls this after consuming its proof.
+/// Gateway-owned namespaces are finite grants. Workspace/connector/recipient
+/// grants require their own authenticated host selectors and are not inferred.
+pub(crate) fn human_authorization(home: PathBuf, agent: String, user: String, epoch: u64,
+    lane: duduclaw_isolation::capability::Lane, turn: super::HostTurn, credential_expiry: Option<u64>)
+    -> Result<super::RuntimeAuthorization, VerificationError> {
+    use duduclaw_isolation::{bounded::{List, Text}, capability::{EmployeeBinding, Principal, ResourceGrant}};
+    let owner = OWNER.get().ok_or(VerificationError::Unavailable)?;
+    if owner.home != home || !owner.boundary.healthy() { return Err(VerificationError::Unavailable); }
+    let authority = owner.product_authority.as_ref().ok_or(VerificationError::Unavailable)?;
+    let current = authority.ingress_snapshot(&user, &agent)?;
+    super::ingress::require_epoch(epoch, current.human.as_ref().map(|human| human.credential_epoch))?;
+    let receipt = crate::handlers::resolve_confirmed_employee(&home, &agent)
+        .map_err(|_| VerificationError::Unavailable)?;
+    if receipt.disabled { return Err(VerificationError::Revoked); }
+    let policy = crate::approval::strict_policy_revision(&home, &agent)
+        .map_err(|_| VerificationError::Unavailable)?;
+    let tools = DISPATCHER.get().ok_or(VerificationError::Unavailable)?.ingress_tools(&home, &agent, lane)?;
+    let text = |value| Text::new(value).map_err(|_| VerificationError::Invalid);
+    let namespace = format!("agent:{agent}");
+    let mut resources = vec![ResourceGrant::Employee { id: receipt.employee },
+        ResourceGrant::Mailbox { id: text(namespace.clone())? }];
+    for table in ["working_state", "beliefs", "user_profile", "decisions", "memory"] {
+        resources.push(ResourceGrant::DatabaseTable { database: text(namespace.clone())?, table: text(table.into())? });
+    }
+    let mut roots = ResourceRoots::default();
+    // These directories live in gateway-private state, never the writable
+    // employee mount. Walk from a trusted home fd without following symlinks.
+    if let Some(wiki) = super::ingress::own_wiki_root(&home, &agent)? {
+        roots.insert_wiki(namespace.clone(), receipt.employee, wiki)?;
+        resources.push(ResourceGrant::Wiki { namespace: text(namespace)? });
+    }
+    let after = authority.ingress_snapshot(&user, &agent)?;
+    if current.acl_generation != after.acl_generation || current.policy_epoch != after.policy_epoch
+        || current.tenant_id != after.tenant_id
+        || after.human.as_ref().map(|human| human.credential_epoch) != Some(epoch)
+        || crate::approval::strict_policy_revision(&home, &agent).ok().as_deref() != Some(policy.as_str()) {
+        return Err(VerificationError::Revoked);
+    }
+    let now = duduclaw_mcp_boundary::authority::now_seconds()?;
+    let expires_at = now.checked_add(30 * 60).ok_or(VerificationError::InvalidTime)?
+        .min(credential_expiry.unwrap_or(u64::MAX));
+    if expires_at <= now { return Err(VerificationError::InvalidTime); }
+    Ok(super::RuntimeAuthorization { home, agent, grant: GrantPolicy {
+        task: None, principal: Principal::Human { user_id: text(user)?, generation: current.acl_generation },
+        binding: EmployeeBinding::Shared(text(current.tenant_id)?), lane, tools,
+        resources: List::new(resources).map_err(|_| VerificationError::Invalid)?,
+        policy_revision: current.policy_epoch, not_before: now, expires_at }, roots: Arc::new(roots),
+        origin: WaitOrigin::Gateway, caller: None, turn: Some(turn), authenticated_epoch: Some(epoch) })
+}
+
+pub(crate) fn delegation_source(home: &Path, sender: &str, context: &duduclaw_mcp_boundary::RequestContext)
+    -> Result<crate::isolation_background::DelegationSource, VerificationError> {
+    let owner = OWNER.get().ok_or(VerificationError::Unavailable)?;
+    if owner.home != home || !owner.boundary.healthy() { return Err(VerificationError::Unavailable); }
+    let source = owner.product_authority.as_ref().ok_or(VerificationError::Unavailable)?.delegation_source(context)?;
+    if source.agent != sender { return Err(VerificationError::BindingMismatch); }
+    Ok(source)
+}
 #[cfg(feature = "isolation-worker-integration")]
 fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut sources: BootSources)
     -> Result<BootOwner, VerificationError> {
@@ -213,7 +319,8 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
     let boundary = McpBoundaryService::start(live)?;
     let worker = crate::isolation_execution::install_worker_services(
         sources.worker_launcher.take().ok_or(VerificationError::Unavailable)?)?;
-    Ok(BootOwner { product_authority: sources.product_authority, home: home.to_owned(), backend, boundary, bindings, worker,
+    Ok(BootOwner { generation: sources.installed_generation.ok_or(VerificationError::Unavailable)?,
+        product_authority: sources.product_authority, home: home.to_owned(), backend, boundary, bindings, worker,
         registry: sources.runtime_registry.take().ok_or(VerificationError::Unavailable)?,
         main_plans: sources.main_plans.take().ok_or(VerificationError::Unavailable)?,
         execution_plans: sources.execution_plans.take().ok_or(VerificationError::Unavailable)?,

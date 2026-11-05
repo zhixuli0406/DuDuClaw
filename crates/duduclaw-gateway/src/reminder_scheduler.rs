@@ -903,6 +903,7 @@ where
     F: FnOnce(String, String) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
+    let material = crate::isolation_background::material::reminder(reminder);
     let mut resolved_reminder = reminder.clone();
     resolved_reminder.agent_id = crate::recipient_guard::scheduled_agent(registry, &reminder.agent_id).await?;
     let reminder = &resolved_reminder;
@@ -961,13 +962,18 @@ where
             // Read the denial flag inside the scope: runtimes wrap the refusal
             // text, so a pause landing after the check above must still leave
             // the reminder Pending rather than Failed.
-            let (result, denied) = crate::autonomous_runtime::scope(
+            let (result, denied) = crate::isolation_background::scope_record(
+                home_dir, "reminder", &reminder.id, &reminder.agent_id,
+                reminder.on_behalf_of.as_deref(), &material, crate::autonomous_runtime::scope(
                 home_dir, &reminder.agent_id, &[],
                 async {
+                    if crate::isolation_background::approval_pending() {
+                        return (Err("背景工作正在等候管理員核准。".into()), true);
+                    }
                     let result = invoke(reminder.agent_id.clone(), full_prompt).await;
                     (result, crate::autonomous_runtime::was_denied())
                 },
-            )
+            ))
             .await;
             drop(typing_guard);
             if denied {

@@ -15,15 +15,19 @@ const MAX_ASSOCIATIONS: usize = 4096;
 /// missing; employee payloads and process environment never reconstruct them.
 pub struct HostTurn {
     pub identity: RunTurnIdentity,
+    pub egress_turn: Option<String>,
     pub metadata: Option<RunMetadata>,
     pub principal_context: Option<String>,
+    pub background: Option<crate::isolation_background::RecordAuthority>,
 }
 #[derive(Clone)]
 struct CapturedTurn {
     turn: String,
+    egress_turn: Option<String>,
     approval_session: Option<String>,
     metadata: Option<RunMetadata>,
     principal_context: Option<String>,
+    background: Option<crate::isolation_background::RecordAuthority>,
 }
 #[derive(Clone)]
 pub struct PreparedAuthority {
@@ -43,8 +47,9 @@ impl PreparedAuthority {
     pub fn revision(&self) -> u64 { self.revision }
     pub fn with_turn(mut self, turn: HostTurn) -> Self {
         self.turn = Some(CapturedTurn { turn: turn.identity.turn,
+            egress_turn: turn.egress_turn,
             approval_session: turn.identity.approval_session, metadata: turn.metadata,
-            principal_context: turn.principal_context });
+            principal_context: turn.principal_context, background: turn.background });
         self
     }
 }
@@ -59,6 +64,11 @@ pub struct GatewayAuthority {
     runs: Mutex<BTreeMap<RunId, PreparedAuthority>>,
 }
 impl GatewayAuthority {
+    pub(super) fn ingress_snapshot(&self, user: &str, agent: &str)
+        -> Result<duduclaw_auth::IsolationAuthoritySnapshot, VerificationError> {
+        (self.agents)(agent)?;
+        self.users.isolation_authority_snapshot(Some(user), agent).map_err(|_| VerificationError::Revoked)
+    }
     pub fn new(home: PathBuf, users: Arc<UserDb>, backend: Arc<SpawndBackend>, agents: Arc<super::AgentAdmission>)
         -> Result<Self, VerificationError> {
         if !home.is_absolute() { return Err(VerificationError::Invalid); }
@@ -112,6 +122,9 @@ impl GatewayAuthority {
         // Preserve the epoch authenticated at ingress; taking the current one
         // here would revive a session revoked before execution admission.
         if credential_epoch != authenticated_epoch { return Err(VerificationError::Revoked); }
+        // Ingress grants were derived under this policy epoch. A policy change
+        // between capture and reservation must not revive the old grant set.
+        if grant.policy_revision != policy_epoch { return Err(VerificationError::Revoked); }
         let policy = crate::approval::strict_policy_revision(&self.home, agent)
             .map_err(|_| VerificationError::Unavailable)?;
         // This is an epoch-local handle, not a shortened policy hash. Every
@@ -132,6 +145,9 @@ impl GatewayAuthority {
     }
 
     fn recheck(&self, prepared: &PreparedAuthority) -> Result<(), VerificationError> {
+        if let Some(receipt) = prepared.turn.as_ref().and_then(|turn| turn.background.as_ref()) {
+            crate::isolation_background::recheck(receipt)?;
+        }
         if duduclaw_mcp_boundary::authority::now_seconds()? >= prepared.expires_at {
             return Err(VerificationError::InvalidTime);
         }
@@ -196,6 +212,23 @@ impl GatewayAuthority {
         }
         self.prepared(RunHandle(record.run))?.turn.ok_or(VerificationError::Unavailable)
     }
+
+    pub(super) fn delegation_source(&self, context: &RequestContext)
+        -> Result<crate::isolation_background::DelegationSource, VerificationError> {
+        let turn = self.turn(context)?;
+        let prepared = self.prepared(RunHandle(context.record().run))?;
+        let Principal::Human { user_id, generation } = prepared.principal else {
+            return Err(VerificationError::Invalid);
+        };
+        Ok(crate::isolation_background::DelegationSource {
+            owner: duduclaw_core::HumanPrincipal::user(user_id.as_str()).ok_or(VerificationError::Invalid)?.to_string(),
+            epoch: prepared.credential_epoch.ok_or(VerificationError::Invalid)?,
+            acl_generation: generation, policy_epoch: prepared.policy_epoch,
+            policy: prepared.policy, agent: prepared.agent, employee: prepared.employee,
+            run: RunHandle(context.record().run), expires_at: prepared.expires_at,
+            lane: context.record().lane, parent: turn.background,
+        })
+    }
 }
 
 fn compare_revision(prepared: &PreparedAuthority, epoch: Option<u64>, policy_epoch: u64, policy: &str)
@@ -240,12 +273,16 @@ impl RunTurnResolver for GatewayAuthority {
         let turn = self.turn(context)?;
         if turn.turn.is_empty() { return Err(VerificationError::Unavailable); }
         Ok(ResolvedRunTurn { identity: RunTurnIdentity { turn: turn.turn, approval_session: turn.approval_session },
+            egress_turn: turn.egress_turn,
             metadata: turn.metadata, principal_context: turn.principal_context, utility_runner: None })
     }
     fn resolve(&self, context: &RequestContext) -> Result<RunTurnIdentity, VerificationError> {
         let turn = self.turn(context)?;
         if turn.turn.is_empty() { return Err(VerificationError::Unavailable); }
         Ok(RunTurnIdentity { turn: turn.turn, approval_session: turn.approval_session })
+    }
+    fn egress_turn(&self, context: &RequestContext) -> Result<Option<String>, VerificationError> {
+        Ok(self.turn(context)?.egress_turn)
     }
     fn metadata(&self, context: &RequestContext) -> Result<Option<RunMetadata>, VerificationError> {
         Ok(self.turn(context)?.metadata)

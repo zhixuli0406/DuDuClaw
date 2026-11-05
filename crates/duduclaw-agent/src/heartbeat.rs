@@ -214,6 +214,17 @@ pub type HostRunNotice = Arc<dyn Fn(&Path, &str, bool) + Send + Sync>;
 /// Gateway-supplied employee budget gate; runs before any proactive model spawn.
 pub type BudgetGate = Arc<dyn Fn(PathBuf, PathBuf, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> + Send + Sync>;
 
+/// The gateway owns protected heartbeat authority and runtime dispatch. Passing
+/// content here never grants permission; the callback verifies the stored owner
+/// approval before the isolated runtime can reserve a run.
+pub type ProtectedProactiveInvoker = Arc<dyn Fn(PathBuf, String, String, serde_json::Value)
+    -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>> + Send + Sync>;
+static PROTECTED_PROACTIVE: std::sync::OnceLock<ProtectedProactiveInvoker> = std::sync::OnceLock::new();
+
+pub fn install_protected_proactive_invoker(invoker: ProtectedProactiveInvoker) -> Result<(), String> {
+    PROTECTED_PROACTIVE.set(invoker).map_err(|_| "protected heartbeat invoker already installed".into())
+}
+
 pub struct HeartbeatScheduler {
     home_dir: PathBuf,
     registry: Arc<RwLock<AgentRegistry>>,
@@ -1247,9 +1258,21 @@ async fn execute_proactive_check(
         warn!(agent = agent_id, "Proactive check refused: {reason}");
         return;
     }
-    let claude = duduclaw_core::which_claude();
-
-    let result = match claude {
+    let result = if duduclaw_core::execution_gate::isolation_required() {
+        let Some(invoker) = PROTECTED_PROACTIVE.get() else {
+            warn!(agent = agent_id, "Protected heartbeat invoker unavailable");
+            return;
+        };
+        let material = serde_json::json!({"agent_id": agent_id,
+            "proactive": agent_config.proactive, "checks": proactive_md});
+        match invoker(home_dir.to_owned(), agent_id.to_owned(), prompt, material).await {
+            Ok(result) => result,
+            Err(error) => {
+                warn!(agent = agent_id, %error, "Protected heartbeat refused");
+                return;
+            }
+        }
+    } else { match duduclaw_core::which_claude() {
         Some(claude_path) => {
             // Not the task sandbox: the check needs the agent's MCP tools.
             // Report it for a sandbox-enabled employee (the gateway's notice
@@ -1365,7 +1388,7 @@ async fn execute_proactive_check(
             warn!(agent = agent_id, "Proactive check: claude CLI not found");
             return;
         }
-    };
+    }};
 
     // Parse result — silent or actionable?
     match proactive::parse_proactive_result(&result) {

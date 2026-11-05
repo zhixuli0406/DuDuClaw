@@ -9,11 +9,15 @@ pub trait RunTurnResolver: Send + Sync {
     /// Resolve related host fields as one observation. Production registries
     /// override this to reuse a single fresh run/authority lookup.
     fn resolve_run(&self, context: &RequestContext) -> Result<ResolvedRunTurn, VerificationError> {
-        Ok(ResolvedRunTurn { identity: self.resolve(context)?, metadata: self.metadata(context)?,
+        Ok(ResolvedRunTurn { identity: self.resolve(context)?, egress_turn: self.egress_turn(context)?, metadata: self.metadata(context)?,
             principal_context: self.principal_context(context)?, utility_runner: self.utility_runner() })
     }
 
     fn resolve(&self, context: &RequestContext) -> Result<RunTurnIdentity, VerificationError>;
+
+    /// Host-minted execution alias, distinct from the original conversation
+    /// turn. Missing linkage stays unknown; it must never reuse provenance.
+    fn egress_turn(&self, _context: &RequestContext) -> Result<Option<String>, VerificationError> { Ok(None) }
 
     /// Read delegation and callback metadata from this run's host-owned row.
     /// Returning no metadata does not identify a root run: nested runs must
@@ -36,6 +40,7 @@ pub trait RunTurnResolver: Send + Sync {
 /// One host-owned turn snapshot, including its utility execution service.
 pub struct ResolvedRunTurn {
     pub identity: RunTurnIdentity,
+    pub egress_turn: Option<String>,
     pub metadata: Option<RunMetadata>,
     pub principal_context: Option<String>,
     pub utility_runner: Option<Arc<dyn UtilityRunner>>,
@@ -129,6 +134,7 @@ pub(crate) struct CallIdentity {
     home: PathBuf,
     agent: String,
     pub(crate) turn: String,
+    provenance_turn: String,
     approval_session: Option<String>,
     principal_context: String,
     metadata: Option<RunMetadata>,
@@ -141,7 +147,7 @@ pub async fn scope<F: Future>(home: &Path, agent: &str, context: &RequestContext
     if !duduclaw_core::is_valid_agent_id(agent) || duduclaw_core::is_reserved_agent_id(agent) {
         return Err(VerificationError::Invalid);
     }
-    let ResolvedRunTurn { identity, metadata, principal_context: registered, utility_runner } = match resolver {
+    let ResolvedRunTurn { identity, egress_turn, metadata, principal_context: registered, utility_runner } = match resolver {
         Some(resolver) => {
             let context = context.clone();
             duduclaw_mcp_boundary::authority::verify_blocking(move || resolver.resolve_run(&context)).await?
@@ -149,7 +155,7 @@ pub async fn scope<F: Future>(home: &Path, agent: &str, context: &RequestContext
         // Never register this as a fresh clean turn. Unknown lineage is tainted.
         None => ResolvedRunTurn { identity: RunTurnIdentity {
             turn: format!("isolated-run-{}", hex::encode(context.record().run.0)), approval_session: None },
-            metadata: None, principal_context: None, utility_runner: None },
+            egress_turn: None, metadata: None, principal_context: None, utility_runner: None },
     };
     let RunTurnIdentity { turn, approval_session } = identity;
     if let Some(metadata) = &metadata { metadata.validate()?; }
@@ -159,6 +165,11 @@ pub async fn scope<F: Future>(home: &Path, agent: &str, context: &RequestContext
     if !crate::computer_use_sessions::turns::valid_turn_id(&turn) {
         return Err(VerificationError::Invalid);
     }
+    let egress_turn = match egress_turn {
+        Some(alias) if crate::computer_use_sessions::turns::valid_turn_id(&alias) => alias,
+        Some(_) => return Err(VerificationError::Invalid),
+        None => format!("isolated-run-{}", hex::encode(context.record().run.0)),
+    };
     if approval_session.as_ref().is_some_and(|session| session.is_empty() || session.len() > 1024
         || session.chars().any(char::is_control)) { return Err(VerificationError::Invalid); }
     let principal = match &context.record().principal {
@@ -195,14 +206,15 @@ pub async fn scope<F: Future>(home: &Path, agent: &str, context: &RequestContext
     Ok(crate::on_behalf_of::ON_BEHALF_OF.scope(principal,
         crate::claude_runner::REPLY_CHANNEL.scope(reply_channel,
         crate::claude_runner::REPLY_SENDER.scope(reply_sender,
-        CALL.scope(CallIdentity { context: context.clone(), utility_runner, home: home.into(), agent: agent.into(), turn, approval_session,
+        CALL.scope(CallIdentity { context: context.clone(), utility_runner, home: home.into(), agent: agent.into(),
+            turn: egress_turn, provenance_turn: turn, approval_session,
             principal_context, metadata }, future)))).await)
 }
 
 /// Request-local compatibility inputs for existing MCP handlers. No process
 /// environment fallback; the guard is revoked when the request future ends.
 pub fn resolved_identity() -> Option<(String, Option<String>)> {
-    CALL.try_with(|call| (call.turn.clone(), call.approval_session.clone())).ok()
+    CALL.try_with(|call| (call.provenance_turn.clone(), call.approval_session.clone())).ok()
 }
 
 pub fn principal_context() -> Option<String> {
@@ -213,11 +225,15 @@ pub fn run_metadata() -> Option<RunMetadata> {
     CALL.try_with(|call| call.metadata.clone()).ok().flatten()
 }
 
-pub(crate) fn turn() -> Option<String> { CALL.try_with(|call| call.turn.clone()).ok() }
+/// Execution-only identity for the original product's egress clients. Approval
+/// and memory consumers must use resolved_identity instead.
+pub fn execution_turn() -> Option<String> { CALL.try_with(|call| call.turn.clone()).ok() }
+
+pub(crate) fn turn() -> Option<String> { execution_turn() }
 
 pub(crate) fn approval_origin() -> Option<Result<(String, String), String>> {
     CALL.try_with(|call| call.approval_session.as_ref()
-        .map(|session| (session.clone(), call.turn.clone()))
+        .map(|session| (session.clone(), call.provenance_turn.clone()))
         .ok_or_else(|| "isolated approval turn origin unavailable".into())).ok()
 }
 
@@ -249,6 +265,7 @@ mod tests {
         fn resolve(&self, _: &RequestContext) -> Result<RunTurnIdentity, VerificationError> {
             Ok(RunTurnIdentity { turn: self.0.clone(), approval_session: None })
         }
+        fn egress_turn(&self, _: &RequestContext) -> Result<Option<String>, VerificationError> { Ok(Some(self.0.clone())) }
     }
 
     #[derive(Clone)]
@@ -275,7 +292,7 @@ mod tests {
             fn resolve_run(&self, _: &RequestContext) -> Result<ResolvedRunTurn, VerificationError> {
                 assert_ne!(std::thread::current().id(), self.reactor);
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(ResolvedRunTurn { identity: RunTurnIdentity { turn: "host-turn".into(), approval_session: None },
+                Ok(ResolvedRunTurn { identity: RunTurnIdentity { turn: "host-turn".into(), approval_session: None }, egress_turn: None,
                     metadata: Some(RunMetadata::root()), principal_context: None, utility_runner: None })
             }
         }
@@ -333,6 +350,49 @@ mod tests {
         assert!(taint.tainted);
         assert!(taint.sources.iter().any(|source| source == "file_read"));
         assert!(super::turn().is_none());
+    }
+
+    #[tokio::test]
+    async fn isolated_execution_alias_preserves_provenance_approvals_and_monotonic_taint() {
+        struct SeparateTurns { original: String, execution: Option<String> }
+        impl RunTurnResolver for SeparateTurns {
+            fn resolve(&self, _: &RequestContext) -> Result<RunTurnIdentity, VerificationError> {
+                Ok(RunTurnIdentity { turn: self.original.clone(), approval_session: Some("original-session".into()) })
+            }
+            fn egress_turn(&self, _: &RequestContext) -> Result<Option<String>, VerificationError> {
+                Ok(self.execution.clone())
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let agent = format!("alias-{}", uuid::Uuid::new_v4().simple());
+        std::fs::create_dir_all(home.path().join("agents").join(&agent)).unwrap();
+        std::fs::write(home.path().join("agents").join(&agent).join("agent.toml"), "").unwrap();
+        let original = uuid::Uuid::new_v4().to_string();
+        let execution = format!("runtime-{}", uuid::Uuid::new_v4().simple());
+        crate::egress_guard::register_turn(&agent, &execution);
+        // An old, unregistered provenance turn must not make a current runtime
+        // unknown, and private reads must taint that same runtime across calls.
+        for private in [false, true] {
+            let resolver = SeparateTurns { original: original.clone(), execution: Some(execution.clone()) };
+            scope(home.path(), &agent, &context(), Some(Arc::new(resolver)), async {
+                assert_eq!(resolved_identity(), Some((original.clone(), Some("original-session".into()))));
+                assert_eq!(approval_origin().unwrap().unwrap(), ("original-session".into(), original.clone()));
+                assert_eq!(super::turn(), Some(execution.clone()));
+                assert_eq!(crate::egress_client::query(home.path(), &agent).await.tainted, private);
+                crate::egress_client::mark(home.path(), &agent, "file_read").await.unwrap();
+            }).await.unwrap();
+        }
+        assert!(crate::egress_guard::query_turn(&agent, Some(&original)).tainted);
+        // Missing execution linkage never falls back to even a registered,
+        // clean provenance turn. A malformed alias refuses outright.
+        crate::egress_guard::register_turn(&agent, &original);
+        let resolver = SeparateTurns { original: original.clone(), execution: None };
+        scope(home.path(), &agent, &context(), Some(Arc::new(resolver)), async {
+            assert!(crate::egress_client::query(home.path(), &agent).await.tainted);
+            assert_ne!(super::turn(), Some(original.clone()));
+        }).await.unwrap();
+        let resolver = SeparateTurns { original, execution: Some("invalid\nalias".into()) };
+        assert!(scope(home.path(), &agent, &context(), Some(Arc::new(resolver)), async {}).await.is_err());
     }
 
     #[tokio::test]
