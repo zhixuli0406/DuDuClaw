@@ -21,8 +21,8 @@
 //!   (see `docs/todo` conventions on graduated confidence). Advanced users
 //!   can opt into hard-blocking via `delivery_gate_placeholder_block`.
 //!
-//! Everything here is pure byte-level inspection — zero LLM calls, zero
-//! network calls. The only I/O is the best-effort audit/Activity Feed write
+//! Checks use zero LLM calls. Protected Office inspection is delegated over
+//! the fixed local parse-worker socket. Other I/O is the audit/Activity Feed write
 //! on a verdict, which never turns into a delivery failure of its own.
 //!
 //! Scope boundary: this module owns the **outbound** `📎DELIVER:` path only.
@@ -163,7 +163,7 @@ fn scan_placeholders(text: &str) -> Vec<String> {
     hits
 }
 
-// ── Pure check — zero I/O, directly unit-testable ───────────────────────
+// ── Byte checks and isolated container preflight ───────────────────────
 
 /// Evaluate one deliverable's bytes against the gate.
 ///
@@ -178,7 +178,7 @@ fn scan_placeholders(text: &str) -> Vec<String> {
 ///
 /// `path` is used only for its extension and basename (for the message); the
 /// bytes to check are `data`, already read by the caller — this function
-/// does no filesystem I/O of its own.
+/// never opens the caller path; protected container checks use the worker.
 pub fn evaluate_bytes(
     path: &Path,
     data: &[u8],
@@ -209,8 +209,11 @@ pub fn evaluate_bytes(
             ));
         }
         if ZIP_CONTAINER_EXTS.contains(&ext) {
-            let cursor = std::io::Cursor::new(data);
-            if zip::ZipArchive::new(cursor).is_err() {
+            if duduclaw_parse_worker::client::required() {
+                crate::document_limits::guard_document_bytes(data,
+                    &crate::document_limits::DocumentLimits::default())
+                    .map_err(|error| error.user_message(display_name))?;
+            } else if zip::ZipArchive::new(std::io::Cursor::new(data)).is_err() {
                 return Err(format!(
                     "交付檔案「{display_name}」的壓縮封裝已損毀或被截斷，無法開啟，已攔截未送出。這通常是寫入中斷或磁碟空間不足造成的，請重新產生這個檔案後再交付。"
                 ));
@@ -266,7 +269,21 @@ pub async fn run_delivery_gate(
         return Ok(Vec::new());
     }
     let (_, agent_id) = derive_home_and_agent(agent_dir);
-    match evaluate_bytes(path, data, cfg) {
+    let needs_worker = duduclaw_parse_worker::client::required()
+        && path.extension().and_then(|value| value.to_str())
+            .is_some_and(|value| ZIP_CONTAINER_EXTS.contains(&value.to_ascii_lowercase().as_str()));
+    let verdict = if needs_worker {
+        if data.len() as u64 > duduclaw_parse_worker::policy::MAX_FILE_BYTES {
+            Err("檔案超過隔離檢查的大小上限，已攔截未送出。".to_string())
+        } else {
+            let path = path.to_owned();
+            let data = data.to_vec();
+            let cfg = *cfg;
+            tokio::task::spawn_blocking(move || evaluate_bytes(&path, &data, &cfg)).await
+                .unwrap_or_else(|_| Err("檔案檢查未完成，已攔截未送出。".to_string()))
+        }
+    } else { evaluate_bytes(path, data, cfg) };
+    match verdict {
         Err(reason) => {
             record_gate_event(
                 home_dir,

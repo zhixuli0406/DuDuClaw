@@ -59,6 +59,8 @@ pub async fn extract_file(
             ),
         ));
     }
+    // Custom document limits remain mandatory. Protected installations send
+    // the complete policy to the disposable worker before extraction.
     if format.is_ooxml() {
         let limits = crate::document_limits::DocumentLimits::from_home(home);
         let p = path.to_path_buf();

@@ -238,6 +238,9 @@ pub async fn run(
     input: &Path,
     limits: SpawnLimits,
 ) -> Result<Spawned, ExtractError> {
+    if duduclaw_parse_worker::client::required() {
+        return run_isolated(format, input, limits).await;
+    }
     let mut std_cmd = std::process::Command::new(&cmd.program);
     std_cmd
         .args(&cmd.leading_args)
@@ -314,6 +317,49 @@ pub async fn run(
             .unwrap_or_else(crashed)),
         _ => Err(classify(status, &stderr)),
     }
+}
+
+/// Native isolation never launches the legacy extractor under the gateway uid.
+/// The structured worker output preserves the existing extraction metadata.
+async fn run_isolated(format: Format, input: &Path, limits: SpawnLimits) -> Result<Spawned, ExtractError> {
+    use duduclaw_parse_worker::{adapters, worker::{ParseError, WorkerLimits}};
+    let format = duduclaw_knowledge::extract::worker_format(format);
+    let input = input.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut file = options.open(&input).map_err(|_| ParseError::InvalidContent)?;
+        if !file.metadata().map_err(|_| ParseError::InvalidContent)?.is_file() {
+            return Err(ParseError::InvalidContent);
+        }
+        let memory = limits.memory_mb.saturating_mul(1024 * 1024)
+            .min(duduclaw_parse_worker::policy::MAX_MEMORY_BYTES).try_into().map_err(|_| ParseError::LimitExceeded)?;
+        let wall = limits.timeout.as_millis().min(u128::from(duduclaw_parse_worker::policy::MAX_WALL_TIME_MS)) as u32;
+        let bytes = limits.max_chars.saturating_mul(4)
+            .min(duduclaw_parse_worker::worker::MAX_RESULT_TEXT_BYTES) as u32;
+        let output = adapters::extract_knowledge_file(&mut file, format,
+            u32::try_from(limits.max_chars).map_err(|_| ParseError::LimitExceeded)?, WorkerLimits {
+            memory_bytes: memory,
+            wall_time_ms: wall.try_into().map_err(|_| ParseError::LimitExceeded)?,
+            max_result_text_bytes: bytes.try_into().map_err(|_| ParseError::LimitExceeded)?,
+        })?;
+        Ok(output)
+    }).await.map_err(|_| crashed())?;
+    let output = result.map_err(|code| match code {
+        ParseError::Timeout => timeout(limits.timeout.as_secs()),
+        ParseError::LimitExceeded => ExtractError::new("extract_limit", "文件解析超過隔離環境的資源上限，請拆成較小的檔案。"),
+        ParseError::Unavailable | ParseError::UnsupportedFormat => ExtractError::new("isolation_unavailable", "隔離解析服務無法處理這份文件，已停止解析。"),
+        _ => crashed(),
+    })?;
+    Ok(Spawned {
+        output: duduclaw_knowledge::extract::from_worker_output(output)?,
+        sandboxed: true,
+    })
 }
 
 #[cfg(all(test, unix))]

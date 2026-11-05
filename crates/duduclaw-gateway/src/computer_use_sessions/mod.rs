@@ -1334,6 +1334,7 @@ impl ComputerUseSessions {
     async fn capture_masked(&self, session: &mut ManagedSession) -> Result<Value, OpError> {
         let agent_id = session.agent_id.clone();
         let shot = session.backend.screenshot().await;
+        self.check_alive(session).await?;
         let now = Instant::now();
         session.last_activity = now;
         let shot = shot.map_err(|e| {
@@ -1354,12 +1355,14 @@ impl ComputerUseSessions {
             PageScan::Unscanned | PageScan::Clean => None,
         }};
         if let Some(reason) = extra_mask {
-            b64 = crate::computer_use::mask_screenshot_regions(
-                &b64,
-                &[[0, 0, session.config.display_width, session.config.display_height]],
+            b64 = crate::computer_use::mask_screenshot_regions_async(
+                b64,
+                vec![[0, 0, session.config.display_width, session.config.display_height]],
                 crate::computer_use::MaskingConfig::default().fill_color,
             )
+            .await
             .map_err(|_| OpError::new(ErrorCode::ScreenshotFailed, "截圖失敗，請稍後再試。"))?;
+            self.check_alive(session).await?;
             fully_masked = true;
             mask_reason = Some(reason);
         }

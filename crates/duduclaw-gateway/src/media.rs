@@ -64,6 +64,14 @@ pub fn detect_mime(data: &[u8]) -> String {
 /// Resize an image to fit within MAX_IMAGE_DIM, maintaining aspect ratio.
 /// Returns JPEG bytes at 85% quality.
 pub fn resize_image(data: &[u8], max_dim: u32) -> Result<Vec<u8>, String> {
+    resize_image_with_isolation(data, max_dim, duduclaw_parse_worker::client::required())
+}
+
+fn resize_image_with_isolation(data: &[u8], max_dim: u32, isolation_required: bool) -> Result<Vec<u8>, String> {
+    if isolation_required {
+        return duduclaw_parse_worker::media_adapters::resize_image(data, max_dim)
+            .map_err(|_| "圖片無法在隔離環境中完成轉換。".to_string());
+    }
     let img = image::load_from_memory(data).map_err(|e| format!("Failed to decode image: {e}"))?;
 
     let (w, h) = (img.width(), img.height());
@@ -106,6 +114,7 @@ pub fn prepare_image_for_vision(attachment: &MediaAttachment) -> Result<(String,
     let processed = match resize_image(&attachment.data, MAX_IMAGE_DIM) {
         Ok(resized) => resized,
         Err(e) => {
+            if duduclaw_parse_worker::client::required() { return Err(e); }
             warn!("Image resize failed, using original: {e}");
             attachment.data.clone()
         }
@@ -429,6 +438,18 @@ pub fn agent_attachment_base(home_dir: &std::path::Path, agent_id: &str) -> std:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_isolation_rejects_malformed_image_and_preserves_legacy() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let bytes = png.into_inner();
+        assert_eq!(resize_image_with_isolation(b"invalid image", 1, true).unwrap_err(),
+            "圖片無法在隔離環境中完成轉換。");
+        let legacy = resize_image_with_isolation(&bytes, 1, false).unwrap();
+        assert_eq!(detect_mime(&legacy), "image/jpeg");
+    }
 
     #[test]
     fn test_detect_mime_jpeg() {

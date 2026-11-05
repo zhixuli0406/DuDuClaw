@@ -130,6 +130,7 @@ impl RestoreLimits {
 /// partial extraction survives (see [`extract_tar_gz_safely`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreViolation {
+    IsolationUnavailable,
     Unreadable,
     /// The bytes do not start with the gzip magic (`1f 8b`).
     NotTarGz,
@@ -159,6 +160,7 @@ pub enum RestoreViolation {
 impl std::fmt::Display for RestoreViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::IsolationUnavailable => write!(f, "隔離模式下請使用受保護的資料匯入流程，已拒絕舊版備份解析"),
             Self::Unreadable => write!(f, "無法讀取備份檔"),
             Self::NotTarGz => write!(f, "不是有效的 .tar.gz 備份檔"),
             Self::Malformed => write!(f, "備份檔壓縮結構損毀，無法解析"),
@@ -238,6 +240,18 @@ pub fn extract_tar_gz_safely(
     dest_dir: &Path,
     limits: &RestoreLimits,
 ) -> Result<RestoreExtractReport, RestoreViolation> {
+    extract_tar_gz_with_isolation(archive_path, dest_dir, limits, duduclaw_parse_worker::client::required())
+}
+
+fn extract_tar_gz_with_isolation(
+    archive_path: &Path,
+    dest_dir: &Path,
+    limits: &RestoreLimits,
+    isolation_required: bool,
+) -> Result<RestoreExtractReport, RestoreViolation> {
+    // Package G owns the bounded migration importer and its authority review.
+    // A parse-worker archive summary cannot authorize a legacy database restore.
+    if isolation_required { return Err(RestoreViolation::IsolationUnavailable); }
     let mut f = std::fs::File::open(archive_path).map_err(|_| RestoreViolation::Unreadable)?;
     let mut magic = [0u8; 2];
     let n = f
@@ -1802,5 +1816,18 @@ mod tests {
         // re-preserve/re-swap.
         assert_eq!(perform_pending_restore_swap(home, "ts2"), Ok(None));
         assert!(!home.join("restore-backup-ts2").exists());
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    #[test]
+    fn parse_isolation_restore_refuses_before_read_or_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("staging");
+        assert_eq!(super::extract_tar_gz_with_isolation(
+            &dir.path().join("missing"), &dest, &super::RestoreLimits::default(), true,
+        ), Err(super::RestoreViolation::IsolationUnavailable));
+        assert!(!dest.exists());
     }
 }

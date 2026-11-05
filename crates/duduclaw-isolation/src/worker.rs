@@ -14,6 +14,10 @@ use crate::bounded::{List, Text};
 use crate::ids::{RequestId, Sha256Digest};
 use crate::ContractError;
 
+#[path = "worker_media.rs"]
+mod media;
+pub use media::{HtmlQuery, HtmlOutputFormat};
+
 /// Phase-0 JSON payload ceiling; transport must check before allocation (§6.2).
 pub const MAX_WORKER_FRAME_BYTES: usize = 256 * 1024;
 /// Phase-0 ceiling on aggregate text bytes in one result (§6.2).
@@ -33,11 +37,17 @@ pub const WORKER_PROTOCOL_VERSION: u16 = 1;
 #[serde(rename_all = "snake_case")]
 pub enum ParseOperation {
     ExtractDocument,
+    ExtractKnowledge,
+    ReadTable,
+    InspectDocument,
+    TransformImage,
+    ExtractHtml,
     InspectImage,
     TranscribeAudio,
     SynthesizeSpeech,
     InspectSkillArchive,
     InspectPackArchive,
+    ExtractPackArchive,
     LoadModel,
     LocalInference,
 }
@@ -54,6 +64,157 @@ pub enum ContentFormat {
     Audio,
     Archive,
     Model,
+}
+
+/// Exact parser selection, separate from the coarse input content hint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeFormat { Pdf, Docx, Pptx, Xlsx, Xls, Csv, Txt, Md, Html }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentKind { Page, Slide, Sheet, Section, Text }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeSegment {
+    pub kind: SegmentKind,
+    pub label: Option<Text<256>>,
+    pub page: Option<u32>,
+    pub sheet: Option<Text<256>>,
+    pub line_rows: Option<List<u32, 8192>>,
+    pub text: Text<8192>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeWarning {
+    pub code: Text<128>,
+    pub pages: List<u32, 1000>,
+    pub count: Option<u32>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeOutput {
+    pub segments: List<KnowledgeSegment, 128>,
+    pub warnings: List<KnowledgeWarning, 128>,
+    pub extractor_version: Text<128>,
+}
+impl KnowledgeOutput {
+    fn text_bytes(&self) -> usize {
+        self.extractor_version.as_str().len()
+            + self.warnings.as_slice().iter().map(|w| w.code.as_str().len()).sum::<usize>()
+            + self.segments.as_slice().iter().map(|s| s.text.as_str().len()
+                + s.label.as_ref().map_or(0, |v| v.as_str().len())
+                + s.sheet.as_ref().map_or(0, |v| v.as_str().len())).sum::<usize>()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableFormat { Csv, Spreadsheet }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TableOptions {
+    pub format: TableFormat,
+    pub delimiter: u8,
+    pub has_header: bool,
+    pub offset: u32,
+    pub limit: u16,
+    pub sheet: Option<Text<256>>,
+}
+impl TableOptions {
+    fn validate(&self) -> Result<(), ContractError> {
+        if self.limit == 0 || self.limit > 2000 || self.delimiter == 0
+            || matches!(self.delimiter, b'\r' | b'\n' | b'"') || self.delimiter > 127 {
+            return Err(ContractError::InvalidValue("worker table options"));
+        }
+        if self.format == TableFormat::Spreadsheet && !self.has_header {
+            return Err(ContractError::InvalidValue("worksheet requires a header row"));
+        }
+        if self.format == TableFormat::Csv && self.sheet.is_some() {
+            return Err(ContractError::InvalidValue("CSV sheet selection"));
+        }
+        Ok(())
+    }
+}
+/// Numbers use JSON's finite number type. Strings retain the existing 8 KiB cap.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TableCell { Null, Bool(bool), Number(serde_json::Number), String(Text<8192>) }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TableOutput {
+    pub columns: List<Text<256>, 256>,
+    pub rows: List<List<TableCell, 256>, 2000>,
+    pub truncated: bool,
+    pub sheet: Option<Text<256>>,
+    pub sheets: List<Text<256>, 128>,
+}
+impl TableOutput {
+    fn text_bytes(&self) -> usize {
+        self.columns.as_slice().iter().map(|c| c.as_str().len()).sum::<usize>()
+            + self.sheets.as_slice().iter().map(|c| c.as_str().len()).sum::<usize>()
+            + self.sheet.as_ref().map_or(0, |c| c.as_str().len())
+            + self.rows.as_slice().iter().flat_map(|r| r.as_slice()).map(|c| match c {
+                TableCell::String(s) => s.as_str().len(),
+                TableCell::Number(n) => n.to_string().len(),
+                TableCell::Bool(_) => 5,
+                TableCell::Null => 4,
+            }).sum::<usize>()
+    }
+    fn validate(&self, options: &TableOptions) -> Result<(), ContractError> {
+        let columns = self.columns.as_slice();
+        let mut unique = std::collections::BTreeSet::new();
+        if columns.iter().any(|c| c.as_str().is_empty() || !unique.insert(c.as_str()))
+            || self.rows.as_slice().len() > usize::from(options.limit)
+ {
+            return Err(ContractError::InvalidValue("worker table shape"));
+        }
+        match options.format {
+            TableFormat::Csv if self.sheet.is_some() || !self.sheets.as_slice().is_empty() =>
+                return Err(ContractError::InvalidValue("CSV sheet result")),
+            TableFormat::Spreadsheet if self.sheet.as_ref().is_none_or(|sheet|
+                !self.sheets.as_slice().contains(sheet)
+                    || options.sheet.as_ref().is_some_and(|requested| requested != sheet)) =>
+                return Err(ContractError::InvalidValue("worker sheet binding")),
+            _ => {},
+        }
+        Ok(())
+    }
+}
+
+/// Caller policy can only narrow the worker's independent safety ceilings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentPolicy {
+    pub max_uncompressed_bytes: u64,
+    pub max_entries: u32,
+    pub max_compression_ratio: u32,
+    pub max_xml_depth: u32,
+    pub xml_scan_part_bytes: u64,
+    pub xml_scan_total_bytes: u64,
+}
+impl DocumentPolicy {
+    fn validate(&self) -> Result<(), ContractError> {
+        if self.max_uncompressed_bytes == 0 || self.max_entries == 0
+            || self.max_compression_ratio == 0 || self.max_xml_depth == 0
+            || self.xml_scan_part_bytes == 0 || self.xml_scan_total_bytes == 0 {
+            return Err(ContractError::InvalidValue("worker document policy"));
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "adapter", content = "options", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ParseOptions {
+    Knowledge { format: KnowledgeFormat, max_chars: u32 },
+    Table(TableOptions),
+    Document(DocumentPolicy),
+    ImageResize { max_dimension: u32 },
+    ImageMask { regions: List<[u32; 4], 128>, fill: [u8; 3] },
+    Html { queries: List<HtmlQuery, 32> },
+    SearchHtml,
+    PackArchive,
 }
 
 /// Declared read-only input fd, indexed in SCM_RIGHTS order (design §6.2/§6.3).
@@ -100,6 +261,9 @@ pub struct ParseRequest {
     pub inputs: List<InputFd, 16>,
     pub outputs: List<OutputFd, 8>,
     pub limits: WorkerLimits,
+    /// Additive opt-in adapter schema. Old requests omit this field entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<ParseOptions>,
 }
 
 impl ParseRequest {
@@ -116,6 +280,35 @@ impl ParseRequest {
         }
         if self.limits.max_result_text_bytes.get() as usize > MAX_RESULT_TEXT_BYTES {
             return Err(ContractError::LimitExceeded("worker result text budget"));
+        }
+        match (&self.operation, &self.options) {
+            (ParseOperation::ExtractKnowledge, Some(ParseOptions::Knowledge { max_chars, .. }))
+                if *max_chars > 0 => {},
+            (ParseOperation::ExtractPackArchive, Some(ParseOptions::PackArchive)) => {},
+            (ParseOperation::TransformImage, Some(ParseOptions::ImageResize { max_dimension }))
+                if (1..=16_384).contains(max_dimension) => {},
+            (ParseOperation::TransformImage, Some(ParseOptions::ImageMask { regions, .. }))
+                if !regions.as_slice().is_empty() => {},
+            (ParseOperation::ExtractHtml, Some(ParseOptions::SearchHtml)) => {},
+            (ParseOperation::ExtractHtml, Some(ParseOptions::Html { queries })) => {
+                if queries.as_slice().is_empty() || queries.as_slice().iter().any(|query|
+                    query.name.as_str().is_empty() || query.selector.as_str().is_empty()
+                        || query.max_matches > 128) {
+                    return Err(ContractError::InvalidValue("worker HTML queries"));
+                }
+            },
+            (ParseOperation::ReadTable, Some(ParseOptions::Table(options))) => options.validate()?,
+            (ParseOperation::InspectDocument, Some(ParseOptions::Document(policy))) => policy.validate()?,
+            (ParseOperation::ExtractKnowledge | ParseOperation::ReadTable | ParseOperation::InspectDocument
+                | ParseOperation::TransformImage | ParseOperation::ExtractHtml | ParseOperation::ExtractPackArchive, _) =>
+                return Err(ContractError::InvalidValue("worker adapter options")),
+            (_, None) => {},
+            _ => return Err(ContractError::InvalidValue("worker adapter options")),
+        }
+        if self.options.is_some() && (self.inputs.as_slice().len() != 1
+            || (!matches!(self.operation, ParseOperation::TransformImage | ParseOperation::ExtractPackArchive) && !self.outputs.as_slice().is_empty())
+            || (matches!(self.operation, ParseOperation::TransformImage | ParseOperation::ExtractPackArchive) && self.outputs.as_slice().len() != 1)) {
+            return Err(ContractError::InvalidValue("worker adapter fd plan"));
         }
         let mut total = 0u64;
         for (index, input) in self.inputs.as_slice().iter().enumerate() {
@@ -162,6 +355,17 @@ pub enum WorkerServiceBinding {
     LocalInference { request_id: RequestId },
 }
 
+/// File records describe byte ranges in a single pre-authorized output fd.
+/// Names remain untrusted: callers must apply their destination path policy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveEntry {
+    pub name: Text<4096>,
+    pub directory: bool,
+    pub offset: u64,
+    pub length: u64,
+}
+
 /// Allowed bounded result item; all strings are content, never authority (§6.2).
 /// Archive entries are summaries only: package E must not return or execute an
 /// installation command. Model metadata does not authorize loading a plugin.
@@ -169,9 +373,13 @@ pub enum WorkerServiceBinding {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ParsedItem {
     Text { input_slot: u16, page: Option<u32>, text: Text<8192> },
+    Knowledge { input_slot: u16, output: KnowledgeOutput },
+    Html { input_slot: u16, query: Text<256>, value: Text<8192> },
+    Table { input_slot: u16, output: TableOutput },
     Transcript { input_slot: u16, start_ms: u64, end_ms: u64, text: Text<8192> },
     Image { input_slot: u16, width: u32, height: u32 },
     ArchiveSummary { input_slot: u16, entries: u32, expanded_bytes: u64 },
+    ArchiveManifest { input_slot: u16, entries: List<ArchiveEntry, 1000>, legacy_encoding: Option<Text<8>>, junk_skipped: u32 },
     ModelSummary { input_slot: u16, tensor_count: u32, total_bytes: u64 },
     OutputArtifact { output_slot: u16, format: ContentFormat, size_bytes: u64, sha256: Sha256Digest },
 }
@@ -222,6 +430,44 @@ impl ParseResponse {
         let mut written_outputs = Vec::new();
         for item in items.as_slice() {
             let input_slot = match item {
+                ParsedItem::Html { input_slot, query, value } => {
+                    if request.operation != ParseOperation::ExtractHtml {
+                        return Err(ContractError::InvalidValue("worker result kind"));
+                    }
+                    match &request.options {
+                        Some(ParseOptions::Html { queries }) if queries.as_slice().iter()
+                            .any(|q| q.name == *query) => {},
+                        Some(ParseOptions::SearchHtml) if query.as_str() == "search" => {},
+                        _ => return Err(ContractError::InvalidValue("worker HTML query binding")),
+                    }
+                    text_bytes += query.as_str().len() + value.as_str().len();
+                    Some(*input_slot)
+                }
+                ParsedItem::Knowledge { input_slot, output } => {
+                    if request.operation != ParseOperation::ExtractKnowledge {
+                        return Err(ContractError::InvalidValue("worker result kind"));
+                    }
+                    let Some(ParseOptions::Knowledge { max_chars, .. }) = &request.options else {
+                        return Err(ContractError::InvalidValue("worker knowledge options"));
+                    };
+                    if output.segments.as_slice().iter().map(|s| s.text.as_str().chars().count())
+                        .sum::<usize>() > *max_chars as usize {
+                        return Err(ContractError::LimitExceeded("worker character budget"));
+                    }
+                    text_bytes += output.text_bytes();
+                    Some(*input_slot)
+                }
+                ParsedItem::Table { input_slot, output } => {
+                    if request.operation != ParseOperation::ReadTable {
+                        return Err(ContractError::InvalidValue("worker result kind"));
+                    }
+                    let Some(ParseOptions::Table(options)) = &request.options else {
+                        return Err(ContractError::InvalidValue("worker table options"));
+                    };
+                    output.validate(options)?;
+                    text_bytes += output.text_bytes();
+                    Some(*input_slot)
+                }
                 ParsedItem::Text { input_slot, text, .. } => {
                     if !matches!(request.operation, ParseOperation::ExtractDocument | ParseOperation::LocalInference) {
                         return Err(ContractError::InvalidValue("worker result kind"));
@@ -243,8 +489,27 @@ impl ParseResponse {
                     Some(*input_slot)
                 }
                 ParsedItem::ArchiveSummary { input_slot, .. } => {
-                    if !matches!(request.operation, ParseOperation::InspectSkillArchive | ParseOperation::InspectPackArchive) {
+                    if !matches!(request.operation, ParseOperation::InspectSkillArchive | ParseOperation::InspectPackArchive | ParseOperation::InspectDocument) {
                         return Err(ContractError::InvalidValue("worker result kind"));
+                    }
+                    Some(*input_slot)
+                }
+                ParsedItem::ArchiveManifest { input_slot, entries, legacy_encoding, .. } => {
+                    if legacy_encoding.as_ref().is_some_and(|value| !matches!(value.as_str(), "gbk" | "big5")) {
+                        return Err(ContractError::InvalidValue("worker archive encoding"));
+                    }
+                    text_bytes += legacy_encoding.as_ref().map_or(0, |value| value.as_str().len());
+                    if request.operation != ParseOperation::ExtractPackArchive {
+                        return Err(ContractError::InvalidValue("worker result kind"));
+                    }
+                    let output = request.outputs.as_slice().first()
+                        .ok_or(ContractError::InvalidValue("worker archive output"))?;
+                    for entry in entries.as_slice() {
+                        text_bytes += entry.name.as_str().len();
+                        if entry.offset.checked_add(entry.length).is_none_or(|end| end > output.max_bytes.get())
+                            || (entry.directory && entry.length != 0) {
+                            return Err(ContractError::InvalidValue("worker archive range"));
+                        }
                     }
                     Some(*input_slot)
                 }
@@ -303,6 +568,7 @@ mod tests {
             version: WORKER_PROTOCOL_VERSION,
             request_id: RequestId([1; 16]),
             operation: ParseOperation::ExtractDocument,
+            options: None,
             inputs: List::new(vec![InputFd { slot: 0, format: ContentFormat::Pdf, size_bytes: 20 }]).unwrap(),
             outputs: List::new(vec![OutputFd { slot: 1, max_bytes: NonZeroU64::new(1024).unwrap() }]).unwrap(),
             limits: WorkerLimits {
@@ -367,5 +633,77 @@ mod tests {
             output_slot: 1, format: ContentFormat::Text, size_bytes: 1025, sha256: Sha256Digest([0; 32]),
         }]).unwrap() };
         assert!(response.validate_for(&request).is_err());
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+    fn request(operation: ParseOperation, options: Option<ParseOptions>) -> ParseRequest {
+        ParseRequest { version: WORKER_PROTOCOL_VERSION, request_id: RequestId([3; 16]), operation,
+            inputs: List::new(vec![InputFd { slot: 0, format: ContentFormat::Text, size_bytes: 10 }]).unwrap(),
+            outputs: List::new(vec![]).unwrap(), options,
+            limits: WorkerLimits { memory_bytes: NonZeroU64::new(512 * 1024 * 1024).unwrap(),
+                wall_time_ms: NonZeroU32::new(30_000).unwrap(),
+                max_result_text_bytes: NonZeroU32::new(MAX_RESULT_TEXT_BYTES as u32).unwrap() } }
+    }
+    fn table_options() -> TableOptions {
+        TableOptions { format: TableFormat::Csv, delimiter: b',', has_header: true,
+            offset: 0, limit: 2, sheet: None }
+    }
+    fn response(request: &ParseRequest, item: ParsedItem) -> ParseResponse {
+        ParseResponse { version: WORKER_PROTOCOL_VERSION, request_id: request.request_id,
+            result: ParseResult::Complete { items: List::new(vec![item]).unwrap() } }
+    }
+    #[test]
+    fn adapter_options_are_opt_in_and_operation_bound() {
+        let legacy = request(ParseOperation::ExtractDocument, None);
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("options").is_none());
+        assert!(ParseRequest::decode_payload(&serde_json::to_vec(&legacy).unwrap()).is_ok());
+        let mut rich = request(ParseOperation::ReadTable, Some(ParseOptions::Table(table_options())));
+        assert!(rich.validate().is_ok());
+        rich.operation = ParseOperation::InspectDocument;
+        assert!(rich.validate().is_err());
+        rich.operation = ParseOperation::ReadTable;
+        rich.options = None;
+        assert!(rich.validate().is_err());
+        let mut options = table_options();
+        options.limit = 2001;
+        rich.options = Some(ParseOptions::Table(options));
+        assert!(rich.validate().is_err());
+        rich.options = Some(ParseOptions::Knowledge { format: KnowledgeFormat::Csv, max_chars: 0 });
+        rich.operation = ParseOperation::ExtractKnowledge;
+        assert!(rich.validate().is_err());
+    }
+    #[test]
+    fn rich_result_text_and_character_limits_include_metadata() {
+        let mut request = request(ParseOperation::ExtractKnowledge,
+            Some(ParseOptions::Knowledge { format: KnowledgeFormat::Txt, max_chars: 2 }));
+        let output = KnowledgeOutput { extractor_version: Text::new("kb-extract/1".into()).unwrap(),
+            warnings: List::new(vec![]).unwrap(), segments: List::new(vec![KnowledgeSegment {
+                kind: SegmentKind::Text, label: None, page: None, sheet: None, line_rows: None,
+                text: Text::new("三個字".into()).unwrap(),
+            }]).unwrap() };
+        let result = response(&request, ParsedItem::Knowledge { input_slot: 0, output });
+        assert!(result.validate_for(&request).is_err());
+        request.options = Some(ParseOptions::Knowledge { format: KnowledgeFormat::Txt, max_chars: 3 });
+        assert!(result.validate_for(&request).is_ok());
+        request.limits.max_result_text_bytes = NonZeroU32::new(9).unwrap();
+        assert!(result.validate_for(&request).is_err());
+    }
+    #[test]
+    fn table_results_bind_options_and_reject_duplicate_headers() {
+        let request = request(ParseOperation::ReadTable, Some(ParseOptions::Table(table_options())));
+        let mut output = TableOutput { columns: List::new(vec![Text::new("a".into()).unwrap()]).unwrap(),
+            rows: List::new(vec![List::new(vec![TableCell::Null, TableCell::Bool(true)]).unwrap()]).unwrap(),
+            truncated: false, sheet: None, sheets: List::new(vec![]).unwrap() };
+        // Ragged rows are preserved for the caller's extra-column policy.
+        assert!(response(&request, ParsedItem::Table { input_slot: 0, output: output.clone() })
+            .validate_for(&request).is_ok());
+        output.columns = List::new(vec![Text::new("a".into()).unwrap(), Text::new("a".into()).unwrap()]).unwrap();
+        assert!(response(&request, ParsedItem::Table { input_slot: 0, output }).validate_for(&request).is_err());
+        assert!(response(&request, ParsedItem::Text { input_slot: 0, page: None, text: Text::new("wrong".into()).unwrap() })
+            .validate_for(&request).is_err());
     }
 }

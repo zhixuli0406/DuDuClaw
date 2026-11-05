@@ -1,0 +1,18 @@
+[Unit]
+Description=DuDuClaw bounded parse worker socket
+
+[Socket]
+ListenSequentialPacket=/run/duduclaw-parse/parse.sock
+Accept=yes
+SocketUser=root
+SocketGroup=duduclaw
+SocketMode=0660
+DirectoryMode=0755
+MaxConnections=4
+Backlog=4
+SendBuffer=512K
+ReceiveBuffer=512K
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
