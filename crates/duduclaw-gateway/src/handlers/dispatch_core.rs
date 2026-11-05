@@ -404,6 +404,19 @@ impl MethodHandler {
             }
 
             // ── MCP API keys (global config.toml [mcp_keys], MK.1–MK.4) ──
+            "mcp_oauth_grants.list" => {
+                require_admin!();
+                boxed_frame(|| self.handle_mcp_oauth_grants_list()).await
+            }
+            "mcp_oauth_grants.revoke" => {
+                if let Err(e) = acl::require_role(ctx, UserRole::Admin) {
+                    let id = params.get("id").and_then(Value::as_str)
+                        .and_then(|id| uuid::Uuid::parse_str(id).ok()).map(|id| id.to_string());
+                    self.audit_mcp_oauth_revoke(ctx, id.as_deref(), "denied", None).await;
+                    return WsFrame::error_response("", &e);
+                }
+                boxed_frame(|| self.handle_mcp_oauth_grants_revoke(params, ctx)).await
+            }
             "mcp_keys.list" => {
                 require_admin!();
                 boxed_frame(|| self.handle_mcp_keys_list()).await

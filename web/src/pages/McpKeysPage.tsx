@@ -33,6 +33,7 @@ import {
   ListGridRow,
   ListGridCell,
 } from '@/components/mds';
+import { OAuthGrantsPanel } from '@/components/mcp/OAuthGrantsPanel';
 import { KeyRound, Plus, Trash2, Copy, Check, AlertTriangle } from 'lucide-react';
 
 /** Column template shared by the MCP-keys ListGrid header + rows (spec §4). */
@@ -172,6 +173,8 @@ export function McpKeysPage() {
           </ListGridContainer>
         </div>
       )}
+
+      <OAuthGrantsPanel />
 
       <CreateKeyDialog
         open={showCreate}

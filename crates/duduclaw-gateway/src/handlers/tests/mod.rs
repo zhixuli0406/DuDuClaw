@@ -104,3 +104,5 @@ mod tool_pruning_rpc_tests;
 mod main_agent_rpc_tests;
 
 mod agents_main_commit_tests;
+
+mod mcp_oauth_grants_rpc_tests;

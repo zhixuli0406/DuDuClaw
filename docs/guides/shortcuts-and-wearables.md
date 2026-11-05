@@ -1,8 +1,6 @@
 # Wrist and wearables: Shortcuts, and AI recording pendant ingestion
 
-> Prerequisite: `duduclaw http-server --bind 127.0.0.1:8765` is already running, and you have a
-> Bearer key from `duduclaw mcp issue-refresh-token` or `~/.duduclaw/mcp_keys.toml`. Your phone
-> or wearable needs to be able to reach that address (a home network IP, or Tailscale).
+> Prerequisite: `duduclaw http-server --bind 127.0.0.1:8765` is already running. Create a static MCP API key in **Manage → Integrations → MCP API keys** with the scopes the shortcut needs, and use it as the Bearer credential. `duduclaw mcp issue-refresh-token` produces stdio-only credentials and does not work over HTTP. Your phone or wearable must be able to reach the server address (a home network IP or Tailscale). See [Remote MCP](remote-mcp.md).
 
 ## 1. iPhone / Apple Watch Shortcuts (no app store, no review)
 

@@ -5189,6 +5189,14 @@ export type SkillSynthesisUpdate = Partial<SkillSynthesisConfig>;
 
 // ── MK: MCP API keys ────────────────────────────────────────────
 
+export interface McpOAuthGrant {
+  id: string;
+  client_name: string;
+  scopes: string[];
+  issued_unix: number;
+  last_used_unix: number | null;
+}
+
 /** A masked MCP key entry from `mcp_keys.list`. The full cleartext key is
  *  NEVER returned here — only on the one-time `mcp_keys.create` response. */
 export interface McpKeyEntry {
@@ -8730,6 +8738,10 @@ export const api = {
         success: boolean;
         changes: string[];
       }>,
+  },
+  mcpOAuthGrants: {
+    list: () => client.call('mcp_oauth_grants.list') as Promise<{ grants: McpOAuthGrant[] }>,
+    revoke: (id: string) => client.call('mcp_oauth_grants.revoke', { id }) as Promise<{ success: boolean; revoked: boolean }>,
   },
   mcpKeys: {
     list: () => client.call('mcp_keys.list') as Promise<{ keys: McpKeyEntry[] }>,

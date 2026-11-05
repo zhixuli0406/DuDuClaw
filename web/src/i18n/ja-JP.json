@@ -9786,5 +9786,14 @@
   "meeting.state.cancelled": "取り消しました",
   "meeting.sizeError": "上限以内の空でない録音や動画を選んでください。",
   "meeting.requestFailed": "処理を完了できませんでした。しばらくして再試行してください。送信済みの部分は保持されます。",
-  "meeting.fileChanged": "以前アップロードしたファイルと内容が異なります。元のファイルを選ぶか、名前を変更して新しく送信してください。"
+  "meeting.fileChanged": "以前アップロードしたファイルと内容が異なります。元のファイルを選ぶか、名前を変更して新しく送信してください。",
+  "mcpKeys.oauth.title": "OAuth 接続の認可",
+  "mcpKeys.oauth.desc": "認可済みアプリを確認できます。取り消すと、その認可で発行されたすべてのトークンが直ちに無効になり、再認可が必要です。",
+  "mcpKeys.oauth.empty": "有効な OAuth 認可はありません",
+  "mcpKeys.oauth.issued": "認可日時",
+  "mcpKeys.oauth.lastUsed": "最終使用",
+  "mcpKeys.oauth.neverUsed": "未使用",
+  "mcpKeys.oauth.revokeTitle": "接続の認可を取り消す",
+  "mcpKeys.oauth.confirm": "{client} の認可を取り消しますか？このアプリは、この認可を使ってデータにアクセスできなくなります。",
+  "mcpKeys.oauth.revoked": "接続の認可を取り消しました"
 }

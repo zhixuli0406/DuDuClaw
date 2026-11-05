@@ -1478,3 +1478,5 @@ pub mod process_tree;
 pub mod mcp_tool_defs;
 
 pub mod tool_pruning;
+
+pub mod mcp_oauth_store;
