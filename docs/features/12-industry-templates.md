@@ -4,6 +4,21 @@
 
 ---
 
+## Manage templates in the dashboard (v1.80.0)
+
+Administrators can browse employee and team templates in either edition. Details and the mandatory review step show the full raw `SOUL.md`, `CONTRACT.toml` and every `SKILL.md`, including each team member. Text is displayed literally rather than rendered as HTML. Review all retained text for secrets and personal data before checking the confirmation box. Correct unsafe free text in the source employee first; company-template editing only narrows tools and skill selection.
+
+Copy/export uses `templates.copy` with `preview: true` without saving a template. Confirmation must include `reviewed: true` and the returned `review_digest`; the server recaptures the source and refuses changed content. `templates.save` and `templates.apply` also require the literal boolean `reviewed: true`; company templates additionally require the reviewed revision. Each employee creation in a team rechecks the revision. If it changes or cannot be validated, application stops with `template_changed` and the already-created employee ids; those employees are kept and the remaining members are not created.
+
+Copies retain projected effective preset configuration and reviewed personality, contract and skill instruction text. They do not read memory/history, `.mcp.json`, channel configuration or arbitrary custom skill assets. Account-pool restrictions cause refusal. Runtime credential/environment fields and nonportable sections are omitted; credential keys in retained policy sections are refused. The entire `[fork]` table is dropped, `db_sources` and `recipients` are emptied, `git_credentials` is disabled, and employee `recipient_guard` is forced to `ask`. Heartbeat and autonomous evolution start disabled. Recognized credential shapes in retained text are masked by the existing diagnostic redactor, which can retain the first/last four characters. **Unknown tokens, short passwords, personal data and recipient identifiers embedded in free text are not reliably removed.** This is mandatory human review, not a secret/PII removal guarantee.
+
+Every raw SOUL, contract and skill document is scanned before saving, and the actual documents are scanned again before employee writes. The existing hidden-content and input-injection scanners reject findings; short HTML comments and single invisible/zero-width characters are rejected too. Scan failure refuses the operation with the filename. No flagged content is copied. A detection rule can also reject instructional examples; revise the source rather than bypassing scanning. Unix reads use `O_NOFOLLOW` and metadata from the opened descriptor, including the hard-link and size checks. This does not pin ancestor directories against same-OS-user replacement.
+
+All five library RPCs (`templates.catalog/get/copy/save/apply`) require a current Admin. Company templates live under `<home>/company_templates/`, with atomic saves, one revision per team, and audit records without document contents. Built-ins are read-only; premium copies retain their license requirement. A team copy includes its leader and descendants (up to 50), preserving internal reporting relationships. Edits may remove skills/members, reduce explicit tool allowlists or add denials, never widen permissions; removing a leader requires removing their descendants. Disabled skills remain disabled. Custom scripts are excluded; pristine bundled office skills restore their bundled assets. Company copies exclude pack knowledge extras and evaluation suites.
+
+Apply asks for employee ids and display names, plus department and active-user Operator bindings in the company edition. Existing creation, product and license limits still apply. Partial results list committed employees and never automatically retry the whole team. Remote gateway compilation/tests, browser acceptance and the required Daybreak Blue follow-up review remain pending; see the [security follow-up handoff](../../wiki/reports/RM-025-template-library-handoff.md) for exact local validation.
+
+
 ## The Metaphor: Restaurant Set Menus vs. A La Carte
 
 When you open a new restaurant, you have two choices:

@@ -168,6 +168,10 @@ impl MethodHandler {
             }
 
             // ── Premium team templates (dashboard onboarding staging flow) ──
+            "templates.catalog" | "templates.get" | "templates.copy" | "templates.save" | "templates.apply" => {
+                require_admin!();
+                boxed_frame(|| self.handle_template_library(method, params, ctx)).await
+            }
             "templates.industries" => {
                 require_admin!();
                 boxed_frame(|| self.handle_templates_industries()).await

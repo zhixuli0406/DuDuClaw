@@ -51,6 +51,7 @@ const MeetingTranscriptsPage = lazyPage(() => import('./pages/MeetingTranscripts
 // appliance image lands here by default.
 const OperatorConsolePage = lazyPage(() => import('./pages/OperatorConsolePage'), 'OperatorConsolePage');
 const AgentsPage = lazyPage(() => import('./pages/AgentsPage'), 'AgentsPage');
+const TemplatesPage = lazyPage(() => import('./pages/TemplatesPage'), 'TemplatesPage');
 const CreateAgentPage = lazyPage(() => import('./pages/agent-form/CreateAgentPage'), 'CreateAgentPage');
 const EditAgentPage = lazyPage(() => import('./pages/agent-form/EditAgentPage'), 'EditAgentPage');
 const TaskBoardPage = lazyPage(() => import('./pages/TaskBoardPage'), 'TaskBoardPage');
@@ -373,6 +374,7 @@ export function App() {
               {/* P4-3 — OS-native fleet report + settings. All five os.* RPCs
                   are `require_admin!`-gated server-side; this mirrors that. */}
               <Route element={<RoleGuard minRole="admin" />}>
+                <Route path="templates" element={<TemplatesPage />} />
                 <Route path="os" element={<OSPage />} />
                 {/* 職務組合（agent preset P1, WP-7I）— presets.list/presets.status
                     are read-only RPCs; this mirrors that (no admin RPC gate on
