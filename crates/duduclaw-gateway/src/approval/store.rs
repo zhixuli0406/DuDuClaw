@@ -92,7 +92,11 @@ impl ApprovalStore {
         connection.execute_batch("PRAGMA secure_delete=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
             .map_err(|e| e.to_string())?;
         verify_live_io()?;
-        let tx = connection.unchecked_transaction().map_err(|e| e.to_string())?;
+        // Take the write lock before inspecting schema versions/columns. All
+        // migrations share this transaction and must never start their own.
+        let tx = rusqlite::Transaction::new_unchecked(
+            connection, rusqlite::TransactionBehavior::Immediate,
+        ).map_err(|e| e.to_string())?;
         let conn = &tx;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS approvals (
@@ -638,4 +642,27 @@ pub(super) fn record_in_connection(conn: &Connection, id: &ApprovalId) -> Result
         params![id.as_str()],
         row_to_record,
     ).optional().map_err(|e| format!("read approval for decision: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_migration_failure_rolls_back_all_schema_changes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE approval_authority_schema(version INTEGER NOT NULL);
+            INSERT INTO approval_authority_schema VALUES(2);").unwrap();
+        let error = ApprovalStore::init_schema(&conn).unwrap_err();
+        assert!(error.contains("unsupported approval authority schema"), "{error}");
+        assert!(conn.is_autocommit());
+        let tables: Vec<String> = conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(tables, vec!["approval_authority_schema"]);
+        conn.execute("UPDATE approval_authority_schema SET version=1", []).unwrap();
+        ApprovalStore::init_schema(&conn).unwrap();
+        ApprovalStore::init_schema(&conn).unwrap();
+        assert!(conn.is_autocommit());
+    }
 }
