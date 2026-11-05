@@ -16,6 +16,11 @@ use tokio::io::AsyncReadExt;
 
 use duduclaw_gateway::remote_mcp::{bridge, connect, store};
 
+fn signed_token(home: &std::path::Path) -> String {
+    let key = duduclaw_core::ensure_identity_key(home).unwrap();
+    duduclaw_core::mint_identity_token(&key, "a1")
+}
+
 #[derive(Default)]
 struct Fake {
     workspace_headers: Vec<String>,
@@ -139,7 +144,7 @@ async fn headers_server_stream_and_tool_gate() {
                  {\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"lookup\",\"arguments\":{}}}\n\
                  {\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"ping\"}\n";
     let (client, server) = tokio::io::duplex(1 << 20);
-    let code = bridge::run_bridge(home, "a1", "crm", input.as_bytes(), server).await;
+    let code = bridge::run_bridge(home, "a1", "crm", &signed_token(home), input.as_bytes(), server).await;
     assert_eq!(code, 0);
     let mut out = String::new();
     tokio::io::BufReader::new(client).read_to_string(&mut out).await.unwrap();
@@ -273,7 +278,7 @@ async fn a_broken_post_answer_stream_is_resumed_with_last_event_id() {
     let (client, server) = tokio::io::duplex(1 << 20);
     let code = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        bridge::run_bridge(home, "a1", "slowsrv", input.as_bytes(), server),
+        bridge::run_bridge(home, "a1", "slowsrv", &signed_token(home), input.as_bytes(), server),
     ).await.expect("resumption must complete the original pending call");
     assert_eq!(code, 0);
     let mut out = String::new();

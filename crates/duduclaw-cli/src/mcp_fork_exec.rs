@@ -1284,7 +1284,7 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let agent_dir = home.path().join("agents/alice");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(home.path().join("identity.key"), [7u8; 32]).unwrap();
+        duduclaw_core::ensure_identity_key(home.path()).unwrap();
         let exe = duduclaw_core::resolve_duduclaw_bin();
         let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(home.path(), "alice", &exe);
         assert!(own["env"]["DUDUCLAW_AGENT_TOKEN"].as_str().is_some());

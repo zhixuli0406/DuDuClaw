@@ -35,7 +35,7 @@ impl Drop for TempDir {
 
 fn write_default_agent_config(home: &std::path::Path, default_agent: &str) {
     let content = format!("[general]\ndefault_agent = \"{default_agent}\"\n");
-    fs::write(home.join("config.toml"), content).unwrap();
+    fs::write(home.join("config.toml"), format!("{content}[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n", (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339())).unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -95,7 +95,7 @@ async fn agent_id_env_empty_string_falls_back_to_config() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn no_env_no_config_defaults_to_dudu() {
+async fn no_env_no_config_rejects_identity_by_default() {
     let _guard = ENV_LOCK.lock().unwrap();
     let tmp = TempDir::new();
     // no config.toml at all
@@ -105,7 +105,7 @@ async fn no_env_no_config_defaults_to_dudu() {
     }
 
     let result = get_default_agent(tmp.path()).await;
-    assert_eq!(result, "dudu", "final fallback must be 'dudu'");
+    assert_eq!(result, duduclaw_core::UNTRUSTED_AGENT_ID);
 }
 
 // ── WP21 debt ⑧ — token binding ────────────────────────────────────────
@@ -125,7 +125,7 @@ fn clear_claim() {
     }
 }
 
-/// No `identity.key` ⇒ zero impact, even for an obviously forged token.
+/// No `identity.key` in soft mode ⇒ zero impact, even for a forged token.
 #[tokio::test(flavor = "current_thread")]
 async fn no_identity_key_means_zero_behaviour_change() {
     let _guard = ENV_LOCK.lock().unwrap();
@@ -345,7 +345,8 @@ async fn can_modify_own_soul_flag_allows_self_write() {
     let tmp = TempDir::new();
     write_agent_with_soul(tmp.path(), "lab-agent", true);
 
-    set_claim("lab-agent", "");
+    let key = duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+    set_claim("lab-agent", &duduclaw_core::mint_identity_token(&key, "lab-agent"));
     let result = super::handle_agent_update_soul(
         &soul_update_params("lab-agent", "# self-authored\n"),
         tmp.path(),
@@ -418,6 +419,31 @@ async fn strict_mode_unverified_claim_is_denied_even_with_flag_set() {
     assert_eq!(result.get("isError").and_then(|v| v.as_bool()), Some(true));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_identity_key_refuses_env_claim_and_mcp_startup() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let tmp = TempDir::new();
+    duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+    for require in [false, true] {
+        fs::write(
+            tmp.path().join("config.toml"),
+            format!("[general]\ndefault_agent = \"agnes\"\n[delegation]\nrequire_identity_token = {require}\n"),
+        ).unwrap();
+        fs::write(duduclaw_core::identity_key_path(tmp.path()), b"short").unwrap();
+        set_claim("ceo", "00");
+        let verdict = super::caller_identity_verdict(tmp.path());
+        let resolved = get_default_agent(tmp.path()).await;
+        let startup = super::run_mcp_server(tmp.path()).await;
+        let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+        clear_claim();
+        assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
+        assert_eq!(verdict, duduclaw_core::IdentityVerdict::Rejected);
+        assert_eq!(resolved, duduclaw_core::UNTRUSTED_AGENT_ID);
+        let error = startup.unwrap_err().to_string();
+        assert!(error.contains("MCP caller identity rejected"), "{error}");
+    }
+}
+
 // ── System-sender names are never a process identity ─────────────────────
 
 /// A self-asserted `DUDUCLAW_AGENT_ID=dashboard` (or `cron`, …) would inherit
@@ -457,6 +483,30 @@ async fn system_sender_name_as_identity_is_untrusted() {
     let result = get_default_agent(tmp.path()).await;
     clear_claim();
     assert_eq!(result, "sales-rep");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn signed_system_sender_identity_is_still_untrusted() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let tmp = TempDir::new();
+    fs::write(tmp.path().join("config.toml"),
+        "[delegation]\nrequire_identity_token = true\n").unwrap();
+    let key = duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+    for sender in duduclaw_core::SYSTEM_SENDERS.iter()
+        .chain(duduclaw_core::RESERVED_QUEUE_SENDERS.iter())
+    {
+        set_claim(sender, &duduclaw_core::mint_identity_token(&key, sender));
+        let result = get_default_agent(tmp.path()).await;
+        let verified = crate::mcp_namespace::verified_employee_from_env(tmp.path());
+        let startup = super::run_mcp_server(tmp.path()).await;
+        let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+        clear_claim();
+        assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
+        assert_eq!(result, duduclaw_core::UNTRUSTED_AGENT_ID, "{sender}");
+        assert_eq!(verified, None, "{sender}");
+        assert!(startup.unwrap_err().to_string().contains("MCP caller identity rejected"));
+        assert!(!tmp.path().join("memory.db").exists());
+    }
 }
 
 /// Rows of `tool_calls.jsonl` recording a refused system-sender identity.
@@ -505,4 +555,117 @@ async fn system_sender_identity_refusal_is_audited_once_with_claim_and_source() 
     write_default_agent_config(ok_home.path(), "agnes");
     let _ = get_default_agent(ok_home.path()).await;
     assert!(identity_refusals(ok_home.path()).is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_identity_config_rejects_mcp_namespace_and_hook() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let tmp = TempDir::new();
+    let key = duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+    let token = duduclaw_core::mint_identity_token(&key, "alice");
+    for body in ["[", "delegation = false", "[delegation]\nrequire_identity_token = 'false'",
+        "[delegation]\nrequire_identity_token = 0"] {
+        fs::write(tmp.path().join("config.toml"), body).unwrap();
+        set_claim("alice", &token);
+        let verdict = super::caller_identity_verdict(tmp.path());
+        let verified = crate::mcp_namespace::verified_employee_from_env(tmp.path());
+        let hook = crate::resolve_hook_caller(tmp.path(), Some("alice"));
+        let startup = super::run_mcp_server(tmp.path()).await;
+        let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+        clear_claim();
+        assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
+        assert_eq!(verdict, duduclaw_core::IdentityVerdict::Rejected);
+        assert_eq!(verified, None);
+        assert_eq!(hook, duduclaw_core::HookCaller::Untrusted("alice".into()));
+        assert!(startup.unwrap_err().to_string().contains("MCP caller identity rejected"));
+    }
+    fs::remove_file(tmp.path().join("config.toml")).unwrap();
+    fs::create_dir(tmp.path().join("config.toml")).unwrap();
+    set_claim("alice", &token);
+    let startup = super::run_mcp_server(tmp.path()).await;
+    let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+    clear_claim();
+    assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
+    assert!(startup.unwrap_err().to_string().contains("MCP caller identity rejected"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn default_strict_and_deleted_key_refuse_mcp_startup() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let tmp = TempDir::new();
+    set_claim("ceo", "garbage");
+    let startup = super::run_mcp_server(tmp.path()).await;
+    let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+    clear_claim();
+    assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
+    assert!(startup.unwrap_err().to_string().contains("MCP caller identity rejected"));
+    duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+    set_claim("ceo", "garbage");
+    let startup = super::run_mcp_server(tmp.path()).await;
+    let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+    clear_claim();
+    assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
+    assert!(startup.unwrap_err().to_string().contains("MCP caller identity rejected"));
+    fs::remove_file(duduclaw_core::identity_key_path(tmp.path())).unwrap();
+    write_default_agent_config(tmp.path(), "alice");
+    set_claim("ceo", "garbage");
+    let startup = super::run_mcp_server(tmp.path()).await;
+    let proxy = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", "never-spawn-invalid-identity", &[]).await;
+    clear_claim();
+    assert!(proxy.unwrap_err().to_string().contains("MCP caller identity rejected"));
+    assert!(startup.unwrap_err().to_string().contains("MCP caller identity rejected"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn strict_default_preserves_operator_selection_without_employee_fallback() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let tmp = TempDir::new();
+    clear_claim();
+    assert_eq!(crate::default_agent_for_command_with_session(tmp.path(), false).await.unwrap(), "dudu");
+    fs::write(tmp.path().join("config.toml"), "[general]\ndefault_agent = 'alice'\n").unwrap();
+    assert_eq!(crate::default_agent_for_command_with_session(tmp.path(), false).await.unwrap(), "alice");
+    assert!(crate::default_agent_for_command_with_session(tmp.path(), true).await.is_err());
+    set_claim("ceo", "garbage");
+    let result = crate::default_agent_for_command(tmp.path()).await;
+    clear_claim();
+    assert!(result.is_err());
+    fs::write(tmp.path().join("config.toml"), "[general]\ndefault_agent = 'dashboard'\n").unwrap();
+    assert!(crate::default_agent_for_command_with_session(tmp.path(), false).await.is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn verified_identity_reaches_proxy_spawn() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let tmp = TempDir::new();
+    let key = duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+    set_claim("alice", &duduclaw_core::mint_identity_token(&key, "alice"));
+    let nonexistent = tmp.path().join("nonexistent-upstream");
+    let result = crate::mcp_proxy::run_mcp_proxy(tmp.path(), "test", nonexistent.to_str().unwrap(), &[]).await;
+    clear_claim();
+    // Reaching spawn proves the new identity gate accepted the verified caller.
+    // No actual upstream is launched, so the test does not depend on test stdin.
+    assert!(result.unwrap_err().to_string().contains("failed to spawn upstream"));
+}
+
+#[test]
+fn stdio_identity_gate_rejects_expired_grace_without_restart() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let tmp = TempDir::new();
+    duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
+    write_default_agent_config(tmp.path(), "alice");
+    unsafe {
+        std::env::set_var(duduclaw_core::ENV_AGENT_ID, "alice");
+        std::env::set_var(duduclaw_core::ENV_AGENT_TOKEN, "garbage");
+    }
+    let before = super::caller_identity_verdict(tmp.path());
+    fs::write(tmp.path().join("config.toml"), format!(
+        "[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n",
+        (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339())).unwrap();
+    let after = super::caller_identity_verdict(tmp.path());
+    unsafe {
+        std::env::remove_var(duduclaw_core::ENV_AGENT_ID);
+        std::env::remove_var(duduclaw_core::ENV_AGENT_TOKEN);
+    }
+    assert_eq!(before, duduclaw_core::IdentityVerdict::Unverified);
+    assert_eq!(after, duduclaw_core::IdentityVerdict::Rejected);
 }

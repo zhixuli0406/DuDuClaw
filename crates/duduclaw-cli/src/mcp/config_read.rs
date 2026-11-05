@@ -248,9 +248,11 @@ mod decrypt_channel_token_tests {
 ///
 /// | `identity.key` | token | `[delegation] require_identity_token` | result |
 /// |---|---|---|---|
-/// | absent | — | — | unchanged (feature not enabled) |
+/// | absent, never initialized | — | `false` | unchanged (explicit legacy mode) |
+/// | absent | — | `true` | untrusted sentinel |
+/// | unreadable/malformed/unsafe permissions | — | either | untrusted sentinel |
 /// | present | valid | — | unchanged, now *proven* |
-/// | present | missing/invalid | `false` (default) | unchanged + one `warn!` per process |
+/// | present | missing/invalid | `false` (explicit opt-out) | unchanged + one `warn!` per process |
 /// | present | missing/invalid | `true` | [`duduclaw_core::UNTRUSTED_AGENT_ID`] |
 ///
 /// The sentinel is not an agent id, is nobody's ancestor, shares no department
@@ -268,6 +270,14 @@ mod decrypt_channel_token_tests {
 /// unconditional delegation reach, so it resolves to the untrusted sentinel.
 pub async fn get_default_agent(home_dir: &Path) -> String {
     if caller_identity_verdict(home_dir) == duduclaw_core::IdentityVerdict::Rejected {
+        if let Ok(claimed) = std::env::var(duduclaw_core::ENV_AGENT_ID) {
+            let claimed = claimed.trim();
+            if duduclaw_core::is_system_sender(claimed)
+                || duduclaw_core::is_reserved_queue_sender(claimed)
+            {
+                audit_system_sender_identity_once(home_dir, claimed, "env");
+            }
+        }
         return duduclaw_core::UNTRUSTED_AGENT_ID.to_string();
     }
 
@@ -338,7 +348,13 @@ fn audit_system_sender_identity_once(home_dir: &Path, claimed: &str, source: &st
 /// site; both are cheap file reads and `get_default_agent` runs a handful of
 /// times per process, not per tool call.
 pub fn caller_identity_verdict(home_dir: &Path) -> duduclaw_core::IdentityVerdict {
-    let require = duduclaw_core::require_identity_token_from_home(home_dir);
+    let require = match duduclaw_core::require_identity_token_from_home(home_dir) {
+        Ok(require) => require,
+        Err(error) => {
+            tracing::error!(%error, "MCP caller identity rejected: cannot read identity policy");
+            return duduclaw_core::IdentityVerdict::Rejected;
+        }
+    };
     duduclaw_core::verify_env_identity(home_dir, require)
 }
 

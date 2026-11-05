@@ -8,10 +8,14 @@
 //!   "env": { "DUDUCLAW_HOME": "<home>" } }
 //! ```
 //!
-//! No URL, token or key appears in the entry (argv is world-readable through
+//! No remote URL, token or key appears in the stored entry (argv is world-readable through
 //! `/proc/<pid>/cmdline`); the bridge reads everything from the encrypted
 //! store. `DUDUCLAW_HOME` is in `env` because the employee's spawn
-//! environment is scrubbed and does not carry it.
+//! environment is scrubbed and does not carry it. Before starting an employee,
+//! the host rewrites this entry with its signed `DUDUCLAW_AGENT_ID` and
+//! `DUDUCLAW_AGENT_TOKEN` pair (including when proxy gates are disabled).
+//! The raw stored entry has no identity pair; the spawn rewrite never trusts
+//! identity supplied by raw third-party entries.
 //!
 //! Candidate form (what a manifest parse produces before anyone has picked
 //! an employee): `{"command": "duduclaw", "args": ["mcp-remote-bridge",
@@ -225,16 +229,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let def = installed_def(dir.path(), "a1", "zap").unwrap();
         assert!(crate::mcp_scan::scan_mcp_server_def("zap", &def).passed);
-        let exe = std::path::Path::new("/opt/duduclaw/bin/duduclaw");
+        let exe = std::path::Path::new(&def.command).to_path_buf();
         let cfg = serde_json::json!({ "mcpServers": { "zap": def } });
-        let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(dir.path(), "a1", exe);
-        let out = crate::redaction_proxy::rewrite_mcp_config_for_proxy(&cfg, exe, &own).unwrap();
+        let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(dir.path(), "a1", &exe);
+        let out = crate::redaction_proxy::rewrite_mcp_config_for_proxy(&cfg, &exe, &own).unwrap();
         let args: Vec<String> = serde_json::from_value(out["mcpServers"]["zap"]["args"].clone()).unwrap();
         assert_eq!(args[0], "mcp-proxy");
         assert!(args.iter().any(|a| a == BRIDGE_SUBCOMMAND), "{args:?}");
-        // The bridge's own env (DUDUCLAW_HOME) rides in the proxy's upstream env.
+        // The proxy passes the host home and signed identity to its native child.
         let env = out["mcpServers"]["zap"]["env"].as_object().unwrap();
-        assert!(env.values().any(|v| v.as_str().is_some_and(|s| s.contains("DUDUCLAW_HOME"))));
+        assert_eq!(env["DUDUCLAW_HOME"], dir.path().to_string_lossy().as_ref());
     }
 
     #[test]

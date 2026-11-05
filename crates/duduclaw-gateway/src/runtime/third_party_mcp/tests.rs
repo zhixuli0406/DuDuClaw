@@ -112,12 +112,12 @@ fn a_bridge_is_wrapped_and_gets_its_env_through_the_spawn_file() {
     );
     let upstream: Value = serde_json::from_str(&zap.upstream_env).unwrap();
     assert_eq!(
-        upstream["DUDUCLAW_HOME"], "/h",
-        "the bridge's own declared env"
+        upstream["DUDUCLAW_HOME"], home.path().to_string_lossy().as_ref(),
+        "the host home replaces the bridge's raw declared env"
     );
     assert!(upstream.as_object().unwrap().keys().all(|key| !is_proxy_private_env_key(key)));
     assert_eq!(zap.proxy_env.get("DUDUCLAW_AGENT_ID").map(String::as_str), Some("trader"));
-    assert_eq!(zap.proxy_env.get("DUDUCLAW_HOME").map(String::as_str), Some("/h"));
+    assert_eq!(zap.proxy_env.get("DUDUCLAW_HOME").map(String::as_str), home.path().to_str());
 }
 
 #[test]

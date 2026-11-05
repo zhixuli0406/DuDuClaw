@@ -427,6 +427,17 @@ pub async fn run_proxy_io_gated(
     gate: Option<Arc<ThirdPartyGate>>,
     io: ProxyIo,
 ) -> std::io::Result<()> {
+    run_proxy_io_with_identity(server, layer, gate, io, None).await
+}
+
+// Production proxies revalidate before forwarding, including approval-held calls.
+async fn run_proxy_io_with_identity(
+    server: &str,
+    layer: Option<Arc<McpRedactionLayer>>,
+    gate: Option<Arc<ThirdPartyGate>>,
+    io: ProxyIo,
+    identity_home: Option<std::path::PathBuf>,
+) -> std::io::Result<()> {
     let ProxyIo {
         client_in,
         mut client_out,
@@ -456,8 +467,22 @@ pub async fn run_proxy_io_gated(
     let (up_tx, mut up_rx) = mpsc::unbounded_channel::<QueuedFrame>();
     let writer_gate = gate.clone();
     let writer_pending = pending.clone();
+    let writer_home = identity_home.clone();
+    let writer_tx = tx.clone();
     let up_writer = tokio::spawn(async move {
         while let Some(mut frame) = up_rx.recv().await {
+            if writer_home.as_deref().is_some_and(|home|
+                crate::mcp::caller_identity_verdict(home) == duduclaw_core::IdentityVerdict::Rejected)
+            {
+                if let Some(id) = parse_frame(&frame.line).and_then(|v| v.get("id").cloned()) {
+                    let id = frame.slot.as_ref().map(|slot| slot.id.clone()).unwrap_or(id);
+                    let _ = writer_tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
+                        &id, "MCP caller identity rejected: strict tokens required or identity policy/key unavailable",
+                    ));
+                }
+                if let Some(gate) = &writer_gate { gate.close_pending(); }
+                continue;
+            }
             if write_queued_frame(&mut upstream_in, &mut frame).await.is_err() {
                 if let Ok(mut pending) = writer_pending.lock() { pending.inner.clear(); }
                 if let Some(gate) = &writer_gate { gate.close_pending(); }
@@ -551,6 +576,16 @@ pub async fn run_proxy_io_gated(
             continue;
         };
 
+        if identity_home.as_deref().is_some_and(|home|
+            crate::mcp::caller_identity_verdict(home) == duduclaw_core::IdentityVerdict::Rejected)
+        {
+            if let Some(id) = frame.get("id") {
+                let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
+                    id, "MCP caller identity rejected: strict tokens required or identity policy/key unavailable",
+                ));
+            }
+            continue;
+        }
         if !frame.is_object()
             || (frame.get("method").and_then(Value::as_str) == Some("tools/call")
                 && tool_call_of(&frame).is_none())
@@ -880,6 +915,13 @@ pub async fn run_mcp_proxy_scoped(
         ));
     }
 
+    let default_agent = crate::mcp::get_default_agent(home_dir).await;
+    if default_agent == duduclaw_core::UNTRUSTED_AGENT_ID {
+        return Err(DuDuClawError::Gateway(
+            "MCP caller identity rejected: refusing to start the upstream proxy".into(),
+        ));
+    }
+
     // Authenticate secret-store reads before initializing other per-agent
     // services. No fallback/default identity may authorize secret resolution.
     let env_blob = match scoped_blob {
@@ -919,8 +961,6 @@ pub async fn run_mcp_proxy_scoped(
             return Err(DuDuClawError::Gateway(message));
         }
     };
-
-    let default_agent = crate::mcp::get_default_agent(home_dir).await;
 
     // Same three outcomes as `mcp-server` (§10.2): disabled ⇒ pass-through,
     // enabled ⇒ redact, broken ⇒ refuse to start.
@@ -1009,7 +1049,7 @@ pub async fn run_mcp_proxy_scoped(
         upstream_out: Box::new(upstream_out),
     };
 
-    if let Err(e) = run_proxy_io_gated(server, layer, gate, io).await {
+    if let Err(e) = run_proxy_io_with_identity(server, layer, gate, io, Some(home_dir.to_path_buf())).await {
         tracing::warn!(server = %server, error = %e, "mcp-proxy: stream loop ended with an error");
     }
 
@@ -1030,6 +1070,29 @@ mod tests {
     };
     use serde_json::json;
     use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn identity_guard_refuses_proxy_frames_before_forwarding() {
+        let home = tempfile::tempdir().unwrap();
+        // Missing grace must be strict even when false was requested.
+        std::fs::write(home.path().join("config.toml"),
+            "[delegation]\nrequire_identity_token = false\n").unwrap();
+        let (client_out, mut client_read) = duplex(4096);
+        let (upstream_in, mut upstream_read) = duplex(4096);
+        let request: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"read\"}}\nopaque\n";
+        run_proxy_io_with_identity("test", None, None, ProxyIo {
+            client_in: Box::new(request),
+            client_out: Box::new(client_out),
+            upstream_in: Box::new(upstream_in),
+            upstream_out: Box::new(tokio::io::empty()),
+        }, Some(home.path().to_path_buf())).await.unwrap();
+        let mut forwarded = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut upstream_read, &mut forwarded).await.unwrap();
+        assert!(forwarded.is_empty());
+        let mut reply = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut client_read, &mut reply).await.unwrap();
+        assert!(reply.contains("MCP caller identity rejected"));
+    }
 
     // ── pure frame classification ────────────────────────────────────
 

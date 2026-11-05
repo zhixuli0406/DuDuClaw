@@ -22,6 +22,11 @@ use tokio::io::AsyncReadExt;
 
 use duduclaw_gateway::remote_mcp::{bridge, connect, store};
 
+fn signed_token(home: &std::path::Path) -> String {
+    let key = duduclaw_core::ensure_identity_key(home).unwrap();
+    duduclaw_core::mint_identity_token(&key, "a1")
+}
+
 #[derive(Default)]
 struct Fake {
     base: String,
@@ -201,7 +206,7 @@ async fn start_fake() -> (S, String) {
 
 async fn run(home: &std::path::Path, input: &str) -> Vec<Value> {
     let (client, server) = tokio::io::duplex(1 << 20);
-    let code = bridge::run_bridge(home, "a1", "fake", input.as_bytes(), server).await;
+    let code = bridge::run_bridge(home, "a1", "fake", &signed_token(home), input.as_bytes(), server).await;
     assert_eq!(code, 0);
     let mut out = String::new();
     tokio::io::BufReader::new(client).read_to_string(&mut out).await.unwrap();

@@ -5729,21 +5729,20 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::Tooling(ToolingCommands::McpRemoteBridge { agent, server }) => {
             // stdout is the JSON-RPC channel; tracing goes to stderr.
-            // A process started for one employee must not borrow another
-            // employee's connection.
-            if let Some(own) = std::env::var_os("DUDUCLAW_AGENT_ID")
-                && !own.is_empty()
-                && own.to_str() != Some(agent.as_str())
-            {
-                eprintln!("mcp-remote-bridge: refusing --agent {agent}: this process runs as a different employee");
-                std::process::exit(2);
-            }
             let home = duduclaw_home();
+            let token = match duduclaw_core::identity_token::verified_bridge_env_token(&home, &agent) {
+                Ok(token) => token,
+                Err(message) => {
+                    eprintln!("mcp-remote-bridge: {message}");
+                    std::process::exit(2);
+                }
+            };
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
             let code = duduclaw_gateway::remote_mcp::bridge::run_bridge(
                 &home,
                 &agent,
                 &server,
+                &token,
                 stdin,
                 tokio::io::stdout(),
             )
@@ -7025,7 +7024,10 @@ fn resolve_hook_caller(
         return duduclaw_core::HookCaller::Absent;
     }
     let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
-    let require = duduclaw_core::require_identity_token_from_home(home);
+    let require = match duduclaw_core::require_identity_token_from_home(home) {
+        Ok(require) => require,
+        Err(_) => return duduclaw_core::HookCaller::Untrusted(claimed.to_string()),
+    };
     match duduclaw_core::verify_identity_claim(home, claimed, token.trim(), require) {
         duduclaw_core::IdentityVerdict::Rejected => {
             duduclaw_core::HookCaller::Untrusted(claimed.to_string())
@@ -7063,6 +7065,8 @@ mod resolve_hook_caller_tests {
     fn agent_flag_takes_priority_over_env_id() {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"),
+            format!("[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n", (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339())).unwrap();
         clear_env();
         // SAFETY: serialized via ENV_LOCK.
         unsafe {
@@ -7089,6 +7093,8 @@ mod resolve_hook_caller_tests {
         // (or not-yet-upgraded) call sites.
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"),
+            format!("[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n", (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339())).unwrap();
         clear_env();
         unsafe {
             std::env::set_var(duduclaw_core::ENV_AGENT_ID, "env-only-agent");
@@ -7109,6 +7115,8 @@ mod resolve_hook_caller_tests {
         // missing flag, matching the existing empty-env-var handling.
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"),
+            format!("[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n", (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339())).unwrap();
         clear_env();
         unsafe {
             std::env::set_var(duduclaw_core::ENV_AGENT_ID, "env-only-agent");
@@ -7125,12 +7133,13 @@ mod resolve_hook_caller_tests {
 
     #[test]
     fn agent_flag_without_env_token_is_soft_mode_agent() {
-        // Soft mode (the default — no config.toml at all here, so
-        // `require_identity_token` defaults to false): an --agent claim with
+        // Explicit soft mode: an --agent claim with
         // no DUDUCLAW_AGENT_TOKEN in env is `Unverified`, which is still
         // trusted — exactly how an env-only claim behaved before this fix.
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"),
+            format!("[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n", (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339())).unwrap();
         clear_env();
         duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
 
@@ -11566,7 +11575,7 @@ async fn cmd_redteam(
     let home = duduclaw_home();
     let agent = match agent {
         Some(a) => a,
-        None => mcp::get_default_agent(&home).await,
+        None => default_agent_for_command(&home).await?,
     };
     let agent_dir = home.join("agents").join(&agent);
     let contract = duduclaw_agent::contract::load_contract(&agent_dir);
@@ -11754,10 +11763,42 @@ async fn open_memory_engine() -> duduclaw_core::error::Result<duduclaw_memory::S
         .map_err(|e| DuDuClawError::Memory(format!("open memory.db: {e}")))
 }
 
-async fn resolve_agent_arg(agent: Option<String>) -> String {
+/// Operator commands select a configured employee without claiming to be that
+/// employee. AI-session callers still pass through the MCP identity gate.
+pub(crate) async fn default_agent_for_command(home: &std::path::Path) -> duduclaw_core::error::Result<String> {
+    default_agent_for_command_with_session(home, !ai_session_guard::markers().is_empty()).await
+}
+
+async fn default_agent_for_command_with_session(home: &std::path::Path, in_session: bool) -> duduclaw_core::error::Result<String> {
+    if in_session {
+        let agent = mcp::get_default_agent(home).await;
+        if agent == duduclaw_core::UNTRUSTED_AGENT_ID {
+            return Err(DuDuClawError::Config("MCP caller identity rejected".into()));
+        }
+        return Ok(agent);
+    }
+    let path = home.join("config.toml");
+    let table = match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(error) => return Err(DuDuClawError::Config(error.to_string())),
+        Ok(_) => std::fs::read_to_string(&path)
+            .map_err(|e| DuDuClawError::Config(e.to_string()))?
+            .parse::<toml::Table>().map_err(|e| DuDuClawError::Config(e.to_string()))?,
+    };
+    let agent = table.get("general").and_then(|v| v.get("default_agent"))
+        .and_then(|v| v.as_str()).unwrap_or("dudu");
+    if !duduclaw_core::is_valid_agent_id(agent) || duduclaw_core::is_reserved_agent_id(agent)
+        || duduclaw_core::is_system_sender(agent) || duduclaw_core::is_reserved_queue_sender(agent)
+    {
+        return Err(DuDuClawError::Config("Invalid default employee identity".into()));
+    }
+    Ok(agent.to_string())
+}
+
+async fn resolve_agent_arg(agent: Option<String>) -> duduclaw_core::error::Result<String> {
     match agent {
-        Some(a) => a,
-        None => mcp::get_default_agent(&duduclaw_home()).await,
+        Some(a) => Ok(a),
+        None => default_agent_for_command(&duduclaw_home()).await,
     }
 }
 
@@ -11803,7 +11844,7 @@ async fn cmd_gdpr_export(
     // Refuse a blank or too-short contact before opening any store: it would
     // become a `%…%` pattern matching most of the employee's data.
     let contact = duduclaw_memory::gdpr_validate_contact(&contact)?.to_string();
-    let agent = resolve_agent_arg(agent).await;
+    let agent = resolve_agent_arg(agent).await?;
     let engine = open_memory_engine().await?;
     let mut bundle = duduclaw_memory::gdpr_export(&engine, &agent, &contact).await?;
     let (sessions, session_count) = gdpr_session_bundle(&contact).await?;
@@ -11847,7 +11888,7 @@ async fn cmd_gdpr_erase(
     // any store is opened: an empty contact matches every memory of the
     // employee, and the session and review-store steps use the same text.
     let contact = duduclaw_memory::gdpr_validate_contact(&contact)?.to_string();
-    let agent = resolve_agent_arg(agent).await;
+    let agent = resolve_agent_arg(agent).await?;
     let engine = open_memory_engine().await?;
 
     // Fail-closed: without --confirm this is a dry-run preview only.
@@ -12105,7 +12146,7 @@ async fn cmd_http_server(
         &home,
     );
 
-    let default_agent = mcp::get_default_agent(&home).await;
+    let default_agent = default_agent_for_command(&home).await?;
 
     // P2-4: initialise the RFC-23 egress layer for the HTTP/SSE transport too.
     // `None` ⇒ redaction not enabled in config.toml (zero-overhead skip). An

@@ -154,7 +154,7 @@ pub async fn run(
 
     let agent_id = match agent {
         Some(a) => a,
-        None => crate::mcp::get_default_agent(&home).await,
+        None => crate::default_agent_for_command(&home).await?,
     };
 
     if is_json_file(&file) {

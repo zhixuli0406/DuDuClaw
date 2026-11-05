@@ -53,6 +53,8 @@ pub(crate) use crate::runtime::third_party_mcp::{GatedServer, gated_servers_for_
 /// the `-c` overrides, which Codex merges over this table. A manual `codex`
 /// run from this file alone starts the server without its declared env. The
 /// explore lane is per spawn and also travels only in the `-c` overrides.
+/// Native bridge identity tokens are also per-spawn only, including tokens on
+/// a redaction proxy wrapping a bridge; never persist them in this table.
 pub(crate) fn file_entries(servers: &BTreeMap<String, GatedServer>) -> HashMap<String, Value> {
     servers
         .iter()
@@ -60,7 +62,8 @@ pub(crate) fn file_entries(servers: &BTreeMap<String, GatedServer>) -> HashMap<S
             let env: BTreeMap<&String, &String> = s
                 .env
                 .iter()
-                .filter(|(k, _)| k.as_str() != PROXY_UPSTREAM_ENV_VAR)
+                .filter(|(k, _)| k.as_str() != PROXY_UPSTREAM_ENV_VAR
+                    && !k.eq_ignore_ascii_case(duduclaw_core::ENV_AGENT_TOKEN))
                 .collect();
             (
                 name.clone(),

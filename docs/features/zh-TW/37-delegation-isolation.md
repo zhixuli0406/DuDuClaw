@@ -263,22 +263,18 @@ allow = [
 
 **工作原理**：
 
-1. Gateway 啟動時在 `~/.duduclaw/identity.key` 生成 256-bit 隨機密鑰（檔案權限 0600）
+1. Gateway 啟動時在 `~/.duduclaw/identity.key` 生成 256-bit 隨機密鑰（Unix 權限 0600；Windows 使用受限 ACL）
 2. Spawn 子 agent 時，gateway 產生簽名 token（HMAC-SHA256，綁定 agent ID）
 3. Token 注入環境變數 `DUDUCLAW_AGENT_TOKEN`，子 agent 啟動時帶著它
 4. MCP server 端驗證 token 有效性與授權者身分
 
-**軟硬模式**：
+**v1.80.0 起預設嚴格模式**，既有安裝未填設定時也適用：`config.toml [delegation] require_identity_token = true`。缺少或無效權杖會拒絕 MCP 啟動；設定讀不到或格式錯誤也拒絕身分。只有明確填入布林值 `false` 並提供有效寬限期限才啟用寬鬆模式，閘道每次啟動都會警告。寬鬆模式接受未驗證的員工宣告，仍有冒充風險，只適合短暫升級過渡。
 
-- **軟模式**（預設）：`config.toml [delegation] require_identity_token = false`
-  - 缺失或無效 token 只發警告，不拒絕 MCP 啟動
-  - 用來容錯：升級中或 token 一時未同步的過渡階段
+寬鬆模式必須同時設定 `require_identity_token = false` 與 `[delegation] identity_token_grace_until`：後者須為加引號的 RFC3339 UTC 時間（`Z` 或 `+00:00`），晚於現在且不超過未來 30 天。缺少、無效、非 UTC、過期或超過上限時會恢復嚴格模式，每個行程只記錄一次錯誤。身分驗證會重查期限，即使呼叫端曾快取寬鬆模式也一樣。Unix 另從已開啟的檔案描述元要求擁有者等於有效 UID、硬連結數為 1；macOS 拒絕任何延伸 ACL 項目，ACL 查詢失敗也拒絕（ENOENT 表示沒有 ACL）。其他 Unix 的延伸 ACL 未檢查。一旦觀察到某個 home 的期限過期或無效，該行程就會持續對此 home 強制嚴格模式；回撥時鐘或修改期限都無法重新放寬。此鎖定不會跨行程重啟保存。
 
-- **嚴格模式**：`config.toml [delegation] require_identity_token = true`
-  - 無效身分直接拒絕 MCP 啟動，失敗訊息寫入日誌
-  - 適合安全要求高的環境
+閘道會為既有及新建金鑰記錄 `identity.key.initialized`。標記存在後金鑰遺失，或金鑰讀不到、格式或權限錯誤時，兩種模式都拒絕身分。初始化失敗會停止閘道啟動。建立程序使用跨行程鎖、不可預測的私有暫存檔，以及不覆寫目的地的原子安裝。Unix 要求 `0600`；Windows 從已開啟的 handle 驗證 reparse 狀態、擁有者及 ACL。系統與佇列寄件者名稱即使帶有有效權杖，也不能成為已驗證員工。
 
-**升級順序很重要**：先重啟 gateway（讓 agent 的 MCP 設定重新簽署），再改成嚴格模式。順序反了 agent 會以無效 token 啟動，進嚴格模式後立即被拒。
+**升級步驟：**保留原本金鑰及標記，先重啟閘道以重新產生員工 MCP 設定，再重啟舊員工行程。若暫時設為 `false`，重啟完成後改回 `true` 或移除設定。Windows 舊金鑰若授權過寬，需先修復 ACL。遺失金鑰時請還原原檔，不要刪除標記。首次初始化中斷可能需要管理員復原。復原方式、平台限制與同帳號威脅範圍見[安全防護](05-security-defense.md#mcp-員工身分驗證)。
 
 ### 組織資料保護
 
