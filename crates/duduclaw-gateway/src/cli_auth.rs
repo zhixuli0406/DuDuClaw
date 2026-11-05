@@ -390,6 +390,9 @@ fn auth_markers(runtime: RuntimeType) -> (Vec<String>, Vec<String>) {
 /// `which_*` match. `openai_compat` has no binary, so it resolves to `None`
 /// structurally rather than by a special case.
 pub fn resolve_program(runtime: RuntimeType) -> Option<String> {
+    if crate::runtime_readiness::is_protected_linux() {
+        return crate::runtime_readiness::detect_runtime(runtime.as_str(), std::path::Path::new("/var/lib/duduclaw"));
+    }
     duduclaw_core::which_runtime(runtime.as_str())
 }
 

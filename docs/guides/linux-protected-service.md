@@ -46,6 +46,23 @@ Without `--enable-now`, installation only installs the service; start it with `s
 
 The root-owned executable is `/opt/duduclaw/bin/duduclaw`; the embedded launcher is installed at `/usr/local/libexec/duduclaw/protected-launcher`. The unit is `/etc/systemd/system/duduclaw-gateway.service`. Data lives in `/var/lib/duduclaw/.duduclaw`; the root key is `/var/lib/duduclaw-protected/root.key` (root:root, mode 0400, one link, 32 bytes). The unit uses `KillMode=control-group` and a read-only system filesystem with only the data and key directories writable.
 
+## Install AI CLIs for the service account
+
+The service runs as `duduclaw`, with `HOME=/var/lib/duduclaw` and `PATH=/usr/sbin:/usr/bin:/sbin:/bin`. AI CLIs must be installed in one of those system PATH directories and be readable and executable by that account. `ProtectHome=yes` hides `/home`, `/root` and `/run/user`; a CLI such as `/home/operator/.local/bin/claude` is unavailable even if root can find it. A symlink in a system directory that points into a hidden home does not solve this.
+
+For Claude Code, replace `<ver>` with the version you intend to install before running these commands:
+
+```sh
+cd / && sudo -H npm install -g --prefix /usr @anthropic-ai/claude-code@<ver>
+sudo -u duduclaw -H claude auth login
+```
+
+Keep both `-H` and `--prefix /usr`: an operator's `~/.npmrc` prefix can otherwise install the CLI back into the operator's home. Install any configured Codex, Grok, AGY or Gemini CLI in the same service-readable system PATH and authenticate it as the service account using its own login procedure.
+
+At the end of `service install --protected-linux` and `service upgrade --protected-linux`, the command checks the configured primary inference runtime and runtimes selected in agents' `agent.toml` files, reading the destination configuration after any migration. It checks executable access as the service account with the service PATH and excludes hidden paths. A CLI found only in the operator's home is reported as unavailable to the service. If the primary runtime is missing, the command prints a warning and exits nonzero. Use `--allow-missing-runtime` on either command only when deliberately completing runtime setup later; this flag does not install or authenticate a CLI. A nonzero runtime check does not undo installation or upgrade work already performed.
+
+Migration copies only `.duduclaw` data, **not AI CLI installations or their login credentials**. When Claude is installed but the service account has no login, installation prints the service-account login command above. Authenticate that account separately; do not copy credentials from the operator's home. On gateway startup, a missing configured inference binary produces an ERROR with repair guidance; runtime status and doctor also show the protected-service instructions.
+
 ## Migrate a user installation
 
 Back up the old data and stop its gateway before copying. As the owner of the old user service, run:

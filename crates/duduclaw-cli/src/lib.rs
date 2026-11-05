@@ -3664,6 +3664,9 @@ enum ServiceCommands {
         /// Preserve the existing destination as a backup and replace it
         #[arg(long, requires = "migrate_from")]
         force_migrate: bool,
+        /// Keep installation successful even if a configured AI CLI is missing
+        #[arg(long, requires = "protected_linux")]
+        allow_missing_runtime: bool,
     },
 
     /// Upgrade using the already installed, root-owned protected executable
@@ -3673,6 +3676,9 @@ enum ServiceCommands {
         /// Official release version (X.Y.Z); defaults to latest
         #[arg(long)]
         version: Option<String>,
+        /// Keep upgrade successful even if a configured AI CLI is missing
+        #[arg(long, requires = "protected_linux")]
+        allow_missing_runtime: bool,
     },
 
     /// Start the background service
@@ -5583,17 +5589,17 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             },
         },
         Commands::Ops(OpsCommands::Service { command }) => match command {
-            ServiceCommands::Install { protected_linux, enable_now, migrate_from, force_migrate, i_verified_this_binary } => {
+            ServiceCommands::Install { protected_linux, enable_now, migrate_from, force_migrate, i_verified_this_binary, allow_missing_runtime } => {
                 if protected_linux {
                     service::protected_linux::install(service::protected_linux::InstallOptions {
-                        enable_now, migrate_from, force_migrate, i_verified_this_binary,
+                        enable_now, migrate_from, force_migrate, i_verified_this_binary, allow_missing_runtime,
                     })
                 } else {
                     service::handle_service(service::ServiceAction::Install).await
                 }
             }
-            ServiceCommands::Upgrade { protected_linux: _, version } => {
-                service::protected_linux::upgrade(version.as_deref()).await
+            ServiceCommands::Upgrade { protected_linux: _, version, allow_missing_runtime } => {
+                service::protected_linux::upgrade(version.as_deref(), allow_missing_runtime).await
             }
             ServiceCommands::Start => service::handle_service(service::ServiceAction::Start).await,
             ServiceCommands::Stop => service::handle_service(service::ServiceAction::Stop).await,

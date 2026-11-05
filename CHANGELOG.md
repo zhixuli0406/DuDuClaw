@@ -30,6 +30,8 @@
 
 ### Fixed
 
+- 修正原生 Linux 受保護服務遷移後找不到 AI CLI 卻沒有警告的問題：安裝與升級會依服務帳號、系統 PATH 及家目錄隔離檢查設定的 runtime；主要 runtime 缺少時以非零狀態結束（可明確使用 `--allow-missing-runtime`），並提供系統安裝及服務帳號登入指令。Gateway 啟動、runtime 狀態與 doctor 補上受保護服務的修復指引；CLI 與登入憑證不會自原使用者搬移。
+
 - 修復 standalone MCP 初始化與嚴格身分驗證的整合：`mcp init` 輸出 API key 及本機簽署身分，既有用戶端升級後需重新初始化；全新安裝缺少 API key 時保留初始化指引。
 - 修正儀表板 OAuth、配對、授權、Widget 與安全稽核說明中，角括號文字被誤判為 ICU 標籤的問題；最近使用技能按鈕明確分隔名稱與描述，避免無障礙名稱黏連。
 - **行為變更**：macOS 由 launchd 管理的 gateway 完成更新後，改由獨立的一次性工作卸載並重新註冊服務，避免只替換執行檔後仍需手動重啟，以及沿用舊註冊資料造成的結束碼 78。重啟失敗會保留日誌與 `duduclaw service restart` 指令，不會無限重試；桌面 App 自帶 gateway 與其他安裝方式維持原流程。

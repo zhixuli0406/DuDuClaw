@@ -10,11 +10,16 @@ mod linux;
 mod migrate;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[path = "protected_linux_runtime.rs"]
+mod runtime;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct InstallOptions {
     pub enable_now: bool,
     pub i_verified_this_binary: bool,
     pub migrate_from: Option<PathBuf>,
     pub force_migrate: bool,
+    pub allow_missing_runtime: bool,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -40,12 +45,12 @@ pub(crate) fn install(options: InstallOptions) -> Result<()> {
     { let _ = options; Err(refused("--protected-linux requires native Linux")) }
 }
 
-pub(crate) async fn upgrade(version: Option<&str>) -> Result<()> {
+pub(crate) async fn upgrade(version: Option<&str>, allow_missing_runtime: bool) -> Result<()> {
     operator_gate()?;
     #[cfg(target_os = "linux")]
-    { linux::upgrade(version).await }
+    { linux::upgrade(version, allow_missing_runtime).await }
     #[cfg(not(target_os = "linux"))]
-    { let _ = version; Err(refused("--protected-linux requires native Linux")) }
+    { let _ = (version, allow_missing_runtime); Err(refused("--protected-linux requires native Linux")) }
 }
 
 pub(crate) fn uninstall() -> Result<()> {

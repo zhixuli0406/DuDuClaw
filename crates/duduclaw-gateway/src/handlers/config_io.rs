@@ -105,6 +105,7 @@ impl MethodHandler {
         // one definition of "what config_file/agents/api_key look like",
         // two projections (`can_repair` is dashboard-only).
         let mut checks = crate::os_ops::doctor_base_checks(config_exists, has_agents, has_key, true);
+        checks.extend(crate::runtime_readiness::configured_checks(&self.home_dir));
         checks.push(json!({
             "name": "skill_default_layers",
             "status": "pass",

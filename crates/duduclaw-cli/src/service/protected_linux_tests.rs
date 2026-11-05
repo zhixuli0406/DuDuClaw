@@ -38,7 +38,7 @@ fn service_protected_account_is_nonlogin_unprivileged() {
 fn service_protected_operator_gate_precedes_platform_or_filesystem_work() {
     for marker in crate::ai_session_guard::AI_SESSION_ENV_VARS {
         let _session = crate::ai_session_guard::test_session(&[(marker, "")]);
-        assert!(install(InstallOptions { enable_now: false, migrate_from: None, force_migrate: false, i_verified_this_binary: false }).is_err());
+        assert!(install(InstallOptions { enable_now: false, migrate_from: None, force_migrate: false, i_verified_this_binary: false, allow_missing_runtime: false }).is_err());
         assert!(uninstall().is_err());
     }
 }
@@ -73,7 +73,18 @@ fn service_protected_upgrade_cli_requires_explicit_mode() {
 async fn service_protected_upgrade_operator_gate_precedes_download() {
     for marker in crate::ai_session_guard::AI_SESSION_ENV_VARS {
         let _session = crate::ai_session_guard::test_session(&[(marker, "")]);
-        let error = upgrade(Some("1.79.3")).await.unwrap_err();
+        let error = upgrade(Some("1.79.3"), false).await.unwrap_err();
         assert!(error.to_string().contains("AI 員工不能"));
     }
+}
+
+#[test]
+fn service_protected_linux_allow_missing_runtime_cli() {
+    use clap::Parser;
+    crate::test_support::run_on_big_stack(|| {
+        for action in ["install", "upgrade"] {
+            assert!(crate::Cli::try_parse_from(["duduclaw", "service", action, "--protected-linux", "--allow-missing-runtime"]).is_ok());
+            assert!(crate::Cli::try_parse_from(["duduclaw", "service", action, "--allow-missing-runtime"]).is_err());
+        }
+    });
 }
