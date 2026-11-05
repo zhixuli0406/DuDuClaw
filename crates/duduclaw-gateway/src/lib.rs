@@ -32,10 +32,19 @@
 
 pub mod isolation_mcp;
 pub mod isolation_background;
+mod isolation_http;
 pub mod isolation_egress;
 pub mod isolation_resources;
 pub mod isolation_connectors;
 pub mod isolation_connector_clients;
+pub mod isolation_connector_boot;
+pub mod isolation_connector_channel;
+pub mod isolation_connector_model;
+pub mod isolation_connector_computer;
+pub mod isolation_connector_database;
+pub mod isolation_connector_odoo;
+pub mod isolation_connector_registry;
+pub mod isolation_connector_search;
 pub mod isolation_execution;
 pub mod isolation_readiness;
 pub mod migration_import;

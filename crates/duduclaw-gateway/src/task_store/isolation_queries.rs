@@ -2,7 +2,7 @@
 //! Current assignment is part of the same SELECT, never an earlier snapshot.
 use super::*;
 
-fn validate_scope(agent: &str, ids: &[String]) -> Result<(), String> {
+pub(super) fn validate_scope(agent: &str, ids: &[String]) -> Result<(), String> {
     if !duduclaw_core::is_valid_agent_id(agent)
         || duduclaw_core::is_reserved_agent_id(agent)
         || agent == duduclaw_core::UNTRUSTED_AGENT_ID
@@ -26,6 +26,7 @@ impl TaskStore {
         validate_scope(agent, ids)?;
         if ids.is_empty() { return Ok(Vec::new()); }
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE assigned_to = ? AND archived = 0 AND id IN ({})", placeholders(ids.len()));
         let mut binds = vec![agent.to_owned()];
         binds.extend_from_slice(ids);
@@ -46,6 +47,7 @@ impl TaskStore {
         validate_scope(agent, ids)?;
         if ids.is_empty() { return Ok((Vec::new(), 0)); }
         let mut conn = self.conn.lock().await;
+        verify_live_io()?;
         let tx = conn.transaction().map_err(|e| format!("begin isolated activity: {e}"))?;
         let mut clause = format!(" FROM activity a JOIN tasks t ON t.id = a.task_id WHERE a.agent_id = ? AND t.assigned_to = ? AND t.id IN ({})", placeholders(ids.len()));
         let mut binds = vec![agent.to_owned(), agent.to_owned()];
@@ -64,7 +66,7 @@ impl TaskStore {
             })).map_err(|e| format!("query isolated activity: {e}"))?
                 .collect::<Result<Vec<_>, _>>().map_err(|e| format!("read isolated activity: {e}"))?
         };
-        tx.commit().map_err(|e| format!("finish isolated activity: {e}"))?;
+        commit_live_write(tx)?;
         Ok((rows, total))
     }
 }

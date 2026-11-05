@@ -109,7 +109,7 @@ pub(super) async fn handle(args: &Value, home: &Path, caller: &str, default_agen
     handle_for_employee(args, home, &employee).await
 }
 
-async fn handle_for_employee(args: &Value, home: &Path, employee: &str) -> Value {
+pub(super) async fn handle_for_employee(args: &Value, home: &Path, employee: &str) -> Value {
     let result = read_authorized(args, home, employee).await
         .and_then(|messages| scanned_history(&messages).map(|block| (messages.len(), block)));
     let count = result.as_ref().map_or(0, |(count, _)| *count);
@@ -176,7 +176,10 @@ async fn read_authorized(args: &Value, home: &Path, employee: &str)
         Some(value) => Some(value.as_i64().ok_or(())?),
     };
     if !bound_to(&registry, employee, channel, group, thread) { return Err(()); }
-    duduclaw_gateway::group_context::read(home, channel, group, thread, limit, before).map_err(|_| ())
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|_| ())?;
+    let rows=duduclaw_gateway::group_context::read(home, channel, group, thread, limit, before).map_err(|_| ())?;
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|_| ())?;
+    Ok(rows)
 }
 
 #[cfg(test)]

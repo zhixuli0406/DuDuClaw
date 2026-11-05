@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
@@ -52,9 +52,17 @@ enum Pool {
 }
 
 /// A live, read-only handle on one configured data source.
+pub type IoAuthority = Arc<dyn Fn() -> bool + Send + Sync>;
+
+fn check_io(authority: &IoAuthority) -> Result<(), sqlx::Error> {
+    if authority() { Ok(()) } else { Err(sqlx::Error::Protocol("database authority revoked".into())) }
+}
+
 pub struct DbSource {
     cfg: DbSourceConfig,
     pool: Pool,
+    authority: IoAuthority,
+    exact_table_names: bool,
 }
 
 impl std::fmt::Debug for DbSource {
@@ -85,6 +93,13 @@ impl DbSource {
     /// those futures to axum, which requires `Send`. The belt was not worth
     /// losing the transport.
     pub async fn connect(cfg: DbSourceConfig) -> Result<DbSource, DbError> {
+        Self::connect_checked(cfg, Arc::new(|| true)).await
+    }
+
+    /// Retains live authority through pool waits and every query; callers must
+    /// supply a guard which also checks the selected account and product policy.
+    pub async fn connect_checked(cfg: DbSourceConfig, authority: IoAuthority) -> Result<DbSource, DbError> {
+        check_io(&authority).map_err(|_| DbError::Config("database authority revoked".into()))?;
         if cfg.allows_all_tables()
             && let Ok(mut seen) = wildcard_warned().lock()
             && seen.insert(cfg.name.clone())
@@ -128,7 +143,17 @@ impl DbSource {
                 Pool::Sqlite(p)
             }
         };
-        Ok(DbSource { cfg, pool })
+        check_io(&authority).map_err(|_| DbError::Config("database authority revoked".into()))?;
+        Ok(DbSource { cfg, pool, authority, exact_table_names:false })
+    }
+
+    /// Task-limited grants name exact database objects. Preserve case here:
+    /// PostgreSQL can contain distinct quoted tables `customers`/`CUSTOMERS`.
+    pub fn with_exact_table_names(mut self) -> Self { self.exact_table_names=true;self }
+
+    fn table_allowed(&self,table:&str)->bool {
+        if self.exact_table_names { self.cfg.allowed_tables.iter().any(|name|name==table) }
+        else { self.cfg.table_allowed(table) }
     }
 
     pub fn config(&self) -> &DbSourceConfig {
@@ -137,17 +162,8 @@ impl DbSource {
 
     /// Cheapest possible liveness probe — used by `db_sources.test`.
     pub async fn ping(&self) -> Result<(), DbError> {
-        self.run(async {
-            match &self.pool {
-                Pool::Postgres(p) => {
-                    sqlx::query("SELECT 1").fetch_one(p).await.map(|_| ())
-                }
-                Pool::MySql(p) => sqlx::query("SELECT 1").fetch_one(p).await.map(|_| ()),
-                Pool::Sqlite(p) => sqlx::query("SELECT 1").fetch_one(p).await.map(|_| ()),
-            }
-        })
-        .await?
-        .map_err(|e| DbError::Query(self.scrub(&e.to_string())))
+        self.run(self.fetch("SELECT 1", &[], 1)).await?
+            .map(|_| ()).map_err(|e| DbError::Query(self.scrub(&e.to_string())))
     }
 
     /// Tables (and views) in the default schema, filtered by `allowed_tables`.
@@ -160,9 +176,15 @@ impl DbSource {
     }
 
     async fn list_tables_inner(&self) -> Result<Vec<TableInfo>, sqlx::Error> {
+        let (schema_sql, table_names) = schema_query_scoped(&self.cfg,self.exact_table_names);
+        check_io(&self.authority)?;
         match &self.pool {
             Pool::Postgres(p) => {
-                let rows = sqlx::query(PG_SCHEMA_SQL).fetch_all(p).await?;
+                let mut connection = p.acquire().await?;
+                check_io(&self.authority)?;
+                let mut query = sqlx::query(&schema_sql);
+                for table in &table_names { query = query.bind(table); }
+                let rows = query.fetch_all(&mut *connection).await?;
                 let mut triples = Vec::with_capacity(rows.len());
                 for r in &rows {
                     triples.push((
@@ -174,7 +196,11 @@ impl DbSource {
                 Ok(self.group_schema_rows(triples.into_iter()))
             }
             Pool::MySql(p) => {
-                let rows = sqlx::query(MYSQL_SCHEMA_SQL).fetch_all(p).await?;
+                let mut connection = p.acquire().await?;
+                check_io(&self.authority)?;
+                let mut query = sqlx::query(&schema_sql);
+                for table in &table_names { query = query.bind(table); }
+                let rows = query.fetch_all(&mut *connection).await?;
                 let mut triples = Vec::with_capacity(rows.len());
                 for r in &rows {
                     triples.push((
@@ -189,19 +215,24 @@ impl DbSource {
                 // SQLite has no information_schema. Names come from
                 // sqlite_master; columns from the pragma table-valued
                 // function, queried only for tables the allowlist admits.
-                let rows = sqlx::query(SQLITE_TABLES_SQL).fetch_all(p).await?;
+                let mut connection = p.acquire().await?;
+                check_io(&self.authority)?;
+                let mut query = sqlx::query(&schema_sql);
+                for table in &table_names { query = query.bind(table); }
+                let rows = query.fetch_all(&mut *connection).await?;
                 let mut out = Vec::new();
                 for row in rows {
                     let name = sqlite_schema_text(&row, "name")?;
-                    if name.is_empty() || !self.cfg.table_allowed(&name) {
+                    if name.is_empty() || !self.table_allowed(&name) {
                         continue;
                     }
                     if out.len() >= MAX_TABLES {
                         break;
                     }
+                    check_io(&self.authority)?;
                     let cols = sqlx::query("SELECT name, type FROM pragma_table_info(?)")
                         .bind(name.clone())
-                        .fetch_all(p)
+                        .fetch_all(&mut *connection)
                         .await?;
                     let mut columns = Vec::with_capacity(cols.len());
                     for c in &cols {
@@ -223,7 +254,7 @@ impl DbSource {
     {
         let mut grouped: BTreeMap<String, Vec<ColumnInfo>> = BTreeMap::new();
         for (table, column, data_type) in rows {
-            if table.is_empty() || !self.cfg.table_allowed(&table) {
+            if table.is_empty() || !self.table_allowed(&table) {
                 continue;
             }
             if !grouped.contains_key(&table) && grouped.len() >= MAX_TABLES {
@@ -243,6 +274,7 @@ impl DbSource {
     /// Structured `SELECT`. Identifiers are validated and quoted; every value
     /// is a bound parameter; the table must be in `allowed_tables`.
     pub async fn select(&self, req: &SelectRequest) -> Result<QueryResult, DbError> {
+        if self.exact_table_names && ident::is_valid_identifier(req.table.trim()) && !self.table_allowed(req.table.trim()) { return Err(DbError::TableNotAllowed { source_name:self.cfg.name.clone(),table:req.table.clone() }); }
         let cap = self.effective_limit(req.limit);
         let built = build_select(&self.cfg, req, cap)?;
         self.run(self.fetch(&built.sql, &built.binds, cap))
@@ -296,6 +328,7 @@ impl DbSource {
     where
         F: std::future::Future<Output = T>,
     {
+        check_io(&self.authority).map_err(|_| DbError::Config("database authority revoked".into()))?;
         tokio::time::timeout(Duration::from_millis(self.cfg.timeout_ms), fut)
             .await
             .map_err(|_| DbError::Timeout(self.cfg.timeout_ms))
@@ -310,9 +343,9 @@ impl DbSource {
         cap: usize,
     ) -> Result<QueryResult, sqlx::Error> {
         match &self.pool {
-            Pool::Postgres(pool) => pg_fetch(pool, sql, binds, cap).await,
-            Pool::MySql(pool) => mysql_fetch(pool, sql, binds, cap).await,
-            Pool::Sqlite(pool) => sqlite_fetch(pool, sql, binds, cap).await,
+            Pool::Postgres(pool) => pg_fetch(pool, sql, binds, cap, &self.authority).await,
+            Pool::MySql(pool) => mysql_fetch(pool, sql, binds, cap, &self.authority).await,
+            Pool::Sqlite(pool) => sqlite_fetch(pool, sql, binds, cap, &self.authority).await,
         }
     }
 }
@@ -363,8 +396,11 @@ async fn pg_fetch(
     sql: &str,
     binds: &[Bind],
     cap: usize,
+    authority: &IoAuthority,
 ) -> Result<QueryResult, sqlx::Error> {
+    check_io(authority)?;
     let mut conn = pool.acquire().await?;
+    check_io(authority)?;
     let c: &mut sqlx::postgres::PgConnection = &mut conn;
     // `Executor::execute(&str)` rather than `sqlx::raw_sql(…)`: `RawSql` is
     // generic over the `Database`, and that genericity is what makes rustc
@@ -379,7 +415,10 @@ async fn pg_fetch(
         for b in binds {
             q = bind_pg(q, b);
         }
-        collect_rows(q.fetch(c), cap, |r: PgRow| pg_row_to_json(&r)).await
+        match check_io(authority) {
+            Ok(()) => collect_rows(q.fetch(c), cap, |r: PgRow| pg_row_to_json(&r)).await,
+            Err(error) => Err(error),
+        }
     };
     let c: &mut sqlx::postgres::PgConnection = &mut conn;
     let _ = c.execute("ROLLBACK").await;
@@ -391,8 +430,11 @@ async fn mysql_fetch(
     sql: &str,
     binds: &[Bind],
     cap: usize,
+    authority: &IoAuthority,
 ) -> Result<QueryResult, sqlx::Error> {
+    check_io(authority)?;
     let mut conn = pool.acquire().await?;
+    check_io(authority)?;
     let c: &mut sqlx::mysql::MySqlConnection = &mut conn;
     // See the note in `pg_fetch` for why this is not `sqlx::raw_sql`.
     c.execute("START TRANSACTION READ ONLY").await?;
@@ -402,7 +444,10 @@ async fn mysql_fetch(
         for b in binds {
             q = bind_mysql(q, b);
         }
-        collect_rows(q.fetch(c), cap, |r: MySqlRow| mysql_row_to_json(&r)).await
+        match check_io(authority) {
+            Ok(()) => collect_rows(q.fetch(c), cap, |r: MySqlRow| mysql_row_to_json(&r)).await,
+            Err(error) => Err(error),
+        }
     };
     let c: &mut sqlx::mysql::MySqlConnection = &mut conn;
     let _ = c.execute("ROLLBACK").await;
@@ -416,13 +461,17 @@ async fn sqlite_fetch(
     sql: &str,
     binds: &[Bind],
     cap: usize,
+    authority: &IoAuthority,
 ) -> Result<QueryResult, sqlx::Error> {
+    check_io(authority)?;
     let mut conn = pool.acquire().await?;
+    check_io(authority)?;
     let c: &mut sqlx::sqlite::SqliteConnection = &mut conn;
     let mut q = sqlx::query(sql);
     for b in binds {
         q = bind_sqlite(q, b);
     }
+    check_io(authority)?;
     collect_rows(q.fetch(c), cap, |r: SqliteRow| sqlite_row_to_json(&r)).await
 }
 
@@ -513,6 +562,38 @@ const SQLITE_TABLES_SQL: &str = "\
 SELECT name FROM sqlite_master \
 WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite@_%' ESCAPE '@' \
 ORDER BY name";
+
+// Restrict metadata at the database boundary as well as in the returned rows.
+// Allowed identifiers are bound values, never SQL fragments.
+#[cfg(test)]
+fn schema_query(cfg: &DbSourceConfig) -> (String, Vec<String>) { schema_query_scoped(cfg,false) }
+fn schema_query_scoped(cfg: &DbSourceConfig,exact:bool) -> (String, Vec<String>) {
+    let (base, column) = match cfg.driver {
+        Driver::Postgres => (PG_SCHEMA_SQL, "c.table_name"),
+        Driver::Mysql => (MYSQL_SCHEMA_SQL, "c.TABLE_NAME"),
+        Driver::Sqlite => (SQLITE_TABLES_SQL, "name"),
+    };
+    if cfg.allows_all_tables() && !exact { return (base.to_owned(), Vec::new()); }
+    let names: Vec<String> = cfg.allowed_tables.iter().map(|name| if exact {name.clone()} else {name.trim().to_ascii_lowercase()}).collect();
+    let (prefix, order) = base.split_once("ORDER BY").expect("constant schema query has ordering");
+    let predicate = if names.is_empty() {
+        "1 = 0".to_owned()
+    } else {
+        let placeholders: Vec<String> = (1..=names.len()).map(|index| match cfg.driver {
+            Driver::Postgres => format!("${index}"),
+            _ => "?".to_owned(),
+        }).collect();
+        if exact {
+            let exact_column=match cfg.driver {
+                Driver::Postgres=>format!("CAST({column} AS TEXT) COLLATE \"C\""),
+                Driver::Mysql=>format!("BINARY {column}"),
+                Driver::Sqlite=>format!("{column} COLLATE BINARY"),
+            };
+            format!("{exact_column} IN ({})",placeholders.join(", "))
+        } else {format!("LOWER({column}) IN ({})", placeholders.join(", "))}
+    };
+    (format!("{prefix} AND {predicate} ORDER BY{order}"), names)
+}
 
 /// Turn a validated [`SelectRequest`] into SQL + binds.
 pub(crate) fn build_select(
@@ -728,6 +809,29 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn metadata_query_only_fetches_granted_tables() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        pool.execute("CREATE TABLE customers(id INTEGER)").await.unwrap();
+        pool.execute("CREATE TABLE unrelated_secret(id INTEGER)").await.unwrap();
+        let mut config = cfg(Driver::Sqlite);
+        config.allowed_tables = vec![" CUSTOMERS ".into()];
+        let (sql, names) = schema_query(&config);
+        let rows = sqlx::query(&sql).bind(&names[0]).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<String, _>("name"), "customers");
+        config.allowed_tables.clear();
+        let (sql, names) = schema_query(&config);
+        assert!(names.is_empty());
+        assert!(sqlx::query(&sql).fetch_all(&pool).await.unwrap().is_empty());
+        for driver in [Driver::Postgres, Driver::Mysql] {
+            let (sql, names) = schema_query(&cfg(driver));
+            assert_eq!(names, ["customers", "orders"]);
+            assert!(!sql.contains("customers"));
+            assert!(sql.contains(if driver == Driver::Postgres { "IN ($1, $2)" } else { "IN (?, ?)" }));
+        }
+    }
+
     #[test]
     fn builds_plain_select() {
         let b = build_select(&cfg(Driver::Sqlite), &req("customers"), 10).unwrap();
@@ -906,15 +1010,15 @@ mod tests {
         assert_send(DbSource::connect(cfg.clone()));
         let pg: Option<&PgPool> = None;
         if let Some(p) = pg {
-            assert_send(pg_fetch(p, "SELECT 1", &[], 1));
+            assert_send(pg_fetch(p, "SELECT 1", &[], 1, &(Arc::new(|| true) as IoAuthority)));
         }
         let my: Option<&MySqlPool> = None;
         if let Some(p) = my {
-            assert_send(mysql_fetch(p, "SELECT 1", &[], 1));
+            assert_send(mysql_fetch(p, "SELECT 1", &[], 1, &(Arc::new(|| true) as IoAuthority)));
         }
         let lite: Option<&SqlitePool> = None;
         if let Some(p) = lite {
-            assert_send(sqlite_fetch(p, "SELECT 1", &[], 1));
+            assert_send(sqlite_fetch(p, "SELECT 1", &[], 1, &(Arc::new(|| true) as IoAuthority)));
         }
         let dummy: Option<&DbSource> = None;
         if let Some(src) = dummy {
@@ -966,6 +1070,26 @@ mod tests {
     /// Layer (c): work that outlives `timeout_ms` comes back as `Timeout`,
     /// not as a hung call.
     #[tokio::test]
+    async fn live_authority_revokes_queries_and_schema_after_pool_creation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let source = live_sqlite(dir.path(), 5_000).await;
+        let config = source.config().clone();
+        source.close().await;
+        let live = Arc::new(AtomicBool::new(true));
+        let flag = live.clone();
+        let source = DbSource::connect_checked(config.clone(), Arc::new(move || flag.load(Ordering::SeqCst)))
+            .await.unwrap();
+        assert!(source.select(&req("t")).await.is_ok());
+        live.store(false, Ordering::SeqCst);
+        assert!(source.select(&req("t")).await.is_err());
+        assert!(source.list_tables().await.is_err());
+        assert!(source.ping().await.is_err());
+        source.close().await;
+        assert!(DbSource::connect_checked(config, Arc::new(|| false)).await.is_err());
+    }
+
+    #[tokio::test]
     async fn run_enforces_the_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let src = live_sqlite(dir.path(), 100).await;
@@ -1014,4 +1138,23 @@ mod tests {
         let out = src.fetch("SELECT COUNT(*) AS n FROM t", &[], 10).await.unwrap();
         assert_eq!(out.rows[0]["n"], serde_json::json!(1));
     }
+    #[tokio::test]
+    async fn exact_table_mode_preserves_signed_object_case_for_select_and_metadata() {
+        let home=tempfile::tempdir().unwrap();
+        let mut source=live_sqlite(home.path(),1000).await;
+        source.cfg.allowed_tables=vec!["t".into()];
+        let source=source.with_exact_table_names();
+        assert!(source.select(&req("T")).await.is_err());
+        assert_eq!(source.select(&req("t")).await.unwrap().row_count,1);
+        let tables=source.group_schema_rows(vec![("t".into(),"id".into(),"INTEGER".into()),
+            ("T".into(),"SECRET".into(),"TEXT".into())].into_iter());
+        assert_eq!(tables.len(),1);assert_eq!(tables[0].name,"t");
+        for driver in [Driver::Postgres,Driver::Mysql,Driver::Sqlite] {
+            let config=cfg(driver);let(sql,names)=schema_query_scoped(&config,true);
+            assert!(!sql.contains("LOWER("));assert_eq!(names,["customers","orders"]);
+            assert!(sql.contains(match driver {Driver::Postgres=>"COLLATE \"C\"",Driver::Mysql=>"BINARY",Driver::Sqlite=>"COLLATE BINARY"}));
+        }
+        source.close().await;
+    }
+
 }

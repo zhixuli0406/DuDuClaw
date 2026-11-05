@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::{Arc, Mutex}, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::BTreeMap, sync::{Arc, Mutex, Weak}, time::{SystemTime, UNIX_EPOCH}};
 use duduclaw_isolation::{bounded::{List, Text}, capability::*, execution::RunHandle,
     ids::{EmployeeId, Sha256Digest}, ipc::{ControlConnectionId, RunStatus}};
 use hmac::{Hmac, Mac};
@@ -62,11 +62,20 @@ struct Entry {
     control: ControlConnectionId,
     agent_slug: String,
     state: State,
+    revoked: tokio::sync::watch::Sender<bool>,
+}
+impl Entry {
+    fn revoke(&mut self) {
+        self.state = State::Revoked;
+        // send_replace preserves revocation even before a receiver subscribes.
+        self.revoked.send_replace(true);
+    }
 }
 
 /// One instance per gateway epoch. Keys and plaintext random capability material
 /// are never serialized, logged, passed to the runtime or kept in an employee home.
 pub struct Boundary {
+    weak: Weak<Self>,
     key: Zeroizing<[u8; 32]>,
     epoch: [u8; 16],
     live: Arc<dyn LiveAuthority>,
@@ -101,7 +110,9 @@ fn binding_matches(binding: &EmployeeBinding, principal: &Principal) -> bool {
 
 impl Boundary {
     pub fn new(live: Arc<dyn LiveAuthority>) -> Result<Arc<Self>, VerificationError> {
-        Ok(Arc::new(Self { key: Zeroizing::new(random()?), epoch: random()?, live,
+        let key = Zeroizing::new(random()?);
+        let epoch = random()?;
+        Ok(Arc::new_cyclic(|weak| Self { weak: weak.clone(), key, epoch, live,
             entries: Mutex::new(BTreeMap::new()) }))
     }
 
@@ -135,13 +146,15 @@ impl Boundary {
         signer.update(&bytes);
         let mac = signer.finalize().into_bytes().into();
         let mut entries = self.entries.lock().map_err(|_| VerificationError::Unavailable)?;
-        entries.retain(|_, e| e.record.expires_at > now);
+        entries.retain(|_, e| {
+            if e.record.expires_at > now { true } else { e.revoke(); false }
+        });
         if entries.len() >= MAX_RECORDS || entries.contains_key(&id.0)
             || entries.values().any(|entry| entry.record.run == record.run) {
             return Err(VerificationError::Invalid);
         }
         entries.insert(id.0, Entry { record, mac, control: reservation.control,
-            agent_slug: snapshot.agent_slug, state: State::Pending });
+            agent_slug: snapshot.agent_slug, state: State::Pending, revoked: tokio::sync::watch::channel(false).0 });
         Ok(id)
     }
 
@@ -187,7 +200,7 @@ impl Boundary {
         let mut entries = self.entries.lock().map_err(|_| VerificationError::Unavailable)?;
         let entry = entries.get_mut(&id.0).ok_or(VerificationError::Revoked)?;
         if entry.state != State::Pending { return Err(VerificationError::Revoked); }
-        if let Err(error) = live { entry.state = State::Revoked; return Err(error); }
+        if let Err(error) = live { entry.revoke(); return Err(error); }
         entry.state = State::Active(nonce);
         Ok(Connection { boundary: self.clone(), id, nonce,
             #[cfg(target_os = "linux")] socket: None })
@@ -195,19 +208,19 @@ impl Boundary {
 
     pub fn revoke_run(&self, run: RunHandle) -> Result<(), VerificationError> {
         let mut entries = self.entries.lock().map_err(|_| VerificationError::Unavailable)?;
-        for entry in entries.values_mut().filter(|e| e.record.run == run.0) { entry.state = State::Revoked; }
+        for entry in entries.values_mut().filter(|e| e.record.run == run.0) { entry.revoke(); }
         Ok(())
     }
 
     pub fn revoke_control(&self, control: ControlConnectionId) -> Result<(), VerificationError> {
         let mut entries = self.entries.lock().map_err(|_| VerificationError::Unavailable)?;
-        for entry in entries.values_mut().filter(|e| e.control == control) { entry.state = State::Revoked; }
+        for entry in entries.values_mut().filter(|e| e.control == control) { entry.revoke(); }
         Ok(())
     }
 
     pub fn revoke_all(&self) -> Result<(), VerificationError> {
         let mut entries = self.entries.lock().map_err(|_| VerificationError::Unavailable)?;
-        for entry in entries.values_mut() { entry.state = State::Revoked; }
+        for entry in entries.values_mut() { entry.revoke(); }
         Ok(())
     }
 
@@ -234,7 +247,7 @@ impl Boundary {
             if !valid {
                 let mut entries = self.entries.lock().map_err(|_| VerificationError::Unavailable)?;
                 if let Some(current) = entries.get_mut(&id) {
-                    if current.state == entry.state { current.state = State::Revoked; }
+                    if current.state == entry.state { current.revoke(); }
                 }
             }
         }
@@ -262,8 +275,35 @@ impl CapabilityVerifier for Boundary {
         let mut entries = self.entries.lock().map_err(|_| VerificationError::Unavailable)?;
         let entry = entries.get_mut(&record.id.0).ok_or(VerificationError::Revoked)?;
         if entry.state != snapshot.state { return Err(VerificationError::Revoked); }
-        if let Err(error) = live { entry.state = State::Revoked; return Err(error); }
-        Ok(RequestContext::from_verified_record(record.clone()))
+        if let Err(error) = live { entry.revoke(); return Err(error); }
+        let State::Active(nonce) = entry.state else { return Err(VerificationError::Revoked); };
+        Ok(RequestContext::with_live_verifier(record.clone(), Arc::new(RequestAuthority {
+            boundary: self.weak.clone(), id: record.id, nonce,
+        })))
+    }
+}
+
+/// A request never owns the connection. Its live verifier becomes unusable
+/// when the connection is dropped or the gateway authority disappears.
+struct RequestAuthority {
+    boundary: Weak<Boundary>,
+    id: CapabilityId,
+    nonce: [u8; 16],
+}
+impl LiveRequestVerifier for RequestAuthority {
+    fn verify_live(&self, record: &CapabilityRecord, now: u64) -> Result<(), VerificationError> {
+        let boundary = self.boundary.upgrade().ok_or(VerificationError::Revoked)?;
+        let snapshot = boundary.entries.lock().map_err(|_| VerificationError::Unavailable)?
+            .get(&self.id.0).cloned().ok_or(VerificationError::Revoked)?;
+        if snapshot.state != State::Active(self.nonce) || &snapshot.record != record {
+            return Err(VerificationError::Revoked);
+        }
+        let live = boundary.check_live(&snapshot, now);
+        let mut entries = boundary.entries.lock().map_err(|_| VerificationError::Unavailable)?;
+        let entry = entries.get_mut(&self.id.0).ok_or(VerificationError::Revoked)?;
+        if entry.state != snapshot.state { return Err(VerificationError::Revoked); }
+        if let Err(error) = live { entry.revoke(); return Err(error); }
+        Ok(())
     }
 }
 
@@ -277,6 +317,13 @@ pub struct Connection {
     pub(crate) socket: Option<std::os::unix::net::UnixStream>,
 }
 impl Connection {
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn revocation(&self) -> Result<tokio::sync::watch::Receiver<bool>, VerificationError> {
+        let entries = self.boundary.entries.lock().map_err(|_| VerificationError::Unavailable)?;
+        let entry = entries.get(&self.id.0).ok_or(VerificationError::Revoked)?;
+        if entry.state != State::Active(self.nonce) { return Err(VerificationError::Revoked); }
+        Ok(entry.revoked.subscribe())
+    }
     pub fn context(&self, now: u64) -> Result<RequestContext, VerificationError> {
         verified_context(&self.boundary, self.id, self.nonce, now)
     }
@@ -349,7 +396,7 @@ impl ConnectionVerifier {
 impl Drop for Connection {
     fn drop(&mut self) {
         if let Ok(mut entries) = self.boundary.entries.lock() {
-            if let Some(entry) = entries.get_mut(&self.id.0) { entry.state = State::Revoked; }
+            if let Some(entry) = entries.get_mut(&self.id.0) { entry.revoke(); }
         }
     }
 }

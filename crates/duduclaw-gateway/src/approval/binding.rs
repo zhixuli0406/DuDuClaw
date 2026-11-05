@@ -392,9 +392,7 @@ impl ApprovalBroker {
             let mut conn = self.store.conn.lock().await;
             self.attach_tasks(&conn, binding)?;
             let resume_workflow = self.attach_workflow_for_resume(&conn, binding)?;
-            let tx = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| e.to_string())?;
+            let tx = begin_live_write(&mut conn)?;
             Self::check_task(&tx, binding)?;
             let current = super::store::record_in_connection(&tx, id)?.ok_or("request missing")?;
             if current.status != ApprovalStatus::Pending || current.is_stale(Utc::now()) {
@@ -430,7 +428,7 @@ impl ApprovalBroker {
             if resume_workflow {
                 Self::write_workflow_resume(&tx, binding, id)?;
             }
-            tx.commit().map_err(|e| e.to_string())?;
+            commit_live_write(tx)?;
         }
         self.store.emit_lifecycle("approval.decided", &rec, status).await;
         Ok(())
@@ -490,15 +488,14 @@ impl ApprovalBroker {
     pub async fn invalidate_request(&self, id: &ApprovalId, reason: &str) -> Result<(), String> {
         let changed = {
             let mut conn = self.store.conn.lock().await;
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| e.to_string())?;
+            let tx = begin_live_write(&mut conn)?;
             let rec = super::store::record_in_connection(&tx, id)?;
             let n = tx.execute(
                 "UPDATE approvals SET status='invalidated',invalidated_reason=?1 WHERE id=?2 AND status IN ('pending',
                     'approved')",
                 params![duduclaw_security::credential_detect::mask(reason), id.as_str()],
             ).map_err(|e| e.to_string())?;
-            tx.commit().map_err(|e| e.to_string())?;
+            commit_live_write(tx)?;
             if n > 0 { rec } else { None }
         };
         if let Some(rec) = changed {
@@ -511,7 +508,8 @@ impl ApprovalBroker {
     /// `true` only for the one caller whose update changed the row, so two
     /// concurrent appliers can never both act on one approval.
     pub async fn consume_approved(&self, id: &ApprovalId, reason: &str) -> Result<bool, String> {
-        let conn = self.store.conn.lock().await;
+        let mut connection = self.store.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
         let n = conn
             .execute(
                 "UPDATE approvals SET status='invalidated',invalidated_reason=?1
@@ -519,6 +517,7 @@ impl ApprovalBroker {
                 params![duduclaw_security::credential_detect::mask(reason), id.as_str()],
             )
             .map_err(|e| e.to_string())?;
+        commit_live_write(conn)?;
         Ok(n == 1)
     }
 }

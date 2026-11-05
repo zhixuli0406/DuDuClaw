@@ -79,6 +79,7 @@ enum ScopedRefreshPolicy<'a> {
 }
 impl ScopedRefreshPolicy<'_> {
     fn check(&self) -> Result<(), Error> {
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|_| Error::Unavailable)?;
         if let Self::Closed { deadline, .. } = self {
             if tokio::time::Instant::now() >= *deadline {
                 return Err(Error::Unavailable);
@@ -116,6 +117,7 @@ impl ScopedRefreshPolicy<'_> {
 }
 fn scoped_refresh_client(policy: &ScopedRefreshPolicy<'_>) -> Result<reqwest::Client, Error> {
     let builder = match policy {
+        ScopedRefreshPolicy::Legacy if duduclaw_mcp_boundary::io_authority::is_scoped() => reqwest::Client::builder().no_proxy(),
         ScopedRefreshPolicy::Legacy => reqwest::Client::builder(),
         ScopedRefreshPolicy::Closed { .. } => reqwest::Client::builder().no_proxy(),
     };

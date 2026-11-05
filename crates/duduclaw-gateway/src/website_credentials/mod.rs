@@ -145,6 +145,7 @@ fn valid_metadata(m: &Metadata) -> bool {
 }
 
 fn read_store(home: &Path) -> Result<DiskStore, String> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
     let file = path(home);
     match std::fs::symlink_metadata(&file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DiskStore::default()),
@@ -152,6 +153,7 @@ fn read_store(home: &Path) -> Result<DiskStore, String> {
         _ => return Err(UNAVAILABLE.into()),
     }
     let mut bytes = Vec::new();
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
     std::fs::File::open(&file).map_err(|_| UNAVAILABLE)?
         .take(MAX_BYTES + 1).read_to_end(&mut bytes).map_err(|_| UNAVAILABLE)?;
     if bytes.len() as u64 > MAX_BYTES { return Err(UNAVAILABLE.into()); }
@@ -163,19 +165,23 @@ fn read_store(home: &Path) -> Result<DiskStore, String> {
 }
 
 fn read_engine(home: &Path) -> Option<CryptoEngine> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().ok()?;
     let file = home.join(".keyfile");
     let meta = std::fs::symlink_metadata(&file).ok()?;
     if !meta.is_file() || meta.len() != 32 { return None; }
+    duduclaw_mcp_boundary::io_authority::verify_before_io().ok()?;
     let bytes = Zeroizing::new(std::fs::read(file).ok()?);
     CryptoEngine::new(bytes.as_slice().try_into().ok()?).ok()
 }
 
 fn write_engine(home: &Path, store: &DiskStore) -> Result<CryptoEngine, String> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
     if let Some(engine) = read_engine(home) { return Ok(engine); }
     // Never replace a broken/missing key when ciphertext already exists.
     if !store.records.is_empty() { return Err(UNAVAILABLE.into()); }
     let file = home.join(".keyfile");
     duduclaw_core::with_file_lock(&file, || {
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| std::io::Error::other(e.to_string()))?;
         if let Some(engine) = read_engine(home) { return Ok(engine); }
         let key = Zeroizing::new(CryptoEngine::generate_key().map_err(std::io::Error::other)?);
         let mut opts = std::fs::OpenOptions::new();
@@ -185,6 +191,7 @@ fn write_engine(home: &Path, store: &DiskStore) -> Result<CryptoEngine, String> 
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| std::io::Error::other(e.to_string()))?;
         let mut out = opts.open(&file)?;
         duduclaw_core::platform::set_owner_only(&file)?;
         out.write_all(key.as_ref())?;
@@ -194,6 +201,7 @@ fn write_engine(home: &Path, store: &DiskStore) -> Result<CryptoEngine, String> 
 }
 
 fn unseal(engine: &CryptoEngine, value: &str) -> Option<SecretRecord> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().ok()?;
     let plain = Zeroizing::new(engine.decrypt_string(value).ok()?);
     let envelope: SealedRecord = serde_json::from_str(&plain).ok()?;
     if envelope.purpose != "website_credentials/v1" || !valid_metadata(&envelope.record.metadata)
@@ -205,6 +213,7 @@ fn unseal(engine: &CryptoEngine, value: &str) -> Option<SecretRecord> {
 }
 
 fn decrypt_records(home: &Path, store: &DiskStore) -> Result<Vec<SecretRecord>, String> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
     if store.records.is_empty() { return Ok(Vec::new()); }
     let engine = read_engine(home).ok_or(UNAVAILABLE)?;
     let records: Vec<_> = store.records.iter()
@@ -225,18 +234,21 @@ fn records(home: &Path) -> Result<Vec<SecretRecord>, String> {
 }
 
 pub fn list(home: &Path) -> Result<Vec<Metadata>, String> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
     Ok(records(home)?.iter().map(|r| r.metadata.clone()).collect())
 }
 
 /// Only call with the employee identity verified by the signed loopback route.
 /// Unknown and ungranted labels are absent; an unreadable store fails closed.
 pub fn for_agent(home: &Path, agent: &str, label: &str) -> Result<Option<SecretRecord>, String> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
     Ok(records(home)?.into_iter().find(|record| {
         record.metadata.label == label && record.metadata.allowed_agents.iter().any(|a| a == agent)
     }))
 }
 
 fn modify<T>(home: &Path, f: impl FnOnce(&mut DiskStore, Vec<SecretRecord>) -> Result<T, String>) -> Result<T, String> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
     let file = path(home);
     let dir = file.parent().ok_or(UNAVAILABLE)?;
     std::fs::create_dir_all(dir).map_err(|_| UNAVAILABLE)?;
@@ -246,14 +258,18 @@ fn modify<T>(home: &Path, f: impl FnOnce(&mut DiskStore, Vec<SecretRecord>) -> R
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|_| UNAVAILABLE)?;
     }
     duduclaw_core::with_file_lock(&file, || {
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| std::io::Error::other(e.to_string()))?;
         let mut store = read_store(home).map_err(std::io::Error::other)?;
         // Validate every existing record under the same lock before any write.
         let existing = decrypt_records(home, &store).map_err(std::io::Error::other)?;
         let result = f(&mut store, existing).map_err(std::io::Error::other)?;
         let bytes = serde_json::to_vec(&store).map_err(std::io::Error::other)?;
         if bytes.len() as u64 > MAX_BYTES { return Err(std::io::Error::other(UNAVAILABLE)); }
-        duduclaw_agent::mcp_template::write_mcp_config_atomic(&file, &bytes)
-            .map_err(|_| std::io::Error::other(UNAVAILABLE))?;
+        let mut staged = tempfile::NamedTempFile::new_in(dir)?;
+        staged.write_all(&bytes)?;
+        staged.as_file().sync_all()?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| std::io::Error::other(e.to_string()))?;
+        staged.persist(&file).map_err(|e| e.error)?;
         #[cfg(unix)]
         std::fs::File::open(dir)?.sync_all()?;
         Ok(result)

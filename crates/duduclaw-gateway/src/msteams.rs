@@ -26,6 +26,7 @@
 //! Config (`config.toml [channels]`): `teams_app_id`,
 //! `teams_app_password` (`_enc`), `teams_tenant_id` (empty = multi-tenant).
 
+use crate::isolation_http::LiveRequest;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -157,7 +158,7 @@ impl TeamsCreds {
                 ("client_secret", app_password.as_str()),
                 ("scope", "https://api.botframework.com/.default"),
             ])
-            .send()
+            .send_authorized()
             .await
             .map_err(|e| format!("token request: {e}"))?;
         if !resp.status().is_success() {
@@ -1045,7 +1046,7 @@ async fn send_activity(
         .post(&url)
         .bearer_auth(&token)
         .json(body)
-        .send()
+        .send_authorized()
         .await
     {
         Ok(resp) if resp.status().is_success() => resp
@@ -1092,7 +1093,7 @@ async fn update_activity(
         .put(&url)
         .bearer_auth(&token)
         .json(body)
-        .send()
+        .send_authorized()
         .await
     {
         warn!("Teams update error: {e}");
@@ -1112,7 +1113,7 @@ async fn delete_activity(creds: &TeamsCreds, target: &TeamsTarget, activity_id: 
         "{}/v3/conversations/{}/activities/{}",
         target.service_url, target.conversation_id, activity_id
     );
-    let _ = creds.http.delete(&url).bearer_auth(&token).send().await;
+    let _ = creds.http.delete(&url).bearer_auth(&token).send_authorized().await;
 }
 
 

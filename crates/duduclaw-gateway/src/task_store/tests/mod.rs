@@ -4,6 +4,7 @@
 //! files for size only.
 
 mod claim_cases;
+mod isolation_io_cases;
 mod authority_cases;
 mod criteria_cases;
 mod goal_cases;

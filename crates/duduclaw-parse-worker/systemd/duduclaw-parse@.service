@@ -41,16 +41,15 @@ RootDirectory=/usr/lib/duduclaw/parse-root
 # Explicit no suppresses v255's automatic host os-release projection into /run.
 MountAPIVFS=no
 BindReadOnlyPaths=/usr/lib/duduclaw/parse-root-tree:/:norbind
-# Nonrecursive projections avoid importing mounts below the host's /usr.
-# Bind sources follow host symlinks, including merged-/usr lib and lib64.
-BindReadOnlyPaths=/usr:/usr:norbind
-BindReadOnlyPaths=-/lib:/lib:norbind -/lib64:/lib64:norbind
+# The signed installer populates parse-root-tree with only the verified worker,
+# its ELF interpreter, and the exact dependency closure. Never bind host /usr,
+# /lib or /lib64 here: those expose unrelated programs and application data.
 # DynamicUser forces PrivateTmp. Higher-priority binds at both /tmp and
 # /var/tmp replace its host-disk directories with the same bounded tmpfs.
 # Mounts sort by destination: /.tmp exists before the bind sources are resolved
 # through the staging path, before systemd pivots into the new root.
 # Kernel protections force a read-only /sys projection; hide module aliases.
-InaccessiblePaths=-/lib/modules -/lib64/modules
+InaccessiblePaths=-/usr/local -/usr/lib/duduclaw -/lib/modules -/lib64/modules
 TemporaryFileSystem=/.tmp:rw,nosuid,nodev,noexec,size=8M,nr_inodes=1024,mode=0700
 BindPaths=/usr/lib/duduclaw/parse-root/.tmp:/tmp:norbind
 BindPaths=/usr/lib/duduclaw/parse-root/.tmp:/var/tmp:norbind

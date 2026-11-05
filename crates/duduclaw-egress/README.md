@@ -38,6 +38,16 @@ answers without that SOA, unrelated SOAs, malformed replies and NXDOMAIN are
 refused. Both families empty still fails; addresses remain subject to the
 existing downstream public-IP policy.
 
+## Global admission limit
+
+The daemon shares 64 tunnel permits across all registered runs. It acquires a
+permit before spawning a DNS/connect task and retains it until the tunnel closes;
+there is no per-tunnel wait queue. Saturation returns `ResourceLimit` without DNS
+or TCP I/O. Cancellation waits for child futures to drop and return their permits.
+Configuration also rejects `max_runs` times any profile's `max_tunnels` above
+1024, bounding the possible per-run tunnel bookkeeping independently of the
+active global ceiling.
+
 ## License
 
 Apache-2.0, as declared by the workspace.

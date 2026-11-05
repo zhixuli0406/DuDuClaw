@@ -313,17 +313,21 @@ fn load(state_dir: &Path) -> WorkingState {
 }
 
 /// Atomic persist: temp file + rename inside the caller-held lock.
+fn verify_io() -> std::io::Result<()> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
+}
+
 fn persist(state_dir: &Path, state: &WorkingState) -> std::io::Result<()> {
+    verify_io()?;
     std::fs::create_dir_all(state_dir)?;
     let path = state_file(state_dir);
-    let tmp = path.with_extension("json.tmp");
     let mut masked = serde_json::to_value(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     duduclaw_security::credential_detect::mask_json(&mut masked);
     let json = serde_json::to_string_pretty(&masked)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &path)
+    duduclaw_memory::wiki_path::atomic_write_nofollow_checked(&path, &json, verify_io)
 }
 
 /// Append one supersession-chain record. Best-effort: a history write
@@ -333,11 +337,12 @@ fn append_history(state_dir: &Path, record: &serde_json::Value) {
     let mut masked = record.clone();
     duduclaw_security::credential_detect::mask_json(&mut masked);
     let line = masked.to_string();
+    if verify_io().is_err() { return; }
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
-        .and_then(|mut f| writeln!(f, "{line}"));
+        .and_then(|mut f| { verify_io()?; writeln!(f, "{line}") });
 }
 
 /// Key hygiene: `^[a-z0-9][a-z0-9._-]{0,63}$`. Keys are map keys only
@@ -422,6 +427,7 @@ pub fn set_entry(
 
     let key_owned = key.to_string();
     with_file_lock(&state_file(&state_dir), || {
+        verify_io()?;
         let mut state = load(&state_dir);
         let now = now_rfc3339();
         // An expired entry is no longer the authority — CAS against it (or
@@ -502,6 +508,7 @@ pub fn clear_entry(
     }
     let key_owned = key.to_string();
     with_file_lock(&state_file(&state_dir), || {
+        verify_io()?;
         let mut state = load(&state_dir);
         let Some(prev) = state.states.remove(&key_owned) else {
             return Ok(Err(format!("查無此鍵：{key_owned}")));
@@ -607,6 +614,7 @@ pub fn set_handoff(
         };
 
     with_file_lock(&state_file(&state_dir), || {
+        verify_io()?;
         let mut state = load(&state_dir);
         let now = now_rfc3339();
         let prev = state.handoff.take().map(|h| h.note);
@@ -676,6 +684,7 @@ pub fn read_full(
     agent_id: &str,
     history_limit: usize,
 ) -> Result<serde_json::Value, String> {
+    verify_io().map_err(|e| e.to_string())?;
     let state_dir = resolve_state_dir(home_dir, agent_id)
         .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
     let state = load(&state_dir);
@@ -859,8 +868,30 @@ pub fn build_working_state_section(home_dir: &Path, agent_id: &str) -> Option<St
 }
 
 #[cfg(test)]
+#[path = "isolation_io_test_support.rs"]
+mod isolation_io_test_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn isolation_working_state_blocking_job_keeps_revocation_scope() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let home = mk_home("worker");
+        set_entry(home.path(), "worker", "status", "before", "test", None, None).unwrap();
+        let before = read_full(home.path(), "worker", 10).unwrap();
+        let active = Arc::new(AtomicBool::new(true));
+        let authority = duduclaw_mcp_boundary::io_authority::scope(
+            isolation_io_test_support::context(active.clone()), async { duduclaw_mcp_boundary::io_authority::capture() }).await;
+        active.store(false, Ordering::SeqCst);
+        let path = home.path().to_owned();
+        let result = tokio::task::spawn_blocking(move || authority.run(||
+            set_entry(&path, "worker", "status", "after", "test", None, None))).await.unwrap();
+        assert!(result.is_err());
+        assert_eq!(read_full(home.path(), "worker", 10).unwrap(), before);
+    }
+
 
     // Security regression; not run (owner forbids builds).
     #[test]

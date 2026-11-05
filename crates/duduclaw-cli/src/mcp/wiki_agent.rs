@@ -186,6 +186,7 @@ pub(crate) async fn post_wiki_activity(home_dir: &Path, agent_id: &str, summary:
     } else {
         "system"
     };
+    if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return; }
     let store = match duduclaw_gateway::task_store::TaskStore::open(home_dir) {
         Ok(s) => s,
         Err(e) => {
@@ -202,12 +203,16 @@ pub(crate) async fn post_wiki_activity(home_dir: &Path, agent_id: &str, summary:
         timestamp: chrono::Utc::now().to_rfc3339(),
         metadata: Some(serde_json::json!({ "page_path": page_path }).to_string()),
     };
-    if store.append_activity(&row).await.is_ok() {
+    if store.append_activity(&row).await.is_ok()
+        && duduclaw_mcp_boundary::io_authority::verify_before_io().is_ok() {
         append_bus_event(home_dir, "activity.new", &activity_row_to_json(&row)).await;
     }
 }
 
 pub(crate) async fn handle_wiki_write(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    if let Err(error) = duduclaw_mcp_boundary::io_authority::verify_before_io() {
+        return tool_error(&error.to_string());
+    }
     let agent_id = args
         .get("agent_id")
         .and_then(|v| v.as_str())
@@ -264,6 +269,11 @@ pub(crate) async fn handle_wiki_write(args: &Value, home_dir: &Path, default_age
             Err(_) => return tool_error("Wiki is busy with an active delivery; retry the write"),
         };
 
+    // The delivery fence may block after dispatch authorization. Recheck the
+    // live run before any page/scaffold mutation once that wait has finished.
+    if let Err(error) = duduclaw_mcp_boundary::io_authority::verify_before_io() {
+        return tool_error(&error.to_string());
+    }
     // Ensure wiki scaffold exists
     if let Err(e) = ensure_wiki_dir(&wiki_dir) {
         return tool_error(&e);
@@ -273,6 +283,9 @@ pub(crate) async fn handle_wiki_write(args: &Value, home_dir: &Path, default_age
     // ancestor must resolve inside the canonical wiki dir (fail closed), so a
     // symlinked subdirectory cannot make this create directories outside the
     // wiki. Checked again after the parents are created.
+    if let Err(error) = duduclaw_mcp_boundary::io_authority::verify_before_io() {
+        return tool_error(&error.to_string());
+    }
     let full_path = match duduclaw_memory::wiki_path::prepare_wiki_write_target(&wiki_dir, page_path)
     {
         Ok(p) => p,
@@ -294,7 +307,13 @@ pub(crate) async fn handle_wiki_write(args: &Value, home_dir: &Path, default_age
     let content = stamped.as_str();
 
     // Atomic write: O_EXCL temp file + rename (never through a planted link).
-    if let Err(e) = duduclaw_memory::wiki_path::atomic_write_nofollow(&full_path, content) {
+    if let Err(error) = duduclaw_mcp_boundary::io_authority::verify_before_io() {
+        return tool_error(&error.to_string());
+    }
+    if let Err(e) = duduclaw_memory::wiki_path::atomic_write_nofollow_checked(&full_path, content, || {
+        duduclaw_mcp_boundary::io_authority::verify_before_io()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
+    }) {
         return tool_error(&format!("Failed to write page: {e}"));
     }
 
@@ -583,7 +602,10 @@ pub(crate) async fn handle_wiki_export(args: &Value, home_dir: &Path, default_ag
                 if let Some(parent) = export_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                match std::fs::write(&export_path, &html) {
+                match duduclaw_memory::wiki_path::atomic_write_nofollow_checked(&export_path, &html, || {
+                    duduclaw_mcp_boundary::io_authority::verify_before_io()
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
+                }) {
                     Ok(()) => tool_text(&format!(
                         "Exported wiki as HTML ({} bytes) to:\n{}",
                         html.len(),

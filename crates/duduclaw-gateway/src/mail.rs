@@ -456,17 +456,28 @@ pub fn processed_dir(home_dir: &Path) -> PathBuf {
 /// here. Every failure is logged and swallowed — provenance must never break
 /// a delivery that already happened.
 pub fn append_row(home_dir: &Path, row: &MailRow) {
+    if let Err(e) = append_row_checked(home_dir, row) {
+        warn!(error = %e, "mail: ledger append failed");
+    }
+}
+
+fn verify_io() -> std::io::Result<()> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
+}
+
+fn append_row_checked(home_dir: &Path, row: &MailRow) -> std::io::Result<()> {
+    verify_io()?;
     let path = ledger_path(home_dir);
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    maybe_rotate(&path);
-    let Ok(mut line) = serde_json::to_string(row) else {
-        warn!(mail_id = %row.mail_id, "mail: row not serializable — dropped");
-        return;
-    };
+    let mut line = serde_json::to_string(row)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     line.push('\n');
-    let result = duduclaw_core::with_file_lock(&path, || {
+    duduclaw_core::with_file_lock(&path, || {
+        verify_io()?;
+        maybe_rotate(&path);
         use std::io::Write as _;
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).append(true);
@@ -488,11 +499,9 @@ pub fn append_row(home_dir: &Path, row: &MailRow) {
                 let _ = f.set_permissions(perms);
             }
         }
+        verify_io()?;
         f.write_all(line.as_bytes())
-    });
-    if let Err(e) = result {
-        warn!(error = %e, "mail: ledger append failed");
-    }
+    })
 }
 
 fn maybe_rotate(path: &Path) {
@@ -502,12 +511,14 @@ fn maybe_rotate(path: &Path) {
     if meta.len() <= ROTATION_MAX_BYTES {
         return;
     }
+    if verify_io().is_err() { return; }
     let _ = std::fs::rename(path, path.with_extension("jsonl.1"));
 }
 
 // ── Read side ────────────────────────────────────────────────────────────
 
 fn read_rows(home_dir: &Path) -> Vec<MailRow> {
+    if verify_io().is_err() { return Vec::new(); }
     use std::io::{Read as _, Seek as _, SeekFrom};
     let path = ledger_path(home_dir);
     let Ok(mut file) = std::fs::File::open(&path) else {
@@ -519,6 +530,7 @@ fn read_rows(home_dir: &Path) -> Vec<MailRow> {
         return Vec::new();
     }
     let mut raw = Vec::new();
+    if verify_io().is_err() { return Vec::new(); }
     if file.read_to_end(&mut raw).is_err() {
         return Vec::new();
     }
@@ -699,13 +711,19 @@ pub fn get_inbox_item(home_dir: &Path, mail_id: &str) -> Option<InboxItem> {
 
 /// Mark read. Returns false when the id is unknown (never invents a row).
 pub fn mark_read(home_dir: &Path, mail_id: &str, by: &str) -> bool {
+    mark_read_checked(home_dir, mail_id, by).unwrap_or(false)
+}
+
+/// Read markers retain the caller's revocable authority through ledger append.
+pub fn mark_read_checked(home_dir: &Path, mail_id: &str, by: &str) -> Result<bool, String> {
+    verify_io().map_err(|e| e.to_string())?;
     if get_inbox_item(home_dir, mail_id).is_none() {
-        return false;
+        return Ok(false);
     }
     let mut row = MailRow::new("read", mail_id);
     row.agent_id = truncate_bytes(by, FIELD_MAX_BYTES).to_string();
-    append_row(home_dir, &row);
-    true
+    append_row_checked(home_dir, &row).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 /// Archive (hide from the default inbox view). Idempotent.
@@ -904,6 +922,31 @@ pub fn record_outbox_draft(
     mail_id
 }
 
+pub fn record_outbox_draft_checked(
+    home_dir: &Path,
+    cfg: &MailConfig,
+    agent_id: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+    approval_id: &str,
+    in_reply_to: Option<&str>,
+) -> Result<String, String> {
+    let mail_id = format!("out-{}", uuid::Uuid::new_v4());
+    let mut row = MailRow::new("outbox", &mail_id);
+    row.agent_id = truncate_bytes(agent_id, FIELD_MAX_BYTES).to_string();
+    row.to = Some(truncate_bytes(to.trim(), FIELD_MAX_BYTES).to_string());
+    row.subject = Some(truncate_chars(subject.trim(), 300));
+    row.body = Some(truncate_chars(body.trim(), cfg.max_body_chars));
+    row.approval_id = Some(truncate_bytes(approval_id, FIELD_MAX_BYTES).to_string());
+    row.in_reply_to = in_reply_to
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_bytes(s, FIELD_MAX_BYTES).to_string());
+    append_row_checked(home_dir, &row).map_err(|e| e.to_string())?;
+    Ok(mail_id)
+}
+
+
 /// Terminal row for an outbound draft.
 pub fn record_outbox_settled(
     home_dir: &Path,
@@ -975,6 +1018,10 @@ pub fn render_mail_as_data(item: &InboxItem) -> String {
 }
 
 #[cfg(test)]
+#[path = "isolation_io_test_support.rs"]
+mod isolation_io_test_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -997,6 +1044,19 @@ mod tests {
             subject: subject.to_string(),
             body: body.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn isolated_mail_draft_refusal_does_not_create_outbox() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let h = home();
+        let config = cfg();
+        let result = duduclaw_mcp_boundary::io_authority::scope(
+            isolation_io_test_support::context(Arc::new(AtomicBool::new(false))), async {
+                record_outbox_draft_checked(h.path(), &config, "worker", "x@example.test", "subject", "body", "approval", None)
+            }).await;
+        assert!(result.is_err());
+        assert!(!ledger_path(h.path()).exists());
     }
 
     // ── config ──────────────────────────────────────────────────────────

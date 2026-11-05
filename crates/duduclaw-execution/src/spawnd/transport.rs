@@ -3,6 +3,9 @@ use std::{io::{self, IoSlice}, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::fs:
 use duduclaw_isolation::{execution::BackendError, ids::{RequestId, SPAWND_SOCKET}, ipc::{self, Envelope, ErrorCode, FdRole, RunStatus, SpawnRequest, SpawnResponse}};
 use nix::{fcntl::{fcntl, FcntlArg, FdFlag, OFlag}, sys::{socket::{self, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr, sockopt}, stat::{fstat, SFlag}}};
 use std::sync::{Arc, Condvar, Mutex, atomic::{AtomicBool, Ordering}};
+#[cfg(test)]
+use tokio::io::unix::AsyncFd;
+type LiveCheck = dyn Fn() -> Result<(), BackendError> + Send + Sync;
 
 pub(super) struct Connection {
     io: Arc<ControlIo>,
@@ -90,10 +93,11 @@ impl ControlIo {
             busy = next;
         }
     }
-    fn transact(&self, request: SpawnRequest, input_fds: Vec<OwnedFd>, deadline: std::time::Instant)
+    fn transact(&self, request: SpawnRequest, input_fds: Vec<OwnedFd>, deadline: std::time::Instant, check: &LiveCheck)
         -> Result<Packet, BackendError> {
         let result = (|| {
             let mut transaction = self.acquire(deadline)?;
+            check()?;
             let request_id = RequestId(*uuid::Uuid::new_v4().as_bytes());
             let frame = ipc::encode(&Envelope { version: ipc::PROTOCOL_VERSION, request_id, message: &request })
                 .map_err(|_| BackendError::Protocol)?;
@@ -102,6 +106,7 @@ impl ControlIo {
             loop {
                 if self.closed.load(Ordering::Acquire) { return Err(BackendError::Unavailable); }
                 if std::time::Instant::now() >= deadline { return Err(BackendError::Timeout); }
+                check()?;
                 match socket::sendmsg::<UnixAddr>(self.fd.as_raw_fd(), &[IoSlice::new(&frame)], &controls,
                     MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT, None) {
                     Ok(bytes) if bytes == frame.len() => break,
@@ -125,6 +130,7 @@ impl ControlIo {
             validate_response(&request, &envelope.message)?;
             validate_fds(&envelope.message.fd_plan(), &fds)?;
             if self.closed.load(Ordering::Acquire) { return Err(BackendError::Unavailable); }
+            check()?;
             transaction.completed = true;
             Ok(Packet { response: envelope.message, fds })
         })();
@@ -154,6 +160,10 @@ impl Connection {
             closed: AtomicBool::new(false) }), id }
     }
     #[cfg(test)]
+    pub(super) fn test_connection(fd: OwnedFd) -> Self {
+        Self::from_fd(fd, ipc::ControlConnectionId([17; 16]))
+    }
+    #[cfg(test)]
     pub(super) fn test_pair() -> (Self, OwnedFd) {
         let (left, right) = socket::socketpair(AddressFamily::Unix, SockType::SeqPacket, None,
             SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK).unwrap();
@@ -169,7 +179,7 @@ impl Connection {
     pub(super) fn live_status(&self, run: duduclaw_isolation::execution::RunHandle,
         reservation_expiry: u64) -> Result<RunStatus, BackendError> {
         let packet = self.io.transact(SpawnRequest::Status { run }, vec![],
-            std::time::Instant::now() + Duration::from_millis(250))?;
+            std::time::Instant::now() + Duration::from_millis(250), &|| Ok(()))?;
         let result = match packet.response {
             SpawnResponse::Status { status, .. } => {
                 if let RunStatus::Reserved { expires_at_unix_ms } = status {
@@ -192,20 +202,26 @@ impl Connection {
     }
 
     pub async fn request(&self, request: SpawnRequest, input_fds: &[OwnedFd]) -> Result<Packet, BackendError> {
-        let packet = self.request_packet(request, input_fds).await?;
+        self.request_checked(request, input_fds, Arc::new(|| Ok(()))).await
+    }
+
+    pub async fn request_checked(&self, request: SpawnRequest, input_fds: &[OwnedFd],
+        check: Arc<LiveCheck>) -> Result<Packet, BackendError> {
+        let packet = self.request_packet(request, input_fds, check).await?;
         if let SpawnResponse::Error { code } = packet.response { return Err(map_error(code)); }
         Ok(packet)
     }
 
     pub(super) async fn pty_activity(&self, run: duduclaw_isolation::execution::RunHandle) -> Result<(), BackendError> {
-        match self.request_packet(SpawnRequest::PtyActivity { run }, &[]).await?.response {
+        match self.request_packet(SpawnRequest::PtyActivity { run }, &[], Arc::new(|| Ok(()))).await?.response {
             SpawnResponse::Ack | SpawnResponse::Error { code: ErrorCode::NotReady } => Ok(()),
             SpawnResponse::Error { code } => Err(map_error(code)),
             _ => Err(BackendError::Protocol),
         }
     }
 
-    async fn request_packet(&self, request: SpawnRequest, input_fds: &[OwnedFd]) -> Result<Packet, BackendError> {
+    async fn request_packet(&self, request: SpawnRequest, input_fds: &[OwnedFd], check: Arc<LiveCheck>) -> Result<Packet, BackendError> {
+        check()?;
         let roles = request.fd_plan().map_err(|_| BackendError::Denied)?;
         if roles.len() != input_fds.len() { return Err(BackendError::Protocol); }
         let inputs = input_fds.iter().map(|fd| fd.try_clone().map_err(|_| BackendError::Io))
@@ -215,8 +231,10 @@ impl Connection {
         // Dropping this future shuts down the socket immediately, including
         // while its blocking task is queued or waiting for the transaction gate.
         let mut cancellation = CancelTransaction(Some(io.clone()));
-        let result = tokio::task::spawn_blocking(move || io.transact(request, inputs, deadline))
+        let transaction_check = check.clone();
+        let result = tokio::task::spawn_blocking(move || io.transact(request, inputs, deadline, transaction_check.as_ref()))
             .await.map_err(|_| BackendError::Unavailable)?;
+        check()?;
         cancellation.0 = None;
         result
     }
@@ -270,6 +288,42 @@ fn validate_response(request: &SpawnRequest, response: &SpawnResponse) -> Result
         _ => false,
     };
     if valid { Ok(()) } else { Err(BackendError::Protocol) }
+}
+
+#[cfg(test)]
+async fn send_checked(fd: &AsyncFd<OwnedFd>, frame: &[u8], input_fds: &[OwnedFd],
+    check: &(dyn Fn() -> Result<(), BackendError> + Send + Sync)) -> Result<(), BackendError> {
+    let raw_fds: Vec<_> = input_fds.iter().map(AsRawFd::as_raw_fd).collect();
+    loop {
+        let mut ready = fd.writable().await.map_err(|_| BackendError::Io)?;
+        check()?;
+        let sent = ready.try_io(|fd| {
+            let controls = if raw_fds.is_empty() { vec![] } else { vec![ControlMessage::ScmRights(&raw_fds)] };
+            socket::sendmsg::<UnixAddr>(fd.get_ref().as_raw_fd(), &[IoSlice::new(frame)], &controls,
+                MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT, None).map_err(io::Error::from)
+        });
+        match sent {
+            Ok(Ok(bytes)) if bytes == frame.len() => return Ok(()),
+            Ok(Ok(_)) => return Err(BackendError::Protocol),
+            Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Ok(Err(_)) => return Err(BackendError::Io),
+            Err(_) => continue,
+        }
+    }
+}
+
+#[cfg(test)]
+async fn receive(fd: &AsyncFd<OwnedFd>) -> Result<(Vec<u8>, Vec<OwnedFd>), BackendError> {
+    loop {
+        let mut ready = fd.readable().await.map_err(|_| BackendError::Io)?;
+        match ready.try_io(|fd| receive_packet(fd.get_ref())) {
+            Ok(Ok(packet)) => return Ok(packet),
+            Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => return Err(BackendError::Protocol),
+            Ok(Err(_)) => return Err(BackendError::Io),
+            Err(_) => continue,
+        }
+    }
 }
 
 fn receive_packet(fd: &OwnedFd) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
@@ -577,4 +631,53 @@ mod tests {
         let mut buffer = vec![0; ipc::MAX_FRAME_BYTES + 4];
         assert_eq!(socket::recv(right.as_raw_fd(), &mut buffer, MsgFlags::empty()).unwrap(), 0);
     }
+    #[tokio::test]
+    async fn checked_request_rechecks_after_transaction_lock_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (left, right) = socket::socketpair(AddressFamily::Unix, SockType::SeqPacket, None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK).unwrap();
+        let connection = Connection::test_connection(left);
+        let live = Arc::new(AtomicBool::new(true));
+        let authority = live.clone();
+        let check: Arc<LiveCheck> = Arc::new(move || if authority.load(Ordering::SeqCst) { Ok(()) } else { Err(BackendError::Denied) });
+        let mut lock = connection.io.acquire(std::time::Instant::now() + Duration::from_secs(1)).unwrap();
+        let request = SpawnRequest::ReserveRun { employee_id: duduclaw_isolation::ids::EmployeeId([1; 16]) };
+        let future = connection.request_checked(request, &[], check);
+        tokio::pin!(future);
+        assert!(tokio::time::timeout(Duration::from_millis(5), &mut future).await.is_err());
+        live.store(false, Ordering::SeqCst);
+        lock.completed = true;
+        drop(lock);
+        assert!(matches!(future.await, Err(BackendError::Denied)));
+        // No bytes crossed the root boundary, and taking then rejecting the
+        // owned connection ensures the reservation is revoked by peer EOF.
+        let mut bytes = [0; 16];
+        assert_eq!(socket::recv(right.as_raw_fd(), &mut bytes, MsgFlags::empty()).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn checked_request_refuses_fd_handover_after_reply_revocation() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let (left, right) = socket::socketpair(AddressFamily::Unix, SockType::SeqPacket, None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK).unwrap();
+        let connection = Connection::test_connection(left);
+        let live = Arc::new(AtomicBool::new(true));
+        let server_live = live.clone();
+        let server = tokio::spawn(async move {
+            let right = AsyncFd::new(right).unwrap();
+            let (bytes, _) = receive(&right).await.unwrap();
+            let request: Envelope<SpawnRequest> = ipc::decode(&bytes).unwrap();
+            let run = duduclaw_isolation::execution::RunHandle(duduclaw_isolation::ids::RunId([9; 16]));
+            let response = Envelope { version: ipc::PROTOCOL_VERSION, request_id: request.request_id,
+                message: SpawnResponse::Reserved { run, expires_at_unix_ms: 100 } };
+            server_live.store(false, Ordering::SeqCst);
+            send_checked(&right, &ipc::encode(&response).unwrap(), &[], &|| Ok(())).await.unwrap();
+        });
+        let check: Arc<LiveCheck> = Arc::new(move || if live.load(Ordering::SeqCst) { Ok(()) } else { Err(BackendError::Denied) });
+        let request = SpawnRequest::ReserveRun { employee_id: duduclaw_isolation::ids::EmployeeId([1; 16]) };
+        assert!(matches!(connection.request_checked(request, &[], check).await, Err(BackendError::Denied)));
+        assert!(connection.is_closed());
+        server.await.unwrap();
+    }
+
 }

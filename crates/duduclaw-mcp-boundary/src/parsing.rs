@@ -7,7 +7,7 @@ use duduclaw_isolation::{bounded::List, worker::*};
 use rand::{rngs::OsRng, RngCore};
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use crate::{RequestContext, VerificationError};
+use crate::{VerificationError, resources::AuthorizedFile, tool_policy::AuthorizedToolCall};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableKind { Csv, Spreadsheet }
@@ -38,9 +38,14 @@ impl TableOptions {
 /// Return a bounded JSON table encoded in Text items in wire order, input slot 0,
 /// without pages. All worker strings remain data and are revalidated by D.
 pub trait FileParser: Send + Sync {
-    fn parse<'a>(&'a self, context: RequestContext, request: ParseRequest, input: File,
+    fn parse<'a>(&'a self, call: AuthorizedToolCall, request: ParseRequest, input: AuthorizedFile,
         options: TableOptions)
         -> Pin<Box<dyn Future<Output = Result<ParseResponse, VerificationError>> + Send + 'a>>;
+}
+
+pub fn authorized_table_request(input: &AuthorizedFile, options: &TableOptions) -> Result<ParseRequest, VerificationError> {
+    input.verify_live()?;
+    table_request(input.file(), options)
 }
 
 pub fn table_request(input: &File, options: &TableOptions) -> Result<ParseRequest, VerificationError> {

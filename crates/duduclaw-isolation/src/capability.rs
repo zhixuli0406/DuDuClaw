@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use crate::{bounded::{List, Text}, ids::{EmployeeId, RunId, Sha256Digest}, ContractError};
 
-pub const CAPABILITY_ENCODING_VERSION: u16 = 1;
+pub const CAPABILITY_ENCODING_VERSION: u16 = 2;
 pub const CAPABILITY_DOMAIN: &[u8] = b"duduclaw-mcp-capability\0";
 
 /// Hash of a high-entropy capability; server storage never retains its bearer (§6.1).
@@ -35,6 +35,12 @@ pub enum Lane { Standard, Explore }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceGrant {
+    /// CONTRACT CHANGE v2: live employee authority for Service/Connector calls.
+    /// This never grants a host path or an execution workspace.
+    EmployeeScope { id: EmployeeId },
+    /// v2 confinement for File/A/E inputs or outputs alongside employee scope.
+    /// It never narrows or expands Service/Connector employee-scope authority.
+    Confined { resource: Box<ResourceGrant> },
     Employee { id: EmployeeId },
     Workspace { handle: Text<128> },
     Mailbox { id: Text<128> },
@@ -88,6 +94,8 @@ fn binding_bytes(out: &mut Vec<u8>, binding: &EmployeeBinding) {
 fn resource_bytes(resource: &ResourceGrant) -> Vec<u8> {
     let mut out = Vec::new();
     match resource {
+        ResourceGrant::EmployeeScope { id } => { out.push(9); out.extend_from_slice(&id.0); }
+        ResourceGrant::Confined { resource } => { out.push(10); out.extend(resource_bytes(resource)); }
         ResourceGrant::Employee { id } => { out.push(0); out.extend_from_slice(&id.0); }
         ResourceGrant::Workspace { handle } => { out.push(1); text_bytes(&mut out, handle.as_str()); }
         ResourceGrant::Mailbox { id } => { out.push(2); text_bytes(&mut out, id.as_str()); }
@@ -115,9 +123,45 @@ fn set_bytes(out: &mut Vec<u8>, mut entries: Vec<Vec<u8>>) -> Result<(), Contrac
 }
 
 impl CapabilityRecord {
-    /// Stable v1 bytes to MAC/sign. Times are Unix seconds. Tags and field order
+    pub fn employee_scope(&self) -> bool {
+        self.resources.as_slice().contains(&ResourceGrant::EmployeeScope { id: self.employee })
+    }
+
+    /// Concrete grants consumed by File/A/E adapters. EmployeeScope remains a
+    /// separate marker; confined resources never become ambient service grants.
+    pub fn io_resources(&self) -> impl Iterator<Item = &ResourceGrant> {
+        self.resources.as_slice().iter().map(|grant| match grant {
+            ResourceGrant::Confined { resource } => resource.as_ref(), _ => grant,
+        })
+    }
+
+    /// A broad service grant must never accidentally erase narrower service grants.
+    /// Workspace and origin grants remain explicit for A/E confinement; they do
+    /// not narrow the employee-scope authority of Service/Connector handlers.
+    pub fn validate_resource_mode(&self) -> Result<(), ContractError> {
+        let scopes: Vec<_> = self.resources.as_slice().iter().filter_map(|grant| match grant {
+            ResourceGrant::EmployeeScope { id } => Some(*id), _ => None,
+        }).collect();
+        if !scopes.is_empty() && (scopes != [self.employee] || self.task.is_some()
+            || self.resources.as_slice().iter().any(|grant| !matches!(grant,
+                ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. } | ResourceGrant::Workspace { .. } | ResourceGrant::UrlOrigin { .. } | ResourceGrant::Confined { .. }))) {
+            return Err(ContractError::InvalidValue("ambiguous employee-scope resource policy"));
+        }
+        for grant in self.resources.as_slice() {
+            if let ResourceGrant::Confined { resource } = grant {
+                if scopes.is_empty() || matches!(resource.as_ref(), ResourceGrant::Confined { .. }
+                    | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. }) {
+                    return Err(ContractError::InvalidValue("invalid confined resource"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stable v2 bytes to MAC/sign. Times are Unix seconds. Tags and field order
     /// are protocol constants; do not replace this with JSON serialization (§6.1).
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ContractError> {
+        self.validate_resource_mode()?;
         if self.issued_at > self.not_before || self.not_before >= self.expires_at {
             return Err(ContractError::InvalidValue("capability validity interval"));
         }
@@ -167,11 +211,39 @@ impl CapabilityRecord {
 /// Immutable handler context constructed by a trusted verifier, never deserialized
 /// from tool arguments (§6.3). The constructor is an implementer trust boundary,
 /// not evidence that verification occurred; only D's verifier may call it.
-#[derive(Debug, Clone)]
-pub struct RequestContext { record: CapabilityRecord }
+/// Host-owned live verifier attached by the boundary, never supplied by MCP.
+/// Implementations must compare this exact record with the active connection
+/// and re-read run, principal and policy authority immediately before I/O.
+pub trait LiveRequestVerifier: Send + Sync {
+    fn verify_live(&self, record: &CapabilityRecord, now: u64) -> Result<(), VerificationError>;
+}
+
+#[derive(Clone)]
+pub struct RequestContext {
+    record: CapabilityRecord,
+    live: Option<std::sync::Arc<dyn LiveRequestVerifier>>,
+}
+impl std::fmt::Debug for RequestContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestContext").field("record", &self.record)
+            .field("live_authority_attached", &self.live.is_some()).finish()
+    }
+}
 impl RequestContext {
-    pub fn from_verified_record(record: CapabilityRecord) -> Self { Self { record } }
+    /// Record-only contexts cannot authorize irreversible I/O. This constructor
+    /// remains for trusted policy evaluation and contract fixtures.
+    pub fn from_verified_record(record: CapabilityRecord) -> Self { Self { record, live: None } }
+    /// Trusted verifier integration seam, not a callable/deserializable RPC.
+    pub fn with_live_verifier(record: CapabilityRecord, live: std::sync::Arc<dyn LiveRequestVerifier>) -> Self {
+        Self { record, live: Some(live) }
+    }
     pub fn record(&self) -> &CapabilityRecord { &self.record }
+    pub fn verify_live(&self, now: u64) -> Result<(), VerificationError> {
+        if now < self.record.not_before || now >= self.record.expires_at {
+            return Err(VerificationError::InvalidTime);
+        }
+        self.live.as_ref().ok_or(VerificationError::Unavailable)?.verify_live(&self.record, now)
+    }
 }
 
 /// Host-owned connection binding; must never be populated from a frame (§6.1).
@@ -224,7 +296,7 @@ mod tests {
     fn canonical_encoding_golden_bytes() {
         let actual: String = record().canonical_bytes().unwrap().iter().map(|b| format!("{b:02x}")).collect();
         let expected = concat!(
-            "64756475636c61772d6d63702d6361706162696c69747900", "0001",
+            "64756475636c61772d6d63702d6361706162696c69747900", "0002",
             "0101010101010101010101010101010101010101010101010101010101010101",
             "02020202020202020202020202020202", "03030303030303030303030303030303",
             "010000000174", "0000000001750000000000000004", "000000000175", "01",
@@ -235,6 +307,40 @@ mod tests {
         );
         assert_eq!(actual, expected);
     }
+    #[test]
+    fn employee_scope_v2_is_mac_covered_and_cannot_shadow_narrow_grants() {
+        let mut scoped = record();
+        scoped.task = None;
+        scoped.resources = List::new(vec![ResourceGrant::EmployeeScope { id: scoped.employee }]).unwrap();
+        let bytes = scoped.canonical_bytes().unwrap();
+        assert_eq!(&bytes[CAPABILITY_DOMAIN.len()..CAPABILITY_DOMAIN.len()+2], &[0, 2]);
+        let mut explicit = scoped.clone();
+        explicit.resources = List::new(vec![ResourceGrant::Employee { id: explicit.employee }]).unwrap();
+        assert_ne!(bytes, explicit.canonical_bytes().unwrap());
+        scoped.resources = List::new(vec![ResourceGrant::EmployeeScope { id: scoped.employee },
+            ResourceGrant::Task { id: Text::new("task-a".into()).unwrap() }]).unwrap();
+        assert!(scoped.canonical_bytes().is_err());
+        scoped.resources = List::new(vec![ResourceGrant::EmployeeScope { id: EmployeeId([9; 16]) }]).unwrap();
+        assert!(scoped.canonical_bytes().is_err());
+    }
+
+    #[test]
+    fn confined_resource_encoding_rejects_ambiguous_or_nested_modes() {
+        let confined = ResourceGrant::Confined { resource: Box::new(ResourceGrant::Wiki { namespace: Text::new("n".into()).unwrap() }) };
+        let mut scoped = record();
+        scoped.task = None;
+        scoped.resources = List::new(vec![ResourceGrant::EmployeeScope { id: scoped.employee }, confined.clone()]).unwrap();
+        let original = scoped.canonical_bytes().unwrap();
+        scoped.resources = List::new(vec![ResourceGrant::EmployeeScope { id: scoped.employee },
+            ResourceGrant::Confined { resource: Box::new(ResourceGrant::Wiki { namespace: Text::new("other".into()).unwrap() }) }]).unwrap();
+        assert_ne!(original, scoped.canonical_bytes().unwrap());
+        scoped.resources = List::new(vec![confined.clone()]).unwrap();
+        assert!(scoped.canonical_bytes().is_err());
+        scoped.resources = List::new(vec![ResourceGrant::EmployeeScope { id: scoped.employee },
+            ResourceGrant::Confined { resource: Box::new(confined) }]).unwrap();
+        assert!(scoped.canonical_bytes().is_err());
+    }
+
     #[test]
     fn serde_round_trip_and_canonical_set_order() {
         let mut a = record();
@@ -269,6 +375,8 @@ mod tests {
     #[test]
     fn canonical_resource_tags_have_golden_bytes() {
         let cases = [
+            (ResourceGrant::Confined { resource: Box::new(ResourceGrant::Wiki { namespace: Text::new("n".into()).unwrap() }) }, "0a05000000016e"),
+            (ResourceGrant::EmployeeScope { id: EmployeeId([2; 16]) }, "0902020202020202020202020202020202"),
             (ResourceGrant::Employee { id: EmployeeId([2; 16]) }, "0002020202020202020202020202020202"),
             (ResourceGrant::Workspace { handle: Text::new("w".into()).unwrap() }, "010000000177"),
             (ResourceGrant::Mailbox { id: Text::new("m".into()).unwrap() }, "02000000016d"),
@@ -294,7 +402,7 @@ mod tests {
         value.lane = Lane::Standard;
         let actual: String = value.canonical_bytes().unwrap().iter().map(|b| format!("{b:02x}")).collect();
         let expected = concat!(
-            "64756475636c61772d6d63702d6361706162696c69747900", "0001",
+            "64756475636c61772d6d63702d6361706162696c69747900", "0002",
             "0101010101010101010101010101010101010101010101010101010101010101",
             "02020202020202020202020202020202", "03030303030303030303030303030303",
             "00", "0100000001740000000000000004", "010000000174", "00",

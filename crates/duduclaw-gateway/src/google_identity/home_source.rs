@@ -24,7 +24,7 @@ pub(crate) use home_callback_io::exchange_claimed_google_code_once;
 #[cfg(test)]
 pub(crate) use home_callback_io::testing as callback_testing;
 pub(crate) use native_selection::{
-    NativeHomeSelection, prepare_home_native_selection, resolve_home_native_pinned,
+    NativeHomeSelection, prepare_home_native_selection, read_home_native_selection, resolve_home_native_pinned,
     validate_home_native_material, validate_home_native_selection,
 };
 pub use oauth_material::get_valid_google_token;

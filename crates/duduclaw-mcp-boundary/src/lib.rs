@@ -1,5 +1,6 @@
 //! Package D: connection-bound authority; no identity is accepted from MCP data.
 pub mod authority;
+pub mod io_authority;
 pub mod config;
 pub mod execution;
 #[cfg(all(target_os = "linux", feature = "execution-integration"))]

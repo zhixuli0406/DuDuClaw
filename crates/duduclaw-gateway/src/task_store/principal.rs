@@ -35,6 +35,7 @@ impl TaskStore {
         );
         let window = format!("-{} minutes", window_minutes.min(10_080));
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(&sql, params![principal, window], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(|e| format!("count chat assignments: {e}"))
     }
@@ -69,6 +70,7 @@ impl TaskStore {
             limit.clamp(1, 200)
         );
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("prepare principal list: {e}"))?;
@@ -115,6 +117,7 @@ impl TaskStore {
             " AND archived = 0"
         });
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let params_ref: Vec<&dyn rusqlite::types::ToSql> = binds
             .iter()
             .map(|s| s as &dyn rusqlite::types::ToSql)

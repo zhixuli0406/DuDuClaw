@@ -35,11 +35,12 @@ fn directories() -> Result<()> {
             return Err(refused("隔離服務目錄權限不符。"));
         }
     }
-    for path in ["/usr/lib/duduclaw/parse-root", "/usr/lib/duduclaw/parse-root-tree"] {
+    for path in ["/usr/lib/duduclaw/parse-root"] {
         if !layout::parse_root_is_reusable(Path::new(path), 0, 0)? {
             return Err(refused("解析服務目錄含有非預期內容。"));
         }
     }
+    parse_runtime_tree(false)?;
     Ok(())
 }
 

@@ -60,6 +60,7 @@ impl ApprovalBroker {
     ) -> Result<Option<OperationRecord>, String> {
         let id: Option<String> = {
             let conn = self.store.conn.lock().await;
+            verify_live_io()?;
             conn.query_row(
                 "SELECT operation_id FROM approval_operations WHERE run_id=?1 AND step_key=?2",
                 params![run_id, step_key],
@@ -84,9 +85,8 @@ impl ApprovalBroker {
         &self,
     ) -> Result<Vec<(String, i64, String, Vec<String>)>, String> {
         let mut conn = self.store.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         let rows: Vec<(String, String, i64, String)> = {
             let mut q = tx
                 .prepare(
@@ -120,7 +120,7 @@ impl ApprovalBroker {
             .map_err(|e| e.to_string())?;
             out.push((grant, epoch, reason, executing));
         }
-        tx.commit().map_err(|e| e.to_string())?;
+        commit_live_write(tx)?;
         Ok(out)
     }
 }

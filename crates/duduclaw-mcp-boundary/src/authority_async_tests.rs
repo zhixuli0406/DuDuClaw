@@ -38,6 +38,7 @@ fn fixture() -> (Arc<Boundary>, CapabilityId, Connection, tokio::net::UnixStream
 }
 struct Wait { slow: Arc<AtomicBool> }
 impl crate::server::Dispatcher for Wait {
+    fn require_complete_services(&self) -> Result<(), VerificationError> { Ok(()) }
     fn dispatch<'a>(&'a self, _: RequestContext, _: &'a str, _: serde_json::Value)
         -> std::pin::Pin<Box<dyn std::future::Future<Output=Result<Option<serde_json::Value>,VerificationError>> + Send + 'a>> {
         Box::pin(async move {
@@ -85,4 +86,25 @@ async fn cancelled_verification_retains_connection_slot_until_work_finishes() {
     assert_eq!(verifier.serial.available_permits(), 0);
     tokio::time::sleep(Duration::from_millis(650)).await;
     assert_eq!(verifier.serial.available_permits(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn revocation_cancels_slow_startup_and_inflight_authority_reads() {
+    for slow_startup in [true, false] {
+        let (boundary, _id, mut connection, mut client, live) = fixture();
+        live.slow.store(slow_startup, Ordering::Release);
+        client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"wait\"}\n").await.unwrap();
+        let dispatcher = Wait { slow: live.slow.clone() };
+        let revoke = async {
+            while !live.entered.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            boundary.revoke_all().unwrap();
+        };
+        let serve = crate::server::serve_with_deadline(&mut connection, &dispatcher, Duration::from_secs(5));
+        let (_, result) = tokio::time::timeout(Duration::from_millis(400), async {
+            tokio::join!(revoke, serve)
+        }).await.expect("sticky revocation must not wait for a blocked authority read");
+        assert_eq!(result, Err(VerificationError::Revoked));
+    }
 }

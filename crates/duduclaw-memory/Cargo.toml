@@ -10,6 +10,7 @@ test-hooks = []
 
 [dependencies]
 duduclaw-core = { workspace = true }
+duduclaw-mcp-boundary = { workspace = true }
 duduclaw-security = { workspace = true }
 tokio = { workspace = true }
 rusqlite = { workspace = true }
@@ -35,6 +36,7 @@ ignore = "0.4.27"
 libc = "0.2"
 
 [dev-dependencies]
+duduclaw-isolation.workspace = true
 tempfile = "3"
 # Integration tests (`tests/`) build the library without `cfg(test)`; they get
 # `Provenance::test_only` through the feature.

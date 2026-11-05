@@ -6,6 +6,7 @@ impl TaskStore {
     /// The global event cursor (`None` until the first event subscription).
     pub async fn event_cursor(&self) -> Result<Option<i64>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             "SELECT last_event_id FROM responsibility_event_cursor WHERE singleton = 1",
             [],
@@ -21,13 +22,16 @@ impl TaskStore {
         last_event_id: i64,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         conn.execute(
             "INSERT OR IGNORE INTO responsibility_event_cursor (singleton, last_event_id, updated_at)
              VALUES (1, ?1, ?2)",
             params![last_event_id, resp_ts(now)],
         )
         .map_err(|e| format!("init event cursor: {e}"))?;
+        commit_live_write(conn)?;
         Ok(())
     }
 
@@ -38,7 +42,9 @@ impl TaskStore {
         last_event_id: i64,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         conn.execute(
             "INSERT INTO responsibility_event_cursor (singleton, last_event_id, updated_at)
              VALUES (1, ?1, ?2)
@@ -48,6 +54,7 @@ impl TaskStore {
             params![last_event_id, resp_ts(now)],
         )
         .map_err(|e| format!("advance event cursor: {e}"))?;
+        commit_live_write(conn)?;
         Ok(())
     }
 
@@ -55,25 +62,31 @@ impl TaskStore {
     /// transition (not per tick); the next pass with the feature on jumps
     /// the cursor to the tail instead of replaying what happened meanwhile.
     pub async fn mark_event_cursor_paused(&self, now: DateTime<Utc>) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         conn.execute(
             "UPDATE responsibility_event_cursor SET paused = 1, updated_at = ?1 WHERE singleton = 1",
             params![resp_ts(now)],
         )
         .map_err(|e| format!("pause event cursor: {e}"))?;
+        commit_live_write(conn)?;
         Ok(())
     }
 
     /// Clear the pause mark; `true` when it was set (the caller then jumps
     /// the cursor to the tail).
     pub async fn take_event_cursor_paused(&self) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let n = conn
             .execute(
                 "UPDATE responsibility_event_cursor SET paused = 0 WHERE singleton = 1 AND paused = 1",
                 [],
             )
             .map_err(|e| format!("resume event cursor: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n == 1)
     }
 
@@ -87,7 +100,9 @@ impl TaskStore {
         period_key: &str,
         now: DateTime<Utc>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let n = conn
             .execute(
                 "INSERT OR IGNORE INTO responsibility_notice_log
@@ -96,6 +111,7 @@ impl TaskStore {
                 params![responsibility_id, notice_key, period_key, resp_ts(now)],
             )
             .map_err(|e| format!("claim notice: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n == 1)
     }
 
@@ -105,13 +121,16 @@ impl TaskStore {
         notice_key: &str,
         outcome: &str,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         conn.execute(
             "UPDATE responsibility_notice_log SET outcome = ?3
               WHERE responsibility_id = ?1 AND notice_key = ?2",
             params![responsibility_id, notice_key, outcome],
         )
         .map_err(|e| format!("notice outcome: {e}"))?;
+        commit_live_write(conn)?;
         Ok(())
     }
 
@@ -122,6 +141,7 @@ impl TaskStore {
         period_key: &str,
     ) -> Result<i64, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             "SELECT COUNT(*) FROM responsibility_notice_log
               WHERE responsibility_id = ?1 AND period_key = ?2 AND outcome IN ('pushed','deferred')",
@@ -138,6 +158,7 @@ impl TaskStore {
         window: &str,
     ) -> Result<i64, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             "SELECT COUNT(DISTINCT f.occurrence_task_id) FROM wakeup_fires f
                JOIN responsibility_occurrences o ON o.task_id = f.occurrence_task_id
@@ -157,12 +178,16 @@ impl TaskStore {
         drop_reason: &str,
         now: DateTime<Utc>,
     ) -> Result<usize, String> {
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
+        let result = conn.execute(
             "UPDATE wakeup_fires SET state = 'dropped', drop_reason = ?3, settled_at = ?4
               WHERE responsibility_id = ?1 AND reason = ?2 AND state = 'pending'",
             params![responsibility_id, reason, drop_reason, resp_ts(now)],
         )
-        .map_err(|e| format!("drop pending fires: {e}"))
+        .map_err(|e| format!("drop pending fires: {e}"))?;
+        commit_live_write(conn)?;
+        Ok(result)
     }
 }

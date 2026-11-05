@@ -189,15 +189,198 @@ pub(crate) async fn handle_tools_call(
     // Per-employee Google identity: decided from the proven employee only
     // (never a tool argument). Only built for the Google tools.
     let isolated = crate::mcp_isolation::current().is_some();
-    let google_caller = if GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
+    let google_caller = if !isolated && GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
         super::google_identity_client::GoogleCaller::for_process(home_dir, caller_client_id)
     } else {
         super::google_identity_client::GoogleCaller::default()
     };
     let result = with_background_caller(record_actor, async {
-        if let Some(result) = crate::mcp_isolation::dispatch_resource_tool(home_dir, tool_name, &arguments).await {
-            return Ok(result);
+        let authorized = if isolated && crate::mcp_isolation::legacy_resource_handler(tool_name) {
+            match crate::mcp_isolation::authorize_gateway_handler(home_dir, tool_name, &arguments).await {
+                Ok(call) => Some(call),
+                Err(_) => return Ok(tool_error("無法確認這次操作的資源授權，已拒絕執行。")),
+            }
+        } else {
+            if let Some(result) = crate::mcp_isolation::dispatch_resource_tool(home_dir, tool_name, &arguments).await {
+                return Ok(result);
+            }
+            None
+        };
+        let handler = GatewayHandler { id, home_dir, http, memory, default_agent, odoo, ns_ctx,
+            daily_quota, caller_client_id, caller_is_admin, wiki_agent, record_actor,
+            google_caller: &google_caller };
+        match authorized {
+            Some(call) => handler.execute(call).await,
+            None => handler.invoke(tool_name, &arguments).await,
         }
+    }).await;
+    let result = match result {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    let result = if !isolated && GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
+        google_caller.finish(home_dir, default_agent, tool_name, result).await
+    } else {
+        result
+    };
+
+    // ── Tool call audit trail (L1 anti-hallucination) ──────────
+    // Use the actual EXECUTING agent's ID, not just default_agent verbatim.
+    // In a genuine agent-to-agent delegation, DUDUCLAW_DELEGATION_SENDER
+    // identifies the real caller; when it is a system/scheduler sender
+    // (goal-loop-driver / cron / heartbeat / autopilot / dashboard / webhook)
+    // it names who dispatched the work, not who is executing this tool call —
+    // see `resolve_audit_agent` (WP-A10 BUG-1 fix).
+    if isolated && is_state_changing {
+        duduclaw_security::audit::append_tool_call_with_extras(home_dir, default_agent, tool_name,
+            "isolated resource tool", !result.get("isError").and_then(Value::as_bool).unwrap_or(false),
+            &[("transport", serde_json::json!("isolated_mcp"))]);
+    } else if is_state_changing {
+        let success = !result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let actual_agent = resolve_audit_agent(|| default_agent.to_string());
+        let params_summary = build_params_summary(tool_name, &arguments);
+        // R4 (TraceElephant): capture the tool's INPUT arguments, not just the
+        // outcome summary — masked (secret keys/values), size-capped, and
+        // skipped for read-only tool names inside the helper. Previously
+        // `append_tool_call_with_input` had zero production callers.
+        //
+        // B3b (GroundEval evidence source): also capture the tool's RESULT
+        // text — masked/capped inside the audit helper — so the B3 grounding
+        // pre-check in `dispatch_engine.rs` has evidence to compare an
+        // agent's claim against, instead of observing `ResultTextMissing`
+        // on every row.
+        //
+        // Fix-2 C1a (2026-08 grounding self-echo audit): tools on
+        // `duduclaw_core::grounding::SELF_ECHO_TOOL_NAMES` (tasks_complete,
+        // tasks_update, ...) return a response envelope that is
+        // substantially the caller's OWN input echoed back
+        // (`task_row_to_json`'s `result_summary`/`title`/`blocked_reason`
+        // fields ARE the `summary`/`title`/`reason` arguments just
+        // supplied). Capturing that as `result_text` let the B3 grounding
+        // pre-check compare an agent's claim against its own words and
+        // trivially pass every time — and, worse, a task JSON that happened
+        // to exceed the audit char cap could truncate exactly the echoed
+        // span and flip the verdict to a false reject. Skip `result_text`
+        // capture entirely for these tools; they still get the `input` +
+        // `success` audit fields like every other state-changing tool, only
+        // the grounding-evidence field is suppressed.
+        // P2-C: workspace answers carry file paths and file content; the
+        // audit row keeps only the argument summary (no result text).
+        let result_text_for_grounding = if duduclaw_core::grounding::is_self_echo_tool(tool_name)
+            || tool_name == "credential_declare"
+            || crate::mcp_dispatch::COMPUTER_WORKSPACE_TOOLS.contains(&tool_name)
+        {
+            None
+        } else {
+            audit_result_text(tool_name, &result)
+        };
+        // `computer_type`'s text never reaches the audit (F5): only its length.
+        let audit_arguments = audit_safe_arguments(tool_name, &arguments);
+        duduclaw_security::audit::append_tool_call_with_input(
+            home_dir,
+            &actual_agent,
+            tool_name,
+            &params_summary,
+            success,
+            Some(&audit_arguments),
+            result_text_for_grounding.as_deref(),
+        );
+    }
+
+    // Read-only tools need usage evidence too. Do not retain arguments or
+    // results here; state-changing calls already have their canonical audit.
+    let pruning_success = !result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    if pruning_success {
+        let actual_agent = resolve_audit_agent(|| default_agent.to_string());
+        let pruning_agent = acting_agent_id(caller_client_id, default_agent);
+        if !is_state_changing || actual_agent != pruning_agent {
+            duduclaw_security::audit::append_tool_call_with_extras(
+                home_dir, pruning_agent, tool_name, "usage", true,
+                &[("usage_only", Value::Bool(true))],
+            );
+        }
+        // The existing tools/list_changed watcher now observes this restored
+        // name immediately, without waiting for the five-minute cache TTL.
+        duduclaw_core::tool_pruning::note_success(home_dir, pruning_agent, tool_name);
+    }
+
+    // ── WP6: channel-action → dashboard live feedback ──────────
+    // Everything this subprocess persists on behalf of a channel command
+    // (a cron routine, a memory write, a synthesised skill) is invisible to
+    // the dashboard until the operator reloads — and invisible reads as
+    // broken. Raise one whitelisted `events.db` row; the gateway's existing
+    // `spawn_events_db_poll` tail pushes it to every connected dashboard,
+    // which refetches the matching page. Best-effort: never affects `result`.
+    //
+    // The caller agent is resolved the same way the audit trail resolves it
+    // (`resolve_audit_agent` — a genuine agent-to-agent delegation is
+    // attributed to the real sender, a system/scheduler sender is not) and
+    // falls back to the memory write namespace, which is exactly the key
+    // `memory.db` rows are stored under and therefore exactly what
+    // MemoryBrowser filters on.
+    let feedback_agent = resolve_audit_agent(|| {
+        if ns_ctx.write_namespace.is_empty() {
+            default_agent.to_string()
+        } else {
+            ns_ctx.write_namespace.clone()
+        }
+    });
+    duduclaw_gateway::dashboard_feedback::emit_for_tool(
+        home_dir,
+        tool_name,
+        &arguments,
+        &result,
+        &feedback_agent,
+    )
+    .await;
+
+    jsonrpc_response(id, result)
+}
+
+/// Host-owned dependencies; the isolated adapter has exactly one call input.
+struct GatewayHandler<'a> {
+    id: &'a Value,
+    home_dir: &'a Path,
+    http: &'a reqwest::Client,
+    memory: &'a SqliteMemoryEngine,
+    default_agent: &'a str,
+    odoo: &'a OdooState,
+    ns_ctx: &'a crate::mcp_namespace::NamespaceContext,
+    daily_quota: &'a crate::mcp_memory_quota::DailyQuota,
+    caller_client_id: &'a str,
+    caller_is_admin: bool,
+    wiki_agent: &'a str,
+    record_actor: RecordActor<'a>,
+    google_caller: &'a super::google_identity_client::GoogleCaller,
+}
+impl GatewayHandler<'_> {
+    async fn execute(&self, call: duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall) -> Result<Value, Value> {
+        let valid = crate::mcp_isolation::current().is_some_and(|current|
+            current.context.record() == call.context().record() && current.agent == self.default_agent
+            && current.home == self.home_dir && crate::mcp_isolation::legacy_resource_handler(call.name()));
+        if !valid || duduclaw_mcp_boundary::authority::now_seconds()
+            .and_then(|now| call.context().verify_live(now)).is_err() {
+            return Ok(tool_error("無法確認這次操作的資源授權，已拒絕執行。"));
+        }
+        duduclaw_mcp_boundary::io_authority::scope(call.context().clone(), async {
+            if let Some(result) = crate::mcp_isolation::collections::execute(&call).await { return Ok(result); }
+            self.invoke(call.name(), call.arguments()).await
+        }).await
+    }
+
+    async fn invoke(&self, tool_name: &str, arguments: &Value) -> Result<Value, Value> {
+        // A connector can never reach an ambient credential selector in isolation.
+        if crate::mcp_isolation::current().is_some()
+            && duduclaw_mcp_boundary::tool_policy::policy(tool_name)
+                .is_some_and(|p| p.route == duduclaw_mcp_boundary::tool_policy::Route::Connector) {
+            return Ok(tool_error("隔離連線服務尚未就緒。"));
+        }
+        let Self { id, home_dir, http, memory, default_agent, odoo, ns_ctx, daily_quota,
+            caller_client_id, caller_is_admin, wiki_agent, record_actor, google_caller } = *self;
         Ok(match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
         "web_search" => handle_web_search(&arguments, http).await,
@@ -813,130 +996,6 @@ pub(crate) async fn handle_tools_call(
         _ => {
             return Err(jsonrpc_error(id, -32602, &format!("Unknown tool: {tool_name}")));
         }
-    }) }).await;
-    let result = match result {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-
-    let result = if GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
-        google_caller.finish(home_dir, default_agent, tool_name, result).await
-    } else {
-        result
-    };
-
-    // ── Tool call audit trail (L1 anti-hallucination) ──────────
-    // Use the actual EXECUTING agent's ID, not just default_agent verbatim.
-    // In a genuine agent-to-agent delegation, DUDUCLAW_DELEGATION_SENDER
-    // identifies the real caller; when it is a system/scheduler sender
-    // (goal-loop-driver / cron / heartbeat / autopilot / dashboard / webhook)
-    // it names who dispatched the work, not who is executing this tool call —
-    // see `resolve_audit_agent` (WP-A10 BUG-1 fix).
-    if isolated && is_state_changing {
-        duduclaw_security::audit::append_tool_call_with_extras(home_dir, default_agent, tool_name,
-            "isolated resource tool", !result.get("isError").and_then(Value::as_bool).unwrap_or(false),
-            &[("transport", serde_json::json!("isolated_mcp"))]);
-    } else if is_state_changing {
-        let success = !result
-            .get("isError")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let actual_agent = resolve_audit_agent(|| default_agent.to_string());
-        let params_summary = build_params_summary(tool_name, &arguments);
-        // R4 (TraceElephant): capture the tool's INPUT arguments, not just the
-        // outcome summary — masked (secret keys/values), size-capped, and
-        // skipped for read-only tool names inside the helper. Previously
-        // `append_tool_call_with_input` had zero production callers.
-        //
-        // B3b (GroundEval evidence source): also capture the tool's RESULT
-        // text — masked/capped inside the audit helper — so the B3 grounding
-        // pre-check in `dispatch_engine.rs` has evidence to compare an
-        // agent's claim against, instead of observing `ResultTextMissing`
-        // on every row.
-        //
-        // Fix-2 C1a (2026-08 grounding self-echo audit): tools on
-        // `duduclaw_core::grounding::SELF_ECHO_TOOL_NAMES` (tasks_complete,
-        // tasks_update, ...) return a response envelope that is
-        // substantially the caller's OWN input echoed back
-        // (`task_row_to_json`'s `result_summary`/`title`/`blocked_reason`
-        // fields ARE the `summary`/`title`/`reason` arguments just
-        // supplied). Capturing that as `result_text` let the B3 grounding
-        // pre-check compare an agent's claim against its own words and
-        // trivially pass every time — and, worse, a task JSON that happened
-        // to exceed the audit char cap could truncate exactly the echoed
-        // span and flip the verdict to a false reject. Skip `result_text`
-        // capture entirely for these tools; they still get the `input` +
-        // `success` audit fields like every other state-changing tool, only
-        // the grounding-evidence field is suppressed.
-        // P2-C: workspace answers carry file paths and file content; the
-        // audit row keeps only the argument summary (no result text).
-        let result_text_for_grounding = if duduclaw_core::grounding::is_self_echo_tool(tool_name)
-            || tool_name == "credential_declare"
-            || crate::mcp_dispatch::COMPUTER_WORKSPACE_TOOLS.contains(&tool_name)
-        {
-            None
-        } else {
-            audit_result_text(tool_name, &result)
-        };
-        // `computer_type`'s text never reaches the audit (F5): only its length.
-        let audit_arguments = audit_safe_arguments(tool_name, &arguments);
-        duduclaw_security::audit::append_tool_call_with_input(
-            home_dir,
-            &actual_agent,
-            tool_name,
-            &params_summary,
-            success,
-            Some(&audit_arguments),
-            result_text_for_grounding.as_deref(),
-        );
+    })
     }
-
-    // Read-only tools need usage evidence too. Do not retain arguments or
-    // results here; state-changing calls already have their canonical audit.
-    let pruning_success = !result.get("isError").and_then(Value::as_bool).unwrap_or(false);
-    if pruning_success {
-        let actual_agent = resolve_audit_agent(|| default_agent.to_string());
-        let pruning_agent = acting_agent_id(caller_client_id, default_agent);
-        if !is_state_changing || actual_agent != pruning_agent {
-            duduclaw_security::audit::append_tool_call_with_extras(
-                home_dir, pruning_agent, tool_name, "usage", true,
-                &[("usage_only", Value::Bool(true))],
-            );
-        }
-        // The existing tools/list_changed watcher now observes this restored
-        // name immediately, without waiting for the five-minute cache TTL.
-        duduclaw_core::tool_pruning::note_success(home_dir, pruning_agent, tool_name);
-    }
-
-    // ── WP6: channel-action → dashboard live feedback ──────────
-    // Everything this subprocess persists on behalf of a channel command
-    // (a cron routine, a memory write, a synthesised skill) is invisible to
-    // the dashboard until the operator reloads — and invisible reads as
-    // broken. Raise one whitelisted `events.db` row; the gateway's existing
-    // `spawn_events_db_poll` tail pushes it to every connected dashboard,
-    // which refetches the matching page. Best-effort: never affects `result`.
-    //
-    // The caller agent is resolved the same way the audit trail resolves it
-    // (`resolve_audit_agent` — a genuine agent-to-agent delegation is
-    // attributed to the real sender, a system/scheduler sender is not) and
-    // falls back to the memory write namespace, which is exactly the key
-    // `memory.db` rows are stored under and therefore exactly what
-    // MemoryBrowser filters on.
-    let feedback_agent = resolve_audit_agent(|| {
-        if ns_ctx.write_namespace.is_empty() {
-            default_agent.to_string()
-        } else {
-            ns_ctx.write_namespace.clone()
-        }
-    });
-    duduclaw_gateway::dashboard_feedback::emit_for_tool(
-        home_dir,
-        tool_name,
-        &arguments,
-        &result,
-        &feedback_agent,
-    )
-    .await;
-
-    jsonrpc_response(id, result)
 }

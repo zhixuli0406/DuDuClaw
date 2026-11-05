@@ -5,6 +5,7 @@ pub mod command;
 mod windows_job;
 pub mod local;
 pub mod selection;
+pub mod workspace;
 #[cfg(target_os = "linux")]
 pub mod spawnd;
 

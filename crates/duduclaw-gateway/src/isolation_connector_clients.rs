@@ -86,6 +86,10 @@ tokio::task_local! {
     static CLIENT_POLICY: Arc<NativeClientPolicy>;
 }
 pub(crate) fn active() -> bool { BOUND_CONNECTOR.try_with(|_| ()).is_ok() }
+pub(crate) fn client_builder() -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    if active() { builder.no_proxy().retry(reqwest::retry::never()) } else { builder }
+}
 pub(crate) fn redirects() -> reqwest::redirect::Policy {
     if active() { reqwest::redirect::Policy::none() } else { reqwest::redirect::Policy::default() }
 }
@@ -111,7 +115,7 @@ pub(crate) fn before_request(provider: &str, url: &str) -> Result<(), &'static s
             "github" => url.host_str() == Some("api.github.com"),
             _ => false,
         };
-        if allowed { Ok(()) } else { Err(REFUSED) }
+        if allowed { selected.recheck().map_err(|_| REFUSED) } else { Err(REFUSED) }
     }).unwrap_or(Ok(()))
 }
 
@@ -151,15 +155,19 @@ impl NativeClientPolicy {
                 else { Err(VerificationError::Unavailable) };
         }
         if !crate::google_workspace::integration_enabled(&self.home) { return Err(VerificationError::Unavailable); }
-        let agent = duduclaw_core::agent_toml::read_effective_text(&self.home.join("agents").join(&self.agent))
+        let agent_dir = crate::ephemeral::resolve_agent_dir(&self.home, &self.agent).or_else(||
+            (!crate::ephemeral::is_ephemeral_id(&self.agent)).then(|| self.home.join("agents").join(&self.agent)))
+            .ok_or(VerificationError::Unavailable)?;
+        let agent = duduclaw_core::agent_toml::read_effective_text(&agent_dir)
             .map_err(|_| VerificationError::Unavailable)?;
         let effective = duduclaw_core::google_identity::combine(
             &duduclaw_core::google_identity::parse_agent_section(&agent),
             &duduclaw_core::google_identity::parse_home_config(&raw));
-        // The bound native account replaces credential selection, not consent.
-        // Legacy delegated/personal selectors require their dedicated requester,
-        // license and consent receipts; this adapter does not bypass those gates.
-        if !matches!(effective.effective, duduclaw_core::google_identity::Effective::Home) {
+        // SelectedConnector rechecks the installed product policy, including
+        // personal requester/consent and shared-home selection, before every I/O.
+        // Do not erase Personal parity by imposing the old home-only selector.
+        if matches!(effective.effective, duduclaw_core::google_identity::Effective::Disabled
+            | duduclaw_core::google_identity::Effective::Invalid(_)) {
             return Err(VerificationError::Unavailable);
         }
         Ok(())
@@ -232,11 +240,12 @@ impl BoundConnectorExecutor for NativeConnectorExecutor {
     fn execute<'a>(&'a self, selected: SelectedConnector, call: AuthorizedToolCall)
         -> Pin<Box<dyn Future<Output = Result<Value, VerificationError>> + Send + 'a>> {
         Box::pin(async move {
+            selected.verify_call(&call)?;
             if !self.supports(call.name()) || selected.context().record() != call.context().record()
                 || provider_for_tool(call.name()) != Some(selected.provider())
                 || !call.resources().iter().any(|r| matches!(r,
                     duduclaw_isolation::capability::ResourceGrant::Connector { account, binding }
-                    if account.as_str() == selected.account() && binding == &call.context().record().employee_binding)) {
+                    if account.as_str() == selected.account() && binding == selected.binding())) {
                 return Err(VerificationError::BindingMismatch);
             }
             selected.recheck()?;

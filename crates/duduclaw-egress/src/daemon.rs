@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, fs::File, io::Read, os::{fd::{AsRawFd, FromRawF
 use duduclaw_isolation::{bounded::List, egress::*, ids::{RunId, EGRESS_CONTROL_SOCKET, EGRESS_USER}, ipc::{self, Envelope}};
 use serde::Deserialize;
 use tokio::task::JoinSet;
-use crate::{budget::{RunBudget, RunCaps, default_limits}, resolver::{HostResolver, DNS_BROKER_SOCKET}, session::serve_run_cancel, transport::{CheckedSocket, socket_info}};
+use crate::{budget::{RunBudget, RunCaps, default_limits}, resolver::{HostResolver, DNS_BROKER_SOCKET}, session::serve_run_limited, transport::{CheckedSocket, socket_info}};
 
 pub const CONFIG_PATH: &str = "/etc/duduclaw/egress.json";
 pub const BROKER_CONFIG_PATH: &str = "/etc/duduclaw/dns-broker.json";
@@ -21,6 +21,10 @@ impl Config {
         if self.max_runs == 0 || self.max_runs > 128 || self.profiles.as_slice().is_empty() { return Err(EgressError::ResourceLimit); }
         for (index, profile) in self.profiles.as_slice().iter().enumerate() {
             profile.validate().map_err(|_| EgressError::InvalidRequest)?;
+            if u32::from(self.max_runs).checked_mul(u32::from(profile.limits.max_tunnels.get()))
+                .is_none_or(|total| total > crate::budget::MAX_CONFIGURED_TUNNELS) {
+                return Err(EgressError::ResourceLimit);
+            }
             if profile.limits.max_tunnels.get() > 256 || profile.limits.max_frame_bytes.get() < 256
                 || self.profiles.as_slice().iter().take(index).any(|p| p.id == profile.id) { return Err(EgressError::InvalidRequest); }
         }
@@ -112,6 +116,7 @@ pub async fn serve_control(control: CheckedSocket, config: &Config) -> Result<()
     let mut tasks = JoinSet::new();
     let mut runs: BTreeMap<RunId, (tokio::sync::watch::Sender<bool>, tokio::sync::oneshot::Receiver<()>)> = BTreeMap::new();
     let resolver = Arc::new(HostResolver::new());
+    let global = Arc::new(tokio::sync::Semaphore::new(crate::budget::MAX_GLOBAL_TUNNELS));
     let mut packets = vec![0; ipc::MAX_FRAME_BYTES + 4];
     let mut limits = default_limits();
     limits.frames_per_second = 100.try_into().unwrap();
@@ -151,8 +156,9 @@ pub async fn serve_control(control: CheckedSocket, config: &Config) -> Result<()
                     let profile = profile.clone();
                     let caps = config.run_caps;
                     let resolver = resolver.clone();
+                    let global = global.clone();
                     tasks.spawn(async move {
-                        let audit = serve_run_cancel(socket, run_id, profile, caps, resolver, receiver).await;
+                        let audit = serve_run_limited(socket, run_id, profile, caps, resolver, receiver, global).await;
                         let _ = done.send(());
                         audit
                     });

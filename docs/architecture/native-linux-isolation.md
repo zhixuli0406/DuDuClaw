@@ -4,6 +4,21 @@ This note records implementation boundaries for native Linux employee isolation.
 Source migration, compilation, protocol fixtures, native acceptance and deployment
 are separate gates. Nothing in this note is production isolation acceptance.
 
+**Current security revision (2026-11-05): PARTIAL / NO-GO.** Capability signing
+uses contract v2; missing adapters and unsupported finite grant modes fail
+startup. See the [per-item security-fix report](native-linux-isolation-security-fixes-2026-11-05.md)
+for current changes, test evidence and remaining integration work. Earlier
+acceptance results below do not verify this revision.
+
+Round 2 carries file authorization through table/worker snapshot and checked
+transport, including a cancellation marker for a dropped async invocation.
+Execution backends must implement the authorized-workspace handoff. Round 3 adds
+SpawndBackend's explicit trusted RootWorkspaceBridge hookup; its production
+receipt producer is not installed by default, so protected MCP execution remains
+unavailable. The installer can build and read back a minimal parse runtime tree
+from a recorded signed generation; first bootstrap and generation replacement
+still need coordinator integration. See the report for scoped build results.
+
 ## Package A
 
 ### Round 2 handoff (2026-11-05)
@@ -2422,9 +2437,18 @@ again under the mutex before activation or authorization.
 `revoke_run`, `revoke_control` and `revoke_all` cover cancellation, control loss
 and shutdown. The pending sweep detects unused-reservation expiry and terminal
 or unavailable runs. Capability expiry removes storage on the next issuance;
-records are capped at 4096 per epoch. Drop revokes connection authority. A live
-server rechecks every 100 ms while idle or awaiting a handler; this polling is a
-backstop, not permission for A to omit explicit lifecycle revocation.
+records are capped at 4096 per epoch. Drop revokes connection authority. Each
+entry owns a sticky watch channel. Every revocation path publishes immediately;
+the server selects it before polling handlers, input or output and drops the
+in-flight future on notification. The 100 ms live-store poll remains a backup;
+A's lifecycle and policy owners must still publish explicit revocation.
+
+`RequestContext::verify_live` uses a boundary-owned weak verifier bound to the
+exact record and active connection nonce. It re-reads run/control, principal,
+binding and policy authority before irreversible adapter I/O. Record-only
+contexts fail closed. `SelectedConnector::recheck` invokes this verifier before
+its account/binding checks, including the existing credential and HTTP retry
+checks. An already-sent remote effect cannot be rolled back by cancellation.
 
 `gateway::isolation_mcp::McpBoundaryService` supplies a one-second lifecycle
 sweep, attachment entry point and `McpRunSession` guard. Dropping the guard

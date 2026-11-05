@@ -393,7 +393,6 @@ fn isolated_file_read(arguments: &Value, home_dir: &Path, agent_id: &str,
     if object.keys().any(|key| !matches!(key.as_str(), "workspace" | "path" | "max_bytes")) {
         return fail();
     }
-    let handle = arg_str(arguments, "workspace");
     let raw_path = arg_str(arguments, "path");
     let path = match duduclaw_mcp_boundary::resources::relative_path(raw_path) {
         Ok(path) => path, Err(_) => return fail(),
@@ -401,7 +400,7 @@ fn isolated_file_read(arguments: &Value, home_dir: &Path, agent_id: &str,
     if structured_extension(path).is_some() {
         return files_error("此工具只讀純文字；請以 csv_read 或 xlsx_read 讀取結構化資料檔。");
     }
-    let file = match call.roots.open_read(&call.context, handle, raw_path) {
+    let (_, file) = match call.roots.authorize_file(&call.context, "file_read", arguments) {
         Ok(file) => file, Err(_) => return fail(),
     };
     let total = match file.metadata() { Ok(metadata) => metadata.len(), Err(_) => return fail() };
@@ -443,7 +442,7 @@ fn read_prefix(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
 /// authorized fd to E instead of invoking a parser with the gateway's identity.
 pub async fn handle_isolated_table_read(tool: &str, arguments: &Value,
     home_dir: &Path, agent_id: &str) -> Value {
-    use duduclaw_mcp_boundary::parsing::{TableKind, TableOptions, table_request, decode_table_response};
+    use duduclaw_mcp_boundary::parsing::{TableKind, TableOptions, authorized_table_request, decode_table_response};
     let fail = || files_error("無法解析這次執行授權範圍內的資料檔。");
     let Some(call) = crate::mcp_isolation::current() else { return fail(); };
     let Some(parser) = call.parser.as_ref() else { return fail(); };
@@ -468,12 +467,12 @@ pub async fn handle_isolated_table_read(tool: &str, arguments: &Value,
     let path = match duduclaw_mcp_boundary::resources::relative_path(raw_path) {
         Ok(path) => path, Err(_) => return fail(),
     };
-    let input = match call.roots.open_read(&call.context, arg_str(arguments, "workspace"), raw_path) {
+    let (authorized, input) = match call.roots.authorize_file(&call.context, tool, arguments) {
         Ok(input) => input, Err(_) => return fail(),
     };
-    let request = match table_request(&input, &options) { Ok(request) => request, Err(_) => return fail() };
+    let request = match authorized_table_request(&input, &options) { Ok(request) => request, Err(_) => return fail() };
     let response = match tokio::time::timeout(std::time::Duration::from_secs(30),
-        parser.parse(call.context.clone(), request.clone(), input, options.clone())).await {
+        parser.parse(authorized, request.clone(), input, options.clone())).await {
         Ok(Ok(response)) => response, _ => return fail(),
     };
     let mut payload = match decode_table_response(&request, &options, response) {

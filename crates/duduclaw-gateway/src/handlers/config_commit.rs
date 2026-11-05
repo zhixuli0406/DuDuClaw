@@ -142,6 +142,7 @@ pub(crate) fn toml_at_json(table: &toml::Table, path: &str) -> Value {
 /// not even for the moment between create and chmod.
 pub(crate) fn write_owner_only(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write;
+    verify_live_io()?;
     let _ = std::fs::remove_file(path);
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -364,6 +365,7 @@ fn commit_rendered_policy(path:&Path,expected_hash:&str,render:impl FnOnce(&str)
 }
 fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>)->Result<(),String> {
     let outcome = duduclaw_core::with_file_lock(path, || {
+        verify_live_io()?;
         let current = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -427,6 +429,7 @@ fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)-
                     let mut temporary=tempfile::NamedTempFile::new_in(parent).map_err(|e|e.to_string())?;
                     temporary.write_all(new_content.as_bytes()).and_then(|_|temporary.as_file().sync_all()).map_err(|e|e.to_string())?;
                     observer(temporary.as_file())?;
+                    verify_live_io().map_err(|e| e.to_string())?;
                     temporary.persist(path).map_err(|e|e.to_string())?;
                     std::fs::File::open(parent).and_then(|f|f.sync_all()).map_err(|e|e.to_string())
                 } else {replace_owner_only(path, &new_content).map_err(|e| e.to_string())}
@@ -545,11 +548,16 @@ fn changed_on_disk(path: &Path) -> String {
 /// whole file name (`SOUL.md.tmp`, `agent.toml.tmp`); it used to swap the
 /// extension for `toml.tmp`, which named a Markdown file's temp copy
 /// `SOUL.toml.tmp`.
+fn verify_live_io() -> std::io::Result<()> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string()))
+}
+
 pub(crate) fn replace_owner_only(path: &Path, content: &str) -> std::io::Result<()> {
     fence_isolation_policy_path(path)?;
     let tmp = tmp_path_for(path);
     write_owner_only(&tmp, content)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(e) = verify_live_io().and_then(|_| std::fs::rename(&tmp, path)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }

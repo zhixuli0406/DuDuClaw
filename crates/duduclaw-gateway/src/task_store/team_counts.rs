@@ -31,6 +31,7 @@ impl TaskStore {
         }
         let names_json = serde_json::to_string(&names).map_err(|e| e.to_string())?;
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(
                 "SELECT assigned_to, COUNT(*) FROM tasks

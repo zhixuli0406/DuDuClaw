@@ -56,15 +56,15 @@ impl TaskStore {
         ledger: &IterationDispatchLedger,
     ) -> Result<(), String> {
         let mut conn = self.conn.lock().await;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("iteration dispatch: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         let previous_dispatches: i64 = tx.query_row(
             "SELECT COALESCE(SUM(dispatch_count),0) FROM task_iterations WHERE task_id=?1",
             params![task_id], |r| r.get(0),
         ).map_err(|e| format!("iteration dispatch: count prior dispatches: {e}"))?;
         iter_dispatch_conn(&tx, task_id, round, now, state_hash, repeat_streak, ledger)?;
         record_survival_difficulty_conn(&tx, task_id, previous_dispatches, ledger)?;
-        tx.commit().map_err(|e| format!("iteration dispatch: commit: {e}"))
+        commit_live_write(tx)
     }
 
     /// A1: stamp the two-stage pre-evaluator's verdict on the round that is
@@ -76,7 +76,9 @@ impl TaskStore {
         task_id: &str,
         evaluator_verdict: &str,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let row_id: Option<i64> = conn
             .query_row(
                 "SELECT id FROM task_iterations
@@ -94,6 +96,7 @@ impl TaskStore {
             )
             .map_err(|e| format!("iter evaluator update: {e}"))?;
         }
+        commit_live_write(conn)?;
         Ok(())
     }
 
@@ -105,9 +108,8 @@ impl TaskStore {
     pub async fn set_criteria_ledger(&self, task_id: &str, ledger_json: &str) -> Result<(), String> {
         require_safe_contract(ledger_json)?;
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("criteria ledger: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         tx.execute(
             "UPDATE tasks SET criteria_ledger = ?2 WHERE id = ?1",
             params![task_id, ledger_json],
@@ -130,7 +132,7 @@ impl TaskStore {
             )
             .map_err(|e| format!("criteria ledger: round snapshot: {e}"))?;
         }
-        tx.commit().map_err(|e| format!("criteria ledger: commit: {e}"))
+        commit_live_write(tx)
     }
 
     /// WP-G2: replace the stored worker reply with its tag-stripped form
@@ -147,7 +149,9 @@ impl TaskStore {
         expected: &str,
         replacement: &str,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let n = conn
             .execute(
                 "UPDATE tasks SET result_summary = ?3
@@ -155,6 +159,7 @@ impl TaskStore {
                 params![task_id, expected, mask_derived_text(replacement)],
             )
             .map_err(|e| format!("rewrite result_summary: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n > 0)
     }
 
@@ -164,6 +169,7 @@ impl TaskStore {
         task_id: &str,
     ) -> Result<Vec<(i64, Option<String>)>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(
                 "SELECT round, criteria_ledger_json FROM task_iterations
@@ -182,7 +188,9 @@ impl TaskStore {
     /// verdict; never overwrites a pause class already on the row. No row ⇒
     /// no-op. Pure bookkeeping: callers log and ignore errors.
     pub async fn stamp_iteration_pause(&self, task_id: &str, pause: &str) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         conn.execute(
             "UPDATE task_iterations SET pause_reason = ?2
               WHERE id = (SELECT id FROM task_iterations WHERE task_id = ?1
@@ -191,12 +199,14 @@ impl TaskStore {
             params![task_id, mask_derived_text(pause)],
         )
         .map_err(|e| format!("iter pause stamp: {e}"))?;
+        commit_live_write(conn)?;
         Ok(())
     }
 
     /// All iteration rows for a task, oldest round first (the revision timeline).
     pub async fn list_iterations(&self, task_id: &str) -> Result<Vec<TaskIterationRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         list_iterations_conn(&conn, task_id)
     }
 

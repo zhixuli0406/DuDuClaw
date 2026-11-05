@@ -93,6 +93,7 @@ fn parse_tokens(body: Value, captured_scopes: &[String], now: u64) -> Result<Res
 }
 fn client(budget: ResolveBudget<'_>) -> Result<reqwest::Client> {
     let builder = match budget {
+        ResolveBudget::Legacy if duduclaw_mcp_boundary::io_authority::is_scoped() => reqwest::Client::builder().no_proxy(),
         ResolveBudget::Legacy => reqwest::Client::builder(),
         ResolveBudget::Remote(..) | ResolveBudget::Preflight(_, _) => {
             reqwest::Client::builder().no_proxy()

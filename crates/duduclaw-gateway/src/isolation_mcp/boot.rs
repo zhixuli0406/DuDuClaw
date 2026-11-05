@@ -7,14 +7,15 @@ use duduclaw_mcp_boundary::{bindings::BindingAuthority, execution::ExecutionPlan
 use duduclaw_parse_worker::client::WorkerLauncher;
 use super::{Dispatcher, GrantPolicy, LiveAuthority, McpBoundaryService, ProtectedMcpLaunch,
     RuntimeBridgeRegistry, VerificationError};
-use crate::{isolation_connectors::{BoundConnectorExecutor, ConnectorCatalog},
+use crate::{isolation_connectors::{BoundConnectorExecutor, ConnectorCatalog, LiveConnectorSelectionPolicy},
     isolation_egress::RunTurnResolver, isolation_resources::GatewayResourceResolver};
 
 /// CLI supplies its adapter before start_gateway. The gateway owns every input;
 /// the adapter must authenticate its original dispatcher and check completeness.
 pub trait DispatcherFactory: Send + Sync {
     fn create(&self, input: DispatcherInput) -> Result<Arc<dyn Dispatcher>, VerificationError>;
-    fn verify_producers(&self, _execution: &dyn ExecutionPlanFactory, _worker: &dyn WorkerPlanFactory)
+    fn verify_producers(&self, _execution: &dyn ExecutionPlanFactory, _worker: &dyn WorkerPlanFactory,
+        _connectors: &dyn BoundConnectorExecutor, _selection: &dyn LiveConnectorSelectionPolicy)
         -> Result<(), VerificationError> { Err(VerificationError::Unavailable) }
     /// Snapshot the real product catalog under the employee's current policy.
     /// Completeness is still checked independently when creating a dispatcher.
@@ -53,12 +54,13 @@ pub struct BootSources {
     pub turns: Option<Arc<dyn RunTurnResolver>>,
     pub connector_catalog: Option<Arc<ConnectorCatalog>>,
     pub connectors: Option<Arc<dyn BoundConnectorExecutor>>,
+    pub connector_selection: Option<Arc<dyn LiveConnectorSelectionPolicy>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MissingProducer {
     Backend, LiveAuthority, DurableBindings, RuntimePublication, ExecutionPlans,
-    WorkerRetirement, WorkerPlans, TurnAuthority, Dispatcher, WorkerIntegration, MainPlans, Initialization,
+    WorkerRetirement, WorkerPlans, TurnAuthority, Dispatcher, WorkerIntegration, MainPlans, ConnectorProviders, Initialization,
 }
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct BootStatus {
@@ -121,6 +123,8 @@ fn missing(sources: &BootSources, dispatcher: bool, backend: bool, worker: bool)
         (sources.worker_launcher.is_some(), MissingProducer::WorkerRetirement),
         (sources.worker_plans.is_some(), MissingProducer::WorkerPlans),
         (sources.turns.is_some(), MissingProducer::TurnAuthority),
+        (sources.connector_catalog.is_some() && sources.connectors.is_some()
+            && sources.connector_selection.is_some(), MissingProducer::ConnectorProviders),
         (dispatcher, MissingProducer::Dispatcher), (worker, MissingProducer::WorkerIntegration)] {
         if !present { absent.push(producer); }
     }
@@ -217,6 +221,7 @@ struct BootOwner {
     turns: Arc<dyn RunTurnResolver>,
     catalog: Option<Arc<ConnectorCatalog>>,
     connectors: Option<Arc<dyn BoundConnectorExecutor>>,
+    connector_selection: Option<Arc<dyn LiveConnectorSelectionPolicy>>,
 }
 
 /// D proves its live owner and the binary's actual complete routing inventory.
@@ -230,7 +235,10 @@ impl crate::isolation_readiness::IntegrationProbe for BoundaryReadiness {
             return Err(ProbeError::Unavailable);
         }
         DISPATCHER.get().ok_or(ProbeError::Unavailable)?.verify_producers(
-            owner.execution_plans.as_ref(), owner.worker_plans.as_ref()).map_err(|_| ProbeError::Unavailable)
+            owner.execution_plans.as_ref(), owner.worker_plans.as_ref(),
+            owner.connectors.as_deref().ok_or(ProbeError::Unavailable)?,
+            owner.connector_selection.as_deref().ok_or(ProbeError::Unavailable)?)
+            .map_err(|_| ProbeError::Unavailable)
     }
     fn verify_service(&self, generation: duduclaw_isolation::ids::Sha256Digest)
         -> Result<crate::isolation_readiness::ServiceObservation, crate::isolation_readiness::ProbeError> {
@@ -312,6 +320,12 @@ pub(crate) fn delegation_source(home: &Path, sender: &str, context: &duduclaw_mc
 fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut sources: BootSources)
     -> Result<BootOwner, VerificationError> {
     if !home.is_absolute() { return Err(VerificationError::Invalid); }
+    if sources.connector_catalog.is_none() { return Err(VerificationError::Unavailable); }
+    DISPATCHER.get().ok_or(VerificationError::Unavailable)?.verify_producers(
+        sources.execution_plans.as_deref().ok_or(VerificationError::Unavailable)?,
+        sources.worker_plans.as_deref().ok_or(VerificationError::Unavailable)?,
+        sources.connectors.as_deref().ok_or(VerificationError::Unavailable)?,
+        sources.connector_selection.as_deref().ok_or(VerificationError::Unavailable)?)?;
     let bindings = sources.bindings.take().ok_or(VerificationError::Unavailable)?;
     let run_policy = sources.authority.take().ok_or(VerificationError::Unavailable)?;
     let live: Arc<dyn LiveAuthority> = if sources.product_authority.is_some() { run_policy }
@@ -326,7 +340,8 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
         execution_plans: sources.execution_plans.take().ok_or(VerificationError::Unavailable)?,
         worker_plans: sources.worker_plans.take().ok_or(VerificationError::Unavailable)?,
         turns: sources.turns.take().ok_or(VerificationError::Unavailable)?,
-        catalog: sources.connector_catalog, connectors: sources.connectors })
+        catalog: sources.connector_catalog, connectors: sources.connectors,
+        connector_selection: sources.connector_selection })
 }
 
 pub(super) async fn claude_plan(home: PathBuf, agent: String, class: duduclaw_isolation::execution::ExecutionClass,
@@ -389,6 +404,7 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
     }).await?;
     let mut resolver = GatewayResourceResolver::new(owner.home.clone(), input.plan.employee, input.agent.clone(), owner.bindings.clone())?;
     if let Some(catalog) = &owner.catalog { resolver = resolver.with_connector_catalog(catalog.clone()); }
+    if let Some(selection) = &owner.connector_selection { resolver = resolver.with_connector_selection_policy(selection.clone()); }
     let resolver = Arc::new(resolver);
     #[cfg(feature = "isolation-worker-integration")]
     {
@@ -423,7 +439,8 @@ mod tests {
         let absent = missing(&BootSources::default(), true, true, true);
         for producer in [MissingProducer::LiveAuthority, MissingProducer::DurableBindings,
             MissingProducer::RuntimePublication, MissingProducer::MainPlans, MissingProducer::ExecutionPlans, MissingProducer::WorkerRetirement,
-            MissingProducer::WorkerPlans, MissingProducer::TurnAuthority] { assert!(absent.contains(&producer)); }
+            MissingProducer::WorkerPlans, MissingProducer::TurnAuthority,
+            MissingProducer::ConnectorProviders] { assert!(absent.contains(&producer)); }
         assert!(!absent.contains(&MissingProducer::Dispatcher));
     }
     #[test]
@@ -432,5 +449,19 @@ mod tests {
         assert!(absent.contains(&MissingProducer::Backend));
         assert!(absent.contains(&MissingProducer::Dispatcher));
         assert!(absent.contains(&MissingProducer::WorkerIntegration));
+    }
+    #[test]
+    fn isolation_boot_requires_catalog_execution_and_live_selection_together() {
+        let registry = Arc::new(crate::isolation_connector_registry::ConnectorProviderRegistry::default());
+        let mut sources = BootSources::default();
+        sources.connector_catalog = Some(Arc::new(ConnectorCatalog::new(
+            rusqlite::Connection::open_in_memory().unwrap()).unwrap()));
+        sources.connectors = Some(registry.clone());
+        assert!(missing(&sources, true, true, true).contains(&MissingProducer::ConnectorProviders));
+        sources.connector_selection = Some(registry);
+        // Presence is only the first gate; assemble separately checks every tool.
+        assert!(!missing(&sources, true, true, true).contains(&MissingProducer::ConnectorProviders));
+        sources.connectors = None;
+        assert!(missing(&sources, true, true, true).contains(&MissingProducer::ConnectorProviders));
     }
 }

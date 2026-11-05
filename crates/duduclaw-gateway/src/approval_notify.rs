@@ -439,6 +439,7 @@ async fn push_dashboard_only(
         else {
             continue;
         };
+        if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return None; }
         if crate::channel_sender::send_plain_text(
             home_dir, &http, &channel, &token, &chat_id, &text,
         )

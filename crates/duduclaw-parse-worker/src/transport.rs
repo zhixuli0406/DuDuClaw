@@ -9,14 +9,22 @@ use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use duduclaw_isolation::{ipc, worker::{ParseError, MAX_WORKER_FRAME_BYTES}};
 
 pub fn wait(fd: &impl AsFd, events: PollFlags, deadline: Instant) -> Result<(), ParseError> {
+    wait_checked(fd, events, deadline, &|| Ok(()))
+}
+
+/// A blocking pool job cannot be cancelled by dropping its async join handle.
+/// Bound each poll so live authority is checked even if no peer event arrives.
+pub fn wait_checked(fd: &impl AsFd, events: PollFlags, deadline: Instant,
+    verify: &dyn Fn() -> Result<(), ParseError>) -> Result<(), ParseError> {
     loop {
+        verify()?;
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() { return Err(ParseError::Timeout); }
-        let millis = i32::try_from(left.as_millis().saturating_add(1)).unwrap_or(i32::MAX);
+        let millis = left.as_millis().saturating_add(1).min(50) as u16;
         let mut fds = [PollFd::new(fd.as_fd(), events)];
-        match poll(&mut fds, u16::try_from(millis).unwrap_or(u16::MAX)) {
-            Ok(0) => return Err(ParseError::Timeout),
-            Ok(_) if fds[0].revents().is_some_and(|flags| flags.contains(events)) => return Ok(()),
+        match poll(&mut fds, millis) {
+            Ok(0) => continue,
+            Ok(_) if fds[0].revents().is_some_and(|flags| flags.contains(events)) => { verify()?; return Ok(()); },
             Ok(_) => return Err(ParseError::Unavailable),
             Err(nix::errno::Errno::EINTR) => continue,
             Err(_) => return Err(ParseError::Unavailable),
@@ -25,12 +33,18 @@ pub fn wait(fd: &impl AsFd, events: PollFlags, deadline: Instant) -> Result<(), 
 }
 
 pub fn send(fd: &impl AsFd, payload: &[u8], files: &[File], deadline: Instant) -> Result<(), ParseError> {
+    send_checked(fd, payload, files, deadline, &|| Ok(()))
+}
+
+pub fn send_checked(fd: &impl AsFd, payload: &[u8], files: &[File], deadline: Instant,
+    verify: &dyn Fn() -> Result<(), ParseError>) -> Result<(), ParseError> {
     let frame = ipc::frame_payload(payload).map_err(|_| ParseError::LimitExceeded)?;
     let raw: Vec<_> = files.iter().map(AsRawFd::as_raw_fd).collect();
     if raw.len() > 24 { return Err(ParseError::InvalidContent); }
-    wait(fd, PollFlags::POLLOUT, deadline)?;
+    wait_checked(fd, PollFlags::POLLOUT, deadline, verify)?;
     let ancillary = [ControlMessage::ScmRights(&raw)];
     let messages = if raw.is_empty() { &[][..] } else { &ancillary[..] };
+    verify()?;
     let written = sendmsg::<()>(fd.as_fd().as_raw_fd(), &[IoSlice::new(&frame)], messages,
         MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT, None).map_err(|_| ParseError::Unavailable)?;
     if written != frame.len() { return Err(ParseError::Unavailable); }
@@ -41,7 +55,13 @@ pub fn send(fd: &impl AsFd, payload: &[u8], files: &[File], deadline: Instant) -
 /// unowned. Use recvmsg here so even a truncated ancillary set is closed first.
 #[allow(unsafe_code)]
 pub fn receive(fd: &impl AsFd, max_fds: usize, deadline: Instant) -> Result<(Vec<u8>, Vec<File>), ParseError> {
-    wait(fd, PollFlags::POLLIN, deadline)?;
+    receive_checked(fd, max_fds, deadline, &|| Ok(()))
+}
+
+#[allow(unsafe_code)]
+pub fn receive_checked(fd: &impl AsFd, max_fds: usize, deadline: Instant,
+    verify: &dyn Fn() -> Result<(), ParseError>) -> Result<(Vec<u8>, Vec<File>), ParseError> {
+    wait_checked(fd, PollFlags::POLLIN, deadline, verify)?;
     let mut bytes = vec![0u8; MAX_WORKER_FRAME_BYTES + 4];
     // Linux SCM_MAX_FD = 253. Leave space for credentials/unknown ancillary data.
     let mut control = [0usize; 512];
@@ -54,6 +74,7 @@ pub fn receive(fd: &impl AsFd, max_fds: usize, deadline: Instant) -> Result<(Vec
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr().cast();
         msg.msg_controllen = std::mem::size_of_val(&control);
+        verify()?;
         let count = libc::recvmsg(fd.as_fd().as_raw_fd(), &mut msg,
             libc::MSG_CMSG_CLOEXEC | libc::MSG_DONTWAIT);
         if count < 0 { return Err(ParseError::Unavailable); }
@@ -324,6 +345,52 @@ mod tests {
         corrupt.write_all(b"wrong!").unwrap();
         let input = snapshot(&mut &b"hello"[..]).unwrap();
         assert!(verified_outputs(&request, &response, vec![input, corrupt]).is_err());
+    }
+
+    #[test]
+    fn checked_send_revalidates_after_writable_poll_before_fd_delivery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (sender, receiver) = pair();
+        let checks = AtomicUsize::new(0);
+        let verify = || if checks.fetch_add(1, Ordering::SeqCst) < 2 { Ok(()) }
+            else { Err(ParseError::Unavailable) };
+        let input = snapshot(&mut &b"private input"[..]).unwrap();
+        assert_eq!(send_checked(&sender, b"{}", &[input], deadline(), &verify), Err(ParseError::Unavailable));
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
+        let mut buffer = [0; 32];
+        assert_eq!(nix::sys::socket::recv(receiver.as_raw_fd(), &mut buffer, MsgFlags::MSG_DONTWAIT),
+            Err(nix::errno::Errno::EAGAIN));
+    }
+
+    #[test]
+    fn checked_receive_revalidates_after_readable_poll_without_consuming_packet() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (sender, receiver) = pair();
+        send(&sender, b"{}", &[], deadline()).unwrap();
+        let checks = AtomicUsize::new(0);
+        let verify = || if checks.fetch_add(1, Ordering::SeqCst) < 2 { Ok(()) }
+            else { Err(ParseError::Unavailable) };
+        assert!(matches!(receive_checked(&receiver, 0, deadline(), &verify), Err(ParseError::Unavailable)));
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
+        assert_eq!(receive(&receiver, 0, deadline()).unwrap().0, b"{}");
+    }
+
+    #[test]
+    fn checked_receive_observes_revocation_while_peer_remains_silent() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let (_sender, receiver) = pair();
+        let live = Arc::new(AtomicBool::new(true));
+        let revoked = live.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            revoked.store(false, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let result = receive_checked(&receiver, 0, start + Duration::from_secs(5),
+            &|| if live.load(Ordering::SeqCst) { Ok(()) } else { Err(ParseError::Unavailable) });
+        thread.join().unwrap();
+        assert!(matches!(result, Err(ParseError::Unavailable)));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
 }

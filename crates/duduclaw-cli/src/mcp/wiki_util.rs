@@ -1,4 +1,5 @@
 use super::*;
+use duduclaw_mcp_boundary::io_authority::verify_before_io;
 
 /// Reserved wiki filenames that cannot be overwritten by wiki_write.
 pub(crate) const WIKI_RESERVED: &[&str] = &["_schema.md", "_index.md", "_log.md"];
@@ -92,6 +93,7 @@ pub(crate) fn resolve_wiki_dir(
         None => {
             let dir = home_dir.join("agents").join(agent_id);
             if !dir.exists() {
+                verify_before_io().map_err(|e| e.to_string())?;
                 std::fs::create_dir_all(&dir)
                     .map_err(|e| format!("Failed to create agent dir for '{}': {}", agent_id, e))?;
             }
@@ -182,6 +184,7 @@ pub(crate) fn ensure_wiki_dir(wiki_dir: &Path) -> std::result::Result<(), String
     for sub in &subdirs {
         let p = wiki_dir.join(sub);
         if !p.exists() {
+            verify_before_io().map_err(|e| e.to_string())?;
             std::fs::create_dir_all(&p)
                 .map_err(|e| format!("Failed to create {}: {e}", p.display()))?;
         }
@@ -190,6 +193,7 @@ pub(crate) fn ensure_wiki_dir(wiki_dir: &Path) -> std::result::Result<(), String
     // Create _schema.md if missing
     let schema_path = wiki_dir.join("_schema.md");
     if !schema_path.exists() {
+        verify_before_io().map_err(|e| e.to_string())?;
         std::fs::write(&schema_path, WIKI_DEFAULT_SCHEMA)
             .map_err(|e| format!("Failed to write _schema.md: {e}"))?;
     }
@@ -197,6 +201,7 @@ pub(crate) fn ensure_wiki_dir(wiki_dir: &Path) -> std::result::Result<(), String
     // Create _index.md if missing
     let index_path = wiki_dir.join("_index.md");
     if !index_path.exists() {
+        verify_before_io().map_err(|e| e.to_string())?;
         std::fs::write(
             &index_path,
             "# Wiki Index\n\n<!-- Auto-maintained by wiki_write. One entry per page. -->\n",
@@ -207,6 +212,7 @@ pub(crate) fn ensure_wiki_dir(wiki_dir: &Path) -> std::result::Result<(), String
     // Create _log.md if missing
     let log_path = wiki_dir.join("_log.md");
     if !log_path.exists() {
+        verify_before_io().map_err(|e| e.to_string())?;
         std::fs::write(
             &log_path,
             "# Wiki Log\n\n<!-- Append-only operation log. -->\n",
@@ -423,6 +429,7 @@ pub(crate) fn update_wiki_index(
     }
 
     let new_content = lines.join("\n") + "\n";
+    verify_before_io().map_err(|e| e.to_string())?;
     std::fs::write(&index_path, new_content).map_err(|e| format!("Failed to update _index.md: {e}"))
 }
 
@@ -437,11 +444,13 @@ pub(crate) fn append_wiki_log(
     let entry = format!("## [{}] {} | {}\n", now, action, page_path);
 
     use std::io::Write;
+    verify_before_io().map_err(|e| e.to_string())?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
         .map_err(|e| format!("Failed to open _log.md: {e}"))?;
+    verify_before_io().map_err(|e| e.to_string())?;
     f.write_all(entry.as_bytes())
         .map_err(|e| format!("Failed to append to _log.md: {e}"))?;
     Ok(())

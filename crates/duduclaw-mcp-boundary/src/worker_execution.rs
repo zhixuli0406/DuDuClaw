@@ -1,6 +1,6 @@
 //! Gateway-side E invocation. All content parsing remains behind the injected
 //! WorkerLauncher/WorkerSession transport; only bounded structured results return.
-use std::{fs::File, sync::Arc};
+use std::sync::Arc;
 use duduclaw_isolation::worker::{ParseRequest, ParseResponse, ParsedItem, ParseResult,
     MAX_WORKER_FRAME_BYTES, MAX_OUTPUT_BYTES};
 use serde_json::{Value, json};
@@ -9,10 +9,24 @@ use crate::{RequestContext, VerificationError, execution::PolicyFuture,
     tool_policy::{self, AuthorizedToolCall, ResourceResolver, Route}};
 
 pub struct WorkerPlan {
-    pub request: ParseRequest,
-    /// Already authorized with ResourceRoots or a host-owned bounded snapshot.
+    request: ParseRequest,
+    /// Already authorized by ResourceRoots for this call and selected file.
     /// Never reopened by pathname. E snapshots it after launcher admission.
-    pub input: File,
+    input: crate::resources::AuthorizedFile,
+}
+impl WorkerPlan {
+    pub fn new(request: ParseRequest, input: crate::resources::AuthorizedFile) -> Result<Self, VerificationError> {
+        let plan = Self { request, input };
+        validate_plan(&plan)?;
+        Ok(plan)
+    }
+    pub fn request(&self) -> &ParseRequest { &self.request }
+    /// Only the installed worker transport consumes this pair, after the bridge
+    /// has compared the token with the current call and checked the inode.
+    pub fn into_parts(self) -> Result<(ParseRequest, crate::resources::AuthorizedFile), VerificationError> {
+        self.input.verify_live()?;
+        Ok((self.request, self.input))
+    }
 }
 pub struct WorkerReply {
     pub response: ParseResponse,
@@ -60,22 +74,33 @@ impl WorkerToolBridge {
         if !self.supports(name) { return Err(VerificationError::Unavailable); }
         let call = tool_policy::authorize_async(context, name, arguments, self.resolver.clone()).await?;
         self.factory.authorize_handler(&call).await?;
-        let plan = self.factory.prepare(&call).await?;
+        let mut plan = self.factory.prepare(&call).await?;
         validate_plan(&plan)?;
+        plan.input.verify(&call)?;
         self.factory.authorize_handler(&call).await?;
         let checked = tool_policy::authorize_async(context, name, arguments, self.resolver.clone()).await?;
         if call.resources() != checked.resources() { return Err(VerificationError::BindingMismatch); }
+        plan.input.verify(&checked)?;
         let request = plan.request.clone();
         let invoke = self.invoke.clone();
+        let invocation = crate::resources::InvocationGuard::new();
+        plan.input.bind_invocation(&invocation)?;
         // A caller drop cannot detach authority from a worker: E retains its
         // launcher lease inside this blocking invocation until teardown.
-        let reply = tokio::task::spawn_blocking(move || invoke(plan)).await
+        let live = checked.context().clone();
+        let reply = tokio::task::spawn_blocking(move || {
+            live.verify_live(crate::authority::now_seconds()?)?;
+            plan.input.verify_live()?;
+            invoke(plan)
+        }).await
             .map_err(|_| VerificationError::Unavailable)??;
         validate_reply(&request, &reply)?;
         self.factory.authorize_handler(&checked).await?;
         let current = tool_policy::authorize_async(context, name, arguments, self.resolver.clone()).await?;
         if checked.resources() != current.resources() { return Err(VerificationError::BindingMismatch); }
-        let result = self.factory.finish(&current, reply).await?;
+        current.context().verify_live(crate::authority::now_seconds()?)?;
+        let result = crate::io_authority::scope(current.context().clone(),
+            self.factory.finish(&current, reply)).await?;
         if serde_json::to_vec(&result).map_err(|_| VerificationError::Invalid)?.len() > MAX_WORKER_FRAME_BYTES {
             return Err(VerificationError::Invalid);
         }
@@ -91,7 +116,7 @@ fn validate_plan(plan: &WorkerPlan) -> Result<(), VerificationError> {
         || plan.request.limits.wall_time_ms.get() > 30_000 {
         return Err(VerificationError::Invalid);
     }
-    let meta = plan.input.metadata().map_err(|_| VerificationError::Unavailable)?;
+    let meta = plan.input.metadata()?;
     if !meta.is_file() || meta.len() > 64 * 1024 * 1024
         || plan.request.inputs.as_slice()[0].size_bytes != meta.len() {
         return Err(VerificationError::Invalid);

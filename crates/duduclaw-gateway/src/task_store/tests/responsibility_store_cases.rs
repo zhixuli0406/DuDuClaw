@@ -243,3 +243,17 @@ async fn steering_refuses_credentials_without_rewriting_body_hash() {
     assert!(store.list_steering(&task.id).await.unwrap().is_empty());
     assert_eq!(steering.body_hash, "bound-hash");
 }
+
+#[tokio::test]
+async fn finite_responsibility_collection_filters_ids_and_current_owner_in_sql() {
+    let (store, _) = temp_store();
+    for (id, owner) in [("allowed", "alice"), ("foreign", "bob"), ("ungranted", "alice")] {
+        let mut row = resp_row(id); row.owner_agent_id = owner.into();
+        store.insert_responsibility(&row, &[], None).await.unwrap();
+    }
+    let ids = vec!["allowed".into(), "foreign".into()];
+    let rows = store.list_responsibilities_isolated("alice", &ids).await.unwrap();
+    assert_eq!(rows.iter().map(|r| r.responsibility_id.as_str()).collect::<Vec<_>>(), vec!["allowed"]);
+    assert!(store.list_responsibilities_isolated("alice", &["*".into()]).await.is_err());
+    assert!(store.list_responsibilities_isolated("alice", &[]).await.unwrap().is_empty());
+}

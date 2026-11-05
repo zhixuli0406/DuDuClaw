@@ -486,7 +486,10 @@ pub async fn handle_memory_store(
         }
     };
     match memory
-        .store_temporal_outcome(&namespace, entry, store_meta, provenance)
+        .store_temporal_outcome_checked(&namespace, entry, store_meta, provenance, || {
+            duduclaw_mcp_boundary::io_authority::verify_before_io()
+                .map_err(|error| duduclaw_core::error::DuDuClawError::Memory(error.to_string()))
+        })
         .await
     {
         Ok(duduclaw_memory::TemporalWriteOutcome::Fenced(r)) => {
@@ -1113,7 +1116,8 @@ pub async fn handle_code_map(params: &Value) -> Value {
 
     let cfg = CodeMapConfig::new(root);
     // CPU-bound directory walk + parse: keep it off the async reactor.
-    let built = tokio::task::spawn_blocking(move || CodeMap::build(&cfg)).await;
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let built = tokio::task::spawn_blocking(move || authority.run(|| CodeMap::build(&cfg))).await;
 
     let map = match built {
         Ok(Ok(m)) => m,

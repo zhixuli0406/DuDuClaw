@@ -478,6 +478,7 @@ enum PinnedReadMode {
 }
 impl PinnedReadMode {
     fn check(self) -> Result<(), Refusal> {
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|_| pinned_changed())?;
         if let Self::Remote(deadline) = self {
             if tokio::time::Instant::now() >= deadline {
                 return Err(pinned_changed());

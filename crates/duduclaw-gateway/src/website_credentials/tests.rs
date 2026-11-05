@@ -225,3 +225,31 @@ fn rpc_input_uses_login_url_and_defaults_to_no_additional_paths() {
         "password":"secret", "allowed_agents":["alice"]
     })).is_err());
 }
+
+#[tokio::test]
+async fn revoked_credential_reads_and_publications_refuse_without_modifying_ciphertext() {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use duduclaw_mcp_boundary::io_authority;
+    let home = tempfile::tempdir().unwrap();
+    let saved = upsert(home.path(), request(), "owner").unwrap();
+    let before = std::fs::read(path(home.path())).unwrap();
+    let live = Arc::new(AtomicBool::new(false));
+    io_authority::scope(crate::isolation_io_test_support::context(live.clone()), async {
+        assert!(list(home.path()).is_err());
+        assert!(for_agent(home.path(), "alice", "work").is_err());
+        assert!(delete(home.path(), &saved.id).is_err());
+        assert!(upsert(home.path(), request(), "owner").is_err());
+    }).await;
+    assert_eq!(std::fs::read(path(home.path())).unwrap(), before);
+    // Revoke from inside the locked mutation: publication still rolls back.
+    live.store(true, Ordering::SeqCst);
+    io_authority::scope(crate::isolation_io_test_support::context(live.clone()), async {
+        assert!(modify(home.path(), |store, _| {
+            store.records.clear();
+            live.store(false, Ordering::SeqCst);
+            Ok(())
+        }).is_err());
+    }).await;
+    assert_eq!(std::fs::read(path(home.path())).unwrap(), before);
+    assert_eq!(list(home.path()).unwrap().len(), 1);
+}

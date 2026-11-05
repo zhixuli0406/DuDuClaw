@@ -22,6 +22,22 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+fn verify_live_io() -> Result<(), String> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())
+}
+
+fn begin_live_write(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>, String> {
+    verify_live_io()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+    verify_live_io()?;
+    Ok(tx)
+}
+
+fn commit_live_write(tx: rusqlite::Transaction<'_>) -> Result<(), String> {
+    verify_live_io()?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
 // ── Constants ───────────────────────────────────────────────
 
 /// Default TTL when a caller does not specify one. 1 hour.

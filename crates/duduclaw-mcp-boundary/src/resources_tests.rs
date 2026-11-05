@@ -40,7 +40,9 @@ fn connector_grants_cannot_cross_personal_or_shared_bindings() {
     }]).unwrap();
     assert!(validate_grants(&record).is_ok());
     record.employee_binding = EmployeeBinding::Personal(Text::new("u".into()).unwrap());
-    assert!(validate_grants(&record).is_err());
+    // v2 permits signing a shared-home grant for a Personal employee. Actual
+    // use still requires the live product policy and BindingStore account check.
+    assert!(validate_grants(&record).is_ok());
 }
 #[test]
 fn ungranted_workspaces_and_other_employees_are_denied() {
@@ -215,4 +217,106 @@ fn wiki_root_replacement_cannot_serve_withdrawn_snapshot() {
     std::fs::rename(&live, dir.path().join("withdrawn")).unwrap();
     std::fs::create_dir(&live).unwrap();
     assert!(roots.verify_wiki_root("agent:main", &directory(&live)).is_err());
+}
+
+struct TestLive;
+impl LiveRequestVerifier for TestLive {
+    fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> { Ok(()) }
+}
+fn selected_call(workspace: &str, path: &str) -> crate::tool_policy::AuthorizedToolCall {
+    struct Selected(String);
+    impl crate::tool_policy::ResourceResolver for Selected {
+        fn resolve(&self, context: &RequestContext, _: &crate::tool_policy::ToolPolicy, _: &serde_json::Value)
+            -> Result<Vec<ResourceGrant>, VerificationError> {
+            Ok(vec![ResourceGrant::Employee { id: context.record().employee },
+                ResourceGrant::Workspace { handle: Text::new(self.0.clone()).unwrap() }])
+        }
+    }
+    let mut record = context().record().clone();
+    record.tools = List::new(vec![Text::new("skill_security_scan".into()).unwrap()]).unwrap();
+    record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee },
+        ResourceGrant::Workspace { handle: Text::new("work".into()).unwrap() },
+        ResourceGrant::Workspace { handle: Text::new("other".into()).unwrap() }]).unwrap();
+    record.expires_at = u64::MAX;
+    crate::tool_policy::authorize(&RequestContext::with_live_verifier(record, std::sync::Arc::new(TestLive)), "skill_security_scan",
+        &serde_json::json!({"path":path}), &Selected(workspace.into())).unwrap()
+}
+
+#[test]
+fn authorized_tokens_are_bound_to_call_selection_and_file_inode() {
+    let work = selected_call("work", "input.txt");
+    let other = selected_call("other", "input.txt");
+    let other_path = selected_call("work", "another.txt");
+    let dir = tempfile::tempdir().unwrap();
+    let mut roots = ResourceRoots::default();
+    for name in ["work", "other"] {
+        roots.insert(name.into(), work.context().record().employee, directory(dir.path())).unwrap();
+    }
+    assert!(roots.authorize_workspace(&work, "other").is_err());
+    let workspace = roots.authorize_workspace(&work, "work").unwrap();
+    assert!(workspace.verify(&work).is_ok());
+    assert!(workspace.verify(&other).is_err());
+    assert!(workspace.verify(&other_path).is_err());
+    assert!(workspace.open_file("another.txt").is_err());
+    let mut file = AuthorizedFile::for_test(&work, tempfile::tempfile().unwrap());
+    assert!(file.verify(&work).is_ok());
+    assert!(file.verify(&other).is_err());
+    assert!(file.verify(&other_path).is_err());
+    // A same-sized regular file is insufficient: it must be this inode.
+    file.file = tempfile::tempfile().unwrap();
+    assert!(file.verify(&work).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn authorized_file_open_retains_selected_inode_after_path_swap() {
+    let call = selected_call("work", "input.txt");
+    let dir = tempfile::tempdir_in("/dev/shm").unwrap();
+    std::fs::write(dir.path().join("input.txt"), b"selected").unwrap();
+    let mut roots = ResourceRoots::default();
+    roots.insert("work".into(), call.context().record().employee, directory(dir.path())).unwrap();
+    let workspace = roots.authorize_workspace(&call, "work").unwrap();
+    let mut file = workspace.open_file("input.txt").unwrap();
+    std::fs::rename(dir.path().join("input.txt"), dir.path().join("saved.txt")).unwrap();
+    std::fs::write(dir.path().join("input.txt"), b"swapped!").unwrap();
+    assert!(file.verify(&call).is_ok());
+    use std::io::Read;
+    let mut text = String::new();
+    file.read_to_string(&mut text).unwrap();
+    assert_eq!(text, "selected");
+}
+
+#[test]
+fn overbroad_resolver_cannot_replace_explicit_or_ambiguous_workspace_selection() {
+    struct Overbroad;
+    impl crate::tool_policy::ResourceResolver for Overbroad {
+        fn resolve(&self, context: &RequestContext, _: &crate::tool_policy::ToolPolicy, _: &serde_json::Value)
+            -> Result<Vec<ResourceGrant>, VerificationError> {
+            Ok(context.record().resources.as_slice().to_vec())
+        }
+    }
+    let baseline = selected_call("work", "input.txt");
+    let dir = tempfile::tempdir().unwrap();
+    let mut roots = ResourceRoots::default();
+    for name in ["work", "other"] {
+        roots.insert(name.into(), baseline.context().record().employee, directory(dir.path())).unwrap();
+    }
+    for key in ["workspace", "workspace_id"] {
+        let arguments = serde_json::json!({(key):"work", "path":"input.txt"});
+        let call = crate::tool_policy::authorize(baseline.context(), "skill_security_scan",
+            &arguments, &Overbroad).unwrap();
+        assert!(roots.authorize_workspace(&call, "work").is_ok());
+        // Both are capability grants and resolver results; the arguments pick work.
+        assert!(roots.authorize_workspace(&call, "other").is_err());
+    }
+    for arguments in [serde_json::json!({"path":"input.txt"}),
+        serde_json::json!({"workspace":"work", "workspace_id":"other", "path":"input.txt"})] {
+        let call = crate::tool_policy::authorize(baseline.context(), "skill_security_scan",
+            &arguments, &Overbroad).unwrap();
+        assert!(roots.authorize_workspace(&call, "work").is_err());
+        assert!(roots.authorize_workspace(&call, "other").is_err());
+    }
+    // An implicit target is valid only when resolution selected one workspace,
+    // even though the capability itself still grants both work and other.
+    assert!(roots.authorize_workspace(&baseline, "work").is_ok());
 }

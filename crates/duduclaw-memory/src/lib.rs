@@ -1,3 +1,4 @@
+mod isolation_io;
 pub mod bench;
 pub mod code_map;
 pub mod causal;

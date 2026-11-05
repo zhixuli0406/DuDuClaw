@@ -57,7 +57,7 @@ const PERSON_FIELDS: [&str; 6] = [
     "updated_by",
 ];
 
-fn strip_person_fields(v: &mut Value) {
+pub(crate) fn strip_person_fields(v: &mut Value) {
     match v {
         Value::Object(map) => {
             for k in PERSON_FIELDS {

@@ -1,17 +1,31 @@
 //! Binary-owned original MCP dispatcher adapter for protected gateway boot.
 //! Authentication stays inside the gateway; no key enters runtime config/fds.
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
+use duduclaw_isolation::ids::EmployeeId;
+use duduclaw_mcp_boundary::resources::ResourceRoots;
+use duduclaw_gateway::{isolation_connector_boot::InstalledConnectorProviders,
+    isolation_connectors::{BoundConnectorExecutor, LiveConnectorSelectionPolicy},
+    isolation_execution::GatewayFactories};
+use crate::{mcp_auth::Principal, mcp_isolation::IsolationDispatcher};
 use duduclaw_gateway::isolation_mcp::{DispatcherFactory, DispatcherInput, Dispatcher, VerificationError};
 
 struct CliDispatcherFactory;
 impl DispatcherFactory for CliDispatcherFactory {
     fn verify_producers(&self, execution: &dyn duduclaw_mcp_boundary::execution::ExecutionPlanFactory,
-        worker: &dyn duduclaw_mcp_boundary::worker_execution::WorkerPlanFactory) -> Result<(), VerificationError> {
+        worker: &dyn duduclaw_mcp_boundary::worker_execution::WorkerPlanFactory,
+        connectors: &dyn BoundConnectorExecutor, selection: &dyn LiveConnectorSelectionPolicy) -> Result<(), VerificationError> {
         use crate::mcp_isolation::BoundaryRoute;
         for tool in crate::mcp::tools() {
             if crate::mcp_isolation_disposition::intentional_refusal(tool.name).is_some() { continue; }
             let ready = match crate::mcp_isolation::boundary_route(tool.name) {
-                Some(BoundaryRoute::GatewayHandler(_) | BoundaryRoute::File) => true,
+                Some(BoundaryRoute::File) => true,
+                Some(BoundaryRoute::Resource) => {
+                    if duduclaw_gateway::isolation_connectors::provider_for_tool(tool.name).is_some() {
+                        connectors.supports(tool.name) && selection.supports(tool.name)
+                    } else {
+                        crate::mcp_isolation::legacy_resource_handler(tool.name)
+                    }
+                },
                 Some(BoundaryRoute::Execution) => execution.supports(tool.name),
                 Some(BoundaryRoute::Worker) => worker.supports(tool.name),
                 // Unknown/new routes require an explicit product adapter.
@@ -66,4 +80,18 @@ impl DispatcherFactory for CliDispatcherFactory {
 
 pub(crate) fn install() -> Result<(), VerificationError> {
     duduclaw_gateway::isolation_mcp::install_dispatcher_factory(Arc::new(CliDispatcherFactory))
+}
+
+impl IsolationDispatcher {
+    /// This is the complete registration entry point for the integration host.
+    /// A successful value is implementation readiness, not provider acceptance.
+    pub fn boot(home: PathBuf, employee: EmployeeId, agent: String, principal: Principal,
+        roots: Arc<ResourceRoots>, connectors: &InstalledConnectorProviders, factories: GatewayFactories)
+        -> Result<Self, VerificationError> {
+        connectors.verify_identity(&home, &agent, employee)?;
+        let dispatcher = Self::new(home, employee, agent, principal, roots)?
+            .with_gateway_services(connectors.resolver(), factories, Some(connectors.registry()));
+        dispatcher.require_complete_services()?;
+        Ok(dispatcher)
+    }
 }

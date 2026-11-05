@@ -151,9 +151,8 @@ impl TaskStore {
         slot: &AssignScheduleSlot<'_>,
     ) -> Result<(), String> {
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("schedule insert: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         let changed = tx
             .execute(
                 "UPDATE assign_schedules SET next_fire_at = ?3, \
@@ -168,8 +167,7 @@ impl TaskStore {
             return Err("scheduled assignment slot no longer active".into());
         }
         super::tasks::insert_task_tx(&tx, row)?;
-        tx.commit()
-            .map_err(|e| format!("schedule insert: commit: {e}"))
+        commit_live_write(tx)
     }
 
     pub(super) fn init_assign_schedule_schema(conn: &Connection) -> Result<(), String> {
@@ -187,9 +185,8 @@ impl TaskStore {
         max_live: i64,
     ) -> Result<bool, String> {
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("insert schedule: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         let live: i64 = tx
             .query_row(
                 &format!(
@@ -231,13 +228,13 @@ impl TaskStore {
             ],
         )
         .map_err(|e| format!("insert schedule: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("insert schedule: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(true)
     }
 
     pub async fn get_assign_schedule(&self, id: &str) -> Result<Option<AssignScheduleRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             &format!("SELECT {COLUMNS} FROM assign_schedules WHERE id = ?1"),
             params![id],
@@ -260,6 +257,7 @@ impl TaskStore {
     ) -> Result<Vec<AssignScheduleRow>, String> {
         let limit = limit.clamp(1, 500);
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let (sql, bind) = match creator_user_id {
             Some(u) => (
                 format!(
@@ -299,6 +297,7 @@ impl TaskStore {
         limit: i64,
     ) -> Result<Vec<AssignScheduleRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {COLUMNS} FROM assign_schedules WHERE status = 'active' AND next_fire_at IS NOT NULL \
@@ -337,7 +336,9 @@ impl TaskStore {
                 }
                 ScheduleFireOutcome::Failed => (None, "failed".into(), 0, 0, true),
             };
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let changed = conn
             .execute(
                 "UPDATE assign_schedules SET \
@@ -356,6 +357,7 @@ impl TaskStore {
                 ],
             )
             .map_err(|e| format!("advance schedule: {e}"))?;
+        commit_live_write(conn)?;
         Ok(changed == 1)
     }
 
@@ -367,7 +369,9 @@ impl TaskStore {
         reason: &str,
         now: DateTime<Utc>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let changed = conn
             .execute(
                 "UPDATE assign_schedules SET status = 'paused', pause_reason = ?2, updated_at = ?3 \
@@ -375,6 +379,7 @@ impl TaskStore {
                 params![id, reason, now.to_rfc3339()],
             )
             .map_err(|e| format!("pause schedule: {e}"))?;
+        commit_live_write(conn)?;
         Ok(changed == 1)
     }
 
@@ -386,7 +391,9 @@ impl TaskStore {
         next_fire_at: &str,
         now: DateTime<Utc>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let changed = conn
             .execute(
                 "UPDATE assign_schedules SET status = 'active', pause_reason = NULL, next_fire_at = ?2, \
@@ -394,6 +401,7 @@ impl TaskStore {
                 params![id, next_fire_at, now.to_rfc3339()],
             )
             .map_err(|e| format!("resume schedule: {e}"))?;
+        commit_live_write(conn)?;
         Ok(changed == 1)
     }
 
@@ -404,7 +412,9 @@ impl TaskStore {
         id: &str,
         now: DateTime<Utc>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let changed = conn
             .execute(
                 "UPDATE assign_schedules SET status = 'removed', next_fire_at = NULL, updated_at = ?2 \
@@ -412,6 +422,7 @@ impl TaskStore {
                 params![id, now.to_rfc3339()],
             )
             .map_err(|e| format!("remove schedule: {e}"))?;
+        commit_live_write(conn)?;
         Ok(changed == 1)
     }
 }

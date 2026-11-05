@@ -23,6 +23,10 @@ pub trait BindingAuthority: Send + Sync {
         principal: &Principal) -> Result<()>;
     fn authorize_connector(&self, employee: EmployeeId, binding: &EmployeeBinding,
         principal: &Principal, account: &str) -> Result<()>;
+    fn authorize_product_home_connector(&self, _employee: EmployeeId, _binding: &EmployeeBinding,
+        _principal: &Principal, _account: &str, _home_binding: &EmployeeBinding) -> Result<()> {
+        Err(BindingError::Denied)
+    }
 }
 
 /// Own this connection in the gateway's protected data directory. SQLite
@@ -59,6 +63,11 @@ impl BindingAuthority for std::sync::Mutex<BindingStore> {
         principal: &Principal, account: &str) -> Result<()> {
         self.lock().map_err(|_| BindingError::Unavailable)?
             .authorize_connector(employee, binding, principal, account)
+    }
+    fn authorize_product_home_connector(&self, employee: EmployeeId, binding: &EmployeeBinding,
+        principal: &Principal, account: &str, home_binding: &EmployeeBinding) -> Result<()> {
+        self.lock().map_err(|_| BindingError::Unavailable)?
+            .authorize_product_home_connector(employee, binding, principal, account, home_binding)
     }
 }
 
@@ -276,6 +285,27 @@ impl BindingStore {
             params![account]).map_err(|_| BindingError::Unavailable)?;
         if count != 1 { return Err(BindingError::Denied); }
         Ok(())
+    }
+
+    /// A trusted live product-selection adapter has explicitly selected the
+    /// installed shared home account. This does not select or discover accounts.
+    /// Personal credentials remain exclusive to their owner's Personal employee;
+    /// Shared employees cannot cross tenants. Callers must repeat product policy
+    /// checks immediately before invoking this method and every credential use.
+    pub fn authorize_product_home_connector(&self, employee: EmployeeId, binding: &EmployeeBinding,
+        principal: &Principal, account: &str, home_binding: &EmployeeBinding) -> Result<()> {
+        identifier(account)?;
+        let EmployeeBinding::Shared(home_tenant) = home_binding else { return Err(BindingError::Denied); };
+        if matches!(binding, EmployeeBinding::Shared(tenant) if tenant != home_tenant) {
+            return Err(BindingError::Denied);
+        }
+        let tx = self.connection.unchecked_transaction().map_err(|_| BindingError::Unavailable)?;
+        self.validate(employee, binding, principal)?;
+        let found = tx.query_row(
+            "SELECT 1 FROM iso_connectors WHERE account=?1 AND kind='shared' AND binding_id=?2 AND revoked=0",
+            params![account, home_tenant.as_str()], |_| Ok(())).optional().map_err(|_| BindingError::Unavailable)?;
+        if found.is_none() { return Err(BindingError::Denied); }
+        tx.commit().map_err(|_| BindingError::Unavailable)
     }
 
     /// Caller still needs a matching ResourceGrant::Connector and existing tool

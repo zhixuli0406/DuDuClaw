@@ -6,9 +6,11 @@ use duduclaw_mcp_boundary::{RequestContext, VerificationError, resources::Resour
 use serde_json::{Value, json};
 use crate::{mcp_auth::Principal, mcp_dispatch::McpDispatcher, mcp_namespace::NamespaceContext};
 
+#[path = "mcp_isolation_collections.rs"]
+pub(crate) mod collections;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BoundaryRoute {
-    GatewayHandler(duduclaw_core::ToolEffect),
     File,
     Resource,
     Execution,
@@ -19,7 +21,7 @@ pub(crate) enum BoundaryRoute {
 /// hardware probe or parse a hostile archive. Both inventories must agree.
 pub(crate) fn boundary_route(name: &str) -> Option<BoundaryRoute> {
     use duduclaw_mcp_boundary::tool_policy::{Route, policy};
-    let effect = duduclaw_core::tool_effect::effect_of_builtin(name)?;
+    duduclaw_core::tool_effect::effect_of_builtin(name)?;
     let policy = policy(name)?;
     Some(match policy.route {
         Route::File => BoundaryRoute::File,
@@ -29,11 +31,10 @@ pub(crate) fn boundary_route(name: &str) -> Option<BoundaryRoute> {
         Route::Execution if matches!(name, "computer_screenshot" | "computer_click" |
             "computer_type" | "computer_login" | "computer_key" | "computer_scroll" |
             "computer_session_start" | "computer_navigate" | "computer_session_stop") =>
-            BoundaryRoute::GatewayHandler(effect),
+            BoundaryRoute::Resource,
         Route::Execution => BoundaryRoute::Execution,
-        Route::Connector if matches!(name, "model_search" | "model_recommend") => BoundaryRoute::Execution,
         Route::Service if name == "hardware_info" => BoundaryRoute::Execution,
-        Route::Service | Route::Connector => BoundaryRoute::GatewayHandler(effect),
+        Route::Service | Route::Connector => BoundaryRoute::Resource,
     })
 }
 
@@ -41,7 +42,7 @@ pub(crate) fn boundary_route(name: &str) -> Option<BoundaryRoute> {
 /// Preserve them for the existing record/delegation/scope policy. Other routes
 /// still prohibit host path and execution identity overrides.
 pub(crate) fn check_tool_arguments(name: &str, arguments: &Value) -> Result<(), VerificationError> {
-    if !matches!(boundary_route(name), Some(BoundaryRoute::GatewayHandler(_))) {
+    if !matches!(boundary_route(name), Some(BoundaryRoute::Resource)) {
         return duduclaw_mcp_boundary::check_arguments(arguments);
     }
     let fields = arguments.as_object().ok_or(VerificationError::Invalid)?;
@@ -83,16 +84,11 @@ pub(crate) async fn dispatch_resource_tool(home: &std::path::Path, name: &str, a
     if let Some(reason) = crate::mcp_isolation_disposition::intentional_refusal(name) {
         return Some(crate::mcp::tool_error(reason.message()));
     }
+    if home != current.home || check_tool_arguments(name, arguments).is_err() {
+        return Some(crate::mcp::tool_error("無法確認這次操作的資源授權，已拒絕執行。"));
+    }
     match boundary_route(name) {
         Some(BoundaryRoute::File) => return None,
-        Some(BoundaryRoute::GatewayHandler(_)) => {
-            // A capability authorizes this call, not ownership of its records.
-            // The same handler as stdio resolves employee policy at use time.
-            return if home == current.home && current.context.record().tools.as_slice().iter().any(|tool| tool.as_str() == name)
-                && check_tool_arguments(name, arguments).is_ok() {
-                None
-            } else { Some(crate::mcp::tool_error("無法確認這次操作的員工身分。")) };
-        }
         Some(BoundaryRoute::Worker) => {
             return Some(match current.worker.as_ref() {
                 Some(bridge) => bridge.execute(&current.context, name, arguments).await,
@@ -116,6 +112,9 @@ pub(crate) async fn dispatch_resource_tool(home: &std::path::Path, name: &str, a
         // may have yielded while ownership/collection membership changed.
         let checked = authorize_resource_call(service.clone(), &current.context, name, arguments).await?;
         if checked.resources() != call.resources() { return Err(VerificationError::BindingMismatch); }
+        let live = checked.context().clone();
+        duduclaw_mcp_boundary::authority::verify_blocking(move ||
+            live.verify_live(duduclaw_mcp_boundary::authority::now_seconds()?)).await?;
         service.execute(checked).await
     }.await;
     Some(match result {
@@ -127,6 +126,30 @@ pub(crate) async fn dispatch_resource_tool(home: &std::path::Path, name: &str, a
             crate::mcp::tool_error("無法確認這次操作的資源授權，已拒絕執行。")
         }
     })
+}
+
+/// Builtin gateway services retain their existing handler, reached only with
+/// an AuthorizedToolCall. Connectors never qualify for this adapter.
+pub(crate) fn legacy_resource_handler(name: &str) -> bool {
+    use duduclaw_mcp_boundary::tool_policy::{policy, Route};
+    matches!(boundary_route(name), Some(BoundaryRoute::Resource))
+        && policy(name).is_some_and(|p| p.route != Route::Connector)
+}
+
+pub(crate) async fn authorize_gateway_handler(home: &std::path::Path, name: &str, arguments: &Value)
+    -> Result<duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall, VerificationError> {
+    let current = current().ok_or(VerificationError::Invalid)?;
+    if home != current.home || !legacy_resource_handler(name) { return Err(VerificationError::Invalid); }
+    check_tool_arguments(name, arguments)?;
+    let service = current.services.as_ref().filter(|s| s.supports(name)).ok_or(VerificationError::Unavailable)?;
+    let call = authorize_resource_call(service.clone(), &current.context, name, arguments).await?;
+    service.check_handler_policy(&call).await?;
+    let checked = authorize_resource_call(service.clone(), &current.context, name, arguments).await?;
+    if checked.resources() != call.resources() { return Err(VerificationError::BindingMismatch); }
+    let live = checked.context().clone();
+    duduclaw_mcp_boundary::authority::verify_blocking(move ||
+        live.verify_live(duduclaw_mcp_boundary::authority::now_seconds()?)).await?;
+    Ok(checked)
 }
 
 pub(crate) struct IsolatedCall {
@@ -162,14 +185,12 @@ pub(crate) fn tool_allowed(name: &str, principal: &Principal) -> bool {
     if crate::mcp_isolation_disposition::intentional_refusal(name).is_some() { return false; }
     let supported = match boundary_route(name) {
         Some(BoundaryRoute::File) => name == "file_read" || call.parser.is_some(),
-        Some(BoundaryRoute::GatewayHandler(_)) => true,
         Some(BoundaryRoute::Worker) => call.worker.as_ref().is_some_and(|bridge| bridge.supports(name)),
         Some(BoundaryRoute::Execution) => call.execution.as_ref().is_some_and(|bridge| bridge.supports(name)),
         Some(BoundaryRoute::Resource) => call.services.as_ref().is_some_and(|service| service.supports(name)),
         None => false,
     };
-    supported && (matches!(boundary_route(name), Some(BoundaryRoute::GatewayHandler(_)))
-            || duduclaw_mcp_boundary::tool_policy::eligible(&call.context, name))
+    supported && duduclaw_mcp_boundary::tool_policy::eligible(&call.context, name)
         && record.tools.as_slice().iter().any(|tool| tool.as_str() == name)
         && crate::mcp_auth::tool_requires_scope(name).is_none_or(|required|
             principal.scopes.contains(&required) || principal.scopes.contains(&crate::mcp_auth::Scope::Admin))
@@ -212,7 +233,6 @@ impl IsolationDispatcher {
                 ServiceState::IntentionalRefusal(reason)
             } else {
                 let ready = match boundary_route(name) {
-                    Some(BoundaryRoute::GatewayHandler(_)) => true,
                     Some(BoundaryRoute::File) => name == "file_read" || self.parser.is_some(),
                     Some(BoundaryRoute::Resource) => self.services.as_ref().is_some_and(|s| s.supports(name)),
                     Some(BoundaryRoute::Execution) => self.execution.as_ref().is_some_and(|s| s.supports(name)),
@@ -229,6 +249,13 @@ impl IsolationDispatcher {
         if self.service_manifest().iter().any(|(_, state)| *state == ServiceState::MissingFactory) {
             return Err(VerificationError::Unavailable);
         }
+        Ok(())
+    }
+
+    pub fn require_context_services(&self, context: &RequestContext) -> Result<(), VerificationError> {
+        self.require_complete_services()?;
+        if context.record().employee != self.employee { return Err(VerificationError::BindingMismatch); }
+        context.record().validate_resource_mode().map_err(|_| VerificationError::Invalid)?;
         Ok(())
     }
 
@@ -287,8 +314,8 @@ impl IsolationDispatcher {
         self.execution = Some(bridge); self
     }
 
-    /// Resource resolver retained for A/E integration. Gateway record tools use
-    /// the original employee record policy rather than finite run record grants.
+    /// Resource resolver retained for A/E integration. Resource services enforce
+    /// finite run grants or the explicitly signed live employee authority.
     pub fn with_record_resolver(mut self,
         resolver: Arc<dyn duduclaw_mcp_boundary::tool_policy::ResourceResolver>) -> Self {
         self.record_resolver = Some(resolver); self
@@ -400,7 +427,15 @@ impl IsolationDispatcher {
 
 fn project_tool_schema(tool: &mut Value) {
     let name = tool["name"].as_str().unwrap_or("").to_owned();
-    if matches!(boundary_route(&name), Some(BoundaryRoute::GatewayHandler(_))) { return; }
+    if matches!(boundary_route(&name), Some(BoundaryRoute::Resource)) {
+        if duduclaw_gateway::isolation_connectors::provider_for_tool(&name).is_some() {
+            if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {
+                properties.insert("connector_account".into(), json!({"type":"string",
+                    "description":"這次執行獲授權的連線帳號識別碼；省略時必須只有一個有效帳號"}));
+            }
+        }
+        return;
+    }
     let schema = &mut tool["inputSchema"];
     let mut target_required = false;
     if let Some(required) = schema["required"].as_array_mut() {
@@ -428,6 +463,13 @@ fn project_tool_schema(tool: &mut Value) {
 }
 
 impl duduclaw_mcp_boundary::server::Dispatcher for IsolationDispatcher {
+    fn require_complete_services(&self) -> Result<(), VerificationError> {
+        IsolationDispatcher::require_complete_services(self)
+    }
+    fn require_context_services(&self, context: &RequestContext) -> Result<(), VerificationError> {
+        IsolationDispatcher::require_context_services(self, context)
+    }
+
     fn dispatch<'a>(&'a self, context: RequestContext, agent_slug: &'a str, request: Value)
         -> Pin<Box<dyn Future<Output = Result<Option<Value>, VerificationError>> + Send + 'a>> {
         Box::pin(async move {
@@ -441,7 +483,7 @@ impl duduclaw_mcp_boundary::server::Dispatcher for IsolationDispatcher {
             duduclaw_gateway::isolation_egress::scope(&self.dispatcher.home_dir, &self.agent, &context,
                 self.turn_resolver.clone(), ISOLATED_CALL.scope(call, crate::mcp_auth::with_authenticated_call(
                 crate::mcp_auth::AuthenticatedCall::without_reference(self.principal.clone()),
-                self.request(request)))).await?
+                duduclaw_mcp_boundary::io_authority::scope(context.clone(), self.request(request))))).await?
         })
     }
 }

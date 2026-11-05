@@ -64,6 +64,32 @@ optional values use 0/1 tags. Sets have u32 counts, sort by encoded bytes and
 reject duplicates. Enum tags are fixed in the encoder and covered by golden
 tests. D supplies keys, MAC verification, live revocation and resource policy.
 
+**CONTRACT CHANGE (2026-11-05): capability encoding v2.** Resource tag 9 is
+`EmployeeScope { id }`, MAC-covered and bound to the record's employee. It means
+current live employee authority for Service/Connector calls, not a wildcard
+host path. Scope cannot coexist with a task restriction or finite task/table/
+wiki/mailbox/recipient/connector grants. Explicit workspace and origin entries
+remain required for File/A/E confinement; they do not narrow Service/Connector
+employee scope. Resource tag 10, `Confined { resource }`, allows exact File/A/E
+input/output grants alongside EmployeeScope (including wiki and connector
+outputs). It cannot be nested or wrap Employee/EmployeeScope. These grants do
+not authorize ambient Service/Connector access. Both full-record and resource-tag
+golden bytes are versioned.
+Old v1 capability MACs fail verification; IPC wire v1 is unchanged.
+
+`RequestContext::verify_live` requires the original connection's host verifier;
+plain `from_verified_record` contexts are suitable for policy fixtures but
+cannot perform I/O. The verifier is in-memory only and is not serialized into
+capability bytes.
+
+Protected MCP helper execution additionally requires
+`ExecutionBackend::supports_authorized_workspace` and `spawn_authorized`.
+The default implementations refuse. The boundary passes an `ExecutionAuthority`
+that verifies the actual retained workspace directory and live request before
+host handoff; matching a workspace string alone is insufficient. Backends must
+not advertise this support before implementing the root identity and final I/O
+checks. This is an in-process API extension; IPC wire v1 is unchanged.
+
 EmployeeId is a 128-bit registry key, not a Linux account name. B permanently
 maps it to a numeric uid and `duduclaw-emp-<uid in decimal>`; neither identifiers
 nor uid/account mappings are recycled. The default uid range is 70000–99999.
@@ -82,7 +108,7 @@ hard limits requires explicit compatibility review. No backend can fall back
 to gateway-uid execution when isolation is unavailable.
 
 ```sh
-CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0 cargo test -p duduclaw-isolation --offline
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-isolation --offline
 ```
 
 ## I1e additive control message

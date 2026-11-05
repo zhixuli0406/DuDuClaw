@@ -153,13 +153,16 @@ pub(crate) async fn send_to_agent_with_ctx(
             }
         }
         let writer_admission = admission.clone();
-        let queued = tokio::task::spawn_blocking(move || -> bool {
+        let authority = duduclaw_mcp_boundary::io_authority::capture();
+        let queued = tokio::task::spawn_blocking(move || authority.run(|| -> bool {
             // The blocking writer owns the lease even if the request is cancelled.
             let _admission = writer_admission;
-            let Ok(conn) = rusqlite::Connection::open(&db_path) else {
+            if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return false; }
+            let Ok(mut conn) = rusqlite::Connection::open(&db_path) else {
                 return false;
             };
             let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+            with_live_delegation_write(&mut conn, |conn| {
             if lane.is_some() {
                 // Same column the gateway adds; ignore "duplicate column".
                 let _ = conn.execute("ALTER TABLE message_queue ADD COLUMN lane TEXT", []);
@@ -264,7 +267,8 @@ pub(crate) async fn send_to_agent_with_ctx(
             )
             .map(|rows| rows > 0)
             .unwrap_or(false)
-        })
+            })
+        }))
         .await
         .unwrap_or(false);
         (queued, admission)
@@ -285,10 +289,13 @@ pub(crate) async fn send_to_agent_with_ctx(
             .map(|s| s.trim().to_string())
             .filter(|s| duduclaw_core::is_valid_agent_id(s));
         let writer_admission = admission.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let authority = duduclaw_mcp_boundary::io_authority::capture();
+        let _ = tokio::task::spawn_blocking(move || authority.run(|| {
             let _admission = writer_admission;
-            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+            if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return; }
+            if let Ok(mut conn) = rusqlite::Connection::open(&db_path) {
                 let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+                with_live_delegation_write(&mut conn, |conn| {
                 // Ensure table exists (MCP process may open DB before gateway).
                 // Schema must match message_queue.rs init_schema — keep in sync.
                 let _ = conn.execute_batch(
@@ -353,8 +360,10 @@ pub(crate) async fn send_to_agent_with_ctx(
                     );
                     }
                 }
+                true
+                });
             }
-        }).await;
+        })).await;
     }
 
     drop(admission);
@@ -834,4 +843,16 @@ mod autonomy_commit_tests {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM message_queue", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 1);
     }
+}
+
+
+fn with_live_delegation_write(
+    conn: &mut rusqlite::Connection,
+    write: impl FnOnce(&rusqlite::Connection) -> bool,
+) -> bool {
+    if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return false; }
+    let Ok(tx) = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) else { return false; };
+    if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() || !write(&tx) { return false; }
+    if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return false; }
+    tx.commit().is_ok()
 }

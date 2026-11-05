@@ -246,7 +246,8 @@ pub async fn verify_and_consume(
         return Err(GrantRefusal::Mismatch);
     }
     let reason = format!("{CONSUMED_PREFIX}{}", uuid::Uuid::new_v4());
-    let conn = broker.store.conn.lock().await;
+    let mut connection = broker.store.conn.lock().await;
+    let conn = super::begin_live_write(&mut connection).map_err(GrantRefusal::Store)?;
     if !rec.expires_at().is_some_and(|expiry| chrono::Utc::now() < expiry) {
         return Err(GrantRefusal::NotApproved);
     }
@@ -259,6 +260,7 @@ pub async fn verify_and_consume(
            AND julianday(created_at) + ttl_seconds / 86400.0 > julianday('now')",
         rusqlite::params![reason, id.as_str(), rec.agent_id, rec.payload.to_string(), rec.created_at, rec.ttl_seconds],
     ).map_err(|e| GrantRefusal::Store(e.to_string()))?;
+    super::commit_live_write(conn).map_err(GrantRefusal::Store)?;
     match consumed {
         1 => Ok(()),
         _ => Err(GrantRefusal::AlreadyUsed),

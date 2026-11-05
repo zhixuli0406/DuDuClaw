@@ -186,12 +186,24 @@ pub fn store_embedding(
     vector: &[f32],
 ) -> Result<()> {
     let blob = encode_vec(vector);
+    crate::isolation_io::verify()?;
+    // Existing lineage transactions retain ownership of commit/rollback.
+    // Standalone lazy embedding work must also recheck after SQLite admission.
+    let transaction = if conn.is_autocommit() {
+        Some(rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| DuDuClawError::Memory(format!("begin embedding: {e}")))?)
+    } else { None };
+    crate::isolation_io::verify()?;
     conn.execute(
         "UPDATE memories SET embedding = ?1, embedding_model = ?2
          WHERE id = ?3 AND agent_id = ?4",
         params![blob, model_id, memory_id, agent_id],
     )
     .map_err(|e| DuDuClawError::Memory(format!("store embedding: {e}")))?;
+    crate::isolation_io::verify()?;
+    if let Some(transaction) = transaction {
+        transaction.commit().map_err(|e| DuDuClawError::Memory(format!("commit embedding: {e}")))?;
+    }
     Ok(())
 }
 

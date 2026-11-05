@@ -7,10 +7,12 @@ use serde_json::Value;
 use crate::{RequestContext, VerificationError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceKind { Employee, Workspace, Mailbox, Task, DatabaseTable, Wiki, Connector, Recipient, UrlOrigin }
+pub enum ResourceKind { EmployeeScope, Employee, Workspace, Mailbox, Task, DatabaseTable, Wiki, Connector, Recipient, UrlOrigin }
 impl ResourceKind {
     pub fn of(resource: &ResourceGrant) -> Self {
         match resource {
+            ResourceGrant::Confined { resource } => Self::of(resource),
+            ResourceGrant::EmployeeScope { .. } => Self::EmployeeScope,
             ResourceGrant::Employee { .. } => Self::Employee,
             ResourceGrant::Workspace { .. } => Self::Workspace,
             ResourceGrant::Mailbox { .. } => Self::Mailbox,
@@ -118,15 +120,15 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "execute_program", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "office_script", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "skill_bank_feedback", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
-    ToolPolicy { name: "computer_screenshot", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "computer_click", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "computer_type", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "computer_login", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace, ResourceKind::Connector] },
-    ToolPolicy { name: "computer_key", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "computer_scroll", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "computer_session_start", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "computer_navigate", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "computer_session_stop", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_screenshot", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_click", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_type", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_login", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Workspace, ResourceKind::Connector] },
+    ToolPolicy { name: "computer_key", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_scroll", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_session_start", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_navigate", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_session_stop", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "computer_workspace_list", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "computer_workspace_read", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "computer_workspace_write", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
@@ -139,7 +141,7 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "terminate_branch", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "fork_cost", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     // tasks
-    ToolPolicy { name: "credential_declare", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "credential_declare", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "discovery_catalog", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "discovery_list", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "discovery_tree", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
@@ -349,6 +351,7 @@ pub struct AuthorizedToolCall {
     resources: Vec<ResourceGrant>,
 }
 impl AuthorizedToolCall {
+    pub fn employee_scope(&self) -> bool { self.context.record().employee_scope() }
     pub fn context(&self) -> &RequestContext { &self.context }
     pub fn policy(&self) -> &'static ToolPolicy { self.policy }
     pub fn name(&self) -> &'static str { self.policy.name }
@@ -367,10 +370,11 @@ fn own_employee(context: &RequestContext) -> ResourceGrant {
 pub fn eligible(context: &RequestContext, name: &str) -> bool {
     let Some(policy) = policy(name) else { return false; };
     let record = context.record();
-    record.tools.as_slice().iter().any(|tool| tool.as_str() == name)
-        && policy.required.iter().all(|kind| record.resources.as_slice().iter()
+    record.validate_resource_mode().is_ok()
+        && record.tools.as_slice().iter().any(|tool| tool.as_str() == name)
+        && ((record.employee_scope() && matches!(policy.route, Route::Service | Route::Connector)) || policy.required.iter().all(|kind| record.io_resources()
             .any(|grant| ResourceKind::of(grant) == *kind && validate_resource(grant).is_ok()
-                && (*kind != ResourceKind::Employee || grant == &own_employee(context))))
+                && (*kind != ResourceKind::Employee || grant == &own_employee(context)))))
 }
 
 fn required_for_call(policy: &ToolPolicy, arguments: &Value) -> Result<Vec<ResourceKind>, VerificationError> {
@@ -437,7 +441,9 @@ pub fn validate_origin(origin: &str) -> Result<(), VerificationError> {
 pub fn validate_resource(resource: &ResourceGrant) -> Result<(), VerificationError> {
     let exact = |value: &str| !value.is_empty() && value != "*" && !value.chars().any(char::is_control);
     let valid = match resource {
-        ResourceGrant::Employee { .. } => true,
+        ResourceGrant::Confined { resource } => !matches!(resource.as_ref(), ResourceGrant::Confined { .. }
+            | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. }) && validate_resource(resource).is_ok(),
+        ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. } => true,
         ResourceGrant::Workspace { handle } => exact(handle.as_str()),
         ResourceGrant::Mailbox { id } | ResourceGrant::Task { id } => exact(id.as_str()),
         ResourceGrant::DatabaseTable { database, table } => exact(database.as_str()) && exact(table.as_str()),
@@ -560,19 +566,35 @@ pub async fn authorize_async(context: &RequestContext, name: &str, arguments: &V
 
 pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolver: &dyn ResourceResolver)
     -> Result<AuthorizedToolCall, VerificationError> {
-    crate::check_arguments(arguments)?;
     let policy = policy(name).ok_or(VerificationError::Invalid)?;
+    // Service selectors are data, never caller identity. The CLI validates them
+    // against the original tool schema before this function is reached.
+    if context.record().employee_scope() && matches!(policy.route, Route::Service | Route::Connector) {
+        let fields = arguments.as_object().ok_or(VerificationError::Invalid)?;
+        if ["principal", "root", "cwd", "run", "run_id", "employee_id"].iter().any(|k| fields.contains_key(*k)) {
+            return Err(VerificationError::Invalid);
+        }
+    } else { crate::check_arguments(arguments)?; }
     if !eligible(context, name) { return Err(VerificationError::Invalid); }
-    let required = required_for_call(policy, arguments)?;
+    if context.record().employee_scope() && policy.route == Route::Service {
+        return Ok(AuthorizedToolCall { context: context.clone(), policy, arguments: arguments.clone(),
+            resources: vec![ResourceGrant::EmployeeScope { id: context.record().employee }] });
+    }
+    let employee_connector = context.record().employee_scope() && policy.route == Route::Connector;
+    let required = if employee_connector { vec![ResourceKind::Employee, ResourceKind::Connector] }
+        else { required_for_call(policy, arguments)? };
     let resources = resolver.resolve(context, policy, arguments)?;
     if resources.is_empty() || resources.len() > 128
         || resources.iter().enumerate().any(|(index, resource)| resources[..index].contains(resource)) {
         return Err(VerificationError::Invalid);
     }
     for resource in &resources {
-        crate::resources::require_resource(context, resource)?;
+        if !employee_connector { crate::resources::require_resource(context, resource)?; }
         if let ResourceGrant::Connector { binding, .. } = resource {
-            if binding != &context.record().employee_binding {
+            // A shared home account may be selected only by the live product
+            // policy; personal credentials still require the lifetime owner.
+            if binding != &context.record().employee_binding
+                && !matches!((&context.record().employee_binding, binding), (EmployeeBinding::Personal(_), EmployeeBinding::Shared(_))) {
                 return Err(VerificationError::BindingMismatch);
             }
             if let EmployeeBinding::Personal(owner) = binding {
@@ -587,7 +609,14 @@ pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolv
         && (*kind != ResourceKind::Employee || resource == &own_employee(context)))) {
         return Err(VerificationError::Invalid);
     }
-    check_selected_resources(policy, arguments, &resources)?;
+    if employee_connector {
+        if let Some(account) = arguments.get("connector_account") {
+            let account = account.as_str().ok_or(VerificationError::Invalid)?;
+            if !resources.iter().any(|r| matches!(r, ResourceGrant::Connector { account: selected, .. } if selected.as_str() == account)) {
+                return Err(VerificationError::BindingMismatch);
+            }
+        }
+    } else { check_selected_resources(policy, arguments, &resources)?; }
     Ok(AuthorizedToolCall { context: context.clone(), policy, arguments: arguments.clone(), resources })
 }
 

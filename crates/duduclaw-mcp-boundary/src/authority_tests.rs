@@ -149,6 +149,7 @@ mod transport {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     struct Echo;
     impl crate::server::Dispatcher for Echo {
+        fn require_complete_services(&self) -> Result<(), VerificationError> { Ok(()) }
         fn dispatch<'a>(&'a self, _context: RequestContext, _slug: &'a str, request: Value)
             -> Pin<Box<dyn Future<Output = Result<Option<Value>, VerificationError>> + Send + 'a>> {
             Box::pin(async move {
@@ -176,6 +177,38 @@ mod transport {
         let connection = boundary.activate(id, &res, delivery, now).unwrap();
         client.set_nonblocking(true).unwrap();
         (boundary, id, connection, tokio::net::UnixStream::from_std(client).unwrap())
+    }
+    #[tokio::test]
+    async fn incomplete_dispatcher_cannot_activate_a_serving_endpoint() {
+        struct Missing;
+        impl crate::server::Dispatcher for Missing {
+            fn dispatch<'a>(&'a self, _: RequestContext, _: &'a str, _: Value)
+                -> Pin<Box<dyn Future<Output = Result<Option<Value>, VerificationError>> + Send + 'a>> {
+                panic!("startup must reject before handler")
+            }
+        }
+        let (boundary, id, connection, _client) = live_connection();
+        assert_eq!(crate::server::serve(connection, &Missing).await, Err(VerificationError::Unavailable));
+        assert!(matches!(boundary.entries.lock().unwrap()[&id.0].state, State::Revoked));
+    }
+    #[tokio::test]
+    async fn context_readiness_refuses_before_reading_or_dispatching_and_revokes() {
+        struct MissingFinite;
+        impl crate::server::Dispatcher for MissingFinite {
+            fn require_complete_services(&self) -> Result<(), VerificationError> { Ok(()) }
+            fn require_context_services(&self, context: &RequestContext) -> Result<(), VerificationError> {
+                assert_eq!(context.record().employee, EmployeeId([2; 16]));
+                assert!(!context.record().employee_scope());
+                Err(VerificationError::Unavailable)
+            }
+            fn dispatch<'a>(&'a self, _: RequestContext, _: &'a str, _: Value)
+                -> Pin<Box<dyn Future<Output = Result<Option<Value>, VerificationError>> + Send + 'a>> {
+                panic!("mode-incomplete dispatcher must not receive calls")
+            }
+        }
+        let (boundary, id, connection, _client) = live_connection();
+        assert_eq!(crate::server::serve(connection, &MissingFinite).await, Err(VerificationError::Unavailable));
+        assert!(matches!(boundary.entries.lock().unwrap()[&id.0].state, State::Revoked));
     }
     #[tokio::test]
     async fn initialized_notification_and_list_can_arrive_in_one_read() {
@@ -249,4 +282,94 @@ mod transport {
             Err(VerificationError::BindingMismatch)));
         assert!(matches!(boundary.entries.lock().unwrap()[&id.0].state, State::Pending));
     }
+}
+
+#[tokio::test]
+async fn all_revocation_paths_notify_without_polling_and_cancel_inflight_future() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Dropped(Arc<AtomicBool>);
+    impl Drop for Dropped {
+        fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+    }
+    for mode in 0..7 {
+        let (boundary, live, id) = setup();
+        live.0.lock().unwrap().0 = RunStatus::Running;
+        let connection = boundary.activate_inner(id, &reservation(), 101).unwrap();
+        let mut revoked = connection.revocation().unwrap();
+        let context = connection.context(101).unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let marker = Dropped(dropped.clone());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(async move {
+            let handler = async move {
+                let _marker = marker;
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            };
+            tokio::select! {
+                biased;
+                _ = crate::server::wait_revoked(&mut revoked) => {},
+                _ = handler => panic!("inflight handler completed"),
+            }
+        });
+        ready.await.unwrap();
+        match mode {
+            0 => boundary.revoke_run(reservation().run).unwrap(),
+            1 => boundary.revoke_control(reservation().control).unwrap(),
+            2 => boundary.revoke_all().unwrap(),
+            3 => { live.0.lock().unwrap().1 += 1; assert!(context.verify_live(101).is_err()); },
+            4 => { live.0.lock().unwrap().2 = true; assert!(context.verify_live(101).is_err()); },
+            5 => boundary.sweep(200).unwrap(),
+            _ => drop(connection),
+        }
+        // No polling task or timer is involved in this cancellation path.
+        tokio::time::timeout(std::time::Duration::from_millis(50), serving).await.unwrap().unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(context.verify_live(101).is_err());
+    }
+}
+
+#[tokio::test]
+async fn revocation_is_sticky_before_the_waiter_first_polls() {
+    let (boundary, live, id) = setup();
+    live.0.lock().unwrap().0 = RunStatus::Running;
+    let connection = boundary.activate_inner(id, &reservation(), 101).unwrap();
+    let mut revoked = connection.revocation().unwrap();
+    boundary.revoke_run(reservation().run).unwrap();
+    tokio::time::timeout(std::time::Duration::from_millis(50),
+        crate::server::wait_revoked(&mut revoked)).await.unwrap();
+}
+
+#[test]
+fn live_request_verifier_fences_effects_after_run_or_policy_change() {
+    for mode in 0..5 {
+        let (boundary, live, id) = setup();
+        live.0.lock().unwrap().0 = RunStatus::Running;
+        let connection = boundary.activate_inner(id, &reservation(), 101).unwrap();
+        let context = connection.context(101).unwrap();
+        assert!(context.verify_live(101).is_ok());
+        match mode {
+            0 => boundary.revoke_run(reservation().run).unwrap(),
+            1 => live.0.lock().unwrap().0 = RunStatus::Ended(RunOutcome::Cancelled),
+            2 => live.0.lock().unwrap().1 += 1,
+            3 => live.0.lock().unwrap().2 = true,
+            _ => drop(connection),
+        }
+        let mut effects = 0;
+        let mut effect = || -> Result<(), VerificationError> {
+            context.verify_live(101)?;
+            effects += 1;
+            Ok(())
+        };
+        assert!(effect().is_err());
+        assert_eq!(effects, 0);
+    }
+}
+
+#[test]
+fn detached_context_has_no_live_io_authority() {
+    let (boundary, _, id) = setup();
+    let (record, _, _) = proof(&boundary, id);
+    let context = RequestContext::from_verified_record(record);
+    assert_eq!(context.verify_live(101), Err(VerificationError::Unavailable));
 }

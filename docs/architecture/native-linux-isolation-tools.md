@@ -1,37 +1,44 @@
-# Package D round 5 tool dispositions
+# Native Linux MCP resource routes (security revision, 2026-11-05)
 
-Isolation changes where employee code runs and where credentials are held. It does not change employee permissions. All gateway handler calls use the employee verified by `RequestContext`, the original dispatcher and the original handler: scopes, allowed/denied tools, permissions, action rules, approvals, record authorization, egress/private-data and input guards stay in force. Credentials remain inside the gateway.
+**PARTIAL: full product parity is not ready.** Employee permissions remain the product contract; missing adapters are startup failures, not newly acceptable product restrictions. The endpoint now invokes `require_complete_services()` before admitting MCP traffic. The inventory tests use explicit discovery doubles for missing connectors and do not prove provider execution or production boot readiness.
 
-The capability authorizes the call; cron, reminders, tasks, mail and knowledge remain employee records. Their existing ownership/delegation/audience policies decide access, including subsequent runs after the creating capability expires. The gateway schedules those executions through `ExecutionBackend`, just as it schedules other employee work. Computer tools operate gateway-owned containers, and durable workspaces retain their existing lease/revision protocol.
+**CONTRACT CHANGE: capability canonical encoding v2.** `EmployeeScope { id }` is an explicit MAC-covered resource variant (tag 9), bound to the verified employee. Service/Connector calls use either exact resource grants or current live employee authority. A scope cannot be combined with task/table/wiki/mailbox/recipient/connector grants or a task-limited run. Workspace and URL-origin entries may accompany scope as explicit File/A/E inputs. Tag 10, `Confined { resource }`, carries other exact File/A/E input/output grants (for example a wiki namespace or a worker connector account); it requires EmployeeScope and forbids nesting. Neither form narrows or expands employee-scope Service/Connector authority. Older capability MACs are not reused.
+
+Every Service/Connector tool enters `BoundaryRoute::Resource`. Exact grants are resolved and checked before the legacy handler. A capability for task-a refuses task-b. Employee-scope calls retain the original live employee gates. Explicit `tasks_list`, `activity_list`, `list_cron_tasks`, `goals_list`, `list_reminders` and `responsibility_get` use finite queries/readers with immutable IDs and employee ownership. Finite `db_query` accepts a strict single-table SELECT subset lowered into the parameterized SelectRequest builder; joins, functions, subqueries and other unsupported grammar refuse. EmployeeScope retains its existing product SQL policy.
+
+A/Execution requires a backend that explicitly supports retained workspace authority. `SpawndBackend::with_workspace_bridge` installs the trusted root-receipt hookup and verifies the held directory, exact reservation/runtime/workspace/cwd and live authority. The production B/H receipt producer is still external; default connect refuses workspace plans. Worker/file plans retain authorized tokens through queued work and checked transport. These are implementation readiness requirements, not Linux acceptance.
+
+Every connector requires an installed per-tool live selection policy, active catalog account, binding verification and bound executor. Executor source coverage is 62/62: native Google/Notion/GitHub (28), Odoo (18), DB (4), channels (8), models (2), computer login (1), search (1). The typed boot registry requires complete selection/execution support before dispatcher construction; the production integration host has not adopted that entry point. Google uses its sealed gateway owner for personal/home OAuth and consent/refresh; actual requester and non-OAuth variants remain pending. Credentials are not copied into the run. Source coverage does not establish complete product/provider parity. See the [round 3 report](native-linux-isolation-security-fixes-2026-11-05.md).
+
+Existing scope, allowed/denied tools, permissions, approvals, record/audience, egress and input guards remain in force. Legacy Service I/O checks after every await are not yet fully instrumented. The typed handler carries authority through awaits; core TaskStore mutations recheck after locks and before writes/commits. Child tasks need explicit scope propagation. The entry check and revocation watch alone do not close that review item. The complete status and verification boundaries are in [the security-fix report](native-linux-isolation-security-fixes-2026-11-05.md).
 
 | Refusal category | Reason |
 | --- | --- |
-| Existing Admin/operator gate | A caller without the authority required by the original scope/permission/handler gate is refused there; isolation adds no operator-only tool list. |
+| Existing Admin/operator gate | The original employee policy decides access. |
 | HostAuthority | A run cannot control or observe the host desktop, devices, power, network configuration or local model services. |
-
-`Refused: HostAuthority` rows below are the complete isolation exception set. Every other row is served subject to the same original employee gates, even when its scope is Admin. Missing A/E factories are wiring errors, not acceptable product restrictions: `require_complete_services()` rejects incomplete boot assembly. The matrix and tests describe implementation, not live provider or native acceptance.
+| Missing adapter | Boot fails; this is unfinished parity, not an intentional tool restriction. |
 
 | Tool | Disposition |
 | --- | --- |
-| `google_status` | Original gateway handler; existing employee gates |
-| `gmail_search` | Original gateway handler; existing employee gates |
-| `gmail_read` | Original gateway handler; existing employee gates |
-| `gmail_create_draft` | Original gateway handler; existing employee gates |
-| `calendar_list_events` | Original gateway handler; existing employee gates |
-| `calendar_create_event` | Original gateway handler; existing employee gates |
-| `sheets_read` | Original gateway handler; existing employee gates |
-| `sheets_append` | Original gateway handler; existing employee gates |
-| `forms_get` | Original gateway handler; existing employee gates |
-| `forms_list_responses` | Original gateway handler; existing employee gates |
-| `gtasks_lists` | Original gateway handler; existing employee gates |
-| `gtasks_list` | Original gateway handler; existing employee gates |
-| `gtasks_create` | Original gateway handler; existing employee gates |
-| `gtasks_complete` | Original gateway handler; existing employee gates |
-| `drive_search` | Original gateway handler; existing employee gates |
-| `drive_read` | Original gateway handler; existing employee gates |
-| `docs_read` | Original gateway handler; existing employee gates |
-| `docs_append` | Original gateway handler; existing employee gates |
-| `slides_read` | Original gateway handler; existing employee gates |
+| `google_status` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `gmail_search` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `gmail_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `gmail_create_draft` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `calendar_list_events` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `calendar_create_event` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `sheets_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `sheets_append` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `forms_get` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `forms_list_responses` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `gtasks_lists` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `gtasks_list` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `gtasks_create` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `gtasks_complete` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `drive_search` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `drive_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `docs_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `docs_append` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `slides_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
 | `os_notify` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_watch_status` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_open` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
@@ -57,218 +64,218 @@ The capability authorizes the call; cron, reminders, tasks, mail and knowledge r
 | `os_display_set` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_audio_get` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_audio_set` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
-| `create_agent` | Original gateway handler; existing employee gates |
-| `list_agents` | Original gateway handler; existing employee gates |
+| `create_agent` | Resource → AuthorizedToolCall → original live employee handler |
+| `list_agents` | Resource → AuthorizedToolCall → original live employee handler |
 | `create_task` | A ExecutionBackend + ExecutionPlanFactory |
-| `check_responses` | Original gateway handler; existing employee gates |
-| `task_status` | Original gateway handler; existing employee gates |
-| `agent_status` | Original gateway handler; existing employee gates |
+| `check_responses` | Resource → AuthorizedToolCall → original live employee handler |
+| `task_status` | Resource → AuthorizedToolCall → original live employee handler |
+| `agent_status` | Resource → AuthorizedToolCall → original live employee handler |
 | `spawn_agent` | A ExecutionBackend + ExecutionPlanFactory |
 | `spawn_ephemeral` | A ExecutionBackend + ExecutionPlanFactory |
-| `agent_update` | Original gateway handler; existing employee gates |
-| `agent_remove` | Original gateway handler; existing employee gates |
-| `agent_update_soul` | Original gateway handler; existing employee gates |
-| `odoo_connect` | Original gateway handler; existing employee gates |
-| `odoo_status` | Original gateway handler; existing employee gates |
-| `odoo_crm_leads` | Original gateway handler; existing employee gates |
-| `odoo_crm_create_lead` | Original gateway handler; existing employee gates |
-| `odoo_crm_update_stage` | Original gateway handler; existing employee gates |
-| `odoo_sale_orders` | Original gateway handler; existing employee gates |
-| `odoo_sale_create_quotation` | Original gateway handler; existing employee gates |
-| `odoo_sale_confirm` | Original gateway handler; existing employee gates |
-| `odoo_inventory_products` | Original gateway handler; existing employee gates |
-| `odoo_inventory_check` | Original gateway handler; existing employee gates |
-| `odoo_invoice_list` | Original gateway handler; existing employee gates |
-| `odoo_payment_status` | Original gateway handler; existing employee gates |
-| `odoo_search` | Original gateway handler; existing employee gates |
-| `odoo_execute` | Original gateway handler; existing employee gates |
-| `odoo_report` | Original gateway handler; existing employee gates |
-| `odoo_partner_search` | Original gateway handler; existing employee gates |
-| `odoo_schema_overview` | Original gateway handler; existing employee gates |
-| `odoo_schema_fields` | Original gateway handler; existing employee gates |
+| `agent_update` | Resource → AuthorizedToolCall → original live employee handler |
+| `agent_remove` | Resource → AuthorizedToolCall → original live employee handler |
+| `agent_update_soul` | Resource → AuthorizedToolCall → original live employee handler |
+| `odoo_connect` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_status` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_crm_leads` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_crm_create_lead` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_crm_update_stage` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_sale_orders` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_sale_create_quotation` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_sale_confirm` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_inventory_products` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_inventory_check` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_invoice_list` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_payment_status` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_search` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_execute` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_report` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_partner_search` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_schema_overview` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_schema_fields` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
 | `skill_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
 | `execute_program` | A ExecutionBackend + ExecutionPlanFactory |
 | `office_script` | A ExecutionBackend + ExecutionPlanFactory |
-| `skill_bank_feedback` | Original gateway handler; existing employee gates |
-| `computer_screenshot` | Original gateway container/workspace handler; existing session and lease gates |
-| `computer_click` | Original gateway container/workspace handler; existing session and lease gates |
-| `computer_type` | Original gateway container/workspace handler; existing session and lease gates |
-| `computer_login` | Original gateway container/workspace handler; existing session and lease gates |
-| `computer_key` | Original gateway container/workspace handler; existing session and lease gates |
-| `computer_scroll` | Original gateway container/workspace handler; existing session and lease gates |
-| `computer_session_start` | Original gateway container/workspace handler; existing session and lease gates |
-| `computer_navigate` | Original gateway container/workspace handler; existing session and lease gates |
-| `computer_session_stop` | Original gateway container/workspace handler; existing session and lease gates |
-| `computer_workspace_list` | Original gateway container/workspace handler; existing session and lease gates |
-| `computer_workspace_read` | Original gateway container/workspace handler; existing session and lease gates |
-| `computer_workspace_write` | Original gateway container/workspace handler; existing session and lease gates |
-| `session_restore_context` | Original gateway handler; existing employee gates |
+| `skill_bank_feedback` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_screenshot` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_click` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_type` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_login` | Resource → selected exact credential metadata/label → original computer session/origin/threat gates |
+| `computer_key` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_scroll` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_session_start` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_navigate` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_session_stop` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_workspace_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_workspace_read` | Resource → AuthorizedToolCall → original live employee handler |
+| `computer_workspace_write` | Resource → AuthorizedToolCall → original live employee handler |
+| `session_restore_context` | Resource → AuthorizedToolCall → original live employee handler |
 | `fork_run` | A ExecutionBackend + ExecutionPlanFactory |
 | `inspect_branches` | A ExecutionBackend + ExecutionPlanFactory |
 | `diff_branches` | A ExecutionBackend + ExecutionPlanFactory |
 | `merge_or_select` | A ExecutionBackend + ExecutionPlanFactory |
 | `terminate_branch` | A ExecutionBackend + ExecutionPlanFactory |
 | `fork_cost` | A ExecutionBackend + ExecutionPlanFactory |
-| `credential_declare` | Original gateway handler; existing employee gates |
+| `credential_declare` | Resource → AuthorizedToolCall → original live employee handler |
 | `discovery_catalog` | A ExecutionBackend + ExecutionPlanFactory |
 | `discovery_list` | A ExecutionBackend + ExecutionPlanFactory |
 | `discovery_tree` | A ExecutionBackend + ExecutionPlanFactory |
 | `discovery_artifact` | A ExecutionBackend + ExecutionPlanFactory |
 | `discovery_cancel` | A ExecutionBackend + ExecutionPlanFactory |
-| `tasks_list` | Original gateway handler; existing employee gates |
-| `tasks_create` | Original gateway handler; existing employee gates |
-| `tasks_update` | Original gateway handler; existing employee gates |
-| `tasks_claim` | Original gateway handler; existing employee gates |
-| `tasks_renew` | Original gateway handler; existing employee gates |
-| `tasks_complete` | Original gateway handler; existing employee gates |
-| `responsibility_get` | Original gateway handler; existing employee gates |
-| `responsibility_followup` | Original gateway handler; existing employee gates |
-| `responsibility_ask` | Original gateway handler; existing employee gates |
-| `tasks_block` | Original gateway handler; existing employee gates |
-| `capability_request` | Original gateway handler; existing employee gates |
-| `goals_create` | Original gateway handler; existing employee gates |
-| `goals_list` | Original gateway handler; existing employee gates |
-| `plan_get` | Original gateway handler; existing employee gates |
-| `plan_update_step` | Original gateway handler; existing employee gates |
-| `activity_post` | Original gateway handler; existing employee gates |
-| `activity_list` | Original gateway handler; existing employee gates |
-| `autopilot_list` | Original gateway handler; existing employee gates |
-| `shared_skill_list` | Original gateway handler; existing employee gates |
-| `shared_skill_share` | Original gateway handler; existing employee gates |
+| `tasks_list` | Resource → finite SQL adapter for explicit grants; original live handler for EmployeeScope |
+| `tasks_create` | Resource → AuthorizedToolCall → original live employee handler |
+| `tasks_update` | Resource → AuthorizedToolCall → original live employee handler |
+| `tasks_claim` | Resource → AuthorizedToolCall → original live employee handler |
+| `tasks_renew` | Resource → AuthorizedToolCall → original live employee handler |
+| `tasks_complete` | Resource → AuthorizedToolCall → original live employee handler |
+| `responsibility_get` | Resource → EmployeeScope original handler / finite owner + responsibility IDs |
+| `responsibility_followup` | Resource → AuthorizedToolCall → original live employee handler |
+| `responsibility_ask` | Resource → AuthorizedToolCall → original live employee handler |
+| `tasks_block` | Resource → AuthorizedToolCall → original live employee handler |
+| `capability_request` | Resource → AuthorizedToolCall → original live employee handler |
+| `goals_create` | Resource → AuthorizedToolCall → original live employee handler |
+| `goals_list` | Resource → EmployeeScope original handler / finite signed task IDs + employee SQL |
+| `plan_get` | Resource → AuthorizedToolCall → original live employee handler |
+| `plan_update_step` | Resource → AuthorizedToolCall → original live employee handler |
+| `activity_post` | Resource → AuthorizedToolCall → original live employee handler |
+| `activity_list` | Resource → finite SQL adapter for explicit grants; original live handler for EmployeeScope |
+| `autopilot_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `shared_skill_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `shared_skill_share` | Resource → AuthorizedToolCall → original live employee handler |
 | `shared_skill_adopt` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
-| `plan_start` | Original gateway handler; existing employee gates |
-| `memory_improve` | Original gateway handler; existing employee gates |
+| `plan_start` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_improve` | Resource → AuthorizedToolCall → original live employee handler |
 | `browser_record_start` | A ExecutionBackend + ExecutionPlanFactory |
 | `browser_record_stop` | A ExecutionBackend + ExecutionPlanFactory |
 | `desktop_record_start` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `desktop_record_stop` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `skill_from_recording` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
-| `memory_search` | Original gateway handler; existing employee gates |
-| `memory_store` | Original gateway handler; existing employee gates |
-| `working_state_set` | Original gateway handler; existing employee gates |
-| `working_state_clear` | Original gateway handler; existing employee gates |
-| `working_state_handoff` | Original gateway handler; existing employee gates |
-| `working_state_get` | Original gateway handler; existing employee gates |
-| `team_handoff` | Original gateway handler; existing employee gates |
-| `belief_submit` | Original gateway handler; existing employee gates |
-| `belief_settle` | Original gateway handler; existing employee gates |
-| `belief_stats` | Original gateway handler; existing employee gates |
-| `mail_list` | Original gateway handler; existing employee gates |
-| `mail_read` | Original gateway handler; existing employee gates |
-| `mail_send` | Original gateway handler; existing employee gates |
+| `memory_search` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_store` | Resource → AuthorizedToolCall → original live employee handler |
+| `working_state_set` | Resource → AuthorizedToolCall → original live employee handler |
+| `working_state_clear` | Resource → AuthorizedToolCall → original live employee handler |
+| `working_state_handoff` | Resource → AuthorizedToolCall → original live employee handler |
+| `working_state_get` | Resource → AuthorizedToolCall → original live employee handler |
+| `team_handoff` | Resource → AuthorizedToolCall → original live employee handler |
+| `belief_submit` | Resource → AuthorizedToolCall → original live employee handler |
+| `belief_settle` | Resource → AuthorizedToolCall → original live employee handler |
+| `belief_stats` | Resource → AuthorizedToolCall → original live employee handler |
+| `mail_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `mail_read` | Resource → AuthorizedToolCall → original live employee handler |
+| `mail_send` | Resource → AuthorizedToolCall → original live employee handler |
 | `codrive_run` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `codrive_status` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
-| `memory_read` | Original gateway handler; existing employee gates |
-| `memory_fetch_batch` | Original gateway handler; existing employee gates |
-| `memory_alias_add` | Original gateway handler; existing employee gates |
-| `memory_alias_list` | Original gateway handler; existing employee gates |
-| `memory_get_history` | Original gateway handler; existing employee gates |
-| `memory_get_at` | Original gateway handler; existing employee gates |
-| `memory_invalidate_by_origin` | Original gateway handler; existing employee gates |
-| `memory_search_by_layer` | Original gateway handler; existing employee gates |
+| `memory_read` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_fetch_batch` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_alias_add` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_alias_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_get_history` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_get_at` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_invalidate_by_origin` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_search_by_layer` | Resource → AuthorizedToolCall → original live employee handler |
 | `code_map` | A ExecutionBackend + ExecutionPlanFactory |
-| `user_profile_record` | Original gateway handler; existing employee gates |
-| `user_profile_get` | Original gateway handler; existing employee gates |
-| `user_code_profile` | Original gateway handler; existing employee gates |
-| `memory_successful_conversations` | Original gateway handler; existing employee gates |
-| `memory_episodic_pressure` | Original gateway handler; existing employee gates |
-| `memory_consolidation_status` | Original gateway handler; existing employee gates |
-| `decision_list` | Original gateway handler; existing employee gates |
-| `decision_resolve` | Original gateway handler; existing employee gates |
-| `skill_search` | Original gateway handler; existing employee gates |
-| `skill_list` | Original gateway handler; existing employee gates |
-| `skill_gaps` | Original gateway handler; existing employee gates |
+| `user_profile_record` | Resource → AuthorizedToolCall → original live employee handler |
+| `user_profile_get` | Resource → AuthorizedToolCall → original live employee handler |
+| `user_code_profile` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_successful_conversations` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_episodic_pressure` | Resource → AuthorizedToolCall → original live employee handler |
+| `memory_consolidation_status` | Resource → AuthorizedToolCall → original live employee handler |
+| `decision_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `decision_resolve` | Resource → AuthorizedToolCall → original live employee handler |
+| `skill_search` | Resource → AuthorizedToolCall → original live employee handler |
+| `skill_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `skill_gaps` | Resource → AuthorizedToolCall → original live employee handler |
 | `skill_security_scan` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
 | `skill_graduate` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
-| `skill_synthesis_status` | Original gateway handler; existing employee gates |
+| `skill_synthesis_status` | Resource → AuthorizedToolCall → original live employee handler |
 | `skill_synthesis_run` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
 | `skill_hub_install` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
 | `skill_curator_status` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
-| `skill_pin` | Original gateway handler; existing employee gates |
-| `notion_status` | Original gateway handler; existing employee gates |
-| `notion_search` | Original gateway handler; existing employee gates |
-| `notion_page_read` | Original gateway handler; existing employee gates |
-| `notion_page_append` | Original gateway handler; existing employee gates |
-| `github_status` | Original gateway handler; existing employee gates |
-| `github_search_issues` | Original gateway handler; existing employee gates |
-| `github_issue_read` | Original gateway handler; existing employee gates |
-| `github_pr_read` | Original gateway handler; existing employee gates |
-| `github_issue_comment` | Original gateway handler; existing employee gates |
-| `cost_summary` | Original gateway handler; existing employee gates |
-| `cost_agents` | Original gateway handler; existing employee gates |
-| `cost_users` | Original gateway handler; existing employee gates |
-| `cost_recent` | Original gateway handler; existing employee gates |
-| `cost_multi_vs_single` | Original gateway handler; existing employee gates |
+| `skill_pin` | Resource → AuthorizedToolCall → original live employee handler |
+| `notion_status` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `notion_search` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `notion_page_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `notion_page_append` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `github_status` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `github_search_issues` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `github_issue_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `github_pr_read` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `github_issue_comment` | Resource → Native account-bound executor; product-policy/boot adapter pending |
+| `cost_summary` | Resource → AuthorizedToolCall → original live employee handler |
+| `cost_agents` | Resource → AuthorizedToolCall → original live employee handler |
+| `cost_users` | Resource → AuthorizedToolCall → original live employee handler |
+| `cost_recent` | Resource → AuthorizedToolCall → original live employee handler |
+| `cost_multi_vs_single` | Resource → AuthorizedToolCall → original live employee handler |
 | `transcribe_audio` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
 | `meeting_transcribe` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
 | `meeting_upload_link` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
 | `meeting_transcribe_status` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
 | `meeting_transcribe_cancel` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
 | `synthesize_speech` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
-| `knowledge_search` | Original gateway handler; existing employee gates |
-| `knowledge_get_passage` | Original gateway handler; existing employee gates |
-| `knowledge_list_collections` | Original gateway handler; existing employee gates |
+| `knowledge_search` | Resource → AuthorizedToolCall → original live employee handler |
+| `knowledge_get_passage` | Resource → AuthorizedToolCall → original live employee handler |
+| `knowledge_list_collections` | Resource → AuthorizedToolCall → original live employee handler |
 | `knowledge_add_source` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
-| `wiki_ls` | Original gateway handler; existing employee gates |
-| `wiki_read` | Original gateway handler; existing employee gates |
-| `wiki_write` | Original gateway handler; existing employee gates |
-| `wiki_search` | Original gateway handler; existing employee gates |
-| `wiki_lint` | Original gateway handler; existing employee gates |
-| `wiki_stats` | Original gateway handler; existing employee gates |
-| `wiki_export` | Original gateway handler; existing employee gates |
-| `wiki_dedup` | Original gateway handler; existing employee gates |
-| `wiki_graph` | Original gateway handler; existing employee gates |
-| `wiki_rebuild_fts` | Original gateway handler; existing employee gates |
-| `wiki_trust_audit` | Original gateway handler; existing employee gates |
-| `wiki_trust_history` | Original gateway handler; existing employee gates |
-| `shared_wiki_delete` | Original gateway handler; existing employee gates |
-| `wiki_namespace_status` | Original gateway handler; existing employee gates |
-| `canvas_push` | Original gateway handler; existing employee gates |
-| `canvas_clear` | Original gateway handler; existing employee gates |
-| `identity_resolve` | Original gateway handler; existing employee gates |
-| `wiki_share` | Original gateway handler; existing employee gates |
-| `db_sources` | Original gateway handler; existing employee gates |
-| `db_tables` | Original gateway handler; existing employee gates |
-| `db_select` | Original gateway handler; existing employee gates |
-| `db_query` | Original gateway handler; existing employee gates |
-| `file_read` | FD read |
-| `csv_read` | E table parser |
-| `xlsx_read` | E table parser |
-| `group_history_read` | Original gateway handler; existing employee gates |
-| `send_message` | Original gateway handler; existing employee gates |
-| `send_photo` | Original gateway handler; existing employee gates |
-| `send_sticker` | Original gateway handler; existing employee gates |
-| `web_search` | Original gateway handler; existing employee gates |
-| `send_to_agent` | Original gateway handler; existing employee gates |
-| `list_cron_tasks` | Original gateway handler; existing employee gates |
-| `update_cron_task` | Original gateway handler; existing employee gates |
-| `delete_cron_task` | Original gateway handler; existing employee gates |
-| `pause_cron_task` | Original gateway handler; existing employee gates |
-| `run_cron_task` | Original gateway handler; existing employee gates |
-| `create_reminder` | Original gateway handler; existing employee gates |
-| `list_reminders` | Original gateway handler; existing employee gates |
-| `cancel_reminder` | Original gateway handler; existing employee gates |
+| `wiki_ls` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_read` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_write` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_search` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_lint` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_stats` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_export` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_dedup` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_graph` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_rebuild_fts` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_trust_audit` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_trust_history` | Resource → AuthorizedToolCall → original live employee handler |
+| `shared_wiki_delete` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_namespace_status` | Resource → AuthorizedToolCall → original live employee handler |
+| `canvas_push` | Resource → AuthorizedToolCall → original live employee handler |
+| `canvas_clear` | Resource → AuthorizedToolCall → original live employee handler |
+| `identity_resolve` | Resource → AuthorizedToolCall → original live employee handler |
+| `wiki_share` | Resource → AuthorizedToolCall → original live employee handler |
+| `db_sources` | Resource → bounded account collection; each member repeats owner/catalog/binding/product checks |
+| `db_tables` | Resource → bound DB provider; live source/table policy and post-pool I/O checks; production boot pending |
+| `db_select` | Resource → bound DB provider; live source/table policy and post-pool I/O checks; production boot pending |
+| `db_query` | Resource → selected DB; finite strict single-table SQL lowers to parameterized SelectRequest; EmployeeScope retains product SQL policy |
+| `file_read` | AuthorizedFile; live authority on each read |
+| `csv_read` | AuthorizedFile → checked E table parser |
+| `xlsx_read` | AuthorizedFile → checked E table parser |
+| `group_history_read` | Resource → selected exact channel/group → original live retained-history gates |
+| `send_message` | Resource → selected exact bot/channel/chat → checked sender; late failure is uncertain |
+| `send_photo` | Resource → selected exact channel/chat → checked media send; unsupported subtype/input refuses |
+| `send_sticker` | Resource → selected exact channel/chat → checked sticker send; unsupported subtype/input refuses |
+| `web_search` | Resource → bound search provider; checked E parser required; production boot pending |
+| `send_to_agent` | Resource → AuthorizedToolCall → original live employee handler |
+| `list_cron_tasks` | Resource → finite owner-and-grant SQL adapter; original live handler for EmployeeScope |
+| `update_cron_task` | Resource → AuthorizedToolCall → original live employee handler |
+| `delete_cron_task` | Resource → AuthorizedToolCall → original live employee handler |
+| `pause_cron_task` | Resource → AuthorizedToolCall → original live employee handler |
+| `run_cron_task` | Resource → AuthorizedToolCall → original live employee handler |
+| `create_reminder` | Resource → AuthorizedToolCall → original live employee handler |
+| `list_reminders` | Resource → EmployeeScope original handler / finite immutable reminder IDs + bounded reader |
+| `cancel_reminder` | Resource → AuthorizedToolCall → original live employee handler |
 | `web_fetch_cached` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
 | `web_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
-| `inference_status` | Original gateway handler; existing employee gates |
-| `model_list` | Original gateway handler; existing employee gates |
+| `inference_status` | Resource → AuthorizedToolCall → original live employee handler |
+| `model_list` | Resource → AuthorizedToolCall → original live employee handler |
 | `model_load` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `model_unload` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `hardware_info` | A ExecutionBackend + ExecutionPlanFactory |
 | `route_query` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
-| `inference_mode` | Original gateway handler; existing employee gates |
+| `inference_mode` | Resource → AuthorizedToolCall → original live employee handler |
 | `llamafile_start` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `llamafile_stop` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
-| `llamafile_list` | Original gateway handler; existing employee gates |
-| `model_search` | A ExecutionBackend + ExecutionPlanFactory |
+| `llamafile_list` | Resource → AuthorizedToolCall → original live employee handler |
+| `model_search` | Resource → public HF checked search + boot hardware snapshot; no ambient token/probe/cache |
 | `model_download` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
-| `model_recommend` | A ExecutionBackend + ExecutionPlanFactory |
-| `submit_feedback` | Original gateway handler; existing employee gates |
-| `evolution_toggle` | Original gateway handler; existing employee gates |
-| `evolution_status` | Original gateway handler; existing employee gates |
-| `audit_trail_query` | Original gateway handler; existing employee gates |
-| `reliability_summary` | Original gateway handler; existing employee gates |
-| `channel_config` | Original gateway handler; existing employee gates |
-| `channel_config_list` | Original gateway handler; existing employee gates |
-| `channel_status` | Original gateway handler; existing employee gates |
-| `pairing_manage` | Original gateway handler; existing employee gates |
+| `model_recommend` | Resource → selected model registry → boot hardware snapshot + curated model rules |
+| `submit_feedback` | Resource → AuthorizedToolCall → original live employee handler |
+| `evolution_toggle` | Resource → AuthorizedToolCall → original live employee handler |
+| `evolution_status` | Resource → AuthorizedToolCall → original live employee handler |
+| `audit_trail_query` | Resource → AuthorizedToolCall → original live employee handler |
+| `reliability_summary` | Resource → AuthorizedToolCall → original live employee handler |
+| `channel_config` | Resource → selected exact settings scope → validated key/value and checked transaction |
+| `channel_config_list` | Resource → selected exact settings scope → bounded settings read |
+| `channel_status` | Resource → selected exact channel/scope → scoped status/session read |
+| `pairing_manage` | Resource → selected exact subject → checked pairing state; finite list |
