@@ -36,6 +36,8 @@ pub mod marker;
 mod messages;
 pub mod container_root;
 mod store;
+mod sanitizer;
+pub use sanitizer::{sanitize_output_text, sanitize_output_value};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -162,7 +164,7 @@ pub struct ProtectionError {
 
 impl ProtectionError {
     fn new(code: &'static str, message_zh: impl Into<String>) -> Self {
-        Self { code, message_zh: message_zh.into() }
+        Self { code, message_zh: sanitize_output_text(&message_zh.into()) }
     }
 
     fn from_state(state: ProtectionState, backend: BackendKind, extra: &str) -> Self {
@@ -389,8 +391,8 @@ impl CredentialProtection {
             enabled_at,
             person_identity_allowed: state == ProtectionState::Ready
                 && level >= PERSON_IDENTITY_MIN_LEVEL,
-            summary_zh,
-            detail_zh,
+            summary_zh: sanitize_output_text(&summary_zh),
+            detail_zh: sanitize_output_text(&detail_zh),
             refusal_reason: self.store.refusal_reason(),
             root_key_recovery,
         }

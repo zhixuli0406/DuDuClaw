@@ -228,6 +228,45 @@ describe('container credential protection', () => {
     expect(diagnostics.querySelector('img')).toBeNull();
   });
 
+  it.each([
+    ['en', en], ['zh-TW', zhTW], ['ja-JP', jaJP],
+  ] as const)('shows the root docker command hint and upgrade requirement in %s', async (locale, messages) => {
+    mockProtection(status({
+      backend: 'container_root_key', state: 'unavailable', refusal_reason: 'engine_socket_reachable',
+      root_key_recovery: {
+        latest_revocation: {
+          reason: 'engine_socket_reachable',
+          detail: '@docker_cli_3e708842d9322cef25983565c19d0866: peer uid=0 (root)',
+          timestamp: '2026-11-05T01:02:03Z',
+        },
+        recovery: 'unit_upgrade_required',
+      },
+    }));
+    renderWithProviders(
+      <IntlProvider locale={locale} messages={messages}><CredentialProtectionPanel /></IntlProvider>,
+    );
+    const diagnostics = await screen.findByTestId('credential-protection-recovery');
+    expect(diagnostics).toHaveTextContent(messages['security.credentialProtection.recovery.docker_cli_root']);
+    expect(diagnostics).toHaveTextContent(messages['security.credentialProtection.recovery.unit_upgrade_required']);
+  });
+
+  it.each([
+    '@docker_cli_3E708842d9322cef25983565c19d0866: peer uid=0 (root)',
+    '@docker_cli_3e708842d9322cef25983565c19d0866: peer uid=1000 (root)',
+    '@docker_cli_3e708842d9322cef25983565c19d0866/suffix: peer uid=0 (root)',
+  ])('does not select the docker command hint for a nonmatching detail: %s', async (detail) => {
+    mockProtection(status({
+      backend: 'container_root_key', state: 'unavailable', refusal_reason: 'engine_socket_reachable',
+      root_key_recovery: {
+        latest_revocation: { reason: 'engine_socket_reachable', detail, timestamp: '2026-11-05T01:02:03Z' },
+        recovery: 'waiting',
+      },
+    }));
+    renderWithProviders(<CredentialProtectionPanel />);
+    const diagnostics = await screen.findByTestId('credential-protection-recovery');
+    expect(diagnostics).not.toHaveTextContent(en['security.credentialProtection.recovery.docker_cli_root']);
+  });
+
   it('does not describe persisted revocation history as a current outage', async () => {
     mockProtection(status({
       ...CONTAINER_READY,

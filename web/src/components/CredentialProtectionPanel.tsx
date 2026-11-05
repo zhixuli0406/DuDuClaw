@@ -74,7 +74,7 @@ const ROOT_KEY_REFUSALS = new Set([
 ]);
 const ROOT_KEY_RECOVERY_STATES = new Set([
   'monitoring', 'disabled', 'waiting', 'budget_exhausted',
-  'restart_requested', 'state_unavailable', 'non_transient',
+  'restart_requested', 'state_unavailable', 'non_transient', 'unit_upgrade_required',
 ]);
 
 export function CredentialProtectionPanel() {
@@ -135,6 +135,9 @@ export function CredentialProtectionPanel() {
   const containerState = container && ['not_enabled', 'missing', 'key_changed', 'unavailable'].includes(state ?? '');
   const recovery = status?.root_key_recovery;
   const latestRevocation = recovery?.latest_revocation;
+  const dockerCliRootHint = latestRevocation?.reason === 'engine_socket_reachable'
+    && latestRevocation.detail?.length === 63
+    && /^@docker_cli_[0-9a-f]{32}: peer uid=0 \(root\)$/.test(latestRevocation.detail);
   const currentlyRefused = container && state === 'unavailable' && !!status?.refusal_reason;
   const label = status
     ? state === 'ready' || state === 'not_enabled'
@@ -206,6 +209,7 @@ export function CredentialProtectionPanel() {
                       })}</p>
                     )}
                     {latestRevocation.detail && <p className="font-mono text-xs">{latestRevocation.detail}</p>}
+                    {dockerCliRootHint && <p>{intl.formatMessage({ id: 'security.credentialProtection.recovery.docker_cli_root' })}</p>}
                   </>
                 )}
                 <p>{intl.formatMessage({

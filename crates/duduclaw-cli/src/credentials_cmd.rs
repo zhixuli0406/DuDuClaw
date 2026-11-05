@@ -12,7 +12,7 @@ use std::path::Path;
 
 use clap::Subcommand;
 use duduclaw_core::error::{DuDuClawError, Result};
-use duduclaw_security::credential_protection::{CredentialProtection, ProtectionStatus};
+use duduclaw_security::credential_protection::{CredentialProtection, ProtectionStatus, sanitize_output_text, sanitize_output_value};
 
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum CredentialsCommands {
@@ -43,25 +43,24 @@ fn authorize(home: &Path, markers: &[&str]) -> Result<()> {
     if !markers.is_empty() {
         return Err(DuDuClawError::Config(format!(
             "AI 員工不能重新授權系統金鑰圈，請由管理者在這台機器的終端機執行（偵測到 {}）",
-            markers.join("、")
+            sanitize_output_text(&markers.join("、"))
         )));
     }
     let status = CredentialProtection::platform(home)
         .authorize()
-        .map_err(|e| DuDuClawError::Config(e.message_zh))?;
+        .map_err(|e| DuDuClawError::Config(sanitize_output_text(&e.message_zh)))?;
     print_status(&status, false);
     Ok(())
 }
 
 fn status_text(status: &ProtectionStatus) -> (String, String) {
-    use duduclaw_core::root_key::recovery::escape_diagnostic_text;
-    (escape_diagnostic_text(&status.summary_zh), escape_diagnostic_text(&status.detail_zh))
+    (sanitize_output_text(&status.summary_zh), sanitize_output_text(&status.detail_zh))
 }
 
 fn print_status(status: &ProtectionStatus, json: bool) {
     let (summary, detail) = status_text(status);
     if json {
-        let value = serde_json::json!({
+        let value = sanitize_output_value(serde_json::json!({
             "level": status.level,
             "platform_level": status.platform_level,
             "backend": status.backend,
@@ -72,7 +71,7 @@ fn print_status(status: &ProtectionStatus, json: bool) {
             "summary": summary,
             "detail": detail,
             "root_key_recovery": status.root_key_recovery,
-        });
+        }));
         println!("{value}");
         return;
     }

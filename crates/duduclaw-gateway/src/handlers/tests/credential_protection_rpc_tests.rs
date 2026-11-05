@@ -387,6 +387,8 @@ fn credential_protection_rpc_sanitizes_recovery_payload_and_display_text() {
     let hostile = "socket\u{1b}]52;fake\u{7}\n\u{9b}\u{202e}\u{7f}";
     status.summary_zh = hostile.into();
     status.detail_zh = hostile.into();
+    status.key_id = Some(hostile.into());
+    status.enabled_at = Some(hostile.into());
     status.root_key_recovery = Some(RecoveryStatus {
         latest_revocation: Some(Revocation {
             reason: "engine_socket_reachable".into(),
@@ -394,7 +396,7 @@ fn credential_protection_rpc_sanitizes_recovery_payload_and_display_text() {
         }), recovery: "waiting".into(),
     });
     let payload = status_json(&status);
-    for value in [&payload["summary"], &payload["detail"],
+    for value in [&payload["summary"], &payload["detail"], &payload["key_id"], &payload["enabled_at"],
         &payload["root_key_recovery"]["latest_revocation"]["detail"]] {
         let text = value.as_str().unwrap();
         assert!(!text.chars().any(char::is_control));

@@ -65,51 +65,7 @@ fn operator_gate() -> Result<()> {
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn unit_text() -> String {
-    let recovery_exit = duduclaw_core::root_key::RECOVERY_RESTART_EXIT_CODE;
-    format!(r"[Unit]
-Description=DuDuClaw protected gateway
-After=network-online.target
-Wants=network-online.target
-# Root-managed authority: at most four starts per hour, shared by recovery,
-# normal failures and manual starts. Even after an old long-lived start expires,
-# recovery cannot obtain a fifth start. The home JSON is only advisory.
-StartLimitIntervalSec=3600
-StartLimitBurst=4
-
-[Service]
-Type=simple
-ExecStart={LAUNCHER} {BINARY} run --yes
-# Stop every descendant before a fresh key handoff.
-KillMode=control-group
-Restart=on-failure
-RestartForceExitStatus={recovery_exit}
-RestartSec=5
-# Only service data and the root key provisioning directory are writable.
-ProtectSystem=strict
-ReadWritePaths=/var/lib/duduclaw /var/lib/duduclaw-protected
-ProtectHome=yes
-PrivateTmp=yes
-# Hide common engine endpoints; '-' tolerates hosts without those paths.
-InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock -/run/containerd -/run/podman -/var/run/podman -/run/user -/run/docker
-# Gateway tools need pseudo devices, not host hardware or raw block devices.
-PrivateDevices=yes
-# Neither the launcher nor gateway needs to change kernel settings or modules.
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-# PID 1 owns the unit cgroup; the gateway must not modify its hierarchy.
-ProtectControlGroups=yes
-# The launcher drops IDs directly; it does not need to create set-ID files.
-RestrictSUIDSGID=yes
-# No execution-domain changes or foreign syscall ABIs are needed.
-LockPersonality=yes
-SystemCallArchitectures=native
-# RestrictNamespaces is intentionally omitted: Codex/bwrap task sandboxes
-# need user, mount, PID and network namespaces. Do not set PrivateUsers.
-UMask=0077
-
-[Install]
-WantedBy=multi-user.target
-")
+    duduclaw_core::root_key::recovery::protected_unit_text()
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

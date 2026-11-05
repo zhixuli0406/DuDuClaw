@@ -111,6 +111,57 @@ fn atomic_install(path: &str, mode: u32, write: impl FnOnce(&mut fs::File) -> Re
     Ok(())
 }
 
+// Read and compare through the same pinned descriptor that was validated.
+fn update_text_if_different(path: &str, mode: u32, expected: &str) -> Result<bool> {
+    use std::io::Read;
+    parents(Path::new(path))?;
+    let installed = match fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path) {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.uid() != 0 || metadata.gid() != 0
+                || metadata.mode() & 0o7022 != 0 || metadata.nlink() != 1 {
+                return Err(refused("unsafe installed service contract"));
+            }
+            let mut bytes = Vec::new();
+            file.take(262145).read_to_end(&mut bytes)?;
+            if bytes.len() > 262144 { return Err(refused("installed service contract too large")); }
+            Some(bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if !duduclaw_core::root_key::recovery::protected_content_differs(installed.as_deref(), expected.as_bytes()) {
+        return Ok(false);
+    }
+    atomic_install(path, mode, |file| { file.write_all(expected.as_bytes())?; Ok(()) })?;
+    Ok(true)
+}
+
+const RECOVERY_BOUND: &str = "/etc/systemd/system/duduclaw-gateway.recovery-bound";
+
+fn invalidate_recovery_bound() -> Result<()> {
+    parents(Path::new(RECOVERY_BOUND))?;
+    match fs::symlink_metadata(RECOVERY_BOUND) {
+        Ok(_) => { trusted(Path::new(RECOVERY_BOUND), false)?; fs::remove_file(RECOVERY_BOUND)?; }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
+    fs::File::open("/etc/systemd/system")?.sync_all()?;
+    Ok(())
+}
+
+fn reload_and_certify_recovery() -> Result<()> {
+    checked("systemctl", &["daemon-reload"])?;
+    let output = checked("systemctl", &["show", UNIT, "-p", "StartLimitIntervalUSec",
+        "-p", "StartLimitBurst", "-p", "RestartForceExitStatus"])?;
+    let properties = std::str::from_utf8(&output.stdout).map_err(|_| refused("invalid unit properties"))?;
+    if !duduclaw_core::root_key::recovery::protected_properties_bounded(properties) {
+        return Err(refused("effective unit restart bounds differ; remove conflicting systemd overrides before upgrading"));
+    }
+    atomic_install(RECOVERY_BOUND, 0o644, |file| { file.write_all(unit_text().as_bytes())?; Ok(()) })
+}
+
 const VERSION_FLOOR: &str = "/var/lib/duduclaw-protected/version-floor";
 const VERSION_PENDING: &str = "/var/lib/duduclaw-protected/version-pending";
 
@@ -211,6 +262,7 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
         super::migrate::copy(&source, uid, gid, options.force_migrate)?;
         println!("個人連線使用不同的金鑰，搬移後必須重新連結。請先停止來源 Gateway，避免資料在複製時變動。");
     }
+    invalidate_recovery_bound()?;
     prepare_version(version)?;
     atomic_install(BINARY, 0o755, |target| {
         let mut source = fs::OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC).open("/proc/self/exe")?;
@@ -221,7 +273,7 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
     atomic_install(LAUNCHER, 0o755, |file| { file.write_all(LAUNCHER_TEXT.as_bytes())?; Ok(()) })?;
     atomic_install(UNIT_PATH, 0o644, |file| { file.write_all(unit_text().as_bytes())?; Ok(()) })?;
     record_floor(version)?;
-    checked("systemctl", &["daemon-reload"])?;
+    reload_and_certify_recovery()?;
     if was_active { checked("systemctl", &["restart", UNIT])?; }
     if options.enable_now { checked("systemctl", &["enable", "--now", UNIT])?; }
     println!("已安裝原生 Linux 憑證保護服務。啟動：sudo systemctl start {UNIT}");
@@ -233,7 +285,7 @@ pub(super) fn uninstall() -> Result<()> {
     gate()?;
     let _lock = version_lock()?;
     // Validate every removal before stopping anything; never follow a replaced path.
-    for file in [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING] {
+    for file in [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING, RECOVERY_BOUND] {
         let path = Path::new(file);
         parents(path)?;
         match fs::symlink_metadata(path) {
@@ -243,7 +295,7 @@ pub(super) fn uninstall() -> Result<()> {
         }
     }
     if Path::new(UNIT_PATH).exists() { checked("systemctl", &["disable", "--now", UNIT])?; }
-    for file in [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING] {
+    for file in [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING, RECOVERY_BOUND] {
         match fs::remove_file(file) {
             Ok(()) => (),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
@@ -295,11 +347,15 @@ pub(super) async fn upgrade(version: Option<&str>) -> Result<()> {
     };
     // Only bytes are installed. Never run the downloaded executable as root,
     // even for a version probe or to obtain its embedded launcher/unit.
+    invalidate_recovery_bound()?;
     prepare_version(&version)?;
     atomic_install(BINARY, 0o755, |target| {
         std::io::copy(&mut fs::File::open(&extracted)?, target)?;
         Ok(())
     })?;
+    update_text_if_different(LAUNCHER, 0o755, LAUNCHER_TEXT)?;
+    update_text_if_different(UNIT_PATH, 0o644, &unit_text())?;
+    reload_and_certify_recovery()?;
     record_floor(&version)?;
     if was_active { checked("systemctl", &["restart", UNIT])?; }
     println!("已驗證並安裝官方版本 {version}。現有資料與根金鑰保留。");

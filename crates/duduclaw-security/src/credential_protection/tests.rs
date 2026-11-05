@@ -55,6 +55,45 @@ fn fresh_home_is_file_level_and_refuses_person_identity() {
 }
 
 #[test]
+fn marker_read_rejects_noncanonical_identifiers_and_timestamps() {
+    let home = TempHome::new("marker-fields");
+    let (cp, _) = protection(&home);
+    cp.enable(false).unwrap();
+    let marker::MarkerRead::Present(original) = marker::read_marker(home.path()) else { panic!("valid marker") };
+    for key_id in ["0123456789abcde", "0123456789abcdef0", "0123456789abcdeF", "0123456789abcde\u{202e}", "0123456789abcde\u{9b}"] {
+        let mut changed = original.clone();
+        changed.key_id = key_id.into();
+        marker::write_marker(home.path(), &changed).unwrap();
+        assert!(matches!(marker::read_marker(home.path()), marker::MarkerRead::Invalid(_)));
+        let status = cp.status();
+        assert_eq!(status.state, ProtectionState::Invalid);
+        assert!(status.key_id.is_none());
+    }
+    for timestamp in ["2026-11-05T00:00:00+00:00", "2026-11-05t00:00:00z", "2026-11-05T00:00:00.000Z", "2026-11-05T00:00:00Z\u{202e}", "\u{9b}"] {
+        let mut changed = original.clone();
+        changed.enabled_at = timestamp.into();
+        marker::write_marker(home.path(), &changed).unwrap();
+        assert!(matches!(marker::read_marker(home.path()), marker::MarkerRead::Invalid(_)));
+        assert!(cp.status().enabled_at.is_none());
+    }
+    marker::write_marker(home.path(), &original).unwrap();
+    assert!(matches!(marker::read_marker(home.path()), marker::MarkerRead::Present(_)));
+}
+
+#[test]
+fn authorize_and_status_escape_untrusted_store_errors() {
+    let home = TempHome::new("hostile-store");
+    let (cp, store) = protection(&home);
+    cp.enable(false).unwrap();
+    store.force_read_error(Some(StoreError::Unavailable("hostile\u{1b}\u{9b}\u{202e}".into())));
+    let status = cp.status();
+    assert!(status.detail_zh.contains("hostile\\u{1b}\\u{9b}\\u{202e}"));
+    let error = cp.authorize().unwrap_err();
+    assert!(error.message_zh.contains("hostile\\u{1b}\\u{9b}\\u{202e}"));
+    assert!(!error.to_string().chars().any(char::is_control));
+}
+
+#[test]
 fn enable_then_seal_round_trips_and_marker_holds_no_key() {
     let home = TempHome::new("enable");
     home.hold_gateway_lock();

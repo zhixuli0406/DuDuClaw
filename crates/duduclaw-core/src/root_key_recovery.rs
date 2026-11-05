@@ -16,6 +16,9 @@ static RUNTIME: OnceLock<Mutex<Runtime>> = OnceLock::new();
 #[path = "root_key_recovery_files.rs"]
 mod files;
 use files::StateDir;
+#[path = "root_key_recovery_unit.rs"]
+mod unit;
+pub use unit::{protected_content_differs, protected_unit_text, protected_properties_bounded};
 
 macro_rules! diagnostic_enum {
     ($name:ident { $($variant:ident => $code:literal),+ $(,)? }) => {
@@ -82,6 +85,7 @@ diagnostic_enum! { RecoveryState {
     Monitoring => "monitoring",
     Waiting => "waiting",
     Disabled => "disabled",
+    UnitUpgradeRequired => "unit_upgrade_required",
     BudgetExhausted => "budget_exhausted",
     RestartRequested => "restart_requested",
     StateUnavailable => "state_unavailable",
@@ -264,6 +268,11 @@ pub(super) fn tick(kind: super::StateKind, reason: Option<&str>, passed: bool, c
         counter.check(false);
         return;
     }
+    tick_with_unit_bound(passed, counter, unit::installed_unit_bounded());
+}
+
+fn tick_with_unit_bound(passed: bool, counter: &mut ConsecutivePasses, unit_bounded: bool) {
+    if restart_requested() { counter.check(false); return; }
     let mut rt = runtime();
     let Some(home) = rt.home.clone() else { counter.check(false); return; };
     let desired = if !rt.state_ready {
@@ -272,6 +281,9 @@ pub(super) fn tick(kind: super::StateKind, reason: Option<&str>, passed: bool, c
     } else if !auto_recover(&home) {
         counter.check(false);
         "disabled"
+    } else if !unit_bounded {
+        counter.check(false);
+        "unit_upgrade_required"
     } else if !counter.check(passed) {
         "waiting"
     } else {
@@ -420,7 +432,7 @@ mod tests {
     fn root_key_recovery_orchestration_in_isolated_process() {
         const CASE: &str = "DUDUCLAW_TEST_KEY_RECOVERY_CASE";
         let Ok(case) = std::env::var(CASE) else {
-            for case in ["success", "disabled", "status_unwritable", "status_unreadable", "budget_unreadable"] {
+            for case in ["success", "unit_missing", "disabled", "status_unwritable", "status_unreadable", "budget_unreadable"] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "root_key::recovery::tests::root_key_recovery_orchestration_in_isolated_process", "--nocapture"])
                     .env(CASE, case).output().unwrap();
@@ -452,19 +464,19 @@ mod tests {
         }
         let mut counter = ConsecutivePasses::default();
         for _ in 0..2 {
-            tick(super::super::StateKind::Refused, Some("engine_socket_reachable"), true, &mut counter);
+            tick_with_unit_bound(true, &mut counter, case != "unit_missing");
             assert!(!restart_requested());
         }
-        tick(super::super::StateKind::Refused, Some("engine_socket_reachable"), true, &mut counter);
+        tick_with_unit_bound(true, &mut counter, case != "unit_missing");
         assert_eq!(restart_requested(), case == "success");
         if case == "success" {
             assert_eq!(read_json::<Budget>(&state_dir.join(BUDGET_FILE)).unwrap().restarts.len(), 1);
             assert_eq!(read_json::<RecoveryStatus>(&state_dir.join(STATUS_FILE)).unwrap().recovery.as_str(), "restart_requested");
-            for _ in 0..4 { tick(super::super::StateKind::Refused, Some("engine_socket_reachable"), true, &mut counter); }
+            for _ in 0..4 { tick_with_unit_bound(true, &mut counter, case != "unit_missing"); }
             assert_eq!(read_json::<Budget>(&state_dir.join(BUDGET_FILE)).unwrap().restarts.len(), 1);
         } else {
             assert_eq!(status(dir.path()).unwrap().recovery.as_str(),
-                if case == "disabled" { "disabled" } else { "state_unavailable" });
+                if case == "disabled" { "disabled" } else if case == "unit_missing" { "unit_upgrade_required" } else { "state_unavailable" });
         }
     }
 
