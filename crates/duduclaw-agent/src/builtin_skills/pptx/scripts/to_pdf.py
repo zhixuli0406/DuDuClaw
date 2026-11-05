@@ -55,11 +55,11 @@ def main():
         subprocess.run(
             [soffice, "--headless", "--convert-to", "pdf", "--outdir", outdir, args.input],
             check=True,
-            capture_output=True,
+            # Inherit the outer runner pipes so its hard output caps also cover LibreOffice.
             timeout=180,
         )
     except subprocess.CalledProcessError as e:  # noqa: PERF203
-        sys.stderr.write(f"Conversion failed: {e.stderr.decode(errors='replace')}\n")
+        sys.stderr.write(f"Conversion failed (exit {e.returncode}).\n")
         sys.exit(1)
     except subprocess.TimeoutExpired:
         sys.stderr.write("Conversion timed out after 180s.\n")

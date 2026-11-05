@@ -10615,6 +10615,16 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // write (they run as the operator's OS user at every spawn).
     checks.push(doctor_mcp_servers::mcp_servers_check(&home));
     checks.push(doctor_egress_leases::check(&home));
+    let office_conflicts = duduclaw_agent::builtin_skills::office_script_conflicts(&home.join("skills"));
+    checks.push((
+        "辦公文件腳本".into(),
+        if office_conflicts.is_empty() { CheckStatus::Pass } else { CheckStatus::Warn },
+        if office_conflicts.is_empty() {
+            "公司層腳本符合內建版本；執行時只使用程式內建腳本".into()
+        } else {
+            format!("公司層腳本有衝突，這些副本不會執行：{}", office_conflicts.join("；"))
+        },
+    ));
 
     // Check 4f: responsibilities whose runtimes may not report usage (M3-2).
     checks.push(responsibility_usage_check(&home).await);

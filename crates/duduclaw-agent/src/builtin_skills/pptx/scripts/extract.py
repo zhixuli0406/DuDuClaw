@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["python-pptx>=0.6.23"]
+# dependencies = ["python-pptx==1.0.2"]
 # ///
 """Extract slide text from a .pptx file.
 

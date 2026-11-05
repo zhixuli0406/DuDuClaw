@@ -150,6 +150,12 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 
 `tasks_create` 搭配 `kind="goal"`（非排程）時接受 `timeout_secs`，30～3600 的整數秒：這個目標每一輪的每次 CLI 執行／API 請求都用它，取代被指派員工的單次執行時間上限。透過 MCP 只能設成小於或等於員工本身的上限；要給目標更多時間，由管理員在儀表板交辦。Claude 員工不套用（固定 30 分鐘）。`tasks_update` 會拒絕這個欄位。例如 `{"kind":"goal","title":"核對帳目","assigned_to":"anna","timeout_secs":180}`。
 
+### `office_script` — 內建 Office 腳本
+
+`office_script` 會執行內嵌於程式、經 manifest 驗證的 `docx`、`xlsx`、`pptx` 或 `pdf` 腳本。可選 `create`、`extract` 或 `to_pdf`；`.py` 後綴可省略，腳本名稱不能含路徑。員工技能資料夾只能改變提示／指示，不能替換可執行腳本。此工具支援 Linux 與 macOS。
+
+`args` 必須是 JSON 字串陣列，例如 `["outline.md", "--out", "attachments/deck.pptx"]`。輸入檔可在員工目錄或共用附件；輸出必須是員工目錄內的新檔案，父目錄須已存在，副檔名須符合該腳本。旗標與值要分開傳入；拒絕 `--key=value`、符號連結及路徑穿越。若要交付產生的檔案，回覆最後一行使用 `DELIVER:<absolute path>`。
+
 ### `codrive_run` — 三段式執行階梯
 
 每個步驟依序嘗試三段，能用高的就用高的：

@@ -263,6 +263,22 @@ build the model's tool list from name, description and input schema only.
 
 `tasks_create` with `kind="goal"` (not scheduled) accepts `timeout_secs`, an integer from 30 to 3600: the limit for each CLI run / API request of that goal's rounds, replacing the assignee's own run limit. Over MCP it can only be shorter than or equal to that limit; giving a goal more time is an Admin decision on the dashboard. Claude employees ignore it (fixed 30-minute limit). `tasks_update` refuses the field. Example: `{"kind":"goal","title":"Reconcile the ledger","assigned_to":"anna","timeout_secs":180}`.
 
+### `office_script` — bundled office scripts
+
+`office_script` runs a manifest-verified script bundled in the binary for
+`docx`, `xlsx`, `pptx`, or `pdf`. Select `create`, `extract`, or `to_pdf`;
+`.py` is optional and script names cannot contain paths. Skills installed in an
+agent's skill folder may change the prompt/instructions, but cannot replace the
+executable script. This tool runs on Linux and macOS.
+
+Pass `args` as a JSON string array, for example `["outline.md", "--out",
+"attachments/deck.pptx"]`. Input may come from the agent directory or shared
+attachments. Output must be a new file under the agent directory, with an
+existing parent directory and the expected extension. Pass each flag and value
+as separate array elements; `--key=value`, symlinks and path traversal are
+refused. To hand a produced file to the user, end the reply with
+`DELIVER:<absolute path>`.
+
 ### `codrive_run` — the three-rung execution ladder
 
 Each step is dispatched through three rungs, tried in this order; prefer the

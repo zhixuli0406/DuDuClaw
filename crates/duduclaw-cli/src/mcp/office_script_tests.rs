@@ -42,97 +42,6 @@ fn is_err(v: &Value) -> bool {
     v.get("isError").and_then(|b| b.as_bool()).unwrap_or(false)
 }
 
-// ── Path sandbox validation ─────────────────────────────────────────
-#[test]
-fn arg_sandbox_allows_bare_flags_and_values() {
-    let root = std::path::Path::new("/home/agent");
-    let attach = std::path::Path::new("/home/attachments");
-    assert!(office_arg_within_sandbox("--format", root, attach));
-    assert!(office_arg_within_sandbox("json", root, attach));
-    assert!(office_arg_within_sandbox("outline.md", root, attach)); // relative, no sep
-}
-
-#[test]
-fn arg_sandbox_allows_paths_inside_agent_and_attachments() {
-    let root = std::path::Path::new("/home/agent");
-    let attach = std::path::Path::new("/home/attachments");
-    assert!(office_arg_within_sandbox(
-        "/home/agent/attachments/out.pptx",
-        root,
-        attach
-    ));
-    assert!(office_arg_within_sandbox(
-        "attachments/out.pptx",
-        root,
-        attach
-    )); // relative → joins root
-    assert!(office_arg_within_sandbox(
-        "/home/attachments/in.pptx",
-        root,
-        attach
-    ));
-}
-
-#[test]
-fn arg_sandbox_rejects_escapes_and_absolute_outside() {
-    let root = std::path::Path::new("/home/agent");
-    let attach = std::path::Path::new("/home/attachments");
-    assert!(!office_arg_within_sandbox("/etc/passwd", root, attach));
-    assert!(!office_arg_within_sandbox(
-        "../victim/secret.docx",
-        root,
-        attach
-    ));
-    assert!(!office_arg_within_sandbox(
-        "/home/agent/../victim/x",
-        root,
-        attach
-    ));
-}
-
-/// WP1.1 follow-up: a bare `--out SOUL.md` (no path separator at all)
-/// used to pass trivially — the "no separator ⇒ always allowed" branch
-/// ran before any containment check. This is the exact office_script
-/// gap the WP1.1 SOUL write-path inventory found: none of the C1–C4
-/// gates watch this tool, so it was a live way to overwrite a protected
-/// agent-structure file with arbitrary script output.
-#[test]
-fn arg_sandbox_rejects_bare_protected_structure_filenames() {
-    let root = std::path::Path::new("/home/agent");
-    let attach = std::path::Path::new("/home/attachments");
-    for bare in [
-        "SOUL.md",
-        "soul.md",
-        "agent.toml",
-        "CLAUDE.md",
-        "MEMORY.md",
-        "CONTRACT.toml",
-        ".mcp.json",
-    ] {
-        assert!(
-            !office_arg_within_sandbox(bare, root, attach),
-            "bare '{bare}' must be rejected"
-        );
-    }
-    // A full path to the same protected file, even though it resolves
-    // inside the sandbox, must be rejected the same way.
-    assert!(!office_arg_within_sandbox(
-        "/home/agent/SOUL.md",
-        root,
-        attach
-    ));
-    assert!(
-        !office_arg_within_sandbox("SOUL.MD", root, attach),
-        "case-insensitive"
-    );
-    // A normal output filename that merely CONTAINS "soul" is untouched.
-    assert!(office_arg_within_sandbox(
-        "soul-searching-report.docx",
-        root,
-        attach
-    ));
-}
-
 // ── Handler fail-closed input validation ────────────────────────────
 #[tokio::test]
 async fn rejects_unknown_skill() {
@@ -160,12 +69,13 @@ async fn rejects_script_with_path_separator() {
     assert!(text_of(&out).contains("Invalid script name"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn rejects_missing_script_file() {
+async fn rejects_script_outside_platform_manifest() {
     let home = TempHome::new();
     // Skill valid, stem valid, but no such script installed.
     let out = handle_office_script(
-        &serde_json::json!({ "skill": "pptx", "script": "create" }),
+        &serde_json::json!({ "skill": "pptx", "script": "untrusted" }),
         home.path(),
         "bot",
     )
@@ -182,14 +92,31 @@ async fn rejects_arg_escaping_sandbox() {
         &serde_json::json!({
             "skill": "pptx",
             "script": "create",
-            "args": ["/etc/passwd"]
+            "args": ["/etc/passwd", "--out", "out.pptx"]
         }),
         home.path(),
         "bot",
     )
     .await;
     assert!(is_err(&out));
-    assert!(text_of(&out).contains("escapes the agent sandbox"));
+    assert!(text_of(&out).contains("office_script refused"));
+}
+
+#[tokio::test]
+async fn office_script_preserves_disabled_and_unreadable_skill_gates() {
+    let home = TempHome::new();
+    let state = home.path().join("skill_state");
+    std::fs::create_dir(&state).unwrap();
+    for content in [r#"{"version":1,"disabled":["pdf"]}"#, "broken"] {
+        std::fs::write(state.join("bot.json"), content).unwrap();
+        let out = handle_office_script(
+            &serde_json::json!({ "skill": "pdf", "script": "create", "args": ["in.md", "--out", "out.pdf"] }),
+            home.path(), "bot",
+        ).await;
+        assert!(is_err(&out));
+        assert!(text_of(&out).contains("switched off"));
+        assert!(!home.path().join(".office-execution").exists());
+    }
 }
 
 #[tokio::test]
@@ -206,81 +133,17 @@ async fn rejects_non_string_arg() {
     assert!(text_of(&out).contains("must be a string"));
 }
 
-// ── Live execution (skips when no Python runner is on PATH) ──────────
-#[tokio::test]
-async fn runs_a_real_script_and_returns_stdout() {
-    // Only meaningful when `uv` or python3 exists — skip otherwise so CI
-    // on a runner without a Python toolchain does not fail.
-    let py = duduclaw_core::platform::python3_command();
-    let has_uv = std::process::Command::new("uv")
-        .arg("--version")
-        .output()
-        .is_ok();
-    let has_py = std::process::Command::new(py)
-        .arg("--version")
-        .output()
-        .is_ok();
-    if !has_uv && !has_py {
-        eprintln!("skipping: neither uv nor {py} available");
-        return;
-    }
-
-    let home = TempHome::new();
-    // A dependency-free script so `python3` fallback also works (uv would
-    // resolve PEP 723 deps, but we assert only on stdout here). The `.stem`
-    // is `extract` to exercise a real allowlisted name.
-    install_script(
-        home.path(),
-        "bot",
-        "pptx",
-        "extract",
-        "print('OFFICE_SCRIPT_OK')\n",
-    );
-    let out = handle_office_script(
-        &serde_json::json!({ "skill": "pptx", "script": "extract" }),
-        home.path(),
-        "bot",
-    )
-    .await;
-    assert!(!is_err(&out), "expected success, got: {}", text_of(&out));
-    assert!(text_of(&out).contains("OFFICE_SCRIPT_OK"));
-}
-
-// Shared defaults must execute from the same layer that owns the skill.
-#[tokio::test]
-async fn office_script_resolves_company_then_department_then_personal() {
-    let home = TempHome::new();
-    let global = home.path().join("skills/pdf/scripts");
-    std::fs::create_dir_all(&global).unwrap();
-    std::fs::write(global.join("create.py"), "company").unwrap();
-    std::fs::write(global.parent().unwrap().join("SKILL.md"), "# Company PDF").unwrap();
-    assert_eq!(resolve_office_script(home.path(), "bot", "pdf", "create").await.unwrap(), global.join("create.py").canonicalize().unwrap());
-    let agent = home.path().join("agents/bot");
-    std::fs::create_dir_all(&agent).unwrap();
-    std::fs::write(agent.join("agent.toml"), "[agent]\ndepartment = 'sales'\n").unwrap();
-    let dept = duduclaw_agent::skill_loader::department_skills_dir(home.path(), "sales").join("pdf/scripts");
-    std::fs::create_dir_all(&dept).unwrap();
-    std::fs::write(dept.join("create.py"), "department").unwrap();
-    std::fs::write(dept.parent().unwrap().join("SKILL.md"), "# Department PDF").unwrap();
-    assert_eq!(resolve_office_script(home.path(), "bot", "pdf", "create").await.unwrap(), dept.join("create.py").canonicalize().unwrap());
-    std::fs::create_dir_all(agent.join("SKILLS/pdf")).unwrap();
-    assert_eq!(resolve_office_script(home.path(), "bot", "pdf", "create").await.unwrap(), dept.join("create.py").canonicalize().unwrap(), "empty personal directory must not shadow department");
-    std::fs::write(agent.join("SKILLS/pdf/SKILL.md"), "# Personal PDF").unwrap();
-    assert!(resolve_office_script(home.path(), "bot", "pdf", "create").await.is_err(), "personal override without script must not fall back");
-    install_script(home.path(), "bot", "pdf", "create", "personal");
-    assert_eq!(resolve_office_script(home.path(), "bot", "pdf", "create").await.unwrap(), agent.join("SKILLS/pdf/scripts/create.py").canonicalize().unwrap());
-}
-
+// The executable and filesystem regressions run in duduclaw-agent's
+// office_execution::tests so they can be tested without compiling the gateway.
 #[cfg(unix)]
 #[tokio::test]
-async fn office_script_refuses_script_links_outside_the_skill() {
-    use std::os::unix::fs::symlink;
+async fn office_script_rejects_inline_output_flag_before_spawn() {
     let home = TempHome::new();
-    let scripts = home.path().join("skills/pdf/scripts");
-    std::fs::create_dir_all(&scripts).unwrap();
-    std::fs::write(scripts.parent().unwrap().join("SKILL.md"), "# Company PDF").unwrap();
-    let outside = home.path().join("outside.py");
-    std::fs::write(&outside, "print('outside')").unwrap();
-    symlink(&outside, scripts.join("create.py")).unwrap();
-    assert!(resolve_office_script(home.path(), "bot", "pdf", "create").await.is_err());
+    install_script(home.path(), "bot", "pdf", "create", "raise Exception('employee code')");
+    let out = handle_office_script(
+        &serde_json::json!({ "skill": "pdf", "script": "create", "args": ["in.md", "--out=/abs/out.pdf"] }),
+        home.path(), "bot",
+    ).await;
+    assert!(is_err(&out));
+    assert!(text_of(&out).contains("--key=value"));
 }

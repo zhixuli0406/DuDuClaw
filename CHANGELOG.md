@@ -17,6 +17,18 @@
 - 修正 v1.79.3 伺服器 Docker 映像因建置時漏複製 Google Chat 設定腳本而無法編譯的問題；新增 CI 檢查，確認編譯時嵌入的檔案都有複製進 Docker 建置階段。
 - 終端控制室的「紀錄」分頁不再錯誤顯示「閘道拒絕此請求」；閘道允許時即時追蹤目前選取的執行紀錄，否則定期刷新。
 
+### Security
+
+- 修正 office_script 共用 uv 快取可被解析器污染、跨員工傳遞資料的問題：可信 base 僅由不含使用者輸入的 host 暖快取建立，沙箱只讀 base，改用本次工作區內的獨立快取副本並於執行結束清除；保留明確 unsandboxed fallback，且不沿用舊可寫快取作為可信來源。
+
+- 修正 `office_script` HN2 runtime 根目錄重疊：Linux bwrap 與 macOS SBPL 建立前解析 home、私人工作／輸出、輸入、腳本、快取及 runtime 允許根目錄，雙向檢查相等或祖先重疊（含別名與 canonical 目標）。重疊或解析失敗預設拒絕，避免自訂 home 位於 `/usr/local`、`/opt/homebrew` 等目錄時暴露全域與其他員工資料；沿用既有明確 unsandboxed 豁免及一次性警告。
+
+- 修正 `office_script` HN2：隔離不可用時預設拒絕。Linux 改用 bwrap 強制檔案系統／網路隔離與 2 GiB RLIMIT_AS；macOS 以 deny-by-default sandbox-exec profile 限制檔案讀寫、禁止網路，嘗試 DATA／RSS 上限並驗證超限配置會遭拒。沿用 `[container.sandbox] script_when_unavailable = "run_unsandboxed"` 明確豁免，每個主機程序警告一次；不新增設定。隔離執行的 uv 一律離線，缺少套件快取時失敗。
+- `office_script` 固定直接 Python 依賴與套件發布截止時間，禁止 source build／自動下載 Python；system Python fallback 核對直接依賴版本。保留 CPU／檔案／程序／fd 上限、process group 清理及 stdout／stderr 各 32 KiB 限制，啟動前重驗腳本 hash 與 no-follow 私有路徑。**剩餘風險**：同 UID 主機程序仍可競態置換 pathname／快取；遞迴依賴尚無完整 hash lock。DATA／RSS 不保證所有 Darwin 主機可用，無效時拒絕；本機 sandbox-exec 被環境拒絕，成功隔離與真實 LibreOffice／Linux 驗收仍待完成。完整邊界見 `docs/features/05-security-defense.md`。
+
+- 辦公文件工具只執行通過編譯時 SHA-256 manifest 的內嵌腳本；個人、部門與公司技能只能覆蓋提示文字。輸入採 no-follow 快照，參數按腳本區分旗標與輸入／輸出，拒絕 `--out=/...` 等合併寫法；輸出由 Rust 以排他建立、no-follow 寫入員工目錄的新檔案，保留既有權限與文件限制。安全執行目前僅支援 Linux 與 macOS，其他平台拒絕。
+- 技能層根目錄與路徑元件拒絕符號連結；部門技能改讀權威 `org.toml` 並核對員工設定副本，無法驗證或不一致即排除部門層。公司層四項辦公技能的腳本全部通過 manifest 才寫入 migration 完成標記；衝突副本保留但永不執行，日誌與 doctor 顯示衝突。
+
 ## [1.79.3] - 2026-11-04 — 原生 Linux 我的連線、群組對話與會議逐字稿
 
 ### Added
