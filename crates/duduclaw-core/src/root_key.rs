@@ -5,6 +5,17 @@ use std::sync::{Mutex, OnceLock};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const KEY_PATH: &str = "/var/lib/duduclaw-protected/root.key";
+/// EX_TEMPFAIL: systemd must run the root launcher for a fresh intake.
+pub const RECOVERY_RESTART_EXIT_CODE: i32 = 75;
+#[path = "root_key_recovery.rs"]
+pub mod recovery;
+
+#[derive(Debug)]
+pub(super) struct Refusal { reason: &'static str, detail: Option<String> }
+impl From<&'static str> for Refusal {
+    fn from(reason: &'static str) -> Self { Self { reason, detail: None } }
+}
+
 const FD_ENV: &str = "DUDUCLAW_ROOT_KEY_FD";
 pub const MODE_ENV: &str = "DUDUCLAW_PROTECTED_KEY_MODE";
 
@@ -57,6 +68,7 @@ fn locked_state() -> Option<std::sync::MutexGuard<'static, State>> {
 fn revoke_state(state: &mut State, reason: &'static str) {
     if let State::Held(key) = state { key.as_mut().zeroize(); }
     *state = State::Refused(reason);
+    recovery::record_refusal(reason, None);
 }
 
 // Called with the state lock held: the Held check and zeroization are one transition.
@@ -148,22 +160,36 @@ pub fn attest(i: &AttestationInputs) -> Result<(), &'static str> {
 pub(crate) fn intake(hardening_failure: Option<&'static str>) {
     STATE.get_or_init(|| Mutex::new(intake_state(hardening_failure)));
     #[cfg(target_os = "linux")]
-    if is_held() && std::env::var_os(MODE_ENV).as_deref() == Some(std::ffi::OsStr::new("native-systemd")) {
+    if (is_held() || refused_reason().is_some_and(recovery::recoverable)) && std::env::var_os(MODE_ENV).as_deref() == Some(std::ffi::OsStr::new("native-systemd")) {
         static MONITOR: OnceLock<()> = OnceLock::new();
         MONITOR.get_or_init(|| {
             let uid = unsafe { libc::getuid() };
             if std::thread::Builder::new().name("protected-key-check".into()).spawn(move || {
+                let mut counter = recovery::ConsecutivePasses::default();
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(60));
                     let Some(mut state) = locked_state() else { break; };
-                    if !matches!(*state, State::Held(_)) { break; }
-                    // Keep key borrowers out until the check and any failed
-                    // Held -> Refused transition finish in this critical section.
-                    if let Err(reason) = native::reattest(uid) {
-                        revoke_if_held(&mut state, reason);
-                        tracing::warn!(reason, "Protected root key revoked; personal accounts unavailable until restart");
-                        break;
+                    // Keep key borrowers out through the probe and zeroization.
+                    let result = native::reattest(uid);
+                    if let Err(failure) = &result {
+                        let was_held = revoke_if_held(&mut state, failure.reason);
+                        // A new non-transient failure permanently stops recovery,
+                        // even if its probe passes again later in this process.
+                        let newly_non_transient = matches!(*state, State::Refused(reason) if recovery::recoverable(reason))
+                            && !recovery::recoverable(failure.reason);
+                        if newly_non_transient { revoke_state(&mut state, failure.reason); }
+                        if was_held || newly_non_transient {
+                            recovery::record_refusal(failure.reason, failure.detail.as_deref());
+                            tracing::warn!(reason = failure.reason, detail = ?failure.detail.as_deref().map(recovery::sanitize_diagnostic),
+                                "Protected root key revoked; personal accounts paused");
+                        }
                     }
+                    let (kind, reason) = match &*state {
+                        State::Held(_) => (StateKind::Held, None),
+                        State::Refused(reason) => (StateKind::Refused, Some(*reason)),
+                        State::NotOffered => (StateKind::NotOffered, None),
+                    };
+                    recovery::tick(kind, reason, result.is_ok(), &mut counter);
                 }
             }).is_err() { revoke("reattest_unavailable"); }
         });
@@ -175,19 +201,21 @@ fn intake_state(hardening_failure: Option<&'static str>) -> State {
         #[cfg(target_os = "linux")]
         let result = linux::take(&offered, hardening_failure);
         #[cfg(not(target_os = "linux"))]
-        let result: Result<Box<Zeroizing<[u8; 32]>>, &'static str> = {
+        let result: Result<Box<Zeroizing<[u8; 32]>>, Refusal> = {
             let _ = (offered, hardening_failure);
             #[cfg(unix)]
             unsafe { libc::close(3); }
-            Err("inactive")
+            Err("inactive".into())
         };
         match result {
             Ok(key) => State::Held(key),
-            Err(reason) => {
+            Err(failure) => {
+                let reason = failure.reason;
                 if reason == "mount_scan_incomplete" {
                     tracing::warn!("Mount table or mount points could not be inspected");
                 }
-                tracing::warn!(reason, "Protected root key refused; personal accounts remain disabled");
+                recovery::record_refusal(reason, failure.detail.as_deref());
+                tracing::warn!(reason, detail = ?failure.detail.as_deref().map(recovery::sanitize_diagnostic), "Protected root key refused; personal accounts remain disabled");
                 State::Refused(reason)
             }
         }
@@ -291,19 +319,19 @@ mod linux {
         fn drop(&mut self) { unsafe { libc::close(3); } }
     }
 
-    pub(super) fn take(offered: &OsStr, failure: Option<&'static str>) -> Result<Box<Zeroizing<[u8; 32]>>, &'static str> {
+    pub(super) fn take(offered: &OsStr, failure: Option<&'static str>) -> Result<Box<Zeroizing<[u8; 32]>>, Refusal> {
         let _close = CloseOffer;
-        if offered != "3" { return Err("fd_contract"); }
-        if let Some(reason) = failure { return Err(reason); }
+        if offered != "3" { return Err("fd_contract".into()); }
+        if let Some(reason) = failure { return Err(reason.into()); }
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: valid writable stat storage; fd 3 is the fixed intake contract.
-        if unsafe { libc::fstat(3, stat.as_mut_ptr()) } != 0 { return Err("fd_stat"); }
+        if unsafe { libc::fstat(3, stat.as_mut_ptr()) } != 0 { return Err("fd_stat".into()); }
         let stat = unsafe { stat.assume_init() };
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG { return Err("fd_type"); }
-        if stat.st_uid != 0 { return Err("fd_owner"); }
-        if stat.st_mode & 0o7777 != 0o400 { return Err("fd_mode"); }
-        if stat.st_nlink != 1 { return Err("fd_links"); }
-        if stat.st_size != 32 { return Err("fd_size"); }
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG { return Err("fd_type".into()); }
+        if stat.st_uid != 0 { return Err("fd_owner".into()); }
+        if stat.st_mode & 0o7777 != 0o400 { return Err("fd_mode".into()); }
+        if stat.st_nlink != 1 { return Err("fd_links".into()); }
+        if stat.st_size != 32 { return Err("fd_size".into()); }
         // Allocate before reading: no non-zeroizing temporary copy of the key.
         let mut key = Box::new(Zeroizing::new([0u8; 32]));
         let mut read = 0;
@@ -311,10 +339,15 @@ mod linux {
             let remaining = &mut key[read..];
             let n = unsafe { libc::read(3, remaining.as_mut_ptr().cast(), remaining.len()) };
             if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted { continue; }
-            if n <= 0 { return Err("fd_read"); }
+            if n <= 0 { return Err("fd_read".into()); }
             read += n as usize;
         }
-        attest(&gather()?)?;
+        let inputs = gather()?;
+        if let Err(reason) = attest(&inputs) {
+            return Err(Refusal { reason, detail: if reason == "engine_socket_reachable" {
+                inputs.native.engine_socket_detail
+            } else { None } });
+        }
         // Best effort only: cap_drop ALL usually prevents locking large regions.
         unsafe { libc::mlock(key.as_ptr().cast(), 32); }
         Ok(key)

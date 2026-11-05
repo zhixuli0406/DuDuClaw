@@ -377,3 +377,31 @@ fn missing_parent_before_existing_symlink_keeps_the_store_after_enable() {
     let physical = canonical.join("new-home");
     check_missing_home_identity_survives_enable(&home, &physical, &missing_ancestor);
 }
+
+#[test]
+fn credential_protection_rpc_sanitizes_recovery_payload_and_display_text() {
+    use duduclaw_core::root_key::recovery::{RecoveryStatus, Revocation};
+    use crate::handlers::credential_protection_rpc::{protection_for, status_json};
+    let home = tempfile::tempdir().unwrap();
+    let mut status = protection_for(home.path()).status();
+    let hostile = "socket\u{1b}]52;fake\u{7}\n\u{9b}\u{202e}\u{7f}";
+    status.summary_zh = hostile.into();
+    status.detail_zh = hostile.into();
+    status.key_id = Some(hostile.into());
+    status.enabled_at = Some(hostile.into());
+    status.root_key_recovery = Some(RecoveryStatus {
+        latest_revocation: Some(Revocation {
+            reason: "engine_socket_reachable".into(),
+            detail: Some(hostile.into()), timestamp: "2026-11-05T01:02:03Z".into(),
+        }), recovery: "waiting".into(),
+    });
+    let payload = status_json(&status);
+    for value in [&payload["summary"], &payload["detail"], &payload["key_id"], &payload["enabled_at"],
+        &payload["root_key_recovery"]["latest_revocation"]["detail"]] {
+        let text = value.as_str().unwrap();
+        assert!(!text.chars().any(char::is_control));
+        assert!(!text.contains('\u{202e}'));
+        assert!(text.contains("\\u{1b}"));
+        assert!(text.contains("\\u{202e}"));
+    }
+}

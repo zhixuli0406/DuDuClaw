@@ -738,6 +738,11 @@ export interface CredentialProtectionStatus {
   person_identity_allowed: boolean;
   /** Closed startup refusal code; never contains key material. */
   refusal_reason?: string | null;
+  /** Non-secret root-key history; this is not the current protection state. */
+  root_key_recovery?: {
+    latest_revocation: { reason: string; detail: string | null; timestamp: string } | null;
+    recovery: string;
+  } | null;
   /** zh-TW one-liner from the gateway (CLI uses the same text). */
   summary: string;
   detail: string;

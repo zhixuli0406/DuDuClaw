@@ -36,6 +36,8 @@ pub mod marker;
 mod messages;
 pub mod container_root;
 mod store;
+mod sanitizer;
+pub use sanitizer::{sanitize_output_text, sanitize_output_value};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -149,6 +151,8 @@ pub struct ProtectionStatus {
     pub detail_zh: String,
     /// Closed startup refusal code for localized dashboard diagnostics.
     pub refusal_reason: Option<&'static str>,
+    /// Latest root-key diagnostic and recovery state, without key material.
+    pub root_key_recovery: Option<duduclaw_core::root_key::recovery::RecoveryStatus>,
 }
 
 /// A refused operation. `code` is a closed set; `message_zh` is user-facing.
@@ -160,7 +164,7 @@ pub struct ProtectionError {
 
 impl ProtectionError {
     fn new(code: &'static str, message_zh: impl Into<String>) -> Self {
-        Self { code, message_zh: message_zh.into() }
+        Self { code, message_zh: sanitize_output_text(&message_zh.into()) }
     }
 
     fn from_state(state: ProtectionState, backend: BackendKind, extra: &str) -> Self {
@@ -373,7 +377,11 @@ impl CredentialProtection {
             },
         };
         let level = if state == ProtectionState::Ready { platform_level } else { ProtectionLevel::File };
-        let (summary_zh, detail_zh) = messages::state_text(state, level, backend, &extra);
+        let (summary_zh, mut detail_zh) = messages::state_text(state, level, backend, &extra);
+        let root_key_recovery = duduclaw_core::root_key::recovery::status(&self.home);
+        if let Some(recovery) = &root_key_recovery {
+            detail_zh.push_str(&messages::recovery_detail(recovery, self.store.refusal_reason().is_some()));
+        }
         ProtectionStatus {
             level,
             platform_level,
@@ -383,9 +391,10 @@ impl CredentialProtection {
             enabled_at,
             person_identity_allowed: state == ProtectionState::Ready
                 && level >= PERSON_IDENTITY_MIN_LEVEL,
-            summary_zh,
-            detail_zh,
+            summary_zh: sanitize_output_text(&summary_zh),
+            detail_zh: sanitize_output_text(&detail_zh),
             refusal_reason: self.store.refusal_reason(),
+            root_key_recovery,
         }
     }
 

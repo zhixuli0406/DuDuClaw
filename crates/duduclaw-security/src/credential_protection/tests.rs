@@ -55,6 +55,45 @@ fn fresh_home_is_file_level_and_refuses_person_identity() {
 }
 
 #[test]
+fn marker_read_rejects_noncanonical_identifiers_and_timestamps() {
+    let home = TempHome::new("marker-fields");
+    let (cp, _) = protection(&home);
+    cp.enable(false).unwrap();
+    let marker::MarkerRead::Present(original) = marker::read_marker(home.path()) else { panic!("valid marker") };
+    for key_id in ["0123456789abcde", "0123456789abcdef0", "0123456789abcdeF", "0123456789abcde\u{202e}", "0123456789abcde\u{9b}"] {
+        let mut changed = original.clone();
+        changed.key_id = key_id.into();
+        marker::write_marker(home.path(), &changed).unwrap();
+        assert!(matches!(marker::read_marker(home.path()), marker::MarkerRead::Invalid(_)));
+        let status = cp.status();
+        assert_eq!(status.state, ProtectionState::Invalid);
+        assert!(status.key_id.is_none());
+    }
+    for timestamp in ["2026-11-05T00:00:00+00:00", "2026-11-05t00:00:00z", "2026-11-05T00:00:00.000Z", "2026-11-05T00:00:00Z\u{202e}", "\u{9b}"] {
+        let mut changed = original.clone();
+        changed.enabled_at = timestamp.into();
+        marker::write_marker(home.path(), &changed).unwrap();
+        assert!(matches!(marker::read_marker(home.path()), marker::MarkerRead::Invalid(_)));
+        assert!(cp.status().enabled_at.is_none());
+    }
+    marker::write_marker(home.path(), &original).unwrap();
+    assert!(matches!(marker::read_marker(home.path()), marker::MarkerRead::Present(_)));
+}
+
+#[test]
+fn authorize_and_status_escape_untrusted_store_errors() {
+    let home = TempHome::new("hostile-store");
+    let (cp, store) = protection(&home);
+    cp.enable(false).unwrap();
+    store.force_read_error(Some(StoreError::Unavailable("hostile\u{1b}\u{9b}\u{202e}".into())));
+    let status = cp.status();
+    assert!(status.detail_zh.contains("hostile\\u{1b}\\u{9b}\\u{202e}"));
+    let error = cp.authorize().unwrap_err();
+    assert!(error.message_zh.contains("hostile\\u{1b}\\u{9b}\\u{202e}"));
+    assert!(!error.to_string().chars().any(char::is_control));
+}
+
+#[test]
 fn enable_then_seal_round_trips_and_marker_holds_no_key() {
     let home = TempHome::new("enable");
     home.hold_gateway_lock();
@@ -372,4 +411,48 @@ fn every_root_refusal_has_plain_chinese_text() {
         assert!(!error.message_zh.contains(code));
     }
     assert!(messages::refusal_text("unknown").is_none());
+}
+
+#[test]
+fn recovery_diagnostics_keep_socket_timestamp_and_history_distinct() {
+    use duduclaw_core::root_key::recovery::{RecoveryStatus, Revocation};
+    let mut status = RecoveryStatus {
+        latest_revocation: Some(Revocation {
+            reason: "engine_socket_reachable".into(),
+            detail: Some("@/containerd-shim/example (peer uid=0, root)".into()),
+            timestamp: "2026-11-05T01:02:03Z".into(),
+        }),
+        recovery: "waiting".into(),
+    };
+    let current = messages::recovery_detail(&status, true);
+    for expected in ["@/containerd-shim/example", "peer uid=0", "2026-11-05T01:02:03Z", "連續三次", "升級 containerd"] {
+        assert!(current.contains(expected), "missing {expected}");
+    }
+    let historical = messages::recovery_detail(&status, false);
+    assert!(historical.contains("以上是歷史記錄"));
+    assert!(!historical.contains("每分鐘重新檢查"));
+    for (code, expected) in [("disabled", "自動恢復已關閉"), ("budget_exhausted", "每小時四次"),
+        ("state_unavailable", "不會自動重啟"), ("non_transient", "此原因不會自動恢復")] {
+        status.recovery = code.into();
+        assert!(messages::recovery_detail(&status, true).contains(expected));
+    }
+}
+
+#[test]
+fn recovery_diagnostic_messages_escape_terminal_and_bidi_controls() {
+    use duduclaw_core::root_key::recovery::{RecoveryStatus, Revocation};
+    let status = RecoveryStatus {
+        latest_revocation: Some(Revocation {
+            reason: "engine_socket_reachable".into(),
+            detail: Some("@docker\u{1b}]52;fake\u{7}\nforged\u{202e}\u{9b}".into()),
+            timestamp: "2026-11-05T01:02:03Z".into(),
+        }),
+        recovery: "waiting".into(),
+    };
+    let text = messages::recovery_detail(&status, true);
+    assert!(!text.chars().any(char::is_control));
+    assert!(!text.contains('\u{202e}'));
+    for escaped in ["\\u{1b}", "\\u{7}", "\\u{a}", "\\u{202e}", "\\u{9b}"] {
+        assert!(text.contains(escaped), "missing {escaped}");
+    }
 }

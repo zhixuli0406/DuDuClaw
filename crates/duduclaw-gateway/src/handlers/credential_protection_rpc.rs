@@ -10,7 +10,7 @@
 use super::*;
 
 use duduclaw_security::audit::{AuditEvent, Severity};
-use duduclaw_security::credential_protection::{CredentialProtection, ProtectionState, ProtectionStatus};
+use duduclaw_security::credential_protection::{CredentialProtection, ProtectionState, ProtectionStatus, sanitize_output_text, sanitize_output_value};
 
 /// The protection for this home. Production uses the platform store; unit
 /// tests get a per-home in-memory store so no test ever touches a real
@@ -35,7 +35,7 @@ pub(crate) fn protection_for(home: &Path) -> CredentialProtection {
 /// The JSON the dashboard reads. Explicit fields — never a serialization of
 /// anything that could one day grow a secret.
 pub(crate) fn status_json(s: &ProtectionStatus) -> Value {
-    json!({
+    sanitize_output_value(json!({
         "level": s.level,
         "platform_level": s.platform_level,
         "backend": s.backend,
@@ -43,10 +43,11 @@ pub(crate) fn status_json(s: &ProtectionStatus) -> Value {
         "key_id": s.key_id,
         "enabled_at": s.enabled_at,
         "person_identity_allowed": s.person_identity_allowed,
-        "summary": s.summary_zh,
-        "detail": s.detail_zh,
+        "summary": sanitize_output_text(&s.summary_zh),
+        "detail": sanitize_output_text(&s.detail_zh),
         "refusal_reason": s.refusal_reason,
-    })
+        "root_key_recovery": s.root_key_recovery,
+    }))
 }
 
 async fn on_blocking<T: Send + 'static>(
@@ -55,7 +56,7 @@ async fn on_blocking<T: Send + 'static>(
 ) -> Result<T, String> {
     tokio::task::spawn_blocking(move || f(protection_for(&home)))
         .await
-        .map_err(|e| format!("憑證保護作業中斷：{e}"))
+        .map_err(|e| sanitize_output_text(&format!("憑證保護作業中斷：{e}")))
 }
 
 fn audit(
@@ -72,7 +73,7 @@ fn audit(
             event,
             "dashboard",
             severity,
-            json!({
+            sanitize_output_value(json!({
                 "actor_user_id": ctx.map(|c| c.user_id.clone()),
                 "actor_email": ctx.map(|c| c.email.clone()),
                 "state": s.map(|s| s.state),
@@ -80,7 +81,7 @@ fn audit(
                 "level": s.map(|s| s.level),
                 "backend": s.map(|s| s.backend),
                 "key_id": s.and_then(|s| s.key_id.clone()),
-            }),
+            })),
         ),
     );
 }
@@ -113,7 +114,7 @@ impl MethodHandler {
                 audit_broken_once(&self.home_dir, &s);
                 WsFrame::ok_response("", status_json(&s))
             }
-            Err(e) => WsFrame::error_response("", &e),
+            Err(e) => WsFrame::error_response("", &sanitize_output_text(&e)),
         }
     }
 
@@ -141,9 +142,9 @@ impl MethodHandler {
             }
             Ok(Err(e)) => {
                 audit(&self.home_dir, "credential_protection_enable_failed", Severity::Warning, Some(ctx), None, None);
-                WsFrame::error_response("", &e.message_zh)
+                WsFrame::error_response("", &sanitize_output_text(&e.message_zh))
             }
-            Err(e) => WsFrame::error_response("", &e),
+            Err(e) => WsFrame::error_response("", &sanitize_output_text(&e)),
         }
     }
 
@@ -166,8 +167,8 @@ impl MethodHandler {
                 audit(&self.home_dir, "credential_protection_disabled", Severity::Critical, Some(ctx), None, None);
                 WsFrame::ok_response("", status_json(&s))
             }
-            Ok(Err(e)) => WsFrame::error_response("", &e.message_zh),
-            Err(e) => WsFrame::error_response("", &e),
+            Ok(Err(e)) => WsFrame::error_response("", &sanitize_output_text(&e.message_zh)),
+            Err(e) => WsFrame::error_response("", &sanitize_output_text(&e)),
         }
     }
 }

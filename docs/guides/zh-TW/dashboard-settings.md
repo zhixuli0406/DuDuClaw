@@ -500,6 +500,8 @@ IPv4 位址、技術人員與本機指紋、到期時間、連線與登入失敗
 - **停用**（`security.credential_protection_disable`，`confirm: true`，需輸入
   確認文字）刪除金鑰，已保存的個人憑證作廢。
 
+[原生 Linux 受保護服務](linux-protected-service.md#容器引擎介面暴露後的恢復)的卡片也會顯示最近的根金鑰撤銷、UTC 時間與具體的引擎 socket 診斷。介面暴露期間個人帳號暫停；預設每隔 60 秒檢查，連續通過三次後正常關機，再由 root 啟動器重新交接金鑰，每個滾動小時最多四次恢復重啟。狀態檔讀寫失敗會阻止自動恢復。本次沒有新增儀表板開關；要維持人工重啟方式，請在 `config.toml` 設定 `[credential_protection] auto_recover = false`。
+
 終端機用 `duduclaw credentials status`（腳本可加 `--json`）看同樣的狀態。細節見
 [安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈v1760)。
 

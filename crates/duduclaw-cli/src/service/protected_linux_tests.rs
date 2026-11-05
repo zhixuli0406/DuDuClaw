@@ -5,6 +5,7 @@ fn service_protected_unit_has_fixed_root_launcher_and_hardening() {
     let unit = unit_text();
     let lines: Vec<_> = unit.lines().collect();
     for required in ["Type=simple", "ExecStart=/usr/local/libexec/duduclaw/protected-launcher /opt/duduclaw/bin/duduclaw run --yes",
+        "StartLimitIntervalSec=3600", "StartLimitBurst=4",
         "KillMode=control-group", "Restart=on-failure", "ProtectSystem=strict",
         "ReadWritePaths=/var/lib/duduclaw /var/lib/duduclaw-protected", "ProtectHome=yes", "PrivateTmp=yes", "UMask=0077",
         "PrivateDevices=yes", "ProtectKernelTunables=yes", "ProtectKernelModules=yes",
@@ -14,7 +15,14 @@ fn service_protected_unit_has_fixed_root_launcher_and_hardening() {
         assert!(lines.contains(&required), "missing {required}");
     }
     assert!(!lines.iter().any(|line| line.split_once('=').is_some_and(|(key, _)| matches!(key, "User" | "Environment" | "EnvironmentFile"))));
+    let unit_section = unit.split("[Service]").next().unwrap();
+    assert!(unit_section.lines().any(|line| line == "StartLimitIntervalSec=3600"));
+    assert!(unit_section.lines().any(|line| line == "StartLimitBurst=4"));
     assert!(!lines.iter().any(|line| line.starts_with("RestrictNamespaces=")));
+    assert!(lines.contains(&format!("RestartForceExitStatus={}",
+        duduclaw_core::root_key::RECOVERY_RESTART_EXIT_CODE).as_str()));
+    assert!(!lines.iter().any(|line| line.starts_with("RestartPreventExitStatus=")
+        || line.starts_with("SuccessExitStatus=")));
     assert!(LAUNCHER_TEXT.starts_with("#!/bin/sh\n"));
 }
 
