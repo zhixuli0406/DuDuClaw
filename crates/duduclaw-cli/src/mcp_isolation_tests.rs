@@ -373,3 +373,60 @@ async fn isolated_round5_workflow_session_is_host_only_and_bound_to_one_run() {
     assert!(other.to_string().contains("workflow extension unavailable"), "{other}");
     assert!(!other.to_string().contains(&secret));
 }
+
+#[tokio::test]
+async fn i1c_protected_fetch_without_origin_resolver_never_uses_legacy_fetch() {
+    let home = tempfile::tempdir().unwrap();
+    let mut isolated = call();
+    Arc::get_mut(&mut isolated).unwrap().home = home.path().to_owned();
+    ISOLATED_CALL.scope(isolated, async {
+        let response = crate::mcp::handle_web_fetch_cached(
+            &json!({"url":"http://127.0.0.1/","ttl_seconds":60}), home.path()).await;
+        assert_eq!(response["isError"], true);
+        assert_eq!(response["content"][0]["text"], "無法在授權範圍內取得這個網頁，已停止。");
+        assert!(!home.path().join("web_cache").exists());
+    }).await;
+}
+
+#[tokio::test]
+async fn i1c_protected_fetch_listing_still_requires_origin_and_resolver_without_worker() {
+    for (resolver, origin, expected) in [(false, true, false), (true, false, false), (true, true, true)] {
+        let mut isolated = call();
+        let call = Arc::get_mut(&mut isolated).unwrap();
+        let mut record = call.context.record().clone();
+        record.tools = List::new(vec![Text::new("web_fetch_cached".into()).unwrap()]).unwrap();
+        let mut resources = vec![ResourceGrant::Employee { id: record.employee }];
+        if origin { resources.push(ResourceGrant::UrlOrigin { origin: Text::new("https://example.com".into()).unwrap() }); }
+        record.resources = List::new(resources).unwrap();
+        call.context = RequestContext::from_verified_record(record);
+        if resolver { call.record_resolver = Some(Arc::new(RecordProbe)); }
+        let mut principal = principal();
+        principal.scopes.insert(crate::mcp_auth::Scope::Admin);
+        ISOLATED_CALL.scope(isolated, async {
+            assert_eq!(tool_allowed("web_fetch_cached", &principal), expected);
+            assert!(!tool_allowed("web_extract", &principal));
+        }).await;
+    }
+}
+
+#[test]
+fn i1c_curator_control_accepts_only_typed_run_flag() {
+    assert!(check_tool_arguments("skill_curator_status", &json!({})).is_ok());
+    for value in [false, true] { assert!(check_tool_arguments("skill_curator_status", &json!({"run":value})).is_ok()); }
+    for args in [json!({"run":"false"}),json!({"run":null}),json!({"agent_id":"alice"}),json!([])] {
+        assert!(check_tool_arguments("skill_curator_status", &args).is_err());
+    }
+    assert!(matches!(boundary_route("skill_curator_status"), Some(BoundaryRoute::GatewayHandler(_))));
+}
+
+#[test]
+fn i1c_host_e_controls_retain_resource_eligibility_and_exact_inventory() {
+    for name in ["skill_from_recording", "skill_hub_install", "skill_curator_status", "skill_synthesis_run", "meeting_transcribe"] {
+        assert!(super::host_e_control(name));
+        assert!(duduclaw_mcp_boundary::tool_policy::policy(name).unwrap().required.contains(
+            &duduclaw_mcp_boundary::tool_policy::ResourceKind::Employee));
+    }
+    for name in ["skill_hub_install_extra", "meeting_transcribe_status", "route_query"] {
+        assert!(!super::host_e_control(name));
+    }
+}

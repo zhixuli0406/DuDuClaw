@@ -73,3 +73,119 @@ pub fn inspect_document_bytes(bytes: &[u8], policy: DocumentPolicy) -> Result<()
 pub fn inspect_document_file(file: &mut File, policy: DocumentPolicy) -> Result<(), ParseError> {
     inspect_document_reader(file, policy)
 }
+
+/// Inspect the actual snapshot; provider selection and credentials stay host-owned.
+pub fn inspect_audio_file(file: &mut File) -> Result<(AudioFormat, u64), ParseError> {
+    let request = client::request(ParseOperation::InspectAudio, ContentFormat::Audio, 0);
+    match client::invoke_reader(&request, file)?.result {
+        ParseResult::Complete { items } => match items.as_slice() {
+            [ParsedItem::Audio { input_slot: 0, format, sample_rate, frames, .. }] => {
+                let millis = frames.checked_mul(1000).ok_or(ParseError::LimitExceeded)?
+                    .checked_div(u64::from(*sample_rate)).ok_or(ParseError::InvalidContent)?;
+                if millis == 0 { return Err(ParseError::InvalidContent); }
+                Ok((*format, millis))
+            }
+            _ => Err(ParseError::InvalidContent),
+        },
+        ParseResult::Failed { code } => Err(code),
+    }
+}
+
+pub fn summarize_recording(bytes: &[u8], desktop: bool, name: &str) -> Result<RecordingSummary, ParseError> {
+    let options = ParseOptions::Recording { desktop,
+        name: duduclaw_isolation::bounded::Text::new(name.to_owned()).map_err(|_| ParseError::InvalidContent)? };
+    match invoke(&mut std::io::Cursor::new(bytes), ParseOperation::SummarizeRecording,
+        ContentFormat::Text, options, None)?.result {
+        ParseResult::Complete { items } => match items.as_slice() {
+            [ParsedItem::Recording { input_slot: 0, summary }] => Ok(summary.clone()),
+            _ => Err(ParseError::InvalidContent),
+        },
+        ParseResult::Failed { code } => Err(code),
+    }
+}
+/// Scan model output as a real bounded file before approval/publication.
+pub fn scan_skill_bytes(bytes: &[u8]) -> Result<(bool, String, Vec<String>), ParseError> {
+    let options = ParseOptions::SkillScan { must_not: duduclaw_isolation::bounded::List::new(vec![])
+        .map_err(|_| ParseError::InvalidContent)? };
+    match invoke(&mut std::io::Cursor::new(bytes), ParseOperation::ScanSkill,
+        ContentFormat::Text, options, None)?.result {
+        ParseResult::Complete { items } => match items.as_slice() {
+            [ParsedItem::SkillScan { input_slot: 0, passed, risk, findings }] => Ok((*passed,
+                risk.as_str().to_owned(), findings.as_slice().iter().map(|f| f.as_str().to_owned()).collect())),
+            _ => Err(ParseError::InvalidContent),
+        },
+        ParseResult::Failed { code } => Err(code),
+    }
+}
+
+pub fn inspect_skill_manifest(bytes: &[u8], name: &str) -> Result<(bool, String, usize), ParseError> {
+    let options = ParseOptions::SkillManifest { name: duduclaw_isolation::bounded::Text::new(name.to_owned())
+        .map_err(|_| ParseError::InvalidContent)? };
+    match invoke(&mut std::io::Cursor::new(bytes), ParseOperation::InspectSkillManifest,
+        ContentFormat::Text, options, None)?.result {
+        ParseResult::Complete { items } => match items.as_slice() {
+            [ParsedItem::SkillScan { input_slot: 0, passed, risk, findings }] => Ok((*passed, risk.as_str().to_owned(), findings.as_slice().len())),
+            _ => Err(ParseError::InvalidContent),
+        },
+        ParseResult::Failed { code } => Err(code),
+    }
+}
+
+pub fn read_evolution_events(bytes: &[u8]) -> Result<String, ParseError> {
+    let request = client::request(ParseOperation::ReadEvolutionEvents, ContentFormat::Text, 0);
+    match client::invoke_reader(&request, &mut std::io::Cursor::new(bytes))?.result {
+        ParseResult::Complete { items } => {
+            let mut text = String::new();
+            for item in items.as_slice() {
+                let ParsedItem::Text { input_slot: 0, page: None, text: part } = item else { return Err(ParseError::InvalidContent); };
+                text.push_str(part.as_str());
+            }
+            Ok(text)
+        }
+        ParseResult::Failed { code } => Err(code),
+    }
+}
+
+
+pub fn read_skill_identity(bytes: &[u8]) -> Result<String, ParseError> {
+    let request = client::request(ParseOperation::ReadSkillIdentity, ContentFormat::Text, bytes.len() as u64);
+    match client::invoke_reader(&request, &mut std::io::Cursor::new(bytes))?.result {
+        ParseResult::Complete { items } => match items.as_slice() {
+            [ParsedItem::Text { input_slot: 0, page: None, text }] if !text.as_str().is_empty()
+                && text.as_str().len() <= 64
+                && text.as_str().bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Ok(text.as_str().to_owned()),
+            _ => Err(ParseError::InvalidContent),
+        },
+        ParseResult::Failed { code } => Err(code),
+    }
+}
+
+pub fn prepare_synthesized_skill(bytes: &[u8], agent: &str, at: &str) -> Result<String, ParseError> {
+    use duduclaw_isolation::bounded::Text;
+    let options = ParseOptions::SynthesizedSkill {
+        agent: Text::new(agent.to_owned()).map_err(|_| ParseError::InvalidContent)?,
+        at: Text::new(at.to_owned()).map_err(|_| ParseError::InvalidContent)?,
+    };
+    match invoke(&mut std::io::Cursor::new(bytes), ParseOperation::PrepareSynthesizedSkill,
+        ContentFormat::Text, options, None)?.result {
+        ParseResult::Complete { items } => match items.as_slice() {
+            [ParsedItem::PreparedSkill { input_slot: 0, content }] => Ok(content.as_str().to_owned()),
+            _ => Err(ParseError::InvalidContent),
+        },
+        ParseResult::Failed { code } => Err(code),
+    }
+}
+
+
+pub fn inspect_skill_identity(bytes: &[u8], name: &str) -> Result<String, ParseError> {
+    let options = ParseOptions::SkillIdentity { name: duduclaw_isolation::bounded::Text::new(name.to_owned())
+        .map_err(|_| ParseError::InvalidContent)? };
+    match invoke(&mut std::io::Cursor::new(bytes), ParseOperation::ReadSkillIdentity,
+        ContentFormat::Text, options, None)?.result {
+        ParseResult::Complete { items } => match items.as_slice() {
+            [ParsedItem::Text { input_slot: 0, page: None, text }] if text.as_str() == name => Ok(text.as_str().to_owned()),
+            _ => Err(ParseError::InvalidContent),
+        },
+        ParseResult::Failed { code } => Err(code),
+    }
+}

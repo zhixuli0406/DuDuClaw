@@ -302,6 +302,27 @@ fn load_cache(url: &str, ttl_seconds: u64, cache_dir: &Path) -> Option<FetchResu
     })
 }
 
+/// Protected reads are bounded before allocation and bind metadata to the
+/// exact requested URL, even when legacy key normalization merges two URLs.
+fn load_protected_cache(url: &str, ttl_seconds: u64, cache_dir: &Path) -> Option<FetchResult> {
+    use std::io::Read;
+    let body_path = cache_path(url, cache_dir);
+    let mut metadata = Vec::new();
+    std::fs::File::open(body_path.with_extension("meta.json")).ok()?
+        .take(16 * 1024 + 1).read_to_end(&mut metadata).ok()?;
+    if metadata.len() > 16 * 1024 { return None; }
+    let meta: CacheMeta = serde_json::from_slice(&metadata).ok()?;
+    let age = Utc::now().signed_duration_since(meta.fetched_at).num_seconds();
+    if meta.url != url || !(200..300).contains(&meta.status_code) || age < 0 || age as u64 > ttl_seconds {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(body_path).ok()?.take(MAX_RESPONSE_SIZE + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_RESPONSE_SIZE { return None; }
+    Some(FetchResult { url: meta.url, status_code: meta.status_code, content_type: meta.content_type,
+        body: String::from_utf8(bytes).ok()?, cached: true, fetched_at: meta.fetched_at })
+}
+
 /// Persist a fetch result to the cache directory.
 fn save_cache(result: &FetchResult, cache_dir: &Path) -> Result<(), FetchError> {
     std::fs::create_dir_all(cache_dir).map_err(|e| FetchError::IoError(e.to_string()))?;
@@ -396,7 +417,22 @@ pub async fn web_fetch_cached(
     ttl_seconds: u64,
     cache_dir: &Path,
 ) -> Result<FetchResult, FetchError> {
-    web_fetch_inner(url, ttl_seconds, cache_dir, false).await
+    web_fetch_inner(url, ttl_seconds, cache_dir, false, false).await
+}
+
+/// Protected MCP fetches may only contact the granted origin. Do not follow
+/// redirects or reuse a cache populated by the legacy redirecting client.
+pub async fn web_fetch_protected_cached(url: &str, ttl_seconds: u64, cache_dir: &Path)
+    -> Result<FetchResult, FetchError> {
+    validate_workflow_public_url(url)?;
+    web_fetch_inner(url, ttl_seconds, &cache_dir.join("protected-no-redirect-v1"), false, true).await
+}
+
+/// One gateway-wide 10/minute budget shared by protected fetch and extraction,
+/// including cache hits. Recreating a per-run factory cannot reset this limit.
+pub fn admit_protected_tool_fetch() -> bool {
+    static LIMITER: std::sync::LazyLock<RateLimiter> = std::sync::LazyLock::new(RateLimiter::new);
+    LIMITER.check("protected-mcp")
 }
 
 /// Workflow-only public-page read: same URL/DNS/SSRF limits, no redirects,
@@ -418,7 +454,7 @@ pub fn validate_workflow_public_url(url: &str) -> Result<reqwest::Url, FetchErro
 }
 pub async fn web_fetch_workflow(url: &str) -> Result<FetchResult, FetchError> {
     validate_workflow_public_url(url)?;
-    web_fetch_inner(url, 0, Path::new(""), true).await
+    web_fetch_inner(url, 0, Path::new(""), true, false).await
 }
 
 async fn web_fetch_inner(
@@ -426,6 +462,7 @@ async fn web_fetch_inner(
     ttl_seconds: u64,
     cache_dir: &Path,
     workflow: bool,
+    protected: bool,
 ) -> Result<FetchResult, FetchError> {
     // 1. SSRF check.
     let validated = validate_url(url)?;
@@ -438,14 +475,16 @@ async fn web_fetch_inner(
     };
 
     if !workflow {
-        if let Some(hit) = load_cache(url, ttl, cache_dir) {
+        let cached = if protected { load_protected_cache(url, ttl, cache_dir) }
+            else { load_cache(url, ttl, cache_dir) };
+        if let Some(hit) = cached {
             info!(url, "web_fetch cache hit");
             return Ok(hit);
         }
     }
 
     // 3. Live fetch.
-    let (status, content_type, bytes) = fetch_live(url, validated, workflow).await?;
+    let (status, content_type, bytes) = fetch_live(url, validated, workflow || protected).await?;
 
     let body = if workflow {
         String::from_utf8(bytes)
@@ -546,7 +585,11 @@ async fn fetch_live(
         }
     });
 
-    let pinned_client = reqwest::Client::builder()
+    let mut client_builder = reqwest::Client::builder();
+    // Proxy environment variables must not bypass the pinned destination of a
+    // protected/no-redirect request (including workflow public reads).
+    if workflow { client_builder = client_builder.no_proxy(); }
+    let pinned_client = client_builder
         .timeout(std::time::Duration::from_secs(CLIENT_TIMEOUT_SECONDS))
         .redirect(redirect_policy)
         .resolve_to_addrs(&host, &resolved_addrs)
@@ -924,5 +967,97 @@ mod tests {
             assert!(limiter.check("agent-x"));
         }
         assert!(!limiter.check("agent-x"));
+    }
+}
+
+#[cfg(test)]
+mod i1c_protected_tests {
+    use super::*;
+
+    fn result(url: &str) -> FetchResult {
+        FetchResult { url: url.into(), status_code: 200, content_type: "text/html".into(),
+            body: "<p>safe cached bytes</p>".into(), cached: false, fetched_at: Utc::now() }
+    }
+    #[tokio::test]
+    async fn i1c_protected_cache_is_separate_and_userinfo_is_refused_before_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://example.com/page";
+        save_cache(&result(url), dir.path()).unwrap();
+        let protected = dir.path().join("protected-no-redirect-v1");
+        assert!(load_protected_cache(url, 60, &protected).is_none());
+        save_cache(&result(url), &protected).unwrap();
+        let fetched = web_fetch_protected_cached(url, 60, dir.path()).await.unwrap();
+        assert!(fetched.cached);
+        assert_eq!(fetched.body, "<p>safe cached bytes</p>");
+        let credential_url = "https://user:password@example.com/page";
+        save_cache(&result(credential_url), &protected).unwrap();
+        assert!(matches!(web_fetch_protected_cached(credential_url, 60, dir.path()).await,
+            Err(FetchError::SsrfBlocked(_))));
+    }
+    #[tokio::test]
+    async fn i1c_product_factory_passes_cached_html_fd_to_worker_and_preserves_result() {
+        use std::io::Read;
+        use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord,
+            EmployeeBinding, Lane, Principal, ResourceGrant}, ids::{EmployeeId, RunId, Sha256Digest},
+            worker::{ParseResponse, ParseResult, ParsedItem}};
+        use duduclaw_mcp_boundary::{RequestContext, VerificationError,
+            tool_policy::{ResourceResolver, ToolPolicy}, worker_execution::{WorkerToolBridge, WorkerReply}};
+        struct Resolver(Vec<ResourceGrant>);
+        impl ResourceResolver for Resolver {
+            fn resolve(&self, _: &RequestContext, _: &ToolPolicy, _: &serde_json::Value)
+                -> Result<Vec<ResourceGrant>, VerificationError> { Ok(self.0.clone()) }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let url = "https://example.com/page";
+        let cache = home.path().join("web_cache/protected-no-redirect-v1");
+        save_cache(&result(url), &cache).unwrap();
+        let resources = vec![ResourceGrant::Employee { id: EmployeeId([2; 16]) },
+            ResourceGrant::UrlOrigin { origin: Text::new("https://example.com".into()).unwrap() }];
+        let context = RequestContext::from_verified_record(CapabilityRecord {
+            id: CapabilityId(Sha256Digest([1; 32])), employee: EmployeeId([2; 16]), run: RunId([3; 16]),
+            task: None, principal: Principal::Human { user_id: Text::new("owner".into()).unwrap(), generation: 1 },
+            employee_binding: EmployeeBinding::Personal(Text::new("owner".into()).unwrap()), lane: Lane::Standard,
+            tools: List::new(vec![Text::new("web_extract".into()).unwrap()]).unwrap(),
+            resources: List::new(resources.clone()).unwrap(), policy_revision: 1, gateway_epoch: [4; 16],
+            issued_at: 1, not_before: 1, expires_at: 2, nonce: [5; 32], jti: [6; 16],
+        });
+        let bridge = WorkerToolBridge::new(Arc::new(crate::isolation_worker_plans::GatewayWorkerPlans::new(
+            home.path().into()).unwrap()), Arc::new(Resolver(resources)), Arc::new(|mut plan| {
+            let mut input = String::new();
+            plan.input.read_to_string(&mut input).unwrap();
+            assert_eq!(input, "<p>safe cached bytes</p>");
+            // Fixture transport only: this test proves production plan/result
+            // wiring, not parser execution, systemd confinement or retirement.
+            Ok(WorkerReply { response: ParseResponse { version: plan.request.version,
+                request_id: plan.request.request_id, result: ParseResult::Complete { items: List::new(vec![
+                    ParsedItem::Html { input_slot: 0, query: Text::new("result".into()).unwrap(),
+                        value: Text::new("\"safe cached bytes\"".into()).unwrap() },
+                ]).unwrap() } }, outputs: vec![] })
+        }));
+        let response = bridge.execute(&context, "web_extract", &serde_json::json!({"url":url,"selector":"p"})).await;
+        assert_ne!(response["isError"], true, "{response}");
+        let report: serde_json::Value = serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(report["cached"], true);
+        assert_eq!(report["results"], serde_json::json!(["safe cached bytes"]));
+    }
+
+    #[test]
+    fn i1c_protected_cache_rejects_url_aliases_bad_status_and_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://example.com/page";
+        save_cache(&result(url), dir.path()).unwrap();
+        assert!(load_protected_cache("https://example.com/page/", 60, dir.path()).is_none());
+        let mut bad = result(url);
+        bad.status_code = 302;
+        save_cache(&bad, dir.path()).unwrap();
+        assert!(load_protected_cache(url, 60, dir.path()).is_none());
+        bad.status_code = 200;
+        bad.body = "x".repeat(MAX_RESPONSE_SIZE as usize + 1);
+        save_cache(&bad, dir.path()).unwrap();
+        assert!(load_protected_cache(url, 60, dir.path()).is_none());
+        bad.body = "ok".into();
+        bad.fetched_at = Utc::now() + chrono::Duration::hours(1);
+        save_cache(&bad, dir.path()).unwrap();
+        assert!(load_protected_cache(url, 60, dir.path()).is_none());
     }
 }

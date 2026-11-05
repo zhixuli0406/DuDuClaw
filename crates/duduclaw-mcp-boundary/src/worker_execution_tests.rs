@@ -133,3 +133,52 @@ fn isolated_worker_factory_checks_output_artifact_digest() {
     result.outputs[0][0] = b'x';
     assert!(validate_reply(&request, &result).is_err());
 }
+
+struct StatefulFactory;
+impl WorkerPlanFactory for StatefulFactory {
+    fn supports(&self, name: &str) -> bool { name == "skill_security_scan" }
+    fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn prepare<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, WorkerPlan> {
+        Box::pin(async { Ok(plan()) })
+    }
+    fn prepare_with_state<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, (WorkerPlan, Value)> {
+        Box::pin(async move { Ok((plan(), call.arguments()["marker"].clone())) })
+    }
+    fn finish<'a>(&'a self, _: &'a AuthorizedToolCall, _: WorkerReply) -> PolicyFuture<'a, Value> {
+        Box::pin(async { panic!("stateful completion must not lose host metadata") })
+    }
+    fn finish_with_state<'a>(&'a self, _: &'a AuthorizedToolCall, _: WorkerReply, state: Value) -> PolicyFuture<'a, Value> {
+        Box::pin(async move { Ok(json!({"marker":state})) })
+    }
+}
+
+#[tokio::test]
+async fn isolated_worker_host_metadata_stays_request_local_across_concurrent_calls() {
+    let bridge = WorkerToolBridge::new(Arc::new(StatefulFactory),
+        Arc::new(Resolver { calls: AtomicUsize::new(0), changes: false }),
+        Arc::new(|plan| Ok(reply(&plan.request))));
+    let context = context();
+    let first = json!({"marker":"first"});
+    let second = json!({"marker":"second"});
+    let (a, b) = tokio::join!(bridge.execute(&context, "skill_security_scan", &first),
+        bridge.execute(&context, "skill_security_scan", &second));
+    assert_eq!(a["marker"], "first");
+    assert_eq!(b["marker"], "second");
+}
+
+#[tokio::test]
+async fn i1c_composite_keeps_primary_refusal_and_never_falls_through_after_selection() {
+    let primary = Arc::new(Factory { refused: true, finishes: AtomicUsize::new(0) });
+    let fallback = Arc::new(Factory { refused: false, finishes: AtomicUsize::new(0) });
+    let composite = Arc::new(CompositeWorkerPlans::new(vec![primary.clone(), fallback.clone()]).unwrap());
+    assert!(composite.supports("skill_security_scan"));
+    assert!(!composite.supports("missing"));
+    assert!(CompositeWorkerPlans::new(vec![]).is_err());
+    let bridge = WorkerToolBridge::new(composite, Arc::new(Resolver { calls: AtomicUsize::new(0), changes: false }),
+        Arc::new(|_| panic!("primary refusal must stop before E")));
+    assert_eq!(bridge.execute(&context(), "skill_security_scan", &json!({})).await["isError"], true);
+    assert_eq!(primary.finishes.load(Ordering::SeqCst), 0);
+    assert_eq!(fallback.finishes.load(Ordering::SeqCst), 0);
+}

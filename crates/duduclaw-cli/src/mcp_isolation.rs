@@ -37,11 +37,26 @@ pub(crate) fn boundary_route(name: &str) -> Option<BoundaryRoute> {
     })
 }
 
+fn host_e_control(name: &str) -> bool {
+    matches!(name, "skill_from_recording" | "skill_hub_install" | "skill_curator_status" | "skill_synthesis_run" | "meeting_transcribe")
+}
+
 /// Target fields in the original tool schema are data, never caller identity.
 /// Preserve them for the existing record/delegation/scope policy. Other routes
 /// still prohibit host path and execution identity overrides.
 pub(crate) fn check_tool_arguments(name: &str, arguments: &Value) -> Result<(), VerificationError> {
+    if name == "skill_curator_status" {
+        let fields = arguments.as_object().ok_or(VerificationError::Invalid)?;
+        if fields.keys().any(|key| key != "run") || fields.get("run").is_some_and(|v| v.as_bool().is_none()) {
+            return Err(VerificationError::Invalid);
+        }
+    }
     if !matches!(boundary_route(name), Some(BoundaryRoute::GatewayHandler(_))) {
+        if matches!(name, "skill_security_scan" | "skill_graduate" | "skill_extract") {
+            let mut data = arguments.clone();
+            data.as_object_mut().ok_or(VerificationError::Invalid)?.remove("agent_id");
+            return duduclaw_mcp_boundary::check_arguments(&data);
+        }
         return duduclaw_mcp_boundary::check_arguments(arguments);
     }
     let fields = arguments.as_object().ok_or(VerificationError::Invalid)?;
@@ -89,6 +104,7 @@ pub(crate) async fn dispatch_resource_tool(home: &std::path::Path, name: &str, a
             // A capability authorizes this call, not ownership of its records.
             // The same handler as stdio resolves employee policy at use time.
             return if home == current.home && current.context.record().tools.as_slice().iter().any(|tool| tool.as_str() == name)
+                && (!host_e_control(name) || duduclaw_mcp_boundary::tool_policy::eligible(&current.context, name))
                 && check_tool_arguments(name, arguments).is_ok() {
                 None
             } else { Some(crate::mcp::tool_error("無法確認這次操作的員工身分。")) };
@@ -162,13 +178,13 @@ pub(crate) fn tool_allowed(name: &str, principal: &Principal) -> bool {
     if crate::mcp_isolation_disposition::intentional_refusal(name).is_some() { return false; }
     let supported = match boundary_route(name) {
         Some(BoundaryRoute::File) => name == "file_read" || call.parser.is_some(),
-        Some(BoundaryRoute::GatewayHandler(_)) => true,
+        Some(BoundaryRoute::GatewayHandler(_)) => name != "web_fetch_cached" || call.record_resolver.is_some(),
         Some(BoundaryRoute::Worker) => call.worker.as_ref().is_some_and(|bridge| bridge.supports(name)),
         Some(BoundaryRoute::Execution) => call.execution.as_ref().is_some_and(|bridge| bridge.supports(name)),
         Some(BoundaryRoute::Resource) => call.services.as_ref().is_some_and(|service| service.supports(name)),
         None => false,
     };
-    supported && (matches!(boundary_route(name), Some(BoundaryRoute::GatewayHandler(_)))
+    supported && ((name != "web_fetch_cached" && !host_e_control(name) && matches!(boundary_route(name), Some(BoundaryRoute::GatewayHandler(_))))
             || duduclaw_mcp_boundary::tool_policy::eligible(&call.context, name))
         && record.tools.as_slice().iter().any(|tool| tool.as_str() == name)
         && crate::mcp_auth::tool_requires_scope(name).is_none_or(|required|
@@ -212,7 +228,11 @@ impl IsolationDispatcher {
                 ServiceState::IntentionalRefusal(reason)
             } else {
                 let ready = match boundary_route(name) {
-                    Some(BoundaryRoute::GatewayHandler(_)) => true,
+                    Some(BoundaryRoute::GatewayHandler(_)) => {
+                        if host_e_control(name) {
+                            self.parser.is_some()
+                        } else { name != "web_fetch_cached" || self.record_resolver.is_some() }
+                    },
                     Some(BoundaryRoute::File) => name == "file_read" || self.parser.is_some(),
                     Some(BoundaryRoute::Resource) => self.services.as_ref().is_some_and(|s| s.supports(name)),
                     Some(BoundaryRoute::Execution) => self.execution.as_ref().is_some_and(|s| s.supports(name)),

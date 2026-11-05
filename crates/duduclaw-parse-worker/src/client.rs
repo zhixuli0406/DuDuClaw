@@ -87,6 +87,9 @@ pub fn install_launcher(launcher: Box<dyn WorkerLauncher>) -> Result<(), ParseEr
     LAUNCHER.set(launcher).map_err(|_| ParseError::Unavailable)
 }
 
+/// Trusted startup installed an explicit launcher; socket existence is not readiness.
+pub fn launcher_installed() -> bool { LAUNCHER.get().is_some() }
+
 pub struct SocketActivatedLauncher;
 
 impl WorkerLauncher for SocketActivatedLauncher {

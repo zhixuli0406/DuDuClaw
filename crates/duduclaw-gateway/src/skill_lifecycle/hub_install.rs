@@ -162,6 +162,9 @@ pub async fn fetch_and_gate(
     skill_name: &str,
     owner: Option<&str>,
 ) -> Result<GatedManifest, String> {
+    if duduclaw_parse_worker::client::required() {
+        return fetch_protected(home_dir, hub_id, skill_name, owner).await;
+    }
     let registry = HubRegistry::from_home(home_dir);
     // Exact-id lookup — an unknown hub is a DENY, never a default.
     let Some(hub) = registry.get(hub_id) else {
@@ -231,6 +234,9 @@ pub async fn install_gated(
 async fn install_gated_locked(
     home_dir: &Path, gated: &GatedManifest, scope: &str,
 ) -> Result<HubInstallReport, String> {
+    if duduclaw_parse_worker::client::required() {
+        return install_protected_locked(home_dir, gated, scope).await;
+    }
     let installed_name = installed_skill_name(&gated.skill_name, &gated.manifest_name, &gated.content)?;
     // Approval evidence is not install authority: reverify exact bytes with current keys.
     let signature_status = TrustStore::load(home_dir)?.verify_content(
@@ -738,4 +744,67 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&home);
     }
+}
+
+/// Protected first-party subset: bounded host fetch, E manifest/scan, then the
+/// existing caller approval. Community manifests await E JSON adapters.
+async fn fetch_protected(home: &Path, hub: &str, name: &str, owner: Option<&str>) -> Result<GatedManifest, String> {
+    use duduclaw_agent::skill_hub::{HUB_ANTHROPIC, ANTHROPIC_OWNER_REPO, ANTHROPIC_PIN_SHA};
+    if hub != HUB_ANTHROPIC || owner.is_some() || !HubRegistry::from_home(home).ids().contains(&hub)
+        || name.is_empty() || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("隔離安裝目前僅支援已設定的官方固定版本技能來源。".into());
+    }
+    if !crate::web_fetch::admit_protected_tool_fetch() { return Err("技能來源請求過於頻繁。".into()); }
+    let url = format!("https://raw.githubusercontent.com/{ANTHROPIC_OWNER_REPO}/{ANTHROPIC_PIN_SHA}/skills/{name}/SKILL.md");
+    let fetched = crate::web_fetch::web_fetch_protected_cached(&url, 0, &home.join("web_cache")).await
+        .map_err(|_| "無法取得官方技能內容。".to_string())?;
+    if !(200..300).contains(&fetched.status_code) { return Err("技能來源未回傳有效內容。".into()); }
+    let content = fetched.body;
+    if content.is_empty() || content.len() > 64 * 1024 { return Err("技能內容超過隔離安裝上限。".into()); }
+    let (bytes, slug) = (content.as_bytes().to_vec(), name.to_owned());
+    let (passed, risk_level, findings) = tokio::task::spawn_blocking(move ||
+        duduclaw_parse_worker::adapters::inspect_skill_manifest(&bytes, &slug)).await
+        .map_err(|_| "隔離技能檢查失敗。")?.map_err(|_| "隔離技能檢查失敗。")?;
+    if !passed { return Err("技能未通過隔離安全檢查。".into()); }
+    let signature_status = TrustStore::load(home)?.verify_content(None, None, content.as_bytes())?;
+    duduclaw_agent::skill_hub::check_signature_history(home, hub, name, &signature_status)?;
+    Ok(GatedManifest { hub: hub.into(), skill_name: name.into(), manifest_name: name.into(), content,
+        publisher: None, signature: None, signature_status, risk_level, findings,
+        trust_floor: duduclaw_agent::trust_tier::TrustTier::Official, source_verdict: None })
+}
+
+async fn install_protected_locked(home: &Path, gated: &GatedManifest, scope: &str) -> Result<HubInstallReport, String> {
+    if gated.hub != duduclaw_agent::skill_hub::HUB_ANTHROPIC || gated.skill_name != gated.manifest_name {
+        return Err("隔離技能來源不受支援。".into());
+    }
+    // Scan again from these exact approved bytes; never trust a previously
+    // passed flag or let the worker select a destination.
+    let (bytes, name) = (gated.content.as_bytes().to_vec(), gated.skill_name.clone());
+    let (passed, risk_level, findings) = tokio::task::spawn_blocking(move ||
+        duduclaw_parse_worker::adapters::inspect_skill_manifest(&bytes, &name)).await
+        .map_err(|_| "隔離技能檢查失敗。")?.map_err(|_| "隔離技能檢查失敗。")?;
+    if !passed { return Err("技能未通過隔離安全檢查。".into()); }
+    let signature = TrustStore::load(home)?.verify_content(gated.publisher.as_deref(), gated.signature.as_deref(), gated.content.as_bytes())?;
+    if signature != gated.signature_status { return Err("技能簽署者信任已變更，請重新送審。".into()); }
+    duduclaw_agent::skill_hub::check_signature_history(home, &gated.hub, &gated.skill_name, &signature)?;
+    record_verified_signature(home, &gated.hub, &gated.skill_name, &signature)?;
+    let directories = if scope == "global" { vec!["skills"] }
+        else if let Some(dept) = scope.strip_prefix("department:") {
+            if !duduclaw_core::is_valid_department(dept) { return Err("技能部門不正確。".into()); }
+            vec!["shared", "skills", "departments", dept]
+        } else {
+            if !duduclaw_core::is_valid_agent_id(scope) || duduclaw_core::is_reserved_agent_id(scope) { return Err("技能員工範圍不正確。".into()); }
+            vec!["agents", scope, "SKILLS"]
+        };
+    crate::isolation_worker_plans::write_host_file(home, &directories, &format!("{}.md", gated.skill_name), gated.content.as_bytes())
+        .map_err(|_| "技能發布尚未確認；既有技能不會覆寫。".to_string())?;
+    let curation_scope = if scope == "global" || scope.strip_prefix("department:").is_some() { scope.to_owned() }
+        else { format!("agent:{scope}") };
+    let store = crate::custom_skills::CustomSkillStore::open(home)?;
+    store.curation_upsert_seen(&gated.skill_name, &curation_scope, &chrono::Utc::now().to_rfc3339()).await?;
+    store.record_hub_signature(&gated.skill_name, &curation_scope, &signature,
+        &duduclaw_agent::skill_hub::sha256_hex(&gated.content)).await?;
+    use sha2::{Digest, Sha256};
+    Ok(HubInstallReport { hub:gated.hub.clone(),skill_name:gated.skill_name.clone(),scope:scope.into(),risk_level,findings,
+        signature_status:signature,content_sha256:hex::encode(Sha256::digest(gated.content.as_bytes())) })
 }

@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-engine = ["dep:zip", "dep:quick-xml", "dep:calamine", "dep:pdf-extract", "dep:image", "dep:encoding_rs", "dep:scraper", "dep:ego-tree", "dep:csv", "dep:chrono"]
+engine = ["dep:zip", "dep:quick-xml", "dep:calamine", "dep:pdf-extract", "dep:image", "dep:encoding_rs", "dep:scraper", "dep:ego-tree", "dep:csv", "dep:chrono", "dep:url", "dep:serde_yaml"]
 
 [[bin]]
 name = "duduclaw-parse-worker"
@@ -17,6 +17,9 @@ required-features = ["engine"]
 duduclaw-isolation.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
+url = { version = "2", optional = true }
+serde_yaml = { version = "0.9", optional = true }
 sha2 = "0.10"
 uuid.workspace = true
 zip = { version = "9.0.5", default-features = false, features = ["deflate"], optional = true }
@@ -26,7 +29,7 @@ pdf-extract = { version = "=0.12.1", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"], optional = true }
 encoding_rs = { version = "0.8", optional = true }
 scraper = { version = "0.22", optional = true }
-chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"], optional = true }
 csv = { version = "1", optional = true }
 ego-tree = { version = "0.10", optional = true }
 

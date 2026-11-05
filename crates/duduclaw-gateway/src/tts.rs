@@ -632,6 +632,14 @@ impl TtsRouter {
         router
     }
 
+    /// Protected E tools may use official HTTP providers only. Configured
+    /// local/command selection stays unavailable until A has a concrete plan.
+    pub fn for_protected_home(home: &std::path::Path) -> Self {
+        let mut router = Self::for_home(home);
+        router.providers.retain(|provider| matches!(provider.name(), "minimax" | "azure" | "openai-tts"));
+        router
+    }
+
     fn load_inference_config(home: &std::path::Path) -> Result<toml::Table, ()> {
         let config_path = home.join("inference.toml");
         match std::fs::read_to_string(&config_path) {

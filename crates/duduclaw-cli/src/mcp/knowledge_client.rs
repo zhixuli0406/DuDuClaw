@@ -463,6 +463,10 @@ pub(crate) async fn handle_knowledge_tool(
     home: &Path,
     agent_id: &str,
 ) -> Value {
+    if crate::mcp_isolation::current().is_some() && tool == "knowledge_add_source"
+        && args.get("path").is_some_and(|v| !v.is_null()) {
+        return error("隔離執行目前僅接受文字或網址提案，請改以其中一種方式提交。");
+    }
     if !available_for(home, agent_id) {
         return error(
             "這位 AI 員工目前沒有可用的文件知識庫：還沒有集合授權給它或它的部門，或知識庫已由管理員關閉。",

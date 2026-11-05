@@ -43,6 +43,15 @@ pub enum ParseOperation {
     TransformImage,
     ExtractHtml,
     InspectImage,
+    InspectAudio,
+    ScanSkill,
+    PrepareSkill,
+    ExtractSkill,
+    SummarizeRecording,
+    InspectSkillManifest,
+    ReadEvolutionEvents,
+    ReadSkillIdentity,
+    PrepareSynthesizedSkill,
     TranscribeAudio,
     SynthesizeSpeech,
     InspectSkillArchive,
@@ -215,6 +224,27 @@ pub enum ParseOptions {
     Html { queries: List<HtmlQuery, 32> },
     SearchHtml,
     PackArchive,
+    SkillKnowledge { name: Text<64>, agent: Text<64>, at: Text<64> },
+    SkillManifest { name: Text<64> },
+    SkillIdentity { name: Text<64> },
+    SynthesizedSkill { agent: Text<64>, at: Text<64> },
+    Recording { desktop: bool, name: Text<64> },
+    SkillScan { must_not: List<Text<1024>, 128> },
+    SkillPrepare { action: SkillAction, agent: Text<64>, at: Text<64>, must_not: List<Text<1024>, 128> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillAction { Adopt, Graduate }
+
+/// Redacted recording evidence, never executable instructions or host paths.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingSummary {
+    pub prompt: Text<65536>,
+    pub env: List<Text<128>, 128>,
+    pub api_count: u16,
+    pub action_count: u16,
 }
 
 /// Declared read-only input fd, indexed in SCM_RIGHTS order (design §6.2/§6.3).
@@ -282,6 +312,21 @@ impl ParseRequest {
             return Err(ContractError::LimitExceeded("worker result text budget"));
         }
         match (&self.operation, &self.options) {
+            (ParseOperation::ReadSkillIdentity, Some(ParseOptions::SkillIdentity { name }))
+                if !name.as_str().is_empty() && name.as_str().bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => {},
+            (ParseOperation::PrepareSynthesizedSkill, Some(ParseOptions::SynthesizedSkill { agent, at }))
+                if !agent.as_str().is_empty() && agent.as_str().bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    && !at.as_str().is_empty() => {},
+            (ParseOperation::InspectSkillManifest, Some(ParseOptions::SkillManifest { name }))
+                if !name.as_str().is_empty() && name.as_str().bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => {},
+            (ParseOperation::SummarizeRecording, Some(ParseOptions::Recording { name, .. }))
+                if !name.as_str().is_empty() && name.as_str().bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') => {},
+            (ParseOperation::ExtractSkill, Some(ParseOptions::SkillKnowledge { name, agent, at }))
+                if !name.as_str().is_empty() && !agent.as_str().is_empty() && !at.as_str().is_empty() => {},
+            (ParseOperation::PrepareSkill, Some(ParseOptions::SkillPrepare { agent, at, .. }))
+                if !agent.as_str().is_empty() && agent.as_str().bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    && !at.as_str().is_empty() => {},
+            (ParseOperation::ScanSkill, Some(ParseOptions::SkillScan { .. })) => {},
             (ParseOperation::ExtractKnowledge, Some(ParseOptions::Knowledge { max_chars, .. }))
                 if *max_chars > 0 => {},
             (ParseOperation::ExtractPackArchive, Some(ParseOptions::PackArchive)) => {},
@@ -299,7 +344,7 @@ impl ParseRequest {
             },
             (ParseOperation::ReadTable, Some(ParseOptions::Table(options))) => options.validate()?,
             (ParseOperation::InspectDocument, Some(ParseOptions::Document(policy))) => policy.validate()?,
-            (ParseOperation::ExtractKnowledge | ParseOperation::ReadTable | ParseOperation::InspectDocument
+            (ParseOperation::PrepareSynthesizedSkill | ParseOperation::InspectSkillManifest | ParseOperation::SummarizeRecording | ParseOperation::ExtractSkill | ParseOperation::PrepareSkill | ParseOperation::ScanSkill | ParseOperation::ExtractKnowledge | ParseOperation::ReadTable | ParseOperation::InspectDocument
                 | ParseOperation::TransformImage | ParseOperation::ExtractHtml | ParseOperation::ExtractPackArchive, _) =>
                 return Err(ContractError::InvalidValue("worker adapter options")),
             (_, None) => {},
@@ -366,18 +411,36 @@ pub struct ArchiveEntry {
     pub length: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioFormat { Wav, Mp3 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillPage {
+    pub path: Text<256>,
+    pub content: Text<8192>,
+    pub rationale: Text<1024>,
+    pub related: List<Text<256>, 64>,
+}
+
 /// Allowed bounded result item; all strings are content, never authority (§6.2).
 /// Archive entries are summaries only: package E must not return or execute an
 /// installation command. Model metadata does not authorize loading a plugin.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ParsedItem {
+    Recording { input_slot: u16, summary: RecordingSummary },
     Text { input_slot: u16, page: Option<u32>, text: Text<8192> },
     Knowledge { input_slot: u16, output: KnowledgeOutput },
     Html { input_slot: u16, query: Text<256>, value: Text<8192> },
     Table { input_slot: u16, output: TableOutput },
     Transcript { input_slot: u16, start_ms: u64, end_ms: u64, text: Text<8192> },
     Image { input_slot: u16, width: u32, height: u32 },
+    SkillKnowledge { input_slot: u16, concepts: u16, entities: u16, pages: List<SkillPage, 64> },
+    PreparedSkill { input_slot: u16, content: Text<65536> },
+    SkillScan { input_slot: u16, passed: bool, risk: Text<16>, findings: List<Text<2048>, 128> },
+    Audio { input_slot: u16, format: AudioFormat, sample_rate: u32, channels: u16, frames: u64 },
     ArchiveSummary { input_slot: u16, entries: u32, expanded_bytes: u64 },
     ArchiveManifest { input_slot: u16, entries: List<ArchiveEntry, 1000>, legacy_encoding: Option<Text<8>>, junk_skipped: u32 },
     ModelSummary { input_slot: u16, tensor_count: u32, total_bytes: u64 },
@@ -468,8 +531,15 @@ impl ParseResponse {
                     text_bytes += output.text_bytes();
                     Some(*input_slot)
                 }
+                ParsedItem::Recording { input_slot, summary } => {
+                    if request.operation != ParseOperation::SummarizeRecording || summary.api_count > 40 || summary.action_count > 120 {
+                        return Err(ContractError::InvalidValue("worker recording summary"));
+                    }
+                    text_bytes += summary.prompt.as_str().len() + summary.env.as_slice().iter().map(|e| e.as_str().len()).sum::<usize>();
+                    Some(*input_slot)
+                }
                 ParsedItem::Text { input_slot, text, .. } => {
-                    if !matches!(request.operation, ParseOperation::ExtractDocument | ParseOperation::LocalInference) {
+                    if !matches!(request.operation, ParseOperation::ExtractDocument | ParseOperation::LocalInference | ParseOperation::ReadEvolutionEvents | ParseOperation::ReadSkillIdentity) {
                         return Err(ContractError::InvalidValue("worker result kind"));
                     }
                     text_bytes += text.as_str().len();
@@ -480,6 +550,36 @@ impl ParseResponse {
                         return Err(ContractError::InvalidValue("worker transcript"));
                     }
                     text_bytes += text.as_str().len();
+                    Some(*input_slot)
+                }
+                ParsedItem::SkillKnowledge { input_slot, concepts, entities, pages } => {
+                    if request.operation != ParseOperation::ExtractSkill || *concepts > 30 || *entities > 10
+                        || pages.as_slice().len() != usize::from(*concepts) + usize::from(*entities) + 1 {
+                        return Err(ContractError::InvalidValue("worker skill knowledge result"));
+                    }
+                    text_bytes += pages.as_slice().iter().map(|p| p.path.as_str().len() + p.content.as_str().len()
+                        + p.rationale.as_str().len() + p.related.as_slice().iter().map(|r| r.as_str().len()).sum::<usize>()).sum::<usize>();
+                    Some(*input_slot)
+                }
+                ParsedItem::PreparedSkill { input_slot, content } => {
+                    if !matches!(request.operation, ParseOperation::PrepareSkill | ParseOperation::PrepareSynthesizedSkill) { return Err(ContractError::InvalidValue("worker prepared skill result")); }
+                    text_bytes += content.as_str().len();
+                    Some(*input_slot)
+                }
+                ParsedItem::SkillScan { input_slot, passed, risk, findings } => {
+                    if !matches!(request.operation, ParseOperation::InspectSkillManifest | ParseOperation::ScanSkill | ParseOperation::PrepareSkill)
+                        || !matches!(risk.as_str(), "Clean" | "Low" | "Medium" | "High" | "Critical")
+                        || *passed != !matches!(risk.as_str(), "High" | "Critical") {
+                        return Err(ContractError::InvalidValue("worker skill scan result"));
+                    }
+                    text_bytes += risk.as_str().len() + findings.as_slice().iter().map(|f| f.as_str().len()).sum::<usize>();
+                    Some(*input_slot)
+                }
+                ParsedItem::Audio { input_slot, sample_rate, channels, frames, .. } => {
+                    if request.operation != ParseOperation::InspectAudio || !(8000..=192000).contains(sample_rate)
+                        || !(1..=8).contains(channels) || *frames == 0 {
+                        return Err(ContractError::InvalidValue("worker audio result"));
+                    }
                     Some(*input_slot)
                 }
                 ParsedItem::Image { input_slot, width, height } => {

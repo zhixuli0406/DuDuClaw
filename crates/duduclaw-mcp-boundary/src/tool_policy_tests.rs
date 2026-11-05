@@ -164,9 +164,30 @@ fn high_risk_tools_are_never_classified_as_plain_gateway_services() {
     for name in ["code_map", "codrive_run", "execute_program", "fork_run", "spawn_agent", "os_open"] {
         assert_eq!(policy(name).unwrap().route, Route::Execution);
     }
-    for name in ["meeting_transcribe", "transcribe_audio", "model_load", "llamafile_start", "skill_hub_install"] {
+    for name in ["transcribe_audio", "model_load", "llamafile_start"] {
         assert_eq!(policy(name).unwrap().route, Route::Worker);
     }
+}
+
+#[test]
+fn job_control_and_pure_routing_do_not_require_parser_inputs() {
+    for name in ["meeting_upload_link", "meeting_transcribe_status", "meeting_transcribe_cancel", "route_query"] {
+        let entry = policy(name).unwrap();
+        assert_eq!(entry.route, Route::Service, "{name}");
+        assert_eq!(entry.required, &[ResourceKind::Employee], "{name}");
+    }
+    // Creation is authenticated job control; the background media stage requires E.
+    assert_eq!(policy("meeting_transcribe").unwrap().route, Route::Service);
+}
+
+#[test]
+fn raw_web_fetch_keeps_origin_authority_and_html_parsing_requires_worker() {
+    let fetch = policy("web_fetch_cached").unwrap();
+    assert_eq!(fetch.route, Route::Service);
+    assert_eq!(fetch.required, &[ResourceKind::Employee, ResourceKind::UrlOrigin]);
+    let extract = policy("web_extract").unwrap();
+    assert_eq!(extract.route, Route::Worker);
+    assert_eq!(extract.required, fetch.required);
 }
 
 #[test]
@@ -236,4 +257,26 @@ async fn async_resource_authority_is_fresh_and_off_the_reactor_thread() {
     assert!(authorize_async(&context, "agent_status", &json!({}), resolver.clone()).await.is_ok());
     assert!(authorize_async(&context, "agent_status", &json!({}), resolver.clone()).await.is_err());
     assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
+#[test]
+fn i1c_source_proposals_are_host_control_and_skill_extraction_requires_own_wiki_grant() {
+    assert_eq!(policy("knowledge_add_source").unwrap().route, Route::Service);
+    for tool in ["skill_extract"] {
+        assert_eq!(policy(tool).unwrap().route, Route::Worker, "{tool}");
+    }
+    let without_wiki = vec![employee(), ResourceGrant::Workspace { handle: text("work") }];
+    assert!(!eligible(&context("skill_extract", without_wiki), "skill_extract"));
+    let with_wiki = vec![employee(), ResourceGrant::Workspace { handle: text("work") }, ResourceGrant::Wiki { namespace: text("agent:alice") }];
+    assert!(eligible(&context("skill_extract", with_wiki), "skill_extract"));
+}
+
+#[test]
+fn i1c_host_controls_keep_real_worker_stages_and_original_resource_grants() {
+    for name in ["skill_from_recording", "skill_hub_install", "meeting_transcribe", "skill_curator_status", "skill_synthesis_run"] {
+        assert_eq!(policy(name).unwrap().route, Route::Service);
+        assert!(policy(name).unwrap().required.contains(&ResourceKind::Employee));
+    }
+    // Parser stages stay in the background/control implementation. Routing
+    // alone is never evidence that full synthesis or protected boot is ready.
 }

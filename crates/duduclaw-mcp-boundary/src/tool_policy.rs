@@ -114,7 +114,7 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "odoo_schema_overview", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "odoo_schema_fields", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     // exec
-    ToolPolicy { name: "skill_extract", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_extract", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace, ResourceKind::Wiki] },
     ToolPolicy { name: "execute_program", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "office_script", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "skill_bank_feedback", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
@@ -173,7 +173,7 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "browser_record_stop", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "desktop_record_start", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "desktop_record_stop", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "skill_from_recording", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_from_recording", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     // memory
     ToolPolicy { name: "memory_search", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
     ToolPolicy { name: "memory_store", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
@@ -214,9 +214,9 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "skill_security_scan", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "skill_graduate", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "skill_synthesis_status", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
-    ToolPolicy { name: "skill_synthesis_run", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "skill_hub_install", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "skill_curator_status", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_synthesis_run", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_hub_install", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_curator_status", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "skill_pin", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     // integrations
     ToolPolicy { name: "notion_status", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
@@ -234,16 +234,18 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "cost_recent", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "cost_multi_vs_single", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "transcribe_audio", route: Route::Worker, required: &[ResourceKind::Employee] },
-    ToolPolicy { name: "meeting_transcribe", route: Route::Worker, required: &[ResourceKind::Employee] },
-    ToolPolicy { name: "meeting_upload_link", route: Route::Worker, required: &[ResourceKind::Employee] },
-    ToolPolicy { name: "meeting_transcribe_status", route: Route::Worker, required: &[ResourceKind::Employee] },
-    ToolPolicy { name: "meeting_transcribe_cancel", route: Route::Worker, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "meeting_transcribe", route: Route::Service, required: &[ResourceKind::Employee] },
+    // Job control uses the authenticated gateway meeting-jobs route. These
+    // operations have no media input; only transcription parsing belongs in E.
+    ToolPolicy { name: "meeting_upload_link", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "meeting_transcribe_status", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "meeting_transcribe_cancel", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "synthesize_speech", route: Route::Worker, required: &[ResourceKind::Employee] },
     // knowledge
     ToolPolicy { name: "knowledge_search", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     ToolPolicy { name: "knowledge_get_passage", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     ToolPolicy { name: "knowledge_list_collections", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
-    ToolPolicy { name: "knowledge_add_source", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "knowledge_add_source", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     // wiki
     ToolPolicy { name: "wiki_ls", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     ToolPolicy { name: "wiki_read", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
@@ -287,14 +289,17 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "list_reminders", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
     ToolPolicy { name: "cancel_reminder", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
     // inference
-    ToolPolicy { name: "web_fetch_cached", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::UrlOrigin] },
+    // Fetching raw bytes stays on the host under signed-origin and egress
+    // policy. Interpreting untrusted HTML remains a separate E operation.
+    ToolPolicy { name: "web_fetch_cached", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::UrlOrigin] },
     ToolPolicy { name: "web_extract", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::UrlOrigin] },
     ToolPolicy { name: "inference_status", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "model_list", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "model_load", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "model_unload", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "hardware_info", route: Route::Service, required: &[ResourceKind::Employee] },
-    ToolPolicy { name: "route_query", route: Route::Worker, required: &[ResourceKind::Employee] },
+    // Host configuration selects a route without loading a model or generating.
+    ToolPolicy { name: "route_query", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "inference_mode", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "llamafile_start", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "llamafile_stop", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
@@ -560,7 +565,11 @@ pub async fn authorize_async(context: &RequestContext, name: &str, arguments: &V
 
 pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolver: &dyn ResourceResolver)
     -> Result<AuthorizedToolCall, VerificationError> {
-    crate::check_arguments(arguments)?;
+    if matches!(name, "skill_security_scan" | "skill_graduate" | "skill_extract") {
+        let mut data = arguments.clone();
+        data.as_object_mut().ok_or(VerificationError::Invalid)?.remove("agent_id");
+        crate::check_arguments(&data)?;
+    } else { crate::check_arguments(arguments)?; }
     let policy = policy(name).ok_or(VerificationError::Invalid)?;
     if !eligible(context, name) { return Err(VerificationError::Invalid); }
     let required = required_for_call(policy, arguments)?;

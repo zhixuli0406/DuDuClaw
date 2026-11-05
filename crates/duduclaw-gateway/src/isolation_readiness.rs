@@ -32,9 +32,9 @@ impl Components {
     fn current(spawnd_verified: bool) -> Self {
         let host = if spawnd_verified { ComponentState::Ready } else { ComponentState::Unavailable };
         Self { launch_service: host, sandbox: host, network: host, storage: host,
-            // No production factory/readback is installed by this integration
-            // subset. A running unit or an existing key file is insufficient.
-            parse_worker: ComponentState::PendingIntegration,
+            // E producers are implemented. Readiness still requires installed
+            // host composition and a fresh authenticated generation receipt.
+            parse_worker: parse_worker_state(),
             update_service: update_service_state(),
             mcp_boundary: ComponentState::PendingIntegration,
             runtime_adapters: ComponentState::PendingIntegration }
@@ -92,6 +92,16 @@ pub(crate) fn verified_generation() -> Option<duduclaw_isolation::ids::Sha256Dig
     let observation = value.as_ref()?;
     (compatible_update(&observation.evidence) && update_fresh(Some(observation.observed), Instant::now()))
         .then_some(observation.evidence.generation)
+}
+
+fn parse_worker_state() -> ComponentState {
+    #[cfg(all(target_os = "linux", feature = "isolation-worker-integration"))]
+    if duduclaw_parse_worker::client::launcher_installed()
+        && crate::isolation_mcp::boot_status().constructed
+        && update_service_state() == ComponentState::Ready {
+        return ComponentState::Ready;
+    }
+    ComponentState::Unavailable
 }
 
 fn update_service_state() -> ComponentState {
@@ -202,7 +212,7 @@ mod tests {
         for verified in [false, true] {
             let components = Components::current(verified);
             assert!(!components.all_ready());
-            assert_eq!(components.parse_worker, ComponentState::PendingIntegration);
+            assert_eq!(components.parse_worker, ComponentState::Unavailable);
             assert_eq!(components.update_service, ComponentState::Unavailable);
             assert_eq!(components.mcp_boundary, ComponentState::PendingIntegration);
             assert_eq!(components.runtime_adapters, ComponentState::PendingIntegration);
