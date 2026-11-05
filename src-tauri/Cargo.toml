@@ -85,3 +85,5 @@ glib = { path = "vendor/glib" }
 # Panic messages / source locations remain; Windows jobs preserve separate PDBs.
 [profile.release]
 strip = "symbols"
+lto = "thin"
+codegen-units = 1

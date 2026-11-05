@@ -161,6 +161,8 @@ duduclaw-onnx = { path = "crates/duduclaw-onnx", default-features = false }
 # Windows release jobs override this to "none" to preserve separate PDBs.
 [profile.release]
 strip = "symbols"
+lto = "thin"
+codegen-units = 1
 
 # Debug builds only. The workflow MCP path
 # hashes the whole running CLI binary (~336 MB in a debug build) with SHA-256
