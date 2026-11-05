@@ -34,6 +34,14 @@ pub enum LicenseError {
     #[error("machine fingerprint mismatch")]
     InvalidFingerprint,
 
+    /// A matching historical binding has no usable hardware identity.
+    #[error("weak machine binding; account holder approval is required to re-bind")]
+    WeakFingerprint,
+
+    /// macOS could not read its hardware UUID after bounded retries.
+    #[error("hardware UUID unavailable; refusing to change the licensed identity")]
+    HardwareIdentityUnavailable,
+
     /// The requested feature is not available at the current license tier.
     #[error("feature not available: {0}")]
     FeatureNotAvailable(String),

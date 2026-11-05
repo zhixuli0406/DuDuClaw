@@ -528,7 +528,7 @@ impl MethodHandler {
             // show to anyone who can already see operational metrics.
             "license.status" => {
                 require_manager!();
-                boxed_frame(|| self.handle_license_status()).await
+                boxed_frame(|| self.handle_license_status(ctx.is_admin())).await
             }
             // Dashboard upgrade flow — install/redeem a commercial license
             // without touching the CLI. Admin-only: this changes what the

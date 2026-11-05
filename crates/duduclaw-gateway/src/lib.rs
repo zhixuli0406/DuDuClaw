@@ -177,6 +177,7 @@ mod image_data;
 pub mod license_runtime;
 pub mod license_seed;
 pub mod license_serve;
+pub mod license_transport;
 pub mod notify_digest;
 pub mod notify_governance;
 // O5 — `push(card, dest)`: the single outbound entry the four notification

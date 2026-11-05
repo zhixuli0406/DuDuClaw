@@ -45,6 +45,9 @@ impl MethodHandler {
     /// reports what the currently-installed license is actually bound to, and
     /// `legacy_binding` flags the "still accepted, please re-issue" state.
     pub(crate) async fn handle_license_fingerprint(&self) -> WsFrame {
+        if duduclaw_license::fingerprint_hardware_unavailable() {
+            return WsFrame::error_response("", "無法讀取此 Mac 的硬體識別，已停止產生新授權指紋。請重新啟動服務後再試。");
+        }
         let strong = crate::license_runtime::strong_fingerprint();
         let effective = crate::license_runtime::cached_fingerprint();
         WsFrame::ok_response(
@@ -85,13 +88,14 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_license_status(&self) -> WsFrame {
+    pub(crate) async fn handle_license_status(&self, is_admin: bool) -> WsFrame {
         let snapshot = match crate::license_runtime::global() {
             Some(runtime) => runtime.snapshot().await,
             None => crate::license_runtime::LicenseSnapshot {
                 tier: duduclaw_license::LicenseTier::OpenSource,
                 mode: "opensource",
                 installed: false,
+                validation_warning: None,
                 customer_id: None,
                 subscription_id: None,
                 expires_at: None,
@@ -104,6 +108,7 @@ impl MethodHandler {
             },
         };
 
+        let snapshot = snapshot.for_admin(is_admin);
         let payload = match serde_json::to_value(&snapshot) {
             Ok(v) => v,
             Err(e) => {

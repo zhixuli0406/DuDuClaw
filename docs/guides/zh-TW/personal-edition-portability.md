@@ -38,13 +38,29 @@ duduclaw start
 
 ## 切換時的注意事項
 
-- **授權**：`license.json` 綁定機器指紋（hostname + MAC）。換機器後個人版核心照常運作（Apache 2.0），
+- **授權**：`license.json` 綁定機器指紋（macOS 使用硬體 UUID；Linux／Windows 使用 hostname + MAC）。換機器後個人版核心照常運作（Apache 2.0），
   若有 Pro 加值模組，需要由發出授權的一方把授權重新綁定到新機器。
 - **頻道 token**：channel bot token 在加密設定內，會一起搬過去；換 IP/網域時記得更新 webhook URL。
 - **EditionProfile**：gateway 依序判定：先看 `DUDUCLAW_EDITION` 環境變數（`personal` 或 `enterprise`），
   再看授權方案（Business、OEM、Partner、Self-Host Pro 視為 `enterprise`），都沒有就是 `personal`。
   儀表板沒有切換開關，設定檔也沒有對應的鍵：`agent.toml [edition] profile` 沒有任何程式讀取。
   沒有上述授權、又要讓自架環境以企業版執行，請在 gateway 的環境加上 `DUDUCLAW_EDITION=enterprise` 後重新啟動。
+
+## macOS 授權指紋與重新綁定
+
+macOS 新指紋採 `macos-uuid-v2:<32 個十六進位字元>`，由 `IOPlatformUUID` 衍生，不包含主機名稱。`duduclaw license fingerprint`、儀表板啟用授權卡與重新綁定請求都使用此穩定值。啟用授權是安裝已簽章的授權，不會自行向控制平面要求簽發。原有「主機名稱 + UUID」候選值仍可驗證，並標示為舊版綁定。所有 MAC 候選值都視為 Weak，僅供遷移辨識，包含真實 MAC、本機管理 MAC、無 MAC、全零 MAC 與共用 `02:00:00:00:00:00`；即使吻合也只以 OpenSource 隔離運作，管理員會看到需要核准換綁的警告。不過無法反推出過去的主機名稱：舊授權若已不符，請聯絡簽發者，待簽發端支援新格式後執行 `duduclaw license rebind`。
+
+重新綁定為新格式後，舊版程式無法驗證該授權。請先升級所有會讀取這份授權的程序；需要降版時，須先請簽發者安排相容的重新綁定。
+
+UUID 最多讀取三次，每次逾時五秒。仍讀不到時，不會用 MAC 候選放行綁定 UUID 的授權；CLI 與儀表板也會拒絕提供新簽發用的指紋，待 UUID 可讀取後再試。本次不建立 UUID 磁碟快取：即使檔案僅擁有者可讀寫，同一帳號執行的其他程式仍可竄改，無法證明 UUID 確實來自本機。Linux／Windows 仍產生「主機名稱 + MAC」識別值，但現在視為 Weak，不能啟用綁定機器的付費功能，需核准遷移至支援的強身分；本次未替 Linux／Windows 新增強身分來源。已安裝授權失效時，核心功能維持 OpenSource；管理員的儀表板顯示警示，`duduclaw license status` 與 `duduclaw doctor` 也會列出原因。
+
+**控制平面相容性：** refresh 的 `machine_fingerprint` 保留已安裝授權的綁定；不同的 macOS 穩定 UUID 透過 `new_fingerprint` 提案，**只有帳號持有人在控制台核准換綁後才生效**。rebind 傳送 `old_fingerprint`、`new_fingerprint` 與新的 nonce。指紋是公開識別值，不能當成所有權證明。已驗簽的 `status: "pending"` 會保留原授權並提示等待控制台核准；HTTP 202 也必須附上此已簽章本文，空白或未通過驗證的回應一律拒絕。Linux／Windows 與未綁定 OEM 的 refresh 綁定不變；macOS 讀不到 UUID 時，已綁定授權的 refresh／rebind 停止，不提案改綁 MAC。
+
+接受 active 回應前，Gateway 與 CLI 會驗證授權與回應兩份簽章、完全相同的 nonce 與原訂閱，以及等於原綁定或提案綁定的回傳指紋（明確 rebind 必須等於提案）；另檢查期限、候選強度、離線寬限及方案／部署型態。active、revoked 與 pending 都必須使用 v2 簽章封套。撤銷回應必須通過驗簽且 `effective_from` 已到期，才會持久保存撤銷標記並移除已安裝授權；偽造或過時的回應不會改動授權或標記。
+
+**簽發端回應簽章契約：** 僅接受數字 `response_signature_version: 2`；缺少版本、舊版、格式錯誤或未知版本一律拒絕。本文包含 `status`、`reason`、RFC3339 格式的 `effective_from`、`nonce`、`subscription_id`、`original_fingerprint`、`proposed_fingerprint`、`license_digest`、`public_key_id` 與 base64 Ed25519 `response_signature`。簽章內容為緊密 UTF-8 JSON 陣列 `["duduclaw:license-response:v2",2,status,reason,effective_from,nonce,subscription,original,proposed,license_digest]`。沒有提案時，提案綁定填原綁定。active 的 `license_digest` 是緊密序列化 `License` 的小寫 SHA-256，依 Rust 欄位順序及可選欄位省略規則，包含授權簽章與 `control_url`；回應與授權的 `public_key_id` 必須相同且可信。pending／revoked 的摘要為空字串，由回應的 `public_key_id` 選擇信任清單中的公鑰。以 `duduclaw_license::refresh::response_payload` 為參考序列化器。簽發端須驗證帳號持有人，等待控制台核准，更新綁定，再簽署授權及回應。升級客戶端前，須先部署支援此契約的簽發端。
+
+Gateway 與 CLI 的啟用、匯入、更新、換綁及撤銷共用跨程序 advisory lock。送出網路請求前，在鎖內取得完整授權檔及撤銷標記的摘要，再釋放鎖；收到回應後重新取鎖，比對任一摘要有變更就拒絕寫入。Gateway 另檢查記憶體 revision。寫入使用唯一暫存檔、檔案 fsync、原子 rename，Unix 另同步目錄。此鎖保護遵循協定的產品程序；具有直接寫入權限的程序仍可忽略 advisory lock。Windows 原生持久化、簽發端實際部署、控制台核准、郵件投遞與客戶遷移仍須另外驗收。授權檔本身的簽章仍排除 `control_url`，但必要的回應簽章會涵蓋該網址。外連另受[固定主機與 DNS 政策](../../features/zh-TW/05-security-defense.md#授權綁定與更新)保護；自訂簽發端即使已在授權檔中提供網址，客戶端仍須在本機明確設定 `DUDUCLAW_CONTROL_URL`。忽略 `new_fingerprint` 的服務會保留舊綁定；弱綁定會一直維持 OpenSource，直到核准遷移成功。
 
 ## 路線圖（規劃中）
 

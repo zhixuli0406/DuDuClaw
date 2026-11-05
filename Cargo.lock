@@ -2196,6 +2196,7 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "ed25519-dalek",
+ "fs2",
  "gethostname",
  "hex",
  "mac_address",
@@ -2206,6 +2207,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml",
+ "url",
 ]
 
 [[package]]

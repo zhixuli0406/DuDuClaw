@@ -10,8 +10,8 @@
 //!   `features.toml` for the active tier (default 7 days for paid tiers,
 //!   disabled for OpenSource). Failure modes are absorbed: a refresh that
 //!   cannot reach the control-plane leaves the local license alone until
-//!   the grace period expires, at which point the runtime silently
-//!   downgrades to OpenSource.
+//!   the grace period expires, at which point the runtime downgrades to
+//!   OpenSource and exposes an admin-facing validation warning.
 //!
 //! - **CRL poll** — every 24 hours fetches `GET /v1/license/crl`,
 //!   verifies the issuer signature, and downgrades immediately if the
@@ -29,24 +29,21 @@ use chrono::Utc;
 use duduclaw_license::{
     EMBEDDED_FEATURES_TOML, FeatureGate, License, LicenseError, LicenseTier, PublicKeyRegistry,
     crl::SignedCrl, fingerprint_candidates, fingerprint_is_hostname_only, generate_fingerprint,
-    save_default, storage,
+    FingerprintCandidate, storage,
 };
 use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 /// Default fall-back when `DUDUCLAW_CONTROL_URL` is unset.
-const DEFAULT_CONTROL_URL: &str = "https://api.duduclaw.dudustudio.monster";
+use duduclaw_license::control_url::DEFAULT_CONTROL_URL;
 
-/// L7: process-wide cache for this machine's **strong** fingerprint.
-/// `generate_fingerprint` enumerates the hostname + MAC addresses on every
-/// call, which is wasteful on hot paths like `LicenseSnapshot::from_state` (one
-/// dashboard poll per second). The fingerprint is host-stable for the lifetime
-/// of the process, so we compute it once and reuse it.
+/// Process-wide cache for the strong fingerprint. The license crate retains
+/// live hardware observations in memory; no editable disk cache is trusted.
 static STRONG_FINGERPRINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Same, for the full candidate list (strong + v1.66.1 legacy compatibility).
-static FINGERPRINT_CANDIDATES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+static FINGERPRINT_CANDIDATES: std::sync::OnceLock<Vec<FingerprintCandidate>> = std::sync::OnceLock::new();
 
 /// The fingerprint that actually identifies this machine to the control-plane:
 /// the candidate the installed license validated against. Falls back to the
@@ -82,7 +79,11 @@ pub(crate) fn strong_fingerprint() -> &'static str {
 }
 
 /// Every fingerprint this machine may legitimately present, strongest first.
-fn cached_candidates() -> &'static [String] {
+fn cached_candidates() -> &'static [FingerprintCandidate] {
+    #[cfg(test)]
+    if let Ok(candidates) = tests::VALIDATION_CANDIDATES.try_with(|candidates| *candidates) {
+        return candidates;
+    }
     FINGERPRINT_CANDIDATES.get_or_init(fingerprint_candidates)
 }
 
@@ -111,15 +112,13 @@ fn clear_effective_fingerprint() {
 }
 
 /// Tell the operator — once — that the active license is bound to a
-/// pre-v1.66.1 fingerprint. The binding stays accepted; only the *next*
+/// historical hostname-based fingerprint. The binding stays accepted; the *next*
 /// issuance should use the strong value.
 fn warn_legacy_binding_once() {
     if !LEGACY_BINDING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         warn!(
-            strong_fingerprint = %strong_fingerprint(),
             "license is bound to a legacy fingerprint (issued before this machine's \
-             identity source changed — on macOS, before v1.66.1 bound to the platform \
-             UUID instead of a placeholder MAC). The binding stays accepted; re-issue \
+             identity source changed). The binding stays accepted; re-issue \
              when convenient with `duduclaw license rebind` (which calls the control \
              plane's /v1/license/rebind) or by re-signing against \
              `duduclaw license fingerprint`"
@@ -208,7 +207,8 @@ pub fn production_registry() -> PublicKeyRegistry {
 
 /// Resolve the control-plane base URL with §10.5 precedence:
 /// `DUDUCLAW_CONTROL_URL` env > `license.control_url` (self-carried) > the baked
-/// default. A blank env value is treated as unset.
+/// default. A blank env value is treated as unset. This is only an untrusted
+/// hint; license_transport validates the endpoint before every outbound call.
 pub fn resolve_control_url(license: Option<&License>) -> String {
     if let Ok(env_url) = std::env::var("DUDUCLAW_CONTROL_URL") {
         let trimmed = env_url.trim();
@@ -257,10 +257,12 @@ pub struct LicenseRuntime {
 }
 
 struct LicenseRuntimeInner {
+    revision: u64,
     /// `None` when no valid license is installed — gateway operates in
     /// OpenSource mode. The runtime exposes a stable `LicenseTier::OpenSource`
     /// to callers in this state.
     license: Option<License>,
+    validation_warning: Option<&'static str>,
 
     /// HS13/D5: `generated_at` of the most recent *accepted* CRL. Used to
     /// reject replays of an older (e.g. pre-revocation) CRL. Loaded from disk
@@ -311,17 +313,7 @@ impl LicenseRuntime {
                 .expect("embedded features.toml is malformed"),
         );
 
-        // M52 fix: honor a persisted revocation marker — if a prior revocation
-        // could not delete license.json, do NOT reload it on restart.
-        let license = if home_dir.join(REVOKED_FILENAME).exists() {
-            warn!(
-                "license revocation marker present — refusing to load license.json; \
-                 running OpenSource until a successful re-subscription clears it"
-            );
-            None
-        } else {
-            load_and_validate(&home_dir, &registry, &gate).await
-        };
+        let (license, validation_warning) = load_and_validate(&home_dir, &registry, &gate).await;
 
         // §10.5: resolve the control-plane URL AFTER loading the license so a
         // self-carried `license.control_url` (baked in by the issuer) is honored
@@ -369,7 +361,9 @@ impl LicenseRuntime {
 
         Self {
             state: Arc::new(RwLock::new(LicenseRuntimeInner {
+                revision: 0,
                 license,
+                validation_warning,
                 last_seen_crl_at,
             })),
             gate,
@@ -477,7 +471,20 @@ impl LicenseRuntime {
     pub async fn snapshot(&self) -> LicenseSnapshot {
         let inner = self.state.read().await;
         let tier = self.live_tier(inner.license.as_ref());
-        LicenseSnapshot::from_state(inner.license.as_ref(), tier)
+        let mut snapshot = LicenseSnapshot::from_state(inner.license.as_ref(), tier);
+        snapshot.validation_warning = inner.validation_warning.or_else(|| {
+            inner.license.as_ref().and_then(|license| {
+                if license.is_expired() { Some("expired") }
+                else if self.gate.grace_period_days(license.tier) > 0
+                    && license.grace_period_exceeded(self.gate.grace_period_days(license.tier)) {
+                    Some("grace_period_expired")
+                } else { None }
+            })
+        });
+        // An invalid installed file is different from a fresh personal install.
+        snapshot.installed |= snapshot.validation_warning.is_some();
+        if snapshot.validation_warning.is_some() { snapshot.mode = "opensource"; }
+        snapshot
     }
 
     /// Verify a candidate license against this runtime's issuer registry +
@@ -497,28 +504,9 @@ impl LicenseRuntime {
         self.registry
             .verify(&license)
             .map_err(|e| format!("授權簽章驗證失敗：{e}"))?;
-        // v1.66.1: accept the strong fingerprint OR any legacy-compatible one,
-        // so a key issued before the macOS-26 MAC-selection fix still installs.
-        let candidates = cached_candidates();
-        let matched = candidates
-            .iter()
-            .find(|c| license.is_valid_for_machine(c))
-            .cloned();
-        match matched {
-            Some(fp) => {
-                if fp != *strong_fingerprint() {
-                    warn_legacy_binding_once();
-                }
-                set_effective_fingerprint(&fp);
-            }
-            None => {
-                let strong = strong_fingerprint();
-                return Err(format!(
-                    "授權綁定的機器指紋與本機不符（本機指紋：{strong}）。\
-                     若是從舊機器搬移，請在本機執行 `duduclaw license rebind`"
-                ));
-            }
-        }
+        let matched = license.validate_any(cached_candidates(),
+            self.gate.phone_home_interval_days(license.tier), self.gate.grace_period_days(license.tier))
+            .map_err(|e| format!("授權驗證失敗：{e}；換綁須由帳號持有人在控制台核准"))?;
         if license.is_expired() {
             return Err(format!("授權已於 {} 過期", license.expires_at));
         }
@@ -542,31 +530,29 @@ impl LicenseRuntime {
                 },
             ));
         }
-        storage::save_to(&license, &self.home_dir.join(storage::DEFAULT_LICENSE_FILENAME))
-            .map_err(|e| format!("寫入授權檔失敗：{e}"))?;
-
-        // A freshly-verified license supersedes a stale revocation marker
-        // (re-subscription path). If this subscription is ALSO on the CRL, the
-        // background CRL poller re-revokes it — we don't weaken that check.
-        let marker = self.home_dir.join(REVOKED_FILENAME);
-        if marker.exists() {
-            if let Err(e) = std::fs::remove_file(&marker) {
-                warn!(error = %e, "could not clear revocation marker after new license install");
-            } else {
-                info!("revocation marker cleared by newly-installed license");
-            }
-        }
-
-        let validated = load_and_validate(&self.home_dir, &self.registry, &self.gate).await;
+        // Serialize disk and memory changes with refresh CAS and revocation.
+        let mut inner = self.state.write().await;
+        let store = storage::LockedLicenseStore::acquire(&self.home_dir.join(storage::DEFAULT_LICENSE_FILENAME))
+            .map_err(|e| format!("鎖定授權檔失敗：{e}"))?;
+        store.save(&license).map_err(|e| format!("寫入授權檔失敗：{e}"))?;
+        let (validated, validation_warning) = match read_validated_license_locked(&self.home_dir, &self.registry, &self.gate, &store) {
+            Ok(license) => (license, None),
+            Err(reason) => (None, Some(reason)),
+        };
         let ok = validated.is_some();
         // A notice cached for the previous license no longer applies; the
         // next fetch brings the new subscription's.
         crate::distributor_notice::runtime::reset(&self.home_dir);
         crate::distributor_brand::runtime::reset(&self.home_dir);
-        {
-            let mut inner = self.state.write().await;
-            inner.license = validated;
+        inner.license = validated;
+        inner.validation_warning = validation_warning;
+        inner.revision += 1;
+        if ok {
+            if matched.legacy { warn_legacy_binding_once(); }
+            set_effective_fingerprint(&matched.fingerprint);
         }
+        drop(store);
+        drop(inner);
         if !ok {
             return Err(
                 "授權已寫入但完整驗證未通過（詳見 gateway 日誌），目前仍為 OpenSource 模式"
@@ -604,6 +590,8 @@ pub struct LicenseSnapshot {
     pub tier: LicenseTier,
     pub mode: &'static str,
     pub installed: bool,
+    /// Stable reason code, only exposed by license.status to Admin. No IDs or hashes.
+    pub validation_warning: Option<&'static str>,
     pub customer_id: Option<String>,
     pub subscription_id: Option<String>,
     pub expires_at: Option<chrono::DateTime<Utc>>,
@@ -623,6 +611,11 @@ pub struct LicenseSnapshot {
 }
 
 impl LicenseSnapshot {
+    pub(crate) fn for_admin(mut self, is_admin: bool) -> Self {
+        if !is_admin { self.validation_warning = None; }
+        self
+    }
+
     fn from_state(license: Option<&License>, tier: LicenseTier) -> Self {
         let installed = license.is_some();
         // L7: reuse the cached fingerprint instead of re-enumerating host MACs.
@@ -638,6 +631,7 @@ impl LicenseSnapshot {
                 "opensource"
             },
             installed,
+            validation_warning: None,
             customer_id: license.map(|l| l.customer_id.clone()),
             subscription_id: license.map(|l| l.subscription_id.clone()),
             expires_at: license.map(|l| l.expires_at),
@@ -740,94 +734,81 @@ fn count_embedded_issuer_keys() -> usize {
 
 // ── Bootstrap helpers ─────────────────────────────────────────
 
-async fn load_and_validate(home_dir: &Path, registry: &PublicKeyRegistry, gate: &FeatureGate) -> Option<License> {
-    // Boot may precede DUDUCLAW_HOME initialization. Read the same explicit
-    // home that license seeding and the identity store use.
-    let license = match storage::load_from(&home_dir.join(storage::DEFAULT_LICENSE_FILENAME)) {
-        Ok(l) => l,
-        Err(LicenseError::FileNotFound(_)) => {
-            debug!("no license file found; running in OpenSource mode");
-            return None;
-        }
-        Err(e) => {
-            warn!(error = %e, "license file present but unreadable; running in OpenSource mode");
-            return None;
-        }
+/// Diagnose the on-disk license with the same checks as gateway bootstrap.
+/// Returns only fixed reason codes; never license content, fingerprints or paths.
+pub fn installed_license_warning(home_dir: &Path, registry: &PublicKeyRegistry, gate: &FeatureGate) -> Option<&'static str> {
+    read_validated_license(home_dir, registry, gate).err()
+}
+
+fn validation_warning(error: &LicenseError) -> &'static str {
+    match error {
+        LicenseError::WeakFingerprint => "weak_binding",
+        LicenseError::InvalidFingerprint if duduclaw_license::fingerprint_hardware_unavailable() => "hardware_identity_unavailable",
+        LicenseError::InvalidFingerprint => "machine_mismatch",
+        LicenseError::Expired => "expired",
+        LicenseError::GracePeriodExceeded(_) => "grace_period_expired",
+        LicenseError::InvalidSignature | LicenseError::UnknownPublicKeyId(_) => "invalid_signature",
+        _ => "invalid_license",
+    }
+}
+
+fn read_validated_license(home_dir: &Path, registry: &PublicKeyRegistry, gate: &FeatureGate) -> Result<Option<License>, &'static str> {
+    let path = home_dir.join(storage::DEFAULT_LICENSE_FILENAME);
+    // Preserve read-only diagnostics on an unused home. Returning no grant
+    // without a lock is safe; any existing artifact is read under the lock.
+    if !path.try_exists().map_err(|_| "unreadable")?
+        && !home_dir.join(REVOKED_FILENAME).try_exists().map_err(|_| "unreadable")? {
+        return Ok(None);
+    }
+    let store = storage::LockedLicenseStore::acquire(&path).map_err(|_| "unreadable")?;
+    read_validated_license_locked(home_dir, registry, gate, &store)
+}
+
+fn read_validated_license_locked(home_dir: &Path, registry: &PublicKeyRegistry, gate: &FeatureGate,
+    store: &storage::LockedLicenseStore) -> Result<Option<License>, &'static str> {
+    if home_dir.join(REVOKED_FILENAME).try_exists().map_err(|_| "unreadable")? {
+        return Err("revoked");
+    }
+    let license = match store.load() {
+        Ok(license) => license,
+        Err(LicenseError::FileNotFound(_)) => return Ok(None),
+        Err(_) => return Err("unreadable"),
     };
+    registry.verify(&license).map_err(|e| validation_warning(&e))?;
+    license.validate_any(cached_candidates(), gate.phone_home_interval_days(license.tier),
+        gate.grace_period_days(license.tier)).map_err(|e| validation_warning(&e))?;
+    license.validate_tier_deployment_binding(is_self_host_deployment())
+        .map_err(|e| validation_warning(&e))?;
+    Ok(Some(license))
+}
 
-    if registry.is_empty() {
-        // No embedded issuer keys → we cannot trust any license. Treat as
-        // OpenSource. Operators see this once at startup so the failure
-        // mode is observable.
-        warn!(
-            "license file present but PublicKeyRegistry is empty — \
-             cannot verify signature; running in OpenSource mode. \
-             Set DUDUCLAW_LICENSE_PUBKEY_* env vars to enable commercial features."
-        );
-        return None;
-    }
-
-    if let Err(e) = registry.verify(&license) {
-        warn!(error = %e, "license signature invalid; running in OpenSource mode");
-        return None;
-    }
-
-    let phone_home = gate.phone_home_interval_days(license.tier);
-    let grace = gate.grace_period_days(license.tier);
-
-    // v1.66.1: try the strong fingerprint first, then the pre-1.66.1
-    // compatibility values. A license bound to the old placeholder-MAC
-    // fingerprint keeps working — it just gets a "re-issue" warning.
-    match license.validate_any(cached_candidates(), phone_home, grace) {
-        Ok(matched) => {
-            // M51: enforce tier ↔ deployment-mode binding. A cloud-only tier
-            // (Solo/Studio/…) must not be honoured on a self-host binary, and a
-            // self-host-only tier (Partner/PersonalProSelfHost/SelfHostPro/Oem)
-            // must not be honoured in Cloud. Fail-closed: a mismatch downgrades
-            // to OpenSource rather than silently granting features.
-            let is_self_host = is_self_host_deployment();
-            if let Err(e) = license.validate_tier_deployment_binding(is_self_host) {
-                warn!(
-                    error = %e,
-                    deployment = if is_self_host { "self_host" } else { "cloud" },
-                    "license tier does not match deployment mode; running in OpenSource mode"
-                );
-                clear_effective_fingerprint();
-                return None;
+async fn load_and_validate(home_dir: &Path, registry: &PublicKeyRegistry, gate: &FeatureGate) -> (Option<License>, Option<&'static str>) {
+    match read_validated_license(home_dir, registry, gate) {
+        Ok(Some(license)) => {
+            let matched = license.validate_any(cached_candidates(), gate.phone_home_interval_days(license.tier),
+                gate.grace_period_days(license.tier));
+            // Recheck before publishing the effective identity; time may have advanced.
+            match matched {
+                Ok(matched) => {
+                    if matched.legacy { warn_legacy_binding_once(); }
+                    set_effective_fingerprint(&matched.fingerprint);
+                    (Some(license), None)
+                }
+                Err(e) => {
+                    clear_effective_fingerprint();
+                    (None, Some(validation_warning(&e)))
+                }
             }
-            if matched.legacy {
-                warn_legacy_binding_once();
-            }
-            set_effective_fingerprint(&matched.fingerprint);
-            Some(license)
         }
-        Err(LicenseError::Expired) => {
-            warn!("installed license is expired; running in OpenSource mode");
+        Ok(None) => {
             clear_effective_fingerprint();
-            None
+            debug!("no license file found; running in OpenSource mode");
+            (None, None)
         }
-        Err(LicenseError::InvalidFingerprint) => {
-            warn!(
-                strong_fingerprint = %strong_fingerprint(),
-                "installed license is bound to a different machine \
-                 (license fingerprint matches neither the current nor any legacy \
-                 fingerprint of this machine); running in OpenSource mode"
-            );
+        Err(reason) => {
             clear_effective_fingerprint();
-            None
-        }
-        Err(LicenseError::GracePeriodExceeded(days)) => {
-            warn!(
-                days,
-                "license grace period exceeded — phone home overdue; running in OpenSource mode"
-            );
-            clear_effective_fingerprint();
-            None
-        }
-        Err(e) => {
-            warn!(error = %e, "license validation failed; running in OpenSource mode");
-            clear_effective_fingerprint();
-            None
+            warn!(reason, "installed license validation failed; running in OpenSource mode");
+            (None, Some(reason))
         }
     }
 }
@@ -1048,46 +1029,35 @@ impl LicenseRuntime {
     }
 
     async fn do_phone_home_once(&self) -> Result<(), PhoneHomeError> {
-        // Snapshot what we need outside the lock — avoid holding the
-        // RwLock across `.await`.
-        let (subscription_id, machine_fingerprint, current_tier) = {
-            let inner = self.state.read().await;
-            let lic = inner.license.as_ref().ok_or(PhoneHomeError::NoLicense)?;
-            (
-                lic.subscription_id.clone(),
-                lic.machine_fingerprint.clone(),
-                lic.tier,
-            )
-        };
-
+        let mut request = self.refresh_snapshot().await?;
+        request.proposed_fingerprint = duduclaw_license::fingerprint::refresh_fingerprint(&request.machine_fingerprint)
+            .map_err(|e| PhoneHomeError::Rejected(e.to_string()))?;
+        let subscription_id = &request.subscription_id;
+        let machine_fingerprint = &request.machine_fingerprint;
         let endpoint = format!(
             "{}/v1/license/refresh",
             self.control_url.trim_end_matches('/')
         );
 
-        // C4.3: anti-replay nonce. Generate a fresh random value per request
-        // and require the control-plane to echo it back in the response. A
-        // replayed (previously-signed) `{"status":"active", license}` body will
-        // carry a stale/absent nonce and is therefore rejected before install.
-        //
-        // Server-side contract: the control-plane MUST copy the request's
-        // `"nonce"` verbatim into the top-level `"nonce"` field of its JSON
-        // response. Responses without a matching nonce are treated as replays.
+        // Every response authenticates this fresh nonce and full request context.
         let nonce = uuid::Uuid::new_v4().to_string();
-        let request_body = json!({
+        let proposed = &request.proposed_fingerprint;
+        let mut request_body = json!({
             "subscription_id": subscription_id,
             "machine_fingerprint": machine_fingerprint,
             "current_version": env!("CARGO_PKG_VERSION"),
             "nonce": nonce,
             "telemetry": {},
         });
+        // Existing issuers require exact equality with the installed binding.
+        // A proposal is only effective after the account holder approves the
+        // re-bind in the console. An old fingerprint is not authentication.
+        if proposed != machine_fingerprint {
+            request_body["new_fingerprint"] = json!(proposed);
+        }
 
-        let client = reqwest::Client::builder()
-            .timeout(PHONE_HOME_TIMEOUT)
-            .build()
-            .map_err(|e| PhoneHomeError::Http(e.to_string()))?;
-        let response = client
-            .post(&endpoint)
+        let response = crate::license_transport::request(reqwest::Method::POST, &endpoint, PHONE_HOME_TIMEOUT)
+            .await.map_err(PhoneHomeError::Http)?
             .json(&request_body)
             .send()
             .await
@@ -1105,11 +1075,15 @@ impl LicenseRuntime {
             )));
         }
 
+        if status_code == reqwest::StatusCode::ACCEPTED
+            || body.get("status").and_then(|v| v.as_str()) == Some("pending") {
+            self.verify_status_response(&request, &nonce, &body, "pending")?;
+            info!("license rebind pending account-holder console approval; installed license unchanged");
+            return Ok(());
+        }
         match body.get("status").and_then(|v| v.as_str()) {
             Some("active") => {
-                // C4.3: reject replays before doing any further work. A captured
-                // old `active` response will not carry the freshly-generated
-                // nonce, so this fails closed without installing anything.
+                // Reject unbound responses before artifact validation.
                 if !response_nonce_ok(&nonce, &body) {
                     return Err(PhoneHomeError::NonceMismatch);
                 }
@@ -1136,34 +1110,14 @@ impl LicenseRuntime {
                     cached_candidates(),
                     phone_home,
                     grace,
+                    &request, &nonce, &body,
                 )?;
-                if matched.legacy {
-                    warn_legacy_binding_once();
-                }
-                set_effective_fingerprint(&matched.fingerprint);
-
-                save_default(&new_license).map_err(|e| PhoneHomeError::Save(e.to_string()))?;
-                {
-                    let mut inner = self.state.write().await;
-                    inner.license = Some(new_license);
-                }
-                // M52: a successful re-subscription clears any prior revocation
-                // marker so the customer recovers paid features on restart.
-                let marker = self.home_dir.join(REVOKED_FILENAME);
-                if marker.exists() {
-                    let _ = std::fs::remove_file(&marker);
-                }
-                info!(tier = %current_tier, "phone-home succeeded; license refreshed");
+                self.apply_refresh(&request, new_license, &matched).await?;
+                info!("phone-home succeeded; license refreshed");
                 Ok(())
             }
             Some("revoked") => {
-                let reason = body
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("revoked")
-                    .to_string();
-                warn!(reason = %reason, "control-plane reported license revoked — downgrading to OpenSource");
-                self.downgrade_to_opensource(&reason).await;
+                self.apply_revocation_response(&request, &nonce, &body).await?;
                 Ok(())
             }
             other => Err(PhoneHomeError::Parse(format!(
@@ -1172,37 +1126,110 @@ impl LicenseRuntime {
         }
     }
 
-    async fn downgrade_to_opensource(&self, reason: &str) {
+    async fn refresh_snapshot(&self) -> Result<RefreshSnapshot, PhoneHomeError> {
+        // Lock order is always memory then disk; release both before network I/O.
         let mut inner = self.state.write().await;
+        let store = self.lock_store()?;
+        let same = match inner.license.as_ref() {
+            Some(license) => store.same_license(license).unwrap_or(false),
+            None => false,
+        };
+        if !same {
+            // A CLI writer cannot update our memory. Reconcile under the same
+            // lock before rejecting the old request, including durable denial.
+            let (license, warning) = match read_validated_license_locked(&self.home_dir, &self.registry, &self.gate, &store) {
+                Ok(license) => (license, None),
+                Err(reason) => (None, Some(reason)),
+            };
+            inner.license = license;
+            inner.validation_warning = warning;
+            inner.revision += 1;
+            clear_effective_fingerprint();
+            if let Some(license) = inner.license.as_ref() {
+                set_effective_fingerprint(&license.machine_fingerprint);
+            }
+            crate::distributor_notice::runtime::reset(&self.home_dir);
+            crate::distributor_brand::runtime::reset(&self.home_dir);
+            return Err(if inner.license.is_some() { PhoneHomeError::StaleResponse } else { PhoneHomeError::NoLicense });
+        }
+        let license = inner.license.as_ref().ok_or(PhoneHomeError::NoLicense)?;
+        Ok(RefreshSnapshot {
+            subscription_id: license.subscription_id.clone(),
+            machine_fingerprint: license.machine_fingerprint.clone(),
+            proposed_fingerprint: license.machine_fingerprint.clone(),
+            revision: inner.revision,
+            disk: store.snapshot().map_err(|e| PhoneHomeError::Save(e.to_string()))?,
+            is_self_host: is_self_host_deployment(),
+        })
+    }
+
+    fn lock_store(&self) -> Result<storage::LockedLicenseStore, PhoneHomeError> {
+        storage::LockedLicenseStore::acquire(&self.home_dir.join(storage::DEFAULT_LICENSE_FILENAME))
+            .map_err(|e| PhoneHomeError::Save(e.to_string()))
+    }
+
+    fn verify_status_response(&self, request: &RefreshSnapshot, nonce: &str,
+        body: &serde_json::Value, status: &str) -> Result<(), PhoneHomeError> {
+        duduclaw_license::refresh::validate_status_response(&self.registry, body, status,
+            nonce, &request.subscription_id, &request.machine_fingerprint, &request.proposed_fingerprint)
+            .map_err(|e| PhoneHomeError::Rejected(e.to_string()))
+    }
+
+    async fn apply_refresh(&self, request: &RefreshSnapshot, license: License,
+        matched: &duduclaw_license::FingerprintMatch) -> Result<(), PhoneHomeError> {
+        let mut inner = self.state.write().await;
+        if !request.matches(&inner) { return Err(PhoneHomeError::StaleResponse); }
+        let store = self.lock_store()?;
+        if !store.matches(&request.disk).map_err(|e| PhoneHomeError::Save(e.to_string()))? {
+            return Err(PhoneHomeError::StaleResponse);
+        }
+        store.save(&license).map_err(|e| PhoneHomeError::Save(e.to_string()))?;
+        inner.license = Some(license);
+        inner.validation_warning = None;
+        inner.revision += 1;
+        if matched.legacy { warn_legacy_binding_once(); }
+        set_effective_fingerprint(&matched.fingerprint);
+        Ok(())
+    }
+
+    async fn apply_revocation_response(&self, request: &RefreshSnapshot, nonce: &str,
+        body: &serde_json::Value) -> Result<(), PhoneHomeError> {
+        self.verify_status_response(request, nonce, body, "revoked")?;
+        let reason = body["reason"].as_str().ok_or_else(|| PhoneHomeError::Parse("missing reason".into()))?;
+        self.apply_revocation(request, reason).await
+    }
+
+    async fn apply_revocation(&self, request: &RefreshSnapshot, reason: &str) -> Result<(), PhoneHomeError> {
+        let mut inner = self.state.write().await;
+        if !request.matches(&inner) { return Err(PhoneHomeError::StaleResponse); }
+        let store = self.lock_store()?;
+        if !store.matches(&request.disk).map_err(|e| PhoneHomeError::Save(e.to_string()))? {
+            return Err(PhoneHomeError::StaleResponse);
+        }
+        // A persisted marker fences restart even if removing the artifact fails.
+        let persisted = store.revoke(reason);
         inner.license = None;
+        inner.revision += 1;
+        inner.validation_warning = Some("revoked");
+        clear_effective_fingerprint();
         crate::distributor_notice::runtime::reset(&self.home_dir);
         crate::distributor_brand::runtime::reset(&self.home_dir);
-        // Best-effort: remove the local file so subsequent restarts don't
-        // reload a known-bad license.
-        if let Err(e) = storage::delete_default() {
-            warn!(error = %e, "could not delete license.json after revocation");
-            // M52 fix: if deletion fails, a restart would reload the revoked
-            // license and run as paid until the next 24h CRL poll. Persist a
-            // revocation marker that bootstrap honors regardless, so revocation
-            // survives restarts even when the file can't be removed.
-            if let Err(e) = std::fs::write(
-                self.home_dir.join(REVOKED_FILENAME),
-                format!("revoked: {reason}\n"),
-            ) {
-                warn!(error = %e, "could not write license revocation marker");
-            }
-        }
-        info!(reason, "downgraded to OpenSource mode");
+        persisted.map_err(|e| PhoneHomeError::Save(e.to_string()))?;
+        info!("downgraded to OpenSource mode");
+        Ok(())
     }
+
 }
 
 /// File (under `home_dir`) marking that the installed license was revoked.
 /// Honored at bootstrap so a revocation survives restarts even if the license
 /// file itself could not be deleted. Cleared on a successful re-subscription.
-const REVOKED_FILENAME: &str = "license_revoked.marker";
+const REVOKED_FILENAME: &str = storage::REVOKED_FILENAME;
 
 #[derive(Debug, thiserror::Error)]
 enum PhoneHomeError {
+    #[error("license changed while refresh was in flight; stale response discarded")]
+    StaleResponse,
     #[error("no license installed")]
     NoLicense,
     #[error("HTTP error: {0}")]
@@ -1223,42 +1250,50 @@ enum PhoneHomeError {
 
 /// C4.3: pure nonce-echo check. The response is accepted only when it carries a
 /// top-level `"nonce"` string equal to the one we sent. Missing field, wrong
-/// type, or a different value all fail (a replayed old response can't echo a
-/// freshly-generated nonce).
+/// type, or a different value all fail. This detects verbatim replay only;
+/// response-signature v2 is needed to authenticate the echo.
 fn response_nonce_ok(sent: &str, body: &serde_json::Value) -> bool {
     body.get("nonce").and_then(|v| v.as_str()) == Some(sent)
 }
 
-/// C4.4: pure acceptance decision for a refreshed license. Composes the two
-/// checks the refresh path must perform before swapping in a license:
-///
-///   1. signature trust — `registry.verify` (Ed25519, dispatched by key id)
-///   2. `validate()` — schema / expiry / machine-fingerprint / grace
-///
-/// Extracted so the acceptance logic is testable without a live control-plane:
-/// construct + sign a `License`, build a trusting `PublicKeyRegistry`, and
-/// assert valid ⇒ Ok while expired / wrong-fingerprint / bad-signature ⇒ Err.
-///
-/// Unbound-OEM note: the machine-binding decision lives entirely inside
-/// `License::validate` (empty fingerprint + `tier == Oem` ⇒ skip binding, all
-/// other tiers ⇒ `InvalidFingerprint`). Both the bootstrap load
-/// (`load_and_validate`) and this refresh path route through `validate`, so an
-/// unbound OEM license refreshed by the control-plane is accepted here for the
-/// same reason it loaded at boot. Do NOT add an independent `machine_fingerprint`
-/// comparison in this path — it would re-break the Docker-rebuild case.
+/// Captured under the state lock before network I/O. Revision also fences an
+/// ABA change where a new installation restores the same subscription/binding.
+struct RefreshSnapshot {
+    subscription_id: String,
+    machine_fingerprint: String,
+    proposed_fingerprint: String,
+    revision: u64,
+    disk: storage::LicenseSnapshot,
+    is_self_host: bool,
+}
+
+impl RefreshSnapshot {
+    fn matches(&self, inner: &LicenseRuntimeInner) -> bool {
+        inner.revision == self.revision && inner.license.as_ref().is_some_and(|license|
+            license.subscription_id == self.subscription_id &&
+            license.machine_fingerprint == self.machine_fingerprint)
+    }
+}
+
+/// Validate the signed artifact, request identity and deployment before CAS.
+#[allow(clippy::too_many_arguments)]
 fn accept_refreshed_license(
     registry: &PublicKeyRegistry,
     new_license: &License,
-    candidates: &[String],
+    candidates: &[FingerprintCandidate],
     phone_home_days: i64,
     grace_days: i64,
+    request: &RefreshSnapshot,
+    nonce: &str,
+    body: &serde_json::Value,
 ) -> Result<duduclaw_license::FingerprintMatch, PhoneHomeError> {
-    registry
-        .verify(new_license)
-        .map_err(|e| PhoneHomeError::Rejected(format!("invalid signature: {e}")))?;
-    new_license
-        .validate_any(candidates, phone_home_days, grace_days)
-        .map_err(|e| PhoneHomeError::Rejected(format!("expiry/fingerprint/grace: {e}")))
+    duduclaw_license::refresh::validate_response(registry, new_license, body, nonce,
+        &request.subscription_id, &request.machine_fingerprint, &request.proposed_fingerprint)
+        .map_err(|e| PhoneHomeError::Rejected(e.to_string()))?;
+    new_license.validate_tier_deployment_binding(request.is_self_host)
+        .map_err(|e| PhoneHomeError::Rejected(e.to_string()))?;
+    new_license.validate_any(candidates, phone_home_days, grace_days)
+        .map_err(|e| PhoneHomeError::Rejected(e.to_string()))
 }
 
 // ── CRL loop ──────────────────────────────────────────────────
@@ -1287,21 +1322,16 @@ impl LicenseRuntime {
     }
 
     async fn do_crl_fetch_once(&self) -> Result<(), PhoneHomeError> {
-        let subscription_id = {
-            let inner = self.state.read().await;
-            match inner.license.as_ref() {
-                Some(l) => l.subscription_id.clone(),
-                None => return Ok(()), // No license → nothing to revoke
-            }
+        let request = match self.refresh_snapshot().await {
+            Ok(request) => request,
+            Err(PhoneHomeError::NoLicense) => return Ok(()),
+            Err(error) => return Err(error),
         };
+        let subscription_id = &request.subscription_id;
 
         let endpoint = format!("{}/v1/license/crl", self.control_url.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
-            .timeout(PHONE_HOME_TIMEOUT)
-            .build()
-            .map_err(|e| PhoneHomeError::Http(e.to_string()))?;
-        let crl: SignedCrl = client
-            .get(&endpoint)
+        let crl: SignedCrl = crate::license_transport::request(reqwest::Method::GET, &endpoint, PHONE_HOME_TIMEOUT)
+            .await.map_err(PhoneHomeError::Http)?
             .send()
             .await
             .map_err(|e| PhoneHomeError::Http(e.to_string()))?
@@ -1352,7 +1382,7 @@ impl LicenseRuntime {
 
         if crl.is_revoked(&subscription_id) {
             warn!(subscription_id = %subscription_id, "CRL lists our subscription as revoked — downgrading to OpenSource");
-            self.downgrade_to_opensource("crl_revoked").await;
+            self.apply_revocation(&request, "crl_revoked").await?;
         } else {
             debug!(
                 revoked_count = crl.revoked.len(),
@@ -1398,12 +1428,42 @@ fn write_last_seen_crl(home_dir: &Path, ts: chrono::DateTime<Utc>) -> std::io::R
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;
     use duduclaw_license::License;
 
     static FINGERPRINT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    pub(crate) const TEST_HARDWARE_FINGERPRINT: &str = "synthetic-hardware-for-license-runtime-tests";
+
+    tokio::task_local! {
+        pub(super) static VALIDATION_CANDIDATES: &'static [FingerprintCandidate];
+    }
+
+    // Scope fixtures to explicitly selected tests. Never upgrade the real MAC
+    // candidates, mutate process-wide caches, or pass the override to child tasks.
+    pub(crate) async fn with_hardware_fixture<T>(future: impl std::future::Future<Output = T>) -> T {
+        static CANDIDATES: std::sync::OnceLock<Vec<FingerprintCandidate>> = std::sync::OnceLock::new();
+        let candidates = CANDIDATES.get_or_init(|| vec![FingerprintCandidate::for_test(TEST_HARDWARE_FINGERPRINT,
+            duduclaw_license::FingerprintStrength::Hardware)]);
+        VALIDATION_CANDIDATES.scope(candidates.as_slice(), future).await
+    }
+
+    #[tokio::test]
+    async fn hardware_fixture_is_scoped_and_does_not_override_child_tasks() {
+        let observed = cached_candidates().to_vec();
+        let child_expected = observed.clone();
+        with_hardware_fixture(async {
+            assert_eq!(cached_candidates()[0].fingerprint(), TEST_HARDWARE_FINGERPRINT);
+            assert_eq!(cached_candidates()[0].strength(), duduclaw_license::FingerprintStrength::Hardware);
+            let child = tokio::spawn(async move {
+                assert_eq!(cached_candidates(), child_expected.as_slice());
+            });
+            child.await.unwrap();
+        }).await;
+        assert_eq!(cached_candidates(), observed.as_slice());
+    }
 
     fn fake_license(tier: LicenseTier, fingerprint: &str) -> License {
         License::new(
@@ -1490,27 +1550,29 @@ mod tests {
 
     #[tokio::test]
     async fn mfa_bootstrap_uses_explicit_home_and_verifies_signed_license() {
-        let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
-        let home = tempfile::tempdir().unwrap();
-        let (key, public) = gen_issuer_keypair();
-        let registry = PublicKeyRegistry::new().with_key("v1", public);
-        let tier = if is_self_host_deployment() { LicenseTier::Oem } else { LicenseTier::Business };
-        let mut license = fake_license(tier, strong_fingerprint());
-        sign_license(&mut license, &key);
-        storage::save_to(&license, &home.path().join("license.json")).unwrap();
-        let runtime = LicenseRuntime::bootstrap(home.path().into(), registry.clone()).await;
-        assert_eq!(runtime.snapshot().await.tier, tier);
-        assert!(!runtime.boot_edition(None, None).await.is_personal());
-        assert!(!home.path().join("users.db").exists());
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let (key, public) = gen_issuer_keypair();
+            let registry = PublicKeyRegistry::new().with_key("v1", public);
+            let tier = if is_self_host_deployment() { LicenseTier::Oem } else { LicenseTier::Business };
+            let mut license = fake_license(tier, TEST_HARDWARE_FINGERPRINT);
+            sign_license(&mut license, &key);
+            storage::save_to(&license, &home.path().join("license.json")).unwrap();
+            let runtime = LicenseRuntime::bootstrap(home.path().into(), registry.clone()).await;
+            assert_eq!(runtime.snapshot().await.tier, tier);
+            assert!(!runtime.boot_edition(None, None).await.is_personal());
+            assert!(!home.path().join("users.db").exists());
 
-        std::fs::write(home.path().join(REVOKED_FILENAME), "revoked").unwrap();
-        let revoked = LicenseRuntime::bootstrap(home.path().into(), registry.clone()).await;
-        assert_eq!(revoked.snapshot().await.tier, LicenseTier::OpenSource);
-        std::fs::remove_file(home.path().join(REVOKED_FILENAME)).unwrap();
-        license.signature[0] ^= 1;
-        storage::save_to(&license, &home.path().join("license.json")).unwrap();
-        let invalid = LicenseRuntime::bootstrap(home.path().into(), registry).await;
-        assert_eq!(invalid.snapshot().await.tier, LicenseTier::OpenSource);
+            std::fs::write(home.path().join(REVOKED_FILENAME), "revoked").unwrap();
+            let revoked = LicenseRuntime::bootstrap(home.path().into(), registry.clone()).await;
+            assert_eq!(revoked.snapshot().await.tier, LicenseTier::OpenSource);
+            std::fs::remove_file(home.path().join(REVOKED_FILENAME)).unwrap();
+            license.signature[0] ^= 1;
+            storage::save_to(&license, &home.path().join("license.json")).unwrap();
+            let invalid = LicenseRuntime::bootstrap(home.path().into(), registry).await;
+            assert_eq!(invalid.snapshot().await.tier, LicenseTier::OpenSource);
+        }).await;
     }
 
     #[tokio::test]
@@ -1525,7 +1587,8 @@ mod tests {
             // Model an already-validated runtime, as the other snapshot tests do.
             let runtime = LicenseRuntime {
                 state: Arc::new(RwLock::new(LicenseRuntimeInner {
-                    license: Some(fake_license(tier, "fp_mfa")), last_seen_crl_at: None,
+                revision: 0,
+                    license: Some(fake_license(tier, "fp_mfa")), validation_warning: None, last_seen_crl_at: None,
                 })),
                 gate: Arc::new(FeatureGate::from_str(EMBEDDED_FEATURES_TOML).unwrap()),
                 registry: Arc::new(PublicKeyRegistry::new()),
@@ -1572,7 +1635,9 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let runtime = LicenseRuntime {
             state: Arc::new(RwLock::new(LicenseRuntimeInner {
+                revision: 0,
                 license: Some(fake_license(LicenseTier::Oem, "fp_brand")),
+                validation_warning: None,
                 last_seen_crl_at: None,
             })),
             gate: Arc::new(FeatureGate::from_str(EMBEDDED_FEATURES_TOML).unwrap()),
@@ -1623,6 +1688,11 @@ mod tests {
                 // Synchronous brand renderers use this same nonblocking read.
                 let snapshot = runtime.snapshot().now_or_never().unwrap();
                 assert_eq!(runtime.current_tier().await, snapshot.tier);
+                let expected_warning = if expires_in_days < 0 { Some("expired") }
+                    else if offline_days > grace { Some("grace_period_expired") }
+                    else { None };
+                assert_eq!(snapshot.validation_warning, expected_warning);
+                assert_eq!(snapshot.mode, if expected_warning.is_some() { "opensource" } else { "commercial" });
                 let name = effective_for(snapshot.tier, snapshot.subscription_id.as_deref(), &accepted)
                     .map(|brand| brand.product_name)
                     .unwrap_or_else(|| ORIGINAL_PRODUCT_NAME.into());
@@ -1761,15 +1831,357 @@ mod tests {
     }
 
     #[test]
+    fn validation_warning_is_only_exposed_to_admin() {
+        let mut snapshot = LicenseSnapshot::from_state(None, LicenseTier::OpenSource);
+        snapshot.installed = true;
+        snapshot.validation_warning = Some("machine_mismatch");
+        assert_eq!(snapshot.clone().for_admin(true).validation_warning, Some("machine_mismatch"));
+        let visible = serde_json::to_value(snapshot.for_admin(false)).unwrap();
+        assert!(visible["validation_warning"].is_null());
+        assert!(visible.get("machine_fingerprint").is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_installed_license_retains_warning_and_recovers_after_activation() {
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let (kp, pubkey) = gen_issuer_keypair();
+            let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+            let missing = LicenseRuntime::bootstrap(home.path().into(), registry.clone()).await;
+            assert!(!missing.snapshot().await.installed);
+            assert_eq!(missing.snapshot().await.validation_warning, None);
+            let mut license = valid_license_for("another-machine");
+            sign_license(&mut license, &kp);
+            storage::save_to(&license, &home.path().join("license.json")).unwrap();
+            let mut runtime = LicenseRuntime::bootstrap(home.path().into(), registry).await;
+            runtime.control_url = "http://127.0.0.1:9".into();
+            let snap = runtime.snapshot().await;
+            assert_eq!(snap.tier, LicenseTier::OpenSource);
+            assert_eq!(snap.mode, "opensource");
+            assert!(snap.installed);
+            let reason = if duduclaw_license::fingerprint_hardware_unavailable() {
+                "hardware_identity_unavailable"
+            } else { "machine_mismatch" };
+            assert_eq!(snap.validation_warning, Some(reason));
+            assert!(snap.customer_id.is_none());
+            assert!(snap.subscription_id.is_none());
+            let json = serde_json::to_string(&snap).unwrap();
+            assert!(!json.contains("another-machine"));
+            license.machine_fingerprint = TEST_HARDWARE_FINGERPRINT.to_string();
+            sign_license(&mut license, &kp);
+            let restored = runtime.install_and_reload(license).await.unwrap();
+            assert_eq!(restored.tier, LicenseTier::SelfHostPro);
+            assert!(restored.installed);
+            assert_eq!(restored.validation_warning, None);
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_or_bad_signature_license_warns_without_exposing_content() {
+        let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let (kp, pubkey) = gen_issuer_keypair();
+        let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+        std::fs::write(home.path().join("license.json"), "private-invalid-content").unwrap();
+        let runtime = LicenseRuntime::bootstrap(home.path().into(), registry.clone()).await;
+        assert_eq!(runtime.snapshot().await.validation_warning, Some("unreadable"));
+        let mut license = valid_license_for(TEST_HARDWARE_FINGERPRINT);
+        sign_license(&mut license, &kp);
+        license.signature[0] ^= 1;
+        storage::save_to(&license, &home.path().join("license.json")).unwrap();
+        let runtime = LicenseRuntime::bootstrap(home.path().into(), registry).await;
+        assert_eq!(runtime.snapshot().await.validation_warning, Some("invalid_signature"));
+    }
+
+    fn test_refresh_snapshot(license: &License) -> RefreshSnapshot {
+        RefreshSnapshot { subscription_id: license.subscription_id.clone(),
+            machine_fingerprint: license.machine_fingerprint.clone(),
+            proposed_fingerprint: license.machine_fingerprint.clone(), revision: 0,
+            disk: storage::LockedLicenseStore::acquire(&tempfile::tempdir().unwrap().path().join("license.json"))
+                .unwrap().snapshot().unwrap(), is_self_host: true }
+    }
+
+    fn signed_response(kp: &ring::signature::Ed25519KeyPair, license: Option<&License>,
+        request: &RefreshSnapshot, status: &str, nonce: &str) -> serde_json::Value {
+        use base64::Engine as _;
+        let digest = license.map(duduclaw_license::refresh::license_digest).transpose().unwrap().unwrap_or_default();
+        let reason = if status == "revoked" { "cancelled" } else { "" };
+        let effective = "2020-01-01T00:00:00Z";
+        let payload = duduclaw_license::refresh::response_payload(status, reason, effective, nonce,
+            &request.subscription_id, &request.machine_fingerprint, &request.proposed_fingerprint, &digest).unwrap();
+        json!({"status":status, "reason":reason, "effective_from":effective,
+            "nonce":nonce, "subscription_id":request.subscription_id,
+            "original_fingerprint":request.machine_fingerprint,
+            "proposed_fingerprint":request.proposed_fingerprint, "license_digest":digest,
+            "public_key_id":"v1", "response_signature_version":2,
+            "response_signature":base64::engine::general_purpose::STANDARD.encode(kp.sign(&payload).as_ref())})
+    }
+
+    fn accept_test_response(kp: &ring::signature::Ed25519KeyPair, registry: &PublicKeyRegistry, license: &License,
+        candidates: &[FingerprintCandidate], ph: i64, grace: i64) -> Result<duduclaw_license::FingerprintMatch, PhoneHomeError> {
+        let request = test_refresh_snapshot(license);
+        let body = signed_response(kp, Some(license), &request, "active", "nonce");
+        accept_refreshed_license(registry, license, candidates, ph, grace, &request, "nonce", &body)
+    }
+
+    #[test]
+    fn accept_refreshed_license_binds_request_and_deployment() {
+        let (kp, pubkey) = gen_issuer_keypair();
+        let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+        let mut license = valid_license_for("old");
+        sign_license(&mut license, &kp);
+        let mut request = test_refresh_snapshot(&license);
+        request.proposed_fingerprint = "new".into();
+        let candidates = [
+            FingerprintCandidate::for_test("old", duduclaw_license::FingerprintStrength::Hardware),
+            FingerprintCandidate::for_test("new", duduclaw_license::FingerprintStrength::Hardware),
+            FingerprintCandidate::for_test("unrequested", duduclaw_license::FingerprintStrength::Hardware),
+        ];
+        let accept = |license: &License, request: &RefreshSnapshot| {
+            let body = signed_response(&kp, Some(license), request, "active", "n");
+            accept_refreshed_license(&registry, license, &candidates, 7, 14, request, "n", &body)
+        };
+        assert!(accept(&license, &request).is_ok());
+        license.machine_fingerprint = "new".into();
+        sign_license(&mut license, &kp);
+        assert!(accept(&license, &request).is_ok());
+        license.subscription_id = "different-subscription".into();
+        sign_license(&mut license, &kp);
+        assert!(accept(&license, &request).is_err());
+        license.subscription_id = request.subscription_id.clone();
+        license.machine_fingerprint = "unrequested".into();
+        sign_license(&mut license, &kp);
+        assert!(accept(&license, &request).is_err());
+        // A legitimate unbound OEM remains supported, but cannot replace a
+        // bound license or enter a cloud deployment through refresh.
+        license.tier = LicenseTier::Oem;
+        license.machine_fingerprint.clear();
+        sign_license(&mut license, &kp);
+        assert!(accept(&license, &request).is_err());
+        request.machine_fingerprint.clear();
+        request.proposed_fingerprint.clear();
+        assert!(accept(&license, &request).is_ok());
+        request.is_self_host = false;
+        assert!(accept(&license, &request).is_err());
+    }
+
+    #[test]
+    fn refresh_snapshot_checks_subscription_binding_and_revision_independently() {
+        let license = valid_license_for("fp");
+        let request = test_refresh_snapshot(&license);
+        let mut inner = LicenseRuntimeInner { revision: 0, license: Some(license.clone()),
+            validation_warning: None, last_seen_crl_at: None };
+        assert!(request.matches(&inner));
+        inner.license.as_mut().unwrap().subscription_id = "other".into();
+        assert!(!request.matches(&inner));
+        inner.license = Some(license.clone());
+        inner.license.as_mut().unwrap().machine_fingerprint = "other".into();
+        assert!(!request.matches(&inner));
+        inner.license = Some(license);
+        inner.revision = 1;
+        assert!(!request.matches(&inner));
+        inner.license = None;
+        assert!(!request.matches(&inner));
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_cannot_overwrite_reinstalled_license_or_disk() {
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let (kp, pubkey) = gen_issuer_keypair();
+            let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+            let mut license = valid_license_for(TEST_HARDWARE_FINGERPRINT);
+            sign_license(&mut license, &kp);
+            storage::save_to(&license, &home.path().join("license.json")).unwrap();
+            let mut runtime = LicenseRuntime::bootstrap(home.path().into(), registry).await;
+            runtime.control_url = "http://127.0.0.1:9".into();
+            let request = runtime.refresh_snapshot().await.unwrap();
+            // Identical subscription/binding still changes the installation. Both
+            // revision and full disk snapshot fence a delayed quota rollback.
+            let mut replacement = license.clone();
+            replacement.max_agents = Some(42);
+            sign_license(&mut replacement, &kp);
+            runtime.install_and_reload(replacement).await.unwrap();
+            let before = std::fs::read(home.path().join("license.json")).unwrap();
+            let matched = license.validate_any(cached_candidates(), 7, 30).unwrap();
+            assert!(matches!(runtime.apply_refresh(&request, license, &matched).await,
+                Err(PhoneHomeError::StaleResponse)));
+            assert_eq!(std::fs::read(home.path().join("license.json")).unwrap(), before);
+            let inner = runtime.state.read().await;
+            assert_eq!(inner.revision, 1);
+            assert_eq!(inner.license.as_ref().unwrap().max_agents, Some(42));
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn external_install_fences_gateway_refresh_and_revocation() {
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("license.json");
+            let (kp, pubkey) = gen_issuer_keypair();
+            let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+            let mut license = valid_license_for(TEST_HARDWARE_FINGERPRINT);
+            sign_license(&mut license, &kp);
+            storage::save_to(&license, &path).unwrap();
+            let runtime = LicenseRuntime::bootstrap(home.path().into(), registry).await;
+            let request = runtime.refresh_snapshot().await.unwrap();
+            let mut replacement = license.clone();
+            replacement.max_agents = Some(42);
+            sign_license(&mut replacement, &kp);
+            // This writer never touches the gateway's in-memory revision.
+            storage::save_to(&replacement, &path).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let matched = license.validate_any(cached_candidates(), 7, 30).unwrap();
+            assert!(matches!(runtime.apply_refresh(&request, license, &matched).await,
+                Err(PhoneHomeError::StaleResponse)));
+            let revoked = signed_response(&kp, None, &request, "revoked", "n");
+            assert!(matches!(runtime.apply_revocation_response(&request, "n", &revoked).await,
+                Err(PhoneHomeError::StaleResponse)));
+            // The independently authenticated CRL path uses the same disk CAS.
+            assert!(matches!(runtime.apply_revocation(&request, "crl_revoked").await,
+                Err(PhoneHomeError::StaleResponse)));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(!home.path().join(REVOKED_FILENAME).exists());
+            assert_eq!(runtime.state.read().await.revision, 0);
+            assert!(matches!(runtime.refresh_snapshot().await, Err(PhoneHomeError::StaleResponse)));
+            assert_eq!(runtime.snapshot().await.max_agents, Some(42));
+            assert!(runtime.refresh_snapshot().await.is_ok());
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn external_revocation_or_deactivation_reconciles_gateway_memory() {
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            for revoke in [true, false] {
+                let home = tempfile::tempdir().unwrap();
+                let path = home.path().join("license.json");
+                let (kp, pubkey) = gen_issuer_keypair();
+                let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+                let mut license = valid_license_for(TEST_HARDWARE_FINGERPRINT);
+                sign_license(&mut license, &kp);
+                storage::save_to(&license, &path).unwrap();
+                let runtime = LicenseRuntime::bootstrap(home.path().into(), registry).await;
+                let store = storage::LockedLicenseStore::acquire(&path).unwrap();
+                if revoke { store.revoke("cancelled").unwrap(); } else { store.delete().unwrap(); }
+                drop(store);
+                // CRL capture reconciles disk first, even though there is now no
+                // subscription to fetch. It must not retain the old paid state.
+                runtime.do_crl_fetch_once().await.unwrap();
+                assert_eq!(runtime.snapshot().await.tier, LicenseTier::OpenSource);
+                assert!(runtime.state.read().await.license.is_none());
+                assert_eq!(runtime.snapshot().await.validation_warning, if revoke { Some("revoked") } else { None });
+            }
+        }).await;
+    }
+
+    #[test]
+    fn bootstrap_read_waits_for_atomic_revocation() {
+        let _fingerprint_guard = FINGERPRINT_TEST_LOCK.blocking_lock();
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("license.json");
+        let (kp, pubkey) = gen_issuer_keypair();
+        let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+        let mut license = valid_license_for(TEST_HARDWARE_FINGERPRINT);
+        sign_license(&mut license, &kp);
+        storage::save_to(&license, &path).unwrap();
+        let store = storage::LockedLicenseStore::acquire(&path).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let home_path = home.path().to_path_buf();
+        let reader = std::thread::spawn(move || {
+            let gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML).unwrap();
+            started_tx.send(()).unwrap();
+            done_tx.send(read_validated_license(&home_path, &registry, &gate)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(StdDuration::from_millis(50)).is_err());
+        store.revoke("cancelled").unwrap();
+        drop(store);
+        assert!(matches!(done_rx.recv_timeout(StdDuration::from_secs(5)).unwrap(), Err("revoked")));
+        reader.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsigned_or_tampered_revocation_cannot_change_disk_or_memory() {
+        with_hardware_fixture(async {
+            let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("license.json");
+            let (kp, pubkey) = gen_issuer_keypair();
+            let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+            let mut license = valid_license_for(TEST_HARDWARE_FINGERPRINT);
+            sign_license(&mut license, &kp);
+            storage::save_to(&license, &path).unwrap();
+            let runtime = LicenseRuntime::bootstrap(home.path().into(), registry.clone()).await;
+            let request = runtime.refresh_snapshot().await.unwrap();
+            let signed = signed_response(&kp, None, &request, "revoked", "n");
+            let before = std::fs::read(&path).unwrap();
+            let mut forged = vec![json!({"status":"revoked"})];
+            for field in ["reason", "effective_from", "nonce", "response_signature_version"] {
+                let mut changed = signed.clone();
+                changed.as_object_mut().unwrap().remove(field);
+                forged.push(changed);
+            }
+            let mut changed = signed.clone();
+            changed["reason"] = json!("different reason");
+            forged.push(changed);
+            for body in forged {
+                assert!(runtime.apply_revocation_response(&request, "n", &body).await.is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert!(!home.path().join(REVOKED_FILENAME).exists());
+                assert_eq!(runtime.snapshot().await.tier, LicenseTier::SelfHostPro);
+            }
+            runtime.apply_revocation_response(&request, "n", &signed).await.unwrap();
+            assert!(!path.exists());
+            assert!(home.path().join(REVOKED_FILENAME).exists());
+            assert_eq!(runtime.snapshot().await.tier, LicenseTier::OpenSource);
+            let restarted = LicenseRuntime::bootstrap(home.path().into(), registry).await;
+            assert_eq!(restarted.snapshot().await.validation_warning, Some("revoked"));
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn weak_installed_license_is_opensource_with_admin_only_rebind_warning() {
+        let _fingerprint_guard = FINGERPRINT_TEST_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let (kp, pubkey) = gen_issuer_keypair();
+        let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+        let weak = cached_candidates().iter().find(|c|
+            c.strength() == duduclaw_license::FingerprintStrength::Weak).unwrap();
+        let mut license = valid_license_for(weak.fingerprint());
+        sign_license(&mut license, &kp);
+        storage::save_to(&license, &home.path().join("license.json")).unwrap();
+        let runtime = LicenseRuntime::bootstrap(home.path().into(), registry).await;
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.tier, LicenseTier::OpenSource);
+        assert_eq!(snapshot.mode, "opensource");
+        assert!(snapshot.installed);
+        assert_eq!(snapshot.validation_warning, Some("weak_binding"));
+        assert_eq!(snapshot.for_admin(false).validation_warning, None);
+        assert!(runtime.install_and_reload(license).await.is_err());
+    }
+
+    #[test]
     fn accept_refreshed_license_accepts_valid() {
         let (kp, pubkey) = gen_issuer_keypair();
         let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
-        let fp = generate_fingerprint();
+        let fp = TEST_HARDWARE_FINGERPRINT.to_string();
 
         let mut lic = valid_license_for(&fp);
         sign_license(&mut lic, &kp);
 
-        let res = accept_refreshed_license(&registry, &lic, std::slice::from_ref(&fp), 7, 14);
+        let res = accept_test_response(
+            &kp,
+            &registry,
+            &lic,
+            &[FingerprintCandidate::for_test(&fp, duduclaw_license::FingerprintStrength::Hardware)],
+            7,
+            14,
+        );
         assert!(
             res.is_ok(),
             "valid signed+current license must be accepted: {res:?}"
@@ -1779,8 +2191,7 @@ mod tests {
 
     #[test]
     fn accept_refreshed_license_accepts_a_legacy_candidate() {
-        // v1.66.1: a license issued against the pre-fix (placeholder-MAC)
-        // fingerprint must keep validating — flagged legacy, never rejected.
+        // A legacy real-hardware fingerprint remains accepted and flagged.
         let (kp, pubkey) = gen_issuer_keypair();
         let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
         let legacy_fp = "1743ebb5466bcad6c206e7e42371f45d".to_string();
@@ -1791,8 +2202,9 @@ mod tests {
         // Literal candidates, not this machine's real ones: a sandboxed test
         // runner can mask MACs, which would make strong == legacy and silently
         // stop exercising the fallback.
-        let candidates = vec!["strong-fp-of-this-machine".to_string(), legacy_fp.clone()];
-        let matched = accept_refreshed_license(&registry, &lic, &candidates, 7, 14)
+        let candidates = vec![FingerprintCandidate::for_test("strong-fp-of-this-machine", duduclaw_license::FingerprintStrength::Hardware),
+            FingerprintCandidate::for_test(legacy_fp.clone(), duduclaw_license::FingerprintStrength::Hardware)];
+        let matched = accept_test_response(&kp, &registry, &lic, &candidates, 7, 14)
             .expect("legacy-bound license must still be accepted");
         assert!(matched.legacy, "a compatibility match must be flagged legacy");
         assert_eq!(matched.fingerprint, legacy_fp);
@@ -1818,14 +2230,14 @@ mod tests {
     fn candidate_list_leads_with_the_strong_fingerprint() {
         let candidates = cached_candidates();
         assert!(!candidates.is_empty());
-        assert_eq!(candidates[0], strong_fingerprint());
+        assert_eq!(candidates[0].fingerprint(), strong_fingerprint());
     }
 
     #[test]
     fn accept_refreshed_license_rejects_expired() {
         let (kp, pubkey) = gen_issuer_keypair();
         let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
-        let fp = generate_fingerprint();
+        let fp = TEST_HARDWARE_FINGERPRINT.to_string();
 
         // Issued + expired in the past — validly signed but past expiry.
         let mut lic = License::new(
@@ -1838,7 +2250,14 @@ mod tests {
         );
         sign_license(&mut lic, &kp);
 
-        let res = accept_refreshed_license(&registry, &lic, std::slice::from_ref(&fp), 7, 14);
+        let res = accept_test_response(
+            &kp,
+            &registry,
+            &lic,
+            &[FingerprintCandidate::for_test(&fp, duduclaw_license::FingerprintStrength::Hardware)],
+            7,
+            14,
+        );
         assert!(res.is_err(), "expired license must be rejected");
     }
 
@@ -1846,13 +2265,20 @@ mod tests {
     fn accept_refreshed_license_rejects_wrong_fingerprint() {
         let (kp, pubkey) = gen_issuer_keypair();
         let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
-        let current_fp = generate_fingerprint();
+        let current_fp = TEST_HARDWARE_FINGERPRINT.to_string();
 
         // Validly signed but bound to a *different* machine.
         let mut lic = valid_license_for("some-other-machine-fingerprint");
         sign_license(&mut lic, &kp);
 
-        let res = accept_refreshed_license(&registry, &lic, std::slice::from_ref(&current_fp), 7, 14);
+        let res = accept_test_response(
+            &kp,
+            &registry,
+            &lic,
+            &[FingerprintCandidate::for_test(&current_fp, duduclaw_license::FingerprintStrength::Hardware)],
+            7,
+            14,
+        );
         assert!(
             res.is_err(),
             "license bound to another machine must be rejected"
@@ -1865,12 +2291,19 @@ mod tests {
         let (kp, _pubkey) = gen_issuer_keypair();
         let (_other_kp, other_pubkey) = gen_issuer_keypair();
         let registry = PublicKeyRegistry::new().with_key("v1", other_pubkey);
-        let fp = generate_fingerprint();
+        let fp = TEST_HARDWARE_FINGERPRINT.to_string();
 
         let mut lic = valid_license_for(&fp);
         sign_license(&mut lic, &kp);
 
-        let res = accept_refreshed_license(&registry, &lic, std::slice::from_ref(&fp), 7, 14);
+        let res = accept_test_response(
+            &kp,
+            &registry,
+            &lic,
+            &[FingerprintCandidate::for_test(&fp, duduclaw_license::FingerprintStrength::Hardware)],
+            7,
+            14,
+        );
         assert!(
             res.is_err(),
             "license signed by an untrusted key must be rejected"

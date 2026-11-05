@@ -4,7 +4,7 @@
 //!
 //! - Parses license files (schema v2, JSON)
 //! - Verifies Ed25519 signatures against embedded issuer public keys
-//! - Computes machine fingerprints (`SHA-256(hostname::MAC)[..16]`)
+//! - Computes machine fingerprints (versioned macOS UUID; legacy hostname + MAC elsewhere)
 //! - Loads `features.toml` and gates commercial feature flags by tier
 //! - Persists license files atomically to `~/.duduclaw/license.json`
 //!
@@ -24,6 +24,7 @@
 //!
 //! See `commercial/docs/specs/spec-license-module.md` for the full design rationale.
 
+pub mod control_url;
 pub mod crl;
 pub mod error;
 pub mod fingerprint;
@@ -31,6 +32,7 @@ pub mod gate;
 pub mod key;
 pub mod license;
 pub mod notice;
+pub mod refresh;
 pub mod storage;
 pub mod tier;
 
@@ -38,7 +40,7 @@ pub mod tier;
 pub use crl::SignedCrl;
 pub use error::{LicenseError, Result};
 pub use fingerprint::{
-    FingerprintMatch, fingerprint_candidates, fingerprint_is_hostname_only, generate_fingerprint,
+    FingerprintCandidate, FingerprintStrength, FingerprintMatch, fingerprint_hardware_unavailable, fingerprint_candidates, fingerprint_is_hostname_only, generate_fingerprint,
     select_primary_mac,
 };
 pub use gate::{FeatureGate, SERVICE_COMMITMENTS, is_service_commitment};

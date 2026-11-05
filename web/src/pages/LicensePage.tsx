@@ -1,4 +1,5 @@
 import { useAuthStore } from '@/stores/auth-store';
+import { LicenseValidationWarning } from '@/components/LicenseValidationWarning';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -239,6 +240,7 @@ export function LicensePage() {
 
       {snapshot && (
         <>
+          <LicenseValidationWarning snapshot={snapshot} />
           {/* ── NFR watermark: signed into the license, never hidden by
               the permanent anti-resale marker ────── */}
           {snapshot.nfr && (
@@ -264,7 +266,7 @@ export function LicensePage() {
               label={intl.formatMessage({ id: 'license.activeTier' })}
               value={TIER_LABELS[snapshot.tier]}
               sub={
-                snapshot.installed
+                snapshot.mode === 'commercial'
                   ? intl.formatMessage({ id: 'license.mode.commercial' })
                   : intl.formatMessage({ id: 'license.mode.opensource' })
               }
@@ -296,7 +298,7 @@ export function LicensePage() {
           </div>
 
           {/* ── Activate — prominent while on OpenSource ── */}
-          {isAdmin && !snapshot.installed && (
+          {isAdmin && snapshot.mode === 'opensource' && (
             <ActivateLicenseCard collapsed={false} onActivated={() => void load()} />
           )}
 
@@ -345,7 +347,7 @@ export function LicensePage() {
             </CardContent>
           </Card>
 
-          {snapshot.installed && expiryClassification.tone !== 'ok' && (
+          {snapshot.installed && snapshot.days_until_expiry != null && expiryClassification.tone !== 'ok' && (
             <Card>
               <CardHeader>
                 <CardTitle>{intl.formatMessage({ id: 'license.cta.renew.title' })}</CardTitle>
@@ -365,7 +367,7 @@ export function LicensePage() {
           )}
 
           {/* ── Replace / re-activate — collapsed once licensed ── */}
-          {isAdmin && snapshot.installed && (
+          {isAdmin && snapshot.mode === 'commercial' && (
             <ActivateLicenseCard collapsed onActivated={() => void load()} />
           )}
 
