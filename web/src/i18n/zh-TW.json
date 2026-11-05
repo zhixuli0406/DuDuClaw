@@ -9785,5 +9785,14 @@
   "meeting.state.cancelled": "已取消",
   "meeting.sizeError": "請選擇未超過大小上限的非空錄音或影片。",
   "meeting.requestFailed": "目前無法完成，請稍後再試；已上傳的部分會保留。",
-  "meeting.fileChanged": "檔案內容與先前上傳的版本不同，請使用原始檔案或更名後重新上傳。"
+  "meeting.fileChanged": "檔案內容與先前上傳的版本不同，請使用原始檔案或更名後重新上傳。",
+  "mcpKeys.oauth.title": "OAuth 連線授權",
+  "mcpKeys.oauth.desc": "查看已授權的應用程式。撤銷後，該次授權的所有連線憑證立即失效；應用程式須重新取得授權。",
+  "mcpKeys.oauth.empty": "目前沒有有效的 OAuth 授權",
+  "mcpKeys.oauth.issued": "授權時間",
+  "mcpKeys.oauth.lastUsed": "最後使用",
+  "mcpKeys.oauth.neverUsed": "尚未使用",
+  "mcpKeys.oauth.revokeTitle": "撤銷連線授權",
+  "mcpKeys.oauth.confirm": "確定撤銷「{client}」的授權？此應用程式將無法再以這次授權存取資料。",
+  "mcpKeys.oauth.revoked": "已撤銷連線授權"
 }

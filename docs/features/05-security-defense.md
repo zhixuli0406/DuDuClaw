@@ -6,6 +6,12 @@ Enterprise [team-history API](68-manager-team-history.md) (v1.76.0): live report
 
 ---
 
+## Remote MCP OAuth grants (v1.80.0)
+
+OAuth code exchange, refresh and access-token validation recheck the original internal consent key and its metadata. Removed, expired, changed or unreadable keys cannot keep a grant alive; invalid refresh and refresh replay remove the whole token family. Requested scopes never exceed the consent key or the previous refresh token. Older tokens without lineage require authorization again. RFC 7009 `/oauth/revoke` uses the existing public-client policy, checks client binding and invalidates the entire family, including access tokens. Dashboard grant listing and revocation are Admin-only; mutations share the same transaction lock; lists contain no credentials. Revocation does not cancel in-flight tool calls. The CLI's `ddc_refresh_*` credentials remain stdio-only; HTTP and SSE reject them. See [Remote MCP](../guides/remote-mcp.md). Shared-store unit tests passed; CLI/gateway/browser acceptance is pending.
+
+OAuth issuance is bounded to 2,048 access/refresh records per family (including spent refresh digests), 16,384 token records and 1,024 grants overall, with a 16 MiB store limit. At capacity, issuance fails without consuming the current refresh token; spent digests are retained until expiry so replay and rotated-token revocation still work. HTTP requests are admitted before authentication: 120 requests/minute per TCP peer IP and 60/minute per Bearer value, followed immediately by the existing per-client gate. Forwarded IP headers are not trusted; clients behind a proxy share its peer allowance. Token exchange also has a 12/minute per-client allowance. Admission tables and blocking storage workers are bounded. Access validation is read-only; admitted use updates last-use telemetry at most once per minute in a blocking worker. Grant-list configuration errors are reported as unavailable, not an empty list. Dashboard revocation audits the actor, family, application, scopes and outcome without credentials or hashes; an audit-write failure is reported even if revocation already took effect.
+
 ## Machine access and the person directing it
 
 Giving an AI employee Bash or machine tools lets anyone bound to that employee direct those tools. Bind it only to people who should have that authority. Admin-granted native tools remain available to ordinary AI employees.

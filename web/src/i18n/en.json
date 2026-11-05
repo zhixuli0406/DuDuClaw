@@ -9785,5 +9785,14 @@
   "meeting.state.cancelled": "Cancelled",
   "meeting.sizeError": "Choose a non-empty recording within the file size limit.",
   "meeting.requestFailed": "Unable to complete the request. Try again shortly; uploaded parts are retained.",
-  "meeting.fileChanged": "This file differs from the earlier upload. Select the original file, or rename it to start a new upload."
+  "meeting.fileChanged": "This file differs from the earlier upload. Select the original file, or rename it to start a new upload.",
+  "mcpKeys.oauth.title": "OAuth connections",
+  "mcpKeys.oauth.desc": "Review authorized applications. Revoking a grant immediately invalidates all its tokens; the application must authorize again.",
+  "mcpKeys.oauth.empty": "No active OAuth grants",
+  "mcpKeys.oauth.issued": "Authorized",
+  "mcpKeys.oauth.lastUsed": "Last used",
+  "mcpKeys.oauth.neverUsed": "Not used yet",
+  "mcpKeys.oauth.revokeTitle": "Revoke connection",
+  "mcpKeys.oauth.confirm": "Revoke access for {client}? This application will no longer be able to use this grant to access data.",
+  "mcpKeys.oauth.revoked": "Connection revoked"
 }

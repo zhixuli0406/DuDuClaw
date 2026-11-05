@@ -2535,6 +2535,18 @@ enum MaintenanceCommands {
         #[arg(long, default_value = "127.0.0.1:8765")]
         bind: String,
 
+        /// Canonical public HTTPS origin used by MCP/OAuth discovery and audiences
+        #[arg(long)]
+        public_origin: Option<String>,
+
+        /// Trusted reverse proxy IP (repeat for each hop); proxy must sanitize/append XFF
+        #[arg(long = "trusted-proxy")]
+        trusted_proxies: Vec<std::net::IpAddr>,
+
+        /// UNSAFE: permit plaintext HTTP on non-loopback networks
+        #[arg(long)]
+        allow_insecure_lan: bool,
+
         /// Disable SSE endpoints (only POST /mcp/v1/call and GET /healthz)
         #[arg(long)]
         no_sse: bool,
@@ -3952,7 +3964,7 @@ enum McpCommands {
         replace: bool,
     },
 
-    /// Issue a new refresh token for an MCP client.
+    /// Issue a stdio-only refresh token for an MCP client (not http-server).
     ///
     /// The raw token is printed to stdout once — capture it immediately and
     /// paste into the client config. Only its SHA-256 hash is persisted in
@@ -5937,10 +5949,10 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             Some(AcpCommands::Server) => acp::server::run_acp_server(&duduclaw_home()).await,
         },
         Commands::Maintenance(MaintenanceCommands::HttpServer {
-            bind,
+            bind, public_origin, trusted_proxies, allow_insecure_lan,
             no_sse,
             timeout_secs,
-        }) => cmd_http_server(&bind, no_sse, timeout_secs).await,
+        }) => cmd_http_server(&bind, public_origin, trusted_proxies, allow_insecure_lan, no_sse, timeout_secs).await,
         Commands::Maintenance(MaintenanceCommands::Proxy {
             bind,
             key,
@@ -12078,6 +12090,9 @@ async fn cmd_import_data(file: PathBuf, force: bool) -> duduclaw_core::error::Re
 /// to `mcp_http_server::run()` which binds an Axum listener.
 async fn cmd_http_server(
     bind: &str,
+    public_origin: Option<String>,
+    trusted_proxies: Vec<std::net::IpAddr>,
+    allow_insecure_lan: bool,
     no_sse: bool,
     timeout_secs: u64,
 ) -> duduclaw_core::error::Result<()> {
@@ -12090,6 +12105,15 @@ async fn cmd_http_server(
     let bind_addr: std::net::SocketAddr = bind
         .parse()
         .map_err(|e| DuDuClawError::Gateway(format!("Invalid bind address '{bind}': {e}")))?;
+
+    let cfg = crate::mcp_http_server::HttpServerConfig {
+        bind: bind_addr,
+        public_origin, trusted_proxies, allow_insecure_lan,
+        home_dir: home.clone(),
+        enable_sse: !no_sse,
+        call_timeout: std::time::Duration::from_secs(timeout_secs),
+    };
+    cfg.external_origin().map_err(DuDuClawError::Gateway)?;
 
     // Initialize HTTP client
     let http = reqwest::Client::builder()
@@ -12140,13 +12164,6 @@ async fn cmd_http_server(
         crate::mcp_memory_quota::DailyQuota::new(),
     )
     .with_redaction(redaction_layer.map(Arc::new));
-
-    let cfg = crate::mcp_http_server::HttpServerConfig {
-        bind: bind_addr,
-        home_dir: home,
-        enable_sse: !no_sse,
-        call_timeout: std::time::Duration::from_secs(timeout_secs),
-    };
 
     println!("DuDuClaw MCP HTTP server starting on http://{bind_addr}");
     if !no_sse {
@@ -12214,6 +12231,7 @@ async fn cmd_mcp(cmd: McpCommands, home: &std::path::Path) -> duduclaw_core::err
             })?;
 
             println!();
+            eprintln!("Warning: {}", mcp_refresh::STDIO_ONLY_NOTICE);
             println!("🔑 Refresh token issued — copy NOW (it will not be shown again):");
             println!();
             println!("    {token}");

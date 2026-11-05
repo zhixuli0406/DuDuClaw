@@ -1,4 +1,4 @@
-//! MCP refresh-token authentication (v1.16.0).
+//! MCP stdio-only refresh-token authentication (v1.16.0).
 //!
 //! Long-lived, revocable, scoped credentials that supersede the legacy 30-day
 //! `ddc_<env>_<32hex>` API keys.  Behaviour summary:
@@ -13,7 +13,7 @@
 //!
 //! The choice of "long-lived refresh token but no separate access token" is
 //! deliberate.  MCP servers are spawned as long-running subprocesses that
-//! authenticate exactly once at startup; there is no subsequent request flow
+//! revalidate this credential on every call; there is no separate exchange flow
 //! that an access token would protect.  The refresh token therefore IS the
 //! credential, and "refresh" in this module means "renew before expiry by
 //! issuing a fresh token and revoking the old one" — managed via CLI.
@@ -35,8 +35,10 @@ pub const REFRESH_TOKEN_TTL_DAYS: i64 = 90;
 /// SQLite filename relative to `~/.duduclaw/`.
 const TOKEN_DB_FILENAME: &str = "mcp_tokens.db";
 
-/// Token prefix that distinguishes refresh tokens from legacy API keys.
-/// Legacy: `ddc_<env>_<32hex>`. Refresh: `ddc_refresh_<env>_<64hex>`.
+/// This credential is not an OAuth refresh token or an HTTP bearer key.
+pub const STDIO_ONLY_NOTICE: &str = "ddc_refresh tokens are stdio-only (mcp-server). For http-server use an MCP API key or the OAuth authorization flow.";
+
+/// Token prefix: `ddc_refresh_<env>_<64hex>`; used only by stdio.
 pub const REFRESH_TOKEN_PREFIX: &str = "ddc_refresh_";
 
 // ── Public types ─────────────────────────────────────────────────────────────

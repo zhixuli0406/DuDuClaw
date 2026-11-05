@@ -37,7 +37,10 @@
 //! Client ID Metadata Documents (2026-10-08, [`cimd`]): a `client_id` that
 //! is an `https://` URL with a path and is not a registered id is resolved by
 //! fetching that URL (public addresses only, pinned resolution, no
-//! redirects, 5 s, 5 KiB, cached 1 h, at most 64 cached). The document must
+//! redirects, 5 s including DNS, 5 KiB, cached 1 h; failures cached 30 s,
+//! at most 64 cached). Four workers retain their slots through caller
+//! cancellation; admission waits at most 100 ms, with 12 attempts/IP/minute.
+//! The document must
 //! be a JSON object whose `client_id` equals the URL exactly, whose
 //! `redirect_uris` pass the same policy as registration, and whose
 //! `token_endpoint_auth_method` is absent or `none` (public clients only).
@@ -47,108 +50,38 @@
 //! client that uses it.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use axum::Json;
+use axum::{Extension, Json};
 use axum::extract::{Form, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use base64::Engine as _;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::mcp_auth::{AuthError, EXTERNALLY_GRANTABLE_SCOPES, Principal, parse_scopes};
-use crate::mcp_http_server::HttpState;
+use crate::mcp_http_server::{HttpState, SourceIp, RegistrationBudget};
 
-const CODE_TTL_SECS: i64 = 600; // RFC 6749 recommends ≤10 min
+use duduclaw_core::mcp_oauth_store::{
+    Consent, Grant, IssuedToken, OAuthStore, PendingCode, RegisteredClient,
+    CODE_TTL_SECS, load_store, update_store, scope_subset,
+};
+#[cfg(test)]
+use duduclaw_core::mcp_oauth_store::store_path;
 const ACCESS_TOKEN_TTL_SECS: i64 = 3600;
 const REFRESH_TOKEN_TTL_SECS: i64 = 30 * 24 * 3600;
-const MAX_CLIENTS: usize = 200;
+use duduclaw_core::mcp_oauth_store::MAX_CLIENTS;
 const MAX_REDIRECT_URIS: usize = 10;
 const MAX_CLIENT_NAME_CHARS: usize = 100;
-
-pub(crate) const STORE_FILE: &str = "mcp_oauth_issued.json";
-
-// ── Store ─────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RegisteredClient {
-    client_name: String,
-    redirect_uris: Vec<String>,
-    created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PendingCode {
-    client_id: String,
-    redirect_uri: String,
-    code_challenge: String,
-    /// Space-joined scope tokens already filtered to the grantable set.
-    scope: String,
-    issued_unix: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct IssuedToken {
-    client_id: String,
-    client_name: String,
-    scope: String,
-    expires_unix: i64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct OAuthStore {
-    #[serde(default)]
-    clients: HashMap<String, RegisteredClient>,
-    /// Keyed by SHA-256 hex of the authorization code.
-    #[serde(default)]
-    codes: HashMap<String, PendingCode>,
-    /// Keyed by SHA-256 hex of the access token.
-    #[serde(default)]
-    tokens: HashMap<String, IssuedToken>,
-    /// Keyed by SHA-256 hex of the refresh token.
-    #[serde(default)]
-    refresh: HashMap<String, IssuedToken>,
-}
-
-fn store_path(home: &Path) -> PathBuf {
-    home.join(STORE_FILE)
-}
 
 fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-fn load_store(home: &Path) -> OAuthStore {
-    let Ok(raw) = std::fs::read_to_string(store_path(home)) else {
-        return OAuthStore::default();
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
-}
-
-/// Prune expired material, then persist atomically under the cross-process
-/// advisory lock (project convention 3).
-fn save_store(home: &Path, mut store: OAuthStore) -> std::io::Result<()> {
-    let now = now_unix();
-    store
-        .codes
-        .retain(|_, c| now - c.issued_unix <= CODE_TTL_SECS);
-    store.tokens.retain(|_, t| t.expires_unix > now);
-    store.refresh.retain(|_, t| t.expires_unix > now);
-    let path = store_path(home);
-    let json = serde_json::to_string_pretty(&store)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    duduclaw_core::with_file_lock(&path, || {
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp, &path)
-    })
+fn store_error() -> Response {
+    oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "OAuth store unavailable")
 }
 
 fn sha256_hex(input: &str) -> String {
@@ -171,56 +104,70 @@ fn random_secret() -> String {
 /// Prefix distinguishing OAuth-issued access tokens from static `ddc_*` keys.
 pub(crate) const OAUTH_TOKEN_PREFIX: &str = "ddc_oauth_";
 
-/// Validate an OAuth-issued access token. Returns the external Principal it
-/// was minted for, or an auth error (expired/unknown ⇒ the caller's 401).
-pub(crate) fn validate_oauth_token(raw: &str, home: &Path) -> Result<Principal, AuthError> {
-    let store = load_store(home);
-    let entry = store
-        .tokens
-        .get(&sha256_hex(raw))
-        .ok_or(AuthError::UnknownKey)?;
-    if entry.expires_unix <= now_unix() {
-        return Err(AuthError::UnknownKey);
-    }
-    let scopes = parse_scopes(&entry.scope.replace(' ', ",")).unwrap_or_default();
-    Ok(Principal {
-        // `oauth_` prefix (not `oauth:`) — namespace client-id charset
-        // is [a-zA-Z0-9_-] and the colon would fail resolve() with a 500.
-        client_id: format!("oauth_{}", entry.client_id),
-        scopes,
-        // OAuth tokens are for remote clients by definition — the C4
-        // external predicate must always apply.
-        is_external: true,
-        created_at: chrono::Utc::now(),
+pub(crate) fn is_oauth_access_token(raw: &str) -> bool {
+    raw.strip_prefix(OAUTH_TOKEN_PREFIX).is_some_and(|secret| {
+        secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
 }
 
-// ── Base-URL derivation ───────────────────────────────────────────────────────
-
-/// Derive the externally-visible base URL from the request (tunnel-friendly:
-/// honours `X-Forwarded-Proto`; falls back to plain http on loopback).
-fn base_url(headers: &HeaderMap) -> String {
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
-        .filter(|v| v == "http" || v == "https")
-        .unwrap_or_else(|| "http".to_string());
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("127.0.0.1")
-        .trim()
-        .to_string();
-    format!("{proto}://{host}")
+/// Validate an OAuth-issued access token. Returns the external Principal it
+/// was minted for, or an auth error (expired/unknown ⇒ the caller's 401).
+pub(crate) fn validate_oauth_token(raw: &str, home: &Path, resource: &str) -> Result<Principal, AuthError> {
+    let store = load_store(home).map_err(|_| AuthError::ReloadFailed)?;
+    let entry = store.tokens.get(&sha256_hex(raw)).ok_or(AuthError::UnknownKey)?;
+    if !store.valid_token(entry, home, resource) || filter_scope(&entry.scope) != entry.scope {
+        return Err(AuthError::UnknownKey);
+    }
+    let grant = store.grants.get(&entry.family_id).ok_or(AuthError::UnknownKey)?;
+    Ok(Principal {
+        client_id: format!("oauth_{}", entry.client_id),
+        scopes: parse_scopes(&entry.scope.replace(' ', ","))?,
+        is_external: true,
+        created_at: chrono::DateTime::from_timestamp(grant.issued_unix, 0).ok_or(AuthError::UnknownKey)?,
+    })
 }
 
-/// The `WWW-Authenticate` value the MCP endpoint's 401s must carry (RFC 9728).
-pub(crate) fn www_authenticate_value(headers: &HeaderMap) -> String {
-    format!(
-        "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
-        base_url(headers)
-    )
+/// Approximate telemetry, at most one persisted update per family per minute.
+/// Re-read under the mutation lock; a stale observation never recreates a grant.
+pub(crate) fn note_oauth_use(raw: &str, home: &Path) {
+    let key = sha256_hex(raw);
+    let Ok(snapshot) = load_store(home) else { return; };
+    let Some(token) = snapshot.tokens.get(&key) else { return; };
+    let Some(grant) = snapshot.grants.get(&token.family_id) else { return; };
+    let now = now_unix();
+    if grant.last_used_unix.is_some_and(|last| now - last < 60) { return; }
+    let _ = update_store(home, |store| {
+        if let Some(token) = store.tokens.get(&key)
+            && token.expires_unix > now
+            && let Some(grant) = store.grants.get_mut(&token.family_id)
+            && grant.last_used_unix.is_none_or(|last| now - last >= 60) {
+            grant.last_used_unix = Some(now);
+        }
+    });
+}
+
+// ── Canonical resource binding ───────────────────────────────────────────────
+
+/// Omitted indicators default only to this server; explicit empty, multiple
+/// different audiences and all other targets are refused (RFC 8707).
+fn requested_resource<'a>(requested: Option<&str>, canonical: &'a str) -> Result<&'a str, Response> {
+    if canonical.is_empty() || requested.is_some_and(|r| r != canonical) {
+        return Err(oauth_error(StatusCode::BAD_REQUEST, "invalid_target", "resource must equal this server's canonical MCP URI"));
+    }
+    Ok(canonical)
+}
+
+fn resource_params(params: &[(String, String)], canonical: &str) -> Result<(), Response> {
+    requested_resource(None, canonical)?;
+    for (_, value) in params.iter().filter(|(key, _)| key == "resource") {
+        requested_resource(Some(value), canonical)?;
+    }
+    Ok(())
+}
+
+/// RFC 9728 challenge uses configuration, never request authority headers.
+pub(crate) fn www_authenticate_value(external_origin: &str) -> String {
+    format!("Bearer resource_metadata=\"{external_origin}/.well-known/oauth-protected-resource\"")
 }
 
 // ── Metadata endpoints ────────────────────────────────────────────────────────
@@ -232,10 +179,10 @@ fn grantable_scope_strings() -> Vec<String> {
         .collect()
 }
 
-pub(crate) async fn protected_resource_metadata(headers: HeaderMap) -> Response {
-    let base = base_url(&headers);
+pub(crate) async fn protected_resource_metadata(State(state): State<HttpState>) -> Response {
+    let base = &state.external_origin;
     Json(json!({
-        "resource": format!("{base}/mcp"),
+        "resource": state.resource,
         "authorization_servers": [base],
         "bearer_methods_supported": ["header"],
         "scopes_supported": grantable_scope_strings(),
@@ -243,13 +190,18 @@ pub(crate) async fn protected_resource_metadata(headers: HeaderMap) -> Response 
     .into_response()
 }
 
-pub(crate) async fn authorization_server_metadata(headers: HeaderMap) -> Response {
-    let base = base_url(&headers);
+pub(crate) async fn authorization_server_metadata(State(state): State<HttpState>) -> Response {
+    authorization_metadata(&state.external_origin)
+}
+
+fn authorization_metadata(base: &str) -> Response {
     Json(json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/oauth/authorize"),
         "token_endpoint": format!("{base}/oauth/token"),
         "registration_endpoint": format!("{base}/oauth/register"),
+        "revocation_endpoint": format!("{base}/oauth/revoke"),
+        "revocation_endpoint_auth_methods_supported": ["none"],
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
@@ -267,12 +219,116 @@ pub(crate) mod cimd {
     use duduclaw_gateway::remote_mcp::url_policy::{OutboundPolicy, check_outbound, pinned_client};
     use serde_json::Value;
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
     pub const MAX_DOC_BYTES: usize = 5 * 1024;
     const CACHE_TTL: Duration = Duration::from_secs(3600);
     const CACHE_MAX: usize = 64;
+    const NEGATIVE_TTL: Duration = Duration::from_secs(30);
+    const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(100);
+    const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[derive(Clone, Debug)]
+    pub enum ResolveError {
+        Invalid(String),
+        Temporary,
+    }
+
+    impl ResolveError {
+        pub fn response(self) -> axum::response::Response {
+            match self {
+                Self::Invalid(message) => super::html_error(axum::http::StatusCode::BAD_REQUEST, &message),
+                Self::Temporary => super::oauth_error(axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "temporarily_unavailable", "retry client metadata resolution later"),
+            }
+        }
+    }
+
+    type CachedResult = Result<RegisteredClient, ResolveError>;
+
+    struct FetchGuard {
+        slots: Arc<tokio::sync::Semaphore>,
+        cache: Mutex<HashMap<String, (CachedResult, Instant)>>,
+        attempts: Mutex<crate::mcp_http_server::Admission>,
+    }
+
+    impl Default for FetchGuard {
+        fn default() -> Self {
+            Self {
+                slots: Arc::new(tokio::sync::Semaphore::new(4)),
+                cache: Mutex::new(HashMap::new()),
+                attempts: Mutex::new(Default::default()),
+            }
+        }
+    }
+
+    impl FetchGuard {
+        fn cached(&self, id: &str) -> Result<Option<CachedResult>, ResolveError> {
+            let mut cache = self.cache.lock().map_err(|_| ResolveError::Temporary)?;
+            cache.retain(|_, (_, until)| *until > Instant::now());
+            Ok(cache.get(id).map(|(value, _)| value.clone()))
+        }
+
+        fn remember(&self, id: &str, result: CachedResult) {
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.retain(|_, (_, until)| *until > Instant::now());
+                if !cache.contains_key(id) && cache.len() >= CACHE_MAX {
+                    if let Some(oldest) = cache.iter().min_by_key(|(_, (_, until))| *until).map(|(key, _)| key.clone()) {
+                        cache.remove(&oldest);
+                    }
+                }
+                let ttl = if result.is_ok() { CACHE_TTL } else { NEGATIVE_TTL };
+                cache.insert(id.to_owned(), (result, Instant::now() + ttl));
+            }
+        }
+
+        async fn resolve<F>(&self, id: &str, source: &str, fetch: F, timeout: Duration) -> CachedResult
+        where F: std::future::Future<Output = Result<RegisteredClient, String>> + Send + 'static {
+            if let Some(cached) = self.cached(id)? { return cached; }
+            if !self.attempts.lock().map(|mut t| t.allow(source.to_owned(), 12)).unwrap_or(false) {
+                return Err(ResolveError::Temporary);
+            }
+            let permit = match tokio::time::timeout(ACQUIRE_TIMEOUT, self.slots.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    self.remember(id, Err(ResolveError::Temporary));
+                    return Err(ResolveError::Temporary);
+                }
+            };
+            // Serialize the cache recheck and in-flight marker to coalesce URL probes.
+            {
+                let mut cache = self.cache.lock().map_err(|_| ResolveError::Temporary)?;
+                cache.retain(|_, (_, until)| *until > Instant::now());
+                if let Some((cached, _)) = cache.get(id) { return cached.clone(); }
+                if cache.len() >= CACHE_MAX {
+                    if let Some(oldest) = cache.iter().min_by_key(|(_, (_, until))| *until).map(|(key, _)| key.clone()) {
+                        cache.remove(&oldest);
+                    }
+                }
+                cache.insert(id.to_owned(), (Err(ResolveError::Temporary), Instant::now() + NEGATIVE_TTL));
+            }
+            // Keep the permit in a detached worker if the HTTP caller cancels or
+            // times out. spawn_blocking DNS cannot be cancelled: releasing here
+            // would let slow resolvers accumulate beyond the four-slot bound.
+            let work = tokio::spawn(async move {
+                let _permit = permit;
+                fetch.await
+            });
+            let result = match tokio::time::timeout(timeout, work).await {
+                Ok(Ok(Ok(client))) => Ok(client),
+                Ok(Ok(Err(message))) => Err(ResolveError::Invalid(message)),
+                _ => Err(ResolveError::Temporary),
+            };
+            self.remember(id, result.clone());
+            result
+        }
+    }
+
+    fn guard() -> &'static FetchGuard {
+        static GUARD: OnceLock<FetchGuard> = OnceLock::new();
+        GUARD.get_or_init(Default::default)
+    }
 
     /// Is `client_id` shaped like a metadata-document URL (https, has a
     /// path other than `/`, no fragment)?
@@ -307,27 +363,27 @@ pub(crate) mod cimd {
         Ok(RegisteredClient {
             client_name: sanitize_client_name(obj.get("client_name").and_then(|v| v.as_str())),
             redirect_uris: uris,
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: chrono::Utc::now().to_rfc3339(), last_used_unix: None,
         })
     }
 
-    fn cache() -> &'static Mutex<HashMap<String, (RegisteredClient, Instant)>> {
-        static C: OnceLock<Mutex<HashMap<String, (RegisteredClient, Instant)>>> = OnceLock::new();
-        C.get_or_init(|| Mutex::new(HashMap::new()))
+    /// Fetch attempts use process-wide slots, bounded positive/negative caches
+    /// and a dedicated per-source budget, independent of bearer hints.
+    pub async fn resolve(client_id: &str, source: &str) -> Result<RegisteredClient, ResolveError> {
+        resolve_from(client_id, source, OutboundPolicy::PUBLIC_ONLY).await
     }
 
-    /// Fetch (or take from the cache) and validate the document.
-    pub async fn resolve(client_id: &str) -> Result<RegisteredClient, String> {
-        resolve_with(client_id, OutboundPolicy::PUBLIC_ONLY).await
+    #[cfg(test)]
+    pub async fn resolve_with(client_id: &str, policy: OutboundPolicy) -> Result<RegisteredClient, ResolveError> {
+        resolve_from(client_id, "test-source", policy).await
     }
 
-    pub async fn resolve_with(client_id: &str, policy: OutboundPolicy) -> Result<RegisteredClient, String> {
-        if let Ok(c) = cache().lock()
-            && let Some((client, at)) = c.get(client_id)
-            && at.elapsed() < CACHE_TTL
-        {
-            return Ok(client.clone());
-        }
+    async fn resolve_from(client_id: &str, source: &str, policy: OutboundPolicy) -> Result<RegisteredClient, ResolveError> {
+        let id = client_id.to_owned();
+        guard().resolve(client_id, source, async move { fetch(&id, policy).await }, FETCH_TIMEOUT).await
+    }
+
+    async fn fetch(client_id: &str, policy: OutboundPolicy) -> Result<RegisteredClient, String> {
         let url = url::Url::parse(client_id).map_err(|_| "client_id is not a URL".to_string())?;
         check_outbound(&url, policy)?;
         let http = pinned_client(&url, policy, Duration::from_secs(5)).await?;
@@ -343,29 +399,122 @@ pub(crate) mod cimd {
         let bytes = duduclaw_gateway::remote_mcp::http::read_capped(resp, MAX_DOC_BYTES).await?;
         let doc: Value = serde_json::from_slice(&bytes).map_err(|_| "the client metadata document is not JSON".to_string())?;
         let client = parse_document(&doc, client_id)?;
-        if let Ok(mut c) = cache().lock() {
-            if c.len() >= CACHE_MAX {
-                c.retain(|_, (_, at)| at.elapsed() < CACHE_TTL);
-                if c.len() >= CACHE_MAX {
-                    c.clear();
-                }
-            }
-            c.insert(client_id.to_string(), (client.clone(), Instant::now()));
-        }
         Ok(client)
     }
+
+    #[cfg(test)]
+    mod guard_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn client() -> RegisteredClient {
+            RegisteredClient { client_name: "Example".into(), redirect_uris: vec![],
+                created_at: chrono::Utc::now().to_rfc3339(), last_used_unix: None }
+        }
+
+        #[tokio::test]
+        async fn four_fetches_bound_global_work_even_when_callers_cancel() {
+            let guard = Arc::new(FetchGuard::default());
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let (started, mut ready) = tokio::sync::mpsc::channel(4);
+            let mut callers = Vec::new();
+            for n in 0..4 {
+                let guard = guard.clone(); let release = release.clone(); let started = started.clone();
+                callers.push(tokio::spawn(async move {
+                    guard.resolve(&format!("https://example.com/{n}"), &format!("source-{n}"), async move {
+                        started.send(()).await.unwrap();
+                        let _permit = release.acquire().await.unwrap();
+                        Ok(client())
+                    }, Duration::from_secs(30)).await
+                }));
+            }
+            for _ in 0..4 { tokio::time::timeout(Duration::from_secs(2), ready.recv()).await.unwrap().unwrap(); }
+            assert_eq!(guard.slots.available_permits(), 0);
+            for caller in callers { caller.abort(); let _ = caller.await; }
+            assert_eq!(guard.slots.available_permits(), 0);
+            let result = guard.resolve("https://example.com/overflow", "another-source", async {
+                panic!("fifth fetch must not start");
+            }, FETCH_TIMEOUT).await;
+            assert!(matches!(result, Err(ResolveError::Temporary)));
+            // Acquire failure is also negatively cached across source addresses.
+            assert!(matches!(guard.cached("https://example.com/overflow").unwrap(), Some(Err(ResolveError::Temporary))));
+            release.add_permits(4);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while guard.slots.available_permits() != 4 { tokio::task::yield_now().await; }
+            }).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn slow_fetch_is_negatively_cached_without_releasing_running_worker() {
+            let guard = FetchGuard::default();
+            let (release, wait) = tokio::sync::oneshot::channel::<()>();
+            let id = "https://example.com/slow";
+            assert!(matches!(guard.resolve(id, "source", async {
+                wait.await.unwrap(); Ok(client())
+            }, Duration::from_millis(10)).await, Err(ResolveError::Temporary)));
+            assert_eq!(guard.slots.available_permits(), 3);
+            assert!(matches!(guard.resolve(id, "different-source", async {
+                panic!("negative cache must prevent another slow fetch");
+            }, FETCH_TIMEOUT).await, Err(ResolveError::Temporary)));
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while guard.slots.available_permits() != 4 { tokio::task::yield_now().await; }
+            }).await.unwrap();
+            assert!(matches!(guard.cached(id).unwrap(), Some(Err(ResolveError::Temporary))));
+        }
+
+        #[tokio::test]
+        async fn failed_fetch_cache_expires_is_bounded_and_success_is_cached() {
+            let guard = FetchGuard::default();
+            let id = "https://example.com/failure";
+            assert!(matches!(guard.resolve(id, "source", async { Err("bad JSON".into()) }, FETCH_TIMEOUT).await,
+                Err(ResolveError::Invalid(_))));
+            assert!(matches!(guard.resolve(id, "other-source", async {
+                panic!("failed fetch must be cached");
+            }, FETCH_TIMEOUT).await, Err(ResolveError::Invalid(_))));
+            guard.cache.lock().unwrap().get_mut(id).unwrap().1 = Instant::now() - Duration::from_secs(1);
+            assert!(guard.resolve(id, "source", async { Ok(client()) }, FETCH_TIMEOUT).await.is_ok());
+            assert!(guard.resolve(id, "source", async { panic!("success must be cached"); }, FETCH_TIMEOUT).await.is_ok());
+            for n in 0..CACHE_MAX + 10 {
+                guard.remember(&format!("https://example.com/failure-{n}"), Err(ResolveError::Temporary));
+            }
+            assert_eq!(guard.cache.lock().unwrap().len(), CACHE_MAX);
+        }
+
+        #[tokio::test]
+        async fn cimd_attempt_budget_is_per_source_even_for_distinct_urls() {
+            let guard = FetchGuard::default();
+            let calls = Arc::new(AtomicUsize::new(0));
+            for n in 0..13 {
+                let calls = calls.clone();
+                let result = guard.resolve(&format!("https://example.com/{n}"), "attacker", async move {
+                    calls.fetch_add(1, Ordering::SeqCst); Err("TLS failure".into())
+                }, FETCH_TIMEOUT).await;
+                if n == 12 { assert!(matches!(result, Err(ResolveError::Temporary))); }
+                else { assert!(matches!(result, Err(ResolveError::Invalid(_)))); }
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 12);
+            assert!(guard.resolve("https://example.com/12", "legitimate", async { Ok(client()) }, FETCH_TIMEOUT).await.is_ok());
+            let response = ResolveError::Temporary.response();
+            assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"], "temporarily_unavailable");
+        }
+    }
+
 }
 
 /// A registered client, or — for an unregistered `https://` client id — its
 /// Client ID Metadata Document.
-async fn resolve_client(store: &OAuthStore, client_id: &str) -> Result<RegisteredClient, String> {
+async fn resolve_client(store: &OAuthStore, client_id: &str, source: &str) -> Result<RegisteredClient, Response> {
     if let Some(c) = store.clients.get(client_id) {
+        if !c.active_at(now_unix()) { return Err(html_error(StatusCode::BAD_REQUEST, "client registration expired; register again")); }
         return Ok(c.clone());
     }
     if cimd::is_cimd_client_id(client_id) {
-        return cimd::resolve(client_id).await;
+        return cimd::resolve(client_id, source).await.map_err(cimd::ResolveError::response);
     }
-    Err("unknown client_id — register first via /oauth/register".into())
+    Err(html_error(StatusCode::BAD_REQUEST, "unknown client_id — register first via /oauth/register"))
 }
 
 // ── Dynamic client registration (RFC 7591) ────────────────────────────────────
@@ -406,8 +555,16 @@ fn sanitize_client_name(raw: Option<&str>) -> String {
 
 pub(crate) async fn register_handler(
     State(state): State<HttpState>,
+    Extension(budget): Extension<RegistrationBudget>,
     Json(body): Json<Value>,
 ) -> Response {
+    crate::mcp_http_server::blocking_http(move || register_response(&state.home_dir, body, &budget)).await
+}
+
+fn register_response(home: &Path, body: Value, budget: &RegistrationBudget) -> Response {
+    if body.get("token_endpoint_auth_method").is_some_and(|method| method.as_str() != Some("none")) {
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata", "only public clients are supported");
+    }
     let Some(uris) = body.get("redirect_uris").and_then(|v| v.as_array()) else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -437,29 +594,29 @@ pub(crate) async fn register_handler(
     }
     let client_name = sanitize_client_name(body.get("client_name").and_then(|v| v.as_str()));
 
-    let mut store = load_store(&state.home_dir);
-    if store.clients.len() >= MAX_CLIENTS {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_client_metadata",
-            "registration limit reached — prune mcp_oauth_issued.json",
-        );
-    }
     let client_id = format!("mcp_{}", uuid::Uuid::new_v4().simple());
-    store.clients.insert(
-        client_id.clone(),
-        RegisteredClient {
-            client_name: client_name.clone(),
-            redirect_uris: redirect_uris.clone(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-        },
-    );
-    if save_store(&state.home_dir, store).is_err() {
-        return oauth_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            "failed to persist registration",
-        );
+    let result = update_store(home, |store| {
+        let victim = if store.clients.len() >= MAX_CLIENTS {
+            match store.registration_eviction_candidate(now_unix()) {
+                Some(id) if store.clients.len() == MAX_CLIENTS => Some(id),
+                _ => return Err(oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata", "registration limit reached")),
+            }
+        } else { None };
+        // Invalid metadata and a full protected registry never charge this budget.
+        if !budget.admit_creation() {
+            return Err(oauth_error(StatusCode::TOO_MANY_REQUESTS, "temporarily_unavailable", "retry registration later"));
+        }
+        if let Some(id) = victim { store.clients.remove(&id); }
+        store.clients.insert(client_id.clone(), RegisteredClient {
+            client_name: client_name.clone(), redirect_uris: redirect_uris.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(), last_used_unix: None,
+        });
+        Ok(())
+    });
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(response)) => return response,
+        Err(_) => return store_error(),
     }
     (
         StatusCode::CREATED,
@@ -572,17 +729,23 @@ fn html_error(status: StatusCode, msg: &str) -> Response {
 
 pub(crate) async fn authorize_handler(
     State(state): State<HttpState>,
-    Query(q): Query<HashMap<String, String>>,
+    Extension(source): Extension<SourceIp>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
-    let store = load_store(&state.home_dir);
+    if let Err(response) = resource_params(&params, &state.resource) { return response; }
+    let q: HashMap<String, String> = params.into_iter().collect();
+    let home = state.home_dir.clone();
+    let store = match crate::mcp_http_server::blocking_io(move || load_store(&home)).await {
+        Ok(Ok(store)) => store, Ok(Err(_)) => return store_error(), Err(response) => return response,
+    };
     // Client + redirect_uri must validate BEFORE any redirect is possible
     // (never bounce a browser to an unverified URI).
     let Some(client_id) = q.get("client_id") else {
         return html_error(StatusCode::BAD_REQUEST, "missing client_id");
     };
-    let client = match resolve_client(&store, client_id).await {
+    let client = match resolve_client(&store, client_id, &source.0).await {
         Ok(c) => c,
-        Err(e) => return html_error(StatusCode::BAD_REQUEST, &e),
+        Err(response) => return response,
     };
     let Some(redirect_uri) = q.get("redirect_uri") else {
         return html_error(StatusCode::BAD_REQUEST, "missing redirect_uri");
@@ -635,6 +798,7 @@ pub(crate) async fn authorize_handler(
 <input type=\"hidden\" name=\"state\" value=\"{state_v}\">\
 <input type=\"hidden\" name=\"code_challenge\" value=\"{challenge}\">\
 <input type=\"hidden\" name=\"scope\" value=\"{scope}\">\
+<input type=\"hidden\" name=\"resource\" value=\"{resource}\">\
 <p><input type=\"password\" name=\"operator_key\" placeholder=\"ddc_…\" \
 style=\"width:100%;padding:.5rem\" autocomplete=\"off\" required></p>\
 <p><button class=\"primary\" name=\"action\" value=\"approve\" style=\"padding:.5rem 1.5rem\">同意連線</button> \
@@ -650,12 +814,14 @@ style=\"width:100%;padding:.5rem\" autocomplete=\"off\" required></p>\
         state_v = escape_html(&state_param),
         challenge = escape_html(&challenge),
         scope = escape_html(&scope),
+        resource = escape_html(&state.resource),
     );
     Html(oauth_page("DuDuClaw 授權", "DuDuClaw 連線授權", &body)).into_response()
 }
 
 #[derive(Deserialize)]
 pub(crate) struct DecisionForm {
+    resource: Option<String>,
     client_id: String,
     redirect_uri: String,
     #[serde(default)]
@@ -669,14 +835,24 @@ pub(crate) struct DecisionForm {
 
 pub(crate) async fn decision_handler(
     State(http_state): State<HttpState>,
+    Extension(source): Extension<SourceIp>,
     Form(f): Form<DecisionForm>,
 ) -> Response {
-    let mut store = load_store(&http_state.home_dir);
-    // Re-validate against the store — hidden form fields are client-supplied.
-    let client = match resolve_client(&store, &f.client_id).await {
-        Ok(c) => c,
-        Err(_) => return html_error(StatusCode::BAD_REQUEST, "unknown client_id"),
+    if let Err(response) = requested_resource(f.resource.as_deref(), &http_state.resource) { return response; }
+    let home = http_state.home_dir.clone();
+    let store = match crate::mcp_http_server::blocking_io(move || load_store(&home)).await {
+        Ok(Ok(store)) => store, Ok(Err(_)) => return store_error(), Err(response) => return response,
     };
+    // Re-validate against the store — hidden form fields are client-supplied.
+    let client = match resolve_client(&store, &f.client_id, &source.0).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    crate::mcp_http_server::blocking_http(move || decision_response(&http_state.home_dir, client, f, &http_state.resource)).await
+}
+
+fn decision_response(home: &Path, client: RegisteredClient, f: DecisionForm, resource: &str) -> Response {
+    if let Err(response) = requested_resource(f.resource.as_deref(), resource) { return response; }
     if !client.redirect_uris.iter().any(|u| u == &f.redirect_uri) {
         return html_error(
             StatusCode::BAD_REQUEST,
@@ -704,7 +880,7 @@ pub(crate) async fn decision_handler(
 
     // Operator proof: a valid INTERNAL key. External keys cannot mint grants
     // (no self-escalation), and failures never redirect a code anywhere.
-    match crate::mcp_auth::authenticate_with_key(&f.operator_key, &http_state.home_dir) {
+    match crate::mcp_auth::authenticate_with_key(&f.operator_key, home) {
         Ok(p) if !p.is_external => {}
         _ => {
             return html_error(
@@ -714,20 +890,20 @@ pub(crate) async fn decision_handler(
         }
     }
 
+    let scope = filter_scope(&f.scope);
+    let Some(consent) = Consent::capture(home, &f.operator_key, &scope) else {
+        return html_error(StatusCode::UNAUTHORIZED, "operator key does not authorize these scopes");
+    };
     let code = random_secret();
-    store.codes.insert(
-        sha256_hex(&code),
-        PendingCode {
-            client_id: f.client_id.clone(),
-            redirect_uri: f.redirect_uri.clone(),
-            code_challenge: f.code_challenge.clone(),
-            scope: filter_scope(&f.scope),
-            issued_unix: now_unix(),
-        },
-    );
-    if save_store(&http_state.home_dir, store).is_err() {
-        return html_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to persist grant");
-    }
+    if update_store(home, |store| {
+        if let Some(client) = store.clients.get_mut(&f.client_id) { client.last_used_unix = Some(now_unix()); }
+        store.codes.insert(sha256_hex(&code), PendingCode {
+            resource: resource.to_owned(),
+            client_id: f.client_id.clone(), redirect_uri: f.redirect_uri.clone(),
+            code_challenge: f.code_challenge.clone(), scope,
+            issued_unix: now_unix(), client_name: client.client_name, consent: Some(consent),
+        });
+    }).is_err() { return store_error(); }
     Redirect::to(&format!(
         "{}{sep}code={}{state_suffix}",
         f.redirect_uri,
@@ -758,26 +934,28 @@ fn pkce_matches(verifier: &str, challenge: &str) -> bool {
     computed.as_bytes().ct_eq(challenge.as_bytes()).into()
 }
 
-fn mint_tokens(store: &mut OAuthStore, client_id: &str, client_name: &str, scope: &str) -> Value {
+fn mint_tokens(store: &mut OAuthStore, client_id: &str, client_name: &str, scope: &str, family_id: &str, resource: &str) -> Value {
     let access = format!("{OAUTH_TOKEN_PREFIX}{}", random_secret());
     let refresh = format!("{OAUTH_TOKEN_PREFIX}r_{}", random_secret());
     let now = now_unix();
     store.tokens.insert(
         sha256_hex(&access),
         IssuedToken {
-            client_id: client_id.to_string(),
+            resource: resource.to_owned(),            client_id: client_id.to_string(),
             client_name: client_name.to_string(),
             scope: scope.to_string(),
             expires_unix: now + ACCESS_TOKEN_TTL_SECS,
+            family_id: family_id.to_string(), used: false,
         },
     );
     store.refresh.insert(
         sha256_hex(&refresh),
         IssuedToken {
-            client_id: client_id.to_string(),
+            resource: resource.to_owned(),            client_id: client_id.to_string(),
             client_name: client_name.to_string(),
             scope: scope.to_string(),
             expires_unix: now + REFRESH_TOKEN_TTL_SECS,
+            family_id: family_id.to_string(), used: false,
         },
     );
     json!({
@@ -791,115 +969,145 @@ fn mint_tokens(store: &mut OAuthStore, client_id: &str, client_name: &str, scope
 
 pub(crate) async fn token_handler(
     State(state): State<HttpState>,
+    Extension(source): Extension<SourceIp>,
+    Form(params): Form<Vec<(String, String)>>,
+) -> Response {
+    if let Err(response) = resource_params(&params, &state.resource) { return response; }
+    let f: HashMap<String, String> = params.into_iter().collect();
+    let client = f.get("client_id").map(String::as_str).unwrap_or("");
+    if !crate::mcp_http_server::oauth_client_admitted(&state.home_dir, client, &source.0) {
+        return oauth_error(StatusCode::TOO_MANY_REQUESTS, "temporarily_unavailable", "retry token exchange later");
+    }
+    crate::mcp_http_server::blocking_http(move || token_response(&state.home_dir, &f, &state.resource)).await
+}
+
+fn token_response(home: &Path, f: &HashMap<String, String>, resource: &str) -> Response {
+    if let Err(response) = requested_resource(f.get("resource").map(String::as_str), resource) { return response; }
+    update_store(home, |store| {
+        match f.get("grant_type").map(String::as_str).unwrap_or("") {
+            "authorization_code" => {
+                let (Some(code), Some(client_id), Some(redirect_uri), Some(verifier)) = (
+                    f.get("code"), f.get("client_id"), f.get("redirect_uri"), f.get("code_verifier"),
+                ) else {
+                    return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "code, client_id, redirect_uri and code_verifier are required");
+                };
+                let Some(pending) = store.codes.remove(&sha256_hex(code)) else {
+                    return invalid_grant();
+                };
+                if pending.resource != resource { return invalid_grant(); }
+                if now_unix() - pending.issued_unix > CODE_TTL_SECS
+                    || &pending.client_id != client_id || &pending.redirect_uri != redirect_uri
+                    || !pkce_matches(verifier, &pending.code_challenge) {
+                    return invalid_grant();
+                }
+                let Some(consent) = pending.consent.as_ref().filter(|c| c.valid(home, &pending.scope)).cloned() else {
+                    return invalid_grant();
+                };
+                if filter_scope(&pending.scope) != pending.scope { return invalid_grant(); }
+                if !store.can_mint(None) {
+                    store.codes.insert(sha256_hex(code), pending);
+                    return capacity_response();
+                }
+                let family = uuid::Uuid::new_v4().to_string();
+                store.grants.insert(family.clone(), Grant {
+                    resource: resource.to_owned(),
+                    client_id: client_id.clone(), client_name: pending.client_name.clone(),
+                    scope: pending.scope.clone(), consent, issued_unix: now_unix(), last_used_unix: None,
+                });
+                token_success(mint_tokens(store, client_id, &pending.client_name, &pending.scope, &family, resource))
+            }
+            "refresh_token" => {
+                let (Some(raw), Some(client_id)) = (f.get("refresh_token"), f.get("client_id")) else {
+                    return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "refresh_token and client_id are required");
+                };
+                let key = sha256_hex(raw);
+                let Some(entry) = store.refresh.get(&key).cloned() else { return invalid_grant(); };
+                // A different public client cannot revoke or consume this grant.
+                if &entry.client_id != client_id { return invalid_grant(); }
+                if entry.resource != resource { return invalid_grant(); }
+                if !store.valid_token(&entry, home, resource) || filter_scope(&entry.scope) != entry.scope {
+                    store.revoke_family(&entry.family_id);
+                    return invalid_grant();
+                }
+                let scope = f.get("scope").map(String::as_str).unwrap_or(&entry.scope);
+                if !scope_subset(scope, &entry.scope) {
+                    return oauth_error(StatusCode::BAD_REQUEST, "invalid_scope", "refresh scopes may only narrow the existing grant");
+                }
+                let scope = filter_scope(scope);
+                if !store.can_mint(Some(&entry.family_id)) { return capacity_response(); }
+                // Retain the spent digest until expiry to detect replay and let
+                // revocation of a rotated token reach its entire family.
+                store.refresh.get_mut(&key).unwrap().used = true;
+                store.grants.get_mut(&entry.family_id).unwrap().last_used_unix = Some(now_unix());
+                if let Some(client) = store.clients.get_mut(client_id) { client.last_used_unix = Some(now_unix()); }
+                token_success(mint_tokens(store, client_id, &entry.client_name, &scope, &entry.family_id, resource))
+            }
+            _ => oauth_error(StatusCode::BAD_REQUEST, "unsupported_grant_type", "unsupported grant_type"),
+        }
+    }).unwrap_or_else(|_| store_error())
+}
+
+fn capacity_response() -> Response {
+    oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable", "OAuth capacity reached; retry later or revoke unused grants")
+}
+
+fn invalid_grant() -> Response {
+    oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "grant expired, revoked or invalid; authorize again")
+}
+
+fn token_success(body: Value) -> Response {
+    let mut response = Json(body).into_response();
+    response.headers_mut().insert("Cache-Control", "no-store".parse().unwrap());
+    response
+}
+
+pub(crate) async fn revoke_handler(
+    State(state): State<HttpState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> Response {
-    let grant_type = f.get("grant_type").map(String::as_str).unwrap_or("");
-    let mut store = load_store(&state.home_dir);
-    match grant_type {
-        "authorization_code" => {
-            let (Some(code), Some(client_id), Some(redirect_uri), Some(verifier)) = (
-                f.get("code"),
-                f.get("client_id"),
-                f.get("redirect_uri"),
-                f.get("code_verifier"),
-            ) else {
-                return oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "code, client_id, redirect_uri and code_verifier are required",
-                );
-            };
-            // Single-use: remove up front so a failed exchange still burns it.
-            let Some(pending) = store.codes.remove(&sha256_hex(code)) else {
-                return oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_grant",
-                    "unknown or reused code",
-                );
-            };
-            let _ = save_store(&state.home_dir, store.clone());
-            if now_unix() - pending.issued_unix > CODE_TTL_SECS
-                || &pending.client_id != client_id
-                || &pending.redirect_uri != redirect_uri
-                || !pkce_matches(verifier, &pending.code_challenge)
-            {
-                return oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_grant",
-                    "code expired or does not match this client/redirect_uri/PKCE verifier",
-                );
-            }
-            let client_name = match resolve_client(&store, client_id).await {
-                Ok(c) => c.client_name,
-                Err(_) => "Unnamed MCP client".to_string(),
-            };
-            let body = mint_tokens(&mut store, client_id, &client_name, &pending.scope);
-            if save_store(&state.home_dir, store).is_err() {
-                return oauth_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    "failed to persist tokens",
-                );
-            }
-            let mut resp = Json(body).into_response();
-            resp.headers_mut()
-                .insert("Cache-Control", "no-store".parse().unwrap());
-            resp
+    crate::mcp_http_server::blocking_http(move || revoke_response(&state.home_dir, &f)).await
+}
+
+fn revoke_response(home: &Path, f: &HashMap<String, String>) -> Response {
+    let Some(client_id) = f.get("client_id").filter(|s| !s.is_empty()) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_client", "public clients must supply client_id");
+    };
+    let Some(raw) = f.get("token").filter(|s| !s.is_empty()) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "token is required");
+    };
+    // As at /oauth/token, only public clients (auth method none) are supported.
+    // Ignore token_type_hint and search both stores (RFC 7009 section 2.1).
+    update_store(home, |store| {
+        let key = sha256_hex(raw);
+        if let Some(entry) = store.refresh.get(&key).or_else(|| store.tokens.get(&key)).cloned()
+            && &entry.client_id == client_id {
+            store.revoke_family(&entry.family_id);
         }
-        "refresh_token" => {
-            let (Some(raw), Some(client_id)) = (f.get("refresh_token"), f.get("client_id")) else {
-                return oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "refresh_token and client_id are required",
-                );
-            };
-            let key = sha256_hex(raw);
-            let Some(entry) = store.refresh.remove(&key) else {
-                return oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_grant",
-                    "unknown refresh token",
-                );
-            };
-            if entry.expires_unix <= now_unix() || &entry.client_id != client_id {
-                let _ = save_store(&state.home_dir, store);
-                return oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_grant",
-                    "refresh token expired or client mismatch",
-                );
-            }
-            // Rotation: old refresh token is already removed; mint a new pair.
-            let body = mint_tokens(
-                &mut store,
-                &entry.client_id,
-                &entry.client_name,
-                &entry.scope,
-            );
-            if save_store(&state.home_dir, store).is_err() {
-                return oauth_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    "failed to persist tokens",
-                );
-            }
-            let mut resp = Json(body).into_response();
-            resp.headers_mut()
-                .insert("Cache-Control", "no-store".parse().unwrap());
-            resp
-        }
-        other => oauth_error(
-            StatusCode::BAD_REQUEST,
-            "unsupported_grant_type",
-            &format!("unsupported grant_type '{other}'"),
-        ),
-    }
+        let mut response = StatusCode::OK.into_response();
+        response.headers_mut().insert("Cache-Control", "no-store".parse().unwrap());
+        response
+    }).unwrap_or_else(|_| store_error())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    const RESOURCE: &str = "https://mcp.example.com/mcp";
+    fn validate_oauth_token(raw: &str, home: &Path) -> Result<Principal, AuthError> {
+        super::validate_oauth_token(raw, home, RESOURCE)
+    }
+    fn mint_tokens(store: &mut OAuthStore, id: &str, name: &str, scope: &str, family: &str) -> Value {
+        super::mint_tokens(store, id, name, scope, family, RESOURCE)
+    }
+
+    fn test_consent(home: &Path) -> Consent {
+        let key = "ddc_dev_0123456789abcdef0123456789abcdef";
+        std::fs::write(home.join("config.toml"), format!(
+            "[mcp_keys.{key}]\nclient_id='operator'\nscopes=['memory:read','wiki:read']\nis_external=false\ncreated_at='{}'\n",
+            chrono::Utc::now().to_rfc3339(),
+        )).unwrap();
+        Consent::capture(home, key, "memory:read wiki:read").unwrap()
+    }
 
     /// The crate-local mark must stay byte-identical to the brand kit copy.
     /// Skipped when the brand kit is absent (e.g. a source tree without docs/).
@@ -1003,8 +1211,10 @@ mod tests {
     fn issued_tokens_validate_and_expire() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = OAuthStore::default();
-        let body = mint_tokens(&mut store, "mcp_abc", "Test Client", "memory:read");
-        save_store(dir.path(), store).unwrap();
+        let consent = test_consent(dir.path());
+        store.grants.insert("family".into(), Grant { resource: RESOURCE.into(), client_id: "mcp_abc".into(), client_name: "Test Client".into(), scope: "memory:read".into(), consent, issued_unix: now_unix(), last_used_unix: None });
+        let body = mint_tokens(&mut store, "mcp_abc", "Test Client", "memory:read", "family");
+        update_store(dir.path(), |s| *s = store).unwrap();
         let access = body["access_token"].as_str().unwrap();
 
         let p = validate_oauth_token(access, dir.path()).unwrap();
@@ -1016,7 +1226,7 @@ mod tests {
         assert!(validate_oauth_token("ddc_oauth_deadbeef", dir.path()).is_err());
 
         // Expired token → rejected.
-        let mut store = load_store(dir.path());
+        let mut store = load_store(dir.path()).unwrap();
         for t in store.tokens.values_mut() {
             t.expires_unix = now_unix() - 10;
         }
@@ -1076,3 +1286,7 @@ mod tests {
         assert!(!page.contains("<svg"));
     }
 }
+
+#[cfg(test)]
+#[path = "mcp_oauth_server_tests.rs"]
+mod lifecycle_tests;
