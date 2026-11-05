@@ -1010,6 +1010,8 @@
   "agents.create.model": "使用的模型",
   "agents.create.modelHint": "這位員工預設用哪個模型回覆；之後可在員工設定的「腦袋與引擎」隨時更換。",
   "agents.create.error": "新增 AI 員工失敗，請確認名稱格式正確",
+  "agents.create.errorExists": "已有同名的 AI 員工，請換一個名稱",
+  "agents.create.errorServer": "新增 AI 員工失敗：{detail}",
   "agents.create.template": "套用板模",
   "agents.create.template.blank": "空白（不套板模）",
   "agents.create.template.blankDesc": "從零開始，全部自己設定。",

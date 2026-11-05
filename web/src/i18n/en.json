@@ -1011,6 +1011,8 @@
   "agents.create.model": "Model",
   "agents.create.modelHint": "Which model this employee replies with by default; you can change it anytime under the employee's Brain & Engine settings.",
   "agents.create.error": "Failed to create agent. Please check the name format.",
+  "agents.create.errorExists": "An agent with this name already exists. Choose another name.",
+  "agents.create.errorServer": "Failed to create agent: {detail}",
   "agents.create.template": "Apply a template",
   "agents.create.template.blank": "Blank (no template)",
   "agents.create.template.blankDesc": "Start from scratch and configure everything yourself.",
