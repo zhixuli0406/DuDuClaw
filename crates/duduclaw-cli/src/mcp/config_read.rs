@@ -267,6 +267,9 @@ mod decrypt_channel_token_tests {
 /// identity can carry one, and it would inherit the system senders'
 /// unconditional delegation reach, so it resolves to the untrusted sentinel.
 pub async fn get_default_agent(home_dir: &Path) -> String {
+    if let Some(employee) = crate::mcp_isolation_identity::verified_employee(home_dir) {
+        return employee.unwrap_or_else(|_| duduclaw_core::UNTRUSTED_AGENT_ID.to_owned());
+    }
     if caller_identity_verdict(home_dir) == duduclaw_core::IdentityVerdict::Rejected {
         return duduclaw_core::UNTRUSTED_AGENT_ID.to_string();
     }
@@ -338,6 +341,10 @@ fn audit_system_sender_identity_once(home_dir: &Path, claimed: &str, source: &st
 /// site; both are cheap file reads and `get_default_agent` runs a handful of
 /// times per process, not per tool call.
 pub fn caller_identity_verdict(home_dir: &Path) -> duduclaw_core::IdentityVerdict {
+    if let Some(employee) = crate::mcp_isolation_identity::verified_employee(home_dir) {
+        return if employee.is_ok() { duduclaw_core::IdentityVerdict::Verified }
+            else { duduclaw_core::IdentityVerdict::Rejected };
+    }
     let require = duduclaw_core::require_identity_token_from_home(home_dir);
     duduclaw_core::verify_env_identity(home_dir, require)
 }

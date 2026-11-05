@@ -56,6 +56,11 @@ pub mod mcp_auth;
 pub mod mcp_capability; // W22-P0 ADR-002: inject_capability_headers + negotiate_capabilities
 pub mod mcp_db; // §13.7 WP-D: read-only SQL data-source MCP tools
 pub mod mcp_dispatch; // W20-P1 Phase 2A: transport-agnostic dispatcher
+mod mcp_isolation_identity;
+pub mod mcp_isolation; // Native Linux connection-bound adapter, sharing the existing gates.
+pub mod mcp_isolation_execution;
+pub mod mcp_isolation_disposition;
+pub mod mcp_isolation_resources;
 pub mod mcp_files; // §14.2 WP-F2: local data-file MCP tools (file/csv/xlsx read)
 pub mod mcp_fork; // RFC-26 P3: Live Run Forking tool surface
 pub mod mcp_fork_exec; // RFC-26 P4: real branch execution + background driver

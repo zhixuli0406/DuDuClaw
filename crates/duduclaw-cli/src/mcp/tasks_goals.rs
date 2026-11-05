@@ -366,7 +366,8 @@ pub(crate) async fn handle_activity_list(
     let task_id_filter = args.get("task_id").and_then(|v| v.as_str());
     let limit = clamp_limit(args, 20, 100);
 
-    let (rows, total) = match store.list_activity(agent_id, event_type, limit, 0).await {
+    let query = store.list_activity(agent_id, event_type, limit, 0).await;
+    let (rows, total) = match query {
         Ok(r) => r,
         Err(e) => return tool_error(&format!("list activity: {e}")),
     };

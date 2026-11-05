@@ -401,7 +401,7 @@ pub(crate) async fn handle_skill_synthesis_run(
         .unwrap_or(1);
 
     // Resolve API key: env var takes precedence over config file.
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
+    let api_key = crate::mcp_isolation_identity::var("ANTHROPIC_API_KEY")
         .ok()
         .filter(|k| !k.is_empty())
         .or_else(|| {
@@ -421,7 +421,7 @@ pub(crate) async fn handle_skill_synthesis_run(
         });
 
     // Point pipeline at real EvolutionEvents location.
-    let events_dir = std::env::var("EVOLUTION_EVENTS_DIR")
+    let events_dir = crate::mcp_isolation_identity::var("EVOLUTION_EVENTS_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| home_dir.join("evolution").join("events"));
 

@@ -94,7 +94,7 @@ impl GoogleCaller {
                 ..Default::default()
             };
         }
-        let claim = std::env::var(duduclaw_core::ENV_AGENT_ID)
+        let claim = crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_ID)
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| duduclaw_core::is_valid_agent_id(v));
@@ -392,7 +392,7 @@ enum Fetched {
 }
 
 fn env_trimmed(name: &str) -> Option<String> {
-    std::env::var(name)
+    crate::mcp_isolation_identity::var(name)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty() && v.len() <= 128 && !v.chars().any(char::is_control))

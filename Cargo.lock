@@ -1840,6 +1840,7 @@ dependencies = [
  "duduclaw-knowledge",
  "duduclaw-license",
  "duduclaw-llm",
+ "duduclaw-mcp-boundary",
  "duduclaw-memory",
  "duduclaw-odoo",
  "duduclaw-os",
@@ -2070,6 +2071,7 @@ dependencies = [
  "duduclaw-knowledge",
  "duduclaw-license",
  "duduclaw-llm",
+ "duduclaw-mcp-boundary",
  "duduclaw-memory",
  "duduclaw-odoo",
  "duduclaw-onnx",
@@ -2296,6 +2298,26 @@ dependencies = [
  "libc",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "duduclaw-mcp-boundary"
+version = "1.79.3"
+dependencies = [
+ "duduclaw-isolation",
+ "hmac",
+ "libc",
+ "rand 0.8.6",
+ "rusqlite",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "zeroize",
 ]
 
 [[package]]

@@ -170,7 +170,7 @@ pub(crate) async fn can_modify_own_soul(home_dir: &Path, agent_id: &str) -> bool
 /// and is therefore always denied, matching every other WP21 gate's
 /// fail-closed contract.
 pub(crate) async fn soul_write_denial(home_dir: &Path, agent_id: &str) -> Option<String> {
-    let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    let claimed = crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
     let claimed = claimed.trim();
     if claimed.is_empty() {
         // Operator / dashboard convention — unrestricted.

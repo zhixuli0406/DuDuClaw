@@ -121,6 +121,8 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [architecture/native-linux-isolation.md](architecture/native-linux-isolation.md) | Native execution backends and spawn inventory; integration incomplete | Unreleased |
 | [architecture/native-linux-isolation.md](architecture/native-linux-isolation.md) | Native Linux isolation implementation boundaries and pending acceptance | In development |
 | [architecture/native-linux-isolation.md](architecture/native-linux-isolation.md) | Native Linux isolation package implementation and remaining integration | Unreleased / partial |
+| [architecture/native-linux-isolation.md](architecture/native-linux-isolation.md) | Native Linux isolation implementation seams and outstanding integration | In development; not enabled |
+| [architecture/native-linux-isolation-tools.md](architecture/native-linux-isolation-tools.md) | Package D: exact tool routes and intentional restrictions | Internal; not live acceptance |
 | [architecture/evolution-engine.md](architecture/evolution-engine.md) | Evolution Engine — Prediction + AEE/Playbook (the only evolution path; the legacy SOUL.md rewrite path was removed) + Cognitive Memory | Current |
 
 ## Design Proposals (RFC / ADR)

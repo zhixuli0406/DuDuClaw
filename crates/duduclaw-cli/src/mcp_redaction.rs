@@ -46,6 +46,19 @@ impl McpRedactionLayer {
         home_dir: &std::path::Path,
         default_agent: &str,
     ) -> Result<Option<Self>, duduclaw_redaction::RedactionError> {
+        let agent = std::env::var(duduclaw_core::ENV_AGENT_ID).ok()
+            .filter(|value| !value.trim().is_empty()).unwrap_or_else(|| default_agent.to_owned());
+        let session = std::env::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok()
+            .filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "mcp-session".to_owned());
+        Self::try_init_for_identity(home_dir, &agent, &session)
+    }
+
+    /// Gateway-side transport: identity and session are host-owned, never env-derived.
+    pub(crate) fn try_init_for_identity(
+        home_dir: &std::path::Path,
+        agent: &str,
+        session: &str,
+    ) -> Result<Option<Self>, duduclaw_redaction::RedactionError> {
         let cfg_path = home_dir.join("config.toml");
         // Fail-closed on a config we cannot read the truth out of. A malformed
         // `[redaction]` block used to collapse (via `.ok()`) into "no config" →
@@ -88,19 +101,10 @@ impl McpRedactionLayer {
         let paths = duduclaw_redaction::ManagerPaths::under_home(home_dir);
         let manager = Arc::new(RedactionManager::open(rcfg, paths)?);
 
-        let agent_id = std::env::var(duduclaw_core::ENV_AGENT_ID)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| default_agent.to_string());
-        let session_id = std::env::var(duduclaw_core::ENV_TRUST_SESSION_ID)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "mcp-session".to_string());
-
         Ok(Some(Self {
             manager,
-            agent_id,
-            session_id,
+            agent_id: agent.to_owned(),
+            session_id: session.to_owned(),
         }))
     }
 

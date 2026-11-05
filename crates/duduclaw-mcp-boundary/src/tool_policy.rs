@@ -1,0 +1,588 @@
+//! Exact MCP resource policy and the trusted resource-resolution seam.
+//!
+//! This registry is independent of handler execution. Listing does not authorize
+//! a call: each call resolves all of its resources and verifies the signed grants.
+use duduclaw_isolation::capability::{EmployeeBinding, ResourceGrant};
+use serde_json::Value;
+use crate::{RequestContext, VerificationError};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind { Employee, Workspace, Mailbox, Task, DatabaseTable, Wiki, Connector, Recipient, UrlOrigin }
+impl ResourceKind {
+    pub fn of(resource: &ResourceGrant) -> Self {
+        match resource {
+            ResourceGrant::Employee { .. } => Self::Employee,
+            ResourceGrant::Workspace { .. } => Self::Workspace,
+            ResourceGrant::Mailbox { .. } => Self::Mailbox,
+            ResourceGrant::Task { .. } => Self::Task,
+            ResourceGrant::DatabaseTable { .. } => Self::DatabaseTable,
+            ResourceGrant::Wiki { .. } => Self::Wiki,
+            ResourceGrant::Connector { .. } => Self::Connector,
+            ResourceGrant::Recipient { .. } => Self::Recipient,
+            ResourceGrant::UrlOrigin { .. } => Self::UrlOrigin,
+        }
+    }
+}
+
+/// Execution and Worker MUST use packages A/E; neither may spawn under the
+/// gateway uid. Connector execution MUST enforce the current binding/lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route { File, Service, Execution, Worker, Connector }
+#[derive(Debug)]
+pub struct ToolPolicy {
+    pub name: &'static str,
+    pub route: Route,
+    pub required: &'static [ResourceKind],
+}
+
+pub const POLICIES: &[ToolPolicy] = &[
+    // google
+    ToolPolicy { name: "google_status", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "gmail_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },
+    ToolPolicy { name: "gmail_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },
+    ToolPolicy { name: "gmail_create_draft", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox, ResourceKind::Recipient] },
+    ToolPolicy { name: "calendar_list_events", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "calendar_create_event", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "sheets_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "sheets_append", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "forms_get", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "forms_list_responses", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "gtasks_lists", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "gtasks_list", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "gtasks_create", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "gtasks_complete", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "drive_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "drive_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "docs_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "docs_append", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "slides_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    // os
+    ToolPolicy { name: "os_notify", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Recipient] },
+    ToolPolicy { name: "os_watch_status", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_open", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "os_frontmost", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_spotlight_search", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "os_calendar_today", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_device_status", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_system_status", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_check_update", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_backup_list", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_network_info", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_wifi_status", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_wifi_scan", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_wifi_connect", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_apply_update", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_boot_assessment", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_update_rollback", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_backup_create", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_power", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_factory_reset", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_doctor_repair", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_display_get", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_display_set", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_audio_get", route: Route::Execution, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "os_audio_set", route: Route::Execution, required: &[ResourceKind::Employee] },
+    // agents
+    ToolPolicy { name: "create_agent", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "list_agents", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "create_task", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "check_responses", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "task_status", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "agent_status", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "spawn_agent", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "spawn_ephemeral", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "agent_update", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "agent_remove", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "agent_update_soul", route: Route::Service, required: &[ResourceKind::Employee] },
+    // odoo
+    ToolPolicy { name: "odoo_connect", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_status", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_crm_leads", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_crm_create_lead", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_crm_update_stage", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_sale_orders", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_sale_create_quotation", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_sale_confirm", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_inventory_products", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_inventory_check", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_invoice_list", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_payment_status", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_execute", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_report", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_partner_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_schema_overview", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_schema_fields", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    // exec
+    ToolPolicy { name: "skill_extract", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "execute_program", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "office_script", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_bank_feedback", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "computer_screenshot", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_click", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_type", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_login", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace, ResourceKind::Connector] },
+    ToolPolicy { name: "computer_key", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_scroll", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_session_start", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_navigate", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_session_stop", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_workspace_list", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_workspace_read", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "computer_workspace_write", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "session_restore_context", route: Route::Service, required: &[ResourceKind::Employee] },
+    // fork
+    ToolPolicy { name: "fork_run", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "inspect_branches", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "diff_branches", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "merge_or_select", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "terminate_branch", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "fork_cost", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    // tasks
+    ToolPolicy { name: "credential_declare", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "discovery_catalog", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "discovery_list", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "discovery_tree", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "discovery_artifact", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "discovery_cancel", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "tasks_list", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "tasks_create", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "tasks_update", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "tasks_claim", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "tasks_renew", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "tasks_complete", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "responsibility_get", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "responsibility_followup", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "responsibility_ask", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "tasks_block", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "capability_request", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "goals_create", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "goals_list", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "plan_get", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "plan_update_step", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "activity_post", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "activity_list", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "autopilot_list", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "shared_skill_list", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "shared_skill_share", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "shared_skill_adopt", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "plan_start", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "memory_improve", route: Route::Service, required: &[ResourceKind::Employee] },
+    // recording
+    ToolPolicy { name: "browser_record_start", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "browser_record_stop", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "desktop_record_start", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "desktop_record_stop", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_from_recording", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    // memory
+    ToolPolicy { name: "memory_search", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "memory_store", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "working_state_set", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "working_state_clear", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "working_state_handoff", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "working_state_get", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "team_handoff", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Mailbox, ResourceKind::Recipient] },
+    ToolPolicy { name: "belief_submit", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "belief_settle", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "belief_stats", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "mail_list", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Mailbox] },
+    ToolPolicy { name: "mail_read", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Mailbox] },
+    ToolPolicy { name: "mail_send", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Mailbox, ResourceKind::Recipient] },
+    ToolPolicy { name: "codrive_run", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "codrive_status", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "memory_read", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "memory_fetch_batch", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "memory_alias_add", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "memory_alias_list", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "memory_get_history", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "memory_get_at", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "memory_invalidate_by_origin", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "memory_search_by_layer", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "code_map", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "user_profile_record", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "user_profile_get", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "user_code_profile", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "memory_successful_conversations", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "memory_episodic_pressure", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "memory_consolidation_status", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "decision_list", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    ToolPolicy { name: "decision_resolve", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
+    // skills
+    ToolPolicy { name: "skill_search", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "skill_list", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "skill_gaps", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "skill_security_scan", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_graduate", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_synthesis_status", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "skill_synthesis_run", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_hub_install", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_curator_status", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "skill_pin", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    // integrations
+    ToolPolicy { name: "notion_status", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "notion_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "notion_page_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "notion_page_append", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "github_status", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "github_search_issues", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "github_issue_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "github_pr_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "github_issue_comment", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "cost_summary", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "cost_agents", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "cost_users", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "cost_recent", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "cost_multi_vs_single", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "transcribe_audio", route: Route::Worker, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "meeting_transcribe", route: Route::Worker, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "meeting_upload_link", route: Route::Worker, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "meeting_transcribe_status", route: Route::Worker, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "meeting_transcribe_cancel", route: Route::Worker, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "synthesize_speech", route: Route::Worker, required: &[ResourceKind::Employee] },
+    // knowledge
+    ToolPolicy { name: "knowledge_search", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "knowledge_get_passage", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "knowledge_list_collections", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "knowledge_add_source", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    // wiki
+    ToolPolicy { name: "wiki_ls", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "wiki_read", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "wiki_write", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "wiki_search", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "wiki_lint", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "wiki_stats", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "wiki_export", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "wiki_dedup", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "wiki_graph", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "wiki_rebuild_fts", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "wiki_trust_audit", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "wiki_trust_history", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "shared_wiki_delete", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "wiki_namespace_status", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    ToolPolicy { name: "canvas_push", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "canvas_clear", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "identity_resolve", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Recipient] },
+    ToolPolicy { name: "wiki_share", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
+    // data
+    ToolPolicy { name: "db_sources", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable, ResourceKind::Connector] },
+    ToolPolicy { name: "db_tables", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable, ResourceKind::Connector] },
+    ToolPolicy { name: "db_select", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable, ResourceKind::Connector] },
+    ToolPolicy { name: "db_query", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable, ResourceKind::Connector] },
+    ToolPolicy { name: "file_read", route: Route::File, required: &[ResourceKind::Workspace] },
+    ToolPolicy { name: "csv_read", route: Route::File, required: &[ResourceKind::Workspace] },
+    ToolPolicy { name: "xlsx_read", route: Route::File, required: &[ResourceKind::Workspace] },
+    // channels
+    ToolPolicy { name: "group_history_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },
+    ToolPolicy { name: "send_message", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Recipient] },
+    ToolPolicy { name: "send_photo", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Recipient] },
+    ToolPolicy { name: "send_sticker", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Recipient] },
+    ToolPolicy { name: "web_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "send_to_agent", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Mailbox, ResourceKind::Recipient] },
+    ToolPolicy { name: "list_cron_tasks", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "update_cron_task", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "delete_cron_task", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "pause_cron_task", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "run_cron_task", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "create_reminder", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "list_reminders", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    ToolPolicy { name: "cancel_reminder", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
+    // inference
+    ToolPolicy { name: "web_fetch_cached", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::UrlOrigin] },
+    ToolPolicy { name: "web_extract", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::UrlOrigin] },
+    ToolPolicy { name: "inference_status", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "model_list", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "model_load", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "model_unload", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "hardware_info", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "route_query", route: Route::Worker, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "inference_mode", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "llamafile_start", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "llamafile_stop", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "llamafile_list", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "model_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "model_download", route: Route::Worker, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    ToolPolicy { name: "model_recommend", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    // ops
+    ToolPolicy { name: "submit_feedback", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "evolution_toggle", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "evolution_status", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "audit_trail_query", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "reliability_summary", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "channel_config", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "channel_config_list", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "channel_status", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "pairing_manage", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+];
+
+pub fn policy(name: &str) -> Option<&'static ToolPolicy> {
+    POLICIES.iter().find(|policy| policy.name == name)
+}
+
+/// Host implementation contract, never supplied by MCP or employee code:
+/// resolve every selected resource using trusted registries and live policy.
+/// Include nested recipients, task dependencies, target employees, connector
+/// credentials and all database tables (including views, joins and triggers).
+/// A query/list resolves its finite authorized collection before execution;
+/// results MUST be restricted to that collection. Unknown/ambiguous selectors,
+/// unavailable stores and over-limit collections return an error. No wildcard
+/// grants, caller-provided OS paths, cached authorization or schema-only guesses.
+/// Resource names are not authority: for example `source` resolves through the
+/// employee's database registry, never an arbitrary connection string.
+///
+/// D verifies the resulting exact grants; this seam is part of the trusted host
+/// resource service. It MUST NOT delegate resolution to the untrusted worker.
+pub trait ResourceResolver: Send + Sync {
+    fn resolve(&self, context: &RequestContext, policy: &ToolPolicy, arguments: &Value)
+        -> Result<Vec<ResourceGrant>, VerificationError>;
+}
+
+/// Only this module constructs a call. Consumers execute against `resources()`
+/// and `context()`, not a second interpretation of authority in the arguments.
+/// They must recheck current leases and enforce row/recipient/namespace bounds at
+/// use, including redirects and secondary I/O; failure cannot reach a legacy
+/// unscoped handler. Paths are opened through ResourceRoots, never reopened.
+#[derive(Debug)]
+pub struct AuthorizedToolCall {
+    context: RequestContext,
+    policy: &'static ToolPolicy,
+    arguments: Value,
+    resources: Vec<ResourceGrant>,
+}
+impl AuthorizedToolCall {
+    pub fn context(&self) -> &RequestContext { &self.context }
+    pub fn policy(&self) -> &'static ToolPolicy { self.policy }
+    pub fn name(&self) -> &'static str { self.policy.name }
+    pub fn arguments(&self) -> &Value { &self.arguments }
+    pub fn resources(&self) -> &[ResourceGrant] { &self.resources }
+}
+
+fn own_employee(context: &RequestContext) -> ResourceGrant {
+    ResourceGrant::Employee { id: context.record().employee }
+}
+
+/// Discovery shares the exact tool and mandatory resource policy with calls.
+/// The transport additionally checks that the corresponding host service exists.
+/// Optional argument-dependent resources are checked by `authorize`, not guessed
+/// while listing (the same principle as existing argument-specific tool gates).
+pub fn eligible(context: &RequestContext, name: &str) -> bool {
+    let Some(policy) = policy(name) else { return false; };
+    let record = context.record();
+    record.tools.as_slice().iter().any(|tool| tool.as_str() == name)
+        && policy.required.iter().all(|kind| record.resources.as_slice().iter()
+            .any(|grant| ResourceKind::of(grant) == *kind && validate_resource(grant).is_ok()
+                && (*kind != ResourceKind::Employee || grant == &own_employee(context))))
+}
+
+fn required_for_call(policy: &ToolPolicy, arguments: &Value) -> Result<Vec<ResourceKind>, VerificationError> {
+    let object = arguments.as_object().ok_or(VerificationError::Invalid)?;
+    let mut required = policy.required.to_vec();
+    let mut add = |kind| { if !required.contains(&kind) { required.push(kind); } };
+    for key in ["path", "source_path", "file", "scope_dir", "page_path", "output_path", "directory", "folder"] {
+        if let Some(value) = object.get(key) {
+            let path = value.as_str().ok_or(VerificationError::Invalid)?;
+            crate::resources::relative_path(path)?;
+            if !(policy.name == "wiki_read" && key == "page_path") { add(ResourceKind::Workspace); }
+        }
+    }
+    for key in ["url", "url_or_path"] {
+        if let Some(value) = object.get(key) {
+            let value = value.as_str().ok_or(VerificationError::Invalid)?;
+            if key == "url_or_path" && !matches!(value.split_once("://"), Some(("https" | "http", _))) {
+                crate::resources::relative_path(value)?;
+                add(ResourceKind::Workspace);
+            } else {
+                if value.is_empty() || value.len() > 8192 || value.chars().any(char::is_control) {
+                    return Err(VerificationError::Invalid);
+                }
+                add(ResourceKind::UrlOrigin);
+            }
+        }
+    }
+    for key in ["to", "cc", "bcc", "attendees", "chat_id", "notify_chat_id", "target_agent", "recipient"] {
+        if object.get(key).is_some_and(|value| !value.is_null()) { add(ResourceKind::Recipient); }
+    }
+    if let Some(attachments) = object.get("attachments") {
+        for attachment in attachments.as_array().ok_or(VerificationError::Invalid)? {
+            let path = attachment.as_str().or_else(|| attachment.get("path").and_then(Value::as_str))
+                .ok_or(VerificationError::Invalid)?;
+            crate::resources::relative_path(path)?;
+            add(ResourceKind::Workspace);
+        }
+    }
+    if object.contains_key("drive_file_id") { add(ResourceKind::Connector); }
+    if object.get("write_wiki").and_then(Value::as_bool) == Some(true) { add(ResourceKind::Wiki); }
+    if matches!(policy.name, "tasks_create" | "tasks_update" | "goals_create" | "activity_post" | "create_task") {
+        for key in ["task_id", "parent_task_id", "goal_id", "parent_goal_id", "depends_on"] {
+            if object.get(key).is_some_and(|value| !value.is_null()) { add(ResourceKind::Task); }
+        }
+    }
+    Ok(required)
+}
+
+/// A grant contains only the canonical origin, never credentials, path, query or
+/// fragment. URL parsing uses the same WHATWG implementation for grants/calls.
+pub fn validate_origin(origin: &str) -> Result<(), VerificationError> {
+    let parsed = url::Url::parse(origin).map_err(|_| VerificationError::Invalid)?;
+    if !matches!(parsed.scheme(), "https" | "http") || parsed.host_str().is_none()
+        || !parsed.username().is_empty() || parsed.password().is_some()
+        || parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some()
+        || parsed.origin().ascii_serialization() != origin {
+        return Err(VerificationError::Invalid);
+    }
+    Ok(())
+}
+
+/// Exact identifiers only: neither issuance nor execution interprets an empty
+/// value or `*` as authority for a collection. Collections use finite grants.
+pub fn validate_resource(resource: &ResourceGrant) -> Result<(), VerificationError> {
+    let exact = |value: &str| !value.is_empty() && value != "*" && !value.chars().any(char::is_control);
+    let valid = match resource {
+        ResourceGrant::Employee { .. } => true,
+        ResourceGrant::Workspace { handle } => exact(handle.as_str()),
+        ResourceGrant::Mailbox { id } | ResourceGrant::Task { id } => exact(id.as_str()),
+        ResourceGrant::DatabaseTable { database, table } => exact(database.as_str()) && exact(table.as_str()),
+        ResourceGrant::Wiki { namespace } => exact(namespace.as_str()),
+        ResourceGrant::Connector { account, .. } => exact(account.as_str()),
+        ResourceGrant::Recipient { id } => exact(id.as_str()),
+        ResourceGrant::UrlOrigin { origin } => validate_origin(origin.as_str()).is_ok(),
+    };
+    if valid { Ok(()) } else { Err(VerificationError::Invalid) }
+}
+
+fn url_origin(value: &str) -> Result<String, VerificationError> {
+    if value.len() > 8192 || value.chars().any(char::is_control) {
+        return Err(VerificationError::Invalid);
+    }
+    let parsed = url::Url::parse(value).map_err(|_| VerificationError::Invalid)?;
+    if !matches!(parsed.scheme(), "https" | "http") || parsed.host_str().is_none()
+        || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(VerificationError::Invalid);
+    }
+    let origin = parsed.origin().ascii_serialization();
+    validate_origin(&origin)?;
+    Ok(origin)
+}
+
+fn check_selected_resources(policy: &ToolPolicy, arguments: &Value, resources: &[ResourceGrant])
+    -> Result<(), VerificationError> {
+    let string = |key| arguments.get(key).map(|value| value.as_str().ok_or(VerificationError::Invalid)).transpose();
+    if let Some(target) = string("target_employee")? {
+        if target.len() != 32 || !target.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err(VerificationError::Invalid);
+        }
+        let mut id = [0; 16];
+        for (index, pair) in target.as_bytes().chunks_exact(2).enumerate() {
+            let digit = |b: u8| if b.is_ascii_digit() { b - b'0' } else { b - b'a' + 10 };
+            id[index] = digit(pair[0]) * 16 + digit(pair[1]);
+        }
+        if !resources.contains(&ResourceGrant::Employee { id: duduclaw_isolation::ids::EmployeeId(id) }) {
+            return Err(VerificationError::Invalid);
+        }
+    }
+    for key in ["workspace", "workspace_id"] {
+        if let Some(handle) = string(key)? {
+            // A new workspace is created under the employee, never interpreted
+            // as an arbitrary host directory or an existing wildcard handle.
+            if !(policy.name == "computer_session_start" && handle == "new")
+                && !resources.iter().any(|resource| matches!(resource, ResourceGrant::Workspace { handle: allowed } if allowed.as_str() == handle)) {
+                return Err(VerificationError::Invalid);
+            }
+        }
+    }
+    for key in ["url", "url_or_path"] {
+        if let Some(value) = string(key)? {
+            if key == "url_or_path" && !matches!(value.split_once("://"), Some(("https" | "http", _))) { continue; }
+            let origin = url_origin(value)?;
+            if !resources.iter().any(|resource| matches!(resource, ResourceGrant::UrlOrigin { origin: allowed } if allowed.as_str() == origin)) {
+                return Err(VerificationError::Invalid);
+            }
+        }
+    }
+    if let Some(namespace) = string("namespace")? {
+        if !resources.iter().any(|resource| matches!(resource, ResourceGrant::Wiki { namespace: allowed } if allowed.as_str() == namespace)) {
+            return Err(VerificationError::Invalid);
+        }
+    }
+    if matches!(policy.name, "db_select" | "db_tables" | "db_query") {
+        let database = string("source")?.ok_or(VerificationError::Invalid)?;
+        let table = if policy.name == "db_select" { Some(string("table")?.ok_or(VerificationError::Invalid)?) } else { None };
+        if !resources.iter().any(|resource| matches!(resource, ResourceGrant::DatabaseTable { database: allowed_db, table: allowed_table }
+            if allowed_db.as_str() == database && table.is_none_or(|table| allowed_table.as_str() == table))) {
+            return Err(VerificationError::Invalid);
+        }
+    }
+    if let Some(account) = string("connector_account")? {
+        if !resources.iter().any(|resource| matches!(resource,
+            ResourceGrant::Connector { account: allowed, .. } if allowed.as_str() == account)) {
+            return Err(VerificationError::BindingMismatch);
+        }
+    }
+    for key in ["to", "cc", "bcc", "attendees", "chat_id", "notify_chat_id", "target_agent", "recipient"] {
+        if let Some(value) = arguments.get(key).filter(|v| !v.is_null()) {
+            let values: Vec<&Value> = match value.as_array() { Some(array) => array.iter().collect(), None => vec![value] };
+            for value in values {
+                let recipient = value.as_str().or_else(|| value.get("email").and_then(Value::as_str))
+                    .ok_or(VerificationError::Invalid)?;
+                if !resources.iter().any(|resource| matches!(resource,
+                    ResourceGrant::Recipient { id } if id.as_str() == recipient)) {
+                    return Err(VerificationError::Invalid);
+                }
+            }
+        }
+    }
+    if policy.route == Route::Service {
+        for key in ["task_id", "parent_task_id", "goal_id", "parent_goal_id"] {
+            if let Some(task) = string(key)? {
+                if !resources.iter().any(|resource| matches!(resource, ResourceGrant::Task { id } if id.as_str() == task)) {
+                    return Err(VerificationError::Invalid);
+                }
+            }
+        }
+        if let Some(dependencies) = arguments.get("depends_on") {
+            for dependency in dependencies.as_array().ok_or(VerificationError::Invalid)? {
+                let task = dependency.as_str().ok_or(VerificationError::Invalid)?;
+                if !resources.iter().any(|resource| matches!(resource, ResourceGrant::Task { id } if id.as_str() == task)) {
+                    return Err(VerificationError::Invalid);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolver: &dyn ResourceResolver)
+    -> Result<AuthorizedToolCall, VerificationError> {
+    crate::check_arguments(arguments)?;
+    let policy = policy(name).ok_or(VerificationError::Invalid)?;
+    if !eligible(context, name) { return Err(VerificationError::Invalid); }
+    let required = required_for_call(policy, arguments)?;
+    let resources = resolver.resolve(context, policy, arguments)?;
+    if resources.is_empty() || resources.len() > 128
+        || resources.iter().enumerate().any(|(index, resource)| resources[..index].contains(resource)) {
+        return Err(VerificationError::Invalid);
+    }
+    for resource in &resources {
+        crate::resources::require_resource(context, resource)?;
+        if let ResourceGrant::Connector { binding, .. } = resource {
+            if binding != &context.record().employee_binding {
+                return Err(VerificationError::BindingMismatch);
+            }
+            if let EmployeeBinding::Personal(owner) = binding {
+                if !context.record().personal_owner_matches(owner.as_str()) {
+                    return Err(VerificationError::BindingMismatch);
+                }
+            }
+        }
+        validate_resource(resource)?;
+    }
+    if !required.iter().all(|kind| resources.iter().any(|resource| ResourceKind::of(resource) == *kind
+        && (*kind != ResourceKind::Employee || resource == &own_employee(context)))) {
+        return Err(VerificationError::Invalid);
+    }
+    check_selected_resources(policy, arguments, &resources)?;
+    Ok(AuthorizedToolCall { context: context.clone(), policy, arguments: arguments.clone(), resources })
+}
+
+#[cfg(test)]
+#[path = "tool_policy_tests.rs"]
+mod tests;

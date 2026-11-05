@@ -168,6 +168,7 @@ pub async fn get_valid_notion_token(home_dir: &Path) -> Result<String, NotionAut
 fn http_client() -> Result<reqwest::Client, NotionApiError> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .redirect(crate::isolation_connector_clients::redirects())
         .build()
         .map_err(|e| NotionApiError::Http(format!("client build failed: {e}")))
 }
@@ -196,10 +197,12 @@ async fn notion_request(
             req = req.json(b);
         }
 
+        crate::isolation_connector_clients::before_request("notion", url)
+            .map_err(|message| NotionApiError::Http(message.to_owned()))?;
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                if attempt < 2 {
+                if attempt < 2 && !crate::isolation_connector_clients::active() {
                     continue;
                 }
                 return Err(NotionApiError::Http(format!("request failed: {e}")));
@@ -216,7 +219,7 @@ async fn notion_request(
                 .map_err(|e| NotionApiError::Http(format!("invalid JSON from Notion: {e}")));
         }
 
-        if (code == 429 || (500..=599).contains(&code)) && attempt < 2 {
+        if (code == 429 || (500..=599).contains(&code)) && attempt < 2 && !crate::isolation_connector_clients::active() {
             continue;
         }
 

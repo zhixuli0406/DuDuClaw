@@ -115,7 +115,8 @@ pub(crate) async fn handle_tasks_list(
         _ => Some(default_agent),
     };
 
-    let mut rows = match store.list_tasks(status, assigned_to, priority).await {
+    let query = store.list_tasks(status, assigned_to, priority).await;
+    let mut rows = match query {
         Ok(r) => r,
         Err(e) => return tool_error(&format!("list tasks: {e}")),
     };
@@ -1096,7 +1097,7 @@ mod criteria_tag_tests {
 /// [`resolve_parent`] refuses (H3-1: present-but-damaged is never read as
 /// "no round"; `duduclaw_core::host_task_id` would read it as absent).
 fn round_env_from_process() -> Option<String> {
-    std::env::var_os(duduclaw_core::ENV_TASK_ID).map(|v| v.into_string().unwrap_or_default())
+    crate::mcp_isolation_identity::var_os(duduclaw_core::ENV_TASK_ID).map(|v| v.into_string().unwrap_or_default())
 }
 
 /// A round value the host could have written: the same rule the gateway
@@ -1428,3 +1429,8 @@ mod autonomy_commit_tests {
         assert_eq!(store.list_tasks(None, None, None).await.unwrap().len(), 1);
     }
 }
+
+/// Finite, immutable grant ids; a missing task grant never means all tasks.
+#[cfg(test)]
+#[path = "../mcp_collection_isolation_tests.rs"]
+mod isolation_collection_tests;

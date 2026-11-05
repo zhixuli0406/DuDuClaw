@@ -1,0 +1,195 @@
+use super::*;
+use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
+use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord,
+    EmployeeBinding, Lane, Principal, ResourceGrant}, ids::{EmployeeId, RunId, Sha256Digest}};
+use duduclaw_mcp_boundary::{bindings::BindingStore, tool_policy::{ResourceResolver, ToolPolicy, authorize}, RequestContext};
+use crate::isolation_connectors::ConnectorCatalog;
+use rusqlite::Connection;
+fn text<const N: usize>(value: &str) -> Text<N> { Text::new(value.into()).unwrap() }
+struct Fixed;
+impl ResourceResolver for Fixed {
+    fn resolve(&self, context: &RequestContext, _: &ToolPolicy, _: &Value) -> Result<Vec<ResourceGrant>, VerificationError> {
+        Ok(context.record().resources.as_slice().to_vec())
+    }
+}
+fn fixture() -> (Arc<Mutex<BindingStore>>, SelectedConnector, AuthorizedToolCall) {
+    let principal = Principal::Human { user_id: text("alice"), generation: 1 };
+    let binding = EmployeeBinding::Personal(text("alice"));
+    let employee = EmployeeId([2; 16]);
+    let mut store = BindingStore::new(Connection::open_in_memory().unwrap()).unwrap();
+    store.register_principal(&principal).unwrap();
+    store.create_employee(employee, &binding).unwrap();
+    store.register_connector("alice-google", &binding).unwrap();
+    let bindings = Arc::new(Mutex::new(store));
+    let catalog = Arc::new(ConnectorCatalog::new(Connection::open_in_memory().unwrap()).unwrap());
+    catalog.register("alice-google", "google").unwrap();
+    let context = RequestContext::from_verified_record(CapabilityRecord {
+        id: CapabilityId(Sha256Digest([1; 32])), employee, run: RunId([3; 16]), task: None,
+        principal, employee_binding: binding.clone(), lane: Lane::Standard,
+        tools: List::new(vec![text("google_status")]).unwrap(),
+        resources: List::new(vec![ResourceGrant::Employee { id: employee }, ResourceGrant::Connector {
+            account: text("alice-google"), binding }]).unwrap(),
+        policy_revision: 1, gateway_epoch: [0; 16], issued_at: 1, not_before: 1, expires_at: u64::MAX,
+        nonce: [0; 32], jti: [0; 16],
+    });
+    let selected = SelectedConnector::select(&context, "google_status", &json!({}), bindings.clone(), catalog).unwrap();
+    let call = authorize(&context, "google_status", &json!({}), &Fixed).unwrap();
+    (bindings, selected, call)
+}
+struct SpyProvider {
+    calls: AtomicUsize,
+    returned_account: &'static str,
+    revoke_during_acquire: Option<Arc<Mutex<BindingStore>>>,
+}
+impl SpyProvider {
+    fn new(account: &'static str) -> Self { Self { calls: AtomicUsize::new(0), returned_account: account, revoke_during_acquire: None } }
+}
+impl AccountCredentialProvider for SpyProvider {
+    fn acquire<'a>(&'a self, account: &'a str, provider: &'a str)
+        -> Pin<Box<dyn Future<Output = Result<AccountCredential, VerificationError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(account, "alice-google");
+            assert_eq!(provider, "google");
+            tokio::task::yield_now().await;
+            if let Some(bindings) = &self.revoke_during_acquire { bindings.lock().unwrap().revoke_connector(account).unwrap(); }
+            AccountCredential::new(self.returned_account.into(), provider.into(), "fixture-secret-token".into(), u64::MAX)
+        })
+    }
+}
+struct ClientFixture { home: tempfile::TempDir, client: NativeConnectorExecutor }
+impl std::ops::Deref for ClientFixture {
+    type Target = NativeConnectorExecutor;
+    fn deref(&self) -> &Self::Target { &self.client }
+}
+fn executor(provider: Arc<dyn AccountCredentialProvider>) -> ClientFixture {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("agents/employee-a")).unwrap();
+    std::fs::write(home.path().join("config.toml"), "[integrations]\ngoogle_workspace=true\ngithub=true\n").unwrap();
+    std::fs::write(home.path().join("agents/employee-a/agent.toml"), "[google]\nidentity='home'\n").unwrap();
+    let client = NativeConnectorExecutor::new(home.path().to_owned(), "employee-a".into(), provider).unwrap();
+    ClientFixture { home, client }
+}
+#[tokio::test]
+async fn isolated_native_connector_revocation_prevents_credential_acquisition() {
+    let (bindings, selected, call) = fixture();
+    bindings.lock().unwrap().revoke_connector("alice-google").unwrap();
+    let provider = Arc::new(SpyProvider::new("alice-google"));
+    assert!(executor(provider.clone()).execute(selected, call).await.is_err());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn isolated_native_connector_rechecks_after_await_and_returned_account() {
+    let (_, selected, call) = fixture();
+    let provider = Arc::new(SpyProvider::new("different-account"));
+    assert!(executor(provider.clone()).execute(selected, call).await.is_err());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let (bindings, selected, call) = fixture();
+    let mut provider = SpyProvider::new("alice-google");
+    provider.revoke_during_acquire = Some(bindings);
+    assert!(executor(Arc::new(provider)).execute(selected, call).await.is_err());
+}
+#[tokio::test]
+async fn isolated_native_connector_status_is_account_specific_without_token_output() {
+    let (_, selected, call) = fixture();
+    let provider = Arc::new(SpyProvider::new("alice-google"));
+    let result = executor(provider).execute(selected, call).await.unwrap().to_string();
+    assert!(result.contains("alice-google"));
+    assert!(!result.contains("fixture-secret-token"));
+    assert!(result.contains("provider_verified"));
+}
+#[tokio::test]
+async fn isolated_native_connector_every_http_hop_rechecks_binding_origin_and_expiry() {
+    let (bindings, selected, _) = fixture();
+    let client = executor(Arc::new(AccountCredentialVault::default()));
+    CLIENT_POLICY.scope(client.policy.clone(), BOUND_CONNECTOR.scope(Arc::new(selected), CREDENTIAL_EXPIRY.scope(u64::MAX, async {
+        assert!(before_request("google", "https://gmail.googleapis.com/gmail/v1/users/me/messages").is_ok());
+        for url in ["http://gmail.googleapis.com/", "https://gmail.googleapis.com.evil.test/", "https://user@gmail.googleapis.com/", "https://127.0.0.1/"] {
+            assert!(before_request("google", url).is_err());
+        }
+        assert!(before_request("github", "https://api.github.com/").is_err());
+        CREDENTIAL_EXPIRY.scope(1, async { assert!(before_request("google", "https://gmail.googleapis.com/").is_err()); }).await;
+        bindings.lock().unwrap().revoke_connector("alice-google").unwrap();
+        assert!(before_request("google", "https://gmail.googleapis.com/").is_err());
+    }))).await;
+    assert!(!active());
+}
+#[test]
+fn isolated_native_connector_support_is_exact_and_has_no_other_provider_fallback() {
+    let client = executor(Arc::new(AccountCredentialVault::default()));
+    let supported: Vec<_> = duduclaw_mcp_boundary::tool_policy::POLICIES.iter().filter(|p| client.supports(p.name)).collect();
+    assert_eq!(supported.len(), 28);
+    for tool in ["google_status_extra", "gmail_search_extra", "github_status_extra", "notion_status_extra", "odoo_search", "db_query", "send_message", "web_search"] {
+        assert!(!client.supports(tool));
+    }
+}
+#[tokio::test]
+async fn isolated_native_connector_vault_is_exact_and_expires_closed() {
+    let vault = AccountCredentialVault::default();
+    assert!(vault.acquire("missing", "google").await.is_err());
+    vault.install(AccountCredential::new("alice-google".into(), "google".into(), "token".into(), 1).unwrap()).unwrap();
+    let (_, selected, _) = fixture();
+    assert!(credential(&selected, &vault).await.is_err());
+    assert!(vault.acquire("alice-google", "github").await.is_err());
+    assert!(vault.install(AccountCredential::new("alice-google".into(), "github".into(), "token".into(), u64::MAX).unwrap()).is_err());
+}
+
+#[test]
+fn isolated_native_credential_rejects_json_escaping_and_non_bearer_alphabet() {
+    for token in ["quote\"token", "slash\\token", "white space", "new\nline", "中文", "token:colon"] {
+        assert!(AccountCredential::new("account".into(), "google".into(), token.into(), u64::MAX).is_err());
+    }
+    assert!(AccountCredential::new("account".into(), "google".into(), "aZ09-._~+/=".into(), u64::MAX).is_ok());
+}
+
+#[tokio::test]
+async fn isolated_native_connector_disabled_or_invalid_integration_never_acquires_credential() {
+    for config in ["[integrations]\ngoogle_workspace=false\n", "[integrations]\ngoogle_workspace='true'\n", "invalid ["] {
+        let (_, selected, call) = fixture();
+        let provider = Arc::new(SpyProvider::new("alice-google"));
+        let client = executor(provider.clone());
+        std::fs::write(client.home.path().join("config.toml"), config).unwrap();
+        assert!(client.execute(selected, call).await.is_err());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+    let (_, selected, call) = fixture();
+    let provider = Arc::new(SpyProvider::new("alice-google"));
+    let client = executor(provider.clone());
+    std::fs::remove_file(client.home.path().join("config.toml")).unwrap();
+    assert!(client.execute(selected, call).await.is_err());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn isolated_native_connector_google_none_or_invalid_employee_never_acquires_credential() {
+    for employee in ["[google]\nidentity='none'\n", "[google]\nidentity=12\n", "invalid ["] {
+        let (_, selected, call) = fixture();
+        let provider = Arc::new(SpyProvider::new("alice-google"));
+        let client = executor(provider.clone());
+        std::fs::write(client.home.path().join("agents/employee-a/agent.toml"), employee).unwrap();
+        assert!(client.execute(selected, call).await.is_err());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn isolated_native_connector_policy_change_fences_later_http_hop() {
+    let (_, selected, _) = fixture();
+    let client = executor(Arc::new(AccountCredentialVault::default()));
+    CLIENT_POLICY.scope(client.policy.clone(), BOUND_CONNECTOR.scope(Arc::new(selected), CREDENTIAL_EXPIRY.scope(u64::MAX, async {
+        assert!(before_request("google", "https://gmail.googleapis.com/").is_ok());
+        std::fs::write(client.home.path().join("agents/employee-a/agent.toml"), "[google]\nidentity='none'\n").unwrap();
+        assert!(before_request("google", "https://gmail.googleapis.com/").is_err());
+    }))).await;
+}
+
+#[test]
+fn isolated_native_google_recipients_are_single_strings_not_silently_ignored_arrays() {
+    for key in ["to", "cc", "attendees"] {
+        for value in [json!(["one@example.org"]), json!({"email":"one@example.org"}), Value::Null,
+            json!("one@example.org,two@example.org"), json!("one@example.org;two@example.org"), json!("one@example.org\n")] {
+            assert!(validate_google_recipients(&json!({(key):value})).is_err());
+        }
+        assert!(validate_google_recipients(&json!({(key):"one@example.org"})).is_ok());
+    }
+}

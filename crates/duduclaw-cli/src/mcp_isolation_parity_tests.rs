@@ -1,0 +1,342 @@
+//! Product parity: the transport changes the execution location, not employee policy.
+//! Only A/E process transports are doubles. Gateway handlers, service readiness,
+//! capability parsing, discovery and dispatch gates are the production code paths.
+use super::*;
+use std::{collections::BTreeSet, sync::Mutex};
+use duduclaw_isolation::execution::*;
+use duduclaw_mcp_boundary::{execution::{ExecutionPlanFactory, PolicyFuture},
+    factories::{GatewayFactories, GatewayTableParser},
+    tool_policy::{AuthorizedToolCall, Route},
+    worker_execution::{WorkerPlan, WorkerPlanFactory, WorkerReply, WorkerToolBridge}};
+
+// Discovery must never execute a process or acquire a credential. These doubles
+// panic if the production list/manifest accidentally crosses that boundary.
+struct ListingBackend;
+impl ExecutionBackend for ListingBackend {
+    fn reserve(&self, _: EmployeeId) -> BackendFuture<'_, RunHandle> { panic!("listing reserved a run") }
+    fn spawn(&self, _: SpawnPolicy) -> BackendFuture<'_, RunHandle> { panic!("listing spawned a run") }
+    fn wait(&self, _: RunHandle, _: WaitOrigin) -> BackendFuture<'_, RunOutcome> { panic!("listing waited") }
+    fn kill(&self, _: RunHandle) -> BackendFuture<'_, ()> { panic!("listing killed a run") }
+    fn take_stdio(&self, _: RunHandle) -> BackendFuture<'_, RunStdio> { panic!("listing opened stdio") }
+    fn take_pty(&self, _: RunHandle) -> BackendFuture<'_, RunPty> { panic!("listing opened a pty") }
+    fn resize(&self, _: RunHandle, _: PtySize) -> BackendFuture<'_, ()> { panic!("listing resized a pty") }
+}
+
+struct ListingPlans;
+impl ExecutionPlanFactory for ListingPlans {
+    fn supports(&self, tool: &str) -> bool {
+        duduclaw_mcp_boundary::tool_policy::policy(tool).is_some_and(|p| p.route == Route::Execution)
+            || matches!(tool, "hardware_info" | "model_search" | "model_recommend")
+    }
+    fn authorize_handler<'a>(&'a self, _: &'a RequestContext, _: &'a str, _: &'a Value) -> PolicyFuture<'a, ()> {
+        panic!("listing authorized execution")
+    }
+    fn prepare<'a>(&'a self, _: &'a RequestContext, _: &'a str, _: &'a Value, _: RunHandle) -> PolicyFuture<'a, SpawnPolicy> {
+        panic!("listing prepared execution")
+    }
+}
+impl WorkerPlanFactory for ListingPlans {
+    fn supports(&self, tool: &str) -> bool {
+        duduclaw_mcp_boundary::tool_policy::policy(tool).is_some_and(|p| p.route == Route::Worker)
+    }
+    fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+        panic!("listing authorized parsing")
+    }
+    fn prepare<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, WorkerPlan> {
+        panic!("listing prepared parsing")
+    }
+    fn finish<'a>(&'a self, _: &'a AuthorizedToolCall, _: WorkerReply) -> PolicyFuture<'a, Value> {
+        panic!("listing finished parsing")
+    }
+}
+
+fn host_tools() -> BTreeSet<String> {
+    // Independent of the implementation's refusal predicate: an accidental new
+    // refusal must change the reviewed product matrix before it can pass parity.
+    let matrix = include_str!("../../../docs/architecture/native-linux-isolation-tools.md");
+    let names: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && line.contains("Refused: HostAuthority"))
+        .filter_map(|line| line.split('`').nth(1)).map(str::to_owned).collect();
+    assert!(names.contains("os_power"), "matrix must enumerate the host-authority exception");
+    assert!(!names.contains("computer_session_start"));
+    assert!(!names.contains("computer_workspace_write"));
+    names
+}
+
+fn employee_config(extra_capabilities: &str) -> String {
+    format!(r#"[agent]
+name = "main"
+display_name = "Parity employee"
+role = "main"
+status = "active"
+trigger = "@main"
+reports_to = ""
+icon = "robot"
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = ""
+api_mode = "cli"
+account_pool = []
+[budget]
+monthly_limit_cents = 1000
+warn_threshold_percent = 80
+hard_stop = false
+[container]
+sandbox_enabled = false
+network_access = false
+timeout_ms = 60000
+max_concurrent = 2
+readonly_project = false
+additional_mounts = []
+[heartbeat]
+enabled = false
+interval_seconds = 300
+max_concurrent_runs = 1
+cron = ""
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = true
+can_modify_own_soul = false
+can_schedule_tasks = true
+allowed_channels = []
+[evolution]
+skill_auto_activate = false
+skill_security_scan = false
+[capabilities]
+allowed_tools = ["mcp__duduclaw__*"]
+os_native = true
+recording = true
+system_operator = true
+codrive = true
+computer_use = true
+db_sources = ["demo"]
+{extra_capabilities}
+[capabilities.computer_use_config]
+workspace = true
+[fork]
+enabled = true
+[google]
+identity = "home"
+[[channels.discord.bindings]]
+kind = "channel"
+id = "parity-group"
+"#)
+}
+
+fn fixture(home: &std::path::Path) -> (IsolationDispatcher, RequestContext) {
+    fixture_with_principal(home, false)
+}
+
+fn fixture_with_principal(home: &std::path::Path, background: bool) -> (IsolationDispatcher, RequestContext) {
+    std::fs::create_dir_all(home.join("agents/main")).unwrap();
+    let raw = employee_config("");
+    let typed: duduclaw_core::types::AgentConfig = toml::from_str(&raw).unwrap();
+    assert_eq!(typed.agent.name, "main");
+    assert!(typed.agent.status.is_operational());
+    assert_eq!(typed.capabilities.allowed_tools, ["mcp__duduclaw__*"]);
+    assert!(typed.capabilities.os_native && typed.capabilities.recording && typed.capabilities.system_operator);
+    assert!(typed.capabilities.computer_use && typed.capabilities.computer_use_config.workspace);
+    assert_eq!(typed.capabilities.db_sources, ["demo"]);
+    assert!(typed.permissions.can_schedule_tasks && typed.permissions.can_send_cross_agent);
+    assert_eq!(typed.channels.unwrap().discord.unwrap().bindings[0].id, "parity-group");
+    std::fs::write(home.join("agents/main/agent.toml"), raw).unwrap();
+    std::fs::write(home.join("config.toml"), r#"[general]
+default_agent = "main"
+[integrations]
+google_workspace = true
+github = true
+[responsibilities]
+enabled = true
+[computer_use.workspaces]
+enabled = true
+[knowledge]
+enabled = true
+"#).unwrap();
+    assert!(duduclaw_gateway::google_workspace::integration_enabled(home));
+    assert!(duduclaw_gateway::github_workspace::integration_enabled(home));
+    assert!(duduclaw_gateway::responsibility::ResponsibilityConfig::from_home(home).enabled);
+    assert!(crate::mcp_fork::load_fork_settings(home, "main").enabled);
+    let _settings = duduclaw_gateway::channel_settings::ChannelSettingsManager::new(&home.join("sessions.db")).unwrap();
+    duduclaw_gateway::group_context::set(home, &duduclaw_gateway::group_context::GroupConfig {
+        channel: "discord".into(), group_id: "parity-group".into(), scope_id: "parity-guild".into(),
+        max_messages: 50, max_age_hours: 24,
+    }).unwrap();
+    let mut knowledge = duduclaw_knowledge::schema::open_home(home).unwrap();
+    let collection = duduclaw_knowledge::store::create_collection(&mut knowledge,
+        &duduclaw_knowledge::store::NewCollection { name: "parity".into(), ..Default::default() },
+        "owner", &duduclaw_knowledge::limits::KnowledgeConfig::default()).unwrap();
+    use duduclaw_knowledge::acl::{PrincipalKind, Role};
+    duduclaw_knowledge::acl::set_acl(&mut knowledge, &collection.id, &[
+        (PrincipalKind::User, "owner".into(), Role::Owner),
+        (PrincipalKind::Agent, "main".into(), Role::Viewer),
+    ], 0, "owner").unwrap();
+    let mut principal = principal();
+    // Registered per-employee keys are an existing production caller shape.
+    // Admin is the key's scope ceiling, not RecordActor::Operator authority.
+    principal.client_id = if std::env::var_os("DUDUCLAW_PARITY_CHILD_HOME").is_some() {
+        duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID.into()
+    } else { "main".into() };
+    principal.scopes = [crate::mcp_auth::Scope::Admin].into_iter().collect();
+    assert_eq!(crate::mcp::record_actor_for(home, &principal.client_id, "main").agent(), Some("main"));
+    let mut record = context().record().clone();
+    record.lane = Lane::Standard;
+    if background {
+        record.principal = RunPrincipal::Background { tenant_id: Text::new("tenant".into()).unwrap(), generation: 1 };
+        record.employee_binding = EmployeeBinding::Shared(Text::new("tenant".into()).unwrap());
+    }
+    let host = host_tools();
+    record.tools = List::new(crate::mcp::tools().filter(|tool| !host.contains(tool.name))
+        .map(|tool| Text::new(tool.name.into()).unwrap()).collect()).unwrap();
+    record.resources = List::new(vec![
+        ResourceGrant::Employee { id: record.employee },
+        ResourceGrant::Workspace { handle: Text::new("work".into()).unwrap() },
+        ResourceGrant::Wiki { namespace: Text::new("agent:main".into()).unwrap() },
+        ResourceGrant::Connector { account: Text::new("model-catalog".into()).unwrap(), binding: record.employee_binding.clone() },
+        ResourceGrant::UrlOrigin { origin: Text::new("https://example.com".into()).unwrap() },
+    ]).unwrap();
+    for resource in record.resources.as_slice() {
+        duduclaw_mcp_boundary::tool_policy::validate_resource(resource).unwrap();
+    }
+    let context = RequestContext::from_verified_record(record);
+    let mut bindings = duduclaw_mcp_boundary::bindings::BindingStore::new(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+    bindings.register_principal(&context.record().principal).unwrap();
+    bindings.create_employee(context.record().employee, &context.record().employee_binding).unwrap();
+    let resolver = Arc::new(duduclaw_gateway::isolation_resources::GatewayResourceResolver::new(
+        home.to_owned(), context.record().employee, "main".into(), Arc::new(Mutex::new(bindings))).unwrap());
+    let parser = Arc::new(GatewayTableParser::new(Arc::new(|_, _, _| panic!("listing parsed a file"))));
+    let factories = GatewayFactories::assemble(Some(Arc::new(ListingBackend)), Some(Arc::new(ListingPlans)),
+        resolver.clone(), Some(parser)).unwrap().with_worker(Arc::new(WorkerToolBridge::new(
+            Arc::new(ListingPlans), resolver.clone(), Arc::new(|_| panic!("listing launched a parser")))));
+    let dispatcher = IsolationDispatcher::new(home.to_owned(), context.record().employee, "main".into(),
+        principal, Arc::new(ResourceRoots::default())).unwrap().with_gateway_services(resolver, factories, None);
+    (dispatcher, context)
+}
+
+fn names(response: &Value) -> BTreeSet<String> {
+    assert!(response.get("error").is_none(), "{response}");
+    response["result"]["tools"].as_array().unwrap().iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned()).collect()
+}
+
+#[test]
+fn isolated_round5_employee_tool_parity_matches_nonisolated_except_documented_host_authority() {
+    // A dedicated test process models a real gateway-spawned MCP child, including
+    // signed employee identity, without racing global env mutations in libtest.
+    if let Some(home) = std::env::var_os("DUDUCLAW_PARITY_CHILD_HOME") {
+        tokio::runtime::Runtime::new().unwrap().block_on(employee_tool_parity(std::path::Path::new(&home)));
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let key = duduclaw_core::identity_token::ensure_key(home.path()).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("isolated_round5_employee_tool_parity_matches_nonisolated_except_documented_host_authority")
+        .arg("--test-threads=1").arg("--nocapture")
+        .env("DUDUCLAW_PARITY_CHILD_HOME", home.path())
+        .env(duduclaw_core::ENV_AGENT_ID, "main")
+        .env(duduclaw_core::ENV_AGENT_TOKEN, duduclaw_core::mint_identity_token(&key, "main"))
+        .env_remove(duduclaw_core::ENV_LANE)
+        .output().unwrap();
+    assert!(output.status.success(), "parity subprocess failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "the parity subprocess must execute its test, not pass an empty filter");
+}
+
+async fn employee_tool_parity(home: &std::path::Path) {
+    let (dispatcher, context) = fixture(home);
+    assert_eq!(crate::mcp_namespace::verified_employee_from_env(home).as_deref(), Some("main"));
+    dispatcher.require_complete_services().unwrap();
+    let host = host_tools();
+    for extra in ["", "denied_tools = [\"odoo_search\", \"wiki_write\", \"send_to_agent\"]\naction_rules = [{tool=\"plan_start\", verdict=\"block\"}]"] {
+        std::fs::write(home.join("agents/main/agent.toml"), employee_config(extra)).unwrap();
+        let ordinary = names(&crate::mcp::handle_tools_list_for_agent(&json!(1), &dispatcher.principal, home, "main").await);
+        let isolated = names(&dispatcher.dispatch(context.clone(), "main", json!({"jsonrpc":"2.0", "id":1,
+            "method":"tools/list"})).await.unwrap().unwrap());
+        let expected = ordinary.difference(&host).cloned().collect::<BTreeSet<_>>();
+        assert_eq!(isolated, expected, "transport must preserve existing employee gates");
+        if extra.is_empty() {
+            for tool in ["odoo_connect", "odoo_execute", "send_message", "send_photo", "send_sticker", "channel_status",
+                "send_to_agent", "team_handoff", "plan_start", "task_status", "session_restore_context", "memory_improve",
+                "list_cron_tasks", "run_cron_task", "create_reminder", "cancel_reminder", "web_search", "mail_send",
+                "db_sources", "db_tables", "db_select", "db_query", "wiki_read", "wiki_write", "wiki_share",
+                "cost_summary", "list_agents", "computer_session_start", "computer_workspace_list", "computer_workspace_write",
+                "group_history_read", "knowledge_search", "knowledge_get_passage", "knowledge_list_collections", "knowledge_add_source",
+                "meeting_transcribe", "meeting_upload_link", "file_read", "csv_read", "xlsx_read", "code_map", "execute_program",
+                "skill_extract", "web_fetch_cached", "web_extract", "model_search", "model_recommend"] {
+                assert!(ordinary.contains(tool), "production fixture did not enable {tool}");
+                assert!(isolated.contains(tool), "production employee lost {tool}");
+            }
+        } else {
+            for tool in ["odoo_search", "wiki_write", "send_to_agent", "plan_start"] {
+                assert!(!isolated.contains(tool), "existing policy was bypassed for {tool}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn isolated_round5_gateway_handler_dispatch_keeps_existing_capability_denials() {
+    let home = tempfile::tempdir().unwrap();
+    let (dispatcher, context) = fixture(home.path());
+    for tool in ["plan_start", "db_sources"] {
+        let mut request = json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":tool}});
+        if tool == "plan_start" { request["params"]["arguments"] = json!({"task":"parity plan"}); }
+        let ordinary = dispatcher.dispatcher.dispatch_tool_call(&dispatcher.principal, &dispatcher.namespace,
+            &request["params"], &request["id"]).await;
+        let response = dispatcher.dispatch(context.clone(), "main", request.clone()).await.unwrap().unwrap();
+        assert!(response.get("error").is_none(), "{tool}: {response}");
+        assert_ne!(response["result"]["isError"], true, "{tool}: {response}");
+        assert_eq!(response["result"], ordinary["result"], "same existing handler: {tool}");
+        let policy = format!("denied_tools = [\"{tool}\"]");
+        std::fs::write(home.path().join("agents/main/agent.toml"), employee_config(&policy)).unwrap();
+        let ordinary_denied = dispatcher.dispatcher.dispatch_tool_call(&dispatcher.principal, &dispatcher.namespace,
+            &request["params"], &request["id"]).await;
+        let denied = dispatcher.dispatch(context.clone(), "main", request).await.unwrap().unwrap();
+        assert!(denied.get("error").is_some(), "{tool}: {denied}");
+        assert_eq!(denied["error"], ordinary_denied["error"], "same existing denial: {tool}");
+        assert!(!denied.to_string().contains("isolation_boundary"), "must use the original gate: {denied}");
+        std::fs::write(home.path().join("agents/main/agent.toml"), employee_config("")).unwrap();
+    }
+}
+
+struct BackgroundTurn;
+impl duduclaw_gateway::isolation_egress::RunTurnResolver for BackgroundTurn {
+    fn resolve(&self, _: &RequestContext) -> Result<duduclaw_gateway::isolation_egress::RunTurnIdentity, VerificationError> {
+        Ok(duduclaw_gateway::isolation_egress::RunTurnIdentity {
+            turn: "parity-background-run".into(), approval_session: None,
+        })
+    }
+    fn metadata(&self, _: &RequestContext) -> Result<Option<duduclaw_gateway::isolation_egress::RunMetadata>, VerificationError> {
+        let mut metadata = duduclaw_gateway::isolation_egress::RunMetadata::root();
+        metadata.dispatch_run = Some(("cron:main".into(), "parity-run".into()));
+        Ok(Some(metadata))
+    }
+}
+
+#[tokio::test]
+async fn isolated_round5_background_memory_store_reuses_handler_with_dispatch_provenance() {
+    let home = tempfile::tempdir().unwrap();
+    let (dispatcher, context) = fixture_with_principal(home.path(), true);
+    let dispatcher = dispatcher.with_turn_resolver(Arc::new(BackgroundTurn));
+    let request = json!({"jsonrpc":"2.0", "id":3, "method":"tools/call",
+        "params":{"name":"memory_store", "arguments":{"content":"The daily report is prepared at nine."}}});
+    let ordinary = dispatcher.dispatcher.dispatch_tool_call(&dispatcher.principal, &dispatcher.namespace,
+        &request["params"], &request["id"]).await;
+    let isolated = dispatcher.dispatch(context, "main", request).await.unwrap().unwrap();
+    let database = rusqlite::Connection::open(home.path().join("memory.db")).unwrap();
+    for response in [&ordinary, &isolated] {
+        assert!(response.get("error").is_none(), "{response}");
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        let id = response["result"]["memory_id"].as_str().unwrap();
+        let (employee, content): (String, String) = database.query_row(
+            "SELECT agent_id,content FROM memories WHERE id=?1", [id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(employee, "main");
+        assert_eq!(content, "The daily report is prepared at nine.");
+    }
+    let id = isolated["result"]["memory_id"].as_str().unwrap();
+    let dispatch_origin: i64 = database.query_row(
+        "SELECT COUNT(*) FROM memory_origins WHERE memory_id=?1 AND agent_id='main'
+         AND source_kind='dispatch_run' AND source_session='cron:main' AND source_message='run:parity-run'",
+        [id], |row| row.get(0)).unwrap();
+    assert_eq!(dispatch_origin, 1, "background memory must retain its gateway-issued dispatch source");
+}

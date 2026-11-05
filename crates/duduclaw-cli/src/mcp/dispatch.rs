@@ -188,12 +188,17 @@ pub(crate) async fn handle_tools_call(
 
     // Per-employee Google identity: decided from the proven employee only
     // (never a tool argument). Only built for the Google tools.
+    let isolated = crate::mcp_isolation::current().is_some();
     let google_caller = if GOOGLE_WORKSPACE_TOOLS.contains(&tool_name) {
         super::google_identity_client::GoogleCaller::for_process(home_dir, caller_client_id)
     } else {
         super::google_identity_client::GoogleCaller::default()
     };
-    let result = with_background_caller(record_actor, async { Ok(match tool_name {
+    let result = with_background_caller(record_actor, async {
+        if let Some(result) = crate::mcp_isolation::dispatch_resource_tool(home_dir, tool_name, &arguments).await {
+            return Ok(result);
+        }
+        Ok(match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
         "web_search" => handle_web_search(&arguments, http).await,
         // ── W19-P0 M1: namespace-aware memory endpoints ────────────────────
@@ -254,7 +259,7 @@ pub(crate) async fn handle_tools_call(
             crate::mcp_memory_handlers::handle_memory_get_at(&arguments, memory, ns_ctx).await
         }
         "memory_invalidate_by_origin" => {
-            let env_agent = std::env::var(duduclaw_core::ENV_AGENT_ID).ok();
+            let env_agent = crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_ID).ok();
             let client_is_agent = duduclaw_core::is_valid_agent_id(caller_client_id)
                 && home_dir
                     .join("agents")
@@ -621,6 +626,9 @@ pub(crate) async fn handle_tools_call(
                 "file_read" => {
                     crate::mcp_files::handle_file_read(&arguments, home_dir, files_agent)
                 }
+                "csv_read" | "xlsx_read" if crate::mcp_isolation::current().is_some() => {
+                    crate::mcp_files::handle_isolated_table_read(tool_name, &arguments, home_dir, files_agent).await
+                }
                 "csv_read" => crate::mcp_files::handle_csv_read(&arguments, home_dir, files_agent),
                 _ => crate::mcp_files::handle_xlsx_read(&arguments, home_dir, files_agent),
             }
@@ -824,7 +832,11 @@ pub(crate) async fn handle_tools_call(
     // (goal-loop-driver / cron / heartbeat / autopilot / dashboard / webhook)
     // it names who dispatched the work, not who is executing this tool call —
     // see `resolve_audit_agent` (WP-A10 BUG-1 fix).
-    if is_state_changing {
+    if isolated && is_state_changing {
+        duduclaw_security::audit::append_tool_call_with_extras(home_dir, default_agent, tool_name,
+            "isolated resource tool", !result.get("isError").and_then(Value::as_bool).unwrap_or(false),
+            &[("transport", serde_json::json!("isolated_mcp"))]);
+    } else if is_state_changing {
         let success = !result
             .get("isError")
             .and_then(|v| v.as_bool())

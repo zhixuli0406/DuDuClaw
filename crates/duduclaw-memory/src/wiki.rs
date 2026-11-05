@@ -1820,7 +1820,7 @@ impl WikiStore {
 // ---------------------------------------------------------------------------
 
 /// Parse a wiki page from raw content.
-fn parse_wiki_page(path: &str, content: &str) -> Result<WikiPage> {
+pub fn parse_wiki_page(path: &str, content: &str) -> Result<WikiPage> {
     let title = extract_title(content).unwrap_or_else(|| path.to_string());
     let created = extract_datetime_field(content, "created").unwrap_or_else(Utc::now);
     let updated = extract_datetime_field(content, "updated").unwrap_or_else(Utc::now);

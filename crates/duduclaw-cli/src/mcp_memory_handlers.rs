@@ -46,7 +46,7 @@ fn client_id_from_ns(ns_ctx: &NamespaceContext) -> &str {
 pub(crate) fn mcp_write_provenance(
     namespace: &str,
 ) -> Result<duduclaw_memory::lineage::Provenance, String> {
-    let env = |k: &str| std::env::var(k).ok();
+    let env = |k: &str| crate::mcp_isolation_identity::var(k).ok();
     mcp_write_sources_with(
         namespace,
         &McpTurnEnv {
@@ -68,7 +68,7 @@ pub(crate) async fn mcp_stamped_provenance(
 ) -> Result<duduclaw_memory::lineage::Provenance, String> {
     let provenance = mcp_write_provenance(namespace)?;
     let snapshot = duduclaw_gateway::egress_client::connector_snapshot(
-        &duduclaw_core::duduclaw_home(), namespace,
+        &crate::mcp_isolation_identity::home(), namespace,
     ).await;
     Ok(snapshot.stamp(provenance))
 }
@@ -331,7 +331,7 @@ pub(crate) fn mcp_fenced_error(
     refusal: &duduclaw_memory::FenceRefusal,
 ) -> Value {
     duduclaw_gateway::memory_provenance::record_fenced(
-        &duduclaw_core::duduclaw_home(),
+        &crate::mcp_isolation_identity::home(),
         namespace,
         producer,
         refusal,

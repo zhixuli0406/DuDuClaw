@@ -24,6 +24,7 @@ members = [
     "crates/duduclaw-parse-worker",
     "crates/duduclaw-updated",
     "crates/duduclaw-isolation-storage",
+    "crates/duduclaw-mcp-boundary",
     "crates/duduclaw-auth",
     "crates/duduclaw-gateway",
     "crates/duduclaw-security",
@@ -140,6 +141,7 @@ duduclaw-execution = { path = "crates/duduclaw-execution" }
 duduclaw-parse-worker = { path = "crates/duduclaw-parse-worker" }
 duduclaw-updated = { path = "crates/duduclaw-updated" }
 duduclaw-isolation-storage = { path = "crates/duduclaw-isolation-storage" }
+duduclaw-mcp-boundary = { path = "crates/duduclaw-mcp-boundary" }
 duduclaw-core = { path = "crates/duduclaw-core" }
 duduclaw-inference = { path = "crates/duduclaw-inference", default-features = false }
 duduclaw-gateway = { path = "crates/duduclaw-gateway", default-features = false }

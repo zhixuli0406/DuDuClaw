@@ -80,7 +80,7 @@ pub(crate) async fn handle_decision_resolve(
         }
         Err(e) => {
             if duduclaw_gateway::memory_provenance::record_fenced_error(
-                &duduclaw_core::duduclaw_home(),
+                &crate::mcp_isolation_identity::home(),
                 agent_id,
                 "mcp_decision_resolve",
                 &e,
