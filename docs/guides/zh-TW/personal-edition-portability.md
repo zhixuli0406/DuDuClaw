@@ -50,11 +50,11 @@ duduclaw start
 
 ## macOS 授權指紋與重新綁定
 
-macOS 新指紋採 `macos-uuid-v2:<32 個十六進位字元>`，由 `IOPlatformUUID` 衍生，不包含主機名稱。`duduclaw license fingerprint`、儀表板啟用授權卡與重新綁定請求都使用此穩定值。啟用授權是安裝已簽章的授權，不會自行向控制平面要求簽發。原有「主機名稱 + UUID」候選值仍可驗證，並標示為舊版綁定。所有 MAC 候選值都視為 Weak，僅供遷移辨識，包含真實 MAC、本機管理 MAC、無 MAC、全零 MAC 與共用 `02:00:00:00:00:00`；即使吻合也只以 OpenSource 隔離運作，管理員會看到需要核准換綁的警告。不過無法反推出過去的主機名稱：舊授權若已不符，請聯絡簽發者，待簽發端支援新格式後執行 `duduclaw license rebind`。
+macOS 新指紋採 `macos-uuid-v2:<32 個十六進位字元>`，由 `IOPlatformUUID` 衍生，不包含主機名稱。`duduclaw license fingerprint`、儀表板啟用授權卡與重新綁定請求都使用此穩定值。啟用授權是安裝已簽章的授權，不會自行向控制平面要求簽發。原有「主機名稱 + UUID」候選值仍可驗證，並標示為舊版綁定。真實的全球管理單播 MAC 候選值仍視為 Hardware，可作為付費授權的硬體綁定依據。本機管理、多播、無 MAC、全零、共用 `02:00:00:00:00:00` 與廣播 `FF:FF:FF:FF:FF:FF` MAC 候選值則視為 Weak，僅供遷移辨識；即使吻合也只以 OpenSource 隔離運作，管理員會看到需要核准換綁的警告。占位 UUID 同樣視為 Weak。不過無法反推出過去的主機名稱：舊授權若已不符，請聯絡簽發者，待簽發端支援新格式後執行 `duduclaw license rebind`。
 
 重新綁定為新格式後，舊版程式無法驗證該授權。請先升級所有會讀取這份授權的程序；需要降版時，須先請簽發者安排相容的重新綁定。
 
-UUID 最多讀取三次，每次逾時五秒。仍讀不到時，不會用 MAC 候選放行綁定 UUID 的授權；CLI 與儀表板也會拒絕提供新簽發用的指紋，待 UUID 可讀取後再試。本次不建立 UUID 磁碟快取：即使檔案僅擁有者可讀寫，同一帳號執行的其他程式仍可竄改，無法證明 UUID 確實來自本機。Linux／Windows 仍產生「主機名稱 + MAC」識別值，但現在視為 Weak，不能啟用綁定機器的付費功能，需核准遷移至支援的強身分；本次未替 Linux／Windows 新增強身分來源。已安裝授權失效時，核心功能維持 OpenSource；管理員的儀表板顯示警示，`duduclaw license status` 與 `duduclaw doctor` 也會列出原因。
+UUID 最多讀取三次，每次逾時五秒。仍讀不到時，不會用 MAC 候選放行綁定 UUID 的授權；CLI 與儀表板也會拒絕提供新簽發用的指紋，待 UUID 可讀取後再試。本次不建立 UUID 磁碟快取：即使檔案僅擁有者可讀寫，同一帳號執行的其他程式仍可竄改，無法證明 UUID 確實來自本機。Linux／Windows 保留「主機名稱 + MAC」綁定：真實的全球管理單播 MAC 仍視為 Hardware，可繼續驗證綁定機器的付費授權，不需遷移。已安裝授權失效時，核心功能維持 OpenSource；管理員的儀表板顯示警示，`duduclaw license status` 與 `duduclaw doctor` 也會列出原因。
 
 **控制平面相容性：** refresh 的 `machine_fingerprint` 保留已安裝授權的綁定；不同的 macOS 穩定 UUID 透過 `new_fingerprint` 提案，**只有帳號持有人在控制台核准換綁後才生效**。rebind 傳送 `old_fingerprint`、`new_fingerprint` 與新的 nonce。指紋是公開識別值，不能當成所有權證明。已驗簽的 `status: "pending"` 會保留原授權並提示等待控制台核准；HTTP 202 也必須附上此已簽章本文，空白或未通過驗證的回應一律拒絕。Linux／Windows 與未綁定 OEM 的 refresh 綁定不變；macOS 讀不到 UUID 時，已綁定授權的 refresh／rebind 停止，不提案改綁 MAC。
 

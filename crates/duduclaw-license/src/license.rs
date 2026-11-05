@@ -220,7 +220,8 @@ impl License {
     /// builds computed on the same machine — see
     /// [`crate::fingerprint::fingerprint_candidates`]. A license bound to a
     /// legacy hardware value keeps working (`legacy = true`). A match backed
-    /// only by any MAC (including placeholder or absent MAC) returns `WeakFingerprint`: callers
+    /// only by a weak identity (such as a placeholder, absent, locally-administered
+    /// or multicast MAC) returns `WeakFingerprint`: callers
     /// must isolate it as OpenSource until an account-approved re-bind.
     ///
     /// Only [`LicenseError::InvalidFingerprint`] advances to the next

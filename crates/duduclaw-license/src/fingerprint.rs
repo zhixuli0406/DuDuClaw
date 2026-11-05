@@ -1,8 +1,8 @@
 //! Machine fingerprint generation.
 //!
 //! macOS uses a versioned UUID-only fingerprint; other platforms retain
-//! hostname + MAC. All MAC-backed values are weak migration candidates and
-//! cannot independently validate a paid binding.
+//! hostname + MAC. Globally-administered unicast MACs remain hardware binding
+//! evidence; unusable MACs are weak migration candidates only.
 //!
 //! ## What changed in v1.66.1
 //!
@@ -30,8 +30,8 @@
 //!   are untouched.
 //! - [`select_primary_mac`] filters the MAC enumeration on every platform, so a
 //!   placeholder / all-zero / multicast / locally-administered address never
-//!   becomes the selected identity. Even globally-administered MACs remain
-//!   weak because software can replay them on another host.
+//!   becomes the selected identity. Real globally-administered unicast MACs
+//!   remain hardware binding evidence for existing paid licenses.
 //! - [`fingerprint_candidates`] reproduces the values older builds computed on
 //!   this machine, retaining their strength classification. Weak historical
 //!   matches are isolated until the account holder approves a re-bind.
@@ -148,7 +148,7 @@ const STABLE_UUID_PREFIX: &str = "macos-uuid-v2:";
 fn build_fingerprint_candidates(hostname: &str, identity: &Identity) -> Vec<FingerprintCandidate> {
     let mut out = Vec::new();
     if let Some(uuid_identity) = identity.candidates.iter()
-        .find(|id| identity_strength(id) == FingerprintStrength::Hardware)
+        .find(|id| is_uuid_identity(id))
     {
         // Both the hash domain and the wire value are versioned. The wire
         // prefix makes this disjoint from all historical 32-hex fingerprints.
@@ -170,10 +170,17 @@ fn build_fingerprint_candidates(hostname: &str, identity: &Identity) -> Vec<Fing
     out
 }
 
+fn is_uuid_identity(identity: &str) -> bool {
+    identity.strip_prefix(UUID_IDENTITY_PREFIX).is_some_and(is_hardware_uuid)
+}
+
 fn identity_strength(identity: &str) -> FingerprintStrength {
-    // A globally-administered MAC can also be copied in software. Keep every
-    // MAC-derived hash for migration diagnostics, never as binding evidence.
-    if identity.strip_prefix(UUID_IDENTITY_PREFIX).is_some_and(is_hardware_uuid) {
+    // Keep real globally-administered unicast MACs as hardware evidence.
+    // Reuse selection's filter so historical placeholders, multicast and
+    // locally-administered MACs cannot bypass it through legacy candidates.
+    let usable_mac = identity.parse::<mac_address::MacAddress>()
+        .is_ok_and(|mac| is_usable_mac(&mac.bytes()));
+    if is_uuid_identity(identity) || usable_mac {
         FingerprintStrength::Hardware
     } else {
         FingerprintStrength::Weak
@@ -184,8 +191,11 @@ fn identity_strength(identity: &str) -> FingerprintStrength {
 /// candidate as evidence of a UUID binding: validation still requires equality.
 /// Old untagged UUID hashes cannot be distinguished from old MAC hashes.
 pub fn fingerprint_hardware_unavailable() -> bool {
-    cfg!(target_os = "macos") && !identity().candidates.iter()
-        .any(|id| identity_strength(id) == FingerprintStrength::Hardware)
+    cfg!(target_os = "macos") && !has_hardware_uuid(identity())
+}
+
+fn has_hardware_uuid(identity: &Identity) -> bool {
+    identity.candidates.iter().any(|id| is_uuid_identity(id))
 }
 
 /// Proposed binding for a refresh. The request must retain the installed
@@ -207,8 +217,8 @@ fn refresh_fingerprint_for(installed: &str, macos: bool, unavailable: bool,
 }
 
 /// `true` when neither a platform UUID nor a usable MAC address could be read,
-/// so the fingerprint is effectively "hostname only". A false value does not
-/// establish binding strength: MAC-backed candidates are still weak.
+/// so the fingerprint is effectively "hostname only". Individual historical
+/// candidates still require their own binding-strength classification.
 ///
 /// A *reported* degradation, never a silent one: the CLI (`license fingerprint`
 /// / `license status`) and the gateway surface it so a weak binding is never
@@ -568,7 +578,8 @@ mod tests {
     #[test]
     fn absent_mac_and_unusable_first_candidates_are_weak() {
         for legacy in [None, Some(LEGACY_ABSENT_MAC), Some("02:00:00:00:00:00"),
-            Some("01:00:5E:00:00:01"), Some("02:11:22:33:44:55")]
+            Some("FF:FF:FF:FF:FF:FF"), Some("01:00:5E:00:00:01"),
+            Some("02:11:22:33:44:55")]
         {
             let identity = Identity {
                 candidates: build_identity_candidates(None, None, legacy.map(str::to_string)),
@@ -584,8 +595,9 @@ mod tests {
     }
 
     #[test]
-    fn copied_hostname_and_mac_cannot_bind_on_another_host() {
-        for mac in ["D0:11:E5:DB:58:67", "02:11:22:33:44:55"] {
+    fn weak_macs_cannot_bind_on_another_host() {
+        for mac in [LEGACY_ABSENT_MAC, "02:00:00:00:00:00",
+            "FF:FF:FF:FF:FF:FF", "01:00:5E:00:00:01", "02:11:22:33:44:55"] {
             let owner = Identity {
                 candidates: build_identity_candidates(
                     Some("ioplatformuuid:11111111-2222-3333-4444-555555555555".into()),
@@ -622,6 +634,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn real_mac_paid_bindings_validate_without_uuid_on_linux_and_windows() {
+        for hostname in ["linux-host", "WINDOWS-PC"] {
+            for mac in ["D0:11:E5:DB:58:67", "00:11:22:33:44:55"] {
+                let identity = Identity {
+                    candidates: build_identity_candidates(None, Some(mac.into()), Some(mac.into())),
+                    hardware_bound: true,
+                };
+                let candidates = build_fingerprint_candidates(hostname, &identity);
+                let fingerprint = compute_fingerprint(&format!("{hostname}::{mac}"));
+                assert_eq!(candidates[0].fingerprint(), fingerprint);
+                assert_eq!(candidates[0].strength(), FingerprintStrength::Hardware);
+                assert!(!has_hardware_uuid(&identity));
+                assert!(candidates.iter().all(|c| !c.fingerprint().starts_with(STABLE_UUID_PREFIX)));
+                for tier in [crate::LicenseTier::Hobby, crate::LicenseTier::Solo,
+                    crate::LicenseTier::Studio, crate::LicenseTier::Business,
+                    crate::LicenseTier::Partner, crate::LicenseTier::PersonalProSelfHost,
+                    crate::LicenseTier::SelfHostPro, crate::LicenseTier::Oem]
+                {
+                    let license = crate::License::new("sub", "customer", tier,
+                        &fingerprint, chrono::Duration::days(30), "test");
+                    let matched = license.validate_any(&candidates, 7, 14).unwrap();
+                    assert_eq!(matched.fingerprint, fingerprint);
+                    assert!(!matched.legacy);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn macos_uuid_failure_never_proposes_mac_even_when_mac_is_hardware() {
+        let identity = sample_identity(false);
+        assert_eq!(identity_strength(&identity.candidates[0]), FingerprintStrength::Hardware);
+        assert!(!has_hardware_uuid(&identity));
+        assert!(matches!(refresh_fingerprint_for("installed", true,
+            !has_hardware_uuid(&identity), || panic!("no MAC proposal")),
+            Err(crate::LicenseError::HardwareIdentityUnavailable)));
+        assert!(has_hardware_uuid(&sample_identity(true)));
     }
 
     #[test]
@@ -1010,8 +1062,8 @@ mod tests {
 
     #[test]
     fn hostname_only_flag_agrees_with_the_resolved_identity() {
-        // This flag reports missing components, not binding strength; a usable
-        // MAC still produces only weak validation candidates.
+        // This flag reports the preferred identity. Historical candidates
+        // may still be weak even when a usable UUID or MAC is present.
         let resolved = identity();
         let first_is_hardware = resolved.candidates[0].starts_with(UUID_IDENTITY_PREFIX)
             || mac_address::MacAddress::try_from(resolved.candidates[0].as_str())
