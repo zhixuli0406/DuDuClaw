@@ -46,11 +46,13 @@ duduclaw start
   がある場合は、ライセンスの発行元が新しいマシンへ紐付け直す必要があります。
 - **チャンネルトークン**：channel bot tokenは暗号化された設定内にあり、一緒に移行される。IPや
   ドメインを変更した際は、webhook URLの更新を忘れないこと。
-- **EditionProfile**：gateway は次の順に判定します。まず `DUDUCLAW_EDITION` 環境変数（`personal` または
-  `enterprise`）、次にライセンスのティア（Business、OEM、Partner、Self-Host Pro は `enterprise`）、
-  どちらもなければ `personal` です。ダッシュボードの切り替えスイッチも設定ファイルのキーもありません。
-  `agent.toml [edition] profile` を読むコードは存在しません。該当ライセンスなしでセルフホスト環境を
-  エンタープライズとして動かすには、gateway の環境に `DUDUCLAW_EDITION=enterprise` を設定して再起動します。
+- **EditionProfile**：すべてのビルドで検証済みライセンスがエディションの上限を決めます
+  （Business、OEM、Partner、Self-Host Pro は `enterprise`）。有効なライセンスがなければ `personal` です。
+  `DUDUCLAW_EDITION`（`personal` または `enterprise`）は組み込みホストの `GatewayConfig.edition` より優先されますが、
+  どちらも上限を狭めることしかできません。昇格要求は無視され、入力元ごとにプロセス内で一度だけ警告します。
+  Business を `personal` に制限できますが、個人ライセンスを `enterprise` に昇格させることはできません。
+  Debug assertions が有効でも昇格は許可されず、テストでは一時的な署名済みライセンスを使います。専用テスト API は非デフォルトの `test-edition-override` feature と Debug assertions の両方を必要とし、release ビルドではこの feature を拒否します。ダッシュボードの切り替えスイッチはなく、
+  `agent.toml [edition] profile` も読み取られません。セルフホストの企業版には対応する有効なライセンスが必要です。
 
 ## ロードマップ（計画中）
 

@@ -101,7 +101,7 @@ mod tests {
         }).unwrap();
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
         handler.set_user_db(db.clone(), Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"))).await;
-        handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+        handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
         let mut ctx = UserContext::admin_fallback();
         ctx.user_id = admin.id;
         ctx.email = admin.email;

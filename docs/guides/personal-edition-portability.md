@@ -46,12 +46,15 @@ duduclaw start
   add-on module, the licence has to be rebound to the new machine by whoever issued it.
 - **Channel tokens**: channel bot tokens live inside the encrypted config and move along with
   everything else; remember to update the webhook URL when the IP or domain changes.
-- **EditionProfile**: the gateway resolves it in this order: the `DUDUCLAW_EDITION` environment
-  variable (`personal` or `enterprise`), then the licence tier (Business, OEM, Partner and
-  Self-Host Pro imply `enterprise`), then `personal`. There is no dashboard switch and no
-  config-file key: `agent.toml [edition] profile` is not read by anything. To run a self-hosted
-  install as enterprise without such a licence, set `DUDUCLAW_EDITION=enterprise` in the
-  gateway's environment and restart it.
+- **EditionProfile**: all builds derive the maximum edition from the verified licence
+  (Business, OEM, Partner and Self-Host Pro allow `enterprise`). A missing or invalid licence
+  means `personal`. `DUDUCLAW_EDITION` (`personal` or `enterprise`) takes precedence over an
+  embedding host's `GatewayConfig.edition`, but both can only narrow that maximum; an attempted
+  elevation is ignored with one warning per source per process. For example, `personal` can
+  restrict a Business install, while `enterprise` cannot upgrade a Personal install.
+  Debug assertions do not allow elevation; tests use signed temporary licences. The separate fixture API requires the non-default `test-edition-override` feature and debug assertions, and release builds reject that feature. There is no dashboard switch or
+  config-file key: `agent.toml [edition] profile` is not read. Self-hosted enterprise operation
+  requires a valid licence with that entitlement.
 
 ## Roadmap (planned)
 

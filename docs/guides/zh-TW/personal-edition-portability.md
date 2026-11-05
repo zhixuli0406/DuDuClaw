@@ -41,10 +41,12 @@ duduclaw start
 - **授權**：`license.json` 綁定機器指紋（hostname + MAC）。換機器後個人版核心照常運作（Apache 2.0），
   若有 Pro 加值模組，需要由發出授權的一方把授權重新綁定到新機器。
 - **頻道 token**：channel bot token 在加密設定內，會一起搬過去；換 IP/網域時記得更新 webhook URL。
-- **EditionProfile**：gateway 依序判定：先看 `DUDUCLAW_EDITION` 環境變數（`personal` 或 `enterprise`），
-  再看授權方案（Business、OEM、Partner、Self-Host Pro 視為 `enterprise`），都沒有就是 `personal`。
-  儀表板沒有切換開關，設定檔也沒有對應的鍵：`agent.toml [edition] profile` 沒有任何程式讀取。
-  沒有上述授權、又要讓自架環境以企業版執行，請在 gateway 的環境加上 `DUDUCLAW_EDITION=enterprise` 後重新啟動。
+- **EditionProfile**：所有建置以有效授權決定版本上限（Business、OEM、Partner、Self-Host Pro 可用 `enterprise`），
+  沒有有效授權時使用 `personal`。`DUDUCLAW_EDITION`（`personal` 或 `enterprise`）優先於嵌入主程式的
+  `GatewayConfig.edition`，兩者都只能縮限授權允許的版本；要求升級時會忽略該值，每個來源每個行程警告一次。
+  例如 Business 授權可用 `personal` 降級，個人授權不能用 `enterprise` 升級。
+  啟用 Debug assertions 也不能升級；測試使用臨時簽署授權。獨立測試 API 必須同時啟用非預設的 `test-edition-override` feature 與 Debug assertions，release 建置拒絕該 feature。儀表板沒有切換開關，`agent.toml [edition] profile` 也沒有程式讀取；
+  自架企業版需要具備該權益的有效授權。
 
 ## 路線圖（規劃中）
 

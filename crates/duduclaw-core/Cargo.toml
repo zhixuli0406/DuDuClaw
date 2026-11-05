@@ -40,6 +40,8 @@ unicode-normalization = "0.1.25"
 
 [features]
 default = []
+# Explicit fixture API only; production resolution never elevates.
+test-edition-override = []
 # Synthetic root-key intake for dependent-crate debug tests only.
 test-root-key = []
 # Synthetic policy for dependent-crate debug tests; ineffective in release libraries/binaries.

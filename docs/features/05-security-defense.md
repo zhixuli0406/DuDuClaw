@@ -1,5 +1,7 @@
 # Security Defense
 
+All builds cap the management edition at the verified licence entitlement. `DUDUCLAW_EDITION` and the embedding host’s edition setting can only narrow it; attempted elevation is ignored with one warning per source per process. Missing or invalid licences resolve to Personal, including for `users.*` and `departments.*` RPC gates. The production resolver never permits elevation, even with debug assertions enabled. An explicit fixture API requires the non-default `test-edition-override` feature and debug assertions; release builds reject this feature.
+
 Enterprise [team-history API](68-manager-team-history.md) (v1.76.0): live reporting-line checks are independent of ordinary agent access; external transcripts require read-time masking and every disclosure requires a durable chained audit. A disabled setting, uncertain origin, installed-model failure or audit failure cannot return transcript content. Regex-only operation explicitly reports `ner: false` and can leave names/addresses visible. Direct host/database access remains outside this product boundary.
 
 > Four live guards, where each one runs, and what none of them covers.

@@ -215,7 +215,7 @@ mod tests {
             let admin = db.create_user("computer-admin@test.invalid", "Admin", "isolated-test-password", UserRole::Admin).unwrap();
             let admin = db.live_user_context(&admin.id).unwrap().unwrap();
             for edition in [duduclaw_core::EditionProfile::Enterprise, duduclaw_core::EditionProfile::Personal] {
-                handler.set_edition_override(Some(edition)).await;
+                handler.set_test_edition(Some(edition)).await;
                 for method in ["computer_sessions.resume", "computer_sessions.hand_back"] {
                     let frame = handler.handle(method, json!({"agent_id": "main-target"}), &manager).await;
                     assert!(matches!(&frame, WsFrame::Response { ok: false, error: Some(e), .. }

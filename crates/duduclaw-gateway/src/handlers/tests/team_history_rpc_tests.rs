@@ -119,7 +119,7 @@ async fn fixture_with_manager_id(manager_id: Option<&str>) -> Fx {
         .unwrap();
     let handler = MethodHandler::new(home.path().into()).await;
     handler
-        .set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise))
+        .set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise))
         .await;
     handler
         .set_user_db(

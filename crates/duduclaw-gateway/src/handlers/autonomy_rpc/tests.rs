@@ -41,7 +41,7 @@ async fn fixture() -> Fixture {
         &home.join("agents"), "sales", "Sales", "@sales", "specialist", "",
     );
     let handler = MethodHandler::new(home.clone()).await;
-    handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
     Fixture {
         _dir: dir,
         home,

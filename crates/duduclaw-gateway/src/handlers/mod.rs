@@ -286,10 +286,11 @@ pub struct MethodHandler {
     jwt_config: RwLock<Option<Arc<JwtConfig>>>,
     /// Plugin extension point (NullExtension by default).
     extension: Arc<dyn GatewayExtension>,
-    /// Explicit product form-factor override, injected after gateway start by
-    /// the Cloud control-plane. `None` → resolve per-request from
-    /// `DUDUCLAW_EDITION` env > license tier > `Personal`.
+    /// Product form-factor restriction injected after gateway start. Both this
+    /// value and `DUDUCLAW_EDITION` are always capped by the license.
     edition_override: RwLock<Option<duduclaw_core::EditionProfile>>,
+    #[cfg(test)]
+    edition_fixture_runtime: RwLock<Option<crate::license_runtime::LicenseRuntime>>,
     /// Active interactive CLI-login sessions ("Dashboard 一鍵登入"), keyed by
     /// session id. Each drives a CLI's native login command in a PTY.
     cli_auth_sessions: RwLock<std::collections::HashMap<String, (String, Arc<crate::cli_auth::AuthSession>)>>,
