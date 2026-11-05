@@ -257,10 +257,11 @@ fn maybe_proxy_mcp_config_with_agent_dir(
             home_dir, &agent_id, "cannot verify MCP secret owner outside an employee directory", explore_lane,
         ));
     }
-    if purpose.none() && preserve_cli_discovery {
+    let self_exe = duduclaw_core::resolve_duduclaw_bin();
+    let has_bridge = duduclaw_core::mcp_proxy_rewrite::has_remote_bridge_entries(&parsed, &self_exe);
+    if purpose.none() && preserve_cli_discovery && !has_bridge {
         return Ok(None);
     }
-    let self_exe = duduclaw_core::resolve_duduclaw_bin();
     let own_server = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(
         home_dir, &agent_id, &self_exe,
     );
@@ -272,7 +273,7 @@ fn maybe_proxy_mcp_config_with_agent_dir(
             audit_dropped_remote_entries(home_dir, &agent_id, &dropped, explore_lane);
             Ok(guard)
         }
-        Err(e) if purpose.tool_gate || purpose.secret_env || !preserve_cli_discovery => {
+        Err(e) if purpose.tool_gate || purpose.secret_env || has_bridge || !preserve_cli_discovery => {
             Err(refuse_gate_config_unavailable(home_dir, &agent_id, &e, explore_lane))
         }
         Err(e) => {
@@ -595,7 +596,8 @@ fn write_gated_mcp_config_value(
     let third_party = parsed.get("mcpServers").and_then(Value::as_object)
         .is_some_and(|servers| servers.keys().any(|name|
             !duduclaw_core::mcp_proxy_rewrite::is_builtin_slot_name(name)));
-    if (preserve_cli_discovery && (purpose.none() || !third_party)) || &rewrite.config == parsed {
+    let has_bridge = duduclaw_core::mcp_proxy_rewrite::has_remote_bridge_entries(parsed, self_exe);
+    if (preserve_cli_discovery && ((purpose.none() && !has_bridge) || !third_party)) || &rewrite.config == parsed {
         debug!("mcp-proxy: nothing to proxy in this .mcp.json");
         return Ok((None, Vec::new()));
     }
@@ -1191,6 +1193,30 @@ mod mcp_config_proxy_tests {
             assert!(!error.contains("secret://"));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
         }
+    }
+
+    #[test]
+    fn remote_bridge_is_signed_when_all_proxy_purposes_are_off() {
+        let home = tempfile::tempdir().unwrap();
+        duduclaw_core::ensure_identity_key(home.path()).unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "[redaction]\nenabled=false\n[security]\negress_guard='off'\n").unwrap();
+        let path = agent_mcp_path(home.path());
+        let own = canonical_builtin(home.path());
+        let agent = own["env"]["DUDUCLAW_AGENT_ID"].as_str().unwrap();
+        let raw = json!({"mcpServers": {
+            "duduclaw": own,
+            "remote": {"command":duduclaw_core::resolve_duduclaw_bin(),
+                "args":["mcp-remote-bridge","--agent",agent,"--server","remote"]}
+        }}).to_string();
+        std::fs::write(&path, &raw).unwrap();
+        let rewritten = maybe_proxy_mcp_config(home.path(), &path).unwrap().expect("signed bridge config");
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&rewritten).unwrap()).unwrap();
+        let env = &config["mcpServers"]["remote"]["env"];
+        assert_eq!(duduclaw_core::identity_token::verify_claim(home.path(), agent,
+            env["DUDUCLAW_AGENT_TOKEN"].as_str().unwrap(), true),
+            duduclaw_core::IdentityVerdict::Verified);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
     }
 
     #[test]

@@ -36,7 +36,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
 use url::Url;
 
-use super::connect::{AuthError, UpstreamAuth, upstream_auth};
+use super::connect::{AuthError, UpstreamAuth, upstream_auth_for_bridge};
 use super::url_policy::{OutboundPolicy, pinned_client};
 
 /// Protocol version announced by the connection probe.
@@ -62,6 +62,7 @@ struct ClientCache {
 struct Bridge {
     home: PathBuf,
     agent_id: String,
+    agent_token: String,
     server: String,
     session: Mutex<Session>,
     clients: Mutex<ClientCache>,
@@ -99,7 +100,20 @@ fn classify(frame: &Value) -> Kind {
     }
 }
 
+pub(super) fn verify_identity(home: &Path, agent_id: &str, token: &str) -> Result<(), String> {
+    if duduclaw_core::verify_identity_claim(home, agent_id, token, true)
+        != duduclaw_core::IdentityVerdict::Verified
+    {
+        return Err("MCP remote bridge identity rejected".into());
+    }
+    Ok(())
+}
+
 impl Bridge {
+    fn verify_identity(&self) -> Result<(), String> {
+        verify_identity(&self.home, &self.agent_id, &self.agent_token)
+    }
+
     fn emit(&self, line: String) {
         let _ = self.out.send(line);
     }
@@ -110,7 +124,8 @@ impl Bridge {
         } else {
             None
         };
-        let a = upstream_auth(&self.home, &self.agent_id, &self.server, force, seen.as_deref()).await?;
+        self.verify_identity().map_err(AuthError::Transient)?;
+        let a = upstream_auth_for_bridge(&self.home, &self.agent_id, &self.server, &self.agent_token, force, seen.as_deref()).await?;
         *self.last_auth.lock().await = Some(a.clone());
         Ok(a)
     }
@@ -146,6 +161,7 @@ impl Bridge {
                 req = req.header("MCP-Protocol-Version", v);
             }
         }
+        self.verify_identity()?;
         if let Some(permit) = permit {
             if !permit.is_live() { return Err("Tool call expired before dispatch".into()); }
             // No await between the phase change and the potentially partial send.
@@ -172,6 +188,10 @@ impl Bridge {
             return;
         }
         let kind = classify(&frame);
+        if let Err(message) = self.verify_identity() {
+            if let Kind::Request(id) = &kind { self.emit(error_frame(id, &message)); }
+            return;
+        }
         if let Kind::Request(id) = &kind {
             if crate::third_party_tools::bridge_reserved_id(id) {
                 self.emit(crate::third_party_tools::refusal_frame(id,
@@ -458,6 +478,7 @@ impl Bridge {
             if let Some(id) = last_event_id {
                 req = req.header("Last-Event-ID", id);
             }
+            self.verify_identity().map_err(|_| GetStreamError::Fatal("identity rejected"))?;
             let resp = req.send().await.map_err(|_| GetStreamError::Transient)?;
             if resp.status().as_u16() == 401 && !forced {
                 forced = true;
@@ -492,6 +513,7 @@ impl Bridge {
             client.delete(auth.url.clone()).header("Mcp-Session-Id", sid),
             &auth,
         );
+        if self.verify_identity().is_err() { return; }
         let _ = tokio::time::timeout(Duration::from_secs(5), req.send()).await;
     }
 
@@ -644,11 +666,19 @@ pub(crate) fn event_data(event: &[u8]) -> Option<String> {
 }
 
 /// Run the bridge until `input` ends. Returns the process exit code.
-pub async fn run_bridge<R, W>(home: &Path, agent_id: &str, server: &str, input: R, mut output: W) -> i32
+/// `agent_token` must be the host-signed token for `agent_id`; the CLI obtains
+/// it only after checking the ambient identity against --agent. Library callers
+/// must supply the same credential. Every use rechecks the current signing key.
+pub async fn run_bridge<R, W>(home: &Path, agent_id: &str, server: &str, agent_token: &str, input: R, mut output: W) -> i32
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    // This check precedes even the first remote store read (including flags).
+    if let Err(e) = verify_identity(home, agent_id, agent_token) {
+        tracing::error!(error = %e, "mcp-remote-bridge: identity rejected");
+        return 2;
+    }
     if let Err(e) = super::store::validate_ids(agent_id, server) {
         tracing::error!(error = %e, "mcp-remote-bridge: invalid arguments");
         return 2;
@@ -667,6 +697,7 @@ where
     let bridge = Arc::new(Bridge {
         home: home.to_path_buf(),
         agent_id: agent_id.to_string(),
+        agent_token: agent_token.to_string(),
         server: server.to_string(),
         session: Mutex::new(Session { session_id: None, protocol_version: None }),
         clients: Mutex::new(ClientCache { client: None }),
@@ -737,6 +768,51 @@ where
 mod tests {
     use super::*;
 
+    fn signed_token(home: &Path) -> String {
+        let key = duduclaw_core::ensure_identity_key(home).unwrap();
+        duduclaw_core::mint_identity_token(&key, "a1")
+    }
+
+    #[tokio::test]
+    async fn bridge_refuses_missing_wrong_and_forged_tokens_before_reading_input_or_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = signed_token(dir.path());
+        for (agent, token) in [("a1", ""), ("other", token.as_str()), ("a1", "forged")] {
+            // A pending reader would hang if the bridge passed its startup gate.
+            let (input, _peer) = tokio::io::duplex(64);
+            let code = tokio::time::timeout(Duration::from_secs(1), run_bridge(
+                dir.path(), agent, "remote", token, tokio::io::BufReader::new(input), tokio::io::sink(),
+            )).await.expect("invalid identities must be refused before reading input");
+            assert_eq!(code, 2);
+            assert!(!super::super::store::store_path(dir.path()).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_rechecks_identity_for_frames_after_key_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = signed_token(dir.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let bridge = Bridge {
+            home: dir.path().to_path_buf(), agent_id: "a1".into(), agent_token: token,
+            server: "remote".into(),
+            session: Mutex::new(Session { session_id: None, protocol_version: None }),
+            clients: Mutex::new(ClientCache { client: None }),
+            last_auth: Mutex::new(None), out: tx,
+            gate: crate::third_party_tools::ThirdPartyGate::new(dir.path(), "a1", "remote", "bridge"),
+            server_stream: false,
+        };
+        assert!(bridge.verify_identity().is_ok());
+        std::fs::remove_file(duduclaw_core::identity_key_path(dir.path())).unwrap();
+        bridge.forward(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string()).await;
+        let response: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["error"]["message"], "MCP remote bridge identity rejected");
+        assert!(bridge.clients.lock().await.client.is_none());
+        assert!(bridge.auth(false).await.is_err());
+        assert!(!super::super::store::store_path(dir.path()).exists());
+    }
+
     #[test]
     fn sse_events_are_split_and_data_joined() {
         let buf = b"event: message\ndata: {\"a\":1}\n\ndata: {\"b\":\r\ndata: 2}\r\n\r\npartial";
@@ -769,7 +845,7 @@ mod tests {
             input.push('\n');
         }
         let (client, server) = tokio::io::duplex(64 * 1024);
-        assert_eq!(run_bridge(dir.path(), "a1", "remote", input.as_bytes(), server).await, 0);
+        assert_eq!(run_bridge(dir.path(), "a1", "remote", &signed_token(dir.path()), input.as_bytes(), server).await, 0);
         let mut out = String::new();
         let mut reader = tokio::io::BufReader::new(client);
         use tokio::io::AsyncReadExt;
@@ -789,7 +865,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n";
         let (client, server) = tokio::io::duplex(64 * 1024);
-        let code = run_bridge(dir.path(), "a1", "remote", &input[..], server).await;
+        let code = run_bridge(dir.path(), "a1", "remote", &signed_token(dir.path()), &input[..], server).await;
         assert_eq!(code, 0);
         let mut out = String::new();
         let mut r = tokio::io::BufReader::new(client);

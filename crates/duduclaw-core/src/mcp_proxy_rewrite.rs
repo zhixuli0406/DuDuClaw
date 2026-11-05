@@ -13,7 +13,7 @@
 //! - **Redaction** (RFC-23 §13.6): every third-party stdio entry is wrapped,
 //!   bridges included, because the bridge itself does not redact.
 //! - **Third-party tool gate** (2026-10-08: `action_rules`, explore lane):
-//!   bridges are left alone, because the bridge applies the same gate itself
+//!   bridges get host-signed env without a proxy, because they apply the same gate themselves
 //!   and wrapping it would ask twice; direct remote entries (`url` / `type`)
 //!   are removed, because nothing can gate them
 //!   ([`rewrite_mcp_config_for_gate`]).
@@ -247,8 +247,9 @@ impl ProxyPurpose {
 ///
 /// Built-in slots are replaced with `own_server`. Left untouched: `type` /
 /// `url` entries (no child
-/// process to wrap), entries with no `command`, and, when redaction is not a purpose, remote
-/// bridge entries. The original `env` map rides along in
+/// process to wrap) and entries with no `command`. Native bridges always get
+/// host-generated identity env; when redaction is not a purpose they need no
+/// wrapper unless raw secret refs requested one. Other entries' original `env` maps ride in
 /// [`PROXY_UPSTREAM_ENV_VAR`] rather than in argv.
 pub fn rewrite_mcp_config_for_proxy_with(json: &Value, self_exe: &Path, purpose: ProxyPurpose, own_server: &Value) -> Result<Value, String> {
     Ok(rewrite_mcp_config_for_gate(json, self_exe, purpose, own_server)?.config)
@@ -330,6 +331,26 @@ fn rewrite_mcp_config_with_slots(json: &Value, self_exe: &Path, purpose: ProxyPu
         if has_private_env(&def) {
             return Err(format!("MCP server '{name}': raw configuration contains a proxy or untrusted host identity"));
         }
+        let bridge = is_remote_bridge_entry(&def, self_exe);
+        if bridge {
+            let agent = own_server["env"][crate::ENV_AGENT_ID].as_str()
+                .ok_or_else(|| format!("MCP server '{name}': host identity is unavailable"))?;
+            // A raw entry cannot select a different employee or add CLI flags.
+            if def.get("args") != Some(&json!([REMOTE_BRIDGE_SUBCOMMAND, "--agent", agent, "--server", name]))
+                || ["cwd", "url", "type", "shell"].iter().any(|key| def.get(key).is_some())
+            {
+                return Err(format!("MCP server '{name}': remote bridge target does not match the host employee"));
+            }
+            if !purpose.redaction && !server_has_secret_refs(&def) {
+                // Sign only the exact host binary. Discard raw env wholesale:
+                // a loader override must not receive a host identity token.
+                servers.insert(name.clone(), json!({
+                    "command": exe, "args": def["args"],
+                    "env": bridge_env(own_server),
+                }));
+                continue;
+            }
+        }
         if purpose.none() {
             continue;
         }
@@ -352,15 +373,6 @@ fn rewrite_mcp_config_with_slots(json: &Value, self_exe: &Path, purpose: ProxyPu
         let Some(command) = def.get("command").and_then(|c| c.as_str()) else {
             continue;
         };
-        let orig_args: Vec<String> = def
-            .get("args")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-            .unwrap_or_default();
-        if !purpose.redaction && !server_has_secret_refs(&def) && is_remote_bridge_invocation(command, &orig_args, self_exe) {
-            continue;
-        }
-
         let mut args = vec![
             json!("mcp-proxy"),
             json!("--server"),
@@ -372,11 +384,14 @@ fn rewrite_mcp_config_with_slots(json: &Value, self_exe: &Path, purpose: ProxyPu
             args.extend(orig.iter().cloned());
         }
 
-        let original_env = def
-            .get("env")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Map::new()));
-        let mut env = carry.clone();
+        let original_env = if bridge {
+            // The native bridge reads remote credentials from its store. Raw
+            // env (especially loader overrides) must not accompany its token.
+            Value::Object(Map::new())
+        } else {
+            def.get("env").cloned().unwrap_or_else(|| Value::Object(Map::new()))
+        };
+        let mut env = if bridge { bridge_env(own_server) } else { carry.clone() };
         env.insert(
             PROXY_UPSTREAM_ENV_VAR.to_string(),
             Value::String(original_env.to_string()),
@@ -389,6 +404,32 @@ fn rewrite_mcp_config_with_slots(json: &Value, self_exe: &Path, purpose: ProxyPu
     }
     dropped_remote.sort();
     Ok(ProxyRewrite { config: out, dropped_remote })
+}
+
+/// Whether the raw config contains this binary's bridge, including malformed
+/// targets that the rewrite must refuse rather than bypassing its validation.
+pub fn has_remote_bridge_entries(config: &Value, self_exe: &Path) -> bool {
+    config.get("mcpServers").and_then(Value::as_object)
+        .is_some_and(|servers| servers.values().any(|def| is_remote_bridge_entry(def, self_exe)))
+}
+
+fn is_remote_bridge_entry(def: &Value, self_exe: &Path) -> bool {
+    def.get("command").and_then(Value::as_str) == self_exe.to_str()
+        && def.get("args").and_then(Value::as_array)
+            .and_then(|args| args.first()).and_then(Value::as_str) == Some(REMOTE_BRIDGE_SUBCOMMAND)
+}
+
+/// Per-spawn bridge identity comes only from the host's canonical definition.
+/// A proxy wrapping the bridge needs this same pair to pass to its child.
+fn bridge_env(own_server: &Value) -> Map<String, Value> {
+    let mut env = carry_env(own_server);
+    if let Some(token) = own_server.get("env")
+        .and_then(|env| env.get(crate::identity_token::ENV_AGENT_TOKEN))
+        .filter(|token| token.is_string())
+    {
+        env.insert(crate::identity_token::ENV_AGENT_TOKEN.into(), token.clone());
+    }
+    env
 }
 
 /// Only the host's canonical definition supplies identity and home.
@@ -431,7 +472,62 @@ mod tests {
         let red = rewrite_mcp_config_for_proxy_with(&cfg(exe), p, ProxyPurpose { redaction: true, tool_gate: false, secret_env: false }, &cfg(exe)["mcpServers"]["duduclaw"]).unwrap();
         assert_eq!(red["mcpServers"]["zap"]["args"][0], "mcp-proxy");
         let none = rewrite_mcp_config_for_proxy_with(&cfg(exe), p, ProxyPurpose { redaction: false, tool_gate: false, secret_env: false }, &cfg(exe)["mcpServers"]["duduclaw"]).unwrap();
-        assert_eq!(none, cfg(exe));
+        assert_eq!(none["mcpServers"]["pg"], cfg(exe)["mcpServers"]["pg"]);
+        assert_eq!(none["mcpServers"]["zap"]["env"]["DUDUCLAW_AGENT_TOKEN"], "t");
+        assert_eq!(red["mcpServers"]["zap"]["env"]["DUDUCLAW_AGENT_TOKEN"], "t");
+    }
+
+    #[test]
+    fn remote_bridge_gets_verified_host_identity_even_without_proxy_purposes() {
+        let home = tempfile::tempdir().unwrap();
+        crate::identity_token::ensure_key(home.path()).unwrap();
+        let exe = Path::new("/opt/duduclaw");
+        let own = canonical_duduclaw_server(home.path(), "a1", exe);
+        let mut raw = cfg(exe.to_str().unwrap());
+        raw["mcpServers"]["zap"]["env"] = json!({
+            "DUDUCLAW_HOME": "/wrong-home", "LD_PRELOAD": "/tmp/evil.so",
+        });
+        for purpose in [
+            ProxyPurpose { redaction: false, tool_gate: false, secret_env: false },
+            ProxyPurpose { redaction: false, tool_gate: true, secret_env: false },
+            ProxyPurpose { redaction: true, tool_gate: true, secret_env: false },
+        ] {
+            let out = rewrite_mcp_config_for_gate(&raw, exe, purpose, &own).unwrap().config;
+            let env = &out["mcpServers"]["zap"]["env"];
+            assert_eq!(env["DUDUCLAW_HOME"], own["env"]["DUDUCLAW_HOME"]);
+            assert_eq!(env["DUDUCLAW_AGENT_ID"], "a1");
+            assert_eq!(crate::identity_token::verify_claim(home.path(), "a1",
+                env["DUDUCLAW_AGENT_TOKEN"].as_str().unwrap(), true),
+                crate::identity_token::IdentityVerdict::Verified);
+            assert!(env.get("LD_PRELOAD").is_none());
+            if let Some(encoded) = env.get(PROXY_UPSTREAM_ENV_VAR) {
+                assert_eq!(encoded, "{}");
+            }
+            assert!(out["mcpServers"]["pg"]["env"].get("DUDUCLAW_AGENT_TOKEN").is_none());
+            // The raw file remains identity-free; signed output is not raw input.
+            assert!(raw["mcpServers"]["zap"]["env"].get("DUDUCLAW_AGENT_TOKEN").is_none());
+        }
+    }
+
+    #[test]
+    fn remote_bridge_refuses_forged_targets_and_raw_identity() {
+        let exe = Path::new("/opt/duduclaw");
+        let own = cfg(exe.to_str().unwrap())["mcpServers"]["duduclaw"].clone();
+        let none = ProxyPurpose { redaction: false, tool_gate: false, secret_env: false };
+        for args in [
+            json!([REMOTE_BRIDGE_SUBCOMMAND, "--agent", "victim", "--server", "zap"]),
+            json!([REMOTE_BRIDGE_SUBCOMMAND, "--agent", "a1", "--server", "other"]),
+            json!([REMOTE_BRIDGE_SUBCOMMAND, "--agent", "a1", "--server", "zap", "--help"]),
+        ] {
+            let raw = json!({"mcpServers":{"zap":{"command":exe,"args":args}}});
+            assert!(rewrite_mcp_config_for_gate(&raw, exe, none, &own).is_err());
+        }
+        let mut raw = cfg(exe.to_str().unwrap());
+        raw["mcpServers"]["zap"]["env"] = json!({"DUDUCLAW_AGENT_ID":"a1", "DUDUCLAW_AGENT_TOKEN":"forged"});
+        assert!(rewrite_mcp_config_for_gate(&raw, exe, none, &own).is_err());
+        raw["mcpServers"]["zap"] = json!({"command":"/tmp/evil", "args":[REMOTE_BRIDGE_SUBCOMMAND]});
+        let out = rewrite_mcp_config_for_gate(&raw, exe, none, &own).unwrap().config;
+        assert!(out["mcpServers"]["zap"].get("env").is_none());
     }
 
     #[test]
@@ -464,7 +560,7 @@ mod tests {
             ProxyPurpose { redaction: false, tool_gate: false, secret_env: true }, &cfg(exe.to_str().unwrap())["mcpServers"]["duduclaw"]).unwrap();
         assert_eq!(out.config["mcpServers"]["zap"]["args"][0], "mcp-proxy");
         assert_eq!(out.dropped_remote, vec!["web"]);
-        assert!(has_mcp_secret_refs(&out.config));
+        assert!(!has_mcp_secret_refs(&out.config), "native bridge env comes only from the host");
         assert!(!has_unrouted_mcp_secret_refs(&out.config));
         assert_eq!(out.config["mcpServers"]["duduclaw"], config["mcpServers"]["duduclaw"]);
     }

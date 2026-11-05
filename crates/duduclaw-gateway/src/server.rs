@@ -192,6 +192,17 @@ struct AppState {
     home_dir: std::path::PathBuf,
 }
 
+/// Identity policy and initial key creation are mandatory startup gates.
+fn prepare_identity_key(home: &std::path::Path) -> std::io::Result<()> {
+    let strict = duduclaw_core::require_identity_token_from_home(home)?;
+    if !strict {
+        tracing::warn!("MCP identity-token grace period is active; unverified employee claims are accepted only until identity_token_grace_until. Re-enable require_identity_token after upgrading agent configs.");
+    }
+    duduclaw_core::ensure_identity_key(home)?;
+    info!(require_identity_token = strict, "MCP caller-identity signing key ready");
+    Ok(())
+}
+
 /// Check any existing identity-store entry before schema initialization can
 /// create a symlink target and obscure the original unreadable policy state.
 fn precheck_identity_policy(home: &std::path::Path, personal: bool) -> Result<(), String> {
@@ -705,26 +716,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // block is assembled, so every `.mcp.json` / runtime config written later
     // in this boot carries a signable `DUDUCLAW_AGENT_TOKEN`. Never rotates an
     // existing key (that would invalidate tokens held by live CLI children).
-    // Failure is warn-not-fatal: no key ⇒ `IdentityVerdict::Disabled` ⇒ the
-    // pre-WP21 behaviour, which is exactly the right degradation.
-    match duduclaw_core::ensure_identity_key(&home_dir) {
-        Ok(_) => {
-            let strict = duduclaw_core::require_identity_token_from_home(&home_dir);
-            info!(
-                require_identity_token = strict,
-                "MCP caller-identity signing key ready ({})",
-                duduclaw_core::identity_key_path(&home_dir).display()
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "could not create the MCP caller-identity key — caller ids stay \
-                 unverified (env-var impersonation remains possible); this does \
-                 not affect any other functionality"
-            );
-        }
-    }
+    prepare_identity_key(&home_dir).map_err(|e| {
+        duduclaw_core::error::DuDuClawError::Gateway(format!(
+            "MCP identity initialization failed; repair the identity policy/key before restarting: {e}"
+        ))
+    })?;
 
     // WP22 T1 — bootstrap `<home>/org.toml`, the authoritative record of who
     // reports to whom. Seeding happens **once**, only when the file is absent:
@@ -19107,3 +19103,30 @@ mod remembered_sessions;
 mod server_mfa_email;
 #[path = "server_mfa_passkey.rs"]
 mod server_mfa_passkey;
+
+#[cfg(test)]
+mod identity_key_startup_tests {
+    use super::prepare_identity_key;
+
+    #[test]
+    fn initial_key_failure_aborts_gateway_preparation() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("identity.key")).unwrap();
+        assert!(prepare_identity_key(home.path()).is_err());
+    }
+
+    #[test]
+    fn missing_initialized_key_and_bad_policy_abort_gateway_preparation() {
+        let home = tempfile::tempdir().unwrap();
+        prepare_identity_key(home.path()).unwrap();
+        std::fs::remove_file(home.path().join("identity.key")).unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "[delegation]\nrequire_identity_token = false\n").unwrap();
+        assert!(prepare_identity_key(home.path()).is_err());
+        let fresh = tempfile::tempdir().unwrap();
+        std::fs::write(fresh.path().join("config.toml"),
+            "[delegation]\nrequire_identity_token = 'false'\n").unwrap();
+        assert!(prepare_identity_key(fresh.path()).is_err());
+        assert!(!fresh.path().join("identity.key").exists());
+    }
+}

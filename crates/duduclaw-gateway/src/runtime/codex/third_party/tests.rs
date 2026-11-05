@@ -107,6 +107,43 @@ fn config_toml_holds_duduclaw_and_the_proxied_third_party_server() {
     assert!(!CodexRuntime::write_spawn_mcp_config(&dir, &own, &servers).unwrap());
 }
 
+#[test]
+fn signed_bridge_identity_is_per_spawn_only_in_codex() {
+    let body = json!({"mcpServers": {
+        "bridge": {"command":EXE,
+            "args":["mcp-remote-bridge","--agent","trader","--server","bridge"]}
+    }}).to_string();
+    let (home, dir) = employee(Some(&body));
+    let own = own_server(home.path());
+    let mut servers = gated_servers(&dir, home.path(), &own, false).unwrap();
+    let mut wrapped = servers["bridge"].clone();
+    wrapped.args = vec!["mcp-proxy".into(), "--server".into(), "wrapped".into(),
+        "--".into(), EXE.into(), "mcp-remote-bridge".into(), "--agent".into(),
+        "trader".into(), "--server".into(), "wrapped".into()];
+    wrapped.env.insert(PROXY_UPSTREAM_ENV_VAR.into(), "{}".into());
+    servers.insert("wrapped".into(), wrapped);
+
+    assert!(CodexRuntime::write_spawn_mcp_config(&dir, &own, &servers).unwrap());
+    let config = config_toml(&dir);
+    for name in ["bridge", "wrapped"] {
+        let env = config["mcp_servers"][name]["env"].as_table().unwrap();
+        assert!(!env.contains_key(duduclaw_core::ENV_AGENT_TOKEN));
+        assert!(!env.contains_key(PROXY_UPSTREAM_ENV_VAR));
+        assert_eq!(env["DUDUCLAW_AGENT_ID"].as_str(), Some("trader"));
+    }
+    // This changes only third-party entries, not the existing built-in writer.
+    assert_eq!(config["mcp_servers"]["duduclaw"]["env"]["DUDUCLAW_AGENT_TOKEN"].as_str(),
+        Some("mac-do-not-forward"));
+    let overrides = override_args(&servers, true, None, &[], home.path()).unwrap();
+    assert!(overrides.process_env.iter().any(|(key, value)|
+        key == duduclaw_core::ENV_AGENT_TOKEN && value == "mac-do-not-forward"));
+    for name in ["bridge", "wrapped"] {
+        assert!(overrides.args.iter().any(|arg|
+            arg.starts_with(&format!("mcp_servers.{name}.env_vars="))
+                && arg.contains(duduclaw_core::ENV_AGENT_TOKEN)));
+    }
+}
+
 /// M2: written owner-only from creation, and an up-to-date file that lost
 /// its owner-only mode is reset to it.
 #[cfg(unix)]
@@ -252,7 +289,7 @@ fn ungateable_entries_are_dropped_never_passed_through() {
         bridge_env.get("DUDUCLAW_MCP_API_KEY").map(String::as_str),
         Some(API_KEY)
     );
-    assert!(!bridge_env.contains_key("DUDUCLAW_AGENT_TOKEN"));
+    assert_eq!(bridge_env.get("DUDUCLAW_AGENT_TOKEN").map(String::as_str), Some("mac-do-not-forward"));
     assert_eq!(servers["spoofed_bridge"].args[0], "mcp-proxy");
 }
 

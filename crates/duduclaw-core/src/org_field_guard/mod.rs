@@ -283,8 +283,12 @@ pub fn classify_identity_surface(file_path: &Path, home: &Path) -> Option<Protec
     let file_name = file_path.file_name()?.to_str()?;
     let normalized = lexical_normalize(file_path);
 
-    if file_name.eq_ignore_ascii_case(crate::identity_token::IDENTITY_KEY_FILE) {
-        let expected = lexical_normalize(&home.join(crate::identity_token::IDENTITY_KEY_FILE));
+    if [crate::identity_token::IDENTITY_KEY_FILE,
+        crate::identity_token::IDENTITY_INITIALIZED_FILE,
+        crate::identity_token::IDENTITY_LOCK_FILE]
+        .iter().any(|name| file_name.eq_ignore_ascii_case(name))
+    {
+        let expected = lexical_normalize(&home.join(file_name));
         return match components_after_ci(&normalized, &expected) {
             Some(rest) if rest.is_empty() => Some(ProtectedSurface::IdentityKey),
             _ => None,

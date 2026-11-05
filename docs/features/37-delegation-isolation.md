@@ -263,22 +263,18 @@ Since v1.52, every agent's MCP calls carry a signed identity token to prevent im
 
 **How it works**:
 
-1. On startup, the gateway generates a 256-bit random key at `~/.duduclaw/identity.key` (file permission 0600)
+1. On startup, the gateway generates a 256-bit random key at `~/.duduclaw/identity.key` (Unix mode 0600; restrictive ACL on Windows)
 2. When spawning a sub-agent, the gateway produces a signed token (HMAC-SHA256, bound to the agent ID)
 3. The token is injected as the environment variable `DUDUCLAW_AGENT_TOKEN`, and the sub-agent starts up carrying it
 4. The MCP server verifies the token's validity and the grantor's identity
 
-**Soft and strict modes**:
+**Strict mode is the default since v1.80.0**, including existing installs with no explicit setting: `config.toml [delegation] require_identity_token = true`. Missing or invalid tokens reject MCP startup. Invalid or unreadable settings also reject identities; only an explicit boolean `false` with a valid grace deadline enables soft mode, with a warning on every gateway boot. Soft mode accepts unverified employee claims and retains impersonation risk, so use it only for a short upgrade transition.
 
-- **Soft mode** (default): `config.toml [delegation] require_identity_token = false`
-  - A missing or invalid token only produces a warning; MCP startup is not rejected
-  - Meant for tolerance: mid-upgrade transitions or moments when a token is briefly out of sync
+Soft mode requires both `require_identity_token = false` and `[delegation] identity_token_grace_until`, a quoted RFC3339 UTC deadline (`Z` or `+00:00`) strictly in the future and no more than 30 days ahead. Missing, invalid, non-UTC, expired or overlong deadlines restore strict mode and log one error per process. Verification rechecks the deadline even when the caller cached soft mode. Unix also requires the opened file to belong to the effective UID and have exactly one hard link. macOS rejects every extended ACL entry using the opened descriptor; ACL query failures reject the file (ENOENT means no ACL). Other Unix extended ACLs are not checked. Once a home’s grace is observed expired or invalid, strict mode stays latched for that home for the rest of the process; moving the clock back or editing the deadline cannot reopen it. This latch is not persisted across process restarts.
 
-- **Strict mode**: `config.toml [delegation] require_identity_token = true`
-  - An invalid identity rejects MCP startup outright, with the failure written to the log
-  - Suited to environments with high security requirements
+The gateway records `identity.key.initialized` for existing and new keys. A missing key after that marker is present, or an unreadable, malformed or unsafe key, rejects identities in both modes. Initialization failures stop gateway startup. Creation uses a cross-process lock, private unpredictable temporary files and atomic non-overwriting publication. Unix requires `0600`; Windows validates the opened handle's reparse state, owner and ACL. System and queue sender names cannot be verified employees even with a valid token.
 
-**Upgrade order matters**: restart the gateway first (so agents' MCP configs get re-signed), then switch to strict mode. In the reverse order, agents start up with invalid tokens and are rejected the moment strict mode takes effect.
+**Upgrade:** retain the original key and marker; restart the gateway to re-issue agent MCP configs, then restart existing employee processes. If temporarily opting out with `false`, restore `true` or remove the setting after the restart. Repair legacy Windows ACLs if broader principals have access. Restore a missing key rather than deleting its marker. An interrupted first initialization can require operator recovery. See [Security defense](05-security-defense.md#mcp-employee-identity-verification) for recovery, platform limits and the same-OS-account threat model.
 
 ### Org data protection
 

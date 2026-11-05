@@ -1107,7 +1107,7 @@ async fn refresh_lock(
     .map_err(AuthError::Transient)
 }
 
-/// The credential to use now. With `force_refresh` (the server answered 401)
+/// The credential to use now for trusted gateway callers. With `force_refresh` (the server answered 401)
 /// or when the access token is within [`REFRESH_SKEW_SECS`] of expiry, the
 /// token is refreshed under the refresh lock, re-reading the record first so a
 /// refresh another process just did is reused instead of repeated. A refused
@@ -1123,6 +1123,34 @@ pub async fn upstream_auth(
     force_refresh: bool,
     seen: Option<&str>,
 ) -> Result<UpstreamAuth, AuthError> {
+    upstream_auth_inner(home, agent_id, server, None, force_refresh, seen).await
+}
+
+/// Credential access for the native employee bridge, including revalidation
+/// after waiting on refresh locks. Gateway-owned event polling uses the
+/// trusted in-process `upstream_auth` path above.
+pub(super) async fn upstream_auth_for_bridge(
+    home: &Path,
+    agent_id: &str,
+    server: &str,
+    agent_token: &str,
+    force_refresh: bool,
+    seen: Option<&str>,
+) -> Result<UpstreamAuth, AuthError> {
+    upstream_auth_inner(home, agent_id, server, Some(agent_token), force_refresh, seen).await
+}
+
+async fn upstream_auth_inner(
+    home: &Path,
+    agent_id: &str,
+    server: &str,
+    agent_token: Option<&str>,
+    force_refresh: bool,
+    seen: Option<&str>,
+) -> Result<UpstreamAuth, AuthError> {
+    if let Some(token) = agent_token {
+        super::bridge::verify_identity(home, agent_id, token).map_err(AuthError::Transient)?;
+    }
     let (rec, secrets) = load_usable(home, agent_id, server)?;
     refuse_stored_google_oauth(home, agent_id, server, &secrets)?;
     let now = chrono::Utc::now().timestamp();
@@ -1144,7 +1172,10 @@ pub async fn upstream_auth(
     let _google_grant_lease = crate::google_personal::grants::acquire(home)
         .await
         .map_err(AuthError::Transient)?;
-    // Re-read under the lock.
+    // Re-read under the lock, after rechecking identity across the waits.
+    if let Some(token) = agent_token {
+        super::bridge::verify_identity(home, agent_id, token).map_err(AuthError::Transient)?;
+    }
     let (_, mut secrets) = load_usable(home, agent_id, server)?;
     refuse_stored_google_oauth(home, agent_id, server, &secrets)?;
     let current = to_upstream(&secrets)?;
@@ -1387,6 +1418,11 @@ mod tests {
         }
     }
 
+    fn bridge_test_token(home: &Path) -> String {
+        let key = duduclaw_core::ensure_identity_key(home).unwrap();
+        duduclaw_core::mint_identity_token(&key, "a1")
+    }
+
     #[tokio::test]
     async fn pasted_url_must_match_a_paste_sign_in() {
         let dir = tempfile::tempdir().unwrap();
@@ -1564,10 +1600,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bridge_credentials_refuse_invalid_identity_before_store_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = bridge_test_token(dir.path());
+        for (agent, token) in [("a1", ""), ("other", token.as_str()), ("a1", "forged")] {
+            let err = upstream_auth_for_bridge(dir.path(), agent, "missing", token, false, None)
+                .await.err().expect("invalid identity must not read credentials");
+            assert_eq!(err.to_string(), "MCP remote bridge identity rejected");
+            assert!(!store::store_path(dir.path()).exists());
+        }
+    }
+
+    #[tokio::test]
     async fn bridge_auth_refuses_records_that_are_not_connected() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        let e = upstream_auth(home, "a1", "missing", false, None)
+        let e = upstream_auth_for_bridge(home, "a1", "missing", &bridge_test_token(home), false, None)
             .await
             .err()
             .unwrap();
@@ -1579,7 +1627,7 @@ mod tests {
             &super::super::bridge_def::candidate_def("https://mcp.example.com/mcp"),
         )
         .unwrap();
-        let e = upstream_auth(home, "a1", "s1", false, None)
+        let e = upstream_auth_for_bridge(home, "a1", "s1", &bridge_test_token(home), false, None)
             .await
             .err()
             .unwrap();
@@ -1619,7 +1667,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = match upstream_auth(home, "a1", "legacy-google", false, None).await {
+        let err = match upstream_auth_for_bridge(home, "a1", "legacy-google", &bridge_test_token(home), false, None).await {
             Err(err) => err,
             Ok(_) => panic!("legacy Google credential must be fenced"),
         };
@@ -1682,7 +1730,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = match upstream_auth(home, "a1", "legacy-google-bearer", false, None).await {
+        let err = match upstream_auth_for_bridge(home, "a1", "legacy-google-bearer", &bridge_test_token(home), false, None).await {
             Err(err) => err,
             Ok(_) => panic!("legacy Google-hosted bearer must be fenced"),
         };
