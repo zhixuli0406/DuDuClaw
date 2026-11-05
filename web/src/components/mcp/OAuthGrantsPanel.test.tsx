@@ -61,6 +61,9 @@ describe('OAuthGrantsPanel', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Revoke' }));
     await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Revoke' })).toBeEnabled());
     expect(screen.getByRole('dialog')).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Desktop client' })).toBeInTheDocument();
+    // A modal hides the background list from the accessibility tree.
+    expect(screen.getByRole('heading', { name: 'Desktop client', hidden: true })).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByRole('heading', { name: 'Desktop client' })).toBeVisible();
   });
 });

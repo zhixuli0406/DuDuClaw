@@ -5,7 +5,6 @@ import { mockWsClient } from '@/test/mocks';
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { SettingsPage } from './SettingsPage';
-import { useAuthStore } from '@/stores/auth-store';
 
 // Sections fire RPCs on mount (system.config, redaction.get, …); a broad
 // resolved-empty mock keeps them quiet so we can smoke-test the shell + rail.

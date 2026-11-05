@@ -329,7 +329,7 @@ describe('enterprise employee navigation', () => {
   });
 });
 
-// Expected visible routes, including the task-entry hiding policy.
+// Expected visible routes, including intended 1.80.0 additions and task-entry hiding.
 // All progressive-disclosure facts are enabled to make every prior entry observable.
 const previousNavigation = {
   "admin:enterprise": {
@@ -350,6 +350,7 @@ const previousNavigation = {
         "/mail",
         "/timeline",
         "/reports",
+        "/employee-health",
         "/foresight",
         "/forks",
         "/os",
@@ -373,6 +374,8 @@ const previousNavigation = {
         "/me/account",
         "/my/history-views",
         "/manage",
+        "/app/system/settings/company",
+        "/app/system/settings/advanced",
         "/about"
       ],
       [
@@ -403,6 +406,8 @@ const previousNavigation = {
       [
         "/me/account",
         "/manage",
+        "/app/system/settings/company",
+        "/app/system/settings/advanced",
         "/about"
       ],
       [
@@ -414,6 +419,7 @@ const previousNavigation = {
         "/mail",
         "/timeline",
         "/reports",
+        "/employee-health",
         "/forks",
         "/os",
         "/presets",
@@ -440,6 +446,7 @@ const previousNavigation = {
         "/mail",
         "/timeline",
         "/reports",
+        "/employee-health",
         "/foresight",
         "/forks",
       ],
@@ -497,6 +504,7 @@ const previousNavigation = {
         "/mail",
         "/timeline",
         "/reports",
+        "/employee-health",
         "/forks",
         "/growth",
         "/org",
@@ -611,6 +619,18 @@ describe('employee health visibility', () => {
         expect(isVisible(entry, 'manager', isPersonal)).toBe(true);
         expect(isVisible(entry, 'admin', isPersonal)).toBe(true);
         expect(isVisible(entry, 'employee', isPersonal)).toBe(false);
+      }
+    }
+  });
+});
+
+describe('member management visibility', () => {
+  it('keeps member management restricted to Enterprise admins', () => {
+    const entry = manageAdvancedNav.find(item => item.to === '/manage/users')!;
+    expect(entry).toBeDefined();
+    for (const personal of [false, true]) {
+      for (const role of ['admin', 'manager', 'employee'] as const) {
+        expect(isVisible(entry, role, personal)).toBe(role === 'admin' && !personal);
       }
     }
   });
