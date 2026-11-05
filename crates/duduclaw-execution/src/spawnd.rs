@@ -42,7 +42,7 @@ pub struct McpReceipt {
 struct Entry {
     employee: EmployeeId,
     reservation_expiry: u64,
-    connection: Connection,
+    connection: Arc<Connection>,
     state: Mutex<State>,
     _permit: OwnedSemaphorePermit,
 }
@@ -153,6 +153,17 @@ impl SpawndBackend {
         bind_task(&mut state, task)
     }
 
+    /// Bind terminal dimensions while the reservation is still unused. Root
+    /// validates them and applies them inside B2 before forking the runtime.
+    pub async fn configure_pty(&self, run: RunHandle, size: PtySize) -> Result<(), BackendError> {
+        size.validate().map_err(|_| BackendError::Denied)?;
+        let entry = self.entry(run)?;
+        let state = entry.state.lock().await;
+        if state.started || state.outcome.is_some() || state.expires <= Instant::now() { return Err(BackendError::Denied); }
+        entry.connection.request(SpawnRequest::Resize { run, size }, &[]).await?;
+        Ok(())
+    }
+
     /// Public queue status contains no PID, path, command or secret.
     pub async fn status(&self, run: RunHandle) -> Result<RunStatus, BackendError> {
         let entry = self.entry(run)?;
@@ -188,7 +199,11 @@ impl SpawndBackend {
         };
         match io {
             fd_io::DeliveredIo::Stdio(stdio) => state.stdio = Some(stdio),
-            fd_io::DeliveredIo::Pty(terminal) => state.terminal = Some(terminal),
+            fd_io::DeliveredIo::Pty(mut terminal) => {
+                terminal.input = Box::new(ActivityWriter { inner: terminal.input, connection: entry.connection.clone(), run });
+                terminal.output = Box::new(ActivityReader { inner: terminal.output, connection: entry.connection.clone(), run });
+                state.terminal = Some(terminal);
+            },
         }
         state.mcp_fd = mcp_fd;
         state.io_receipt = Some(packet.response);
@@ -227,7 +242,7 @@ impl ExecutionBackend for SpawndBackend {
             let remaining = (expires_at_unix_ms as u128).checked_sub(now_ms)
                 .filter(|ms| *ms > 0 && *ms <= ipc::RESERVATION_TIMEOUT_MS as u128)
                 .ok_or(BackendError::Protocol)?;
-            let entry = Arc::new(Entry { employee, reservation_expiry: expires_at_unix_ms, connection, _permit: permit, state: Mutex::new(State {
+            let entry = Arc::new(Entry { employee, reservation_expiry: expires_at_unix_ms, connection: Arc::new(connection), _permit: permit, state: Mutex::new(State {
                 expires: Instant::now() + Duration::from_millis(remaining as u64), started: false, task_ref: None,
                 pty: false, mcp: false, output_bytes: 0, output_buffer: 0,
                 io_received: false, stdio: None, terminal: None, mcp_fd: None, io_receipt: None, outcome: None, terminal_at: None,
@@ -342,10 +357,48 @@ impl ExecutionBackend for SpawndBackend {
             size.validate().map_err(|_| BackendError::Denied)?;
             let entry = self.entry(run)?;
             if !entry.state.lock().await.pty { return Err(BackendError::Denied); }
-            entry.connection.request(SpawnRequest::Resize { run, size }, &[]).await?;
-            Ok(())
+            tokio::time::timeout(Duration::from_millis(ipc::CONTROL_TIMEOUT_MS), async {
+                loop {
+                    match entry.connection.request(SpawnRequest::Resize { run, size }, &[]).await {
+                        Ok(_) => return Ok(()),
+                        Err(BackendError::Unavailable) => tokio::time::sleep(Duration::from_millis(25)).await,
+                        Err(error) => return Err(error),
+                    }
+                }
+            }).await.map_err(|_| BackendError::Timeout)?
         })
     }
+}
+
+// A is part of the TCB. Root owns the idle clock, and only successful byte
+// transfers on these actual master handles produce an activity notification.
+struct ActivityReader { inner: Box<dyn RunReader>, connection: Arc<Connection>, run: RunHandle }
+impl RunReader for ActivityReader {
+    fn read<'a>(&'a mut self, bytes: &'a mut [u8]) -> BackendFuture<'a, usize> {
+        Box::pin(async move {
+            let count = self.inner.read(bytes).await?;
+            if count > 0 { note_activity(&self.connection, self.run).await?; }
+            Ok(count)
+        })
+    }
+}
+struct ActivityWriter { inner: Box<dyn RunWriter>, connection: Arc<Connection>, run: RunHandle }
+impl RunWriter for ActivityWriter {
+    fn write<'a>(&'a mut self, bytes: &'a [u8]) -> BackendFuture<'a, usize> {
+        Box::pin(async move {
+            let count = self.inner.write(bytes).await?;
+            if count > 0 { note_activity(&self.connection, self.run).await?; }
+            Ok(count)
+        })
+    }
+    fn close(&mut self) -> BackendFuture<'_, ()> { self.inner.close() }
+}
+async fn note_activity(connection: &Connection, run: RunHandle) -> Result<(), BackendError> {
+    // A transfer already happened. A valid root NotReady may mean retirement
+    // is still draining (public Status remains Running until cleanup finishes).
+    // Preserve the byte count, without renewing that run's expired idle clock.
+    // All other root/transport/protocol failures still surface as errors.
+    connection.pty_activity(run).await
 }
 
 fn retain_state(state: &State, now: Instant) -> bool {
@@ -429,7 +482,7 @@ mod tests {
         let (connection, peer) = Connection::test_pair();
         let run = RunHandle(RunId([19; 16]));
         let entry = Arc::new(Entry { employee: EmployeeId([23; 16]), reservation_expiry: 123456,
-            connection, _permit: slots.clone().acquire_owned().await.unwrap(),
+            connection: Arc::new(connection), _permit: slots.clone().acquire_owned().await.unwrap(),
             state: Mutex::new(State {
                 expires: Instant::now() + Duration::from_secs(30), started: false, task_ref: None,
                 pty: false, mcp: false, output_bytes: 1, output_buffer: 1, io_received: false,
@@ -437,6 +490,56 @@ mod tests {
             }) });
         let backend = SpawndBackend { runs: StdMutex::new(BTreeMap::from([(run.0, entry.clone())])), slots, admission: None };
         (backend, run, entry, peer)
+    }
+
+    #[tokio::test]
+    async fn pty_activity_is_sent_only_after_nonempty_successful_reads() {
+        let (_, run, entry, peer) = metadata_fixture().await;
+        let worker = std::thread::spawn(move || {
+            use nix::sys::socket::{self, MsgFlags};
+            let mut poll = libc::pollfd { fd: peer.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            assert_eq!(unsafe { libc::poll(&mut poll, 1, 2000) }, 1);
+            let mut bytes = vec![0; ipc::MAX_FRAME_BYTES + 4];
+            let size = socket::recv(peer.as_raw_fd(), &mut bytes, MsgFlags::MSG_DONTWAIT).unwrap();
+            bytes.truncate(size);
+            let request: ipc::Envelope<SpawnRequest> = ipc::decode(&bytes).unwrap();
+            assert_eq!(request.message, SpawnRequest::PtyActivity { run });
+            let reply = ipc::encode(&ipc::Envelope { version: ipc::PROTOCOL_VERSION,
+                request_id: request.request_id, message: SpawnResponse::Ack }).unwrap();
+            socket::send(peer.as_raw_fd(), &reply, MsgFlags::MSG_NOSIGNAL).unwrap();
+            assert_eq!(unsafe { libc::poll(&mut poll, 1, 100) }, 0, "empty reads/EOF cannot keep a PTY alive");
+        });
+        let mut reader = ActivityReader { inner: Box::new(Bytes(std::io::Cursor::new(b"x".to_vec()))),
+            connection: entry.connection.clone(), run };
+        assert_eq!(reader.read(&mut []).await.unwrap(), 0);
+        let mut buffer = [0; 1];
+        assert_eq!(reader.read(&mut buffer).await.unwrap(), 1); assert_eq!(buffer, *b"x");
+        assert_eq!(reader.read(&mut buffer).await.unwrap(), 0);
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pty_retirement_refusal_preserves_already_transferred_output() {
+        let (_, run, entry, peer) = metadata_fixture().await;
+        let worker = std::thread::spawn(move || {
+            use nix::sys::socket::{self, MsgFlags};
+            let mut poll = libc::pollfd { fd: peer.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            assert_eq!(unsafe { libc::poll(&mut poll, 1, 2000) }, 1);
+            let mut bytes = vec![0; ipc::MAX_FRAME_BYTES + 4];
+            let count = socket::recv(peer.as_raw_fd(), &mut bytes, MsgFlags::MSG_DONTWAIT).unwrap(); bytes.truncate(count);
+            let request: ipc::Envelope<SpawnRequest> = ipc::decode(&bytes).unwrap();
+            assert_eq!(request.message, SpawnRequest::PtyActivity { run });
+            let reply = ipc::encode(&ipc::Envelope { version: ipc::PROTOCOL_VERSION, request_id: request.request_id,
+                message: SpawnResponse::Error { code: ipc::ErrorCode::NotReady } }).unwrap();
+            socket::send(peer.as_raw_fd(), &reply, MsgFlags::MSG_NOSIGNAL).unwrap();
+            // No Status poll is necessary: Draining is deliberately not exposed
+            // as Ended until all three retirement readbacks have completed.
+            assert_eq!(unsafe { libc::poll(&mut poll, 1, 100) }, 0);
+        });
+        let mut reader = ActivityReader { inner: Box::new(Bytes(std::io::Cursor::new(b"tail".to_vec()))),
+            connection: entry.connection.clone(), run };
+        let mut bytes = [0; 4]; assert_eq!(reader.read(&mut bytes).await.unwrap(), 4); assert_eq!(&bytes, b"tail");
+        assert_eq!(reader.read(&mut bytes).await.unwrap(), 0); worker.join().unwrap();
     }
 
     #[tokio::test]

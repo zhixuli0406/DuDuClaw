@@ -301,7 +301,7 @@ pub async fn spawn(command: &mut Command, class: ExecutionClass, required: bool)
     if required && !crate::selection::gateway_exception(class) {
         #[cfg(target_os = "linux")]
         {
-            let mut prepared = protected(command_snapshot(command), class, false).await?;
+            let mut prepared = protected(command_snapshot(command), class, false, None).await?;
             let (backend, run, lifecycle) = (prepared.backend.clone(), prepared.run, prepared.lifecycle.clone());
             let streams = match prepared.stdio().await {
                 Ok(streams) => streams,
@@ -336,17 +336,13 @@ pub async fn spawn_pty(command: portable_pty::CommandBuilder, size: PtySize,
     if required && !crate::selection::gateway_exception(class) {
         #[cfg(target_os = "linux")]
         {
-            let mut prepared = protected(pty_snapshot(&command), class, true).await?;
+            let mut prepared = protected(pty_snapshot(&command), class, true, Some(size)).await?;
             let (backend, run, lifecycle) = (prepared.backend.clone(), prepared.run, prepared.lifecycle.clone());
             let streams = match prepared.pty().await {
                 Ok(streams) => streams,
                 Err(reason) => { rollback(backend.as_ref(), run, lifecycle.as_ref()).await; return Err(error(reason)); },
             };
             activate(&backend, run, lifecycle.as_ref(), prepared.mcp).await?;
-            if let Err(reason) = backend.resize(run, size).await {
-                rollback(backend.as_ref(), run, lifecycle.as_ref()).await;
-                return Err(error(reason));
-            }
             prepared.armed = false;
             return Ok(PtyChild { input: Some(writer(streams.input)), output: Some(reader(streams.output)),
                 control: monitor(backend, run, Some(lifecycle), None), reaped: false });
@@ -417,7 +413,7 @@ impl Drop for Prepared {
 }
 
 #[cfg(target_os = "linux")]
-async fn protected(native: NativeCommandSnapshot, class: ExecutionClass, pty: bool)
+async fn protected(native: NativeCommandSnapshot, class: ExecutionClass, pty: bool, initial_size: Option<PtySize>)
     -> io::Result<Prepared>
 {
     let lifecycle = capture_context().ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, crate::selection::ISOLATION_UNAVAILABLE))?;
@@ -444,6 +440,12 @@ async fn protected(native: NativeCommandSnapshot, class: ExecutionClass, pty: bo
     if let Err(reason) = backend.bind_task(run, lifecycle.task()).await {
         rollback(&backend, run, lifecycle.as_ref()).await;
         return Err(error(reason));
+    }
+    if let Some(size) = initial_size {
+        if let Err(reason) = backend.configure_pty(run, size).await {
+            rollback(&backend, run, lifecycle.as_ref()).await;
+            return Err(error(reason));
+        }
     }
     prepared.mcp = policy.capabilities.mcp_bridge;
     prepared.io_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(policy.timeouts.queue_ms.saturating_add(policy.timeouts.startup_ms));

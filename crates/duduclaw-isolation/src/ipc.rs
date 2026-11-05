@@ -126,7 +126,14 @@ pub enum SpawnRequest {
         input_fds: List<InputFd, MAX_INPUT_FDS>,
         pty: bool,
     },
+    /// Before StartRun, bind the initial PTY size to this reservation. It does
+    /// not start work; a following non-PTY StartRun is refused. During Running,
+    /// change the existing PTY size. Queued/Starting/terminal runs refuse it.
     Resize { run: RunHandle, size: PtySize },
+    /// Additive I1e control message. Only the authenticated gateway may report
+    /// a successful nonempty PTY read/write after TakeIo. Root supplies time;
+    /// this message cannot revive a terminal/draining run or change a deadline.
+    PtyActivity { run: RunHandle },
     Cancel { run: RunHandle },
     /// `caller_run` is host-derived. Same-employee waits return WouldDeadlock;
     /// the queued run remains asynchronous. None is reserved for gateway callers.
@@ -270,6 +277,18 @@ mod tests {
     fn start() -> SpawnRequest {
         SpawnRequest::StartRun { run: RunHandle(crate::ids::RunId([3; 16])), employee_id: EmployeeId([1; 16]), runtime_request: RuntimeKind::Codex,
             task_ref: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(), pty: false }
+    }
+    #[test]
+    fn pty_activity_is_narrow_and_has_no_rights_or_caller_clock() {
+        let request = SpawnRequest::PtyActivity { run: RunHandle(crate::ids::RunId([3; 16])) };
+        assert!(request.fd_plan().unwrap().is_empty());
+        let envelope = Envelope { version: 1, request_id: RequestId([2; 16]), message: request.clone() };
+        assert_eq!(decode::<SpawnRequest>(&encode(&envelope).unwrap()).unwrap(), envelope);
+        for name in ["timestamp", "bytes", "uid", "employee_id", "profile", "deadline"] {
+            let mut value = serde_json::to_value(&request).unwrap();
+            value[name] = 42.into();
+            assert!(serde_json::from_value::<SpawnRequest>(value).is_err());
+        }
     }
     #[test]
     fn serde_round_trip_and_fd_plan() {

@@ -34,6 +34,8 @@ pub mod allocation;
 
 #[cfg(target_os = "linux")]
 pub mod native_trampoline;
+#[cfg(target_os = "linux")]
+mod native_pty;
 
 #[cfg(target_os = "linux")]
 pub mod installed;

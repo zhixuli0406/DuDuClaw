@@ -18,10 +18,14 @@ pub struct LaunchPolicy {
     pub runtime_ms: u64,
     pub pty_idle_ms: Option<u64>,
     pub ptys: u16,
+    pub pty_size: Option<PtySize>,
     pub delivery: IoDelivery,
 }
 impl LaunchPolicy {
     pub fn validate(&self) -> Result<()> {
+        if self.pty_size.is_some() != self.delivery.pty || self.pty_size.is_some_and(|size| size.validate().is_err()) {
+            return Err(ErrorCode::RuntimeDenied);
+        }
         if self.queue_ms == 0 || self.queue_ms > 3_600_000 || self.startup_ms == 0
             || self.startup_ms > 300_000 || self.runtime_ms == 0 || self.runtime_ms > 86_400_000
             || self.ptys > 64 || (self.delivery.pty && (self.ptys == 0 || self.pty_idle_ms.is_none()))
@@ -112,6 +116,8 @@ struct Entry<I> {
     terminal_at: u64,
     outcome: Option<RunOutcome>,
     io_taken: bool,
+    pty_activity_ms: u64,
+    initial_pty_size: Option<PtySize>,
 }
 impl<I> Entry<I> {
     fn active(&self) -> bool {
@@ -171,7 +177,7 @@ impl<H: Host> Coordinator<H> {
         self.sequence = self.sequence.checked_add(1).ok_or(ErrorCode::ResourceLimit)?;
         self.entries.insert(random_run.0, Entry { employee, connection, reservation, state: AdmissionState::Reserved,
             request: None, policy: None, inputs: None, input_bytes: 0, input_descriptors: 0, sequence: self.sequence,
-            deadline: expires, started: 0, terminal_at: 0, outcome: None, io_taken: false });
+            deadline: expires, started: 0, terminal_at: 0, outcome: None, io_taken: false, pty_activity_ms: 0, initial_pty_size: None });
         Ok(SpawnResponse::Reserved { run: random_run, expires_at_unix_ms: expires })
     }
     pub fn start(&mut self, connection: ControlConnectionId, request: SpawnRequest, inputs: H::Inputs,
@@ -184,7 +190,10 @@ impl<H: Host> Coordinator<H> {
         if entry.employee != employee_id || entry.state != AdmissionState::Reserved || now >= entry.deadline {
             return Err(ErrorCode::InvalidRequest);
         }
-        let policy = self.host.policy(employee_id, runtime_request, pty)?;
+        let initial_size = entry.initial_pty_size;
+        if !pty && initial_size.is_some() { return Err(ErrorCode::InvalidRequest); }
+        let mut policy = self.host.policy(employee_id, runtime_request, pty)?;
+        if let Some(size) = initial_size { policy.pty_size = Some(size); }
         policy.validate()?;
         if policy.delivery.pty != pty { return Err(ErrorCode::RuntimeDenied); }
         let input_bytes = input_fds.as_slice().iter().fold(prompt_bytes, |sum, input| sum + match input {
@@ -259,10 +268,30 @@ impl<H: Host> Coordinator<H> {
     pub fn resize(&mut self, run: RunHandle, connection: ControlConnectionId, size: PtySize) -> Result<()> {
         size.validate().map_err(|_| ErrorCode::InvalidRequest)?;
         let entry = self.owned(run, connection)?;
+        if entry.state == AdmissionState::Reserved && self.last_now < entry.deadline {
+            self.entries.get_mut(&run.0).ok_or(ErrorCode::Internal)?.initial_pty_size = Some(size);
+            return Ok(());
+        }
         if entry.state != AdmissionState::Running || !entry.policy.as_ref().is_some_and(|p| p.delivery.pty) {
             return Err(ErrorCode::NotReady);
         }
         self.host.resize(run, size)
+    }
+    /// Activity is reported by A on the original authenticated control socket,
+    /// never by the employee or an arbitrary timestamp supplied on the wire.
+    pub fn pty_activity(&mut self, run: RunHandle, connection: ControlConnectionId, now: u64) -> Result<()> {
+        self.time(now)?;
+        let entry = self.owned(run, connection)?;
+        if entry.state != AdmissionState::Running || !entry.io_taken
+            || !entry.policy.as_ref().is_some_and(|p| p.delivery.pty) { return Err(ErrorCode::NotReady); }
+        let idle = entry.policy.as_ref().and_then(|p| p.pty_idle_ms).ok_or(ErrorCode::Internal)?;
+        if now.saturating_sub(entry.pty_activity_ms.max(entry.started)) >= idle {
+            // A late message must not win a race against an expired idle timer.
+            let _ = self.drain(run, RunOutcome::IdleTimeout);
+            return Err(ErrorCode::NotReady);
+        }
+        self.entries.get_mut(&run.0).ok_or(ErrorCode::Internal)?.pty_activity_ms = now;
+        Ok(())
     }
     fn drain(&mut self, run: RunHandle, reason: RunOutcome) -> Result<()> {
         let entry = self.entries.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
@@ -334,8 +363,8 @@ impl<H: Host> Coordinator<H> {
                         Ok(HostProgress::Starting) if entry.state == AdmissionState::Starting => None,
                         Ok(HostProgress::Running { last_activity_ms }) => {
                             if last_activity_ms > now { Some(RunOutcome::IsolationFailure) }
-                            else if policy.pty_idle_ms.is_some_and(|idle| now.saturating_sub(last_activity_ms) >= idle) { Some(RunOutcome::IdleTimeout) }
-                            else { if entry.state == AdmissionState::Starting { entry.transition(AdmissionState::Running, None)?; } None }
+                            else if policy.pty_idle_ms.is_some_and(|idle| now.saturating_sub(if entry.state == AdmissionState::Starting { now } else { last_activity_ms.max(entry.pty_activity_ms) }) >= idle) { Some(RunOutcome::IdleTimeout) }
+                            else { if entry.state == AdmissionState::Starting { entry.transition(AdmissionState::Running, None)?; entry.pty_activity_ms = now; } None }
                         }
                         Ok(HostProgress::Ended(outcome)) => Some(outcome),
                         Err(ErrorCode::NotReady) => None,

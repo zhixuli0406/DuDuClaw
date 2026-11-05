@@ -47,7 +47,7 @@ impl Stages {
             StatusRecord::Exited(code) => return Ok(Some(RunOutcome::Exited(i32::from(code)))),
             StatusRecord::Signalled(signal) => return Ok(Some(RunOutcome::Signalled(u32::from(signal)))),
             StatusRecord::Error(_) => return Err(unavailable()),
-            StatusRecord::Pty => return Err(unavailable()),
+            StatusRecord::Pty | StatusRecord::PtyIdentity { .. } => return Err(unavailable()),
         };
         if *bit { return Err(unavailable()); }
         *bit = true;
@@ -61,6 +61,9 @@ struct Pending {
     stages: Stages,
     prepared_at_ms: u64,
     terminal: Option<RunOutcome>,
+    pty: bool,
+    uid: u32,
+    master: Option<crate::native_pty::ReturnedPty>,
 }
 pub struct NativeTrampoline { installation: Box<dyn Installation>, runs: BTreeMap<RunId, Pending> }
 impl NativeTrampoline {
@@ -77,10 +80,9 @@ impl Trampoline for NativeTrampoline {
         inputs: Vec<OwnedFd>, stdin: Option<OwnedFd>, mcp: Option<OwnedFd>, egress: Option<OwnedFd>,
         profile: NativeProfile) -> Result<PreparedBootstrap> {
         plan.validate()?;
-        // PTY needs additional master mount readback before it may be enabled.
-        if plan.pty || self.runs.contains_key(&plan.run.0) || self.runs.len() >= 128
+        if self.runs.contains_key(&plan.run.0) || self.runs.len() >= 128
             || mounts.projection_run != plan.run || inputs.len() != 1 + plan.input_fds.len()
-            || stdin.is_none() || mcp.is_some() != plan.mcp || egress.is_some() != plan.egress
+            || stdin.is_some() == plan.pty || mcp.is_some() != plan.mcp || egress.is_some() != plan.egress
             || profile.forwarder.is_some() != plan.egress { return Err(unavailable()); }
         let bytes = plan.encode()?;
         checked(crate::fds::validate_sealed(sealed.as_fd(), bytes.len() as u64))?;
@@ -119,18 +121,18 @@ impl Trampoline for NativeTrampoline {
         rights.extend(inputs); rights.extend(stdin); rights.extend(mcp);
         let forwarder = forwarder.map(|(program, executable)| { rights.extend(egress); rights.push(executable); program });
         let trusted = TrustedRun { root: RootConfig { employee_uid: plan.uid, employee_gid: plan.gid,
-            pty: false, pty_limit: plan.max_ptys.max(1), work_noexec: true, tmp_noexec: true,
+            pty: plan.pty, pty_limit: plan.max_ptys.max(1), work_noexec: true, tmp_noexec: true,
             tmpfs_bytes: profile.tmpfs_bytes, tmpfs_inodes: profile.tmpfs_inodes },
             mounts: identities.try_into().map_err(|_| unavailable())?, supervisor_uid: plan.supervisor_uid,
             supervisor_gid: plan.supervisor_gid, gateway_uid: profile.snapshot.gateway_uid,
             gateway_mount: profile.snapshot.mount_id, program, forwarder, prompt_bytes: plan.prompt_bytes,
-            attachments: plan.input_fds, mcp: plan.mcp, proc_subset_pid: profile.proc_subset_pid, stdin: true };
+            attachments: plan.input_fds, mcp: plan.mcp, proc_subset_pid: profile.proc_subset_pid, stdin: !plan.pty, pty_size: plan.pty_size };
         checked(trusted.validate())?;
         if trusted.expected_fd_count() != rights.len() { return Err(unavailable()); }
         let (socket, bootstrap_for_unit) = checked(nix::sys::socket::socketpair(nix::sys::socket::AddressFamily::Unix,
             nix::sys::socket::SockType::SeqPacket, None, nix::sys::socket::SockFlag::SOCK_CLOEXEC))?;
         self.runs.insert(plan.run.0, Pending { socket, manifest: Some((trusted,rights)), cancelled: None,
-            stages: Stages::default(), prepared_at_ms: checked(crate::server::coordination_time_ms())?, terminal: None });
+            stages: Stages::default(), prepared_at_ms: checked(crate::server::coordination_time_ms())?, terminal: None, pty: plan.pty, uid: plan.uid, master: None });
         Ok(PreparedBootstrap { bootstrap_for_unit })
     }
     fn bind_unit(&mut self, run: RunHandle, unit: &crate::systemd::linux::StartedUnit, cancelled: Arc<AtomicBool>) -> Result<()> {
@@ -148,6 +150,8 @@ impl Trampoline for NativeTrampoline {
         Ok(())
     }
     fn poll(&mut self, run: RunHandle) -> Result<HostProgress> {
+        let occupied_mounts: Vec<_> = self.runs.values().filter_map(|pending|
+            pending.master.as_ref().map(|master| master.mount_id)).collect();
         let pending = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
         if pending.cancelled.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire)) { return Err(unavailable()); }
         if let Some(outcome) = &pending.terminal { return Ok(HostProgress::Ended(outcome.clone())); }
@@ -159,6 +163,12 @@ impl Trampoline for NativeTrampoline {
             if count == 0 { break; }
             if poll.revents & libc::POLLIN == 0 { return Err(unavailable()); }
             let (record, rights) = checked(bootstrap::receive_status(pending.socket.as_raw_fd()))?;
+            if let StatusRecord::PtyIdentity { mount_id } = record {
+                if !pending.pty || pending.master.is_some() || occupied_mounts.contains(&mount_id) { return Err(unavailable()); }
+                pending.master = Some(crate::native_pty::ReturnedPty::validate(
+                    rights.ok_or_else(unavailable)?, mount_id, pending.uid)?);
+                continue;
+            }
             if rights.is_some() { return Err(unavailable()); }
             if let Some(outcome) = pending.stages.record(record)? {
                 pending.terminal = Some(outcome.clone());
@@ -167,12 +177,20 @@ impl Trampoline for NativeTrampoline {
         }
         // Non-PTY work has no idle timer. Do not fabricate activity each poll;
         // the receipt shares the coordinator clock and predates asynchronous polling.
-        if pending.stages.ready() && pending.cancelled.is_some() {
+        if pending.stages.ready() && pending.cancelled.is_some() && (!pending.pty || pending.master.is_some()) {
             Ok(HostProgress::Running { last_activity_ms: pending.prepared_at_ms })
         } else { Ok(HostProgress::Starting) }
     }
-    fn resize(&mut self, _: RunHandle, _: PtySize) -> Result<()> { Err(unavailable()) }
-    fn take_pty(&mut self, _: RunHandle) -> Result<OwnedFd> { Err(unavailable()) }
+    fn resize(&mut self, run: RunHandle, size: PtySize) -> Result<()> {
+        let pending = self.runs.get(&run.0).ok_or(ErrorCode::NotFound)?;
+        if pending.terminal.is_some() || !pending.stages.ready() { return Err(ErrorCode::NotReady); }
+        pending.master.as_ref().ok_or(ErrorCode::NotReady)?.resize(size)
+    }
+    fn take_pty(&mut self, run: RunHandle) -> Result<OwnedFd> {
+        let pending = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
+        if !pending.stages.ready() { return Err(ErrorCode::NotReady); }
+        pending.master.as_mut().ok_or(ErrorCode::NotReady)?.take()
+    }
     fn close(&mut self, run: RunHandle) -> Result<()> { self.runs.remove(&run.0); Ok(()) }
 }
 

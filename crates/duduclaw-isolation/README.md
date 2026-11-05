@@ -85,6 +85,21 @@ to gateway-uid execution when isolation is unavailable.
 CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0 cargo test -p duduclaw-isolation --offline
 ```
 
+## I1e additive control message
+
+`SpawnRequest::PtyActivity { run }` is a new fd-free request with `Ack` response.
+Existing v1 message encodings, canonical capability bytes and hard limits are
+unchanged. `Resize` additionally accepts an unused reservation to bind initial
+terminal dimensions; a subsequent non-PTY StartRun is refused. Queued/Starting
+runs cannot change this binding. The root plan carries the validated size to B2
+for readback before fork/exec.
+Only A reports successful nonempty PTY byte transfers on the original control
+connection, after `TakeIo`; B1 supplies the timestamp and refuses terminal,
+draining, non-PTY, untaken and already-idle runs. Status/resize are not activity.
+A is part of the trusted gateway, so this is not independent kernel byte
+telemetry. An older peer rejects the unknown operation; components must be
+upgraded together. No compatibility fallback disables the idle timeout.
+
 ## License
 
 Apache-2.0, as declared by the workspace.

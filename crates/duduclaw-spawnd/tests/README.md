@@ -121,3 +121,35 @@ runall.sh /var/tmp/iso-i1-r5-chain 'iso_root_e2e_(claude_installed_shim_tool_tra
 Exactly two outer tests should be selected and each must report `1 passed`.
 The internal helpers intentionally lack the `iso_root_` prefix and must never be
 run independently. Missing signed prerequisites cause failures, not skips.
+
+## I1e installed PTY chain
+
+`pty_chain.rs` adds three `iso_root_pty_` tests using the real A backend, original
+B1 control connection, systemd and production B2. Run serially on a disposable
+root Linux VM with one confirmed **idle** employee. Provision the debug-only
+`duduclaw-spawnd-pty-fixture` ELF as signed registered runtime
+`iso-pty-fixture-v1` with empty fixed argv, offline network, `mcp: false`,
+`pty_allowed: true`, an idle budget of 2–10 seconds and a runtime budget greater
+than four idle periods. Preserve actual F/H/account/namespace readiness. The
+signed syscall profile must support ordinary Rust I/O, termios ioctls, getsid,
+getuid/geteuid and fcntl, without widening B2's common prohibitions. The root
+observer checks the exact currently built fixture digest; copy the binary to
+its embedded `CARGO_BIN_EXE` path on the VM before running. No test creates or
+signs policy, bypasses readiness, allocates an account, or skips missing setup.
+
+```sh
+# Native Linux builder:
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-spawnd --features root-test-fixture --test pty_chain --no-run
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo build -p duduclaw-spawnd --features root-test-fixture --bin duduclaw-spawnd-pty-fixture
+# Root disposable acceptance host, after signing/installing the exact fixture:
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --features root-test-fixture --test pty_chain iso_root_pty_ -- --ignored --test-threads=1 --nocapture
+```
+
+Exactly **3 outer tests** must pass. The internal `installed_pty_gateway_child`
+helper is selected only by the root parent; it verifies the root observer's
+socket identity and runs as the real gateway UID with no supplementary groups.
+The tests cover terminal FD identity/namespaces, one-shot master delivery,
+initial 31×113 dimensions read at startup before any dynamic resize, 37×93
+resize read back by the employee, input/output, real-byte idle renewal followed
+by idle expiry, cancellation, and independent unit/cgroup/UID retirement.
+They do not exercise authenticated product ingress, Grok or any live provider.

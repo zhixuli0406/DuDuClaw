@@ -175,6 +175,7 @@ fn dispatch<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut
             SpawnRequest::Cancel { run } => { coordinator.cancel(run, connection, now)?; SpawnResponse::Ack }
             SpawnRequest::Status { run } => SpawnResponse::Status { run, status: coordinator.status(run, connection)? },
             SpawnRequest::Wait { run, caller_run } => SpawnResponse::Status { run, status: coordinator.wait(run, connection, caller_run)? },
+            SpawnRequest::PtyActivity { run } => { coordinator.pty_activity(run, connection, now)?; SpawnResponse::Ack }
             SpawnRequest::Resize { run, size } => { coordinator.resize(run, connection, size)?; SpawnResponse::Ack }
             SpawnRequest::TakeIo { run } => {
                 let (delivery, descriptors) = coordinator.take_io(run, connection)?;
