@@ -104,7 +104,7 @@ mod tests {
     use crate::mcp_isolation::{IsolatedCall, ISOLATED_CALL};
 
     fn call(home: &Path, agent: &str) -> Arc<IsolatedCall> {
-        Arc::new(IsolatedCall {
+        Arc::new(IsolatedCall { forks: None,
             home: home.to_path_buf(), agent: agent.to_owned(), roots: Arc::new(ResourceRoots::default()),
             parser: None, services: None, execution: None, worker: None, record_resolver: None,
             context: RequestContext::from_verified_record(CapabilityRecord {

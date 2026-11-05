@@ -42,7 +42,7 @@ fn context() -> RequestContext {
     })
 }
 fn call() -> Arc<IsolatedCall> {
-    Arc::new(IsolatedCall { home: PathBuf::new(), execution: None, worker: None, record_resolver: None, context: context(), agent: "main".into(), roots: Arc::new(ResourceRoots::default()), parser: None, services: None })
+    Arc::new(IsolatedCall { forks: None, home: PathBuf::new(), execution: None, worker: None, record_resolver: None, context: context(), agent: "main".into(), roots: Arc::new(ResourceRoots::default()), parser: None, services: None })
 }
 fn adapter(home: &std::path::Path) -> IsolationDispatcher {
     std::fs::create_dir_all(home.join("agents/main")).unwrap();
@@ -157,7 +157,7 @@ async fn isolated_file_read_uses_granted_fd_and_keeps_bounded_result() {
     std::fs::write(work.path().join("note.txt"), "abcdef").unwrap();
     let mut roots = ResourceRoots::default();
     roots.insert("work".into(), EmployeeId([2; 16]), std::fs::File::open(work.path()).unwrap()).unwrap();
-    let call = Arc::new(IsolatedCall { home: PathBuf::new(), execution: None, worker: None, record_resolver: None, context: context(), agent: "main".into(), roots: Arc::new(roots), parser: None, services: None });
+    let call = Arc::new(IsolatedCall { forks: None, home: PathBuf::new(), execution: None, worker: None, record_resolver: None, context: context(), agent: "main".into(), roots: Arc::new(roots), parser: None, services: None });
     ISOLATED_CALL.scope(call, async {
         let value = crate::mcp_files::handle_file_read(
             &json!({"workspace":"work", "path":"note.txt", "max_bytes":3}), home.path(), "main");
@@ -208,7 +208,12 @@ fn isolated_every_tool_def_has_exact_boundary_route_and_effect() {
     for name in ["unknown", "tasks_list_extra", "xmemory_search", "TASKS_LIST"] {
         assert_eq!(boundary_route(name), None);
     }
-    for name in ["hardware_info", "model_search", "model_recommend", "execute_program"] {
+    for name in ["hardware_info", "model_search", "model_recommend"] {
+        if cfg!(target_os = "linux") {
+            assert!(matches!(boundary_route(name), Some(BoundaryRoute::GatewayHandler(_))));
+        } else { assert_eq!(boundary_route(name), Some(BoundaryRoute::Execution)); }
+    }
+    for name in ["execute_program"] {
         assert_eq!(boundary_route(name), Some(BoundaryRoute::Execution));
     }
     for name in ["cost_recent", "cost_users", "wiki_read", "identity_resolve", "computer_session_start", "computer_workspace_write"] {
@@ -237,7 +242,7 @@ async fn isolated_records_use_employee_authority_not_run_record_grants() {
     record.tools = List::new(vec![Text::new("tasks_update".into()).unwrap()]).unwrap();
     record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee },
         ResourceGrant::Task { id: Text::new("task-a".into()).unwrap() }]).unwrap();
-    let call = Arc::new(IsolatedCall { home: home.path().into(), context: RequestContext::from_verified_record(record),
+    let call = Arc::new(IsolatedCall { forks: None, home: home.path().into(), context: RequestContext::from_verified_record(record),
         agent: "main".into(), roots: Arc::new(ResourceRoots::default()), parser: None,
         services: None, execution: None, worker: None, record_resolver: Some(Arc::new(RecordProbe)) });
     ISOLATED_CALL.scope(call, async {
@@ -297,7 +302,7 @@ async fn isolated_round4_intentional_refusals_stay_hidden_with_grants() {
             let mut record = context().record().clone();
             record.tools = List::new(vec![Text::new(tool.name.into()).unwrap()]).unwrap();
             record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee }]).unwrap();
-            let call = Arc::new(IsolatedCall { home: PathBuf::new(), context: RequestContext::from_verified_record(record),
+            let call = Arc::new(IsolatedCall { forks: None, home: PathBuf::new(), context: RequestContext::from_verified_record(record),
                 agent: "main".into(), roots: Arc::new(ResourceRoots::default()), parser: None,
                 services: None, execution: None, worker: None, record_resolver: Some(Arc::new(RecordProbe)) });
             ISOLATED_CALL.scope(call, async {
@@ -333,7 +338,7 @@ async fn isolated_mail_read_preserves_original_employee_ownership_rule() {
         "from":"sender@example.com", "subject":"private", "body":"PRIVATE_UNOWNED_BODY", "source":"dropfolder"
     })).unwrap();
     duduclaw_gateway::mail::append_row(home.path(), &row);
-    let isolated = Arc::new(IsolatedCall { home: home.path().into(), context: context(), agent: "main".into(),
+    let isolated = Arc::new(IsolatedCall { forks: None, home: home.path().into(), context: context(), agent: "main".into(),
         roots: Arc::new(ResourceRoots::default()), parser: None, services: None,
         execution: None, worker: None, record_resolver: None });
     ISOLATED_CALL.scope(isolated, async {
@@ -372,4 +377,146 @@ async fn isolated_round5_workflow_session_is_host_only_and_bound_to_one_run() {
         .await.unwrap().unwrap();
     assert!(other.to_string().contains("workflow extension unavailable"), "{other}");
     assert!(!other.to_string().contains(&secret));
+}
+
+#[test]
+fn isolated_i1b_host_routes_preserve_full_inventory_and_missing_helpers() {
+    let home = tempfile::tempdir().unwrap();
+    let dispatcher = adapter(home.path());
+    let manifest = dispatcher.service_manifest();
+    // The original 22 A operations remain advertised in the implementation
+    // inventory. Only concrete queue/store/control/host-query handlers are ready here.
+    for name in ["create_task", "spawn_agent", "spawn_ephemeral", "discovery_catalog", "discovery_list",
+        "discovery_tree", "discovery_cancel"] {
+        assert!(matches!(boundary_route(name), Some(BoundaryRoute::GatewayHandler(_))), "{name}");
+        assert_eq!(manifest.iter().find(|(tool, _)| *tool == name).unwrap().1,
+            ServiceState::Ready, "{name}");
+    }
+    for name in ["hardware_info", "model_search", "model_recommend"] {
+        if cfg!(target_os = "linux") {
+            assert!(matches!(boundary_route(name), Some(BoundaryRoute::GatewayHandler(_))), "{name}");
+            assert_eq!(manifest.iter().find(|(tool, _)| *tool == name).unwrap().1, ServiceState::Ready, "{name}");
+        } else {
+            assert_eq!(boundary_route(name), Some(BoundaryRoute::Execution), "{name}");
+            assert_eq!(manifest.iter().find(|(tool, _)| *tool == name).unwrap().1, ServiceState::MissingFactory, "{name}");
+        }
+    }
+    for name in ["fork_run", "merge_or_select", "terminate_branch"] {
+        assert!(matches!(boundary_route(name), Some(BoundaryRoute::GatewayHandler(_))), "{name}");
+        assert_eq!(manifest.iter().find(|(tool, _)| *tool == name).unwrap().1,
+            ServiceState::IntentionalRefusal(crate::mcp_isolation_disposition::Refusal::ForkNextRelease), "{name}");
+    }
+    for name in ["inspect_branches", "diff_branches", "fork_cost"] {
+        assert!(matches!(boundary_route(name), Some(BoundaryRoute::GatewayHandler(_))), "{name}");
+        assert_eq!(manifest.iter().find(|(tool, _)| *tool == name).unwrap().1, ServiceState::MissingFactory, "{name}");
+    }
+    for name in ["execute_program", "office_script", "browser_record_start", "browser_record_stop",
+        "code_map"] {
+        assert_eq!(boundary_route(name), Some(BoundaryRoute::Execution), "{name}");
+        assert_eq!(manifest.iter().find(|(tool, _)| *tool == name).unwrap().1,
+            ServiceState::MissingFactory, "{name}");
+    }
+    if cfg!(target_os = "linux") {
+        assert!(matches!(boundary_route("discovery_artifact"), Some(BoundaryRoute::GatewayHandler(_))));
+        assert_eq!(manifest.iter().find(|(tool, _)| *tool == "discovery_artifact").unwrap().1, ServiceState::Ready);
+    } else {
+        assert_eq!(manifest.iter().find(|(tool, _)| *tool == "discovery_artifact").unwrap().1, ServiceState::MissingFactory);
+    }
+    assert!(dispatcher.require_complete_services().is_err());
+}
+
+#[tokio::test]
+async fn isolated_i1b_round6_dispatch_localizes_deferred_forks_even_with_explicit_grants() {
+    let home = tempfile::tempdir().unwrap();
+    let mut dispatcher = adapter(home.path());
+    dispatcher.principal.scopes = [crate::mcp_auth::Scope::Admin].into_iter().collect();
+    let mut record = context().record().clone();
+    record.lane = Lane::Standard;
+    record.tools = List::new(duduclaw_mcp_boundary::fork_policy::DEFERRED_TOOLS.into_iter()
+        .map(|name| Text::new(name.into()).unwrap()).collect()).unwrap();
+    record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee },
+        ResourceGrant::Workspace { handle: Text::new("employee-work".into()).unwrap() }]).unwrap();
+    for language in ["zh-TW", "en", "ja"] {
+        std::fs::write(home.path().join("config.toml"),
+            format!("[general]\ndefault_language = '{language}'\n")).unwrap();
+        for name in duduclaw_mcp_boundary::fork_policy::DEFERRED_TOOLS {
+            let response = dispatcher.dispatch(RequestContext::from_verified_record(record.clone()), "main",
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":name,"arguments":{}}})).await.unwrap().unwrap();
+            assert_eq!(response["error"]["code"], -32003, "{response}");
+            assert_eq!(response["error"]["message"], duduclaw_mcp_boundary::fork_policy::message(Some(language)));
+        }
+    }
+    assert!(!home.path().join("fork_store.db").exists());
+    assert!(!home.path().join("fork_ws").exists());
+}
+
+#[tokio::test]
+async fn isolated_i1b_host_controls_still_require_the_exact_capability() {
+    ISOLATED_CALL.scope(call(), async {
+        for name in ["create_task", "spawn_agent", "spawn_ephemeral", "inspect_branches",
+            "diff_branches", "fork_cost", "discovery_catalog", "discovery_list",
+            "discovery_tree", "discovery_cancel"] {
+            assert!(!tool_allowed(name, &principal()), "{name}");
+            let denied = dispatch_resource_tool(std::path::Path::new(""), name, &json!({})).await.unwrap();
+            assert_eq!(denied["isError"], true, "{name}");
+        }
+    }).await;
+}
+
+#[test]
+fn isolated_i1b_helper_control_schema_preserves_start_fields_and_host_controls() {
+    let mut tool = json!({"name":"execute_program", "inputSchema":{
+        "required":["code","language"], "properties":{"code":{"type":"string"},"language":{"type":"string"}}
+    }});
+    project_tool_schema(&mut tool);
+    assert_eq!(tool["inputSchema"]["required"], json!([]));
+    assert_eq!(tool["inputSchema"]["anyOf"][0]["required"], json!(["code","language"]));
+    assert_eq!(tool["inputSchema"]["anyOf"][0]["not"]["required"], json!(["action"]));
+    assert_eq!(tool["inputSchema"]["anyOf"][1]["required"], json!(["action","job"]));
+    assert_eq!(tool["inputSchema"]["properties"]["action"]["enum"], json!(["status","cancel"]));
+    assert_eq!(tool["inputSchema"]["properties"]["job"]["pattern"], "^[0-9a-f]{32}$");
+
+    let mut tool = json!({"name":"code_map", "inputSchema":{"properties":{"root":{"type":"string"}, "query":{"type":"string"}}}});
+    project_tool_schema(&mut tool);
+    assert!(tool["inputSchema"]["properties"].get("root").is_none());
+    assert_eq!(tool["inputSchema"]["required"], json!(["workspace"]));
+    assert!(tool["inputSchema"]["properties"].get("action").is_some());
+}
+
+#[test]
+fn isolated_i1b_recording_schema_requires_headless_and_reports_host_stop_semantics() {
+    let mut start = json!({"name":"browser_record_start","inputSchema":{"required":["url"],"properties":{"url":{"type":"string"}}}});
+    project_tool_schema(&mut start);
+    assert_eq!(start["inputSchema"]["properties"]["headless"]["const"], true);
+    assert_eq!(start["inputSchema"]["properties"]["max_seconds"]["maximum"], 300);
+    assert_eq!(start["inputSchema"]["anyOf"][0]["required"], json!(["url","headless"]));
+    assert_eq!(start["inputSchema"]["anyOf"][1]["required"], json!(["action","job"]));
+    let mut stop = json!({"name":"browser_record_stop","inputSchema":{"required":["id"],"properties":{"id":{"type":"string"}}}});
+    project_tool_schema(&mut stop);
+    assert_eq!(stop["inputSchema"]["properties"]["id"]["pattern"], "^[0-9a-f]{32}$");
+    assert!(stop["description"].as_str().unwrap().contains("stop_requested"));
+}
+
+#[test]
+fn isolated_i1b_fork_selection_schema_requires_exact_parent_cas() {
+    let mut selection = json!({"name":"merge_or_select","inputSchema":{"properties":{},"required":[]}});
+    project_tool_schema(&mut selection);
+    assert_eq!(selection["inputSchema"]["required"],
+        json!(["fork_id","branch_id","expected_revision","expected_parent_digest"]));
+    assert_eq!(selection["inputSchema"]["additionalProperties"], false);
+    assert!(selection["description"].as_str().unwrap().contains("does not overwrite"));
+    let mut diff = json!({"name":"diff_branches","inputSchema":{"properties":{},"required":[]}});
+    project_tool_schema(&mut diff);
+    assert_eq!(diff["inputSchema"]["required"], json!(["fork_id","left_branch_id","right_branch_id"]));
+    assert!(diff["inputSchema"]["properties"].get("branch_a").is_none());
+}
+
+#[test]
+fn isolated_i1b_round6_cost_schema_marks_missing_measurement() {
+    let mut tool = json!({"name":"fork_cost","inputSchema":{"properties":{"fork_id":{"type":"string"}},"required":["fork_id"]}});
+    project_tool_schema(&mut tool);
+    let description = tool["description"].as_str().unwrap();
+    assert!(description.contains("unavailable") && description.contains("null") && description.contains("never zero"));
+    assert_eq!(tool["inputSchema"]["required"], json!(["fork_id"]));
 }

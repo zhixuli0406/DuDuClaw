@@ -5589,3 +5589,1099 @@ bash scripts/release.sh linux-assets --target aarch64-unknown-linux-gnu --output
 | `docs/features/ja-JP/05-security-defense.md` | Align Japanese security description |
 | `CHANGELOG.md` | User-facing v1.80 preparation and changed timer/legacy-operation behavior |
 | `docs/architecture/native-linux-isolation.md` | This evidence, exact implementation gaps and remote handoff |
+
+## Package I1b — A tool operation routing (2026-11-05)
+
+**Round 1 archive. Superseded by the I1b Round 2 handoff below.**
+
+**Status: PARTIAL.** This work separates ten concrete gateway-owned operations
+from the 22-tool A execution inventory. It does not supply the twelve remaining
+installed helper/lifecycle producers. The program helper and conditional plan
+factory below are preparation only. This package does not populate `BootSources.execution_plans`, and
+does not make protected TEAM runnable. `require_complete_services` is unchanged:
+missing factories still block boot. No advertised tool was removed, no fake
+`SpawnPolicy` was added, and no gateway-uid fallback was introduced.
+
+### Implemented operation routes
+
+| Tools | Production behavior and authorization |
+| --- | --- |
+| `create_task`, `spawn_agent`, `spawn_ephemeral` | Gateway queue admission through the original handlers, retaining delegation/target ACLs, background admission leases, depth/hop limits, and immutable host caller/turn projection. `agent_id` remains target data and never changes caller identity. No same-employee helper is reserved. |
+| `inspect_branches`, `diff_branches`, `fork_cost` | Host-owned SQLite record queries. All three now require the fork's recorded owner before returning branch records/output/spend, including ordinary installations. Branch-read failures return errors rather than empty success. No workspace/artifact paths are opened. |
+| `discovery_catalog`, `discovery_list`, `discovery_tree`, `discovery_cancel` | Original discovery service and creator/target/manager gates, with a new constructor that requires the existing gateway request-local home/agent scope. It retains Agent authority; a human behind the run never becomes a Manager caller. |
+
+Discovery list/tree previously called the artifact verifier while projecting
+status, recursively hashing employee output directories. Independent review
+caught this hidden path. `TrustedCaller` now retains a private isolation bit;
+protected views skip that verifier and return `artifact_verified: null` plus
+`artifact_verification: "unavailable"`. Ordinary views keep their verification
+and boolean result, with the additional `"checked"` state. Both the CLI adapter
+and discovery artifact service refuse isolated artifact delivery. The protected
+views still read trusted configuration, frozen requests, bounded host reports
+and host SQLite records; they are not fd-based artifact delivery.
+
+Queue acceptance is **not** isolated target execution. Existing queues store
+sender/origin/depth/hop/turn/session and `on_behalf_of` where already supported;
+they do not serialize a fresh authenticated epoch/resource grant set or a full
+launch authorization. I1a must reconstruct and validate that authority at the
+actual target ingress. Ephemeral target UID/workspace provisioning is also still
+missing. Discovery cancellation commits the original task CAS (and withdrawal
+when pending approval); it does not claim cgroup/process retirement.
+
+### Program helper and workspace preparation (not installed)
+
+`duduclaw-program-helper` implements an internal, version-named fd protocol:
+Linux only, exact argument, non-root matching uid/euid, NNP, fixed `/work`, and
+sealed bounded fd 4. It accepts Python/Bash/JavaScript source (64 KiB), a 1–300 s
+timeout, and no caller executable/path/environment fields. Fixed interpreters run
+with a cleared environment. Concurrent output draining retains at most 128 KiB;
+validated typed JSON results fit in 1 MiB. Timeout kills/reaps the leader;
+namespace descendant retirement still relies on B2 and needs root acceptance.
+Other platforms refuse the binary entry. This protocol is internal to the helper,
+not a change to the shared isolation wire format or canonical bytes.
+
+The Linux-only `InstalledProgramPlans` producer re-reads the root publication,
+checks its generation, derives the calling employee's runtime entitlement, and
+requires the exact registered helper, fixed arguments, offline network, no MCP
+or PTY, and bounded resources. It reauthorizes during preparation and supplies
+only encoded source through the input stream. The root runtime deadline must
+include at least five additional seconds beyond the requested script timeout
+for kill/reap and result delivery. This allowance is not a measured teardown
+acceptance result. This producer is exported but **not installed in BootSources**.
+Signed installer packaging, result persistence/retrieval, original product result
+semantics and run-lifecycle integration are still missing; enabling it now would
+only return asynchronous acceptance and would not complete execute_program.
+
+`ResourceRoots::authorize_workspace` now mints an owned `AuthorizedWorkspace`
+proof bound to employee, caller run, exact workspace policy and an opened dirfd.
+`GatewayFactories::assemble` takes trusted roots; its resource wrapper checks the
+fresh grant set after preparation, opens the workspace with the existing safe
+openat2 path, and verifies the proof before returning the plan. The proof does
+not transfer a mount fd to spawnd and is dropped after plan validation: root still
+resolves its own employee mount. End-to-end root registry/mount identity and the
+spawn-time handoff must be verified before claiming workspace delivery acceptance.
+The assemble signature is an additive internal API dependency for sibling merges;
+all call sites in this worktree were updated. No contract crate was modified.
+
+The process inventory has one exact `isolated_helper` classification, constrained
+to employee identity and the private `program_helper.rs::execute` symbol. Other
+symbols or identities cannot use that exemption. This is inventory accounting,
+not evidence that the helper was installed or launched by the product.
+
+### Remaining work, in dependency order
+
+1. **Complete the real program path:** ship/register the signed helper and fixed
+   interpreter runtime; connect validated output collection, durable status,
+   original tool result semantics, cancellation and cleanup. Only then compose
+   the factory into boot. Preserve existing approvals and verify policy parity
+   with the legacy program handler (including the deliberately narrower offline
+   policy); do not turn the current queued handle into a completion claim.
+2. **Workspace handoff acceptance:** verify the new proof against actual root
+   registry mounts, resource changes and spawn-time identity on Linux. Extend
+   authorized workspace/input/output delivery for Office, forks and code maps.
+   Never treat legacy path strings as authority.
+3. **Twelve A routes remain `MissingFactory`:**
+
+   | Tool(s) | Still required |
+   | --- | --- |
+   | `execute_program` | Helper protocol, conditional factory and workspace proof are written; signed packaging/registration, policy parity, result retrieval/lifetime handling and boot installation remain. |
+   | `office_script` | Published approved skill/script mapping, disabled-skill and argument policies, authorized input/output workspaces, signed helper and result publication. |
+   | `fork_run` | Authorized parent/branch workspaces; sequential employee launches under D8; captured host authorization across task boundaries; branch/result lifecycle. Existing `current_dir` and detached execution are not usable protected producers. |
+   | `merge_or_select` | Owner-checked, fd-authorized retained output and parent publication/CAS. Existing pathname promotion stays unreachable from the protected route. |
+   | `terminate_branch` | Owned protected run mapping and backend cancellation/retirement; the legacy process-local cancellation set and pathname cleanup are insufficient. |
+   | `discovery_artifact` | Authorized descriptor-based manifest/read/digest delivery; do not reuse recursive host-path verification. |
+   | `browser_record_start`, `browser_record_stop` | Signed recording helper protocol plus gateway-owned job/run mapping, authorization and stop/result lifecycle. |
+   | `code_map` | Authorized workspace token and isolated bounded parser/helper; never rebuild the code map recursively in the gateway. |
+   | `hardware_info`, `model_search`, `model_recommend` | Explicit host-authority probe/catalog service mapping preserving original gates, fixed probe policy and credential/egress boundaries. The existing raw hardware subprocesses and model search's ambient `HF_TOKEN`/HTTP/cache path were not simply reclassified as safe. |
+
+4. **Cross-package gates and acceptance:** retain missing-factory boot refusal,
+   complete I1a target ingress and ephemeral provisioning, integrate E and other
+   runtime packages, then exercise the actual gateway/product dispatch path on
+   the Linux matrix. No root fixture or live-provider acceptance was run here.
+5. **Remote compilation and security review:** CLI/gateway Rust tests below are
+   written, not executed. Formal Daybreak review remains required; no Daybreak
+   tool/model was available in this session. Ordinary independent review is not
+   that signoff. Its discovery HIGH finding was fixed and re-reviewed separately.
+
+### Validation and remote commands
+
+Observed locally, without `cargo fmt`, gateway/CLI/workspace build, commit,
+merge, deployment, or edits to another project worktree:
+
+- `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=<this-worktree>/target/i1b-syntax cargo build --manifest-path /private/tmp/iso-a-syntax/Cargo.toml --offline`:
+  existing small syn syntax utility compiled successfully; no product crate was
+  compiled. Its source was inspected before use.
+- `target/i1b-syntax/debug/iso-a-syntax <changed Rust paths>`: syntax only; final
+  pass parsed **22 Rust files, 0 syntax errors**. This is not type checking.
+- `python3 -m unittest discover -s scripts/ci -p 'test_spawn_inventory.py' -v`:
+  **18 passed, 0 failed**.
+- `python3 scripts/ci/check_spawn_inventory.py --require-migrated`:
+  **499 functions classified, 0 migrations pending**. Inventory coverage is not
+  producer readiness or isolation acceptance.
+- `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target/i1b-check cargo test -p duduclaw-mcp-boundary --offline --lib`:
+  **61 passed, 0 failed** on macOS. Linux-only workspace tests did not run here.
+- `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target/i1b-check cargo check -p duduclaw-mcp-boundary --tests --target x86_64-unknown-linux-gnu --offline`:
+  passed, including Linux-only test type checking; existing unsafe-code warnings.
+- `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-execution --lib program_helper --offline`:
+  **2 passed, 0 failed** on macOS (pure protocol/capture tests).
+- `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo check -p duduclaw-execution --tests --target x86_64-unknown-linux-gnu --offline`:
+  passed; the four additional Linux helper tests were type-checked, not executed.
+- The first inventory run after adding the helper correctly failed on its new
+  unclassified process spawn; the constrained classification and its regression
+  test were then added. Final inventory result above supersedes that failure.
+- `git diff --check`: passed.
+
+Run on the remote builder (do not mistake an empty test filter for a pass):
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo check --target x86_64-unknown-linux-gnu -p duduclaw-gateway -p duduclaw-cli --tests
+cargo test -p duduclaw-execution --lib program_helper
+cargo test -p duduclaw-mcp-boundary --lib helper_workspace_token_binds_owner_run_and_relative_directory
+cargo test -p duduclaw-mcp-boundary --lib factories::tests
+cargo test -p duduclaw-gateway program_plans_
+cargo test -p duduclaw-cli target_dispatch_
+cargo test -p duduclaw-cli discovery_isolation_
+cargo test -p duduclaw-cli isolated_fork_reads_require_owner_before_returning_records
+cargo test -p duduclaw-cli isolated_i1b_
+cargo test -p duduclaw-gateway discovery_isolation_completed_views_never_invoke_artifact_verifier
+cargo test -p duduclaw-cli mcp_isolation
+cargo test -p duduclaw-cli mcp_fork::tests
+cargo test -p duduclaw-gateway discovery::service::tests
+```
+
+Also run the existing macOS/Windows compilation legs. The helper adds Linux-only
+uid/NNP/sealed-fd checks behind cfg; no new dependency, shared isolation contract
+change or root fixture was added. No root/provider/product acceptance is claimed.
+
+### File handoff
+
+| File | Change |
+| --- | --- |
+| `crates/duduclaw-cli/src/lib.rs` | Register the A target-dispatch routing module. |
+| `crates/duduclaw-cli/src/mcp_isolation_a_routes.rs` | Exact target-dispatch classification; original queue, caller metadata, delegation and background-admission regressions. |
+| `crates/duduclaw-cli/src/mcp_isolation.rs` | Route ten queue/store/control operations through their authenticated original handlers. |
+| `crates/duduclaw-cli/src/mcp_isolation_tests.rs` | Pin all 22 A inventory entries, twelve missing helpers, completeness refusal and exact capability denials. |
+| `crates/duduclaw-cli/src/mcp_fork.rs` | Owner checks for three record queries, fail-closed store errors, cross-owner regression. |
+| `crates/duduclaw-cli/src/mcp/discovery.rs` | Match immutable scopes, invoke isolated Agent constructor, refuse protected artifact paths. |
+| `crates/duduclaw-cli/src/mcp/discovery_isolation_tests.rs` | Forged caller/home, foreign access and own cancellation regressions. |
+| `crates/duduclaw-gateway/src/discovery/service.rs` | Verified isolated Agent constructor and private isolation bit. |
+| `crates/duduclaw-gateway/src/discovery/service_queries.rs` | Isolated metadata views skip artifact traversal; direct artifact service rejects isolated callers. |
+| `crates/duduclaw-gateway/src/discovery/tests_service.rs` | Include completed-run isolation regression. |
+| `crates/duduclaw-gateway/src/discovery/tests_service_isolation.rs` | Real host-store completed-run fixture with poison artifact path and verifier invocation instrumentation/control. |
+| `crates/duduclaw-execution/src/program_helper.rs` | Strict request/result protocol, sealed input entry, bounded child execution and six tests (two portable, four Linux-only). |
+| `crates/duduclaw-execution/src/bin/duduclaw-program-helper.rs` | Fixed binary entry; non-Linux refuses. |
+| `crates/duduclaw-execution/src/lib.rs` | Export helper protocol. |
+| `crates/duduclaw-execution/README.md` | Describe protocol, deployment and acceptance boundary. |
+| `crates/duduclaw-gateway/src/isolation_execution_program.rs` | Fresh-publication, employee-entitled conditional program plan factory and three tests. |
+| `crates/duduclaw-gateway/src/isolation_execution.rs` | Linux-only export; no boot activation. |
+| `crates/duduclaw-mcp-boundary/src/resources.rs` | Private-constructor workspace authorization proof over retained dirfd. |
+| `crates/duduclaw-mcp-boundary/src/resources_tests.rs` | Linux proof owner/run/path/symlink denial test. |
+| `crates/duduclaw-mcp-boundary/src/factories.rs` | Trusted roots argument and post-prepare workspace authorization. |
+| `crates/duduclaw-mcp-boundary/src/factories_tests.rs` | Update injected roots; reject a plan workspace present in capability but absent from the operation resolver grants. |
+| `crates/duduclaw-mcp-boundary/README.md` | Document workspace proof and internal assembly dependency. |
+| `crates/duduclaw-gateway/src/isolation_mcp/boot.rs` | Pass existing trusted roots into assembly (one additive argument). |
+| `crates/duduclaw-cli/src/mcp_isolation_parity_tests.rs` | Update assembly fixture for trusted roots argument. |
+| `scripts/ci/check_spawn_inventory.py` | Constrain the employee-side helper classification to one exact symbol. |
+| `scripts/ci/privileged_effects.json` | Inventory the private helper process launch. |
+| `scripts/ci/test_spawn_inventory.py` | Reject broad or wrong-identity helper exemptions. |
+| `docs/features/{,zh-TW/,ja-JP/}05-security-defense.md` | Owner checks, metadata-only discovery behavior, queue/cancellation and acceptance boundaries. |
+| `CHANGELOG.md` | Self-contained Security entry in Traditional Chinese. |
+| `docs/architecture/native-linux-isolation.md` | This I1b partial handoff, remaining twelve routes and remote test instructions. |
+
+Final ordinary independent review: the discovery artifact-traversal HIGH was
+fixed; re-review reported no remaining HIGH/Critical finding in this diff.
+The program timeout review finding was fixed with explicit result-delivery
+headroom and re-reviewed without a remaining HIGH or MEDIUM finding. A final
+resolver-vs-capability workspace regression was added, passed and reviewed.
+Gateway/CLI type checking, product execution and Daybreak signoff remain
+unverified; the small-crate checks above do not replace them.
+
+### I1b Round 2 handoff — 2026-11-05
+
+**Archived status; the I1b Round 3 handoff below supersedes this remaining-work list.**
+
+**Status: PARTIAL; supersedes the Round 1 preparation/remaining-work status.**
+The assigned `feat/iso-i1b-20261105` worktree still contains both rounds, all
+uncommitted. This session did not create or remove a worktree, run cargo fmt,
+commit, merge, release, deploy, change production data, or build the gateway/CLI
+packages. Their complete compilation/tests remain a remote-builder gate.
+
+#### Actual routing after this round
+
+The original 22 A tools remain in the inventory. Fourteen have concrete host
+queue/store/control/query/artifact routes on Linux (the ten from round 1 plus
+three inference queries and `discovery_artifact`). Three additional tools have
+conditional installed helper producers. Five still lack production producers:
+
+| Tools | Current production path / limit |
+| --- | --- |
+| `execute_program` | `InstalledProgramPlans`, real backend reservation/spawn, authorized employee-work proof, sealed fd-4 program request, strict typed result collector and durable gateway job. Offline only; same-employee execution is queued until the caller exits. |
+| `office_script` | Exact signed per-skill/script profile; disabled-skill state is read from the exact authenticated gateway call during both authorization and preparation. Only bundled `docx`/`xlsx`/`pptx`/`pdf` `create` and `extract` schemas are admitted. Input is a bounded nofollow/openat2 snapshot; private output is checked and published atomically with RENAME_NOREPLACE through its retained workspace parent fd. Existing outputs/links and missing parents refuse. `to_pdf` remains refused pending a signed converter dependency protocol. |
+| `code_map` | Offline employee helper over authorized employee-work. Bounded lexical source/symbol index with query/chat-file ranking, finite traversal/input/output ceilings and explicit truncation. It is not the legacy complete tree-sitter-style index or a recursive gateway parser. |
+| `hardware_info` | Authenticated host handler, bounded fixed `/proc/meminfo` and sysfs PCI/VRAM reads, no hardware subprocesses. Unsupported GPU names/counters remain unknown. Original capability/scope/live resources still narrow it. |
+| `model_search`, `model_recommend` | Authenticated host catalog queries, retaining Connector resource authorization. Explicitly **bundled catalog only**, hardware-filtered, multi-vendor; no HuggingFace network search, ambient token or shared cache. List descriptions state this narrower behavior. |
+| `discovery_artifact` | Original creator/target ACLs and terminal checkpoint binding, durable host-published manifest, host-owned private export dirfds and openat2 BENEATH/NO_SYMLINKS/NO_MAGICLINKS/NO_XDEV. Selected file bytes are SHA-256 checked and ACL/checkpoint binding is rechecked after I/O. Protected download cap is 2 MiB so base64 plus JSON fit D's 4-MiB response envelope. Listing distinguishes manifest verification from current file content verification. |
+| `fork_run`, `merge_or_select`, `terminate_branch` | **MissingFactory.** Require a durable owned fork/branch→run/workspace mapping, sequential D8 launch, captured host authority, retained output descriptors and publication/CAS. Existing current_dir, detached fork execution, process-local cancellation and pathname promotion are still not protected producers. |
+| `browser_record_start`, `browser_record_stop` | **MissingFactory.** Require signed browser/driver/dependency profiles, an actual recording helper protocol with egress, durable recording→run ownership, stop/retirement and typed artifact publication. Existing ambient Node/Playwright/desktop driver code stays unreachable. |
+
+The three helper tools also remain unavailable if their signed profiles are
+absent. No profile was signed, installed or registered on a live machine here.
+`fill_installed_sources` now conditionally supplies the execution plan factory
+from the composite hook's verified generation, but never writes readiness.
+`require_complete_services` is unchanged and the five remaining A routes (plus
+other packages' gaps) continue to prevent protected TEAM execution. No tool was
+removed from inventory to pass that check.
+
+#### Signed helper packaging contract (not published here)
+
+All helper entries are root-published registered runtimes, offline, no MCP or
+PTY; the selected employee must have the exact profile entitlement. Publication
+is reread on support/authorization/preparation and generation must match the
+composite verified generation. Resource budgets must cover the encoded input
+and 1-MiB result envelope; root runtime deadline must reserve five seconds beyond
+the helper's requested deadline.
+
+| Runtime | Binary / exact fixed args |
+| --- | --- |
+| `duduclaw-program-v1` | `duduclaw-program-helper --program-fd-v1 <python-sha256> <bash-sha256> <node-sha256>` |
+| `duduclaw-code-map-v1` | `duduclaw-code-map-helper --code-map-fd-v1` |
+| `duduclaw-office-<skill>-<script>-v1` | `duduclaw-office-helper --office-fd-v1 <skill> <script> <script-sha256> <python-sha256>` |
+
+Program interpreters are the immutable root-owned `/runtime/python3`,
+`/runtime/bash`, `/runtime/node`; Office uses `/runtime/python3` and
+`/runtime/office-<skill>-<script>.py`. Helpers verify the root-profile-pinned
+SHA-256 of the selected interpreter (streamed, 256-MiB ceiling; regular,
+single-link, root-owned, not group/other-writable) before execution. Office also
+verifies its script digest. There is no production `/usr/bin` interpreter or
+PATH fallback. The `/usr/bin` program fixture is explicitly `cfg(test)` only.
+Python stdlib/site-packages, native libraries, script compatibility and signed
+installer packaging still require real generation/root-runtime acceptance.
+No claim is made that these runtime files presently exist in an installation.
+
+The helper fd inputs are bounded internal JSON protocols, not additions to the
+shared isolation wire schema/canonical signing bytes. **No shared-contract
+change.** One light direct dependency was added: execution now uses existing
+locked `sha2 0.10.9`; no dependency version was upgraded.
+
+#### Jobs, results and authenticated host control
+
+Boot opens a gateway-owned `isolation-execution-jobs.db` before constructing
+protected dispatchers. `ResourceCheckedPlans` still resolves live resources
+before/after policy preparation and requires its opaque AuthorizedWorkspace
+proof. Root/B2 independently resolves the actual mount; proof→root mount identity
+acceptance remains outstanding.
+
+The helper call returns `accepted`, `completion=pending`, `job` and the legacy
+`run_handle`, never synchronous success. Its background **host** collector uses
+WaitOrigin::Gateway, retries TakeIo while queued, drains stdout/stderr with hard
+limits, validates the typed helper protocol only after backend completion, and
+persists the result. SpawndBackend now permits the root protocol's one-time
+retained stdio delivery after a fast Exited/Signalled run too.
+
+The same authenticated tool accepts `action=status|cancel`, `job` and optional
+workspace (code_map's projected schema requires workspace). These are host job
+control operations: no child reservation, fabricated plan, PID or employee wait.
+They require current capability/scope/live resource checks plus exact employee,
+principal including generation, employee binding and original tool name in the
+host record. A selector cannot transfer authority to another employee/principal.
+Cancel Ack means requested, not retired. Broken transport, abandonment and restart
+remain uncertain. The durable store is WAL/FULL, at most 32 records per employee
+and 4096 total; oldest own complete results may be evicted at the per-employee
+cap, complete/uncertain metadata expires after seven days. Expiring metadata
+never certifies process retirement. Insertion/caller-cancellation races and
+failed spawns cannot silently leave permanent pending records.
+
+Discovery manifests reuse hashes already captured by the existing private
+checkpoint export's IntegrityGuard; publication adds no new recursive tree read.
+Manifest+checkpoint digest are written in one host row. Bounds: 4096 entries,
+1-MiB encoded manifest, UTF-8 safe relative names and complete directory ancestry.
+Historical rows without manifests refuse protected delivery; no on-demand
+backfill walks employee content. This does not implement `discovery_create`'s
+separate protected execution/worker producer.
+
+#### Files changed in round 2
+
+Round 1-only edits remain present and are listed in its archived table above.
+
+| Path | Round 2 change |
+| --- | --- |
+| `crates/duduclaw-execution/Cargo.toml`, `Cargo.lock` | Add existing sha2 for runtime interpreter/script digest readback. |
+| `crates/duduclaw-execution/src/lib.rs` | Export code-map/Office helper protocols and gate Office I/O to Linux. |
+| `crates/duduclaw-execution/src/program_helper.rs` | Reusable private bounded process runner; root-pinned immutable interpreters; shared sealed input checks. |
+| `crates/duduclaw-execution/src/code_map_helper.rs` | New bounded offline workspace index/protocol/result validation and tests. |
+| `crates/duduclaw-execution/src/office_helper.rs` | New signed mapping, exact create/extract schema and typed helper entry/tests. |
+| `crates/duduclaw-execution/src/office_io.rs` | New descriptor input snapshots, private output and atomic no-clobber publication/tests. |
+| `crates/duduclaw-execution/src/bin/duduclaw-code-map-helper.rs` | New fixed code-map entry. |
+| `crates/duduclaw-execution/src/bin/duduclaw-office-helper.rs` | New fixed Office entry. |
+| `crates/duduclaw-execution/src/spawnd.rs` | Preserve one-shot output collection after a fast terminal run; root remains authoritative. |
+| `crates/duduclaw-mcp-boundary/src/execution.rs` | Typed asynchronous collection, authenticated host status/cancel, queued I/O retry and abandonment cleanup. |
+| `crates/duduclaw-mcp-boundary/src/execution_tests.rs` | Queued I/O, failed start and abandoned INSERT regression tests. |
+| `crates/duduclaw-mcp-boundary/src/execution_jobs.rs` | New durable exact-actor job store, finite retention/admission and SQLite tests. |
+| `crates/duduclaw-mcp-boundary/src/factories.rs` | Propagate result/control contracts and install host-owned jobs into the bridge. |
+| `crates/duduclaw-mcp-boundary/src/lib.rs` | Export jobs interface. |
+| `crates/duduclaw-gateway/src/isolation_execution_program.rs` | Conditional real program/Office/code-map plans, publication/entitlement/payload/typed-result validation. |
+| `crates/duduclaw-gateway/src/isolation_egress.rs` | Exact verified task-local employee identity for Office disabled-skill policy. |
+| `crates/duduclaw-gateway/src/isolation_mcp/boot.rs` | Conditional installed plan factory and durable jobs; no readiness promotion. |
+| `crates/duduclaw-cli/src/mcp_isolation_inference.rs` | New authenticated bounded host hardware and explicit catalog-only model queries/tests. |
+| `crates/duduclaw-cli/src/mcp/inference.rs` | Protected-call dispatch to the host inference service. |
+| `crates/duduclaw-cli/src/lib.rs` | Register the host inference adapter. |
+| `crates/duduclaw-cli/src/mcp_isolation.rs` | Exact Linux host query/artifact routes, constrained descriptions, helper status/cancel schemas. |
+| `crates/duduclaw-cli/src/mcp_isolation_tests.rs` | Preserve inventory/readiness assertions and add helper control-schema regression. |
+| `crates/duduclaw-cli/src/mcp/discovery.rs` | Send protected artifacts to the ACL-bound host descriptor service. |
+| `crates/duduclaw-gateway/src/discovery/artifact_manifest.rs` | New bounded checkpoint manifest and descriptor-only host export reader. |
+| `crates/duduclaw-gateway/src/discovery/service_artifact_isolation.rs` | New ACL/rebinding-safe selected artifact delivery. |
+| `crates/duduclaw-gateway/src/discovery/tests_artifact_manifest.rs` | New bounded protocol and Linux fd denial tests. |
+| `crates/duduclaw-gateway/src/discovery/tests_service_isolation.rs` | ACL/checkpoint/content-tamper service test. |
+| `crates/duduclaw-gateway/src/discovery/mod.rs` | Register the artifact module. |
+| `crates/duduclaw-gateway/src/discovery/store.rs` | Add nullable manifest column for historical compatibility. |
+| `crates/duduclaw-gateway/src/discovery/store_metadata.rs` | Atomic digest+manifest publication and bounded readback. |
+| `crates/duduclaw-gateway/src/discovery/workspace.rs` | Export the already captured checkpoint hashes without another walk. |
+| `crates/duduclaw-gateway/src/discovery/online.rs` | Publish manifest from the verified private checkpoint guard. |
+| `scripts/ci/check_spawn_inventory.py`, `scripts/ci/privileged_effects.json`, `scripts/ci/test_spawn_inventory.py` | Keep the employee helper exception exact after moving spawn to private execute_command. |
+| Execution/boundary READMEs, this note, security feature pages (en/zh-TW/ja-JP), `CHANGELOG.md` | Document actual conditional behavior, narrower semantics, outstanding gates and evidence. |
+
+#### Round 2 observed validation and remaining acceptance
+
+Every cargo invocation used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, offline,
+and a target directory inside this assigned worktree. No gateway/CLI package or
+workspace build was run. Cross checks compile Linux/Windows branches and tests;
+they do **not** execute them.
+
+| Exact command after that environment prefix | Observed result |
+| --- | --- |
+| `CARGO_TARGET_DIR=target/i1b-check cargo test -p duduclaw-execution --lib --offline` | macOS: 37 passed, 0 failed. Includes program/Office/code-map protocol tests and existing local backend regressions. |
+| `CARGO_TARGET_DIR=target/i1b-check cargo test -p duduclaw-mcp-boundary --features binding-store --lib --offline` | macOS: 77 passed, 0 failed. Includes actor/generation/binding/tool theft, quota/retention, cancellation, restart, abandoned INSERT and queued-I/O collector regressions. |
+| `CARGO_TARGET_DIR=target/i1b-helper-final cargo check -p duduclaw-execution --tests --bins --target x86_64-unknown-linux-gnu --offline` | PASS; Linux Office snapshot/no-clobber and helper process tests type-check only. |
+| `CARGO_TARGET_DIR=target/i1b-check cargo check -p duduclaw-execution --tests --bins --target x86_64-pc-windows-gnu --offline` | PASS; helper binary entries refuse off Linux. No Windows execution. |
+| `CARGO_TARGET_DIR=target/i1b-helper-final cargo check -p duduclaw-mcp-boundary --features binding-store --tests --target x86_64-unknown-linux-gnu --offline` | PASS, including Linux tests. Uses the explicit Zig C compiler wrapper described below for bundled SQLite. |
+| `CARGO_TARGET_DIR=target/i1b-check cargo check --manifest-path /private/tmp/i1b-plan-check/Cargo.toml --tests --target x86_64-unknown-linux-gnu --offline` | PASS. Compiles the actual gateway producer source against real execution/isolation/boundary/spawnd APIs. Only employee task-local lookup and disabled-skill reads are explicitly stubbed; this is not a gateway build or policy acceptance. |
+| `CARGO_TARGET_DIR=target/i1b-artifact-final cargo test --manifest-path /private/tmp/i1b-artifact-check/Cargo.toml --offline` | macOS source-module harness: 2 passed, 0 failed; only the actual artifact manifest module, no gateway build. |
+| `CARGO_TARGET_DIR=target/i1b-check cargo check --manifest-path /private/tmp/i1b-artifact-check/Cargo.toml --tests --target x86_64-unknown-linux-gnu --offline` | PASS; two Linux descriptor tests compile but did not execute. |
+| `python3 -m unittest discover -s scripts/ci -p 'test_spawn_inventory.py' -v` | 18 passed, 0 failed. |
+| `python3 scripts/ci/check_spawn_inventory.py --require-migrated` | 499 functions classified, 0 migrations pending; not producer readiness evidence. |
+| `target/i1b-syntax/debug/iso-a-syntax <all changed/untracked Rust paths>` | 43 Rust files parsed, 0 syntax errors; gateway/CLI type checking remains remote. |
+| `git diff --check` | PASS. |
+
+For Linux checks that depend on bundled SQLite, the command additionally used
+`CC_x86_64_unknown_linux_gnu=/private/tmp/i1b-zig-cc`,
+`ZIG_GLOBAL_CACHE_DIR=/private/tmp/i1b-zig-cache`, and
+`ZIG_LOCAL_CACHE_DIR=/private/tmp/i1b-zig-local`. The small local wrapper executes
+installed `/opt/homebrew/bin/zig cc -target x86_64-linux-gnu`, removing cc-rs's
+incompatible `--target=x86_64-unknown-linux-gnu` spelling. The harness lockfile
+was copied from this worktree's Cargo.lock to preserve the existing locked
+async-executor version. Initial harness attempts failed on offline resolution
+of a yanked dependency and missing cross gcc; the final pinned-lock/Zig check
+passed without dependency upgrades or gateway/CLI compilation. Unsafe-code
+warnings in the isolation packages remain warnings, not suppressed checks.
+
+Ordinary independent review found and fixed: queued TakeIo wrongly causing
+cancellation; durable pending-row leakage/cross-employee quota exhaustion;
+Office existing symlink input/output escape; artifact base64 exceeding the MCP
+response budget; code-map rendered text overflowing its typed bound. Reviewers
+read back fixes and reported no remaining CRITICAL/HIGH in the reviewed scope.
+This is **not Daybreak** implementation signoff; that tool/model was unavailable.
+
+Remote builder/native runner must still run these filters (plus full required
+Rust/CLI/gateway checks), on the actual integrated branch:
+
+```sh
+cargo test -p duduclaw-cli isolated_i1b_
+cargo test -p duduclaw-cli host_inference_
+cargo test -p duduclaw-cli discovery_isolation_
+cargo test -p duduclaw-gateway program_plans_
+cargo test -p duduclaw-gateway isolation_boot_
+cargo test -p duduclaw-gateway artifact_manifest_
+cargo test -p duduclaw-gateway discovery_isolation_
+cargo test -p duduclaw-execution program_helper
+cargo test -p duduclaw-execution office_
+cargo test -p duduclaw-execution code_map_helper
+cargo test -p duduclaw-mcp-boundary --features binding-store isolated_execution_
+cargo test -p duduclaw-mcp-boundary --features binding-store execution_jobs_
+```
+
+Linux-specific named tests include
+`office_snapshots_reject_workspace_links_and_publish_without_replacement`,
+`program_helper_executes_fixed_interpreter_and_reports_exit`,
+`program_helper_timeout_kills_and_reaps_interpreter`,
+`program_helper_drains_both_streams_past_combined_limit`,
+`program_helper_rejects_unsealed_and_accepts_fully_sealed_input`,
+`artifact_manifest_descriptor_delivery_rejects_symlinks_hardlinks_and_fifo`, and
+`artifact_manifest_descriptor_root_rejects_replaced_ancestor`.
+These ordinary isolated-temp fixtures do not require root/namespaces. No new
+privileged root fixture was introduced, and no such test was executed here.
+
+Remaining hard gates: the five A producers above; to_pdf converter protocol;
+official signed helper/interpreter/script/dependency packaging and root profile
+registration; complete gateway/CLI compilation; proof-to-mount/root publication
+acceptance and actual D8 launch/result/cancel/restart on the Linux matrix; I1a
+parent→target launch authority/ephemeral provisioning; E and runtime/PTY sibling
+integration; formal Daybreak review and owner release decision. Protected TEAM,
+provider, migration, release and customer acceptance are not claimed.
+
+### I1b Round 3 handoff — 2026-11-05
+
+**Status: PARTIAL. This supersedes Round 2's five-missing-producer status; it
+is not A readiness or native/browser acceptance.** Rounds 1–3 remain uncommitted
+in the assigned `feat/iso-i1b-20261105` worktree. This session did not create a
+worktree, commit, run cargo fmt, build the gateway/CLI packages locally, deploy,
+sign/install a runtime, or change production data.
+
+#### Readiness decision and exact remaining producers
+
+The original 22 A tools remain in the inventory: fourteen concrete host routes,
+five conditional helper/control implementations, and **three missing fork
+producers**. The new two conditional implementations are
+`browser_record_start` / `browser_record_stop`; they are unavailable without
+the exact installed signed runtime and durable jobs. **The A readiness hook was
+not flipped**, and `require_complete_services` is unchanged. A factory's
+`supports` result is implementation availability, never successful execution
+or native acceptance. There is no inventory shrink or gateway-uid fallback.
+
+| Operation | Round 3 outcome / remaining blocker |
+| --- | --- |
+| `browser_record_start` | Actual conditional registered helper plan, sealed request, backend reservation/spawn, AuthorizedWorkspace wrapper, egress, typed result collection and atomic bounded artifact publication. Only explicit headless mode, 1–300 seconds (default 30). Signed packaging/profile compatibility and native browser acceptance remain absent. Human-operated desktop/browser demonstration and recording-to-skill integration are not implemented by this path. |
+| `browser_record_stop` | Actual exact-owner durable cooperative stop alias, plus an independent fresh-Admin gateway RPC usable while D8 is occupied. No fake plan, child reservation or synchronous same-employee wait. Acknowledgement is `stop_requested`, not completed/retired. No dedicated dashboard button was added. |
+| `fork_run` | **Not implemented; MissingFactory.** There is still no protected durable fork/branch-to-reserved-run/workspace association or sequential D8 branch driver carrying captured host authorization. `InstalledMainPlanFactory` currently only builds its existing Claude main/dispatch classes and fixed employee-work; it is not an authorized branch launch/snapshot producer. Reusing detached legacy execution or process current_dir would violate the assignment. |
+| `merge_or_select` | **Not implemented; MissingFactory.** No producer-owned retained branch descriptor/manifest plus exact actor/generation binding and parent publication CAS exists. Legacy `fork_store.db` employee-name ownership and pathname promotion cannot authorize a protected publication. |
+| `terminate_branch` | **Not implemented; MissingFactory.** No durable exact-actor branch-to-root RunHandle mapping exists; the process-local kill registry and logical branch-state write do not prove backend cancellation or retirement. |
+
+The three legacy fork mutation handlers now additionally refuse an isolated
+call or a process requiring isolation **before** opening stores, sweeping
+retention, discovering accounts, spawning or publishing paths. This closes an
+accidental direct-handler fallback; it is expressly **not** a fork producer.
+The native browser handlers likewise refuse direct protected invocation before
+ambient Node/Playwright lookup or recording filesystem work.
+
+Next implementation must supply the owned fork mapping and branch execution
+first, then descriptor/manifest publication with CAS and authenticated backend
+cancellation. Do not make promotion or termination look ready by inventing
+records for legacy forks. The work was stopped with these explicit gaps rather
+than weakening D8 or treating preparation as a working producer.
+
+#### Signed recording protocol and actual semantics
+
+`duduclaw-recording-helper` is a Linux employee helper, root runtime id
+`duduclaw-browser-record-v1`, with **exactly** these signed fixed arguments:
+
+```text
+--browser-record-fd-v1 <node-sha256> <playwright-bundle-sha256> <chromium-sha256>
+```
+
+The helper uses the same sealed fd-4, non-root uid/euid, NNP and `/work` entry
+checks as the existing program helpers. `/runtime/node`, a self-contained
+`/runtime/playwright.cjs` bundle and `/runtime/chromium` must be immutable,
+root-owned regular single-link files with matching SHA-256. The browser driver
+is embedded in the signed helper; no ambient npm cache, NODE_PATH, download,
+user executable path, host display, `--no-sandbox` or local fallback is used.
+The profile must have egress, no MCP and no PTY; output budget is at least
+64 KiB, with runtime headroom of 20 seconds beyond the recording cap (15 for
+flush/helper termination plus the common 5-second result grace). The largest
+accepted cap therefore needs a 320,000-ms runtime profile.
+
+Chromium keeps its sandbox enabled. Compatibility with B's namespace/seccomp
+policy has **not** been demonstrated. Package F still needs to ship/pin the
+real bundle, browser, shared-library/resource dependencies and root profile;
+no such runtime was published or live-tested here. Do not fix incompatibility
+by disabling the sandbox or permitting new namespace authority without review.
+C's root-derived loopback proxy is passed explicitly to the browser; private
+address/DNS/redirect denial stays with C. HTTP navigation can fail under the
+CONNECT-only profile; the typed `navigation` field distinguishes completed,
+failed, interrupted and not_attempted rather than calling a failed load a
+successful navigation.
+
+Requests accept only URL/name/headless/max_seconds and the authorized workspace
+selector. The caller cannot choose id, run, program, argv, proxy or identity.
+The host replaces the provisional id with the actual reserved RunHandle before
+sealing the input. The collector checks returned recording id against that
+handle. Root entitlements, resource checks and original MCP recording/scope/
+approval gates still narrow every launch.
+
+The helper creates trace.zip, actions.json and network.json in private per-run
+temporary storage. Actions contain kind/tag only; network metadata contains
+origin/status only, omitting URL query/path, headers, cookies and bodies.
+**Trace screenshots/snapshots remain sensitive raw content and may contain
+secrets; this is not a redacted HAR.** No trace content is read or parsed by the
+gateway, exported to a user automatically, or fed to skill distillation.
+
+Publication snapshots each regular single-link file (at most 16 MiB each),
+computes its digest, fsyncs and publishes the whole directory at
+`employee-work/recordings/<id>` using retained dirfds, openat2 BENEATH /
+NO_SYMLINKS / NO_MAGICLINKS / NO_XDEV and RENAME_NOREPLACE. Existing names,
+links, missing artifacts and oversize refuse. Pre-publication staging is cleaned
+on error; an already-renamed publication is not deleted on a later fsync error.
+Only three fixed artifact names, byte counts/digests and bounded status fields
+reach the gateway. Publication/collector failure never manufactures a recording.
+
+`browser_record_stop {id}` authorizes the exact original actor, employee,
+principal generation, binding and **start-tool** job association, then persists
+`stop_requested`. The host collector keeps stdin open and delivers only
+`stop\n`, checking partial/zero writes. It still drains bounded output and
+observes the terminal backend outcome before publishing a result. The start
+tool also exposes its existing `action=status|cancel, job=…` controls. A hard
+cancel can lose unflushed artifacts; neither stop nor cancel acknowledgement is
+proof of cgroup retirement. D8 means the recording starts only after the caller
+run exits, and a subsequent employee run may itself queue until recording ends.
+
+To make an in-progress stop reachable under D8, gateway-owned RPCs
+`isolation.recording_status {id}` and `isolation.recording_stop {id}` operate
+independently of employee runs. They route **before extension/plugin dispatch**,
+re-read the current dashboard Admin role on the blocking pool, require the same
+home's boot-owned job store, and restrict the SQL transaction to recording
+jobs. They do not fabricate RequestContext, impersonate an employee or wait for
+D8. Stop audits contain actor, opaque job and status only. There is no new
+web page/button or end-to-end RPC acceptance evidence yet.
+
+An observed stop before launch avoids loading/launching the browser and returns
+`not_recorded` with no artifacts; a stop during launch avoids subsequent
+navigation. Once recording exists it flushes a real trace. Navigation already
+in flight can have side effects before an asynchronous stop is observed; this
+is not a navigation barrier. Restart changes pending/cancel/stop-requested jobs
+to uncertain, with no automatic recording resume or claim of retirement.
+
+#### Round 3 file inventory
+
+Only round-3 responsibilities are listed; retain all prior uncommitted edits.
+
+| Paths | Change |
+| --- | --- |
+| `crates/duduclaw-execution/src/recording_helper.rs`, `recording_io.rs` | New bounded sealed recording protocol, fixed dependency readback, employee driver lifecycle and atomic no-clobber artifact publication. |
+| `crates/duduclaw-execution/src/recording_driver.cjs`, `recording_driver.test.cjs` | Embedded fixed headless driver and three stop-ordering fixtures with an explicitly fake browser. |
+| `crates/duduclaw-execution/src/bin/duduclaw-recording-helper.rs`, `src/lib.rs` | Register the actual helper binary/module; Linux-only filesystem implementation. |
+| `crates/duduclaw-execution/Cargo.toml`, `Cargo.lock` | Add the existing locked `url` dependency for strict URL parsing; no version upgrade or new shared wire format. |
+| `crates/duduclaw-mcp-boundary/src/execution.rs`, `execution_jobs.rs`, `execution_tests.rs`, `factories.rs` | Cooperative-stop factory propagation, exact recording alias, persistent actor-bound stop state, host-only recording control, stdin delivery and terminal result/id binding tests. |
+| `crates/duduclaw-gateway/src/isolation_execution_program.rs` | Conditional real recording plans, exact signed profile/deadline/protocol checks and two additional producer tests. |
+| `crates/duduclaw-gateway/src/isolation_mcp/boot.rs`, `isolation_mcp.rs` | Same-home boot job control with current dashboard Admin validation and stop audit. No readiness promotion. |
+| `crates/duduclaw-gateway/src/handlers/isolation_recording_rpc.rs`, `handlers/mod.rs` | Register protected host recording RPCs before extension dispatch, with refusal tests. |
+| `crates/duduclaw-cli/src/mcp_isolation.rs`, `mcp_isolation_tests.rs` | Honest protected recording schemas, explicit headless/deadline/id bounds and asynchronous result/control descriptions/tests. |
+| `crates/duduclaw-cli/src/mcp_fork.rs`, `mcp_recording.rs`, `mcp_isolation_a_routes.rs` | Reject direct protected invocation of legacy mutation/ambient-browser paths; test that fork refusal creates no store/files. |
+| `scripts/ci/check_spawn_inventory.py`, `privileged_effects.json`, `test_spawn_inventory.py` | Add only the exact private employee recording runner to the sealed helper exception and prove other symbols remain ineligible. |
+| Both execution/boundary READMEs, security feature pages (en/zh-TW/ja-JP), `CHANGELOG.md`, this handoff | Record actual conditional behavior, sensitive traces, remaining fork/native gates and evidence. |
+
+#### Observed validation and remote follow-up
+
+All cargo commands used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and `--offline`.
+Only small crates/source-module harnesses were built; **gateway and CLI were
+not locally compiled or type-checked**. The first Linux helper check exposed a
+temporary-reader borrow error; it was fixed and the final checks below passed.
+Existing unsafe-code/deprecation warnings were not hidden.
+
+| Command (after the environment prefix) | Final observed result |
+| --- | --- |
+| `CARGO_TARGET_DIR=target/i1b-check cargo test -p duduclaw-execution --lib --offline` | macOS: **39 passed, 0 failed**. |
+| `CARGO_TARGET_DIR=target/i1b-check cargo test -p duduclaw-mcp-boundary --features binding-store --lib --offline` | macOS: **83 passed, 0 failed**. Includes owned stop, wrong job/tool/actor, restart uncertainty, host-only control, partial stdin writes and collector delivery. |
+| `CARGO_TARGET_DIR=target/i1b-helper-final cargo check -p duduclaw-execution --tests --bins --target x86_64-unknown-linux-gnu --offline` | PASS; Linux recording file/driver code and tests compile, not executed. |
+| `CARGO_TARGET_DIR=target/i1b-check cargo check -p duduclaw-execution --tests --bins --target x86_64-pc-windows-gnu --offline` | PASS; helper entry refuses off Linux. No Windows execution. |
+| `CARGO_TARGET_DIR=target/i1b-helper-final cargo check -p duduclaw-mcp-boundary --features binding-store --tests --target x86_64-unknown-linux-gnu --offline` | PASS using the round-2 explicit Zig SQLite compiler environment. No Linux test execution. |
+| `CARGO_TARGET_DIR=target/i1b-check cargo check --manifest-path /private/tmp/i1b-plan-check/Cargo.toml --tests --target x86_64-unknown-linux-gnu --offline` | PASS using the same Zig environment. Compiles the actual gateway program/recording producer source and tests against real small-package APIs; existing Office identity/disabled-skill seams remain stubs. **Not gateway/RPC/CLI type checking.** |
+| `node --test crates/duduclaw-execution/src/recording_driver.test.cjs` | **3 passed, 0 failed**, fake Playwright fixtures only. No actual browser or network acceptance. |
+| `python3 -m unittest discover -s scripts/ci -p 'test_spawn_inventory.py' -v` | **18 passed, 0 failed**. |
+| `python3 scripts/ci/check_spawn_inventory.py --require-migrated` | **500 classified, 0 inventory migrations pending**; not producer readiness evidence. |
+| `target/i1b-syntax/debug/iso-a-syntax <all changed/untracked Rust files>` | **50 files parsed, 0 syntax errors**; no full gateway/CLI type checking. |
+| `git diff --check` | PASS. |
+
+The Zig environment is unchanged from round 2:
+`CC_x86_64_unknown_linux_gnu=/private/tmp/i1b-zig-cc`,
+`ZIG_GLOBAL_CACHE_DIR=/private/tmp/i1b-zig-cache`,
+`ZIG_LOCAL_CACHE_DIR=/private/tmp/i1b-zig-local`. Final logs are
+`/private/tmp/i1b-r3-{execution,boundary,linux-helper,windows-helper,linux-boundary,plan,inventory-tests}.log`.
+
+Independent ordinary code review identified the missing D8-independent stop
+entry and navigation-after-observed-stop bug; both were fixed and re-read. The
+reviewer reported no remaining CRITICAL/HIGH in that reviewed scope and reran
+the three Node fixtures. This is **not Daybreak signoff**; the requested
+Daybreak model invocation was not available in this session.
+
+Remote builder/native runner must still run the full integrated gateway/CLI
+checks and the earlier round-2 filters, plus:
+
+```sh
+cargo test -p duduclaw-cli isolated_i1b_
+cargo test -p duduclaw-gateway program_plans_
+cargo test -p duduclaw-gateway isolation_recording_rpc_
+cargo test -p duduclaw-execution recording_
+cargo test -p duduclaw-mcp-boundary --features binding-store isolated_recording_
+cargo test -p duduclaw-mcp-boundary --features binding-store execution_jobs_
+node --test crates/duduclaw-execution/src/recording_driver.test.cjs
+```
+
+The Linux-only file test is
+`recording_publication_rejects_links_and_never_overwrites` (ordinary disposable
+fixture; not root acceptance). Native signed-profile acceptance must separately
+prove browser/dependency loading with its sandbox, C egress/redirect/SSRF denial,
+D8 queueing, an Admin RPC stop while the recorder owns the slot, trace flush and
+artifact publication, all-actor theft denial, restart uncertainty and root
+cgroup/descendant retirement. Full human-SOP/distillation behavior is still
+missing. None of the source/harness/fixture results authorizes A readiness.
+
+### I1b Round 4 handoff — 2026-11-05
+
+**Status: PARTIAL / NOT READY. This supersedes the Round 3 remaining-work
+description, not its recording protocol or acceptance limitations.** Rounds
+1–4 remain uncommitted in the assigned worktree. The three fork producers are
+still not installed. A readiness and the 22-tool inventory were not changed.
+No gateway/CLI build, cargo fmt, deployment, runtime signing or live data access
+was performed. This session did not create a worktree or commit.
+
+#### Newly identified prerequisite: root workspace delivery
+
+`SpawnPolicy.workspace` is an internal policy, not a root mount handoff.
+`AuthorizedWorkspace` only proves that D opened the granted directory.
+`crates/duduclaw-execution/src/spawnd.rs::spawn` constructs `StartRun` without
+either the workspace handle or relative cwd; the existing wire v1 has neither
+field. B derives the employee's whole work mount and starts at `/work`.
+Consequently, assigning a fork handle/cwd to a plan does **not** execute inside
+that fork. The new backend guard rejects anything except `employee-work` with
+empty/`.` cwd before consuming any inputs or contacting StartRun. It prevents
+silent wrong-workspace execution; it does not implement branch delivery.
+
+**CONTRACT CHANGE: none.** No shared wire/canonical bytes/hard limit or Package B
+code was changed. Do not remove this guard just to make a fork plan pass. A
+reviewed root-derived workspace selector/delivery receipt, or a signed runtime
+input protocol that actually establishes the branch directory with equivalent
+authorization/readback, is required. This spans A/B/F and needs coordination
+with their current implementation; a raw cwd string or process current_dir is
+not a substitute.
+
+#### Implemented, uninstalled building blocks
+
+`duduclaw-mcp-boundary::forks` (binding-store feature) now provides:
+
+- A separate host-owned SQLite schema, never populated by importing legacy
+  employee-name/path-owned fork records. Forks bind exact employee, principal
+  including generation, and employee binding. Branches bind unique host
+  workspace/cwd, unique child RunHandle and state. At most four branches/fork
+  and 1024 retained forks; this prototype has no automatic metadata/volume GC.
+- Exact resource checks after actor matching: branch reads/cancel require that
+  branch's workspace grant, and selection also requires the parent workspace.
+  Having an unrelated Workspace grant is insufficient.
+- A launch driver that authorizes before reserving its own child, asks a
+  trusted `ForkPlanFactory` for policy plus `AuthorizedWorkspace`, verifies the
+  exact reserved run/employee/Fork class/workspace and proof, persists the
+  branch/run binding before backend spawn, and marks running via CAS. It only
+  cancels reservations it obtained itself. Drop guards cover cancellation
+  during factory preparation and blocking state transitions. There is **no
+  installed ForkPlanFactory** and no root delivery claim.
+- Persistent cancellation intent followed by `ExecutionBackend::kill` of the
+  authenticated branch's bound RunHandle. Pending cancellation fences later
+  bind/start; cancel_requested fences late successful results from publication.
+  Acknowledgement is cancel_requested, not retirement. Drop guards also cover
+  a discarded blocking-pool join result. Restart makes reserved/running/cancel
+  requested records uncertain, never resumed or publishable. A boot reconciler
+  for those uncertain root handles is still absent.
+- Bounded, canonical recorded manifests (1000 entries, 256 KiB encoded maximum),
+  validated relative paths and lowercase SHA-256 values. Public Deserialize
+  cannot bypass construction. Diff compares recorded manifests and does not
+  claim to verify live file contents.
+- An atomic shared `(employee, parent workspace)` **manifest-pointer CAS**.
+  Exact baseline digest/revision and complete branch/run association are
+  required. Two forks of the same parent cannot both select from the same old
+  version. A fork can select only once. This does **not** copy/merge files,
+  snapshot an employee tree, monitor live edits, or promote a parent workspace.
+  Only a future verified immutable snapshot/materializer can make that claim.
+- `ForkHostControl` strict adapters for diff, selection and termination using
+  verified RequestContext, original capability eligibility, exact actor/resource
+  binding and parameter allowlists. SQL runs on the blocking pool. These are
+  host-control methods, never fake execution plans; they are **not wired into
+  the product dispatcher/boot** and have no supports/readiness assertion.
+  Selection explicitly returns `manifest_selected, workspace_materialized=false`.
+
+#### Exact remaining work, in dependency order
+
+1. Coordinate real root branch workspace delivery/proof with A/B/F. Supply a
+   production ForkPlanFactory using that implementation, current fork-enabled,
+   scope/approval/budget policy and captured fresh host authorization. Do not
+   synthesize extra branch workspace grants inside an employee request.
+2. Provision bounded immutable parent/branch snapshots through the isolated
+   worker/helper lane. Record verified manifests and descriptors. No gateway
+   recursive parsing of employee trees. The store APIs currently accept only
+   trusted host-provided snapshots; no production snapshot producer exists.
+3. Implement a sequential D8 fork orchestrator and terminal/result collector,
+   provider/account/budget handling, retained workspace lifetime and restart
+   reconciliation. The driver currently launches one already-provisioned branch;
+   it is not the `fork_run` handler and performs no same-employee wait.
+4. Materialize/promote exact immutable outputs with parent filesystem revision/
+   digest recheck and atomic publication/readback. Metadata pointer selection
+   alone does not implement merge or promotion. Live parent edits outside that
+   future materializer are not represented by the prototype revision table.
+5. Install the store/control adapters in protected boot and route all six fork
+   tools through current original handler gates and the new exact-actor store.
+   Current `fork_run`, `merge_or_select`, `terminate_branch` remain MissingFactory;
+   the Round 3 direct protected mutation refusals remain. Existing legacy fork
+   reads were not rewritten in this round. Only after these real paths exist
+   should the A readiness hook be considered, without shrinking the inventory.
+
+#### Round 4 file inventory
+
+| Paths | Round 4 responsibility |
+| --- | --- |
+| `crates/duduclaw-mcp-boundary/src/forks.rs` | New uninstalled durable bindings, owned launch driver/factory seam, exact authenticated controls and shared manifest-pointer CAS. |
+| `crates/duduclaw-mcp-boundary/src/forks_tests.rs` | Ten portable state/authority/CAS/cancellation tests and one Linux dirfd proof + explicit fake-backend driver test. |
+| `crates/duduclaw-mcp-boundary/src/lib.rs`, `README.md` | Feature-gated export and explicit integration/non-readiness contract. |
+| `crates/duduclaw-execution/src/spawnd.rs`, `README.md` | Reject undelivered workspace/cwd rather than ignore them; Linux allow/deny regression. |
+| `scripts/ci/privileged_effects.json` | Classify only the new backend dispatch and Tokio cleanup task. No new native-spawn exception. |
+| `CHANGELOG.md`, security feature pages (en/zh-TW/ja-JP), this handoff | Document the actual fail-closed guard and remaining fork/delivery/materialization gaps. |
+
+#### Round 4 observed validation and remote follow-up
+
+All Cargo commands used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and `--offline`;
+only small crates were built. Final logs are `/private/tmp/i1b-r4-*.log`.
+
+| Command after environment prefix | Observed result |
+| --- | --- |
+| `CARGO_TARGET_DIR=target/i1b-check cargo test -p duduclaw-mcp-boundary --features binding-store --lib --offline` | macOS: **93 passed, 0 failed**, including ten new portable fork tests. |
+| `CARGO_TARGET_DIR=target/i1b-check cargo test -p duduclaw-execution --lib --offline` | macOS: **39 passed, 0 failed**; Linux backend guard is not executed on macOS. |
+| `CARGO_TARGET_DIR=target/i1b-helper-final cargo check -p duduclaw-execution --tests --bins --target x86_64-unknown-linux-gnu --offline` | PASS; Linux backend guard/test compile, no native execution. |
+| `CARGO_TARGET_DIR=target/i1b-helper-final cargo check -p duduclaw-mcp-boundary --features binding-store --tests --target x86_64-unknown-linux-gnu --offline` | PASS with the unchanged Round 3 Zig SQLite environment; includes the actual Linux AuthorizedWorkspace-construction test. No Linux execution. |
+| `python3 scripts/ci/check_spawn_inventory.py` | PASS: **502 classified, 0 pending**. Lexical coverage is not producer/root acceptance. |
+| `python3 -m unittest discover -s scripts/ci -p test_spawn_inventory.py` | **18 passed**. |
+| `git diff --check` | PASS. |
+
+The first focused build found missing PTY methods on the test backend; they
+were added. A focused route test initially omitted its own Employee grant and
+was correctly refused; the fixture was fixed. Independent code review found
+and prompted fixes for public Manifest deserialization, non-owned reservation
+cancellation, cancelled-future cleanup, per-fork rather than shared parent CAS,
+exact workspace grant checks and blocking SQLite on the async failure path.
+This is ordinary code review, **not Daybreak security signoff**.
+
+Remote/native follow-up (in addition to all Round 3 gateway/CLI tests):
+
+```sh
+cargo test -p duduclaw-mcp-boundary --features binding-store forks::tests::
+cargo test -p duduclaw-execution spawnd_workspace_policy_rejects_undelivered_branch_roots_and_cwd
+cargo check -p duduclaw-gateway --features isolation-worker-integration
+cargo check -p duduclaw-cli
+```
+
+The Linux driver test needs a nodev `/dev/shm`; its backend/runtime are explicit
+doubles, so a pass is not root-delivery or native provider acceptance. Native
+end-to-end tests still need actual separate branch workspaces, exact signed
+runtime, D8 sequencing, original budgets/approvals, cancellation/descendant
+retirement, concurrent parent edits, immutable output promotion and actor/
+generation/grant theft denial. **Do not flip A readiness from this round.**
+
+### I1b Round 5 handoff — 2026-11-05
+
+**Archived: the final Round 6 handoff below supersedes the remaining-work and readiness decision.**
+
+**Status: PARTIAL / NOT READY.** This supersedes Round 4's workspace-delivery
+and uninstalled-host-control descriptions. Rounds 1–5 remain uncommitted in
+`feat/iso-i1b-20261105`; the assigned worktree was reused, not created here.
+No cargo fmt, gateway/CLI build, commit, deployment, runtime signing or live
+customer access was performed. A readiness remains unchanged because the
+production model-branch producer is still missing. The A inventory was not shrunk.
+
+#### CONTRACT CHANGE: authorized root workspace delivery
+
+`SpawnPolicy.workspace_delivery` retains an owned directory fd derived by
+`AuthorizedWorkspace::delivery()`. Both resource-checked execution plans and the
+fork launch driver attach the proof rather than discard it after authorization.
+The additive StartRun `workspace` field carries a bounded fixed handle, relative
+cwd and device/inode. An accompanying final `WorkspaceDirectory` descriptor pins
+the directory through the root D8 queue, preventing inode-reuse substitution.
+Prompt/attachment descriptors keep their order and the attachment cap remains
+64; the maximum StartRun descriptor count is now **66**, not 65. All byte limits
+are unchanged. Omitted selectors retain the old canonical representation; old
+roots reject new selectors/roles, so new workspace launches require a coordinated
+root/gateway generation. This is an explicit change to the shared launch contract.
+
+Root never mounts an arbitrary gateway-supplied directory. It reopens only
+`employee-work` or `fork-<32 lowercase hex>` (the latter maps to `.forks/<id>`)
+under the employee's H-attached work filesystem, using openat2 BENEATH /
+NO_SYMLINKS / NO_MAGICLINKS / NO_XDEV, then checks employee UID, H device,
+device/inode and the retained fd. It clones the selected directory into the
+existing root-owned detached work mount. The existing duduclaw-run manifest
+consumes that mount; no B2 manifest format changed. A nonempty relative cwd
+narrows the directory exposed as `/work`, rather than exposing a parent and
+chdir-ing below it. Without delivery, only default employee-work and empty/`.`
+cwd are accepted. No native privileged mount test ran in this session.
+
+#### Snapshot helper and D8 queue component
+
+The new fixed `duduclaw-fork-snapshot-v1` helper protocol supports parent clone
+and branch result snapshot. It operates only under `/work`, with generated
+`.forks/<id>` / `.fork-results/<id>` destinations and atomic RENAME_NOREPLACE
+publication. Descriptor-relative traversal rejects links, special files, cross
+mounts, invalid UTF-8/names, source changes and oversized trees. Limits are
+1000 total entries, 16 MiB total file bytes and depth 32; response encoding is
+bounded to 256 KiB. Owner-execute is preserved as 0700/0600 files; set-id and
+group/world access are stripped. Failed staging is retained for conservative
+recovery; automatic staging/metadata/volume GC is not implemented.
+
+`InstalledForkSnapshots` reads the pinned root generation and employee
+entitlement on each plan, requires the exact fixed offline, non-MCP runtime
+protocol and bounded output/memfd/deadline policy, attaches the workspace proof,
+and collects bounded stdout/stderr plus terminal outcome. Queueing retries
+TakeIo; it does not synchronously wait inside the employee tool handler. Its
+new actual-source harness type-checks these methods against the real small-crate
+APIs; it is not gateway boot/type-check evidence. The signed runtime still needs
+to be provisioned; this class is not yet called by an installed full fork service.
+
+`fork_queue` provides bounded per-employee batch serialization (2–4 branches,
+8 queued batches per employee, 128 employee queues). It commits queued state
+before a nonblocking handoff, then processes one branch at a time; root D8 owns
+admission against every other run class. Accepted(Queued) stays reserved;
+`running` is recorded only after TakeIo succeeds. Collector limits are 1 MiB
+per stream and 1200 seconds overall. It waits for terminal outcome and EOF before
+requesting a result snapshot. Dropped/failed collection cancels only its owned
+RunHandle and records uncertainty. Queued/reserved/running/cancel-requested
+records become uncertain on restart; they are not replayed and this is not a
+root-handle retirement reconciler. This component remains **uninstalled as the
+production fork_run orchestrator** until fresh child launch authority is available.
+
+Snapshot helper output is **not immutable storage**: later employee runs can
+edit H-owned files. Manifests compare content only, not permissions or live tree
+state. Source-change checks are bounded consistency checks, not a transactional
+filesystem snapshot. No output is promoted into the live parent workspace.
+
+#### Host routes and boot wiring that are installed
+
+Protected boot opens a separate `isolation-forks.db` and installs ForkHostControl
+(or an explicitly host-injected ForkToolService). GatewayFactories passes that
+service into the CLI-hosted dispatcher. All six fork handlers now route protected
+calls through that service with the original employee opt-in and common
+scope/approval/irreversibility gates; no protected read or mutation opens the
+legacy name/path-owned fork store. Exact actor, principal generation, employee
+binding and workspace grants remain required by the host store.
+
+Installed controls are inspect, recorded-manifest diff, shared parent pointer
+CAS selection, and cancellation. Inspect returns the baseline parent revision
+and digest needed for selection. Protected schemas require explicit
+`expected_revision` and `expected_parent_digest`; concurrent stale selections
+refuse. Selection returns `manifest_selected, workspace_materialized=false`.
+It does not publish immutable bytes or detect arbitrary live parent edits.
+Cancellation acknowledges intent, never cgroup retirement. `fork_run` and
+measured `fork_cost` remain MissingFactory; a service implementing only four
+controls cannot appear complete in the readiness manifest.
+
+#### Remaining work, in dependency order
+
+1. Implement and install the production model-branch service. It must derive
+   fresh host child authority without adding arbitrary grants to an employee's
+   current RequestContext, use D's MCP reservation/config/connection activation
+   and revocation lifecycle, and preserve the original runtime/provider/account,
+   scope/approval and per-branch/aggregate budget policy. Direct backend.spawn of
+   a Claude plan is not a substitute for that D integration.
+2. Connect the signed snapshot factory, exact retained branch roots and ForkQueue
+   to that service's real fork_run handler; validate delayed policy/authorization
+   again after the parent exits and before each queued operation. No concrete
+   production ForkPlanFactory/ForkResultSnapshot implementation is installed yet.
+3. Freeze and verify published result bytes under host/root authority, bind the
+   immutable descriptor/manifest to the branch run, and implement exact parent
+   revision/digest recheck plus atomic materialization/readback. Current pointer
+   CAS and employee-writable `.fork-results` do not satisfy this requirement.
+4. Add restart root-handle retirement reconciliation, volume/staging retention,
+   real usage/cost publication and all three fork producer acceptance journeys.
+5. Run full integrated gateway/CLI checks remotely, then native signed-profile
+   root/D8/provider tests. Only after all A producers are real should the A hook
+   be reconsidered. Daybreak security signoff is still outstanding.
+
+#### Round 5 files
+
+| Scope | Paths |
+| --- | --- |
+| Additive contract/proof | `duduclaw-isolation/src/{execution,ipc}.rs`, `duduclaw-mcp-boundary/src/resources.rs`, `duduclaw-execution/src/spawnd.rs` |
+| Root H reopen/pinned fd/mount | `duduclaw-spawnd/src/{bootstrap_mounts,host,fds,admission,transport}.rs`, their fixtures; existing SpawnPolicy literals receive explicit None |
+| Real bounded helper | `duduclaw-execution/src/{fork_helper,fork_io}.rs`, `src/bin/duduclaw-fork-snapshot-helper.rs`, module exports |
+| Queue/store/host controls | `duduclaw-mcp-boundary/src/{forks,forks_tests,fork_queue,factories,lib}.rs` |
+| Signed snapshot producer | `duduclaw-gateway/src/isolation_forks.rs`, Linux lib export |
+| Protected boot/CLI routing | `duduclaw-gateway/src/isolation_mcp/boot.rs`, `duduclaw-cli/src/{mcp_fork,mcp_isolation}.rs` and affected IsolatedCall fixtures |
+| Evidence/docs | execution/boundary/spawnd READMEs, three security feature pages, CHANGELOG, spawn inventory and this handoff |
+
+#### Observed validation
+
+All Cargo runs use `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and `--offline`.
+Only small crates or the explicit source-module harness were compiled. Existing
+unsafe/deprecation warnings remain visible. **No gateway or CLI build/type-check
+was run.** Linux and Windows results below are cross-checks, not native execution.
+
+| Check | Final observed result |
+| --- | --- |
+| `cargo test -p duduclaw-isolation --lib --offline` | 33 passed, 0 failed |
+| `cargo test -p duduclaw-execution --lib --offline` | macOS: 40 passed, 0 failed |
+| `cargo test -p duduclaw-mcp-boundary --features binding-store --lib --offline` | macOS: 96 passed, 0 failed |
+| `cargo check -p duduclaw-spawnd -p duduclaw-execution --tests --bins --target x86_64-unknown-linux-gnu --offline` | PASS, normal feature graph |
+| execution Linux tests/bins after helper changes | PASS |
+| boundary binding-store Linux tests (existing Zig SQLite environment) | PASS |
+| execution Windows tests/bins | PASS |
+| `/private/tmp/i1b-fork-plan-check` actual-source Linux harness, `cargo check --tests` | PASS; compiles snapshot producer and its two tests, does not execute them |
+| `python3 -m unittest discover -s scripts/ci -p test_spawn_inventory.py` | 18 passed |
+| spawn inventory `--require-migrated` | 505 classified, 0 migrations pending |
+| existing syn parser over changed/untracked Rust | 73 files parsed, 0 syntax errors; not type checking |
+| `git diff --check` | PASS |
+
+Logs: `/private/tmp/i1b-r5-{contract-test,contract-linux,execution-fork,boundary-fork,boundary-final,linux-fork,linux-boundary-fork,windows-fork,fork-plan,inventory,inventory-tests,syntax}.log`.
+The final boundary run includes proof attachment in the fork driver. The existing
+Zig environment remains the Round 3 one; no dependency version was upgraded.
+
+Independent ordinary review covered the root contract/helper/queue and separately
+the CLI/boot/factory changes. It found executable-bit loss, accepted-queued being
+reported running, and discarded authorization proof; all were corrected. The
+review reported no remaining CRITICAL/HIGH in its scope. This is **not Daybreak
+security signoff**, and no native root mount/helper/provider acceptance is claimed.
+
+Remote follow-up, with the prior rounds' commands retained:
+
+```sh
+cargo check -p duduclaw-gateway --features isolation-worker-integration --tests
+cargo check -p duduclaw-cli --tests
+cargo test -p duduclaw-cli isolated_i1b_
+cargo test -p duduclaw-gateway isolation_forks::tests
+cargo test -p duduclaw-mcp-boundary --features binding-store forks::tests::
+cargo test -p duduclaw-execution fork_
+cargo test -p duduclaw-spawnd workspace_selection_reopens_only_the_exact_h_directory
+```
+
+Native tests must separately prove exact branch/cwd mount delivery, separate
+branch contents, UID/device/inode/symlink/fd-role theft refusal, real sequential
+D8 behavior, capability activation/revocation, original budgets/account policy,
+root descendant retirement and immutable parent/result publication. The new
+Linux helper fixture is ordinary unprivileged disposable-file verification;
+it has only been cross-compiled here.
+
+
+### I1b Round 6 FINAL handoff — 2026-11-05
+
+**Path taken: v1.80.0 protected-TEAM fork deferral (the authorized fallback).**
+The full model-fork producer and immutable result publication/apply are **not
+implemented or enabled**. The final sub-package scope is the existing 22-tool A
+inventory with exactly three explicit exceptions: `fork_run`, `merge_or_select`,
+and `terminate_branch`. Non-protected installations retain their existing fork
+handlers, opt-in, account selection and budget behavior. Rounds 1–6 remain
+uncommitted on `feat/iso-i1b-20261105` in the assigned worktree. This session did
+not create a worktree, run cargo fmt, build gateway/CLI locally, commit, deploy,
+sign a runtime or access a live model/provider.
+
+#### Decision and remaining implementation boundary
+
+The producer investigation found that the remaining work crosses four authority
+contracts, so the fallback was selected early rather than extending unsafe
+partial launch authority toward the time limit:
+
+- `ForkPlanFactory` returns only a plan and workspace proof. The queue does not
+  own D activation/revocation or an MCP dispatcher lifecycle. Reusing
+  `ProtectedMcpLaunch` requires an owned per-branch lifecycle through TakeIo,
+  cancellation and terminal observation.
+- `ForkStore::create` requires the parent context to have every new branch
+  workspace grant; `AuthorizedWorkspace` is run-bound. A host-derived fresh
+  child context/association is required. Mutating the caller's resource list is
+  not a permissible shortcut.
+- `AccountRotator::select_for_provider_with_pool_excluding` retains the required
+  provider/health/pool policy, but its legacy environment credentials cannot be
+  copied into a protected fixed root plan. Host-selected account binding is
+  missing. The installed main Claude factory also excludes the Fork class.
+- The existing employee budget gate and fork-local `Pool`/`LiveAggregate` do not
+  reserve slices of a parent's budget. A durable atomic reserve/settle/unknown
+  liability ledger and run binding remain necessary. The queue currently drains
+  model output without measuring usage.
+
+The snapshot helper still writes employee-owned bytes. Immutable host/root
+content-addressed storage, exact baseline verification, atomic live-parent
+materialization/readback and restart recovery remain unimplemented. The retained
+pointer CAS is not advertised as an apply operation. No additional producer,
+account/budget shim or immutable-storage implementation was added in this round.
+
+#### Installed refusal and remaining A readiness
+
+`duduclaw-mcp-boundary::fork_policy` contains the exact three deferred mutations
+and zh-TW/en/ja next-release messages. CLI's protected service manifest labels
+these `IntentionalRefusal(ForkNextRelease)`, rather than MissingFactory; the
+entries remain in the full inventory. Protected tools/list hides them, and a
+raw tools/call returns the configured-language refusal. The direct handlers
+refuse before fork settings, stores, account selection, reservations or
+publication. An injected service cannot enable them. ForkHostControl also
+refuses all three before accessing its store/backend. The pre-existing general
+native execution fence is unchanged; ordinary unprotected calls do not enter
+this new refusal.
+
+Protected `inspect_branches` and `diff_branches` retain exact actor/generation
+and workspace-grant checks and never read legacy rows. `fork_cost` now has a
+real owner-checked host read handler: partial records have no measured usage,
+so it returns `measurement_status=unavailable`, `aggregate_spent_usd=null`, and
+per-branch `spent_usd=null`. Unknown/foreign/revoked-generation/ungranted records
+are refused, not returned as zero. The protected tool description states this
+limitation. There is no new product path to create forks in protected TEAM.
+
+The A `runtime_adapters` hook is no longer unconditionally PendingIntegration.
+It returns Ready only when the assembled boot owner is healthy and all five
+remaining helper/control producers (`execute_program`, `office_script`,
+`code_map`, `browser_record_start`, `browser_record_stop`) and all three fork
+readers report support. Each installed helper factory continues to re-read its
+signed publication, so missing or replaced runtimes still refuse readiness.
+The three deferred mutations are excluded explicitly, never silently removed
+from the 22-tool inventory. Other composite fields and admission requirements
+are unchanged; this hook is not root/provider/native acceptance and does not
+make a partially assembled installation executable.
+
+User/operator messages follow `[general] default_language` (unknown/missing
+language uses zh-TW):
+
+| Language | Refusal |
+| --- | --- |
+| zh-TW | 受保護模式下的分支試算將於下一版開放。 |
+| en | Branch trials in protected mode will be available in the next release. |
+| ja | 保護モードでの分岐試行は次のバージョンで利用可能になります。 |
+
+#### Round 6 files
+
+| Scope | Files changed this round |
+| --- | --- |
+| Shared deferral/readiness and host reads | `crates/duduclaw-mcp-boundary/src/{fork_policy,lib,forks,forks_tests}.rs` |
+| Protected localized refusal and schema | `crates/duduclaw-cli/src/{mcp_dispatch,mcp_fork,mcp_isolation,mcp_isolation_disposition}.rs` |
+| CLI regression/parity fixtures | `crates/duduclaw-cli/src/{mcp_isolation_tests,mcp_isolation_a_routes,mcp_isolation_parity_tests}.rs` |
+| A readiness hook | `crates/duduclaw-gateway/src/{isolation_readiness,isolation_mcp}.rs`, `isolation_mcp/boot.rs` |
+| Inventory and documentation | `scripts/ci/privileged_effects.json` (renamed parity fixture only), `docs/architecture/native-linux-isolation-tools.md`, this handoff, `CHANGELOG.md`, boundary README and three security-feature translations |
+
+#### Observed validation and explicit build limit
+
+All Cargo commands use `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`, the existing
+`target/i1b-check` cache and `--offline`; no dependency version was upgraded.
+
+| Check | Observed result |
+| --- | --- |
+| `cargo test -p duduclaw-mcp-boundary --features binding-store --lib --offline` | **101 passed**, 0 failed; includes deferred host routes, no mutation/backend effects, exact cost-read ownership and missing-helper readiness |
+| `cargo check -p duduclaw-mcp-boundary --features binding-store,execution-integration --tests --target x86_64-unknown-linux-gnu --offline` | PASS; cross-check only, no Linux execution |
+| `/private/tmp/i1b-r6-readiness-check` actual-source harness, macOS tests | **8 passed**, 0 failed; uses the real readiness/disposition source plus real small-crate APIs, with explicit core/worker/boot seams stubbed; not a gateway or CLI build |
+| Actual-source readiness harness Linux `cargo check --tests` | PASS; same explicit boot/core/worker stubs, not integrated gateway/CLI type checking |
+| Rust syntax parser over changed/untracked sources | **77 parsed**, 0 syntax errors; not type checking |
+| `python3 -m unittest discover -s scripts/ci -p test_spawn_inventory.py` | **18 passed** |
+| Spawn inventory `--require-migrated` | **505 classified**, 0 migrations pending |
+| `git diff --check` | PASS |
+| Full gateway/CLI compilation and new CLI tests | **NOT RUN**: local builds forbidden by assignment; authorized Linux `connect.py check` returned `ssh: connect to host 192.168.0.45 port 22: Operation not permitted` under the current sandbox |
+| Native root, provider and customer acceptance | NOT RUN |
+
+The first temporary harness resolution rejected an unlocked, yanked
+async-executor version; reusing the repository lockfile fixed resolution without
+upgrading dependencies. The first SQLite cross-check used a missing llvm-ar
+path; it was corrected to `/opt/homebrew/opt/llvm/bin/llvm-ar` and passed. The
+renamed parity test required its spawn-inventory key to be renamed too; the
+final inventory check passes.
+
+Logs: `/private/tmp/i1b-r6-{boundary,boundary-linux,readiness,readiness-linux,inventory,inventory-tests,syntax}.log`.
+The new CLI regression tests cover locale selection through the dispatcher,
+direct-handler refusal with an injected service, unchanged ordinary tool listing,
+exact documented exceptions and honest cost schema. Their source was parsed,
+but they have not been executed. Full integrated compiling state therefore
+remains **unverified**, not inferred from these small-crate results.
+
+Independent ordinary review found a private-module visibility error in the
+Linux readiness call and a stale cost-tool description; both were corrected and
+re-reviewed with no remaining CRITICAL/HIGH in the round-6 scope. Daybreak
+security signoff remains outstanding; no Daybreak tool is available in this
+session. Ordinary review is not a substitute for that signoff.
+
+Required next verification on an authorized remote builder (not implementation
+of the deferred tools in this final sub-package):
+
+```sh
+cargo check -p duduclaw-gateway --features isolation-worker-integration --tests
+cargo check -p duduclaw-cli --tests
+cargo test -p duduclaw-cli isolated_i1b_
+cargo test -p duduclaw-cli isolated_round6_employee_tool_parity_matches_documented_exceptions
+cargo test -p duduclaw-mcp-boundary --features binding-store --lib
+```
+
+The future release must complete fresh child D authority, rotator-bound account
+selection, parent budget reservations/settlement, immutable result storage and
+atomic apply, restart/retirement reconciliation and native acceptance before
+removing `ForkNextRelease`. This round does not authorize merge or release.

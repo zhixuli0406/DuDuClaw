@@ -199,6 +199,17 @@ pub async fn scope<F: Future>(home: &Path, agent: &str, context: &RequestContext
             principal_context, metadata }, future)))).await)
 }
 
+/// Internal helper-policy lookup. Exact verified call binding only; never
+/// reconstruct an employee from environment or tool arguments.
+pub(crate) fn employee_tool_identity(context: &RequestContext) -> Result<(PathBuf, String), VerificationError> {
+    CALL.try_with(|call| {
+        let actual = call.context.record().canonical_bytes().map_err(|_| VerificationError::Invalid)?;
+        let expected = context.record().canonical_bytes().map_err(|_| VerificationError::Invalid)?;
+        if actual != expected { return Err(VerificationError::BindingMismatch); }
+        Ok((call.home.clone(), call.agent.clone()))
+    }).map_err(|_| VerificationError::Unavailable)?
+}
+
 /// Request-local compatibility inputs for existing MCP handlers. No process
 /// environment fallback; the guard is revoked when the request future ends.
 pub fn resolved_identity() -> Option<(String, Option<String>)> {

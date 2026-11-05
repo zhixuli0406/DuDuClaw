@@ -222,6 +222,7 @@ mod system_update_config_v168;
 mod tick_sources_rpc;
 mod channel_ingress_rpc;
 mod computer_workspaces_rpc;
+mod isolation_recording_rpc;
 mod computer_sessions_rpc;
 mod computer_team_rpc;
 mod computer_watch_links_rpc;
@@ -535,6 +536,12 @@ impl MethodHandler {
                 return WsFrame::error_response("", &error);
             }
             return self.handle_migration_confirmations(method, params, ctx).await;
+        }
+
+        // Recording lifecycle is host authority and must stay available under
+        // D8. Extensions cannot replace its fresh dashboard-role checks.
+        if matches!(method, "isolation.recording_status" | "isolation.recording_stop") {
+            return self.handle_isolation_recording(method, params, ctx).await;
         }
 
         // MFA is a gateway-owned authentication namespace, never delegated to

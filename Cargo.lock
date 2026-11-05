@@ -2013,8 +2013,10 @@ dependencies = [
  "nix 0.29.0",
  "portable-pty",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "url",
  "uuid",
  "windows-sys 0.59.0",
 ]

@@ -45,17 +45,17 @@ impl ExecutionPlanFactory for Plans {
 
 #[test]
 fn isolated_boot_missing_factories_stay_unavailable() {
-    let factories = GatewayFactories::assemble(None, None, resolver(false, false), None).unwrap();
+    let factories = GatewayFactories::assemble(None, None, resolver(false, false), None, Arc::new(crate::resources::ResourceRoots::default())).unwrap();
     assert!(factories.execution.is_none());
     assert!(factories.parser.is_none());
     assert!(GatewayFactories::assemble(None, Some(Arc::new(Plans(AtomicUsize::new(0)))),
-        resolver(false, false), None).is_err());
+        resolver(false, false), None, Arc::new(crate::resources::ResourceRoots::default())).is_err());
 }
 
 #[tokio::test]
 async fn isolated_boot_resource_authorization_precedes_factory() {
     let plans = Arc::new(Plans(AtomicUsize::new(0)));
-    let checked = ResourceCheckedPlans { plans: plans.clone(), resolver: resolver(false, true) };
+    let checked = ResourceCheckedPlans { plans: plans.clone(), resolver: resolver(false, true), roots: Arc::new(crate::resources::ResourceRoots::default()) };
     assert!(checked.authorize_handler(&context("execute_program"), "execute_program", &json!({})).await.is_err());
     assert_eq!(plans.0.load(Ordering::SeqCst), 0);
     assert!(!checked.supports("execute_program_extra"));
@@ -64,10 +64,52 @@ async fn isolated_boot_resource_authorization_precedes_factory() {
 #[tokio::test]
 async fn isolated_boot_resource_change_during_factory_is_refused() {
     let plans = Arc::new(Plans(AtomicUsize::new(0)));
-    let checked = ResourceCheckedPlans { plans: plans.clone(), resolver: resolver(true, false) };
+    let checked = ResourceCheckedPlans { plans: plans.clone(), resolver: resolver(true, false), roots: Arc::new(crate::resources::ResourceRoots::default()) };
     assert!(matches!(checked.authorize_handler(&context("execute_program"), "execute_program", &json!({})).await,
         Err(VerificationError::BindingMismatch)));
     assert_eq!(plans.0.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn isolated_boot_plan_cannot_select_workspace_outside_resolved_grants() {
+    use duduclaw_isolation::execution::*;
+    struct Input;
+    impl RunReader for Input {
+        fn read<'a>(&'a mut self, _: &'a mut [u8]) -> BackendFuture<'a, usize> { Box::pin(async { Ok(0) }) }
+    }
+    struct OtherWorkspace;
+    impl ExecutionPlanFactory for OtherWorkspace {
+        fn supports(&self, name: &str) -> bool { name == "execute_program" }
+        fn authorize_handler<'a>(&'a self, _: &'a RequestContext, _: &'a str, _: &'a Value) -> PolicyFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn prepare<'a>(&'a self, context: &'a RequestContext, _: &'a str, _: &'a Value,
+            run: RunHandle) -> PolicyFuture<'a, SpawnPolicy> {
+            Box::pin(async move { Ok(SpawnPolicy {
+                workspace_delivery: None, run, employee: context.record().employee, class: ExecutionClass::EmployeeTool,
+                runtime: RuntimeKind::Registered(Text::new("test-helper".into()).unwrap()),
+                argv_allowlist: vec![], environment_allowlist: Default::default(),
+                workspace: WorkspacePolicy { workspace: Text::new("other".into()).unwrap(),
+                    relative_cwd: Text::new(".".into()).unwrap() },
+                resources: ResourceLimits { memory_bytes: 1024, cpu_quota_percent: 100, tasks: 2,
+                    open_files: 32, ptys: 0, disk: DiskQuota::LoopFilesystem { bytes: 1024, inodes: 32 },
+                    io_read_bytes_per_sec: 1024, io_write_bytes_per_sec: 1024, io_read_ops_per_sec: 10,
+                    io_write_ops_per_sec: 10, output_buffer_bytes: 1024, output_total_bytes: 1024,
+                    memfd_total_bytes: 1024 },
+                network: NetworkPolicy::Offline, pty: false,
+                capabilities: CapabilityHandover { mcp_bridge: false, egress_forwarder: false },
+                timeouts: RunTimeouts { queue_ms: 1000, startup_ms: 1000, runtime_ms: 1000,
+                    pty_idle_ms: None, termination_grace_ms: 100 },
+                inputs: RunInputs { prompt: RunInput { reader: Box::new(Input), max_bytes: 1 }, attachments: vec![] },
+            }) })
+        }
+    }
+    let context = context("execute_program");
+    // Both workspaces occur in the capability, but this operation resolves only work.
+    let checked = ResourceCheckedPlans { plans: Arc::new(OtherWorkspace), resolver: resolver(false, false),
+        roots: Arc::new(crate::resources::ResourceRoots::default()) };
+    assert!(matches!(checked.prepare(&context, "execute_program", &json!({}), RunHandle(RunId([9; 16]))).await,
+        Err(VerificationError::BindingMismatch)));
 }
 
 fn options() -> TableOptions {

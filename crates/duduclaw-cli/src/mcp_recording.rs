@@ -329,6 +329,9 @@ pub(crate) async fn handle_browser_record_start(
     home_dir: &Path,
     agent: &str,
 ) -> Value {
+    if crate::mcp_isolation::current().is_some() || duduclaw_core::execution_gate::isolation_required() {
+        return rec_error("受保護錄製須使用隔離執行服務，已拒絕主機錄製。");
+    }
     let url = args
         .get("url")
         .and_then(|v| v.as_str())
@@ -501,6 +504,9 @@ fn resolve_existing_recording(args: &Value, home_dir: &Path) -> Result<(String, 
 // ── browser_record_stop ──────────────────────────────────────────────────────
 
 pub(crate) async fn handle_browser_record_stop(args: &Value, home_dir: &Path) -> Value {
+    if crate::mcp_isolation::current().is_some() || duduclaw_core::execution_gate::isolation_required() {
+        return rec_error("受保護錄製須使用隔離工作控制，已拒絕主機錄製。");
+    }
     let (id, dir) = match resolve_existing_recording(args, home_dir) {
         Ok(v) => v,
         Err(e) => return e,

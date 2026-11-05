@@ -95,6 +95,16 @@ pub struct IntegrityGuard {
     filtered: bool,
 }
 impl IntegrityGuard {
+    /// Use the manifest already captured for the private checkpoint export.
+    /// This does not walk/read the tree and cannot authorize a live employee
+    /// workspace. The checkpoint owner verifies the guard around publication.
+    pub(crate) fn checkpoint_manifest(&self) -> Result<super::artifact_manifest::ArtifactManifest, String> {
+        if self.filtered || self.hashes.len() > super::artifact_manifest::MAX_ENTRIES {
+            return Err("artifact checkpoint manifest unavailable".into());
+        }
+        super::artifact_manifest::ArtifactManifest::from_checkpoint(self.hashes.clone())
+    }
+
     pub fn capture(root: &Path) -> io::Result<Self> {
         Ok(Self {
             root: root.canonicalize()?,

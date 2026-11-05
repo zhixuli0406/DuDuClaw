@@ -9,6 +9,8 @@ duduclaw-isolation.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
+url = "2"
 portable-pty = "0.9"
 
 [target.'cfg(unix)'.dependencies]

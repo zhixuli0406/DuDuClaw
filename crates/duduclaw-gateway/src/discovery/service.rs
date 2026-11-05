@@ -52,7 +52,7 @@ async fn withdraw_approval(broker: &ApprovalBroker, approval_id: &str, task_id: 
 }
 
 #[derive(Debug, Clone)]
-pub struct TrustedCaller { principal: Principal }
+pub struct TrustedCaller { principal: Principal, isolated: bool }
 #[derive(Debug, Clone)]
 enum Principal { User(UserContext), Agent(String) }
 impl TrustedCaller {
@@ -60,7 +60,7 @@ impl TrustedCaller {
         if context.user_id.trim().is_empty() || context.requires_password_change() {
             return Err("permission denied".into());
         }
-        Ok(Self { principal: Principal::User(context.clone()) })
+        Ok(Self { principal: Principal::User(context.clone()), isolated: false })
     }
     pub fn from_signed_agent(home: &Path, id: &str, token: Option<&str>) -> Result<Self, String> {
         valid_id(id)?;
@@ -68,7 +68,17 @@ impl TrustedCaller {
             duduclaw_core::IdentityVerdict::Verified) {
             return Err("discovery requires a verified agent identity".into());
         }
-        Ok(Self { principal: Principal::Agent(id.into()) })
+        Ok(Self { principal: Principal::Agent(id.into()), isolated: false })
+    }
+    /// The connection-bound MCP dispatcher has already authenticated this
+    /// request. Keep the employee role: a human principal behind the run does
+    /// not turn its discovery operations into manager operations.
+    pub fn from_isolated_agent(home: &Path, id: &str) -> Result<Self, String> {
+        valid_id(id)?;
+        match crate::isolation_egress::current(home, id) {
+            Some(Ok(_)) => Ok(Self { principal: Principal::Agent(id.into()), isolated: true }),
+            _ => Err("discovery requires a verified isolated caller".into()),
+        }
     }
     fn id(&self) -> String {
         match &self.principal { Principal::User(user) => format!("user:{}", user.user_id),

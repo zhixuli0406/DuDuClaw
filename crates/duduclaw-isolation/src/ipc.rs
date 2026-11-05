@@ -107,6 +107,39 @@ pub fn decode<T: DeserializeOwned>(frame: &[u8]) -> Result<Envelope<T>, Contract
 #[serde(tag = "backing", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InputFd { SealedMemfd { bytes: u64 }, ReadOnlySnapshot { bytes: u64 } }
 
+/// Additive v1 workspace selector. No host path or mount descriptor is accepted.
+/// Root resolves the fixed handle beneath the employee's H work mount and
+/// compares the opened directory identity to D's authorization readback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSelection {
+    pub handle: Text<128>,
+    pub relative_cwd: Text<4096>,
+    pub device: u64,
+    pub inode: u64,
+}
+impl WorkspaceSelection {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let handle = self.handle.as_str();
+        let branch = handle.strip_prefix("fork-").is_some_and(|id| id.len() == 32
+            && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        let cwd = self.relative_cwd.as_str();
+        if (handle != "employee-work" && !branch) || self.device == 0 || self.inode == 0
+            || (!matches!(cwd, "" | ".") && (cwd.len() > 4096 || cwd.split('/').any(|part|
+                part.is_empty() || part == "." || part == ".." || part.bytes().any(|b| b == 0 || b == b'\\')))) {
+            return Err(ContractError::InvalidValue("workspace"));
+        }
+        Ok(())
+    }
+    pub fn storage_relative(&self) -> Result<String, ContractError> {
+        self.validate()?;
+        let root = if self.handle.as_str() == "employee-work" { ".".to_owned() }
+            else { format!(".forks/{}", &self.handle.as_str()[5..]) };
+        Ok(if matches!(self.relative_cwd.as_str(), "" | ".") { root }
+            else { format!("{root}/{}", self.relative_cwd.as_str()) })
+    }
+}
+
 /// Narrow root RPC. No uid, argv, env, cwd, profile, paths or unit properties (§4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -122,6 +155,8 @@ pub enum SpawnRequest {
         employee_id: EmployeeId,
         runtime_request: RuntimeKind,
         task_ref: Option<Text<128>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<WorkspaceSelection>,
         prompt_bytes: u64,
         input_fds: List<InputFd, MAX_INPUT_FDS>,
         pty: bool,
@@ -139,7 +174,7 @@ pub enum SpawnRequest {
 
 /// Ordered ancillary roles, never OS descriptor numbers (§4 fd matrix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FdRole { PromptSealed, AttachmentSealed, AttachmentSnapshot, McpGateway, StdoutRead, StderrRead, StdinWrite, PtyMaster }
+pub enum FdRole { PromptSealed, WorkspaceDirectory, AttachmentSealed, AttachmentSnapshot, McpGateway, StdoutRead, StderrRead, StdinWrite, PtyMaster }
 
 impl SpawnRequest {
     /// Exact fd order accompanying this message. There are no caller-supplied
@@ -147,18 +182,20 @@ impl SpawnRequest {
     pub fn fd_plan(&self) -> Result<Vec<FdRole>, ContractError> {
         self.validate()?;
         let mut roles = Vec::new();
-        if let Self::StartRun { input_fds, .. } = self {
+        if let Self::StartRun { input_fds, workspace, .. } = self {
             roles.push(FdRole::PromptSealed);
             roles.extend(input_fds.as_slice().iter().map(|input| match input {
                 InputFd::SealedMemfd { .. } => FdRole::AttachmentSealed,
                 InputFd::ReadOnlySnapshot { .. } => FdRole::AttachmentSnapshot,
             }));
+            if workspace.is_some() { roles.push(FdRole::WorkspaceDirectory); }
         }
         Ok(roles)
     }
     pub fn validate(&self) -> Result<(), ContractError> {
         match self {
-            Self::StartRun { prompt_bytes, input_fds, .. } => {
+            Self::StartRun { prompt_bytes, input_fds, workspace, .. } => {
+                if let Some(selection) = workspace { selection.validate()?; }
                 if *prompt_bytes > MAX_PROMPT_BYTES { return Err(ContractError::LimitExceeded("prompt")); }
                 let mut total = 0u64;
                 let mut memfd_total = *prompt_bytes;
@@ -269,7 +306,7 @@ mod tests {
     use super::*;
     fn start() -> SpawnRequest {
         SpawnRequest::StartRun { run: RunHandle(crate::ids::RunId([3; 16])), employee_id: EmployeeId([1; 16]), runtime_request: RuntimeKind::Codex,
-            task_ref: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(), pty: false }
+            task_ref: None, workspace: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(), pty: false }
     }
     #[test]
     fn serde_round_trip_and_fd_plan() {
@@ -280,6 +317,26 @@ mod tests {
             let mut value = serde_json::to_value(start()).unwrap();
             value[forbidden] = "unsafe".into();
             assert!(serde_json::from_value::<SpawnRequest>(value).is_err());
+        }
+    }
+    #[test]
+    fn workspace_selector_is_additive_bounded_and_has_a_pinned_fd_role() {
+        let legacy = serde_json::to_value(start()).unwrap();
+        assert!(legacy.get("workspace").is_none());
+        assert!(serde_json::from_value::<SpawnRequest>(legacy).is_ok());
+        let selection = WorkspaceSelection { handle: Text::new(format!("fork-{}", "a".repeat(32))).unwrap(),
+            relative_cwd: Text::new("src/tests".into()).unwrap(), device: 7, inode: 9 };
+        assert_eq!(selection.storage_relative().unwrap(), format!(".forks/{}/src/tests", "a".repeat(32)));
+        let mut request = start();
+        if let SpawnRequest::StartRun { workspace, .. } = &mut request { *workspace = Some(selection.clone()); }
+        assert_eq!(request.fd_plan().unwrap(), vec![FdRole::PromptSealed, FdRole::WorkspaceDirectory]);
+        for cwd in ["/etc", "../escape", "a/../b", "a//b", "a\\b", "a/."] {
+            let mut bad = selection.clone(); bad.relative_cwd = Text::new(cwd.into()).unwrap();
+            assert!(bad.validate().is_err(), "{cwd}");
+        }
+        for handle in ["/work", "fork-../etc", "fork-ABCDEF", "employee-work-extra"] {
+            let mut bad = selection.clone(); bad.handle = Text::new(handle.into()).unwrap();
+            assert!(bad.validate().is_err(), "{handle}");
         }
     }
     #[test]

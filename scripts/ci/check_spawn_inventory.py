@@ -228,7 +228,7 @@ def check(sites: list[Site], registry: dict) -> list[str]:
     entries = registry.get("entries", [])
     indexed = {}
     identities = {"gateway", "employee", "parse_worker", "import_worker", "spawn_daemon", "trampoline", "egress", "updater", "downloader", "operator", "test", "host_service"}
-    migrations = {"pending", "backend", "gateway_exception", "privileged_service", "not_process", "test_only", "other_package"}
+    migrations = {"pending", "backend", "gateway_exception", "privileged_service", "isolated_helper", "not_process", "test_only", "other_package"}
     for entry in entries:
         symbol = entry.get("symbol")
         if not symbol or symbol in indexed:
@@ -245,6 +245,14 @@ def check(sites: list[Site], registry: dict) -> list[str]:
             "spawn_daemon", "trampoline", "updater", "downloader", "host_service",
         }:
             errors.append(f"invalid privileged service exemption: {symbol}")
+        if entry.get("migration") == "isolated_helper" and (
+            entry.get("identity") != "employee"
+            or symbol not in {
+                "crates/duduclaw-execution/src/program_helper.rs::execute_command",
+                "crates/duduclaw-execution/src/recording_helper.rs::run_driver",
+            }
+        ):
+            errors.append(f"invalid isolated helper exemption: {symbol}")
     observed = {site.symbol: site for site in sites}
     for symbol, site in observed.items():
         if symbol not in indexed:

@@ -53,7 +53,7 @@ fn run(n: u8) -> RunHandle { RunHandle(RunId([n; 16])) }
 fn employee(n: u8) -> EmployeeId { EmployeeId([n; 16]) }
 fn request(n: u8, emp: u8, runtime: RuntimeKind) -> SpawnRequest {
     SpawnRequest::StartRun { run: run(n), employee_id: employee(emp), runtime_request: runtime,
-        task_ref: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(), pty: false }
+        task_ref: None, workspace: None, prompt_bytes: 1, input_fds: List::new(vec![]).unwrap(), pty: false }
 }
 fn queue(coordinator: &mut Coordinator<FakeHost>, n: u8, emp: u8, runtime: RuntimeKind) {
     coordinator.reserve(conn(), employee(emp), run(n), 100).unwrap();

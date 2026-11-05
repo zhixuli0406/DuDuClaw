@@ -78,6 +78,19 @@ resumed and require explicit destruction or operator data recovery. Any failed j
 H's `images()` reports kernel-verified image/mount identities for reconciliation.
 Before reporting usage the adapter calls H readiness and reads real `statvfs`;
 when idle it briefly mounts and detaches under a durable maintenance phase.
+**CONTRACT CHANGE (I1b round 5):** StartRun optionally carries a bounded
+`workspace` selector and one trailing directory fd after its existing prompt
+and attachments (66 descriptors maximum; the 64 attachment cap is unchanged).
+The fd pins D's AuthorizedWorkspace directory while queued. Root never mounts
+that supplied fd: after H attachment it reopens only `employee-work` or
+`.forks/<32 lowercase hex>` plus a validated relative cwd under the H work
+mount using openat2 BENEATH/NO_SYMLINKS/NO_MAGICLINKS/NO_XDEV. Employee UID,
+H device and authorization device/inode must all match. The reopened directory
+becomes the existing detached `/work` mount, narrowing a nonempty cwd to that
+subdirectory; the B2 bootstrap schema remains unchanged. Missing selectors retain
+the original work mount. Old roots reject new fields; mixed versions fail closed.
+Native root mount/queue acceptance is still required.
+
 Both home and workspace are conservatively noexec. Only private detached clones
 of their directories reach B1/B2, never images or block devices. B1 still owns the
 unit/cgroup/UID-empty proof and must release every clone before detach/destroy.

@@ -216,3 +216,30 @@ fn wiki_root_replacement_cannot_serve_withdrawn_snapshot() {
     std::fs::create_dir(&live).unwrap();
     assert!(roots.verify_wiki_root("agent:main", &directory(&live)).is_err());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn helper_workspace_token_binds_owner_run_and_relative_directory() {
+    use duduclaw_isolation::execution::WorkspacePolicy;
+    let directory = tempfile::tempdir_in("/dev/shm").unwrap();
+    std::fs::create_dir(directory.path().join("notes")).unwrap();
+    let context = context();
+    let mut roots = ResourceRoots::default();
+    roots.insert("work".into(), context.record().employee, File::open(directory.path()).unwrap()).unwrap();
+    let policy = WorkspacePolicy { workspace: Text::new("work".into()).unwrap(),
+        relative_cwd: Text::new("notes".into()).unwrap() };
+    let proof = roots.authorize_workspace(&context, &policy).unwrap();
+    assert!(proof.permits(&context, &policy));
+    let mut other_run = context.record().clone();
+    other_run.run = RunId([9; 16]);
+    assert!(!proof.permits(&RequestContext::from_verified_record(other_run), &policy));
+    let mut wrong = policy.clone();
+    wrong.relative_cwd = Text::new("../private".into()).unwrap();
+    assert!(!proof.permits(&context, &wrong));
+    assert!(roots.authorize_workspace(&context, &wrong).is_err());
+    std::os::unix::fs::symlink("notes", directory.path().join("link")).unwrap();
+    wrong.relative_cwd = Text::new("link".into()).unwrap();
+    assert!(roots.authorize_workspace(&context, &wrong).is_err());
+    wrong.workspace = Text::new("unregistered".into()).unwrap();
+    assert!(roots.authorize_workspace(&context, &wrong).is_err());
+}

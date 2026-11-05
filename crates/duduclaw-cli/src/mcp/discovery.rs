@@ -2,6 +2,12 @@
 use super::*;
 use duduclaw_gateway::discovery::service::{self, TrustedCaller};
 fn caller(home: &Path, agent: &str) -> std::result::Result<TrustedCaller,String> {
+    if let Some(call) = crate::mcp_isolation::current() {
+        if call.home != home || call.agent != agent {
+            return Err("discovery caller does not match the verified request".into());
+        }
+        return TrustedCaller::from_isolated_agent(home, agent);
+    }
     let claim=crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
     if claim != agent { return Err("discovery requires an explicit signed caller identity".into()); }
     let token=crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_TOKEN).ok();
@@ -45,3 +51,7 @@ pub(crate) async fn handle_discovery_query(name: &str,args: &Value,home: &Path,a
     };
     match result {Ok(value)=>tool_text(&value.to_string()),Err(error)=>tool_error(&error)}
 }
+
+#[cfg(test)]
+#[path = "discovery_isolation_tests.rs"]
+mod isolation_tests;

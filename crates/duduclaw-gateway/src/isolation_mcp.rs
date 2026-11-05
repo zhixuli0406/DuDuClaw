@@ -110,6 +110,10 @@ mod launch;
 #[path = "isolation_mcp/boot.rs"]
 mod boot;
 #[cfg(target_os = "linux")]
+pub(crate) use boot::a_producers_ready;
+#[cfg(target_os = "linux")]
+pub(crate) use boot::control_recording;
+#[cfg(target_os = "linux")]
 #[path = "isolation_mcp/runtime.rs"]
 pub(crate) mod runtime;
 #[cfg(target_os = "linux")]

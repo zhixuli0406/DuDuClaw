@@ -1,4 +1,4 @@
-# Package D round 5 tool dispositions
+# Native Linux tool dispositions — I1b round 6 (v1.80.0)
 
 Isolation changes where employee code runs and where credentials are held. It does not change employee permissions. All gateway handler calls use the employee verified by `RequestContext`, the original dispatcher and the original handler: scopes, allowed/denied tools, permissions, action rules, approvals, record authorization, egress/private-data and input guards stay in force. Credentials remain inside the gateway.
 
@@ -8,8 +8,17 @@ The capability authorizes the call; cron, reminders, tasks, mail and knowledge r
 | --- | --- |
 | Existing Admin/operator gate | A caller without the authority required by the original scope/permission/handler gate is refused there; isolation adds no operator-only tool list. |
 | HostAuthority | A run cannot control or observe the host desktop, devices, power, network configuration or local model services. |
+| ForkNextRelease | v1.80.0 protected TEAM only: `fork_run`, `merge_or_select`, `terminate_branch` are deferred until fresh child capability/account/budget authority and immutable result apply are complete. Non-protected installations retain their existing behavior. |
 
-`Refused: HostAuthority` rows below are the complete isolation exception set. Every other row is served subject to the same original employee gates, even when its scope is Admin. Missing A/E factories are wiring errors, not acceptable product restrictions: `require_complete_services()` rejects incomplete boot assembly. The matrix and tests describe implementation, not live provider or native acceptance.
+`Refused: HostAuthority` and `Refused: ForkNextRelease` rows below are the complete isolation exception set. Every other row is served subject to the same original employee gates, even when its scope is Admin. The three deferred fork tools remain in this inventory, are hidden from protected tools/list, and return a localized refusal on tools/call; an injected service cannot enable them. Apart from that explicit v1.80.0 deferral, missing A/E factories are wiring errors: `require_complete_services()` rejects incomplete boot assembly. The matrix and tests describe implementation, not live provider or native acceptance.
+
+A readiness excludes exactly the three deferred mutations and requires all five signed helper/control producers plus the three host fork readers. An absent or changed signed helper publication still blocks readiness. This does not enable the other composite components, claim native/provider acceptance, or remove any of the original 22 A tools from the inventory.
+
+Operator/user messages follow `[general] default_language`:
+
+- zh-TW: 受保護模式下的分支試算將於下一版開放。
+- en: Branch trials in protected mode will be available in the next release.
+- ja: 保護モードでの分岐試行は次のバージョンで利用可能になります。
 
 | Tool | Disposition |
 | --- | --- |
@@ -103,12 +112,12 @@ The capability authorizes the call; cron, reminders, tasks, mail and knowledge r
 | `computer_workspace_read` | Original gateway container/workspace handler; existing session and lease gates |
 | `computer_workspace_write` | Original gateway container/workspace handler; existing session and lease gates |
 | `session_restore_context` | Original gateway handler; existing employee gates |
-| `fork_run` | A ExecutionBackend + ExecutionPlanFactory |
-| `inspect_branches` | A ExecutionBackend + ExecutionPlanFactory |
-| `diff_branches` | A ExecutionBackend + ExecutionPlanFactory |
-| `merge_or_select` | A ExecutionBackend + ExecutionPlanFactory |
-| `terminate_branch` | A ExecutionBackend + ExecutionPlanFactory |
-| `fork_cost` | A ExecutionBackend + ExecutionPlanFactory |
+| `fork_run` | Refused: ForkNextRelease — protected TEAM v1.80.0 limitation; unchanged on non-protected installations. |
+| `inspect_branches` | Host fork store; exact actor/generation and workspace grants; no legacy-row import. |
+| `diff_branches` | Host recorded-manifest comparison; exact actor/grants; not live or immutable byte verification. |
+| `merge_or_select` | Refused: ForkNextRelease — protected TEAM v1.80.0 limitation; unchanged on non-protected installations. |
+| `terminate_branch` | Refused: ForkNextRelease — protected TEAM v1.80.0 limitation; unchanged on non-protected installations. |
+| `fork_cost` | Host owner-checked query; measurement_status=unavailable and null spend until measured usage is implemented; never fabricated zero. |
 | `credential_declare` | Original gateway handler; existing employee gates |
 | `discovery_catalog` | A ExecutionBackend + ExecutionPlanFactory |
 | `discovery_list` | A ExecutionBackend + ExecutionPlanFactory |

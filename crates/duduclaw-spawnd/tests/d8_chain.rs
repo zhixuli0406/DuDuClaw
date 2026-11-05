@@ -249,7 +249,7 @@ fn plan(setup: &Setup, gid: u32, run: RunHandle, role: &str) -> SpawnPolicy {
     let policy = publication.policy().unwrap(); let (runtime, _) = policy.derive(setup.employee, &kind(), false).unwrap();
     assert!(!runtime.mcp && runtime.fixed_args.is_empty() && runtime.network == NetworkPolicy::Offline);
     let prompt = serde_json::to_vec(&json!({"role":role,"nonce":setup.nonce})).unwrap();
-    SpawnPolicy { run, employee: setup.employee, class: ExecutionClass::EmployeeMain, runtime: kind(),
+    SpawnPolicy { workspace_delivery: None, run, employee: setup.employee, class: ExecutionClass::EmployeeMain, runtime: kind(),
         argv_allowlist: vec![], environment_allowlist: Default::default(),
         workspace: WorkspacePolicy { workspace: Text::new("employee-work".into()).unwrap(), relative_cwd: Text::new(String::new()).unwrap() },
         resources: runtime.resources.clone(), network: runtime.network.clone(), pty: false,

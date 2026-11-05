@@ -3,7 +3,7 @@ use std::{fs, io::{self, IoSlice}, mem, os::{fd::{AsFd, AsRawFd, BorrowedFd, Fro
 use nix::{fcntl::{fcntl, FcntlArg, FdFlag, OFlag}, sys::{socket::{self, AddressFamily, Backlog, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr, sockopt}, time::TimeVal}};
 use duduclaw_isolation::{ids::{SPAWND_SOCKET, EGRESS_CONTROL_SOCKET}, ipc::{self, CONTROL_TIMEOUT_MS, MAX_FRAME_BYTES, MAX_INPUT_FDS}};
 
-const MAX_RIGHTS: usize = MAX_INPUT_FDS + 1;
+const MAX_RIGHTS: usize = MAX_INPUT_FDS + 2;
 // Linux SCM_MAX_FD is 253. Receive all of them before rejecting excess descriptors.
 const KERNEL_MAX_RIGHTS: usize = 253;
 

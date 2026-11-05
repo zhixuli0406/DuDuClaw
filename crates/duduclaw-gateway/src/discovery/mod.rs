@@ -39,6 +39,7 @@
 
 pub mod agent_spawn;
 pub mod artifact;
+pub mod artifact_manifest;
 pub mod attempt_adapter;
 pub mod attempt_container;
 pub mod attempt_guard;

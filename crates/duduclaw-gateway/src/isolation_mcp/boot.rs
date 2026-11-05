@@ -39,6 +39,7 @@ pub struct BootSources {
     pub runtime_registry: Option<Arc<dyn RuntimeBridgeRegistry>>,
     pub main_plans: Option<Arc<duduclaw_spawnd::gateway_plan::InstalledMainPlanFactory>>,
     pub execution_plans: Option<Arc<dyn ExecutionPlanFactory>>,
+    pub fork_tools: Option<Arc<dyn duduclaw_mcp_boundary::forks::ForkToolService>>,
     pub worker_launcher: Option<Box<dyn WorkerLauncher>>,
     pub worker_plans: Option<Arc<dyn WorkerPlanFactory>>,
     pub turns: Option<Arc<dyn RunTurnResolver>>,
@@ -75,6 +76,14 @@ pub fn install_boot_sources(sources: BootSources) -> Result<(), VerificationErro
     Ok(())
 }
 fn fill_installed_sources(sources: &mut BootSources) {
+    if sources.execution_plans.is_none() {
+        if let Some(generation) = crate::isolation_readiness::verified_generation() {
+            if let Ok(factory) = crate::isolation_execution::InstalledProgramPlans::new(
+                generation, nix::unistd::getegid().as_raw()) {
+                sources.execution_plans = Some(factory);
+            }
+        }
+    }
     if sources.main_plans.is_none() {
         if let Some(generation) = crate::isolation_readiness::verified_generation() {
             if let Ok(factory) = duduclaw_spawnd::gateway_plan::InstalledMainPlanFactory::new(
@@ -176,6 +185,16 @@ pub fn boot_status() -> BootStatus {
     status
 }
 
+/// A's v1.80 producer hook excludes exactly the documented fork mutations.
+/// Recheck the installed helpers on every observation; source presence alone
+/// does not override missing/replaced signed runtime publications.
+pub fn a_producers_ready() -> bool {
+    OWNER.get().is_some_and(|owner| owner.boundary.healthy()
+        && duduclaw_mcp_boundary::fork_policy::remaining_producers_ready(
+            |name| owner.execution_plans.supports(name),
+            |name| owner.fork_tools.supports(name)))
+}
+
 pub struct LaunchInput {
     pub agent: String,
     pub plan: SpawnPolicy,
@@ -195,6 +214,8 @@ struct BootOwner {
     registry: Arc<dyn RuntimeBridgeRegistry>,
     main_plans: Arc<duduclaw_spawnd::gateway_plan::InstalledMainPlanFactory>,
     execution_plans: Arc<dyn ExecutionPlanFactory>,
+    execution_jobs: Arc<duduclaw_mcp_boundary::execution_jobs::SqliteExecutionJobs>,
+    fork_tools: Arc<dyn duduclaw_mcp_boundary::forks::ForkToolService>,
     worker_plans: Arc<dyn WorkerPlanFactory>,
     #[cfg(feature = "isolation-worker-integration")]
     worker: crate::isolation_execution::InstalledWorkerServices,
@@ -213,7 +234,15 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
     let boundary = McpBoundaryService::start(live)?;
     let worker = crate::isolation_execution::install_worker_services(
         sources.worker_launcher.take().ok_or(VerificationError::Unavailable)?)?;
-    Ok(BootOwner { product_authority: sources.product_authority, home: home.to_owned(), backend, boundary, bindings, worker,
+    let execution_jobs = duduclaw_mcp_boundary::execution_jobs::SqliteExecutionJobs::open(&home.join("isolation-execution-jobs.db"))?;
+    let fork_tools = match sources.fork_tools.take() {
+        Some(service) => service,
+        None => Arc::new(duduclaw_mcp_boundary::forks::ForkHostControl {
+            store: duduclaw_mcp_boundary::forks::ForkStore::open(&home.join("isolation-forks.db"))?,
+            backend: backend.clone(),
+        }),
+    };
+    Ok(BootOwner { fork_tools, execution_jobs, product_authority: sources.product_authority, home: home.to_owned(), backend, boundary, bindings, worker,
         registry: sources.runtime_registry.take().ok_or(VerificationError::Unavailable)?,
         main_plans: sources.main_plans.take().ok_or(VerificationError::Unavailable)?,
         execution_plans: sources.execution_plans.take().ok_or(VerificationError::Unavailable)?,
@@ -265,7 +294,9 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
     #[cfg(feature = "isolation-worker-integration")]
     {
         let factories = GatewayFactories::assemble(Some(owner.backend.clone()), Some(owner.execution_plans.clone()),
-            resolver.clone(), Some(owner.worker.parser.clone()))?
+            resolver.clone(), Some(owner.worker.parser.clone()), input.roots.clone())?
+            .with_execution_jobs(owner.execution_jobs.clone())
+            .with_forks(owner.fork_tools.clone())
             .with_worker(owner.worker.tools(owner.worker_plans.clone(), resolver.clone()));
         let dispatcher_input = DispatcherInput {
             home: owner.home.clone(), employee: input.plan.employee, agent: input.agent,
@@ -305,4 +336,21 @@ mod tests {
         assert!(absent.contains(&MissingProducer::Dispatcher));
         assert!(absent.contains(&MissingProducer::WorkerIntegration));
     }
+}
+
+/// Dashboard control stays available while D8 is occupied by a recording. It
+/// never mints an employee context or waits synchronously for that employee.
+pub(crate) fn control_recording(home: &Path, ctx: &duduclaw_auth::UserContext, id: &str, stop: bool)
+    -> Result<serde_json::Value, VerificationError> {
+    crate::approval::require_current_dashboard_role_in_home(home, ctx, duduclaw_auth::UserRole::Admin)
+        .map_err(|_| VerificationError::Invalid)?;
+    let run = duduclaw_mcp_boundary::execution_jobs::parse_handle(id)?;
+    let owner = OWNER.get().filter(|owner| owner.home == home).ok_or(VerificationError::Unavailable)?;
+    let result = owner.execution_jobs.admin_recording_control(run, stop)?;
+    if stop {
+        duduclaw_security::audit::append_audit_event(home, &duduclaw_security::audit::AuditEvent::new(
+            "isolation_recording_stop_requested", "gateway", duduclaw_security::audit::Severity::Info,
+            serde_json::json!({"actor":ctx.user_id,"job":id,"status":result["status"]})));
+    }
+    Ok(result)
 }

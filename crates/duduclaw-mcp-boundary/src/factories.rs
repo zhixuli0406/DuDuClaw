@@ -11,6 +11,8 @@ use crate::{RequestContext, VerificationError, execution::{ExecutionPlanFactory,
 /// Missing A or E deliberately leaves the corresponding routes unavailable.
 #[derive(Default)]
 pub struct GatewayFactories {
+    #[cfg(feature = "binding-store")]
+    pub forks: Option<Arc<dyn crate::forks::ForkToolService>>,
     pub execution: Option<Arc<ExecutionToolBridge>>,
     pub parser: Option<Arc<dyn FileParser>>,
     pub worker: Option<Arc<crate::worker_execution::WorkerToolBridge>>,
@@ -19,14 +21,26 @@ pub struct GatewayFactories {
 impl GatewayFactories {
     pub fn assemble(backend: Option<Arc<dyn ExecutionBackend>>,
         plans: Option<Arc<dyn ExecutionPlanFactory>>, resolver: Arc<dyn ResourceResolver>,
-        parser: Option<Arc<dyn FileParser>>) -> Result<Self, VerificationError> {
+        parser: Option<Arc<dyn FileParser>>, roots: Arc<crate::resources::ResourceRoots>) -> Result<Self, VerificationError> {
         let execution = match (backend, plans) {
             (Some(backend), Some(plans)) => Some(Arc::new(ExecutionToolBridge::new(backend,
-                Arc::new(ResourceCheckedPlans { plans, resolver })))),
+                Arc::new(ResourceCheckedPlans { plans, resolver, roots })))),
             (None, None) => None,
             _ => return Err(VerificationError::Unavailable),
         };
-        Ok(Self { execution, parser, worker: None })
+        Ok(Self { execution, parser, worker: None, #[cfg(feature = "binding-store")] forks: None })
+    }
+
+    pub fn with_execution_jobs(mut self, jobs: Arc<dyn crate::execution_jobs::ExecutionJobs>) -> Self {
+        if let Some(bridge) = self.execution.take() {
+            self.execution = Some(Arc::new(bridge.with_jobs(jobs)));
+        }
+        self
+    }
+
+    #[cfg(feature = "binding-store")]
+    pub fn with_forks(mut self, forks: Arc<dyn crate::forks::ForkToolService>) -> Self {
+        self.forks = Some(forks); self
     }
 
     pub fn with_worker(mut self, worker: Arc<crate::worker_execution::WorkerToolBridge>) -> Self {
@@ -37,12 +51,29 @@ impl GatewayFactories {
 /// The injected handler factory chooses the registered operation and supplies
 /// bounded inputs. D independently verifies resources before and after awaits.
 struct ResourceCheckedPlans {
+    roots: Arc<crate::resources::ResourceRoots>,
     plans: Arc<dyn ExecutionPlanFactory>,
     resolver: Arc<dyn ResourceResolver>,
 }
 
 impl ExecutionPlanFactory for ResourceCheckedPlans {
     fn supports(&self, tool: &str) -> bool { self.plans.supports(tool) }
+    fn collects_results(&self, tool: &str) -> bool { self.plans.collects_results(tool) }
+    fn cooperative_stop(&self, tool: &str) -> bool { self.plans.cooperative_stop(tool) }
+    fn decode_result(&self, tool: &str, stdout: &[u8], stderr: &[u8],
+        outcome: &duduclaw_isolation::execution::RunOutcome) -> Result<Value, VerificationError> {
+        self.plans.decode_result(tool, stdout, stderr, outcome)
+    }
+    fn authorize_control<'a>(&'a self, context: &'a RequestContext, tool: &'a str,
+        arguments: &'a Value) -> PolicyFuture<'a, ()> {
+        Box::pin(async move {
+            let before = tool_policy::authorize_async(context, tool, arguments, self.resolver.clone()).await?;
+            self.plans.authorize_control(context, tool, arguments).await?;
+            let after = tool_policy::authorize_async(context, tool, arguments, self.resolver.clone()).await?;
+            if before.resources() != after.resources() { return Err(VerificationError::BindingMismatch); }
+            Ok(())
+        })
+    }
     fn authorize_handler<'a>(&'a self, context: &'a RequestContext, tool: &'a str,
         arguments: &'a Value) -> PolicyFuture<'a, ()> {
         Box::pin(async move {
@@ -58,9 +89,20 @@ impl ExecutionPlanFactory for ResourceCheckedPlans {
         Box::pin(async move {
             let before = tool_policy::authorize_async(context, tool, arguments, self.resolver.clone()).await?;
             self.plans.authorize_handler(context, tool, arguments).await?;
-            let plan = self.plans.prepare(context, tool, arguments, run).await?;
+            let mut plan = self.plans.prepare(context, tool, arguments, run).await?;
             let after = tool_policy::authorize_async(context, tool, arguments, self.resolver.clone()).await?;
             if before.resources() != after.resources() { return Err(VerificationError::BindingMismatch); }
+            if !after.resources().iter().any(|resource| matches!(resource,
+                duduclaw_isolation::capability::ResourceGrant::Workspace { handle } if handle == &plan.workspace.workspace)) {
+                return Err(VerificationError::BindingMismatch);
+            }
+            let roots = self.roots.clone();
+            let context = context.clone();
+            let workspace = plan.workspace.clone();
+            let authorized = crate::authority::verify_blocking(move ||
+                roots.authorize_workspace(&context, &workspace)).await?;
+            if !authorized.permits(after.context(), &plan.workspace) { return Err(VerificationError::BindingMismatch); }
+            plan.workspace_delivery = Some(authorized.delivery()?);
             Ok(plan)
         })
     }

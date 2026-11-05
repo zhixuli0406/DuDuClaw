@@ -32,13 +32,19 @@ impl Components {
     fn current(spawnd_verified: bool) -> Self {
         let host = if spawnd_verified { ComponentState::Ready } else { ComponentState::Unavailable };
         Self { launch_service: host, sandbox: host, network: host, storage: host,
-            // No production factory/readback is installed by this integration
-            // subset. A running unit or an existing key file is insufficient.
+            // E/D still need their composite readback integration. A now has
+            // its own remaining-producer hook; neither proves the other gates.
             parse_worker: ComponentState::PendingIntegration,
             update_service: update_service_state(),
             mcp_boundary: ComponentState::PendingIntegration,
-            runtime_adapters: ComponentState::PendingIntegration }
+            runtime_adapters: runtime_adapters_state() }
     }
+}
+
+fn runtime_adapters_state() -> ComponentState {
+    #[cfg(target_os = "linux")]
+    if crate::isolation_mcp::a_producers_ready() { return ComponentState::Ready; }
+    ComponentState::PendingIntegration
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -57,7 +57,7 @@ fn claude_plan(policy: &RootPolicy, employee: EmployeeId, class: ExecutionClass,
     // them twice or copy anything from the legacy native Command builder.
     let mut argv_allowlist = runtime.fixed_args.clone();
     argv_allowlist.truncate(argv_allowlist.len() - 3);
-    Ok(SpawnPolicy { run: RunHandle(RunId([0; 16])), employee, class, runtime: RuntimeKind::Claude,
+    Ok(SpawnPolicy { workspace_delivery: None, run: RunHandle(RunId([0; 16])), employee, class, runtime: RuntimeKind::Claude,
         argv_allowlist, environment_allowlist: Default::default(),
         workspace: WorkspacePolicy { workspace: Text::new("employee-work".into()).map_err(|_| BackendError::Denied)?,
             relative_cwd: Text::new(String::new()).map_err(|_| BackendError::Denied)? },

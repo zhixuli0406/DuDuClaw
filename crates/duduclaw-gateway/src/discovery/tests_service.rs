@@ -1,4 +1,6 @@
 //! Real database and authenticated-caller fixtures; no provider or Docker calls.
+#[path = "tests_service_isolation.rs"]
+mod isolation_tests;
 use super::*;
 use crate::approval::ApprovalStore;
 use std::collections::HashMap;

@@ -481,11 +481,11 @@ impl Host for Core {
         Ok(self.policy.as_ref().ok_or_else(unavailable)?.derive(employee, runtime, pty)?.1)
     }
     fn cleanup(&mut self, employee: EmployeeId, previous: Option<RunHandle>) -> Result<CleanupReadback> { self.cleanup_run(employee, previous) }
-    fn start(&mut self, run: RunHandle, employee: EmployeeId, request: &SpawnRequest, _: &LaunchPolicy, inputs: Self::Inputs) -> Result<()> {
+    fn start(&mut self, run: RunHandle, employee: EmployeeId, request: &SpawnRequest, _: &LaunchPolicy, mut inputs: Self::Inputs) -> Result<()> {
         self.monitor.check_run(run)?;
         self.ready(employee)?;
         if !self.cleanup_run(employee, None)?.complete() { return Err(unavailable()); }
-        let SpawnRequest::StartRun { runtime_request, pty, prompt_bytes, input_fds, .. } = request else { return Err(ErrorCode::InvalidRequest); };
+        let SpawnRequest::StartRun { runtime_request, pty, prompt_bytes, input_fds, workspace, .. } = request else { return Err(ErrorCode::InvalidRequest); };
         let account = self.account(employee)?;
         let (runtime, _) = self.policy.as_ref().ok_or_else(unavailable)?.derive(employee, runtime_request, *pty)?;
         let runtime = runtime.clone();
@@ -495,9 +495,16 @@ impl Host for Core {
         self.runs.insert(run.0, LiveRun { employee, unit: None, attachment: None, revokers: vec![], gateway_io: Some(vec![]),
             relays: vec![], egress: false, pty: *pty, pty_taken: false, closed: false, started_event: false, truncated_event: false,
             runtime_deadline: Instant::now() + Duration::from_millis(runtime.timeouts.runtime_ms), bootstrap_attempted: false, projection: None });
-        let storage = self.components.storage.attach(employee, account.uid, run, &runtime.resources.disk)?;
+        let mut storage = self.components.storage.attach(employee, account.uid, run, &runtime.resources.disk)?;
         storage.receipt.check(employee, run)?;
         self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.attachment = Some(storage.receipt.clone());
+        if let Some(selection) = workspace {
+            let pin = inputs.pop().ok_or(ErrorCode::InvalidFds)?;
+            os(crate::fds::validate_workspace_directory(pin.as_fd(), selection))?;
+            os(crate::bootstrap_mounts::select_workspace(&mut storage, selection, account.uid))?;
+            // The root-owned detached mount now pins the authorized inode.
+            drop(pin);
+        }
         let mut gateway_io = Vec::new();
         let mut revokers = Vec::new();
         let mcp = if runtime.mcp {

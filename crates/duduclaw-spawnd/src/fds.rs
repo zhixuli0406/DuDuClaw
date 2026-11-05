@@ -22,13 +22,29 @@ pub struct SnapshotAuthority { pub gateway_uid: u32, pub mount_id: u64 }
 pub fn validate_start(request: &SpawnRequest, descriptors: &[OwnedFd], authority: SnapshotAuthority) -> io::Result<()> {
     let plan = request.fd_plan().map_err(|_| invalid())?;
     if descriptors.len() != plan.len() { return Err(invalid()); }
-    let SpawnRequest::StartRun { prompt_bytes, input_fds, .. } = request else { return Ok(()); };
+    let SpawnRequest::StartRun { prompt_bytes, input_fds, workspace, .. } = request else { return Ok(()); };
     validate_sealed(descriptors[0].as_fd(), *prompt_bytes)?;
     for (input, fd) in input_fds.as_slice().iter().zip(descriptors.iter().skip(1)) {
         match input {
             InputFd::SealedMemfd { bytes } => validate_sealed(fd.as_fd(), *bytes)?,
             InputFd::ReadOnlySnapshot { bytes } => validate_snapshot(fd.as_fd(), *bytes, authority)?,
         }
+    }
+    if let Some(selection) = workspace {
+        let fd = descriptors.last().ok_or_else(invalid)?.as_fd();
+        validate_workspace_directory(fd, selection)?;
+    }
+    Ok(())
+}
+
+pub fn validate_workspace_directory(fd: BorrowedFd<'_>, selection: &duduclaw_isolation::ipc::WorkspaceSelection) -> io::Result<()> {
+    selection.validate().map_err(|_| invalid())?;
+    let stat = fstat(fd.as_raw_fd())?;
+    let flags = fcntl(fd.as_raw_fd(), FcntlArg::F_GETFL)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR || stat.st_dev != selection.device || stat.st_ino != selection.inode
+        || flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_PATH != 0
+        || fcntl(fd.as_raw_fd(), FcntlArg::F_GETFD)? & libc::FD_CLOEXEC == 0 {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -90,7 +106,7 @@ mod tests {
     use duduclaw_isolation::{bounded::List, execution::{RunHandle, RuntimeKind}, ids::{EmployeeId, RunId}};
     fn request() -> SpawnRequest {
         SpawnRequest::StartRun { run: RunHandle(RunId([1;16])), employee_id: EmployeeId([2;16]), runtime_request: RuntimeKind::Codex,
-            task_ref: None, prompt_bytes: 2, input_fds: List::new(vec![]).unwrap(), pty: false }
+            task_ref: None, workspace: None, prompt_bytes: 2, input_fds: List::new(vec![]).unwrap(), pty: false }
     }
     #[test]
     fn sealed_fd_rejects_missing_seals_and_false_size() {

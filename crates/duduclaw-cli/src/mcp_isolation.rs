@@ -21,6 +21,17 @@ pub(crate) fn boundary_route(name: &str) -> Option<BoundaryRoute> {
     use duduclaw_mcp_boundary::tool_policy::{Route, policy};
     let effect = duduclaw_core::tool_effect::effect_of_builtin(name)?;
     let policy = policy(name)?;
+    // These are authenticated queue/store/control operations. No employee
+    // subprocess is started by their original handlers; launch factories are
+    // still mandatory for the separate run/parse operations.
+    if crate::mcp_isolation_a_routes::is_target_dispatch(name)
+        || crate::mcp_isolation_inference::supports(name)
+        || (cfg!(target_os = "linux") && name == "discovery_artifact")
+        || crate::mcp_fork::is_fork_tool(name)
+        || matches!(name, "inspect_branches" | "diff_branches" | "fork_cost"
+            | "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_cancel") {
+        return Some(BoundaryRoute::GatewayHandler(effect));
+    }
     Some(match policy.route {
         Route::File => BoundaryRoute::File,
         Route::Worker => BoundaryRoute::Worker,
@@ -81,7 +92,7 @@ async fn authorize_resource_call(service: Arc<dyn ResourceToolService>, context:
 pub(crate) async fn dispatch_resource_tool(home: &std::path::Path, name: &str, arguments: &Value) -> Option<Value> {
     let current = current()?;
     if let Some(reason) = crate::mcp_isolation_disposition::intentional_refusal(name) {
-        return Some(crate::mcp::tool_error(reason.message()));
+        return Some(crate::mcp::tool_error(refusal_message(home, reason).await));
     }
     match boundary_route(name) {
         Some(BoundaryRoute::File) => return None,
@@ -138,6 +149,7 @@ pub(crate) struct IsolatedCall {
     pub services: Option<Arc<dyn ResourceToolService>>,
     pub worker: Option<Arc<duduclaw_mcp_boundary::worker_execution::WorkerToolBridge>>,
     pub execution: Option<Arc<crate::mcp_isolation_execution::ExecutionToolBridge>>,
+    pub forks: Option<Arc<dyn duduclaw_mcp_boundary::forks::ForkToolService>>,
     pub record_resolver: Option<Arc<dyn duduclaw_mcp_boundary::tool_policy::ResourceResolver>>,
 }
 
@@ -145,6 +157,13 @@ tokio::task_local! { pub(crate) static ISOLATED_CALL: Arc<IsolatedCall>; }
 
 pub(crate) fn current() -> Option<Arc<IsolatedCall>> {
     ISOLATED_CALL.try_with(Arc::clone).ok()
+}
+
+pub(crate) async fn refusal_message(home: &std::path::Path,
+    reason: crate::mcp_isolation_disposition::Refusal) -> &'static str {
+    if reason == crate::mcp_isolation_disposition::Refusal::HostAuthority { return reason.message(); }
+    let language = duduclaw_gateway::prompt_identity::read_default_language(home).await;
+    reason.message_for_language(language.as_deref())
 }
 
 pub(crate) fn process_lane() -> duduclaw_core::ProcessLane {
@@ -162,13 +181,16 @@ pub(crate) fn tool_allowed(name: &str, principal: &Principal) -> bool {
     if crate::mcp_isolation_disposition::intentional_refusal(name).is_some() { return false; }
     let supported = match boundary_route(name) {
         Some(BoundaryRoute::File) => name == "file_read" || call.parser.is_some(),
+        Some(BoundaryRoute::GatewayHandler(_)) if crate::mcp_fork::is_fork_tool(name) =>
+            call.forks.as_ref().is_some_and(|service| service.supports(name)),
         Some(BoundaryRoute::GatewayHandler(_)) => true,
         Some(BoundaryRoute::Worker) => call.worker.as_ref().is_some_and(|bridge| bridge.supports(name)),
         Some(BoundaryRoute::Execution) => call.execution.as_ref().is_some_and(|bridge| bridge.supports(name)),
         Some(BoundaryRoute::Resource) => call.services.as_ref().is_some_and(|service| service.supports(name)),
         None => false,
     };
-    supported && (matches!(boundary_route(name), Some(BoundaryRoute::GatewayHandler(_)))
+    supported && ((!crate::mcp_isolation_inference::supports(name)
+            && matches!(boundary_route(name), Some(BoundaryRoute::GatewayHandler(_))))
             || duduclaw_mcp_boundary::tool_policy::eligible(&call.context, name))
         && record.tools.as_slice().iter().any(|tool| tool.as_str() == name)
         && crate::mcp_auth::tool_requires_scope(name).is_none_or(|required|
@@ -189,6 +211,7 @@ pub struct IsolationDispatcher {
     services: Option<Arc<dyn ResourceToolService>>,
     worker: Option<Arc<duduclaw_mcp_boundary::worker_execution::WorkerToolBridge>>,
     execution: Option<Arc<crate::mcp_isolation_execution::ExecutionToolBridge>>,
+    forks: Option<Arc<dyn duduclaw_mcp_boundary::forks::ForkToolService>>,
     record_resolver: Option<Arc<dyn duduclaw_mcp_boundary::tool_policy::ResourceResolver>>,
     turn_resolver: Option<Arc<dyn duduclaw_gateway::isolation_egress::RunTurnResolver>>,
     workflow: Option<(duduclaw_isolation::ids::RunId, Arc<crate::mcp::workflow_operation::WorkflowSession>)>,
@@ -212,6 +235,8 @@ impl IsolationDispatcher {
                 ServiceState::IntentionalRefusal(reason)
             } else {
                 let ready = match boundary_route(name) {
+                    Some(BoundaryRoute::GatewayHandler(_)) if crate::mcp_fork::is_fork_tool(name) =>
+                        self.forks.as_ref().is_some_and(|service| service.supports(name)),
                     Some(BoundaryRoute::GatewayHandler(_)) => true,
                     Some(BoundaryRoute::File) => name == "file_read" || self.parser.is_some(),
                     Some(BoundaryRoute::Resource) => self.services.as_ref().is_some_and(|s| s.supports(name)),
@@ -257,7 +282,7 @@ impl IsolationDispatcher {
             crate::mcp_rate_limit::RateLimiter::new(), crate::mcp_memory_quota::DailyQuota::new())
             .with_redaction(redaction.map(Arc::new));
         Ok(Self { employee, agent, principal, namespace, dispatcher, roots,
-            parser: None, services: None, execution: None, worker: None, record_resolver: None, turn_resolver: None, workflow: None })
+            parser: None, services: None, execution: None, worker: None, forks: None, record_resolver: None, turn_resolver: None, workflow: None })
     }
 
     /// Boot wiring: A/E readiness and resource/account authority are injected
@@ -269,6 +294,7 @@ impl IsolationDispatcher {
         self.services = Some(Arc::new(crate::mcp_isolation_resources::GatewayResourceToolService::new(
             self.dispatcher.home_dir.clone(), self.agent.clone(), self.roots.clone(), resolver.clone(), connectors)));
         self.record_resolver = Some(resolver);
+        self.forks = factories.forks;
         self.execution = factories.execution;
         self.worker = factories.worker;
         self.parser = factories.parser;
@@ -399,6 +425,38 @@ impl IsolationDispatcher {
 }
 
 fn project_tool_schema(tool: &mut Value) {
+    crate::mcp_isolation_inference::describe(tool);
+    if tool["name"] == "fork_cost" {
+        tool["description"] = json!("Read an owned protected fork's cost availability. Usage is not yet measured: measurement_status is unavailable, aggregate and per-branch spend are null, never zero estimates.");
+    }
+    if tool["name"] == "merge_or_select" {
+        tool["description"] = json!("Select an exact completed branch result using the host parent revision and digest. Returns manifest_selected; does not overwrite the live parent filesystem.");
+        tool["inputSchema"]["properties"] = json!({
+            "fork_id":{"type":"string"}, "branch_id":{"type":"string"},
+            "expected_revision":{"type":"integer","minimum":0},
+            "expected_parent_digest":{"type":"string","pattern":"^[0-9a-f]{64}$"}});
+        tool["inputSchema"]["required"] = json!(["fork_id","branch_id","expected_revision","expected_parent_digest"]);
+        tool["inputSchema"]["additionalProperties"] = json!(false);
+    }
+    if tool["name"] == "diff_branches" {
+        tool["description"] = json!("Compare authenticated recorded branch snapshots by their manifests; does not read live parent files.");
+        tool["inputSchema"]["properties"] = json!({"fork_id":{"type":"string"},
+            "left_branch_id":{"type":"string"},"right_branch_id":{"type":"string"}});
+        tool["inputSchema"]["required"] = json!(["fork_id","left_branch_id","right_branch_id"]);
+        tool["inputSchema"]["additionalProperties"] = json!(false);
+    }
+
+    if tool["name"] == "browser_record_start" {
+        tool["description"] = json!("Queue a protected headless browser recording (headless=true required, 1–300 seconds, default 30). Starts after this employee run exits. Returns id/job; trace stays in the authorized workspace.");
+        tool["inputSchema"]["properties"]["headless"] = json!({"type":"boolean","const":true,"description":"受保護錄製須明確指定 true；不開啟主機桌面視窗"});
+        tool["inputSchema"]["properties"]["max_seconds"] = json!({"type":"integer","minimum":1,"maximum":300,"default":30});
+        if let Some(required) = tool["inputSchema"]["required"].as_array_mut() { required.push(json!("headless")); }
+        else { tool["inputSchema"]["required"] = json!(["headless"]); }
+    }
+    if tool["name"] == "browser_record_stop" {
+        tool["description"] = json!("Request a cooperative stop of your protected browser recording by its returned id. Returns stop_requested while flushing; repeat to read the terminal result. A request is not confirmed completion.");
+        tool["inputSchema"]["properties"]["id"] = json!({"type":"string","pattern":"^[0-9a-f]{32}$"});
+    }
     let name = tool["name"].as_str().unwrap_or("").to_owned();
     if matches!(boundary_route(&name), Some(BoundaryRoute::GatewayHandler(_))) { return; }
     let schema = &mut tool["inputSchema"];
@@ -417,6 +475,14 @@ fn project_tool_schema(tool: &mut Value) {
             properties.insert("workspace".into(), json!({"type":"string", "description":"這次執行獲授權的工作區識別碼"}));
             properties.insert("path".into(), json!({"type":"string", "description":"工作區內的相對目錄路徑；省略表示整個工作區"}));
         }
+    }
+    if matches!(name.as_str(), "execute_program" | "office_script" | "code_map" | "browser_record_start") {
+        schema["properties"]["action"] = json!({"type":"string","enum":["status","cancel"],"description":"查詢或取消先前交付的工作；省略即建立新工作"});
+        schema["properties"]["job"] = json!({"type":"string","pattern":"^[0-9a-f]{32}$","description":"先前回傳的工作識別碼"});
+        let required = schema.get("required").cloned().unwrap_or(json!([]));
+        schema["anyOf"] = json!([{"required":required,"not":{"required":["action"]}},
+            {"required":["action","job"]}]);
+        schema["required"] = json!([]);
     }
     if target_required {
         schema["required"].as_array_mut().expect("required array checked above").push(json!("target_employee"));
@@ -437,7 +503,7 @@ impl duduclaw_mcp_boundary::server::Dispatcher for IsolationDispatcher {
             let call = Arc::new(IsolatedCall { home: self.dispatcher.home_dir.clone(),
                 context: context.clone(), agent: self.agent.clone(), roots: self.roots.clone(),
                 parser: self.parser.clone(), services: self.services.clone(), execution: self.execution.clone(), worker: self.worker.clone(),
-                record_resolver: self.record_resolver.clone() });
+                record_resolver: self.record_resolver.clone(), forks: self.forks.clone() });
             duduclaw_gateway::isolation_egress::scope(&self.dispatcher.home_dir, &self.agent, &context,
                 self.turn_resolver.clone(), ISOLATED_CALL.scope(call, crate::mcp_auth::with_authenticated_call(
                 crate::mcp_auth::AuthenticatedCall::without_reference(self.principal.clone()),
