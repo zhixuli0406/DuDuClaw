@@ -32,7 +32,7 @@ async fn fixture(auto_login_off: bool) -> Fixture {
     let jwt = Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"));
     handler.set_user_db(db.clone(), jwt).await;
     let ctx = UserContext {
-        credential_epoch: 0,
+        credential_epoch: owner.credential_epoch,
         user_id: owner.id.clone(),
         email: owner.email.clone(),
         role: UserRole::Admin,
@@ -75,7 +75,7 @@ fn error_text(frame: &WsFrame) -> String {
 /// email without a password, which they never chose.
 #[tokio::test]
 async fn personal_auto_login_owner_sets_email_without_password() {
-    let f = fixture(false).await;
+    let mut f = fixture(false).await;
     let me = ok_payload(&f.handler.handle("users.me", json!({}), &f.owner).await);
     assert_eq!(me["email_setup"]["placeholder"], json!(true));
     assert_eq!(me["email_setup"]["password_required"], json!(false));
@@ -94,6 +94,9 @@ async fn personal_auto_login_owner_sets_email_without_password() {
         "owner@example.com"
     );
 
+    assert!(matches!(f.handler.handle("users.me", json!({}), &f.owner).await,
+        WsFrame::Response { ok: false, .. }));
+    f.owner = f.db.live_user_context(&f.owner.user_id).unwrap().unwrap();
     let me = ok_payload(&f.handler.handle("users.me", json!({}), &f.owner).await);
     assert_eq!(me["email_setup"]["placeholder"], json!(false));
 }

@@ -92,7 +92,14 @@ fn prepare_office_source(bytes: &[u8], extension: &str, document_limits: &crate:
     // Only the OS-selected temporary root is trusted for alias resolution
     // (e.g. macOS /var -> /private/var); never canonicalize attachment dirs.
     let temporary_root = std::env::temp_dir().canonicalize().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let staging = tempfile::Builder::new().prefix("dudu-preview-").tempdir_in(temporary_root)
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("dudu-preview-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let staging = builder.tempdir_in(temporary_root)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let directory = crate::fs_safe::SafeDir::open_nofollow(staging.path(), false)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

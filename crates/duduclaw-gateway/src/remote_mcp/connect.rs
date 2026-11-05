@@ -1744,7 +1744,9 @@ mod tests {
         for (agent, token) in [("a1", ""), ("other", token.as_str()), ("a1", "forged")] {
             let err = upstream_auth_for_bridge(dir.path(), agent, "missing", token, false, None)
                 .await.err().expect("invalid identity must not read credentials");
-            assert_eq!(err.to_string(), "MCP remote bridge identity rejected");
+            assert!(matches!(&err, AuthError::Transient(reason)
+                if reason == "MCP remote bridge identity rejected"), "{err:?}");
+            assert_eq!(err.to_string(), "MCP sign-in temporarily unavailable; retry later");
             assert!(!store::store_path(dir.path()).exists());
         }
     }

@@ -48,10 +48,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GatewayExtension for ComplianceClaimingExtension {
+        fn rpc_methods(&self) -> Vec<String> { vec!["ext.duduclaw.compliance_probe".into()] }
         async fn handle_method(&self, method: &str, _params: Value, _ctx: &UserContext) -> Option<WsFrame> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match method {
-                "compliance.generate" | "test.compliance_extension_probe" => {
+                "compliance.generate" | "ext.duduclaw.compliance_probe" => {
                     Some(WsFrame::ok_response("", json!({"extension": true})))
                 }
                 _ => None,
@@ -64,7 +65,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let extension = Arc::new(ComplianceClaimingExtension::default());
         let handler = MethodHandler::with_extension(home.path().to_path_buf(), extension.clone()).await;
-        handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+        handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
 
         for role in [UserRole::Manager, UserRole::Employee] {
             let mut ctx = UserContext::admin_fallback();
@@ -80,7 +81,7 @@ mod tests {
         assert!(!home.path().join("security_audit.jsonl").exists());
 
         // Prove the extension is wired in and still handles unreserved methods.
-        let frame = handler.handle("test.compliance_extension_probe", json!({}), &UserContext::admin_fallback()).await;
+        let frame = handler.handle("ext.duduclaw.compliance_probe", json!({}), &UserContext::admin_fallback()).await;
         assert!(matches!(frame, WsFrame::Response { ok: true, payload: Some(payload), .. } if payload == json!({"extension": true})));
         assert_eq!(extension.calls.load(Ordering::SeqCst), 1);
     }

@@ -54,6 +54,7 @@ fn config(home: &Path) -> toml::Table {
 
 async fn handler_with_agent() -> (tempfile::TempDir, MethodHandler) {
     let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "[general]\ndefault_agent = \"dudu\"\n").unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     ok(&handler
         .handle_agents_create_as(json!({ "name": "a1", "display_name": "A1" }), Some(&admin()))

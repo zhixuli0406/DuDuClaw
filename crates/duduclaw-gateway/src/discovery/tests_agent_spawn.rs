@@ -94,11 +94,11 @@ fn unsupported_runtime_refused() {
         operator_identity: true, budget: None, account_rotator: None, extra_read_paths: vec![], max_concurrency: 2,
     };
     // The operator-only host experiment stays Claude-only (design §9.1).
-    for runtime in ["grok","openai-compat"] {
+    for runtime in ["codex","grok","openai-compat"] {
         assert!(matches!(f.for_runtime(runtime),
             Err(AttemptInfraError::CapabilityUnsupported{capability,..}) if capability=="unconfined operator experiment"),"{runtime}");
     }
-    for runtime in ["codex", "cursor", "gemini"] {
+    for runtime in ["cursor", "gemini"] {
         assert!(matches!(f.for_runtime(runtime),Err(AttemptInfraError::RuntimeUnsupported(_))), "{runtime}");
     }
     assert!(f.for_runtime("claude").is_ok());

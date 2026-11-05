@@ -18,6 +18,8 @@ struct Org {
 }
 
 fn org(home: &Path) -> Org {
+    // Main-target admission requires readable gateway configuration.
+    std::fs::write(home.join("config.toml"), "").unwrap();
     crate::team_edition::record(home, duduclaw_core::EditionProfile::Enterprise);
     let db = UserDb::new(&home.join("users.db")).unwrap();
     let mk = |name: &str, role| {

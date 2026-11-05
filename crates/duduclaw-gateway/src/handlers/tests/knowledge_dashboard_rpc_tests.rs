@@ -77,6 +77,7 @@ struct Fx {
 /// (granted to nobody).
 async fn fixture() -> Fx {
     let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "[general]\ndefault_agent = \"dudu\"\n").unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     for name in ["a1", "a2"] {
         ok(&handler

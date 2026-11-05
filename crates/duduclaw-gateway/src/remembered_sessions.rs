@@ -165,7 +165,7 @@ mod tests {
         use crate::handlers::live_context::SocketValidity;
         for action in ["disable", "offboard", "delete", "admin_logout", "self_logout"] {
             let (_dir,state,admin)=fixture().await;
-            state.handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+            state.handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
             let user=state.user_db.create_user("target@example.test","Target","test-password",duduclaw_auth::UserRole::Employee).unwrap();
             let now=chrono::Utc::now().timestamp();
             let ordinary=state.jwt_config.issue_access_token(&user,&[]).unwrap();
@@ -205,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn admin_session_rpc_rejects_non_admin_unknown_target_and_invalid_policy() {
         let (_dir,state,admin)=fixture().await;
-        state.handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+        state.handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
         let user=state.user_db.create_user("employee@example.test","Employee","test-password",duduclaw_auth::UserRole::Employee).unwrap();
         let token=state.jwt_config.issue_access_token(&user,&[]).unwrap();
         let employee=authenticate_jwt(&state,&token).unwrap();
@@ -268,7 +268,7 @@ mod tests {
         let now=chrono::Utc::now().timestamp();
         let family=uuid::Uuid::new_v4().to_string();
         let (_,secret,_)=state.user_db.remember_create(&user.id,0,&family,"Browser",None,180,now,false,|_,_,_|Ok(())).unwrap();
-        state.handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+        state.handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
         assert!(crate::mfa::enforced(&state.home_dir,false).is_err());
         let mut headers=HeaderMap::new();
         headers.insert(header::ORIGIN,HeaderValue::from_static("http://localhost:18889"));

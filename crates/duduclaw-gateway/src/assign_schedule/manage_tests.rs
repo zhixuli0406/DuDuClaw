@@ -15,6 +15,8 @@ pub(crate) struct Org {
 }
 
 pub(crate) fn org(home: &Path) -> Org {
+    // Main-target admission requires readable gateway configuration.
+    std::fs::write(home.join("config.toml"), "").unwrap();
     // Creation now checks the actual target, so store-only fixtures also
     // need the ordinary employee that the creator is allowed to assign.
     if !home.join("agents/sales-rep/agent.toml").exists() {

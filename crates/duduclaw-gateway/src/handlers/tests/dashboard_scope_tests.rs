@@ -5,6 +5,7 @@ struct CapturingExtension(Arc<AtomicUsize>);
 
 #[async_trait::async_trait]
 impl GatewayExtension for CapturingExtension {
+    fn rpc_methods(&self) -> Vec<String> { vec!["ext.duduclaw.probe".into()] }
     async fn handle_method(&self, _: &str, _: Value, _: &UserContext) -> Option<WsFrame> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Some(WsFrame::ok_response("", json!({"extension": true})))
@@ -18,7 +19,7 @@ async fn dashboard_scope_unknown_methods_are_denied_before_extension() {
     let handler = MethodHandler::with_extension(
         home.path().to_path_buf(), Arc::new(CapturingExtension(calls.clone())),
     ).await;
-    handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
     for role in [UserRole::Employee, UserRole::Manager] {
         let mut ctx = UserContext::admin_fallback();
         ctx.role = role;
@@ -30,6 +31,9 @@ async fn dashboard_scope_unknown_methods_are_denied_before_extension() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(matches!(handler.handle("cron.future", json!({}), &UserContext::admin_fallback()).await,
+        WsFrame::Response { ok: false, .. }));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(handler.handle("ext.duduclaw.probe", json!({}), &UserContext::admin_fallback()).await,
         WsFrame::Response { ok: true, .. }));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

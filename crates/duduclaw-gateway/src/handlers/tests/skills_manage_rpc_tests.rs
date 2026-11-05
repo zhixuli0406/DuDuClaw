@@ -57,6 +57,7 @@ async fn fixture() -> Fx {
     for marker in ["wp19-builtin-skills-seed.done", "g1-connect-google-seed-v1.done"] {
         std::fs::write(home.join("migrations").join(marker), "done").unwrap();
     }
+    std::fs::write(home.join("config.toml"), "[general]\ndefault_agent = \"dudu\"\n").unwrap();
     let h = MethodHandler::new(home.clone()).await;
     let system = UserContext::admin_fallback();
     for (id, name) in [("a1", "Alice"), ("b1", "Bob")] {
@@ -347,6 +348,7 @@ async fn skills_list_b3_composes_three_scopes_without_global_duplicates() {
     let mut agent: toml::Value = toml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
     agent["agent"]["department"] = toml::Value::String("sales".into());
     std::fs::write(config, toml::to_string(&agent).unwrap()).unwrap();
+    std::fs::write(f.home.join("org.toml"), "schema = 1\n[agents.a1]\ndepartment = \"sales\"\n").unwrap();
     let dept = duduclaw_agent::skill_loader::department_skills_dir(&f.home, "sales");
     std::fs::create_dir_all(&dept).unwrap();
     std::fs::write(dept.join("sales-guide.md"), "# Sales guide\n").unwrap();

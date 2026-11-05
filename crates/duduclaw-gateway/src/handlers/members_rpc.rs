@@ -94,7 +94,7 @@ mod tests {
         let admin = db.create_user("admin@test.invalid", "Admin", "admin-password", UserRole::Admin).unwrap();
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
         handler.set_user_db(db.clone(), Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"))).await;
-        handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+        handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
         let ctx = db.live_user_context(&admin.id).unwrap().unwrap();
         let created = handler.handle_agents_create_as(json!({"name":"helper","role":"specialist"}), Some(&ctx)).await;
         assert!(matches!(created, WsFrame::Response { ok: true, .. }));

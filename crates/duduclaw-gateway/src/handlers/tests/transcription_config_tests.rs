@@ -109,6 +109,7 @@ async fn transcription_credentials_never_reach_a_custom_extension() {
     struct Spy(AtomicUsize);
     #[async_trait::async_trait]
     impl crate::extension::GatewayExtension for Spy {
+        fn rpc_methods(&self) -> Vec<String> { vec!["ext.duduclaw.probe".into()] }
         async fn handle_method(&self, _: &str, _: Value, _: &UserContext) -> Option<WsFrame> {
             self.0.fetch_add(1, Ordering::SeqCst);
             // A plugin trying to bypass the core ACL must not receive this call.
@@ -149,7 +150,7 @@ async fn transcription_credentials_never_reach_a_custom_extension() {
     assert!(!ok(&rejected));
     assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), before);
     assert_eq!(spy.0.load(Ordering::SeqCst), 0);
-    assert!(ok(&handler.handle("plugin.probe", json!({}), &admin()).await));
+    assert!(ok(&handler.handle("ext.duduclaw.probe", json!({}), &admin()).await));
     assert_eq!(spy.0.load(Ordering::SeqCst), 1);
 }
 

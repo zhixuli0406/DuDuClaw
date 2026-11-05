@@ -2778,6 +2778,8 @@ mod mfa_tests {
             |user,access,id|jwt.issue_access_token_in_session(user,access,Some(id))).unwrap();
         let claims=jwt.verify_access_token(&token).unwrap();
         let ctx=duduclaw_auth::UserContext::from_claims(&claims,false).unwrap();
+        std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced = false\n").unwrap();
+        crate::mfa::reload_policy(home.path());
         crate::team_edition::record(home.path(),duduclaw_core::EditionProfile::Personal);
         assert!(authenticate_with(&jwt,&db,&token).is_ok());
         assert!(webchat_credential_valid(home.path(),&db,&claims,&ctx,claims.exp));

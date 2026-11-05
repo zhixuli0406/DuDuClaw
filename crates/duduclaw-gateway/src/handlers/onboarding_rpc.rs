@@ -107,7 +107,7 @@ mod tests {
         let admin = db.create_user("admin@test.invalid", "Admin", "password123", UserRole::Admin).unwrap();
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
         handler.set_user_db(db.clone(), Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"))).await;
-        handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+        handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
         let mut ctx = UserContext::admin_fallback();
         ctx.user_id = admin.id;
         ctx.email = admin.email;
@@ -129,6 +129,7 @@ mod tests {
     struct NamespaceCollision(std::sync::atomic::AtomicUsize);
     #[async_trait::async_trait]
     impl crate::extension::GatewayExtension for NamespaceCollision {
+        fn rpc_methods(&self) -> Vec<String> { vec!["ext.duduclaw.control".into()] }
         async fn handle_method(&self, _method: &str, _params: Value, _ctx: &UserContext) -> Option<WsFrame> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Some(WsFrame::ok_response("", json!({"extension":true})))
@@ -138,7 +139,7 @@ mod tests {
     async fn reserved_namespace_collisions_never_reach_extensions() {
         let (_home, mut handler, db, admin) = fixture().await;
         let extension = Arc::new(NamespaceCollision(std::sync::atomic::AtomicUsize::new(0)));
-        handler.extension = extension.clone();
+        handler.extension = crate::extension::register(extension.clone());
         for role in [UserRole::Employee, UserRole::Manager, UserRole::Admin] {
             let user = db.create_user(&format!("collision-{role}@test.invalid"), "User", "password123", role).unwrap();
             let ctx = db.live_user_context(&user.id).unwrap().unwrap();
@@ -152,7 +153,7 @@ mod tests {
             }
         }
         assert_eq!(extension.0.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(payload(handler.handle("plugin.control", json!({}), &admin).await)["extension"], true);
+        assert_eq!(payload(handler.handle("ext.duduclaw.control", json!({}), &admin).await)["extension"], true);
         assert_eq!(extension.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
     #[tokio::test]
