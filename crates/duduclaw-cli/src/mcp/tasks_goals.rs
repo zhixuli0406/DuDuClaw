@@ -12,6 +12,7 @@ pub(crate) async fn check_task_holder(
     actor: RecordActor<'_>,
     tool: &str,
 ) -> std::result::Result<(), Value> {
+    check_a2a_task_access(home_dir, store, actor, task_id).await?;
     let Some(me) = actor.agent() else {
         return Ok(());
     };
@@ -301,6 +302,11 @@ pub(crate) async fn handle_activity_post(
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
     };
+    if let Some(tid) = task_id.as_deref() {
+        if let Err(refusal) = check_a2a_task_access(home_dir, &store, actor, tid).await {
+            return refusal;
+        }
+    }
     if let (Some(me), Some(tid)) = (actor.agent(), task_id.as_deref()) {
         let task = match store.get_task(tid).await {
             Ok(Some(t)) => t,
@@ -366,7 +372,8 @@ pub(crate) async fn handle_activity_list(
     let task_id_filter = args.get("task_id").and_then(|v| v.as_str());
     let limit = clamp_limit(args, 20, 100);
 
-    let (rows, total) = match store.list_activity(agent_id, event_type, limit, 0).await {
+    let worker = verified_a2a_worker(home_dir, actor);
+    let (rows, total) = match store.list_activity_for_worker(agent_id, event_type, limit, 0, worker).await {
         Ok(r) => r,
         Err(e) => return tool_error(&format!("list activity: {e}")),
     };
@@ -377,9 +384,18 @@ pub(crate) async fn handle_activity_list(
             None => true,
         })
         .collect();
+    let mut allowed = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(task_id) = row.task_id.as_deref() {
+            if check_a2a_task_access(home_dir, &store, actor, task_id).await.is_err() {
+                continue;
+            }
+        }
+        allowed.push(row);
+    }
     let rows = match actor.agent() {
-        Some(viewer) => activity_rows_visible_to(&store, home_dir, viewer, rows).await,
-        None => rows,
+        Some(viewer) => activity_rows_visible_to(&store, home_dir, viewer, allowed).await,
+        None => allowed,
     };
     let items: Vec<Value> = rows.iter().map(activity_row_to_json).collect();
     tool_text(

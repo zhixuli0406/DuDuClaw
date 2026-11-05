@@ -139,6 +139,15 @@ async fn search_drops_deliverables_of_tasks_the_reader_may_not_see() {
 #[tokio::test]
 async fn forward_recent_keeps_only_rows_of_readable_tasks() {
     let f = fixture().await;
+    let store = f.handler.task_store().await.unwrap();
+    let root = admin(&f);
+    for (id, owner) in [("a2a-live", &f.alice), ("a2a-gone", &f.alice), ("admin-a2a-gone", &root)] {
+        let mut task = TaskRow::new(id.into(), "A2A private".into(), String::new(),
+            "normal".into(), "sales".into(), format!("a2a:user:{}", owner.user_id));
+        task.a2a_owner = Some(format!("user:{}", owner.user_id));
+        store.insert_task(&task).await.unwrap();
+        if id.ends_with("gone") { store.remove_task(id).await.unwrap(); }
+    }
     let db = f.home.join("prediction.db");
     let _model = crate::prediction::task_forward_store::TaskForwardModel::new(db.clone());
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -146,6 +155,9 @@ async fn forward_recent_keeps_only_rows_of_readable_tasks() {
         ("p1", PRIVATE, "sales"),
         ("p2", OPEN, "sales"),
         ("p3", "gone", "other"),
+        ("p4", "a2a-live", "sales"),
+        ("p5", "a2a-gone", "sales"),
+        ("p6", "admin-a2a-gone", "sales"),
     ] {
         conn.execute(
             "INSERT INTO task_prediction_log (prediction_id, task_id, agent_id, round, state_key, \
@@ -166,11 +178,25 @@ async fn forward_recent_keeps_only_rows_of_readable_tasks() {
         f.handler.handle_forward_recent(json!({}), &f.bob).await,
     ));
     assert_eq!(bob, vec![OPEN.to_string()]);
-    let root = admin(&f);
     let all = rows(payload(
         f.handler.handle_forward_recent(json!({}), &root).await,
     ));
-    assert_eq!(all.len(), 3, "admins keep removed and private tasks");
+    assert_eq!(all.len(), 4, "only non-A2A tasks and the admin's own tombstone remain visible");
+    for task in [PRIVATE, OPEN, "gone", "admin-a2a-gone"] { assert!(all.iter().any(|id| id == task)); }
+    for task in ["a2a-live", "a2a-gone"] {
+        assert!(!all.iter().any(|id| id == task));
+        assert!(denied(&f.handler.handle_forward_chain(json!({"task_id":task}), &root).await));
+        assert!(denied(&f.handler.handle_forward_chain(json!({"task_id":task}), &f.bob).await));
+    }
+    let alice = rows(payload(f.handler.handle_forward_recent(json!({}), &f.alice).await));
+    assert!(alice.iter().any(|id| id == "a2a-live"));
+    assert!(ok(&f.handler.handle_forward_chain(json!({"task_id":"a2a-live"}), &f.alice).await));
+    for task in ["gone", "admin-a2a-gone"] {
+        let chain = payload(f.handler.handle_forward_chain(json!({"task_id":task}), &root).await);
+        assert_eq!(chain["rounds"].as_array().unwrap().len(), 1);
+    }
+    f.db.set_user_status(&root.user_id, duduclaw_auth::UserStatus::Suspended).unwrap();
+    assert!(denied(&f.handler.handle_forward_chain(json!({"task_id":"gone"}), &root).await));
 }
 
 #[tokio::test]

@@ -167,6 +167,8 @@ mod workflow_errors;
 #[cfg(test)]
 mod task_privacy_tests;
 #[cfg(test)]
+mod task_a2a_privacy_tests;
+#[cfg(test)]
 mod f5_privacy_tests;
 #[cfg(test)]
 mod workflow_review_tests;
@@ -563,6 +565,16 @@ impl MethodHandler {
             return boxed_frame(|| self.handle_website_credentials(method, params, ctx)).await;
         }
 
+        // A2A is gateway-owned and uses the live identity/password gates above.
+        if let Some(operation) = method.strip_prefix("a2a.") {
+            // Only the authenticated HTTP adapter supplies this internal call;
+            // dashboard sockets must not bypass version/body/signature rules.
+            if conn.peer.is_some() {
+                return WsFrame::error_response("", "A2A requires the HTTP endpoint");
+            }
+            return boxed_frame(|| self.handle_a2a_rpc(operation, params, ctx)).await;
+        }
+
         // ── Plugin extension dispatch ──────
         // Try extension first; if it returns Some, the method is handled.
         if let Some(frame) = self
@@ -586,3 +598,4 @@ impl MethodHandler {
 }
 
 mod mfa_rpc;
+mod a2a_rpc;

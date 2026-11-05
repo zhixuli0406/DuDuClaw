@@ -95,6 +95,10 @@ pub struct GoalCreateRequest {
     /// Where the caller's right to assign came from (`binding`,
     /// `team:<user>:<depth>`, `admin`), for the activity row's metadata.
     pub grant_via: Option<String>,
+    /// Host-owned A2A principal; never accepted from task mutation input.
+    pub a2a_owner: Option<String>,
+    /// A2A message id and canonical payload digest, committed with the task.
+    pub a2a_request: Option<(String, String)>,
 }
 
 /// Parse the optional cost ceiling without silently accepting malformed values.
@@ -321,6 +325,7 @@ async fn create_goal_task_inner(
     task.timeout_secs = req.timeout_secs;
     task.risk_boundary = risk_boundary;
     task.on_behalf_of = req.on_behalf_of.clone();
+    task.a2a_owner = req.a2a_owner.clone();
     task.created_via = req.on_behalf_of.as_ref().and(req.created_via.clone());
     if let Some((channel, chat_id)) = &req.source {
         if !channel.is_empty() {
@@ -363,10 +368,19 @@ async fn create_goal_task_inner(
         Some(admission) => admission.await?,
         None => None,
     };
-    match slot {
-        Some(slot) => store.insert_assign_schedule_task(&task, slot).await,
-        None => store.insert_task(&task).await,
-    }.map_err(|e| format!("create goal task: {e}"))?;
+    if let Some((message_id, payload_sha256)) = &req.a2a_request {
+        if slot.is_some() || req.plan_first {
+            return Err("A2A does not support scheduled or planned creation".into());
+        }
+        if let Some(existing) = store.insert_a2a_task(&task, message_id, payload_sha256).await? {
+            return Ok(GoalCreated { task: existing, plan_first: false });
+        }
+    } else {
+        match slot {
+            Some(slot) => store.insert_assign_schedule_task(&task, slot).await,
+            None => store.insert_task(&task).await,
+        }.map_err(|e| format!("create goal task: {e}"))?;
+    }
 
     // Freeze the team once, at the same contract boundary as the baseline.
     // Non-fatal validation failures (e.g. same-family verifier) run Solo.

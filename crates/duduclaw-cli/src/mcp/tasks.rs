@@ -119,6 +119,7 @@ pub(crate) async fn handle_tasks_list(
         Ok(r) => r,
         Err(e) => return tool_error(&format!("list tasks: {e}")),
     };
+    rows.retain(|row| a2a_task_access_allowed(home_dir, actor, &row.id, Some(row)));
     if let Some(viewer) = actor.agent() {
         rows.retain(|row| {
             duduclaw_gateway::review_evidence::audience::agent_may_read_task_row(
@@ -529,6 +530,9 @@ pub(crate) async fn handle_tasks_create(
         // Fail-closed dependency validation: every dep must exist (an unknown
         // id would gate the task forever) and must not close a cycle.
         for dep in &depends_on {
+            if let Err(refusal) = check_a2a_task_access(home_dir, &store, actor, dep).await {
+                return refusal;
+            }
             match store.get_task(dep).await {
                 Ok(Some(_)) => {}
                 Ok(None) => return tool_error(&format!("depends_on task not found: {dep}")),
@@ -631,6 +635,15 @@ pub(crate) async fn check_task_update_by_employee(
     current: &duduclaw_gateway::task_store::TaskRow,
     args: &Value,
 ) -> std::result::Result<(), Value> {
+    if !a2a_task_access_allowed(home_dir, actor, &current.id, Some(current)) {
+        return Err(tool_error("permission denied"));
+    }
+    if current.a2a_owner.is_some()
+        && (args.get("assigned_to").is_some_and(|v| v.as_str() != Some(current.assigned_to.as_str()))
+            || args.get("parent_task_id").is_some())
+    {
+        return Err(tool_error("permission denied"));
+    }
     let Some(me) = actor.agent() else {
         return Ok(());
     };
@@ -846,6 +859,9 @@ pub(crate) async fn handle_tasks_update(
             _ => return tool_error("depends_on must be a JSON array or comma-separated ids"),
         };
         for dep in &deps {
+            if let Err(refusal) = check_a2a_task_access(home_dir, &store, actor, dep).await {
+                return refusal;
+            }
             match store.get_task(dep).await {
                 Ok(Some(_)) => {}
                 Ok(None) => return tool_error(&format!("depends_on task not found: {dep}")),
@@ -912,6 +928,9 @@ pub(crate) async fn handle_tasks_claim(
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
     };
+    if let Err(refusal) = check_a2a_task_access(home_dir, &store, actor, task_id).await {
+        return refusal;
+    }
     if let Some(me) = actor.agent() {
         match store.get_task(task_id).await {
             Ok(Some(t)) => {
@@ -1042,6 +1061,11 @@ pub(crate) async fn handle_tasks_renew(
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
     };
+    if let Err(refusal) = check_a2a_task_access(
+        home_dir, &store, RecordActor::Agent(default_agent), task_id,
+    ).await {
+        return refusal;
+    }
     let now = chrono::Utc::now();
     let new_expiry = (now
         + chrono::Duration::seconds(duduclaw_gateway::dispatch_engine::DEFAULT_LEASE_SECS))
@@ -1116,12 +1140,13 @@ fn round_value_well_formed(v: &str) -> bool {
 ///   default parent, and a `parent_task_id` the model gives must be that
 ///   task or one of its descendants, otherwise the call is refused (a task
 ///   cannot be hung outside the run to escape its cost cap or its stop).
-/// - Any other round (an ordinary goal round, a heartbeat wake-up, someone
-///   else's task): no default parent; the old rule applies.
+/// - A signed A2A executor's round always becomes the default parent, and
+///   an explicit parent must remain inside its tree so the owner is inherited.
+/// - Other ordinary goal rounds or heartbeat wake-ups keep the old rule.
 /// - Old rule: a model-given `parent_task_id` needs a relationship to the
 ///   parent (assignee, claimer, creator, or the delegation predicate against
 ///   the parent's assignee).
-/// - Operators keep what they asked for.
+/// - Operators keep ordinary parents; A2A parents require a verified worker.
 /// - An employee cannot hang more than `MAX_CHILDREN_PER_TASK` open sub-tasks
 ///   under one task.
 ///
@@ -1163,11 +1188,14 @@ async fn resolve_parent_inner(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(str::to_string);
+    let store = duduclaw_gateway::task_store::TaskStore::open(home_dir)
+        .map_err(|e| tool_error(&format!("open task store: {e}")))?;
+    if let Some(parent) = requested.as_deref() {
+        check_a2a_task_access(home_dir, &store, actor, parent).await?;
+    }
     let Some(caller) = actor.agent().map(str::trim).filter(|c| !c.is_empty()) else {
         return Ok(requested);
     };
-    let store = duduclaw_gateway::task_store::TaskStore::open(home_dir)
-        .map_err(|e| tool_error(&format!("open task store: {e}")))?;
     // The round this call runs in, only when it is the caller's own task in a
     // responsibility run's tree; `None` means the old rule applies.
     let run_round = match round_env {
@@ -1181,6 +1209,20 @@ async fn resolve_parent_inner(
             Ok(Some(t))
                 if t.assigned_to == caller || t.claimed_by.as_deref() == Some(caller) =>
             {
+                if t.a2a_owner.is_some() {
+                    check_a2a_task_access(home_dir, &store, actor, &t.id).await?;
+                    return match requested {
+                        None => Ok(Some(t.id)),
+                        Some(parent) => {
+                            if parent != t.id && !store.is_descendant_of(&parent, &t.id).await
+                                .map_err(|_| tool_error("permission denied"))?
+                            {
+                                return Err(tool_error("permission denied"));
+                            }
+                            Ok(Some(parent))
+                        }
+                    };
+                }
                 let in_run = store
                     .in_occurrence_tree(&t.id)
                     .await

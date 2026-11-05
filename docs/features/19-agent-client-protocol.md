@@ -1,289 +1,99 @@
-# Agent Client Protocol (ACP/A2A)
+# ACP and A2A interfaces
 
-> Let the IDE talk to the agent the same way the agent talks to its tools — stdio JSON-RPC 2.0, discoverable, language-agnostic.
+DuDuClaw has separate interfaces for IDE conversations and external task submission. Their transports, credentials and task lifetimes differ.
 
----
+| Interface | Entry point | Purpose |
+|---|---|---|
+| Agent Client Protocol v1 | `duduclaw acp`, stdio | IDE sessions and prompt turns |
+| Legacy A2A command | `duduclaw acp server`, stdio | Existing local scripts using `agent/discover`, `message/send`, `tasks/send` / `tasks/get` / `tasks/cancel` |
+| A2A v1.0 JSON-RPC, unreleased | Gateway `POST /a2a` | Authenticated external task-board goals |
+| MCP | `duduclaw mcp-server` or the separate HTTP server | Tools for AI runtimes and MCP clients |
 
-## The Metaphor: A Restaurant's Reservation Line
+## Gateway A2A v1.0 (unreleased)
 
-Every restaurant has two entrances:
+The gateway publishes a signed Agent Card at `/.well-known/agent-card.json`. It advertises the JSON-RPC interface, protocol version `1.0`, the actual enabled skills of employees explicitly exposed by the operator, and Dashboard Bearer JWT authentication. Signing protects card integrity; it does not authenticate a caller or grant access to a skill. The card advertises no streaming or push notification support. Only enabled skills with nonempty names and descriptions are published, tagged `employee:<id>` for their actual employee. If no employee is exposed or no publishable skill exists, the public card returns HTTP 503; an authenticated caller with no available skills receives `-32007` from `GetExtendedAgentCard`. `SendMessage` requires an exposed employee with at least one publishable skill. If the signing key is unavailable, discovery returns HTTP 503 rather than an unsigned card.
 
-- **The dining room** — where customers walk in, browse the menu, and interact with servers.
-- **The reservation line** — a telephone protocol. A reservation system on the other end doesn't need to know what the dining room looks like; it just needs to ask *"do you have a table for four at 7 PM?"* and get a yes/no.
+No employees are exposed by default. Configure the existing employee ids in `config.toml`:
 
-IDEs like Zed, JetBrains, and Neovim want to ask an agent *"can you take this task?"* without having to understand DuDuClaw's entire channel infrastructure. They need the reservation line — a clean, stable, protocol-driven interface.
-
-That's what the two protocol servers are. DuDuClaw ships them as **separate
-commands**: `duduclaw acp` speaks the Agent Client Protocol for IDE agent
-panels (Zed / JetBrains / nvim — see "Protocol Scope" below for setup), and
-`duduclaw acp server` speaks the A2A protocol for agent-to-agent and
-script/CI integration (everything described in the next sections).
-
----
-
-## What Is ACP/A2A?
-
-**ACP** stands for Agent Client Protocol — a stdio JSON-RPC 2.0 line protocol for IDE ↔ agent communication. **A2A** is the related "Agent to Agent" protocol for agent discovery and task exchange.
-
-Together they let an IDE (or another agent, or a CI pipeline, or a shell script) treat a running DuDuClaw agent as a first-class service — one it can discover, send tasks to, poll for status, and cancel.
-
-DuDuClaw ships the server side:
-
-```
-duduclaw acp server
-     |
-     v
-Listens on stdin, writes to stdout (line-delimited JSON-RPC 2.0)
-     |
-     v
-Responds to:
-  agent/discover   → return AgentCard
-  tasks/send       → queue new task
-  tasks/get        → poll task status
-  tasks/cancel     → cancel running task
+```toml
+[a2a]
+exposed_agents = ["researcher"]
+public_url = "https://host.example/a2a"
+trusted_proxy_cidrs = []
 ```
 
-Before v1.8.9, `duduclaw acp server` was a placeholder that printed a message and returned. v1.8.9 wired it to a real `A2ATaskManager` and made it functional.
+`public_url` is the externally reachable HTTPS URL for `/a2a`; configure TLS at the gateway's reverse proxy. Exposing an employee only narrows the existing authorization checks. It does not grant a Dashboard account access to that employee, enable a disabled skill, or change tool capabilities. An empty list, unreadable configuration or invalid A2A configuration refuses task access. Removing an employee from the list also removes A2A access to that employee's earlier tasks.
 
----
+`trusted_proxy_cidrs` defaults to `[]` and accepts at most 32 valid IPv4/IPv6 CIDRs. Configure only the immediate proxies you control. A matching proxy must overwrite `X-Forwarded-For` with one client IP: a missing, duplicate, chained or malformed value is rejected. Headers from other peers are ignored. Without this configuration, clients behind one proxy share its peer-IP bucket within each traffic class. For example, use `trusted_proxy_cidrs = ["192.0.2.10/32"]` only when that address is your immediate proxy; it does not grant request authorization.
 
-## The Agent Card
+Every RPC requires `Authorization: Bearer <Dashboard access JWT>` and `A2A-Version: 1.0`. Obtain the JWT through the existing Dashboard account login. This endpoint does not accept the legacy shared admin token or MCP HTTP-server API keys. The public card is discoverable without authentication; `GetExtendedAgentCard` requires an authenticated caller and preserves all access restrictions.
 
-Every ACP server can describe itself. When a client connects, it can issue `agent/discover` and receive an **Agent Card** — a JSON document with identity, capabilities, and skills:
+An absent or empty version is treated as `0.3`, which this HTTP interface does not support: the response is `VersionNotSupportedError` (`-32009`). Use the PascalCase v1.0 methods. The existing stdio names `message/send` and `tasks/get` are HTTP aliases, but still require the `1.0` header and v1.0 request objects. They do not enable a 0.3 transport.
+
+### Submit and poll
+
+The following request example has not been verified against a live gateway. Replace the host and employee id, and supply a valid Dashboard JWT in `DUDUCLAW_DASHBOARD_JWT`.
+
+```sh
+curl --fail-with-body 'https://host.example/a2a' \
+  -H "Authorization: Bearer $DUDUCLAW_DASHBOARD_JWT" \
+  -H 'A2A-Version: 1.0' \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"metadata":{"agentId":"researcher"},"message":{"messageId":"request-001","role":"ROLE_USER","parts":[{"text":"Summarize the public project documentation."}]},"configuration":{"returnImmediately":true}}}'
+```
+
+`metadata.agentId` selects the exposed employee. `message.messageId` is required; `role` must be `ROLE_USER`, with plain-text `parts`. Set `configuration.returnImmediately` to `true`: this implementation creates an asynchronous goal through the existing task-board goal creation path and returns `result.task`. Execution uses the employee's configured runtime and existing goal-loop gates. Submission requires direct Operator access or Admin; a team-only grant is insufficient. Each message is limited to 4,000 characters and the HTTP body to 64 KiB. Only new tasks are accepted: omit `message.contextId` and `message.taskId`; the returned `contextId` equals the task id. `historyLength` must be omitted or `0`. The authenticated account and `messageId` form a durable unique key. Resending the same full `params` object returns the original task; reusing the id with different parameters is rejected. JSON object key order does not matter. Deleting the task does not make the id reusable or recreate the task. Retries still require current authorization.
+
+The duplicate check compares the full canonical `params`: object key order is ignored, array order is retained, and omitted fields differ from explicitly supplied defaults. A conflicting payload returns `-32602` (`INVALID_ARGUMENT`); a retry after deletion returns `-32001` (`TASK_NOT_FOUND`). Pagination tokens bind the owner and the context, status, status-timestamp and artifact filters; `pageSize` may change between pages.
+
+Use the returned task id for subsequent requests to the same endpoint, with the same authentication and version headers:
 
 ```json
-{
-  "name": "duduclaw-pm",
-  "description": "Project manager for DuDuClaw v1.9 roadmap",
-  "url": "stdio://duduclaw acp server --agent duduclaw-pm",
-  "version": "1.8.14",
-  "capabilities": {
-    "streaming": true,
-    "multi_turn": true,
-    "tool_use": true
-  },
-  "skills": [
-    {
-      "name": "task_planning",
-      "description": "Break down features into TaskSpec workflows",
-      "tags": ["planning", "orchestration"]
-    },
-    {
-      "name": "sprint_review",
-      "description": "Summarize sprint outcomes from memory + tasks",
-      "tags": ["reporting", "retrospective"]
-    }
-  ]
-}
+{"jsonrpc":"2.0","id":2,"method":"GetTask","params":{"id":"<task-id>"}}
+{"jsonrpc":"2.0","id":3,"method":"ListTasks","params":{"pageSize":20}}
+{"jsonrpc":"2.0","id":4,"method":"CancelTask","params":{"id":"<task-id>"}}
+{"jsonrpc":"2.0","id":5,"method":"GetExtendedAgentCard","params":{}}
 ```
 
-This is the same document format as A2A's `.well-known/agent.json` discovery endpoint. An IDE can cache it, display available skills in a UI, and decide whether to route a request to this particular agent.
+`ListTasks` accepts `contextId`, `status`, `statusTimestampAfter` and `includeArtifacts`, with `pageSize` from 1 to 100 and opaque `pageToken` cursors. Pass `nextPageToken` for the next page. Tasks are ordered by a monotonic creation sequence. The first page fixes an upper sequence bound that subsequent tokens retain; tasks created later appear only in a new listing without a token. Permissions and status filters are checked again on every page, so this is an inventory boundary, not a frozen copy of task state. `totalSize` counts only currently readable tasks; more than 10,000 stored tasks for one caller returns `RESOURCE_EXHAUSTED` instead of a partial count. Reads and cancellation are limited to tasks created by the same authenticated account through A2A. They also recheck employee exposure, live account/employee permissions and the task's audience. Ownership is stored on the task and inherited by child tasks. The same owner restriction applies to ordinary Dashboard task lists, reads, edits, deletion, stopping, comments, attachments, activity and push events. Admin has no bypass, and no separate administrative override is provided. Ownership records retained after deletion continue protecting remaining evidence. External MCP callers without the Dashboard owner principal are refused; the authenticated employee assigned to execute the task retains necessary task access.
 
-### `.well-known` Generation
+Task status uses `TASK_STATE_*`, including `TASK_STATE_SUBMITTED`, `TASK_STATE_WORKING`, `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_INPUT_REQUIRED` and `TASK_STATE_CANCELED`. Approval or human-input waits are not completion. Cancellation applies the existing task-tree stop fence. A pending or uncertain stop must be polled; it is not proof that an external process or side effect has physically stopped. Canceling a terminal task returns `TaskNotCancelableError` (`-32002`).
 
-For agents exposed over HTTP (a future extension), DuDuClaw can emit a `.well-known/agent.json` file so external clients can discover the agent without first connecting:
+### Supported scope and errors
 
-```
-/etc/duduclaw/agents/dudu/.well-known/agent.json
-     ↓
-https://your-host.example.com/.well-known/agent.json
-```
+The retained owner check also applies to `forward.recent` and `forward.chain`, including deleted A2A tasks; Admin cannot bypass another caller's ownership. `tasks.flow_metrics` excludes other A2A owners' tasks before calculating counts, timing and round statistics. Non-A2A task access remains unchanged.
 
-Any A2A-compatible client reads it, learns the agent's capabilities, and decides whether to proceed.
+Before any task-store schema migration, an existing A2A schema or receipt requires a readable `task_access_principals` table. If that table is missing or unreadable, opening the store fails; it is never rebuilt empty from surviving tasks. Restore the intact registry from a consistent backup. Fresh databases and legacy databases without A2A traces still migrate.
 
----
+Existing `keys/a2a-signing.ed25519` keys must be regular files, not symbolic links. On Unix they must belong to the gateway's effective user and have mode exactly `0600`; Windows skips Unix ownership/mode checks. Invalid files are refused without replacing them or changing their permissions. Peer-IP admission is recorded before the global bucket: requests rejected by the peer limit do not consume global capacity.
 
-## The JSON-RPC Loop
+| Operation | Support |
+|---|---|
+| `SendMessage` | New asynchronous plain-text goal |
+| `GetTask`, `ListTasks` | Own A2A tasks, subject to current access |
+| `CancelTask` | Own task-tree stop request |
+| `GetExtendedAgentCard` | Authenticated card; no extra authority |
+| `SendStreamingMessage`, `SubscribeToTask` | Unsupported; no SSE |
+| Blocking responses, task continuation, push notification configuration | Unsupported |
 
-The stdio server is a simple line-delimited JSON-RPC 2.0 loop:
+JSON-RPC protocol errors use the standard error codes. A2A errors use `-32001` through `-32009` where applicable, with `error.data` as an array of typed `google.rpc.ErrorInfo` details. Unauthenticated and unauthorized requests use HTTP 401/403. Input screening, method authorization and security audit apply before task operations. Public discovery, rejected authentication and authenticated RPC each have separate 120 requests/minute IP buckets. Their separate global limits are 600, 600 and 1,200 requests/minute respectively; RPC also retains the 60/minute caller limit. Anonymous traffic cannot spend the authenticated RPC budget. Each IP/caller limiter holds at most 10,000 keys; saturation refuses new keys, and stale-key cleanup is throttled. This interface is HTTP-only; WebSocket `a2a.*` calls are refused. See [Security defense](05-security-defense.md).
 
-```
-loop {
-    read line from stdin
-    parse JSON-RPC 2.0 request
-    dispatch to handler:
-        agent/discover  → return AgentCard
-        tasks/send      → TaskManager.send(params)
-        tasks/get       → TaskManager.get(id)
-        tasks/cancel    → TaskManager.cancel(id)
-    write JSON-RPC 2.0 response to stdout
-}
-```
+Tests cover the HTTP contract and access boundaries. The security crate’s six focused rate-limiter tests passed locally. Gateway/CLI compilation and tests, a renewed Daybreak review after these fixes, and live client/reverse-proxy acceptance remain pending. The 2026-11-05 follow-up Daybreak review found two Medium and three Low issues; fixes and regression tests have been added, but the revised patch has not received security sign-off.
 
-JSON-RPC over stdio is the same transport MCP uses — if you've already built an MCP server, you've already built 95% of an ACP server.
+## IDE Agent Client Protocol
 
-### Example Session
+For an IDE agent panel, use `duduclaw acp`. It implements `initialize`, `session/new`, `session/prompt`, `session/update` and `session/cancel`. An unconfigured home reports `AUTH_REQUIRED` and points to terminal onboarding. Prompt turns use the gateway reply pipeline and the Main-role employee.
 
-```
-→ {"jsonrpc":"2.0","id":1,"method":"agent/discover"}
-← {"jsonrpc":"2.0","id":1,"result":{
-     "name":"duduclaw-pm",
-     "version":"1.8.14",
-     "capabilities":{"streaming":true,"multi_turn":true,"tool_use":true},
-     "skills":[...]
-   }}
+Zed configuration:
 
-→ {"jsonrpc":"2.0","id":2,"method":"tasks/send","params":{
-     "task":"Draft the v1.9 release notes from the last 50 commits",
-     "priority":"high"
-   }}
-← {"jsonrpc":"2.0","id":2,"result":{
-     "task_id":"t_abc123",
-     "status":"queued"
-   }}
-
-→ {"jsonrpc":"2.0","id":3,"method":"tasks/get","params":{"task_id":"t_abc123"}}
-← {"jsonrpc":"2.0","id":3,"result":{
-     "task_id":"t_abc123",
-     "status":"completed",
-     "output":"# DuDuClaw v1.9 Release Notes\n\n..."
-   }}
+```json
+{"agent_servers":{"DuDuClaw":{"command":"duduclaw","args":["acp"]}}}
 ```
 
----
+The gateway A2A HTTP methods are not IDE session methods. Do not configure an IDE panel with `duduclaw acp server`.
 
-## The A2ATaskManager
+## Legacy A2A over stdio
 
-Behind `tasks/send`, `tasks/get`, and `tasks/cancel` lives the `A2ATaskManager`. Its job is to:
+`duduclaw acp server` retains its existing local protocol. Its `message/send` path writes to the gateway's delegation bus as `a2a-client`; the existing `[acp] trusted` policy applies. Its process-local task index and best-effort bus observations are separate from the durable HTTP task-board goals. Restarting that stdio process loses its indexed task ids; a missing bus response does not prove completion. The legacy in-memory `tasks/send` manager is also distinct from the HTTP task board.
 
-1. **Queue** incoming tasks into the agent's existing task system (`TaskSpec`, `tasks/` directory).
-2. **Track** status transitions (queued → running → completed/failed/cancelled).
-3. **Route** task execution through the agent's normal runtime (Claude / Codex / Grok / OpenAI-compat or another catalog runtime).
-4. **Expose** results in the task envelope so the client can poll for them.
-
-This means tasks submitted via ACP flow through the **same** pipelines as tasks submitted via channels or MCP tools — single source of truth, unified observability in the Logs/Activity dashboard.
-
----
-
-## Protocol Scope — Read This First
-
-> **Status correction (2026-08-13).** `duduclaw acp server` currently speaks the
-> **A2A (Agent2Agent) protocol** over stdio — `agent/discover`, `message/send`,
-> `tasks/send|get|cancel` — plus the `.well-known` agent card. It does **not**
-> yet implement the *Agent Client Protocol* used by IDE agent panels
-> (`initialize` / `authenticate` / `session/new` / `session/prompt` with
-> streaming updates). Pointing Zed, the JetBrains ACP integration, or
-> `nvim-acp` at it today will fail at `initialize` with "Method not found".
-> The two protocols unfortunately share the "ACP" acronym; earlier revisions
-> of this document conflated them.
->
-> **Update (2026-08-13, same day): the real Agent Client Protocol now ships as
-> its own command — `duduclaw acp`.** It implements ACP **v1**
-> (`initialize` → `session/new` → `session/prompt`, with `session/update`
-> streaming: `agent_message_chunk`, `tool_call` / `tool_call_update`, `plan`)
-> plus `session/cancel` (the pending turn answers `stopReason: "cancelled"` as
-> the spec requires). An unconfigured home answers the spec's `AUTH_REQUIRED`
-> error (`-32000`) and advertises an auth method that points at `duduclaw
-> onboard` in a terminal. Prompt turns run through the same gateway reply
-> pipeline as the messaging channels (session memory, contract enforcement),
-> against your Main-role agent.
->
-> Zed `settings.json`:
->
-> ```json
-> { "agent_servers": { "DuDuClaw": { "command": "duduclaw", "args": ["acp"] } } }
-> ```
->
-> `duduclaw acp server` remains the A2A surface — the two protocols stay on
-> separate commands on purpose.
-
-## What Works Today (A2A over stdio)
-
-### CI/CD Pipelines
-
-A pipeline step can send a task via ACP and poll for completion:
-
-```yaml
-- name: Generate release notes via DuDuClaw
-  run: |
-    echo '{"jsonrpc":"2.0","id":1,"method":"tasks/send","params":{"task":"..."}}' \
-      | duduclaw acp server --agent duduclaw-pm
-```
-
-No HTTP server, no auth tokens, no port management — just stdio in the container.
-
----
-
-## The Three Stdio Protocols DuDuClaw Speaks
-
-This is worth mapping because the naming overlaps:
-
-| Protocol | Purpose | Direction | Command |
-|----------|---------|-----------|---------|
-| **MCP** | Expose DuDuClaw's tools (channel, memory, agent, wiki, task, ...) to an AI runtime | Runtime → DuDuClaw | `duduclaw mcp-server` |
-| **ACP/A2A** | Let external clients (IDEs, pipelines, other agents) send tasks to DuDuClaw | IDE → DuDuClaw | `duduclaw acp server` |
-| **Runtime stdio** | DuDuClaw spawns a runtime (Claude/Codex/Grok) subprocess and talks to it via stdio JSON | DuDuClaw → Runtime | *Internal* |
-
-They're three distinct conversations, all on stdio, all JSON-RPC-adjacent. The same agent participates in all three simultaneously at runtime.
-
----
-
-## Why Stdio, Not HTTP?
-
-Stdio has a few practical advantages for IDE integration:
-
-- **Zero configuration** — no port to pick, no TLS cert, no firewall rule.
-- **Process-scoped** — the ACP server lives and dies with the IDE session. No orphaned listeners.
-- **OS-level auth** — if you can spawn the process, you already have the permission you need. No API keys.
-- **Transport-agnostic** — the same line protocol can be tunneled over SSH, inside a container, or across a VS Code remote session.
-
-HTTP is still available for the Dashboard and Prometheus metrics, but for IDE ↔ agent, stdio is simpler and safer.
-
----
-
-## Streaming & Multi-Turn
-
-The Agent Card advertises `streaming: true` and `multi_turn: true`. This signals to the client that:
-
-- **Streaming**: long-running tasks can emit progress events over the same stdio connection, not just a single response.
-- **Multi-turn**: a task context can span multiple request/response pairs (clarifications, follow-ups) without losing state.
-
-These capabilities mirror the Session Memory Stack — pinned instructions, snowball recap, and key facts all carry across multi-turn ACP conversations the same way they do in channel messages.
-
----
-
-## Security Considerations
-
-ACP, like MCP, inherits DuDuClaw's security boundaries:
-
-- **CONTRACT.toml** — must_not/must_always rules still apply; an ACP-submitted task can't violate them.
-- **Capability gating** — `agent.toml [capabilities]` deny-by-default still gates tool access.
-- **Audit log** — tasks submitted via ACP appear in `audit.unified_log` with source=`acp`.
-- **Sandboxing** — tasks run under the same optional per-agent task sandbox as any other task; see [Task sandbox](../guides/task-sandbox.md).
-
-The client being an IDE doesn't grant elevated trust — the agent's own policies are the last line of defense.
-
----
-
-## Interaction with Other Systems
-
-- **Task Board**: ACP-submitted tasks flow through the same `TaskStore` as channel-submitted ones. Both show in the Dashboard Activity Feed.
-- **Runtime selection**: The agent's normal runtime (Claude/Codex/Grok/OpenAI-compat) handles ACP tasks — same session memory, same prompt cache strategy, same account rotation.
-- **Evolution**: ACP tasks count as "substantive turns" for Key-Fact extraction and prediction error calibration.
-- **Audit log**: All ACP requests are logged with source=`acp`, alongside the other four audit sources (security / tool_calls / channel_failures / feedback).
-
----
-
-## Why This Matters
-
-### Standards-Based Integration
-
-A2A is the Linux-Foundation-governed interop standard for agent-to-agent messaging (150+ organizations as of 2026), and the Agent Client Protocol has real IDE clients (Zed, nvim-acp, JetBrains). DuDuClaw ships A2A today; genuine Agent Client Protocol support is the planned bridge into the IDE ecosystem (see the status note at the top).
-
-### Same Agent, New Interface
-
-No new agents, no new configuration, no new runtime boundaries. The existing agent (SOUL.md, CONTRACT.toml, memory, skills, wiki) is simply reachable from a new entry point. All the investment in agent behavior transfers.
-
-### Developer Loop Acceleration
-
-Instead of asking an agent a question in a chat app and then copy-pasting the response into the editor, developers can invoke the agent directly from where they work. The friction drops to near-zero, and the agent's responses land *in context*.
-
-### Composable Orchestration
-
-One agent can be an A2A client to another agent. Orchestrator-style agents can discover sub-agents via `agent/discover`, check their skill tags, and route tasks via `tasks/send` — a structured, standard alternative to DuDuClaw's internal file-based IPC for cross-process scenarios.
-
----
-
-## The Takeaway
-
-A good agent should be reachable from wherever work happens. The dining room (channels) is for end users; the reservation line (ACP/A2A) is for the IDEs, pipelines, and peer agents that need to work with it programmatically. Same agent, same brain, same contracts — just a cleaner protocol on the front door.
+The HTTP exposure list and JWT ownership rules described above belong to `/a2a`; they do not redefine the stdio command's trust model. The earlier versions of this page incorrectly described HTTP as a future discovery-only extension and advertised streaming/multi-turn task behavior without an implemented transport. The supported HTTP operations are listed above.

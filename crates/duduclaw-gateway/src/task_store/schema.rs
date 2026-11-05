@@ -7,6 +7,8 @@ impl TaskStore {
     pub fn open(home_dir: &Path) -> Result<Self, String> {
         let db_path = home_dir.join("tasks.db");
         let conn = Connection::open(&db_path).map_err(|e| format!("open task store: {e}"))?;
+        // Inspect the original schema before migrations can hide lost tombstones.
+        Self::validate_task_access_schema(&conn)?;
         Self::init_schema(&conn)?;
         debug!(?db_path, "TaskStore initialized");
         Ok(Self {
@@ -39,6 +41,7 @@ impl TaskStore {
 
              CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
              CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_to);
+             CREATE INDEX IF NOT EXISTS idx_tasks_a2a_creator_id ON tasks(created_by, id);
              CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
 
              CREATE TABLE IF NOT EXISTS discovery_decision_receipts (
@@ -94,6 +97,7 @@ impl TaskStore {
         // rewrite. Each ALTER is guarded by a column-existence check so re-running
         // is a no-op (rusqlite has no `ADD COLUMN IF NOT EXISTS`).
         Self::add_dispatch_columns(conn)?;
+        Self::init_task_access_schema(conn)?;
         Self::init_authority_schema(conn)?;
         // ── U4 co-edited plans: idempotent table creation ──
         Self::init_plan_schema(conn)?;
@@ -104,6 +108,7 @@ impl TaskStore {
         Self::init_responsibility_schema(conn)?;
         // ── Scheduled assignments (new table only) ──
         Self::init_assign_schedule_schema(conn)?;
+        Self::init_a2a_schema(conn)?;
         Ok(())
     }
 
@@ -394,6 +399,7 @@ impl TaskStore {
             // reads back as "not assigned by a person".
             ("on_behalf_of", "on_behalf_of TEXT"),
             ("created_via", "created_via TEXT"),
+            ("a2a_owner", "a2a_owner TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {

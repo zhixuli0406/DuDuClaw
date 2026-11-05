@@ -190,6 +190,9 @@ impl MethodHandler {
             .await
         {
             Ok(rows) => {
+                let rows: Vec<_> = rows.into_iter().filter(|r| {
+                    task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), &r.id)
+                }).collect();
                 // E8 reverse handoff: "在 <通道> 中開啟" — resolve from the
                 // `/goal` entry point's stamped source conversation
                 // (`source_channel`/`source_chat_id`, P5 write-back). No
@@ -307,6 +310,15 @@ impl MethodHandler {
             .get("parent_task_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        if let Some(parent) = row.parent_task_id.as_deref() {
+            let live = match live_reader_context(&self.home_dir, ctx) {
+                Ok(live) => live,
+                Err(()) => return WsFrame::error_response("", PERMISSION_DENIED),
+            };
+            if !task_privacy::a2a_owner_allows(&self.home_dir, &live, parent) {
+                return WsFrame::error_response("", PERMISSION_DENIED);
+            }
+        }
         // The person handing the work over: the authenticated account, never
         // a request field (the gateway admin token names nobody).
         row.on_behalf_of = crate::trigger_route::assign::principal_for_user(&ctx.user_id);
@@ -370,6 +382,15 @@ impl MethodHandler {
             Err(()) => return WsFrame::error_response("", PERMISSION_DENIED),
         };
         let ctx = &live;
+        if !task_privacy::a2a_owner_allows(&self.home_dir, ctx, task_id) {
+            return WsFrame::error_response("", PERMISSION_DENIED);
+        }
+        let references = params.get("parent_task_id").and_then(Value::as_str).into_iter()
+            .chain(params.get("depends_on").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str));
+        if references.filter(|id| !id.is_empty())
+            .any(|id| !task_privacy::a2a_owner_allows(&self.home_dir, ctx, id)) {
+            return WsFrame::error_response("", PERMISSION_DENIED);
+        }
         let existing = store.get_task(task_id).await.ok().flatten();
         let owner_agent = existing.as_ref().map(|r| r.assigned_to.clone());
         if let Some(agent) = owner_agent.as_deref() {
@@ -578,6 +599,9 @@ impl MethodHandler {
             Err(()) => return WsFrame::error_response("", PERMISSION_DENIED),
         };
         let ctx = &live;
+        if !task_privacy::a2a_owner_allows(&self.home_dir, ctx, task_id) {
+            return WsFrame::error_response("", PERMISSION_DENIED);
+        }
         match store.get_task(task_id).await.ok().flatten() {
             Some(row) => {
                 let direct = ctx.has_agent_access(&row.assigned_to, AccessLevel::Operator)
@@ -707,8 +731,9 @@ impl MethodHandler {
         let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
         let offset = params.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
         match store
-            .list_tasks_paginated(
+            .list_tasks_page_for_principal(
                 status, agent_id, priority, goal_mode, archived, limit, offset,
+                Some(&format!("user:{}", reader.live().user_id)),
             )
             .await
         {

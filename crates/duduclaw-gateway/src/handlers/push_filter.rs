@@ -55,7 +55,8 @@ pub(crate) fn classify(event: &str) -> PushRule {
         | "system.update_installed"
         | "system.update_progress"
         | "maintenance.status_changed" => PushRule::System,
-        "events_lost" | "dashboard.navigate" | "task.removed" | "channel_queue_rejected" => PushRule::Authenticated,
+        "events_lost" | "dashboard.navigate" | "channel_queue_rejected" => PushRule::Authenticated,
+        "task.removed" => PushRule::Authenticated,
         "task.created" | "task.updated" | "task.comment" | "activity.new"
         | "task.needs_human" | "goal.round_started" | "goal.round_finished"
         | "goal.done" | "goal.failed" => PushRule::Task,
@@ -278,7 +279,12 @@ impl PushGate {
             return self.drop_event(&event, "login session belongs to another user");
         }
         match rule {
-            PushRule::System | PushRule::Authenticated => Some(line.to_string()),
+            PushRule::System | PushRule::Authenticated => {
+                if event == "task.removed" && !payload.get("task_id").and_then(Value::as_str)
+                    .is_some_and(|id| super::task_privacy::a2a_owner_allows(&self.home, &live, id))
+                { return self.drop_event(&event, "task principal"); }
+                Some(line.to_string())
+            },
             PushRule::Never => None,
             PushRule::Approval => self.drop_event(&event, "approval requires live asynchronous gate"),
             PushRule::Admin => {
@@ -313,7 +319,8 @@ impl PushGate {
                                     let (owner, audience) = self.task(id);
                                     owner.filter(|owner| duduclaw_core::is_valid_agent_id(owner))
                                         .is_some_and(|owner| {
-                                            live.has_agent_access(&owner, AccessLevel::Viewer)
+                                            super::task_privacy::a2a_owner_allows(&self.home, &live, id)
+                                                && live.has_agent_access(&owner, AccessLevel::Viewer)
                                                 && (live.is_admin() || !crate::machine_employee::requires_admin_for_id(&self.home, &owner))
                                                 && dashboard_may_read_task(&live, &audience)
                                         })
@@ -404,6 +411,9 @@ impl PushGate {
         };
         if !duduclaw_core::is_valid_agent_id(&task_id) {
             return self.drop_event(event, "invalid task id");
+        }
+        if !super::task_privacy::a2a_owner_allows(&self.home, live, &task_id) {
+            return self.drop_event(event, "task principal");
         }
         let (owner, audience) = self.task(&task_id);
         let Some(owner) = owner.filter(|id| duduclaw_core::is_valid_agent_id(id)) else {
