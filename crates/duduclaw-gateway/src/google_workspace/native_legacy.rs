@@ -322,7 +322,9 @@ pub(crate) async fn handle(
     home: &Path,
     g: &dyn crate::google_identity::native_tools::NativeGoogleAccess,
 ) -> Value {
-    if matches!(tool, "google_chat_spaces" | "google_chat_messages") && !super::chat_read_enabled(home) {
+    if matches!(tool, "google_chat_spaces" | "google_chat_messages")
+        && !super::chat_read_tool_available(home, tool)
+    {
         crate::egress_client::builtin_not_dispatched();
         return super::native_call::tool_error(super::chat_read::GUIDANCE);
     }

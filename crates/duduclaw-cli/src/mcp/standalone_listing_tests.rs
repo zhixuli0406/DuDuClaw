@@ -167,6 +167,24 @@ async fn init_token_listing_matches_the_internal_scoped_listing() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn google_chat_listing_tracks_admin_switch_for_employee_and_external_client() {
+    let home = scaffold_home();
+    duduclaw_gateway::google_workspace::set_integration_enabled(home.path(), true).unwrap();
+    let employee = principal("scaffold", "", false);
+    let external = principal("external-reader", "google:read", true);
+
+    for enabled in [false, true] {
+        duduclaw_gateway::google_workspace::set_chat_read_enabled(home.path(), enabled).unwrap();
+        let employee_tools = names(&employee, home.path(), "scaffold", false).await;
+        let external_tools = names(&external, home.path(), "scaffold", false).await;
+        for tool in ["google_chat_spaces", "google_chat_messages"] {
+            assert_eq!(employee_tools.contains(tool), enabled, "employee: {tool}");
+            assert_eq!(external_tools.contains(tool), enabled, "external: {tool}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn employee_listing_is_unchanged_and_unverified_internal_background_is_hidden() {
     let home = scaffold_home();
     // Per-agent key whose client id is the employee (the O7 budget fixture):

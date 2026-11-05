@@ -195,6 +195,13 @@ pub fn chat_read_enabled(home: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a native Google Chat read tool may be listed or dispatched.
+/// Unknown tool names return false so callers cannot accidentally widen the
+/// Chat gate by passing an unrecognized tool.
+pub fn chat_read_tool_available(home: &Path, tool: &str) -> bool {
+    matches!(tool, "google_chat_spaces" | "google_chat_messages") && chat_read_enabled(home)
+}
+
 pub fn requested_scopes(home: &Path) -> Vec<&'static str> {
     let mut scopes = REQUIRED_SCOPES.to_vec();
     if chat_read_enabled(home) { scopes.extend_from_slice(CHAT_READ_SCOPES); }
@@ -1492,6 +1499,18 @@ mod tests {
             assert!(super::set_chat_read_enabled(home.path(), true).is_err());
             assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), bad);
         }
+    }
+
+    #[test]
+    fn chat_tool_availability_is_fail_closed_and_tool_specific() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!super::chat_read_tool_available(home.path(), "google_chat_spaces"));
+        std::fs::write(home.path().join("config.toml"), "[google]\nchat_read = 'true'\n").unwrap();
+        assert!(!super::chat_read_tool_available(home.path(), "google_chat_messages"));
+        std::fs::write(home.path().join("config.toml"), "[google]\nchat_read = true\n").unwrap();
+        assert!(super::chat_read_tool_available(home.path(), "google_chat_spaces"));
+        assert!(super::chat_read_tool_available(home.path(), "google_chat_messages"));
+        assert!(!super::chat_read_tool_available(home.path(), "gmail_read"));
     }
 
     use super::*;

@@ -51,7 +51,7 @@ impl PendingGoogleCall {
             return Err(changed());
         };
         if matches!(native_tool.as_str(), "google_chat_spaces" | "google_chat_messages")
-            && !crate::google_workspace::chat_read_enabled(&self.context.home)
+            && !crate::google_workspace::chat_read_tool_available(&self.context.home, native_tool)
         {
             return Ok(tool_error(crate::google_workspace::chat_read::GUIDANCE));
         }
@@ -130,7 +130,10 @@ impl GoogleEffectAuthority {
             return Err(changed());
         }
         if matches!(native_tool.as_str(), "google_chat_spaces" | "google_chat_messages")
-            && !crate::google_workspace::chat_read_enabled(&self.material.context.home)
+            && !crate::google_workspace::chat_read_tool_available(
+                &self.material.context.home,
+                native_tool,
+            )
         {
             return Err(Refusal::hard("google_chat_disabled", "管理員已關閉 Google Chat 讀取。"));
         }
