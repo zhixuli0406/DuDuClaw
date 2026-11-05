@@ -118,7 +118,7 @@ pub trait AuditSink: Send + Sync {
 }
 
 /// JSONL file sink. Each call appends one line; the file is opened in
-/// append mode each time so the OS handles concurrent writes safely.
+/// append mode under a stable cross-process sidecar lock shared with readers.
 /// (Volume is low — at most a handful of events per request.)
 pub struct JsonlAuditSink {
     path: PathBuf,
@@ -151,27 +151,30 @@ impl JsonlAuditSink {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Rotate if needed.
-        if let Ok(meta) = std::fs::metadata(&self.path)
-            && meta.len() >= self.rotation_bytes
-        {
-            let rotated = self.path.with_extension(format!(
-                "{}.1",
-                self.path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("jsonl"),
-            ));
-            let _ = std::fs::rename(&self.path, &rotated);
-        }
+        duduclaw_core::with_file_lock(&self.path, || {
+            // Rotate if needed.
+            if let Ok(meta) = std::fs::metadata(&self.path)
+                && meta.len() >= self.rotation_bytes
+            {
+                let rotated = self.path.with_extension(format!(
+                    "{}.1",
+                    self.path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("jsonl"),
+                ));
+                std::fs::rename(&self.path, &rotated)?;
+            }
 
-        let mut f: File = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        f.write_all(line.as_bytes())?;
-        f.write_all(b"\n")?;
-        f.sync_data()?;
+            let mut f: File = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?;
+            f.write_all(line.as_bytes())?;
+            f.write_all(b"\n")?;
+            f.sync_data()?;
+            Ok(())
+        })?;
         Ok(())
     }
 }
@@ -218,6 +221,53 @@ impl AuditSink for NullAuditSink {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn jsonl_cross_process_writer_child() {
+        let Some(path) = std::env::var_os("DUDUCLAW_REDACTION_LOCK_TEST") else { return; };
+        let sink = JsonlAuditSink::new(path.into()).with_rotation(600_000);
+        println!("READY");
+        std::io::stdout().flush().unwrap();
+        let line = serde_json::json!({"event":"test", "payload":"x".repeat(12_000)}).to_string();
+        for _ in 0..20 { sink.append_line(&line).unwrap(); }
+    }
+
+    #[test]
+    fn jsonl_cross_process_rotation_and_whole_lines_share_family_lock() {
+        use std::io::BufRead;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("audit.jsonl");
+        let mut children = Vec::new();
+        duduclaw_core::with_file_lock(&path, || {
+            for _ in 0..4 {
+                let mut child = std::process::Command::new(std::env::current_exe()?)
+                    .args(["--exact", "audit::tests::jsonl_cross_process_writer_child", "--nocapture"])
+                    .env("DUDUCLAW_REDACTION_LOCK_TEST", &path)
+                    .stdout(std::process::Stdio::piped()).spawn()?;
+                let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+                let mut line = String::new();
+                loop {
+                    assert_ne!(output.read_line(&mut line)?, 0);
+                    if line.trim() == "READY" { break; }
+                    line.clear();
+                }
+                children.push((child, output));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!path.exists(), "writers must wait for the family snapshot lock");
+            Ok(())
+        }).unwrap();
+        for (mut child, _output) in children { assert!(child.wait().unwrap().success()); }
+        let mut count = 0;
+        for file in [&path, &path.with_extension("jsonl.1")] {
+            for line in std::fs::read_to_string(file).unwrap().lines() {
+                let value: Value = serde_json::from_str(line).unwrap();
+                assert_eq!(value["payload"].as_str().unwrap().len(), 12_000);
+                count += 1;
+            }
+        }
+        assert_eq!(count, 80);
+    }
 
     #[test]
     fn jsonl_appends_lines_with_ts() {

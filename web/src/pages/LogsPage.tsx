@@ -1,3 +1,4 @@
+import { ComplianceReportButton } from '@/components/ComplianceReportButton';
 import { auditEventSummary } from '@/lib/home-overview';
 import { useEffect, useRef, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -73,12 +74,13 @@ export function LogsPage() {
   return (
     <div className="flex h-full min-h-0 flex-col gap-4">
       {/* Header */}
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <FileText className="size-5 text-muted-foreground" />
         <div>
           <h1 className="text-base font-medium">{intl.formatMessage({ id: 'nav.logs' })}</h1>
           <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'logs.subtitle' })}</p>
         </div>
+        <div className="ml-auto"><ComplianceReportButton /></div>
       </div>
 
       <Tabs value={tab} onValueChange={(v) => setTab(v as Tab)} variant="line">

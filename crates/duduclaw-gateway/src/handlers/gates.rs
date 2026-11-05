@@ -107,6 +107,7 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
         | "distributor"
         // 身分解析 — 把不同通道上的「人」對到同一身分
         | "identity"
+        | "compliance"
     ) {
         return true;
     }

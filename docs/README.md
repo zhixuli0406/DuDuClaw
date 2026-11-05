@@ -86,6 +86,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/71-control-room.md](features/71-control-room.md) | Terminal control room — what `duduclaw tui` is for, the three ways to stop work, trust boundaries, verified terminals |
 | [features/72-group-context.md](features/72-group-context.md) | Opt-in group context and Discord employee choices ([繁體中文](features/zh-TW/72-group-context.md), [日本語](features/ja-JP/72-group-context.md)) |
 | [features/73-meeting-transcripts.md](features/73-meeting-transcripts.md) | Meeting recordings to Taiwan Traditional Chinese transcripts, timestamps, provider privacy and limits; [繁體中文](features/zh-TW/73-meeting-transcripts.md) / [日本語](features/ja-JP/73-meeting-transcripts.md) |
+| [features/74-compliance-reports.md](features/74-compliance-reports.md) | Enterprise Admin compliance reports: recorded outbound decisions, approvals, action reviews and data-source accesses; [繁體中文](features/zh-TW/74-compliance-reports.md) / [日本語](features/ja-JP/74-compliance-reports.md) |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
 ---

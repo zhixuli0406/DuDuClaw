@@ -632,6 +632,7 @@ pub mod role_turns;
 pub mod team_composer;
 
 pub mod data_exports;
+pub mod compliance;
 pub mod product_policy;
 
 /// Thinking display: the normalised `ThinkingEvent`, the per-turn sink and
