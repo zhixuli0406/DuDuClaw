@@ -112,7 +112,10 @@ pub(super) async fn chat_spaces<I: LocalIo>(io: &mut I, template: &NativeCallTem
 pub(super) async fn chat_messages<I: LocalIo>(io: &mut I, template: &NativeCallTemplate, args: &chat_read::MessagesArgs) -> Result<Value, GoogleApiError> {
     let mut query = vec![("pageSize", args.limit.to_string()), ("orderBy", "createTime desc".into())];
     if let Some(filter) = &args.filter { query.push(("filter", filter.clone())); }
-    let endpoint = chat_read::messages_endpoint(&args.space).map_err(GoogleApiError::Auth)?;
+    let endpoint = chat_read::messages_endpoint(&args.space).map_err(|message| GoogleApiError::Api {
+        status: 400,
+        message,
+    })?;
     let data = google_request(io, template, reqwest::Method::GET, &endpoint, &query, None)
         .await.map_err(chat_error)?;
     let mut result = chat_read::messages_response(&data, args);
