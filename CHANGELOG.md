@@ -102,12 +102,12 @@
 - 同仁詳情新增管理員專用「登出此同仁的所有裝置」與確認對話框；撤銷所有一般與保持登入工作階段並記錄操作者、目標及結果。停用與離職會增加憑證版本，重新啟用也不會恢復舊憑證；保留既有 WebSocket 撤銷檢查與 24 小時重驗限制。
 - 修正強制兩步驟驗證切換時的登入競態：登入、一般續期與保持登入會在發出憑證的同一筆交易內重查政策、帳號狀態與憑證版本，避免沿用切換前的單因素授權。
 - 保持登入端點現在完整比對 Origin（含通訊協定與連接埠）並要求 CSRF 標頭；輪替改用已驗證的世代編號與固定大小的憑證紀錄，限制有效裝置及撤銷紀錄總數。帳號 WebSocket 最長存活 24 小時，讓到期撤銷紀錄可安全清除；備份須一併保留獨立登入簽章金鑰。
-- Email 驗證碼綁定登入挑戰、雜湊保存、限用一次並限制嘗試與重寄；通行金鑰使用 WebAuthn 驗證並要求裝置使用者驗證。因素變更需再次驗證密碼，強制兩步驟驗證時保留至少一種因素。保持登入採 HttpOnly、SameSite=Strict Cookie 與伺服器端雜湊、輪替及重用撤銷，登出、密碼與因素變更等操作會撤銷裝置；Cookie 端點與 WebSocket 升級驗證 Origin。實際寄信、跨平台通行金鑰及完整整合驗收仍待完成。
+- Email 驗證碼綁定登入挑戰、雜湊保存、限用一次並限制嘗試與重寄；通行金鑰使用 WebAuthn 驗證並要求裝置使用者驗證。因素變更需再次驗證密碼，強制兩步驟驗證時保留至少一種因素。保持登入採 HttpOnly、SameSite=Strict Cookie 與伺服器端雜湊、輪替及重用撤銷，登出、密碼與因素變更等操作會撤銷裝置；Cookie 端點與 WebSocket 升級驗證 Origin。已知限制：實際寄信、跨平台通行金鑰及完整整合流程尚未完成實機驗收。
 - 修正個人授權可透過環境變數或嵌入主程式設定開啟多人管理功能的問題：所有建置以有效授權為版本上限，設定只能降級；沒有有效授權時維持個人版。忽略升級要求時，每個來源每個行程警告一次；即使 release 啟用 Debug assertions 也不能升級；獨立測試 API 另需明確啟用測試 feature，發版建置會拒絕該 feature。
 - 修正 office_script 共用 uv 快取可被解析器污染、跨員工傳遞資料的問題：可信 base 僅由不含使用者輸入的 host 暖快取建立，沙箱只讀 base，改用本次工作區內的獨立快取副本並於執行結束清除；保留明確 unsandboxed fallback，且不沿用舊可寫快取作為可信來源。
 - 修正 `office_script` HN2 runtime 根目錄重疊：Linux bwrap 與 macOS SBPL 建立前解析 home、私人工作／輸出、輸入、腳本、快取及 runtime 允許根目錄，雙向檢查相等或祖先重疊（含別名與 canonical 目標）。重疊或解析失敗預設拒絕，避免自訂 home 位於 `/usr/local`、`/opt/homebrew` 等目錄時暴露全域與其他員工資料；沿用既有明確 unsandboxed 豁免及一次性警告。
 - 修正 `office_script` HN2：隔離不可用時預設拒絕。Linux 改用 bwrap 強制檔案系統／網路隔離與 2 GiB RLIMIT_AS；macOS 以 deny-by-default sandbox-exec profile 限制檔案讀寫、禁止網路，嘗試 DATA／RSS 上限並驗證超限配置會遭拒。沿用 `[container.sandbox] script_when_unavailable = "run_unsandboxed"` 明確豁免，每個主機程序警告一次；不新增設定。隔離執行的 uv 一律離線，缺少套件快取時失敗。
-- `office_script` 固定直接 Python 依賴與套件發布截止時間，禁止 source build／自動下載 Python；system Python fallback 核對直接依賴版本。保留 CPU／檔案／程序／fd 上限、process group 清理及 stdout／stderr 各 32 KiB 限制，啟動前重驗腳本 hash 與 no-follow 私有路徑。**剩餘風險**：同 UID 主機程序仍可競態置換 pathname／快取；遞迴依賴尚無完整 hash lock。DATA／RSS 不保證所有 Darwin 主機可用，無效時拒絕；本機 sandbox-exec 被環境拒絕，成功隔離與真實 LibreOffice／Linux 驗收仍待完成。完整邊界見 `docs/features/05-security-defense.md`。
+- `office_script` 固定直接 Python 依賴與套件發布截止時間，禁止 source build／自動下載 Python；system Python fallback 核對直接依賴版本。保留 CPU／檔案／程序／fd 上限、process group 清理及 stdout／stderr 各 32 KiB 限制，啟動前重驗腳本 hash 與 no-follow 私有路徑。**剩餘風險**：同 UID 主機程序仍可競態置換 pathname／快取；遞迴依賴尚無完整 hash lock。DATA／RSS 不保證所有 Darwin 主機可用，無效時拒絕；本機 sandbox-exec 被環境拒絕，成功隔離與真實 LibreOffice／Linux 環境尚未完成實機驗收。完整邊界見 `docs/features/05-security-defense.md`。
 - 辦公文件工具只執行通過編譯時 SHA-256 manifest 的內嵌腳本；個人、部門與公司技能只能覆蓋提示文字。輸入採 no-follow 快照，參數按腳本區分旗標與輸入／輸出，拒絕 `--out=/...` 等合併寫法；輸出由 Rust 以排他建立、no-follow 寫入員工目錄的新檔案，保留既有權限與文件限制。安全執行目前僅支援 Linux 與 macOS，其他平台拒絕。
 - 技能層根目錄與路徑元件拒絕符號連結；部門技能改讀權威 `org.toml` 並核對員工設定副本，無法驗證或不一致即排除部門層。公司層四項辦公技能的腳本全部通過 manifest 才寫入 migration 完成標記；衝突副本保留但永不執行，日誌與 doctor 顯示衝突。
 - 附件授權與上傳配額資料庫現在逐層檢查直到 `/` 的目錄擁有者與寫入權限，拒絕其他使用者可置換祖先目錄的路徑；root 擁有的 sticky 暫存目錄只允許下一層由執行使用者擁有。首次建立 DuDuClaw 資料目錄採 `0700`，既有權限不自動變更；CLI 與儀表板健檢會提示群組／其他使用者可寫的資料目錄及 `chmod 700` 修復指令。
@@ -127,7 +127,7 @@
 - 遠端 MCP bridge 暫停新版多回合輸入與狀態續傳，避免互動內容繞過外送及審批檢查。bridge 連線建立後或 API 用戶端執行工具時遇到協定版本不符，都會拒絕操作並停止接受後續請求，須重啟對話或重新連線、列舉工具及檢查權限，不會沿用舊核准跨版本重送。OAuth 憑證必須精確符合 MCP 端點的資源路徑，拒絕同源其他路徑與帶 query／fragment 的資源，不符的舊憑證須重新連線。API HTTP 用戶端每次新連線獨立探測版本，移除可能跨帳號影響協定選擇的共用快取。
 - 拒絕 nil、全 F、重複填充值及已知韌體占位 UUID，這些值不再作為付費授權的硬體依據；指紋與強度欄位改為私有，合成硬體指紋僅供測試。CLI 換綁與更新在輸出前驗證控制端網址，只顯示正規化後的網址；共用網路位址檢查補齊 IANA IPv6 特殊範圍，封鎖 6to4 並保留明列為可全球連線的例外。
 - 授權檔的 `control_url` 不再能任意指定外連目的地：Gateway／CLI 授權與經銷商資料請求只允許固定官方主機，其他簽發端須由客戶端本機設定 `DUDUCLAW_CONTROL_URL`。強制 HTTPS／443、拒絕使用者資訊、IP literal、localhost 與非公開 DNS 結果，固定連線位址並停用重新導向與代理；保留既有授權簽章格式。Owner gateway 將授權狀態讀取與兩層簽章納入同一筆 SQLite 寫入交易，防止撤銷在讀取後、簽章前提交卻仍簽出有效授權。
-- 本機管理、多播、無 MAC、全零、共用 `02:00:00:00:00:00` 與廣播 `FF:FF:FF:FF:FF:FF` MAC 指紋視為 Weak，不再啟用綁定機器的付費授權，管理員會收到需由帳號持有人在控制台核准換綁的提示；真實的全球管理單播 MAC 仍視為 Hardware，Linux／Windows 既有付費綁定繼續有效。macOS 優先使用 UUID v2，UUID 讀取失敗時仍不提案改綁 MAC。授權更新核對原訂閱、提案綁定、nonce 與部署型態；待核准換綁不覆寫原授權。
+- 授權指紋分三類：真實的全球管理單播 MAC 為 Hardware；Linux／Windows 上每台唯一的本機管理單播 MAC（例如雲端虛擬機與 Docker 容器）為「雲端／容器識別」，既有與新的付費綁定都有效；多播、無 MAC、全零、共用 `02:00:00:00:00:00`、Npcap／KM-TEST 共用位址與廣播 `FF:FF:FF:FF:FF:FF` 視為 Weak，不能啟用綁定機器的付費授權，管理員會收到需由帳號持有人在控制台核准換綁的提示。macOS 優先使用 UUID v2，UUID 讀取失敗時仍不提案改綁 MAC。授權更新核對原訂閱、提案綁定、nonce 與部署型態；待核准換綁不覆寫原授權。
 - 授權更新、撤銷及待核准回應一律驗證第 2 版簽章，涵蓋狀態、原因、生效時間及請求身分；移除舊版與無簽章回應相容路徑，避免授權遭重播或偽造撤銷。簽發端須先升級。CLI 與閘道的授權寫入共用跨程序鎖，收到回應後重查完整檔案狀態，防止延遲回應覆蓋管理員剛安裝的授權；寫入改用獨立暫存檔並同步磁碟。
 
 ## [1.79.3] - 2026-11-04 — 原生 Linux 我的連線、群組對話與會議逐字稿
