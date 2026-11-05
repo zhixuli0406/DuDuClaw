@@ -299,6 +299,23 @@ async fn primary_selection_never_guesses_among_multiple_or_stale_bindings() {
 }
 
 #[tokio::test]
+async fn viewer_bindings_and_downgraded_primary_never_become_chat_candidates() {
+    let f = fixture().await;
+    let db = &f.state.user_db;
+    db.set_primary_agent(&f.emp, Some("finance")).unwrap();
+    db.bind_agent(&f.emp, "finance", AccessLevel::Viewer).unwrap();
+    assert!(db.set_primary_agent(&f.emp, Some("finance")).is_err());
+    assert_eq!(f.state.resolve_new_agent(&f.emp).await, Err("no_agents"));
+    assert!(f.state.authorize_target(&f.emp, "finance", false).await.is_err());
+    assert!(f.state.authorize_resume_target(&f.emp, "finance").await.is_err());
+    db.bind_agent(&f.emp, "sales-rep", AccessLevel::Operator).unwrap();
+    assert_eq!(f.state.resolve_new_agent(&f.emp).await.unwrap().as_deref(), Some("sales-rep"));
+    db.set_primary_agent(&f.emp, Some("sales-rep")).unwrap();
+    db.bind_agent(&f.emp, "sales-rep", AccessLevel::Viewer).unwrap();
+    assert_eq!(f.state.resolve_new_agent(&f.emp).await, Err("no_agents"));
+}
+
+#[tokio::test]
 async fn configured_default_and_all_main_roles_are_denied_even_when_bound() {
     let f = fixture().await;
     std::fs::write(f._dir.path().join("config.toml"), "[general]\ndefault_agent = \"finance\"\n").unwrap();

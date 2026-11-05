@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { useNavigate, useSearchParams } from 'react-router';
 import {
   Settings,
+  Mail,
   Container,
   HeartPulse,
   Stethoscope,
@@ -30,6 +31,7 @@ import { useSystemStore } from '@/stores/system-store';
 import { isNewFeature } from '@/apps/registry';
 
 /** v1.68 (W2): 設定檔進階編輯 tab — new-feature chip. */
+const INVITATION_NEW_IN = '1.80.0';
 const CONFIG_RAW_NEW_IN = '1.68.0';
 const KNOWLEDGE_SEARCH_NEW_IN = '1.76.0';
 import { GeneralTab } from '@/components/settings/sections/GeneralTab';
@@ -49,6 +51,7 @@ import { AutomationTab } from '@/components/settings/sections/AutomationTab';
 import { DelegationTab } from '@/components/settings/sections/DelegationTab';
 import { CalibrationTab } from '@/components/settings/sections/CalibrationTab';
 import { ConfigRawTab } from '@/components/settings/sections/ConfigRawTab';
+import { InvitationTab } from '@/components/settings/sections/InvitationTab';
 import { RestartRequiredBanner } from '@/components/settings/RestartRequiredBanner';
 
 /** Settings sub-tab whitelist (spec §5.3 式3). `?tab=` is validated against this
@@ -59,7 +62,7 @@ const VALID_TABS = [
   // 1.76: knowledge-base meaning-based search (embedding models), admin-only.
   'knowledgeSearch',
   // v1.68 (W2): raw config.toml / inference.toml / agent.toml editor, admin-only.
-  'configRaw',
+  'configRaw', 'invitation',
 ] as const;
 type TabId = (typeof VALID_TABS)[number];
 
@@ -95,7 +98,7 @@ export function SettingsPage() {
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const version = useSystemStore((s) => s.status?.version ?? null);
 
-  const ADMIN_ONLY_TABS = ['delegation', 'calibration', 'configRaw', 'knowledgeSearch'];
+  const ADMIN_ONLY_TABS = ['delegation', 'calibration', 'configRaw', 'knowledgeSearch', 'invitation'];
   const tabAllowed = (tab: string) =>
     (VALID_TABS as readonly string[]).includes(tab) && (!ADMIN_ONLY_TABS.includes(tab) || isAdmin);
   const activeTab: TabId = tabAllowed(tabParam ?? '') ? (tabParam as TabId) : 'general';
@@ -114,6 +117,16 @@ export function SettingsPage() {
       items: [
         { value: 'general', label: t('settings.general'), icon: Settings },
         { value: 'account', label: t('settings.account'), icon: KeyRound },
+        ...(isAdmin ? [{
+          value: 'invitation',
+          label: isNewFeature(INVITATION_NEW_IN, version) ? (
+            <span className="flex items-center gap-1.5">
+              {t('invitation.title')}
+              <span className="rounded border border-surface-border px-1.5 py-0.5 text-xs text-muted-foreground">{t('nav.badge.new')}</span>
+            </span>
+          ) : t('invitation.title'),
+          icon: Mail,
+        }] : []),
         { value: 'voice', label: t('settings.voice'), icon: Mic },
         { value: 'proactive', label: t('settings.proactive'), icon: Zap },
         // 系統更新 moved to its own management entry (2026-08-04, D18) —
@@ -185,6 +198,9 @@ export function SettingsPage() {
         <SettingsTab value="account" title={t('settings.account.title')}>
           <AccountTab />
         </SettingsTab>
+        {isAdmin && <SettingsTab value="invitation" title={t('invitation.title')}>
+          <InvitationTab />
+        </SettingsTab>}
         <SettingsTab value="system" title={t('settings.system')} description={t('settings.system.desc')}>
           <SystemTab />
         </SettingsTab>

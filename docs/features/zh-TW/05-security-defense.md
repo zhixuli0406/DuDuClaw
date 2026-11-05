@@ -457,3 +457,9 @@ Read 防護會拒絕讀取 `<home>/secrets`。這不是對 Bash 的隔離：員�
 `computer_login` 只接受標籤。Gateway 用已驗證的員工身分比對非空的 `allowed_agents` 清單，再執行該工具獨立的工具與 session 閘門。Gateway 先透過既有導覽檢查開啟保存的登入網址。秘密只透過 stdin 送入容器 helper，不放在命令列參數或模型結果。Helper 填寫前須符合確切來源與登入路徑；只有送出第一步後到達、且有可見密碼欄位的第二步才能使用 `allowed_paths`。填寫前、同步 input/change 事件後及 submit 事件後都要求有效提交方式為 POST；原生 `requestSubmit` 與備援路徑都會檢查實際選用送出按鈕的 `formmethod`。網路層也會拒絕查詢參數解碼後的值等於完整帳號或密碼的非 POST 請求。CDP Fetch 會中止每個來源不符的請求與轉址，登入期間也會略過 service worker。解除攔截前，helper 會追蹤 `Network.requestWillBeSent`、`Network.loadingFinished` 與 `Network.loadingFailed`，確認請求已結束。最多等待 3 秒，且須連續兩次命令往返都沒有新請求活動或待完成請求。若無法確認完成，回傳 `failed_uncleared`，在 Fetch 攔截仍啟用時呼叫 `Browser.close`，再由 Gateway 移除 session 與容器。執行期間暫停截圖；若無法確認欄位已清除，Gateway 會停止並移除 session 與容器，要求重新啟動 session。
 
 這項保護無法阻止同來源 JavaScript 讀取已填入的欄位，也不提供對同一 OS 使用者程序的檔案隔離，更不取代網路白名單。登入僅限保存的 HTTPS 來源與允許的登入路徑，localhost 也必須使用 HTTPS。雙因素驗證與驗證碼須由人員透過既有接手流程處理。須重建電腦操作映像以安裝 `duduclaw-fill-login`。結果定義與設定方式見[瀏覽器自動化](08-browser-automation.md)。
+
+### 新增同仁與首次登入進度（v1.80.0）
+
+`users.create_members` 與 `invitation.get/update/preview` 明列為 Admin 權限並重查有效帳號。建立同仁及修改邀請信的寫入交易內會再核對憑證版本。每位同仁的帳號、綁定、主要對象、選用邀請、進度與稽核一起提交。SMTP 在交易外執行，寄送失敗不刪除已建立的帳號，複製與重寄仍限管理員。信件先跳脫所有管理員文字，只解讀粗體與換行；選填課程網址限 HTTPS，不接受內嵌帳密。預覽不產生憑證。`onboarding.get/update` 固定使用目前登入者身分與憑證版本，更新不接受指定他人 ID。連線步驟由伺服器紀錄確認，引導完成不授予任何權限。見[使用指南](../../guides/zh-TW/user-management-and-first-login.md)。
+
+邀請、首次登入與新增同仁 RPC 命名空間中的未知方法，在核心派送前要求 Admin，且不會交給 extension。主要員工的寫入與讀取要求直接 Owner／Operator 綁定；控制台聊天候選與續接目標拒絕僅有 Viewer 的權限。邀請與課程網址一律要求 HTTPS 且不得內含帳密，localhost 亦同；郵件標頭欄位移除控制字元。

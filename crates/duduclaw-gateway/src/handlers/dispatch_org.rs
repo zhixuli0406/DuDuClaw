@@ -161,6 +161,15 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_user_invites(method, params, ctx)).await
             }
+            "users.create_members" => {
+                require_admin!();
+                boxed_frame(|| self.handle_users_create_members(params, ctx)).await
+            }
+            "invitation.get" | "invitation.update" | "invitation.preview" => {
+                require_admin!();
+                boxed_frame(|| self.handle_invitation_content(method, params, ctx)).await
+            }
+            "onboarding.get" | "onboarding.update" => boxed_frame(|| self.handle_onboarding(method, params, ctx)).await,
             "users.create" => {
                 require_admin!();
                 boxed_frame(|| self.handle_users_create(params, ctx)).await

@@ -155,6 +155,8 @@ Open standards that define the DuDuClaw agent ecosystem.
 
 ## User & Developer Guides
 
+New: [Add teammates and first login](guides/user-management-and-first-login.md) · [繁體中文](guides/zh-TW/user-management-and-first-login.md) · [日本語](guides/ja-JP/user-management-and-first-login.md).
+
 | Document | Description | Status |
 |----------|-------------|--------|
 | [guides/tui.md](guides/tui.md) | Terminal control room with decision cards and streaming inbox; password or OTP login, SSH, security limits, settings and keys ([zh-TW](guides/zh-TW/tui.md), [ja-JP](guides/ja-JP/tui.md)) | Current |

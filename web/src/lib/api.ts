@@ -2365,6 +2365,43 @@ export interface LicenseSnapshot {
 
 // ── User management types ────────────────────────────────────
 
+export interface InvitationContent {
+  opening: string;
+  steps: string;
+  examples: [string, string, string];
+  course_url: string;
+}
+export interface InvitationPreview {
+  subject: string;
+  text: string;
+  html: string;
+  examples: string[];
+}
+export type OnboardingStep = 'channel' | 'google' | 'example' | 'capabilities';
+export type OnboardingStepStatus = 'pending' | 'done' | 'skipped';
+export interface OnboardingProgress {
+  enabled: boolean;
+  dismissed: boolean;
+  password_done: boolean;
+  steps: Record<OnboardingStep, OnboardingStepStatus>;
+  examples: string[];
+}
+export interface NewMemberInput {
+  display_name: string;
+  email: string;
+  role: 'employee' | 'manager' | 'admin';
+  department?: string;
+  primary_agent_id: string;
+  bindings: Array<{ agent_name: string; access_level: 'operator' | 'viewer' }>;
+  invite: boolean;
+}
+export interface CreateMemberResult {
+  index: number;
+  user?: UserInfo;
+  invite?: UserInviteResult;
+  error?: string;
+}
+
 export interface UserInfo {
   primary_agent_id?: string | null;
   id: string;
@@ -8828,7 +8865,20 @@ export const api = {
         300000,
       ) as Promise<MigrateResult>,
   },
+  invitation: {
+    get: (locale: string) => client.call('invitation.get', { locale }) as Promise<{locale: string; content: InvitationContent}>,
+    update: (locale: string, content: InvitationContent) => client.call('invitation.update', { locale, content }) as Promise<{locale: string; content: InvitationContent}>,
+    preview: (params: { locale: string; content?: InvitationContent; display_name?: string }) =>
+      client.call('invitation.preview', params) as Promise<InvitationPreview>,
+  },
+  onboarding: {
+    get: (locale = 'zh-TW') => client.call('onboarding.get', { locale }) as Promise<OnboardingProgress>,
+    update: (change: { step?: OnboardingStep; status?: 'done' | 'skipped'; dismissed?: true }, locale = 'zh-TW') =>
+      client.call('onboarding.update', { ...change, locale }) as Promise<OnboardingProgress>,
+  },
   users: {
+    createMembers: (params: { members: NewMemberInput[]; public_url?: string; locale?: string }) =>
+      client.call('users.create_members', params, false, 330000) as Promise<{ results: CreateMemberResult[] }>,
     invite: (userId: string, publicUrl: string) =>
       client.call('users.invite', { user_id: userId, public_url: publicUrl }) as Promise<UserInviteResult>,
     inviteStatus: () =>

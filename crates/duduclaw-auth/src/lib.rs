@@ -9,6 +9,9 @@ pub mod team_history;
 pub mod otp;
 pub mod user_update;
 pub mod user_invites;
+pub mod members;
+pub mod onboarding;
+pub mod invitation_content;
 mod user_row;
 
 pub use acl::UserContext;

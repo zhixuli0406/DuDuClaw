@@ -169,6 +169,11 @@ export const useConversationsStore = create<ConversationsState>((set, get) => {
       set({ ...emptyView });
       const previousChat = useChatStore.getState();
       useChatStore.getState().reset();
+      if (!requiresAssignedChatAgent()) {
+        const primary = useAgentsStore.getState().agents.find(agent =>
+          agent.name === useAuthStore.getState().user?.primary_agent_id);
+        if (primary) useChatStore.getState().selectAgent(primary.role === 'main' ? null : primary.name);
+      }
       const chat = useChatStore.getState();
       if (requiresAssignedChatAgent() && (!chat.resolvedAgent || chat.assignmentError
         || (previousChat.resumedExplicitly && !previousChat.isStreaming))

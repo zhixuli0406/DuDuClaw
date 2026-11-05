@@ -11,6 +11,7 @@ import { useAuthStore } from '@/stores/auth-store';
 beforeEach(() => {
   vi.clearAllMocks();
   useConnectionStore.setState({ state: 'authenticated' as never, error: null });
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
   mockWsClient.call.mockResolvedValue({ users: [], departments: [], agents: [] });
 });
 
@@ -27,14 +28,15 @@ describe('UsersPage', () => {
     expect(await screen.findByText('User Management', { selector: 'p' })).toBeInTheDocument();
   });
 
-  it('opens create user dialog when button clicked', async () => {
+  it('opens the single-page member form when button clicked', async () => {
     const user = userEvent.setup();
     renderWithProviders(<UsersPage />);
 
-    const createButton = screen.getByRole('button', { name: /create user/i });
+    const createButton = screen.getByRole('button', { name: /add members/i });
     await user.click(createButton);
 
-    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Add members' })).toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 });
 

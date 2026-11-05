@@ -73,6 +73,50 @@ fn audit(conn: &Connection, actor: &str, action: &str, user: &str, invite_id: &s
     Ok(())
 }
 
+/// Reuse the invitation protocol inside a caller-owned account transaction.
+pub(crate) fn issue_in_transaction(conn: &Connection, user_id: &str, created_by: &str, epoch: Option<u64>) -> Result<IssuedUserInvite, String> {
+    let mut bytes = [0u8; 32];
+    SystemRandom::new().fill(&mut bytes).map_err(|_| "invitation RNG unavailable")?;
+    let token = URL_SAFE_NO_PAD.encode(bytes);
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().timestamp();
+    let admin: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND role='admin' AND status='active'
+         AND must_change_password=0 AND (?2 IS NULL OR credential_epoch=?2))",
+        params![created_by, epoch], |r| r.get(0),
+    ).map_err(|_| "invitation storage unavailable")?;
+    if !admin { return Err(INVITE_ADMIN_REQUIRED.to_owned()); }
+    let email: Option<String> = conn.query_row(
+        "SELECT email FROM users WHERE id=?1 AND status='active'
+         AND password_hash=''",
+        [user_id], |r| r.get(0),
+    ).optional().map_err(|_| "invitation storage unavailable")?;
+    let email = email.ok_or(INVITE_USER_INELIGIBLE)?;
+    let revoked = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM user_invites WHERE user_id=?1 AND used_at IS NULL AND revoked_at IS NULL",
+        ).map_err(|_| "invitation storage unavailable")?;
+        let rows = stmt.query_map([user_id], |r| r.get::<_, String>(0))
+            .map_err(|_| "invitation storage unavailable")?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|_| "invitation storage unavailable")?
+    };
+    conn.execute(
+        "UPDATE user_invites SET revoked_at=?2 WHERE user_id=?1 AND used_at IS NULL AND revoked_at IS NULL",
+        params![user_id, now],
+    ).map_err(|_| "invitation storage unavailable")?;
+    for old_id in revoked {
+        audit(conn, created_by, "user_invite.revoked", user_id, &old_id)?;
+    }
+    let expires_at = now + INVITE_TTL_SECS;
+    conn.execute(
+        "INSERT INTO user_invites(id,user_id,token_sha256,created_by,created_at,expires_at)
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![id, user_id, token_sha256(&token), created_by, now, expires_at],
+    ).map_err(|_| "invitation storage unavailable")?;
+    audit(conn, created_by, "user_invite.created", user_id, &id)?;
+    Ok(IssuedUserInvite { id, user_id: user_id.to_owned(), email, token, expires_at })
+}
+
 impl UserDb {
     /// Issue and revoke older unused invitations in one write transaction.
     /// Re-read Admin authority and target eligibility under that same lock.
@@ -87,50 +131,12 @@ impl UserDb {
     }
 
     fn issue_user_invite_checked(&self, user_id: &str, created_by: &str, epoch: Option<u64>) -> Result<IssuedUserInvite, String> {
-        let mut bytes = [0u8; 32];
-        SystemRandom::new().fill(&mut bytes).map_err(|_| "invitation RNG unavailable")?;
-        let token = URL_SAFE_NO_PAD.encode(bytes);
-        let id = Uuid::new_v4().to_string();
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| "invitation storage unavailable")?;
-        let now = Utc::now().timestamp();
-        let admin: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND role='admin' AND status='active'
-             AND must_change_password=0 AND (?2 IS NULL OR credential_epoch=?2))",
-            params![created_by, epoch], |r| r.get(0),
-        ).map_err(|_| "invitation storage unavailable")?;
-        if !admin { return Err(INVITE_ADMIN_REQUIRED.to_owned()); }
-        let email: Option<String> = tx.query_row(
-            "SELECT email FROM users WHERE id=?1 AND status='active'
-             AND password_hash=''",
-            [user_id], |r| r.get(0),
-        ).optional().map_err(|_| "invitation storage unavailable")?;
-        let email = email.ok_or(INVITE_USER_INELIGIBLE)?;
-        let revoked = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM user_invites WHERE user_id=?1 AND used_at IS NULL AND revoked_at IS NULL",
-            ).map_err(|_| "invitation storage unavailable")?;
-            let rows = stmt.query_map([user_id], |r| r.get::<_, String>(0))
-                .map_err(|_| "invitation storage unavailable")?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|_| "invitation storage unavailable")?
-        };
-        tx.execute(
-            "UPDATE user_invites SET revoked_at=?2 WHERE user_id=?1 AND used_at IS NULL AND revoked_at IS NULL",
-            params![user_id, now],
-        ).map_err(|_| "invitation storage unavailable")?;
-        for old_id in revoked {
-            audit(&tx, created_by, "user_invite.revoked", user_id, &old_id)?;
-        }
-        let expires_at = now + INVITE_TTL_SECS;
-        tx.execute(
-            "INSERT INTO user_invites(id,user_id,token_sha256,created_by,created_at,expires_at)
-             VALUES(?1,?2,?3,?4,?5,?6)",
-            params![id, user_id, token_sha256(&token), created_by, now, expires_at],
-        ).map_err(|_| "invitation storage unavailable")?;
-        audit(&tx, created_by, "user_invite.created", user_id, &id)?;
+        let issued = issue_in_transaction(&tx, user_id, created_by, epoch)?;
         tx.commit().map_err(|_| "invitation storage unavailable")?;
-        Ok(IssuedUserInvite { id, user_id: user_id.to_owned(), email, token, expires_at })
+        Ok(issued)
     }
 
     /// Return an email only while this invitation can still be consumed.
@@ -186,6 +192,8 @@ impl UserDb {
         tx.execute("UPDATE users SET credential_epoch=1 WHERE id=?1 AND credential_epoch=0", [&user_id])
             .map_err(|_| "invitation storage unavailable")?;
         bump_acl_generation(&tx).map_err(|_| "invitation storage unavailable")?;
+        tx.execute("INSERT OR IGNORE INTO user_onboarding(user_id) VALUES(?1)", [&user_id])
+            .map_err(|_| "invitation storage unavailable")?;
         audit(&tx, &user_id, "user_invite.used", &user_id, &id)?;
         tx.commit().map_err(|_| "invitation storage unavailable")?;
         Ok(Some(user_id))

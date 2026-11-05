@@ -141,6 +141,8 @@ mod widgets_custom;
 mod departments_rpc;
 mod users_rpc;
 mod user_invites_rpc;
+mod members_rpc;
+mod onboarding_rpc;
 mod users_org;
 mod team_rpc;
 pub(crate) mod live_context;
@@ -542,7 +544,11 @@ impl MethodHandler {
 
         // Invitations are gateway-owned authentication methods. An extension
         // must never replace their Admin checks or inspect a returned link.
-        if let Some(role) = user_invites_rpc::minimum_role(method) {
+        // Reserved namespace fallbacks are Admin-only and stay in core dispatch,
+        // which rejects unknown methods before any extension can claim them.
+        if let Some(role) = user_invites_rpc::minimum_role(method)
+            .or_else(|| members_rpc::minimum_role(method))
+            .or_else(|| onboarding_rpc::minimum_role(method)) {
             if let Err(e) = acl::require_role(ctx, role) {
                 return WsFrame::error_response("", &e);
             }

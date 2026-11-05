@@ -269,10 +269,20 @@ async fn primary_agent_is_self_only_and_uses_live_bindings() {
     f.db.bind_agent(&other.id, "other-only", duduclaw_auth::AccessLevel::Owner).unwrap();
     let refused = f.handler.handle("users.set_primary_agent", json!({"agent_id": "other-only", "user_id": other.id}), &f.owner).await;
     assert!(matches!(refused, WsFrame::Response { ok: false, .. }));
+    let refused = f.handler.handle("users.set_primary_agent", json!({"agent_id": "chosen"}), &f.owner).await;
+    assert!(matches!(refused, WsFrame::Response { ok: false, .. }));
+    assert_eq!(f.db.primary_agent(&f.owner.user_id).unwrap(), None);
+    // The existing context must use the upgraded live binding, not a JWT snapshot.
+    f.db.bind_agent(&f.owner.user_id, "chosen", duduclaw_auth::AccessLevel::Operator).unwrap();
     ok_payload(&f.handler.handle("users.set_primary_agent", json!({"agent_id": "chosen", "user_id": other.id}), &f.owner).await);
     assert_eq!(f.db.primary_agent(&other.id).unwrap(), None);
     let me = ok_payload(&f.handler.handle("users.me", json!({}), &f.owner).await);
     assert_eq!(me["user"]["primary_agent_id"], "chosen");
+    f.db.bind_agent(&f.owner.user_id, "chosen", duduclaw_auth::AccessLevel::Viewer).unwrap();
+    let me = ok_payload(&f.handler.handle("users.me", json!({}), &f.owner).await);
+    assert_eq!(me["user"]["primary_agent_id"], "first");
+    let refused = f.handler.handle("users.set_primary_agent", json!({"agent_id": "chosen"}), &f.owner).await;
+    assert!(matches!(refused, WsFrame::Response { ok: false, .. }));
     f.db.unbind_agent(&f.owner.user_id, "chosen").unwrap();
     let me = ok_payload(&f.handler.handle("users.me", json!({}), &f.owner).await);
     assert_eq!(me["user"]["primary_agent_id"], "first");

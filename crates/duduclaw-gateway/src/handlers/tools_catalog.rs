@@ -9,6 +9,10 @@ impl MethodHandler {
             "",
             json!({
                 "tools": [
+                    { "name": "users.create_members", "description": "Atomically create each teammate with AI staff bindings and an optional invitation (Admin only)" },
+                    { "name": "invitation.get", "description": "Read localized invitation email content (Admin only)" },
+                    { "name": "invitation.update", "description": "Update localized invitation email content (Admin only)" },
+                    { "name": "invitation.preview", "description": "Preview escaped invitation email without issuing a token (Admin only)" },
                     { "name": "users.invite", "description": "Issue and deliver a one-time teammate invitation (Admin only)" },
                     { "name": "users.invite_status", "description": "List per-user invitation states without links or tokens (Admin only)" },
                     { "name": "agents.list", "description": "List all registered agents" },
