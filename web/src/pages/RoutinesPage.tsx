@@ -5,6 +5,9 @@ import { api } from '@/lib/api';
 import { client } from '@/lib/ws-client';
 import { debounceTrailing } from '@/lib/debounce';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAuthStore } from '@/stores/auth-store';
+import { ScheduledAssignmentsSection } from '@/components/tasks/ScheduledAssignmentsSection';
+import { AutomationReminders } from '@/components/tasks/AutomationReminders';
 import { useAgentsStore } from '@/stores/agents-store';
 import { toast } from '@/lib/toast';
 import { runStatusText } from '@/components/workflow/workflow-text';
@@ -53,6 +56,10 @@ interface Routine {
   schedule?: string;
   task?: string;
   enabled: boolean;
+  can_manage?: boolean;
+  can_edit?: boolean;
+  can_resume?: boolean;
+  can_run?: boolean;
   last_run_at?: string | null;
   last_status?: string | null;
 }
@@ -76,6 +83,9 @@ function AgentSelect({ value, onChange }: { value: string; onChange: (v: string)
   useEffect(() => {
     fetchAgents();
   }, [fetchAgents]);
+  const { user, bindings } = useAuthStore();
+  const selectable = !user || user.role === 'admin' ? agents : agents.filter((a) =>
+    bindings.some((b) => b.agent_name === a.name && b.access_level !== 'viewer'));
   const current = agents.find((a) => a.name === value);
   const label = current
     ? `${glyphText(current.icon)} ${current.display_name || current.name}`
@@ -91,7 +101,7 @@ function AgentSelect({ value, onChange }: { value: string; onChange: (v: string)
         {value && !agents.some((a) => a.name === value) && (
           <SelectItem value={value}>{value}</SelectItem>
         )}
-        {agents.map((a) => (
+        {selectable.map((a) => (
           <SelectItem key={a.name} value={a.name}>
             {glyphText(a.icon) + ' ' + (a.display_name || a.name)}
           </SelectItem>
@@ -104,8 +114,8 @@ function AgentSelect({ value, onChange }: { value: string; onChange: (v: string)
 /**
  * Create / edit dialog for a routine (MDS Dialog). `task === null` ⇒ create mode
  * (`cron.add`); otherwise edit mode (`cron.update`). Reuses the same
- * `ScheduleBuilder` so the schedule UX is unchanged — same `cron.*` RPCs, no
- * backend change.
+ * `ScheduleBuilder` so the schedule UX is unchanged — same `cron.*` RPCs with server-side
+ * record authorization.
  */
 function RoutineFormDialog({
   task,
@@ -119,6 +129,7 @@ function RoutineFormDialog({
   const intl = useIntl();
   const errorText = useErrorMessage();
   const isEdit = !!task;
+  const employee = useAuthStore((s) => !!s.user && s.user.role !== 'admin');
   const [name, setName] = useState(task?.name ?? '');
   const [schedule, setSchedule] = useState(task?.schedule ?? task?.cron ?? '0 * * * *');
   const [agent, setAgent] = useState(task?.agent_id ?? '');
@@ -145,7 +156,7 @@ function RoutineFormDialog({
     setBody(t.prompt);
   };
 
-  const canSave = !!schedule.trim() && (isEdit || !!name.trim());
+  const canSave = !!schedule.trim() && (isEdit || !!name.trim()) && (!employee || !!agent.trim());
 
   const handleSave = async () => {
     if (!canSave) return;
@@ -229,7 +240,7 @@ function RoutineFormDialog({
             <label className="text-xs font-medium text-muted-foreground">
               {intl.formatMessage({ id: 'settings.cron.agentPick' })}
             </label>
-            <AgentSelect value={agent} onChange={setAgent} />
+            {employee && isEdit ? <p className="text-sm">{agent}</p> : <AgentSelect value={agent} onChange={setAgent} />}
           </div>
 
           <div className="space-y-1.5">
@@ -301,7 +312,7 @@ function RoutineRow({
       <ListGridCell className="justify-center" data-stop-row-nav>
         <Switch
           checked={routine.enabled}
-          disabled={busy}
+          disabled={busy || routine.can_manage === false || (!routine.enabled && routine.can_resume === false)}
           onCheckedChange={onToggle}
           aria-label={intl.formatMessage({
             id: routine.enabled ? 'routines.pause' : 'routines.resume',
@@ -314,7 +325,7 @@ function RoutineRow({
         </span>
       </ListGridCell>
       <ListGridCell className="justify-end">
-        <DropdownMenu>
+        {routine.can_manage !== false && <DropdownMenu>
           <DropdownMenuTrigger
             render={
               <Button
@@ -328,15 +339,15 @@ function RoutineRow({
             <MoreHorizontal />
           </DropdownMenuTrigger>
           <DropdownMenuContent>
-            <DropdownMenuItem onClick={onRunNow} disabled={busy}>
+            <DropdownMenuItem onClick={onRunNow} disabled={busy || routine.can_run === false}>
               <FlaskConical />
               {intl.formatMessage({ id: 'routines.runNow' })}
             </DropdownMenuItem>
-            <DropdownMenuItem onClick={onEdit} disabled={busy}>
+            <DropdownMenuItem onClick={onEdit} disabled={busy || routine.can_edit === false}>
               <Pencil />
               {intl.formatMessage({ id: 'routines.edit' })}
             </DropdownMenuItem>
-            <DropdownMenuItem onClick={onToggle} disabled={busy}>
+            <DropdownMenuItem onClick={onToggle} disabled={busy || (!routine.enabled && routine.can_resume === false)}>
               {routine.enabled ? <Pause /> : <Play />}
               {intl.formatMessage({ id: routine.enabled ? 'routines.pause' : 'routines.resume' })}
             </DropdownMenuItem>
@@ -345,7 +356,7 @@ function RoutineRow({
               {intl.formatMessage({ id: 'routines.remove' })}
             </DropdownMenuItem>
           </DropdownMenuContent>
-        </DropdownMenu>
+        </DropdownMenu>}
       </ListGridCell>
     </ListGridRow>
   );
@@ -355,13 +366,23 @@ function RoutineRow({
  * RoutinesPage (`/routines`, Zone B) — the single "例行工作" home (MDS surface).
  * A CollectionPageHeader + a Linear-style ListGrid of scheduled tasks with an
  * enable Switch and a kebab (edit / pause / delete). Create/edit is an MDS
- * Dialog reusing the same `ScheduleBuilder`. Same `cron.*` RPCs throughout — no
- * backend change. The Calm-Glass primitives are gone.
+ * Dialog reusing the same `ScheduleBuilder`. The same `cron.*` RPCs enforce
+ * server-side record authorization.
  */
 export function RoutinesPage() {
+  const { user, bindings } = useAuthStore();
+  const accessKey = JSON.stringify([user?.id, user?.role,
+    bindings.map((b) => [b.agent_name, b.access_level]).sort()]);
+  return <RoutinesContent key={accessKey} />;
+}
+
+function RoutinesContent() {
   const intl = useIntl();
   const errorText = useErrorMessage();
   const connectionState = useConnectionStore((s) => s.state);
+  const { user, bindings } = useAuthStore();
+  const isAdmin = !user || user.role === 'admin';
+  const canCreate = isAdmin || bindings.some((b) => b.access_level !== 'viewer');
   const [routines, setRoutines] = useState<Routine[]>([]);
   const [loading, setLoading] = useState(true);
   // A failed load must not read as "you have no routines" — that misleads the
@@ -482,12 +503,12 @@ export function RoutinesPage() {
         title={intl.formatMessage({ id: 'routines.title' })}
         count={routines.length || undefined}
         description={intl.formatMessage({ id: 'routines.subtitle' })}
-        action={
+        action={canCreate ? (
           <Button variant="brand" size="sm" onClick={() => setDialog(null)}>
             <Plus />
             <span className="hidden sm:inline">{intl.formatMessage({ id: 'routines.add' })}</span>
           </Button>
-        }
+        ) : undefined}
       />
 
       {dialog !== undefined && (
@@ -516,12 +537,12 @@ export function RoutinesPage() {
             icon={Clock}
             title={intl.formatMessage({ id: 'routines.empty' })}
             description={intl.formatMessage({ id: 'routines.emptyHint' })}
-            action={
+            action={canCreate ? (
               <Button variant="brand" size="sm" onClick={() => setDialog(null)}>
                 <Plus />
                 {intl.formatMessage({ id: 'routines.add' })}
               </Button>
-            }
+            ) : undefined}
           />
         ) : (
           <div className="overflow-hidden rounded-xl border border-surface-border">
@@ -561,6 +582,11 @@ export function RoutinesPage() {
             </ListGridContainer>
           </div>
         )}
+      </div>
+
+      <div className="space-y-6 px-4 pb-6 md:px-6">
+        <ScheduledAssignmentsSection enabled={connectionState === 'authenticated'} isAdmin={isAdmin} accessible />
+        <AutomationReminders enabled={connectionState === 'authenticated'} />
       </div>
 
       {toRemove && (

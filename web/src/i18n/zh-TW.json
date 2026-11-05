@@ -9785,5 +9785,13 @@
   "meeting.state.cancelled": "已取消",
   "meeting.sizeError": "請選擇未超過大小上限的非空錄音或影片。",
   "meeting.requestFailed": "目前無法完成，請稍後再試；已上傳的部分會保留。",
-  "meeting.fileChanged": "檔案內容與先前上傳的版本不同，請使用原始檔案或更名後重新上傳。"
+  "meeting.fileChanged": "檔案內容與先前上傳的版本不同，請使用原始檔案或更名後重新上傳。",
+  "nav.automations": "自動化",
+  "nav.automations.desc": "管理自己的排程與提醒",
+  "routines.reminders": "提醒",
+  "routines.remindersEmpty": "目前沒有提醒",
+  "routines.cancelReminder": "取消提醒",
+  "routines.reminderCancelFailed": "無法取消提醒，請重新整理後再試。",
+  "assign.skill.runnerMultiple": "送出後，系統會選擇能執行全部所選技能的 AI 員工。",
+  "assign.skill.error.noCommonRunner": "目前沒有你可交辦的 AI 員工能執行全部所選技能，請分開交辦或調整選擇。"
 }

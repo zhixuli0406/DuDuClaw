@@ -9785,5 +9785,13 @@
   "meeting.state.cancelled": "Cancelled",
   "meeting.sizeError": "Choose a non-empty recording within the file size limit.",
   "meeting.requestFailed": "Unable to complete the request. Try again shortly; uploaded parts are retained.",
-  "meeting.fileChanged": "This file differs from the earlier upload. Select the original file, or rename it to start a new upload."
+  "meeting.fileChanged": "This file differs from the earlier upload. Select the original file, or rename it to start a new upload.",
+  "nav.automations": "Automations",
+  "nav.automations.desc": "Manage your schedules and reminders",
+  "routines.reminders": "Reminders",
+  "routines.remindersEmpty": "No reminders yet",
+  "routines.cancelReminder": "Cancel reminder",
+  "routines.reminderCancelFailed": "Could not cancel the reminder. Refresh and try again.",
+  "assign.skill.runnerMultiple": "After you submit, an AI employee who can run all selected skills will be chosen.",
+  "assign.skill.error.noCommonRunner": "No AI employee you can assign to can run all selected skills. Assign them separately or change your selection."
 }

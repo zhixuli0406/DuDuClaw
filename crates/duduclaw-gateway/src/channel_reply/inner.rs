@@ -948,6 +948,11 @@ pub(super) async fn build_reply_with_session_inner(
     };
     if let Some(id) = user_message_id {
         crate::credential_ledger::bind_message(&ctx.home_dir, &credential_source, session_id, id);
+        if let Ok(user) = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone) {
+            if !crate::webchat::is_widget_visitor(&user) {
+                crate::recent_skills::record_chat(&ctx.home_dir, &ctx.registry, &user, &agent_id, text).await;
+            }
+        }
     }
     // P2-B: the turn's memory sources are the stored rows' ids (host-made,
     // never from the model). A message that could not be saved has none.

@@ -172,7 +172,6 @@ function AppShell() {
             </RouteErrorBoundary>
           </div>
         </div>
-        {employee && status?.version && <p className="shrink-0 px-4 pb-16 text-right font-mono text-[10px] text-muted-foreground md:pb-2">v{status.version}</p>}
       </SidebarInset>
 
       {/* Right column — mounts only when a page supplies panel content. */}

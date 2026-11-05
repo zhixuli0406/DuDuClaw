@@ -9785,5 +9785,13 @@
   "meeting.state.cancelled": "取り消しました",
   "meeting.sizeError": "上限以内の空でない録音や動画を選んでください。",
   "meeting.requestFailed": "処理を完了できませんでした。しばらくして再試行してください。送信済みの部分は保持されます。",
-  "meeting.fileChanged": "以前アップロードしたファイルと内容が異なります。元のファイルを選ぶか、名前を変更して新しく送信してください。"
+  "meeting.fileChanged": "以前アップロードしたファイルと内容が異なります。元のファイルを選ぶか、名前を変更して新しく送信してください。",
+  "nav.automations": "自動化",
+  "nav.automations.desc": "自分の予約とリマインダーを管理",
+  "routines.reminders": "リマインダー",
+  "routines.remindersEmpty": "リマインダーはありません",
+  "routines.cancelReminder": "リマインダーをキャンセル",
+  "routines.reminderCancelFailed": "キャンセルできませんでした。再読み込みしてお試しください。",
+  "assign.skill.runnerMultiple": "送信後、選択したすべてのスキルを実行できる AI スタッフが選ばれます。",
+  "assign.skill.error.noCommonRunner": "選択したすべてのスキルを実行できる、依頼可能な AI スタッフがいません。別々に依頼するか、選択を変更してください。"
 }

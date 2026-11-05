@@ -44,6 +44,9 @@ pub(crate) async fn handle_schedule_task_for_actor(
 
     // Validate cron expression before persisting — through the shared
     // normaliser so validation reads day-of-week exactly like the scheduler.
+    if cron.len() > duduclaw_gateway::cron_store::MAX_CRON_BYTES {
+        return tool_error("Automation schedule exceeds 256 bytes");
+    }
     let normalised_cron = duduclaw_core::cron_tz::normalise_cron(cron);
     if normalised_cron.parse::<cron::Schedule>().is_err() {
         return serde_json::json!({
@@ -121,6 +124,8 @@ pub(crate) async fn handle_schedule_task_for_actor(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .or_else(|| {
+            // Human-origin rows share the store's UTC cadence contract.
+            if principal.is_some() { return Some("UTC".into()); }
             let detected = detect_local_timezone();
             if let Some(ref tz) = detected {
                 tracing::info!(detected_tz = %tz, "cron schedule: auto-detected local timezone (no cron_timezone param supplied)");
@@ -502,6 +507,9 @@ pub(crate) async fn handle_update_cron_task(
 
     // Validate cron expression if changed — same shared normaliser as the
     // scheduler and creation path.
+    if new_cron.len() > duduclaw_gateway::cron_store::MAX_CRON_BYTES {
+        return tool_error("Automation schedule exceeds 256 bytes");
+    }
     if new_cron != existing.cron {
         let normalised = duduclaw_core::cron_tz::normalise_cron(new_cron);
         if normalised.parse::<cron::Schedule>().is_err() {

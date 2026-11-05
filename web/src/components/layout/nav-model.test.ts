@@ -284,19 +284,19 @@ describe('self-service account navigation', () => {
 describe('enterprise employee navigation', () => {
   it('shows exactly the daily employee destinations in the agreed order', () => {
     expect(employeeNavItems().map((item) => item.to)).toEqual([
-      '/', '/inbox', '/skills', '/memory', '/world',
+      '/', '/inbox', '/routines', '/skills', '/memory', '/world', '/org',
     ]);
     expect(employeeNavItems(false)).toEqual(employeeNavItems());
-    expect(employeeNavItems().every((item) => item.newIn === undefined)).toBe(true);
+    expect(employeeNavItems().filter(item => item.newIn).map(item => [item.to, item.newIn])).toEqual([['/routines', '1.80.0'], ['/org', '1.80.0']]);
     expect(employeeNavItems().find((item) => item.to === '/inbox')?.badge).toBe('inbox');
   });
 
   it('keeps task rows hidden when enabled, retaining responsibility and foresight gates', () => {
     expect(employeeNavItems(true).map((item) => item.to)).toEqual([
-      '/', '/inbox', '/skills', '/memory', '/world', '/responsibilities',
+      '/', '/inbox', '/routines', '/skills', '/memory', '/world', '/org', '/responsibilities',
     ]);
-    expect(employeeNavItems(true).some((item) => item.to === '/routines' || item.to === '/org')).toBe(false);
-    expect(employeeNavItems(true).every((item) => item.newIn === undefined)).toBe(true);
+    expect(employeeNavItems(true).filter(item => ['/routines', '/org'].includes(item.to))).toHaveLength(2);
+    expect(employeeNavItems(true).filter(item => item.newIn).every(item => item.newIn === '1.80.0')).toBe(true);
   });
 
   it('applies only to employees outside the Personal edition', () => {

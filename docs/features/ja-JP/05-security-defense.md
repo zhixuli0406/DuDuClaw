@@ -458,3 +458,30 @@ Read ガードは `<home>/secrets` への読み取りを拒否します。これ
 `computer_login` はラベルのみを受け取ります。Gateway は検証済みのスタッフを空でない `allowed_agents` リストと照合し、独立したツール名でツールとセッションのゲートを適用します。既存のナビゲーション検査で保存済みのログイン URL を最初に開きます。秘密は stdin でコンテナのヘルパーへ送り、コマンドライン引数やモデルへの結果には含めません。入力前に正確なオリジンとログインパスの一致が必要です。`allowed_paths` はヘルパーの最初の送信後に到達し、パスワード欄が表示された二段階目にのみ使えます。入力前、同期 input/change イベント後、submit ハンドラー後に有効な送信方法が POST であることを確認します。ネイティブの `requestSubmit` と代替経路の両方で、選択した送信ボタンの `formmethod` を検査します。ネットワーク側でもデコードしたクエリ値が完全なユーザー名またはパスワードと一致する非 POST リクエストを拒否します。CDP Fetch は別オリジンへのリクエストとリダイレクトをすべて中止し、処理中はサービスワーカーも迂回します。インターセプトを解除する前に、ヘルパーは `Network.requestWillBeSent`、`Network.loadingFinished`、`Network.loadingFailed` を追跡し、リクエストの終了を確認します。最大 3 秒待機し、保留リクエストも新しい活動もないコマンド往復が 2 回連続することを要求します。完了を確認できない場合は `failed_uncleared` とし、Fetch の制限を維持したまま `Browser.close` を呼び出して、その後 Gateway がセッションとコンテナを削除します。スクリーンショットを抑止し、消去を確認できない場合はセッションとコンテナを停止・削除して、新しいセッションを要求します。
 
 同一オリジンの JavaScript による入力済みフィールドの読み取りは防げません。また、gateway と同じ OS ユーザー権限を持つプロセスからのファイル隔離を提供するものでも、ネットワーク許可リストの代わりでもありません。対象は保存した HTTPS オリジンと許可されたログインパスのみで、localhost も HTTPS が必要です。二要素認証や CAPTCHA は既存の引き継ぎ機能で人が処理します。`duduclaw-fill-login` の追加には Computer Use イメージの再ビルドが必要です。結果の意味と設定は[ブラウザ自動化](08-browser-automation.md)を参照してください。
+
+## 一般従業員の自動化と最近のスキルの権限（v1.80.0）
+
+Dashboard RPC の最低ロールは `handlers/dashboard_scope.rs` が extension dispatch より前に確認します。MCP scope 表とは別です。この画面のメソッドを明示登録し、未登録の `cron.*`、`reminders.*`、`assign_schedules.*`、`agents.org_chart.*`、`skills.recent.*` は Admin を要求します。他の既存 namespace は従来の検査を維持します。レコード単位の Viewer／Operator と作成者の検査も維持し、アカウント状態と直接の紐付けは要求ごとに更新します。読み取れない場合は拒否します。
+
+| Dashboard RPC | 範囲 |
+| --- | --- |
+| `agents.org_chart` | Admin は表示可能な全スタッフ。他のアカウントは直接 Viewer 以上で紐付いたスタッフと users.db の本人の部署のみ。範囲外の reports_to 祖先は name と role のみ。非表示スタッフは除外し、操作権限は付与しません。 |
+| `skills.recent` | 現在のアカウントのみ。現在呼び出せて有効なスキルを既存のチェックで絞り込み、重複なしで最大5件。他人のユーザー指定は受け付けません。 |
+| `cron.list` | Admin は全件。他のアカウントは自分が作成した記録か、直接 Viewer 以上で紐付いたスタッフの記録のみ。 |
+| `cron.add`、`cron.update`、`cron.resume`、`cron.run_now` | Admin 以外は時刻指定のプロンプト予約のみ。対象の直接 Operator 権限と既存の主エージェント、機械スタッフ、実行主体の確認が必要です。 |
+| `cron.pause`、`cron.remove` | 作成者か直接 Operator。ワークフローに紐付く記録は保護されます。 |
+| `cron.templates` | ログイン済みアカウントが組み込みテンプレートを閲覧できます。 |
+| `reminders.list`、`reminders.cancel` | 自分のリマインダーか直接紐付いた対象。Viewer は閲覧、Operator はキャンセルできます。通知先の指定や作成 API は公開しません。 |
+| `assign_schedules.list`（`scope: accessible`）、`assign_schedules.pause`、`assign_schedules.resume`、`assign_schedules.remove` | 作成者か直接紐付いた対象。閲覧は Viewer、変更は Operator。再開時は元の作成者も再確認します。 |
+
+最近のスキルにはアカウント、対象スタッフ、スキル名だけを1アカウント最大100件保存し、メッセージやスキル本文は保存しません。送信の受理後に記録し、チップの選択だけでは記録しません。実行成功を保証する履歴ではありません。組織図の表示は会話や設定へのアクセスを広げません。従業員の自動化編集では shell コマンド、条件スクリプト、任意の通知先、ワークフロー管理を許可しません。作成者を確認できない既存記録には直接の紐付けでのみアクセスできます。
+
+Cron admission は `on_behalf_of`、`created_by_user_id`、`scoped_by_user_id` を持つ全記録の共通 store 制約です。MCP の追加・更新・再開も同じ `BEGIN IMMEDIATE` トランザクションで検査・保存します。有効な予定は帰属する利用者ごとに 20 件、AI スタッフごとに 50 件（既存 Admin 予定を含む）までで、Dashboard と MCP を合算します。作成・新たな引き受けは利用者ごとに直近一時間 20 件まで。記録は削除・再起動後も残り、通常の編集では再加算しません。単純な停止・削除は可能です。由来マーカーのない Admin 予定は従来どおりですが、人間の由来を持つ MCP 記録は Admin の場合も制限されます。最短間隔は 15 分で、日付条件にかかわらず連続日とみなし、深夜をまたぐ間隔も検査します。Scheduler の読み込み時と実行直前にも不適合の記録をスキップし、件数だけをログに記録します。
+
+従業員の `cron.run_now` は spawn 前に判定します。直近 10 分間で予定ごとに 3 回、利用者ごとに 10 回、未完了は利用者ごとに 2 件、全体で 4 件までです。Semaphore の空きがなければ busy を返し、待機 task は作りません。拒否は回数を消費せず、受理後の失敗は回数に含めます。完了・キャンセル・panic で未完了枠を解放します。状態は容量制限のあるプロセスメモリーに保存され、再起動でリセットされます。ロック異常時は拒否します。従業員の cron 式は正規化・解析前に 256 bytes に制限し、store と runtime の検査にも適用します。
+
+非 Admin の追加・更新は結果の name＋task のモデルプロンプト全文にチャットと同じ `scan_input_with_audit` を適用し、拒否時は保存せず `security_audit.jsonl` に記録します。再開・手動実行でも既存 task を検査し、agent_id の変更は禁止です。H2 は host 実行対象を制限する方式です。追加、編集、再開、手動実行には既存の代理と `[container] sandbox_enabled = false` が必要で、registry とディスク上の有効な型付き設定を検査します。設定を読めない場合は拒否します。保存された `created_by_user_id`／`scoped_by_user_id` と手動呼び出し元により実行直前にも再検査し、サンドボックス有効化や対象不明時は停止して skipped を記録します。既存 host runner の runtime、capabilities、native sandbox 設定は維持します。コンテナ内 cron は今回実装せず、社員マーカーのない既存 Admin 予定は従来どおり host で実行します。設定の読み取りからプロセス起動までを覆う原子的なロックはありません。
+
+社員 cron は UTC のみ（ゼロ時差の UTC／GMT 別名も可）です。DST による実時間の間隔短縮を避けるため、他のタイムゾーンを使う既存予定の編集・再開・手動実行は拒否します。閲覧と権限に基づく停止・削除は可能で、タイムゾーン付き予定は Admin が管理します。
+
+人間由来の MCP 予定は UTC が既定で、由来マーカーのない Admin／バックグラウンド予定はローカル時間帯の検出を維持します。

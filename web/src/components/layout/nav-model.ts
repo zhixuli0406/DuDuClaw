@@ -477,15 +477,18 @@ export function isEmployeeSidebar(role: UserRole | undefined, isPersonal: boolea
   return role === 'employee' && !isPersonal;
 }
 
-/** Existing pages, reordered for employees without advertising them as new features. */
+/** Employee destinations; only newly available pages carry the release badge. */
 export function employeeNavItems(employeeTasks = false): NavItem[] {
   const items = [
     ...pickItems(['/']),
     inboxEntry,
+    { to: '/routines', icon: CalendarClock, label: 'nav.automations', desc: 'nav.automations.desc', ownScope: true, newIn: '1.80.0' },
     ...pickItems(['/skills', '/memory', '/world']),
+    { to: '/org', icon: Users2, label: 'nav.org', desc: 'nav.org.desc', ownScope: true, newIn: '1.80.0' },
     ...(employeeTasks ? pickItems(['/tasks', '/goals', '/responsibilities', '/foresight']) : []),
   ];
   return filterVisible(items, 'employee', false).map((item) => {
+    if (item.newIn === '1.80.0') return item;
     const { newIn: _newIn, ...existingPage } = item;
     return existingPage;
   });

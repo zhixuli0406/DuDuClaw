@@ -328,3 +328,17 @@ it('does not use the hidden task board as the Personal advanced-group shortcut',
   fireEvent.click(screen.getByRole('button', { name: 'Advanced' }));
   expect(screen.getByTestId('location-probe')).toHaveTextContent('/plans');
 });
+
+it.each([
+  ['Automations', '/routines'],
+  ['Org Chart', '/org'],
+])('lets an employee find %s through search', async (label, route) => {
+  useAuthStore.setState({ user: { id: 'employee', display_name: 'Reader', role: 'employee' }, bindings: [] } as never);
+  useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
+  renderPalette();
+  fireEvent.change(screen.getByPlaceholderText(/Paste an ID/i), { target: { value: label } });
+  const options = await screen.findAllByRole('option', { name: new RegExp(label) });
+  expect(options).toHaveLength(1);
+  fireEvent.click(options[0]);
+  expect(screen.getByTestId('location-probe')).toHaveTextContent(route);
+});

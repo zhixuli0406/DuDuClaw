@@ -267,7 +267,7 @@ export function App() {
               <Route path="canvas" element={<CanvasPage />} />
               <Route path="files" element={<FilesPage />} />
               {/* cron.* is admin-only, including read operations. */}
-              <Route element={<RoleGuard minRole="admin" />}><Route path="routines" element={<RoutinesPage />} /></Route>
+              <Route path="routines" element={<RoutinesPage />} />
 
               {/* ── 員工 / 公司 ── */}
               <Route path="agents" element={<AgentsPage />} />
@@ -349,12 +349,13 @@ export function App() {
                 <Route path="my/history-views" element={<MyHistoryViewsPage />} />
               </Route>
 
+              <Route path="org" element={<OrgChartPage />} />
+
               {/* manager+ routes (Zone B/C) */}
               <Route element={<RoleGuard minRole="manager" />}>
                 <Route path="forks" element={<ForkPage />} />
                 <Route path="timeline" element={<TimelinePage />} />
                 <Route path="reports" element={<ReportPage />} />
-                <Route path="org" element={<OrgChartPage />} />
                 {/* 我的團隊 (1.76.0) — `users.my_team` is `require_manager!`
                     and, as a `users.*` method, Enterprise-only server-side;
                     both are mirrored here. */}

@@ -66,7 +66,7 @@ export function AboutPage() {
       {/* Server-provided distributor information, independent of license tier;
           sanitized server-side and sandboxed here. */}
       {typeof about?.distributor_notice === 'string' && about.distributor_notice.length > 0 && (
-        <DistributorNoticeCard html={about.distributor_notice} />
+        <div id="distributor-support"><DistributorNoticeCard html={about.distributor_notice} /></div>
       )}
 
       {/* Lower — fixed upstream-vendor block (never overwritable) */}
