@@ -7,6 +7,11 @@ LC_ALL=C
 export LC_ALL
 umask 077
 trust_fail() {
+    if [ "${trust_context:-source}" = updater ]; then
+        echo "Unsafe protected updater: $*" >&2
+        echo 'Repair the protected update installation as root before enabling automatic updates.' >&2
+        exit 1
+    fi
     echo "Unsafe installer source: $*" >&2
     echo 'As root, copy the reviewed directory to /root/duduclaw-auto-upgrade with cp -r --no-preserve=ownership (or install), chown -R root:root that copy, and chmod -R go-w that copy; then verify it against the pinned commit before running it.' >&2
     exit 1
@@ -25,6 +30,33 @@ trusted() {
     esac
     case "$mode" in ''|*[!0-7]*) trust_fail "invalid mode: $1" ;; esac
     [ "$((0$mode & 022))" -eq 0 ] || trust_fail "group/other writable: $1"
+}
+check_updater() {
+    # Walk the lexical path so no writable/symlink ancestor can replace the
+    # frozen launcher. Merely finding an old protected gateway is insufficient.
+    trust_context=updater
+    launcher=/usr/libexec/duduclaw-updated-launch
+    trusted "$launcher" file
+    [ -x "$launcher" ] || trust_fail "launcher is not executable: $launcher"
+    [ "$(stat -c '%h' -- "$launcher")" = 1 ] || trust_fail 'launcher must have exactly one link'
+    ancestor=$(dirname -- "$launcher")
+    while :; do
+        trusted "$ancestor" directory
+        [ "$ancestor" != / ] || break
+        ancestor=$(dirname -- "$ancestor")
+    done
+    trust_context=source
+    check_updater_active
+}
+check_updater_active() {
+    state=$(systemctl show -p ActiveState --value duduclaw-updated.service) || {
+        echo 'Cannot read protected updater service state; automatic updates were not enabled.' >&2
+        exit 1
+    }
+    [ "$state" = active ] || {
+        echo 'Protected updater service must be active before enabling automatic updates.' >&2
+        exit 1
+    }
 }
 check_source() {
     source_path=$1
@@ -75,6 +107,7 @@ esac
 # Reject the lexical directory link before canonicalizing and checking ancestors.
 [ ! -L "$0" ] || trust_fail "symlink installer: $0"
 check_source "$(dirname -- "$0")"
+check_updater
 # Trusted ancestors prevent unprivileged replacement during snapshot creation.
 # Install only the private snapshot, never reopen source files after validation.
 trusted /run directory
@@ -95,4 +128,5 @@ for unit in duduclaw-auto-upgrade.service duduclaw-auto-upgrade.timer; do
     install -o root -g root -m 0644 "$stage/$unit" "/etc/systemd/system/$unit"
 done
 systemctl daemon-reload
+check_updater_active
 systemctl enable --now duduclaw-auto-upgrade.timer

@@ -30,4 +30,6 @@ sh -n scripts/linux-protected/auto-upgrade/install.sh
 python3 -m unittest discover -s scripts/tests -p 'test_protected_auto_upgrade.py' -v
 ```
 
-測試只改寫暫存副本並模擬 root 與更新程式，不連線、不安裝。沒有 `systemd-analyze` 時，unit 驗證明確跳過，仍需 Linux 實機驗收。完整狀態見[繁體中文指南](../../../docs/guides/zh-TW/linux-protected-service.md#自動升級僅供開發)。
+測試只改寫暫存副本並模擬 root 與更新程式，不連線、不安裝。沒有 `systemd-analyze` 時，unit 驗證明確跳過，仍需 Linux 實機驗收。完整狀態見[繁體中文指南](../../../docs/guides/zh-TW/linux-protected-service.md#每晚自動更新)。
+
+安裝器在寫入前確認凍結更新啟動器是 root:root、不可由其他帳號修改的單一連結可執行檔，並逐層檢查其祖先；寫入前與啟用 timer 前均要求更新服務狀態精確為 `active`。這是排程的安裝前提，不是完整隔離或更新成功的證據；安裝器不會為了檢查而送出更新要求。

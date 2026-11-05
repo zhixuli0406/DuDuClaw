@@ -88,7 +88,7 @@ jobs:
 
       - name: Build binary (cross-compile — skip desktop feature, Wayland unavailable in cross)
         if: runner.os == 'Linux'
-        run: cross build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
+        run: python3 scripts/package-linux-release.py --target ${{ matrix.target }} --build-only
         env:
           PKG_CONFIG_ALLOW_CROSS: 1
 
@@ -96,12 +96,14 @@ jobs:
         if: matrix.target != 'aarch64-unknown-linux-gnu' && runner.os != 'Linux'
         run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-gateway/desktop,duduclaw-cli/dashboard
 
-      - name: Check Linux glibc baseline
+      - name: Package Linux binaries and check glibc baseline
         if: runner.os == 'Linux'
-        run: python3 scripts/check_glibc.py target/${{ matrix.target }}/release/duduclaw
+        # Offline isolation target keys are never CI secrets. This explicitly
+        # skips F metadata signing; the release operator signs it offline.
+        run: python3 scripts/package-linux-release.py --target ${{ matrix.target }} --skip-build --output-dir .
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
         run: |
           mkdir -p _pkg
           cp target/${{ matrix.target }}/release/duduclaw _pkg/

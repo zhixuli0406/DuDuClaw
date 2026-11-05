@@ -1,5 +1,6 @@
 //! Durable migration components. Host and product adapters must fail closed.
 pub mod archive;
+pub mod bootstrap_protocol;
 pub mod journal;
 pub mod confirmation;
 pub mod import_receiver;

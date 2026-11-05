@@ -53,12 +53,34 @@ ancestors. Destination parent directories must already exist. The signed install
 is responsible for constructing the plan from trusted installation metadata.
 
 `new-setup-token --plan ...` is root-terminal-only and restricted to
-`IsolationVerified`/`AwaitingAdministrator`. Its `RootBootstrapIssuer` adapter must
-call the fresh gateway's already open `UserDb::issue_setup_token(false)` and
-construct the link using the actual dashboard claim route. This worktree contains
-no dashboard setup-token claim route, so the bundled adapter refuses: no guessed
-URL is printed and root never opens gateway-owned SQLite/WAL files. Issuer wiring
-is still required before this command can create a token.
+`IsolationVerified`/`AwaitingAdministrator`. `GatewayBootstrapIssuer` connects to
+`.migration-bootstrap.sock` in the fixed fresh home, checks the socket's ownership
+and mode and authenticates the gateway UID/GID with `SO_PEERCRED`. The gateway only
+accepts root peers and the current completed import manifest's migration ID. It
+uses its already open `UserDb::issue_setup_token(false)`; root never opens the
+user database. The response is bounded and the secret is never logged.
+
+The real `/api/migration/setup` page receives the token in a URL fragment, removes
+it from browser history, and claims it through a same-origin, loopback-only JSON
+route. Token consumption, creating the first Admin and setting the chosen password
+share one transaction; recovery tokens, replay and a nonempty user table refuse.
+The gateway skips its ordinary default-admin and pending-account bootstrap for a
+root-authenticated completed import. The root coordinator persists
+`/etc/duduclaw/migration-import.json` before stopping the old installation and
+before publishing the matching `/run` copy. Losing `/run` at reboot retains this
+fence; missing or mismatching durable state refuses ordinary startup. This initial route requires the gateway to
+bind `127.0.0.1` or `0.0.0.0`; remote operators use an SSH tunnel to the printed
+loopback port. The static page has Traditional Chinese, English and Japanese text.
+This wiring does not replace the still-missing signed `MigrationPlatform`, and
+end-to-end migration and browser/native-socket acceptance remain unverified.
+
+The protected CLI installer/upgrade now routes a version crossing into 1.80 to
+G's transaction using the root-owned mode-0600 plan at
+`/var/lib/duduclaw-migrate/plan.json`, before any legacy install or updater request.
+A missing plan or platform refuses; it never copies old authority in place.
+The installer accepts only the protected v1.79.3 home and root-key locations.
+An `AwaitingAdministrator` checkpoint prints a newly issued link to the root
+terminal and returns without claiming migration completion.
 
 `status --plan ...` reports the persisted checkpoint. `export-records --plan ...
 --destination /root/new-recovery` writes authenticated, inert recovery JSONL into a

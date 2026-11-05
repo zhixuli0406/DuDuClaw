@@ -18,11 +18,10 @@ fn run() -> Result<(), duduclaw_migration::Error> {
         }
         Some("new-setup-token") if args.len() == 3 => {
             use std::io::IsTerminal;
-            use duduclaw_migration::root_host::bootstrap::UnavailableBootstrapIssuer;
+            use duduclaw_migration::root_host::bootstrap::GatewayBootstrapIssuer;
             if !std::io::stdout().is_terminal() { return Err(Error::Authentication); }
-            // A signed gateway bootstrap adapter must replace this unavailable
-            // implementation. Never open gateway/legacy SQLite here as root.
-            flow.new_setup_token(&mut UnavailableBootstrapIssuer)?.print_once()?;
+            // The live gateway owns its fresh user database and authenticates root.
+            flow.new_setup_token(&mut GatewayBootstrapIssuer)?.print_once()?;
         }
         Some("expire") if args.len() == 3 => {
             let now = u64::try_from(chrono::Utc::now().timestamp()).map_err(|_| Error::Invalid)?;

@@ -482,6 +482,25 @@ impl UserDb {
         email: &str,
         display_name: &str,
     ) -> Result<User, String> {
+        self.claim_setup_token_inner(token, email, display_name, None)
+    }
+
+    /// Migration bootstrap: create the FIRST administrator and set its chosen
+    /// password in the same token-consumption transaction. Recovery tokens are
+    /// never accepted by this entry point.
+    pub fn claim_first_admin_setup_token(
+        &self, token: &str, email: &str, display_name: &str, password: &str,
+    ) -> Result<User, String> {
+        let email = crate::db::validate_account_email(email).map_err(str::to_owned)?;
+        if password.chars().count() < 12 || password.len() > 1024 {
+            return Err("password must be 12 characters or longer and at most 1024 bytes".into());
+        }
+        self.claim_setup_token_inner(token, email, display_name, Some(password))
+    }
+
+    fn claim_setup_token_inner(
+        &self, token: &str, email: &str, display_name: &str, password: Option<&str>,
+    ) -> Result<User, String> {
         if token.is_empty() || token.len() > 256 || email.is_empty() || email.len() > 320
             || display_name.len() > 256 {
             return Err("invalid setup request".into());
@@ -524,7 +543,8 @@ impl UserDb {
         let (token_id, _, expires, recovery, _) = candidate.ok_or("setup token unavailable")?;
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
             .map_err(|_| "setup users unavailable")?;
-        if !recovery && count != 0 { return Err("first administrator already exists".into()); }
+        if password.is_some() && recovery { return Err("recovery token refused for first administrator".into()); }
+        if (!recovery || password.is_some()) && count != 0 { return Err("first administrator already exists".into()); }
         let changed = tx.execute("UPDATE setup_tokens SET consumed = 1
             WHERE id = ?1 AND consumed = 0 AND expires_at = ?2 AND expires_at > ?3",
             params![token_id, expires, Utc::now().to_rfc3339()])
@@ -532,10 +552,10 @@ impl UserDb {
         if changed != 1 { return Err("invalid or expired setup token".into()); }
         let id = Uuid::new_v4().to_string();
         let timestamp = now.to_rfc3339();
-        let password_hash = hash_password(&generate_password(32))?;
-        tx.execute("INSERT INTO users (id, email, display_name, password_hash, role, status, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, 'admin', 'active', ?5, ?5)",
-            params![id, email, display_name, password_hash, timestamp])
+        let password_hash = match password { Some(value) => hash_password(value)?, None => hash_password(&generate_password(32))? };
+        tx.execute("INSERT INTO users (id, email, display_name, password_hash, role, status, created_at, updated_at, bootstrap_owner)
+            VALUES (?1, ?2, ?3, ?4, 'admin', 'active', ?5, ?5, ?6)",
+            params![id, email, display_name, password_hash, timestamp, password.is_some()])
             .map_err(|_| "setup account creation failed")?;
         tx.execute("UPDATE setup_tokens SET consumed = 1", [])
             .map_err(|_| "setup revocation failed")?;
@@ -831,4 +851,17 @@ mod tests {
         assert!(db.issue_setup_token(false).unwrap().is_none());
         assert!(db.issue_setup_token(true).unwrap().is_some());
     }
+    #[test]
+    fn migration_first_admin_claim_sets_password_atomically_and_rejects_replay() {
+        let db = db();
+        let token = db.issue_setup_token(false).unwrap().unwrap();
+        assert!(db.claim_first_admin_setup_token(&token, "first@example.com", "First", "short").is_err());
+        let user = db.claim_first_admin_setup_token(&token, "first@example.com", "First", "new-password-123").unwrap();
+        assert_eq!(user.role, UserRole::Admin);
+        assert!(db.verify_password("first@example.com", "new-password-123").is_ok());
+        assert!(db.claim_first_admin_setup_token(&token, "second@example.com", "Second", "new-password-123").is_err());
+        let recovery = db.issue_setup_token(true).unwrap().unwrap();
+        assert!(db.claim_first_admin_setup_token(&recovery, "second@example.com", "Second", "new-password-123").is_err());
+    }
+
 }
