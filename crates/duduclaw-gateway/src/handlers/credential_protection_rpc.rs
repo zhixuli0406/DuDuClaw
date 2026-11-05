@@ -46,6 +46,7 @@ pub(crate) fn status_json(s: &ProtectionStatus) -> Value {
         "summary": s.summary_zh,
         "detail": s.detail_zh,
         "refusal_reason": s.refusal_reason,
+        "root_key_recovery": s.root_key_recovery,
     })
 }
 

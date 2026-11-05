@@ -208,6 +208,42 @@ describe('container credential protection', () => {
   });
 
   it.each([
+    ['en', en], ['zh-TW', zhTW], ['ja-JP', jaJP],
+  ] as const)('shows socket diagnostics and blocked recovery in %s', async (locale, messages) => {
+    const detail = '@/containerd-shim/<img src=x onerror=alert(1)> (peer uid=0, root)';
+    mockProtection(status({
+      backend: 'container_root_key', state: 'unavailable', refusal_reason: 'engine_socket_reachable',
+      root_key_recovery: {
+        latest_revocation: { reason: 'engine_socket_reachable', detail, timestamp: '2026-11-05T01:02:03Z' },
+        recovery: 'state_unavailable',
+      },
+    }));
+    renderWithProviders(
+      <IntlProvider locale={locale} messages={messages}><CredentialProtectionPanel /></IntlProvider>,
+    );
+    const diagnostics = await screen.findByTestId('credential-protection-recovery');
+    expect(diagnostics).toHaveTextContent(detail);
+    expect(diagnostics).toHaveTextContent('2026-11-05T01:02:03Z');
+    expect(diagnostics).toHaveTextContent(messages['security.credentialProtection.recovery.state_unavailable']);
+    expect(diagnostics.querySelector('img')).toBeNull();
+  });
+
+  it('does not describe persisted revocation history as a current outage', async () => {
+    mockProtection(status({
+      ...CONTAINER_READY,
+      root_key_recovery: {
+        latest_revocation: { reason: 'engine_socket_reachable', detail: '@/containerd-shim/example (root)', timestamp: '2026-11-05T01:02:03Z' },
+        recovery: 'waiting',
+      },
+    }));
+    renderWithProviders(<CredentialProtectionPanel />);
+    const diagnostics = await screen.findByTestId('credential-protection-recovery');
+    expect(diagnostics).toHaveTextContent(en['security.credentialProtection.recovery.history']);
+    expect(diagnostics).not.toHaveTextContent(en['security.credentialProtection.recovery.waiting']);
+    expect(screen.getByTestId('credential-protection-line')).toHaveTextContent('Separate key');
+  });
+
+  it.each([
     ['en', en],
     ['zh-TW', zhTW],
     ['ja-JP', jaJP],

@@ -518,6 +518,8 @@ says.
   typed confirmation) deletes the key; saved personal credentials stop
   working.
 
+For a [protected native Linux service](linux-protected-service.md#recover-after-an-engine-socket-exposure), the card also shows the latest root-key revocation, its UTC time and the exact engine socket finding. Personal accounts pause while that interface is exposed. Automatic recovery defaults on: three successful checks 60 seconds apart trigger a graceful restart and a fresh root key intake, limited to four recovery restarts per rolling hour. Storage errors block recovery. There is no dashboard toggle in this change; set `config.toml [credential_protection] auto_recover = false` to keep manual restart behavior.
+
 `duduclaw credentials status` (add `--json` for scripts) prints the same
 state from the terminal. Details: [Security defense](../features/05-security-defense.md#person-credentials-in-the-os-keychain-v1760).
 

@@ -65,6 +65,7 @@ fn print_status(status: &ProtectionStatus, json: bool) {
             "person_identity_allowed": status.person_identity_allowed,
             "summary": status.summary_zh,
             "detail": status.detail_zh,
+            "root_key_recovery": status.root_key_recovery,
         });
         println!("{value}");
         return;

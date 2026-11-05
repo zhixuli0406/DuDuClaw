@@ -15,6 +15,10 @@ fn service_protected_unit_has_fixed_root_launcher_and_hardening() {
     }
     assert!(!lines.iter().any(|line| line.split_once('=').is_some_and(|(key, _)| matches!(key, "User" | "Environment" | "EnvironmentFile"))));
     assert!(!lines.iter().any(|line| line.starts_with("RestrictNamespaces=")));
+    assert!(lines.contains(&format!("RestartForceExitStatus={}",
+        duduclaw_core::root_key::RECOVERY_RESTART_EXIT_CODE).as_str()));
+    assert!(!lines.iter().any(|line| line.starts_with("RestartPreventExitStatus=")
+        || line.starts_with("SuccessExitStatus=")));
     assert!(LAUNCHER_TEXT.starts_with("#!/bin/sh\n"));
 }
 

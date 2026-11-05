@@ -143,10 +143,25 @@ SystemCallArchitectures=native
 
 依 [systemd.exec](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html) 規則，每個 `-` 前綴會忽略不存在的路徑。這些設定隱藏常見引擎端點、隔離硬體裝置、禁止修改核心／模組／cgroup 與建立 set-ID 檔案，並限制執行模式及 syscall 架構。未設定 `RestrictNamespaces`，因為 gateway 的 Codex／bwrap 工作沙箱需要 user、mount、PID 與 network namespace。
 
-Gateway 在啟動時及每 60 秒重新檢查常見引擎 socket 的可達性與附加群組。定期檢查失敗時，會原位清零持有的金鑰、將保護狀態改為拒絕並記錄警告；個人連線在重新啟動前都無法使用。也會檢查 `/proc/net/unix` 的監聽中 abstract socket：名稱以 `/` 分段後，任一段完全等於 `docker`、`containerd`、`podman`、`buildkit`、`lxd`，或以這些名稱接 `.`、`-`、`_` 開頭，就會列為候選；不以任意子字串比對。 名稱命中本身不會造成拒絕：Gateway 會以短逾時的非阻塞連線取得 `SO_PEERCRED`，只有連得上且 peer uid 為 0 才視為風險。無法連線的候選與無關的格式錯誤行會略過。啟動時無法讀取 `/proc/net/unix` 仍拒絕接收金鑰；定期檢查遇到讀取失敗則記錄警告，僅保留這項探測先前的判定，路徑及群組檢查照常執行。
+Gateway 在啟動時及每 60 秒重新檢查常見引擎 socket 的可達性與附加群組。定期檢查失敗時，會原位清零持有的金鑰、將保護狀態改為拒絕並記錄警告；個人連線暫停，直到重新啟動並通過完整金鑰交接檢查。撤銷後監測仍會繼續；自動恢復方式見下節。也會檢查 `/proc/net/unix` 的監聽中 abstract socket：名稱以 `/` 分段後，任一段完全等於 `docker`、`containerd`、`podman`、`buildkit`、`lxd`，或以這些名稱接 `.`、`-`、`_` 開頭，就會列為候選；不以任意子字串比對。 名稱命中本身不會造成拒絕：Gateway 會以短逾時的非阻塞連線取得 `SO_PEERCRED`，只有連得上且 peer uid 為 0 才視為風險。無法連線的候選與無關的格式錯誤行會略過。啟動時無法讀取 `/proc/net/unix` 仍拒絕接收金鑰。只有仍持有金鑰時，定期檢查遇到讀取失敗才會記錄警告並保留這項探測先前的判定，路徑及群組檢查照常執行。撤銷後的恢復檢查若讀不到該表，會判定失敗並重置連續通過次數。
 
 AI 員工的 Bash／工具仍以 gateway 的 uid 執行。保護依賴 non-dumpable、root 擁有的金鑰與程式、沒有 sudo／linger 權限，以及無法存取引擎 socket。員工仍能修改可寫資料、停止 gateway、要求已授權操作，並讀取自己回合取得的存取權杖。主機不得授予 `duduclaw` 帳號存取容器引擎或其他特權代理的權限。這些檢查只涵蓋啟動時與每分鐘檢查的常見端點，並非無條件的隔離保證。未識別名稱的 abstract socket、其他路徑的引擎 socket、特權代理、其他提權途徑、主機 root 遭入侵，以及已在 gateway 內執行的惡意程式不在防護範圍；兩次檢查之間也可能出現新的存取途徑。執行檔擁有者檢查防止服務 uid 修改程式；它不能驗證惡意 root 管理員交來的程式簽章。
 
 根金鑰不提供通用沙箱。持有金鑰時，同樣禁止在 gateway 內載入 ONNX：NER 遮罩、本機 embedding 與 Kokoro 無法使用；需要遮罩時請使用正規表示式規則。同時包含資料與根金鑰的備份可解開憑證。只在儀表板更換保護金鑰不能防止還原舊資料；懷疑根金鑰外洩時，主機管理員應停止服務、安全更換根金鑰、重設保護並重新連結帳號。
 
 原生 systemd 安裝、不同 sudo 版本與 socket 探測仍需在目標發行版實測。單元測試或 macOS 編譯通過不代表原生 Linux 驗收通過。
+
+## 容器引擎介面暴露後的恢復
+
+同一台主機上的其他程式（常見於開發者啟動的容器）可能暴露 root 擁有的引擎控制介面，即使 `duduclaw` 不在 Docker 群組也可能發生。警告與憑證保護狀態會列出路徑及原因（可寫入、連線成功或非預期 errno），或 abstract socket 名稱及 peer uid。最新撤銷原因、詳細資訊及 UTC 時間保存在 `<home>/state/root-key-status.json`；`<home>` 通常是 `/var/lib/duduclaw/.duduclaw`。記錄不含金鑰。請依顯示的介面找出並停止暴露它的程式；建議把開發容器移到其他主機。若命中舊版 containerd shim，請升級 containerd。
+
+自動恢復預設開啟，只適用於 `engine_socket_reachable`。撤銷後每 60 秒繼續執行相同檢查，連續通過三次才會要求一次正常關機；中途失敗會重新計數。Gateway 完成正常關機流程後以退出碼 75 結束，由 systemd 重啟 root 啟動器。啟動器與新 gateway 會重新執行全部金鑰交接檢查，通過才取得金鑰。遭拒絕的程序不會自行恢復金鑰，仍持有金鑰的程序也不會觸發恢復重啟。執行檔擁有者或權限、附加群組、cgroup／unit、user namespace、容器環境及可存取根金鑰路徑等問題，須由管理員修復，不會觸發自動恢復。
+
+`<home>/state/root-key-recovery.json` 保存跨重啟的次數限制，每個滾動小時最多四次恢復重啟。狀態檔讀取或寫入失敗時會停止自動恢復，個人連線維持暫停；請依回報錯誤檢查儲存空間與存取權限。重啟也會短暫中斷其他 gateway 連線。若要維持人工重啟方式，在 `config.toml` 設定：
+
+```toml
+[credential_protection]
+auto_recover = false
+```
+
+新版安裝的 unit 在 `Restart=on-failure` 外另有 `RestartForceExitStatus=75`。現行受保護升級指令只替換執行檔，**不會**重寫啟動器或 unit；未修改的舊版 unit 已可透過 `Restart=on-failure` 重啟退出碼 75。驗證並安裝新版後，主機管理員可執行 `sudo /opt/duduclaw/bin/duduclaw service install --protected-linux` 更新內嵌啟動器與 unit。這會保留資料與根金鑰、重新載入 systemd，並重啟原本執行中的 gateway；如有本機 unit 覆寫設定，也請一併確認。

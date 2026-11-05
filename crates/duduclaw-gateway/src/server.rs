@@ -543,6 +543,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
+    if singleton_held {
+        duduclaw_core::root_key::recovery::initialize(&home_dir);
+    }
+
     // ── System-settings app: re-apply a persisted static wired-network
     // config, if any (see `network::wired::reapply_wired_config_on_boot`'s
     // own doc for WHY — the sysd verb's effect lives on tmpfs, so it does
@@ -3416,7 +3420,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = async {
+                while !duduclaw_core::root_key::recovery::restart_requested() {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            } => {},
+        }
         info!("Shutdown signal received, flushing state...");
         // sd_notify STOPPING=1 — best-effort, no-op off-systemd.
         let _ = crate::watchdog::notify_stopping();
@@ -3479,6 +3490,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                  clients) — forcing shutdown so restart/re-exec can proceed"
             );
         }
+    }
+
+    // Recovery needs a fresh root launcher, never an unprivileged re-exec.
+    // The monitor has already zeroized the key and durably charged the budget.
+    if duduclaw_core::root_key::recovery::restart_requested()
+        && duduclaw_core::root_key::state_kind() == duduclaw_core::root_key::StateKind::Refused {
+        std::process::exit(duduclaw_core::root_key::RECOVERY_RESTART_EXIT_CODE);
     }
 
     // Self-update installed a new binary during this run: re-exec into it

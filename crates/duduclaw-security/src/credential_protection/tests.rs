@@ -373,3 +373,28 @@ fn every_root_refusal_has_plain_chinese_text() {
     }
     assert!(messages::refusal_text("unknown").is_none());
 }
+
+#[test]
+fn recovery_diagnostics_keep_socket_timestamp_and_history_distinct() {
+    use duduclaw_core::root_key::recovery::{RecoveryStatus, Revocation};
+    let mut status = RecoveryStatus {
+        latest_revocation: Some(Revocation {
+            reason: "engine_socket_reachable".into(),
+            detail: Some("@/containerd-shim/example (peer uid=0, root)".into()),
+            timestamp: "2026-11-05T01:02:03Z".into(),
+        }),
+        recovery: "waiting".into(),
+    };
+    let current = messages::recovery_detail(&status, true);
+    for expected in ["@/containerd-shim/example", "peer uid=0", "2026-11-05T01:02:03Z", "連續三次", "升級 containerd"] {
+        assert!(current.contains(expected), "missing {expected}");
+    }
+    let historical = messages::recovery_detail(&status, false);
+    assert!(historical.contains("以上是歷史記錄"));
+    assert!(!historical.contains("每分鐘重新檢查"));
+    for (code, expected) in [("disabled", "自動恢復已關閉"), ("budget_exhausted", "每小時四次"),
+        ("state_unavailable", "不會自動重啟"), ("non_transient", "此原因不會自動恢復")] {
+        status.recovery = code.into();
+        assert!(messages::recovery_detail(&status, true).contains(expected));
+    }
+}

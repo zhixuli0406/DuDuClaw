@@ -72,6 +72,10 @@ const ROOT_KEY_REFUSALS = new Set([
   'docker_socket',
   'docker_host',
 ]);
+const ROOT_KEY_RECOVERY_STATES = new Set([
+  'monitoring', 'disabled', 'waiting', 'budget_exhausted',
+  'restart_requested', 'state_unavailable', 'non_transient',
+]);
 
 export function CredentialProtectionPanel() {
   const intl = useIntl();
@@ -129,6 +133,9 @@ export function CredentialProtectionPanel() {
   const ready = state === 'ready';
   const container = status?.backend === 'container_root_key';
   const containerState = container && ['not_enabled', 'missing', 'key_changed', 'unavailable'].includes(state ?? '');
+  const recovery = status?.root_key_recovery;
+  const latestRevocation = recovery?.latest_revocation;
+  const currentlyRefused = container && state === 'unavailable' && !!status?.refusal_reason;
   const label = status
     ? state === 'ready' || state === 'not_enabled'
       ? intl.formatMessage({ id: `security.credentialProtection.level.${status.level}` })
@@ -182,6 +189,31 @@ export function CredentialProtectionPanel() {
                   }`,
                 })}
               </p>
+            )}
+            {recovery && (latestRevocation || currentlyRefused) && (
+              <div className="space-y-2 break-words text-sm text-muted-foreground" data-testid="credential-protection-recovery">
+                {latestRevocation && (
+                  <>
+                    <p>{intl.formatMessage(
+                      { id: 'security.credentialProtection.recovery.latest' },
+                      { timestamp: latestRevocation.timestamp },
+                    )}</p>
+                    {!currentlyRefused && (
+                      <p>{intl.formatMessage({
+                        id: `security.credentialProtection.refusal.${
+                          ROOT_KEY_REFUSALS.has(latestRevocation.reason) ? latestRevocation.reason : 'unknown'
+                        }`,
+                      })}</p>
+                    )}
+                    {latestRevocation.detail && <p className="font-mono text-xs">{latestRevocation.detail}</p>}
+                  </>
+                )}
+                <p>{intl.formatMessage({
+                  id: `security.credentialProtection.recovery.${currentlyRefused
+                    ? ROOT_KEY_RECOVERY_STATES.has(recovery.recovery) ? recovery.recovery : 'unknown'
+                    : 'history'}`,
+                })}</p>
+              </div>
             )}
             {state === 'needs_authorization' && (
               <code className="block rounded-md bg-secondary px-3 py-2 font-mono text-xs">

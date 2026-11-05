@@ -65,6 +65,7 @@ fn operator_gate() -> Result<()> {
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn unit_text() -> String {
+    let recovery_exit = duduclaw_core::root_key::RECOVERY_RESTART_EXIT_CODE;
     format!(r"[Unit]
 Description=DuDuClaw protected gateway
 After=network-online.target
@@ -76,6 +77,7 @@ ExecStart={LAUNCHER} {BINARY} run --yes
 # Stop every descendant before a fresh key handoff.
 KillMode=control-group
 Restart=on-failure
+RestartForceExitStatus={recovery_exit}
 RestartSec=5
 # Only service data and the root key provisioning directory are writable.
 ProtectSystem=strict

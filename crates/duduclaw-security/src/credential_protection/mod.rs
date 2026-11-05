@@ -149,6 +149,8 @@ pub struct ProtectionStatus {
     pub detail_zh: String,
     /// Closed startup refusal code for localized dashboard diagnostics.
     pub refusal_reason: Option<&'static str>,
+    /// Latest root-key diagnostic and recovery state, without key material.
+    pub root_key_recovery: Option<duduclaw_core::root_key::recovery::RecoveryStatus>,
 }
 
 /// A refused operation. `code` is a closed set; `message_zh` is user-facing.
@@ -373,7 +375,11 @@ impl CredentialProtection {
             },
         };
         let level = if state == ProtectionState::Ready { platform_level } else { ProtectionLevel::File };
-        let (summary_zh, detail_zh) = messages::state_text(state, level, backend, &extra);
+        let (summary_zh, mut detail_zh) = messages::state_text(state, level, backend, &extra);
+        let root_key_recovery = duduclaw_core::root_key::recovery::status(&self.home);
+        if let Some(recovery) = &root_key_recovery {
+            detail_zh.push_str(&messages::recovery_detail(recovery, self.store.refusal_reason().is_some()));
+        }
         ProtectionStatus {
             level,
             platform_level,
@@ -386,6 +392,7 @@ impl CredentialProtection {
             summary_zh,
             detail_zh,
             refusal_reason: self.store.refusal_reason(),
+            root_key_recovery,
         }
     }
 

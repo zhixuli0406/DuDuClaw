@@ -195,7 +195,7 @@ fn valid_native() -> AttestationInputs {
         native: NativeInputs {
             initial_user_namespace: true, container_environment_absent: true,
             ppid: 1, cgroup: CgroupState::Unit, executable: ExecutableState::Protected,
-            supplementary_groups: Some(0), engine_sockets_denied: true,
+            supplementary_groups: Some(0), engine_sockets_denied: true, engine_socket_detail: None,
         },
         pid: 1234, sockets_absent: false, ..valid()
     }
