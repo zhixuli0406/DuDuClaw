@@ -234,6 +234,7 @@ fn clear_delegation_env() {
         std::env::remove_var(duduclaw_core::ENV_DELEGATION_ORIGIN);
         std::env::remove_var(duduclaw_core::ENV_DELEGATION_SENDER);
         std::env::remove_var(duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN);
+        std::env::remove_var(duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT);
     }
 }
 
@@ -254,7 +255,7 @@ async fn dispatch_pairing_manage_list_and_read_audit_line(default_agent: &str, s
             (duduclaw_core::ENV_DELEGATION_SENDER.to_string(), sender.to_string()),
         ]);
         let env = duduclaw_gateway::claude_runner::DELEGATION_ENV.scope(context, async {
-            duduclaw_gateway::claude_runner::delegation_audit_env(tmp.path(), default_agent)
+            duduclaw_gateway::claude_runner::delegation_context_env(tmp.path(), default_agent, 300)
         }).await;
         unsafe {
             std::env::set_var(duduclaw_core::ENV_AGENT_ID, default_agent);

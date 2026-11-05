@@ -340,17 +340,168 @@ pub fn verify_token(key: &[u8], agent_id: &str, token: &str) -> bool {
     mac.verify_slice(&bytes).is_ok()
 }
 
-/// Host proof binding an audit delegation sender to its executing employee.
-/// Domain separation and NUL delimiters prevent reuse as an identity token.
+/// Legacy proof name, retained only so process boundaries can scrub it.
 pub const ENV_DELEGATION_AUDIT_TOKEN: &str = "DUDUCLAW_DELEGATION_AUDIT_TOKEN";
+/// Secret, per-spawn host proof. Never persist this envelope in runtime argv.
+pub const ENV_DELEGATION_CONTEXT: &str = "DUDUCLAW_DELEGATION_CONTEXT";
 
-pub fn mint_delegation_audit_token(key: &[u8], worker: &str, sender: &str) -> String {
-    mint_token(key, &format!("delegation-audit-v1\0{worker}\0{sender}"))
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationContext {
+    pub version: u8,
+    pub worker: String,
+    pub sender: String,
+    pub origin: String,
+    pub depth: u8,
+    pub run_id: Option<String>,
+    pub expires_at: u64,
+    pub nonce: String,
 }
 
-pub fn verify_delegation_audit_token(key: &[u8], worker: &str, sender: &str, token: &str) -> bool {
-    crate::is_valid_agent_id(worker) && crate::is_valid_agent_id(sender)
-        && verify_token(key, &format!("delegation-audit-v1\0{worker}\0{sender}"), token)
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedDelegationContext {
+    context: DelegationContext,
+    signature: String,
+}
+
+/// Canonical binding shared by host task-local injection and MCP verification.
+/// Runtime injection clears absent ambient values with empty strings.
+pub fn delegation_run_binding(
+    dispatch_run: Option<&str>, task_id: Option<&str>, turn_id: Option<&str>,
+) -> Option<String> {
+    let dispatch_run = dispatch_run.filter(|id| !id.is_empty());
+    let task_id = task_id.filter(|id| !id.is_empty());
+    let turn_id = turn_id.filter(|id| !id.is_empty());
+    if dispatch_run.is_none() && task_id.is_none() && turn_id.is_none() {
+        None
+    } else {
+        serde_json::to_string(&(dispatch_run, task_id, turn_id)).ok()
+    }
+}
+
+fn delegation_employee_id(id: &str) -> bool {
+    crate::is_valid_agent_id(id) && !crate::delegation_policy::is_reserved_agent_id(id)
+}
+
+impl DelegationContext {
+    fn well_formed(&self) -> bool {
+        self.version == 1
+            && delegation_employee_id(&self.worker)
+            && delegation_employee_id(&self.sender)
+            && delegation_employee_id(&self.origin)
+            && self.depth <= crate::MAX_DELEGATION_DEPTH
+            && self.run_id.as_ref().is_none_or(|id|
+                !id.is_empty() && id.len() <= 4096 && !id.contains('\0'))
+            && self.expires_at > 0
+            && self.nonce.len() == 64
+            && self.nonce.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    fn mac_payload(&self) -> String {
+        // Every field is NUL-free before this method is used. The optional run
+        // binding uses an empty field only for None (Some("") is rejected).
+        format!("duduclaw-delegation-context\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            self.version, self.worker, self.sender, self.origin, self.depth,
+            self.run_id.as_deref().unwrap_or(""), self.expires_at, self.nonce)
+    }
+}
+
+/// Mint one context per MCP child. Randomness failure rejects delegation.
+#[allow(clippy::too_many_arguments)]
+pub fn mint_delegation_context(
+    key: &[u8], worker: &str, sender: &str, origin: &str, depth: u8,
+    run_id: Option<&str>, expires_at: u64,
+) -> Option<String> {
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce).ok()?;
+    let context = DelegationContext {
+        version: 1, worker: worker.to_owned(), sender: sender.to_owned(),
+        origin: origin.to_owned(), depth, run_id: run_id.map(str::to_owned),
+        expires_at, nonce: hex_lower(&nonce),
+    };
+    if !context.well_formed() { return None; }
+    let signature = mint_token(key, &context.mac_payload());
+    serde_json::to_string(&SignedDelegationContext { context, signature }).ok()
+}
+
+/// Verify attribution and delegation bounds against the authenticated worker
+/// and this spawn's run/task/turn identity. Legacy audit tokens are rejected.
+/// Call [`claim_delegation_context`] before using the returned context.
+pub fn verify_delegation_context(
+    key: &[u8], worker: &str, expected_run_id: Option<&str>, token: &str, now: u64,
+) -> Option<DelegationContext> {
+    if token.len() > 16384 { return None; }
+    let signed: SignedDelegationContext = serde_json::from_str(token).ok()?;
+    let context = signed.context;
+    if !context.well_formed() || context.worker != worker
+        || context.run_id.as_deref() != expected_run_id || now >= context.expires_at
+        || !verify_token(key, &context.mac_payload(), &signed.signature)
+    {
+        return None;
+    }
+    Some(context)
+}
+
+type DelegationClaims = std::collections::HashSet<(PathBuf, u32, String)>;
+static DELEGATION_CLAIMS: std::sync::OnceLock<std::sync::Mutex<DelegationClaims>> =
+    std::sync::OnceLock::new();
+
+/// Consume a host nonce once across MCP processes. The same process may verify
+/// it for multiple calls until expiry. A fork has a different PID and cannot
+/// reuse its parent's in-memory claim. Claim files survive child exit/restart.
+/// The directory contains non-secret nonces and expiry timestamps, never proofs.
+pub fn claim_delegation_context(home: &Path, context: &DelegationContext) -> bool {
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    if !context.well_formed() || now.as_secs() >= context.expires_at { return false; }
+    let Ok(mut claims) = DELEGATION_CLAIMS.get_or_init(Default::default).lock() else {
+        return false;
+    };
+    claim_delegation_context_with(home, context, std::process::id(), &mut claims)
+}
+
+fn claim_delegation_context_with(
+    home: &Path, context: &DelegationContext, pid: u32, claims: &mut DelegationClaims,
+) -> bool {
+    use std::io::Write;
+    let Ok(home) = home.canonicalize() else { return false; };
+    let cache_key = (home.clone(), pid, context.nonce.clone());
+    if claims.contains(&cache_key) { return true; }
+    let directory = home.join("delegation-context-claims");
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    if let Err(error) = builder.create(&directory) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists { return false; }
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(&directory) else { return false; };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() { return false; }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return false;
+        }
+    }
+    let Ok(mut file) = open_private(&directory.join(&context.nonce), true, true) else {
+        return false;
+    };
+    if writeln!(file, "{}", context.expires_at).is_err() || file.sync_all().is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    if std::fs::File::open(&directory).and_then(|file| file.sync_all()).is_err() {
+        return false;
+    }
+    claims.insert(cache_key);
+    true
 }
 
 // ── Signed internal requests ─────────────────────────────────────────────────
@@ -665,6 +816,142 @@ mod tests {
         assert!(!ok("alice", &tok, "1700000000", "00ff", b"{\"op\":\"stop\"}", &sig));
         assert!(!ok("alice", &tok, "1700000000", "00ff", b"{\"op\":\"status\"}", "zz"));
         assert!(!verify_internal_request_signature(b"other-key", "alice", &tok, "1700000000", "00ff", b"{\"op\":\"status\"}", &sig));
+    }
+
+    #[test]
+    fn delegation_context_binds_every_field_and_rejects_expiry_and_cross_run_replay() {
+        let key = key();
+        let run = delegation_run_binding(Some("run-1"), Some("task-1"), Some("turn-1")).unwrap();
+        let token = mint_delegation_context(&key, "worker", "sender", "origin", 2,
+            Some(&run), 1000).unwrap();
+        let verified = verify_delegation_context(&key, "worker", Some(&run), &token, 999).unwrap();
+        assert_eq!(verified.sender, "sender");
+        assert_eq!(verified.origin, "origin");
+        assert_eq!(verified.depth, 2);
+        assert!(verify_delegation_context(&key, "worker", Some(&run), &token, 1000).is_none());
+        assert!(verify_delegation_context(&key, "worker", Some(&run), &token, 1001).is_none());
+        assert!(verify_delegation_context(&key, "other-worker", Some(&run), &token, 999).is_none());
+        assert!(verify_delegation_context(&key, "worker", None, &token, 999).is_none());
+        for other_run in [
+            delegation_run_binding(Some("run-2"), Some("task-1"), Some("turn-1")),
+            delegation_run_binding(Some("run-1"), Some("task-2"), Some("turn-1")),
+            delegation_run_binding(Some("run-1"), Some("task-1"), Some("turn-2")),
+        ] {
+            assert!(verify_delegation_context(&key, "worker", other_run.as_deref(), &token, 999).is_none());
+        }
+        for (field, value) in [
+            ("version", serde_json::json!(2)),
+            ("worker", serde_json::json!("other-worker")),
+            ("sender", serde_json::json!("ceo")),
+            ("origin", serde_json::json!("ceo")),
+            ("depth", serde_json::json!(0)),
+            ("run_id", serde_json::json!("other-run")),
+            ("expires_at", serde_json::json!(2000)),
+            ("nonce", serde_json::json!("a".repeat(64))),
+        ] {
+            let mut forged: serde_json::Value = serde_json::from_str(&token).unwrap();
+            forged["context"][field] = value;
+            assert!(verify_delegation_context(&key, "worker", Some(&run),
+                &forged.to_string(), 999).is_none(), "accepted changed {field}");
+        }
+        assert!(verify_delegation_context(&[9; 32], "worker", Some(&run), &token, 999).is_none());
+        assert!(verify_delegation_context(&key, "worker", Some(&run),
+            &mint_token(&key, "delegation-audit-v1\0worker\0sender"), 999).is_none());
+    }
+
+    #[test]
+    fn delegation_context_rejects_reserved_identities_on_mint_and_verify() {
+        let key = key();
+        let token = mint_delegation_context(&key, "worker", "sender", "origin", 0, None, 1000).unwrap();
+        for reserved in crate::SYSTEM_SENDERS.iter().chain(crate::RESERVED_QUEUE_SENDERS.iter()) {
+            for name in [reserved.to_string(), reserved.to_ascii_uppercase()] {
+                assert!(mint_delegation_context(&key, &name, "sender", "origin", 0, None, 1000).is_none());
+                assert!(mint_delegation_context(&key, "worker", &name, "origin", 0, None, 1000).is_none());
+                assert!(mint_delegation_context(&key, "worker", "sender", &name, 0, None, 1000).is_none());
+                // Even a valid MAC cannot turn a system sender into an employee.
+                for field in ["worker", "sender", "origin"] {
+                    let mut signed: SignedDelegationContext = serde_json::from_str(&token).unwrap();
+                    match field {
+                        "worker" => signed.context.worker = name.clone(),
+                        "sender" => signed.context.sender = name.clone(),
+                        _ => signed.context.origin = name.clone(),
+                    }
+                    signed.signature = mint_token(&key, &signed.context.mac_payload());
+                    let claimed = signed.context.worker.clone();
+                    assert!(verify_delegation_context(&key, &claimed, None,
+                        &serde_json::to_string(&signed).unwrap(), 999).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delegation_context_requires_bounded_unambiguous_fields_and_random_nonce() {
+        let key = key();
+        assert!(mint_delegation_context(&key, "worker", "sender", "origin",
+            crate::MAX_DELEGATION_DEPTH + 1, None, 1000).is_none());
+        for invalid_run in ["".to_owned(), "run\0task".to_owned(), "a".repeat(4097)] {
+            assert!(mint_delegation_context(&key, "worker", "sender", "origin", 0,
+                Some(&invalid_run), 1000).is_none());
+        }
+        assert!(mint_delegation_context(&key, "worker", "sender", "origin", 0, None, 0).is_none());
+        let mint = || mint_delegation_context(&key, "worker", "sender", "origin", 0, None, 1000).unwrap();
+        let first = mint();
+        let second = mint();
+        assert_ne!(first, second);
+        assert!(verify_delegation_context(&key, "worker", None, &first, 999).is_some());
+        assert!(verify_delegation_context(&key, "worker", None, &second, 999).is_some());
+        assert_eq!(delegation_run_binding(None, None, None), None);
+        assert_eq!(delegation_run_binding(Some(""), Some(""), None), None);
+        assert_eq!(delegation_run_binding(Some("run"), Some(""), None),
+            delegation_run_binding(Some("run"), None, None));
+    }
+
+    #[test]
+    fn delegation_context_nonce_claim_rejects_new_process_replay_and_forks() {
+        let home = TempDir::new().unwrap();
+        let key = key();
+        let token = mint_delegation_context(&key, "worker", "sender", "origin", 0,
+            None, u64::MAX).unwrap();
+        let context = verify_delegation_context(&key, "worker", None, &token, 999).unwrap();
+        let mut first_process = DelegationClaims::new();
+        assert!(claim_delegation_context_with(home.path(), &context, 100, &mut first_process));
+        assert!(claim_delegation_context_with(home.path(), &context, 100, &mut first_process));
+        let mut independent_process = DelegationClaims::new();
+        assert!(!claim_delegation_context_with(home.path(), &context, 101, &mut independent_process));
+        // Restart/PID reuse has no in-memory claim; the durable file rejects it.
+        assert!(!claim_delegation_context_with(home.path(), &context, 100, &mut independent_process));
+        // A fork inherits cache entries, but not its parent's PID.
+        assert!(!claim_delegation_context_with(home.path(), &context, 101, &mut first_process));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = home.path().join("delegation-context-claims");
+            assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::metadata(dir.join(&context.nonce)).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let mut expired = context;
+        expired.expires_at = 1;
+        assert!(!claim_delegation_context(home.path(), &expired));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delegation_context_nonce_claim_rejects_unsafe_or_redirected_registry() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let home = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let key = key();
+        let token = mint_delegation_context(&key, "worker", "sender", "origin", 0,
+            None, u64::MAX).unwrap();
+        let context = verify_delegation_context(&key, "worker", None, &token, 999).unwrap();
+        let directory = home.path().join("delegation-context-claims");
+        symlink(other.path(), &directory).unwrap();
+        assert!(!claim_delegation_context(home.path(), &context));
+        std::fs::remove_file(&directory).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!claim_delegation_context(home.path(), &context));
     }
 
     /// RFC 4231 test case 1 — a fixed vector proves this is real HMAC-SHA256

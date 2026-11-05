@@ -120,6 +120,11 @@ pub const PROXY_PRIVATE_ENV: &[&str] = &[
     "DUDUCLAW_UPSTREAM_UNKNOWN",
     "DUDUCLAW_ON_BEHALF_OF",
     "DUDUCLAW_TASK_ID",
+    duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN,
+    duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT,
+    duduclaw_core::ENV_DELEGATION_SENDER,
+    duduclaw_core::ENV_DELEGATION_ORIGIN,
+    duduclaw_core::ENV_DELEGATION_DEPTH,
 
 ];
 
@@ -323,16 +328,16 @@ fn call_capacity(held: &mut tokio::task::JoinSet<()>) -> bool {
 /// [`PROXY_PRIVATE_ENV`], with the JSON map from [`PROXY_UPSTREAM_ENV_VAR`]
 /// layered on top.
 ///
-/// This is only a merge helper, not a security control. Production calls it
-/// only after `resolve_declared_env` has strictly parsed and resolved the
-/// declared map, and checks the merged result before spawning.
+/// Private host credentials/metadata are excluded from both sources, with
+/// case-insensitive matching for Windows environment semantics. Production
+/// resolves the declared map first and checks unresolved values before spawn.
 pub fn upstream_env(
     inherited: impl IntoIterator<Item = (String, String)>,
     encoded: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = inherited
         .into_iter()
-        .filter(|(k, _)| !PROXY_PRIVATE_ENV.contains(&k.as_str()))
+        .filter(|(k, _)| !PROXY_PRIVATE_ENV.iter().any(|private| private.eq_ignore_ascii_case(k)))
         .collect();
 
     let declared: Vec<(String, String)> = encoded
@@ -346,6 +351,7 @@ pub fn upstream_env(
         .unwrap_or_default();
 
     for (k, v) in declared {
+        if PROXY_PRIVATE_ENV.iter().any(|private| private.eq_ignore_ascii_case(&k)) { continue; }
         match out.iter_mut().find(|(ek, _)| *ek == k) {
             Some(slot) => slot.1 = v,
             None => out.push((k, v)),
@@ -1534,6 +1540,24 @@ mod tests {
         assert!(!map.contains_key("DUDUCLAW_MCP_API_KEY"));
         assert!(!map.contains_key("DUDUCLAW_AGENT_TOKEN"));
         assert!(!map.contains_key(PROXY_UPSTREAM_ENV_VAR));
+    }
+
+    #[test]
+    fn upstream_env_never_contains_delegation_proof_or_metadata() {
+        let names = [
+            duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN,
+            duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT,
+            duduclaw_core::ENV_DELEGATION_SENDER,
+            duduclaw_core::ENV_DELEGATION_ORIGIN,
+            duduclaw_core::ENV_DELEGATION_DEPTH,
+        ];
+        let variants: Vec<String> = names.iter().flat_map(|name| [
+            name.to_string(), name.to_ascii_lowercase(), name.replacen("DUDUCLAW", "DuDuClaw", 1),
+        ]).collect();
+        let inherited = variants.iter().map(|name| (name.clone(), "private".to_string()));
+        let declared: serde_json::Map<String, Value> = variants.iter()
+            .map(|name| (name.clone(), Value::String("declared-secret".into()))).collect();
+        assert!(upstream_env(inherited, Some(&serde_json::to_string(&declared).unwrap())).is_empty());
     }
 
     #[test]

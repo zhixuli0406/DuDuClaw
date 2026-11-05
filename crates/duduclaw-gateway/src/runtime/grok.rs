@@ -657,7 +657,12 @@ impl AgentRuntime for GrokRuntime {
         for (k, v) in duduclaw_core::mcp_forward_env_vars() {
             cmd.env(k, v);
         }
-        cmd.envs(crate::claude_runner::delegation_audit_env(&context.home_dir, &context.agent_id));
+        for name in [duduclaw_core::ENV_DISPATCH_RUN_ID, duduclaw_core::ENV_TASK_ID,
+            duduclaw_core::ENV_TRUST_TURN_ID] {
+            cmd.env_remove(name);
+        }
+        cmd.envs(crate::claude_runner::delegation_context_env(&context.home_dir, &context.agent_id,
+            crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref())));
         // P2-B N4: the turn/run source identity, same channel as the id. Grok
         // may hand its MCP child only the declared config env, in which case
         // this does not arrive (unverified); the persisted config is not used
@@ -907,8 +912,13 @@ impl GrokRuntime {
         env.extend(duduclaw_core::agent_identity_env_vars_default(
             &context.agent_id,
         ));
+        for name in [duduclaw_core::ENV_DISPATCH_RUN_ID, duduclaw_core::ENV_TASK_ID,
+            duduclaw_core::ENV_TRUST_TURN_ID] {
+            env.remove(name);
+        }
         env.extend(crate::memory_provenance::turn_source_env_pairs());
-        env.extend(crate::claude_runner::delegation_audit_env(&context.home_dir, &context.agent_id));
+        env.extend(crate::claude_runner::delegation_context_env(&context.home_dir, &context.agent_id,
+            deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs()));
         for var in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE"] {
             if let Ok(v) = std::env::var(var) {
                 if !v.trim().is_empty() {

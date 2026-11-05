@@ -51,7 +51,7 @@ pub(crate) struct ActionGuardOutcome {
     findings: Vec<duduclaw_gateway::approval::ActionGuardFinding>,
 }
 
-/// Delegation context read from environment variables (or injected for testing).
+/// Verified host delegation metadata; tests may inject a context directly.
 #[derive(Debug, Clone)]
 pub(crate) struct DelegationContext {
     depth: u8,
@@ -59,17 +59,13 @@ pub(crate) struct DelegationContext {
 }
 
 impl DelegationContext {
-    /// Read from env vars set by the dispatcher. This is the ONLY trusted source
-    /// in production — tool params are ignored to prevent LLM agents from spoofing.
-    fn from_env() -> Self {
-        let depth = std::env::var(duduclaw_core::ENV_DELEGATION_DEPTH)
-            .ok()
-            .and_then(|v| v.parse::<u8>().ok())
-            .unwrap_or(0);
-        let origin = std::env::var(duduclaw_core::ENV_DELEGATION_ORIGIN)
-            .ok()
-            .filter(|s| !s.is_empty());
-        Self { depth, origin }
+    /// An unsigned/expired context has no delegation headroom. Ordinary tools
+    /// still run as the verified worker, but cannot start a new delegation.
+    fn from_env(home: &Path, worker: &str) -> Self {
+        match verified_delegation_context(home, worker) {
+            Some(context) => Self { depth: context.depth, origin: Some(context.origin) },
+            None => Self { depth: duduclaw_core::MAX_DELEGATION_DEPTH, origin: None },
+        }
     }
 }
 

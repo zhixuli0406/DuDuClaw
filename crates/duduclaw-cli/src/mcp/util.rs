@@ -171,39 +171,62 @@ pub(crate) fn shared_wiki_reader<'a>(
     }
 }
 
-/// Audit attribution is bound to authenticated transport identity. An external
-/// client never inherits an employee or ambient delegation sender. Internal
-/// senders require a host MAC bound to the strictly verified worker identity;
-/// identity-token grace does not authenticate delegation context.
+/// Verify host delegation independently of audit attribution. Raw sender,
+/// origin and depth variables never confer authority.
+pub(crate) fn verified_delegation_context(
+    home: &Path,
+    worker: &str,
+) -> Option<duduclaw_core::identity_token::DelegationContext> {
+    use duduclaw_core::identity_token::{
+        claim_delegation_context, delegation_run_binding, verify_delegation_context,
+        ENV_DELEGATION_CONTEXT,
+    };
+    let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).ok()?;
+    let identity = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).ok()?;
+    if claimed != worker { return None; }
+    let key = zeroize::Zeroizing::new(duduclaw_core::load_identity_key(home)?);
+    if !duduclaw_core::verify_identity_token(&key, worker, &identity) { return None; }
+    let run = std::env::var(duduclaw_core::ENV_DISPATCH_RUN_ID).ok();
+    let task = std::env::var(duduclaw_core::ENV_TASK_ID).ok();
+    let turn = std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).ok();
+    let binding = delegation_run_binding(run.as_deref(), task.as_deref(), turn.as_deref());
+    let token = std::env::var(ENV_DELEGATION_CONTEXT).ok()?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let context = verify_delegation_context(&key, worker, binding.as_deref(), &token, now)?;
+    claim_delegation_context(home, &context).then_some(context)
+}
+
+/// Authorization uses the authenticated worker/client, never audit attribution.
+/// The request dispatcher already resolved and verified the employee identity.
+pub(crate) fn resolve_authorizing_agent(
+    home: &Path,
+    principal: Option<&crate::mcp_auth::Principal>,
+    default_agent: &str,
+) -> String {
+    match principal {
+        Some(p) if p.is_external => p.client_id.clone(),
+        Some(p) => record_actor_for(home, &p.client_id, default_agent).id().to_string(),
+        None => default_agent.to_string(),
+    }
+}
+
+pub(crate) fn current_authorizing_agent(home: &Path, default_agent: &str) -> String {
+    let call = crate::mcp_auth::current_authenticated_call();
+    resolve_authorizing_agent(home, call.as_ref().map(|c| c.principal()), default_agent)
+}
+
+/// Audit-only attribution. Callers: tool success/denial logs, usage evidence
+/// comparisons and dashboard feedback. Never use this result for authorization.
 pub(crate) fn resolve_audit_agent(
     home: &Path,
     principal: Option<&crate::mcp_auth::Principal>,
     default_agent: &str,
 ) -> String {
     let Some(principal) = principal else { return default_agent.to_string(); };
-    if principal.is_external {
-        return principal.client_id.clone();
-    }
-    let worker = default_agent;
-    let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
-    let identity = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
-    let sender = std::env::var(duduclaw_core::ENV_DELEGATION_SENDER).unwrap_or_default();
-    let token = std::env::var(duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN).unwrap_or_default();
-    if claimed == worker && !duduclaw_core::is_system_sender(&sender)
-        && let Some(key) = duduclaw_core::load_identity_key(home).map(zeroize::Zeroizing::new)
-        && duduclaw_core::verify_identity_token(&key, worker, &identity)
-        && duduclaw_core::identity_token::verify_delegation_audit_token(&key, worker, &sender, &token)
-    {
-        return sender;
-    }
-    worker.to_string()
-}
-
-/// In-handler callers use the already authenticated request scope, never
-/// re-authenticate an ambient API key or interpret a sender as a principal.
-pub(crate) fn current_audit_agent(home: &Path, default_agent: &str) -> String {
-    let call = crate::mcp_auth::current_authenticated_call();
-    resolve_audit_agent(home, call.as_ref().map(|c| c.principal()), default_agent)
+    if principal.is_external { return principal.client_id.clone(); }
+    verified_delegation_context(home, default_agent)
+        .map(|context| context.sender)
+        .unwrap_or_else(|| default_agent.to_string())
 }
 
 /// Which agent is actually acting behind `caller_client_id`?

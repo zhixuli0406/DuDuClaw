@@ -1754,18 +1754,156 @@ fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
     mcp_client_envs_in(agent_id, &duduclaw_core::platform::duduclaw_home())
 }
 
-/// Per-spawn audit context comes only from the host dispatcher task-local.
-/// Empty pairs clear inherited proof on non-delegated invocations.
-pub fn delegation_audit_env(home: &Path, worker: &str) -> Vec<(String, String)> {
-    use duduclaw_core::identity_token::{ENV_DELEGATION_AUDIT_TOKEN, mint_delegation_audit_token};
-    let sender = DELEGATION_ENV.try_with(|env| env.get(duduclaw_core::ENV_DELEGATION_SENDER).cloned())
-        .ok().flatten().unwrap_or_default();
-    let token = if duduclaw_core::is_valid_agent_id(&sender) && !duduclaw_core::is_system_sender(&sender) {
-        duduclaw_core::load_identity_key(home).map(zeroize::Zeroizing::new)
-            .map(|key| mint_delegation_audit_token(&key, worker, &sender)).unwrap_or_default()
-    } else { String::new() };
-    vec![(duduclaw_core::ENV_DELEGATION_SENDER.to_string(), sender),
-         (ENV_DELEGATION_AUDIT_TOKEN.to_string(), token)]
+/// Per-spawn delegation authority comes only from host task locals. Direct
+/// calls are signed at depth zero; inherited process env never grants headroom.
+pub fn delegation_context_env(home: &Path, worker: &str, timeout_secs: u64) -> Vec<(String, String)> {
+    use duduclaw_core::identity_token::{ENV_DELEGATION_CONTEXT, ENV_DELEGATION_AUDIT_TOKEN,
+        delegation_run_binding, mint_delegation_context};
+    let scoped = DELEGATION_ENV.try_with(Clone::clone).ok();
+    let employee = |id: &str| duduclaw_core::is_valid_agent_id(id)
+        && !duduclaw_core::is_system_sender(id)
+        && !duduclaw_core::is_reserved_queue_sender(id);
+    let sender = scoped.as_ref().and_then(|env| env.get(duduclaw_core::ENV_DELEGATION_SENDER))
+        .filter(|id| employee(id)).cloned().unwrap_or_else(|| worker.to_string());
+    let origin = scoped.as_ref().and_then(|env| env.get(duduclaw_core::ENV_DELEGATION_ORIGIN))
+        .filter(|id| employee(id)).cloned().unwrap_or_else(|| worker.to_string());
+    let depth = match scoped.as_ref() {
+        Some(env) => env.get(duduclaw_core::ENV_DELEGATION_DEPTH)
+            .and_then(|value| value.parse::<u8>().ok()).unwrap_or(duduclaw_core::MAX_DELEGATION_DEPTH),
+        None => 0,
+    };
+    let run = crate::memory_provenance::DISPATCH_RUN.try_with(Clone::clone).ok().flatten()
+        .map(|(_, run)| run);
+    let task = crate::runtime::round_task_env().map(|(_, task)| task);
+    let turn = duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(Clone::clone).ok().flatten();
+    let binding = delegation_run_binding(run.as_deref(), task.as_deref(), turn.as_deref());
+    let expiry = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|now| now.as_secs().saturating_add(timeout_secs).saturating_add(60)).unwrap_or(0);
+    let token = duduclaw_core::load_identity_key(home).map(zeroize::Zeroizing::new)
+        .and_then(|key| mint_delegation_context(&key, worker, &sender, &origin, depth, binding.as_deref(), expiry))
+        .unwrap_or_default();
+    let mut envs = vec![(ENV_DELEGATION_CONTEXT.to_string(), token),
+         (ENV_DELEGATION_AUDIT_TOKEN.to_string(), String::new()),
+         (duduclaw_core::ENV_DELEGATION_SENDER.to_string(), sender),
+         (duduclaw_core::ENV_DELEGATION_ORIGIN.to_string(), origin),
+         (duduclaw_core::ENV_DELEGATION_DEPTH.to_string(), depth.to_string())];
+    for (name, value) in [(duduclaw_core::ENV_DISPATCH_RUN_ID, run),
+        (duduclaw_core::ENV_TASK_ID, task), (duduclaw_core::ENV_TRUST_TURN_ID, turn)] {
+        if let Some(value) = value { envs.push((name.to_string(), value)); }
+    }
+    envs
+}
+
+#[cfg(test)]
+mod delegation_context_tests {
+    use super::*;
+    use duduclaw_core::identity_token::{ENV_DELEGATION_CONTEXT, verify_delegation_context};
+
+    fn proof(env: &[(String, String)]) -> &str {
+        &env.iter().find(|(name, _)| name == ENV_DELEGATION_CONTEXT).unwrap().1
+    }
+
+    #[test]
+    fn direct_context_is_signed_for_worker_with_bounded_lifetime() {
+        let home = tempfile::tempdir().unwrap();
+        let key = zeroize::Zeroizing::new(duduclaw_core::identity_token::ensure_key(home.path()).unwrap());
+        let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let env = delegation_context_env(home.path(), "worker", 300);
+        let context = verify_delegation_context(&key, "worker", None, proof(&env), before).unwrap();
+        assert_eq!(context.sender, "worker");
+        assert_eq!(context.origin, "worker");
+        assert_eq!(context.depth, 0);
+        assert!((before + 360..=before + 361).contains(&context.expires_at));
+        assert!(verify_delegation_context(&key, "other", None, proof(&env), before).is_none());
+        assert!(verify_delegation_context(&key, "worker", None, proof(&env), context.expires_at).is_none());
+    }
+
+    #[tokio::test]
+    async fn delegated_context_binds_run_and_preserves_depth() {
+        let home = tempfile::tempdir().unwrap();
+        let key = zeroize::Zeroizing::new(duduclaw_core::identity_token::ensure_key(home.path()).unwrap());
+        let scoped = std::collections::HashMap::from([
+            (duduclaw_core::ENV_DELEGATION_SENDER.into(), "manager".into()),
+            (duduclaw_core::ENV_DELEGATION_ORIGIN.into(), "origin".into()),
+            (duduclaw_core::ENV_DELEGATION_DEPTH.into(), "2".into()),
+        ]);
+        let env = crate::memory_provenance::DISPATCH_RUN.scope(Some(("session".into(), "run:one".into())),
+            DELEGATION_ENV.scope(scoped, async { delegation_context_env(home.path(), "worker", 300) })).await;
+        let binding = duduclaw_core::identity_token::delegation_run_binding(Some("run:one"), None, None);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let context = verify_delegation_context(&key, "worker", binding.as_deref(), proof(&env), now).unwrap();
+        assert_eq!(context.sender, "manager");
+        assert_eq!(context.origin, "origin");
+        assert_eq!(context.depth, 2);
+        assert!(verify_delegation_context(&key, "worker", None, proof(&env), now).is_none());
+    }
+
+    #[tokio::test]
+    async fn reserved_dispatch_senders_never_become_employee_attribution() {
+        let home = tempfile::tempdir().unwrap();
+        let key = zeroize::Zeroizing::new(duduclaw_core::identity_token::ensure_key(home.path()).unwrap());
+        for sender in ["workflow", "heartbeat-scheduler"] {
+            let scoped = std::collections::HashMap::from([
+                (duduclaw_core::ENV_DELEGATION_SENDER.into(), sender.into()),
+                (duduclaw_core::ENV_DELEGATION_ORIGIN.into(), sender.into()),
+                (duduclaw_core::ENV_DELEGATION_DEPTH.into(), "1".into()),
+            ]);
+            let env = DELEGATION_ENV.scope(scoped, async { delegation_context_env(home.path(), "worker", 300) }).await;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let context = verify_delegation_context(&key, "worker", None, proof(&env), now).unwrap();
+            assert_eq!(context.sender, "worker");
+            assert_eq!(context.origin, "worker");
+            assert_eq!(context.depth, 1);
+        }
+    }
+
+    #[test]
+    fn claude_builtin_aliases_each_receive_a_distinct_context() {
+        let home = tempfile::tempdir().unwrap();
+        let key = zeroize::Zeroizing::new(duduclaw_core::identity_token::ensure_key(home.path()).unwrap());
+        let mut servers = serde_json::Map::new();
+        for name in ["duduclaw".to_string(), "duduclaw-pro".into(), duduclaw_core::mcp_server_key()] {
+            servers.insert(name, serde_json::json!({"command": "duduclaw", "args": ["mcp-server"], "env": {}}));
+        }
+        servers.insert("duduclaw-evil".into(), serde_json::json!({"command": "proxy", "env": {}}));
+        let original = tempfile::NamedTempFile::new().unwrap();
+        serde_json::to_writer(original.as_file(), &serde_json::json!({"mcpServers": servers})).unwrap();
+        let mut args = vec!["--mcp-config".into(), original.path().to_string_lossy().into_owned()];
+        let _guard = bind_delegation_mcp_config(&mut args, None,
+            || delegation_context_env(home.path(), "worker", 300)).unwrap();
+        let bound: serde_json::Value = serde_json::from_slice(&std::fs::read(&args[1]).unwrap()).unwrap();
+        let mut nonces = std::collections::HashSet::new();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        for (name, server) in bound["mcpServers"].as_object().unwrap() {
+            if name == "duduclaw-evil" {
+                assert!(server["env"].get(ENV_DELEGATION_CONTEXT).is_none());
+                continue;
+            }
+            let token = server["env"][ENV_DELEGATION_CONTEXT].as_str().unwrap();
+            let context = verify_delegation_context(&key, "worker", None, token, now).unwrap();
+            assert!(nonces.insert(context.nonce), "each MCP child needs a fresh nonce");
+        }
+        assert!(nonces.len() >= 2);
+    }
+
+    #[test]
+    fn claude_config_only_gives_proof_to_duduclaw_child() {
+        let original = tempfile::NamedTempFile::new().unwrap();
+        let config = serde_json::json!({"mcpServers": {
+            "duduclaw": {"command": "duduclaw", "args": ["mcp-server"], "env": {}},
+            "external": {"command": "proxy", "env": {"PUBLIC": "value"}}
+        }});
+        serde_json::to_writer(original.as_file(), &config).unwrap();
+        let mut args = vec!["--mcp-config".into(), original.path().to_string_lossy().into_owned(), "--strict-mcp-config".into()];
+        let env = vec![(ENV_DELEGATION_CONTEXT.into(), "secret-proof".into())];
+        let _guard = bind_delegation_mcp_config(&mut args, None, || env.clone()).unwrap();
+        let bound: serde_json::Value = serde_json::from_slice(&std::fs::read(&args[1]).unwrap()).unwrap();
+        assert_eq!(bound["mcpServers"]["duduclaw"]["env"][ENV_DELEGATION_CONTEXT], "secret-proof");
+        assert_eq!(bound["mcpServers"]["external"], config["mcpServers"]["external"]);
+        assert!(!args.iter().any(|arg| arg.contains("secret-proof")));
+        let unchanged: serde_json::Value = serde_json::from_slice(&std::fs::read(original.path()).unwrap()).unwrap();
+        assert_eq!(unchanged, config);
+    }
 }
 
 fn mcp_client_envs_in(agent_id: &str, home: &Path) -> Vec<(String, String)> {
@@ -1783,7 +1921,8 @@ fn mcp_client_envs_in(agent_id: &str, home: &Path) -> Vec<(String, String)> {
         .filter(|(key, _)| key != "DUDUCLAW_HOME"));
     envs.push(("DUDUCLAW_HOME".into(), home.to_string_lossy().into_owned()));
     // P2-A H-2: the round this tool loop runs for (openai-compat runtime).
-    envs.extend(delegation_audit_env(home, agent_id));
+    envs.extend(delegation_context_env(home, agent_id,
+        crate::runtime_config::call_timeout_secs(Some(&home.join("agents").join(agent_id)))));
     envs.extend(crate::runtime::round_task_env());
     // The explore lane (`crate::explore_lane`, either source): the
     // openai-compat runtime has no built-ins, the MCP server is the gate.
@@ -4144,6 +4283,38 @@ fn mcp_config_cli_args(
     )))
 }
 
+/// Bind only the DuDuClaw entry, keeping the proof out of Claude's process
+/// env and argv. A new mode-0600 temp file never alters persistent agent config.
+fn bind_delegation_mcp_config(
+    args: &mut [String],
+    guard: Option<tempfile::TempPath>,
+    mut mint_env: impl FnMut() -> Vec<(String, String)>,
+) -> Result<Option<tempfile::TempPath>, String> {
+    let Some(path) = args.get(1) else { return Err("missing MCP config argument".into()); };
+    // Preserve the existing fail-closed missing-config branch.
+    if !Path::new(path).exists() { return Ok(guard); }
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read frozen MCP config: {e}"))?;
+    let mut config: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("invalid frozen MCP config: {e}"))?;
+    if let Some(servers) = config.get_mut("mcpServers").and_then(serde_json::Value::as_object_mut) {
+        for (name, server) in servers {
+            if !duduclaw_core::mcp_proxy_rewrite::is_builtin_slot_name(name) { continue; }
+            // The preceding gate replaced each built-in alias with its host-owned
+            // definition. Each slot starts a distinct MCP process and needs its
+            // own nonce; sharing a proof would trip replay protection.
+            let server = server.as_object_mut().ok_or("invalid DuDuClaw MCP config")?;
+            let target = server.entry("env").or_insert_with(|| serde_json::json!({}))
+                .as_object_mut().ok_or("invalid DuDuClaw MCP environment")?;
+            for (name, value) in mint_env() { target.insert(name, serde_json::json!(value)); }
+        }
+    }
+    let mut file = tempfile::NamedTempFile::new().map_err(|e| format!("cannot freeze delegation config: {e}"))?;
+    serde_json::to_writer(&mut file, &config).map_err(|e| format!("cannot write delegation config: {e}"))?;
+    let path = file.into_temp_path();
+    args[1] = path.to_string_lossy().into_owned();
+    Ok(Some(path))
+}
+
 /// Guards whose lifetime must cover the spawned child: the temp files the
 /// command line points at are deleted when these drop.
 ///
@@ -4254,8 +4425,11 @@ fn prepare_claude_cmd(
     // RFC-23 §13.6: override that auto-discovery with a proxied copy when
     // the managed MCP gate runs (see `mcp_proxy_cli_args`). `None` ⇒ no flags at
     // all, auto-discovery unchanged.
+    let worker = config_dir.and_then(|d| d.file_name()).and_then(|s| s.to_str()).unwrap_or("");
     let mcp_proxy_guard = match mcp_config_cli_args(home_dir, work_dir, identity.mcp_config)? {
-        Some((args, guard)) => {
+        Some((mut args, guard)) => {
+            let guard = bind_delegation_mcp_config(&mut args, guard,
+                || delegation_context_env(home_dir, worker, HARD_MAX_TIMEOUT_SECS))?;
             cmd.args(&args);
             guard
         }
@@ -4448,24 +4622,17 @@ fn prepare_claude_cmd(
     // Prevent "nested session" error when gateway was launched from a Claude Code session
     cmd.env_remove("CLAUDECODE");
 
-    // Inject delegation context if running inside a dispatcher/cron task.
-    // These env vars propagate to the MCP server subprocess so it can
-    // enforce depth limits without trusting LLM-supplied tool params.
-    match DELEGATION_ENV.try_with(|env| {
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-    }) {
-        Ok(()) => { /* delegation context injected */ }
-        Err(_) => {
-            // Task-local not set — this is normal for regular chat (non-delegation).
-            // Delegation depth tracking is not needed for direct user→agent chat.
-            debug!("No DELEGATION_ENV task-local — delegation depth tracking inactive");
-        }
+    // The signed context belongs only to the DuDuClaw MCP child's env in
+    // the frozen config. Third-party MCPs and Claude's shell do not inherit it.
+    for name in [duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT,
+        duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN,
+        duduclaw_core::ENV_DELEGATION_SENDER, duduclaw_core::ENV_DELEGATION_ORIGIN,
+        duduclaw_core::ENV_DELEGATION_DEPTH] {
+        cmd.env_remove(name);
     }
-
-    let audit_worker = config_dir.and_then(|d| d.file_name()).and_then(|s| s.to_str()).unwrap_or("");
-    cmd.envs(delegation_audit_env(home_dir, audit_worker));
+    if let Ok(Some(hop)) = DELEGATION_ENV.try_with(|env| env.get(duduclaw_core::ENV_HOP_DEPTH).cloned()) {
+        cmd.env(duduclaw_core::ENV_HOP_DEPTH, hop);
+    }
 
     // Inject channel reply context so `send_to_agent` MCP tool can register
     // delegation callbacks for sub-agent response forwarding.

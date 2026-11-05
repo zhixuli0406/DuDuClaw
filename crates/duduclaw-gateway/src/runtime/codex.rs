@@ -453,7 +453,8 @@ struct McpOverrides {
 fn is_secret_env_name(k: &str) -> bool {
     const SECRET_SUFFIXES: &[&str] = &["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"];
     let upper = k.to_ascii_uppercase();
-    SECRET_SUFFIXES.iter().any(|s| upper.ends_with(s))
+    upper == duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT
+        || SECRET_SUFFIXES.iter().any(|s| upper.ends_with(s))
 }
 
 /// [`mcp_override_args`] with the Codex-version gate made explicit, so both
@@ -488,7 +489,7 @@ fn mcp_override_args_with_extra_env(
 ) -> McpOverrides {
     if !supports_env_vars {
         // Old Codex cannot forward secrets privately. Do not disclose a new
-        // delegation proof through argv; audit falls back to the worker.
+        // delegation proof through argv; further delegation is refused.
         return McpOverrides {
             args: mcp_override_args(agent_id, home_dir),
             process_env: Vec::new(),
@@ -1614,9 +1615,10 @@ impl AgentRuntime for CodexRuntime {
         // path per process; env passthrough alone falls back on probe failure.
         // The required employee permission profile was checked above.
         let supports_env_vars = codex_supports_env_vars(&self.codex_path).await;
-        let audit_env = crate::claude_runner::delegation_audit_env(&context.home_dir, &context.agent_id);
+        let delegation_env = crate::claude_runner::delegation_context_env(&context.home_dir, &context.agent_id,
+            crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref()));
         let mcp_overrides = mcp_override_args_with_extra_env(
-            &context.agent_id, &context.home_dir, supports_env_vars, &audit_env,
+            &context.agent_id, &context.home_dir, supports_env_vars, &delegation_env,
         );
         // Values first: on the `env_vars` branch Codex copies these out of its
         // OWN environment, so they must be set before it runs. They never
@@ -1950,7 +1952,7 @@ mod tests {
         let baseline = mcp_override_args_with("tester", home.path(), true);
         assert!(!baseline.args.is_empty(), "MCP server must be resolvable");
         assert!(baseline.process_env.iter().any(|(key, _)| key == duduclaw_core::ENV_AGENT_TOKEN));
-        let name = duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN;
+        let name = duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT;
         let proof = "host-proof-do-not-expose";
         let extra = vec![(name.to_string(), proof.to_string()),
                          (duduclaw_core::ENV_DELEGATION_SENDER.to_string(), "researcher".to_string())];
@@ -2119,7 +2121,9 @@ mod tests {
                 .and_then(|(_, value)| value).unwrap();
             assert!(std::path::Path::new(owned).is_dir());
             assert!(!std::path::Path::new(owned).join("config.toml").exists());
-            Ok(collected_fixture("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"PASS\"}}\n"))
+            let mut output = collected_fixture("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"PASS\"}}\n");
+            output.status = Some(std::process::ExitStatus::default());
+            Ok(output)
         });
         let response = MCP_CONFIG_TEST_PATHS.scope(vec![],
             COLLECT_PROBE.scope(probe, crate::runtime_dispatch::UTILITY_CALL.scope((),
@@ -3357,6 +3361,7 @@ mod tests {
         for ok in [
             "DUDUCLAW_MCP_API_KEY",
             "DUDUCLAW_AGENT_TOKEN",
+            "DUDUCLAW_DELEGATION_CONTEXT",
             "X_SECRET",
             "DB_PASSWORD",
             "db_password",
