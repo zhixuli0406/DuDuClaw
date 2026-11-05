@@ -569,6 +569,7 @@ async fn google_chat_listing_and_call_share_employee_denial() {
 #[tokio::test]
 async fn google_chat_tools_list_uses_same_scope_and_identity_receipt_as_gmail() {
     let home = fixture("");
+    duduclaw_gateway::google_workspace::set_chat_read_enabled(home.path(), true).unwrap();
     let call = authenticate_with_key_call(KEY, home.path()).unwrap();
     let principal = call.principal().clone();
     let names = with_authenticated_call(call, async {

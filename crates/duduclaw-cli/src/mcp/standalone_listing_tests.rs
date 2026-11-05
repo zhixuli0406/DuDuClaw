@@ -171,15 +171,19 @@ async fn google_chat_listing_tracks_admin_switch_for_employee_and_external_clien
     let home = scaffold_home();
     duduclaw_gateway::google_workspace::set_integration_enabled(home.path(), true).unwrap();
     let employee = principal("scaffold", "", false);
+    let standalone = principal("standalone-reader", "google:read", false);
     let external = principal("external-reader", "google:read", true);
 
     for enabled in [false, true] {
         duduclaw_gateway::google_workspace::set_chat_read_enabled(home.path(), enabled).unwrap();
         let employee_tools = names(&employee, home.path(), "scaffold", false).await;
+        let standalone_tools = names(&standalone, home.path(), "scaffold", false).await;
         let external_tools = names(&external, home.path(), "scaffold", false).await;
         for tool in ["google_chat_spaces", "google_chat_messages"] {
             assert_eq!(employee_tools.contains(tool), enabled, "employee: {tool}");
-            assert_eq!(external_tools.contains(tool), enabled, "external: {tool}");
+            assert_eq!(standalone_tools.contains(tool), enabled, "standalone: {tool}");
+            // External keys need an authenticated employee receipt, not only a scope.
+            assert!(!external_tools.contains(tool), "external without receipt: {tool}");
         }
     }
 }

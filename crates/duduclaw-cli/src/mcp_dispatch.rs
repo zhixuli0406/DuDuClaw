@@ -4842,7 +4842,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            259,
+            261,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
