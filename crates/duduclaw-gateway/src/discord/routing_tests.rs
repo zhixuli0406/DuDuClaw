@@ -93,7 +93,7 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_safe::private_test_home().unwrap();
         let home = temp.path().canonicalize().unwrap();
         let provider = Arc::new(crate::test_channel_provider::TestChannelProvider::start().await);
         let (token, transport) = routing_test_transport::install(&home, &provider.token);
@@ -640,7 +640,7 @@ async fn stale_binding_can_be_repaired_only_by_manage_guild_and_model_admin_is_p
     f.no_model_or_cloud();
     // The test transport cannot map another home, an unregistered dedicated
     // token or another service to this owned Discord server.
-    let another_home = tempfile::tempdir().unwrap();
+    let another_home = crate::fs_safe::private_test_home().unwrap();
     for (home, token, url) in [
         (
             another_home.path(),

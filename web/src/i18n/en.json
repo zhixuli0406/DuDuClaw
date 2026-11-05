@@ -9610,6 +9610,7 @@
   "webchat.queued": "Queued — will be handled after the current reply",
   "webchat.cancelQueued": "Cancel queued message",
   "webchat.turnLimit": "Too many messages are being processed. Please wait for the current replies to finish.",
+  "webchat.attachmentUploadRefused": "Attachments could not be uploaded. Reduce the number or size of files, or try again later.",
   "webchat.send": "Send",
   "webchat.stop": "Stop",
   "webchat.resend": "Copy to composer",
@@ -9785,5 +9786,10 @@
   "meeting.state.cancelled": "Cancelled",
   "meeting.sizeError": "Choose a non-empty recording within the file size limit.",
   "meeting.requestFailed": "Unable to complete the request. Try again shortly; uploaded parts are retained.",
-  "meeting.fileChanged": "This file differs from the earlier upload. Select the original file, or rename it to start a new upload."
+  "meeting.fileChanged": "This file differs from the earlier upload. Select the original file, or rename it to start a new upload.",
+  "webchat.attachment.download": "Download",
+  "webchat.attachment.downloadToOpen": "Download to open in your document viewer.",
+  "webchat.attachment.previewTooLarge": "Images larger than 2 MiB can be downloaded to view.",
+  "webchat.attachment.tooLarge": "This attachment exceeds the 20 MiB download limit.",
+  "webchat.attachment.unavailable": "This attachment is unavailable or you no longer have access."
 }

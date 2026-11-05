@@ -68,7 +68,7 @@ pub enum ChatMessage {
         agent: Option<String>,
         /// Uploaded files (base64). Saved to disk and referenced by path in the
         /// prompt, mirroring the channel attachment pipeline (Telegram/LINE).
-        #[serde(default)]
+        #[serde(default, deserialize_with = "uploads::deserialize_attachments")]
         attachments: Vec<ChatAttachment>,
         /// Client conversation nonce (dashboard "conversation" id). Two roles:
         /// ① scopes this turn to its own server-side session bucket
@@ -326,6 +326,7 @@ const NO_REPLY_TEXT: &str = "這則訊息沒有產生回覆，請稍後再傳一
 /// Machine code of [`NO_REPLY_TEXT`] for clients that word it themselves.
 const NO_REPLY_CODE: &str = "no_reply";
 mod route;
+mod uploads;
 pub(crate) mod access;
 
 /// A file attachment uploaded through the WebChat socket.
@@ -745,7 +746,9 @@ pub async fn ws_chat_handler(
         warn!(origin, "WebChat connection rejected: invalid origin");
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(move |socket| handle_chat_socket(socket, state, peer.ip()))
+    ws.max_message_size(uploads::MAX_MESSAGE_BYTES)
+        .max_frame_size(uploads::MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_chat_socket(socket, state, peer.ip()))
         .into_response()
 }
 
@@ -789,7 +792,11 @@ async fn stage_owned_webchat_deliverable(
 /// this reply.
 async fn rollback_owned_webchat_archives(paths: &[PathBuf]) {
     for path in paths {
-        let _ = tokio::fs::remove_file(path).await;
+        let Some(parent) = path.parent() else { continue; };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue; };
+        if let Ok(directory) = crate::fs_safe::SafeDir::open_nofollow(parent, false) {
+            let _ = directory.remove_file(name);
+        }
     }
 }
 
@@ -840,7 +847,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     let (auth_user, must_change_password) = {
         let auth_timeout = std::time::Duration::from_secs(10);
         let authed = match tokio::time::timeout(auth_timeout, stream.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ChatMessage>(&text) {
+            Ok(Some(Ok(Message::Text(text)))) => match uploads::parse_message(&text) {
                 Ok(ChatMessage::Auth { token }) => {
                     state.authenticate(&token).and_then(|identity| {
                         if !token.starts_with("widget:") {
@@ -1006,7 +1013,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                     Message::Text(text) => {
                         // Stop requests narrow authority, including after credential revocation.
                         // Reject malformed or concurrent frames before any credential I/O.
-                        if let Ok(ChatMessage::CancelDownstream { downstream_ref, request_id }) = serde_json::from_str::<ChatMessage>(&text) {
+                        if let Ok(ChatMessage::CancelDownstream { downstream_ref, request_id }) = uploads::parse_message(&text) {
                             let request_id = request_id.filter(|id| assign_event_id(Some(id)).is_some());
                             let permit = match turns::downstream::admit_stop(&downstream_stop, &downstream_ref, request_id.as_deref()) {
                                 Ok(permit) => permit,
@@ -1038,7 +1045,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 break;
                             }
                             if validity == crate::handlers::live_context::SocketValidity::Unavailable {
-                                if let Ok(ChatMessage::UserMessage { msg_id, conv, .. }) = serde_json::from_str::<ChatMessage>(&text) {
+                                if let Ok(ChatMessage::UserMessage { msg_id, conv, .. }) = uploads::parse_message(&text) {
                                     let _ = sink.send(turns::IdentityUnavailable::before_routing(
                                         msg_id.as_deref(), conv.as_deref(),
                                     )).await;
@@ -1046,7 +1053,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                             }
                             continue;
                         }
-                        let chat_msg: ChatMessage = match serde_json::from_str(&text) {
+                        let chat_msg: ChatMessage = match uploads::parse_message(&text) {
                             Ok(m) => m,
                             Err(e) => {
                                 let err = ChatMessage::error(format!("Invalid message format: {e}"));
@@ -1459,6 +1466,13 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     turn_sink.identity_unavailable(validity, true).await;
                                     continue;
                                 }
+                                let attachments = match uploads::admit(&state.ctx.home_dir, &auth_user, attachments).await {
+                                    Ok(files) => files,
+                                    Err(error) => {
+                                        turn_sink.frame(ChatMessage::error_coded(error, "attachment_upload_refused")).await;
+                                        continue;
+                                    }
+                                };
                                 match Box::pin(state.turns.admit_persistent(
                                     state.approvals.as_ref(), &cancel_principal, &auth_user, sid, conv_nonce.clone(), &msg_id,
                                     turns::configured_limit(&state.ctx.home_dir),
@@ -1659,54 +1673,29 @@ fn compose_session_id(base: &str, agent: Option<&str>, conv_nonce: Option<&str>)
     composed
 }
 
-/// Decode, size-check, and persist WebChat attachments to
-/// `<base_dir>/attachments/`, returning markdown file-reference lines to append
-/// to the prompt. Invalid or oversized attachments are logged and skipped
-/// (never abort the whole message). `base_dir` is the per-agent dir (WP1.3),
-/// falling back to the shared home dir.
+/// Validate the complete batch before creating any file. Save failures roll back
+/// only files created by this batch; the durable quota reservation stays charged.
 async fn save_webchat_attachments(
     base_dir: &std::path::Path,
     attachments: &[ChatAttachment],
-) -> Vec<String> {
-    use base64::Engine;
-
+) -> Result<Vec<String>, String> {
+    let prepared = uploads::prepare(attachments).await?;
     let mut refs = Vec::new();
-    for att in attachments {
-        let data =
-            match base64::engine::general_purpose::STANDARD.decode(att.data_base64.as_bytes()) {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(file = %att.filename, "WebChat attachment base64 decode failed: {e}");
-                    continue;
-                }
-            };
-        if data.len() as u64 > crate::media::MAX_FILE_SIZE {
-            warn!(
-                file = %att.filename,
-                bytes = data.len(),
-                "WebChat attachment exceeds max size — skipping"
-            );
-            continue;
-        }
-        let filename = if att.filename.trim().is_empty() {
-            "upload.bin".to_string()
-        } else {
-            att.filename.clone()
-        };
-        match crate::media::save_webchat_attachment_in_base(base_dir, &data, &filename).await {
-            Ok(path) => {
-                let mime = att
-                    .mime
-                    .clone()
-                    .filter(|m| !m.is_empty())
-                    .unwrap_or_else(|| crate::media::detect_mime(&data));
-                let mt = crate::media::media_type_from_mime(&mime);
-                refs.push(crate::media::format_attachment_ref(&mt, &filename, &path));
+    let mut paths = Vec::new();
+    for att in prepared {
+        let path = match crate::media::save_webchat_attachment_in_base(base_dir, &att.data, &att.filename).await {
+            Ok(path) => path,
+            Err(error) => {
+                rollback_owned_webchat_archives(&paths).await;
+                return Err(error);
             }
-            Err(e) => warn!(file = %filename, "WebChat attachment save failed: {e}"),
-        }
+        };
+        let mime = att.mime.unwrap_or_else(|| crate::media::detect_mime(&att.data));
+        let mt = crate::media::media_type_from_mime(&mime);
+        refs.push(crate::media::format_attachment_ref(&mt, &att.filename, &path));
+        paths.push(path);
     }
-    refs
+    Ok(refs)
 }
 
 #[cfg(test)]
@@ -1876,11 +1865,25 @@ mod tests {
         assert!(turn_admission_error("turn_limit", "session", None, "message")["conv"].is_null());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn webchat_rollback_refuses_symlinked_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("archive.txt");
+        std::fs::write(&target, b"untouched").unwrap();
+        std::os::unix::fs::symlink(outside.path(), home.join("attachments")).unwrap();
+        rollback_owned_webchat_archives(&[home.join("attachments/archive.txt")]).await;
+        assert_eq!(std::fs::read(target).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn revoked_credential_rolls_back_archives_before_blocking_final_reply() {
         let mut recovery = crate::handlers::live_context::SocketRecovery::default();
         let archive = tempfile::NamedTempFile::new().unwrap();
-        let archive_path = archive.path().to_path_buf();
+        let archive_path = archive.path().canonicalize().unwrap();
         assert!(!rollback_before_final_reply(crate::handlers::live_context::SocketValidity::Revoked,
             &mut recovery, std::slice::from_ref(&archive_path)).await);
         assert!(recovery.closed());

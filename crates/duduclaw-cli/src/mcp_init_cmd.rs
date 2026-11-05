@@ -344,7 +344,7 @@ pub(crate) fn prepare(
 /// `duduclaw mcp-server` opens `memory.db` at start. There is no second
 /// initialisation path to keep in step with the platform's.
 fn ensure_home(home: &Path) -> Result<()> {
-    std::fs::create_dir_all(home).map_err(|e| {
+    duduclaw_core::config::create_home_dir(home).map_err(|e| {
         DuDuClawError::Config(format!(
             "cannot create the data directory {}: {e}",
             home.display()

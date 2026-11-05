@@ -7,8 +7,14 @@ struct TempDir(std::path::PathBuf);
 impl TempDir {
     fn new() -> Self {
         let path =
-            std::env::temp_dir().join(format!("duduclaw-th-test-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&path).unwrap();
+            std::env::temp_dir().canonicalize().unwrap().join(format!("duduclaw-th-test-{}", uuid::Uuid::new_v4()));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path).unwrap();
         Self(path)
     }
     fn path(&self) -> &std::path::Path {

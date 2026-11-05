@@ -170,7 +170,7 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
         }
     };
     let home = work.join("eval-home");
-    std::fs::create_dir_all(&home).map_err(|e| err(e.to_string()))?;
+    duduclaw_core::config::create_home_dir(&home).map_err(|e| err(e.to_string()))?;
     if duduclaw_knowledge::schema::db_path(&home).exists() {
         return Err(err(format!(
             "工作目錄 {} 已有評估資料庫，請換一個空的資料夾。",

@@ -9610,6 +9610,7 @@
   "webchat.queued": "待機中 — 現在の返信が終わってから処理します",
   "webchat.cancelQueued": "待機中のメッセージをキャンセル",
   "webchat.turnLimit": "同時に処理できるメッセージの上限に達しました。現在の返信が終わるまでお待ちください。",
+  "webchat.attachmentUploadRefused": "添付ファイルをアップロードできません。ファイル数やサイズを減らすか、しばらくしてから再試行してください。",
   "webchat.send": "送信",
   "webchat.stop": "停止",
   "webchat.resend": "入力欄に戻す",
@@ -9785,5 +9786,10 @@
   "meeting.state.cancelled": "取り消しました",
   "meeting.sizeError": "上限以内の空でない録音や動画を選んでください。",
   "meeting.requestFailed": "処理を完了できませんでした。しばらくして再試行してください。送信済みの部分は保持されます。",
-  "meeting.fileChanged": "以前アップロードしたファイルと内容が異なります。元のファイルを選ぶか、名前を変更して新しく送信してください。"
+  "meeting.fileChanged": "以前アップロードしたファイルと内容が異なります。元のファイルを選ぶか、名前を変更して新しく送信してください。",
+  "webchat.attachment.download": "ダウンロード",
+  "webchat.attachment.downloadToOpen": "ダウンロードしてドキュメントビューアーで開いてください。",
+  "webchat.attachment.previewTooLarge": "2 MiB を超える画像はダウンロードしてご覧ください。",
+  "webchat.attachment.tooLarge": "この添付ファイルはダウンロード上限の 20 MiB を超えています。",
+  "webchat.attachment.unavailable": "添付ファイルを読み込めないか、アクセス権がありません。"
 }

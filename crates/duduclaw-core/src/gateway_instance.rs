@@ -75,6 +75,7 @@ fn acquire_inner(home: &Path, record_refusal: bool) -> Result<(), String> {
     // Canonicalize only after creation. A missing home under a relative or
     // symlinked parent otherwise gets a different registry key after locking,
     // so held()/the next acquire would fail to recognize our own handle.
+    crate::config::create_home_dir(home).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(home.join("locks")).map_err(|e| e.to_string())?;
     let key = key(home);
     let mut held = held_locks()

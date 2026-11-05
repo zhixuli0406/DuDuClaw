@@ -17,6 +17,7 @@ enum Kind {
     Session,
     Run,
     Cursor,
+    Attachment,
 }
 impl Kind {
     fn tag(self) -> &'static str {
@@ -24,13 +25,14 @@ impl Kind {
             Self::Session => "s",
             Self::Run => "r",
             Self::Cursor => "c",
+            Self::Attachment => "a",
         }
     }
     fn max_raw(self) -> usize {
         match self {
             Self::Session => MAX_RAW,
             Self::Run => MAX_RAW + 32,
-            Self::Cursor => 4096,
+            Self::Cursor | Self::Attachment => 4096,
         }
     }
 }
@@ -44,9 +46,13 @@ const TTL: Duration = Duration::from_secs(1800);
 struct Entry {
     raw: String,
     issued: Instant,
+    accessed: Instant,
 }
 type Cache = HashMap<(PathBuf, String, String), Entry>;
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+static ATTACHMENTS: OnceLock<Mutex<Cache>> = OnceLock::new();
+const ATTACHMENTS_PER_USER: usize = 512;
+fn attachment_cache() -> &'static Mutex<Cache> { ATTACHMENTS.get_or_init(Default::default) }
 fn cache() -> &'static Mutex<Cache> {
     CACHE.get_or_init(Default::default)
 }
@@ -76,6 +82,7 @@ fn remember(home: &Path, user: &str, handle: &str, raw: &str) {
                 Entry {
                     raw: raw.into(),
                     issued: Instant::now(),
+                    accessed: Instant::now(),
                 },
             );
         }
@@ -89,6 +96,17 @@ pub fn issue_run(home: &Path, user: &str, raw: &str) -> Result<String, String> {
 }
 pub fn issue_cursor(home: &Path, user: &str, raw: &str) -> Result<String, String> {
     issue_kind(home, user, raw, Kind::Cursor)
+}
+/// Attachment routes are cached server-side and never accept raw client paths.
+pub fn issue_attachment(home: &Path, user: &str, raw: &str) -> Result<String, String> {
+    issue_kind(home, user, raw, Kind::Attachment)
+}
+pub async fn resolve_attachment(home: &Path, user: &str, value: &str) -> Result<String, String> {
+    if !value.strip_prefix(prefix(Kind::Attachment).as_str())
+        .is_some_and(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err("attachment unavailable".into());
+    }
+    resolve_kind(home, user, value, Kind::Attachment).await
 }
 /// Non-routing references for search keys and CSV message identifiers.
 pub fn reference(home: &Path, user: &str, raw: &str) -> Result<String, String> {
@@ -108,8 +126,27 @@ fn issue_kind(home: &Path, user: &str, raw: &str, kind: Kind) -> Result<String, 
     }
     let key = crate::trigger_route::access::private_view_key(home, user)?;
     let value = with_key(&key, kind.tag(), raw);
-    remember(home, user, &value, raw);
+    if matches!(kind, Kind::Attachment) {
+        let mut c = attachment_cache().lock().map_err(|_| "attachment unavailable")?;
+        remember_attachment(&mut c, home, user, &value, raw)?;
+    } else {
+        remember(home, user, &value, raw);
+    }
     Ok(value)
+}
+fn remember_attachment(c: &mut Cache, home: &Path, user: &str, value: &str, raw: &str) -> Result<(), String> {
+    c.retain(|_, e| e.issued.elapsed() < TTL);
+    let key = (home.to_path_buf(), user.to_owned(), value.to_owned());
+    if !c.contains_key(&key) {
+        let own: Vec<_> = c.iter().filter(|((h,u,_),_)| h == home && u == user)
+            .map(|(k,e)| (k.clone(), e.accessed)).collect();
+        if own.len() >= ATTACHMENTS_PER_USER {
+            if let Some((oldest, _)) = own.into_iter().min_by_key(|(_, t)| *t) { c.remove(&oldest); }
+        }
+        if c.len() >= MAX_CACHE { return Err("attachment capacity reached".into()); }
+    }
+    c.insert(key, Entry { raw: raw.into(), issued: Instant::now(), accessed: Instant::now() });
+    Ok(())
 }
 pub async fn resolve(home: &Path, user: &str, value: &str) -> Result<String, String> {
     resolve_kind(home, user, value, Kind::Session).await
@@ -138,16 +175,17 @@ async fn resolve_kind(home: &Path, user: &str, value: &str, kind: Kind) -> Resul
         return Err("session not found".into());
     }
     let key = crate::trigger_route::access::private_view_key(home, user)?;
-    if let Some(raw) = cache()
+    let selected_cache = if matches!(kind, Kind::Attachment) { attachment_cache() } else { cache() };
+    if let Some(raw) = selected_cache
         .lock()
         .map_err(|_| "history unavailable")?
-        .get(&(home.into(), user.into(), value.into()))
+        .get_mut(&(home.into(), user.into(), value.into()))
         .filter(|e| e.issued.elapsed() < TTL)
-        .map(|e| e.raw.clone())
+        .map(|e| { e.accessed = Instant::now(); e.raw.clone() })
     {
         return Ok(raw);
     }
-    if matches!(kind, Kind::Cursor) {
+    if matches!(kind, Kind::Cursor | Kind::Attachment) {
         return Err("cursor expired".into());
     }
     static READERS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -167,7 +205,7 @@ async fn resolve_kind(home: &Path, user: &str, value: &str, kind: Kind) -> Resul
         )
         .map_err(|_| "session not found")?;
         let sql=match kind {
-            Kind::Cursor=>return Err("cursor expired".into()),
+            Kind::Cursor | Kind::Attachment=>return Err("cursor expired".into()),
             Kind::Session=>"SELECT id FROM sessions WHERE archived_at IS NULL ORDER BY rowid DESC LIMIT ?1",
             Kind::Run=>"SELECT s.id || '#' || CAST(m.id AS TEXT) FROM session_messages m JOIN sessions s ON s.id=m.session_id WHERE s.archived_at IS NULL AND m.hidden=0 AND m.undone_at IS NULL AND m.role='user' ORDER BY m.id DESC LIMIT ?1",
         };
@@ -189,4 +227,34 @@ async fn resolve_kind(home: &Path, user: &str, value: &str, kind: Kind) -> Resul
     })
     .await
     .map_err(|_| "history unavailable".to_string())?
+}
+
+#[cfg(test)]
+mod attachment_cache_tests {
+    use super::*;
+    #[test]
+    fn chat_attachment_cache_per_user_lru_and_capacity_never_issue_dead_handles() {
+        let mut c = Cache::new();
+        let home = Path::new("/cache-test");
+        remember_attachment(&mut c, home, "bob", "b", "bob-reference").unwrap();
+        for i in 0..ATTACHMENTS_PER_USER + 5 {
+            let id = format!("a-{i}");
+            remember_attachment(&mut c, home, "alice", &id, "alice-reference").unwrap();
+            assert!(c.contains_key(&(home.into(), "alice".into(), id)));
+            if i == ATTACHMENTS_PER_USER - 1 {
+                c.get_mut(&(home.into(), "alice".into(), "a-0".into())).unwrap().accessed = Instant::now();
+            }
+        }
+        assert!(c.contains_key(&(home.into(), "bob".into(), "b".into())));
+        assert_eq!(c.len(), ATTACHMENTS_PER_USER + 1);
+        assert!(c.contains_key(&(home.into(), "alice".into(), "a-0".into())));
+        assert!(!c.contains_key(&(home.into(), "alice".into(), "a-1".into())));
+        while c.len() < MAX_CACHE {
+            let user = format!("other-{}", c.len());
+            c.insert((home.into(), user, "id".into()), Entry { raw: "r".into(), issued: Instant::now(), accessed: Instant::now() });
+        }
+        assert!(remember_attachment(&mut c, home, "carol", "new", "ref").is_err());
+        assert!(!c.contains_key(&(home.into(), "carol".into(), "new".into())));
+        assert!(remember_attachment(&mut c, home, "bob", "b", "updated").is_ok());
+    }
 }

@@ -54,7 +54,7 @@ impl ReadState {
     }
     pub fn save(&self, home: &Path) -> Result<()> {
         // Same-directory tempfile + fsync + atomic replacement (also on Windows).
-        std::fs::create_dir_all(home).map_err(|_| Error::LocalState)?;
+        duduclaw_core::config::create_home_dir(home).map_err(|_| Error::LocalState)?;
         let mut temp = tempfile::NamedTempFile::new_in(home).map_err(|_| Error::LocalState)?;
         let bytes = serde_json::to_vec(self).map_err(|_| Error::LocalState)?;
         if bytes.len() as u64 > MAX_FILE_BYTES {

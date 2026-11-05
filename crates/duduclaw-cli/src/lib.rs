@@ -4244,13 +4244,16 @@ pub async fn entry_point() {
     // failed: Broken pipe" and the agent lost its entire tool surface over a
     // diagnostics convenience. Use the fallible builder and degrade to
     // stderr-only logging instead.
-    let log_dir = duduclaw_home().join("logs");
-    let _ = std::fs::create_dir_all(&log_dir);
-    let file_writer = match tracing_appender::rolling::Builder::new()
+    let home = duduclaw_home();
+    let log_dir = home.join("logs");
+    let file_writer = match duduclaw_core::config::create_home_dir(&home)
+        .and_then(|_| std::fs::create_dir_all(&log_dir))
+        .map_err(|e| e.to_string())
+        .and_then(|_| tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("gateway.log")
         .max_log_files(duduclaw_gateway::log::FILE_LOG_MAX_FILES)
-        .build(&log_dir)
+        .build(&log_dir).map_err(|e| e.to_string()))
     {
         Ok(appender) => {
             let (non_blocking, guard) = tracing_appender::non_blocking(appender);
@@ -8499,6 +8502,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     );
 
     // Create directory structure
+    duduclaw_core::config::create_home_dir(&home)?;
     let agent_dir = home.join("agents").join(&agent_name);
     for dir in &[
         home.clone(),
@@ -8988,7 +8992,7 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
     // zero-prompt bootstrap already satisfies.
     let _ = yes;
     if !home.join("config.toml").exists() {
-        std::fs::create_dir_all(&home)?;
+        duduclaw_core::config::create_home_dir(&home)?;
         let content = format!(
         "# DuDuClaw configuration (auto-created on first run).\n\
          # Finish setup in the dashboard — no need to edit this by hand.\n\
@@ -10444,6 +10448,10 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
         ));
     }
 
+    if let Some(message) = duduclaw_core::config::home_permissions_warning(&home) {
+        checks.push(("資料目錄權限".into(), CheckStatus::Warn, message));
+    }
+
     // Check 2b (WP22 T1): organisational authority + mirror drift.
     checks.push(org_authority_check(&home));
 
@@ -11081,6 +11089,7 @@ pub(crate) async fn scaffold_planned_agent_dir(
     let config = std::str::from_utf8(config).map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     duduclaw_gateway::product_policy::validate_write(home, &agent_dir.join("agent.toml"), "", config)
         .map_err(DuDuClawError::Agent)?;
+    duduclaw_core::config::create_home_dir(home)?;
     std::fs::create_dir_all(home.join("agents"))
         .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     // Exclusive directory creation refuses a destination created after planning.
@@ -11205,6 +11214,7 @@ pub(crate) async fn scaffold_agent_dir(
     }
 
     // Create directory structure
+    duduclaw_core::config::create_home_dir(home)?;
     for dir in &[
         agent_dir.clone(),
         agent_dir.join("SKILLS"),

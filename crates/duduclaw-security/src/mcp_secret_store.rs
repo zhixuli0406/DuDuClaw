@@ -126,7 +126,7 @@ fn store_path(home: &Path, agent: &str) -> io::Result<PathBuf> {
 }
 
 fn prepare_store(home: &Path) -> io::Result<()> {
-    fs::create_dir_all(home)?;
+    duduclaw_core::config::create_home_dir(home)?;
     private_dir(&home.join("secrets"))?;
     private_dir(&home.join("secrets/mcp"))
 }

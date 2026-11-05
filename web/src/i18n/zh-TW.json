@@ -9610,6 +9610,7 @@
   "webchat.queued": "排隊中，這一輪結束後處理",
   "webchat.cancelQueued": "取消排隊",
   "webchat.turnLimit": "同時處理的訊息已達上限，請等目前的回覆完成",
+  "webchat.attachmentUploadRefused": "附件無法上傳，請減少檔案數量或大小，或稍後再試。",
   "webchat.send": "送出",
   "webchat.stop": "停止",
   "webchat.resend": "重新填入輸入框",
@@ -9785,5 +9786,10 @@
   "meeting.state.cancelled": "已取消",
   "meeting.sizeError": "請選擇未超過大小上限的非空錄音或影片。",
   "meeting.requestFailed": "目前無法完成，請稍後再試；已上傳的部分會保留。",
-  "meeting.fileChanged": "檔案內容與先前上傳的版本不同，請使用原始檔案或更名後重新上傳。"
+  "meeting.fileChanged": "檔案內容與先前上傳的版本不同，請使用原始檔案或更名後重新上傳。",
+  "webchat.attachment.download": "下載",
+  "webchat.attachment.downloadToOpen": "下載後使用文件閱讀器開啟。",
+  "webchat.attachment.previewTooLarge": "超過 2 MiB 的圖片請下載後檢視。",
+  "webchat.attachment.tooLarge": "此附件超過 20 MiB 的下載上限。",
+  "webchat.attachment.unavailable": "附件無法讀取，或你已無權存取。"
 }

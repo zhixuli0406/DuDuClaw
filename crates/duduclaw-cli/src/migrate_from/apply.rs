@@ -269,7 +269,7 @@ pub(super) fn read_config_table(home:&Path)->(toml::value::Table,String) {
 /// not invoke this helper. No migration-generated source stamp is trusted.
 pub(super) fn write_config_table(home:&Path,table:&toml::value::Table,expected_hash:&str)->Result<()> {
     let content=toml::to_string_pretty(table).map_err(|e|DuDuClawError::Config(format!("序列化 config.toml 失敗: {e}")))?;
-    std::fs::create_dir_all(home).ok();
+    duduclaw_core::config::create_home_dir(home)?;
     duduclaw_gateway::commit_config_rendered(home,expected_hash,|_|Ok(content))
         .map_err(|e|DuDuClawError::Io(std::io::Error::other(format!("覆寫 config.toml 失敗: {e}"))))
 }

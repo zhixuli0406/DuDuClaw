@@ -2709,6 +2709,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         // a `token` query param so browser preview/download links work.
         .route("/api/files", get(handle_files_list))
         .route("/api/files/download", get(handle_files_download))
+        .route("/api/chat/attachments", get(handle_chat_attachment))
         .route(
             "/api/data-exports/{id}/download",
             get(data_exports_http::download),
@@ -14842,106 +14843,65 @@ struct FilesDownloadQuery {
     token: Option<String>,
 }
 
-/// GET /api/files/download — stream a single attachment file.
+#[derive(serde::Deserialize)]
+struct ChatAttachmentQuery { id: String, #[serde(default)] preview: bool }
+
+/// Dashboard JWT header only: no credentials in href/src/query strings.
+async fn handle_chat_attachment(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ChatAttachmentQuery>,
+) -> axum::response::Response {
+    let ctx = match knowledge_caller(&state, &headers) { Ok(c) => c, Err(r) => return r };
+    let max = if q.preview { crate::chat_attachments::limits::MAX_PREVIEW } else { crate::chat_attachments::limits::MAX_DOWNLOAD };
+    let (bytes, name, admission) = match state.handler.history_attachment_bytes(&ctx, &q.id, max).await {
+        Ok(f) => f,
+        Err(_) => return axum::http::StatusCode::NOT_FOUND.into_response(),
+    };
+    let mime = crate::files_api::content_type_for(&name);
+    let inline = matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp");
+    let disposition = if inline { "inline" } else { "attachment" };
+    let cd = format!("{disposition}; filename*=UTF-8''{}", crate::files_api::encode_filename_star(&name));
+    let size = bytes.len();
+    let mut response = axum::response::Response::new(crate::chat_attachments::response::body(bytes, admission));
+    let h = response.headers_mut();
+    h.insert("content-length", axum::http::HeaderValue::from_str(&size.to_string()).expect("numeric length"));
+    h.insert("content-encoding", axum::http::HeaderValue::from_static("identity"));
+    h.insert("content-type", axum::http::HeaderValue::from_static(mime));
+    h.insert("content-disposition", axum::http::HeaderValue::from_str(&cd).unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment")));
+    h.insert("x-content-type-options", axum::http::HeaderValue::from_static("nosniff"));
+    h.insert("cache-control", axum::http::HeaderValue::from_static("private, no-store"));
+    h.insert("content-security-policy", axum::http::HeaderValue::from_static("sandbox; default-src 'none'"));
+    response
+}
+
+#[cfg(test)]
+mod chat_attachments_http_tests;
+
+mod files_snapshot;
+
+/// GET /api/files/download — authorize and serve the same bounded FD snapshot.
 async fn handle_files_download(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<FilesDownloadQuery>,
 ) -> axum::response::Response {
     let agent = q.agent.as_deref().filter(|s| !s.is_empty());
-    // Auth (header or `token` query) + per-agent authorization, fail-closed.
     let ctx = match authorize_file_access(&state, &headers, q.token.as_deref(), agent) {
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
-        return resp;
-    }
-
-    let dir = match crate::files_api::attachments_dir(&state.home_dir, agent) {
-        Some(d) => d,
-        None => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid agent id" })),
-            )
-                .into_response();
-        }
+    let snapshot = match files_snapshot::load(&state, &ctx, agent, &q.name,
+        crate::chat_attachments::limits::MAX_DOWNLOAD).await {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
     };
-
-    let path = match crate::files_api::resolve_attachment_file(&dir, &q.name) {
-        Ok(p) => p,
-        Err(crate::files_api::ResolveError::BadRequest) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid file name" })),
-            )
-                .into_response();
-        }
-        Err(crate::files_api::ResolveError::Denied) => {
-            return (
-                axum::http::StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "error": "access denied" })),
-            )
-                .into_response();
-        }
-        Err(crate::files_api::ResolveError::NotFound) => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "file not found" })),
-            )
-                .into_response();
-        }
-    };
-
-    let file = match tokio::fs::File::open(&path).await {
-        Ok(f) => f,
-        Err(_) => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "file not found" })),
-            )
-                .into_response();
-        }
-    };
-
-    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
-        return resp;
-    }
-    let stream = tokio_util::io::ReaderStream::new(file);
-    let body = axum::body::Body::from_stream(stream);
-    let ct = crate::files_api::content_type_for(&q.name);
-    let disposition = if crate::files_api::is_inline_previewable(&q.name) {
-        "inline"
-    } else {
-        "attachment"
-    };
-    // RFC 5987 filename* keeps CJK filenames intact across the header.
-    let cd = format!(
-        "{disposition}; filename*=UTF-8''{}",
-        crate::files_api::encode_filename_star(&q.name)
-    );
-
-    let mut resp = axum::response::Response::new(body);
-    resp.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static(ct),
-    );
-    resp.headers_mut().insert(
-        axum::http::header::CONTENT_DISPOSITION,
-        axum::http::HeaderValue::from_str(&cd)
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment")),
-    );
-    resp
+    files_snapshot::response(snapshot.bytes, &q.name, crate::files_api::content_type_for(&q.name),
+        crate::files_api::is_inline_previewable(&q.name), snapshot.admission)
 }
 
-/// GET /api/files/preview — in-browser preview for office documents.
-///
-/// Natively-previewable types (pdf/images) stream inline directly. Office
-/// types (docx/xlsx/pptx/…) are converted to PDF via LibreOffice headless
-/// with an mtime-validated cache under `<home>/cache/preview/<agent>/`;
-/// LibreOffice missing → explicit 503 JSON (never a broken byte stream).
-/// Same auth + path fences as `handle_files_download`.
+/// GET /api/files/preview — inline bytes or an isolated conversion of the same
+/// checked snapshot. Never pass the mutable attachment pathname to LibreOffice.
 async fn handle_files_preview(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -14952,195 +14912,21 @@ async fn handle_files_preview(
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
-        return resp;
-    }
-    let dir = match crate::files_api::attachments_dir(&state.home_dir, agent) {
-        Some(d) => d,
-        None => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid agent id" })),
-            )
-                .into_response();
-        }
+    let snapshot = match files_snapshot::load(&state, &ctx, agent, &q.name,
+        crate::chat_attachments::limits::MAX_PREVIEW).await {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
     };
-    let path = match crate::files_api::resolve_attachment_file(&dir, &q.name) {
-        Ok(p) => p,
-        Err(crate::files_api::ResolveError::BadRequest) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid file name" })),
-            )
-                .into_response();
-        }
-        Err(crate::files_api::ResolveError::Denied) => {
-            return (
-                axum::http::StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "error": "access denied" })),
-            )
-                .into_response();
-        }
-        Err(crate::files_api::ResolveError::NotFound) => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "file not found" })),
-            )
-                .into_response();
-        }
-    };
-
-    // Natively previewable → stream the file itself inline.
+    // load rechecks live authority against the opened bytes, including inline.
     if crate::files_api::is_inline_previewable(&q.name) {
-        return stream_preview_pdf(&path, &q.name, crate::files_api::content_type_for(&q.name))
-            .await;
+        return files_snapshot::response(snapshot.bytes, &q.name, crate::files_api::content_type_for(&q.name),
+            true, snapshot.admission);
     }
     if !crate::files_api::is_office_convertible(&q.name) {
-        return (
-            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            Json(serde_json::json!({ "error": "此檔案類型不支援預覽，請下載後開啟" })),
-        )
-            .into_response();
+        return files_snapshot::error(axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "此檔案類型不支援預覽，請下載後開啟");
     }
-
-    // WP-4G: office documents are zip containers, and the file being previewed
-    // may be an attachment a stranger sent into a channel. LibreOffice is a
-    // recursive-descent OOXML parser with no resource ceiling of its own — a
-    // zip bomb or a deeply-nested part would take out the host, not just the
-    // conversion. Gate BEFORE the process is spawned; fail-closed on violation.
-    let limits = crate::document_limits::DocumentLimits::from_home(&state.home_dir);
-    if let Err(v) = crate::document_limits::guard_document_path(&path, &limits) {
-        tracing::warn!(
-            file = %q.name,
-            violation = v.kind(),
-            "files preview: refused — document exceeds inbound resource limits"
-        );
-        return (
-            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({ "error": v.user_message(&q.name) })),
-        )
-            .into_response();
-    }
-
-    // Cache: <home>/cache/preview/<agent|_shared>/<stem>.pdf, valid while it
-    // is newer than the source file.
-    let cache_dir = crate::files_api::preview_cache_dir(&state.home_dir, agent);
-    let stem = std::path::Path::new(&q.name)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("preview");
-    let cached = cache_dir.join(format!("{stem}.pdf"));
-    let src_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    let cache_fresh = match (
-        std::fs::metadata(&cached).and_then(|m| m.modified()),
-        src_mtime,
-    ) {
-        (Ok(c), Some(s)) => c >= s,
-        _ => false,
-    };
-
-    if !cache_fresh {
-        let Some(soffice) = crate::files_api::find_soffice() else {
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "尚未安裝 LibreOffice，無法產生 Office 檔預覽；請下載檔案開啟，或安裝 LibreOffice 後重試"
-                })),
-            )
-                .into_response();
-        };
-        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("preview cache dir failed: {e}") })),
-            )
-                .into_response();
-        }
-        // Isolated LO profile: parallel conversions against the default
-        // profile fight over its lock and abort.
-        let profile = cache_dir.join(".lo_profile");
-        let profile_arg = format!("-env:UserInstallation=file://{}", profile.display());
-        let mut command = tokio::process::Command::new(&soffice);
-        duduclaw_core::ns_guard::guard_command(&mut command);
-        let run = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            command.arg("--headless")
-                .arg(profile_arg)
-                .arg("--convert-to")
-                .arg("pdf")
-                .arg("--outdir")
-                .arg(&cache_dir)
-                .arg(&path)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .output(),
-        )
-        .await;
-        let converted = match run {
-            Ok(Ok(out)) if out.status.success() && cached.is_file() => true,
-            Ok(Ok(out)) => {
-                let raw = String::from_utf8_lossy(&out.stderr);
-                let stderr = duduclaw_core::truncate_bytes(&raw, 240);
-                tracing::warn!(file = %q.name, %stderr, "files preview: soffice conversion failed");
-                false
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(file = %q.name, error = %e, "files preview: soffice spawn failed");
-                false
-            }
-            Err(_) => {
-                tracing::warn!(file = %q.name, "files preview: soffice conversion timed out (60s)");
-                false
-            }
-        };
-        if !converted {
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "預覽轉檔失敗，請下載檔案開啟" })),
-            )
-                .into_response();
-        }
-    }
-
-    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
-        return resp;
-    }
-    stream_preview_pdf(&cached, &format!("{stem}.pdf"), "application/pdf").await
-}
-
-/// Stream `path` inline with `ct` + an RFC 5987 filename header.
-async fn stream_preview_pdf(
-    path: &std::path::Path,
-    filename: &str,
-    ct: &'static str,
-) -> axum::response::Response {
-    let file = match tokio::fs::File::open(path).await {
-        Ok(f) => f,
-        Err(_) => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "file not found" })),
-            )
-                .into_response();
-        }
-    };
-    let stream = tokio_util::io::ReaderStream::new(file);
-    let body = axum::body::Body::from_stream(stream);
-    let cd = format!(
-        "inline; filename*=UTF-8''{}",
-        crate::files_api::encode_filename_star(filename)
-    );
-    let mut resp = axum::response::Response::new(body);
-    resp.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static(ct),
-    );
-    resp.headers_mut().insert(
-        axum::http::header::CONTENT_DISPOSITION,
-        axum::http::HeaderValue::from_str(&cd)
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("inline")),
-    );
-    resp
+    files_snapshot::office_preview(&state, &ctx, agent, &q.name, snapshot).await
 }
 
 // ── Voice endpoints (openhuman-parity B: STT + TTS) ──────────────

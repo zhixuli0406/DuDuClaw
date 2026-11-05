@@ -56,7 +56,7 @@ Every delivered file is copied into the agent's `attachments/` directory **befor
 The Files page previews office documents in the browser via `GET /api/files/preview`:
 
 - PDF and images stream inline natively.
-- `docx/xlsx/pptx/odt/ods/odp/csv` are converted to PDF by LibreOffice (`soffice --headless`) with an mtime-validated cache under `<home>/cache/preview/<agent>/`, an isolated LO profile (parallel conversions against the default profile fight over its lock), and a 60-second timeout.
+- `docx/xlsx/pptx/odt/ods/odp/csv` are converted to PDF by LibreOffice (`soffice --headless`) from a verified snapshot in a private directory for each request, with an isolated LO profile and a 60-second timeout. The mutable attachment path and old mtime cache are not used for conversion. Both source and converted preview are limited to 2 MiB; larger files remain downloadable up to 20 MiB. File downloads and inline previews also authorize the same bounded bytes they return. These attachment operations require Unix no-follow directory handles; other platforms refuse access.
 - LibreOffice missing → an explicit 503 JSON message, never a broken byte stream.
 - Same JWT auth and path fences as the download endpoint.
 
@@ -89,3 +89,26 @@ Two surfaces read the ledger:
 | Deliver path | absolute, canonicalized, inside agent dir or shared `attachments/` (fail-closed) |
 | Sweep | 3 files / reply, 15-min window, depth ≤ 3, office extensions only |
 | Preview conversion | LibreOffice required for office types; 60s timeout per conversion |
+
+
+### Attachments in conversation history
+
+On Unix gateways, readable history attachments appear as cards with a name, size, type and download button. PNG, JPEG, GIF and WebP show thumbnails. PDF and Office files download for opening in your document viewer; history does not run LibreOffice conversion. The Files page keeps its separate preview flow.
+
+Existing Markdown attachment links are resolved on the server. DELIVER sources outside the attachments folder work only when an exact, unambiguous host archive record points to a copy in that employee's attachments folder. Missing files, old paths from another home, ambiguous source versions and unsafe paths do not produce downloadable cards. The browser receives an opaque reference, never the stored host path.
+
+Requests use the current dashboard JWT in the Authorization header, without tokens in URLs. Both the conversation history rules and the existing artifact audience/ownership rules apply on every request. Masked external histories never expose original attachments. Restricted readers need trusted WebChat ownership or an existing task grant; an old message with a typed path is not an ownership grant. Handles expire after 30 minutes or a gateway restart: reload history to refresh them. Non-Unix gateways currently refuse this new file-serving route because descriptor-relative no-follow reads are not implemented there.
+
+Downloads are limited to 20 MiB and image previews to 2 MiB. Larger images remain download-only; they are not fetched automatically as cards approach the viewport. The gateway checks the opened file's size, makes a bounded snapshot and checks its hash against recorded provenance and any required workflow receipt before returning those same bytes. Responses carry `Content-Length`; the browser checks that length and stops reading if the response exceeds its limit. Uploads use unpredictable UUID names and exclusive creation, so simultaneous same-name uploads do not overwrite each other.
+
+History reads select the newest rows with SQL `LIMIT`, open the durable authorization index once per request and query archive/source keys. Each response is bounded to 2 MiB of message text, 1 MiB per message, 32 attachments and 256 inspected references. History projection allows at most two concurrent requests and 30 requests per minute per user, with four concurrent requests globally. Downloads allow two concurrent requests per user and four globally; each user has a 120 MiB-per-minute budget, reserved using the request's size cap rather than the bytes ultimately transferred. Exceeding a limit makes that request unavailable; retry later.
+
+Attachment handles have a separate cache with a 512-entry per-user LRU quota. Capacity pressure can expire older handles before their normal 30-minute expiry. If the global cache cannot retain a handle, no unusable handle is returned. Restricted readers cannot download legacy artifacts without a recorded content hash; existing Admin/full-history rules for legacy files remain. Windows and other non-Unix gateways refuse this endpoint. Rust gateway tests on the remote builder, native platform behavior and live browser/download acceptance remain unverified for this repair.
+
+WebChat validates the complete upload batch before writing files or dispatching a turn: at most 8 attachments and 20 MiB of decoded data, filenames up to 255 bytes and MIME labels up to 128 bytes. WebSocket messages and frames are capped at 28 MiB; a bounded attachment parser rejects excessive counts before constructing the attachment vector. Invalid base64 or an exceeded limit rejects the whole batch. Per-user admission allows 8 batches, 32 files and 80 MiB per minute. Durable reservations cap new uploads at 512 MiB / 2,048 files per user and 4 GiB / 16,384 files globally. Empty files still consume file quota. Failed or interrupted reservations remain charged; manually deleting a file does not restore this quota automatically.
+
+Download responses have a 30-second total deadline. An independent timer releases the snapshot and admission permits even when the client never consumes the body. The transport receives copied chunks of at most 64 KiB, so a held chunk cannot retain the whole snapshot. Expired responses fail; retrying requires a new authorized request and consumes its normal budget.
+
+Historical attachment authorization uses an indexed durable SQLite store for archive name, owner, content hash, size and source path. Rotating or truncating the display/audit JSONL no longer removes existing authorization records. Database failures refuse restricted access, and WebChat uploads must save their authorization record before reporting success. Legacy files without a trustworthy content binding remain unavailable to restricted readers.
+
+On first use, the store imports the retained previous and current audit files in one transaction, with a combined 32 MiB limit and 64 KiB per row. Unreadable, malformed or oversized input aborts migration without partial grants; repair the retained records before retrying. Records already discarded by older rotations cannot be reconstructed automatically. Later audit edits do not overwrite the imported authority store.

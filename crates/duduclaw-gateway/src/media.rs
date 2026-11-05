@@ -160,26 +160,32 @@ pub async fn save_attachment_in_base(
     data: &[u8],
     filename: &str,
 ) -> Result<std::path::PathBuf, String> {
-    let path = save_attachment_in_base_untracked(base_dir, data, filename).await?;
+    let (path, directory) = save_attachment_pinned(base_dir, data, filename).await?;
     // The 「加入知識庫」 chat command accepts only files saved here (an
     // inbound adapter), claimed by the message that carries them.
-    crate::knowledge::chat_attachments::note_saved(&path, filename);
-    crate::artifacts::record_saved(
+    if let Err(error) = crate::artifacts::record_saved_bytes(
         base_dir,
         &path,
         filename,
-        data.len() as u64,
+        data,
         &crate::artifacts::SaveContext::uploaded(None),
-    );
+    ) {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) { let _ = directory.remove_file(name); }
+        return Err(error);
+    }
+    crate::knowledge::chat_attachments::note_saved(&path, filename);
     Ok(path)
 }
 
 /// Authenticated WebChat's inbound-only save. The principal task-local is
 /// installed by the socket host, never by a model or attachment filename.
 pub(crate) async fn save_webchat_attachment_in_base(base_dir:&std::path::Path,data:&[u8],filename:&str)->Result<std::path::PathBuf,String> {
-    let path=save_attachment_in_base_untracked(base_dir,data,filename).await?;
+    let (path, directory)=save_attachment_pinned(base_dir,data,filename).await?;
+    if let Err(error) = crate::artifacts::record_saved_bytes(base_dir,&path,filename,data,&crate::artifacts::SaveContext::uploaded(Some("webchat"))) {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) { let _ = directory.remove_file(name); }
+        return Err(error);
+    }
     crate::knowledge::chat_attachments::note_saved(&path,filename);
-    crate::artifacts::record_saved(base_dir,&path,filename,data.len() as u64,&crate::artifacts::SaveContext::uploaded(Some("webchat")));
     Ok(path)
 }
 
@@ -190,10 +196,18 @@ pub async fn save_attachment_in_base_untracked(
     data: &[u8],
     filename: &str,
 ) -> Result<std::path::PathBuf, String> {
+    save_attachment_pinned(base_dir, data, filename).await.map(|(path, _)| path)
+}
+
+async fn save_attachment_pinned(
+    base_dir: &std::path::Path,
+    data: &[u8],
+    filename: &str,
+) -> Result<(std::path::PathBuf, crate::fs_safe::SafeDir), String> {
+    if data.len() as u64 > MAX_FILE_SIZE { return Err("Attachment size limit exceeded".into()); }
     let dir = base_dir.join("attachments");
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| format!("Failed to create attachments dir: {e}"))?;
+    let directory = crate::fs_safe::SafeDir::open_nofollow(&dir, true)
+        .map_err(|e| format!("Failed to open attachments dir: {e}"))?;
 
     // Sanitize filename: keep only safe characters
     let safe_name: String = filename
@@ -206,16 +220,10 @@ pub async fn save_attachment_in_base_untracked(
             }
         })
         .collect();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let unique_name = format!("{ts}_{safe_name}");
+    let safe_name = duduclaw_core::truncate_bytes(&safe_name, 180);
+    let unique_name = format!("{}_{}", uuid::Uuid::new_v4(), safe_name);
     let path = dir.join(&unique_name);
-
-    tokio::fs::write(&path, data)
-        .await
-        .map_err(|e| format!("Failed to write attachment: {e}"))?;
+    create_attachment_new(&directory, &unique_name, data).await?;
 
     // WP2.6 §5: record an extension-based capability-gap signal at this single
     // chokepoint. Best-effort + fire-and-forget — a failure here never affects
@@ -223,7 +231,24 @@ pub async fn save_attachment_in_base_untracked(
     // (`<home>/agents/<id>`); the shared-home fallback carries no agent context.
     record_ext_gap_signal(base_dir, filename);
 
-    Ok(path)
+    Ok((path, directory))
+}
+
+async fn create_attachment_new(directory: &crate::fs_safe::SafeDir, name: &str, data: &[u8]) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    let file = directory.open_create_new(name)
+        .map_err(|e| format!("Failed to create attachment: {e}"))?;
+    let mut file = tokio::fs::File::from_std(file);
+    let result = async {
+        file.write_all(data).await.map_err(|e| format!("Failed to write attachment: {e}"))?;
+        file.sync_all().await.map_err(|e| format!("Failed to sync attachment: {e}"))?;
+        Ok(())
+    }.await;
+    if result.is_err() {
+        drop(file);
+        let _ = directory.remove_file(name);
+    }
+    result
 }
 
 /// Derive `(home_dir, agent_id)` from a per-agent attachment base
@@ -266,10 +291,23 @@ pub fn format_attachment_ref(
         MediaType::File => "file",
     };
     let hint = data_file_tool_hint(filename);
+    let filename = attachment_display_name(filename);
     format!(
         "[{emoji} {filename} ({type_label})]({}){hint}",
         path.display()
     )
+}
+
+/// Display labels are plain, single-line text, never Markdown syntax. Use
+/// fullwidth punctuation so legacy references remain parseable without an
+/// ambiguous backslash escape grammar.
+pub(crate) fn attachment_display_name(filename: &str) -> String {
+    filename.chars().map(|c| match c {
+        '[' => '［', ']' => '］', '(' => '（', ')' => '）',
+        '{' => '｛', '}' => '｝', '\\' => '＼',
+        c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') => ' ',
+        c => c,
+    }).collect()
 }
 
 /// Extensions whose content must reach the model through an MCP tool, never
@@ -587,4 +625,84 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_webchat_uploads_same_name_have_distinct_uuid_and_content_binding() {
+        use sha2::{Digest, Sha256};
+        let home = crate::fs_safe::private_test_home().unwrap();
+        let base = home.path().join("agents/sales");
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(32));
+        let mut jobs = tokio::task::JoinSet::new();
+        for i in 0..32 {
+            let base = base.clone();
+            let barrier = barrier.clone();
+            jobs.spawn(async move {
+                let owner = format!("user-{i}");
+                let data = format!("private-content-{i}");
+                let path = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(owner.clone(), async {
+                    barrier.wait().await;
+                    save_webchat_attachment_in_base(&base, data.as_bytes(), "same report.txt").await.unwrap()
+                }).await;
+                (owner, data, path)
+            });
+        }
+        let mut saved = Vec::new();
+        let mut names = std::collections::HashSet::new();
+        while let Some(result) = jobs.join_next().await {
+            let (owner, data, path) = result.unwrap();
+            let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+            let (id, original) = name.split_once('_').unwrap();
+            assert!(uuid::Uuid::parse_str(id).is_ok());
+            assert_eq!(original, "same_report.txt");
+            assert!(names.insert(name.clone()));
+            assert_eq!(std::fs::read(&path).unwrap(), data.as_bytes());
+            saved.push((owner, data, name));
+        }
+        let index = crate::artifacts::HistoryIndex::load(home.path(), Some("sales"));
+        for (owner, data, name) in saved {
+            let provenance = index.provenance(&name).unwrap();
+            assert_eq!(provenance.owner_user_id.as_deref(), Some(owner.as_str()));
+            assert_eq!(provenance.content_hash.as_deref(), Some(hex::encode(Sha256::digest(data.as_bytes())).as_str()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attachment_upload_refuses_symlinked_parents_without_outside_write() {
+        for part in ["agents", "agents/sales", "agents/sales/attachments"] {
+            let root = crate::fs_safe::private_test_home().unwrap();
+            let home = root.path().canonicalize().unwrap();
+            let outside = crate::fs_safe::private_test_home().unwrap();
+            let planted = home.join(part);
+            std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(outside.path(), planted).unwrap();
+            assert!(save_attachment_in_base_untracked(&home.join("agents/sales"), b"data", "report.txt").await.is_err());
+            assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attachment_create_new_never_overwrites_existing_or_symlink() {
+        let home = crate::fs_safe::private_test_home().unwrap();
+        let path = home.path().join("same.txt");
+        std::fs::write(&path, b"original").unwrap();
+        let directory = crate::fs_safe::SafeDir::open_nofollow(home.path(), false).unwrap();
+        assert!(create_attachment_new(&directory, "same.txt", b"replacement").await.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        let link = home.path().join("link.txt");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(create_attachment_new(&directory, "link.txt", b"replacement").await.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+}
+
+#[cfg(all(test, not(unix)))]
+#[tokio::test]
+async fn attachment_save_fails_closed_without_nofollow_support() {
+    let home = crate::fs_safe::private_test_home().unwrap();
+    assert!(save_attachment_in_base_untracked(home.path(), b"private", "file.txt").await.is_err());
+    assert!(!home.path().join("attachments").exists());
 }
