@@ -1097,6 +1097,28 @@ async fn mfa_email_http_login_uses_verified_address_and_consumes_challenge() {
 }
 
 #[tokio::test]
+async fn mfa_email_http_verify_succeeds_after_smtp_config_is_removed() {
+    let (dir,state,user)=fixture(false,false).await;
+    std::fs::write(dir.path().join("config.toml"),"[auth]\nmfa_enforced=false\n[channels.email]\nsmtp_host='127.0.0.1'\nsmtp_port=9\nfrom_addr='sender@example.test'\nsmtp_tls='none'\n").unwrap();
+    let now=chrono::Utc::now().timestamp();
+    let token=state.user_db.mfa_factor_password_challenge(&user.id,"correct horse battery","session",now).unwrap();
+    let (_,code)=state.user_db.mfa_email_send(&token,true,now).unwrap();
+    state.user_db.mfa_email_verify_and_issue(&token,&code,true,now,|_,_,_|Ok(())).unwrap();
+    let token=state.user_db.mfa_challenge(&user.id,duduclaw_auth::mfa::FirstFactor::Password,false,now+60).unwrap();
+    let (_,code)=state.user_db.mfa_email_send(&token,false,now+60).unwrap();
+    let payload=||serde_json::from_value(json!({"challenge_id":token,"code":code})).unwrap();
+    std::fs::write(dir.path().join("config.toml"),"[auth]\nmfa_enforced=false\n").unwrap();
+
+    let (status,value)=body(super::super::server_mfa_email::verify(State(state.clone()),ConnectInfo(peer(232)),Json(payload())).await).await;
+    assert_eq!(status,StatusCode::OK);
+    assert!(state.jwt_config.verify_access_token(value["access_token"].as_str().unwrap()).is_ok());
+
+    let (status,value)=body(super::super::server_mfa_email::verify(State(state),ConnectInfo(peer(232)),Json(payload())).await).await;
+    assert_eq!(status,StatusCode::UNAUTHORIZED);
+    assert_eq!(value["error"],"兩步驟驗證失敗或已過期，請重新登入。");
+}
+
+#[tokio::test]
 async fn mfa_enforced_email_user_can_add_totp_without_another_proof() {
     let (_dir,state,user)=fixture(false,true).await;
     let now=chrono::Utc::now().timestamp();

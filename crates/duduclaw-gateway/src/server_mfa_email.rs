@@ -67,7 +67,6 @@ pub(super) async fn verify(State(state):State<Arc<AppState>>,ConnectInfo(addr):C
     let checked=tokio::task::spawn_blocking(move || check.user_db.mfa_email_http_capability(
         &capability,enrollment,password.as_deref(),chrono::Utc::now().timestamp())).await;
     if !matches!(checked,Ok(Ok(()))) {return denied();}
-    if !crate::mfa_email::available(&state.home_dir) {return unavailable();}
     let personal=state.handler.resolve_edition_profile().await.is_personal();
     if crate::mfa::enforced(&state.home_dir,personal).is_err() {return denied();}
     let work=state.clone();
