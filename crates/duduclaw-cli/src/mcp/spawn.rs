@@ -155,6 +155,9 @@ pub(crate) async fn spawn_agent_with_ctx_and_upstream(
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
+    if let Err(reason) = persist_spawn_authority(home_dir, caller, &entry).await {
+        return tool_error(&reason);
+    }
     let queued: std::result::Result<(), String> = tokio::task::spawn_blocking({
         let path = queue_path.clone();
         let entry_str = entry.to_string();
@@ -512,6 +515,12 @@ pub(crate) async fn spawn_ephemeral_with_ctx_and_upstream(
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
+    if let Err(reason) = persist_spawn_authority(home_dir, caller, &entry).await {
+        // This scaffold was created by this call and has not been enqueued.
+        // Confirmation/provisioning belongs to the operator, never this tool.
+        let _ = std::fs::remove_dir_all(&scaffolded.dir);
+        return tool_error(&reason);
+    }
     let queued: std::result::Result<(), String> = tokio::task::spawn_blocking({
         let path = queue_path.clone();
         let entry_str = entry.to_string();
@@ -580,6 +589,58 @@ pub(crate) async fn spawn_ephemeral_with_ctx_and_upstream(
     }
 }
 
+/// Persist authority before publishing the exact host-built bus message. A
+/// failed append may leave an unused receipt, never an executable queue entry.
+async fn persist_spawn_authority(home: &Path, caller: &str, entry: &Value)
+    -> std::result::Result<(), String> {
+    if !duduclaw_core::execution_gate::isolation_required() { return Ok(()); }
+    let call = crate::mcp_isolation::current()
+        .ok_or_else(|| "無法確認這次委派的原始執行授權。".to_string())?;
+    if call.home.as_path() != home || call.agent != caller {
+        return Err("這次委派的原始執行身分不一致。".into());
+    }
+    let (id, target, material) = spawn_authority_material(caller, entry)?;
+    duduclaw_gateway::isolation_background::record_bus_delegation(home, caller,
+        &call.context, &target, &id, &material).await
+        .map_err(|_| "這次委派的授權已失效，或目標員工尚未完成隔離確認。".into())
+}
+
+/// Keep this shape identical to the legacy dispatcher's BusMessage projection.
+/// It receives only the entry constructed above, never the tool's raw params.
+fn spawn_authority_material(caller: &str, entry: &Value)
+    -> std::result::Result<(String, String, Value), String> {
+    let invalid = || "無法確認這次委派的工作內容。".to_string();
+    let required = |key| entry.get(key).and_then(Value::as_str).filter(|value| !value.is_empty())
+        .ok_or_else(invalid);
+    if entry.get("type").and_then(Value::as_str) != Some("agent_message")
+        || required("sender_agent")? != caller || entry.get("spawned").and_then(Value::as_bool) != Some(true) {
+        return Err(invalid());
+    }
+    let id = required("message_id")?;
+    let target = required("agent_id")?;
+    if !duduclaw_core::is_valid_agent_id(target) { return Err(invalid()); }
+    let depth = entry.get("delegation_depth").and_then(Value::as_u64)
+        .and_then(|depth| u8::try_from(depth).ok()).ok_or_else(invalid)?;
+    let hop = entry.get("hop_depth").and_then(Value::as_u64)
+        .and_then(|depth| u8::try_from(depth).ok()).ok_or_else(invalid)?;
+    let unknown = match entry.get("upstream_unknown") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(invalid)?,
+    };
+    let optional = |key| -> std::result::Result<Option<&str>, String> {
+        match entry.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value)),
+            _ => Err(invalid()),
+        }
+    };
+    let material = duduclaw_gateway::isolation_background::material::delegation(
+        caller, target, required("payload")?, optional("turn_id")?, optional("session_id")?,
+        optional("lane")?, depth, optional("origin_agent")?, None, Some(caller),
+        unknown, hop, true, optional("on_behalf_of")?);
+    Ok((id.into(), target.into(), material))
+}
+
 /// Bus lineage is host-owned and all-or-nothing, matching send_to_agent.
 fn stamp_spawn_upstream(
     entry: &mut Value,
@@ -604,5 +665,44 @@ fn stamp_spawn_upstream(
             message_id,
             missing,
         );
+    }
+}
+
+#[cfg(test)]
+mod isolation_authority_tests {
+    use super::*;
+
+    fn entry() -> Value {
+        serde_json::json!({"type":"agent_message", "message_id":"message", "agent_id":"bob",
+            "payload":"work", "sender_agent":"alice", "origin_agent":"alice",
+            "delegation_depth":1, "hop_depth":2, "spawned":true, "turn_id":"turn",
+            "session_id":"session", "lane":"explore", "on_behalf_of":"user:owner"})
+    }
+
+    #[test]
+    fn isolated_spawn_material_matches_dispatcher_projection() {
+        let (id, target, actual) = spawn_authority_material("alice", &entry()).unwrap();
+        assert_eq!(id, "message");
+        assert_eq!(target, "bob");
+        let expected = duduclaw_gateway::isolation_background::material::delegation(
+            "alice", "bob", "work", Some("turn"), Some("session"), Some("explore"), 1,
+            Some("alice"), None, Some("alice"), false, 2, true, Some("user:owner"));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn isolated_spawn_material_refuses_missing_identity_and_malformed_metadata() {
+        let original = entry();
+        for (field, bad) in [("sender_agent", serde_json::json!("mallory")),
+            ("agent_id", serde_json::json!("../bob")), ("spawned", serde_json::json!(false)),
+            ("delegation_depth", serde_json::json!(256)), ("hop_depth", serde_json::json!(-1)),
+            ("upstream_unknown", serde_json::json!("false")), ("turn_id", serde_json::json!(3))] {
+            let mut value = original.clone();
+            value[field] = bad;
+            assert!(spawn_authority_material("alice", &value).is_err(), "{field}");
+        }
+        let mut value = original;
+        value.as_object_mut().unwrap().remove("message_id");
+        assert!(spawn_authority_material("alice", &value).is_err());
     }
 }

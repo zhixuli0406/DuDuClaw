@@ -858,7 +858,7 @@ impl CronStore {
     }
 }
 
-fn row_to_cron_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronTaskRow> {
+pub(crate) fn row_to_cron_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronTaskRow> {
     let enabled_int: i64 = row.get(5)?;
     Ok(CronTaskRow {
         id: row.get(0)?,

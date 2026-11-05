@@ -139,6 +139,19 @@ pub(crate) async fn send_to_agent_with_ctx(
             Ok(guard) => guard.map(std::sync::Arc::new),
             Err(reason) => return tool_error(&reason),
         };
+        if duduclaw_core::execution_gate::isolation_required() {
+            let Some(call) = crate::mcp_isolation::current() else {
+                return tool_error("無法確認這次委派的原始執行授權。");
+            };
+            let material = duduclaw_gateway::isolation_background::material::delegation(
+                caller, target, prompt, trust_turn_id.as_deref(), trust_session_id.as_deref(),
+                lane.as_deref(), outgoing_depth, Some(origin), reply_channel.as_deref(),
+                Some(caller), upstream_dropped, 0, false, on_behalf_of.as_deref());
+            if duduclaw_gateway::isolation_background::record_delegation(home_dir, caller,
+                &call.context, target, &msg_id, &material).await.is_err() {
+                return tool_error("這次委派的授權已失效，請由原交辦人重新交辦。");
+            }
+        }
         let writer_admission = admission.clone();
         let queued = tokio::task::spawn_blocking(move || -> bool {
             // The blocking writer owns the lease even if the request is cancelled.

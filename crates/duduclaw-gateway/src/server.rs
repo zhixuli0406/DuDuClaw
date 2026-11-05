@@ -1570,6 +1570,28 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             );
         },
     );
+    let proactive_registry = handler.registry().clone();
+    if duduclaw_agent::heartbeat::install_protected_proactive_invoker(Arc::new(
+        move |home, agent, prompt, material| {
+            let registry = proactive_registry.clone();
+            Box::pin(async move {
+                // A shared employee is not a person. Only the stored approval
+                // can identify who authorized this recurring heartbeat.
+                let owner = crate::isolation_background::record_owner(&home, "heartbeat", &agent);
+                let principal = owner.clone();
+                crate::on_behalf_of::scope_first(principal,
+                    crate::explore_lane::EXPLORE.scope(true,
+                    crate::isolation_background::scope_record(&home, "heartbeat", &agent, &agent,
+                        owner.as_deref(), &material,
+                        crate::autonomous_runtime::scope(&home, &agent, &[],
+                        crate::process_group::with_class(duduclaw_core::execution_gate::ExecutionClass::Heartbeat,
+                        crate::claude_runner::call_claude_for_agent_with_type(&home, &registry, &agent,
+                            &prompt, crate::cost_telemetry::RequestType::Cron)))))).await
+            })
+        },
+    )).is_err() {
+        tracing::error!("受保護排程的執行介面無法註冊，相關工作維持暫停。");
+    }
     let heartbeat = duduclaw_agent::heartbeat::start_heartbeat_scheduler_with(
         home_dir.clone(),
         handler.registry().clone(),

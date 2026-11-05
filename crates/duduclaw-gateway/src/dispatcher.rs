@@ -287,6 +287,49 @@ async fn park_paused_goal_after_turn(
     Ok(())
 }
 
+/// Waiting for the stored approval must not consume a dispatch retry or poll
+/// the model future. Existing autonomy deferral retains the queued record.
+async fn pending_isolation_approval<F: std::future::Future<Output = Result<String, DispatchError>>>(
+    future: F) -> Result<String, DispatchError> {
+    if crate::isolation_background::approval_pending() {
+        return Err(DispatchError::AutonomyPaused("背景工作正在等候管理員核准。".into()));
+    }
+    future.await
+}
+
+/// Resolve system wakes to the current task contract; employee markers never
+/// choose a task approval. Delegations stay bound to their exact message.
+async fn isolated_queue_scope<F: std::future::Future<Output = Result<String, DispatchError>>>(home: &Path,
+    message: &crate::message_queue::QueueMessage, future: F) -> Result<String, DispatchError> {
+    if !duduclaw_core::execution_gate::isolation_required() { return future.await; }
+    let task_id = if message.sender == crate::responsibility::GOAL_LOOP_SENDER {
+        extract_goal_loop_task_id(&message.payload)
+    } else if message.sender == "heartbeat-scheduler" {
+        extract_heartbeat_task_id(&message.payload)
+    } else { None };
+    if let Some(task_id) = task_id {
+        let row = match crate::task_store::TaskStore::open(home) {
+            Ok(store) => store.get_task(task_id).await.ok().flatten(),
+            Err(_) => None,
+        };
+        let row = row.filter(|row| row.assigned_to == message.target
+            && row.on_behalf_of == message.on_behalf_of);
+        let material = row.as_ref().map(crate::isolation_background::material::task)
+            .unwrap_or(serde_json::Value::Null);
+        return crate::isolation_background::scope_record(home, "task", task_id,
+            &message.target, row.as_ref().and_then(|row| row.on_behalf_of.as_deref()),
+            &material, pending_isolation_approval(future)).await;
+    }
+    let material = crate::isolation_background::material::delegation(
+        &message.sender, &message.target, &message.payload, message.turn_id.as_deref(),
+        message.session_id.as_deref(), message.lane.as_deref(),
+        u8::try_from(message.delegation_depth).unwrap_or(u8::MAX), message.origin_agent.as_deref(),
+        message.reply_channel.as_deref(), message.sender_agent.as_deref(), message.upstream_unknown, 0, false,
+        message.on_behalf_of.as_deref());
+    crate::isolation_background::scope_record(home, "delegation", &message.id,
+        &message.target, message.on_behalf_of.as_deref(), &material, pending_isolation_approval(future)).await
+}
+
 /// Poll the SQLite message queue for pending messages and dispatch them.
 pub(crate) async fn poll_and_dispatch_sqlite(
     queue: &Arc<crate::message_queue::MessageQueue>,
@@ -569,6 +612,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             "message_queue",
         );
         let dispatch_fut = crate::on_behalf_of::scope_first(principal, dispatch_fut);
+        let dispatch_fut = isolated_queue_scope(home_dir, &msg, dispatch_fut);
 
         // WP-A4/A5/T10: only goal-loop dispatches get a native-tool
         // collector scoped — the design's A3 forward model only observes
@@ -1134,7 +1178,10 @@ async fn poll_and_dispatch(
     // and callback identities rather than re-enqueuing a coalesced prompt.
     let mut deferred_messages: std::collections::HashMap<_, _> = to_dispatch.iter()
         .map(|message| (message.message_id.clone(), message.clone())).collect();
-    let to_dispatch = coalesce_messages(to_dispatch);
+    // A protected queue authority binds the exact message, not a merged prompt.
+    let to_dispatch = if duduclaw_core::execution_gate::isolation_required() {
+        to_dispatch
+    } else { coalesce_messages(to_dispatch) };
 
     info!(
         count = to_dispatch.len(),
@@ -1310,6 +1357,14 @@ async fn poll_and_dispatch(
                 "bus_queue",
             );
             let dispatch_fut = crate::on_behalf_of::scope_first(principal, dispatch_fut);
+            let material = crate::isolation_background::material::delegation(
+                msg.sender_agent.as_deref().unwrap_or(""), &msg.agent_id, &msg.payload,
+                msg.turn_id.as_deref(), msg.session_id.as_deref(), msg.lane.as_deref(),
+                msg.delegation_depth, msg.origin_agent.as_deref(), None, msg.sender_agent.as_deref(),
+                msg.upstream_unknown, msg.hop_depth, msg.spawned, msg.on_behalf_of.as_deref());
+            let dispatch_fut = crate::isolation_background::scope_record(
+                &home, "delegation", &msg.message_id, &msg.agent_id,
+                msg.on_behalf_of.as_deref(), &material, pending_isolation_approval(dispatch_fut));
             // The delegation's lane (written by a run in the explore lane,
             // `spawn_agent` / `spawn_ephemeral`): the receiving run stays
             // read-only too, or is refused when the employee cannot carry
@@ -2065,10 +2120,13 @@ async fn dispatch_taskspec_inner(
             hop_depth: 0,
         };
         crate::responsibility::test_hooks::pause_point("autonomy_taskspec_handoff", &spec.task_id).await;
+        let authority_id = format!("{}:{}:step:{step_index}", spec.agent_id, spec.task_id);
+        let material = crate::isolation_background::material::task_spec(spec, step_index);
         let result = match check_autonomous_dispatch(home_dir, registry, &spec.agent_id).await {
-            Ok(()) => dispatch_to_agent_outcome(
+            Ok(()) => crate::isolation_background::scope_record(home_dir, "task_spec", &authority_id,
+                &target_agent, spec.on_behalf_of.as_deref(), &material, pending_isolation_approval(dispatch_to_agent_outcome(
                 home_dir, registry, &target_agent, &prompt, &delegation, None,
-            ).await,
+            ))).await,
             Err(reason) => Err(DispatchError::AutonomyPaused(reason)),
         };
 

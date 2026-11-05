@@ -4,6 +4,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use serde::Serialize;
 
+#[path = "isolation_readiness/integration.rs"]
+mod integration;
+pub use integration::{IntegrationComponent, IntegrationProbe, ProbeError, PtyRequirement,
+    ServiceObservation, ServiceObservationCache, install_integration_probe};
+
 static REQUIRED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -29,15 +34,24 @@ impl Components {
             self.runtime_adapters].into_iter().all(|state| state == ComponentState::Ready)
     }
 
-    fn current(spawnd_verified: bool) -> Self {
-        let host = if spawnd_verified { ComponentState::Ready } else { ComponentState::Unavailable };
+    fn current(host_was_verified: bool) -> Self {
+        let generation = current_generation();
+        let mut integration = integration::current(generation);
+        // A generation rotation during a probe cannot combine old adapters
+        // with the new updater observation. Boot must compose them again.
+        let current = current_generation();
+        if current != generation { integration.invalidate(); }
+        // Integration probes can consume B1's sub-second receipt lifetime.
+        // Re-read at final admission instead of retaining an earlier bool.
+        let host = if host_was_verified && spawnd_verified() { ComponentState::Ready }
+            else { ComponentState::Unavailable };
         Self { launch_service: host, sandbox: host, network: host, storage: host,
-            // No production factory/readback is installed by this integration
-            // subset. A running unit or an existing key file is insufficient.
-            parse_worker: ComponentState::PendingIntegration,
-            update_service: update_service_state(),
-            mcp_boundary: ComponentState::PendingIntegration,
-            runtime_adapters: ComponentState::PendingIntegration }
+            parse_worker: integration.parse_worker,
+            update_service: if generation.is_some() && current == generation {
+                ComponentState::Ready
+            } else { ComponentState::Unavailable },
+            mcp_boundary: integration.mcp_boundary,
+            runtime_adapters: integration.runtime_adapters }
     }
 }
 
@@ -88,19 +102,16 @@ fn compatible_update(evidence: &duduclaw_updated::readiness::GenerationEvidence)
 /// Authenticated F observation, usable by boot consumers only while fresh.
 #[cfg(target_os = "linux")]
 pub(crate) fn verified_generation() -> Option<duduclaw_isolation::ids::Sha256Digest> {
+    current_generation()
+}
+
+fn current_generation() -> Option<duduclaw_isolation::ids::Sha256Digest> {
     let value = UPDATE_OBSERVATION.lock().ok()?;
     let observation = value.as_ref()?;
     (compatible_update(&observation.evidence) && update_fresh(Some(observation.observed), Instant::now()))
         .then_some(observation.evidence.generation)
 }
 
-fn update_service_state() -> ComponentState {
-    match UPDATE_OBSERVATION.lock() {
-        Ok(value) if value.as_ref().is_some_and(|v| compatible_update(&v.evidence)
-            && update_fresh(Some(v.observed), Instant::now())) => ComponentState::Ready,
-        _ => ComponentState::Unavailable,
-    }
-}
 #[cfg(target_os = "linux")]
 fn start_update_probe() {
     // One bounded blocking client, off every execution/admission thread. A

@@ -110,10 +110,15 @@ mod launch;
 #[path = "isolation_mcp/boot.rs"]
 mod boot;
 #[cfg(target_os = "linux")]
+#[path = "isolation_mcp/ingress.rs"]
+pub(crate) mod ingress;
+#[cfg(target_os = "linux")]
 #[path = "isolation_mcp/runtime.rs"]
 pub(crate) mod runtime;
 #[cfg(target_os = "linux")]
 pub use runtime::{RuntimeAuthorization, with_runtime_authorization};
+#[cfg(target_os = "linux")]
+pub(crate) use boot::{human_authorization as record_authorization, delegation_source};
 #[cfg(target_os = "linux")]
 pub use boot::{BootSources, BootStatus, MissingProducer, DispatcherFactory, DispatcherInput, LaunchInput,
     install_boot_sources, install_dispatcher_factory, boot_protected, boot_status, prepare_launch};

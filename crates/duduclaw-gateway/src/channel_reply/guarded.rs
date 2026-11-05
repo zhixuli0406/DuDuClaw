@@ -92,6 +92,8 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     // carries (`DUDUCLAW_ON_BEHALF_OF`), and every delegation or task the
     // employee starts from it inherits.
     let principal = crate::on_behalf_of::principal_for_requester(&ctx.home_dir, &requester);
+    #[cfg(target_os = "linux")]
+    let isolation_requester = requester.clone();
     let cited: Arc<std::sync::Mutex<Vec<duduclaw_knowledge::cite::CitationRef>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     // Keep the authenticated channel caller and exact conversation in scope
@@ -148,6 +150,8 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     // Scope the already boxed turn, keeping every added layer pointer-sized
     // and preserving the innermost boxed reply pipeline.
     let turn = Box::pin(crate::on_behalf_of::scope_first(principal, turn));
+    #[cfg(target_os = "linux")]
+    let turn = Box::pin(crate::isolation_mcp::ingress::reply_scope(&ctx.home_dir, &isolation_requester, turn));
     let raw = match interim {
         Some(w) => w.run(turn).await,
         None => turn.await,
