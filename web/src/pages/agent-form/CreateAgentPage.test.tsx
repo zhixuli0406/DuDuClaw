@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route } from 'react-router';
 import en from '@/i18n/en.json';
+import zhTW from '@/i18n/zh-TW.json';
 import { mockWsClient } from '@/test/mocks';
 import { SidebarProvider } from '@/components/mds';
 import { CreateAgentPage } from './CreateAgentPage';
@@ -140,6 +141,33 @@ describe('CreateAgentPage', () => {
 
     expect(screen.getByText(`Failed to create agent: ${message}`)).toBeInTheDocument();
     expect(screen.getByText(message)).toHaveClass('text-muted-foreground');
+  });
+
+  it('splits full-width-colon backend errors into summary and detail', async () => {
+    const message = '建立員工失敗：服務帳號缺少執行權限';
+    mockWsClient.call.mockImplementation((method) => {
+      if (method === 'agents.create') return Promise.reject(message);
+      return Promise.resolve({ roles: [], departments: [], models: [{ id: 'opus', label: 'Opus', type: 'cloud', provider: 'anthropic' }] });
+    });
+    render(
+      <IntlProvider messages={zhTW} locale="zh-TW" defaultLocale="zh-TW">
+        <MemoryRouter initialEntries={['/agents/new']}>
+          <SidebarProvider><Routes><Route path="/agents/new" element={<CreateAgentPage />} /></Routes></SidebarProvider>
+        </MemoryRouter>
+      </IntlProvider>,
+    );
+    await waitFor(() => expect(screen.getByText('基本資料')).toBeInTheDocument());
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText('coder'), 'louis');
+    await user.type(screen.getByPlaceholderText('Coder'), 'Louis');
+    await user.selectOptions(screen.getByLabelText('使用的模型'), 'opus');
+    await user.click(screen.getByRole('button', { name: '新增 AI 員工' }));
+    await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
+
+    const alert = screen.getByRole('alert');
+    expect(alert.children[0]).toHaveTextContent('新增 AI 員工失敗：');
+    expect(alert.children[1]).toHaveTextContent('服務帳號缺少執行權限');
+    expect(alert.children[1]).toHaveClass('text-muted-foreground');
   });
 
   it('shows unknown backend errors with sanitized detail and no stack trace', async () => {
