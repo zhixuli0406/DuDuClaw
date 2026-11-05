@@ -63,8 +63,9 @@ pub trait ProposalValidator {
 /// stage validates via normal product APIs without enabling anything; publish uses
 /// atomic replacement; read_back verifies effective state. disable must revoke all
 /// partial effects (including UID tombstones) and verify their disabled state.
-/// These calls run under a short SQLite writer transaction: adapters must enforce
-/// bounded RPC timeouts and never re-enter this store.
+/// Calls run after a durable intent commits, without a SQLite writer transaction.
+/// Adapters must enforce bounded RPC timeouts. A per-proposal process lock keeps
+/// apply and compensation mutually exclusive; receipt commits use an intent CAS.
 pub trait ProposalApplier {
     fn stage(&mut self, item: &ConfirmationItem) -> Result<()>;
     fn publish(&mut self, item: &ConfirmationItem) -> Result<()>;
@@ -140,6 +141,9 @@ fn digest(category: ConfirmationCategory, fields: &[ProposalField]) -> Result<Sh
     Ok(Sha256Digest(hash.finalize().into()))
 }
 
+#[path = "confirmation_effects.rs"]
+mod effects;
+
 pub struct ConfirmationStore { conn: Connection }
 impl ConfirmationStore {
     /// Opens only a store already initialized in a fresh gateway home.
@@ -149,6 +153,7 @@ impl ConfirmationStore {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
         conn.query_row("SELECT COUNT(*) FROM migration_proposals", [], |r| r.get::<_, u64>(0))?;
+        effects::schema(&conn)?;
         Ok(Self { conn })
     }
     /// Does not create a database or schema. The gateway only uses this after the
@@ -176,6 +181,7 @@ impl ConfirmationStore {
             CREATE TABLE IF NOT EXISTS migration_rotations (
                 id BLOB NOT NULL, revision INTEGER NOT NULL, field TEXT NOT NULL,
                 fingerprint BLOB NOT NULL, PRIMARY KEY(id, revision, field));")?;
+        effects::schema(&conn)?;
         Ok(Self { conn })
     }
 
@@ -258,13 +264,22 @@ impl ConfirmationStore {
         csrf: [u8; 32], now: u64, validator: &dyn ProposalValidator) -> Result<()> {
         session.check(&csrf, now)?;
         if bindings.is_empty() || bindings.len() > 200 { return Err(ConfirmationError::Limit); }
+        // Validators can wait for live registry or remote readback. Never keep a
+        // SQLite writer while they run. The transaction below rechecks every
+        // immutable binding and Pending status before committing the batch.
+        for binding in bindings {
+            let item = required(&self.conn, binding)?;
+            if item.status != ConfirmationStatus::Pending || (bindings.len() > 1 && item.high_risk) {
+                return Err(ConfirmationError::Denied);
+            }
+            validator.validate_fresh(&item)?;
+        }
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for binding in bindings {
             let mut item = required(&tx, binding)?;
             if item.status != ConfirmationStatus::Pending || (bindings.len() > 1 && item.high_risk) {
                 return Err(ConfirmationError::Denied);
             }
-            validator.validate_fresh(&item)?;
             item.transition(ConfirmationStatus::Approved).map_err(|_| ConfirmationError::Denied)?;
             save(&tx, &item)?;
             audit(&tx, &item, "approved", Some(session.actor))?;
@@ -273,38 +288,45 @@ impl ConfirmationStore {
         Ok(())
     }
 
-    /// Advances at most one durable effect. A crash after an external effect but
-    /// before COMMIT repeats that exact binding; the adapter must return its prior
-    /// receipt. SQLite serializes apply/reject across processes, including effects.
+    /// Advances one durable effect: intent -> commit -> adapter -> receipt CAS.
+    /// The proposal lock is released by process death, unlike a stale lease that
+    /// could permit a still-running publisher to race compensation. Other
+    /// proposals remain writable throughout an external call.
     pub fn apply_next(&mut self, binding: &ProposalBinding,
         adapter: &mut dyn ProposalApplier) -> Result<ConfirmationItem> {
+        let _guard = effects::lock(&self.conn, binding)?;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut item = required(&tx, binding)?;
         if item.status == ConfirmationStatus::Applied { return Ok(item); }
         if item.status == ConfirmationStatus::Approved {
             item.transition(ConfirmationStatus::Applying).map_err(|_| ConfirmationError::Denied)?;
         } else if item.status != ConfirmationStatus::Applying { return Err(ConfirmationError::Denied); }
-        let previous = step(&tx, binding)?;
-        let (next, result) = match previous {
-            None | Some(3) => (0, adapter.stage(&item)),
-            Some(0) => (1, adapter.publish(&item)),
-            Some(1) => (2, adapter.read_back(&item)),
+        let next = match step(&tx, binding)? {
+            None | Some(3) => 0, Some(0) => 1, Some(1) => 2,
             _ => return Err(ConfirmationError::Stale),
         };
+        save(&tx, &item)?;
+        let intent = effects::intent(&tx, &item, next)?;
+        tx.commit()?;
+        let result = match next {
+            0 => adapter.stage(&item), 1 => adapter.publish(&item), _ => adapter.read_back(&item),
+        };
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        effects::consume(&tx, &item, next, &intent)?;
         if result.is_err() {
             item.transition(ConfirmationStatus::Failed).map_err(|_| ConfirmationError::Invalid)?;
             save(&tx, &item)?;
             audit(&tx, &item, "failed_compensation_pending", None)?;
+            let intent = effects::intent(&tx, &item, 3)?;
             tx.commit()?;
-            // Persist failure before compensation. A crash while disabling must
-            // never let an ordinary apply tick publish the authority again.
-            let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let item = required(&tx, binding)?;
-            if item.status != ConfirmationStatus::Failed { return Err(ConfirmationError::Stale); }
             let disabled = adapter.disable_and_read_back(&item).is_ok();
+            let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            effects::consume(&tx, &item, 3, &intent)?;
             if disabled {
                 receipt(&tx, &item, 3)?;
                 audit(&tx, &item, "failed_disabled", None)?;
+            } else {
+                audit(&tx, &item, "compensation_failed", None)?;
             }
             tx.commit()?;
             return Err(if disabled { ConfirmationError::Apply } else { ConfirmationError::Compensation });
@@ -321,16 +343,18 @@ impl ConfirmationStore {
         csrf: [u8; 32], now: u64, adapter: &mut dyn ProposalApplier,
         validator: &dyn ProposalValidator) -> Result<()> {
         session.check(&csrf, now)?;
+        let _guard = effects::lock(&self.conn, binding)?;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut item = required(&tx, binding)?;
         if item.status != ConfirmationStatus::Failed { return Err(ConfirmationError::Denied); }
+        let intent = effects::intent(&tx, &item, 3)?;
+        tx.commit()?;
         adapter.disable_and_read_back(&item).map_err(|_| ConfirmationError::Compensation)?;
-        // Fresh validation may require the destination to be absent (grants,
-        // skills). Reconcile our partial effect first, or a transient failed
-        // compensation would make retries permanently fail on their own data.
-        // The live session, immutable binding and Failed state are already
-        // checked. A validation failure leaves Failed, with authority disabled.
+        // Disable before absence validation. Both calls are outside the writer.
+        // A validation failure leaves Failed and can safely repeat compensation.
         validator.validate_fresh(&item)?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        effects::consume(&tx, &item, 3, &intent)?;
         receipt(&tx, &item, 3)?;
         item.transition(ConfirmationStatus::Applying).map_err(|_| ConfirmationError::Invalid)?;
         save(&tx, &item)?;
@@ -342,27 +366,26 @@ impl ConfirmationStore {
     pub fn reject(&mut self, binding: &ProposalBinding, session: &ApprovalSession,
         csrf: [u8; 32], now: u64, adapter: &mut dyn ProposalApplier) -> Result<()> {
         session.check(&csrf, now)?;
-        // Persist rejecting before compensation so crashes never revive authority.
-        {
-            let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let mut item = required(&tx, binding)?;
-            if item.status == ConfirmationStatus::Rejected { return Ok(()); }
-            if item.status == ConfirmationStatus::Pending {
-                item.transition(ConfirmationStatus::Rejected).map_err(|_| ConfirmationError::Denied)?;
-            } else if item.status != ConfirmationStatus::Rejecting {
-                if item.status == ConfirmationStatus::Applying {
-                    item.transition(ConfirmationStatus::Failed).map_err(|_| ConfirmationError::Denied)?;
-                }
-                item.transition(ConfirmationStatus::Rejecting).map_err(|_| ConfirmationError::Denied)?;
-            }
-            save(&tx, &item)?;
-            audit(&tx, &item, "reject_requested", Some(session.actor))?;
-            tx.commit()?;
-        }
+        let _guard = effects::lock(&self.conn, binding)?;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut item = required(&tx, binding)?;
         if item.status == ConfirmationStatus::Rejected { return Ok(()); }
+        if item.status == ConfirmationStatus::Pending {
+            item.transition(ConfirmationStatus::Rejected).map_err(|_| ConfirmationError::Denied)?;
+        } else if item.status != ConfirmationStatus::Rejecting {
+            if item.status == ConfirmationStatus::Applying {
+                item.transition(ConfirmationStatus::Failed).map_err(|_| ConfirmationError::Denied)?;
+            }
+            item.transition(ConfirmationStatus::Rejecting).map_err(|_| ConfirmationError::Denied)?;
+        }
+        save(&tx, &item)?;
+        audit(&tx, &item, "reject_requested", Some(session.actor))?;
+        if item.status == ConfirmationStatus::Rejected { tx.commit()?; return Ok(()); }
+        let intent = effects::intent(&tx, &item, 3)?;
+        tx.commit()?;
         adapter.disable_and_read_back(&item).map_err(|_| ConfirmationError::Compensation)?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        effects::consume(&tx, &item, 3, &intent)?;
         receipt(&tx, &item, 3)?;
         item.transition(ConfirmationStatus::Rejected).map_err(|_| ConfirmationError::Denied)?;
         save(&tx, &item)?;
@@ -393,8 +416,8 @@ impl ConfirmationStore {
     /// never an imported assertion. Adapter verification is mandatory.
     pub fn record_rotation(&mut self, binding: &ProposalBinding, field: &str,
         new_fingerprint: Sha256Digest, validator: &dyn RotationVerifier) -> Result<()> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let item = required(&tx, binding)?;
+        let _guard = effects::lock(&self.conn, binding)?;
+        let item = required(&self.conn, binding)?;
         if item.status != ConfirmationStatus::Applied { return Err(ConfirmationError::Denied); }
         let old = item.fields.iter().find(|f| f.name == field).ok_or(ConfirmationError::Invalid)?;
         let ProposalValue::SecretFingerprint { keyed_fingerprint, .. } = &old.value else {
@@ -402,6 +425,8 @@ impl ConfirmationStore {
         };
         if *keyed_fingerprint == new_fingerprint { return Err(ConfirmationError::Denied); }
         validator.verify_rotated(binding, field, new_fingerprint)?;
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if required(&tx, binding)?.status != ConfirmationStatus::Applied { return Err(ConfirmationError::Stale); }
         tx.execute("INSERT INTO migration_rotations VALUES(?1,?2,?3,?4)
             ON CONFLICT(id,revision,field) DO UPDATE SET fingerprint=excluded.fingerprint",
             params![binding.operation_id.proposal_id.0.as_slice(), binding.operation_id.revision,

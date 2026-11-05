@@ -107,7 +107,7 @@ impl ArtifactPlan {
             let stage=tempfile::tempdir_in(home.join("migration-authority")).map_err(|_|Error::Storage)?;
             let source=stage.path().join(format!("{name}.md"));std::fs::write(&source,&self.after).map_err(|_|Error::Storage)?;
             let output=stage.path().join("installed");let quarantine=stage.path().join("quarantine");
-            let parsed=live.handle.block_on(duduclaw_agent::skill_loader::install_skill(&source,&output,&quarantine)).map_err(|_|Error::Apply)?;
+            let parsed=bounded(&live.handle,duduclaw_agent::skill_loader::install_skill(&source,&output,&quarantine))?.map_err(|_|Error::Apply)?;
             if parsed.meta.name!=*name || std::fs::read_to_string(output.join(format!("{name}.md"))).map_err(|_|Error::Storage)?!=self.after {return Err(Error::Apply);}
         }
         prepared.publish(home,&path,self.before.as_deref(),&self.after)
@@ -117,11 +117,11 @@ impl ArtifactPlan {
         let path=dir.join(&self.relative);
         if !self.prepared.as_ref().ok_or(Error::Storage)?.owns(&path) || optional(&path)?.as_deref()!=Some(&self.after) {return Err(Error::Apply);}
         match &self.kind {
-            ArtifactKind::Skill {name}=>live.handle.block_on(async {
+            ArtifactKind::Skill {name}=>bounded(&live.handle,async {
                 let mut registry=live.registry.write().await;registry.scan().await.map_err(|_|Error::Apply)?;
                 let employee=registry.get(&self.agent).ok_or(Error::Apply)?;
                 if employee.skills.iter().filter(|s|s.name==*name && s.content==self.after).count()!=1 {return Err(Error::Apply);}Ok(())
-            }),
+            })?,
             ArtifactKind::Hook {..}=>{
                 let root:Value=serde_json::from_str(&self.after).map_err(|_|Error::Apply)?;let mut effective=root.clone();guards(home,&self.agent,&mut effective)?;
                 if root!=effective {return Err(Error::Apply);}Ok(())
@@ -133,8 +133,8 @@ impl ArtifactPlan {
         self.prepared.as_ref().ok_or(Error::Storage)?.restore(home,&path,self.before.as_deref(),&self.after)?;
         if optional(&path)?!=self.before {return Err(Error::Compensation);}
         if let ArtifactKind::Skill {name}=&self.kind {
-            live.handle.block_on(async {let mut registry=live.registry.write().await;registry.scan().await.map_err(|_|Error::Compensation)?;
-                if registry.get(&self.agent).is_some_and(|a|a.skills.iter().any(|s|s.name==*name && s.content==self.after)) {return Err(Error::Compensation);}Ok(())})?;
+            bounded(&live.handle,async {let mut registry=live.registry.write().await;registry.scan().await.map_err(|_|Error::Compensation)?;
+                if registry.get(&self.agent).is_some_and(|a|a.skills.iter().any(|s|s.name==*name && s.content==self.after)) {return Err(Error::Compensation);}Ok(())})??;
         }
         Ok(())
     }

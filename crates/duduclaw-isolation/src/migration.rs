@@ -26,10 +26,11 @@ pub enum MigrationState {
     KeysRotated,
     TokenRevocationRecorded,
     EmployeeProposalsStaged,
-    ContentImported,
+    ContentArchived,
     ConfirmationReady,
     IsolationVerified,
     AwaitingAdministrator,
+    ContentImported,
     Complete,
 }
 
@@ -43,11 +44,12 @@ impl MigrationState {
             | (Self::LegacyQuarantined, Self::KeysRotated)
             | (Self::KeysRotated, Self::TokenRevocationRecorded)
             | (Self::TokenRevocationRecorded, Self::EmployeeProposalsStaged)
-            | (Self::EmployeeProposalsStaged, Self::ContentImported)
-            | (Self::ContentImported, Self::ConfirmationReady)
+            | (Self::EmployeeProposalsStaged, Self::ContentArchived)
+            | (Self::ContentArchived, Self::ConfirmationReady)
             | (Self::ConfirmationReady, Self::IsolationVerified)
             | (Self::IsolationVerified, Self::AwaitingAdministrator)
-            | (Self::AwaitingAdministrator, Self::Complete) => Ok(next),
+            | (Self::AwaitingAdministrator, Self::ContentImported)
+            | (Self::ContentImported, Self::Complete) => Ok(next),
             _ => Err(ContractError::IllegalTransition),
         }
     }
@@ -348,9 +350,9 @@ mod tests {
         let states = [MigrationState::Planned, MigrationState::OldEnvironmentStopped,
             MigrationState::LegacyQuarantined, MigrationState::KeysRotated,
             MigrationState::TokenRevocationRecorded, MigrationState::EmployeeProposalsStaged,
-            MigrationState::ContentImported, MigrationState::ConfirmationReady,
+            MigrationState::ContentArchived, MigrationState::ConfirmationReady,
             MigrationState::IsolationVerified, MigrationState::AwaitingAdministrator,
-            MigrationState::Complete];
+            MigrationState::ContentImported, MigrationState::Complete];
         for (a, from) in states.iter().enumerate() {
             for (b, to) in states.iter().enumerate() {
                 assert_eq!(from.transition(*to).is_ok(), b == a + 1);

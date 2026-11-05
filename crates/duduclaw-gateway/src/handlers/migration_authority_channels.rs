@@ -20,10 +20,10 @@ impl ChannelPlan {
     pub(super) fn publish(&self,home:&Path)->Result<()> {self.store(home).migration_bind(&self.operation,&self.digest,&self.channel,&self.user,&self.agent).map_err(|_|Error::Apply)}
     pub(super) fn read_back(&self,home:&Path,live:&super::categories::LiveAuthority)->Result<()> {
         let store=self.store(home);store.migration_readback(&self.operation,&self.digest,&self.channel,&self.user,&self.agent).map_err(|_|Error::Apply)?;
-        if live.handle.block_on(store.resolve_bound_agent(&self.channel,&self.user)).as_deref()!=Some(self.agent.as_str()) {return Err(Error::Apply);}Ok(())
+        if bounded(&live.handle,store.resolve_bound_agent(&self.channel,&self.user))?.as_deref()!=Some(self.agent.as_str()) {return Err(Error::Apply);}Ok(())
     }
     pub(super) fn disable(&self,home:&Path,live:&super::categories::LiveAuthority)->Result<()> {
         let store=self.store(home);store.migration_unbind(&self.operation,&self.digest).map_err(|_|Error::Compensation)?;
-        if live.handle.block_on(store.resolve_bound_agent(&self.channel,&self.user)).is_some() {return Err(Error::Compensation);}Ok(())
+        if bounded(&live.handle,store.resolve_bound_agent(&self.channel,&self.user))?.is_some() {return Err(Error::Compensation);}Ok(())
     }
 }

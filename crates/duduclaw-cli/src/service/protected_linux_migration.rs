@@ -42,7 +42,7 @@ pub(super) fn run_if_required(installed: Option<&str>, target: &str) -> Result<b
     let state = flow.run().map_err(|_| refused("遷移未完成；請檢查已驗證安裝套件與遷移進度後重試。未改用舊版升級。"))?;
     match state {
         MigrationState::AwaitingAdministrator => {
-            println!("資料匯入已進入待確認階段；尚未核准的舊權限不會啟用。");
+            println!("資料已封存，等待管理員確認與匯入；尚未核准的舊權限不會啟用。");
             match flow.new_setup_token(&mut GatewayBootstrapIssuer) {
                 Ok(link) => {
                     println!("請使用下列一次性連結建立管理員，再於儀表板逐項確認。");
@@ -54,6 +54,7 @@ pub(super) fn run_if_required(installed: Option<&str>, target: &str) -> Result<b
                 Err(_) => return Err(refused("尚未取得首位管理員設定連結；資料遷移仍待確認。請確認新服務後重試遷移命令。")),
             }
         }
+        MigrationState::ContentImported => println!("內容匯入已驗證，遷移尚未完成。請登入儀表板處理剩餘的憑證輪替與確認事項。"),
         MigrationState::Complete => println!("資料遷移與確認已完成；本次未執行舊版原地升級。"),
         _ => return Err(refused("遷移停在未完成階段；未執行舊版升級。")),
     }

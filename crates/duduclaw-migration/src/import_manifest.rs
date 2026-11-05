@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, import_receiver::ImportGrant};
 use crate::contract::{ConfirmationCategory, ProposalField};
 use crate::ids::RequestId;
+use crate::materialization::{MaterializationDecision, BlobCopyReceipt};
 
 pub const DURABLE_IMPORT_MANIFEST: &str = "/etc/duduclaw/migration-import.json";
 pub const IMPORT_MANIFEST: &str = "/run/duduclaw-migrate/manifest.json";
@@ -49,6 +50,10 @@ pub struct ManifestGrant {
     /// None archives content without creating an employee, UID, disk or active
     /// memory/wiki namespace. Root may only name an already confirmed employee.
     pub target_agent: Option<String>,
+    #[serde(default)]
+    pub materialization: Option<MaterializationDecision>,
+    #[serde(default)]
+    pub blob_receipts: Vec<BlobCopyReceipt>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,9 +90,30 @@ impl ImportManifest {
                 || !sources.insert(item.grant.source_id.clone()) {
                 return Err(Error::Invalid);
             }
-            // Import runs before employee confirmation. Materialization belongs
-            // to the confirmed allocation path, not this privileged boot plan.
-            if item.target_agent.is_some() { return Err(Error::Invalid); }
+            match &item.materialization {
+                Some(decision) => {
+                    decision.validate(&item.grant)?;
+                    match decision {
+                        MaterializationDecision::Confirmed { allocation } => {
+                            if item.target_agent.as_deref()!=Some(allocation.agent.as_str()) {return Err(Error::Invalid);}
+                            let root=if item.grant.class==crate::import_receiver::ContentClass::Attachment {
+                                self.home.join("agents").join(&allocation.agent).join("attachments")
+                            } else {allocation.workspace.clone()};
+                            let mut handles=BTreeSet::new();
+                            for receipt in &item.blob_receipts {
+                                if receipt.allocation_digest!=allocation.allocation_digest
+                                    || receipt.destination.parent()!=Some(root.as_path())
+                                    || receipt.destination.components().any(|c| !matches!(c,Component::RootDir|Component::Normal(_)))
+                                    || !handles.insert(receipt.source_handle.0) {return Err(Error::Invalid);}
+                            }
+                        }
+                        _ if item.target_agent.is_some() || !item.blob_receipts.is_empty() => return Err(Error::Invalid),
+                        _ => {},
+                    }
+                }
+                None if item.target_agent.is_some() || !item.blob_receipts.is_empty() => return Err(Error::Invalid),
+                None => {},
+            }
         }
         let mut operations = BTreeSet::new();
         for item in &self.pending_proposals {
@@ -157,7 +183,7 @@ mod tests {
     fn plan() -> ImportManifest {
         ImportManifest {schema_version:1,migration_id:RequestId([1;16]),home:PathBuf::from("/var/lib/duduclaw/.duduclaw"),gateway_uid:991,
             grants:vec![ManifestGrant {grant:ImportGrant {migration_id:RequestId([1;16]),employee:Some(EmployeeId([2;16])),source_id:"memory".into(),
-                class:ContentClass::Memory,stream_bytes:0,records:0,stream_sha256:Sha256Digest([3;32])},target_agent:None}],pending_proposals:vec![],completed:false}
+                class:ContentClass::Memory,stream_bytes:0,records:0,stream_sha256:Sha256Digest([3;32])},target_agent:None,materialization:None,blob_receipts:vec![]}],pending_proposals:vec![],completed:false}
     }
     #[test]
     fn import_manifest_never_allocates_unconfirmed_employee() {

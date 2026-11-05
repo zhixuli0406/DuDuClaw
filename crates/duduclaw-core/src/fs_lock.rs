@@ -11,6 +11,32 @@ use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
+use std::cell::Cell;
+use std::time::{Duration, Instant};
+
+thread_local! {
+    static LOCK_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// The active caller-owned bound, if this thread is inside a bounded operation.
+pub fn current_lock_deadline() -> Option<Instant> { LOCK_DEADLINE.with(Cell::get) }
+
+/// Bounds synchronous file-lock waits inside a caller-owned operation. The
+/// migration bridge polls its future on this same blocking thread, so nested
+/// normal product writers (including history writes) inherit the deadline.
+/// Nested scopes can only shorten it. Nothing is detached on expiry.
+pub fn with_lock_deadline<T>(deadline: Instant, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Instant>);
+    impl Drop for Restore { fn drop(&mut self) { LOCK_DEADLINE.with(|slot| slot.set(self.0)); } }
+    let previous = LOCK_DEADLINE.with(|slot| {
+        let previous = slot.get();
+        slot.set(Some(previous.map_or(deadline, |old| old.min(deadline))));
+        previous
+    });
+    let _restore = Restore(previous);
+    f()
+}
+
 
 /// Run `f` while holding an exclusive cross-process advisory lock keyed on
 /// `path`. The lock is taken on a sidecar `<path>.lock` file (created if
@@ -40,7 +66,22 @@ fn acquire(path: &Path) -> io::Result<File> {
         .read(true)
         .write(true)
         .open(&lock_path)?;
-    file.lock_exclusive()?;
+    if let Some(deadline) = LOCK_DEADLINE.with(Cell::get) {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "file lock deadline exceeded"));
+            }
+            match FileExt::try_lock_exclusive(&file) {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(5)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    } else {
+        file.lock_exclusive()?;
+    }
     Ok(file)
 }
 
@@ -92,5 +133,40 @@ mod tests {
         // Lock must be free again.
         with_file_lock(&target, || Ok::<_, io::Error>(())).unwrap();
         let _ = std::fs::remove_file(lock_path_for(&target));
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn contended_writer_returns_at_deadline_without_running_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile");
+        let held = acquire(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let result = with_lock_deadline(deadline, || with_file_lock(&path, || {
+            panic!("a contended migration writer must not run");
+            #[allow(unreachable_code)] Ok(())
+        }));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(Instant::now().duration_since(deadline) < Duration::from_secs(1));
+        drop(held);
+        with_file_lock(&path, || Ok(())).unwrap();
+    }
+
+    #[test]
+    fn deadline_scope_restores_after_panic_and_nested_scope_cannot_extend_it() {
+        let deadline = Instant::now() - Duration::from_millis(1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile");
+        assert!(std::panic::catch_unwind(|| with_lock_deadline(deadline, || {
+            with_lock_deadline(Instant::now() + Duration::from_secs(60), || {
+                assert_eq!(with_file_lock(&path, || Ok(())).unwrap_err().kind(), io::ErrorKind::TimedOut);
+            });
+            panic!("injected panic");
+        })).is_err());
+        with_file_lock(&path, || Ok(())).unwrap();
     }
 }

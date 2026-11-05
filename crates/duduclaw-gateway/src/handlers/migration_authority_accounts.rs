@@ -32,7 +32,7 @@ impl MigrationConfigReadback for GatewayAccountReadback {
         let expected=expected.to_owned();
         // The caller runs on spawn_blocking. Use the gateway's existing runtime,
         // not a second runtime and not a detached task that can outlive the RPC.
-        self.handle.block_on(async move {
+        bounded(&self.handle,async move {
             tokio::time::timeout(std::time::Duration::from_secs(10),async {
                 if read_optional(&home.join(relative))?!=expected {return Err(Error::Stale);}
                 crate::claude_runner::invalidate_rotator_cache().await;
@@ -56,7 +56,7 @@ impl MigrationConfigReadback for GatewayAccountReadback {
                 if read_optional(&home.join(relative))?!=expected {return Err(Error::Stale);}
                 Ok(())
             }).await.map_err(|_|Error::Apply)?
-        })
+        })?
     }
 }
 

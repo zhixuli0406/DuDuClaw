@@ -102,7 +102,7 @@ mod tests {
         for state in [MigrationState::Planned, MigrationState::OldEnvironmentStopped,
             MigrationState::LegacyQuarantined, MigrationState::KeysRotated,
             MigrationState::TokenRevocationRecorded, MigrationState::EmployeeProposalsStaged,
-            MigrationState::ContentImported, MigrationState::ConfirmationReady, MigrationState::Complete] {
+            MigrationState::ContentArchived, MigrationState::ContentImported, MigrationState::ConfirmationReady, MigrationState::Complete] {
             assert!(!allowed_stage(state));
         }
     }

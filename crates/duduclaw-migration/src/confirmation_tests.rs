@@ -341,3 +341,86 @@ fn read_only_open_never_creates_a_missing_store() {
     assert!(ConfirmationStore::open_read_only(&path).is_err());
     assert!(!path.exists());
 }
+
+#[test]
+fn external_effects_commit_intents_and_release_the_sqlite_writer() {
+    struct Probe { path: std::path::PathBuf, calls: usize }
+    impl Probe {
+        fn check(&mut self, item: &ConfirmationItem) -> Result<()> {
+            let mut other = Connection::open(&self.path)?;
+            other.busy_timeout(std::time::Duration::from_millis(20))?;
+            let tx = other.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let count: u64 = tx.query_row("SELECT COUNT(*) FROM migration_effect_intents WHERE id=?1 AND revision=?2 AND digest=?3",
+                params![item.binding.operation_id.proposal_id.0.as_slice(), item.binding.operation_id.revision,
+                    item.binding.proposal_digest.0.as_slice()], |r|r.get(0))?;
+            assert_eq!(count, 1, "effect must have a committed intent");
+            tx.commit()?;
+            self.calls += 1;
+            Ok(())
+        }
+    }
+    impl ProposalApplier for Probe {
+        fn stage(&mut self, item: &ConfirmationItem) -> Result<()> { self.check(item) }
+        fn publish(&mut self, item: &ConfirmationItem) -> Result<()> { self.check(item) }
+        fn read_back(&mut self, item: &ConfirmationItem) -> Result<()> { self.check(item) }
+        fn disable_and_read_back(&mut self, item: &ConfirmationItem) -> Result<()> { self.check(item) }
+    }
+    let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("confirmations.db");
+    let mut store = ConfirmationStore::from_connection(Connection::open(&path).unwrap()).unwrap();
+    let item = stage(&mut store, 1, ConfirmationCategory::Employee); approve(&mut store, &item);
+    let mut adapter = Probe {path, calls:0};
+    for _ in 0..3 { store.apply_next(&item.binding, &mut adapter).unwrap(); }
+    let partial = stage(&mut store, 2, ConfirmationCategory::Employee); approve(&mut store, &partial);
+    for _ in 0..2 { store.apply_next(&partial.binding, &mut adapter).unwrap(); }
+    store.reject(&partial.binding, &session(), [7;32], 101, &mut adapter).unwrap();
+    assert_eq!(adapter.calls, 6);
+    assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM migration_effect_intents", [], |r|r.get::<_,u64>(0)).unwrap(), 0);
+}
+
+#[test]
+fn approval_validation_releases_writer_and_rechecks_concurrent_rejection() {
+    struct RejectDuringValidation { path: std::path::PathBuf }
+    impl ProposalValidator for RejectDuringValidation {
+        fn validate_fresh(&self, item: &ConfirmationItem) -> Result<()> {
+            let mut store = ConfirmationStore::open_existing(&self.path)?;
+            store.reject_pending(&[item.binding], &session(), [7;32], 101)
+        }
+    }
+    let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("confirmations.db");
+    let mut store = ConfirmationStore::from_connection(Connection::open(&path).unwrap()).unwrap();
+    let item = stage(&mut store, 1, ConfirmationCategory::Employee);
+    assert!(store.approve(&[item.binding], &session(), [7;32], 101, &RejectDuringValidation {path}).is_err());
+    assert_eq!(store.list().unwrap()[0].status, ConfirmationStatus::Rejected);
+}
+
+#[test]
+fn active_effect_blocks_same_proposal_compensation_but_not_other_decisions() {
+    struct Concurrent { path: std::path::PathBuf, other: ProposalBinding }
+    impl ProposalApplier for Concurrent {
+        fn stage(&mut self, item: &ConfirmationItem) -> Result<()> {
+            let mut store = ConfirmationStore::open_existing(&self.path)?;
+            assert!(matches!(store.reject(&item.binding, &session(), [7;32], 101,
+                &mut Adapter::default()), Err(ConfirmationError::Stale)));
+            store.approve(&[self.other], &session(), [7;32], 101, &Valid)?;
+            Ok(())
+        }
+        fn publish(&mut self, _: &ConfirmationItem) -> Result<()> { Ok(()) }
+        fn read_back(&mut self, _: &ConfirmationItem) -> Result<()> { Ok(()) }
+        fn disable_and_read_back(&mut self, _: &ConfirmationItem) -> Result<()> { Ok(()) }
+    }
+    let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("confirmations.db");
+    let mut store = ConfirmationStore::from_connection(Connection::open(&path).unwrap()).unwrap();
+    let item = stage(&mut store, 1, ConfirmationCategory::Employee); approve(&mut store, &item);
+    let other = stage(&mut store, 2, ConfirmationCategory::Department);
+    store.apply_next(&item.binding, &mut Concurrent {path,other:other.binding}).unwrap();
+    assert_eq!(required(&store.conn, &other.binding).unwrap().status, ConfirmationStatus::Approved);
+}
+
+#[test]
+fn obsolete_effect_token_cannot_commit_a_receipt() {
+    let mut store = store(); let item = stage(&mut store, 1, ConfirmationCategory::Employee);
+    let first = effects::intent(&store.conn, &item, 0).unwrap();
+    let second = effects::intent(&store.conn, &item, 0).unwrap();
+    assert!(effects::consume(&store.conn, &item, 0, &first).is_err());
+    effects::consume(&store.conn, &item, 0, &second).unwrap();
+}
