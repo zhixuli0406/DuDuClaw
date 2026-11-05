@@ -1389,6 +1389,7 @@ impl AgentRuntime for CodexRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
+        super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::Codex)?;
         if crate::runtime_dispatch::in_utility_call() {
             let (mut cmd, _work_dir, _schema_file) = self.prepare_utility_command(prompt, context)?;
             return execute_codex_command(&mut cmd, context).await;
@@ -1763,6 +1764,7 @@ impl CodexRuntime {
         prompt: &str,
         context: &super::RuntimeContext,
     ) -> Result<Vec<super::RuntimeChunk>, String> {
+        super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::Codex)?;
         let response = self.execute(prompt, context).await?;
         Ok(vec![super::RuntimeChunk::Done(response)])
     }

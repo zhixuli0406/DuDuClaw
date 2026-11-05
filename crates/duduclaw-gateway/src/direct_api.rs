@@ -617,6 +617,7 @@ pub async fn call_moa_model(
 ) -> Result<String, String> {
     use std::sync::Arc;
 
+    crate::isolation_readiness::check_execution()?;
     let name = duduclaw_llm::moa_name(model_id)
         .ok_or_else(|| format!("`{model_id}` 不是 MoA 模型 id（格式應為 `moa:<name>`）"))?;
     let registry = crate::cost_telemetry::model_registry();

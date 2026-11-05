@@ -5,12 +5,17 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusRecord {
     Error(u8),
+    /// Selected ruleset ABI (1..=7), not the kernel's possibly newer ABI.
+    /// This privilege receipt precedes Landlock enforcement, not proof of exec.
     EmployeeReady { landlock_abi: u32 },
     Pty,
     ChildrenForked,
     Exited(u8),
     Signalled(u8),
     SupervisorReady,
+    /// Final fd readback, Landlock and seccomp completed for runtime/forwarder.
+    /// Does not prove exec succeeded or that either child remains alive.
+    IsolationReady,
 }
 
 impl StatusRecord {
@@ -34,6 +39,7 @@ impl StatusRecord {
             4 if value <= 255 => Ok(Self::Exited(value as u8)),
             5 if (1..=64).contains(&value) => Ok(Self::Signalled(value as u8)),
             6 if value == 0 => Ok(Self::SupervisorReady),
+            7 if value == 0 => Ok(Self::IsolationReady),
             _ => Err(Error::Status),
         }
     }
@@ -47,6 +53,7 @@ impl StatusRecord {
             Self::Exited(code) => (4, 0, u32::from(code)),
             Self::Signalled(signal) => (5, 0, u32::from(signal)),
             Self::SupervisorReady => (6, 0, 0),
+            Self::IsolationReady => (7, 0, 0),
         };
         let mut bytes = [0u8; 12];
         bytes[..4].copy_from_slice(b"DCR1");
@@ -65,7 +72,7 @@ mod tests {
     fn status_roundtrip_and_exact_ancillary_counts() {
         for record in [StatusRecord::Error(16), StatusRecord::EmployeeReady { landlock_abi: 1 },
             StatusRecord::Pty, StatusRecord::ChildrenForked, StatusRecord::Exited(255),
-            StatusRecord::Signalled(64), StatusRecord::SupervisorReady] {
+            StatusRecord::Signalled(64), StatusRecord::SupervisorReady, StatusRecord::IsolationReady] {
             let packet = record.encode().unwrap();
             let fds = usize::from(record == StatusRecord::Pty);
             assert_eq!(StatusRecord::decode(&packet, fds), Ok(record));

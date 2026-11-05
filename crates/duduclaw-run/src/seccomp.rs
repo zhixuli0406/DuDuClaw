@@ -181,7 +181,8 @@ pub fn init(arch: Architecture, status_fd: i32) -> Result<Filter, FilterError> {
 
 /// Root registry's expanded allowlist. No moving '@system-service' aliases.
 /// The signed manifest stores digest(arch); callers cannot assert its own digest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeProfile { pub allowed_syscalls: Vec<u32> }
 impl RuntimeProfile {
     pub fn canonical_bytes(&self, arch: Architecture) -> Result<Vec<u8>, FilterError> {

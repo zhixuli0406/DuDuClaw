@@ -9,6 +9,7 @@ pub mod codex_sandbox;
 pub mod generic_cli;
 pub mod grok;
 pub mod openai_compat;
+mod isolation_gate;
 pub(crate) mod third_party_mcp;
 
 use std::collections::HashMap;

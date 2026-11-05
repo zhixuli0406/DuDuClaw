@@ -53,6 +53,12 @@ pub async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R)
 #[cfg(target_os = "linux")]
 pub async fn serve(mut connection: crate::Connection, dispatcher: &dyn Dispatcher)
     -> Result<(), VerificationError> {
+    serve_with_deadline(&mut connection, dispatcher, std::time::Duration::from_secs(300)).await
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn serve_with_deadline(connection: &mut crate::Connection, dispatcher: &dyn Dispatcher,
+    request_timeout: std::time::Duration) -> Result<(), VerificationError> {
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let socket = connection.socket.take().ok_or(VerificationError::Invalid)?;
@@ -61,8 +67,18 @@ pub async fn serve(mut connection: crate::Connection, dispatcher: &dyn Dispatche
     let (reader, mut writer) = socket.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
     let agent_slug = connection.agent_slug()?;
-    let mut watch = tokio::time::interval(Duration::from_millis(100));
-    watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let verifier = connection.verifier();
+    // This future is polled alongside the handler/deadline, never awaited in
+    // a selected branch. Slow authority I/O cannot monopolize the reactor.
+    let watch = async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            verifier.context().await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), VerificationError>(())
+    };
+    tokio::pin!(watch);
     let mut window = tokio::time::Instant::now();
     let mut requests = 0u16;
     loop {
@@ -72,7 +88,7 @@ pub async fn serve(mut connection: crate::Connection, dispatcher: &dyn Dispatche
             loop {
                 tokio::select! {
                     result = &mut read => break result?,
-                    _ = watch.tick() => { connection.context(crate::authority::now_seconds()?)?; }
+                    result = &mut watch => return result,
                 }
             }
         };
@@ -84,16 +100,26 @@ pub async fn serve(mut connection: crate::Connection, dispatcher: &dyn Dispatche
         if requests == 120 { return Err(VerificationError::Unavailable); }
         requests += 1;
         let request = decode(&frame)?;
-        let context = connection.context(crate::authority::now_seconds()?)?;
+        let deadline = tokio::time::sleep(request_timeout);
+        tokio::pin!(deadline);
+        let context = tokio::select! {
+            result = verifier.context() => result?,
+            result = &mut watch => return result,
+            result = peer_eof(&mut reader) => return result,
+            _ = &mut deadline => return Err(VerificationError::Unavailable),
+        };
         let call = dispatcher.dispatch(context, &agent_slug, request);
         tokio::pin!(call);
-        let deadline = tokio::time::sleep(Duration::from_secs(300));
-        tokio::pin!(deadline);
-        let response = loop {
+        // Immediately ready protocol messages may share a read. Only a call
+        // that actually yields can conflict with a second in-flight request.
+        let immediate = std::future::poll_fn(|cx| match call.as_mut().poll(cx) {
+            std::task::Poll::Ready(value) => std::task::Poll::Ready(Some(value)),
+            std::task::Poll::Pending => std::task::Poll::Ready(None),
+        }).await;
+        let response = if let Some(result) = immediate { result? } else {
             tokio::select! {
-                biased;
-                _ = watch.tick() => { connection.context(crate::authority::now_seconds()?)?; }
-                result = &mut call => break result?,
+                result = &mut watch => return result,
+                result = &mut call => result?,
                 next = reader.fill_buf() => {
                     return if next.map_err(|_| VerificationError::Unavailable)?.is_empty() {
                         Ok(())
@@ -102,24 +128,34 @@ pub async fn serve(mut connection: crate::Connection, dispatcher: &dyn Dispatche
                 _ = &mut deadline => return Err(VerificationError::Unavailable),
             }
         };
-        connection.context(crate::authority::now_seconds()?)?;
+        tokio::select! {
+            result = verifier.context() => { result?; },
+            result = &mut watch => return result,
+            result = peer_eof(&mut reader) => return result,
+            _ = &mut deadline => return Err(VerificationError::Unavailable),
+        }
         if let Some(response) = response {
             let bytes = encode_response(&response)?;
             let write = tokio::time::timeout(Duration::from_secs(5), writer.write_all(&bytes));
             tokio::pin!(write);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = watch.tick() => { connection.context(crate::authority::now_seconds()?)?; }
+            tokio::select! {
+                    result = &mut watch => return result,
                     result = &mut write => {
                         result.map_err(|_| VerificationError::Unavailable)?
                             .map_err(|_| VerificationError::Unavailable)?;
-                        break;
                     }
-                }
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn peer_eof<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<(), VerificationError> {
+    use tokio::io::AsyncBufReadExt;
+    if reader.fill_buf().await.map_err(|_| VerificationError::Unavailable)?.is_empty() { return Ok(()); }
+    // A buffered next protocol message is not EOF. Preserve it for the normal
+    // dispatch stage, which applies the one-in-flight-request rule.
+    std::future::pending().await
 }
 
 pub fn encode_response(value: &Value) -> Result<Vec<u8>, VerificationError> {

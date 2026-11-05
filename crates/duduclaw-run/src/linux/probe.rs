@@ -2,7 +2,19 @@ use crate::{Error, Result};
 use std::os::fd::{FromRawFd, OwnedFd};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Readiness { pub kernel_major: u32, pub kernel_minor: u32, pub landlock_abi: u32 }
+pub struct Readiness {
+    pub kernel_major: u32,
+    pub kernel_minor: u32,
+    /// Actual kernel ABI; never replace this evidence with the policy ceiling.
+    pub landlock_abi: u32,
+    /// Policy selected for launch; actual enforcement is checked during launch.
+    pub landlock_ruleset_abi: u32,
+}
+
+fn landlock_evidence(detected: u32) -> Result<(u32, u32)> {
+    let policy = crate::landlock::Policy::for_abi(detected).map_err(|_| Error::UnsupportedKernel)?;
+    Ok((detected, policy.abi()))
+}
 
 pub fn kernel_version(release: &str) -> Result<(u32, u32)> {
     let mut parts = release.split('.');
@@ -21,7 +33,7 @@ pub fn probe() -> Result<Readiness> {
     let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
     let (kernel_major, kernel_minor) = kernel_version(release.to_str().map_err(|_| Error::UnsupportedKernel)?)?;
     let landlock_abi = crate::landlock::probe_abi().map_err(|_| Error::UnsupportedKernel)?;
-    crate::landlock::Policy::for_abi(landlock_abi).map_err(|_| Error::UnsupportedKernel)?;
+    let (landlock_abi, landlock_ruleset_abi) = landlock_evidence(landlock_abi)?;
     // No actual process creation: size zero must fail EINVAL on a supported API.
     let clone = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0usize) };
     if clone != -1 || super::errno() != libc::EINVAL { return Err(Error::UnsupportedKernel); }
@@ -37,7 +49,7 @@ pub fn probe() -> Result<Readiness> {
     probe_mount_api()?;
     let action: u32 = 0x80000000; // SECCOMP_RET_KILL_PROCESS.
     if unsafe { libc::syscall(libc::SYS_seccomp, 2u32, 0u32, &action) } != 0 { return Err(Error::UnsupportedKernel); }
-    Ok(Readiness { kernel_major, kernel_minor, landlock_abi })
+    Ok(Readiness { kernel_major, kernel_minor, landlock_abi, landlock_ruleset_abi })
 }
 
 fn probe_mount_api() -> Result<()> {
@@ -72,6 +84,22 @@ fn probe_mount_api() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn readiness_preserves_detected_landlock_abi_and_policy_ceiling() {
+        assert_eq!(landlock_evidence(0), Err(Error::UnsupportedKernel));
+        for abi in 1..=7 { assert_eq!(landlock_evidence(abi), Ok((abi, abi))); }
+        for abi in [8, 12, u32::MAX] { assert_eq!(landlock_evidence(abi), Ok((abi, 7))); }
+    }
+
+    #[test]
+    #[ignore = "iso_root_: root Linux VM with mount APIs and Landlock; kernel evidence only"]
+    fn iso_root_landlock_probe_reports_detected_and_selected_abi() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let ready = probe().expect("required kernel APIs");
+        assert_eq!(ready.landlock_abi, crate::landlock::probe_abi().unwrap());
+        assert_eq!(ready.landlock_ruleset_abi,
+            crate::landlock::Policy::for_abi(ready.landlock_abi).unwrap().abi());
+    }
     #[test]
     fn readiness_version_requires_supported_kernel_not_distribution_name() {
         for version in ["5.15.0-ubuntu", "6.1.12", "6.8.0"] { assert!(kernel_version(version).is_ok()); }

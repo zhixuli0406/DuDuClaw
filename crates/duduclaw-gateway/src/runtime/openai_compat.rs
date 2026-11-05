@@ -142,6 +142,7 @@ impl AgentRuntime for OpenAiCompatRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
+        super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::OpenAiCompat)?;
         // APIs require a concrete model; unlike CLI runtimes there is no
         // vendor-selected default to use when both agent model keys are blank.
         validate_model(&context.model)?;
@@ -961,6 +962,7 @@ impl OpenAiCompatRuntime {
         prompt: &str,
         context: &super::RuntimeContext,
     ) -> Result<super::RuntimeResponse, String> {
+        super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::OpenAiCompat)?;
         crate::product_policy::require_model(crate::product_policy::load(&context.home_dir)?, &context.model)?;
         let (api_key, base_url, _provider_name) = resolve_provider_config(
             &context.home_dir,

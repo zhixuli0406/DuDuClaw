@@ -172,6 +172,11 @@ pub fn policy_revision(home: &Path, actor: &str) -> Result<String, String> {
     ))
 }
 
+/// Parsed-only policy fingerprint for protected execution admission.
+pub fn strict_policy_revision(home: &Path, actor: &str) -> Result<String, String> {
+    super::policy_snapshot::strict_revision(home, actor)
+}
+
 impl ApprovalBroker {
     /// Commit before notifying: an immediate reply can never race a missing row.
     pub async fn request_bound(

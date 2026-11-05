@@ -196,6 +196,7 @@ impl<P: ChatProvider> ChatProvider for ReasoningTap<P> {
     }
 
     async fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        crate::isolation_readiness::check_execution().map_err(LlmError::InvalidRequest)?;
         if self.live && super::policy().wants_live() {
             match self.inner.stream(req).await {
                 Ok(stream) => return self.drain(req, stream).await,
@@ -211,6 +212,7 @@ impl<P: ChatProvider> ChatProvider for ReasoningTap<P> {
                 ),
             }
         }
+        crate::isolation_readiness::check_execution().map_err(LlmError::InvalidRequest)?;
         let resp = self.inner.complete(req).await?;
         self.report_parts(&resp);
         Ok(resp)
@@ -220,6 +222,7 @@ impl<P: ChatProvider> ChatProvider for ReasoningTap<P> {
         &self,
         req: &ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+        crate::isolation_readiness::check_execution().map_err(LlmError::InvalidRequest)?;
         // The tool loops only call `complete()`; pass through untouched.
         self.inner.stream(req).await
     }

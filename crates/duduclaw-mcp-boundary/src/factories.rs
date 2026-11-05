@@ -46,9 +46,9 @@ impl ExecutionPlanFactory for ResourceCheckedPlans {
     fn authorize_handler<'a>(&'a self, context: &'a RequestContext, tool: &'a str,
         arguments: &'a Value) -> PolicyFuture<'a, ()> {
         Box::pin(async move {
-            let before = tool_policy::authorize(context, tool, arguments, self.resolver.as_ref())?;
+            let before = tool_policy::authorize_async(context, tool, arguments, self.resolver.clone()).await?;
             self.plans.authorize_handler(context, tool, arguments).await?;
-            let after = tool_policy::authorize(context, tool, arguments, self.resolver.as_ref())?;
+            let after = tool_policy::authorize_async(context, tool, arguments, self.resolver.clone()).await?;
             if before.resources() != after.resources() { return Err(VerificationError::BindingMismatch); }
             Ok(())
         })
@@ -56,10 +56,10 @@ impl ExecutionPlanFactory for ResourceCheckedPlans {
     fn prepare<'a>(&'a self, context: &'a RequestContext, tool: &'a str,
         arguments: &'a Value, run: RunHandle) -> PolicyFuture<'a, SpawnPolicy> {
         Box::pin(async move {
-            let before = tool_policy::authorize(context, tool, arguments, self.resolver.as_ref())?;
+            let before = tool_policy::authorize_async(context, tool, arguments, self.resolver.clone()).await?;
             self.plans.authorize_handler(context, tool, arguments).await?;
             let plan = self.plans.prepare(context, tool, arguments, run).await?;
-            let after = tool_policy::authorize(context, tool, arguments, self.resolver.as_ref())?;
+            let after = tool_policy::authorize_async(context, tool, arguments, self.resolver.clone()).await?;
             if before.resources() != after.resources() { return Err(VerificationError::BindingMismatch); }
             Ok(plan)
         })

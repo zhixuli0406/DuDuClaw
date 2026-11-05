@@ -126,6 +126,16 @@ pub fn verify_script(fd: RawFd, relative: &CStr, registry_mount: u64) -> Result<
 /// after moving the sources high and before closing script/directory descriptors.
 /// No descriptor is allocated after the two final close_range calls.
 pub fn reorder(plan: FdPlan, owned: Vec<OwnedFd>, script: Option<(&CStr, u64)>) -> Result<OwnedFd> {
+    if plan.sources().iter().any(|source| source.destination == Destination::ExecStatus) {
+        return Err(Error::Descriptors);
+    }
+    Ok(reorder_for_exec(plan, owned, script)?.0)
+}
+
+/// Preserve one CLOEXEC notification pipe until execveat. It carries no
+/// authority and disappears on successful exec; the namespace init waits for
+/// EOF before reporting runtime readiness.
+pub fn reorder_for_exec(plan: FdPlan, owned: Vec<OwnedFd>, script: Option<(&CStr, u64)>) -> Result<(OwnedFd, Option<OwnedFd>)> {
     if owned.len() != plan.sources().len() || owned.iter().zip(plan.sources()).any(|(fd, s)| fd.as_raw_fd() != s.fd)
         || script.is_some() != plan.sources().iter().any(|s| s.destination == Destination::Script) {
         return Err(Error::Descriptors);
@@ -142,6 +152,7 @@ pub fn reorder(plan: FdPlan, owned: Vec<OwnedFd>, script: Option<(&CStr, u64)>) 
     }
     drop(owned);
     let mut exec = None;
+    let mut exec_status = None;
     let mut expected = Vec::new();
     for ((source, high), identity) in plan.sources().iter().zip(copies).zip(identities) {
         match &source.destination {
@@ -152,6 +163,7 @@ pub fn reorder(plan: FdPlan, owned: Vec<OwnedFd>, script: Option<(&CStr, u64)>) 
                 }
             }
             Destination::Executable => { exec = Some(high); }
+            Destination::ExecStatus => { exec_status = Some(high); }
             Destination::Script => {
                 let (path, mount) = script.ok_or(Error::Executable)?;
                 verify_script(high.as_raw_fd(), path, mount)?;
@@ -160,20 +172,23 @@ pub fn reorder(plan: FdPlan, owned: Vec<OwnedFd>, script: Option<(&CStr, u64)>) 
     }
     let exec = exec.ok_or(Error::Descriptors)?;
     let exec_fd = exec.as_raw_fd();
-    close_range((plan.last_target() + 1) as u32, (exec_fd - 1) as u32)?;
-    close_range((exec_fd + 1) as u32, u32::MAX)?;
-    for fd in 0..=exec_fd + 1 {
+    let status_fd = exec_status.as_ref().map(AsRawFd::as_raw_fd);
+    let mut keep: Vec<_> = (0..=plan.last_target()).collect();
+    keep.push(exec_fd);
+    if let Some(status) = status_fd { keep.push(status); }
+    close_except(&keep)?;
+    for fd in 0..=exec_fd.max(status_fd.unwrap_or(0)) + 1 {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         if fd <= plan.last_target() {
             if flags < 0 || flags & libc::FD_CLOEXEC != 0 { return Err(Error::Descriptors); }
-        } else if fd == exec_fd {
+        } else if fd == exec_fd || status_fd == Some(fd) {
             if flags < 0 || flags & libc::FD_CLOEXEC == 0 { return Err(Error::Descriptors); }
         } else if flags != -1 || super::errno() != libc::EBADF { return Err(Error::Descriptors); }
     }
     for (fd, identity) in expected {
         if observe(fd)?.identity != identity { return Err(Error::Descriptors); }
     }
-    Ok(exec)
+    Ok((exec, exec_status))
 }
 
 /// Useful for supervisor/init: consuming handles avoids double-closes after a

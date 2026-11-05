@@ -90,3 +90,17 @@ fn iso_root_full_launch_reaps_double_fork_descendants() { fixture("launch-teardo
 #[test]
 #[ignore = "requires root Linux full trampoline; --features root-test-fixture"]
 fn iso_root_full_launch_supervisor_failure_blocks_runtime() { fixture("launch-supervisor-failure"); }
+
+// Production sealed-manifest transport plus the actual trampoline. The fixture
+// supplies root-owned plans; these are not gateway/spawnd/systemd admission tests.
+#[test]
+#[ignore = "requires root Linux full trampoline; --features root-test-fixture"]
+fn iso_root_e2e_sealed_bootstrap_trampoline_uid_namespaces_fds() { fixture("launch-elf"); }
+
+#[test]
+#[ignore = "requires root Linux full trampoline; --features root-test-fixture; not D8 admission"]
+fn iso_root_e2e_sealed_bootstrap_trampoline_double_fork_teardown() { fixture("launch-teardown"); }
+
+#[test]
+#[ignore = "requires root Linux full trampoline; --features root-test-fixture"]
+fn iso_root_e2e_sealed_bootstrap_fast_exit_preserves_status() { fixture("launch-fast-exit"); }

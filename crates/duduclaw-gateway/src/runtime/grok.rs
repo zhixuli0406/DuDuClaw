@@ -380,6 +380,7 @@ impl AgentRuntime for GrokRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
+        super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::Grok)?;
         if crate::runtime_dispatch::in_utility_call() {
             return Err("Grok utility calls refused: no verified tool-free mode".into());
         }
@@ -874,6 +875,7 @@ impl GrokRuntime {
         prompt: &str,
         context: &super::RuntimeContext,
     ) -> Result<Vec<super::RuntimeChunk>, String> {
+        super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::Grok)?;
         let response = self.execute(prompt, context).await?;
         Ok(vec![super::RuntimeChunk::Done(response)])
     }

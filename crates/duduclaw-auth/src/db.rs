@@ -203,6 +203,7 @@ impl UserDb {
              INSERT OR IGNORE INTO auth_meta (key, value) VALUES ('acl_generation', 1);",
         )
         .map_err(|e| format!("failed to migrate auth_meta: {e}"))?;
+        crate::isolation::initialize_tenant(&conn)?;
         Ok(())
     }
 

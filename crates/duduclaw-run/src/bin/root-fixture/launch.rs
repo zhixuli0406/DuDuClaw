@@ -1,8 +1,9 @@
 // Full serve/handshake/launch tests. This module exists only in the debug-only
-// root fixture; its registry and syscall profile are never production policy.
+// root fixture; its plan and syscall profile are never production policy.
+// The manifest transport/registry are the production B1 -> B2 implementations.
 use super::*;
 use duduclaw_isolation::{ids::RunId, ipc::InputFd};
-use duduclaw_run::{linux::{bootstrap, runner::{self, MountIdentity, Program, TrustedRun}},
+use duduclaw_run::{linux::{bootstrap, sealed_registry::{self, SealedRegistry}, runner::{self, MountIdentity, Program, TrustedRun}},
     seccomp::RuntimeProfile, validation::Identity};
 use std::time::{Duration, Instant};
 
@@ -10,14 +11,6 @@ const RUN: RunId = RunId([0x42;16]);
 const SUPERVISOR: u32 = 997;
 const PROMPT: &[u8] = b"sealed-prompt-fixture";
 const ATTACHMENT: &[u8] = b"sealed-attachment-fixture";
-
-struct Registry(Option<TrustedRun>);
-impl bootstrap::RootRegistry for Registry {
-    fn take_run(&mut self, run: RunId) -> duduclaw_run::Result<TrustedRun> {
-        if run != RUN { return Err(duduclaw_run::Error::RegistryUnavailable); }
-        self.0.take().ok_or(duduclaw_run::Error::RegistryUnavailable)
-    }
-}
 
 fn socketpair(kind: i32) -> (OwnedFd,OwnedFd) {
     let mut descriptors=[-1;2];
@@ -99,9 +92,10 @@ fn prepare(root: &Path, scenario: &str) -> (TrustedRun,Vec<OwnedFd>,OwnedFd,Opti
         (Some(program(identity,"forwarder",None)),Some(host))
     } else {(None,None)};
     let mode=match scenario {
-        "launch-pty"=>"pty", "launch-teardown"=>"orphan", "launch-script"=>"script", _=>"normal",
+        "launch-pty"=>"pty", "launch-teardown"=>"orphan", "launch-script"=>"script",
+        "launch-fast-exit"=>"fast", _=>"normal",
     };
-    let plan=TrustedRun {root:mounts::RootConfig {employee_uid:EMPLOYEE,employee_gid:EMPLOYEE,
+    let plan=TrustedRun {stdin:false,root:mounts::RootConfig {employee_uid:EMPLOYEE,employee_gid:EMPLOYEE,
         pty:scenario=="launch-pty",pty_limit:2,work_noexec:true,tmp_noexec:true,
         tmpfs_bytes:4*1024*1024,tmpfs_inodes:256},mounts:identities.try_into().ok().unwrap(),
         supervisor_uid:SUPERVISOR,supervisor_gid:SUPERVISOR,gateway_uid:998,gateway_mount:0,
@@ -185,14 +179,14 @@ pub(super) fn run(root: &Path, scenario: &str) {
         if scenario=="launch-supervisor-failure" {fail_supervisor_transition();}
         // All pre-fork descriptor owners are intentionally abandoned: serve takes
         // the complete descriptor table and never returns.
-        unsafe {runner::serve(&mut Registry(Some(plan)))}
+        unsafe {runner::serve(&mut SealedRegistry::default())}
     }
     let cleanup=Cleanup;
     drop(child_bootstrap); drop(write_output);
     assert!(readable(bootstrap.as_raw_fd(),10_000),"bootstrap challenge timed out");
     let challenge=bootstrap::receive_challenge(bootstrap.as_raw_fd()).unwrap();
     let rights:Vec<_>=descriptors.iter().map(AsRawFd::as_raw_fd).collect();
-    bootstrap::send_offer(bootstrap.as_raw_fd(),challenge,RUN,&rights).unwrap();
+    sealed_registry::send(bootstrap.as_raw_fd(),challenge,RUN,plan,&rights).unwrap();
     drop(descriptors);
     let mut records=Vec::new();
     let mut pty=None;
@@ -288,9 +282,26 @@ pub(super) fn run(root: &Path, scenario: &str) {
     } else {
         let supervisor=records.iter().position(|r|r.0==6).expect("supervisor readiness receipt");
         let employee=records.iter().position(|r|r.0==1).expect("employee privilege receipt");
-        let forked=records.iter().position(|r|r.0==3).expect("children forked receipt");
-        assert!(supervisor<employee && employee<forked,"launch receipt ordering");
-        let expected=match scenario {"launch-exec-failure"=>126,"launch-forwarder-failure"=>125,
+        assert!(supervisor<employee,"supervisor must authorize employee privilege drop");
+        if scenario=="launch-exec-failure" {
+            assert!(!records.iter().any(|r|matches!(r.0,3|7)),"failed startup must not advertise isolation readiness");
+        } else if scenario=="launch-fast-exit" {
+            // Scheduling may let init observe a live, fully isolated process or
+            // an already-exited one. Neither case may rewrite a real exit 23.
+            let isolated=records.iter().position(|r|r.0==7);
+            let forked=records.iter().position(|r|r.0==3);
+            assert_eq!(isolated.is_some(),forked.is_some(),"readiness receipts must agree");
+            if let Some(isolated)=isolated { assert!(employee<isolated); }
+        } else {
+            let forked=records.iter().position(|r|r.0==3).expect("children forked receipt");
+            assert!(employee<forked,"launch receipt ordering");
+        }
+        if matches!(scenario,"launch-elf"|"launch-script"|"launch-pty"|"launch-teardown") {
+            let isolated=records.iter().position(|r|*r==(7,0,0)).expect("post-isolation readiness receipt");
+            let terminal=records.iter().position(|r|matches!(r.0,4|5)).expect("terminal receipt");
+            assert!(employee<isolated && isolated<terminal,"isolation ready must precede completion");
+        }
+        let expected=match scenario {"launch-exec-failure"=>125,"launch-forwarder-failure"=>125,
             "launch-cancel"|"launch-cancel-startup"=>143,_=>23};
         assert_eq!(terminal,Some((4,expected)));
         assert_eq!(libc::WEXITSTATUS(wait_status),expected as i32);
@@ -299,6 +310,9 @@ pub(super) fn run(root: &Path, scenario: &str) {
             assert!(records.iter().any(|r|*r==(0,16,0)),"late exec error must survive fd sweep");
         } else if scenario=="launch-forwarder-failure" {
             assert!(ready); assert!(records.iter().any(|r|*r==(0,14,0)));
+        } else if scenario=="launch-fast-exit" {
+            assert!(!ready,"fast runtime never sends application READY");
+            assert!(!records.iter().any(|r|r.0==0),"legitimate fast exit is not an isolation/exec error");
         } else {
             assert!(ready || startup_cancelled);
             assert!(!records.iter().any(|r|r.0==0));
@@ -365,6 +379,7 @@ pub(super) fn runtime_mode() {
             assert_eq!(fd::observe(0).unwrap().identity,fd::observe(2).unwrap().identity);
             assert_eq!(unsafe {libc::write(1,b"PTY-OK\n".as_ptr().cast(),7)},7);
         }
+        if mode=="fast" { return; }
         if mode=="orphan" {
             let child=unsafe {libc::fork()}; assert!(child>=0);
             if child==0 {

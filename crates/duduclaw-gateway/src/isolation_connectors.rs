@@ -1,10 +1,12 @@
 //! Account selection for isolated MCP. No credential fallback or ambient account.
 use std::{future::Future, pin::Pin, sync::{Arc, Mutex}};
 use duduclaw_isolation::capability::ResourceGrant;
-use duduclaw_mcp_boundary::{bindings::BindingStore, tool_policy::AuthorizedToolCall,
+use duduclaw_mcp_boundary::{bindings::BindingAuthority, tool_policy::AuthorizedToolCall,
     RequestContext, VerificationError};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
+#[cfg(test)]
+use duduclaw_mcp_boundary::bindings::BindingStore;
 
 /// Gateway-owned account routing metadata. Registration happens only after the
 /// connector's actual account has been provisioned; deletion/revocation is final.
@@ -79,7 +81,7 @@ pub struct SelectedConnector {
     account: String,
     provider: &'static str,
     context: RequestContext,
-    bindings: Arc<Mutex<BindingStore>>,
+    bindings: Arc<dyn BindingAuthority>,
     catalog: Arc<ConnectorCatalog>,
 }
 impl SelectedConnector {
@@ -91,14 +93,13 @@ impl SelectedConnector {
         let record = self.context.record();
         let now = duduclaw_mcp_boundary::authority::now_seconds()?;
         if now < record.not_before || now >= record.expires_at { return Err(VerificationError::Invalid); }
-        self.bindings.lock().map_err(|_| VerificationError::Unavailable)?
-            .authorize_connector(record.employee, &record.employee_binding, &record.principal, &self.account)
+        self.bindings.authorize_connector(record.employee, &record.employee_binding, &record.principal, &self.account)
             .map_err(|_| VerificationError::BindingMismatch)?;
         if !self.catalog.matches(&self.account, self.provider)? { return Err(VerificationError::BindingMismatch); }
         Ok(())
     }
     pub fn select(context: &RequestContext, tool: &str, arguments: &Value,
-        bindings: Arc<Mutex<BindingStore>>, catalog: Arc<ConnectorCatalog>) -> Result<Self, VerificationError> {
+        bindings: Arc<dyn BindingAuthority>, catalog: Arc<ConnectorCatalog>) -> Result<Self, VerificationError> {
         let provider = provider_for_tool(tool).ok_or(VerificationError::Invalid)?;
         if !context.record().tools.as_slice().iter().any(|allowed| allowed.as_str() == tool) {
             return Err(VerificationError::Invalid);

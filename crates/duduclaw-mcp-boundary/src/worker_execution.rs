@@ -58,12 +58,12 @@ impl WorkerToolBridge {
     async fn run(&self, context: &RequestContext, name: &str, arguments: &Value)
         -> Result<Value, VerificationError> {
         if !self.supports(name) { return Err(VerificationError::Unavailable); }
-        let call = tool_policy::authorize(context, name, arguments, self.resolver.as_ref())?;
+        let call = tool_policy::authorize_async(context, name, arguments, self.resolver.clone()).await?;
         self.factory.authorize_handler(&call).await?;
         let plan = self.factory.prepare(&call).await?;
         validate_plan(&plan)?;
         self.factory.authorize_handler(&call).await?;
-        let checked = tool_policy::authorize(context, name, arguments, self.resolver.as_ref())?;
+        let checked = tool_policy::authorize_async(context, name, arguments, self.resolver.clone()).await?;
         if call.resources() != checked.resources() { return Err(VerificationError::BindingMismatch); }
         let request = plan.request.clone();
         let invoke = self.invoke.clone();
@@ -73,7 +73,7 @@ impl WorkerToolBridge {
             .map_err(|_| VerificationError::Unavailable)??;
         validate_reply(&request, &reply)?;
         self.factory.authorize_handler(&checked).await?;
-        let current = tool_policy::authorize(context, name, arguments, self.resolver.as_ref())?;
+        let current = tool_policy::authorize_async(context, name, arguments, self.resolver.clone()).await?;
         if checked.resources() != current.resources() { return Err(VerificationError::BindingMismatch); }
         let result = self.factory.finish(&current, reply).await?;
         if serde_json::to_vec(&result).map_err(|_| VerificationError::Invalid)?.len() > MAX_WORKER_FRAME_BYTES {

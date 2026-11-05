@@ -6,7 +6,7 @@ pub const MAX_SOURCES: usize = 72;
 pub const MAX_TARGET: i32 = 4 + duduclaw_isolation::ipc::MAX_INPUT_FDS as i32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Destination { Runtime(Vec<i32>), Executable, Script }
+pub enum Destination { Runtime(Vec<i32>), Executable, Script, ExecStatus }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source { pub fd: i32, pub destination: Destination }
 
@@ -22,6 +22,7 @@ impl FdPlan {
         let mut targets = std::collections::BTreeSet::new();
         let mut executable = 0;
         let mut script = 0;
+        let mut exec_status = 0;
         for source in &sources {
             if source.fd < 0 || u64::try_from(source.fd).unwrap_or(u64::MAX) >= soft_limit
                 || !source_fds.insert(source.fd) { return Err(Error::Descriptors); }
@@ -36,10 +37,11 @@ impl FdPlan {
                 }
                 Destination::Executable => executable += 1,
                 Destination::Script => script += 1,
+                Destination::ExecStatus => exec_status += 1,
             }
         }
         let last = *targets.last().ok_or(Error::Descriptors)?;
-        if executable != 1 || script > 1 || last < 4 || targets.len() != (last + 1) as usize {
+        if executable != 1 || script > 1 || exec_status > 1 || last < 4 || targets.len() != (last + 1) as usize {
             return Err(Error::Descriptors);
         }
         Ok(Self { sources, last })
@@ -78,6 +80,15 @@ mod tests {
         let mut bad = valid(); bad[1].destination = Destination::Runtime(vec![0]);
         assert!(FdPlan::new(bad, 4096).is_err());
         assert!(FdPlan::required_limit(73).is_err());
+    }
+    #[test]
+    fn exec_notification_is_single_and_never_a_runtime_target() {
+        let mut sources = valid();
+        sources.push(Source { fd: 7, destination: Destination::ExecStatus });
+        let plan = FdPlan::new(sources.clone(), 4096).unwrap();
+        assert_eq!(plan.last_target(), 4);
+        sources.push(Source { fd: 8, destination: Destination::ExecStatus });
+        assert_eq!(FdPlan::new(sources, 4096), Err(Error::Descriptors));
     }
     #[test]
     fn fd_plan_requires_exactly_one_executable_and_at_most_one_script() {

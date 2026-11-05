@@ -161,6 +161,7 @@ mod tests {
     #[tokio::test]
     async fn isolated_identity_uses_host_delegation_metadata_without_resetting_nested_runs() {
         use duduclaw_gateway::isolation_egress::{RunMetadata, RunTurnIdentity, RunTurnResolver};
+        #[derive(Clone)]
         struct Resolver(RunMetadata);
         impl RunTurnResolver for Resolver {
             fn resolve(&self, _: &RequestContext) -> Result<RunTurnIdentity, duduclaw_mcp_boundary::VerificationError> {
@@ -178,7 +179,7 @@ mod tests {
             let call = call(home.path(), "one");
             let context = call.context.clone();
             let resolver = Resolver(metadata.clone());
-            duduclaw_gateway::isolation_egress::scope(home.path(), "one", &context, Some(&resolver),
+            duduclaw_gateway::isolation_egress::scope(home.path(), "one", &context, Some(Arc::new(resolver.clone())),
                 ISOLATED_CALL.scope(call, async {
                     assert_eq!(var(duduclaw_core::ENV_DELEGATION_DEPTH).unwrap(), metadata.delegation_depth.to_string());
                     assert_eq!(var(duduclaw_core::ENV_HOP_DEPTH).unwrap(), metadata.hop_depth.to_string());
@@ -198,6 +199,7 @@ mod tests {
     #[tokio::test]
     async fn isolated_identity_preserves_background_and_memory_provenance_pairs() {
         use duduclaw_gateway::isolation_egress::{RunMetadata, RunTurnIdentity, RunTurnResolver};
+        #[derive(Clone)]
         struct Resolver { session: Option<String>, metadata: RunMetadata }
         impl RunTurnResolver for Resolver {
             fn resolve(&self, _: &RequestContext) -> Result<RunTurnIdentity, duduclaw_mcp_boundary::VerificationError> {
@@ -216,7 +218,7 @@ mod tests {
         let resolver = Resolver { session: None, metadata: RunMetadata {
             dispatch_run: Some(("cron:one".into(), "registered-run".into())), upstream_unknown: true,
             ..RunMetadata::root() } };
-        duduclaw_gateway::isolation_egress::scope(home.path(), "one", &context, Some(&resolver),
+        duduclaw_gateway::isolation_egress::scope(home.path(), "one", &context, Some(Arc::new(resolver.clone())),
             ISOLATED_CALL.scope(call.clone(), async {
                 assert_eq!(host_principal_checked().unwrap(), None);
                 assert_eq!(var(duduclaw_core::ENV_TRUST_TURN_ID), Err(VarError::NotPresent));
@@ -232,7 +234,7 @@ mod tests {
             })).await.unwrap();
         let resolver = Resolver { session: Some("conversation".into()), metadata: RunMetadata {
             user_message: Some((7, "2026-11-05T00:00:00Z".into())), ..RunMetadata::root() } };
-        duduclaw_gateway::isolation_egress::scope(home.path(), "one", &context, Some(&resolver),
+        duduclaw_gateway::isolation_egress::scope(home.path(), "one", &context, Some(Arc::new(resolver.clone())),
             ISOLATED_CALL.scope(call.clone(), async {
                 assert_eq!(var(duduclaw_core::ENV_TRUST_TURN_ID).unwrap(), "host-turn");
                 assert_eq!(var(duduclaw_core::ENV_TRUST_SESSION_ID).unwrap(), "conversation");
@@ -254,6 +256,6 @@ mod tests {
             })).await.unwrap();
         let orphan_message = Resolver { session: None, ..resolver };
         assert!(duduclaw_gateway::isolation_egress::scope(home.path(), "one", &context,
-            Some(&orphan_message), async {}).await.is_err());
+            Some(Arc::new(orphan_message)), async {}).await.is_err());
     }
 }

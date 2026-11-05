@@ -19,7 +19,7 @@ fn main() {
             let gateway = server::gateway_identity()?;
             duduclaw_spawnd::transport::prepare_runtime_directory()?;
             let audit = AuditWorker::start()?;
-            let host = LinuxHost::open(gateway, Components::default(), audit.clone())?;
+            let host = LinuxHost::open(gateway, Components::installed(), audit.clone())?;
             let listener = server::listener(gateway.1)?;
             let snapshots = host.snapshots;
             let limits = Limits { host_ptys: host.host_ptys, ..Limits::default() };

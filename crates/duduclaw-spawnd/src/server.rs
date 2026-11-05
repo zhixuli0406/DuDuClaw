@@ -65,6 +65,20 @@ pub fn listener(gateway_gid: u32) -> io::Result<Listener> {
 
 struct Client { socket: Seqpacket, id: ControlConnectionId, last_request: u64 }
 
+/// One monotonic epoch domain for coordinator deadlines and asynchronous host
+/// receipts. Reading wall time independently in a worker can invent activity in
+/// the future after clock adjustment, and boot-relative time is a different unit.
+pub(crate) fn coordination_time_ms() -> io::Result<u64> {
+    static CLOCK: std::sync::OnceLock<(u64, Instant)> = std::sync::OnceLock::new();
+    if CLOCK.get().is_none() {
+        let epoch = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| unavailable())?
+            .as_millis().try_into().map_err(|_| unavailable())?;
+        let _ = CLOCK.set((epoch, Instant::now()));
+    }
+    let (epoch, start) = CLOCK.get().ok_or_else(unavailable)?;
+    epoch.checked_add(start.elapsed().as_millis().try_into().map_err(|_| unavailable())?).ok_or_else(unavailable)
+}
+
 pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listener,
     gateway: (u32, u32), snapshots: SnapshotAuthority, host: H, limits: Limits,
     audit: crate::audit::disk::AuditWorker) -> io::Result<()> {
@@ -75,17 +89,15 @@ pub fn serve<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(listener: Listen
     unsafe { sigaction(Signal::SIGTERM, &handler)?; sigaction(Signal::SIGINT, &handler)?; }
     if snapshots.gateway_uid != gateway.0 { return Err(unavailable()); }
     let mut coordinator = Coordinator::new(host, limits).map_err(|_| unavailable())?;
-    let epoch: u64 = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| unavailable())?
-        .as_millis().try_into().map_err(|_| unavailable())?;
-    let boot = Instant::now();
+    coordination_time_ms()?;
     let mut clients: Vec<Client> = Vec::new();
     loop {
-        let now = epoch.checked_add(boot.elapsed().as_millis().try_into().map_err(|_| unavailable())?).ok_or_else(unavailable)?;
+        let now = coordination_time_ms()?;
         if STOP.load(Ordering::Relaxed) {
             coordinator.begin_shutdown(now);
             let until = Instant::now() + Duration::from_secs(10);
             while coordinator.has_active_runs() && Instant::now() < until {
-                let now = epoch + boot.elapsed().as_millis() as u64;
+                let now = coordination_time_ms()?;
                 let _ = coordinator.tick(now);
                 std::thread::sleep(Duration::from_millis(25));
             }

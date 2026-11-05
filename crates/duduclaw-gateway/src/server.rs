@@ -665,6 +665,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         home_dir.clone(), edition_override,
     ).await;
     info!("edition_profile={}", boot_edition.as_str());
+    crate::isolation_readiness::initialize(!boot_edition.is_personal());
+    crate::isolation_readiness::connect_backend().await;
     // Allow an old store with no MFA tables; refuse a partial MFA schema or
     // unreadable policy before schema initialization can hide the failure.
     precheck_identity_policy(&home_dir, boot_edition.is_personal())
@@ -828,6 +830,16 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     let handler = MethodHandler::with_extension(config.home_dir, extension.clone()).await;
     handler.set_edition_override(edition_override).await;
+    let isolation_agents = handler.registry().clone();
+    crate::isolation_mcp::boot_protected(&home_dir, user_db.clone(), Arc::new(move |agent| {
+        use crate::isolation_mcp::VerificationError;
+        let registry = isolation_agents.try_read().map_err(|_| VerificationError::Unavailable)?;
+        let employee = registry.get(agent).ok_or(VerificationError::Revoked)?;
+        if !employee.config.agent.status.is_operational() {
+            return Err(VerificationError::Revoked);
+        }
+        Ok(())
+    })).await;
 
     // Initialize cost telemetry (must happen before any Claude CLI calls)
     if let Err(e) = crate::cost_telemetry::init_telemetry(&home_dir) {

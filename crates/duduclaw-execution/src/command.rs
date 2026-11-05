@@ -428,7 +428,7 @@ async fn protected(native: NativeCommandSnapshot, class: ExecutionClass, pty: bo
         || (matches!(lifecycle.wait_origin(), WaitOrigin::Run(_)) && lifecycle.caller_employee().is_none()) {
         return Err(error(BackendError::WouldDeadlock));
     }
-    let backend = Arc::new(crate::SpawndBackend::connect().await.map_err(error)?);
+    let backend = crate::selection::protected_backend().map_err(error)?;
     let employee = lifecycle.employee();
     let run = backend.reserve(employee).await.map_err(error)?;
     let mut prepared = Prepared { backend: backend.clone(), run, lifecycle: lifecycle.clone(), mcp: false, armed: true, io_deadline: tokio::time::Instant::now() };

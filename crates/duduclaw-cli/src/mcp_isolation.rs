@@ -69,6 +69,13 @@ pub trait ResourceToolService: Send + Sync {
         -> Pin<Box<dyn Future<Output = Result<Value, VerificationError>> + Send + 'a>>;
 }
 
+async fn authorize_resource_call(service: Arc<dyn ResourceToolService>, context: &RequestContext,
+    name: &str, arguments: &Value) -> Result<duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall, VerificationError> {
+    let (context, name, arguments) = (context.clone(), name.to_owned(), arguments.clone());
+    duduclaw_mcp_boundary::authority::verify_blocking(move ||
+        duduclaw_mcp_boundary::tool_policy::authorize(&context, &name, &arguments, service.resolver())).await
+}
+
 /// Called after the legacy dispatcher gates and argument rewrites. Native file
 /// handlers retain their fd-only path; every other tool uses an explicit service.
 pub(crate) async fn dispatch_resource_tool(home: &std::path::Path, name: &str, arguments: &Value) -> Option<Value> {
@@ -103,11 +110,11 @@ pub(crate) async fn dispatch_resource_tool(home: &std::path::Path, name: &str, a
     let result = async {
         let service = current.services.as_ref().filter(|service| service.supports(name))
             .ok_or(VerificationError::Unavailable)?;
-        let call = duduclaw_mcp_boundary::tool_policy::authorize(&current.context, name, arguments, service.resolver())?;
+        let call = authorize_resource_call(service.clone(), &current.context, name, arguments).await?;
         service.check_handler_policy(&call).await?;
         // Re-resolve after an async handler-policy check. An approval or lookup
         // may have yielded while ownership/collection membership changed.
-        let checked = duduclaw_mcp_boundary::tool_policy::authorize(&current.context, name, arguments, service.resolver())?;
+        let checked = authorize_resource_call(service.clone(), &current.context, name, arguments).await?;
         if checked.resources() != call.resources() { return Err(VerificationError::BindingMismatch); }
         service.execute(checked).await
     }.await;
@@ -432,7 +439,7 @@ impl duduclaw_mcp_boundary::server::Dispatcher for IsolationDispatcher {
                 parser: self.parser.clone(), services: self.services.clone(), execution: self.execution.clone(), worker: self.worker.clone(),
                 record_resolver: self.record_resolver.clone() });
             duduclaw_gateway::isolation_egress::scope(&self.dispatcher.home_dir, &self.agent, &context,
-                self.turn_resolver.as_deref(), ISOLATED_CALL.scope(call, crate::mcp_auth::with_authenticated_call(
+                self.turn_resolver.clone(), ISOLATED_CALL.scope(call, crate::mcp_auth::with_authenticated_call(
                 crate::mcp_auth::AuthenticatedCall::without_reference(self.principal.clone()),
                 self.request(request)))).await?
         })

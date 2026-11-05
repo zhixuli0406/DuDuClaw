@@ -8,6 +8,10 @@ pub mod response;
 pub mod parsers;
 #[cfg(target_os = "linux")]
 pub mod transport;
+#[cfg(target_os = "linux")]
+pub mod retirement;
+#[cfg(target_os = "linux")]
+mod retirement_hello;
 #[cfg(all(target_os = "linux", feature = "engine"))]
 pub mod sandbox;
 

@@ -1,23 +1,27 @@
 //! Live resource resolution for the gateway's isolated MCP adapter.
 //! The employee/agent mapping is supplied by the authenticated boot registry.
-use std::{path::{Path, PathBuf}, sync::{Arc, Mutex}};
+use std::{path::{Path, PathBuf}, sync::Arc};
 use duduclaw_isolation::{bounded::Text, capability::ResourceGrant, ids::EmployeeId};
-use duduclaw_mcp_boundary::{bindings::BindingStore, tool_policy::{ResourceKind, ResourceResolver, ToolPolicy},
+use duduclaw_mcp_boundary::{bindings::BindingAuthority, tool_policy::{ResourceKind, ResourceResolver, ToolPolicy},
     RequestContext, VerificationError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
+use duduclaw_mcp_boundary::bindings::BindingStore;
 use crate::isolation_connectors::{ConnectorCatalog, SelectedConnector};
 
 pub struct GatewayResourceResolver {
     home: PathBuf,
     employee: EmployeeId,
     agent: String,
-    bindings: Arc<Mutex<BindingStore>>,
+    bindings: Arc<dyn BindingAuthority>,
     connectors: Option<Arc<ConnectorCatalog>>,
 }
 impl GatewayResourceResolver {
     pub fn new(home: PathBuf, employee: EmployeeId, agent: String,
-        bindings: Arc<Mutex<BindingStore>>) -> Result<Self, VerificationError> {
+        bindings: Arc<dyn BindingAuthority>) -> Result<Self, VerificationError> {
         if !duduclaw_core::is_valid_agent_id(&agent) || duduclaw_core::is_reserved_agent_id(&agent)
             || agent == duduclaw_core::UNTRUSTED_AGENT_ID || !home.is_absolute() {
             return Err(VerificationError::Invalid);
@@ -36,8 +40,7 @@ impl GatewayResourceResolver {
     fn identity(&self, context: &RequestContext) -> Result<(), VerificationError> {
         let record = context.record();
         if record.employee != self.employee { return Err(VerificationError::BindingMismatch); }
-        self.bindings.lock().map_err(|_| VerificationError::Unavailable)?
-            .validate(record.employee, &record.employee_binding, &record.principal)
+        self.bindings.validate(record.employee, &record.employee_binding, &record.principal)
             .map_err(|_| VerificationError::BindingMismatch)
     }
     fn database(&self, filename: &str) -> Result<Connection, VerificationError> {

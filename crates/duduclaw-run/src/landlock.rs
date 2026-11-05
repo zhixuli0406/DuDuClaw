@@ -19,6 +19,8 @@ pub const MAKE_SYM: u64 = 1 << 12;
 pub const REFER: u64 = 1 << 13;
 pub const TRUNCATE: u64 = 1 << 14;
 pub const IOCTL_DEV: u64 = 1 << 15;
+pub const MIN_ABI: u32 = 1;
+pub const MAX_KNOWN_ABI: u32 = 7;
 const READ: u64 = READ_FILE | READ_DIR;
 const CREATE_ORDINARY: u64 = MAKE_DIR | MAKE_REG | MAKE_SYM;
 const WRITE_ORDINARY: u64 = WRITE_FILE | REMOVE_DIR | REMOVE_FILE | CREATE_ORDINARY | REFER | TRUNCATE;
@@ -48,8 +50,11 @@ pub enum PolicyError {
 pub struct Policy { abi: u32, pub handled: u64 }
 impl Policy {
     /// All filesystem rights understood by the pinned landlock 0.4.5 dependency.
-    /// Unknown future ABIs are refused until reviewed; never silently omit rights.
-    pub fn for_abi(abi: u32) -> Result<Self, PolicyError> {
+    /// Newer kernels enforce the same known ruleset. Unknown additional rights
+    /// are not claimed as enforced; the minimum required ABI remains mandatory.
+    pub fn for_abi(detected_abi: u32) -> Result<Self, PolicyError> {
+        if detected_abi < MIN_ABI { return Err(PolicyError::UnsupportedAbi); }
+        let abi = detected_abi.min(MAX_KNOWN_ABI);
         let handled = match abi {
             1 => (1 << 13) - 1,
             2 => (1 << 14) - 1,
@@ -59,6 +64,7 @@ impl Policy {
         };
         Ok(Self { abi, handled })
     }
+    /// ABI of the selected policy, not necessarily the kernel's detected ABI.
     pub fn abi(&self) -> u32 { self.abi }
     pub fn rights(&self, class: PathClass) -> u64 {
         let rights = match class {
@@ -93,7 +99,7 @@ pub fn restrict(policy: &Policy,
     use ::landlock::{AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath,
         Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus};
     if roots.is_empty() || roots.len() > 32 || *policy != Policy::for_abi(policy.abi)?
-        || probe_abi()? != policy.abi {
+        || *policy != Policy::for_abi(probe_abi()?)? {
         return Err(PolicyError::InvalidPolicy);
     }
     let handled = BitFlags::<AccessFs>::from_bits(policy.handled)
@@ -124,11 +130,24 @@ mod tests {
         for (abi,handled) in expected {
             assert_eq!(Policy::for_abi(abi).unwrap().handled,handled);
         }
-        for abi in [0,8,u32::MAX] { assert!(Policy::for_abi(abi).is_err()); }
+        assert!(Policy::for_abi(0).is_err());
+    }
+    #[test]
+    fn landlock_newer_kernel_uses_exact_abi_seven_policy() {
+        let known = Policy::for_abi(MAX_KNOWN_ABI).unwrap();
+        for abi in [8, 9, 12, u32::MAX] {
+            let policy = Policy::for_abi(abi).unwrap();
+            assert_eq!(policy, known);
+            assert_eq!(policy.abi(), MAX_KNOWN_ABI);
+            for class in [PathClass::ReadOnly, PathClass::ReadExecute, PathClass::Persistent,
+                PathClass::Ephemeral, PathClass::Devices] {
+                assert_eq!(policy.rights(class), known.rights(class));
+            }
+        }
     }
     #[test]
     fn landlock_d8_persistent_socket_fifo_and_device_creation_are_denied() {
-        for abi in 1..=7 {
+        for abi in 1..=12 {
             let policy=Policy::for_abi(abi).unwrap();
             let persistent=policy.rights(PathClass::Persistent);
             assert_eq!(persistent & (MAKE_SOCK|MAKE_FIFO|MAKE_CHAR|MAKE_BLOCK|IOCTL_DEV),0);
@@ -140,7 +159,7 @@ mod tests {
     }
     #[test]
     fn landlock_ephemeral_and_readonly_rules_are_separate() {
-        for abi in 1..=7 {
+        for abi in 1..=12 {
             let policy=Policy::for_abi(abi).unwrap();
             assert_eq!(policy.rights(PathClass::ReadOnly),READ);
             assert_eq!(policy.rights(PathClass::ReadExecute),READ|EXECUTE);

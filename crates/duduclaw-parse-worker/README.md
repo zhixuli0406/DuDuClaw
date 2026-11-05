@@ -82,9 +82,46 @@ cannot be reset. This is not a protected-readiness check or a migration switch.
 Unsupported operations fail closed; legacy installations retain their old path.
 
 The named A/B lifecycle seam is `WorkerLauncher` / `WorkerSession`, installed once
-through `install_launcher`. The default fixed socket launcher has process-local
-admission and failure quarantine, but does not provide host-wide cancellation
-receipts. Output memfds are sealed before size and SHA-256 verification.
+through `install_launcher`. Protected callers use `retirement::RetiringLauncher`
+when no launcher was explicitly installed. Boot may also install it explicitly.
+It reserves one host-wide slot before snapshotting, using a fixed root-owned
+`/run/duduclaw-parse/retirement.lease` file (regular, one link, mode 0660,
+root:duduclaw). The installer must create it with exactly `clean\n` only after
+proving that no previous parse worker or socket activation remains. The launcher
+never creates or resets it. `systemd/duduclaw-parse-tmpfiles.conf` supplies the
+create-only boot rule; install it as `/usr/lib/tmpfiles.d/duduclaw-parse.conf`.
+It must not be used to repair a live dirty lease, and the installer still owns
+the clean-install/no-existing-worker prerequisite. Its conservative slot covers the full input ceiling
+and the fixed worker memory ceiling; a second process cannot acquire the flock.
+
+Before receiving content, the worker answers a private nonce handshake with its
+own pidfd. The gateway receives kernel SCM_CREDENTIALS, verifies the pidfd's PID
+and liveness, and resolves the exact systemd instance, InvocationID, MainPID,
+DynamicUser, PrivateNetwork, NoNewPrivileges, TasksMax and MemoryMax. The worker
+closes that pidfd before parsing. Ordinary parse request/response schemas are
+unchanged; the legacy non-protected socket launcher does not send the handshake.
+
+The lease is fsynced dirty before connecting. A response does not retire it:
+a separate bounded cleanup thread waits for the recorded unit to be inactive or
+failed with its original InvocationID, its cgroup to be empty/removed, and its
+pidfd to be exited. If PID 1 has already garbage-collected the instance, only an
+explicit `GetUnit(exact_name)` `NoSuchUnit` reply together with an exited pidfd
+and removal of the exact recorded cgroup directory can substitute for inactive.
+The cgroup-v2 mount is verified before interpreting a missing directory; bus
+errors or an unreadable/missing events file alone do not count. No `RefUnit` or
+`UnrefUnit` is issued (systemd 249 duplicate-reference acceptance regression).
+Only these full readbacks permit writing clean and releasing the slot. Unknown launch ownership, failed
+readback, cleanup timeout or gateway crash leave dirty durably and refuse later
+work. Root must reconcile the socket queue and all parse units/cgroups before
+resetting it; automatic crash recovery is not implemented. This sacrifices
+availability after uncertain failure instead of releasing an unproven budget.
+The legacy socket launcher retains process-local quarantine only. Output memfds
+are sealed before size and SHA-256 verification.
+
+Round 3 adds `iso_root_e2e_worker_retirement_holds_host_slot_through_response_and_drop`
+for the successful-response and pre-snapshot-drop paths. This test needs the
+updated worker binary, template, system bus and initialized lease on a disposable
+Linux VM; it has not been run on macOS.
 
 ## Development
 

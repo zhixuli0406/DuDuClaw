@@ -7,8 +7,11 @@ use crate::{Error, Result, fd_plan::{Destination, FdPlan, Source}, landlock::{Pa
     seccomp::{self, Architecture, Filter, RuntimeProfile}, state::{Machine, Stage}, validation::{self, Expected, Identity}};
 use super::{bootstrap, fd, mounts, privileges, probe};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MountIdentity { pub mount: u64, pub fs_type: i64 }
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Program {
     pub identity: Identity,
     pub script: Option<(Identity, CString)>,
@@ -22,6 +25,8 @@ pub struct Program {
 /// derive this object by deserializing a gateway SpawnPolicy or bootstrap offer.
 /// fd order: five mounts, executable, optional script, prompt, attachments,
 /// optional MCP, optional egress + forwarder ELF. stdout/stderr are fd 1/2.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustedRun {
     pub root: mounts::RootConfig,
     pub mounts: [MountIdentity; 5],
@@ -35,14 +40,17 @@ pub struct TrustedRun {
     pub attachments: Vec<InputFd>,
     pub mcp: bool,
     pub proc_subset_pid: bool,
+    #[serde(default)]
+    pub stdin: bool,
 }
 impl TrustedRun {
     pub fn expected_fd_count(&self) -> usize {
         5 + 1 + usize::from(self.program.script.is_some()) + 1 + self.attachments.len()
-            + usize::from(self.mcp) + if self.forwarder.is_some() { 2 } else { 0 }
+            + usize::from(self.stdin) + usize::from(self.mcp) + if self.forwarder.is_some() { 2 } else { 0 }
     }
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         self.root.validate().map_err(|_| Error::Mount)?;
+        if self.stdin && self.root.pty { return Err(Error::Descriptors); }
         let uid = self.root.employee_uid;
         let gid = self.root.employee_gid;
         if self.supervisor_uid == 0 || self.supervisor_uid >= 1000 || self.supervisor_gid == 0
@@ -88,7 +96,7 @@ fn validate_program(program: &Program) -> Result<()> {
 struct Inputs {
     mounts: mounts::MountInputs,
     exec: OwnedFd, script: Option<OwnedFd>, prompt: OwnedFd,
-    attachments: Vec<OwnedFd>, mcp: Option<OwnedFd>, forwarder: Option<(OwnedFd, OwnedFd)>,
+    attachments: Vec<OwnedFd>, stdin: Option<OwnedFd>, mcp: Option<OwnedFd>, forwarder: Option<(OwnedFd, OwnedFd)>,
 }
 
 fn take_inputs(plan: &TrustedRun, descriptors: Vec<OwnedFd>) -> Result<Inputs> {
@@ -129,6 +137,13 @@ fn take_inputs(plan: &TrustedRun, descriptors: Vec<OwnedFd>) -> Result<Inputs> {
         attachments.push(fd);
     }
     validation::validate_input_budget(fd::observe(prompt.as_raw_fd())?.size, &actual_sizes)?;
+    let stdin = if plan.stdin {
+        let stdin = fds.next().ok_or(Error::Descriptors)?;
+        let observed = fd::observe(stdin.as_raw_fd())?;
+        if observed.kind != validation::FileKind::Fifo || observed.access != validation::Access::Read
+            || !observed.cloexec { return Err(Error::Descriptors); }
+        Some(stdin)
+    } else { None };
     let mcp = if plan.mcp {
         let mcp = fds.next().ok_or(Error::Descriptors)?; fd::socketpair_endpoint(mcp.as_raw_fd())?; Some(mcp)
     } else { None };
@@ -141,7 +156,7 @@ fn take_inputs(plan: &TrustedRun, descriptors: Vec<OwnedFd>) -> Result<Inputs> {
         verify_executable(exec.as_raw_fd(), program.identity, plan.mounts[3].mount)?;
         Some((socket, exec))
     } else { None };
-    Ok(Inputs { mounts, exec, script, prompt, attachments, mcp, forwarder })
+    Ok(Inputs { mounts, exec, script, prompt, attachments, stdin, mcp, forwarder })
 }
 
 fn verify_executable(fd: RawFd, identity: Identity, registry_mount: u64) -> Result<()> {
@@ -182,13 +197,13 @@ pub unsafe fn serve(registry: &mut dyn bootstrap::RootRegistry) -> ! {
 
 fn launch(plan: TrustedRun, fds: Vec<OwnedFd>, ready: probe::Readiness, mut machine: Machine) -> Result<()> {
     plan.validate()?;
-    let n = 3 + 1 + 1 + plan.attachments.len() + 1 + usize::from(plan.program.script.is_some());
+    let n = 3 + 1 + 1 + 1 + plan.attachments.len() + 1 + usize::from(plan.program.script.is_some());
     if fd::soft_limit()? < FdPlan::required_limit(n)? { return Err(Error::DescriptorLimit); }
     let input = take_inputs(&plan, fds)?;
     machine.advance(Stage::DescriptorsVerified)?;
     mounts::enter_namespaces().map_err(|_| Error::Namespace)?;
     machine.advance(Stage::Namespaces)?; machine.advance(Stage::PrivatePropagation)?;
-    let Inputs { mounts: mount_inputs, exec, script, prompt, attachments, mcp, forwarder } = input;
+    let Inputs { mounts: mount_inputs, exec, script, prompt, attachments, stdin, mcp, forwarder } = input;
     let mut root = mounts::build_root(mount_inputs, &plan.root).map_err(|_| Error::Mount)?;
     let pty = root.take_pty();
     let slave = if let Some(pty) = pty {
@@ -218,7 +233,7 @@ fn launch(plan: TrustedRun, fds: Vec<OwnedFd>, ready: probe::Readiness, mut mach
         let supervisor_identity = (plan.supervisor_uid, plan.supervisor_gid);
         // The parent never needs heap state again. Do not drop fd owners after
         // sweeping descriptors: a reused descriptor must never be closed twice.
-        std::mem::forget((plan, exec, script, prompt, attachments, mcp, forwarder, slave, write));
+        std::mem::forget((plan, exec, script, prompt, attachments, stdin, mcp, forwarder, slave, write));
         supervisor(status, pidfd, machine, supervisor_identity, failure)
     } else {
         drop(read);
@@ -227,8 +242,8 @@ fn launch(plan: TrustedRun, fds: Vec<OwnedFd>, ready: probe::Readiness, mut mach
         if let Err(error) = failure.await_supervisor() {
             failure.record(error); write_status(status, bootstrap::error_status(error)); exit_now(125);
         }
-        let result = child_init(plan, exec, script, prompt, attachments, mcp, forwarder,
-            slave, ready.landlock_abi, status, machine, failure);
+        let result = child_init(plan, exec, script, prompt, attachments, stdin, mcp, forwarder,
+            slave, ready.landlock_ruleset_abi, status, machine, failure);
         if let Err(error) = result { failure.record(error); write_status(status, bootstrap::error_status(error)); }
         exit_now(125)
     }
@@ -248,14 +263,14 @@ struct CloneArgs {
 #[derive(Clone, Copy)]
 struct FailurePage(*const SharedStatus);
 #[repr(C)]
-struct SharedStatus { error: AtomicU32, supervisor_ready: AtomicU32 }
+struct SharedStatus { error: AtomicU32, supervisor_ready: AtomicU32, isolated: AtomicU32 }
 impl FailurePage {
     fn new() -> Result<Self> {
         let page = unsafe { libc::mmap(std::ptr::null_mut(), 4096, libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED | libc::MAP_ANONYMOUS, -1, 0) };
         if page == libc::MAP_FAILED { return Err(Error::Process); }
         let word = page.cast::<SharedStatus>();
-        unsafe { word.write(SharedStatus { error: AtomicU32::new(0), supervisor_ready: AtomicU32::new(0) }); }
+        unsafe { word.write(SharedStatus { error: AtomicU32::new(0), supervisor_ready: AtomicU32::new(0), isolated: AtomicU32::new(0) }); }
         Ok(Self(word))
     }
     fn record(self, error: Error) {
@@ -264,6 +279,10 @@ impl FailurePage {
     fn read(self) -> u8 {
         let code = unsafe { &*self.0 }.error.load(Ordering::Acquire);
         if code <= 16 { code as u8 } else { bootstrap::error_code(Error::Status) }
+    }
+    fn mark_isolated(self, bit: u32) { unsafe { &*self.0 }.isolated.fetch_or(bit, Ordering::Release); }
+    fn all_isolated(self, forwarder: bool) -> bool {
+        self.read() == 0 && unsafe { &*self.0 }.isolated.load(Ordering::Acquire) == if forwarder { 3 } else { 1 }
     }
     fn allow_child(self) { unsafe { &*self.0 }.supervisor_ready.store(1, Ordering::Release); }
     fn await_supervisor(self) -> Result<()> {
@@ -333,7 +352,7 @@ fn supervisor(status: RawFd, pidfd: RawFd, mut machine: Machine, identity: (u32,
 
 #[allow(clippy::too_many_arguments)]
 fn child_init(plan: TrustedRun, exec: OwnedFd, script: Option<OwnedFd>, prompt: OwnedFd,
-    attachments: Vec<OwnedFd>, mcp: Option<OwnedFd>, forwarder: Option<(OwnedFd,OwnedFd)>,
+    attachments: Vec<OwnedFd>, stdin: Option<OwnedFd>, mcp: Option<OwnedFd>, forwarder: Option<(OwnedFd,OwnedFd)>,
     slave: Option<OwnedFd>, abi: u32, status: RawFd, mut machine: Machine, failure: FailurePage) -> Result<()> {
     mounts::mount_proc(plan.proc_subset_pid).map_err(|_| Error::Mount)?; machine.advance(Stage::ProcMounted)?;
     privileges::set_securebits()?; machine.advance(Stage::Securebits)?;
@@ -351,6 +370,10 @@ fn child_init(plan: TrustedRun, exec: OwnedFd, script: Option<OwnedFd>, prompt: 
     let runtime_filter = seccomp::runtime(arch, &plan.program.seccomp, plan.program.seccomp_digest).map_err(|_| Error::Seccomp)?;
     let init_filter = seccomp::init(arch, status).map_err(|_| Error::Seccomp)?;
     install_signal_handlers()?;
+    let mut exec_pipe = [-1; 2];
+    super::checked(unsafe { libc::pipe2(exec_pipe.as_mut_ptr(), libc::O_CLOEXEC) }, Error::Process)?;
+    let exec_check = unsafe { OwnedFd::from_raw_fd(exec_pipe[0]) };
+    let exec_done = unsafe { OwnedFd::from_raw_fd(exec_pipe[1]) };
     let mut forwarder_pid = None;
     if let Some((socket, forward_exec)) = forwarder {
         let program = plan.forwarder.as_ref().ok_or(Error::Executable)?;
@@ -358,8 +381,9 @@ fn child_init(plan: TrustedRun, exec: OwnedFd, script: Option<OwnedFd>, prompt: 
         let child = fork()?;
         if child == 0 {
             // Drop all runtime capability objects before entering the forwarder.
-            drop((exec, script, prompt, attachments, mcp, slave));
-            let result = execute_forwarder(program, forward_exec, socket, &filter, failure);
+            drop((exec, script, prompt, attachments, stdin, mcp, slave));
+            drop(exec_check);
+            let result = execute_forwarder(program, forward_exec, socket, exec_done, &filter, failure);
             if let Err(error) = result { failure.record(error); write_status(status, bootstrap::error_status(error)); }
             exit_now(126);
         }
@@ -369,12 +393,40 @@ fn child_init(plan: TrustedRun, exec: OwnedFd, script: Option<OwnedFd>, prompt: 
     let runtime = fork()?;
     machine.advance(Stage::Forked)?;
     if runtime == 0 {
-        let result = execute_runtime(&plan.program, exec, script, prompt, attachments, mcp, slave, &runtime_filter, machine, failure);
+        drop(exec_check);
+        let result = execute_runtime(&plan.program, exec, script, prompt, attachments, stdin, mcp, slave, exec_done, &runtime_filter, machine, failure);
         if let Err(error) = result { failure.record(error); write_status(status, bootstrap::error_status(error)); }
         exit_now(126);
     }
     RUNTIME_PID.store(runtime, Ordering::Relaxed);
-    drop((exec, script, prompt, attachments, mcp, slave));
+    drop(exec_done);
+    // EOF alone is not evidence: a child can die before exec. Shared flags are
+    // written only after final fd readback, Landlock and seccomp installation.
+    let mut byte = 0u8;
+    loop {
+        let count = unsafe { libc::read(exec_check.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+        if count == 0 { break; }
+        if count < 0 && super::errno() == libc::EINTR { continue; }
+        return Err(Error::Exec);
+    }
+    drop(exec_check);
+    if !failure.all_isolated(forwarder_pid.is_some()) { return Err(Error::Exec); }
+    // A dead forwarder is a broken network boundary. A short successful runtime,
+    // however, must preserve its actual outcome without issuing a ready receipt.
+    for (pid, is_runtime) in forwarder_pid.into_iter().map(|pid| (pid, false)).chain([(runtime, true)]) {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if unsafe { libc::waitid(libc::P_PID, pid as u32, &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) } != 0 { return Err(Error::Process); }
+        if unsafe { info.si_pid() } != 0 {
+            if !is_runtime { return Err(Error::Process); }
+            let code = unsafe { info.si_status() };
+            exit_now(if info.si_code == libc::CLD_EXITED { code } else { 128 + code });
+        }
+    }
+    // Isolation completion is not an exec-success receipt. Terminal status
+    // still revokes the capability if exec fails or the process exits later.
+    write_status(status, bootstrap::status(7, 0, 0));
+    drop((exec, script, prompt, attachments, stdin, mcp, slave));
     fd::close_except(&[status])?; machine.advance(Stage::InitClosed)?;
     machine.advance(Stage::InitFiltered)?;
     init_filter.install().map_err(|_| Error::Seccomp)?;
@@ -418,7 +470,7 @@ fn restrict_filesystem(abi: u32) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn execute_runtime(program: &Program, exec: OwnedFd, script: Option<OwnedFd>, prompt: OwnedFd,
-    attachments: Vec<OwnedFd>, mcp: Option<OwnedFd>, slave: Option<OwnedFd>, filter: &Filter,
+    attachments: Vec<OwnedFd>, stdin: Option<OwnedFd>, mcp: Option<OwnedFd>, slave: Option<OwnedFd>, exec_done: OwnedFd, filter: &Filter,
     mut machine: Machine, failure: FailurePage) -> Result<()> {
     super::checked(unsafe { libc::setsid() }, Error::Process)?;
     super::checked(unsafe { libc::chdir(c"/work".as_ptr()) }, Error::Process)?;
@@ -431,7 +483,7 @@ fn execute_runtime(program: &Program, exec: OwnedFd, script: Option<OwnedFd>, pr
         super::checked(unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0) }, Error::Process)?;
         add(slave, Destination::Runtime(vec![0,1,2]));
     } else {
-        add(dev_null(libc::O_RDONLY)?, Destination::Runtime(vec![0]));
+        add(match stdin { Some(fd) => fd, None => dev_null(libc::O_RDONLY)? }, Destination::Runtime(vec![0]));
         add(unsafe { OwnedFd::from_raw_fd(1) }, Destination::Runtime(vec![1]));
         add(unsafe { OwnedFd::from_raw_fd(2) }, Destination::Runtime(vec![2]));
     }
@@ -439,39 +491,43 @@ fn execute_runtime(program: &Program, exec: OwnedFd, script: Option<OwnedFd>, pr
     add(prompt, Destination::Runtime(vec![4]));
     for (index, fd) in attachments.into_iter().enumerate() { add(fd, Destination::Runtime(vec![5 + index as i32])); }
     add(exec, Destination::Executable);
+    add(exec_done, Destination::ExecStatus);
     if let Some(script) = script { add(script, Destination::Script); }
     let plan = FdPlan::new(sources, fd::soft_limit()?)?;
     let script = program.script.as_ref().map(|(identity,path)| (path.as_c_str(),identity.mount));
-    let exec = fd::reorder(plan, owned, script)?; machine.advance(Stage::RuntimeFds)?;
-    execute(program, exec, filter, &mut machine, failure)
+    let (exec, exec_done) = fd::reorder_for_exec(plan, owned, script)?; machine.advance(Stage::RuntimeFds)?;
+    execute(program, exec, exec_done.ok_or(Error::Descriptors)?, filter, &mut machine, failure)
 }
 
-fn execute_forwarder(program: &Program, exec: OwnedFd, socket: OwnedFd, filter: &Filter, failure: FailurePage) -> Result<()> {
+fn execute_forwarder(program: &Program, exec: OwnedFd, socket: OwnedFd, exec_done: OwnedFd, filter: &Filter, failure: FailurePage) -> Result<()> {
     super::checked(unsafe { libc::setsid() }, Error::Process)?;
     // Fixed 0..4 preserve the same audited shuffle; only fd 3 is authority-bearing.
     // Forwarder stdout/stderr are discarded, never inherited runtime output pipes.
     let null = dev_null(libc::O_RDWR)?;
     let sources = vec![Source { fd: null.as_raw_fd(), destination: Destination::Runtime(vec![0,1,2,4]) },
         Source { fd: socket.as_raw_fd(), destination: Destination::Runtime(vec![3]) },
-        Source { fd: exec.as_raw_fd(), destination: Destination::Executable }];
+        Source { fd: exec.as_raw_fd(), destination: Destination::Executable },
+        Source { fd: exec_done.as_raw_fd(), destination: Destination::ExecStatus }];
     let plan = FdPlan::new(sources, fd::soft_limit()?)?;
-    let exec = fd::reorder(plan, vec![null,socket,exec], None)?;
+    let (exec, exec_done) = fd::reorder_for_exec(plan, vec![null,socket,exec,exec_done], None)?;
     // Forwarder shares the runtime post-fork close/exec implementation; lifecycle
     // checks for the main runtime remain separate from this auxiliary process.
-    execute_raw(program, exec, filter, failure)
+    execute_raw(program, exec, exec_done.ok_or(Error::Descriptors)?, filter, failure, 2)
 }
 
-fn execute(program: &Program, exec: OwnedFd, filter: &Filter, machine: &mut Machine, failure: FailurePage) -> Result<()> {
+fn execute(program: &Program, exec: OwnedFd, exec_done: OwnedFd, filter: &Filter, machine: &mut Machine, failure: FailurePage) -> Result<()> {
     machine.advance(Stage::RuntimeFiltered)?;
-    execute_raw(program, exec, filter, failure)
+    execute_raw(program, exec, exec_done, filter, failure, 1)
 }
-fn execute_raw(program: &Program, exec: OwnedFd, filter: &Filter, failure: FailurePage) -> Result<()> {
+fn execute_raw(program: &Program, exec: OwnedFd, exec_done: OwnedFd, filter: &Filter, failure: FailurePage, isolated_bit: u32) -> Result<()> {
     let mut argv: Vec<_> = program.argv.iter().map(|s| s.as_ptr()).collect(); argv.push(std::ptr::null());
     let mut env: Vec<_> = program.environment.iter().map(|s| s.as_ptr()).collect(); env.push(std::ptr::null());
     let exec = exec.into_raw_fd();
+    let _exec_done = exec_done.into_raw_fd();
     reset_signal_handlers()?;
     // Avoid cleanup/error formatting after this point: only execveat/exit_group.
     if filter.install().is_err() { failure.record(Error::Seccomp); exit_now(126); }
+    failure.mark_isolated(isolated_bit);
     unsafe { libc::syscall(libc::SYS_execveat, exec, c"".as_ptr(), argv.as_ptr(), env.as_ptr(), libc::AT_EMPTY_PATH); }
     failure.record(Error::Exec);
     exit_now(126)
@@ -538,6 +594,19 @@ fn exit_now(code: i32) -> ! { unsafe { libc::_exit(code) } }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn eof_without_both_final_isolation_receipts_never_admits() {
+        let page = FailurePage::new().unwrap();
+        assert!(!page.all_isolated(false));
+        page.mark_isolated(1);
+        assert!(page.all_isolated(false));
+        assert!(!page.all_isolated(true));
+        page.mark_isolated(2);
+        assert!(page.all_isolated(true));
+        page.record(Error::Exec);
+        assert!(!page.all_isolated(true));
+        unsafe { libc::munmap(page.0.cast_mut().cast(), 4096); }
+    }
     #[test]
     fn supervisor_barrier_never_releases_after_preparation_failure() {
         let page = FailurePage::new().unwrap();

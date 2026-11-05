@@ -278,6 +278,7 @@ fn transport_admission(snapshot: Snapshot) -> duduclaw_core::autonomy_handoff::A
 /// Early callback check only. Final transport admission rechecks under the lease.
 /// Do not mark a durable round started until a transport is about to hand off.
 pub(crate) async fn check_current() -> Result<(), String> {
+    crate::isolation_readiness::check_execution()?;
     let Ok(context) = CONTEXT.try_with(Clone::clone) else {
         return Ok(());
     };
@@ -299,6 +300,7 @@ fn check_context(context: &AdmissionContext) -> Result<(), String> {
 /// The fd lives through spawn/send. All identities are rechecked under one
 /// shared lease, so neither a target pause nor a caller pause races handoff.
 pub(crate) async fn admit_current() -> Result<Option<AdmissionGuard>, String> {
+    crate::isolation_readiness::check_execution()?;
     let Ok(context) = CONTEXT.try_with(Clone::clone) else {
         return Ok(None);
     };

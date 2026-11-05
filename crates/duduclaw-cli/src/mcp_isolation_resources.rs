@@ -2,11 +2,12 @@
 //! selection, or a file to a handler that reopens an employee pathname.
 use std::{future::Future, io::Read, path::PathBuf, pin::Pin, sync::Arc};
 use duduclaw_gateway::{isolation_resources::GatewayResourceResolver,
-    isolation_connectors::BoundConnectorExecutor};
+    isolation_connectors::{BoundConnectorExecutor, SelectedConnector}};
 use duduclaw_mcp_boundary::{resources::ResourceRoots, tool_policy::{AuthorizedToolCall, ResourceResolver},
     VerificationError};
 use serde_json::Value;
 
+#[derive(Clone)]
 pub struct GatewayResourceToolService {
     home: PathBuf,
     agent: String,
@@ -18,6 +19,18 @@ impl GatewayResourceToolService {
     pub fn new(home: PathBuf, agent: String, roots: Arc<ResourceRoots>,
         resolver: Arc<GatewayResourceResolver>, connectors: Option<Arc<dyn BoundConnectorExecutor>>) -> Self {
         Self { home, agent, roots, resolver, connectors }
+    }
+
+    async fn select_connector(&self, call: &AuthorizedToolCall) -> Result<SelectedConnector, VerificationError> {
+        let resolver = self.resolver.clone();
+        let context = call.context().clone();
+        let name = call.name().to_owned();
+        let arguments = call.arguments().clone();
+        duduclaw_mcp_boundary::authority::verify_blocking(move || {
+            let selected = resolver.connector(&context, &name, &arguments)?;
+            selected.recheck()?;
+            Ok(selected)
+        }).await
     }
 
     fn read_wiki(&self, call: &AuthorizedToolCall) -> Result<Value, VerificationError> {
@@ -93,7 +106,7 @@ impl crate::mcp_isolation::ResourceToolService for GatewayResourceToolService {
         Box::pin(async move {
             if !self.supports(call.name()) { return Err(VerificationError::Unavailable); }
             if call.name() != "wiki_read" {
-                self.resolver.connector(call.context(), call.name(), call.arguments())?.recheck()?;
+                self.select_connector(call).await?;
             }
             Ok(())
         })
@@ -101,11 +114,13 @@ impl crate::mcp_isolation::ResourceToolService for GatewayResourceToolService {
     fn execute<'a>(&'a self, call: AuthorizedToolCall)
         -> Pin<Box<dyn Future<Output = Result<Value, VerificationError>> + Send + 'a>> {
         Box::pin(async move {
-            if call.name() == "wiki_read" { return self.read_wiki(&call); }
+            if call.name() == "wiki_read" {
+                let service = self.clone();
+                return duduclaw_mcp_boundary::authority::verify_blocking(move || service.read_wiki(&call)).await;
+            }
             let executor = self.connectors.as_ref().filter(|e| e.supports(call.name()))
                 .ok_or(VerificationError::Unavailable)?;
-            let selected = self.resolver.connector(call.context(), call.name(), call.arguments())?;
-            selected.recheck()?;
+            let selected = self.select_connector(&call).await?;
             executor.execute(selected, call).await
         })
     }

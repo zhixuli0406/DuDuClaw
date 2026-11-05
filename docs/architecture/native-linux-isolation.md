@@ -676,10 +676,11 @@ capability contracts. Common restrictions cannot be overridden by a runtime list
 The common filter additionally refuses ptrace/process_vm operations and limits
 socketpair to AF_UNIX. These are deliberate narrowing defenses.
 
-Kernel readiness checks require Linux 5.15+, actual Landlock ABI 1–7, seccomp
+Kernel readiness checks require Linux 5.15+, actual Landlock ABI >=1, seccomp
 KILL_PROCESS, clone3, openat2, statx mount IDs, close_range and detached fs-context
-mount APIs including recursive mount_setattr/NOSYMFOLLOW. Unknown Landlock ABIs
-fail closed pending review. Launch still verifies every actual namespace, mount
+mount APIs including recursive mount_setattr/NOSYMFOLLOW. I1 selects the exact
+ABI-7 filesystem policy on kernels reporting newer ABIs; missing ABI 1 or any
+enforcement failure still refuses execution. Launch still verifies every actual namespace, mount
 and privilege syscall. Kernel capability probing does not prove B1/systemd/egress
 readiness or replace the three-distribution acceptance run.
 
@@ -962,8 +963,8 @@ fd. These resolve the design's ordering conflicts and are explicit review items.
 
 The shared contract mandates sealed prompts, so the optional pipe prompt variant
 in the design is not accepted. Common seccomp additionally denies ptrace and
-process_vm calls and narrows socketpair to AF_UNIX. Unknown Landlock ABI >7 is
-refused pending review. The launcher uses fixed cwd `/work`; B1's environment is
+process_vm calls and narrows socketpair to AF_UNIX. The earlier refusal of Landlock ABI >7 is superseded by the I1 compatibility
+policy below. The launcher uses fixed cwd `/work`; B1's environment is
 passed from scratch through execveat, never inherited from this process.
 
 Dependencies are existing-lockfile `libc`, `landlock 0.4.5`, `sha2 0.10`, serde,
@@ -2368,10 +2369,10 @@ Defects found by the root runs and fixed in this round:
   needed `recursion_limit = "512"`. Gateway and CLI with tests then type-check on
   Linux.
 
-Design limitation confirmed, not changed: B2 refuses Landlock ABIs above 7
-(`UnsupportedKernel` from the readiness probe). The current GCP Ubuntu 24.04
-image boots kernel 7.0 with ABI 8, so every B2 launch test fails there with that
-readiness error. Accepting newer ABIs needs an owner decision.
+Historical limitation at the time of this root acceptance: B2 refused Landlock
+ABIs above 7 (`UnsupportedKernel`). I1 changes that policy to use the ABI-7
+ruleset on newer kernels. The ABI-8 row above remains the observed historical
+result; the changed code still needs a new native acceptance run.
 
 Daybreak security review of these fixes: three rounds; the reported MEDIUM and
 LOW findings in the userdb client were fixed and the final pass reported no
@@ -3673,3 +3674,1498 @@ npx vitest run src/pages/MigrationConfirmationsPage.test.tsx src/components/layo
 - `web/src/pages/MigrationConfirmationsPage.test.tsx`：高風險／未就緒／遮罩／讀回失敗測試。
 - `web/src/pages/MigrationConfirmationsPage.tsx`：純文字檢視／秘密遮罩／唯讀拒絕 UI。
 - `wiki/reports/native-linux-isolation-package-g-2026-11-05.md`：交付證據、完整剩餘工作與遠端驗證指令。
+
+## Package I1 — runtime integration (2026-11-05)
+
+**Current handoff: see "Round 2" below. The following round-1 record is historical
+and is superseded where round 2 describes changed behavior.**
+
+### Round 1 — historical integration subset
+
+Status: **PARTIAL — development wiring, not a runnable protected TEAM install.**
+This worktree remains uncommitted. No gateway/CLI/workspace build, installation,
+account mutation, migration or native-root test was performed in this session.
+The existing subprocess fence remains fail-closed. There is no new local-backend
+fallback. The remaining integration must not treat this diagnostic report or
+small-crate tests as full-product acceptance.
+
+### Composite diagnosis and operator access
+
+`isolation_readiness::initialize` runs after boot edition resolution and on live
+edition resolution, so Personal-to-TEAM activation also latches requirements.
+It applies only to Linux `native-systemd` TEAM and enables both the existing
+execution requirement and E's isolated-parser requirement. A later downgrade
+cannot clear a latch. Other installations receive no new latch from this module;
+the older core native-systemd fence is not weakened.
+
+`system.status.isolation_readiness` reports eight fixed component names. B1's
+root-owned, bounded, boot-bound and expiring `EvidenceReport` is read afresh.
+All B1 primary checks must pass before launch-service, sandbox, egress and storage
+are shown ready. Missing, malformed, stale or unreadable evidence yields
+unavailable. D, E, F and runtime adapters remain `pending_integration`: neither
+service liveness nor the presence of key files can substitute for their missing
+trusted factories/readbacks. The composite therefore stays unready in this
+subset. A once-only operator error and a non-dismissible dashboard banner explain
+that protected employee processes cannot start. Admins can inspect fixed status
+labels and refresh; no host paths, PIDs, secret bytes or raw errors are exposed.
+
+This is **diagnosis, not a complete TEAM admission gate**. Missing
+`ProtectedLaunch` still blocks protected subprocess launches; API/in-process work
+needs the remaining explicit TEAM admission wiring. The dashboard stays running.
+G's existing `/app/system/migration` route, Admin navigation with `newIn: 1.80.0`,
+and FirstRunGate exception were verified by source inspection and retained;
+this does not establish migration apply/readback acceptance.
+
+### B1 to H storage adapter
+
+`storage::LoopStorage::open(storage_directory, journal_directory)` now implements
+B1's storage trait using H's `EmployeeStorage`. It is ready for trusted root
+composition; `Components::default()` deliberately still refuses storage because
+F/G have not supplied installed anchors and the other production adapters.
+The root-local journal binds each approved operation ID to its full proposal
+digest, employee, immutable UID and quota. It preserves employee/UID tombstones,
+and fsyncs a fresh run/generation attachment intent before H attachment. Only
+private, noexec detached home/work mounts leave this adapter. H's new read-only
+`images()` inventory compares actual mounts against image/device identity.
+Unknown images, missing Ready images, unleased mounts, incomplete maintenance
+and invalid/lost journals cannot become readiness success.
+
+A stale receipt cannot detach a newer run. An attach intent that never mounted
+has no observed device (0:0); it is accepted only by cleanup identity checks,
+never by launch/device checks. B1 still proves unit inactivity, empty cgroup and
+absence of employee-UID processes before calling detach. No account allocation
+or proposal approval is implemented by this adapter.
+
+H usage requires an attached image. Idle preflight usage therefore uses a
+journaled maintenance attach/statvfs/detach cycle, not cached usage or `du`.
+Interrupted temporary mounts of completed images can be recovered with the same
+approved operation. H Creating/Quarantined images do **not** automatically resume
+formatting; they require explicitly authorized destruction or operator recovery.
+Readiness stays false until resolved. The production factory and G's approved
+employee allocation RPC still need to call this adapter.
+
+### Landlock policy and design §15 compatibility note
+
+The requested I1 policy selects `min(detected ABI, 7)`. ABI 0, an unavailable
+Landlock API and any failed enforcement still refuse execution. ABI >7 produces
+exactly the known ABI-7 filesystem rights; no new rights are invented or claimed
+as handled. Persistent socket/FIFO/device creation stays denied. `restrict`
+re-probes the kernel and compares the resulting policy before applying the
+hard-required ruleset. This follows the kernel's explicit handled-rights
+[forward/backward compatibility model](https://docs.kernel.org/userspace-api/landlock.html).
+
+The probe exposes both `landlock_abi` (actual kernel evidence) and
+`landlock_ruleset_abi` (selected policy), logging both once per process to stderr.
+During a launch this is the bounded employee stderr pipe, not a B1 boot journal;
+B1 still needs to publish/log the probe evidence through its readiness adapter.
+The unchanged 12-byte privilege receipt continues to carry 1–7, now explicitly
+the selected ruleset ABI. It precedes enforcement and cannot establish exec or
+full isolation. No shared wire layout or capability canonical bytes changed.
+
+For the design §15 table: Linux 5.15/6.1/6.8 keep their detected ABI 1/2/4
+policies; a kernel reporting ABI 8 or later selects ABI 7. The external design
+file was not edited because this assignment restricts writes to this worktree.
+The handoff described this policy as pending owner confirmation; implementing
+it here is not owner release approval. Historical ABI-8 failures in the earlier
+acceptance table remain historical facts; the modified code requires re-testing.
+
+### Remaining work, in dependency order
+
+1. F/G verified root publication, installed anchors, account-lockdown evidence
+   and B1 production `Components` composition. Connect `LoopStorage` only with
+   those trusted installation inputs; no default paths or successful stubs.
+2. Reconcile B1's sealed `BootstrapPlan` with B2's `RootRegistry/TrustedRun`:
+   descriptor order, non-PTY stdin contract, executable/mount identities,
+   digest-bound runtime and forwarder seccomp profiles, forwarder ELF and
+   root tmpfs/devpts policy. B2's binary still uses `UnavailableRegistry`.
+3. Use C's authenticated `EgressController` for root-selected run registrations,
+   revocation and DNS evidence; carry B2 probe/kernel ABI evidence into B1's
+   trusted report and preserve cancellation/readback barriers.
+4. Construct gateway `SpawndBackend` with full composite admission, D live
+   authority/key material/metadata/resource resolvers and `ProtectedLaunch`;
+   inject real `ExecutionPlanFactory`, worker plans and a host-budgeted
+   `WorkerLauncher` with proven retirement. Update every CLI/runtime's published
+   MCP projection and verify inherited socketpair fd behavior. Do not invent
+   factories that claim all tools are supported without execution.
+5. Complete E/F/D live readiness, including updater loaded generation and worker
+   unit/retirement evidence. Apply the composite gate to API/in-process TEAM
+   execution too. The diagnostic-only module must not serve as authorization.
+6. Wire G's F/B1/H platform and authority adapters: only Admin-confirmed proposals
+   allocate UIDs/disks, with operation/digest-bound apply, readback and compensation.
+   Existing migration UI reachability is not completion of those adapters.
+7. Add and execute genuine `iso_root_e2e_*` tests for the full A→B1→systemd→B2
+   chain, real MCP tool call through D, same-employee queued D8 admission with a
+   double-fork leftover, `WouldDeadlock`, and real SSH public-key/su/user-manager/
+   crontab/at failures. No placeholder E2E test was added: the production chain
+   needed to exercise it is still missing.
+8. Remote gateway/CLI compilation, frontend type-check/tests, the three Linux
+   distributions (including ABI 8+), native Windows/macOS regression where
+   applicable, and formal Daybreak security review remain required.
+
+### Validation and acceptance handoff
+
+Actual commands and counts are recorded below. Cross-target
+checking is compilation/type checking, never native execution. No tests matching
+zero cases count as a test pass.
+
+Remote gateway/frontend checks (not run locally):
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway isolation_readiness::tests
+cd web
+npx tsc -b
+npx vitest run src/components/IsolationReadinessBanner.test.tsx
+```
+
+There are 5 new gateway cases and 7 UI cases. `web/node_modules` is absent in
+this worktree, so frontend dependencies were not installed. Local build limits
+prohibit compiling gateway/CLI; the above remains an explicit unverified gate.
+
+Root builder commands, only on a disposable Linux VM:
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-run --features root-test-fixture --offline -- --ignored iso_root_ --test-threads=1
+unshare --mount --propagation private env DUDUCLAW_ISO_DISPOSABLE=1 ISO_STORAGE_TEST_ROOT=/var/lib/iso-storage-test cargo test -p duduclaw-spawnd --offline -- --ignored iso_root_storage_adapter_reopen_generation_and_proposal_binding --test-threads=1
+```
+
+Reuse the existing acceptance `build.sh`/`push.sh` artifact inventory and
+`runall.sh`: one test process per `--ignored --exact <name> --test-threads=1`,
+retaining its exit status and requiring **exactly one passed case**. Include B2's
+new `iso_root_landlock_probe_reports_detected_and_selected_abi` library test as
+well as all 16 existing fixture tests. The new B1 storage root test also needs
+`unshare --mount --propagation private`, which the old `runall.sh` automatically
+uses only for package H: extend its package/name condition or run the B1 test
+with the explicit command above. Do not run it with shared host propagation.
+These are package tests; they are not the requested full-chain E2E suite.
+
+### Actual I1 checks
+
+All Cargo commands below used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`.
+
+| Exact command (after the two environment assignments) | Observed result |
+| --- | --- |
+| `cargo test -p duduclaw-run --offline` | 19 passed, 0 failed; 16 root cases ignored on macOS |
+| `cargo check --tests --features root-test-fixture --target x86_64-unknown-linux-gnu -p duduclaw-run --offline` | Passed; Linux-only tests and fixture type-checked, not executed |
+| `cargo test -p duduclaw-isolation --offline` | 32 passed, 0 failed; shared canonical/wire contract regressions |
+| `cargo test -p duduclaw-spawnd storage_adapter --offline` | Intermediate: 3 passed, 0 failed |
+| `cargo test -p duduclaw-spawnd storage --offline` | Final storage subset: 6 passed, 0 failed, 67 filtered |
+| `cargo test -p duduclaw-isolation-storage --offline` | 17 passed, 0 failed |
+| `cargo check -p duduclaw-spawnd --tests --target x86_64-unknown-linux-gnu --offline` | Passed; includes new real-loop root test type checking |
+| `cargo check --tests --features duduclaw-run/root-test-fixture --target x86_64-unknown-linux-gnu -p duduclaw-run -p duduclaw-spawnd -p duduclaw-isolation-storage --offline` | Final combined Linux type check passed; unsafe-code warnings remain, including adapter syscall sites |
+| `cargo check --tests --target x86_64-pc-windows-gnu -p duduclaw-run -p duduclaw-spawnd -p duduclaw-isolation-storage --offline` | Passed; Windows type check only, not native execution; deprecated/dead-code warnings remain |
+| `cargo metadata --no-deps --format-version 1 --offline` | Passed; metadata only, not a gateway build |
+| `git diff --check` | Passed |
+
+The four final macOS test selections total **74 passed, 0 failed**; the earlier
+3-case filter is a subset and is not counted twice. Locale JSON parsing and all
+14 new keys in each of the three languages were checked. Independent static
+review covered B2, gateway/web and B1/H. The live-edition latch, misleading
+privilege-receipt wording, fabricated unknown-device sentinel and invalid-input
+journal poisoning findings were corrected. No unresolved Critical/High/Medium
+was reported in that code review. It was **not** formal Daybreak review.
+
+**CONTRACT CHANGE:** none to `duduclaw-isolation` wire formats, canonical bytes or
+hard limits. Additive internal APIs are H's `ImageStatus`/`EmployeeStorage::images`,
+B1's cleanup-only `Attachment::check_identity`, and B2's selected-ABI readiness
+field. Gateway status gains an optional diagnostic payload. Dependency edges
+reuse existing workspace crates; no new third-party dependency or version.
+
+### I1 file-by-file handoff
+
+| File | Change |
+| --- | --- |
+| `Cargo.lock` | Record gateway→spawnd and spawnd→storage workspace dependency edges. |
+| `crates/duduclaw-gateway/Cargo.toml` | Linux-only spawnd evidence dependency. |
+| `crates/duduclaw-gateway/src/isolation_readiness.rs` | New fail-closed diagnostic snapshot, narrow-only latches and 5 tests. |
+| `crates/duduclaw-gateway/src/server.rs` | Initialize protected TEAM requirements after boot edition resolution. |
+| `crates/duduclaw-gateway/src/handlers/lifecycle.rs` | Also initialize after live edition promotion; never clear latches. |
+| `crates/duduclaw-gateway/src/handlers/system_status.rs` | Add operator-safe optional isolation status. |
+| `crates/duduclaw-gateway/src/lib.rs` | Export diagnostic module. |
+| `crates/duduclaw-isolation-storage/src/lib.rs` | Add refusing-by-default root-local image inventory API. |
+| `crates/duduclaw-isolation-storage/src/linux.rs` | Implement verified image/mount inventory and extend root assertions. |
+| `crates/duduclaw-isolation-storage/README.md` | Explain inventory and B1 responsibilities. |
+| `crates/duduclaw-spawnd/Cargo.toml` | Reuse H workspace crate. |
+| `crates/duduclaw-spawnd/src/storage.rs` | Export real adapter and distinguish cleanup identity from launch device proof. |
+| `crates/duduclaw-spawnd/src/storage/adapter.rs` | New durable B1→H adapter, safe detached mounts and ignored root lifecycle test. |
+| `crates/duduclaw-spawnd/src/storage/adapter_state.rs` | New bounded operation/run journal reconciliation and portable tests. |
+| `crates/duduclaw-spawnd/src/host.rs` | Permit cleanup of an identity-bound attach intent without inventing a device. |
+| `crates/duduclaw-spawnd/README.md` | Adapter prerequisites, failure/recovery boundaries and root acceptance instructions. |
+| `crates/duduclaw-run/src/landlock.rs` | Clamp newer detected ABIs to exact known ABI-7 policy and test rights. |
+| `crates/duduclaw-run/src/linux/probe.rs` | Preserve detected/selected ABI evidence, once-per-process logging and tests. |
+| `crates/duduclaw-run/src/linux/runner.rs` | Carry selected ABI into the existing bounded privilege receipt. |
+| `crates/duduclaw-run/src/status.rs` | Clarify that the receipt is not enforcement/exec success. |
+| `crates/duduclaw-run/README.md` | Current ABI compatibility, evidence and integration limits. |
+| `web/src/components/IsolationReadinessBanner.tsx` | Persistent warning, Admin details and refresh. |
+| `web/src/components/IsolationReadinessBanner.test.tsx` | Seven presentation/state regressions, not run locally. |
+| `web/src/components/layout/MainLayout.tsx` | Mount the warning in the dashboard shell. |
+| `web/src/lib/api.ts` | Optional typed composite status. |
+| `web/src/i18n/zh-TW.json` | Traditional Chinese operator wording. |
+| `web/src/i18n/en.json` | Matching English wording. |
+| `web/src/i18n/ja-JP.json` | Matching Japanese wording. |
+| `docs/features/05-security-defense.md` | Enabled diagnosis/parser latch and remaining admission boundaries. |
+| `docs/features/zh-TW/05-security-defense.md` | Matching Traditional Chinese documentation. |
+| `docs/features/ja-JP/05-security-defense.md` | Matching Japanese documentation. |
+| `docs/architecture/native-linux-isolation.md` | This evidence-bounded handoff and corrected ABI history/current policy. |
+| `CHANGELOG.md` | Self-contained unreleased diagnosis and Landlock compatibility entries. |
+
+### Round 2 — historical integration handoff (2026-11-05)
+
+**PARTIAL / NOT READY FOR DEPLOYMENT.** Work remains uncommitted in the assigned
+worktree. This round changes TEAM admission from diagnostics into refusal at
+execution entry points, and adds real transport/lifecycle implementations. It
+still does not produce a runnable protected TEAM installation: the authoritative
+installation and runtime producers below are missing. No protected employee was
+executed here. No gateway/CLI/workspace build, root test, deployment, customer
+acceptance or formal Daybreak review was performed.
+
+| Requested priority | Current implementation | Remaining closure |
+| --- | --- | --- |
+| Gateway A backend and B1→B2 | Boot connects one `SpawndBackend::connect_with_admission`, installs it as the protected selection; production Host uses `NativeTrampoline`; the binary consumes sealed plans through `SealedRegistry`. | Installed root publication, runtime profiles, binary/namespace/Landlock installation evidence and root anchors are absent. Native B1 PTY remains refused. |
+| D/A/E boot and runtime shim | Concrete `ProtectedMcpLaunch`; boot owner assembles Boundary, A execution plans, E services and binary-owned CLI dispatcher when all trusted inputs exist. | No production `BootSources` producer, fresh component-readback producer, root CLI projection/inheritance acceptance producer or runtime call-site `prepare_launch`/`with_context` wiring. |
+| Composite TEAM admission | API and subprocess entry points refuse unless every component is ready; retained A backend handles and model/tool-loop rounds recheck. F now has a real expiring health probe. | D/E/runtime-adapter states intentionally remain pending; constructed services are not readiness evidence. |
+| F/G adapters | Dashboard update path verified; new F authenticated readiness. G confirmed allocation goes through the B1 lifecycle owner to account/H operations and readback. | Missing installation evidence and unprovisioned H anchors still refuse real allocation; new-employee product creation and complete generation-activation endpoints remain absent. |
+| `iso_root_e2e_*` | Added real sealed transport and B2 fixture tests, plus a G durable binding/compensation fixture. | None executed here. These are narrower than the requested full A→B1→systemd→B2/D-tool/D8/real-login negative suite, which remains unwritten. |
+
+#### Execution, admission and boot ownership
+
+`isolation_readiness::connect_backend` connects at trusted boot even while another
+component is unready. `selection` holds one backend; protected `select` and the
+command adapter no longer create unrelated per-run connections. The boot-only
+accessor permits composition before readiness, but the installed backend itself
+checks the callback before/after reservation, before spawn, after awaited input
+preparation and after StartRun. A late failed check closes the control connection
+so B1 cancels its runs. Cleanup is not blocked by readiness.
+
+A retains the actual authenticated reservation expiry, employee, run and random
+control-connection identity, plus the validated TakeIo receipt. D uses these
+rather than synthesized IDs. `ProtectedMcpLaunch` is single-use: trusted
+policy/grant, root-verified runtime projection, issue, actual MCP socket delivery,
+activation and revocation. Error, explicit revoke and Drop revoke the capability
+and abort the connection task. Native argv/env are never converted into root
+policy or accepted as runtime publication.
+
+The gateway now calls `isolation_mcp::boot_protected` after backend connection.
+The binary registers a concrete dispatcher factory before `cmd_run_server` starts
+the gateway. It uses the existing internal-key authenticator inside the gateway,
+retains the original scope checks and requires complete dispatcher services; no
+key is placed in runtime files/fds and no principal is manufactured from a slug.
+The owner retains Boundary/sweep and E services. `prepare_launch` re-reads G's
+confirmed root mapping and D's durable binding before creating the launch.
+`isolation-worker-integration` is enabled in gateway defaults; no E engine runs
+inside gateway. Missing producers are logged explicitly, and boot construction
+never flips composite readiness to true. This is composition support, not a
+claim that runtime entry points already scope every call through it.
+
+The process-wide TEAM gate is checked before human-context shortcuts in
+`autonomous_runtime`, at `run_agent_prompt_inner`, the Claude runner, MoA and the
+operator direct tool-loop. RecordingProvider, ReasoningTap and LocalChatProvider
+check again for each complete/stream call; the SSE fallback rechecks too. These
+checks return a nonretryable configuration/request refusal. Existing explicit
+Admin maintenance/model-probe paths retain their existing separate authority.
+Non-protected installations and non-Linux platforms receive no new TEAM latch;
+LocalBackend behavior remains unchanged. A live TEAM promotion latches refusal;
+a restart is still needed to obtain missing boot composition inputs.
+
+#### B1 production adapter and B2 final isolation receipt
+
+`native_trampoline::NativeTrampoline` is now the production Host's adapter. It
+accepts only a root `Publication::native_profile` (not deserializable gateway
+policy), verifies the existing sealed BootstrapPlan bytes, and converts actual
+mount/executable observations into B2's exact descriptor order:
+
+`home, work, projection, runtime, etc, ELF, [script], prompt, attachments,
+[stdin], [MCP], [egress, forwarder ELF]`.
+
+The optional forwarder is opened relative to the detached runtime mount and
+hash-verified. Runtime/forwarder seccomp allowlists and digests, snapshot mount
+identity, tmpfs limits and proc policy must come from the verified publication.
+`bind_unit` validates the checked StartedUnit/run association and cgroup, receives
+the root-authenticated fresh challenge, checks cancellation, then sends the
+nonce/run-bound root memfd plus rights. The unit barrier is not released before
+the monitor owns the cgroup. The sender drops its copies after handoff. Failed
+start/transport still follows B1's existing revoke/kill/D8 cleanup path.
+
+B2's production binary no longer uses `UnavailableRegistry`. `SealedRegistry`
+consumes one offer, verifies root ownership, bounded regular tmpfs file, seals,
+nonce/run/domain and trusted-plan validation; no pathname or environment override
+is accepted. Malformed first offers cannot retry. Non-PTY stdin is now an exact
+read-only CLOEXEC pipe; PTY+stdin is refused. The private fd contract remains
+bounded by 80 bootstrap descriptors and the original 72-source shuffle limit.
+
+A CLOEXEC notification pipe plus shared atomic final-stage bits separates
+isolation completion from a mere fork or pipe EOF. Runtime and forwarder set their
+bits only after Landlock, final fd readback and final seccomp installation. EOF
+without those bits, or any recorded failure, refuses. B1 needs **all four**
+EmployeeReady, SupervisorReady, IsolationReady and ChildrenForked receipts before
+Running; ChildrenForked follows init's dedicated filter. Duplicate/error/unexpected
+PTY receipts refuse. IsolationReady is not proof that exec succeeded or that the
+process remains alive. Terminal status always takes precedence when drained.
+An already-exited short runtime preserves its actual exit result without issuing
+a readiness receipt; an early dead forwarder fails the run.
+
+The native B1 adapter currently refuses PTY: returned-master provenance and
+actual PTY activity tracking still need their production integration. It does
+not allocate a host PTY or invent activity each poll. Non-PTY activity timestamps
+use one shared monotonic epoch clock with the coordinator and are captured during
+preparation, avoiding boot-relative/epoch confusion and future asynchronous
+receipt timestamps.
+
+Landlock probe logging was moved out of the employee stderr pipe. `probe()` only
+returns actual detected/selected evidence. A trusted trampoline readiness
+producer must provide both ABIs; B1 emits them once to daemon stderr and
+publishes `EvidenceReport.landlock`. The supplied service currently discards
+stderr; a bounded retained daemon-log destination remains an installer task. Claimed trampoline readiness without valid
+ABI evidence now refuses; selected ABI must equal `min(detected, 7)`. The actual
+installation/self-test producer is still missing, so the default does not report
+this evidence as ready. The round-1 stderr behavior above is historical.
+
+#### F and confirmed G allocation
+
+F's private probe uses the existing fixed root socket, fresh nonce, strict schema,
+peer credentials and no ancillary rights. It refuses work-in-progress, poisoned,
+maintenance, pending or resume-required state and verifies the running updater
+slot plus signed committed manifest/current selector. Full artifact verification
+occurs during clean recovery; the once-per-second probe avoids rehashing up to
+8 GiB under the service lock. The root-only `verified_committed_generation` API
+can re-verify all artifact bytes, but its release manifest is not a substitute
+for NSS/SSH evidence or B1 runtime/mount policy.
+
+Gateway probes in one background thread. Evidence expires two seconds after the
+RPC **started**, not after it completed; failure clears the cache immediately.
+Admission does not block on F's five-second socket timeout. Version and the entire
+protocol vector are checked. B1 does not yet publish a loaded generation digest,
+so cross-component generation equality remains unverified. The existing Admin
+`system.apply_update`/status dashboard client was checked; only Committed is
+success. No update was requested or installed in this round.
+
+G's private allocation protocol binds operation ID, full normalized proposal
+digest, label and quota. Root generates a random immutable EmployeeId before
+account effects; it never hashes a label. The same B1 lifecycle worker owns the
+allocator, RegistryStore flock and H provider. Only Applying confirmations can
+allocate; Pending/Approved payloads refuse. Successful retries return the same
+identity; altered bindings refuse. Every partially created UID/reservation is
+added to the independent monitor before replying, including failure cases.
+
+Compensation persists Disabling, permanently tombstones the UID, proves no
+remaining process, destroys/readbacks H state, then persists Disabled. A proven
+never-provisioned image is a no-op only after complete inventory. Disabled
+operations cannot resurrect UIDs. A failed employee retry completes compensation
+and asks for a new proposal; a new operation may reuse the product label with a
+new EmployeeId/UID. This is deliberately narrower than transparent same-operation
+recovery and is a remaining product limitation.
+
+The dashboard confirmation adapter currently supports employees already written
+through the normal product flow, with complete settings exactly equal to the
+live registry config and live Admin access. It does not copy imported authority
+into a fresh employee. The confirmed mapping is stored separately and resolution
+requires an Applied confirmation plus live root ReadBack. It proves employee/UID/
+quota only, not D principal/session/policy revisions. New-employee creation and
+partial imported-setting re-entry are not integrated.
+
+#### Remaining work before any runnable/acceptance claim
+
+1. Root installer must provision the fixed H image/journal anchors described below;
+   provide actual UID-range/no-existing-owner/SSH public-key and forwarding
+   evidence, not config booleans. Missing anchors and account evidence still deny.
+2. F/G must publish the root runtime/entitlement registry, mount anchors,
+   architecture-specific seccomp/forwarder profiles and actual trampoline
+   installation/self-test evidence. F's current signed artifact list alone does
+   not encode these policies. The C DNS readiness producer is still missing.
+3. Supply gateway BootSources from live principal/session/binding/revision,
+   trusted execution plans, root runtime projection and acceptance receipts,
+   E host input budgets plus proven worker cgroup retirement, turn authority and
+   fresh composite readbacks. Merely opening E's socket is insufficient.
+4. Wire each runtime call site to `prepare_launch` and execution context; publish
+   Claude/Codex/Grok/generic/openai-compat configs with D's fixed shim and prove
+   fd-3 inheritance. Appending arguments inside A does not modify B1's fixed
+   root argv because StartRun intentionally carries no argv/env.
+5. Implement/validate native B1 PTY, complete G fresh employee creation/recovery,
+   and close F's drain/prepare/apply/readback/resume generation endpoints.
+6. Write and run the full gateway A→B1→systemd→B2 suite with a real D tool call,
+   D8 second-run admission including a double-fork leftover, same-employee
+   WouldDeadlock and actual ssh public-key/ssh forwarding/su/user-manager/cron/at
+   rejection. Do not relabel the narrow fixtures below as that acceptance.
+7. Compile/test gateway and CLI remotely; run frontend checks when dependencies
+   exist; run root fixtures on disposable Ubuntu 22.04/24.04 and Debian 12,
+   including newer Landlock ABI. Formal Daybreak review remains a separate gate.
+
+#### Round-2 validation and remote filters
+
+Local commands use `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`. Cross checks do not
+link or execute Linux/Windows code; zero-test binaries/doc-tests are not counted.
+
+| Command / selection | Observed result |
+| --- | --- |
+| `cargo test -p duduclaw-spawnd -p duduclaw-run -p duduclaw-execution -p duduclaw-isolation --features duduclaw-run/root-test-fixture --offline` | macOS: 73 + 20 + 32 + 32 = **157 passed**, 0 failed; root fixture tests ignored |
+| `cargo test -p duduclaw-mcp-boundary --features execution-integration --offline` | macOS: **59 passed** (58 library + 1 bridge); Linux lifecycle not executed |
+| `cargo test --offline -p duduclaw-updated -p duduclaw-migration --lib` | macOS: **35 + 41 passed**, 0 failed; one hardware-key fixture ignored |
+| Combined Linux check of execution, mcp-boundary, spawnd, run, updated, migration with all targets, binding-store/execution-integration/root-test-fixture features | Passed (final 3.89 s); exact command below. |
+| `cargo check -p duduclaw-run -p duduclaw-spawnd -p duduclaw-execution -p duduclaw-migration -p duduclaw-updated --tests --target x86_64-pc-windows-gnu --offline` with the same SQLite metadata workaround | Passed (11.26 s); type check only, no Windows execution/linking. |
+| Standalone boot harness including actual new boot module, boundary service and E adapter, with unrelated gateway dependencies stubbed | Linux check including tests and no-default-feature check passed; not a gateway/CLI package build. |
+| Standalone readiness harness including the actual readiness module, with only core latch names stubbed on macOS | **7 passed**, 0 failed; verifies pure admission/expiry logic, not actual gateway entry points. |
+
+The non-overlapping real-crate local suites above total **292 passed, 0 failed**.
+The additional seven pure readiness-harness passes are reported separately.
+The final B2 rerun had 20 passed and 19 ignored root fixture tests. The earlier
+round-1 checks and repeated subsets are not added again. The new spawnd→migration
+edge pulls existing bundled SQLite into the graph: the first Linux cross check
+failed because `x86_64-linux-gnu-gcc` is absent. Subsequent **type checks only** used
+`LIBSQLITE3_SYS_USE_PKG_CONFIG=1 PKG_CONFIG_ALLOW_CROSS=1`; this is not evidence that
+the resulting Linux/Windows binaries link. No new third-party version was added.
+
+```sh
+LIBSQLITE3_SYS_USE_PKG_CONFIG=1 PKG_CONFIG_ALLOW_CROSS=1 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo check -p duduclaw-execution -p duduclaw-mcp-boundary -p duduclaw-spawnd -p duduclaw-run -p duduclaw-updated -p duduclaw-migration --all-targets --features duduclaw-run/root-test-fixture,duduclaw-mcp-boundary/execution-integration,duduclaw-mcp-boundary/binding-store --target x86_64-unknown-linux-gnu --offline
+```
+
+Remote gateway/CLI checks (not executed locally):
+
+```sh
+CARGO_BUILD_JOBS=12 CARGO_INCREMENTAL=0 cargo check -p duduclaw-gateway -p duduclaw-cli --tests
+cargo test -p duduclaw-gateway isolation_readiness::tests -- --test-threads=1
+cargo test -p duduclaw-gateway isolation_mcp::boot::tests -- --test-threads=1
+cargo test -p duduclaw-gateway isolation_execution -- --test-threads=1
+cargo test -p duduclaw-gateway migration_authority -- --test-threads=1
+cargo test -p duduclaw-gateway protected_update -- --test-threads=1
+cargo test -p duduclaw-cli mcp_isolation -- --test-threads=1
+cargo test -p duduclaw-execution reservation_metadata_
+cargo test -p duduclaw-execution mcp_receipt_requires_actual_delivery_and_live_control
+cargo test -p duduclaw-execution retained_backend_checks_admission_before_connecting_to_root
+cargo test -p duduclaw-spawnd native_trampoline::tests
+cargo test -p duduclaw-run eof_without_both_final_isolation_receipts_never_admits
+cargo test -p duduclaw-run sealed_transport_test_plan_obeys_production_policy_validation
+cargo test -p duduclaw-migration allocation::tests
+cargo test -p duduclaw-updated readiness::tests
+cargo test -p duduclaw-mcp-boundary --features binding-store,execution-integration
+```
+
+Check that each requested selection matches tests; counts are not inferred from
+exit zero. The admission wrappers also require actual API/CLI-path tests on the
+remote gateway, not only the pure component-state tests above.
+
+On a disposable root Linux acceptance machine:
+
+```sh
+cargo test -p duduclaw-run --lib iso_root_e2e_sealed_registry -- --ignored --test-threads=1
+cargo test -p duduclaw-run --features root-test-fixture --test root iso_root_e2e_sealed_bootstrap -- --ignored --test-threads=1
+cargo test -p duduclaw-run --features root-test-fixture --test root iso_root_full_launch -- --ignored --test-threads=1
+cargo test -p duduclaw-spawnd iso_root_e2e_confirmed_allocation_binding_restart_and_compensation -- --ignored --test-threads=1
+unshare --mount --propagation private env DUDUCLAW_ISO_DISPOSABLE=1 ISO_STORAGE_TEST_ROOT=/var/lib/iso-storage-test cargo test -p duduclaw-spawnd iso_root_storage_adapter_reopen_generation_and_proposal_binding -- --ignored --test-threads=1
+```
+
+The sealed-registry filter has three real handshake/descriptor tests. The sealed
+bootstrap filter has three real B2 employee uid/namespace/fd, teardown and fast-exit
+fixtures. Including G, there are seven newly added e2e-named root tests.
+Existing full-launch scenarios now all use the production sealed registry,
+including expected exec failure. The G e2e-named fixture uses real root journal/
+registry persistence but **injected account/storage effects**. None proves
+production systemd/D8 or a real D tool call. Reuse the acceptance scripts'
+artifact inventory and one-process-per-exact-test convention; for B1/H storage
+add the explicit private mount namespace shown above. Do not run storage tests
+with shared host propagation or on a non-disposable host.
+
+`web/node_modules` is absent: no dependency installation, tsc or vitest was run.
+Three locale JSON files parse; all 14 readiness keys match and are nonempty.
+Remote frontend commands remain `npx tsc -b` and
+`npx vitest run src/components/IsolationReadinessBanner.test.tsx` in `web`.
+
+#### Round-2 file map
+
+| Files | Change |
+| --- | --- |
+| `execution/src/selection.rs`, `command.rs` | Shared boot-installed protected backend and no per-run reconnect/fallback. |
+| `execution/src/spawnd.rs`, `spawnd/transport.rs` | Actual reservation/control/MCP metadata; retained-handle admission checks and tests. |
+| `mcp-boundary/src/protected_launch.rs`, `lib.rs`, `Cargo.toml` | Concrete A/D lifecycle behind execution-integration. |
+| `gateway/src/isolation_readiness.rs`, `server.rs`, `Cargo.toml` | Composite gate, A boot connection, F background evidence and E integration feature. |
+| `gateway/src/autonomous_runtime.rs`, `runtime_dispatch.rs`, `claude_runner.rs`, `direct_api.rs`, `channel_reply/direct_api.rs`, `thinking/llm_tap.rs`, `local_llm.rs` | Initial and per-round API/tool-loop TEAM admission. |
+| `gateway/src/isolation_mcp.rs`, `isolation_mcp/boot.rs` | Boot owner, explicit missing sources, assembly and confirmed launch helper. |
+| `cli/src/mcp_isolation_boot.rs`, `lib.rs` | Existing authenticated CLI dispatcher factory registered before server boot. |
+| `run/src/linux/sealed_registry.rs`, `sealed_registry_root_tests.rs`, `bootstrap.rs`, `main.rs`, `linux/mod.rs` | Production one-shot sealed plan transport and root tests. |
+| `run/src/linux/runner.rs`, `fd.rs`, `mounts.rs`, `fd_plan.rs`, `seccomp.rs`, `status.rs` | Trusted-plan serialization, non-PTY stdin, final isolation barrier and exact fd preservation. |
+| `run/src/linux/probe.rs`, `spawnd/src/bootstrap.rs`, `host_state.rs`, `host.rs` | ABI evidence belongs to root readiness/logging rather than employee output. |
+| `run/src/bin/root-fixture.rs`, `root-fixture/launch.rs`, `run/tests/root.rs` | Actual fixture launches use production sealed transport and assert isolation/terminal boundaries. |
+| `spawnd/src/native_trampoline.rs`, `bootstrap_mounts.rs`, `bootstrap.rs`, `host.rs`, `lib.rs`, `main.rs`, `server.rs` | B1/B2 adapter, typed root profile seam, cancellation/stage checks and shared clock. |
+| `updated/src/readiness.rs`, `client.rs`, `linux/service.rs`, `lib.rs` | Authenticated private health protocol and verified generation API. |
+| `migration/src/allocation.rs`, `allocation/transport.rs`, `confirmation.rs`, `lib.rs` | Bound allocation protocol, client, receipt checks and safe failed-employee retry behavior. |
+| `spawnd/src/allocation.rs`, `admission.rs`, `host_worker.rs`, `host.rs`, `lib.rs`, `storage/adapter.rs` | Single-owner root allocator, durable identity/compensation and proven absent-image no-op. |
+| `gateway/src/handlers/migration_authority_employee.rs`, `migration_authority.rs`, `migration_confirmations_rpc.rs`, `mod.rs` | Confirmed employee adapter and read-only root-verified mapping resolver. |
+| `spawnd/Cargo.toml`, `Cargo.lock` | Existing run/migration dependency edges; SQLite cross-compilation limitation above. |
+| `run/README.md`, `spawnd/README.md`, security feature docs in all three languages, `CHANGELOG.md`, three locale files | Actual gate/transport behavior, operator wording and explicit remaining limits. |
+
+All abbreviated crate paths above are below `crates/duduclaw-.../`. Round-1 files
+not changed again remain described in the preceding table. Review found and
+corrected retained-backend admission bypass, EOF false readiness, incomplete
+init-stage evidence, fast-exit outcome loss, clock-domain mismatch, G compensation/
+monitor/retry issues and API-only MoA/tool-loop omissions. This is ordinary
+independent code review, **not** the required formal Daybreak security sign-off.
+
+**CONTRACT CHANGE:** no change to `duduclaw-isolation` wire formats, capability
+canonical bytes or hard limits. New protocols are private F health and G/B1
+allocation; B1/B2 adds a sealed root manifest descriptor and private status kind 7
+(`IsolationReady`). Internal root readiness adds actual/selected ABI evidence;
+missing evidence refuses. No commit, merge, release or installation occurred.
+
+Evidence logs retained locally for this round: `/tmp/iso-i1-r2-final-local-tests.log`,
+`/tmp/iso-i1-r2-run-final-tests.log`, `/tmp/iso-i1-r2-final-linux-check.log`,
+`/tmp/iso-i1-r2-final-windows-check.log`, `/tmp/iso-i1-r2-boundary-test.log`,
+`/tmp/iso-i1-r2-fg-tests.log`, `/tmp/iso-i1-r2-boot-typecheck-tests.log`, and
+`/tmp/iso-i1-r2-readiness-harness.log`. The harness sources are under
+`/tmp/iso-i1-r2-boot-check` and `/tmp/iso-i1-r2-readiness-check`; their stubs are
+explicit and must not be mistaken for production implementations. `git diff
+--check` passed after final integration.
+
+Final production storage closure: `main` now uses `Components::installed()`, which
+attempts the real H adapter at fixed `/var/lib/duduclaw-spawnd/images` and
+`/var/lib/duduclaw-spawnd/storage`. This resolves the earlier unspecified-layout
+seam; it does not create/mount anchors or allocate an employee disk at startup.
+Both anchors must already be root:root 0700; H still requires private propagation,
+supported backing, capacity reserve and complete inventory. Opening may create
+only the existing adapters' lock/metadata files. Failure retains the refusing
+UnavailableStorage implementation. The remaining installer, account evidence and
+runtime publication gates are unchanged. Independent review passed, and final
+Linux spawnd all-targets type-check passed (`/tmp/iso-i1-r2-installed-storage-check.log`).
+
+
+### Round 3 — historical integration handoff (2026-11-05)
+
+**PARTIAL / NOT READY: the requested protected Claude employee turn has not been
+implemented or demonstrated end to end.** This round supplies real installed
+publication consumers, post-StartRun MCP projection receipts and worker retirement.
+It does not fill missing authority with a synthetic principal, fixed policy
+revision or permissive tool factory. Consequently protected TEAM admission still
+refuses work, even if all service units exist. Rounds 1–3 remain uncommitted in the
+assigned worktree. No gateway/CLI/workspace build was run locally.
+
+#### Ordered progress and remaining work
+
+| Requested stage | Round-3 change | What still prevents completion |
+| --- | --- | --- |
+| Root publication / BootSources | Production B1 uses `InstalledPublication` and measured installation receipt consumers. Boot can obtain the runtime registry from F's verified generation and installs `RetiringLauncher`. | No installer/signing harness currently produces the required policy artifact, account/kernel/DNS receipts and exact-runtime MCP acceptance transcripts. Boot still lacks live authority, durable bindings, execution/worker plans and turn authority. |
+| Runtime contexts and D shim | `InstalledRuntimeRegistry` validates current root publication and actual per-run mount receipt. `ProtectedMcpLaunch` defers mount-receipt validation until after TakeIo; Claude uses `/config/mcp.json`. | No CLI runtime call site yet calls `prepare_launch` / `with_context`. Claude/OpenAI RunConfig publication is supported; Codex/Grok home/project overlays and generic Registered runtimes refuse. No actual runtime's fd-3 inheritance or exclusive config was tested. |
+| E retirement | A host-wide dirty lease, authenticated worker pidfd, exact systemd invocation and cgroup retirement hold the input/memory slot through response and cleanup. | Root execution of the new worker test, a linked Linux parser-engine binary, installation and crash reconciliation remain outstanding; engine all-targets cross type-check now passes. Construction is not readiness evidence. |
+| PTY | Inspected B1/B2/A ownership and idle-timeout paths; retained refusal. | Need authenticated returned-master provenance and an activity mechanism that observes real bytes without stealing them from A. NativeTrampoline still refuses PTY. |
+| Full root e2e | Added narrower publication/retirement checks; commands below distinguish them. | The full A→B1→systemd→B2 employee UID→Claude MCP child→D real-tool test and D8 double-fork leftover test remain unwritten/unexecuted. A real login/scheduler denial test is now written and type-checked, but has not been executed. |
+
+The authority gap is concrete: the product has authenticated human contexts and
+fresh `users.db` access checks, and G can resolve a confirmed immutable EmployeeId,
+but there is no production writer for D's principal generations, lifetime
+employee/tenant bindings or complete policy revision. `BindingStore::new`,
+`register_principal` and `create_employee` are currently used by tests, not the
+product administration flow. An ACL generation is not a revision of all employee
+policy, and an employee slug is not an authenticated tenant. The execution and
+worker plan traits likewise have no production per-tool implementations. These
+must be implemented from trusted administration/dispatch state before wiring a
+runtime context; a deny-all placeholder would not satisfy the requested turn.
+
+#### Installed publication and per-run MCP readback
+
+B1 consumes `/var/lib/duduclaw-spawnd/publication.json` for generation-bound host
+entitlements, and the signed F `RuntimeEntry` artifact `isolation-policy-v1` for
+runtime/native profiles. Root installation measurements live under
+`/run/duduclaw-isolation-evidence`; they bind boot, generation, inventory and
+bounded freshness. Account readiness requires real positive/negative SSH evidence
+and the other account controls; no receipt is inferred from a unit's existence.
+The exact strict schemas and limits are documented in the spawnd README.
+
+F is nonce-probed every time a committed generation is consumed. Only the expensive
+full verification of the same immutable signed generation is cached; failures
+clear the cache and generation changes reverify it. A cold verification that
+exceeds the one-second freshness budget only warms the cache; a subsequent fresh
+probe is required to admit it. Per-launch executable/bridge/forwarder hashes remain.
+
+B1 atomically publishes the gateway-readable root-owned 0640
+`/run/duduclaw-spawnd/publication.json`. MCP acceptance binds runtime version,
+runtime/bridge/config digests, native launch policy, fd 3, successful initialize,
+parent/child exec, exclusive config and a nonzero transcript digest. This is a
+consumer of measured acceptance, not an implementation that generates it. Runtime
+scripts refuse because the present receipt cannot attest interpreter plus script
+with one executable digest. Multiple profiles for a runtime also refuse at the
+gateway registration lookup instead of guessing which policy applies.
+
+Before StartRun, the host checks exact projection bytes and adds only D-owned fixed
+arguments to the in-process plan. Those arguments do not travel in StartRun: the
+signed root runtime registry must already contain them. B1 publishes root-owned
+0444 config files, verifies the detached mount's recursive readonly state, ancestry,
+exact contents and bridge digest, and writes a boot/run/employee/generation-bound
+`mcp-<run>.json` receipt with a real mount ID. D reads that receipt only after the
+actual TakeIo handoff. A missing/mismatched/stale receipt revokes the capability.
+The root receipt TTL is 60 seconds; the general publication TTL is at most one
+second. The projection has a 64 KiB limit. No gateway pathname is used inside the
+employee namespace.
+
+#### Worker lifecycle and acceptance boundary
+
+The root-created `/run/duduclaw-parse/retirement.lease` begins with `clean\n` only
+after the installer proves no old worker or queued activation. A create-only
+systemd tmpfiles rule is provided. The launcher holds a cross-process flock and
+fsyncs `dirty\n` before connecting, reserving one full input/memory slot. It never
+creates or repairs the lease. A private pre-content nonce handshake carries the
+worker's own pidfd with kernel SCM_CREDENTIALS; the gateway checks the PID and exact
+systemd invocation plus sandbox/resource properties. The pidfd is closed in the
+worker before parsing; normal parse protocol bytes are unchanged.
+
+A successful response is not retirement. Cleanup requires the recorded process to
+exit and its cgroup to be empty/removed, with the recorded unit/invocation lifecycle
+validated. Unknown ownership, readback errors, timeout or gateway crash leave the
+lease dirty. Root must reconcile workers and queued activation before resetting
+it; automatic crash repair is not implemented. See the parse-worker README for
+the final systemd lifecycle detail and the root test prerequisites.
+
+#### PTY blocker
+
+B2 can create a private devpts PTY in its own fixture, but the production status
+handoff currently gives B1 a master fd without a namespace/mount provenance receipt.
+B1's output relay handles pipes; merely duplicating the master cannot observe
+activity without consuming bytes intended for A. Updating an idle timestamp on
+each poll would disable the timeout, and replacing the master with a stream would
+fail A's real-PTY validation. Completing this needs a private authenticated activity
+channel or an equivalent design plus provenance checks, followed by the full-chain
+PTY acceptance. Existing B2 PTY tests are not that evidence.
+
+#### Remote build and root commands
+
+Remote execution was attempted, not completed. The existing builder wrapper's
+gcloud access failed because this sandbox cannot write its credentials database;
+a direct SSH attempt to the inventoried builder address was denied with
+`Operation not permitted`. No remote package or root test result is claimed.
+Use a separate round-3 directory so another acceptance session's binaries remain
+unchanged. The builder name was inventoried; its historical IP is not a current
+reachability assertion.
+
+```sh
+GS=/Users/lizhixu/Project/commercial-wt-v180-linux/scripts/v180-gcp-builder/gssh.sh
+rsync -az -e "$GS" --exclude target/ --exclude node_modules/ --exclude .git --exclude artifacts/ --exclude web/dist/ \
+  /Users/lizhixu/Project/DuDuClaw-wt-iso-i1/ duduclaw-v180-builder-4:wt/iso-i1-r3/
+"$GS" duduclaw-v180-builder-4 'cd ~/wt/iso-i1-r3 && . ~/.cargo/env && CARGO_BUILD_JOBS=12 CARGO_INCREMENTAL=0 cargo check -p duduclaw-gateway -p duduclaw-cli --tests'
+```
+
+The gateway build must use the real dashboard asset build required by the project;
+a stub asset directory is at most type-check scaffolding, never acceptance.
+On the Linux builder, after syncing the final sources:
+
+```sh
+CARGO_BUILD_JOBS=12 CARGO_INCREMENTAL=0 cargo check -p duduclaw-parse-worker --features engine --all-targets
+cargo test -p duduclaw-gateway isolation_mcp::boot::tests -- --test-threads=1
+cargo test -p duduclaw-gateway isolation_readiness::tests -- --test-threads=1
+cargo test -p duduclaw-cli mcp_isolation -- --test-threads=1
+cargo test -p duduclaw-spawnd installed::tests -- --test-threads=1
+cargo test -p duduclaw-spawnd gateway_mcp::tests -- --test-threads=1
+cargo test -p duduclaw-execution live_status_ -- --test-threads=1
+cargo test -p duduclaw-execution live_snapshot_ -- --test-threads=1
+cargo test -p duduclaw-mcp-boundary --features binding-store,execution-integration
+cargo test -p duduclaw-parse-worker retirement -- --test-threads=1
+```
+
+Require actual nonzero matching test counts. Compile root test executables on the
+builder using the existing acceptance `build.sh` JSON artifact inventory convention,
+then copy those executables and matching installed binaries to the disposable VM.
+The original acceptance scripts are under the task's `scratchpad/accept`; adjust
+both build and runner roots consistently to `~/wt/iso-i1-r3` / `~/wt/iso-i1-r3-out`.
+Do not reuse old `exes.txt` paths from another build. The runner uses one process per
+exact ignored test, `DUDUCLAW_ISO_DISPOSABLE=1`, `--test-threads=1 --nocapture`, and
+requires `test result: ok. 1 passed`; a zero-test exit is not a pass.
+
+For the new E test, install the matching engine binary, socket/template and
+create-only tmpfiles configuration first, and initialize a clean lease only after
+proving that there are no old workers or pending activations:
+
+```sh
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-parse-worker --features engine --test systemd \
+  iso_root_e2e_worker_retirement_holds_host_slot_through_response_and_drop \
+  -- --ignored --exact --test-threads=1 --nocapture
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --lib \
+  installed::tests::iso_root_e2e_publication_receipt_mode_and_symlink_refusal \
+  -- --ignored --exact --test-threads=1 --nocapture
+```
+
+The E test exercises response/drop budget retention and actual retirement. The
+publication fixture checks root mode/symlink rules. Neither is a Claude turn or
+a substitute for the missing full-chain test. Root-installed publication readback
+commands and final local validation results are recorded below after final review.
+
+#### Round-3 file map
+
+| Files (under `crates/duduclaw-*`) | Change |
+| --- | --- |
+| `spawnd/src/installed.rs`, `installed_root_tests.rs`, `installed_account_root_tests.rs`, `host.rs`, `bootstrap_mounts.rs`, `policy.rs`, `lib.rs`, `Cargo.toml`, README | Signed policy / measured installation consumers, root projections and per-run readback. |
+| `spawnd/src/gateway_mcp.rs` | Gateway reader binding F generation, actual run and accepted runtime bytes. |
+| `mcp-boundary/src/protected_launch.rs`, `config.rs`, `config_tests.rs` | Verify mount receipt after TakeIo; select Claude's in-namespace config path. |
+| `gateway/src/isolation_mcp.rs`, `isolation_mcp/boot.rs`, `isolation_readiness.rs` | Consume fresh F generation for registry, install retiring E launcher, keep explicit missing authorities. |
+| `execution/src/spawnd.rs`, `spawnd/transport.rs` | Fresh original-control-connection run snapshot for D and concurrency regression work. |
+| `parse-worker/src/{retirement,retirement_hello}.rs`, `client.rs`, `lib.rs`, `main.rs`, `Cargo.toml`, unit/tmpfiles files, `tests/systemd.rs`, README | Cross-process budget lease, worker identity handshake and retirement lifecycle. |
+| `scripts/ci/privileged_effects.json` | Exact account-test host-command and four I1 thread inventory entries; no whole-file exemptions. |
+| `Cargo.lock`, security docs in three languages, `CHANGELOG.md`, this handoff | Existing zbus dependency edge, behavior/limits and exact validation instructions. |
+
+**CONTRACT CHANGE:** no shared isolation wire formats, canonical capability bytes
+or hard limits changed. Added schemas are private root publication/readback and
+E's opt-in pre-request handshake. zbus 5.19 was already in Cargo.lock; no new
+third-party version was introduced. No commit, deployment, installation, release
+or formal Daybreak review occurred.
+
+
+The installed-publication tests below require the real signed F generation,
+measured installation receipts, confirmed root account/entitlement and exact CLI
+MCP-child acceptance. They create none of those prerequisites. Missing evidence
+fails the test. The last test additionally requires an already-running real Claude
+run whose root receipt is still younger than 60 seconds; it does not start that run.
+
+```sh
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --lib \
+  installed::root_acceptance::iso_root_e2e_installed_publication_signed_policy_and_gateway_consumer \
+  -- --ignored --exact --test-threads=1 --nocapture
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --lib \
+  installed::root_acceptance::iso_root_e2e_installed_publication_live_install_evidence \
+  -- --ignored --exact --test-threads=1 --nocapture
+# Set ISO_INSTALLED_RUN_ID to the actual 32-lowercase-hex run ID from the root journal.
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --lib \
+  installed::root_acceptance::iso_root_e2e_installed_publication_actual_run_mcp_receipt \
+  -- --ignored --exact --test-threads=1 --nocapture
+```
+
+E no longer uses `RefUnit`/`UnrefUnit`. If PID 1 has garbage-collected the unit,
+only explicit exact-name `NoSuchUnit`, an exited original pidfd, a still-mounted
+cgroup-v2 hierarchy and disappearance of the original cgroup directory permit
+release. A missing `cgroup.events` file in an existing directory is insufficient.
+If the unit still exists, its InvocationID must match and state must be inactive
+or failed with an empty/removed cgroup. Property/GC races retry for at most 40
+seconds; none releases a dirty lease on its own.
+
+A's new `live_snapshot` reads fresh root Status on the original authenticated
+control connection. Independent review caught normal async Status polling racing
+a synchronous D watch. All transactions now share one bounded gate, and async
+packet I/O executes in `spawn_blocking`, so a synchronous verifier on a
+current-thread Tokio runtime cannot stall the future needed to release the gate.
+Each read sends its own request ID and consumes its own response; there is no
+cached allow or second control connection. The sync wait+I/O budget remains
+250 ms. Cancellation, protocol errors and timeout shutdown the original socket
+before releasing the gate. The new regression is
+`live_snapshot_serializes_with_wait_without_revoking_a_live_run`; Linux execution
+of it remains pending. No production `LiveAuthority` yet consumes this snapshot.
+
+
+Independent review also found that repeated bundle reads could combine an old
+BootstrapPlan with a newer acceptance/native profile when profile and version were
+unchanged. B1 now pins one F generation for the daemon lifetime; every publication,
+anchor, prepare, record and native-profile lookup refuses another generation until
+F restarts B1. It compares every `PublishedRuntime` field, reconstructs the exact
+BootstrapPlan and rechecks native launch acceptance. Tests change argv, resource
+limits, timeouts, network and executable digest without changing profile/version,
+and verify that all refuse. The reviewer rechecked both HIGH findings and found
+no remaining HIGH/CRITICAL in the reviewed diff. This is ordinary independent
+review, not the requested formal Daybreak sign-off or proof of runtime acceptance.
+
+#### Round-3 validation record
+
+Local commands used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`; no `cargo fmt` or
+local gateway/CLI/workspace build was run. Test totals below exclude repeat runs,
+ignored Linux root tests, zero-test binaries and earlier rounds.
+
+| Selection | Observed result |
+| --- | --- |
+| macOS `cargo test -p duduclaw-mcp-boundary --features execution-integration,binding-store --offline` | 65 library + 1 bridge = **66 passed**, 0 failed. |
+| macOS `cargo test -p duduclaw-spawnd -p duduclaw-execution -p duduclaw-parse-worker --offline` | **73 + 32 + 7 = 112 passed**, 0 failed. spawnd rerun after generation pin also passed 73. |
+| Linux `cargo check -p duduclaw-parse-worker --features engine --all-targets --target x86_64-unknown-linux-gnu --offline` | Passed, 13.70 s. Includes the changed worker binary's code; no Linux link or execution. |
+| Combined Linux all-target check of spawnd/execution/mcp-boundary/parse-worker with binding-store, execution-integration and engine | Passed, 8.68 s; the final spawnd all-targets check including real account attempts also passed (0.37 s warm cache). |
+| Combined Windows all-target check of those four crates with binding-store and execution-integration | Passed, 5.85 s; no Windows link or execution, no parser engine feature. |
+| Standalone harness including actual gateway boot/boundary/worker modules with unrelated gateway APIs stubbed | Linux all-target check passed, 3.57 s; no-worker-feature variant passed, 1.84 s. This is not the gateway or CLI package. |
+
+The distinct macOS suites total **178 passed, 0 failed**. New Linux-only concurrency,
+root publication, handshake and retirement tests were type-checked, not executed.
+The first standalone harness attempt lacked the workspace lock and failed offline
+resolution of the already-locked yanked async-executor version; copying Cargo.lock
+resolved it. No dependency versions were changed to work around that error.
+Cross checks use `LIBSQLITE3_SYS_USE_PKG_CONFIG=1 PKG_CONFIG_ALLOW_CROSS=1` because
+this machine lacks the target C linker; this workaround proves Rust types only.
+
+Exact combined check (run locally; not a Linux runtime result):
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 LIBSQLITE3_SYS_USE_PKG_CONFIG=1 PKG_CONFIG_ALLOW_CROSS=1 \
+  cargo check -p duduclaw-spawnd -p duduclaw-execution -p duduclaw-mcp-boundary -p duduclaw-parse-worker \
+  --features duduclaw-mcp-boundary/execution-integration,duduclaw-mcp-boundary/binding-store,duduclaw-parse-worker/engine \
+  --all-targets --target x86_64-unknown-linux-gnu --offline
+```
+
+Logs are `/private/tmp/iso-i1-r3-boundary-tests.log`,
+`iso-i1-r3-component-tests.log`, `iso-i1-r3-spawnd-final-tests.log`,
+`iso-i1-r3-worker-engine-check.log`, `iso-i1-r3-final-linux-check.log`,
+`iso-i1-r3-final-windows-check.log`, `iso-i1-r3-boot-check.log`,
+`iso-i1-r3-boot-no-worker-check.log`,
+`iso-i1-r3-status-serialization-check.log`, and
+`iso-i1-e-retirement-check.log` in the same temporary directory. Harness sources
+are `/private/tmp/iso-i1-r3-boot-check`. The earlier
+`iso-i1-r3-stage3-check.log` records the intermediate post-retirement Linux check.
+
+
+#### Authority producer investigation for the next implementation pass
+
+Use `UserDb::live_user_context`, not only `effective_access`: the former includes
+credential epoch and forced-password-change state. `duduclaw-auth/src/org.rs`
+`load_access` reads active user, direct/team access and ACL generation in one
+transaction. Existing auth writers advance that ACL generation, but they do not
+write D's `iso_principals`; client-only logout is not server-side revocation.
+
+No existing field was found that can honestly serve as an immutable Shared tenant
+identity. `OrgStore` stores reporting lines/departments; license customer and
+subscription IDs describe billing/license records; the Teams connector's tenant
+ID belongs to Microsoft Teams. G's Employee proposal and allocation Receipt do
+not contain D lifetime Personal/Shared binding. Its separate UserAgentBinding
+proposal's `owner_id` is an email resolved to a user UUID and `shared:<AccessLevel>`
+is an ACL, not a tenant binding. `EmployeeAuthority::readback_shared_employee`
+currently proves only confirmed root UID/quota, despite its name.
+
+The next implementation therefore needs a durable installation/tenant identity
+and explicit administration/migration confirmation of each lifetime employee
+binding, plus live synchronization/revocation of D principals. Suitable existing
+policy write points are `agent_files/writer.rs::commit_locked_with_lifecycle`,
+`handlers/config_commit.rs::commit_rendered_inner`, `OrgStore::mutate` and UserDb's
+transactional ACL writers. `autonomy_gate::lifecycle_barrier_required` currently
+covers status becoming non-active, not all tool/permission/scope changes. A new
+monotonic isolation revision must fence old runs/capabilities before these writes,
+read back successful bytes and publish the next revision; after-commit events or
+content hashes alone do not prevent an A→B→A policy from reviving old authority.
+These are missing product integrations, not a request for new credentials and not
+something that can be solved by merely starting the existing units.
+
+
+#### Real account denial acceptance (written, not executed)
+
+`installed::account_root_acceptance::iso_root_e2e_installed_account_real_denials`
+executes actual SSH public-key login/forwarding, su login, user-manager transient
+unit, crontab installation and at scheduling attempts. It requires an already
+confirmed installed employee and a dedicated unprivileged control account. Every
+positive control must succeed; missing tools, unreachable SSH, an unstarted user
+manager or arbitrary nonzero status are not passing negative evidence. Commands
+have a 12-second deadline plus a two-second kill grace. Cron probes contain only
+one harmless comment; at probes schedule `/usr/bin/true` and remove/read back the
+newly created job. Unexpected SSH/cron/at success is cleaned up before test failure.
+
+The fixture requires root-owned SSH key/known-host files and the same public key
+in the fixed root-owned authorized-key file for the control and employee accounts.
+Disk `sshd -T` alone is not enough: each real negative SSH attempt selects a fresh
+source port and requires current-boot root journal entries for the same sshd PID,
+port and employee plus an exact `DenyUsers` policy rejection. This prevents a
+missing key or stale/different live daemon configuration from being mistaken for
+lockdown. The dedicated control's public-key login and remote forwarding must
+both succeed. Scheduler and user-manager tools run with `setpriv` at the real
+employee UID/GID and cleared groups, checking an actual UID marker, so PAM's
+expired-account refusal cannot substitute for testing the tool itself. The su
+probe intentionally exercises the login/PAM path.
+
+The full fixture prerequisites are in `crates/duduclaw-spawnd/README.md`; no setup,
+key creation, installed SSH change or scheduler request was performed locally.
+Export `ISO_ACCOUNT_CONTROL_USER`, `ISO_ACCOUNT_SSH_KEY` and
+`ISO_ACCOUNT_SSH_KNOWN_HOSTS` to the documented dedicated fixture values, then run
+from a root shell on the disposable VM:
+
+```sh
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --lib \
+  installed::account_root_acceptance::iso_root_e2e_installed_account_real_denials \
+  -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p duduclaw-spawnd ssh_policy_evidence_requires_same_root_session_and_source_port
+```
+
+The latter is a pure log-binding regression test, not an SSH attempt. This new
+suite closes the previously unwritten account-attempt test source, not its Linux
+execution gate, and does not cover the missing Claude turn or D8 chain.
+
+
+Final account-test Linux check passed; log:
+`/private/tmp/iso-i1-r3-account-final-check.log`. The new test and its log-binding
+regression have been type-checked only. Final `git diff --check` passed.
+
+The repository spawn-inventory check is **not green**:
+
+```sh
+python3 scripts/ci/check_spawn_inventory.py
+```
+
+It reports **34 unclassified functions**, each confirmed to exist in HEAD with
+identical observed API counts. This round explicitly registered the new account
+fixture's host process and four I1 threads (A's concurrency test, E retirement,
+the F probe and B1 allocation server); the latter two were inherited from rounds
+1–2. Production threads are classified `not_process`, not employee-execution
+exemptions. No whole-file exclusion was added. The baseline comparison is
+`/private/tmp/iso-i1-spawn-inventory-baseline.json`; final checker output is
+`/private/tmp/iso-i1-r3-final-spawn-inventory.log`. The four I1 threads are now classified, while the 34 unrelated baseline entries
+remain for their owning packages. Independent review checked all five new
+inventory entries against their exact methods. Inventory coverage does not
+establish isolation acceptance.
+
+### Round 4 — historical integration handoff (2026-11-05)
+
+**Status: partial authority integration, not an executable protected TEAM release.**
+Work remained in the requested dependency order. The production Shared authority
+adapter now uses existing product records; complete BootSources, runtime entry
+contexts, PTY, and Claude/D8 full-chain tests are still unfinished. No commit,
+merge, release, local gateway/CLI/agent build, workspace build, or `cargo fmt` was
+performed. Existing rounds 1–3 remain uncommitted in this same supplied worktree;
+this session created no additional worktree. No contract wire format, canonical
+bytes, or hard limit changed.
+
+#### Authority and cancellation changes
+
+- `users.db/auth_meta` now holds a stable installation tenant UUID and monotonic
+  isolation policy epoch, initialized together by the existing UserDb migration.
+  No new database, table, synthetic background user, or parallel ACL store was
+  introduced. A missing single key, corrupt UUID, or corrupt epoch is refused;
+  only a legacy database missing both keys gets the initial pair.
+- The read-only auth snapshot uses the existing transactional active-user,
+  direct/team/manager access and ACL-generation calculation. Human runs need a
+  completed login, no forced password change, Operator-or-higher employee access,
+  and the credential epoch authenticated at ingress. Background runs explicitly
+  have no human; their tenant and ACL generation remain live-checked.
+- G's existing `confirmed_employees` allocation index now pins the tenant beside
+  its receipt. Every lookup rechecks the Applied confirmation and root UID/quota
+  receipt. An active legacy row without a tenant cannot be silently backfilled;
+  disable it and approve a fresh employee allocation. A disabled employee ID
+  cannot be resurrected or transferred. Compensation may disable an unpinned
+  row without assigning it a tenant.
+- `GatewayAuthority` rechecks the live employee registry, auth snapshot, complete
+  strict policy digest, tenant pin and A's original authenticated control/run
+  status. Boot occurs after UserDb and MethodHandler's registry initialization.
+  Both the registry and current effective policy file must say Active. Registry
+  `try_read` contention refuses validation and may revoke a connection during a
+  rescan; it does not reuse a cached allow. Personal lifetime bindings and
+  connector-to-tenant grants still have no production adapter and are refused.
+- Epoch-local employee/run maps are bounded to 4096; they are associations, not
+  durable authority. Prepared policy revisions are unique local counters, not
+  truncated hashes. Verification compares the full digest and durable epoch;
+  the epoch is read again after digest/root Status I/O. Run registration occurs
+  after reservation and before D issues a capability. Revocation and cancellation
+  clean up a late blocking registration through RAII and a cancellation latch.
+- Core org/preset/bootstrap writers, dashboard config/agent/contract writes,
+  Google config commits, custom redaction writes and changed resolved-preset
+  artifacts fence the existing users.db epoch before publication. Restoring A
+  after A→B→A cannot restore the old epoch. A failed write may conservatively
+  revoke extra runs. The CLI org-sync and preset bind/unbind/install-builtin
+  entries run existing auth migration after their operator gates, so a legitimate
+  standalone command can upgrade a legacy store before gateway startup. Other
+  onboard/scaffold/expert creation flows have not had equivalent legacy-entry
+  coverage added. Direct external edits do not get an epoch bump; the live digest
+  catches a persistent change, but transient external A→B→A is not covered.
+- Policy fencing rejects a symlink database leaf. It resolves the trusted parent
+  first because SQLite NOFOLLOW also rejects macOS's ordinary `/var` ancestor
+  symlink. Missing databases stay missing; missing/corrupt metadata is not repaired
+  by the fence. Tests cover both parent and leaf cases.
+- A shared bounded blocking verifier (16 jobs; 2-second permit wait; 10-second
+  result deadline) keeps root/SQLite reads off Tokio's reactor. Cancelled jobs
+  retain their permit until completion. Each connection allows one authority
+  read at a time; its watcher is polled independently of request deadlines and
+  EOF. Pending D grants are revoked if a cancelled blocking result is discarded.
+  Resource checks and host turn snapshots use the same off-reactor path. The
+  connector client's remaining synchronous checks are not all converted; the
+  production connector grant adapter currently refuses those routes.
+
+These are source and unit-level properties. Full prepared-run A→B→A/racing-root-
+Status execution tests, actual authenticated ingress capture and formal Daybreak
+security sign-off remain pending. The independent ordinary review found and
+rechecked fixes for tenant transfer, watcher starvation and legacy standalone
+CLI migration; its final read found no new HIGH/CRITICAL in the reviewed scope.
+
+#### Remaining work, in required order
+
+1. Finish production authority integration: ingress/dispatch must construct
+   `LaunchInput` with the actual authenticated credential epoch, principal,
+   bounded tool/resource grants and `HostTurn` (turn ID, approval session,
+   metadata, principal context). Do not reconstruct missing values from employee
+   payloads or environment. Personal bindings, connector ownership and the
+   utility-runner association remain absent. Audit remaining policy writers and
+   exercise complete run revocation across real writes and root Status races.
+2. Complete BootSources with real `ExecutionPlanFactory` and `WorkerPlanFactory`.
+   Only fixtures and the resource-checking wrapper implement these traits today.
+   The CLI's `require_complete_services` must remain enforced: partial factories,
+   `ListingPlans`, or fabricated support flags cannot establish readiness.
+3. After boot services compile, wire Claude, Codex, Grok, generic CLI and
+   openai-compat separately through `prepare_launch` and the scoped execution
+   context. Their MCP config must use D's root-published shim, preserving the
+   exact per-runtime fd-3 acceptance and sealed projection. No runtime call site
+   was connected in this round.
+4. Pass PTY through A→B1→B2 with its descriptor roles, status/resize, cancellation
+   and teardown. No PTY-chain implementation was added this round.
+5. Write the real ignored Claude and D8 `iso_root_e2e_*` tests: one authenticated
+   D tool call; actual process uid/namespaces/cgroup/fd evidence; a second run
+   waiting for an empty first cgroup including double-fork residue; self-dispatch
+   returning WouldDeadlock. **These full-chain tests still do not exist.** The
+   existing publication/receipt/account tests below are narrower and cannot be
+   reported as substitutes.
+
+The missing execution routes (22), after the CLI overrides and documented host
+refusals, are `create_task`, `spawn_agent`, `spawn_ephemeral`, `execute_program`,
+`office_script`, `fork_run`, `inspect_branches`, `diff_branches`, `merge_or_select`,
+`terminate_branch`, `fork_cost`, `discovery_catalog`, `discovery_list`,
+`discovery_tree`, `discovery_artifact`, `discovery_cancel`, `browser_record_start`,
+`browser_record_stop`, `code_map`, `hardware_info`, `model_search`, `model_recommend`.
+The missing worker routes (18) are `skill_extract`, `shared_skill_adopt`,
+`skill_from_recording`, `skill_security_scan`, `skill_graduate`,
+`skill_synthesis_run`, `skill_hub_install`, `skill_curator_status`,
+`transcribe_audio`, `meeting_transcribe`, `meeting_upload_link`,
+`meeting_transcribe_status`, `meeting_transcribe_cancel`, `synthesize_speech`,
+`knowledge_add_source`, `web_fetch_cached`, `web_extract`, `route_query`.
+
+For execution, reuse `GatewayPublication::read(gateway_gid)?.policy()?.derive(...)`
+for root policy, but first provide an actual tool→registered-runtime/helper-input
+mapping and extract the original handler's no-effect authorization/plan API.
+Native command argv or invented runtime IDs are not root authority. For workers,
+reuse `install_worker_services` and E's actual fd parsers, then implement
+handler authorization → authorized File → ParseRequest → existing result/write
+APIs. Status/cancel tools cannot be represented by fabricated parser input.
+TranscribeAudio/SynthesizeSpeech/LoadModel/LocalInference wire enum variants do
+not establish parser implementations; the inspected E engine does not implement
+those operations. Detailed source pointers are also preserved in
+`/private/tmp/iso-i1-r4-factory-prerequisites.md`.
+
+#### Round-4 file handoff
+
+Paths below are under `crates/` unless stated otherwise; inherited round-1–3
+changes outside this list were preserved.
+
+| File | Round-4 change |
+| --- | --- |
+| `duduclaw-auth/src/isolation.rs` | Existing users.db initialization and live read-only authority snapshot. |
+| `duduclaw-auth/src/isolation_tests.rs` | Tenant, human ACL/epoch, corruption and legacy-migration regressions. |
+| `duduclaw-auth/src/db.rs` | Initialize tenant/epoch through normal schema migration. |
+| `duduclaw-auth/src/org.rs` | Reuse effective-access calculation within the caller's transaction. |
+| `duduclaw-auth/src/lib.rs` | Export authority snapshot API. |
+| `duduclaw-core/src/isolation_policy.rs` | Durable pre-write epoch fence, with no database creation. |
+| `duduclaw-core/src/isolation_policy_tests.rs` | Writer ABA, corruption, no-create and symlink regressions. |
+| `duduclaw-core/src/org_store.rs` | Fence org publication under its writer lock. |
+| `duduclaw-core/src/preset.rs` | Fence preset bindings and installed operator preset writes. |
+| `duduclaw-core/src/config.rs` | Fence minimal config publication. |
+| `duduclaw-core/src/lib.rs` | Export policy fence. |
+| `duduclaw-core/Cargo.toml`, root `Cargo.lock` | Reuse already-locked workspace rusqlite; no dependency version change. |
+| `duduclaw-agent/src/registry.rs` | Fence changed/removing resolved preset artifact; unchanged bytes do not bump. |
+| `duduclaw-cli/src/isolation_policy_init.rs` | Operator-only callers' existing-auth migration helper and tests. |
+| `duduclaw-cli/src/preset_cmd.rs` | Migration preparation and install-builtin operator guard. |
+| `duduclaw-cli/src/lib.rs` | Register helper; prepare non-dry-run org sync. |
+| `duduclaw-cli/src/mcp_isolation.rs` | Async resource checks and owned turn resolver. |
+| `duduclaw-cli/src/mcp_isolation_identity.rs` | Adjust turn-scope callers/tests. |
+| `duduclaw-cli/src/mcp_isolation_resources.rs` | Offload connector/resource reads from reactor. |
+| `duduclaw-gateway/src/approval/policy_snapshot.rs` | Strict parsed/active authority digest and regressions; legacy digest unchanged. |
+| `duduclaw-gateway/src/approval/binding.rs`, `approval/mod.rs` | Export strict revision entry. |
+| `duduclaw-gateway/src/handlers/migration_authority_employee.rs` | Tenant pin on existing allocation index; live root readback and tests. |
+| `duduclaw-gateway/src/handlers/config_commit.rs` | Fence known authority targets before publish, with writer regression. |
+| `duduclaw-gateway/src/google_identity/home_source.rs` | Fence both actual Home config commit paths. |
+| `duduclaw-gateway/src/redaction_custom_rules.rs` | Fence custom redaction publication/deletion. |
+| `duduclaw-gateway/src/isolation_mcp/authority.rs` | Production Shared authority, bounded run associations, live epoch/status checks. |
+| `duduclaw-gateway/src/isolation_mcp/launch.rs` | Cancel-safe authority registration around ProtectedMcpLaunch. |
+| `duduclaw-gateway/src/isolation_mcp/boot.rs` | Construct authority from existing UserDb/registry; still refuse missing factories. |
+| `duduclaw-gateway/src/isolation_mcp.rs` | Bounded async sweep, exports and non-Linux boot signature. |
+| `duduclaw-gateway/src/server.rs` | Boot authority after existing auth and employee registry initialization. |
+| `duduclaw-gateway/src/isolation_egress.rs` | One host turn snapshot off reactor; regression source added. |
+| `duduclaw-gateway/src/isolation_resources.rs`, `isolation_connectors.rs` | Consume BindingAuthority rather than a second durable BindingStore. |
+| `duduclaw-mcp-boundary/src/bindings.rs` | BindingAuthority abstraction; preserve fixture store adapter. |
+| `duduclaw-mcp-boundary/src/authority.rs`, `authority_async_tests.rs` | Bounded verifier, per-connection serialization and Linux regressions. |
+| `duduclaw-mcp-boundary/src/server.rs` | Independent watcher/deadline/EOF polling and fresh dispatch checks. |
+| `duduclaw-mcp-boundary/src/protected_launch.rs` | Cancellation-safe pending grants and off-reactor issue/activation. |
+| `duduclaw-mcp-boundary/src/tool_policy.rs`, `tool_policy_tests.rs` | Async resource authorization and current-thread regression. |
+| `duduclaw-mcp-boundary/src/factories.rs`, `worker_execution.rs` | Await live resource authorization around effects. |
+| `CHANGELOG.md`, this document | Current status, evidence limits and next exact commands. |
+
+#### Round-4 validation actually performed
+
+All local Cargo commands used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`. Gateway,
+CLI and agent packages were not built. Standalone harnesses use actual changed
+source files through `#[path]`, with unrelated gateway APIs stubbed; they are not
+full-package validation. No Linux root test was executed this round.
+
+| Command/selection | Result |
+| --- | --- |
+| `cargo test -p duduclaw-mcp-boundary --features binding-store,execution-integration --offline` | **66 library + 1 bridge passed**, 0 failed; Linux-only tests excluded on macOS. |
+| `cargo test -p duduclaw-auth isolation_authority --lib` | **8 passed**, 0 failed, with the default macOS TMPDIR. |
+| `cargo test -p duduclaw-auth org::tests --lib` | **30 passed**, 0 failed. |
+| `cargo test -p duduclaw-core isolation_policy --lib --offline` | **7 passed**, 0 failed. |
+| `cargo test -p duduclaw-core org_store --lib` | **19 passed**, 0 failed. |
+| `cargo test -p duduclaw-core preset::tests --lib` | **23 passed**, 0 failed, 1 pre-existing ignored. |
+| `cargo test -p duduclaw-core config::tests --lib` | **13 passed**, 0 failed. |
+| Standalone actual policy_snapshot source | **6 passed**, 0 failed; payload hashing helper is stubbed. |
+| Standalone actual G employee authority source | **2 passed**, 0 failed; no root ReadBack executed. |
+| Standalone actual CLI policy-init helper | **3 passed**, 0 failed; no CLI crate build. |
+| Linux all-target core/auth/boundary check | Passed, with boundary binding-store/execution-integration. |
+| Windows all-target boundary check | Passed; no Windows execution or link, core/auth not checked on Windows this round. |
+| Linux actual boot/authority/launch source harness | Passed with worker feature and without worker feature; unrelated gateway services are stubs. |
+
+Intermediate failures were not hidden: the initial Linux harness needed an
+available target C compiler for aws-lc (then passed using the existing Zig
+wrapper), and SQLite NOFOLLOW initially rejected `/var` ancestors (6 auth tests
+passed, 2 failed). Canonicalizing only the trusted parent fixed the actual code;
+the default-temp auth rerun passed all 8 and the explicit parent/leaf regression
+passed. No lockfile version workaround was used.
+
+Logs: `/private/tmp/iso-i1-r4-resource-authority-tests.log`,
+`iso-i1-policy-legacy-auth-final.log`, `iso-i1-r4-auth-org-tests.log`, `iso-i1-r4-core-final-tests.log`,
+`iso-i1-policy-epoch-org.log`, `iso-i1-policy-epoch-preset.log`,
+`iso-i1-policy-epoch-config.log`, `iso-i1-r4-policy-final-tests.log`,
+`iso-i1-r4-employee-check.log`, `iso-i1-cli-policy-helper-harness.log`,
+`iso-i1-r4-final-linux-check.log`, `iso-i1-r4-final-windows-check.log`,
+`iso-i1-r4-live-registry-check.log`, `iso-i1-r4-boot-no-worker-check.log`.
+Harness directories: `/private/tmp/iso-i1-r4-boot-check`,
+`/private/tmp/iso-i1-r4-employee-check`,
+`/private/tmp/iso-i1-cli-policy-helper-harness`.
+
+The existing spawn checker still reports the same 34 inherited unclassified
+functions in this worktree (`/private/tmp/iso-i1-r4-spawn-inventory-before.log`).
+Per the owner, I2 already fixed these on the integration branch; this round did
+not redo or edit their inventory entries. No new process-launch site was added.
+The new `verify_blocking` call runs bounded host verification on Tokio's blocking
+pool; it does not launch an employee process and is not a scanner process site.
+Final `git diff --check` passed. Full gateway/CLI compilation remains the remote
+builder's next check; the local compiling state is limited to the small crates
+and explicitly scoped source harnesses above.
+
+#### Exact remote compile and regression commands (not run here)
+
+Use the Linux builder for the actual packages before root acceptance. The
+standalone harness does not replace these checks. Preserve the acceptance
+builder's normal feature flags and lower jobs if sharing its memory budget.
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo check -p duduclaw-gateway -p duduclaw-cli --all-targets
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib isolation_mcp::authority::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib approval::policy_snapshot::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib handlers::migration_authority::employee::isolation_tenant_tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib \
+  handlers::config_commit::tests::isolation_policy_replacement_fences_all_authority_targets_before_publish \
+  -- --exact --nocapture
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib \
+  isolation_egress::tests::isolated_turn_snapshot_runs_once_off_the_reactor_thread -- --exact
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-cli --lib isolation_policy_init::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-cli --lib mcp_isolation_identity
+```
+
+These boundary tests are unprivileged Linux regressions, **not ignored root
+acceptance**. Require nonzero matched tests (the async module contains three):
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-mcp-boundary \
+  --features binding-store,execution-integration authority::async_tests -- --nocapture
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-mcp-boundary \
+  --features binding-store,execution-integration \
+  protected_launch::tests::pending_guard_drop_revokes_issued_capability -- --exact
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-mcp-boundary \
+  --features binding-store,execution-integration \
+  protected_launch::tests::cancelled_blocking_handoff_drops_pending_capability -- --exact
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-mcp-boundary \
+  --features binding-store,execution-integration \
+  tool_policy::tests::async_resource_authority_is_fresh_and_off_the_reactor_thread -- --exact
+```
+
+The three async test names are
+`authority::async_tests::slow_authority_does_not_starve_request_deadline_or_delay_revocation`,
+`authority::async_tests::slow_authority_idle_eof_revokes_without_waiting_for_blocking_job`,
+and `authority::async_tests::cancelled_verification_retains_connection_slot_until_work_finishes`.
+
+#### Exact existing root e2e commands and acceptance-runner convention
+
+Only run on the provisioned disposable Linux acceptance VM, from a root shell.
+The installed signed publication, live units, storage, exact-runtime acceptance
+and confirmed employee prerequisites in the spawnd README remain mandatory.
+The third command needs `ISO_INSTALLED_RUN_ID` from an **already real run**; it
+reads its receipt and does not launch Claude. The fourth needs the dedicated
+control account, root-owned SSH key/known-host fixtures and actual services
+specified in `crates/duduclaw-spawnd/README.md`.
+
+```sh
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --lib \
+  installed::root_acceptance::iso_root_e2e_installed_publication_signed_policy_and_gateway_consumer \
+  -- --ignored --exact --test-threads=1 --nocapture
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --lib \
+  installed::root_acceptance::iso_root_e2e_installed_publication_live_install_evidence \
+  -- --ignored --exact --test-threads=1 --nocapture
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --lib \
+  installed::root_acceptance::iso_root_e2e_installed_publication_actual_run_mcp_receipt \
+  -- --ignored --exact --test-threads=1 --nocapture
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --lib \
+  installed::account_root_acceptance::iso_root_e2e_installed_account_real_denials \
+  -- --ignored --exact --test-threads=1 --nocapture
+```
+
+For prebuilt executables, use the supplied `accept/build.sh`/push convention and
+place `exes.txt` at `/home/lizhixu/wt/iso-accept/exes.txt`. On the VM, with
+`ISO_EGRESS_ECHO_ADDR` and the fixture variables above exported, the supplied
+`runall.sh` can select exactly these existing four tests:
+
+```sh
+bash runall.sh /home/lizhixu/wt/iso-accept/i1-r4 \
+  '^installed::(root_acceptance::iso_root_e2e_installed_publication_(signed_policy_and_gateway_consumer|live_install_evidence|actual_run_mcp_receipt)|account_root_acceptance::iso_root_e2e_installed_account_real_denials)$'
+```
+
+Require exactly four summary rows, each with `test result: ok. 1 passed` in its
+raw log. The runner supplies the disposable marker, storage root, serial exact
+selection and 600-second timeout. Zero selected tests, receipt-only checks and
+account denials do not satisfy the absent Claude/D8 full-chain gate. There is no
+honest exact full-chain filter to provide until those tests are implemented.
+
+### Round 5 — current integration handoff (2026-11-05)
+
+**PARTIAL: production Claude end-to-end execution is not closed.** The existing
+rounds 1–4 changes remain uncommitted. This round added the root-published Claude
+main plan, the protected launch consumer in both Claude streaming paths, explicit
+refusals for the other four runtimes, and two ignored root-chain tests. It did
+not complete the production MCP tool factories or authenticated ingress. The
+composite gate still refuses protected TEAM work. No gateway-UID fallback was
+added, no readiness field was changed to Ready, and no tool-completeness check
+was weakened. Neither new root test was executed.
+
+The owner's requested ordering was Claude first, then the other runtimes, then
+PTY. Claude's complete production path remains the first outstanding item. The
+other runtimes received only the requested fail-closed entry fences; PTY was not
+started. There is no contract wire-format/canonical-byte/hard-limit change, no
+new dependency version, no commit, and no local gateway/CLI/workspace build or
+`cargo fmt`. Work stayed in the supplied worktree; no worktree was created.
+
+#### What changed in this round
+
+Paths in this table are relative to `crates/` unless stated otherwise. Entries
+name this round's edits only, not all inherited dirty files.
+
+| File | Round-5 change |
+| --- | --- |
+| `duduclaw-spawnd/src/gateway_plan.rs` (new) | `InstalledMainPlanFactory`, fresh generation-pinned root policy read, exact signed Claude input protocol, pure plan tests. This is a main-process factory, **not** D's MCP `ExecutionPlanFactory`. |
+| `duduclaw-spawnd/src/lib.rs` | Expose the Linux main-plan module, with pure tests available on the development host. |
+| `duduclaw-gateway/src/isolation_mcp/boot.rs` | Fill and retain `main_plans` from verified generation/real gateway GID; report `MainPlans` when absent; derive a Claude plan only for the confirmed employee under the same gateway home. Existing E `RetiringLauncher` injection remains intact. |
+| `duduclaw-gateway/src/isolation_mcp/runtime.rs` (new) | One-shot host `RuntimeAuthorization`, protected A/D launch context, concurrent bounded stdin delivery, cancellation ownership, five source-level tests. |
+| `duduclaw-gateway/src/isolation_mcp.rs` | Linux-only runtime module and host-only authorization scope export. |
+| `duduclaw-gateway/src/claude_runner.rs` | Protected Claude consumer in the shared stream reader; skip legacy MCP/hook preparation and native credential/command path; refuse unsupported execution options. Local stream callers and cancellation test retain their existing path. |
+| `duduclaw-gateway/src/channel_reply/cli_env.rs` | Protected Claude consumer retaining the channel stream parser, thinking, usage attribution and trajectory handling; skip legacy credential/MCP/hook/system-temp preparation; observe input completion before success. |
+| `duduclaw-gateway/src/runtime/isolation_gate.rs` (new) | Named terminal operator-facing refusal for unfinished runtimes; two pure source tests. |
+| `duduclaw-gateway/src/runtime/{mod,codex,grok,generic_cli,openai_compat}.rs` | Register the gate; refuse all seven execution/streaming entry points before native credentials, configuration, network or PTY work. |
+| `duduclaw-spawnd/tests/claude_chain.rs` (new) | Real installed A/B1/B2/Claude/shim/D transport acceptance with a test-only D callback and authority. |
+| `duduclaw-spawnd/tests/d8_chain.rs` (new) | Real double-fork residue, queueing, self-wait refusal, process identity and independent unit/cgroup retirement observations. |
+| `duduclaw-spawnd/src/bin/d8-fixture.rs` (new) | Explicit-feature, debug-only ELF that must be separately signed into the disposable acceptance generation. |
+| `duduclaw-spawnd/Cargo.toml` | Linux test dependencies using existing versions, fixture feature and binary target. |
+| `Cargo.lock` (repository root) | Record the spawnd test dependency edges to execution/Tokio using existing locked versions; retain inherited lockfile changes. |
+| `duduclaw-spawnd/tests/README.md` (new) | Exact signed prerequisites, root commands, copied-executable convention and evidence limits. |
+| `scripts/ci/privileged_effects.json` (repository root) | Classify the three new constructor/backend/fork sites; leave the 34 inherited I2 inventory findings untouched. |
+| `docs/features/{,zh-TW/,ja-JP/}05-security-defense.md`, `CHANGELOG.md` (repository root) | Document the actual runtime refusal behavior and incomplete production status. |
+| `docs/architecture/native-linux-isolation.md` (repository root) | This handoff; Round 4 retained as historical evidence. |
+
+`InstalledMainPlanFactory::claude` rereads root publication for each plan and
+requires an exact generation and employee entitlement. The signed Claude argv
+must equal `gateway_plan::claude_arguments(model)`: text stdin, stream-json
+output, system prompt at `/proc/self/fd/5`, built-in tools disabled with
+`--tools ""`, only D MCP tools auto-approved, and strict `/config/mcp.json`.
+D appends its three fixed MCP arguments exactly once. Runtime resources,
+network and timeouts come from root publication. Native `Command` arguments
+and environment are never treated as authority. Model changes, extra flags,
+wrong employee, unsupported execution classes and input budgets are refused.
+The initial scope is non-PTY Claude, not the no-tool judge profile.
+
+The user prompt is sealed in fd 4 and delivered unchanged on stdin with EOF;
+the system prompt is a separate sealed attachment at fd 5. The gateway drains
+input concurrently with output, limits delivery to 30 seconds, kills the run
+on incomplete input, and observes writer completion before returning success.
+Cancellation drops both the managed child and writer. The root test checks an
+independent system nonce, so a user-prompt echo cannot impersonate fd 5 delivery.
+
+`RuntimeAuthorization` has no serde/environment/RPC constructor. An initiating
+host scope is consumed once, does not inherit into a new Tokio task, and cannot
+be replaced or revived by a nested scope. Both employee directory and gateway
+home must match. Missing authority, unsupported credential/env overrides,
+reasoning effort, explicit legacy MCP config, or channel session resume refuse
+with a terminal spawn-gate message. **There is currently no production ingress
+that constructs this scope.** The export is a consumer seam, not completed
+principal propagation. The root test uses its own explicitly marked authority.
+
+#### Remaining work, in dependency order
+
+1. **Production tool factories:** `BootSources.execution_plans` and
+   `worker_plans` still have no production producers. D's execution factory is
+   for MCP-triggered helpers, distinct from the new Claude main plan. The
+   existing dispatcher completeness check covers 22 A execution tools and 18 E
+   worker tools. Their real handler-to-plan adapters, registered helper runtime
+   publications and typed results must be implemented together. Do not return
+   unconditional `supports`, fabricate a no-op plan, narrow the advertised
+   inventory just to pass boot, or skip `require_complete_services`. E's actual
+   retirement-aware `WorkerLauncher` is already injected; the missing part is
+   its product operation/plan mapping, not another socket launcher.
+2. **Authenticated ingress:** construct the authorization from the original
+   verified channel/web user or approved background trigger and carry it across
+   the actual task/spawn boundaries. Populate fresh policy grants/resource
+   roots, `WaitOrigin`, caller, turn and authenticated epoch; do not infer an
+   anonymous background principal from an absent user. Scope only the target
+   employee invocation. Preserve approvals, delegation identity, cancellation,
+   budget attribution and terminal error handling.
+3. **Composite readiness:** replace `PendingIntegration` for parse worker, D
+   boundary and runtime adapters only after the corresponding real producers,
+   fresh service evidence and supported runtime policy exist. Current code
+   deliberately keeps these pending. A constructed main-plan object is not a
+   ready product or root acceptance receipt.
+4. **Production Claude acceptance:** run the new transport test with the exact
+   signed Claude input protocol, then exercise actual gateway boot, real ingress
+   and the original CLI product dispatcher with one real product tool. The
+   transport test's live-status test authority and nonce callback cannot close
+   that second acceptance requirement. Provider credentials/routing must be
+   provisioned through the approved isolation design; no gateway credential
+   environment is copied into the run.
+5. **Other runtimes:** reuse the protected launch path and signed runtime
+   configuration. Codex/Grok additionally need accepted home/config projections;
+   generic CLI needs its registered protocol, and openai-compat needs an
+   isolated API worker path. Their current explicit refusals are intentional.
+   Non-protected callers retain existing behavior.
+6. **PTY:** carry allocation, fd transport, terminal size, resize/input/output,
+   idle timeout, cancellation and retirement through A/B1/B2, with native tests.
+   No PTY integration or PTY acceptance was added this round.
+7. **Acceptance/review:** actual package compilation on the owner's remote
+   builder, both new root tests, complete product-path tests and formal Daybreak
+   security review remain required. Ordinary independent review found no new
+   CRITICAL/HIGH issue after fixes, but it was not Daybreak/security signoff.
+
+The tool-factory gap requires operation routing work, not just filling two
+constructors. A's `ExecutionToolBridge::execute` reserves `context.employee`,
+accepts only `EmployeeTool + Registered + !mcp + !pty`, and returns an accepted
+run handle. It cannot directly preserve a cross-employee delegation, store
+query or cancellation API. E's `WorkerToolBridge::validate_plan` requires an
+actual input `File` and parser result; job-control APIs have no such input.
+Do not manufacture a file or child process to satisfy these shapes.
+
+| Existing product operations | Concrete integration seam still missing |
+| --- | --- |
+| `mcp/bus_tasks.rs::handle_create_task`, `mcp/spawn.rs::handle_spawn_agent` / `handle_spawn_ephemeral` | Target-employee dispatch with original delegation, target ACL and background admission; a same-employee helper plan changes semantics. |
+| `mcp_fork.rs` run/inspect/diff/merge/terminate/cost; `mcp/discovery.rs::handle_discovery_query` | Split actual branch launches from authorized store/artifact reads, workspace promotion/CAS and existing-run cancellation. Preserve original handler authorization and record gates. |
+| `mcp/exec.rs` program/Office execution; `mcp_recording.rs` record start/stop; `mcp_memory_handlers.rs` code map; `mcp/inference.rs` hardware/model operations | Actual signed helper protocols, authorized workspace inputs and typed results; preserve skill/script/path/network policies and existing-run handle ownership. |
+| Skill lifecycle/hub/curator/recording-distill tools | Separate fetch, approval, parsing and publication; an archive parse result alone does not implement install or curator semantics. |
+| `mcp/meeting_tools.rs` upload/status/cancel; `mcp/media_tools.rs` transcription/TTS; `mcp/inference.rs` route query | Keep authenticated job control/provider credentials/pure routing on their appropriate host paths; isolate untrusted media processing. These are not all file-parser operations. |
+| `mcp/knowledge_client.rs` source ingestion; `mcp/web.rs` fetch/cache/extract | Reuse E knowledge/HTML parsing with host-owned descriptors while retaining collection/source authority, egress/SSRF/rate/cache policy and indexing/publication results. |
+
+Already reusable: root `GatewayPublication`/`RootPolicy::derive` for registered
+runtime entitlement, `RetiringLauncher`/`WorkerInvoke` for real worker lifetime
+and fd exchange, E's knowledge/table/document/archive adapters, `ResourceRoots`
+and `ResourceCheckedPlans`, and the original product dispatcher/approval gates.
+Selecting a correct authenticated gateway-control route is distinct from
+deleting a tool from completeness. That routing design and its regressions must
+be completed before these producer slots can truthfully close.
+
+#### Validation actually run
+
+| Check | Result and evidence |
+| --- | --- |
+| `cargo test -p duduclaw-spawnd --lib gateway_plan --offline` with 2 jobs/incremental off | **2 passed**, 0 failed; `/private/tmp/iso-i1-r5-main-plan-tests.log`. |
+| Actual `isolation_mcp/runtime.rs` in standalone source harness | **5 passed**, 0 failed; `/private/tmp/iso-i1-r5-runtime-tests.log`. Real core/execution/boundary dependencies, stub gateway boot/autonomy and spawn-error facade. This is not a gateway package build or product-path test. |
+| Actual `runtime/isolation_gate.rs` in standalone rustc harness | **2 passed**, 0 failed. Execution latch/error facade stubbed; pure refusal cases only. |
+| Actual boot/authority/launch/runtime sources in Linux source harness, `--all-targets`, worker feature on and off | **Both checks passed**; `/private/tmp/iso-i1-r5-boot-tests-check.log` and `iso-i1-r5-boot-no-worker-check.log`. Unrelated gateway services are stubs. |
+| Actual spawnd Claude/D8 tests and fixture, Linux cross-check | **Passed**, not executed; `/private/tmp/iso-i1-r5-chain-check.log`. |
+| Privileged-effect inventory | Still **34 inherited unclassified sites**; normalized site sets equal Round 4, no new unclassified site. This is not a passing full scanner result. `/private/tmp/iso-i1-r5-spawn-final.log`. |
+| `git diff --check` | Passed. |
+| Local gateway/CLI/workspace build; root execution | **Not run** per build limit / absent signed disposable acceptance setup. No actual Claude tool-call or D8 root pass is claimed. |
+
+The compiling state is bounded to the small crate/test targets and source
+harnesses above. The changed complete gateway modules, full package feature
+matrix and Windows/macOS gateway builds still need the remote build. The local
+Claude `--help` was inspected for the input/tools flags, but that does not prove
+the acceptance machine's signed CLI version or provider execution.
+
+Exact local commands used (source harnesses are temporary diagnostics):
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-spawnd --lib gateway_plan --offline
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 \
+  CARGO_TARGET_DIR="$PWD/target" cargo test \
+  --manifest-path /private/tmp/iso-i1-r5-runtime-tests/Cargo.toml --offline
+rustc --edition=2021 --test /private/tmp/iso-i1-r5-runtime-gate-harness.rs \
+  -o /private/tmp/iso-i1-r5-runtime-gate-harness
+/private/tmp/iso-i1-r5-runtime-gate-harness
+```
+
+For each of the following cross-check invocations, set the environment below.
+`/private/tmp` Zig caches are necessary on the restricted development host.
+
+```sh
+export CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0
+export CC_x86_64_unknown_linux_gnu=/private/tmp/iso-i1-zig-cc
+export AR_x86_64_unknown_linux_gnu=/private/tmp/iso-zig-ar
+export ZIG_GLOBAL_CACHE_DIR=/private/tmp/iso-i1-zig-global
+export ZIG_LOCAL_CACHE_DIR=/private/tmp/iso-i1-zig-local
+export CARGO_TARGET_DIR=/private/tmp/iso-i1-r3-target
+cargo check --manifest-path /private/tmp/iso-i1-r5-boot-check/Cargo.toml \
+  --all-targets --target x86_64-unknown-linux-gnu --offline
+cargo check --manifest-path /private/tmp/iso-i1-r5-boot-check/Cargo.toml \
+  --all-targets --no-default-features --target x86_64-unknown-linux-gnu --offline
+cargo check -p duduclaw-spawnd --test claude_chain --test d8_chain \
+  --bin duduclaw-spawnd-d8-fixture --features root-test-fixture \
+  --target x86_64-unknown-linux-gnu --offline
+```
+
+#### Exact remote compile and regression commands (not run here)
+
+Run on the Linux builder, not this development Mac. Keep the Round-4 regression
+commands as well. Require nonzero matches for each test filter; the new runtime
+modules contain five and two tests respectively.
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo check -p duduclaw-gateway -p duduclaw-cli --all-targets
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-spawnd --lib gateway_plan
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib isolation_mcp::runtime::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib runtime::isolation_gate::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib isolation_mcp::boot::tests
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib \
+  channel_reply::cli_env::thinking_tests::l1_stub_claude_thinking_flows_by_policy -- --exact
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p duduclaw-gateway --lib \
+  claude_runner::process_tree_cancellation_tests::webchat_claude_streaming_cancel_kills_grandchild -- --exact
+```
+
+#### New root-chain commands and evidence boundary
+
+Detailed prerequisites and cleanup semantics are in
+[`crates/duduclaw-spawnd/tests/README.md`](../../crates/duduclaw-spawnd/tests/README.md).
+These tests require an already provisioned **disposable** Linux host with the
+signed generation, idle confirmed employee, real gateway account, H image,
+live B1/F/egress services, exact accepted Claude/shim ELF and actual provider
+routing. The D8 debug fixture must be separately signed as
+`Registered("iso-d8-fixture-v1")`; no acceptance or signature is synthesized.
+
+The Claude test re-execs its driver as the real gateway UID with empty groups.
+It uses the production main-plan factory and runtime registry through
+A → spawnd → systemd → duduclaw-run → real Claude → real shim → D. Root verifies
+UID/GID, namespaces, cgroup, executable digests, MCP socket and sealed fd 4/5
+while a tool call is held. A test-only D echo callback checks independent user
+and system nonces and returns an unpredictable response that must appear in the
+Claude stream. It **does not** construct production gateway BootOwner or execute
+a real product tool handler.
+
+D8 uses a genuine double fork adopted by namespace PID 1. With init held by
+pidfd and the main process exited, the orphan remains alive and a second run
+must remain queued, have no I/O and refuse self-wait with `WouldDeadlock`.
+After resuming init, observation of the second process requires the first unit
+inactive and its cgroup empty via independent systemd readback, plus no employee
+UID processes outside the second cgroup. This is a bounded repeated observation,
+not a continuous trace of every teardown/admission transition. Panic cleanup
+resumes held init before retiring only the test's recorded units.
+
+Build on the acceptance builder (12 jobs follows its existing `build.sh`;
+reduce if that machine is shared):
+
+```sh
+CARGO_BUILD_JOBS=12 CARGO_INCREMENTAL=0 cargo test -p duduclaw-spawnd \
+  --features root-test-fixture --test claude_chain --test d8_chain --no-run
+CARGO_BUILD_JOBS=12 CARGO_INCREMENTAL=0 cargo build -p duduclaw-spawnd \
+  --features root-test-fixture --bin duduclaw-spawnd-d8-fixture
+```
+
+Run from root on the prepared disposable host; **not run in this round**:
+
+```sh
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd --test claude_chain \
+  iso_root_e2e_claude_installed_shim_tool_transport \
+  -- --ignored --exact --test-threads=1 --nocapture
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-spawnd \
+  --features root-test-fixture --test d8_chain \
+  iso_root_e2e_d8_double_fork_residue_blocks_second_run \
+  -- --ignored --exact --test-threads=1 --nocapture
+```
+
+For the supplied acceptance `build.sh`/`push.sh` convention, add
+`--features root-test-fixture` to the spawnd build, collect both test executables
+and the fixture in `exes.txt`, and preserve their absolute paths on the VM. The
+fixture digest check uses `CARGO_BIN_EXE_duduclaw-spawnd-d8-fixture`; changing its
+path breaks the test. With the runner's existing `ISO_EGRESS_ECHO_ADDR` and other
+required environment set:
+
+```sh
+bash runall.sh /var/tmp/iso-i1-r5-chain \
+  'iso_root_e2e_(claude_installed_shim_tool_transport|d8_double_fork_residue_blocks_second_run)$'
+```
+
+Require exactly two outer summary rows, each with `test result: ok. 1 passed`.
+Internal self-exec helpers intentionally have no `iso_root_` prefix and must not
+be selected independently. Passing these transport/retirement tests would still
+leave production factory/ingress acceptance and the other runtimes/PTY open.

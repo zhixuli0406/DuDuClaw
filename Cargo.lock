@@ -1935,6 +1935,7 @@ dependencies = [
  "minisign-verify",
  "percent-encoding",
  "portable-pty",
+ "rusqlite",
  "semver",
  "serde",
  "serde_json",
@@ -2064,6 +2065,7 @@ dependencies = [
  "duduclaw-core",
  "duduclaw-dashboard",
  "duduclaw-db",
+ "duduclaw-execution",
  "duduclaw-fork",
  "duduclaw-identity",
  "duduclaw-import",
@@ -2083,6 +2085,7 @@ dependencies = [
  "duduclaw-relay",
  "duduclaw-sandbox",
  "duduclaw-security",
+ "duduclaw-spawnd",
  "duduclaw-sysd",
  "duduclaw-updated",
  "ed25519-dalek",
@@ -2322,6 +2325,7 @@ dependencies = [
 name = "duduclaw-mcp-boundary"
 version = "1.79.3"
 dependencies = [
+ "duduclaw-execution",
  "duduclaw-isolation",
  "hmac",
  "libc",
@@ -2461,6 +2465,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "uuid",
+ "zbus",
  "zip",
 ]
 
@@ -2595,7 +2600,13 @@ dependencies = [
 name = "duduclaw-spawnd"
 version = "1.79.3"
 dependencies = [
+ "duduclaw-execution",
  "duduclaw-isolation",
+ "duduclaw-isolation-storage",
+ "duduclaw-mcp-boundary",
+ "duduclaw-migration",
+ "duduclaw-run",
+ "duduclaw-updated",
  "fs2",
  "libc",
  "nix 0.29.0",
@@ -2604,6 +2615,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+ "tokio",
  "zbus",
 ]
 

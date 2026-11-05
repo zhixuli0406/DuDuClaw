@@ -116,7 +116,7 @@ pub use workflow_grants::{
 };
 pub use binding::{
     CURRENT_DECISION_CONTEXT, DecisionContext, ExecutionBinding, RequestKind, payload_hash,
-    policy_revision, WORKFLOW_ACTIVATION_KIND,
+    policy_revision, strict_policy_revision, WORKFLOW_ACTIVATION_KIND,
 };
 pub use operations::{OPERATION_LEASE_HELD, OperationClaim, OperationRecord, OperationState};
 mod gates;

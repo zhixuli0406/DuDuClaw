@@ -90,6 +90,7 @@ impl MethodHandler {
             // Without it `[telemetry] otlp_endpoint` is accepted and saved but
             // exports nothing, so the settings page says so next to the field.
             "otel_compiled": cfg!(feature = "otel"),
+            "isolation_readiness": crate::isolation_readiness::status(),
         });
         let policy = crate::mfa::policy_status(&self.home_dir);
         if policy["degraded"] == true { payload["mfa_policy"] = policy; }

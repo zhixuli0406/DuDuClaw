@@ -48,8 +48,9 @@ pub enum ConfigDestination { RunConfig, RuntimeHome, WorkingDirectory }
 pub struct RuntimeProjection {
     pub registration: RuntimeRegistration,
     pub files: Vec<ProjectionFile>,
-    /// Fixed runtime arguments, appended by A's protected spawn adapter. These
-    /// never contain tokens, identity, host directories or caller-provided args.
+    /// Fixed runtime arguments, checked by A and independently required in B's
+    /// signed runtime registry; StartRun carries no argv. These never contain
+    /// tokens, identity, host directories or caller-provided args.
     pub arguments: Vec<String>,
     pub inherited_mcp_fd: i32,
 }
@@ -110,8 +111,8 @@ pub trait RuntimeBridgeRegistry: Send + Sync {
         projection: &RuntimeProjection) -> Result<ProjectionReceipt, VerificationError>;
 }
 
-/// Prepared value has no public constructor: only a fully matched root readback
-/// yields arguments/config that A may hand to its protected execution backend.
+/// Prepared value has no public constructor: only a fully matched post-start
+/// root readback permits D to activate the run's actual MCP endpoint.
 pub struct PreparedRuntimeBridge { projection: RuntimeProjection, receipt: ProjectionReceipt }
 impl PreparedRuntimeBridge {
     pub fn projection(&self) -> &RuntimeProjection { &self.projection }
@@ -162,7 +163,7 @@ pub fn runtime_projection(registration: RuntimeRegistration) -> Result<RuntimePr
             destination: ConfigDestination::RunConfig, relative_target: "mcp.json",
             contents: serde_json::json!({"mcpServers": {"duduclaw": server}}).to_string(),
         }], vec!["--strict-mcp-config".into(), "--mcp-config".into(),
-            "/run/duduclaw/config/mcp.json".into()]),
+            "/config/mcp.json".into()]),
         RuntimeKind::Codex => (vec![ProjectionFile {
             destination: ConfigDestination::RuntimeHome, relative_target: ".codex/config.toml",
             contents: format!("[mcp_servers.duduclaw]\ncommand = {command}\nargs = []\nenv_vars = []\ndefault_tools_approval_mode = \"auto\"\n"),

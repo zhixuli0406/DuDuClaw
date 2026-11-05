@@ -5,10 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+execution-integration = ["dep:duduclaw-execution"]
 binding-store = ["dep:rusqlite"]
 
 [dependencies]
 duduclaw-isolation.workspace = true
+duduclaw-execution = { workspace = true, optional = true }
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"

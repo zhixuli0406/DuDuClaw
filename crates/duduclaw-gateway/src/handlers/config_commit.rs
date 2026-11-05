@@ -407,6 +407,7 @@ fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)-
             }
         }
         let write = || {
+            fence_isolation_policy_path(path).map_err(|e| e.to_string())?;
             #[cfg(test)]
             if mfa_actor.is_some() {
                 MFA_BEFORE_REPLACE.with(|hook| {
@@ -545,12 +546,29 @@ fn changed_on_disk(path: &Path) -> String {
 /// extension for `toml.tmp`, which named a Markdown file's temp copy
 /// `SOUL.toml.tmp`.
 pub(crate) fn replace_owner_only(path: &Path, content: &str) -> std::io::Result<()> {
+    fence_isolation_policy_path(path)?;
     let tmp = tmp_path_for(path);
     write_owner_only(&tmp, content)?;
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    Ok(())
+}
+
+/// Increment the existing users.db authority epoch before publishing policy.
+/// Even a failed write may revoke a run; a later A -> B -> A edit must never
+/// restore an earlier capability merely because its content hash matches.
+fn fence_isolation_policy_path(path: &Path) -> std::io::Result<()> {
+    let name = path.file_name().and_then(|name| name.to_str());
+    let home = match name {
+        Some("config.toml" | "org.toml" | "KILLSWITCH.toml" | "preset_bindings.toml") => path.parent(),
+        Some("agent.toml" | "CONTRACT.toml") => path.parent().and_then(Path::parent)
+            .filter(|dir| dir.file_name().and_then(|name| name.to_str()) == Some("agents"))
+            .and_then(Path::parent),
+        _ => None,
+    };
+    if let Some(home) = home { duduclaw_core::isolation_policy::fence_change(home)?; }
     Ok(())
 }
 
@@ -821,6 +839,31 @@ pub(crate) fn prune_backups(dir: &Path, name: &str, keep: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn isolation_policy_replacement_fences_all_authority_targets_before_publish() {
+        let home = tempfile::tempdir().unwrap();
+        let users = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let epoch = || users.isolation_authority_snapshot(None, "alice").unwrap().policy_epoch;
+        for relative in ["config.toml", "org.toml", "KILLSWITCH.toml", "preset_bindings.toml",
+            "agents/alice/agent.toml", "agents/alice/CONTRACT.toml"] {
+            let path = home.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let before = epoch();
+            super::replace_owner_only(&path, "value='a'\n").unwrap();
+            super::replace_owner_only(&path, "value='b'\n").unwrap();
+            super::replace_owner_only(&path, "value='a'\n").unwrap();
+            assert_eq!(epoch(), before + 3, "{relative}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "value='a'\n");
+        }
+        let before = epoch();
+        super::replace_owner_only(&home.path().join("agents/alice/SOUL.md"), "text").unwrap();
+        assert_eq!(epoch(), before, "non-policy text must not use this fence");
+        let db = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        db.execute("DELETE FROM auth_meta WHERE key='isolation_policy_epoch'", []).unwrap();
+        let path = home.path().join("config.toml");
+        assert!(super::replace_owner_only(&path, "value='new'\n").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "value='a'\n");
+    }
     use super::*;
 
     // Added regression tests; not run in this change.

@@ -597,4 +597,5 @@ impl MethodHandler {
 mod mfa_rpc;
 mod migration_confirmations_rpc;
 mod migration_authority;
+pub(crate) use migration_authority::employee::resolve_confirmed_employee;
 pub(crate) use migration_authority::stage_import_proposals;

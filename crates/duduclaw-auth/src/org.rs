@@ -329,21 +329,28 @@ pub(crate) fn direct_bindings(conn: &Connection, user_id: &str) -> Result<BTreeM
 /// snapshot. `Ok(None)` when the user does not exist or is not Active.
 fn load_access(conn: &mut Connection, user_id: &str) -> Result<Option<(User, EffectiveAccess)>, String> {
     let tx = conn.transaction().map_err(|e| format!("read error: {e}"))?;
-    let generation = read_acl_generation(&tx)?;
-    let Some(user) = crate::user_row::load_user(&tx, user_id)? else {
+    let access = load_access_on(&tx, user_id)?;
+    tx.finish().map_err(|e| format!("read error: {e}"))?;
+    Ok(access)
+}
+
+/// Caller owns the read transaction, allowing additional authority facts to
+/// be read at exactly the same database snapshot.
+pub(crate) fn load_access_on(conn: &Connection, user_id: &str) -> Result<Option<(User, EffectiveAccess)>, String> {
+    let generation = read_acl_generation(conn)?;
+    let Some(user) = crate::user_row::load_user(conn, user_id)? else {
         return Ok(None);
     };
     if user.status != UserStatus::Active {
         return Ok(None);
     }
-    let direct = direct_bindings(&tx, user_id)?;
+    let direct = direct_bindings(conn, user_id)?;
     // Q2: only someone whose role can manage gets anything from a team.
     let team = if user.role.at_least(UserRole::Manager) {
-        team_grants_on(&tx, user_id)?
+        team_grants_on(conn, user_id)?
     } else {
         BTreeMap::new()
     };
-    tx.finish().map_err(|e| format!("read error: {e}"))?;
     let access = EffectiveAccess {
         user_id: user.id.clone(),
         role: user.role,

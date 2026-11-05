@@ -31,6 +31,8 @@ mod data_grants;
 mod departments;
 #[path = "migration_authority_config_receipt.rs"]
 mod config_receipt;
+#[path = "migration_authority_employee.rs"]
+pub(crate) mod employee;
 pub(crate) use accounts::GatewayAccountReadback;
 pub(crate) use categories::LiveAuthority;
 

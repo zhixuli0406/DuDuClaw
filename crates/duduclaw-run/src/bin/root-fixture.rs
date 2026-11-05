@@ -489,7 +489,7 @@ mod linux {
             "propagation"=>crate::propagation::run(root),
             "launch-elf"|"launch-script"|"launch-pty"|"launch-exec-failure"|
             "launch-forwarder-failure"|"launch-cancel"|"launch-cancel-startup"|"launch-teardown"|
-            "launch-supervisor-failure"=>launch::run(root,&scenario),
+            "launch-supervisor-failure"|"launch-fast-exit"=>launch::run(root,&scenario),
             _=>panic!("unknown test scenario"),
         }
     }

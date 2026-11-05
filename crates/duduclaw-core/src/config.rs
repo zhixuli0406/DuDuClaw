@@ -55,6 +55,7 @@ pub fn write_minimal_config(home: &Path, bind: &str, port: u16) -> Result<()> {
 
     let target = home.join("config.toml");
     let tmp = home.join("config.toml.tmp");
+    crate::isolation_policy::fence_change(home)?;
     std::fs::write(&tmp, content.as_bytes())?;
     std::fs::rename(&tmp, &target).map_err(|e| {
         // Best-effort cleanup so a failed rename doesn't leave the temp behind.

@@ -5,7 +5,7 @@ use duduclaw_isolation::{bounded::Text, egress::ProfileId, execution::{ResourceL
 use crate::{Result, admission::LaunchPolicy};
 
 /// Names relative to the verified runtime mount. Never PATH-resolved.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Executable {
     Elf { entry: Text<128>, digest: Sha256Digest },
     Script { interpreter: Text<128>, interpreter_digest: Sha256Digest,
@@ -14,7 +14,7 @@ pub enum Executable {
 
 /// Construct only from F's verified, root-published runtime manifest. This type
 /// deliberately has no Deserialize implementation and is not an IPC payload.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PublishedRuntime {
     pub runtime: RuntimeKind,
     pub profile: ProfileId,

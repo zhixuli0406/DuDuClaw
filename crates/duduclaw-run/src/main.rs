@@ -2,10 +2,10 @@
 fn main() {
     #[cfg(target_os = "linux")]
     {
-        // PID 1 invokes this binary with no arguments. B1 must replace the explicit
-        // unavailable adapter with its root-owned registry integration before use.
+        // PID 1 invokes this binary with no arguments. Authority arrives only
+        // over the root-created bootstrap socket as a sealed, nonce-bound plan.
         // SAFETY: a fresh single-threaded binary; serve owns the whole process.
-        unsafe { duduclaw_run::linux::runner::serve(&mut duduclaw_run::linux::bootstrap::UnavailableRegistry) }
+        unsafe { duduclaw_run::linux::runner::serve(&mut duduclaw_run::linux::sealed_registry::SealedRegistry::default()) }
     }
     #[cfg(not(target_os = "linux"))]
     {

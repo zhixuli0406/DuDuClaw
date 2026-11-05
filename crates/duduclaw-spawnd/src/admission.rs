@@ -63,6 +63,9 @@ pub trait Host {
     fn forget(&mut self, run: RunHandle) -> Result<()>;
     /// Adapter background work; never called on the control socket thread.
     fn maintenance(&mut self) -> Result<()> { Ok(()) }
+    fn allocation(&mut self, _: &duduclaw_migration::allocation::Request) -> Result<duduclaw_migration::allocation::Receipt> {
+        Err(ErrorCode::IsolationUnavailable)
+    }
 }
 
 #[derive(Clone)]

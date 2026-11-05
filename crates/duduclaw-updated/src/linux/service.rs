@@ -19,6 +19,9 @@ pub fn accounts() -> Result<(u32, u32, Downloader)> {
     if gateway.uid.as_raw() == 0 || gateway.gid.as_raw() == 0 || gateway.uid == downloader.uid { return Err(Error::Maintenance); }
     Ok((gateway.uid.as_raw(), gateway.gid.as_raw(), Downloader::new(downloader.uid.as_raw(), downloader.gid.as_raw())?))
 }
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Incoming { Update(UpdateRequest), Probe(crate::readiness::ProbeRequest) }
 struct Service { state: State, disk: state::FailClosedDisk<Directory>, working: bool }
 impl Service {
     fn mutate<T>(&mut self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
@@ -62,8 +65,27 @@ pub fn run(slot: UpdateSlot) -> Result<()> {
     if let Some((id, version)) = recovery { start_worker(Arc::clone(&shared), id, version); }
     loop {
         let fd = match transport::accept(&listener, gateway_uid, gateway_gid) { Ok(fd) => fd, Err(_) => continue };
-        let request: UpdateRequest = match transport::receive(&fd) { Ok(r) => r, Err(_) => continue };
-        let UpdateRequest::V1(request) = request;
+        let request: Incoming = match transport::receive(&fd) { Ok(r) => r, Err(_) => continue };
+        let request = match request {
+            Incoming::Update(UpdateRequest::V1(request)) => request,
+            Incoming::Probe(request) => {
+                let evidence = (|| -> Result<crate::readiness::GenerationEvidence> {
+                    if request.readiness_schema != crate::readiness::READINESS_SCHEMA || request.nonce.0 == [0; 16] {
+                        return Err(Error::Invalid);
+                    }
+                    let service = shared.lock().map_err(|_| Error::Maintenance)?;
+                    if service.working || service.disk.poisoned() { return Err(Error::Maintenance); }
+                    let root = load_trust()?;
+                    super::launcher::verify_executing_slot(&service.state, slot, &root)?;
+                    let (digest, manifest) = verified_state_generation(&service.state, false)?;
+                    Ok(crate::readiness::GenerationEvidence { generation: digest, product: manifest.product,
+                        version: manifest.version, protocols: manifest.protocols })
+                })().ok();
+                let _ = transport::send(&fd, &crate::readiness::ProbeResponse {
+                    readiness_schema: crate::readiness::READINESS_SCHEMA, nonce: request.nonce, evidence });
+                continue;
+            }
+        };
         let mut service = shared.lock().map_err(|_| Error::Maintenance)?;
         let mut start = None;
         let response = match request {
@@ -146,6 +168,35 @@ fn verify_artifacts(generation: &Directory, manifest: &ReleaseManifest) -> Resul
         super::files::verify_fd(file, artifact.size_bytes, artifact.sha256)?;
     }
     generation.sync()
+}
+/// Read-only root publication: verify trust, immutable installed bytes, and the
+/// committed selector. This proves F's generation, not NSS/SSH or mount policy.
+pub fn verified_committed_generation() -> Result<(Sha256Digest, ReleaseManifest)> {
+    let disk = Directory::open(Path::new(STATE_ROOT))?;
+    let before: State = disk.json("state.json")?;
+    let result = verified_state_generation(&before, true)?;
+    let after: State = disk.json("state.json")?;
+    after.validate()?;
+    if after.effective_digest() != result.0 || after.pending.is_some() || after.maintenance || after.resume_required {
+        return Err(Error::Maintenance);
+    }
+    Ok(result)
+}
+fn verified_state_generation(state: &State, verify_all_artifacts: bool) -> Result<(Sha256Digest, ReleaseManifest)> {
+    state.validate()?;
+    if state.maintenance || state.pending.is_some() || state.resume_required { return Err(Error::Maintenance); }
+    let digest = state.effective_digest();
+    if super::activation::read_current()? != digest { return Err(Error::Maintenance); }
+    let (generation, bytes, signature) = installed_generation(digest)?;
+    let manifest = super::trust_admin::verify_recorded(&bytes, &signature)?;
+    if manifest.product != state.product || manifest.arch != state.arch
+        || manifest.version != state.running_version.unwrap_or(state.floor) { return Err(Error::Incompatible); }
+    // Clean service boot already verified every artifact. A health request
+    // rechecks signed identity and the executing updater rather than hashing up
+    // to 8 GiB under the service lock on every gateway readiness tick.
+    if verify_all_artifacts { verify_artifacts(&generation, &manifest)?; }
+    if super::activation::read_current()? != digest { return Err(Error::Maintenance); }
+    Ok((digest, manifest))
 }
 fn recover_committed(shared: &Arc<Mutex<Service>>) -> Result<()> {
     let (committed, pending, resume) = {

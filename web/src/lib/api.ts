@@ -338,7 +338,17 @@ export interface DoctorCheck {
 /** Product form-factor, orthogonal to the license `edition` string. */
 export type EditionProfile = 'personal' | 'enterprise';
 
+export type IsolationComponentState = 'ready' | 'unavailable' | 'pending_integration';
+export interface IsolationReadiness {
+  required: boolean;
+  ready: boolean;
+  components: Record<'launch_service' | 'sandbox' | 'network' | 'storage' |
+    'parse_worker' | 'update_service' | 'mcp_boundary' | 'runtime_adapters', IsolationComponentState>;
+}
+
 export interface SystemStatus {
+  /** Protected Linux TEAM evidence; absent/null on other installations. */
+  isolation_readiness?: IsolationReadiness | null;
   mfa_policy?: import('./mfa-api').MfaPolicy;
   version: string;
   uptime_seconds: number;

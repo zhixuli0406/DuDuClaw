@@ -5685,6 +5685,104 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/installed_account_root_tests.rs::Harness::run",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored disposable-root installed-account acceptance only: bounded real SSH/su/user-manager/crontab/at attempts with positive controls and cleanup; never linked into production."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/spawnd/transport.rs::tests::live_status_waits_for_existing_transaction_and_reads_its_own_reply",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "thread_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Round 3 regression creates one scoped Rust thread to verify status-query transaction ordering; no OS process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-parse-worker/src/retirement.rs::DropforSession::drop",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "thread_spawn"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "Production worker-session teardown starts one bounded 40-second Rust thread to poll exact systemd retirement and retain the durable input lease until proven empty; no OS process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/isolation_readiness.rs::start_update_probe",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "thread_spawn"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "I1 background Rust thread serially probes the fixed authenticated updater socket and refreshes expiring readiness evidence; thread creation does not launch an OS child process."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/allocation.rs::serve",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "thread_spawn"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "not_process",
+      "rationale": "I1 root-daemon Rust listener thread authenticates bounded allocation IPC and forwards typed work to the existing lifecycle worker with a four-second response bound; this spawn starts a thread, not an OS child process."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/claude_runner.rs::call_claude_with_env",
+      "apis": {
+        "command_constructor": 1
+      },
+      "identity": "employee",
+      "migration": "backend",
+      "effects": [
+        "process_spawn"
+      ],
+      "rationale": "Protected Claude marker builder is consumed only by the trusted root-derived launch context; it is never spawned locally. Existing local runtime path is unchanged."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/isolation_mcp/runtime.rs::spawn_claude",
+      "apis": {
+        "backend_spawn_class": 1,
+        "command_constructor": 1
+      },
+      "identity": "employee",
+      "migration": "backend",
+      "effects": [
+        "process_spawn"
+      ],
+      "rationale": "One-shot host authorization and fresh root publication prepare the Claude main run; SpawndBackend owns execution and teardown. The native marker has no authority and cannot run on the gateway uid."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/bin/d8-fixture.rs::main",
+      "apis": {
+        "raw_fork": 2
+      },
+      "identity": "test",
+      "migration": "test_only",
+      "effects": [
+        "process_spawn"
+      ],
+      "rationale": "Feature-gated debug-only acceptance ELF creates a real double-fork orphan inside the signed disposable D8 test run. Release builds refuse this fixture."
     }
   ]
 }

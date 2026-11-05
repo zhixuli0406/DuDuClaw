@@ -28,3 +28,18 @@ pub mod channels;
 pub mod egress;
 
 pub type Result<T> = std::result::Result<T, duduclaw_isolation::ipc::ErrorCode>;
+
+#[cfg(target_os = "linux")]
+pub mod allocation;
+
+#[cfg(target_os = "linux")]
+pub mod native_trampoline;
+
+#[cfg(target_os = "linux")]
+pub mod installed;
+
+#[cfg(target_os = "linux")]
+pub mod gateway_mcp;
+
+#[cfg(any(target_os = "linux", test))]
+pub mod gateway_plan;

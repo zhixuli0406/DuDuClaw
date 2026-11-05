@@ -145,6 +145,8 @@ impl WorkerSession for SocketSession {
 fn launch(request: &ParseRequest) -> Result<Box<dyn WorkerSession>, ParseError> {
     match LAUNCHER.get() {
         Some(launcher) => launch_with(&**launcher, request),
+        #[cfg(target_os = "linux")]
+        None if required() => launch_with(&crate::retirement::RetiringLauncher, request),
         None => launch_with(&SocketActivatedLauncher, request),
     }
 }

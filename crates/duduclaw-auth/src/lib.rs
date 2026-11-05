@@ -22,3 +22,5 @@ pub use user_update::{NewUser, UserUpdate, UserWriteError};
 
 pub mod mfa;
 pub mod migration;
+pub mod isolation;
+pub use isolation::{IsolationAuthoritySnapshot, read_isolation_authority};

@@ -2,7 +2,8 @@
 use super::*;
 use duduclaw_migration::{confirmation::{ApprovalSession, ConfirmationStore},
     contract::{ProposalBinding, ConfirmationStatus}, ids::RequestId};
-use super::migration_authority::{GatewayAuthority, GatewayAccountReadback, LiveAuthority};
+use super::migration_authority::{GatewayAuthority, GatewayAccountReadback, LiveAuthority, MigrationAuthorityBackend};
+use super::migration_authority::employee::EmployeeAuthority;
 
 pub(super) fn known_method(method: &str) -> bool {
     matches!(method, "migration.confirmations.list" | "migration.confirmations.step_up"
@@ -71,8 +72,9 @@ impl MethodHandler {
             if method == "migration.confirmations.list" {
                 let store = ConfirmationStore::open_read_only(&path).map_err(|_| "無法讀取遷移狀態。")?;
                 let items = store.list().map_err(|_| "無法讀取遷移狀態。")?;
+                let employee_backend = EmployeeAuthority::new(home.clone(), live.clone());
                 let items: Vec<Value> = items.into_iter().map(|item| {
-                    let supported = GatewayAuthority::built_in_item_supported(&item)
+                    let supported = employee_backend.validate(&item).is_ok() || GatewayAuthority::built_in_item_supported(&item)
                         || GatewayAccountReadback::available(&home, &item)
                         || (matches!(item.category,duduclaw_migration::contract::ConfirmationCategory::EmployeeInstructions | duduclaw_migration::contract::ConfirmationCategory::Skill | duduclaw_migration::contract::ConfirmationCategory::Hook) && !item.fields.iter().any(|f|f.name=="requires_reentry"));
                     let rotation_pending = store.rotation_pending(&item.binding).unwrap_or(true);
@@ -105,7 +107,8 @@ impl MethodHandler {
                     .find(|item| item.binding == input.binding && item.status == ConfirmationStatus::Applied)
                     .ok_or("請先完成此項目的核准與套用。")?;
                 let readback = Arc::new(GatewayAccountReadback::new(home.clone(), runtime));
-                let authority = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone());
+                let employee_backend = Arc::new(EmployeeAuthority::new(home.clone(), live.clone()));
+                let authority = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
                 let fingerprint = authority.rotate_secret(&item, &input.new_value).map_err(|_| "憑證更新尚未確認，請重新載入後用相同新值重試。")?;
                 store.record_rotation(&input.binding, "credential", fingerprint, &authority)
                     .map_err(|_| "憑證更新尚未確認，請重新載入後重試。")?;
@@ -122,8 +125,9 @@ impl MethodHandler {
             // Separate handles share the durable binding ledger. No cloned payload
             // can bypass the normal fresh-input validator at approval or staging.
             let readback = Arc::new(GatewayAccountReadback::new(home.clone(), runtime));
-            let validator = GatewayAuthority::new(home.clone()).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback.clone()).with_live(live.clone());
-            let mut applier = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone());
+            let employee_backend = Arc::new(EmployeeAuthority::new(home.clone(), live.clone()));
+            let validator = GatewayAuthority::new(home.clone()).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback.clone()).with_live(live.clone()).with_backend(employee_backend.clone());
+            let mut applier = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
             let error = "項目已變更、尚未支援或套用失敗，請重新載入確認目前狀態。";
             match method.as_str() {
                 "migration.confirmations.approve" => {
@@ -134,6 +138,13 @@ impl MethodHandler {
                     let item = store.list().map_err(|_| error)?.into_iter()
                         .find(|item| item.binding == input.bindings[0]).ok_or(error)?;
                     if item.status == ConfirmationStatus::Failed {
+                        if item.category == duduclaw_migration::contract::ConfirmationCategory::Employee {
+                            // Reconcile any interrupted compensation, but never
+                            // revive a permanently tombstoned UID on Retry.
+                            approval.authorize(&input.csrf_token, now as u64).map_err(|_| error)?;
+                            duduclaw_migration::confirmation::ProposalApplier::disable_and_read_back(&mut applier, &item).map_err(|_| error)?;
+                            return Err("此員工配置已撤銷，舊身分不會重用。請重新建立員工配置提案，再逐筆確認。");
+                        }
                         store.retry(&item.binding, &approval, input.csrf_token, now as u64,
                             &mut applier, &validator).map_err(|_| error)?;
                     } else {

@@ -48,6 +48,8 @@ pub struct MountInputs {
 }
 
 /// Trusted root-registry policy, never deserialized from a gateway request.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RootConfig {
     pub employee_uid: u32,
     pub employee_gid: u32,

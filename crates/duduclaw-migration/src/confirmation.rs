@@ -140,6 +140,17 @@ fn digest(category: ConfirmationCategory, fields: &[ProposalField]) -> Result<Sh
     Ok(Sha256Digest(hash.finalize().into()))
 }
 
+/// Revalidate the entire normalized payload at the privileged allocation boundary.
+pub fn verify_item_binding(item: &ConfirmationItem) -> Result<()> {
+    item.validate().map_err(|_| ConfirmationError::Invalid)?;
+    let mut fields = item.fields.clone();
+    normalize(item.category, &mut fields)?;
+    if fields != item.fields || digest(item.category, &fields)? != item.binding.proposal_digest {
+        return Err(ConfirmationError::Stale);
+    }
+    Ok(())
+}
+
 pub struct ConfirmationStore { conn: Connection }
 impl ConfirmationStore {
     /// Opens only a store already initialized in a fresh gateway home.

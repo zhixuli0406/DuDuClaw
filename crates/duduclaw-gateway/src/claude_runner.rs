@@ -803,6 +803,7 @@ async fn call_claude_for_agent_impl(
     // every other caller passes and is behaviourally a no-op.
     overrides: DispatchOverrides,
 ) -> Result<String, String> {
+    crate::isolation_readiness::check_execution()?;
     #[cfg(test)]
     crate::model_call_probe::record("claude_runner");
     // Cron and direct task calls do not pass through the bus dispatcher.
@@ -1140,7 +1141,7 @@ async fn call_claude_for_agent_impl(
         .await;
     }
 
-    if agent_dir.exists() {
+    if agent_dir.exists() && !duduclaw_core::execution_gate::isolation_required() {
         // `.mcp.json` platform fix: regenerate the DuDuClaw entry before the
         // CLI starts every server the file lists; a file that cannot be
         // confirmed refuses this spawn (fail closed, audited).
@@ -1710,6 +1711,8 @@ impl duduclaw_llm::ChatProvider for RecordingProvider {
         &self,
         req: &duduclaw_llm::ChatRequest,
     ) -> Result<duduclaw_llm::ChatResponse, duduclaw_llm::LlmError> {
+        crate::isolation_readiness::check_execution()
+            .map_err(duduclaw_llm::LlmError::InvalidRequest)?;
         // Each provider transport admits immediately before sending, including
         // every tool-loop iteration. Billing must not retain its lease.
         let resp = self.inner.complete(req).await?;
@@ -1743,6 +1746,8 @@ impl duduclaw_llm::ChatProvider for RecordingProvider {
         >,
         duduclaw_llm::LlmError,
     > {
+        crate::isolation_readiness::check_execution()
+            .map_err(duduclaw_llm::LlmError::InvalidRequest)?;
         self.inner.stream(req).await
     }
 }
@@ -3702,6 +3707,7 @@ fn claude_tool_result_content_text(content: &serde_json::Value) -> Option<String
 async fn call_claude_streaming(
     cmd: &mut tokio::process::Command,
     on_progress: Option<&crate::channel_reply::ProgressCallback>,
+    protected_input: Option<(&Path, &str, &str, &str)>,
 ) -> Result<ClaudeResponse, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -3710,15 +3716,32 @@ async fn call_claude_streaming(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let admission = crate::autonomous_runtime::admit_current().await?;
-    let mut child = duduclaw_core::execution_gate::with_runtime(
+    #[cfg(target_os = "linux")]
+    let mut prompt_writer = None;
+    let mut child = if let Some((agent_dir, prompt, system_prompt, model)) = protected_input {
+        #[cfg(target_os = "linux")]
+        {
+            let (child, writer) = crate::isolation_mcp::runtime::spawn_claude(agent_dir, prompt, system_prompt, model).await?;
+            prompt_writer = Some(writer);
+            child
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (agent_dir, prompt, system_prompt, model);
+            return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error("此平台尚未提供原生隔離執行。"));
+        }
+    } else {
+        let admission = crate::autonomous_runtime::admit_current().await?;
+        let child = duduclaw_core::execution_gate::with_runtime(
         duduclaw_core::execution_gate::RuntimeKind::Claude,
         crate::process_group::BackendChild::spawn_class(cmd, crate::process_group::execution_class(
             duduclaw_core::execution_gate::ExecutionClass::EmployeeMain)),
     ).await
         .map_err(|e| crate::process_group::backend_error(e, "claude CLI spawn error"))?;
-    crate::autonomous_runtime::mark_handoff();
-    drop(admission);
+        crate::autonomous_runtime::mark_handoff();
+        drop(admission);
+        child
+    };
     let stdout = child.child().stdout.take().ok_or("failed to capture stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
@@ -3934,6 +3957,8 @@ async fn call_claude_streaming(
     }
 
     thinking.finish();
+    #[cfg(target_os = "linux")]
+    if let Some(writer) = prompt_writer.as_mut() { writer.finish().await?; }
     let status = child.child().wait().await.map_err(|e| format!("wait error: {e}"))?;
     // Preserve successful completion semantics; cancellation before this point
     // drops the managed owner and terminates all descendants.
@@ -4633,6 +4658,15 @@ async fn call_claude_with_env(
     // Team-as-Agent: identity-scoped config dir + explicit `--mcp-config`.
     identity: SpawnIdentity<'_>,
 ) -> Result<ClaudeResponse, String> {
+    if duduclaw_core::execution_gate::isolation_required() {
+        if !env_vars.is_empty() || effort.is_some() || identity.mcp_config.is_some() {
+            return Err(protected_claude_options_refusal());
+        }
+        let agent_dir = identity.config_dir.or(work_dir).ok_or_else(protected_claude_options_refusal)?;
+        let system_prompt = system_prompt.replace(crate::direct_api::CACHE_SPLIT_MARKER, "");
+        let mut marker = tokio::process::Command::new("root-selected-claude");
+        return call_claude_streaming(&mut marker, None, Some((agent_dir, prompt, &system_prompt, model))).await;
+    }
     let claude = duduclaw_core::which_claude().ok_or("Claude CLI not found")?;
     // `_cmd_guards` holds the `--system-prompt-file` and (RFC-23 §13.6)
     // `--mcp-config` temp files; both must outlive the child below.
@@ -4664,7 +4698,12 @@ async fn call_claude_with_env(
     // outside its workspace (e.g. `~/.claude`).
     crate::runtime::apply_native_sandbox(&mut cmd, capabilities, work_dir, "claude")?;
 
-    call_claude_streaming(&mut cmd, None).await
+    call_claude_streaming(&mut cmd, None, None).await
+}
+
+pub(crate) fn protected_claude_options_refusal() -> String {
+    duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+        "受保護模式尚不支援這次要求的執行選項或登入來源；已停止執行，請由管理員檢查設定。")
 }
 
 // ---------------------------------------------------------------------------
@@ -6135,7 +6174,7 @@ mod process_tree_cancellation_tests {
         let mut cmd = tokio::process::Command::new("/bin/sh");
         cmd.current_dir(dir.path())
             .args(["-c", "/bin/sleep 300 & echo $! > grandchild.pid; wait"]);
-        let task = tokio::spawn(async move { super::call_claude_streaming(&mut cmd, None).await });
+        let task = tokio::spawn(async move { super::call_claude_streaming(&mut cmd, None, None).await });
         let pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Some(pid) = std::fs::read_to_string(dir.path().join("grandchild.pid"))

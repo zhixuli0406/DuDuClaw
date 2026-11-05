@@ -278,21 +278,72 @@ pub struct Connection {
 }
 impl Connection {
     pub fn context(&self, now: u64) -> Result<RequestContext, VerificationError> {
+        verified_context(&self.boundary, self.id, self.nonce, now)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verifier(&self) -> ConnectionVerifier {
+        ConnectionVerifier { boundary: self.boundary.clone(), id: self.id, nonce: self.nonce,
+            serial: Arc::new(tokio::sync::Semaphore::new(1)) }
+    }
+    pub fn agent_slug(&self) -> Result<String, VerificationError> {
+        let entries = self.boundary.entries.lock().map_err(|_| VerificationError::Unavailable)?;
+        Ok(entries.get(&self.id.0).ok_or(VerificationError::Revoked)?.agent_slug.clone())
+    }
+}
+
+fn verified_context(boundary: &Arc<Boundary>, id: CapabilityId, nonce: [u8; 16], now: u64)
+    -> Result<RequestContext, VerificationError> {
         let (record, mac) = {
-            let entries = self.boundary.entries.lock().map_err(|_| VerificationError::Unavailable)?;
-            let entry = entries.get(&self.id.0).ok_or(VerificationError::Revoked)?;
-            if !matches!(entry.state, State::Active(nonce) if nonce == self.nonce) {
+            let entries = boundary.entries.lock().map_err(|_| VerificationError::Unavailable)?;
+            let entry = entries.get(&id.0).ok_or(VerificationError::Revoked)?;
+            if !matches!(entry.state, State::Active(current) if current == nonce) {
                 return Err(VerificationError::Revoked);
             }
             (entry.record.clone(), entry.mac)
         };
         let binding = ConnectionBinding { capability: record.id, employee: record.employee,
             run: record.run, gateway_epoch: record.gateway_epoch };
-        self.boundary.verify(&record, CapabilityProof(&mac), &binding, now)
-    }
-    pub fn agent_slug(&self) -> Result<String, VerificationError> {
-        let entries = self.boundary.entries.lock().map_err(|_| VerificationError::Unavailable)?;
-        Ok(entries.get(&self.id.0).ok_or(VerificationError::Revoked)?.agent_slug.clone())
+        boundary.verify(&record, CapabilityProof(&mac), &binding, now)
+}
+
+/// Blocking authority I/O shares one bounded pool. Cancellation or timeout
+/// detaches a running job, but the job retains its permit until it really ends.
+pub async fn verify_blocking<T, F>(work: F) -> Result<T, VerificationError>
+where T: Send + 'static, F: FnOnce() -> Result<T, VerificationError> + Send + 'static {
+    use std::{sync::OnceLock, time::Duration};
+    static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let slots = SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(16))).clone();
+    let permit = tokio::time::timeout(Duration::from_secs(2), slots.acquire_owned()).await
+        .map_err(|_| VerificationError::Unavailable)?.map_err(|_| VerificationError::Unavailable)?;
+    let job = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    });
+    tokio::time::timeout(Duration::from_secs(10), job).await
+        .map_err(|_| VerificationError::Unavailable)?.map_err(|_| VerificationError::Unavailable)?
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct ConnectionVerifier {
+    boundary: Arc<Boundary>, id: CapabilityId, nonce: [u8; 16],
+    serial: Arc<tokio::sync::Semaphore>,
+}
+#[cfg(target_os = "linux")]
+impl ConnectionVerifier {
+    pub(crate) async fn context(&self) -> Result<RequestContext, VerificationError> {
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(2), self.serial.clone().acquire_owned())
+            .await.map_err(|_| VerificationError::Unavailable)?.map_err(|_| VerificationError::Unavailable)?;
+        let (boundary, id, nonce) = (self.boundary.clone(), self.id, self.nonce);
+        verify_blocking(move || {
+            let _permit = permit;
+            let context = verified_context(&boundary, id, nonce, now_seconds()?)?;
+            // Root readback may have consumed the remaining capability TTL.
+            let now = now_seconds()?;
+            if now < context.record().not_before || now >= context.record().expires_at {
+                return Err(VerificationError::InvalidTime);
+            }
+            Ok(context)
+        }).await
     }
 }
 impl Drop for Connection {
@@ -306,3 +357,7 @@ impl Drop for Connection {
 #[cfg(test)]
 #[path = "authority_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "authority_async_tests.rs"]
+mod async_tests;

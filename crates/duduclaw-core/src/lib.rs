@@ -44,6 +44,7 @@ pub mod mcp_scopes;
 pub mod org;
 pub mod org_field_guard;
 pub mod org_store;
+pub mod isolation_policy;
 pub mod pack;
 pub mod publishers;
 pub mod platform;

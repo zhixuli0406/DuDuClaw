@@ -1,11 +1,15 @@
-//! Package D integration seam. Package A owns authenticated spawnd I/O and must
+//! Package D protected boot composition. Package A owns authenticated spawnd I/O and must
 //! call issue before StartRun, attach only on matching TakeIo, and revoke before
-//! Cancel/terminal status/control disconnect. This module is not startup-enabled.
+//! Cancel/terminal status/control disconnect. Boot refuses absent trusted sources.
 //! The binary injects CLI's Dispatcher adapter; gateway never depends on CLI.
 pub use duduclaw_mcp_boundary::{bindings, Boundary, GrantPolicy, LiveAuthority, LiveSnapshot,
     Reservation, VerificationError};
 pub use duduclaw_mcp_boundary::server::Dispatcher;
 pub use duduclaw_mcp_boundary::config::{PreparedRuntimeBridge, RuntimeBridgeRegistry};
+/// Reads the gateway's existing live employee registry without caching an allow.
+pub type AgentAdmission = dyn Fn(&str) -> Result<(), VerificationError> + Send + Sync;
+#[cfg(target_os = "linux")]
+pub use duduclaw_mcp_boundary::protected_launch::ProtectedMcpLaunch;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -28,8 +32,9 @@ mod linux {
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tick.tick().await;
-                    let result = duduclaw_mcp_boundary::authority::now_seconds()
-                        .and_then(|now| sweeping.sweep(now));
+                    let checking = sweeping.clone();
+                    let result = duduclaw_mcp_boundary::authority::verify_blocking(move ||
+                        duduclaw_mcp_boundary::authority::now_seconds().and_then(|now| checking.sweep(now))).await;
                     if result.is_err() { let _ = sweeping.revoke_all(); break; }
                 }
             });
@@ -37,10 +42,11 @@ mod linux {
         }
 
         pub fn boundary(&self) -> &Arc<Boundary> { &self.boundary }
+        pub fn healthy(&self) -> bool { !self.sweep.is_finished() }
 
-        /// A calls this after reserve and before issue/spawn. B publishes the native MCP
-        /// projection and proves the registered runtime preserves fd 3 into its
-        /// MCP child. Missing acceptance or any stale readback rejects the run;
+        /// Verify after StartRun/TakeIo, when B's per-run mount receipt exists.
+        /// B publishes the native MCP projection and supplies exact-runtime
+        /// acceptance that fd 3 reaches its MCP child. Missing or stale readback rejects the run;
         /// callers must not reuse legacy config or retry under the gateway uid.
         pub fn prepare_runtime(&self, registry: &dyn RuntimeBridgeRegistry,
             runtime: &duduclaw_isolation::execution::RuntimeKind, run: RunHandle,
@@ -91,3 +97,26 @@ mod linux {
 }
 #[cfg(target_os = "linux")]
 pub use linux::{McpBoundaryService, McpRunSession};
+
+#[cfg(target_os = "linux")]
+#[path = "isolation_mcp/authority.rs"]
+mod authority;
+#[cfg(target_os = "linux")]
+pub use authority::HostTurn;
+#[cfg(target_os = "linux")]
+#[path = "isolation_mcp/launch.rs"]
+mod launch;
+#[cfg(target_os = "linux")]
+#[path = "isolation_mcp/boot.rs"]
+mod boot;
+#[cfg(target_os = "linux")]
+#[path = "isolation_mcp/runtime.rs"]
+pub(crate) mod runtime;
+#[cfg(target_os = "linux")]
+pub use runtime::{RuntimeAuthorization, with_runtime_authorization};
+#[cfg(target_os = "linux")]
+pub use boot::{BootSources, BootStatus, MissingProducer, DispatcherFactory, DispatcherInput, LaunchInput,
+    install_boot_sources, install_dispatcher_factory, boot_protected, boot_status, prepare_launch};
+#[cfg(not(target_os = "linux"))]
+pub async fn boot_protected(_: &std::path::Path, _: std::sync::Arc<duduclaw_auth::UserDb>,
+    _: std::sync::Arc<AgentAdmission>) {}

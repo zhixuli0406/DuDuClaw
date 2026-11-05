@@ -1,11 +1,18 @@
 //! In-process egress identity for the connection-bound MCP dispatcher.
 //! Missing host turn linkage stays unknown; it never inherits process env.
-use std::{future::Future, path::{Path, PathBuf}};
+use std::{future::Future, path::{Path, PathBuf}, sync::Arc};
 use duduclaw_mcp_boundary::{RequestContext, VerificationError};
 
 /// Package A supplies the original registered turn for this verified run.
 /// Implementations must read the live host mapping, not employee arguments.
 pub trait RunTurnResolver: Send + Sync {
+    /// Resolve related host fields as one observation. Production registries
+    /// override this to reuse a single fresh run/authority lookup.
+    fn resolve_run(&self, context: &RequestContext) -> Result<ResolvedRunTurn, VerificationError> {
+        Ok(ResolvedRunTurn { identity: self.resolve(context)?, metadata: self.metadata(context)?,
+            principal_context: self.principal_context(context)?, utility_runner: self.utility_runner() })
+    }
+
     fn resolve(&self, context: &RequestContext) -> Result<RunTurnIdentity, VerificationError>;
 
     /// Read delegation and callback metadata from this run's host-owned row.
@@ -24,6 +31,14 @@ pub trait RunTurnResolver: Send + Sync {
         Ok(None)
     }
 
+}
+
+/// One host-owned turn snapshot, including its utility execution service.
+pub struct ResolvedRunTurn {
+    pub identity: RunTurnIdentity,
+    pub metadata: Option<RunMetadata>,
+    pub principal_context: Option<String>,
+    pub utility_runner: Option<Arc<dyn UtilityRunner>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,20 +137,21 @@ pub(crate) struct CallIdentity {
 tokio::task_local! { static CALL: CallIdentity; }
 
 pub async fn scope<F: Future>(home: &Path, agent: &str, context: &RequestContext,
-    resolver: Option<&dyn RunTurnResolver>, future: F) -> Result<F::Output, VerificationError> {
+    resolver: Option<Arc<dyn RunTurnResolver>>, future: F) -> Result<F::Output, VerificationError> {
     if !duduclaw_core::is_valid_agent_id(agent) || duduclaw_core::is_reserved_agent_id(agent) {
         return Err(VerificationError::Invalid);
     }
-    let identity = match resolver {
-        Some(resolver) => resolver.resolve(context)?,
+    let ResolvedRunTurn { identity, metadata, principal_context: registered, utility_runner } = match resolver {
+        Some(resolver) => {
+            let context = context.clone();
+            duduclaw_mcp_boundary::authority::verify_blocking(move || resolver.resolve_run(&context)).await?
+        }
         // Never register this as a fresh clean turn. Unknown lineage is tainted.
-        None => RunTurnIdentity { turn: format!("isolated-run-{}", hex::encode(context.record().run.0)), approval_session: None },
+        None => ResolvedRunTurn { identity: RunTurnIdentity {
+            turn: format!("isolated-run-{}", hex::encode(context.record().run.0)), approval_session: None },
+            metadata: None, principal_context: None, utility_runner: None },
     };
     let RunTurnIdentity { turn, approval_session } = identity;
-    let metadata = match resolver {
-        Some(resolver) => resolver.metadata(context)?,
-        None => None,
-    };
     if let Some(metadata) = &metadata { metadata.validate()?; }
     if metadata.as_ref().is_some_and(|value| value.user_message.is_some()) && approval_session.is_none() {
         return Err(VerificationError::Invalid);
@@ -155,10 +171,6 @@ pub async fn scope<F: Future>(home: &Path, agent: &str, context: &RequestContext
     // absent metadata must shadow the ambient process/caller's callback route.
     let reply_channel = metadata.as_ref().and_then(|value| value.reply_channel.clone()).unwrap_or_default();
     let reply_sender = metadata.as_ref().and_then(|value| value.reply_sender.clone()).unwrap_or_default();
-    let registered = match resolver {
-        Some(resolver) => resolver.principal_context(context)?,
-        None => None,
-    };
     let (principal_context, _request_guard) = match registered {
         Some(reference) => {
             if crate::on_behalf_of::context::lookup(home, agent, &reference) != Some(principal.clone())
@@ -183,7 +195,7 @@ pub async fn scope<F: Future>(home: &Path, agent: &str, context: &RequestContext
     Ok(crate::on_behalf_of::ON_BEHALF_OF.scope(principal,
         crate::claude_runner::REPLY_CHANNEL.scope(reply_channel,
         crate::claude_runner::REPLY_SENDER.scope(reply_sender,
-        CALL.scope(CallIdentity { context: context.clone(), utility_runner: resolver.and_then(|r| r.utility_runner()), home: home.into(), agent: agent.into(), turn, approval_session,
+        CALL.scope(CallIdentity { context: context.clone(), utility_runner, home: home.into(), agent: agent.into(), turn, approval_session,
             principal_context, metadata }, future)))).await)
 }
 
@@ -231,6 +243,7 @@ mod tests {
             gateway_epoch: [4; 16], issued_at: 1, not_before: 1, expires_at: 2, nonce: [5; 32], jti: [6; 16],
         })
     }
+    #[derive(Clone)]
     struct Turn(String);
     impl RunTurnResolver for Turn {
         fn resolve(&self, _: &RequestContext) -> Result<RunTurnIdentity, VerificationError> {
@@ -238,6 +251,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct MappedTurn(RunMetadata);
     impl RunTurnResolver for MappedTurn {
         fn resolve(&self, _: &RequestContext) -> Result<RunTurnIdentity, VerificationError> {
@@ -248,6 +262,33 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn isolated_turn_snapshot_runs_once_off_the_reactor_thread() {
+        struct SnapshotResolver {
+            reactor: std::thread::ThreadId,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl RunTurnResolver for SnapshotResolver {
+            fn resolve(&self, _: &RequestContext) -> Result<RunTurnIdentity, VerificationError> {
+                panic!("scope must use the combined host snapshot")
+            }
+            fn resolve_run(&self, _: &RequestContext) -> Result<ResolvedRunTurn, VerificationError> {
+                assert_ne!(std::thread::current().id(), self.reactor);
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(ResolvedRunTurn { identity: RunTurnIdentity { turn: "host-turn".into(), approval_session: None },
+                    metadata: Some(RunMetadata::root()), principal_context: None, utility_runner: None })
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let resolver = Arc::new(SnapshotResolver { reactor: std::thread::current().id(),
+            calls: std::sync::atomic::AtomicUsize::new(0) });
+        scope(home.path(), "main", &context(), Some(resolver.clone()), async {
+            assert_eq!(resolved_identity(), Some(("host-turn".into(), None)));
+            assert_eq!(run_metadata(), Some(RunMetadata::root()));
+        }).await.unwrap();
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
     #[tokio::test]
     async fn isolated_run_metadata_preserves_root_and_nested_depths() {
         let home = tempfile::tempdir().unwrap();
@@ -256,20 +297,20 @@ mod tests {
             reply_sender: Some("sender".into()), ..RunMetadata::root() };
         for metadata in [RunMetadata::root(), nested] {
             let resolver = MappedTurn(metadata.clone());
-            scope(home.path(), "main", &context(), Some(&resolver), async {
+            scope(home.path(), "main", &context(), Some(Arc::new(resolver.clone())), async {
                 tokio::task::yield_now().await;
                 assert_eq!(crate::claude_runner::reply_sender_for("telegram", "123"), metadata.reply_sender);
                 assert_eq!(run_metadata(), Some(metadata));
             }).await.unwrap();
             assert_eq!(run_metadata(), None);
         }
-        scope(home.path(), "main", &context(), Some(&Turn("missing-metadata".into())), async {
+        scope(home.path(), "main", &context(), Some(Arc::new(Turn("missing-metadata".into()))), async {
             assert_eq!(run_metadata(), None);
             assert_eq!(crate::claude_runner::reply_sender_for("telegram", "123"), None);
         }).await.unwrap();
         let bad = MappedTurn(RunMetadata { delegation_origin: Some("../other".into()),
             ..RunMetadata::root() });
-        assert!(scope(home.path(), "main", &context(), Some(&bad), async {}).await.is_err());
+        assert!(scope(home.path(), "main", &context(), Some(Arc::new(bad)), async {}).await.is_err());
     }
 
     #[tokio::test]
@@ -280,7 +321,7 @@ mod tests {
         std::fs::write(home.path().join("agents").join(&agent).join("agent.toml"), "").unwrap();
         let turn = Turn(uuid::Uuid::new_v4().to_string());
         crate::egress_guard::register_turn(&agent, &turn.0);
-        let read = scope(home.path(), &agent, &context(), Some(&turn), async {
+        let read = scope(home.path(), &agent, &context(), Some(Arc::new(turn.clone())), async {
             assert!(!crate::egress_client::query(home.path(), &agent).await.tainted);
             assert!(crate::egress_client::reserve(home.path(), "different", "file_read").await.is_err());
             let (read, _) = crate::egress_client::reserve(home.path(), &agent, "file_read").await.unwrap();
@@ -302,7 +343,7 @@ mod tests {
             assert!(current(home.path(), "other").unwrap().is_err());
             assert!(approval_origin().unwrap().is_err());
         }).await.unwrap();
-        assert!(scope(home.path(), "main", &context(), Some(&Turn(String::new())), async {}).await.is_err());
+        assert!(scope(home.path(), "main", &context(), Some(Arc::new(Turn(String::new()))), async {}).await.is_err());
         assert!(super::turn().is_none());
     }
 
@@ -325,6 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn isolated_original_runtime_context_retains_lifetime_and_identity() {
+        #[derive(Clone)]
         struct Existing(String);
         impl RunTurnResolver for Existing {
             fn resolve(&self, _: &RequestContext) -> Result<RunTurnIdentity, VerificationError> {
@@ -340,17 +382,17 @@ mod tests {
         }).await;
         let resolver = Existing(guard.reference().into());
         for _ in 0..2 {
-            scope(home.path(), "main", &context(), Some(&resolver), async {
+            scope(home.path(), "main", &context(), Some(Arc::new(resolver.clone())), async {
                 assert_eq!(principal_context().as_deref(), Some(guard.reference()));
             }).await.unwrap();
         }
-        assert!(scope(home.path(), "other", &context(), Some(&resolver), async {}).await.is_err());
+        assert!(scope(home.path(), "other", &context(), Some(Arc::new(resolver.clone())), async {}).await.is_err());
         let mut other = context().record().clone();
         other.principal = Principal::Human { user_id: Text::new("other".into()).unwrap(), generation: 1 };
         assert!(scope(home.path(), "main", &RequestContext::from_verified_record(other),
-            Some(&resolver), async {}).await.is_err());
+            Some(Arc::new(resolver.clone())), async {}).await.is_err());
         drop(guard);
-        assert!(scope(home.path(), "main", &context(), Some(&resolver), async {}).await.is_err());
+        assert!(scope(home.path(), "main", &context(), Some(Arc::new(resolver.clone())), async {}).await.is_err());
     }
 
     #[tokio::test]
@@ -386,7 +428,7 @@ mod tests {
             assert_eq!(run_utility(request()).await,
                 Some(Err("isolated utility execution backend unavailable".into())));
         }).await.unwrap();
-        scope(home.path(), "main", &context(), Some(&Resolver), async {
+        scope(home.path(), "main", &context(), Some(Arc::new(Resolver)), async {
             assert_eq!(run_utility(request()).await, Some(Ok("original judge result".into())));
         }).await.unwrap();
         assert!(run_utility(request()).await.is_none());
@@ -397,7 +439,7 @@ mod tests {
         let expected = crate::autonomous_runtime::human_interactive(home.path(),
             crate::runtime_dispatch::run_utility_prompt(home.path(), None, "main", "system", "prompt", 1)).await;
         assert!(expected.as_ref().unwrap_err().contains(removed.removed_in));
-        scope(home.path(), "main", &context(), Some(&Resolver), async {
+        scope(home.path(), "main", &context(), Some(Arc::new(Resolver)), async {
             let actual = crate::autonomous_runtime::human_interactive(home.path(),
                 crate::runtime_dispatch::run_utility_prompt(home.path(), None, "main", "system", "prompt", 1)).await;
             assert_eq!(actual, expected);

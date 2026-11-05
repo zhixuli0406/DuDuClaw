@@ -20,7 +20,12 @@ fn serve() -> Result<(), duduclaw_parse_worker::worker::ParseError> {
     // Parser diagnostics never enter stderr/journal, even on a caught panic.
     std::panic::set_hook(Box::new(|_| {}));
     let deadline = Instant::now() + Duration::from_millis(policy::MAX_WALL_TIME_MS as u64);
-    let (payload, mut files) = transport::receive(&socket, 24, deadline)?;
+    let (payload, files) = transport::receive(&socket, 24, deadline)?;
+    let (payload, mut files) = if duduclaw_parse_worker::retirement::is_hello(&payload) {
+        if !files.is_empty() { return Err(ParseError::InvalidContent); }
+        duduclaw_parse_worker::retirement::answer_hello(&socket, &payload, deadline)?;
+        transport::receive(&socket, 24, deadline)?
+    } else { (payload, files) };
     let request = ParseRequest::decode_payload(&payload).map_err(|_| ParseError::InvalidContent)?;
     let result = policy::validate(&request).and_then(|_| transport::validate_inputs(&request, &mut files))
         .and_then(|_| sandbox::apply(&request.limits, request.outputs.as_slice().iter().map(|o| o.max_bytes.get()).max().unwrap_or(0)));

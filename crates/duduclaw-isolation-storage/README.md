@@ -111,6 +111,14 @@ unshare --mount --propagation private env ISO_STORAGE_TEST_ROOT=/var/lib/iso-sto
 
 See [implementation notes](../../docs/architecture/native-linux-isolation.md).
 
+## B1 reconciliation inventory
+
+`EmployeeStorage::images()` returns registered employee/UID/quota/phase values and
+an optional kernel-verified mounted device identity. It remains available when an
+image is incomplete or quarantined, so B1 can recover its durable operation/run
+ledger. Unknown implementations default to refusal. Inventory is not readiness:
+call `readiness()` before admission and `usage()` for actual quota readback.
+
 ## License
 
 Apache-2.0, as declared by the workspace.

@@ -3,7 +3,7 @@
 use std::{collections::{BTreeMap, BTreeSet}, io, os::fd::{AsFd, OwnedFd}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use duduclaw_isolation::{execution::{RunHandle, RuntimeKind, PtySize, NetworkPolicy}, ids::{EmployeeId, RunId, RequestId}, ipc::{CleanupReadback, ErrorCode, SpawnRequest}};
 use crate::{Result, admission::{Host, HostProgress, LaunchPolicy}, accounts::{self, InstallationEvidence, LinuxAccounts},
-    audit::{Event, Record, disk::AuditWorker}, bootstrap::{BootstrapPlan, Trampoline, UnavailableTrampoline},
+    audit::{Event, Record, disk::AuditWorker}, bootstrap::{BootstrapPlan, Trampoline},
     channels::{OutputRelay, RevocablePair, ConnectionRevoker}, fds::SnapshotAuthority,
     host_state::{RunJournal, RunRecord}, host_worker::{WorkerHost, Scan}, policy::RootPolicy,
     readiness::Readiness, registry::{AccountHost, RegistryStore, EmployeeAccount},
@@ -19,6 +19,13 @@ pub trait Publication: Send {
     fn snapshot_authority(&mut self, gateway_uid: u32) -> Result<SnapshotAuthority>;
     fn supervisor_identity(&mut self) -> Result<(u32, u32)>;
     fn anchors(&mut self) -> Result<crate::bootstrap_mounts::RootPublicationAnchors>;
+    fn native_profile(&mut self, _: &crate::policy::PublishedRuntime) -> Result<crate::native_trampoline::NativeProfile> { Err(unavailable()) }
+    /// Installed root publications enforce MCP projection readback; fixture
+    /// publications may implement their own independent launch contract.
+    fn prepare_mcp_projection(&mut self, _: &BootstrapPlan, _: &crate::policy::PublishedRuntime) -> Result<()> { Ok(()) }
+    fn record_mcp_projection(&mut self, _: &BootstrapPlan, _: &crate::policy::PublishedRuntime,
+        _: &crate::bootstrap_mounts::PreparedMounts) -> Result<()> { Ok(()) }
+    fn retire_mcp_projection(&mut self, _: RunHandle) -> Result<()> { Ok(()) }
 }
 pub struct MissingPublication;
 impl Publication for MissingPublication {
@@ -72,7 +79,23 @@ pub struct Components {
 impl Default for Components {
     fn default() -> Self { Self { installation: Arc::new(accounts::MissingInstallationEvidence),
         publication: Box::new(MissingPublication), storage: Box::new(UnavailableStorage),
-        trampoline: Box::new(UnavailableTrampoline), egress: Box::new(LinuxEgress::new(Box::new(MissingDnsEvidence))) } }
+        trampoline: Box::new(crate::native_trampoline::NativeTrampoline::default()), egress: Box::new(LinuxEgress::new(Box::new(MissingDnsEvidence))) } }
+}
+/// Fixed root installer layout. These are not request/config/environment inputs.
+/// The installer creates 0700 root-owned directories and makes the image anchor
+/// a private mount on H-supported backing. Boot never creates/mounts that anchor.
+pub const STORAGE_IMAGES: &str = "/var/lib/duduclaw-spawnd/images";
+pub const STORAGE_JOURNAL: &str = "/var/lib/duduclaw-spawnd/storage";
+impl Components {
+    pub fn installed() -> Self {
+        let mut components = Self::default();
+        crate::installed::install(&mut components);
+        match crate::storage::LoopStorage::open(std::path::Path::new(STORAGE_IMAGES), std::path::Path::new(STORAGE_JOURNAL)) {
+            Ok(storage) => components.storage = Box::new(storage),
+            Err(_) => eprintln!("duduclaw-spawnd: installed storage unavailable"),
+        }
+        components
+    }
 }
 #[derive(Clone)]
 struct ScanEntry { account: EmployeeAccount, run: Option<RunId>, cgroup: Option<String>, revokers: Vec<Arc<ConnectionRevoker>>, cancelled: Arc<AtomicBool>, deadline: Option<Instant> }
@@ -244,6 +267,7 @@ struct LiveRun {
 struct PublishedView { report: EvidenceReport, policy: Option<RootPolicy>, employees: BTreeSet<EmployeeId> }
 pub struct LinuxHost { worker: WorkerHost, view: Arc<Mutex<PublishedView>>, scanner: ScanReader, pub snapshots: SnapshotAuthority, pub host_ptys: u32 }
 struct Core {
+    allocator: crate::allocation::Allocator,
     registry: RegistryStore, systemd: Systemd, journal: RunJournal, components: Components,
     policy: Option<RootPolicy>, report: EvidenceReport, gateway: (u32, u32), monitor: Monitor,
     runs: BTreeMap<RunId, LiveRun>, audit: AuditWorker, last_refresh: Instant, poisoned: bool,
@@ -261,7 +285,7 @@ impl LinuxHost {
             report: EvidenceReport::current(Readiness::default(), 0)?, policy: None,
             employees: registry.registry().employees.iter().filter(|a| a.state == crate::registry::AccountState::Ready).map(|a| a.employee).collect(),
         }));
-        let mut core = Core { registry, systemd: Systemd::connect()?, journal: RunJournal::open()?,
+        let mut core = Core { allocator: crate::allocation::Allocator::open()?, registry, systemd: Systemd::connect()?, journal: RunJournal::open()?,
             components, policy: None, report: EvidenceReport::current(Readiness::default(), 0)?, gateway,
             monitor, runs: BTreeMap::new(), audit, last_refresh: Instant::now(), poisoned: false, view: view.clone() };
         core.report.publish(gateway.1)?;
@@ -272,7 +296,9 @@ impl LinuxHost {
             .unwrap_or(SnapshotAuthority { gateway_uid: gateway.0, mount_id: 0 });
         let host_ptys = crate::systemd::linux::host_pty_budget().unwrap_or(0);
         core.refresh();
-        Ok(Self { worker: WorkerHost::spawn(core, worker_scanner)?, view, scanner, snapshots, host_ptys })
+        let worker = WorkerHost::spawn(core, worker_scanner)?;
+        crate::allocation::serve(gateway, worker.allocation_sender())?;
+        Ok(Self { worker, view, scanner, snapshots, host_ptys })
     }
 }
 impl Core {
@@ -321,10 +347,18 @@ impl Core {
         checks.ssh_live_negative_checks = registry;
         checks.cron_at_acl_and_jobs_verified = registry;
         checks.external_iam_reservation_verified = registry;
+        let mut landlock = None;
         if let Ok(evidence) = self.components.trampoline.readiness() {
             checks.trampoline_verified = evidence.check().is_ok();
             checks.landlock_self_test = evidence.landlock_self_test;
             checks.namespace_self_test = evidence.namespace_self_test;
+            if checks.trampoline_verified {
+                static LOG_ABI: std::sync::Once = std::sync::Once::new();
+                LOG_ABI.call_once(|| eprintln!("duduclaw-spawnd: Landlock detected_abi={} selected_abi={}",
+                    evidence.detected_landlock_abi, evidence.selected_landlock_abi));
+                landlock = Some(crate::host_state::LandlockEvidence { detected_abi: evidence.detected_landlock_abi,
+                    selected_abi: evidence.selected_landlock_abi });
+            }
         }
         if let Ok(layer) = self.components.egress.readiness() {
             checks.egress_verified = true; checks.dns_route_verified = true; checks.egress_second_layer = layer;
@@ -337,6 +371,7 @@ impl Core {
         match EvidenceReport::current(checks, ptys.unwrap_or(0)) {
             Ok(mut report) => {
                 report.checked_boottime_ms = probe_started;
+                report.landlock = landlock;
                 self.report = report;
                 if self.report.publish(self.gateway.1).is_err() { self.poisoned = true; self.report.checks.startup_reconciled = false; }
             },
@@ -384,11 +419,12 @@ impl Core {
                     // An attach reply can be lost after H persisted the mount.
                     // Its durable inventory, not our optional receipt, is authority.
                     for attachment in self.components.storage.attachments()?.into_iter().filter(|a| a.run == run) {
-                        attachment.check(employee, run)?;
+                        attachment.check_identity(employee, run)?;
                         self.components.storage.detach(&attachment)?;
                     }
                     if self.components.storage.attachments()?.iter().any(|a| a.run == run) { return Err(unavailable()); }
                     if let Some(anchors) = &entry.projection { os(crate::bootstrap_mounts::cleanup_projection(anchors, run))?; }
+                    self.components.publication.retire_mcp_projection(run)?;
                     // Detach/close can be slow. Do not timestamp the earlier
                     // cleanup observation as a fresh proof after those jobs.
                     if !os(accounts::unexpected_processes(account.uid, None))?.is_empty() { return Err(ErrorCode::NotReady); }
@@ -407,6 +443,28 @@ impl Core {
     }
 }
 impl Host for Core {
+    fn allocation(&mut self, request: &duduclaw_migration::allocation::Request) -> Result<duduclaw_migration::allocation::Receipt> {
+        if self.poisoned { return Err(unavailable()); }
+        // Allocation never races an active run or the lifecycle's H journal.
+        if request.action != duduclaw_migration::allocation::Action::ReadBack && !self.runs.is_empty() { return Err(ErrorCode::NotReady); }
+        let mut accounts = LinuxAccounts { evidence: self.components.installation.as_ref() };
+        let result = self.allocator.handle(request, &mut self.registry, &mut accounts, self.components.storage.as_mut());
+        let mut entries = self.monitor.entries.lock().map_err(|_| unavailable())?;
+        // Even a failed allocation may have created a durable UID reservation.
+        // Monitor every such identity before returning its failure to the gateway.
+        for account in &self.registry.registry().employees {
+            if let Some(entry) = entries.iter_mut().find(|e| e.account.employee == account.employee) {
+                entry.account = account.clone();
+                if account.state != crate::registry::AccountState::Ready { entry.cancelled.store(true, Ordering::Release); }
+            } else {
+                entries.push(ScanEntry { account: account.clone(), run: None, cgroup: None, revokers: vec![],
+                    cancelled: Arc::new(AtomicBool::new(account.state != crate::registry::AccountState::Ready)), deadline: None });
+            }
+        }
+        drop(entries);
+        self.last_refresh = Instant::now() - Duration::from_secs(10);
+        result
+    }
     type Inputs = Vec<OwnedFd>; type Io = Vec<OwnedFd>;
     fn ready(&mut self, employee: EmployeeId) -> Result<()> {
         if self.poisoned { return Err(unavailable()); }
@@ -470,14 +528,17 @@ impl Host for Core {
         let entry = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
         entry.gateway_io = Some(gateway_io); entry.relays = vec![out, err]; entry.revokers = revokers.clone();
         self.monitor.set_run(employee, Some(run.0), None, revokers.clone())?;
+        self.components.publication.prepare_mcp_projection(&plan, &runtime)?;
         let anchors = self.components.publication.anchors()?;
         self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.projection = Some(anchors);
         let anchors = self.runs.get(&run.0).and_then(|entry| entry.projection.as_ref()).ok_or_else(unavailable)?;
         let mounts = os(crate::bootstrap_mounts::prepare(&plan, &storage, anchors))?;
+        self.components.publication.record_mcp_projection(&plan, &runtime, &mounts)?;
         self.monitor.check_run(run)?;
         self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.bootstrap_attempted = true;
+        let native_profile = self.components.publication.native_profile(&runtime)?;
         let sealed_plan = plan.seal()?;
-        let prepared = self.components.trampoline.prepare(plan, sealed_plan, mounts, inputs, stdin, mcp, egress)?;
+        let prepared = self.components.trampoline.prepare(plan, sealed_plan, mounts, inputs, stdin, mcp, egress, native_profile)?;
         os(crate::fds::validate_bootstrap(prepared.bootstrap_for_unit.as_fd()))?;
         let policy = os(UnitPolicy::new(run.0, employee, &runtime.resources, &runtime.timeouts, storage.receipt.device_major, storage.receipt.device_minor))?;
         self.monitor.check_run(run)?;

@@ -2,6 +2,7 @@
 //! trampoline process only; never load the launcher into the gateway process.
 #![allow(unsafe_code)]
 pub mod bootstrap;
+pub mod sealed_registry;
 pub mod fd;
 pub mod mounts;
 pub mod privileges;

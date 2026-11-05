@@ -21,10 +21,27 @@ const MAX_MEMFD_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 pub struct SpawndBackend {
     runs: StdMutex<BTreeMap<RunId, Arc<Entry>>>,
     slots: Arc<Semaphore>,
+    admission: Option<fn() -> Result<(), BackendError>>,
+}
+
+/// Read-only host metadata; generated only after peer and reply validation.
+#[derive(Clone, Debug)]
+pub struct ReservationMetadata {
+    pub run: RunHandle,
+    pub employee: EmployeeId,
+    pub control: ipc::ControlConnectionId,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct McpReceipt {
+    pub control: ipc::ControlConnectionId,
+    pub response: SpawnResponse,
 }
 
 struct Entry {
     employee: EmployeeId,
+    reservation_expiry: u64,
     connection: Connection,
     state: Mutex<State>,
     _permit: OwnedSemaphorePermit,
@@ -42,6 +59,7 @@ struct State {
     stdio: Option<RunStdio>,
     terminal: Option<RunPty>,
     mcp_fd: Option<OwnedFd>,
+    io_receipt: Option<SpawnResponse>,
     outcome: Option<RunOutcome>,
     terminal_at: Option<Instant>,
 }
@@ -51,7 +69,55 @@ impl SpawndBackend {
     /// Package B performs readiness checks for the trampoline, egress and quotas.
     pub async fn connect() -> Result<Self, BackendError> {
         let _probe = transport::connect()?;
-        Ok(Self { runs: StdMutex::new(BTreeMap::new()), slots: Arc::new(Semaphore::new(MAX_TRACKED_RUNS)) })
+        Ok(Self { runs: StdMutex::new(BTreeMap::new()), slots: Arc::new(Semaphore::new(MAX_TRACKED_RUNS)), admission: None })
+    }
+
+    /// Gateway boot uses this constructor so retained backend Arcs cannot
+    /// bypass a later readiness change. Cleanup operations remain available.
+    pub async fn connect_with_admission(check: fn() -> Result<(), BackendError>) -> Result<Self, BackendError> {
+        // Boot may install the backend before the remaining services initialize;
+        // admission is checked at each reserve/spawn, never cached at connect.
+        let mut backend = Self::connect().await?;
+        backend.admission = Some(check);
+        Ok(backend)
+    }
+
+    fn check_admission(&self) -> Result<(), BackendError> {
+        self.admission.map_or(Ok(()), |check| check())
+    }
+
+    /// Exact metadata retained from ReserveRun on the authenticated control
+    /// connection. D must read this before issuing a pending capability.
+    pub async fn reservation(&self, run: RunHandle) -> Result<ReservationMetadata, BackendError> {
+        let entry = self.entry(run)?;
+        let state = entry.state.lock().await;
+        if entry.connection.is_closed() || state.started || state.outcome.is_some()
+            || Instant::now() >= state.expires { return Err(BackendError::Denied); }
+        Ok(ReservationMetadata { run, employee: entry.employee,
+            control: entry.connection.id, expires_at_unix_ms: entry.reservation_expiry })
+    }
+
+    /// Synchronous authority adapter: original control identity plus a fresh
+    /// root Status reply, never a cached Running state. Concurrent RPCs serialize
+    /// on the original control socket. The transaction may block up to 250 ms;
+    /// callers should use a blocking pool rather than block_on a Tokio runtime.
+    pub fn live_snapshot(&self, run: RunHandle) -> Result<(ReservationMetadata, RunStatus), BackendError> {
+        let entry = self.entry(run)?;
+        let status = entry.connection.live_status(run, entry.reservation_expiry)?;
+        Ok((ReservationMetadata { run, employee: entry.employee,
+            control: entry.connection.id, expires_at_unix_ms: entry.reservation_expiry }, status))
+    }
+
+    /// Retains the actual validated TakeIo response, rather than reconstructing
+    /// an Io reply from a caller's request. The endpoint itself transfers once.
+    pub async fn mcp_receipt(&self, run: RunHandle) -> Result<McpReceipt, BackendError> {
+        let entry = self.entry(run)?;
+        let state = entry.state.lock().await;
+        if entry.connection.is_closed() || state.outcome.is_some() || !state.mcp {
+            return Err(BackendError::Denied);
+        }
+        let response = state.io_receipt.clone().ok_or(BackendError::Unavailable)?;
+        Ok(McpReceipt { control: entry.connection.id, response })
     }
 
     fn entry(&self, run: RunHandle) -> Result<Arc<Entry>, BackendError> {
@@ -109,7 +175,7 @@ impl SpawndBackend {
         if state.io_received { return Ok(()); }
         if !state.started || state.outcome.is_some() { return Err(BackendError::Denied); }
         let packet = entry.connection.request(SpawnRequest::TakeIo { run }, &[]).await?;
-        let SpawnResponse::Io { delivery, .. } = packet.response else { return Err(BackendError::Protocol); };
+        let SpawnResponse::Io { delivery, .. } = &packet.response else { return Err(BackendError::Protocol); };
         if delivery.pty != state.pty || delivery.mcp != state.mcp {
             entry.connection.close().await;
             return Err(BackendError::Protocol);
@@ -125,6 +191,7 @@ impl SpawndBackend {
             fd_io::DeliveredIo::Pty(terminal) => state.terminal = Some(terminal),
         }
         state.mcp_fd = mcp_fd;
+        state.io_receipt = Some(packet.response);
         state.io_received = true;
         Ok(())
     }
@@ -145,20 +212,25 @@ impl SpawndBackend {
 impl ExecutionBackend for SpawndBackend {
     fn reserve(&self, employee: EmployeeId) -> BackendFuture<'_, RunHandle> {
         Box::pin(async move {
+            self.check_admission()?;
             self.prune_reservations()?;
             let permit = self.slots.clone().try_acquire_owned().map_err(|_| BackendError::Unavailable)?;
             let connection = transport::connect()?;
             let packet = connection.request(SpawnRequest::ReserveRun { employee_id: employee }, &[]).await?;
+            if let Err(error) = self.check_admission() {
+                connection.close().await;
+                return Err(error);
+            }
             let SpawnResponse::Reserved { run, expires_at_unix_ms } = packet.response else { return Err(BackendError::Protocol); };
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| BackendError::Unavailable)?.as_millis();
             let remaining = (expires_at_unix_ms as u128).checked_sub(now_ms)
                 .filter(|ms| *ms > 0 && *ms <= ipc::RESERVATION_TIMEOUT_MS as u128)
                 .ok_or(BackendError::Protocol)?;
-            let entry = Arc::new(Entry { employee, connection, _permit: permit, state: Mutex::new(State {
+            let entry = Arc::new(Entry { employee, reservation_expiry: expires_at_unix_ms, connection, _permit: permit, state: Mutex::new(State {
                 expires: Instant::now() + Duration::from_millis(remaining as u64), started: false, task_ref: None,
                 pty: false, mcp: false, output_bytes: 0, output_buffer: 0,
-                io_received: false, stdio: None, terminal: None, mcp_fd: None, outcome: None, terminal_at: None,
+                io_received: false, stdio: None, terminal: None, mcp_fd: None, io_receipt: None, outcome: None, terminal_at: None,
             }) });
             let mut runs = self.runs.lock().map_err(|_| BackendError::Unavailable)?;
             if runs.contains_key(&run.0)
@@ -174,6 +246,7 @@ impl ExecutionBackend for SpawndBackend {
 
     fn spawn(&self, policy: SpawnPolicy) -> BackendFuture<'_, RunHandle> {
         Box::pin(async move {
+            self.check_admission()?;
             let entry = self.entry(policy.run)?;
             let mut state = entry.state.lock().await;
             if entry.employee != policy.employee || state.started || state.expires <= Instant::now() {
@@ -192,8 +265,18 @@ impl ExecutionBackend for SpawndBackend {
                 runtime_request: policy.runtime, task_ref: state.task_ref.clone(), prompt_bytes: prepared.prompt_bytes,
                 input_fds: List::new(prepared.attachments).map_err(|_| BackendError::Denied)?, pty: policy.pty };
             request.validate().map_err(|_| BackendError::Denied)?;
+            // Input preparation awaits untrusted bounded streams. Recheck at
+            // the final boundary before handing execution to the root service.
+            if let Err(error) = self.check_admission() {
+                entry.connection.close().await;
+                return Err(error);
+            }
             let packet = entry.connection.request(request, &prepared.fds).await?;
             let SpawnResponse::Accepted { status, .. } = packet.response else { return Err(BackendError::Protocol); };
+            if let Err(error) = self.check_admission() {
+                entry.connection.close().await;
+                return Err(error);
+            }
             state.started = true;
             state.pty = policy.pty;
             state.mcp = policy.capabilities.mcp_bridge;
@@ -341,12 +424,145 @@ mod tests {
         RunInput { reader: Box::new(Bytes(std::io::Cursor::new(bytes.to_vec()))), max_bytes }
     }
 
+    async fn metadata_fixture() -> (SpawndBackend, RunHandle, Arc<Entry>, OwnedFd) {
+        let slots = Arc::new(Semaphore::new(1));
+        let (connection, peer) = Connection::test_pair();
+        let run = RunHandle(RunId([19; 16]));
+        let entry = Arc::new(Entry { employee: EmployeeId([23; 16]), reservation_expiry: 123456,
+            connection, _permit: slots.clone().acquire_owned().await.unwrap(),
+            state: Mutex::new(State {
+                expires: Instant::now() + Duration::from_secs(30), started: false, task_ref: None,
+                pty: false, mcp: false, output_bytes: 1, output_buffer: 1, io_received: false,
+                stdio: None, terminal: None, mcp_fd: None, io_receipt: None, outcome: None, terminal_at: None,
+            }) });
+        let backend = SpawndBackend { runs: StdMutex::new(BTreeMap::from([(run.0, entry.clone())])), slots, admission: None };
+        (backend, run, entry, peer)
+    }
+
+    #[tokio::test]
+    async fn retained_backend_checks_admission_before_connecting_to_root() {
+        let (mut backend, _, _, _peer) = metadata_fixture().await;
+        backend.admission = Some(|| Err(BackendError::Denied));
+        assert!(matches!(backend.reserve(EmployeeId([23; 16])).await, Err(BackendError::Denied)));
+    }
+
+    #[tokio::test]
+    async fn live_snapshot_reads_each_root_status_and_preserves_control_identity() {
+        let (backend, run, entry, peer) = metadata_fixture().await;
+        let thread = std::thread::spawn(move || {
+            use nix::sys::socket::{self, MsgFlags};
+            for status in [RunStatus::Running, RunStatus::Ended(RunOutcome::Exited(0))] {
+                let mut pollfd = libc::pollfd { fd: peer.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                // SAFETY: one live pollfd with its exact array length.
+                assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 2000) }, 1);
+                let mut bytes = vec![0; ipc::MAX_FRAME_BYTES + 4];
+                let size = socket::recv(peer.as_raw_fd(), &mut bytes, MsgFlags::MSG_DONTWAIT).unwrap();
+                bytes.truncate(size);
+                let request: ipc::Envelope<SpawnRequest> = ipc::decode(&bytes).unwrap();
+                assert!(matches!(request.message, SpawnRequest::Status { run: actual } if actual == run));
+                let frame = ipc::encode(&ipc::Envelope { version: ipc::PROTOCOL_VERSION,
+                    request_id: request.request_id, message: SpawnResponse::Status { run, status } }).unwrap();
+                socket::send(peer.as_raw_fd(), &frame, MsgFlags::MSG_NOSIGNAL).unwrap();
+            }
+        });
+        // The authority path must never acquire this async state mutex.
+        let _state = entry.state.lock().await;
+        for expected_running in [true, false] {
+            let (metadata, status) = backend.live_snapshot(run).unwrap();
+            assert_eq!(metadata.employee, entry.employee);
+            assert_eq!(metadata.control, entry.connection.id);
+            assert_eq!(metadata.expires_at_unix_ms, entry.reservation_expiry);
+            assert_eq!(matches!(status, RunStatus::Running), expected_running);
+        }
+        thread.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_snapshot_serializes_with_wait_without_revoking_a_live_run() {
+        let (backend, run, _, peer) = metadata_fixture().await;
+        let backend = Arc::new(backend);
+        let (started, received) = tokio::sync::oneshot::channel();
+        let peer_thread = std::thread::spawn(move || {
+            use nix::sys::socket::{self, MsgFlags};
+            let mut started = Some(started);
+            // Wait and the synchronous authority probe each receive their own
+            // root response; the third poll really observes termination.
+            for index in 0..3 {
+                let mut pollfd = libc::pollfd { fd: peer.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                // SAFETY: the kernel receives exactly one valid pollfd.
+                assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 2000) }, 1);
+                let mut bytes = vec![0; ipc::MAX_FRAME_BYTES + 4];
+                let size = socket::recv(peer.as_raw_fd(), &mut bytes, MsgFlags::MSG_DONTWAIT).unwrap();
+                bytes.truncate(size);
+                let request: ipc::Envelope<SpawnRequest> = ipc::decode(&bytes).unwrap();
+                assert!(matches!(request.message, SpawnRequest::Status { run: actual } if actual == run));
+                if let Some(started) = started.take() {
+                    started.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+                let status = if index == 2 { RunStatus::Ended(RunOutcome::Exited(0)) } else { RunStatus::Running };
+                let frame = ipc::encode(&ipc::Envelope { version: ipc::PROTOCOL_VERSION,
+                    request_id: request.request_id, message: SpawnResponse::Status { run, status } }).unwrap();
+                socket::send(peer.as_raw_fd(), &frame, MsgFlags::MSG_NOSIGNAL).unwrap();
+            }
+        });
+        let waiter = backend.clone();
+        let wait = tokio::spawn(async move { waiter.wait(run, WaitOrigin::Gateway).await });
+        received.await.unwrap();
+        // This deliberately blocks the only Tokio worker while wait's first
+        // Status is still in flight. Its blocking I/O owner must progress.
+        let (metadata, status) = backend.live_snapshot(run).unwrap();
+        assert_eq!(metadata.run, run);
+        assert!(matches!(status, RunStatus::Running));
+        assert!(!backend.entry(run).unwrap().connection.is_closed());
+        assert_eq!(wait.await.unwrap().unwrap(), RunOutcome::Exited(0));
+        peer_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reservation_metadata_preserves_authenticated_identity_and_refuses_started_run() {
+        let (backend, run, entry, _peer) = metadata_fixture().await;
+        let metadata = backend.reservation(run).await.unwrap();
+        assert_eq!(metadata.run, run);
+        assert_eq!(metadata.employee, EmployeeId([23; 16]));
+        assert_eq!(metadata.control, ipc::ControlConnectionId([17; 16]));
+        assert_eq!(metadata.expires_at_unix_ms, 123456);
+        entry.state.lock().await.started = true;
+        assert!(matches!(backend.reservation(run).await, Err(BackendError::Denied)));
+    }
+
+    #[tokio::test]
+    async fn reservation_metadata_refuses_expired_and_disconnected_control() {
+        let (backend, run, entry, _peer) = metadata_fixture().await;
+        entry.state.lock().await.expires = Instant::now();
+        assert!(matches!(backend.reservation(run).await, Err(BackendError::Denied)));
+        entry.state.lock().await.expires = Instant::now() + Duration::from_secs(30);
+        entry.connection.close().await;
+        assert!(matches!(backend.reservation(run).await, Err(BackendError::Denied)));
+    }
+
+    #[tokio::test]
+    async fn mcp_receipt_requires_actual_delivery_and_live_control() {
+        let (backend, run, entry, _peer) = metadata_fixture().await;
+        assert!(backend.mcp_receipt(run).await.is_err());
+        entry.state.lock().await.mcp = true;
+        assert!(matches!(backend.mcp_receipt(run).await, Err(BackendError::Unavailable)));
+        // The real receive_io path stores the validated Io packet verbatim.
+        let response = SpawnResponse::Io { run, delivery: ipc::IoDelivery { pty: false, mcp: true } };
+        entry.state.lock().await.io_receipt = Some(response.clone());
+        let receipt = backend.mcp_receipt(run).await.unwrap();
+        assert_eq!(receipt.control, ipc::ControlConnectionId([17; 16]));
+        assert_eq!(receipt.response, response);
+        entry.connection.close().await;
+        assert!(matches!(backend.mcp_receipt(run).await, Err(BackendError::Denied)));
+    }
+
     #[test]
     fn task_binding_is_immutable_after_start_or_expiry() {
         let mut state = State {
             expires: Instant::now() + Duration::from_secs(30), started: false, task_ref: None,
             pty: false, mcp: false, output_bytes: 1, output_buffer: 1,
-            io_received: false, stdio: None, terminal: None, mcp_fd: None, outcome: None, terminal_at: None,
+            io_received: false, stdio: None, terminal: None, mcp_fd: None, io_receipt: None, outcome: None, terminal_at: None,
         };
         let task = Some(Text::new("task-1".into()).unwrap());
         bind_task(&mut state, task.clone()).unwrap();
@@ -365,7 +581,7 @@ mod tests {
         let mut state = State {
             expires: now, started: true, task_ref: None, pty: false, mcp: false,
             output_bytes: 1, output_buffer: 1, io_received: false, stdio: None,
-            terminal: None, mcp_fd: None, outcome: None, terminal_at: None,
+            terminal: None, mcp_fd: None, io_receipt: None, outcome: None, terminal_at: None,
         };
         assert!(retain_state(&state, now + TERMINAL_RETENTION));
         state.outcome = Some(RunOutcome::Exited(0));

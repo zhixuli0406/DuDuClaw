@@ -181,6 +181,8 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
 async fn run_agent_prompt_inner(
     req: AgentPrompt<'_>,
 ) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
+    crate::isolation_readiness::check_execution().map_err(|error|
+        RuntimeDispatchFailure::preflight(req.provider_override, req.model, RuntimePreflightKind::Config, error))?;
     if let Some(dir) = req.agent_dir {
         crate::runtime_config::ensure_active_agent_provider(dir).map_err(|error| {
             RuntimeDispatchFailure::preflight(

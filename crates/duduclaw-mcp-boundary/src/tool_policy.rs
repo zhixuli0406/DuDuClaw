@@ -550,6 +550,14 @@ fn check_selected_resources(policy: &ToolPolicy, arguments: &Value, resources: &
     Ok(())
 }
 
+/// Async callers resolve live resources on the bounded authority worker pool.
+/// The returned call owns its context, arguments and exact finite resources.
+pub async fn authorize_async(context: &RequestContext, name: &str, arguments: &Value,
+    resolver: std::sync::Arc<dyn ResourceResolver>) -> Result<AuthorizedToolCall, VerificationError> {
+    let (context, name, arguments) = (context.clone(), name.to_owned(), arguments.clone());
+    crate::authority::verify_blocking(move || authorize(&context, &name, &arguments, resolver.as_ref())).await
+}
+
 pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolver: &dyn ResourceResolver)
     -> Result<AuthorizedToolCall, VerificationError> {
     crate::check_arguments(arguments)?;

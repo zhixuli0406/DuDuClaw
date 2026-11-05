@@ -19,6 +19,12 @@ pub struct Offer { pub nonce: [u8; 32], pub run: RunId }
 /// signature-verified registry. It must never forward gateway SpawnPolicy fields.
 pub trait RootRegistry {
     fn take_run(&mut self, run: RunId) -> Result<super::runner::TrustedRun>;
+    /// Called only after root-peer and fresh nonce authentication. Production
+    /// consumes the first descriptor as a sealed root plan; fixtures may use an
+    /// in-memory registry without a manifest descriptor.
+    fn take_received_run(&mut self, run: RunId, _nonce: [u8; 32], _fds: &mut Vec<OwnedFd>)
+        -> Result<super::runner::TrustedRun> { self.take_run(run) }
+
 }
 
 /// Explicit cross-package seam. Missing B1 integration is a terminal refusal.
@@ -94,9 +100,9 @@ pub fn handshake(fd: RawFd, registry: &mut dyn RootRegistry) -> Result<(super::r
     let challenge = Envelope { version: ipc::PROTOCOL_VERSION, request_id: RequestId([0;16]), message: Challenge { nonce } };
     let packet = ipc::encode(&challenge).map_err(|_| Error::Bootstrap)?;
     send_packet(fd, &packet, None)?;
-    let (packet, fds) = receive(fd)?;
+    let (packet, mut fds) = receive(fd)?;
     let run = decode_offer(&packet, nonce)?;
-    let plan = registry.take_run(run)?;
+    let plan = registry.take_received_run(run, nonce, &mut fds)?;
     if fds.len() != plan.expected_fd_count() { return Err(Error::Descriptors); }
     Ok((plan, fds))
 }

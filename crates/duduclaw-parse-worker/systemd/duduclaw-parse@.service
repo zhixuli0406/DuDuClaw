@@ -31,7 +31,7 @@ RestrictAddressFamilies=AF_UNIX
 SystemCallArchitectures=native
 # Fixed list for dynamic loading and service setup. The executable installs a
 # smaller BPF allowlist before parsing (no opens, exec, clone, socket or connect).
-SystemCallFilter=read write close ftruncate pread64 readv writev lseek fstat newfstatat statx openat access faccessat readlink readlinkat mmap mprotect munmap mremap brk madvise futex clock_gettime clock_nanosleep nanosleep rt_sigaction rt_sigprocmask rt_sigreturn sigaltstack getrandom getpid gettid getuid geteuid getgid getegid getresuid getresgid sched_yield restart_syscall sendmsg recvmsg ppoll poll exit exit_group execve arch_prctl set_tid_address set_robust_list rseq prlimit64 setrlimit getrlimit prctl seccomp fcntl fstatfs getsockopt close_range alarm setitimer
+SystemCallFilter=read write close ftruncate pread64 readv writev lseek fstat newfstatat statx openat access faccessat readlink readlinkat mmap mprotect munmap mremap brk madvise futex clock_gettime clock_nanosleep nanosleep rt_sigaction rt_sigprocmask rt_sigreturn sigaltstack getrandom getpid gettid getuid geteuid getgid getegid getresuid getresgid sched_yield restart_syscall sendmsg recvmsg ppoll poll exit exit_group execve arch_prctl set_tid_address set_robust_list rseq prlimit64 setrlimit getrlimit prctl seccomp fcntl fstatfs getsockopt pidfd_open close_range alarm setitimer
 SystemCallErrorNumber=EPERM
 # v249 gives ProtectSystem's READONLY / priority over TMPFS /. RootDirectory
 # is the staging mountpoint; the separate skeleton hides the base directories

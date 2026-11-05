@@ -14,6 +14,42 @@ fn iso_root_systemd_document_roundtrip() {
     assert_eq!(client::extract_bytes("員工文件".as_bytes(), ContentFormat::Text).unwrap(), "員工文件");
 }
 
+#[test]
+#[ignore = "iso_root_: installed worker/units, system bus and root-created clean retirement.lease; disposable VM"]
+fn iso_root_e2e_worker_retirement_holds_host_slot_through_response_and_drop() {
+    assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"),
+        "this test changes a global host lease and requires an explicitly disposable VM");
+    use duduclaw_parse_worker::{client::WorkerLauncher, retirement::{RetiringLauncher, LEASE_PATH}, transport};
+    use std::time::{Duration, Instant};
+    let _guard = ROOT_LOCK.lock().unwrap();
+    require_root();
+    assert_eq!(std::fs::read_to_string(LEASE_PATH).unwrap(), "clean\n");
+    let request = client::request(ParseOperation::ExtractDocument, ContentFormat::Text, 5);
+    let mut session = RetiringLauncher.launch(&request, 64 * 1024 * 1024).unwrap();
+    assert_eq!(std::fs::read_to_string(LEASE_PATH).unwrap(), "dirty\n");
+    assert!(RetiringLauncher.launch(&request, 64 * 1024 * 1024).is_err());
+    let file = transport::snapshot(&mut &b"hello"[..]).unwrap();
+    let response = session.exchange(&request, &[file]).unwrap();
+    assert!(matches!(response.result, ParseResult::Complete { .. }));
+    // A valid result alone must not free the host budget or permit reuse.
+    assert_eq!(std::fs::read_to_string(LEASE_PATH).unwrap(), "dirty\n");
+    assert!(RetiringLauncher.launch(&request, 64 * 1024 * 1024).is_err());
+    drop(session);
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while std::fs::read_to_string(LEASE_PATH).unwrap() != "clean\n" {
+        assert!(Instant::now() < deadline, "unit/cgroup retirement was not proven");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Cancellation before a snapshot also waits for the actual worker to exit.
+    let session = RetiringLauncher.launch(&request, 64 * 1024 * 1024).unwrap();
+    drop(session);
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while std::fs::read_to_string(LEASE_PATH).unwrap() != "clean\n" {
+        assert!(Instant::now() < deadline, "dropped session did not retire");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[cfg(feature = "engine")]
 #[test]
 #[ignore = "requires root, systemd and installed Package E units/binary"]

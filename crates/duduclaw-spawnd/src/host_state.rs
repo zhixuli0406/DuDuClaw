@@ -24,7 +24,7 @@ pub fn atomic_json<T: Serialize>(path: &Path, value: &T, gid: u32, mode: u32) ->
     file.write_all(&bytes)?; file.sync_all()?;
     fs::rename(&temp, path)?; File::open(parent)?.sync_all()
 }
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, gid: u32, mode: u32) -> io::Result<T> {
+pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, gid: u32, mode: u32) -> io::Result<T> {
     root_path(path, false)?;
     let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)?;
     let meta = file.metadata()?;
@@ -66,23 +66,32 @@ impl RunJournal {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct LandlockEvidence { pub detected_abi: u32, pub selected_abi: u32 }
+impl LandlockEvidence {
+    fn valid(&self) -> bool { self.detected_abi > 0 && self.selected_abi == self.detected_abi.min(7) }
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceReport {
     pub version: u16,
     pub boot_id: String,
     pub checked_boottime_ms: u64,
     pub valid_for_ms: u64,
     pub host_pty_budget: u32,
+    #[serde(default)]
+    pub landlock: Option<LandlockEvidence>,
     pub checks: Readiness,
 }
 impl EvidenceReport {
     pub fn current(checks: Readiness, host_pty_budget: u32) -> io::Result<Self> {
         Ok(Self { version: 1, boot_id: fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_owned(),
-            checked_boottime_ms: boottime_ms()?, valid_for_ms: 1_000, host_pty_budget, checks })
+            checked_boottime_ms: boottime_ms()?, valid_for_ms: 1_000, host_pty_budget, landlock: None, checks })
     }
     pub fn check_at(&self, boot_id: &str, now: u64) -> crate::Result<()> {
         if self.version != 1 || self.boot_id != boot_id || self.valid_for_ms == 0 || self.valid_for_ms > 1_000
             || now < self.checked_boottime_ms || now - self.checked_boottime_ms >= self.valid_for_ms
-            || self.host_pty_budget == 0 { return Err(ErrorCode::IsolationUnavailable); }
+            || self.host_pty_budget == 0
+            || (self.checks.trampoline_verified && !self.landlock.as_ref().is_some_and(LandlockEvidence::valid)) { return Err(ErrorCode::IsolationUnavailable); }
         self.checks.check()
     }
     pub fn publish(&self, gateway_gid: u32) -> io::Result<()> { atomic_json(Path::new(READINESS_PATH), self, gateway_gid, 0o640) }
@@ -104,7 +113,7 @@ mod tests {
     #[test]
     fn evidence_rejects_stale_future_different_boot_and_missing_components() {
         let report = EvidenceReport { version: 1, boot_id: "boot".into(), checked_boottime_ms: 100,
-            valid_for_ms: 1000, host_pty_budget: 100, checks: Readiness {
+            valid_for_ms: 1000, host_pty_budget: 100, landlock: Some(LandlockEvidence { detected_abi: 8, selected_abi: 7 }), checks: Readiness {
                 protocol: 1, registry_verified: true, accounts_locked: true, ssh_live_negative_checks: true,
                 cron_at_acl_and_jobs_verified: true, external_iam_reservation_verified: true,
                 trampoline_verified: true, landlock_self_test: true, namespace_self_test: true,
@@ -113,6 +122,11 @@ mod tests {
                 egress_second_layer: crate::readiness::EgressSecondLayer::Unavailable,
             } };
         assert!(report.check_at("boot", 100).is_ok());
+        let mut missing_abi = report.clone(); missing_abi.landlock = None;
+        assert!(missing_abi.check_at("boot", 100).is_err());
+        let mut invalid_abi = report.clone();
+        invalid_abi.landlock = Some(LandlockEvidence { detected_abi: 8, selected_abi: 8 });
+        assert!(invalid_abi.check_at("boot", 100).is_err());
         for (boot, now) in [("other", 101), ("boot", 99), ("boot", 1100)] { assert!(report.check_at(boot, now).is_err()); }
     }
 }

@@ -2,9 +2,14 @@
 use std::{io::{self, IoSlice}, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::fs::{FileTypeExt, MetadataExt}}, path::Path, time::Duration};
 use duduclaw_isolation::{execution::BackendError, ids::{RequestId, SPAWND_SOCKET}, ipc::{self, Envelope, ErrorCode, FdRole, RunStatus, SpawnRequest, SpawnResponse}};
 use nix::{fcntl::{fcntl, FcntlArg, FdFlag, OFlag}, sys::{socket::{self, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, UnixAddr, sockopt}, stat::{fstat, SFlag}}};
-use tokio::{io::unix::AsyncFd, sync::Mutex};
+use std::sync::{Arc, Condvar, Mutex, atomic::{AtomicBool, Ordering}};
 
-pub(super) struct Connection { fd: Mutex<Option<AsyncFd<OwnedFd>>> }
+pub(super) struct Connection {
+    io: Arc<ControlIo>,
+    // Gateway-local identity for this authenticated connection, never sent by
+    // an employee and never reused after reconnecting to the fixed endpoint.
+    pub(super) id: ipc::ControlConnectionId,
+}
 pub(super) struct Packet { pub response: SpawnResponse, pub fds: Vec<OwnedFd> }
 
 pub(super) fn connect() -> Result<Connection, BackendError> {
@@ -28,7 +33,7 @@ pub(super) fn connect() -> Result<Connection, BackendError> {
     // there is no unauthenticated blocking connect or path-based fallback.
     socket::connect(fd.as_raw_fd(), &address).map_err(|_| BackendError::Unavailable)?;
     authenticate_peer(&fd, 0, 0)?;
-    Ok(Connection { fd: Mutex::new(Some(AsyncFd::new(fd).map_err(|_| BackendError::Unavailable)?)) })
+    Ok(Connection::from_fd(fd, ipc::ControlConnectionId(*uuid::Uuid::new_v4().as_bytes())))
 }
 
 fn authenticate_peer(fd: &OwnedFd, uid: u32, gid: u32) -> Result<(), BackendError> {
@@ -52,41 +57,181 @@ fn socket_domain(fd: &OwnedFd) -> Result<libc::c_int, BackendError> {
     Ok(domain)
 }
 
-impl Connection {
-    pub async fn close(&self) { self.fd.lock().await.take(); }
+// Only the transaction owner touches packet I/O. The original authenticated
+// socket stays alive in this Arc; shutdown is safe during another transaction
+// and immediately fences root without racing a recycled raw descriptor number.
+struct ControlIo {
+    fd: OwnedFd,
+    busy: Mutex<bool>,
+    available: Condvar,
+    closed: AtomicBool,
+}
+impl ControlIo {
+    fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let _ = socket::shutdown(self.fd.as_raw_fd(), socket::Shutdown::Both);
+        }
+        // Pair notification with the gate mutex so cancellation cannot be lost
+        // between a waiter's predicate check and its condvar sleep.
+        let _busy = self.busy.lock().unwrap_or_else(|error| error.into_inner());
+        self.available.notify_all();
+    }
+    fn acquire(&self, deadline: std::time::Instant) -> Result<Transaction<'_>, BackendError> {
+        let mut busy = self.busy.lock().map_err(|_| BackendError::Unavailable)?;
+        loop {
+            if self.closed.load(Ordering::Acquire) { return Err(BackendError::Unavailable); }
+            let remaining = deadline.checked_duration_since(std::time::Instant::now())
+                .ok_or(BackendError::Timeout)?;
+            if !*busy {
+                *busy = true;
+                return Ok(Transaction { io: self, completed: false });
+            }
+            let (next, _) = self.available.wait_timeout(busy, remaining).map_err(|_| BackendError::Unavailable)?;
+            busy = next;
+        }
+    }
+    fn transact(&self, request: SpawnRequest, input_fds: Vec<OwnedFd>, deadline: std::time::Instant)
+        -> Result<Packet, BackendError> {
+        let result = (|| {
+            let mut transaction = self.acquire(deadline)?;
+            let request_id = RequestId(*uuid::Uuid::new_v4().as_bytes());
+            let frame = ipc::encode(&Envelope { version: ipc::PROTOCOL_VERSION, request_id, message: &request })
+                .map_err(|_| BackendError::Protocol)?;
+            let raw: Vec<_> = input_fds.iter().map(AsRawFd::as_raw_fd).collect();
+            let controls = if raw.is_empty() { vec![] } else { vec![ControlMessage::ScmRights(&raw)] };
+            loop {
+                if self.closed.load(Ordering::Acquire) { return Err(BackendError::Unavailable); }
+                if std::time::Instant::now() >= deadline { return Err(BackendError::Timeout); }
+                match socket::sendmsg::<UnixAddr>(self.fd.as_raw_fd(), &[IoSlice::new(&frame)], &controls,
+                    MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT, None) {
+                    Ok(bytes) if bytes == frame.len() => break,
+                    Ok(_) => return Err(BackendError::Protocol),
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(nix::errno::Errno::EAGAIN) => poll_until(&self.fd, libc::POLLOUT, deadline)?,
+                    Err(_) => return Err(BackendError::Io),
+                }
+            }
+            let (bytes, fds) = loop {
+                poll_until(&self.fd, libc::POLLIN, deadline)?;
+                match receive_packet(&self.fd) {
+                    Ok(packet) => break packet,
+                    Err(error) if matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock) => continue,
+                    Err(error) if error.kind() == io::ErrorKind::InvalidData => return Err(BackendError::Protocol),
+                    Err(_) => return Err(BackendError::Io),
+                }
+            };
+            let envelope: Envelope<SpawnResponse> = ipc::decode(&bytes).map_err(|_| BackendError::Protocol)?;
+            if envelope.request_id != request_id { return Err(BackendError::Protocol); }
+            validate_response(&request, &envelope.message)?;
+            validate_fds(&envelope.message.fd_plan(), &fds)?;
+            if self.closed.load(Ordering::Acquire) { return Err(BackendError::Unavailable); }
+            transaction.completed = true;
+            Ok(Packet { response: envelope.message, fds })
+        })();
+        if result.is_err() { self.close(); }
+        result
+    }
+}
+struct Transaction<'a> { io: &'a ControlIo, completed: bool }
+impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        // Fence failure before releasing the gate; no waiter can send a new
+        // packet in the gap between a bad response and shutdown.
+        if !self.completed { self.io.close(); }
+        let mut busy = self.io.busy.lock().unwrap_or_else(|error| error.into_inner());
+        *busy = false;
+        self.io.available.notify_all();
+    }
+}
+struct CancelTransaction(Option<Arc<ControlIo>>);
+impl Drop for CancelTransaction {
+    fn drop(&mut self) { if let Some(io) = &self.0 { io.close(); } }
+}
 
-    pub fn is_closed(&self) -> bool {
-        self.fd.try_lock().is_ok_and(|fd| fd.is_none())
+impl Connection {
+    fn from_fd(fd: OwnedFd, id: ipc::ControlConnectionId) -> Self {
+        Self { io: Arc::new(ControlIo { fd, busy: Mutex::new(false), available: Condvar::new(),
+            closed: AtomicBool::new(false) }), id }
+    }
+    #[cfg(test)]
+    pub(super) fn test_pair() -> (Self, OwnedFd) {
+        let (left, right) = socket::socketpair(AddressFamily::Unix, SockType::SeqPacket, None,
+            SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK).unwrap();
+        (Self::from_fd(left, ipc::ControlConnectionId([17; 16])), right)
+    }
+
+    pub async fn close(&self) { self.io.close(); }
+    pub fn is_closed(&self) -> bool { self.io.closed.load(Ordering::Acquire) }
+
+    /// Fresh Status serialized with async RPCs on the original control socket.
+    /// The entire wait plus I/O budget is 250 ms. Async I/O runs independently
+    /// in the blocking pool, so even a current-thread runtime can make progress.
+    pub(super) fn live_status(&self, run: duduclaw_isolation::execution::RunHandle,
+        reservation_expiry: u64) -> Result<RunStatus, BackendError> {
+        let packet = self.io.transact(SpawnRequest::Status { run }, vec![],
+            std::time::Instant::now() + Duration::from_millis(250))?;
+        let result = match packet.response {
+            SpawnResponse::Status { status, .. } => {
+                if let RunStatus::Reserved { expires_at_unix_ms } = status {
+                    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                        Ok(value) => value.as_millis(),
+                        Err(_) => { self.io.close(); return Err(BackendError::Unavailable); }
+                    };
+                    if expires_at_unix_ms != reservation_expiry || now >= u128::from(expires_at_unix_ms) {
+                        self.io.close();
+                        return Err(BackendError::Denied);
+                    }
+                }
+                Ok(status)
+            }
+            SpawnResponse::Error { code } => Err(map_error(code)),
+            _ => Err(BackendError::Protocol),
+        };
+        if result.is_err() { self.io.close(); }
+        result
     }
 
     pub async fn request(&self, request: SpawnRequest, input_fds: &[OwnedFd]) -> Result<Packet, BackendError> {
         let roles = request.fd_plan().map_err(|_| BackendError::Denied)?;
         if roles.len() != input_fds.len() { return Err(BackendError::Protocol); }
-        let request_id = RequestId(*uuid::Uuid::new_v4().as_bytes());
-        let frame = ipc::encode(&Envelope { version: ipc::PROTOCOL_VERSION, request_id, message: &request })
-            .map_err(|_| BackendError::Protocol)?;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(ipc::CONTROL_TIMEOUT_MS);
-        let mut guard = tokio::time::timeout_at(deadline, self.fd.lock()).await.map_err(|_| BackendError::Timeout)?;
-        // Take ownership before the first await: dropping this future, timing out,
-        // or rejecting the response closes the socket and revokes the run on B.
-        let fd = guard.take().ok_or(BackendError::Unavailable)?;
-        let result = tokio::time::timeout_at(deadline, async {
-            send(&fd, &frame, input_fds).await?;
-            let (bytes, fds) = receive(&fd).await?;
-            let envelope: Envelope<SpawnResponse> = ipc::decode(&bytes).map_err(|_| BackendError::Protocol)?;
-            if envelope.request_id != request_id { return Err(BackendError::Protocol); }
-            validate_response(&request, &envelope.message)?;
-            validate_fds(&envelope.message.fd_plan(), &fds)?;
-            Ok(Packet { response: envelope.message, fds })
-        }).await.map_err(|_| BackendError::Timeout)?;
-        match result {
-            Ok(packet) => {
-                *guard = Some(fd);
-                if let SpawnResponse::Error { code } = packet.response { return Err(map_error(code)); }
-                Ok(packet)
-            }
-            Err(error) => Err(error),
+        let inputs = input_fds.iter().map(|fd| fd.try_clone().map_err(|_| BackendError::Io))
+            .collect::<Result<Vec<_>, _>>()?;
+        let deadline = std::time::Instant::now() + Duration::from_millis(ipc::CONTROL_TIMEOUT_MS);
+        let io = self.io.clone();
+        // Dropping this future shuts down the socket immediately, including
+        // while its blocking task is queued or waiting for the transaction gate.
+        let mut cancellation = CancelTransaction(Some(io.clone()));
+        let result = tokio::task::spawn_blocking(move || io.transact(request, inputs, deadline))
+            .await.map_err(|_| BackendError::Unavailable)?;
+        cancellation.0 = None;
+        let packet = result?;
+        if let SpawnResponse::Error { code } = packet.response { return Err(map_error(code)); }
+        Ok(packet)
+    }
+}
+impl Drop for Connection {
+    fn drop(&mut self) { self.io.close(); }
+}
+
+fn poll_until(fd: &OwnedFd, events: libc::c_short, deadline: std::time::Instant) -> Result<(), BackendError> {
+    loop {
+        let remaining = deadline.checked_duration_since(std::time::Instant::now())
+            .ok_or(BackendError::Timeout)?;
+        if remaining.is_zero() { return Err(BackendError::Timeout); }
+        let timeout = remaining.as_millis().min(250) as libc::c_int;
+        // Round down rather than exceed the budget; a sub-ms remainder refuses.
+        if timeout == 0 { return Err(BackendError::Timeout); }
+        let mut pollfd = libc::pollfd { fd: fd.as_raw_fd(), events, revents: 0 };
+        // SAFETY: one live typed pollfd; poll cannot access beyond this slot.
+        let result = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+        if result < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted { continue; }
+            return Err(BackendError::Io);
         }
+        if result == 0 { continue; }
+        if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 { return Err(BackendError::Io); }
+        if pollfd.revents & events != 0 { return Ok(()); }
+        if pollfd.revents & libc::POLLHUP != 0 { return Err(BackendError::Io); }
     }
 }
 
@@ -113,38 +258,6 @@ fn validate_response(request: &SpawnRequest, response: &SpawnResponse) -> Result
         _ => false,
     };
     if valid { Ok(()) } else { Err(BackendError::Protocol) }
-}
-
-async fn send(fd: &AsyncFd<OwnedFd>, frame: &[u8], input_fds: &[OwnedFd]) -> Result<(), BackendError> {
-    let raw_fds: Vec<_> = input_fds.iter().map(AsRawFd::as_raw_fd).collect();
-    loop {
-        let mut ready = fd.writable().await.map_err(|_| BackendError::Io)?;
-        let sent = ready.try_io(|fd| {
-            let controls = if raw_fds.is_empty() { vec![] } else { vec![ControlMessage::ScmRights(&raw_fds)] };
-            socket::sendmsg::<UnixAddr>(fd.get_ref().as_raw_fd(), &[IoSlice::new(frame)], &controls,
-                MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT, None).map_err(io::Error::from)
-        });
-        match sent {
-            Ok(Ok(bytes)) if bytes == frame.len() => return Ok(()),
-            Ok(Ok(_)) => return Err(BackendError::Protocol),
-            Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Ok(Err(_)) => return Err(BackendError::Io),
-            Err(_) => continue,
-        }
-    }
-}
-
-async fn receive(fd: &AsyncFd<OwnedFd>) -> Result<(Vec<u8>, Vec<OwnedFd>), BackendError> {
-    loop {
-        let mut ready = fd.readable().await.map_err(|_| BackendError::Io)?;
-        match ready.try_io(|fd| receive_packet(fd.get_ref())) {
-            Ok(Ok(packet)) => return Ok(packet),
-            Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => return Err(BackendError::Protocol),
-            Ok(Err(_)) => return Err(BackendError::Io),
-            Err(_) => continue,
-        }
-    }
 }
 
 fn receive_packet(fd: &OwnedFd) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
@@ -238,6 +351,104 @@ mod tests {
     use super::*;
     use duduclaw_isolation::{execution::RunHandle, ids::RunId, ipc::IoDelivery};
 
+    fn status_peer(peer: OwnedFd, response: impl FnOnce(Envelope<SpawnRequest>) -> (Envelope<SpawnResponse>, Vec<OwnedFd>)
+        + Send + 'static) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            poll_until(&peer, libc::POLLIN, std::time::Instant::now() + Duration::from_secs(2)).unwrap();
+            let (bytes, fds) = receive_packet(&peer).unwrap();
+            assert!(fds.is_empty());
+            let request = ipc::decode(&bytes).unwrap();
+            let (reply, rights) = response(request);
+            let bytes = ipc::encode(&reply).unwrap();
+            let raw: Vec<_> = rights.iter().map(AsRawFd::as_raw_fd).collect();
+            let controls = if raw.is_empty() { vec![] } else { vec![ControlMessage::ScmRights(&raw)] };
+            socket::sendmsg::<UnixAddr>(peer.as_raw_fd(), &[IoSlice::new(&bytes)], &controls,
+                MsgFlags::MSG_NOSIGNAL, None).unwrap();
+        })
+    }
+
+    #[tokio::test]
+    async fn live_status_reads_matching_root_response_without_async_state_lock() {
+        let (connection, peer) = Connection::test_pair();
+        let run = RunHandle(RunId([1; 16]));
+        let thread = status_peer(peer, move |request| {
+            assert!(matches!(request.message, SpawnRequest::Status { run: actual } if actual == run));
+            (Envelope { version: ipc::PROTOCOL_VERSION, request_id: request.request_id,
+                message: SpawnResponse::Status { run, status: RunStatus::Running } }, vec![])
+        });
+        assert!(matches!(connection.live_status(run, 1), Ok(RunStatus::Running)));
+        assert!(!connection.is_closed());
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_status_waits_for_existing_transaction_and_reads_its_own_reply() {
+        let (connection, peer) = Connection::test_pair();
+        let connection = Arc::new(connection);
+        let run = RunHandle(RunId([1; 16]));
+        let mut transaction = connection.io.acquire(std::time::Instant::now() + Duration::from_secs(1)).unwrap();
+        transaction.completed = true;
+        let peer = status_peer(peer, move |request| (Envelope { version: ipc::PROTOCOL_VERSION,
+            request_id: request.request_id, message: SpawnResponse::Status { run,
+                status: RunStatus::Running } }, vec![]));
+        std::thread::scope(|scope| {
+            let query = scope.spawn(|| connection.live_status(run, 1));
+            std::thread::sleep(Duration::from_millis(10));
+            drop(transaction);
+            assert!(matches!(query.join().unwrap(), Ok(RunStatus::Running)));
+        });
+        assert!(!connection.is_closed());
+        peer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_status_timeout_closes_control_and_cannot_reuse_late_reply() {
+        let (connection, _peer) = Connection::test_pair();
+        let started = std::time::Instant::now();
+        assert!(matches!(connection.live_status(RunHandle(RunId([1; 16])), 1), Err(BackendError::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(connection.is_closed());
+        assert!(matches!(connection.live_status(RunHandle(RunId([1; 16])), 1), Err(BackendError::Unavailable)));
+    }
+
+    #[tokio::test]
+    async fn live_status_rejects_wrong_request_run_and_unexpected_rights() {
+        let run = RunHandle(RunId([1; 16]));
+        for mutation in 0..3 {
+            let (connection, peer) = Connection::test_pair();
+            let (read, write) = nix::unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
+            let before = open_copies(&read);
+            let thread = status_peer(peer, move |request| {
+                let rights = if mutation == 2 { vec![write] } else { vec![] };
+                (Envelope { version: ipc::PROTOCOL_VERSION,
+                    request_id: if mutation == 0 { RequestId([0; 16]) } else { request.request_id },
+                    message: SpawnResponse::Status {
+                        run: if mutation == 1 { RunHandle(RunId([2; 16])) } else { run },
+                        status: RunStatus::Running } }, rights)
+            });
+            assert!(matches!(connection.live_status(run, 1), Err(BackendError::Protocol)));
+            assert!(connection.is_closed());
+            thread.join().unwrap();
+            assert_eq!(open_copies(&read), before - 1, "received rights and peer copy must close");
+        }
+    }
+
+    #[tokio::test]
+    async fn live_status_reservation_must_match_authenticated_expiry_and_be_live() {
+        let run = RunHandle(RunId([1; 16]));
+        let future = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap()
+            .as_millis() as u64 + 30_000;
+        for (reported, expected, accepted) in [(future, future, true), (future, future + 1, false), (1, 1, false)] {
+            let (connection, peer) = Connection::test_pair();
+            let thread = status_peer(peer, move |request| (Envelope { version: ipc::PROTOCOL_VERSION,
+                request_id: request.request_id, message: SpawnResponse::Status { run,
+                    status: RunStatus::Reserved { expires_at_unix_ms: reported } } }, vec![]));
+            assert_eq!(connection.live_status(run, expected).is_ok(), accepted);
+            assert_eq!(connection.is_closed(), !accepted);
+            thread.join().unwrap();
+        }
+    }
+
     #[test]
     fn replies_bind_operation_and_run() {
         let run = RunHandle(RunId([1; 16]));
@@ -309,7 +520,7 @@ mod tests {
         let before = open_copies(&read);
         socket::sendmsg::<UnixAddr>(right.as_raw_fd(), &[IoSlice::new(b"bad frame")],
             &[ControlMessage::ScmRights(&[read.as_raw_fd()])], MsgFlags::empty(), None).unwrap();
-        let connection = Connection { fd: Mutex::new(Some(AsyncFd::new(left).unwrap())) };
+        let connection = Connection::from_fd(left, ipc::ControlConnectionId([7; 16]));
         let request = SpawnRequest::ReserveRun { employee_id: duduclaw_isolation::ids::EmployeeId([1; 16]) };
         assert!(matches!(connection.request(request.clone(), &[]).await, Err(BackendError::Protocol)));
         assert_eq!(open_copies(&read), before);
@@ -330,13 +541,28 @@ mod tests {
     async fn cancelled_transaction_closes_control_connection() {
         let (left, right) = socket::socketpair(AddressFamily::Unix, SockType::SeqPacket, None,
             SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK).unwrap();
-        let connection = Connection { fd: Mutex::new(Some(AsyncFd::new(left).unwrap())) };
+        let connection = Connection::from_fd(left, ipc::ControlConnectionId([7; 16]));
         let request = SpawnRequest::ReserveRun { employee_id: duduclaw_isolation::ids::EmployeeId([1; 16]) };
-        assert!(tokio::time::timeout(Duration::from_millis(10), connection.request(request.clone(), &[])).await.is_err());
+        let (received, notice) = tokio::sync::oneshot::channel();
+        let peer = std::thread::spawn(move || {
+            poll_until(&right, libc::POLLIN, std::time::Instant::now() + Duration::from_secs(2)).unwrap();
+            let (bytes, fds) = receive_packet(&right).unwrap();
+            assert!(!bytes.is_empty()); assert!(fds.is_empty());
+            received.send(()).unwrap();
+            right
+        });
+        let mut pending = Box::pin(connection.request(request.clone(), &[]));
+        tokio::select! {
+            result = &mut pending => panic!("RPC completed before cancellation: {}", result.is_ok()),
+            result = notice => result.unwrap(),
+        }
+        drop(pending);
+        let right = peer.join().unwrap();
+        assert!(connection.is_closed());
         assert!(matches!(connection.request(request, &[]).await, Err(BackendError::Unavailable)));
-        // The queued request may remain readable, then peer EOF proves closure.
+        // The first request was received, but no reply was sent. Cancellation
+        // still shuts down control while the independent I/O owner is polling.
         let mut buffer = vec![0; ipc::MAX_FRAME_BYTES + 4];
-        assert!(socket::recv(right.as_raw_fd(), &mut buffer, MsgFlags::empty()).unwrap() > 0);
         assert_eq!(socket::recv(right.as_raw_fd(), &mut buffer, MsgFlags::empty()).unwrap(), 0);
     }
 }

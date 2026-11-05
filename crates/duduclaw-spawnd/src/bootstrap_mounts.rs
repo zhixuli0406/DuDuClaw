@@ -171,7 +171,7 @@ fn set_attributes(fd: BorrowedFd<'_>, attr: &MountAttr) -> io::Result<()> {
     if result != 0 { return Err(io::Error::last_os_error()); }
     Ok(())
 }
-fn open_verified(runtime: BorrowedFd<'_>, name: &str, digest: Sha256Digest, elf: bool, deadline: Instant) -> io::Result<VerifiedExecutable> {
+pub(crate) fn open_verified(runtime: BorrowedFd<'_>, name: &str, digest: Sha256Digest, elf: bool, deadline: Instant) -> io::Result<VerifiedExecutable> {
     if name.is_empty() || matches!(name, "." | "..") || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')) {
         return Err(invalid());
     }
@@ -251,6 +251,31 @@ fn verify_projection_entries(directory: BorrowedFd<'_>, expected: &BTreeMap<&str
     }
     if count != expected.len() { return Err(invalid()); }
     Ok(())
+}
+
+/// Read exact immutable MCP bytes from the detached mount which B2 receives.
+/// Only flat RunConfig projections are currently implemented. No writable HOME
+/// or project configuration is treated as an equivalent overlay.
+pub(crate) fn verify_mcp_projection(mounts: &PreparedMounts,
+    projection: &duduclaw_mcp_boundary::config::RuntimeProjection) -> io::Result<u64> {
+    use duduclaw_mcp_boundary::config::ConfigDestination;
+    let mut expected = BTreeMap::new();
+    for entry in &projection.files {
+        if entry.destination != ConfigDestination::RunConfig || entry.relative_target.contains('/')
+            || expected.insert(entry.relative_target, entry.contents.clone()).is_some() { return Err(invalid()); }
+    }
+    if expected.is_empty() { return Err(invalid()); }
+    verify_projection_entries(mounts.projection.as_fd(), &expected)?;
+    let mut flags: libc::statvfs = unsafe { mem::zeroed() };
+    if unsafe { libc::fstatvfs(mounts.projection.as_raw_fd(), &mut flags) } != 0
+        || flags.f_flag & libc::ST_RDONLY == 0 { return Err(invalid()); }
+    let mount_id = crate::fds::mount_id(mounts.projection.as_fd())?;
+    for (name, contents) in expected {
+        let digest = Sha256Digest(Sha256::digest(contents.as_bytes()).into());
+        let opened = open_verified(mounts.projection.as_fd(), name, digest, false, Instant::now() + Duration::from_secs(5))?;
+        if opened.identity.bytes != contents.len() as u64 || opened.identity.mount_id != mount_id { return Err(invalid()); }
+    }
+    Ok(mount_id)
 }
 
 /// Enumerate crash residues without accepting arbitrary directory names. The

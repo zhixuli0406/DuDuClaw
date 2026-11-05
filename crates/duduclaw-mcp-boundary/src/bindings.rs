@@ -15,6 +15,16 @@ pub enum BindingError {
 
 type Result<T> = std::result::Result<T, BindingError>;
 
+/// Fresh binding checks supplied by the host's authoritative registries. A
+/// product adapter can reuse its existing stores without copying authority into
+/// the standalone BindingStore. Unreadable or unknown state must reject.
+pub trait BindingAuthority: Send + Sync {
+    fn validate(&self, employee: EmployeeId, binding: &EmployeeBinding,
+        principal: &Principal) -> Result<()>;
+    fn authorize_connector(&self, employee: EmployeeId, binding: &EmployeeBinding,
+        principal: &Principal, account: &str) -> Result<()>;
+}
+
 /// Own this connection in the gateway's protected data directory. SQLite
 /// constraints defend normal write paths, not a compromised gateway/DB owner.
 pub struct BindingStore { connection: Connection }
@@ -24,7 +34,7 @@ pub struct BindingStore { connection: Connection }
 /// adds a fresh principal/member/tombstone check on every boundary verification.
 pub struct BindingCheckedAuthority {
     pub run_policy: std::sync::Arc<dyn crate::LiveAuthority>,
-    pub bindings: std::sync::Arc<std::sync::Mutex<BindingStore>>,
+    pub bindings: std::sync::Arc<dyn BindingAuthority>,
 }
 
 impl crate::LiveAuthority for BindingCheckedAuthority {
@@ -34,10 +44,21 @@ impl crate::LiveAuthority for BindingCheckedAuthority {
         if snapshot.employee != employee || snapshot.run != run {
             return Err(crate::VerificationError::BindingMismatch);
         }
-        self.bindings.lock().map_err(|_| crate::VerificationError::Unavailable)?
-            .validate(employee, &snapshot.binding, &snapshot.principal)
+        self.bindings.validate(employee, &snapshot.binding, &snapshot.principal)
             .map_err(|_| crate::VerificationError::Revoked)?;
         Ok(snapshot)
+    }
+}
+
+impl BindingAuthority for std::sync::Mutex<BindingStore> {
+    fn validate(&self, employee: EmployeeId, binding: &EmployeeBinding,
+        principal: &Principal) -> Result<()> {
+        self.lock().map_err(|_| BindingError::Unavailable)?.validate(employee, binding, principal)
+    }
+    fn authorize_connector(&self, employee: EmployeeId, binding: &EmployeeBinding,
+        principal: &Principal, account: &str) -> Result<()> {
+        self.lock().map_err(|_| BindingError::Unavailable)?
+            .authorize_connector(employee, binding, principal, account)
     }
 }
 

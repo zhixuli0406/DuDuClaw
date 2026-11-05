@@ -183,11 +183,15 @@ pub struct TrampolineReadiness {
     pub executable_verified: bool,
     pub landlock_self_test: bool,
     pub namespace_self_test: bool,
+    pub detected_landlock_abi: u32,
+    pub selected_landlock_abi: u32,
 }
 impl TrampolineReadiness {
     pub fn check(&self) -> Result<()> {
         if self.version != BOOTSTRAP_VERSION || !self.executable_verified
-            || !self.landlock_self_test || !self.namespace_self_test {
+            || !self.landlock_self_test || !self.namespace_self_test
+            || self.detected_landlock_abi == 0
+            || self.selected_landlock_abi != self.detected_landlock_abi.min(7) {
             return Err(ErrorCode::IsolationUnavailable);
         }
         Ok(())
@@ -215,7 +219,7 @@ pub trait Trampoline: Send {
     fn readiness(&mut self) -> Result<TrampolineReadiness>;
     fn prepare(&mut self, plan: BootstrapPlan, sealed_plan: std::os::fd::OwnedFd, mounts: crate::bootstrap_mounts::PreparedMounts,
         inputs: Vec<std::os::fd::OwnedFd>, stdin: Option<std::os::fd::OwnedFd>, mcp: Option<std::os::fd::OwnedFd>,
-        egress: Option<std::os::fd::OwnedFd>) -> Result<PreparedBootstrap>;
+        egress: Option<std::os::fd::OwnedFd>, profile: crate::native_trampoline::NativeProfile) -> Result<PreparedBootstrap>;
     fn bind_unit(&mut self, run: RunHandle, unit: &crate::systemd::linux::StartedUnit, cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<()>;
     fn poll(&mut self, run: RunHandle) -> Result<crate::admission::HostProgress>;
     fn resize(&mut self, run: RunHandle, size: duduclaw_isolation::execution::PtySize) -> Result<()>;
@@ -229,7 +233,7 @@ pub struct UnavailableTrampoline;
 impl Trampoline for UnavailableTrampoline {
     fn readiness(&mut self) -> Result<TrampolineReadiness> { Err(ErrorCode::IsolationUnavailable) }
     fn prepare(&mut self, _: BootstrapPlan, _: std::os::fd::OwnedFd, _: crate::bootstrap_mounts::PreparedMounts, _: Vec<std::os::fd::OwnedFd>,
-        _: Option<std::os::fd::OwnedFd>, _: Option<std::os::fd::OwnedFd>, _: Option<std::os::fd::OwnedFd>) -> Result<PreparedBootstrap> { Err(ErrorCode::IsolationUnavailable) }
+        _: Option<std::os::fd::OwnedFd>, _: Option<std::os::fd::OwnedFd>, _: Option<std::os::fd::OwnedFd>, _: crate::native_trampoline::NativeProfile) -> Result<PreparedBootstrap> { Err(ErrorCode::IsolationUnavailable) }
     fn bind_unit(&mut self, _: RunHandle, _: &crate::systemd::linux::StartedUnit, _: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<()> { Err(ErrorCode::IsolationUnavailable) }
     fn poll(&mut self, _: RunHandle) -> Result<crate::admission::HostProgress> { Err(ErrorCode::IsolationUnavailable) }
     fn resize(&mut self, _: RunHandle, _: duduclaw_isolation::execution::PtySize) -> Result<()> { Err(ErrorCode::IsolationUnavailable) }

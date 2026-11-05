@@ -21,7 +21,9 @@ pub trait Scan: Send {
     fn register(&mut self, run: RunHandle, employee: EmployeeId, startup_ms: u64) -> Result<()>;
     fn cancel(&mut self, run: RunHandle) -> Result<()>;
 }
+pub(crate) type AllocationWork = (duduclaw_migration::allocation::Request, SyncSender<Result<duduclaw_migration::allocation::Receipt>>);
 pub struct WorkerHost {
+    allocation_sender: SyncSender<AllocationWork>,
     sender: SyncSender<(Key, Work)>, receiver: Receiver<Completed>, slots: BTreeMap<Key, Slot>,
     scanner: Box<dyn Scan>,
 }
@@ -30,9 +32,13 @@ impl WorkerHost {
     where H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>> + Send + 'static {
         let (sender, commands) = mpsc::sync_channel::<(Key, Work)>(128);
         let (completed, receiver) = mpsc::sync_channel(128);
+        let (allocation_sender, allocation_commands) = mpsc::sync_channel::<AllocationWork>(8);
         std::thread::Builder::new().name("spawnd-lifecycle".into()).spawn(move || {
             loop {
                 let _ = host.maintenance();
+                if let Ok((request, reply)) = allocation_commands.try_recv() {
+                    let _ = reply.send(host.allocation(&request));
+                }
                 match commands.recv_timeout(Duration::from_millis(25)) {
                     Ok((key, work)) => {
                         let result = match work {
@@ -54,8 +60,9 @@ impl WorkerHost {
                 }
             }
         })?;
-        Ok(Self { sender, receiver, slots: BTreeMap::new(), scanner })
+        Ok(Self { sender, receiver, slots: BTreeMap::new(), scanner, allocation_sender })
     }
+    pub(crate) fn allocation_sender(&self) -> SyncSender<AllocationWork> { self.allocation_sender.clone() }
     fn receive(&mut self) {
         while let Ok(done) = self.receiver.try_recv() {
             if let Some(slot) = self.slots.get_mut(&done.key) { slot.result = Some((done.result, done.at)); }

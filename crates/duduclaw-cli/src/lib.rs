@@ -58,6 +58,8 @@ pub mod mcp_db; // §13.7 WP-D: read-only SQL data-source MCP tools
 pub mod mcp_dispatch; // W20-P1 Phase 2A: transport-agnostic dispatcher
 mod mcp_isolation_identity;
 pub mod mcp_isolation; // Native Linux connection-bound adapter, sharing the existing gates.
+#[cfg(target_os = "linux")]
+mod mcp_isolation_boot;
 pub mod mcp_isolation_execution;
 pub mod mcp_isolation_disposition;
 pub mod mcp_isolation_resources;
@@ -97,6 +99,7 @@ mod premium_templates; // Licensed industry templates (commercial/templates-prem
 #[cfg(test)]
 mod profile_edit_test_hook;
 mod preset_cmd; // WP-6F: `duduclaw preset` — agent preset ("職務組合") CLI surface
+mod isolation_policy_init;
 mod ptc;
 pub mod redaction_verify; // WP2: `duduclaw redaction verify` evidence report
 mod secaudit; // Code security audit MVP: intake + OSS scanner orchestration (`duduclaw secaudit`)
@@ -9151,6 +9154,9 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
         edition: None,
     };
 
+    #[cfg(target_os = "linux")]
+    mcp_isolation_boot::install().map_err(|_| duduclaw_core::error::DuDuClawError::Gateway(
+        "隔離工具介面初始化失敗，請重新啟動服務。".into()))?;
     duduclaw_gateway::start_gateway(config).await
 }
 
@@ -10271,6 +10277,7 @@ fn cmd_org_sync(agent: Option<&str>, dry_run: bool) -> duduclaw_core::error::Res
         }
     }
 
+    if !dry_run { isolation_policy_init::prepare_existing_authority(&home)?; }
     let changes = duduclaw_core::org_store::sync_from_mirrors(&home, agent, dry_run)
         .map_err(|e| DuDuClawError::Agent(format!("寫入 org.toml 失敗:{e}")))?;
 

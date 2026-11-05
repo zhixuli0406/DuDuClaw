@@ -214,3 +214,26 @@ fn wiki_page_uses_wiki_grant_and_still_rejects_path_escape() {
         assert!(authorize(&ctx, "wiki_read", &json!({"page_path":path}), &Fixed(resources.clone())).is_err());
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_resource_authority_is_fresh_and_off_the_reactor_thread() {
+    struct Changing {
+        reactor: std::thread::ThreadId,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl ResourceResolver for Changing {
+        fn resolve(&self, _: &RequestContext, _: &ToolPolicy, _: &Value)
+            -> Result<Vec<ResourceGrant>, VerificationError> {
+            assert_ne!(std::thread::current().id(), self.reactor);
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                Ok(vec![employee()])
+            } else { Err(VerificationError::Revoked) }
+        }
+    }
+    let resolver = std::sync::Arc::new(Changing { reactor: std::thread::current().id(),
+        calls: std::sync::atomic::AtomicUsize::new(0) });
+    let context = context("agent_status", vec![employee()]);
+    assert!(authorize_async(&context, "agent_status", &json!({}), resolver.clone()).await.is_ok());
+    assert!(authorize_async(&context, "agent_status", &json!({}), resolver.clone()).await.is_err());
+    assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+}

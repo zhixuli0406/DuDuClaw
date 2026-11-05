@@ -98,6 +98,25 @@ impl Storage {
         Ok(())
     }
 
+    /// Available even for incomplete images, so B1 can reconcile interrupted
+    /// operations. A mounted image must still prove its kernel backing identity.
+    pub fn images(&self) -> Result<Vec<crate::ImageStatus>> {
+        self.healthy()?;
+        self.inventory()?;
+        self.state.images.iter().map(|entry| {
+            let mounted_device = match mounted_at(&self.mount_path(entry.employee))? {
+                Some(mounted) => {
+                    let image = self.open_image_identity(entry)?;
+                    self.verify_mount_identity(&image, &mounted)?;
+                    Some(mounted.device)
+                },
+                None => None,
+            };
+            Ok(crate::ImageStatus { employee: entry.employee, uid: entry.uid,
+                quota: entry.quota, phase: entry.phase, mounted_device })
+        }).collect()
+    }
+
     /// UID is B1's root-registry mapping, never a gateway request field.
     pub fn provision(&mut self, employee: EmployeeId, uid: u32, quota: Quota) -> Result<()> {
         self.healthy()?;
@@ -877,12 +896,18 @@ mod tests {
     fn iso_root_provision_mount_usage_unmount_destroy() {
         let path = test_path("lifecycle");
         let mut storage = Storage::open(&path).unwrap();
+        assert!(storage.images().unwrap().is_empty());
         let employee = EmployeeId([1; 16]);
         let quota = Quota { bytes: 128 * 1024 * 1024, inodes: 1024 };
         storage.provision(employee, 70000, quota).unwrap();
+        let inventory = storage.images().unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].employee, employee); assert_eq!(inventory[0].uid, 70000);
+        assert_eq!(inventory[0].quota, quota); assert!(inventory[0].mounted_device.is_none());
         storage.provision(employee, 70000, quota).unwrap();
         assert_eq!(storage.resize(employee, Quota { bytes: quota.bytes / 2, ..quota }), Err(Error::ResizeUnsupported));
         let anchor = storage.attach(employee, true).unwrap();
+        assert_eq!(storage.images().unwrap()[0].mounted_device, Some(mounted_at(&anchor.path).unwrap().unwrap().device));
         assert_eq!(storage.attach(employee, true).unwrap().path, anchor.path);
         assert!(matches!(Storage::open(&path), Err(Error::Busy)));
         assert_eq!(storage.attach(employee, false).unwrap_err(), Error::RecoveryRequired);

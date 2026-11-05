@@ -766,6 +766,7 @@ impl AgentRuntime for GenericCliRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
+        super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::GenericCli)?;
         if crate::runtime_dispatch::in_utility_call() {
             return Err("generic CLI utility calls refused: no verified tool-free mode".into());
         }

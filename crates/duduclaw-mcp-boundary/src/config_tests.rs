@@ -22,6 +22,17 @@ fn bridge_projection_has_no_bearer_env_or_legacy_server_command() {
 }
 
 #[test]
+fn claude_selects_the_config_path_visible_inside_the_run() {
+    let projection = runtime_projection(registration(RuntimeKind::Claude)).unwrap();
+    // B2 installs the detached projection at /config after pivot_root. A host
+    // /run path would pass schema validation but fail in the actual employee.
+    assert_eq!(projection.arguments, ["--strict-mcp-config", "--mcp-config", "/config/mcp.json"]);
+    assert_eq!(projection.files.len(), 1);
+    assert_eq!(projection.files[0].destination, ConfigDestination::RunConfig);
+    assert_eq!(projection.files[0].relative_target, "mcp.json");
+}
+
+#[test]
 fn every_native_projection_is_fresh_secret_free_and_bound_to_binary_bytes() {
     for runtime in [RuntimeKind::Claude, RuntimeKind::Codex, RuntimeKind::Grok, RuntimeKind::OpenAiCompat] {
         let projection = runtime_projection(registration(runtime)).unwrap();

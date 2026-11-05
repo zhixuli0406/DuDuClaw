@@ -2,6 +2,8 @@
 pub mod authority;
 pub mod config;
 pub mod execution;
+#[cfg(all(target_os = "linux", feature = "execution-integration"))]
+pub mod protected_launch;
 pub mod factories;
 pub mod worker_execution;
 pub mod resources;

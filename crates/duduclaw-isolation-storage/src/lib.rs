@@ -59,12 +59,24 @@ pub struct Usage {
 #[derive(Debug)]
 pub struct MountAnchor { pub path: std::path::PathBuf, pub noexec: bool }
 
+/// Root-local inventory for B1 crash reconciliation. Mount identity is read
+/// from the kernel and checked against the registered image, never a pathname.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageStatus {
+    pub employee: EmployeeId,
+    pub uid: u32,
+    pub quota: Quota,
+    pub phase: metadata::Phase,
+    pub mounted_device: Option<device::DeviceId>,
+}
+
 /// Root-local B1 seam. No method authorizes a gateway request. B1 must serialize
 /// per-employee admission, drain runs/clones before resize/detach/destroy, and
 /// call readiness at boot, before EVERY run and on its monitoring timer.
 /// Implementations must return errors, never use an unbounded fallback directory.
 pub trait EmployeeStorage: Send {
     fn readiness(&self) -> Result<()>;
+    fn images(&self) -> Result<Vec<ImageStatus>> { Err(Error::Unsupported) }
     fn provision(&mut self, employee: EmployeeId, uid: u32, quota: Quota) -> Result<()>;
     fn attach(&mut self, employee: EmployeeId, noexec: bool) -> Result<MountAnchor>;
     fn detach(&mut self, employee: EmployeeId) -> Result<()>;
@@ -75,6 +87,7 @@ pub trait EmployeeStorage: Send {
 
 impl EmployeeStorage for Storage {
     fn readiness(&self) -> Result<()> { Storage::readiness(self) }
+    fn images(&self) -> Result<Vec<ImageStatus>> { Storage::images(self) }
     fn provision(&mut self, employee: EmployeeId, uid: u32, quota: Quota) -> Result<()> { Storage::provision(self, employee, uid, quota) }
     fn attach(&mut self, employee: EmployeeId, noexec: bool) -> Result<MountAnchor> { Storage::attach(self, employee, noexec) }
     fn detach(&mut self, employee: EmployeeId) -> Result<()> { Storage::detach(self, employee) }
@@ -109,6 +122,7 @@ impl Storage {
     pub fn destroy(&mut self, _: EmployeeId) -> Result<()> { Err(Error::Unsupported) }
     pub fn usage(&self, _: EmployeeId) -> Result<Usage> { Err(Error::Unsupported) }
     pub fn readiness(&self) -> Result<()> { Err(Error::Unsupported) }
+    pub fn images(&self) -> Result<Vec<ImageStatus>> { Err(Error::Unsupported) }
     pub fn resize(&mut self, _: EmployeeId, _: Quota) -> Result<()> { Err(Error::Unsupported) }
 }
 
@@ -152,6 +166,7 @@ mod tests {
         let employee = EmployeeId([1; 16]);
         let quota = Quota { bytes: 64 * 1024 * 1024, inodes: 1024 };
         assert_eq!(storage.readiness(), Err(Error::Unsupported));
+        assert_eq!(storage.images(), Err(Error::Unsupported));
         assert_eq!(storage.provision(employee, 70000, quota), Err(Error::Unsupported));
         assert_eq!(storage.attach(employee, true).unwrap_err(), Error::Unsupported);
         assert_eq!(storage.detach(employee), Err(Error::Unsupported));

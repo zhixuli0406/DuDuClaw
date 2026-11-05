@@ -36,6 +36,7 @@ pub mod isolation_resources;
 pub mod isolation_connectors;
 pub mod isolation_connector_clients;
 pub mod isolation_execution;
+pub mod isolation_readiness;
 pub mod migration_import;
 pub mod migration_startup;
 

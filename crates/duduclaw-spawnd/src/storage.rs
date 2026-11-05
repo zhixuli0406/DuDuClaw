@@ -2,6 +2,13 @@
 use duduclaw_isolation::{execution::{DiskQuota, RunHandle}, ids::{EmployeeId, RequestId, Sha256Digest}, ipc::ErrorCode};
 use crate::Result;
 
+#[cfg(any(target_os = "linux", test))]
+mod adapter_state;
+#[cfg(target_os = "linux")]
+mod adapter;
+#[cfg(target_os = "linux")]
+pub use adapter::LoopStorage;
+
 /// G must bind the complete approved proposal to a stable operation id. Retries
 /// with the same id and different content must fail, including after a restart.
 #[derive(Debug, Clone)]
@@ -65,10 +72,15 @@ pub struct Attachment {
     pub device_minor: u32,
 }
 impl Attachment {
+    /// Cleanup also accepts a durable attach intent with no observed device.
+    pub fn check_identity(&self, employee: EmployeeId, run: RunHandle) -> Result<()> {
+        if self.employee != employee || self.run != run { return Err(ErrorCode::IsolationUnavailable); }
+        Ok(())
+    }
+    /// A launch additionally requires an actually observed mounted device.
     pub fn check(&self, employee: EmployeeId, run: RunHandle) -> Result<()> {
-        if self.employee != employee || self.run != run || self.device_major == 0 {
-            return Err(ErrorCode::IsolationUnavailable);
-        }
+        self.check_identity(employee, run)?;
+        if self.device_major == 0 { return Err(ErrorCode::IsolationUnavailable); }
         Ok(())
     }
 }
@@ -84,7 +96,7 @@ pub struct AttachedStorage {
     pub work: std::os::fd::OwnedFd,
 }
 
-/// Implement with duduclaw-isolation-storage after package H is integrated.
+/// Implemented by LoopStorage using package H and a separate durable B1 journal.
 /// All calls are bounded worker operations; never block the intrusion scanner.
 /// Provision/destroy require G's administrator-approved idempotent operation.
 /// Attach rechecks space/quota/device evidence. Detach is idempotent and only
@@ -129,6 +141,16 @@ mod tests {
         let mut bad = valid.clone(); bad.bytes = 1025; assert!(bad.check(employee, &quota).is_err());
         let mut bad = valid.clone(); bad.device_graph_verified = false; assert!(bad.check(employee, &quota).is_err());
         let mut bad = valid; bad.hard_quota_verified = false; assert!(bad.check(employee, &quota).is_err());
+    }
+    #[test]
+    fn storage_adapter_unmounted_intent_is_cleanup_only() {
+        let employee = EmployeeId([1; 16]);
+        let run = RunHandle(duduclaw_isolation::ids::RunId([2; 16]));
+        let intent = Attachment { employee, run, token: RequestId([3; 16]), device_major: 0, device_minor: 0 };
+        assert!(intent.check_identity(employee, run).is_ok());
+        assert!(intent.check(employee, run).is_err());
+        assert!(intent.check_identity(EmployeeId([4; 16]), run).is_err());
+        assert!(intent.check_identity(employee, RunHandle(duduclaw_isolation::ids::RunId([5; 16]))).is_err());
     }
     #[test]
     fn unavailable_storage_never_returns_empty_success() {

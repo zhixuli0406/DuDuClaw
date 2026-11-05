@@ -15,3 +15,13 @@ pub fn request(request: UpdateRequest) -> Result<UpdateResponse> {
     if actual != expected { return Err(Error::Invalid); }
     Ok(response)
 }
+
+/// Authenticated live probe. Callers compare all returned protocols and the
+/// generation against the other components before admitting protected TEAM runs.
+pub fn probe(nonce: duduclaw_isolation::ids::RequestId) -> Result<crate::readiness::GenerationEvidence> {
+    if nonce.0 == [0; 16] { return Err(Error::Invalid); }
+    let fd = transport::connect()?;
+    transport::send(&fd, &crate::readiness::ProbeRequest { readiness_schema: crate::readiness::READINESS_SCHEMA, nonce })?;
+    let response: crate::readiness::ProbeResponse = transport::receive(&fd)?;
+    response.checked(nonce)
+}

@@ -170,6 +170,7 @@ pub(crate) fn commit_google_config_under_guard(
         before.as_ref().map(|b| b.as_slice()),
         next.as_bytes().to_vec(),
     )?;
+    duduclaw_core::isolation_policy::fence_change(&g.home).map_err(|_| Error::Io)?;
     if config_projection(current)? == config_projection(next)? {
         return home_store::publish_unrelated_source(g, write);
     }
@@ -203,6 +204,7 @@ pub(crate) fn commit_unrelated_config_observed(
     let before=home_store::read_config_snapshot(g)?;
     if before.as_ref().map_or("",|b|std::str::from_utf8(b).unwrap_or("\0"))!=current {return Err(Error::Stale);}
     let write=home_store::prepare_config_write(before.as_ref().map(|b|b.as_slice()),next.as_bytes().to_vec())?;
+    duduclaw_core::isolation_policy::fence_change(&g.home).map_err(|_|Error::Io)?;
     home_store::publish_unrelated_source_observed(g,write,&mut |file|observer(file).map_err(|_|Error::Io))
 }
 pub(crate) fn require_unrelated_config(current:&str,next:&str)->Result<()> {
