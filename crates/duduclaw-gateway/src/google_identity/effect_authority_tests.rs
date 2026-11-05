@@ -3603,8 +3603,9 @@ async fn google_chat_native_personal_and_home_owners_obey_opt_in() {
         let args = json!({"space":"spaces/AAA"});
         let pending = d1_pending(&f, "google_chat_messages", &args);
         crate::google_workspace::set_chat_read_enabled(f.home.path(), false).unwrap();
-        let result = pending.execute_native(args).await.unwrap();
-        assert_eq!(result["isError"], true);
+        // Changing config.toml invalidates the pinned account receipt before the tool gate.
+        let error = pending.execute_native(args).await.unwrap_err();
+        assert_eq!(error.code, "identity_changed", "home={home}");
         assert_eq!(wire.hits.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

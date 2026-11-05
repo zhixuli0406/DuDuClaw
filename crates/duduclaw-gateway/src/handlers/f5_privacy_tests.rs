@@ -475,17 +475,29 @@ async fn shared_system_admin_connections_cannot_open_or_read_cli_login_sessions(
 
 #[tokio::test]
 async fn account_commit_rechecks_role_after_the_request_started() {
-    let f = fixture().await;
-    let root = admin(&f);
-    let guard = CredentialWriteGuard::new(&f.home, &root, crate::power_local::RpcConnInfo::internal());
-    f.db.update_user(&root.user_id, None, Some(UserRole::Employee), None).unwrap();
-    let result = f.handler.handle_accounts_add_with_probe_base_guard(
-        json!({"id":"late-write", "provider":"openai", "type":"api_key", "key":"synthetic-test-key"}),
-        "http://127.0.0.1:1",
-        Some(guard),
-    ).await;
-    assert!(format!("{result:?}").contains("permission denied"));
-    assert!(!f.home.join("config.toml").exists());
+    for existing_config in [false, true] {
+        let f = fixture().await;
+        let config_path = f.home.join("config.toml");
+        // The shared task-privacy fixture seeds a default-agent config before handler construction.
+        let original = std::fs::read(&config_path).unwrap();
+        if !existing_config {
+            std::fs::remove_file(&config_path).unwrap();
+        }
+        let root = admin(&f);
+        let guard = CredentialWriteGuard::new(&f.home, &root, crate::power_local::RpcConnInfo::internal());
+        f.db.update_user(&root.user_id, None, Some(UserRole::Employee), None).unwrap();
+        let result = f.handler.handle_accounts_add_with_probe_base_guard(
+            json!({"id":"late-write", "provider":"openai", "type":"api_key", "key":"synthetic-test-key"}),
+            "http://127.0.0.1:1",
+            Some(guard),
+        ).await;
+        assert!(format!("{result:?}").contains("permission denied"));
+        if existing_config {
+            assert_eq!(std::fs::read(&config_path).unwrap(), original);
+        } else {
+            assert!(!config_path.exists());
+        }
+    }
 }
 
 #[test]
