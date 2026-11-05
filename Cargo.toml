@@ -20,6 +20,7 @@ members = [
     "crates/duduclaw-execution",
     "crates/duduclaw-spawnd",
     "crates/duduclaw-run",
+    "crates/duduclaw-egress",
     "crates/duduclaw-auth",
     "crates/duduclaw-gateway",
     "crates/duduclaw-security",

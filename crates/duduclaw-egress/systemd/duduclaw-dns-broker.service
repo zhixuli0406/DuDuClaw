@@ -1,0 +1,44 @@
+[Unit]
+Description=DuDuClaw fixed-upstream DNS broker
+Requires=duduclaw-dns-broker.socket
+After=duduclaw-dns-broker.socket
+
+[Service]
+ExecStart=/opt/duduclaw/bin/duduclaw-egress dns-broker
+User=duduclaw-dns
+Group=duduclaw-dns
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/tmp /var/tmp
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=accept accept4 access arch_prctl bind brk capget chdir clock_gettime clock_nanosleep close close_range connect dup dup2 dup3 epoll_create1 epoll_ctl epoll_pwait epoll_wait eventfd2 execve exit exit_group fcntl fstat futex getcwd getdents64 getegid geteuid getgid getgroups getpeername getpid getrandom getresgid getresuid getrlimit getsockname getsockopt gettid getuid ioctl listen lseek madvise mmap mprotect mremap munmap nanosleep newfstatat openat poll ppoll prctl pread64 prlimit64 pselect6 read readlink readlinkat readv recvfrom recvmmsg recvmsg restart_syscall rseq rt_sigaction rt_sigprocmask rt_sigreturn sched_getaffinity sched_yield seccomp sendmsg sendto set_robust_list set_tid_address setsockopt shutdown sigaltstack socket socketpair statx uname write writev
+SystemCallErrorNumber=EPERM
+TemporaryFileSystem=/run:ro
+BindReadOnlyPaths=/run/duduclaw-dns-broker
+UMask=0077
+LimitCORE=0
+LimitNOFILE=128
+TasksMax=8
+MemoryMax=64M
+CPUQuota=50%
+StandardOutput=null
+StandardError=journal
+LogRateLimitIntervalSec=60
+LogRateLimitBurst=10
+IPAddressDeny=any
+# Installer MUST add IPAddressAllow=<root-selected upstream>/32 or /128 here.
+# Only this separate process gets that exception; its protocol produces DNS only.
