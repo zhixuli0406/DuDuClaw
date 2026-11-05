@@ -74,6 +74,7 @@ pub(super) struct Fixture {
 /// manager). Employees: main (default), finance, sales, hr, faq (public).
 pub(super) async fn fixture() -> Fixture {
     let home = tempfile::tempdir().unwrap();
+    duduclaw_core::write_minimal_config(home.path(), "127.0.0.1", 18889).unwrap();
     seed_agent(home.path(), "main", "嘟嘟總機", "main", "");
     seed_agent(home.path(), "finance", "財務小幫手", "specialist", "");
     seed_agent(home.path(), "sales", "業務專員", "specialist", "");

@@ -52,6 +52,10 @@ pub enum ChatMessage {
     /// Client → Server: consume an owned offer to stop downstream work.
     #[serde(rename = "cancel_downstream")]
     CancelDownstream { downstream_ref: String, #[serde(default)] request_id: Option<String> },
+    #[serde(rename = "logout")]
+    Logout,
+    #[serde(rename = "subscribe")]
+    Subscribe { session_id: Option<String>, conv: Option<String> },
     /// Client → Server: user sends a message, optionally with file attachments.
     #[serde(rename = "user_message")]
     UserMessage {
@@ -321,6 +325,12 @@ pub(crate) fn current_turn_id() -> Option<String> {
     turns::TURN_ID.try_with(Clone::clone).ok()
 }
 
+fn subscription_unavailable(sid: &str, conv: Option<&str>) -> Message {
+    // Echo only the requested correlation, never a session lookup result.
+    Message::Text(serde_json::json!({"type":"error", "code":"subscription_unavailable",
+        "message":"目前無法接續這段對話，請稍後再試。", "session_id":sid, "conv":conv}).to_string().into())
+}
+
 /// Sent instead of a reply when a turn produced none (B10).
 const NO_REPLY_TEXT: &str = "這則訊息沒有產生回覆，請稍後再傳一次。";
 /// Machine code of [`NO_REPLY_TEXT`] for clients that word it themselves.
@@ -352,11 +362,13 @@ const ACL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Snapshot of what a user may call — role, direct bindings and team
 /// grants (`duduclaw_auth::EffectiveAccess`, read live from users.db at one
 /// ACL generation) — the data `WebChatState::agent_access_allowed` needs to
-/// gate explicit `agent` selection in a WebChat `user_message`. Pure data,
-/// no DB handle, so the decision logic below (`acl_allows_agent` /
+/// gate explicit `agent` selection in a WebChat `user_message`. The edition
+/// lease captures the epoch used to filter team grants. There is no DB handle,
+/// so the decision logic below (`acl_allows_agent` /
 /// `resolve_agent_acl`) is unit-testable without a live `UserDb`.
 #[derive(Debug, Clone)]
 struct AclSnapshot {
+    edition: crate::team_edition::EditionSnapshot,
     access: std::sync::Arc<duduclaw_auth::EffectiveAccess>,
 }
 
@@ -464,9 +476,11 @@ fn load_acl_snapshot(
     if user_db.get_user(user_id)?.is_none() {
         return Err("user not found".to_string());
     }
-    match crate::trigger_route::access::load_account(home, user_db, user_id)? {
-        Some(access) => Ok(AclSnapshot { access }),
+    let (access, edition) = crate::trigger_route::access::load_account_with_edition(home, user_db, user_id)?;
+    match access {
+        Some(access) => Ok(AclSnapshot { access, edition }),
         None => Ok(AclSnapshot {
+            edition,
             access: crate::trigger_route::access::inactive_access(
                 user_id,
                 generation.unwrap_or(0),
@@ -487,6 +501,7 @@ pub struct WebChatState {
     credential_results: std::sync::Mutex<std::collections::VecDeque<crate::handlers::live_context::SocketValidity>>,
     /// Track active connections per user_id.
     turns: Arc<turns::Registry>,
+    subscriptions: turns::Subscriptions,
     approvals: Option<crate::approval::ApprovalBroker>,
     connections: tokio::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// C-ACL (P0-S1): per-user callable-set snapshot cache, keyed by
@@ -509,6 +524,7 @@ impl WebChatState {
             #[cfg(test)]
             credential_results: Default::default(),
             turns: Arc::new(turns::Registry::default()),
+            subscriptions: Default::default(),
             approvals,
             connections: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             acl_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -717,11 +733,13 @@ fn authenticate_with(
 fn webchat_credential_valid(home: &std::path::Path, claims: &duduclaw_auth::jwt::Claims,
     live: &duduclaw_auth::UserContext, now: u64) -> bool {
     if !duduclaw_auth::mfa::credential_epoch_matches(claims.credential_epoch, live.credential_epoch) { return false; }
+    webchat_credential_expiry(home, claims).is_ok_and(|expiry| expiry.is_none_or(|expiry| now < expiry))
+}
+
+fn webchat_credential_expiry(home: &std::path::Path, claims: &duduclaw_auth::jwt::Claims) -> Result<Option<u64>, String> {
     let personal = !crate::team_edition::team_grants_enabled(home);
-    match crate::mfa::enforced(home, personal) {
-        Ok(required) => !(required || (!personal && live.credential_epoch > 0)) || now < claims.exp,
-        Err(_) => false,
-    }
+    crate::mfa::enforced(home, personal)
+        .map(|required| (required || (!personal && claims.credential_epoch > 0)).then_some(claims.exp))
 }
 
 /// Axum handler: upgrade HTTP to WebSocket for WebChat.
@@ -824,7 +842,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
         return;
     }
 
-    let (sink, mut stream) = socket.split();
+    let socket_gate = turns::SocketGate::default();
+    let (sink, mut stream) = turns::GuardedSocket::new(socket, socket_gate.clone()).split();
     let mut sink = turns::BoundedSocketSink(sink);
 
     // ── C5: in-band authentication gate ──────────────────────────────────
@@ -920,19 +939,20 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     let mut cfg_rx = crate::channel_reply::agent_config_events().subscribe();
 
     // Heartbeat: send ping every 30s, close if no pong in 60s
-    let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut heartbeat_interval = tokio::time::interval(liveness::PING_INTERVAL);
     // B10: liveness counts every frame read and every finished turn (see
     // `liveness`), not only pongs, which stay unread while a turn runs.
     let live = liveness::Liveness::new();
 
     let (out_tx, mut out_rx) = turns::outbound_channel();
+    let subscription = state.subscriptions.register(&auth_user, out_tx.clone());
     let writer_state = state.clone();
     let writer_credential = credential.clone();
     let mut writer = tokio::spawn(async move {
         let mut recovery = crate::handlers::live_context::SocketRecovery::default();
         while let Some(frame) = out_rx.recv().await {
-            let validity = writer_state.credential_validity(writer_credential.as_ref(), true).await;
-            if frame.deliver_authorized(validity, &mut recovery, &mut sink).await.is_err() { break; }
+            if frame.deliver_live(&writer_state, writer_credential.as_ref(), &mut recovery, &mut sink, &socket_gate)
+                .await.is_err() { break; }
         }
     });
     let mut sink = turns::SocketSender(out_tx.clone());
@@ -1004,6 +1024,13 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                 #[allow(clippy::collapsible_match)]
                 match msg {
                     Message::Text(text) => {
+                        // Explicit logout narrows only this authenticated socket's turns,
+                        // even when the identity store is temporarily unavailable.
+                        if matches!(serde_json::from_str::<ChatMessage>(&text), Ok(ChatMessage::Logout)) {
+                            state.turns.logout_origin(&auth_user, &user_id, &subscription.resumed_turns());
+                            subscription.clear();
+                            break;
+                        }
                         // Stop requests narrow authority, including after credential revocation.
                         // Reject malformed or concurrent frames before any credential I/O.
                         if let Ok(ChatMessage::CancelDownstream { downstream_ref, request_id }) = serde_json::from_str::<ChatMessage>(&text) {
@@ -1011,7 +1038,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                             let permit = match turns::downstream::admit_stop(&downstream_stop, &downstream_ref, request_id.as_deref()) {
                                 Ok(permit) => permit,
                                 Err(value) => {
-                                    let _ = out_tx.send(turns::Outbound { identity_notice: None,
+                                    let _ = out_tx.send(turns::Outbound { route: None, identity_notice: None,
                                         message: Message::Text(value.to_string().into()), ack: None, deadline: None }).await;
                                     continue;
                                 }
@@ -1025,7 +1052,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 let value = turns::downstream::stop_request(&state, credential.as_ref(), &user,
                                     &downstream_ref, request_id.as_deref()).await;
                                 let notice = turns::IdentityUnavailable::downstream(request_id);
-                                let _ = out.send(turns::Outbound { identity_notice: Some(notice),
+                                let _ = out.send(turns::Outbound { route: None, identity_notice: Some(notice),
                                     message: Message::Text(value.to_string().into()), ack: None,
                                     deadline: Some(tokio::time::Instant::now() + turns::SEND_TIMEOUT) }).await;
                             });
@@ -1057,7 +1084,25 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                             }
                         };
 
+                        let (chat_msg, subscribe_only) = match chat_msg {
+                            ChatMessage::Subscribe { session_id: wanted, conv } => {
+                                subscription.clear();
+                                let Some(wanted) = wanted.filter(|sid| !sid.trim().is_empty()) else {
+                                    let _ = sink.send(Message::Text(serde_json::json!({"type":"subscribed", "session_id":null, "conv":conv}).to_string().into())).await;
+                                    continue;
+                                };
+                                // Force the existing resume path; never mint a session on subscribe.
+                                if wanted == session_id {
+                                    let _ = sink.send(subscription_unavailable(&wanted, conv.as_deref())).await;
+                                    continue;
+                                }
+                                (ChatMessage::UserMessage { content: String::new(), session_id: Some(wanted),
+                                    agent: None, attachments: Vec::new(), conv, msg_id: None }, true)
+                            }
+                            message => (message, false),
+                        };
                         match chat_msg {
+                            ChatMessage::Logout => unreachable!("handled before credential check"),
                             ChatMessage::UserMessage { content, session_id: custom_session, agent: requested_agent, attachments, conv, msg_id } => {
                                 let arrival_seq = crate::trigger_route::pending::next_seq();
                                 // Reuse one event for admission and delayed command handling,
@@ -1200,38 +1245,18 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 if is_resume {
                                     let want = requested_sid.unwrap().to_string();
 
-                                    // ── F3: cross-session / cross-channel resume guard ──
-                                    // Without this, any WS client could resume an
-                                    // arbitrary `webchat:…` (or `telegram:…`) session
-                                    // id and read/write another user's conversation:
-                                    // the resume path only checked that a named agent
-                                    // matched the session's stored owner, not that the
-                                    // *connection* owns the session.
-                                    //
-                                    // A webchat connection announces its own session id
-                                    // `webchat:webchat:{peer_ip}:{random-suffix}` and
-                                    // every session it creates shares that id as a
-                                    // prefix (optionally a `#agent:<name>` suffix). We
-                                    // therefore only allow resuming a session that
-                                    // belongs to THIS connection's ownership scope:
-                                    //   * exactly the connection's own session id, or
-                                    //   * one derived from it (`{session_id}#…`).
-                                    // This rejects cross-channel ids (telegram:/discord:
-                                    // never share the prefix) and any session minted by
-                                    // a different connection (different random suffix).
-                                    //
-                                    // Residual limitation (honest DEGRADED): because a
-                                    // webchat identity is only ephemeral IP + random
-                                    // suffix (no durable user), a session created on a
-                                    // *previous* connection cannot be securely resumed
-                                    // on a fresh one — it fails closed here. That is the
-                                    // cost of closing the cross-user read/write hole
-                                    // until webchat gains a real authenticated user id.
+                                    // Authenticated users retain a stable ownership tag across
+                                    // sockets. Widget identities rotate per connection; their
+                                    // previous visit and every other user's sessions stay denied.
                                     let owns_session = owns_webchat_session(&want, &owner_tag);
                                     if !owns_session {
                                         warn!(
                                             "WebChat resume denied: session {want} not owned by this user"
                                         );
+                                        if subscribe_only {
+                                            let _ = sink.send(subscription_unavailable(&want, conv_nonce.as_deref())).await;
+                                            continue;
+                                        }
                                         let err = ChatMessage::error("conversation not found");
                                         if let Ok(json) = serde_json::to_string(&err) {
                                             let _ = sink.send(Message::Text(json.into())).await;
@@ -1239,10 +1264,19 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         continue;
                                     }
 
-                                    match state.ctx.session_manager.session_agent(&want).await {
+                                    let stored = state.ctx.session_manager.session_agent(&want).await;
+                                    let stored = match stored {
+                                        Ok(None) if subscribe_only => Ok(state.turns.pending_agent(&auth_user, &want)),
+                                        result => result,
+                                    };
+                                    match stored {
                                         Ok(Some(stored_agent)) => {
                                             if let Err(frame) = state.authorize_resume_target(&auth_user, &stored_agent).await {
-                                                sink.frame(frame).await;
+                                                if subscribe_only {
+                                                    let _ = sink.send(subscription_unavailable(&want, conv_nonce.as_deref())).await;
+                                                } else {
+                                                    sink.frame(frame).await;
+                                                }
                                                 continue;
                                             }
                                             // Identity guard: a named agent must own
@@ -1329,6 +1363,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             announced_agent = effective_agent.clone();
                                         }
                                         Ok(None) => {
+                                            if subscribe_only {
+                                                let _ = sink.send(subscription_unavailable(&want, conv_nonce.as_deref())).await;
+                                                continue;
+                                            }
                                             let err = ChatMessage::error("conversation not found");
                                             if let Ok(json) = serde_json::to_string(&err) {
                                                 let _ = sink.send(Message::Text(json.into())).await;
@@ -1337,6 +1375,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         }
                                         Err(e) => {
                                             warn!("WebChat resume lookup failed: {e}");
+                                            if subscribe_only {
+                                                let _ = sink.send(subscription_unavailable(&want, conv_nonce.as_deref())).await;
+                                                continue;
+                                            }
                                             let err = ChatMessage::error("failed to load conversation");
                                             if let Ok(json) = serde_json::to_string(&err) {
                                                 let _ = sink.send(Message::Text(json.into())).await;
@@ -1365,6 +1407,12 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         conv_nonce.as_deref(),
                                     );
                                     sid = &sid_owned;
+                                }
+
+                                if subscribe_only {
+                                    subscription.subscribe(sid, conv_nonce.clone());
+                                    let _ = sink.send(Message::Text(serde_json::json!({"type":"subscribed", "session_id":sid, "conv":conv_nonce}).to_string().into())).await;
+                                    continue;
                                 }
 
                                 // ── `@` routing (D6): a message may call another
@@ -1494,11 +1542,13 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             content, attachments, assign_event, arrival_seq,
                                             resume_acl: resume_acl || routed.called,
                                         };
+                                        ticket.set_origin(input.effective_agent.as_deref().unwrap_or(&input.agent_id), &user_id);
+                                        subscription.subscribe(sid, input.conv_nonce.clone());
                                         tokio::spawn(turns::execute(input, turn_sink, ticket));
                                     }
                                     Err(code) => {
                                         let value = turn_admission_error(code, sid, conv_nonce.as_deref(), &msg_id);
-                                        let _ = out_tx.send(turns::Outbound { identity_notice: None, message: Message::Text(value.to_string().into()), ack: None, deadline: None }).await;
+                                        let _ = out_tx.send(turns::Outbound { route: None, identity_notice: None, message: Message::Text(value.to_string().into()), ack: None, deadline: None }).await;
                                     }
                                 }
                             }
@@ -1516,7 +1566,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     serde_json::json!({"type":"error", "code":"turn_not_found",
                                         "message":"Pending conversation not found or ambiguous", "request_id":request_id})
                                 };
-                                let frame = turns::Outbound { identity_notice: None,
+                                let frame = turns::Outbound { route: None, identity_notice: None,
                                     message: Message::Text(value.to_string().into()),
                                     ack: None, deadline: None,
                                 };
@@ -2404,7 +2454,9 @@ mod tests {
     // WebSocket needed to exercise the actual security decision.
 
     fn snapshot(role: UserRole, bound: &[&str]) -> AclSnapshot {
+        let home = tempfile::tempdir().unwrap();
         AclSnapshot {
+            edition: crate::team_edition::snapshot(home.path()).unwrap(),
             access: std::sync::Arc::new(duduclaw_auth::EffectiveAccess {
                 user_id: "u-test".into(),
                 role,

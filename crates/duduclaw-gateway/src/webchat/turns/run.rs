@@ -17,6 +17,17 @@ pub(in crate::webchat) struct TurnInput {
     pub arrival_seq: i64,
 }
 
+struct RefuseCancelledDelivery<'a> {
+    reply: &'a crate::channel_reply::GuardedReply,
+    cancel: &'a CancellationToken,
+}
+
+impl Drop for RefuseCancelledDelivery<'_> {
+    fn drop(&mut self) {
+        if self.cancel.is_cancelled() { self.reply.refuse_delivery(); }
+    }
+}
+
 pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
     let TurnInput {
         state,
@@ -237,6 +248,12 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
         watch_tx,
         work,
     );
+    let (accepted_tx, mut accepted_rx) = mpsc::channel(1);
+    let delivery = crate::channel_reply::WebChatTurnDelivery {
+        state: state.clone(), user: auth_user.clone(), client_msg_id: sink.msg_id.clone(), accepted: accepted_tx,
+        refused: Arc::new(AtomicBool::new(false)),
+    };
+    let work = crate::channel_reply::WEBCHAT_TURN_DELIVERY.scope(delivery.clone(), work);
     tokio::pin!(work);
     // The model the backend ACTUALLY answered with
     // (ProgressEvent::ModelInfo) — stamped onto the
@@ -250,6 +267,9 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
         thinking_visibility.flush_redaction(&progress, &mut sink).await;
         tokio::select! {
             r = &mut work => break r,
+            Some((stored_sid, id)) = accepted_rx.recv() => {
+                sink.value(serde_json::json!({"type":"turn_accepted", "user_row_id":id, "session_id":stored_sid})).await;
+            }
             Some(notice) = watch_rx.recv() => {
                 let msg = ChatMessage::ComputerWatch {
                     agent_id: notice.agent_id, href: notice.href,
@@ -312,16 +332,29 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
             }
         }
     };
+    if let Ok((stored_sid, id)) = accepted_rx.try_recv() {
+        sink.value(serde_json::json!({"type":"turn_accepted", "user_row_id":id, "session_id":stored_sid})).await;
+    }
     let actual_model = progress.finish(&sink.progress_dropped);
+    let guarded = reply;
+    // Runs before GuardedReply::drop even when cancellation drops an awaited
+    // credential/commit future after begin_delivery has fenced ordinary cancel.
+    let _cancel_delivery = RefuseCancelledDelivery { reply: &guarded, cancel: &ticket.delivery_cancel };
     // No await may expose a completed reply to cancellation before this fence.
     if !ticket.begin_delivery() {
-        reply.refuse_delivery();
+        guarded.refuse_delivery();
         return;
     }
     let validity = state.credential_validity(credential.as_ref(), true).await;
     if validity != crate::handlers::live_context::SocketValidity::Valid {
-        reply.refuse_delivery();
+        guarded.refuse_delivery();
         sink.identity_unavailable(validity, false).await;
+        return;
+    }
+    let answering_agent = guarded.answered_by.as_ref().map(|a| a.id.as_str()).unwrap_or(effective_agent_id);
+    if delivery.refused.load(Ordering::SeqCst)
+        || state.authorize_target(&auth_user, answering_agent, true).await.is_err() {
+        guarded.refuse_delivery();
         return;
     }
     thinking_visibility.flush_redaction(&progress, &mut sink).await;
@@ -339,7 +372,6 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
     // transformation below (📎DELIVER parsing, cli-noise,
     // branding, etc.) only ever operates on the text; the
     // artifact rides along untouched to the final frame.
-    let guarded = reply;
     let reply = guarded.text.clone();
     let operator_artifact = guarded.artifact.clone();
     let answered_by = guarded.answered_by.clone();
@@ -460,7 +492,7 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
         persist_failure(&state.ctx.session_manager, sid, NO_REPLY_TEXT).await;
         let frame = ChatMessage::error_coded(NO_REPLY_TEXT, NO_REPLY_CODE);
         if let Ok(json) = serde_json::to_string(&frame) {
-            let _ = send_terminal(&state, credential.as_ref(), &mut sink, &guarded, &owned_archives, Message::Text(json.into())).await;
+            let _ = send_terminal(&state, &auth_user, answering_agent, sid, &ticket.delivery_cancel, credential.as_ref(), &mut sink, &guarded, &owned_archives, Message::Text(json.into())).await;
         } else {
             guarded.refuse_delivery();
             rollback_owned_webchat_archives(&owned_archives).await;
@@ -486,11 +518,7 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
             rollback_owned_webchat_archives(&owned_archives).await;
             return;
         }
-        let send_result = send_terminal(&state, credential.as_ref(), &mut sink, &guarded, &owned_archives, Message::Text(json.into())).await;
-        if !guarded.still_valid().await {
-            rollback_owned_webchat_archives(&owned_archives).await;
-            warn!("WebChat: source changed during reply delivery");
-        }
+        let send_result = send_terminal(&state, &auth_user, answering_agent, sid, &ticket.delivery_cancel, credential.as_ref(), &mut sink, &guarded, &owned_archives, Message::Text(json.into())).await;
         if send_result.is_err() {
             return;
         }
@@ -501,25 +529,77 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
 }
 
 /// The surrounding delivery-cleanup scope waits for row revocation before
-/// releasing the session FIFO. A successful ack remains delivered on disconnect.
+/// releasing the session FIFO. Transport loss alone keeps the persisted reply.
 async fn send_terminal(
     state: &WebChatState,
+    auth_user: &str,
+    answering_agent: &str,
+    sid: &str,
+    cancel: &CancellationToken,
     credential: Option<&duduclaw_auth::jwt::Claims>,
     sink: &mut TurnSink,
     guarded: &crate::channel_reply::GuardedReply,
     owned_archives: &[PathBuf],
     frame: Message,
 ) -> Result<(), ()> {
+    if cancel.is_cancelled() || state.authorize_target(auth_user, answering_agent, true).await.is_err() {
+        guarded.refuse_delivery();
+        rollback_owned_webchat_archives(owned_archives).await;
+        return Err(());
+    }
     let validity = state.credential_validity(credential, true).await;
     let mut recovery = crate::handlers::live_context::SocketRecovery::default();
-    if !rollback_before_final_reply(validity, &mut recovery, owned_archives).await {
+    if cancel.is_cancelled() || state.authorize_target(auth_user, answering_agent, true).await.is_err()
+        || !rollback_before_final_reply(validity, &mut recovery, owned_archives).await {
         guarded.refuse_delivery();
+        rollback_owned_webchat_archives(owned_archives).await;
         sink.identity_unavailable(validity, false).await;
         return Err(());
     }
-    let result = guarded.confirm_send(sink.send(frame)).await;
-    if result.is_err() {
-        rollback_owned_webchat_archives(owned_archives).await;
+    let content = match &frame {
+        Message::Text(text) => serde_json::from_str::<serde_json::Value>(text).ok()
+            .and_then(|value| value.get("content").and_then(|v| v.as_str()).map(str::to_owned)),
+        _ => None,
+    };
+    if let Some(content) = content {
+        if guarded.persist_webchat(&state.ctx.session_manager, sid, &content).await.is_err() {
+            rollback_owned_webchat_archives(owned_archives).await;
+            return Err(());
+        }
     }
-    result
+    if state.authorize_target(auth_user, answering_agent, true).await.is_err() {
+        guarded.refuse_delivery();
+        rollback_owned_webchat_archives(owned_archives).await;
+        return Err(());
+    }
+    // The pipeline staged a tombstoned row. Socket failure alone still permits
+    // publication after fan-out; source or authority failure leaves it hidden.
+    for mut destination in state.subscriptions.sinks(auth_user, sid, &sink.msg_id, answering_agent, credential, guarded.delivery_fence().for_turn(cancel)) {
+        if state.authorize_target(auth_user, answering_agent, true).await.is_err() {
+            guarded.refuse_delivery();
+        }
+        if !guarded.still_valid().await {
+            rollback_owned_webchat_archives(owned_archives).await;
+            return Err(());
+        }
+        let _ = destination.send(frame.clone()).await;
+    }
+    let users = state.user_db.clone();
+    let generation = tokio::task::spawn_blocking(move || users.acl_generation()).await
+        .ok().and_then(Result::ok);
+    let validity = state.credential_validity(credential, true).await;
+    if cancel.is_cancelled() || state.authorize_target(auth_user, answering_agent, true).await.is_err()
+        || !rollback_before_final_reply(validity, &mut recovery, owned_archives).await {
+        guarded.refuse_delivery();
+        rollback_owned_webchat_archives(owned_archives).await;
+        return Err(());
+    }
+    let policy = state.target_policy(auth_user, answering_agent, true).await;
+    let published = match (generation, policy) {
+        (Some(generation), Ok(policy)) => guarded.publish_webchat(&state.ctx.session_manager, sid,
+            &state.user_db, generation, &policy, cancel).await,
+        _ => { guarded.refuse_delivery(); Err(()) }
+    };
+    if published.is_err() { rollback_owned_webchat_archives(owned_archives).await; }
+    published
 }

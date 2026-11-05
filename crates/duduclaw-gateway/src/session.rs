@@ -55,6 +55,7 @@ pub(crate) struct WebChatHistoryMessage {
     pub id: i64,
     pub message: SessionMessage,
     pub notice_kind: Option<String>,
+    pub client_msg_id: Option<String>,
 }
 
 /// One row of `list_title_candidates` — a session the background auto-titler
@@ -257,6 +258,10 @@ impl SessionManager {
         //   just before each user turn is appended (i.e. before every agent
         //   run); /rollback tombstones everything after it.
         let _ = conn.execute("ALTER TABLE session_messages ADD COLUMN undone_at TEXT", []);
+        // Pending WebChat replies are tombstoned from insertion. Only the
+        // final delivery fence may publish them; ordinary restore cannot.
+        let _ = conn.execute("ALTER TABLE session_messages ADD COLUMN delivery_pending INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE session_messages ADD COLUMN client_msg_id TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE sessions ADD COLUMN lineage INTEGER NOT NULL DEFAULT 1",
             [],
@@ -355,6 +360,13 @@ impl SessionManager {
         content: &str,
         tokens: u32,
     ) -> Result<i64> {
+        self.append_delivery_message(session_id, role, content, tokens, None, false).await
+    }
+
+    pub(crate) async fn append_delivery_message(
+        &self, session_id: &str, role: &str, content: &str, tokens: u32,
+        client_msg_id: Option<&str>, pending: bool,
+    ) -> Result<i64> {
         let conn = self.acquire().await;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -375,9 +387,11 @@ impl SessionManager {
         }
 
         conn.execute(
-            "INSERT INTO session_messages (session_id, role, content, tokens, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id, role, content, tokens, now],
+            "INSERT INTO session_messages (session_id, role, content, tokens, timestamp,
+                                          client_msg_id, delivery_pending, undone_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![session_id, role, content, tokens, now, client_msg_id, pending,
+                pending.then_some(&now)],
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         let message_id = conn.last_insert_rowid();
@@ -576,7 +590,7 @@ impl SessionManager {
     pub(crate) async fn webchat_history(&self, session_id: &str) -> Result<Vec<WebChatHistoryMessage>> {
         let conn = self.acquire().await;
         let mut stmt = conn.prepare(
-            "SELECT id, role, content, tokens, timestamp, notice_kind FROM session_messages
+            "SELECT id, role, content, tokens, timestamp, notice_kind, client_msg_id FROM session_messages
              WHERE session_id = ?1 AND undone_at IS NULL
                AND (hidden = 0 OR notice_kind = 'turn_failure') ORDER BY id ASC",
         ).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
@@ -586,6 +600,7 @@ impl SessionManager {
                 role: row.get(1)?, content: row.get(2)?, tokens: row.get(3)?, timestamp: row.get(4)?,
             },
             notice_kind: row.get(5)?,
+            client_msg_id: row.get(6)?,
         })).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))
@@ -665,6 +680,20 @@ impl SessionManager {
     /// therefore retained for audit only *until the next compression*, not
     /// indefinitely (see `session_portability.rs` module docs).
     pub async fn compress(&self, session_id: &str, summary: &str) -> Result<()> {
+        self.compress_checked(session_id, summary, None).await
+    }
+
+    /// Background summaries must not discard rows that arrived while the
+    /// utility model was running, including a newly published staged reply.
+    pub(crate) async fn compress_if_unchanged(
+        &self, session_id: &str, summary: &str, expected_ids: &[i64],
+    ) -> Result<()> {
+        self.compress_checked(session_id, summary, Some(expected_ids)).await
+    }
+
+    async fn compress_checked(
+        &self, session_id: &str, summary: &str, expected_ids: Option<&[i64]>,
+    ) -> Result<()> {
         let masked_summary = duduclaw_security::credential_detect::mask(summary);
         let summary = masked_summary.as_str();
         let conn = self.acquire().await;
@@ -673,6 +702,27 @@ impl SessionManager {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_messages WHERE session_id=?1 AND delivery_pending=1)",
+            [session_id], |row| row.get(0),
+        ).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        if pending {
+            return Err(DuDuClawError::Gateway("session delivery still pending".into()));
+        }
+        if let Some(expected) = expected_ids {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM session_messages WHERE session_id=?1
+                 AND hidden=0 AND undone_at IS NULL ORDER BY id ASC",
+            ).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            let current = stmt.query_map([session_id], |row| row.get::<_, i64>(0))
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            if current.as_slice() != expected {
+                return Err(DuDuClawError::Gateway("session changed during compression".into()));
+            }
+        }
 
         tx.execute(
             "DELETE FROM session_ccr_references WHERE session_id = ?1",
@@ -1305,12 +1355,38 @@ impl SessionManager {
         let now = chrono::Utc::now().to_rfc3339();
         let rows = conn
             .execute(
-                "UPDATE session_messages SET content = ?1, undone_at = ?2
-                 WHERE id = ?3 AND session_id = ?4 AND undone_at IS NULL",
+                "UPDATE session_messages SET content = ?1, undone_at = ?2, delivery_pending = 0
+                 WHERE id = ?3 AND session_id = ?4 AND (undone_at IS NULL OR delivery_pending = 1)",
                 params![replacement, now, message_id, session_id],
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         Ok(rows > 0)
+    }
+
+    /// Publish under the users.db generation lease AND the live config/registry
+    /// policy locks. No await separates the final policy check and UPDATE.
+    pub(crate) async fn publish_webchat_message(
+        &self, session_id: &str, message_id: i64, users: &duduclaw_auth::UserDb,
+        generation: u64, policy: &crate::webchat::access::TargetPolicy, allowed: impl FnOnce() -> bool,
+    ) -> Result<bool> {
+        let conn = self.acquire().await;
+        conn.busy_timeout(std::time::Duration::ZERO)
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let result = users.with_acl_generation(generation, || {
+            policy.with_current(|| {
+                if !allowed() { return Ok(false); }
+                conn.execute(
+                    "UPDATE session_messages SET undone_at = NULL, delivery_pending = 0
+                     WHERE id = ?1 AND session_id = ?2 AND role = 'assistant'
+                       AND delivery_pending = 1 AND undone_at IS NOT NULL",
+                    params![message_id, session_id],
+                ).map(|rows| rows == 1).map_err(|e| DuDuClawError::Gateway(e.to_string()))
+            }).map_err(DuDuClawError::Gateway).and_then(|result| result)
+        }).map_err(DuDuClawError::Gateway).and_then(|result| result);
+        if let Err(error) = conn.busy_timeout(std::time::Duration::from_secs(5)) {
+            tracing::warn!(%error, "Session connection timeout restore failed");
+        }
+        result
     }
 
     /// Restore a previously hidden message back to active context.
@@ -1491,6 +1567,89 @@ impl SessionManager {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn webchat_client_message_id_survives_reopen_without_acceptance_frame() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("webchat:owned", "worker").await.unwrap();
+        let id = mgr.append_delivery_message("webchat:owned", "user", "same text", 2,
+            Some("client-turn-1"), false).await.unwrap();
+        mgr.append_delivery_message("webchat:owned", "user", "same text", 2,
+            Some("client-turn-2"), false).await.unwrap();
+        drop(mgr);
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        let history = mgr.webchat_history("webchat:owned").await.unwrap();
+        assert_eq!(history[0].id, id);
+        assert_eq!(history[0].message.role, "user");
+        assert_eq!(history[0].client_msg_id.as_deref(), Some("client-turn-1"));
+        assert_eq!(history[1].client_msg_id.as_deref(), Some("client-turn-2"));
+        assert!(mgr.webchat_history("webchat:other").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn webchat_pending_publication_requires_current_acl_and_final_fence() {
+        let tmp = NamedTempFile::new().unwrap();
+        let user_file = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        let users = duduclaw_auth::UserDb::new(user_file.path()).unwrap();
+        mgr.get_or_create("webchat:owned", "worker").await.unwrap();
+        let id = mgr.append_delivery_message("webchat:owned", "assistant", "private reply", 2,
+            None, true).await.unwrap();
+        let generation = users.acl_generation().unwrap();
+        Connection::open(user_file.path()).unwrap().execute(
+            "UPDATE auth_meta SET value=value+1 WHERE key='acl_generation'", [],
+        ).unwrap();
+        assert!(mgr.publish_webchat_message("webchat:owned", id, &users, generation, &crate::webchat::access::TargetPolicy::test_admin(),
+            || panic!("a stale generation must not enter the publication callback")).await.is_err());
+        let generation = users.acl_generation().unwrap();
+        assert!(!mgr.publish_webchat_message("webchat:owned", id, &users, generation, &crate::webchat::access::TargetPolicy::test_admin(), || false).await.unwrap());
+        assert!(mgr.get_messages("webchat:owned").await.unwrap().is_empty());
+        assert!(mgr.webchat_history("webchat:owned").await.unwrap().is_empty());
+        assert!(mgr.publish_webchat_message("webchat:owned", id, &users, generation, &crate::webchat::access::TargetPolicy::test_admin(), || true).await.unwrap());
+        assert_eq!(mgr.get_messages("webchat:owned").await.unwrap()[0].content, "private reply");
+        assert!(!mgr.publish_webchat_message("webchat:owned", id, &users, generation, &crate::webchat::access::TargetPolicy::test_admin(), || true).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn compression_preserves_pending_and_newly_published_replies() {
+        let tmp = NamedTempFile::new().unwrap();
+        let user_file = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        let users = duduclaw_auth::UserDb::new(user_file.path()).unwrap();
+        mgr.get_or_create("webchat:owned", "worker").await.unwrap();
+        mgr.append_message("webchat:owned", "user", "question", 2).await.unwrap();
+        let before_reply = mgr.get_message_ids("webchat:owned").await.unwrap();
+        let id = mgr.append_delivery_message("webchat:owned", "assistant", "private reply", 2,
+            None, true).await.unwrap();
+        assert!(mgr.compress("webchat:owned", "incomplete summary").await.is_err());
+        assert!(mgr.compress_if_unchanged("webchat:owned", "incomplete summary", &before_reply).await.is_err());
+        assert_eq!(mgr.compression_summary("webchat:owned").await.unwrap(), "");
+        assert!(mgr.publish_webchat_message("webchat:owned", id, &users,
+            users.acl_generation().unwrap(), &crate::webchat::access::TargetPolicy::test_admin(), || true).await.unwrap());
+        // A previous background job may finish after this publication. Its
+        // snapshot omitted the reply, so it cannot delete the completed turn.
+        assert!(mgr.compress_if_unchanged("webchat:owned", "old summary", &before_reply).await.is_err());
+        assert_eq!(mgr.get_messages("webchat:owned").await.unwrap().len(), 2);
+        let after_reply = mgr.get_message_ids("webchat:owned").await.unwrap();
+        mgr.compress_if_unchanged("webchat:owned", "complete summary", &after_reply).await.unwrap();
+        assert_eq!(mgr.compression_summary("webchat:owned").await.unwrap(), "complete summary");
+    }
+
+    #[tokio::test]
+    async fn webchat_scrubbed_pending_reply_cannot_be_published() {
+        let tmp = NamedTempFile::new().unwrap();
+        let user_file = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        let users = duduclaw_auth::UserDb::new(user_file.path()).unwrap();
+        mgr.get_or_create("webchat:owned", "worker").await.unwrap();
+        let id = mgr.append_delivery_message("webchat:owned", "assistant", "private reply", 2,
+            None, true).await.unwrap();
+        assert!(mgr.revoke_message("webchat:owned", id, "refused").await.unwrap());
+        assert!(!mgr.publish_webchat_message("webchat:owned", id, &users,
+            users.acl_generation().unwrap(), &crate::webchat::access::TargetPolicy::test_admin(), || true).await.unwrap());
+        assert!(mgr.webchat_history("webchat:owned").await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn webchat_cancellation_purge_uses_second_connection_and_explicit_delete() {

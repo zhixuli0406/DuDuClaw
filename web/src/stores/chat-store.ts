@@ -86,7 +86,7 @@ export interface ChatMessage {
   readonly artifact?: ChatArtifact;
   /** Knowledge-base sources cited by `[n]` markers in this reply (validated). */
   readonly citations?: readonly ChatCitation[];
-  /** Stored row id from `chat.sessions.history` (resumed messages only). */
+  /** Stored row id from `turn_accepted` or `chat.sessions.history`. */
   readonly historyId?: number;
   /** The AI staff member that answered (from `assistant_done.agent`). Differs
    *  from the selected partner when the message called someone else by `@`. */
@@ -233,11 +233,14 @@ interface ChatStore {
   readonly lastCompletedReplyId: string | null;
   readonly lastTurnFrameAt: number | null;
   readonly historyReplyRevision: number;
+  readonly historyReconnectRevision: number;
   /** Fine-grained turn phase for the companion face (thinking/speaking/…). */
   readonly phase: ChatPhase;
   /** Current mouth shape while `speaking` — sampled per assistant chunk. */
   readonly viseme: VisemeShape;
   readonly sessionId: string | null;
+  /** Canonical session supplied by a correlated accepted turn, including @ routing. */
+  readonly acceptedSessionId: string | null;
   /**
    * The session id the server assigned to THIS connection, captured from the
    * first `session_info` frame. Held in store state (not a module variable) so
@@ -479,6 +482,8 @@ export interface HistoryMessageWire {
   readonly artifact?: unknown;
   /** Stored message row id (optional; newer gateways). */
   readonly id?: number;
+  /** Original user-message id, persisted even if its acknowledgement is lost. */
+  readonly client_msg_id?: string | null;
 }
 
 /**
@@ -502,6 +507,8 @@ export function historyToMessages(raw: readonly HistoryMessageWire[]): ChatMessa
       ...(typeof m.tokens === 'number' ? { tokens: m.tokens } : {}),
       ...(artifact ? { artifact } : {}),
       ...(typeof m.id === 'number' && Number.isFinite(m.id) ? { historyId: m.id } : {}),
+      ...(m.role === 'user' && typeof m.client_msg_id === 'string' && m.client_msg_id
+        ? { turnId: m.client_msg_id } : {}),
     };
   });
 }
@@ -523,6 +530,14 @@ let awaitingFirstServerFrame = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempt = 0;
 let intentionalDisconnect = false;
+let visibilityListener: (() => void) | null = null;
+
+function subscribeCurrentConversation() {
+  if (!wsRef || wsRef.readyState !== WebSocket.OPEN) return;
+  const state = useChatStore.getState();
+  wsRef.send(JSON.stringify({ type: 'subscribe',
+    session_id: state.resumedExplicitly ? state.sessionId : null, conv: state.convId }));
+}
 const MAX_RECONNECT_ATTEMPTS = 10;
 
 // When the reply stream pauses (no chunk for a beat), let the mouth fall back to
@@ -551,13 +566,34 @@ function scheduleReconnect(connectFn: () => void) {
 
 export const useChatStore = create<ChatStore>((set, get) => {
   function connect() {
-    if (wsRef && wsRef.readyState === WebSocket.OPEN) return;
+    if (wsRef && (wsRef.readyState === WebSocket.OPEN || wsRef.readyState === WebSocket.CONNECTING)) return;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (!visibilityListener) {
+      visibilityListener = () => {
+        if (document.visibilityState !== 'visible' || intentionalDisconnect) return;
+        // A suspended tab may still report OPEN for a dead transport. Replace it
+        // immediately, without waiting for a delayed close event or backoff.
+        const previous = wsRef;
+        wsRef = null;
+        previous?.close();
+        reconnectAttempt = 0;
+        connect();
+      };
+      document.addEventListener('visibilitychange', visibilityListener);
+    }
 
     intentionalDisconnect = false;
-    // A fresh connection re-derives its own server session id, so start a fresh
-    // conversation nonce too (the previous connection's buckets are unreachable
-    // once the server mints a new suffix).
-    set(state => ({ connectionState: 'connecting', ...(!state.resumedExplicitly ? { resolvedAgent: undefined, assignmentError: null } : {}), ownSessionId: null, activeMessageId: null, lastCompletedReplyId: null, convId: nextConvId() }));
+    // Preserve the conversation identity across transport replacement. The
+    // connection hello only supplies the base for the next new conversation.
+    set(state => {
+      const resume = state.sessionId && (state.resumedExplicitly || state.messages.length > 0);
+      const sessionId = resume ? state.acceptedSessionId ?? (state.resumedExplicitly ? state.sessionId
+        : `${state.sessionId}${state.selectedAgentId ? `#agent:${state.selectedAgentId}` : ''}#conv:${state.convId}`)
+        : state.sessionId;
+      return { connectionState: 'connecting', ownSessionId: null,
+        ...(resume ? { sessionId, resumedExplicitly: true } : { resolvedAgent: undefined, assignmentError: null }),
+      };
+    });
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${window.location.host}/ws/chat`;
@@ -585,6 +621,14 @@ export const useChatStore = create<ChatStore>((set, get) => {
       if (wsRef !== socket) return;
       try {
         const data = JSON.parse(event.data);
+        // A lost subscription is not a terminal event for an accepted turn.
+        // Only a refusal correlated to this exact view may trigger recovery.
+        if (data.type === 'error' && data.code === 'subscription_unavailable') {
+          if (get().resumedExplicitly && data.session_id === get().sessionId && data.conv === get().convId) {
+            set(state => ({ historyReconnectRevision: state.historyReconnectRevision + 1 }));
+          }
+          return;
+        }
         // A finished reply — for ANY conversation, even one whose frames are
         // about to be dropped below — changed the server-side session list
         // (created/updated a session bucket). Signal the page to refresh the
@@ -600,6 +644,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
         if (!shouldRenderChatFrame(data, get())) {
           if (isOtherConversationFailure(data, get())) toast.info(lookupMessage('chat.otherConversationFailed'));
           return;
+        }
+        if (data.type !== 'error' && typeof data.session_id === 'string' && data.session_id
+          && data.conv === get().convId && typeof data.msg_id === 'string'
+          && get().messages.findLast(message => message.role === 'user')?.turnId === data.msg_id) {
+          set({ acceptedSessionId: data.session_id });
         }
         const frameTurnId = data.type === 'error' && ['turn_limit', 'identity_unavailable'].includes(data.code)
           ? data.request_id ?? data.msg_id : data.msg_id;
@@ -625,6 +674,20 @@ export const useChatStore = create<ChatStore>((set, get) => {
           set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
         }
         switch (data.type) {
+          case 'turn_accepted': {
+            if (typeof data.msg_id === 'string' && Number.isSafeInteger(data.user_row_id) && data.user_row_id > 0) {
+              set(state => ({ messages: state.messages.map(message =>
+                message.role === 'user' && message.turnId === data.msg_id
+                  ? { ...message, historyId: data.user_row_id } : message) }));
+            }
+            break;
+          }
+          case 'subscribed': {
+            if (data.session_id === get().sessionId && data.conv === get().convId) {
+              set(state => ({ historyReconnectRevision: state.historyReconnectRevision + 1 }));
+            }
+            break;
+          }
           case 'session_info': {
             // A connection hello describes the default partner, not a history
             // session opened before the socket connected.
@@ -651,6 +714,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
               set(metadata);
               break;
             }
+            const hello = get().ownSessionId === null;
             set((state) => ({
               ownSessionId:
                 state.ownSessionId === null && typeof data.session_id === 'string'
@@ -663,6 +727,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
               ),
               ...metadata,
             }));
+            if (hello && get().resumedExplicitly) subscribeCurrentConversation();
             break;
           }
 
@@ -931,9 +996,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
     activeMessageId: null,
     lastTurnFrameAt: null,
     historyReplyRevision: 0,
+    historyReconnectRevision: 0,
     phase: 'idle',
     viseme: REST_VISEME,
     sessionId: null,
+    acceptedSessionId: null,
     ownSessionId: null,
     resumedExplicitly: false,
     convId: nextConvId(),
@@ -980,6 +1047,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         viseme: REST_VISEME,
         // Fresh conversation with the new partner — bump the nonce so any reply
         // still in flight for the previous partner is dropped from this view.
+        acceptedSessionId: null,
         convId: nextConvId(),
         // Restore the active session to this connection's own id. If we were
         // viewing a resumed historical conversation, its `sessionId` belongs to
@@ -999,10 +1067,18 @@ export const useChatStore = create<ChatStore>((set, get) => {
     },
 
     discardHistory: (identityChanged = false) => {
+      if (identityChanged) {
+        // Explicit identity changes revoke accepted turns; ordinary transport
+        // replacement must never send this control frame.
+        if (wsRef && wsRef.readyState === WebSocket.OPEN) {
+          try { wsRef.send(JSON.stringify({ type: 'logout' })); } catch { /* already disconnected */ }
+        }
+        get().disconnect();
+      }
       clearVisemeIdle();
       set(state => ({
         messages: [], lastCompletedReplyId: null, steps: [], stepTree: [], thinking: null, isStreaming: false, activeMessageId: null,
-        phase: 'idle', viseme: REST_VISEME, resumedExplicitly: false, convId: nextConvId(),
+        phase: 'idle', viseme: REST_VISEME, resumedExplicitly: false, acceptedSessionId: null, convId: nextConvId(),
         sessionId: identityChanged ? null : state.ownSessionId,
         ...(identityChanged ? { ownSessionId: null, selectedAgentId: null, resolvedAgent: undefined, assignmentError: null } : {}),
       }));
@@ -1026,12 +1102,15 @@ export const useChatStore = create<ChatStore>((set, get) => {
         // the conversation we just left is dropped from this view. (The resumed
         // turn continues the stored session id server-side; `conv` here is only
         // the attribution tag, echoed back on reply frames.)
+        acceptedSessionId: null,
         convId: nextConvId(),
       });
     },
 
     disconnect: () => {
       intentionalDisconnect = true;
+      if (visibilityListener) document.removeEventListener('visibilitychange', visibilityListener);
+      visibilityListener = null;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -1053,6 +1132,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
       // Add user message to local state immediately (with attachment chips)
       set((state) => ({
+        acceptedSessionId: null,
         messages: [
           ...state.messages,
           {
@@ -1135,8 +1215,16 @@ export const useChatStore = create<ChatStore>((set, get) => {
         viseme: REST_VISEME,
         sessionId: target,
         resumedExplicitly: false,
+        acceptedSessionId: null,
         convId: nextConvId(),
       });
     },
   };
+});
+
+// View changes replace the socket subscription; they never cancel accepted turns.
+useChatStore.subscribe((next, previous) => {
+  if (next.convId !== previous.convId && next.connectionState === 'connected') {
+    subscribeCurrentConversation();
+  }
 });

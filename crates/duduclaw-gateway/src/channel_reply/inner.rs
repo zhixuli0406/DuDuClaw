@@ -936,8 +936,9 @@ pub(super) async fn build_reply_with_session_inner(
 
     // Append user message to session using improved CJK-aware token estimate
     let user_tokens = estimate_tokens(&sanitized_text);
+    let client_msg_id = super::WEBCHAT_TURN_DELIVERY.try_with(|turn| turn.client_msg_id.clone()).ok();
     let user_message_id = match session_mgr
-        .append_message_with_id(session_id, "user", &sanitized_text, user_tokens)
+        .append_delivery_message(session_id, "user", &sanitized_text, user_tokens, client_msg_id.as_deref(), false)
         .await
     {
         Ok(id) => Some(id),
@@ -947,6 +948,7 @@ pub(super) async fn build_reply_with_session_inner(
         }
     };
     if let Some(id) = user_message_id {
+        let _ = super::WEBCHAT_TURN_DELIVERY.try_with(|turn| turn.accepted.try_send((session_id.to_owned(), id)));
         crate::credential_ledger::bind_message(&ctx.home_dir, &credential_source, session_id, id);
     }
     // P2-B: the turn's memory sources are the stored rows' ids (host-made,
@@ -1503,13 +1505,14 @@ pub(super) async fn build_reply_with_session_inner(
         None => Default::default(),
     };
     if let Some(direct) = turn_knowledge.direct_reply.clone() {
-        match session_mgr
-            .append_message_with_id(session_id, "assistant", &direct, estimate_tokens(&direct))
+        if !super::webchat_commit_allowed(&agent_id).await { return String::new(); }
+        match super::append_turn_assistant(session_mgr, session_id, &direct, estimate_tokens(&direct))
             .await
         {
             Ok(id) => super::record_turn_assistant_message(session_id, id),
             Err(e) => warn!("Failed to save assistant message to session: {e}"),
         }
+        if !super::webchat_commit_allowed(&agent_id).await { return String::new(); }
         return direct;
     }
     let full_system_prompt =
@@ -2145,15 +2148,16 @@ pub(super) async fn build_reply_with_session_inner(
             }
         }
 
+        if !super::webchat_commit_allowed(&agent_id).await { return String::new(); }
+
         // Save assistant reply to session.
         //
         // This runs BEFORE the CCR delivery lease is rechecked (that happens
         // in `GuardedReply::new`, after this whole function returns), so the
-        // row id is registered with the turn's delivery gate: a refused
-        // delivery revokes and overwrites it instead of leaving
-        // source-derived wording in the conversation history.
-        match session_mgr
-            .append_message_with_id(session_id, "assistant", &reply, reply_tokens)
+        // row id is registered with the turn's delivery gate. WebChat inserts
+        // it tombstoned until final publication; refusal scrubs its content,
+        // and even a failed scrub cannot expose it in history.
+        match super::append_turn_assistant(session_mgr, session_id, &reply, reply_tokens)
             .await
         {
             Ok(message_id) => {
@@ -2174,6 +2178,8 @@ pub(super) async fn build_reply_with_session_inner(
             }
             Err(e) => warn!("Failed to save assistant message to session: {e}"),
         }
+
+        if !super::webchat_commit_allowed(&agent_id).await { return String::new(); }
 
         // Notify dashboard clients that a session gained a turn, so the
         // conversation sidebar re-lists without a webchat-local trigger.
@@ -3741,10 +3747,22 @@ pub(super) async fn build_reply_with_session_inner(
         let home_for_compress = ctx.home_dir.clone();
         let agent_dir_for_compress = agent_dir.clone();
         let agent_for_compress = agent_id.clone();
+        let compression_verdict = ccr_delivery_verdict();
         tokio::spawn(async move {
+            if let Some(verdict) = compression_verdict {
+                if !matches!(verdict.await, Ok(true)) { return; }
+            }
             if sm.should_compress(&sid).await {
-                // Gather last messages to summarise
-                let msgs = sm.get_messages(&sid).await.unwrap_or_default();
+                // Capture ids before reading text; the final transaction refuses
+                // any intervening turn or visibility change instead of deleting it.
+                let expected_ids = match sm.get_message_ids(&sid).await {
+                    Ok(ids) => ids,
+                    Err(_) => return,
+                };
+                let msgs = match sm.get_messages(&sid).await {
+                    Ok(messages) => messages,
+                    Err(_) => return,
+                };
                 let transcript = {
                     let mut buf = String::with_capacity(msgs.len() * 350);
                     for m in &msgs {
@@ -3791,7 +3809,7 @@ pub(super) async fn build_reply_with_session_inner(
                             .to_string()
                     }
                 };
-                if let Err(e) = sm.compress(&sid, &summary).await {
+                if let Err(e) = sm.compress_if_unchanged(&sid, &summary, &expected_ids).await {
                     warn!("Session compression failed: {e}");
                 }
             }

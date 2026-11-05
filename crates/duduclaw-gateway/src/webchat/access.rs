@@ -2,14 +2,20 @@
 use super::*;
 use crate::trigger_route::SenderAccess;
 
+mod delivery;
+pub(crate) use delivery::TargetPolicy;
+
 /// Read the configured gateway default separately from channel fallbacks.
 /// An unreadable configuration cannot establish that a target is non-main.
 pub(crate) async fn gateway_default_id(home: &std::path::Path) -> Result<String, String> {
     let raw = match tokio::fs::read_to_string(home.join("config.toml")).await {
         Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
         Err(e) => return Err(e.to_string()),
     };
+    parse_gateway_default(&raw)
+}
+
+fn parse_gateway_default(raw: &str) -> Result<String, String> {
     let config: toml::Value = raw.parse().map_err(|e: toml::de::Error| e.to_string())?;
     let general = match config.get("general") {
         None => return Ok(String::new()),
@@ -131,7 +137,7 @@ impl WebChatState {
 
     /// Repeated before admission and after FIFO waiting. No default/public grant
     /// can turn a main agent into a callable dashboard target.
-    pub(super) async fn authorize_target(&self, user: &str, agent: &str, public: bool) -> Result<(), ChatMessage> {
+    pub(crate) async fn authorize_target(&self, user: &str, agent: &str, public: bool) -> Result<(), ChatMessage> {
         self.authorize_target_inner(user, agent, public).await
     }
 
@@ -147,17 +153,20 @@ impl WebChatState {
         let sender = SenderAccess::from_effective(snapshot.access.clone()).for_webchat(Ok(default));
         let reg = self.ctx.registry.read().await;
         let loaded = reg.get(agent).ok_or_else(|| denied("unknown_agent"))?;
-        if !sender.webchat_allows(loaded) {
-            return Err(denied("main_agent_admin_only"));
-        }
-        if !loaded.config.agent.status.is_operational()
-            || !sender.may_call(loaded, None)
-            || (!public && !snapshot.access.may_call(agent))
-        {
+        if !target_allowed(&sender, loaded, public) {
             return Err(denied("agent_forbidden"));
         }
         Ok(())
     }
+}
+
+/// Shared by async admission and the synchronous final-write policy fence.
+fn target_allowed(sender: &SenderAccess, loaded: &duduclaw_agent::registry::LoadedAgent, public: bool) -> bool {
+    sender.webchat_allows(loaded)
+        && loaded.config.agent.status.is_operational()
+        && sender.may_call(loaded, None)
+        && (public || matches!(&sender.sender,
+            crate::trigger_route::Sender::Account { access, .. } if access.may_call(&loaded.config.agent.name)))
 }
 
 pub(super) async fn user_session_info(

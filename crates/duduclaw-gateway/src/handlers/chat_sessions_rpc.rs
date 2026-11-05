@@ -150,6 +150,9 @@ impl MethodHandler {
                             row["artifact"] = a;
                         }
                         row["id"] = json!(entry.id);
+                        if let Some(id) = &entry.client_msg_id {
+                            row["client_msg_id"] = json!(id);
+                        }
                         if let Some(kind) = &entry.notice_kind {
                             row["notice_kind"] = json!(kind);
                         }

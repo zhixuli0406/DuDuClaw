@@ -41,6 +41,38 @@ tokio::task_local! {
     pub(super) static CCR_TURN_DELIVERY: Arc<CcrTurnDelivery>;
 }
 
+/// WebChat keeps the live authority and persisted user-row acknowledgement
+/// inside the pipeline, including early knowledge-only replies.
+#[derive(Clone)]
+pub(crate) struct WebChatTurnDelivery {
+    pub state: Arc<crate::webchat::WebChatState>,
+    pub user: String,
+    pub client_msg_id: String,
+    pub accepted: tokio::sync::mpsc::Sender<(String, i64)>,
+    pub refused: Arc<std::sync::atomic::AtomicBool>,
+}
+
+tokio::task_local! {
+    pub(crate) static WEBCHAT_TURN_DELIVERY: WebChatTurnDelivery;
+}
+
+pub(super) async fn webchat_commit_allowed(agent: &str) -> bool {
+    let Ok(turn) = WEBCHAT_TURN_DELIVERY.try_with(Clone::clone) else { return true; };
+    if turn.refused.load(std::sync::atomic::Ordering::SeqCst) { return false; }
+    if turn.state.authorize_target(&turn.user, agent, true).await.is_err() {
+        turn.refused.store(true, std::sync::atomic::Ordering::SeqCst);
+        return false;
+    }
+    true
+}
+
+pub(super) async fn append_turn_assistant(
+    sessions: &SessionManager, sid: &str, text: &str, tokens: u32,
+) -> duduclaw_core::error::Result<i64> {
+    let pending = WEBCHAT_TURN_DELIVERY.try_with(|_| ()).is_ok();
+    sessions.append_delivery_message(sid, "assistant", text, tokens, None, pending).await
+}
+
 /// Per-turn record of everything that must not outlive a refused CCR delivery.
 pub(crate) struct CcrTurnDelivery {
     /// `(session_id, row id)` of the assistant message already persisted by
@@ -54,6 +86,7 @@ pub(crate) struct CcrTurnDelivery {
     /// comes first — never twice.
     pub(super) settled: std::sync::atomic::AtomicBool,
     cleanup: Option<DeliveryCleanup>,
+    published: std::sync::atomic::AtomicBool,
 }
 
 type DeliveryCleanup = Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<Result<(), String>>>>>;
@@ -69,6 +102,7 @@ impl Default for CcrTurnDelivery {
             waiters: Default::default(),
             settled: Default::default(),
             cleanup: DELIVERY_CLEANUP.try_with(Clone::clone).ok(),
+            published: Default::default(),
         }
     }
 }
@@ -116,6 +150,8 @@ impl CcrTurnDelivery {
     /// work exactly once and hand back the assistant row that a refusal must
     /// erase. Idempotent — the second caller gets `None`.
     pub(super) fn publish(&self, delivered: bool) -> Option<(String, i64)> {
+        let delivered = delivered && (!self.waits_for_turn_delivery()
+            || self.published.load(std::sync::atomic::Ordering::SeqCst));
         if self
             .settled
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -290,7 +326,52 @@ pub struct GuardedReply {
     pub(super) revoked: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Read-only source fence for the socket writer; refusal latches on the owning reply.
+#[derive(Clone)]
+pub(crate) struct ReplyDeliveryFence {
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    guards: Vec<duduclaw_llm::CcrDeliveryGuards>,
+    revoked: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ReplyDeliveryFence {
+    #[cfg(test)]
+    pub(crate) fn test_live() -> Self {
+        Self { cancel: None, guards: Vec::new(), revoked: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+    }
+
+    pub(crate) fn refuse(&self) {
+        self.revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn for_turn(mut self, cancel: &tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = Some(cancel.clone());
+        self
+    }
+
+    pub(crate) fn latched_valid(&self) -> bool {
+        if self.cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled()) { self.refuse(); }
+        !self.revoked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) async fn valid(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled()) { self.refuse(); }
+        if self.revoked.load(Ordering::SeqCst) { return false; }
+        let guards = self.guards.clone();
+        let valid = tokio::task::spawn_blocking(move || guards.iter()
+            .all(duduclaw_llm::CcrDeliveryGuards::still_valid_blocking)).await.unwrap_or(false);
+        if !valid { self.revoked.store(true, Ordering::SeqCst); }
+        if self.cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled()) { self.refuse(); }
+        valid && !self.revoked.load(Ordering::SeqCst)
+    }
+}
+
 impl GuardedReply {
+    pub(crate) fn delivery_fence(&self) -> ReplyDeliveryFence {
+        ReplyDeliveryFence { cancel: None, guards: self.guards.clone(), revoked: self.revoked.clone() }
+    }
+
     pub(super) async fn new(
         text: String,
         artifact: Option<serde_json::Value>,
@@ -400,13 +481,63 @@ impl GuardedReply {
         self.revoked.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// An unconfirmed terminal send is a refusal, even if its source is valid.
-    /// The captured cleanup scope joins the row revocation when this guard drops.
-    pub(crate) async fn confirm_send<F>(&self, send: F) -> Result<(), ()>
-    where F: std::future::Future<Output = Result<(), ()>> {
-        let result = send.await;
-        if result.is_err() { self.refuse_delivery(); }
-        result
+    /// Stage a hidden durable row before live fan-out. Some early reply paths
+    /// (and a failed pipeline append) have no assistant row. Record those here;
+    /// publication waits for the final authority fence.
+    pub(crate) async fn persist_webchat(
+        &self, sessions: &Arc<SessionManager>, sid: &str, text: &str,
+    ) -> Result<(), ()> {
+        if !self.still_valid().await { return Err(()); }
+        let Some(rollback) = &self.rollback else {
+            self.refuse_delivery();
+            return Err(());
+        };
+        let existing = rollback.delivery.assistant_message.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        match existing {
+            Some((stored_sid, _)) if stored_sid == sid => {}
+            Some(_) => { self.refuse_delivery(); return Err(()); }
+            None => {
+                let id = sessions.append_delivery_message(sid, "assistant", text, 0, None, true).await
+                    .map_err(|error| {
+                        warn!(session_id = sid, %error, "WebChat durable reply commit failed");
+                        self.refuse_delivery();
+                    })?;
+                *rollback.delivery.assistant_message.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((sid.into(), id));
+            }
+        }
+        if !self.still_valid().await { return Err(()); }
+        Ok(())
+    }
+
+    /// Complete durable delivery after live fan-out and every authority fence.
+    /// A failed scrub can never reveal the staged row. Successful publication
+    /// settles the turn here so later Drop cannot reinterpret its verdict.
+    pub(crate) async fn publish_webchat(
+        &self, sessions: &SessionManager, sid: &str, users: &duduclaw_auth::UserDb,
+        generation: u64, policy: &crate::webchat::access::TargetPolicy, cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), ()> {
+        let Some(rollback) = &self.rollback else { self.refuse_delivery(); return Err(()); };
+        let row = rollback.delivery.assistant_message.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let Some((stored_sid, id)) = row else { self.refuse_delivery(); return Err(()); };
+        if stored_sid != sid { self.refuse_delivery(); return Err(()); }
+        if !self.still_valid().await { return Err(()); }
+        let published = sessions.publish_webchat_message(sid, id, users, generation, policy,
+            || !cancel.is_cancelled() && !self.revoked.load(std::sync::atomic::Ordering::SeqCst)).await;
+        match published {
+            Ok(true) => {
+                rollback.delivery.published.store(true, std::sync::atomic::Ordering::SeqCst);
+                rollback.delivery.publish(true);
+                Ok(())
+            }
+            result => {
+                if let Err(error) = result { warn!(session_id = sid, %error, "WebChat reply publication failed"); }
+                self.refuse_delivery();
+                Err(())
+            }
+        }
     }
 
     pub(super) async fn revoke_turn(&self) {

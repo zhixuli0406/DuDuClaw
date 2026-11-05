@@ -157,6 +157,7 @@ async fn download(State(st):State<Arc<RouteState>>,RoutePath(id):RoutePath<Strin
     struct Fixture{_home:tempfile::TempDir,service:Arc<Service>,db:Arc<duduclaw_auth::UserDb>,ctx:UserContext}
     async fn fixture()->Fixture{
         let home=tempfile::tempdir().unwrap();let path=home.path().canonicalize().unwrap();
+        duduclaw_core::write_minimal_config(&path,"127.0.0.1",18889).unwrap();
         crate::team_edition::record(&path,duduclaw_core::EditionProfile::Enterprise);
         for (id,role) in [("alice","specialist"),("main","main"),("other","specialist")]{
             crate::trigger_route::tests::write_agent(&path.join("agents"),id,id,"",role,"\n[capabilities]\nallowed_tools=['mcp__duduclaw__*']\n");
