@@ -120,7 +120,9 @@ describe('AppSidebar (Multica shell)', () => {
     expect(screen.getByRole('link', { name: /Dashboard/i })).toBeInTheDocument();
     if (role === 'manager') expect(screen.getByRole('link', { name: /About/i })).toBeInTheDocument();
     else expect(screen.queryByRole('link', { name: /About/i })).not.toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: /Automations/i })).not.toBeInTheDocument();
+    // Employees get the scoped 1.80.0 automation page; managers retain the admin gate.
+    if (role === 'employee') expect(screen.getByRole('link', { name: /Automations/i })).toHaveAttribute('href', '/routines');
+    else expect(screen.queryByRole('link', { name: /Automations/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /Gallery/i })).not.toBeInTheDocument();
   });
 
@@ -486,7 +488,7 @@ it('opens the distributor support entry when the server provides a notice', asyn
   renderWithProviders(<SidebarProvider><AppSidebar /><MenuLocation /></SidebarProvider>);
   await waitFor(() => expect(api.about.get).toHaveBeenCalled());
   await user.click(screen.getByRole('button', { name: 'Alice' }));
-  await user.click(screen.getByRole('menuitem', { name: 'Get help' }));
+  await user.click(await screen.findByRole('menuitem', { name: 'Get help' }));
   expect(screen.getByTestId('menu-location')).toHaveTextContent('/about#distributor-support');
 });
 
@@ -498,6 +500,6 @@ it('opens language settings from the employee menu and keeps the version out of 
   renderWithProviders(<SidebarProvider><AppSidebar /><MenuLocation /></SidebarProvider>);
   expect(screen.queryByText('v1.80.0')).not.toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: 'Alice' }));
-  await user.click(screen.getByRole('menuitem', { name: 'Switch language' }));
+  await user.click(await screen.findByRole('menuitem', { name: 'Switch language' }));
   expect(screen.getByTestId('menu-location')).toHaveTextContent('/me/account#language');
 });

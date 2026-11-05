@@ -362,6 +362,7 @@ const previousNavigation = {
         "/memory",
         "/knowledge-base",
         "/agents",
+        "/templates",
         "/world",
         "/growth",
         "/org",
@@ -398,6 +399,7 @@ const previousNavigation = {
       "/knowledge-base",
       "/agents",
       "/world",
+      "/templates",
       "/experts",
       "/gallery",
       "/pet-studio"
@@ -632,6 +634,23 @@ describe('member management visibility', () => {
       for (const role of ['admin', 'manager', 'employee'] as const) {
         expect(isVisible(entry, role, personal)).toBe(role === 'admin' && !personal);
       }
+    }
+  });
+});
+
+
+describe('employee template navigation', () => {
+  it('keeps templates Admin-only in both editions and out of the employee sidebar', () => {
+    for (const personal of [false, true]) {
+      const entries = [...primaryItemsForEdition(personal), ...navGroupsForEdition(personal).flatMap(group => group.items)]
+        .filter(item => item.to === '/templates');
+      expect(entries).toHaveLength(1);
+      for (const role of ['admin', 'manager', 'employee'] as const) {
+        expect(isVisible(entries[0], role, personal)).toBe(role === 'admin');
+      }
+    }
+    for (const enabled of [false, true]) {
+      expect(employeeNavItems(enabled).some(item => item.to === '/templates')).toBe(false);
     }
   });
 });

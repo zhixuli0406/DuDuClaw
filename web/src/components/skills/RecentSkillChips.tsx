@@ -54,7 +54,7 @@ export function RecentSkillChips({ value, onChange, agentId, assigning = false, 
               aria-pressed={active} disabled={disabled}
               onClick={() => { onChange(toggleSkillToken(value, skill.name)); onPick?.(); }}
               className="h-auto max-w-full items-start whitespace-normal py-2 text-left">
-              <span className="min-w-0"><span className="block truncate">{skill.display_name || skill.name}</span>
+              <span className="min-w-0"><span className="block truncate">{skill.display_name || skill.name}</span>{' '}
                 {skill.description && <span className="block max-w-64 truncate text-xs text-muted-foreground">{skill.description}</span>}
               </span>
             </Button>

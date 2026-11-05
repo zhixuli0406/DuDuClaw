@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor, act } from '@testing-library/react';
+import { screen, waitFor, act, fireEvent } from '@testing-library/react';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { useConnectionStore } from '@/stores/connection-store';
@@ -131,7 +131,12 @@ describe('employee automations', () => {
     renderWithProviders(<RoutinesPage />);
     await screen.findByText('Visible schedule');
     expect(screen.queryByText('New automation')).not.toBeInTheDocument();
-    expect(screen.getByRole('switch')).toBeDisabled();
+    // Base UI renders a span switch, whose disabled state is expressed through ARIA.
+    const toggle = screen.getByRole('switch');
+    expect(toggle).toHaveAttribute('aria-disabled', 'true');
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-checked', 'true');
+    expect(mockWsClient.call.mock.calls.some((c) => c[0] === 'cron.pause' || c[0] === 'cron.resume')).toBe(false);
     expect(screen.queryByRole('button', { name: 'More actions' })).not.toBeInTheDocument();
     expect(mockWsClient.call).toHaveBeenCalledWith('assign_schedules.list', { scope: 'accessible' });
     expect(mockWsClient.call.mock.calls.some((c) => c[0] === 'reminders.list')).toBe(true);
