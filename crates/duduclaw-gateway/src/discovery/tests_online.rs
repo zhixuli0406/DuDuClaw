@@ -117,7 +117,7 @@ async fn setup(
     calls: u32,
     fail: bool,
 ) -> (tempfile::TempDir, DiscoveryConfig, RunSpec, Arc<Runner>) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::discovery::private_test_home();
     let seed = dir.path().join("seed");
     std::fs::create_dir(&seed).unwrap();
     std::fs::write(seed.join("score.txt"), "1").unwrap();
@@ -414,7 +414,7 @@ struct NoisyScorer;
 #[test]
 #[cfg_attr(not(unix), ignore = "discovery is unix-only: private-ACL, link-count and flock checks fail closed on this platform")]
 fn changed_source_before_export_preserves_prior_checkpoint_and_valid_ledger() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::discovery::private_test_home();
     let home = temp.path().canonicalize().unwrap();
     let world = home.join("discovery/runs/checkpoint/r1");
     std::fs::create_dir_all(&world).unwrap();

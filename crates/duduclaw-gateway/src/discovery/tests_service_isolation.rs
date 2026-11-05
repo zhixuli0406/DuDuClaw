@@ -36,7 +36,7 @@ async fn discovery_isolation_completed_views_never_invoke_artifact_verifier() {
     store.record_verified_artifact(&created.run_id, "r1-b0-a0", &"b".repeat(64)).unwrap();
     store.finish_run(&created.run_id, "complete", Some("r1-b0-a0")).unwrap();
     let artifact_parent = home.join("discovery/artifacts").join(&created.run_id).join("r1-b0-a0");
-    std::fs::create_dir_all(&artifact_parent).unwrap();
+    workspace::create_private_directory(&artifact_parent).unwrap();
     let poison = home.join("private-content");
     std::fs::create_dir(&poison).unwrap();
     std::fs::write(poison.join("secret"), "MUST_NOT_BE_READ").unwrap();
@@ -68,6 +68,7 @@ async fn discovery_isolation_completed_views_never_invoke_artifact_verifier() {
 #[tokio::test]
 async fn discovery_isolation_artifact_reads_published_manifest_and_exact_file_digest() {
     use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
     use super::super::super::artifact_manifest::ArtifactManifest;
     let (dir, spec, broker) = fixture();
     let home = dir.path().canonicalize().unwrap();
@@ -83,8 +84,9 @@ async fn discovery_isolation_artifact_reads_published_manifest_and_exact_file_di
         creator_origin: "mcp".into(), approved_root_id: Some(spec.approved_root_id.clone()),
     }).unwrap();
     let root = home.join("discovery/artifacts").join(&created.run_id).join("r1-b0-a0/ws");
-    std::fs::create_dir_all(&root).unwrap();
+    workspace::create_private_directory(&root).unwrap();
     std::fs::write(root.join("result.txt"), "checkpoint").unwrap();
+    std::fs::set_permissions(root.join("result.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
     let manifest = ArtifactManifest::from_checkpoint(BTreeMap::from([
         (PathBuf::from("result.txt"), format!("{:x}", Sha256::digest(b"checkpoint"))),
     ])).unwrap();

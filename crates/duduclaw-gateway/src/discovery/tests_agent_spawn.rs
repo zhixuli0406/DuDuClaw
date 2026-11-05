@@ -136,7 +136,7 @@ async fn invalid_workspace_fails_closed() {
 async fn fake_runner(script: &str, calls: u32) -> (tempfile::TempDir, ClaudeAttemptRunner, AttemptRequest) {
     use duduclaw_agent::account_rotator::{Account, AccountRotator, RotationStrategy};
     use super::super::contracts::RunBudget;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::discovery::private_test_home();
     let node = dir.path().join("discovery/runs/run/r1/b0/a0/ws");
     super::super::workspace::create_private_directory(&node).unwrap();
     let tools = dir.path().join("tools");

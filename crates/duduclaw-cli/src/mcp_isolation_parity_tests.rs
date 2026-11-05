@@ -257,8 +257,24 @@ enabled = true
     record.canonical_bytes().expect("production issuer must produce a signable capability");
     let context = live_context(record);
     let mut bindings = duduclaw_mcp_boundary::bindings::BindingStore::new(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
-    bindings.register_principal(&context.record().principal).unwrap();
+    // The production issuer binds employees to the tenant. The store double
+    // needs that tenant principal and the human's explicit shared membership.
+    let EmployeeBinding::Shared(tenant_id) = &context.record().employee_binding else {
+        panic!("production issuer must retain its shared tenant binding");
+    };
+    let tenant = RunPrincipal::Background { tenant_id: tenant_id.clone(), generation: snapshot.acl_generation };
+    bindings.register_principal(&tenant).unwrap();
+    if context.record().principal != tenant {
+        bindings.register_principal(&context.record().principal).unwrap();
+    }
     bindings.create_employee(context.record().employee, &context.record().employee_binding).unwrap();
+    if let RunPrincipal::Human { user_id, .. } = &context.record().principal {
+        assert!(bindings.validate(context.record().employee, &context.record().employee_binding,
+            &context.record().principal).is_err(), "shared employees require explicit membership");
+        bindings.add_shared_member(context.record().employee, user_id.as_str(), "owner").unwrap();
+    }
+    bindings.validate(context.record().employee, &context.record().employee_binding,
+        &context.record().principal).unwrap();
     let resolver = Arc::new(duduclaw_gateway::isolation_resources::GatewayResourceResolver::new(
         home.to_owned(), context.record().employee, "main".into(), Arc::new(Mutex::new(bindings))).unwrap()
         .with_connector_catalog(Arc::new(duduclaw_gateway::isolation_connectors::ConnectorCatalog::new(

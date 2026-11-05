@@ -1223,11 +1223,12 @@ mod container_lifecycle_tests {
 mod sealed_execution_tests {
     use super::*;
     fn fixture(cheating_valid: bool) -> (tempfile::TempDir, RegisteredEvaluator) {
-        let temp = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let temp = crate::discovery::private_test_home();
         let home = temp.path().canonicalize().unwrap();
         let root = home.join("discovery/evaluators/test");
-        fs::create_dir_all(root.join("good")).unwrap();
-        fs::create_dir(root.join("bad")).unwrap();
+        super::super::workspace::create_private_directory(&root.join("good")).unwrap();
+        super::super::workspace::create_private_directory(&root.join("bad")).unwrap();
         let good =
             json!({"pass":true,"valid":true,"score":2.5,"fail_class":"ok","feedback":"verified"});
         let bad = if cheating_valid {
@@ -1237,6 +1238,9 @@ mod sealed_execution_tests {
         };
         fs::write(root.join("good/verdict.json"), good.to_string()).unwrap();
         fs::write(root.join("bad/verdict.json"), bad.to_string()).unwrap();
+        for path in ["good/verdict.json", "bad/verdict.json"] {
+            fs::set_permissions(root.join(path), fs::Permissions::from_mode(0o600)).unwrap();
+        }
         crate::test_exec::write_executable(&root.join("judge"), "#!/bin/sh\ncat \"$1/verdict.json\"\n", 0o755);
         let entry = EvaluatorConfig {
             command: vec![root.join("judge").to_string_lossy().into_owned()],

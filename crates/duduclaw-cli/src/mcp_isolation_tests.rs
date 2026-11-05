@@ -380,7 +380,10 @@ async fn isolated_mail_read_preserves_original_employee_ownership_rule() {
 #[tokio::test]
 async fn isolated_round5_workflow_session_is_host_only_and_bound_to_one_run() {
     let home = tempfile::tempdir().unwrap();
-    let mut adapter = adapter(home.path()).with_resource_services(Arc::new(RecordProbe));
+    // Workflow sessions bind their identity to the canonical home. Use the
+    // same host path for the dispatcher (macOS temp paths can be aliases).
+    let canonical_home = home.path().canonicalize().unwrap();
+    let mut adapter = adapter(&canonical_home).with_resource_services(Arc::new(RecordProbe));
     adapter.principal.scopes = [crate::mcp_auth::Scope::Admin].into_iter().collect();
     std::fs::write(home.path().join("agents/main/agent.toml"),
         "[agent]\nname = \"main\"\n[capabilities]\nallowed_tools = [\"mcp__duduclaw__*\"]\n").unwrap();

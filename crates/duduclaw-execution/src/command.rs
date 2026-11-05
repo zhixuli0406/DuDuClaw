@@ -610,14 +610,28 @@ mod tests {
     #[tokio::test]
     async fn early_stdin_close_retains_native_broken_pipe_kind() {
         use tokio::io::AsyncWriteExt;
-        let mut child = spawn(&mut shell("exec 0<&-; printf ready; sleep 60"), ExecutionClass::Discovery, false).await.unwrap();
+        // Shells may retain a saved stdin descriptor until exec. Cross that
+        // boundary before announcing readiness so no pipe reader remains.
+        let mut child = spawn(&mut shell("exec /bin/sh -c 'printf ready; exec sleep 60' 0<&-"), ExecutionClass::Discovery, false).await.unwrap();
         let mut stdout = child.stdout.take().unwrap();
-        let mut ready = [0; 5];
-        stdout.read_exact(&mut ready).await.unwrap();
-        assert_eq!(&ready, b"ready");
-        let error = child.stdin.as_mut().unwrap().write_all(b"input").await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut ready = [0; 5];
+            stdout.read_exact(&mut ready).await.unwrap();
+            assert_eq!(&ready, b"ready");
+            loop {
+                match child.stdin.as_mut().unwrap().write_all(b"input").await {
+                    Err(error) => break error,
+                    // Concurrent process spawns can temporarily inherit the
+                    // pipe's read end until their exec closes it. A successful
+                    // write is not proof that this child still accepts input.
+                    Ok(()) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
+                }
+            }
+        }).await;
         child.kill().await.unwrap();
+        let error = result.expect("closed stdin must report an error within five seconds");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
     }
 
     #[cfg(unix)]

@@ -615,7 +615,7 @@ esac
     #[cfg(unix)]
     #[test]
     fn boot_marks_crashed_runs_but_leaves_an_active_operator_alone() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::discovery::private_test_home();
         std::fs::write(dir.path().join("config.toml"), "").unwrap();
         let store = DiscoveryStore::open(dir.path()).unwrap();
         let budget = super::super::contracts::RunBudget { max_agent_calls: 1, max_usd: 1., max_wall_secs: 1, max_rounds: 1 };

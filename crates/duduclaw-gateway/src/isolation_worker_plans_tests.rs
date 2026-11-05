@@ -88,6 +88,7 @@ fn media_call(name: &str, args: Value) -> AuthorizedToolCall {
         tools: List::new(vec![Text::new(name.to_owned()).unwrap()]).unwrap(),
         resources: List::new(vec![ResourceGrant::Employee { id: employee },
             ResourceGrant::Workspace { handle: Text::new("work".into()).unwrap() },
+            ResourceGrant::Recipient { id: Text::new("alice".into()).unwrap() },
             ResourceGrant::UrlOrigin { origin: Text::new("https://example.com".into()).unwrap() }]).unwrap(),
         policy_revision: 1, gateway_epoch: [4; 16], issued_at: 1, not_before: 1, expires_at: u64::MAX - 1,
         nonce: [5; 32], jti: [6; 16],
@@ -288,14 +289,15 @@ fn i1c_absolute_snapshot_rejects_links_hardlinks_and_oversized_inputs() {
     assert!(absolute_snapshot(&path, 64).is_err());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[tokio::test]
 async fn i1c_skill_publication_carries_live_authority_into_blocking_commit() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use duduclaw_isolation::capability::{CapabilityRecord, LiveRequestVerifier};
-    struct Live(Arc<AtomicBool>);
+    struct Live(Arc<AtomicBool>, Arc<AtomicUsize>);
     impl LiveRequestVerifier for Live {
         fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> {
+            self.1.fetch_add(1, Ordering::SeqCst);
             if self.0.load(Ordering::SeqCst) { Ok(()) } else { Err(VerificationError::Revoked) }
         }
     }
@@ -305,17 +307,22 @@ async fn i1c_skill_publication_carries_live_authority_into_blocking_commit() {
     std::fs::write(home.path().join("shared/skills/notes.md"), source).unwrap();
     let call = media_call("shared_skill_adopt", json!({"skill_name":"notes","target_agent":"alice"}));
     let live = Arc::new(AtomicBool::new(true));
+    let checks = Arc::new(AtomicUsize::new(0));
     let context = duduclaw_mcp_boundary::RequestContext::with_live_verifier(
-        call.context().record().clone(), Arc::new(Live(live.clone())));
+        call.context().record().clone(), Arc::new(Live(live.clone(), checks.clone())));
     let authority = duduclaw_mcp_boundary::io_authority::scope(context, async {
         duduclaw_mcp_boundary::io_authority::capture()
     }).await;
+    assert_eq!(checks.load(Ordering::SeqCst), 0);
     live.store(false, Ordering::SeqCst);
     let path = home.path().to_owned();
     let state = json!({"source":"shared","sha256":hex::encode(Sha256::digest(source))});
     let result = tokio::task::spawn_blocking(move || authority.run(||
         publish_skill(&path, "alice", "notes", "shared_skill_adopt", &state, "published body"))).await.unwrap();
     assert!(result.is_err());
+    // Check the refusal came from live authority, not a later filesystem or
+    // platform error. This pre-I/O fence is testable on every Unix host.
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
     assert!(!home.path().join("agents/alice/SKILLS/notes.md").exists());
     assert!(!home.path().join("graduation_log.jsonl").exists());
     assert_eq!(std::fs::read(home.path().join("shared/skills/notes.md")).unwrap(), source);

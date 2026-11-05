@@ -42,7 +42,7 @@ mod tests {
     use super::*;
     use crate::discovery::{budget::SharedBudget, contracts::RunBudget, tree::{CostSource, Direction}};
     fn fixture() -> (tempfile::TempDir, SharedBudget) {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::discovery::private_test_home();
         let limits = RunBudget { max_agent_calls:3, max_usd:3.0, max_wall_secs:30, max_rounds:1 };
         DiscoveryStore::open(home.path()).unwrap().create_run("run-1", "goal", "agent", "score",
             &"a".repeat(64), Direction::Max, &limits).unwrap();
@@ -88,7 +88,7 @@ mod private_database_tests {
     use std::os::unix::fs::PermissionsExt;
     #[test]
     fn database_and_wal_are_private_even_when_the_home_is_traversable() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::discovery::private_test_home();
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let store = DiscoveryStore::open(home.path()).unwrap();
         store.conn.execute("INSERT INTO discovery_runs(run_id,direction,created_at) VALUES('private','max','now')", []).unwrap();
@@ -99,7 +99,7 @@ mod private_database_tests {
     }
     #[test]
     fn database_entry_points_refuse_shared_linked_and_hardlinked_files() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::discovery::private_test_home();
         let original = home.path().join("original.db");
         drop(DiscoveryStore::open_path(&original).unwrap());
         std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -152,7 +152,7 @@ mod private_database_tests {
     /// the file drops all of this process's POSIX locks on it.
     #[test]
     fn opening_a_second_store_keeps_the_live_stores_sqlite_locks() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::discovery::private_test_home();
         let live = DiscoveryStore::open(home.path()).unwrap();
         let _: i64 = live.conn.query_row("SELECT count(*) FROM discovery_runs", [], |r| r.get(0)).unwrap();
         let db = live.db_path().to_path_buf();

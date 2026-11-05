@@ -243,7 +243,8 @@ mod tests {
             assert_eq!(components.parse_worker, ComponentState::Unavailable);
             assert_eq!(components.update_service, ComponentState::Unavailable);
             assert_eq!(components.mcp_boundary, ComponentState::PendingIntegration);
-            assert_eq!(components.runtime_adapters, ComponentState::PendingIntegration);
+            // Missing runtime producers override a pending integration probe.
+            assert_eq!(components.runtime_adapters, ComponentState::Unavailable);
         }
     }
 

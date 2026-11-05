@@ -79,14 +79,39 @@ fn isolated_resolver_missing_connector_factory_refuses() {
 }
 
 #[test]
-fn isolated_resolver_rejects_implicit_latest_plan_and_responsibility_collection() {
+fn isolated_resolver_rejects_implicit_latest_plan() {
     let (_home, resolver, context, _bindings) = fixture();
-    for tool in ["plan_get", "responsibility_get"] {
-        let policy = duduclaw_mcp_boundary::tool_policy::policy(tool).unwrap();
-        assert!(resolver.selected_tasks(&context, policy, &json!({})).is_err());
-        let key = if tool == "plan_get" { "plan_id" } else { "responsibility_id" };
-        assert!(resolver.selected_tasks(&context, policy, &json!({(key):""})).is_err());
+    let policy = duduclaw_mcp_boundary::tool_policy::policy("plan_get").unwrap();
+    for args in [json!({}), json!({"plan_id":""})] {
+        assert!(resolver.selected_tasks(&context, policy, &args).is_err());
     }
+}
+
+#[test]
+fn isolated_resolver_responsibility_collection_intersects_grants_and_live_ownership() {
+    let (home, resolver, context, _bindings) = fixture();
+    let connection = Connection::open(home.path().join("tasks.db")).unwrap();
+    connection.execute_batch("CREATE TABLE responsibilities(responsibility_id TEXT PRIMARY KEY, owner_agent_id TEXT NOT NULL);
+        INSERT INTO responsibilities VALUES ('allowed','employee-a'),('unsigned','employee-a'),('foreign','employee-b');").unwrap();
+    let policy = duduclaw_mcp_boundary::tool_policy::policy("responsibility_get").unwrap();
+    assert!(resolver.selected_tasks(&context, policy, &json!({})).unwrap().is_empty());
+    let mut record = context.record().clone();
+    record.resources = List::new(vec![
+        ResourceGrant::Task { id: text("responsibility:allowed".into()).unwrap() },
+        ResourceGrant::Task { id: text("responsibility:foreign".into()).unwrap() },
+    ]).unwrap();
+    let context = RequestContext::from_verified_record(record);
+    for args in [json!({}), json!({"responsibility_id":""}), json!({"responsibility_id":"  "}),
+        json!({"responsibility_id":"allowed"})] {
+        assert_eq!(resolver.selected_tasks(&context, policy, &args).unwrap(),
+            vec![ResourceGrant::Task { id: text("responsibility:allowed".into()).unwrap() }]);
+    }
+    for id in ["foreign", "unsigned", "missing"] {
+        assert!(resolver.selected_tasks(&context, policy, &json!({"responsibility_id":id})).is_err());
+    }
+    connection.execute("UPDATE responsibilities SET owner_agent_id='employee-b' WHERE responsibility_id='allowed'", []).unwrap();
+    assert!(resolver.selected_tasks(&context, policy, &json!({})).unwrap().is_empty());
+    assert!(resolver.selected_tasks(&context, policy, &json!({"responsibility_id":"allowed"})).is_err());
 }
 
 #[test]
