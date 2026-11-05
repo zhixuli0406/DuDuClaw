@@ -351,6 +351,20 @@ fn write_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn create_private_dir(path: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700).create(path)
+    }
+
+    #[cfg(unix)]
+    fn make_private_dir(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     #[test]
     fn root_key_consecutive_passes_reset_and_trigger_once() {
         let mut counter = ConsecutivePasses::default();
@@ -376,6 +390,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         if unsafe { libc::geteuid() } == 0 { return; }
         let dir = tempfile::tempdir().unwrap();
+        make_private_dir(dir.path());
         initialize_budget(dir.path()).unwrap();
         let path = dir.path().join(BUDGET_FILE);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -403,6 +418,7 @@ mod tests {
     #[test]
     fn root_key_hourly_budget_survives_restarts_and_clock_rollback() {
         let dir = tempfile::tempdir().unwrap();
+        make_private_dir(dir.path());
         initialize_budget(dir.path()).unwrap();
         for now in [1000, 1010, 1020, 1030] { assert!(reserve_restart(dir.path(), now).unwrap()); }
         initialize_budget(dir.path()).unwrap();
@@ -416,6 +432,7 @@ mod tests {
     #[test]
     fn root_key_unreadable_or_unwritable_budget_refuses_restart() {
         let dir = tempfile::tempdir().unwrap();
+        make_private_dir(dir.path());
         assert!(reserve_restart(dir.path(), 1000).is_err());
         initialize_budget(dir.path()).unwrap();
         let path = dir.path().join(BUDGET_FILE);
@@ -423,7 +440,7 @@ mod tests {
         assert!(initialize_budget(dir.path()).is_err());
         assert!(reserve_restart(dir.path(), 1000).is_err());
         std::fs::remove_file(&path).unwrap();
-        std::fs::create_dir(&path).unwrap();
+        create_private_dir(&path).unwrap();
         assert!(reserve_restart(dir.path(), 1000).is_err());
         assert!(write_json(&path, &Budget::default()).is_err());
     }
@@ -442,8 +459,9 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
+        make_private_dir(dir.path());
         let state_dir = dir.path().join("state");
-        std::fs::create_dir(&state_dir).unwrap();
+        create_private_dir(&state_dir).unwrap();
         initialize_budget(&state_dir).unwrap();
         {
             let mut rt = runtime();
@@ -455,7 +473,7 @@ mod tests {
         if case == "disabled" {
             std::fs::write(dir.path().join("config.toml"), "[credential_protection]\nauto_recover = false").unwrap();
         } else if case == "status_unwritable" {
-            std::fs::create_dir(state_dir.join(STATUS_FILE)).unwrap();
+            create_private_dir(&state_dir.join(STATUS_FILE)).unwrap();
         } else if case == "status_unreadable" {
             write_json(&state_dir.join(STATUS_FILE), &RecoveryStatus { latest_revocation: None, recovery: "waiting".into() }).unwrap();
             std::fs::write(state_dir.join(STATUS_FILE), "broken").unwrap();
@@ -484,7 +502,8 @@ mod tests {
     #[test]
     fn root_key_status_roundtrip_has_exact_detail_and_utc() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("state")).unwrap();
+        make_private_dir(dir.path());
+        create_private_dir(&dir.path().join("state")).unwrap();
         let status = RecoveryStatus { latest_revocation: Some(Revocation {
             reason: "engine_socket_reachable".into(), detail: Some("@/containerd-shim/test: peer uid=0 (root)".into()),
             timestamp: "2026-11-05T01:02:03Z".into(),
@@ -546,10 +565,11 @@ mod tests {
     fn root_key_state_files_refuse_symlinks_hardlinks_modes_and_wrong_owner() {
         use std::os::unix::fs::{symlink, PermissionsExt};
         let home = tempfile::tempdir().unwrap();
+        make_private_dir(home.path());
         let state = home.path().join("state");
-        std::fs::create_dir(&state).unwrap();
+        create_private_dir(&state).unwrap();
         let outside = home.path().join("outside");
-        std::fs::create_dir(&outside).unwrap();
+        create_private_dir(&outside).unwrap();
         let link = home.path().join("linked-state");
         symlink(&state, &link).unwrap();
         assert!(StateDir::open(&link).is_err());
@@ -596,10 +616,12 @@ mod tests {
     fn root_key_state_directory_stays_pinned_across_parent_replacement() {
         use std::os::unix::fs::symlink;
         let home = tempfile::tempdir().unwrap();
+        make_private_dir(home.path());
         let dir = StateDir::open_home(home.path(), true).unwrap();
         let original = home.path().join("original");
         std::fs::rename(home.path().join("state"), &original).unwrap();
         let outside = tempfile::tempdir().unwrap();
+        make_private_dir(outside.path());
         symlink(outside.path(), home.path().join("state")).unwrap();
         assert!(StateDir::open_home(home.path(), false).is_err());
         initialize_budget_at(&dir).unwrap();
