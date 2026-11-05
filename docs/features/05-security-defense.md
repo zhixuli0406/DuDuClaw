@@ -36,6 +36,10 @@ MCP cron schedules, agent-callback reminders and TaskSpec plans retain the host-
 
 Distributor branding checks license expiry and offline grace whenever the effective brand is read. An expired license or exceeded offline grace shows the original DuDuClaw brand, even if control-plane polls keep failing and the gateway has not restarted.
 
+## Employee health metadata (v1.80.0)
+
+The read-only `agents.health` RPC requires Manager or Admin and rechecks the live identity. Non-Admins see only directly bound AI employees; team grants do not widen this aggregate. Responses contain health counts and status metadata, never conversation bodies or raw provider errors. Health reminders go only to active employee owners and administrators through verified linked channel identities. A missing configuration file or omitted section uses conservative defaults (five failures or six hours). Other read errors or invalid settings disable reminders. These product checks do not change the existing boundary: an employee with unrestricted file access under the same OS user can still access local state directly.
+
 ## A note on history
 
 Until 2026-09 this page described a three-phase shell-script defense: a deterministic blacklist, an obfuscation/exfiltration scanner, and a Haiku AI judgment layer, all living in `.claude/hooks/` and orchestrated by a GREEN/YELLOW/RED threat-level state machine.

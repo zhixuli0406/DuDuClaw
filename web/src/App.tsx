@@ -50,6 +50,7 @@ const MeetingTranscriptsPage = lazyPage(() => import('./pages/MeetingTranscripts
 // "operate the whole machine" scaffold; see `HomeLanding` below for how the
 // appliance image lands here by default.
 const OperatorConsolePage = lazyPage(() => import('./pages/OperatorConsolePage'), 'OperatorConsolePage');
+const EmployeeHealthPage = lazyPage(() => import('./pages/EmployeeHealthPage'), 'EmployeeHealthPage');
 const AgentsPage = lazyPage(() => import('./pages/AgentsPage'), 'AgentsPage');
 const CreateAgentPage = lazyPage(() => import('./pages/agent-form/CreateAgentPage'), 'CreateAgentPage');
 const EditAgentPage = lazyPage(() => import('./pages/agent-form/EditAgentPage'), 'EditAgentPage');
@@ -356,6 +357,7 @@ export function App() {
                 <Route path="forks" element={<ForkPage />} />
                 <Route path="timeline" element={<TimelinePage />} />
                 <Route path="reports" element={<ReportPage />} />
+                <Route path="employee-health" element={<EmployeeHealthPage />} />
                 <Route path="org" element={<OrgChartPage />} />
                 {/* 我的團隊 (1.76.0) — `users.my_team` is `require_manager!`
                     and, as a `users.*` method, Enterprise-only server-side;

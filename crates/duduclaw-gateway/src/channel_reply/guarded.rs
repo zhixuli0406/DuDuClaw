@@ -51,6 +51,7 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
     Option<crate::trigger_route::AnsweredBy>,
     Vec<duduclaw_knowledge::cite::CitationRef>,
     TurnBuildRollback,
+    Option<(String, Option<&'static str>)>,
 ) {
     // P10: one model-free status line if this turn stays silent too long
     // (off by default; external channel sessions only).
@@ -115,7 +116,9 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
         user_id,
         on_progress,
     ));
-    let pipeline = crate::autonomous_runtime::human_interactive(&ctx.home_dir, pipeline);
+    let outcome = Arc::new(std::sync::Mutex::new(None));
+    let pipeline = super::health::OUTCOME.scope(outcome.clone(), pipeline);
+    let pipeline = Box::pin(crate::autonomous_runtime::human_interactive(&ctx.home_dir, pipeline));
     let turn = Box::pin(reply_identity_scope(
         session_id,
         user_id,
@@ -166,7 +169,10 @@ pub(super) async fn build_reply_with_session_inner_capturing_operator_result(
         .lock()
         .map(|mut c| std::mem::take(&mut *c))
         .unwrap_or_default();
-    (raw, operator_result_artifact, guards, delivery, answered_by, cited, build_rollback)
+    let outcome = if super::health::is_channel(session_id) {
+        outcome.lock().ok().and_then(|mut value| value.take())
+    } else { None };
+    (raw, operator_result_artifact, guards, delivery, answered_by, cited, build_rollback, outcome)
 }
 
 /// Build this turn's thinking sink (see `crate::thinking`). The agent is only
@@ -304,7 +310,7 @@ pub async fn build_guarded_reply_for_agent(
     // Boxed so every channel adapter that wraps this future in its own
     // task-local scopes carries a pointer, not the turn state (see the
     // stack note in `build_reply_with_session_inner_capturing_operator_result`).
-    let (raw, operator_result_artifact, guards, delivery, answered_by, cited, mut build_rollback) =
+    let (raw, operator_result_artifact, guards, delivery, answered_by, cited, mut build_rollback, health_outcome) =
         Box::pin(build_reply_with_session_inner_capturing_operator_result(
             text,
             ctx,
@@ -316,7 +322,9 @@ pub async fn build_guarded_reply_for_agent(
         .await;
     let Some(guards) = guards else {
         delivery.settle(&ctx.session_manager, false).await;
-        return GuardedReply::refused();
+        let reply = GuardedReply::refused();
+        Box::pin(super::health::finish(&ctx.home_dir, health_outcome, true, &reply)).await;
+        return reply;
     };
     let (raw, pending_artifact) = strip_operator_pending_marker(&raw);
     let artifact = pending_artifact.or(operator_result_artifact);
@@ -326,7 +334,9 @@ pub async fn build_guarded_reply_for_agent(
         None => (agent_name.to_string(), session_id.to_string()),
     };
     let restored = restore_for_channel(raw, ctx, &agent_id, &turn_session).await;
-    let enforced = enforce_contract(restored, &ctx.home_dir, &agent_id).await;
+    let (enforced, health_blocked) = enforce_contract_with_status(restored, &ctx.home_dir, &agent_id).await;
+    let health_outcome = health_outcome.map(|(id, reason)|
+        (id, reason.or(enforced.trim().is_empty().then_some("empty_reply"))));
     // The "rules changed / model switched" FYI is for the operator; a public
     // website visitor must not see it (it stays pending for the next
     // operator-facing reply).
@@ -340,6 +350,7 @@ pub async fn build_guarded_reply_for_agent(
         .await
         .with_answered_by(answered_by)
         .with_citations(cited);
+    Box::pin(super::health::finish(&ctx.home_dir, health_outcome, health_blocked, &reply)).await;
     build_rollback.disarm();
     reply
 }
@@ -381,7 +392,7 @@ pub async fn build_guarded_reply_with_session(
     on_progress: Option<ProgressCallback>,
 ) -> GuardedReply {
     // Boxed for the same reason as in `build_guarded_reply_for_agent`.
-    let (raw, operator_result_artifact, guards, delivery, answered_by, cited, mut build_rollback) =
+    let (raw, operator_result_artifact, guards, delivery, answered_by, cited, mut build_rollback, health_outcome) =
         Box::pin(build_reply_with_session_inner_capturing_operator_result(
             text,
             ctx,
@@ -393,7 +404,9 @@ pub async fn build_guarded_reply_with_session(
         .await;
     let Some(guards) = guards else {
         delivery.settle(&ctx.session_manager, false).await;
-        return GuardedReply::refused();
+        let reply = GuardedReply::refused();
+        Box::pin(super::health::finish(&ctx.home_dir, health_outcome, true, &reply)).await;
+        return reply;
     };
     let (raw, pending_artifact) = strip_operator_pending_marker(&raw);
     let artifact = pending_artifact.or(operator_result_artifact);
@@ -409,7 +422,9 @@ pub async fn build_guarded_reply_with_session(
         None => (resolve_agent_for_restore(ctx, session_id).await, session_id.to_string()),
     };
     let restored = restore_for_channel(raw, ctx, &agent_id, &turn_session).await;
-    let enforced = enforce_contract(restored, &ctx.home_dir, &agent_id).await;
+    let (enforced, health_blocked) = enforce_contract_with_status(restored, &ctx.home_dir, &agent_id).await;
+    let health_outcome = health_outcome.map(|(id, reason)|
+        (id, reason.or(enforced.trim().is_empty().then_some("empty_reply"))));
     let with_notice = append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id);
     // Messaging apps: label replies from a called (non-default) employee.
     let labelled = match &answered_by {
@@ -424,6 +439,7 @@ pub async fn build_guarded_reply_with_session(
         .await
         .with_answered_by(answered_by)
         .with_citations(cited);
+    Box::pin(super::health::finish(&ctx.home_dir, health_outcome, health_blocked, &reply)).await;
     build_rollback.disarm();
     reply
 }

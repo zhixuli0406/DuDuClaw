@@ -318,6 +318,7 @@ export const navGroups: NavGroup[] = [
       // G11 Work Timeline — company-level Gantt of every AI staff member's runs.
       { to: '/timeline', icon: ChartGantt, label: 'nav.timeline', desc: 'nav.timeline.desc', minRole: 'manager' },
       { to: '/reports', icon: BarChart3, label: 'nav.reports', desc: 'nav.reports.desc', minRole: 'manager' },
+      { to: '/employee-health', icon: Activity, label: 'nav.employeeHealth', desc: 'nav.employeeHealth.desc', minRole: 'manager', newIn: '1.80.0' },
       // LLM→LWM loop view (2026-08-14) — predict→act→observe→score per task,
       // with the query-time skill verdict. RPCs are manager-gated.
       { to: '/foresight', icon: RadarIcon, label: 'nav.foresight', desc: 'nav.foresight.desc', minRole: 'manager', newIn: '1.58.0' },
@@ -565,6 +566,7 @@ export const personalAdvancedGroup: NavGroup = {
     '/mail',
     '/timeline',
     '/reports',
+    '/employee-health',
     '/forks',
     '/os',
     // 職務組合（WP-7I 2026-08-16）— same slot as its Enterprise `/os` neighbour.

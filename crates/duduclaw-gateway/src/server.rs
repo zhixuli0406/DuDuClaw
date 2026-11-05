@@ -1269,6 +1269,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         info!("GVU stagnation detector scheduled — 30 min interval");
     }
 
+    tokio::spawn(crate::employee_health::run(home_dir.clone(), handler.registry().clone()));
+
     // ── Channel-outage alerting ─────────────────────────────────────────
     // `channel_failures.jsonl` previously had no reverse notification path —
     // a channel that stayed connectable but stopped actually delivering

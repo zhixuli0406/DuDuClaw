@@ -62,6 +62,7 @@ mod lifecycle;
 mod handshake_license;
 mod tools_catalog;
 mod agents_basic;
+mod agents_health;
 mod agents_create;
 mod templates_util;
 mod templates_rpc;

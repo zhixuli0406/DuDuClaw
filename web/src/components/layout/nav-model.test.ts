@@ -579,7 +579,6 @@ describe('task navigation hidden for all roles and editions', () => {
   });
 });
 
-
 describe('advanced and company settings navigation', () => {
   it('shows one Admin-only versioned entry per page in both editions', () => {
     for (const personal of [false, true]) {
@@ -598,5 +597,21 @@ describe('advanced and company settings navigation', () => {
   it('uses the new page label rather than the parent settings breadcrumb', () => {
     expect(crumbsFor('/app/system/settings/advanced').at(-1)?.labelId).toBe('advancedSettings.title');
     expect(crumbsFor('/app/system/settings/company').at(-1)?.labelId).toBe('companyInfo.title');
+  });
+});
+
+describe('employee health visibility', () => {
+  it('keeps the new page in both editions with manager access and the release badge', () => {
+    const team = navGroups.flatMap(group => group.items).find(item => item.to === '/employee-health')!;
+    const personal = personalAdvancedGroup.items.find(item => item.to === '/employee-health')!;
+    for (const entry of [team, personal]) {
+      expect(entry).toBeDefined();
+      expect(entry.newIn).toBe('1.80.0');
+      for (const isPersonal of [false, true]) {
+        expect(isVisible(entry, 'manager', isPersonal)).toBe(true);
+        expect(isVisible(entry, 'admin', isPersonal)).toBe(true);
+        expect(isVisible(entry, 'employee', isPersonal)).toBe(false);
+      }
+    }
   });
 });
