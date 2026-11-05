@@ -25,6 +25,9 @@ jobs:
     needs: delivery-gate
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      # MSVC symbols live in separate PDBs; retain the existing Windows output.
+      CARGO_PROFILE_RELEASE_STRIP: ${{ startsWith(matrix.os, 'windows') && 'none' || 'symbols' }}
     permissions:
       contents: write
       id-token: write   # cosign keyless (Sigstore OIDC) signing
@@ -109,6 +112,7 @@ jobs:
           cd _pkg
           tar czf ../${{ matrix.artifact }}.tar.gz duduclaw python
           cd ..
+          python3 scripts/check_update_archive_size.py ${{ matrix.artifact }}.tar.gz
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
           rm -rf _pkg
 
@@ -129,6 +133,8 @@ jobs:
           cd _pkg
           7z a ../${{ matrix.artifact }}.zip duduclaw.exe python
           cd ..
+          python scripts/check_update_archive_size.py ${{ matrix.artifact }}.zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # Standard "hash  filename" layout so the in-app updater can parse it
           $hash = (Get-FileHash ${{ matrix.artifact }}.zip -Algorithm SHA256).Hash.ToLower()
           "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii ${{ matrix.artifact }}.zip.sha256

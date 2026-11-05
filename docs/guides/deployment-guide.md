@@ -410,6 +410,61 @@ Notes by install method:
 | Homebrew (discontinued) | Self-update refuses; the tap is retired and will never receive new versions — reinstall via npm or the desktop app instead |
 | Source (`cargo`/`target/`) | Self-update allowed but a rebuild will overwrite |
 
+### Troubleshooting: dashboard update from v1.79.2 or older to v1.79.3 fails
+
+On macOS Apple Silicon, the original v1.79.3 executable is 210,561,920 bytes
+(200.8 MiB). Updaters in v1.79.2 and older reject an extracted executable at
+200 MiB (209,715,200 bytes), so every attempt fails. The old dashboard may show
+only “Update failed”. Raising the limit in the new release cannot change the
+updater that is still running. New release builds remove symbols and check
+archive sizes before publication to keep them compatible with these updaters.
+
+For an ordinary standalone installation, replace the executable manually once:
+
+1. Download the archive for the intended version, OS and CPU from
+   [GitHub Releases](https://github.com/zhixuli0406/DuDuClaw/releases), along
+   with its `.sha256` and `.minisig`. Install `minisign` first if necessary.
+   Example for v1.79.3 on macOS Apple Silicon:
+
+```sh
+version=1.79.3
+asset=duduclaw-darwin-arm64.tar.gz
+stage=$(mktemp -d)
+cd "$stage"
+base="https://github.com/zhixuli0406/DuDuClaw/releases/download/v$version"
+curl -fL "$base/$asset" -o "$asset"
+curl -fL "$base/$asset.sha256" -o "$asset.sha256"
+curl -fL "$base/$asset.minisig" -o "$asset.minisig"
+shasum -a 256 -c "$asset.sha256" &&
+  minisign -Vm "$asset" -x "$asset.minisig" \
+    -P 'RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh'
+```
+
+2. Continue only if **both** checks succeed. The public key above is the
+   official release key, also pinned in the updater; do not substitute a key
+   downloaded alongside the archive. Extract with `tar -xzf "$asset" duduclaw`
+   and run `./duduclaw version` to confirm the version.
+3. Find the executable path used by the service (the launchd plist or systemd
+   unit in section 7). Resolve any symlink: npm's `duduclaw` command can point
+   to a JavaScript wrapper, which must not be replaced with the native binary.
+   Keep a copy of the actual executable, for example `<binary>.pre-upgrade`.
+4. Stop the service and confirm it has stopped: on macOS use the installed
+   executable's `service stop`; on Linux use `systemctl --user stop duduclaw`.
+   For a foreground installation, stop its process in the original terminal.
+   Copy the verified `./duduclaw` over the actual executable path and restore
+   executable permissions (`chmod 755 <binary>`). Leave the data directory intact.
+5. Start the same service: on macOS use `<binary> service restart` (reloads the
+   registered LaunchAgent); on Linux use `systemctl --user start duduclaw`.
+   Foreground installations use their original start command. Confirm the
+   dashboard version and service status. If startup fails, stop it, restore the
+   saved executable and start it again; keep the backup until verification succeeds.
+
+Linux archives use `duduclaw-linux-x64.tar.gz` or `duduclaw-linux-arm64.tar.gz`;
+use `sha256sum -c` if `shasum` is unavailable. This procedure is for ordinary
+installations. Desktop apps use their app updater; protected Linux services use
+[the protected service upgrade procedure](linux-protected-service.md).
+
+
 ---
 
 ## 9. Prometheus + Grafana monitoring

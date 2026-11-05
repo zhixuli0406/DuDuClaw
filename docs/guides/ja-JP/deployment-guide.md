@@ -414,6 +414,62 @@ auto_update = true   # default: false — dashboard notification only
 | Homebrew（提供終了） | 自己アップデートを拒否します。この tap はすでに廃止され、新しいバージョンが配信されることはありません。npm かデスクトップアプリで再インストールしてください。 |
 | ソースからのビルド（`cargo`/`target/`） | 自己アップデートは可能ですが、再ビルドすると上書きされます |
 
+### トラブルシューティング：v1.79.2 以前から v1.79.3 へのダッシュボード更新が失敗する
+
+macOS Apple Silicon 向けの初期 v1.79.3 実行ファイルは 210,561,920 bytes
+（200.8 MiB）で、v1.79.2 以前の更新プログラムの展開上限 200 MiB
+（209,715,200 bytes）を超えています。再試行しても失敗し、古いダッシュボードには
+「更新失敗」だけが表示される場合があります。新しい版で上限を引き上げても、現在
+動作中の古い更新プログラムには反映されません。今後のリリースではシンボルを削除し、
+公開前にアーカイブ内の実行ファイルサイズを確認して互換性を維持します。
+
+通常のスタンドアロン環境では、一度だけ実行ファイルを手動で交換してください。
+
+1. [GitHub Releases](https://github.com/zhixuli0406/DuDuClaw/releases) から、
+   対象バージョン・OS・CPU のアーカイブと同名の `.sha256`、`.minisig` を取得します。
+   必要なら先に `minisign` をインストールしてください。macOS Apple Silicon の
+   v1.79.3 の例です。
+
+```sh
+version=1.79.3
+asset=duduclaw-darwin-arm64.tar.gz
+stage=$(mktemp -d)
+cd "$stage"
+base="https://github.com/zhixuli0406/DuDuClaw/releases/download/v$version"
+curl -fL "$base/$asset" -o "$asset"
+curl -fL "$base/$asset.sha256" -o "$asset.sha256"
+curl -fL "$base/$asset.minisig" -o "$asset.minisig"
+shasum -a 256 -c "$asset.sha256" &&
+  minisign -Vm "$asset" -x "$asset.minisig" \
+    -P 'RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh'
+```
+
+2. **両方の検証に成功した場合だけ**続行します。上記の鍵は更新プログラムにも埋め
+   込まれた公式リリース公開鍵です。アーカイブと一緒に取得した未知の鍵に置き換えない
+   でください。`tar -xzf "$asset" duduclaw` で展開し、`./duduclaw version` で
+   バージョンを確認します。
+3. 第 7 節の launchd plist または systemd unit でサービスが使用する実行ファイルの
+   パスを確認し、シンボリックリンクを解決します。npm の `duduclaw` コマンドは
+   JavaScript ラッパーの場合があり、ネイティブ実行ファイルで上書きしてはいけません。
+   実際の実行ファイルを `<binary>.pre-upgrade` などにコピーして保存します。
+4. サービスを停止して停止状態を確認します。macOS はインストール済み実行ファイルの
+   `service stop`、Linux は `systemctl --user stop duduclaw` を使用します。
+   フォアグラウンド実行なら元の端末で停止します。検証済みの `./duduclaw` を実際の
+   実行ファイルのパスへコピーし、`chmod 755 <binary>` で実行権限を戻します。
+   データディレクトリはそのまま残します。
+5. 同じサービスを起動します。macOS は `<binary> service restart` で登録済み
+   LaunchAgent を再読み込みし、Linux は `systemctl --user start duduclaw` を実行
+   します。フォアグラウンドなら従来の起動コマンドを使います。サービス状態とダッシュ
+   ボードのバージョンを確認します。起動に失敗した場合は停止して保存した実行ファイルを
+   戻し、再起動してください。確認が終わるまでバックアップを残します。
+
+Linux のアーカイブは `duduclaw-linux-x64.tar.gz` または
+`duduclaw-linux-arm64.tar.gz` です。`shasum` がなければ `sha256sum -c` を使います。
+この手順は通常のインストール向けです。デスクトップアプリはアプリの更新機能を、
+保護された Linux サービスは[専用のアップグレード手順](linux-protected-service.md)を
+使用してください。
+
+
 ---
 
 ## 9. Prometheus + Grafana モニタリング

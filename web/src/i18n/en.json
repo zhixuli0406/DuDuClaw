@@ -1,4 +1,13 @@
 {
+  "settings.update.failure.download": "Unable to download the update. Check your connection and check for updates again.",
+  "settings.update.failure.verify": "Update verification failed; installation was stopped. Download the official release again.",
+  "settings.update.failure.extract": "Unable to extract the update. Download the official release again.",
+  "settings.update.failure.size": "The update exceeds this version’s size limit. Follow the upgrade guide to update manually.",
+  "settings.update.failure.write": "Unable to write the update. Check free disk space and installation directory permissions.",
+  "settings.update.failure.swap": "Unable to replace the executable. Check the technical details and current installation state.",
+  "settings.update.failure.rollback": "The update and rollback both failed. Restore manually from the backup location in the technical details.",
+  "settings.update.failure.unknown": "The update did not complete. Check the technical details or follow the upgrade guide to update manually.",
+  "settings.update.failure.details": "Technical details",
   "invite.title": "Accept your invitation",
   "invite.loading": "Checking invitation…",
   "invite.invalid": "This invitation is unavailable. Ask your administrator for a new invitation.",

@@ -2453,12 +2453,20 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                                 Ok(result) => {
                                     // apply_update returned success=false (e.g. Homebrew)
                                     warn!(
-                                        msg = %result.message,
+                                        msg = %crate::updater::sanitize_failure_detail(&result.message),
                                         "Auto-update skipped"
                                     );
                                 }
                                 Err(e) => {
-                                    warn!(error = %e, "Auto-update failed — will retry next cycle");
+                                    let sanitized = crate::updater::sanitize_failure_detail(&e);
+                                    warn!(error = %sanitized, "Auto-update failed — will retry next cycle");
+                                    let failed_event = WsFrame::event(
+                                        "system.update_failed", crate::updater::failure_payload(&e),
+                                    );
+                                    if let Ok(json) = serde_json::to_string(&failed_event) {
+                                        let _ = etx.send(json);
+                                    }
+
 
                                     crate::security_autopilot::audit_and_emit(
                                         &home_for_update,
@@ -2468,7 +2476,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                                             duduclaw_security::audit::Severity::Warning,
                                             serde_json::json!({
                                                 "target_version": info.latest_version,
-                                                "error": e.replace('\n', " "),
+                                                "error": sanitized,
                                             }),
                                         ),
                                     );
