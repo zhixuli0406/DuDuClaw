@@ -8,6 +8,11 @@ pub(crate) fn available(home: &Path) -> bool {
     crate::mail_worker::resolve_smtp_config(home).is_some()
 }
 
+/// Explain availability without exposing configuration or delivery details.
+pub(crate) fn unavailable_reason(home: &Path) -> Option<&'static str> {
+    if available(home) { None } else { Some("no_smtp") }
+}
+
 pub(crate) async fn send_code(home: &Path, db: &UserDb, token: &str, email: &str, code: &str) -> Result<(),String> {
     let config=crate::mail_worker::resolve_smtp_config(home).ok_or(UNAVAILABLE)?;
     if crate::email::send_email(&config,email,"DuDuClaw Email 驗證碼",
@@ -37,4 +42,21 @@ pub(crate) fn notify_change(home: &Path, db: &std::sync::Arc<UserDb>, user: &str
         tracing::warn!("MFA security notification delivery failed");
     }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smtp_availability_has_only_a_safe_reason_code() {
+        let home=tempfile::tempdir().unwrap();
+        assert_eq!(unavailable_reason(home.path()),Some("no_smtp"));
+        std::fs::write(home.path().join("config.toml"),"[channels.email]\nsmtp_host='127.0.0.1'\n").unwrap();
+        assert_eq!(unavailable_reason(home.path()),Some("no_smtp"));
+        std::fs::write(home.path().join("config.toml"),"[channels.email]\nsmtp_host='127.0.0.1'\nfrom_addr='sender@example.test'\n").unwrap();
+        assert_eq!(unavailable_reason(home.path()),None);
+        std::fs::write(home.path().join("config.toml"),"invalid toml").unwrap();
+        assert_eq!(unavailable_reason(home.path()),Some("no_smtp"));
+    }
 }

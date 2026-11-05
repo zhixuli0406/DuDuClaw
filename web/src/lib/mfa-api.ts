@@ -1,3 +1,4 @@
+import { passkeyUnavailableReason } from '@/lib/passkey';
 import { client } from '@/lib/ws-client';
 import { ApiError, apiPost, useAuthStore, type FactorAvailability, type SessionTokens } from '@/stores/auth-store';
 
@@ -69,7 +70,7 @@ export function mfaErrorId(error: unknown): string {
     if (error.status === 401 || error.status === 403) return 'mfa.error.expired';
   }
   const message = error instanceof Error ? error.message : '';
-  if (message === 'PASSKEY_UNAVAILABLE') return 'mfa.passkey.unavailable';
+  if (message === 'PASSKEY_UNAVAILABLE') return `mfa.passkey.${passkeyUnavailableReason() ?? 'unavailable'}`;
   if (message === 'PASSKEY_CANCELLED' || (error instanceof DOMException && error.name === 'NotAllowedError')) return 'mfa.passkey.cancelled';
   if (/嘗試次數|too many/i.test(message)) return 'mfa.error.attempts';
   if (/過期|失效|expired|驗證失敗/i.test(message)) return 'mfa.error.expired';

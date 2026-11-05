@@ -5,7 +5,7 @@ import { AdditionalFactors } from './AdditionalFactors';
 import * as transport from '@/lib/mfa-api';
 import * as passkey from '@/lib/passkey';
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 it('preserves the password and displays the independent proof reference before starting a passkey ceremony', async () => {
   vi.spyOn(passkey, 'passkeyAvailable').mockReturnValue(true);
   const create = vi.spyOn(passkey, 'createPasskey');
@@ -24,4 +24,14 @@ it('preserves the password and displays the independent proof reference before s
   fireEvent.change(screen.getByLabelText('Channel or Admin enrollment code'), { target: { value: 'proof' } });
   fireEvent.click(screen.getByRole('button', { name: 'Add a passkey' }));
   await waitFor(() => expect(request).toHaveBeenLastCalledWith('/api/mfa/passkey/register/begin', { password: 'password', name: 'My laptop', enrollment_token: 'proof-token', proof_code: 'proof' }));
+});
+
+it('explains why email and passkey enrollment are disabled in account settings', async () => {
+  vi.stubGlobal('isSecureContext', false);
+  vi.spyOn(transport, 'accountRequest').mockResolvedValue({ passkeys: [], available: true });
+  renderWithProviders(<AdditionalFactors status={{ enabled: false, enforced: false, factors: { totp: false, email: false, passkey: false }, email_available: false, email_unavailable_reason: 'no_smtp' }} onChange={vi.fn()} />);
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Add a passkey' })).toBeDisabled());
+  expect(screen.getByRole('button', { name: 'Set up email verification' })).toBeDisabled();
+  expect(screen.getByText(/server has no outgoing email/)).toHaveTextContent('SMTP');
+  expect(screen.getByText(/Passkeys require HTTPS or localhost/)).toBeInTheDocument();
 });

@@ -144,3 +144,41 @@ fn email_admin_reset_reauth_checks_live_role_target_and_consumes_grant() {
     assert!(!db.mfa_active(&target.id).unwrap());
     assert!(db.mfa_admin_reset_reauth(&id,&target.id,&token,"session",2000).is_err());
 }
+
+#[test]
+fn email_http_capability_checks_are_read_only_and_preserve_scopes() {
+    let (_dir,db,id)=setup();
+    let token=db.mfa_challenge(&id,FirstFactor::Password,true,1000).unwrap();
+    db.mfa_prepare_enrollment(&token,false,1000).unwrap();
+    assert!(db.mfa_email_http_capability(&token,true,None,1000).is_ok());
+    assert!(db.mfa_email_http_capability(&token,false,None,1000).is_err());
+    assert!(db.mfa_email_http_capability(&"a".repeat(64),true,None,1000).is_err());
+    assert!(db.mfa_email_http_capability(&token,true,None,1000+TTL).is_err());
+    let counts:(i64,i64,i64)=db.conn().query_row("SELECT
+        (SELECT COUNT(*) FROM mfa_email_codes),(SELECT COUNT(*) FROM mfa_email_sends),
+        (SELECT SUM(attempts) FROM mfa_challenges)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(counts,(0,0,0));
+    let stepup=db.mfa_factor_password_challenge(&id,"password-test","session",1000).unwrap();
+    assert!(db.mfa_email_http_capability(&stepup,true,None,1000).is_err());
+    let channel=db.mfa_challenge(&id,FirstFactor::ChannelOtp,true,1000).unwrap();
+    db.mfa_prepare_enrollment(&channel,false,1000).unwrap();
+    assert!(db.mfa_email_http_capability(&channel,true,None,1000).is_err());
+    assert!(db.mfa_email_http_capability(&channel,true,Some("wrong"),1000).is_err());
+    assert!(db.mfa_email_http_capability(&channel,true,Some("password-test"),1000).is_ok());
+    db.conn().execute("UPDATE mfa_challenges SET attempts=5 WHERE token_hash=?1",[token_hash(&token)]).unwrap();
+    assert!(db.mfa_email_http_capability(&token,true,None,1000).is_err());
+}
+
+#[test]
+fn email_http_capability_refuses_consumed_login_and_inactive_user() {
+    let (_dir,db,id)=setup();
+    enrolled(&db,&id,1000);
+    let token=db.mfa_challenge(&id,FirstFactor::Password,false,2000).unwrap();
+    assert!(db.mfa_email_http_capability(&token,false,None,2000).is_ok());
+    let (_,code)=db.mfa_email_send(&token,false,2000).unwrap();
+    db.mfa_email_verify_and_issue(&token,&code,false,2000,|_,_,_|Ok(())).unwrap();
+    assert!(db.mfa_email_http_capability(&token,false,None,2000).is_err());
+    let token=db.mfa_challenge(&id,FirstFactor::Password,false,3000).unwrap();
+    db.conn().execute("UPDATE users SET status='suspended' WHERE id=?1",[&id]).unwrap();
+    assert!(db.mfa_email_http_capability(&token,false,None,3000).is_err());
+}

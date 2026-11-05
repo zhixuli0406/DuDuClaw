@@ -207,10 +207,11 @@ async fn mfa_password_and_channel_otp_return_no_token_in_entire_body() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["challenge_id", "email_available", "factors", "last_used", "mfa_required"]);
+        vec!["challenge_id", "email_available", "email_unavailable_reason", "factors", "last_used", "mfa_required"]);
     assert_eq!(response["factors"], json!({"totp":true,"email":false,"passkey":false}));
     assert_eq!(response["last_used"], "totp");
     assert_eq!(response["email_available"], false);
+    assert_eq!(response["email_unavailable_reason"], "no_smtp");
     assert_eq!(response["mfa_required"], true);
     assert!(!response.to_string().contains("token"));
 }
@@ -243,8 +244,9 @@ async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
     let old = state.jwt_config.issue_session_tokens(&user, &[]).unwrap();
     let (_, response) = login(&state, 184).await;
     assert_eq!(response.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["challenge_ref", "email_available", "enrollment_token", "mfa_enrollment_required"]);
+        vec!["challenge_ref", "email_available", "email_unavailable_reason", "enrollment_token", "mfa_enrollment_required"]);
     assert_eq!(response["email_available"], false);
+    assert_eq!(response["email_unavailable_reason"], "no_smtp");
     assert_eq!(response["mfa_enrollment_required"], true);
     assert!(response.get("access_token").is_none() && response.get("refresh_token").is_none());
     let token = response["enrollment_token"].as_str().unwrap().to_owned();
@@ -1069,6 +1071,7 @@ async fn mfa_refresh_and_local_session_refuse_durable_policy_despite_stale_cache
 async fn mfa_email_http_unconfigured_is_unavailable_without_sending_or_enabling() {
     let (_dir,state,user)=fixture(false,false).await;
     let token=state.user_db.mfa_challenge(&user.id,duduclaw_auth::mfa::FirstFactor::Password,true,chrono::Utc::now().timestamp()).unwrap();
+    state.user_db.mfa_prepare_enrollment(&token,false,chrono::Utc::now().timestamp()).unwrap();
     let payload=serde_json::from_value(json!({"enrollment_token":token})).unwrap();
     let (status,_)=body(super::super::server_mfa_email::send(State(state.clone()),ConnectInfo(peer(230)),Json(payload)).await).await;
     assert_eq!(status,StatusCode::SERVICE_UNAVAILABLE);
@@ -1109,4 +1112,32 @@ async fn mfa_enforced_email_user_can_add_totp_without_another_proof() {
     let WsFrame::Response{ok:true,payload:Some(value),..}=response else {panic!("begin failed")};
     assert!(value["secret"].is_string());
     assert!(value.get("proof_required").is_none());
+}
+
+#[tokio::test]
+async fn mfa_email_http_invalid_capabilities_hide_send_availability() {
+    let (dir,state,user)=fixture(false,false).await;
+    let now=chrono::Utc::now().timestamp();
+    let stepup=state.user_db.mfa_factor_password_challenge(&user.id,"correct horse battery","session",now).unwrap();
+    let expired=state.user_db.mfa_challenge(&user.id,duduclaw_auth::mfa::FirstFactor::Password,true,now-3600).unwrap();
+    let invalid=[json!({}),json!({"challenge_id":"short"}),json!({"challenge_id":"a".repeat(64)}),
+        json!({"enrollment_token":"a".repeat(64)}),json!({"challenge_id":"a".repeat(64),"enrollment_token":"b".repeat(64)}),
+        json!({"enrollment_token":stepup}),json!({"enrollment_token":expired})];
+    let mut expected=None;
+    for smtp in [false,true] {
+        let config=if smtp {"[channels.email]\nsmtp_host='127.0.0.1'\nsmtp_port=9\nfrom_addr='sender@example.test'\n"} else {"[auth]\nmfa_enforced=false\n"};
+        std::fs::write(dir.path().join("config.toml"),config).unwrap();
+        assert_eq!(crate::mfa_email::available(dir.path()),smtp);
+        for (i,value) in invalid.iter().enumerate() {
+            let addr=peer(240+i as u8);
+            let payload=serde_json::from_value(value.clone()).unwrap();
+            let send=body(super::super::server_mfa_email::send(State(state.clone()),ConnectInfo(addr),Json(payload)).await).await;
+            let payload=serde_json::from_value(value.clone()).unwrap();
+            let verify=body(super::super::server_mfa_email::verify(State(state.clone()),ConnectInfo(addr),Json(payload)).await).await;
+            assert_eq!(send.0,StatusCode::UNAUTHORIZED);
+            assert_eq!(verify.0,StatusCode::UNAUTHORIZED);
+            assert_eq!(send,verify);
+            if let Some(ref expected)=expected {assert_eq!(&send,expected);} else {expected=Some(send);}
+        }
+    }
 }
