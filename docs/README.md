@@ -8,6 +8,7 @@ Native Linux personal accounts: [Protected system service](guides/linux-protecte
 
 Developer implementation status: [Native Linux isolation — Package B1](architecture/native-linux-isolation.md) (not enabled).
 Developer handoff: [Native Linux isolation packages](architecture/native-linux-isolation.md) (development status and remaining acceptance gates).
+Internal engineering: [Native Linux isolation implementation](architecture/native-linux-isolation.md) (not active product behavior).
 
 ## Feature Highlights
 
