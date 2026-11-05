@@ -385,7 +385,7 @@ describe('employee sidebar', () => {
   it('marks and sorts the primary employee before an Owner binding', () => {
     useAgentsStore.setState({ agents: makeAgents(2) as never });
     useAuthStore.setState({ user: { id: 'employee', role: 'employee', primary_agent_id: 'agent-1' } as never,
-      bindings: [{ agent_name: 'agent-0', access_level: 'owner' }, { agent_name: 'agent-1', access_level: 'viewer' }] as never });
+      bindings: [{ agent_name: 'agent-0', access_level: 'owner' }, { agent_name: 'agent-1', access_level: 'operator' }] as never });
     renderSidebar();
     const links = screen.getAllByRole('link').filter(link => /^\/agents\//.test(link.getAttribute('href') ?? ''));
     expect(links.map(link => link.getAttribute('href'))).toEqual(['/agents/agent-1', '/agents/agent-0']);
@@ -397,7 +397,7 @@ describe('employee sidebar', () => {
     const user = userEvent.setup();
     const bindings = [
       { agent_name: 'agent-0', access_level: 'owner' },
-      { agent_name: 'agent-1', access_level: 'viewer' },
+      { agent_name: 'agent-1', access_level: 'operator' },
     ];
     const currentUser = { id: 'employee', role: 'employee', display_name: 'Alice', primary_agent_id: 'agent-0' };
     useAgentsStore.setState({ agents: makeAgents(2) as never });
@@ -422,6 +422,14 @@ describe('employee sidebar', () => {
     });
     expect(useAuthStore.getState().user?.primary_agent_id).toBe('agent-1');
     me.mockRestore();
+  });
+
+  it('does not offer a primary selection for Viewer bindings', () => {
+    useAgentsStore.setState({ agents: makeAgents(2) as never });
+    useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never,
+      bindings: [{ agent_name: 'agent-0', access_level: 'viewer' }, { agent_name: 'agent-1', access_level: 'operator' }] as never });
+    renderSidebar();
+    expect(screen.getAllByRole('button', { name: 'Set as primary' })).toHaveLength(1);
   });
 
   it('sorts bound staff by owner, operator, viewer and limits the list to eight', () => {

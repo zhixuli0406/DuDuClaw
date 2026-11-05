@@ -445,3 +445,42 @@ describe('server-resolved non-admin chat', () => {
     expect(screen.getByPlaceholderText(/message/i)).toBeDisabled();
   });
 });
+
+describe('WebChatPage primary preference', () => {
+  beforeEach(() => {
+    useAuthStore.setState({ user: { id: 'admin', role: 'admin', primary_agent_id: 'nova' } as never });
+    useAgentsStore.setState({ loaded: true, agents: [
+      { name: 'main', role: 'main', display_name: 'Main' },
+      { name: 'nova', role: 'specialist', display_name: 'Nova' },
+    ] as never });
+    useChatStore.setState({ selectedAgentId: null, messages: [], resumedExplicitly: false });
+  });
+  it('uses the visible primary when opening a fresh admin conversation', async () => {
+    renderWithProviders(<WebChatPage />);
+    await waitFor(() => expect(useChatStore.getState().selectedAgentId).toBe('nova'));
+  });
+  it('does not replace the partner of a historical conversation', () => {
+    useChatStore.setState({ selectedAgentId: 'history-staff', resumedExplicitly: true });
+    renderWithProviders(<WebChatPage />);
+    expect(useChatStore.getState().selectedAgentId).toBe('history-staff');
+  });
+  it('does not replace an explicit partner with the account default', () => {
+    render(<IntlProvider messages={en} locale="en"><MemoryRouter initialEntries={['/chat?agent=other']}><WebChatPage /></MemoryRouter></IntlProvider>);
+    expect(useChatStore.getState().selectedAgentId).toBe('other');
+  });
+  it('restores the primary when starting another new conversation', () => {
+    useChatStore.setState({ selectedAgentId: 'other', resumedExplicitly: true, messages: [{ id: 'past', role: 'user', content: 'Old question', timestamp: 0 }] });
+    act(() => useConversationsStore.getState().startNew());
+    expect(useChatStore.getState().selectedAgentId).toBe('nova');
+    expect(useChatStore.getState().messages).toEqual([]);
+    expect(useChatStore.getState().resumedExplicitly).toBe(false);
+  });
+  it('leaves enterprise member assignment to the gateway', () => {
+    useAuthStore.setState({ user: { id: 'employee', role: 'employee', primary_agent_id: 'nova' } as never });
+    useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
+    useChatStore.setState({ resolvedAgent: { id: 'assigned', name: 'Assigned', icon: '' }, assignmentError: null });
+    const select = vi.spyOn(useChatStore.getState(), 'selectAgent');
+    renderWithProviders(<WebChatPage />);
+    expect(select).not.toHaveBeenCalled();
+  });
+});

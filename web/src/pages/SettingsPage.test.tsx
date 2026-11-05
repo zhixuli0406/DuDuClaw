@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { screen, fireEvent, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 import { mockWsClient } from '@/test/mocks';
+import { useAuthStore } from '@/stores/auth-store';
+import { useSystemStore } from '@/stores/system-store';
 import { SettingsPage } from './SettingsPage';
 import { useAuthStore } from '@/stores/auth-store';
 
@@ -38,4 +40,28 @@ describe('SettingsPage', () => {
       expect(screen.getByText('Account & Password')).toBeInTheDocument();
     });
   });
+});
+
+// Both editions use this same settings rail; the invitation tab is Admin-only.
+it('shows the invitation tab with the 1.80.0 badge and opens its editor', async () => {
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
+  useSystemStore.setState({ status: { version: '1.80.0' } as never });
+  mockWsClient.call.mockImplementation(async (method: string) => {
+    if (method === 'invitation.get') return { locale: 'en', content: { opening: 'Welcome', steps: 'Set a password', examples: ['A', 'B', 'C'], course_url: '' } };
+    if (method === 'invitation.preview') return { subject: 'Welcome', html: '<p>Welcome</p>', text: 'Welcome', examples: ['A', 'B', 'C'] };
+    return {};
+  });
+  renderWithProviders(<SettingsPage />);
+  const tab = screen.getByRole('tab', { name: /Invitation email/i });
+  expect(tab).toHaveTextContent('New');
+  fireEvent.click(tab);
+  expect(await screen.findByLabelText('Opening text')).toHaveValue('Welcome');
+  expect(mockWsClient.call).toHaveBeenCalledWith('invitation.get', { locale: 'en' });
+});
+
+it('hides invitation settings from a manager', () => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never });
+  mockWsClient.call.mockResolvedValue({});
+  renderWithProviders(<SettingsPage />);
+  expect(screen.queryByRole('tab', { name: /Invitation email/i })).not.toBeInTheDocument();
 });

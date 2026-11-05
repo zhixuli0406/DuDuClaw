@@ -4,7 +4,7 @@ use super::*;
 /// Explicit Admin scope registry for gateway-owned invitation RPCs.
 pub(super) fn minimum_role(method: &str) -> Option<UserRole> {
     match method {
-        "users.invite" | "users.invite_status" => Some(UserRole::Admin),
+        _ if method.starts_with("users.invite") => Some(UserRole::Admin),
         _ => None,
     }
 }
@@ -71,6 +71,12 @@ impl MethodHandler {
         let epoch = ctx.credential_epoch;
         let issued = tokio::task::spawn_blocking(move || work.issue_user_invite_at_epoch(&id, &actor, epoch)).await;
         let issued = match issued { Ok(Ok(issued)) => issued, _ => return Err(invite_error("invite_target_invalid")) };
+        self.deliver_user_invitation(db, issued, ctx, &base, "zh-TW").await
+    }
+
+    pub(crate) async fn deliver_user_invitation(&self, db: &Arc<UserDb>, issued: duduclaw_auth::user_invites::IssuedUserInvite, ctx: &UserContext, base: &str, locale: &str) -> Result<Value, WsFrame> {
+        if !live_admin(db, ctx) { return Err(WsFrame::error_response("", "permission denied")); }
+        let user_id = issued.user_id.clone();
         // Re-read eligibility before delivery; the recipient itself was read
         // in the issuance transaction so a concurrent email edit cannot redirect it.
         if !matches!(db.user_invite_email(&issued.token), Ok(Some(_))) {
@@ -78,9 +84,13 @@ impl MethodHandler {
         }
         let email = issued.email;
         let link = format!("{base}/invite#{}", issued.token);
-        let payload = crate::user_invites::send(&self.home_dir, &email, &link).await;
+        let content = db.invitation_content(locale).map_err(|_| invite_error("invite_content_unavailable"))?;
+        let name = db.get_user(&user_id).ok().flatten().map(|u| u.display_name).unwrap_or_default();
+        let rendered = crate::user_invites::render_invitation(&self.home_dir, &content, locale, &name, &link, Some(&link))
+            .map_err(invite_error)?;
+        let payload = crate::user_invites::send_rendered(&self.home_dir, &email, &link, &rendered).await;
         let action = if payload["sent"] == true { "user_invite.sent" } else { "user_invite.failed" };
-        let _ = db.log_action(Some(&ctx.user_id), action, Some(user_id), None, None);
+        let _ = db.log_action(Some(&ctx.user_id), action, Some(&user_id), None, None);
         // Recheck before exposing a capability after an asynchronous delivery.
         if !live_admin(db, ctx) { return Err(WsFrame::error_response("", "permission denied")); }
         Ok(payload)
@@ -120,7 +130,7 @@ mod tests {
     fn invitation_scope_is_explicit_and_admin_only() {
         assert_eq!(minimum_role("users.invite"), Some(UserRole::Admin));
         assert_eq!(minimum_role("users.invite_status"), Some(UserRole::Admin));
-        assert_eq!(minimum_role("users.invite_unknown"), None);
+        assert_eq!(minimum_role("users.invite_unknown"), Some(UserRole::Admin));
     }
 
     #[tokio::test]

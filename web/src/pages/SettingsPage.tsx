@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
 import { useIntl } from 'react-intl';
 import { useLocation, useNavigate, useSearchParams } from 'react-router';
-import { Settings, Mic, Zap, KeyRound, SlidersHorizontal, Building2 } from 'lucide-react';
+import { Settings, Mic, Zap, KeyRound, SlidersHorizontal, Building2, Mail } from 'lucide-react';
 import { SettingsShell, SettingsTab, type SettingsNavGroup } from '@/components/mds';
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
@@ -11,13 +11,15 @@ import { AccountTab } from '@/components/settings/sections/AccountTab';
 import { VoiceTab } from '@/components/settings/sections/VoiceTab';
 import { ProactiveTab } from '@/components/settings/sections/ProactiveTab';
 import { AdvancedSettings } from '@/components/settings/AdvancedSettings';
+import { InvitationTab } from '@/components/settings/sections/InvitationTab';
 import { CompanySettings } from '@/components/settings/CompanySettings';
 import { ADVANCED_SETTINGS_PATH, LEGACY_ADVANCED_TABS } from '@/components/settings/advanced-settings-catalog';
 import { RestartRequiredBanner } from '@/components/settings/RestartRequiredBanner';
 
+const INVITATION_NEW_IN = '1.80.0';
 const SETTINGS_PATH = '/app/system/settings';
 const COMPANY_PATH = `${SETTINGS_PATH}/company`;
-const VALID_TABS = ['general', 'account', 'voice', 'proactive', 'advanced', 'company'] as const;
+const VALID_TABS = ['general', 'account', 'voice', 'proactive', 'advanced', 'company', 'invitation'] as const;
 type TabId = (typeof VALID_TABS)[number];
 
 /** Common settings stay short; uncommon settings share one searchable Admin page. */
@@ -31,7 +33,7 @@ export function SettingsPage() {
   const version = useSystemStore((s) => s.status?.version ?? null);
   const requested = pathname === ADVANCED_SETTINGS_PATH ? 'advanced' : pathname === COMPANY_PATH ? 'company' : tabParam;
   const tabAllowed = (tab: string | null): tab is TabId =>
-    (VALID_TABS as readonly (string | null)[]).includes(tab) && (isAdmin || (tab !== 'advanced' && tab !== 'company'));
+    (VALID_TABS as readonly (string | null)[]).includes(tab) && (isAdmin || (tab !== 'advanced' && tab !== 'company' && tab !== 'invitation'));
   const activeTab: TabId = tabAllowed(requested) ? requested : 'general';
 
   useEffect(() => {
@@ -63,6 +65,16 @@ export function SettingsPage() {
       items: [
         { value: 'general', label: t('settings.general'), icon: Settings },
         { value: 'account', label: t('settings.account'), icon: KeyRound },
+        ...(isAdmin ? [{
+          value: 'invitation',
+          label: isNewFeature(INVITATION_NEW_IN, version) ? (
+            <span className="flex items-center gap-1.5">
+              {t('invitation.title')}
+              <span className="rounded border border-surface-border px-1.5 py-0.5 text-xs text-muted-foreground">{t('nav.badge.new')}</span>
+            </span>
+          ) : t('invitation.title'),
+          icon: Mail,
+        }] : []),
         { value: 'voice', label: t('settings.voice'), icon: Mic },
         { value: 'proactive', label: t('settings.proactive'), icon: Zap },
         ...(isAdmin ? [{ value: 'company', label: newLabel('companyInfo.title'), icon: Building2 }] : []),
@@ -80,6 +92,7 @@ export function SettingsPage() {
       <SettingsShell value={activeTab} onValueChange={setTab} groups={navGroups}>
         <SettingsTab value="general" title={t('settings.general')}><GeneralTab /></SettingsTab>
         <SettingsTab value="account" title={t('settings.account.title')}><AccountTab /></SettingsTab>
+        {isAdmin && <SettingsTab value="invitation" title={t('invitation.title')}><InvitationTab /></SettingsTab>}
         <SettingsTab value="voice" title={t('voice.title')}><VoiceTab /></SettingsTab>
         <SettingsTab value="proactive" title={t('proactive.title')}><ProactiveTab /></SettingsTab>
         {isAdmin && <SettingsTab value="company" title={t('companyInfo.title')} description={t('companyInfo.description')}><CompanySettings /></SettingsTab>}

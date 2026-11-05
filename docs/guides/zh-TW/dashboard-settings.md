@@ -608,7 +608,7 @@ AI 員工回覆時，你仍可輸入並送出下一則訊息。同一個對話�
 
 管理員在「管理 → 成員 → 新增成員」勾選「寄送邀請信」，確認信件預覽後建立帳號。邀請帳號沒有可用密碼。已有帳號若仍在職，且尚未設定密碼，可以選「重新寄送」。清單會標示「邀請中」及「邀請已過期」。
 
-在 `config.toml` 設定 `[gateway] public_url = "https://ai.example.com"`，填入成員能連到的儀表板網址。未設定時，儀表板會以管理員目前瀏覽器的來源網址傳入 `public_url`。Gateway 不會採用 HTTP Host 或 Origin 標頭產生連結。沒有網址會回覆 `public_url_required`；設定的網址格式錯誤時會拒絕寄送。對外網址必須使用 HTTPS；僅解析後主機名稱完全等於 `localhost`、`127.0.0.1` 或 `::1` 時允許 HTTP。
+在 `config.toml` 設定 `[gateway] public_url = "https://ai.example.com"`，填入成員能連到的儀表板網址。未設定時，儀表板會以管理員目前瀏覽器的來源網址傳入 `public_url`。Gateway 不會採用 HTTP Host 或 Origin 標頭產生連結。沒有網址會回覆 `public_url_required`；設定的網址格式錯誤時會拒絕寄送。所有邀請公開網址一律要求 HTTPS，包含 `localhost`、`127.0.0.1` 與 `::1`。
 
 邀請信沿用 `[channels.email]` 的 SMTP 設定，支援既有加密憑證；目前儲存庫沒有 Resend 或 SendGrid 寄件程式。信內連結七天有效，限用一次。尚未設定寄信或寄送失敗時，管理員會看到一次可複製連結；寄送成功不會回傳連結。關閉結果視窗後不再顯示。重新寄送會撤銷之前未使用的連結，保留歷史紀錄。
 

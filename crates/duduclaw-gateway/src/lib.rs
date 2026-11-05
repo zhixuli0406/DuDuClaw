@@ -660,6 +660,7 @@ pub(crate) mod live_events;
 
 pub(crate) mod user_invites;
 pub(crate) mod company_info;
+mod invitation_email;
 
 /// Gateway-owned meeting transcription execution.
 pub mod meeting_transcription;

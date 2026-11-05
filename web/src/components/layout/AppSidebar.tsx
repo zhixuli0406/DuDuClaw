@@ -333,7 +333,7 @@ function StaffZone({
                   <span className="min-w-0 flex-1 truncate">{a.display_name}{a.readOnly && <span className="block text-[10px] text-muted-foreground">{intl.formatMessage({ id: 'agents.teamMember' }, { name: a.teamMember })}</span>}</span>
                   {employee && a.name === primaryAgent && <span className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'sidebar.primaryAgent' })}</span>}
                 </NavLink>
-                {employee && <DropdownMenu>
+                {employee && bindings.some(binding => binding.agent_name === a.name && (binding.access_level === 'owner' || binding.access_level === 'operator')) && <DropdownMenu>
                   <DropdownMenuTrigger render={<Button variant="ghost" size="icon" className="absolute right-1 top-1 size-6" aria-label={intl.formatMessage({ id: 'sidebar.setPrimaryAgent' })} />}>
                     <MoreHorizontal className="size-4" />
                   </DropdownMenuTrigger>

@@ -52,7 +52,7 @@ impl WebChatState {
         let reg = self.ctx.registry.read().await;
         let candidates: Vec<String> = reg.list().into_iter().filter_map(|a| {
             let id = &a.config.agent.name;
-            (a.config.agent.status.is_operational() && snapshot.access.may_call(id)
+            (a.config.agent.status.is_operational() && snapshot.access.may_assign(id)
                 && sender.webchat_allows(a) && sender.may_call(a, None)).then(|| id.clone())
         }).collect();
         if let Some(primary) = primary.filter(|id| candidates.iter().any(|a| a == id)) {
@@ -152,7 +152,8 @@ impl WebChatState {
         }
         if !loaded.config.agent.status.is_operational()
             || !sender.may_call(loaded, None)
-            || (!public && !snapshot.access.may_call(agent))
+            || snapshot.access.level(agent).is_some_and(|(level, _)| !level.at_least(duduclaw_auth::AccessLevel::Operator))
+            || (!public && !snapshot.access.may_assign(agent))
         {
             return Err(denied("agent_forbidden"));
         }
