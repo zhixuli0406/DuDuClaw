@@ -6,7 +6,9 @@ import { useNavigate } from 'react-router';
 import { useAgentsStore } from '@/stores/agents-store';
 import { OrgChart } from '@/components/OrgChart';
 import { OrgNodePanel } from '@/components/agent';
-import type { AgentDetail } from '@/lib/api';
+import { api, type AgentDetail, type OrgChartAgent } from '@/lib/api';
+import { useAuthStore } from '@/stores/auth-store';
+import { useConnectionStore } from '@/stores/connection-store';
 import { Users } from 'lucide-react';
 import {
   CollectionPageHeader,
@@ -19,6 +21,55 @@ import { toast } from '@/lib/toast';
 import { usePanel } from '@/components/ui';
 
 export function OrgChartPage() {
+  const user = useAuthStore(s => s.user);
+  return user?.role === 'employee'
+    ? <EmployeeOrgChart key={user.id} />
+    : <ManagedOrgChart />;
+}
+
+function EmployeeOrgChart() {
+  const intl = useIntl();
+  const connection = useConnectionStore(s => s.state);
+  const [agents, setAgents] = useState<OrgChartAgent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<unknown>(null);
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    let active = true;
+    setAgents([]);
+    setLoading(true);
+    setError(null);
+    if (connection === 'authenticated') {
+      void api.agents.orgChart().then(result => {
+        if (active) setAgents(result.agents);
+      }).catch(err => {
+        if (active) setError(err);
+      }).finally(() => {
+        if (active) setLoading(false);
+      });
+    }
+    return () => { active = false; };
+  }, [connection, attempt]);
+  return (
+    <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+      <CollectionPageHeader icon={Users} title={intl.formatMessage({ id: 'nav.org' })}
+        count={agents.length} description={intl.formatMessage({ id: 'nav.org.desc' })} />
+      <div className="mx-auto w-full max-w-6xl p-6">
+        {loading ? <CollectionPageState state="loading" />
+          : error != null ? <ErrorState icon={Users} error={error} onRetry={() => setAttempt(n => n + 1)} />
+          : agents.length === 0 ? <CollectionPageState state="empty" icon={Users} title={intl.formatMessage({ id: 'agents.empty' })} />
+          : <Card className="gap-0 p-2"><OrgChart agents={agents} labels={{
+            main: intl.formatMessage({ id: 'orgchart.legend.main' }),
+            specialist: intl.formatMessage({ id: 'orgchart.legend.specialist' }),
+            worker: intl.formatMessage({ id: 'orgchart.legend.worker' }),
+            zoom: intl.formatMessage({ id: 'orgchart.zoom' }),
+          }} /></Card>}
+      </div>
+    </div>
+  );
+}
+
+function ManagedOrgChart() {
   const intl = useIntl();
   const navigate = useNavigate();
   const errorText = useErrorMessage();

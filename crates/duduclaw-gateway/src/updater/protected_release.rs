@@ -25,6 +25,7 @@ fn allowed_redirect(url: &reqwest::Url) -> bool {
 /// Fetch and authenticate the exact release archive using the existing updater
 /// key and integrity verifier, then stream the executable into the caller's
 /// root-only staging file, hashing and counting bytes without executing them.
+/// The staging file must be opened read/write for static version inspection.
 /// Returns the version, compressed size and executable size after fsync.
 /// The operator CLI owns the staging file and atomic destination swap.
 pub async fn download_protected_release(version: Option<&str>, output: &mut std::fs::File) -> Result<(String, u64, u64), String> {
@@ -46,13 +47,15 @@ pub async fn download_protected_release(version: Option<&str>, output: &mut std:
         .build().map_err(|e| format!("HTTP client error: {e}"))?;
     let checksum = format!("{url}.sha256");
     let signature = format!("{url}.minisig");
-    let archive = with_retries(&DOWNLOAD_RETRY_DELAYS_SECS, &|_, _| {}, |_| {
+    let (archive, identity) = with_retries(&DOWNLOAD_RETRY_DELAYS_SECS, &|_, _| {}, |_| {
         download_and_verify_once(&client, &url, &checksum, &signature)
     }).await.map_err(|e| e.message)?;
+    identity.check_archive(&archive)?;
     let size = archive.len() as u64;
     eprintln!("Release archive bytes: {size}");
     let binary_size = extract_binary_to(&archive, "duduclaw", output)?;
     if binary_size == 0 { return Err("Release binary is empty".into()); }
+    release_identity::verify_binary_version(output, identity.version())?;
     output.sync_all().map_err(|e| format!("Failed to sync staged binary: {e}"))?;
     eprintln!("Release binary bytes: {binary_size}");
     Ok((version, size, binary_size))

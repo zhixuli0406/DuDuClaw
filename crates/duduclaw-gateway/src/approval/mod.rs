@@ -104,6 +104,8 @@ pub mod policy_snapshot;
 mod delivery;
 pub(crate) use delivery::{CURRENT_TRUSTED_REPLY_TARGET, TrustedReplyTarget, scope_trusted_reply};
 mod broker;
+mod ag_ui;
+pub(crate) use ag_ui::same_ag_ui_request;
 mod turn_origin;
 pub(crate) use turn_origin::scope_turn;
 pub(crate) use binding::require_current_dashboard_role_in_home;

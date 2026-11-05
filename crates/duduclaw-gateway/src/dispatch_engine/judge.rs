@@ -291,13 +291,9 @@ impl duduclaw_fork::judge::LlmCaller for GoalAcceptanceCaller {
         // (arXiv:2607.13918). Read per call — same hot-reload schedule as
         // `[dispatch] judge` / `two_stage_judge`.
         //
-        // A hint that cannot be honoured (family mismatch, or the runtime is
-        // not installed on this host) is DROPPED, audited, and the call runs
-        // on the default utility resolution: an adjudication must never fail
-        // because of a routing preference. `resolve_hinted_utility` makes that
-        // decision BEFORE any spawn, so a degrade costs zero tokens — genuine
-        // LLM errors still surface as errors instead of being silently retried
-        // on a second model.
+        // An explicitly selected Codex judge is an acceptance requirement:
+        // refusal or runtime failure must never substitute the default judge.
+        // Other providers retain their existing audited degradation policy.
         // Live round 8: the stage currently running may require a reply shape.
         // Kept OUT of the routing decision below on purpose — a schema changes
         // the reply's shape, not which model answers — and folded onto the hint
@@ -313,6 +309,7 @@ impl duduclaw_fork::judge::LlmCaller for GoalAcceptanceCaller {
         };
         let hint = crate::judge_mode::judge_model_hint_from_home(Some(&self.home_dir))
             .map_err(duduclaw_fork::ForkError::Executor)?;
+        let codex_required = explicit_codex_judge(&self.home_dir, hint.as_ref());
         let effective = if hint.is_some() {
             let (_, degraded) = crate::runtime_dispatch::resolve_hinted_utility(
                 &self.home_dir,
@@ -323,6 +320,9 @@ impl duduclaw_fork::judge::LlmCaller for GoalAcceptanceCaller {
             match degraded {
                 None => hint,
                 Some(reason) => {
+                    if codex_required {
+                        return Err(codex_judge_refusal(&self.home_dir, &reason));
+                    }
                     warn!(
                         reason = %reason,
                         "judge seam: [dispatch] judge_provider/judge_model 無法使用 → 退回預設 utility 判官模型（降級不影響裁決）"
@@ -356,16 +356,14 @@ impl duduclaw_fork::judge::LlmCaller for GoalAcceptanceCaller {
             ..hint
         };
 
-        // POST-spawn degrade (live-test gap): the hinted runtime was usable
-        // and was selected, then failed anyway (bad argv, auth, crash). It is
-        // already guaranteed NOT to have been silently rescued by the worker's
-        // family — `run_utility_prompt_with_hint` runs a provider-changing
-        // hint with `allow_cross_family_failover = false` — so this error is
-        // the real one, and the honest move is to say so and retry un-hinted.
-        // The settle must never fail because of a routing preference.
+        // Codex failures remain acceptance errors; only other providers may
+        // retry through the existing default utility degradation path.
         match run_judge_utility(&self.home_dir, prompt, Some(&hint)).await {
             Ok(text) => Ok(text),
             Err(e) => {
+                if codex_required {
+                    return Err(codex_judge_refusal(&self.home_dir, &e));
+                }
                 let (spec, _) = crate::runtime_dispatch::resolve_hinted_utility(
                     &self.home_dir,
                     None,
@@ -398,6 +396,25 @@ impl duduclaw_fork::judge::LlmCaller for GoalAcceptanceCaller {
             }
         }
     }
+}
+
+fn explicit_codex_judge(
+    home: &std::path::Path,
+    hint: Option<&crate::runtime_dispatch::UtilityModelHint>,
+) -> bool {
+    hint.filter(|hint| !hint.is_empty()).is_some_and(|hint| {
+        hint.provider.unwrap_or_else(|| crate::runtime_config::resolve_utility(home, None).provider)
+            == duduclaw_core::types::RuntimeType::Codex
+    })
+}
+
+fn codex_judge_refusal(home: &std::path::Path, reason: &str) -> duduclaw_fork::ForkError {
+    let reason = format!("指定的 Codex 判官無法執行，驗收步驟失敗：{reason}");
+    crate::judge_mode::log_judge_seam_event(
+        Some(home), JUDGE_CALLER_ID, "judge_seam_refused",
+        crate::judge_mode::JudgeMode::from_home(Some(home)), &reason,
+    );
+    duduclaw_fork::ForkError::Executor(reason)
 }
 
 /// One judge/evaluator utility call. Factored out of
@@ -1227,6 +1244,60 @@ pub fn parse_verdict(raw: &str) -> AcceptanceVerdict {
 mod removed_runtime_tests {
     use super::GoalAcceptanceCaller;
     use duduclaw_fork::judge::LlmCaller;
+
+    #[tokio::test]
+    async fn explicit_codex_judge_degradation_fails_acceptance_without_default() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "[dispatch]\njudge_provider='codex'\njudge_model='claude-haiku-4-5'\n").unwrap();
+        let caller = GoalAcceptanceCaller { home_dir: home.path().to_path_buf() };
+        let error = caller.complete("must not use the default judge").await.unwrap_err().to_string();
+        assert!(error.contains("指定的 Codex 判官"), "{error}");
+        assert!(error.contains("does not belong to runtime codex"), "{error}");
+    }
+
+    struct RefusedCodex;
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for RefusedCodex {
+        fn name(&self) -> &str { "codex" }
+        async fn is_available(&self) -> bool { panic!("fixture must not probe host binaries") }
+        async fn execute(&self, _: &str, _: &crate::runtime::RuntimeContext)
+            -> Result<crate::runtime::RuntimeResponse, String> {
+            Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+                "/etc/codex/config.toml defines native mcp_servers"))
+        }
+    }
+
+    struct ForbiddenDefault;
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for ForbiddenDefault {
+        fn name(&self) -> &str { "openai_compat" }
+        async fn is_available(&self) -> bool { panic!("fixture must not probe host binaries") }
+        async fn execute(&self, _: &str, _: &crate::runtime::RuntimeContext)
+            -> Result<crate::runtime::RuntimeResponse, String> {
+            panic!("refused explicit Codex judge must not retry the default judge")
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_codex_spawn_refusal_fails_acceptance_without_default() {
+        use duduclaw_core::types::RuntimeType;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "[runtime]\nutility_provider='openai_compat'\nutility_model='gpt-5.4-mini'\n[dispatch]\njudge_provider='codex'\njudge_model='gpt-5.4-mini'\n").unwrap();
+        let runtimes: std::collections::HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> =
+            std::collections::HashMap::from([
+                (RuntimeType::Codex, Box::new(RefusedCodex) as Box<dyn crate::runtime::AgentRuntime>),
+                (RuntimeType::OpenAiCompat, Box::new(ForbiddenDefault) as Box<dyn crate::runtime::AgentRuntime>),
+            ]);
+        let _registry = crate::runtime_dispatch::testing::RegistryGuard::install(
+            home.path(), crate::runtime::RuntimeRegistry::with_runtimes(runtimes)).await;
+        let caller = GoalAcceptanceCaller { home_dir: home.path().to_path_buf() };
+        let error = crate::autonomous_runtime::scope(home.path(), "", &[],
+            caller.complete("must not use default judge")).await.unwrap_err().to_string();
+        assert!(error.contains("指定的 Codex 判官"), "{error}");
+        assert!(error.contains("/etc/codex/config.toml"), "{error}");
+    }
 
     #[tokio::test]
     async fn removed_judge_runtime_is_refused_before_default_utility_can_run() {

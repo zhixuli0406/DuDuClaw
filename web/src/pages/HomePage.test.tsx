@@ -74,6 +74,7 @@ describe('HomePage (WP1.5)', () => {
       expect(screen.queryByText(label)).not.toBeInTheDocument();
     }
     expect(mockWsClient.call.mock.calls.map(([method]) => method)).not.toContain('dashboard.layout.get');
+    expect(mockWsClient.call.mock.calls.map(([method]) => method)).not.toContain('onboarding.get');
   });
 
   it('renders the greeting line and the usage KPI strip for an admin', async () => {

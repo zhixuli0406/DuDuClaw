@@ -15,6 +15,7 @@ import { CredentialProtectionPanel } from '@/components/CredentialProtectionPane
 import { WebsiteCredentialsPanel } from '@/components/WebsiteCredentialsPanel';
 import { AdminMfa } from '@/components/mfa/AdminMfa';
 import { ForgetReceiptsPanel } from '@/components/ForgetReceiptsPanel';
+import { RememberedSessionPolicy } from '@/components/mfa/RememberedSessionPolicy';
 import { toast, formatError } from '@/lib/toast';
 import {
   TRIGGER_KEYS,
@@ -147,6 +148,7 @@ export function SecurityPage() {
           single-owner Personal install as to an Enterprise one, so unlike the
           cards below it does not fold behind the Personal AdvancedSection. */}
       <CredentialHygienePanel onGoToAccounts={() => navigate('/app/system/accounts')} />
+      <RememberedSessionPolicy />
 
       {/* Credential inventory (WP-H1 P1) — sits directly under hygiene because
           the two answer adjacent questions: hygiene says what is wrong, the
@@ -684,6 +686,10 @@ function AuditRow({ event }: { event: AuditEvent }) {
             {event.event_type}
           </span>
           <Badge variant={badge.variant} className={badge.className}>{event.severity}</Badge>
+          {['engine_socket_policy_change_requested', 'engine_socket_policy_changed', 'engine_socket_warning_started', 'engine_socket_warning_ended'].includes(event.event_type)
+            && (event.details?.policy_event_source === 'root' || event.details?.policy_event_source === 'runtime') && (
+            <Badge variant="secondary">{String(event.details.policy_event_source)}</Badge>
+          )}
           {event.agent_id && (
             <span className="flex items-center gap-1 text-xs text-muted-foreground">
               <ActorAvatar actorType="agent" name={event.agent_id} size="xs" />

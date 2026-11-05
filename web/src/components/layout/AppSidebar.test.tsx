@@ -1,4 +1,6 @@
+import { useCompanyStore } from '@/stores/company-store';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { useLocation } from 'react-router';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
@@ -40,6 +42,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   useBrandStore.setState({ brand: null });
+  useCompanyStore.getState().setCompany(null);
+  vi.spyOn(api.about, 'get').mockResolvedValue({} as never);
   useAuthStore.setState({
     user: { display_name: 'Boss', role: 'admin' } as never,
     bindings: [],
@@ -53,6 +57,24 @@ beforeEach(() => {
 });
 
 describe('AppSidebar (Multica shell)', () => {
+  it('shows the company identity while preserving the distributor fallback', () => {
+    useBrandStore.getState().setBrand({ product_name: 'Partner Desk', logo_light: 'data:image/png;base64,iVBORw0KGgo=' });
+    const logo = `/api/company/logo/${'a'.repeat(64)}.png`;
+    useCompanyStore.getState().setCompany({ name: 'Acme Team', logo_url: logo });
+    renderSidebar();
+    expect(screen.getByRole('img', { name: 'Acme Team' })).toHaveAttribute('src', logo);
+    expect(screen.getByText('Acme Team')).toBeInTheDocument();
+    expect(screen.queryByText('Partner Desk')).toBeNull();
+  });
+
+  it('uses the distributor logo when no customer logo is configured', () => {
+    const logo = 'data:image/png;base64,iVBORw0KGgo=';
+    useBrandStore.getState().setBrand({ product_name: 'Partner Desk', logo_light: logo });
+    renderSidebar();
+    expect(screen.getByRole('img', { name: 'Partner Desk' })).toHaveAttribute('src', logo);
+    expect(screen.getByText('Partner Desk')).toBeInTheDocument();
+  });
+
   // Multica IA (spec §5.1): flat daily row + 工作 / 公司 / 設定 groups + a live
   // 員工 zone. Home is the single spine.
   it('renders the flat daily items and the three collapsible group labels', () => {
@@ -98,7 +120,9 @@ describe('AppSidebar (Multica shell)', () => {
     expect(screen.getByRole('link', { name: /Dashboard/i })).toBeInTheDocument();
     if (role === 'manager') expect(screen.getByRole('link', { name: /About/i })).toBeInTheDocument();
     else expect(screen.queryByRole('link', { name: /About/i })).not.toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: /Automations/i })).not.toBeInTheDocument();
+    // Employees get the scoped 1.80.0 automation page; managers retain the admin gate.
+    if (role === 'employee') expect(screen.getByRole('link', { name: /Automations/i })).toHaveAttribute('href', '/routines');
+    else expect(screen.queryByRole('link', { name: /Automations/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /Gallery/i })).not.toBeInTheDocument();
   });
 
@@ -315,6 +339,7 @@ describe('employee sidebar', () => {
     useSystemStore.setState({ status: { edition_profile: 'enterprise', version: '1.79.0' } as never });
     useAuthStore.setState({ user: { id: 'employee', display_name: 'Alice', role: 'employee', email: 'alice@example.com', department: 'Sales' } as never });
     useBrandStore.setState({ brand: null });
+  useCompanyStore.getState().setCompany(null);
     vi.spyOn(api.personalGoogle, 'status').mockRejectedValue(new Error('offline'));
   });
 
@@ -325,7 +350,7 @@ describe('employee sidebar', () => {
     expect(screen.getByRole('link', { name: /Inbox/i })).toHaveAttribute('href', '/inbox');
     expect(screen.queryByRole('button', { name: /Workspace/i })).not.toBeInTheDocument();
     expect(screen.getByText('Sales')).toBeInTheDocument();
-    expect(screen.getAllByRole('link').slice(0, 5).map(link => link.getAttribute('href'))).toEqual(['/', '/inbox', '/skills', '/memory', '/world']);
+    expect(screen.getAllByRole('link').slice(0, 7).map(link => link.getAttribute('href'))).toEqual(['/', '/inbox', '/routines', '/skills', '/memory', '/world', '/org']);
     expect(precedes(screen.getByRole('button', { name: /Command palette/i }), screen.getByRole('button', { name: /New chat/i }))).toBe(true);
     expect(screen.queryByRole('link', { name: /Task Board/i })).not.toBeInTheDocument();
     await waitFor(() => expect(api.personalGoogle.status).toHaveBeenCalledTimes(1));
@@ -341,7 +366,8 @@ describe('employee sidebar', () => {
     for (const name of ['My connections', 'Settings', 'Appearance', 'Get help']) {
       expect(screen.getByRole('menuitem', { name: new RegExp(name, 'i') })).toBeInTheDocument();
     }
-    expect(screen.getByText('Switch language')).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: 'Switch language' })).toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: '日本語' })).not.toBeInTheDocument();
     expect(screen.getByRole('menuitem', { name: /Sign Out/i })).toBeInTheDocument();
     await waitFor(() => expect(api.personalGoogle.status).toHaveBeenCalledTimes(2));
     expect(screen.queryByRole('img', { name: 'Connection needed' })).not.toBeInTheDocument();
@@ -364,7 +390,7 @@ describe('employee sidebar', () => {
   it('marks and sorts the primary employee before an Owner binding', () => {
     useAgentsStore.setState({ agents: makeAgents(2) as never });
     useAuthStore.setState({ user: { id: 'employee', role: 'employee', primary_agent_id: 'agent-1' } as never,
-      bindings: [{ agent_name: 'agent-0', access_level: 'owner' }, { agent_name: 'agent-1', access_level: 'viewer' }] as never });
+      bindings: [{ agent_name: 'agent-0', access_level: 'owner' }, { agent_name: 'agent-1', access_level: 'operator' }] as never });
     renderSidebar();
     const links = screen.getAllByRole('link').filter(link => /^\/agents\//.test(link.getAttribute('href') ?? ''));
     expect(links.map(link => link.getAttribute('href'))).toEqual(['/agents/agent-1', '/agents/agent-0']);
@@ -376,7 +402,7 @@ describe('employee sidebar', () => {
     const user = userEvent.setup();
     const bindings = [
       { agent_name: 'agent-0', access_level: 'owner' },
-      { agent_name: 'agent-1', access_level: 'viewer' },
+      { agent_name: 'agent-1', access_level: 'operator' },
     ];
     const currentUser = { id: 'employee', role: 'employee', display_name: 'Alice', primary_agent_id: 'agent-0' };
     useAgentsStore.setState({ agents: makeAgents(2) as never });
@@ -403,6 +429,14 @@ describe('employee sidebar', () => {
     me.mockRestore();
   });
 
+  it('does not offer a primary selection for Viewer bindings', () => {
+    useAgentsStore.setState({ agents: makeAgents(2) as never });
+    useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never,
+      bindings: [{ agent_name: 'agent-0', access_level: 'viewer' }, { agent_name: 'agent-1', access_level: 'operator' }] as never });
+    renderSidebar();
+    expect(screen.getAllByRole('button', { name: 'Set as primary' })).toHaveLength(1);
+  });
+
   it('sorts bound staff by owner, operator, viewer and limits the list to eight', () => {
     const agents = makeAgents(10);
     useAgentsStore.setState({ agents: agents as never });
@@ -416,7 +450,7 @@ describe('employee sidebar', () => {
 });
 
 
-it('shows the connection dot and hides help for an active distributor brand', async () => {
+it('shows help even when a distributor brand has no support notice', async () => {
   useAuthStore.setState({ user: { display_name: 'Alice', role: 'employee' } as never });
   useBrandStore.setState({ brand: { product_name: 'Partner', logo_light: '' } });
   vi.spyOn(api.personalGoogle, 'status').mockResolvedValue({
@@ -426,7 +460,7 @@ it('shows the connection dot and hides help for an active distributor brand', as
   renderSidebar();
   await user.click(screen.getByRole('button', { name: 'Alice' }));
   expect(await screen.findByRole('img', { name: 'Connection needed' })).toBeInTheDocument();
-  expect(screen.queryByRole('menuitem', { name: 'Get help' })).not.toBeInTheDocument();
+  expect(screen.getByRole('menuitem', { name: 'Get help' })).toBeInTheDocument();
 });
 
 
@@ -439,4 +473,33 @@ describe('single desktop new-conversation entry', () => {
     expect(screen.queryByRole('link', { name: 'New chat' })).not.toBeInTheDocument();
     expect(container.querySelector('a[href="/tasks"], a[href="/goals"], a[href="/assign"]')).toBeNull();
   });
+});
+
+function MenuLocation() {
+  const location = useLocation();
+  return <output data-testid="menu-location">{location.pathname}{location.hash}</output>;
+}
+
+it('opens the distributor support entry when the server provides a notice', async () => {
+  useAuthStore.setState({ user: { id: 'employee', display_name: 'Alice', role: 'employee' } as never });
+  vi.spyOn(api.personalGoogle, 'status').mockRejectedValue(new Error('offline'));
+  vi.spyOn(api.about, 'get').mockResolvedValue({ distributor_notice: '<p>Support</p>' } as never);
+  const user = userEvent.setup();
+  renderWithProviders(<SidebarProvider><AppSidebar /><MenuLocation /></SidebarProvider>);
+  await waitFor(() => expect(api.about.get).toHaveBeenCalled());
+  await user.click(screen.getByRole('button', { name: 'Alice' }));
+  await user.click(await screen.findByRole('menuitem', { name: 'Get help' }));
+  expect(screen.getByTestId('menu-location')).toHaveTextContent('/about#distributor-support');
+});
+
+it('opens language settings from the employee menu and keeps the version out of the rail', async () => {
+  useAuthStore.setState({ user: { id: 'employee', display_name: 'Alice', role: 'employee' } as never });
+  useSystemStore.setState({ status: { edition_profile: 'enterprise', version: '1.80.0' } as never });
+  vi.spyOn(api.personalGoogle, 'status').mockRejectedValue(new Error('offline'));
+  const user = userEvent.setup();
+  renderWithProviders(<SidebarProvider><AppSidebar /><MenuLocation /></SidebarProvider>);
+  expect(screen.queryByText('v1.80.0')).not.toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Alice' }));
+  await user.click(await screen.findByRole('menuitem', { name: 'Switch language' }));
+  expect(screen.getByTestId('menu-location')).toHaveTextContent('/me/account#language');
 });

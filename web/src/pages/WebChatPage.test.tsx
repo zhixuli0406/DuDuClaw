@@ -1,3 +1,4 @@
+import { useConnectionStore } from '@/stores/connection-store';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, fireEvent, act, waitFor } from '@testing-library/react';
 import '@/test/mocks';
@@ -17,6 +18,7 @@ import { useBrandStore } from '@/stores/brand-store';
 import { stashChatAttachments } from '@/lib/chat-handoff';
 
 beforeEach(() => {
+  useConnectionStore.setState({ state: 'authenticated' });
   vi.clearAllMocks();
   useBrandStore.getState().setBrand(null);
   useAuthStore.setState({ user: { id: 'admin', display_name: 'Boss', role: 'admin' } as never, bindings: [] });
@@ -37,6 +39,25 @@ beforeEach(() => {
 });
 
 describe('WebChatPage', () => {
+  it('offers recent skills to an employee on a new chat without sending on selection', async () => {
+    useAuthStore.setState({ user: { id: 'employee-a', role: 'employee' } as never });
+    // Changing accounts disconnects chat; seed the completed employee handshake.
+    useChatStore.setState({ connectionState: 'connected', selectedAgentId: 'sales', resolvedAgent: { id: 'sales', name: 'Sales', icon: '' } });
+    const send = vi.spyOn(useChatStore.getState(), 'send').mockImplementation(() => {});
+    const recent = vi.spyOn(api.skills, 'recent').mockResolvedValue({ skills: [
+      { name: 'quote', display_name: 'Quote', description: 'Prepare a quote' },
+      { name: 'pdf', display_name: 'PDF', description: 'Read a PDF' },
+    ] });
+    renderWithProviders(<WebChatPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Quote Prepare a quote' }));
+    expect(recent).toHaveBeenCalledWith('sales', false);
+    fireEvent.click(screen.getByRole('button', { name: 'PDF Read a PDF' }));
+    expect(screen.getByRole('combobox')).toHaveValue('/quote /pdf ');
+    expect(send).not.toHaveBeenCalled();
+    recent.mockRestore();
+    send.mockRestore();
+  });
+
   it('uses the verified product name for the default partner header and heading', () => {
     useBrandStore.getState().setBrand({ product_name: '晨光智能', logo_light: 'data:image/png;base64,iVBORw0KGgo=' });
     useChatStore.setState({ selectedAgentId: null, agentName: 'DuDuClaw' });
@@ -443,5 +464,44 @@ describe('server-resolved non-admin chat', () => {
     renderWithProviders(<WebChatPage />);
     expect(screen.getByRole('alert')).toHaveTextContent(en['webchat.assignment.mainAdminOnly']);
     expect(screen.getByPlaceholderText(/message/i)).toBeDisabled();
+  });
+});
+
+describe('WebChatPage primary preference', () => {
+  beforeEach(() => {
+    useAuthStore.setState({ user: { id: 'admin', role: 'admin', primary_agent_id: 'nova' } as never });
+    useAgentsStore.setState({ loaded: true, agents: [
+      { name: 'main', role: 'main', display_name: 'Main' },
+      { name: 'nova', role: 'specialist', display_name: 'Nova' },
+    ] as never });
+    useChatStore.setState({ selectedAgentId: null, messages: [], resumedExplicitly: false });
+  });
+  it('uses the visible primary when opening a fresh admin conversation', async () => {
+    renderWithProviders(<WebChatPage />);
+    await waitFor(() => expect(useChatStore.getState().selectedAgentId).toBe('nova'));
+  });
+  it('does not replace the partner of a historical conversation', () => {
+    useChatStore.setState({ selectedAgentId: 'history-staff', resumedExplicitly: true });
+    renderWithProviders(<WebChatPage />);
+    expect(useChatStore.getState().selectedAgentId).toBe('history-staff');
+  });
+  it('does not replace an explicit partner with the account default', () => {
+    render(<IntlProvider messages={en} locale="en"><MemoryRouter initialEntries={['/chat?agent=other']}><WebChatPage /></MemoryRouter></IntlProvider>);
+    expect(useChatStore.getState().selectedAgentId).toBe('other');
+  });
+  it('restores the primary when starting another new conversation', () => {
+    useChatStore.setState({ selectedAgentId: 'other', resumedExplicitly: true, messages: [{ id: 'past', role: 'user', content: 'Old question', timestamp: 0 }] });
+    act(() => useConversationsStore.getState().startNew());
+    expect(useChatStore.getState().selectedAgentId).toBe('nova');
+    expect(useChatStore.getState().messages).toEqual([]);
+    expect(useChatStore.getState().resumedExplicitly).toBe(false);
+  });
+  it('leaves enterprise member assignment to the gateway', () => {
+    useAuthStore.setState({ user: { id: 'employee', role: 'employee', primary_agent_id: 'nova' } as never });
+    useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
+    useChatStore.setState({ resolvedAgent: { id: 'assigned', name: 'Assigned', icon: '' }, assignmentError: null });
+    const select = vi.spyOn(useChatStore.getState(), 'selectAgent');
+    renderWithProviders(<WebChatPage />);
+    expect(select).not.toHaveBeenCalled();
   });
 });

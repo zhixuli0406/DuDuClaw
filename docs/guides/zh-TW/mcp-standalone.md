@@ -30,8 +30,12 @@ npx duduclaw mcp init --client codex
 [mcp_servers.duduclaw]
 command = "npx"
 args = ["-y", "duduclaw@<版本>", "mcp-server"]
-env = { DUDUCLAW_MCP_API_KEY = "ddc_refresh_prod_…" }
+env = { DUDUCLAW_MCP_API_KEY = "ddc_refresh_prod_…", DUDUCLAW_AGENT_ID = "standalone-codex", DUDUCLAW_AGENT_TOKEN = "<generated identity token>" }
 ```
+
+這個簽署身分僅供該 standalone 用戶端使用，不能用於員工或 remote bridge 驗證。
+
+請完整複製產生的環境變數：嚴格模式啟動同時需要 API key 與本機簽署的身分。既有用戶端升級後請重新執行 `mcp init`，不要停用身分驗證。
 
 `<版本>` 是執行 `mcp init` 的那個版本（`duduclaw --version` 印出的值）。設定釘住這個版本，用戶端啟動的 server 就是簽發金鑰的那一版；升級後請再跑一次 `mcp init`。
 

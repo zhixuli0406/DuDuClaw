@@ -150,6 +150,10 @@ impl MethodHandler {
             ctx.is_admin(),
         );
         if ctx.is_admin() {
+            if let Some(g) = gc_cfg {
+                googlechat["connection"] = json!(g.connection);
+                googlechat["pubsub_subscription"] = json!(g.pubsub_subscription);
+            }
             if let Some(app) = store::agent_chat_app(home, agent_id).await {
                 let key: Value = serde_json::from_str(app.service_account.expose()).unwrap_or_default();
                 googlechat["project_id"] = key.get("project_id").cloned().unwrap_or(Value::Null);

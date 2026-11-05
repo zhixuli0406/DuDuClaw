@@ -18,11 +18,36 @@ use crate::user_row::{
 /// SQLite-backed user database with connection pool.
 pub struct UserDb {
     pool: Vec<Mutex<Connection>>,
+    pub(crate) remember_key: ring::hmac::Key,
 }
 
 const POOL_SIZE: usize = 2;
 
 impl UserDb {
+    /// Linearize a nonblocking delivery with every ACL writer, including other
+    /// processes. A WAL read transaction alone would not exclude revocation.
+    /// The callback must not await, block, or re-enter this database.
+    pub fn with_acl_generation<T>(&self, expected: u64, deliver: impl FnOnce() -> T) -> Result<T, String> {
+        let mut conn = self.pool.iter().find_map(|slot| slot.try_lock().ok())
+            .ok_or_else(|| "ACL delivery connection busy".to_string())?;
+        conn.busy_timeout(std::time::Duration::ZERO).map_err(|e| e.to_string())?;
+        let result = (|| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+            if crate::user_row::read_acl_generation(&tx)? != expected {
+                return Err("ACL changed before delivery".into());
+            }
+            // No database mutation: dropping the transaction releases the
+            // writer reservation only after the synchronous delivery decision.
+            Ok(deliver())
+        })();
+        let restored = conn.busy_timeout(std::time::Duration::from_secs(5));
+        // The callback may already have sent bytes; never disguise its result
+        // as a refusal because restoring the connection's timeout failed.
+        if let Err(error) = restored { warn!(%error, "ACL connection timeout restore failed"); }
+        result
+    }
+
     /// Open (or create) the user database at the given path.
     pub fn new(db_path: &Path) -> Result<Self, String> {
         Self::new_with_mfa_default(db_path, false)
@@ -39,7 +64,8 @@ impl UserDb {
                 .map_err(|e| format!("failed to set pragmas: {e}"))?;
             pool.push(Mutex::new(conn));
         }
-        let db = Self { pool };
+        let remember_key = crate::remembered_sessions::load_key(db_path, &pool[0].lock().unwrap())?;
+        let db = Self { pool, remember_key };
         db.init_tables(enforced)?;
         Ok(db)
     }
@@ -135,6 +161,7 @@ impl UserDb {
 
         crate::google_identity::migrate(&conn)?;
         crate::mfa::migrate(&conn, enforced)?;
+        crate::remembered_sessions::migrate(&conn)?;
         crate::user_invites::migrate(&conn)?;
 
         // Idempotent migrations: ADD COLUMN errors if the column is already
@@ -182,6 +209,8 @@ impl UserDb {
             conn.execute("ALTER TABLE users ADD COLUMN primary_agent_id TEXT", [])
                 .map_err(|e| format!("failed to migrate users.primary_agent_id: {e}"))?;
         }
+        crate::onboarding::migrate(&conn)?;
+        crate::invitation_content::migrate(&conn)?;
         // `auth_meta.acl_generation` invalidates every cached live ACL: each
         // authorization-relevant write bumps it in the same transaction.
         conn.execute_batch(
@@ -194,17 +223,18 @@ impl UserDb {
     }
 
     /// Set a personal preference, checking the current binding in the same write.
-    /// NULL clears the preference; an unbound agent never changes the row.
+    /// NULL clears the preference; only an Owner/Operator binding may be selected.
     pub fn set_primary_agent(&self, user_id: &str, agent_id: Option<&str>) -> Result<(), String> {
         let conn = self.conn();
         let changed = conn.execute(
             "UPDATE users SET primary_agent_id = ?1, updated_at = ?2
              WHERE id = ?3 AND status = 'active' AND
              (?1 IS NULL OR EXISTS(SELECT 1 FROM user_agent_bindings
-                 WHERE user_id = ?3 AND agent_name = ?1))",
+                 WHERE user_id = ?3 AND agent_name = ?1
+                   AND access_level IN ('owner', 'operator')))",
             params![agent_id, Utc::now().to_rfc3339(), user_id],
         ).map_err(|e| format!("set primary agent: {e}"))?;
-        if changed == 1 { Ok(()) } else { Err("agent is not bound to current user".into()) }
+        if changed == 1 { Ok(()) } else { Err("agent requires an Owner or Operator binding".into()) }
     }
 
     /// Resolve a stale preference against live bindings; clearing stays NULL.
@@ -213,12 +243,13 @@ impl UserDb {
         conn.query_row(
             "SELECT CASE WHEN primary_agent_id IS NULL THEN NULL
              WHEN EXISTS(SELECT 1 FROM user_agent_bindings b
-                 WHERE b.user_id = users.id AND b.agent_name = primary_agent_id)
+                 WHERE b.user_id = users.id AND b.agent_name = primary_agent_id
+                   AND b.access_level IN ('owner', 'operator'))
              THEN primary_agent_id ELSE
                  (SELECT agent_name FROM user_agent_bindings b
                   WHERE b.user_id = users.id AND b.access_level = 'owner'
                   ORDER BY bound_at, agent_name LIMIT 1) END
-             FROM users WHERE id = ?1",
+             FROM users WHERE id = ?1 AND status = 'active'",
             [user_id], |row| row.get(0),
         ).optional().map(|value| value.flatten())
             .map_err(|e| format!("read primary agent: {e}"))
@@ -230,7 +261,8 @@ impl UserDb {
         self.conn().query_row(
             "SELECT primary_agent_id FROM users WHERE id = ?1 AND status = 'active'
              AND EXISTS(SELECT 1 FROM user_agent_bindings b
-                 WHERE b.user_id = users.id AND b.agent_name = primary_agent_id)",
+                 WHERE b.user_id = users.id AND b.agent_name = primary_agent_id
+                   AND b.access_level IN ('owner', 'operator'))",
             [user_id], |row| row.get(0),
         ).optional().map(|value| value.flatten())
             .map_err(|e| format!("read bound primary agent: {e}"))
@@ -946,12 +978,42 @@ mod tests {
     }
 
     #[test]
+    fn acl_delivery_generation_orders_cross_connection_writes() {
+        let (db, tmp) = test_db();
+        let other = Connection::open(tmp.path()).unwrap();
+        other.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let generation = db.acl_generation().unwrap();
+        let mut delivered = 0;
+        db.with_acl_generation(generation, || {
+            assert!(other.execute("UPDATE auth_meta SET value=value+1 WHERE key='acl_generation'", []).is_err());
+            delivered += 1;
+        }).unwrap();
+        assert_eq!(delivered, 1);
+        other.execute("UPDATE auth_meta SET value=value+1 WHERE key='acl_generation'", []).unwrap();
+        assert!(db.with_acl_generation(generation, || delivered += 1).is_err());
+        assert_eq!(delivered, 1, "stale generations must never enter the writer callback");
+    }
+
+    #[test]
+    fn acl_delivery_generation_fails_closed_on_busy_and_unreadable_store() {
+        let (db, tmp) = test_db();
+        let other = Connection::open(tmp.path()).unwrap();
+        let generation = db.acl_generation().unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(db.with_acl_generation(generation, || panic!("busy must deny")).is_err());
+        other.execute_batch("ROLLBACK; DELETE FROM auth_meta").unwrap();
+        assert!(db.with_acl_generation(generation, || panic!("missing generation must deny")).is_err());
+        other.execute_batch("DROP TABLE auth_meta").unwrap();
+        assert!(db.with_acl_generation(generation, || panic!("unreadable generation must deny")).is_err());
+    }
+
+    #[test]
     fn primary_agent_checks_binding_falls_back_and_clears() {
         let (db, _tmp) = test_db();
         let user = db.create_user("primary@example.com", "Primary", "password1", UserRole::Employee).unwrap();
         assert!(db.set_primary_agent(&user.id, Some("unbound")).is_err());
         db.bind_agent(&user.id, "owner", AccessLevel::Owner).unwrap();
-        db.bind_agent(&user.id, "chosen", AccessLevel::Viewer).unwrap();
+        db.bind_agent(&user.id, "chosen", AccessLevel::Operator).unwrap();
         db.set_primary_agent(&user.id, Some("chosen")).unwrap();
         assert_eq!(db.primary_agent(&user.id).unwrap().as_deref(), Some("chosen"));
         assert_eq!(db.bound_primary_agent(&user.id).unwrap().as_deref(), Some("chosen"));
@@ -963,6 +1025,35 @@ mod tests {
         db.set_primary_agent(&user.id, Some("owner")).unwrap();
         db.unbind_agent(&user.id, "owner").unwrap();
         assert_eq!(db.primary_agent(&user.id).unwrap(), None);
+    }
+
+    #[test]
+    fn primary_agent_requires_live_operator_access_even_for_legacy_preferences() {
+        let (db, _tmp) = test_db();
+        let user = db.create_user("viewer@example.com", "Viewer", "password1", UserRole::Employee).unwrap();
+        db.bind_agent(&user.id, "chosen", AccessLevel::Viewer).unwrap();
+        assert!(db.set_primary_agent(&user.id, Some("chosen")).is_err());
+        assert_eq!(db.primary_agent(&user.id).unwrap(), None);
+        for access in [AccessLevel::Operator, AccessLevel::Owner] {
+            db.bind_agent(&user.id, "chosen", access).unwrap();
+            db.set_primary_agent(&user.id, Some("chosen")).unwrap();
+            assert_eq!(db.bound_primary_agent(&user.id).unwrap().as_deref(), Some("chosen"));
+            db.bind_agent(&user.id, "chosen", AccessLevel::Viewer).unwrap();
+            assert_eq!(db.bound_primary_agent(&user.id).unwrap(), None);
+            assert_eq!(db.primary_agent(&user.id).unwrap(), None);
+        }
+        // A corrupt access level is never a grant; clearing remains possible.
+        db.conn().execute("UPDATE user_agent_bindings SET access_level='unknown' WHERE user_id=?1", [&user.id]).unwrap();
+        assert!(db.set_primary_agent(&user.id, Some("chosen")).is_err());
+        assert_eq!(db.bound_primary_agent(&user.id).unwrap(), None);
+        assert_eq!(db.primary_agent(&user.id).unwrap(), None);
+        db.set_primary_agent(&user.id, None).unwrap();
+        db.bind_agent(&user.id, "chosen", AccessLevel::Operator).unwrap();
+        db.set_primary_agent(&user.id, Some("chosen")).unwrap();
+        db.set_user_status(&user.id, UserStatus::Suspended).unwrap();
+        assert!(db.set_primary_agent(&user.id, Some("chosen")).is_err());
+        assert_eq!(db.primary_agent(&user.id).unwrap(), None);
+        assert_eq!(db.bound_primary_agent(&user.id).unwrap(), None);
     }
 
     #[test]

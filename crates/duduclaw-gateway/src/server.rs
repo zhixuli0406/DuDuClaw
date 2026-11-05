@@ -1,10 +1,15 @@
+#[path = "server_company.rs"]
+mod server_company;
 mod data_exports_http;
+mod a2a_http;
 #[path = "server_invites.rs"]
 mod server_invites;
 #[cfg(test)]
 mod data_exports_http_tests;
 #[cfg(test)]
 mod task_rpc_http_tests;
+#[cfg(test)]
+mod extension_http_tests;
 
 use axum::body::Bytes;
 use axum::{
@@ -164,9 +169,9 @@ pub struct GatewayConfig {
     pub allowed_origins: Vec<String>,
     /// Plugin extension point. Defaults to [`NullExtension`].
     pub extension: Arc<dyn GatewayExtension>,
-    /// Explicit product form-factor override. `None` means resolve at request
-    /// time from `DUDUCLAW_EDITION` env > license tier > `Personal`. Cloud
-    /// control-plane sets `Some(..)` (or the env var) per managed tenant.
+    /// Product form-factor restriction, always capped by the verified license.
+    /// `None` resolves per request from the license and `DUDUCLAW_EDITION`.
+    /// Debug assertions never permit elevation.
     pub edition: Option<duduclaw_core::EditionProfile>,
 }
 
@@ -188,6 +193,17 @@ struct AppState {
     /// DuDuClaw home directory (`~/.duduclaw`). Used by the voice endpoints to
     /// read `[voice]` STT/TTS config from `config.toml`.
     home_dir: std::path::PathBuf,
+}
+
+/// Identity policy and initial key creation are mandatory startup gates.
+fn prepare_identity_key(home: &std::path::Path) -> std::io::Result<()> {
+    let strict = duduclaw_core::require_identity_token_from_home(home)?;
+    if !strict {
+        tracing::warn!("MCP identity-token grace period is active; unverified employee claims are accepted only until identity_token_grace_until. Re-enable require_identity_token after upgrading agent configs.");
+    }
+    duduclaw_core::ensure_identity_key(home)?;
+    info!(require_identity_token = strict, "MCP caller-identity signing key ready");
+    Ok(())
 }
 
 /// Check any existing identity-store entry before schema initialization can
@@ -527,6 +543,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
+    if singleton_held {
+        duduclaw_core::root_key::recovery::initialize(&home_dir);
+    }
+
     // ── System-settings app: re-apply a persisted static wired-network
     // config, if any (see `network::wired::reapply_wired_config_on_boot`'s
     // own doc for WHY — the sysd verb's effect lives on tmpfs, so it does
@@ -558,6 +578,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // Validate the installation policy after a possible restore and before runtime startup.
     crate::product_policy::load(&home_dir).map_err(duduclaw_core::error::DuDuClawError::Config)?;
+    crate::runtime_readiness::log_startup_missing(&home_dir);
     crate::data_exports::initialize(&home_dir)
         .map_err(duduclaw_core::error::DuDuClawError::Gateway)?;
     {
@@ -703,26 +724,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // block is assembled, so every `.mcp.json` / runtime config written later
     // in this boot carries a signable `DUDUCLAW_AGENT_TOKEN`. Never rotates an
     // existing key (that would invalidate tokens held by live CLI children).
-    // Failure is warn-not-fatal: no key ⇒ `IdentityVerdict::Disabled` ⇒ the
-    // pre-WP21 behaviour, which is exactly the right degradation.
-    match duduclaw_core::ensure_identity_key(&home_dir) {
-        Ok(_) => {
-            let strict = duduclaw_core::require_identity_token_from_home(&home_dir);
-            info!(
-                require_identity_token = strict,
-                "MCP caller-identity signing key ready ({})",
-                duduclaw_core::identity_key_path(&home_dir).display()
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "could not create the MCP caller-identity key — caller ids stay \
-                 unverified (env-var impersonation remains possible); this does \
-                 not affect any other functionality"
-            );
-        }
-    }
+    prepare_identity_key(&home_dir).map_err(|e| {
+        duduclaw_core::error::DuDuClawError::Gateway(format!(
+            "MCP identity initialization failed; repair the identity policy/key before restarting: {e}"
+        ))
+    })?;
 
     // WP22 T1 — bootstrap `<home>/org.toml`, the authoritative record of who
     // reports to whom. Seeding happens **once**, only when the file is absent:
@@ -779,6 +785,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // Install operator-configured extra allowed Origins for dashboard WS/CORS.
     // Empty by default => built-in loopback origins only (no behaviour change).
+    remembered_sessions::set_origins(&config.allowed_origins, Some(config.port));
     let extra_origins = init_allowed_origins(config.allowed_origins.clone());
     if extra_origins.is_empty() {
         info!("dashboard WS/CORS: loopback origins only (localhost / 127.0.0.1 / [::1])");
@@ -1267,6 +1274,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         info!("GVU stagnation detector scheduled — 30 min interval");
     }
 
+    tokio::spawn(crate::employee_health::run(home_dir.clone(), handler.registry().clone()));
+
     // ── Channel-outage alerting ─────────────────────────────────────────
     // `channel_failures.jsonl` previously had no reverse notification path —
     // a channel that stayed connectable but stopped actually delivering
@@ -1519,6 +1528,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // (crate::googlechat_agents); credentials are checked in the background.
     let googlechat_agents_router = crate::googlechat_agents::router(reply_ctx.clone());
     crate::googlechat_agents::spawn_boot_probes(reply_ctx.clone());
+    crate::googlechat_pubsub::spawn(reply_ctx.clone());
     // Odoo website Live Chat: the bot answers as an Odoo operator. Always
     // spawned; it idles until `[odoo_livechat] enabled = true`, so the
     // dashboard can switch it on without a restart (crate::odoo_livechat).
@@ -2434,27 +2444,33 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                                     if result.needs_restart {
                                         // Graceful shutdown after 3s to let WebSocket
                                         // clients receive the notification. The
-                                        // restart flag makes the post-shutdown hook
-                                        // re-exec the new binary (works with or
-                                        // without launchd/systemd supervision).
+                                        // restart dispatcher uses a separate launchd job
+                                        // on macOS; other installs use graceful exec.
                                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                                         info!(
                                             "Auto-update: restarting for v{}",
                                             info.latest_version
                                         );
-                                        duduclaw_core::platform::request_restart_after_shutdown();
-                                        duduclaw_core::platform::self_interrupt();
+                                        crate::updater::restart_after_update().await;
                                     }
                                 }
                                 Ok(result) => {
                                     // apply_update returned success=false (e.g. Homebrew)
                                     warn!(
-                                        msg = %result.message,
+                                        msg = %crate::updater::sanitize_failure_detail(&result.message),
                                         "Auto-update skipped"
                                     );
                                 }
                                 Err(e) => {
-                                    warn!(error = %e, "Auto-update failed — will retry next cycle");
+                                    let sanitized = crate::updater::sanitize_failure_detail(&e);
+                                    warn!(error = %sanitized, "Auto-update failed — will retry next cycle");
+                                    let failed_event = WsFrame::event(
+                                        "system.update_failed", crate::updater::failure_payload(&e),
+                                    );
+                                    if let Ok(json) = serde_json::to_string(&failed_event) {
+                                        let _ = etx.send(json);
+                                    }
+
 
                                     crate::security_autopilot::audit_and_emit(
                                         &home_for_update,
@@ -2464,7 +2480,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                                             duduclaw_security::audit::Severity::Warning,
                                             serde_json::json!({
                                                 "target_version": info.latest_version,
-                                                "error": e.replace('\n', " "),
+                                                "error": sanitized,
                                             }),
                                         ),
                                     );
@@ -2644,12 +2660,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // WebChat endpoint — C5: now requires JWT auth (in-band) + Origin check,
     // mirroring the main /ws gate instead of being unauthenticated.
     let meeting_auth_state = state.clone();
+    let extension_auth_state = state.clone();
     let knowledge_users = state.user_db.clone();
     let webchat_state = Arc::new(crate::webchat::WebChatState::new(
         webchat_ctx,
         state.jwt_config.clone(),
         state.user_db.clone(),
     ));
+    let ag_ui_router = crate::webchat::ag_ui::router(webchat_state.clone());
     let webchat_router = Router::new()
         .route("/ws/chat", get(crate::webchat::ws_chat_handler))
         .with_state(webchat_state);
@@ -2664,15 +2682,31 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/mfa/verify", post(server_mfa::verify))
         .route("/api/mfa/enroll/begin", post(server_mfa::enroll_begin))
         .route("/api/mfa/enroll/confirm", post(server_mfa::enroll_confirm))
+        .route("/api/mfa/email/send", post(server_mfa_email::send))
+        .route("/api/mfa/email/verify", post(server_mfa_email::verify))
+        .route("/api/mfa/passkey/list", post(server_mfa_passkey::list))
+        .route("/api/mfa/passkey/register/begin", post(server_mfa_passkey::register_begin))
+        .route("/api/mfa/passkey/register/finish", post(server_mfa_passkey::register_finish))
+        .route("/api/mfa/passkey/login/begin", post(server_mfa_passkey::login_begin))
+        .route("/api/mfa/passkey/login/finish", post(server_mfa_passkey::login_finish))
+        .route("/api/mfa/passkey/delete", post(server_mfa_passkey::delete))
         .route("/api/channel-identity/bind", post(handle_channel_bind))
         .route(
             "/api/channel-identity/list",
             get(handle_channel_identity_list),
         )
         .route("/api/refresh", post(handle_refresh))
+        .route("/api/session/remember", post(remembered_sessions::remember))
+        .route("/api/session/refresh", post(remembered_sessions::refresh))
+        .route("/api/session/logout", post(remembered_sessions::logout))
+        .route("/api/session/devices", get(remembered_sessions::devices))
+        .route("/api/session/revoke", post(remembered_sessions::revoke))
         .route("/api/me", get(handle_me))
         .route("/api/change-password", post(handle_change_password))
         .route("/api/brand", get(handle_public_brand))
+        .route("/api/company", get(server_company::company))
+        .route("/api/company/logo", server_company::upload_route())
+        .route("/api/company/logo/{filename}", get(server_company::logo))
         .route("/api/first-run/status", get(handle_first_run_status))
         .route("/api/first-run/claim", post(handle_first_run_claim))
         // D4a: OOBE pre-auth network setup — see `first_run_network_gate`'s
@@ -2709,6 +2743,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         // a `token` query param so browser preview/download links work.
         .route("/api/files", get(handle_files_list))
         .route("/api/files/download", get(handle_files_download))
+        .route("/api/chat/attachments", get(handle_chat_attachment))
         .route(
             "/api/data-exports/{id}/download",
             get(data_exports_http::download),
@@ -3103,9 +3138,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             "/api/voice/config",
             get(handle_voice_config_get).post(handle_voice_config_set),
         )
+        .route("/a2a", post(a2a_http::rpc))
+        .route("/.well-known/agent-card.json", get(a2a_http::card))
+        .route("/.well-known/agent.json", get(a2a_http::card))
         .with_state(state)
         .merge(auth_router)
-        .merge(webchat_router);
+        .merge(webchat_router)
+        .merge(ag_ui_router);
 
     // Wiki trust federation inbound endpoint — only mounted when the trust
     // store is initialised. Fails closed by returning 503 from a stub when
@@ -3143,12 +3182,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     app = app.merge(crate::license_serve::router(home_dir.clone()));
 
     if duduclaw_core::gateway_instance::held(&home_dir) {
+        crate::meeting_transcription::spawn_google_stt_cleanup(home_dir.clone());
         match crate::meeting_jobs::Manager::open(home_dir.clone()) {
             Ok(jobs) => {
                 jobs.spawn();
                 match crate::meeting_uploads::Service::open(jobs.clone()) {
                     Ok(uploads) => {
-                        app=app.merge(crate::meeting_uploads::router(uploads.clone(),Arc::new(move |headers|knowledge_caller(&meeting_auth_state,headers))));
+                        let meeting_users=meeting_auth_state.user_db.clone();
+                        app=app.merge(crate::meeting_uploads::router_with_google(uploads.clone(),Arc::new(move |headers|knowledge_caller(&meeting_auth_state,headers)),meeting_users));
                         match crate::meeting_links::router(uploads) {Ok(router)=>app=app.merge(router),Err(error)=>tracing::error!(%error,"meeting upload links unavailable")}
                     }
                     Err(error)=>tracing::error!(%error,"meeting uploads unavailable"),
@@ -3248,10 +3289,6 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             "/.well-known/mcp-server.json",
             get(well_known_mcp_server_card),
         )
-        // A2A v1.0 signed Agent Card (G6). `agent-card.json` is the v1.0 path;
-        // `agent.json` is kept as a legacy alias. Both serve the signed card.
-        .route("/.well-known/agent-card.json", get(well_known_agent_card))
-        .route("/.well-known/agent.json", get(well_known_agent_card))
         // JWKS advertising the A2A signing public key for card verification.
         .route("/.well-known/jwks.json", get(well_known_jwks));
 
@@ -3262,15 +3299,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     app = app.merge(crate::webhook_slots::router(webhook_slots));
     app = app.merge(googlechat_agents_router);
 
-    // Merge plugin extension routes (if any)
-    if let Some(extra) = extension.extra_routes() {
-        app = app.merge(extra);
-    }
-
     #[cfg(feature = "dashboard")]
     {
         app = app.merge(duduclaw_dashboard::dashboard_router());
     }
+
+    // Validate against the completed core router before opening the listener.
+    app = crate::extension::merge_routes(app, extension.as_ref(), Arc::new(move |headers, minimum_role| {
+        extension_caller(&extension_auth_state, headers, minimum_role)
+    })).map_err(|error| {
+        tracing::error!(%error, "extension HTTP registration refused");
+        duduclaw_core::error::DuDuClawError::Gateway(error)
+    })?;
 
     // ── Decision Lab kill switch (audit X1, 方案 6) ────────────────
     // `config.toml [decision] enabled` (default true — the line stays mounted).
@@ -3381,7 +3421,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = async {
+                while !duduclaw_core::root_key::recovery::restart_requested() {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            } => {},
+        }
         info!("Shutdown signal received, flushing state...");
         // sd_notify STOPPING=1 — best-effort, no-op off-systemd.
         let _ = crate::watchdog::notify_stopping();
@@ -3446,11 +3493,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
+    // Recovery needs a fresh root launcher, never an unprivileged re-exec.
+    // The monitor has already zeroized the key and durably charged the budget.
+    if duduclaw_core::root_key::recovery::restart_requested()
+        && duduclaw_core::root_key::state_kind() == duduclaw_core::root_key::StateKind::Refused {
+        std::process::exit(duduclaw_core::root_key::RECOVERY_RESTART_EXIT_CODE);
+    }
+
     // Self-update installed a new binary during this run: re-exec into it
     // now that the graceful shutdown sequence (prediction flush → worker
     // supervisor SIGTERM chain → axum drain) has completed. exec() keeps
-    // the PID on Unix, so launchd/systemd supervision is undisturbed; it
-    // also covers unsupervised foreground runs (npm wrapper, `duduclaw run`).
+    // the PID on Unix for systemd and foreground runs (npm wrapper,
+    // `duduclaw run`). Updated launchd jobs use the independent helper instead.
     if duduclaw_core::platform::restart_requested() {
         if duduclaw_core::root_key::is_held() {
             // Re-exec would reset dumpability and lose the one-shot key. PID 1
@@ -3537,15 +3591,11 @@ async fn handle_login(
         return response;
     }
 
-    let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
-    let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
-        .iter()
-        .map(|b| (b.agent_name.clone(), b.access_level))
-        .collect();
+    let policy_exempt = state.handler.resolve_edition_profile().await.is_personal();
 
     // Issue tokens
     let (access_token, refresh_token) =
-        match state.user_db.mfa_issue_if_unenrolled(&user.id, || state.jwt_config.issue_session_tokens(&user, &agent_access)) {
+        match state.user_db.mfa_issue_if_unenrolled(&user.id, user.credential_epoch, policy_exempt, |current, access| state.jwt_config.issue_session_tokens(current, access)) {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to issue access token: {e}");
@@ -3695,14 +3745,10 @@ async fn handle_otp_verify(
         return response;
     }
 
-    let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
-    let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
-        .iter()
-        .map(|b| (b.agent_name.clone(), b.access_level))
-        .collect();
+    let policy_exempt = state.handler.resolve_edition_profile().await.is_personal();
 
     let (access_token, refresh_token) =
-        match state.user_db.mfa_issue_if_unenrolled(&user.id, || state.jwt_config.issue_session_tokens(&user, &agent_access)) {
+        match state.user_db.mfa_issue_if_unenrolled(&user.id, user.credential_epoch, policy_exempt, |current, access| state.jwt_config.issue_session_tokens(current, access)) {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to issue access token: {e}");
@@ -4038,6 +4084,11 @@ async fn handle_refresh(
         }
     };
 
+    if state.user_db.remember_login_exchanged(claims.jti.as_deref()).unwrap_or(true) {
+        return (axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error":"refresh credential was exchanged"}))).into_response();
+    }
+
     // Fetch fresh user data and bindings
     let user = match state.user_db.get_user(&claims.sub) {
         Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active && duduclaw_auth::mfa::credential_epoch_matches(claims.credential_epoch, u.credential_epoch) => u,
@@ -4057,8 +4108,8 @@ async fn handle_refresh(
             Json(serde_json::json!({"error": "請重新登入並完成雙因素驗證註冊。"}))).into_response();
     }
 
-    let access_token = match state.user_db.mfa_issue_refresh(
-        &user.id, claims.credential_epoch,
+    let access_token = match state.user_db.mfa_refresh_and_issue(
+        &user.id, claims.credential_epoch, claims.jti.as_deref(), false,
         |user, access| state.jwt_config.issue_access_token_in_session(user, access, claims.jti.as_deref()),
     ) {
         Ok(t) => t,
@@ -4926,6 +4977,7 @@ pub(crate) fn init_allowed_origins(raw: Vec<String>) -> Vec<String> {
 /// are normalized, empties dropped, deduped (config first, then env). Returns the
 /// resulting live list.
 pub(crate) fn set_allowed_origins(config_entries: Vec<String>) -> Vec<String> {
+    remembered_sessions::set_origins(&config_entries, None);
     let mut merged: Vec<String> = config_entries
         .iter()
         .filter_map(|s| normalize_origin_entry(s))
@@ -5059,10 +5111,13 @@ fn authorize_file_access(
     // The token proves identity only. Like RPC live_context, rebuild all
     // authority from one current users.db snapshot, never JWT bindings.
     // This also refuses inactive users and database errors without a fallback.
-    let claims = state.jwt_config.verify_access_token(token).map_err(|_| unauthorized())?;
-    let ctx = crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &claims.sub)
+    let authenticated = authenticate_jwt(state, token).map_err(|_| unauthorized())?;
+    let ctx = crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &authenticated.user_id)
         .map_err(|_| unauthorized())?
         .ok_or_else(unauthorized)?;
+    if !duduclaw_auth::mfa::credential_epoch_matches(authenticated.credential_epoch, ctx.credential_epoch) {
+        return Err(unauthorized());
+    }
     require_password_changed(&ctx)?;
 
     let allowed = match agent {
@@ -14815,106 +14870,65 @@ struct FilesDownloadQuery {
     token: Option<String>,
 }
 
-/// GET /api/files/download — stream a single attachment file.
+#[derive(serde::Deserialize)]
+struct ChatAttachmentQuery { id: String, #[serde(default)] preview: bool }
+
+/// Dashboard JWT header only: no credentials in href/src/query strings.
+async fn handle_chat_attachment(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ChatAttachmentQuery>,
+) -> axum::response::Response {
+    let ctx = match knowledge_caller(&state, &headers) { Ok(c) => c, Err(r) => return r };
+    let max = if q.preview { crate::chat_attachments::limits::MAX_PREVIEW } else { crate::chat_attachments::limits::MAX_DOWNLOAD };
+    let (bytes, name, admission) = match state.handler.history_attachment_bytes(&ctx, &q.id, max).await {
+        Ok(f) => f,
+        Err(_) => return axum::http::StatusCode::NOT_FOUND.into_response(),
+    };
+    let mime = crate::files_api::content_type_for(&name);
+    let inline = matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp");
+    let disposition = if inline { "inline" } else { "attachment" };
+    let cd = format!("{disposition}; filename*=UTF-8''{}", crate::files_api::encode_filename_star(&name));
+    let size = bytes.len();
+    let mut response = axum::response::Response::new(crate::chat_attachments::response::body(bytes, admission));
+    let h = response.headers_mut();
+    h.insert("content-length", axum::http::HeaderValue::from_str(&size.to_string()).expect("numeric length"));
+    h.insert("content-encoding", axum::http::HeaderValue::from_static("identity"));
+    h.insert("content-type", axum::http::HeaderValue::from_static(mime));
+    h.insert("content-disposition", axum::http::HeaderValue::from_str(&cd).unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment")));
+    h.insert("x-content-type-options", axum::http::HeaderValue::from_static("nosniff"));
+    h.insert("cache-control", axum::http::HeaderValue::from_static("private, no-store"));
+    h.insert("content-security-policy", axum::http::HeaderValue::from_static("sandbox; default-src 'none'"));
+    response
+}
+
+#[cfg(test)]
+mod chat_attachments_http_tests;
+
+mod files_snapshot;
+
+/// GET /api/files/download — authorize and serve the same bounded FD snapshot.
 async fn handle_files_download(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<FilesDownloadQuery>,
 ) -> axum::response::Response {
     let agent = q.agent.as_deref().filter(|s| !s.is_empty());
-    // Auth (header or `token` query) + per-agent authorization, fail-closed.
     let ctx = match authorize_file_access(&state, &headers, q.token.as_deref(), agent) {
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
-        return resp;
-    }
-
-    let dir = match crate::files_api::attachments_dir(&state.home_dir, agent) {
-        Some(d) => d,
-        None => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid agent id" })),
-            )
-                .into_response();
-        }
+    let snapshot = match files_snapshot::load(&state, &ctx, agent, &q.name,
+        crate::chat_attachments::limits::MAX_DOWNLOAD).await {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
     };
-
-    let path = match crate::files_api::resolve_attachment_file(&dir, &q.name) {
-        Ok(p) => p,
-        Err(crate::files_api::ResolveError::BadRequest) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid file name" })),
-            )
-                .into_response();
-        }
-        Err(crate::files_api::ResolveError::Denied) => {
-            return (
-                axum::http::StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "error": "access denied" })),
-            )
-                .into_response();
-        }
-        Err(crate::files_api::ResolveError::NotFound) => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "file not found" })),
-            )
-                .into_response();
-        }
-    };
-
-    let file = match tokio::fs::File::open(&path).await {
-        Ok(f) => f,
-        Err(_) => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "file not found" })),
-            )
-                .into_response();
-        }
-    };
-
-    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
-        return resp;
-    }
-    let stream = tokio_util::io::ReaderStream::new(file);
-    let body = axum::body::Body::from_stream(stream);
-    let ct = crate::files_api::content_type_for(&q.name);
-    let disposition = if crate::files_api::is_inline_previewable(&q.name) {
-        "inline"
-    } else {
-        "attachment"
-    };
-    // RFC 5987 filename* keeps CJK filenames intact across the header.
-    let cd = format!(
-        "{disposition}; filename*=UTF-8''{}",
-        crate::files_api::encode_filename_star(&q.name)
-    );
-
-    let mut resp = axum::response::Response::new(body);
-    resp.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static(ct),
-    );
-    resp.headers_mut().insert(
-        axum::http::header::CONTENT_DISPOSITION,
-        axum::http::HeaderValue::from_str(&cd)
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment")),
-    );
-    resp
+    files_snapshot::response(snapshot.bytes, &q.name, crate::files_api::content_type_for(&q.name),
+        crate::files_api::is_inline_previewable(&q.name), snapshot.admission)
 }
 
-/// GET /api/files/preview — in-browser preview for office documents.
-///
-/// Natively-previewable types (pdf/images) stream inline directly. Office
-/// types (docx/xlsx/pptx/…) are converted to PDF via LibreOffice headless
-/// with an mtime-validated cache under `<home>/cache/preview/<agent>/`;
-/// LibreOffice missing → explicit 503 JSON (never a broken byte stream).
-/// Same auth + path fences as `handle_files_download`.
+/// GET /api/files/preview — inline bytes or an isolated conversion of the same
+/// checked snapshot. Never pass the mutable attachment pathname to LibreOffice.
 async fn handle_files_preview(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -14925,195 +14939,21 @@ async fn handle_files_preview(
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
-        return resp;
-    }
-    let dir = match crate::files_api::attachments_dir(&state.home_dir, agent) {
-        Some(d) => d,
-        None => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid agent id" })),
-            )
-                .into_response();
-        }
+    let snapshot = match files_snapshot::load(&state, &ctx, agent, &q.name,
+        crate::chat_attachments::limits::MAX_PREVIEW).await {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
     };
-    let path = match crate::files_api::resolve_attachment_file(&dir, &q.name) {
-        Ok(p) => p,
-        Err(crate::files_api::ResolveError::BadRequest) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid file name" })),
-            )
-                .into_response();
-        }
-        Err(crate::files_api::ResolveError::Denied) => {
-            return (
-                axum::http::StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "error": "access denied" })),
-            )
-                .into_response();
-        }
-        Err(crate::files_api::ResolveError::NotFound) => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "file not found" })),
-            )
-                .into_response();
-        }
-    };
-
-    // Natively previewable → stream the file itself inline.
+    // load rechecks live authority against the opened bytes, including inline.
     if crate::files_api::is_inline_previewable(&q.name) {
-        return stream_preview_pdf(&path, &q.name, crate::files_api::content_type_for(&q.name))
-            .await;
+        return files_snapshot::response(snapshot.bytes, &q.name, crate::files_api::content_type_for(&q.name),
+            true, snapshot.admission);
     }
     if !crate::files_api::is_office_convertible(&q.name) {
-        return (
-            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            Json(serde_json::json!({ "error": "此檔案類型不支援預覽，請下載後開啟" })),
-        )
-            .into_response();
+        return files_snapshot::error(axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "此檔案類型不支援預覽，請下載後開啟");
     }
-
-    // WP-4G: office documents are zip containers, and the file being previewed
-    // may be an attachment a stranger sent into a channel. LibreOffice is a
-    // recursive-descent OOXML parser with no resource ceiling of its own — a
-    // zip bomb or a deeply-nested part would take out the host, not just the
-    // conversion. Gate BEFORE the process is spawned; fail-closed on violation.
-    let limits = crate::document_limits::DocumentLimits::from_home(&state.home_dir);
-    if let Err(v) = crate::document_limits::guard_document_path(&path, &limits) {
-        tracing::warn!(
-            file = %q.name,
-            violation = v.kind(),
-            "files preview: refused — document exceeds inbound resource limits"
-        );
-        return (
-            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({ "error": v.user_message(&q.name) })),
-        )
-            .into_response();
-    }
-
-    // Cache: <home>/cache/preview/<agent|_shared>/<stem>.pdf, valid while it
-    // is newer than the source file.
-    let cache_dir = crate::files_api::preview_cache_dir(&state.home_dir, agent);
-    let stem = std::path::Path::new(&q.name)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("preview");
-    let cached = cache_dir.join(format!("{stem}.pdf"));
-    let src_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    let cache_fresh = match (
-        std::fs::metadata(&cached).and_then(|m| m.modified()),
-        src_mtime,
-    ) {
-        (Ok(c), Some(s)) => c >= s,
-        _ => false,
-    };
-
-    if !cache_fresh {
-        let Some(soffice) = crate::files_api::find_soffice() else {
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "尚未安裝 LibreOffice，無法產生 Office 檔預覽；請下載檔案開啟，或安裝 LibreOffice 後重試"
-                })),
-            )
-                .into_response();
-        };
-        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("preview cache dir failed: {e}") })),
-            )
-                .into_response();
-        }
-        // Isolated LO profile: parallel conversions against the default
-        // profile fight over its lock and abort.
-        let profile = cache_dir.join(".lo_profile");
-        let profile_arg = format!("-env:UserInstallation=file://{}", profile.display());
-        let mut command = tokio::process::Command::new(&soffice);
-        duduclaw_core::ns_guard::guard_command(&mut command);
-        let run = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            command.arg("--headless")
-                .arg(profile_arg)
-                .arg("--convert-to")
-                .arg("pdf")
-                .arg("--outdir")
-                .arg(&cache_dir)
-                .arg(&path)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .output(),
-        )
-        .await;
-        let converted = match run {
-            Ok(Ok(out)) if out.status.success() && cached.is_file() => true,
-            Ok(Ok(out)) => {
-                let raw = String::from_utf8_lossy(&out.stderr);
-                let stderr = duduclaw_core::truncate_bytes(&raw, 240);
-                tracing::warn!(file = %q.name, %stderr, "files preview: soffice conversion failed");
-                false
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(file = %q.name, error = %e, "files preview: soffice spawn failed");
-                false
-            }
-            Err(_) => {
-                tracing::warn!(file = %q.name, "files preview: soffice conversion timed out (60s)");
-                false
-            }
-        };
-        if !converted {
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "預覽轉檔失敗，請下載檔案開啟" })),
-            )
-                .into_response();
-        }
-    }
-
-    if let Err(resp) = authorize_review_artifact(&state, &ctx, agent, &q.name).await {
-        return resp;
-    }
-    stream_preview_pdf(&cached, &format!("{stem}.pdf"), "application/pdf").await
-}
-
-/// Stream `path` inline with `ct` + an RFC 5987 filename header.
-async fn stream_preview_pdf(
-    path: &std::path::Path,
-    filename: &str,
-    ct: &'static str,
-) -> axum::response::Response {
-    let file = match tokio::fs::File::open(path).await {
-        Ok(f) => f,
-        Err(_) => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "file not found" })),
-            )
-                .into_response();
-        }
-    };
-    let stream = tokio_util::io::ReaderStream::new(file);
-    let body = axum::body::Body::from_stream(stream);
-    let cd = format!(
-        "inline; filename*=UTF-8''{}",
-        crate::files_api::encode_filename_star(filename)
-    );
-    let mut resp = axum::response::Response::new(body);
-    resp.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static(ct),
-    );
-    resp.headers_mut().insert(
-        axum::http::header::CONTENT_DISPOSITION,
-        axum::http::HeaderValue::from_str(&cd)
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("inline")),
-    );
-    resp
+    files_snapshot::office_preview(&state, &ctx, agent, &q.name, snapshot).await
 }
 
 // ── Voice endpoints (openhuman-parity B: STT + TTS) ──────────────
@@ -15167,6 +15007,20 @@ fn knowledge_caller(
             .into_response()
     })?;
     require_password_changed(&ctx)?;
+    Ok(ctx)
+}
+
+/// Extension handlers receive current authority, never the role/bindings cached
+/// in a JWT. Reuse the core token/epoch/account/password checks first.
+fn extension_caller(state: &AppState, headers: &axum::http::HeaderMap, minimum_role: duduclaw_auth::UserRole) -> Result<UserContext, axum::response::Response> {
+    let identity = knowledge_caller(state, headers)?;
+    let ctx = crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &identity.user_id)
+        .map_err(|_| axum::http::StatusCode::UNAUTHORIZED.into_response())?
+        .ok_or_else(|| axum::http::StatusCode::UNAUTHORIZED.into_response())?;
+    require_password_changed(&ctx)?;
+    if !ctx.has_role(minimum_role) {
+        return Err(axum::http::StatusCode::FORBIDDEN.into_response());
+    }
     Ok(ctx)
 }
 
@@ -16631,6 +16485,16 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     });
     macro_rules! socket_output_gate {
         ($heartbeat:expr, $drops_output:expr) => {
+            if !remembered_sessions::dashboard_socket_age_valid(dashboard_session.is_some(), conn_start.elapsed().as_secs()) {
+                let _ = sink.send(Message::Close(None)).await;
+                break;
+            }
+            if let Some((user, session)) = dashboard_session.as_ref() {
+                if !state.user_db.remember_session_valid(Some(session), user, chrono::Utc::now().timestamp()).unwrap_or(false) {
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                }
+            }
             let validity = server_mfa::socket_validity(
                 &state, &user_ctx, access_expires, legacy_admin_authenticated, $heartbeat,
             ).await;
@@ -17091,6 +16955,9 @@ fn jwt_account_gate(
 /// Single DB lookup, fail-closed on error (R2 fix for double-lookup + fail-open).
 fn authenticate_jwt(state: &AppState, jwt_str: &str) -> Result<UserContext, String> {
     let claims = state.jwt_config.verify_access_token(jwt_str)?;
+    if !state.user_db.remember_session_valid(claims.jti.as_deref(), &claims.sub, chrono::Utc::now().timestamp())? {
+        return Err("登入裝置已登出，請重新登入。".into());
+    }
 
     // Single DB lookup — fail-closed: DB error = reject.
     let must_change_password = match state.user_db.get_user(&claims.sub) {
@@ -17483,6 +17350,10 @@ mod personal_google_callback_tests {
                 client_secret: "secret".into(),
                 epoch: 1,
                 google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
+                meeting_recordings: false,
+                drive_tools: false,
+                chat_read: false,
+                expected_connection: None,
                 created: std::time::Instant::now(),
                 code: None,
             });
@@ -17517,6 +17388,10 @@ mod personal_google_callback_tests {
                 client_secret: "SECRET_MUST_NOT_LEAK".into(),
                 epoch: 1,
                 google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
+                meeting_recordings: false,
+                drive_tools: false,
+                chat_read: false,
+                expected_connection: None,
                 created: std::time::Instant::now(),
                 code: None,
             });
@@ -17608,22 +17483,32 @@ fn remote_mcp_result_page(ok: bool, message: &str, back: Option<&str>) -> axum::
 /// `mcp.remote_connect`.
 async fn handle_remote_mcp_oauth_callback(
     State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::Query(pairs): axum::extract::Query<Vec<(String, String)>>,
 ) -> axum::response::Response {
     use crate::remote_mcp;
     let home = state.handler.home_dir().to_path_buf();
-    let st = params.get("state").map(String::as_str).unwrap_or("");
-    if let Some(err) = params.get("error") {
-        let pending = remote_mcp::connect::cancel_pending(st);
-        let back = pending.as_ref().map(|p| p.dashboard_base.clone());
-        if let Some(p) = &pending {
-            remote_mcp::audit(
-                &home,
-                remote_mcp::AUDIT_CONNECT_FAILED,
-                &p.agent_id,
-                serde_json::json!({ "agent_id": p.agent_id, "server": p.server, "error": duduclaw_core::truncate_chars(err, 100) }),
-            );
+    let mut params = std::collections::HashMap::new();
+    for (key, value) in pairs {
+        if params.insert(key.clone(), value).is_some()
+            && matches!(key.as_str(), "state" | "code" | "error" | "iss")
+        {
+            return remote_mcp_result_page(false, "The sign-in response contains repeated parameters.", None);
         }
+    }
+    let st = params.get("state").map(String::as_str).unwrap_or("");
+    let issuer = params.get("iss").map(String::as_str);
+    if let Some(err) = params.get("error") {
+        let pending = match remote_mcp::connect::cancel_pending_with_issuer(st, issuer) {
+            Ok(pending) => pending,
+            Err(error) => return remote_mcp_result_page(false, &error, None),
+        };
+        let back = pending.dashboard_base.clone();
+        remote_mcp::audit(
+            &home,
+            remote_mcp::AUDIT_CONNECT_FAILED,
+            &pending.agent_id,
+            serde_json::json!({ "agent_id": pending.agent_id, "server": pending.server, "error": duduclaw_core::truncate_chars(err, 100) }),
+        );
         let desc = params
             .get("error_description")
             .map(String::as_str)
@@ -17632,10 +17517,10 @@ async fn handle_remote_mcp_oauth_callback(
             &format!("The authorization server answered: {err} {desc}"),
             300,
         );
-        return remote_mcp_result_page(false, &msg, back.as_deref());
+        return remote_mcp_result_page(false, &msg, Some(&back));
     }
     let code = params.get("code").map(String::as_str).unwrap_or("");
-    match remote_mcp::connect::complete_callback(&home, st, code).await {
+    match remote_mcp::connect::complete_callback_with_issuer(&home, st, code, issuer).await {
         Ok(done) => match crate::handlers::finish_remote_sign_in(&home, &done).await {
             Ok(()) => {
                 info!(agent = %done.agent_id, server = %done.server, "remote MCP sign-in completed");
@@ -18419,9 +18304,8 @@ mod pre_auth_handshake_tests {
 }
 
 /// Process-wide A2A signer, initialized once from the on-disk key (generating it
-/// on first use). `None` means key load/generation failed — the card is served
-/// unsigned (fail-open on availability, fail-closed on integrity: an unsigned
-/// card is honest about its lack of a signature). A warning is logged once.
+/// on first use). `None` means key load/generation failed; card endpoints
+/// refuse to serve an unsigned replacement. A warning is logged once.
 fn a2a_signer() -> Option<&'static crate::a2a_signing::A2aSigner> {
     use std::sync::OnceLock;
     static SIGNER: OnceLock<Option<crate::a2a_signing::A2aSigner>> = OnceLock::new();
@@ -18440,51 +18324,12 @@ fn a2a_signer() -> Option<&'static crate::a2a_signing::A2aSigner> {
                     Some(signer)
                 }
                 Err(e) => {
-                    warn!("A2A 簽章金鑰不可用，Agent Card 將以未簽章方式提供：{e}");
+                    warn!("A2A 簽章金鑰不可用，暫停提供 Agent Card：{e}");
                     None
                 }
             }
         })
         .as_ref()
-}
-
-/// Build the unsigned A2A Agent Card body (existing fields, unchanged).
-fn build_agent_card() -> serde_json::Value {
-    serde_json::json!({
-        "name": "DuDuClaw Agent",
-        "description": "AI agent with channel routing, memory, and self-evolution",
-        // Same shared resolver `duduclaw run` uses (env > config.toml
-        // [gateway] port > default) — this used to read `DUDUCLAW_PORT` only
-        // and default to a stale 3000 (the gateway's actual default is
-        // 18889), so an unconfigured A2A client following this card's `url`
-        // with no env var set landed on a dead port.
-        "url": format!(
-            "http://localhost:{}",
-            duduclaw_core::gateway_port_for_home(&duduclaw_core::duduclaw_home()).0
-        ),
-        "version": crate::updater::current_version(),
-        "capabilities": {
-            "streaming": true,
-            "multi_turn": true,
-            "tool_use": true,
-        },
-        "skills": [
-            {"name": "chat", "description": "Multi-turn conversation", "tags": ["conversation"]},
-            {"name": "channel_messaging", "description": "Telegram/LINE/Discord messaging", "tags": ["messaging"]},
-            {"name": "memory", "description": "Search and store memories", "tags": ["memory"]},
-        ],
-    })
-}
-
-async fn well_known_agent_card() -> axum::Json<serde_json::Value> {
-    let mut card = build_agent_card();
-    // A2A v1.0 signature — only added when a signer is available; original
-    // fields are never modified (only-add invariant). Fail-closed on error =>
-    // serve the unsigned card rather than a 500.
-    if let Some(signer) = a2a_signer() {
-        signer.sign_card(&mut card);
-    }
-    axum::Json(card)
 }
 
 /// JWKS endpoint advertising the A2A signing public key (RFC 8037 OKP/Ed25519).
@@ -19140,6 +18985,45 @@ mod live_events_socket_tests {
     }
 
     #[tokio::test]
+    async fn activity_subscribe_filters_per_connection_employee_access() {
+        let mut allowed = MfaSocket::new().await;
+        allowed.state.user_db.update_user(&allowed.user.id, None,
+            Some(duduclaw_auth::UserRole::Employee), None).unwrap();
+        allowed.state.user_db.bind_agent(&allowed.user.id, "sales",
+            duduclaw_auth::AccessLevel::Viewer).unwrap();
+        let user = allowed.state.user_db.create_user("unbound@example.test", "Unbound",
+            "password-test", duduclaw_auth::UserRole::Employee).unwrap();
+        let mut denied = MfaSocket::connect(allowed._home.clone(), allowed.state.clone(), user).await;
+        for connection in [&mut allowed, &mut denied] {
+            assert_eq!(connection.rpc("activity.subscribe", json!({})).await["ok"], true);
+        }
+
+        let activity = json!({"id":"activity-sales", "agent_id":"sales", "summary":"Sales activity"});
+        for frame in [
+            WsFrame::event("activity.new", activity.clone()),
+            // An ordered, universally visible marker proves the denied socket
+            // processed the activity without relying on a silence timeout.
+            WsFrame::event("system.status_changed", json!({"id":"after-activity"})),
+        ] {
+            allowed.state.event_tx.send(serde_json::to_string(&frame).unwrap()).unwrap();
+        }
+        let received = next_json(&mut allowed.client).await;
+        assert_eq!(received["event"], "activity.new");
+        assert_eq!(received["payload"], activity);
+        assert_eq!(received["seq"], 1);
+        let marker = next_json(&mut allowed.client).await;
+        assert_eq!(marker["event"], "system.status_changed");
+        assert_eq!(marker["payload"]["id"], "after-activity");
+        assert_eq!(marker["seq"], 2);
+        let marker = next_json(&mut denied.client).await;
+        assert_eq!(marker["event"], "system.status_changed");
+        assert_eq!(marker["payload"]["id"], "after-activity");
+        assert_eq!(marker["seq"], 1, "denied activity must not consume a sequence number");
+        allowed.finish().await;
+        denied.finish().await;
+    }
+
+    #[tokio::test]
     async fn broker_database_bridge_reaches_ws_with_filtered_sequence_and_loss() {
         let home = tempfile::tempdir().unwrap();
         // Model a booted home with MFA disabled before accepting a system peer.
@@ -19230,5 +19114,40 @@ mod tts_limit_tests {
         assert!(!limiter.take("extra", now));
         assert!(limiter.take("user-0", now));
         assert!(limiter.take("extra", now + std::time::Duration::from_secs(60)));
+    }
+}
+
+#[path = "remembered_sessions.rs"]
+mod remembered_sessions;
+
+#[path = "server_mfa_email.rs"]
+mod server_mfa_email;
+#[path = "server_mfa_passkey.rs"]
+mod server_mfa_passkey;
+
+#[cfg(test)]
+mod identity_key_startup_tests {
+    use super::prepare_identity_key;
+
+    #[test]
+    fn initial_key_failure_aborts_gateway_preparation() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("identity.key")).unwrap();
+        assert!(prepare_identity_key(home.path()).is_err());
+    }
+
+    #[test]
+    fn missing_initialized_key_and_bad_policy_abort_gateway_preparation() {
+        let home = tempfile::tempdir().unwrap();
+        prepare_identity_key(home.path()).unwrap();
+        std::fs::remove_file(home.path().join("identity.key")).unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "[delegation]\nrequire_identity_token = false\n").unwrap();
+        assert!(prepare_identity_key(home.path()).is_err());
+        let fresh = tempfile::tempdir().unwrap();
+        std::fs::write(fresh.path().join("config.toml"),
+            "[delegation]\nrequire_identity_token = 'false'\n").unwrap();
+        assert!(prepare_identity_key(fresh.path()).is_err());
+        assert!(!fresh.path().join("identity.key").exists());
     }
 }

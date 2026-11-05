@@ -42,8 +42,8 @@ pub struct License {
     /// License tier — determines feature gating via `FeatureGate`.
     pub tier: LicenseTier,
 
-    /// SHA-256(hostname::MAC)[..16] hex-encoded fingerprint of the licensed
-    /// machine. Verified against `fingerprint::generate_fingerprint()`.
+    /// Versioned macOS UUID fingerprint or a historical hostname-based hash.
+    /// Verified against `fingerprint::fingerprint_candidates()`.
     pub machine_fingerprint: String,
 
     /// When this license was issued. Used for diagnostic / audit purposes.
@@ -67,14 +67,16 @@ pub struct License {
     pub signature: Vec<u8>,
 
     /// Self-carried distributor control-plane base URL. When an issuer
-    /// bakes its owner-gateway URL into the key at issue time, the client
-    /// resolves phone-home / CRL against it without the operator having to set
-    /// `DUDUCLAW_CONTROL_URL` — the root fix for the 60-day offline downgrade.
+    /// bakes its owner-gateway URL into the key at issue time, the client treats
+    /// it only as an untrusted hint. Outbound transport enforces a pinned host
+    /// allowlist; custom issuers require local `DUDUCLAW_CONTROL_URL` configuration.
+    /// HTTPS, public DNS pinning and no redirects apply even to that override.
     ///
     /// **Deliberately excluded from [`Self::canonical_payload`]** (same tier as
-    /// `signature`): tampering with it requires local write access to the 0600
-    /// `license.json`, and the refresh response is itself signature-verified, so
-    /// the worst case degrades to "URL unreachable" = the pre-existing baseline.
+    /// `signature`) for existing license-file compatibility. Refresh/rebind
+    /// require a v2 response signature covering the full returned License,
+    /// including this URL, and the exact request identity. Missing or legacy
+    /// response signature versions are refused before any state change.
     /// Old license files lacking this field deserialize to `None` (serde
     /// default; `License` has no `deny_unknown_fields`, so a new binary reads an
     /// old file and vice-versa).
@@ -217,8 +219,10 @@ impl License {
     /// current (strong) fingerprint and the rest reproduce what older DuDuClaw
     /// builds computed on the same machine — see
     /// [`crate::fingerprint::fingerprint_candidates`]. A license bound to a
-    /// legacy value keeps working (`legacy = true`, caller should tell the
-    /// operator to re-issue) instead of silently downgrading to OpenSource.
+    /// legacy Hardware or Instance value keeps working (`legacy = true`). A match backed
+    /// only by a weak identity (such as a placeholder, absent, broadcast
+    /// or multicast MAC) returns `WeakFingerprint`: callers
+    /// must isolate it as OpenSource until an account-approved re-bind.
     ///
     /// Only [`LicenseError::InvalidFingerprint`] advances to the next
     /// candidate — every other failure (expiry, grace period, unsupported
@@ -230,7 +234,7 @@ impl License {
     /// implements (and fails closed for every other tier).
     pub fn validate_any(
         &self,
-        candidates: &[String],
+        candidates: &[crate::fingerprint::FingerprintCandidate],
         phone_home_interval: i64,
         grace_period: i64,
     ) -> Result<crate::fingerprint::FingerprintMatch, LicenseError> {
@@ -243,10 +247,15 @@ impl License {
         }
 
         for (index, candidate) in candidates.iter().enumerate() {
-            match self.validate(candidate, phone_home_interval, grace_period) {
+            match self.validate(candidate.fingerprint(), phone_home_interval, grace_period) {
                 Ok(()) => {
+                    if !self.machine_fingerprint.is_empty()
+                        && candidate.strength() == crate::fingerprint::FingerprintStrength::Weak
+                    {
+                        return Err(LicenseError::WeakFingerprint);
+                    }
                     return Ok(crate::fingerprint::FingerprintMatch {
-                        fingerprint: candidate.clone(),
+                        fingerprint: candidate.fingerprint().to_owned(),
                         legacy: index > 0,
                     });
                 }
@@ -812,7 +821,10 @@ mod tests {
     #[test]
     fn validate_any_matches_the_strong_fingerprint_first() {
         let license = make_license(LicenseTier::SelfHostPro, 30, 3);
-        let candidates = vec!["abc123".to_string(), "legacy-fp".to_string()];
+        let candidates = vec![
+            crate::fingerprint::FingerprintCandidate::for_test("abc123", crate::fingerprint::FingerprintStrength::Hardware),
+            crate::fingerprint::FingerprintCandidate::for_test("legacy-fp", crate::fingerprint::FingerprintStrength::Hardware),
+        ];
         let m = license.validate_any(&candidates, 7, 30).unwrap();
         assert_eq!(m.fingerprint, "abc123");
         assert!(!m.legacy, "a strong match must not be flagged legacy");
@@ -821,18 +833,47 @@ mod tests {
     #[test]
     fn validate_any_falls_back_to_a_legacy_candidate() {
         let license = make_license(LicenseTier::SelfHostPro, 30, 3);
-        // The machine's strong fingerprint changed (macOS 26 upgrade); the
-        // installed license is still bound to the old placeholder-MAC value.
-        let candidates = vec!["strong-fp".to_string(), "abc123".to_string()];
+        // The installed license is still bound to a real historical hardware
+        // identity; compatibility must retain its strength requirement.
+        let candidates = vec![
+            crate::fingerprint::FingerprintCandidate::for_test("strong-fp", crate::fingerprint::FingerprintStrength::Hardware),
+            crate::fingerprint::FingerprintCandidate::for_test("abc123", crate::fingerprint::FingerprintStrength::Hardware),
+        ];
         let m = license.validate_any(&candidates, 7, 30).unwrap();
         assert_eq!(m.fingerprint, "abc123");
         assert!(m.legacy, "a compatibility match must be flagged legacy");
     }
 
     #[test]
+    fn validate_any_rejects_weak_bindings_for_every_paid_tier() {
+        let weak = crate::fingerprint::FingerprintCandidate::for_test(
+            "abc123", crate::fingerprint::FingerprintStrength::Weak);
+        for tier in [LicenseTier::Hobby, LicenseTier::Solo, LicenseTier::Studio, LicenseTier::Business,
+            LicenseTier::Partner, LicenseTier::PersonalProSelfHost, LicenseTier::SelfHostPro, LicenseTier::Oem]
+        {
+            let license = make_license(tier, 30, 0);
+            for candidates in [
+                vec![weak.clone()],
+                vec![crate::fingerprint::FingerprintCandidate::for_test(
+                    "other-hardware",
+                    crate::fingerprint::FingerprintStrength::Hardware,
+                ), weak.clone()],
+            ] {
+                assert!(matches!(license.validate_any(&candidates, 7, 30), Err(LicenseError::WeakFingerprint)));
+            }
+        }
+        let mut unbound = make_license(LicenseTier::Oem, 30, 0);
+        unbound.machine_fingerprint.clear();
+        assert!(unbound.validate_any(&[weak], 7, 30).is_ok());
+    }
+
+    #[test]
     fn validate_any_rejects_when_no_candidate_matches() {
         let license = make_license(LicenseTier::Solo, 30, 0);
-        let candidates = vec!["nope-1".to_string(), "nope-2".to_string()];
+        let candidates = vec![
+            crate::fingerprint::FingerprintCandidate::for_test("nope-1", crate::fingerprint::FingerprintStrength::Hardware),
+            crate::fingerprint::FingerprintCandidate::for_test("nope-2", crate::fingerprint::FingerprintStrength::Hardware),
+        ];
         let err = license.validate_any(&candidates, 7, 30).unwrap_err();
         assert!(matches!(err, LicenseError::InvalidFingerprint));
     }
@@ -842,7 +883,10 @@ mod tests {
         // An expired license must report Expired, not InvalidFingerprint —
         // otherwise the operator chases the wrong problem.
         let license = make_license(LicenseTier::SelfHostPro, -1, 0);
-        let candidates = vec!["abc123".to_string(), "legacy-fp".to_string()];
+        let candidates = vec![
+            crate::fingerprint::FingerprintCandidate::for_test("abc123", crate::fingerprint::FingerprintStrength::Hardware),
+            crate::fingerprint::FingerprintCandidate::for_test("legacy-fp", crate::fingerprint::FingerprintStrength::Hardware),
+        ];
         let err = license.validate_any(&candidates, 7, 30).unwrap_err();
         assert!(matches!(err, LicenseError::Expired), "got {err:?}");
 
@@ -861,7 +905,14 @@ mod tests {
         let mut license = make_license(LicenseTier::Oem, 365, 1);
         license.machine_fingerprint = String::new();
         let m = license
-            .validate_any(&["whatever".to_string()], 7, 30)
+            .validate_any(
+                &[crate::fingerprint::FingerprintCandidate::for_test(
+                    "whatever",
+                    crate::fingerprint::FingerprintStrength::Hardware,
+                )],
+                7,
+                30,
+            )
             .unwrap();
         assert_eq!(m.fingerprint, "whatever");
         assert!(!m.legacy);
@@ -871,7 +922,14 @@ mod tests {
         let mut bound = make_license(LicenseTier::Solo, 365, 1);
         bound.machine_fingerprint = String::new();
         let err = bound
-            .validate_any(&["whatever".to_string()], 7, 30)
+            .validate_any(
+                &[crate::fingerprint::FingerprintCandidate::for_test(
+                    "whatever",
+                    crate::fingerprint::FingerprintStrength::Hardware,
+                )],
+                7,
+                30,
+            )
             .unwrap_err();
         assert!(matches!(err, LicenseError::InvalidFingerprint));
     }

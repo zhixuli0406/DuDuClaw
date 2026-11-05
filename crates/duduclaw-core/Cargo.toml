@@ -40,6 +40,8 @@ unicode-normalization = "0.1.25"
 
 [features]
 default = []
+# Explicit fixture API only; production resolution never elevates.
+test-edition-override = []
 # Synthetic root-key intake for dependent-crate debug tests only.
 test-root-key = []
 # Synthetic policy for dependent-crate debug tests; ineffective in release libraries/binaries.
@@ -77,6 +79,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_JobObjects",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_SystemServices",
     "Win32_System_Console",
 ] }
 

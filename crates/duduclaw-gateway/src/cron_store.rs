@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+mod scoped;
+pub use scoped::MAX_CRON_BYTES;
+pub(crate) use scoped::{requires_admission, scoped_cron_timezone_allowed, validate_scoped_schedule};
+
 /// One row in the `cron_tasks` table.
 ///
 /// `notify_channel` / `notify_chat_id` / `notify_thread_id` are optional
@@ -80,6 +84,12 @@ pub struct CronTaskRow {
     /// Host-carried human origin. Legacy NULL rows remain background work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_behalf_of: Option<String>,
+    /// Immutable dashboard creator; legacy and MCP rows have no proven creator.
+    #[serde(default)]
+    pub created_by_user_id: Option<String>,
+    /// Last dashboard employee who activated or edited this job.
+    #[serde(default)]
+    pub scoped_by_user_id: Option<String>,
 }
 
 /// serde default for [`CronTaskRow::trigger_kind`].
@@ -114,6 +124,8 @@ impl CronTaskRow {
             condition_state: None,
             watch_command: None,
             on_behalf_of: None,
+            created_by_user_id: None,
+            scoped_by_user_id: None,
         }
     }
 
@@ -337,6 +349,8 @@ impl CronStore {
             "condition_state",
             "watch_command",
             "on_behalf_of",
+            "created_by_user_id",
+            "scoped_by_user_id",
         ] {
             let sql = format!("ALTER TABLE cron_tasks ADD COLUMN {col} TEXT");
             if let Err(e) = conn.execute(&sql, []) {
@@ -346,6 +360,14 @@ impl CronStore {
                 }
             }
         }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS cron_creation_receipts (
+            user_id TEXT NOT NULL, created_unix INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS idx_cron_creation_receipts ON cron_creation_receipts(user_id,created_unix);
+            CREATE INDEX IF NOT EXISTS idx_cron_scoped_creator ON cron_tasks(created_by_user_id,enabled);
+            CREATE INDEX IF NOT EXISTS idx_cron_scoped_actor ON cron_tasks(scoped_by_user_id,enabled);
+            CREATE INDEX IF NOT EXISTS idx_cron_scoped_principal ON cron_tasks(on_behalf_of,enabled);
+            CREATE INDEX IF NOT EXISTS idx_cron_scoped_agent ON cron_tasks(agent_id,enabled);")
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -360,7 +382,7 @@ impl CronStore {
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
                         cron_timezone,
-                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of
+                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id
                  FROM cron_tasks
                  ORDER BY created_at ASC",
             )
@@ -382,7 +404,7 @@ impl CronStore {
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
                         cron_timezone,
-                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of
+                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id
                  FROM cron_tasks
                  WHERE enabled = 1
                  ORDER BY created_at ASC",
@@ -405,7 +427,7 @@ impl CronStore {
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
                         cron_timezone,
-                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of
+                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id
                  FROM cron_tasks WHERE id = ?1",
                 params![id],
                 row_to_cron_task,
@@ -424,7 +446,7 @@ impl CronStore {
                         run_count, failure_count,
                         notify_channel, notify_chat_id, notify_thread_id,
                         cron_timezone,
-                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of
+                        trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id
                  FROM cron_tasks WHERE name = ?1 LIMIT 1",
                 params![name],
                 row_to_cron_task,
@@ -438,7 +460,21 @@ impl CronStore {
 
     /// Insert a new row. Fails if `id` already exists.
     pub async fn insert(&self, row: &CronTaskRow) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        scoped::check_write(&tx, row)?;
+        scoped::record_creation(&tx, row, None)?;
+        Self::insert_row(&tx, row)?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub(crate) async fn insert_scoped(&self, row: &CronTaskRow) -> Result<(), String> {
+        if !scoped::requires_admission(row) { return Err("Automation actor is required".into()); }
+        self.insert(row).await
+    }
+
+    fn insert_row(conn: &Connection, row: &CronTaskRow) -> Result<(), String> {
         conn.execute(
             "INSERT INTO cron_tasks
                 (id, name, agent_id, cron, task, enabled,
@@ -446,9 +482,9 @@ impl CronStore {
                  run_count, failure_count,
                  notify_channel, notify_chat_id, notify_thread_id,
                  cron_timezone,
-                 trigger_kind, condition_script, condition_state, watch_command, on_behalf_of)
+                 trigger_kind, condition_script, condition_state, watch_command, on_behalf_of, created_by_user_id, scoped_by_user_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 row.id,
                 row.name,
@@ -472,138 +508,133 @@ impl CronStore {
                 row.condition_state,
                 row.watch_command,
                 row.on_behalf_of,
+                row.created_by_user_id,
+                row.scoped_by_user_id,
             ],
         )
         .map_err(|e| format!("insert cron task: {e}"))?;
         Ok(())
     }
 
-    /// Update the editable fields of a task (name, agent_id, cron, task, enabled).
-    /// `notify_*` and `cron_timezone` are preserved — use [`Self::update_notify`]
-    /// or [`Self::update_cron_timezone`] to change them.
-    pub async fn update_fields(
-        &self,
-        id: &str,
-        name: &str,
-        agent_id: &str,
-        cron: &str,
-        task: &str,
-        enabled: bool,
-    ) -> Result<bool, String> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().await;
-        let changed = conn
-            .execute(
-                "UPDATE cron_tasks
-                 SET name = ?2, agent_id = ?3, cron = ?4, task = ?5,
-                     enabled = ?6, updated_at = ?7
-                 WHERE id = ?1",
-                params![
-                    id,
-                    name,
-                    agent_id,
-                    cron,
-                    task,
-                    if enabled { 1 } else { 0 },
-                    now
-                ],
-            )
-            .map_err(|e| format!("update cron task: {e}"))?;
-        Ok(changed > 0)
+    /// Employee edits compare the whole authorized snapshot in one write transaction.
+    /// This also refuses a concurrent workflow binding or owner reassignment.
+    pub(crate) async fn edit_scoped(&self, expected: &CronTaskRow, changed: Option<&CronTaskRow>) -> Result<bool, String> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let current = tx.query_row(
+            "SELECT id,name,agent_id,cron,task,enabled,created_at,updated_at,last_run_at,last_status,last_error,
+             run_count,failure_count,notify_channel,notify_chat_id,notify_thread_id,cron_timezone,
+             trigger_kind,condition_script,condition_state,watch_command,on_behalf_of,created_by_user_id,scoped_by_user_id FROM cron_tasks WHERE id=?1",
+            params![expected.id], row_to_cron_task,
+        ).optional().map_err(|e| e.to_string())?;
+        let Some(current) = current else { return Ok(false) };
+        if serde_json::to_value(&current).map_err(|e| e.to_string())?
+            != serde_json::to_value(expected).map_err(|e| e.to_string())? { return Ok(false); }
+        let bound: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM cron_workflow_bindings WHERE cron_id=?1)",
+            params![expected.id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if bound { return Ok(false); }
+        if let Some(row) = changed {
+            if row.id != current.id || row.agent_id != current.agent_id || row.created_by_user_id != current.created_by_user_id {
+                return Err("Automation identity cannot change".into());
+            }
+            scoped::check_transition(&tx, &current, row)?;
+            tx.execute("UPDATE cron_tasks SET name=?2,cron=?3,task=?4,enabled=?5,on_behalf_of=?6,updated_at=?7,scoped_by_user_id=?8 WHERE id=?1",
+                params![expected.id,row.name,row.cron,row.task,row.enabled,row.on_behalf_of,Utc::now().to_rfc3339(),row.scoped_by_user_id])
+                .map_err(|e| e.to_string())?;
+        } else {
+            tx.execute("DELETE FROM cron_tasks WHERE id=?1", params![expected.id]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
     }
 
-    /// Atomically update editable fields and an explicitly supplied notification route.
+    fn row_in_transaction(conn: &Connection, id: &str) -> Result<Option<CronTaskRow>, String> {
+        conn.query_row(
+            "SELECT id,name,agent_id,cron,task,enabled,created_at,updated_at,last_run_at,last_status,last_error,
+             run_count,failure_count,notify_channel,notify_chat_id,notify_thread_id,cron_timezone,
+             trigger_kind,condition_script,condition_state,watch_command,on_behalf_of,created_by_user_id,scoped_by_user_id
+             FROM cron_tasks WHERE id=?1", params![id], row_to_cron_task,
+        ).optional().map_err(|e| e.to_string())
+    }
+
+    fn persist_edit(conn: &Connection, before: &CronTaskRow, row: &CronTaskRow) -> Result<(), String> {
+        scoped::check_transition(conn, before, row)?;
+        conn.execute(
+            "UPDATE cron_tasks SET name=?2,agent_id=?3,cron=?4,task=?5,enabled=?6,
+             notify_channel=?7,notify_chat_id=?8,notify_thread_id=?9,cron_timezone=?10,
+             trigger_kind=?11,condition_script=?12,watch_command=?13,on_behalf_of=?14,updated_at=?15 WHERE id=?1",
+            params![row.id,row.name,row.agent_id,row.cron,row.task,row.enabled,row.notify_channel,
+                row.notify_chat_id,row.notify_thread_id,row.cron_timezone,row.trigger_kind,
+                row.condition_script,row.watch_command,row.on_behalf_of,Utc::now().to_rfc3339()],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Every public configuration writer reloads, checks and writes under the
+    /// same RESERVED lock. A rejected mutation rolls back its quota receipt too.
+    async fn edit_row(&self, id: &str, change: impl FnOnce(&mut CronTaskRow)) -> Result<bool, String> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let Some(before) = Self::row_in_transaction(&tx, id)? else { return Ok(false) };
+        let mut row = before.clone();
+        change(&mut row);
+        Self::persist_edit(&tx, &before, &row)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    pub async fn update_fields(
+        &self, id: &str, name: &str, agent_id: &str, cron: &str, task: &str, enabled: bool,
+    ) -> Result<bool, String> {
+        self.update_fields_with_principal(id, name, agent_id, cron, task, enabled, None, None).await
+    }
+
     pub async fn update_fields_with_notify(
         &self, id: &str, name: &str, agent_id: &str, cron: &str, task: &str, enabled: bool,
         notify_channel: Option<&str>, notify_chat_id: Option<&str>, notify_thread_id: Option<&str>,
     ) -> Result<bool, String> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().await;
-        let changed = conn.execute(
-            "UPDATE cron_tasks SET name=?2, agent_id=?3, cron=?4, task=?5, enabled=?6,
-             notify_channel=?7, notify_chat_id=?8, notify_thread_id=?9, updated_at=?10 WHERE id=?1",
-            params![id, name, agent_id, cron, task, if enabled { 1 } else { 0 },
-                notify_channel, notify_chat_id, notify_thread_id, now],
-        ).map_err(|e| format!("update cron task and notification: {e}"))?;
-        Ok(changed > 0)
+        self.update_fields_with_principal(id, name, agent_id, cron, task, enabled,
+            Some((notify_channel, notify_chat_id, notify_thread_id)), None).await
     }
 
-    /// MCP edits atomically stamp the host origin with the changed prompt/routing.
-    /// An absent host retains a stored human origin instead of erasing it.
+    /// An absent host retains the stored human origin instead of erasing it.
     pub async fn update_fields_with_principal(
         &self, id: &str, name: &str, agent_id: &str, cron: &str, task: &str, enabled: bool,
         notify: Option<(Option<&str>, Option<&str>, Option<&str>)>, principal: Option<&str>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
-        let (channel, chat, thread) = notify.unwrap_or((None, None, None));
-        let changed = conn.execute(
-            "UPDATE cron_tasks SET name=?2,agent_id=?3,cron=?4,task=?5,enabled=?6,
-             updated_at=?7,on_behalf_of=COALESCE(?8,on_behalf_of),
-             notify_channel=CASE WHEN ?9 THEN ?10 ELSE notify_channel END,
-             notify_chat_id=CASE WHEN ?9 THEN ?11 ELSE notify_chat_id END,
-             notify_thread_id=CASE WHEN ?9 THEN ?12 ELSE notify_thread_id END WHERE id=?1",
-            params![id,name,agent_id,cron,task,enabled,Utc::now().to_rfc3339(),principal,
-                notify.is_some(),channel,chat,thread],
-        ).map_err(|e| format!("update cron task with principal: {e}"))?;
-        Ok(changed > 0)
+        self.edit_row(id, |row| {
+            row.name = name.into(); row.agent_id = agent_id.into(); row.cron = cron.into();
+            row.task = task.into(); row.enabled = enabled;
+            if let Some(principal) = principal { row.on_behalf_of = Some(principal.into()); }
+            if let Some((channel, chat, thread)) = notify {
+                row.notify_channel = channel.map(str::to_owned);
+                row.notify_chat_id = chat.map(str::to_owned);
+                row.notify_thread_id = thread.map(str::to_owned);
+            }
+        }).await
     }
 
-    /// Resume a legacy job under the host principal in the same SQLite write.
     pub async fn set_enabled_with_principal(
         &self, id: &str, enabled: bool, principal: Option<&str>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
-        let changed = conn.execute(
-            "UPDATE cron_tasks SET enabled=?2,updated_at=?3,
-             on_behalf_of=COALESCE(?4,on_behalf_of) WHERE id=?1",
-            params![id,enabled,Utc::now().to_rfc3339(),principal],
-        ).map_err(|e| format!("set_enabled_with_principal: {e}"))?;
-        Ok(changed > 0)
+        self.edit_row(id, |row| {
+            row.enabled = enabled;
+            if let Some(principal) = principal { row.on_behalf_of = Some(principal.into()); }
+        }).await
     }
 
-    /// Update just the `cron_timezone` column. Pass `None` to clear it
-    /// (which reverts the row to UTC / legacy semantics).
-    pub async fn update_cron_timezone(
-        &self,
-        id: &str,
-        cron_timezone: Option<&str>,
-    ) -> Result<bool, String> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().await;
-        let changed = conn
-            .execute(
-                "UPDATE cron_tasks
-                 SET cron_timezone = ?2, updated_at = ?3
-                 WHERE id = ?1",
-                params![id, cron_timezone, now],
-            )
-            .map_err(|e| format!("update_cron_timezone: {e}"))?;
-        Ok(changed > 0)
+    pub async fn update_cron_timezone(&self, id: &str, cron_timezone: Option<&str>) -> Result<bool, String> {
+        self.edit_row(id, |row| row.cron_timezone = cron_timezone.map(str::to_owned)).await
     }
 
-    /// Update the G3 event-trigger fields (`trigger_kind`, `condition_script`,
-    /// `watch_command`). `condition_state` is NOT touched here — it is managed
-    /// by the scheduler via [`Self::update_condition_state`]. Pass `None` to
-    /// clear the script / watch command.
     pub async fn update_trigger(
-        &self,
-        id: &str,
-        trigger_kind: &str,
-        condition_script: Option<&str>,
-        watch_command: Option<&str>,
+        &self, id: &str, trigger_kind: &str, condition_script: Option<&str>, watch_command: Option<&str>,
     ) -> Result<bool, String> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().await;
-        let changed = conn
-            .execute(
-                "UPDATE cron_tasks
-                 SET trigger_kind = ?2, condition_script = ?3, watch_command = ?4,
-                     updated_at = ?5
-                 WHERE id = ?1",
-                params![id, trigger_kind, condition_script, watch_command, now],
-            )
-            .map_err(|e| format!("update_trigger: {e}"))?;
-        Ok(changed > 0)
+        self.edit_row(id, |row| {
+            row.trigger_kind = trigger_kind.into();
+            row.condition_script = condition_script.map(str::to_owned);
+            row.watch_command = watch_command.map(str::to_owned);
+        }).await
     }
 
     /// Persist the condition state carried across evaluations. Rejects state
@@ -644,42 +675,31 @@ impl CronStore {
         notify_chat_id: Option<&str>,
         notify_thread_id: Option<&str>,
     ) -> Result<bool, String> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().await;
-        let changed = conn
-            .execute(
-                "UPDATE cron_tasks
-                 SET notify_channel = ?2, notify_chat_id = ?3, notify_thread_id = ?4,
-                     updated_at = ?5
-                 WHERE id = ?1",
-                params![id, notify_channel, notify_chat_id, notify_thread_id, now],
-            )
-            .map_err(|e| format!("update_notify: {e}"))?;
-        Ok(changed > 0)
+        self.edit_row(id, |row| {
+            row.notify_channel = notify_channel.map(str::to_owned);
+            row.notify_chat_id = notify_chat_id.map(str::to_owned);
+            row.notify_thread_id = notify_thread_id.map(str::to_owned);
+        }).await
     }
 
     pub async fn set_enabled(&self, id: &str, enabled: bool) -> Result<bool, String> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().await;
-        let changed = conn
-            .execute(
-                "UPDATE cron_tasks SET enabled = ?2, updated_at = ?3 WHERE id = ?1",
-                params![id, if enabled { 1 } else { 0 }, now],
-            )
-            .map_err(|e| format!("set_enabled: {e}"))?;
-        Ok(changed > 0)
+        self.set_enabled_with_principal(id, enabled, None).await
     }
 
     pub async fn set_enabled_by_name(&self, name: &str, enabled: bool) -> Result<bool, String> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().await;
-        let changed = conn
-            .execute(
-                "UPDATE cron_tasks SET enabled = ?2, updated_at = ?3 WHERE name = ?1",
-                params![name, if enabled { 1 } else { 0 }, now],
-            )
-            .map_err(|e| format!("set_enabled_by_name: {e}"))?;
-        Ok(changed > 0)
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let ids = tx.prepare("SELECT id FROM cron_tasks WHERE name=?1").map_err(|e| e.to_string())?
+            .query_map(params![name], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        for id in &ids {
+            let before = Self::row_in_transaction(&tx, id)?.ok_or("Automation disappeared")?;
+            let mut row = before.clone();
+            row.enabled = enabled;
+            Self::persist_edit(&tx, &before, &row)?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(!ids.is_empty())
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool, String> {
@@ -850,6 +870,8 @@ impl CronStore {
                 notify_thread_id,
                 cron_timezone,
                 on_behalf_of: None,
+                created_by_user_id: None,
+                scoped_by_user_id: None,
                 trigger_kind: value
                     .get("trigger_kind")
                     .and_then(|v| v.as_str())
@@ -924,6 +946,8 @@ fn row_to_cron_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronTaskRow> {
         condition_state: row.get(19)?,
         watch_command: row.get(20)?,
         on_behalf_of: row.get(21)?,
+        created_by_user_id: row.get(22)?,
+        scoped_by_user_id: row.get(23)?,
     })
 }
 

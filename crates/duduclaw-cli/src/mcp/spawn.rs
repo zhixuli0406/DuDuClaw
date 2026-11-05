@@ -2,7 +2,7 @@ use super::*;
 
 /// Spawn a persistent sub-agent task in the background.
 pub(crate) async fn handle_spawn_agent(params: &Value, home_dir: &Path, caller: &str) -> Value {
-    spawn_agent_with_ctx(params, home_dir, caller, DelegationContext::from_env()).await
+    spawn_agent_with_ctx(params, home_dir, caller, DelegationContext::from_env(home_dir, caller)).await
 }
 
 /// Core spawn_agent with injectable delegation context.
@@ -227,18 +227,13 @@ pub(crate) async fn spawn_agent_with_ctx_and_upstream(
 /// See `duduclaw_gateway::ephemeral` for the scaffold/GC design (AOrchestra,
 /// arXiv:2602.03786).
 pub(crate) async fn handle_spawn_ephemeral(params: &Value, home_dir: &Path, caller: &str) -> Value {
-    // The capability envelope is the ACTUAL caller's — in delegated contexts
-    // that is the delegation sender (same trusted env source the audit trail
-    // uses), never a spoofable tool param.
-    let actual_caller = std::env::var(duduclaw_core::ENV_DELEGATION_SENDER)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| caller.to_string());
+    // `caller` is the dispatcher's verified record actor. Even a signed
+    // audit sender never widens this worker's capability/placement envelope.
     spawn_ephemeral_with_ctx(
         params,
         home_dir,
-        &actual_caller,
-        DelegationContext::from_env(),
+        caller,
+        DelegationContext::from_env(home_dir, caller),
     )
     .await
 }

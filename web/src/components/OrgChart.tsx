@@ -2,7 +2,7 @@ import { useBrandStore } from '@/stores/brand-store';
 import { useDarkAppearance } from '@/components/brand/ProductLogo';
 import { useEffect, useRef, useCallback } from 'react';
 import * as d3 from 'd3';
-import type { AgentDetail } from '@/lib/api';
+import type { AgentDetail, OrgChartAgent } from '@/lib/api';
 import { characterFor } from '@/lib/character-gen';
 import { glyphText } from '@/lib/agent-glyph';
 import { useEffectiveName } from '@/lib/product-identity';
@@ -35,15 +35,17 @@ interface OrgChartLabels {
   zoom?: string;
 }
 
+type ChartAgent = OrgChartAgent & { model?: AgentDetail['model'] };
+
 interface OrgChartProps {
-  agents: ReadonlyArray<AgentDetail>;
+  agents: ReadonlyArray<ChartAgent>;
   onNodeClick?: (agentName: string) => void;
   labels?: OrgChartLabels;
 }
 
 // ── Helpers ───────────────────────────────────────────────────
 
-function buildTree(agents: ReadonlyArray<AgentDetail>, rootName: string): OrgNode {
+function buildTree(agents: ReadonlyArray<ChartAgent>, rootName: string): OrgNode {
   if (agents.length === 0) {
     return { name: '__root__', displayName: rootName, role: 'system', status: 'active', icon: '', model: '', department: '', children: [] };
   }
@@ -52,18 +54,18 @@ function buildTree(agents: ReadonlyArray<AgentDetail>, rootName: string): OrgNod
   const root = agents.find((a) => a.role === 'main')
     ?? agents.find((a) => !a.reports_to || a.reports_to === '');
 
-  const toNode = (agent: AgentDetail, visited = new Set<string>()): OrgNode => {
+  const toNode = (agent: ChartAgent, visited = new Set<string>()): OrgNode => {
     // Prevent infinite recursion from circular reports_to
     if (visited.has(agent.name)) {
-      return { name: agent.name, displayName: agent.display_name, role: agent.role, status: agent.status, icon: glyphText(agent.icon), model: agent.model?.preferred ?? '', department: agent.department ?? '', children: [] };
+      return { name: agent.name, displayName: agent.display_name ?? agent.name, role: agent.role, status: agent.status ?? '', icon: glyphText(agent.icon), model: agent.model?.preferred ?? '', department: agent.department ?? '', children: [] };
     }
     const next = new Set(visited);
     next.add(agent.name);
     return {
       name: agent.name,
-      displayName: agent.display_name,
+      displayName: agent.display_name ?? agent.name,
       role: agent.role,
-      status: agent.status,
+      status: agent.status ?? '',
       icon: glyphText(agent.icon),
       model: agent.model?.preferred ?? '',
       department: agent.department ?? '',
@@ -258,7 +260,7 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
         'transform',
         (d) => `translate(${d.x! - NODE_W / 2},${d.y! - NODE_H / 2})`,
       )
-      .style('cursor', 'pointer')
+      .style('cursor', onNodeClick ? 'pointer' : 'default')
       .on('click', (_event, d) => {
         if (d.data.name !== '__root__' && onNodeClick) {
           onNodeClick(d.data.name);
@@ -371,7 +373,7 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
         // WP-ORG — surface the functional department when set (status is
         // already carried by the top-right dot + card colors).
         const dept = d.data.department;
-        const line = dept ? `${dept} · ${role}` : `${role} · ${d.data.status}`;
+        const line = dept ? `${dept} · ${role}` : d.data.status ? `${role} · ${d.data.status}` : role;
         return line.length > 20 ? line.slice(0, 19) + '…' : line;
       });
 

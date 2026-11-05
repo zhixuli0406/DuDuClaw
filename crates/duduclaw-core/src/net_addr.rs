@@ -19,17 +19,17 @@
 //! refused — notably `::` and `::1`, `::/96` (IPv4-compatible, deprecated),
 //! `100::/64` (discard), `64:ff9b:1::/48` (local-use NAT64), `fc00::/7`,
 //! `fe80::/10`, `fec0::/10`, `ff00::/8` — and inside `2000::/3` these are
-//! refused too: `2001::/32` (Teredo), `2001:db8::/32` and `3fff::/20`
-//! (documentation).
+//! refused too: the IANA special-purpose ranges `2001::/23` (except its
+//! explicitly globally reachable allocations), `2001:db8::/32`, `2002::/16`
+//! (6to4, reachability not guaranteed), and `3fff::/20` (documentation).
+//! `5f00::/16` (SRv6 SIDs) is already outside global unicast.
 //!
-//! IPv6 forms that carry an IPv4 address in a fixed position are classified
-//! by that embedded address: `::ffff:0:0/96` (IPv4-mapped), `64:ff9b::/96`
-//! (well-known NAT64 prefix) and `2002::/16` (6to4). So `::ffff:127.0.0.1`
-//! and `64:ff9b::a9fe:a9fe` are refused, while `64:ff9b::101:101` (1.1.1.1
-//! behind DNS64) stays reachable. Forms whose embedded address cannot be
-//! extracted reliably — IPv4-compatible, Teredo (two embedded addresses, one
-//! obfuscated) and local-use NAT64 (operator-chosen prefix length) — are
-//! refused as a whole class.
+//! Registry: <https://www.iana.org/assignments/iana-ipv6-special-registry>
+//! (reviewed 2026-11-05). Keep the narrow exceptions in sync with this registry.
+//!
+//! IPv4-mapped `::ffff:0:0/96` and well-known NAT64 `64:ff9b::/96` retain
+//! embedded-IPv4 classification: public IPv4 stays reachable and private IPv4
+//! is refused. Other transition forms, including all 6to4, are refused.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -81,10 +81,17 @@ pub fn is_public_ipv6(ip: &Ipv6Addr) -> bool {
     if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001 {
         return false;
     }
-    // 2002::/16 — 6to4: the IPv4 sits in bits 16..48.
+    // 6to4 is not globally reachable evidence, even with a public embedded IPv4.
     if s[0] == 0x2002 {
-        let v4 = Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8);
-        return is_public_ipv4(&v4);
+        return false;
+    }
+    // IANA 2001::/23: allow only more-specific Globally Reachable=True rows.
+    // This excludes Teredo, benchmarking, deprecated ORCHID and reserved space.
+    if s[0] == 0x2001 && s[1] < 0x0200 {
+        return (s[1] == 1 && s[2..7] == [0, 0, 0, 0, 0] && (1..=3).contains(&s[7]))
+            || s[1] == 3 // AMT 2001:3::/32
+            || (s[1] == 4 && s[2] == 0x0112) // AS112 2001:4:112::/48
+            || (0x0020..=0x003f).contains(&s[1]); // ORCHIDv2 /28 and DETs /28
     }
     let first = s[0];
     // Only 2000::/3 is global unicast; everything outside it (::/8 apart
@@ -94,10 +101,8 @@ pub fn is_public_ipv6(ip: &Ipv6Addr) -> bool {
         return false;
     }
     !(
-        // 2001::/32 Teredo.
-        (first == 0x2001 && s[1] == 0x0000)
         // 2001:db8::/32 documentation.
-        || (first == 0x2001 && s[1] == 0x0db8)
+        (first == 0x2001 && s[1] == 0x0db8)
         // 3fff::/20 documentation (RFC 9637).
         || (first == 0x3fff && s[1] < 0x1000)
     )
@@ -138,7 +143,10 @@ mod tests {
         ("::1", "::ffff:ffff", None, None),
         ("100::", "100::ffff:ffff:ffff:ffff", None, None),
         ("64:ff9b:1::", "64:ff9b:1:ffff:ffff:ffff:ffff:ffff", None, None),
-        ("2001::", "2001:0:ffff:ffff:ffff:ffff:ffff:ffff", Some("2000:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), Some("2001:1::")),
+        ("2001::", "2001:0:ffff:ffff:ffff:ffff:ffff:ffff", Some("2000:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), None),
+        ("2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", None, Some("2001:200::")),
+        ("2002::", "2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff", Some("2001:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), Some("2003::")),
+        ("5f00::", "5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff", None, None),
         ("2001:db8::", "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", Some("2001:db7:ffff:ffff:ffff:ffff:ffff:ffff"), Some("2001:db9::")),
         ("3fff::", "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff", Some("3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), Some("3fff:1000::")),
         // Everything above global unicast: fc00::/7, fe80::/10, fec0::/10,
@@ -177,6 +185,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn iana_protocol_assignment_exceptions_are_narrow() {
+        for allowed in ["2001:1::1", "2001:1::2", "2001:1::3",
+            "2001:3::", "2001:3:ffff:ffff:ffff:ffff:ffff:ffff",
+            "2001:4:112::", "2001:4:112:ffff:ffff:ffff:ffff:ffff",
+            "2001:20::", "2001:2f:ffff:ffff:ffff:ffff:ffff:ffff",
+            "2001:30::", "2001:3f:ffff:ffff:ffff:ffff:ffff:ffff",
+            "2620:4f:8000::1"]
+        {
+            assert!(public(allowed), "globally reachable allocation: {allowed}");
+        }
+        for refused in ["2001:1::", "2001:1::4", "2001:1:0:0:0:1::1",
+            "2001:2::", "2001:2:0:ffff:ffff:ffff:ffff:ffff",
+            "2001:4:111:ffff:ffff:ffff:ffff:ffff", "2001:4:113::",
+            "2001:10::", "2001:1f:ffff:ffff:ffff:ffff:ffff:ffff",
+            "2001:40::", "2001:1ff::", "100:0:0:1::1", "5f00::1"]
+        {
+            assert!(!public(refused), "special-purpose address: {refused}");
+        }
+    }
+
     /// Embedded-IPv4 forms with a fixed position follow the embedded address
     /// across its whole range (first/last of the class + a public probe).
     #[test]
@@ -205,7 +234,7 @@ mod tests {
         assert!(!public("2002:a9fe:a9fe::1"));
         assert!(!public("2002::"), "2002:0000:0000:: embeds 0.0.0.0");
         assert!(!public("2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), "embeds 255.255.255.255");
-        assert!(public("2002:101:101::1"), "6to4 of 1.1.1.1");
+        assert!(!public("2002:101:101::1"), "all 6to4 must be refused, including 1.1.1.1");
         assert!(public("2001:ffff:ffff:ffff:ffff:ffff:ffff:ffff") && public("2003::"), "neighbours of 2002::/16");
     }
 }

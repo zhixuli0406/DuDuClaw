@@ -123,6 +123,10 @@ pub fn domain_allowed(home: &Path, metadata: &Metadata) -> Result<bool, String> 
 }
 
 fn check_record(home: &Path, record: &vault::Record, tool: &str) -> Result<(), Refusal> {
+    // Every unseal/refresh path must name an explicit bearer operation.
+    if !scopes::token_tool(tool) {
+        return Err(Refusal::hard("scope_missing", "這項操作不能取得 Google 權杖。"));
+    }
     check_metadata(home, &record.metadata, tool)
 }
 pub(super) fn check_metadata(home: &Path, metadata: &Metadata, tool: &str) -> Result<(), Refusal> {
@@ -153,10 +157,16 @@ pub(super) fn check_metadata_authority(
             "這個 Google 帳號不在管理員允許的網域內。",
         ));
     }
-    if !scopes::permitted(tool, &metadata.granted_scopes) {
+    // Status selection reads metadata only. check_record separately forbids
+    // using this exemption at any credential unseal/refresh boundary.
+    if tool != "google_status" && !scopes::permitted_for(tool, metadata) {
         return Err(Refusal::hard(
             "scope_missing",
-            "你連結 Google 時沒有開放這項服務；請重新連結，並勾選這次需要的服務。",
+            if matches!(tool, "google_chat_spaces" | "google_chat_messages") {
+                crate::google_workspace::chat_read::GUIDANCE
+            } else {
+                "你連結 Google 時沒有開放這項服務；請重新連結，並勾選這次需要的服務。"
+            },
         ));
     }
     Ok(())

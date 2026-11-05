@@ -62,10 +62,12 @@ mod lifecycle;
 mod handshake_license;
 mod tools_catalog;
 mod agents_basic;
+mod agents_health;
 mod agents_create;
 mod templates_util;
 mod templates_rpc;
 mod templates_create;
+mod templates_library;
 mod agents_ops;
 mod main_agent_access;
 mod autonomy_rpc;
@@ -100,12 +102,16 @@ pub(crate) use shared_wiki_rpc::SharedWikiReader;
 mod search_rpc;
 mod skills_rpc;
 mod skills_list_rpc;
+mod skills_recent_rpc;
 mod skills_manage_rpc;
 mod skills_install_request;
 mod skills_custom;
 mod cron_rpc;
+mod cron_scoped_rpc;
+mod dashboard_scope;
 mod about_rpc;
 mod data_exports_rpc;
+mod compliance_rpc;
 mod distributor_rpc;
 mod cli_login_rpc;
 mod setup_token_rpc;
@@ -119,6 +125,7 @@ mod security_rpc;
 mod credential_audit_rpc;
 pub(crate) mod credential_protection_rpc;
 mod website_credentials_rpc;
+mod transcription_credentials_rpc;
 mod analytics_rpc;
 mod evolution_rpc;
 mod playbook_rpc;
@@ -141,6 +148,9 @@ mod widgets_custom;
 mod departments_rpc;
 mod users_rpc;
 mod user_invites_rpc;
+pub(crate) mod company_rpc;
+mod members_rpc;
+mod onboarding_rpc;
 mod users_org;
 mod team_rpc;
 pub(crate) mod live_context;
@@ -166,6 +176,8 @@ mod artifact_evidence;
 mod workflow_errors;
 #[cfg(test)]
 mod task_privacy_tests;
+#[cfg(test)]
+mod task_a2a_privacy_tests;
 #[cfg(test)]
 mod f5_privacy_tests;
 #[cfg(test)]
@@ -286,10 +298,11 @@ pub struct MethodHandler {
     jwt_config: RwLock<Option<Arc<JwtConfig>>>,
     /// Plugin extension point (NullExtension by default).
     extension: Arc<dyn GatewayExtension>,
-    /// Explicit product form-factor override, injected after gateway start by
-    /// the Cloud control-plane. `None` → resolve per-request from
-    /// `DUDUCLAW_EDITION` env > license tier > `Personal`.
+    /// Product form-factor restriction injected after gateway start. Both this
+    /// value and `DUDUCLAW_EDITION` are always capped by the license.
     edition_override: RwLock<Option<duduclaw_core::EditionProfile>>,
+    #[cfg(test)]
+    edition_fixture_runtime: RwLock<Option<crate::license_runtime::LicenseRuntime>>,
     /// Active interactive CLI-login sessions ("Dashboard 一鍵登入"), keyed by
     /// session id. Each drives a CLI's native login command in a PTY.
     cli_auth_sessions: RwLock<std::collections::HashMap<String, (String, Arc<crate::cli_auth::AuthSession>)>>,
@@ -456,6 +469,17 @@ impl MethodHandler {
         ctx: &UserContext,
         conn: crate::power_local::RpcConnInfo,
     ) -> WsFrame {
+        // Move the credential into a zeroizing owner before any early-return
+        // gate. Secret-bearing requests never reach the extension clone.
+        let mut params = params;
+        let credential_request = if method.split('.').next() == Some("transcription_credentials") {
+            Some(transcription_credentials_rpc::Request::take(method, params.take()))
+        } else { None };
+        if method == "system.update_config"
+            && transcription_credentials_rpc::reject_generic_credentials(&mut params) {
+            return WsFrame::error_response("", "請使用專用的會議轉錄憑證設定操作。");
+        }
+
         // ── Pre-auth connection gate (appliance lock screen) ─────────────
         // Runs before EVERY other gate, including the forced-password-change
         // and edition gates below: those two answer "may this identity do
@@ -528,6 +552,16 @@ impl MethodHandler {
             return enterprise_only_reject_frame();
         }
 
+        // Session administration cannot be replaced by an extension. The
+        // handler rechecks the explicit Admin role in the DB transaction so
+        // denied requests are audited together with their target.
+        if method.starts_with("sessions.") || method == "users.revoke_sessions" {
+            if session_policy_rpc::minimum_role(method) != Some(UserRole::Admin) {
+                return WsFrame::error_response("", "不允許此操作。");
+            }
+            return self.handle_session_policy_rpc(method, params, ctx).await;
+        }
+
         // MFA is a gateway-owned authentication namespace, never delegated to
         // plugins. Every allowed method has an explicit authorization entry.
         if method.split('.').next() == Some("mfa") || matches!(method, "users.mfa_reset" | "users.mfa_enrollment_code") {
@@ -540,9 +574,25 @@ impl MethodHandler {
             return self.dispatch_org(method, params, ctx, conn).await;
         }
 
+        // Customer identity is gateway-owned; extensions never intercept uploads.
+        if method.split('.').next() == Some("company") {
+            let Some(role) = company_rpc::minimum_role(method) else {
+                return WsFrame::error_response("", "不支援此公司資訊操作。");
+            };
+            if let Err(e) = acl::require_role(ctx, role) {
+                company_rpc::audit(&self.home_dir, &ctx.user_id, method, "refused");
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.handle_company(method, params, ctx)).await;
+        }
+
         // Invitations are gateway-owned authentication methods. An extension
         // must never replace their Admin checks or inspect a returned link.
-        if let Some(role) = user_invites_rpc::minimum_role(method) {
+        // Reserved namespace fallbacks are Admin-only and stay in core dispatch,
+        // which rejects unknown methods before any extension can claim them.
+        if let Some(role) = user_invites_rpc::minimum_role(method)
+            .or_else(|| members_rpc::minimum_role(method))
+            .or_else(|| onboarding_rpc::minimum_role(method)) {
             if let Err(e) = acl::require_role(ctx, role) {
                 return WsFrame::error_response("", &e);
             }
@@ -563,15 +613,53 @@ impl MethodHandler {
             return boxed_frame(|| self.handle_website_credentials(method, params, ctx)).await;
         }
 
-        // ── Plugin extension dispatch ──────
-        // Try extension first; if it returns Some, the method is handled.
-        if let Some(frame) = self
-            .extension
-            .handle_method(method, params.clone(), ctx)
-            .await
-        {
-            return frame;
+        // Compliance exports are gateway-owned. An extension must never
+        // replace their Admin checks or receive report parameters.
+        if method == "compliance.generate" {
+            if let Err(e) = acl::require_role(ctx, UserRole::Admin) {
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.dispatch_system(method, params, ctx, conn)).await;
         }
+
+        // Apply the employee-dashboard namespace floor before an extension
+        // can handle a method. Unregistered methods in these namespaces are
+        // Admin-only; the normal handlers retain all record-level checks.
+        if let Some(role) = dashboard_scope::minimum_role(method) {
+            if let Err(e) = acl::require_role(ctx, role) {
+                return WsFrame::error_response("", &e);
+            }
+        }
+
+        if let Some(request) = credential_request {
+            if let Err(e) = acl::require_role(ctx, UserRole::Admin) {
+                request.audit(&self.home_dir, &ctx.user_id, "refused");
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.handle_transcription_credentials(request, ctx)).await;
+        }
+
+        // Raw TOML submissions may contain rejected credential values too.
+        // Keep validation and the Admin gate ahead of extension dispatch.
+        if method == "config.raw.set" {
+            if let Err(e) = acl::require_role(ctx, UserRole::Admin) {
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.handle_config_raw_set(params, ctx)).await;
+        }
+
+        // A2A is gateway-owned and uses the live identity/password gates above.
+        if let Some(operation) = method.strip_prefix("a2a.") {
+            // Only the authenticated HTTP adapter supplies this internal call;
+            // dashboard sockets must not bypass version/body/signature rules.
+            if conn.peer.is_some() {
+                return WsFrame::error_response("", "A2A requires the HTTP endpoint");
+            }
+            return boxed_frame(|| self.handle_a2a_rpc(operation, params, ctx)).await;
+        }
+
+        // Core dispatch always runs first. Only the terminal unknown-method
+        // arm may consult the registered extension, without cloning secrets.
         if let Some(frame) = boxed_frame(|| self.dispatch_kb(method, &params, ctx)).await {
             return frame;
         }
@@ -586,3 +674,5 @@ impl MethodHandler {
 }
 
 mod mfa_rpc;
+mod session_policy_rpc;
+mod a2a_rpc;

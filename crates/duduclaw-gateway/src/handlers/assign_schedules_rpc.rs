@@ -218,7 +218,11 @@ impl MethodHandler {
             Ok(s) => s,
             Err(f) => return f,
         };
-        let rows = match manage::list(&store, &actor, all).await {
+        let accessible = params.get("scope").and_then(Value::as_str) == Some("accessible");
+        let result = if accessible && !ctx.is_admin() {
+            store.list_bound_assign_schedules(&ctx.user_id, &ctx.agent_access.keys().cloned().collect::<Vec<_>>()).await
+        } else { manage::list(&store, &actor, all || accessible).await };
+        let rows = match result {
             Ok(r) => r,
             Err(e) => return WsFrame::error_response("", &format!("list schedules: {e}")),
         };
@@ -231,7 +235,14 @@ impl MethodHandler {
                         crate::trigger_route::assign_create::account_name(&home, &r.creator_user_id)
                     })
                     .flatten();
-                manage::row_json(r, name.as_deref())
+                let mut value = manage::row_json(r, name.as_deref());
+                value["can_manage"] = json!(actor.is_admin || r.creator_user_id == actor.user_id
+                    || ctx.has_agent_access(&r.agent_id, AccessLevel::Operator));
+                if !ctx.is_admin() && r.creator_user_id != actor.user_id {
+                    value["creator_user_id"] = Value::Null;
+                    value["creator_name"] = Value::Null;
+                }
+                value
             })
             .collect();
         // Listing and narrowing controls remain available when config is
@@ -269,14 +280,16 @@ impl MethodHandler {
             Ok(s) => s,
             Err(f) => return f,
         };
+        let row = match store.get_assign_schedule(id).await {
+            Ok(Some(row)) if actor.is_admin || row.creator_user_id == actor.user_id
+                || ctx.has_agent_access(&row.agent_id, AccessLevel::Operator) => row,
+            _ => return WsFrame::error_response("", "not_found"),
+        };
         if matches!(action, ManageAction::Resume) {
-            let row = match store.get_assign_schedule(id).await {
-                Ok(Some(row)) if actor.is_admin || row.creator_user_id == actor.user_id => row,
-                _ => return WsFrame::error_response("", "not_found"),
-            };
             if let Err(frame) = self.deny_main_for_non_admin(ctx, &row.agent_id).await { return frame; }
         }
-        match manage::manage(&self.home_dir, &store, &actor, id, action, Utc::now()).await {
+        let bound = ctx.has_agent_access(&row.agent_id, AccessLevel::Operator).then_some(row.agent_id.as_str());
+        match manage::manage_with_binding(&self.home_dir, &store, &actor, id, action, Utc::now(), bound).await {
             Ok(row) => {
                 self.broadcast_event("assign_schedule.changed", json!({}))
                     .await;

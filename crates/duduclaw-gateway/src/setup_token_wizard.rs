@@ -111,6 +111,9 @@ pub enum SetupTokenErrorCode {
     /// A token WAS captured but the post-capture API round-trip failed —
     /// never persisted.
     ValidationFailed,
+    /// Code received, but Claude Code output could not be read safely.
+    CaptureFailed,
+    AuthenticationRejected,
     /// A second `submit` arrived while the first was still in flight.
     AlreadySubmitting,
     /// PTY / process spawn failure unrelated to the code itself.
@@ -126,6 +129,8 @@ impl SetupTokenErrorCode {
             Self::InvalidCode => "invalid_code",
             Self::Timeout => "timeout",
             Self::ValidationFailed => "validation_failed",
+            Self::CaptureFailed => "capture_failed",
+            Self::AuthenticationRejected => "authentication_rejected",
             Self::AlreadySubmitting => "already_submitting",
             Self::Io => "io_error",
         }
@@ -237,13 +242,12 @@ pub async fn wait_for_auth_url(session: &AuthSession) -> Option<String> {
 pub enum SubmitOutcome {
     /// Login succeeded and a token was captured and validated.
     Validated(String),
-    /// Login succeeded but no token was ever captured (should not happen for
-    /// the Claude runtime — `claude setup-token` always prints one on
-    /// success — surfaced as `ValidationFailed` by the caller).
-    NoToken,
+    /// Code received but no well-formed token could be captured.
+    CaptureFailed,
     /// A token was captured but failed live validation. Message is a
     /// sanitized, non-secret-bearing summary — never the raw CLI transcript.
     ValidationFailed(String),
+    AuthenticationRejected,
     /// The CLI's own markers reported failure, or the process exited without
     /// ever confirming success (garbled/expired code, Enter never landed).
     InvalidCode,
@@ -278,7 +282,8 @@ pub async fn submit_code(claude_bin: &str, session: &AuthSession, code: &str) ->
         let status = session.status();
         if status.is_terminal() {
             match status {
-                AuthStatus::Succeeded => break,
+                AuthStatus::Succeeded if session.token_capture_is_quiet() => break,
+                AuthStatus::Succeeded => {},
                 // Failed (CLI's own "invalid code" marker) or Exited (process
                 // ended with no marker at all — in practice also a rejected
                 // code) both map to the same user-facing remedy: try again.
@@ -292,15 +297,21 @@ pub async fn submit_code(claude_bin: &str, session: &AuthSession, code: &str) ->
         tokio::time::sleep(SUBMIT_POLL_INTERVAL).await;
     }
 
-    let Some(token) = session.captured_token() else {
-        return SubmitOutcome::NoToken;
+    let Some(token) = session.captured_token().filter(|t| crate::cli_auth::valid_oauth_token_shape(t)) else {
+        session.log_capture_failure();
+        return SubmitOutcome::CaptureFailed;
     };
 
     match validate_captured_token(claude_bin, &token).await {
         Ok(()) => SubmitOutcome::Validated(token),
+        Err(reason) if reason == AUTHENTICATION_REJECTED => SubmitOutcome::AuthenticationRejected,
         Err(reason) => SubmitOutcome::ValidationFailed(reason),
     }
 }
+
+pub const AUTHENTICATION_REJECTED: &str = "Claude 拒絕了這組登入，請重新授權一次。";
+
+pub const CAPTURE_FAILED_MESSAGE: &str = "擷取失敗：已收到授權碼，但 DuDuClaw 無法讀取 Claude Code 的登入結果。請重試，或在受保護的 Linux 主機終端執行 sudo -u duduclaw -H claude auth login；其他環境執行 claude auth login。";
 
 /// Validate a freshly captured OAuth token with a REAL API round-trip. See
 /// the module doc for why `claude auth status` cannot be used here. Runs
@@ -336,6 +347,10 @@ pub async fn submit_code(claude_bin: &str, session: &AuthSession, code: &str) ->
 /// exactly the class of bug this function exists to prevent (see the
 /// module-level `claude auth status` finding above).
 pub async fn validate_captured_token(claude_bin: &str, token: &str) -> Result<(), String> {
+    // Defense in depth: malformed captures never reach a subprocess or network.
+    if !crate::cli_auth::valid_oauth_token_shape(token) {
+        return Err(CAPTURE_FAILED_MESSAGE.to_string());
+    }
     let scratch_dir = std::env::temp_dir().join("duduclaw-setup-token-validate");
     if let Err(e) = tokio::fs::create_dir_all(&scratch_dir).await {
         return Err(format!("could not prepare a scratch directory: {e}"));
@@ -391,7 +406,7 @@ pub async fn validate_captured_token(claude_bin: &str, token: &str) -> Result<()
                 .and_then(|v| v.get("api_error_status"))
                 .and_then(Value::as_i64);
             Err(match api_status {
-                Some(401) => "帳號驗證失敗（401）：剛取得的授權碼可能已失效。".to_string(),
+                Some(401) => AUTHENTICATION_REJECTED.to_string(),
                 Some(code) => format!("驗證呼叫回傳錯誤（API {code}）。"),
                 None => "驗證呼叫回傳失敗，但沒有明確的錯誤碼。".to_string(),
             })
@@ -407,6 +422,33 @@ pub async fn validate_captured_token(claude_bin: &str, token: &str) -> Result<()
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn malformed_setup_token_is_rejected_before_spawning_validator() {
+        let result = validate_captured_token("/nonexistent/claude-must-not-run", "sk-ant-at01-corrupted000000000").await;
+        assert_eq!(result, Err(CAPTURE_FAILED_MESSAGE.to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_token_validator_401_uses_reauthorization_message() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("claude-validator-fixture");
+        std::fs::write(&program, "#!/bin/sh\nprintf '%s' '{\"is_error\":true,\"api_error_status\":401}'\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = validate_captured_token(program.to_str().unwrap(), "sk-ant-oat01-AbC123_def-456GHI").await;
+        assert_eq!(result, Err(AUTHENTICATION_REJECTED.to_string()));
+    }
+
+    #[test]
+    fn setup_token_failure_messages_distinguish_capture_and_rejection() {
+        assert_eq!(SetupTokenErrorCode::CaptureFailed.as_str(), "capture_failed");
+        assert_eq!(SetupTokenErrorCode::AuthenticationRejected.as_str(), "authentication_rejected");
+        assert!(CAPTURE_FAILED_MESSAGE.contains("sudo -u duduclaw -H claude auth login"));
+        assert!(!AUTHENTICATION_REJECTED.contains("失效"));
+        assert!(!CAPTURE_FAILED_MESSAGE.contains("失效"));
+    }
+
     #[test]
     fn every_error_code_has_a_stable_non_empty_string() {
         let all = [
@@ -416,6 +458,8 @@ mod tests {
             SetupTokenErrorCode::InvalidCode,
             SetupTokenErrorCode::Timeout,
             SetupTokenErrorCode::ValidationFailed,
+            SetupTokenErrorCode::CaptureFailed,
+            SetupTokenErrorCode::AuthenticationRejected,
             SetupTokenErrorCode::AlreadySubmitting,
             SetupTokenErrorCode::Io,
         ];
@@ -475,7 +519,7 @@ mod tests {
         let result = validate_captured_token(&claude_bin, fake_token).await;
         let err = result.expect_err("a fake token must fail live validation");
         assert!(
-            err.contains("401") || err.contains("驗證"),
+            err == AUTHENTICATION_REJECTED || err.contains("驗證"),
             "expected a 401-classified or generic validation-failure message, got: {err}"
         );
         // The fake token itself must never appear in the error message.

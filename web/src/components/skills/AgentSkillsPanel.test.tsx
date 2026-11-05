@@ -10,6 +10,7 @@ function setup(canManage: boolean) {
     if (method === 'skills.list')
       return Promise.resolve({
         skills: [
+          { name: 'sales-guide', content: '', scope: 'department', agent_id: 'agnes', enabled: true },
           { name: 'tone', content: '', scope: 'global', agent_id: 'agnes', enabled: true },
           { name: 'quote', content: '', scope: 'agent', agent_id: 'agnes', enabled: false, use_count: 2, last_used_at: '2026-10-20T00:00:00Z' },
         ],
@@ -29,6 +30,17 @@ function setup(canManage: boolean) {
 beforeEach(() => vi.clearAllMocks());
 
 describe('AgentSkillsPanel', () => {
+  it('loads the employee effective list and labels every scope', async () => {
+    setup(false);
+    renderWithProviders(<AgentSkillsPanel agentId="agnes" agentName="Agnes" />);
+    await screen.findByText('sales-guide');
+    expect(mockWsClient.call).toHaveBeenCalledWith('skills.list', { agent_id: 'agnes' });
+    for (const label of ['Company-wide', 'Department', 'Personal']) {
+      expect(screen.getByText(label)).toBeInTheDocument();
+    }
+    expect(screen.getAllByRole('switch')).toHaveLength(3);
+  });
+
   it('switches a skill back on, removes an own skill and restores an archived one', async () => {
     const user = userEvent.setup();
     setup(true);

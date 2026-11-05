@@ -1,5 +1,7 @@
 # MCP ツールを増やす：MCP レジストリ、リモートサーバー、アプリ統合サービス
 
+**Codex の外部設定検査（v1.80.0 から）：** 外部設定がないか MCP を定義していなければ、通常の社員、Explore、utility、Task Sandbox、Discovery は実行できます。MCP の検出、既存設定の読み取り・解析失敗ではソース名を示して拒否します。明示した Codex judge の拒否は判定失敗となり、既定の judge では再試行しません。起動前のローカル／キャッシュのスナップショット検査であり、その後のクラウド更新を完全に隔離する保証はありません。[検査対象と制限](../../architecture/extension-gates.md)。
+
 DuDuClaw の AI 従業員は、自分の `.mcp.json` に並んだ MCP サーバーを通じてツールを使います。組み込みカタログ（Playwright、Browserbase、Filesystem、Memory）と「URL からインポート」に加えて、ダッシュボードでは次のことができるようになりました。
 
 1. **公式 MCP レジストリを検索**し、サーバーを従業員ひとりにインストールする（`MCP → MCP レジストリ`）。
@@ -135,34 +137,34 @@ DuDuClaw 自身のツールにはそれぞれ動作の種類（`read`、`draft`�
 | アノテーション | 種類 |
 |----------------|------|
 | `destructiveHint: true` | `delete` |
-| `readOnlyHint: true`、サーバーが `trusted_read_hint_servers` にある | `read` |
-| `readOnlyHint: true`、サーバーがない | `modify` |
+| `readOnlyHint: true`、旧設定の信頼指定に関係なく | `modify` |
 | それ以外（アノテーションなしを含む） | `modify` |
 
-アノテーションはサーバーの自己申告で、誰も確認しません。`destructiveHint` はどのサーバーからでも信じます（ツールを厳しくするだけなので）。`readOnlyHint` は管理者が列挙したサーバーだけ信じます。
+アノテーションは未検証の自己申告で、リスクを引き上げる場合だけ採用します。`destructiveHint` は既定の Modify を Delete に引き上げます。`readOnlyHint` と旧 `trusted_read_hint_servers` は読み取り例外を与えません。
 
 ```toml
 [capabilities]
-trusted_read_hint_servers = ["github"]   # .mcp.json のサーバー名
 action_rules = [
   { effect = "modify", verdict = "ask" },
   { tool = "github.delete_repository", verdict = "block" },   # または "mcp__github__delete_repository"
 ]
 ```
 
-既定の代償：悪意あるサーバーは削除を行うツールに `readOnlyHint: true` と付けられます。信じればすべての `read` ルールと読み取り専用レーンを通ってしまいます。信じなければ、列挙されていないサーバーの本当に読み取り専用のツールも変更として扱われます（`modify` が確認・ブロック・非表示になる場所では同様）。サーバーが一覧化する前に呼ばれたツールはアノテーションがないので `modify` です。
+読み取り専用のサードパーティツールも Modify として扱い、Modify の動作ルールと送信リースを適用します。探索レーンでは利用できません。一覧化前の呼び出しも Modify が既定です。
 
 **適用**はプロキシとブリッジで、従業員の `action_rules` に従います（一覧化と呼び出しのたびに読み直し、DuDuClaw のツールと同じ規則。`tool` ルールは `<サーバー>.<ツール>` または `mcp__<サーバー>__<ツール>`、`<サーバー>.*` でそのサーバーの全ツール）。
 
 - `block`：従業員が見る `tools/list` から外し、呼び出しはサーバーに届く前に JSON-RPC エラー `-32003` で返します（監査 `third_party_tool_refused`）。
 - `ask`：呼び出しは ApprovalBroker の判断を待ちます（`mcp_call` カード、5 分）。拒否・期限切れ・承認システムの停止はすべて拒否です（監査 `third_party_tool_approval`）。
-- **読み取り専用レーン**（`DUDUCLAW_LANE=explore`：ハートビートの能動チェックと MCP Events で始まる作業）：種類が `read` のツールだけを一覧化・呼び出しでき、列挙されていないサーバーのツールはすべて隠れます。
+- **読み取り専用レーン**（`DUDUCLAW_LANE=explore`）：サードパーティツールの最低分類は Modify のため、すべて非表示で呼び出しも拒否します。ホスト管理の読み取り例外は未実装です。
 
-`action_rules` キーがなく通常レーンなら何も変わりません。秘匿化が有効なとき、従業員に `action_rules` キーがあるとき、または読み取り専用レーンで起動するとき、`.mcp.json` の stdio サーバーはプロキシを通ります。リモートサーバーは常にブリッジを通ります。
+管理対象の全起動は、秘匿化、`action_rules`、レーンにかかわらず `.mcp.json` の stdio サーバーをプロキシに通します。管理対象のリモートサーバーはブリッジを使います。`[[mcp.external]]` マウントもプロセス内レジストリで `ThirdPartyGate` を適用しますが、utility と探索レーンではマウントしません。
 
 **ダッシュボード**：`MCP → リモートサーバー →「サードパーティのツールと動作の種類」` で、従業員ごとに各サーバーがプロキシまたはブリッジ経由で最後に一覧化したツール（`<home>/mcp_tool_effects/<従業員>/<サーバー>.json`）を、現在の設定で再計算した種類と判断付きで表示します。セッションが DuDuClaw 経由で一覧化した後にだけ表示されます。スナップショットは表示専用で、制御は常にその時点の一覧に従います。
 
-**対象ランタイム**：Claude CLI（`.mcp.json` のサーバーを起動し、spawn は書き換えた設定を渡します）と Codex（`.mcp.json` の各サードパーティ stdio サーバーは、その spawn で必ず `duduclaw mcp-proxy` 経由として登録されます。Codex は渡されたサーバーを自動承認するためです。リモートブリッジの項目は自身で制御するのでそのまま登録されます。proxy が使うサードパーティの認証情報はコマンドラインではなく、その spawn 専用で所有者だけが読める一時ファイルに置かれます）。2026-10-20 以降は Grok、そして openai-compat ランタイム・Direct API の返信・ローカル推論が共有するツールループも対象で、いずれも常に制御付きです。Grok は MCP の登録を永続的なファイルに持つため、項目は `duduclaw mcp-proxy --spawn-scoped …` になります。上流の認証情報はその spawn 専用で所有者だけが読めるディレクトリに置かれ、そのサーバーを登録した spawn 以外（補助呼び出し、CLI の手動実行）で起動された proxy は何も起動しません。Grok は作業ディレクトリの `.mcp.json` も自分で読むため、そこにある名前はすべて `.grok/config.toml` で上書きされます（制御付き、または無効）。以前は Grok がこれらのサーバーを制御なしで起動していました。詳細は `docs/features/ja-JP/13-multi-runtime.md` を参照してください。`.mcp.json` の `url`／`type` 項目（CLI が直接接続）は制御できないため、制御付きの spawn（`action_rules` がある、または読み取り専用レーン）では CLI に渡す設定から取り除かれます（監査 `third_party_remote_entry_dropped`、`duduclaw doctor` も案内します）。リモートサーバーとして接続してください。制御用の `.mcp.json` コピーを作れない場合、その spawn は拒否され（監査 `third_party_gate_config_unavailable`）、制御なしでは起動しません。
+**対象ランタイム**：Claude CLI（`.mcp.json` のサーバーを起動し、spawn は書き換えた設定を渡します）と Codex（`.mcp.json` の各サードパーティ stdio サーバーは、その spawn で必ず `duduclaw mcp-proxy` 経由として登録されます。Codex は渡されたサーバーを自動承認するためです。リモートブリッジの項目は自身で制御するのでそのまま登録されます。proxy が使うサードパーティの認証情報はコマンドラインではなく、その spawn 専用で所有者だけが読める一時ファイルに置かれます）。2026-10-20 以降は Grok、そして openai-compat ランタイム・Direct API の返信・ローカル推論が共有するツールループも対象で、いずれも常に制御付きです。Grok は MCP の登録を永続的なファイルに持つため、項目は `duduclaw mcp-proxy --spawn-scoped …` になります。上流の認証情報はその spawn 専用で所有者だけが読めるディレクトリに置かれ、そのサーバーを登録した spawn 以外（補助呼び出し、CLI の手動実行）で起動された proxy は何も起動しません。Grok は作業ディレクトリの `.mcp.json` も自分で読むため、そこにある名前はすべて `.grok/config.toml` で上書きされます（制御付き、または無効）。以前は Grok がこれらのサーバーを制御なしで起動していました。詳細は `docs/features/ja-JP/13-multi-runtime.md` を参照してください。`.mcp.json` の `url`／`type` 項目（CLI が直接接続）は制御できないため、すべての管理対象の spawn で CLI に渡す設定から取り除かれます（監査 `third_party_remote_entry_dropped`、`duduclaw doctor` も案内します）。リモートサーバーとして接続してください。制御用の `.mcp.json` コピーを作れない場合、その spawn は拒否され（監査 `third_party_gate_config_unavailable`）、制御なしでは起動しません。
+
+管理対象の Claude 起動は、内蔵ツールだけの場合も一時的な厳格 MCP 設定のみを使い、ほかの MCP 読み込み元を追加しません。Grok 起動は、プロジェクトの管理外 MCP エントリーと、実際の `HOME` または `GROK_HOME` にあるグローバル MCP 定義を拒否します。設定を読めない場合も起動しません。Grok が実際に使う設定ルートは絶対パスである必要があります。`HOME` または `GROK_HOME` が相対パスなら修正してから再試行してください。既存ファイルは保持するため、サーバー定義をスタッフの MCP 設定へ移してから再試行してください。単独で起動する CLI とネイティブツールはこの境界の対象外です。
 
 ## 5. リモートサーバーからのイベント（MCP Events）
 
@@ -222,3 +224,5 @@ action_rules = [
 - デスクトップアプリのダッシュボードのオリジン（`tauri://…`）はリダイレクト先として受け付けません。ブラウザからサインインしてください。
 - 従業員は Gateway と同じ OS ユーザーで動きます。制限のない Bash を持つ従業員はキーファイルや記録ファイルを読めたり、自分の `--agent` でブリッジを手動起動したりできます。ブリッジはプロセスの `DUDUCLAW_AGENT_ID` と異なる `--agent` を拒否しますが、本当の隔離は Bash を与えないことです。
 - 進行中のサインインは Gateway のメモリにだけあります。サインイン中に Gateway を再起動した場合はやり直してください。
+
+サードパーティゲート有効時、未知または矛盾する MCP transport 形式は起動を拒否します。分類済み stdio と管理対象のリモートブリッジだけがランタイムに渡されます。

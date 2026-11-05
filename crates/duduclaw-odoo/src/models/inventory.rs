@@ -73,6 +73,76 @@ pub const STOCK_QUANT_FIELDS: &[&str] =
 mod tests {
     use super::*;
     use serde_json::json;
+    #[tokio::test]
+    async fn inventory_domain_uses_cached_field_shape_without_hiding_services() {
+        for metadata in [json!({"id":{}, "name":{}, "is_storable":{}, "type":{}}),
+            json!({"id":{}, "name":{}, "detailed_type":{}, "type":{}})] {
+            let expected = if metadata.get("is_storable").is_some() {
+                json!(["is_storable", "=", true])
+            } else { json!(["detailed_type", "=", "product"]) };
+            let conn = crate::connector::mocked_connector(vec![Ok(metadata), Ok(json!([]))]);
+            assert_eq!(conn.inventory_product_domain("", false).await.unwrap(), Vec::<Value>::new());
+            assert_eq!(conn.inventory_product_domain("課程", false).await.unwrap(),
+                vec![json!(["name", "ilike", "課程"])]);
+            assert_eq!(conn.inventory_product_domain("", true).await.unwrap(), vec![expected]);
+            conn.search_read("product.product", vec![], PRODUCT_FIELDS, 20).await.unwrap();
+            assert_eq!(conn.mocked_requests().len(), 2);
+            assert_eq!(conn.mocked_requests()[0].3["attributes"], json!(["type"]));
+        }
+        let conn = crate::connector::mocked_connector(vec![Ok(json!({"type":{}}))]);
+        assert!(conn.inventory_product_domain("", true).await.unwrap_err().contains("儲存"));
+        assert!(conn.inventory_product_domain("課程", false).await.is_err());
+        assert_eq!(conn.mocked_requests().len(), 1);
+        let conn = crate::connector::mocked_connector(vec![Err("metadata denied".into())]);
+        assert!(conn.inventory_product_domain("", false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn inventory_check_returns_product_totals_and_safe_quant_error() {
+        for quant_result in [Ok(json!([])), Err("AccessError: /private/server password=secret".into())] {
+            let conn = crate::connector::mocked_connector(vec![
+                Ok(json!({"id":{}, "name":{}, "qty_available":{}, "virtual_available":{}})),
+                Ok(json!([{"id":7,"name":"課程","qty_available":0.0,"virtual_available":0.0}])),
+                Ok(json!({"product_id":{}, "quantity":{}})), quant_result.clone(),
+            ]);
+            let result = conn.inventory_check(7).await;
+            if quant_result.is_ok() {
+                let result = result.unwrap();
+                assert_eq!(result["name"], "課程");
+                assert_eq!(result["qty_available"], 0.0);
+                assert_eq!(result["virtual_available"], 0.0);
+                assert_eq!(result["quants"], json!([]));
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("權限"));
+                assert!(!error.contains("secret"));
+            }
+        }
+        let conn = crate::connector::mocked_connector(vec![Ok(json!({"id":{}, "name":{}})), Ok(json!([]))]);
+        assert!(conn.inventory_check(7).await.unwrap_err().contains("找不到"));
+        assert_eq!(conn.mocked_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn inventory_totals_are_not_computed_from_location_sample() {
+        let conn = crate::connector::mocked_connector(vec![
+            Ok(json!({"id":{}, "name":{}, "qty_available":{}, "virtual_available":{}})),
+            Ok(json!([{"id":7,"name":"商品","qty_available":123.0,"virtual_available":140.0}])),
+            Ok(json!({"product_id":{}, "quantity":{}})),
+            Ok(json!([{"product_id":[7,"商品"],"quantity":2.0}])),
+        ]);
+        let result = conn.inventory_check(7).await.unwrap();
+        assert_eq!(result["qty_available"], 123.0);
+        assert_eq!(result["virtual_available"], 140.0);
+        assert_eq!(result["quants"][0]["quantity"], 2.0);
+        assert_eq!(conn.mocked_requests()[3].3["limit"], 10);
+        let conn = crate::connector::mocked_connector(vec![
+            Ok(json!({"id":{}, "name":{}})), Ok(json!([{"id":7,"name":"課程"}])),
+            Err("stock.quant missing".into()),
+        ]);
+        assert!(conn.inventory_check(7).await.unwrap_err().contains("權限"));
+    }
+
     #[test]
     fn product_type_accepts_new_type_and_preserves_existing_detailed_type() {
         for product_type in ["service", "combo", "consu"] {

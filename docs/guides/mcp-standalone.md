@@ -44,8 +44,12 @@ It prints a block to paste into `~/.codex/config.toml`:
 [mcp_servers.duduclaw]
 command = "npx"
 args = ["-y", "duduclaw@<version>", "mcp-server"]
-env = { DUDUCLAW_MCP_API_KEY = "ddc_refresh_prod_…" }
+env = { DUDUCLAW_MCP_API_KEY = "ddc_refresh_prod_…", DUDUCLAW_AGENT_ID = "standalone-codex", DUDUCLAW_AGENT_TOKEN = "<generated identity token>" }
 ```
+
+The signed identity belongs only to this standalone client; employee and remote-bridge authentication still reject it.
+
+Copy the complete generated environment: strict MCP startup requires both the API key and the host-signed identity. Existing clients must rerun `mcp init` after upgrading; do not disable identity enforcement.
 
 `<version>` is the version that ran `mcp init` (what `duduclaw --version`
 prints): the snippet pins it, so the server the client starts is

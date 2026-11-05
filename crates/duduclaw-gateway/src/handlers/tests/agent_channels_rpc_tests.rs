@@ -359,3 +359,42 @@ async fn admin_binds_a_chat_app_per_employee_and_duplicates_are_refused() {
         .await);
     assert!(!agent_toml(home.path(), "a1").contains("[channels.googlechat]"));
 }
+
+#[tokio::test]
+async fn googlechat_pubsub_subscription_only_change_reverifies_topic_before_save() {
+    use crate::agent_channels::e2e_gchat_tests as google;
+    let (home, h) = setup().await;
+    let fake = google::start_fake().await;
+    let email = format!("subscription-rpc-{}@test-project.iam.gserviceaccount.com", uuid::Uuid::new_v4().simple());
+    let mut key: Value = serde_json::from_str(&google::service_account(&fake, &email)).unwrap();
+    key["project_id"] = json!("test-project");
+    let before = agent_toml(home.path(), "a1");
+    google::set_subscription_exactly_once(&fake, Some(json!(true)));
+    let refused = err(&h.handle("agents.channels.googlechat.set", json!({
+        "agent_id":"a1", "project_number":"444444444", "service_account_json":key.to_string(),
+        "connection":"pubsub", "pubsub_subscription":"projects/test-project/subscriptions/chat-events"
+    }), &admin()).await);
+    assert!(refused.contains("exactly-once"), "{refused}");
+    assert_eq!(agent_toml(home.path(), "a1"), before);
+    google::set_subscription_exactly_once(&fake, Some(json!(false)));
+    ok(&h.handle("agents.channels.googlechat.set", json!({
+        "agent_id":"a1", "project_number":"444444444", "service_account_json":key.to_string(),
+        "connection":"pubsub", "pubsub_subscription":"projects/test-project/subscriptions/chat-events"
+    }), &admin()).await);
+    let stored = agent_toml(home.path(), "a1");
+    google::set_subscription_exactly_once(&fake, Some(json!(true)));
+    let refused = err(&h.handle("agents.channels.googlechat.set", json!({
+        "agent_id":"a1", "project_number":"444444444",
+        "pubsub_subscription":"projects/test-project/subscriptions/other-events"
+    }), &admin()).await);
+    assert!(refused.contains("exactly-once"), "{refused}");
+    assert_eq!(agent_toml(home.path(), "a1"), stored);
+    google::set_subscription_exactly_once(&fake, None);
+    google::set_subscription_topic(&fake, "projects/test-project/topics/untrusted");
+    let refused = err(&h.handle("agents.channels.googlechat.set", json!({
+        "agent_id":"a1", "project_number":"444444444",
+        "pubsub_subscription":"projects/test-project/subscriptions/other-events"
+    }), &admin()).await);
+    assert!(refused.contains("主題不符"), "{refused}");
+    assert_eq!(agent_toml(home.path(), "a1"), stored);
+}

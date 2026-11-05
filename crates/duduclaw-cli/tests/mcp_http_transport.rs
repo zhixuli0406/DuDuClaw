@@ -1019,3 +1019,56 @@ async fn mcp_oauth_discovery_documents_are_public_and_complete() {
         assert!(j.get(key).is_some(), "{key} missing from metadata: {j}");
     }
 }
+
+#[tokio::test]
+async fn oauth_metadata_and_challenge_ignore_host_and_forwarded_proto() {
+    let home = TempDir::new().unwrap();
+    for public in [None, Some("https://canonical.example".to_owned())] {
+        let mut cfg = make_cfg(home.path());
+        cfg.bind = "127.0.0.1:8765".parse().unwrap();
+        cfg.public_origin = public.clone();
+        let router = build_router(&cfg, make_dispatcher(home.path()));
+        let origin = public.as_deref().unwrap_or("http://127.0.0.1:8765");
+        for endpoint in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server"] {
+            let response = router.clone().oneshot(Request::builder().uri(endpoint)
+                .header("host", "attacker.example").header("x-forwarded-proto", "http")
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if endpoint.ends_with("protected-resource") {
+                assert_eq!(value["resource"], format!("{origin}/mcp"));
+            } else {
+                assert_eq!(value["issuer"], origin);
+                assert_eq!(value["token_endpoint"], format!("{origin}/oauth/token"));
+                assert_eq!(value["revocation_endpoint"], format!("{origin}/oauth/revoke"));
+            }
+        }
+        let response = router.clone().oneshot(Request::builder().method("POST").uri("/mcp")
+            .header("host", "attacker.example").header("x-forwarded-proto", "https")
+            .header("content-type", "application/json").body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["www-authenticate"], format!("Bearer resource_metadata=\"{origin}/.well-known/oauth-protected-resource\""));
+    }
+}
+
+#[tokio::test]
+async fn oauth_authorize_and_token_reject_foreign_resource_including_duplicates() {
+    let home = TempDir::new().unwrap();
+    let mut cfg = make_cfg(home.path());
+    cfg.public_origin = Some("https://canonical.example".into());
+    let router = build_router(&cfg, make_dispatcher(home.path()));
+    for params in ["resource=https%3A%2F%2Fattacker.example%2Fmcp", "resource=https%3A%2F%2Fattacker.example%2Fmcp&resource=https%3A%2F%2Fcanonical.example%2Fmcp"] {
+        for method in ["GET", "POST"] {
+            let (uri, body) = if method == "GET" {
+                (format!("/oauth/authorize?{params}"), Body::empty())
+            } else { ("/oauth/token".into(), Body::from(params)) };
+            let response = router.clone().oneshot(Request::builder().method(method).uri(uri)
+                .header("content-type", "application/x-www-form-urlencoded").body(body).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"], "invalid_target");
+        }
+    }
+}

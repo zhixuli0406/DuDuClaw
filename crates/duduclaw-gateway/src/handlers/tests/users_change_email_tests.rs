@@ -32,7 +32,7 @@ async fn fixture(auto_login_off: bool) -> Fixture {
     let jwt = Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"));
     handler.set_user_db(db.clone(), jwt).await;
     let ctx = UserContext {
-        credential_epoch: 0,
+        credential_epoch: owner.credential_epoch,
         user_id: owner.id.clone(),
         email: owner.email.clone(),
         role: UserRole::Admin,
@@ -75,7 +75,7 @@ fn error_text(frame: &WsFrame) -> String {
 /// email without a password, which they never chose.
 #[tokio::test]
 async fn personal_auto_login_owner_sets_email_without_password() {
-    let f = fixture(false).await;
+    let mut f = fixture(false).await;
     let me = ok_payload(&f.handler.handle("users.me", json!({}), &f.owner).await);
     assert_eq!(me["email_setup"]["placeholder"], json!(true));
     assert_eq!(me["email_setup"]["password_required"], json!(false));
@@ -94,6 +94,9 @@ async fn personal_auto_login_owner_sets_email_without_password() {
         "owner@example.com"
     );
 
+    assert!(matches!(f.handler.handle("users.me", json!({}), &f.owner).await,
+        WsFrame::Response { ok: false, .. }));
+    f.owner = f.db.live_user_context(&f.owner.user_id).unwrap().unwrap();
     let me = ok_payload(&f.handler.handle("users.me", json!({}), &f.owner).await);
     assert_eq!(me["email_setup"]["placeholder"], json!(false));
 }
@@ -269,10 +272,20 @@ async fn primary_agent_is_self_only_and_uses_live_bindings() {
     f.db.bind_agent(&other.id, "other-only", duduclaw_auth::AccessLevel::Owner).unwrap();
     let refused = f.handler.handle("users.set_primary_agent", json!({"agent_id": "other-only", "user_id": other.id}), &f.owner).await;
     assert!(matches!(refused, WsFrame::Response { ok: false, .. }));
+    let refused = f.handler.handle("users.set_primary_agent", json!({"agent_id": "chosen"}), &f.owner).await;
+    assert!(matches!(refused, WsFrame::Response { ok: false, .. }));
+    assert_eq!(f.db.primary_agent(&f.owner.user_id).unwrap(), None);
+    // The existing context must use the upgraded live binding, not a JWT snapshot.
+    f.db.bind_agent(&f.owner.user_id, "chosen", duduclaw_auth::AccessLevel::Operator).unwrap();
     ok_payload(&f.handler.handle("users.set_primary_agent", json!({"agent_id": "chosen", "user_id": other.id}), &f.owner).await);
     assert_eq!(f.db.primary_agent(&other.id).unwrap(), None);
     let me = ok_payload(&f.handler.handle("users.me", json!({}), &f.owner).await);
     assert_eq!(me["user"]["primary_agent_id"], "chosen");
+    f.db.bind_agent(&f.owner.user_id, "chosen", duduclaw_auth::AccessLevel::Viewer).unwrap();
+    let me = ok_payload(&f.handler.handle("users.me", json!({}), &f.owner).await);
+    assert_eq!(me["user"]["primary_agent_id"], "first");
+    let refused = f.handler.handle("users.set_primary_agent", json!({"agent_id": "chosen"}), &f.owner).await;
+    assert!(matches!(refused, WsFrame::Response { ok: false, .. }));
     f.db.unbind_agent(&f.owner.user_id, "chosen").unwrap();
     let me = ok_payload(&f.handler.handle("users.me", json!({}), &f.owner).await);
     assert_eq!(me["user"]["primary_agent_id"], "first");

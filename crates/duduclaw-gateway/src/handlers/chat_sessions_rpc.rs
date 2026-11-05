@@ -75,8 +75,32 @@ impl MethodHandler {
         }
     }
 
+    /// Shared conversation read gate for history JSON and attachment bytes.
+    async fn history_session_access(&self, ctx: &UserContext, requested: &str) -> Result<(UserContext, String, String, Mode, Class), String> {
+        let live = self.bound_history_live(ctx)?;
+        let id = handles::resolve(&self.home_dir, &live.user_id, requested).await?;
+        let rc = self.reply_ctx.read().await.clone().ok_or("session store unavailable")?;
+        let owner = rc.session_manager.session_agent(&id).await
+            .map_err(|_| "session not found")?.ok_or("session not found")?;
+        let mode = privacy::mode(&self.home_dir, &live, &owner)?;
+        let class = if mode == Mode::Filtered {
+            let home = self.home_dir.clone();
+            let user = live.user_id.clone();
+            let raw = id.clone();
+            let permit = read::permit()?;
+            let metadata = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                read::metadata(&read::open(&home)?, &user, &raw)
+            }).await.map_err(|_| "session not found")??.ok_or("session not found")?;
+            if metadata.agent != owner || metadata.class == Class::Hidden { return Err("session not found".into()); }
+            metadata.class
+        } else { Class::Own };
+        self.bound_history_recheck(&live, &owner, mode)?;
+        Ok((live, id, owner, mode, class))
+    }
+
     pub(crate) async fn handle_chat_sessions_history(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        let mut session_id = params
+        let session_id = params
             .get("session_id")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -91,76 +115,132 @@ impl MethodHandler {
             .unwrap_or(CHAT_HISTORY_DEFAULT_LIMIT as u64)
             .min(CHAT_HISTORY_MAX_LIMIT as u64) as usize;
 
-        let rc = match self.reply_ctx.read().await.clone() {
-            Some(c) => c,
-            None => return WsFrame::error_response("", "session store unavailable"),
-        };
+        if self.reply_ctx.read().await.is_none() { return WsFrame::error_response("", "session store unavailable"); }
 
-        let live = match self.bound_history_live(ctx) { Ok(c) => c, Err(e) => return WsFrame::error_response("",&e) };
-        session_id = match handles::resolve(&self.home_dir,&live.user_id,&session_id).await {
-            Ok(s) => s, Err(_) => return WsFrame::error_response("","session not found"),
+        let (live, session_id, owner, initial, class) = match self.history_session_access(ctx, &session_id).await {
+            Ok(access) => access, Err(e) => return WsFrame::error_response("", &e),
         };
-        // Resolve the owning agent; fail closed on an unknown id (never expose
-        // an empty transcript for a session that does not exist).
-        let owner = match rc.session_manager.session_agent(&session_id).await {
-            Ok(Some(a)) => a,
-            Ok(None) => return WsFrame::error_response("", "session not found"),
-            Err(e) => return WsFrame::error_response("", &format!("resolve session: {e}")),
-        };
-        let initial = match privacy::mode(&self.home_dir,&live,&owner) {
-            Ok(m) => m, Err(_) => return WsFrame::error_response("","session not found"),
-        };
-        if initial == Mode::Filtered {
-            let home=self.home_dir.clone(); let user=live.user_id.clone(); let id=session_id.clone();
-            let permit=match read::permit() { Ok(p)=>p,Err(e)=>return WsFrame::error_response("",&e) };
-            let metadata=tokio::task::spawn_blocking(move || {let _permit=permit;read::metadata(&read::open(&home)?,&user,&id)}).await;
-            let class=match metadata { Ok(Ok(Some(m))) => m.class, _ => return WsFrame::error_response("","session not found") };
-            match class {
-                Class::Hidden => return WsFrame::error_response("","session not found"),
-                Class::External {channel} => return match self.bound_external_history(&live,&session_id,&owner,&channel,limit).await {
-                    Ok(value) => WsFrame::ok_response("",value), Err(e) => WsFrame::error_response("",&e),
-                },
-                Class::Own => {},
-            }
+        if let Class::External { channel } = class {
+            return match self.bound_external_history(&live, &session_id, &owner, &channel, limit).await {
+                Ok(value) => WsFrame::ok_response("", value), Err(e) => WsFrame::error_response("", &e),
+            };
         }
 
-        // Fetch ids and display-only notices in one consistent read.
-        match rc.session_manager.webchat_history(&session_id).await {
-            Ok(msgs) => {
-                if let Err(e)=self.bound_history_recheck(&live,&owner,initial) { return WsFrame::error_response("",&e); }
-                // F9: `webchat_history` returns oldest→newest. Show the NEWEST
-                // `limit` turns (where the user left off), not the oldest — on a
-                // long resumed conversation the oldest window is stale scrollback.
-                // Skip to the tail while preserving chronological order.
-                let start = msgs.len().saturating_sub(limit);
-                let messages: Vec<Value> = msgs
-                    .iter()
-                    .skip(start)
-                    .map(|entry| {
-                        let m = &entry.message;
-                        let (content, artifact) =
-                            chat_history_row_content_and_artifact(&m.role, &m.content);
-                        let mut row = json!({
-                            "role": m.role,
-                            "content": content,
-                            "timestamp": m.timestamp,
-                            "tokens": m.tokens,
-                        });
-                        if let Some(a) = artifact {
-                            row["artifact"] = a;
+        let admission = match crate::chat_attachments::limits::history(&self.home_dir, &live.user_id) {
+            Ok(p) => std::sync::Arc::new(p), Err(e) => return WsFrame::error_response("", &e),
+        };
+        let home = self.home_dir.clone();
+        let user = live.user_id.clone();
+        let session = session_id.clone();
+        let agent = owner.clone();
+        let worker_admission = admission.clone();
+        let projected = tokio::task::spawn_blocking(move || {
+            let _admission = worker_admission;
+            let index = crate::artifacts::HistoryIndex::load(&home, Some(&agent));
+            let rows = crate::chat_attachments::history_rows(&home, &session, limit)?;
+            let mut references_left = crate::chat_attachments::limits::MAX_REFERENCES;
+            let mut attachments_left = crate::chat_attachments::limits::MAX_ATTACHMENTS;
+            let projected: Vec<_> = rows.into_iter().map(|entry| {
+                let (body, attachments) = crate::chat_attachments::project_indexed(
+                    &home, &user, &session, &agent, entry.id, &entry.message.content,
+                    &index, &mut references_left, &mut attachments_left,
+                );
+                (entry, body, attachments)
+            }).collect();
+            Ok::<_, String>((index, projected))
+        }).await.map_err(|_| "history unavailable".to_owned()).and_then(|r| r);
+        match projected {
+            Ok((index, projected)) => {
+                let store = match self.workflow_store().await {
+                    Ok(s) => s, Err(e) => return WsFrame::error_response("", &e),
+                };
+                let mut messages = Vec::new();
+                for (entry, body, candidates) in projected {
+                    let m = &entry.message;
+                    let mut attachments = Vec::new();
+                    for attachment in candidates {
+                        if crate::review_evidence::download::authorize_artifact_access_indexed(
+                            &self.home_dir, &store, &live, Some(&owner), &attachment.filename, &index,
+                        ).await.is_ok() {
+                            attachments.push(attachment);
                         }
-                        row["id"] = json!(entry.id);
-                        if let Some(kind) = &entry.notice_kind {
-                            row["notice_kind"] = json!(kind);
-                        }
-                        row
-                    })
-                    .collect();
+                    }
+                    let (content, artifact) = chat_history_row_content_and_artifact(&m.role, &body);
+                    let mut row = json!({
+                        "role": m.role, "content": content, "timestamp": m.timestamp,
+                        "tokens": m.tokens, "attachments": attachments, "id": entry.id,
+                    });
+                    if let Some(a) = artifact { row["artifact"] = a; }
+                    if let Some(id) = &entry.client_msg_id { row["client_msg_id"] = json!(id); }
+                    if let Some(kind) = &entry.notice_kind { row["notice_kind"] = json!(kind); }
+                    messages.push(row);
+                }
+                if let Err(e) = self.bound_history_recheck(&live, &owner, initial) {
+                    return WsFrame::error_response("", &e);
+                }
                 let mut response=json!({"session_id":session_id,"agent_id":owner,"messages":messages});
                 if initial==Mode::Filtered {response["privacy_mode"]=json!("own");response["channel"]=json!("webchat");}
                 WsFrame::ok_response("",response)
             }
             Err(e) => WsFrame::error_response("", &format!("session history: {e}")),
         }
+    }
+    /// Membership is checked independently of cached routing data. No handles
+    /// are issued here and no per-reference ledger scans are performed.
+    async fn history_contains_attachment(&self, ctx: &UserContext, reference: &crate::chat_attachments::Reference, index: std::sync::Arc<crate::artifacts::HistoryIndex>) -> Result<(), String> {
+        let (live, session, agent, mode, class) = self.history_session_access(ctx, &reference.session).await?;
+        if matches!(class, Class::External { .. } | Class::Hidden) || agent != reference.agent { return Err("attachment unavailable".into()); }
+        let home = self.home_dir.clone();
+        let message = reference.message;
+        let path = reference.path.clone();
+        let worker_agent = agent.clone();
+        let permit = read::permit()?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let conn = read::open(&home)?;
+            let raw: String = conn.query_row(
+                "SELECT content FROM session_messages WHERE id=?1 AND session_id=?2 AND hidden=0 AND undone_at IS NULL AND role IN ('user','assistant') AND length(CAST(content AS BLOB))<=1048576",
+                rusqlite::params![message, session], |r| r.get(0),
+            ).map_err(|_| "attachment unavailable")?;
+            let (_, refs) = crate::chat_attachments::parse(&raw);
+            if !refs.into_iter().any(|(_, raw)| crate::chat_attachments::archived_path_indexed(&home, &worker_agent, &raw, &index).as_deref() == Some(path.as_str())) {
+                return Err("attachment unavailable".to_owned());
+            }
+            Ok(())
+        }).await.map_err(|_| "attachment unavailable")??;
+        self.bound_history_recheck(&live, &agent, mode)
+    }
+
+    pub(crate) async fn history_attachment_bytes(&self, ctx: &UserContext, id: &str, max: u64) -> Result<(Vec<u8>, String, std::sync::Arc<crate::chat_attachments::limits::Permit>), String> {
+        let live = self.bound_history_live(ctx)?;
+        let admission = std::sync::Arc::new(crate::chat_attachments::limits::download(&self.home_dir, &live.user_id, max)?);
+        let raw = handles::resolve_attachment(&self.home_dir, &live.user_id, id).await?;
+        let reference: crate::chat_attachments::Reference = serde_json::from_str(&raw).map_err(|_| "attachment unavailable")?;
+        // Check conversation authority before any attachment disk I/O.
+        let (_, _, agent, _, class) = self.history_session_access(&live, &reference.session).await?;
+        if agent != reference.agent || matches!(class, Class::External { .. } | Class::Hidden) { return Err("attachment unavailable".into()); }
+        let home = self.home_dir.clone();
+        let path = reference.path.clone();
+        let worker_admission = admission.clone();
+        let (index, bytes, hash, filename) = tokio::task::spawn_blocking(move || {
+            let _admission = worker_admission;
+            let index = std::sync::Arc::new(crate::artifacts::HistoryIndex::load(&home, Some(&agent)));
+            let (file, filename) = crate::chat_attachments::open(&home, &agent, &path)?;
+            let (bytes, hash) = crate::chat_attachments::snapshot(file, max)?;
+            Ok::<_, String>((index, bytes, hash, filename))
+        }).await.map_err(|_| "attachment unavailable")??;
+        self.history_contains_attachment(&live, &reference, index.clone()).await?;
+        let store = self.workflow_store().await?;
+        crate::review_evidence::download::authorize_artifact_access_snapshot(
+            &self.home_dir, &store, &live, Some(&reference.agent), &filename, &hash, bytes.len() as u64, &index,
+        ).await?;
+        self.history_contains_attachment(&live, &reference, index).await?;
+        Ok((bytes, filename, admission))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_history_attachment(&self, ctx: &UserContext, id: &str) -> Result<(std::io::Cursor<Vec<u8>>, String), String> {
+        let (bytes, name, _permit) = self.history_attachment_bytes(ctx, id, crate::chat_attachments::limits::MAX_DOWNLOAD).await?;
+        Ok((std::io::Cursor::new(bytes), name))
     }
 }

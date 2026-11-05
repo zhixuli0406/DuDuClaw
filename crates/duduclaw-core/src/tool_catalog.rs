@@ -633,6 +633,8 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "google",
     ),
     ("gmail_search", "Search Gmail", "google:read", "google"),
+    ("google_chat_spaces", "List Google Chat spaces", "google:read", "google"),
+    ("google_chat_messages", "Read Google Chat messages", "google:read", "google"),
     (
         "gmail_read",
         "Read a Gmail message",

@@ -3,6 +3,8 @@
 //! [B-1a] Parses SKILL.md frontmatter (name, description, trigger, tools)
 //! and converts to DuDuClaw's internal `SkillFile` format.
 
+pub mod safe_dir;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -464,6 +466,35 @@ pub async fn install_skill_department(
     install_skill(skill_path, &dept_skills_dir, quarantine_dir).await
 }
 
+/// Department prompt access requires an authoritative entry and a matching
+/// display mirror. An unavailable authority never falls back to self-assertion.
+pub fn authoritative_department(home: &Path, agent: &str) -> Option<String> {
+    use std::io::Read;
+    if !duduclaw_core::is_valid_agent_id(agent) { return None; }
+    let read = |path: &Path| -> Option<toml::Value> {
+        let dir = safe_dir::SafeDir::open(path.parent()?).ok()?;
+        let file = dir.read_file(path.file_name()?.to_str()?).ok()?;
+        if file.metadata().ok()?.len() > 1024 * 1024 { return None; }
+        let mut content = String::new();
+        file.take(1024 * 1024 + 1).read_to_string(&mut content).ok()?;
+        if content.len() > 1024 * 1024 { return None; }
+        content.parse().ok()
+    };
+    let authority = read(&home.join("org.toml"))?;
+    if let Some(schema) = authority.get("schema") {
+        if schema.as_integer()? != 1 { return None; }
+    }
+    let dept = authority.get("agents")?.get(agent)?.get("department")?.as_str()?.trim();
+    if dept.is_empty() || !duduclaw_core::is_valid_department(dept) { return None; }
+    let agent_dir = home.join("agents").join(agent);
+    let mirror = read(&agent_dir.join("agent.toml"))?;
+    if mirror.get("agent")?.get("department")?.as_str()?.trim() != dept {
+        tracing::warn!(agent, "department skill layer refused: org.toml mirror drift");
+        return None;
+    }
+    Some(dept.to_string())
+}
+
 /// Path to a department's shared skill directory. `department` MUST already be
 /// validated via [`duduclaw_core::is_valid_department`].
 pub fn department_skills_dir(home_dir: &Path, department: &str) -> std::path::PathBuf {
@@ -645,5 +676,39 @@ mod install_safety_tests {
         assert!(department_skills_dir(&home, "art").join("art-brief.md").is_file());
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod authority_security_tests {
+    use super::*;
+    #[test]
+    fn department_requires_authority_and_matching_mirror() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join("agents/alice")).unwrap();
+        let mirror = home.join("agents/alice/agent.toml");
+        std::fs::write(&mirror, "[agent]\ndepartment = 'sales'\n").unwrap();
+        assert_eq!(authoritative_department(&home, "alice"), None);
+        std::fs::write(home.join("org.toml"), "schema = 1\n[agents.alice]\ndepartment = 'sales'\n").unwrap();
+        assert_eq!(authoritative_department(&home, "alice"), Some("sales".into()));
+        std::fs::write(&mirror, "[agent]\ndepartment = 'finance'\n").unwrap();
+        assert_eq!(authoritative_department(&home, "alice"), None);
+        std::fs::remove_file(&mirror).unwrap();
+        assert_eq!(authoritative_department(&home, "alice"), None);
+        std::fs::write(&mirror, "[agent]\ndepartment = 'sales'\n").unwrap();
+        std::fs::write(home.join("org.toml"), "broken TOML").unwrap();
+        assert_eq!(authoritative_department(&home, "alice"), None);
+    }
+
+    #[test]
+    fn department_refuses_symlinked_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join("agents/alice")).unwrap();
+        std::fs::write(home.join("agents/alice/agent.toml"), "[agent]\ndepartment = 'sales'\n").unwrap();
+        std::fs::write(home.join("authority"), "[agents.alice]\ndepartment = 'sales'\n").unwrap();
+        std::os::unix::fs::symlink("authority", home.join("org.toml")).unwrap();
+        assert_eq!(authoritative_department(&home, "alice"), None);
     }
 }

@@ -41,7 +41,9 @@
 //! written or an env directory that cannot be created refuses the spawn
 //! (before, a failed write only warned; now a missing shadow would hand Grok
 //! an ungated server). With no third-party server listed anywhere the spawn
-//! is exactly the old one.
+//! needs no third-party rewrite, but still checks project/global sources.
+//! Unmanaged project entries and any global MCP entries refuse a managed
+//! spawn; the operator moves them into the employee's MCP configuration.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -102,7 +104,13 @@ pub(crate) async fn prepare(
     // git root (`sources`).
     let mut other: Vec<(PathBuf, Vec<String>, Vec<String>)> = Vec::new();
     let mut any_third_party = false;
+    let self_exe = duduclaw_core::resolve_duduclaw_bin();
     for dir in &targets {
+        refuse_unmanaged(dir, &self_exe).map_err(|e| refuse(&e))?;
+        // Existing project registrations must be canonicalized too, including
+        // a borrowed root's purported built-in slot.
+        any_third_party |= !sources::toml_server_names(&dir.join(".grok/config.toml"))
+            .map_err(|_| refuse("無法確認 Grok 專案 MCP 設定"))?.is_empty();
         let own_names = crate::redaction_proxy::mcp_json_server_names(
             home_dir,
             &dir.join(".mcp.json"),
@@ -116,9 +124,6 @@ pub(crate) async fn prepare(
         other.push((dir.clone(), own_names, names));
     }
     if !any_third_party {
-        for dir in &targets {
-            warn_unmanaged(dir, agent_id, &duduclaw_core::resolve_duduclaw_bin());
-        }
         return Ok(Prepared::default());
     }
 
@@ -172,22 +177,47 @@ pub(crate) async fn prepare(
     })
 }
 
-/// Warn (every spawn) about each `.grok/config.toml` entry in `dir` that is
-/// neither `duduclaw` nor written by DuDuClaw: Grok starts it as written,
-/// without `duduclaw mcp-proxy`. Read-only; an unreadable or malformed file
-/// is skipped here (the managed path refuses it when it has to write).
-fn warn_unmanaged(dir: &Path, agent_id: &str, self_exe: &Path) {
-    let Ok(raw) = std::fs::read_to_string(dir.join(".grok").join("config.toml")) else {
-        return;
+/// Refuse a project source that would start an operator-written MCP server
+/// outside the gate. Never rewrite or print its credentials.
+fn refuse_unmanaged(dir: &Path, self_exe: &Path) -> Result<(), String> {
+    let path = dir.join(".grok/config.toml");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("無法確認 Grok 專案 MCP 設定，請管理者檢查設定。".into()),
     };
-    let Ok(doc) = toml::from_str::<toml::Value>(&raw) else {
-        return;
-    };
-    if let Some(map) = doc.get("mcp_servers").and_then(|m| m.as_table()) {
-        for name in unmanaged_names(map, self_exe) {
-            log_unmanaged(agent_id, &name);
+    let doc: toml::Value = toml::from_str(&raw)
+        .map_err(|_| "無法解析 Grok 專案 MCP 設定，請管理者檢查設定。".to_string())?;
+    if let Some(value) = doc.get("mcp_servers") {
+        let map = value.as_table().ok_or_else(|| "Grok MCP 設定格式錯誤。".to_string())?;
+        if !unmanaged_names(map, self_exe).is_empty() {
+            return Err("Grok 專案含未受代理保護的 MCP 伺服器；請管理者移至員工 MCP 設定，或移除該項後再試。".into());
         }
     }
+    Ok(())
+}
+
+/// User-level Grok MCP sources cannot be disabled by the project overlay.
+/// Reject them before either ordinary or PTY spawn; compatibility sources
+/// remain disabled by COMPAT_MCP_SOURCES_OFF. Tests supply isolated homes.
+pub(super) fn refuse_global_sources(user_home: &Path, grok_home: Option<&str>) -> Result<(), String> {
+    let root = grok_home.map(str::trim).filter(|s| !s.is_empty())
+        .map(PathBuf::from).unwrap_or_else(|| user_home.join(".grok"));
+    if !root.is_absolute() {
+        return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+            "Grok 設定目錄必須使用絕對路徑，這次不啟動；請管理者修正設定。",
+        ));
+    }
+    let names = sources::toml_server_names(&root.join("config.toml"))
+        .map_err(|_| duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+            "無法確認 Grok 全域 MCP 設定，這次不啟動；請管理者檢查設定。",
+        ))?;
+    if !names.is_empty() {
+        return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+            "Grok 全域設定含未受代理保護的 MCP 伺服器，這次不啟動；請管理者改用員工 MCP 設定。",
+        ));
+    }
+    Ok(())
 }
 
 fn unmanaged_names(map: &toml::map::Map<String, toml::Value>, self_exe: &Path) -> Vec<String> {
@@ -202,8 +232,7 @@ fn log_unmanaged(agent_id: &str, server: &str) {
         runtime = "grok",
         agent = %agent_id,
         server = %server,
-        "grok .grok/config.toml holds an MCP server DuDuClaw did not write — Grok starts it as \
-         written, without duduclaw mcp-proxy (no third-party tool gate)"
+        "Grok config contains an unmanaged MCP server; managed spawns refuse it"
     );
 }
 
@@ -335,10 +364,8 @@ pub(crate) fn merge_servers(
             changed = true;
         }
     }
-    // Any entry DuDuClaw did not write (an operator's own, same name as a
-    // `.mcp.json` server or not) outranks `.mcp.json` and is started by Grok
-    // as written, unproxied. It is the operator's file, so it is kept, but
-    // said out loud on every spawn.
+    // Production admission refuses these entries before this pure merge;
+    // keep diagnostics for direct callers without overwriting operator data.
     for name in unmanaged_names(map, desired.self_exe) {
         log_unmanaged(desired.agent_id, &name);
     }
@@ -387,6 +414,9 @@ pub(crate) fn write_config(dir: &Path, home_dir: &Path, desired: &Desired) -> Re
         let map = mcp
             .as_table_mut()
             .expect("mcp_servers normalized to a table above");
+        if !unmanaged_names(map, desired.self_exe).is_empty() {
+            return Err(std::io::Error::other("Grok MCP config contains an unproxied server; move it to the employee MCP configuration"));
+        }
         if !merge_servers(map, desired) {
             restrict(dir);
             return Ok(false);

@@ -243,15 +243,8 @@ pub(crate) async fn handle_create_agent(
         });
     }
     let _ = std::fs::create_dir_all(agent_dir.join("SKILLS"));
-    // RFC-26 P6.3: seed the deep-agents default skill set (code-review / refactor
-    // / test-writer / git-workflow). Idempotent; never overwrites operator edits.
-    match duduclaw_agent::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS")) {
-        Ok(written) if !written.is_empty() => {
-            info!(agent = name, skills = ?written, "seeded built-in skills");
-        }
-        Ok(_) => {}
-        Err(e) => warn!("failed to seed built-in skills for {name}: {e}"),
-    }
+    // Shared defaults are installed once; employee SKILLS stays personal.
+    duduclaw_gateway::builtin_skills_seed_migration::run(home_dir);
 
     if let Err(e) = std::fs::write(agent_dir.join("agent.toml"), &agent_toml) {
         return serde_json::json!({

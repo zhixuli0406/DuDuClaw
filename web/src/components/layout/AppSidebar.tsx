@@ -36,8 +36,7 @@ import { hasMinRole } from '@/lib/roles';
 import { filterVisible } from '@/lib/nav-visibility';
 import { useForksExist } from '@/hooks/useForksExist';
 import { useIsAppliance } from '@/hooks/useIsAppliance';
-import { useEffectiveName } from '@/lib/product-identity';
-import { ProductLogo } from '@/components/brand/ProductLogo';
+import { CompanyLogo, useCompanyName } from '@/components/brand/CompanyLogo';
 import {
   SidebarHeader,
   SidebarContent,
@@ -334,7 +333,7 @@ function StaffZone({
                   <span className="min-w-0 flex-1 truncate">{a.display_name}{a.readOnly && <span className="block text-[10px] text-muted-foreground">{intl.formatMessage({ id: 'agents.teamMember' }, { name: a.teamMember })}</span>}</span>
                   {employee && a.name === primaryAgent && <span className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'sidebar.primaryAgent' })}</span>}
                 </NavLink>
-                {employee && <DropdownMenu>
+                {employee && bindings.some(binding => binding.agent_name === a.name && (binding.access_level === 'owner' || binding.access_level === 'operator')) && <DropdownMenu>
                   <DropdownMenuTrigger render={<Button variant="ghost" size="icon" className="absolute right-1 top-1 size-6" aria-label={intl.formatMessage({ id: 'sidebar.setPrimaryAgent' })} />}>
                     <MoreHorizontal className="size-4" />
                   </DropdownMenuTrigger>
@@ -373,12 +372,12 @@ function CompanySwitcher({ collapsed, employee = false }: { collapsed: boolean; 
   // undo itself. Hidden instead of shown-and-broken — password protection is
   // the `local_auto_login` switch, explained in account settings.
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
-  const brandName = useEffectiveName();
+  const brandName = useCompanyName();
   const locale = useLocaleStore((s) => s.locale);
   const setLocale = useLocaleStore((s) => s.setLocale);
 
   // C1 mark at nav size (28 px); no chip behind it (logo usage rules).
-  const logoNode = <ProductLogo size={28} title={brandName} />;
+  const logoNode = <CompanyLogo size={28} />;
 
   if (employee) return (
     <div className={cn("flex items-center gap-2 p-1.5", collapsed && "justify-center")} >

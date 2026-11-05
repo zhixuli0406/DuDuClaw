@@ -607,3 +607,71 @@ async fn spawn_downstream_lineage_survives_ephemeral_admission_replay() {
         assert_eq!(events.lines().filter(|line| line.contains("bus_upstream_identity_dropped")).count(), usize::from(unknown));
     }
 }
+
+#[tokio::test]
+async fn spawn_ephemeral_forged_env_sender_never_widens_verified_parent() {
+    // This regression crosses async scaffold/queue work while setting process
+    // identity. Run it in a separate test process so unrelated authorization
+    // tests cannot observe the temporary employee identity.
+    const CHILD: &str = "DUDUCLAW_TEST_SIGNED_SPAWN_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "mcp::tests::part5::spawn_ephemeral_forged_env_sender_never_widens_verified_parent", "--nocapture"])
+            .env(CHILD, "1");
+        for name in [duduclaw_core::ENV_AGENT_ID, duduclaw_core::ENV_AGENT_TOKEN,
+            duduclaw_core::ENV_DELEGATION_SENDER, duduclaw_core::ENV_DELEGATION_ORIGIN,
+            duduclaw_core::ENV_DELEGATION_DEPTH, duduclaw_core::ENV_DISPATCH_RUN_ID,
+            duduclaw_core::ENV_TASK_ID, duduclaw_core::ENV_TRUST_TURN_ID,
+            duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT,
+            duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN] {
+            command.env_remove(name);
+        }
+        assert!(command.status().unwrap().success());
+        return;
+    }
+    use duduclaw_core::identity_token::{mint_delegation_context, delegation_run_binding, ENV_DELEGATION_CONTEXT};
+    let _lock = ENV_LOCK.lock().unwrap();
+    let tmp = TempDir::new();
+    let home = tmp.path();
+    let agents = home.join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    create_test_agent_with_caps(&agents, "worker", &["Read"]);
+    create_test_agent_with_caps(&agents, "ceo", &["Read", "Bash"]);
+    let key = zeroize::Zeroizing::new(duduclaw_core::identity_token::ensure_key(home).unwrap());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let run = std::env::var(duduclaw_core::ENV_DISPATCH_RUN_ID).ok();
+    let task = std::env::var(duduclaw_core::ENV_TASK_ID).ok();
+    let turn = std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).ok();
+    let binding = delegation_run_binding(run.as_deref(), task.as_deref(), turn.as_deref());
+    let params = serde_json::json!({"instruction":"x", "context":"y", "tools":["Bash"]});
+    clear_delegation_env();
+    unsafe {
+        std::env::set_var(duduclaw_core::ENV_AGENT_ID, "worker");
+        std::env::set_var(duduclaw_core::ENV_AGENT_TOKEN, duduclaw_core::mint_identity_token(&key, "worker"));
+        std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, "ceo");
+        std::env::set_var(duduclaw_core::ENV_DELEGATION_DEPTH, "0");
+    }
+    let unsigned = handle_spawn_ephemeral(&params, home, "worker").await;
+    // Even host-authenticated attribution to the CEO cannot change the parent.
+    let signed = mint_delegation_context(&key, "worker", "ceo", "ceo", 0, binding.as_deref(), now + 60).unwrap();
+    unsafe { std::env::set_var(ENV_DELEGATION_CONTEXT, signed); }
+    let escalated = handle_spawn_ephemeral(&params, home, "worker").await;
+    let allowed = handle_spawn_ephemeral(
+        &serde_json::json!({"instruction":"x", "context":"y", "tools":["Read"]}), home, "worker",
+    ).await;
+    unsafe {
+        std::env::remove_var(duduclaw_core::ENV_AGENT_ID);
+        std::env::remove_var(duduclaw_core::ENV_AGENT_TOKEN);
+    }
+    clear_delegation_env();
+    assert_eq!(unsigned["isError"], true, "{unsigned}");
+    assert!(unsigned["content"][0]["text"].as_str().unwrap().contains("depth limit"));
+    assert_eq!(escalated["isError"], true, "{escalated}");
+    assert!(escalated["content"][0]["text"].as_str().unwrap().contains("privilege escalation"));
+    assert_ne!(allowed["isError"], true, "{allowed}");
+    let queued = fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+    let msg: Value = serde_json::from_str(queued.trim()).unwrap();
+    let dir = duduclaw_gateway::ephemeral::resolve_agent_dir(home, msg["agent_id"].as_str().unwrap()).unwrap();
+    assert_eq!(duduclaw_gateway::ephemeral::read_meta(&dir).unwrap().parent, "worker");
+    assert_eq!(msg["sender_agent"], "worker");
+}

@@ -52,7 +52,7 @@ describe('AgentOwnChannelsSection', () => {
     expect(await screen.findByText('Connected as @sales_bot')).toBeInTheDocument();
   });
 
-  it('saves a per-employee HTTP app through manual setup', async () => {
+  it.each(['http', 'pubsub'] as const)('saves a per-employee %s app through manual setup', async (connection) => {
     const user = userEvent.setup();
     mockRpc({
       'agents.channels.status': () => status(true),
@@ -60,13 +60,16 @@ describe('AgentOwnChannelsSection', () => {
       'agents.channels.googlechat.set': () => ({ verified: true }),
     });
     renderWithProviders(<AgentOwnChannelsSection agentId="a1" />);
-    await user.click(await screen.findByText('Manual setup'));
+    await user.selectOptions(await screen.findByLabelText('Connection type'), connection);
+    if (connection === 'pubsub') await user.type(screen.getByLabelText('Full Pub/Sub subscription name'), 'projects/my-project/subscriptions/chat');
+    await user.click(screen.getByText('Manual setup'));
     await user.type(screen.getByLabelText('Google Cloud project number'), '123456789');
     await user.click(screen.getByLabelText('Service-account JSON key'));
     await user.paste('{"type":"service_account"}');
     await user.click(screen.getAllByRole('button', { name: 'Connect' }).at(-1)!);
     await waitFor(() => expect(callsOf('agents.channels.googlechat.set').at(-1)).toEqual({
       agent_id: 'a1', project_number: '123456789', service_account_json: '{"type":"service_account"}',
+      connection, pubsub_subscription: connection === 'pubsub' ? 'projects/my-project/subscriptions/chat' : '',
     }));
   });
 

@@ -133,6 +133,8 @@ pub const RESERVED_HEADERS: &[&str] = &[
     "accept-encoding",
     "mcp-session-id",
     "mcp-protocol-version",
+    "mcp-method",
+    "mcp-name",
     "last-event-id",
     "cookie",
 ];
@@ -154,7 +156,7 @@ pub fn validate_custom_headers(raw: &[(String, String)]) -> Result<Vec<(String, 
             return Err(format!("header name '{}' is not valid", duduclaw_core::truncate_chars(name, 40)));
         }
         let lower = name.to_ascii_lowercase();
-        if RESERVED_HEADERS.contains(&lower.as_str()) || lower.starts_with("sec-") || lower.starts_with("proxy-") {
+        if RESERVED_HEADERS.contains(&lower.as_str()) || lower.starts_with("sec-") || lower.starts_with("proxy-") || lower.starts_with("mcp-param-") {
             return Err(format!("header '{name}' is set by DuDuClaw itself and cannot be supplied"));
         }
         let value = v.trim();
@@ -187,6 +189,9 @@ impl std::fmt::Debug for RemoteSecrets {
 }
 
 /// OAuth state needed to refresh and to use the token.
+/// Credentials stay with this issuer's encrypted token bundle. Reconnecting
+/// discovers and registers anew; client credentials are never reused from a
+/// different issuer or another server record.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct OAuthSecrets {
     pub issuer: String,
@@ -429,7 +434,7 @@ mod tests {
     fn custom_headers_are_validated() {
         let h = |k: &str, v: &str| vec![(k.to_string(), v.to_string())];
         assert_eq!(validate_custom_headers(&h(" X-Workspace ", " acme ")).unwrap(), h("X-Workspace", "acme"));
-        for bad in ["Authorization", "host", "Content-Length", "Mcp-Session-Id", "mcp-protocol-version", "Proxy-X", "Sec-Fetch", "Last-Event-ID", "a b", "", "x:y"] {
+        for bad in ["Authorization", "host", "Content-Length", "Mcp-Session-Id", "mcp-protocol-version", "Mcp-Method", "MCP-NAME", "Mcp-Param-Tenant", "Proxy-X", "Sec-Fetch", "Last-Event-ID", "a b", "", "x:y"] {
             assert!(validate_custom_headers(&h(bad, "v")).is_err(), "{bad}");
         }
         for bad in ["a\r\nb", "a\nb", "a\0b", "café"] {

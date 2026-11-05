@@ -21,6 +21,7 @@ export function createdGoalPath(result: GoalCreateResult): string {
 
 /** Gateway error prefixes that have their own sentence. */
 const KNOWN_ERRORS: ReadonlyArray<readonly [string, string]> = [
+  ['skills_no_common_runner', 'assign.skill.error.noCommonRunner'],
   ['skill_not_enabled', 'assign.skill.error.notEnabled'],
   ['skill_not_found', 'assign.skill.error.notFound'],
   ['permission denied', 'assign.skill.error.denied'],

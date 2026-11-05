@@ -37,6 +37,10 @@ impl MethodHandler {
         }
 
         match method {
+            "compliance.generate" => {
+                require_admin!();
+                boxed_frame(|| self.handle_compliance_generate(params, ctx)).await
+            }
             "credentials.audit_list" | "credentials.audit_get" | "credentials.audit_update" => {
                 require_admin!();
                 boxed_frame(|| self.handle_credentials_audit(method, params)).await

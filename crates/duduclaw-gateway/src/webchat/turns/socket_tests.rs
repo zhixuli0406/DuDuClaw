@@ -194,7 +194,11 @@ async fn frame(socket: &mut Socket) -> Value {
                 .expect("WebChat closed before its reply")
                 .unwrap()
             {
-                WireMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
+                WireMessage::Text(text) => {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if value["type"] == "turn_accepted" { continue; }
+                    return value;
+                },
                 WireMessage::Ping(data) => socket.send(WireMessage::Pong(data)).await.unwrap(),
                 WireMessage::Pong(_) => {}
                 other => panic!("unexpected WebChat frame: {other:?}"),
@@ -561,6 +565,12 @@ async fn webchat_memory_socket_mfa_revocation_blocks_fifo_waiter_and_turn_frames
     let running = fixture.entered().await;
     message(&mut socket, "same", "queued").await;
     fixture.turn_count(2).await;
+    // turn_accepted acknowledges a persisted user row, not FIFO admission.
+    // This fixture's model seam returns before that INSERT and is still held
+    // before session creation; the queued turn has not entered the seam at all.
+    // Waiting for either receipt here would retain SOCKET_TEST_LOCK forever.
+    assert!(fixture.gate.entered.try_recv().is_err(), "FIFO waiter must not start before revocation");
+    assert!(fixture.state.ctx.session_manager.session_agent(&running.session_id).await.unwrap().is_none());
     fixture.state.user_db.mfa_operator_reset("revoked@socket.test").unwrap();
     running.release.send(()).unwrap();
     fixture.turn_count(0).await;
@@ -926,11 +936,14 @@ async fn webchat_fifo_waiter_rechecks_revoked_non_admin_binding() {
     fixture.state.user_db.unbind_agent(&user, "finance").unwrap();
     let sid = first.session_id.clone();
     first.release.send(()).unwrap();
-    done(&mut socket, "fifo", "first", &sid).await;
     let denied = frame(&mut socket).await;
     assert_eq!(denied["code"], "agent_unavailable");
     assert_eq!(denied["msg_id"], "second");
     fixture.turn_count(0).await;
+    assert!(fixture.state.ctx.session_manager.get_messages(&sid).await.unwrap().iter()
+        .all(|row| row.role != "assistant"));
+    send(&mut socket, json!({"type":"subscribe", "session_id":null})).await;
+    assert_eq!(frame(&mut socket).await["type"], "subscribed", "no revoked reply may precede this barrier");
     assert!(fixture.gate.entered.try_recv().is_err());
     socket.close(None).await.unwrap();
 }
@@ -1050,4 +1063,377 @@ async fn non_admin_assignment_socket_failures_have_identical_frames() {
     assert!(!fixture._home.path().join("tasks.db").exists());
     assert!(fixture.gate.entered.try_recv().is_err());
     socket.close(None).await.unwrap();
+}
+
+
+#[tokio::test]
+async fn webchat_reconnect_delivers_saved_reply_only_to_owned_subscribed_conversation() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::start(true).await.unwrap();
+    let alice = fixture.user("reconnect-alice");
+    let bob = fixture.user("reconnect-bob");
+    let (mut original, _) = fixture.connect(&alice).await;
+    message(&mut original, "retained", "reply-1").await;
+    let pending = fixture.entered().await;
+    let sid = pending.session_id.clone();
+    // Resume even before the pipeline creates its session row: admission owns
+    // the pending conversation and records its already-authorized employee.
+    assert!(fixture.state.ctx.session_manager.session_agent(&sid).await.unwrap().is_none());
+    original.close(None).await.unwrap();
+    drop(original);
+
+    let (mut resumed, _) = fixture.connect(&alice).await;
+    send(&mut resumed, json!({"type":"subscribe", "session_id":sid, "conv":"new-tab"})).await;
+    assert_eq!(frame(&mut resumed).await["type"], "session_info");
+    assert_eq!(frame(&mut resumed).await["type"], "subscribed");
+    let (mut other_conversation, _) = fixture.connect(&alice).await;
+    let (mut foreign, _) = fixture.connect(&bob).await;
+    send(&mut foreign, json!({"type":"subscribe", "session_id":sid, "conv":"new-tab"})).await;
+    assert_eq!(frame(&mut foreign).await["type"], "error");
+    pending.release.send(()).unwrap();
+    done(&mut resumed, "new-tab", "reply-1", &sid).await;
+    fixture.turn_count(0).await;
+    assert!(fixture.state.ctx.session_manager.get_messages(&sid).await.unwrap().iter()
+        .any(|message| message.role == "assistant" && message.content.contains("OWN_BOT_REPLY")));
+    // A control acknowledgement is ordered behind any incorrectly leaked reply.
+    for socket in [&mut foreign, &mut other_conversation] {
+        send(socket, json!({"type":"subscribe", "session_id":null})).await;
+        assert_eq!(frame(socket).await["type"], "subscribed");
+    }
+    send(&mut resumed, json!({"type":"user_message", "content":"offline", "session_id":sid,
+        "conv":"new-tab", "msg_id":"reply-2"})).await;
+    assert_eq!(frame(&mut resumed).await["type"], "session_info");
+    let pending = fixture.entered().await;
+    resumed.close(None).await.unwrap();
+    drop(resumed);
+    pending.release.send(()).unwrap();
+    fixture.turn_count(0).await;
+    let history = fixture.state.ctx.session_manager.get_messages(&sid).await.unwrap();
+    assert_eq!(history.iter().filter(|message| message.role == "assistant"
+        && message.content.contains("OWN_BOT_REPLY")).count(), 2);
+    assert!(history.iter().all(|message| !message.content.contains("source changed")));
+}
+
+#[tokio::test]
+async fn webchat_protocol_ping_is_answered_without_application_timers() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    let fixture = Fixture::start(true).await.unwrap();
+    let token = fixture.user("protocol-heartbeat");
+    let (mut socket, _) = fixture.connect(&token).await;
+    let ping = tokio::time::timeout(DEADLINE, socket.next()).await.unwrap().unwrap().unwrap();
+    let WireMessage::Ping(payload) = ping else { panic!("server must originate a protocol ping"); };
+    socket.send(WireMessage::Pong(payload)).await.unwrap();
+    send(&mut socket, json!({"type":"subscribe", "session_id":null})).await;
+    assert_eq!(frame(&mut socket).await["type"], "subscribed");
+}
+
+#[tokio::test]
+async fn webchat_explicit_logout_cancels_the_origin_turn_without_cancelling_other_tabs() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::start(true).await.unwrap();
+    let token = fixture.user("explicit-logout");
+    let (mut first, _) = fixture.connect(&token).await;
+    let (mut second, _) = fixture.connect(&token).await;
+    message(&mut first, "first", "m1").await;
+    let logged_out = fixture.entered().await;
+    message(&mut second, "second", "m2").await;
+    let retained = fixture.entered().await;
+    send(&mut first, json!({"type":"logout"})).await;
+    fixture.turn_count(1).await;
+    assert!(logged_out.release.send(()).is_err());
+    retained.release.send(()).unwrap();
+    done(&mut second, "second", "m2", &retained.session_id).await;
+    fixture.turn_count(0).await;
+    assert!(fixture.state.ctx.session_manager.session_agent(&logged_out.session_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn webchat_queued_reply_rechecks_answerer_acl_and_retracts_history() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    for failure in ["revoked", "unreadable", "allowed"] {
+        let mut fixture = Fixture::start(true).await.unwrap();
+        let (user, _) = fixture.employee("queued-acl", &["finance", "sales"], Some("finance")).await;
+        let sid = format!("webchat:{user}#agent:finance#conv:queued");
+        let (tx, mut rx) = outbound_channel();
+        let subscription = fixture.state.subscriptions.register(&user, tx.clone());
+        subscription.subscribe(&sid, Some("queued".into()));
+        let ticket = fixture.state.turns.admit(&user, &sid, Some("queued".into()), "queued", 3, 10).unwrap();
+        let input = TurnInput {
+            state: fixture.state.clone(), auth_user: user.clone(), credential: None,
+            user_id: user.clone(), agent_id: "dudu".into(), requested_agent: None,
+            effective_agent: Some("finance".into()), sid: sid.clone(), conv_nonce: Some("queued".into()),
+            content: "Hello".into(), attachments: Vec::new(), assign_event: None,
+            resume_acl: false, arrival_seq: 1,
+        };
+        let task = tokio::spawn(execute(input, TurnSink::new(tx, &sid, Some("queued".into()), "queued"), ticket));
+        fixture.entered().await.release.send(()).unwrap();
+        let queued = tokio::time::timeout(DEADLINE, async {
+            loop {
+                let frame = rx.recv().await.unwrap();
+                if frame.route.is_some() { break frame; }
+            }
+        }).await.unwrap();
+        assert!(!fixture.state.ctx.session_manager.get_messages(&sid).await.unwrap().iter()
+            .any(|row| row.role == "assistant"), "queued replies remain unpublished");
+        let route = queued.route.as_ref().unwrap();
+        assert_eq!(route.agent, "finance");
+        assert!(fixture.state.authorize_target(&user, "sales", true).await.is_ok());
+        if failure == "revoked" {
+            fixture.state.user_db.unbind_agent(&user, "finance").unwrap();
+        } else if failure == "unreadable" {
+            // The credential is still valid; only the live ACL read fails.
+            rusqlite::Connection::open(fixture._home.path().join("users.db")).unwrap()
+                .execute_batch("DROP TABLE user_agent_bindings; DELETE FROM auth_meta;").unwrap();
+        }
+        let allowed = route.authorized(&fixture.state).await;
+        assert_eq!(allowed, failure == "allowed");
+        if let Some(ack) = queued.ack { let _ = ack.send(allowed); }
+        tokio::time::timeout(DEADLINE, task).await.unwrap().unwrap();
+        let history = fixture.state.ctx.session_manager.get_messages(&sid).await.unwrap();
+        assert_eq!(history.iter().filter(|row| row.role == "assistant").count(),
+            if failure == "allowed" { 1 } else { 0 });
+    }
+}
+
+#[tokio::test]
+async fn webchat_subscription_refusals_echo_only_requested_correlation() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    let fixture = Fixture::start(true).await.unwrap();
+    let token = fixture.user("subscription-refusal");
+    let (mut socket, info) = fixture.connect(&token).await;
+    for sid in [info["session_id"].as_str().unwrap().to_owned(),
+        format!("{}#conv:missing", info["session_id"].as_str().unwrap()),
+        "webchat:someone-else#conv:foreign".to_string()] {
+        send(&mut socket, json!({"type":"subscribe", "session_id":sid, "conv":"requested-view"})).await;
+        let refusal = frame(&mut socket).await;
+        assert_eq!(refusal["type"], "error");
+        assert_eq!(refusal["code"], "subscription_unavailable");
+        assert_eq!(refusal["session_id"], sid);
+        assert_eq!(refusal["conv"], "requested-view");
+    }
+    socket.close(None).await.unwrap();
+}
+
+
+/// Exposes the readiness boundary without sleeps or dependence on OS buffers.
+struct BackpressuredWriter {
+    ready: oneshot::Receiver<()>,
+    waiting: Option<oneshot::Sender<()>>,
+    written: Arc<Mutex<Vec<Message>>>,
+}
+
+impl futures_util::Stream for BackpressuredWriter {
+    type Item = Result<Message, ()>;
+    fn poll_next(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Pending
+    }
+}
+
+impl futures_util::Sink<Message> for BackpressuredWriter {
+    type Error = ();
+    fn poll_ready(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), ()>> {
+        if let Some(waiting) = self.waiting.take() { let _ = waiting.send(()); }
+        std::future::Future::poll(std::pin::Pin::new(&mut self.ready), cx).map(|ready| ready.map_err(|_| ()))
+    }
+    fn start_send(self: std::pin::Pin<&mut Self>, item: Message) -> Result<(), ()> {
+        self.written.lock().unwrap().push(item);
+        Ok(())
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), ()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), ()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn webchat_writer_rechecks_acl_after_backpressure_before_start_send() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    for failure in ["allowed", "revoked", "generation", "cancelled", "source_refused", "unreadable"] {
+        let refused = failure != "allowed";
+        let fixture = Fixture::start(true).await.unwrap();
+        let (user, token) = fixture.employee("backpressure", &["finance"], None).await;
+        let credential = fixture.state.jwt_config.verify_access_token(&token).unwrap();
+        let subscriptions = subscriptions::Subscriptions::default();
+        let (tx, mut rx) = outbound_channel();
+        let subscription = subscriptions.register(&user, tx);
+        subscription.subscribe("owned", None);
+        let cancel = CancellationToken::new();
+        let source = crate::channel_reply::ReplyDeliveryFence::test_live().for_turn(&cancel);
+        let mut turn = subscriptions.sinks(&user, "owned", "m", "finance", Some(&credential), source.clone())
+            .pop().unwrap();
+        let sending = tokio::spawn(async move {
+            turn.send(Message::Text(r#"{"type":"assistant_done","content":"private"}"#.into())).await
+        });
+        let queued = rx.recv().await.unwrap();
+        let (release, ready) = oneshot::channel();
+        let (waiting, blocked) = oneshot::channel();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let captured = written.clone();
+        let state = fixture.state.clone();
+        let writer = tokio::spawn(async move {
+            let gate = SocketGate::default();
+            // Match production's adapter order: SplitSink buffers the frame
+            // before the underlying writer becomes ready.
+            let (writer, _reader) = GuardedSocket::new(
+                BackpressuredWriter { ready, waiting: Some(waiting), written: captured }, gate.clone(),
+            ).split();
+            queued.deliver_live(&state, Some(&credential),
+                &mut crate::handlers::live_context::SocketRecovery::default(),
+                &mut BoundedSocketSink(writer), &gate).await
+        });
+        // This notification is emitted only after the first authorization has
+        // passed, and while poll_ready is still pending. No frame was written.
+        tokio::time::timeout(DEADLINE, blocked).await.unwrap().unwrap();
+        assert!(written.lock().unwrap().is_empty());
+        match failure {
+            "revoked" => fixture.state.user_db.unbind_agent(&user, "finance").unwrap(),
+            "generation" => fixture.state.user_db.bind_agent(&user, "unrelated", duduclaw_auth::AccessLevel::Owner).unwrap(),
+            "cancelled" => cancel.cancel(),
+            "source_refused" => source.refuse(),
+            "unreadable" => {
+                rusqlite::Connection::open(fixture._home.path().join("users.db")).unwrap()
+                    .execute_batch("DELETE FROM auth_meta").unwrap();
+            }
+            _ => {}
+        }
+        release.send(()).unwrap();
+        assert_eq!(tokio::time::timeout(DEADLINE, writer).await.unwrap().unwrap().is_ok(), !refused);
+        assert_eq!(sending.await.unwrap().is_ok(), !refused);
+        assert_eq!(written.lock().unwrap().len(), usize::from(!refused));
+        assert_eq!(source.valid().await, !refused);
+    }
+}
+
+#[tokio::test]
+async fn webchat_final_policy_change_sends_no_bytes_and_publishes_no_history() {
+    let _serial = tokio::time::timeout(DEADLINE, SOCKET_TEST_LOCK.lock()).await.unwrap();
+    for change in ["allowed", "role", "default", "status", "public", "missing_config", "config_busy", "registry_busy"] {
+        assert_final_policy_window(change).await;
+    }
+}
+
+#[tokio::test]
+async fn webchat_final_edition_downgrade_sends_no_bytes_and_publishes_no_history() {
+    let _serial = tokio::time::timeout(DEADLINE, SOCKET_TEST_LOCK.lock()).await.unwrap();
+    for change in ["edition_downgrade", "edition_roundtrip", "edition_unchanged"] {
+        assert_final_policy_window(change).await;
+    }
+}
+
+async fn assert_final_policy_window(change: &str) {
+    tokio::time::timeout(DEADLINE, async {
+        let allowed = matches!(change, "allowed" | "edition_unchanged");
+        let fixture = Fixture::start(true).await.unwrap();
+        let (user, token) = fixture.employee("final-policy", &["finance"], None).await;
+        let (user, token) = if change.starts_with("edition_") {
+            let db = &fixture.state.user_db;
+            let manager = db.create_user("manager@socket.test", "Manager", "Manager-Test-Password-12345",
+                duduclaw_auth::UserRole::Manager).unwrap();
+            db.set_manager(&user, Some(&manager.id)).unwrap();
+            let access = db.effective_access(&manager.id).unwrap().unwrap();
+            assert!(access.direct.is_empty(), "permission must come only from the team grant");
+            assert!(access.team.contains_key("finance"));
+            let token = fixture.state.jwt_config.issue_access_token(&manager, &[]).unwrap();
+            (manager.id, token)
+        } else { (user, token) };
+        let credential = fixture.state.jwt_config.verify_access_token(&token).unwrap();
+        let path = fixture._home.path().join("agents/finance/agent.toml");
+        if change == "public" {
+            let raw = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, format!("{raw}\n[channels]\npublic_trigger = true\n")).unwrap();
+            fixture.state.ctx.registry.write().await.scan().await.unwrap();
+            fixture.state.user_db.unbind_agent(&user, "finance").unwrap();
+        }
+        let sessions = &fixture.state.ctx.session_manager;
+        sessions.get_or_create("owned", "finance").await.unwrap();
+        let row = sessions.append_delivery_message("owned", "assistant", "private", 0, None, true).await.unwrap();
+        let generation = fixture.state.user_db.acl_generation().unwrap();
+        let policy = fixture.state.target_policy(&user, "finance", true).await.unwrap();
+        assert!(fixture.state.authorize_target(&user, "finance", true).await.is_ok());
+        assert!(policy.with_current(|| ()).is_ok());
+        let (tx, mut rx) = outbound_channel();
+        let subscriptions = subscriptions::Subscriptions::default();
+        let subscription = subscriptions.register(&user, tx);
+        subscription.subscribe("owned", None);
+        let source = crate::channel_reply::ReplyDeliveryFence::test_live();
+        let mut turn = subscriptions.sinks(&user, "owned", "m", "finance", Some(&credential), source.clone()).pop().unwrap();
+        let sending = tokio::spawn(async move {
+            turn.send(Message::Text(r#"{"type":"assistant_done","content":"private"}"#.into())).await
+        });
+        let queued = rx.recv().await.unwrap();
+        let (release, ready) = oneshot::channel();
+        let (waiting, blocked) = oneshot::channel();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let captured = written.clone();
+        let state = fixture.state.clone();
+        let writer = tokio::spawn(async move {
+            let gate = SocketGate::default();
+            let (writer, _reader) = GuardedSocket::new(
+                BackpressuredWriter { ready, waiting: Some(waiting), written: captured }, gate.clone(),
+            ).split();
+            queued.deliver_live(&state, Some(&credential), &mut Default::default(),
+                &mut BoundedSocketSink(writer), &gate).await
+        });
+        // SplitSink::poll_ready only reserves its slot. The underlying
+        // readiness notification is AFTER deliver_live's LAST async check
+        // and permit creation, immediately before GuardedSocket::start_send.
+        blocked.await.unwrap();
+        assert!(written.lock().unwrap().is_empty());
+        let mut config_lock = None;
+        let mut registry_lock = None;
+        match change {
+            "edition_downgrade" | "edition_roundtrip" | "edition_unchanged" => {
+                let home = fixture._home.path();
+                if change != "edition_unchanged" {
+                    crate::team_edition::record(home, duduclaw_core::EditionProfile::Personal);
+                }
+                if change != "edition_downgrade" {
+                    crate::team_edition::record(home, duduclaw_core::EditionProfile::Enterprise);
+                }
+            }
+            "role" | "status" | "public" => {
+                let raw = std::fs::read_to_string(&path).unwrap();
+                let raw = match change {
+                    "role" => raw.replace("role = \"specialist\"", "role = \"main\""),
+                    "status" => raw.replace("status = \"active\"", "status = \"paused\""),
+                    _ => raw.replace("public_trigger = true", "public_trigger = false"),
+                };
+                std::fs::write(&path, raw).unwrap();
+                fixture.state.ctx.registry.write().await.scan().await.unwrap();
+            }
+            "default" => {
+                let path = fixture._home.path().join("config.toml");
+                duduclaw_core::with_file_lock(&path, || std::fs::write(&path,
+                    "[general]\ndefault_agent = \"finance\"\n")).unwrap();
+            }
+            "missing_config" => std::fs::remove_file(fixture._home.path().join("config.toml")).unwrap(),
+            "config_busy" => {
+                let lock = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+                    .open(fixture._home.path().join("config.toml.lock")).unwrap();
+                fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+                config_lock = Some(lock);
+            }
+            "registry_busy" => registry_lock = Some(fixture.state.ctx.registry.write().await),
+            _ => {}
+        }
+        assert_eq!(fixture.state.user_db.acl_generation().unwrap(), generation,
+            "policy-only changes must exercise the gap outside users.db");
+        // Independently exercise publication with an unconditional source
+        // callback BEFORE the socket refusal can latch anything false.
+        let published = sessions.publish_webchat_message("owned", row, &fixture.state.user_db,
+            generation, &policy, || true).await;
+        assert_eq!(matches!(published, Ok(true)), allowed, "{change}");
+        release.send(()).unwrap();
+        assert_eq!(writer.await.unwrap().is_ok(), allowed, "{change}");
+        assert_eq!(sending.await.unwrap().is_ok(), allowed, "{change}");
+        assert_eq!(written.lock().unwrap().len(), usize::from(allowed), "{change}");
+        let history = sessions.webchat_history("owned").await.unwrap();
+        assert_eq!(history.iter().filter(|row| row.message.role == "assistant").count(),
+            usize::from(allowed), "{change}");
+        assert_eq!(sessions.get_messages("owned").await.unwrap().len(), usize::from(allowed));
+        drop(registry_lock);
+        drop(config_lock);
+    }).await.unwrap_or_else(|_| panic!("final policy window timed out: {change}"));
 }

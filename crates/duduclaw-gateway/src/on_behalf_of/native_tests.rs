@@ -90,7 +90,7 @@ fn signed_license(
         "sub_obo_native_fixture",
         "fixture",
         tier,
-        duduclaw_license::generate_fingerprint(),
+        crate::license_runtime::tests::TEST_HARDWARE_FINGERPRINT,
         chrono::Duration::days(1),
         "obo-test",
     );
@@ -110,6 +110,7 @@ fn is_ok(result: &Value) -> bool {
 async fn native_mcp_team_manager_uses_host_authority() {
     use duduclaw_auth::{AccessLevel, UserDb, UserRole};
     use duduclaw_license::{LicenseTier, PublicKeyRegistry};
+    use crate::license_runtime::tests::with_hardware_fixture;
     let home =
         std::path::PathBuf::from(std::env::var("DUDUCLAW_HOME").expect("explicit fixture home"));
     let expected =
@@ -140,7 +141,9 @@ async fn native_mcp_team_manager_uses_host_authority() {
         &home.join("license.json"),
     )
     .unwrap();
-    let runtime = crate::license_runtime::LicenseRuntime::bootstrap(home.clone(), registry).await;
+    let runtime = with_hardware_fixture(
+        crate::license_runtime::LicenseRuntime::bootstrap(home.clone(), registry),
+    ).await;
     assert_eq!(runtime.current_tier().await, LicenseTier::SelfHostPro);
     std::fs::write(home.join("config.toml"), format!("[gateway]\nbind='127.0.0.1'\nport={port}\n[delegation]\npolicy='open'\nhuman_principal='enforce'\nrequire_identity_token=true\n[mcp_keys.\"{}\"]\nclient_id='gateway-internal'\nis_external=false\ncreated_at='{}'\nscopes=['admin']\n", "ddc_prod_0123456789abcdef0123456789abcdef", chrono::Utc::now().to_rfc3339())).unwrap();
     for name in ["bot", "sales", "hr"] {
@@ -208,9 +211,9 @@ async fn native_mcp_team_manager_uses_host_authority() {
         db.unbind_agent(&emp.id, "sales").unwrap();
         assert!(!is_ok(&mcp_call(&home, port, Some(&principal), r, "tasks_create", json!({"title":"native-binding-removed","assigned_to":"sales"})).await));
         db.bind_agent(&emp.id, "sales", AccessLevel::Owner).unwrap();
-        runtime.install_and_reload(signed_license(&key, LicenseTier::PersonalProSelfHost)).await.unwrap();
+        with_hardware_fixture(runtime.install_and_reload(signed_license(&key, LicenseTier::PersonalProSelfHost))).await.unwrap();
         assert!(!is_ok(&mcp_call(&home, port, Some(&principal), r, "tasks_create", json!({"title":"native-personal-denied","assigned_to":"sales"})).await));
-        runtime.install_and_reload(signed_license(&key, LicenseTier::SelfHostPro)).await.unwrap();
+        with_hardware_fixture(runtime.install_and_reload(signed_license(&key, LicenseTier::SelfHostPro))).await.unwrap();
         db.set_user_status(&mgr.id, duduclaw_auth::UserStatus::Suspended).unwrap();
         assert!(!is_ok(&mcp_call(&home, port, Some(&principal), r, "tasks_create", json!({"title":"native-inactive-denied","assigned_to":"sales"})).await));
         guard.reference().to_owned()

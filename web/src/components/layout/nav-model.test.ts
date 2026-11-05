@@ -284,19 +284,19 @@ describe('self-service account navigation', () => {
 describe('enterprise employee navigation', () => {
   it('shows exactly the daily employee destinations in the agreed order', () => {
     expect(employeeNavItems().map((item) => item.to)).toEqual([
-      '/', '/inbox', '/skills', '/memory', '/world',
+      '/', '/inbox', '/routines', '/skills', '/memory', '/world', '/org',
     ]);
     expect(employeeNavItems(false)).toEqual(employeeNavItems());
-    expect(employeeNavItems().every((item) => item.newIn === undefined)).toBe(true);
+    expect(employeeNavItems().filter(item => item.newIn).map(item => [item.to, item.newIn])).toEqual([['/routines', '1.80.0'], ['/org', '1.80.0']]);
     expect(employeeNavItems().find((item) => item.to === '/inbox')?.badge).toBe('inbox');
   });
 
   it('keeps task rows hidden when enabled, retaining responsibility and foresight gates', () => {
     expect(employeeNavItems(true).map((item) => item.to)).toEqual([
-      '/', '/inbox', '/skills', '/memory', '/world', '/responsibilities',
+      '/', '/inbox', '/routines', '/skills', '/memory', '/world', '/org', '/responsibilities',
     ]);
-    expect(employeeNavItems(true).some((item) => item.to === '/routines' || item.to === '/org')).toBe(false);
-    expect(employeeNavItems(true).every((item) => item.newIn === undefined)).toBe(true);
+    expect(employeeNavItems(true).filter(item => ['/routines', '/org'].includes(item.to))).toHaveLength(2);
+    expect(employeeNavItems(true).filter(item => item.newIn).every(item => item.newIn === '1.80.0')).toBe(true);
   });
 
   it('applies only to employees outside the Personal edition', () => {
@@ -329,7 +329,7 @@ describe('enterprise employee navigation', () => {
   });
 });
 
-// Expected visible routes, including the task-entry hiding policy.
+// Expected visible routes, including intended 1.80.0 additions and task-entry hiding.
 // All progressive-disclosure facts are enabled to make every prior entry observable.
 const previousNavigation = {
   "admin:enterprise": {
@@ -350,6 +350,7 @@ const previousNavigation = {
         "/mail",
         "/timeline",
         "/reports",
+        "/employee-health",
         "/foresight",
         "/forks",
         "/os",
@@ -361,6 +362,7 @@ const previousNavigation = {
         "/memory",
         "/knowledge-base",
         "/agents",
+        "/templates",
         "/world",
         "/growth",
         "/org",
@@ -373,6 +375,8 @@ const previousNavigation = {
         "/me/account",
         "/my/history-views",
         "/manage",
+        "/app/system/settings/company",
+        "/app/system/settings/advanced",
         "/about"
       ],
       [
@@ -395,6 +399,7 @@ const previousNavigation = {
       "/knowledge-base",
       "/agents",
       "/world",
+      "/templates",
       "/experts",
       "/gallery",
       "/pet-studio"
@@ -403,6 +408,8 @@ const previousNavigation = {
       [
         "/me/account",
         "/manage",
+        "/app/system/settings/company",
+        "/app/system/settings/advanced",
         "/about"
       ],
       [
@@ -414,6 +421,7 @@ const previousNavigation = {
         "/mail",
         "/timeline",
         "/reports",
+        "/employee-health",
         "/forks",
         "/os",
         "/presets",
@@ -440,6 +448,7 @@ const previousNavigation = {
         "/mail",
         "/timeline",
         "/reports",
+        "/employee-health",
         "/foresight",
         "/forks",
       ],
@@ -497,6 +506,7 @@ const previousNavigation = {
         "/mail",
         "/timeline",
         "/reports",
+        "/employee-health",
         "/forks",
         "/growth",
         "/org",
@@ -576,5 +586,71 @@ describe('task navigation hidden for all roles and editions', () => {
     }
     expect(navGroups.flatMap(group => group.items).some(item => item.to === '/responsibilities')).toBe(true);
     expect(navGroups.flatMap(group => group.items).some(item => item.to === '/foresight')).toBe(true);
+  });
+});
+
+describe('advanced and company settings navigation', () => {
+  it('shows one Admin-only versioned entry per page in both editions', () => {
+    for (const personal of [false, true]) {
+      const items = navGroupsForEdition(personal).flatMap((group) => group.items);
+      for (const page of ['advanced', 'company']) {
+        const entries = items.filter((item) => item.to === `/app/system/settings/${page}`);
+        expect(entries).toHaveLength(1);
+        expect(entries[0].newIn).toBe('1.80.0');
+        expect(isVisible(entries[0], 'admin', personal)).toBe(true);
+        expect(isVisible(entries[0], 'manager', personal)).toBe(false);
+        expect(isVisible(entries[0], 'employee', personal)).toBe(false);
+      }
+    }
+  });
+
+  it('uses the new page label rather than the parent settings breadcrumb', () => {
+    expect(crumbsFor('/app/system/settings/advanced').at(-1)?.labelId).toBe('advancedSettings.title');
+    expect(crumbsFor('/app/system/settings/company').at(-1)?.labelId).toBe('companyInfo.title');
+  });
+});
+
+describe('employee health visibility', () => {
+  it('keeps the new page in both editions with manager access and the release badge', () => {
+    const team = navGroups.flatMap(group => group.items).find(item => item.to === '/employee-health')!;
+    const personal = personalAdvancedGroup.items.find(item => item.to === '/employee-health')!;
+    for (const entry of [team, personal]) {
+      expect(entry).toBeDefined();
+      expect(entry.newIn).toBe('1.80.0');
+      for (const isPersonal of [false, true]) {
+        expect(isVisible(entry, 'manager', isPersonal)).toBe(true);
+        expect(isVisible(entry, 'admin', isPersonal)).toBe(true);
+        expect(isVisible(entry, 'employee', isPersonal)).toBe(false);
+      }
+    }
+  });
+});
+
+describe('member management visibility', () => {
+  it('keeps member management restricted to Enterprise admins', () => {
+    const entry = manageAdvancedNav.find(item => item.to === '/manage/users')!;
+    expect(entry).toBeDefined();
+    for (const personal of [false, true]) {
+      for (const role of ['admin', 'manager', 'employee'] as const) {
+        expect(isVisible(entry, role, personal)).toBe(role === 'admin' && !personal);
+      }
+    }
+  });
+});
+
+
+describe('employee template navigation', () => {
+  it('keeps templates Admin-only in both editions and out of the employee sidebar', () => {
+    for (const personal of [false, true]) {
+      const entries = [...primaryItemsForEdition(personal), ...navGroupsForEdition(personal).flatMap(group => group.items)]
+        .filter(item => item.to === '/templates');
+      expect(entries).toHaveLength(1);
+      for (const role of ['admin', 'manager', 'employee'] as const) {
+        expect(isVisible(entries[0], role, personal)).toBe(role === 'admin');
+      }
+    }
+    for (const enabled of [false, true]) {
+      expect(employeeNavItems(enabled).some(item => item.to === '/templates')).toBe(false);
+    }
   });
 });

@@ -19,11 +19,13 @@ async fn fixture() -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().canonicalize().unwrap();
     let handler = MethodHandler::new(home.clone()).await;
+    // Main-target admission reads this file even for a specialist.
+    std::fs::write(home.join("config.toml"), "[general]\ndefault_agent='main'\n").unwrap();
     let system = duduclaw_auth::UserContext::admin_fallback();
     handler
         .handle(
             "agents.create",
-            json!({ "name": "a1", "display_name": "Alice" }),
+            json!({ "name": "a1", "display_name": "Alice", "role": "specialist" }),
             &system,
         )
         .await;

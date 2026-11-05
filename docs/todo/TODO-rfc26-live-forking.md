@@ -26,8 +26,8 @@ The cross-process + parity follow-ups were implemented. Summary of what landed:
 - **P6.1 Plan Mode** — `plan_start` clarify-first tool + `[planner]` config (7 tests).
 - **P6.5 Task Board** — `introduces_parent_cycle` cycle detection + `claim_task` CAS + `would_create_parent_cycle`
   store method (5 tests).
-- **P6.3 built-in skills** — `builtin_skills` bundles code-review/refactor/test-writer/git-workflow, seeded
-  idempotently into every new agent's `SKILLS/` at creation (3 tests).
+- **P6.3 built-in skills** — `builtin_skills` bundles code-review/refactor/test-writer/git-workflow, originally seeded
+  into each new agent. Superseded by B4 (2026-11-05): office defaults are company-wide, programming skills are optional.
 - **Checkpoint SQLite** — `CheckpointManager::with_persistence` durable backend; fork/rewind/lineage survive
   restart (3 tests). `new()` stays pure in-memory (unchanged).
 
@@ -256,7 +256,7 @@ process that owns the child, which is where kill must originate.
 - [x] **Round 2**: `plan_start` MCP tool (`mcp_planner.rs`) + `[planner]` config — clarify-first flow emits ≤3 clarifying questions then decomposes into `tasks_create` steps wiring `depends_on` for ordered steps (7 tests).
 
 ### 6.3 Built-in skill set parity ✅ DONE
-- [x] **Round 2**: `builtin_skills` bundles `code-review` / `refactor` / `test-writer` / `git-workflow` SKILL.md, seeded idempotently into every new agent's `SKILLS/` at creation (3 tests).
+- [x] **Round 2**: `builtin_skills` bundles `code-review` / `refactor` / `test-writer` / `git-workflow` SKILL.md, originally seeded into every new agent; superseded by B4 (2026-11-05): no personal default copies, company-wide office skills only, programming skills optional.
 
 ### 6.4 Memory `/improve` ✅ DONE
 - [x] **Round 2**: `memory_improve` MCP tool (`mcp_memory_handlers::handle_memory_improve`, tool def in `mcp.rs`, gated in `mcp_auth.rs`) — clusters memories by tag into a propose-not-apply reflection scaffold (does not auto-write) (2 tests).

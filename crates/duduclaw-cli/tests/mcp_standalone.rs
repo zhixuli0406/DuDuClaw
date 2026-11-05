@@ -27,7 +27,7 @@ fn base_command(home: &Path, data: &Path) -> Command {
 }
 
 /// Run `duduclaw mcp init --client print` and take the key from its output.
-fn init_token(home: &Path, data: &Path) -> String {
+fn init_env(home: &Path, data: &Path) -> Vec<(String, String)> {
     let out = base_command(home, data)
         .args(["mcp", "init", "--client", "print"])
         .output()
@@ -38,14 +38,23 @@ fn init_token(home: &Path, data: &Path) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let marker = "DUDUCLAW_MCP_API_KEY=";
-    let start = stdout.find(marker).expect("key in output") + marker.len();
-    stdout[start..]
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .trim_matches('\'')
-        .to_string()
+    parse_init_env(&stdout)
+}
+
+fn parse_init_env(stdout: &str) -> Vec<(String, String)> {
+    // Print includes shell commands, TOML and JSON. Read the JSON entry so
+    // quoting, escaped paths and platform-specific shell syntax are irrelevant.
+    let json_start = stdout.split_inclusive('\n').scan(0, |offset, line| {
+        let start = *offset;
+        *offset += line.len();
+        Some((start, line))
+    }).find(|(_, line)| line.trim() == "{").expect("Cursor JSON in init output").0;
+    let config: Value = serde_json::Deserializer::from_str(&stdout[json_start..])
+        .into_iter().next().expect("Cursor JSON value").expect("valid Cursor JSON");
+    config["mcpServers"]["duduclaw"]["env"].as_object().expect("client env")
+        .iter().map(|(name, value)| {
+            (name.clone(), value.as_str().expect("string env value").to_string())
+        }).collect()
 }
 
 struct Server {
@@ -56,9 +65,9 @@ struct Server {
 }
 
 impl Server {
-    fn start(home: &Path, data: &Path, token: &str, cwd: &Path) -> Self {
+    fn start(home: &Path, data: &Path, env: &[(String, String)], cwd: &Path) -> Self {
         let mut child = base_command(home, data)
-            .env("DUDUCLAW_MCP_API_KEY", token)
+            .envs(env.iter().cloned())
             .arg("mcp-server")
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -163,11 +172,12 @@ fn standalone_init_key_lists_only_callable_tools_and_round_trips() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&cwd).unwrap();
 
-    let token = init_token(&home, &data);
-    assert!(token.starts_with("ddc_refresh_"), "{token}");
+    let env = init_env(&home, &data);
+    assert!(env.iter().find(|(name, _)| name == "DUDUCLAW_MCP_API_KEY")
+        .expect("API key in init output").1.starts_with("ddc_refresh_"));
     assert!(data.join("mcp_tokens.db").is_file());
 
-    let mut server = Server::start(&home, &data, &token, &cwd);
+    let mut server = Server::start(&home, &data, &env, &cwd);
     let list = server.request("tools/list", json!({}));
     let names: Vec<String> = list["result"]["tools"]
         .as_array()
@@ -268,6 +278,90 @@ fn standalone_init_key_lists_only_callable_tools_and_round_trips() {
 }
 
 #[test]
+fn standalone_api_key_does_not_bypass_strict_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = home.join(".duduclaw");
+    let env = init_env(&home, &data);
+    let bridge = base_command(&home, &data)
+        .envs(env.iter().cloned())
+        .args(["mcp-remote-bridge", "--agent", "standalone-print", "--server", "test"])
+        .stdin(Stdio::null())
+        .output().unwrap();
+    assert_eq!(bridge.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bridge.stderr)
+        .contains("MCP remote bridge requires a verified identity matching --agent"));
+    for case in ["missing_token", "wrong_agent", "other_standalone_client", "damaged_key"] {
+        let mut supplied = env.clone();
+        match case {
+            "missing_token" => supplied.retain(|(key, _)| key != duduclaw_core::ENV_AGENT_TOKEN),
+            "wrong_agent" => supplied.iter_mut()
+                .find(|(key, _)| key == duduclaw_core::ENV_AGENT_ID).unwrap().1 = "other-agent".into(),
+            "other_standalone_client" => {
+                let key = duduclaw_core::load_identity_key(&data).unwrap();
+                supplied.iter_mut().find(|(key, _)| key == duduclaw_core::ENV_AGENT_ID)
+                    .unwrap().1 = "standalone-codex".into();
+                supplied.iter_mut().find(|(key, _)| key == duduclaw_core::ENV_AGENT_TOKEN)
+                    .unwrap().1 = duduclaw_core::mint_identity_token(&key, "standalone-codex");
+            }
+            _ => std::fs::write(data.join("identity.key"), b"damaged").unwrap(),
+        }
+        let out = base_command(&home, &data)
+            .envs(supplied)
+            .arg("mcp-server")
+            .stdin(Stdio::null())
+            .output().unwrap();
+        assert!(!out.status.success(), "{case}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("MCP caller identity rejected"), "{case}");
+    }
+}
+
+#[test]
+fn external_api_key_cannot_claim_employee_during_identity_grace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = home.join(".duduclaw");
+    let env = init_env(&home, &data);
+    let api_key = "ddc_dev_a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4";
+    std::fs::write(data.join("config.toml"), format!(
+        "[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n\
+         [mcp_keys.{api_key}]\nclient_id = 'external-client'\nis_external = true\n\
+         scopes = ['memory:read']\ncreated_at = {:?}\n",
+        (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
+        chrono::Utc::now().to_rfc3339(),
+    )).unwrap();
+    assert!(!duduclaw_core::require_identity_token_from_home(&data).unwrap());
+    let key = zeroize::Zeroizing::new(duduclaw_core::load_identity_key(&data).unwrap());
+    for client in ["standalone-print", "external-client"] {
+        for case in ["original_token", "missing_token", "signed_employee", "missing_claim"] {
+            let mut cmd = base_command(&home, &data);
+            cmd.envs(env.iter().cloned());
+            if client == "external-client" {
+                cmd.env("DUDUCLAW_MCP_API_KEY", api_key);
+            }
+            cmd.env(duduclaw_core::ENV_AGENT_ID, "sales");
+            match case {
+                "missing_token" => { cmd.env_remove(duduclaw_core::ENV_AGENT_TOKEN); }
+                "signed_employee" => {
+                    cmd.env(duduclaw_core::ENV_AGENT_TOKEN,
+                        duduclaw_core::mint_identity_token(&key, "sales"));
+                }
+                "missing_claim" => {
+                    cmd.env_remove(duduclaw_core::ENV_AGENT_ID);
+                    cmd.env_remove(duduclaw_core::ENV_AGENT_TOKEN);
+                }
+                _ => {}
+            }
+            let out = cmd.arg("mcp-server").stdin(Stdio::null()).output().unwrap();
+            assert!(!out.status.success(), "{client}/{case}");
+            assert!(String::from_utf8_lossy(&out.stderr)
+                .contains("MCP caller identity rejected"), "{client}/{case}");
+        }
+    }
+    assert!(!data.join("memory.db").exists(), "reject before serving tools");
+}
+
+#[test]
 fn mcp_server_without_key_names_the_init_command() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
@@ -288,4 +382,38 @@ fn mcp_server_without_key_names_the_init_command() {
         all.contains("Run: duduclaw mcp init --client claude-code"),
         "missing hint: {all}"
     );
+}
+
+#[test]
+fn standalone_delegation_sender_cannot_spoof_audit_actor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = home.join(".duduclaw");
+    let cwd = tmp.path().join("work");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut env = init_env(&home, &data);
+    let client = env.iter().find(|(k, _)| k == duduclaw_core::ENV_AGENT_ID).unwrap().1.clone();
+    env.push((duduclaw_core::ENV_DELEGATION_SENDER.to_string(), "sales".to_string()));
+    // A malformed proof cannot promote an external principal either.
+    env.push((duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN.to_string(), "forged".to_string()));
+    let mut server = Server::start(&home, &data, &env, &cwd);
+    let result = server.call("memory_store", json!({"content": "Audit attribution regression marker"}));
+    assert!(result.get("error").is_none(), "{result}");
+    assert_ne!(result["result"]["isError"], true, "{result}");
+    let rows = std::fs::read_to_string(data.join("tool_calls.jsonl")).unwrap();
+    let audit: Vec<Value> = rows.lines().map(|l| serde_json::from_str(l).unwrap())
+        .filter(|r: &Value| r["tool_name"] == "memory_store").collect();
+    assert!(!audit.is_empty(), "missing memory_store audit: {rows}");
+    for row in audit { assert_eq!(row["agent_id"], client, "{row}"); }
+    let db = rusqlite::Connection::open(data.join("events.db")).unwrap();
+    let payload: String = db.query_row("SELECT payload FROM events WHERE event = 'memory.changed' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    let feedback: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(feedback["agent_id"], client, "{feedback}");
+    // Rejected calls must use the same authenticated actor too.
+    server.call("tasks_list", json!({}));
+    let rows = std::fs::read_to_string(data.join("tool_calls.jsonl")).unwrap();
+    for row in rows.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()) {
+        assert_ne!(row["agent_id"], "sales", "{row}");
+    }
 }

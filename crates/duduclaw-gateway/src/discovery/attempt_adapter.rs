@@ -46,8 +46,8 @@ impl RuntimeFamily {
     }
     /// True when no native step ceiling exists and the host counts steps.
     pub fn host_counted_steps(self) -> bool { matches!(self, Self::Codex) }
-    pub fn argv(self, model: &str, turns: u32, node: &Path) -> Vec<String> {
-        match self {
+    pub fn argv(self, model: &str, turns: u32, node: &Path) -> Result<Vec<String>, AttemptInfraError> {
+        Ok(match self {
             Self::Claude => {
                 let mut argv=super::agent_spawn::build_claude_argv(model,turns,Path::new("/dudu-runtime/empty-mcp.json"));
                 argv.retain(|arg|arg!="--restricted"); argv.push("--safe-mode".into()); argv
@@ -76,7 +76,7 @@ impl RuntimeFamily {
                 "--disable-web-search".into(),"--no-subagents".into(),"--no-plan".into(),"--no-auto-update".into()],
             Self::OpenAiCompat => vec!["-I".into(),"-S".into(),"-B".into(),"-c".into(),
                 include_str!("python/attempt_openai_compat.py").into(), model.into(),turns.to_string()],
-        }
+        })
     }
 }
 
@@ -263,3 +263,66 @@ pub fn compatible_endpoint(value:&str)->Result<String,AttemptInfraError> {
 #[cfg(test)]
 #[path = "tests_attempt_adapter.rs"]
 mod tests;
+
+/// Run the check in the container namespace, where system config actually lives.
+/// Fresh HOME/CODEX_HOME and disabled user/project config do not exclude /etc.
+pub(crate) fn codex_container_command(executable: &Path, argv: Vec<String>) -> (std::path::PathBuf, Vec<String>) {
+    let mut checked = vec!["-I".into(), "-S".into(), "-B".into(), "-c".into(), CODEX_CONTAINER_GATE.into(),
+        executable.to_string_lossy().into_owned()];
+    checked.extend(argv);
+    ("/usr/local/bin/python3".into(), checked)
+}
+
+pub(crate) const CODEX_CONTAINER_GATE: &str = r#"
+import json, os, pathlib, sys, tomllib
+
+def has_mcp(value):
+    if not isinstance(value, dict):
+        return False
+    if "mcp_servers" in value:
+        servers = value["mcp_servers"]
+        if not isinstance(servers, dict) or servers:
+            return True
+    return any(has_mcp(child) for child in value.values())
+
+def check(path):
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        # A dangling link exists but is not a safely absent layer.
+        if not path.is_symlink():
+            return
+        raise
+    if path.suffix == ".json":
+        cache = json.loads(data)
+        bundle = cache["signed_payload"]["bundle"]
+        for key in ("config_toml", "requirements_toml"):
+            for fragment in bundle.get(key, {}).get("enterprise_managed", []):
+                if has_mcp(tomllib.loads(fragment["contents"])):
+                    raise ValueError("defines native mcp_servers")
+    elif has_mcp(tomllib.loads(data.decode("utf-8"))):
+        raise ValueError("defines native mcp_servers")
+
+paths = [pathlib.Path("/etc/codex") / name for name in
+         ("config.toml", "managed_config.toml", "requirements.toml")]
+home = pathlib.Path(os.environ["CODEX_HOME"])
+# --ignore-user-config leaves trusted project layers active in Codex 0.166.0.
+cwd = pathlib.Path.cwd().resolve()
+paths.append(cwd / "config.toml")
+paths.extend(parent / ".codex" / "config.toml" for parent in (cwd, *cwd.parents))
+try:
+    path = home
+    try:
+        profiles = list(home.iterdir())
+    except FileNotFoundError:
+        profiles = []
+    paths.extend(p for p in profiles if p.name.endswith(".config.toml")
+                 or p.name == "cloud-config-bundle-cache.json"
+                 or (p.name.startswith("managed-config-") and p.name.endswith(".json")))
+    for path in paths:
+        check(path)
+except Exception as error:
+    print("Codex MCP configuration refused: " + str(path) + ": " + str(error), file=sys.stderr)
+    sys.exit(78)
+os.execv(sys.argv[1], sys.argv[1:])
+"#;

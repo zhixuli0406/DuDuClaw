@@ -45,6 +45,7 @@ class ReleaseProGateTests(unittest.TestCase):
         key.parent.mkdir()
         key.write_text("key")
         self.fake_tool("minisign")
+        self.fake_tool("llvm-strip")
         self.fake_tool("docker")
         # `gcloud auth list --format=value(account)` prints the active account.
         self.fake_tool("gcloud", "echo deployer@example.iam.gserviceaccount.com")
@@ -73,6 +74,16 @@ class ReleaseProGateTests(unittest.TestCase):
         result = self.run_bash(PREFLIGHT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("REACHED_NEXT_STAGE PRO_RELEASE=1", result.stdout)
+
+    def test_missing_stripper_stops_before_release_and_override_is_supported(self):
+        self.provide_prerequisites()
+        result = self.run_bash(PREFLIGHT, DUDUCLAW_LLVM_STRIP=str(self.bin / "missing-strip"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("REACHED_NEXT_STAGE", result.stdout)
+        self.assertIn("llvm-strip", result.stdout)
+        self.fake_tool("custom-strip")
+        result = self.run_bash(PREFLIGHT, DUDUCLAW_LLVM_STRIP=str(self.bin / "custom-strip"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_stopped_docker_or_signed_out_gcloud_stops_the_release(self):
         self.provide_prerequisites()

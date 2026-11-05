@@ -225,7 +225,7 @@ impl Manager {
     fn current_config(&self, job: &Job) -> Result<TranscriptionConfig,String> {
         let cfg=TranscriptionConfig::load(&self.home)?;
         if cfg.max_bytes<job.source_bytes {return Err("錄音超過目前設定的大小上限。".into());}
-        if cfg.engine!=job.config.engine || cfg.model!=job.config.model {return Err("轉錄設定已變更，請重新提交會議。".into());}
+        if cfg.engine!=job.config.engine || cfg.model!=job.config.model || cfg.google_stt!=job.config.google_stt {return Err("轉錄設定已變更，請重新提交會議。".into());}
         Ok(cfg)
     }
 }
@@ -320,6 +320,19 @@ pub(crate) fn audit(home:&Path,event:&str,actor:&str,agent:&str,id:&str,outcome:
         assert!(m.background_allowed("alice").is_err());
         std::fs::write(m.home.join(duduclaw_core::autonomy_gate::STATE_FILE), "unknown").unwrap();
         assert!(m.background_allowed("alice").is_err());
+    }
+    #[test] fn transcription_google_stt_destination_change_fences_existing_job() {
+        let (_home,m)=setup();
+        let path=m.home.join("config.toml");
+        let original=std::fs::read_to_string(&path).unwrap();
+        let config=format!("{original}\n[transcription]\nengine='google_stt'\n[transcription.google_stt]\nproject_id='unit-project'\nbucket='approved-bucket'\n");
+        std::fs::write(&path,&config).unwrap();
+        let source=m.agent_dir("alice").join("attachments/audio.wav");
+        std::fs::write(&source,b"approved").unwrap();
+        let job=m.create("alice",source.to_str().unwrap(),None,"zh-TW",None).unwrap();
+        assert!(m.current_config(&job).is_ok());
+        std::fs::write(&path,config.replace("approved-bucket","different-bucket")).unwrap();
+        assert!(m.current_config(&job).is_err());
     }
     #[test] fn admission_binds_bytes_before_approval_and_keeps_snapshot_after_replacement() {
         let (_home,m)=setup();let source=m.agent_dir("alice").join("attachments/audio.wav");

@@ -18,6 +18,9 @@
 //! The registration *content* generators are pure functions so every platform's
 //! output is unit-testable from any host OS.
 
+#[cfg(any(target_os = "macos", test))]
+pub mod update_restart;
+
 use std::path::{Path, PathBuf};
 
 use crate::error::{DuDuClawError, Result};

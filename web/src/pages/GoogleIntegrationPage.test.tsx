@@ -5,6 +5,7 @@ import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { GoogleIntegrationPage } from './GoogleIntegrationPage';
 import { api, type GoogleCredentialsStatus } from '@/lib/api';
+import { useAuthStore } from '@/stores/auth-store';
 
 const BASE: GoogleCredentialsStatus = {
   integration_enabled: true,
@@ -20,6 +21,7 @@ function mockGet(overrides: Partial<GoogleCredentialsStatus> = {}) {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  useAuthStore.setState({user:null});
 });
 
 describe('GoogleIntegrationPage — master gate (G6)', () => {
@@ -69,4 +71,26 @@ describe('GoogleIntegrationPage — master gate (G6)', () => {
     expect(screen.queryByTestId('google-gate-off')).not.toBeInTheDocument();
     expect(screen.queryByTestId('google-gate-on')).not.toBeInTheDocument();
   });
+});
+
+it('lets an administrator opt into Chat without changing the Google integration gate', async () => {
+  useAuthStore.setState({user:{id:'admin',email:'admin@example.test',display_name:'Admin',role:'admin',status:'active'}});
+  mockGet({chat_read:false});
+  const set = vi.spyOn(api.googleCredentials, 'setChatRead').mockResolvedValue({chat_read:true,changed:true});
+  const integration = vi.spyOn(api.googleCredentials, 'setIntegration');
+  renderWithProviders(<GoogleIntegrationPage/>);
+  const toggle = await screen.findByRole('checkbox', {name:'Read Google Chat'});
+  expect(toggle).not.toBeChecked();
+  await userEvent.click(toggle);
+  await waitFor(()=>expect(toggle).toBeChecked());
+  expect(set).toHaveBeenCalledWith(true);
+  expect(integration).not.toHaveBeenCalled();
+  expect(screen.getByText(/Enable the Google Chat API/)).toBeInTheDocument();
+});
+
+it('does not offer the Chat switch to a non-administrator', async () => {
+  mockGet({chat_read:true});
+  renderWithProviders(<GoogleIntegrationPage/>);
+  await screen.findByTestId('google-gate-on');
+  expect(screen.queryByRole('checkbox', {name:'Read Google Chat'})).not.toBeInTheDocument();
 });

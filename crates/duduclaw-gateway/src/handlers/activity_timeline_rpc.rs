@@ -45,7 +45,7 @@ impl MethodHandler {
             Err(f) => return f,
         };
         match store
-            .list_activity(agent_id, event_type, limit, offset)
+            .list_activity_for_principal(agent_id, event_type, limit, offset, Some(&format!("user:{}", reader.live().user_id)))
             .await
         {
             Ok((rows, total)) => {
@@ -103,11 +103,14 @@ impl MethodHandler {
             Ok(t) => t,
             Err(e) => return WsFrame::error_response("", &format!("timeline tasks: {e}")),
         };
+        let tasks: Vec<_> = tasks.into_iter().filter(|t| {
+            task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), &t.id)
+        }).collect();
         // Most-recent TIMELINE_ROW_CAP activity events; events older than the
         // newest cap-full may be missing from wide windows — the `truncated`
         // flag + `cap` in the response make that visible to the client.
         let (activities, _total) = match store
-            .list_activity(agent_id, None, TIMELINE_ROW_CAP as i64, 0)
+            .list_activity_for_principal(agent_id, None, TIMELINE_ROW_CAP as i64, 0, Some(&format!("user:{}", reader.live().user_id)))
             .await
         {
             Ok(r) => r,

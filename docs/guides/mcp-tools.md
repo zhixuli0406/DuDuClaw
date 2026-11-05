@@ -12,6 +12,63 @@ declaration surface, not the implementation. To run the server on its own,
 without the gateway, see [mcp-standalone.md](mcp-standalone.md).
 
 
+## MCP client protocol versions
+
+The API/openai-compat client and remote MCP bridge prefer **2026-07-28**. They
+probe with `server/discover` and put the revision, client capabilities and client
+identity in each request. HTTP requests include `MCP-Protocol-Version`, `Mcp-Method`
+and, where required, `Mcp-Name`. Valid `x-mcp-header` tool arguments are mirrored
+into headers; tools with invalid annotations are hidden. Unicode header values
+use the protocol's Base64 encoding.
+
+Older servers fall back to **2025-11-25** or **2025-06-18** with `initialize`,
+`notifications/initialized` and the negotiated session header. During initial
+discovery, `-32022` selects the newest mutually supported revision. Once connected,
+the bridge refuses `-32022`, invalidates the connection and requires a conversation
+restart to negotiate, list tools and apply the gates again; it never replays the
+call under a different revision. The API client also terminates a `tools/call`
+that receives `-32022` and refuses all subsequent requests on that client. Its host
+must reconnect, list tools and apply the gates again; initial handshake and
+standalone list recovery remain available. Explicit modern capability/header errors do not
+trigger a downgrade. Each new API HTTP connection performs its own discovery;
+there is no global URL-only version cache. The bridge retains negotiation state
+only for its own connection. Credentials, sessions and tool lists are not shared
+between principals. The API client also tries deprecated HTTP+SSE if legacy initialization returns 400/404/405, accepting
+an `endpoint` only on the configured origin.
+
+The API client's modern MRTR uses a fresh request ID, the original tool arguments
+and the server's unchanged `requestState` for each retry, with a finite round limit. It
+supports a host-provided input handler; without one it declares no interactive
+capabilities and refuses unsolicited input requests. There is no new consent UI
+or automatic acceptance of elicitation. Tasks, sampling and roots are not enabled
+by default. The remote bridge declares no modern interactive capabilities and
+refuses every `input_required` result, including state-only results. It also
+refuses downstream requests containing `requestState` or `inputResponses` before
+sending them upstream. Bridge MRTR remains unavailable until the complete
+continuation payload can pass egress and approval checks bound to the original
+approved call generation. A broken tool response is an error; an uncertain side
+effect is not silently replayed. Tool filters and third-party classification still apply.
+
+Remote OAuth uses pre-registered credentials first. To use CIMD, an administrator
+may configure an existing public HTTPS metadata document:
+
+```toml
+[remote_mcp]
+client_metadata_url = "https://your-domain.example/mcp-client.json"
+```
+
+When the authorization server supports CIMD, the document must identify that exact
+URL, allow the configured callback URI and use public-client authentication
+(`token_endpoint_auth_method = "none"`). Invalid selected metadata fails closed.
+Otherwise dynamic registration remains the fallback, with `application_type`.
+PKCE and resource indicators remain required; callback `iss` is checked before
+code exchange, and saved credentials remain bound to their issuer. Both discovered
+and stored OAuth resources must exactly match the MCP endpoint's canonical
+resource (scheme, host, port and path, with trailing slashes removed). Resource
+query strings, fragments and other paths on the same origin are refused. Older
+stored credentials that do not match require reconnection. Automatic
+403 scope step-up and CIMD `private_key_jwt` are not implemented.
+
 ## Meeting transcription
 
 `meeting_transcribe` takes `source_path` from the calling employee's own attachments,
@@ -86,8 +143,8 @@ still reaches the real gates, which accept or refuse it under the existing rules
 |---|---|---|
 | External client whitelist | `principal.is_external` | Only the 7 legacy whitelist tools plus tools in explicitly granted scopes; then the scope row below applies |
 | Scopes of a non-employee caller | `principal.scopes`, for a key that holds no `admin` and is not an AI employee (not the gateway-internal key, not a per-agent key, not a process the gateway spawned for an employee) | Only tools whose minimum scope the key holds; tools that act for the process's own agent (`working_state_*`, `canvas_*`, `shared_wiki_delete`, `memory_search_by_layer` and three consolidation reads, …) are hidden from it, and from every external key, and the dispatch gate refuses them by the same rule (`process_agent_tool`). See [mcp-standalone.md](mcp-standalone.md) |
-| Google Workspace | `config.toml [integrations] google_workspace` | All 19 Google tools, including `google_status`, are hidden while off. Dashboard setup and tests remain available: [Connect Google](google-setup.md). |
-| Google identity (v1.76.0) | `agent.toml [google] identity`, else `config.toml [integrations.google_identity] default_identity` | `none` hides the same 19 tools and the dispatch gate refuses them. Any other value keeps them listed; a call that cannot use the identity returns the reason. `google_status` now starts with who the employee acts as |
+| Google Workspace | `config.toml [integrations] google_workspace` | All 21 Google tools, including `google_status`, are hidden while off. Dashboard setup and tests remain available: [Connect Google](google-setup.md). |
+| Google identity (v1.76.0) | `agent.toml [google] identity`, else `config.toml [integrations.google_identity] default_identity` | `none` hides the same 21 tools and the dispatch gate refuses them. Any other value keeps them listed; a call that cannot use the identity returns the reason. `google_status` now starts with who the employee acts as |
 | GitHub | `config.toml [integrations] github` | 5 `github_*` tools hidden |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | Denied tools hidden; a non-empty allowlist hides everything else. An entry matches a tool exactly, or by a trailing `*`: `*`, `mcp__duduclaw__*` (every DuDuClaw tool), `mcp__duduclaw__odoo_*` / `memory_*` (anchored prefix). `mcp__<other server>__…` never names a DuDuClaw tool; a `*` elsewhere is literal. The approval lists and `scoped_tools` use the same rule |
 | `os_native` | `agent.toml [capabilities]` | 6 `os_*` automation tools hidden |
@@ -262,6 +319,22 @@ build the model's tool list from name, description and input schema only.
 ### `tasks_create` — per-goal run limit
 
 `tasks_create` with `kind="goal"` (not scheduled) accepts `timeout_secs`, an integer from 30 to 3600: the limit for each CLI run / API request of that goal's rounds, replacing the assignee's own run limit. Over MCP it can only be shorter than or equal to that limit; giving a goal more time is an Admin decision on the dashboard. Claude employees ignore it (fixed 30-minute limit). `tasks_update` refuses the field. Example: `{"kind":"goal","title":"Reconcile the ledger","assigned_to":"anna","timeout_secs":180}`.
+
+### `office_script` — bundled office scripts
+
+`office_script` runs a manifest-verified script bundled in the binary for
+`docx`, `xlsx`, `pptx`, or `pdf`. Select `create`, `extract`, or `to_pdf`;
+`.py` is optional and script names cannot contain paths. Skills installed in an
+agent's skill folder may change the prompt/instructions, but cannot replace the
+executable script. This tool runs on Linux and macOS.
+
+Pass `args` as a JSON string array, for example `["outline.md", "--out",
+"attachments/deck.pptx"]`. Input may come from the agent directory or shared
+attachments. Output must be a new file under the agent directory, with an
+existing parent directory and the expected extension. Pass each flag and value
+as separate array elements; `--key=value`, symlinks and path traversal are
+refused. To hand a produced file to the user, end the reply with
+`DELIVER:<absolute path>`.
 
 ### `codrive_run` — the three-rung execution ladder
 
@@ -594,3 +667,17 @@ The proxy resolves references for its own employee only, immediately before star
 At gateway boot, legacy literal env values are migrated after an encrypted backup is saved to `<home>/backups/mcp-migrate/<agent>-<timestamp>.enc`. The encrypted store is written and read back before the config is replaced atomically. Every stage waits for a parent-directory fsync barrier in this order: key, encrypted backup, store, config. A failed stage aborts that employee; failure after config replacement restores the original bytes. If restoration also fails, the error is reported and the durable encrypted backup is retained for recovery. Migration continues with other employees; at most three migration backups are retained per employee after cleanup; an I/O failure is logged and cleanup is retried on the next sweep. Deleting a server or employee removes its store entries. Restoring a deleted employee requires re-entering its keys.
 
 The Read guard denies `<home>/secrets`. This is not isolation from Bash: an employee running under the same OS user can still read gateway files, including `.keyfile`; real isolation requires no Bash or the task sandbox. Only `env` is covered: keys in `args` or `url`, and tool results that echo a key, are not covered. Existing plaintext exports and backups are not retroactively cleaned.
+
+## Google Chat read tools
+
+`google_chat_spaces` lists spaces the connected user belongs to: resource name, display name, type and last active time when Google supplies it. `limit` defaults to 20 (1–50); `filter` accepts exactly `SPACE`, `GROUP_CHAT` or `DIRECT_MESSAGE`.
+
+`google_chat_messages` reads recent messages from a strict `spaces/...` resource name, newest first. `limit` defaults to 30 (1–100); optional `since` must be RFC3339 and `thread` must be a thread resource within that space. Each message includes its sender, creation time, text (at most 2,000 characters), thread and attachment names. Attachments are never downloaded. Sender names use Google's returned display name or the `users/...` resource; no People API or extra membership permission is used. The complete returned content is capped at 30,000 characters.
+
+1. An administrator enables **Google Chat read** in the dashboard under Manage → Integrations → Google (`[google] chat_read = true`, default false).
+2. The user reconnects their own Google account in **My connections** and selects both Chat read permissions. The optional scopes are `https://www.googleapis.com/auth/chat.spaces.readonly` and `https://www.googleapis.com/auth/chat.messages.readonly`; existing users are not asked for them while the switch is off.
+3. In the OAuth client's Google Cloud project, enable **Google Chat API** and configure a **Chat app**, even for user authentication. A Workspace administrator may also need to allow the OAuth app.
+
+These tools use the same employee/account ownership, scope, approval and private-data egress gates as Gmail reads. They read the account selected by that existing identity policy; they do not accept a user/account argument. Apps Script does not support these Chat reads. This is separate from the Chat bot channel's DMs and mentions. Disabling the switch blocks new Chat reads, including existing tokens; it does not revoke Google's previously granted permissions.
+
+Returned content is untrusted reference data, wrapped and scanned with the group-history policy. Any injection hit refuses the whole response with `not available`. Audit entries retain space identifiers and counts, never message text. Fixture and local tests do not establish real-account access; verify consent and reading with the customer's account before acceptance.

@@ -41,16 +41,36 @@ duduclaw start
 
 ## 移行時の注意点
 
-- **ライセンス**：`license.json` はマシンフィンガープリント（hostname + MAC）に紐づいている。
+- **ライセンス**：`license.json` はマシンフィンガープリント（macOS はハードウェア UUID、Linux／Windows は hostname + MAC）に紐づいている。
   マシンを変更してもPersonal Editionのコア機能はそのまま動作する（Apache 2.0）。Pro付加モジュール
   がある場合は、ライセンスの発行元が新しいマシンへ紐付け直す必要があります。
 - **チャンネルトークン**：channel bot tokenは暗号化された設定内にあり、一緒に移行される。IPや
   ドメインを変更した際は、webhook URLの更新を忘れないこと。
-- **EditionProfile**：gateway は次の順に判定します。まず `DUDUCLAW_EDITION` 環境変数（`personal` または
-  `enterprise`）、次にライセンスのティア（Business、OEM、Partner、Self-Host Pro は `enterprise`）、
-  どちらもなければ `personal` です。ダッシュボードの切り替えスイッチも設定ファイルのキーもありません。
-  `agent.toml [edition] profile` を読むコードは存在しません。該当ライセンスなしでセルフホスト環境を
-  エンタープライズとして動かすには、gateway の環境に `DUDUCLAW_EDITION=enterprise` を設定して再起動します。
+- **EditionProfile**：すべてのビルドで検証済みライセンスがエディションの上限を決めます
+  （Business、OEM、Partner、Self-Host Pro は `enterprise`）。有効なライセンスがなければ `personal` です。
+  `DUDUCLAW_EDITION`（`personal` または `enterprise`）は組み込みホストの `GatewayConfig.edition` より優先されますが、
+  どちらも上限を狭めることしかできません。昇格要求は無視され、入力元ごとにプロセス内で一度だけ警告します。
+  Business を `personal` に制限できますが、個人ライセンスを `enterprise` に昇格させることはできません。
+  Debug assertions が有効でも昇格は許可されず、テストでは一時的な署名済みライセンスを使います。専用テスト API は非デフォルトの `test-edition-override` feature と Debug assertions の両方を必要とし、release ビルドではこの feature を拒否します。ダッシュボードの切り替えスイッチはなく、
+  `agent.toml [edition] profile` も読み取られません。セルフホストの企業版には対応する有効なライセンスが必要です。
+
+## macOS のライセンス識別と再紐付け
+
+macOS の新しいフィンガープリントは `macos-uuid-v2:<32 桁の16進数>` です。ホスト名を含めず、`IOPlatformUUID` から生成します。`duduclaw license fingerprint`、ダッシュボードの有効化カード、再紐付け要求ではこの値を使用します。有効化は署名済みライセンスのインストールであり、その操作自体が発行を要求するわけではありません。従来の「ホスト名 + UUID」の候補は検証でき、旧方式として表示されます。ただし過去のホスト名は復元できません。旧ライセンスが一致しなくなった場合は発行元に連絡し、新形式への対応後に `duduclaw license rebind` を実行してください。
+
+MAC 由来の識別は3段階です。**Hardware** はグローバル管理のユニキャスト MAC です。**Instance** は Linux／Windows 上の既知の共有プレースホルダーを除くローカル管理のユニキャスト MAC で、GCP、AWS、Docker の NIC を含みます。状態には「クラウド／コンテナー識別」と表示します。どちらも既存の有料ライセンス、新規有効化、承認済み再紐付けに使用できます。主要 MAC は Hardware、次に Instance を優先します。**Weak** は MAC なし、全ゼロ、共有 `02:00:00:00:00:00` と Npcap／KM-TEST `02:00:4C:4F:4F:50`、ブロードキャスト `FF:FF:FF:FF:FF:FF`、マルチキャスト MAC、プレースホルダー UUID です。一致しても承認済み再紐付けまで OpenSource を維持し、新しい紐付けの候補にはしません。Linux／Windows は旧版の hostname + MAC ハッシュを維持し、過去の Instance 候補も検証できます（主要候補でなければ `legacy = true`）。OS 管理者はこれらの識別情報を複製できます。Instance はローカルで取得した識別情報を表し、ハードウェア証明ではありません。macOS の過去のローカル管理 MAC は UUID を取得できる場合もできない場合も Weak のままです。Windows の主要インターフェース選択では、ソフトウェアループバック、ソフトウェア仮想、トンネル型と既知のループバック記述も除外します。macOS の UUID v2 と UUID 取得失敗時の制限は変わりません。
+
+新形式へ再紐付けしたライセンスは旧版のプログラムでは検証できません。移行前にライセンスを読むすべてのプロセスを更新し、ダウングレードが必要な場合は発行元に互換形式への再紐付けを依頼してください。
+
+UUID の読み取りは最大3回、各回のタイムアウトは5秒です。取得できなくても UUID に紐付いたライセンスを MAC 候補で許可しません。CLI とダッシュボードも、UUID を読み取れるまで新規発行用のフィンガープリントの提供を拒否します。UUID のファイルキャッシュは作成しません。所有者だけが読み書きできるファイルでも同じアカウントの別プロセスが変更でき、その UUID がこのマシンから取得された証拠にはならないためです。Linux／Windows は hostname + MAC の紐付けを維持します。実際のグローバル管理ユニキャスト MAC は引き続き Hardware として、移行なしで有料ライセンスを検証できます。インストール済みライセンスが無効ならコア機能は OpenSource として動作し、Admin のダッシュボード、`duduclaw license status`、`duduclaw doctor` に理由が表示されます。
+
+**コントロールプレーンの互換性：** refresh の `machine_fingerprint` はインストール済みの紐付けを保持します。異なる macOS UUID を `new_fingerprint` として提案しますが、**アカウント所有者がコンソールで再紐付けを承認した後にのみ有効**です。rebind は `old_fingerprint`、`new_fingerprint` と新しい nonce を送信します。フィンガープリントは公開識別子であり、所有権の証明ではありません。検証済みの署名を持つ `status: "pending"` では元のライセンスを保持し、コンソール承認待ちと表示します。HTTP 202 にもこの署名済み本文が必要で、空の応答や検証できない応答は拒否します。Linux／Windows の refresh は一致する Hardware または Instance の紐付けを維持し、それ以外はローカルの Weak ではない優先候補を提案します。unbound OEM の refresh は変わりません。macOS UUID を取得できない場合、紐付けのあるライセンスの refresh／rebind は停止し、MAC への変更を提案しません。
+
+active 応答はライセンスと応答の両方の署名、完全一致する nonce と元のサブスクリプション、元または提案した紐付け（明示的な rebind は提案した紐付けのみ）、期限、候補の強度、オフライン猶予、プランと配備方式を検証します。active、revoked、pending のすべてに v2 署名エンベロープが必要です。失効応答は署名を検証し、`effective_from` の時刻が到来している場合にのみ、失効マーカーを永続化してインストール済みライセンスを削除します。偽造された応答や古い応答でライセンスやマーカーは変更されません。
+
+**発行側の応答署名契約：** 数値 `response_signature_version: 2` のみを受け付けます。バージョンの欠落、旧版、不正な形式、未知のバージョンは拒否します。本文には `status`、`reason`、RFC3339 形式の `effective_from`、`nonce`、`subscription_id`、`original_fingerprint`、`proposed_fingerprint`、`license_digest`、`public_key_id`、base64 Ed25519 `response_signature` を含めます。署名対象は空白なし UTF-8 JSON 配列 `["duduclaw:license-response:v2",2,status,reason,effective_from,nonce,subscription,original,proposed,license_digest]` です。提案がなければ、提案した紐付けには元の紐付けを使用します。active の `license_digest` は Rust のフィールド順序と省略規則でコンパクトにシリアライズした `License`（署名と `control_url` を含む）の小文字 SHA-256 です。応答とライセンスの `public_key_id` は同一の信頼済みキーである必要があります。pending／revoked のダイジェストは空文字列で、応答の `public_key_id` により信頼済みレジストリから公開鍵を選択します。参照シリアライザーは `duduclaw_license::refresh::response_payload` です。発行側はアカウント所有者を認証し、コンソール承認を待って紐付けを更新し、ライセンスと応答を署名します。クライアントを更新する前に、この契約に対応した発行側を配備してください。
+
+Gateway と CLI の有効化、インポート、更新、再紐付け、失効処理は、プロセス間 advisory lock を共有します。ネットワーク要求の前にロック内でライセンスファイル全体と失効マーカーのダイジェストを取得し、ロックを解放します。応答後に再取得し、どちらかのダイジェストが変わっていれば書き込みを拒否します。Gateway はメモリ上の revision も確認します。書き込みには一意の一時ファイル、ファイル fsync、原子的 rename を使用し、Unix ではディレクトリも同期します。このロックは協調する製品プロセスを保護しますが、直接書き込み権限を持つプロセスは advisory lock を無視できます。Windows ネイティブでの永続化、発行側の実際の配備、コンソール承認、メール配信、顧客環境の移行は別途検証が必要です。ライセンスファイル自体の署名からは引き続き `control_url` を除外しますが、必須の応答署名にはこの URL が含まれます。外部通信には[固定ホストと DNS のポリシー](../../features/ja-JP/05-security-defense.md#ライセンスの紐付けと更新)も適用します。独自の発行元はライセンスに URL を含めていても、クライアント側で `DUDUCLAW_CONTROL_URL` を明示的に設定する必要があります。`new_fingerprint` を無視するサーバーでは旧紐付けを維持し、弱い紐付けは承認された移行が成功するまで OpenSource のままです。
 
 ## ロードマップ（計画中）
 

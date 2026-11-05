@@ -154,7 +154,7 @@ mod tests {
     fn secret_resolution_requires_a_valid_host_token_even_in_soft_mode() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("config.toml"),
-            "[delegation]\nrequire_identity_token = false\n[general]\ndefault_agent = 'alice'\n").unwrap();
+            format!("[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n[general]\ndefault_agent = 'alice'\n", (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339())).unwrap();
         let env = serde_json::json!({"API_KEY":"sentinel-key"}).as_object().unwrap().clone();
         let refs = duduclaw_security::mcp_secret_store::store_mcp_env(home.path(), "alice", "server", &env).unwrap();
         let raw = serde_json::Value::Object(refs).to_string();

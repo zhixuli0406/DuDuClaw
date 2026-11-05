@@ -29,6 +29,8 @@ import { looksLikeIdQuery, findIdMatch, idMatchRoute } from '@/lib/id-lookup';
 import { useDataScope, useVisibleAgents } from '@/lib/data-scope';
 import {
   allManageNav,
+  employeeNavItems,
+  isEmployeeSidebar,
   conversationsEntry,
   inboxEntry,
   manageEntry,
@@ -344,10 +346,10 @@ export function CommandPalette() {
     // destination (T1.5). `staffEntry` / `manageEntry` are already inside
     // `navGroups`, so they must NOT be appended again (duplicate route id).
     const navSources: Array<{ item: NavItem; groupLabel: string }> = [
-      ...primaryItemsForEdition(isPersonal).map((item) => ({ item, groupLabel: 'navGroup.daily' })),
+      ...(isEmployeeSidebar(user?.role, isPersonal) ? employeeNavItems() : primaryItemsForEdition(isPersonal)).map((item) => ({ item, groupLabel: 'navGroup.daily' })),
       // 收件匣 and 對話紀錄 left / never joined the standing rail (2026-08-04,
       // D17) — ⌘K is how you reach them by name, so fold them back in here.
-      { item: inboxEntry, groupLabel: 'navGroup.daily' },
+      ...(!isEmployeeSidebar(user?.role, isPersonal) ? [{ item: inboxEntry, groupLabel: 'navGroup.daily' }] : []),
       { item: conversationsEntry, groupLabel: 'navGroup.daily' },
       ...navGroupsForEdition(isPersonal).flatMap((group) =>
         group.items.map((item) => ({ item, groupLabel: group.label })),
@@ -367,6 +369,7 @@ export function CommandPalette() {
       decisionEnabled,
     };
     const navCommands: Command[] = navSources
+      .filter(({ item }, index, entries) => entries.findIndex(entry => entry.item.to === item.to) === index)
       .filter(({ item }) => isVisible(item, user?.role, isPersonal, visibilityCtx))
       .map(({ item, groupLabel }) => ({
         id: `nav:${item.to}`,

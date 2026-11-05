@@ -120,8 +120,18 @@ pub const PROXY_PRIVATE_ENV: &[&str] = &[
     "DUDUCLAW_UPSTREAM_UNKNOWN",
     "DUDUCLAW_ON_BEHALF_OF",
     "DUDUCLAW_TASK_ID",
+    duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN,
+    duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT,
+    duduclaw_core::ENV_DELEGATION_SENDER,
+    duduclaw_core::ENV_DELEGATION_ORIGIN,
+    duduclaw_core::ENV_DELEGATION_DEPTH,
 
 ];
+
+fn is_private_upstream_env(name: &str) -> bool {
+    duduclaw_core::mcp_proxy_rewrite::is_proxy_private_env_key(name)
+        || PROXY_PRIVATE_ENV.iter().any(|private| private.eq_ignore_ascii_case(name))
+}
 
 // ── Pure frame helpers (unit-tested without any process) ────────────────────
 
@@ -323,16 +333,16 @@ fn call_capacity(held: &mut tokio::task::JoinSet<()>) -> bool {
 /// [`PROXY_PRIVATE_ENV`], with the JSON map from [`PROXY_UPSTREAM_ENV_VAR`]
 /// layered on top.
 ///
-/// This is only a merge helper, not a security control. Production calls it
-/// only after `resolve_declared_env` has strictly parsed and resolved the
-/// declared map, and checks the merged result before spawning.
+/// Private host credentials/metadata are excluded from both sources, with
+/// case-insensitive matching for Windows environment semantics. Production
+/// resolves the declared map first and checks unresolved values before spawn.
 pub fn upstream_env(
     inherited: impl IntoIterator<Item = (String, String)>,
     encoded: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = inherited
         .into_iter()
-        .filter(|(k, _)| !PROXY_PRIVATE_ENV.contains(&k.as_str()))
+        .filter(|(k, _)| !is_private_upstream_env(k))
         .collect();
 
     let declared: Vec<(String, String)> = encoded
@@ -346,6 +356,7 @@ pub fn upstream_env(
         .unwrap_or_default();
 
     for (k, v) in declared {
+        if is_private_upstream_env(&k) { continue; }
         match out.iter_mut().find(|(ek, _)| *ek == k) {
             Some(slot) => slot.1 = v,
             None => out.push((k, v)),
@@ -427,6 +438,17 @@ pub async fn run_proxy_io_gated(
     gate: Option<Arc<ThirdPartyGate>>,
     io: ProxyIo,
 ) -> std::io::Result<()> {
+    run_proxy_io_with_identity(server, layer, gate, io, None).await
+}
+
+// Production proxies revalidate before forwarding, including approval-held calls.
+async fn run_proxy_io_with_identity(
+    server: &str,
+    layer: Option<Arc<McpRedactionLayer>>,
+    gate: Option<Arc<ThirdPartyGate>>,
+    io: ProxyIo,
+    identity_home: Option<std::path::PathBuf>,
+) -> std::io::Result<()> {
     let ProxyIo {
         client_in,
         mut client_out,
@@ -456,8 +478,22 @@ pub async fn run_proxy_io_gated(
     let (up_tx, mut up_rx) = mpsc::unbounded_channel::<QueuedFrame>();
     let writer_gate = gate.clone();
     let writer_pending = pending.clone();
+    let writer_home = identity_home.clone();
+    let writer_tx = tx.clone();
     let up_writer = tokio::spawn(async move {
         while let Some(mut frame) = up_rx.recv().await {
+            if writer_home.as_deref().is_some_and(|home|
+                crate::mcp::caller_identity_verdict(home) == duduclaw_core::IdentityVerdict::Rejected)
+            {
+                if let Some(id) = parse_frame(&frame.line).and_then(|v| v.get("id").cloned()) {
+                    let id = frame.slot.as_ref().map(|slot| slot.id.clone()).unwrap_or(id);
+                    let _ = writer_tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
+                        &id, "MCP caller identity rejected: strict tokens required or identity policy/key unavailable",
+                    ));
+                }
+                if let Some(gate) = &writer_gate { gate.close_pending(); }
+                continue;
+            }
             if write_queued_frame(&mut upstream_in, &mut frame).await.is_err() {
                 if let Ok(mut pending) = writer_pending.lock() { pending.inner.clear(); }
                 if let Some(gate) = &writer_gate { gate.close_pending(); }
@@ -551,6 +587,16 @@ pub async fn run_proxy_io_gated(
             continue;
         };
 
+        if identity_home.as_deref().is_some_and(|home|
+            crate::mcp::caller_identity_verdict(home) == duduclaw_core::IdentityVerdict::Rejected)
+        {
+            if let Some(id) = frame.get("id") {
+                let _ = tx.send(duduclaw_gateway::third_party_tools::refusal_frame(
+                    id, "MCP caller identity rejected: strict tokens required or identity policy/key unavailable",
+                ));
+            }
+            continue;
+        }
         if !frame.is_object()
             || (frame.get("method").and_then(Value::as_str) == Some("tools/call")
                 && tool_call_of(&frame).is_none())
@@ -880,6 +926,13 @@ pub async fn run_mcp_proxy_scoped(
         ));
     }
 
+    let default_agent = crate::mcp::get_default_agent(home_dir).await;
+    if default_agent == duduclaw_core::UNTRUSTED_AGENT_ID {
+        return Err(DuDuClawError::Gateway(
+            "MCP caller identity rejected: refusing to start the upstream proxy".into(),
+        ));
+    }
+
     // Authenticate secret-store reads before initializing other per-agent
     // services. No fallback/default identity may authorize secret resolution.
     let env_blob = match scoped_blob {
@@ -919,8 +972,6 @@ pub async fn run_mcp_proxy_scoped(
             return Err(DuDuClawError::Gateway(message));
         }
     };
-
-    let default_agent = crate::mcp::get_default_agent(home_dir).await;
 
     // Same three outcomes as `mcp-server` (§10.2): disabled ⇒ pass-through,
     // enabled ⇒ redact, broken ⇒ refuse to start.
@@ -1009,7 +1060,7 @@ pub async fn run_mcp_proxy_scoped(
         upstream_out: Box::new(upstream_out),
     };
 
-    if let Err(e) = run_proxy_io_gated(server, layer, gate, io).await {
+    if let Err(e) = run_proxy_io_with_identity(server, layer, gate, io, Some(home_dir.to_path_buf())).await {
         tracing::warn!(server = %server, error = %e, "mcp-proxy: stream loop ended with an error");
     }
 
@@ -1030,6 +1081,29 @@ mod tests {
     };
     use serde_json::json;
     use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn identity_guard_refuses_proxy_frames_before_forwarding() {
+        let home = tempfile::tempdir().unwrap();
+        // Missing grace must be strict even when false was requested.
+        std::fs::write(home.path().join("config.toml"),
+            "[delegation]\nrequire_identity_token = false\n").unwrap();
+        let (client_out, mut client_read) = duplex(4096);
+        let (upstream_in, mut upstream_read) = duplex(4096);
+        let request: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"read\"}}\nopaque\n";
+        run_proxy_io_with_identity("test", None, None, ProxyIo {
+            client_in: Box::new(request),
+            client_out: Box::new(client_out),
+            upstream_in: Box::new(upstream_in),
+            upstream_out: Box::new(tokio::io::empty()),
+        }, Some(home.path().to_path_buf())).await.unwrap();
+        let mut forwarded = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut upstream_read, &mut forwarded).await.unwrap();
+        assert!(forwarded.is_empty());
+        let mut reply = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut client_read, &mut reply).await.unwrap();
+        assert!(reply.contains("MCP caller identity rejected"));
+    }
 
     // ── pure frame classification ────────────────────────────────────
 
@@ -1474,6 +1548,34 @@ mod tests {
     }
 
     #[test]
+    fn upstream_env_never_contains_delegation_proof_or_metadata() {
+        let names = [
+            "DUDUCLAW_DELEGATION_",
+            "dUdUcLaW_dElEgAtIoN_CONTEXT_SUFFIX",
+            "DUDUCLAW_DELEGATION_FUTURE",
+            duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN,
+            duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT,
+            duduclaw_core::ENV_DELEGATION_SENDER,
+            duduclaw_core::ENV_DELEGATION_ORIGIN,
+            duduclaw_core::ENV_DELEGATION_DEPTH,
+        ];
+        let variants: Vec<String> = names.iter().flat_map(|name| [
+            name.to_string(), name.to_ascii_lowercase(), name.replacen("DUDUCLAW", "DuDuClaw", 1),
+        ]).collect();
+        for name in &variants {
+            let raw = serde_json::json!({"mcpServers": {"third-party": {
+                "command": "server", "env": {name: "private"}
+            }}});
+            assert!(duduclaw_core::mcp_proxy_rewrite::validate_raw_mcp_config(
+                &raw, Path::new("/duduclaw"), &serde_json::json!({})).is_err());
+        }
+        let inherited = variants.iter().map(|name| (name.clone(), "private".to_string()));
+        let declared: serde_json::Map<String, Value> = variants.iter()
+            .map(|name| (name.clone(), Value::String("declared-secret".into()))).collect();
+        assert!(upstream_env(inherited, Some(&serde_json::to_string(&declared).unwrap())).is_empty());
+    }
+
+    #[test]
     fn a_malformed_env_blob_is_ignored_not_fatal() {
         let inherited = vec![("PATH".to_string(), "/bin".to_string())];
         let out = upstream_env(inherited, Some("not json"));
@@ -1598,7 +1700,7 @@ mod tests {
 
     /// The third-party tool gate in the proxy: a blocked tool is hidden and
     /// refused without reaching the upstream, an `ask` tool waits for an
-    /// ApprovalBroker decision, a trusted read passes.
+    /// ApprovalBroker decision, including upstream read-only claims.
     #[tokio::test]
     async fn gate_hides_refuses_and_holds_calls_for_approval() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1662,13 +1764,15 @@ mod tests {
         let home = tmp.path().to_path_buf();
         let approver = tokio::spawn(async move {
             let broker = duduclaw_gateway::approval::ApprovalBroker::open(&home).unwrap();
+            let mut approved = std::collections::HashSet::new();
             for _ in 0..200 {
                 let pending = broker.list_pending(Some("a1")).await.unwrap_or_default();
                 if let Some(rec) = pending.first() {
                     assert_eq!(rec.action_kind, "mcp_call");
-                    assert!(rec.summary.contains("crm.put"), "{}", rec.summary);
+                    assert!(rec.summary.contains("crm.put") || rec.summary.contains("crm.get"), "{}", rec.summary);
                     broker.decide(&rec.id, true, "dashboard:admin").await.unwrap();
-                    return true;
+                    approved.insert(rec.id.clone());
+                    if approved.len() == 2 { return true; }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -1692,7 +1796,7 @@ mod tests {
         w.flush().await.unwrap();
         drop(w);
 
-        assert!(approver.await.unwrap(), "an approval was filed");
+        assert!(approver.await.unwrap(), "both Modify calls required approval");
         proxy.await.unwrap().unwrap();
         let seen = upstream.await.unwrap();
         while let Ok(Some(l)) = lines.next_line().await {

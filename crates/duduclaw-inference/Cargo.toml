@@ -29,9 +29,11 @@ regex-lite = "0.1"
 ferrous-opencc = { version = "=0.4.0", default-features = false, features = ["s2t-conversion"] }
 tempfile = "3"
 libc = "0.2"
+fs2 = "0.4"
 zeroize = "1"
 base64 = { workspace = true }
 sha2 = "0.10"
+jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 hex = "0.4"
 ucci = { git = "https://github.com/varunkotte6/ucci", rev = "80cd2319cc2b41e3a5c35a64acd6b5dcbf5c217b" }
 

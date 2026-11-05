@@ -1,5 +1,7 @@
 # Task sandbox: run an agent's delegated tasks in a locked-down container
 
+**Codex external configuration gate (since v1.80.0):** Employees, Explore, utility, Task Sandbox and Discovery may run when external layers are absent or define no MCP servers; detected MCP or unreadable/unparseable existing layers refuse launch with the source named. A refused explicit Codex judge fails acceptance without retrying the default judge. This checks a local/cache snapshot before launch, not complete isolation from subsequent cloud refresh. See [checked sources and limits](../architecture/extension-gates.md).
+
 The task sandbox runs a delegated task for one agent inside a Docker container: the agent's AI CLI starts in a read-only, non-root, resource-limited container with a private throw-away workspace, and only the final reply text comes back. It is off by default and is switched on per agent.
 
 This is not the script sandbox used by `duduclaw secaudit` (the PoC step) and PTC. That one is a separate code path: it runs a script, not an AI CLI, with no network by default. The two share one thing, the image: the script sandbox reads the same `config.toml [container.sandbox] image` key, defaults to the same platform image, and is never pulled automatically either, so one `docker pull` covers both.

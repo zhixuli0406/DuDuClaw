@@ -19,10 +19,9 @@
 //! sequence). [`append_chained_line`] therefore holds the SAME advisory lock
 //! (`duduclaw_core::platform::flock_exclusive`) the audit writers already
 //! took for corruption-avoidance, but widens its scope to cover the
-//! read-then-write critical section, not just the write. A flock failure is
-//! warned, not fatal — matching the pre-existing convention in this
-//! module's callers (best-effort concurrency safety, not a hard guarantee;
-//! see `duduclaw_security::audit`'s own doc comments on the same trade-off).
+//! read-then-write critical section, not just the write. Lock failures abort
+//! the append. Rotating tool-log writers additionally hold the stable sidecar
+//! lock shared with snapshot readers, covering rotation and append together.
 //!
 //! ## Rotation boundary semantics (documented choice — task requirement)
 //!
@@ -141,6 +140,20 @@ pub fn append_chained_line(
     record: serde_json::Map<String, serde_json::Value>,
     unix_create_mode: Option<u32>,
 ) -> io::Result<()> {
+    #[cfg(unix)]
+    { append_chained_line_locked(path, record, unix_create_mode) }
+    #[cfg(not(unix))]
+    { duduclaw_core::with_file_lock(path, || append_chained_line_locked(path, record, unix_create_mode)) }
+}
+
+// Rotating callers hold the stable family sidecar lock, including rotation.
+// Non-rotating Unix callers retain the data-file lock protocol; some already
+// hold a sidecar themselves, so do not reacquire it here.
+pub(crate) fn append_chained_line_locked(
+    path: &Path,
+    record: serde_json::Map<String, serde_json::Value>,
+    unix_create_mode: Option<u32>,
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -158,12 +171,8 @@ pub fn append_chained_line(
 
     #[cfg(unix)]
     {
-        // Widen the lock to cover the read-tail step below too — see module
-        // doc "Concurrency" section. Warn-not-fail matches the pre-existing
-        // convention in `duduclaw_security::audit`'s writers.
-        if let Err(e) = duduclaw_core::platform::flock_exclusive(&file) {
-            warn!("flock failed on {}: {e}", path.display());
-        }
+        // Retain compatibility with data-file readers as well as the sidecar.
+        duduclaw_core::platform::flock_exclusive(&file)?;
         if let Some(mode) = unix_create_mode {
             tighten_permissions(&file, mode, path);
         }
@@ -182,7 +191,7 @@ pub fn append_chained_line(
         // instead — the same cross-process primitive `bus_queue.jsonl` uses.
         // (`unix_create_mode` is, as named, unix-only; NTFS ACLs apply here.)
         let _ = unix_create_mode;
-        duduclaw_core::with_file_lock(path, || chain_and_write(path, &file, record))
+        chain_and_write(path, &file, record)
     }
 }
 
@@ -278,20 +287,25 @@ pub fn verify_chain(path: &Path) -> io::Result<ChainVerifyResult> {
         return Ok(ChainVerifyResult::Intact { lines_checked: 0 });
     }
     let content = fs::read_to_string(path)?;
+    Ok(verify_chain_content(&content))
+}
 
+/// Verify exactly the snapshot that a caller will consume, without reopening a path.
+/// Preserves the legacy-prefix and rotation-segment rules of `verify_chain`.
+pub fn verify_chain_content(content: &str) -> ChainVerifyResult {
     let mut prev_raw: Option<String> = None;
     let mut checked = 0usize;
 
     for (line_index, line) in content.lines().enumerate() {
         let line_number = line_index + 1;
         if line.trim().is_empty() {
-            if checked > 0 { return Ok(ChainVerifyResult::Broken { line_number }); }
+            if checked > 0 { return ChainVerifyResult::Broken { line_number }; }
             continue;
         }
 
         let value = match serde_json::from_str::<serde_json::Value>(line) {
             Ok(serde_json::Value::Object(value)) => value,
-            _ => return Ok(ChainVerifyResult::Broken { line_number }),
+            _ => return ChainVerifyResult::Broken { line_number },
         };
         match value.get("_prev_hash") {
             Some(serde_json::Value::String(claimed)) => {
@@ -300,18 +314,18 @@ pub fn verify_chain(path: &Path) -> io::Result<ChainVerifyResult> {
                     Some(p) => sha256_hex(p.as_bytes()),
                 };
                 if claimed != &expected {
-                    return Ok(ChainVerifyResult::Broken { line_number });
+                    return ChainVerifyResult::Broken { line_number };
                 }
                 checked += 1;
             }
             None if checked == 0 => (),
-            _ => return Ok(ChainVerifyResult::Broken { line_number }),
+            _ => return ChainVerifyResult::Broken { line_number },
         }
 
         prev_raw = Some(line.to_string());
     }
 
-    Ok(ChainVerifyResult::Intact { lines_checked: checked })
+    ChainVerifyResult::Intact { lines_checked: checked }
 }
 
 #[cfg(test)]
@@ -340,6 +354,36 @@ mod tests {
             m.insert((*k).to_string(), serde_json::Value::String((*v).to_string()));
         }
         m
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_existing_sidecar_caller_does_not_relock_sidecar() {
+        // credential_ledger already owns this sidecar before calling the
+        // non-rotating security writer. Preserve its data-file lock protocol.
+        let home = fresh_home();
+        let path = home.join("security_audit.jsonl");
+        duduclaw_core::with_file_lock(&path, || {
+            append_chained_line(&path, obj(&[("event", "credential_ledger")]), None)
+        }).unwrap();
+        assert!(verify_chain(&path).unwrap().is_intact());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn snapshot_verifier_uses_captured_bytes_after_path_changes() {
+        let home = fresh_home();
+        let path = home.join("test.jsonl");
+        append_chained_line(&path, obj(&[("event", "one")]), None).unwrap();
+        append_chained_line(&path, obj(&[("event", "two")]), None).unwrap();
+        let snapshot = std::fs::read_to_string(&path).unwrap();
+        assert!(verify_chain_content(&snapshot).is_intact());
+        std::fs::write(&path, snapshot.replacen("one", "bad", 1)).unwrap();
+        assert!(!verify_chain(&path).unwrap().is_intact());
+        assert!(verify_chain_content(&snapshot).is_intact());
+        std::fs::remove_file(&path).unwrap();
+        assert!(verify_chain_content(&snapshot).is_intact());
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

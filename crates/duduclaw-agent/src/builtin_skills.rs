@@ -1,7 +1,7 @@
 //! RFC-26 §4.3 (P6.3): built-in skill set parity with deep-agents.
 //!
-//! Nine bundled skills installed into every new agent's `SKILLS/`
-//! directory at creation: five inline skills and four multi-file office skills.
+//! Office skills are seeded once into the company-wide layer. Inline
+//! programming skills remain available as opt-in content, never creation defaults.
 //! Idempotent: existing
 //! files are never overwritten (operator edits win).
 
@@ -142,55 +142,171 @@ pub fn install_builtin_skills(skills_dir: &Path) -> std::io::Result<Vec<&'static
     install_skills(skills_dir, true)
 }
 
-/// The Google backfill owns its own no-follow writer and versioned marker.
-pub fn install_legacy_builtin_skills(skills_dir: &Path) -> std::io::Result<Vec<&'static str>> {
+/// Seed only the four office defaults. Google setup has its own backfill.
+/// Programming skills are opt-in; existing copies are left untouched.
+pub fn install_office_skills(skills_dir: &Path) -> std::io::Result<Vec<&'static str>> {
     install_skills(skills_dir, false)
 }
 
-fn install_skills(skills_dir: &Path, include_google: bool) -> std::io::Result<Vec<&'static str>> {
-    std::fs::create_dir_all(skills_dir)?;
+fn install_skills(skills_dir: &Path, include_inline: bool) -> std::io::Result<Vec<&'static str>> {
+    use crate::skill_loader::safe_dir::SafeDir;
+    use std::io::Write;
+    let parent = SafeDir::open(skills_dir.parent().ok_or_else(|| std::io::Error::other("skills parent missing"))?)?;
+    let root = parent.mkdir_child(skills_dir.file_name().and_then(|s| s.to_str())
+        .ok_or_else(|| std::io::Error::other("invalid skills directory"))?, 0o700)?;
     let mut written = Vec::new();
-    for (name, body) in BUILTIN_SKILLS {
-        if !include_google && *name == "connect-google" {
-            continue;
+    if include_inline {
+        for (name, body) in BUILTIN_SKILLS {
+            let dir = root.mkdir_child(name, 0o700)?;
+            match dir.create_new("SKILL.md", 0o600) {
+                Ok(mut file) => { file.write_all(body.as_bytes())?; written.push(*name); }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => { dir.read_file("SKILL.md")?; }
+                Err(e) => return Err(e),
+            }
         }
-        // Anthropic Skills layout: <skills>/<name>/SKILL.md
-        let dir = skills_dir.join(name);
-        let file = dir.join("SKILL.md");
-        if file.exists() {
-            continue;
-        }
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(&file, body)?;
-        written.push(*name);
     }
     for (name, files) in BUILTIN_SKILL_FILES {
-        let dir = skills_dir.join(name);
-        // Idempotency gate keyed on SKILL.md — if the operator has the skill,
-        // leave the whole directory (scripts included) untouched.
-        if dir.join("SKILL.md").exists() {
-            continue;
+        let dir = root.mkdir_child(name, 0o700)?;
+        match dir.read_file("SKILL.md") {
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
-        for (rel, content) in *files {
-            // Build the destination by joining POSIX path components so nested
-            // `scripts/foo.py` paths are portable across platforms.
-            let mut dest = dir.clone();
-            for part in rel.split('/') {
-                dest.push(part);
+        // Write scripts first; SKILL.md is the install completion point.
+        for (rel, content) in files.iter().filter(|(rel, _)| *rel != "SKILL.md") {
+            let scripts = dir.mkdir_child("scripts", 0o700)?;
+            let filename = rel.strip_prefix("scripts/").ok_or_else(|| std::io::Error::other("invalid bundled script path"))?;
+            crate::office_execution::manifest::verify_script(name, rel, content.as_bytes())?;
+            match scripts.create_new(filename, 0o600) {
+                Ok(mut file) => file.write_all(content.as_bytes())?,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => { scripts.read_file(filename)?; }
+                Err(e) => return Err(e),
             }
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&dest, content)?;
+        }
+        let body = files.iter().find(|(rel, _)| *rel == "SKILL.md").unwrap().1;
+        match dir.create_new("SKILL.md", 0o600) {
+            Ok(mut file) => file.write_all(body.as_bytes())?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => { dir.read_file("SKILL.md")?; }
+            Err(e) => return Err(e),
         }
         written.push(*name);
     }
     Ok(written)
 }
 
+/// Inspect the whole company office bundle without trusting executable paths.
+/// Missing, unreadable, symlinked, unknown and modified scripts are conflicts;
+/// callers log/show these, but execution always uses the embedded manifest.
+pub fn office_script_conflicts(skills_dir: &Path) -> Vec<String> {
+    use crate::skill_loader::safe_dir::SafeDir;
+    use std::io::Read;
+    let mut conflicts = Vec::new();
+    let root = match SafeDir::open(skills_dir) {
+        Ok(root) => root,
+        Err(error) => return vec![format!("office skill layer unavailable: {error}")],
+    };
+    for (skill, files) in BUILTIN_SKILL_FILES {
+        let check = (|| -> std::io::Result<()> {
+            let dir = root.child(skill)?;
+            dir.read_file("SKILL.md")?;
+            let scripts = dir.child("scripts")?;
+            for name in scripts.list()? {
+                let relative = format!("scripts/{name}");
+                if !files.iter().any(|(path, _)| *path == relative) {
+                    conflicts.push(format!("{skill}: unknown script entry"));
+                }
+            }
+            for (path, _) in files.iter().filter(|(path, _)| path.starts_with("scripts/")) {
+                let file = scripts.read_file(path.strip_prefix("scripts/").unwrap())?;
+                if file.metadata()?.len() > 1024 * 1024 { return Err(std::io::Error::other("script too large")); }
+                let mut bytes = Vec::new();
+                file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+                crate::office_execution::manifest::verify_script(skill, path, &bytes)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = check { conflicts.push(format!("{skill}: {error}")); }
+    }
+    conflicts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn office_defaults_exclude_programming_and_preserve_existing_content() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let skills = temp.path().join("skills");
+        let first = install_office_skills(&skills).unwrap();
+        assert_eq!(first, ["docx", "xlsx", "pptx", "pdf"]);
+        for (name, files) in BUILTIN_SKILL_FILES {
+            for (relative, body) in *files {
+                assert_eq!(std::fs::read_to_string(skills.join(name).join(relative)).unwrap(), *body);
+            }
+        }
+        for (name, _) in BUILTIN_SKILLS { assert!(!skills.join(name).exists()); }
+        std::fs::write(skills.join("docx/SKILL.md"), "Operator edit").unwrap();
+        std::fs::create_dir_all(skills.join("refactor")).unwrap();
+        std::fs::write(skills.join("refactor/SKILL.md"), "Existing optional skill").unwrap();
+        assert!(install_office_skills(&skills).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(skills.join("docx/SKILL.md")).unwrap(), "Operator edit");
+        assert_eq!(std::fs::read_to_string(skills.join("refactor/SKILL.md")).unwrap(), "Existing optional skill");
+    }
+
+    #[test]
+    fn company_manifest_conflicts_preserve_operator_prompt_and_scripts() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let skills = home.join("skills");
+        install_office_skills(&skills).unwrap();
+        assert!(office_script_conflicts(&skills).is_empty());
+        std::fs::write(skills.join("pdf/SKILL.md"), "operator prompt").unwrap();
+        assert!(office_script_conflicts(&skills).is_empty(), "only scripts are immutable");
+        std::fs::write(skills.join("pdf/scripts/create.py"), "print('attacker')").unwrap();
+        assert!(office_script_conflicts(&skills).iter().any(|s| s.starts_with("pdf:")));
+        assert!(install_office_skills(&skills).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(skills.join("pdf/scripts/create.py")).unwrap(), "print('attacker')");
+    }
+
+    #[test]
+    fn company_manifest_detects_missing_and_unknown_scripts() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let skills = home.join("skills");
+        install_office_skills(&skills).unwrap();
+        std::fs::remove_file(skills.join("docx/scripts/extract.py")).unwrap();
+        std::fs::write(skills.join("xlsx/scripts/extra.py"), "pass").unwrap();
+        let conflicts = office_script_conflicts(&skills);
+        assert!(conflicts.iter().any(|s| s.starts_with("docx:")));
+        assert!(conflicts.iter().any(|s| s.starts_with("xlsx:")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn office_seed_and_manifest_refuse_symlinked_layer_root() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(home.join("outside")).unwrap();
+        std::os::unix::fs::symlink("outside", home.join("skills")).unwrap();
+        assert!(install_office_skills(&home.join("skills")).is_err());
+        assert!(!office_script_conflicts(&home.join("skills")).is_empty());
+        assert_eq!(std::fs::read_dir(home.join("outside")).unwrap().count(), 0);
+    }
+
+    // Raw non-UTF8 directory entries require a filesystem that supports them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn company_manifest_refuses_non_utf8_unknown_script_entry() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let skills = temp.path().join("skills");
+        install_office_skills(&skills).unwrap();
+        let bad = std::ffi::OsString::from_vec(vec![0xff, b'.', b'p', b'y']);
+        std::fs::write(skills.join("pdf/scripts").join(bad), "attacker").unwrap();
+        let conflicts = office_script_conflicts(&skills);
+        assert!(conflicts.iter().any(|s| s.starts_with("pdf:")), "{conflicts:?}");
+    }
 
     #[test]
     fn google_guide_stays_under_three_kilobytes() {
@@ -237,7 +353,7 @@ mod tests {
 
     #[test]
     fn install_writes_all_then_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let skills = dir.path().join("SKILLS");
 
         let first = install_builtin_skills(&skills).unwrap();
@@ -265,7 +381,7 @@ mod tests {
 
     #[test]
     fn office_skill_operator_edit_wins() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let skills = dir.path().join("SKILLS");
         std::fs::create_dir_all(skills.join("docx")).unwrap();
         std::fs::write(skills.join("docx").join("SKILL.md"), "MY EDIT").unwrap();
@@ -282,7 +398,7 @@ mod tests {
 
     #[test]
     fn install_does_not_overwrite_operator_edits() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let skills = dir.path().join("SKILLS");
         std::fs::create_dir_all(skills.join("refactor")).unwrap();
         std::fs::write(skills.join("refactor").join("SKILL.md"), "MY EDIT").unwrap();

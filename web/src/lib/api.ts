@@ -135,6 +135,10 @@ export interface CallableAgent {
   selectable: boolean;
 }
 
+/** Structural directory data only; listing a node grants no agent access. */
+export type OrgChartAgent = Pick<AgentInfo, 'name' | 'role'> & Partial<Pick<AgentInfo,
+  'display_name' | 'status' | 'icon' | 'reports_to' | 'department'>>;
+
 export interface AgentDetail extends AgentInfo {
   budget: AgentBudget;
   model: AgentModel;
@@ -246,6 +250,8 @@ export interface AgentOwnChannels {
     service_account_email: string | null;
     endpoint_path: string;
     project_id?: string | null;
+    connection?: 'http' | 'pubsub';
+    pubsub_subscription?: string | null;
     error: string | null;
     last_event: string | null;
     shared_app_configured: boolean;
@@ -628,6 +634,13 @@ export interface SkillScanPath {
   count: number;
 }
 
+/** One skill in the current account's recent submitted skills. */
+export interface RecentSkill {
+  name: string;
+  display_name: string;
+  description: string;
+}
+
 /** Aggregate (`skills.list` with no `agent_id`) — every layer, every staffer. */
 export interface SkillsListAll {
   global_skills: SkillInfo[];
@@ -725,6 +738,20 @@ export interface CredentialProtectionStatus {
   person_identity_allowed: boolean;
   /** Closed startup refusal code; never contains key material. */
   refusal_reason?: string | null;
+  /** Non-secret root-key history; this is not the current protection state. */
+  root_key_recovery?: {
+    latest_revocation: { reason: string; detail: string | null; timestamp: string } | null;
+    recovery: string;
+  } | null;
+  /** Root-managed native Linux policy; display only, never dashboard-writable. */
+  engine_socket_policy?: {
+    action: 'revoke' | 'warn';
+    warning_active: boolean;
+    detail: string | null;
+    risk_zh: string;
+    command_warn: string;
+    command_revoke: string;
+  } | null;
   /** zh-TW one-liner from the gateway (CLI uses the same text). */
   summary: string;
   detail: string;
@@ -996,6 +1023,7 @@ export type AssignScheduleSpec =
 
 /** One scheduled assignment. Every fire re-checks the creator's right. */
 export interface AssignScheduleInfo {
+  can_manage?: boolean;
   id: string;
   agent_id: string;
   kind: 'task' | 'goal';
@@ -2356,6 +2384,10 @@ export interface LicenseSnapshot {
   days_since_phone_home?: number | null;
   /** `true` when the license fingerprint matches the current machine. */
   fingerprint_match?: boolean | null;
+  /** Informational identity evidence, independent of validation failures. */
+  fingerprint_strength?: 'hardware' | 'instance' | 'weak' | null;
+  /** Admin-only validation failure reason; absent for a healthy or unlicensed host. */
+  validation_warning?: string | null;
   /**
    * NFR (Not-For-Resale) internal-test license. Renders a badge that
    * must remain visible as the anti-resale watermark.
@@ -2364,6 +2396,43 @@ export interface LicenseSnapshot {
 }
 
 // ── User management types ────────────────────────────────────
+
+export interface InvitationContent {
+  opening: string;
+  steps: string;
+  examples: [string, string, string];
+  course_url: string;
+}
+export interface InvitationPreview {
+  subject: string;
+  text: string;
+  html: string;
+  examples: string[];
+}
+export type OnboardingStep = 'channel' | 'google' | 'example' | 'capabilities';
+export type OnboardingStepStatus = 'pending' | 'done' | 'skipped';
+export interface OnboardingProgress {
+  enabled: boolean;
+  dismissed: boolean;
+  password_done: boolean;
+  steps: Record<OnboardingStep, OnboardingStepStatus>;
+  examples: string[];
+}
+export interface NewMemberInput {
+  display_name: string;
+  email: string;
+  role: 'employee' | 'manager' | 'admin';
+  department?: string;
+  primary_agent_id: string;
+  bindings: Array<{ agent_name: string; access_level: 'operator' | 'viewer' }>;
+  invite: boolean;
+}
+export interface CreateMemberResult {
+  index: number;
+  user?: UserInfo;
+  invite?: UserInviteResult;
+  error?: string;
+}
 
 export interface UserInfo {
   primary_agent_id?: string | null;
@@ -5189,6 +5258,14 @@ export type SkillSynthesisUpdate = Partial<SkillSynthesisConfig>;
 
 // ── MK: MCP API keys ────────────────────────────────────────────
 
+export interface McpOAuthGrant {
+  id: string;
+  client_name: string;
+  scopes: string[];
+  issued_unix: number;
+  last_used_unix: number | null;
+}
+
 /** A masked MCP key entry from `mcp_keys.list`. The full cleartext key is
  *  NEVER returned here — only on the one-time `mcp_keys.create` response. */
 export interface McpKeyEntry {
@@ -5814,6 +5891,7 @@ export interface GoogleServiceProbe {
 }
 
 export interface GoogleCredentialsStatus {
+  chat_read?: boolean;
   /** `config.toml [integrations] google_workspace` — the master gate. */
   integration_enabled: boolean;
   /** Which path a real tool call would take right now. */
@@ -5890,7 +5968,8 @@ export interface UserInviteResult {
 export type UserInviteState = 'none' | 'pending' | 'expired' | 'used';
 
 export interface PersonalGoogleStatus {
-  connection: { owner_id: string; account_email: string; granted_scopes: string[]; status: 'connected' | 'needs_reconnect' | 'suspended'; connected_at: string } | null;
+  chat_read?: boolean;
+  connection: { owner_id: string; account_email: string; granted_scopes: string[]; local_purposes?: string[]; status: 'connected' | 'needs_reconnect' | 'suspended'; connected_at: string } | null;
   login_email: string;
   client_configured: boolean;
   integration_enabled: boolean;
@@ -5928,6 +6007,9 @@ export interface ChatSessionSummary {
 }
 
 export interface ChatSessionMessage {
+  attachments?: unknown;
+  /** Original user-message id for exact recovery after a lost acknowledgement. */
+  client_msg_id?: string | null;
   notice_kind?: string | null;
   sender_label?: string;
   parts?: TeamHistoryPart[];
@@ -6277,6 +6359,7 @@ export const api = {
       }) as Promise<ChatSessionHistory>,
   },
   agents: {
+    orgChart: () => client.call('agents.org_chart', {}) as Promise<{ agents: OrgChartAgent[] }>,
     exportProfile: (agentId: string, format: AgentProfileFormat, includeUser = false) =>
       client.call('agents.export_profile', { agent_id: agentId, format, include_user: includeUser }) as Promise<AgentProfileExport>,
     /** WP4 — pass `include_archived: true` to also list archived AI staff
@@ -6734,10 +6817,12 @@ export const api = {
       }>,
     agentTelegramRemove: (agentId: string) =>
       client.call('agents.channels.telegram.remove', { agent_id: agentId }) as Promise<{ success: boolean }>,
-    agentGoogleChatSet: (agentId: string, projectNumber: string, serviceAccountJson?: string) =>
+    agentGoogleChatSet: (agentId: string, projectNumber: string, serviceAccountJson?: string, connection: 'http' | 'pubsub' = 'http', pubsubSubscription?: string) =>
       client.call('agents.channels.googlechat.set', {
         agent_id: agentId,
         project_number: projectNumber,
+        connection,
+        pubsub_subscription: connection === 'pubsub' ? pubsubSubscription ?? '' : '',
         ...(serviceAccountJson && serviceAccountJson.trim() ? { service_account_json: serviceAccountJson } : {}),
       }) as Promise<{
         success: boolean;
@@ -7141,6 +7226,8 @@ export const api = {
       client.call('shared_wiki.stats') as Promise<SharedWikiStats>,
   },
   skills: {
+    recent: (agentId?: string, assigning = false) =>
+      client.call('skills.recent', { agent_id: agentId, assigning }) as Promise<{ skills: RecentSkill[] }>,
     list: (agentId: string) =>
       client.call('skills.list', { agent_id: agentId }) as Promise<SkillsListOne>,
     /** Aggregate across every layer and every staffer (no `agent_id`). */
@@ -7438,7 +7525,7 @@ export const api = {
         /** Global utility provider, canonicalized; removed providers are retained for explicit repair. */
         utility_provider?: string;
         voice?: Partial<VoiceSettings> | null;
-        transcription?: { engine: 'gemini' | 'google_stt' | 'whisper'; model: string | null; max_bytes: number } | null;
+        transcription?: { engine: 'gemini' | 'google_stt' | 'whisper'; model: string | null; max_bytes: number; google_stt?: { project_id: string; location: string; bucket: string; language: string; model: string; diarization: boolean } } | null;
         transcription_error?: string | null;
         // Structured [gateway] allowed_origins for the remote-access allowlist UI.
         allowed_origins?: string[];
@@ -7455,6 +7542,10 @@ export const api = {
         daily_digest_enabled?: boolean;
         daily_digest_at?: string;
       }>,
+    setTranscriptionCredential: (googleSttKey: string) =>
+      client.call('transcription_credentials.set', { google_stt_key: googleSttKey }) as Promise<{ success: boolean }>,
+    clearTranscriptionCredential: () =>
+      client.call('transcription_credentials.clear', {}) as Promise<{ success: boolean }>,
     updateConfig: (fields: Record<string, unknown>) =>
       client.call('system.update_config', fields) as Promise<{ success: boolean; changes: string[]; applied?: boolean; hot_reloaded?: string[]; /** v1.68: keys that only apply after a gateway restart. */ restart_required?: string[] }>,
     checkUpdate: () =>
@@ -7965,6 +8056,7 @@ export const api = {
    * `get` never returns the stored bridge secret — only whether one is set.
    */
   googleCredentials: {
+    setChatRead: (chatRead: boolean) => client.call('google.integration.set', { chat_read: chatRead }) as Promise<{ chat_read: boolean; changed: boolean }>,
     get: () => client.call('google.credentials.get') as Promise<GoogleCredentialsStatus>,
     set: (params: GoogleCredentialsInput) =>
       client.call('google.credentials.set', params).then(notifyDisconnectForget) as Promise<{ ok: boolean; mode: string; staged?: boolean }>,
@@ -8014,7 +8106,7 @@ export const api = {
   },
   personalGoogle: {
     status: () => client.call('me.google.status') as Promise<PersonalGoogleStatus>,
-    start: (acknowledgeGoogleData: boolean) => client.call('me.google.connect_start', { redirect_origin: window.location.origin, acknowledge_google_data: acknowledgeGoogleData }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
+    start: (acknowledgeGoogleData: boolean, meetingRecordings = false, driveTools = false) => client.call('me.google.connect_start', { redirect_origin: window.location.origin, acknowledge_google_data: acknowledgeGoogleData, ...(meetingRecordings ? { meeting_recordings: true } : {}), ...(driveTools ? { drive_tools: true } : {}) }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
     finish: (state: string) => client.call('me.google.connect_finish', { state }),
     paste: (url: string) => client.call('me.google.connect_paste', { url }),
     disconnect: () => client.call('me.google.disconnect', { confirm: true }).then(notifyDisconnectForget) as Promise<{provider_revoked:boolean;provider_note:string|null}>,
@@ -8193,7 +8285,7 @@ export const api = {
   /** Scheduled assignments: the caller's own; `scope: 'all'` lists
    *  everyone's for an Admin. */
   assignSchedules: {
-    list: (scope: 'mine' | 'all' = 'mine') =>
+    list: (scope: 'mine' | 'all' | 'accessible' = 'mine') =>
       client.call('assign_schedules.list', { scope }) as Promise<{
         schedules: AssignScheduleInfo[];
         max_active: number | null;
@@ -8313,6 +8405,7 @@ export const api = {
      *  that employee. Same response shape as `goalCreate`, plus who runs it. */
     skillAssign: (params: {
       skill_name: string;
+      skill_names?: string[];
       note?: string;
       attachments?: TaskAttachmentInput[];
     }) =>
@@ -8731,6 +8824,10 @@ export const api = {
         changes: string[];
       }>,
   },
+  mcpOAuthGrants: {
+    list: () => client.call('mcp_oauth_grants.list') as Promise<{ grants: McpOAuthGrant[] }>,
+    revoke: (id: string) => client.call('mcp_oauth_grants.revoke', { id }) as Promise<{ success: boolean; revoked: boolean }>,
+  },
   mcpKeys: {
     list: () => client.call('mcp_keys.list') as Promise<{ keys: McpKeyEntry[] }>,
     create: (params: { client_id: string; is_external: boolean; scopes: string[]; env?: 'prod' | 'staging' | 'dev' }) =>
@@ -8828,7 +8925,20 @@ export const api = {
         300000,
       ) as Promise<MigrateResult>,
   },
+  invitation: {
+    get: (locale: string) => client.call('invitation.get', { locale }) as Promise<{locale: string; content: InvitationContent}>,
+    update: (locale: string, content: InvitationContent) => client.call('invitation.update', { locale, content }) as Promise<{locale: string; content: InvitationContent}>,
+    preview: (params: { locale: string; content?: InvitationContent; display_name?: string }) =>
+      client.call('invitation.preview', params) as Promise<InvitationPreview>,
+  },
+  onboarding: {
+    get: (locale = 'zh-TW') => client.call('onboarding.get', { locale }) as Promise<OnboardingProgress>,
+    update: (change: { step?: OnboardingStep; status?: 'done' | 'skipped'; dismissed?: true }, locale = 'zh-TW') =>
+      client.call('onboarding.update', { ...change, locale }) as Promise<OnboardingProgress>,
+  },
   users: {
+    createMembers: (params: { members: NewMemberInput[]; public_url?: string; locale?: string }) =>
+      client.call('users.create_members', params, false, 330000) as Promise<{ results: CreateMemberResult[] }>,
     invite: (userId: string, publicUrl: string) =>
       client.call('users.invite', { user_id: userId, public_url: publicUrl }) as Promise<UserInviteResult>,
     inviteStatus: () =>

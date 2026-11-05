@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["reportlab>=4.0"]
+# dependencies = ["reportlab==4.4.10"]
 # ///
 """Render a markdown or plain-text source file into a PDF.
 

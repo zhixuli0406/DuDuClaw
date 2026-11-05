@@ -763,14 +763,9 @@ pub struct DelegationConfig {
     /// `allow = [["a", "b"], ...]` — unordered whitelist pairs (design doc
     /// §2.2). Defaults to empty when the key is absent.
     pub allow: Vec<Vec<String>>,
-    /// WP21 debt ⑧ — refuse MCP callers whose `DUDUCLAW_AGENT_ID` is not backed
-    /// by a valid `DUDUCLAW_AGENT_TOKEN` (see
-    /// [`crate::identity_token`]). **Default `false`** (soft mode: warn once and
-    /// proceed) so upgrading an existing install changes nothing; flip it on
-    /// once every agent's MCP config has been re-issued with a token.
-    ///
-    /// Inert unless `~/.duduclaw/identity.key` exists — no key means no claim
-    /// can be verified *or* refused, and the verdict is `Disabled`.
+    /// Require a valid DuDuClaw-issued identity token (default true).
+    /// Authorization reads this through `require_identity_token_from_home`,
+    /// whose errors must reject the caller. Soft mode also requires a valid, bounded grace deadline.
     pub require_identity_token: bool,
 }
 
@@ -779,7 +774,7 @@ impl Default for DelegationConfig {
         Self {
             policy: DelegationPolicy::default().as_str().to_string(),
             allow: Vec::new(),
-            require_identity_token: false,
+            require_identity_token: true,
         }
     }
 }
@@ -830,16 +825,12 @@ pub fn delegation_config_from_table(table: &toml::Table) -> DelegationConfig {
         })
         .unwrap_or_default();
 
-    // Same independent-extraction discipline as `policy` / `allow`: a
-    // wrong-typed value (string "true", a number) is ignored in favour of the
-    // safe default rather than taking the whole section down with it. Note the
-    // default is `false`, so a typo here degrades to *soft* mode — the choice
-    // that preserves an existing deployment, matching this section's
-    // "壞項忽略,不整段失效" rule.
+    // Authorization uses the fallible reader below; this compatibility view
+    // never weakens the default on malformed values.
     let require_identity_token = section
         .get("require_identity_token")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     DelegationConfig {
         policy,
@@ -911,10 +902,81 @@ pub fn policy_from_home(home_dir: &Path) -> DelegationPolicy {
     policy
 }
 
-/// `config.toml [delegation] require_identity_token` (WP21 debt ⑧), defaulting
-/// to `false` when the file, section or key is absent.
-pub fn require_identity_token_from_home(home_dir: &Path) -> bool {
-    DelegationConfig::from_home(home_dir).require_identity_token
+/// Strict by default. Explicit false also requires a future UTC grace deadline
+/// no more than 30 days away. An invalid grace deadline restores strict mode.
+/// Once observed invalid or expired, that home's grace stays disabled for the
+/// lifetime of this process, even after clock rollback or a config edit.
+/// Unreadable files, invalid TOML and wrong-shaped settings are errors; callers
+/// must reject rather than replacing an error with either boolean value.
+pub fn require_identity_token_from_home(home_dir: &Path) -> std::io::Result<bool> {
+    require_identity_token_from_home_at(home_dir, chrono::Utc::now())
+}
+
+fn require_identity_token_from_home_at(
+    home_dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> std::io::Result<bool> {
+    let path = home_dir.join("config.toml");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+        Ok(_) => {},
+    }
+    let content = std::fs::read_to_string(path)?;
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData,
+        "invalid delegation identity-token setting");
+    let table = content.parse::<toml::Table>().map_err(|_| invalid())?;
+    let Some(section) = table.get("delegation") else { return Ok(true) };
+    let section = section.as_table().ok_or_else(invalid)?;
+    match section.get("require_identity_token") {
+        None => Ok(true),
+        Some(value) => {
+            let require = value.as_bool().ok_or_else(invalid)?;
+            if require { return Ok(true) }
+            let valid = identity_grace_enabled(home_dir, section, now)?;
+            if !valid {
+                IDENTITY_GRACE_ERROR_LOGGED.call_once(|| tracing::error!(
+                    "Ignoring require_identity_token=false: identity_token_grace_until must be an RFC3339 UTC string in the future and at most 30 days ahead; enforcing strict identity tokens for this process lifetime."
+                ));
+            }
+            Ok(!valid)
+        },
+    }
+}
+
+static IDENTITY_GRACE_ERROR_LOGGED: std::sync::Once = std::sync::Once::new();
+
+// Keep separate installations independent, but resolve path aliases so an
+// alternate spelling of the same home cannot reopen its expired grace.
+static IDENTITY_GRACE_DISABLED: std::sync::LazyLock<
+    std::sync::Mutex<HashSet<std::path::PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+fn identity_grace_enabled(
+    home_dir: &Path,
+    section: &toml::Table,
+    now: chrono::DateTime<chrono::Utc>,
+) -> std::io::Result<bool> {
+    let home = std::fs::canonicalize(home_dir)?;
+    let mut disabled = IDENTITY_GRACE_DISABLED.lock()
+        .map_err(|_| std::io::Error::other("identity grace latch unavailable"))?;
+    if disabled.contains(&home) {
+        return Ok(false);
+    }
+    if !identity_grace_valid(section, now) {
+        disabled.insert(home);
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn identity_grace_valid(section: &toml::Table, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let Some(deadline) = section.get("identity_token_grace_until")
+        .and_then(toml::Value::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) else { return false };
+    deadline.offset().local_minus_utc() == 0
+        && deadline > now
+        && deadline.signed_duration_since(now) <= chrono::Duration::days(30)
 }
 
 /// Same as [`delegation_rules_from_home`], but takes an already-parsed table
@@ -1310,37 +1372,86 @@ mod tests {
         );
     }
 
-    /// WP21 debt ⑧ — `require_identity_token` parses independently of `policy`
-    /// and defaults to `false` (soft mode) in every degenerate case, so an
-    /// upgrade cannot lock an existing install out of its own MCP server.
     #[test]
-    fn require_identity_token_defaults_off_and_parses_independently() {
+    fn require_identity_token_defaults_strict_and_rejects_invalid_config() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-
-        assert!(!require_identity_token_from_home(home), "no config ⇒ soft mode");
-
-        for body in [
-            "[delegation]\npolicy = \"open\"\n",                      // key absent
-            "[delegation]\nrequire_identity_token = false\n",          // explicit off
-            "[delegation]\nrequire_identity_token = \"true\"\n",       // wrong type (string)
-            "[delegation]\nrequire_identity_token = 1\n",              // wrong type (int)
-            "[general]\nlog_level = \"info\"\n",                       // section absent
-        ] {
+        assert!(require_identity_token_from_home(home).unwrap());
+        for body in ["", "[delegation]\npolicy = 'open'\n", "[general]\nlog_level = 'info'\n",
+            "[delegation]\nrequire_identity_token = true\nallow = [42]\n"] {
             std::fs::write(home.join("config.toml"), body).unwrap();
-            assert!(!require_identity_token_from_home(home), "{body:?} must stay soft");
+            assert!(require_identity_token_from_home(home).unwrap());
         }
+        std::fs::write(home.join("config.toml"), "[delegation]\nrequire_identity_token = false\n").unwrap();
+        assert!(require_identity_token_from_home(home).unwrap());
+        for body in ["[", "delegation = false", "[delegation]\nrequire_identity_token = 'false'",
+            "[delegation]\nrequire_identity_token = 0"] {
+            std::fs::write(home.join("config.toml"), body).unwrap();
+            assert!(require_identity_token_from_home(home).is_err());
+        }
+        std::fs::remove_file(home.join("config.toml")).unwrap();
+        std::fs::create_dir(home.join("config.toml")).unwrap();
+        assert!(require_identity_token_from_home(home).is_err());
+    }
 
-        // Explicit opt-in, alongside an unrelated bad `allow` entry: the bad
-        // entry is dropped, the flag survives, and so does `policy`.
-        std::fs::write(
-            home.join("config.toml"),
-            "[delegation]\npolicy = \"hierarchy\"\nrequire_identity_token = true\nallow = [42]\n",
-        )
-        .unwrap();
-        let cfg = DelegationConfig::from_home(home);
-        assert!(cfg.require_identity_token);
-        assert_eq!(cfg.policy(), DelegationPolicy::Hierarchy);
+    #[test]
+    fn identity_grace_has_exact_utc_time_bounds() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-05T00:00:00Z").unwrap().to_utc();
+        for (deadline, expected) in [
+            ("2026-11-05T00:00:00Z", false),
+            ("2026-11-04T23:59:59Z", false),
+            ("2026-11-05T00:00:01Z", true),
+            ("2026-12-05T00:00:00Z", true),
+            ("2026-12-05T00:00:00.000000001Z", false),
+            ("2026-11-06T00:00:00+00:00", true),
+            ("2026-11-06T08:00:00+08:00", false),
+            ("2026-11-06", false), ("invalid", false),
+        ] {
+            let mut section = toml::Table::new();
+            section.insert("identity_token_grace_until".into(), toml::Value::String(deadline.into()));
+            assert_eq!(identity_grace_valid(&section, now), expected, "{deadline}");
+        }
+    }
+
+    #[test]
+    fn identity_grace_expiry_is_irreversible_after_clock_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::write(home.join("config.toml"),
+            "[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = '2026-11-06T00:00:00Z'\n").unwrap();
+        let before = chrono::DateTime::parse_from_rfc3339("2026-11-05T00:00:00Z").unwrap().to_utc();
+        let expired = before + chrono::Duration::days(1);
+        assert!(!require_identity_token_from_home_at(home, before).unwrap());
+        assert!(require_identity_token_from_home_at(home, expired).unwrap());
+        assert!(require_identity_token_from_home_at(home, before).unwrap());
+        assert!(require_identity_token_from_home_at(&home.join("."), before).unwrap());
+
+        // Even replacing the expired deadline cannot reopen grace in this process.
+        std::fs::write(home.join("config.toml"),
+            "[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = '2026-11-07T00:00:00Z'\n").unwrap();
+        assert!(require_identity_token_from_home_at(home, before).unwrap());
+    }
+
+    #[test]
+    fn identity_grace_invalid_deadlines_latch_without_affecting_other_homes() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-05T00:00:00Z").unwrap().to_utc();
+        for deadline in [None, Some("invalid"), Some("2026-11-06T08:00:00+08:00"),
+            Some("2026-12-06T00:00:00Z")] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut body = "[delegation]\nrequire_identity_token = false\n".to_string();
+            if let Some(deadline) = deadline {
+                body.push_str(&format!("identity_token_grace_until = '{deadline}'\n"));
+            }
+            std::fs::write(dir.path().join("config.toml"), body).unwrap();
+            assert!(require_identity_token_from_home_at(dir.path(), now).unwrap());
+            std::fs::write(dir.path().join("config.toml"),
+                "[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = '2026-11-06T00:00:00Z'\n").unwrap();
+            assert!(require_identity_token_from_home_at(dir.path(), now).unwrap());
+        }
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("config.toml"),
+            "[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = '2026-11-06T00:00:00Z'\n").unwrap();
+        assert!(!require_identity_token_from_home_at(other.path(), now).unwrap());
     }
 
     #[test]

@@ -50,7 +50,9 @@ const MeetingTranscriptsPage = lazyPage(() => import('./pages/MeetingTranscripts
 // "operate the whole machine" scaffold; see `HomeLanding` below for how the
 // appliance image lands here by default.
 const OperatorConsolePage = lazyPage(() => import('./pages/OperatorConsolePage'), 'OperatorConsolePage');
+const EmployeeHealthPage = lazyPage(() => import('./pages/EmployeeHealthPage'), 'EmployeeHealthPage');
 const AgentsPage = lazyPage(() => import('./pages/AgentsPage'), 'AgentsPage');
+const TemplatesPage = lazyPage(() => import('./pages/TemplatesPage'), 'TemplatesPage');
 const CreateAgentPage = lazyPage(() => import('./pages/agent-form/CreateAgentPage'), 'CreateAgentPage');
 const EditAgentPage = lazyPage(() => import('./pages/agent-form/EditAgentPage'), 'EditAgentPage');
 const TaskBoardPage = lazyPage(() => import('./pages/TaskBoardPage'), 'TaskBoardPage');
@@ -266,8 +268,8 @@ export function App() {
               <Route path="runs" element={<RunsPage />} />
               <Route path="canvas" element={<CanvasPage />} />
               <Route path="files" element={<FilesPage />} />
-              {/* cron.* is admin-only, including read operations. */}
-              <Route element={<RoleGuard minRole="admin" />}><Route path="routines" element={<RoutinesPage />} /></Route>
+              {/* Automation RPCs enforce the signed-in user’s scope server-side. */}
+              <Route path="routines" element={<RoutinesPage />} />
 
               {/* ── 員工 / 公司 ── */}
               <Route path="agents" element={<AgentsPage />} />
@@ -336,6 +338,8 @@ export function App() {
                   <Route path="decision-lab" element={<DecisionLabPage />} />
                   <Route path="ccr" element={<CcrDashboardPage />} />
                   <Route path="settings" element={<SettingsPage />} />
+                  <Route path="settings/advanced" element={<SettingsPage />} />
+                  <Route path="settings/company" element={<SettingsPage />} />
                 </Route>
                 <Route element={<RoleGuard minRole="manager" />}>
                   <Route path="license" element={<LicenseShell />} />
@@ -349,12 +353,14 @@ export function App() {
                 <Route path="my/history-views" element={<MyHistoryViewsPage />} />
               </Route>
 
+              <Route path="org" element={<OrgChartPage />} />
+
               {/* manager+ routes (Zone B/C) */}
               <Route element={<RoleGuard minRole="manager" />}>
                 <Route path="forks" element={<ForkPage />} />
                 <Route path="timeline" element={<TimelinePage />} />
                 <Route path="reports" element={<ReportPage />} />
-                <Route path="org" element={<OrgChartPage />} />
+                <Route path="employee-health" element={<EmployeeHealthPage />} />
                 {/* 我的團隊 (1.76.0) — `users.my_team` is `require_manager!`
                     and, as a `users.*` method, Enterprise-only server-side;
                     both are mirrored here. */}
@@ -373,6 +379,7 @@ export function App() {
               {/* P4-3 — OS-native fleet report + settings. All five os.* RPCs
                   are `require_admin!`-gated server-side; this mirrors that. */}
               <Route element={<RoleGuard minRole="admin" />}>
+                <Route path="templates" element={<TemplatesPage />} />
                 <Route path="os" element={<OSPage />} />
                 {/* 職務組合（agent preset P1, WP-7I）— presets.list/presets.status
                     are read-only RPCs; this mirrors that (no admin RPC gate on

@@ -88,6 +88,7 @@ impl MethodHandler {
 
         match method {
             "mfa.status" | "mfa.enroll_begin" | "mfa.enroll_confirm"
+            | "mfa.email_begin" | "mfa.email_confirm" | "mfa.email_remove"
             | "mfa.recovery_regenerate" | "mfa.disable" => {
                 self.handle_mfa_rpc(method, params, ctx).await
             }
@@ -161,6 +162,15 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_user_invites(method, params, ctx)).await
             }
+            "users.create_members" => {
+                require_admin!();
+                boxed_frame(|| self.handle_users_create_members(params, ctx)).await
+            }
+            "invitation.get" | "invitation.update" | "invitation.preview" => {
+                require_admin!();
+                boxed_frame(|| self.handle_invitation_content(method, params, ctx)).await
+            }
+            "onboarding.get" | "onboarding.update" => boxed_frame(|| self.handle_onboarding(method, params, ctx)).await,
             "users.create" => {
                 require_admin!();
                 boxed_frame(|| self.handle_users_create(params, ctx)).await
@@ -535,7 +545,7 @@ impl MethodHandler {
             }
             "tasks.flow_metrics" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                boxed_frame(|| self.handle_tasks_flow_metrics(params)).await
+                boxed_frame(|| self.handle_tasks_flow_metrics(params, ctx)).await
             }
 
             // ── Co-edited plans (U4, Cocoa arXiv:2412.10999) ──
@@ -571,10 +581,11 @@ impl MethodHandler {
                 check_agent_filter!(AccessLevel::Viewer);
                 boxed_frame(|| self.handle_activity_list(params, ctx)).await
             }
-            // Per-topic filtering is NOT implemented: BroadcastLayer fans out every
-            // activity event to every authenticated WS client unconditionally. This
-            // RPC exists purely as a client-intent signal and future-compat hook so
-            // callers can declare interest without guessing at server state.
+            // This RPC records no subscription filter; it is a client-intent /
+            // future-compat hook. BroadcastLayer fans out activity events internally,
+            // but server.rs::handle_socket filters each connection before delivery
+            // via handlers/push_filter.rs::PushGate::filter_prepared: activity.new
+            // follows the task visibility gate, or employee access when taskless.
             "activity.subscribe" => WsFrame::ok_response(
                 "",
                 json!({

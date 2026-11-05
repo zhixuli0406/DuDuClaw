@@ -191,7 +191,10 @@ mod tests {
             .filter(|s| !s.starts_with("## Skill: connect-google\n"))
             .cloned().collect();
         assert_eq!(old, retained, "new skill must preserve the exact prior selection");
-        for name in ["refactor", "test-writer"] {
+        // The full bundled set exceeds the cap; verify skills retained by the
+        // current baseline, including Office skills, rather than requiring
+        // a later alphabetical entry to fit as the bundled content grows.
+        for name in ["docx", "pdf", "refactor"] {
             let heading = format!("## Skill: {name}\n");
             assert!(old.iter().any(|s| s.starts_with(&heading)), "fixture must include {name}");
             assert!(new.iter().any(|s| s.starts_with(&heading)), "new skill displaced {name}");

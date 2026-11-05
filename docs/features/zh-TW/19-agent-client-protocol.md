@@ -1,267 +1,97 @@
-# Agent Client Protocol (ACP/A2A)
+# ACP 與 A2A 介面
 
-> 讓 IDE 與 Agent 對話的方式，就像 Agent 與其工具對話一樣：stdio JSON-RPC 2.0、可探索、與語言無關。
+DuDuClaw 分別提供 IDE 對話與外部任務介面，各自有不同的傳輸方式、憑證和任務生命週期。
 
----
+| 介面 | 入口 | 用途 |
+|---|---|---|
+| Agent Client Protocol v1 | `duduclaw acp`，stdio | IDE 工作階段與提示回合 |
+| 既有 A2A 指令 | `duduclaw acp server`，stdio | 使用 `agent/discover`、`message/send`、`tasks/send` / `tasks/get` / `tasks/cancel` 的本機腳本 |
+| A2A v1.0 JSON-RPC，v1.80.0 起 | Gateway `POST /a2a` | 經認證的外部任務看板目標 |
+| MCP | `duduclaw mcp-server` 或獨立 HTTP server | 提供 AI runtime 與 MCP client 使用的工具 |
 
-## 比喻：餐廳的訂位專線
+## Gateway A2A v1.0（v1.80.0 起）
 
-每家餐廳都有兩個入口：
+Gateway 在 `/.well-known/agent-card.json` 提供有簽章的 Agent Card，列出 JSON-RPC 介面、協定版本 `1.0`、管理員明確公開之員工實際啟用的技能，以及 Dashboard Bearer JWT 認證方式。簽章用來驗證卡片完整性，不會授予呼叫者任何技能權限。卡片不宣告串流或推播通知支援。僅公開名稱與說明皆非空的已啟用技能，並標記實際員工的 `employee:<id>`。未公開員工或沒有可公開技能時，公開卡片回覆 HTTP 503；登入者沒有可用技能時，`GetExtendedAgentCard` 回覆 `-32007`。`SendMessage` 只接受至少有一項可公開技能的已公開員工。簽章金鑰不可用時，探索端點回覆 HTTP 503，不會提供未簽章卡片。
 
-- **用餐區**：顧客走進來、瀏覽菜單、與服務生互動的地方。
-- **訂位專線**：一套電話協定。電話另一端的訂位系統不需要知道用餐區長什麼樣子；它只需要問「晚上 7 點有四人桌嗎？」並得到一個是／否。
+預設不公開任何員工。在 `config.toml` 填入既有員工 id：
 
-像 Zed、JetBrains、Neovim 這樣的 IDE 想問 Agent「你能接這個任務嗎？」，而不必理解 DuDuClaw 的整套頻道基礎設施。它們需要的是訂位專線，一個乾淨、穩定、協定驅動的介面。
-
-那正是這兩個協定 server 的角色。DuDuClaw 把它們**分成兩個指令**出貨：`duduclaw acp` 說 IDE agent panel 用的 Agent Client Protocol（Zed／JetBrains／nvim，設定方式見下方「協定範圍」），`duduclaw acp server` 說 A2A 協定，服務 agent 對 agent 與腳本／CI 整合（即後續各節描述的內容）。
-
----
-
-## 什麼是 ACP/A2A？
-
-**ACP** 代表 Agent Client Protocol：一套用於 IDE ↔ Agent 通訊的 stdio JSON-RPC 2.0 行協定。**A2A** 是相關的「Agent to Agent」協定，用於 Agent 探索與任務交換。
-
-兩者合在一起，讓 IDE（或另一個 Agent、CI pipeline、shell 腳本）能把一個正在執行的 DuDuClaw Agent 當作一等公民服務來對待，可以探索它、發送任務、輪詢狀態、取消任務。
-
-DuDuClaw 提供的是 server 端：
-
-```
-duduclaw acp server
-     |
-     v
-Listens on stdin, writes to stdout (line-delimited JSON-RPC 2.0)
-     |
-     v
-Responds to:
-  agent/discover   → return AgentCard
-  tasks/send       → queue new task
-  tasks/get        → poll task status
-  tasks/cancel     → cancel running task
+```toml
+[a2a]
+exposed_agents = ["researcher"]
+public_url = "https://host.example/a2a"
+trusted_proxy_cidrs = []
 ```
 
-在 v1.8.9 之前，`duduclaw acp server` 只是一個佔位符，印出一段訊息就返回。v1.8.9 將它接上了真正的 `A2ATaskManager`，使其得以運作。
+`public_url` 是外部可連線的 `/a2a` HTTPS 網址，TLS 由 gateway 前方的反向代理設定。公開名單仍受既有授權限制，不會替 Dashboard 帳號增加員工存取權、啟用停用的技能，或改變工具能力。名單為空、設定無法讀取或 A2A 設定無效時，拒絕任務存取。移除某位員工後，也無法再透過 A2A 存取該員工先前的任務。
 
----
+`trusted_proxy_cidrs` 預設為 `[]`，最多接受 32 筆有效 IPv4／IPv6 CIDR，只應填入你控制的直接反向代理。符合名單的代理必須將 `X-Forwarded-For` 覆寫為單一 client IP；缺漏、重複、多層 IP 清單或無效值都會被拒絕。其他來源的標頭不採用。未設定時，同一代理後方的 client 仍在各流量類別內共用代理 IP 額度。例如，僅當 `192.0.2.10` 是你的直接代理時，才使用 `trusted_proxy_cidrs = ["192.0.2.10/32"]`；此設定不授予呼叫權限。
 
-## Agent Card
+每個 RPC 都需要 `Authorization: Bearer <Dashboard access JWT>` 和 `A2A-Version: 1.0`。JWT 由既有 Dashboard 帳號登入流程取得；此端點不接受舊版共用管理員 token 或 MCP HTTP-server API key。公開卡片可匿名探索；`GetExtendedAgentCard` 需要認證，且保留全部存取限制。
 
-每個 ACP server 都能描述自己。當客戶端連線時，它可以發出 `agent/discover` 並收到一份 **Agent Card**（一份包含身分、能力與技能的 JSON 文件）：
+版本標頭缺漏或為空時視為 `0.3`，HTTP 介面不支援此版本，回覆 `VersionNotSupportedError`（`-32009`）。請使用 v1.0 的 PascalCase 方法。既有 stdio 名稱 `message/send`、`tasks/get` 作為 HTTP 別名保留，但仍須提供 `1.0` 標頭與 v1.0 請求物件，不代表支援 0.3 傳輸。
+
+### 提交與查詢
+
+下列範例尚未經活體 gateway 驗證。請替換主機名稱與員工 id，並在 `DUDUCLAW_DASHBOARD_JWT` 提供有效的 Dashboard JWT。
+
+```sh
+curl --fail-with-body 'https://host.example/a2a' \
+  -H "Authorization: Bearer $DUDUCLAW_DASHBOARD_JWT" \
+  -H 'A2A-Version: 1.0' \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"metadata":{"agentId":"researcher"},"message":{"messageId":"request-001","role":"ROLE_USER","parts":[{"text":"Summarize the public project documentation."}]},"configuration":{"returnImmediately":true}}}'
+```
+
+`metadata.agentId` 指定公開的員工。`message.messageId` 必填，`role` 必須為 `ROLE_USER`，`parts` 只接受純文字。請設定 `configuration.returnImmediately = true`；此實作經由既有任務看板目標建立流程新增非同步目標，回傳 `result.task`。執行時沿用員工設定的 runtime 與 goal loop 權限閘。提交者須有直接 Operator 權限或為 Admin，僅有團隊授權不足以提交。每則訊息最多 4,000 字，HTTP 本文最多 64 KiB。僅接受新任務，請省略 `message.contextId` 與 `message.taskId`；回傳的 `contextId` 等於 task id。`historyLength` 只能省略或設為 `0`。登入帳號與 `messageId` 組成持久化唯一鍵。以相同完整 `params` 重送會回傳原任務；同一 id 搭配不同參數會被拒絕，JSON 物件欄位順序不影響判定。刪除任務不會釋出該 id，也不會因重送而重建任務；重送仍須通過目前授權。
+
+去重比對完整正規化 `params`：忽略物件欄位順序、保留陣列順序，省略欄位與明確填入預設值視為不同參數。相同 id 的內容衝突回覆 `-32602`（`INVALID_ARGUMENT`）；任務刪除後重送回覆 `-32001`（`TASK_NOT_FOUND`）。分頁 token 綁定所有者與 context、status、status timestamp、artifacts 篩選條件；`pageSize` 可逐頁調整。
+
+取得 task id 後，在相同端點送出以下請求，沿用認證與版本標頭：
 
 ```json
-{
-  "name": "duduclaw-pm",
-  "description": "Project manager for DuDuClaw v1.9 roadmap",
-  "url": "stdio://duduclaw acp server --agent duduclaw-pm",
-  "version": "1.8.14",
-  "capabilities": {
-    "streaming": true,
-    "multi_turn": true,
-    "tool_use": true
-  },
-  "skills": [
-    {
-      "name": "task_planning",
-      "description": "Break down features into TaskSpec workflows",
-      "tags": ["planning", "orchestration"]
-    },
-    {
-      "name": "sprint_review",
-      "description": "Summarize sprint outcomes from memory + tasks",
-      "tags": ["reporting", "retrospective"]
-    }
-  ]
-}
+{"jsonrpc":"2.0","id":2,"method":"GetTask","params":{"id":"<task-id>"}}
+{"jsonrpc":"2.0","id":3,"method":"ListTasks","params":{"pageSize":20}}
+{"jsonrpc":"2.0","id":4,"method":"CancelTask","params":{"id":"<task-id>"}}
+{"jsonrpc":"2.0","id":5,"method":"GetExtendedAgentCard","params":{}}
 ```
 
-這與 A2A 的 `.well-known/agent.json` 探索端點是同一份文件格式。IDE 可以快取它、在 UI 中顯示可用技能，並決定是否要把請求路由到這個特定的 Agent。
+`ListTasks` 支援 `contextId`、`status`、`statusTimestampAfter`、`includeArtifacts`，`pageSize` 為 1 至 100，並使用不透明的 `pageToken` 游標；將 `nextPageToken` 帶入下一頁。任務依單調遞增的建立序號排序，第一頁固定序號上界，後續 token 沿用同一上界；分頁期間新增的任務須另開不帶 token 的列表才會出現。每頁仍重查權限與狀態條件，固定的是任務範圍，並非凍結任務狀態。`totalSize` 只計目前可讀的任務；單一呼叫者儲存的任務超過 10,000 筆時，回覆 `RESOURCE_EXHAUSTED`，不提供不完整的總數。讀取與取消只限同一登入帳號透過 A2A 建立的任務，並重新檢查公開名單、目前帳號與員工權限，以及任務閱覽對象。所有者身分保存在任務上，子任務繼承相同所有者。一般 Dashboard 的任務列表、讀取、修改、刪除、停止、留言、附件、活動紀錄與推播同樣受所有者限制；Admin 沒有例外，也未提供另外的管理員覆寫入口。任務刪除後保留所有者紀錄，繼續保護殘留證據。外部 MCP 呼叫者若沒有 Dashboard 所有者身分便會被拒絕；經驗證且受指派執行該任務的員工保留工作所需存取權。
 
-### `.well-known` 產生
+狀態使用 `TASK_STATE_*`，包含 `TASK_STATE_SUBMITTED`、`TASK_STATE_WORKING`、`TASK_STATE_COMPLETED`、`TASK_STATE_FAILED`、`TASK_STATE_INPUT_REQUIRED` 與 `TASK_STATE_CANCELED`。等待核准或人工輸入不代表完成。取消沿用任務樹停止機制；若停止仍待確認或結果不確定，應持續查詢，不能把回覆當作外部程序或副作用已實體中止的證明。取消終止狀態的任務回覆 `TaskNotCancelableError`（`-32002`）。
 
-對於透過 HTTP 暴露的 Agent（未來的擴充），DuDuClaw 可以產生一份 `.well-known/agent.json` 檔案，讓外部客戶端不必先連線就能探索該 Agent：
+### 支援範圍與錯誤
 
-```
-/etc/duduclaw/agents/dudu/.well-known/agent.json
-     ↓
-https://your-host.example.com/.well-known/agent.json
-```
+`forward.recent` 與 `forward.chain` 也檢查保留的所有者紀錄，包含已刪除的 A2A 任務；Admin 不能繞過別人的所有權。`tasks.flow_metrics` 先排除其他 A2A 所有者的任務，再計算數量、時間與輪數統計。非 A2A 任務的存取規則維持不變。
 
-任何相容於 A2A 的客戶端都能讀取它、得知該 Agent 的能力，並決定是否要繼續。
+任務資料庫在任何 schema 遷移前，若已有 A2A 結構或重送紀錄，就必須有可讀取的 `task_access_principals` 表。表格缺失或無法讀取時拒絕開啟，不會從尚存任務重建空表；需從一致的備份還原完整所有者紀錄。全新資料庫及沒有 A2A 痕跡的舊版資料庫仍可遷移。
 
----
+既有 `keys/a2a-signing.ed25519` 必須是一般檔案，不能是符號連結。Unix 另要求檔案屬於 gateway 的有效執行使用者，且權限精確為 `0600`；Windows 不檢查 Unix owner／mode。不合格的檔案直接拒絕，不會覆寫或自動改權限。限流先檢查並記錄來源 IP 額度，通過後才扣全域額度；來源已超限的請求不會耗掉其他來源的全域容量。
 
-## JSON-RPC 迴圈
+| 操作 | 支援範圍 |
+|---|---|
+| `SendMessage` | 新增純文字、非同步目標 |
+| `GetTask`、`ListTasks` | 查詢自己建立且仍有權限的 A2A 任務 |
+| `CancelTask` | 請求停止自己的任務樹 |
+| `GetExtendedAgentCard` | 需認證的卡片，不增加權限 |
+| `SendStreamingMessage`、`SubscribeToTask` | 不支援，沒有 SSE |
+| 等待完成才回覆、接續既有任務、推播通知設定 | 不支援 |
 
-stdio server 是一個簡單的、以行為界的 JSON-RPC 2.0 迴圈：
+JSON-RPC 協定錯誤使用標準錯誤碼；A2A 錯誤依情況使用 `-32001` 至 `-32009`，`error.data` 是含 `google.rpc.ErrorInfo` 型別資訊的陣列。未認證與未授權請求使用 HTTP 401/403。任務操作前會檢查輸入與方法權限，並留下安全稽核紀錄。公開探索、認證失敗與已認證 RPC 各自使用獨立的 IP 額度，每個 IP 每分鐘限 120 次；三類全域上限依序為每分鐘 600、600、1,200 次，RPC 另有每個呼叫者每分鐘 60 次的限制。匿名流量不會扣除已認證 RPC 額度。每個 IP／呼叫者限流器最多保存 10,000 個鍵，滿額拒絕新鍵，過期清理另有頻率限制。此介面僅提供 HTTP，WebSocket 的 `a2a.*` 呼叫會被拒絕。詳見[安全防護](05-security-defense.md)。
 
-```
-loop {
-    read line from stdin
-    parse JSON-RPC 2.0 request
-    dispatch to handler:
-        agent/discover  → return AgentCard
-        tasks/send      → TaskManager.send(params)
-        tasks/get       → TaskManager.get(id)
-        tasks/cancel    → TaskManager.cancel(id)
-    write JSON-RPC 2.0 response to stdout
-}
-```
+## IDE Agent Client Protocol
 
-stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同。如果你已經建好了一個 MCP server，那你已經建好了一個 ACP server 的 95%。
+IDE agent panel 使用 `duduclaw acp`，支援 `initialize`、`session/new`、`session/prompt`、`session/update` 與 `session/cancel`。尚未設定的 home 會回覆 `AUTH_REQUIRED`，引導至終端 onboarding。提示回合使用 gateway 回覆管線，由 Main 角色員工處理。
 
-### 範例工作階段
+Zed 設定：
 
-```
-→ {"jsonrpc":"2.0","id":1,"method":"agent/discover"}
-← {"jsonrpc":"2.0","id":1,"result":{
-     "name":"duduclaw-pm",
-     "version":"1.8.14",
-     "capabilities":{"streaming":true,"multi_turn":true,"tool_use":true},
-     "skills":[...]
-   }}
-
-→ {"jsonrpc":"2.0","id":2,"method":"tasks/send","params":{
-     "task":"Draft the v1.9 release notes from the last 50 commits",
-     "priority":"high"
-   }}
-← {"jsonrpc":"2.0","id":2,"result":{
-     "task_id":"t_abc123",
-     "status":"queued"
-   }}
-
-→ {"jsonrpc":"2.0","id":3,"method":"tasks/get","params":{"task_id":"t_abc123"}}
-← {"jsonrpc":"2.0","id":3,"result":{
-     "task_id":"t_abc123",
-     "status":"completed",
-     "output":"# DuDuClaw v1.9 Release Notes\n\n..."
-   }}
+```json
+{"agent_servers":{"DuDuClaw":{"command":"duduclaw","args":["acp"]}}}
 ```
 
----
+Gateway A2A HTTP 方法與 IDE 工作階段方法不同；IDE panel 請勿設定為 `duduclaw acp server`。
 
-## A2ATaskManager
+## 既有 stdio A2A
 
-在 `tasks/send`、`tasks/get` 與 `tasks/cancel` 背後，是 `A2ATaskManager`。它的職責是：
+`duduclaw acp server` 保留既有本機協定。它的 `message/send` 以 `a2a-client` 身分寫入 gateway 委派佇列，受既有 `[acp] trusted` 政策限制。程序內的任務索引與盡力而為的佇列觀察，和 HTTP 持久化任務看板目標分開；重啟 stdio 程序會失去已索引的 task id，查無佇列回覆也不能證明任務完成。舊版 `tasks/send` 記憶體管理器同樣與 HTTP 任務看板分開。
 
-1. **排入佇列**：將傳入的任務排入 Agent 既有的任務系統（`TaskSpec`、`tasks/` 目錄）。
-2. **追蹤**狀態轉換（queued → running → completed/failed/cancelled）。
-3. **路由**任務執行至 Agent 的正常 runtime（Claude / Codex / Grok / OpenAI-compat 或其他目錄內 runtime）。
-4. **暴露**任務封套中的結果，讓客戶端能輪詢取得。
-
-這代表透過 ACP 提交的任務，會流經與透過頻道或 MCP 工具提交的任務**相同**的管線，這是單一事實來源，在 Logs/Activity dashboard 中統一可觀測。
-
----
-
-## 協定範圍：請先讀這段
-
-> **狀態更正（2026-08-13）。**`duduclaw acp server` 目前說的是 **A2A（Agent2Agent）協定**（stdio 上的 `agent/discover`、`message/send`、`tasks/send|get|cancel`＋`.well-known` agent card），**尚未**實作 IDE agent panel 使用的 *Agent Client Protocol*（`initialize`／`authenticate`／`session/new`／`session/prompt` 串流）。今天把 Zed、JetBrains 或 `nvim-acp` 指向它，會在 `initialize` 就收到 Method not found。兩個協定不巧共用「ACP」縮寫，本文早期版本把它們混為一談。
->
-> **更新（2026-08-13 同日）：真正的 Agent Client Protocol 已出貨，獨立指令 `duduclaw acp`。** 實作 ACP **v1**（`initialize` → `session/new` → `session/prompt`，`session/update` 串流：`agent_message_chunk`、`tool_call`／`tool_call_update`、`plan`），並支援 `session/cancel`（進行中的回合依 spec 以 `stopReason: "cancelled"` 收尾）。home 尚未設定時回 spec 的 `AUTH_REQUIRED`（`-32000`）並宣告指向終端機 `duduclaw onboard` 的認證方法。prompt 回合走與通訊頻道**同一條** gateway 回覆管線（session 記憶、契約檢查），對象是 Main 角色的 AI 員工。
->
-> Zed `settings.json` 設定：
->
-> ```json
-> { "agent_servers": { "DuDuClaw": { "command": "duduclaw", "args": ["acp"] } } }
-> ```
->
-> `duduclaw acp server` 維持 A2A 用途：兩個協定刻意分開在不同指令上。
-
-## 目前可用的功能（stdio 上的 A2A）
-
-### CI/CD Pipeline
-
-一個 pipeline 步驟可以透過 ACP 發送任務並輪詢直到完成：
-
-```yaml
-- name: Generate release notes via DuDuClaw
-  run: |
-    echo '{"jsonrpc":"2.0","id":1,"method":"tasks/send","params":{"task":"..."}}' \
-      | duduclaw acp server --agent duduclaw-pm
-```
-
-不需要 HTTP server、不需要 auth token、不需要管理連接埠；只需容器內的 stdio。
-
----
-
-## DuDuClaw 所說的三種 Stdio 協定
-
-值得梳理一下，因為命名有所重疊：
-
-| 協定 | 用途 | 方向 | 指令 |
-|----------|---------|-----------|---------|
-| **MCP** | 將 DuDuClaw 的工具（channel、memory、agent、wiki、task……）暴露給 AI runtime | Runtime → DuDuClaw | `duduclaw mcp-server` |
-| **ACP/A2A** | 讓外部客戶端（IDE、pipeline、其他 Agent）向 DuDuClaw 發送任務 | IDE → DuDuClaw | `duduclaw acp server` |
-| **Runtime stdio** | DuDuClaw 衍生一個 runtime（Claude/Codex/Grok）子行程並透過 stdio JSON 與它對話 | DuDuClaw → Runtime | *內部* |
-
-它們是三場各自獨立的對話，全都在 stdio 上，全都與 JSON-RPC 相鄰。同一個 Agent 在執行期同時參與這三者。
-
----
-
-## 為什麼是 Stdio，而非 HTTP？
-
-對 IDE 整合而言，stdio 有幾個實務上的優勢：
-
-- **零設定**：不必挑連接埠、不必 TLS 憑證、不必防火牆規則。
-- **行程範圍**：ACP server 與 IDE 工作階段同生共死。不會有孤兒監聽器。
-- **OS 層級驗證**：如果你能衍生這個行程，你就已經擁有所需的權限。不需要 API key。
-- **與傳輸無關**：同一套行協定可以透過 SSH 隧道傳輸、在容器內、或跨 VS Code remote 工作階段。
-
-HTTP 對 Dashboard 與 Prometheus metrics 仍然可用，但對 IDE ↔ Agent 而言，stdio 更簡單也更安全。
-
----
-
-## 串流與多輪
-
-Agent Card 宣告 `streaming: true` 與 `multi_turn: true`。這向客戶端傳達：
-
-- **串流**：長時間執行的任務可以在同一條 stdio 連線上陸續發出進度事件，最後才送出回應。
-- **多輪**：一個任務情境可以橫跨多個請求／回應對（釐清、後續追問）而不喪失狀態。
-
-這些能力對映 Session Memory Stack，釘選指令、滾雪球式回顧與關鍵事實，都會橫跨多輪 ACP 對話延續，方式與頻道訊息中相同。
-
----
-
-## 安全考量
-
-ACP 與 MCP 一樣，繼承 DuDuClaw 的安全邊界：
-
-- **CONTRACT.toml**：must_not/must_always 規則依然適用；經由 ACP 提交的任務無法違反它們。
-- **能力閘控**：`agent.toml [capabilities]` 的預設拒絕仍然閘控工具存取。
-- **稽核日誌**：經由 ACP 提交的任務會以 source=`acp` 出現在 `audit.unified_log` 中。
-- **沙箱化**：任務與其他任務一樣，套用可選的每 Agent 任務沙箱，詳見[任務沙箱](../../guides/zh-TW/task-sandbox.md)。
-
-客戶端是 IDE 並不會授予較高的信任；Agent 自身的策略才是最後一道防線。
-
----
-
-## 與其他系統的互動
-
-- **Task Board**：經由 ACP 提交的任務流經與經由頻道提交者相同的 `TaskStore`。兩者都會顯示在 Dashboard Activity Feed 中。
-- **Runtime 選擇**：Agent 的正常 runtime（Claude/Codex/Grok/OpenAI-compat）處理 ACP 任務，相同的工作階段記憶、相同的 prompt cache 策略、相同的帳號輪替。
-- **演化**：ACP 任務在關鍵事實萃取與預測錯誤校準上，計為「實質性輪次」。
-- **稽核日誌**：所有 ACP 請求都以 source=`acp` 記錄，與其他四個稽核來源（security / tool_calls / channel_failures / feedback）並列。
-
----
-
-## 為什麼這很重要
-
-### 以標準為基礎的整合
-
-ACP 是一個有真實客戶端（Zed、nvim-acp、實驗性 JetBrains 外掛）的真實協定。支援它讓 DuDuClaw 進入一個成長中的生態系，而不必為每個 IDE 製作客製整合。
-
-### 同一個 Agent，新的介面
-
-沒有新 Agent、沒有新設定、沒有新的 runtime 邊界。既有的 Agent（SOUL.md、CONTRACT.toml、記憶、技能、wiki）只是從一個新的進入點變得可達。所有對 Agent 行為的投資都得以延續。
-
-### 加速開發者迴圈
-
-開發者不必在聊天 app 中問 Agent 問題、再把回應複製貼上到編輯器，而能直接從工作之處呼叫 Agent。摩擦降至近乎為零，而 Agent 的回應就*落在情境中*。
-
-### 可組合的編排
-
-一個 Agent 可以是另一個 Agent 的 A2A 客戶端。編排者風格的 Agent 可以透過 `agent/discover` 探索子 Agent、檢查它們的技能標籤，並透過 `tasks/send` 路由任務。對於跨行程情境，這是 DuDuClaw 內部以檔案為基礎的 IPC 的一個結構化、標準的替代方案。
-
----
-
-## 總結
-
-一個好的 Agent 應該能從工作發生的任何地方被觸及。用餐區（頻道）是給終端使用者的；訂位專線（ACP/A2A）是給那些需要以程式化方式與它協作的 IDE、pipeline 與對等 Agent 的。同一個 Agent、同一顆大腦、同一套契約，只是前門換上了一個更乾淨的協定。
+上述 HTTP 公開名單與 JWT 任務歸屬規則適用於 `/a2a`，不會改寫 stdio 指令的信任模型。本文舊版將 HTTP 描述為未來僅供探索的擴充，並誤稱具備已實作的串流與多回合任務傳輸；HTTP 支援範圍以本頁表格為準。

@@ -32,7 +32,10 @@ pub fn state_text(
             ProtectionState::NotEnabled => Some((level_label(ProtectionLevel::File), "個人帳號的憑證保護尚未開啟。請到「安全」頁開啟憑證保護，再讓 AI 員工使用個人的 Google 帳號。".to_string())),
             ProtectionState::Missing => Some(("保護金鑰不見了", "找不到加密保存的保護金鑰，可能被刪除了。已保存的個人帳號憑證不能再用。請重新啟用，並請已連結的人重新連結。".to_string())),
             ProtectionState::KeyChanged => Some(("保護金鑰被更換", "加密保存的保護金鑰無法驗證，可能被改動；根金鑰遺失或被更換也會造成這個狀況。個人帳號已停用。請先檢查部署設定和根金鑰，再重新啟用並請大家重新連結。懷疑金鑰外洩時，請依部署指南更換儲存位置中的根金鑰；只在儀表板更換保護金鑰，擋不住有人還原舊的資料夾內容。".to_string())),
-            ProtectionState::Unavailable => Some(("獨立金鑰無法使用", with_extra("無法使用啟動時交付的獨立金鑰。個人帳號暫停使用；其他功能不受影響。", refusal_text(extra).unwrap_or(extra)))),
+            ProtectionState::Unavailable => Some(("獨立金鑰無法使用", match refusal_text(extra) {
+                Some(text) => format!("無法使用啟動時交付的獨立金鑰。個人帳號暫停使用；其他功能不受影響。{text}"),
+                None => with_extra("無法使用啟動時交付的獨立金鑰。個人帳號暫停使用；其他功能不受影響。", extra),
+            })),
             _ => None,
         };
         if let Some((label, detail)) = text { return (summary(label), detail); }
@@ -99,7 +102,8 @@ pub(super) fn refusal_text(reason: &str) -> Option<&'static str> {
         "exe_ancestor_owner" => "DuDuClaw 安裝路徑的目錄不全屬於 root。",
         "exe_ancestor_writable" => "其他帳號能修改 DuDuClaw 安裝路徑的目錄。",
         "supplementary_groups" => "DuDuClaw 仍有額外群組權限，或無法確認已清除。",
-        "engine_socket_reachable" => "DuDuClaw 能使用容器引擎的控制介面，或無法確認已被拒絕。",
+        "engine_socket_reachable" => "偵測到可存取的容器引擎控制介面。同機其他程式（常見於開發者啟動的容器）可能暴露此介面，個人帳號已暫停。預設會在介面移除、環境檢查通過後自動重新取得金鑰；自動恢復關閉、次數用盡或無法保存狀態時會繼續暫停。建議將開發容器移到其他主機；若為舊版 containerd shim，請升級 containerd。",
+        "engine_socket_probe_failed" => "無法完整檢查容器引擎控制介面（例如讀表失敗、格式錯誤或連線結果不明）。即使設定為只警告，仍會停用個人帳號；修復檢查環境後，依既有自動恢復設定重新取得金鑰，或由管理者重新啟動服務。",
         "engine_socket" => "容器裡看得到引擎控制介面，AI 員工可能藉此讀到金鑰。",
         "mount_scan_incomplete" => "無法完整檢查容器的引擎控制介面掛載。",
         "inactive" => "程序保護沒有啟用，無法接收獨立金鑰。",
@@ -134,5 +138,83 @@ fn with_extra(base: &str, extra: &str) -> String {
         base.to_string()
     } else {
         format!("{base}（{}）", duduclaw_core::truncate_chars(extra, 120))
+    }
+}
+
+/// This name is a diagnostic hint only; it never exempts a root-owned socket.
+fn docker_cli_root_detail(detail: &str) -> bool {
+    detail.strip_prefix("@docker_cli_").and_then(|rest| rest.strip_suffix(": peer uid=0 (root)"))
+        .is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+}
+
+/// Locale selection for surfaces that expose translated credential diagnostics.
+fn docker_cli_root_hint(locale: &str) -> &'static str {
+    match locale {
+        "en" => "This usually means someone ran the docker command as root on this host (for example, sudo docker compose …). Personal accounts pause while it runs and normally recover a few minutes after it ends, once checks pass and automatic recovery is available. To avoid this, run docker as a regular user in the docker group, or run development containers on another host.",
+        "ja-JP" => "通常は、このホストで誰かが root として docker コマンド（例：sudo docker compose …）を実行したことを示します。実行中は個人アカウントを一時停止し、終了後に環境チェックが成功して自動復旧が利用できれば、通常は数分で復旧します。回避するには docker グループの一般ユーザーで docker を実行するか、開発用コンテナを別のホストで実行してください。",
+        _ => "這通常表示有人在這台主機以 root 執行 docker 指令（例如 sudo docker compose …）。指令執行期間，個人帳號會暫停；結束後，環境檢查通過且自動恢復可用時，通常幾分鐘內會恢復。若要避免此情況，請用 docker 群組的一般使用者執行 docker，或將開發容器移到其他主機。",
+    }
+}
+
+/// Persisted diagnostics are history, never evidence that a different process
+/// (for example `doctor`) currently holds or has revoked the gateway's key.
+pub(super) fn recovery_detail(
+    status: &duduclaw_core::root_key::recovery::RecoveryStatus,
+    currently_refused: bool,
+) -> String {
+    let mut text = String::new();
+    if let Some(revocation) = &status.latest_revocation {
+        text.push_str(&format!(" 最近一次金鑰拒絕或撤銷（UTC {}）：{}",
+            duduclaw_core::root_key::recovery::sanitize_diagnostic(&revocation.timestamp), refusal_text(revocation.reason.as_str()).unwrap_or("保護檢查未通過。")));
+        if let Some(detail) = &revocation.detail {
+            text.push_str(&format!(" 偵測詳情：{}。", duduclaw_core::root_key::recovery::sanitize_diagnostic(detail)));
+            if revocation.reason.as_str() == "engine_socket_reachable" && docker_cli_root_detail(detail) {
+                text.push_str(docker_cli_root_hint("zh-TW"));
+            }
+        }
+    }
+    if currently_refused {
+        text.push_str(match status.recovery.as_str() {
+            "unit_upgrade_required" => " 尚未安裝可驗證的服務啟動上限，因此不會自動重啟。請由管理者執行 service upgrade --protected-linux，更新受保護服務後再試。",
+            "disabled" => " 自動恢復已關閉；排除原因後，請由管理者重新啟動受保護服務。",
+            "waiting" | "monitoring" => " 每分鐘重新檢查，連續三次通過後會重新啟動服務，重新執行完整金鑰交接檢查。",
+            "budget_exhausted" => " 已用完每小時四次自動重啟的建議額度；系統服務管理員另限制每小時的啟動總數，一般故障重啟也會計入。達到系統限制後，請由管理者確認環境並重新啟動。",
+            "restart_requested" => " 已要求正常關機；服務管理員將重新啟動服務並重新執行完整金鑰交接檢查。",
+            "state_unavailable" => " 無法讀取或保存恢復狀態，因此不會自動重啟。請檢查服務資料目錄的權限與可用空間。",
+            "non_transient" => " 此原因不會自動恢復；請修正保護設定後，由管理者重新啟動受保護服務。",
+            _ => " 無法確認自動恢復狀態，請由管理者檢查受保護服務。",
+        });
+    } else if status.latest_revocation.is_some() {
+        text.push_str(" 以上是歷史記錄，不代表服務目前仍被拒絕；請以儀表板的目前保護狀態為準。");
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_protection_docker_cli_hint_requires_exact_name_and_root_peer() {
+        let detail = "@docker_cli_3e708842d9322cef25983565c19d0866: peer uid=0 (root)";
+        assert!(docker_cli_root_detail(detail));
+        for locale in ["zh-TW", "en", "ja-JP"] {
+            let hint = docker_cli_root_hint(locale);
+            assert!(hint.contains("sudo docker compose …"));
+            assert!(hint.contains("docker"));
+        }
+        assert_ne!(docker_cli_root_hint("zh-TW"), docker_cli_root_hint("en"));
+        assert_ne!(docker_cli_root_hint("en"), docker_cli_root_hint("ja-JP"));
+        for invalid in [detail.replace("uid=0", "uid=1000"), detail.replace("3e708", "3E708"),
+            detail.replace(": peer", "/suffix: peer"), detail.replace("3e708", "3e70"), format!("{detail} extra")] {
+            assert!(!docker_cli_root_detail(&invalid), "{invalid}");
+        }
+        let status = duduclaw_core::root_key::recovery::RecoveryStatus {
+            latest_revocation: Some(duduclaw_core::root_key::recovery::Revocation {
+                reason: "engine_socket_reachable".into(), detail: Some(detail.into()),
+                timestamp: "2026-11-05T01:02:03Z".into(),
+            }), recovery: "waiting".into(),
+        };
+        assert!(recovery_detail(&status, true).contains(docker_cli_root_hint("zh-TW")));
     }
 }

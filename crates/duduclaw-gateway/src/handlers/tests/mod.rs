@@ -4,6 +4,7 @@
 use super::*;
 
 mod known_mcp_scopes_tests;
+mod employee_health_rpc_tests;
 mod transcription_config_tests;
 mod knowledge_dashboard_rpc_tests;
 mod knowledge_agent_tab_tests;
@@ -104,3 +105,8 @@ mod tool_pruning_rpc_tests;
 mod main_agent_rpc_tests;
 
 mod agents_main_commit_tests;
+
+mod mcp_oauth_grants_rpc_tests;
+mod templates_library_tests;
+mod cron_scoped_rpc_tests;
+mod dashboard_scope_tests;

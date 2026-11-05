@@ -118,7 +118,8 @@ mod ccr_guarded_reply_tests {
         let verdict = CCR_TURN_DELIVERY
             .scope(delivery.clone(), async {
                 let id = mgr
-                    .append_message_with_id("telegram:-100123", "assistant", SOURCE_DERIVED, 12)
+                    .append_delivery_message("telegram:-100123", "assistant", SOURCE_DERIVED, 12,
+                        None, delivery.waits_for_turn_delivery())
                     .await
                     .unwrap();
                 record_turn_assistant_message("telegram:-100123", id);
@@ -376,15 +377,52 @@ mod ccr_guarded_reply_tests {
     }
 
     #[tokio::test]
-    async fn webchat_row_revocation_failure_reaches_the_cancel_caller() {
-        let (_, cleanup) = super::with_delivery_cleanup(async {
-            let (_dir, mgr, delivery, _verdict) = session_with_pending_assistant_turn().await;
+    async fn webchat_unpublished_drop_never_notifies_success() {
+        let ((_dir, mgr, verdict), cleanup) = super::with_delivery_cleanup(async {
+            let (dir, mgr, delivery, verdict) = session_with_pending_assistant_turn().await;
+            let reply = GuardedReply::new(SOURCE_DERIVED.into(), None, Vec::new(),
+                Some(super::TurnRollback { delivery, session_mgr: mgr.clone() })).await;
+            assert!(reply.still_valid().await);
+            drop(reply);
+            (dir, mgr, verdict)
+        }).await;
+        cleanup.unwrap();
+        assert_eq!(verdict.await, Ok(false));
+        assert!(mgr.webchat_history("telegram:-100123").await.unwrap().iter()
+            .all(|row| row.message.role != "assistant"));
+    }
+
+    #[tokio::test]
+    async fn webchat_failed_revocation_stays_hidden_after_reopen_and_restore() {
+        let ((dir, mgr, id, verdict), cleanup) = super::with_delivery_cleanup(async {
+            let (dir, mgr, delivery, verdict) = session_with_pending_assistant_turn().await;
+            let id = delivery.assistant_message.lock().unwrap().as_ref().unwrap().1;
+            // Preserve the row and inject the exact failure being reviewed.
+            mgr.acquire().await.execute_batch(
+                "CREATE TRIGGER reject_revoke BEFORE UPDATE OF content ON session_messages
+                 BEGIN SELECT RAISE(ABORT, 'injected revocation failure'); END;"
+            ).unwrap();
+            assert!(mgr.webchat_history("telegram:-100123").await.unwrap().iter()
+                .all(|row| row.message.content != SOURCE_DERIVED));
             let building = super::TurnBuildRollback::new(delivery, mgr.clone());
-            mgr.acquire().await.execute("DROP TABLE session_messages", []).unwrap();
             drop(building);
-            (_dir, mgr)
+            (dir, mgr, id, verdict)
         }).await;
         assert!(cleanup.is_err());
+        assert_eq!(verdict.await, Ok(false));
+        assert!(mgr.get_message_ids("telegram:-100123").await.unwrap().iter().all(|row| *row != id));
+        drop(mgr);
+        let reopened = SessionManager::new(&dir.path().join("sessions.db")).unwrap();
+        reopened.restore_message("telegram:-100123", id).await.unwrap();
+        for message in reopened.get_messages("telegram:-100123").await.unwrap() {
+            assert_ne!(message.content, SOURCE_DERIVED);
+        }
+        assert!(reopened.webchat_history("telegram:-100123").await.unwrap().iter()
+            .all(|row| row.id != id));
+        let raw: String = reopened.acquire().await.query_row(
+            "SELECT content FROM session_messages WHERE id=?1", [id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(raw, SOURCE_DERIVED, "failed scrub must be hidden even when bytes remain");
     }
 
     #[tokio::test]
@@ -469,67 +507,83 @@ mod ccr_guarded_reply_tests {
             .iter().all(|message| message.content != SOURCE_DERIVED));
     }
 
-    async fn terminal_send_verdict(mode: &str) {
+    #[tokio::test]
+    async fn webchat_history_delivery_survives_transport_loss_but_not_source_revocation() {
+        for revoke in [false, true] {
+            let ((_dir, mgr, verdict), cleanup) = super::with_delivery_cleanup(async {
+                let (dir, mgr, delivery, verdict) = session_with_pending_assistant_turn().await;
+                let (guards, valid, _) = fake_guards();
+                let reply = GuardedReply::new(SOURCE_DERIVED.into(), None, guards,
+                    Some(super::TurnRollback { delivery, session_mgr: mgr.clone() })).await;
+                reply.persist_webchat(&mgr, "telegram:-100123", SOURCE_DERIVED).await.unwrap();
+                reply.persist_webchat(&mgr, "telegram:-100123", SOURCE_DERIVED).await.unwrap();
+                // The live writer is gone; history is the delivery destination.
+                let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
+                drop(rx);
+                assert!(tx.send(()).await.is_err());
+                if revoke { valid.store(false, Ordering::SeqCst); }
+                assert_eq!(reply.delivery_fence().valid().await, !revoke);
+                assert_eq!(reply.still_valid().await, !revoke);
+                if !revoke {
+                    let users = duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
+                    reply.publish_webchat(&mgr, "telegram:-100123", &users, users.acl_generation().unwrap(), &crate::webchat::access::TargetPolicy::test_admin(),
+                        &tokio_util::sync::CancellationToken::new()).await.unwrap();
+                }
+                drop(reply);
+                (dir, mgr, verdict)
+            }).await;
+            cleanup.unwrap();
+            assert_eq!(verdict.await, Ok(!revoke));
+            let history = mgr.get_messages("telegram:-100123").await.unwrap();
+            assert_eq!(history.iter().any(|m| m.content == SOURCE_DERIVED), !revoke);
+            // Revocation tombstones the row, so get_messages must hide it.
+            // Transport loss alone keeps exactly one row, even after a retry.
+            assert_eq!(history.iter().filter(|m| m.role == "assistant").count(), if revoke { 0 } else { 1 });
+        }
+    }
+
+    #[tokio::test]
+    async fn webchat_logout_after_history_commit_revokes_delivery() {
         let ((_dir, mgr, verdict), cleanup) = super::with_delivery_cleanup(async {
             let (dir, mgr, delivery, verdict) = session_with_pending_assistant_turn().await;
-            let reply = GuardedReply::new(
-                SOURCE_DERIVED.into(), None, Vec::new(),
-                Some(super::TurnRollback { delivery, session_mgr: mgr.clone() }),
-            ).await;
-            let (ack, received) = tokio::sync::oneshot::channel::<bool>();
-            let result = match mode {
-                "timeout" => {
-                    let result = reply.confirm_send(async {
-                        tokio::time::timeout(std::time::Duration::from_millis(10), received)
-                            .await.map_err(|_| ())?.map_err(|_| ())?.then_some(()).ok_or(())
-                    }).await;
-                    drop(ack);
-                    result
-                }
-                "closed_ack" => {
-                    drop(ack);
-                    reply.confirm_send(async { received.await.map(|_| ()).map_err(|_| ()) }).await
-                }
-                "closed_writer" => {
-                    let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
-                    drop(rx);
-                    reply.confirm_send(async { tx.send(()).await.map_err(|_| ()) }).await
-                }
-                "ack_then_close" => {
-                    ack.send(true).unwrap();
-                    reply.confirm_send(async { received.await.map(|_| ()).map_err(|_| ()) }).await
-                }
-                _ => panic!("unknown mode"),
-            };
-            assert_eq!(result.is_ok(), mode == "ack_then_close");
+            let reply = GuardedReply::new(SOURCE_DERIVED.into(), None, Vec::new(),
+                Some(super::TurnRollback { delivery, session_mgr: mgr.clone() })).await;
+            reply.persist_webchat(&mgr, "telegram:-100123", SOURCE_DERIVED).await.unwrap();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let fence = reply.delivery_fence().for_turn(&cancel);
+            cancel.cancel();
+            assert!(!fence.valid().await);
             drop(reply);
             (dir, mgr, verdict)
         }).await;
         cleanup.unwrap();
-        let delivered = mode == "ack_then_close";
-        assert_eq!(verdict.await, Ok(delivered));
-        assert_eq!(mgr.get_messages("telegram:-100123").await.unwrap()
-            .iter().any(|message| message.content == SOURCE_DERIVED), delivered);
+        assert_eq!(verdict.await, Ok(false));
+        assert!(mgr.get_messages("telegram:-100123").await.unwrap().iter()
+            .all(|m| m.content != SOURCE_DERIVED));
     }
 
     #[tokio::test]
-    async fn webchat_terminal_ack_timeout_revokes_history_and_delivery() {
-        terminal_send_verdict("timeout").await;
-    }
-
-    #[tokio::test]
-    async fn webchat_terminal_closed_writer_revokes_history_and_delivery() {
-        terminal_send_verdict("closed_writer").await;
-    }
-
-    #[tokio::test]
-    async fn webchat_terminal_closed_ack_revokes_history_and_delivery() {
-        terminal_send_verdict("closed_ack").await;
-    }
-
-    #[tokio::test]
-    async fn webchat_terminal_successful_ack_then_close_keeps_delivery() {
-        terminal_send_verdict("ack_then_close").await;
+    async fn webchat_history_delivery_records_missing_pipeline_row() {
+        let ((_dir, mgr, verdict), cleanup) = super::with_delivery_cleanup(async {
+            let (dir, mgr, _, _) = session_with_pending_assistant_turn().await;
+            let delivery = Arc::new(CcrTurnDelivery::default());
+            let verdict = delivery.subscribe();
+            let reply = GuardedReply::new("early response".into(), None, Vec::new(),
+                Some(super::TurnRollback { delivery, session_mgr: mgr.clone() })).await;
+            reply.persist_webchat(&mgr, "telegram:-100123", "early response").await.unwrap();
+            reply.persist_webchat(&mgr, "telegram:-100123", "early response").await.unwrap();
+            assert!(mgr.get_messages("telegram:-100123").await.unwrap().iter()
+                .all(|m| m.content != "early response"));
+            let users = duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
+            reply.publish_webchat(&mgr, "telegram:-100123", &users, users.acl_generation().unwrap(), &crate::webchat::access::TargetPolicy::test_admin(),
+                &tokio_util::sync::CancellationToken::new()).await.unwrap();
+            drop(reply);
+            (dir, mgr, verdict)
+        }).await;
+        cleanup.unwrap();
+        assert_eq!(verdict.await, Ok(true));
+        assert_eq!(mgr.get_messages("telegram:-100123").await.unwrap().iter()
+            .filter(|m| m.content == "early response").count(), 1);
     }
 
     #[tokio::test]

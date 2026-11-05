@@ -170,6 +170,29 @@ describe('SubscriptionSetupWizard', () => {
     expect(screen.getByRole('button', { name: /start over/i })).toBeInTheDocument();
   });
 
+  it.each([
+    ['capture_failed', /Capture failed: the code was received/],
+    ['authentication_rejected', /Claude rejected this login/],
+    ['validation_failed', /Login verification did not complete/],
+  ])('selects the localized %s message', async (code, expected) => {
+    const user = userEvent.setup();
+    mockCall({
+      'accounts.setup_token_start': () => ({
+        session_id: 'message-test',
+        auth_url: 'https://claude.com/cai/oauth/authorize?code=true',
+        expires_in_seconds: 300,
+        program: 'claude',
+      }),
+      'accounts.setup_token_submit': () => Promise.reject({ code, message: 'raw secret diagnostic' }),
+    });
+    renderWithProviders(<SubscriptionSetupWizard open onClose={vi.fn()} />);
+    await acknowledgeRiskAndContinue(user);
+    await user.type(await screen.findByPlaceholderText(/paste the code you received/i), 'CODE');
+    await user.click(screen.getByRole('button', { name: /^submit$/i }));
+    expect(await screen.findByText(expected)).toBeInTheDocument();
+    expect(screen.queryByText('raw secret diagnostic')).not.toBeInTheDocument();
+  });
+
   it('maps the gateway subscription-risk refusal to its i18n copy', async () => {
     const user = userEvent.setup();
     mockCall({

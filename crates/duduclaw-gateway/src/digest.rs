@@ -1032,7 +1032,8 @@ pub async fn apply_channel_feedback(
     // account and for this channel.
     let task_allowed = |task: &crate::task_store::TaskRow| {
         let audience = task_audience(home, &task.id);
-        live.has_agent_access(&task.assigned_to, AccessLevel::Operator)
+        crate::task_store::TaskStore::a2a_principal_allows(home, &task.id, &format!("user:{}", live.user_id))
+            && live.has_agent_access(&task.assigned_to, AccessLevel::Operator)
             && dashboard_may_read_task(&live, &audience)
             && channel_may_read_task(channel, &audience)
     };

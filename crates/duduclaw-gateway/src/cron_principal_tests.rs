@@ -148,3 +148,152 @@ async fn manual_legacy_cron_inherits_the_current_host_without_erasing_stored_ori
     // A one-off invocation does not claim ownership of future scheduled fires.
     assert_eq!(store.get(&row.id).await.unwrap().unwrap().on_behalf_of, None);
 }
+
+#[tokio::test]
+async fn scoped_legacy_cron_stops_after_operator_binding_revoked() {
+    let (home, registry, employee, _) = fixture().await;
+    let store = Arc::new(CronStore::open(home.path()).unwrap());
+    let mut row = CronTaskRow::new("scoped-legacy".into(), "Scoped legacy".into(), "worker".into(),
+        "0 9 * * *".into(), "prepare report".into());
+    row.on_behalf_of = Some(employee.clone());
+    let user = employee.strip_prefix("user:").unwrap();
+    row.scoped_by_user_id = Some(user.into());
+    assert!(row.created_by_user_id.is_none());
+    store.insert(&row).await.unwrap();
+    let users = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+    users.bind_agent(user, "worker", duduclaw_auth::AccessLevel::Viewer).unwrap();
+    let invoker = PrincipalInvoker { seen: Default::default(), deny_main: false };
+    dispatch_cron_task(home.path(), &store, &registry, &row, &invoker).await;
+    assert!(invoker.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn scoped_manual_cron_refuses_changed_snapshot() {
+    let (home, registry, employee, _) = fixture().await;
+    let store = Arc::new(CronStore::open(home.path()).unwrap());
+    let row = CronTaskRow::new("scoped-manual".into(), "Scoped manual".into(), "worker".into(),
+        "0 9 * * *".into(), "prepare report".into());
+    store.insert(&row).await.unwrap();
+    store.update_fields(&row.id, &row.name, "main", &row.cron, "other task", true).await.unwrap();
+    let invoker = PrincipalInvoker { seen: Default::default(), deny_main: false };
+    dispatch_cron_task_checked(home.path(), &store, &registry, &row, &invoker, None, Some(&employee)).await;
+    assert!(invoker.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn scoped_cron_pauses_when_sandbox_changes_without_registry_reload() {
+    let (home, registry, employee, _) = fixture().await;
+    let store = Arc::new(CronStore::open(home.path()).unwrap());
+    let mut row = CronTaskRow::new("scoped-sandbox".into(), "Scoped".into(), "worker".into(),
+        "0 9 * * *".into(), "prepare report".into());
+    row.on_behalf_of = Some(employee.clone());
+    row.created_by_user_id = employee.strip_prefix("user:").map(str::to_string);
+    row.scoped_by_user_id = row.created_by_user_id.clone();
+    store.insert(&row).await.unwrap();
+    let path = home.path().join("agents/worker/agent.toml");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, raw.replace("[container]", "[container]\nsandbox_enabled = true")).unwrap();
+    let invoker = PrincipalInvoker { seen: Default::default(), deny_main: false };
+    dispatch_cron_task(home.path(), &store, &registry, &row, &invoker).await;
+    assert!(invoker.seen.lock().unwrap().is_empty());
+    let stored = store.get(&row.id).await.unwrap().unwrap();
+    assert!(!stored.enabled);
+    assert_eq!(stored.run_count, 0);
+    assert_eq!(stored.last_status.as_deref(), Some("skipped"));
+    // A scoped manual run of a legacy job must not bypass the same gate.
+    let legacy = CronTaskRow::new("legacy-sandbox".into(), "Legacy".into(), "worker".into(),
+        "0 9 * * *".into(), "prepare report".into());
+    store.insert(&legacy).await.unwrap();
+    dispatch_cron_task_checked(home.path(), &store, &registry, &legacy, &invoker, None, Some(&employee)).await;
+    assert!(invoker.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn human_origin_only_cron_refuses_sandbox_target_without_verified_admin() {
+    let (home, registry, employee, admin) = fixture().await;
+    let store = Arc::new(CronStore::open(home.path()).unwrap());
+    let path = home.path().join("agents/worker/agent.toml");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, raw.replace("[container]", "[container]\nsandbox_enabled = true")).unwrap();
+    let invoker = PrincipalInvoker { seen: Default::default(), deny_main: false };
+    for (index, principal) in [employee, "unmapped:line:0123456789abcdef".into(),
+        "user:missing-account".into(), "malformed".into(), admin].into_iter().enumerate() {
+        let mut row = CronTaskRow::new(format!("human-only-{index}"), "Human".into(),
+            "worker".into(), "0 9 * * *".into(), "prepare report".into());
+        store.insert(&row).await.unwrap();
+        // Model existing MCP rows, including externally corrupted origins.
+        rusqlite::Connection::open(home.path().join("cron_tasks.db")).unwrap()
+            .execute("UPDATE cron_tasks SET on_behalf_of=?1 WHERE id=?2", [&principal, &row.id]).unwrap();
+        row.on_behalf_of = Some(principal);
+        assert!(row.created_by_user_id.is_none() && row.scoped_by_user_id.is_none());
+        dispatch_cron_task(home.path(), &store, &registry, &row, &invoker).await;
+        let stored = store.get(&row.id).await.unwrap().unwrap();
+        if index < 4 {
+            assert!(invoker.seen.lock().unwrap().is_empty());
+            assert!(!stored.enabled);
+            assert_eq!(stored.run_count, 0);
+            assert_eq!(stored.last_status.as_deref(), Some("skipped"));
+        } else {
+            assert_eq!(invoker.seen.lock().unwrap().len(), 1);
+            assert_eq!(stored.run_count, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn scoped_cron_host_target_runs_and_admin_sandbox_behavior_is_unchanged() {
+    let (home, registry, employee, admin) = fixture().await;
+    let store = Arc::new(CronStore::open(home.path()).unwrap());
+    let mut row = CronTaskRow::new("host-scoped".into(), "Host".into(), "worker".into(),
+        "0 9 * * *".into(), "prepare report".into());
+    row.on_behalf_of = Some(employee.clone());
+    row.scoped_by_user_id = employee.strip_prefix("user:").map(str::to_string);
+    store.insert(&row).await.unwrap();
+    let invoker = PrincipalInvoker { seen: Default::default(), deny_main: false };
+    dispatch_cron_task(home.path(), &store, &registry, &row, &invoker).await;
+    assert_eq!(invoker.seen.lock().unwrap().len(), 1);
+    let path = home.path().join("agents/worker/agent.toml");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, raw.replace("[container]", "[container]\nsandbox_enabled = true")).unwrap();
+    row.id = "admin-sandbox".into();
+    row.scoped_by_user_id = None;
+    row.on_behalf_of = Some(admin);
+    store.insert(&row).await.unwrap();
+    dispatch_cron_task(home.path(), &store, &registry, &row, &invoker).await;
+    assert_eq!(invoker.seen.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn scoped_cron_scheduler_skips_legacy_fast_rows_and_refreshes_before_dispatch() {
+    let (home, registry, employee, _) = fixture().await;
+    let store = Arc::new(CronStore::open(home.path()).unwrap());
+    let invoker = PrincipalInvoker { seen: Default::default(), deny_main: false };
+    let scheduler = CronScheduler::new(home.path().into(), store.clone(), registry.clone());
+    for marker in ["principal", "creator", "actor"] {
+        let mut row = CronTaskRow::new(marker.into(), marker.into(), "worker".into(),
+            "0 9 * * *".into(), "report".into());
+        match marker {
+            "principal" => row.on_behalf_of = Some(employee.clone()),
+            "creator" => row.created_by_user_id = employee.strip_prefix("user:").map(str::to_owned),
+            _ => row.scoped_by_user_id = employee.strip_prefix("user:").map(str::to_owned),
+        }
+        store.insert(&row).await.unwrap();
+        let conn = rusqlite::Connection::open(home.path().join("cron_tasks.db")).unwrap();
+        conn.execute("UPDATE cron_tasks SET cron='* * * * *' WHERE id=?1", [&row.id]).unwrap();
+        drop(conn);
+        // Dispatch must refresh the cached, previously-valid snapshot.
+        dispatch_cron_task(home.path(), &store, &registry, &row, &invoker).await;
+        assert_eq!(store.get(&row.id).await.unwrap().unwrap().run_count, 0);
+    }
+    assert!(invoker.seen.lock().unwrap().is_empty());
+    scheduler.reload().await;
+    assert!(scheduler.tasks.read().await.is_empty());
+    // An unmarked Admin-created row retains its existing cadence behavior.
+    let admin = CronTaskRow::new("admin-fast".into(), "Admin".into(), "worker".into(),
+        "* * * * *".into(), "report".into());
+    store.insert(&admin).await.unwrap();
+    dispatch_cron_task(home.path(), &store, &registry, &admin, &invoker).await;
+    assert_eq!(invoker.seen.lock().unwrap().len(), 1);
+    scheduler.reload().await;
+    assert_eq!(scheduler.tasks.read().await.len(), 1);
+}

@@ -335,9 +335,18 @@ on its final step.
 
 Creates `~/Library/LaunchAgents/com.duduclaw.gateway.plist`
 
-After updating a macOS LaunchAgent, use `duduclaw service restart` to unload
-and bootstrap the job against its plist. If `duduclaw doctor` reports launchd
+After a verified gateway update, a separate one-shot LaunchAgent automatically
+re-registers and restarts the running gateway. It first allows up to 55 seconds
+for the gateway to flush and drain, then unloads and bootstraps the job. The
+helper runs the installed binary and bounds re-registration to 90 seconds. If
+the original process has not exited within 55 seconds, it refuses forced unload.
+It does not retry indefinitely. Its log is `~/.duduclaw-update-relaunch/relaunch.log`; its private
+plist is removed when consumed. An exited helper registration is inert and is
+replaced at the next update. If automatic relaunch fails, use
+`duduclaw service restart`. If `duduclaw doctor` reports launchd
 exit code 78, run that command to re-register the job with the updated binary.
+The first upgrade from a version without this fix can still need a manual
+restart: the new behavior starts once the fixed gateway is running.
 
 ### Linux (systemd)
 
@@ -363,6 +372,21 @@ the same pipeline:
    tampered releases are rejected, no override)
 3. Verify the new binary executes (`duduclaw version`), then atomically
    swap it in place (backup + rename, auto-rollback on failure)
+4. On macOS, a gateway managed by the standard or legacy DuDuClaw LaunchAgent
+   is re-registered by the independent helper described above. Other installs
+   keep graceful shutdown followed by in-process re-exec (PID preserved on
+   Unix). Desktop sidecars continue to be updated and restarted by the app.
+3. Verify the new binary executes (`duduclaw version`), then replace it.
+   On Unix, staging is created exclusively in the install directory with mode
+   `0755`, flushed, and installed by one rename over the old path, followed by
+   a directory sync. A hard-link or flushed copy preserves the old binary first;
+   rollback also uses one rename. Windows uses `ReplaceFileW` with a backup,
+   then tries `MoveFileExW` with replacement and write-through. If a running
+   executable blocks both, the rename-aside fallback restores the old file on
+   a reported install failure; a crash between those moves can still leave the
+   install path empty. Rollback uses native replacement only; if blocked, it reports a retained recovery copy.
+   CLI self-update uses this same pipeline. Protected Linux service upgrades
+   and desktop updates have separate installers.
 4. Graceful shutdown, then **re-exec the new binary in-process** — the PID
    is preserved on macOS/Linux, so launchd/systemd keep supervising, and
    unsupervised foreground runs (npm wrapper, `duduclaw run`) restart too
@@ -385,6 +409,61 @@ Notes by install method:
 | Standalone / npm | Self-update in place (npm registry metadata goes stale until the next `npm i -g duduclaw`, harmless) |
 | Homebrew (discontinued) | Self-update refuses; the tap is retired and will never receive new versions — reinstall via npm or the desktop app instead |
 | Source (`cargo`/`target/`) | Self-update allowed but a rebuild will overwrite |
+
+### Troubleshooting: dashboard update from v1.79.2 or older to v1.79.3 fails
+
+On macOS Apple Silicon, the original v1.79.3 executable is 210,561,920 bytes
+(200.8 MiB). Updaters in v1.79.2 and older reject an extracted executable at
+200 MiB (209,715,200 bytes), so every attempt fails. The old dashboard may show
+only “Update failed”. Raising the limit in the new release cannot change the
+updater that is still running. New release builds remove symbols and check
+archive sizes before publication to keep them compatible with these updaters.
+
+For an ordinary standalone installation, replace the executable manually once:
+
+1. Download the archive for the intended version, OS and CPU from
+   [GitHub Releases](https://github.com/zhixuli0406/DuDuClaw/releases), along
+   with its `.sha256` and `.minisig`. Install `minisign` first if necessary.
+   Example for v1.79.3 on macOS Apple Silicon:
+
+```sh
+version=1.79.3
+asset=duduclaw-darwin-arm64.tar.gz
+stage=$(mktemp -d)
+cd "$stage"
+base="https://github.com/zhixuli0406/DuDuClaw/releases/download/v$version"
+curl -fL "$base/$asset" -o "$asset"
+curl -fL "$base/$asset.sha256" -o "$asset.sha256"
+curl -fL "$base/$asset.minisig" -o "$asset.minisig"
+shasum -a 256 -c "$asset.sha256" &&
+  minisign -Vm "$asset" -x "$asset.minisig" \
+    -P 'RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh'
+```
+
+2. Continue only if **both** checks succeed. The public key above is the
+   official release key, also pinned in the updater; do not substitute a key
+   downloaded alongside the archive. Extract with `tar -xzf "$asset" duduclaw`
+   and run `./duduclaw version` to confirm the version.
+3. Find the executable path used by the service (the launchd plist or systemd
+   unit in section 7). Resolve any symlink: npm's `duduclaw` command can point
+   to a JavaScript wrapper, which must not be replaced with the native binary.
+   Keep a copy of the actual executable, for example `<binary>.pre-upgrade`.
+4. Stop the service and confirm it has stopped: on macOS use the installed
+   executable's `service stop`; on Linux use `systemctl --user stop duduclaw`.
+   For a foreground installation, stop its process in the original terminal.
+   Copy the verified `./duduclaw` over the actual executable path and restore
+   executable permissions (`chmod 755 <binary>`). Leave the data directory intact.
+5. Start the same service: on macOS use `<binary> service restart` (reloads the
+   registered LaunchAgent); on Linux use `systemctl --user start duduclaw`.
+   Foreground installations use their original start command. Confirm the
+   dashboard version and service status. If startup fails, stop it, restore the
+   saved executable and start it again; keep the backup until verification succeeds.
+
+Linux archives use `duduclaw-linux-x64.tar.gz` or `duduclaw-linux-arm64.tar.gz`;
+use `sha256sum -c` if `shasum` is unavailable. This procedure is for ordinary
+installations. Desktop apps use their app updater; protected Linux services use
+[the protected service upgrade procedure](linux-protected-service.md).
+
 
 ---
 

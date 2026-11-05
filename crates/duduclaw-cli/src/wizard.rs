@@ -229,11 +229,8 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
         ))
     })?;
 
-    // Seed the bundled skills so a wizard-created staffer isn't born with an
-    // empty Skills page. Runs before the template copy — `install_builtin_skills`
-    // never overwrites an existing `<name>/SKILL.md`, so a premium template that
-    // ships its own version of a bundled skill still wins.
-    let _ = duduclaw_agent::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS"));
+    // Shared defaults are installed once, independently of employee templates.
+    duduclaw_gateway::builtin_skills_seed_migration::run(&home);
 
     // Copy template files if the industry has a template. Free templates
     // resolve under `templates/`; premium ones carry their own absolute path

@@ -23,11 +23,17 @@ export interface AgentBinding {
 
 export interface SessionTokens {
   access_token: string;
-  refresh_token: string;
+  refresh_token?: string;
+  remembered?: boolean;
 }
-export type LoginChallenge =
+export interface FactorAvailability {
+  factors?: { totp: boolean; email: boolean; passkey: boolean };
+  last_used?: 'totp' | 'email' | 'passkey';
+  email_available?: boolean;
+}
+export type LoginChallenge = FactorAvailability & (
   | { mfa_required: true; challenge_id: string }
-  | { mfa_enrollment_required: true; enrollment_token: string; challenge_ref: string };
+  | { mfa_enrollment_required: true; enrollment_token: string; challenge_ref: string });
 export type LoginResult = LoginChallenge | void;
 
 interface AuthStore {
@@ -40,7 +46,7 @@ interface AuthStore {
   readonly loading: boolean;
   readonly authAttempt: number;
 
-  login: (email: string, password: string) => Promise<LoginResult>;
+  login: (email: string, password: string, remember?: boolean) => Promise<LoginResult>;
   establishSession: (tokens: SessionTokens, attempt?: number, isActive?: () => boolean) => Promise<boolean>;
   /** The MFA RPC has already rebound this socket; keep the mounted route. */
   replaceSessionTokens: (tokens: SessionTokens, previousRefreshToken: string | null) => void;
@@ -48,7 +54,7 @@ interface AuthStore {
    *  challenge id (+ masked target hint when the account has a channel). */
   otpRequest: (email: string) => Promise<{ challenge_id: string; hint?: string }>;
   /** Passwordless login step 2: verify the code and establish the session. */
-  otpVerify: (challengeId: string, code: string) => Promise<LoginResult>;
+  otpVerify: (challengeId: string, code: string, remember?: boolean) => Promise<LoginResult>;
   /**
    * Personal edition, loopback caller: ask the gateway to issue a session
    * without a password (WP-F1 / design §2, D3-A). Resolves `true` when a
@@ -69,28 +75,31 @@ interface AuthStore {
 }
 
 const STORAGE_KEY_REFRESH = 'duduclaw-refresh-token';
+const REMEMBER_MARKER = 'duduclaw-remembered';
+const COOKIE_SESSION = 'cookie';
+let pendingRemember: boolean | null = null;
 
-// M22 mitigation (client-only): the access token (`jwt`) is already held in
-// memory only (zustand state, never persisted), so it is not readable from
-// any persistent store. The refresh token is moved from `localStorage` to
-// `sessionStorage` to shrink its XSS-exposure surface:
-//   - it is scoped to the originating tab/window and is NOT shared with other
-//     tabs, and
-//   - it is cleared automatically when the tab/window closes (no indefinite
-//     persistence on the device).
-// A new tab requires a fresh login, which is an acceptable trade-off and a
-// strict improvement over an indefinitely-persisted localStorage token.
-//
-// NOTE: this is a partial mitigation only. The full fix requires the backend
-// to deliver the refresh token in an httpOnly + SameSite + Secure cookie so it
-// is never reachable from JavaScript at all. That needs gateway Set-Cookie
-// support (out of scope for this client-side change). Until then, any code
-// reading the token MUST go through `refreshTokenStorage` below.
-//
-// We also migrate any pre-existing localStorage token to sessionStorage on
-// first read so users who logged in before this change are not force-logged-out.
+// Serialize locally even when Web Locks are unavailable. Web Locks also protect
+// cross-tab rotation, including response-cookie updates before the next request.
+let cookieQueue: Promise<unknown> = Promise.resolve();
+let cookieOperationsPending = 0;
+function cookieOperation<T>(run: () => Promise<T>): Promise<T> {
+  cookieOperationsPending++;
+  const result = cookieQueue.then<T>(async () => {
+    if (typeof navigator !== 'undefined' && navigator.locks) {
+      return await navigator.locks.request('duduclaw-session-cookie', run);
+    }
+    return await run();
+  }).finally(() => { cookieOperationsPending--; });
+  cookieQueue = result.catch(() => undefined);
+  return result;
+}
+
+// Ordinary sessions retain the existing tab-scoped JWT. Remembered sessions
+// persist only a non-secret marker; the rotating credential is HttpOnly.
 const refreshTokenStorage = {
   get(): string | null {
+    if (typeof localStorage !== 'undefined' && localStorage.getItem(REMEMBER_MARKER) === '1') return COOKIE_SESSION;
     if (typeof sessionStorage === 'undefined') return null;
     const fromSession = sessionStorage.getItem(STORAGE_KEY_REFRESH);
     if (fromSession) return fromSession;
@@ -106,6 +115,15 @@ const refreshTokenStorage = {
     return null;
   },
   set(token: string): void {
+    if (token === COOKIE_SESSION) {
+      if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem(STORAGE_KEY_REFRESH);
+      if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem(STORAGE_KEY_REFRESH);
+        localStorage.setItem(REMEMBER_MARKER, '1');
+      }
+      return;
+    }
+    if (typeof localStorage !== 'undefined') localStorage.removeItem(REMEMBER_MARKER);
     if (typeof sessionStorage !== 'undefined') {
       sessionStorage.setItem(STORAGE_KEY_REFRESH, token);
     }
@@ -115,6 +133,7 @@ const refreshTokenStorage = {
     }
   },
   clear(): void {
+    if (typeof localStorage !== 'undefined') localStorage.removeItem(REMEMBER_MARKER);
     if (typeof sessionStorage !== 'undefined') {
       sessionStorage.removeItem(STORAGE_KEY_REFRESH);
     }
@@ -205,8 +224,9 @@ const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 export async function apiPost<T>(path: string, body: Record<string, unknown>): Promise<T> {
   const res = await fetch(path, {
     method: 'POST',
+    credentials: 'same-origin',
     cache: 'no-store',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-DuDuClaw-CSRF': '1' },
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
@@ -259,10 +279,26 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
 
   establishSession: async (data, attempt = get().authAttempt, isActive = () => true) => {
     if (attempt !== get().authAttempt || !isActive()) return false;
+    const wasRemembered = (get().refreshToken ?? refreshTokenStorage.get()) === COOKIE_SESSION;
+    const remember = pendingRemember ?? wasRemembered;
+    if (pendingRemember === false && wasRemembered) {
+      await cookieOperation(() => apiPost('/api/session/logout', {}));
+      if (attempt !== get().authAttempt || !isActive()) return false;
+    }
+    if (remember && data.refresh_token) {
+      const original = data;
+      data = await cookieOperation(() => apiPost<SessionTokens>('/api/session/remember', {
+        access_token: original.access_token, refresh_token: original.refresh_token,
+      }));
+      if (attempt !== get().authAttempt || !isActive()) return false;
+    }
+    const token = data.remembered ? COOKIE_SESSION : data.refresh_token;
+    if (!token) throw new Error('Missing session credential');
     const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>('/api/me', data.access_token);
     if (attempt !== get().authAttempt || !isActive()) return false;
-    refreshTokenStorage.set(data.refresh_token);
-    set({ user: me.user, jwt: data.access_token, refreshToken: data.refresh_token,
+    refreshTokenStorage.set(token);
+    pendingRemember = null;
+    set({ user: me.user, jwt: data.access_token, refreshToken: token,
       isAuthenticated: true, initialized: true, bindings: me.bindings });
     startRefreshTimer(get().refresh);
     return true;
@@ -275,13 +311,28 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     // No /api/me fetch or socket reconnect between receipt and showing codes.
     // The connected socket is already authenticated at this token's epoch;
     // its reconnect token getter reads jwt directly from this store.
-    set({ jwt: data.access_token, refreshToken: data.refresh_token });
-    try { refreshTokenStorage.set(data.refresh_token); }
+    const token = data.remembered ? COOKIE_SESSION : data.refresh_token;
+    if (!token) return;
+    set({ jwt: data.access_token, refreshToken: token });
+    try { refreshTokenStorage.set(token); }
     catch { /* Keep the live session and recovery codes if storage is unavailable. */ }
+    if (previousRefreshToken === COOKIE_SESSION && data.refresh_token) {
+      const attempt = get().authAttempt;
+      // The mutation already revoked the old epoch. Reissue this device only,
+      // while keeping its replacement access token usable during the exchange.
+      void cookieOperation(() => apiPost<SessionTokens>('/api/session/remember', {
+        access_token: data.access_token, refresh_token: data.refresh_token,
+      })).then(next => {
+        if (attempt !== get().authAttempt || get().jwt !== data.access_token || !next.remembered) return;
+        set({ jwt: next.access_token, refreshToken: COOKIE_SESSION });
+        refreshTokenStorage.set(COOKIE_SESSION);
+      }).catch(() => { /* The short session remains usable; the revoked persistent credential is never restored. */ });
+    }
     startRefreshTimer(get().refresh);
   },
 
-  login: async (email, password) => {
+  login: async (email, password, remember = false) => {
+    pendingRemember = remember;
     const attempt = get().authAttempt + 1;
     set({ loading: true, authAttempt: attempt });
     try {
@@ -301,7 +352,8 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     return { challenge_id: data.challenge_id, hint: data.hint };
   },
 
-  otpVerify: async (challengeId, code) => {
+  otpVerify: async (challengeId, code, remember = false) => {
+    pendingRemember = remember;
     const attempt = get().authAttempt + 1;
     set({ loading: true, authAttempt: attempt });
     try {
@@ -364,6 +416,9 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
 
   // R2 fix: disconnect WebSocket on logout (via client singleton, avoids circular dep)
   logout: () => {
+    const remembered = (get().refreshToken ?? refreshTokenStorage.get()) === COOKIE_SESSION || cookieOperationsPending > 0;
+    pendingRemember = null;
+    if (remembered) void cookieOperation(() => apiPost('/api/session/logout', {})).catch(() => { /* Local logout remains immediate; retry on the next explicit sign-in. */ });
     set({ authAttempt: get().authAttempt + 1 });
     stopRefreshTimer();
     client.disconnect();
@@ -391,9 +446,9 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
           return;
         }
 
-        const data = await apiPost<{ access_token: string }>('/api/refresh', {
-          refresh_token: refreshToken,
-        });
+        const data = refreshToken === COOKIE_SESSION
+          ? await cookieOperation(() => apiPost<SessionTokens>('/api/session/refresh', {}))
+          : await apiPost<SessionTokens>('/api/refresh', { refresh_token: refreshToken });
         if (!stillCurrent()) return;
 
         const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>(
@@ -452,9 +507,9 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     // 401/403 clears the token.
     for (let attempt = 0; attempt < RETRY_MAX_ATTEMPTS; attempt++) {
       try {
-        const data = await apiPost<{ access_token: string }>('/api/refresh', {
-          refresh_token: refreshToken,
-        });
+        const data = refreshToken === COOKIE_SESSION
+          ? await cookieOperation(() => apiPost<SessionTokens>('/api/session/refresh', {}))
+          : await apiPost<SessionTokens>('/api/refresh', { refresh_token: refreshToken });
 
         const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>(
           '/api/me',

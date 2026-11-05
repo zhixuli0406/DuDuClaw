@@ -5,6 +5,7 @@ import { api, type PersonalGoogleStatus } from '@/lib/api';
 import { toast } from '@/lib/toast';
 import { Button, Card, CardContent, CardHeader, CardTitle, ErrorState, Input, Skeleton } from '@/components/mds';
 import { GoogleDataDisclosure } from '@/components/GoogleDataDisclosure';
+import { DRIVE_FILE_SCOPE, MEET_READ_SCOPE } from '@/lib/meeting/drive';
 
 export function MyConnectionsPage() {
   const intl = useIntl();
@@ -20,6 +21,8 @@ export function MyConnectionsPage() {
   const [confirmed,setConfirmed] = useState<Record<string,boolean>>({});
   const [disconnectConfirmed,setDisconnectConfirmed] = useState(false);
   const [googleDataConfirmed,setGoogleDataConfirmed] = useState(false);
+  const [meetingConfirmed,setMeetingConfirmed] = useState(false);
+  const [driveToolsConfirmed,setDriveToolsConfirmed] = useState(false);
   const [disconnectNote,setDisconnectNote] = useState('');
   const load = useCallback(async () => {
     try { setStatus(await api.personalGoogle.status()); setError(null); } catch(e) { setError(e); }
@@ -38,11 +41,11 @@ export function MyConnectionsPage() {
     setQuery({}, {replace:true});
     void run(()=>api.personalGoogle.finish(state));
   },[query,setQuery,run]);
-  const connect = async () => {
+  const connect = async (purpose?: 'meeting' | 'drive_tools') => {
     const popup = window.open('about:blank','_blank');
     if (popup) popup.opener = null;
     setBusy(true);
-    try { const started = await api.personalGoogle.start(googleDataConfirmed); setGoogleDataConfirmed(false); setRedirectUri(started.redirect_uri); setPaste(started.completion === 'paste'); if (popup) popup.location.replace(started.authorization_url); else window.location.assign(started.authorization_url); }
+    try { const started = await api.personalGoogle.start(googleDataConfirmed, purpose === 'meeting', purpose === 'drive_tools'); setGoogleDataConfirmed(false); setMeetingConfirmed(false); setDriveToolsConfirmed(false); setRedirectUri(started.redirect_uri); setPaste(started.completion === 'paste'); if (popup) popup.location.replace(started.authorization_url); else window.location.assign(started.authorization_url); }
     catch(e) { popup?.close(); toast.error(e instanceof Error ? e.message : String(e)); }
     finally { setBusy(false); }
   };
@@ -55,14 +58,31 @@ export function MyConnectionsPage() {
         <Link to="/mail" className="text-sm underline">{t('nav.mail')}</Link>
         {status.connection.account_email.toLowerCase() !== status.login_email.toLowerCase() && <p className="text-sm text-warning">{t('myConnections.different',{email:status.login_email})}</p>}
         <p className="text-sm">{t('myConnections.connectedAt',{time:new Date(status.connection.connected_at).toLocaleString(intl.locale)})}</p>
-        <p className="text-sm">{t('myConnections.services')}: {['gmail','calendar','drive','spreadsheets','documents','presentations','forms','tasks'].filter(service=>status.connection!.granted_scopes.some(scope=>scope.includes(service))).map(service=>t(`myConnections.service.${service}`)).join('、') || t('myConnections.noServices')}</p>
+        <p className="text-sm">{t('myConnections.services')}: {['gmail','calendar','drive','spreadsheets','documents','presentations','forms','tasks','chat'].filter(service=>status.connection!.local_purposes?.includes(service === 'drive' ? 'drive_tools' : service === 'chat' ? 'chat_read' : 'base') && status.connection!.granted_scopes.some(scope=>service === 'drive' ? ['https://www.googleapis.com/auth/drive.readonly','https://www.googleapis.com/auth/drive'].includes(scope) : scope.includes(service))).map(service=>t(`myConnections.service.${service}`)).join('、') || t('myConnections.noServices')}</p>
       </>}
       {!status.client_configured && <p>{t('myConnections.noClient')}</p>}
       {!status.integration_enabled && <p className="text-sm text-warning">{t('myConnections.integrationOff')}</p>}
       {status.requires_login && <p className="text-sm text-warning">{t('myConnections.loginAgain')}</p>}
       <p className="text-xs text-muted-foreground">{t('myConnections.testing')}</p>
+      {status.chat_read && <p className="text-sm text-muted-foreground">{t('google.chatRead.hint')}</p>}
       <GoogleDataDisclosure confirmed={googleDataConfirmed} onConfirmedChange={setGoogleDataConfirmed}/>
       <Button disabled={busy||!status.client_configured||status.requires_login||!googleDataConfirmed} onClick={()=>void connect()}>{status.connection ? t('myConnections.reconnect') : t('myConnections.connect')}</Button>
+      {status.connection && <section className="space-y-3 rounded-lg border border-border p-4" aria-labelledby="meeting-google-consent">
+        <h2 id="meeting-google-consent" className="font-medium">{t('meeting.drive.consentTitle')}</h2>
+        <p className="text-sm leading-6">{t('meeting.drive.consentDescription')}</p>
+        <ul className="space-y-2 text-xs text-muted-foreground"><li className="break-all">{DRIVE_FILE_SCOPE}</li><li className="break-all">{MEET_READ_SCOPE}</li></ul>
+        <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={meetingConfirmed} onChange={e=>setMeetingConfirmed(e.target.checked)}/>{t('meeting.drive.consentConfirm')}</label>
+        <Button variant="outline" disabled={busy||!status.client_configured||status.requires_login||!googleDataConfirmed||!meetingConfirmed} onClick={()=>void connect('meeting')}>{t('meeting.drive.authorize')}</Button>
+        <p className="text-xs text-muted-foreground">{t('meeting.drive.revokeHint')}</p>
+        <Link to="/meeting-transcripts" className="text-sm underline">{t('meeting.title')}</Link>
+      </section>}
+      {status.connection && <section className="space-y-3 rounded-lg border border-border p-4" aria-labelledby="drive-tools-google-consent">
+        <h2 id="drive-tools-google-consent" className="font-medium">{t('myConnections.driveTools.title')}</h2>
+        <p className="text-sm leading-6">{t('myConnections.driveTools.description')}</p>
+        <p className="break-all text-xs text-muted-foreground">https://www.googleapis.com/auth/drive.readonly</p>
+        <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={driveToolsConfirmed} onChange={e=>setDriveToolsConfirmed(e.target.checked)}/>{t('myConnections.driveTools.confirm')}</label>
+        <Button variant="outline" disabled={busy||!status.client_configured||status.requires_login||!googleDataConfirmed||!driveToolsConfirmed} onClick={()=>void connect('drive_tools')}>{t('myConnections.driveTools.authorize')}</Button>
+      </section>}
       {redirectUri&&<div className="space-y-2"><label htmlFor="google-registered-return">{t('myConnections.registeredReturn')}</label><Input id="google-registered-return" readOnly value={redirectUri}/><Button variant="outline" onClick={()=>void navigator.clipboard.writeText(redirectUri).catch(e=>toast.error(e instanceof Error?e.message:String(e)))}>{t('myConnections.copyReturn')}</Button></div>}
       {disconnectNote&&<p className="text-sm text-warning">{disconnectNote}</p>}
       {status.connection && <div className="space-y-2"><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={disconnectConfirmed} onChange={e=>setDisconnectConfirmed(e.target.checked)}/>{t('myConnections.disconnectConfirm')}</label><Button variant="outline" disabled={busy||!disconnectConfirmed} onClick={()=>void run(async()=>{const result=await api.personalGoogle.disconnect();setDisconnectNote(result.provider_note??'');})}>{t('myConnections.disconnect')}</Button></div>}

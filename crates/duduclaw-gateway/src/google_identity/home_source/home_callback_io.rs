@@ -27,7 +27,12 @@ fn expected_request(requested: &[String]) -> Result<Vec<String>> {
             .map(|s| s.to_string())
             .collect(),
     )?;
-    if actual != required {
+    let mut with_chat = required.clone();
+    with_chat.extend(crate::google_workspace::CHAT_READ_SCOPES.iter().map(|s| s.to_string()));
+    let with_chat = home_store::normalized_scopes(with_chat)?;
+    // Both approved request shapes are frozen in the owned start ticket.
+    // Never accept a partial optional set or arbitrary caller-supplied scopes.
+    if actual != required && actual != with_chat {
         return Err(Error::Invalid);
     }
     Ok(actual)

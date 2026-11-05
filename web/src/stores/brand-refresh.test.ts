@@ -100,16 +100,18 @@ describe('brand refresh after license changes', () => {
     expect(useBrandStore.getState().brand).toEqual(brand);
   });
   it('rechecks on reconnect and when an authenticated tab gains focus', async () => {
+    // Company info also refreshes on reconnect/focus; count only logo downloads.
+    const brandFetches = () => vi.mocked(fetch).mock.calls.filter(([url]) => url === '/api/brand');
     mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'about.get'
       ? { brand_revision: 'v1' } : {}));
     useConnectionStore.setState({ state: 'connecting' });
     useConnectionStore.setState({ state: 'authenticated' });
-    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(brandFetches()).toHaveLength(1));
     useBrandStore.getState().setBrand(brand, 'v1');
     mockWsClient.call.mockClear();
     window.dispatchEvent(new Event('focus'));
     await vi.waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('about.get', { brand_revision_only: true }));
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(brandFetches()).toHaveLength(1);
     useConnectionStore.setState({ state: 'disconnected' });
   });
   it('rechecks using the existing periodic session refresh timer', async () => {

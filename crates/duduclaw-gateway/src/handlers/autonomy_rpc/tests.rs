@@ -40,8 +40,9 @@ async fn fixture() -> Fixture {
     crate::trigger_route::tests::write_agent(
         &home.join("agents"), "sales", "Sales", "@sales", "specialist", "",
     );
+    std::fs::write(home.join("config.toml"), "[general]\ndefault_agent = \"dudu\"\n").unwrap();
     let handler = MethodHandler::new(home.clone()).await;
-    handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
     Fixture {
         _dir: dir,
         home,

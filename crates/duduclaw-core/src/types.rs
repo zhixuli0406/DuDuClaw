@@ -1272,20 +1272,18 @@ impl RuntimeType {
 /// tier (which controls which `commercial/` modules unlock) and to the
 /// CE/Pro source split.
 ///
-/// `EditionProfile` only changes **defaults and UI presentation** — it never
-/// gates a core feature (design rule "畫法 A"). A [`Personal`] deployment hides
-/// the multi-seat / audit-management surfaces by default; an [`Enterprise`]
-/// deployment shows them. Both run the exact same Apache-2.0 core.
+/// `EditionProfile` controls defaults, UI presentation and management RPC gates.
+/// A [`Personal`] deployment refuses multi-seat management surfaces; an
+/// [`Enterprise`] deployment enables them. Overrides can only narrow
+/// the edition derived from the verified license.
 ///
 /// The `Personal` profile is also the *unit of tenancy* for managed ("代管")
 /// personal hosting — a managed personal instance is the same artifact a user
 /// could self-host.
 ///
-/// Resolution precedence (see [`EditionProfile::resolve`]):
-/// `DUDUCLAW_EDITION` env  >  license tier  >  default ([`Personal`]).
-/// `resolve` also takes an explicit override between the two (the gateway's
-/// `GatewayConfig.edition`, meant for an embedding host); the shipped CLI
-/// always passes `None`, and no `agent.toml` key feeds it.
+/// Resolution: license tier (default [`Personal`]) is the ceiling.
+/// Within that ceiling, `DUDUCLAW_EDITION` precedes `GatewayConfig.edition`.
+/// The shipped CLI passes no config override, and no `agent.toml` key feeds it.
 ///
 /// [`Personal`]: EditionProfile::Personal
 /// [`Enterprise`]: EditionProfile::Enterprise
@@ -1358,25 +1356,43 @@ impl EditionProfile {
         }
     }
 
-    /// Resolve the active edition using the documented precedence:
-    /// env override > explicit override > license tier > default.
+    /// Resolve the active edition, always capped by the verified license.
+    /// Env precedes config; an elevation attempt is ignored with a warning
+    /// once per source per process, regardless of build profile or test features.
     ///
     /// - `env`: value of `DUDUCLAW_EDITION` (`None` if unset).
-    /// - `config`: an explicit override from the caller (the gateway passes
-    ///   `GatewayConfig.edition`, which the shipped CLI leaves `None`; no
-    ///   `agent.toml` key is read for it).
-    /// - `tier_key`: the active license tier's TOML key (`None` for open-source).
+    /// - `config`: `GatewayConfig.edition`; no `agent.toml` key is read.
+    /// - `tier_key`: verified license tier (`None` for no valid license).
     pub fn resolve(env: Option<&str>, config: Option<&str>, tier_key: Option<&str>) -> Self {
-        if let Some(e) = env.map(str::trim).filter(|s| !s.is_empty()) {
-            return Self::parse(e);
-        }
-        if let Some(c) = config.map(str::trim).filter(|s| !s.is_empty()) {
-            return Self::parse(c);
-        }
-        if let Some(t) = tier_key.map(str::trim).filter(|s| !s.is_empty()) {
-            return Self::from_tier_key(t);
-        }
-        Self::Personal
+        Self::resolve_with_policy(env, config, tier_key, false)
+    }
+
+    /// Explicit fixture-only elevation; never used by the production resolver.
+    #[cfg(all(feature = "test-edition-override", debug_assertions))]
+    pub fn resolve_for_test(env: Option<&str>, config: Option<&str>, tier_key: Option<&str>) -> Self {
+        Self::resolve_with_policy(env, config, tier_key, true)
+    }
+
+    fn resolve_with_policy(
+        env: Option<&str>, config: Option<&str>, tier_key: Option<&str>, allow_elevation: bool,
+    ) -> Self {
+        static ENV_ELEVATION_WARNING: std::sync::Once = std::sync::Once::new();
+        static CONFIG_ELEVATION_WARNING: std::sync::Once = std::sync::Once::new();
+        let licensed = tier_key.map(Self::from_tier_key).unwrap_or_default();
+        let narrow = |value: Option<&str>, warning: &std::sync::Once, source: &str| {
+            let requested = value.map(str::trim).filter(|s| !s.is_empty()).map(Self::parse)?;
+            if !allow_elevation && licensed.is_personal() && !requested.is_personal() {
+                warning.call_once(|| {
+                    tracing::warn!(source, "edition override exceeds the verified license; ignoring override");
+                });
+                None
+            } else {
+                Some(requested)
+            }
+        };
+        let env = narrow(env, &ENV_ELEVATION_WARNING, "DUDUCLAW_EDITION");
+        let config = narrow(config, &CONFIG_ELEVATION_WARNING, "GatewayConfig.edition");
+        env.or(config).unwrap_or(licensed)
     }
 
     /// Convenience wrapper reading `DUDUCLAW_EDITION` from the process env as
@@ -1423,6 +1439,40 @@ impl EditionProfile {
 #[cfg(test)]
 mod edition_cap_tests {
     use super::EditionProfile;
+
+    #[test]
+    fn edition_release_precedence_matrix() {
+        use EditionProfile::{Enterprise, Personal};
+        for (env, config, tier, expected) in [
+            (Some("enterprise"), None, Some("personal_pro_self_host"), Personal),
+            (Some("team"), None, Some("personal_pro_self_host"), Personal),
+            (Some("team"), None, None, Personal),
+            (Some("personal"), None, Some("business"), Personal),
+            (Some("enterprise"), None, None, Personal),
+            (None, Some("enterprise"), None, Personal),
+            (None, Some("enterprise"), Some("personal_pro_self_host"), Personal),
+            (None, Some("personal"), Some("business"), Personal),
+            (Some("enterprise"), Some("personal"), Some("business"), Enterprise),
+            (Some("personal"), Some("enterprise"), Some("business"), Personal),
+            (Some("enterprise"), Some("enterprise"), Some("invalid"), Personal),
+            (Some("team"), None, Some("business"), Personal),
+            (Some("invalid"), None, Some("business"), Personal),
+            (Some(" "), Some("personal"), Some("business"), Personal),
+            (None, None, Some("business"), Enterprise),
+            (None, None, None, Personal),
+        ] {
+            assert_eq!(EditionProfile::resolve(env, config, tier), expected,
+                "env={env:?}, config={config:?}, tier={tier:?}");
+        }
+    }
+
+    #[cfg(all(feature = "test-edition-override", debug_assertions))]
+    #[test]
+    fn edition_test_elevation_requires_explicit_api() {
+        assert_eq!(EditionProfile::resolve_for_test(Some("enterprise"), None, None), EditionProfile::Enterprise);
+        assert_eq!(EditionProfile::resolve_for_test(None, Some("enterprise"), None), EditionProfile::Enterprise);
+        assert_eq!(EditionProfile::resolve(Some("enterprise"), None, None), EditionProfile::Personal);
+    }
 
     #[test]
     fn personal_cap_default_is_unlimited() {
@@ -1885,12 +1935,8 @@ pub struct CapabilitiesConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipients: Option<toml::Value>,
 
-    /// Third-party MCP servers (`.mcp.json` keys) whose `readOnlyHint`
-    /// annotation is believed (2026-10-08). For any other server a tool that
-    /// says it is read-only is still classed `modify`, because a server can
-    /// claim anything about itself. Exact names; read fail-closed by
-    /// [`crate::agent_toml::load_third_party_policy`] (a malformed value
-    /// trusts no server). See [`crate::tool_effect::ThirdPartyPolicy`].
+    /// Legacy third-party server trust list, retained for configuration compatibility.
+    /// This field no longer lowers tool risk: upstream read-only claims remain Modify.
     #[serde(default, deserialize_with = "crate::lenient::string_vec")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trusted_read_hint_servers: Vec<String>,
@@ -3297,14 +3343,17 @@ pub struct DingTalkChannelConfig {
 
 /// Per-agent Google Chat channel settings.
 ///
-/// The Chat app is configured in the Google Cloud console with an HTTP
-/// endpoint URL pointing at `POST /webhook/googlechat`. Inbound requests
+/// The Chat app uses an HTTP endpoint or a Pub/Sub pull subscription.
+/// HTTP requests to `POST /webhook/googlechat`
 /// carry a JWT issued by `chat@system.gserviceaccount.com` whose audience
 /// is the Cloud **project number**. Outbound (async) sends authenticate
-/// with a service-account key (scope `chat.bot`).
+/// with a service-account key (scope `chat.bot`). Pub/Sub notifications are
+/// re-read through the Chat API before the sender and content are trusted.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GoogleChatChannelConfig {
+    pub connection: String,
+    pub pubsub_subscription: String,
     /// Google Cloud project number (JWT audience for inbound verification).
     pub project_number: String,
     /// Service-account JSON key (full JSON content, encrypted at rest).
@@ -3314,20 +3363,33 @@ pub struct GoogleChatChannelConfig {
 
 impl<'de> Deserialize<'de> for GoogleChatChannelConfig {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Default, Deserialize)]
+        #[derive(Deserialize)]
         #[serde(default)]
         struct Fields {
+            #[serde(default = "default_googlechat_connection")]
+            connection: String,
+            pubsub_subscription: String,
             project_number: String,
             service_account_json: String,
             service_account_json_enc: Option<String>,
             #[serde(flatten)]
             unknown: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
         }
+        impl Default for Fields {
+            fn default() -> Self {
+                Self { connection: default_googlechat_connection(), pubsub_subscription: String::new(), project_number: String::new(), service_account_json: String::new(), service_account_json_enc: None, unknown: Default::default() }
+            }
+        }
         let fields = Fields::deserialize(deserializer)?;
         if let Some(field) = fields.unknown.keys().next() {
             return Err(serde::de::Error::custom(format!("Google Chat 設定包含不支援的欄位「{field}」，請移除後再試。")));
         }
+        if !matches!(fields.connection.as_str(), "http" | "pubsub") {
+            return Err(serde::de::Error::custom("Google Chat 連線類型必須是 http 或 pubsub。"));
+        }
         Ok(Self {
+            connection: fields.connection,
+            pubsub_subscription: fields.pubsub_subscription,
             project_number: fields.project_number,
             service_account_json: fields.service_account_json,
             service_account_json_enc: fields.service_account_json_enc,
@@ -3335,9 +3397,37 @@ impl<'de> Deserialize<'de> for GoogleChatChannelConfig {
     }
 }
 
+fn default_googlechat_connection() -> String { "http".into() }
+
 impl Default for GoogleChatChannelConfig {
     fn default() -> Self {
-        Self { project_number: String::new(), service_account_json: String::new(), service_account_json_enc: None }
+        Self { connection: default_googlechat_connection(), pubsub_subscription: String::new(), project_number: String::new(), service_account_json: String::new(), service_account_json_enc: None }
+    }
+}
+
+#[cfg(test)]
+mod googlechat_config_tests {
+    use super::GoogleChatChannelConfig;
+
+    #[test]
+    fn googlechat_transport_config_defaults_and_roundtrips() {
+        let http: GoogleChatChannelConfig = toml::from_str("project_number = \"123456789\"").unwrap();
+        assert_eq!(http.connection, "http");
+        assert!(http.pubsub_subscription.is_empty());
+        let raw = "connection = \"pubsub\"\npubsub_subscription = \"projects/test-project/subscriptions/chat-events\"";
+        let config: GoogleChatChannelConfig = toml::from_str(raw).unwrap();
+        let roundtrip: GoogleChatChannelConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(roundtrip.connection, "pubsub");
+        assert_eq!(roundtrip.pubsub_subscription, config.pubsub_subscription);
+    }
+
+    #[test]
+    fn googlechat_transport_config_refuses_unknown_fields_modes_and_wrong_types() {
+        for raw in ["connection = \"other\"", "connection = 123", "pubsub_subscription = false", "unknown = \"value\""] {
+            assert!(toml::from_str::<GoogleChatChannelConfig>(raw).is_err(), "{raw}");
+        }
+        let error = toml::from_str::<GoogleChatChannelConfig>("unknown = \"value\"").unwrap_err();
+        assert!(error.to_string().contains("不支援的欄位「unknown」"));
     }
 }
 
@@ -4847,15 +4937,14 @@ mod tests {
 
     #[test]
     fn edition_profile_resolve_precedence() {
-        // env wins over everything
+        // Production resolution never elevates, even in debug fixtures.
         assert_eq!(
             EditionProfile::resolve(Some("enterprise"), Some("personal"), Some("solo")),
-            EditionProfile::Enterprise
+            EditionProfile::Personal
         );
-        // config wins over tier when env absent
         assert_eq!(
             EditionProfile::resolve(None, Some("enterprise"), Some("solo")),
-            EditionProfile::Enterprise
+            EditionProfile::Personal
         );
         // tier used when env + config absent
         assert_eq!(

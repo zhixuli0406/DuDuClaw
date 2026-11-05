@@ -12,7 +12,9 @@
 //! - the `.grok/config.toml` of every directory up to the git root (lower
 //!   priority than the working directory's own);
 //! - user-level sources outside the employee directory (`~/.grok`,
-//!   `~/.claude.json`, `~/.cursor/mcp.json`), not handled here.
+//!   `~/.claude.json`, `~/.cursor/mcp.json`): global Grok MCP entries are
+//!   refused by `refuse_global_sources`; compatibility sources are disabled
+//!   in the managed spawn environment.
 //!
 //! Not loaded (measured): `<cwd>/.claude.json`, `<cwd>/.claude/settings.json`
 //! and `settings.local.json` `mcpServers`.

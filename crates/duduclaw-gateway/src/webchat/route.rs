@@ -19,7 +19,8 @@ impl WebChatState {
     /// What the account may call, through the ACL cache. An entry is reused
     /// only while `auth_meta.acl_generation` is unchanged (every binding,
     /// role, status or manager write bumps it) and for `ACL_CACHE_TTL` at
-    /// most. When the generation cannot be read the cache is bypassed. A
+    /// most, and only while its edition epoch is current. When the generation
+    /// cannot be read the cache is bypassed. A
     /// failed lookup is not cached and returns `Err` (callers deny).
     pub(super) async fn acl_snapshot(&self, user_id: &str) -> Result<AclSnapshot, String> {
         let now = std::time::Instant::now();
@@ -39,7 +40,8 @@ impl WebChatState {
         if let Some(g) = generation {
             let cache = self.acl_cache.lock().await;
             if let Some((snapshot, at)) = cache.get(user_id) {
-                if snapshot.generation() == g && now.duration_since(*at) < super::ACL_CACHE_TTL {
+                if snapshot.generation() == g && snapshot.edition.is_current()
+                    && now.duration_since(*at) < super::ACL_CACHE_TTL {
                     return Ok(snapshot.clone());
                 }
             }
@@ -56,10 +58,10 @@ impl WebChatState {
             // Cache only a snapshot read at the generation seen before the
             // read; one taken after a concurrent write would carry a newer
             // generation and is simply not cached.
-            if snapshot.generation() == g {
+            if snapshot.generation() == g && snapshot.edition.is_current() {
                 let mut cache = self.acl_cache.lock().await;
                 if cache.len() >= ACL_CACHE_MAX && !cache.contains_key(user_id) {
-                    cache.retain(|_, (s, _)| s.generation() == g);
+                    cache.retain(|_, (s, _)| s.generation() == g && s.edition.is_current());
                     if cache.len() >= ACL_CACHE_MAX {
                         cache.clear();
                     }

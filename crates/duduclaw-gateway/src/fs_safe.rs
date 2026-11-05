@@ -17,6 +17,24 @@
 
 use std::io;
 
+#[path = "fs_safe/sqlite.rs"]
+pub(crate) mod sqlite;
+
+/// Test homes must satisfy the same ownership/mode contract as production.
+/// tempfile's default directory mode is 0777 & !umask, not necessarily 0700.
+#[cfg(test)]
+pub(crate) fn private_test_home() -> io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    // Resolve only the OS-selected temporary root (e.g. macOS /var), never
+    // a production database path or an untrusted path supplied by a caller.
+    builder.tempdir_in(std::env::temp_dir().canonicalize()?)
+}
+
 pub(crate) fn refused(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, msg.into())
 }
@@ -126,6 +144,30 @@ mod imp {
             })
         }
 
+        /// Walk from the filesystem root without resolving any symlink. Unlike
+        /// open_root, this is for paths whose parent components are untrusted.
+        pub(crate) fn open_nofollow(path: &Path, create: bool) -> io::Result<Self> {
+            use std::path::Component;
+            let absolute = if path.is_absolute() { path.to_owned() } else { std::env::current_dir()?.join(path) };
+            let mut dir = Self::open_root(Path::new("/"))?;
+            for component in absolute.components() {
+                match component {
+                    Component::RootDir => {}
+                    Component::Normal(name) => {
+                        let name = name.to_str().ok_or_else(|| refused("non-UTF-8 directory"))?;
+                        dir = dir.child_dir(name, create)?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                    }
+                    _ => return Err(refused("invalid directory component")),
+                }
+            }
+            Ok(dir)
+        }
+
+        pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+            // Duplicate the descriptor; never reopen the directory by name.
+            std::fs::File::from(self.fd.try_clone()?).metadata()
+        }
+
         fn stat(&self, name: &str) -> io::Result<Option<FileStat>> {
             match fstatat(
                 Some(self.fd.as_raw_fd()),
@@ -204,6 +246,23 @@ mod imp {
             max_bytes: u64,
             single_link: bool,
         ) -> io::Result<Option<Vec<u8>>> {
+            let Some(file) = self.open_read_checked(name, single_link)? else { return Ok(None) };
+            let meta = file.metadata()?;
+            if meta.len() > max_bytes {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
+            }
+            let mut out = Vec::new();
+            file.take(max_bytes.saturating_add(1))
+                .read_to_end(&mut out)?;
+            if out.len() as u64 > max_bytes {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
+            }
+            Ok(Some(out))
+        }
+
+        /// Return the already-open, no-follow descriptor. Callers must stream
+        /// this handle, never reopen a checked path.
+        pub(crate) fn open_read_checked(&self, name: &str, single_link: bool) -> io::Result<Option<std::fs::File>> {
             check_name(name)?;
             match self.stat(name)? {
                 None => return Ok(None),
@@ -238,16 +297,7 @@ mod imp {
             if single_link && std::os::unix::fs::MetadataExt::nlink(&meta) > 1 {
                 return Err(refused(format!("{name} has several hard links")));
             }
-            if meta.len() > max_bytes {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
-            }
-            let mut out = Vec::new();
-            file.take(max_bytes.saturating_add(1))
-                .read_to_end(&mut out)?;
-            if out.len() as u64 > max_bytes {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
-            }
-            Ok(Some(out))
+            Ok(Some(file))
         }
 
         /// Read regular file `name` as UTF-8 text (no size cap). `Ok(None)`
@@ -261,25 +311,31 @@ mod imp {
             }
         }
 
-        /// Create only: never overwrite an operator file or follow a link.
-        pub(crate) fn create_file_new(&self, name: &str, contents: &[u8]) -> io::Result<bool> {
+        /// Create a new 0600 file relative to this pinned directory. The caller
+        /// owns the descriptor and may hand it to an asynchronous writer.
+        pub(crate) fn open_create_new(&self, name: &str) -> io::Result<std::fs::File> {
             check_name(name)?;
-            let raw = match openat(
+            let raw = openat(
                 Some(self.fd.as_raw_fd()), name,
                 OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
                 Mode::S_IRUSR | Mode::S_IWUSR,
-            ) {
-                Ok(raw) => raw,
-                Err(Errno::EEXIST) => {
+            ).map_err(to_io)?;
+            // SAFETY: openat returned a fresh descriptor owned only here.
+            Ok(unsafe { std::fs::File::from_raw_fd(raw) })
+        }
+
+        /// Create only: never overwrite an operator file or follow a link.
+        pub(crate) fn create_file_new(&self, name: &str, contents: &[u8]) -> io::Result<bool> {
+            let mut file = match self.open_create_new(name) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     return match self.entry(name)? {
                         Some(entry) if entry.kind == EntryKind::File && entry.nlink == 1 => Ok(false),
-                        _ => Err(refused("existing skill is not a regular, single-link file")),
+                        _ => Err(refused("existing file is not a regular, single-link file")),
                     };
                 }
-                Err(e) => return Err(to_io(e)),
+                Err(e) => return Err(e),
             };
-            // SAFETY: openat returned a fresh descriptor owned only here.
-            let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
             file.write_all(contents)?;
             file.sync_all()?;
             self.sync_dir();
@@ -553,6 +609,14 @@ mod imp {
             }
         }
 
+        pub(crate) fn open_nofollow(_path: &Path, _create: bool) -> io::Result<Self> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "secure attachment directories require no-follow handles"))
+        }
+
+        pub(crate) fn open_read_checked(&self, _name: &str, _single_link: bool) -> io::Result<Option<std::fs::File>> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "secure attachment reads require no-follow directory handles"))
+        }
+
         pub(crate) fn read_file(&self, name: &str) -> io::Result<Option<String>> {
             match self.read_bytes(name, u64::MAX)? {
                 None => Ok(None),
@@ -560,6 +624,10 @@ mod imp {
                     .map(Some)
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8")),
             }
+        }
+
+        pub(crate) fn open_create_new(&self, _name: &str) -> io::Result<std::fs::File> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "secure attachment creation requires no-follow directory handles"))
         }
 
         /// Refuse creation where fd-relative no-follow operations are unavailable.
@@ -817,5 +885,40 @@ mod tests {
         assert!(dir.open_path(&["sub"], false).unwrap().is_some());
         assert!(dir.open_path(&["link"], false).is_err());
         assert!(dir.open_path(&["nope", "x"], false).unwrap().is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod attachment_dir_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn attachment_creation_pins_every_directory_before_name_swap() {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let outside = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let path = root.path().join("agents/sales/attachments");
+        let directory = SafeDir::open_nofollow(&path, true).unwrap();
+        let original = root.path().join("old-agent");
+        std::fs::rename(path.parent().unwrap(), &original).unwrap();
+        symlink(outside.path(), path.parent().unwrap()).unwrap();
+        assert!(directory.create_file_new("upload.txt", b"pinned").unwrap());
+        assert_eq!(std::fs::read(original.join("attachments/upload.txt")).unwrap(), b"pinned");
+        assert_eq!(std::fs::metadata(original.join("attachments/upload.txt")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+        assert!(SafeDir::open_nofollow(&path, true).is_err());
+    }
+
+    #[test]
+    fn attachment_creation_rejects_symlink_in_each_parent_without_creating_children() {
+        for part in ["agents", "agents/sales", "agents/sales/attachments"] {
+            let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let outside = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let planted = root.path().join(part);
+            std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+            symlink(outside.path(), &planted).unwrap();
+            assert!(SafeDir::open_nofollow(&root.path().join("agents/sales/attachments"), true).is_err());
+            assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none(), "{part}");
+        }
     }
 }

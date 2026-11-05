@@ -1,5 +1,7 @@
 # 任務沙箱：讓 AI 員工的委派任務在上鎖的容器裡執行
 
+**Codex 外部設定檢查（v1.80.0 起）：** 外部設定不存在或未定義 MCP 時，一般員工、Explore、utility、Task Sandbox 與 Discovery 可執行；偵測到 MCP 或既有設定無法讀取／解析時，回報來源並拒絕。明確指定的 Codex 判官遭拒時，驗收失敗，不改用預設判官。這是啟動前的本機／快取快照檢查，無法保證後續雲端更新的完整隔離；[來源範圍與限制](../../architecture/extension-gates.md)。
+
 任務沙箱會把某位員工被委派的任務放進 Docker 容器執行：該員工的 AI CLI 在唯讀、非 root、有資源上限的容器裡啟動，使用一個用完即丟的私有工作目錄，只有最後的回覆文字會傳回來。預設關閉，逐位員工開啟。
 
 它不是 `duduclaw secaudit`（PoC 步驟）與 PTC 使用的腳本沙箱。那是另一條獨立的程式路徑：跑的是腳本，沒有 AI CLI，預設不連網。兩者共用的只有 image：腳本沙箱讀同一個 `config.toml [container.sandbox] image`，預設也是同一個平台 image，同樣不會自動下載，所以 `docker pull` 一次兩邊都能用。

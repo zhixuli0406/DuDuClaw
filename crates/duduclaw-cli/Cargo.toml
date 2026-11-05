@@ -93,7 +93,7 @@ encoding_rs = "0.8.35"
 # exact: a spreadsheet parser is an attack surface reached by customer files,
 # so the version that was reviewed is the version that ships.
 csv = "1"
-calamine = { version = "=0.36.1", default-features = false, features = ["dates"] }
+calamine = { version = "=0.38.0", default-features = false, features = ["dates"] }
 # Document knowledge base: `knowledge-extract` child, `knowledge eval`.
 duduclaw-knowledge = { workspace = true }
 tempfile = "3"
@@ -103,6 +103,7 @@ unicode-normalization = "0.1"
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+duduclaw-license = { workspace = true, features = ["test-support"] }
 duduclaw-core = { workspace = true, features = ["installation-policy-test-hooks"] }
 # P2-B: `Provenance::test_only` exists only with this feature (never in a
 # production build).

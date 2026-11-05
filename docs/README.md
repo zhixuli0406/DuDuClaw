@@ -86,6 +86,8 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/71-control-room.md](features/71-control-room.md) | Terminal control room — what `duduclaw tui` is for, the three ways to stop work, trust boundaries, verified terminals |
 | [features/72-group-context.md](features/72-group-context.md) | Opt-in group context and Discord employee choices ([繁體中文](features/zh-TW/72-group-context.md), [日本語](features/ja-JP/72-group-context.md)) |
 | [features/73-meeting-transcripts.md](features/73-meeting-transcripts.md) | Meeting recordings to Taiwan Traditional Chinese transcripts, timestamps, provider privacy and limits; [繁體中文](features/zh-TW/73-meeting-transcripts.md) / [日本語](features/ja-JP/73-meeting-transcripts.md) |
+| [features/74-ag-ui.md](features/74-ag-ui.md) | AG-UI 1.0 HTTP/SSE frontend endpoint, account-bound conversations and approval interrupts; [繁體中文](features/zh-TW/74-ag-ui.md) / [日本語](features/ja-JP/74-ag-ui.md) |
+| [features/75-compliance-reports.md](features/75-compliance-reports.md) | Enterprise Admin compliance reports: recorded outbound decisions, approvals, action reviews and data-source accesses; [繁體中文](features/zh-TW/75-compliance-reports.md) / [日本語](features/ja-JP/75-compliance-reports.md) |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
 ---
@@ -113,6 +115,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | Document | Description | Status |
 |----------|-------------|--------|
 | [architecture/overview.md](architecture/overview.md) | System architecture overview | Current |
+| [architecture/extension-gates.md](architecture/extension-gates.md) | Extension RPC/HTTP and third-party MCP boundaries; Odoo Live Chat and voice entry-point inventory | Current (v1.80.0) |
 | [architecture/evolution-engine.md](architecture/evolution-engine.md) | Evolution Engine — Prediction + AEE/Playbook (the only evolution path; the legacy SOUL.md rewrite path was removed) + Cognitive Memory | Current |
 
 ## Design Proposals (RFC / ADR)
@@ -154,6 +157,8 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [todo/TODO-genspark-workspace-shell.md](todo/TODO-genspark-workspace-shell.md) | 「工作空間」雙層體驗（消費級外殼＋進階儀表板）與桌面 app 的實作追蹤 |
 
 ## User & Developer Guides
+
+New: [Add teammates and first login](guides/user-management-and-first-login.md) · [繁體中文](guides/zh-TW/user-management-and-first-login.md) · [日本語](guides/ja-JP/user-management-and-first-login.md).
 
 | Document | Description | Status |
 |----------|-------------|--------|

@@ -11,9 +11,10 @@ import { mockRpc } from '@/pages/knowledge/test-fixtures';
 import { GoogleChatSetup, bootstrapCommand, publicEndpoint, shellQuote } from './GoogleChatSetup';
 
 describe('Google Chat setup', () => {
-  it('quotes shell arguments and includes the HTTP endpoint', () => {
+  it('quotes shell arguments and omits the endpoint for Pub/Sub', () => {
     expect(shellQuote("a'$(touch /tmp/pwn)")).toBe("'a'\"'\"'$(touch /tmp/pwn)'");
-    expect(bootstrapCommand('https://chat.example/webhook/googlechat', 'sales')).toContain("--agent 'sales'");
+    expect(bootstrapCommand('http', 'https://chat.example/webhook/googlechat', 'sales')).toContain("--agent 'sales'");
+    expect(bootstrapCommand('pubsub', 'https://chat.example')).not.toContain('--endpoint-url');
   });
   it('uses only an HTTPS public base without embedded credentials', () => {
     expect(publicEndpoint('https://chat.example/root/', '/webhook/googlechat')).toBe('https://chat.example/root/webhook/googlechat');
@@ -23,10 +24,26 @@ describe('Google Chat setup', () => {
   });
   it('loads the configured public URL and shows the final configuration after import', async () => {
     mockRpc({ 'system.config': () => ({ config: '[dashboard]\npublic_url = "https://public.example"\n[channels]\ngooglechat_project_number = "123456789"' }) });
-    renderWithProviders(<GoogleChatSetup />);
+    renderWithProviders(<GoogleChatSetup connection="http" onConnectionChange={vi.fn()} subscription="" onSubscriptionChange={vi.fn()} />);
     expect(await screen.findByRole('link', { name: 'Open Google Chat app configuration' })).toHaveAttribute('href', expect.stringContaining('project=123456789'));
     await waitFor(() => expect(screen.getByLabelText('Public HTTPS endpoint')).toHaveValue('https://public.example/webhook/googlechat'));
     expect(screen.getByText(/Authentication Audience: Project number/)).toBeInTheDocument();
+  });
+  it('does not invent the topic of a custom subscription', async () => {
+    mockRpc({ 'system.config': () => ({ config: '' }) });
+    renderWithProviders(<GoogleChatSetup connection="pubsub" onConnectionChange={vi.fn()} subscription="projects/my-project/subscriptions/custom" onSubscriptionChange={vi.fn()} agentId="sales" projectNumber="123456789" />);
+    expect(screen.getByText(/Cloud Pub\/Sub topic: Use the topic name printed by the setup script/)).toBeInTheDocument();
+  });
+  it('exposes Pub/Sub without requiring a public URL and links Cloud Shell', async () => {
+    mockRpc({ 'system.config': () => ({ config: '' }) });
+    const user = userEvent.setup();
+    const change = vi.fn();
+    renderWithProviders(<GoogleChatSetup connection="pubsub" onConnectionChange={change} subscription="projects/my-project/subscriptions/duduclaw-chat-events-sub" onSubscriptionChange={vi.fn()} agentId="sales" projectNumber="123456789" />);
+    expect(screen.queryByLabelText('Public HTTPS endpoint')).toBeNull();
+    expect(screen.getByText(/Cloud Pub\/Sub topic: projects\/my-project\/topics\/duduclaw-chat-events/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open in Cloud Shell' })).toHaveAttribute('href', expect.stringContaining('cloudshell_tutorial='));
+    await user.selectOptions(screen.getByLabelText('Connection type'), 'http');
+    expect(change).toHaveBeenCalledWith('http');
   });
   it.each([['en', en], ['zh-TW', zhTW], ['ja-JP', jaJP]] as const)(
     'shows and copies the add-on opt-out instruction in %s', async (locale, messages) => {
@@ -34,7 +51,7 @@ describe('Google Chat setup', () => {
       const user = userEvent.setup();
       const clipboard = vi.spyOn(navigator.clipboard, 'writeText');
       render(<IntlProvider locale={locale} messages={messages}>
-        <GoogleChatSetup agentId="a-very-long-employee-name-that-exceeds-the-app-limit" projectNumber="123456789" />
+        <GoogleChatSetup connection="pubsub" onConnectionChange={vi.fn()} subscription="projects/my-project/subscriptions/duduclaw-chat-events-sub" onSubscriptionChange={vi.fn()} agentId="a-very-long-employee-name-that-exceeds-the-app-limit" projectNumber="123456789" />
       </IntlProvider>);
       expect(screen.getByText(messages['googlechat.setup.disableAddon'])).toBeInTheDocument();
       expect(screen.getByText(messages['googlechat.setup.dedicatedProject'])).toBeInTheDocument();

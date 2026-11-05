@@ -527,3 +527,59 @@ async fn real_home_logical_ask_restore_and_private_execute_stamp_remain_one_host
     assert_ne!(body["selection_stamp"], "model-cannot-authorize");
     assert!(body.get("host_google_account").is_none());
 }
+
+#[test]
+fn google_chat_registration_matches_gmail_private_read_contract() {
+    for tool in ["google_chat_spaces", "google_chat_messages"] {
+        let def = duduclaw_core::mcp_tool_defs::tools().find(|def| def.name == tool).unwrap();
+        let schema = duduclaw_core::mcp_tool_defs::build_tool_schema(def);
+        assert_eq!(schema["inputSchema"]["properties"]["limit"]["type"], "integer");
+        assert_eq!(schema["inputSchema"]["properties"]["limit"]["minimum"], 1);
+        assert_eq!(schema["inputSchema"]["properties"]["limit"]["maximum"], if tool == "google_chat_spaces" { 50 } else { 100 });
+
+        assert!(duduclaw_core::google_identity::NATIVE_GOOGLE_TOOLS.contains(&tool));
+        assert_eq!(crate::mcp_auth::tool_requires_scope(tool), crate::mcp_auth::tool_requires_scope("gmail_read"));
+        assert_eq!(duduclaw_core::effect_of_builtin(tool), duduclaw_core::effect_of_builtin("gmail_read"));
+        assert_eq!(duduclaw_core::tool_effect::reads_private(tool), Some(true));
+        assert_eq!(duduclaw_core::tool_effect::egress_capable(tool), duduclaw_core::tool_effect::egress_capable("gmail_read"));
+    }
+}
+
+#[tokio::test]
+async fn google_chat_listing_and_call_share_employee_denial() {
+    for tool in ["google_chat_spaces", "google_chat_messages"] {
+        let home = fixture(&format!("[capabilities]\ndenied_tools=['{tool}']"));
+        let call = authenticate_with_key_call(KEY, home.path()).unwrap();
+        let principal = call.principal().clone();
+        let names = with_authenticated_call(call, async {
+            crate::mcp::visible_tool_names(&principal, home.path(), "different-process-agent").await
+        }).await;
+        assert!(!names.contains(&tool));
+        assert!(names.contains(&"gmail_read"));
+        let dispatcher = dispatcher(home.path()).await;
+        let call = authenticate_with_key_call(KEY, home.path()).unwrap();
+        let result = with_authenticated_call(call, dispatcher.dispatch_tool_call(
+            &principal, &namespace(), &json!({"name":tool,"arguments":{"space":"spaces/AAAA"}}), &json!(91),
+        )).await;
+        assert_eq!(result["error"]["code"], -32003, "{result}");
+        assert!(result["error"]["message"].as_str().unwrap().contains("denied_tools"));
+    }
+}
+
+#[tokio::test]
+async fn google_chat_tools_list_uses_same_scope_and_identity_receipt_as_gmail() {
+    let home = fixture("");
+    duduclaw_gateway::google_workspace::set_chat_read_enabled(home.path(), true).unwrap();
+    let call = authenticate_with_key_call(KEY, home.path()).unwrap();
+    let principal = call.principal().clone();
+    let names = with_authenticated_call(call, async {
+        crate::mcp::visible_tool_names(&principal, home.path(), "different-process-agent").await
+    }).await;
+    for tool in ["gmail_read", "google_chat_spaces", "google_chat_messages"] {
+        assert!(names.contains(&tool), "{tool}: {names:?}");
+    }
+    let names = crate::mcp::visible_tool_names(&principal, home.path(), "different-process-agent").await;
+    for tool in ["gmail_read", "google_chat_spaces", "google_chat_messages"] {
+        assert!(!names.contains(&tool), "missing authenticated receipt: {tool}");
+    }
+}

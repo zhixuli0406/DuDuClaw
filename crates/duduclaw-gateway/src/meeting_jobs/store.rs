@@ -70,7 +70,11 @@ impl Store {
             CREATE TABLE IF NOT EXISTS meeting_job_events (id INTEGER PRIMARY KEY, job_id TEXT NOT NULL,
             agent TEXT NOT NULL, event TEXT NOT NULL, at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS meeting_uploads(id TEXT PRIMARY KEY, agent TEXT NOT NULL, owner TEXT NOT NULL, size INTEGER NOT NULL, reserved INTEGER NOT NULL, expires INTEGER NOT NULL, state TEXT NOT NULL, extension TEXT NOT NULL, job_id TEXT);
-            CREATE TABLE IF NOT EXISTS meeting_upload_chunks(upload_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY(upload_id,chunk_index));").map_err(|_| STORE_ERROR)?;
+            CREATE TABLE IF NOT EXISTS meeting_upload_chunks(upload_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY(upload_id,chunk_index));
+            CREATE TABLE IF NOT EXISTS meeting_drive_sources (
+                upload_id TEXT PRIMARY KEY, owner TEXT NOT NULL, google_account TEXT NOT NULL,
+                drive_file_id TEXT NOT NULL, drive_version TEXT NOT NULL, imported_at INTEGER NOT NULL
+            ); CREATE INDEX IF NOT EXISTS meeting_drive_sources_retention ON meeting_drive_sources(imported_at);").map_err(|_| STORE_ERROR)?;
         Ok(Self(Mutex::new(c)))
     }
     pub fn create(&self, job: &Job, quota: u64) -> Result<(), String> {
@@ -117,6 +121,11 @@ impl Store {
         change(&mut job)?;
         job.updated_at = chrono::Utc::now().timestamp();
         tx.execute("UPDATE meeting_jobs SET state=?1,reserved=?2,data=?3 WHERE id=?4 AND agent=?5",params![job.state,job.reserved_bytes,serde_json::to_string(&job).map_err(|_| STORE_ERROR)?,id,agent]).map_err(|_| STORE_ERROR)?;
+        if matches!(job.state.as_str(), "failed" | "cancelled") {
+            // Source provenance must not outlive a failed or cancelled import,
+            // including failures after upload admission created the job.
+            tx.execute("DELETE FROM meeting_drive_sources WHERE upload_id IN (SELECT id FROM meeting_uploads WHERE job_id=?1 AND agent=?2)", params![id,agent]).map_err(|_| STORE_ERROR)?;
+        }
         if old != job.state {
             tx.execute("INSERT INTO meeting_job_events(job_id,agent,event,at) VALUES (?1,?2,?3,?4)",params![id,agent,format!("job_{}",job.state),job.updated_at]).map_err(|_| STORE_ERROR)?;
         }
@@ -168,6 +177,27 @@ mod tests {
         assert!(!value.to_string().contains("injected"));
         assert!(!value.to_string().contains("provider"));
         assert!(j.public()["result"]["preview"].is_string());
+    }
+    #[test]
+    fn terminal_import_failure_or_cancellation_removes_source_atomically() {
+        for state in ["failed", "cancelled"] {
+            let h=tempfile::tempdir().unwrap();let s=Store::open(h.path()).unwrap();
+            let mut j=job("a");j.source_upload_id=Some("upload".into());
+            s.create(&j,1000).unwrap();
+            {
+                let c=s.0.lock().unwrap();
+                c.execute("INSERT INTO meeting_uploads VALUES ('upload','alice','person',100,0,9999999999,'done','wav','a')",[]).unwrap();
+                c.execute("INSERT INTO meeting_drive_sources VALUES ('upload','person','person@example.test','file','1',0)",[]).unwrap();
+                c.execute_batch("CREATE TRIGGER deny_source_delete BEFORE DELETE ON meeting_drive_sources BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+            }
+            assert!(s.update("alice","a",|j|{j.state=state.into();Ok(())}).is_err());
+            assert_eq!(s.get("alice","a").unwrap().state,"queued");
+            s.0.lock().unwrap().execute_batch("DROP TRIGGER deny_source_delete;").unwrap();
+            s.update("alice","a",|j|{j.state=state.into();Ok(())}).unwrap();
+            let count:u64=s.0.lock().unwrap().query_row("SELECT COUNT(*) FROM meeting_drive_sources",[],|r|r.get(0)).unwrap();
+            assert_eq!(count,0);
+            assert_eq!(s.get("alice","a").unwrap().state,state);
+        }
     }
     #[test]
     fn quota_ownership_cancel_and_restart() {

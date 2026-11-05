@@ -141,7 +141,7 @@ impl UserDb {
         if let Some(actor) = actor {
             let admin: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND role='admin' AND status='active')", [actor], |r|r.get(0)).map_err(|e|e.to_string())?;
             if !admin { return Err("admin required".into()); }
-            let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM mfa_credentials WHERE user_id=?1)", [user_id], |r|r.get(0)).map_err(|e|e.to_string())?;
+            let active = crate::mfa::any_factor(&tx, user_id)?;
             let enforced = crate::mfa::read_enforcement(&tx)?;
             if enforced && !active && actor == user_id {
                 return Err("強制雙因素驗證期間，請由另一位管理員或主機操作員核准通道綁定。".into());

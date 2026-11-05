@@ -105,6 +105,13 @@ impl MethodHandler {
         // one definition of "what config_file/agents/api_key look like",
         // two projections (`can_repair` is dashboard-only).
         let mut checks = crate::os_ops::doctor_base_checks(config_exists, has_agents, has_key, true);
+        checks.extend(crate::runtime_readiness::configured_checks(&self.home_dir));
+        checks.push(json!({
+            "name": "skill_default_layers",
+            "status": "pass",
+            "message": "新員工共用公司層的 docx、pdf、pptx、xlsx，不再複製預設技能。舊員工的副本會保留；清理前請逐檔比對內容雜湊（含腳本），確認與公司版本相同後，再於技能頁移除個人副本，必要時從封存還原。",
+            "can_repair": false,
+        }));
         checks.push(json!({
             "name": "codex_employee_shell",
             "status": codex_sandbox.0,
@@ -199,6 +206,15 @@ impl MethodHandler {
             checks.push(json!({
                 "name": "grok_cli",
                 "status": status,
+                "message": message,
+                "can_repair": false,
+            }));
+        }
+
+        if let Some(message) = duduclaw_core::config::home_permissions_warning(&self.home_dir) {
+            checks.push(json!({
+                "name": "home_permissions",
+                "status": "warn",
                 "message": message,
                 "can_repair": false,
             }));

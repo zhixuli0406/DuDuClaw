@@ -4,7 +4,7 @@
 //!
 //!   activate <key>      Install a license key into ~/.duduclaw/license.json
 //!   status              Show the active license tier, expiry, and gating
-//!   refresh             Phone home to control-plane (Phase 2; stub for now)
+//!   refresh             Phone home to control-plane
 //!   export              Print the current license as JSON (for transfer)
 //!   import <path>       Import a license JSON file from disk
 //!   deactivate          Remove the active license (revert to OpenSource)
@@ -16,8 +16,6 @@
 //!   CLI must never error out. Most subcommands degrade gracefully.
 //! - `activate` accepts the license either as a base64-encoded blob, a
 //!   raw JSON string, or a path to a JSON file. We auto-detect.
-//! - Phone-home is intentionally a stub until the control-plane crate
-//!   lands (see commercial/docs/specs/spec-license-module.md §6).
 
 use std::fs;
 use std::path::PathBuf;
@@ -27,7 +25,7 @@ use clap::Subcommand;
 
 use duduclaw_core::error::{DuDuClawError, Result};
 use duduclaw_license::{
-    EMBEDDED_FEATURES_TOML, FeatureGate, License, LicenseError, LicenseTier,
+    EMBEDDED_FEATURES_TOML, FeatureGate, FingerprintCandidate, FingerprintStrength, License, LicenseError, LicenseTier,
     fingerprint_candidates, fingerprint_is_hostname_only, generate_fingerprint, load_default,
     save_default, storage,
 };
@@ -55,8 +53,7 @@ pub enum LicenseCommands {
     /// Phone home to the DuDuClaw control-plane to refresh the license
     /// and reset the grace-period timer.
     ///
-    /// Currently a stub — control-plane lands in Phase 2 of the M1 plan
-    /// (see commercial/docs/specs/spec-license-module.md §6).
+    /// A changed machine binding requires account-holder approval in the console.
     Refresh,
 
     /// Print the current license to stdout for transfer to another machine.
@@ -77,8 +74,8 @@ pub enum LicenseCommands {
     /// Does not delete any other DuDuClaw data.
     Deactivate,
 
-    /// Move the installed license to THIS machine (re-sign for the current
-    /// fingerprint). Run after copying `license.json` from the old machine.
+    /// Request moving the installed license to this machine. The account holder
+    /// must approve the rebind in the console before it takes effect.
     Rebind,
 
     /// Show this machine's subscription status from the control-plane
@@ -87,8 +84,8 @@ pub enum LicenseCommands {
 
     /// Print this machine's fingerprint, for issuing a new license.
     Fingerprint {
-        /// Also list the backward-compatible fingerprints this machine still
-        /// accepts (pre-1.66.1 bindings). The first line is always the strong
+        /// Also list historical fingerprints for diagnosis, including weak
+        /// values that cannot activate a paid tier. The first line is the current
         /// fingerprint, so scripts can keep reading line 1.
         #[arg(long)]
         all: bool,
@@ -183,55 +180,136 @@ fn resolve_control_url(license_control_url: Option<&str>) -> String {
     DEFAULT_CONTROL_URL.to_string()
 }
 
-fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|e| DuDuClawError::License(format!("build http client: {e}")))
+fn validated_control_endpoint(endpoint: &str) -> Result<reqwest::Url> {
+    let operator_override = std::env::var("DUDUCLAW_CONTROL_URL").ok();
+    duduclaw_license::control_url::validate_control_url(endpoint, operator_override.as_deref())
+        .map_err(|error| DuDuClawError::License(error.into()))
+}
+
+async fn control_request(endpoint: &str) -> Result<reqwest::RequestBuilder> {
+    duduclaw_gateway::license_transport::request(reqwest::Method::POST, endpoint,
+        std::time::Duration::from_secs(20)).await.map_err(DuDuClawError::License)
 }
 
 /// Extract a signed `License` from a `{ "license": {...} }` control-plane
 /// response and install it locally after an authorized machine rebind.
-fn install_license_from_envelope(envelope: &serde_json::Value) -> Result<License> {
+fn install_license_from_envelope(envelope: &serde_json::Value, installed: &License, expected_fingerprint: &str, nonce: &str,
+    path: &std::path::Path, snapshot: &storage::LicenseSnapshot) -> Result<License> {
     let value = envelope
         .get("license")
         .ok_or_else(|| DuDuClawError::License("response missing 'license'".into()))?;
     let license: License = serde_json::from_value(value.clone())
         .map_err(|e| DuDuClawError::License(format!("parse license: {e}")))?;
-    save_default(&license).map_err(|e| DuDuClawError::License(format!("save license: {e}")))?;
+    duduclaw_license::refresh::validate_response(
+        &duduclaw_gateway::license_runtime::production_registry(), &license, envelope,
+        nonce, &installed.subscription_id, &installed.machine_fingerprint, expected_fingerprint,
+    ).map_err(|e| DuDuClawError::License(format!("rebind response rejected; installed license unchanged: {e}")))?;
+    validate_control_plane_license(&license)?;
+    if license.machine_fingerprint != expected_fingerprint {
+        return Err(DuDuClawError::License("rebind response did not use the requested fingerprint; installed license unchanged".into()));
+    }
+    save_response_if_current(path, snapshot, &license)?;
     Ok(license)
 }
 
-/// How the installed license binds to this machine (v1.66.1).
-///
-/// `Strong` — bound to the current fingerprint. `Legacy` — bound to a value an
-/// older DuDuClaw build computed here (macOS 26 collapsed the MAC component to
-/// a shared placeholder); still accepted, but the next issuance should use the
-/// strong value. `None` — matches nothing on this machine.
+/// A rejected refresh/rebind response must never replace the installed license.
+fn validate_control_plane_license(license: &License) -> Result<()> {
+    let gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML)
+        .map_err(|e| DuDuClawError::License(format!("embedded features.toml is broken: {e}")))?;
+    duduclaw_gateway::license_runtime::production_registry().verify(license)
+        .and_then(|_| license.validate_any(
+            &fingerprint_candidates(), gate.phone_home_interval_days(license.tier),
+            gate.grace_period_days(license.tier),
+        ).map(|_| ()))
+        .and_then(|_| license.validate_tier_deployment_binding(
+            duduclaw_gateway::license_runtime::is_self_host_deployment(),
+        ))
+        .map_err(|e| DuDuClawError::License(format!("control-plane license rejected; installed license unchanged: {e}")))
+}
+
+/// Hardware-backed legacy bindings remain usable. Weak matches are diagnostic
+/// only and never enable a paid tier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Binding {
     Strong,
     Legacy(String),
+    Weak,
     None,
 }
 
-/// Classify a license against this machine's fingerprint candidates.
-///
-/// Pure over the candidate list so it is unit-testable without touching the
-/// host's network interfaces.
-fn classify_binding(license_fp: &str, candidates: &[String]) -> Binding {
-    match candidates.iter().position(|c| c == license_fp) {
-        Some(0) => Binding::Strong,
+fn classify_binding(license_fp: &str, candidates: &[FingerprintCandidate]) -> Binding {
+    match candidates.iter().enumerate().find(|(_, c)| c.fingerprint() == license_fp) {
+        Some((_, candidate)) if candidate.strength() == FingerprintStrength::Weak => Binding::Weak,
+        Some((0, _)) => Binding::Strong,
         Some(_) => Binding::Legacy(license_fp.to_string()),
         None => Binding::None,
     }
 }
 
-/// Warn (on stderr, so stdout stays machine-readable) when this host could not
-/// produce a hardware-bound fingerprint at all.
-///
-/// Saying so out loud beats letting a weak binding pass for a strong one.
-fn warn_if_hostname_only() {
+const REBIND_PENDING_MESSAGE: &str = "需要帳號持有人到控制台核准換綁；原授權未變更。";
+
+fn response_pending(status: reqwest::StatusCode, envelope: &serde_json::Value) -> bool {
+    status == reqwest::StatusCode::ACCEPTED
+        || envelope.get("status").and_then(|v| v.as_str()) == Some("pending")
+}
+
+fn load_request_snapshot(path: &std::path::Path) -> duduclaw_license::Result<(License, storage::LicenseSnapshot)> {
+    let store = storage::LockedLicenseStore::acquire(path)?;
+    let license = store.load()?;
+    let snapshot = store.snapshot()?;
+    Ok((license, snapshot))
+}
+
+fn current_response_store(path: &std::path::Path, snapshot: &storage::LicenseSnapshot) -> Result<storage::LockedLicenseStore> {
+    let store = storage::LockedLicenseStore::acquire(path)
+        .map_err(|e| DuDuClawError::License(format!("lock license: {e}")))?;
+    if !store.matches(snapshot).map_err(|e| DuDuClawError::License(format!("read license state: {e}")))? {
+        return Err(DuDuClawError::License(
+            "license changed while request was in flight; stale response discarded".into(),
+        ));
+    }
+    Ok(store)
+}
+
+fn save_response_if_current(path: &std::path::Path, snapshot: &storage::LicenseSnapshot, license: &License) -> Result<()> {
+    current_response_store(path, snapshot)?.save(license)
+        .map_err(|e| DuDuClawError::License(format!("save license: {e}")))
+}
+
+fn validate_status_response(envelope: &serde_json::Value, expected_status: &str,
+    installed: &License, proposed: &str, nonce: &str) -> Result<()> {
+    duduclaw_license::refresh::validate_status_response(
+        &duduclaw_gateway::license_runtime::production_registry(), envelope, expected_status,
+        nonce, &installed.subscription_id, &installed.machine_fingerprint, proposed,
+    ).map_err(|e| DuDuClawError::License(format!("response rejected; installed license unchanged: {e}")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_revoked_response(path: &std::path::Path, snapshot: &storage::LicenseSnapshot,
+    registry: &duduclaw_license::PublicKeyRegistry, envelope: &serde_json::Value,
+    installed: &License, proposed: &str, nonce: &str) -> Result<()> {
+    duduclaw_license::refresh::validate_status_response(registry, envelope, "revoked", nonce,
+        &installed.subscription_id, &installed.machine_fingerprint, proposed)
+        .map_err(|e| DuDuClawError::License(format!("revocation rejected; installed license unchanged: {e}")))?;
+    let reason = envelope.get("reason").and_then(|v| v.as_str())
+        .ok_or_else(|| DuDuClawError::License("revocation reason missing".into()))?;
+    current_response_store(path, snapshot)?.revoke(reason)
+        .map_err(|e| DuDuClawError::License(format!("persist revocation: {e}")))
+}
+
+/// Report identity evidence on stderr, keeping fingerprint stdout machine-readable.
+/// Instance is informational; missing usable evidence remains a warning.
+fn warn_if_hostname_only(installed: Option<&str>) {
+    if duduclaw_license::fingerprint_hardware_unavailable() {
+        eprintln!("⚠️  無法讀取本機硬體 UUID；只保留舊版指紋驗證，暫停新授權簽發與重新綁定。請稍後再試。");
+        return;
+    }
+    let candidates = fingerprint_candidates();
+    let observed = installed.and_then(|fp| candidates.iter().find(|c| c.fingerprint() == fp))
+        .or_else(|| candidates.first());
+    if observed.is_some_and(|c| c.strength() == FingerprintStrength::Instance) {
+        eprintln!("Identity: 雲端／容器識別 (cloud/container identity)");
+    }
     if fingerprint_is_hostname_only() {
         eprintln!(
             "⚠️  No hardware identity is readable on this host (no platform UUID, \
@@ -249,6 +327,7 @@ fn binding_label(binding: &Binding) -> &'static str {
     match binding {
         Binding::Strong => "strong",
         Binding::Legacy(_) => "legacy (re-issue recommended)",
+        Binding::Weak => "weak (OpenSource only; console approval required to rebind)",
         Binding::None => "none (does not match this machine)",
     }
 }
@@ -271,8 +350,10 @@ async fn control_error(resp: reqwest::Response) -> DuDuClawError {
 // ── rebind (move to this machine) ─────────────────────────────
 
 async fn cmd_rebind() -> Result<()> {
-    let installed = match load_default() {
-        Ok(l) => l,
+    let path = storage::default_license_path()
+        .map_err(|e| DuDuClawError::License(format!("license path: {e}")))?;
+    let (installed, snapshot) = match load_request_snapshot(&path) {
+        Ok(value) => value,
         Err(LicenseError::FileNotFound(_)) => {
             return Err(DuDuClawError::License(
                 "no license installed — copy license.json from the old machine \
@@ -283,25 +364,37 @@ async fn cmd_rebind() -> Result<()> {
         Err(e) => return Err(DuDuClawError::License(format!("read license: {e}"))),
     };
 
+    if duduclaw_license::fingerprint_hardware_unavailable() {
+        return Err(DuDuClawError::License(
+            "無法讀取本機硬體 UUID；請稍後再試，不會將授權重新綁定至 MAC。".into(),
+        ));
+    }
+    if fingerprint_is_hostname_only() {
+        return Err(DuDuClawError::License(
+            "無法讀取可識別本機的硬體資訊，暫時無法提出有效的換綁申請。請恢復硬體識別後再試。".into(),
+        ));
+    }
     let new_fp = generate_fingerprint();
     if installed.machine_fingerprint == new_fp {
         println!("License is already bound to this machine — nothing to rebind.");
         return Ok(());
     }
-    // A legacy-bound license IS still valid here, but rebinding upgrades it to
-    // the strong fingerprint — exactly what we want the operator to do, so we
-    // let it proceed rather than short-circuiting.
+    // A fingerprint is not an ownership credential. Only account-holder
+    // approval in the console authorizes the issuer to change the binding.
 
-    let endpoint = format!("{}/v1/license/rebind", control_url().trim_end_matches('/'));
+    let endpoint = format!("{}/v1/license/rebind", resolve_control_url(installed.control_url.as_deref()).trim_end_matches('/'));
+    let nonce = uuid::Uuid::new_v4().to_string();
     let body = serde_json::json!({
         "subscription_id": installed.subscription_id,
         "old_fingerprint": installed.machine_fingerprint,
         "new_fingerprint": new_fp,
+        "nonce": nonce,
     });
 
-    println!("→ Rebinding license to this machine at {endpoint} ...");
-    let resp = http_client()?
-        .post(&endpoint)
+    let endpoint = validated_control_endpoint(&endpoint)?;
+    let request = control_request(endpoint.as_str()).await?;
+    println!("→ 正在提出換綁申請；需要帳號持有人到控制台核准後才會生效。 ({endpoint})");
+    let resp = request
         .json(&body)
         .send()
         .await
@@ -311,11 +404,22 @@ async fn cmd_rebind() -> Result<()> {
         return Err(control_error(resp).await);
     }
 
+    let status = resp.status();
     let envelope: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| DuDuClawError::License(format!("parse rebind response: {e}")))?;
-    let license = install_license_from_envelope(&envelope)?;
+    if response_pending(status, &envelope) {
+        validate_status_response(&envelope, "pending", &installed, &new_fp, &nonce)?;
+        println!("{REBIND_PENDING_MESSAGE}");
+        return Ok(());
+    }
+    if envelope.get("status").and_then(|v| v.as_str()) == Some("revoked") {
+        apply_revoked_response(&path, &snapshot, &duduclaw_gateway::license_runtime::production_registry(),
+            &envelope, &installed, &new_fp, &nonce)?;
+        return Err(DuDuClawError::License("license revoked by control-plane; reverted to OpenSource".into()));
+    }
+    let license = install_license_from_envelope(&envelope, &installed, &new_fp, &nonce, &path, &snapshot)?;
 
     println!("✓ License rebound to this machine");
     println!("  Tier:     {}", license.tier);
@@ -341,8 +445,7 @@ async fn cmd_subscriptions() -> Result<()> {
         "machine_fingerprint": installed.machine_fingerprint,
     });
 
-    let resp = http_client()?
-        .post(&endpoint)
+    let resp = control_request(&endpoint).await?
         .json(&body)
         .send()
         .await
@@ -385,16 +488,18 @@ async fn cmd_activate(key_input: &str) -> Result<()> {
     match classify_binding(&license.machine_fingerprint, &candidates) {
         Binding::Strong => {}
         Binding::Legacy(_) => {
-            // v1.66.1: keys issued before the MAC-selection fix still install —
-            // refusing them would brick every license issued on macOS 26.
+            // Only historical UUID or usable MAC bindings reach this branch.
             eprintln!(
                 "ℹ️  This license is bound to a legacy fingerprint for this machine \
-                 (pre-1.66.1). It stays valid; re-issue against \
+                 (hostname-based). It stays valid; re-issue against \
                  `duduclaw license fingerprint` when convenient."
             );
         }
+        Binding::Weak => {
+            return Err(DuDuClawError::License(validation_warning_message("weak_binding").into()));
+        }
         Binding::None => {
-            let current_fp = &candidates[0];
+            let current_fp = candidates[0].fingerprint();
             eprintln!("⚠️  License fingerprint mismatch.");
             eprintln!("   License is bound to: {}", license.machine_fingerprint);
             eprintln!("   Current machine:     {current_fp}");
@@ -465,13 +570,61 @@ fn parse_license_input(input: &str) -> Result<License> {
 // ── status ────────────────────────────────────────────────────
 
 async fn cmd_status() -> Result<()> {
+    let home = storage::license_dir()
+        .map_err(|e| DuDuClawError::License(format!("license directory: {e}")))?;
+    let warning = installed_warning(&home)?;
+    if let Some(reason) = warning {
+        println!("⚠️  {}", validation_warning_message(reason));
+        println!("Effective mode: OpenSource（商用授權未生效）；請處理授權後重新啟動服務。");
+    }
     match load_default() {
-        Ok(license) => print_status(&license),
+        Ok(license) => print_status(&license, warning),
         Err(LicenseError::FileNotFound(_)) => {
             print_opensource_status();
+            warn_if_hostname_only(None);
             Ok(())
         }
+        Err(_) if warning.is_some() => Ok(()),
         Err(e) => Err(DuDuClawError::License(format!("read license: {e}"))),
+    }
+}
+
+fn installed_warning(home: &std::path::Path) -> Result<Option<&'static str>> {
+    let gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML)
+        .map_err(|e| DuDuClawError::License(format!("embedded features.toml is broken: {e}")))?;
+    Ok(duduclaw_gateway::license_runtime::installed_license_warning(
+        home, &duduclaw_gateway::license_runtime::production_registry(), &gate,
+    ))
+}
+
+// Fixed operator-facing text: no license-controlled strings or identifiers.
+fn validation_warning_message(reason: &str) -> &'static str {
+    match reason {
+        "weak_binding" => "授權未生效：舊綁定缺少可識別此機器的硬體資訊，目前僅使用 OpenSource。請執行 duduclaw license rebind，並由帳號持有人到控制台核准換綁。",
+        "machine_mismatch" => "授權已失效：此機器的識別與授權不符。請聯絡簽發者確認，必要時執行 duduclaw license rebind。",
+        "hardware_identity_unavailable" => "授權驗證失敗：無法讀取本機硬體識別。請稍後重啟服務再試；不會以 MAC 代替 UUID 綁定。",
+        "expired" => "授權已失效：授權已過期，請聯絡簽發者續約。",
+        "invalid_signature" => "授權已失效：簽章無法驗證，請向簽發者取得有效授權。",
+        "grace_period_expired" => "授權已失效：離線寬限期已過，請執行 duduclaw license refresh。",
+        "unreadable" => "授權驗證失敗：無法讀取授權檔，請檢查內容與檔案權限。",
+        "revoked" => "授權已失效：授權已撤銷，請聯絡簽發者。",
+        _ => "授權驗證失敗：授權資料或部署型態不符，請檢查 gateway 日誌並聯絡簽發者。",
+    }
+}
+
+pub(crate) fn doctor_check(home: &std::path::Path) -> (String, duduclaw_core::types::CheckStatus, String) {
+    use duduclaw_core::types::CheckStatus;
+    let name = "授權狀態".to_string();
+    match installed_warning(home) {
+        Ok(Some(reason)) => (name, CheckStatus::Warn,
+            format!("{} 有效授權層級：OpenSource。", validation_warning_message(reason))),
+        Ok(None) => (name, CheckStatus::Pass,
+            if home.join(storage::DEFAULT_LICENSE_FILENAME).exists() {
+                "本機授權驗證通過。".into()
+            } else {
+                "未安裝商用授權；使用 OpenSource（個人版）。".into()
+            }),
+        Err(_) => (name, CheckStatus::Warn, "無法檢查授權狀態；請執行 duduclaw license status。".into()),
     }
 }
 
@@ -490,21 +643,23 @@ fn print_opensource_status() {
     println!("  https://futurecorp.tw");
 }
 
-fn print_status(license: &License) -> Result<()> {
+fn print_status(license: &License, warning: Option<&str>) -> Result<()> {
     let gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML)
         .map_err(|e| DuDuClawError::License(format!("embedded features.toml is broken: {e}")))?;
 
     let candidates = fingerprint_candidates();
-    let current_fp = candidates[0].clone();
+    let current_fp = candidates[0].fingerprint().to_owned();
     let binding = classify_binding(&license.machine_fingerprint, &candidates);
-    let fp_matches = binding != Binding::None;
+    let fp_matches = matches!(binding, Binding::Strong | Binding::Legacy(_));
     let expired = license.is_expired();
     let days_until = license.days_until_expiry();
     let phone_home_interval = gate.phone_home_interval_days(license.tier);
     let grace_period = gate.grace_period_days(license.tier);
 
-    println!("Mode:             Commercial");
-    println!("Tier:             {}", license.tier);
+    let effective_tier = if warning.is_some() { LicenseTier::OpenSource } else { license.tier };
+    println!("Mode:             {}", if warning.is_some() { "OpenSource" } else { "Commercial" });
+    println!("Tier:             {effective_tier}");
+    println!("Installed tier:   {}", license.tier);
     println!("Customer ID:      {}", license.customer_id);
     println!("Subscription ID:  {}", license.subscription_id);
     println!("Schema version:   {}", license.version);
@@ -512,7 +667,9 @@ fn print_status(license: &License) -> Result<()> {
     println!();
     println!("Issued at:        {}", license.issued_at);
     println!("Expires:          {}", license.expires_at);
-    if expired {
+    if warning.is_some() {
+        println!("Status:           ⚠️  INVALID — installed license is not active");
+    } else if expired {
         println!(
             "Status:           ⚠️  EXPIRED ({} days overdue)",
             -days_until
@@ -542,7 +699,7 @@ fn print_status(license: &License) -> Result<()> {
         println!("Fingerprint binding: {}", binding_label(&binding));
     }
 
-    warn_if_hostname_only();
+    warn_if_hostname_only(Some(&license.machine_fingerprint));
 
     // Phone-home freshness
     let days_since_ph = license.days_since_phone_home();
@@ -580,7 +737,7 @@ fn print_status(license: &License) -> Result<()> {
         ),
     ];
     for (flag, label) in capability_gates {
-        let mark = if gate.check(license.tier, flag) {
+        let mark = if gate.check(effective_tier, flag) {
             "✓"
         } else {
             "—"
@@ -599,7 +756,7 @@ fn print_status(license: &License) -> Result<()> {
         ("dedicated_engineer", "Dedicated engineer"),
     ];
     for (flag, label) in commitments {
-        let mark = if gate.service_commitment(license.tier, flag) {
+        let mark = if gate.service_commitment(effective_tier, flag) {
             "✓"
         } else {
             "—"
@@ -613,11 +770,13 @@ fn print_status(license: &License) -> Result<()> {
 // ── refresh ────────────────────────────────────────────────────
 
 /// Default control-plane URL. Overridable via `DUDUCLAW_CONTROL_URL` env var.
-const DEFAULT_CONTROL_URL: &str = "https://api.duduclaw.dudustudio.monster";
+use duduclaw_license::control_url::DEFAULT_CONTROL_URL;
 
 async fn cmd_refresh() -> Result<()> {
-    let license = match load_default() {
-        Ok(l) => l,
+    let path = storage::default_license_path()
+        .map_err(|e| DuDuClawError::License(format!("license path: {e}")))?;
+    let (license, snapshot) = match load_request_snapshot(&path) {
+        Ok(value) => value,
         Err(LicenseError::FileNotFound(_)) => {
             println!("No license installed — nothing to refresh.");
             return Ok(());
@@ -631,22 +790,28 @@ async fn cmd_refresh() -> Result<()> {
     let control_url = resolve_control_url(license.control_url.as_deref());
     let endpoint = format!("{}/v1/license/refresh", control_url.trim_end_matches('/'));
 
-    let request_body = serde_json::json!({
+    let proposed_fingerprint = duduclaw_license::fingerprint::refresh_fingerprint(&license.machine_fingerprint)
+        .map_err(|e| DuDuClawError::License(format!("cannot refresh machine identity: {e}")))?;
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let mut request_body = serde_json::json!({
         "subscription_id": license.subscription_id,
+        // Existing issuers authorize refresh against the installed binding.
         "machine_fingerprint": license.machine_fingerprint,
         "current_version": env!("CARGO_PKG_VERSION"),
+        "nonce": nonce,
         // Phase 1: no telemetry yet — added in Phase 2 once gateway exposes counters.
         "telemetry": {},
     });
+    if proposed_fingerprint != license.machine_fingerprint {
+        // This proposal is only effective after the account holder approves
+        // the rebind in the console. The installed binding is not a secret.
+        request_body["new_fingerprint"] = serde_json::json!(proposed_fingerprint);
+    }
 
+    let endpoint = validated_control_endpoint(&endpoint)?;
+    let client = control_request(endpoint.as_str()).await?;
     println!("→ Refreshing license at {endpoint} ...");
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| DuDuClawError::License(format!("build http client: {e}")))?;
-
-    let response = match client.post(&endpoint).json(&request_body).send().await {
+    let response = match client.json(&request_body).send().await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("✗ Could not reach control-plane: {e}");
@@ -673,6 +838,11 @@ async fn cmd_refresh() -> Result<()> {
         .await
         .map_err(|e| DuDuClawError::License(format!("parse refresh response: {e}")))?;
 
+    if response_pending(status, &envelope) {
+        validate_status_response(&envelope, "pending", &license, &proposed_fingerprint, &nonce)?;
+        println!("{REBIND_PENDING_MESSAGE}");
+        return Ok(());
+    }
     match envelope.get("status").and_then(|v| v.as_str()) {
         Some("active") => {
             let new_license_value = envelope.get("license").ok_or_else(|| {
@@ -681,13 +851,17 @@ async fn cmd_refresh() -> Result<()> {
             let new_license: License = serde_json::from_value(new_license_value.clone())
                 .map_err(|e| DuDuClawError::License(format!("parse new license: {e}")))?;
 
-            let saved_to = save_default(&new_license)
-                .map_err(|e| DuDuClawError::License(format!("save new license: {e}")))?;
+            duduclaw_license::refresh::validate_response(
+                &duduclaw_gateway::license_runtime::production_registry(), &new_license, &envelope,
+                &nonce, &license.subscription_id, &license.machine_fingerprint, &proposed_fingerprint,
+            ).map_err(|e| DuDuClawError::License(format!("refresh response rejected; installed license unchanged: {e}")))?;
+            validate_control_plane_license(&new_license)?;
+            save_response_if_current(&path, &snapshot, &new_license)?;
 
             println!("✓ License refreshed");
             println!("  Tier:           {}", new_license.tier);
             println!("  Days remaining: {}", new_license.days_until_expiry());
-            println!("  Saved to:       {}", saved_to.display());
+            println!("  Saved to:       {}", path.display());
 
             if let Some(warnings) = envelope.get("warnings").and_then(|v| v.as_array()) {
                 if !warnings.is_empty() {
@@ -703,6 +877,8 @@ async fn cmd_refresh() -> Result<()> {
             Ok(())
         }
         Some("revoked") => {
+            apply_revoked_response(&path, &snapshot, &duduclaw_gateway::license_runtime::production_registry(),
+                &envelope, &license, &proposed_fingerprint, &nonce)?;
             let reason = envelope
                 .get("reason")
                 .and_then(|v| v.as_str())
@@ -715,9 +891,7 @@ async fn cmd_refresh() -> Result<()> {
             eprintln!("  Reason:         {reason}");
             eprintln!("  Effective from: {effective_from}");
             eprintln!();
-            eprintln!("The local license file is preserved so you can export it for");
-            eprintln!("audit purposes. Run `duduclaw license deactivate` to remove it");
-            eprintln!("and revert to OpenSource mode.");
+            eprintln!("The verified revocation was saved; reverted to OpenSource mode.");
             Err(DuDuClawError::License(format!(
                 "license revoked by control-plane: {reason}"
             )))
@@ -768,27 +942,34 @@ async fn cmd_import(path: &PathBuf) -> Result<()> {
     if classify_binding(&license.machine_fingerprint, &candidates) == Binding::None {
         eprintln!("⚠️  License fingerprint mismatch.");
         eprintln!("   License is bound to: {}", license.machine_fingerprint);
-        eprintln!("   Current machine:     {}", candidates[0]);
+        eprintln!("   Current machine:     {}", candidates[0].fingerprint());
         return Err(DuDuClawError::License(
             "license fingerprint mismatch".into(),
         ));
     }
 
+    if classify_binding(&license.machine_fingerprint, &candidates) == Binding::Weak {
+        eprintln!("⚠️  {}", validation_warning_message("weak_binding"));
+    }
     let saved_to =
         save_default(&license).map_err(|e| DuDuClawError::License(format!("save: {e}")))?;
 
     println!("✓ License imported");
-    println!("  Tier:    {}", license.tier);
-    println!("  Saved:   {}", saved_to.display());
+    println!("  Installed tier: {}", license.tier);
+    println!("  Saved:          {}", saved_to.display());
     Ok(())
 }
 
 // ── deactivate ────────────────────────────────────────────────
 
 async fn cmd_deactivate() -> Result<()> {
-    match load_default() {
+    let path = storage::default_license_path()
+        .map_err(|e| DuDuClawError::License(format!("license path: {e}")))?;
+    let store = storage::LockedLicenseStore::acquire(&path)
+        .map_err(|e| DuDuClawError::License(format!("lock license: {e}")))?;
+    match store.load() {
         Ok(license) => {
-            storage::delete_default()
+            store.delete()
                 .map_err(|e| DuDuClawError::License(format!("delete license: {e}")))?;
             println!("✓ License deactivated (tier was: {})", license.tier);
             println!("  Reverted to OpenSource mode.");
@@ -807,22 +988,28 @@ async fn cmd_deactivate() -> Result<()> {
 // ── fingerprint ───────────────────────────────────────────────
 
 async fn cmd_fingerprint(all: bool) -> Result<()> {
-    // Line 1 is ALWAYS the strong fingerprint — this is the value a customer
+    if duduclaw_license::fingerprint_hardware_unavailable() {
+        return Err(DuDuClawError::License(
+            "無法讀取本機硬體 UUID；不提供 MAC 指紋供新授權簽發。請稍後再試。".into(),
+        ));
+    }
+    if fingerprint_is_hostname_only() {
+        return Err(DuDuClawError::License(
+            "無法取得有效的本機識別；不提供弱指紋供新授權簽發。".into(),
+        ));
+    }
+    // Line 1 is ALWAYS the preferred Hardware or Instance fingerprint — this is the value a customer
     // reports and a new license is issued against. `--all` appends the
-    // pre-1.66.1 values this machine still accepts, for diagnosing an existing
-    // binding.
-    let candidates = if all {
-        fingerprint_candidates()
-    } else {
-        vec![generate_fingerprint()]
-    };
+    // historical values for diagnosis. Weak candidates never activate a paid tier.
+    let mut candidates = fingerprint_candidates();
+    if !all { candidates.truncate(1); }
     for fp in &candidates {
-        println!("{fp}");
+        println!("{}", fp.fingerprint());
     }
     if all && candidates.len() == 1 {
         eprintln!("(no legacy fingerprints — this machine accepts only the value above)");
     }
-    warn_if_hostname_only();
+    warn_if_hostname_only(None);
     Ok(())
 }
 
@@ -830,11 +1017,165 @@ async fn cmd_fingerprint(all: bool) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn candidates() -> Vec<String> {
+    fn candidates() -> Vec<FingerprintCandidate> {
         vec![
-            "1837a5d96419f6a9d7396c3902882fe8".to_string(), // strong
-            "1743ebb5466bcad6c206e7e42371f45d".to_string(), // legacy placeholder-MAC
+            FingerprintCandidate::for_test("1837a5d96419f6a9d7396c3902882fe8", FingerprintStrength::Hardware), // strong
+            FingerprintCandidate::for_test("1743ebb5466bcad6c206e7e42371f45d", FingerprintStrength::Hardware), // hardware-backed legacy
         ]
+    }
+
+    #[test]
+    fn pending_response_selection_never_requires_a_license_payload() {
+        for body in [serde_json::Value::Null, serde_json::json!({"license": "malformed"}),
+            serde_json::json!({"status": "active", "license": {"tier": "oem"}})] {
+            assert!(response_pending(reqwest::StatusCode::ACCEPTED, &body));
+        }
+        assert!(response_pending(reqwest::StatusCode::OK, &serde_json::json!({"status": "pending"})));
+        for status in ["active", "pending-other", "pending "] {
+            assert!(!response_pending(reqwest::StatusCode::OK, &serde_json::json!({"status": status})));
+        }
+        assert!(REBIND_PENDING_MESSAGE.contains("帳號持有人到控制台核准"));
+        assert!(REBIND_PENDING_MESSAGE.contains("原授權未變更"));
+    }
+
+    fn response_test_license() -> License {
+        License::new("sub-cli-response", "customer", LicenseTier::SelfHostPro,
+            "binding", chrono::Duration::days(30), "test")
+    }
+
+    #[test]
+    fn pending_response_requires_signed_status_even_for_http_202() {
+        let installed = response_test_license();
+        for body in [serde_json::Value::Null, serde_json::json!({"status":"pending", "nonce":"n"}),
+            serde_json::json!({"status":"active", "nonce":"n"})] {
+            assert!(response_pending(reqwest::StatusCode::ACCEPTED, &body));
+            assert!(validate_status_response(&body, "pending", &installed, "new", "n").is_err());
+        }
+    }
+
+    #[test]
+    fn delayed_cli_response_preserves_concurrently_installed_license() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(storage::DEFAULT_LICENSE_FILENAME);
+        let original = response_test_license();
+        storage::save_to(&original, &path).unwrap();
+        let (_, snapshot) = load_request_snapshot(&path).unwrap();
+        let mut replacement = original.clone();
+        replacement.max_agents = Some(2);
+        replacement.control_url = Some("https://replacement.example.test".into());
+        storage::save_to(&replacement, &path).unwrap();
+        assert!(save_response_if_current(&path, &snapshot, &original).is_err());
+        let after = storage::load_from(&path).unwrap();
+        assert_eq!(serde_json::to_value(after).unwrap(), serde_json::to_value(replacement).unwrap());
+        assert!(current_response_store(&path, &snapshot).is_err(), "stale revocation must also be fenced");
+        assert!(!home.path().join("license_revoked.marker").exists());
+    }
+
+    #[test]
+    fn delayed_cli_response_cannot_restore_deactivated_license() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(storage::DEFAULT_LICENSE_FILENAME);
+        let original = response_test_license();
+        storage::save_to(&original, &path).unwrap();
+        let (_, snapshot) = load_request_snapshot(&path).unwrap();
+        storage::LockedLicenseStore::acquire(&path).unwrap().delete().unwrap();
+        assert!(save_response_if_current(&path, &snapshot, &original).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn unsigned_cli_revocation_never_changes_disk_state() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(storage::DEFAULT_LICENSE_FILENAME);
+        let original = response_test_license();
+        storage::save_to(&original, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let (_, snapshot) = load_request_snapshot(&path).unwrap();
+        for version in [serde_json::Value::Null, serde_json::json!(1), serde_json::json!(2)] {
+            let body = serde_json::json!({"status":"revoked", "nonce":"n", "reason":"revoked",
+                "response_signature_version":version});
+            assert!(apply_revoked_response(&path, &snapshot, &duduclaw_license::PublicKeyRegistry::new(),
+                &body, &original, "new", "n").is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(!home.path().join("license_revoked.marker").exists());
+        }
+    }
+
+    #[test]
+    fn signed_cli_revocation_is_fenced_by_concurrent_install() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/license_response_v2.json")).unwrap();
+        let registry = duduclaw_license::PublicKeyRegistry::new().with_key("test-vector",
+            hex::decode(fixture["public_key_hex"].as_str().unwrap()).unwrap());
+        let body = fixture["status_vectors"].as_array().unwrap().iter()
+            .find(|body| body["status"] == "revoked").unwrap();
+        let mut original: License = serde_json::from_value(fixture["license"].clone()).unwrap();
+        original.machine_fingerprint = fixture["original_binding"].as_str().unwrap().into();
+        let proposed = fixture["proposed_binding"].as_str().unwrap();
+        let nonce = fixture["nonce"].as_str().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(storage::DEFAULT_LICENSE_FILENAME);
+        storage::save_to(&original, &path).unwrap();
+        let (_, snapshot) = load_request_snapshot(&path).unwrap();
+        let mut replacement = original.clone();
+        replacement.subscription_id = "new-subscription".into();
+        storage::save_to(&replacement, &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(apply_revoked_response(&path, &snapshot, &registry, body, &original, proposed, nonce).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!home.path().join("license_revoked.marker").exists());
+
+        storage::save_to(&original, &path).unwrap();
+        let (_, current) = load_request_snapshot(&path).unwrap();
+        apply_revoked_response(&path, &current, &registry, body, &original, proposed, nonce).unwrap();
+        assert!(!path.exists());
+        assert!(home.path().join("license_revoked.marker").exists());
+    }
+
+    #[test]
+    fn classify_binding_never_labels_weak_matches_as_valid() {
+        let weak = FingerprintCandidate::for_test("shared-hostname-hash", FingerprintStrength::Weak);
+        for candidates in [vec![weak.clone()], vec![FingerprintCandidate::for_test("real-hardware", FingerprintStrength::Hardware), weak]] {
+            assert_eq!(classify_binding("shared-hostname-hash", &candidates), Binding::Weak);
+        }
+        assert!(binding_label(&Binding::Weak).contains("OpenSource only"));
+        assert!(validation_warning_message("weak_binding").contains("控制台核准換綁"));
+    }
+
+    #[test]
+    fn doctor_license_reports_missing_without_writing() {
+        let home = tempfile::tempdir().unwrap();
+        let row = doctor_check(home.path());
+        assert_eq!(row.1, duduclaw_core::types::CheckStatus::Pass);
+        assert!(row.2.contains("未安裝商用授權"));
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn doctor_license_warns_for_unreadable_installed_license() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(storage::DEFAULT_LICENSE_FILENAME), "not json").unwrap();
+        let row = doctor_check(home.path());
+        assert_eq!(row.1, duduclaw_core::types::CheckStatus::Warn);
+        assert!(row.2.contains("無法讀取授權檔"));
+        assert!(row.2.contains("OpenSource"));
+    }
+
+    #[test]
+    fn control_plane_response_with_untrusted_signature_is_rejected() {
+        let license = License::new(
+            "sub-test", "customer-test", LicenseTier::SelfHostPro, &generate_fingerprint(),
+            chrono::Duration::days(30), "untrusted-test-issuer",
+        );
+        let error = validate_control_plane_license(&license).unwrap_err().to_string();
+        assert!(error.contains("installed license unchanged"));
+    }
+
+    #[test]
+    fn license_warning_messages_do_not_echo_unknown_input() {
+        let private_value = "machine-secret-fingerprint";
+        assert!(!validation_warning_message(private_value).contains(private_value));
+        assert!(validation_warning_message("machine_mismatch").contains("此機器的識別與授權不符"));
     }
 
     #[test]
@@ -847,8 +1188,7 @@ mod tests {
 
     #[test]
     fn classify_binding_detects_a_legacy_binding() {
-        // The macOS 26 regression: the installed license is bound to the
-        // placeholder-MAC fingerprint. Still valid — just not strong.
+        // A historical UUID or real-MAC fingerprint remains hardware-backed.
         let binding = classify_binding("1743ebb5466bcad6c206e7e42371f45d", &candidates());
         assert_eq!(
             binding,
@@ -885,7 +1225,7 @@ mod tests {
         // candidates[0]; `--all` prints the same value on line 1.
         let all = fingerprint_candidates();
         assert!(!all.is_empty());
-        assert_eq!(all[0], generate_fingerprint());
+        assert_eq!(all[0].fingerprint(), generate_fingerprint());
     }
 
     #[test]

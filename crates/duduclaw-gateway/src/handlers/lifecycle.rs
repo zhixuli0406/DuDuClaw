@@ -41,6 +41,7 @@ impl MethodHandler {
 
     /// Create a new handler with a custom extension (used by Pro binary).
     pub async fn with_extension(home_dir: PathBuf, extension: Arc<dyn GatewayExtension>) -> Self {
+        let extension = crate::extension::register(extension);
         let agents_dir = home_dir.join("agents");
         // v1.68: one-time reset of scaffold-noise `false` permission flags
         // (they are enforced from now on); runs before the registry scan so
@@ -99,6 +100,8 @@ impl MethodHandler {
             jwt_config: RwLock::new(None),
             extension,
             edition_override: RwLock::new(None),
+            #[cfg(test)]
+            edition_fixture_runtime: RwLock::new(None),
             cli_auth_sessions: RwLock::new(std::collections::HashMap::new()),
             setup_token_session: RwLock::new(None),
             cron_store: RwLock::new(None),
@@ -134,15 +137,35 @@ impl MethodHandler {
         *self.edition_override.write().await = edition;
     }
 
-    /// Resolve the active product form-factor ([`EditionProfile`]) at request
-    /// time using the documented precedence: `DUDUCLAW_EDITION` env >
-    /// explicit override > license tier > `Personal`. This is the value the
-    /// dashboard reads to decide whether to show enterprise management
-    /// surfaces. It never gates a core feature.
-    ///
-    /// [`EditionProfile`]: duduclaw_core::EditionProfile
+    /// Supply a signed, verified fixture license without changing the process-global runtime.
+    #[cfg(test)]
+    pub(crate) async fn set_test_edition(&self, edition: Option<duduclaw_core::EditionProfile>) {
+        if edition == Some(duduclaw_core::EditionProfile::Enterprise) {
+            use duduclaw_license::{License, LicenseTier, PublicKeyRegistry};
+            use ed25519_dalek::Signer;
+            let home = tempfile::tempdir().unwrap();
+            let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            let registry = PublicKeyRegistry::new().with_key("edition-fixture", key.verifying_key().to_bytes().to_vec());
+            let tier = if crate::license_runtime::is_self_host_deployment() { LicenseTier::Oem } else { LicenseTier::Business };
+            let mut license = License::new("sub_edition_fixture", "fixture", tier,
+                duduclaw_license::generate_fingerprint(), chrono::Duration::days(1), "edition-fixture");
+            license.nfr = true;
+            license.signature = key.sign(&license.canonical_payload().unwrap()).to_bytes().to_vec();
+            duduclaw_license::storage::save_to(&license, &home.path().join("license.json")).unwrap();
+            let runtime = crate::license_runtime::LicenseRuntime::bootstrap(home.path().into(), registry).await;
+            assert_eq!(runtime.current_tier().await, tier);
+            *self.edition_fixture_runtime.write().await = Some(runtime);
+        }
+        self.set_edition_override(edition).await;
+    }
+
+    /// Resolve the edition for UI and management RPC gates through the shared
+    /// resolver. The verified license always caps both env and explicit overrides.
     pub(crate) async fn resolve_edition_profile(&self) -> duduclaw_core::EditionProfile {
-        let tier_key = match crate::license_runtime::global() {
+        let runtime = crate::license_runtime::global().cloned();
+        #[cfg(test)]
+        let runtime = self.edition_fixture_runtime.read().await.clone().or(runtime);
+        let tier_key = match runtime {
             Some(runtime) => Some(runtime.snapshot().await.tier.as_toml_key().to_string()),
             None => None,
         };
@@ -186,6 +209,10 @@ impl MethodHandler {
                 Ok::<_, String>(Arc::new(idx))
             })
             .await?;
+        // Root policy rows are re-derived before every consumer, even when
+        // the general JSONL index remains background-synced. A failed rebuild
+        // must not let a consumer serve stale service-owned root cache rows.
+        crate::protected_policy_audit::drain(&self.home_dir, idx).await?;
         Ok(idx.clone())
     }
 

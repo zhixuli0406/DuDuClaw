@@ -1,0 +1,63 @@
+{
+  "test_only_seed_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+  "public_key_hex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+  "nonce": "nonce-vector-20261105",
+  "subscription": "sub_rebind_vector",
+  "original_binding": "legacy-machine-binding",
+  "proposed_binding": "macos-uuid-v2:00112233445566778899aabbccddeeff",
+  "license": {
+    "version": 2,
+    "subscription_id": "sub_rebind_vector",
+    "customer_id": "cus_vector",
+    "tier": "self_host_pro",
+    "machine_fingerprint": "macos-uuid-v2:00112233445566778899aabbccddeeff",
+    "issued_at": "2026-11-05T00:00:00Z",
+    "expires_at": "2026-12-05T00:00:00Z",
+    "last_phone_home": "2026-11-06T00:00:00Z",
+    "public_key_id": "test-vector",
+    "signature": "2gUZpZuLKGQH9VubeuM7IX/Ssh3RCWp/IvQt6z9SlXSobaOESOR3DlVz6zxJdtwyXTCI7jN5gdtFuLoTSI8sCg==",
+    "control_url": "https://issuer.example.test",
+    "max_agents": 7
+  },
+  "license_digest": "157421ffbb510cb1d95b6b75f4fc22dd4d5670dc57b5584743d8058dca0d9ed3",
+  "canonical_payload": "[\"duduclaw:license-response:v2\",2,\"active\",\"\",\"2026-11-06T00:00:00Z\",\"nonce-vector-20261105\",\"sub_rebind_vector\",\"legacy-machine-binding\",\"macos-uuid-v2:00112233445566778899aabbccddeeff\",\"157421ffbb510cb1d95b6b75f4fc22dd4d5670dc57b5584743d8058dca0d9ed3\"]",
+  "response_signature_version": 2,
+  "response_signature": "sSI/8zFiMFw7V5hTySFEmjhIgzSHL8KTOBBnvE55NYy5/k7go0c7/oKwH5HmRyUFV0A86VQA+Ut980SI3LpFAg==",
+  "status": "active",
+  "reason": "",
+  "effective_from": "2026-11-06T00:00:00Z",
+  "public_key_id": "test-vector",
+  "subscription_id": "sub_rebind_vector",
+  "original_fingerprint": "legacy-machine-binding",
+  "proposed_fingerprint": "macos-uuid-v2:00112233445566778899aabbccddeeff",
+  "status_vectors": [
+    {
+      "nonce": "nonce-vector-20261105",
+      "subscription_id": "sub_rebind_vector",
+      "original_fingerprint": "legacy-machine-binding",
+      "proposed_fingerprint": "macos-uuid-v2:00112233445566778899aabbccddeeff",
+      "public_key_id": "test-vector",
+      "effective_from": "2026-01-01T00:00:00Z",
+      "status": "revoked",
+      "reason": "test_revocation",
+      "license_digest": "",
+      "canonical_payload": "[\"duduclaw:license-response:v2\",2,\"revoked\",\"test_revocation\",\"2026-01-01T00:00:00Z\",\"nonce-vector-20261105\",\"sub_rebind_vector\",\"legacy-machine-binding\",\"macos-uuid-v2:00112233445566778899aabbccddeeff\",\"\"]",
+      "response_signature_version": 2,
+      "response_signature": "0o7NL+Q+DC7O3k7usLzl3ElZxoAQ2CMBhkEBnfhR2VuVyrNfWjoPdbSMKLoY3ZE/F/DbtRpOtpP5OMKMoqhqDQ=="
+    },
+    {
+      "nonce": "nonce-vector-20261105",
+      "subscription_id": "sub_rebind_vector",
+      "original_fingerprint": "legacy-machine-binding",
+      "proposed_fingerprint": "macos-uuid-v2:00112233445566778899aabbccddeeff",
+      "public_key_id": "test-vector",
+      "effective_from": "2026-11-06T00:00:00Z",
+      "status": "pending",
+      "reason": "approval_required",
+      "license_digest": "",
+      "canonical_payload": "[\"duduclaw:license-response:v2\",2,\"pending\",\"approval_required\",\"2026-11-06T00:00:00Z\",\"nonce-vector-20261105\",\"sub_rebind_vector\",\"legacy-machine-binding\",\"macos-uuid-v2:00112233445566778899aabbccddeeff\",\"\"]",
+      "response_signature_version": 2,
+      "response_signature": "3eHfosQky2Oo9Thahe5v79Kj6wGnym7QHhmoF7CjkOJ1JZCujeaBztVa3zEIcf10vC4shy6N6a0lrClN+HlGBA=="
+    }
+  ]
+}

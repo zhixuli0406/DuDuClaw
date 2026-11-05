@@ -493,6 +493,8 @@ mod tests {
     ///     └ mkt_lead   ─ mkt_rep                  (department 行銷)
     fn seed_home() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
+        // Main-target admission requires readable gateway configuration.
+        std::fs::write(tmp.path().join("config.toml"), "").unwrap();
         let agents = tmp.path().join("agents");
         let write = |name: &str, reports_to: &str, department: &str| {
             write_agent(&agents, name, reports_to, department);
@@ -609,7 +611,7 @@ mod tests {
     async fn parent_grandparent_and_same_department_are_allowed() {
         let tmp = seed_home();
         let home = tmp.path();
-        // Default policy (no config.toml at all) = department.
+        // Default policy (no delegation section) = department.
         assert_eq!(effective_policy(home), DelegationPolicy::Department);
 
         for (sender, target, what) in [

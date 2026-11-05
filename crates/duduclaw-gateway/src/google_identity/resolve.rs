@@ -145,7 +145,7 @@ pub async fn resolve_person(
     requester: &RequesterIdentity,
     people: &dyn People,
 ) -> Result<Resolved, Refusal> {
-    resolve_person_for_tool(home, agent, requester, people, "google_status").await
+    resolve_person_for_tool(home, agent, requester, people, "google_remote_mcp").await
 }
 
 pub async fn resolve_person_for_tool(
@@ -155,6 +155,9 @@ pub async fn resolve_person_for_tool(
     people: &dyn People,
     tool: &str,
 ) -> Result<Resolved, Refusal> {
+    if !crate::google_personal::scopes::token_tool(tool) {
+        return Err(Refusal::hard("scope_missing", "這項操作不能取得 Google 權杖。"));
+    }
     let eff = gi::effective_for(home, Some(agent));
     if matches!(eff.effective, Effective::Personal { .. }) {
         let outcome =

@@ -10,11 +10,19 @@ mod linux;
 mod migrate;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[path = "protected_linux_runtime.rs"]
+mod runtime;
+
+#[path = "protected_linux_policy.rs"]
+pub(crate) mod policy;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct InstallOptions {
     pub enable_now: bool,
     pub i_verified_this_binary: bool,
     pub migrate_from: Option<PathBuf>,
     pub force_migrate: bool,
+    pub allow_missing_runtime: bool,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -40,12 +48,12 @@ pub(crate) fn install(options: InstallOptions) -> Result<()> {
     { let _ = options; Err(refused("--protected-linux requires native Linux")) }
 }
 
-pub(crate) async fn upgrade(version: Option<&str>) -> Result<()> {
+pub(crate) async fn upgrade(version: Option<&str>, allow_missing_runtime: bool) -> Result<()> {
     operator_gate()?;
     #[cfg(target_os = "linux")]
-    { linux::upgrade(version).await }
+    { linux::upgrade(version, allow_missing_runtime).await }
     #[cfg(not(target_os = "linux"))]
-    { let _ = version; Err(refused("--protected-linux requires native Linux")) }
+    { let _ = (version, allow_missing_runtime); Err(refused("--protected-linux requires native Linux")) }
 }
 
 pub(crate) fn uninstall() -> Result<()> {
@@ -58,51 +66,14 @@ pub(crate) fn uninstall() -> Result<()> {
 
 fn operator_gate() -> Result<()> {
     if !crate::ai_session_guard::command_markers().is_empty() {
-        return Err(refused("AI 員工不能安裝、升級或移除受保護服務，請由管理者在自己的終端機操作。"));
+        return Err(refused("AI 員工不能安裝、升級、移除受保護服務或變更其政策，請由管理者在自己的終端機操作。"));
     }
     Ok(())
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn unit_text() -> String {
-    format!(r"[Unit]
-Description=DuDuClaw protected gateway
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart={LAUNCHER} {BINARY} run --yes
-# Stop every descendant before a fresh key handoff.
-KillMode=control-group
-Restart=on-failure
-RestartSec=5
-# Only service data and the root key provisioning directory are writable.
-ProtectSystem=strict
-ReadWritePaths=/var/lib/duduclaw /var/lib/duduclaw-protected
-ProtectHome=yes
-PrivateTmp=yes
-# Hide common engine endpoints; '-' tolerates hosts without those paths.
-InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock -/run/containerd -/run/podman -/var/run/podman -/run/user -/run/docker
-# Gateway tools need pseudo devices, not host hardware or raw block devices.
-PrivateDevices=yes
-# Neither the launcher nor gateway needs to change kernel settings or modules.
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-# PID 1 owns the unit cgroup; the gateway must not modify its hierarchy.
-ProtectControlGroups=yes
-# The launcher drops IDs directly; it does not need to create set-ID files.
-RestrictSUIDSGID=yes
-# No execution-domain changes or foreign syscall ABIs are needed.
-LockPersonality=yes
-SystemCallArchitectures=native
-# RestrictNamespaces is intentionally omitted: Codex/bwrap task sandboxes
-# need user, mount, PID and network namespaces. Do not set PrivateUsers.
-UMask=0077
-
-[Install]
-WantedBy=multi-user.target
-")
+    duduclaw_core::root_key::recovery::protected_unit_text()
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

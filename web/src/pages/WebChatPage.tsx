@@ -1,3 +1,4 @@
+import { RecentSkillChips } from '@/components/skills/RecentSkillChips';
 import { ChatWaitingNotice } from '@/components/chat/ChatWaitingNotice';
 import { ReadOnlyHistoryView } from '@/components/chat/ReadOnlyHistoryView';
 import { DataExportButton } from '@/components/DataExportButton';
@@ -139,6 +140,20 @@ function InteractiveWebChatPage() {
     if (preselect && !assignedOnly) selectAgent(preselect);
     // Keep the session alive across unmounts — no disconnect here.
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Direct entry to a fresh chat uses the account preference. Non-admin
+  // enterprise users get their primary from the server's assignment resolver.
+  const primaryApplied = useRef(false);
+  useEffect(() => {
+    if (assignedOnly || !agentsLoaded || !user || primaryApplied.current) return;
+    primaryApplied.current = true;
+    if (resumedExplicitly || messages.length || selectedAgentId || searchParams.get('agent')) return;
+    const primary = agents.find(agent => agent.name === user?.primary_agent_id);
+    if (primary && primary.role !== 'main') {
+      selectAgent(primary.name);
+      setAgentParam(primary.name);
+    }
+  }, [assignedOnly, agentsLoaded, agents, user?.primary_agent_id, resumedExplicitly, messages.length, selectedAgentId, searchParams, selectAgent, setAgentParam, user]);
 
   // 問一問 handoff (UX plan I-1b): the 交辦任務 page passes its draft through
   // router state rather than the URL (a goal paragraph does not belong in a
@@ -343,6 +358,7 @@ function InteractiveWebChatPage() {
 
   const newConversation = () => {
     startNewConversation();
+    setAgentParam(useChatStore.getState().selectedAgentId);
   };
 
   // `@` list: exactly the staff this account may call (`agents.callable`),
@@ -617,6 +633,9 @@ function InteractiveWebChatPage() {
                   {assignmentBlocked ? assignmentMessage : intl.formatMessage({ id: 'webchat.welcome', defaultMessage: 'Hi! How can I help you today?' })}
                 </p>
               </div>
+              {!assignmentBlocked && <RecentSkillChips value={input} onChange={setInput}
+                agentId={historyAgentId ?? undefined} disabled={connectionState !== 'connected'}
+                onPick={() => inputRef.current?.focus()} />}
               <div className="flex flex-wrap justify-center gap-2">
                 {!assignmentBlocked && suggestions.map((s) => (
                   <button

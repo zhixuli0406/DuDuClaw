@@ -53,6 +53,7 @@ fn enterprise_surfaces_are_listed() {
         "wiki.trust_override",
         // 可靠性報告
         "audit.reliability_summary",
+        "compliance.generate",
     ] {
         assert!(
             is_enterprise_only_method(method),

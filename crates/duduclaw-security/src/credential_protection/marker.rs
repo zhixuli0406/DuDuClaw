@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::CryptoEngine;
 
-use super::BackendKind;
+use super::{BackendKind, sanitize_output_text};
 
 /// File name of the marker under the DuDuClaw home.
 pub const MARKER_FILE: &str = "credential_protection.json";
@@ -110,18 +110,28 @@ pub fn read_marker(home: &Path) -> MarkerRead {
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MarkerRead::Absent,
-        Err(e) => return MarkerRead::Invalid(format!("cannot read marker: {e}")),
+        Err(e) => return MarkerRead::Invalid(sanitize_output_text(&format!("cannot read marker: {e}"))),
     };
     match serde_json::from_slice::<Marker>(&bytes) {
-        Ok(m) if m.version == MARKER_VERSION => MarkerRead::Present(m),
+        Ok(m) if m.version == MARKER_VERSION => {
+            if m.key_id.len() != ID_HEX_LEN || !m.key_id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+                return MarkerRead::Invalid("marker key_id must be 16 lowercase hexadecimal characters".into());
+            }
+            let canonical = chrono::DateTime::parse_from_rfc3339(&m.enabled_at).ok()
+                .map(|time| time.with_timezone(&chrono::Utc).to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+            if canonical.as_deref() != Some(m.enabled_at.as_str()) {
+                return MarkerRead::Invalid("marker enabled_at must be canonical UTC RFC3339 (seconds, Z)".into());
+            }
+            MarkerRead::Present(m)
+        },
         Ok(m) => MarkerRead::Invalid(format!("unsupported marker version {}", m.version)),
-        Err(e) => MarkerRead::Invalid(format!("marker is not valid JSON: {e}")),
+        Err(e) => MarkerRead::Invalid(sanitize_output_text(&format!("marker is not valid JSON: {e}"))),
     }
 }
 
 /// Write the marker atomically with owner-only permissions.
 pub fn write_marker(home: &Path, marker: &Marker) -> Result<(), String> {
-    std::fs::create_dir_all(home).map_err(|e| format!("cannot create home: {e}"))?;
+    duduclaw_core::config::create_home_dir(home).map_err(|e| format!("cannot create home: {e}"))?;
     let body = serde_json::to_vec_pretty(marker).map_err(|e| format!("marker encode: {e}"))?;
     let path = marker_path(home);
     // Random suffix + create_new: a pre-planted file or symlink at the

@@ -55,8 +55,8 @@ fn command(name: &str, args: &[&str]) -> Result<Output> {
     let executable = fs::canonicalize(executable)?;
     parents(&executable)?;
     trusted(&executable, false)?;
-    Ok(Command::new(executable).args(args).env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin").env("LC_ALL", "C").output()?)
+    Ok(Command::new(executable).args(args).current_dir("/").env_clear()
+        .env("PATH", super::runtime::SERVICE_PATH).env("HOME", "/var/lib/duduclaw").env("LC_ALL", "C").output()?)
 }
 
 fn checked(name: &str, args: &[&str]) -> Result<Output> {
@@ -109,6 +109,57 @@ fn atomic_install(path: &str, mode: u32, write: impl FnOnce(&mut fs::File) -> Re
     temp.persist(path).map_err(|error| error.error)?;
     fs::File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+// Read and compare through the same pinned descriptor that was validated.
+fn update_text_if_different(path: &str, mode: u32, expected: &str) -> Result<bool> {
+    use std::io::Read;
+    parents(Path::new(path))?;
+    let installed = match fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path) {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.uid() != 0 || metadata.gid() != 0
+                || metadata.mode() & 0o7022 != 0 || metadata.nlink() != 1 {
+                return Err(refused("unsafe installed service contract"));
+            }
+            let mut bytes = Vec::new();
+            file.take(262145).read_to_end(&mut bytes)?;
+            if bytes.len() > 262144 { return Err(refused("installed service contract too large")); }
+            Some(bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if !duduclaw_core::root_key::recovery::protected_content_differs(installed.as_deref(), expected.as_bytes()) {
+        return Ok(false);
+    }
+    atomic_install(path, mode, |file| { file.write_all(expected.as_bytes())?; Ok(()) })?;
+    Ok(true)
+}
+
+const RECOVERY_BOUND: &str = "/etc/systemd/system/duduclaw-gateway.recovery-bound";
+
+fn invalidate_recovery_bound() -> Result<()> {
+    parents(Path::new(RECOVERY_BOUND))?;
+    match fs::symlink_metadata(RECOVERY_BOUND) {
+        Ok(_) => { trusted(Path::new(RECOVERY_BOUND), false)?; fs::remove_file(RECOVERY_BOUND)?; }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
+    fs::File::open("/etc/systemd/system")?.sync_all()?;
+    Ok(())
+}
+
+fn reload_and_certify_recovery() -> Result<()> {
+    checked("systemctl", &["daemon-reload"])?;
+    let output = checked("systemctl", &["show", UNIT, "-p", "StartLimitIntervalUSec",
+        "-p", "StartLimitBurst", "-p", "RestartForceExitStatus"])?;
+    let properties = std::str::from_utf8(&output.stdout).map_err(|_| refused("invalid unit properties"))?;
+    if !duduclaw_core::root_key::recovery::protected_properties_bounded(properties) {
+        return Err(refused("effective unit restart bounds differ; remove conflicting systemd overrides before upgrading"));
+    }
+    atomic_install(RECOVERY_BOUND, 0o644, |file| { file.write_all(unit_text().as_bytes())?; Ok(()) })
 }
 
 const VERSION_FLOOR: &str = "/var/lib/duduclaw-protected/version-floor";
@@ -211,6 +262,7 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
         super::migrate::copy(&source, uid, gid, options.force_migrate)?;
         println!("個人連線使用不同的金鑰，搬移後必須重新連結。請先停止來源 Gateway，避免資料在複製時變動。");
     }
+    invalidate_recovery_bound()?;
     prepare_version(version)?;
     atomic_install(BINARY, 0o755, |target| {
         let mut source = fs::OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC).open("/proc/self/exe")?;
@@ -221,19 +273,19 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
     atomic_install(LAUNCHER, 0o755, |file| { file.write_all(LAUNCHER_TEXT.as_bytes())?; Ok(()) })?;
     atomic_install(UNIT_PATH, 0o644, |file| { file.write_all(unit_text().as_bytes())?; Ok(()) })?;
     record_floor(version)?;
-    checked("systemctl", &["daemon-reload"])?;
+    reload_and_certify_recovery()?;
     if was_active { checked("systemctl", &["restart", UNIT])?; }
     if options.enable_now { checked("systemctl", &["enable", "--now", UNIT])?; }
     println!("已安裝原生 Linux 憑證保護服務。啟動：sudo systemctl start {UNIT}");
     println!("請由原本使用者執行，停止並停用舊的使用者服務：\nsystemctl --user stop duduclaw.service\nsystemctl --user disable duduclaw.service");
-    Ok(())
+    check_runtimes(uid, gid, options.allow_missing_runtime)
 }
 
 pub(super) fn uninstall() -> Result<()> {
     gate()?;
     let _lock = version_lock()?;
     // Validate every removal before stopping anything; never follow a replaced path.
-    for file in [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING] {
+    for file in [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING, RECOVERY_BOUND] {
         let path = Path::new(file);
         parents(path)?;
         match fs::symlink_metadata(path) {
@@ -243,7 +295,7 @@ pub(super) fn uninstall() -> Result<()> {
         }
     }
     if Path::new(UNIT_PATH).exists() { checked("systemctl", &["disable", "--now", UNIT])?; }
-    for file in [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING] {
+    for file in [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING, RECOVERY_BOUND] {
         match fs::remove_file(file) {
             Ok(()) => (),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
@@ -271,7 +323,7 @@ fn installed_executable() -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn upgrade(version: Option<&str>) -> Result<()> {
+pub(super) async fn upgrade(version: Option<&str>, allow_missing_runtime: bool) -> Result<()> {
     gate()?;
     installed_executable()?;
     let _lock = version_lock()?;
@@ -281,7 +333,7 @@ pub(super) async fn upgrade(version: Option<&str>) -> Result<()> {
     fs::set_permissions(staging.path(), fs::Permissions::from_mode(0o700))?;
     trusted(staging.path(), true)?;
     let extracted = staging.path().join("duduclaw");
-    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&extracted)?;
+    let mut file = fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&extracted)?;
     let (version, _, _) = duduclaw_gateway::updater::download_protected_release(version, &mut file)
         .await.map_err(refused)?;
     check_floor(&version, true)?;
@@ -295,13 +347,81 @@ pub(super) async fn upgrade(version: Option<&str>) -> Result<()> {
     };
     // Only bytes are installed. Never run the downloaded executable as root,
     // even for a version probe or to obtain its embedded launcher/unit.
+    invalidate_recovery_bound()?;
     prepare_version(&version)?;
     atomic_install(BINARY, 0o755, |target| {
         std::io::copy(&mut fs::File::open(&extracted)?, target)?;
         Ok(())
     })?;
+    update_text_if_different(LAUNCHER, 0o755, LAUNCHER_TEXT)?;
+    update_text_if_different(UNIT_PATH, 0o644, &unit_text())?;
+    reload_and_certify_recovery()?;
     record_floor(&version)?;
     if was_active { checked("systemctl", &["restart", UNIT])?; }
     println!("已驗證並安裝官方版本 {version}。現有資料與根金鑰保留。");
-    Ok(())
+    let (uid, gid) = account()?;
+    check_runtimes(uid, gid, allow_missing_runtime)
+}
+
+// Probe only fixed system tools after dropping every supplemental group, just
+// like the launcher. Never run the discovered CLI (or migrated files) as root.
+fn service_access(path: &Path, uid: u32, gid: u32) -> Result<bool> {
+    let uid = uid.to_string();
+    let gid = gid.to_string();
+    let path = path.to_str().ok_or_else(|| refused("non-UTF8 runtime path"))?;
+    let result = command("setpriv", &["--reuid", &uid, "--regid", &gid, "--clear-groups",
+        "--inh-caps=-all", "--bounding-set=-all", "--no-new-privs",
+        "/usr/bin/test", "-f", path, "-a", "-r", path, "-a", "-x", path])?;
+    match result.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(refused("cannot check runtime access as duduclaw")),
+    }
+}
+
+fn operator_home() -> Option<PathBuf> {
+    // SUDO_UID is used only to obtain diagnostic paths, never as authority.
+    let uid = std::env::var("SUDO_UID").ok()?.parse::<u32>().ok()?;
+    let output = command("getent", &["passwd", &uid.to_string()]).ok()?;
+    if !output.status.success() { return None; }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let home = PathBuf::from(text.trim_end().split(':').nth(5)?);
+    home.is_absolute().then_some(home)
+}
+
+fn check_runtimes(uid: u32, gid: u32, allow_missing: bool) -> Result<()> {
+    let runtimes = super::runtime::configured(Path::new("/var/lib/duduclaw/.duduclaw"))?;
+    let operator = operator_home();
+    let mut missing_primary = false;
+    for (provider, required) in runtimes {
+        let binaries = super::runtime::binary_names(&provider)?;
+        if binaries.is_empty() { continue; }
+        let mut resolution = super::runtime::Resolution::Missing;
+        for binary in &binaries {
+            // Propagate failed account probes; never mistake them for success.
+            let access_error = std::cell::RefCell::new(None);
+            let candidate = super::runtime::resolve(binary, |path| fs::canonicalize(path).ok(), |path| {
+                if duduclaw_gateway::runtime_readiness::protected_canonical_path(path).is_none() { return false; }
+                match service_access(path, uid, gid) {
+                    Ok(access) => access,
+                    Err(error) => { *access_error.borrow_mut() = Some(error); false }
+                }
+            }, operator.as_deref());
+            if let Some(error) = access_error.into_inner() { return Err(error); }
+            match candidate {
+                super::runtime::Resolution::Found(_) => { resolution = candidate; break; }
+                super::runtime::Resolution::Hidden(_) => resolution = candidate,
+                super::runtime::Resolution::Missing => (),
+            }
+        }
+        if matches!(resolution, super::runtime::Resolution::Found(_)) {
+            if provider == "claude" {
+                eprintln!("Claude CLI 已可供服務使用；登入資料不會搬移。請確認服務帳號已登入 / CLI login is not migrated; authenticate the service account if needed:\nsudo -u duduclaw -H claude auth login");
+            }
+        } else {
+            eprintln!("{}", super::runtime::missing_message(binaries[0], &resolution));
+            missing_primary |= required;
+        }
+    }
+    super::runtime::enforce(missing_primary, allow_missing)
 }

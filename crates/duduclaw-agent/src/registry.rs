@@ -137,7 +137,8 @@ impl AgentRegistry {
                     // department < per-agent. Nearest layer wins on a name
                     // collision. Agents with no (or an invalid) department only
                     // see global + local, exactly as before WP7.
-                    let dept = agent.config.agent.department.trim().to_string();
+                    let dept = crate::skill_loader::authoritative_department(&home_dir, &dir_name)
+                        .unwrap_or_default();
                     let dept_skills: Vec<SkillFile> =
                         if !dept.is_empty() && duduclaw_core::is_valid_department(&dept) {
                             if let Some(cached) = dept_skill_cache.get(&dept) {
@@ -433,189 +434,101 @@ impl AgentRegistry {
     /// - **Recursion depth capped at `MAX_DEPTH`** (currently 8) so a
     ///   misplaced symlink loop can't hang startup.
     /// - **Hidden entries skipped** (`.` prefix) — `.git`, `.DS_Store`, etc.
-    /// - **Symlink-safe**: we resolve via `tokio::fs::metadata` (follows
-    ///   symlinks once) but don't recurse into a symlinked directory whose
-    ///   target is outside `root`.
+    /// - **Symlink-safe**: root, ancestors, subdirectories and files use
+    ///   descriptor-relative no-follow access. No symlink layer is loaded.
     /// - **Errors are warned but never fatal** — a single broken file must
     ///   not stop the agent from starting.
     pub async fn load_skills(skills_dir: &Path) -> Vec<SkillFile> {
-        // Bounded BFS so we don't risk stack overflow on adversarial trees.
-        // Tuple is `(path, depth, is_top_level)`.
+        let path = skills_dir.to_path_buf();
+        match tokio::task::spawn_blocking(move || Self::load_skills_blocking(&path)).await {
+            Ok(skills) => skills,
+            Err(error) => {
+                warn!(%error, "skill scan worker failed");
+                Vec::new()
+            }
+        }
+    }
+
+    fn load_skills_blocking(skills_dir: &Path) -> Vec<SkillFile> {
+        use crate::skill_loader::safe_dir::SafeDir;
+        use std::io::Read;
         const MAX_DEPTH: usize = 8;
+        const MAX_PROMPT_BYTES: u64 = 1024 * 1024;
         let mut skills: Vec<SkillFile> = Vec::new();
-        let mut seen: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        // Resolve once so symlinked-root cases are stable. If canonicalize
-        // fails (root doesn't exist), bail with empty Vec — caller treats
-        // missing skills/ as optional.
-        let root_canonical = match tokio::fs::canonicalize(skills_dir).await {
-            Ok(p) => p,
-            Err(_) => return skills,
+        // The layer root and every ancestor are checked with lstat semantics
+        // and opened component by component with O_NOFOLLOW. Keep handles,
+        // never a canonicalize-then-reopen pathname, during the entire walk.
+        let root = match SafeDir::open(skills_dir) {
+            Ok(root) => root,
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(path = %skills_dir.display(), %error, "refused unsafe skill layer");
+                }
+                return skills;
+            }
         };
-
-        let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
-            std::collections::VecDeque::new();
-        queue.push_back((root_canonical.clone(), 0));
-
-        while let Some((dir, depth)) = queue.pop_front() {
-            if depth > MAX_DEPTH {
-                warn!(
-                    dir = %dir.display(),
-                    depth,
-                    "skill scan: max depth reached, pruning subtree"
-                );
+        let entries = match root.list() {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(%error, "skill scan: cannot list root");
+                return skills;
+            }
+        };
+        // Lazy DFS holds only one directory per depth, even in a wide library.
+        let mut stack = vec![(root, skills_dir.to_path_buf(), 0, entries.into_iter())];
+        while let Some((dir, path, depth, entries)) = stack.last_mut() {
+            let Some(name) = entries.next() else { stack.pop(); continue; };
+            if name.starts_with('.') { continue; }
+            if let Ok(child) = dir.child(&name) {
+                if *depth < MAX_DEPTH {
+                    match child.list() {
+                        Ok(entries) => {
+                            let child_path = path.join(&name);
+                            let child_depth = *depth + 1;
+                            stack.push((child, child_path, child_depth, entries.into_iter()));
+                        }
+                        Err(error) => warn!(%error, "skill scan: cannot list directory"),
+                    }
+                } else {
+                    warn!("skill scan: max directory depth reached");
+                }
                 continue;
             }
-
-            let mut entries = match fs::read_dir(&dir).await {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(dir = %dir.display(), error = %e, "skill scan: read_dir failed");
-                    continue;
+            let file_path = path.join(&name);
+            if !file_path.extension().and_then(|v| v.to_str())
+                .is_some_and(|v| v.eq_ignore_ascii_case("md")) { continue; }
+            let is_skill_md = name.eq_ignore_ascii_case("SKILL.md");
+            if *depth != 0 && !is_skill_md { continue; }
+            let skill_name = if is_skill_md {
+                path.file_name().and_then(|v| v.to_str()).unwrap_or("SKILL")
+            } else {
+                file_path.file_stem().and_then(|v| v.to_str()).unwrap_or("unknown")
+            }.to_string();
+            let result = (|| -> std::io::Result<(String, Option<i64>)> {
+                let file = dir.read_file(&name)?;
+                let metadata = file.metadata()?;
+                if metadata.len() > MAX_PROMPT_BYTES {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "skill prompt too large"));
                 }
-            };
-
-            loop {
-                let entry = match entries.next_entry().await {
-                    Ok(Some(e)) => e,
-                    Ok(None) => break,
-                    Err(e) => {
-                        warn!(error = %e, "skill scan: next_entry failed, skipping");
-                        continue;
-                    }
-                };
-
-                let path = entry.path();
-                let file_name_os = entry.file_name();
-                let file_name = match file_name_os.to_str() {
-                    Some(s) => s,
-                    None => {
-                        // Non-UTF8 filename — skip rather than panic.
-                        warn!(path = %path.display(), "skill scan: non-UTF8 file name, skipping");
-                        continue;
-                    }
-                };
-
-                // Skip hidden entries (`.git`, `.DS_Store`, dotfiles).
-                if file_name.starts_with('.') {
-                    continue;
-                }
-
-                let metadata = match tokio::fs::metadata(&path).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!(path = %path.display(), error = %e, "skill scan: metadata failed");
-                        continue;
-                    }
-                };
-
-                if metadata.is_dir() {
-                    // Symlink containment: only recurse if the resolved
-                    // path is still under the original root, so a
-                    // `skills/external -> /etc` doesn't expose unrelated
-                    // dirs. If canonicalize fails, log and skip.
-                    let resolved = match tokio::fs::canonicalize(&path).await {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!(path = %path.display(), error = %e, "skill scan: canonicalize subdir failed");
-                            continue;
-                        }
-                    };
-                    if !resolved.starts_with(&root_canonical) {
-                        warn!(
-                            path = %path.display(),
-                            resolved = %resolved.display(),
-                            "skill scan: refusing to follow symlink outside skill root"
-                        );
-                        continue;
-                    }
-                    queue.push_back((path, depth + 1));
-                    continue;
-                }
-
-                if !metadata.is_file() {
-                    continue;
-                }
-
-                let is_md = path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| ext.eq_ignore_ascii_case("md"))
-                    .unwrap_or(false);
-                if !is_md {
-                    continue;
-                }
-
-                // Decide whether this `.md` file is a skill body:
-                //   - `SKILL.md` (case-insensitive) anywhere → Anthropic
-                //     spec, skill name = parent directory name.
-                //   - Top-level `*.md` (depth == 0) → legacy flat skill,
-                //     skill name = file stem.
-                //   - Otherwise (e.g. `references/api.md`) → reference
-                //     material, NOT a separately loadable skill.
-                let is_skill_md = file_name.eq_ignore_ascii_case("SKILL.md");
-                let is_top_level_flat = depth == 0 && !is_skill_md;
-
-                let skill_name = if is_skill_md {
-                    // Use the parent directory name. Falls back to
-                    // file_stem() if the parent is somehow unreadable
-                    // (root-mounted SKILL.md — unusual but valid).
-                    path.parent()
-                        .and_then(|p| p.file_name())
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "SKILL".to_string())
-                } else if is_top_level_flat {
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown")
-                        .to_string()
-                } else {
-                    // Nested non-SKILL.md file — reference material.
-                    continue;
-                };
-
-                // De-duplicate when the same skill name shows up via
-                // both layouts (e.g. legacy `foo.md` AND `foo/SKILL.md`).
-                // Anthropic spec wins because it carries metadata.
-                let dedup_key = skill_name.to_ascii_lowercase();
-                if !is_skill_md && seen.contains(&dedup_key) {
-                    // SKILL.md form already won; skip the legacy file.
-                    continue;
-                }
-
-                let modified_unix = metadata
-                    .modified()
-                    .ok()
+                let modified = metadata.modified().ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .and_then(|d| i64::try_from(d.as_secs()).ok());
-                match fs::read_to_string(&path).await {
-                    Ok(content) => {
-                        // If we previously inserted a flat-form skill
-                        // with the same name and now found the SKILL.md
-                        // form, replace it.
-                        if is_skill_md
-                            && let Some(existing) = skills
-                                .iter_mut()
-                                .find(|s| s.name.eq_ignore_ascii_case(&skill_name))
-                        {
-                            existing.content = content;
-                            existing.modified_unix = modified_unix;
-                            seen.insert(dedup_key);
-                            continue;
-                        }
-                        seen.insert(dedup_key);
-                        skills.push(SkillFile {
-                            name: skill_name,
-                            content,
-                            modified_unix,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(path = %path.display(), error = %e, "failed to read skill file");
+                let mut content = String::new();
+                file.take(MAX_PROMPT_BYTES + 1).read_to_string(&mut content)?;
+                if content.len() as u64 > MAX_PROMPT_BYTES {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "skill prompt too large"));
+                }
+                Ok((content, modified))
+            })();
+            match result {
+                Ok((content, modified_unix)) => {
+                    if let Some(existing) = skills.iter_mut().find(|s| s.name.eq_ignore_ascii_case(&skill_name)) {
+                        if is_skill_md { existing.content = content; existing.modified_unix = modified_unix; }
+                    } else {
+                        skills.push(SkillFile { name: skill_name, content, modified_unix });
                     }
                 }
+                Err(error) => warn!(path = %file_path.display(), %error, "refused unsafe skill prompt"),
             }
         }
 
@@ -628,7 +541,6 @@ impl AgentRegistry {
 #[cfg(test)]
 mod load_skills_tests {
     use super::*;
-    use tempfile::TempDir;
 
     /// Helper to create a single skill file under `root` at the given
     /// relative path, creating parent directories as needed.
@@ -653,8 +565,17 @@ mod load_skills_tests {
     // ── Layout 1: legacy flat ────────────────────────────────────────────
 
     #[tokio::test]
+    async fn wide_skill_library_is_not_truncated_by_open_handle_budget() {
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        for index in 0..96 {
+            write_skill(tmp.path(), &format!("skill-{index:03}/SKILL.md"), "prompt");
+        }
+        assert_eq!(load(tmp.path()).await.len(), 96);
+    }
+
+    #[tokio::test]
     async fn flat_layout_loads_top_level_md_files() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         write_skill(tmp.path(), "alpha.md", "alpha body");
         write_skill(tmp.path(), "beta.md", "beta body");
         let skills = load(tmp.path()).await;
@@ -664,7 +585,7 @@ mod load_skills_tests {
 
     #[tokio::test]
     async fn missing_directory_returns_empty_not_panic() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         // Don't create the dir — load_skills must tolerate ENOENT.
         let skills = load(&tmp.path().join("nonexistent")).await;
         assert!(skills.is_empty());
@@ -672,7 +593,7 @@ mod load_skills_tests {
 
     #[tokio::test]
     async fn empty_directory_returns_empty() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let skills = load(tmp.path()).await;
         assert!(skills.is_empty());
     }
@@ -682,7 +603,7 @@ mod load_skills_tests {
     #[tokio::test]
     async fn skill_md_in_subdirectory_uses_parent_dir_as_name() {
         // Per Anthropic spec: <skill-name>/SKILL.md.
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         write_skill(
             tmp.path(),
             "pdf-extractor/SKILL.md",
@@ -696,7 +617,7 @@ mod load_skills_tests {
     #[tokio::test]
     async fn skill_md_case_insensitive() {
         // Some tooling produces `Skill.md` / `skill.md` — accept both.
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         write_skill(tmp.path(), "case-a/skill.md", "lower body");
         write_skill(tmp.path(), "case-b/Skill.md", "title body");
         let skills = load(tmp.path()).await;
@@ -706,7 +627,7 @@ mod load_skills_tests {
     #[tokio::test]
     async fn nested_non_skill_md_files_are_ignored_as_references() {
         // `references/api.md` is reference material per spec, NOT a skill.
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         write_skill(tmp.path(), "tool/SKILL.md", "skill body");
         write_skill(tmp.path(), "tool/references/api.md", "reference doc");
         write_skill(tmp.path(), "tool/scripts/notes.md", "script notes");
@@ -717,7 +638,7 @@ mod load_skills_tests {
     #[tokio::test]
     async fn deep_nested_skill_md_still_uses_immediate_parent_name() {
         // Even at depth 3, the parent dir name wins over the path.
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         write_skill(
             tmp.path(),
             "category/subcategory/my-skill/SKILL.md",
@@ -770,7 +691,7 @@ mod load_skills_tests {
 
     #[tokio::test]
     async fn flat_and_skill_md_coexist() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         write_skill(tmp.path(), "legacy.md", "legacy body");
         write_skill(tmp.path(), "modern/SKILL.md", "modern body");
         let skills = load(tmp.path()).await;
@@ -781,7 +702,7 @@ mod load_skills_tests {
     async fn skill_md_form_wins_when_same_name_present_in_both_layouts() {
         // If both `foo.md` and `foo/SKILL.md` exist, Anthropic spec wins
         // (it carries frontmatter metadata).
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         write_skill(tmp.path(), "shared.md", "FLAT VERSION");
         write_skill(tmp.path(), "shared/SKILL.md", "SKILL.md VERSION");
         let skills = load(tmp.path()).await;
@@ -794,7 +715,7 @@ mod load_skills_tests {
 
     #[tokio::test]
     async fn hidden_dirs_and_files_are_skipped() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         // Hidden dir (e.g. `.git`) — entire subtree skipped.
         write_skill(tmp.path(), ".git/SKILL.md", "should not load");
         // Hidden file at root.
@@ -807,7 +728,7 @@ mod load_skills_tests {
 
     #[tokio::test]
     async fn non_md_files_are_ignored() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         write_skill(tmp.path(), "foo/SKILL.md", "skill");
         write_skill(tmp.path(), "foo/scripts/run.py", "print('x')");
         write_skill(tmp.path(), "foo/scripts/run.js", "console.log('x')");
@@ -820,7 +741,7 @@ mod load_skills_tests {
     async fn results_are_sorted_for_stable_cache() {
         // Prompt cache hits depend on stable section ordering. The
         // returned Vec is sorted by name regardless of filesystem order.
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         write_skill(tmp.path(), "zebra.md", "z");
         write_skill(tmp.path(), "alpha.md", "a");
         write_skill(tmp.path(), "mike.md", "m");
@@ -835,7 +756,7 @@ mod load_skills_tests {
         // Build a chain depth 12 so max=8 trims it. We only need to
         // prove the loader doesn't hang or panic — exact contents
         // beyond MAX_DEPTH are an explicit non-feature.
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let mut path = String::new();
         for i in 0..12 {
             path.push_str(&format!("d{i}/"));
@@ -848,13 +769,31 @@ mod load_skills_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn all_layer_roots_and_prompt_links_are_refused() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        write_skill(&home, "outside/pdf/SKILL.md", "attacker prompt");
+        for layer in ["skills", "agents/alice/SKILLS", "shared/skills/departments/sales"] {
+            let target = home.join(layer);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            symlink(home.join("outside"), &target).unwrap();
+            assert!(AgentRegistry::load_skills(&target).await.is_empty(), "{layer}");
+        }
+        std::fs::create_dir_all(home.join("normal/pdf")).unwrap();
+        symlink(home.join("outside/pdf/SKILL.md"), home.join("normal/pdf/SKILL.md")).unwrap();
+        assert!(AgentRegistry::load_skills(&home.join("normal")).await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn external_symlink_is_not_followed() {
         // Create a symlink inside skill dir pointing OUTSIDE the root.
         // The target dir contains a SKILL.md that we must NOT load.
-        let outside = TempDir::new().unwrap();
+        let outside = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         write_skill(outside.path(), "evil/SKILL.md", "should not load");
 
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         write_skill(tmp.path(), "honest.md", "honest body");
         std::os::unix::fs::symlink(
             outside.path().join("evil"),
@@ -882,7 +821,6 @@ mod duplicate_name_scan_tests {
     //! because this last-wins collapse already discards the information they
     //! need. This module proves the collapse itself stays safe.
     use super::*;
-    use tempfile::TempDir;
 
     /// A full, deserializable `agent.toml` — anything short of every
     /// non-`#[serde(default)]` section (`agent`/`model`/`container`/
@@ -953,7 +891,7 @@ skill_security_scan = true
     /// deterministic single-entry collapse — is what's pinned here.
     #[tokio::test]
     async fn scan_survives_duplicate_agent_name_across_two_directories() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let agents_dir = tmp.path().join("agents");
         write_full_agent_toml(&agents_dir.join("sales-old"), "sales-lead");
         write_full_agent_toml(&agents_dir.join("sales-new"), "sales-lead");
@@ -984,7 +922,7 @@ skill_security_scan = true
     /// the collision path must not fire on non-duplicates.
     #[tokio::test]
     async fn scan_keeps_both_agents_when_names_differ() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let agents_dir = tmp.path().join("agents");
         write_full_agent_toml(&agents_dir.join("sales"), "sales-lead");
         write_full_agent_toml(&agents_dir.join("warehouse"), "warehouse-lead");
@@ -1002,7 +940,7 @@ skill_security_scan = true
     /// B8: `list()` is ordered by agent name, not by `HashMap` iteration.
     #[tokio::test]
     async fn list_is_ordered_by_agent_name() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let agents_dir = tmp.path().join("agents");
         for n in ["zeta", "alpha", "mike", "bravo"] {
             write_full_agent_toml(&agents_dir.join(n), n);
@@ -1017,7 +955,7 @@ skill_security_scan = true
     /// employee (from any layer) and stays loaded for everyone else.
     #[tokio::test]
     async fn switched_off_skill_is_not_loaded_for_that_employee_only() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let home = tmp.path();
         let agents_dir = home.join("agents");
         write_full_agent_toml(&agents_dir.join("alice"), "alice");
@@ -1048,7 +986,7 @@ skill_security_scan = true
     /// B8: an unreadable switch file loads no skills for that employee.
     #[tokio::test]
     async fn unreadable_switch_file_loads_no_skills() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let home = tmp.path();
         let agents_dir = home.join("agents");
         write_full_agent_toml(&agents_dir.join("alice"), "alice");
@@ -1162,7 +1100,7 @@ denied_tools = []
     /// Agent-config import: INSTRUCTIONS.md is read next to SOUL/IDENTITY.
     #[tokio::test]
     async fn instructions_md_is_loaded_into_the_agent() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let agents_dir = tmp.path().join("agents");
         let dir = write_agent(&agents_dir, "clinic-sales", AGENT_TOML);
         let loaded = AgentRegistry::load_agent(&dir).await.unwrap();
@@ -1177,7 +1115,7 @@ denied_tools = []
     /// comparing the merged-agent path against the pre-preset code path.
     #[tokio::test]
     async fn unbound_agent_loads_byte_identical_to_direct_parse() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let agents_dir = tmp.path().join("agents");
         let dir = write_agent(&agents_dir, "clinic-sales", AGENT_TOML);
 
@@ -1199,7 +1137,7 @@ denied_tools = []
     /// shadow readers (R2b).
     #[tokio::test]
     async fn bound_agent_config_reflects_the_merge_and_writes_the_resolved_artifact() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let agents_dir = tmp.path().join("agents");
         let dir = write_agent(&agents_dir, "clinic-sales", AGENT_TOML);
         write_preset(tmp.path(), "sales-followup", PRESET_TOML);
@@ -1225,7 +1163,7 @@ denied_tools = []
     /// (R1.5).
     #[tokio::test]
     async fn resolved_artifact_is_cleaned_up_when_resolution_stops_succeeding() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let agents_dir = tmp.path().join("agents");
         let dir = write_agent(&agents_dir, "clinic-sales", AGENT_TOML);
         write_preset(tmp.path(), "sales-followup", PRESET_TOML);
@@ -1256,7 +1194,7 @@ denied_tools = []
     /// air for an agent with zero binding-store history.
     #[tokio::test]
     async fn never_bound_agent_is_unbound_not_unresolved() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let agents_dir = tmp.path().join("agents");
         let dir = write_agent(&agents_dir, "clinic-sales", AGENT_TOML);
         let loaded = AgentRegistry::load_agent(&dir).await.unwrap();

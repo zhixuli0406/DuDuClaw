@@ -112,69 +112,32 @@ fn partial_primary_and_successful_fallback_book_each_leg_once() {
 }
 
 #[test]
-fn codex_collected_timeout_books_discarded_and_displayed_usage_once() {
-    let Some(home) = isolated_home("codex_collected_timeout_books_discarded_and_displayed_usage_once") else { return; };
+fn codex_refused_utility_and_employee_book_no_usage() {
+    let Some(home) = isolated_home("codex_refused_utility_and_employee_book_no_usage") else { return; };
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         crate::cost_telemetry::init_telemetry(&home).unwrap();
-        #[cfg(unix)]
-        let codex_path = {
-            use std::os::unix::fs::PermissionsExt;
-            let bin = home.join("codex");
-            std::fs::write(&bin, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'codex-cli 0.164.0'\n  exit 0\nfi\nexit 1\n").unwrap();
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-            bin.to_string_lossy().into_owned()
-        };
-        #[cfg(not(unix))]
-        let codex_path = "/never-spawn-fixture".to_owned();
-        for (agent, reply, completed, measured) in [
-            ("discarded-text", false, true, true), ("discarded-no-text", false, false, true),
-            ("reply-no-text", true, false, true), ("reply-text", true, true, true),
-            ("unmeasured", false, false, false),
-        ] {
+        for (agent, reply) in [("utility", false), ("employee", true)] {
             let call_home = home.join(agent);
             std::fs::create_dir(&call_home).unwrap();
             let mut runtimes: std::collections::HashMap<RuntimeType, Box<dyn AgentRuntime>> = std::collections::HashMap::new();
-            runtimes.insert(RuntimeType::Codex, Box::new(CodexRuntime { codex_path: codex_path.clone() }));
+            runtimes.insert(RuntimeType::Codex, Box::new(CodexRuntime { codex_path: "/never-spawn-fixture".into() }));
             let _registry = runtime_dispatch::testing::RegistryGuard::install(&call_home, RuntimeRegistry::with_runtimes(runtimes)).await;
-            let probe: Box<dyn Fn(&tokio::process::Command) -> Result<CodexOutput, String> + Send + Sync> = Box::new(move |_| {
-                let mut output = CodexOutput::default();
-                if completed {
-                    output.stdout_bytes(b"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"PASS\"}}\n");
-                }
-                if measured {
-                    output.stdout_bytes(b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":31,\"output_tokens\":37}}\n");
-                }
-                Ok(output)
-            });
-            // The utility profile avoids all employee MCP/config preparation.
-            // CHANNEL_REPLY_PARTIAL still loses to UTILITY_CALL, so only the
-            // display case uses the normal producer with an employee directory.
+            let probe: Box<dyn Fn(&tokio::process::Command) -> Result<CodexOutput, String> + Send + Sync> = Box::new(|_| panic!("refused Codex must not collect output"));
             let settings = RuntimeSettings::default();
             let mut req = request(&call_home, agent, &settings);
             if reply { req.agent_dir = Some(&call_home); }
             req.request_type = if reply { RequestType::Chat } else { RequestType::Evolution };
             let call = super::tests::COLLECT_PROBE.scope(probe,
                 runtime_dispatch::run_agent_prompt_detailed(req));
-            let result = if reply {
-                crate::runtime::ROLE_COST_ATTRIBUTION.scope(
-                    RoleCostAttribution { role: "worker", episode_id: "collector-task".into() },
-                    runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), call),
-                ).await
-            } else { runtime_dispatch::UTILITY_CALL.scope((), call).await };
-            if reply && completed {
-                let response = result.unwrap();
-                assert_eq!(response.content, "PASS");
-                assert_eq!(response.partial_timeout_secs, Some(300));
-            } else {
-                let error = result.unwrap_err().legacy_message();
-                assert!(error.contains(if reply { "no completed output" } else { "partial output discarded" }), "{error}");
-            }
-            let usage = rows(&home, agent);
-            assert_eq!(usage.len(), usize::from(measured), "{agent}: {usage:?}");
-            if measured {
-                assert_eq!((&*usage[0].0, &*usage[0].1, usage[0].2, usage[0].3),
-                    (if reply { "chat" } else { "evolution" }, "gpt-5.4", 31, 37));
-            }
+            let layer = call_home.join("managed_config.toml");
+            std::fs::write(&layer, "[mcp_servers.native]\ncommand='unsafe'\n").unwrap();
+            let result = super::MCP_CONFIG_TEST_PATHS.scope(vec![layer], async { if reply {
+                runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), call).await
+            } else { runtime_dispatch::UTILITY_CALL.scope((), call).await } }).await;
+            let error = result.unwrap_err().legacy_message();
+            assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{error}");
+            assert!(error.contains("managed_config.toml"), "{error}");
+            assert!(rows(&home, agent).is_empty(), "refusal must not book usage");
         }
     });
 }

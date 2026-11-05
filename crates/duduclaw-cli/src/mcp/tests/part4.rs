@@ -213,18 +213,18 @@ fn delegation_context_from_env() {
         std::env::set_var(duduclaw_core::ENV_DELEGATION_ORIGIN, "main-agent");
         std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, "researcher");
     }
-    let ctx = DelegationContext::from_env();
+    let ctx = DelegationContext::from_env(Path::new("/nonexistent-delegation-home"), "tester");
     clear_delegation_env();
-    assert_eq!(ctx.depth, 3);
-    assert_eq!(ctx.origin.as_deref(), Some("main-agent"));
+    assert_eq!(ctx.depth, duduclaw_core::MAX_DELEGATION_DEPTH);
+    assert!(ctx.origin.is_none());
 }
 
 #[test]
 fn delegation_context_from_env_defaults() {
     let _lock = ENV_LOCK.lock().unwrap();
     clear_delegation_env();
-    let ctx = DelegationContext::from_env();
-    assert_eq!(ctx.depth, 0);
+    let ctx = DelegationContext::from_env(Path::new("/nonexistent-delegation-home"), "tester");
+    assert_eq!(ctx.depth, duduclaw_core::MAX_DELEGATION_DEPTH);
     assert!(ctx.origin.is_none());
 }
 
@@ -236,9 +236,9 @@ fn delegation_context_from_env_empty_strings() {
         std::env::set_var(duduclaw_core::ENV_DELEGATION_ORIGIN, "");
         std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, "");
     }
-    let ctx = DelegationContext::from_env();
+    let ctx = DelegationContext::from_env(Path::new("/nonexistent-delegation-home"), "tester");
     clear_delegation_env();
-    assert_eq!(ctx.depth, 0);
+    assert_eq!(ctx.depth, duduclaw_core::MAX_DELEGATION_DEPTH);
     assert!(ctx.origin.is_none(), "Empty string should filter to None");
 }
 
@@ -248,9 +248,9 @@ fn delegation_context_from_env_invalid_depth() {
     unsafe {
         std::env::set_var(duduclaw_core::ENV_DELEGATION_DEPTH, "not_a_number");
     }
-    let ctx = DelegationContext::from_env();
+    let ctx = DelegationContext::from_env(Path::new("/nonexistent-delegation-home"), "tester");
     clear_delegation_env();
-    assert_eq!(ctx.depth, 0, "Invalid depth should default to 0");
+    assert_eq!(ctx.depth, duduclaw_core::MAX_DELEGATION_DEPTH);
 }
 
 // ── WP-A10 BUG-1 regression: execution attribution vs. delegation sender ──
@@ -259,7 +259,7 @@ fn delegation_context_from_env_invalid_depth() {
 // ids — they name who *dispatched* the work (goal-loop/cron/heartbeat/
 // autopilot/dashboard/webhook), never who is *executing* a tool call —
 // and fall back to the executing agent's own identity. A genuine
-// agent-to-agent delegation sender must still be honoured verbatim.
+// agent-to-agent delegation sender requires a worker-bound host signature.
 // See wiki/reports/memory-quality/2026-08/wp-a10-live-test-2026-08-06.md
 // §1 BUG-1: before this fix every goal-loop worker's tool call was
 // recorded under `goal-loop-driver`, permanently starving A3/A4
@@ -273,7 +273,7 @@ fn resolve_audit_agent_ignores_every_system_sender() {
             std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, sender);
         }
         assert_eq!(
-            resolve_audit_agent(|| "tester".to_string()),
+            resolve_audit_agent(std::path::Path::new("/nonexistent-audit-home"), Some(&audit_test_principal("gateway-internal", false)), "tester"),
             "tester",
             "system sender {sender:?} must not be stamped as the executing agent"
         );
@@ -282,16 +282,16 @@ fn resolve_audit_agent_ignores_every_system_sender() {
 }
 
 #[test]
-fn resolve_audit_agent_honours_real_delegation_sender() {
+fn resolve_audit_agent_rejects_unsigned_delegation_sender() {
     let _lock = ENV_LOCK.lock().unwrap();
     unsafe {
         std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, "researcher");
     }
-    let resolved = resolve_audit_agent(|| "tester".to_string());
+    let resolved = resolve_audit_agent(std::path::Path::new("/nonexistent-audit-home"), Some(&audit_test_principal("gateway-internal", false)), "tester");
     clear_delegation_env();
     assert_eq!(
-        resolved, "researcher",
-        "a real agent-to-agent delegation sender must still be stamped verbatim"
+        resolved, "tester",
+        "an unsigned sender must not override the verified employee"
     );
 }
 
@@ -299,11 +299,11 @@ fn resolve_audit_agent_honours_real_delegation_sender() {
 fn resolve_audit_agent_falls_back_when_sender_absent_or_empty() {
     let _lock = ENV_LOCK.lock().unwrap();
     clear_delegation_env();
-    assert_eq!(resolve_audit_agent(|| "tester".to_string()), "tester");
+    assert_eq!(resolve_audit_agent(std::path::Path::new("/nonexistent-audit-home"), Some(&audit_test_principal("gateway-internal", false)), "tester"), "tester");
     unsafe {
         std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, "");
     }
-    assert_eq!(resolve_audit_agent(|| "tester".to_string()), "tester");
+    assert_eq!(resolve_audit_agent(std::path::Path::new("/nonexistent-audit-home"), Some(&audit_test_principal("gateway-internal", false)), "tester"), "tester");
     clear_delegation_env();
 }
 
@@ -319,7 +319,7 @@ async fn goal_loop_driver_sender_attributes_tool_call_to_worker_not_driver() {
     unsafe {
         std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, "goal-loop-driver");
     }
-    let line = dispatch_pairing_manage_list_and_read_audit_line("tester").await;
+    let line = dispatch_pairing_manage_list_and_read_audit_line("tester", None).await;
     clear_delegation_env();
 
     let rec: serde_json::Value = serde_json::from_str(&line).expect("valid JSONL");
@@ -341,7 +341,7 @@ async fn cron_sender_attributes_tool_call_to_worker_not_cron() {
     unsafe {
         std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, "cron");
     }
-    let line = dispatch_pairing_manage_list_and_read_audit_line("tester").await;
+    let line = dispatch_pairing_manage_list_and_read_audit_line("tester", None).await;
     clear_delegation_env();
 
     let rec: serde_json::Value = serde_json::from_str(&line).expect("valid JSONL");
@@ -353,16 +353,15 @@ async fn cron_sender_attributes_tool_call_to_worker_not_cron() {
 }
 
 /// A real agent-to-agent delegation must be unaffected: the sender IS the
-/// actual caller in that case, so it is still what gets stamped — this is
-/// the behaviour the pre-fix code already had for non-system senders, and
-/// must not regress.
+/// caller when the host vouches for the sender and worker together. Exercise
+/// the real gateway signing helper and tool dispatch before reading the audit.
 #[tokio::test(flavor = "current_thread")]
 async fn real_delegation_sender_still_attributes_tool_call_to_sender() {
     let _lock = ENV_LOCK.lock().unwrap();
     unsafe {
         std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, "researcher");
     }
-    let line = dispatch_pairing_manage_list_and_read_audit_line("tester").await;
+    let line = dispatch_pairing_manage_list_and_read_audit_line("tester", Some("researcher")).await;
     clear_delegation_env();
 
     let rec: serde_json::Value = serde_json::from_str(&line).expect("valid JSONL");
@@ -637,4 +636,56 @@ async fn agent_update_stop_with_background_edits_always_drains_admissions() {
             "sales-rep2",
         );
     }
+}
+
+#[test]
+fn resolve_audit_agent_requires_worker_bound_host_proof() {
+    use duduclaw_core::identity_token::{mint_delegation_context, ENV_DELEGATION_CONTEXT};
+    let _lock = ENV_LOCK.lock().unwrap();
+    let home = TempDir::new();
+    let key = zeroize::Zeroizing::new(duduclaw_core::identity_token::ensure_key(home.path()).unwrap());
+    let internal = audit_test_principal("gateway-internal", false);
+    let external = audit_test_principal("standalone-test", true);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let run = std::env::var(duduclaw_core::ENV_DISPATCH_RUN_ID).ok();
+    let task = std::env::var(duduclaw_core::ENV_TASK_ID).ok();
+    let turn = std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).ok();
+    let binding = duduclaw_core::identity_token::delegation_run_binding(run.as_deref(), task.as_deref(), turn.as_deref());
+    unsafe {
+        std::env::set_var(duduclaw_core::ENV_AGENT_ID, "tester");
+        std::env::set_var(duduclaw_core::ENV_AGENT_TOKEN, duduclaw_core::mint_identity_token(&key, "tester"));
+        std::env::set_var(duduclaw_core::ENV_DELEGATION_SENDER, "forged-parent");
+        std::env::set_var(duduclaw_core::ENV_DELEGATION_DEPTH, "0");
+        std::env::set_var(duduclaw_core::ENV_DELEGATION_ORIGIN, "forged-origin");
+    }
+    for (worker, expiry, signed, expected) in [
+        ("tester", now + 60, false, "tester"),
+        ("other-worker", now + 60, true, "tester"),
+        ("tester", now - 1, true, "tester"),
+        ("tester", now + 60, true, "researcher"),
+    ] {
+        let token = if signed {
+            mint_delegation_context(&key, worker, "researcher", "researcher", 2, binding.as_deref(), expiry).unwrap()
+        } else { String::new() };
+        unsafe { std::env::set_var(ENV_DELEGATION_CONTEXT, token); }
+        assert_eq!(resolve_audit_agent(home.path(), Some(&internal), "tester"), expected);
+        assert_eq!(resolve_audit_agent(home.path(), Some(&external), "tester"), "standalone-test");
+        // Authorization and the ephemeral parent remain the actual worker,
+        // including when valid attribution names a more privileged employee.
+        assert_eq!(resolve_authorizing_agent(home.path(), Some(&internal), "tester"), "tester");
+        let ctx = DelegationContext::from_env(home.path(), "tester");
+        if expected == "researcher" {
+            assert_eq!(ctx.depth, 2);
+            assert_eq!(ctx.origin.as_deref(), Some("researcher"));
+        } else {
+            assert_eq!(ctx.depth, duduclaw_core::MAX_DELEGATION_DEPTH);
+        }
+    }
+    unsafe { std::env::set_var(duduclaw_core::ENV_AGENT_TOKEN, "forged"); }
+    assert_eq!(resolve_audit_agent(home.path(), Some(&internal), "tester"), "tester");
+    unsafe {
+        std::env::remove_var(duduclaw_core::ENV_AGENT_ID);
+        std::env::remove_var(duduclaw_core::ENV_AGENT_TOKEN);
+    }
+    clear_delegation_env();
 }

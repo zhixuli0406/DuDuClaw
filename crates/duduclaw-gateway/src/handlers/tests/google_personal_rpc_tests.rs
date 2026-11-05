@@ -79,7 +79,7 @@ impl PrimaryProfileFixture {
             )
             .await;
         handler
-            .set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise))
+            .set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise))
             .await;
         let admin_ctx = db.live_user_context(&admin.id).unwrap().unwrap();
         payload(
@@ -329,7 +329,7 @@ async fn personal_rpc_self_consent_owner_change_and_legacy_session_are_enforced(
         Arc::new(JwtConfig::new(b"fixture-signing-key-32-bytes-only")),
     )
     .await;
-    h.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise))
+    h.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise))
         .await;
     let alice_ctx = db.live_user_context(&alice.id).unwrap().unwrap();
     let admin_ctx = db.live_user_context(&admin.id).unwrap().unwrap();

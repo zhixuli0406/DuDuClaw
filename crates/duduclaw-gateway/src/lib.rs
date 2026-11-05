@@ -60,6 +60,7 @@ pub fn validate_mfa_import_policy(home: &std::path::Path, after: &str, personal:
 }
 
 pub mod a2a_signing;
+mod a2a;
 pub mod access_control;
 pub mod group_context;
 pub mod agent_binding;
@@ -71,6 +72,7 @@ pub mod workflow_draft_context;
 pub mod workflow_drafts;
 // ── D7: "every Claude account failed authentication" alarm bell ──────────
 pub mod auth_outage;
+pub(crate) mod employee_health;
 // ── WP-B: appliance-image device management (`device.*` dashboard RPCs) ──
 pub mod device;
 // ── System-settings app: `device.about` / `device.timedate*` data ─────────
@@ -132,6 +134,8 @@ pub mod google_personal;
 pub mod google_service_account;
 pub mod google_workspace;
 pub mod googlechat;
+pub mod googlechat_pubsub;
+mod googlechat_inbox;
 pub mod googlechat_agents;
 pub mod killswitch_triggers;
 pub mod markdown_render;
@@ -177,6 +181,7 @@ mod image_data;
 pub mod license_runtime;
 pub mod license_seed;
 pub mod license_serve;
+pub mod license_transport;
 pub mod notify_digest;
 pub mod notify_governance;
 // O5 — `push(card, dest)`: the single outbound entry the four notification
@@ -187,6 +192,7 @@ pub(crate) mod notify_push;
 pub mod notify_stats;
 pub mod posture_watch;
 pub mod premium_templates;
+pub mod company_templates;
 pub mod security_autopilot;
 pub mod security_rules_seed;
 pub mod takeover;
@@ -357,6 +363,7 @@ pub mod failover;
 pub mod fault_attribution;
 pub mod feishu;
 pub mod files_api;
+pub(crate) mod chat_attachments;
 pub(crate) mod fs_safe;
 pub mod governance;
 pub mod gvu;
@@ -409,6 +416,7 @@ pub mod search_index;
 pub mod secret_redact;
 pub mod server;
 mod mfa;
+mod mfa_email;
 pub mod session;
 pub mod session_origin;
 pub mod session_portability;
@@ -489,6 +497,7 @@ pub mod night_llm;
 // record shape + window filter, used by both `dispatch_engine` (judge
 // evidence block) and `prediction::task_observe` (A3 observation layer).
 pub mod recent_actions;
+pub(crate) mod recent_skills;
 pub mod tool_activity;
 
 // WP-F (P2-c): durable per-task file-change evidence behind the dashboard's
@@ -632,7 +641,10 @@ pub mod role_turns;
 pub mod team_composer;
 
 pub mod data_exports;
+pub mod compliance;
 pub mod product_policy;
+pub mod runtime_readiness;
+mod protected_policy_audit;
 
 /// Thinking display: the normalised `ThinkingEvent`, the per-turn sink and
 /// gate (masking, truncation, CONTRACT checks) and the display policy.
@@ -654,6 +666,8 @@ mod egress_registry;
 pub(crate) mod live_events;
 
 pub(crate) mod user_invites;
+pub(crate) mod company_info;
+mod invitation_email;
 
 /// Gateway-owned meeting transcription execution.
 pub mod meeting_transcription;

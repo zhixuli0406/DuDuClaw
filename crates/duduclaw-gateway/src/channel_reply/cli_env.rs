@@ -227,33 +227,17 @@ pub(super) async fn spawn_claude_cli_with_env(
         crate::agent_hook_installer::ensure_spawn_hook_settings(home_dir, dir, &bin).await?;
         cmd.current_dir(dir);
 
-        // --bare disables .mcp.json auto-discovery, so explicitly specify it.
-        // --strict-mcp-config ensures no ambient global MCP leaks into agent context.
-        let mcp_json = dir.join(".mcp.json");
-        if mcp_json.exists() {
-            // RFC-23 §13.6: external MCP servers are launched by the Claude
-            // CLI, so their tool results never pass DuDuClaw's MCP choke
-            // point. With redaction active, hand the CLI a rewritten config
-            // that routes each of them through `duduclaw mcp-proxy` instead.
-            // `None` (redaction off / nothing to proxy) ⇒ byte-identical.
-            // In the explore lane third-party servers are proxied too, so
-            // they list and run only read tools (`crate::explore_lane`).
-            // A gate that is needed but cannot be built refuses the spawn
-            // (2026-10-08 close-out) instead of handing the CLI the ungated
-            // file.
-            _mcp_proxy_guard = crate::redaction_proxy::maybe_proxy_mcp_config_in_lane(
-                home_dir,
-                &mcp_json,
-                crate::explore_lane::in_explore(),
-            )?;
-            match _mcp_proxy_guard.as_ref() {
-                Some(proxied) => cmd.args(["--mcp-config", &proxied.to_string_lossy()]),
-                None => cmd.args(["--mcp-config", &mcp_json.to_string_lossy()]),
-            };
-            cmd.arg("--strict-mcp-config");
-        } else {
-            _mcp_proxy_guard = None;
-        }
+        // Use the same frozen, per-child signed context as dispatcher spawns.
+        // Channel/dashboard roots have no DELEGATION_ENV and start at depth 0.
+        _mcp_proxy_guard = match crate::claude_runner::signed_mcp_config_cli_args(
+            home_dir, Some(dir), Some(dir), None,
+        )? {
+            Some((args, guard)) => {
+                cmd.args(&args);
+                guard
+            }
+            None => None,
+        };
     } else {
         _mcp_proxy_guard = None;
     }

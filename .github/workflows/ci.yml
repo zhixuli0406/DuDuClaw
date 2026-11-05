@@ -142,6 +142,12 @@ jobs:
       # `--features otel` could not compile on macOS or Windows at all (H7 in
       # the feature audit moved them into the plain `[dependencies]` table;
       # verified locally on aarch64-apple-darwin the same day).
+      - name: Verify edition ceiling in release artifacts with assertions
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: 'true'
+        run: cargo test --locked --release -p duduclaw-core --test edition_license_ceiling
+
       - name: Test gateway Discord voice TLS transport
         # Songbird is an existing Linux-only dependency. Exercise its Serenity
         # bridge so the security transport backport cannot silently rot.
@@ -325,6 +331,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_*distributor*.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_release_delivery.py' -v
           python3 -m unittest discover -s scripts/tests -p 'test_release_pro_gate.py' -v
+          python3 -m unittest discover -s scripts/tests -p 'test_release_edition_guard.py' -v
           bash -n scripts/release.sh
 
   security:

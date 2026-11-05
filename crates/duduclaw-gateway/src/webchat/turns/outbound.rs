@@ -168,7 +168,7 @@ impl OutboundReceiver {
                 biased;
                 Some(frame) = self.terminal.recv() => self.terminals.push_back(frame),
                 Some(frame) = self.control.recv() => return Some(frame.frame),
-                progress = self.progress.recv(), if !self.control.is_closed() => return Some(Outbound { identity_notice: None,
+                progress = self.progress.recv(), if !self.control.is_closed() => return Some(Outbound { route: None, identity_notice: None,
                     message: progress.message, ack: None, deadline: None,
                 }),
                 else => return None,
@@ -181,7 +181,7 @@ impl OutboundReceiver {
 pub(in crate::webchat) struct SocketSender(pub(in crate::webchat) OutboundSender);
 impl SocketSender {
     pub(in crate::webchat) async fn send(&mut self, message: Message) -> Result<(), ()> {
-        self.0.send(Outbound { identity_notice: None, message, ack: None, deadline: None }).await
+        self.0.send(Outbound { route: None, identity_notice: None, message, ack: None, deadline: None }).await
     }
 }
 
@@ -207,13 +207,19 @@ pub(in crate::webchat) struct TurnSink {
     conv: Option<String>,
     pub(in crate::webchat) msg_id: String,
     wait_ack: bool,
+    route: Option<subscriptions::Route>,
     pub(in crate::webchat) progress_dropped: Arc<AtomicU64>,
 }
 
 impl TurnSink {
     pub(in crate::webchat) fn new(tx: OutboundSender, sid: &str, conv: Option<String>, msg_id: &str) -> Self {
-        Self { tx, sid: sid.into(), conv, msg_id: msg_id.into(), wait_ack: false,
+        Self { tx, sid: sid.into(), conv, msg_id: msg_id.into(), wait_ack: false, route: None,
             progress_dropped: Arc::new(AtomicU64::new(0)) }
+    }
+
+    pub(super) fn routed(mut self, route: subscriptions::Route) -> Self {
+        self.route = Some(route);
+        self
     }
 
     pub(in crate::webchat) fn acknowledged(mut self) -> Self {
@@ -228,7 +234,7 @@ impl TurnSink {
         if validity != crate::handlers::live_context::SocketValidity::Unavailable { return; }
         self.tx.finish_progress(&self.progress_dropped);
         let notice = IdentityUnavailable::new(&self.sid, self.conv.clone(), &self.msg_id, admission);
-        let frame = Outbound {
+        let frame = Outbound { route: self.route.clone(),
             message: notice.message(), identity_notice: Some(notice), ack: None,
             deadline: Some(tokio::time::Instant::now() + SEND_TIMEOUT),
         };
@@ -244,7 +250,7 @@ impl TurnSink {
         // Refusals and cleanup also hold the FIFO ticket. A saturated writer
         // must not keep them waiting indefinitely or discard their only terminal
         // when identity becomes temporarily unavailable before delivery.
-        let _ = self.tx.send_owned(Outbound {
+        let _ = self.tx.send_owned(Outbound { route: self.route.clone(),
             identity_notice: terminal.then(|| IdentityUnavailable::new(&self.sid, self.conv.clone(), &self.msg_id, false)),
             message: self.envelope(value), ack: None,
             deadline: Some(tokio::time::Instant::now() + SEND_TIMEOUT),
@@ -279,7 +285,7 @@ impl TurnSink {
             }
             let terminal = is_terminal(&value);
             if !self.wait_ack || is_redaction(&value) {
-                return self.tx.send_owned(Outbound {
+                return self.tx.send_owned(Outbound { route: self.route.clone(),
                     identity_notice: terminal.then(|| IdentityUnavailable::new(&self.sid, self.conv.clone(), &self.msg_id, false)),
                     message: self.envelope(value), ack: None,
                     deadline: Some(tokio::time::Instant::now() + SEND_TIMEOUT),
@@ -287,7 +293,7 @@ impl TurnSink {
             }
             let (ack, received) = oneshot::channel();
             let deadline = tokio::time::Instant::now() + SEND_TIMEOUT;
-            self.tx.send_owned(Outbound {
+            self.tx.send_owned(Outbound { route: self.route.clone(),
                 identity_notice: terminal.then(|| IdentityUnavailable::new(&self.sid, self.conv.clone(), &self.msg_id, false)),
                 message: self.envelope(value), ack: Some(ack), deadline: Some(deadline),
             }, Some(self.progress_dropped.clone()), terminal).await?;
@@ -379,10 +385,10 @@ mod tests {
     async fn full_control_lane_backpressures_without_dropping_controls() {
         let (tx, mut rx) = outbound_channel();
         for _ in 0..CONTROL_CAPACITY {
-            tx.send(Outbound { identity_notice: None, message: Message::Ping(vec![].into()), ack: None, deadline: None }).await.unwrap();
+            tx.send(Outbound { route: None, identity_notice: None, message: Message::Ping(vec![].into()), ack: None, deadline: None }).await.unwrap();
         }
         let next = tokio::spawn(async move {
-            tx.send(Outbound { identity_notice: None, message: Message::Pong(vec![].into()), ack: None, deadline: None }).await
+            tx.send(Outbound { route: None, identity_notice: None, message: Message::Pong(vec![].into()), ack: None, deadline: None }).await
         });
         tokio::task::yield_now().await;
         assert!(!next.is_finished());
@@ -495,10 +501,10 @@ mod tests {
         let (tx, mut rx) = outbound_channel();
         // Queue a frame whose deadline expires while the writer stalls.
         let (ack, received_expired) = oneshot::channel();
-        tx.send(Outbound { identity_notice: None, message: Message::Text("expired".into()), ack: Some(ack),
+        tx.send(Outbound { route: None, identity_notice: None, message: Message::Text("expired".into()), ack: Some(ack),
             deadline: Some(tokio::time::Instant::now() + SEND_TIMEOUT) }).await.unwrap();
         tokio::time::advance(SEND_TIMEOUT).await;
-        tx.send(Outbound { identity_notice: None, message: Message::Text("live".into()), ack: None, deadline: None }).await.unwrap();
+        tx.send(Outbound { route: None, identity_notice: None, message: Message::Text("live".into()), ack: None, deadline: None }).await.unwrap();
         drop(tx);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let captured = sent.clone();
@@ -550,7 +556,7 @@ mod tests {
         });
         let task = tokio::spawn(async move {
             let mut writer = BoundedSocketSink(Box::pin(stalled));
-            Outbound { identity_notice: None, message: Message::Text("partial".into()), ack: Some(ack),
+            Outbound { route: None, identity_notice: None, message: Message::Text("partial".into()), ack: Some(ack),
                 deadline: Some(tokio::time::Instant::now() + SEND_TIMEOUT) }.deliver(&mut writer).await
         });
         polled.notified().await;

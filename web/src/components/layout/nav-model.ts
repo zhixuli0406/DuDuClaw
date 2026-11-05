@@ -318,6 +318,7 @@ export const navGroups: NavGroup[] = [
       // G11 Work Timeline — company-level Gantt of every AI staff member's runs.
       { to: '/timeline', icon: ChartGantt, label: 'nav.timeline', desc: 'nav.timeline.desc', minRole: 'manager' },
       { to: '/reports', icon: BarChart3, label: 'nav.reports', desc: 'nav.reports.desc', minRole: 'manager' },
+      { to: '/employee-health', icon: Activity, label: 'nav.employeeHealth', desc: 'nav.employeeHealth.desc', minRole: 'manager', newIn: '1.80.0' },
       // LLM→LWM loop view (2026-08-14) — predict→act→observe→score per task,
       // with the query-time skill verdict. RPCs are manager-gated.
       { to: '/foresight', icon: RadarIcon, label: 'nav.foresight', desc: 'nav.foresight.desc', minRole: 'manager', newIn: '1.58.0' },
@@ -376,6 +377,7 @@ export const navGroups: NavGroup[] = [
       // wiki tab of 記憶 (App.tsx) — this page lives at `/knowledge-base`.
       { to: '/knowledge-base', icon: Library, label: 'nav.knowledgeBase', desc: 'nav.knowledgeBase.desc', newIn: '1.76.0' },
       staffEntry,
+      { to: '/templates', icon: Library, label: 'nav.templates', desc: 'nav.templates.desc', minRole: 'admin', newIn: '1.80.0' },
       { to: '/world', icon: Globe2, label: 'nav.world', desc: 'nav.world.desc', ownScope: true },
       // 成長 lifted above the occasional rows (WP-NAV, 2026-08-12): the matrix
       // (10-ia-scatter-audit.md §4) grades it 高頻・低重要 — people open it
@@ -421,6 +423,8 @@ export const navGroups: NavGroup[] = [
       { to: '/me/account', icon: KeyRound, label: 'nav.account', desc: 'nav.account.desc', ownScope: true, newIn: '1.78.0' },
       { to: '/my/history-views', icon: Eye, label: 'nav.myHistoryViews', desc: 'nav.myHistoryViews.desc', ownScope: true, enterprise: true, newIn: '1.76.0' },
       manageEntry,
+      { to: '/app/system/settings/company', icon: Building2, label: 'companyInfo.title', desc: 'companyInfo.description', minRole: 'admin', newIn: '1.80.0' },
+      { to: '/app/system/settings/advanced', icon: Settings, label: 'advancedSettings.title', desc: 'advancedSettings.description', minRole: 'admin', newIn: '1.80.0' },
       // 關於 — brand info + fixed upstream-vendor block. Open to every user.
       { to: '/about', icon: Info, label: 'nav.about', desc: 'nav.about.desc' },
     ],
@@ -477,15 +481,18 @@ export function isEmployeeSidebar(role: UserRole | undefined, isPersonal: boolea
   return role === 'employee' && !isPersonal;
 }
 
-/** Existing pages, reordered for employees without advertising them as new features. */
+/** Employee destinations; only newly available pages carry the release badge. */
 export function employeeNavItems(employeeTasks = false): NavItem[] {
   const items = [
     ...pickItems(['/']),
     inboxEntry,
+    { to: '/routines', icon: CalendarClock, label: 'nav.automations', desc: 'nav.automations.desc', ownScope: true, newIn: '1.80.0' },
     ...pickItems(['/skills', '/memory', '/world']),
+    { to: '/org', icon: Users2, label: 'nav.org', desc: 'nav.org.desc', ownScope: true, newIn: '1.80.0' },
     ...(employeeTasks ? pickItems(['/tasks', '/goals', '/responsibilities', '/foresight']) : []),
   ];
   return filterVisible(items, 'employee', false).map((item) => {
+    if (item.newIn === '1.80.0') return item;
     const { newIn: _newIn, ...existingPage } = item;
     return existingPage;
   });
@@ -522,6 +529,7 @@ export const personalPrimaryItems: NavItem[] = pickItems([
   // leaving it in both places would render the row twice). 22 ready-made
   // industry teams were previously undiscoverable on Personal: admin-gated
   // AND buried at the bottom of a collapsed group (design doc walkthrough 5).
+  '/templates',
   '/experts',
   // 靈感畫廊 (P2-b, curated MVP, 2026-08-15) — right after 「AI 團隊」 on Personal
   // too, same pairing rationale as the Enterprise 公司 group above.
@@ -563,6 +571,7 @@ export const personalAdvancedGroup: NavGroup = {
     '/mail',
     '/timeline',
     '/reports',
+    '/employee-health',
     '/forks',
     '/os',
     // 職務組合（WP-7I 2026-08-16）— same slot as its Enterprise `/os` neighbour.
@@ -773,12 +782,10 @@ export function crumbsFor(pathname: string): Array<{ labelId: string; to?: strin
   // just points here now), `device` lives in `navGroups` instead (it was
   // never a 管理 row). Check both so every migrated page still gets a trail
   // instead of silently falling through to the empty-array default below.
-  if (pathname.startsWith('/app/system')) {
-    const fromManage = allManageNav.find((i) => pathname.startsWith(i.to));
-    const fromNav = navGroups
-      .flatMap((g) => g.items)
-      .find((i) => i.to !== '/' && pathname.startsWith(i.to));
-    const item = fromManage ?? fromNav;
+  if (pathname === '/app/system' || pathname.startsWith('/app/system/')) {
+    const item = [...allManageNav, ...navGroups.flatMap((g) => g.items)]
+      .filter((entry) => pathname === entry.to || pathname.startsWith(`${entry.to}/`))
+      .sort((a, b) => b.to.length - a.to.length)[0];
     return [
       { labelId: 'app.system.name', to: '/app/system' },
       ...(item ? [{ labelId: item.crumb ?? item.label }] : []),

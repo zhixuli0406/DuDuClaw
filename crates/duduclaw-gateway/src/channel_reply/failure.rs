@@ -113,3 +113,35 @@ pub(super) fn conversation_outcome_evidence(
     }
 }
 
+
+// Transport adapters need a typed failure signal without parsing user-facing text.
+tokio::task_local! {
+    static FAILURE_OBSERVER: std::sync::Arc<std::sync::atomic::AtomicBool>;
+}
+
+pub(crate) async fn track_failure<F: std::future::Future>(work: F) -> (F::Output, bool) {
+    let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let result = FAILURE_OBSERVER.scope(failed.clone(), work).await;
+    (result, failed.load(std::sync::atomic::Ordering::Acquire))
+}
+
+pub(super) fn mark_runtime_failure() {
+    let _ = FAILURE_OBSERVER.try_with(|failed| failed.store(true, std::sync::atomic::Ordering::Release));
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runtime_failure_signal_is_scoped_without_changing_the_reply() {
+        let (reply, failed) = track_failure(async {
+            mark_runtime_failure();
+            "existing user-facing failure"
+        }).await;
+        assert!(failed);
+        assert_eq!(reply, "existing user-facing failure");
+        let (_, failed) = track_failure(async { "ordinary reply" }).await;
+        assert!(!failed);
+    }
+}

@@ -6,45 +6,31 @@
 //! mcp-server`. Tools of the other servers in an employee's `.mcp.json` never
 //! pass that server; DuDuClaw sees them only where it sits in the stream:
 //!
-//! - `duduclaw mcp-proxy` (stdio servers, `duduclaw-cli/src/mcp_proxy.rs`),
-//!   put in the path by the spawn-time rewrite when redaction is active, when
-//!   the employee has `[capabilities] action_rules`, or in the explore lane;
-//!   for Codex always (2026-10-19, `runtime/codex/third_party.rs`), because
-//!   Codex auto-approves the servers it is given; for Grok and
-//!   the in-process tool loop (openai-compat, Direct API, local inference)
-//!   always too (2026-10-20, `runtime/third_party_mcp.rs`), Grok as `--spawn-scoped` proxies in their persistent configs;
-//! - `duduclaw mcp-remote-bridge` (remote servers,
-//!   [`crate::remote_mcp::bridge`]), always in the path for them.
+//! - `duduclaw mcp-proxy` for stdio `.mcp.json` servers on every managed
+//!   runtime spawn, regardless of redaction, action rules or explore mode;
+//! - `duduclaw mcp-remote-bridge` for operator-connected remote servers;
+//! - `egress_registry::RegistryBoundary` for `agent.toml [[mcp.external]]`
+//!   stdio, HTTP and scoped Google mounts in the in-process tool loop.
 //!
-//! Both call [`ThirdPartyGate`]: it classifies each tool from the
-//! `annotations` of the upstream `tools/list`
-//! ([`duduclaw_core::effect_from_annotations`]), hides refused tools from the
-//! listing passed to the employee, refuses or asks (ApprovalBroker, fail
-//! closed) on `tools/call`, and records what it saw in a snapshot the
-//! dashboard reads ([`load_snapshots`]).
+//! All call [`ThirdPartyGate`]: upstream annotations survive discovery, the
+//! same gate filters listings and checks calls (ApprovalBroker, fail closed),
+//! and snapshots are available to the dashboard ([`load_snapshots`]). Direct
+//! `url` / `type` entries in `.mcp.json` are refused and audited on every
+//! managed spawn; operators connect them with `mcp.remote_connect` so the
+//! bridge owns transport and credentials.
 //!
 //! Annotations are claims a server makes about itself. `destructiveHint` is
 //! believed from everyone (it only makes a tool stricter); `readOnlyHint` is
-//! believed only for servers the operator lists in `[capabilities]
-//! trusted_read_hint_servers`, otherwise the tool is `modify`. The policy is
+//! never allowed to lower the default `modify`, including servers in the legacy
+//! `trusted_read_hint_servers` list. The policy is
 //! re-read from `agent.toml` for every listing and every call.
 //!
-//! Not covered: Claude Code built-in tools; `url` / `type` entries in
-//! `.mcp.json` on a Claude spawn that needs no gate (the CLI talks to them
-//! directly, no proxy in the path; a gated spawn and every other runtime
-//! remove them); `agent.toml [[mcp.external]]` servers of the tool loop
-//! (mounted directly, unmounted in the explore lane); servers an operator
-//! configured for a CLI outside DuDuClaw (Grok also reads the OS user's
-//! `~/.grok/config.toml`;
-//! Grok's Claude/Cursor-compat sources `~/.claude.json` and
-//! `~/.cursor/mcp.json` are switched off per spawn, `runtime/grok.rs`
-//! `COMPAT_MCP_SOURCES_OFF`); entries in an employee's
-//! `.grok/config.toml` that DuDuClaw did not
-//! write (kept, warned on every spawn); a `.mcp.json` changed between the
-//! spawn's read and the CLI's own. Grok's project-level sources (`.mcp.json`
-//! and `.cursor/mcp.json` of the working directory, and `.mcp.json` /
-//! `.grok/config.toml` up to the git root) are shadowed in the working
-//! directory's `.grok/config.toml` (`runtime/grok/third_party/sources.rs`).
+//! Not covered: Claude Code built-in tools, independently launched CLIs, and
+//! files changed after the managed spawn's validation. Managed Claude spawns
+//! pin a frozen strict config even for built-in-only files. Managed Grok
+//! spawns refuse user-level MCP entries and unmanaged project MCP entries;
+//! Claude/Cursor-compat sources remain disabled per spawn. Project ancestors
+//! are shadowed (`runtime/grok/third_party/sources.rs`).
 //! Every runtime registers the
 //! employee's `.mcp.json` third-party servers through this gate: the Claude
 //! CLI through the spawn-time rewrite, Codex since 2026-10-19, Grok
@@ -845,10 +831,10 @@ mod tests {
         std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\nrecipient_guard='ask'\n").unwrap();
         let gate = ThirdPartyGate::with_lane(home.path(), "a1", "crm", "proxy", ProcessLane::Normal);
         gate.filter_list_result(&mut listing());
-        assert!(gate.check_call_with_taint("get", &json!({}), crate::egress_guard::Taint { tainted: false, sources: vec![], connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None }).await.unwrap().is_none());
+        assert_eq!(gate.decide("get").0, ToolEffect::Modify);
         let broker = ApprovalBroker::open(home.path()).unwrap();
         let args = json!({"to":"line:visitor", "body":"hello"});
-        let call = gate.check_call_with_taint("put", &args, crate::egress_guard::Taint { tainted: false, sources: vec![], connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None });
+        let call = gate.check_call_with_taint("get", &args, crate::egress_guard::Taint { tainted: false, sources: vec![], connector_refs: Vec::new(), dropped_connector_refs: 0, turn_started_at: None });
         let decision = async {
             let request = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
@@ -1017,18 +1003,18 @@ mod tests {
         assert!(err.contains("action_rules"), "{err}");
         let views = load_snapshots(home.path(), "a1");
         assert_eq!(views.len(), 1);
-        assert!(views[0].read_hint_trusted);
+        assert!(!views[0].read_hint_trusted);
         let by: HashMap<_, _> = views[0].tools.iter().map(|t| (t.name.as_str(), t)).collect();
-        assert_eq!(by["get"].effect, ToolEffect::Read);
+        assert_eq!(by["get"].effect, ToolEffect::Modify);
         assert_eq!(by["put"].effect, ToolEffect::Modify);
         assert_eq!(by["drop"].verdict, "block");
-        assert!(by["get"].explore_visible && !by["put"].explore_visible);
+        assert!(!by["get"].explore_visible && !by["put"].explore_visible);
         let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
         assert!(audit.contains("third_party_tool_refused"));
     }
 
     #[tokio::test]
-    async fn explore_lane_lists_only_trusted_reads_and_unknown_tools_are_modify() {
+    async fn explore_lane_rejects_upstream_read_claims_and_unknown_tools() {
         let home = home_with_rules("[capabilities]\n");
         let g = ThirdPartyGate::with_lane(home.path(), "a1", "crm", "bridge", ProcessLane::Explore);
         let mut r = listing();
@@ -1040,8 +1026,8 @@ mod tests {
         let g = ThirdPartyGate::with_lane(home.path(), "a1", "crm", "bridge", ProcessLane::Explore);
         let mut r = listing();
         g.filter_list_result(&mut r);
-        assert_eq!(names(&r), vec!["get"]);
-        assert!(g.check_call("get").await.is_ok());
+        assert!(names(&r).is_empty());
+        assert!(g.check_call("get").await.is_err());
         // Never listed ⇒ no annotations ⇒ modify ⇒ refused in the lane.
         assert!(g.check_call("secret_tool").await.is_err());
     }

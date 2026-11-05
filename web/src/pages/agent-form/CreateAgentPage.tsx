@@ -25,6 +25,7 @@ import { RowText, RowSelect, FieldBlock } from './form-rows';
 import { TEMPLATE_KIND_ORDER } from './defaults';
 import { ModelSelect } from '@/components/shared/ModelSelect';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
+import { sanitizeErrorDetail } from '@/lib/error-message';
 
 /**
  * CreateAgentPage — standalone route (/agents/new) for hiring a new AI
@@ -142,6 +143,22 @@ export function CreateAgentPage() {
 
   const usingTemplate = templateRoleId !== '' && roleDetail !== null;
 
+  const handleCreateError = (cause: unknown) => {
+    const detail = sanitizeErrorDetail(cause);
+    if (/^Agent name must be lowercase alphanumeric with hyphens, max 64 chars$/i.test(detail)) {
+      setError(intl.formatMessage({ id: 'agents.create.error' }));
+      return;
+    }
+    if (/^Agent '.+' already exists$/i.test(detail) || /^已有同名的 AI 員工\(.+\),請換一個名稱$/.test(detail)) {
+      setError(intl.formatMessage({ id: 'agents.create.errorExists' }));
+      return;
+    }
+    setError(intl.formatMessage(
+      { id: 'agents.create.errorServer' },
+      { detail: detail || intl.formatMessage({ id: 'common.error' }) },
+    ));
+  };
+
   const handleSubmit = async () => {
     if (!name.trim() || !displayName.trim()) return;
     setError(null);
@@ -183,7 +200,8 @@ export function CreateAgentPage() {
         setErrorState(e);
         setErrorRetry(() => () => void handleSubmit());
       } else {
-        setError(intl.formatMessage({ id: 'agents.create.error' }));
+        setErrorState(null);
+        handleCreateError(e);
       }
     } finally {
       setSubmitting(false);
@@ -386,7 +404,14 @@ export function CreateAgentPage() {
             onRetry={errorRetry ?? undefined}
           />
         )}
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <div role="alert" className="text-sm text-destructive">
+            <p>{error}</p>
+            {error.includes(': ') && (
+              <p className="mt-1 text-xs text-muted-foreground">{error.slice(error.indexOf(': ') + 2)}</p>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

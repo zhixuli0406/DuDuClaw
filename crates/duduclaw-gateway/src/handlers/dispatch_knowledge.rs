@@ -370,6 +370,8 @@ impl MethodHandler {
 
             // ── Skills (open to all) ─────────────────────────
             // B8: filtered to the employees the caller may view (read live).
+            // Per-account history, with live Viewer access and callable-skill filtering.
+            "skills.recent" => boxed_frame(|| self.handle_skills_recent(params, ctx)).await,
             "skills.list" => boxed_frame(|| self.handle_skills_list(params, ctx)).await,
             // B8: per-employee switches and removal — Owner of each named
             // employee (or admin), checked live inside the handlers.
@@ -451,38 +453,14 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_gallery_list()).await
             }
 
-            // ── Cron (admin only) ────────────────────────────
-            "cron.list" => {
-                require_admin!();
-                boxed_frame(|| self.handle_cron_list()).await
+            "reminders.list" | "reminders.cancel" => {
+                boxed_frame(|| self.handle_dashboard_reminders(params, ctx, method == "reminders.cancel")).await
             }
-            "cron.add" => {
-                require_admin!();
-                boxed_frame(|| self.handle_cron_add(params)).await
-            }
-            "cron.update" => {
-                require_admin!();
-                boxed_frame(|| self.handle_cron_update(params)).await
-            }
-            "cron.pause" => {
-                require_admin!();
-                boxed_frame(|| self.handle_cron_set_enabled(params, false)).await
-            }
-            "cron.resume" => {
-                require_admin!();
-                boxed_frame(|| self.handle_cron_set_enabled(params, true)).await
-            }
-            "cron.remove" => {
-                require_admin!();
-                boxed_frame(|| self.handle_cron_remove(params)).await
-            }
-            "cron.run_now" => {
-                require_admin!();
-                boxed_frame(|| self.handle_cron_run_now(params)).await
-            }
-            "cron.templates" => {
-                require_admin!();
-                boxed_frame(|| self.handle_cron_templates()).await
+
+            // Record authorization lives in the scoped handler; Admin retains the full API.
+            "cron.list" | "cron.add" | "cron.update" | "cron.pause" | "cron.resume"
+            | "cron.remove" | "cron.run_now" | "cron.templates" => {
+                boxed_frame(|| self.handle_scoped_cron(method, params, ctx)).await
             }
 
             // ── System (admin only for config changes) ───────

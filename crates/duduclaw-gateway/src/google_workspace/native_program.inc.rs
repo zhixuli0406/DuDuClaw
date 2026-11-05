@@ -100,6 +100,54 @@ async fn google_request_text<I: LocalIo>(
     io.checkpoint()?;
     result
 }
+pub(super) async fn chat_spaces<I: LocalIo>(io: &mut I, template: &NativeCallTemplate, args: &chat_read::SpacesArgs) -> Result<Value, GoogleApiError> {
+    let mut query = vec![("pageSize", args.limit.to_string())];
+    if let Some(filter) = &args.filter { query.push(("filter", filter.clone())); }
+    let data = google_request(io, template, reqwest::Method::GET, chat_read::SPACES_ENDPOINT, &query, None)
+        .await.map_err(chat_error)?;
+    let mut result = chat_read::spaces_response(&data, args.limit);
+    sanitize_chat(&mut result, io);
+    Ok(result)
+}
+pub(super) async fn chat_messages<I: LocalIo>(io: &mut I, template: &NativeCallTemplate, args: &chat_read::MessagesArgs) -> Result<Value, GoogleApiError> {
+    let mut query = vec![("pageSize", args.limit.to_string()), ("orderBy", "createTime desc".into())];
+    if let Some(filter) = &args.filter { query.push(("filter", filter.clone())); }
+    let endpoint = chat_read::messages_endpoint(&args.space).map_err(|message| GoogleApiError::Api {
+        status: 400,
+        message,
+    })?;
+    let data = google_request(io, template, reqwest::Method::GET, &endpoint, &query, None)
+        .await.map_err(chat_error)?;
+    let mut result = chat_read::messages_response(&data, args);
+    sanitize_chat(&mut result, io);
+    Ok(result)
+}
+fn sanitize_chat<I: LocalIo>(value: &mut Value, io: &I) {
+    match value {
+        Value::String(text) => *text = io.sanitize(&duduclaw_security::one_time_credential::strip_one_time_credentials(text).text),
+        Value::Array(rows) => rows.iter_mut().for_each(|v| sanitize_chat(v, io)),
+        Value::Object(fields) => fields.values_mut().for_each(|v| sanitize_chat(v, io)),
+        _ => {},
+    }
+}
+fn chat_error(error: GoogleApiError) -> GoogleApiError {
+    let message = match error {
+        GoogleApiError::Forbidden(_) | GoogleApiError::Unauthorized => chat_read::GUIDANCE.to_owned(),
+        GoogleApiError::RateLimited => "Google Chat 請求次數過多，請稍後再試。".into(),
+        GoogleApiError::Http(_) => "無法連線至 Google Chat，請稍後再試。".into(),
+        GoogleApiError::Api { status: 404, .. } => "找不到此 Google Chat 空間，或目前連結的使用者沒有存取權。".into(),
+        GoogleApiError::Api { .. } => "Google Chat 讀取失敗，請確認空間、時間與討論串設定。".into(),
+        GoogleApiError::Auth(_) => chat_read::GUIDANCE.to_owned(),
+    };
+    GoogleApiError::Forbidden(message)
+}
+fn render_chat<I: LocalRender>(value: &Value, io: &mut I) -> Value {
+    if let Err(error) = io.inspect_curated(value) { return tool_error(&error.to_string()); }
+    match chat_read::scanned_envelope(value) {
+        Ok(block) => tool_text(&block),
+        Err(()) => tool_error("not available"),
+    }
+}
 pub(super) async fn gmail_search<I: LocalIo>(
     io: &mut I,
     template: &NativeCallTemplate,
@@ -1458,6 +1506,7 @@ pub(super) fn scope_guidance(api_error_body: &str) -> String {
 }
 
 pub(super) enum Outcome {
+    Chat(Value),
     GmailSearch(GmailSearchResult),
     GmailRead(GmailReadResult),
     GmailDraft(GmailDraftResult),
@@ -1486,6 +1535,7 @@ fn tool_error(text: &str) -> Value {
 }
 pub(super) fn render<I: LocalRender>(value: Outcome, io: &mut I) -> Value {
     match value {
+        Outcome::Chat(r) => render_chat(&r, io),
         Outcome::GmailSearch(r) => render_json(&r, io),
         Outcome::GmailRead(r) => render_json(&r, io),
         Outcome::CalendarList(r) => render_json(&r, io),
@@ -1539,6 +1589,8 @@ pub(super) async fn run<I: LocalIo>(template: &NativeCallTemplate, io: &mut I) -
         return tool_error(&e.to_string());
     }
     let result: Result<Outcome, GoogleApiError> = match template.parsed() {
+        ParsedNativeArguments::ChatSpaces(args) => chat_spaces(io, template, args).await.map(Outcome::Chat),
+        ParsedNativeArguments::ChatMessages(args) => chat_messages(io, template, args).await.map(Outcome::Chat),
         ParsedNativeArguments::GmailSearch { query, max } => {
             gmail_search(io, template, query, *max)
                 .await

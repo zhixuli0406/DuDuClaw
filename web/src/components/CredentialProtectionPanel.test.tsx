@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen } from '@testing-library/react';
+import { screen, within } from '@testing-library/react';
 import { IntlProvider } from 'react-intl';
 import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
@@ -208,6 +208,81 @@ describe('container credential protection', () => {
   });
 
   it.each([
+    ['en', en], ['zh-TW', zhTW], ['ja-JP', jaJP],
+  ] as const)('shows socket diagnostics and blocked recovery in %s', async (locale, messages) => {
+    const detail = '@/containerd-shim/<img src=x onerror=alert(1)> (peer uid=0, root)';
+    mockProtection(status({
+      backend: 'container_root_key', state: 'unavailable', refusal_reason: 'engine_socket_reachable',
+      root_key_recovery: {
+        latest_revocation: { reason: 'engine_socket_reachable', detail, timestamp: '2026-11-05T01:02:03Z' },
+        recovery: 'state_unavailable',
+      },
+    }));
+    renderWithProviders(
+      <IntlProvider locale={locale} messages={messages}><CredentialProtectionPanel /></IntlProvider>,
+    );
+    const diagnostics = await screen.findByTestId('credential-protection-recovery');
+    expect(diagnostics).toHaveTextContent(detail);
+    expect(diagnostics).toHaveTextContent('2026-11-05T01:02:03Z');
+    expect(diagnostics).toHaveTextContent(messages['security.credentialProtection.recovery.state_unavailable']);
+    expect(diagnostics.querySelector('img')).toBeNull();
+  });
+
+  it.each([
+    ['en', en], ['zh-TW', zhTW], ['ja-JP', jaJP],
+  ] as const)('shows the root docker command hint and upgrade requirement in %s', async (locale, messages) => {
+    mockProtection(status({
+      backend: 'container_root_key', state: 'unavailable', refusal_reason: 'engine_socket_reachable',
+      root_key_recovery: {
+        latest_revocation: {
+          reason: 'engine_socket_reachable',
+          detail: '@docker_cli_3e708842d9322cef25983565c19d0866: peer uid=0 (root)',
+          timestamp: '2026-11-05T01:02:03Z',
+        },
+        recovery: 'unit_upgrade_required',
+      },
+    }));
+    renderWithProviders(
+      <IntlProvider locale={locale} messages={messages}><CredentialProtectionPanel /></IntlProvider>,
+    );
+    const diagnostics = await screen.findByTestId('credential-protection-recovery');
+    expect(diagnostics).toHaveTextContent(messages['security.credentialProtection.recovery.docker_cli_root']);
+    expect(diagnostics).toHaveTextContent(messages['security.credentialProtection.recovery.unit_upgrade_required']);
+  });
+
+  it.each([
+    '@docker_cli_3E708842d9322cef25983565c19d0866: peer uid=0 (root)',
+    '@docker_cli_3e708842d9322cef25983565c19d0866: peer uid=1000 (root)',
+    '@docker_cli_3e708842d9322cef25983565c19d0866/suffix: peer uid=0 (root)',
+  ])('does not select the docker command hint for a nonmatching detail: %s', async (detail) => {
+    mockProtection(status({
+      backend: 'container_root_key', state: 'unavailable', refusal_reason: 'engine_socket_reachable',
+      root_key_recovery: {
+        latest_revocation: { reason: 'engine_socket_reachable', detail, timestamp: '2026-11-05T01:02:03Z' },
+        recovery: 'waiting',
+      },
+    }));
+    renderWithProviders(<CredentialProtectionPanel />);
+    const diagnostics = await screen.findByTestId('credential-protection-recovery');
+    expect(diagnostics).not.toHaveTextContent(en['security.credentialProtection.recovery.docker_cli_root']);
+  });
+
+  it('does not describe persisted revocation history as a current outage', async () => {
+    mockProtection(status({
+      ...CONTAINER_READY,
+      root_key_recovery: {
+        latest_revocation: { reason: 'engine_socket_reachable', detail: '@/containerd-shim/example (root)', timestamp: '2026-11-05T01:02:03Z' },
+        recovery: 'waiting',
+      },
+    }));
+    renderWithProviders(<CredentialProtectionPanel />);
+    const diagnostics = await screen.findByTestId('credential-protection-recovery');
+    expect(diagnostics).toHaveTextContent(en['security.credentialProtection.recovery.history']);
+    expect(diagnostics).not.toHaveTextContent(en['security.credentialProtection.recovery.waiting']);
+    expect(screen.getByTestId('credential-protection-line')).toHaveTextContent('Separate key');
+  });
+
+  it.each([
     ['en', en],
     ['zh-TW', zhTW],
     ['ja-JP', jaJP],
@@ -248,5 +323,61 @@ describe('container credential protection', () => {
     expect(screen.queryByText(/system keychain/i)).toBeNull();
     const buttons = screen.getAllByRole('button', { name: 'Turn off' });
     expect(buttons[buttons.length - 1]).toBeDisabled();
+  });
+});
+
+
+describe('native Linux engine socket policy', () => {
+  const policy = {
+    action: 'warn' as const,
+    warning_active: true,
+    detail: '@/containerd-shim/example: peer uid=0 (root)',
+    risk_zh: 'Backend Chinese text is localized by the panel.',
+    command_warn: 'sudo duduclaw service protected-linux policy engine-socket warn --yes',
+    command_revoke: 'sudo duduclaw service protected-linux policy engine-socket revoke',
+  };
+
+  it.each([['en', en], ['zh-TW', zhTW], ['ja-JP', jaJP]] as const)(
+    'keeps the warning visible for ready personal accounts and shows a read-only command in %s',
+    async (locale, messages) => {
+      mockProtection(status({ ...READY, backend: 'container_root_key', engine_socket_policy: policy }));
+      renderWithProviders(
+        <IntlProvider locale={locale} messages={messages}><CredentialProtectionPanel /></IntlProvider>,
+      );
+      const panel = await screen.findByTestId('credential-protection-engine-policy');
+      expect(within(panel).getByRole('alert')).toHaveTextContent(messages['security.credentialProtection.enginePolicy.active']);
+      expect(panel).toHaveTextContent(messages['security.credentialProtection.enginePolicy.warn']);
+      expect(panel).toHaveTextContent(messages['security.credentialProtection.enginePolicy.risk']);
+      expect(panel).toHaveTextContent(policy.detail);
+      expect(panel).toHaveTextContent(policy.command_revoke);
+      expect(panel).not.toHaveTextContent(policy.command_warn);
+      expect(within(panel).queryByRole('button')).toBeNull();
+      expect(mockWsClient.call).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('shows the conservative default and explicit acknowledgement command without an active warning', async () => {
+    mockProtection(status({ engine_socket_policy: { ...policy, action: 'revoke', warning_active: false, detail: null } }));
+    renderWithProviders(<CredentialProtectionPanel />);
+    const panel = await screen.findByTestId('credential-protection-engine-policy');
+    expect(panel).toHaveTextContent(en['security.credentialProtection.enginePolicy.revoke']);
+    expect(panel).toHaveTextContent(policy.command_warn);
+    expect(within(panel).queryByRole('alert')).toBeNull();
+  });
+
+  it('keeps warn policy visible after the exposure ends without claiming an active exposure', async () => {
+    mockProtection(status({ engine_socket_policy: { ...policy, warning_active: false, detail: null } }));
+    renderWithProviders(<CredentialProtectionPanel />);
+    const panel = await screen.findByTestId('credential-protection-engine-policy');
+    expect(panel).toHaveTextContent(en['security.credentialProtection.enginePolicy.warn']);
+    expect(panel).toHaveTextContent(en['security.credentialProtection.enginePolicy.risk']);
+    expect(within(panel).queryByRole('alert')).toBeNull();
+  });
+
+  it('does not show a native policy for other protection backends', async () => {
+    mockProtection(status({ engine_socket_policy: null }));
+    renderWithProviders(<CredentialProtectionPanel />);
+    await screen.findByTestId('credential-protection-line');
+    expect(screen.queryByTestId('credential-protection-engine-policy')).toBeNull();
   });
 });

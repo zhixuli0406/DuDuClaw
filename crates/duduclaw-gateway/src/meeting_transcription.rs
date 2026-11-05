@@ -2,7 +2,7 @@
 use std::{path::Path, sync::Arc};
 use duduclaw_inference::transcription::{
     config::{resolve_gemini_model, EngineKind, TranscriptionConfig},
-    pipeline, GeminiEngine, TranscriptionEngine, TranscriptionUsage, WhisperEngine,
+    pipeline, GeminiEngine, GoogleSttEngine, TranscriptionEngine, TranscriptionUsage, WhisperEngine,
 };
 use serde_json::{json, Value};
 
@@ -30,6 +30,42 @@ async fn provider_key(home: &Path, provider: &str) -> std::result::Result<String
         .ok_or_else(|| format!("尚未設定 {provider} 的 API 憑證。"))
 }
 
+async fn google_stt_key(home: &Path) -> std::result::Result<String, String> {
+    let raw = tokio::fs::read_to_string(home.join("config.toml")).await
+        .map_err(|_| "無法讀取會議轉錄憑證設定。")?;
+    let table: toml::Table = raw.parse().map_err(|_| "會議轉錄憑證設定格式錯誤。")?;
+    let section = table.get("transcription_credentials").and_then(toml::Value::as_table)
+        .ok_or("尚未設定 Google Cloud 語音轉錄的服務帳戶憑證。")?;
+    // New credentials have no legacy plaintext lane.
+    if section.contains_key("google_stt_key") || section.get("google_stt_key_enc").and_then(toml::Value::as_str).is_none() {
+        return Err("Google Cloud 語音轉錄憑證須透過管理員設定加密儲存。".into());
+    }
+    crate::config_crypto::decrypt_config_field_async(&table, "transcription_credentials", "google_stt_key", home).await
+        .map(|secret| secret.expose_owned()).ok_or_else(|| "無法解密 Google Cloud 語音轉錄憑證。".into())
+}
+
+/// Run independently of job recovery and the currently selected engine. A
+/// configuration change or credential outage must never discard cleanup intents.
+pub(crate) fn spawn_google_stt_cleanup(home: std::path::PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            if !duduclaw_core::gateway_instance::held(&home) { return; }
+            match reconcile_google_stt_cleanup(&home).await {
+                Ok(0) => {},
+                Ok(pending) => tracing::warn!(pending, "Google STT audio cleanup pending; maintenance will retry"),
+                Err(()) => tracing::warn!("Google STT audio cleanup unavailable; durable intents retained for retry"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
+async fn reconcile_google_stt_cleanup(home: &Path) -> Result<usize, ()> {
+    if !GoogleSttEngine::has_pending_cleanup(home).map_err(|_| ())? { return Ok(0); }
+    let key = google_stt_key(home).await.map_err(|_| ())?;
+    GoogleSttEngine::reconcile_pending(key, home).await.map_err(|_| ())
+}
+
 pub async fn execute(
     home: &Path, agent: &str, source: &Path, output: &Path,
     cfg: &TranscriptionConfig, kind: EngineKind, language: &str,
@@ -40,11 +76,14 @@ pub async fn execute(
     pipeline::preflight_output(output)?;
     let mut registry = duduclaw_llm::ModelRegistry::vendored();
     registry.load_override(&home.join("models.toml"))?;
-    let model_name=match kind { EngineKind::Gemini=>resolve_gemini_model(cfg,&registry)?, EngineKind::Whisper=>"openai/whisper-1".into(), EngineKind::GoogleStt=>"google-stt".into() };
+    let model_name=match kind { EngineKind::Gemini=>resolve_gemini_model(cfg,&registry)?, EngineKind::Whisper=>"openai/whisper-1".into(), EngineKind::GoogleStt=>format!("google-stt/{}", cfg.google_stt.model) };
     let engine: Box<dyn TranscriptionEngine> = match kind {
         EngineKind::Gemini => Box::new(GeminiEngine::new(provider_key(home, "gemini").await?, model_name.clone()).map_err(|e| e.to_string())?),
         EngineKind::Whisper => Box::new(WhisperEngine::new(provider_key(home, "openai").await?).map_err(|e| e.to_string())?),
-        EngineKind::GoogleStt => return Err("Google Cloud 語音轉錄尚未支援長會議；請由管理員選擇 Gemini 或 Whisper。".into()),
+        EngineKind::GoogleStt => {
+            let key = google_stt_key(home).await?;
+            Box::new(GoogleSttEngine::new(key, cfg.google_stt.clone(), home).map_err(|e| e.to_string())?)
+        },
     };
     let redaction = init_redaction(home, agent, session)?;
     let telemetry = crate::cost_telemetry::CostTelemetry::new(&home.join("cost_telemetry.db"))?;
@@ -54,7 +93,7 @@ pub async fn execute(
         provider: kind.as_str(), model: &model_name, record_id:output_id.unwrap_or("synchronous"),
         totals: tokio::sync::Mutex::new((0, 0)),
     };
-    let transcription = pipeline::transcribe_chunks(engine.as_ref(), &prepared, language, &observer).await;
+    let transcription = pipeline::transcribe_chunks(engine.as_ref(), &prepared, if kind == EngineKind::GoogleStt { &cfg.google_stt.language } else { language }, &observer).await;
     if transcription.is_err() { crate::meeting_jobs::audit(home,"meeting_provider_result",agent,agent,output_id.unwrap_or("synchronous"),"failed",Some(kind.as_str()),Some(&model_name)); }
     let mut transcript = transcription?;
     pipeline::convert_taiwan(&mut transcript)?;
@@ -136,6 +175,12 @@ fn usage_millicents(registry: &duduclaw_llm::ModelRegistry, item: &Transcription
         // Whisper's published $0.006/minute = 10 true millicents/second.
         // Round to the ledger's cents only after accumulating this job's calls.
         return Ok((seconds * 10.0).round() as u64);
+    }
+    if item.model == "google-stt/chirp_2" {
+        let seconds = item.audio_seconds.filter(|s| s.is_finite() && *s >= 0.0)
+            .ok_or("轉錄服務未回報有效錄音長度，無法計算費用。")?;
+        // Standard V2 list rate $0.016/min; storage/network and discounts excluded.
+        return Ok((seconds.ceil() * 1600.0 / 60.0).ceil() as u64);
     }
     let model = registry.get(&item.model).ok_or("轉錄模型缺少費率資料，無法記錄費用。")?;
     Ok(registry.cost_audio_millicents(&duduclaw_llm::NormalizedUsage {
@@ -219,6 +264,42 @@ mod tests {
         assert!(usage_millicents(&registry, &item).is_err());
         item.model = "unknown/model".into();
         assert!(usage_millicents(&registry, &item).is_err());
+    }
+
+    #[test]
+    fn transcription_google_stt_cost_uses_rounded_seconds() {
+        let registry = duduclaw_llm::ModelRegistry::vendored();
+        let mut item = TranscriptionUsage { model: "google-stt/chirp_2".into(), audio_seconds: Some(60.0), estimated: true, ..Default::default() };
+        assert_eq!(usage_millicents(&registry, &item).unwrap(), 1600);
+        item.audio_seconds = Some(60.01);
+        assert_eq!(usage_millicents(&registry, &item).unwrap(), 1627);
+        item.audio_seconds = None;
+        assert!(usage_millicents(&registry, &item).is_err());
+        item.audio_seconds = Some(f64::INFINITY);
+        assert!(usage_millicents(&registry, &item).is_err());
+    }
+
+    #[tokio::test]
+    async fn transcription_google_stt_cleanup_skips_unused_installs_and_keeps_unavailable_intents() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(reconcile_google_stt_cleanup(home.path()).await, Ok(0));
+        assert!(!home.path().join("google_stt_cleanup").exists());
+        let dir = home.path().join("google_stt_cleanup");
+        std::fs::create_dir(&dir).unwrap();
+        let record = dir.join(format!("{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&record, "pending-canary").unwrap();
+        assert!(reconcile_google_stt_cleanup(home.path()).await.is_err());
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "pending-canary");
+    }
+
+    #[tokio::test]
+    async fn transcription_google_stt_credentials_reject_plaintext_and_broken_ciphertext() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(google_stt_key(home.path()).await.is_err());
+        for config in ["[transcription_credentials]\ngoogle_stt_key='plaintext'", "[transcription_credentials]\ngoogle_stt_key_enc='broken'"] {
+            std::fs::write(home.path().join("config.toml"), config).unwrap();
+            assert!(google_stt_key(home.path()).await.is_err());
+        }
     }
 
     #[test]

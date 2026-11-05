@@ -1,48 +1,41 @@
 //! stdio ⇄ Streamable HTTP bridge (`duduclaw mcp-remote-bridge`).
 //!
-//! The Claude CLI starts the bridge as an ordinary stdio MCP server. Every
-//! line it writes (requests, notifications, and responses to server-initiated
-//! requests) is POSTed to the remote server with a fresh access
-//! token. Tool calls use generation-specific wire IDs, restored on correlated
-//! terminal responses; every JSON-RPC message the server answers with, as a JSON body or as
-//! `text/event-stream` events, is written back as one line. The bridge does
-//! not interpret MCP beyond three things the transport needs: it remembers the
-//! `Mcp-Session-Id` the server assigns, sends the negotiated
-//! `MCP-Protocol-Version` header after `initialize`, and on a `401` refreshes
-//! the token once and retries before answering with an error.
+//! The bridge prefers 2026-07-28 upstream and caches its negotiated era for
+//! this process. Modern calls carry per-request metadata and routing headers;
+//! legacy servers retain initialize, sessions and GET resumption. A legacy
+//! HTTP+SSE endpoint event is accepted only on the authenticated origin.
 //!
-//! Ordering: `initialize`, notifications and responses are sent one at a time
-//! in input order (the server must see `initialize` → `initialized` → the
-//! rest); other requests run concurrently so a long tool call does not block
-//! the next one.
+//! Both downstream generations keep the same tool listing and dispatch gates.
+//! Modern MRTR is refused until continuation data can be gated and bound to
+//! the original approval generation. No modern interactive capability is declared.
+//! Legacy-to-legacy connections preserve the downstream capabilities. Every
+//! internal retry gets a new wire ID and retains the original gate generation.
 //!
-//! Server-initiated `GET` stream (2026-10-08, off by default, per-server
-//! opt-in `server_stream` on the record): after `notifications/initialized`
-//! the bridge opens `GET <url>` with `Accept: text/event-stream`, forwards
-//! every message on it to stdout, remembers the last SSE `id:` and reconnects
-//! with `Last-Event-ID` (backoff 1 s doubling to 30 s, reset by an event); a
-//! `405` (the server offers no such stream) or `404` (session gone) stops it,
-//! and it is aborted when stdin ends. A broken *POST* answer stream is
-//! resumed the same way (`GET` + `Last-Event-ID`, bounded; see
-//! `Bridge::relay_sse`). Legacy HTTP+SSE (2024-11-05) servers are not
-//! supported by this bridge.
+//! The optional server_stream setting opens subscriptions/listen on modern
+//! servers or the existing GET stream on legacy Streamable HTTP. A broken
+//! modern request fails explicitly; it never resumes via Last-Event-ID.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
 use url::Url;
 
-use super::connect::{AuthError, UpstreamAuth, upstream_auth};
+use super::connect::{AuthError, UpstreamAuth, upstream_auth_for_bridge};
 use super::url_policy::{OutboundPolicy, pinned_client};
 
 /// Protocol version announced by the connection probe.
-pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+pub const DEFAULT_PROTOCOL_VERSION: &str = duduclaw_llm::mcp_protocol::MODERN;
+
+mod modern;
+mod legacy_sse;
+pub(crate) use legacy_sse::probe_static_sse;
+use duduclaw_llm::mcp_protocol as protocol;
 /// Largest single JSON-RPC message accepted in either direction.
-pub const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_MESSAGE_BYTES: usize = protocol::MAX_STDIO_FRAME_BYTES;
 /// A pinned HTTP client is rebuilt (DNS re-resolved and re-screened) this often.
 const CLIENT_TTL: Duration = Duration::from_secs(300);
 /// Upper bound for one upstream exchange (a tool call can take a while).
@@ -53,6 +46,11 @@ const BRIDGE_ERROR: i64 = -32000;
 struct Session {
     session_id: Option<String>,
     protocol_version: Option<String>,
+    discovery: Option<Value>,
+    requires_restart: bool,
+    downstream_capabilities: Value,
+    legacy_endpoint: Option<Url>,
+    legacy_source: Option<Url>,
 }
 
 struct ClientCache {
@@ -62,9 +60,14 @@ struct ClientCache {
 struct Bridge {
     home: PathBuf,
     agent_id: String,
+    agent_token: String,
     server: String,
     session: Mutex<Session>,
     clients: Mutex<ClientCache>,
+    negotiation: Mutex<()>,
+    schemas: Mutex<std::collections::HashMap<String, Value>>,
+    effect_annotations: Mutex<std::collections::HashMap<String, Value>>,
+    legacy_stream: Mutex<Option<legacy_sse::LegacyStream>>,
     /// Last `Authorization` value used, so a 401 refresh can tell whether
     /// another process already renewed the token.
     last_auth: Mutex<Option<UpstreamAuth>>,
@@ -99,7 +102,28 @@ fn classify(frame: &Value) -> Kind {
     }
 }
 
+pub(super) fn verify_identity(home: &Path, agent_id: &str, token: &str) -> Result<(), String> {
+    if duduclaw_core::verify_identity_claim(home, agent_id, token, true)
+        != duduclaw_core::IdentityVerdict::Verified
+    {
+        return Err("MCP remote bridge identity rejected".into());
+    }
+    Ok(())
+}
+
+fn strip_modern_metadata(frame: &mut Value) {
+    if let Some(meta) = frame.get_mut("params").and_then(|p| p.get_mut("_meta")).and_then(Value::as_object_mut) {
+        for key in ["io.modelcontextprotocol/protocolVersion", "io.modelcontextprotocol/clientCapabilities", "io.modelcontextprotocol/clientInfo"] {
+            meta.remove(key);
+        }
+    }
+}
+
 impl Bridge {
+    fn verify_identity(&self) -> Result<(), String> {
+        verify_identity(&self.home, &self.agent_id, &self.agent_token)
+    }
+
     fn emit(&self, line: String) {
         let _ = self.out.send(line);
     }
@@ -110,7 +134,8 @@ impl Bridge {
         } else {
             None
         };
-        let a = upstream_auth(&self.home, &self.agent_id, &self.server, force, seen.as_deref()).await?;
+        self.verify_identity().map_err(AuthError::Transient)?;
+        let a = upstream_auth_for_bridge(&self.home, &self.agent_id, &self.server, &self.agent_token, force, seen.as_deref()).await?;
         *self.last_auth.lock().await = Some(a.clone());
         Ok(a)
     }
@@ -122,30 +147,55 @@ impl Bridge {
             && *k == key
             && at.elapsed() < CLIENT_TTL
         {
+            self.verify_identity()?;
             return Ok(c.clone());
         }
         let c = pinned_client(url, OutboundPolicy::for_mcp_url(url), REQUEST_TIMEOUT).await?;
+        // Legacy HTTP+SSE opens its GET directly after obtaining this client.
+        // Recheck after lock/DNS waits as well as on the cached-client path.
+        self.verify_identity()?;
         cache.client = Some((c.clone(), Instant::now(), key));
         Ok(c)
     }
 
     async fn post(&self, auth: &UpstreamAuth, body: &str, permit: Option<&crate::third_party_tools::DispatchPermit>) -> Result<reqwest::Response, String> {
-        let client = self.client_for(&auth.url).await?;
+        let target = {
+            let session = self.session.lock().await;
+            match (&session.legacy_endpoint, &session.legacy_source) {
+                (Some(endpoint), Some(source)) => legacy_sse::checked_endpoint(endpoint, source, &auth.url)?,
+                (Some(_), None) => return Err("legacy MCP source binding is missing; restart the conversation".into()),
+                (None, _) => auth.url.clone(),
+            }
+        };
+        let client = self.client_for(&target).await?;
         let mut req = client
-            .post(auth.url.clone())
+            .post(target)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .body(body.to_string());
         req = super::connect::apply_upstream_headers(req, auth);
         {
             let s = self.session.lock().await;
-            if let Some(id) = &s.session_id {
-                req = req.header("Mcp-Session-Id", id);
+            if s.requires_restart { return Err("MCP protocol changed; restart the conversation to reconnect".into()); }
+            let frame: Value = serde_json::from_str(body).map_err(|_| "invalid MCP request")?;
+            if s.discovery.is_none() && !matches!(frame["method"].as_str(), Some("initialize" | "server/discover" | "notifications/initialized")) {
+                return Err("MCP negotiation is in progress; retry the request".into());
             }
-            if let Some(v) = &s.protocol_version {
-                req = req.header("MCP-Protocol-Version", v);
+            if s.protocol_version.as_deref() == Some(protocol::MODERN) {
+                let schemas = self.schemas.lock().await;
+                let schema = frame["params"]["name"].as_str().and_then(|name| schemas.get(name));
+                for (name, value) in protocol::request_headers(&frame, protocol::MODERN, schema)? {
+                    req = req.header(name, value);
+                }
+            } else {
+                let mut frame: Value = serde_json::from_str(body).map_err(|_| "invalid MCP request")?;
+                strip_modern_metadata(&mut frame);
+                req = req.body(frame.to_string());
+                if let Some(id) = &s.session_id { req = req.header("Mcp-Session-Id", id); }
+                if let Some(v) = &s.protocol_version { req = req.header("MCP-Protocol-Version", v); }
             }
         }
+        self.verify_identity()?;
         if let Some(permit) = permit {
             if !permit.is_live() { return Err("Tool call expired before dispatch".into()); }
             // No await between the phase change and the potentially partial send.
@@ -153,7 +203,7 @@ impl Bridge {
         }
         req.send()
             .await
-            .map_err(|e| format!("cannot reach {}: {e}", super::http::host_label(&auth.url)))
+            .map_err(|_| format!("cannot reach {}", super::http::host_label(&auth.url)))
     }
 
     /// Forward one input line. Errors become JSON-RPC error responses for
@@ -172,6 +222,10 @@ impl Bridge {
             return;
         }
         let kind = classify(&frame);
+        if let Err(message) = self.verify_identity() {
+            if let Kind::Request(id) = &kind { self.emit(error_frame(id, &message)); }
+            return;
+        }
         if let Kind::Request(id) = &kind {
             if crate::third_party_tools::bridge_reserved_id(id) {
                 self.emit(crate::third_party_tools::refusal_frame(id,
@@ -180,11 +234,53 @@ impl Bridge {
             }
         }
         let method = frame.get("method").and_then(|m| m.as_str());
+        if frame["params"].get("requestState").is_some() || frame["params"].get("inputResponses").is_some() {
+            if let Kind::Request(id) = &kind {
+                self.emit(error_frame(id, "MCP bridge multi-round inputs are not supported"));
+            }
+            return;
+        }
         let is_initialize = method == Some("initialize");
+        if matches!(method, Some("initialize" | "server/discover")) {
+            if let Kind::Request(id) = &kind {
+                {
+                    let mut session = self.session.lock().await;
+                    session.downstream_capabilities = if is_initialize {
+                        frame["params"]["capabilities"].as_object().map(|v| Value::Object(v.clone())).unwrap_or_else(|| json!({}))
+                    } else { json!({}) };
+                }
+                match self.negotiate().await {
+                    Ok(discovery) => {
+                        let result = if is_initialize {
+                            let requested = frame["params"]["protocolVersion"].as_str().unwrap_or("2025-11-25");
+                            let version = if ["2025-11-25", "2025-06-18"].contains(&requested) { requested } else { "2025-11-25" };
+                            json!({"protocolVersion":version,"capabilities":discovery["capabilities"],
+                                "serverInfo":{"name":"DuDuClaw remote bridge","version":env!("CARGO_PKG_VERSION")}})
+                        } else { discovery };
+                        self.emit(json!({"jsonrpc":"2.0","id":id,"result":result}).to_string());
+                    }
+                    Err(msg) => self.emit(error_frame(id, &msg)),
+                }
+            }
+            return;
+        }
+        if method == Some("notifications/initialized") { return; }
+        if let Err(msg) = self.negotiate().await {
+            if let Kind::Request(id) = &kind { self.emit(error_frame(id, &msg)); }
+            return;
+        }
         if method == Some("tools/call") && !matches!(&kind, Kind::Request(_)) {
             self.emit(crate::third_party_tools::refusal_frame(&Value::Null,
                 "Malformed tools/call cannot pass the egress gate."));
             return;
+        }
+
+        if method == Some("tools/call") && self.session.lock().await.protocol_version.as_deref() == Some(protocol::MODERN) {
+            let name = frame["params"]["name"].as_str().unwrap_or("");
+            if let Err(message) = self.ensure_schema(name).await {
+                if let Kind::Request(id) = &kind { self.emit(error_frame(id, &message)); }
+                return;
+            }
         }
 
         // Claim once per caller request. Hold this same pending entry and lease
@@ -214,7 +310,15 @@ impl Bridge {
         let wire_kind = classify(&frame);
         let wire_line = frame.to_string();
         let permit = call.as_ref().map(crate::third_party_tools::PendingCall::dispatch_permit);
-        if let Err(msg) = self.exchange(&wire_line, &wire_kind, is_initialize, list_id.as_ref(), permit.as_ref()).await {
+        let modern = self.session.lock().await.protocol_version.as_deref() == Some(protocol::MODERN);
+        let result = if modern {
+            self.modern_exchange(frame, list_id.as_ref(), permit.as_ref()).await
+        } else if self.session.lock().await.legacy_endpoint.is_some() {
+            self.legacy_sse_exchange(frame, list_id.as_ref(), permit.as_ref()).await
+        } else {
+            self.exchange(&wire_line, &wire_kind, is_initialize, list_id.as_ref(), permit.as_ref()).await
+        };
+        if let Err(msg) = result {
             match &kind {
                 Kind::Request(id) => self.emit(error_frame(id, &msg)),
                 _ => tracing::warn!(server = %self.server, error = %msg, "remote MCP message not delivered"),
@@ -307,6 +411,15 @@ impl Bridge {
     }
 
     async fn deliver(&self, mut msg: Value, is_initialize: bool, list_id: Option<&Value>) {
+        if msg["result"]["resultType"] == "input_required" {
+            msg = json!({"jsonrpc":"2.0","id":msg["id"],"error":{
+                "code":BRIDGE_ERROR,"message":"MCP bridge multi-round inputs are not supported"}});
+        }
+        if self.session.lock().await.protocol_version.as_deref() == Some(protocol::MODERN)
+            && msg.get("method").is_some() && msg.get("id").is_some() {
+            tracing::warn!(server = %self.server, "modern MCP server sent an unsolicited request");
+            return;
+        }
         if !self.gate.observe_bridge_response(&mut msg).await { return; }
         // The answer to a `tools/list`: hide the tools this employee may not
         // call here and remember every tool's annotations.
@@ -315,6 +428,9 @@ impl Bridge {
             && msg.get("method").is_none()
             && let Some(result) = msg.get_mut("result")
         {
+            if self.session.lock().await.protocol_version.as_deref() == Some(protocol::MODERN) {
+                self.remember_schemas(result).await;
+            }
             self.gate.filter_list_result(result);
         }
         if is_initialize
@@ -369,7 +485,7 @@ impl Bridge {
                 let chunk = match r.chunk().await {
                     Ok(Some(c)) => c,
                     Ok(None) => break None,
-                    Err(e) => break Some(format!("the remote event stream broke: {e}")),
+                    Err(_) => break Some("the remote event stream broke".to_string()),
                 };
                 buf.extend_from_slice(&chunk);
                 if buf.len() > MAX_MESSAGE_BYTES {
@@ -458,6 +574,7 @@ impl Bridge {
             if let Some(id) = last_event_id {
                 req = req.header("Last-Event-ID", id);
             }
+            self.verify_identity().map_err(|_| GetStreamError::Fatal("identity rejected"))?;
             let resp = req.send().await.map_err(|_| GetStreamError::Transient)?;
             if resp.status().as_u16() == 401 && !forced {
                 forced = true;
@@ -492,6 +609,7 @@ impl Bridge {
             client.delete(auth.url.clone()).header("Mcp-Session-Id", sid),
             &auth,
         );
+        if self.verify_identity().is_err() { return; }
         let _ = tokio::time::timeout(Duration::from_secs(5), req.send()).await;
     }
 
@@ -516,6 +634,9 @@ impl Bridge {
     }
 
     async fn server_stream_once(&self, last_event_id: &mut Option<String>) -> StreamEnd {
+        if self.session.lock().await.protocol_version.as_deref() == Some(protocol::MODERN) {
+            return self.modern_subscription_once().await;
+        }
         let resp = match self.open_get_stream(last_event_id.as_deref()).await {
             Ok(r) => r,
             Err(GetStreamError::Fatal(why)) => return StreamEnd::Stop(why),
@@ -644,11 +765,19 @@ pub(crate) fn event_data(event: &[u8]) -> Option<String> {
 }
 
 /// Run the bridge until `input` ends. Returns the process exit code.
-pub async fn run_bridge<R, W>(home: &Path, agent_id: &str, server: &str, input: R, mut output: W) -> i32
+/// `agent_token` must be the host-signed token for `agent_id`; the CLI obtains
+/// it only after checking the ambient identity against --agent. Library callers
+/// must supply the same credential. Every use rechecks the current signing key.
+pub async fn run_bridge<R, W>(home: &Path, agent_id: &str, server: &str, agent_token: &str, input: R, mut output: W) -> i32
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    // This check precedes even the first remote store read (including flags).
+    if let Err(e) = verify_identity(home, agent_id, agent_token) {
+        tracing::error!(error = %e, "mcp-remote-bridge: identity rejected");
+        return 2;
+    }
     if let Err(e) = super::store::validate_ids(agent_id, server) {
         tracing::error!(error = %e, "mcp-remote-bridge: invalid arguments");
         return 2;
@@ -667,9 +796,14 @@ where
     let bridge = Arc::new(Bridge {
         home: home.to_path_buf(),
         agent_id: agent_id.to_string(),
+        agent_token: agent_token.to_string(),
         server: server.to_string(),
-        session: Mutex::new(Session { session_id: None, protocol_version: None }),
+        session: Mutex::new(Session { session_id: None, protocol_version: None, discovery: None, requires_restart: false, downstream_capabilities: json!({}), legacy_endpoint: None, legacy_source: None }),
         clients: Mutex::new(ClientCache { client: None }),
+        negotiation: Mutex::new(()),
+        schemas: Mutex::new(std::collections::HashMap::new()),
+        effect_annotations: Mutex::new(std::collections::HashMap::new()),
+        legacy_stream: Mutex::new(None),
         last_auth: Mutex::new(None),
         out: tx,
         gate: crate::third_party_tools::ThirdPartyGate::new(home, agent_id, server, "bridge"),
@@ -680,29 +814,28 @@ where
     });
     let mut stream_task: Option<tokio::task::JoinHandle<()>> = None;
 
-    let mut lines = input.lines();
+    let mut input = input;
+    let mut input_failed = false;
     let mut tasks = tokio::task::JoinSet::new();
     loop {
-        let line = match lines.next_line().await {
+        let line = match protocol::read_stdio_frame(&mut input).await {
             Ok(Some(l)) => l,
             Ok(None) => break,
-            Err(e) => {
-                tracing::warn!(error = %e, "mcp-remote-bridge: stdin read failed");
+            Err(_) => {
+                bridge.emit(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"invalid or oversized MCP stdio frame"}}).to_string());
+                tracing::warn!("mcp-remote-bridge: invalid or oversized stdin frame");
+                input_failed = true;
                 break;
             }
         };
         if line.trim().is_empty() {
             continue;
         }
-        if line.len() > MAX_MESSAGE_BYTES {
-            bridge.emit(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"message too large"}}).to_string());
-            continue;
-        }
         let parsed = serde_json::from_str::<Value>(&line).ok();
         let ordered = match &parsed {
             Some(v) => {
                 !matches!(classify(v), Kind::Request(_))
-                    || v.get("method").and_then(|m| m.as_str()) == Some("initialize")
+                    || matches!(v.get("method").and_then(|m| m.as_str()), Some("initialize" | "server/discover"))
             }
             None => true,
         };
@@ -713,7 +846,10 @@ where
             == Some("notifications/initialized");
         if ordered {
             bridge.forward(line).await;
-            if is_initialized && bridge.server_stream && stream_task.is_none() {
+            let modern_ready = parsed.as_ref().and_then(|v| v["method"].as_str()) == Some("server/discover")
+                && bridge.session.lock().await.protocol_version.as_deref() == Some(protocol::MODERN);
+            if (is_initialized || modern_ready) && bridge.server_stream && stream_task.is_none()
+                && bridge.session.lock().await.legacy_endpoint.is_none() {
                 stream_task = Some(tokio::spawn(bridge.clone().server_stream_loop()));
             }
         } else {
@@ -722,6 +858,8 @@ where
         }
         while tasks.try_join_next().is_some() {}
     }
+    drop(input);
+    if input_failed { tasks.abort_all(); }
     while tasks.join_next().await.is_some() {}
     if let Some(t) = stream_task.take() {
         t.abort();
@@ -730,12 +868,80 @@ where
     bridge.close_session().await;
     drop(bridge);
     let _ = writer.await;
-    0
+    if input_failed { 2 } else { 0 }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn signed_token(home: &Path) -> String {
+        let key = duduclaw_core::ensure_identity_key(home).unwrap();
+        duduclaw_core::mint_identity_token(&key, "a1")
+    }
+
+    #[tokio::test]
+    async fn bridge_refuses_missing_wrong_and_forged_tokens_before_reading_input_or_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = signed_token(dir.path());
+        for (agent, token) in [("a1", ""), ("other", token.as_str()), ("a1", "forged")] {
+            // A pending reader would hang if the bridge passed its startup gate.
+            let (input, _peer) = tokio::io::duplex(64);
+            let code = tokio::time::timeout(Duration::from_secs(1), run_bridge(
+                dir.path(), agent, "remote", token, tokio::io::BufReader::new(input), tokio::io::sink(),
+            )).await.expect("invalid identities must be refused before reading input");
+            assert_eq!(code, 2);
+            assert!(!super::super::store::store_path(dir.path()).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_rechecks_identity_for_frames_after_key_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = signed_token(dir.path());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let bridge = Bridge {
+            home: dir.path().to_path_buf(), agent_id: "a1".into(), agent_token: token,
+            server: "remote".into(),
+            session: Mutex::new(Session { session_id: None, protocol_version: None, discovery: None, requires_restart: false, downstream_capabilities: json!({}), legacy_endpoint: None, legacy_source: None }),
+            clients: Mutex::new(ClientCache { client: None }),
+            negotiation: Mutex::new(()),
+            schemas: Mutex::new(std::collections::HashMap::new()),
+            effect_annotations: Mutex::new(std::collections::HashMap::new()),
+            legacy_stream: Mutex::new(None),
+            last_auth: Mutex::new(None), out: tx,
+            gate: crate::third_party_tools::ThirdPartyGate::new(dir.path(), "a1", "remote", "bridge"),
+            server_stream: false,
+        };
+        assert!(bridge.verify_identity().is_ok());
+        std::fs::remove_file(duduclaw_core::identity_key_path(dir.path())).unwrap();
+        bridge.forward(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string()).await;
+        let response: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["error"]["message"], "MCP remote bridge identity rejected");
+        assert!(bridge.clients.lock().await.client.is_none());
+        assert!(bridge.auth(false).await.is_err());
+        assert!(!super::super::store::store_path(dir.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn oversized_stdio_without_newline_returns_error_and_stops() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Infinite source: neither a delimiter nor EOF can end the read.
+        let input = tokio::io::BufReader::new(tokio::io::repeat(b'x'));
+        let (mut reader, writer) = tokio::io::duplex(1024);
+        let code = tokio::time::timeout(Duration::from_secs(5),
+            run_bridge(dir.path(), "a1", "remote", &signed_token(dir.path()), input, writer),
+        ).await.expect("oversized frame must not wait for LF or EOF");
+        assert_eq!(code, 2);
+        let mut out = String::new();
+        reader.read_to_string(&mut out).await.unwrap();
+        let frame: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(frame, json!({"jsonrpc":"2.0","id":null,"error":{
+            "code":-32600,"message":"invalid or oversized MCP stdio frame"
+        }}));
+    }
 
     #[test]
     fn sse_events_are_split_and_data_joined() {
@@ -769,7 +975,7 @@ mod tests {
             input.push('\n');
         }
         let (client, server) = tokio::io::duplex(64 * 1024);
-        assert_eq!(run_bridge(dir.path(), "a1", "remote", input.as_bytes(), server).await, 0);
+        assert_eq!(run_bridge(dir.path(), "a1", "remote", &signed_token(dir.path()), input.as_bytes(), server).await, 0);
         let mut out = String::new();
         let mut reader = tokio::io::BufReader::new(client);
         use tokio::io::AsyncReadExt;
@@ -789,7 +995,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n";
         let (client, server) = tokio::io::duplex(64 * 1024);
-        let code = run_bridge(dir.path(), "a1", "remote", &input[..], server).await;
+        let code = run_bridge(dir.path(), "a1", "remote", &signed_token(dir.path()), &input[..], server).await;
         assert_eq!(code, 0);
         let mut out = String::new();
         let mut r = tokio::io::BufReader::new(client);

@@ -1,5 +1,44 @@
 //! A partial consent can serve only the operations it actually covers.
 
+/// The bearer broker accepts only these operations; status is metadata-only.
+pub const TOKEN_TOOLS: &[&str] = &[
+    "google_chat_spaces", "google_chat_messages",
+    "gmail_search", "gmail_read", "mail_poll", "gmail_create_draft",
+    "calendar_list_events", "calendar_create_event", "sheets_read", "sheets_append",
+    "forms_get", "forms_list_responses", "gtasks_lists", "gtasks_list",
+    "gtasks_create", "gtasks_complete", "drive_search", "drive_read",
+    "docs_read", "docs_append", "slides_read", "google_remote_mcp",
+];
+
+pub fn token_tool(tool: &str) -> bool {
+    TOKEN_TOOLS.contains(&tool)
+}
+
+/// Expose only scopes that have a corresponding local purpose grant.
+pub fn visible_scopes(metadata: &crate::person_credentials::Metadata) -> Vec<String> {
+    metadata.granted_scopes.iter().filter(|scope| {
+        let mut single = metadata.clone();
+        single.granted_scopes = vec![(*scope).clone()];
+        TOKEN_TOOLS.iter().any(|tool| permitted_for(tool, &single))
+            || (metadata.local_purposes.iter().any(|p| p == "meeting_recordings")
+                && matches!(scope.as_str(),
+                    "https://www.googleapis.com/auth/drive.file"
+                    | "https://www.googleapis.com/auth/meetings.space.readonly"))
+    }).cloned().collect()
+}
+
+pub fn permitted_for(tool: &str, metadata: &crate::person_credentials::Metadata) -> bool {
+    if !token_tool(tool) { return false; }
+    let consent = |purpose: &str| metadata.local_purposes.iter().any(|p| p == purpose);
+    let local = match tool {
+        "google_chat_spaces" | "google_chat_messages" => consent("chat_read"),
+        "drive_search" | "drive_read" => consent("drive_tools"),
+        "google_remote_mcp" => consent("base") && consent("drive_tools"),
+        _ => consent("base"),
+    };
+    local && permitted(tool, &metadata.granted_scopes)
+}
+
 fn has(granted: &[String], candidates: &[&str]) -> bool {
     granted
         .iter()
@@ -8,7 +47,8 @@ fn has(granted: &[String], candidates: &[&str]) -> bool {
 
 pub fn permitted(tool: &str, granted: &[String]) -> bool {
     match tool {
-        "google_status" => true,
+        "google_chat_spaces" => has(granted, &["https://www.googleapis.com/auth/chat.spaces.readonly"]),
+        "google_chat_messages" => has(granted, &["https://www.googleapis.com/auth/chat.messages.readonly"]),
         "gmail_search" | "gmail_read" | "mail_poll" => has(
             granted,
             &[

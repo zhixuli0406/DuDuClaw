@@ -5,6 +5,7 @@ import { AlertTriangle } from 'lucide-react';
 import { useChatStore, type ChatMessage } from '@/stores/chat-store';
 import { cn } from '@/lib/utils';
 import { AttachmentChip } from './AttachmentChip';
+import { HistoryAttachmentCard } from './HistoryAttachmentCard';
 import { AssignedTaskCard } from './AssignedTaskCard';
 import { CitationSourceList } from './CitationChips';
 import { MarkdownContent } from './MarkdownContent';
@@ -53,7 +54,8 @@ export function MessageBubble({
         {message.attachments && message.attachments.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-1.5">
             {message.attachments.map((a, i) => (
-              <AttachmentChip key={i} name={a.name} mime={a.mime} />
+              'id' in a ? <HistoryAttachmentCard key={a.id} attachment={a} />
+                : <AttachmentChip key={i} name={a.name} mime={a.mime} />
             ))}
           </div>
         )}

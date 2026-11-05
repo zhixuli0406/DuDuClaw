@@ -153,7 +153,7 @@ describe('EmbeddingStatusBanner', () => {
     renderWithProviders(<EmbeddingStatusBanner />);
     const note = await screen.findByRole('note');
     expect(note).toHaveTextContent('尚未安裝向量模型');
-    expect(screen.getByRole('link', { name: 'Set up meaning-based search' })).toHaveAttribute('href', '/settings?tab=knowledgeSearch');
+    expect(screen.getByRole('link', { name: 'Set up meaning-based search' })).toHaveAttribute('href', '/app/system/settings/advanced#knowledgeSearch');
     useAuthStore.setState({ user: null } as never);
   });
 });

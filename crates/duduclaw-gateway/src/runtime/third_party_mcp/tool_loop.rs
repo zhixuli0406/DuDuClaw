@@ -20,8 +20,8 @@
 //!   environment (`McpClient::connect_scrubbed`), not the gateway's.
 //! - Explore lane: mounted, with `DUDUCLAW_LANE=explore` in each child's
 //!   env, so the proxy (and the bridge) allow read-only tools only — the
-//!   same as a Claude CLI spawn in the lane. `agent.toml` externals stay
-//!   unmounted in the lane because nothing gates them.
+//!   same as a Claude CLI spawn in the lane. `agent.toml` externals remain
+//!   unmounted in the lane, preserving its narrower existing surface.
 //! - A server named in `agent.toml` too (by name, or the same stdio command
 //!   and arguments) is mounted once, from `agent.toml`: that entry already
 //!   carries the operator's tool allowlist and `secret://` references.

@@ -4,18 +4,29 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     info!("Starting DuDuClaw MCP server");
 
     // WP21 debt ⑧ — refuse to serve an unprovable caller identity when the
-    // operator has opted into strict mode. Same fail-closed shape as the M6
+    // policy/key is broken or the default strict check fails. Same shape as the M6
     // auth gate below: a server that cannot say *who* is calling cannot
     // authorize anything, and dying at boot with a legible reason beats
     // running as `__untrusted__` and answering every tool call with a
     // confusing "not in your team".
     if caller_identity_verdict(home_dir) == duduclaw_core::IdentityVerdict::Rejected {
+        // A fresh standalone install lacks both credentials. Keep the identity
+        // refusal first, while still pointing the operator to initialization.
+        let init_hint = if std::env::var_os("DUDUCLAW_MCP_API_KEY").is_none()
+            && std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default().trim().is_empty()
+        {
+            " Run: duduclaw mcp init --client claude-code"
+        } else {
+            ""
+        };
         return Err(DuDuClawError::Gateway(format!(
-            "MCP caller identity rejected: {} is missing or does not match {} \
-             (checked against {}). `[delegation] require_identity_token = true` \
-             in config.toml requires a DuDuClaw-issued token. Restart the gateway \
-             so it re-issues every agent's MCP config, or set the flag back to \
-             false to run in soft mode.",
+            "MCP caller identity rejected: cannot verify {} against {} using {}. \
+             The signing key must be readable, contain exactly 32 bytes, and have \
+             owner-only permissions (0600 on Unix). Restore the original key if \
+             it is damaged. Identity enforcement defaults to strict; the policy \
+             must be readable and valid, and system/queue sender names are refused. \
+             After repairing the key or policy, restart the gateway to re-issue \
+             agent MCP configs.{init_hint}",
             duduclaw_core::ENV_AGENT_TOKEN,
             duduclaw_core::ENV_AGENT_ID,
             duduclaw_core::identity_key_path(home_dir).display(),
@@ -53,11 +64,12 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     let auth_cache = crate::mcp_auth::KeyRegistryCache::new();
     let principal = crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache)
         .map_err(|e| DuDuClawError::Gateway(startup_auth_error(&e)))?;
+
     // Memory namespace unification (v1.68.0): an internal-key caller whose
     // `DUDUCLAW_AGENT_ID` is proven by `DUDUCLAW_AGENT_TOKEN` reads and writes
     // memory under the bare employee id — the same rows the gateway distils,
     // injects and shows on the dashboard. The environment does not change for
-    // the life of this process, so the proof is checked once here; without it
+    // the life of this process; identity is rechecked on each request below. Without it
     // the caller stays in the old shared pool (fail closed).
     let verified_agent = crate::mcp_namespace::verified_employee_from_env(home_dir);
     let resolve_ns = |p: &crate::mcp_auth::Principal| {
@@ -291,6 +303,15 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
             caps
         };
 
+        // A process started during grace must not retain an unverified identity
+        // after the deadline. Keep this stdio-only gate ahead of all dispatch.
+        if caller_identity_verdict(home_dir) == duduclaw_core::IdentityVerdict::Rejected {
+            let err = jsonrpc_error(&id, -32003,
+                "MCP caller identity rejected: strict tokens required or identity policy/key unavailable");
+            let err = if modern { crate::mcp_protocol::modernize_response(err) } else { err };
+            write_response(&mut stdout, &err).await?;
+            continue;
+        }
         let response = match (method, modern) {
             ("initialize", _) => {
                 legacy_initialized = true;

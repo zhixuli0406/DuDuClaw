@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["pypdf>=4.0"]
+# dependencies = ["pypdf==6.7.1"]
 # ///
 """Extract text from a PDF, page by page.
 

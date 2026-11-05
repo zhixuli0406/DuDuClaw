@@ -15,7 +15,7 @@ import { Badge, Button, Card, CardContent, Spinner, Switch } from '@/components/
  * pause / resume / remove. The gateway checks the creator's right again
  * before every run and pauses the schedule when it is gone.
  */
-export function ScheduledAssignmentsSection({ enabled, isAdmin }: { enabled: boolean; isAdmin: boolean }) {
+export function ScheduledAssignmentsSection({ enabled, isAdmin, accessible = false }: { enabled: boolean; isAdmin: boolean; accessible?: boolean }) {
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) =>
     intl.formatMessage({ id: `assignSchedule.${id}` }, values);
@@ -32,7 +32,7 @@ export function ScheduledAssignmentsSection({ enabled, isAdmin }: { enabled: boo
   const load = useCallback(async () => {
     if (!enabled) return;
     try {
-      const r = await api.assignSchedules.list(all && isAdmin ? 'all' : 'mine');
+      const r = await api.assignSchedules.list(accessible ? 'accessible' : all && isAdmin ? 'all' : 'mine');
       setRows(r.schedules ?? []);
       setLimitsUnavailable(r.max_active === null || r.min_interval_minutes === null);
       setFailed(false);
@@ -41,7 +41,7 @@ export function ScheduledAssignmentsSection({ enabled, isAdmin }: { enabled: boo
     } finally {
       setLoading(false);
     }
-  }, [enabled, all, isAdmin]);
+  }, [enabled, all, isAdmin, accessible]);
 
   useEffect(() => {
     setLoading(true);
@@ -89,7 +89,7 @@ export function ScheduledAssignmentsSection({ enabled, isAdmin }: { enabled: boo
           <CalendarClock className="size-4 text-muted-foreground" />
           {t('heading', { n: rows.length })}
         </h2>
-        {isAdmin && (
+        {isAdmin && !accessible && (
           <label className="flex items-center gap-2 text-xs text-muted-foreground">
             <Switch checked={all} onCheckedChange={(v) => setAll(Boolean(v))} />
             {t('showAll')}
@@ -130,7 +130,7 @@ export function ScheduledAssignmentsSection({ enabled, isAdmin }: { enabled: boo
                     {r.creator_name && ` · ${t('creator', { name: r.creator_name })}`}
                   </p>
                 </div>
-                <div className="flex items-center gap-1">
+                {r.can_manage !== false && <div className="flex items-center gap-1">
                   {r.status === 'active' && (
                     <Button size="sm" variant="outline" disabled={busy === r.id} onClick={() => void act(r, 'pause')}>
                       <Pause />
@@ -153,7 +153,7 @@ export function ScheduledAssignmentsSection({ enabled, isAdmin }: { enabled: boo
                     <Trash2 />
                     {confirmRemove === r.id && t('action.confirmRemove')}
                   </Button>
-                </div>
+                </div>}
               </div>
             ))}
           </CardContent>

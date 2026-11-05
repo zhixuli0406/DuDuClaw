@@ -937,7 +937,7 @@ mod tests {
             &home.path().join("agents"), "sales", "Sales", "@sales", "main", "",
         );
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
-        let ctx = claiming_admin(&user);
+        let mut ctx = claiming_admin(&user);
         let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
         let board = broker
             .request("sales", "strategic_plan", "review", json!({}), 300)
@@ -991,6 +991,8 @@ mod tests {
         );
 
         db.set_user_status(&user.id, duduclaw_auth::UserStatus::Active).unwrap();
+        // Reactivation does not restore the credential revoked by suspension.
+        ctx = db.live_user_context(&user.id).unwrap().unwrap();
         let board_frame = handler
             .handle_approvals_decide(json!({"id": board.as_str(), "approve": true}), &ctx)
             .await;

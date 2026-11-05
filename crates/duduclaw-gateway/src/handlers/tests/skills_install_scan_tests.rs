@@ -24,6 +24,7 @@ async fn system_doctor_includes_mcp_server_check() {
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
     let checks = handler.run_doctor_checks().await;
+    assert!(checks.iter().any(|c| c["name"] == "skill_default_layers" && c["can_repair"] == false));
     let mcp = checks
         .iter()
         .find(|c| c["name"] == "mcp_server")
@@ -250,54 +251,29 @@ async fn skills_list_reports_the_directories_it_scanned() {
     assert_eq!(agent["count"], 1);
 }
 
-/// Every agent-creation path must seed the bundled skills. Wiring it to
-/// the MCP `create_agent` tool alone meant a dashboard-onboarded customer
-/// got an empty `SKILLS/` — and, since nothing writes `<home>/skills/`
-/// either, a permanently blank Skills page.
+/// Default capabilities are shared, never copied into a new employee.
 #[tokio::test]
-async fn agent_creation_seeds_the_builtin_skills() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let root = home.path();
-    let skills_dir = root.join("agents").join("newbie").join("SKILLS");
-    std::fs::create_dir_all(&skills_dir).unwrap();
-
-    MethodHandler::seed_builtin_skills(&skills_dir);
-
-    let loaded = duduclaw_agent::registry::AgentRegistry::load_skills(&skills_dir).await;
-    assert!(
-        !loaded.is_empty(),
-        "a freshly created staffer must start with skills the loader can see"
-    );
-    // Seeding writes `<name>/SKILL.md`; the loader keys those on the
-    // parent directory name. If the two layouts ever drift apart the
-    // skills would be on disk yet invisible — the exact failure mode the
-    // customer reported.
-    for (name, _) in duduclaw_agent::builtin_skills::BUILTIN_SKILLS {
-        assert!(
-            loaded.iter().any(|s| s.name == *name),
-            "seeded skill `{name}` must be visible to the loader"
-        );
+async fn agent_creation_uses_company_builtin_skills() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    for name in ["office-one", "office-two"] {
+        let response = handler.handle_agents_create_as(
+            json!({ "name": name, "display_name": name }),
+            Some(&UserContext::admin_fallback()),
+        ).await;
+        assert!(frame_ok(&response), "{response:?}");
+        let personal = home.path().join("agents").join(name).join("SKILLS");
+        assert_eq!(std::fs::read_dir(personal).unwrap().count(), 0);
+        let registry = handler.registry.read().await;
+        let employee = registry.get(name).unwrap();
+        for office in ["docx", "pdf", "pptx", "xlsx"] {
+            assert!(employee.skills.iter().any(|skill| skill.name == office));
+        }
+        for dev in ["code-review", "refactor", "test-writer", "git-workflow"] {
+            assert!(!employee.skills.iter().any(|skill| skill.name == dev));
+        }
     }
-
-    // Idempotent: re-seeding must not duplicate or clobber.
-    std::fs::write(
-        skills_dir
-            .join(duduclaw_agent::builtin_skills::BUILTIN_SKILLS[0].0)
-            .join("SKILL.md"),
-        "# edited by the operator\n",
-    )
-    .unwrap();
-    MethodHandler::seed_builtin_skills(&skills_dir);
-    let after = std::fs::read_to_string(
-        skills_dir
-            .join(duduclaw_agent::builtin_skills::BUILTIN_SKILLS[0].0)
-            .join("SKILL.md"),
-    )
-    .unwrap();
-    assert_eq!(
-        after, "# edited by the operator\n",
-        "operator edits must win"
-    );
+    assert!(home.path().join("skills/docx/scripts/create.py").is_file());
 }
 
 /// WP6 — a routine created from the dashboard must announce itself on the
