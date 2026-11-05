@@ -398,3 +398,22 @@ fn recovery_diagnostics_keep_socket_timestamp_and_history_distinct() {
         assert!(messages::recovery_detail(&status, true).contains(expected));
     }
 }
+
+#[test]
+fn recovery_diagnostic_messages_escape_terminal_and_bidi_controls() {
+    use duduclaw_core::root_key::recovery::{RecoveryStatus, Revocation};
+    let status = RecoveryStatus {
+        latest_revocation: Some(Revocation {
+            reason: "engine_socket_reachable".into(),
+            detail: Some("@docker\u{1b}]52;fake\u{7}\nforged\u{202e}\u{9b}".into()),
+            timestamp: "2026-11-05T01:02:03Z".into(),
+        }),
+        recovery: "waiting".into(),
+    };
+    let text = messages::recovery_detail(&status, true);
+    assert!(!text.chars().any(char::is_control));
+    assert!(!text.contains('\u{202e}'));
+    for escaped in ["\\u{1b}", "\\u{7}", "\\u{a}", "\\u{202e}", "\\u{9b}"] {
+        assert!(text.contains(escaped), "missing {escaped}");
+    }
+}

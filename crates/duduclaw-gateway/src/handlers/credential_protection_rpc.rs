@@ -35,6 +35,7 @@ pub(crate) fn protection_for(home: &Path) -> CredentialProtection {
 /// The JSON the dashboard reads. Explicit fields — never a serialization of
 /// anything that could one day grow a secret.
 pub(crate) fn status_json(s: &ProtectionStatus) -> Value {
+    use duduclaw_core::root_key::recovery::escape_diagnostic_text;
     json!({
         "level": s.level,
         "platform_level": s.platform_level,
@@ -43,8 +44,8 @@ pub(crate) fn status_json(s: &ProtectionStatus) -> Value {
         "key_id": s.key_id,
         "enabled_at": s.enabled_at,
         "person_identity_allowed": s.person_identity_allowed,
-        "summary": s.summary_zh,
-        "detail": s.detail_zh,
+        "summary": escape_diagnostic_text(&s.summary_zh),
+        "detail": escape_diagnostic_text(&s.detail_zh),
         "refusal_reason": s.refusal_reason,
         "root_key_recovery": s.root_key_recovery,
     })

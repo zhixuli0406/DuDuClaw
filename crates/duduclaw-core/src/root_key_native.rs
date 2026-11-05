@@ -1,5 +1,9 @@
 //! Native systemd attestation facts and Linux probes. No configuration fallback.
 
+#[cfg(any(target_os = "linux", test))]
+#[path = "root_key_unix_diag.rs"]
+mod unix_diag;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CgroupState { Unit, V1, #[default] Invalid }
 
@@ -87,63 +91,126 @@ pub fn native_host_check() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Abstract sockets are matched by slash-delimited components, exactly an
-/// engine name or its . / - / _ suffix namespace. Never arbitrary substrings.
+/// Abstract sockets are matched as raw bytes by slash-delimited components,
+/// exactly an engine name or its . / - / _ suffix namespace.
 #[cfg(any(target_os = "linux", test))]
-fn abstract_engine_name(name: &str) -> bool {
-    // docker/cli cmd/docker/docker.go creates this random coordination socket
-    // via cli-plugins/socket/socket.go with a nil handler; clients only get
-    // EOF when the CLI exits, so it cannot expose the container engine API.
-    if let Some(random) = name.strip_prefix("@docker_cli_") {
-        if random.len() == 32 && random.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
-            return false;
-        }
-    }
-    name.strip_prefix('@').is_some_and(|name| name.split('/').any(|component| {
-        ["docker", "containerd", "podman", "buildkit", "lxd"].iter().any(|engine| {
+fn abstract_engine_name(name: &[u8]) -> bool {
+    name.strip_prefix(b"@").is_some_and(|name| name.split(|b| *b == b'/').any(|component| {
+        [b"docker".as_slice(), b"containerd", b"podman", b"buildkit", b"lxd"].iter().any(|engine| {
             component == *engine || component.strip_prefix(*engine).is_some_and(|suffix| {
-                suffix.starts_with('.') || suffix.starts_with('-') || suffix.starts_with('_')
+                matches!(suffix.first(), Some(b'.' | b'-' | b'_'))
             })
         })
     }))
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn abstract_sockets_denied(input: Option<&str>, periodic: bool, mut peer_uid: impl FnMut(&str) -> Option<u32>) -> Result<(), String> {
-    // A held key proves this probe passed intake. On a transient table read
-    // failure retain only that probe's previous safe verdict; still check paths
-    // and groups. Intake has no previous verdict and must fail closed.
-    let Some(input) = input else {
-        return if periodic { Ok(()) } else { Err("/proc/net/unix: table unreadable".into()) };
+#[derive(Clone, Copy)]
+struct Peer { uid: u32, pid: u32 }
+
+#[cfg(any(target_os = "linux", test))]
+fn docker_cli_candidate(name: &[u8]) -> bool {
+    name.strip_prefix(b"@docker_cli_").is_some_and(|random| random.len() == 32
+        && random.iter().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)))
+}
+
+/// The name is only a candidate. Host root can already read the key: the
+/// residual trust is "host root, not containerised", not executable identity.
+/// A privileged container able to rewrite its cgroup is host-root equivalent.
+#[cfg(any(target_os = "linux", test))]
+fn host_docker_cli(peer: Peer, read_proc: &mut impl FnMut(u32, &str) -> Option<Vec<u8>>) -> bool {
+    if peer.uid != 0 || peer.pid == 0 { return false; }
+    let Some(cgroup) = read_proc(peer.pid, "cgroup") else { return false; };
+    let cgroup = cgroup.strip_suffix(b"\n").unwrap_or(&cgroup);
+    let Some(path) = cgroup.strip_prefix(b"0::/") else { return false; };
+    // One parseable v2 line only. Escaped/control/non-ASCII paths cannot prove
+    // that container markers are absent, so they are not eligible for exclusion.
+    if path.iter().any(|b| !(0x21..=0x7e).contains(b) || matches!(b, b'\\' | b':')) {
+        return false;
+    }
+    if !path.is_empty() && path.split(|b| *b == b'/').any(|part| {
+        part.is_empty() || part == b"." || part == b".." || part == b"docker"
+            || (part.starts_with(b"docker-") && part.ends_with(b".scope"))
+            || part == b"containerd" || part == b"machine.slice"
+            || [b"libpod".as_slice(), b"crio", b"kubepods", b"lxc", b"actions_job"]
+                .iter().any(|prefix| part.starts_with(prefix))
+    }) { return false; }
+    let Some(comm) = read_proc(peer.pid, "comm") else { return false; };
+    if comm != b"docker\n" && comm != b"docker" { return false; }
+    let Some(status) = read_proc(peer.pid, "status") else { return false; };
+    let mut nspids = status.split(|b| *b == b'\n').filter_map(|line| line.strip_prefix(b"NSpid:"));
+    let Some(nspid) = nspids.next() else { return false; };
+    if nspids.next().is_some() { return false; }
+    let ids: Vec<_> = nspid.split(u8::is_ascii_whitespace).filter(|v| !v.is_empty()).collect();
+    ids.len() == 1 && parse_number(ids[0], 10) == Some(u64::from(peer.pid))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_number(bytes: &[u8], radix: u32) -> Option<u64> {
+    if bytes.is_empty() || !bytes.iter().all(|b| match radix {
+        16 => b.is_ascii_hexdigit(), _ => b.is_ascii_digit(),
+    }) { return None; }
+    u64::from_str_radix(std::str::from_utf8(bytes).ok()?, radix).ok()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn abstract_sockets_denied(input: Option<&[u8]>, mut peer_cred: impl FnMut(&[u8]) -> Option<Peer>,
+    mut read_proc: impl FnMut(u32, &str) -> Option<Vec<u8>>) -> Result<(), String> {
+    // Never retain a previous verdict, including while Held. /proc renders
+    // raw name bytes (and newlines), so validate every row before ignoring it.
+    // This conservative byte parser avoids UTF-8 decoding of the whole table.
+    let Some(input) = input else { return Err("/proc/net/unix: table unreadable".into()); };
+    let Some(input) = input.strip_suffix(b"\n") else {
+        return Err("/proc/net/unix: truncated table".into());
     };
-    let mut lines = input.lines();
-    if lines.next() != Some("Num       RefCount Protocol Flags    Type St Inode Path") {
+    let mut lines = input.split(|byte| *byte == b'\n');
+    if lines.next() != Some(b"Num       RefCount Protocol Flags    Type St Inode Path".as_slice()) {
         return Err("/proc/net/unix: unexpected table header".into());
     }
     for line in lines {
+        // A name containing whitespace or a newline continuation is ambiguous;
+        // reject instead of guessing whether it belongs to an engine row.
         let mut rest = line;
-        let mut fields = Vec::new();
+        let mut fields = Vec::with_capacity(7);
         for _ in 0..7 {
-            rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
-            let end = rest.find(|c: char| c.is_ascii_whitespace()).unwrap_or(rest.len());
+            rest = rest.trim_ascii_start();
+            let end = rest.iter().position(|b| *b == b' ').unwrap_or(rest.len());
             fields.push(&rest[..end]);
             rest = &rest[end..];
         }
-        let name = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
-        // Malformed unrelated rows cannot establish engine reachability.
-        if !abstract_engine_name(name) { continue; }
-        let Ok(flags) = u32::from_str_radix(fields[3], 16) else { continue; };
-        if flags & 0x10000 != 0 {
-            if let Some(0) = peer_uid(name) { return Err(format!("{name}: peer uid=0 (root)")); }
+        let name = if rest.is_empty() { rest } else {
+            let name = rest.strip_prefix(b" ").unwrap_or_default();
+            if name.is_empty() || name.iter().any(u8::is_ascii_whitespace) {
+                return Err("/proc/net/unix: malformed row or split socket name".into());
+            }
+            name
+        };
+        if !line.first().is_some_and(u8::is_ascii_hexdigit)
+            || fields[0].strip_suffix(b":").and_then(|v| parse_number(v, 16)).is_none()
+            || fields[1..6].iter().any(|v| parse_number(v, 16).is_none())
+            || parse_number(fields[6], 10).is_none() {
+            return Err("/proc/net/unix: malformed row or split socket name".into());
+        }
+        let flags = parse_number(fields[3], 16).filter(|v| *v <= u32::MAX as u64)
+            .ok_or_else(|| "/proc/net/unix: invalid flags".to_owned())?;
+        // The kernel prints embedded NUL as '@', losing address identity.
+        if name.iter().any(|b| b.is_ascii_control()) || name.get(1..).is_some_and(|s| s.contains(&b'@')) {
+            return Err("/proc/net/unix: ambiguous socket name".into());
+        }
+        if !abstract_engine_name(name) || flags & 0x10000 == 0 { continue; }
+        if let Some(peer @ Peer { uid: 0, .. }) = peer_cred(name) {
+            if docker_cli_candidate(name) && host_docker_cli(peer, &mut read_proc) { continue; }
+            let label: String = name.iter().flat_map(|byte| std::ascii::escape_default(*byte)).map(char::from).collect();
+            return Err(format!("{label}: peer uid=0 (root)"));
         }
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn abstract_peer_uid(name: &str) -> Option<u32> {
+fn abstract_peer_cred(name: &[u8]) -> Option<Peer> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let name = name.strip_prefix('@')?.as_bytes();
+    let name = name.strip_prefix(b"@")?;
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     if name.len() + 1 > address.sun_path.len() { return None; }
     address.sun_family = libc::AF_UNIX as libc::sa_family_t;
@@ -169,32 +236,33 @@ fn abstract_peer_uid(name: &str) -> Option<u32> {
     if unsafe { libc::getsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED,
         (&mut credentials as *mut libc::ucred).cast(), &mut size) } != 0
         || size as usize != std::mem::size_of_val(&credentials) { return None; }
-    Some(credentials.uid)
+    Some(Peer { uid: credentials.uid, pid: u32::try_from(credentials.pid).ok()? })
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn reattest(uid: u32, held: bool) -> Result<(), super::Refusal> {
+pub(super) fn reattest(uid: u32) -> Result<(), super::Refusal> {
     let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
     if count != 0 { return Err("supplementary_groups".into()); }
-    // After revocation there is no held-key verdict to retain on read failure.
-    engine_sockets_denied(uid, held).map_err(|detail| super::Refusal {
+    engine_sockets_denied(uid).map_err(|detail| super::Refusal {
         reason: "engine_socket_reachable", detail: Some(detail),
     })
 }
 
 #[cfg(target_os = "linux")]
-fn engine_sockets_denied(uid: u32, periodic: bool) -> Result<(), String> {
+fn engine_sockets_denied(uid: u32) -> Result<(), String> {
     for path in [
         "/var/run/docker.sock".to_string(), "/run/docker.sock".to_string(),
         "/run/podman/podman.sock".to_string(), "/var/run/podman/podman.sock".to_string(),
         "/run/containerd/containerd.sock".to_string(),
         format!("/run/user/{uid}/docker.sock"), format!("/run/user/{uid}/podman/podman.sock"),
     ] { engine_socket_denied(&path)?; }
-    let table = std::fs::read_to_string("/proc/net/unix");
-    if periodic && table.is_err() {
-        tracing::warn!(error = ?table.as_ref().err(), "Abstract socket table unreadable; retaining previous probe verdict");
-    }
-    abstract_sockets_denied(table.ok().as_deref(), periodic, abstract_peer_uid)
+    let table = std::fs::read("/proc/net/unix");
+    abstract_sockets_denied(table.ok().as_deref(), abstract_peer_cred, |pid, file| {
+        std::fs::read(format!("/proc/{pid}/{file}")).ok()
+    })?;
+    // The table alone cannot recognize a newline followed by a valid forged
+    // row. Kernel length-delimited names are mandatory before a safe verdict.
+    unix_diag::validate_names()
 }
 
 /// Accept exactly one v2 unit line, with at most the kernel's trailing newline.
@@ -216,7 +284,7 @@ pub(super) fn parse_cgroup(input: Option<&str>) -> CgroupState {
 #[cfg(target_os = "linux")]
 pub(super) fn gather(uid: u32) -> NativeInputs {
     let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    let socket_check = engine_sockets_denied(uid, false);
+    let socket_check = engine_sockets_denied(uid);
     NativeInputs {
         initial_user_namespace: initial_user_namespace(),
         container_environment_absent: container_environment_absent(),
@@ -324,15 +392,29 @@ mod tests {
 #[cfg(test)]
 mod parser_tests {
     use super::*;
-    const HEADER: &str = "Num       RefCount Protocol Flags    Type St Inode Path\n";
+    const HEADER: &[u8] = b"Num       RefCount Protocol Flags    Type St Inode Path\n";
+    const CLI: &[u8] = b"@docker_cli_3e708842d9322cef25983565c19d0866";
+    const ROOT: Peer = Peer { uid: 0, pid: 42 };
+
+    fn table(name: &[u8]) -> Vec<u8> {
+        [HEADER, b"0000: 2 0 00010000 0001 01 42 ", name, b"\n"].concat()
+    }
+
+    fn host_proc(pid: u32, file: &str) -> Option<Vec<u8>> {
+        assert_eq!(pid, 42);
+        Some(match file {
+            "cgroup" => b"0::/user.slice/user-0.slice/session-1.scope\n".as_slice(),
+            "comm" => b"docker\n",
+            "status" => b"Name:\tdocker\nNSpid:\t42\nUid:\t0\t0\t0\t0\n",
+            _ => panic!("unexpected proc file"),
+        }.to_vec())
+    }
 
     #[test]
     fn root_key_abstract_detail_identifies_exact_root_peer() {
-        let table = format!("{HEADER}0000: 2 0 00010000 0001 01 42 @/containerd-shim/example\n");
-        assert_eq!(abstract_sockets_denied(Some(&table), false, |_| Some(0)),
+        assert_eq!(abstract_sockets_denied(Some(&table(b"@/containerd-shim/example")), |_| Some(ROOT), host_proc),
             Err("@/containerd-shim/example: peer uid=0 (root)".into()));
-        assert_eq!(abstract_sockets_denied(Some("bad header"), true, |_| None),
-            Err("/proc/net/unix: unexpected table header".into()));
+        assert!(abstract_sockets_denied(Some(b"bad header\n"), |_| None, host_proc).is_err());
     }
 
     #[cfg(unix)]
@@ -348,52 +430,114 @@ mod parser_tests {
     }
 
     #[test]
-    fn root_key_abstract_peer_credentials_and_transient_reads() {
-        let table = format!("{HEADER}bad row\n0000: 2 0 00010000 0001 01 42 @attacker/docker\n");
-        assert!(abstract_sockets_denied(Some(&table), false, |_| Some(1000)).is_ok());
-        assert!(abstract_sockets_denied(Some(&table), false, |_| None).is_ok());
-        assert!(abstract_sockets_denied(Some(&table), false, |_| Some(0)).is_err());
-        assert!(abstract_sockets_denied(None, true, |_| panic!("no table")).is_ok());
-        assert!(abstract_sockets_denied(None, false, |_| panic!("no table")).is_err());
-        let unrelated = format!("{HEADER}bad row\n0000: 2 0 broken 0001 01 42 @unrelated\n");
-        assert!(abstract_sockets_denied(Some(&unrelated), true, |_| panic!("non-candidate")).is_ok());
+    fn root_key_abstract_peer_credentials_and_read_errors() {
+        let table = table(b"@attacker/docker");
+        assert!(abstract_sockets_denied(Some(&table), |_| Some(Peer { uid: 1000, pid: 42 }), host_proc).is_ok());
+        assert!(abstract_sockets_denied(Some(&table), |_| None, host_proc).is_ok());
+        assert!(abstract_sockets_denied(Some(&table), |_| Some(ROOT), host_proc).is_err());
+        // Intake, Held and Refused all use this same fail-closed read path.
+        assert!(abstract_sockets_denied(None, |_| panic!("no table"), host_proc).is_err());
+        assert!(abstract_sockets_denied(Some(HEADER), |_| panic!("no candidates"), host_proc).is_ok());
     }
 
     #[test]
-    fn abstract_engine_socket_names_are_component_anchored() {
+    fn root_key_non_utf8_names_do_not_blind_engine_probe() {
+        let mut input = table(b"@unrelated-\xff");
+        input.extend_from_slice(&table(b"@docker.sock")[HEADER.len()..]);
+        let result = abstract_sockets_denied(Some(&input), |name| {
+            assert_eq!(name, b"@docker.sock"); Some(ROOT)
+        }, host_proc);
+        assert_eq!(result, Err("@docker.sock: peer uid=0 (root)".into()));
+        assert!(abstract_sockets_denied(Some(&table(b"@unrelated-\xff")), |_| panic!("non-engine"), host_proc).is_ok());
+        assert!(abstract_sockets_denied(Some(&table(b"@docker_\xff")), |name| {
+            assert_eq!(name, b"@docker_\xff"); Some(ROOT)
+        }, host_proc).unwrap_err().contains("\\xff"));
+    }
+
+    #[test]
+    fn root_key_malformed_rows_and_split_names_fail_closed() {
+        for row in [b"bad row\n".as_slice(), b"\n", b"0000: 2 0 broken 0001 01 42 @unrelated\n",
+            b"0000: 2 0 100000000 0001 01 42 @unrelated\n", b"0000: 2 0 10000 0001 01\n",
+            b"0000: 2 0 10000 0001 01 NaN @unrelated\n", b"x: 2 0 10000 0001 01 42 @unrelated\n",
+            b"0000: 2 0 10000 nope 01 42 @unrelated\n", b"0000: 2 0 10000 0001 01 42 @name extra\n",
+            b"0000: 2 0 10000 0001 01 42 @unrelated\ncontinuation\n",
+            b"0000: 2 0 10000 0001 01 42 @unrelated\r\n",
+            b"0000: 2 0 10000 0001 01 42 @unrelated \n",
+            b"0000: 2 0 10000 0001 01 42  @unrelated\n",
+            b"0000: 2 0 10000 0001 01 42 @embedded@nul\n",
+            b"0000: 2 0 10000 0001 01 42 @unterminated"] {
+            let input = [HEADER, row].concat();
+            assert!(abstract_sockets_denied(Some(&input), |_| None, host_proc).is_err(), "{row:?}");
+        }
+        let unnamed = [HEADER, b"0000: 2 0 00000000 0001 03 42\n"].concat();
+        assert!(abstract_sockets_denied(Some(&unnamed), |_| panic!("unnamed"), host_proc).is_ok());
+    }
+
+    #[test]
+    fn root_key_abstract_engine_socket_names_are_component_anchored() {
         for name in ["@docker", "@docker.sock", "@run/podman/control", "@containerd-shim",
             "@buildkit_worker", "@lxd/unix.socket"] {
-            assert!(abstract_engine_name(name), "{name}");
-            let table = format!("{HEADER}0000: 00000002 00000000 00010000 0001 01 42 {name}\n");
-            assert!(abstract_sockets_denied(Some(&table), false, |_| Some(0)).is_err());
-            let connected = format!("{HEADER}0000: 00000002 00000000 00000000 0001 03 42 {name}\n");
-            assert!(abstract_sockets_denied(Some(&connected), false, |_| Some(0)).is_ok());
+            assert!(abstract_engine_name(name.as_bytes()), "{name}");
+            assert!(abstract_sockets_denied(Some(&table(name.as_bytes())), |_| Some(ROOT), host_proc).is_err());
+            let connected = format!("0000: 2 0 00000000 0001 03 42 {name}\n");
+            let input = [HEADER, connected.as_bytes()].concat();
+            assert!(abstract_sockets_denied(Some(&input), |_| panic!("not listening"), host_proc).is_ok());
         }
         for name in ["@notdocker", "@dockerish", "@my-containerd", "@notes-about-podman",
             "@path/dockerman", "/run/docker.sock"] {
-            assert!(!abstract_engine_name(name), "{name}");
+            assert!(!abstract_engine_name(name.as_bytes()), "{name}");
         }
-        assert!(abstract_sockets_denied(None, false, |_| Some(0)).is_err());
-        assert!(abstract_sockets_denied(Some(""), false, |_| Some(0)).is_err());
-        assert!(abstract_sockets_denied(Some(&format!("{HEADER}bad row")), false, |_| panic!("non-candidate")).is_ok());
-        assert!(abstract_sockets_denied(Some(HEADER), false, |_| Some(0)).is_ok());
     }
 
     #[test]
-    fn docker_cli_coordination_socket_is_not_an_engine_socket() {
-        assert!(!abstract_engine_name("@docker_cli_3e708842d9322cef25983565c19d0866"));
-        for name in [
-            "@docker_cli_x",
-            "@docker_cli_3e708842d9322cef25983565c19d0866/x",
-            "@docker_cli_3e708842d9322cef25983565c19d086",
-            "@docker_cli_3e708842d9322cef25983565c19d08666",
-            "@docker_cli_3E708842D9322CEF25983565C19D0866",
-            "@/containerd-shim/...",
-            "@docker",
-            "@docker.sock",
-            "@containerd-shim",
+    fn root_key_docker_cli_name_alone_never_excludes_a_root_peer() {
+        assert!(abstract_engine_name(CLI));
+        assert!(docker_cli_candidate(CLI));
+        assert!(abstract_sockets_denied(Some(&table(CLI)), |_| Some(ROOT), host_proc).is_ok());
+        assert!(abstract_sockets_denied(Some(&table(CLI)), |_| Some(ROOT), |_, _| None).is_err());
+        for name in ["@docker_cli_x", "@docker_cli_3e708842d9322cef25983565c19d0866/x",
+            "@docker_cli_3e708842d9322cef25983565c19d086", "@docker_cli_3e708842d9322cef25983565c19d08666",
+            "@docker_cli_3E708842D9322CEF25983565C19D0866"] {
+            assert!(!docker_cli_candidate(name.as_bytes()));
+            assert!(abstract_sockets_denied(Some(&table(name.as_bytes())), |_| Some(ROOT), host_proc).is_err());
+        }
+    }
+
+    #[test]
+    fn root_key_docker_cli_requires_visible_host_pid_and_all_proc_facts() {
+        for file in ["cgroup", "comm", "status"] {
+            assert!(!host_docker_cli(ROOT, &mut |pid, name| if name == file { None } else { host_proc(pid, name) }));
+        }
+        for peer in [Peer { uid: 1000, pid: 42 }, Peer { uid: 0, pid: 0 }] {
+            assert!(!host_docker_cli(peer, &mut |_, _| panic!("invalid peer")));
+        }
+        for (file, bytes) in [
+            ("comm", b"dockerd\n".as_slice()), ("comm", b"docker \n"), ("comm", b"docker\nextra"),
+            ("status", b"NSpid:\t42 1\n"), ("status", b"NSpid:\t\n"), ("status", b"Name:\tdocker\n"),
+            ("status", b"NSpid: nope\n"), ("status", b"NSpid: 41\n"), ("status", b"NSpid: 42\nNSpid: 42\n"),
+            ("cgroup", b""), ("cgroup", b"0::/\n0::/\n"), ("cgroup", b"1:name=systemd:/\n"),
+            ("cgroup", b"0::relative\n"), ("cgroup", b"0::/bad\xff\n"), ("cgroup", b"0::/bad\\x2fname\n"),
         ] {
-            assert!(abstract_engine_name(name), "{name}");
+            assert!(abstract_sockets_denied(Some(&table(CLI)), |_| Some(ROOT), |pid, name| {
+                if name == file { Some(bytes.to_vec()) } else { host_proc(pid, name) }
+            }).is_err(), "{file}: {bytes:?}");
+        }
+        for path in ["/", "/system.slice/docker.service", "/user.slice/session-1.scope"] {
+            assert!(host_docker_cli(ROOT, &mut |pid, file| if file == "cgroup" {
+                Some(format!("0::{path}\n").into_bytes())
+            } else { host_proc(pid, file) }));
+        }
+    }
+
+    #[test]
+    fn root_key_docker_cli_rejects_every_container_cgroup_marker() {
+        for component in ["docker-0123.scope", "docker", "containerd", "libpod", "libpod-123.scope",
+            "crio", "crio-123.scope", "kubepods", "kubepods.slice", "lxc", "lxc.payload.demo",
+            "machine.slice", "actions_job", "actions_job_123"] {
+            assert!(abstract_sockets_denied(Some(&table(CLI)), |_| Some(ROOT), |pid, file| {
+                if file == "cgroup" { Some(format!("0::/system.slice/{component}/child\n").into_bytes()) }
+                else { host_proc(pid, file) }
+            }).is_err(), "{component}");
         }
     }
 }

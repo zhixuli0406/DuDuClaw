@@ -169,9 +169,8 @@ pub(crate) fn intake(hardening_failure: Option<&'static str>) {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(60));
                     let Some(mut state) = locked_state() else { break; };
-                    let held = matches!(*state, State::Held(_));
                     // Keep key borrowers out through the probe and zeroization.
-                    let result = native::reattest(uid, held);
+                    let result = native::reattest(uid);
                     if let Err(failure) = &result {
                         let was_held = revoke_if_held(&mut state, failure.reason);
                         // A new non-transient failure permanently stops recovery,
@@ -181,7 +180,7 @@ pub(crate) fn intake(hardening_failure: Option<&'static str>) {
                         if newly_non_transient { revoke_state(&mut state, failure.reason); }
                         if was_held || newly_non_transient {
                             recovery::record_refusal(failure.reason, failure.detail.as_deref());
-                            tracing::warn!(reason = failure.reason, detail = ?failure.detail,
+                            tracing::warn!(reason = failure.reason, detail = ?failure.detail.as_deref().map(recovery::sanitize_diagnostic),
                                 "Protected root key revoked; personal accounts paused");
                         }
                     }
@@ -216,7 +215,7 @@ fn intake_state(hardening_failure: Option<&'static str>) -> State {
                     tracing::warn!("Mount table or mount points could not be inspected");
                 }
                 recovery::record_refusal(reason, failure.detail.as_deref());
-                tracing::warn!(reason, detail = ?failure.detail, "Protected root key refused; personal accounts remain disabled");
+                tracing::warn!(reason, detail = ?failure.detail.as_deref().map(recovery::sanitize_diagnostic), "Protected root key refused; personal accounts remain disabled");
                 State::Refused(reason)
             }
         }

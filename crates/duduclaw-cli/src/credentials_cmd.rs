@@ -53,7 +53,13 @@ fn authorize(home: &Path, markers: &[&str]) -> Result<()> {
     Ok(())
 }
 
+fn status_text(status: &ProtectionStatus) -> (String, String) {
+    use duduclaw_core::root_key::recovery::escape_diagnostic_text;
+    (escape_diagnostic_text(&status.summary_zh), escape_diagnostic_text(&status.detail_zh))
+}
+
 fn print_status(status: &ProtectionStatus, json: bool) {
+    let (summary, detail) = status_text(status);
     if json {
         let value = serde_json::json!({
             "level": status.level,
@@ -63,15 +69,15 @@ fn print_status(status: &ProtectionStatus, json: bool) {
             "key_id": status.key_id,
             "enabled_at": status.enabled_at,
             "person_identity_allowed": status.person_identity_allowed,
-            "summary": status.summary_zh,
-            "detail": status.detail_zh,
+            "summary": summary,
+            "detail": detail,
             "root_key_recovery": status.root_key_recovery,
         });
         println!("{value}");
         return;
     }
-    println!("{}", status.summary_zh);
-    println!("  {}", status.detail_zh);
+    println!("{summary}");
+    println!("  {detail}");
     let allowed = if status.person_identity_allowed { "可以" } else { "不可以" };
     println!("  AI 員工使用個人帳號：{allowed}");
 }
@@ -87,4 +93,16 @@ mod tests {
         assert!(err.contains("AI 員工不能"), "{err}");
         assert!(!home.exists(), "nothing may be created on refusal");
     }
+    #[test]
+    fn credentials_status_text_escapes_terminal_controls() {
+        let home = tempfile::tempdir().unwrap();
+        let mut status = CredentialProtection::platform(home.path()).status();
+        status.summary_zh = "狀態\u{1b}[2J".into();
+        status.detail_zh = "詳情\r\n\u{9b}\u{202e}\u{7f}".into();
+        let (summary, detail) = status_text(&status);
+        assert_eq!(summary, "狀態\\u{1b}[2J");
+        assert_eq!(detail, "詳情\\u{d}\\u{a}\\u{9b}\\u{202e}\\u{7f}");
+        assert!(!summary.chars().chain(detail.chars()).any(char::is_control));
+    }
+
 }

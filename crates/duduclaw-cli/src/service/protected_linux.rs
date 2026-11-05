@@ -70,6 +70,11 @@ fn unit_text() -> String {
 Description=DuDuClaw protected gateway
 After=network-online.target
 Wants=network-online.target
+# Root-managed authority: at most four starts per hour, shared by recovery,
+# normal failures and manual starts. Even after an old long-lived start expires,
+# recovery cannot obtain a fifth start. The home JSON is only advisory.
+StartLimitIntervalSec=3600
+StartLimitBurst=4
 
 [Service]
 Type=simple

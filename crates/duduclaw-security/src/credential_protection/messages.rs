@@ -149,16 +149,16 @@ pub(super) fn recovery_detail(
     let mut text = String::new();
     if let Some(revocation) = &status.latest_revocation {
         text.push_str(&format!(" 最近一次金鑰拒絕或撤銷（UTC {}）：{}",
-            revocation.timestamp, refusal_text(&revocation.reason).unwrap_or("保護檢查未通過。")));
+            duduclaw_core::root_key::recovery::sanitize_diagnostic(&revocation.timestamp), refusal_text(revocation.reason.as_str()).unwrap_or("保護檢查未通過。")));
         if let Some(detail) = &revocation.detail {
-            text.push_str(&format!(" 偵測詳情：{detail}。"));
+            text.push_str(&format!(" 偵測詳情：{}。", duduclaw_core::root_key::recovery::sanitize_diagnostic(detail)));
         }
     }
     if currently_refused {
         text.push_str(match status.recovery.as_str() {
             "disabled" => " 自動恢復已關閉；排除原因後，請由管理者重新啟動受保護服務。",
             "waiting" | "monitoring" => " 每分鐘重新檢查，連續三次通過後會重新啟動服務，重新執行完整金鑰交接檢查。",
-            "budget_exhausted" => " 已用完每小時四次自動重啟額度；額度恢復且環境檢查通過後再試。",
+            "budget_exhausted" => " 已用完每小時四次自動重啟的建議額度；系統服務管理員另限制每小時的啟動總數，一般故障重啟也會計入。達到系統限制後，請由管理者確認環境並重新啟動。",
             "restart_requested" => " 已要求正常關機；服務管理員將重新啟動服務並重新執行完整金鑰交接檢查。",
             "state_unavailable" => " 無法讀取或保存恢復狀態，因此不會自動重啟。請檢查服務資料目錄的權限與可用空間。",
             "non_transient" => " 此原因不會自動恢復；請修正保護設定後，由管理者重新啟動受保護服務。",
