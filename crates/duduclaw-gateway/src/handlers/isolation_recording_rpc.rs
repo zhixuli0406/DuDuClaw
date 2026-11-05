@@ -17,7 +17,7 @@ impl MethodHandler {
             }
         }
         #[cfg(not(target_os = "linux"))]
-        { let _ = (id, ctx); WsFrame::error_response("", "這個環境尚未提供受保護錄製。"); }
+        { let _ = (id, ctx); WsFrame::error_response("", "這個環境尚未提供受保護錄製。") }
     }
 }
 #[cfg(test)]
