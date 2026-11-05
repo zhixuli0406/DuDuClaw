@@ -3644,6 +3644,11 @@ mod compat_feature_gate_tests {
 
 #[derive(Subcommand)]
 enum ServiceCommands {
+    /// Check protected Linux installation and isolation readiness without starting services
+    Readiness {
+        #[arg(long, required = true)]
+        protected_linux: bool,
+    },
     /// Install DuDuClaw as a system service
     Install {
         /// Install the root-protected native Linux system service (requires sudo)
@@ -5593,6 +5598,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             },
         },
         Commands::Ops(OpsCommands::Service { command }) => match command {
+            ServiceCommands::Readiness { protected_linux: _ } => service::protected_linux::readiness(),
             ServiceCommands::Install { protected_linux, enable_now, migrate_from, force_migrate, i_verified_this_binary } => {
                 if protected_linux {
                     service::protected_linux::install(service::protected_linux::InstallOptions {

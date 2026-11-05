@@ -4,6 +4,7 @@ use duduclaw_isolation::{ids::RequestId, migration::MigrationState};
 use rand::{RngCore, rngs::OsRng};
 use rustix::{fd::{AsFd, OwnedFd}, fs::{self as rfs, FlockOperation, Mode, OFlags}};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[path = "native_stop.rs"]
 pub mod native_stop;
 #[path = "root_bootstrap.rs"]
@@ -52,12 +53,16 @@ impl RootPlan {
 pub trait RootMigrationIntegration {
     /// Prove all required adapters/services are installed BEFORE stopping the old
     /// environment. The explicit prepare-only operator command is the exception.
+    fn materialization_ready(&mut self, _plan: &RootPlan) -> Result<bool, Error> { Ok(false) }
     fn preflight(&mut self, _plan: &RootPlan) -> Result<(), Error> { Err(Error::Unavailable) }
     fn readback(&mut self, operation: StageOperation, plan: &RootPlan) -> Result<Option<Evidence>, Error>;
     fn perform(&mut self, operation: StageOperation, plan: &RootPlan) -> Result<(), Error>;
     /// Prove the new gateway uid cannot read the quarantined tree. The final
     /// IsolationVerified readback must also check the effective unit namespace.
     fn gateway_denied_legacy(&mut self, plan: &RootPlan) -> Result<bool, Error>;
+    /// Live readback of every proposal and accepted content record. A receipt
+    /// for an archived stream, or a past Complete state, is not sufficient.
+    fn retention_ready(&mut self, _plan: &RootPlan) -> Result<bool, Error> { Err(Error::Unavailable) }
 }
 
 pub struct MissingIntegration;
@@ -151,6 +156,29 @@ pub struct RootMigration<I> {
 }
 struct RootHost<I> { plan: RootPlan, integration: I }
 
+const ROTATED_FILES: [(&str, u64); 4] = [("root.key", 32), ("identity.key", 32), ("jwt_secret", 64), ("config.toml", 4096)];
+const KEY_RECEIPT: &str = "keys-rotated.json";
+const RETIRED_KEYS: &str = "fresh-keys.removing";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyDigest { name: String, bytes: u64, sha256: [u8; 32] }
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyRotationReceipt { migration: RequestId, files: Vec<KeyDigest> }
+
+impl KeyRotationReceipt {
+    fn validate(&self, migration: RequestId) -> Result<(), Error> {
+        if self.migration != migration || self.files.len() != ROTATED_FILES.len() { return Err(Error::Conflict); }
+        for (file, (name, limit)) in self.files.iter().zip(ROTATED_FILES) {
+            if file.name != name || file.bytes == 0 || file.bytes > limit
+                || (name != "config.toml" && file.bytes != limit) { return Err(Error::Invalid); }
+        }
+        Ok(())
+    }
+}
+
 impl<I: RootMigrationIntegration> RootMigration<I> {
     pub fn open(plan: RootPlan, integration: I) -> Result<Self, Error> {
         root()?;
@@ -190,6 +218,9 @@ impl<I: RootMigrationIntegration> RootMigration<I> {
     fn advance_prepared(&mut self) -> Result<MigrationState, Error> {
         let next = next_stage(self.state()?).ok_or(Error::Conflict)?;
         self.journal.run_one(next, &mut self.host)?;
+        if matches!(next, MigrationState::ContentImported | MigrationState::Complete) {
+            self.expire(chrono::Utc::now().timestamp().max(0) as u64)?;
+        }
         Ok(next)
     }
     /// Completion remains pending until all confirmation and rotation obligations
@@ -198,17 +229,28 @@ impl<I: RootMigrationIntegration> RootMigration<I> {
         self.host.integration.preflight(&self.plan)?;
         loop {
             let state = self.state()?;
-            if state == MigrationState::Complete { return Ok(state); }
+            if state == MigrationState::Complete {
+                if !self.host.integration.retention_ready(&self.plan)? {return Err(Error::Readback);}
+                self.host.remove_verified_key_staging()?;
+                self.expire(chrono::Utc::now().timestamp().max(0) as u64)?;
+                return Ok(state);
+            }
             // Waiting for an administrator is a successful, resumable outcome,
             // not an unavailable adapter and never implicit approval.
             if state == MigrationState::AwaitingAdministrator {
+                if !self.host.integration.materialization_ready(&self.plan)? { return Ok(state); }
+            }
+            if state == MigrationState::ContentImported {
                 let op = StageOperation { migration: self.plan.migration, target: MigrationState::Complete };
                 match self.host.integration.readback(op, &self.plan)? {
                     Some(evidence) if evidence.validate(MigrationState::Complete).is_ok() => {},
                     _ => return Ok(state),
                 }
             }
-            self.advance()?;
+            match self.advance() {
+                Err(Error::AwaitingConfirmation) if state == MigrationState::AwaitingAdministrator => return Ok(state),
+                result => {result?;},
+            }
         }
     }
     /// Explicit maintenance operation: stop and quarantine the installation, then
@@ -225,12 +267,15 @@ impl<I: RootMigrationIntegration> RootMigration<I> {
             }
         }
     }
-    /// Timer entry point. Retention uses the immutable root plan, never a client
-    /// deadline. Plaintext deletion always follows a successful archive readback.
+    /// Timer entry point. Remove plaintext as soon as all proposal and content
+    /// receipts are terminal; keep the encrypted recovery snapshot until expiry.
+    /// Even the hard deadline cannot authorize deletion of unresolved content.
     pub fn expire(&mut self, now_unix: u64) -> Result<bool, Error> {
-        if now_unix < self.plan.expires_at_unix { return Ok(false); }
         if matches!(self.state()?, MigrationState::Planned | MigrationState::OldEnvironmentStopped) {
-            return Err(Error::Conflict);
+            return if now_unix < self.plan.expires_at_unix { Ok(false) } else { Err(Error::Conflict) };
+        }
+        if !self.host.integration.retention_ready(&self.plan)? {
+            return if now_unix < self.plan.expires_at_unix { Ok(false) } else { Err(Error::Readback) };
         }
         let legacy = self.plan.state_dir.join("legacy");
         let snapshot = self.plan.state_dir.join("snapshot.aead");
@@ -241,6 +286,15 @@ impl<I: RootMigrationIntegration> RootMigration<I> {
             remove_tree(&parent, std::ffi::OsStr::new("legacy"), 0, &mut count)?;
             rfs::fsync(&parent).map_err(|_| Error::Storage)?;
         }
+        // Extracted streams contain plaintext too (including rejected content).
+        // Their durable per-record receipts make them unnecessary after terminality.
+        if self.plan.state_dir.join("streams").try_exists()? {
+            if !self.host.snapshot_verified()? { return Err(Error::Readback); }
+            let parent = directory(&self.plan.state_dir)?;
+            remove_tree(&parent, std::ffi::OsStr::new("streams"), 0, &mut 0)?;
+            rfs::fsync(&parent).map_err(|_| Error::Storage)?;
+        }
+        if now_unix < self.plan.expires_at_unix { return Ok(false); }
         // Retry after a crash is safe: once plaintext is absent, remaining
         // encrypted data and the key can be deleted independently.
         if snapshot.try_exists()? { path_metadata(&snapshot, false, 0)?; fs::remove_file(&snapshot)?; sync_parent(&snapshot)?; }
@@ -277,9 +331,9 @@ pub fn next_stage(state: MigrationState) -> Option<MigrationState> {
     Some(match state {
         S::Planned => S::OldEnvironmentStopped, S::OldEnvironmentStopped => S::LegacyQuarantined,
         S::LegacyQuarantined => S::KeysRotated, S::KeysRotated => S::TokenRevocationRecorded,
-        S::TokenRevocationRecorded => S::EmployeeProposalsStaged, S::EmployeeProposalsStaged => S::ContentImported,
-        S::ContentImported => S::ConfirmationReady, S::ConfirmationReady => S::IsolationVerified,
-        S::IsolationVerified => S::AwaitingAdministrator, S::AwaitingAdministrator => S::Complete,
+        S::TokenRevocationRecorded => S::EmployeeProposalsStaged, S::EmployeeProposalsStaged => S::ContentArchived,
+        S::ContentArchived => S::ConfirmationReady, S::ConfirmationReady => S::IsolationVerified,
+        S::IsolationVerified => S::AwaitingAdministrator, S::AwaitingAdministrator => S::ContentImported, S::ContentImported => S::Complete,
         S::Complete => return None,
     })
 }
@@ -343,6 +397,10 @@ impl<I: RootMigrationIntegration> RootHost<I> {
         Ok(())
     }
     fn key_material(&self) -> Result<Vec<(&'static str, Vec<u8>)>, Error> {
+        // A completed readback is irreversible: never generate another set if
+        // a crash happened while deleting its temporary secret copies.
+        if self.plan.state_dir.join(KEY_RECEIPT).try_exists()?
+            || self.plan.state_dir.join(RETIRED_KEYS).try_exists()? { return Err(Error::Conflict); }
         let dir = self.plan.state_dir.join("fresh-keys");
         private_dir(&dir)?;
         let root = random_stage(&dir.join("root.key"), 32)?;
@@ -389,13 +447,32 @@ impl<I: RootMigrationIntegration> RootHost<I> {
     }
     fn keys_verified(&self) -> Result<bool, Error> {
         let stage = self.plan.state_dir.join("fresh-keys");
-        if !stage.try_exists()? { return Ok(false); }
-        for (name, cap) in [("root.key", 32), ("identity.key", 32), ("jwt_secret", 64), ("config.toml", 4096)] {
-            let expected_path = stage.join(name);
+        let receipt_path = self.plan.state_dir.join(KEY_RECEIPT);
+        let receipt = if receipt_path.try_exists()? {
+            let receipt: KeyRotationReceipt = serde_json::from_slice(&read_private(&receipt_path, 4096, 0)?)?;
+            receipt.validate(self.plan.migration)?;
+            receipt
+        } else {
+            if !stage.try_exists()? { return Ok(false); }
+            path_metadata(&stage, true, 0)?;
+            let mut files = Vec::new();
+            for (name, cap) in ROTATED_FILES {
+                let expected_path = stage.join(name);
+                if !expected_path.try_exists()? { return Ok(false); }
+                let bytes = read_private(&expected_path, cap, 0)?;
+                files.push(KeyDigest { name: name.into(), bytes: bytes.len() as u64, sha256: Sha256::digest(&bytes).into() });
+            }
+            let receipt = KeyRotationReceipt { migration: self.plan.migration, files };
+            receipt.validate(self.plan.migration)?;
+            receipt
+        };
+        for (expected, (name, cap)) in receipt.files.iter().zip(ROTATED_FILES) {
             let actual = if name == "root.key" { self.plan.root_key_path.clone() } else { self.plan.legacy_home.join(name) };
-            if !expected_path.try_exists()? || !actual.try_exists()? { return Ok(false); }
+            if !actual.try_exists()? { return Ok(false); }
             let uid = if name == "root.key" { 0 } else { self.plan.gateway_uid };
-            if read_private(&expected_path, cap, 0)? != read_private(&actual, cap, uid)? { return Ok(false); }
+            let bytes = read_private(&actual, cap, uid)?;
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            if bytes.len() as u64 != expected.bytes || digest != expected.sha256 { return Ok(false); }
         }
         // No old users/session/token/sealed-store files can be present at this stage.
         for entry in fs::read_dir(&self.plan.legacy_home)? {
@@ -405,7 +482,35 @@ impl<I: RootMigrationIntegration> RootHost<I> {
         }
         let home = fs::symlink_metadata(&self.plan.legacy_home)?;
         if home.uid() == 0 { return Ok(false); }
-        Ok(path_metadata(&self.plan.legacy_home, true, self.plan.gateway_uid)?.mode() & 0o7777 == 0o700)
+        if path_metadata(&self.plan.legacy_home, true, self.plan.gateway_uid)?.mode() & 0o7777 != 0o700 { return Ok(false); }
+        // Persist only digests before removing staging. If the journal commit
+        // crashes afterwards, the next readback compares these to live keys.
+        publish(&receipt_path, &serde_json::to_vec(&receipt)?, 0, 0, false)?;
+        self.remove_verified_key_staging()?;
+        Ok(true)
+    }
+    fn remove_verified_key_staging(&self) -> Result<(), Error> {
+        let stage = self.plan.state_dir.join("fresh-keys");
+        let retired = self.plan.state_dir.join(RETIRED_KEYS);
+        if !stage.try_exists()? && !retired.try_exists()? { return Ok(()); }
+        let receipt: KeyRotationReceipt = serde_json::from_slice(
+            &read_private(&self.plan.state_dir.join(KEY_RECEIPT), 4096, 0)?)?;
+        receipt.validate(self.plan.migration)?;
+        if stage.try_exists()? {
+            path_metadata(&stage, true, 0)?;
+            if retired.try_exists()? { return Err(Error::Conflict); }
+            // Remove the public staging name atomically, then resume bounded
+            // no-follow erasure under a fixed private name after any crash.
+            fs::rename(&stage, &retired)?;
+            sync_parent(&retired)?;
+        }
+        if retired.try_exists()? {
+            path_metadata(&retired, true, 0)?;
+            let parent = directory(&self.plan.state_dir)?;
+            remove_tree(&parent, std::ffi::OsStr::new(RETIRED_KEYS), 0, &mut 0)?;
+            rfs::fsync(&parent).map_err(|_| Error::Storage)?;
+        }
+        Ok(())
     }
 }
 impl<I: RootMigrationIntegration> HostAdapter for RootHost<I> {
@@ -455,18 +560,21 @@ mod tests {
         let mut current = MigrationState::Planned;
         let mut count = 0;
         while let Some(next) = next_stage(current) { current.transition(next).unwrap(); current = next; count += 1; }
-        assert_eq!(current, MigrationState::Complete); assert_eq!(count, 10);
+        assert_eq!(current, MigrationState::Complete); assert_eq!(count, 11);
     }
     struct AdministratorPending { outstanding:u32 }
     impl RootMigrationIntegration for AdministratorPending {
         fn preflight(&mut self,_:&RootPlan)->Result<(),Error>{Ok(())}
+        fn materialization_ready(&mut self,_:&RootPlan)->Result<bool,Error>{Ok(self.outstanding == 0)}
         fn readback(&mut self,op:StageOperation,_:&RootPlan)->Result<Option<Evidence>,Error>{
+            if op.target == MigrationState::ContentImported { return Ok(Some(Evidence::Materialized { all_records_terminal:self.outstanding == 0 })); }
             assert_eq!(op.target,MigrationState::Complete);
             Ok(Some(Evidence::Complete{outstanding_proposals:self.outstanding,rotation_obligations:0,
                 failed_applies:0,unclaimed_personal_owners:0,isolation_readback:true}))
         }
         fn perform(&mut self,_:StageOperation,_:&RootPlan)->Result<(),Error>{panic!("completion must use live readback")}
         fn gateway_denied_legacy(&mut self,_:&RootPlan)->Result<bool,Error>{Ok(true)}
+        fn retention_ready(&mut self,_:&RootPlan)->Result<bool,Error>{Ok(self.outstanding == 0)}
     }
     #[test]
     fn migration_run_returns_pending_and_only_finishes_after_live_confirmation_readback(){
@@ -492,6 +600,7 @@ mod tests {
         }
         fn perform(&mut self, _: StageOperation, _: &RootPlan) -> Result<(), Error> { Err(Error::Unavailable) }
         fn gateway_denied_legacy(&mut self, _: &RootPlan) -> Result<bool, Error> { Ok(true) }
+        fn retention_ready(&mut self, _: &RootPlan) -> Result<bool, Error> { Ok(true) }
     }
     #[test]
     #[ignore = "root-only filesystem operations; disposable Linux VM, no system service mutation"]
@@ -515,17 +624,66 @@ mod tests {
         let key = fs::read(&p.root_key_path).unwrap();
         assert_eq!(key.len(), 32);
         assert_eq!(fs::metadata(p.legacy_home.join("identity.key")).unwrap().uid(), p.gateway_uid);
+        assert!(!p.state_dir.join("fresh-keys").exists());
+        assert!(!p.state_dir.join(RETIRED_KEYS).exists());
+        assert!(p.state_dir.join(KEY_RECEIPT).is_file());
+        // A crash between staging deletion and the journal commit needs no new
+        // key generation. Readback uses the durable digest and the live files.
+        assert!(resumed.host.keys_verified().unwrap());
+        assert_eq!(resumed.host.key_material().unwrap_err(), Error::Conflict);
+        private_dir(&p.state_dir.join(RETIRED_KEYS)).unwrap();
+        publish(&p.state_dir.join(RETIRED_KEYS).join("interrupted-secret"), b"secret", 0, 0, false).unwrap();
+        assert!(resumed.host.keys_verified().unwrap());
+        assert!(!p.state_dir.join(RETIRED_KEYS).exists());
         assert_eq!(resumed.advance(), Err(Error::Unavailable));
         assert_eq!(resumed.state().unwrap(), MigrationState::KeysRotated);
         let output = resumed.export_records(&tmp.path().join("recovered")).unwrap();
         assert!(fs::read_to_string(output).unwrap().lines().all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()));
         assert!(!resumed.expire(p.expires_at_unix - 1).unwrap());
+        assert!(!p.state_dir.join("legacy").exists());
+        assert!(p.state_dir.join("snapshot.aead").exists());
+        assert!(p.state_dir.join("snapshot.key").exists());
         assert!(resumed.expire(p.expires_at_unix).unwrap());
         assert!(resumed.expire(p.expires_at_unix).unwrap());
         assert!(!p.state_dir.join("legacy").exists());
         assert!(!p.state_dir.join("snapshot.aead").exists());
         drop(resumed);
         assert_eq!(fs::read(p.root_key_path).unwrap(), key);
+    }
+    #[test]
+    fn missing_terminal_content_receipt_blocks_cleanup_even_after_deadline() {
+        let tmp = tempfile::tempdir().unwrap(); let p = plan(tmp.path());
+        let db = tmp.path().join("journal.db");
+        let journal = Journal::from_connection(rusqlite::Connection::open(&db).unwrap(), p.migration).unwrap();
+        rusqlite::Connection::open(&db).unwrap().execute("UPDATE migration SET state=?1 WHERE singleton=1",
+            [serde_json::to_string(&MigrationState::AwaitingAdministrator).unwrap()]).unwrap();
+        fs::create_dir(&p.state_dir).unwrap();
+        fs::create_dir(p.state_dir.join("legacy")).unwrap();
+        fs::write(p.state_dir.join("legacy/content"), b"only plaintext copy").unwrap();
+        fs::write(p.state_dir.join("snapshot.aead"), b"encrypted copy").unwrap();
+        fs::write(p.state_dir.join("snapshot.key"), b"snapshot key").unwrap();
+        let mut flow = RootMigration { plan: p.clone(), _lock: File::create(tmp.path().join("test-lock")).unwrap(), journal,
+            host: RootHost { plan: p.clone(), integration: AdministratorPending { outstanding: 1 } } };
+        assert!(!flow.expire(p.expires_at_unix - 1).unwrap());
+        assert_eq!(flow.expire(p.expires_at_unix), Err(Error::Readback));
+        assert_eq!(fs::read(p.state_dir.join("legacy/content")).unwrap(), b"only plaintext copy");
+        assert!(p.state_dir.join("snapshot.aead").exists());
+        assert!(p.state_dir.join("snapshot.key").exists());
+    }
+    #[test]
+    fn key_receipt_binds_migration_and_exact_complete_key_set() {
+        let id = RequestId([1; 16]);
+        let mut receipt = KeyRotationReceipt { migration: id, files: ROTATED_FILES.iter()
+            .map(|(name, cap)| KeyDigest { name: (*name).into(), bytes: *cap, sha256: [7; 32] }).collect() };
+        assert!(receipt.validate(id).is_ok());
+        assert_eq!(receipt.validate(RequestId([2; 16])), Err(Error::Conflict));
+        receipt.files[0].bytes = 1;
+        assert_eq!(receipt.validate(id), Err(Error::Invalid));
+        receipt.files[0].bytes = 32;
+        receipt.files[0].name = "identity.key".into();
+        assert_eq!(receipt.validate(id), Err(Error::Invalid));
+        receipt.files.pop();
+        assert_eq!(receipt.validate(id), Err(Error::Conflict));
     }
     #[test]
     #[ignore = "root-only ownership/path validation; disposable Linux VM"]

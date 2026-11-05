@@ -2998,6 +2998,38 @@ or proof that the eventual protected boot has supplied every operation factory.
 No commits, merges, deployment or production-data changes were made.
 ## Package G — migration from v1.79.3
 
+### Migration security correction (2026-11-05)
+
+The migration security patch separates `ContentArchived` (authenticated streams
+persisted, no content claim) from `ContentImported` after administrator decisions.
+Root resumes confirmed employees in batches, binding all product writes and blob
+copies to proposal operation/digest and a live confirmed allocation. Per-record
+materialization, blob-copy and readback receipts are durable; a crash repeats the
+same identity and cannot rebind to another allocation. The dashboard reports
+rejected employees as not migrated. Rejected plaintext archive payloads are
+securely deleted before their terminal receipts; originals remain in the encrypted
+snapshot until expiry. Details and the additional signed-platform allocation
+protocol are in [the migration README](../../crates/duduclaw-migration/README.md#post-confirmation-content-and-recovery).
+
+Cleanup requires all proposals and all accepted records to be terminal even past
+the deadline. With a verified snapshot it removes `legacy` and extracted streams
+early, retaining encrypted recovery until expiry. Key readback atomically removes
+`fresh-keys`, retaining only non-secret digests and receipts. Legacy archive-only
+Complete journals are corrected, while old manifests lacking the v2 inventory
+seal refuse cleanup because their attachment/work-product inventory is incomplete.
+
+Authority adapters now commit intents before external calls and CAS receipts
+outside any SQLite writer transaction. One 30-second deadline covers the async
+bridge and nested synchronous product file-lock waits, including publication and
+compensation after async calls return.
+
+This is component implementation, not native deployment acceptance. The signed
+`duduclaw-migration-platform` executable and production Employee allocation backend
+are still absent from this worktree; the new materialization path requires their
+live stopped-process, UID, mount and quota proof. Gateway/CLI were not built in
+this security task, and real Linux root materialization remains unverified.
+The prior round notes below are historical evidence, not this patch's test results.
+
 ### Round 3b status (2026-11-05)
 
 Phase 1 completed: inspected the inherited tracked diff and untracked Package G
@@ -5169,3 +5201,391 @@ Require exactly two outer summary rows, each with `test result: ok. 1 passed`.
 Internal self-exec helpers intentionally have no `iso_root_` prefix and must not
 be selected independently. Passing these transport/retirement tests would still
 leave production factory/ingress acceptance and the other runtimes/PTY open.
+## Package I2 — installer and release integration (2026-11-05)
+
+### Round 2 handoff (2026-11-05)
+
+Status: **PARTIAL — inventory CI is repaired; authenticated inactive publication,
+installer migration routing, first-admin claim, local readiness checks and
+coordinated removal are implemented. Signed initial activation, G's platform
+adapter and I1 composite readiness remain implementation blockers.** This section
+supersedes the historical round-1 status below. No commit, cargo fmt, local
+CLI/gateway/workspace build, release publication or live service mutation was
+performed. The supplied worktree is retained for the integration owner.
+
+#### Completed changes and enforcement boundaries
+
+0. **Spawn inventory was repaired first.** All 34 previously unclassified sites
+   now have written per-site reasons: 16 test-only, nine task/thread operations
+   (not process launches), eight privileged-service launches and one existing
+   ExecutionBackend adapter. `privileged_service` is restricted to explicit
+   trusted service identities; it cannot exempt employee, operator or gateway
+   execution. Root spawnd/trampoline, updater and migration-import launches stay
+   outside the employee ExecutionBackend for their documented design §4.1 roles.
+   The installer command runner's bounded capture uses `spawn`, kills/reaps on
+   failure, and has the matching registry count. Final guard: **489 functions,
+   zero migrations pending**. This proves coverage, not runtime isolation.
+1. **F publication and packaging.** The archive now also contains a separate
+   regular-file frozen `duduclaw-updated-launch`. F's parser filename is aligned
+   with E (`duduclaw-parse-worker`). The migration executable is a required signed
+   component. Optional offline `--bootstrap-root` / `--bootstrap-root-signatures`
+   inputs produce the fixed bootstrap inbox alongside F's signed manifest and
+   artifacts; signing keys remain refused in CI.
+
+   `duduclaw-updated --bootstrap-stage` reads the root-owned fixed inbox
+   `/etc/duduclaw-updated/bootstrap`. It checks the compiled
+   `DUDUCLAW_BOOTSTRAP_ROOT_SHA256` pin, bootstrap root threshold signatures, F
+   target signature, exact ten-component set, architecture/protocol, modes and
+   sizes. It opens all artifact FDs, validates and copies from those same FDs,
+   rehashes copies, fsyncs and atomically publishes an inactive generation under
+   `/opt/duduclaw-isolated/generations/<digest>`. Retry revalidates existing bytes.
+   An absent compiled pin refuses. This path **does not select `current`, create
+   trust/slot receipts or updater state/floors, authorize the legacy dual-signature
+   transition, publish mixed fixed prefixes, or execute/start any artifact**.
+   It is authenticated staging, not a finished bootstrap installer.
+2. **G and first administrator.** Protected install/upgrade from v1.79.3 (or an
+   unknown floor) to v1.80+ enters G's durable transaction using the fixed,
+   root-managed plan. Invalid paths, missing plan/platform or non-terminal output
+   refuse; there is no legacy copy/apply fallback. G preflights its installed
+   adapter before stopping the old service. Existing F-managed installations
+   bypass legacy-floor migration and a reinstall only reads readiness, avoiding
+   overwriting newer signed unit templates.
+
+   G's `GatewayBootstrapIssuer` now uses a bounded, root-peer-only Unix socket
+   owned by the gateway, with matching migration identity. The gateway requires
+   an authenticated completed import manifest and its held singleton lock.
+   Only the gateway accesses its UserDb. The local setup page receives the token
+   through the URL fragment, has no remote assets and uses a restrictive CSP;
+   POST requires a loopback peer and exact same-origin Host/Origin. Its real auth
+   transaction validates email/password, consumes the one-use token and creates
+   the first Admin with the chosen password atomically. Empty-user/recovery,
+   token expiry/replay and existing failure/rate limits remain enforced.
+   Already-claimed installer retries do not issue another first-admin token.
+   Migration mode skips both default-admin creation and the old pending-account
+   landing behavior.
+
+   G now writes the durable root-owned
+   `/etc/duduclaw/migration-import.json` boot fence after platform preflight and
+   before the old service stop. Completion is written durably before `/run`.
+   Startup requires matching durable/runtime manifests, rejects a runtime-only
+   manifest and refuses incomplete import; a reboot clearing `/run` cannot
+   restore the default-admin path. This does not implement the still-missing
+   signed `duduclaw-migration-platform` or other G authority/materialization
+   adapters, so actual end-to-end migration currently refuses at preflight.
+3. **Readiness.** `service readiness --protected-linux` (also the `ops service`
+   alias) is root/operator gated and read-only. It prints every group's result:
+   executable ownership/modes/links, service identities, directories/parser roots,
+   unit files/live loaded state, and composite isolation. Static IDs, distinct
+   identities, locked passwords, auxiliary expiry, no supplementary groups or
+   linger, G's root:root 0711 parent and gateway:gateway 0700 child home,
+   exact unit bytes/fragment paths, no pending daemon reload and no
+   unverified drop-ins are checked. Installer/reinstaller and a successful G
+   handoff run the summary. `CompositeReadiness` is the explicit I1 integration
+   seam; `MissingComposite` always fails, so no false readiness or enablement is
+   reported. This is not the runtime probe/capability/storage/egress acceptance.
+4. **Coordinated uninstall.** Isolation detection and a persistent retry marker
+   route to the new coordinator. It inventories owned units, rejects unknown
+   DuDuClaw unit names, durably backs up unit files and atomically masks them in
+   `/etc/systemd/system` (a runtime mask would lose to an existing `/etc` unit).
+   After daemon-reload and mask readback it stops admissions/timers, gateway and
+   workers, proves inactive units, empty cgroups and no relevant processes or
+   mounts, then removes the fixed installation binaries/helpers. Failures before
+   quiescence never reach removal. Unit-template masks are verified on disk,
+   since systemd cannot load an uninstantiated template for state readback.
+
+   It preserves service accounts, employee allocations/tombstones, data, keys,
+   version floors, updater state/trust/generations/selectors, durable masks and
+   unit backups. Repeated removal uses the retained marker and never falls into
+   legacy uninstall. No purge, lazy unmount or forced process termination is
+   hidden in removal. Mount checking covers the fixed installation/agent roots;
+   **H's arbitrary configured storage roots still need an authoritative inventory
+   adapter before complete storage-aware uninstall acceptance**.
+
+Shared `duduclaw-isolation` wire formats, canonical bytes and limits were not
+changed. The bootstrap exchange is a new private G/gateway protocol, not a shared
+contract revision. CLI adds an existing workspace migration dependency (Linux
+only); no third-party dependency was added.
+
+#### Round 2 observed validation
+
+Cargo runs below used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`; Linux target checks
+also used `LIBSQLITE3_SYS_USE_PKG_CONFIG=1`. Neither CLI nor gateway crate was built.
+Counts describe each final suite once; subset reruns are not added to totals.
+
+| Command (environment prefixes above apply to Cargo) | Observed result |
+| --- | --- |
+| `python3 scripts/ci/check_spawn_inventory.py --require-migrated` | 489 classified, zero pending |
+| `python3 -m unittest discover -s scripts/ci -p 'test_spawn_inventory.py' -v` | 17 passed |
+| `rustc --edition=2021 --test scripts/tests/protected_layout_harness.rs -o /private/tmp/iso-i2-layout-tests` then `/private/tmp/iso-i2-layout-tests` | 12 passed; actual layout/lifecycle code, including fake-root migrated-home ownership/modes/links, durable mask/backup/retry/refusal and fail-before-removal checks |
+| `cargo test -p duduclaw-updated --offline` | 37 passed, one ignored on macOS |
+| `cargo check --tests --target x86_64-unknown-linux-gnu -p duduclaw-updated --offline` | Passed, including Linux-only bootstrap tests; not executed on Linux |
+| `cargo test -p duduclaw-migration --offline` | 44 passed (42 unit, two integration) |
+| `cargo check --tests --target x86_64-unknown-linux-gnu -p duduclaw-migration --offline` | Passed |
+| `cargo test -p duduclaw-auth otp::tests --offline` | 19 passed |
+| `cargo test --manifest-path /private/tmp/iso-i2-bootstrap-harness/Cargo.toml --offline` | Three passed: actual page/origin tests and actual HTTP claim handler with real UserDb; AppState/import-manifest seams are harness stubs |
+| `cargo check --tests --target x86_64-unknown-linux-gnu --manifest-path /private/tmp/iso-i2-bootstrap-harness/Cargo.toml --offline` | Passed: actual full installer/layout/lifecycle/migration/readiness/uninstall modules and gateway's new Linux socket/start code; real core/G/F/isolation libraries |
+| `python3 -m unittest discover -s scripts/tests -p 'test_package_linux_release.py' -v` | 17 passed |
+| `python3 -m unittest discover -s scripts/tests -p 'test_protected_auto_upgrade.py' -v` | 20 passed, one skipped (macOS lacks systemd-analyze) |
+| `python3 -m unittest discover -s scripts/tests -p 'test_release_*.py' -v` | 75 passed |
+| `python3 -m unittest discover -s scripts/tests -p 'test_sign_isolation_manifest.py' -v` | Four passed |
+| `bash -n scripts/release.sh`; `sh -n scripts/linux-protected/auto-upgrade/install.sh`; `git diff --check` | Passed |
+| Three-language documentation link/fence/marker checks | Three guides, nine links passed |
+
+The standalone Linux harness stubs only installer parent constants/options/unit
+text/account validation, legacy copy and gateway version lookup; its gateway
+side also stubs AppState/manifest and Linux UserDb types. An initial Linux auth
+cross-check failed because aws-lc requires the absent `x86_64-linux-gnu-gcc`;
+using the explicitly scoped UserDb type stub is **not** full gateway/CLI compile
+acceptance. The macOS HTTP test uses real auth. Temporary harness/evidence is
+under `/private/tmp/iso-i2-bootstrap-harness` and `/private/tmp/iso-i2-*.log`.
+No native root systemd, socket, browser or release-binary test was run.
+
+Independent ordinary code review identified and drove fixes for persistent-mask
+precedence, managed reinstall overwrites, repeat-uninstall legacy fallback,
+volatile reboot fencing, singleton-lock ownership and readiness matching G's
+root-owned parent/private gateway home. The final ordinary review found no
+unresolved HIGH/CRITICAL in the reviewed changes. Ordinary review and
+fixture tests do not constitute formal `gpt-daybreak-blue-latest` security signoff;
+that review has not been obtained.
+
+#### Remaining implementation and remote gates
+
+- Bind real offline bootstrap keys/pin and legacy dual signatures; implement the
+  authenticated initial activation transaction, trust bundle, A/B receipts and
+  updater state/floor. Resolve F `/opt/duduclaw-isolated/current` versus G
+  `/usr/lib/duduclaw/current` and B/E/legacy fixed prefixes without unsigned
+  copying or symlink shortcuts. Do not activate a mixed generation.
+- Supply the signed G platform adapter and runtime/storage/authority materializers,
+  then verify quarantine/import, pending confirmations and first-admin setup.
+- Wire I1 composite readiness and verified DNS/unit configuration; no current
+  readiness command can return overall success with `MissingComposite`.
+- Connect H's complete storage inventory to removal; run real fresh-install,
+  retry/reinstall and removal acceptance. The fixed-path coordinator exists but
+  does not prove arbitrary configured storage is unmounted.
+- Build actual GNU x86_64/aarch64 releases, verify glibc and real offline signatures,
+  obtain formal security review and run the supported native kernel matrix.
+  GCP kernel 7.0 / Landlock ABI 8 remains refused; I2 did not widen support.
+
+Exact remote commands (not local build or acceptance evidence):
+
+```sh
+cargo check -p duduclaw-cli -p duduclaw-gateway --tests
+cargo test -p duduclaw-cli service_protected_
+cargo test -p duduclaw-cli spawnd_install_tests
+cargo test -p duduclaw-cli legacy_protected_upgrade_cannot_bypass_migration
+cargo test -p duduclaw-gateway migration_setup_
+cargo test -p duduclaw-gateway migration_import_boot_
+cargo test -p duduclaw-auth otp::tests
+cargo test -p duduclaw-migration
+cargo test -p duduclaw-updated
+# Root, disposable native VM only; inspect each fixture's prerequisites first:
+cargo test -p duduclaw-updated iso_root_bootstrap_ -- --ignored --test-threads=1
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-cli iso_root_install_support_staging_and_idempotent_readback -- --ignored --test-threads=1
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-cli iso_root_install_uninstall_preserves_recovery_and_is_repeatable -- --ignored --test-threads=1
+# Build web/dist first; no signing keys in CI:
+bash scripts/release.sh linux-assets --target x86_64-unknown-linux-gnu --output-dir dist-linux-x64
+bash scripts/release.sh linux-assets --target aarch64-unknown-linux-gnu --output-dir dist-linux-arm64
+```
+
+Live first-admin acceptance must include non-root issuer refusal, held-lock
+checks, wrong-origin/non-loopback/replay denial, reboot with `/run` cleared,
+already-claimed installer retry and the actual SSH-tunnel setup page.
+
+#### Round 2 file inventory (round 1 remains uncommitted)
+
+| File | Round 2 responsibility |
+| --- | --- |
+| `scripts/ci/check_spawn_inventory.py` | Validate narrowly scoped privileged-service classifications |
+| `scripts/ci/privileged_effects.json` | Classify 34 missing sites and updated bounded installer spawn |
+| `scripts/ci/test_spawn_inventory.py` | Reject privileged exemptions for gateway/employee identities |
+| `scripts/package-linux-release.py` | Include frozen launcher and optional verified bootstrap inbox inputs |
+| `scripts/tests/test_package_linux_release.py` | Bootstrap input, signing and artifact inventory regressions |
+| `crates/duduclaw-updated/src/publication.rs` | Shared required artifact names and complete signed-set validation |
+| `crates/duduclaw-updated/src/linux/bootstrap.rs` | Root-pinned, same-FD inactive publication and ignored native fixtures |
+| `crates/duduclaw-updated/src/linux/service.rs` | Correct parser artifact name through shared mapping |
+| `crates/duduclaw-updated/src/linux/mod.rs` | Expose bootstrap staging |
+| `crates/duduclaw-updated/src/main.rs` | Fixed root-only bootstrap-stage entry point |
+| `crates/duduclaw-updated/src/lib.rs` | Export publication policy |
+| `crates/duduclaw-updated/README.md` | Document staging and outstanding activation boundary |
+| `crates/duduclaw-cli/src/service/protected_linux_layout.rs` | Match G's root-owned parent/private gateway home and test ownership/mode/link refusals |
+| `crates/duduclaw-cli/src/service/protected_linux_lifecycle.rs` | Removal inventory/order/quiescence policy and durable fake-root-tested masks |
+| `crates/duduclaw-cli/src/service/protected_linux_uninstall.rs` | Native coordinated removal, retained recovery state and ignored VM fixture |
+| `crates/duduclaw-cli/src/service/protected_linux_readiness.rs` | Five-group local readiness and explicit missing composite seam |
+| `crates/duduclaw-cli/src/service/protected_linux_migration.rs` | Fixed-plan installer handoff to G and one-time admin link |
+| `crates/duduclaw-cli/src/service/protected_linux_install.rs` | Bounded command capture, managed routing, readiness and removal wiring |
+| `crates/duduclaw-cli/src/service/protected_linux.rs` | Register lifecycle/migration/readiness entry points |
+| `crates/duduclaw-cli/src/service/protected_linux_tests.rs` | Readiness command option/operator-gate regressions |
+| `crates/duduclaw-cli/src/lib.rs` | CLI readiness parser and dispatch |
+| `crates/duduclaw-cli/Cargo.toml`, `Cargo.lock` | Existing migration crate as Linux-only CLI dependency |
+| `scripts/tests/protected_layout_harness.rs` | Compile actual layout and lifecycle modules without CLI build |
+| `crates/duduclaw-auth/src/otp.rs` | Transactional token claim with chosen-password first Admin and tests |
+| `crates/duduclaw-migration/src/bootstrap_protocol.rs` | Bounded private bootstrap request/reply and boot-fence location |
+| `crates/duduclaw-migration/src/root_bootstrap.rs` | Peer-checked gateway issuer and already-claimed handling |
+| `crates/duduclaw-migration/src/root_pipeline.rs` | Durable pre-stop/completion boot fence |
+| `crates/duduclaw-migration/src/import_manifest.rs` | Durable/runtime consistency selection and reboot tests |
+| `crates/duduclaw-migration/src/lib.rs` | Export private bootstrap protocol |
+| `crates/duduclaw-migration/src/bin/duduclaw-migrate.rs` | Use real gateway bootstrap issuer |
+| `crates/duduclaw-migration/README.md` | Explain implemented issuer/claim and platform gap |
+| `crates/duduclaw-gateway/src/server_migration_bootstrap.rs` | Root-peer socket, local setup route and actual auth claim |
+| `crates/duduclaw-gateway/src/migration_setup.html` | Local three-language first-admin form and fragment token |
+| `crates/duduclaw-gateway/src/migration_startup.rs` | Read durable boot fence and reject inconsistent/incomplete imports |
+| `crates/duduclaw-gateway/src/server.rs` | Migration startup, default-admin exclusion and route/listener wiring |
+| `docs/guides/linux-protected-service.md`, `docs/guides/zh-TW/linux-protected-service.md`, `docs/guides/ja-JP/linux-protected-service.md` | Matching staging/migration/readiness/removal behavior and limitations |
+| `docs/features/05-security-defense.md`, `docs/features/zh-TW/05-security-defense.md`, `docs/features/ja-JP/05-security-defense.md` | Matching evidence-bounded security behavior |
+| `CHANGELOG.md` | User-facing round-2 changes without completed isolation claim |
+| `docs/architecture/native-linux-isolation.md` | Current handoff, evidence and remaining integration gates |
+
+### Round 1 historical handoff (superseded above)
+
+Status: **PARTIAL — release packaging and installation prerequisites are implemented;
+full fresh installation, migration activation and removal are not implemented.**
+This is a coherent staging-only subset within the delegated time/build limits.
+The existing worktree/branch was retained; no commit, formatter, release, service
+operation, other-worktree write or production-home access was performed.
+
+### Implemented behavior
+
+- Both GNU Linux release targets build nine explicit production binaries: gateway,
+  spawnd, trampoline, egress, updater, parser with `engine`, importer, migration
+  command and MCP bridge. The archive also includes a separate regular-file
+  egress-forwarder copy of the egress ELF and the Python SDK. Root test fixtures
+  are never selected. Every binary must be nonempty and strictly below 200 MiB;
+  all actual release binaries go through the existing glibc baseline checker.
+  Archive names, SHA-256 output and workflow minisign/cosign steps are retained.
+- `scripts/release.sh linux-assets --target <triple>` shares the workflow helper.
+  A single frozen input set feeds the tarball and optional F raw assets. With
+  `--manifest-template <reviewed JSON> --signing-key <offline target key>`, the
+  helper delegates canonical signing to F's existing script. Missing keys print
+  an explicit skip; CI refuses a key before reading it. This does not generate
+  a bootstrap root, release policy template or migration dual signatures.
+- The old optional B1 support hook now checks the complete fixed-path publication
+  before staging 15 units, 15 root-owned directories and four auxiliary static
+  accounts, plus checking the gateway account. It **does not publish binaries**.
+  `protected_linux_layout.rs` records the paths expected by the current package
+  templates. Every executable and ancestor is checked without following links;
+  executable files require root:root, exact 0755, one link and nonzero size.
+  These checks do not authenticate a release; signed bootstrap must publish first.
+- System IDs must be nonzero and strictly below explicit `SYS_UID_MAX` and
+  `SYS_GID_MAX`, whose values must be below DynamicUser's range. New accounts
+  use a capped max-minus-one allocation, no subordinate ranges, and auxiliary
+  accounts have locked/expired passwords, nologin, no home or supplementary
+  groups, and disabled linger. Service UID/GID pairs must be distinct. Existing
+  incompatible accounts refuse; this hook does not silently repurpose them.
+- The two parser roots start root:root 0755 and empty. Reinstall accepts only the
+  bounded empty mountpoint skeleton that systemd can leave; files, symlinks,
+  unexpected descendants, writable directories and different devices refuse.
+  It never recursively removes unexpected contents. SSH/cron/at employee policy
+  remains with spawnd; no second implementation was added here.
+- Support units are staged only and are not enabled. No DNS profile, runtime
+  publication, accepted-generation receipt, first-admin URL or readiness success
+  is invented. Existing v1.80 fresh/cross-version migration guards remain intact.
+  A legacy reinstall now refuses when F's state/current exists, before modifying
+  that managed generation. Legacy uninstall refuses any published isolation
+  component or F state/current before removing anything; pure legacy removal is
+  unchanged. Full coordinated removal is still outstanding.
+- Nightly requests already used F's frozen launcher. The timer installer now
+  checks its root ownership, ancestors and executable/single-link status before
+  installation. Exact updater `active` state is checked before installation and
+  again before enabling. It does
+  not request an update while checking. Active is a timer prerequisite, not
+  composite isolation or update-success evidence.
+- Three-language guides now describe the planned architecture, real migration
+  command interface and confirmation page, explicit implementation gaps, and
+  the existing package-level kernel matrix. Kernel 7.0 / Landlock ABI 8 remains
+  refused. No new supported-kernel claim was added by I2.
+
+### Validation in this worktree
+
+No CLI/gateway/workspace Cargo build or test was run, as explicitly prohibited.
+The standalone Rust harness compiles the **actual std-only layout module**, not
+an alternative implementation; it does not type-check the full Linux installer.
+The ignored root fixture was written, not executed or compiled as part of CLI.
+
+| Actual command | Result |
+| --- | --- |
+| `rustc --edition=2021 --test scripts/tests/protected_layout_harness.rs -o /private/tmp/iso-i2-layout-tests` then `/private/tmp/iso-i2-layout-tests` | 6 passed, 0 failed; real temporary-filesystem ownership/mode/link/incomplete-publication/skeleton tests plus policy/template checks |
+| `python3 -m unittest discover -s scripts/tests -p 'test_package_linux_release.py' -v` | 12 passed, 0 failed; both archive inventories, exact 200 MiB boundary, offline OpenSSH signing and CI refusal |
+| `python3 -m unittest discover -s scripts/tests -p 'test_protected_auto_upgrade.py' -v` | 20 passed, 0 failed, 1 skipped because macOS has no systemd-analyze |
+| `python3 -m unittest discover -s scripts/tests -p 'test_release_*.py' -v` | 75 passed, 0 failed (packaging agent) |
+| `python3 -m unittest discover -s scripts/tests -p 'test_sign_isolation_manifest.py' -v` | 4 passed, 0 failed (packaging agent) |
+| `bash -n scripts/release.sh`; `sh -n scripts/linux-protected/auto-upgrade/install.sh`; `git diff --check` | Passed |
+| Existing `/private/tmp/iso-a-syntax/target/debug/iso-a-syntax` on the three changed installer Rust modules | 3 files parsed, 0 syntax errors; not type checking |
+| Three-guide link/marker/fence checks | Passed: 3 guides, 9 relative links (documentation agent) |
+| `python3 scripts/ci/check_spawn_inventory.py --require-migrated` | FAILED: 34 unclassified symbols; reconstructing changed-file sites from HEAD reproduced the identical 34 failures, so no I2 regression or passing whole-project inventory is claimed |
+
+Initial standalone test compilation directly at crate root failed because the
+module has `pub(super)` visibility; the checked-in parent harness fixes that.
+One intermediate macOS test failed because setting setuid did not retain that bit
+in this environment; the setuid filesystem assertion is now Linux-only, while
+non-executable/group-write/ownership/link checks run on macOS too. A parallel fixture initially collided on a coarse timestamp; an atomic sequence now
+separates temporary roots. No production permission check was weakened. Independent ordinary code review drove fixes for
+gateway allocation at the inclusive useradd limit, parser-root reuse, signed-asset
+name collisions and relative CARGO_TARGET_DIR resolution. This is not a formal
+Daybreak security review. No new dependency or shared isolation contract change.
+
+### Required next steps (implementation, not just acceptance)
+
+1. Supply independently authenticated bootstrap publication of every binary and
+   F's trust bundle, slot receipts, initial state and generation. Resolve current
+   package path mismatches: F publishes `/opt/duduclaw-isolated/current`, whereas
+   G/import templates expect `/usr/lib/duduclaw/current`; spawnd, parser, egress
+   and the old gateway still use separate fixed prefixes. F's ParseWorker target
+   currently installs `duduclaw-work`, whereas E executes `duduclaw-parse-worker`.
+   The layout refuses symlink ancestors, so simply linking those prefixes is not
+   an implementation. Do not activate a mixed generation.
+2. Implement G's `duduclaw-migration-platform`, signed preflight/final readbacks,
+   employee allocation/materialization, first-admin issuer/claim route and the
+   remaining G authority adapters. Wire installer → quarantine → import → pending
+   confirmation. I2 intentionally kept the v1.80 refusal instead of copying legacy
+   databases or using an unsigned in-place switch.
+3. Complete signed unit activation and root-selected DNS configuration/drop-ins,
+   storage provisioning and the composite readiness checker/summary. The current
+   hook stages files only; a daemon's `active` state is insufficient.
+4. Implement coordinated uninstall: stop admissions/timers/workers, prove empty
+   cgroups and no live mounts, remove the owned installation set and preserve
+   permanent identity mappings, data, root keys, trust and recovery material.
+5. Run remote CLI/gateway compilation, actual GNU x86_64/aarch64 release builds,
+   glibc checks, real offline hardware signatures, fresh install/reinstall/removal
+   and v1.79.3 migration on the supported kernel matrix. The new ignored test
+   proves staging only, not complete fresh-install acceptance. Obtain formal
+   implementation security review. Reconcile the existing spawn registry failures
+   in the integration owner’s scope before CI can be green.
+
+Remote commands (not executed locally):
+
+```sh
+cargo check -p duduclaw-cli -p duduclaw-gateway --tests
+cargo test -p duduclaw-cli service_protected_
+cargo test -p duduclaw-cli spawnd_install_tests
+cargo test -p duduclaw-cli legacy_protected_upgrade_cannot_bypass_migration
+# Root, disposable native VM, complete trusted binary publication already present:
+DUDUCLAW_ISO_DISPOSABLE=1 cargo test -p duduclaw-cli iso_root_install_support_staging_and_idempotent_readback -- --ignored --test-threads=1
+# Build web/dist first. No signing keys in CI:
+bash scripts/release.sh linux-assets --target x86_64-unknown-linux-gnu --output-dir dist-linux-x64
+bash scripts/release.sh linux-assets --target aarch64-unknown-linux-gnu --output-dir dist-linux-arm64
+```
+
+### Changed-file inventory
+
+| File | Change |
+| --- | --- |
+| `.github/workflows/release.yml` | Build/package all Linux components through one helper; preserve archive signing |
+| `.github/workflows/release-cache-warm.yml` | Warm the matching production binary build set |
+| `scripts/release.sh` | Add explicit local `linux-assets` entry point without publishing |
+| `scripts/package-linux-release.py` | Build, freeze, validate, archive and optionally offline-sign Linux assets |
+| `scripts/tests/test_package_linux_release.py` | Packaging, missing-input, size, signing and target-directory regressions |
+| `scripts/linux-protected/auto-upgrade/install.sh` | Refuse timer installation without trusted frozen launcher and active updater |
+| `scripts/linux-protected/auto-upgrade/README.md` | Explain timer prerequisites and evidence boundary |
+| `scripts/tests/test_protected_auto_upgrade.py` | Fake-root prerequisites and stopped-during-install regressions |
+| `crates/duduclaw-cli/src/service/protected_linux.rs` | Register the shared fixed-layout module |
+| `crates/duduclaw-cli/src/service/protected_linux_install.rs` | Complete published-support staging, static accounts, parser-root reuse and legacy-operation refusal |
+| `crates/duduclaw-cli/src/service/protected_linux_layout.rs` | Fixed binary/unit/directory inventory, range and filesystem validation, six tests |
+| `scripts/tests/protected_layout_harness.rs` | Compile actual installer policy without building CLI/gateway |
+| `docs/guides/linux-protected-service.md` | Rewrite English architecture, migration, readiness and recovery guide |
+| `docs/guides/zh-TW/linux-protected-service.md` | Matching Traditional Chinese guide |
+| `docs/guides/ja-JP/linux-protected-service.md` | Matching Japanese guide |
+| `docs/features/05-security-defense.md` | Align English native isolation state and limitations |
+| `docs/features/zh-TW/05-security-defense.md` | Align Traditional Chinese security description |
+| `docs/features/ja-JP/05-security-defense.md` | Align Japanese security description |
+| `CHANGELOG.md` | User-facing v1.80 preparation and changed timer/legacy-operation behavior |
+| `docs/architecture/native-linux-isolation.md` | This evidence, exact implementation gaps and remote handoff |

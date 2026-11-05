@@ -49,6 +49,10 @@ pub fn classify(path:&Path)->Option<Source> {
         ["wiki",..] if agent.is_some() && path.extension().is_some_and(|e|e=="md")=>"wiki_text",
         ["tasks",..] if agent.is_some()=>"task_archive",
         ["tool_calls.jsonl"]=>"audit_archive",
+        ["attachments",..] if agent.is_some()=>"attachment",
+        _ if agent.is_some() && !tail.iter().any(|p| matches!(*p,".claude"|".grok"|".codex"|"state"|"tmp") || p.starts_with(".soul_"))
+            && !tail.first().is_some_and(|p|p.starts_with('.'))
+            && path.extension().and_then(|e|e.to_str()).is_some_and(|e|matches!(e,"docx"|"xlsx"|"pdf"|"csv"|"md"|"txt"|"json"|"png"|"jpg"|"jpeg"|"svg"))=>"work_product",
         _=>return None,
     };
     Some(Source{relative:path.into(),kind:kind.into(),agent})

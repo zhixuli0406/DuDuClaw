@@ -17,6 +17,43 @@ impl RootBootstrapIssuer for UnavailableBootstrapIssuer {
     fn issue_first_admin_link(&mut self, _: &RootPlan) -> Result<SetupLink, Error> { Err(Error::Unavailable) }
 }
 
+/// Authenticate the already running fresh gateway, never open its SQLite files.
+/// Only root may request a token; only the plan's gateway uid/gid may reply.
+pub struct GatewayBootstrapIssuer;
+impl RootBootstrapIssuer for GatewayBootstrapIssuer {
+    fn issue_first_admin_link(&mut self, plan: &RootPlan) -> Result<SetupLink, Error> {
+        use std::{io::{Read, Write}, os::{fd::AsRawFd, unix::{fs::{FileTypeExt, MetadataExt}, net::UnixStream}}, time::Duration};
+        use crate::bootstrap_protocol::{SetupRequest, SetupReply, SOCKET_NAME, MAX_SETUP_MESSAGE};
+        root()?;
+        let path = plan.legacy_home.join(SOCKET_NAME);
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_socket() || metadata.uid() != plan.gateway_uid
+            || metadata.gid() != plan.gateway_gid || metadata.mode() & 0o7777 != 0o600 {
+            return Err(Error::Authentication);
+        }
+        let mut stream = UnixStream::connect(path)?;
+        let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: getsockopt fills an exactly sized owned ucred buffer.
+        if unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED,
+            (&mut peer as *mut libc::ucred).cast(), &mut length) } != 0
+            || length as usize != std::mem::size_of::<libc::ucred>()
+            || peer.uid != plan.gateway_uid || peer.gid != plan.gateway_gid {
+            return Err(Error::Authentication);
+        }
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        let request = SetupRequest { version: 1, migration: plan.migration };
+        stream.write_all(&serde_json::to_vec(&request)?)?;
+        stream.shutdown(std::net::Shutdown::Write)?;
+        let mut bytes = Vec::new();
+        stream.take((MAX_SETUP_MESSAGE + 1) as u64).read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_SETUP_MESSAGE { return Err(Error::Limit); }
+        let reply: SetupReply = serde_json::from_slice(&bytes)?;
+        SetupLink::from_verified_gateway_route(reply.link(plan.migration)?)
+    }
+}
+
 /// Deliberately has no Debug/Serialize implementation. Never put a setup link in
 /// the migration journal, command diagnostics, service logs or audit evidence.
 pub struct SetupLink(String);
@@ -65,7 +102,7 @@ mod tests {
         for state in [MigrationState::Planned, MigrationState::OldEnvironmentStopped,
             MigrationState::LegacyQuarantined, MigrationState::KeysRotated,
             MigrationState::TokenRevocationRecorded, MigrationState::EmployeeProposalsStaged,
-            MigrationState::ContentImported, MigrationState::ConfirmationReady, MigrationState::Complete] {
+            MigrationState::ContentArchived, MigrationState::ContentImported, MigrationState::ConfirmationReady, MigrationState::Complete] {
             assert!(!allowed_stage(state));
         }
     }

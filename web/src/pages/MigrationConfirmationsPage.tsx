@@ -90,6 +90,7 @@ export function MigrationConfirmationsPage() {
             <span className="text-sm">{t(`status.${item.status}`)}</span>
             {item.high_risk && <span className="text-sm font-medium text-destructive">{t('highRisk')}</span>}
           </div>
+          {item.content_status && <p className="text-sm text-muted-foreground">{t(`content.${item.content_status}`)}</p>}
           <dl className="space-y-3">{item.fields.map(field => <div key={field.name}>
             <dt className="text-sm font-medium break-all">{intl.formatMessage({ id: `migrationConfirm.field.${field.name}`, defaultMessage: t('field.unknown') })}</dt>
             <dd className="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 text-sm">{field.value.kind === 'text' ? field.value.value : <>{t('secretMasked')}{item.rotation_pending && ` — ${t('rotationRequired')}`}</>}</dd>

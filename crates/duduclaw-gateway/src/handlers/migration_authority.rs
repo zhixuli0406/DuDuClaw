@@ -9,6 +9,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Serialize, Deserialize};
 use super::{config_commit, config_raw_rpc};
 type Result<T> = std::result::Result<T, Error>;
+#[path = "migration_authority_bridge.rs"]
+mod bridge;
+use bridge::bounded;
 #[path = "migration_authority_accounts.rs"]
 mod accounts;
 #[path = "migration_authority_categories.rs"]
@@ -211,6 +214,7 @@ impl GatewayAuthority {
     /// Root-only import integration: persist the original separately, encrypted,
     /// only when its fingerprint matches the already-bound proposal.
     pub(crate) fn stage_legacy_secret(&self, item: &ConfirmationItem, secret: &str) -> Result<()> {
+        bridge::operation(|| {
         if item.category != ConfirmationCategory::ConfigurationSection { return Err(Error::Denied); }
         let fingerprint=self.fingerprint_secret(secret)?;
         let expected=item.fields.iter().find(|f|f.name=="credential").ok_or(Error::Invalid)?;
@@ -221,6 +225,7 @@ impl GatewayAuthority {
             params![operation(&item.binding),item.binding.proposal_digest.0.as_slice(),encrypted]).map_err(|_|Error::Storage)?;
         if self.legacy_secret(item)?!=secret {return Err(Error::Stale);}
         Ok(())
+        })
     }
     fn legacy_secret(&self,item:&ConfirmationItem)->Result<String> {
         let (digest,encrypted):(Vec<u8>,Vec<u8>)=self.db.query_row("SELECT digest,value FROM secrets WHERE operation=?1",
@@ -235,6 +240,7 @@ impl GatewayAuthority {
     /// the normal config writer, then recompute evidence from the live readback.
     /// A crash after publication is safe: retrying the same value reads it back.
     pub(crate) fn rotate_secret(&self,item:&ConfirmationItem,new_value:&str)->Result<Sha256Digest> {
+        bridge::operation(|| {
         if item.status!=ConfirmationStatus::Applied || item.category!=ConfirmationCategory::ConfigurationSection
             || new_value.is_empty() || new_value.len()>MAX_PROPOSAL_VALUE_BYTES
             || config_commit::is_secret_placeholder(new_value) {return Err(Error::Denied);}
@@ -265,6 +271,7 @@ impl GatewayAuthority {
         self.db.execute("INSERT INTO rotated VALUES(?1,?2,'credential',?3,?4) ON CONFLICT(operation,field) DO UPDATE SET fingerprint=excluded.fingerprint,path=excluded.path WHERE digest=excluded.digest",
             params![operation(&item.binding),item.binding.proposal_digest.0.as_slice(),keyed_fingerprint.0.as_slice(),path]).map_err(|_|Error::Storage)?;
         Ok(keyed_fingerprint)
+        })
     }
     fn rotate_account(&self,item:&ConfirmationItem,new_value:&str,runtime:&dyn MigrationConfigReadback)->Result<Sha256Digest> {
         let input=accounts::account_input(item)?;
@@ -302,6 +309,7 @@ impl GatewayAuthority {
 }
 impl ProposalValidator for GatewayAuthority {
     fn validate_fresh(&self, item: &ConfirmationItem) -> Result<()> {
+        bridge::operation(|| {
         item.validate().map_err(|_| Error::Invalid)?;
         if item.fields.iter().any(|f|f.name=="requires_reentry") {return Err(Error::Denied);}
         match item.category {
@@ -335,10 +343,12 @@ impl ProposalValidator for GatewayAuthority {
             ConfirmationCategory::LegacyApproval => Err(Error::Denied),
             _ => self.backend.as_ref().ok_or(Error::Denied)?.validate(item),
         }
+        })
     }
 }
 impl ProposalApplier for GatewayAuthority {
     fn stage(&mut self, item: &ConfirmationItem) -> Result<()> {
+        bridge::operation(|| {
         self.validate_fresh(item)?;
         if self.plan(item)?.is_some() { return Ok(()); }
         if accounts::GatewayAccountReadback::item_supported(item) {
@@ -361,8 +371,10 @@ impl ProposalApplier for GatewayAuthority {
             _ => return self.backend.as_ref().ok_or(Error::Denied)?.stage(item),
         };
         self.save_plan(item,&plan)
+        })
     }
     fn publish(&mut self, item: &ConfirmationItem) -> Result<()> {
+        bridge::operation(|| {
         let Some(plan) = self.plan(item)? else { return self.backend.as_ref().ok_or(Error::Denied)?.publish(item); };
         match plan {
             Plan::Binding(plan) => {self.require_shared_employee(item)?;plan.publish(&self.home)},
@@ -382,8 +394,10 @@ impl ProposalApplier for GatewayAuthority {
             Plan::User {email,display,role} => self.user_db()?.migration_invite_user(&operation(&item.binding),&item.binding.proposal_digest.0,&email,&display,role).map(|_|()).map_err(|_| Error::Apply),
             Plan::Config {relative,before,after} => self.publish_config(item,&relative,&before,&after),
         }
+        })
     }
     fn read_back(&mut self, item: &ConfirmationItem) -> Result<()> {
+        bridge::operation(|| {
         let Some(plan) = self.plan(item)? else { return self.backend.as_ref().ok_or(Error::Denied)?.read_back(item); };
         match plan {
             Plan::Binding(plan) => {self.require_shared_employee(item)?;plan.read_back(&self.home)},
@@ -401,8 +415,10 @@ impl ProposalApplier for GatewayAuthority {
             }
             Plan::Config {relative,before,after} => self.read_back_config(item,&relative,&before,&after),
         }
+        })
     }
     fn disable_and_read_back(&mut self, item: &ConfirmationItem) -> Result<()> {
+        bridge::operation(|| {
         let Some(plan) = self.plan(item)? else {
             return match &self.backend { Some(b) if b.supports(item.category) => b.disable(item), _ if Self::built_in_supports(item.category) => Ok(()), _ => Err(Error::Compensation) };
         };
@@ -418,10 +434,12 @@ impl ProposalApplier for GatewayAuthority {
             Plan::User {..} => self.user_db()?.migration_user_disable(&operation(&item.binding),&item.binding.proposal_digest.0).map_err(|_| Error::Compensation),
             Plan::Config {relative,before,after} => self.disable_config(item,&relative,&before,&after),
         }
+        })
     }
 }
 impl RotationVerifier for GatewayAuthority {
     fn verify_rotated(&self, binding: &ProposalBinding, field: &str, fingerprint: Sha256Digest) -> Result<()> {
+        bridge::operation(|| {
         let row: (Vec<u8>,Vec<u8>,String) = self.db.query_row("SELECT digest,fingerprint,path FROM rotated WHERE operation=?1 AND field=?2",
             params![operation(binding),field], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_| Error::Denied)?;
         if row.0 != binding.proposal_digest.0 || row.1 != fingerprint.0 { return Err(Error::Denied); }
@@ -430,6 +448,7 @@ impl RotationVerifier for GatewayAuthority {
         let ProposalValue::SecretFingerprint {keyed_fingerprint,..}=self.fingerprint_secret(&observed)? else {return Err(Error::Invalid);};
         if keyed_fingerprint!=fingerprint {return Err(Error::Denied);}
         Ok(())
+        })
     }
 }
 fn operation(binding: &ProposalBinding) -> String { format!("{}-{:x}",hex::encode(binding.operation_id.proposal_id.0),binding.operation_id.revision) }

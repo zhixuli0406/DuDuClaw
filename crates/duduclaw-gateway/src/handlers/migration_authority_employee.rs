@@ -14,7 +14,7 @@ impl EmployeeAuthority {
         if item.fields.iter().any(|f| !matches!(f.name.as_str(),"employee_id"|"disk_bytes"|"settings"))
             || !duduclaw_core::is_valid_agent_id(&spec.label) || duduclaw_core::is_reserved_agent_id(&spec.label) {return Err(Error::Denied);}
         let expected:serde_json::Value=serde_json::from_str(text(item,"settings")?).map_err(|_|Error::Invalid)?;
-        self.live.handle.block_on(async {
+        bounded(&self.live.handle,async {
             let registry=self.live.registry.read().await;
             let employee=registry.get(&spec.label).ok_or(Error::Denied)?;
             let current=serde_json::to_value(&employee.config).map_err(|_|Error::Invalid)?;
@@ -24,7 +24,7 @@ impl EmployeeAuthority {
             let fresh=crate::agent_files::flow::require_live_agent_access(&self.home,&self.live.context,&spec.label,duduclaw_auth::AccessLevel::Owner).map_err(|_|Error::Denied)?;
             if !fresh.is_admin(){return Err(Error::Denied)}
             Ok(())
-        })
+        })?
     }
     fn exchange(&self,item:&ConfirmationItem,action:Action)->Result<Receipt>{exchange(item,action)}
     fn save(&self,item:&ConfirmationItem,receipt:&Receipt)->Result<()> {

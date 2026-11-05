@@ -1,7 +1,7 @@
 //! Exclusive import boot. This branch runs before normal gateway initialization,
 //! so no public listener, channel, timer, model runtime or employee loader exists.
 use std::path::Path;
-use duduclaw_migration::{Error, import_manifest::{ImportManifest, IMPORT_MANIFEST}};
+use duduclaw_migration::{Error, import_manifest::{ImportManifest, IMPORT_MANIFEST, DURABLE_IMPORT_MANIFEST}};
 pub use duduclaw_migration::import_manifest::IMPORT_ONLY_ENV;
 
 fn gateway_error(_: Error) -> duduclaw_core::error::DuDuClawError {
@@ -14,7 +14,7 @@ pub async fn maybe_run(home: &Path) -> duduclaw_core::error::Result<bool> {
     let requested = std::env::var_os(IMPORT_ONLY_ENV);
     #[cfg(target_os = "linux")]
     {
-        let manifest = linux::read_manifest(Path::new(IMPORT_MANIFEST)).map_err(gateway_error)?;
+        let manifest = linux::read_boot_manifest().map_err(gateway_error)?;
         use duduclaw_migration::import_manifest::{boot_decision,ImportBootDecision};
         match boot_decision(requested.as_deref(),manifest.as_ref(),home).map_err(gateway_error)? {
             ImportBootDecision::Normal => Ok(false),
@@ -32,12 +32,37 @@ pub async fn maybe_run(home: &Path) -> duduclaw_core::error::Result<bool> {
     }
 }
 
+/// Read the root-authenticated completed import identity for first-admin setup.
+/// An unfinished manifest never authorizes normal/bootstrap startup.
+pub(crate) fn completed_manifest(home: &Path) -> Result<Option<ImportManifest>, Error> {
+    #[cfg(target_os = "linux")]
+    {
+        let manifest = linux::read_boot_manifest()?;
+        match manifest {
+            Some(value) if value.home == home => {
+                if !value.completed { return Err(Error::Authentication); }
+                Ok(Some(value))
+            }
+            _ => Ok(None),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = home; Ok(None) }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
     use std::{fs::OpenOptions, io::Read, os::{fd::{AsRawFd, FromRawFd}, unix::{fs::{FileTypeExt, MetadataExt, OpenOptionsExt}, net::UnixListener}}, path::PathBuf};
     use duduclaw_migration::{import_manifest::MAX_MANIFEST_BYTES, import_receiver::{ImportGrant, ImportedBlob}};
     use crate::migration_import::{GatewayImportWriter, ImportModeGate, serve_import_connection};
+    use duduclaw_migration::materialization::{MaterializationDecision, BlobCopyReceipt};
+    use duduclaw_migration::contract::{ConfirmationCategory, ConfirmationStatus, ProposalValue};
+
+    pub(super) fn read_boot_manifest() -> Result<Option<ImportManifest>, Error> {
+        duduclaw_migration::import_manifest::select_boot_manifest(
+            read_manifest(Path::new(IMPORT_MANIFEST))?, read_manifest(Path::new(DURABLE_IMPORT_MANIFEST))?)
+    }
 
     pub(super) fn read_manifest(path: &Path) -> Result<Option<ImportManifest>, Error> {
         match std::fs::symlink_metadata(path) {
@@ -74,7 +99,44 @@ mod linux {
         fn authorize(&self, grant: &ImportGrant) -> Result<Option<String>, Error> {
             self.readback_import_only()?;
             let entry=self.manifest.grants.iter().find(|entry|entry.grant==*grant).ok_or(Error::Authentication)?;
+            self.materialization(grant)?;
             Ok(entry.target_agent.clone())
+        }
+        fn materialization(&self, grant:&ImportGrant)->Result<Option<MaterializationDecision>,Error> {
+            self.readback_import_only()?;
+            let entry=self.manifest.grants.iter().find(|entry|entry.grant==*grant).ok_or(Error::Authentication)?;
+            let Some(decision)=entry.materialization.as_ref() else {return Ok(None);};
+            decision.validate(grant)?;
+            let (binding,required,agent)=match decision {
+                MaterializationDecision::Confirmed {allocation} => (allocation.proposal,ConfirmationStatus::Applied,Some(allocation.agent.as_str())),
+                MaterializationDecision::Rejected {proposal} => (*proposal,ConfirmationStatus::Rejected,None),
+                MaterializationDecision::Retained {policy} => {
+                    if policy!="administrator_read_only_history" || !matches!(grant.class,
+                        duduclaw_migration::import_receiver::ContentClass::TaskHistory|duduclaw_migration::import_receiver::ContentClass::LegacyAuditArchive) {
+                        return Err(Error::Authentication);
+                    }
+                    return Ok(Some(decision.clone()));
+                }
+            };
+            let store=duduclaw_migration::confirmation::ConfirmationStore::open_read_only(&self.manifest.home.join("migration-confirmations.db")).map_err(|_|Error::Storage)?;
+            let items=store.list().map_err(|_|Error::Storage)?;
+            let item=items.iter().find(|item|item.binding==binding && item.category==ConfirmationCategory::Employee && item.status==required).ok_or(Error::Authentication)?;
+            let label=item.fields.iter().find_map(|field|match (&*field.name,&field.value) {
+                ("employee_id",ProposalValue::Text{value})=>Some(value.as_str()),_=>None,
+            }).ok_or(Error::Authentication)?;
+            if grant.employee!=Some(duduclaw_migration::root_sources::employee_id(grant.migration_id,label))
+                || agent.is_some_and(|agent|agent!=label) {return Err(Error::Authentication);}
+            Ok(Some(decision.clone()))
+        }
+        fn blob_receipt(&self,grant:&ImportGrant,blob:&ImportedBlob)->Result<BlobCopyReceipt,Error> {
+            self.readback_import_only()?;
+            let MaterializationDecision::Confirmed{allocation}=self.materialization(grant)?.ok_or(Error::Authentication)? else {return Err(Error::Authentication);};
+            let entry=self.manifest.grants.iter().find(|entry|entry.grant==*grant).ok_or(Error::Authentication)?;
+            let receipt=entry.blob_receipts.iter().find(|receipt|receipt.source_handle==blob.source_handle).ok_or(Error::Readback)?;
+            if receipt.allocation_digest!=allocation.allocation_digest || receipt.sha256!=blob.sha256 || receipt.size_bytes!=blob.size_bytes {
+                return Err(Error::Readback);
+            }
+            Ok(receipt.clone())
         }
         fn readback_import_only(&self) -> Result<(), Error> {
             if self.current()?.completed || !duduclaw_core::gateway_instance::held(&self.manifest.home)
@@ -87,9 +149,35 @@ mod linux {
             self.readback_import_only()?;
             Ok(self.manifest.grants.iter().map(|entry|entry.grant.clone()).collect())
         }
-        // Blobs require root copy plus confirmed B/H allocation. No authority or
-        // filesystem receipt is inferred from old data or an archive record.
-        fn readback_blob(&self, _: &ImportGrant, _: &ImportedBlob, _: bool) -> Result<(), Error> {Err(Error::Unavailable)}
+        fn readback_blob(&self, grant:&ImportGrant, blob:&ImportedBlob, work_product:bool) -> Result<(), Error> {
+            use sha2::{Digest,Sha256};
+            let receipt=self.blob_receipt(grant,blob)?;
+            if work_product {
+                // The employee-owned 0600 file is deliberately unreadable to the
+                // gateway. The authenticated root manifest carries root's fd
+                // readback; it is bound to the confirmed immutable allocation.
+                return Ok(());
+            }
+            // Attachments are gateway-owned product files. Open through pinned
+            // directories; a copied receipt never substitutes for their readback.
+            let path=std::ffi::CString::new(receipt.destination.as_os_str().as_encoded_bytes()).map_err(|_|Error::Invalid)?;
+            #[repr(C)] struct OpenHow {flags:u64,mode:u64,resolve:u64}
+            let how=OpenHow {flags:(libc::O_RDONLY|libc::O_CLOEXEC|libc::O_NOFOLLOW|libc::O_NONBLOCK) as u64,mode:0,resolve:0x02|0x04};
+            // SAFETY: bounded C path and initialized open_how are valid through
+            // syscall; the successful descriptor is immediately taken once.
+            let fd=unsafe {libc::syscall(libc::SYS_openat2,libc::AT_FDCWD,path.as_ptr(),&how,std::mem::size_of::<OpenHow>())};
+            if fd<0 {return Err(Error::Readback);}
+            let mut file=unsafe {std::fs::File::from_raw_fd(fd as i32)};
+            let metadata=file.metadata()?;
+            if !metadata.is_file() || metadata.uid()!=self.manifest.gateway_uid || metadata.nlink()!=1
+                || metadata.mode()&0o7777!=0o600 || metadata.len()!=blob.size_bytes {return Err(Error::Readback);}
+            let mut digest=Sha256::new();let mut bytes=0u64;let mut buffer=[0;65536];
+            loop {let n=file.read(&mut buffer)?;if n==0 {break;}
+                bytes=bytes.checked_add(n as u64).ok_or(Error::Limit)?;if bytes>blob.size_bytes {return Err(Error::Readback);}
+                digest.update(&buffer[..n]);}
+            if bytes!=blob.size_bytes || <[u8;32]>::from(digest.finalize())!=blob.sha256.0 {return Err(Error::Readback);}
+            Ok(())
+        }
     }
 
     fn take_listener(uid:u32) -> Result<tokio::net::UnixListener, Error> {

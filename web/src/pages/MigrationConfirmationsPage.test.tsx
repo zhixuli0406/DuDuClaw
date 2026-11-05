@@ -21,6 +21,13 @@ beforeEach(() => {
   mockWsClient.call.mockResolvedValue(response());
 });
 describe('migration confirmation', () => {
+  it('labels rejected employee content as not migrated and retained until the snapshot deadline', async () => {
+    mockWsClient.call.mockResolvedValue(response([{ ...item(true, 1), category: 'employee',
+      status: 'rejected', content_status: 'not_migrated_rejected' }]));
+    renderWithProviders(<MigrationConfirmationsPage />);
+    await screen.findByText('Not migrated (rejected); content remains in the encrypted snapshot until its retention deadline.');
+    expect(screen.queryByText('Applied and verified')).toBeNull();
+  });
   it('renders full untrusted text inertly and excludes high-risk proposals from bulk selection', async () => {
     renderWithProviders(<MigrationConfirmationsPage />);
     await screen.findAllByText('<script>unsafe()</script>');

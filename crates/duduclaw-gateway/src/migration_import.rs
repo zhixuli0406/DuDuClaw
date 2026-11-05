@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use duduclaw_migration::{Error, import_receiver::{ImportGrant, StagedImport, ImportedContent, ImportedBlob}};
 use duduclaw_memory::{SqliteMemoryEngine, engine::TemporalMeta, lineage::{Provenance, SourceRef}};
 use duduclaw_core::types::{MemoryEntry, MemoryLayer};
+use duduclaw_migration::materialization::{MaterializationStore, MaterializationDecision, RecordReceipt, BlobCopyReceipt, payload_digest};
 
 /// Package A/startup seam. Implementations read the active migration manifest and
 /// verify that channels, execution and public dashboard listeners are stopped.
@@ -14,6 +15,8 @@ use duduclaw_core::types::{MemoryEntry, MemoryLayer};
 pub trait ImportModeGate {
     fn authorize(&self, grant: &ImportGrant) -> Result<Option<String>, Error>;
     fn readback_import_only(&self) -> Result<(), Error>;
+    fn materialization(&self, _: &ImportGrant) -> Result<Option<MaterializationDecision>, Error> { Ok(None) }
+    fn blob_receipt(&self, _: &ImportGrant, _: &ImportedBlob) -> Result<BlobCopyReceipt, Error> { Err(Error::Unavailable) }
     fn expected_grants(&self) -> Result<Vec<ImportGrant>, Error> { Err(Error::Unavailable) }
     /// Root manifest receipt from import_blobs::copy_blob. Work products additionally
     /// require confirmed employee allocation and quota readback from packages B/H.
@@ -32,6 +35,7 @@ impl ImportModeGate for UnavailableImportMode {
 pub struct GatewayImportWriter {
     home: PathBuf,
     archive: Connection,
+    materialization: MaterializationStore,
     memory: SqliteMemoryEngine,
     sessions: crate::session::SessionManager,
 }
@@ -39,7 +43,7 @@ impl GatewayImportWriter {
     pub fn open(home: &Path, gate: &impl ImportModeGate) -> Result<Self, Error> {
         gate.readback_import_only()?;
         let archive = Connection::open(home.join("legacy_content.db"))?;
-        archive.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+        archive.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS legacy_content (
                 id TEXT PRIMARY KEY, migration TEXT NOT NULL, agent TEXT, source_id TEXT NOT NULL,
                 payload TEXT NOT NULL, materialized INTEGER NOT NULL DEFAULT 0,
@@ -49,12 +53,20 @@ impl GatewayImportWriter {
         let memory = crate::memory_factory::build_memory_engine(&home.join("memory.db"), home)
             .map_err(|_| Error::Storage)?.with_supersession_trust_guard(true);
         let sessions = crate::session::SessionManager::new(&home.join("sessions.db")).map_err(|_| Error::Storage)?;
-        Ok(Self { home: home.to_path_buf(), archive, memory, sessions })
+        let materialization = MaterializationStore::open(&home.join("migration-materialization.db"))?;
+        Ok(Self { home: home.to_path_buf(), archive, materialization, memory, sessions })
     }
 
     pub async fn apply(&mut self, staged: &StagedImport, gate: &impl ImportModeGate) -> Result<u64, Error> {
         gate.readback_import_only()?;
         let agent = gate.authorize(staged.grant())?;
+        let decision = gate.materialization(staged.grant())?;
+        match (&decision, &agent) {
+            (Some(MaterializationDecision::Confirmed { allocation }), Some(agent)) if allocation.agent == *agent => {},
+            (Some(MaterializationDecision::Confirmed { .. }), _) | (_, Some(_)) => return Err(Error::Authentication),
+            _ => {},
+        }
+        if let Some(decision) = &decision { decision.validate(staged.grant())?; }
         if agent.as_deref().is_some_and(|id| !duduclaw_core::is_valid_agent_id(id)) { return Err(Error::Invalid); }
         // Root owns source-fd copying. An absent or unverified publication receipt
         // refuses the entire stream before content or retry-ledger writes.
@@ -67,25 +79,59 @@ impl GatewayImportWriter {
             }
         }
         let migration = format!("legacy_import:{}", hex(&staged.grant().migration_id.0));
+        let rejected=matches!(&decision,Some(MaterializationDecision::Rejected { .. }));
         let tx = self.archive.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for record in staged.records() {
             let payload = serde_json::to_string(record)?;
-            let id = record_id(&migration, agent.as_deref(), &record.source_record_id);
+            let id = content_record_id(&migration, &staged.grant().source_id, &record.source_record_id);
             let existing: Option<String> = tx.query_row("SELECT payload FROM legacy_content WHERE id=?1", [&id], |r| r.get(0)).optional()?;
             if existing.as_ref().is_some_and(|old| old != &payload) { return Err(Error::Conflict); }
-            tx.execute("INSERT OR IGNORE INTO legacy_content(id,migration,agent,source_id,payload) VALUES (?1,?2,?3,?4,?5)",
-                params![id, migration, agent, record.source_record_id, payload])?;
+            if rejected {
+                tx.execute("DELETE FROM legacy_content WHERE id=?1 AND materialized=0",[&id])?;
+            } else {
+                tx.execute("INSERT OR IGNORE INTO legacy_content(id,migration,agent,source_id,payload) VALUES (?1,?2,?3,?4,?5)",
+                    params![id, migration, Option::<String>::None, record.source_record_id, payload])?;
+            }
+            // Upgrade the pre-materialization archive identity without retaining
+            // a second plaintext copy. Older imports never materialized None.
+            let old_id=record_id(&migration,None,&record.source_record_id);
+            tx.execute("DELETE FROM legacy_content WHERE id=?1 AND id<>?2 AND payload=?3 AND agent IS NULL AND materialized=0",
+                params![old_id,id,payload])?;
         }
         tx.commit()?;
+        if rejected {
+            let (busy,_,_):(u64,u64,u64)=self.archive.query_row("PRAGMA wal_checkpoint(TRUNCATE)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            if busy!=0 {return Err(Error::Readback);}
+        }
+        self.materialization.register(staged.grant(), staged.records())?;
         for record in staged.records() {
+            let Some(decision) = decision.as_ref() else { continue; };
+            gate.readback_import_only()?;
+            if gate.materialization(staged.grant())?.as_ref()!=Some(decision) { return Err(Error::Conflict); }
+            let pending=self.materialization.begin(staged.grant(),record,decision)?;
+            if matches!(decision,MaterializationDecision::Rejected { .. }) {
+                if pending {self.materialization.finish(staged.grant(),record,decision,&RecordReceipt::Rejected)?;}
+                // The archive was securely deleted and checkpointed before
+                // this receipt. Replays never reintroduce rejected plaintext.
+                continue;
+            }
+            if !pending { continue; }
+            match decision {
+                MaterializationDecision::Rejected { .. } => return Err(Error::Conflict),
+                MaterializationDecision::Retained { policy } => {
+                    if policy!="administrator_read_only_history" || !matches!(record.content,
+                        ImportedContent::TaskHistory { .. } | ImportedContent::LegacyAuditArchive { .. }) { return Err(Error::Invalid); }
+                    self.materialization.finish(staged.grant(),record,decision,&RecordReceipt::Retained {policy:policy.clone()})?;
+                    continue;
+                }
+                MaterializationDecision::Confirmed { .. } => {},
+            }
             // Before employee confirmation the archive is the only destination.
             // It is never consulted by employee execution, memory or wiki loaders.
             if agent.is_none() { continue; }
             gate.readback_import_only()?;
             if gate.authorize(staged.grant())? != agent { return Err(Error::Conflict); }
-            let id = record_id(&migration, agent.as_deref(), &record.source_record_id);
-            let done: bool = self.archive.query_row("SELECT materialized FROM legacy_content WHERE id=?1", [&id], |r| r.get(0))?;
-            if done { continue; }
+            let id = content_record_id(&migration, &staged.grant().source_id, &record.source_record_id);
             match &record.content {
                 ImportedContent::Memory { text } => {
                     let agent = agent.as_deref().ok_or(Error::Invalid)?;
@@ -106,6 +152,12 @@ impl GatewayImportWriter {
                             .await.map_err(|_| Error::Storage)?;
                         if stored != id { return Err(Error::Readback); }
                     }
+                    let stored = self.memory.get_by_id(agent, &id).await.map_err(|_| Error::Storage)?
+                        .ok_or(Error::Readback)?;
+                    if stored.content != *text || stored.source_event != migration
+                        || self.memory.get_origin_trust(agent, &id).await.map_err(|_| Error::Storage)? != Some(0.0) {
+                        return Err(Error::Readback);
+                    }
                 }
                 ImportedContent::WikiPage { title, text } => {
                     let agent = agent.as_deref().ok_or(Error::Invalid)?;
@@ -119,17 +171,32 @@ impl GatewayImportWriter {
                     let stored = std::fs::read_to_string(self.home.join("agents").join(agent).join("wiki").join(&path))?;
                     // WikiStore may add host metadata, but the exact inert payload must survive.
                     if !stored.lines().any(|line| line == quoted) { return Err(Error::Readback); }
+                    let published=self.home.join("agents").join(agent).join("wiki").join(&path);
+                    std::fs::File::open(&published)?.sync_all()?;
+                    std::fs::File::open(published.parent().ok_or(Error::Invalid)?)?.sync_all()?;
                 }
                 ImportedContent::Conversation { text, .. } | ImportedContent::ChannelHistory { text, .. } => {
                     let agent = agent.as_deref().ok_or(Error::Invalid)?;
                     let session_id = record_id(&migration, Some(agent), &staged.grant().source_id);
                     self.sessions.import_legacy_message(&session_id, agent, &id, &migration, text).await?;
                 }
-                ImportedContent::TaskHistory { .. } | ImportedContent::LegacyAuditArchive { .. } => {}
+                ImportedContent::TaskHistory { .. } | ImportedContent::LegacyAuditArchive { .. } => {
+                    self.materialization.finish(staged.grant(),record,decision,&RecordReceipt::Retained {
+                        policy:"administrator_read_only_history".into() })?;
+                    continue;
+                }
                 ImportedContent::Attachment { blob } => gate.readback_blob(staged.grant(),blob,false)?,
                 ImportedContent::WorkProduct { blob } => gate.readback_blob(staged.grant(),blob,true)?,
             }
-            self.archive.execute("UPDATE legacy_content SET materialized=1 WHERE id=?1", [&id])?;
+            gate.readback_import_only()?;
+            if gate.materialization(staged.grant())?.as_ref()!=Some(decision) { return Err(Error::Conflict); }
+            let blob_copy=match &record.content {
+                ImportedContent::Attachment {blob} | ImportedContent::WorkProduct {blob} => Some(gate.blob_receipt(staged.grant(),blob)?),
+                _ => None,
+            };
+            self.archive.execute("UPDATE legacy_content SET materialized=1,agent=?2 WHERE id=?1", params![id,agent])?;
+            self.materialization.finish(staged.grant(),record,decision,&RecordReceipt::Materialized {
+                readback:payload_digest(record)?,blob_copy })?;
         }
         gate.readback_import_only()?;
         let encoded = serde_json::to_string(staged.grant())?;
@@ -157,14 +224,16 @@ impl GatewayImportWriter {
         }
         let proposals=duduclaw_migration::confirmation::ConfirmationStore::open_read_only(&self.home.join("migration-confirmations.db"))
             .map_err(|_|Error::Storage)?.list().map_err(|_|Error::Storage)?;
-        if proposals.iter().any(|item| !matches!(item.status,ConfirmationStatus::Pending|ConfirmationStatus::ExpiredRejected)) {
-            return Err(Error::Readback);
-        }
         let expired=proposals.iter().filter(|item|item.category==ConfirmationCategory::LegacyApproval
             && item.status==ConfirmationStatus::ExpiredRejected).count();
-        Ok(serde_json::json!({"complete":streams==grants.len() as u64,"proposal_count":proposals.len(),
+        let materialized:u64=self.archive.query_row("SELECT COUNT(*) FROM legacy_content WHERE materialized=1",[],|row|row.get(0))?;
+        let archived_complete=streams==grants.len() as u64;
+        let authority_inactive=proposals.iter().all(|item|matches!(item.status,ConfirmationStatus::Pending|ConfirmationStatus::ExpiredRejected));
+        let complete=archived_complete && self.materialization.all_terminal(&grants)?;
+        Ok(serde_json::json!({"complete":complete,"archived_complete":archived_complete,"proposal_count":proposals.len(),
             "pending_count":proposals.iter().filter(|item|item.status==ConfirmationStatus::Pending).count(),
-            "expired_approvals":expired,"authority_inactive":true,"imported_streams":streams,"imported_records":records}))
+            "expired_approvals":expired,"authority_inactive":authority_inactive,"archived_streams":streams,"archived_records":records,
+            "imported_records":materialized}))
     }
 }
 impl crate::session::SessionManager {
@@ -175,7 +244,7 @@ impl crate::session::SessionManager {
     pub(crate) async fn import_legacy_message(&self, session_id: &str, agent: &str,
         record_id: &str, source: &str, text: &str) -> Result<(), Error> {
         let conn = self.acquire().await;
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS legacy_import_messages (
+        conn.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS legacy_import_messages (
             record_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, payload TEXT NOT NULL);")?;
         let tx = conn.unchecked_transaction()?;
         let payload = serde_json::to_string(&serde_json::json!({"source":source,"text":text}))?;
@@ -183,6 +252,10 @@ impl crate::session::SessionManager {
             |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
         if let Some((old_session, old_payload)) = old {
             if old_session != session_id || old_payload != payload { return Err(Error::Conflict); }
+            let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM session_messages m JOIN sessions s ON s.id=m.session_id
+                WHERE m.session_id=?1 AND s.agent_id=?2 AND s.archived_at IS NOT NULL AND m.role='user' AND m.content=?3)",
+                params![session_id,agent,payload],|r|r.get(0))?;
+            if !exists { return Err(Error::Readback); }
             return Ok(());
         }
         let now = Utc::now().to_rfc3339();
@@ -195,11 +268,19 @@ impl crate::session::SessionManager {
             params![session_id,payload,now])?;
         tx.execute("INSERT INTO legacy_import_messages(record_id,session_id,payload) VALUES (?1,?2,?3)",params![record_id,session_id,payload])?;
         tx.commit()?;
+        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM session_messages m JOIN sessions s ON s.id=m.session_id
+            WHERE m.session_id=?1 AND s.agent_id=?2 AND s.archived_at IS NOT NULL AND m.role='user' AND m.content=?3)",
+            params![session_id,agent,payload],|r|r.get(0))?;
+        if !exists {return Err(Error::Readback);}
         Ok(())
     }
 }
 
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
+fn content_record_id(migration:&str,source:&str,record:&str)->String {
+    let identity=serde_json::to_string(&(source,record)).expect("strings serialize");
+    record_id(migration,None,&identity)
+}
 fn record_id(migration: &str, agent: Option<&str>, source: &str) -> String {
     let canonical = serde_json::to_vec(&(migration, agent, source)).expect("strings serialize");
     format!("legacy-{}", hex(&Sha256::digest(canonical)))
@@ -258,6 +339,15 @@ mod tests {
             Ok(Some("sales".into()))
         }
         fn readback_import_only(&self) -> Result<(), Error> { Ok(()) }
+        fn expected_grants(&self)->Result<Vec<ImportGrant>,Error> {Ok(vec![self.0.clone()])}
+        fn materialization(&self,grant:&ImportGrant)->Result<Option<MaterializationDecision>,Error> {
+            use duduclaw_migration::{materialization::ConfirmedAllocation, contract::{ProposalBinding,ProposalOperationId}};
+            Ok(Some(MaterializationDecision::Confirmed {allocation:ConfirmedAllocation {
+                proposal:ProposalBinding {operation_id:ProposalOperationId {proposal_id:RequestId([8;16]),revision:1},proposal_digest:Sha256Digest([9;32])},
+                employee:grant.employee.ok_or(Error::Invalid)?,agent:"sales".into(),uid:62000,allocation_digest:Sha256Digest([7;32]),
+                quota_bytes:1024,workspace:"/var/lib/duduclaw/workspaces/sales".into(),
+            }}))
+        }
     }
     #[tokio::test]
     async fn migration_import_memory_uses_low_trust_lineage_and_retries_without_duplicates() {
@@ -341,8 +431,10 @@ mod tests {
         duduclaw_migration::confirmation::ConfirmationStore::from_connection(Connection::open(home.path().join("migration-confirmations.db")).unwrap()).unwrap();
         assert!(!writer.status(&gate).unwrap()["complete"].as_bool().unwrap());
         for _ in 0..2 {assert_eq!(writer.apply(&staged,&gate).await.unwrap(),1);}
-        assert_eq!(writer.status(&gate).unwrap()["imported_streams"],1);
-        assert_eq!(writer.status(&gate).unwrap()["imported_records"],1);
+        assert_eq!(writer.status(&gate).unwrap()["archived_streams"],1);
+        assert_eq!(writer.status(&gate).unwrap()["archived_records"],1);
+        assert_eq!(writer.status(&gate).unwrap()["imported_records"],0);
+        assert_eq!(writer.status(&gate).unwrap()["complete"],false);
         assert_eq!(writer.status(&gate).unwrap()["authority_inactive"],true);
         assert!(writer.memory.list_recent("old-admin",10).await.unwrap().is_empty());
         assert!(!home.path().join("agents").exists());
@@ -350,6 +442,73 @@ mod tests {
         assert!(!home.path().join(".mcp.json").exists());
         let count:u64=writer.archive.query_row("SELECT COUNT(*) FROM legacy_content WHERE materialized=0",[],|row|row.get(0)).unwrap();
         assert_eq!(count,1);
+    }
+
+    #[tokio::test]
+    async fn migration_import_rejected_content_leaves_only_terminal_digests() {
+        struct RejectedGate(ImportGrant);
+        impl ImportModeGate for RejectedGate {
+            fn authorize(&self,grant:&ImportGrant)->Result<Option<String>,Error> {
+                if grant!=&self.0 {return Err(Error::Authentication);}Ok(None)
+            }
+            fn readback_import_only(&self)->Result<(),Error> {Ok(())}
+            fn expected_grants(&self)->Result<Vec<ImportGrant>,Error> {Ok(vec![self.0.clone()])}
+            fn materialization(&self,grant:&ImportGrant)->Result<Option<MaterializationDecision>,Error> {
+                let Some(MaterializationDecision::Confirmed{allocation})=Gate(self.0.clone()).materialization(grant)? else {return Err(Error::Invalid);};
+                Ok(Some(MaterializationDecision::Rejected{proposal:allocation.proposal}))
+            }
+        }
+        let home=tempfile::tempdir().unwrap();
+        let record=ImportRecord {schema_version:1,migration_id:RequestId([1;16]),employee:Some(EmployeeId([2;16])),
+            sequence:0,source_record_id:"memory:one".into(),content:ImportedContent::Memory{text:"REJECTED-PLAINTEXT-CANARY".into()}};
+        let mut bytes=serde_json::to_vec(&record).unwrap();bytes.push(b'\n');
+        let grant=ImportGrant {migration_id:record.migration_id,employee:record.employee,source_id:"memory".into(),class:ContentClass::Memory,
+            stream_bytes:bytes.len() as u64,records:1,stream_sha256:Sha256Digest(Sha256::digest(&bytes).into())};
+        let staged=StagedImport::receive(grant.clone(),bytes.as_slice(),true).unwrap();
+        duduclaw_migration::confirmation::ConfirmationStore::from_connection(Connection::open(home.path().join("migration-confirmations.db")).unwrap()).unwrap();
+        let archive=ArchiveGate(grant.clone());let rejected=RejectedGate(grant);
+        let mut writer=GatewayImportWriter::open(home.path(),&archive).unwrap();
+        writer.apply(&staged,&archive).await.unwrap();
+        for _ in 0..2 {writer.apply(&staged,&rejected).await.unwrap();}
+        assert_eq!(writer.status(&rejected).unwrap()["complete"],true);
+        assert_eq!(writer.status(&rejected).unwrap()["imported_records"],0);
+        assert_eq!(writer.archive.query_row("SELECT COUNT(*) FROM legacy_content",[],|r|r.get::<_,u64>(0)).unwrap(),0);
+        for suffix in ["","-wal"] {
+            let path=home.path().join(format!("legacy_content.db{suffix}"));
+            if let Ok(bytes)=std::fs::read(path) {assert!(!bytes.windows(b"REJECTED-PLAINTEXT-CANARY".len()).any(|bytes|bytes==b"REJECTED-PLAINTEXT-CANARY"));}
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_import_archived_stream_materializes_after_confirmation_and_crash_resume() {
+        let home=tempfile::tempdir().unwrap();
+        let record=ImportRecord {schema_version:1,migration_id:RequestId([1;16]),employee:Some(EmployeeId([2;16])),
+            sequence:0,source_record_id:"memory:one".into(),content:ImportedContent::Memory{text:"preserve this fact".into()}};
+        let mut bytes=serde_json::to_vec(&record).unwrap();bytes.push(b'\n');
+        let grant=ImportGrant {migration_id:record.migration_id,employee:record.employee,source_id:"memory".into(),class:ContentClass::Memory,
+            stream_bytes:bytes.len() as u64,records:1,stream_sha256:Sha256Digest(Sha256::digest(&bytes).into())};
+        let staged=StagedImport::receive(grant.clone(),bytes.as_slice(),true).unwrap();
+        let archive_gate=ArchiveGate(grant.clone());let confirmed=Gate(grant.clone());
+        duduclaw_migration::confirmation::ConfirmationStore::from_connection(Connection::open(home.path().join("migration-confirmations.db")).unwrap()).unwrap();
+        let mut writer=GatewayImportWriter::open(home.path(),&archive_gate).unwrap();
+        writer.apply(&staged,&archive_gate).await.unwrap();
+        assert_eq!(writer.status(&archive_gate).unwrap()["archived_complete"],true);
+        assert_eq!(writer.status(&archive_gate).unwrap()["complete"],false);
+        writer.apply(&staged,&confirmed).await.unwrap();
+        assert_eq!(writer.status(&confirmed).unwrap()["complete"],true);
+        // Simulate death after the product write but before its durable receipt.
+        Connection::open(home.path().join("migration-materialization.db")).unwrap()
+            .execute("UPDATE content_receipts SET receipt=NULL",[]).unwrap();
+        assert_eq!(writer.status(&confirmed).unwrap()["complete"],false);
+        drop(writer);
+        let mut resumed=GatewayImportWriter::open(home.path(),&confirmed).unwrap();
+        for _ in 0..2 {resumed.apply(&staged,&confirmed).await.unwrap();}
+        assert_eq!(resumed.status(&confirmed).unwrap()["complete"],true);
+        assert_eq!(resumed.memory.list_recent("sales",10).await.unwrap().len(),1);
+        assert_eq!(resumed.archive.query_row("SELECT COUNT(*) FROM legacy_content",[],|row|row.get::<_,u64>(0)).unwrap(),1);
+        let mut changed=confirmed.materialization(&grant).unwrap().unwrap();
+        if let MaterializationDecision::Confirmed{allocation}=&mut changed {allocation.uid+=1;}
+        assert!(resumed.materialization.begin(&grant,&record,&changed).is_err());
     }
 
     #[tokio::test]

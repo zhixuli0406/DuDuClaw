@@ -7,6 +7,7 @@ pub mod launcher;
 pub mod activation;
 pub mod trust_admin;
 pub mod emergency;
+pub mod bootstrap;
 
 use crate::{Error, Result};
 pub const STATE_ROOT: &str = "/var/lib/duduclaw-updated";

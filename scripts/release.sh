@@ -5,6 +5,9 @@
 #                                                          # bump + sync all platforms
 #   ./scripts/release.sh audit                              # show every platform's version + drift
 #   ./scripts/release.sh verify [version]                  # confirm registries published <version>
+#   ./scripts/release.sh linux-assets --target <triple> [--output-dir <dir>]
+#                         [--manifest-template <json> --signing-key <offline-key>]
+#                                                          # build/package, never publish
 #
 # --title "<theme>" sets the one-line release theme in the CHANGELOG version
 # header (house style: "## [1.36.0] - 2026-07-15 — <theme>"). On a bump the
@@ -325,6 +328,7 @@ if [[ $# -lt 1 ]]; then
     echo "                                       bump + sync every platform manifest"
     echo "  $0 audit                             show each platform's version + drift"
     echo "  $0 verify [version]                  confirm PyPI/npm published <version>"
+    echo "  $0 linux-assets --target <triple>     build/package all native Linux binaries"
     exit 1
 fi
 
@@ -336,6 +340,10 @@ if [[ -z "$CURRENT_VERSION" ]]; then
 fi
 
 case "$1" in
+    linux-assets)
+        shift
+        exec python3 "$(dirname "$0")/package-linux-release.py" "$@"
+        ;;
     audit)
         run_audit "$CURRENT_VERSION" || {
             echo ""
@@ -422,6 +430,7 @@ if $DRY_RUN; then
     fi
     echo "[DRY RUN] ALL channels: 5 GitHub targets + minisign/cosign, npm, PyPI, KB, GHCR,"
     echo "          computer-use image, desktop, Pro image/OEM tar/pro-bin/control-plane allowlist."
+    echo "[DRY RUN] Linux archives include native isolation services; F metadata is signed offline only."
     echo "[DRY RUN] Pro image CLOUD_BUILD=$CLOUD_BUILD; no signing/build/install/commit/tag/publish performed."
     echo "[DRY RUN] Confirm after publishing: $0 verify $NEW_VERSION"
 fi

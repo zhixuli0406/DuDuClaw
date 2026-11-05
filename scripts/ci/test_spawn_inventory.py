@@ -106,6 +106,20 @@ class SpawnInventoryTests(unittest.TestCase):
         registry["entries"][0]["rationale"] = " "
         self.assertIn("missing effect/rationale", check(sites, registry)[0])
 
+    def test_privileged_service_classification_cannot_exempt_employee_or_gateway(self):
+        sites = self.scan('fn launch() { Command::new("systemctl").spawn(); }')
+        registry = self.registry(sites)
+        entry = registry["entries"][0]
+        entry["migration"] = "privileged_service"
+        entry["rationale"] = "Root updater controls its fixed service set; no employee argv."
+        for identity in ("employee", "gateway", "operator", "parse_worker", "import_worker"):
+            entry["identity"] = identity
+            self.assertTrue(any("invalid privileged service exemption" in error
+                                for error in check(sites, registry)))
+        for identity in ("spawn_daemon", "trampoline", "updater", "downloader", "host_service"):
+            entry["identity"] = identity
+            self.assertEqual(check(sites, registry), [])
+
     def test_platform_factories_and_raw_exec_are_counted(self):
         sites = self.scan('''fn start() {
           let cmd = duduclaw_core::platform::async_command_for("x");

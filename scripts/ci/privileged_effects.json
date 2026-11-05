@@ -113,6 +113,18 @@
       "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
     },
     {
+      "symbol": "crates/duduclaw-auth/src/migration.rs::tests::migration_invite_concurrent_connections_return_one_identity",
+      "apis": {
+        "terminal_spawn": 2
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Regression test uses two scoped Rust threads to check atomic invitation identity creation; no OS child process."
+    },
+    {
       "symbol": "crates/duduclaw-cli-runtime/src/oneshot.rs::oneshot_pty_invoke",
       "apis": {
         "command_constructor": 1
@@ -741,6 +753,19 @@
       "rationale": "Operator standalone MCP installation command; updates CLI registration rather than running employee work."
     },
     {
+      "symbol": "crates/duduclaw-cli/src/mcp_isolation_parity_tests.rs::isolated_round5_employee_tool_parity_matches_nonisolated_except_documented_host_authority",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only self-exec isolates signed employee environment for MCP parity assertions; not a production MCP spawn path."
+    },
+    {
       "symbol": "crates/duduclaw-cli/src/mcp_proxy.rs::execution_backend_equivalence_tests::third_party_mcp_backend_command_matches_legacy_argv_env_cwd",
       "apis": {
         "platform_command_factory": 1
@@ -1043,14 +1068,14 @@
       "symbol": "crates/duduclaw-cli/src/service/protected_linux_install.rs::command",
       "apis": {
         "command_constructor": 1,
-        "terminal_output": 1
+        "terminal_spawn": 1
       },
       "effects": [
         "process_spawn"
       ],
       "identity": "gateway",
       "migration": "gateway_exception",
-      "rationale": "Operator installation/service-lifecycle helper; runs service-manager commands under the invoking administrator or gateway identity, not employee content."
+      "rationale": "Operator-only protected Linux installer invokes root-trusted OS utilities with fixed caller-built argv, cleared environment and null stdin. Temporary-file capture is capped at 4 MiB per stream with a 30-second child deadline; no employee prompt, shell text or backend workload runs here."
     },
     {
       "symbol": "crates/duduclaw-container/src/apple.rs::AppleContainerRuntime::is_available",
@@ -1721,6 +1746,66 @@
       "identity": "operator",
       "migration": "other_package",
       "rationale": "Desktop/OS host integration outside native Linux employee isolation; needs its own capability boundary. Not a protected-mode execution exemption."
+    },
+    {
+      "symbol": "crates/duduclaw-egress/src/daemon.rs::serve_control",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "egress",
+      "migration": "not_process",
+      "rationale": "JoinSet::spawn creates a Tokio task for a registered run tunnel in the existing egress process; no native child is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-egress/src/forwarder.rs::forward_loop",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "employee",
+      "migration": "not_process",
+      "rationale": "JoinSet::spawn handles a bounded loopback client within the already isolated forwarder process; this is a Tokio task, not process creation."
+    },
+    {
+      "symbol": "crates/duduclaw-egress/src/forwarder.rs::run_with_listener",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "employee",
+      "migration": "not_process",
+      "rationale": "JoinSet::spawn reads the inherited host connection in the already isolated forwarder process; no native child is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-egress/src/resolver.rs::serve_dns_broker",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "host_service",
+      "migration": "not_process",
+      "rationale": "JoinSet::spawn serves an authenticated DNS request as a bounded Tokio task in the non-root DNS broker; no native process."
+    },
+    {
+      "symbol": "crates/duduclaw-egress/src/session.rs::run_loop",
+      "apis": {
+        "terminal_spawn": 2
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "egress",
+      "migration": "not_process",
+      "rationale": "The two JoinSet::spawn calls create frame-reader and tunnel Tokio tasks inside egress, using its existing policy and budget; no native process."
     },
     {
       "symbol": "crates/duduclaw-execution/src/command.rs::DropforPrepared::drop",
@@ -3162,6 +3247,19 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/document_limits.rs::tests::parse_isolation_public_document_guards_route_by_container",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only self-exec isolates the parse-worker isolation switch while checking document routing; no production employee launch."
     },
     {
       "symbol": "crates/duduclaw-gateway/src/downstream_runs/tests.rs::downstream_stop_kills_real_process_tree",
@@ -4804,6 +4902,19 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
+      "symbol": "crates/duduclaw-isolation-storage/src/linux.rs::run_helper",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "privileged_service",
+      "rationale": "H root storage adapter runs trusted mkfs.ext4 on a pinned image fd and dmsetup for backing-device inspection with fixed callers, cleared environment and bounded output/lifetime. Provisioning precedes employee admission and cannot run as an employee ExecutionBackend task."
+    },
+    {
       "symbol": "crates/duduclaw-knowledge/src/embed/cloud.rs::JsonTransportforHttpTransport::post_json",
       "apis": {
         "terminal_spawn": 1
@@ -4814,6 +4925,19 @@
       "identity": "gateway",
       "migration": "not_process",
       "rationale": "The lexical spawn match starts a Rust thread or Tokio task/JoinSet worker in this function; it does not create an OS child process."
+    },
+    {
+      "symbol": "crates/duduclaw-knowledge/src/embed/local_onnx.rs::tests::parse_isolation_onnx_refuses_before_model_load",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only self-exec isolates the parse-worker isolation switch and proves ONNX refuses before model load; not a production model subprocess."
     },
     {
       "symbol": "crates/duduclaw-knowledge/src/embed/local_onnx.rs::tests::root_key_refuses_models_before_ort",
@@ -5004,6 +5128,30 @@
       "rationale": "Operator maintenance helper for bounded journal/service/system diagnostics; not an employee model/tool execution path."
     },
     {
+      "symbol": "crates/duduclaw-mcp-boundary/src/execution.rs::DropforReservationGuard::drop",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "Tokio runtime Handle::spawn schedules best-effort backend reservation cancellation; it does not create an OS process or run employee code."
+    },
+    {
+      "symbol": "crates/duduclaw-mcp-boundary/src/execution.rs::ExecutionToolBridge::execute",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "backend_dispatch"
+      ],
+      "identity": "employee",
+      "migration": "backend",
+      "rationale": "Calls Arc<dyn ExecutionBackend>::spawn with the authorized typed SpawnPolicy after reservation, handler authorization and immutable context/plan validation. No native Command or gateway-uid fallback."
+    },
+    {
       "symbol": "crates/duduclaw-memory/src/engine.rs::call_claude_summarize",
       "apis": {
         "backend_spawn": 1
@@ -5051,6 +5199,83 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-migration/src/import_launcher.rs::command",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "host_service",
+      "migration": "privileged_service",
+      "rationale": "G root migration coordinator calls trusted systemctl/systemd-run to launch and inspect the one-source DynamicUser importer. The bounded fixed protocol passes pinned source fds; legacy bytes are parsed only by the isolated importer, never this root helper."
+    },
+    {
+      "symbol": "crates/duduclaw-migration/src/import_receiver.rs::activation_tests::iso_root_import_authenticates_acceptor_after_root_socket_activation",
+      "apis": {
+        "raw_fork": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored Linux-root test forks a socketpair peer which drops to nobody to verify post-activation gateway authentication; not production import."
+    },
+    {
+      "symbol": "crates/duduclaw-migration/src/native_stop.rs::command",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "host_service",
+      "migration": "privileged_service",
+      "rationale": "G root migration maintenance adapter invokes trusted OS account/systemd utilities with caller-built argv, cleared environment and bounded output/time to stop and mask legacy processes before import. No employee request or legacy script is executed."
+    },
+    {
+      "symbol": "crates/duduclaw-migration/src/native_stop.rs::deny_probe",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "host_service",
+      "migration": "privileged_service",
+      "rationale": "Root migration readback executes the trusted OS test utility after setting gateway uid/gid to prove the quarantine state directory is unreadable. Fixed -r probe only; no legacy content or employee payload is executed."
+    },
+    {
+      "symbol": "crates/duduclaw-migration/src/native_stop.rs::tests::iso_root_pidfd_stop_reads_all_uid_fields",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root test creates its own sleep child under disposable uid 199991 to verify pidfd-based migration stop and reaping."
+    },
+    {
+      "symbol": "crates/duduclaw-migration/src/root_pipeline.rs::platform_call",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "host_service",
+      "migration": "privileged_service",
+      "rationale": "G root coordinator launches only the root-trusted installed duduclaw-migration-platform adapter with fixed migration-v1 argv and bounded stdin/stdout JSON. The F/B/H platform seam performs privileged publication/readback outside employee execution; absent adapter refuses before outage."
     },
     {
       "symbol": "crates/duduclaw-os/src/calendar.rs::today_events",
@@ -5118,6 +5343,32 @@
       "rationale": "Desktop/OS host integration outside native Linux employee isolation; needs its own capability boundary. Not a protected-mode execution exemption."
     },
     {
+      "symbol": "crates/duduclaw-parse-worker/src/sandbox.rs::tests::iso_root_memory_limit_ssrf_and_watchdog",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root test self-execs a disposable resource-probe child to exercise parser memory, network and watchdog restrictions."
+    },
+    {
+      "symbol": "crates/duduclaw-parse-worker/src/sandbox.rs::tests::seccomp_real_child_can_parse_but_cannot_open_or_network",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only self-exec applies production seccomp in a dedicated child so the test runner remains usable; no production worker bypass."
+    },
+    {
       "symbol": "crates/duduclaw-redaction/src/ner/runtime.rs::NerEngine::spawn_idle_watchdog",
       "apis": {
         "terminal_spawn": 1
@@ -5141,6 +5392,66 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-run/src/bin/root-fixture.rs::linux::Child::spawn",
+      "apis": {
+        "raw_fork": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Root acceptance fixture child helper; root-test-fixture feature is required and release builds are forbidden. Not a shipped spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-run/src/bin/root-fixture.rs::linux::run",
+      "apis": {
+        "raw_fork": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Root acceptance fixture forks isolated syscall/namespace test children; root-test-fixture feature is required and release builds are forbidden."
+    },
+    {
+      "symbol": "crates/duduclaw-run/src/bin/root-fixture/launch.rs::run",
+      "apis": {
+        "raw_fork": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Root acceptance fixture forks the trampoline test child; the binary requires root-test-fixture and rejects release builds. Not shipped by release packaging."
+    },
+    {
+      "symbol": "crates/duduclaw-run/src/bin/root-fixture/launch.rs::runtime_mode",
+      "apis": {
+        "raw_fork": 2
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Root acceptance fixture forks malicious runtime/signal probes; enabled only by root-test-fixture, with release-build compile_error. Not a production runtime entry."
+    },
+    {
+      "symbol": "crates/duduclaw-run/src/bin/root-fixture/propagation.rs::Child::spawn",
+      "apis": {
+        "raw_fork": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Root acceptance fixture forks a mount-propagation probe; only the explicitly enabled non-release root-test-fixture binary includes it."
     },
     {
       "symbol": "crates/duduclaw-sandbox/src/lib.rs::tests::full_access_spec_is_skipped_by_confine",
@@ -5253,6 +5564,68 @@
       "identity": "test",
       "migration": "test_only",
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/accounts.rs::linux::command",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "privileged_service",
+      "rationale": "B1 root account authority invokes trusted fixed OS utilities for NSS allocation, SSH/cron/at readback, locked-account setup and session cleanup; bounded argv/output/time and cleared environment. These host prerequisites cannot execute under employee identities."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/accounts.rs::tests::iso_root_intruder_is_signalled_through_pidfd",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root test creates its own disposable sleep child to verify intruder pidfd identity checks and termination; not an employee admission path."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/audit.rs::disk::AuditWorker::start",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "not_process",
+      "rationale": "std::thread::Builder::spawn starts the bounded audit sink thread inside spawnd; no OS child process."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/host.rs::Monitor::start",
+      "apis": {
+        "terminal_spawn": 2
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "not_process",
+      "rationale": "Two std::thread::Builder::spawn calls create emergency-stop and UID-monitor threads inside spawnd; they do not launch executable content."
+    },
+    {
+      "symbol": "crates/duduclaw-spawnd/src/host_worker.rs::WorkerHost::spawn",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "spawn_daemon",
+      "migration": "not_process",
+      "rationale": "std::thread::Builder::spawn runs the bounded lifecycle command queue inside spawnd. Actual host process creation is inventoried at its native launch sites."
     },
     {
       "symbol": "crates/duduclaw-sysd/src/dispatch.rs::bless_boot",
@@ -5687,6 +6060,58 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
+      "symbol": "crates/duduclaw-updated/src/linux/activation.rs::systemctl",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "updater",
+      "migration": "privileged_service",
+      "rationale": "F root updater invokes trusted /usr/bin/systemctl with fixed internal activation/readback argv, cleared environment and bounded output/time. Controlling the signed service generation is root maintenance, not employee code execution."
+    },
+    {
+      "symbol": "crates/duduclaw-updated/src/linux/download.rs::Downloader::url",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "downloader",
+      "migration": "privileged_service",
+      "rationale": "F launches trusted /usr/bin/curl for the fixed official release repository only; pre_exec clears supplementary groups, drops real/effective/saved uid/gid to duduclaw-dl and sets/readbacks NNP before exec. This updater download is outside employee workloads and never runs curl as root."
+    },
+    {
+      "symbol": "crates/duduclaw-updated/src/linux/download.rs::tests::iso_root_downloader_real_saved_ids_and_empty_supplementary_groups",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root test launches its dedicated self-exec probe through the production downloader identity-drop adapter and checks all uid/gid/group fields; no network."
+    },
+    {
+      "symbol": "crates/duduclaw-updated/src/linux/files.rs::tests::iso_root_same_verified_fd_exec_survives_path_replacement",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_status": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Ignored root test executes only a copied trusted true fixture through the verified-fd adapter after replacing its pathname; not downloaded production code."
+    },
+    {
       "symbol": "crates/duduclaw-spawnd/src/installed_account_root_tests.rs::Harness::run",
       "apis": {
         "command_constructor": 1,
@@ -5783,6 +6208,19 @@
         "process_spawn"
       ],
       "rationale": "Feature-gated debug-only acceptance ELF creates a real double-fork orphan inside the signed disposable D8 test run. Release builds refuse this fixture."
+    },
+    {
+      "symbol": "crates/duduclaw-migration/src/root_materialization.rs::installed_allocation",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "host_service",
+      "migration": "privileged_service",
+      "rationale": "G root materialization coordinator invokes only the root-trusted installed platform allocation readback with fixed migration-v1 argv, bounded JSON and a 30-second deadline. The reply must bind the confirmed proposal and prove stopped execution and verified quota; no employee process is launched."
     }
   ]
 }

@@ -78,7 +78,24 @@ impl MethodHandler {
                         || GatewayAccountReadback::available(&home, &item)
                         || (matches!(item.category,duduclaw_migration::contract::ConfirmationCategory::EmployeeInstructions | duduclaw_migration::contract::ConfirmationCategory::Skill | duduclaw_migration::contract::ConfirmationCategory::Hook) && !item.fields.iter().any(|f|f.name=="requires_reentry"));
                     let rotation_pending = store.rotation_pending(&item.binding).unwrap_or(true);
+                    let content_status = if item.category == duduclaw_migration::contract::ConfirmationCategory::Employee {
+                        match item.status {
+                            ConfirmationStatus::Rejected | ConfirmationStatus::ExpiredRejected => Some("not_migrated_rejected"),
+                            ConfirmationStatus::Applied => {
+                                let migrated=crate::migration_startup::completed_manifest(&home).ok().flatten().is_some_and(|manifest| {
+                                    let grants:Vec<_>=manifest.grants.iter().filter(|entry| matches!(&entry.materialization,
+                                        Some(duduclaw_migration::materialization::MaterializationDecision::Confirmed{allocation}) if allocation.proposal==item.binding))
+                                        .map(|entry|entry.grant.clone()).collect();
+                                    !grants.is_empty() && duduclaw_migration::materialization::MaterializationStore::open_read_only(&home.join("migration-materialization.db"))
+                                        .and_then(|ledger|ledger.all_terminal(&grants)).unwrap_or(false)
+                                });
+                                Some(if migrated {"migrated"}else{"awaiting_materialization"})
+                            },
+                            _ => None,
+                        }
+                    } else { None };
                     let mut value = serde_json::to_value(item).expect("bounded confirmation schema");
+                    value["content_status"] = json!(content_status);
                     value["apply_available"] = json!(supported);
                     value["rotation_pending"] = json!(rotation_pending);
                     value

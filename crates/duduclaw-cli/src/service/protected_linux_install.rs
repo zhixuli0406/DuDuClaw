@@ -1,5 +1,9 @@
 use super::*;
 use std::{fs, io::Write, os::unix::{fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt}, io::AsRawFd}, path::Path, process::{Command, Output}};
+#[path = "protected_linux_readiness.rs"]
+mod readiness;
+#[path = "protected_linux_uninstall.rs"]
+mod removal;
 
 fn gate() -> Result<()> {
     if unsafe { libc::getuid() } != 0 || unsafe { libc::geteuid() } != 0 {
@@ -55,8 +59,36 @@ fn command(name: &str, args: &[&str]) -> Result<Output> {
     let executable = fs::canonicalize(executable)?;
     parents(&executable)?;
     trusted(&executable, false)?;
-    Ok(Command::new(executable).args(args).env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin").env("LC_ALL", "C").output()?)
+    use std::{io::Read, process::Stdio, time::{Duration, Instant}};
+    struct ReapOnError(std::process::Child);
+    impl Drop for ReapOnError {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill(); let _ = self.0.wait();
+            }
+        }
+    }
+    trusted(Path::new("/run"), true)?;
+    let mut stdout = tempfile::NamedTempFile::new_in("/run")?;
+    let mut stderr = tempfile::NamedTempFile::new_in("/run")?;
+    let mut child = ReapOnError(Command::new(executable).args(args).env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin").env("LC_ALL", "C")
+        .stdin(Stdio::null()).stdout(stdout.reopen()?).stderr(stderr.reopen()?).spawn()?);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let limit = 4 * 1024 * 1024;
+    let status = loop {
+        if stdout.as_file().metadata()?.len() > limit || stderr.as_file().metadata()?.len() > limit
+            || Instant::now() >= deadline {
+            return Err(refused("system command exceeded its time or output limit"));
+        }
+        if let Some(status) = child.0.try_wait()? { break status; }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut out = Vec::new(); let mut err = Vec::new();
+    stdout.as_file_mut().take(limit + 1).read_to_end(&mut out)?;
+    stderr.as_file_mut().take(limit + 1).read_to_end(&mut err)?;
+    if out.len() as u64 > limit || err.len() as u64 > limit { return Err(refused("system command output exceeded limit")); }
+    Ok(Output { status, stdout: out, stderr: err })
 }
 
 fn checked(name: &str, args: &[&str]) -> Result<Output> {
@@ -70,7 +102,18 @@ fn checked(name: &str, args: &[&str]) -> Result<Output> {
 fn account() -> Result<(u32, u32)> {
     let mut output = command("getent", &["passwd", "duduclaw"])?;
     if output.status.code() == Some(2) {
-        checked("useradd", &["--system", "--home-dir", "/var/lib/duduclaw", "--create-home", "--shell", "/usr/sbin/nologin", "duduclaw"])?;
+        let mut args = vec!["--system", "--user-group", "--home-dir", "/var/lib/duduclaw",
+            "--create-home", "--shell", "/usr/sbin/nologin"];
+        let limits;
+        if layout::published_components(Path::new("/"), 0, 0)? {
+            let defs = fs::read_to_string("/etc/login.defs")?;
+            limits = [format!("SYS_UID_MAX={}", layout::system_id_limit(&defs, "SYS_UID_MAX").map_err(refused)? - 1),
+                format!("SYS_GID_MAX={}", layout::system_id_limit(&defs, "SYS_GID_MAX").map_err(refused)? - 1)];
+            args.extend(["--key", limits[0].as_str(), "--key", limits[1].as_str(),
+                "--key", "SUB_UID_COUNT=0", "--key", "SUB_GID_COUNT=0"]);
+        }
+        args.push("duduclaw");
+        checked("useradd", &args)?;
         output = checked("getent", &["passwd", "duduclaw"])?;
     } else if !output.status.success() { return Err(refused("cannot query duduclaw account")); }
     let text = String::from_utf8(output.stdout).map_err(|_| refused("invalid passwd response"))?;
@@ -114,83 +157,83 @@ fn atomic_install(path: &str, mode: u32, write: impl FnOnce(&mut fs::File) -> Re
 const VERSION_FLOOR: &str = "/var/lib/duduclaw-protected/version-floor";
 const VERSION_PENDING: &str = "/var/lib/duduclaw-protected/version-pending";
 
+#[cfg(test)]
 const SPAWND_BINARY: &str = "/usr/lib/duduclaw/duduclaw-spawnd";
-const RUN_BINARY: &str = "/usr/lib/duduclaw/duduclaw-run";
-const SPAWND_UNITS: &[(&str, &str)] = &[
-    ("duduclaw-spawnd.service", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-spawnd.service")),
-    ("duduclaw-spawnd.socket", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-spawnd.socket")),
-    ("duduclaw.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw.slice")),
-    ("duduclaw-tcb.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-tcb.slice")),
-    ("duduclaw-employees.slice", include_str!("../../../../scripts/linux-protected/spawnd/duduclaw-employees.slice")),
-];
-
-// F/G publish the signature-verified binaries first. This hook stages support
-// only: it cannot declare readiness or enable a partial isolation generation.
-fn install_spawnd_support_if_published() -> Result<()> {
-    let present = [SPAWND_BINARY, RUN_BINARY].map(|path| fs::symlink_metadata(path));
-    if present.iter().all(|entry| entry.as_ref().is_err_and(|error|
-        error.kind() == std::io::ErrorKind::NotFound)) { return Ok(()); }
-    for path in [SPAWND_BINARY, RUN_BINARY] {
-        parents(Path::new(path))?;
-        trusted(Path::new(path), false)?;
-        let metadata = fs::metadata(path)?;
-        if metadata.mode() & 0o7000 != 0 || metadata.mode() & 0o111 == 0 || metadata.nlink() != 1 {
-            return Err(refused("unsafe isolation component"));
-        }
-    }
-    let query = command("getent", &["passwd", "duduclaw-runsup"])?;
-    match query.status.code() {
-        Some(2) => {
-            checked("useradd", &["--system", "--user-group", "--no-create-home",
-                "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin",
-                "--password", "!*", "--expiredate", "1970-01-02", "duduclaw-runsup"])?;
-        }
-        Some(0) => (),
-        _ => return Err(refused("cannot query run supervisor account")),
-    }
-    let passwd = checked("getent", &["passwd", "duduclaw-runsup"])?;
-    let passwd = String::from_utf8(passwd.stdout).map_err(|_| refused("invalid supervisor account"))?;
-    let fields: Vec<_> = passwd.trim_end_matches('\n').split(':').collect();
-    if fields.len() != 7 || fields[0] != "duduclaw-runsup" || fields[5] != "/nonexistent"
-        || fields[6] != "/usr/sbin/nologin" { return Err(refused("unsafe supervisor account")); }
-    let uid: u32 = fields[2].parse().map_err(|_| refused("invalid supervisor uid"))?;
-    let gid: u32 = fields[3].parse().map_err(|_| refused("invalid supervisor gid"))?;
+// Signed bootstrap publishes the entire component set before this hook runs.
+// Ownership checks are installation checks, not signature verification. Never
+// enable services, invent trust/state, or copy companions from an untrusted cwd.
+fn install_isolation_support_if_published() -> Result<()> {
+    // Validate every file and ancestor before any accounts or units change.
+    if !layout::published_components(Path::new("/"), 0, 0)? { return Ok(()); }
     let defs = fs::read_to_string("/etc/login.defs")?;
-    let mut sys_max = None;
-    for line in defs.lines() {
-        let values: Vec<_> = line.split('#').next().unwrap_or("").split_whitespace().collect();
-        if values.first() == Some(&"SYS_UID_MAX") {
-            if values.len() != 2 || sys_max.is_some() { return Err(refused("invalid system uid range")); }
-            sys_max = Some(values[1].parse::<u32>().map_err(|_| refused("invalid system uid range"))?);
+    // Validate explicit host ranges before useradd can allocate anything.
+    layout::system_id_limit(&defs, "SYS_UID_MAX").map_err(refused)?;
+    layout::system_id_limit(&defs, "SYS_GID_MAX").map_err(refused)?;
+    let (uid, gid) = account()?;
+    layout::validate_system_ids(uid, gid, &defs).map_err(refused)?;
+    let mut identities = vec![(uid, gid)];
+    for name in layout::ACCOUNTS {
+        let identity = isolation_account(name, &defs)?;
+        if identities.iter().any(|(uid, gid)| *uid == identity.0 || *gid == identity.1) {
+            return Err(refused("isolation services must have distinct uid and gid values"));
+        }
+        identities.push(identity);
+    }
+    for (path, mode) in layout::DIRECTORIES {
+        mkdir(path, *mode)?;
+        if matches!(*path, "/usr/lib/duduclaw/parse-root" | "/usr/lib/duduclaw/parse-root-tree")
+            && !layout::parse_root_is_reusable(Path::new(path), 0, 0)? {
+            return Err(refused("parse worker roots contain unexpected content; stop workers and inspect the directory"));
         }
     }
-    let max = sys_max.ok_or_else(|| refused("system uid range unavailable"))?;
-    if uid == 0 || gid == 0 || uid >= max || (61184..=65519).contains(&uid)
-        || (61184..=65519).contains(&gid) { return Err(refused("supervisor must be a static system account")); }
-    let groups = checked("id", &["-G", "duduclaw-runsup"])?;
-    let groups = String::from_utf8(groups.stdout).map_err(|_| refused("invalid supervisor groups"))?;
-    if groups.split_whitespace().collect::<Vec<_>>() != vec![fields[3]] {
-        return Err(refused("supervisor has supplementary groups"));
-    }
-    let shadow = checked("getent", &["shadow", "duduclaw-runsup"])?;
-    let shadow = String::from_utf8(shadow.stdout).map_err(|_| refused("invalid supervisor lockdown"))?;
-    let shadow: Vec<_> = shadow.trim_end_matches('\n').split(':').collect();
-    if shadow.len() != 9 || shadow[0] != "duduclaw-runsup" || shadow[1] != "!*" || shadow[7] != "1" {
-        return Err(refused("supervisor account lockdown mismatch"));
-    }
-    checked("loginctl", &["disable-linger", "duduclaw-runsup"])?;
-    match fs::symlink_metadata("/var/lib/systemd/linger/duduclaw-runsup") {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-        _ => return Err(refused("supervisor linger remains enabled")),
-    }
-    mkdir("/var/lib/duduclaw-spawnd", 0o700)?;
-    mkdir("/var/lib/duduclaw-spawnd/etc", 0o700)?;
-    mkdir("/var/log/duduclaw-spawnd", 0o700)?;
-    for (name, text) in SPAWND_UNITS {
+    for (name, text) in layout::UNITS {
         atomic_install(&format!("/etc/systemd/system/{name}"), 0o644,
             |file| { file.write_all(text.as_bytes())?; Ok(()) })?;
     }
+    println!("隔離服務的帳號、目錄與單元已備妥，尚未啟用。簽章世代、DNS 政策、遷移與完整就緒檢查仍須由已驗證的安裝流程完成。");
     Ok(())
+}
+
+fn isolation_account(name: &str, defs: &str) -> Result<(u32, u32)> {
+    let query = command("getent", &["passwd", name])?;
+    match query.status.code() {
+        Some(2) => {
+            let uid_max = format!("SYS_UID_MAX={}", layout::system_id_limit(defs, "SYS_UID_MAX").map_err(refused)? - 1);
+            let gid_max = format!("SYS_GID_MAX={}", layout::system_id_limit(defs, "SYS_GID_MAX").map_err(refused)? - 1);
+            checked("useradd", &["--system", "--user-group", "--no-create-home", "--no-log-init",
+                "--key", "SUB_UID_COUNT=0", "--key", "SUB_GID_COUNT=0",
+                "--key", &uid_max, "--key", &gid_max,
+                "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin",
+                "--password", "!*", "--expiredate", "1970-01-02", name])?;
+        }
+        Some(0) => (),
+        _ => return Err(refused("cannot query isolation service account")),
+    }
+    let passwd = checked("getent", &["passwd", name])?;
+    let passwd = String::from_utf8(passwd.stdout).map_err(|_| refused("invalid service account"))?;
+    let fields: Vec<_> = passwd.trim_end_matches('\n').split(':').collect();
+    if fields.len() != 7 || fields[0] != name || fields[5] != "/nonexistent"
+        || fields[6] != "/usr/sbin/nologin" { return Err(refused("unsafe isolation service account")); }
+    let uid: u32 = fields[2].parse().map_err(|_| refused("invalid service uid"))?;
+    let gid: u32 = fields[3].parse().map_err(|_| refused("invalid service gid"))?;
+    layout::validate_system_ids(uid, gid, defs).map_err(refused)?;
+    let groups = checked("id", &["-G", name])?;
+    let groups = String::from_utf8(groups.stdout).map_err(|_| refused("invalid service groups"))?;
+    if groups.split_whitespace().collect::<Vec<_>>() != vec![fields[3]] {
+        return Err(refused("isolation service has supplementary groups"));
+    }
+    let shadow = checked("getent", &["shadow", name])?;
+    let shadow = String::from_utf8(shadow.stdout).map_err(|_| refused("invalid service lockdown"))?;
+    let shadow: Vec<_> = shadow.trim_end_matches('\n').split(':').collect();
+    if shadow.len() != 9 || shadow[0] != name || shadow[1] != "!*" || shadow[7] != "1" {
+        return Err(refused("isolation service account lockdown mismatch"));
+    }
+    checked("loginctl", &["disable-linger", name])?;
+    match fs::symlink_metadata(format!("/var/lib/systemd/linger/{name}")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        _ => return Err(refused("isolation service linger remains enabled")),
+    }
+    Ok((uid, gid))
 }
 
 // Serialize binary and floor changes across install, upgrade and uninstall.
@@ -300,10 +343,50 @@ fn record_floor(version: &str) -> Result<()> {
     Ok(())
 }
 
+// This decides which coordinator owns the request, not whether the generation
+// is trusted. F still authenticates metadata and live readbacks before any apply.
+fn managed_install() -> Result<bool> {
+    let state = Path::new("/var/lib/duduclaw-updated/state.json");
+    let current = Path::new("/opt/duduclaw-isolated/current");
+    let exists = |path: &Path| -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    };
+    match (exists(state)?, exists(current)?) {
+        (false, false) => Ok(false),
+        (true, true) => {
+            let directory = duduclaw_updated::linux::files::Directory::open(Path::new("/var/lib/duduclaw-updated"))
+                .map_err(|_| refused("無法確認隔離更新服務的狀態擁有者。"))?;
+            let saved: duduclaw_updated::state::State = directory.json("state.json")
+                .map_err(|_| refused("隔離更新狀態無法讀取。"))?;
+            saved.validate().map_err(|_| refused("隔離更新狀態不完整。"))?;
+            let selected = duduclaw_updated::linux::activation::read_current()
+                .map_err(|_| refused("隔離世代選擇器無法驗證。"))?;
+            if selected != saved.effective_digest() && !saved.pending.as_ref().is_some_and(|pending| pending.digest == selected) {
+                return Err(refused("隔離世代與更新狀態不符。"));
+            }
+            Ok(true)
+        }
+        _ => Err(refused("隔離更新狀態不完整；請先恢復更新交易，未執行舊版安裝或遷移。")),
+    }
+}
+
 pub(super) fn install(options: InstallOptions) -> Result<()> {
     gate()?;
     let _lock = version_lock()?;
     let version = duduclaw_gateway::updater::current_version();
+    if managed_install()? {
+        // The invoking CLI's templates may be older than F's committed
+        // generation. A reinstall cannot replace signed service policy.
+        return readiness::check(&mut readiness::MissingComposite);
+    }
+    let floor = read_version_file(VERSION_FLOOR)?;
+    if native_migration::run_if_required(floor.as_deref(), version)? {
+        return readiness::check(&mut readiness::MissingComposite);
+    }
     check_floor(version, false)?;
     let executable = fs::canonicalize("/proc/self/exe")?;
     if parents(&executable).and_then(|()| trusted(&executable, false)).is_err() {
@@ -329,6 +412,7 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
         super::migrate::copy(&source, uid, gid, options.force_migrate)?;
         println!("個人連線使用不同的金鑰，搬移後必須重新連結。請先停止來源 Gateway，避免資料在複製時變動。");
     }
+    install_isolation_support_if_published()?;
     prepare_version(version)?;
     atomic_install(BINARY, 0o755, |target| {
         let mut source = fs::OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC).open("/proc/self/exe")?;
@@ -338,7 +422,6 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
     })?;
     atomic_install(LAUNCHER, 0o755, |file| { file.write_all(LAUNCHER_TEXT.as_bytes())?; Ok(()) })?;
     atomic_install(UNIT_PATH, 0o644, |file| { file.write_all(unit_text().as_bytes())?; Ok(()) })?;
-    install_spawnd_support_if_published()?;
     record_floor(version)?;
     checked("systemctl", &["daemon-reload"])?;
     if was_active { checked("systemctl", &["restart", UNIT])?; }
@@ -351,6 +434,16 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
 pub(super) fn uninstall() -> Result<()> {
     gate()?;
     let _lock = version_lock()?;
+    for path in layout::BINARIES.iter().copied().chain([
+        "/var/lib/duduclaw-updated/state.json", "/opt/duduclaw-isolated/current",
+        "/var/lib/duduclaw-protected/uninstall-units",
+    ]) {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+            Ok(_) => return removal::run(),
+        }
+    }
     // Validate every removal before stopping anything; never follow a replaced path.
     for file in [UNIT_PATH, BINARY, LAUNCHER, VERSION_FLOOR, VERSION_PENDING] {
         let path = Path::new(file);
@@ -374,14 +467,27 @@ pub(super) fn uninstall() -> Result<()> {
     Ok(())
 }
 
+pub(super) fn readiness() -> Result<()> {
+    gate()?;
+    readiness::check(&mut readiness::MissingComposite)
+}
+
 // The privileged update service owns verification, installation and restart.
 // This command only submits a stable version; it never supplies paths or URLs.
 pub(super) async fn upgrade(version: Option<&str>) -> Result<()> {
     use duduclaw_isolation::ids::RequestId;
     use duduclaw_isolation::update::{UpdateRequest, UpdateRequestV1, UpdateResponse, UpdateResponseV1};
-    let version = duduclaw_updated::parse_version(version.ok_or_else(||
-        refused("請指定 --version x.y.z，或從儀表板檢查並安裝更新。"))?)
+    let requested = version.ok_or_else(|| refused("請指定 --version x.y.z，或從儀表板檢查並安裝更新。"))?;
+    let version = duduclaw_updated::parse_version(requested)
         .map_err(|_| refused("版本必須是正式版 x.y.z。"))?;
+    gate()?;
+    let _lock = version_lock()?;
+    if !managed_install()? {
+        let floor = read_version_file(VERSION_FLOOR)?;
+        if native_migration::run_if_required(floor.as_deref(), requested)? {
+            return readiness::check(&mut readiness::MissingComposite);
+        }
+    }
     let request_id = RequestId(*uuid::Uuid::new_v4().as_bytes());
     let response = tokio::task::spawn_blocking(move ||
         duduclaw_updated::client::request(UpdateRequest::V1(UpdateRequestV1::Apply { version, request_id })))
@@ -403,7 +509,7 @@ mod spawnd_install_tests {
 
     #[test]
     fn spawnd_templates_use_fixed_root_seqpacket_and_bounded_hierarchy() {
-        let lookup = |name| SPAWND_UNITS.iter().find(|(unit, _)| *unit == name).unwrap().1;
+        let lookup = |name| layout::UNITS.iter().find(|(unit, _)| *unit == name).unwrap().1;
         let socket = lookup("duduclaw-spawnd.socket");
         assert!(socket.lines().any(|line| line == "ListenSequentialPacket=/run/duduclaw-spawnd/control.sock"));
         assert!(socket.lines().any(|line| line == "SocketUser=root"));
@@ -417,5 +523,32 @@ mod spawnd_install_tests {
         assert!(service.lines().any(|line| line == "ReadWritePaths=/var/lib/duduclaw-spawnd /var/log/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger"));
         assert!(lookup("duduclaw-employees.slice").lines().any(|line| line == "TasksMax=1024"));
         assert!(lookup("duduclaw.slice").lines().any(|line| line == "MemoryMin=512M"));
+    }
+}
+
+#[cfg(test)]
+mod isolation_install_root_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a disposable native Linux VM and the full root-published binary set"]
+    fn iso_root_install_support_staging_and_idempotent_readback() {
+        assert_eq!(std::env::var("DUDUCLAW_ISO_DISPOSABLE").as_deref(), Ok("1"));
+        gate().unwrap();
+        assert!(layout::published_components(Path::new("/"), 0, 0).unwrap());
+        install_isolation_support_if_published().unwrap();
+        install_isolation_support_if_published().unwrap();
+        for (path, mode) in layout::DIRECTORIES {
+            let meta = fs::symlink_metadata(path).unwrap();
+            assert!(meta.is_dir());
+            assert_eq!((meta.uid(), meta.gid(), meta.mode() & 0o7777), (0, 0, *mode));
+        }
+        for (name, text) in layout::UNITS {
+            let path = format!("/etc/systemd/system/{name}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), *text);
+            let meta = fs::symlink_metadata(path).unwrap();
+            assert_eq!((meta.uid(), meta.gid(), meta.mode() & 0o7777), (0, 0, 0o644));
+        }
+        // This fixture proves staging only: it never enables services or certifies readiness.
     }
 }

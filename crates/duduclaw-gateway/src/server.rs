@@ -1,4 +1,6 @@
 mod data_exports_http;
+#[path = "server_migration_bootstrap.rs"]
+mod migration_bootstrap;
 #[path = "server_invites.rs"]
 mod server_invites;
 #[cfg(test)]
@@ -1093,8 +1095,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         // gateway operation must not depend on a new history audit writer.
         warn!(error=%e,"team history activation sync failed; team history remains unavailable");
     }
-    // Ensure a default admin exists on first run
-    let bootstrap_password = match user_db.ensure_default_admin() {
+    // A completed root-authenticated migration has an empty, fresh users DB.
+    // Its first Admin is established only through the root-issued setup token.
+    let migration_bootstrap = migration_bootstrap::start(&home_dir, user_db.clone(), listener_addr).await?;
+    let bootstrap_password = if migration_bootstrap.is_some() { None } else { match user_db.ensure_default_admin() {
         Ok(password) => password, // Some(..) on first run, None if an admin already existed
         Err(e) => {
             // C2 fix: fail hard if we can't create admin — don't silently continue
@@ -1102,7 +1106,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 "Failed to initialize user database: {e}"
             )));
         }
-    };
+    } };
+
+    // Keep the root-only bootstrap listener alive for this gateway lifetime.
+    let _migration_bootstrap = migration_bootstrap;
 
     // WP3 (DESIGN-installer-settings-integration-2026-08.md §4): land an
     // installer-written pending-account.json, if the graphical installer ran
@@ -1111,7 +1118,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // one-time password `ensure_default_admin` just generated no longer
     // matches the now-claimed row), so printing has to check the
     // POST-landing claim state, not just whether this was a first run.
-    crate::pending_account::land_pending_account(&user_db, &home_dir);
+    if _migration_bootstrap.is_none() {
+        crate::pending_account::land_pending_account(&user_db, &home_dir);
+    }
 
     // Stage 2 (design doc §5 plan (b)): land an installer-written
     // pending-network.json the same way — the live installer only
@@ -2686,6 +2695,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/me", get(handle_me))
         .route("/api/change-password", post(handle_change_password))
         .route("/api/brand", get(handle_public_brand))
+        .route("/api/migration/setup", get(migration_bootstrap::page))
+        .route("/api/migration/setup/claim", post(migration_bootstrap::claim).layer(DefaultBodyLimit::max(8192)))
         .route("/api/first-run/status", get(handle_first_run_status))
         .route("/api/first-run/claim", post(handle_first_run_claim))
         // D4a: OOBE pre-auth network setup — see `first_run_network_gate`'s
