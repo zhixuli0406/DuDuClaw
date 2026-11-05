@@ -354,6 +354,8 @@ fn test_google_tools_scope_split() {
         "google_status",
         "gmail_search",
         "gmail_read",
+        "google_chat_spaces",
+        "google_chat_messages",
         "calendar_list_events",
     ] {
         assert_eq!(

@@ -125,3 +125,16 @@ fn full_required_scopes_with_illegal_extra_or_129_raw_duplicates_still_refuse() 
     positive["scope"] = json!(valid);
     assert!(parse_tokens(positive, &req, 1_800_000_000).is_ok());
 }
+
+#[test]
+fn google_chat_optional_request_is_exact_and_never_an_arbitrary_scope_extension() {
+    let base: Vec<String> = crate::google_workspace::REQUIRED_SCOPES.iter().map(|s| s.to_string()).collect();
+    assert!(expected_request(&base).is_ok());
+    let mut chat = base.clone();
+    chat.extend(crate::google_workspace::CHAT_READ_SCOPES.iter().map(|s| s.to_string()));
+    assert!(expected_request(&chat).is_ok());
+    chat.pop();
+    assert!(expected_request(&chat).is_err());
+    chat.push("https://www.googleapis.com/auth/chat.messages".into());
+    assert!(expected_request(&chat).is_err());
+}

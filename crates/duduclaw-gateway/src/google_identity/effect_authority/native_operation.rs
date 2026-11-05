@@ -50,6 +50,11 @@ impl PendingGoogleCall {
         else {
             return Err(changed());
         };
+        if matches!(native_tool.as_str(), "google_chat_spaces" | "google_chat_messages")
+            && !crate::google_workspace::chat_read_enabled(&self.context.home)
+        {
+            return Ok(tool_error(crate::google_workspace::chat_read::GUIDANCE));
+        }
         if gi::google_arguments_digest(&arguments) != *final_arguments_digest {
             return Err(changed());
         }
@@ -97,11 +102,14 @@ impl PendingGoogleCall {
                 "此 Google 專用連線的封閉送出介面仍在驗收中，這次沒有送出 Google 操作。",
             ));
         }
+        let chat_audit = matches!(native_tool.as_str(), "google_chat_spaces" | "google_chat_messages")
+            .then(|| (self.context.home.clone(), self.context.agent.clone(), native_tool.clone()));
         let authority = self.resolve().await?.acquire_effect().await?;
-        authority
-            .execute_native(template)
-            .await
-            .map_err(ClosedNativeFailure::into_refusal)
+        let result = authority.execute_native(template).await.map_err(ClosedNativeFailure::into_refusal)?;
+        if let Some((home, agent, tool)) = chat_audit {
+            crate::google_workspace::chat_read::audit(&home, &agent, &tool, &arguments, &result);
+        }
+        Ok(result)
     }
 }
 
@@ -120,6 +128,11 @@ impl GoogleEffectAuthority {
         };
         if template.tool() != native_tool || template.digest() != final_arguments_digest {
             return Err(changed());
+        }
+        if matches!(native_tool.as_str(), "google_chat_spaces" | "google_chat_messages")
+            && !crate::google_workspace::chat_read_enabled(&self.material.context.home)
+        {
+            return Err(Refusal::hard("google_chat_disabled", "管理員已關閉 Google Chat 讀取。"));
         }
         self.validate_dedicated(native_tool, final_arguments_digest, credential_ref)
     }

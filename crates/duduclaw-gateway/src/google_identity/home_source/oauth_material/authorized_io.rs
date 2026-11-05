@@ -87,6 +87,7 @@ impl Transport<'_, '_> {
             && url.fragment().is_none()
             && url.port().is_none_or(|p| p == 443)
             && match url.host_str() {
+                Some("chat.googleapis.com") => url.path() == "/v1/spaces" || url.path().starts_with("/v1/spaces/"),
                 Some("gmail.googleapis.com") => url.path().starts_with("/gmail/v1/users/me/"),
                 Some("www.googleapis.com") => {
                     url.path()

@@ -112,6 +112,7 @@ async fn token(
         );
     }
     let (account, scope) = match who {
+        "chat-alice" => ("alice", format!("openid email https://www.googleapis.com/auth/gmail.readonly {}", crate::google_workspace::CHAT_READ_SCOPES.join(" "))),
         "meeting-downgrade" => ("alice", format!("openid email {} {}", meeting_access::DRIVE_SCOPE, meeting_access::MEET_SCOPE)),
         "meeting-extra-drive" => ("alice", format!("openid email https://www.googleapis.com/auth/gmail.readonly {} {} {}", meeting_access::DRIVE_SCOPE, meeting_access::MEET_SCOPE, oauth::DRIVE_TOOLS_SCOPE)),
         "meeting-alice" => ("alice", format!("openid email https://www.googleapis.com/auth/gmail.readonly {} {}", meeting_access::DRIVE_SCOPE, meeting_access::MEET_SCOPE)),
@@ -1214,4 +1215,25 @@ fn token_allowlist_excludes_status_and_unknown_tools() {
     assert!(!scopes::token_tool("google_status"));
     assert!(!scopes::permitted("google_status", &[]));
     assert!(!scopes::token_tool("arbitrary_tool"));
+}
+
+#[tokio::test]
+async fn google_chat_opt_in_scopes_require_requested_and_actual_consent() {
+    for (enabled, code, permitted) in [(false, "chat-alice", false), (true, "alice", false), (true, "chat-alice", true)] {
+        let f = Fixture::new();
+        crate::google_workspace::set_chat_read_enabled(&f.home, enabled).unwrap();
+        let start = flow::start(&f.home, &f.db, &f.alice.id, "chat-login", "http://127.0.0.1:18889", &[], true).await.unwrap();
+        let url = url::Url::parse(start["authorization_url"].as_str().unwrap()).unwrap();
+        let requested = url.query_pairs().find(|(key, _)| key == "scope").unwrap().1.into_owned();
+        for scope in crate::google_workspace::CHAT_READ_SCOPES {
+            assert_eq!(requested.split_ascii_whitespace().any(|s| s == *scope), enabled);
+        }
+        let state = start["state"].as_str().unwrap();
+        pending::receive_code(&f.home, state, code).unwrap();
+        flow::finish(&f.home, &f.db, &f.alice.id, "chat-login", state).await.unwrap();
+        let record = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+        for tool in ["google_chat_spaces", "google_chat_messages"] {
+            assert_eq!(scopes::permitted_for(tool, &record.metadata), permitted);
+        }
+    }
 }

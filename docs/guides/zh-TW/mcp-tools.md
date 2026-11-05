@@ -97,8 +97,8 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 |---|---|---|
 | 外部用戶端白名單 | `principal.is_external` | 只列 7 個舊白名單工具加上明確授予 scope 的工具，接著再套下一列的 scope 規則 |
 | 非員工呼叫者的 scope | `principal.scopes`，適用於不持有 `admin`、也不是 AI 員工的金鑰（不是 gateway 內部金鑰、不是單一員工金鑰、也不是 gateway 為員工啟動的行程） | 只列金鑰持有其最低 scope 的工具；替行程本身的 agent 動作的工具（`working_state_*`、`canvas_*`、`shared_wiki_delete`、`memory_search_by_layer` 與三個整併狀態查詢等）不列，對所有外部金鑰也不列；呼叫時 dispatch 閘依同一條規則拒絕（`process_agent_tool`）。見 [mcp-standalone.md](mcp-standalone.md) |
-| Google Workspace | `config.toml [integrations] google_workspace` | 關閉時隱藏全部 19 個 Google 工具，包含 `google_status`；儀表板仍可設定與測試，見[連接 Google](google-setup.md)。 |
-| Google 身分（v1.76.0） | `agent.toml [google] identity`，沒寫時看 `config.toml [integrations.google_identity] default_identity` | `none` 隱藏同樣 19 個工具，呼叫也被拒。其他值都照常列出；用不了的呼叫會回原因。`google_status` 改為先講員工目前代表誰 |
+| Google Workspace | `config.toml [integrations] google_workspace` | 關閉時隱藏全部 21 個 Google 工具，包含 `google_status`；儀表板仍可設定與測試，見[連接 Google](google-setup.md)。 |
+| Google 身分（v1.76.0） | `agent.toml [google] identity`，沒寫時看 `config.toml [integrations.google_identity] default_identity` | `none` 隱藏同樣 21 個工具，呼叫也被拒。其他值都照常列出；用不了的呼叫會回原因。`google_status` 改為先講員工目前代表誰 |
 | GitHub | `config.toml [integrations] github` | 隱藏 5 個 `github_*` |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 被拒的隱藏；允許清單非空時其餘全隱藏。清單項目完全相同才算，或用結尾的 `*` 比對：`*`、`mcp__duduclaw__*`（全部 DuDuClaw 工具）、`mcp__duduclaw__odoo_*`／`memory_*`（從開頭比對的前綴）。`mcp__<其他伺服器>__…` 不會對到 DuDuClaw 工具；其他位置的 `*` 只是一般字元。三份審批清單與 `scoped_tools` 用同一套規則 |
 | `os_native` | `agent.toml [capabilities]` | 隱藏 6 個 `os_*` 自動化工具 |
@@ -364,3 +364,17 @@ Proxy 只解析自己所屬員工的參照，並在啟動上游伺服器前才�
 Gateway 啟動時會遷移舊有明文 env：先將原檔加密備份至 `<home>/backups/mcp-migrate/<agent>-<timestamp>.enc`，寫入並讀回驗證憑證庫後，才以原子操作替換設定檔。依金鑰、加密備份、憑證庫、設定檔的順序，每一步都須完成父目錄 fsync 才繼續。任一步失敗即停止該員工的遷移；若替換設定後同步失敗，會還原原始明文。還原也失敗時會明確報錯並保留已持久化的加密備份供復原，然後繼續處理其他員工；清理後每位員工最多保留三份遷移備份；清理若因 I/O 錯誤失敗會記錄，並於下次掃描重試。刪除伺服器或員工會移除對應的憑證庫項目，復原已刪除員工後須重新輸入金鑰。
 
 Read 防護會拒絕讀取 `<home>/secrets`。這不是對 Bash 的隔離：員工與 gateway 使用相同 OS 使用者執行時，有 Bash 仍可讀取 gateway 檔案，包括 `.keyfile`；真正隔離需要不授予 Bash，或使用任務沙箱。這項功能只涵蓋 `env`，不涵蓋 `args`／`url` 裡的金鑰，也不涵蓋工具結果回傳的金鑰。既有明文匯出與備份不會被追溯清除。
+
+## Google Chat 讀取工具
+
+`google_chat_spaces` 列出已連結帳號加入的聊天室、群聊與私訊，包含資源名稱、顯示名稱、類型及 Google 有提供的最後活動時間。`limit` 預設 20，範圍 1–50；`filter` 僅接受 `SPACE`、`GROUP_CHAT` 或 `DIRECT_MESSAGE`。
+
+`google_chat_messages` 以嚴格驗證的 `spaces/...` 資源名稱讀取近期訊息，從新到舊排列。`limit` 預設 30，範圍 1–100；選填 `since` 必須是 RFC3339 時間，`thread` 必須是該聊天室內的討論串資源名稱。回傳發送者、建立時間、文字（每則最多 2,000 字元）、討論串及附件名稱，不下載附件。發送者名稱採 Google 回傳的顯示名稱，缺少時顯示 `users/...`；不呼叫 People API，也不另索取會員權限。整份回覆最多 30,000 字元。
+
+1. 管理員在 Google 連線頁啟用「Google Chat 讀取」（`[google] chat_read = true`，預設 false）。
+2. 使用者到「我的連線」重新連結自己的 Google 帳號，勾選兩項 Chat 讀取權限。額外 scope 為 `https://www.googleapis.com/auth/chat.spaces.readonly` 與 `https://www.googleapis.com/auth/chat.messages.readonly`；開關關閉時不會要求既有使用者追加同意。
+3. 在 OAuth 用戶端所屬的 Google Cloud 專案啟用 **Google Chat API**，並完成 **Chat 應用程式設定**，即使使用個人帳號授權也需要。Workspace 管理員可能還需允許這個 OAuth 應用程式。
+
+兩項工具沿用 Gmail 讀取的員工與帳號綁定、scope、核准及私有資料外送閘，使用既有身分政策選定的帳號，不接受任意指定使用者或帳號的參數。Apps Script 不支援這兩項讀取。這與只接收私訊和提及的 Chat 機器人通道不同。關閉開關會阻止後續讀取，即使權杖仍有效；不會撤銷 Google 端已同意的權限。
+
+回傳內容只作為不可信參考資料，使用群組歷史的包覆格式與注入掃描；任何命中都會拒絕整次回覆，顯示 `not available`。稽核僅保留聊天室識別碼與數量，不記錄訊息文字。本機與固定資料測試不代表真實帳號可讀，交付前仍須以客戶帳號驗證同意流程及讀取結果。

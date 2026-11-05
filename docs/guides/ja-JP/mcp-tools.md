@@ -103,8 +103,8 @@ Claude CLI の `minimal_context` は `--tools` で内蔵 CLI ツールを制御�
 |---|---|---|
 | 外部クライアント許可リスト | `principal.is_external` | 従来の許可リスト 7 ツールと、明示的に付与した scope のツールのみ。続けて次の行の scope 規則が適用されます |
 | 社員でない呼び出し元の scope | `principal.scopes`。`admin` を持たず AI 社員でもないキー（gateway 内部キーでも、社員ごとのキーでも、gateway が社員用に起動したプロセスでもない）に適用 | キーが最低 scope を持つツールだけを掲載。プロセス自身のエージェントとして動くツール（`working_state_*`、`canvas_*`、`shared_wiki_delete`、`memory_search_by_layer` と三つの統合状態の参照など）は掲載せず、すべての外部キーにも掲載しません。呼び出しはディスパッチゲートが同じ規則で拒否します（`process_agent_tool`）。[mcp-standalone.md](mcp-standalone.md) を参照 |
-| Google Workspace | `config.toml [integrations] google_workspace` | オフ時は `google_status` を含む全 19 ツールが非表示。ダッシュボードの設定・テストは可能。[接続手順](google-setup.md)。 |
-| Google の身元（v1.76.0） | `agent.toml [google] identity`、なければ `config.toml [integrations.google_identity] default_identity` | `none` なら同じ 19 ツールを非表示にし、呼び出しも拒否。それ以外の値では一覧に残り、使えない呼び出しは理由を返します。`google_status` は最初に社員が誰として動いているかを示します |
+| Google Workspace | `config.toml [integrations] google_workspace` | オフ時は `google_status` を含む全 21 ツールが非表示。ダッシュボードの設定・テストは可能。[接続手順](google-setup.md)。 |
+| Google の身元（v1.76.0） | `agent.toml [google] identity`、なければ `config.toml [integrations.google_identity] default_identity` | `none` なら同じ 21 ツールを非表示にし、呼び出しも拒否。それ以外の値では一覧に残り、使えない呼び出しは理由を返します。`google_status` は最初に社員が誰として動いているかを示します |
 | GitHub | `config.toml [integrations] github` | `github_*` 5 ツールを非表示 |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 拒否分を非表示。許可リストが非空なら他を全て非表示。項目は完全一致、または末尾の `*` で照合：`*`、`mcp__duduclaw__*`（DuDuClaw の全ツール）、`mcp__duduclaw__odoo_*`／`memory_*`（先頭からの前方一致）。`mcp__<他のサーバー>__…` は DuDuClaw のツールに一致しない。それ以外の位置の `*` は通常の文字。3 つの承認リストと `scoped_tools` も同じ規則 |
 | `os_native` | `agent.toml [capabilities]` | `os_*` 自動化 6 ツールを非表示 |
@@ -379,3 +379,17 @@ Proxy は自分の社員に属する参照だけを、上流サーバーの起�
 Gateway の起動時に既存の平文 env を移行します。まず元のファイルを `<home>/backups/mcp-migrate/<agent>-<timestamp>.enc` に暗号化して保存し、資格情報ストアへの書き込みと読み戻し検証を終えてから、設定をアトミックに置き換えます。ある社員の移行が失敗した場合は処理を中止し、ほかの社員を処理します。設定の復元も失敗した場合の回復方法は上記のとおりです。クリーンアップ後の移行バックアップは社員ごとに最大三つです。I/O エラーで削除できなかった場合は記録し、次回の走査で再試行します。サーバーや社員の削除時にはストアの該当項目を削除します。削除した社員を復元した場合はキーの再入力が必要です。
 
 Read ガードは `<home>/secrets` への読み取りを拒否します。これは Bash に対する隔離ではありません。同じ OS ユーザーで動く社員が Bash を持つ場合、`.keyfile` を含む gateway のファイルを読めます。実際の隔離には Bash を与えないか、タスクサンドボックスを使う必要があります。対象は `env` のみで、`args`／`url` 内のキーや、キーを返すツール結果は対象外です。既存の平文エクスポートやバックアップを遡って消すことはありません。
+
+## Google Chat 読み取りツール
+
+`google_chat_spaces` は接続したユーザーが参加するスペース、グループチャット、DM を一覧表示します。リソース名、表示名、種類、Google が返す場合は最終活動時刻を含みます。`limit` は既定 20（1–50）、`filter` は `SPACE`、`GROUP_CHAT`、`DIRECT_MESSAGE` のいずれかです。
+
+`google_chat_messages` は厳密に検証した `spaces/...` の最近のメッセージを新しい順に読みます。`limit` は既定 30（1–100）、任意の `since` は RFC3339、`thread` は同じスペース内のスレッドリソース名です。送信者、作成時刻、本文（1件最大 2,000 文字）、スレッド、添付ファイル名を返し、添付はダウンロードしません。表示名がない送信者は `users/...` で示し、People API や追加のメンバー権限は使用しません。応答全体は最大 30,000 文字です。
+
+1. 管理者が Google 接続画面で **Google Chat 読み取り**を有効にします（`[google] chat_read = true`、既定 false）。
+2. ユーザーは「自分の接続」から自分の Google アカウントを再接続し、Chat の読み取り権限を両方選択します。追加スコープは `https://www.googleapis.com/auth/chat.spaces.readonly` と `https://www.googleapis.com/auth/chat.messages.readonly`。無効時は既存ユーザーに追加同意を求めません。
+3. OAuth クライアントの Google Cloud プロジェクトで **Google Chat API** を有効化し、**Chat アプリ**を構成します。ユーザー認証でも必要です。Workspace 管理者によるアプリ許可が必要な場合もあります。
+
+Gmail 読み取りと同じ社員・アカウントの紐付け、スコープ、承認、私有データの送信制御を使用します。既存の身分ポリシーが選択したアカウントを使い、任意のユーザー指定は受け付けません。Apps Script はこの Chat 読み取りに対応しません。DM とメンションを受信する Chat ボットとは別の機能です。無効化すると既存トークンでの新たな読み取りも拒否しますが、Google 側の同意を取り消すものではありません。
+
+応答は信頼しない参照データとして包み、グループ履歴と同じ注入検査を行います。1件でも検出すると応答全体を `not available` として拒否します。監査にはスペース ID と件数のみを記録し、本文は残しません。固定データ・ローカルテストは実アカウントでの成功を保証しないため、納品前に実際の同意・読み取りを検証してください。

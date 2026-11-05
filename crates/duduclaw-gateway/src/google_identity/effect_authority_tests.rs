@@ -79,7 +79,9 @@ impl Fixture {
             account_email: "alice@unit.test".into(),
             google_sub: "unit-sub".into(),
             hosted_domain: None,
-            local_purposes: vec!["base".into(), "drive_tools".into()],
+            local_purposes: if crate::google_workspace::CHAT_READ_SCOPES.iter().all(|scope| scopes.iter().any(|s| s == scope)) {
+                vec!["base".into(), "drive_tools".into(), "chat_read".into()]
+            } else { vec!["base".into(), "drive_tools".into()] },
             granted_scopes: scopes,
             status: Status::Connected,
             status_before_suspension: None,
@@ -3575,3 +3577,76 @@ mod cli_composed;
 
 #[path = "effect_authority_w3_tests.rs"]
 mod w3;
+
+#[tokio::test]
+async fn google_chat_native_personal_and_home_owners_obey_opt_in() {
+    use serde_json::json;
+    let mut scopes = crate::google_workspace::REQUIRED_SCOPES.to_vec();
+    scopes.extend_from_slice(crate::google_workspace::CHAT_READ_SCOPES);
+    for home in [false, true] {
+        let f = Fixture::new(scopes.iter().map(|s| s.to_string()).collect(), 4_000_000_000);
+        crate::google_workspace::set_chat_read_enabled(f.home.path(), true).unwrap();
+        if home {
+            vault::disconnect(f.home.path(), &f.user).unwrap();
+            write_current_home_token(f.home.path(), D1_SECRET, None, None, &scopes);
+        }
+        let wire = d1_wire(|_, path| D1Reply::json(if path.contains("/messages") {
+            json!({"messages":[{"text":"fixture conversation","sender":{"name":"users/123"}}]})
+        } else { json!({"spaces":[{"name":"spaces/AAA","spaceType":"SPACE"}]}) })).await;
+        let _fixture = crate::google_workspace::native_call::testing::install(f.home.path(), &wire.endpoint);
+        for (tool, args) in [("google_chat_spaces", json!({})), ("google_chat_messages", json!({"space":"spaces/AAA"}))] {
+            let result = d1_pending(&f, tool, &args).execute_native(args).await.unwrap();
+            assert_ne!(result.get("isError"), Some(&json!(true)), "{home}: {result}");
+            assert!(result.to_string().contains("group_recent_context"));
+        }
+        assert_eq!(wire.hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let args = json!({"space":"spaces/AAA"});
+        let pending = d1_pending(&f, "google_chat_messages", &args);
+        crate::google_workspace::set_chat_read_enabled(f.home.path(), false).unwrap();
+        let result = pending.execute_native(args).await.unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(wire.hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn google_chat_native_missing_scope_refuses_before_wire() {
+    use serde_json::json;
+    let mut scopes = crate::google_workspace::REQUIRED_SCOPES.to_vec();
+    scopes.extend_from_slice(crate::google_workspace::CHAT_READ_SCOPES);
+    for home in [false, true] {
+        for (tool, args, missing) in [
+            ("google_chat_spaces", json!({}), "https://www.googleapis.com/auth/chat.spaces.readonly"),
+            ("google_chat_messages", json!({"space":"spaces/AAA"}), "https://www.googleapis.com/auth/chat.messages.readonly"),
+        ] {
+            let f = Fixture::new(scopes.iter().map(|s| s.to_string()).collect(), 4_000_000_000);
+            crate::google_workspace::set_chat_read_enabled(f.home.path(), true).unwrap();
+            let reduced: Vec<&str> = scopes.iter().copied().filter(|scope| *scope != missing).collect();
+            if home {
+                vault::disconnect(f.home.path(), &f.user).unwrap();
+                write_current_home_token(f.home.path(), D1_SECRET, None, None, &reduced);
+            } else {
+                // Retain the local chat_read purpose so this exercises the scope gate.
+                let old = vault::get(f.home.path(), &f.user).unwrap().unwrap();
+                let key = crate::google_identity::protection_gate(f.home.path()).unwrap();
+                let granted: Vec<String> = reduced.iter().map(|scope| scope.to_string()).collect();
+                assert!(vault::finish_refresh_with_scopes(
+                    f.home.path(), &key, &old.metadata,
+                    &Secret { access_token: D1_SECRET.into(), refresh_token: None, expires_at: Some(4_000_000_000) },
+                    Some(&granted),
+                ).unwrap());
+            }
+            let wire = d1_wire(|_, _| panic!("missing Chat scope must never send a request")).await;
+            let _fixture = crate::google_workspace::native_call::testing::install(f.home.path(), &wire.endpoint);
+            let reference = duduclaw_core::google_identity::CredentialRef {
+                kind: duduclaw_core::google_identity::CredentialKind::Legacy,
+                sha256: client_digest("ddc_prod_0123456789abcdef0123456789abcdef"),
+            };
+            assert!(SelectionStore::default().select_dedicated(
+                f.home.path(), Some(&f.db), "bot", &reference, tool, &args, Clock::now(),
+            ).is_err(), "{home}: {tool}");
+            assert_eq!(wire.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(access::pinned_test::events(f.home.path()).is_empty());
+        }
+    }
+}

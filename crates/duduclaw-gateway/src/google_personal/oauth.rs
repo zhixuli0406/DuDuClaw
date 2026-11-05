@@ -378,7 +378,7 @@ pub fn authorization_url_with_meetings(
     challenge: &str,
     meeting_recordings: bool,
 ) -> Result<String, String> {
-    authorization_url_for(client_id, redirect, state, challenge, meeting_recordings, false)
+    authorization_url_for(client_id, redirect, state, challenge, meeting_recordings, false, false)
 }
 
 pub fn authorization_url_with_drive_tools(
@@ -387,19 +387,21 @@ pub fn authorization_url_with_drive_tools(
     state: &str,
     challenge: &str,
 ) -> Result<String, String> {
-    authorization_url_for(client_id, redirect, state, challenge, false, true)
+    authorization_url_for(client_id, redirect, state, challenge, false, true, false)
 }
 
-fn authorization_url_for(
+pub(crate) fn authorization_url_for(
     client_id: &str,
     redirect: &str,
     state: &str,
     challenge: &str,
     meeting_recordings: bool,
     drive_tools: bool,
+    chat_read: bool,
 ) -> Result<String, String> {
     let mut url = url::Url::parse(&endpoint(AUTHORIZE)).map_err(|_| "Google 連結網址無法建立。")?;
-    let scopes = requested_scopes(meeting_recordings, drive_tools);
+    let mut scopes = requested_scopes(meeting_recordings, drive_tools);
+    if chat_read { scopes.extend_from_slice(crate::google_workspace::CHAT_READ_SCOPES); }
     url.query_pairs_mut().extend_pairs([
         ("response_type", "code"),
         ("client_id", client_id),

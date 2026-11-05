@@ -19,6 +19,8 @@ pub const NATIVE_GOOGLE_TOOLS: &[&str] = &[
     "google_status",
     "gmail_search",
     "gmail_read",
+    "google_chat_spaces",
+    "google_chat_messages",
     "gmail_create_draft",
     "calendar_list_events",
     "calendar_create_event",
@@ -42,6 +44,8 @@ pub fn native_google_scope(tool: &str) -> Option<NativeGoogleScope> {
         "google_status"
         | "gmail_search"
         | "gmail_read"
+        | "google_chat_spaces"
+        | "google_chat_messages"
         | "calendar_list_events"
         | "sheets_read"
         | "forms_get"
@@ -73,7 +77,7 @@ mod tests {
             assert!(unique.insert(tool));
             assert!(native_google_scope(tool).is_some(), "{tool}");
         }
-        assert_eq!(unique.len(), 19);
+        assert_eq!(unique.len(), 21);
         assert_eq!(
             native_google_scope("gtasks_complete"),
             Some(NativeGoogleScope::Write)

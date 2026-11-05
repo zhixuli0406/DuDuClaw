@@ -10143,5 +10143,9 @@
   "routines.cancelReminder": "Cancel reminder",
   "routines.reminderCancelFailed": "Could not cancel the reminder. Refresh and try again.",
   "assign.skill.runnerMultiple": "After you submit, an AI employee who can run all selected skills will be chosen.",
-  "assign.skill.error.noCommonRunner": "No AI employee you can assign to can run all selected skills. Assign them separately or change your selection."
+  "assign.skill.error.noCommonRunner": "No AI employee you can assign to can run all selected skills. Assign them separately or change your selection.",
+  "google.chatRead.title": "Read Google Chat",
+  "google.chatRead.hint": "After enabling, users reconnect Google in My Connections and select the Chat permissions. AI employees can read spaces and recent messages available to that account. They cannot send messages or download attachments.",
+  "google.chatRead.setup": "Enable the Google Chat API and configure a Chat app in the OAuth client’s Google Cloud project. A Workspace administrator may also need to allow the app.",
+  "myConnections.service.chat": "Google Chat"
 }

@@ -148,6 +148,8 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("code_map", "chat_files", "array"),
     ("memory_fetch_batch", "ids", "array"),
     ("memory_fetch_batch", "include_metadata", "boolean"),
+    ("google_chat_spaces", "limit", "integer"),
+    ("google_chat_messages", "limit", "integer"),
     ("memory_improve", "limit", "integer"),
     ("memory_search", "limit", "integer"),
     ("memory_search", "tags", "array"),
@@ -217,6 +219,16 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
                     "required":["max_agent_calls","max_usd","max_wall_secs","max_rounds"]}
             },"required":["approved_root_id","evaluator","runtime","model","branch_count","refine_count","max_parallelism","budget"]
         }));
+    }
+    if matches!(tool.name, "google_chat_spaces" | "google_chat_messages") {
+        let spaces = tool.name == "google_chat_spaces";
+        properties.insert("limit".into(), serde_json::json!({
+            "type":"integer", "minimum":1, "maximum":if spaces { 50 } else { 100 },
+            "default":if spaces { 20 } else { 30 },
+        }));
+        if spaces {
+            properties.get_mut("filter").unwrap()["enum"] = serde_json::json!(["SPACE", "GROUP_CHAT", "DIRECT_MESSAGE"]);
+        }
     }
     if tool.name == "group_history_read" {
         properties.insert("limit".into(), serde_json::json!({

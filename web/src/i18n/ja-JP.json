@@ -10143,5 +10143,9 @@
   "routines.cancelReminder": "リマインダーをキャンセル",
   "routines.reminderCancelFailed": "キャンセルできませんでした。再読み込みしてお試しください。",
   "assign.skill.runnerMultiple": "送信後、選択したすべてのスキルを実行できる AI スタッフが選ばれます。",
-  "assign.skill.error.noCommonRunner": "選択したすべてのスキルを実行できる、依頼可能な AI スタッフがいません。別々に依頼するか、選択を変更してください。"
+  "assign.skill.error.noCommonRunner": "選択したすべてのスキルを実行できる、依頼可能な AI スタッフがいません。別々に依頼するか、選択を変更してください。",
+  "google.chatRead.title": "Google Chat の読み取り",
+  "google.chatRead.hint": "有効にした後、ユーザーは「自分の接続」で Google に再接続し、Chat の権限を選択してください。AI 従業員はそのアカウントのスペースと最近のメッセージを読み取れます。メッセージ送信や添付ファイルのダウンロードは行いません。",
+  "google.chatRead.setup": "OAuth クライアントの Google Cloud プロジェクトで Google Chat API を有効にして、Chat アプリを設定してください。Workspace 管理者によるアプリの許可が必要な場合もあります。",
+  "myConnections.service.chat": "Google Chat"
 }

@@ -368,7 +368,7 @@ pub(crate) fn capture_google_home_start(
         };
         let size = secret_size(&secret)?;
         let scopes = home_store::normalized_scopes(
-            crate::google_workspace::REQUIRED_SCOPES
+            crate::google_workspace::requested_scopes(home)
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),

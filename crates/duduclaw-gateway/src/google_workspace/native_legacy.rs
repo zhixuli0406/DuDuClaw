@@ -322,6 +322,10 @@ pub(crate) async fn handle(
     home: &Path,
     g: &dyn crate::google_identity::native_tools::NativeGoogleAccess,
 ) -> Value {
+    if matches!(tool, "google_chat_spaces" | "google_chat_messages") && !super::chat_read_enabled(home) {
+        crate::egress_client::builtin_not_dispatched();
+        return super::native_call::tool_error(super::chat_read::GUIDANCE);
+    }
     let template = match NativeCallTemplate::prepare(tool, args) {
         Ok(t) => t,
         Err(e) => {
@@ -330,6 +334,20 @@ pub(crate) async fn handle(
         }
     };
     let result: Result<program::Outcome, GoogleApiError> = match template.parsed() {
+        ParsedNativeArguments::ChatSpaces(args) => {
+            let backend = match g.backend(home, tool).await { Ok(b) => b, Err(e) => return super::native_call::tool_error(&e) };
+            match backend {
+                GoogleBackend::Direct(token) => program::chat_spaces(&mut LegacyIo { token: &token }, &template, args).await.map(program::Outcome::Chat),
+                GoogleBackend::AppsScript(_) => return super::native_call::tool_error("Google Chat 讀取需要使用者自己的 Google OAuth 連線；不支援 Apps Script Bridge。"),
+            }
+        }
+        ParsedNativeArguments::ChatMessages(args) => {
+            let backend = match g.backend(home, tool).await { Ok(b) => b, Err(e) => return super::native_call::tool_error(&e) };
+            match backend {
+                GoogleBackend::Direct(token) => program::chat_messages(&mut LegacyIo { token: &token }, &template, args).await.map(program::Outcome::Chat),
+                GoogleBackend::AppsScript(_) => return super::native_call::tool_error("Google Chat 讀取需要使用者自己的 Google OAuth 連線；不支援 Apps Script Bridge。"),
+            }
+        }
         ParsedNativeArguments::GmailSearch { query, max } => {
             let backend = match g.backend(home, tool).await {
                 Ok(b) => b,

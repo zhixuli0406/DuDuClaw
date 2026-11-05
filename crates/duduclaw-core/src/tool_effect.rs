@@ -159,7 +159,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "db_tables" | "decision_list" | "diff_branches" | "docs_read" | "drive_read"
         | "drive_search" | "evolution_status" | "file_read" | "fork_cost" | "forms_get"
         | "forms_list_responses" | "github_issue_read" | "github_pr_read"
-        | "github_search_issues" | "github_status" | "gmail_read" | "gmail_search"
+        | "github_search_issues" | "github_status" | "gmail_read" | "gmail_search" | "google_chat_spaces" | "google_chat_messages"
         | "goals_list" | "google_status" | "gtasks_list" | "gtasks_lists" | "hardware_info"
         | "identity_resolve" | "inference_mode" | "inference_status" | "inspect_branches"
         | "knowledge_get_passage" | "knowledge_list_collections" | "knowledge_search"
@@ -263,7 +263,7 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "discovery_list" | "discovery_tree" | "docs_read" | "drive_read" | "drive_search"
         | "evolution_status" | "execute_program" | "file_read" | "fork_cost" | "fork_run"
         | "forms_get" | "forms_list_responses" | "github_issue_read" | "github_pr_read"
-        | "github_search_issues" | "github_status" | "gmail_read" | "gmail_search"
+        | "github_search_issues" | "github_status" | "gmail_read" | "gmail_search" | "google_chat_spaces" | "google_chat_messages"
         | "goals_list" | "google_status" | "gtasks_list" | "gtasks_lists" | "hardware_info"
         | "identity_resolve" | "inference_mode" | "inference_status" | "inspect_branches"
         | "knowledge_get_passage" | "knowledge_list_collections" | "knowledge_search"
@@ -349,6 +349,8 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
     "github_search_issues",
     "gmail_create_draft",
     "gmail_read",
+    "google_chat_spaces",
+    "google_chat_messages",
     "gmail_search",
     "gtasks_complete",
     "gtasks_create",
@@ -1099,6 +1101,8 @@ mod tests {
             "browser_record_start",
             "os_open",
             "gmail_search",
+            "google_chat_spaces",
+            "google_chat_messages",
             "docs_append",
         ] {
             assert_eq!(super::egress_capable(name), Some(true), "{name}");

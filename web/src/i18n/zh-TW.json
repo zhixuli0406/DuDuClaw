@@ -10143,5 +10143,9 @@
   "routines.cancelReminder": "取消提醒",
   "routines.reminderCancelFailed": "無法取消提醒，請重新整理後再試。",
   "assign.skill.runnerMultiple": "送出後，系統會選擇能執行全部所選技能的 AI 員工。",
-  "assign.skill.error.noCommonRunner": "目前沒有你可交辦的 AI 員工能執行全部所選技能，請分開交辦或調整選擇。"
+  "assign.skill.error.noCommonRunner": "目前沒有你可交辦的 AI 員工能執行全部所選技能，請分開交辦或調整選擇。",
+  "google.chatRead.title": "Google Chat 讀取",
+  "google.chatRead.hint": "開啟後，請使用者到「我的連線」重新連結 Google，並勾選 Chat 權限。AI 員工可讀取該帳號加入的聊天室與最近訊息；不會傳送訊息或下載附件。",
+  "google.chatRead.setup": "OAuth 用戶端所屬的 Google Cloud 專案須啟用 Google Chat API 並完成 Chat 應用程式設定；Workspace 管理員可能還須允許此應用程式。",
+  "myConnections.service.chat": "Google Chat"
 }

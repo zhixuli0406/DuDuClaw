@@ -2,6 +2,7 @@
 
 /// The bearer broker accepts only these operations; status is metadata-only.
 pub const TOKEN_TOOLS: &[&str] = &[
+    "google_chat_spaces", "google_chat_messages",
     "gmail_search", "gmail_read", "mail_poll", "gmail_create_draft",
     "calendar_list_events", "calendar_create_event", "sheets_read", "sheets_append",
     "forms_get", "forms_list_responses", "gtasks_lists", "gtasks_list",
@@ -30,6 +31,7 @@ pub fn permitted_for(tool: &str, metadata: &crate::person_credentials::Metadata)
     if !token_tool(tool) { return false; }
     let consent = |purpose: &str| metadata.local_purposes.iter().any(|p| p == purpose);
     let local = match tool {
+        "google_chat_spaces" | "google_chat_messages" => consent("chat_read"),
         "drive_search" | "drive_read" => consent("drive_tools"),
         "google_remote_mcp" => consent("base") && consent("drive_tools"),
         _ => consent("base"),
@@ -45,6 +47,8 @@ fn has(granted: &[String], candidates: &[&str]) -> bool {
 
 pub fn permitted(tool: &str, granted: &[String]) -> bool {
     match tool {
+        "google_chat_spaces" => has(granted, &["https://www.googleapis.com/auth/chat.spaces.readonly"]),
+        "google_chat_messages" => has(granted, &["https://www.googleapis.com/auth/chat.messages.readonly"]),
         "gmail_search" | "gmail_read" | "mail_poll" => has(
             granted,
             &[

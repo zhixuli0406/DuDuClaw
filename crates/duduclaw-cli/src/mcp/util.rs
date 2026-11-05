@@ -289,7 +289,7 @@ pub(crate) fn meeting_audit_tool(tool_name: &str) -> bool {
 }
 
 pub(crate) fn audit_result_text(tool_name: &str, result: &Value) -> Option<String> {
-    if meeting_audit_tool(tool_name) { None } else { extract_tool_result_text(result) }
+    if meeting_audit_tool(tool_name) || matches!(tool_name, "google_chat_spaces" | "google_chat_messages") { None } else { extract_tool_result_text(result) }
 }
 
 fn meeting_audit_arguments(args: &Value) -> Value {
@@ -306,6 +306,11 @@ fn meeting_audit_arguments(args: &Value) -> Value {
 pub(crate) fn audit_safe_arguments(tool_name: &str, args: &Value) -> Value {
     if meeting_audit_tool(tool_name) { return meeting_audit_arguments(args); }
     match tool_name {
+        "google_chat_spaces" | "google_chat_messages" => {
+            let space = args.get("space").and_then(Value::as_str)
+                .filter(|s| duduclaw_gateway::google_workspace::chat_read::valid_space(s));
+            serde_json::json!({"space":space})
+        }
         "credential_declare" => serde_json::json!({"redacted":true}),
         "computer_login" => serde_json::json!({"credential": args.get("credential").and_then(Value::as_str)}),
         "computer_type" => {
@@ -521,5 +526,20 @@ pub(crate) fn audit_test_principal(client_id: &str, is_external: bool) -> crate:
     crate::mcp_auth::Principal {
         client_id: client_id.to_string(), is_external,
         scopes: Default::default(), created_at: chrono::Utc::now(),
+    }
+}
+
+#[cfg(test)]
+mod google_chat_audit_tests {
+    use super::*;
+
+    #[test]
+    fn google_chat_audit_retains_only_validated_space() {
+        for tool in ["google_chat_spaces", "google_chat_messages"] {
+            let args = serde_json::json!({"space":"spaces/AAAA", "text":"private text", "since":"private timestamp", "thread":"private thread"});
+            assert_eq!(audit_safe_arguments(tool, &args), serde_json::json!({"space":"spaces/AAAA"}));
+            assert_eq!(audit_safe_arguments(tool, &serde_json::json!({"space":"spaces/private text"})), serde_json::json!({"space":null}));
+            assert!(audit_result_text(tool, &serde_json::json!({"content":[{"type":"text","text":"private message"}]})).is_none());
+        }
     }
 }
