@@ -59,7 +59,7 @@ fn read_config(path: &Path) -> Result<toml::Value> {
 
 // Every agent primary is required; a configured fallback is checked but optional.
 // Do not silently drop retired selectors such as gemini/agy from migrated data.
-pub(super) fn configured(home: &Path) -> Result<BTreeMap<String, bool>> {
+pub(crate) fn configured(home: &Path) -> Result<BTreeMap<String, bool>> {
     let config = read_config(&home.join("config.toml"))?;
     let default_agent = config.get("general").and_then(|v| v.get("default_agent"))
         .and_then(toml::Value::as_str).filter(|value| !value.is_empty());
@@ -102,7 +102,7 @@ pub(super) fn configured(home: &Path) -> Result<BTreeMap<String, bool>> {
     Ok(runtimes)
 }
 
-pub(super) fn binary_names(provider: &str) -> Result<Vec<&'static str>> {
+pub(crate) fn binary_names(provider: &str) -> Result<Vec<&'static str>> {
     if let Some(spec) = duduclaw_core::runtime_catalog::spec_for(provider) {
         if spec.binary.is_empty() { return Ok(Vec::new()); }
         return Ok(std::iter::once(spec.binary).chain(spec.binary_aliases.iter().copied()).collect());

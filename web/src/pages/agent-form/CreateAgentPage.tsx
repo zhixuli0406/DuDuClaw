@@ -213,6 +213,7 @@ export function CreateAgentPage() {
   const showRosterNotes = usingTemplate && roster?.industry != null;
 
   const t = (key: string) => intl.formatMessage({ id: key });
+  const errorSeparator = error ? /: |：/.exec(error) : null;
 
   const roleOptions: SelectOption[] = ['main', 'specialist', 'worker', 'developer', 'qa', 'planner'].map(
     (r) => ({ value: r, label: t(`agents.role.${r}`), raw: r }),
@@ -407,8 +408,8 @@ export function CreateAgentPage() {
         {error && (
           <div role="alert" className="text-sm text-destructive">
             <p>{error}</p>
-            {error.includes(': ') && (
-              <p className="mt-1 text-xs text-muted-foreground">{error.slice(error.indexOf(': ') + 2)}</p>
+            {errorSeparator && (
+              <p className="mt-1 text-xs text-muted-foreground">{error.slice(errorSeparator.index! + errorSeparator[0].length)}</p>
             )}
           </div>
         )}
