@@ -661,3 +661,98 @@ fn isolated_i1b_round6_cost_schema_marks_missing_measurement() {
     assert!(description.contains("unavailable") && description.contains("null") && description.contains("never zero"));
     assert_eq!(tool["inputSchema"]["required"], json!(["fork_id"]));
 }
+
+#[test]
+fn isolated_background_dispatch_future_sizes() {
+    let home = tempfile::tempdir().unwrap();
+    let dispatcher = adapter(home.path());
+    let request = json!({"jsonrpc":"2.0", "id":3, "method":"tools/call",
+        "params":{"name":"memory_store", "arguments":{"content":"size probe"}}});
+    let sizes = [
+        ("isolated.request", std::mem::size_of_val(&dispatcher.request(request.clone())), 8 * 1024),
+        ("mcp.dispatch", std::mem::size_of_val(&dispatcher.dispatcher.dispatch_tool_call(
+            &dispatcher.principal, &dispatcher.namespace, &request["params"], &request["id"])), 16 * 1024),
+    ];
+    for (name, size, limit) in sizes {
+        eprintln!("{name}: {size} bytes");
+        assert!(size <= limit, "{name}: {size} > {limit}; keep dispatch boundaries boxed");
+    }
+}
+
+fn background_memory_adapter(home: &std::path::Path) -> (IsolationDispatcher, RequestContext) {
+    let mut dispatcher = adapter(home);
+    dispatcher.principal.client_id = "main".into();
+    dispatcher.principal.scopes = [crate::mcp_auth::Scope::Admin].into_iter().collect();
+    std::fs::write(home.join("agents/main/agent.toml"),
+        "[agent]\nname = \"main\"\n[capabilities]\nallowed_tools = [\"mcp__duduclaw__*\"]\n").unwrap();
+    let mut record = context().record().clone();
+    record.lane = Lane::Standard;
+    record.principal = RunPrincipal::Background { tenant_id: Text::new("tenant".into()).unwrap(), generation: 1 };
+    record.employee_binding = EmployeeBinding::Shared(Text::new("tenant".into()).unwrap());
+    record.tools = List::new(vec![Text::new("memory_store".into()).unwrap()]).unwrap();
+    record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee },
+        ResourceGrant::EmployeeScope { id: record.employee },
+        ResourceGrant::Confined { resource: Box::new(ResourceGrant::DatabaseTable {
+            database: Text::new("agent:main".into()).unwrap(), table: Text::new("memory".into()).unwrap() }) },
+    ]).unwrap();
+    let mut bindings = duduclaw_mcp_boundary::bindings::BindingStore::new(
+        rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+    bindings.register_principal(&record.principal).unwrap();
+    bindings.create_employee(record.employee, &record.employee_binding).unwrap();
+    let resolver = Arc::new(duduclaw_gateway::isolation_resources::GatewayResourceResolver::new(
+        home.to_owned(), record.employee, "main".into(), Arc::new(std::sync::Mutex::new(bindings))).unwrap());
+    let services = Arc::new(crate::mcp_isolation_resources::GatewayResourceToolService::new(
+        home.to_owned(), "main".into(), dispatcher.roots.clone(), resolver.clone(), None));
+    dispatcher = dispatcher.with_record_resolver(resolver).with_resource_services(services);
+    (dispatcher, live_context(record))
+}
+
+struct BackgroundTurn;
+impl duduclaw_gateway::isolation_egress::RunTurnResolver for BackgroundTurn {
+    fn resolve(&self, _: &RequestContext) -> Result<duduclaw_gateway::isolation_egress::RunTurnIdentity, VerificationError> {
+        Ok(duduclaw_gateway::isolation_egress::RunTurnIdentity {
+            turn: "parity-background-run".into(), approval_session: None,
+        })
+    }
+    fn metadata(&self, _: &RequestContext) -> Result<Option<duduclaw_gateway::isolation_egress::RunMetadata>, VerificationError> {
+        let mut metadata = duduclaw_gateway::isolation_egress::RunMetadata::root();
+        metadata.dispatch_run = Some(("cron:main".into(), "parity-run".into()));
+        Ok(Some(metadata))
+    }
+}
+
+#[test]
+fn isolated_background_memory_store_on_two_mib_stack() {
+    std::thread::Builder::new().name("isolated-memory-2mib".into())
+        .stack_size(2 * 1024 * 1024).spawn(|| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(background_memory_store_with_dispatch_provenance());
+        }).unwrap().join().unwrap();
+}
+
+async fn background_memory_store_with_dispatch_provenance() {
+    let home = tempfile::tempdir().unwrap();
+    let (dispatcher, context) = background_memory_adapter(home.path());
+    let dispatcher = dispatcher.with_turn_resolver(Arc::new(BackgroundTurn));
+    let request = json!({"jsonrpc":"2.0", "id":3, "method":"tools/call",
+        "params":{"name":"memory_store", "arguments":{"content":"The daily report is prepared at nine."}}});
+    let ordinary = dispatcher.dispatcher.dispatch_tool_call(&dispatcher.principal, &dispatcher.namespace,
+        &request["params"], &request["id"]).await;
+    let isolated = dispatcher.dispatch(context, "main", request).await.unwrap().unwrap();
+    let database = rusqlite::Connection::open(home.path().join("memory.db")).unwrap();
+    for response in [&ordinary, &isolated] {
+        assert!(response.get("error").is_none(), "{response}");
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        let id = response["result"]["memory_id"].as_str().unwrap();
+        let (employee, content): (String, String) = database.query_row(
+            "SELECT agent_id,content FROM memories WHERE id=?1", [id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(employee, "main");
+        assert_eq!(content, "The daily report is prepared at nine.");
+    }
+    let id = isolated["result"]["memory_id"].as_str().unwrap();
+    let dispatch_origin: i64 = database.query_row(
+        "SELECT COUNT(*) FROM memory_origins WHERE memory_id=?1 AND agent_id='main'
+         AND source_kind='dispatch_run' AND source_session='cron:main' AND source_message='run:parity-run'",
+        [id], |row| row.get(0)).unwrap();
+    assert_eq!(dispatch_origin, 1, "background memory must retain its gateway-issued dispatch source");
+}

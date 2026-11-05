@@ -470,7 +470,8 @@ impl IsolationDispatcher {
                         manager: layer.manager.clone(), agent_id: self.agent.clone(), session_id: format!("isolated:{run}"),
                     }));
                 }
-                dispatcher.dispatch_tool_call(&self.principal, &self.namespace, &params, id).await
+                // Bound the request future before it crosses the nested identity scopes.
+                Box::pin(dispatcher.dispatch_tool_call(&self.principal, &self.namespace, &params, id)).await
             }
             _ => crate::mcp::jsonrpc_error(id, -32601, "不支援此隔離執行方法。"),
         };
@@ -583,7 +584,7 @@ impl duduclaw_mcp_boundary::server::Dispatcher for IsolationDispatcher {
             duduclaw_gateway::isolation_egress::scope(&self.dispatcher.home_dir, &self.agent, &context,
                 self.turn_resolver.clone(), ISOLATED_CALL.scope(call, crate::mcp_auth::with_authenticated_call(
                 crate::mcp_auth::AuthenticatedCall::without_reference(self.principal.clone()),
-                duduclaw_mcp_boundary::io_authority::scope(context.clone(), self.request(request))))).await?
+                duduclaw_mcp_boundary::io_authority::scope(context.clone(), Box::pin(self.request(request)))))).await?
         })
     }
 }

@@ -424,8 +424,16 @@ impl duduclaw_gateway::isolation_egress::RunTurnResolver for BackgroundTurn {
     }
 }
 
-#[tokio::test]
-async fn isolated_round5_background_memory_store_reuses_handler_with_dispatch_provenance() {
+#[test]
+fn isolated_round5_background_memory_store_reuses_handler_with_dispatch_provenance() {
+    std::thread::Builder::new().name("isolated-memory-2mib".into())
+        .stack_size(2 * 1024 * 1024).spawn(|| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(background_memory_store_with_dispatch_provenance());
+        }).unwrap().join().unwrap();
+}
+
+async fn background_memory_store_with_dispatch_provenance() {
     let home = tempfile::tempdir().unwrap();
     let (dispatcher, context) = fixture_with_principal(home.path(), true);
     let dispatcher = dispatcher.with_turn_resolver(Arc::new(BackgroundTurn));

@@ -1837,7 +1837,9 @@ impl McpDispatcher {
         } else { None };
         let handler = crate::mcp_auth::with_accepted_google_call(
             accepted_google,
-            crate::mcp::handle_tools_call(
+            // Keep the all-tools handler out of the observation/task-local
+            // state machines: these run on 2 MiB production worker stacks.
+            Box::pin(crate::mcp::handle_tools_call(
                 id,
                 &params_owned,
                 &self.home_dir,
@@ -1849,7 +1851,7 @@ impl McpDispatcher {
                 &self.daily_quota,
                 &principal.client_id,
                 caller_is_admin,
-            ),
+            )),
         );
         if let Some(lease) = &sink_lease { lease.dispatched(); }
         let execution = async {

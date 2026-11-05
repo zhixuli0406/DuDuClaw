@@ -70,6 +70,8 @@
 
 ### Fixed
 
+- 修正隔離背景工具派送內嵌大型共用 handler future 的堆疊溢位風險；在呼叫邊界配置於 heap，並加入 2 MiB 執行緒與 future 大小回歸測試，涵蓋記憶、知識庫與任務共用路徑。
+
 - 將跨執行期派送與 Linux Claude 啟動的 future 裝箱，保留既有大小上限（待 Linux builder 驗證）；校正隔離測試的員工／Wiki 授權、內建模型目錄的路由斷言與分支拒絕訊息格式。技能知識發布支援員工範圍下的 confined Wiki grant，仍檢查自己的 namespace、目錄與有效授權。
 
 - 修正核准資料庫初始化時重複開啟交易，導致 gateway 與 CLI 無法開啟核准儲存區；結構建立與遷移共用單一交易，失敗時完整回復。

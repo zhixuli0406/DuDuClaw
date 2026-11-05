@@ -210,7 +210,9 @@ pub(crate) async fn handle_tools_call(
             daily_quota, caller_client_id, caller_is_admin, wiki_agent, record_actor,
             google_caller: &google_caller };
         match authorized {
-            Some(call) => handler.execute(call).await,
+            // Do not embed both copies of the all-tools match future in this
+            // authorization branch (or the background caller's task-local scope).
+            Some(call) => Box::pin(handler.execute(call)).await,
             None => handler.invoke(tool_name, &arguments).await,
         }
     }).await;
@@ -373,6 +375,12 @@ impl GatewayHandler<'_> {
     }
 
     async fn invoke(&self, tool_name: &str, arguments: &Value) -> std::result::Result<Value, Value> {
+        // Every tool shares the large match below. Box before any caller or
+        // task-local scope embeds it, including the ordinary/background routes.
+        Box::pin(self.invoke_inner(tool_name, arguments)).await
+    }
+
+    async fn invoke_inner(&self, tool_name: &str, arguments: &Value) -> std::result::Result<Value, Value> {
         // A connector can never reach an ambient credential selector in isolation.
         if crate::mcp_isolation::current().is_some()
             && duduclaw_mcp_boundary::tool_policy::policy(tool_name)
@@ -997,5 +1005,52 @@ impl GatewayHandler<'_> {
             return Err(jsonrpc_error(id, -32602, &format!("Unknown tool: {tool_name}")));
         }
     })
+    }
+}
+
+#[cfg(test)]
+mod future_size_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn gateway_handler_future_sizes() {
+        let home = tempfile::tempdir().unwrap();
+        let memory = SqliteMemoryEngine::new(&home.path().join("memory.db")).unwrap();
+        let http = reqwest::Client::new();
+        let odoo: OdooState = std::sync::Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+        let ns = crate::mcp_namespace::NamespaceContext { write_namespace: "main".into(), read_namespaces: vec!["main".into()] };
+        let quota = crate::mcp_memory_quota::DailyQuota::new();
+        let id = json!(1);
+        let arguments = json!({"content":"size probe"});
+        let google_caller = super::super::google_identity_client::GoogleCaller::default();
+        let handler = GatewayHandler { id: &id, home_dir: home.path(), http: &http,
+            memory: &memory, default_agent: "main", odoo: &odoo, ns_ctx: &ns,
+            daily_quota: &quota, caller_client_id: "main", caller_is_admin: false,
+            wiki_agent: "main", record_actor: RecordActor::Agent("main"), google_caller: &google_caller };
+        // The match state machine is shared by memory_*, wiki_* and tasks_*.
+        for name in ["memory_store", "memory_search", "wiki_write", "tasks_create"] {
+            let future = handler.invoke(name, &arguments);
+            let size = std::mem::size_of_val(&future);
+            eprintln!("gateway.invoke({name}): {size} bytes");
+            assert!(size <= 1024, "{name}: {size}; keep the all-tools future boxed");
+        }
+        let params = json!({"name":"memory_store", "arguments":arguments});
+        let sizes = [
+            ("gateway.invoke_inner", std::mem::size_of_val(&handler.invoke_inner("memory_store", &arguments)), 64 * 1024),
+            ("gateway.tools_call", std::mem::size_of_val(&handle_tools_call(&id, &params,
+                home.path(), &http, &memory, "main", &odoo, &ns, &quota, "main", false)), 8 * 1024),
+            ("wiki.write", std::mem::size_of_val(&handle_wiki_write(&arguments, home.path(), "main")), 16 * 1024),
+            ("tasks.create", std::mem::size_of_val(&handle_tasks_create(&arguments, home.path(), RecordActor::Agent("main"))), 16 * 1024),
+            ("tasks.update", std::mem::size_of_val(&handle_tasks_update(&arguments, home.path(), RecordActor::Agent("main"))), 16 * 1024),
+        ];
+        for (name, size, limit) in sizes {
+            eprintln!("{name}: {size} bytes");
+            assert!(size <= limit, "{name}: {size} > {limit}; keep handler boundaries boxed");
+        }
+        let future = crate::mcp_memory_handlers::handle_memory_store(&arguments, &memory, &ns, &quota);
+        let size = std::mem::size_of_val(&future);
+        eprintln!("memory.store: {size} bytes");
+        assert!(size <= 16 * 1024, "memory.store: {size}; keep leaf futures bounded");
     }
 }
