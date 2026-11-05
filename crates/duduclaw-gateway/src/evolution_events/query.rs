@@ -195,6 +195,10 @@ impl AuditEventIndex {
                  ON audit_index(skill_id)
                  WHERE skill_id IS NOT NULL;
 
+             CREATE TABLE IF NOT EXISTS protected_policy_imports (
+                 event_id TEXT PRIMARY KEY
+             );
+
              -- Track which files (and how many lines) have been indexed.
              CREATE TABLE IF NOT EXISTS indexed_files (
                  filename       TEXT    PRIMARY KEY,
@@ -204,6 +208,37 @@ impl AuditEventIndex {
         )
         .map_err(|e| format!("init audit index schema: {e}"))?;
         Ok(())
+    }
+
+    /// Look up completed imports using the receipt primary key before reading
+    /// any JSONL history. A receipt means both audit copies landed.
+    pub(crate) async fn imported_protected_policy_ids(&self, ids: &[String]) -> Result<std::collections::HashSet<String>, String> {
+        let conn = self.conn.lock().await;
+        let mut statement = conn.prepare("SELECT EXISTS(SELECT 1 FROM protected_policy_imports WHERE event_id = ?1)")
+            .map_err(|e| e.to_string())?;
+        let mut imported = std::collections::HashSet::new();
+        for id in ids {
+            let exists: bool = statement.query_row(params![id], |row| row.get(0)).map_err(|e| e.to_string())?;
+            if exists { imported.insert(id.clone()); }
+        }
+        Ok(imported)
+    }
+
+    /// Import one verified root-policy or runtime transition event exactly once.
+    /// The receipt and index row commit together, including across restarts.
+    pub(crate) async fn import_protected_policy(&self, id: &str, event: &AuditEvent) -> Result<(), String> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let inserted = tx.execute("INSERT OR IGNORE INTO protected_policy_imports(event_id) VALUES (?1)",
+            params![id]).map_err(|e| e.to_string())?;
+        if inserted != 0 {
+            tx.execute("INSERT INTO audit_index
+                (timestamp, event_type, agent_id, outcome, metadata, source_file)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![event.timestamp,
+                event.event_type.to_string(), event.agent_id, event.outcome.to_string(),
+                event.metadata.to_string(), "protected-policy"]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
     // ── Sync ──────────────────────────────────────────────────────────────────

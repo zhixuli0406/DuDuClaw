@@ -218,6 +218,7 @@ impl MethodHandler {
     pub async fn refresh_audit_index(&self) {
         match self.audit_index().await {
             Ok(idx) => {
+                crate::protected_policy_audit::drain(&self.home_dir, &idx).await;
                 if let Err(e) = idx.sync_from_files().await {
                     warn!("audit_index background sync warning: {e}");
                 }

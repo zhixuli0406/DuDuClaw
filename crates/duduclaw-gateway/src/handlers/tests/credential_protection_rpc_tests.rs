@@ -405,3 +405,28 @@ fn credential_protection_rpc_sanitizes_recovery_payload_and_display_text() {
         assert!(text.contains("\\u{202e}"));
     }
 }
+
+#[test]
+fn credential_protection_rpc_reports_read_only_engine_socket_policy() {
+    use duduclaw_core::root_key::policy::{EngineSocketAction, PolicyStatus};
+    use crate::handlers::credential_protection_rpc::{protection_for, status_json};
+    let home = tempfile::tempdir().unwrap();
+    let mut status = protection_for(home.path()).status();
+    let hostile = "socket\u{1b}\u{202e}";
+    status.engine_socket_policy = Some(PolicyStatus { action: EngineSocketAction::Warn,
+        warning_active: true, detail: Some(hostile.into()), risk_zh: hostile.into(),
+        command_warn: "sudo duduclaw service protected-linux policy engine-socket warn --yes".into(),
+        command_revoke: "sudo duduclaw service protected-linux policy engine-socket revoke".into() });
+    let payload = status_json(&status);
+    let policy = &payload["engine_socket_policy"];
+    assert_eq!(policy["action"], "warn");
+    assert_eq!(policy["warning_active"], true);
+    assert_eq!(policy["command_warn"], "sudo duduclaw service protected-linux policy engine-socket warn --yes");
+    assert_eq!(policy["command_revoke"], "sudo duduclaw service protected-linux policy engine-socket revoke");
+    for field in ["detail", "risk_zh"] {
+        let text = policy[field].as_str().unwrap();
+        assert!(!text.chars().any(char::is_control));
+        assert!(!text.contains('\u{202e}'));
+        assert!(text.contains("\\u{1b}"));
+    }
+}

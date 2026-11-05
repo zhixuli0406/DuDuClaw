@@ -644,6 +644,7 @@ pub mod data_exports;
 pub mod compliance;
 pub mod product_policy;
 pub mod runtime_readiness;
+mod protected_policy_audit;
 
 /// Thinking display: the normalised `ThinkingEvent`, the per-turn sink and
 /// gate (masking, truncation, CONTRACT checks) and the display policy.

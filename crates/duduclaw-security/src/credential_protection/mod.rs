@@ -153,6 +153,8 @@ pub struct ProtectionStatus {
     pub refusal_reason: Option<&'static str>,
     /// Latest root-key diagnostic and recovery state, without key material.
     pub root_key_recovery: Option<duduclaw_core::root_key::recovery::RecoveryStatus>,
+    /// Root-managed native Linux policy; never writable through this API.
+    pub engine_socket_policy: Option<duduclaw_core::root_key::policy::PolicyStatus>,
 }
 
 /// A refused operation. `code` is a closed set; `message_zh` is user-facing.
@@ -377,11 +379,13 @@ impl CredentialProtection {
             },
         };
         let level = if state == ProtectionState::Ready { platform_level } else { ProtectionLevel::File };
-        let (summary_zh, mut detail_zh) = messages::state_text(state, level, backend, &extra);
+        let (mut summary_zh, mut detail_zh) = messages::state_text(state, level, backend, &extra);
         let root_key_recovery = duduclaw_core::root_key::recovery::status(&self.home);
         if let Some(recovery) = &root_key_recovery {
             detail_zh.push_str(&messages::recovery_detail(recovery, self.store.refusal_reason().is_some()));
         }
+        let engine_socket_policy = native_engine_socket_policy();
+        apply_engine_socket_warning(&mut summary_zh, &mut detail_zh, engine_socket_policy.as_ref());
         ProtectionStatus {
             level,
             platform_level,
@@ -395,6 +399,7 @@ impl CredentialProtection {
             detail_zh: sanitize_output_text(&detail_zh),
             refusal_reason: self.store.refusal_reason(),
             root_key_recovery,
+            engine_socket_policy,
         }
     }
 
@@ -660,6 +665,30 @@ mod fingerprint_protection_tests {
             let key = ProtectedKey { backend: BackendKind::MacosKeychain, level, key: Zeroizing::new([7; KEY_LEN]), key_id: "fixture".into() };
             assert_eq!(key.credential_fingerprint("api_key", value.as_bytes()).is_some(), level == ProtectionLevel::AppBound);
             assert!(key.credential_fingerprint("api_key", "guessable".repeat(8).as_bytes()).is_none());
+        }
+    }
+}
+
+fn native_engine_socket_policy() -> Option<duduclaw_core::root_key::policy::PolicyStatus> {
+    #[cfg(target_os = "linux")]
+    if duduclaw_core::root_key::state_kind() != duduclaw_core::root_key::StateKind::NotOffered
+        && std::env::var_os(duduclaw_core::root_key::MODE_ENV).as_deref()
+            == Some(std::ffi::OsStr::new("native-systemd")) {
+        return Some(duduclaw_core::root_key::policy::status());
+    }
+    None
+}
+
+fn apply_engine_socket_warning(summary: &mut String, detail: &mut String,
+    policy: Option<&duduclaw_core::root_key::policy::PolicyStatus>) {
+    if let Some(policy) = policy.filter(|policy| policy.warning_active) {
+        summary.push('；');
+        summary.push_str(duduclaw_core::root_key::policy::WARNING_ZH);
+        detail.push('。');
+        detail.push_str(&policy.risk_zh);
+        if let Some(probe) = &policy.detail {
+            detail.push('。');
+            detail.push_str(probe);
         }
     }
 }

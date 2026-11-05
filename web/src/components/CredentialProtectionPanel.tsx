@@ -46,6 +46,7 @@ const ROOT_KEY_REFUSALS = new Set([
   'exe_ancestor_writable',
   'supplementary_groups',
   'engine_socket_reachable',
+  'engine_socket_probe_failed',
   'engine_socket',
   'mount_scan_incomplete',
   'inactive',
@@ -135,6 +136,7 @@ export function CredentialProtectionPanel() {
   const containerState = container && ['not_enabled', 'missing', 'key_changed', 'unavailable'].includes(state ?? '');
   const recovery = status?.root_key_recovery;
   const latestRevocation = recovery?.latest_revocation;
+  const enginePolicy = status?.engine_socket_policy;
   const dockerCliRootHint = latestRevocation?.reason === 'engine_socket_reachable'
     && latestRevocation.detail?.length === 63
     && /^@docker_cli_[0-9a-f]{32}: peer uid=0 \(root\)$/.test(latestRevocation.detail);
@@ -149,7 +151,7 @@ export function CredentialProtectionPanel() {
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-sm font-medium">
-          {ready ? (
+          {ready && !enginePolicy?.warning_active ? (
             <ShieldCheck className="size-4 text-success" />
           ) : (
             <ShieldAlert className="size-4 text-warning" />
@@ -218,6 +220,31 @@ export function CredentialProtectionPanel() {
                     : 'history'}`,
                 })}</p>
               </div>
+            )}
+            {enginePolicy && (
+              <section
+                className="space-y-2 break-words rounded-md border border-surface-border p-3 text-sm"
+                data-testid="credential-protection-engine-policy"
+              >
+                <p className="font-medium">{intl.formatMessage(
+                  { id: 'security.credentialProtection.enginePolicy.current' },
+                  { action: intl.formatMessage({ id: `security.credentialProtection.enginePolicy.${enginePolicy.action === 'warn' ? 'warn' : 'revoke'}` }) },
+                )}</p>
+                {enginePolicy.warning_active && (
+                  <p role="alert" className="font-medium text-warning">
+                    {intl.formatMessage({ id: 'security.credentialProtection.enginePolicy.active' })}
+                  </p>
+                )}
+                <p className="text-muted-foreground">{intl.formatMessage({ id: 'security.credentialProtection.enginePolicy.risk' })}</p>
+                {enginePolicy.warning_active && enginePolicy.detail && (
+                  <p className="font-mono text-xs">{enginePolicy.detail}</p>
+                )}
+                <p className="text-muted-foreground">{intl.formatMessage({ id: 'security.credentialProtection.enginePolicy.command' })}</p>
+                {/* The gateway sanitizes these fixed operator commands; render only text. */}
+                <code className="block whitespace-pre-wrap rounded-md bg-secondary px-3 py-2 font-mono text-xs">
+                  {enginePolicy.action === 'warn' ? enginePolicy.command_revoke : enginePolicy.command_warn}
+                </code>
+              </section>
             )}
             {state === 'needs_authorization' && (
               <code className="block rounded-md bg-secondary px-3 py-2 font-mono text-xs">

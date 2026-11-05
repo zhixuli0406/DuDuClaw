@@ -47,6 +47,7 @@ pub(crate) fn status_json(s: &ProtectionStatus) -> Value {
         "detail": sanitize_output_text(&s.detail_zh),
         "refusal_reason": s.refusal_reason,
         "root_key_recovery": s.root_key_recovery,
+        "engine_socket_policy": s.engine_socket_policy,
     }))
 }
 
@@ -112,6 +113,9 @@ impl MethodHandler {
         match on_blocking(self.home_dir.clone(), |cp| cp.status()).await {
             Ok(s) => {
                 audit_broken_once(&self.home_dir, &s);
+                if let Ok(index) = self.audit_index().await {
+                    crate::protected_policy_audit::drain(&self.home_dir, &index).await;
+                }
                 WsFrame::ok_response("", status_json(&s))
             }
             Err(e) => WsFrame::error_response("", &sanitize_output_text(&e)),

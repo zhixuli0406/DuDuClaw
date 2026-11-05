@@ -13,6 +13,9 @@ mod migrate;
 #[path = "protected_linux_runtime.rs"]
 mod runtime;
 
+#[path = "protected_linux_policy.rs"]
+pub(crate) mod policy;
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct InstallOptions {
     pub enable_now: bool,
@@ -63,7 +66,7 @@ pub(crate) fn uninstall() -> Result<()> {
 
 fn operator_gate() -> Result<()> {
     if !crate::ai_session_guard::command_markers().is_empty() {
-        return Err(refused("AI 員工不能安裝、升級或移除受保護服務，請由管理者在自己的終端機操作。"));
+        return Err(refused("AI 員工不能安裝、升級、移除受保護服務或變更其政策，請由管理者在自己的終端機操作。"));
     }
     Ok(())
 }

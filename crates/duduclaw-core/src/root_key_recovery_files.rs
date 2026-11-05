@@ -77,16 +77,24 @@ impl StateDir {
     }
 
     pub(super) fn read_json<T: serde::de::DeserializeOwned>(&self, name: &str) -> io::Result<T> {
+        self.read_json_bounded(name, 16384)
+    }
+
+    pub(super) fn read_json_bounded<T: serde::de::DeserializeOwned>(&self, name: &str, limit: u64) -> io::Result<T> {
         use std::io::Read;
         let file = self.open_at(name, libc::O_RDONLY, 0)?;
         Self::validate_file(&file)?;
         let mut bytes = Vec::new();
-        file.take(16385).read_to_end(&mut bytes)?;
-        if bytes.len() > 16384 { return Err(io::Error::other("recovery state file too large")); }
+        file.take(limit + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit { return Err(io::Error::other("recovery state file too large")); }
         serde_json::from_slice(&bytes).map_err(io::Error::other)
     }
 
     pub(super) fn write_json(&self, name: &str, value: &impl Serialize) -> io::Result<()> {
+        self.write_json_bounded(name, value, 16384)
+    }
+
+    pub(super) fn write_json_bounded(&self, name: &str, value: &impl Serialize, limit: u64) -> io::Result<()> {
         use std::io::Write;
         use std::os::fd::AsRawFd;
         // Refuse suspicious existing files, including hard links and symlinks.
@@ -97,7 +105,7 @@ impl StateDir {
             Err(error) => return Err(error),
         }
         let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
-        if bytes.len() > 16384 { return Err(io::Error::other("recovery state file too large")); }
+        if bytes.len() as u64 > limit { return Err(io::Error::other("recovery state file too large")); }
         let temp_name = format!(".root-key-{}.tmp", uuid::Uuid::new_v4());
         let temp = Self::name(&temp_name)?;
         let target = Self::name(name)?;
@@ -122,6 +130,8 @@ impl StateDir {
 impl StateDir {
     pub(super) fn open_home(_: &Path, _: bool) -> io::Result<Self> { Err(io::ErrorKind::Unsupported.into()) }
     pub(super) fn budget_lock(&self) -> io::Result<std::fs::File> { Err(io::ErrorKind::Unsupported.into()) }
+    pub(super) fn read_json_bounded<T: serde::de::DeserializeOwned>(&self, _: &str, _: u64) -> io::Result<T> { Err(io::ErrorKind::Unsupported.into()) }
+    pub(super) fn write_json_bounded(&self, _: &str, _: &impl Serialize, _: u64) -> io::Result<()> { Err(io::ErrorKind::Unsupported.into()) }
     pub(super) fn read_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> io::Result<T> { Err(io::ErrorKind::Unsupported.into()) }
     pub(super) fn write_json(&self, _: &str, _: &impl Serialize) -> io::Result<()> { Err(io::ErrorKind::Unsupported.into()) }
 }
