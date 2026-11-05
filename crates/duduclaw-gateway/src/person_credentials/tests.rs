@@ -435,3 +435,13 @@ fn incremental_publication_rejects_downgrade_and_concurrent_refresh() {
     assert!(connect_with_previous(home.path(), &key, next, &secret(), epoch, Some(&old)).is_err());
     assert_eq!(std::fs::read(path(home.path())).unwrap(), refreshed);
 }
+
+#[test]
+fn google_chat_local_purpose_is_valid_only_as_known_bounded_consent() {
+    let mut meta = metadata("user-a");
+    meta.local_purposes = ["base", "meeting_recordings", "drive_tools", "chat_read"]
+        .iter().map(|p| p.to_string()).collect();
+    assert!(valid_metadata(&meta));
+    meta.local_purposes[3] = "chat_write".into();
+    assert!(!valid_metadata(&meta));
+}

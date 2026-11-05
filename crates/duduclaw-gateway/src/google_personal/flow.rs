@@ -98,6 +98,7 @@ async fn start_consent(
     } else {
         None
     };
+    let chat_read = !meeting_recordings && !drive_tools && crate::google_workspace::chat_read_enabled(home);
     let epoch = vault::begin_connection(home, user)?;
     let google_data_consent = crate::google_data_consent::Evidence::issue(user)?;
     pending::cancel_user(home, user);
@@ -114,16 +115,16 @@ async fn start_consent(
         epoch,
         meeting_recordings,
         drive_tools,
+        chat_read,
         expected_connection,
         google_data_consent,
         created: Instant::now(),
         code: None,
     });
-    let authorization_url = if drive_tools {
-        oauth::authorization_url_with_drive_tools(&client.client_id, &redirect_uri, &state, &challenge)?
-    } else {
-        oauth::authorization_url_with_meetings(&client.client_id, &redirect_uri, &state, &challenge, meeting_recordings)?
-    };
+    let authorization_url = oauth::authorization_url_for(
+        &client.client_id, &redirect_uri, &state, &challenge,
+        meeting_recordings, drive_tools, chat_read,
+    )?;
     Ok(
         json!({ "authorization_url": authorization_url, "state": state, "completion": if paste { "paste" } else { "redirect" }, "redirect_uri": redirect_uri, "expires_in": 600 }),
     )
@@ -176,6 +177,10 @@ pub async fn finish(
     if !local_purposes.iter().any(|p| p == purpose) {
         local_purposes.push(purpose.into());
     }
+    if pending.chat_read && crate::google_workspace::CHAT_READ_SCOPES.iter()
+        .all(|scope| scopes.iter().any(|granted| granted == scope)) {
+        local_purposes.push("chat_read".into());
+    }
     local_purposes.sort();
     local_purposes.dedup();
     let mut expected_scopes = oauth::requested_scopes(pending.meeting_recordings, pending.drive_tools)
@@ -186,6 +191,9 @@ pub async fn finish(
         expected_scopes.extend(oauth::requested_scopes(
             granted_purpose == "meeting_recordings", granted_purpose == "drive_tools",
         ).into_iter().map(str::to_string));
+    }
+    if local_purposes.iter().any(|purpose| purpose == "chat_read") {
+        expected_scopes.extend(crate::google_workspace::CHAT_READ_SCOPES.iter().map(|s| s.to_string()));
     }
     let mut unexpected_scopes: Vec<_> = scopes.iter()
         .filter(|scope| !expected_scopes.contains(scope)).cloned().collect();

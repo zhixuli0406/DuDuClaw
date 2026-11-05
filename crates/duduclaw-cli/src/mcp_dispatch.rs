@@ -4647,6 +4647,8 @@ effect = "forbid"
         "group_history_read",
         "gmail_create_draft",
         "gmail_read",
+        "google_chat_spaces",
+        "google_chat_messages",
         "gmail_search",
         "goals_create",
         "goals_list",

@@ -1,10 +1,10 @@
 # Google Workspace ツールと安全モデル
 
-設定は [Google を接続する](google-setup.md)を参照してください。ネイティブ REST は八サービス・十九ツール、Apps Script は三サービス・状態確認込み八アクションに対応します。連携がオフでもダッシュボードは表示され、ツールは `[integrations] google_workspace = true` で有効になります。共用 OAuth 認証情報は同梱しません。
+設定は [Google を接続する](google-setup.md)を参照してください。ネイティブ REST は九サービス・二十一ツール、Apps Script は三サービス・状態確認込み八アクションに対応します。連携がオフでもダッシュボードは表示され、ツールは `[integrations] google_workspace = true` で有効になります。共用 OAuth 認証情報は同梱しません。
 
 ## 何が使えるようになるか
 
-2つのスコープ(`google:read` / `google:write`)で管理される、19個のエージェント向け
+2つのスコープ(`google:read` / `google:write`)で管理される、21個のエージェント向け
 MCPツールです。
 
 | ツール | 分類 | 内容 |
@@ -12,6 +12,8 @@ MCPツールです。
 | `google_status` | read | 経路別の身分・認証情報を診断。サービス読取の証明にはならず、連携または社員の Google が無効なら非表示。 |
 | `gmail_search` | read | Gmailのクエリ構文(`from:… is:unread`など)でメールボックスを検索。送信者／件名／日付／スニペットを返す。 |
 | `gmail_read` | read | 1件のメッセージを全文読み取る: ヘッダー、プレーンテキスト本文(長い場合は切り詰め)、添付ファイル一覧(ファイル名とサイズのみ、ダウンロードは行わない)。 |
+| `google_chat_spaces` | read | 接続したユーザーのスペース、グループチャット、DM を一覧表示。Chat 読み取りの有効化が必要。 |
+| `google_chat_messages` | read | 最近の Chat メッセージを検査済みの参照データとして読み取り。添付は名前のみ。 |
 | `gmail_create_draft` | write | Gmailの**下書き**を作成する。送信は行わない。送信は常に人間が手動で行う。 |
 | `calendar_list_events` | read | プライマリカレンダーのイベントを一覧表示する(デフォルトは今後7日間)。 |
 | `calendar_create_event` | write | 実際に外部から見えるイベントを作成する。Google Meetリンクをオプションで付与可能。 |
@@ -67,6 +69,21 @@ MCPツールです。
   approval_required_tools = ["gmail_create_draft", "calendar_create_event", "sheets_append", "gtasks_create", "gtasks_complete", "docs_append"]
   ```
 
+## 個人の Google Chat 会話を読む（オプトイン）
+
+`google_chat_spaces` は接続したユーザーが参加するスペース、グループチャット、DM を一覧表示します。リソース名、表示名、種類、Google が返す場合は最終活動時刻を含みます。`limit` は既定 20（1–50）、`filter` は `SPACE`、`GROUP_CHAT`、`DIRECT_MESSAGE` のいずれかです。
+
+`google_chat_messages` は厳密に検証した `spaces/...` の最近のメッセージを新しい順に読みます。`limit` は既定 30（1–100）、任意の `since` は RFC3339、`thread` は同じスペース内のスレッドリソース名です。送信者、作成時刻、本文（1件最大 2,000 文字）、スレッド、添付ファイル名を返し、添付はダウンロードしません。表示名がない送信者は `users/...` で示し、People API や追加のメンバー権限は使用しません。応答全体は最大 30,000 文字です。
+
+1. 管理者が Google 接続画面で **Google Chat 読み取り**を有効にします（`[google] chat_read = true`、既定 false）。
+2. ユーザーは「自分の接続」から自分の Google アカウントを再接続し、Chat の読み取り権限を両方選択します。追加スコープは `https://www.googleapis.com/auth/chat.spaces.readonly` と `https://www.googleapis.com/auth/chat.messages.readonly`。無効時は既存ユーザーに追加同意を求めません。
+3. OAuth クライアントの Google Cloud プロジェクトで **Google Chat API** を有効化し、**Chat アプリ**を構成します。ユーザー認証でも必要です。Workspace 管理者によるアプリ許可が必要な場合もあります。
+
+Gmail 読み取りと同じ社員・アカウントの紐付け、スコープ、承認、私有データの送信制御を使用します。既存の身分ポリシーが選択したアカウントを使い、任意のユーザー指定は受け付けません。Apps Script はこの Chat 読み取りに対応しません。DM とメンションを受信する Chat ボットとは別の機能です。無効化すると既存トークンでの新たな読み取りも拒否しますが、Google 側の同意を取り消すものではありません。
+
+応答は信頼しない参照データとして包み、グループ履歴と同じ注入検査を行います。1件でも検出すると応答全体を `not available` として拒否します。監査にはスペース ID と件数のみを記録し、本文は残しません。固定データ・ローカルテストは実アカウントでの成功を保証しないため、納品前に実際の同意・読み取りを検証してください。
+
+
 ## AI 社員ごとに別の Google アカウントを使う（会社の委任、v1.76.0）
 
 既定では、すべての AI 社員が下で設定する 1 つの Google アカウント（会社の共用アカウント）を使います。Google Workspace の顧客は、社員ごとに指定した同僚として使わせることもできます。営業アシスタントは `alice@customer.com` のメールボックスで読んで下書きし、日程アシスタントは `bob@customer.com` のカレンダーを扱います。ドメイン全体の委任を設定したサービスアカウント 1 つを全員で使い、社員ごとに代わりに動く同僚を指定します。
@@ -103,7 +120,7 @@ default_identity = "home"   # [google] のない社員が使うもの：home（�
 allowed_subject_domains = ["customer.com"]
 ```
 
-`[google]` のない社員は `default_identity` を使うので、既存のインストールの動作は変わりません。`none` は 19 個の Google ツールを隠して呼び出しも拒否します。不正な値は共用アカウントへ切り替えず拒否します。Enterprise では `owner` と `user:<id>` を使えますが、有効な直接 Owner と本人の明示的な同意が必要です。[個人 Google 接続（v1.76.0）](google-personal-connections.md)を参照してください。
+`[google]` のない社員は `default_identity` を使うので、既存のインストールの動作は変わりません。`none` は 21 個の Google ツールを隠して呼び出しも拒否します。不正な値は共用アカウントへ切り替えず拒否します。Enterprise では `owner` と `user:<id>` を使えますが、有効な直接 Owner と本人の明示的な同意が必要です。[個人 Google 接続（v1.76.0）](google-personal-connections.md)を参照してください。
 
 ### この社員を通じて誰がアカウントを使えるか
 
@@ -132,7 +149,7 @@ Web サイトの公開訪問者（WebChat ウィジェット、Odoo ライブチ
 
 ### 社員専用 API key と Google MCP マウント（v1.76.0）
 
-検証済みの社員専用 API key に `google:read` または `google:write` が明示されている場合、閉じた 19 個の Google ツールのうち対応するものを使えます。`admin` だけでは代用できず、実在する社員と読める設定が必要です。一般の外部キーに付与できる権限やほかの連携は変わりません。OAuth 認証からこの実行用の証明は作られません。社員に紐づかない正規の内部カスタム連携キーは、従来の Home 経路を保ちます。
+検証済みの社員専用 API key に `google:read` または `google:write` が明示されている場合、閉じた 21 個の Google ツールのうち対応するものを使えます。`admin` だけでは代用できず、実在する社員と読める設定が必要です。一般の外部キーに付与できる権限やほかの連携は変わりません。OAuth 認証からこの実行用の証明は作られません。社員に紐づかない正規の内部カスタム連携キーは、従来の Home 経路を保ちます。
 
 社員の許可／拒否ツール、動作ルール、PolicyKernel、期限付き権限、承認要求は引き続き適用されます。承認待ちの間も、受理した社員、ツール、最終引数は固定されます。キーの失効、社員の削除、権限変更は拒否となり、プロセスの別の身元や別アカウントには切り替わりません。gateway が Google 操作を実行し、外部 MCP クライアントにはサイズ制限付きの結果だけを返します。Google bearer は返しません。
 

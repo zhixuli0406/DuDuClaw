@@ -2,6 +2,8 @@
 use serde_json::{Value, json};
 
 pub(crate) enum ParsedNativeArguments {
+    ChatSpaces(super::chat_read::SpacesArgs),
+    ChatMessages(super::chat_read::MessagesArgs),
     GmailSearch {
         query: String,
         max: u32,
@@ -134,6 +136,8 @@ fn timestamp(label: &str, value: &str, example: &str) -> Result<(), String> {
 impl NativeCallTemplate {
     pub(crate) fn prepare(tool: &str, args: &Value) -> Result<Self, String> {
         let parsed = match tool {
+            "google_chat_spaces" => ParsedNativeArguments::ChatSpaces(super::chat_read::spaces_args(args)?),
+            "google_chat_messages" => ParsedNativeArguments::ChatMessages(super::chat_read::messages_args(args)?),
             "gmail_search" => ParsedNativeArguments::GmailSearch {
                 query: required(args, "query", false, true)?,
                 max: number(args, "max_results", 10),

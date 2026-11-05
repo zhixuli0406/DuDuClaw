@@ -208,6 +208,7 @@ impl MethodHandler {
         requests.sort_by_key(|r| r.get("allowed").is_some_and(|v| !v.is_null()));
         Ok(
             json!({"connection":own,"login_email":ctx.email,"client_configured":crate::mcp_oauth::get_client_config(&self.home_dir,"google").is_some(),
+            "chat_read":crate::google_workspace::chat_read_enabled(&self.home_dir),
             "integration_enabled":crate::google_workspace::integration_enabled(&self.home_dir),"requests":requests,"delegated":delegated,
             "requires_login":google_personal::session_for(&ctx.user_id).is_err(),"recent_usage":google_personal::history::recent(&self.home_dir,&ctx.user_id,&ctx.email)?}),
         )

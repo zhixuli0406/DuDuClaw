@@ -1,6 +1,7 @@
 use super::*;
 
 pub(crate) use duduclaw_gateway::google_identity::native_tools::{
+    handle_google_chat_spaces, handle_google_chat_messages,
     arg_u32, arg_u64, handle_calendar_create_event, handle_calendar_list_events,
     handle_docs_append, handle_docs_read, handle_drive_read, handle_drive_search, handle_forms_get,
     handle_forms_list_responses, handle_gmail_create_draft, handle_gmail_read, handle_gmail_search,

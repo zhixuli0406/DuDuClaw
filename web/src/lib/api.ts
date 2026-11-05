@@ -5880,6 +5880,7 @@ export interface GoogleServiceProbe {
 }
 
 export interface GoogleCredentialsStatus {
+  chat_read?: boolean;
   /** `config.toml [integrations] google_workspace` — the master gate. */
   integration_enabled: boolean;
   /** Which path a real tool call would take right now. */
@@ -5956,6 +5957,7 @@ export interface UserInviteResult {
 export type UserInviteState = 'none' | 'pending' | 'expired' | 'used';
 
 export interface PersonalGoogleStatus {
+  chat_read?: boolean;
   connection: { owner_id: string; account_email: string; granted_scopes: string[]; local_purposes?: string[]; status: 'connected' | 'needs_reconnect' | 'suspended'; connected_at: string } | null;
   login_email: string;
   client_configured: boolean;
@@ -8043,6 +8045,7 @@ export const api = {
    * `get` never returns the stored bridge secret — only whether one is set.
    */
   googleCredentials: {
+    setChatRead: (chatRead: boolean) => client.call('google.integration.set', { chat_read: chatRead }) as Promise<{ chat_read: boolean; changed: boolean }>,
     get: () => client.call('google.credentials.get') as Promise<GoogleCredentialsStatus>,
     set: (params: GoogleCredentialsInput) =>
       client.call('google.credentials.set', params).then(notifyDisconnectForget) as Promise<{ ok: boolean; mode: string; staged?: boolean }>,

@@ -162,7 +162,11 @@ pub(super) fn check_metadata_authority(
     if tool != "google_status" && !scopes::permitted_for(tool, metadata) {
         return Err(Refusal::hard(
             "scope_missing",
-            "你連結 Google 時沒有開放這項服務；請重新連結，並勾選這次需要的服務。",
+            if matches!(tool, "google_chat_spaces" | "google_chat_messages") {
+                crate::google_workspace::chat_read::GUIDANCE
+            } else {
+                "你連結 Google 時沒有開放這項服務；請重新連結，並勾選這次需要的服務。"
+            },
         ));
     }
     Ok(())

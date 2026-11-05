@@ -1,16 +1,18 @@
 # Google Workspace 工具與安全模型
 
-設定步驟見[連接 Google](google-setup.md)。原生 REST 涵蓋八項服務、十九個工具；Apps Script 涵蓋三項服務，含狀態查詢共八個動作。整合關閉時仍可開啟儀表板，工具要等 `[integrations] google_workspace = true` 才會顯示。DuDuClaw 不提供共用 OAuth 憑證。
+設定步驟見[連接 Google](google-setup.md)。原生 REST 涵蓋九項服務、二十一個工具；Apps Script 涵蓋三項服務，含狀態查詢共八個動作。整合關閉時仍可開啟儀表板，工具要等 `[integrations] google_workspace = true` 才會顯示。DuDuClaw 不提供共用 OAuth 憑證。
 
 ## 你會拿到什麼
 
-十九個面向 agent 的 MCP 工具，由兩個 scope 管控（`google:read` / `google:write`）：
+二十一個面向 agent 的 MCP 工具，由兩個 scope 管控（`google:read` / `google:write`）：
 
 | 工具 | 類別 | 做什麼 |
 |------|-------|--------------|
 | `google_status` | read | 依帳號路徑回報身分與憑證診斷，不能證明各服務可讀。整合或員工 Google 身分停用時隱藏。 |
 | `gmail_search` | read | 用 Gmail 查詢語法搜尋信箱（`from:… is:unread` 等）。回傳寄件者／主旨／日期／摘要。 |
 | `gmail_read` | read | 完整讀取一封信：標頭、純文字內文（過長會截斷）、附件清單（只列檔名與大小，絕不下載）。 |
+| `google_chat_spaces` | read | 列出已連結帳號的聊天室、群聊與私訊，需先啟用 Chat 讀取。 |
+| `google_chat_messages` | read | 讀取近期 Chat 訊息，回傳經掃描的參考資料；附件只列名稱。 |
 | `gmail_create_draft` | write | 建立一封 Gmail **草稿**。永不寄出，寄信永遠是人工動作。 |
 | `calendar_list_events` | read | 列出主行事曆的活動（預設列出未來 7 天）。 |
 | `calendar_create_event` | write | 建立一個真實、對外可見的活動；可選擇附上 Google Meet 連結。 |
@@ -63,6 +65,21 @@
   approval_required_tools = ["gmail_create_draft", "calendar_create_event", "sheets_append", "gtasks_create", "gtasks_complete", "docs_append"]
   ```
 
+## 讀取個人 Google Chat 對話（選擇啟用）
+
+`google_chat_spaces` 列出已連結帳號加入的聊天室、群聊與私訊，包含資源名稱、顯示名稱、類型及 Google 有提供的最後活動時間。`limit` 預設 20，範圍 1–50；`filter` 僅接受 `SPACE`、`GROUP_CHAT` 或 `DIRECT_MESSAGE`。
+
+`google_chat_messages` 以嚴格驗證的 `spaces/...` 資源名稱讀取近期訊息，從新到舊排列。`limit` 預設 30，範圍 1–100；選填 `since` 必須是 RFC3339 時間，`thread` 必須是該聊天室內的討論串資源名稱。回傳發送者、建立時間、文字（每則最多 2,000 字元）、討論串及附件名稱，不下載附件。發送者名稱採 Google 回傳的顯示名稱，缺少時顯示 `users/...`；不呼叫 People API，也不另索取會員權限。整份回覆最多 30,000 字元。
+
+1. 管理員在 Google 連線頁啟用「Google Chat 讀取」（`[google] chat_read = true`，預設 false）。
+2. 使用者到「我的連線」重新連結自己的 Google 帳號，勾選兩項 Chat 讀取權限。額外 scope 為 `https://www.googleapis.com/auth/chat.spaces.readonly` 與 `https://www.googleapis.com/auth/chat.messages.readonly`；開關關閉時不會要求既有使用者追加同意。
+3. 在 OAuth 用戶端所屬的 Google Cloud 專案啟用 **Google Chat API**，並完成 **Chat 應用程式設定**，即使使用個人帳號授權也需要。Workspace 管理員可能還需允許這個 OAuth 應用程式。
+
+兩項工具沿用 Gmail 讀取的員工與帳號綁定、scope、核准及私有資料外送閘，使用既有身分政策選定的帳號，不接受任意指定使用者或帳號的參數。Apps Script 不支援這兩項讀取。這與只接收私訊和提及的 Chat 機器人通道不同。關閉開關會阻止後續讀取，即使權杖仍有效；不會撤銷 Google 端已同意的權限。
+
+回傳內容只作為不可信參考資料，使用群組歷史的包覆格式與注入掃描；任何命中都會拒絕整次回覆，顯示 `not available`。稽核僅保留聊天室識別碼與數量，不記錄訊息文字。本機與固定資料測試不代表真實帳號可讀，交付前仍須以客戶帳號驗證同意流程及讀取結果。
+
+
 ## 每位 AI 員工用不同的 Google 帳號（公司授權代表，v1.76.0）
 
 預設所有 AI 員工共用下方設定的那一個 Google 帳號（公司共用帳號）。Google Workspace 客戶可以改成讓每位員工代表一位指定的同事：業務助理在 `alice@customer.com` 的信箱裡讀信、存草稿，排程助理管理 `bob@customer.com` 的日曆。全部共用一個開了網域委派的服務帳號，每位員工各自指定代表的同事。
@@ -99,7 +116,7 @@ default_identity = "home"   # 沒寫 [google] 的員工用什麼：home（預設
 allowed_subject_domains = ["customer.com"]
 ```
 
-沒寫 `[google]` 的員工用 `default_identity`，所以既有安裝的行為完全不變。`none` 會讓這位員工看不到 19 個 Google 工具，呼叫也會被拒。讀不懂的值（打錯字、不認得的欄位）會讓這位員工的 Google 工具全部拒絕，絕不會變成公司共用帳號。企業版可用 `owner` 與 `user:<id>`，但指定人必須是有效的直接 Owner，且本人明確同意；見[連結自己的 Google（v1.76.0）](google-personal-connections.md)。
+沒寫 `[google]` 的員工用 `default_identity`，所以既有安裝的行為完全不變。`none` 會讓這位員工看不到 21 個 Google 工具，呼叫也會被拒。讀不懂的值（打錯字、不認得的欄位）會讓這位員工的 Google 工具全部拒絕，絕不會變成公司共用帳號。企業版可用 `owner` 與 `user:<id>`，但指定人必須是有效的直接 Owner，且本人明確同意；見[連結自己的 Google（v1.76.0）](google-personal-connections.md)。
 
 ### 誰能透過這位員工使用這個帳號
 
@@ -128,7 +145,7 @@ allowed_subject_domains = ["customer.com"]
 
 ### 員工專用 API key 與 Google MCP 掛載（v1.76.0）
 
-通過驗證、綁定真實員工的專用 API key，明確帶有 `google:read` 或 `google:write` 時，可以使用 19 個原生 Google 工具中相應的工具。只有 `admin` 不算；員工設定也必須可讀。一般外部金鑰可申請的權限與其他連接器不變，OAuth 驗證不會產生這條執行路徑需要的憑證。沒有綁定員工的合法內部整合金鑰，仍保留原本的公司共用帳號路徑。
+通過驗證、綁定真實員工的專用 API key，明確帶有 `google:read` 或 `google:write` 時，可以使用 21 個原生 Google 工具中相應的工具。只有 `admin` 不算；員工設定也必須可讀。一般外部金鑰可申請的權限與其他連接器不變，OAuth 驗證不會產生這條執行路徑需要的憑證。沒有綁定員工的合法內部整合金鑰，仍保留原本的公司共用帳號路徑。
 
 這些呼叫仍受員工的工具允許／拒絕清單、動作規則、PolicyKernel、階段性授權與人工審批限制。等審批時，已接受的員工、工具與最終參數固定不變。金鑰失效、員工被移除或授權設定改變，只會拒絕，不會改用行程的其他身分或別的帳號。Google 操作由 gateway 執行，外部 MCP 用戶端拿到有大小限制的工具結果，不會拿到 Google bearer。
 

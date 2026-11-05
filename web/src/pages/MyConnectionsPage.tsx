@@ -58,12 +58,13 @@ export function MyConnectionsPage() {
         <Link to="/mail" className="text-sm underline">{t('nav.mail')}</Link>
         {status.connection.account_email.toLowerCase() !== status.login_email.toLowerCase() && <p className="text-sm text-warning">{t('myConnections.different',{email:status.login_email})}</p>}
         <p className="text-sm">{t('myConnections.connectedAt',{time:new Date(status.connection.connected_at).toLocaleString(intl.locale)})}</p>
-        <p className="text-sm">{t('myConnections.services')}: {['gmail','calendar','drive','spreadsheets','documents','presentations','forms','tasks'].filter(service=>status.connection!.local_purposes?.includes(service === 'drive' ? 'drive_tools' : 'base') && status.connection!.granted_scopes.some(scope=>service === 'drive' ? ['https://www.googleapis.com/auth/drive.readonly','https://www.googleapis.com/auth/drive'].includes(scope) : scope.includes(service))).map(service=>t(`myConnections.service.${service}`)).join('、') || t('myConnections.noServices')}</p>
+        <p className="text-sm">{t('myConnections.services')}: {['gmail','calendar','drive','spreadsheets','documents','presentations','forms','tasks','chat'].filter(service=>status.connection!.local_purposes?.includes(service === 'drive' ? 'drive_tools' : service === 'chat' ? 'chat_read' : 'base') && status.connection!.granted_scopes.some(scope=>service === 'drive' ? ['https://www.googleapis.com/auth/drive.readonly','https://www.googleapis.com/auth/drive'].includes(scope) : scope.includes(service))).map(service=>t(`myConnections.service.${service}`)).join('、') || t('myConnections.noServices')}</p>
       </>}
       {!status.client_configured && <p>{t('myConnections.noClient')}</p>}
       {!status.integration_enabled && <p className="text-sm text-warning">{t('myConnections.integrationOff')}</p>}
       {status.requires_login && <p className="text-sm text-warning">{t('myConnections.loginAgain')}</p>}
       <p className="text-xs text-muted-foreground">{t('myConnections.testing')}</p>
+      {status.chat_read && <p className="text-sm text-muted-foreground">{t('google.chatRead.hint')}</p>}
       <GoogleDataDisclosure confirmed={googleDataConfirmed} onConfirmedChange={setGoogleDataConfirmed}/>
       <Button disabled={busy||!status.client_configured||status.requires_login||!googleDataConfirmed} onClick={()=>void connect()}>{status.connection ? t('myConnections.reconnect') : t('myConnections.connect')}</Button>
       {status.connection && <section className="space-y-3 rounded-lg border border-border p-4" aria-labelledby="meeting-google-consent">

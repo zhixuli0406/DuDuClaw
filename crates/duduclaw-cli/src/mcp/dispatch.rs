@@ -746,6 +746,8 @@ pub(crate) async fn handle_tools_call(
                 .await
         }
         "google_status" => handle_google_status(home_dir, &google_caller).await,
+        "google_chat_spaces" => handle_google_chat_spaces(&arguments, home_dir, &google_caller).await,
+        "google_chat_messages" => handle_google_chat_messages(&arguments, home_dir, &google_caller).await,
         "gmail_search" => handle_gmail_search(&arguments, home_dir, &google_caller).await,
         "gmail_read" => handle_gmail_read(&arguments, home_dir, &google_caller).await,
         "gmail_create_draft" => {
@@ -874,6 +876,11 @@ pub(crate) async fn handle_tools_call(
             Some(&audit_arguments),
             result_text_for_grounding.as_deref(),
         );
+    }
+
+    if matches!(tool_name, "google_chat_spaces" | "google_chat_messages") && !google_caller.is_dedicated() {
+        let agent = resolve_audit_agent(home_dir, Some(principal), default_agent);
+        duduclaw_gateway::google_workspace::chat_read::audit(home_dir, &agent, tool_name, &arguments, &result);
     }
 
     // Read-only tools need usage evidence too. Do not retain arguments or

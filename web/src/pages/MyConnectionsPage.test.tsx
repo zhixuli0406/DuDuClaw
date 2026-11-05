@@ -106,3 +106,9 @@ describe('MyConnectionsPage', () => {
     await waitFor(() => expect(consent).toHaveBeenCalledWith('helper',true));
   });
 });
+
+it('shows Chat reconnect guidance after the administrator opts in', async () => {
+  vi.mocked(api.personalGoogle.status).mockResolvedValue({...status,chat_read:true});
+  renderWithProviders(<MyConnectionsPage/>);
+  expect(await screen.findByText(/users reconnect Google in My Connections/)).toBeInTheDocument();
+});
