@@ -57,6 +57,31 @@ impl GatewayImportWriter {
         Ok(Self { home: home.to_path_buf(), archive, materialization, memory, sessions })
     }
 
+    // Keep rusqlite's !Send transaction out of the async apply state machine,
+    // including its early-error/rollback paths. Commit before materialization.
+    fn archive_records(&mut self, staged: &StagedImport, migration: &str, rejected: bool) -> Result<(), Error> {
+        let tx = self.archive.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for record in staged.records() {
+            let payload = serde_json::to_string(record)?;
+            let id = content_record_id(migration, &staged.grant().source_id, &record.source_record_id);
+            let existing: Option<String> = tx.query_row("SELECT payload FROM legacy_content WHERE id=?1", [&id], |r| r.get(0)).optional()?;
+            if existing.as_ref().is_some_and(|old| old != &payload) { return Err(Error::Conflict); }
+            if rejected {
+                tx.execute("DELETE FROM legacy_content WHERE id=?1 AND materialized=0",[&id])?;
+            } else {
+                tx.execute("INSERT OR IGNORE INTO legacy_content(id,migration,agent,source_id,payload) VALUES (?1,?2,?3,?4,?5)",
+                    params![id, migration, Option::<String>::None, record.source_record_id, payload])?;
+            }
+            // Upgrade the pre-materialization archive identity without retaining
+            // a second plaintext copy. Older imports never materialized None.
+            let old_id=record_id(migration,None,&record.source_record_id);
+            tx.execute("DELETE FROM legacy_content WHERE id=?1 AND id<>?2 AND payload=?3 AND agent IS NULL AND materialized=0",
+                params![old_id,id,payload])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub async fn apply(&mut self, staged: &StagedImport, gate: &impl ImportModeGate) -> Result<u64, Error> {
         gate.readback_import_only()?;
         let agent = gate.authorize(staged.grant())?;
@@ -80,25 +105,7 @@ impl GatewayImportWriter {
         }
         let migration = format!("legacy_import:{}", hex(&staged.grant().migration_id.0));
         let rejected=matches!(&decision,Some(MaterializationDecision::Rejected { .. }));
-        let tx = self.archive.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        for record in staged.records() {
-            let payload = serde_json::to_string(record)?;
-            let id = content_record_id(&migration, &staged.grant().source_id, &record.source_record_id);
-            let existing: Option<String> = tx.query_row("SELECT payload FROM legacy_content WHERE id=?1", [&id], |r| r.get(0)).optional()?;
-            if existing.as_ref().is_some_and(|old| old != &payload) { return Err(Error::Conflict); }
-            if rejected {
-                tx.execute("DELETE FROM legacy_content WHERE id=?1 AND materialized=0",[&id])?;
-            } else {
-                tx.execute("INSERT OR IGNORE INTO legacy_content(id,migration,agent,source_id,payload) VALUES (?1,?2,?3,?4,?5)",
-                    params![id, migration, Option::<String>::None, record.source_record_id, payload])?;
-            }
-            // Upgrade the pre-materialization archive identity without retaining
-            // a second plaintext copy. Older imports never materialized None.
-            let old_id=record_id(&migration,None,&record.source_record_id);
-            tx.execute("DELETE FROM legacy_content WHERE id=?1 AND id<>?2 AND payload=?3 AND agent IS NULL AND materialized=0",
-                params![old_id,id,payload])?;
-        }
-        tx.commit()?;
+        self.archive_records(staged, &migration, rejected)?;
         if rejected {
             let (busy,_,_):(u64,u64,u64)=self.archive.query_row("PRAGMA wal_checkpoint(TRUNCATE)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
             if busy!=0 {return Err(Error::Readback);}

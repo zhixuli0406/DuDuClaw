@@ -868,10 +868,6 @@ pub fn build_working_state_section(home_dir: &Path, agent_id: &str) -> Option<St
 }
 
 #[cfg(test)]
-#[path = "isolation_io_test_support.rs"]
-mod isolation_io_test_support;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -883,7 +879,7 @@ mod tests {
         let before = read_full(home.path(), "worker", 10).unwrap();
         let active = Arc::new(AtomicBool::new(true));
         let authority = duduclaw_mcp_boundary::io_authority::scope(
-            isolation_io_test_support::context(active.clone()), async { duduclaw_mcp_boundary::io_authority::capture() }).await;
+            crate::isolation_io_test_support::context(active.clone()), async { duduclaw_mcp_boundary::io_authority::capture() }).await;
         active.store(false, Ordering::SeqCst);
         let path = home.path().to_owned();
         let result = tokio::task::spawn_blocking(move || authority.run(||

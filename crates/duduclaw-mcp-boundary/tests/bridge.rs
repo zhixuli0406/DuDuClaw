@@ -29,16 +29,41 @@ fn bridge_forwards_bytes_and_exits_on_gateway_eof_with_stdin_open() {
     // The command retains its own CLOEXEC source until fork, not a borrowed fd.
     drop(employee);
     let mut child = command.spawn().unwrap();
-    child.stdin.as_mut().unwrap().write_all(b"request\n").unwrap();
-    let mut bytes = [0; 8];
-    host.read_exact(&mut bytes).unwrap();
-    assert_eq!(&bytes, b"request\n");
-    host.write_all(b"response\n").unwrap();
+    // Bound the entire exchange, including pipe reads/writes. Killing the
+    // bridge on timeout also releases the reader thread's stdout pipe.
+    host.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
-    let mut bytes = [0; 9];
-    output.read_exact(&mut bytes).unwrap();
-    assert_eq!(&bytes, b"response\n");
-    drop(host);
+    let (sent, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let exchange = || -> std::io::Result<()> {
+            input.write_all(b"request\n")?;
+            let mut bytes = [0; 8];
+            host.read_exact(&mut bytes)?;
+            if &bytes != b"request\n" { return Err(std::io::ErrorKind::InvalidData.into()); }
+            host.write_all(b"response\n")?;
+            let mut bytes = [0; 9];
+            output.read_exact(&mut bytes)?;
+            if &bytes != b"response\n" { return Err(std::io::ErrorKind::InvalidData.into()); }
+            // Include a response without a newline: MCP is a byte pump and
+            // must not rely on stdout's line buffering or gateway EOF.
+            host.write_all(b"response")?;
+            let mut bytes = [0; 8];
+            output.read_exact(&mut bytes)?;
+            if &bytes != b"response" { return Err(std::io::ErrorKind::InvalidData.into()); }
+            Ok(())
+        }();
+        drop(host);
+        let _ = sent.send((exchange, input));
+    });
+    let _input = match received.recv_timeout(Duration::from_secs(5)) {
+        Ok((Ok(()), input)) => input,
+        result => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("bridge request/response exchange failed before gateway EOF: {result:?}");
+        }
+    };
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if let Some(status) = child.try_wait().unwrap() { assert!(status.success()); break; }

@@ -1104,10 +1104,6 @@ pub fn render_tick_diff_section(pairs: &[(BeliefRow, f64)]) -> Option<String> {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[path = "../isolation_io_test_support.rs"]
-mod isolation_io_test_support;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1135,7 +1131,7 @@ mod tests {
         use std::sync::{Arc, atomic::AtomicBool};
         let (db, _dir) = temp_db();
         let result = duduclaw_mcp_boundary::io_authority::scope(
-            isolation_io_test_support::context(Arc::new(AtomicBool::new(false))), async {
+            crate::isolation_io_test_support::context(Arc::new(AtomicBool::new(false))), async {
                 submit(&db, belief("worker", "subject", "up", 0.7, 100.0))
             }).await;
         assert!(result.is_err());

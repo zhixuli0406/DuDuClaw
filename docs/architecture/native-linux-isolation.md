@@ -7175,3 +7175,24 @@ Commands use `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and
    subset boundaries, not fabricated successful producers. No Linux root,
    native transport/retirement, provider, publication or customer acceptance has
    been established by the checks above.
+
+
+## Package I1 — test target and bridge liveness fixes (2026-11-05)
+
+The gateway has one crate-root `cfg(test)` I/O authority fixture shared by all
+storage boundary tests, without an OS-specific gate. Resource resolver fixtures
+retain their concrete binding store alongside its `Arc<dyn BindingAuthority>`
+view so lifetime tombstoning still exercises the production authorization path.
+The migration archive transaction runs in a synchronous helper before async
+materialization; rusqlite transactions must not enter the startup future's state
+machine. A compile-time test requires the entire `start_gateway` future to be
+`Send` without polling it or opening a listener.
+
+The employee MCP bridge explicitly reads, writes, and flushes each gateway output
+chunk. `io::copy` can fill stdout's writer buffer and await more socket input
+before flushing, deadlocking a peer that awaits the response while keeping its
+socket open. The regression fixture requires a response without a newline before
+closing the gateway socket, keeps child stdin open through EOF, bounds the whole
+exchange with a channel deadline, and kills/reaps the bridge on timeout. This
+changes neither capability contracts nor descriptor inheritance. Cross-target
+checks do not establish native Linux or privileged runtime acceptance.

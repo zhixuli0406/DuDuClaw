@@ -19,10 +19,6 @@ impl LiveRequest for reqwest::RequestBuilder {
 }
 
 #[cfg(test)]
-#[path = "isolation_io_test_support.rs"]
-mod isolation_io_test_support;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -34,7 +30,7 @@ mod tests {
         // from the authority refusal which must happen first.
         let request = reqwest::Client::new().post("invalid URL");
         let future = duduclaw_mcp_boundary::io_authority::scope(
-            isolation_io_test_support::context(live.clone()), async { request.send_authorized() }).await;
+            crate::isolation_io_test_support::context(live.clone()), async { request.send_authorized() }).await;
         live.store(false, Ordering::SeqCst);
         assert_eq!(future.await.unwrap_err(), duduclaw_mcp_boundary::VerificationError::Revoked.to_string());
     }

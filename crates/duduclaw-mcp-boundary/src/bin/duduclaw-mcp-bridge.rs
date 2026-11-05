@@ -1,7 +1,7 @@
 //! Unprivileged byte pump. Authority resides exclusively at the gateway endpoint.
 #[cfg(target_os = "linux")]
 fn main() -> std::process::ExitCode {
-    use std::{io, net::Shutdown, os::fd::FromRawFd};
+    use std::{io::{self, Read, Write}, net::Shutdown, os::fd::FromRawFd};
     // SAFETY: fcntl accepts a possibly-invalid raw descriptor and returns EBADF.
     // Do not create a BorrowedFd before proving that the inherited slot exists.
     let fd = unsafe { libc::fcntl(duduclaw_mcp_boundary::config::MCP_FD, libc::F_DUPFD_CLOEXEC, 5) };
@@ -24,9 +24,22 @@ fn main() -> std::process::ExitCode {
             let _ = writer.shutdown(Shutdown::Write);
         }
     });
-    match io::copy(&mut socket, &mut io::stdout().lock()) {
-        Ok(_) => std::process::ExitCode::SUCCESS,
-        Err(_) => std::process::ExitCode::FAILURE,
+    // io::copy may read directly into stdout's buffered writer and wait for
+    // more socket bytes before flushing. A request/response peer keeps its
+    // write half open while waiting for this response, so flush every read.
+    let mut output = io::stdout().lock();
+    let mut bytes = [0; 8192];
+    loop {
+        match socket.read(&mut bytes) {
+            Ok(0) => return std::process::ExitCode::SUCCESS,
+            Ok(count) => {
+                if output.write_all(&bytes[..count]).and_then(|_| output.flush()).is_err() {
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return std::process::ExitCode::FAILURE,
+        }
     }
 }
 

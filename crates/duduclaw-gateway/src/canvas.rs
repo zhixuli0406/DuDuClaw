@@ -624,10 +624,6 @@ pub fn ensure_broadcast_bridge(
 // ─── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[path = "isolation_io_test_support.rs"]
-mod isolation_io_test_support;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -638,7 +634,7 @@ mod tests {
         store.push("alice", "first", "<p>first</p>").await.unwrap();
         let lock = store.conn.lock().await;
         let live = std::sync::Arc::new(AtomicBool::new(true));
-        let context = isolation_io_test_support::context(live.clone());
+        let context = crate::isolation_io_test_support::context(live.clone());
         let worker_store = store.clone();
         let worker = tokio::spawn(duduclaw_mcp_boundary::io_authority::scope(context, async move {
             worker_store.clear("alice").await

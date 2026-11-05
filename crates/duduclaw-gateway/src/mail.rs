@@ -1018,10 +1018,6 @@ pub fn render_mail_as_data(item: &InboxItem) -> String {
 }
 
 #[cfg(test)]
-#[path = "isolation_io_test_support.rs"]
-mod isolation_io_test_support;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1052,7 +1048,7 @@ mod tests {
         let h = home();
         let config = cfg();
         let result = duduclaw_mcp_boundary::io_authority::scope(
-            isolation_io_test_support::context(Arc::new(AtomicBool::new(false))), async {
+            crate::isolation_io_test_support::context(Arc::new(AtomicBool::new(false))), async {
                 record_outbox_draft_checked(h.path(), &config, "worker", "x@example.test", "subject", "body", "approval", None)
             }).await;
         assert!(result.is_err());

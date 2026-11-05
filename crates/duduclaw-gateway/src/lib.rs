@@ -33,6 +33,8 @@
 pub mod isolation_mcp;
 pub mod isolation_background;
 mod isolation_http;
+#[cfg(test)]
+pub(crate) mod isolation_io_test_support;
 pub mod isolation_egress;
 pub mod isolation_resources;
 pub mod isolation_connectors;

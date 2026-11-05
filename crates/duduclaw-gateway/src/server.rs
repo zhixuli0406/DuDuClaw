@@ -427,6 +427,18 @@ mod backup_restore_boot_tests {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn start_gateway_future_is_send() {
+    fn assert_send<T: Send>(_: T) {}
+    // Only construct and drop the future; this never starts a gateway.
+    assert_send(start_gateway(GatewayConfig {
+        bind: "127.0.0.1".into(), port: 0, auth_token: None,
+        home_dir: std::path::PathBuf::new(), allowed_origins: vec![],
+        extension: Arc::new(crate::extension::NullExtension), edition: None,
+    }));
+}
+
 /// Start the WebSocket RPC gateway and block until it shuts down.
 pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Result<()> {
     if crate::migration_startup::maybe_run(&config.home_dir).await? { return Ok(()); }

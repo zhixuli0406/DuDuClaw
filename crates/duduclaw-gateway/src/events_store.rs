@@ -363,10 +363,6 @@ impl EventBusStore {
 }
 
 #[cfg(test)]
-#[path = "isolation_io_test_support.rs"]
-mod isolation_io_test_support;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -378,7 +374,7 @@ mod tests {
         let active = Arc::new(AtomicBool::new(true));
         let held = store.conn.lock().await;
         let request = duduclaw_mcp_boundary::io_authority::scope(
-            isolation_io_test_support::context(active.clone()), store.append("task.updated", "{}"));
+            crate::isolation_io_test_support::context(active.clone()), store.append("task.updated", "{}"));
         tokio::pin!(request);
         std::future::poll_fn(|cx| { assert!(request.as_mut().poll(cx).is_pending()); Poll::Ready(()) }).await;
         active.store(false, Ordering::SeqCst);

@@ -1199,10 +1199,6 @@ pub fn start_reminder_scheduler(
 // ── Tests ───────────────────────────────────────────────────
 
 #[cfg(test)]
-#[path = "isolation_io_test_support.rs"]
-mod isolation_io_test_support;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1216,7 +1212,7 @@ mod tests {
         let live = Arc::new(AtomicBool::new(true));
         let revoke = live.clone();
         let result = duduclaw_mcp_boundary::io_authority::scope(
-            isolation_io_test_support::context(live),
+            crate::isolation_io_test_support::context(live),
             mutate_reminders(home.path(), move |rows| {
                 rows.clear();
                 revoke.store(false, Ordering::SeqCst);
