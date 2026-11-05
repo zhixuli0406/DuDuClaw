@@ -8,7 +8,9 @@ impl MethodHandler {
 
     pub(crate) async fn handle_security_audit_log(&self, params: Value) -> WsFrame {
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-        let events = duduclaw_security::audit::read_recent_events(&self.home_dir, limit);
+        let home = self.home_dir.clone();
+        let events = tokio::task::spawn_blocking(move || crate::protected_policy_audit::dashboard_events(&home, limit))
+            .await.unwrap_or_default();
         let events_json: Vec<Value> = events
             .iter()
             .map(|e| {
@@ -88,8 +90,11 @@ impl MethodHandler {
 
         // ── Source: security_audit.jsonl ────────────────────────────
         if requested_sources.iter().any(|s| s == "security") {
-            let path = self.home_dir.join("security_audit.jsonl");
-            let rows = read_jsonl_lines(&path).await;
+            let home = self.home_dir.clone();
+            let rows = tokio::task::spawn_blocking(move || {
+                crate::protected_policy_audit::dashboard_events(&home, usize::MAX).into_iter()
+                    .filter_map(|event| serde_json::to_value(event).ok()).collect::<Vec<_>>()
+            }).await.unwrap_or_default();
             *source_counts.entry("security".into()).or_insert(0) += rows.len();
             for row in &rows {
                 let timestamp = row
@@ -145,7 +150,7 @@ impl MethodHandler {
                     "agent_id": agent_id,
                     "severity": severity,
                     "summary": summary,
-                    "details": { "security_audit": row },
+                    "details": { "security_audit": row, "policy_event_source": row["details"]["policy_event_source"] },
                 }));
             }
         }

@@ -1,6 +1,6 @@
 //! Descriptor-relative root policy storage, following the protected unit checks.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
-use super::{EngineSocketAction, PolicyEvent, PolicySnapshot};
+use super::{EngineSocketAction, RootPolicyEvent, RootPolicyEventKind, PolicySnapshot};
 use std::{fs::File, io::{self, Read, Write}, os::{fd::{AsRawFd, FromRawFd}, unix::fs::{MetadataExt, OpenOptionsExt}}, path::Path};
 const POLICY: &str = "protected-policy.toml";
 const AUDIT: &str = "protected-policy-audit.jsonl";
@@ -62,15 +62,14 @@ impl Dir {
         Ok(text)
     }
     pub(super) fn read_policy(&self) -> io::Result<PolicySnapshot> { super::parse(&self.read(POLICY, POLICY_LIMIT)?) }
-    pub(super) fn read_audit(&self) -> io::Result<Vec<PolicyEvent>> {
+    pub(super) fn read_audit(&self) -> io::Result<Vec<RootPolicyEvent>> {
         let text = self.read(AUDIT, AUDIT_LIMIT)?;
         // An interrupted final append is not a committed event. Earlier durable
         // records remain importable; the writer refuses a broken audit tail.
         text.split_inclusive('\n').filter(|line| line.ends_with('\n')).map(|line| {
-            let event: PolicyEvent = serde_json::from_str(line).map_err(io::Error::other)?;
+            let event: RootPolicyEvent = serde_json::from_str(line).map_err(io::Error::other)?;
             if uuid::Uuid::parse_str(&event.id).is_err()
-                || chrono::DateTime::parse_from_rfc3339(&event.timestamp).is_err()
-                || !matches!(event.event.as_str(), "engine_socket_policy_changed" | "engine_socket_policy_change_requested") {
+                || chrono::DateTime::parse_from_rfc3339(&event.timestamp).is_err() {
                 return Err(io::Error::other("invalid root policy audit event"));
             }
             Ok(event)
@@ -115,18 +114,18 @@ impl Dir {
         let id = uuid::Uuid::new_v4().to_string();
         let policy = PolicySnapshot { action, change_id: Some(id.clone()) };
         let bytes = toml::to_string(&policy).map_err(io::Error::other)?;
-        let event = |event: &str, event_id: String| PolicyEvent { id: event_id, event: event.into(), action,
+        let event = |event: RootPolicyEventKind, event_id: String| RootPolicyEvent { id: event_id, event, action,
             detail: Some(format!("root uid=0; policy change {id}")), timestamp: chrono::Utc::now().to_rfc3339() };
-        let append = |file: &mut File, record: PolicyEvent| -> io::Result<()> {
+        let append = |file: &mut File, record: RootPolicyEvent| -> io::Result<()> {
             let mut bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
             bytes.push(b'\n'); file.write_all(&bytes)?; file.sync_all()
         };
         // Durable intent precedes the policy. A crash between rename and the
         // completion record leaves both this intent and change_id as evidence.
-        append(&mut audit, event("engine_socket_policy_change_requested", uuid::Uuid::new_v4().to_string()))?;
+        append(&mut audit, event(RootPolicyEventKind::ChangeRequested, uuid::Uuid::new_v4().to_string()))?;
         self.file.sync_all()?;
         self.atomic_policy(bytes.as_bytes())?;
-        append(&mut audit, event("engine_socket_policy_changed", id.clone()))
+        append(&mut audit, event(RootPolicyEventKind::Changed, id.clone()))
     }
 }
 

@@ -210,23 +210,78 @@ impl AuditEventIndex {
         Ok(())
     }
 
-    /// Look up completed imports using the receipt primary key before reading
-    /// any JSONL history. A receipt means both audit copies landed.
-    pub(crate) async fn imported_protected_policy_ids(&self, ids: &[String]) -> Result<std::collections::HashSet<String>, String> {
-        let conn = self.conn.lock().await;
-        let mut statement = conn.prepare("SELECT EXISTS(SELECT 1 FROM protected_policy_imports WHERE event_id = ?1)")
-            .map_err(|e| e.to_string())?;
-        let mut imported = std::collections::HashSet::new();
-        for id in ids {
-            let exists: bool = statement.query_row(params![id], |row| row.get(0)).map_err(|e| e.to_string())?;
-            if exists { imported.insert(id.clone()); }
+    /// Rebuild the root-derived slice from the pinned root log on EVERY pass.
+    /// No service-owned receipt or JSONL row is evidence of a root import.
+    pub(crate) async fn rebuild_root_policy(&self, events: &[(String, AuditEvent)]) -> Result<(), String> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM audit_index WHERE event_type IN
+            ('engine_socket_policy_changed', 'engine_socket_policy_change_requested')
+            OR source_file = 'protected-policy:root'", []).map_err(|e| e.to_string())?;
+        // Old warning copies have no provenance. They can only be runtime
+        // diagnostics, even if their metadata claims otherwise. Parse in Rust
+        // so malformed cache JSON cannot abort the root transaction.
+        let legacy: Vec<(i64, String)> = {
+            let mut statement = tx.prepare("SELECT id, metadata FROM audit_index
+                WHERE event_type IN ('engine_socket_warning_started', 'engine_socket_warning_ended')")
+                .map_err(|e| e.to_string())?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get::<_, String>(1).unwrap_or_default())))
+                .map_err(|e| e.to_string())?;
+            rows.filter_map(|row| match row {
+                Ok(row) => Some(row),
+                Err(_) => { warn!(quarantined_rows = 1, "Unreadable runtime cache row skipped"); None }
+            }).collect()
+        };
+        for (row_id, raw) in legacy {
+            let parsed = serde_json::from_str::<Json>(&raw).ok().and_then(|mut meta| {
+                let id = meta["policy_event_id"].as_str()?;
+                let uuid = uuid::Uuid::parse_str(id.strip_prefix("runtime:").unwrap_or(id)).ok()?;
+                meta["policy_event_id"] = format!("runtime:{uuid}").into();
+                meta["policy_event_source"] = "runtime".into();
+                Some(meta)
+            });
+            if let Some(meta) = parsed {
+                tx.execute("UPDATE audit_index SET metadata = ?1, source_file = 'protected-policy:runtime' WHERE id = ?2",
+                    params![meta.to_string(), row_id]).map_err(|e| e.to_string())?;
+                // Keep legacy warning replays idempotent after namespacing.
+                tx.execute("INSERT OR IGNORE INTO protected_policy_imports(event_id) VALUES (?1)",
+                    params![meta["policy_event_id"].as_str()]).map_err(|e| e.to_string())?;
+            } else {
+                warn!(quarantined_rows = 1, "Malformed legacy runtime cache row skipped");
+                tx.execute("DELETE FROM audit_index WHERE id = ?1", params![row_id]).map_err(|e| e.to_string())?;
+            }
         }
-        Ok(imported)
+        // Retire legacy unscoped receipts and planted root acknowledgements.
+        tx.execute("DELETE FROM protected_policy_imports WHERE event_id NOT LIKE 'runtime:%'", [])
+            .map_err(|e| e.to_string())?;
+        let mut seen = std::collections::HashSet::new();
+        for (id, event) in events {
+            if !id.starts_with("root:")
+                || !matches!(event.event_type, super::schema::AuditEventType::EngineSocketPolicyChanged
+                    | super::schema::AuditEventType::EngineSocketPolicyChangeRequested)
+                || event.metadata["policy_event_source"] != "root"
+                || event.metadata["policy_event_id"].as_str() != Some(id.as_str()) {
+                return Err("invalid root event source, type or namespace".into());
+            }
+            if !seen.insert(id) { continue; }
+            tx.execute("INSERT INTO audit_index
+                (timestamp, event_type, agent_id, outcome, metadata, source_file)
+                VALUES (?1, ?2, ?3, ?4, ?5, 'protected-policy:root')", params![event.timestamp,
+                event.event_type.to_string(), event.agent_id, event.outcome.to_string(),
+                event.metadata.to_string()]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
-    /// Import one verified root-policy or runtime transition event exactly once.
-    /// The receipt and index row commit together, including across restarts.
-    pub(crate) async fn import_protected_policy(&self, id: &str, event: &AuditEvent) -> Result<(), String> {
+    /// Runtime receipts are diagnostic only and cannot address root records.
+    pub(crate) async fn import_runtime_warning(&self, id: &str, event: &AuditEvent) -> Result<(), String> {
+        if !id.starts_with("runtime:")
+            || !matches!(event.event_type, super::schema::AuditEventType::EngineSocketWarningStarted
+                | super::schema::AuditEventType::EngineSocketWarningEnded)
+            || event.metadata["policy_event_source"] != "runtime"
+            || event.metadata["policy_event_id"].as_str() != Some(id) {
+            return Err("invalid runtime event source, type or namespace".into());
+        }
         let mut conn = self.conn.lock().await;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let inserted = tx.execute("INSERT OR IGNORE INTO protected_policy_imports(event_id) VALUES (?1)",
@@ -234,9 +289,9 @@ impl AuditEventIndex {
         if inserted != 0 {
             tx.execute("INSERT INTO audit_index
                 (timestamp, event_type, agent_id, outcome, metadata, source_file)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![event.timestamp,
+                VALUES (?1, ?2, ?3, ?4, ?5, 'protected-policy:runtime')", params![event.timestamp,
                 event.event_type.to_string(), event.agent_id, event.outcome.to_string(),
-                event.metadata.to_string(), "protected-policy"]).map_err(|e| e.to_string())?;
+                event.metadata.to_string()]).map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())
     }
@@ -306,6 +361,17 @@ impl AuditEventIndex {
                         continue;
                     }
                 };
+
+                // Service-owned JSONL must never populate the reserved policy
+                // slice. Only the source-specific importer can write these rows.
+                if matches!(ev.event_type, super::schema::AuditEventType::EngineSocketPolicyChanged
+                    | super::schema::AuditEventType::EngineSocketPolicyChangeRequested
+                    | super::schema::AuditEventType::EngineSocketWarningStarted
+                    | super::schema::AuditEventType::EngineSocketWarningEnded) {
+                    warn!("sync_from_files: quarantined protected policy row from service JSONL");
+                    committed += 1;
+                    continue;
+                }
 
                 let meta_str = serde_json::to_string(&ev.metadata).unwrap_or_else(|_| "{}".into());
 

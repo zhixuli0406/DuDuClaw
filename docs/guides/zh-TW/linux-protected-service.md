@@ -190,6 +190,8 @@ sudo duduclaw service protected-linux policy engine-socket revoke
 
 警告轉態會先同步保存至 `<home>/state/engine-socket-warning-events.json`，兩份稽核紀錄匯入成功後才確認移除。這份服務帳號擁有的日誌僅供診斷，不能授予政策權限。root 稽核紀錄上限為 4 MiB；達上限後，指令會拒絕變更，須由管理者先封存紀錄。既有政策目錄須可供服務讀取及穿越；指令會拒絕權限過嚴的目錄，不會自行修改既有目錄權限。
 
+政策變更與執行期警告採用各自的事件允許清單，以及 `root:`／`runtime:` ID 空間。每次匯入先從固定描述符驗證的 root 日誌重建政策索引，並在重建時依 ID 去重；服務帳號可寫的 JSONL 與 SQLite 收據不再代表 root 事件已匯入。損壞的執行期紀錄會逐筆略過、計數並警告，不阻擋 root 匯入。儀表板也重新讀取 root 日誌，排除服務端的政策變更副本，並標示 `root`／`runtime` 來源；同 UID 程式仍可偽造執行期診斷。
+
 ## 容器引擎介面暴露後的恢復
 
 同一台主機上的其他程式（常見於開發者啟動的容器）可能暴露 root 擁有的引擎控制介面，即使 `duduclaw` 不在 Docker 群組也可能發生。警告與憑證保護狀態會列出路徑及原因（可寫入、連線成功或非預期 errno），或 abstract socket 名稱及 peer uid。最新撤銷原因、詳細資訊及 UTC 時間保存在 `<home>/state/root-key-status.json`；`<home>` 通常是 `/var/lib/duduclaw/.duduclaw`。記錄不含金鑰。請依顯示的介面找出並停止暴露它的程式；建議把開發容器移到其他主機。若命中舊版 containerd shim，請升級 containerd。

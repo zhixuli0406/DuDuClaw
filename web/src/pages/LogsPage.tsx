@@ -374,6 +374,10 @@ function AuditRow({
       <div className="flex flex-wrap items-center gap-2">
         <Badge variant="ghost">{sourceLabel}</Badge>
         <span className="font-mono text-xs text-muted-foreground">{event.event_type}</span>
+        {['engine_socket_policy_change_requested', 'engine_socket_policy_changed', 'engine_socket_warning_started', 'engine_socket_warning_ended'].includes(event.event_type)
+            && (event.details?.policy_event_source === 'root' || event.details?.policy_event_source === 'runtime') && (
+          <Badge variant="ghost">{String(event.details.policy_event_source)}</Badge>
+        )}
         {event.agent_id && (
           <span className="flex items-center gap-1 text-xs font-medium text-brand">
             <ActorAvatar actorType="agent" name={agentName} size="xs" />

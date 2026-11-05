@@ -40,12 +40,37 @@ pub struct PolicyStatus {
     pub command_revoke: String,
 }
 
+// Each source has its own deserialization allowlist. A runtime journal cannot
+// deserialize a root policy change, even if it supplies a root-looking ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RootPolicyEventKind {
+    #[serde(rename = "engine_socket_policy_change_requested")]
+    ChangeRequested,
+    #[serde(rename = "engine_socket_policy_changed")]
+    Changed,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimeWarningEventKind {
+    #[serde(rename = "engine_socket_warning_started")]
+    Started,
+    #[serde(rename = "engine_socket_warning_ended")]
+    Ended,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PolicyEvent {
+pub struct RootPolicyEvent {
     pub timestamp: String,
     pub id: String,
-    pub event: String,
+    pub event: RootPolicyEventKind,
+    pub detail: Option<String>,
+    pub action: EngineSocketAction,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeWarningEvent {
+    pub timestamp: String,
+    pub id: String,
+    pub event: RuntimeWarningEventKind,
     pub detail: Option<String>,
     pub action: EngineSocketAction,
 }
@@ -53,8 +78,7 @@ pub struct PolicyEvent {
 #[derive(Default)]
 struct Runtime {
     warning: Option<String>,
-    events: Vec<PolicyEvent>,
-    imported: std::collections::HashSet<String>,
+    events: Vec<RuntimeWarningEvent>,
     journal: Option<super::state_files::StateDir>,
 }
 static RUNTIME: OnceLock<Mutex<Runtime>> = OnceLock::new();
@@ -83,7 +107,34 @@ const JOURNAL: &str = "engine-socket-warning-events.json";
 const JOURNAL_LIMIT: u64 = 1024 * 1024;
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Journal { last_warning: Option<String>, events: Vec<PolicyEvent> }
+struct Journal { last_warning: Option<String>, events: Vec<RuntimeWarningEvent> }
+fn decode_journal(value: serde_json::Value) -> (Journal, usize) {
+    let mut journal = Journal::default();
+    let mut quarantined = 0;
+    if let Some(rows) = value.get("events").and_then(serde_json::Value::as_array) {
+        let mut ids = std::collections::HashSet::new();
+        for row in rows {
+            let parsed = serde_json::from_value::<RuntimeWarningEvent>(row.clone()).ok().and_then(|mut event| {
+                // Accept old UUID-only runtime journals, but never root: IDs.
+                let raw = event.id.strip_prefix("runtime:").unwrap_or(&event.id);
+                let id = uuid::Uuid::parse_str(raw).ok()?;
+                chrono::DateTime::parse_from_rfc3339(&event.timestamp).ok()?;
+                event.id = format!("runtime:{id}");
+                Some(event)
+            });
+            match parsed {
+                Some(event) => { if ids.insert(event.id.clone()) { journal.events.push(event); } }
+                None => quarantined += 1,
+            }
+        }
+        journal.last_warning = value.get("last_warning").and_then(serde_json::Value::as_str).map(str::to_owned);
+    } else { quarantined += 1; }
+    if quarantined != 0 {
+        tracing::warn!(quarantined_rows = quarantined, "Malformed runtime warning rows quarantined (skipped)");
+    }
+    (journal, quarantined)
+}
+
 impl Runtime {
     fn persist(&self) -> std::io::Result<()> {
         if let Some(dir) = &self.journal { dir.write_json_bounded(JOURNAL, &Journal { last_warning: self.warning.clone(), events: self.events.clone() }, JOURNAL_LIMIT)?; }
@@ -92,22 +143,27 @@ impl Runtime {
     fn initialize(&mut self, home: &std::path::Path) -> std::io::Result<()> {
         if self.journal.is_some() { return Ok(()); }
         let dir = super::state_files::StateDir::open_home(home, true)?;
-        let historical: Journal = match dir.read_json_bounded(JOURNAL, JOURNAL_LIMIT) {
-            Ok(events) => events,
+        // Parse rows separately: one poisoned row must not hide valid warnings
+        // or interfere with the independent root log import.
+        let historical = match dir.read_json_bounded::<serde_json::Value>(JOURNAL, JOURNAL_LIMIT) {
+            Ok(value) => decode_journal(value).0,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Journal::default(),
-            Err(error) => return Err(error),
+            Err(_) => {
+                tracing::warn!(quarantined_rows = 1, "Malformed runtime warning journal skipped");
+                Journal::default()
+            }
         };
         // Journal contents are diagnostic only, never policy or key authority.
         let mut current = std::mem::take(&mut self.events);
         // The new intake owns live status. Historical state only suppresses a
         // duplicate start or records the end discovered on this fresh intake.
         if let Some(previous) = historical.last_warning {
-            if current.first().is_some_and(|event| event.event == "engine_socket_warning_started") {
+            if current.first().is_some_and(|event| event.event == RuntimeWarningEventKind::Started) {
                 current.remove(0);
             }
-            if self.warning.is_none() && !current.iter().any(|event| event.event == "engine_socket_warning_ended") {
-                current.push(PolicyEvent { id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: chrono::Utc::now().to_rfc3339(), event: "engine_socket_warning_ended".into(),
+            if self.warning.is_none() && !current.iter().any(|event| event.event == RuntimeWarningEventKind::Ended) {
+                current.push(RuntimeWarningEvent { id: format!("runtime:{}", uuid::Uuid::new_v4()),
+                    timestamp: chrono::Utc::now().to_rfc3339(), event: RuntimeWarningEventKind::Ended,
                     detail: Some(super::recovery::sanitize_diagnostic(&previous)), action: read().action });
             }
         }
@@ -127,9 +183,9 @@ impl Runtime {
         let next = detail.map(super::recovery::sanitize_diagnostic);
         let changed = self.warning.is_some() != next.is_some();
         if changed {
-            self.events.push(PolicyEvent {
-                id: uuid::Uuid::new_v4().to_string(), timestamp: chrono::Utc::now().to_rfc3339(),
-                event: if next.is_some() { "engine_socket_warning_started" } else { "engine_socket_warning_ended" }.into(),
+            self.events.push(RuntimeWarningEvent {
+                id: format!("runtime:{}", uuid::Uuid::new_v4()), timestamp: chrono::Utc::now().to_rfc3339(),
+                event: if next.is_some() { RuntimeWarningEventKind::Started } else { RuntimeWarningEventKind::Ended },
                 detail: next.clone().or_else(|| self.warning.clone()), action,
             });
         }
@@ -156,20 +212,24 @@ pub(super) fn initialize(home: &std::path::Path) {
 
 pub fn ack_events(ids: &[String]) -> std::io::Result<()> { runtime().ack(ids) }
 
-/// Import root audit history as well as runtime transitions. IDs survive restarts;
-/// the gateway also deduplicates against its persisted audit log.
-pub fn take_events() -> Vec<PolicyEvent> {
+/// Read only the pinned root-owned source, on every import pass. Service-owned
+/// receipts, JSONL files and in-memory acknowledgements cannot suppress it.
+pub fn read_root_events() -> std::io::Result<Vec<RootPolicyEvent>> {
     #[cfg(target_os = "linux")]
-    let root_events = files::Dir::open(false).and_then(|dir| dir.read_audit()).unwrap_or_default();
-    #[cfg(not(target_os = "linux"))]
-    let root_events: Vec<PolicyEvent> = Vec::new();
-    let mut rt = runtime();
-    let _ = rt.persist();
-    let mut events = rt.events.clone();
-    for event in root_events {
-        if rt.imported.insert(event.id.clone()) { events.push(event); }
+    {
+        match files::Dir::open(false).and_then(|dir| dir.read_audit()) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            result => result,
+        }
     }
-    events
+    #[cfg(not(target_os = "linux"))]
+    { Ok(Vec::new()) }
+}
+
+pub fn take_runtime_events() -> Vec<RuntimeWarningEvent> {
+    let rt = runtime();
+    let _ = rt.persist();
+    rt.events.clone()
 }
 
 pub fn write(action: EngineSocketAction) -> std::io::Result<()> {
@@ -189,6 +249,41 @@ mod files;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn root_key_policy_runtime_allowlist_namespace_and_quarantine() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = serde_json::json!({"id": id, "timestamp": "2026-11-05T01:02:03Z",
+            "event": "engine_socket_warning_started", "action": "warn", "detail": null});
+        let mut forged_type = row.clone();
+        forged_type["event"] = "engine_socket_policy_changed".into();
+        let mut forged_id = row.clone();
+        forged_id["id"] = format!("root:{id}").into();
+        let (journal, quarantined) = decode_journal(serde_json::json!({
+            "last_warning": null, "events": [forged_type, "broken", forged_id, row, row]
+        }));
+        assert_eq!(quarantined, 3);
+        assert_eq!(journal.events.len(), 1);
+        assert_eq!(journal.events[0].id, format!("runtime:{id}"));
+        assert_eq!(journal.events[0].event, RuntimeWarningEventKind::Started);
+        assert!(serde_json::from_value::<RootPolicyEvent>(serde_json::to_value(&journal.events[0]).unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_key_policy_malformed_runtime_journal_does_not_block_live_events() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = super::super::state_files::StateDir::open_home(home.path(), true).unwrap();
+        dir.write_json_bounded(JOURNAL, &serde_json::json!({"events": ["broken"]}), JOURNAL_LIMIT).unwrap();
+        let mut rt = Runtime::default();
+        rt.observe(EngineSocketAction::Warn, Some("@docker"));
+        rt.initialize(home.path()).unwrap();
+        assert_eq!(rt.events.len(), 1);
+        assert!(rt.events[0].id.starts_with("runtime:"));
+        assert_eq!(rt.events[0].event, RuntimeWarningEventKind::Started);
+    }
+
     #[cfg(unix)]
     #[test]
     fn root_key_policy_warning_journal_survives_restart_until_ack() {
@@ -205,7 +300,7 @@ mod tests {
         assert_eq!(restarted.events[0].id, id);
         assert!(restarted.warning.is_none()); // journal cannot claim live exposure or key state
         assert_eq!(restarted.events.len(), 2);
-        assert_eq!(restarted.events[1].event, "engine_socket_warning_ended");
+        assert_eq!(restarted.events[1].event, RuntimeWarningEventKind::Ended);
         let ids = restarted.events.iter().map(|event| event.id.clone()).collect::<Vec<_>>();
         restarted.ack(&ids).unwrap();
         drop(restarted);
@@ -252,7 +347,7 @@ mod tests {
         rt.observe(EngineSocketAction::Revoke, None);
         rt.observe(EngineSocketAction::Revoke, None);
         assert_eq!(rt.events.len(), 2);
-        assert!(rt.events[0].event.ends_with("started"));
-        assert!(rt.events[1].event.ends_with("ended"));
+        assert_eq!(rt.events[0].event, RuntimeWarningEventKind::Started);
+        assert_eq!(rt.events[1].event, RuntimeWarningEventKind::Ended);
     }
 }

@@ -209,6 +209,10 @@ impl MethodHandler {
                 Ok::<_, String>(Arc::new(idx))
             })
             .await?;
+        // Root policy rows are re-derived before every consumer, even when
+        // the general JSONL index remains background-synced. A failed rebuild
+        // must not let a consumer serve stale service-owned root cache rows.
+        crate::protected_policy_audit::drain(&self.home_dir, idx).await?;
         Ok(idx.clone())
     }
 
@@ -218,7 +222,6 @@ impl MethodHandler {
     pub async fn refresh_audit_index(&self) {
         match self.audit_index().await {
             Ok(idx) => {
-                crate::protected_policy_audit::drain(&self.home_dir, &idx).await;
                 if let Err(e) = idx.sync_from_files().await {
                     warn!("audit_index background sync warning: {e}");
                 }

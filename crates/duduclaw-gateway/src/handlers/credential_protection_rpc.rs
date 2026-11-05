@@ -113,8 +113,8 @@ impl MethodHandler {
         match on_blocking(self.home_dir.clone(), |cp| cp.status()).await {
             Ok(s) => {
                 audit_broken_once(&self.home_dir, &s);
-                if let Ok(index) = self.audit_index().await {
-                    crate::protected_policy_audit::drain(&self.home_dir, &index).await;
+                if let Err(error) = self.audit_index().await {
+                    tracing::warn!(%error, "Protected policy audit refresh unavailable");
                 }
                 WsFrame::ok_response("", status_json(&s))
             }

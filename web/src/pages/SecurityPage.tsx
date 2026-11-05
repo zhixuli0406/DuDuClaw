@@ -686,6 +686,10 @@ function AuditRow({ event }: { event: AuditEvent }) {
             {event.event_type}
           </span>
           <Badge variant={badge.variant} className={badge.className}>{event.severity}</Badge>
+          {['engine_socket_policy_change_requested', 'engine_socket_policy_changed', 'engine_socket_warning_started', 'engine_socket_warning_ended'].includes(event.event_type)
+            && (event.details?.policy_event_source === 'root' || event.details?.policy_event_source === 'runtime') && (
+            <Badge variant="secondary">{String(event.details.policy_event_source)}</Badge>
+          )}
           {event.agent_id && (
             <span className="flex items-center gap-1 text-xs text-muted-foreground">
               <ActorAvatar actorType="agent" name={event.agent_id} size="xs" />
