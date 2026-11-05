@@ -2,7 +2,7 @@
 //!
 //! macOS uses a versioned UUID-only fingerprint; other platforms retain
 //! hostname + MAC. Globally-administered unicast MACs remain hardware binding
-//! evidence; instance-unique local MACs support cloud/container bindings, while
+//! evidence; Linux/Windows instance-unique local MACs support cloud/container bindings, while
 //! shared or invalid MACs are weak migration candidates only.
 //!
 //! ## What changed in v1.66.1
@@ -50,6 +50,31 @@ use sha2::{Digest, Sha256};
 /// information.
 const PLACEHOLDER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
 
+// Shared defaults carry no machine identity, regardless of platform or source.
+const SHARED_MACS: &[[u8; 6]] = &[
+    [0; 6],
+    [0xff; 6],
+    PLACEHOLDER_MAC,
+    [0x02, 0x00, 0x4c, 0x4f, 0x4f, 0x50], // Npcap / KM-TEST loopback
+];
+
+#[cfg(any(target_os = "windows", test))]
+#[path = "fingerprint/windows_mac.rs"]
+mod windows_mac;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // All platforms are exercised by platform-independent tests.
+enum IdentityPlatform { Macos, Linux, Windows, Other }
+
+impl IdentityPlatform {
+    fn current() -> Self {
+        if cfg!(target_os = "macos") { Self::Macos }
+        else if cfg!(target_os = "linux") { Self::Linux }
+        else if cfg!(target_os = "windows") { Self::Windows }
+        else { Self::Other }
+    }
+}
+
 /// The MAC string the pre-v1.66.1 algorithm substituted when no MAC could be
 /// read at all. Kept only to diagnose licenses requiring an approved re-bind.
 const LEGACY_ABSENT_MAC: &str = "00:00:00:00:00:00";
@@ -66,7 +91,7 @@ const UUID_IDENTITY_PREFIX: &str = "ioplatformuuid:";
 #[serde(rename_all = "snake_case")]
 pub enum FingerprintStrength {
     Hardware,
-    /// Locally-administered unicast MAC, excluding known shared placeholders.
+    /// Linux/Windows locally-administered unicast MAC, excluding shared placeholders.
     Instance,
     Weak,
 }
@@ -165,7 +190,7 @@ fn build_fingerprint_candidates(hostname: &str, identity: &Identity) -> Vec<Fing
     for id in &identity.candidates {
         let candidate = FingerprintCandidate {
             fingerprint: compute_fingerprint(&format!("{hostname}::{id}")),
-            strength: identity_strength(id),
+            strength: identity_strength(id, identity.platform),
         };
         if !out.iter().any(|existing| existing.fingerprint == candidate.fingerprint) {
             out.push(candidate);
@@ -178,10 +203,14 @@ fn is_uuid_identity(identity: &str) -> bool {
     identity.strip_prefix(UUID_IDENTITY_PREFIX).is_some_and(is_hardware_uuid)
 }
 
-fn identity_strength(identity: &str) -> FingerprintStrength {
+fn identity_strength(identity: &str, platform: IdentityPlatform) -> FingerprintStrength {
     if is_uuid_identity(identity) { return FingerprintStrength::Hardware; }
     identity.parse::<mac_address::MacAddress>()
-        .map(|mac| mac_strength(&mac.bytes()))
+        .map(|mac| match mac_strength(&mac.bytes()) {
+            FingerprintStrength::Instance if !matches!(platform, IdentityPlatform::Linux | IdentityPlatform::Windows)
+                => FingerprintStrength::Weak,
+            strength => strength,
+        })
         .unwrap_or(FingerprintStrength::Weak)
 }
 
@@ -255,6 +284,7 @@ fn push_unique(out: &mut Vec<String>, value: String) {
 
 /// The identity components this host offers, in descending strength.
 struct Identity {
+    platform: IdentityPlatform,
     /// Identity strings, strongest first, deduplicated. Never empty.
     candidates: Vec<String>,
     /// `true` when `candidates[0]` has a platform UUID or a usable Hardware or
@@ -270,9 +300,12 @@ fn identity() -> &'static Identity {
 
 fn resolve_identity() -> Identity {
     let hardware = hardware_identity();
-    let selected_mac = selected_mac_string();
+    let platform = IdentityPlatform::current();
+    let selected_mac = selected_mac_string().filter(|mac|
+        identity_strength(mac, platform) != FingerprintStrength::Weak);
     let legacy_mac = legacy_mac_string();
     Identity {
+        platform,
         hardware_bound: hardware.is_some() || selected_mac.is_some(),
         candidates: build_identity_candidates(hardware, selected_mac, legacy_mac),
     }
@@ -450,12 +483,13 @@ pub fn select_primary_mac(candidates: impl IntoIterator<Item = [u8; 6]>) -> Opti
 }
 
 fn mac_strength(mac: &[u8; 6]) -> FingerprintStrength {
-    if mac.iter().all(|b| *b == 0) || *mac == PLACEHOLDER_MAC || mac[0] & 0x01 != 0 {
+    if SHARED_MACS.contains(mac) || mac[0] & 0x01 != 0 {
         return FingerprintStrength::Weak;
     }
     if mac[0] & 0x02 != 0 { FingerprintStrength::Instance } else { FingerprintStrength::Hardware }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn is_usable_mac(mac: &[u8; 6]) -> bool {
     mac_strength(mac) != FingerprintStrength::Weak
 }
@@ -473,6 +507,13 @@ fn format_mac(mac: &[u8; 6]) -> String {
 /// The MAC this host offers as an identity: the first *usable* address in the
 /// full enumeration, or — when the enumeration itself is unavailable — the
 /// legacy single-address probe, but only if that address is usable.
+#[cfg(target_os = "windows")]
+fn selected_mac_string() -> Option<String> {
+    // Never fall back to the metadata-free legacy probe after filtering.
+    select_primary_mac(windows_mac::eligible_macs()).map(|mac| format_mac(&mac))
+}
+
+#[cfg(not(target_os = "windows"))]
 fn selected_mac_string() -> Option<String> {
     if let Some(mac) = mac_address::MacAddressIterator::new()
         .ok()
@@ -516,12 +557,57 @@ mod tests {
 
     fn sample_identity(uuid: bool) -> Identity {
         Identity {
+            platform: IdentityPlatform::Macos,
             candidates: build_identity_candidates(
                 uuid.then(|| hardware_identity_from(|| Some(IOREG_SAMPLE.into())).unwrap()),
                 Some("D0:11:E5:DB:58:67".into()),
                 Some("02:00:00:00:00:00".into()),
             ),
             hardware_bound: true,
+        }
+    }
+
+    #[test]
+    fn shared_mac_spellings_are_weak_for_selection_and_paid_legacy_bindings() {
+        for mac in SHARED_MACS {
+            assert_eq!(select_primary_mac([*mac]), None);
+            let cloud = [0x42, 1, 10, 128, 0, 2];
+            assert_eq!(select_primary_mac([*mac, cloud]), Some(cloud));
+            let canonical = format_mac(mac);
+            for spelling in [canonical.clone(), canonical.to_ascii_lowercase(),
+                canonical.replace(':', "-"), canonical.replace(':', "-").to_ascii_lowercase(),
+                canonical.replace(':', ""), canonical.replace(':', "").to_ascii_lowercase()]
+            {
+                for platform in [IdentityPlatform::Linux, IdentityPlatform::Windows, IdentityPlatform::Macos] {
+                    assert_eq!(identity_strength(&spelling, platform), FingerprintStrength::Weak);
+                    let identity = Identity { platform, candidates: vec![spelling.clone()], hardware_bound: false };
+                    let candidates = build_fingerprint_candidates("same-host", &identity);
+                    let license = crate::License::new("sub", "customer", crate::LicenseTier::SelfHostPro,
+                        compute_fingerprint(&format!("same-host::{spelling}")), chrono::Duration::days(30), "test");
+                    assert!(matches!(license.validate_any(&candidates, 7, 14), Err(crate::LicenseError::WeakFingerprint)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn macos_legacy_local_mac_stays_weak_with_or_without_uuid() {
+        for uuid in [false, true] {
+            let mut identity = sample_identity(uuid);
+            identity.candidates = build_identity_candidates(
+                uuid.then(|| hardware_identity_from(|| Some(IOREG_SAMPLE.into())).unwrap()),
+                None, Some("02:11:22:33:44:55".into()));
+            let candidates = build_fingerprint_candidates("same-host", &identity);
+            let legacy = compute_fingerprint("same-host::02:11:22:33:44:55");
+            assert_eq!(candidates.iter().find(|c| c.fingerprint() == legacy).unwrap().strength(),
+                FingerprintStrength::Weak);
+            let license = crate::License::new("sub", "customer", crate::LicenseTier::SelfHostPro,
+                legacy, chrono::Duration::days(30), "test");
+            assert!(matches!(license.validate_any(&candidates, 7, 14), Err(crate::LicenseError::WeakFingerprint)));
+            assert_eq!(candidates[0].strength(), if uuid { FingerprintStrength::Hardware } else { FingerprintStrength::Weak });
+        }
+        for platform in [IdentityPlatform::Linux, IdentityPlatform::Windows] {
+            assert_eq!(identity_strength("02:11:22:33:44:55", platform), FingerprintStrength::Instance);
         }
     }
 
@@ -536,7 +622,7 @@ mod tests {
             let legacy = compute_fingerprint(&format!("Mac-mini.local::{id}"));
             let license = crate::License::new("sub", "customer", crate::LicenseTier::SelfHostPro,
                 &legacy, chrono::Duration::days(30), "test");
-            if identity_strength(id) == FingerprintStrength::Weak {
+            if identity_strength(id, identity.platform) == FingerprintStrength::Weak {
                 assert!(matches!(license.validate_any(&old, 7, 14), Err(crate::LicenseError::WeakFingerprint)));
             } else {
                 let matched = license.validate_any(&old, 7, 14).unwrap();
@@ -579,6 +665,7 @@ mod tests {
             Some("FF:FF:FF:FF:FF:FF"), Some("01:00:5E:00:00:01")]
         {
             let identity = Identity {
+                platform: IdentityPlatform::Linux,
                 candidates: build_identity_candidates(None, None, legacy.map(str::to_string)),
                 hardware_bound: false,
             };
@@ -596,18 +683,21 @@ mod tests {
         for mac in [LEGACY_ABSENT_MAC, "02:00:00:00:00:00",
             "FF:FF:FF:FF:FF:FF", "01:00:5E:00:00:01"] {
             let owner = Identity {
+                platform: IdentityPlatform::Linux,
                 candidates: build_identity_candidates(
                     Some("ioplatformuuid:11111111-2222-3333-4444-555555555555".into()),
                     Some(mac.into()), Some(mac.into())),
                 hardware_bound: true,
             };
             let copied = Identity {
+                platform: IdentityPlatform::Linux,
                 candidates: build_identity_candidates(
                     Some("ioplatformuuid:AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE".into()),
                     Some(mac.into()), Some(mac.into())),
                 hardware_bound: true,
             };
             let mac_only = Identity {
+                platform: IdentityPlatform::Linux,
                 candidates: build_identity_candidates(None, Some(mac.into()), Some(mac.into())),
                 hardware_bound: true,
             };
@@ -635,7 +725,8 @@ mod tests {
 
     #[test]
     fn cloud_macs_validate_paid_bindings_and_preserve_legacy_candidates() {
-        for hostname in ["linux-cloud", "WINDOWS-VM"] {
+        for (hostname, platform) in [("linux-cloud", IdentityPlatform::Linux),
+            ("WINDOWS-VM", IdentityPlatform::Windows)] {
             for mac in ["42:01:0A:80:00:02", "02:11:22:33:44:55",
                 "06:11:22:33:44:55", "0A:11:22:33:44:55", "02:42:AC:11:00:02"]
             {
@@ -643,6 +734,7 @@ mod tests {
                 assert_eq!(select_primary_mac([bytes]), Some(bytes));
                 // A newly selected instance identity keeps the old hash byte-for-byte.
                 let identity = Identity {
+                    platform,
                     candidates: build_identity_candidates(None, Some(mac.into()), Some(mac.into())),
                     hardware_bound: true,
                 };
@@ -652,6 +744,7 @@ mod tests {
                 assert_eq!(candidates[0].fingerprint(), fingerprint);
                 // A later hardware NIC must not invalidate the historical instance binding.
                 let upgraded = Identity {
+                    platform,
                     candidates: build_identity_candidates(None, Some("D0:11:E5:DB:58:67".into()), Some(mac.into())),
                     hardware_bound: true,
                 };
@@ -675,9 +768,11 @@ mod tests {
 
     #[test]
     fn real_mac_paid_bindings_validate_without_uuid_on_linux_and_windows() {
-        for hostname in ["linux-host", "WINDOWS-PC"] {
+        for (hostname, platform) in [("linux-host", IdentityPlatform::Linux),
+            ("WINDOWS-PC", IdentityPlatform::Windows)] {
             for mac in ["D0:11:E5:DB:58:67", "00:11:22:33:44:55"] {
                 let identity = Identity {
+                    platform,
                     candidates: build_identity_candidates(None, Some(mac.into()), Some(mac.into())),
                     hardware_bound: true,
                 };
@@ -705,7 +800,7 @@ mod tests {
     #[test]
     fn macos_uuid_failure_never_proposes_mac_even_when_mac_is_hardware() {
         let identity = sample_identity(false);
-        assert_eq!(identity_strength(&identity.candidates[0]), FingerprintStrength::Hardware);
+        assert_eq!(identity_strength(&identity.candidates[0], identity.platform), FingerprintStrength::Hardware);
         assert!(!has_hardware_uuid(&identity));
         assert!(matches!(refresh_fingerprint_for("installed", true,
             !has_hardware_uuid(&identity), &build_fingerprint_candidates("host", &identity)),
@@ -845,7 +940,7 @@ mod tests {
             let local = [first, 0x11, 0x22, 0x33, 0x44, 0x55];
             let unicast = first & 0x01 == 0;
             assert_eq!(select_primary_mac([local]), unicast.then_some(local));
-            assert_eq!(identity_strength(&format_mac(&local)),
+            assert_eq!(identity_strength(&format_mac(&local), IdentityPlatform::Linux),
                 if unicast { FingerprintStrength::Instance } else { FingerprintStrength::Weak });
             let global = [0xd0, 0x11, 0xe5, 0xdb, 0x58, 0x67];
             assert_eq!(select_primary_mac([local, global]), Some(global));
@@ -919,8 +1014,8 @@ mod tests {
                 assert!(hardware_identity_from(|| Some(output.clone())).is_none());
                 // Defense in depth: even a bypassed parser cannot promote a placeholder.
                 let id = format!("{UUID_IDENTITY_PREFIX}{spelling}");
-                assert_eq!(identity_strength(&id), FingerprintStrength::Weak);
-                let identity = Identity { candidates: vec![id], hardware_bound: false };
+                assert_eq!(identity_strength(&id, IdentityPlatform::Macos), FingerprintStrength::Weak);
+                let identity = Identity { platform: IdentityPlatform::Macos, candidates: vec![id], hardware_bound: false };
                 let candidates = build_fingerprint_candidates("shared-host", &identity);
                 assert_eq!(candidates.len(), 1);
                 assert_eq!(candidates[0].strength(), FingerprintStrength::Weak);

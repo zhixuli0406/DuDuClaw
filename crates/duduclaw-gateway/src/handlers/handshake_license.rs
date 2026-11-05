@@ -59,7 +59,7 @@ impl MethodHandler {
                 "fingerprint": strong,
                 "effective": effective,
                 "legacy_binding": effective != strong,
-                "fingerprint_strength": crate::license_runtime::cached_candidates().first().map(|c| c.strength()),
+                "fingerprint_strength": crate::license_runtime::preferred_fingerprint_strength(),
             }),
         )
     }
@@ -107,7 +107,7 @@ impl MethodHandler {
                 last_phone_home: None,
                 days_since_phone_home: None,
                 fingerprint_match: None,
-                fingerprint_strength: crate::license_runtime::cached_candidates().first().map(|c| c.strength()),
+                fingerprint_strength: crate::license_runtime::preferred_fingerprint_strength(),
                 max_agents: None,
                 nfr: false,
             },

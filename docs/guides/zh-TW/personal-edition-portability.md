@@ -52,7 +52,7 @@ duduclaw start
 
 macOS 新指紋使用 `macos-uuid-v2:<32 位十六進位字元>`，只由 `IOPlatformUUID` 產生，不包含主機名稱。`duduclaw license fingerprint`、Dashboard 啟用卡與換綁申請都使用此值。啟用只安裝已簽章授權，不會自行要求簽發。舊版 hostname + UUID 候選仍可驗證並標示 legacy；過去的主機名稱無法從雜湊還原，若舊綁定不再相符，請聯絡簽發端支援新格式後執行 `duduclaw license rebind`。
 
-MAC 衍生識別分為三種強度。**Hardware** 是全球管理的單播 MAC。**Instance** 是非已知共用占位值的本機管理單播 MAC，包含 GCP、AWS 與 Docker 網卡；狀態顯示「雲端／容器識別」。兩者都可驗證既有付費綁定，也可用於新啟用與經核准的換綁。主要 MAC 優先選 Hardware，其次 Instance。**Weak** 包含未取得或全零 MAC、共用 `02:00:00:00:00:00`、廣播 `FF:FF:FF:FF:FF:FF`、多播 MAC 與占位 UUID；即使相符，仍維持 OpenSource 直到核准換綁，也不會用於新綁定提案。Linux／Windows 保留舊版 hostname + MAC 雜湊，歷史 Instance 候選仍可驗證（非主要候選時 `legacy = true`）。作業系統管理員仍能複製這些識別；Instance 表示本機取得的識別證據，不代表硬體證明。macOS UUID v2 指紋與 UUID 讀取失敗時的限制維持不變。
+MAC 衍生識別分為三種強度。**Hardware** 是全球管理的單播 MAC。**Instance** 是 Linux／Windows 上非已知共用占位值的本機管理單播 MAC，包含 GCP、AWS 與 Docker 網卡；狀態顯示「雲端／容器識別」。兩者都可驗證既有付費綁定，也可用於新啟用與經核准的換綁。主要 MAC 優先選 Hardware，其次 Instance。**Weak** 包含未取得或全零 MAC、共用 `02:00:00:00:00:00` 與 Npcap／KM-TEST `02:00:4C:4F:4F:50`、廣播 `FF:FF:FF:FF:FF:FF`、多播 MAC 與占位 UUID；即使相符，仍維持 OpenSource 直到核准換綁，也不會用於新綁定提案。Linux／Windows 保留舊版 hostname + MAC 雜湊，歷史 Instance 候選仍可驗證（非主要候選時 `legacy = true`）。作業系統管理員仍能複製這些識別；Instance 表示本機取得的識別證據，不代表硬體證明。macOS 歷史本機管理 MAC 在 UUID 可讀或不可讀時都維持 Weak。Windows 選取主要介面時另排除軟體迴路、軟體虛擬及隧道介面類型與已知迴路描述。macOS UUID v2 指紋與 UUID 讀取失敗時的限制維持不變。
 
 重新綁定為新格式後，舊版程式無法驗證該授權。請先升級所有會讀取這份授權的程序；需要降版時，須先請簽發者安排相容的重新綁定。
 

@@ -87,6 +87,11 @@ fn cached_candidates() -> &'static [FingerprintCandidate] {
     FINGERPRINT_CANDIDATES.get_or_init(fingerprint_candidates)
 }
 
+/// Preferred locally observed identity class for the handshake snapshot.
+pub(crate) fn preferred_fingerprint_strength() -> Option<duduclaw_license::FingerprintStrength> {
+    cached_candidates().first().map(FingerprintCandidate::strength)
+}
+
 /// Return the effective machine fingerprint (see [`FINGERPRINT_CACHE`]).
 pub(crate) fn cached_fingerprint() -> String {
     FINGERPRINT_CACHE
