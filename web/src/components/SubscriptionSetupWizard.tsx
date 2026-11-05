@@ -27,6 +27,8 @@ const KNOWN_ERROR_CODES = [
   'invalid_code',
   'timeout',
   'validation_failed',
+  'capture_failed',
+  'authentication_rejected',
   'already_submitting',
   'io_error',
 ] as const;
