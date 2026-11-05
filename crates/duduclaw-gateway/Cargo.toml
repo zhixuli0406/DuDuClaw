@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+duduclaw-isolation = { workspace = true }
+duduclaw-mcp-boundary = { workspace = true, features = ["binding-store"] }
 # H4/H5 (WP-B goal loop hardening): gap-fingerprint path:line extraction +
 # the bail-pattern regex panel. Already a direct dependency elsewhere in the
 # workspace (duduclaw-cli, duduclaw-security, duduclaw-redaction), so no new
@@ -193,6 +195,8 @@ atspi = "0.30"
 songbird = { version = "0.5", optional = true, features = ["driver", "rustls", "receive"] }
 
 [features]
+# Integration branch supplies Package E's dependency; Package D alone does not.
+isolation-worker-integration = []
 default = ["dashboard", "desktop"]
 # Kept as an empty feature so existing `--features duduclaw-gateway/desktop`
 # invocations (release workflow) still resolve. It used to pull in

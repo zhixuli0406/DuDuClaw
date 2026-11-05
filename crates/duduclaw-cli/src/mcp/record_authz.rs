@@ -100,6 +100,11 @@ pub(crate) fn record_actor_for<'a>(
     caller_client_id: &'a str,
     default_agent: &'a str,
 ) -> RecordActor<'a> {
+    if let Some(call) = crate::mcp_isolation::current() {
+        return RecordActor::Agent(if call.agent == default_agent {
+            default_agent
+        } else { duduclaw_core::UNTRUSTED_AGENT_ID });
+    }
     let env_agent = std::env::var(duduclaw_core::ENV_AGENT_ID).ok();
     let client_is_agent = crate::mcp_namespace::client_is_agent(home_dir, caller_client_id);
     RecordActor::resolve(

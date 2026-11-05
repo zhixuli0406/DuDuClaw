@@ -2,9 +2,9 @@
 use super::*;
 use duduclaw_gateway::discovery::service::{self, TrustedCaller};
 fn caller(home: &Path, agent: &str) -> std::result::Result<TrustedCaller,String> {
-    let claim=std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    let claim=crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
     if claim != agent { return Err("discovery requires an explicit signed caller identity".into()); }
-    let token=std::env::var(duduclaw_core::ENV_AGENT_TOKEN).ok();
+    let token=crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_TOKEN).ok();
     TrustedCaller::from_signed_agent(home,&claim,token.as_deref())
 }
 pub(crate) async fn handle_discovery_create(args: &Value, home: &Path, agent: &str) -> Value {

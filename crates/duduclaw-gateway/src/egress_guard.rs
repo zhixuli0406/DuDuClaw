@@ -845,6 +845,51 @@ fn valid_source(source: &str) -> bool {
     !source.is_empty() && source.len() <= 256 && !source.chars().any(char::is_control)
 }
 
+/// Trusted in-process transport. The caller has checked the immutable MCP
+/// context against its home/employee/turn binding; no HTTP credential or env
+/// identity is consulted. Use the same ledger and connector policy as HTTP.
+pub(crate) fn isolated_exchange(home: &Path, agent: &str, turn: &str, op: &str,
+    source: Option<&str>, reservation: Option<&str>, payload: Option<bool>, own_read: Option<&str>,
+    connector_ref: Option<&str>, remote_server: Option<&str>) -> Result<serde_json::Value, String> {
+    if !crate::computer_use_sessions::turns::valid_turn_id(turn)
+        || source.is_some_and(|source| !valid_source(source))
+        || reservation.is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
+        || own_read.is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
+        || (connector_ref.is_some() && remote_server.is_some()) {
+        return Err("invalid isolated ledger request".into());
+    }
+    if op == "recipients" {
+        return crate::recipient_guard::context(home, agent, turn)
+            .map(|context| serde_json::json!(context));
+    }
+    let remote = remote_server.filter(|_| op == "mark")
+        .and_then(|server| connectors::remote_reference(home, agent, server));
+    let connector = connector_ref.filter(|reference| op == "mark" && connectors::declared_allowed(home, agent, reference))
+        .or(remote.as_deref());
+    let rejected = (connector_ref.is_some() || remote_server.is_some()) && connector.is_none();
+    let key = (agent.into(), turn.into());
+    let now = Instant::now();
+    let mut ledger = ledger().lock().map_err(|_| "ledger unavailable")?;
+    let state = match op {
+        "query" => ledger.query(&key, now),
+        "reserve" => ledger.reserve_with_policy(home, &key,
+            reservation.ok_or("missing reservation")?, source.ok_or("missing source")?, now)?,
+        "finish" => ledger.finish(&key, reservation.ok_or("missing reservation")?,
+            payload.ok_or("missing payload")?, now),
+        "acquire_sink" => ledger.acquire_persisted_sink(home, &key,
+            reservation.ok_or("missing reservation")?, own_read, now, chrono::Utc::now().timestamp_millis())?,
+        "release_sink" => ledger.release_sink(&key, reservation.ok_or("missing reservation")?, now),
+        "mark" => {
+            let source = source.ok_or("missing source")?;
+            if connector_ref.is_none() && remote_server.is_none() { ledger.mark(&key, source, now); }
+            ledger.stamp(&key, connector, rejected, now);
+            ledger.query(&key, now)
+        }
+        _ => return Err("unknown isolated ledger operation".into()),
+    };
+    Ok(serde_json::json!(state))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

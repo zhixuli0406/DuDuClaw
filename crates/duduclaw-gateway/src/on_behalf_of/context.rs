@@ -48,6 +48,29 @@ pub(crate) fn register(home: &Path, agent: &str) -> Option<ContextGuard> {
     register_value(home, agent, super::current())
 }
 fn register_value(home: &Path, agent: &str, principal: Option<String>) -> Option<ContextGuard> {
+    register_details(home, agent, principal,
+        crate::computer_use_sessions::attended_call::capture(agent),
+        crate::runtime::round_task_env().map(|(_, task)| task),
+        crate::memory_provenance::DISPATCH_RUN.try_with(Clone::clone).ok().flatten()
+            .map(|(_, run)| run))
+}
+
+/// Connection-bound MCP calls must not capture an unrelated gateway task's
+/// attendance, principal or round. The verified capability is the sole source.
+pub(crate) fn register_isolated(home: &Path, agent: &str,
+    context: &duduclaw_mcp_boundary::RequestContext) -> Option<ContextGuard> {
+    let principal = match &context.record().principal {
+        duduclaw_isolation::capability::Principal::Human { user_id, .. } =>
+            Some(duduclaw_core::HumanPrincipal::user(user_id.as_str())?.to_string()),
+        duduclaw_isolation::capability::Principal::Background { .. } => None,
+    };
+    register_details(home, agent, principal, None,
+        context.record().task.as_ref().map(|task| task.as_str().to_string()), None)
+}
+
+fn register_details(home: &Path, agent: &str, principal: Option<String>,
+    attendance: Option<crate::computer_use_sessions::attended_call::AttendedCall>,
+    task: Option<String>, run: Option<String>) -> Option<ContextGuard> {
     if !duduclaw_core::is_valid_agent_id(agent) {
         return None;
     }
@@ -78,10 +101,9 @@ fn register_value(home: &Path, agent: &str, principal: Option<String>) -> Option
             agent: agent.into(),
             principal,
             created: now,
-            attendance: crate::computer_use_sessions::attended_call::capture(agent),
-            task: crate::runtime::round_task_env().map(|(_, task)| task),
-            run: crate::memory_provenance::DISPATCH_RUN.try_with(Clone::clone).ok().flatten()
-                .map(|(_, run)| run),
+            attendance,
+            task,
+            run,
         },
     );
     Some(ContextGuard(reference))

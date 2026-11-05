@@ -62,11 +62,11 @@ impl DelegationContext {
     /// Read from env vars set by the dispatcher. This is the ONLY trusted source
     /// in production — tool params are ignored to prevent LLM agents from spoofing.
     fn from_env() -> Self {
-        let depth = std::env::var(duduclaw_core::ENV_DELEGATION_DEPTH)
+        let depth = crate::mcp_isolation_identity::var(duduclaw_core::ENV_DELEGATION_DEPTH)
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
             .unwrap_or(0);
-        let origin = std::env::var(duduclaw_core::ENV_DELEGATION_ORIGIN)
+        let origin = crate::mcp_isolation_identity::var(duduclaw_core::ENV_DELEGATION_ORIGIN)
             .ok()
             .filter(|s| !s.is_empty());
         Self { depth, origin }

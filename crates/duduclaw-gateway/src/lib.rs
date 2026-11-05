@@ -30,6 +30,13 @@
 #![allow(clippy::sliced_string_as_bytes)]
 #![allow(clippy::if_same_then_else)]
 
+pub mod isolation_mcp;
+pub mod isolation_egress;
+pub mod isolation_resources;
+pub mod isolation_connectors;
+pub mod isolation_connector_clients;
+pub mod isolation_execution;
+
 // The live-test seams (in-memory credential protection, Google REST base
 // override) must never reach a shipped binary.
 #[cfg(all(feature = "live-test-mocks", not(debug_assertions)))]

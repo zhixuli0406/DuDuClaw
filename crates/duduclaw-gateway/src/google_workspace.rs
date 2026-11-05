@@ -729,6 +729,7 @@ pub async fn api_get(token: &str, url: &str) -> Result<Value, GoogleApiError> {
 fn http_client() -> Result<reqwest::Client, GoogleApiError> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .redirect(crate::isolation_connector_clients::redirects())
         .build()
         .map_err(|e| GoogleApiError::Http(format!("client build failed: {e}")))
 }
@@ -763,7 +764,7 @@ async fn google_request(
     body: Option<&Value>,
 ) -> Result<Value, GoogleApiError> {
     let client = http_client()?;
-    let retry_allowed = automatic_retry_allowed(&method);
+    let retry_allowed = automatic_retry_allowed(&method) && !crate::isolation_connector_clients::active();
 
     let mut attempt = 0;
     loop {
@@ -778,6 +779,8 @@ async fn google_request(
             req = req.json(b);
         }
 
+        crate::isolation_connector_clients::before_request("google", url)
+            .map_err(|message| GoogleApiError::Http(message.to_owned()))?;
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
@@ -826,7 +829,7 @@ async fn google_request_text(
     query: &[(&str, String)],
 ) -> Result<String, GoogleApiError> {
     let client = http_client()?;
-    let retry_allowed = automatic_retry_allowed(&method);
+    let retry_allowed = automatic_retry_allowed(&method) && !crate::isolation_connector_clients::active();
 
     let mut attempt = 0;
     loop {
@@ -838,6 +841,8 @@ async fn google_request_text(
             req = req.query(query);
         }
 
+        crate::isolation_connector_clients::before_request("google", url)
+            .map_err(|message| GoogleApiError::Http(message.to_owned()))?;
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {

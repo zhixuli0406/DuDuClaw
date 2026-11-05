@@ -33,6 +33,12 @@
 //! `row_count` — the *shape* of the read. Cell content is never written
 //! there: the audit log is not where customer data belongs (same rule as
 //! `mcp_db.rs`'s filter values).
+//!
+//! Native isolation uses a separate path below: immutable request identity,
+//! granted workspace dirfds and openat2. CSV/workbook bytes go only to E's
+//! fd-only parser adapter; an absent adapter refuses without a legacy fallback.
+//! The canonicalized path and in-process parsers described above remain legacy
+//! transport behavior only.
 
 use std::path::{Path, PathBuf};
 
@@ -326,6 +332,9 @@ fn json_null() -> Value {
 /// Read a plain-text file (txt / md / json / log / yaml …), capped at
 /// [`FILE_READ_MAX_BYTES`].
 pub fn handle_file_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if let Some(call) = crate::mcp_isolation::current() {
+        return isolated_file_read(arguments, home_dir, agent_id, &call);
+    }
     let raw_path = arg_str(arguments, "path");
     let path = match vet_path(raw_path, home_dir, agent_id) {
         Ok(p) => p,
@@ -373,6 +382,43 @@ pub fn handle_file_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> V
     files_json(&payload)
 }
 
+fn isolated_file_read(arguments: &Value, home_dir: &Path, agent_id: &str,
+    call: &crate::mcp_isolation::IsolatedCall) -> Value {
+    use std::io::Read;
+    let fail = || files_error("無法讀取這次執行授權範圍內的文字檔。");
+    if call.agent != agent_id || duduclaw_mcp_boundary::check_arguments(arguments).is_err() {
+        return fail();
+    }
+    let Some(object) = arguments.as_object() else { return fail(); };
+    if object.keys().any(|key| !matches!(key.as_str(), "workspace" | "path" | "max_bytes")) {
+        return fail();
+    }
+    let handle = arg_str(arguments, "workspace");
+    let raw_path = arg_str(arguments, "path");
+    let path = match duduclaw_mcp_boundary::resources::relative_path(raw_path) {
+        Ok(path) => path, Err(_) => return fail(),
+    };
+    if structured_extension(path).is_some() {
+        return files_error("此工具只讀純文字；請以 csv_read 或 xlsx_read 讀取結構化資料檔。");
+    }
+    let file = match call.roots.open_read(&call.context, handle, raw_path) {
+        Ok(file) => file, Err(_) => return fail(),
+    };
+    let total = match file.metadata() { Ok(metadata) => metadata.len(), Err(_) => return fail() };
+    let max_bytes = arg_usize(arguments, "max_bytes").map(|n| n as u64)
+        .unwrap_or(FILE_READ_MAX_BYTES).clamp(1, FILE_READ_MAX_BYTES);
+    let mut bytes = Vec::new();
+    if file.take(max_bytes).read_to_end(&mut bytes).is_err() { return fail(); }
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text.to_owned(),
+        Err(error) => String::from_utf8_lossy(&bytes[..error.valid_up_to()]).into_owned(),
+    };
+    let table = table_name(path);
+    audit(home_dir, agent_id, "file_read", path, &table, None, true);
+    files_json(&json!({"path": raw_path, "table": table, "text": text,
+        "truncated": total > bytes.len() as u64}))
+}
+
 /// The file's extension when it is one `file_read` must not swallow.
 fn structured_extension(path: &Path) -> Option<String> {
     let ext = path
@@ -393,12 +439,63 @@ fn read_prefix(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
 
 // ── csv_read ────────────────────────────────────────────────────────────────
 
+/// Isolated table readers keep the original dispatch gates, but send the exact
+/// authorized fd to E instead of invoking a parser with the gateway's identity.
+pub async fn handle_isolated_table_read(tool: &str, arguments: &Value,
+    home_dir: &Path, agent_id: &str) -> Value {
+    use duduclaw_mcp_boundary::parsing::{TableKind, TableOptions, table_request, decode_table_response};
+    let fail = || files_error("無法解析這次執行授權範圍內的資料檔。");
+    let Some(call) = crate::mcp_isolation::current() else { return fail(); };
+    let Some(parser) = call.parser.as_ref() else { return fail(); };
+    if call.agent != agent_id || duduclaw_mcp_boundary::check_arguments(arguments).is_err() {
+        return fail();
+    }
+    let Some(object) = arguments.as_object() else { return fail(); };
+    let kind = match tool { "csv_read" => TableKind::Csv, "xlsx_read" => TableKind::Spreadsheet,
+        _ => return fail() };
+    if object.keys().any(|key| match key.as_str() {
+        "workspace" | "path" | "offset" | "limit" => false,
+        "delimiter" | "has_header" => kind != TableKind::Csv,
+        "sheet" => kind != TableKind::Spreadsheet,
+        _ => true,
+    }) { return fail(); }
+    let delimiter = match resolve_delimiter(arguments) { Ok(value) => value, Err(_) => return fail() };
+    let options = TableOptions { kind, delimiter, has_header: arg_bool(arguments, "has_header").unwrap_or(true),
+        offset: resolve_offset(arguments), limit: resolve_limit(arguments),
+        sheet: arguments.get("sheet").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned) };
+    if options.validate().is_err() { return fail(); }
+    let raw_path = arg_str(arguments, "path");
+    let path = match duduclaw_mcp_boundary::resources::relative_path(raw_path) {
+        Ok(path) => path, Err(_) => return fail(),
+    };
+    let input = match call.roots.open_read(&call.context, arg_str(arguments, "workspace"), raw_path) {
+        Ok(input) => input, Err(_) => return fail(),
+    };
+    let request = match table_request(&input, &options) { Ok(request) => request, Err(_) => return fail() };
+    let response = match tokio::time::timeout(std::time::Duration::from_secs(30),
+        parser.parse(call.context.clone(), request.clone(), input, options.clone())).await {
+        Ok(Ok(response)) => response, _ => return fail(),
+    };
+    let mut payload = match decode_table_response(&request, &options, response) {
+        Ok(payload) => payload, Err(_) => return fail(),
+    };
+    let table = table_name(path);
+    payload["path"] = json!(raw_path);
+    payload["table"] = json!(table);
+    let rows = payload["row_count"].as_u64().map(|n| n as usize);
+    audit(home_dir, agent_id, tool, path, &table, rows, true);
+    files_json(&payload)
+}
+
 /// Read a delimited text file into `{columns, rows, row_count, truncated}`.
 ///
 /// Cells are always strings: a CSV has no types, and guessing them (is
 /// `0912345678` a number or a phone?) would both mangle data and hand the
 /// redaction rules a shape that changes per file.
 pub fn handle_csv_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if crate::mcp_isolation::current().is_some() {
+        return files_error("隔離執行必須透過授權的資料解析服務。");
+    }
     let raw_path = arg_str(arguments, "path");
     let path = match vet_path(raw_path, home_dir, agent_id) {
         Ok(p) => p,
@@ -535,6 +632,9 @@ fn empty_table_result(
 /// Read one worksheet of a workbook (xlsx / xlsm / xls / ods) into the same
 /// shape `csv_read` returns, plus `sheet` and `sheets`.
 pub fn handle_xlsx_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if crate::mcp_isolation::current().is_some() {
+        return files_error("隔離執行必須透過授權的資料解析服務。");
+    }
     use calamine::Reader;
 
     let raw_path = arg_str(arguments, "path");

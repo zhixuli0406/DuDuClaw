@@ -172,6 +172,7 @@ pub(crate) fn lane_refusal(lane: &duduclaw_core::ProcessLane, name: &str) -> Opt
 
 /// Whether this process was spawned by the gateway for an employee.
 pub(crate) fn employee_process_from_env() -> bool {
+    if crate::mcp_isolation::current().is_some() { return true; }
     std::env::var(duduclaw_core::ENV_AGENT_ID).is_ok_and(|v| !v.trim().is_empty())
 }
 
@@ -298,7 +299,7 @@ pub(crate) async fn visible_tools_with(
         home_dir,
         default_agent,
         employee_process,
-        &duduclaw_core::ProcessLane::current(),
+        &crate::mcp_isolation::process_lane(),
     )
     .await
 }
@@ -522,6 +523,7 @@ pub(crate) async fn visible_tools_in_lane(
     let scoped = duduclaw_gateway::capability_grants::scoped_tools(&agent_dir);
 
     tools()
+        .filter(|t| crate::mcp_isolation::tool_allowed(t.name, principal))
         .filter(|t| !matches!(t.name, "meeting_transcribe" | "meeting_transcribe_status" | "meeting_transcribe_cancel" | "meeting_upload_link") || meeting_listed(home_dir, principal))
         .filter(|t| background_allowed || !super::creates_background_work(t.name))
         .filter(|t| {

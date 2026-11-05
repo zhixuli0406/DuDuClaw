@@ -851,6 +851,20 @@ pub async fn run_utility_prompt_with_hint(
             "output_schema requested but this runtime has no structured-output flag — ignored"
         );
     }
+    if crate::isolation_egress::resolved_identity().is_some() {
+        // Keep original provider, model, autonomy and budget gates before the
+        // host execution handoff. CLI utilities can retain read-capable tools.
+        if spec.provider != RuntimeType::Claude {
+            crate::runtime_config::ensure_model_provider(&spec.model, spec.provider)?;
+        }
+        let budget_kind = if spec.provider == RuntimeType::Claude { "claude_utility" } else { "runtime_dispatch" };
+        crate::budget::gate_before_spawn(home_dir, agent_dir, agent_id, budget_kind)
+            .await.map_err(|e| e.legacy_message())?;
+        return crate::isolation_egress::run_utility(crate::isolation_egress::UtilityRequest {
+            home: home_dir, agent_dir, agent: agent_id, system_prompt, prompt, max_tokens, hint,
+            provider: spec.provider, model: &spec.model,
+        }).await.unwrap_or_else(|| Err("isolated utility context unavailable".into()));
+    }
     if spec.provider == RuntimeType::Claude {
         crate::budget::gate_before_spawn(home_dir, agent_dir, agent_id, "claude_utility")
             .await.map_err(|e| e.legacy_message())?;

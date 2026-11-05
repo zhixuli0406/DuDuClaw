@@ -274,8 +274,11 @@ pub(crate) async fn run_approval_bound(
     let kind = subject.action_kind();
     // F5-D: a card raised inside a goal round names that round's task (set
     // by the gateway at spawn), so the inbox applies the task's audience.
-    let mut payload =
-        duduclaw_core::with_host_task_id(payload, duduclaw_core::host_task_id().as_deref());
+    let task = match crate::mcp_isolation::current() {
+        Some(call) => call.context.record().task.as_ref().map(|task| task.as_str().to_owned()),
+        None => duduclaw_core::host_task_id(),
+    };
+    let mut payload = duduclaw_core::with_host_task_id(payload, task.as_deref());
     if let (Some(g), Some(obj)) = (grant, payload.as_object_mut()) {
         obj.insert(
             duduclaw_gateway::approval::action_grant::ACTION_GRANT_KEY.to_string(),

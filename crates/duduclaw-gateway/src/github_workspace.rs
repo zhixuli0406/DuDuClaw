@@ -318,6 +318,7 @@ pub async fn get_valid_github_token(home_dir: &Path) -> Result<String, GithubAut
 fn http_client() -> Result<reqwest::Client, GithubApiError> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .redirect(crate::isolation_connector_clients::redirects())
         .build()
         .map_err(|e| GithubApiError::Http(format!("client build failed: {e}")))
 }
@@ -348,10 +349,12 @@ async fn github_request(
             req = req.json(b);
         }
 
+        crate::isolation_connector_clients::before_request("github", url)
+            .map_err(|message| GithubApiError::Http(message.to_owned()))?;
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                if attempt < 2 {
+                if attempt < 2 && !crate::isolation_connector_clients::active() {
                     continue;
                 }
                 return Err(GithubApiError::Http(format!("request failed: {e}")));
@@ -368,7 +371,7 @@ async fn github_request(
                 .map_err(|e| GithubApiError::Http(format!("invalid JSON from GitHub: {e}")));
         }
 
-        if (500..=599).contains(&code) && attempt < 2 {
+        if (500..=599).contains(&code) && attempt < 2 && !crate::isolation_connector_clients::active() {
             continue;
         }
 

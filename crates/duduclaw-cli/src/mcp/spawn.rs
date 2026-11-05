@@ -14,8 +14,8 @@ pub(crate) async fn spawn_agent_with_ctx(
 ) -> Value {
     spawn_agent_with_ctx_and_upstream(
         params, home_dir, caller, ctx,
-        (std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).ok(),
-         std::env::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok()),
+        (crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_TURN_ID).ok(),
+         crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok()),
     ).await
 }
 
@@ -134,7 +134,7 @@ pub(crate) async fn spawn_agent_with_ctx_and_upstream(
     stamp_spawn_upstream(&mut entry, home_dir, caller, &task_id, upstream);
     // A run in the explore lane hands read-only work on: the dispatcher
     // reads this like `message_queue.lane`.
-    if let Some(lane) = duduclaw_core::ProcessLane::current().delegation_stamp() {
+    if let Some(lane) = crate::mcp_isolation::process_lane().delegation_stamp() {
         entry["lane"] = serde_json::json!(lane);
     }
     // The person this run works for (host env only); the dispatcher scopes
@@ -230,7 +230,7 @@ pub(crate) async fn handle_spawn_ephemeral(params: &Value, home_dir: &Path, call
     // The capability envelope is the ACTUAL caller's — in delegated contexts
     // that is the delegation sender (same trusted env source the audit trail
     // uses), never a spoofable tool param.
-    let actual_caller = std::env::var(duduclaw_core::ENV_DELEGATION_SENDER)
+    let actual_caller = crate::mcp_isolation_identity::var(duduclaw_core::ENV_DELEGATION_SENDER)
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| caller.to_string());
@@ -252,8 +252,8 @@ pub(crate) async fn spawn_ephemeral_with_ctx(
 ) -> Value {
     spawn_ephemeral_with_ctx_and_upstream(
         params, home_dir, caller, ctx,
-        (std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).ok(),
-         std::env::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok()),
+        (crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_TURN_ID).ok(),
+         crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok()),
     ).await
 }
 
@@ -401,7 +401,7 @@ pub(crate) async fn spawn_ephemeral_with_ctx_and_upstream(
             if let Some(principal) = host_on_behalf_of(home_dir, caller) {
                 payload["on_behalf_of"] = serde_json::json!(principal);
             }
-            if let Some(lane) = duduclaw_core::ProcessLane::current().delegation_stamp() {
+            if let Some(lane) = crate::mcp_isolation::process_lane().delegation_stamp() {
                 payload["lane"] = serde_json::json!(lane);
             }
             let _admission = match admit_background_identity(home_dir, caller, "spawn_ephemeral").await {
@@ -505,7 +505,7 @@ pub(crate) async fn spawn_ephemeral_with_ctx_and_upstream(
     if let Some(principal) = host_on_behalf_of(home_dir, caller) {
         entry["on_behalf_of"] = serde_json::json!(principal);
     }
-    if let Some(lane) = duduclaw_core::ProcessLane::current().delegation_stamp() {
+    if let Some(lane) = crate::mcp_isolation::process_lane().delegation_stamp() {
         entry["lane"] = serde_json::json!(lane);
     }
     let admission = match admit_background_identity(home_dir, caller, "spawn_ephemeral").await {

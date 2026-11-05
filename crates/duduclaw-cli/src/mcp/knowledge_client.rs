@@ -74,7 +74,7 @@ pub(crate) fn available_for(home: &Path, agent_id: &str) -> bool {
 }
 
 fn turn_id() -> Option<String> {
-    std::env::var(duduclaw_core::ENV_TRUST_TURN_ID)
+    crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_TURN_ID)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty() && v.len() <= 128 && !v.chars().any(char::is_control))
@@ -83,7 +83,7 @@ fn turn_id() -> Option<String> {
 /// The `DUDUCLAW_DISPATCH_RUN_ID` of this MCP process (cron and dispatched
 /// runs), sent so the gateway can treat the call as a system turn.
 fn run_id() -> Option<String> {
-    std::env::var(duduclaw_core::ENV_DISPATCH_RUN_ID)
+    crate::mcp_isolation_identity::var(duduclaw_core::ENV_DISPATCH_RUN_ID)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty() && v.len() <= 128 && !v.chars().any(char::is_control))
@@ -209,7 +209,7 @@ fn interpret(status: u16, body: &[u8]) -> Result<Value, String> {
 
 async fn post(home: &Path, agent_id: &str, body: &Value) -> Result<Value, String> {
     let env = |name: &str| {
-        std::env::var(name)
+        crate::mcp_isolation_identity::var(name)
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())

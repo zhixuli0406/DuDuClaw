@@ -49,6 +49,7 @@ mod discovery;
 pub(crate) use discovery::DiscoveryDecisionReceipt;
 mod goals;
 mod iterations;
+mod isolation_queries;
 mod plans;
 mod principal;
 mod pure;

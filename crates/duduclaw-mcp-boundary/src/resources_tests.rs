@@ -1,0 +1,218 @@
+use super::*;
+use duduclaw_isolation::{bounded::{List, Text}, capability::*, ids::{RunId, Sha256Digest}};
+fn directory(path: &Path) -> File {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).custom_flags(0x02000000).open(path).unwrap()
+    }
+    #[cfg(not(windows))]
+    { File::open(path).unwrap() }
+}
+fn context() -> RequestContext {
+    RequestContext::from_verified_record(CapabilityRecord {
+        id: CapabilityId(Sha256Digest([1; 32])), employee: EmployeeId([2; 16]), run: RunId([3; 16]),
+        task: None, principal: Principal::Human { user_id: Text::new("u".into()).unwrap(), generation: 1 },
+        employee_binding: EmployeeBinding::Personal(Text::new("u".into()).unwrap()), lane: Lane::Standard,
+        tools: List::new(vec![]).unwrap(), resources: List::new(vec![ResourceGrant::Workspace {
+            handle: Text::new("work".into()).unwrap() }]).unwrap(), policy_revision: 1,
+        gateway_epoch: [0; 16], issued_at: 1, not_before: 1, expires_at: 2, nonce: [0; 32], jti: [0; 16],
+    })
+}
+#[test]
+fn resource_paths_reject_absolute_parent_and_ambiguous_components() {
+    for path in ["", "/etc/passwd", "../secret", "a/../b", "a/./b", "a//b", "a/", "a\\b", "a\0b"] {
+        assert!(relative_path(path).is_err(), "{path:?}");
+    }
+    assert!(relative_path("notes/員工.md").is_ok());
+}
+#[test]
+fn connector_grants_cannot_cross_personal_or_shared_bindings() {
+    let mut record = context().record().clone();
+    record.employee_binding = EmployeeBinding::Shared(Text::new("tenant-a".into()).unwrap());
+    record.resources = List::new(vec![ResourceGrant::Connector {
+        account: Text::new("account".into()).unwrap(),
+        binding: EmployeeBinding::Shared(Text::new("tenant-b".into()).unwrap()),
+    }]).unwrap();
+    assert!(validate_grants(&record).is_err());
+    record.resources = List::new(vec![ResourceGrant::Connector {
+        account: Text::new("account".into()).unwrap(), binding: record.employee_binding.clone(),
+    }]).unwrap();
+    assert!(validate_grants(&record).is_ok());
+    record.employee_binding = EmployeeBinding::Personal(Text::new("u".into()).unwrap());
+    assert!(validate_grants(&record).is_err());
+}
+#[test]
+fn ungranted_workspaces_and_other_employees_are_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut roots = ResourceRoots::default();
+    roots.insert("work".into(), EmployeeId([9; 16]), directory(dir.path())).unwrap();
+    assert!(roots.open_read(&context(), "work", "file").is_err());
+    assert!(roots.open_read(&context(), "unknown", "file").is_err());
+    assert!(roots.open_directory(&context(), "work", None).is_err());
+    assert!(roots.open_directory(&context(), "unknown", None).is_err());
+}
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn unsupported_platform_refuses_without_path_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("file"), b"data").unwrap();
+    let mut roots = ResourceRoots::default();
+    roots.insert("work".into(), context().record().employee, directory(dir.path())).unwrap();
+    assert!(roots.open_read(&context(), "work", "file").is_err());
+    assert!(roots.open_directory(&context(), "work", None).is_err());
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn openat2_rejects_symlinks_hardlinks_directories_and_fifo() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir_in("/dev/shm").unwrap();
+    std::fs::write(dir.path().join("file"), b"safe").unwrap();
+    symlink("file", dir.path().join("link")).unwrap();
+    std::fs::create_dir(dir.path().join("directory")).unwrap();
+    rustix::fs::mknodat(rustix::fs::CWD, dir.path().join("fifo"), rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR, 0).unwrap();
+    let mut roots = ResourceRoots::default();
+    roots.insert("work".into(), context().record().employee, File::open(dir.path()).unwrap()).unwrap();
+    assert!(roots.open_read(&context(), "work", "file").is_ok());
+    assert!(roots.open_directory(&context(), "work", None).is_ok());
+    assert!(roots.open_directory(&context(), "work", Some("directory")).is_ok());
+    assert!(roots.open_directory(&context(), "work", Some("file")).is_err());
+    for path in ["link", "directory", "fifo"] { assert!(roots.open_read(&context(), "work", path).is_err()); }
+    std::fs::hard_link(dir.path().join("file"), dir.path().join("hard")).unwrap();
+    assert!(roots.open_read(&context(), "work", "hard").is_err());
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn symlink_swap_during_openat2_never_reads_outside_root() {
+    use std::{io::Read, os::unix::fs::symlink, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+    let root = tempfile::tempdir_in("/dev/shm").unwrap();
+    let outside = tempfile::tempdir_in("/dev/shm").unwrap();
+    std::fs::write(outside.path().join("secret"), b"secret").unwrap();
+    std::fs::create_dir(root.path().join("inside")).unwrap();
+    std::fs::write(root.path().join("inside/secret"), b"safe").unwrap();
+    let mut roots = ResourceRoots::default();
+    roots.insert("work".into(), context().record().employee, File::open(root.path()).unwrap()).unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    let flag = running.clone();
+    let path = root.path().to_owned();
+    let target = outside.path().to_owned();
+    let writer = std::thread::spawn(move || {
+        while flag.load(Ordering::Relaxed) {
+            std::fs::rename(path.join("inside"), path.join("saved")).unwrap();
+            symlink(&target, path.join("inside")).unwrap();
+            std::fs::remove_file(path.join("inside")).unwrap();
+            std::fs::rename(path.join("saved"), path.join("inside")).unwrap();
+        }
+    });
+    for _ in 0..2000 {
+        if let Ok(mut file) = roots.open_read(&context(), "work", "inside/secret") {
+            let mut text = String::new();
+            file.read_to_string(&mut text).unwrap();
+            assert_eq!(text, "safe");
+        }
+    }
+    running.store(false, Ordering::Relaxed);
+    writer.join().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires root and mount privileges; creates only temporary test mounts"]
+fn iso_root_openat2_mount_crossing_devices_and_nodev() {
+    use std::{ffi::CString, os::unix::{ffi::OsStrExt, net::UnixListener}};
+    struct Mount(CString);
+    impl Mount {
+        fn new(path: &Path, nodev: bool) -> Self {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let flags = libc::MS_NOSUID | libc::MS_NOEXEC | if nodev { libc::MS_NODEV } else { 0 };
+            // SAFETY: all strings live across mount; each destination is a new
+            // test directory, never an existing operator mount.
+            let result = unsafe { libc::mount(c"tmpfs".as_ptr(), path.as_ptr(), c"tmpfs".as_ptr(),
+                flags, c"size=1m,mode=0700".as_ptr().cast()) };
+            assert_eq!(result, 0, "mount: {}", std::io::Error::last_os_error());
+            Self(path)
+        }
+    }
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            // SAFETY: this guard owns precisely the temporary mount above.
+            let result = unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) };
+            assert_eq!(result, 0, "unmount: {}", std::io::Error::last_os_error());
+        }
+    }
+    // SAFETY: geteuid has no inputs and no side effects.
+    assert_eq!(unsafe { libc::geteuid() }, 0, "run the ignored suite as root");
+    let dir = tempfile::tempdir().unwrap();
+    let _mount = Mount::new(dir.path(), true);
+    std::fs::write(dir.path().join("file"), b"safe").unwrap();
+    std::fs::create_dir(dir.path().join("nested")).unwrap();
+    let _nested = Mount::new(&dir.path().join("nested"), true);
+    std::fs::write(dir.path().join("nested/secret"), b"other mount").unwrap();
+    let _socket = UnixListener::bind(dir.path().join("socket")).unwrap();
+    rustix::fs::mknodat(rustix::fs::CWD, dir.path().join("device"), rustix::fs::FileType::CharacterDevice,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR, rustix::fs::makedev(1, 3)).unwrap();
+    let mut roots = ResourceRoots::default();
+    roots.insert("work".into(), context().record().employee, File::open(dir.path()).unwrap()).unwrap();
+    assert!(roots.open_read(&context(), "work", "file").is_ok());
+    assert!(roots.open_directory(&context(), "work", None).is_ok());
+    for path in ["nested/secret", "device", "socket"] {
+        assert!(roots.open_read(&context(), "work", path).is_err(), "{path}");
+    }
+    assert!(roots.open_directory(&context(), "work", Some("nested")).is_err());
+    let unsafe_dir = tempfile::tempdir().unwrap();
+    let _unsafe_mount = Mount::new(unsafe_dir.path(), false);
+    std::fs::write(unsafe_dir.path().join("file"), b"safe bytes on unsafe mount").unwrap();
+    let mut unsafe_roots = ResourceRoots::default();
+    unsafe_roots.insert("work".into(), context().record().employee, File::open(unsafe_dir.path()).unwrap()).unwrap();
+    assert!(unsafe_roots.open_read(&context(), "work", "file").is_err());
+    assert!(unsafe_roots.open_directory(&context(), "work", None).is_err());
+}
+
+#[test]
+fn wiki_roots_cannot_be_authorized_by_workspace_or_another_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut roots = ResourceRoots::default();
+    roots.insert_wiki("agent:main".into(), context().record().employee, directory(dir.path())).unwrap();
+    assert!(roots.open_wiki_read(&context(), "agent:main", "page.md").is_err());
+    let mut record = context().record().clone();
+    record.resources = List::new(vec![ResourceGrant::Wiki { namespace: Text::new("agent:other".into()).unwrap() }]).unwrap();
+    assert!(roots.open_wiki_read(&RequestContext::from_verified_record(record), "agent:main", "page.md").is_err());
+    assert!(roots.open_read(&context(), "agent:main", "page.md").is_err());
+    assert!(roots.insert_wiki("agent:main".into(), context().record().employee, directory(dir.path())).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn wiki_read_uses_openat2_fd_and_never_reopens_swapped_path() {
+    use std::{io::Read, os::unix::fs::symlink};
+    let dir = tempfile::tempdir_in("/dev/shm").unwrap();
+    std::fs::write(dir.path().join("page.md"), b"published").unwrap();
+    let mut roots = ResourceRoots::default();
+    roots.insert_wiki("agent:main".into(), context().record().employee, directory(dir.path())).unwrap();
+    let mut record = context().record().clone();
+    record.resources = List::new(vec![ResourceGrant::Wiki { namespace: Text::new("agent:main".into()).unwrap() }]).unwrap();
+    let context = RequestContext::from_verified_record(record);
+    let mut opened = roots.open_wiki_read(&context, "agent:main", "page.md").unwrap();
+    std::fs::rename(dir.path().join("page.md"), dir.path().join("saved.md")).unwrap();
+    symlink("/etc/passwd", dir.path().join("page.md")).unwrap();
+    let mut text = String::new();
+    opened.read_to_string(&mut text).unwrap();
+    assert_eq!(text, "published");
+    assert!(roots.open_wiki_read(&context, "agent:main", "page.md").is_err());
+    assert!(roots.open_wiki_read(&context, "agent:main", "../page.md").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn wiki_root_replacement_cannot_serve_withdrawn_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let live = dir.path().join("wiki");
+    std::fs::create_dir(&live).unwrap();
+    let mut roots = ResourceRoots::default();
+    roots.insert_wiki("agent:main".into(), context().record().employee, directory(&live)).unwrap();
+    assert!(roots.verify_wiki_root("agent:main", &directory(&live)).is_ok());
+    std::fs::rename(&live, dir.path().join("withdrawn")).unwrap();
+    std::fs::create_dir(&live).unwrap();
+    assert!(roots.verify_wiki_root("agent:main", &directory(&live)).is_err());
+}

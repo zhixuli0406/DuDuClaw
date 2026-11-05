@@ -207,6 +207,7 @@ pub(crate) fn shared_wiki_reader<'a>(
 /// reading `DUDUCLAW_DELEGATION_SENDER` verbatim, because "who is allowed to
 /// delegate here" and "who executed this tool call" are different questions.
 pub(crate) fn resolve_audit_agent(fallback: impl FnOnce() -> String) -> String {
+    if let Some(call) = crate::mcp_isolation::current() { return call.agent.clone(); }
     match std::env::var(duduclaw_core::ENV_DELEGATION_SENDER) {
         Ok(sender) if !sender.is_empty() && !duduclaw_core::is_system_sender(&sender) => sender,
         _ => fallback(),

@@ -7,8 +7,12 @@ use duduclaw_core::types::{AgentConfig, Message, MessageType};
 const NOT_AVAILABLE: &str = "not available";
 
 fn process_employee(home: &Path, caller: &str, default_agent: &str) -> Option<String> {
-    let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
-    let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
+    if let Some(employee) = crate::mcp_isolation_identity::verified_employee(home) {
+        let employee = employee.ok()?;
+        return (employee == super::acting_agent_id(caller, default_agent)).then_some(employee);
+    }
+    let claimed = crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    let token = crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
     employee_from_claim(home, caller, default_agent, &claimed, &token)
 }
 
