@@ -19,6 +19,7 @@ members = [
     "crates/duduclaw-isolation",
     "crates/duduclaw-execution",
     "crates/duduclaw-spawnd",
+    "crates/duduclaw-run",
     "crates/duduclaw-auth",
     "crates/duduclaw-gateway",
     "crates/duduclaw-security",

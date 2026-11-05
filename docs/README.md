@@ -116,6 +116,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 |----------|-------------|--------|
 | [architecture/overview.md](architecture/overview.md) | System architecture overview | Current |
 | [architecture/native-linux-isolation.md](architecture/native-linux-isolation.md) | Native execution backends and spawn inventory; integration incomplete | Unreleased |
+| [architecture/native-linux-isolation.md](architecture/native-linux-isolation.md) | Native Linux isolation implementation boundaries and pending acceptance | In development |
 | [architecture/evolution-engine.md](architecture/evolution-engine.md) | Evolution Engine — Prediction + AEE/Playbook (the only evolution path; the legacy SOUL.md rewrite path was removed) + Cognitive Memory | Current |
 
 ## Design Proposals (RFC / ADR)

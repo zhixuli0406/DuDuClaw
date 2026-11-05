@@ -2425,6 +2425,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-run"
+version = "1.79.3"
+dependencies = [
+ "duduclaw-isolation",
+ "landlock",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "duduclaw-sandbox"
 version = "1.79.3"
 dependencies = [
