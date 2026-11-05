@@ -1,5 +1,7 @@
 # DuDuClaw 架構總覽
 
+**Codex 外部設定檢查（尚未發佈）：** 外部設定不存在或未定義 MCP 時，一般員工、Explore、utility、Task Sandbox 與 Discovery 可執行；偵測到 MCP 或既有設定無法讀取／解析時，回報來源並拒絕。明確指定的 Codex 判官遭拒時，驗收失敗，不改用預設判官。這是啟動前的本機／快取快照檢查，無法保證後續雲端更新的完整隔離；[來源範圍與限制](../extension-gates.md)。
+
 ## 架構總覽（依 v1.67.0 校對）
 
 DuDuClaw 是一套**多執行環境 AI Agent 平台（Multi-Runtime AI Agent Platform）**，透過統一的 `AgentRuntime` trait 支援 **Claude Code / Codex / Grok** CLI（另有 OpenAI 相容 API）作為 AI 後端（Gemini CLI 後端已移除），具備自動偵測與逐 Agent 設定能力。DuDuClaw 並非獨立的 LLM 產品；它是把一個（或多個）AI CLI 轉變成長駐運作 Agent 的管線層，涵蓋通道路由、對話記憶、自我演化、多帳號輪替、本機 LLM 推理、瀏覽器自動化與 IDE 整合。

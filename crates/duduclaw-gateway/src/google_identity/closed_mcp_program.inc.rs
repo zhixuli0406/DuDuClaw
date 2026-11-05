@@ -143,6 +143,7 @@ pub(super) async fn run<I: LocalIo>(
                 .unwrap_or_else(|| serde_json::json!({"type":"object"}));
             scrub_nested(io, &mut input_schema, 64)?;
             defs.push(McpToolDef {
+                annotations: duduclaw_core::ToolAnnotations::from_tool(tool),
                 name: name.into(),
                 description,
                 input_schema,

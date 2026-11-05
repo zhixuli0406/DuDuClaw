@@ -485,7 +485,8 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_maintenance_log_access(params, ctx)).await
             }
 
-            unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
+            unknown => self.extension.handle_method(unknown, params, ctx).await
+                .unwrap_or_else(|| WsFrame::error_response("", &format!("Unknown method: {unknown}"))),
         }
     }
 }

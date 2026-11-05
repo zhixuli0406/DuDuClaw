@@ -1,5 +1,7 @@
 # 資料外送防護
 
+**Codex 外部設定檢查（尚未發佈）：** 外部設定不存在或未定義 MCP 時，一般員工、Explore、utility、Task Sandbox 與 Discovery 可執行；偵測到 MCP 或既有設定無法讀取／解析時，回報來源並拒絕。明確指定的 Codex 判官遭拒時，驗收失敗，不改用預設判官。這是啟動前的本機／快取快照檢查，無法保證後續雲端更新的完整隔離；[來源範圍與限制](../../architecture/extension-gates.md)。
+
 v1.77.0 起提供。AI 員工在一輪工作中讀取私人資料後，後續的 MCP 外送呼叫會先經過程式檢查，再決定是否執行；判斷不交給模型。
 
 ## 選擇處理方式
@@ -101,7 +103,7 @@ Cron、派工、提醒、信件、heartbeat、ephemeral 執行入口改為獨立
 
 ## 已知限制
 
-直接由 `[[mcp.external]]` 掛入 API 工具迴圈的工具（stdio、HTTP 與 Google 封閉橋接）也會經過檢查。這條路徑的工具登錄不保留 MCP annotations，因此全部保守視為 **Modify**；即使伺服器自述唯讀，讀過私人資料後仍可能要求外送核准，精確工具名稱的動作規則仍適用。MCP 代理與遠端橋接則保留原有 annotations 與 `trusted_read_hint_servers` 判定。
+直接由 `[[mcp.external]]` 掛入 API 工具迴圈的工具（stdio、HTTP 與 Google 封閉橋接）也會經過檢查並保留 annotations。所有第三方路徑預設為 **Modify**，即使宣稱 `readOnlyHint` 也一樣；`destructiveHint` 提高為 **Delete**。舊的 `trusted_read_hint_servers` 不得降低風險或跳過外送租約，精確工具名稱的動作規則仍適用。
 
 這是每一輪的 MCP 邊界，不是網路沙箱。CLI 內建工具檢查也涵蓋上述路徑，並未提供整個 runtime 的網路隔離。提示中已有的私人資料、從範圍外工具取得的資料不會自動分類。新一輪使用新紀錄，不追蹤跨輪複製的資訊；gateway 重啟後不保留回合污點來源，但會恢復已持久化的外送 lease。「僅記錄」仍會允許外送。
 

@@ -1935,12 +1935,8 @@ pub struct CapabilitiesConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipients: Option<toml::Value>,
 
-    /// Third-party MCP servers (`.mcp.json` keys) whose `readOnlyHint`
-    /// annotation is believed (2026-10-08). For any other server a tool that
-    /// says it is read-only is still classed `modify`, because a server can
-    /// claim anything about itself. Exact names; read fail-closed by
-    /// [`crate::agent_toml::load_third_party_policy`] (a malformed value
-    /// trusts no server). See [`crate::tool_effect::ThirdPartyPolicy`].
+    /// Legacy third-party server trust list, retained for configuration compatibility.
+    /// This field no longer lowers tool risk: upstream read-only claims remain Modify.
     #[serde(default, deserialize_with = "crate::lenient::string_vec")]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trusted_read_hint_servers: Vec<String>,

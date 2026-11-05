@@ -41,6 +41,7 @@ impl MethodHandler {
 
     /// Create a new handler with a custom extension (used by Pro binary).
     pub async fn with_extension(home_dir: PathBuf, extension: Arc<dyn GatewayExtension>) -> Self {
+        let extension = crate::extension::register(extension);
         let agents_dir = home_dir.join("agents");
         // v1.68: one-time reset of scaffold-noise `false` permission flags
         // (they are enforced from now on); runs before the registry scan so

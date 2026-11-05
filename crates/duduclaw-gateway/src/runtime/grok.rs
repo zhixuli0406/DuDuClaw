@@ -434,7 +434,7 @@ impl AgentRuntime for GrokRuntime {
         // MCP wiring: register the duduclaw MCP server before spawning. Grok is
         // MCP-native; the config format is verified (`[mcp_servers.duduclaw]`
         // TOML) but per-agent project-local discovery is the one residual — so we
-        // ALSO forward the agent identity via spawn env below. Warn-not-fatal.
+        // ALSO forward the agent identity via spawn env below. Fail closed.
         // Skipped when `third_party::prepare` already wrote the config.
         if let Some(ref dir) = context.agent_dir {
             if third_party.managed {
@@ -446,8 +446,11 @@ impl AgentRuntime for GrokRuntime {
                     runtime = "grok",
                     agent = %context.agent_id,
                     error = %e,
-                    "failed to write grok MCP config — continuing without it"
+                    "failed to write grok MCP config — refusing spawn"
                 );
+                return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+                    "無法建立受保護的 Grok MCP 設定，這次不啟動。",
+                ));
             }
             // Custom sandbox profiles (duduclaw state dir writable) — see the
             // --sandbox mapping below for why the built-ins are unusable.
@@ -539,6 +542,7 @@ impl AgentRuntime for GrokRuntime {
         // the PTY retry so both spawns look at the same credential root.
         let user_home = resolve_user_home(&context.home_dir, std::env::var("HOME").ok().as_deref());
         let grok_home_override = std::env::var("GROK_HOME").ok();
+        third_party::refuse_global_sources(&user_home, grok_home_override.as_deref())?;
         let mut home_env = build_home_env(&user_home, grok_home_override.as_deref());
         // Folder-trust gate (2026-07-28, verified `grok inspect`: "Project
         // trusted: no"): the per-agent `.grok/config.toml` this runtime writes
@@ -614,9 +618,11 @@ impl AgentRuntime for GrokRuntime {
                         runtime = "grok",
                         agent = %context.agent_id,
                         error = %e,
-                        "failed to write grok MCP config in the overridden work root — \
-                         the member may run without duduclaw tools"
+                        "failed to write grok MCP config in the overridden work root — refusing spawn"
                     );
+                    return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+                        "無法建立工作目錄的受保護 Grok MCP 設定，這次不啟動。",
+                    ));
                 }
                 if let Err(e) = Self::ensure_sandbox_profiles(root, &context.home_dir).await {
                     warn!(

@@ -67,6 +67,7 @@ pub use coverage::{
 pub enum Unavailable {
     InvalidConfig(String),
     UnsupportedRuntime(String),
+    CodexMcpIsolation(String),
     NetworkDisabled,
     RootUser,
     UnsupportedPlatform,
@@ -86,6 +87,7 @@ impl Unavailable {
         match self {
             Self::InvalidConfig(_) => "invalid_config",
             Self::UnsupportedRuntime(_) => "unsupported_runtime",
+            Self::CodexMcpIsolation(_) => "codex_mcp_isolation",
             Self::NetworkDisabled => "network_disabled",
             Self::RootUser => "root_user",
             Self::UnsupportedPlatform => "unsupported_platform",
@@ -102,6 +104,7 @@ impl Unavailable {
             Self::UnsupportedRuntime(runtime) => format!(
                 "runtime `{runtime}` cannot run in the task sandbox (supported: claude, codex, grok, openai_compat)"
             ),
+            Self::CodexMcpIsolation(reason) => reason.clone(),
             Self::NetworkDisabled => {
                 "the AI inside the sandbox must reach its model provider, but this agent has \
                 [container] network_access = false; set network_access = true to use the sandbox"
@@ -461,9 +464,6 @@ pub async fn dispatch(
             account_pool: agent.config.model.account_pool.clone(),
         }
     };
-    if let Err(refusal) = crate::budget::gate_before_spawn(home, Some(&spec.agent_dir), &spec.agent_id, "task_sandbox").await {
-        return SandboxDispatch::Completed(Err(SandboxFailure::failed("budget_refused", refusal.to_string())));
-    }
     if let Err(error) = crate::runtime_config::ensure_active_agent_provider(&spec.agent_dir) {
         return SandboxDispatch::Completed(Err(SandboxFailure::failed(
             failure_code::REMOVED_RUNTIME,
@@ -471,6 +471,15 @@ pub async fn dispatch(
         )));
     }
     let runtime_settings = crate::runtime_config::load_runtime_settings(&spec.agent_dir);
+    // Security refusal is terminal, before routing, accounts or sandbox preparation.
+    if runtime_settings.provider == RuntimeType::Codex {
+        if let Err(reason) = crate::runtime::codex::require_mcp_isolation() {
+            return SandboxDispatch::Completed(Err(SandboxFailure::from(&Unavailable::CodexMcpIsolation(reason))));
+        }
+    }
+    if let Err(refusal) = crate::budget::gate_before_spawn(home, Some(&spec.agent_dir), &spec.agent_id, "task_sandbox").await {
+        return SandboxDispatch::Completed(Err(SandboxFailure::failed("budget_refused", refusal.to_string())));
+    }
     // O1 confidence-aware delegation routing applies to Claude runtimes only
     // (tier models are Claude ids); identical to the unsandboxed path.
     let model = crate::delegation_router::resolve_delegation_model(
@@ -527,6 +536,9 @@ pub fn settle(
             failure.log(&spec.agent_id);
             SandboxDispatch::Completed(Err(failure))
         }
+        Err(SandboxError::Unavailable(reason @ Unavailable::CodexMcpIsolation(_))) => {
+            SandboxDispatch::Completed(Err(SandboxFailure::from(&reason)))
+        }
         Err(SandboxError::Unavailable(reason)) => {
             audit(
                 home,
@@ -566,6 +578,9 @@ pub fn preflight(
     settings: &SandboxSettings,
     spec: &TaskSpec,
 ) -> Result<RuntimeFamily, Unavailable> {
+    if spec.runtime == RuntimeType::Codex {
+        crate::runtime::codex::require_mcp_isolation().map_err(Unavailable::CodexMcpIsolation)?;
+    }
     let family = family_for(spec.runtime)
         .ok_or_else(|| Unavailable::UnsupportedRuntime(spec.runtime.as_str().into()))?;
     if !spec.network_access {
@@ -785,7 +800,8 @@ async fn execute(
     let secrets = secret_values(&selected.env);
     let prompt = wrap_prompt(&spec.system_prompt, &spec.prompt);
     let workspace = Path::new(container::WORKSPACE);
-    let mut argv = family.argv(model, settings.max_turns, workspace);
+    let mut argv = family.argv(model, settings.max_turns, workspace)
+        .map_err(|error| failed("runtime_unsupported", error.to_string()))?;
     if family == RuntimeFamily::Claude
         && let Some(denied) = claude_disallowed(&spec.disallowed_tools)
     {
@@ -828,9 +844,12 @@ async fn execute(
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .collect();
+    let (executable, argv) = if family == RuntimeFamily::Codex {
+        adapter::codex_container_command(settings.executable(family), argv)
+    } else { (settings.executable(family).to_path_buf(), argv) };
     let plan = container::ContainerPlan {
         image: &settings.image,
-        executable: settings.executable(family),
+        executable: &executable,
         argv: &argv,
         env: &selected.env,
         agent_files: &agent_files,
@@ -967,6 +986,11 @@ async fn execute(
                 tool_label(tool)
             ),
         ));
+    }
+    if family == RuntimeFamily::Codex && output.status.code() == Some(78)
+        && output.stderr.contains("Codex MCP configuration refused:")
+    {
+        return Err(failed("codex_mcp_isolation", detail(&output.stderr, "", &secrets)));
     }
     let failed_run = !output.status.success() || summary.is_error;
     if matches!(stop, Some(StopCause::RateLimited))

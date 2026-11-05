@@ -1,5 +1,7 @@
 # 更多 MCP 工具：MCP 註冊表、遠端伺服器與應用整合平台
 
+**Codex 外部設定檢查（尚未發佈）：** 外部設定不存在或未定義 MCP 時，一般員工、Explore、utility、Task Sandbox 與 Discovery 可執行；偵測到 MCP 或既有設定無法讀取／解析時，回報來源並拒絕。明確指定的 Codex 判官遭拒時，驗收失敗，不改用預設判官。這是啟動前的本機／快取快照檢查，無法保證後續雲端更新的完整隔離；[來源範圍與限制](../../architecture/extension-gates.md)。
+
 DuDuClaw 的 AI 員工透過自己 `.mcp.json` 裡列的 MCP server 使用工具。除了內建目錄（Playwright、Browserbase、Filesystem、Memory）與「從網址匯入」之外，儀表板現在可以：
 
 1. **搜尋官方 MCP 註冊表**，把伺服器安裝給某位員工（`MCP → MCP 註冊表`）。
@@ -135,34 +137,34 @@ DuDuClaw 自己的每個工具都有動作類型（`read`、`draft`、`send`、`
 | 標記 | 類型 |
 |------|------|
 | `destructiveHint: true` | `delete` |
-| `readOnlyHint: true`，伺服器列在 `trusted_read_hint_servers` | `read` |
-| `readOnlyHint: true`，伺服器未列入 | `modify` |
+| `readOnlyHint: true`，不論舊設定是否信任伺服器 | `modify` |
 | 其他情況，包括沒有標記 | `modify` |
 
-標記是伺服器對自己的說法，沒有人查核。`destructiveHint` 來自任何伺服器都採信（只會讓工具更嚴格）；`readOnlyHint` 只對管理員列出的伺服器採信：
+標記是未經查證的上游宣稱，只能提高風險。`destructiveHint` 將預設 Modify 提高為 Delete；`readOnlyHint` 不得降低分類，舊的 `trusted_read_hint_servers` 不再提供唯讀例外。
 
 ```toml
 [capabilities]
-trusted_read_hint_servers = ["github"]   # .mcp.json 的伺服器名稱
 action_rules = [
   { effect = "modify", verdict = "ask" },
   { tool = "github.delete_repository", verdict = "block" },   # 或 "mcp__github__delete_repository"
 ]
 ```
 
-預設的代價：惡意伺服器可以把會刪資料的工具標成 `readOnlyHint: true`；若採信，它會通過所有 `read` 規則與唯讀通道。不採信時，未列入的伺服器中真正唯讀的工具會被當成修改（在 `modify` 會被詢問、阻擋或隱藏的地方一樣處理）。員工在伺服器列出工具前就呼叫的工具沒有標記，算 `modify`。
+真正唯讀的第三方工具也維持 Modify 預設，仍受 Modify 動作規則與外送租約檢查約束，探索通道不開放。伺服器列出工具前的呼叫沒有標記，也預設為 Modify。
 
 **執行**在 proxy 與橋接中，依員工的 `action_rules`（每次列出與呼叫都重讀，與 DuDuClaw 工具同一套規則；`tool` 規則寫 `<伺服器>.<工具>` 或 `mcp__<伺服器>__<工具>`，`<伺服器>.*` 代表該伺服器所有工具）：
 
 - `block`：從員工看到的 `tools/list` 移除，呼叫以 JSON-RPC 錯誤 `-32003` 回覆，不會送到伺服器（稽核 `third_party_tool_refused`）。
 - `ask`：呼叫等待 ApprovalBroker 決定（`mcp_call` 卡片，5 分鐘）；拒絕、逾時或核准系統無法使用時一律拒絕（稽核 `third_party_tool_approval`）。
-- **唯讀通道**（`DUDUCLAW_LANE=explore`：心跳主動檢查與 MCP Events 啟動的工作）：只列出、只能呼叫類型為 `read` 的工具，因此未列入伺服器的工具全部隱藏。
+- **唯讀通道**（`DUDUCLAW_LANE=explore`）：第三方工具最低為 Modify，因此全部隱藏並拒絕呼叫；目前沒有主機管理的唯讀例外。
 
-沒有 `action_rules` 鍵且在一般通道：一切照舊。遮蔽啟用、員工有 `action_rules` 鍵、或在唯讀通道啟動時，`.mcp.json` 的 stdio 伺服器會經過 proxy；遠端伺服器一律經過橋接。
+所有受管理的啟動都讓 `.mcp.json` 的 stdio 伺服器經過 proxy，不受遮蔽、`action_rules` 或通道影響；受管理的遠端伺服器走橋接。`[[mcp.external]]` 掛載也透過行程內工具註冊表套用 `ThirdPartyGate`；utility 與探索通道不掛載它們。
 
 **儀表板**：`MCP → 遠端伺服器 →「第三方工具與其動作類型」` 依員工顯示每個伺服器最近一次經 proxy 或橋接列出的工具（`<home>/mcp_tool_effects/<員工>/<伺服器>.json`），類型與決定依目前設定重新計算。伺服器要在某次工作階段經 DuDuClaw 列出工具後才會出現。這份快照只用於顯示；管制一律依當下的清單。
 
-**涵蓋的 runtime**：Claude CLI（它啟動 `.mcp.json` 的伺服器，spawn 交給它改寫後的設定）與 Codex（`.mcp.json` 裡每個第三方 stdio 伺服器都會在這次 spawn 登記成經過 `duduclaw mcp-proxy` 啟動，而且一律如此，因為 Codex 會自動核准登記給它的伺服器；遠端橋接項目照原樣登記，它們自己會管制；proxy 用到的第三方憑證放在這次 spawn 專用、只有擁有者能讀的暫存檔，不放在命令列）。2026-10-20 起再加上 Grok，以及 openai-compat runtime、Direct API 回覆與本地推論共用的工具迴圈，同樣一律經過管制。Grok 的 MCP 登記是一個長期存在的檔案，所以它們的項目寫成 `duduclaw mcp-proxy --spawn-scoped …`：上游憑證放在這次 spawn 專用、只有擁有者能讀的目錄，不是登記這個伺服器的那次 spawn（輔助呼叫、手動執行 CLI）啟動 proxy 時，它什麼都不會啟動。Grok 本身也會讀工作目錄的 `.mcp.json`，現在那裡的每個名稱都會在 `.grok/config.toml` 被覆蓋（經過管制，或停用）；之前 Grok 會自己啟動這些伺服器，沒有任何管制。細節見 `docs/features/zh-TW/13-multi-runtime.md`。`.mcp.json` 中的 `url`／`type` 項目（CLI 直接連線）無法管制，所以受管制的 spawn（有 `action_rules` 或在唯讀通道）會把它們從交給 CLI 的設定移除（稽核 `third_party_remote_entry_dropped`，`duduclaw doctor` 也會說明）；請改以遠端伺服器連線。管制用的 `.mcp.json` 副本建不出來時，這次 spawn 會被拒絕（稽核 `third_party_gate_config_unavailable`），不會在沒有管制的情況下啟動。
+**涵蓋的 runtime**：Claude CLI（它啟動 `.mcp.json` 的伺服器，spawn 交給它改寫後的設定）與 Codex（`.mcp.json` 裡每個第三方 stdio 伺服器都會在這次 spawn 登記成經過 `duduclaw mcp-proxy` 啟動，而且一律如此，因為 Codex 會自動核准登記給它的伺服器；遠端橋接項目照原樣登記，它們自己會管制；proxy 用到的第三方憑證放在這次 spawn 專用、只有擁有者能讀的暫存檔，不放在命令列）。2026-10-20 起再加上 Grok，以及 openai-compat runtime、Direct API 回覆與本地推論共用的工具迴圈，同樣一律經過管制。Grok 的 MCP 登記是一個長期存在的檔案，所以它們的項目寫成 `duduclaw mcp-proxy --spawn-scoped …`：上游憑證放在這次 spawn 專用、只有擁有者能讀的目錄，不是登記這個伺服器的那次 spawn（輔助呼叫、手動執行 CLI）啟動 proxy 時，它什麼都不會啟動。Grok 本身也會讀工作目錄的 `.mcp.json`，現在那裡的每個名稱都會在 `.grok/config.toml` 被覆蓋（經過管制，或停用）；之前 Grok 會自己啟動這些伺服器，沒有任何管制。細節見 `docs/features/zh-TW/13-multi-runtime.md`。`.mcp.json` 中的 `url`／`type` 項目（CLI 直接連線）無法管制，所以每次受管理的 spawn 都會把它們從交給 CLI 的設定移除（稽核 `third_party_remote_entry_dropped`，`duduclaw doctor` 也會說明）；請改以遠端伺服器連線。管制用的 `.mcp.json` 副本建不出來時，這次 spawn 會被拒絕（稽核 `third_party_gate_config_unavailable`），不會在沒有管制的情況下啟動。
+
+受管理的 Claude 啟動一律使用暫存的嚴格 MCP 設定，即使只有內建工具也不讀取其他 MCP 來源。Grok 啟動會拒絕專案內未受管理的 MCP 項目，以及實際 `HOME` 或 `GROK_HOME` 下的全域 MCP 定義；設定讀不到時也不啟動。Grok 實際使用的設定根目錄必須是絕對路徑；`HOME` 或 `GROK_HOME` 若填相對路徑，請先修正再重試。原檔保留，請先將伺服器定義移到員工 MCP 設定再重試。手動執行的獨立 CLI 與原生工具仍在這道邊界之外。
 
 ## 5. 遠端伺服器的事件（MCP Events）
 
@@ -224,3 +226,5 @@ action_rules = [
 - 桌面版的儀表板來源（`tauri://…`）不是可接受的轉回來源；請用瀏覽器登入。
 - 員工與 Gateway 是同一個系統使用者：擁有不受限 Bash 的員工可以讀取金鑰檔與紀錄檔，或自行以自己的 `--agent` 啟動橋接。橋接會拒絕與行程 `DUDUCLAW_AGENT_ID` 不同的 `--agent`，但真正的隔離是不要開放 Bash。
 - 進行中的登入只存在 Gateway 記憶體：登入途中重啟 Gateway 就要重新開始。
+
+第三方閘門啟用時，未知或互相衝突的 MCP transport 格式會拒絕啟動；只有已分類的 stdio 與受管理的遠端橋接可交給 runtime。

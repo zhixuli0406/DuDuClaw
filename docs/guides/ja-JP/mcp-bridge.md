@@ -2,6 +2,12 @@
 
 DuDuClawは、サードパーティの [Model Context Protocol](https://modelcontextprotocol.io) サーバーを、内蔵MCPサーバーと並べてマウントできます。これにより、Rustで手書きのコネクタを書かなくても、エージェントのツールループが外部サーバーのツールを獲得します。Plane、Chatwoot、Invoice Ninja、Gmail/Calendar、WooCommerce、その他あらゆるMCPサーバーをエージェントに接続する方法がこれです。
 
+## 外部ツールの検査（未リリース）
+
+`[[mcp.external]]` の stdio と Streamable HTTP マウントは、管理対象 MCP プロキシと同じ `ThirdPartyGate` を使い、ツールの宣言から効果を分類します。サーバー単位の許可／拒否リストに加え、スタッフの名前制限、動作ルール、承認要件を一覧と呼び出しに適用します。アノテーションは既定の Modify を Delete に引き上げる場合だけ採用し、読み取り専用の自己申告では分類を下げません。拒否されたツールはモデルに公開しません。
+
+スタッフの `.mcp.json` に直接指定した URL/type エントリーは管理対象の起動経路で拒否されます。管理対象のリモート MCP 接続へ移行してください。`[[mcp.external]]` 自体の HTTP `url` マウントは引き続き利用できます。[拡張機能の境界](../../architecture/extension-gates.md)を参照してください。
+
 ## MCPブリッジかネイティブコネクタか
 
 - **MCPブリッジ**（このページ）：SaaS側（またはコミュニティ）がすでにMCPサーバーを提供している場合。設定だけでマウントでき、コードは不要です。
@@ -73,7 +79,7 @@ allowed_tools = ["search_threads", "get_thread", "create_draft"]
 - **内蔵のduduclaw MCPサーバーは常にclient 0** です。ツール名が衝突した場合は内蔵ツールが優先され、外部側の重複はログを残して破棄されます。
 - 各外部サーバーは独立して起動します。どれかが**接続に失敗した場合はそのサーバーだけスキップ**され、内蔵サーバーや他の外部サーバーはそのまま動作します。結合後の `tools/list` 自体が失敗した場合は、レジストリは**内蔵のみ**に縮退し、全ツールを失うことはありません。
 - `allowed_tools` は **deny-by-default** です。allowlistを設定すると、リストにないツールは非表示になります。`denied_tools` と組み合わせて、特に危険なツールを個別にブロックできます。
-- 書き込み系／不可逆なツール（課金、削除など）は、エージェントの `[capabilities] approval_required_tools` にも列挙し、HITLの `ApprovalBroker` を経由させてください。MCPブリッジが制御するのは*可視性*、承認フローが制御するのは*実行*です。
+- 書き込み系／不可逆なツール（課金、削除など）は、エージェントの `[capabilities] approval_required_tools` にも列挙し、HITLの `ApprovalBroker` を経由させてください。レジストリのゲートは一覧と実行の両方を検査し、一覧からの非表示だけに認可を依存しません。
 
 ## ライブ検証の手順
 

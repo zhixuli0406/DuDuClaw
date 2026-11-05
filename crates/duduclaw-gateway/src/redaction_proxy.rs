@@ -3,15 +3,11 @@
 //!
 //! Two halves, one purpose.
 //!
-//! 1. **Claude-runtime spawn rewrite** — [`maybe_proxy_mcp_config`]. When an
-//!    agent's turn has redaction active, the per-spawn `--mcp-config` no
-//!    longer points at the agent's raw `.mcp.json`: every third-party stdio
-//!    server in it is rewritten to launch through `duduclaw mcp-proxy`
-//!    (`duduclaw_core::mcp_proxy_rewrite`), which applies the same egress /
-//!    result redaction the built-in choke point applies. The explore lane,
-//!    action rules and active egress guard also require the third-party gate.
-//!    With no third-party servers, or with all these purposes off, nothing
-//!    is written and the spawn stays byte-identical.
+//! 1. **Claude-runtime spawn rewrite** — [`maybe_proxy_mcp_config`]. Every
+//!    third-party stdio server is routed through `duduclaw mcp-proxy` for
+//!    ThirdPartyGate, with optional redaction on the same path. Direct remote
+//!    entries are refused; remote bridges gate themselves. Built-in-only
+//!    files are frozen too, so strict config disables ambient discovery.
 //!
 //! 2. **Direct-API tool loop** — [`RedactionToolInterceptor`], a
 //!    [`duduclaw_llm::ToolInterceptor`]. The openai-compat runtime drives
@@ -164,14 +160,10 @@ pub fn data_file_guard_env_for_spawn(home_dir: &Path) -> Option<String> {
 
 /// Produce the `--mcp-config` path this spawn should use.
 ///
-/// `Ok(None)` ⇒ use the agent's `.mcp.json` unchanged (no proxy purpose,
-/// no `.mcp.json`, or nothing to rewrite). Unreadable configs and secret-reference
-/// failures refuse the spawn. Malformed JSON retains Claude's legacy fallback
-/// only when the tool gate is off and no secret reference is present. `Some(temp)` ⇒ pass
-/// `temp`'s path; the returned [`tempfile::TempPath`] deletes the file when
-/// dropped, so callers hold it until the child has exited — the same
-/// lifetime discipline the `--system-prompt-file` guard uses at the same
-/// spawn sites.
+/// Missing files produce an empty managed config; even built-in-only files
+/// get a frozen copy. Unreadable or malformed configs refuse the spawn.
+/// `Some(temp)` must be passed with
+/// `--strict-mcp-config` and held until the child exits.
 ///
 /// Same as [`maybe_proxy_mcp_config_in_lane`] outside the explore lane.
 pub fn maybe_proxy_mcp_config(
@@ -184,22 +176,13 @@ pub fn maybe_proxy_mcp_config(
 /// [`maybe_proxy_mcp_config`] for a spawn that may run in the explore lane
 /// (`DUDUCLAW_LANE=explore` set on the CLI).
 ///
-/// The proxy is put in the path when redaction is active (every third-party
-/// stdio server, remote bridges included) or when the third-party tool gate
-/// needs it (2026-10-08: the employee has `[capabilities] action_rules`, or
-/// `explore_lane`; remote bridges are left alone because they gate
-/// themselves; direct `url` / `type` entries are removed and audited
-/// `third_party_remote_entry_dropped`, see
-/// `duduclaw_core::mcp_proxy_rewrite::rewrite_mcp_config_for_gate`). The
-/// employee directory is the `.mcp.json`'s parent.
+/// ThirdPartyGate is mandatory even without action rules or redaction.
+/// Direct `url` / `type` entries are removed, logged with the migration action
+/// and audited as `third_party_remote_entry_dropped`. Remote bridges already
+/// enforce ThirdPartyGate; redaction may add an outer proxy.
 ///
-/// `Err` (2026-10-08 close-out, fail closed): the gate is needed and the
-/// gated copy cannot be produced (unreadable or malformed `.mcp.json`, no
-/// path to this binary, temp file not written). The caller must refuse the
-/// spawn; the message carries `mcp_spawn_gate::SPAWN_GATE_ERROR_PREFIX` and
-/// an audit row `third_party_gate_config_unavailable` is written. When only
-/// redaction asked for the proxy, a temp-file failure keeps the old fallback:
-/// `Ok(None)`. Secret references always require the proxy and never fall back.
+/// Any failure to produce the gated copy refuses the spawn with
+/// `SPAWN_GATE_ERROR_PREFIX` and `third_party_gate_config_unavailable`.
 pub fn maybe_proxy_mcp_config_in_lane(
     home_dir: &Path,
     mcp_json: &Path,
@@ -229,18 +212,12 @@ fn maybe_proxy_mcp_config_with_agent_dir(
 ) -> Result<Option<tempfile::TempPath>, String> {
     let agent_id = agent_dir.and_then(|dir| dir.file_name())
         .and_then(|name| name.to_str()).unwrap_or("unknown").to_string();
-    let tool_gate = agent_dir.is_some_and(|dir| {
-        duduclaw_core::agent_toml::third_party_gate_needed(dir, explore_lane)
-            || duduclaw_core::egress_guard::effective_mode(home_dir, Some(dir))
-                != duduclaw_core::egress_guard::Mode::Off
-    });
-    // Only Claude's ungated, malformed-file path keeps its legacy fallback.
-    // Valid raw input still undergoes identity validation, even with gates off.
-    let Some(parsed) = read_mcp_json_for_spawn(
-        home_dir, mcp_json, explore_lane, &agent_id, preserve_cli_discovery && !tool_gate,
-    )? else {
-        return Ok(None);
-    };
+    // Every employee server must cross ThirdPartyGate, even without action
+    // rules or redaction. Turning another guard off never bypasses this gate.
+    let tool_gate = true;
+    let parsed = read_mcp_json_for_spawn(
+        home_dir, mcp_json, explore_lane, &agent_id, false,
+    )?.unwrap_or_else(|| serde_json::json!({"mcpServers": {}}));
     let purpose = ProxyPurpose {
         redaction: redaction_active_for_spawn(home_dir),
         secret_env: duduclaw_core::mcp_proxy_rewrite::has_mcp_secret_refs(&parsed),
@@ -273,13 +250,7 @@ fn maybe_proxy_mcp_config_with_agent_dir(
             audit_dropped_remote_entries(home_dir, &agent_id, &dropped, explore_lane);
             Ok(guard)
         }
-        Err(e) if purpose.tool_gate || purpose.secret_env || has_bridge || !preserve_cli_discovery => {
-            Err(refuse_gate_config_unavailable(home_dir, &agent_id, &e, explore_lane))
-        }
-        Err(e) => {
-            warn!(agent = %agent_id, error = %e, "mcp-proxy: gated copy unavailable — external MCP servers stay unproxied for this spawn");
-            Ok(None)
-        }
+        Err(e) => Err(refuse_gate_config_unavailable(home_dir, &agent_id, &e, explore_lane)),
     }
 }
 
@@ -590,14 +561,16 @@ fn write_gated_mcp_config_value(
 ) -> Result<(Option<tempfile::TempPath>, Vec<String>), String> {
     let rewrite = rewrite_mcp_config_for_gate(parsed, self_exe, purpose, own_server)?;
     require_resolvable_config(&rewrite.config)?;
-    // Claude's legacy no-op lane adds no flags for built-in-only files. When
-    // producing a config for third-party servers, every built-in slot above
-    // has already been replaced with the canonical host definition.
+    // A mandatory tool gate always freezes a copy, including built-in-only
+    // files, so callers add strict config flags and disable ambient discovery.
+    // Redaction-only test callers retain their historical no-op behavior.
     let third_party = parsed.get("mcpServers").and_then(Value::as_object)
         .is_some_and(|servers| servers.keys().any(|name|
             !duduclaw_core::mcp_proxy_rewrite::is_builtin_slot_name(name)));
     let has_bridge = duduclaw_core::mcp_proxy_rewrite::has_remote_bridge_entries(parsed, self_exe);
-    if (preserve_cli_discovery && ((purpose.none() && !has_bridge) || !third_party)) || &rewrite.config == parsed {
+    if !purpose.tool_gate
+        && ((preserve_cli_discovery && ((purpose.none() && !has_bridge) || !third_party)) || &rewrite.config == parsed)
+    {
         debug!("mcp-proxy: nothing to proxy in this .mcp.json");
         return Ok((None, Vec::new()));
     }
@@ -1012,7 +985,7 @@ mod mcp_config_proxy_tests {
                 ));
                 let prepared: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
                 assert_eq!(prepared["mcpServers"][&name], own);
-                assert!(maybe_proxy_mcp_config(&home, &path).unwrap().is_none());
+                assert!(maybe_proxy_mcp_config(&home, &path).unwrap().is_some());
                 std::fs::write(home.join("spawn-verified"), b"ok").unwrap();
             }
             return;
@@ -1228,7 +1201,7 @@ mod mcp_config_proxy_tests {
         let raw = config.to_string();
         std::fs::write(&path, &raw).unwrap();
         assert!(!mcp_json_lists_third_party_servers(home.path(), &path, false).unwrap());
-        assert!(maybe_proxy_mcp_config(home.path(), &path).unwrap().is_none());
+        assert!(maybe_proxy_mcp_config(home.path(), &path).unwrap().is_some());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
     }
 
@@ -1379,9 +1352,52 @@ mod mcp_config_proxy_tests {
         assert_eq!(body["mcpServers"]["crm_pg"]["args"][0], "mcp-proxy");
         std::fs::write(dir.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
         assert!(
-            maybe_proxy_mcp_config(dir.path(), &mcp).unwrap().is_none(),
-            "redaction and egress off must preserve the original spawn"
+            maybe_proxy_mcp_config(dir.path(), &mcp).unwrap().is_some(),
+            "redaction and egress off must not bypass the third-party tool gate"
         );
+    }
+
+    #[test]
+    fn pl0_claude_without_opt_in_proxies_stdio_and_refuses_direct_remote() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
+        let path = agent_mcp_path(home.path());
+        std::fs::write(path.parent().unwrap().join("agent.toml"), "").unwrap();
+        let raw = runtime_sample(home.path()).to_string();
+        std::fs::write(&path, &raw).unwrap();
+        let guard = maybe_proxy_mcp_config(home.path(), &path).unwrap().unwrap();
+        let body: Value = serde_json::from_slice(&std::fs::read(&guard).unwrap()).unwrap();
+        assert_eq!(body["mcpServers"]["crm_pg"]["args"][0], "mcp-proxy");
+        assert!(body["mcpServers"].get("remote_erp").is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+    }
+
+    #[test]
+    fn pl0_claude_without_opt_in_refuses_malformed_config() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
+        let path = agent_mcp_path(home.path());
+        std::fs::write(&path, "{ broken").unwrap();
+        let error = maybe_proxy_mcp_config(home.path(), &path).unwrap_err();
+        assert!(error.starts_with(duduclaw_agent::mcp_spawn_gate::SPAWN_GATE_ERROR_PREFIX));
+    }
+
+    #[test]
+    fn pl0_unknown_transport_refuses_spawn_and_preserves_source() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
+        let path = agent_mcp_path(home.path());
+        for definition in [
+            serde_json::json!({"endpoint": "https://example.invalid/mcp"}),
+            serde_json::json!({"type": "future", "command": "never-run"}),
+            serde_json::json!({"command": 42}),
+        ] {
+            let raw = serde_json::json!({"mcpServers": {"unknown": definition}}).to_string();
+            std::fs::write(&path, &raw).unwrap();
+            let error = maybe_proxy_mcp_config(home.path(), &path).unwrap_err();
+            assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        }
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # DuDuClaw Complete Feature Inventory
 
+**Codex external configuration gate (unreleased):** Employees, Explore, utility, Task Sandbox and Discovery may run when external layers are absent or define no MCP servers; detected MCP or unreadable/unparseable existing layers refuse launch with the source named. A refused explicit Codex judge fails acceptance without retrying the default judge. This checks a local/cache snapshot before launch, not complete isolation from subsequent cloud refresh. See [checked sources and limits](../architecture/extension-gates.md).
+
 > v1.24.0 core + 2026-07/08 additions | Last reviewed against the code: 2026-10-02 (v1.67.0)
 >
 > Note: the sections below started as the v1.24.0 baseline and have been

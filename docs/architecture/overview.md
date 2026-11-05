@@ -1,5 +1,7 @@
 # DuDuClaw Architecture Overview
 
+**Codex external configuration gate (unreleased):** Employees, Explore, utility, Task Sandbox and Discovery may run when external layers are absent or define no MCP servers; detected MCP or unreadable/unparseable existing layers refuse launch with the source named. A refused explicit Codex judge fails acceptance without retrying the default judge. This checks a local/cache snapshot before launch, not complete isolation from subsequent cloud refresh. See [checked sources and limits](extension-gates.md).
+
 ## Architecture Overview (reviewed against v1.67.0)
 
 DuDuClaw is a **Multi-Runtime AI Agent Platform** — supporting **Claude Code / Codex / Grok** CLI (plus OpenAI-compatible APIs) as AI backends via a unified `AgentRuntime` trait with auto-detection and per-agent configuration (Gemini CLI has been removed). DuDuClaw is not a standalone LLM product; it is the plumbing layer that turns one (or many) AI CLIs into long-running agents with channel routing, session memory, self-evolution, multi-account rotation, local LLM inference, browser automation, and IDE integration.

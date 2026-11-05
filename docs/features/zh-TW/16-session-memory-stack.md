@@ -1,5 +1,7 @@
 # Session Memory Stack
 
+**Codex 外部設定檢查（尚未發佈）：** 外部設定不存在或未定義 MCP 時，一般員工、Explore、utility、Task Sandbox 與 Discovery 可執行；偵測到 MCP 或既有設定無法讀取／解析時，回報來源並拒絕。明確指定的 Codex 判官遭拒時，驗收失敗，不改用預設判官。這是啟動前的本機／快取快照檢查，無法保證後續雲端更新的完整隔離；[來源範圍與限制](../../architecture/extension-gates.md)。
+
 > Instruction Pinning、Snowball Recap 與 Key-Fact Accumulator：三層廉價的機制，取代了一套 6,500 token 的重量級記憶系統。
 
 ---
@@ -51,7 +53,7 @@ Injected at: system prompt tail (high-attention U-shape position)
 
 Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪替；一般對話仍保留原有帳號輪替。
 
-輔助呼叫（含分類與評審）使用專用執行模式。Claude 使用無工具、單回合的輕量路徑；OpenAI 相容 API 只送出一次不帶工具的請求，不進入工具迴圈。Codex 使用受限模式：唯讀沙箱、不注入平台 MCP 設定、每次建立只有擁有者能存取的空白暫存工作目錄、忽略使用者設定，且不保存工作階段。呼叫結束後刪除暫存目錄，包含錯誤與逾時；系統提示放進 prompt，不寫入 `AGENTS.md`。明確指定 Codex 的 judge 與團隊 verifier 也使用此模式。Grok 與通用 CLI 仍不支援輔助執行，員工背景工作改用全域輔助後端／模型（預設 Claude／`claude-haiku-4-5`），每個員工／後端組合記錄一次警告。全域後端必須是 Claude、Codex 或 OpenAI 相容 API；不支援的全域後端或明確指定會被拒絕。既有評審上層可依降級策略，不帶不支援的指定重試，仍須遵守相同模式。Codex 可能保留內建讀取工具，剩餘風險見[安全防禦](05-security-defense.md)。
+輔助呼叫（含分類與評審）使用專用執行模式。Claude 使用無工具、單回合的輕量路徑；OpenAI 相容 API 只送出一次不帶工具的請求，不進入工具迴圈。Codex 使用受限模式：唯讀沙箱、不注入平台 MCP 設定、每次建立只有擁有者能存取的空白暫存工作目錄、忽略使用者設定，且不保存工作階段。呼叫結束後刪除暫存目錄，包含錯誤與逾時；系統提示放進 prompt，不寫入 `AGENTS.md`。明確指定 Codex 的 judge 與團隊 verifier 也使用此模式。Grok 與通用 CLI 仍不支援輔助執行，員工背景工作改用全域輔助後端／模型（預設 Claude／`claude-haiku-4-5`），每個員工／後端組合記錄一次警告。全域後端必須是 Claude、Codex 或 OpenAI 相容 API；不支援的全域後端或明確指定會被拒絕。明確指定的 Codex 判官遭拒時直接使驗收失敗，不以預設判官重試；其他後端維持既有降級策略。Codex 可能保留內建讀取工具，剩餘風險見[安全防禦](05-security-defense.md)。
 
 定期對話摘要與自動標題也依對話所屬員工，套用相同的輔助後端選擇與全域備援規則。儲存的所屬員工必須是非系統保留名稱，且具備相符的 `agent.toml`；目錄不得是符號連結，正規化後必須是 `<home>/agents` 的直接子目錄。非空白但無效的員工身分會讓本次輔助工作停止並記錄錯誤，只有未指定員工的對話直接使用全域輔助設定。摘要的受保護區塊仍不會送入模型，並按既有限額逐字保留。明確指定但不相容的輔助模型仍保留原值，每個員工／模型組合只記錄一次警告。沒有所屬員工的工作使用 `[runtime] utility_provider`／`utility_model`，可在「設定 → 進階 → 系統」調整。
 

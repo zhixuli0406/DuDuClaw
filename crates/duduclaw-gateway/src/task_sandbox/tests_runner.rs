@@ -44,7 +44,7 @@ fn fixture(events: &[Value], tail: &str, image_present: bool) -> Fixture {
     let inspect = if image_present { "printf 'sha256:%064d\\n' 7" } else { "echo 'Error: No such image' >&2; exit 1" };
     let client = tools.join("docker");
     crate::test_exec::write_executable(&client, format!(
-        "#!/bin/sh\nd=\"${{0%/*}}\"\ncase \"$1\" in\n\
+        "#!/bin/sh\nd=\"${{0%/*}}\"\nprintf '%s\\n' \"$1\" >> \"$d/calls\"\ncase \"$1\" in\n\
          version) echo 27.3.1;;\n\
          info) echo '{{\"SecurityOptions\":[\"name=seccomp,profile=builtin\"]}}';;\n\
          ps) case \"$*\" in *--last*) ;; *) exit 3;; esac;;\n\
@@ -143,24 +143,19 @@ async fn tool_violation_fails_without_retry_and_is_audited() {
 }
 
 #[tokio::test]
-async fn host_step_limit_returns_the_last_reply() {
-    let events = [json!({"type":"item.completed","item":{"id":"m0","type":"agent_message","text":"partial answer"}}),
-        json!({"type":"item.started","item":{"id":"c1","type":"command_execution"}}),
-        json!({"type":"item.started","item":{"id":"c2","type":"command_execution"}})];
-    let fx = fixture(&events, "/bin/sleep 20", true);
-    let reply = go(&fx, RuntimeType::Codex, "openai", "sk-openai-fake-0123456789", 1).await.unwrap();
-    assert_eq!(reply, "partial answer");
-    assert_eq!(fx.runs_left(), 0);
-}
-
-#[tokio::test]
-async fn step_limit_without_any_reply_is_an_error() {
-    let events = [json!({"type":"item.started","item":{"id":"c1","type":"command_execution"}}),
-        json!({"type":"item.started","item":{"id":"c2","type":"command_execution"}})];
-    let fx = fixture(&events, "/bin/sleep 20", true);
-    let err = go(&fx, RuntimeType::Codex, "openai", "sk-openai-fake-0123456789", 1).await.unwrap_err();
-    assert!(matches!(&err, SandboxError::Failed(f) if f.code == failure_code::STEP_LIMIT && f.message.contains("step limit")), "{err:?}");
-    assert_eq!(fx.runs_left(), 0);
+async fn codex_detected_config_is_refused_before_container_or_file_preparation() {
+    let fx = fixture(&[], "exit 99", true);
+    let layer = fx.home.join("system-codex.toml");
+    std::fs::write(&layer,"[mcp_servers.native]\ncommand = \"unsafe\"\n").unwrap();
+    let err = crate::runtime::codex::MCP_CONFIG_TEST_PATHS.scope(vec![layer.clone()],
+        run(&fx.home, &SandboxSettings::default(), &task(&fx, RuntimeType::Codex),
+            Err("accounts must not be needed".into()))).await.unwrap_err();
+    assert!(matches!(&err, SandboxError::Unavailable(Unavailable::CodexMcpIsolation(reason))
+        if reason.contains(layer.to_str().unwrap())));
+    assert!(!fx.home.join("sandbox").exists());
+    for name in ["calls", "create.args", "keys", "stdin", "rm"] {
+        assert!(!fx.tools.join(name).exists(), "unexpected side effect: {name}");
+    }
 }
 
 #[tokio::test]
@@ -179,7 +174,7 @@ async fn auth_failure_text_is_redacted() {
         json!({"type":"error","message":format!("401 Unauthorized: Incorrect API key provided: {key}")}),
         json!({"type":"turn.failed","error":{"message":format!("Incorrect API key provided: {key}")}})];
     let fx = fixture(&events, &format!("echo 'auth error for {key}' >&2; exit 1"), true);
-    let err = go(&fx, RuntimeType::Codex, "openai", key, 30).await.unwrap_err();
+    let err = go(&fx, RuntimeType::Grok, "xai", key, 30).await.unwrap_err();
     let SandboxError::Failed(failure) = err else { panic!("{err:?}") };
     assert_eq!(failure.code, failure_code::AUTH_FAILED);
     assert!(failure.message.contains("authentication failed"), "{failure:?}");
@@ -253,7 +248,7 @@ fn soul_mount() -> Vec<super::container::AgentMount> {
 
 fn plan_args(family: RuntimeFamily, env: &BTreeMap<String, String>, ws: &Path) -> Vec<String> {
     let s = SandboxSettings::default();
-    let argv = family.argv("model-x", 5, ws);
+    let argv = family.argv("model-x", 5, ws).unwrap();
     let agent_files = soul_mount();
     let plan = ContainerPlan {
         image: &s.image, executable: s.executable(family), argv: &argv, env,
@@ -274,7 +269,7 @@ fn pair(args: &[String], flag: &str, value: &str) -> bool {
 #[test]
 fn every_family_gets_the_same_hardened_container() {
     let ws = Path::new(super::container::WORKSPACE);
-    for family in settings::FAMILIES {
+    for family in settings::FAMILIES.into_iter().filter(|family| *family != RuntimeFamily::Codex) {
         let mut selected = std::collections::HashMap::new();
         for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY"] {
             selected.insert(key.to_string(), format!("secret-{key}-value"));

@@ -1661,7 +1661,7 @@ mod tests {
 
     /// The third-party tool gate in the proxy: a blocked tool is hidden and
     /// refused without reaching the upstream, an `ask` tool waits for an
-    /// ApprovalBroker decision, a trusted read passes.
+    /// ApprovalBroker decision, including upstream read-only claims.
     #[tokio::test]
     async fn gate_hides_refuses_and_holds_calls_for_approval() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1725,13 +1725,15 @@ mod tests {
         let home = tmp.path().to_path_buf();
         let approver = tokio::spawn(async move {
             let broker = duduclaw_gateway::approval::ApprovalBroker::open(&home).unwrap();
+            let mut approved = std::collections::HashSet::new();
             for _ in 0..200 {
                 let pending = broker.list_pending(Some("a1")).await.unwrap_or_default();
                 if let Some(rec) = pending.first() {
                     assert_eq!(rec.action_kind, "mcp_call");
-                    assert!(rec.summary.contains("crm.put"), "{}", rec.summary);
+                    assert!(rec.summary.contains("crm.put") || rec.summary.contains("crm.get"), "{}", rec.summary);
                     broker.decide(&rec.id, true, "dashboard:admin").await.unwrap();
-                    return true;
+                    approved.insert(rec.id.clone());
+                    if approved.len() == 2 { return true; }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -1755,7 +1757,7 @@ mod tests {
         w.flush().await.unwrap();
         drop(w);
 
-        assert!(approver.await.unwrap(), "an approval was filed");
+        assert!(approver.await.unwrap(), "both Modify calls required approval");
         proxy.await.unwrap().unwrap();
         let seen = upstream.await.unwrap();
         while let Ok(Some(l)) = lines.next_line().await {

@@ -250,8 +250,8 @@ pub(crate) fn apply_capabilities_to_table(
         changes.push(format!("capabilities.action_rules = [{n} rules]"));
     }
 
-    // ── trusted_read_hint_servers (2026-10-08) — third-party servers whose
-    // `readOnlyHint` the tool gate believes. REPLACE semantics; each entry
+    // ── trusted_read_hint_servers — inert legacy setting retained for config
+    // compatibility; it cannot lower tool risk. REPLACE semantics; each entry
     // must be a valid `.mcp.json` server name (not DuDuClaw's own).
     if let Some(raw) = cap.get("trusted_read_hint_servers") {
         let arr = raw

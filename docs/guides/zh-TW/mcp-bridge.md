@@ -2,6 +2,12 @@
 
 DuDuClaw 可以把第三方 [Model Context Protocol](https://modelcontextprotocol.io) 伺服器掛載在自己內建的 MCP server 旁邊，讓 agent 的工具迴圈直接拿到外部伺服器的工具，不必手刻一支 Rust 連接器。Plane、Chatwoot、Invoice Ninja、Gmail/Calendar、WooCommerce，以及其他任何 MCP server，都是這樣接進 agent 的。
 
+## 第三方工具檢查（尚未發佈）
+
+`[[mcp.external]]` 的 stdio 與 Streamable HTTP 掛載都採用與受管理 MCP 代理相同的 `ThirdPartyGate`，依工具宣告判定影響類別。伺服器的工具允許／拒絕清單仍會限縮工具，員工的名稱限制、動作規則與審批要求也會套用到清單與呼叫。annotations 只能將預設 Modify 提高為 Delete，唯讀宣稱即使搭配舊信任設定也不得降低風險；遭拒的工具不會提供給模型。
+
+員工 `.mcp.json` 中直接指定 URL/type 的項目會由受管理的啟動路徑拒絕，請改用受管理的遠端 MCP 連線。`[[mcp.external]]` 本身的 HTTP `url` 掛載仍受支援。詳見[擴充功能邊界](../../architecture/extension-gates.md)。
+
 ## MCP Bridge 還是原生連接器
 
 - **MCP Bridge**（本頁）：這套 SaaS 本身（或社群）已經有現成的 MCP server，你只要用設定檔掛上去，不必寫任何程式碼。
@@ -73,7 +79,7 @@ allowed_tools = ["search_threads", "get_thread", "create_draft"]
 - **內建的 duduclaw MCP server 永遠是 client 0**，工具名稱撞名時內建工具優先（外部重複的那個會被丟棄並留下 log）。
 - 每個外部伺服器都是獨立啟動的；哪一個**連不上就跳過那個**，內建伺服器與其他外部伺服器照常運作。如果合併後的 `tools/list` 整組失敗，工具註冊表會降級成**只剩內建工具**，不會整組工具都不見。
 - `allowed_tools` 是 **deny-by-default**：設了允許清單，沒列進去的工具就會被隱藏。可以搭配 `denied_tools` 再點名擋掉特定危險工具。
-- 寫入型／不可逆的工具（計費、刪除）還要另外列進 agent 的 `[capabilities] approval_required_tools`，讓它們走 HITL 的 `ApprovalBroker`。MCP Bridge 控制的是「看不看得到」，審批機制控制的是「能不能執行」。
+- 寫入型／不可逆的工具（計費、刪除）還要另外列進 agent 的 `[capabilities] approval_required_tools`，讓它們走 HITL 的 `ApprovalBroker`。工具註冊表的閘門會同時檢查清單與執行；隱藏工具並非唯一的授權檢查。
 
 ## 活體驗證流程
 

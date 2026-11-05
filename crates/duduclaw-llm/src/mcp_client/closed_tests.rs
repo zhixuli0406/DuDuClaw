@@ -129,6 +129,7 @@ impl OwnedScopedOperation for FakeOperation {
         let is_error = self.args.get("isError") == Some(&json!(true));
         let reply = if self.discover || self.wrong {
             OwnedScopedReply::Discover(vec![McpToolDef {
+                annotations: Default::default(),
                 name: "closed_tool".into(),
                 description: "fixture".into(),
                 input_schema: json!({"type":"object"}),
