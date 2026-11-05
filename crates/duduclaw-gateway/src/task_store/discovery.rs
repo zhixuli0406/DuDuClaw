@@ -19,13 +19,15 @@ impl TaskStore {
             .optional().map_err(|e|e.to_string())
     }
     pub(crate) async fn save_discovery_decision_receipt(&self, receipt: &DiscoveryDecisionReceipt) -> Result<(), String> {
-        let mut connection = self.conn.lock().await;
-        let conn = begin_live_write(&mut connection)?;
-        conn.execute("INSERT INTO discovery_decision_receipts(approval_id,task_id,decider,approve,payload_sha256,frozen_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(approval_id) DO NOTHING",
-            params![receipt.approval_id,receipt.task_id,receipt.decider,receipt.approve as i64,
-                receipt.payload_sha256,receipt.frozen_sha256,Utc::now().to_rfc3339()]).map_err(|e|e.to_string())?;
-        commit_live_write(conn)?;
-        drop(connection);
+        // Keep the non-Send SQLite transaction out of the readback await.
+        {
+            let mut connection = self.conn.lock().await;
+            let conn = begin_live_write(&mut connection)?;
+            conn.execute("INSERT INTO discovery_decision_receipts(approval_id,task_id,decider,approve,payload_sha256,frozen_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(approval_id) DO NOTHING",
+                params![receipt.approval_id,receipt.task_id,receipt.decider,receipt.approve as i64,
+                    receipt.payload_sha256,receipt.frozen_sha256,Utc::now().to_rfc3339()]).map_err(|e|e.to_string())?;
+            commit_live_write(conn)?;
+        }
         if self.discovery_decision_receipt(&receipt.approval_id).await?.as_ref() != Some(receipt) {
             return Err("discovery approval already has a different human decision intent".into());
         }

@@ -86,11 +86,12 @@ pub(crate) async fn spawn_claude(agent_dir: &std::path::Path, prompt: &str, syst
     let class = crate::process_group::execution_class(ExecutionClass::EmployeeMain);
     let plan = super::boot::claude_plan(authorization.home.clone(), authorization.agent.clone(), class,
         prompt.as_bytes().to_vec(), system_prompt.as_bytes().to_vec(), model.into()).await.map_err(|_| refusal())?;
-    spawn_plan(authorization, plan, class, RuntimeKind::Claude, prompt.as_bytes().to_vec()).await
+    spawn_plan(authorization, plan, class, RuntimeKind::Claude, prompt.as_bytes().to_vec(), principal_context).await
 }
 
 async fn spawn_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolation::execution::SpawnPolicy,
-    class: ExecutionClass, runtime: RuntimeKind, bytes: Vec<u8>)
+    class: ExecutionClass, runtime: RuntimeKind, bytes: Vec<u8>,
+    principal_context: Option<crate::on_behalf_of::context::ContextGuard>)
     -> Result<(crate::process_group::BackendChild, PromptWriter), String> {
     let launch = super::prepare_launch(super::LaunchInput { agent: authorization.agent, plan,
         grant: authorization.grant, roots: authorization.roots, origin: authorization.origin,
@@ -154,7 +155,7 @@ pub(crate) async fn execute_registered_cli(id: &str, prompt: &str, context: &cra
 
 async fn collect_plan(authorization: RuntimeAuthorization, plan: duduclaw_isolation::execution::SpawnPolicy,
     class: ExecutionClass, runtime: RuntimeKind, bytes: Vec<u8>, deadline: Duration) -> Result<Vec<u8>, String> {
-    let (mut child, mut writer) = spawn_plan(authorization, plan, class, runtime, bytes).await?;
+    let (mut child, mut writer) = spawn_plan(authorization, plan, class, runtime, bytes, None).await?;
     let mut stdout = child.child().stdout.take().ok_or_else(refusal)?;
     let mut stderr = child.child().stderr.take().ok_or_else(refusal)?;
     let mut out = Vec::new();

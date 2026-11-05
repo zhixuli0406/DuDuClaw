@@ -880,8 +880,8 @@ mod tests {
 
     #[test]
     fn approvals_decide_keeps_scoped_inner_future_on_heap() {
-        // Inspect future types without constructing a handler or polling a future.
-        fn future_size<F: std::future::Future>(
+        // Check Send and size without constructing a handler or polling a future.
+        fn future_size<F: std::future::Future + Send>(
             _: impl FnOnce(&'static MethodHandler, &'static UserContext) -> F,
         ) -> usize {
             std::mem::size_of::<F>()
