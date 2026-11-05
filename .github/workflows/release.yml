@@ -153,9 +153,12 @@ jobs:
             duduclaw-*.pem
 
   release:
-    needs: build
+    needs: [build, delivery-gate]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          ref: ${{ needs.delivery-gate.outputs.commit }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
         with:
           merge-multiple: true
@@ -178,6 +181,7 @@ jobs:
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           for f in duduclaw-*.tar.gz duduclaw-*.zip; do
             [ -f "$f" ] || continue
+            python3 scripts/verify_release_marker.py --tag "$TAG" --archive "$f"
             minisign -S -s /tmp/minisign.key -m "$f" -t "duduclaw $TAG $f" -x "$f.minisig"
           done
           rm -f /tmp/minisign.key

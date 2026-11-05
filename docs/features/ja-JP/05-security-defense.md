@@ -1,5 +1,9 @@
 # セキュリティ防御
 
+公式 GitHub 更新は minisign の trusted comment `duduclaw v{version} {archive-file-name}` をプラットフォーム・アーキテクチャまで厳密に照合します。Pro 更新は `duduclaw-pro` と独自の固定公開鍵を使います。ペイロード署名とコメントを保護する global signature の両方が必要です。すべてのアーカイブ導入経路で、検証器が生成した `VerifiedReleaseIdentity` が必須となり、アーカイブのダイジェスト、版、ファイル名、署名済みコメントを結び付けます。整合性確認だけでは導入できません。置換前に実行ファイルの版も確認します。保護アップグレードでは root でダウンロードしたコードを実行せず、ビルド時の固定形式レコードを読みます。ヘッダー `NUL + DUDUCLAW_RELEASE_ID:V1:`、安定版 `X.Y.Z`、末尾 `NUL + DUDUCLAW_RELEASE_END + NUL` の完全なレコードが正確に一つ必要です。すべての `DUDUCLAW_RELEASE_ID` がこの形式に一致しなければなりません。欠落、不正、重複、競合、マーカーのない旧版は拒否します。署名前に実際のアーカイブ内の実行ファイルを解析し、tag と照合します。Pro のパッケージ作成にも適用します。通常更新は `version` 出力を確認します。不一致は置換および保護版の intent/floor 更新前に中止します。この検査には修正済みの更新プログラムが必要です。旧版の更新プログラムは管理者が確認した手動導入で先に更新してください。
+
+Provider は `verify_release_archive_with_pubkey(bytes, checksum, signature, pinned_key, expected_version, expected_file)` の結果を `install_verified_binary(bytes, &identity)` に渡してください。期待する版とファイル名は選択したリリース情報から取得し、ダウンロードした署名から流用しないでください。旧来の一引数の導入 API は廃止しました。
+
 Enterprise [チーム履歴 API](68-manager-team-history.md)（v1.76.0）は、既存のスタッフ権限とは独立して現在の報告関係を確認します。外部本文は閲覧時にマスクし、開示ごとに永続的なハッシュチェーン監査が必要です。設定オフ、出所不明、導入済みモデルの故障、監査失敗では本文を返しません。regex のみなら `ner: false` を明示し、氏名や住所が残る場合があります。ホスト／DB への直接アクセスは製品経路の保護対象外です。
 
 > 稼働中の4つのガード、それぞれがどこで動くか、そしてどれもカバーしないもの。
