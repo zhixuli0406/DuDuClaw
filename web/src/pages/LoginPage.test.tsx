@@ -4,6 +4,12 @@ import { screen, fireEvent, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 import { useAuthStore } from '@/stores/auth-store';
 import { LoginPage } from './LoginPage';
+import { useLocation } from 'react-router';
+
+function LocationProbe() {
+  const location = useLocation();
+  return <span data-testid="location">{location.pathname}</span>;
+}
 
 /**
  * WP5.1 — LoginPage Multica migration smoke test. Locks in the centered-card
@@ -25,7 +31,7 @@ beforeEach(() => {
 describe('<LoginPage>', () => {
   it('uses an effective distributor brand without customer-side branding controls', async () => {
     useBrandStore.getState().setBrand({ product_name: 'Partner Desk', logo_light: 'data:image/png;base64,iVBORw0KGgo=' });
-    renderWithProviders(<LoginPage />);
+    renderWithProviders(<><LoginPage /><LocationProbe /></>);
     expect(await screen.findByText('Partner Desk')).toBeInTheDocument();
     expect(screen.getByRole('img', { name: 'Partner Desk' })).toHaveAttribute('src', 'data:image/png;base64,iVBORw0KGgo=');
     expect(screen.getByText('Sign in to your account')).toBeInTheDocument();
@@ -69,6 +75,47 @@ describe('<LoginPage> first-run claim', () => {
       expect(firstRunClaim).toHaveBeenCalledWith('owner@example.com', 'a-strong-pw'),
     );
     expect(screen.queryByPlaceholderText('admin@local')).not.toBeInTheDocument();
+  });
+
+  it('shows MFA enrollment after a successful first-run claim without navigating', async () => {
+    const challenge = { mfa_enrollment_required: true as const, enrollment_token: 't', challenge_ref: 'r' };
+    const firstRunClaim = vi.fn(async () => challenge);
+    useAuthStore.setState({
+      firstRunStatus: (async () => true) as never,
+      firstRunClaim: firstRunClaim as never,
+    });
+    const { container } = renderWithProviders(<><LoginPage /><LocationProbe /></>);
+
+    const initialPath = screen.getByTestId('location').textContent;
+    fireEvent.change(await screen.findByLabelText('Your email'), { target: { value: 'owner@example.com' } });
+    fireEvent.change(screen.getByLabelText('Set a password'), { target: { value: 'a-strong-pw' } });
+    fireEvent.change(screen.getByLabelText('Confirm password'), { target: { value: 'a-strong-pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Set password & sign in' }));
+
+    await screen.findByLabelText('Channel or Admin enrollment code');
+    expect(container.textContent).toContain('Enrollment reference: r');
+    expect(screen.getByText('r')).toBeInTheDocument();
+    expect(screen.getByLabelText('Channel or Admin enrollment code')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Your email')).not.toBeInTheDocument();
+    expect(firstRunClaim).toHaveBeenCalledWith('owner@example.com', 'a-strong-pw');
+    expect(screen.getByTestId('location')).toHaveTextContent(initialPath ?? '');
+  });
+
+  it('navigates after a first-run claim with no MFA challenge', async () => {
+    const firstRunClaim = vi.fn(async () => undefined);
+    useAuthStore.setState({
+      firstRunStatus: (async () => true) as never,
+      firstRunClaim: firstRunClaim as never,
+    });
+    renderWithProviders(<><LoginPage /><LocationProbe /></>);
+
+    fireEvent.change(await screen.findByLabelText('Your email'), { target: { value: 'owner@example.com' } });
+    fireEvent.change(screen.getByLabelText('Set a password'), { target: { value: 'a-strong-pw' } });
+    fireEvent.change(screen.getByLabelText('Confirm password'), { target: { value: 'a-strong-pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Set password & sign in' }));
+
+    await waitFor(() => expect(firstRunClaim).toHaveBeenCalledWith('owner@example.com', 'a-strong-pw'));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/'));
   });
 });
 

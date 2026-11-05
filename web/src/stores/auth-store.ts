@@ -68,7 +68,7 @@ interface AuthStore {
   firstRunStatus: () => Promise<boolean>;
   /** First-run onboarding: set the initial admin password, then establish the
    *  session (no console one-time password needed). */
-  firstRunClaim: (email: string, password: string) => Promise<void>;
+  firstRunClaim: (email: string, password: string) => Promise<LoginResult>;
   logout: () => void;
   refresh: () => Promise<void>;
   loadFromStorage: () => Promise<boolean>;
@@ -408,7 +408,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       // Claim only sets the owner's email and password; establish the session
       // via the normal login path so token wiring / refresh timer are
       // identical. The server echoes the stored (trimmed) email.
-      await get().login(res.email ?? email.trim(), password);
+      return await get().login(res.email ?? email.trim(), password);
     } catch (e) {
       if (attempt === get().authAttempt) set({ loading: false });
       throw e;
