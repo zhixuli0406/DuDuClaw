@@ -572,11 +572,6 @@ impl AgentRuntime for GrokRuntime {
         // Interactive `grok login` sessions are honoured by the CLI itself.
         let api_key = std::env::var("XAI_API_KEY").unwrap_or_default();
 
-        let mut cmd = tokio::process::Command::new(&self.grok_path);
-        cmd.args(&args);
-        // This token belongs to the Claude host session and must not reach Grok.
-        cmd.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
-
         // Working directory (also the root Grok walks for AGENTS.md / project config).
         //
         // A caller may override the cwd via `super::SPAWN_OVERRIDE` (today: the
@@ -628,58 +623,9 @@ impl AgentRuntime for GrokRuntime {
                 }
             }
         }
-        if let Some(ref dir) = work_root {
-            cmd.current_dir(dir);
-        }
-
-        for (k, v) in &home_env {
-            cmd.env(k, v);
-        }
-        if !api_key.is_empty() {
-            cmd.env("XAI_API_KEY", &api_key);
-        }
-
-        // Forward the duduclaw MCP identity via spawn env so the MCP server child
-        // (spawned by grok, inheriting this env) resolves the right agent even if
-        // Grok doesn't pick up the per-agent project config (residual #2).
-        // Identity pair, not just the id: an MCP child that inherits this env
-        // instead of the declared block must still be able to prove its claim
-        // under `[delegation] require_identity_token = true`.
-        for (k, v) in duduclaw_core::agent_identity_env_vars(&context.home_dir, &context.agent_id) {
-            cmd.env(k, v);
-        }
-        for (k, v) in duduclaw_core::mcp_forward_env_vars() {
-            cmd.env(k, v);
-        }
-        // P2-B N4: the turn/run source identity, same channel as the id. Grok
-        // may hand its MCP child only the declared config env, in which case
-        // this does not arrive (unverified); the persisted config is not used
-        // for per-turn values. Grok inherits the gateway's environment, so an
-        // ambient `DUDUCLAW_ON_BEHALF_OF` is removed first; only the scoped
-        // value (in the pairs) may reach the MCP child.
-        cmd.env_remove(duduclaw_core::ENV_ON_BEHALF_OF);
-        cmd.env_remove(crate::on_behalf_of::context::ENV_CONTEXT);
-        for (k, v) in crate::memory_provenance::turn_source_env_pairs() {
-            cmd.env(k, v);
-        }
-        // RuntimeContext is authoritative for isolated eval arms. The process
-        // env can still name the source home, whose MCP auth/task state must
-        // never receive a role member's calls.
-        cmd.env("DUDUCLAW_HOME", &context.home_dir);
-        // P2-A H-2: only reaches the MCP child if Grok passes its own env on
-        // (its declared per-agent block is persistent and never carries it).
-        if let Some((k, v)) = super::round_task_env() {
-            cmd.env(k, v);
-        }
-        // This spawn's third-party upstream-env directory: Grok expands it
-        // into each spawn-scoped proxy's env (`${DUDUCLAW_MCP_PROXY_ENV_DIR:-}`
-        // in `.grok/config.toml`). Removed first so an ambient value can never
-        // stand in for it; absent for a spawn without third-party servers and
-        // for a utility call, whose proxies then start nothing.
-        cmd.env_remove(duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_DIR_VAR);
-        if let Some((k, v)) = &third_party_env {
-            cmd.env(k, v);
-        }
+        let mut cmd = self.prepare_command(
+            &args, &home_env, &api_key, context, work_root.as_deref(), third_party_env.as_ref(),
+        );
 
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -694,11 +640,13 @@ impl AgentRuntime for GrokRuntime {
 
         let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        let output = crate::process_group::output_for_model(
+        let output = duduclaw_core::execution_gate::with_runtime(
+            duduclaw_core::execution_gate::RuntimeKind::Grok,
+            crate::process_group::output_for_model(
             &mut cmd, None, deadline.saturating_duration_since(tokio::time::Instant::now()),
-        ).await.map_err(|e| match e {
+        )).await.map_err(|e| match e {
             crate::process_group::OutputError::Timeout => format!("Grok CLI hard timeout after {timeout_secs}s"),
-            crate::process_group::OutputError::Io(e) => format!("Failed to run grok: {e}"),
+            crate::process_group::OutputError::Io(e) => crate::process_group::backend_error(e, "Failed to run grok"),
         })?;
 
         if !output.status.success() {
@@ -843,6 +791,79 @@ impl AgentRuntime for GrokRuntime {
     }
 }
 
+impl GrokRuntime {
+    /// The command handed to the backend is the same native builder used locally.
+    fn prepare_command(
+        &self,
+        args: &[String],
+        home_env: &[(String, String)],
+        api_key: &str,
+        context: &RuntimeContext,
+        work_root: Option<&std::path::Path>,
+        third_party_env: Option<&(String, String)>,
+    ) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.grok_path);
+        cmd.args(args);
+        // This token belongs to the Claude host session and must not reach Grok.
+        cmd.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
+
+        if let Some(dir) = work_root {
+            cmd.current_dir(dir);
+        }
+
+        for (k, v) in home_env {
+            cmd.env(k, v);
+        }
+        if !api_key.is_empty() {
+            cmd.env("XAI_API_KEY", api_key);
+        }
+
+        // Forward the duduclaw MCP identity via spawn env so the MCP server child
+        // (spawned by grok, inheriting this env) resolves the right agent even if
+        // Grok doesn't pick up the per-agent project config (residual #2).
+        // Identity pair, not just the id: an MCP child that inherits this env
+        // instead of the declared block must still be able to prove its claim
+        // under `[delegation] require_identity_token = true`.
+        for (k, v) in duduclaw_core::agent_identity_env_vars(&context.home_dir, &context.agent_id) {
+            cmd.env(k, v);
+        }
+        for (k, v) in duduclaw_core::mcp_forward_env_vars() {
+            cmd.env(k, v);
+        }
+        // P2-B N4: the turn/run source identity, same channel as the id. Grok
+        // may hand its MCP child only the declared config env, in which case
+        // this does not arrive (unverified); the persisted config is not used
+        // for per-turn values. Grok inherits the gateway's environment, so an
+        // ambient `DUDUCLAW_ON_BEHALF_OF` is removed first; only the scoped
+        // value (in the pairs) may reach the MCP child.
+        cmd.env_remove(duduclaw_core::ENV_ON_BEHALF_OF);
+        cmd.env_remove(crate::on_behalf_of::context::ENV_CONTEXT);
+        for (k, v) in crate::memory_provenance::turn_source_env_pairs() {
+            cmd.env(k, v);
+        }
+        // RuntimeContext is authoritative for isolated eval arms. The process
+        // env can still name the source home, whose MCP auth/task state must
+        // never receive a role member's calls.
+        cmd.env("DUDUCLAW_HOME", &context.home_dir);
+        // P2-A H-2: only reaches the MCP child if Grok passes its own env on
+        // (its declared per-agent block is persistent and never carries it).
+        if let Some((k, v)) = super::round_task_env() {
+            cmd.env(k, v);
+        }
+        // This spawn's third-party upstream-env directory: Grok expands it
+        // into each spawn-scoped proxy's env (`${DUDUCLAW_MCP_PROXY_ENV_DIR:-}`
+        // in `.grok/config.toml`). Removed first so an ambient value can never
+        // stand in for it; absent for a spawn without third-party servers and
+        // for a utility call, whose proxies then start nothing.
+        cmd.env_remove(duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_DIR_VAR);
+        if let Some((k, v)) = third_party_env {
+            cmd.env(k, v);
+        }
+
+        cmd
+    }
+}
+
 // ── Streaming ───────────────────────────────────────────────────
 
 impl GrokRuntime {
@@ -915,7 +936,9 @@ impl GrokRuntime {
         if remaining.is_zero() {
             return Err(format!("Grok CLI hard timeout after {timeout_secs}s"));
         }
-        let out = crate::pty_runtime::invoke_oneshot(
+        let out = duduclaw_core::execution_gate::with_runtime(
+            duduclaw_core::execution_gate::RuntimeKind::Grok,
+            crate::pty_runtime::invoke_oneshot(
             self.grok_path.clone(),
             args.to_vec(),
             env,
@@ -929,7 +952,7 @@ impl GrokRuntime {
             // the Claude spawn paths this WP fixed; flagged as a follow-up
             // candidate, not silently left unmentioned.
             false,
-        )
+        ))
         .await
         .map_err(|e| grok_pty_error(e, timeout_secs))?;
         salvage_pty_stdout(&out.stdout, args)
@@ -1205,6 +1228,34 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn local_backend_equivalence_grok() {
+        let home = tempfile::tempdir().unwrap();
+        let mut context = ctx("system", "fixture-model");
+        context.home_dir = home.path().to_owned();
+        context.agent_dir = Some(home.path().join("employee"));
+        let runtime = GrokRuntime { grok_path: "grok-fixture".into() };
+        let args = vec!["--permission-mode".into(), "bypassPermissions".into(), "-p".into(), "繁體中文 $HOME;\nnext".into()];
+        let env = vec![("HOME".into(), "fixture home".into()), ("GROK_HOME".into(), "fixture config".into())];
+        let command = runtime.prepare_command(&args, &env, "fixture-key", &context,
+            context.agent_dir.as_deref(), None);
+        let before = duduclaw_core::execution_gate::command_snapshot(&command);
+        let mut expected = tokio::process::Command::new("grok-fixture");
+        expected.args(["--permission-mode", "bypassPermissions", "-p", "繁體中文 $HOME;\nnext"])
+            .current_dir(home.path().join("employee"))
+            .env_remove("CLAUDE_CODE_MESSAGING_TOKEN")
+            .env("HOME", "fixture home").env("GROK_HOME", "fixture config")
+            .env("XAI_API_KEY", "fixture-key")
+            .env(duduclaw_core::ENV_AGENT_ID, "test")
+            .envs(duduclaw_core::mcp_forward_env_vars())
+            .env_remove(duduclaw_core::ENV_ON_BEHALF_OF)
+            .env_remove(crate::on_behalf_of::context::ENV_CONTEXT)
+            .env("DUDUCLAW_HOME", home.path())
+            .env_remove(duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_DIR_VAR);
+        assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected));
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
+    }
 
     #[test]
     fn egress_grok_modes_and_shared_hook_roots() {

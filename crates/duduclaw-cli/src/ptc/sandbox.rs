@@ -88,6 +88,30 @@ pub(crate) const CONTAINER_PYTHON: &str = "python3";
 /// Sandbox executor for PTC scripts.
 pub struct PtcSandbox;
 
+fn script_command(program: &str, args: &[String]) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command.args(args)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env(
+            "HOME",
+            std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_default(),
+        )
+        .env(
+            "USERPROFILE",
+            std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .unwrap_or_default(),
+        )
+        .env("LANG", std::env::var("LANG").unwrap_or_default())
+        .env("PYTHONUNBUFFERED", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command
+}
+
 impl PtcSandbox {
     /// Execute a script as a direct child process (no container isolation).
     /// Reached only through `script_when_unavailable = "run_unsandboxed"`.
@@ -140,27 +164,12 @@ impl PtcSandbox {
         };
 
         let timeout = std::time::Duration::from_millis(req.timeout_ms);
-        let mut child = tokio::process::Command::new(&program)
-            .args(&args)
-            .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env(
-                "HOME",
-                std::env::var("HOME")
-                    .or_else(|_| std::env::var("USERPROFILE"))
-                    .unwrap_or_default(),
-            )
-            .env(
-                "USERPROFILE",
-                std::env::var("USERPROFILE")
-                    .or_else(|_| std::env::var("HOME"))
-                    .unwrap_or_default(),
-            )
-            .env("LANG", std::env::var("LANG").unwrap_or_default())
-            .env("PYTHONUNBUFFERED", "1")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+        let mut command = script_command(&program, &args);
+        let mut child = duduclaw_core::execution_gate::with_runtime(
+        duduclaw_core::execution_gate::RuntimeKind::Registered(
+            duduclaw_core::execution_gate::Text::new("execute-program".into()).expect("constant runtime id")),
+        duduclaw_core::execution_gate::spawn(&mut command,
+            duduclaw_core::execution_gate::ExecutionClass::EmployeeTool)).await
             .map_err(|e| DuDuClawError::Agent(format!("Failed to spawn {program}: {e}")))?;
 
         // Take stdout/stderr handles before waiting so we retain ownership of `child` for kill()
@@ -173,7 +182,7 @@ impl PtcSandbox {
         // while we block in wait() waiting for the child to exit. tokio::join!
         // on (wait, drain_stdout, drain_stderr) keeps the pipes draining.
         let read_limit = req.max_output_bytes as u64 + 1024;
-        let drain = |handle: Option<tokio::process::ChildStdout>| async move {
+        let drain = |handle: Option<duduclaw_core::execution_gate::ChildStdout>| async move {
             let mut buf = Vec::with_capacity(65536);
             if let Some(out) = handle {
                 use tokio::io::AsyncReadExt as _;
@@ -182,7 +191,7 @@ impl PtcSandbox {
             }
             buf
         };
-        let drain_err = |handle: Option<tokio::process::ChildStderr>| async move {
+        let drain_err = |handle: Option<duduclaw_core::execution_gate::ChildStderr>| async move {
             let mut buf = Vec::with_capacity(4096);
             if let Some(err) = handle {
                 use tokio::io::AsyncReadExt as _;
@@ -254,6 +263,11 @@ impl PtcSandbox {
         agent_id: &str,
     ) -> Result<ScriptResult> {
         use duduclaw_gateway::task_sandbox::settings::{self, WhenUnavailable};
+        // Protected runs use the backend's trusted input/policy handoff; the
+        // gateway must never start Docker or silently retry the local branch.
+        if duduclaw_core::execution_gate::isolation_required() {
+            return Self::execute(req, rpc_server).await;
+        }
         // The script sandbox's own escape hatch, read on its own: it keeps
         // working while another key of the section is invalid. The task
         // sandbox's `when_unavailable` never applies here.
@@ -749,5 +763,28 @@ mod tests {
             .to_string();
         assert!(err.contains("(image_missing)") && err.contains(&format!("docker pull {missing}")), "{err}");
         assert!(audit_lines(home.path()).contains("image_missing"));
+    }
+}
+
+#[cfg(test)]
+mod execution_backend_equivalence_tests {
+    use super::*;
+    #[tokio::test]
+    async fn execute_program_backend_command_matches_legacy_argv_env_cwd() {
+        let args = vec!["script with spaces.py".into(), "繁體中文 $HOME;\nnext".into()];
+        let command = script_command("python3", &args);
+        let mut legacy = tokio::process::Command::new("python3");
+        legacy.args(&args).env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default())
+            .env("USERPROFILE", std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default())
+            .env("LANG", std::env::var("LANG").unwrap_or_default()).env("PYTHONUNBUFFERED", "1")
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        assert_eq!(command.as_std().get_program(), legacy.as_std().get_program());
+        assert_eq!(command.as_std().get_args().collect::<Vec<_>>(), legacy.as_std().get_args().collect::<Vec<_>>());
+        assert_eq!(command.as_std().get_envs().collect::<Vec<_>>(), legacy.as_std().get_envs().collect::<Vec<_>>());
+        assert_eq!(command.as_std().get_current_dir(), legacy.as_std().get_current_dir());
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(),
+            duduclaw_core::execution_gate::command_snapshot(&legacy));
     }
 }

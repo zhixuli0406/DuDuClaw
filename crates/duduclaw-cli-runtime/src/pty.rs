@@ -1,19 +1,18 @@
-//! Cross-platform PTY handle backed by [`portable-pty`].
+//! Cross-platform PTY handle backed by the selected execution backend.
 //!
-//! `portable-pty` gives us a uniform `PtySystem` trait that picks ConPTY on
-//! Windows 10 1809+ and openpty on Unix. The blocking reader/writer halves are
-//! pumped onto async channels via dedicated `spawn_blocking` tasks so callers can
-//! interact in pure Tokio land.
+//! LocalBackend owns portable-pty; protected Linux owns the daemon PTY.
+//! Callers retain asynchronous streams and opaque lifecycle authority.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::CommandBuilder;
+use duduclaw_core::execution_gate::{RunControl, PtySize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tracing::{debug, trace, warn};
 
@@ -110,11 +109,7 @@ pub struct PtyHandle {
 }
 
 struct PtyInner {
-    // Held to keep the PTY pair alive; Phase 4 will surface a resize() that
-    // actually goes through this lock.
-    #[allow(dead_code)]
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    child: Mutex<Box<dyn Child + Send + Sync>>,
+    control: RunControl,
     writer_tx: mpsc::Sender<WriteCmd>,
     reader_rx: AsyncMutex<mpsc::Receiver<ReadEvent>>,
     /// Drained-yet-not-yet-consumed bytes from the reader pump (used to handle
@@ -129,13 +124,6 @@ enum WriteCmd {
         bytes: Vec<u8>,
         ack: oneshot::Sender<Result<(), PtyError>>,
     },
-    Resize {
-        #[allow(dead_code)]
-        rows: u16,
-        #[allow(dead_code)]
-        cols: u16,
-        ack: oneshot::Sender<Result<(), PtyError>>,
-    },
     Shutdown,
 }
 
@@ -147,76 +135,35 @@ enum ReadEvent {
 }
 
 impl PtyHandle {
-    /// Spawn a child under a fresh PTY pair and start the async pumps.
-    pub fn spawn(cmd: PtyCommand) -> Result<Self, PtyError> {
-        Self::spawn_with_handoff(cmd, || {})
+    /// Spawn through the selected backend and retain its opaque lifecycle handle.
+    pub async fn spawn(cmd: PtyCommand) -> Result<Self, PtyError> {
+        Self::spawn_with_handoff(cmd, || {}).await
     }
 
-    /// Notify immediately after the native child exists, before pump setup.
-    pub(crate) fn spawn_with_handoff(
+    pub(crate) async fn spawn_with_handoff(
         cmd: PtyCommand, handed_off: impl FnOnce(),
     ) -> Result<Self, PtyError> {
-        let system = native_pty_system();
-        let pair = system
-            .openpty(PtySize {
-                rows: cmd.rows,
-                cols: cmd.cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| PtyError::OpenPty(e.to_string()))?;
-
-        let mut builder = CommandBuilder::new(&cmd.program);
-        for arg in &cmd.args {
-            builder.arg(arg);
-        }
-        if cmd.clear_env {
-            builder.env_clear();
-        }
-        for (k, v) in &cmd.env {
-            builder.env(OsString::from(k), OsString::from(v));
-        }
-        if let Some(cwd) = &cmd.cwd {
-            builder.cwd(cwd);
-        }
-
-        let child = pair.slave.spawn_command(builder).map_err(|e| {
-            PtyError::SpawnChild {
-                program: cmd.program.clone(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
-            }
-        })?;
+        let builder = command_builder(&cmd);
+        let mut child = duduclaw_core::execution_gate::spawn_pty(builder,
+            PtySize { rows: cmd.rows, columns: cmd.cols },
+            duduclaw_core::execution_gate::capture_class()).await
+            .map_err(|source| PtyError::SpawnChild { program: cmd.program.clone(), source })?;
         handed_off();
-        let pid = child.process_id();
-
-        let master = pair.master;
-        // Take blocking reader/writer halves before moving master into the lock.
-        let reader = master
-            .try_clone_reader()
-            .map_err(|e| PtyError::OpenPty(format!("clone_reader: {e}")))?;
-        let writer = master
-            .take_writer()
-            .map_err(|e| PtyError::OpenPty(format!("take_writer: {e}")))?;
-
+        let pid = child.id();
+        let control = child.control();
+        let reader = child.output.take().ok_or(PtyError::Closed)?;
+        let writer = child.input.take().ok_or(PtyError::Closed)?;
         let (reader_tx, reader_rx) = mpsc::channel::<ReadEvent>(64);
         let (writer_tx, writer_rx) = mpsc::channel::<WriteCmd>(64);
-
-        // Reader pump: blocking thread → async channel.
         spawn_reader_pump(reader, reader_tx);
-        // Writer pump: async channel → blocking thread.
         spawn_writer_pump(writer, writer_rx);
-
-        let inner = Arc::new(PtyInner {
-            master: Mutex::new(master),
-            child: Mutex::new(child),
-            writer_tx,
-            reader_rx: AsyncMutex::new(reader_rx),
-            rx_buffer: Mutex::new(String::new()),
-            pid,
-            system: PtySystemKind::current(),
-        });
-
-        Ok(Self { inner })
+        // Keep the owning handle alive until termination. Cancellation is
+        // independent of this wait and runs through the backend control handle.
+        tokio::spawn(async move { let _ = child.wait().await; });
+        Ok(Self { inner: Arc::new(PtyInner {
+            control, writer_tx, reader_rx: AsyncMutex::new(reader_rx),
+            rx_buffer: Mutex::new(String::new()), pid, system: PtySystemKind::current(),
+        }) })
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -241,15 +188,9 @@ impl PtyHandle {
         rx.await.map_err(|_| PtyError::Closed)?
     }
 
-    /// Resize the PTY (rows × cols).
+    /// Resize the backend's real PTY (rows × columns).
     pub async fn resize(&self, rows: u16, cols: u16) -> Result<(), PtyError> {
-        let (ack, rx) = oneshot::channel();
-        self.inner
-            .writer_tx
-            .send(WriteCmd::Resize { rows, cols, ack })
-            .await
-            .map_err(|_| PtyError::Closed)?;
-        rx.await.map_err(|_| PtyError::Closed)?
+        self.inner.control.resize(PtySize { rows, columns: cols }).await.map_err(PtyError::Io)
     }
 
     /// Read until `marker` appears in the rolling buffer, OR until `deadline` elapses.
@@ -371,30 +312,31 @@ impl PtyHandle {
         }
     }
 
-    /// Check whether the child process is still alive.
+    /// Check the backend's cached terminal state; a PID is never authority.
     pub fn is_alive(&self) -> bool {
-        let mut child = self.inner.child.lock();
-        match child.try_wait() {
-            Ok(None) => true,
-            Ok(Some(_)) => false,
-            Err(_) => false,
-        }
+        matches!(self.inner.control.try_wait(), Ok(None))
     }
 
-    /// Cooperative shutdown: stop background pumps, kill child, drop master.
     pub async fn shutdown(&self) {
         let _ = self.inner.writer_tx.send(WriteCmd::Shutdown).await;
-        let mut child = self.inner.child.lock();
-        if let Err(e) = child.kill() {
-            warn!(error = %e, "pty: kill failed (already exited?)");
+        if let Err(error) = self.inner.control.kill().await {
+            warn!(%error, "pty: backend termination failed");
         }
-        let _ = child.wait();
+        let _ = self.inner.control.wait().await;
     }
 }
 
-/// Free-function spawn wrapper for symmetry with the rest of the crate API.
-pub fn spawn_pty(cmd: PtyCommand) -> Result<PtyHandle, PtyError> {
-    PtyHandle::spawn(cmd)
+pub async fn spawn_pty(cmd: PtyCommand) -> Result<PtyHandle, PtyError> {
+    PtyHandle::spawn(cmd).await
+}
+
+fn command_builder(cmd: &PtyCommand) -> CommandBuilder {
+    let mut builder = CommandBuilder::new(&cmd.program);
+    for arg in &cmd.args { builder.arg(arg); }
+    if cmd.clear_env { builder.env_clear(); }
+    for (key, value) in &cmd.env { builder.env(OsString::from(key), OsString::from(value)); }
+    if let Some(cwd) = &cmd.cwd { builder.cwd(cwd); }
+    builder
 }
 
 impl Clone for PtyHandle {
@@ -409,21 +351,19 @@ impl Drop for PtyInner {
     fn drop(&mut self) {
         // Best-effort cleanup. Background pumps will see the channels close and exit.
         let _ = self.writer_tx.try_send(WriteCmd::Shutdown);
-        if let Some(mut child) = self.child.try_lock() {
-            let _ = child.kill();
-        }
+        let _ = self.control.start_kill();
     }
 }
 
-fn spawn_reader_pump(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<ReadEvent>) {
-    std::thread::spawn(move || {
+fn spawn_reader_pump(mut reader: duduclaw_core::execution_gate::ChildStdout, tx: mpsc::Sender<ReadEvent>) {
+    tokio::spawn(async move {
         let mut chunk = [0u8; 4096];
         // Spill buffer for incomplete UTF-8 codepoints at chunk boundaries.
         let mut carry: Vec<u8> = Vec::new();
         loop {
-            match reader.read(&mut chunk) {
+            match reader.read(&mut chunk).await {
                 Ok(0) => {
-                    let _ = tx.blocking_send(ReadEvent::Eof);
+                    let _ = tx.send(ReadEvent::Eof).await;
                     break;
                 }
                 Ok(n) => {
@@ -434,7 +374,7 @@ fn spawn_reader_pump(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<ReadEven
                         Ok(s) => {
                             let payload = s.to_string();
                             carry.clear();
-                            if tx.blocking_send(ReadEvent::Chunk(payload)).is_err() {
+                            if tx.send(ReadEvent::Chunk(payload)).await.is_err() {
                                 break;
                             }
                         }
@@ -450,7 +390,7 @@ fn spawn_reader_pump(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<ReadEven
                                 };
                                 let remainder = carry[valid_up_to..].to_vec();
                                 carry = remainder;
-                                if tx.blocking_send(ReadEvent::Chunk(payload)).is_err() {
+                                if tx.send(ReadEvent::Chunk(payload)).await.is_err() {
                                     break;
                                 }
                             } else if carry.len() > 8 {
@@ -458,7 +398,7 @@ fn spawn_reader_pump(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<ReadEven
                                 // — emit as lossy and drain so we don't loop forever.
                                 let payload = String::from_utf8_lossy(&carry).into_owned();
                                 carry.clear();
-                                if tx.blocking_send(ReadEvent::Chunk(payload)).is_err() {
+                                if tx.send(ReadEvent::Chunk(payload)).await.is_err() {
                                     break;
                                 }
                             }
@@ -467,7 +407,7 @@ fn spawn_reader_pump(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<ReadEven
                     }
                 }
                 Err(e) => {
-                    let _ = tx.blocking_send(ReadEvent::Error(e.to_string()));
+                    let _ = tx.send(ReadEvent::Error(e.to_string())).await;
                     break;
                 }
             }
@@ -476,33 +416,49 @@ fn spawn_reader_pump(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<ReadEven
 }
 
 fn spawn_writer_pump(
-    mut writer: Box<dyn Write + Send>,
+    mut writer: duduclaw_core::execution_gate::ChildStdin,
     mut rx: mpsc::Receiver<WriteCmd>,
 ) {
-    std::thread::spawn(move || {
-        while let Some(cmd) = rx.blocking_recv() {
+    tokio::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
             match cmd {
                 WriteCmd::Bytes { bytes, ack } => {
-                    let result = writer.write_all(&bytes).and_then(|_| writer.flush());
+                    let result = async {
+                        writer.write_all(&bytes).await?;
+                        writer.flush().await
+                    }.await;
                     let _ = ack.send(result.map_err(PtyError::Io));
-                }
-                WriteCmd::Resize { rows: _, cols: _, ack } => {
-                    // Resize is on the master, not the writer; the caller of resize()
-                    // takes that lock directly. To avoid plumbing the master through
-                    // here we treat this as an explicit no-op success — actual resize
-                    // happens in PtyHandle::resize via the master mutex (TODO: wire
-                    // through to master if needed; not used in Phase 1).
-                    let _ = ack.send(Ok(()));
                 }
                 WriteCmd::Shutdown => break,
             }
         }
+        let _ = writer.shutdown().await;
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scheduled_grok_pty_keeps_typed_policy_across_task_boundary() {
+        use duduclaw_core::execution_gate::{self, ExecutionClass, RuntimeKind, CapturedLaunch};
+        let captured = execution_gate::with_class(ExecutionClass::Scheduled,
+            execution_gate::with_runtime(RuntimeKind::Grok, async { CapturedLaunch::capture() })).await;
+        tokio::spawn(async move {
+            captured.scope(async {
+                // These are the task-scoped values consumed by spawn_with_handoff.
+                assert_eq!(execution_gate::capture_class(), ExecutionClass::Scheduled);
+                assert_eq!(execution_gate::capture_runtime(), RuntimeKind::Grok);
+                let command = PtyCommand::new("grok-fixture").args(["-p", "繁體中文 $HOME;\nnext"]);
+                let builder = command_builder(&command);
+                let before = execution_gate::pty_snapshot(&builder);
+                assert_eq!(execution_gate::local_pty_roundtrip(builder,
+                    PtySize { rows: command.rows, columns: command.cols }).await.unwrap(), before);
+            }).await;
+        }).await.unwrap();
+    }
+
 
     fn echo_program() -> (String, Vec<String>) {
         #[cfg(windows)]
@@ -525,7 +481,7 @@ mod tests {
     async fn echo_round_trip() {
         let (program, args) = echo_program();
         let cmd = PtyCommand::new(program).args(args);
-        let pty = PtyHandle::spawn(cmd).expect("spawn echo");
+        let pty = PtyHandle::spawn(cmd).await.expect("spawn echo");
         let out = pty
             .read_until("hello-pty", Duration::from_secs(5))
             .await
@@ -540,7 +496,7 @@ mod tests {
     async fn read_until_times_out_or_closes_when_marker_absent() {
         let (program, args) = echo_program();
         let cmd = PtyCommand::new(program).args(args);
-        let pty = PtyHandle::spawn(cmd).expect("spawn echo");
+        let pty = PtyHandle::spawn(cmd).await.expect("spawn echo");
         // After `echo` finishes, the reader eventually sees EOF, which surfaces
         // as PtyError::Closed; before EOF arrives, the marker absence yields
         // PtyError::ReadTimeout. Both outcomes prove `read_until` doesn't
@@ -570,7 +526,7 @@ mod tests {
     async fn push_buffer_round_trips_via_drain() {
         let (program, args) = echo_program();
         let cmd = PtyCommand::new(program).args(args);
-        let pty = PtyHandle::spawn(cmd).expect("spawn echo");
+        let pty = PtyHandle::spawn(cmd).await.expect("spawn echo");
         // Push synthetic tail bytes; drain_buffer must return them verbatim.
         pty.push_buffer("tail-bytes-from-prev-turn");
         let drained = pty.drain_buffer();
@@ -585,7 +541,7 @@ mod tests {
     async fn push_buffer_preserves_stream_order_when_buffer_nonempty() {
         let (program, args) = echo_program();
         let cmd = PtyCommand::new(program).args(args);
-        let pty = PtyHandle::spawn(cmd).expect("spawn echo");
+        let pty = PtyHandle::spawn(cmd).await.expect("spawn echo");
         // Simulate: buffer already holds "newer" bytes, then we push back the
         // "older" tail we over-read. Older must come out first.
         pty.push_buffer("NEWER");
@@ -610,7 +566,7 @@ mod tests {
         // drain_residual must surface them.
         let (program, args) = echo_program();
         let cmd = PtyCommand::new(program).args(args);
-        let pty = PtyHandle::spawn(cmd).expect("spawn echo");
+        let pty = PtyHandle::spawn(cmd).await.expect("spawn echo");
 
         // Give the reader pump time to push the echo onto the channel.
         for _ in 0..50 {
@@ -629,5 +585,40 @@ mod tests {
             pty.push_buffer(&snapshot);
         }
         panic!("drain_residual never surfaced reader-channel bytes");
+    }
+}
+
+#[cfg(test)]
+mod execution_backend_equivalence_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn grok_pty_backend_command_matches_legacy_argv_env_cwd() {
+        for clear_env in [false, true] {
+            let mut command = PtyCommand::new("grok").args(["--prompt", "繁體中文 $HOME;\nnext", ""])
+                .cwd(PathBuf::from("pty workspace")).env("PTY_FIXTURE", "literal value").size(31, 123);
+            command.clear_env = clear_env;
+            let actual = command_builder(&command);
+            let mut legacy = CommandBuilder::new(&command.program);
+            for arg in &command.args { legacy.arg(arg); }
+            if command.clear_env { legacy.env_clear(); }
+            for (key, value) in &command.env { legacy.env(OsString::from(key), OsString::from(value)); }
+            legacy.cwd(command.cwd.as_ref().unwrap());
+            assert_eq!(duduclaw_core::execution_gate::local_pty_roundtrip(actual,
+                PtySize { rows: command.rows, columns: command.cols }).await.unwrap(),
+                duduclaw_core::execution_gate::pty_snapshot(&legacy));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backend_pty_resize_changes_real_terminal_dimensions() {
+        let pty = PtyHandle::spawn(PtyCommand::new("sh")
+            .args(["-c", "read value; stty size"])).await.unwrap();
+        pty.resize(37, 93).await.unwrap();
+        pty.write_all(b"go\n").await.unwrap();
+        pty.read_until("37 93", Duration::from_secs(5)).await.unwrap();
+        pty.shutdown().await;
+        assert!(!pty.is_alive());
     }
 }

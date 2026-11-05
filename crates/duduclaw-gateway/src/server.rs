@@ -15062,9 +15062,7 @@ async fn handle_files_preview(
         let profile_arg = format!("-env:UserInstallation=file://{}", profile.display());
         let mut command = tokio::process::Command::new(&soffice);
         duduclaw_core::ns_guard::guard_command(&mut command);
-        let run = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            command.arg("--headless")
+        command.arg("--headless")
                 .arg(profile_arg)
                 .arg("--convert-to")
                 .arg("pdf")
@@ -15072,10 +15070,9 @@ async fn handle_files_preview(
                 .arg(&cache_dir)
                 .arg(&path)
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .output(),
-        )
-        .await;
+                .stderr(std::process::Stdio::piped());
+        let run = tokio::time::timeout(std::time::Duration::from_secs(60),
+            duduclaw_core::execution_gate::output(&mut command, duduclaw_core::execution_gate::ExecutionClass::ParseWorker)).await;
         let converted = match run {
             Ok(Ok(out)) if out.status.success() && cached.is_file() => true,
             Ok(Ok(out)) => {

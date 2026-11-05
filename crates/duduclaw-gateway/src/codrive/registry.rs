@@ -546,20 +546,8 @@ fn render_argv(template: &[&'static str], params: &Value) -> Result<Vec<String>,
     Ok(out)
 }
 
-async fn execute_cli(
-    argv_template: &'static [&'static str],
-    wait: WaitMode,
-    params: &Value,
-) -> Result<String, String> {
-    if argv_template.is_empty() {
-        // Defensive, not load-bearing: every real registry entry has a
-        // non-empty template — see this module's own const definitions.
-        return Err("empty argv_template".to_string());
-    }
-    let argv = render_argv(argv_template, params)?;
-    let program = argv[0].clone();
-
-    let mut cmd = tokio::process::Command::new(&program);
+fn prepare_cli_command(argv: &[String]) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     duduclaw_core::apply_agent_cli_env_allowlist(&mut cmd);
     // WP-CD4c VM live-fire fix (2026-08-22, minimal/surgical): layered on
@@ -590,6 +578,24 @@ async fn execute_cli(
     }
     cmd.stdin(std::process::Stdio::null());
 
+    cmd
+}
+
+async fn execute_cli(
+    argv_template: &'static [&'static str],
+    wait: WaitMode,
+    params: &Value,
+) -> Result<String, String> {
+    if argv_template.is_empty() {
+        // Defensive, not load-bearing: every real registry entry has a
+        // non-empty template — see this module's own const definitions.
+        return Err("empty argv_template".to_string());
+    }
+    let argv = render_argv(argv_template, params)?;
+    let program = argv[0].clone();
+
+    let mut cmd = prepare_cli_command(&argv);
+
     match wait {
         WaitMode::ForExit => {
             cmd.stdout(std::process::Stdio::piped());
@@ -601,7 +607,9 @@ async fn execute_cli(
             // the call, which is exactly why that branch must not set it.
             cmd.kill_on_drop(true);
 
-            let output = tokio::time::timeout(EXEC_TIMEOUT, cmd.output())
+            let output = tokio::time::timeout(EXEC_TIMEOUT,
+                duduclaw_core::execution_gate::output(&mut cmd,
+                    duduclaw_core::execution_gate::ExecutionClass::EmployeeTool))
                 .await
                 .map_err(|_| format!("timed out after {EXEC_TIMEOUT:?}"))?
                 .map_err(|e| format!("spawn failed for '{program}': {e}"))?;
@@ -627,8 +635,8 @@ async fn execute_cli(
             cmd.stderr(std::process::Stdio::piped());
             cmd.kill_on_drop(false);
 
-            let mut child = cmd
-                .spawn()
+            let mut child = duduclaw_core::execution_gate::spawn(&mut cmd,
+                duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).await
                 .map_err(|e| format!("spawn failed for '{program}': {e}"))?;
             let pid = child.id();
             // Spawned BEFORE the grace sleep, not after: the child is
@@ -702,7 +710,7 @@ async fn execute_cli(
 /// and wedge it — while RETAINING only the first
 /// [`DETACH_STDERR_CAPTURE_BYTES`]. Reading and retaining are deliberately
 /// separate operations here: the cap bounds memory, never the reading.
-async fn drain_stderr_bounded(mut pipe: tokio::process::ChildStderr) -> Vec<u8> {
+async fn drain_stderr_bounded(mut pipe: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
     use tokio::io::AsyncReadExt;
 
     let mut kept: Vec<u8> = Vec::new();
@@ -751,7 +759,7 @@ async fn collect_detach_stderr(drain: Option<tokio::task::JoinHandle<Vec<u8>>>) 
     }
 }
 
-fn reap_detached(mut child: tokio::process::Child, program: &str) {
+fn reap_detached(mut child: duduclaw_core::execution_gate::Child, program: &str) {
     let program = program.to_string();
     tokio::spawn(async move {
         match child.wait().await {
@@ -817,6 +825,25 @@ async fn execute_dbus(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_backend_equivalence_codrive() {
+        let argv = render_argv(&["fixture-browser", "--new-window", "{url}"],
+            &serde_json::json!({"url": "https://example.test/繁體中文?q=$HOME;next"})).unwrap();
+        let command = prepare_cli_command(&argv);
+        let before = duduclaw_core::execution_gate::command_snapshot(&command);
+        let mut expected = tokio::process::Command::new("fixture-browser");
+        expected.args(["--new-window", "https://example.test/繁體中文?q=$HOME;next"]);
+        duduclaw_core::apply_agent_cli_env_allowlist(&mut expected);
+        for key in ["XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DISPLAY"] {
+            if let Ok(value) = std::env::var(key) {
+                if !value.is_empty() { expected.env(key, value); }
+            }
+        }
+        assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected));
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
+    }
+
 
     fn req(action: &str, params: Value) -> ApiActionRequest {
         ApiActionRequest {

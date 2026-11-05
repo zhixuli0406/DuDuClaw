@@ -3,7 +3,8 @@
 use std::io::{BufReader, Read, Write};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
+use duduclaw_core::execution_blocking::Child;
 use std::sync::{Arc, Condvar, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -62,6 +63,7 @@ impl From<Command> for Launch {
 /// Removing the daemon-owned container is mandatory even when the attached
 /// Docker client exits successfully. Cleanup itself is bounded and reaped.
 struct ContainerCleanup {
+    launch_context: duduclaw_core::execution_gate::CapturedLaunch,
     client: DockerClient,
     name: String,
     stopped: Mutex<Option<Result<(), PolicyDegraded>>>,
@@ -73,7 +75,7 @@ impl ContainerCleanup {
         if let Some(result) = &*stopped { return result.clone(); }
         let mut command = self.client.command();
         command.args(["rm", "-f", &self.name]);
-        let result = control_output(command, Duration::from_secs(5)).map(|_| ())
+        let result = self.launch_context.sync_scope(|| control_output(command, Duration::from_secs(5))).map(|_| ())
             .or_else(|reason| {
                 // --rm may already have removed a normally exited container.
                 if reason.to_string().contains("No such container") { Ok(()) }
@@ -116,12 +118,6 @@ struct Session {
     reaped: bool,
     cleanup: Option<Arc<ContainerCleanup>>,
     budget: Option<super::budget::SharedBudget>,
-}
-fn kill_group(pid: u32) {
-    #[cfg(unix)]
-    { let _ = duduclaw_core::platform::kill_process_group(pid); }
-    #[cfg(windows)]
-    { let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output(); }
 }
 impl Session {
     #[cfg(test)]
@@ -171,11 +167,11 @@ impl Session {
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(unix)]
         { use std::os::unix::process::CommandExt; command.process_group(0); }
-        let mut child = command.spawn().map_err(|reason| {
+        let mut child = duduclaw_core::execution_blocking::spawn(&mut command, duduclaw_core::execution_gate::ExecutionClass::Discovery).map_err(|reason| {
             if let Some(cleanup) = &cleanup { let _ = cleanup.stop(); }
             io_rejected(reason)
         })?;
-        let pid = child.id();
+        let control = child.control();
         let finished = Arc::new((Mutex::new(false), Condvar::new()));
         let timed_out = Arc::new(AtomicBool::new(false));
         let signal = finished.clone();
@@ -193,7 +189,7 @@ impl Session {
             }
             if !*completed {
                 expired.store(true, Ordering::SeqCst);
-                kill_group(pid);
+                let _ = control.start_kill();
                 if let Some(cleanup) = deadline_cleanup { let _ = cleanup.stop(); }
             }
         });
@@ -213,13 +209,13 @@ impl Session {
     fn complete<T>(&mut self, result: Result<T, PolicyDegraded>) -> Result<T, PolicyDegraded> {
         self.child.stdin.take();
         if result.is_err() {
-            kill_group(self.child.id()); let _ = self.child.kill();
+            let _ = self.child.control().start_kill(); let _ = self.child.kill();
             if let Some(cleanup) = &self.cleanup { let _ = cleanup.stop(); }
         }
         let status = self.child.wait().map_err(io_rejected)?;
         self.reaped = true;
         // Kill descendants before joining pipe readers, including on success.
-        kill_group(self.child.id());
+        let _ = self.child.control().start_kill();
         *self.finished.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.finished.1.notify_all();
         if let Some(cleanup) = &self.cleanup { cleanup.stop()?; }
@@ -303,7 +299,7 @@ impl Drop for Session {
         *self.finished.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.finished.1.notify_all();
         if !self.reaped {
-            kill_group(self.child.id());
+            let _ = self.child.control().start_kill();
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
@@ -451,7 +447,7 @@ impl PythonPolicyRuntime {
         args: impl IntoIterator<Item = &'a str>) -> Result<Launch, PolicyDegraded> {
         if let Some(backend) = &self.container {
             let name = format!("dudu-policy-{}", uuid::Uuid::new_v4());
-            let cleanup = Arc::new(ContainerCleanup { client: backend.client.clone(), name: name.clone(), stopped: Mutex::new(None), scope: self.scope.clone() });
+            let cleanup = Arc::new(ContainerCleanup { launch_context: duduclaw_core::execution_gate::CapturedLaunch::capture(), client: backend.client.clone(), name: name.clone(), stopped: Mutex::new(None), scope: self.scope.clone() });
             let mut create = backend.client.command();
             create.args(["create", "-i", "--pull", "never", "--name", &name,
                 "--network", "none", "--read-only", "--user", "nobody",
@@ -682,8 +678,8 @@ impl PythonPolicy {
         }
         PolicyError::Failed(reason.to_string())
     }
-    fn exchange<T>(&self, serve: impl FnOnce(&mut BufReader<std::process::ChildStdout>,
-        &mut std::process::ChildStdin) -> Result<T, super::protocol::ServeError>) -> Result<T, PolicyError> {
+    fn exchange<T>(&self, serve: impl FnOnce(&mut BufReader<duduclaw_core::execution_blocking::Reader>,
+        &mut duduclaw_core::execution_blocking::Writer) -> Result<T, super::protocol::ServeError>) -> Result<T, PolicyError> {
         let result = (|| {
             let stage = self.runtime.stage_source(&self.source, self.timeout.saturating_sub(self.started.elapsed()))?;
             let stage_path = stage.path().canonicalize().map_err(io_rejected)?;

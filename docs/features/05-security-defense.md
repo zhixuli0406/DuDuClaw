@@ -2,7 +2,7 @@
 
 ## Planned native Linux isolation contracts
 
-The unreleased `duduclaw-isolation` crate defines shared contracts for per-employee execution, MCP capabilities, egress, isolated parsing, signed updates and migration confirmation. This phase adds types, bounded message formats and lifecycle checks only. The gateway does not use them yet; no new isolation guarantee is active, and existing installations behave as before. Native Linux enforcement, signature verification, migration and three-distribution acceptance remain separate delivery requirements.
+Employee runtimes and subprocess helpers now share an execution backend. Ordinary installations retain their native command arguments, environment and working directory. Protected native Linux refuses execution unless the isolated service and trusted policy/capability context are available; a failure never falls back to the gateway identity. The process inventory guard checks every classified spawn path. Capability and worker integration, migration, remote compilation and native acceptance are still required; this change alone is not a deployable protected-mode upgrade.
 
 
 Enterprise [team-history API](68-manager-team-history.md) (v1.76.0): live reporting-line checks are independent of ordinary agent access; external transcripts require read-time masking and every disclosure requires a durable chained audit. A disabled setting, uncertain origin, installed-model failure or audit failure cannot return transcript content. Regex-only operation explicitly reports `ner: false` and can leave names/addresses visible. Direct host/database access remains outside this product boundary.

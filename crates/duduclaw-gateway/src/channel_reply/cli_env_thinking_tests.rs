@@ -6,6 +6,10 @@ use super::*;
 use crate::thinking::policy::{SinkLevel, ThinkingPolicy};
 use std::sync::{Arc, Mutex};
 
+tokio::task_local! {
+    pub(super) static COMMAND_CAPTURE: Arc<Mutex<Option<tokio::process::Command>>>;
+}
+
 const CHILD_HOME: &str = "DUDU_TEST_THINKING_CLI_HOME";
 const SECRET: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -78,6 +82,15 @@ fn child(home: std::path::PathBuf) {
         .build()
         .unwrap();
     rt.block_on(async {
+        let captured = Arc::new(Mutex::new(None));
+        assert_eq!(COMMAND_CAPTURE.scope(captured.clone(), spawn(&home)).await.unwrap_err(),
+            "channel command captured before backend execution");
+        let command = captured.lock().unwrap().take().unwrap();
+        let before = duduclaw_core::execution_gate::command_snapshot(&command);
+        assert!(before.argv.iter().any(|arg| arg == "hi"));
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before,
+            "channel argv, env removals and cwd survive LocalBackend registration unchanged");
+
         // 1. No sink (cron / dispatch / any non-reply spawn): argv has no
         //    partial-messages flag, the answer is the plain text.
         assert_eq!(spawn(&home).await.unwrap(), "兩份報表一致。");

@@ -53,11 +53,10 @@ impl AppleContainerRuntime {
         if args == ["--version"] {
             duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
         }
-        let output = cmd.args(args)
+        cmd.args(args)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await
+            .stderr(std::process::Stdio::piped());
+        let output = duduclaw_core::execution_gate::output(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).await
             .map_err(|e| DuDuClawError::Container(format!("Apple container command failed: {e}")))?;
 
         if !output.status.success() {

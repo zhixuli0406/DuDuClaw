@@ -652,6 +652,12 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             continue;
         }
         let dispatch_fut = cancellable_dispatch(downstream.as_ref(), dispatch_fut);
+        let class = if msg.sender == crate::responsibility::HEARTBEAT_SENDER {
+            duduclaw_core::execution_gate::ExecutionClass::Heartbeat
+        } else {
+            duduclaw_core::execution_gate::ExecutionClass::Dispatch
+        };
+        let dispatch_fut = crate::process_group::with_class(class, dispatch_fut);
         let result = match (native_collector.clone().zip(goal_attr), msg.reply_channel.clone()) {
             (Some((collector, attr)), Some(rc)) if !rc.is_empty() => {
                 crate::runtime::NATIVE_TOOL_COLLECTOR

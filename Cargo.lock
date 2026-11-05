@@ -1921,6 +1921,8 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "cron",
+ "duduclaw-execution",
+ "duduclaw-isolation",
  "fs2",
  "getrandom 0.3.4",
  "hmac",
@@ -1928,6 +1930,7 @@ dependencies = [
  "libc",
  "minisign-verify",
  "percent-encoding",
+ "portable-pty",
  "semver",
  "serde",
  "serde_json",
@@ -1981,6 +1984,21 @@ dependencies = [
  "rdev",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "duduclaw-execution"
+version = "1.79.3"
+dependencies = [
+ "duduclaw-isolation",
+ "libc",
+ "nix 0.29.0",
+ "portable-pty",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

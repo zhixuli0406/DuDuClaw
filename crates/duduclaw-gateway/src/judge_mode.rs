@@ -1060,6 +1060,25 @@ impl ExternalAcceptanceJudge {
             .unwrap_or("")
     }
 
+    fn prepare_command(&self) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.config.command[0]);
+        duduclaw_core::ns_guard::guard_command(&mut cmd);
+        cmd.args(&self.config.command[1..]);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        // Own process group / tree so a timeout can kill everything the judge
+        // spawned, not just its leader; `kill_on_drop` is the backstop for a
+        // cancelled review future.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
+        cmd.kill_on_drop(true);
+
+        cmd
+    }
+
     /// Full-context adjudication. The trait method delegates here with an
     /// empty `tool_activity`; `review_goal_tasks` calls this directly because
     /// it is the one place that holds the unwrapped audit digest.
@@ -1089,27 +1108,13 @@ impl ExternalAcceptanceJudge {
         // Deliberately left untouched — flagged in the WP-8B report as a
         // same-family follow-up that needs its own decision + doc update,
         // not a silent fix.
-        let mut cmd = tokio::process::Command::new(&self.config.command[0]);
-        duduclaw_core::ns_guard::guard_command(&mut cmd);
-        cmd.args(&self.config.command[1..]);
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        // Own process group / tree so a timeout can kill everything the judge
-        // spawned, not just its leader; `kill_on_drop` is the backstop for a
-        // cancelled review future.
-        #[cfg(unix)]
-        cmd.process_group(0);
-        #[cfg(windows)]
-        cmd.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
-        cmd.kill_on_drop(true);
+        let mut cmd = self.prepare_command();
 
         let admission = duduclaw_core::autonomy_handoff::admit().await?;
-        let mut child = cmd
-            .spawn()
+        let mut child = duduclaw_core::execution_gate::spawn(&mut cmd,
+            duduclaw_core::execution_gate::ExecutionClass::Judge).await
             .map_err(|e| format!("spawn external judge `{}` failed: {e}", self.program()))?;
         admission.handed_off();
-        let pid = child.id();
 
         // Feed stdin, drain both pipes and wait — all concurrently under ONE
         // deadline, so a child that fills a pipe before reading stdin cannot
@@ -1144,7 +1149,7 @@ impl ExternalAcceptanceJudge {
                     res.map_err(|e| format!("external judge `{}` io error: {e}", self.program()))?
                 }
                 Err(_) => {
-                    kill_judge_tree(&mut child, pid).await;
+                    kill_judge_tree(&mut child).await;
                     return Err(format!(
                         "external judge `{}` timed out after {}s",
                         self.program(),
@@ -1206,26 +1211,10 @@ where
 /// Kill a timed-out judge together with everything it spawned, then reap it.
 /// Best-effort: failures are logged, never returned (the caller is already
 /// on the degrade-to-MAV path).
-async fn kill_judge_tree(child: &mut tokio::process::Child, pid: Option<u32>) {
-    if let Some(pid) = pid {
-        // Unix: the pid is the pgid (`process_group(0)`). Windows: `taskkill
-        // /T` is a blocking subprocess, so keep it off the async worker.
-        match tokio::task::spawn_blocking(move || {
-            duduclaw_core::platform::kill_process_group(pid)
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::debug!(pid, "external judge group kill: {e}"),
-            Err(e) => tracing::debug!(pid, "external judge group kill task: {e}"),
-        }
-    }
-    let _ = child.start_kill();
-    if tokio::time::timeout(Duration::from_secs(5), child.wait())
-        .await
-        .is_err()
-    {
-        tracing::warn!(?pid, "external judge did not exit within 5s of SIGKILL");
+async fn kill_judge_tree(child: &mut duduclaw_core::execution_gate::Child) {
+    // The backend owns the process tree/cgroup; a remote run has no gateway PID.
+    if tokio::time::timeout(Duration::from_secs(5), child.kill()).await.is_err() {
+        tracing::warn!("external judge did not exit within 5s of cancellation");
     }
 }
 
@@ -1274,6 +1263,21 @@ pub fn log_judge_seam_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_backend_equivalence_external_judge() {
+        let judge = ExternalAcceptanceJudge::new(ExternalJudgeConfig {
+            command: vec!["judge-fixture".into(), "--schema".into(), "繁體中文 $HOME;\nnext".into()],
+            timeout_secs: 30, home_dir: None,
+        });
+        let command = judge.prepare_command();
+        let before = duduclaw_core::execution_gate::command_snapshot(&command);
+        let mut expected = tokio::process::Command::new("judge-fixture");
+        expected.args(["--schema", "繁體中文 $HOME;\nnext"]);
+        assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected));
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
+    }
+
 
     // ── mode parsing ────────────────────────────────────────────────────
 

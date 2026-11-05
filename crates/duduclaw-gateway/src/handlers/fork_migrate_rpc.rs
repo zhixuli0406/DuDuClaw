@@ -379,7 +379,7 @@ impl MethodHandler {
         } else {
             std::time::Duration::from_secs(60)
         };
-        let output = match tokio::time::timeout(dur, cmd.output()).await {
+        let output = match tokio::time::timeout(dur, duduclaw_core::execution_gate::output(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::ImportWorker)).await {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => {
                 return WsFrame::error_response("", &format!("spawn migrate from failed: {e}"));

@@ -127,7 +127,8 @@ impl std::fmt::Display for GenericCliError {
                 write!(f, "{runtime} CLI hard timeout after {secs}s")
             }
             Self::Spawn { runtime, error } => {
-                write!(f, "spawn error: failed to start {runtime} CLI: {error}")
+                if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error) { f.write_str(error) }
+                else { write!(f, "spawn error: failed to start {runtime} CLI: {error}") }
             }
             Self::Unparseable {
                 runtime,
@@ -491,64 +492,11 @@ impl GenericCliRuntime {
         self.spec
     }
 
-    /// Run one turn. Split out from the trait method so the error type stays
-    /// typed all the way to the boundary.
-    async fn run(
-        &self,
-        prompt: &str,
-        context: &RuntimeContext,
-    ) -> Result<RuntimeResponse, GenericCliError> {
+    /// Keep legacy argv/environment/cwd construction separate from execution.
+    fn prepare_command(&self, args: &[String], context: &RuntimeContext) -> tokio::process::Command {
         let id = self.spec.id;
-        if crate::runtime_dispatch::in_utility_call() {
-            return Err(GenericCliError::Spawn {
-                runtime: id,
-                error: "utility calls refused: no verified tool-free mode".into(),
-            });
-        }
-        if duduclaw_core::egress_guard::effective_mode(&context.home_dir, context.agent_dir.as_deref())
-            >= duduclaw_core::egress_guard::Mode::Ask
-        {
-            duduclaw_security::audit::append_tool_call_with_extras(
-                &context.home_dir, &context.agent_id, id,
-                "外送防護尚未涵蓋此通用 CLI；請使用已支援的 runtime 或任務沙箱。", true,
-                &[("egress_guard", serde_json::json!("would_refuse_unsupported_runtime"))],
-            );
-        }
-        let payload = build_prompt(context, prompt, id);
-        let args = build_args(self.spec, &payload, &context.model);
-
-        // Capability honesty (see the module doc): this runtime has no per-CLI
-        // tool-confinement flag to translate into, so a declared restriction
-        // is reported, never silently dropped.
-        if let Some(caps) = context.capabilities.as_ref()
-            && caps.has_tool_restrictions()
-        {
-            warn!(
-                runtime = id,
-                agent = %context.agent_id,
-                level = ?duduclaw_core::types::sandbox_level_for(context.capabilities.as_ref()),
-                "agent declares tool restrictions but the {id} CLI exposes no \
-                 confinement flag this runtime can translate — only the opt-in \
-                 native OS sandbox ([capabilities] native_sandbox) enforces them here"
-            );
-        }
-
-        // P1/WP-3: the generic print-mode CLIs (qwen / kimi / copilot / kiro /
-        // vibe / opencode) were never probed for an effort flag, so there is no
-        // verified flag to emit. Log and ignore — guessing a flag name would
-        // turn a working spawn into an "unexpected argument" failure, which is
-        // exactly the codex `--ask-for-approval` bug this round had to fix.
-        if let Some(effort) = context.effort {
-            tracing::debug!(
-                runtime = id,
-                agent = %context.agent_id,
-                effort = %effort,
-                "no verified reasoning-effort flag for this CLI — effort ignored for this spawn"
-            );
-        }
-
         let mut cmd = tokio::process::Command::new(&self.program);
-        cmd.args(&args);
+        cmd.args(args);
         // This token belongs to the Claude host session and must not reach another vendor's CLI.
         cmd.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
 
@@ -627,6 +575,67 @@ impl GenericCliRuntime {
             }
         }
 
+        cmd
+    }
+
+    /// Run one turn. Split out from the trait method so the error type stays
+    /// typed all the way to the boundary.
+    async fn run(
+        &self,
+        prompt: &str,
+        context: &RuntimeContext,
+    ) -> Result<RuntimeResponse, GenericCliError> {
+        let id = self.spec.id;
+        if crate::runtime_dispatch::in_utility_call() {
+            return Err(GenericCliError::Spawn {
+                runtime: id,
+                error: "utility calls refused: no verified tool-free mode".into(),
+            });
+        }
+        if duduclaw_core::egress_guard::effective_mode(&context.home_dir, context.agent_dir.as_deref())
+            >= duduclaw_core::egress_guard::Mode::Ask
+        {
+            duduclaw_security::audit::append_tool_call_with_extras(
+                &context.home_dir, &context.agent_id, id,
+                "外送防護尚未涵蓋此通用 CLI；請使用已支援的 runtime 或任務沙箱。", true,
+                &[("egress_guard", serde_json::json!("would_refuse_unsupported_runtime"))],
+            );
+        }
+        let payload = build_prompt(context, prompt, id);
+        let args = build_args(self.spec, &payload, &context.model);
+
+        // Capability honesty (see the module doc): this runtime has no per-CLI
+        // tool-confinement flag to translate into, so a declared restriction
+        // is reported, never silently dropped.
+        if let Some(caps) = context.capabilities.as_ref()
+            && caps.has_tool_restrictions()
+        {
+            warn!(
+                runtime = id,
+                agent = %context.agent_id,
+                level = ?duduclaw_core::types::sandbox_level_for(context.capabilities.as_ref()),
+                "agent declares tool restrictions but the {id} CLI exposes no \
+                 confinement flag this runtime can translate — only the opt-in \
+                 native OS sandbox ([capabilities] native_sandbox) enforces them here"
+            );
+        }
+
+        // P1/WP-3: the generic print-mode CLIs (qwen / kimi / copilot / kiro /
+        // vibe / opencode) were never probed for an effort flag, so there is no
+        // verified flag to emit. Log and ignore — guessing a flag name would
+        // turn a working spawn into an "unexpected argument" failure, which is
+        // exactly the codex `--ask-for-approval` bug this round had to fix.
+        if let Some(effort) = context.effort {
+            tracing::debug!(
+                runtime = id,
+                agent = %context.agent_id,
+                effort = %effort,
+                "no verified reasoning-effort flag for this CLI — effort ignored for this spawn"
+            );
+        }
+
+        let mut cmd = self.prepare_command(&args, context);
+
         let stdin_prompt = self.spec.headless.prompt_via_stdin();
         cmd.stdin(if stdin_prompt {
             Stdio::piped()
@@ -660,14 +669,16 @@ impl GenericCliRuntime {
 
         duduclaw_core::ns_guard::guard_command(&mut cmd);
         let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
-        let output = crate::process_group::output_for_model(
+        let output = duduclaw_core::execution_gate::with_runtime(
+            duduclaw_core::execution_gate::RuntimeKind::Registered(duduclaw_core::execution_gate::Text::new(id.to_string()).map_err(|_| GenericCliError::Spawn { runtime: id, error: "Invalid registered runtime id".into() })?),
+            crate::process_group::output_for_model(
             &mut cmd, stdin_prompt.then_some(payload.as_bytes()), Duration::from_secs(timeout_secs),
-        ).await.map_err(|e| match e {
+        )).await.map_err(|e| match e {
             crate::process_group::OutputError::Timeout => GenericCliError::Timeout {
                 runtime: id, secs: timeout_secs,
             },
             crate::process_group::OutputError::Io(e) => GenericCliError::Spawn {
-                runtime: id, error: e.to_string(),
+                runtime: id, error: crate::process_group::backend_error(e, ""),
             },
         })?;
 
@@ -1065,6 +1076,47 @@ mod tests {
         assert_eq!(resp.content, "the plain answer");
         assert_eq!(resp.runtime_name, "copilot");
         assert!(resp.input_tokens > 0, "tokens are estimated, not zero");
+    }
+
+    #[tokio::test]
+    async fn local_backend_equivalence_generic_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        for id in ["copilot", "qwen", "kimi", "opencode", "vibe"] {
+            let spec = spec_for(id).unwrap();
+            let runtime = GenericCliRuntime::with_program(spec, "fixture vendor");
+            let context = ctx(home.path());
+            let args = build_args(spec, "繁體中文 $HOME;\nnext", &context.model);
+            let command = runtime.prepare_command(&args, &context);
+            let before = duduclaw_core::execution_gate::command_snapshot(&command);
+            let prompt = "繁體中文 $HOME;\nnext";
+            let (legacy_args, key): (Vec<&str>, &str) = match id {
+                "copilot" => (vec!["-p", prompt, "-s", "--no-ask-user", "--allow-all-tools", "--model=test-model"], "COPILOT_GITHUB_TOKEN"),
+                "qwen" => (vec!["-p", prompt, "--yolo", "--output-format", "json", "--model", "test-model"], "DASHSCOPE_API_KEY"),
+                "kimi" => (vec!["-p", prompt, "--output-format", "stream-json", "-m", "test-model"], "KIMI_MODEL_API_KEY"),
+                "opencode" => (vec!["run", prompt, "--auto", "--format", "json", "--model", "test-model"], "OPENCODE_API_KEY"),
+                "vibe" => (vec!["-p", prompt, "--yolo", "--trust", "--output", "json"], "MISTRAL_API_KEY"),
+                _ => unreachable!(),
+            };
+            let mut expected = tokio::process::Command::new("fixture vendor");
+            let user_home = crate::runtime::grok::resolve_user_home(home.path(), std::env::var("HOME").ok().as_deref());
+            expected.args(legacy_args).current_dir(home.path())
+                .env_remove("CLAUDE_CODE_MESSAGING_TOKEN")
+                .env("HOME", &user_home).env("USERPROFILE", &user_home)
+                .env("NO_COLOR", "1").env("TERM", "dumb");
+            if id == "vibe" {
+                expected.env("VIBE_ACTIVE_MODEL", "test-model").env("VIBE_ENABLE_TELEMETRY", "false");
+            }
+            if let Ok(value) = std::env::var(key) {
+                if !value.is_empty() { expected.env(key, value); }
+            }
+            expected.envs(duduclaw_core::agent_identity_env_vars_default("tester"))
+                .envs(duduclaw_core::mcp_forward_env_vars())
+                .env_remove(duduclaw_core::ENV_UPSTREAM_UNKNOWN)
+                .env_remove(duduclaw_core::ENV_ON_BEHALF_OF)
+                .env_remove(crate::on_behalf_of::context::ENV_CONTEXT);
+            assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected), "{id}");
+            assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
+        }
     }
 
     /// P2-B N4: the turn and run in scope reach the CLI's env, which its

@@ -524,8 +524,7 @@ async fn run_live(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let child = cmd
-        .spawn()
+    let child = duduclaw_core::execution_gate::spawn(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::Judge).await
         .map_err(|e| format!("failed to spawn {claude}: {e}"))?;
 
     let timeout = std::time::Duration::from_secs(case.case.timeout_secs);

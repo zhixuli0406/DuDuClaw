@@ -253,7 +253,7 @@ pub(crate) async fn poll_once(
             let mut command = tokio::process::Command::new(program);
             duduclaw_core::ns_guard::guard_command(&mut command);
             command.args(args).kill_on_drop(true);
-            let output = tokio::time::timeout(timeout, command.output())
+            let output = tokio::time::timeout(timeout, duduclaw_core::execution_gate::output(&mut command, duduclaw_core::execution_gate::ExecutionClass::Scheduled))
                 .await
                 .map_err(|_| format!("command timed out after {}s", timeout.as_secs()))?
                 .map_err(|e| format!("spawn failed: {e}"))?;

@@ -195,6 +195,18 @@ impl Drop for GroupKillGuard {
 pub fn spawn_guarded(cmd: &mut tokio::process::Command)
     -> std::io::Result<(tokio::process::Child, GroupKillGuard)>
 {
+    spawn_guarded_class(cmd, crate::execution_gate::ExecutionClass::EmployeeMain)
+}
+
+/// Explicit exception classes are supplied only by trusted routing. Employee
+/// callers using native Child handles fail closed until their backend is wired.
+pub fn spawn_guarded_class(cmd: &mut tokio::process::Command, class: crate::execution_gate::ExecutionClass)
+    -> std::io::Result<(tokio::process::Child, GroupKillGuard)>
+{
+    crate::execution_gate::check_local(class)?;
+    if class == crate::execution_gate::ExecutionClass::InteractiveLogin {
+        crate::execution_gate::scrub_login_environment(cmd.as_std_mut());
+    }
     isolate(cmd);
     cmd.kill_on_drop(true);
     #[cfg(windows)]
@@ -247,6 +259,11 @@ impl ManagedChild {
         Ok(Self { child: Some(child), guard })
     }
 
+    pub fn spawn_class(cmd: &mut tokio::process::Command, class: crate::execution_gate::ExecutionClass) -> std::io::Result<Self> {
+        let (child, guard) = spawn_guarded_class(cmd, class)?;
+        Ok(Self { child: Some(child), guard })
+    }
+
     pub fn child(&mut self) -> &mut tokio::process::Child {
         self.child.as_mut().expect("managed leader is present")
     }
@@ -282,6 +299,46 @@ impl Drop for ManagedChild {
                 handle.spawn(async move { let _ = child.wait().await; });
             }
         }
+    }
+}
+
+
+/// Backend-owned child, including remote run cancellation. No PID participates
+/// in authorization; the local PID is retained only for cleanup observation.
+pub struct BackendChild {
+    child: crate::execution_gate::Child,
+    report: Option<CleanupReport>,
+    pid: Option<u32>,
+}
+impl BackendChild {
+    pub async fn spawn(cmd: &mut tokio::process::Command) -> std::io::Result<Self> {
+        Self::spawn_class(cmd, crate::execution_gate::ExecutionClass::EmployeeMain).await
+    }
+    pub async fn spawn_class(cmd: &mut tokio::process::Command, class: crate::execution_gate::ExecutionClass) -> std::io::Result<Self> {
+        let child = crate::execution_gate::spawn(cmd, class).await?;
+        let pid = child.id();
+        Ok(Self { child, report: CleanupReport::capture(), pid })
+    }
+    pub fn child(&mut self) -> &mut crate::execution_gate::Child { &mut self.child }
+    pub fn leader_exited(&mut self) { let _ = self.child.start_kill(); }
+    fn finish_report(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid.take() { confirm_group(pid, self.report.take()); }
+        // Remote cleanup is not proven by a successful cancel request. D's
+        // lifecycle/admission integration owns that stronger observation.
+        drop(self.report.take());
+    }
+    pub fn disarm(&mut self) { self.finish_report(); }
+    pub async fn kill_and_reap(&mut self) {
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+        self.finish_report();
+    }
+}
+impl Drop for BackendChild {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+        self.finish_report();
     }
 }
 
@@ -322,6 +379,35 @@ mod downstream_cleanup_tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.expect("fixture starts its grandchild")
+    }
+
+    #[tokio::test]
+    async fn backend_child_drop_reports_only_after_real_process_group_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (observer, receiver) = observer();
+        let (group, descendant) = with_cleanup_observer(observer, async {
+            let mut child = BackendChild::spawn(&mut tree(dir.path())).await.unwrap();
+            let group = child.child().id().unwrap();
+            let descendant = grandchild(dir.path()).await;
+            drop(child);
+            (group, descendant)
+        }).await;
+        assert!(tokio::time::timeout(Duration::from_secs(15), receiver).await.unwrap().unwrap());
+        assert!(group_is_gone(group).unwrap());
+        assert!(!crate::platform::process_alive(descendant));
+    }
+
+    #[tokio::test]
+    async fn backend_child_normal_exit_confirms_after_wait() {
+        let (observer, receiver) = observer();
+        with_cleanup_observer(observer, async {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", "exit 0"]);
+            let mut child = BackendChild::spawn(&mut command).await.unwrap();
+            assert!(child.child().wait().await.unwrap().success());
+            child.disarm();
+        }).await;
+        assert!(tokio::time::timeout(Duration::from_secs(15), receiver).await.unwrap().unwrap());
     }
 
     #[tokio::test]

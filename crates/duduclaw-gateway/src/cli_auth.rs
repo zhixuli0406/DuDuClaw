@@ -601,6 +601,9 @@ impl AuthSession {
         for (k, val) in &env {
             cmd.env(k, val);
         }
+        for key in duduclaw_core::execution_gate::LOGIN_ENV_BLOCKLIST {
+            cmd.env_remove(key);
+        }
         // Surface the auth URL in-band instead of trying to launch a browser the
         // user can't see (esp. headless / remote). `BROWSER=echo` is honoured by
         // most CLIs' "open in browser" helpers.

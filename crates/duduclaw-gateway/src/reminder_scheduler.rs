@@ -858,14 +858,14 @@ async fn deliver_reminder(
     reminder: &Reminder,
 ) -> Result<(), String> {
     deliver_reminder_with(home_dir, http, registry, sem, reminder, |agent_id, prompt| async move {
+        crate::process_group::with_class(duduclaw_core::execution_gate::ExecutionClass::Reminder,
         call_claude_for_agent_with_type(
             home_dir,
             registry,
             &agent_id,
             &prompt,
             crate::cost_telemetry::RequestType::Cron,
-        )
-        .await
+        )).await
     })
     .await
 }

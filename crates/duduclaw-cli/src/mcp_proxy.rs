@@ -963,32 +963,13 @@ pub async fn run_mcp_proxy_scoped(
         Arc::new(ThirdPartyGate::new(home_dir, &default_agent, server, "proxy"))
     });
 
-    let mut cmd = duduclaw_core::platform::async_command_for(command);
-    cmd.args(args);
-    cmd.env_clear();
-    cmd.envs(env_pairs);
-    if upstream_is_bridge {
-        // This is this executable's exact remote-bridge subcommand, not an
-        // external server. It needs host identity to sign its ledger calls.
-        for key in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE",
-            duduclaw_core::ENV_AGENT_ID, duduclaw_core::ENV_AGENT_TOKEN,
-            duduclaw_core::ENV_MCP_API_KEY, duduclaw_core::ENV_TRUST_TURN_ID,
-            duduclaw_core::egress_guard::ENV_TURN_ALIAS,
-            duduclaw_core::ENV_TASK_ID, duduclaw_core::ENV_ON_BEHALF_OF]
-        {
-            cmd.env_remove(key);
-            if let Some(value) = std::env::var_os(key) { cmd.env(key, value); }
-        }
-    }
+    let mut cmd = upstream_command(command, args, env_pairs, upstream_is_bridge);
 
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    // stderr is inherited so the upstream's diagnostics still reach the
-    // Claude CLI's MCP log exactly as before.
-    cmd.stderr(std::process::Stdio::inherit());
-    cmd.kill_on_drop(true);
-
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = duduclaw_core::execution_gate::with_runtime(
+        duduclaw_core::execution_gate::RuntimeKind::Registered(
+            duduclaw_core::execution_gate::Text::new("third-party-mcp".into()).expect("constant runtime id")),
+        duduclaw_core::execution_gate::spawn(&mut cmd,
+        duduclaw_core::execution_gate::ExecutionClass::ThirdPartyMcp)).await.map_err(|e| {
         DuDuClawError::Gateway(format!(
             "mcp-proxy: failed to spawn upstream '{command}': {e}"
         ))
@@ -1017,6 +998,37 @@ pub async fn run_mcp_proxy_scoped(
         DuDuClawError::Gateway(format!("mcp-proxy: waiting for upstream failed: {e}"))
     })?;
     Ok(status.code().unwrap_or(1))
+}
+
+fn upstream_command(command: &str, args: &[String], env_pairs: Vec<(String, String)>, upstream_is_bridge: bool)
+    -> tokio::process::Command
+{
+    let mut cmd = duduclaw_core::platform::async_command_for(command);
+    cmd.args(args);
+    cmd.env_clear();
+    cmd.envs(env_pairs);
+    if upstream_is_bridge {
+        // This is this executable's exact remote-bridge subcommand, not an
+        // external server. It needs host identity to sign its ledger calls.
+        for key in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE",
+            duduclaw_core::ENV_AGENT_ID, duduclaw_core::ENV_AGENT_TOKEN,
+            duduclaw_core::ENV_MCP_API_KEY, duduclaw_core::ENV_TRUST_TURN_ID,
+            duduclaw_core::egress_guard::ENV_TURN_ALIAS,
+            duduclaw_core::ENV_TASK_ID, duduclaw_core::ENV_ON_BEHALF_OF]
+        {
+            cmd.env_remove(key);
+            if let Some(value) = std::env::var_os(key) { cmd.env(key, value); }
+        }
+    }
+
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    // stderr is inherited so the upstream's diagnostics still reach the
+    // Claude CLI's MCP log exactly as before.
+    cmd.stderr(std::process::Stdio::inherit());
+    cmd.kill_on_drop(true);
+
+    cmd
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1831,5 +1843,21 @@ mod tests {
         let (seen, replies) = drive("fakepg", None, vec![call.clone()], Some(canned)).await;
         assert_eq!(seen, vec![call]);
         assert!(replies[0].contains("王小明"), "{}", replies[0]);
+    }
+}
+
+#[cfg(test)]
+mod execution_backend_equivalence_tests {
+    use super::*;
+    #[tokio::test]
+    async fn third_party_mcp_backend_command_matches_legacy_argv_env_cwd() {
+        let args = vec!["--fixture".into(), "繁體中文 $HOME;\nnext".into(), "".into()];
+        let env = vec![("MCP_ENV".into(), "literal value".into())];
+        let command = upstream_command("fixture-mcp", &args, env.clone(), false);
+        let mut legacy = duduclaw_core::platform::async_command_for("fixture-mcp");
+        legacy.args(&args).env_clear().envs(env).stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).kill_on_drop(true);
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(),
+            duduclaw_core::execution_gate::command_snapshot(&legacy));
     }
 }

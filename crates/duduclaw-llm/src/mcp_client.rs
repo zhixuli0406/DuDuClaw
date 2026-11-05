@@ -49,8 +49,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout, Command};
-use duduclaw_core::process_tree::ManagedChild;
+use tokio::process::Command;
+use duduclaw_core::execution_gate::{ChildStdin, ChildStdout};
+use duduclaw_core::process_tree::BackendChild as ManagedChild;
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -384,6 +385,64 @@ fn concat_content_blocks(blocks: &[Value]) -> String {
 // Client — stdio child process OR remote Streamable HTTP
 // ---------------------------------------------------------------------------
 
+/// Build the original stdio command before handing ownership to the backend.
+fn stdio_command(
+    command: &str, args: &[String], envs: &[(String, String)],
+    stderr: std::process::Stdio, clear_env: bool,
+) -> Result<Command, McpError> {
+    let mut cmd = Command::new(command);
+    duduclaw_core::ns_guard::guard_command(&mut cmd);
+    if clear_env {
+        cmd.env_clear();
+    }
+    let workflow_home = if envs
+        .iter()
+        .any(|(key, _)| key == "DUDUCLAW_WORKFLOW_SESSION_ID")
+    {
+        let home = envs
+            .iter()
+            .find(|(key, _)| key == "DUDUCLAW_HOME")
+            .map(|(_, value)| value)
+            .ok_or_else(|| McpError::Spawn("workflow child requires explicit home".into()))?;
+        if !std::path::Path::new(home).is_absolute() {
+            return Err(McpError::Spawn("workflow home must be absolute".into()));
+        }
+        cmd.env_clear();
+        for key in ["PATH", "TMPDIR", "SystemRoot"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        // Windows: `std::env::temp_dir` reads `TMP` / `TEMP`, the profile
+        // comes from `USERPROFILE`, and process start-up needs `SystemRoot`
+        // / `windir` / `ComSpec`; with only the three keys above the child
+        // `duduclaw mcp-server` exited before the MCP handshake on the CI
+        // Windows runner (13 `workflow_stdio` cases, `McpError::Closed`).
+        // Same system-only allow-list the agent CLI spawn uses; no
+        // secret-shaped names (pinned by spawn_env's shape test).
+        #[cfg(windows)]
+        for key in duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST_WINDOWS {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        Some(home)
+    } else {
+        None
+    };
+    cmd.args(args)
+        .envs(envs.iter().map(|(k, v)| (k.clone(), v.clone())))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(stderr)
+        .kill_on_drop(true);
+    if let Some(home) = workflow_home {
+        cmd.env("HOME", home);
+    }
+
+    Ok(cmd)
+}
+
 /// The wire the client speaks over.
 enum McpTransport {
     /// Line-delimited JSON-RPC over a spawned child's stdin/stdout.
@@ -502,57 +561,14 @@ impl McpClient {
         stderr: std::process::Stdio,
         clear_env: bool,
     ) -> Result<Self, McpError> {
-        let mut cmd = Command::new(command);
-        duduclaw_core::ns_guard::guard_command(&mut cmd);
-        if clear_env {
-            cmd.env_clear();
-        }
-        let workflow_home = if envs
-            .iter()
-            .any(|(key, _)| key == "DUDUCLAW_WORKFLOW_SESSION_ID")
-        {
-            let home = envs
-                .iter()
-                .find(|(key, _)| key == "DUDUCLAW_HOME")
-                .map(|(_, value)| value)
-                .ok_or_else(|| McpError::Spawn("workflow child requires explicit home".into()))?;
-            if !std::path::Path::new(home).is_absolute() {
-                return Err(McpError::Spawn("workflow home must be absolute".into()));
-            }
-            cmd.env_clear();
-            for key in ["PATH", "TMPDIR", "SystemRoot"] {
-                if let Some(value) = std::env::var_os(key) {
-                    cmd.env(key, value);
-                }
-            }
-            // Windows: `std::env::temp_dir` reads `TMP` / `TEMP`, the profile
-            // comes from `USERPROFILE`, and process start-up needs `SystemRoot`
-            // / `windir` / `ComSpec`; with only the three keys above the child
-            // `duduclaw mcp-server` exited before the MCP handshake on the CI
-            // Windows runner (13 `workflow_stdio` cases, `McpError::Closed`).
-            // Same system-only allow-list the agent CLI spawn uses; no
-            // secret-shaped names (pinned by spawn_env's shape test).
-            #[cfg(windows)]
-            for key in duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST_WINDOWS {
-                if let Some(value) = std::env::var_os(key) {
-                    cmd.env(key, value);
-                }
-            }
-            Some(home)
-        } else {
-            None
-        };
-        cmd.args(args)
-            .envs(envs.iter().map(|(k, v)| (k.clone(), v.clone())))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(stderr)
-            .kill_on_drop(true);
-        if let Some(home) = workflow_home {
-            cmd.env("HOME", home);
-        }
+        let mut cmd = stdio_command(command, args, envs, stderr, clear_env)?;
 
-        let mut child = ManagedChild::spawn(&mut cmd).map_err(|e| McpError::Spawn(e.to_string()))?;
+        let mut child = duduclaw_core::execution_gate::with_runtime(
+            duduclaw_core::execution_gate::RuntimeKind::Registered(
+                duduclaw_core::execution_gate::Text::new("tool-loop-mcp".into()).expect("constant runtime id")),
+            ManagedChild::spawn_class(&mut cmd,
+            duduclaw_core::execution_gate::ExecutionClass::ToolLoopMcp)).await
+            .map_err(|e| McpError::Spawn(e.to_string()))?;
         let stdin = child.child()
             .stdin
             .take()
@@ -2875,5 +2891,42 @@ mod process_tree_cancellation_tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.expect("cancel must kill the MCP server's grandchild");
+    }
+}
+
+#[cfg(test)]
+mod execution_backend_equivalence_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tool_loop_mcp_backend_command_matches_legacy_argv_env_cwd() {
+        let args = vec!["mcp-server".into(), "繁體中文 $HOME;\nnext".into(), "".into()];
+        let env = vec![("MCP_FIXTURE".into(), "literal value".into())];
+        for clear in [false, true] {
+            let command = stdio_command("fixture-mcp", &args, &env, std::process::Stdio::null(), clear).unwrap();
+            let mut legacy = Command::new("fixture-mcp");
+            duduclaw_core::ns_guard::guard_command(&mut legacy);
+            if clear { legacy.env_clear(); }
+            legacy.args(&args).envs(env.iter().cloned()).stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+            assert_eq!(command.as_std().get_program(), legacy.as_std().get_program());
+            assert_eq!(command.as_std().get_args().collect::<Vec<_>>(), legacy.as_std().get_args().collect::<Vec<_>>());
+            assert_eq!(command.as_std().get_envs().collect::<Vec<_>>(), legacy.as_std().get_envs().collect::<Vec<_>>());
+            assert_eq!(command.as_std().get_current_dir(), legacy.as_std().get_current_dir());
+        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(),
+            duduclaw_core::execution_gate::command_snapshot(&legacy));
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_loop_mcp_backend_workflow_home_remains_explicit() {
+        let missing = vec![("DUDUCLAW_WORKFLOW_SESSION_ID".into(), "fixture".into())];
+        assert!(stdio_command("fixture", &[], &missing, std::process::Stdio::null(), false).is_err());
+        let home = if cfg!(windows) { "C:\\fixture" } else { "/fixture" };
+        let env = vec![("DUDUCLAW_WORKFLOW_SESSION_ID".into(), "fixture".into()),
+            ("DUDUCLAW_HOME".into(), home.into()), ("HOME".into(), "/ambient-must-not-win".into())];
+        let command = stdio_command("fixture", &[], &env, std::process::Stdio::null(), false).unwrap();
+        assert_eq!(command.as_std().get_envs().find(|(key, _)| *key == "HOME").unwrap().1,
+            Some(std::ffi::OsStr::new(home)));
     }
 }

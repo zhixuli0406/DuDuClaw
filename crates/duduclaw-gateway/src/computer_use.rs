@@ -266,10 +266,9 @@ pub async fn detect_sensitive_regions(
     // screenshot loop. On timeout we return `Err`, which makes
     // `capture_masked_screenshot` mask the whole screenshot (fail closed);
     // `kill_on_drop` kills the `docker exec` client when the future is dropped.
-    let exec = tokio::process::Command::new("docker")
-        .args(["exec", container_name, "duduclaw-eval-dom", &js])
-        .kill_on_drop(true)
-        .output();
+    let mut command = tokio::process::Command::new("docker");
+    command.args(["exec", container_name, "duduclaw-eval-dom", &js]).kill_on_drop(true);
+    let exec = duduclaw_core::execution_gate::output(&mut command, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool);
     let output = match tokio::time::timeout(DOM_DETECT_TIMEOUT, exec).await {
         Ok(result) => result
             .map_err(|e| RegionDetectFailure::Failed(format!("container exec failed: {e}")))?,

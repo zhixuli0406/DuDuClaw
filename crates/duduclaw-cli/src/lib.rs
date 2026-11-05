@@ -4156,13 +4156,16 @@ pub async fn entry_point() {
         // Must run before logging, banners or any other stdout initialization.
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt;
             if let Err(error) = duduclaw_core::ns_guard::install_current_process_forced() {
                 eprintln!("Error: namespace guard installation failed; refusing execution: {error}");
                 std::process::exit(1);
             }
-            let error = std::process::Command::new(&command[0]).args(&command[1..]).exec();
-            eprintln!("Error: namespace guard exec failed for {:?}: {error}", command[0]);
+            let mut cmd = tokio::process::Command::new(&command[0]);
+            cmd.args(&command[1..]);
+            match duduclaw_core::execution_gate::status(&mut cmd, duduclaw_core::execution_gate::ExecutionClass::EmployeeTool).await {
+                Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                Err(error) => eprintln!("Error: namespace guard execution failed: {error}"),
+            }
         }
         #[cfg(not(unix))]
         {

@@ -207,20 +207,6 @@ fn last_line(bytes: &[u8]) -> Option<&str> {
         .find(|l| !l.trim().is_empty())
 }
 
-#[cfg(unix)]
-fn kill_group(pid: Option<u32>) {
-    #[allow(unsafe_code)]
-    if let Some(pid) = pid {
-        // SAFETY: plain kill(2) on the child's own process group.
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_group(_pid: Option<u32>) {}
-
 /// Map a non-zero, non-2 exit to a closed-set error.
 fn classify(status: std::process::ExitStatus, stderr: &[u8]) -> ExtractError {
     let text = String::from_utf8_lossy(stderr);
@@ -277,14 +263,14 @@ pub async fn run(
         ));
     }
     duduclaw_core::ns_guard::guard_command_std(&mut std_cmd);
-    let mut child = tokio::process::Command::from(std_cmd)
-        .kill_on_drop(true)
-        .spawn()
+    let mut command = tokio::process::Command::from(std_cmd);
+    command.kill_on_drop(true);
+    let mut child = duduclaw_core::execution_gate::with_memory_limit(limits.memory_mb.saturating_mul(1024 * 1024),
+        duduclaw_core::execution_gate::spawn(&mut command, duduclaw_core::execution_gate::ExecutionClass::ParseWorker)).await
         .map_err(|e| {
             tracing::error!(error = %e, "knowledge-extract spawn failed");
             crashed()
         })?;
-    let pid = child.id();
     let stdout_cap = limits.max_chars.saturating_mul(4).saturating_add(64 * 1024);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -304,11 +290,11 @@ pub async fn run(
     let status = match waited {
         Ok(Ok(status)) => status,
         Ok(Err(_)) => {
-            kill_group(pid);
+            let _ = child.start_kill();
             return Err(crashed());
         }
         Err(_) => {
-            kill_group(pid);
+            let _ = child.start_kill();
             let _ = child.kill().await;
             return Err(timeout(limits.timeout.as_secs()));
         }
