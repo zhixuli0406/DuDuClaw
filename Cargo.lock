@@ -1836,6 +1836,7 @@ dependencies = [
  "duduclaw-gateway",
  "duduclaw-identity",
  "duduclaw-inference",
+ "duduclaw-isolation",
  "duduclaw-knowledge",
  "duduclaw-license",
  "duduclaw-llm",
@@ -1846,6 +1847,7 @@ dependencies = [
  "duduclaw-redaction",
  "duduclaw-security",
  "duduclaw-tui",
+ "duduclaw-updated",
  "encoding_rs",
  "flate2",
  "futures-util",
@@ -2054,6 +2056,7 @@ dependencies = [
  "duduclaw-fork",
  "duduclaw-identity",
  "duduclaw-inference",
+ "duduclaw-isolation",
  "duduclaw-knowledge",
  "duduclaw-license",
  "duduclaw-llm",
@@ -2067,6 +2070,7 @@ dependencies = [
  "duduclaw-sandbox",
  "duduclaw-security",
  "duduclaw-sysd",
+ "duduclaw-updated",
  "ed25519-dalek",
  "flate2",
  "fs2",
@@ -2576,6 +2580,23 @@ dependencies = [
  "vt100",
  "vte",
  "zeroize",
+]
+
+[[package]]
+name = "duduclaw-updated"
+version = "1.79.3"
+dependencies = [
+ "base64 0.22.1",
+ "duduclaw-isolation",
+ "ed25519-dalek",
+ "hex",
+ "libc",
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

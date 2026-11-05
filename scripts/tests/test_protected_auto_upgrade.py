@@ -18,31 +18,16 @@ class AutoUpgradeTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
-        self.floor = self.work / "version-floor"
-        self.floor.write_text("1.79.3")
-        self.pending = self.work / "version-pending"
-        self.response = self.work / "api.json"
         self.calls = self.work / "calls"
         self.uid = self.work / "uid"
         self.uid.write_text("0")
-        self.network_failure = self.work / "network-failure"
         self.stub("id", f"cat {shlex.quote(str(self.uid))}\n")
-        self.stub("curl", f"[ ! -e {shlex.quote(str(self.network_failure))} ] || exit 22\n"
-                  f"cat {shlex.quote(str(self.response))}\n")
-        binary = self.stub("duduclaw", f"printf '%s\\n' \"$@\" > {shlex.quote(str(self.calls))}\n")
+        self.updater = self.stub("updated", f"printf '%s\\n' \"$@\" > {shlex.quote(str(self.calls))}\n")
         text = (SOURCE / "duduclaw-auto-upgrade").read_text()
-        # Rewrite fixed constants in a private copy, never production env overrides.
-        text = text.replace("PATH=/usr/sbin:/usr/bin:/sbin:/bin",
-                            f"PATH={shlex.quote(str(self.work))}:/usr/bin:/bin")
-        for old, new in (("/var/lib/duduclaw-protected/version-floor", self.floor),
-                         ("/var/lib/duduclaw-protected/version-pending", self.pending),
-                         ("/opt/duduclaw/bin/duduclaw", binary)):
-            text = text.replace(old, str(new))
-        text = text.replace("/tmp/duduclaw-auto-upgrade.XXXXXXXXXX",
-                            str(self.work / "api-temp.XXXXXXXXXX"))
+        text = text.replace("PATH=/usr/sbin:/usr/bin:/sbin:/bin", f"PATH={shlex.quote(str(self.work))}:/usr/bin:/bin")
+        text = text.replace("/usr/libexec/duduclaw-updated-launch", str(self.updater))
         self.script = self.work / "helper"
         self.script.write_text(text)
-        self.releases("v1.80.0")
 
     def stub(self, name, body):
         path = self.work / name
@@ -50,141 +35,30 @@ class AutoUpgradeTests(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def releases(self, *tags, pretty=False):
-        self.response.write_text(json.dumps([
-            {"url": f"https://api.github.com/repos/zhixuli0406/DuDuClaw/releases/{i}",
-             "tag_name": tag, "name": f"Release {tag}", "draft": False,
-             "prerelease": False,
-             "body": 'Notes: "quoted" text; fake "tag_name":"v99.0.0"; \\ paths'}
-            for i, tag in enumerate(tags)
-        ], indent=2 if pretty else None, separators=None if pretty else (",", ":")))
-
-    def test_primary_fixture_is_minified_without_final_newline(self):
-        raw = self.response.read_bytes()
-        self.assertNotIn(b"\n", raw)
-        self.assertTrue(raw.startswith(b'[{"url":'))
-        self.assertTrue(raw.endswith(b"}]"))
-        self.assertIn(b'\\"tag_name\\":\\"v99.0.0\\"', raw)
-
-    def test_pretty_printed_response(self):
-        self.releases("v1.80.0", pretty=True)
-        result = self.run_helper("--dry-run")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--version 1.80.0", result.stdout)
-
-    def test_whitespace_around_array_and_split_field(self):
-        self.response.write_text(' \n\t[ {"tag_name"\n: \n"v1.80.0"} ] \n\t')
-        result = self.run_helper("--dry-run")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--version 1.80.0", result.stdout)
-
     def run_helper(self, *args):
-        return subprocess.run(["sh", str(self.script), *args], text=True,
-                              capture_output=True)
+        return subprocess.run(["sh", str(self.script), *args], text=True, capture_output=True)
 
-    def assert_refused(self):
-        result = self.run_helper()
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(self.calls.exists())
+    def test_requests_daemon_candidate_discovery(self):
+        self.assertEqual(self.run_helper().returncode, 0)
+        self.assertEqual(self.calls.read_text().splitlines(), ["--check-latest"])
 
-    def test_newer_passes_explicit_version(self):
-        self.releases("v1.80.0", "v1.100.0", "v1.9.0")
-        result = self.run_helper()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.calls.read_text().splitlines(),
-                         ["service", "upgrade", "--protected-linux", "--version", "1.100.0"])
-
-    def test_dry_run(self):
-        result = self.run_helper("--dry-run")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("would upgrade", result.stdout)
-        self.assertIn("--version 1.80.0", result.stdout)
-        self.assertFalse(self.calls.exists())
-
-    def test_equal_or_older(self):
-        for tag in ("v1.79.3", "v1.79.2"):
-            with self.subTest(tag=tag):
-                self.releases(tag)
-                result = self.run_helper()
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("already up to date", result.stdout)
-                self.assertFalse(self.calls.exists())
-
-    def test_ignores_desktop_and_malformed_tags(self):
-        self.releases("desktop-v99.0.0", "v2.0", "v2.0.0-rc.1", "2.0.0",
-                      "v2.0.0;id", "v2.0.0extra", "v2.0.0.1", "v1.80.0")
-        result = self.run_helper("--dry-run")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--version 1.80.0", result.stdout)
-
-    def test_missing_floor(self):
-        self.floor.unlink()
-        self.assert_refused()
-
-    def test_invalid_floor(self):
-        for value in ("", "v1.79.3", "1.79.3\n", "1.79.3\n2.0.0", "1.79.3 ", "bad", "1.79.3\x00"):
-            with self.subTest(value=value):
-                self.floor.write_text(value)
-                self.assert_refused()
-
-    def test_pending_requires_manual_attention(self):
-        self.pending.touch()
-        result = self.run_helper()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("manual attention", result.stderr)
-        self.assertFalse(self.calls.exists())
-
-    def test_non_root(self):
-        self.uid.write_text("1000")
-        self.assert_refused()
-
-    def test_network_failure_even_with_partial_response(self):
-        self.network_failure.touch()
-        self.assert_refused()
-
-    def test_empty_or_unparseable_response(self):
-        for value in ("[]", "not JSON", '{"message": "rate limited"}'):
-            self.response.write_text(value)
-            self.assert_refused()
-
-    def test_truncated_response_with_valid_tag(self):
-        for value in ('[{"tag_name":"v1.80.0"}', '[\n{\n"tag_name": "v1.80.0",\n'):
-            with self.subTest(value=value):
-                self.response.write_text(value)
-                self.assert_refused()
-
-    def test_non_array_response_with_valid_tag(self):
-        self.response.write_text(json.dumps({"tag_name": "v1.80.0"}, indent=2))
-        self.assert_refused()
-
-    def test_body_mentions_do_not_supply_tags(self):
-        for pretty in (False, True):
-            with self.subTest(pretty=pretty):
-                self.releases("desktop-v9.0.0", pretty=pretty)
-                self.assert_refused()
-
-    def test_documented_prerelease_flag_policy(self):
-        self.releases("v1.80.0")
-        releases = json.loads(self.response.read_text())
-        releases[0]["prerelease"] = True
-        self.response.write_text(json.dumps(releases, separators=(",", ":")))
+    def test_dry_run_remains_read_only(self):
         self.assertEqual(self.run_helper("--dry-run").returncode, 0)
+        self.assertEqual(self.calls.read_text().splitlines(), ["--check-latest", "--dry-run"])
 
-    def test_response_size_cap_and_cleanup(self):
-        # The curl stub deliberately ignores Content-Length/max-filesize.
-        self.response.write_bytes(b" " * 8388609)
-        result = self.run_helper()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("exceeds 8 MiB", result.stderr)
-        self.assertEqual(list(self.work.glob("api-temp.*")), [])
+    def test_non_root_and_authority_arguments_refused(self):
+        for args in [("--version", "1.80.0"), ("--url", "https://evil.example"), ("--dry-run", "extra")]:
+            self.assertNotEqual(self.run_helper(*args).returncode, 0)
+            self.assertFalse(self.calls.exists())
+        self.uid.write_text("1000")
+        self.assertNotEqual(self.run_helper().returncode, 0)
         self.assertFalse(self.calls.exists())
 
-    def test_upgrade_failure_propagates(self):
-        self.stub("duduclaw", "exit 42\n")
+    def test_updater_failure_propagates_without_legacy_fallback(self):
+        self.stub("updated", "exit 42\n")
         self.assertEqual(self.run_helper().returncode, 42)
-
-    def test_invalid_arguments(self):
-        self.assertNotEqual(self.run_helper("--version", "2.0.0").returncode, 0)
+        self.updater.unlink()
+        self.assertNotEqual(self.run_helper().returncode, 0)
 
 
 class InstallerTrustTests(unittest.TestCase):

@@ -194,7 +194,7 @@ pub enum InstallMethod {
     /// deployment honestly reports "no update channel" rather than offering an
     /// install button that is guaranteed to be refused.
     Pro,
-    /// Root-owned native service; upgrades require the operator installer.
+    /// Root-owned native service; upgrades go through the isolated update service.
     Manual,
     Standalone,
     Source,
@@ -209,8 +209,9 @@ pub enum InstallMethod {
 ///   (the Pro build follows the OSS release train, so "a newer version exists"
 ///   is true information), but nothing in this process can install one.
 /// - `"github"` — the public CE release channel.
+/// - `"protected"` — the root update service verifies and installs a generation.
 pub fn update_channel_label(provider_present: bool) -> &'static str {
-    if is_native_protected_install() { return "none"; }
+    if is_native_protected_install() { return "protected"; }
     if provider_present {
         return "control_plane";
     }
@@ -245,7 +246,7 @@ fn native_protected_install(containerized: bool, mode: Option<&str>, exe: &std::
 }
 
 pub const NATIVE_PROTECTED_UPDATE_HINT: &str =
-    "此服務由 root 管理。請執行 sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux";
+    "此服務由獨立更新服務管理，請從儀表板的系統更新頁操作；無法更新時請管理員檢查更新服務。";
 
 /// Result of applying an update.
 #[derive(Debug, Clone, Serialize)]

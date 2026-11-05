@@ -267,7 +267,7 @@ impl MethodHandler {
                         // "installed, restart to apply".
                         "restart_pending_version": restart_pending_version,
                         // Which channel can actually install this update:
-                        // "control_plane" | "github" | "none". The update page
+                        // "control_plane" | "github" | "protected" | "none". The update page
                         // hides its install button on "none" instead of offering
                         // a click that is guaranteed to be refused.
                         "update_channel": update_channel,
@@ -284,9 +284,9 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_system_apply_update(&self, _params: Value) -> WsFrame {
+    pub(crate) async fn handle_system_apply_update(&self, params: Value) -> WsFrame {
         if crate::updater::is_native_protected_install() {
-            return WsFrame::error_response("", crate::updater::NATIVE_PROTECTED_UPDATE_HINT);
+            return self.handle_protected_update_apply(params).await;
         }
         // An extension-supplied provider installs through its own channel and
         // its own pinned key. Without one this is byte-for-byte the previous

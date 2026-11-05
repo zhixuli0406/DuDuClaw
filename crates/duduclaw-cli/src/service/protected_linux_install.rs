@@ -335,55 +335,27 @@ pub(super) fn uninstall() -> Result<()> {
     Ok(())
 }
 
-// Upgrades must start from the installed trust anchor, never from a download.
-fn installed_executable() -> Result<()> {
-    let executable = fs::read_link("/proc/self/exe")?;
-    if executable != Path::new(BINARY) {
-        return Err(refused("upgrade must run as sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux"));
-    }
-    parents(Path::new(BINARY))?;
-    trusted(Path::new(BINARY), false)?;
-    let running = fs::metadata("/proc/self/exe")?;
-    let installed = fs::metadata(BINARY)?;
-    if running.dev() != installed.dev() || running.ino() != installed.ino() {
-        return Err(refused("installed executable changed; invoke the installed binary again"));
-    }
-    Ok(())
-}
-
+// The privileged update service owns verification, installation and restart.
+// This command only submits a stable version; it never supplies paths or URLs.
 pub(super) async fn upgrade(version: Option<&str>) -> Result<()> {
-    gate()?;
-    installed_executable()?;
-    let _lock = version_lock()?;
-    if let Some(version) = version { check_floor(version, true)?; }
-    // Pin a root-only staging directory in the trusted installation hierarchy.
-    let staging = tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).prefix(".upgrade-").tempdir_in("/opt/duduclaw")?;
-    fs::set_permissions(staging.path(), fs::Permissions::from_mode(0o700))?;
-    trusted(staging.path(), true)?;
-    let extracted = staging.path().join("duduclaw");
-    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&extracted)?;
-    let (version, _, _) = duduclaw_gateway::updater::download_protected_release(version, &mut file)
-        .await.map_err(refused)?;
-    check_floor(&version, true)?;
-    drop(file);
-    installed_executable()?;
-    let active = command("systemctl", &["is-active", "--quiet", UNIT])?;
-    let was_active = match active.status.code() {
-        Some(0) => true,
-        Some(3 | 4) => false,
-        _ => return Err(refused("cannot determine system service state")),
-    };
-    // Only bytes are installed. Never run the downloaded executable as root,
-    // even for a version probe or to obtain its embedded launcher/unit.
-    prepare_version(&version)?;
-    atomic_install(BINARY, 0o755, |target| {
-        std::io::copy(&mut fs::File::open(&extracted)?, target)?;
-        Ok(())
-    })?;
-    record_floor(&version)?;
-    if was_active { checked("systemctl", &["restart", UNIT])?; }
-    println!("已驗證並安裝官方版本 {version}。現有資料與根金鑰保留。");
-    Ok(())
+    use duduclaw_isolation::ids::RequestId;
+    use duduclaw_isolation::update::{UpdateRequest, UpdateRequestV1, UpdateResponse, UpdateResponseV1};
+    let version = duduclaw_updated::parse_version(version.ok_or_else(||
+        refused("請指定 --version x.y.z，或從儀表板檢查並安裝更新。"))?)
+        .map_err(|_| refused("版本必須是正式版 x.y.z。"))?;
+    let request_id = RequestId(*uuid::Uuid::new_v4().as_bytes());
+    let response = tokio::task::spawn_blocking(move ||
+        duduclaw_updated::client::request(UpdateRequest::V1(UpdateRequestV1::Apply { version, request_id })))
+        .await.map_err(|_| refused("更新服務無法連線，未執行舊版升級流程。"))?
+        .map_err(|_| refused("更新服務無法連線，未執行舊版升級流程。"))?;
+    match response {
+        UpdateResponse::V1(UpdateResponseV1::Accepted { request_id: received }) if received == request_id => {
+            println!("已送出更新要求 {}，尚未確認安裝完成。請在儀表板查看結果。", uuid::Uuid::from_bytes(request_id.0));
+            Ok(())
+        }
+        UpdateResponse::V1(UpdateResponseV1::Error { .. }) => Err(refused("更新服務拒絕要求，未變更安裝。")),
+        _ => Err(refused("更新服務回應不符，未確認更新結果。")),
+    }
 }
 
 #[cfg(test)]

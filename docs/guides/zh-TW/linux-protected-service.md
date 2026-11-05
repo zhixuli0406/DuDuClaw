@@ -1,5 +1,7 @@
 # 原生 Linux 的個人連線受保護服務
 
+> 下方安裝與使用者資料搬移章節描述既有 v1.79.3 服務；開發中的更新流程另行實作且尚未完成。變更既有安裝前，請先讀[升級與解除安裝](#升級與解除安裝)。
+
 官方 Linux CLI 執行檔需要 **glibc ≥ 2.31**：Ubuntu 20.04+、Debian 11+、RHEL／Rocky Linux 9+。較舊系統請使用 Docker。此基準適用於 CLI／gateway（含桌面版的 CLI sidecar）；桌面圖形介面另需符合 WebKitGTK 等系統函式庫需求。
 
 這個模式讓原生 Linux 的「我的連線」可使用個人 Google 與遠端 MCP OAuth。Gateway 以專用的 `duduclaw` 帳號執行，啟動時接收 root 準備的金鑰。一般使用者服務不會收到這把金鑰。另見[個人 Google 連線](google-personal-connections.md)。
@@ -65,56 +67,45 @@ sudo /opt/duduclaw/bin/duduclaw service install --protected-linux \
 
 ## 升級與解除安裝
 
-使用已安裝、由 root 擁有的執行檔升級：
+**開發分支：受保護更新尚未可供部署。** 儀表板與 CLI 現在改向獨立的 root 更新服務提出要求。必須先由隔離遷移套件建立服務、帳號與信任根；只替換 v1.79.3 的執行檔或 timer 不會完成這些準備。
+
+管理員可從儀表板要求更新至較新的正式版本，並依持久保存的要求識別碼追蹤結果。CLI 必須明確指定版本：
 
 ```sh
-sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux
-# Select a published version instead of latest:
-sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux --version X.Y.Z
+sudo duduclaw service upgrade --protected-linux --version X.Y.Z
 ```
 
-只有 `/proc/self/exe` 精確指向 `/opt/duduclaw/bin/duduclaw`，且程式與所有上層目錄都屬於 root、禁止非 root 寫入時，才能升級。它從官方 GitHub Release 下載 Linux 封存檔（預設最新版），重用 updater 內嵌的 minisign 公鑰驗證完整下載內容，再解壓至 root 擁有、權限為 0700 的暫存目錄。替換使用同目錄暫存檔、fsync 與 rename；升級期間不會以 root 執行新程式。驗證失敗不會變更已安裝程式；系統服務原本有在執行時才會重新啟動。現有資料與根金鑰保留。儀表板在這個模式顯示手動更新，不會替換程式。
+跨越更新服務 socket 的資料只有版本與要求識別碼，呼叫端不能指定路徑、網址、命令或信任金鑰。服務驗證對端身分、簽章清單、檔案雜湊、架構、期限、版本下限與序號。已接受、下載中與已暫存都不代表安裝成功；回應中斷時儀表板保留識別碼繼續追蹤，只有 `committed` 才顯示成功。服務無法連線時，不會退回舊安裝器。
+
+Linux 更新程式已實作整組版本切換、固定服務重啟與實際版本／協定／執行檔讀回，通過才提高版本下限。中斷後會繼續同一筆交易，就緒不確定時保持工作准入關閉。跨套件的排空、遷移／runtime 與就緒端點仍須串接；缺少端點就拒絕更新。遷移 bootstrap 的雙簽章流程、真實 FIDO2 簽章與 Linux 實機更新驗收尚未完成。請勿啟用這份原始碼的無人值守更新。
+
+既有 **v1.79.3 安裝**應保留經驗證、固定版本的 v1.79.3 程式及其操作指引。該歷史版本會下載並驗證 minisign 簽章封存檔，以原子替換更新程式，再重啟原本執行中的服務；儀表板只提供手動更新。其 root 管理的 `version-floor` 與 `version-pending` 分別限制一般降版及保留中斷目標。這些歷史檔案不是新更新服務的狀態或信任存放區。
+
+既有 v1.79.3 的解除安裝指令仍為：
 
 ```sh
 sudo /opt/duduclaw/bin/duduclaw service uninstall --protected-linux
 ```
 
-解除安裝會停止並停用服務，移除服務檔、執行檔與啟動腳本，**不會刪除** `/var/lib/duduclaw` 或 `/var/lib/duduclaw-protected`，包括根金鑰；該目錄只移除版本下限及待完成的版本意圖。重新安裝可沿用保留的資料與金鑰。
+它會停止並停用舊服務，移除其服務檔、執行檔與啟動器，**不會刪除** `/var/lib/duduclaw` 或 `/var/lib/duduclaw-protected`，包括根金鑰；只移除舊的版本下限及待完成意圖。這個指令不能當作新隔離安裝的清理或回退流程。部署前須由遷移套件提供新安裝的遷移與復原指引。
 
-升級只接受比目前執行版本新的穩定 semver `X.Y.Z`。安裝與升級也拒絕低於 `/var/lib/duduclaw-protected/version-floor` 的版本；此檔案由 root:root 擁有、權限為 0600，在執行檔替換成功後原子寫入最高已安裝版本。檔案不存在時以目前版本為下限，內容損壞則拒絕操作。升級沒有回退選項。緊急回退必須由 root 刻意解除安裝（會移除版本下限），再用舊版封存檔執行上方驗簽後首次安裝流程；資料與根金鑰仍保留。 替換中斷時，root-only 的寫入意圖（`version-pending`）也會保留已驗證目標的下限；請以該版本或較新版重做驗簽安裝，或刻意解除安裝後清除。
+## 自動升級（僅供開發）
 
-## 自動升級（選用）
+目前的 `scripts/linux-protected/auto-upgrade/` 保留既有 timer 時間：每天當地時間 03:30，最多隨機延遲 20 分鐘，`Persistent=false` 讓早上開機不補跑。helper 改為呼叫固定、由 root 管理的 `/usr/libexec/duduclaw-updated-launch --check-latest`；加上 `--dry-run` 只查候選版本，不送出 Apply。
 
-`scripts/linux-protected/auto-upgrade/` 在 v1.79.3 之後的原始碼才加入，目前尚無已發布標籤包含它。第一個包含它的版本發布前，請從固定的完整 commit SHA（下方以 `<commit>` 表示，請換成你審閱過的那一筆）取得並審閱，不要使用會移動的 `main`（[原始碼位置](https://github.com/zhixuli0406/DuDuClaw/tree/<commit>/scripts/linux-protected/auto-upgrade)）；Linux 發行封存檔也不含 `scripts/`。它只呼叫既有的 `service upgrade --protected-linux --version`，因此可搭配 v1.79.3 受保護安裝。
+候選版本查詢由低權限的 `duduclaw-dl` 帳號執行 curl，清除繼承設定，將 API 回應限制在 1 MiB 並完整解析 JSON。最新發行紀錄必須符合 `draft=false`、`prerelease=false` 與正式版本格式。未簽章的索引只決定候選版本，安裝仍須通過 root 更新服務對官方簽章清單的驗證。相同或較舊版本不送出更新；連線、帳號、狀態或更新服務出錯便停止，不退回舊流程。要求端 unit 的逾時為六分鐘，不寫入發行檔案。
 
-排程每天當地時間 03:30 執行，最多隨機延遲 20 分鐘，早上開機不補跑。較新的官方版本經既有流程驗簽安裝後，會重啟原本執行中的 gateway，請避開工作時段。未安裝排程則維持手動升級；儀表板在 v1.80.0 前仍顯示手動指令。
+請勿把這份開發中的 helper 複製到 v1.79.3 安裝，也不要啟用其 timer。既有 v1.79.3 夜間排程應保留先前審閱過的固定版本 helper，等完整隔離遷移提供後再轉換。不要從會移動的 `main` 取得正式環境使用的 helper。
 
-審閱四個腳本／unit 檔後，將整個目錄複製到 `/root/duduclaw-auto-upgrade`，確認檔案與所有上層目錄均由 root 管理、非 root 不可寫入，再執行：
+原始碼安裝器仍檢查 root:root 擁有權、一般檔案型別與上層目錄不可被他人寫入，拒絕符號連結與 sticky `/tmp`，並從 root 私有快照安裝。這些檢查不能證明程式碼來源；日後部署前仍須審閱精確 commit 及 root 副本，不要從使用者可寫入的 checkout 執行 root 安裝器。詳見 [helper README](../../../scripts/linux-protected/auto-upgrade/README.md)。
 
-```sh
-# Replace <commit> with the reviewed full commit SHA; obtain files from that SHA.
-# Run from the reviewed checkout; the destination must not already exist.
-sudo cp -r --no-preserve=ownership scripts/linux-protected/auto-upgrade /root/duduclaw-auto-upgrade
-sudo chown -R root:root /root/duduclaw-auto-upgrade
-sudo chmod -R go-w /root/duduclaw-auto-upgrade
-sudo sh /root/duduclaw-auto-upgrade/install.sh
-sudo /usr/local/sbin/duduclaw-auto-upgrade --dry-run
-systemctl list-timers duduclaw-auto-upgrade.timer
-sudo journalctl -u duduclaw-auto-upgrade.service
-```
-不要以 root 執行使用者可寫入目錄中的 `install.sh`。檔案可能在審閱後、複製前被替換，請再核對 root 副本；安裝程式會拒絕來源目錄與四個腳本／unit 檔案的符號連結、非一般檔案、非 root:root 擁有或群組／其他人可寫入的項目，也會檢查解析後目錄至 `/` 的每一層祖先；即使有 sticky bit 的 `/tmp` 也不接受。通過後，先複製至 `/run` 下的 root 專用 0700 暫存目錄，再檢查副本為一般檔案且大小為 1 byte 至 1 MiB，最後從副本安裝並清理暫存。這些權限檢查無法證明程式碼出處；仍須核對固定 commit，改成 root 所有不代表已驗證內容。
-
-需要 GNU coreutils（含 `sort -V`）、curl、grep、sed、tr、systemd 與既有升級流程所需工具。腳本以 root 的 `version-floor` 為已安裝版本；下限遺失、格式錯誤或存在 `version-pending` 時停止，需人工處理。只檢查最近 30 筆 release，選最高的純 `vX.Y.Z`，忽略 `desktop-v*` 與帶後綴的 tag。沒有較新版就正常結束，不下載封存檔；API 失敗或沒有合格 tag 則失敗且不升級。
-
-解析支援單行壓縮與多行 JSON，只檢查外層陣列並擷取版本欄位，未完整驗證 JSON 語法，也不解析 `prerelease`：純 `vX.Y.Z` 即使標為 prerelease 仍納入。未登入 API 不回傳草稿。若 release 先發布、Linux 封存檔尚未上傳完成，當晚升級會失敗，隔晚重試；請查看 journal。
-
-API 回應上限為 8 MiB，保留 60 秒逾時；curl 的 `--max-filesize` 在舊版僅能檢查已知 Content-Length，因此回應先寫入私有 `/tmp` 下 0700 目錄中的暫存檔，解析前再檢查實際大小，退出時清理。systemd 的 `PrivateTmp=yes` 提供私有且可寫入的 `/tmp`；主機寫入只開放 `/opt/duduclaw` 與 `/var/lib/duduclaw-protected`，服務啟動逾時設為 1 小時以容納下載重試與安裝／重啟。純 `vX.Y.Z` 即使 GitHub 標為 prerelease，較新且驗簽通過仍會安裝。封存檔的 minisign 簽章是信任錨點，版本選擇本身沒有簽章。
-
-移除排程、腳本與 unit（不移除 gateway 或其資料）；若升級仍在執行，會先停用 timer 再拒絕移除，請等升級完成後重跑：
+若要移除已安裝的排程而保留 gateway 與資料，使用先前審閱過的安裝器副本：
 
 ```sh
 sudo sh /root/duduclaw-auto-upgrade/install.sh --uninstall
 ```
+
+升級仍在進行時，解除安裝會先停用 timer，但拒絕移除；請等作業結束後重試。
 
 ## 保護範圍與限制
 

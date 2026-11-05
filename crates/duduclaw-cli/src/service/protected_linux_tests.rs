@@ -77,3 +77,13 @@ async fn service_protected_upgrade_operator_gate_precedes_download() {
         assert!(error.to_string().contains("AI 員工不能"));
     }
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn service_protected_upgrade_requires_stable_version_before_ipc() {
+    let _session = crate::ai_session_guard::test_session(&[]);
+    assert!(upgrade(None).await.unwrap_err().to_string().contains("--version"));
+    for version in ["1.80.0-beta", "1.80.0+build", "../update", "https://example.com/update"] {
+        assert!(upgrade(Some(version)).await.unwrap_err().to_string().contains("正式版"));
+    }
+}

@@ -1,5 +1,7 @@
 # Personal connections on a native Linux service
 
+> The installation and user-data migration sections below describe the existing v1.79.3 service. The development update path is separate and incomplete; see [Upgrade and uninstall](#upgrade-and-uninstall) before changing an existing installation.
+
 Official Linux CLI binaries require **glibc ≥ 2.31**: Ubuntu 20.04+, Debian 11+, or RHEL/Rocky Linux 9+. Use Docker on older systems. This baseline applies to the CLI/gateway, including the desktop CLI sidecar; the desktop GUI also requires its own WebKitGTK/system libraries.
 
 Use this mode to enable **My connections** (personal Google and remote MCP OAuth) on a native Linux host. It runs the gateway as a dedicated `duduclaw` account and hands it a root-provisioned key at startup. Ordinary user services do not receive that key. See also [personal Google connections](google-personal-connections.md).
@@ -65,54 +67,45 @@ Re-enable credential protection and ask everyone to reconnect personal Google an
 
 ## Upgrade and uninstall
 
-Run the upgrade through the already-installed root-owned executable:
+**Development branch: protected updates are not ready for deployment.** The dashboard and CLI now send requests to the separate root update service. Provisioning through the isolation migration package is required; replacing only a v1.79.3 binary or timer does not install this service or its trust root.
+
+An Admin can request a newer stable version from the dashboard and follow its durable request id. CLI requests require an explicit version:
 
 ```sh
-sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux
-# Select a published version instead of latest:
-sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux --version X.Y.Z
+sudo duduclaw service upgrade --protected-linux --version X.Y.Z
 ```
 
-The command refuses unless `/proc/self/exe` is exactly `/opt/duduclaw/bin/duduclaw` and the executable and its ancestor chain are root-owned and protected against non-root writes. It downloads the official GitHub Linux release archive (latest by default), verifies its exact bytes with the updater’s embedded minisign public key, and extracts into a root-owned mode-0700 temporary directory. It atomically replaces the installed binary using a temporary file in the same directory, fsync and rename; the new binary is never executed as root during upgrade. Verification failure leaves the installed binary unchanged. It restarts the system unit only if it was active. The existing root key and data remain. The dashboard reports manual updates and refuses binary replacement in this mode.
+Only the version and request id cross the updater socket. The caller cannot select a path, URL, command or trust key. The service authenticates the peer and verifies the signed manifest, artifact hashes, architecture, expiry, version floor and serial. Acceptance, downloading and staging do not mean installation succeeded. An interrupted reply leaves the dashboard tracking the request; only `committed` is displayed as success. An unavailable service does not fall back to the old installer.
+
+The Linux activator now switches a complete generation, restarts fixed services and compares live version/protocol/executable readbacks before advancing the floor. It resumes interrupted transactions and keeps work admission closed when readiness is uncertain. The named cross-package drain, migration/runtime and readiness endpoints still need integration; absent endpoints refuse the update. The migration bootstrap's dual-signature flow, real FIDO2 signatures and native Linux update acceptance are not complete. Do not enable unattended updates from this source yet.
+
+For an existing **v1.79.3 installation**, retain the verified, pinned v1.79.3 executable and its matching operational instructions. That historical executable downloads and verifies the minisign-signed archive, atomically replaces its binary and restarts an active service; its dashboard only supports manual updates. Its root-owned `version-floor` and `version-pending` prevent ordinary downgrades and reserve an interrupted target. Those historical files are not the new updater's state or trust store.
+
+The existing v1.79.3 uninstall command remains:
 
 ```sh
 sudo /opt/duduclaw/bin/duduclaw service uninstall --protected-linux
 ```
 
-Uninstall stops/disables the system unit and removes the unit, executable and launcher. It **does not delete** `/var/lib/duduclaw` or `/var/lib/duduclaw-protected`, including the root key. It removes the version floor and pending version intent from that directory. Reinstallation can reuse the retained data and key.
+It stops/disables the old system unit and removes its unit, executable and launcher. It **does not delete** `/var/lib/duduclaw` or `/var/lib/duduclaw-protected`, including the root key; it removes the old version floor and pending intent. This command is not a cleanup or rollback procedure for the new isolation installation. New-isolation migration and recovery instructions must be supplied by the migration package before deployment.
 
-Upgrade accepts only a stable semver `X.Y.Z` strictly newer than the running version. Installation and upgrade also refuse versions below `/var/lib/duduclaw-protected/version-floor` (root:root, 0600), atomically recording the highest installed version after replacing the binary. A missing floor defaults to the running version; a malformed floor is refused. There is no rollback option. Emergency rollback requires root to deliberately uninstall (which removes the floor), then perform the verified first-install procedure above with the older archive. Data and the root key remain. An interrupted replacement also reserves its verified target in a root-only write intent (`version-pending`); repeat the verified installation procedure with that version or a newer one, or deliberately uninstall to clear it.
+## Automatic upgrades (development only)
 
-## Automatic upgrades (optional)
+The current `scripts/linux-protected/auto-upgrade/` keeps the existing timer schedule: 03:30 local time, up to 20 minutes of random delay, and `Persistent=false` so a missed run is not replayed after a morning boot. Its helper now invokes the fixed root-owned `/usr/libexec/duduclaw-updated-launch --check-latest`; `--dry-run` adds candidate discovery without submitting Apply.
 
-`scripts/linux-protected/auto-upgrade/` is an optional nightly helper added to the source after v1.79.3. It works with a v1.79.3 protected install because it only calls the existing `service upgrade --protected-linux --version` command. It runs at 03:30 local time plus up to 20 minutes of random delay. It installs only newer official signed releases through the existing verified upgrade command, restarting an active gateway. Choose a time without ongoing work. `Persistent=false` avoids catching up after a morning boot during office hours. The dashboard still shows the manual command until v1.80.0. Without this timer, upgrades remain manual.
+Candidate discovery runs curl as the unprivileged `duduclaw-dl` account, clears inherited configuration, caps the API response at 1 MiB and parses complete JSON. The latest-release record must have `draft=false`, `prerelease=false` and a stable version. The unsigned index chooses only a candidate: installation still requires an officially signed manifest accepted by the root service. Equal or older candidates do not submit an update. Network, account, state or service failures stop the request; there is no legacy fallback. The requester unit has a six-minute timeout and does not write release files.
 
-The v1.79.3 source tag does not contain this directory, and no released tag contains it yet. Until a release tag includes it, obtain the directory from a specific full commit SHA (shown as `<commit>` below; use the one you reviewed) and review it; do not fetch from moving `main` ([source location](https://github.com/zhixuli0406/DuDuClaw/tree/<commit>/scripts/linux-protected/auto-upgrade)). Linux release archives do not include `scripts/`. Review the four script/unit files and copy the directory to `/root/duduclaw-auto-upgrade` using the commands below. The installer rejects symlinks, non-regular files, ownership other than root:root, and group/other write permission on the source directory/files and every resolved ancestor through `/`; sticky `/tmp` directories are also rejected. It snapshots all four files into a root-only 0700 directory under `/run`, rechecks regular-file type and size (1 byte through 1 MiB), installs from that copy and cleans it up. Ownership checks do not authenticate code: compare the root copy against the pinned commit before executing it.
+Do not copy this development helper onto a v1.79.3 installation or enable its timer yet. An existing v1.79.3 nightly deployment must retain its previously reviewed pinned helper until the complete isolation migration is available. Never fetch an operational helper from moving `main`.
 
-```sh
-# Replace <commit> with the reviewed full commit SHA; obtain files from that SHA.
-# Run from the reviewed checkout; the destination must not already exist.
-sudo cp -r --no-preserve=ownership scripts/linux-protected/auto-upgrade /root/duduclaw-auto-upgrade
-sudo chown -R root:root /root/duduclaw-auto-upgrade
-sudo chmod -R go-w /root/duduclaw-auto-upgrade
-sudo sh /root/duduclaw-auto-upgrade/install.sh
-sudo /usr/local/sbin/duduclaw-auto-upgrade --dry-run
-systemctl list-timers duduclaw-auto-upgrade.timer
-sudo journalctl -u duduclaw-auto-upgrade.service
-```
-Do not execute `install.sh` as root directly from a user-writable directory. Another process could replace reviewed files before copying, so compare the root-controlled copy too. The installer does not verify source provenance; copying unreviewed code into root ownership does not make it safe. See the directory's README.
+The source installer still checks root:root ownership, ordinary file types and non-writable ancestors, rejects symlinks and sticky `/tmp`, and installs from a private root snapshot. These checks do not authenticate source provenance. Review the exact commit and root-controlled copy before any eventual deployment; do not execute a root installer from a user-writable checkout. See [the helper README](../../scripts/linux-protected/auto-upgrade/README.md).
 
-Dependencies are GNU coreutils (including `sort -V`), curl, grep, sed, tr and systemd, plus the existing upgrade command's host preparation requirements. The helper reads the root `version-floor`; a missing or invalid floor, or any `version-pending`, fails without upgrading and needs manual attention. It selects the highest plain `vX.Y.Z` tag among the latest 30 GitHub releases, ignoring `desktop-v*` and suffixed tags. Equal or older versions exit successfully without downloading the large archive. API failure or no eligible tags prevents upgrades. This is not a complete history scan; investigate manually if those 30 entries contain no gateway release.
-
-Extraction supports minified and pretty-printed JSON, checks the outer array envelope and matches plain version tags; it does not validate the full JSON grammar or parse the `prerelease` flag. Tags with suffixes such as `-rc` are excluded, but a plain `vX.Y.Z` marked prerelease remains eligible. Unauthenticated API requests do not return drafts. If a release is published before its Linux archives finish uploading, that night's upgrade fails and the next night retries; check the journal.
-
-API responses are capped at 8 MiB with a 60-second timeout. On older curl, `--max-filesize` only applies with a known Content-Length, so the response is streamed into a temporary file in a root-only 0700 directory under private `/tmp`, checked for actual size before parsing, and cleaned on exit. `PrivateTmp=yes` supplies writable private `/tmp`; host writes are limited to `/opt/duduclaw` and `/var/lib/duduclaw-protected`. The service has a one-hour start timeout for download retries plus install/restart. A plain `vX.Y.Z` marked prerelease on GitHub will still be installed if newer and signature verification succeeds. The archive minisign signature is the trust anchor; version selection itself is not signed.
-
-Remove the schedule, helper and units, keeping the gateway and its data. If an upgrade is running, uninstall disables the timer but refuses removal; wait for completion and retry:
+To remove an already installed schedule, keeping the gateway and its data, use its reviewed installer copy:
 
 ```sh
 sudo sh /root/duduclaw-auto-upgrade/install.sh --uninstall
 ```
+
+If an upgrade is running, uninstall disables the timer but refuses removal; wait for completion and retry.
 
 ## Protection and limits
 

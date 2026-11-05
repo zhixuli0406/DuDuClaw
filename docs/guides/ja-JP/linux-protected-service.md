@@ -1,5 +1,7 @@
 # ネイティブ Linux サービスで個人アカウントを接続する
 
+> 以下のインストールとユーザーデータ移行は既存 v1.79.3 サービスの手順です。開発中の更新経路は別の未完成実装です。既存環境を変更する前に[更新とアンインストール](#更新とアンインストール)を確認してください。
+
 公式 Linux CLI バイナリには **glibc ≥ 2.31** が必要です。Ubuntu 20.04+、Debian 11+、RHEL/Rocky Linux 9+ をサポートします。古いシステムでは Docker を使用してください。この基準は CLI/gateway（デスクトップ版の CLI sidecar を含む）に適用され、デスクトップ GUI には別途 WebKitGTK などのシステムライブラリが必要です。
 
 このモードでは、ネイティブ Linux の「自分の接続」で個人 Google とリモート MCP OAuth を利用できます。gateway は専用の `duduclaw` アカウントで動作し、起動時に root が用意した鍵を受け取ります。通常のユーザーサービスには鍵を渡しません。[個人 Google 接続](google-personal-connections.md)も参照してください。
@@ -65,54 +67,45 @@ sudo /opt/duduclaw/bin/duduclaw service install --protected-linux \
 
 ## 更新とアンインストール
 
-インストール済みの root 所有の実行ファイルから更新します。
+**開発ブランチ：保護された更新はまだ導入できません。** ダッシュボードと CLI は、独立した root 更新サービスへ要求を送る方式に変わりました。隔離移行パッケージによるサービス、アカウント、信頼ルートの準備が必要です。v1.79.3 の実行ファイルや timer だけを置き換えても準備は完了しません。
+
+Admin はダッシュボードから新しい安定版を要求し、永続化された要求 ID で結果を追跡できます。CLI ではバージョンの明示が必要です。
 
 ```sh
-sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux
-# Select a published version instead of latest:
-sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux --version X.Y.Z
+sudo duduclaw service upgrade --protected-linux --version X.Y.Z
 ```
 
-`/proc/self/exe` が正確に `/opt/duduclaw/bin/duduclaw` を指し、そのファイルと全祖先が root 所有で非 root に書き込みを許さない場合だけ更新できます。公式 GitHub Release の Linux アーカイブ（既定は最新版）を取得し、updater と共通の組み込み minisign 公開鍵でダウンロードしたバイト列を検証してから、root 所有・0700 の一時ディレクトリに展開します。同じ配置先ディレクトリの一時ファイル、fsync、rename で原子的に置き換えます。更新中に新しいプログラムを root として実行することはありません。検証失敗時は既存プログラムを変更せず、ユニットは稼働中だった場合だけ再起動します。既存のデータとルートキーは維持します。このモードではダッシュボードは手動更新を案内し、プログラムの置き換えを拒否します。
+更新サービスの socket に渡すのはバージョンと要求 ID だけです。呼び出し側はパス、URL、コマンド、信頼鍵を指定できません。サービスは相手の身分、署名付きマニフェスト、ファイルのハッシュ、アーキテクチャ、有効期限、バージョン下限と連番を検証します。受理、ダウンロード、ステージングはインストール成功を意味しません。応答が途切れてもダッシュボードは ID を保持して追跡し、`committed` だけを成功として表示します。サービスに接続できない場合、旧インストーラには戻りません。
+
+Linux アダプタは世代を切り替え、固定サービスを再起動し、実際のバージョン・プロトコル・実行ファイルを照合した後に下限を更新します。中断された処理を再開し、準備完了を確認できない場合は作業受付を閉じたままにします。パッケージ間の排出・移行／runtime・準備完了エンドポイントの接続は必要で、不足すれば更新を拒否します。移行 bootstrap の二重署名手順、実物の FIDO2 署名、Linux 実機の更新受け入れ試験も未完了です。このソースの無人更新を有効にしないでください。
+
+既存の **v1.79.3 インストール**は、検証済みの固定した v1.79.3 実行ファイルと対応する運用手順を維持してください。その旧版は minisign 署名付きアーカイブを検証し、実行ファイルを原子的に置き換え、稼働中のサービスを再起動します。ダッシュボードは手動更新のみです。root 管理の `version-floor` と `version-pending` は通常のダウングレードを防ぎ、中断した対象を記録します。これらは新しい更新サービスの状態・信頼ストアではありません。
+
+既存の v1.79.3 のアンインストールコマンドは次のとおりです。
 
 ```sh
 sudo /opt/duduclaw/bin/duduclaw service uninstall --protected-linux
 ```
 
-サービスを停止・無効化し、ユニット、実行ファイル、ランチャーを削除します。`/var/lib/duduclaw` と `/var/lib/duduclaw-protected`、その中のルートキーは**削除しません**。そのディレクトリからはバージョン下限と未完了の書き込み意図だけを削除します。データとキーは再インストール時に再利用できます。
+旧システムサービスを停止・無効化し、unit、実行ファイル、ランチャーを削除します。root 鍵を含む `/var/lib/duduclaw` と `/var/lib/duduclaw-protected` は**削除せず**、旧バージョン下限と保留記録だけを除去します。このコマンドを新しい隔離インストールの削除・復旧手順として使わないでください。導入前に、移行パッケージによる新環境の移行・復旧手順が必要です。
 
-更新は実行中のバージョンより新しい安定版 semver `X.Y.Z` のみ許可します。インストールと更新では `/var/lib/duduclaw-protected/version-floor` を下回るバージョンも拒否します。このファイルは root:root 所有、0600 で、実行ファイルの置き換え後に最高のインストール済みバージョンを原子的に記録します。ファイルがなければ実行中のバージョンを下限とし、不正な内容は拒否します。更新にロールバックオプションはありません。緊急時のロールバックは root が意図的にアンインストール（下限ファイルも削除）した後、古いアーカイブを使って上記の署名検証付き初回インストールを行います。データとルートキーは残ります。 置き換えが中断した場合も、root 専用の書き込み意図（`version-pending`）で検証済みの更新先を下限として保持します。同じ版か新しい版で署名検証付きインストールを再実行するか、意図的にアンインストールして解除してください。
+## 自動更新（開発用のみ）
 
-## 自動更新（任意）
+現在の `scripts/linux-protected/auto-upgrade/` は既存 timer の時刻を維持します。現地時刻 03:30 に最大 20 分のランダムな遅延を加え、`Persistent=false` により朝の起動時に未実行分を補いません。helper は固定の root 管理コマンド `/usr/libexec/duduclaw-updated-launch --check-latest` を呼びます。`--dry-run` は候補の照会だけを行い、Apply を送りません。
 
-`scripts/linux-protected/auto-upgrade/` は v1.79.3 より後のソースに追加された任意の夜間更新スクリプトです。既存の `service upgrade --protected-linux --version` だけを呼び出すため、v1.79.3 の保護インストールでも使えます。ホストの現地時刻で毎日 03:30 に、最大 20 分のランダムな遅延を加えて実行します。既存の署名検証付き更新コマンドで、新しい公式署名済みリリースだけをインストールし、稼働中の gateway を再起動します。作業のない時間に設定してください。`Persistent=false` により、朝の起動後に夜間の未実行分を補って営業時間中に再起動することはありません。ダッシュボードは v1.80.0 まで手動コマンドを表示します。未導入時は手動更新のままです。
+候補照会は非特権の `duduclaw-dl` アカウントで curl を実行し、継承した設定を消去します。API 応答は 1 MiB 以下で、JSON 全体を解析します。最新リリースの記録には `draft=false`、`prerelease=false`、安定版の形式が必要です。未署名の索引は候補の選択にしか使わず、インストールには root サービスによる公式署名付きマニフェストの検証が必要です。同じ版や古い版には要求を送りません。接続、アカウント、状態、サービスの異常は要求を停止し、旧経路には戻りません。要求側 unit のタイムアウトは 6 分で、リリースファイルを書き込みません。
 
-v1.79.3 のソースタグにはこのディレクトリがなく、現時点では公開済みタグにも含まれていません。含まれるリリースタグが出るまでは、固定の完全なコミット SHA（以下では `<commit>` と表記。確認したコミットに置き換えてください）から取得し、確認してください。移動する `main` から取得しないでください（[ソースの場所](https://github.com/zhixuli0406/DuDuClaw/tree/<commit>/scripts/linux-protected/auto-upgrade)）。Linux リリースアーカイブには `scripts/` がありません。4 個のスクリプト／ユニットファイルを確認してから、`/root/duduclaw-auto-upgrade` など root だけが書き込める場所にコピーします。ファイルとすべての親ディレクトリが root 管理であることを確認して実行します。
+この開発中 helper を v1.79.3 にコピーしたり、timer を有効にしたりしないでください。既存 v1.79.3 の夜間運用では、完全な隔離移行が提供されるまで、以前に確認した固定版 helper を維持してください。運用コードを移動する `main` から取得しないでください。
 
-```sh
-# Replace <commit> with the reviewed full commit SHA; obtain files from that SHA.
-# Run from the reviewed checkout; the destination must not already exist.
-sudo cp -r --no-preserve=ownership scripts/linux-protected/auto-upgrade /root/duduclaw-auto-upgrade
-sudo chown -R root:root /root/duduclaw-auto-upgrade
-sudo chmod -R go-w /root/duduclaw-auto-upgrade
-sudo sh /root/duduclaw-auto-upgrade/install.sh
-sudo /usr/local/sbin/duduclaw-auto-upgrade --dry-run
-systemctl list-timers duduclaw-auto-upgrade.timer
-sudo journalctl -u duduclaw-auto-upgrade.service
-```
-ユーザーが書き換えられるディレクトリから `install.sh` を root として直接実行しないでください。確認後からコピーまでに別のプロセスが置き換える可能性があるため、root 管理のコピーも照合してください。インストーラーはソースディレクトリと4個のファイルのシンボリックリンク、通常ファイル以外、root:root 以外の所有者、グループ／他ユーザーの書き込み権限を拒否します。解決済みディレクトリから `/` までの各親も確認し、sticky bit 付きの `/tmp` も拒否します。検証後、`/run` の root 専用 0700 一時ディレクトリへコピーし、通常ファイルかつ 1 byte～1 MiB であることを再確認してからコピーをインストールし、一時ファイルを削除します。権限検査は出所の証明にはなりません。固定コミットと root 管理のコピーを照合してください。ディレクトリ内の README も参照してください。
+ソースのインストーラは引き続き root:root 所有、通常ファイル、他者が書き込めない祖先ディレクトリを検査し、symlink と sticky `/tmp` を拒否して root 専用スナップショットからインストールします。この検査はコードの出所を証明しません。将来の導入前にも正確な commit と root 管理のコピーを確認し、ユーザーが書き込める checkout から root インストーラを実行しないでください。[helper README](../../../scripts/linux-protected/auto-upgrade/README.md) を参照してください。
 
-GNU coreutils（`sort -V` を含む）、curl、grep、sed、tr、systemd と、既存更新処理のホスト準備要件が必要です。root の `version-floor` を読み取り、ファイルがない、不正、または `version-pending` が存在する場合は更新せず失敗します。手動で確認してください。GitHub の直近 30 リリースから最大の純粋な `vX.Y.Z` タグを選び、`desktop-v*` と接尾辞付きタグを除外します。同じ版か古い版なら大きなアーカイブを取得せず正常終了します。API エラーや候補なしの場合も更新しません。全履歴は検索しないため、30 件に gateway リリースがなければ手動調査が必要です。
-
-圧縮された 1 行 JSON と整形済み JSON に対応し、外側の配列と純粋なバージョンタグを確認します。JSON 文法全体と `prerelease` フラグは解析しません。`-rc` などの接尾辞は除外しますが、純粋な `vX.Y.Z` が prerelease 指定でも候補になります。未認証 API はドラフトを返しません。Linux アーカイブのアップロード完了前にリリースが公開されると、その夜の更新は失敗し、翌夜に再試行します。journal を確認してください。
-
-API 応答は 8 MiB、タイムアウトは 60 秒です。古い curl の `--max-filesize` は既知の Content-Length のみに適用されるため、応答を私有 `/tmp` の 0700 ディレクトリ内の一時ファイルに保存し、解析前に実サイズも確認して終了時に削除します。`PrivateTmp=yes` が私有の書き込み可能な `/tmp` を提供します。ホストへの書き込みは `/opt/duduclaw` と `/var/lib/duduclaw-protected` に限定し、ダウンロード再試行とインストール／再起動のため起動タイムアウトを1時間にします。純粋な `vX.Y.Z` は GitHub で prerelease とされていても、新しく署名検証に成功すればインストールされます。信頼の基点はアーカイブの minisign 署名であり、バージョンの選択自体は署名されていません。
-
-gateway とデータを残し、スケジュール、スクリプト、ユニットを削除するには以下を実行します。更新中の場合、タイマーだけを無効化して削除を拒否します。更新完了後に再実行してください。
+導入済みのスケジュールだけを削除して gateway とデータを残すには、確認済みインストーラのコピーを使います。
 
 ```sh
 sudo sh /root/duduclaw-auto-upgrade/install.sh --uninstall
 ```
+
+更新が進行中なら timer を無効化した後、削除を拒否します。完了を待って再実行してください。
 
 ## 保護範囲と制限
 

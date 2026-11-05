@@ -1,3 +1,4 @@
+import type { ProtectedUpdateResult } from '@/lib/protected-update';
 import { beginBrandRequest, loadPublicBrand, useBrandStore, type DistributorBrand } from '@/stores/brand-store';
 import { client } from './ws-client';
 import type { SkillSignatureStatus } from './api-custom-skills';
@@ -7477,7 +7478,7 @@ export const api = {
          *   version is real, but nothing here can install it, so the install
          *   button must not be offered.
          */
-        update_channel?: 'control_plane' | 'github' | 'none';
+        update_channel?: 'control_plane' | 'github' | 'none' | 'protected';
         /**
          * True when this gateway is running inside a container (`/.dockerenv`
          * or `DUDUCLAW_IN_CONTAINER`). The image is immutable — an in-process
@@ -7497,13 +7498,17 @@ export const api = {
      * worked on retry" field report. 10 minutes covers the worst legitimate
      * case; the gateway's own timeouts still bound it from the other side.
      */
-    applyUpdate: () =>
-      client.call('system.apply_update', {}, false, 600000) as Promise<{
+    applyUpdate: (requestId?: string) =>
+      client.call('system.apply_update', requestId ? { request_id: requestId } : {}, false, 600000) as Promise<{
         success: boolean;
         message: string;
         needs_restart: boolean;
         restart_hint?: string | null;
+        protected_request_id?: string;
+        protected_state?: ProtectedUpdateResult['protected_state'];
       }>,
+    protectedUpdateStatus: (requestId: string) =>
+      client.call('system.protected_update_status', { request_id: requestId }) as Promise<ProtectedUpdateResult>,
     /**
      * Restart onto the binary already on disk (`restart_pending_version`).
      * Refused unless that version differs from the running one, and on

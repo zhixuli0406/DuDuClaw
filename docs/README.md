@@ -7,6 +7,7 @@
 Native Linux personal accounts: [Protected system service](guides/linux-protected-service.md) · [繁體中文](guides/zh-TW/linux-protected-service.md) · [日本語](guides/ja-JP/linux-protected-service.md)
 
 Developer implementation status: [Native Linux isolation — Package B1](architecture/native-linux-isolation.md) (not enabled).
+Developer handoff: [Native Linux isolation packages](architecture/native-linux-isolation.md) (development status and remaining acceptance gates).
 
 ## Feature Highlights
 
