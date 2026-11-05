@@ -8,13 +8,14 @@
 //!
 //! ## Scope (deliberately partial)
 //!
-//! Only the three methods the tool loop needs are implemented:
-//!   * `initialize` handshake (+ the `notifications/initialized` follow-up),
-//!   * `tools/list`,
-//!   * `tools/call`.
+//! The client prefers 2026-07-28 discovery and per-request metadata, falling
+//! back to 2025-11-25 / 2025-06-18 initialization. The tool loop uses
+//! `tools/list` and `tools/call`; modern calls support bounded MRTR with an
+//! optional host input handler. No interactive capabilities are advertised
+//! unless the host installs that handler.
 //!
 //! **Not implemented** (out of scope for this client): resources
-//! (`resources/*`), prompts (`prompts/*`), sampling, roots, logging,
+//! (`resources/*`), prompts (`prompts/*`), logging,
 //! completion, progress notifications, server-initiated requests,
 //! cancellation, and pagination cursors on `tools/list`. A server that
 //! *requires* any of those to serve tools is unsupported.
@@ -48,7 +49,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use duduclaw_core::process_tree::ManagedChild;
 use tokio::sync::Mutex;
@@ -64,7 +65,15 @@ use crate::types::ToolDef;
 /// JSON-RPC protocol version echoed in every frame.
 const JSONRPC_VERSION: &str = "2.0";
 /// MCP protocol revision advertised in the `initialize` handshake.
-const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+
+pub mod protocol;
+mod negotiation;
+mod legacy_http;
+mod workflow;
+use negotiation::{protocol_header, read_http_body};
+#[cfg(test)]
+mod generation_tests;
 /// Default per-request timeout.
 pub const DEFAULT_MCP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -104,6 +113,9 @@ pub enum McpError {
     /// A JSON-RPC protocol error (the `error` member of a response frame).
     #[error("mcp rpc error {code}: {message}")]
     Rpc { code: i64, message: String },
+
+    #[error("mcp HTTP response rejected: {0}")]
+    HttpStatus(u16),
 
     #[error("mcp parse error: {0}")]
     Parse(String),
@@ -226,7 +238,7 @@ pub fn build_initialize_request(id: i64) -> Value {
         "initialize",
         json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": { "tools": {} },
+            "capabilities": {},
             "clientInfo": { "name": "duduclaw-llm", "version": env!("CARGO_PKG_VERSION") },
         }),
     )
@@ -343,6 +355,10 @@ pub fn parse_tools_list_response(frame: &Value) -> Result<Vec<McpToolDef>, McpEr
 /// other block kinds (image, resource) are noted as a placeholder so the
 /// model still sees that non-text content was returned.
 pub fn parse_tool_call_result(frame: &Value) -> Result<ToolCallResult, McpError> {
+    protocol::validate_result(frame).map_err(McpError::Parse)?;
+    if frame.pointer("/result/resultType").and_then(Value::as_str) == Some("input_required") {
+        return Err(McpError::Parse("unfinished MCP input round".into()));
+    }
     if let Some(e) = rpc_error_of(frame) {
         return Err(e);
     }
@@ -407,6 +423,7 @@ enum McpTransport {
         /// Present only for a single scoped operation. The transport owns
         /// both values through response parsing, including error/cancel paths.
         scoped: Option<ScopedHttpAuthority>,
+        legacy: Option<legacy_http::LegacyHttp>,
     },
 }
 
@@ -420,10 +437,23 @@ pub struct McpClient {
     transport: McpTransport,
     next_id: AtomicI64,
     timeout: Duration,
-    /// Server name for diagnostics (the spawned command or the URL).
+    /// Server name for diagnostics (never a secret-bearing HTTP URL).
     label: String,
     workflow_version: Option<u32>,
     builtin_tool_timeouts: bool,
+    protocol_version: &'static str,
+    requires_reconnect: bool,
+    last_http_status: Option<u16>,
+    tool_schemas: HashMap<String, Value>,
+    input_handler: Option<Arc<dyn McpInputHandler>>,
+}
+
+/// Host-provided interaction boundary. A handler must obtain user consent
+/// before accepting elicitation; the default client advertises no inputs.
+#[async_trait]
+pub trait McpInputHandler: Send + Sync {
+    fn capabilities(&self) -> Value;
+    async fn respond(&self, request: &Value) -> Result<Value, McpError>;
 }
 
 impl McpClient {
@@ -573,6 +603,11 @@ impl McpClient {
             label: command.to_string(),
             workflow_version: None,
             builtin_tool_timeouts: false,
+            protocol_version: protocol::MODERN,
+            requires_reconnect: false,
+            last_http_status: None,
+            tool_schemas: HashMap::new(),
+            input_handler: None,
         };
 
         if let Err(e) = client.handshake().await {
@@ -596,15 +631,13 @@ impl McpClient {
         timeout: Duration,
     ) -> Result<Self, McpError> {
         if !http_endpoint_allowed(url) {
-            return Err(McpError::Spawn(format!(
-                "MCP HTTP endpoint must be https:// (or localhost for dev): {url}"
-            )));
+            return Err(McpError::Spawn("MCP HTTP endpoint must be https:// (or localhost for dev)".into()));
         }
         let http = reqwest::Client::builder()
-            .timeout(timeout)
+            .connect_timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|e| McpError::Spawn(e.to_string()))?;
+            .map_err(|_| McpError::Spawn("MCP HTTP client unavailable".into()))?;
 
         let mut client = Self {
             transport: McpTransport::Http {
@@ -613,12 +646,18 @@ impl McpClient {
                 headers: headers.to_vec(),
                 session_id: None,
                 scoped: None,
+                legacy: None,
             },
             next_id: AtomicI64::new(1),
             timeout,
-            label: url.to_string(),
+            label: "remote-http".into(),
             workflow_version: None,
             builtin_tool_timeouts: false,
+            protocol_version: protocol::MODERN,
+            requires_reconnect: false,
+            last_http_status: None,
+            tool_schemas: HashMap::new(),
+            input_handler: None,
         };
         client.handshake().await?;
         Ok(client)
@@ -632,7 +671,7 @@ impl McpClient {
         lease: Box<dyn ToolCallLease>,
     ) -> Result<Self, McpError> {
         let http = reqwest::Client::builder()
-            .timeout(recipe.operation_timeout)
+            .connect_timeout(recipe.operation_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .build()
@@ -644,12 +683,18 @@ impl McpClient {
                 headers: recipe.headers.clone(),
                 session_id: None,
                 scoped: Some(ScopedHttpAuthority { bearer, lease }),
+                legacy: None,
             },
             next_id: AtomicI64::new(1),
             timeout: recipe.operation_timeout,
             label: "scoped-http".into(),
             workflow_version: None,
             builtin_tool_timeouts: false,
+            protocol_version: protocol::MODERN,
+            requires_reconnect: false,
+            last_http_status: None,
+            tool_schemas: HashMap::new(),
+            input_handler: None,
         };
         client.handshake().await?;
         Ok(client)
@@ -690,52 +735,42 @@ impl McpClient {
         }
     }
 
-    async fn handshake(&mut self) -> Result<(), McpError> {
-        let id = self.alloc_id();
-        let frame = build_initialize_request(id);
-        let is_http = matches!(self.transport, McpTransport::Http { .. });
-        let resp = if is_http {
-            // `initialize` is the one HTTP request that captures the
-            // server-issued `Mcp-Session-Id` (if any) for later echo.
-            self.http_request(frame, id, true).await?
-        } else {
-            self.request(frame, id).await?
-        };
-        if let Some(e) = rpc_error_of(&resp) {
-            return Err(e);
-        }
-        self.workflow_version = resp
-            .pointer("/result/capabilities/experimental/duduclaw_workflow/version")
-            .and_then(Value::as_u64)
-            .and_then(|v| u32::try_from(v).ok());
-        // Announce readiness; notifications get no reply.
-        let note = build_initialized_notification();
-        if is_http {
-            // Persistent compatibility: stateless servers may reject this
-            // notification. Scoped operations instead require acceptance.
-            if let Err(e) = self.http_notify(&note).await {
-                if self.is_scoped_http() {
-                    // A scoped notification is part of the authorized
-                    // operation. Never continue after a refused authority.
-                    return Err(e);
-                }
-                warn!(server = %self.label, error = %e, "MCP initialized notification not accepted (continuing)");
-            }
-        } else {
-            self.send_line(&note).await?;
-        }
-        Ok(())
-    }
-
     fn alloc_id(&self) -> i64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// List the server's tools.
     pub async fn list_tools(&mut self) -> Result<Vec<McpToolDef>, McpError> {
+        self.list_tools_inner(true).await
+    }
+
+    async fn list_tools_inner(&mut self, allow_version_recovery: bool) -> Result<Vec<McpToolDef>, McpError> {
         let id = self.alloc_id();
-        let resp = self.request(build_tools_list_request(id), id).await?;
-        parse_tools_list_response(&resp)
+        let response = self.request(build_tools_list_request(id), id).await;
+        if !allow_version_recovery && matches!(&response, Ok(frame) if frame["error"]["code"] == -32022) {
+            self.requires_reconnect = true;
+            self.tool_schemas.clear();
+            return Err(McpError::Parse("MCP protocol changed; reconnect and rediscover tools before retrying".into()));
+        }
+        let resp = if allow_version_recovery && self.recover_version(&response).await? {
+            let id = self.alloc_id();
+            self.request(build_tools_list_request(id), id).await?
+        } else { response? };
+        protocol::validate_result(&resp).map_err(McpError::Parse)?;
+        if resp["result"].get("resultType").is_some_and(|v| v != "complete") {
+            return Err(McpError::Parse("tool list result must be complete".into()));
+        }
+        let mut tools = parse_tools_list_response(&resp)?;
+        if self.protocol_version == protocol::MODERN {
+            tools.retain(|tool| {
+                if protocol::validate_header_schema(&tool.input_schema).is_err() {
+                    warn!("MCP tool has invalid x-mcp-header annotations; hiding it");
+                    false
+                } else { true }
+            });
+        }
+        self.tool_schemas = tools.iter().map(|t| (t.name.clone(), t.input_schema.clone())).collect();
+        Ok(tools)
     }
 
     /// Call one tool by name with parsed JSON arguments.
@@ -748,7 +783,10 @@ impl McpClient {
     ) -> Result<ToolCallResult, McpError> {
         let id = self.alloc_id();
         if let Some(lease) = lease { lease.dispatched(); }
-        let resp = self.request(build_tools_call_request(id, name, args), id).await?;
+        let frame = build_tools_call_request(id, name, args);
+        let timeout = self.request_timeout(&frame);
+        let resp = tokio::time::timeout(timeout, self.call_rounds(frame)).await
+            .map_err(|_| McpError::Timeout)??;
         // request() correlates the id. Parsing failures after a terminal frame
         // do not imply the remote operation is still running.
         if resp.get("method").is_none()
@@ -785,24 +823,7 @@ impl McpClient {
         frame["params"]["_meta"] = serde_json::json!({"duduclaw_workflow":metadata});
         duduclaw_core::workflow_mcp::canonical_bytes(&frame).map_err(McpError::Parse)?;
         let response = self.request(frame, id).await?;
-        duduclaw_core::workflow_mcp::canonical_bytes(&response).map_err(McpError::Parse)?;
-        if let Some(error) = rpc_error_of(&response) {
-            return Err(error);
-        }
-        let version = response
-            .pointer("/result/version")
-            .or_else(|| response.pointer("/result/effective/version"))
-            .and_then(Value::as_u64);
-        if version != Some(u64::from(duduclaw_core::workflow_mcp::VERSION)) {
-            return Err(McpError::Parse("unknown workflow response version".into()));
-        }
-        serde_json::from_value(
-            response
-                .get("result")
-                .cloned()
-                .ok_or_else(|| McpError::Parse("missing workflow result".into()))?,
-        )
-        .map_err(|_| McpError::Parse("invalid typed workflow response".into()))
+        workflow::decode_response(response, self.protocol_version == protocol::MODERN)
     }
     pub async fn prepare_workflow_call(
         &mut self,
@@ -864,25 +885,31 @@ impl McpClient {
     /// Send a request and await the frame whose `id` matches, all under a
     /// single timeout. Stdio: read frames, skipping non-matching lines. HTTP:
     /// one POST whose response body carries the frame (JSON or SSE).
-    async fn request(&mut self, frame: Value, expect_id: i64) -> Result<Value, McpError> {
+    async fn request(&mut self, mut frame: Value, expect_id: i64) -> Result<Value, McpError> {
+        if self.requires_reconnect {
+            return Err(McpError::Parse("MCP protocol changed; reconnect and rediscover tools before retrying".into()));
+        }
+        if self.protocol_version == protocol::MODERN {
+            protocol::inject_meta(&mut frame, self.protocol_version, &self.client_capabilities());
+        }
         if matches!(self.transport, McpTransport::Http { .. }) {
             return self.http_request(frame, expect_id, false).await;
         }
         let timeout = self.request_timeout(&frame);
+        let mut read_failed = false;
         let fut = async {
             self.send_line(&frame).await?;
             let McpTransport::Stdio { stdout, .. } = &mut self.transport else {
                 return Err(McpError::Io("stdio transport vanished".into()));
             };
             loop {
-                let mut line = String::new();
-                let n = stdout
-                    .read_line(&mut line)
+                let line = protocol::read_stdio_frame(stdout)
                     .await
-                    .map_err(|e| McpError::Io(e.to_string()))?;
-                if n == 0 {
-                    return Err(McpError::Closed);
-                }
+                    .map_err(|_| {
+                        read_failed = true;
+                        McpError::Io("invalid or oversized MCP stdio frame".into())
+                    })?
+                    .ok_or(McpError::Closed)?;
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -892,6 +919,9 @@ impl McpClient {
                     // Not JSON (stray log line) — ignore and keep reading.
                     Err(_) => continue,
                 };
+                if value.get("id").is_some() && value.get("method").is_some() {
+                    return Err(McpError::Parse("unsolicited MCP server request".into()));
+                }
                 if value.get("id").and_then(Value::as_i64) == Some(expect_id) {
                     return Ok(value);
                 }
@@ -899,10 +929,18 @@ impl McpClient {
             }
         };
 
-        match tokio::time::timeout(timeout, fut).await {
+        let result = match tokio::time::timeout(timeout, fut).await {
             Ok(res) => res,
             Err(_) => Err(McpError::Timeout),
+        };
+        if read_failed {
+            // A malformed/oversized frame cannot be reused as a new reply.
+            self.requires_reconnect = true;
+            if let McpTransport::Stdio { child, .. } = &mut self.transport {
+                child.kill_and_reap().await;
+            }
         }
+        result
     }
 
     /// POST one JSON-RPC request frame to the Streamable HTTP endpoint and
@@ -918,6 +956,15 @@ impl McpClient {
         let scoped = self.is_scoped_http();
         let resp = self.http_post(&frame).await?;
         let status = resp.status();
+        self.last_http_status = Some(status.as_u16());
+        if let McpTransport::Http { legacy: Some(legacy), .. } = &mut self.transport {
+            if !status.is_success() { return Err(McpError::HttpStatus(status.as_u16())); }
+            let mut value = tokio::time::timeout(self.timeout, legacy.response(expect_id)).await
+                .map_err(|_| McpError::Timeout)??;
+            self.validate_scoped_authority().await?;
+            self.redact_scoped_response(&mut value);
+            return Ok(value);
+        }
 
         if capture_session {
             let sid = resp
@@ -941,7 +988,7 @@ impl McpClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let body = resp.text().await.map_err(|e| {
+        let body = read_http_body(resp, expect_id, content_type.split(';').next() == Some("text/event-stream")).await.map_err(|e| {
             if scoped {
                 McpError::Io("scoped MCP response unavailable".into())
             } else {
@@ -949,21 +996,24 @@ impl McpClient {
             }
         })?;
 
-        if !status.is_success() {
+        if !status.is_success() && !matches!(status.as_u16(), 400 | 404 | 405) {
             if scoped {
                 // A provider may echo Authorization in its error body.
                 return Err(McpError::Io(format!(
                     "scoped MCP HTTP response rejected: {status}"
                 )));
             }
-            let snippet: String = body.chars().take(300).collect();
-            return Err(McpError::Io(format!("HTTP {status}: {snippet}")));
+            return Err(McpError::HttpStatus(status.as_u16()));
         }
         if body.len() as u64 > MAX_HTTP_BODY_BYTES {
             return Err(McpError::Io("MCP HTTP response too large".into()));
         }
 
-        let mut value: Value = if content_type.starts_with("text/event-stream") {
+        if !status.is_success() && serde_json::from_str::<Value>(&body).ok()
+            .is_none_or(|v| v.get("error").is_none()) {
+            return Err(McpError::HttpStatus(status.as_u16()));
+        }
+        let mut value: Value = if content_type.split(';').next() == Some("text/event-stream") {
             sse_extract_response(&body, expect_id)
                 .ok_or_else(|| McpError::Parse("no matching response frame in SSE body".into()))?
         } else {
@@ -975,6 +1025,9 @@ impl McpClient {
                 }
             })?
         };
+        if value.get("method").is_some() {
+            return Err(McpError::Parse("unsolicited MCP server request".into()));
+        }
         if value.get("id").and_then(Value::as_i64) != Some(expect_id) {
             return Err(McpError::Parse(format!(
                 "HTTP response id mismatch (expected {expect_id})"
@@ -1002,12 +1055,18 @@ impl McpClient {
     /// caller headers + session echo.
     async fn http_post(&mut self, frame: &Value) -> Result<reqwest::Response, McpError> {
         let timeout = self.request_timeout(frame);
+        let schema = frame.pointer("/params/name").and_then(Value::as_str)
+            .and_then(|name| self.tool_schemas.get(name));
+        let protocol_headers = protocol::request_headers(frame, self.protocol_version, schema)
+            .map_err(McpError::Parse)?;
+        let modern = self.protocol_version == protocol::MODERN;
         let McpTransport::Http {
             http,
             url,
             headers,
             session_id,
             scoped,
+            legacy,
         } = &mut self.transport
         else {
             return Err(McpError::Io("http_post on non-http transport".into()));
@@ -1020,44 +1079,29 @@ impl McpClient {
                 .map_err(|_| McpError::Io("scoped MCP authority is no longer valid".into()))?;
         }
         let mut req = http
-            .post(url.as_str())
+            .post(legacy.as_ref().map(|l| l.endpoint.as_str()).unwrap_or(url.as_str()))
             .timeout(timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(
                 reqwest::header::ACCEPT,
                 "application/json, text/event-stream",
-            )
-            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
+            );
         for (k, v) in headers {
-            req = req.header(k.as_str(), v.as_str());
+            if !protocol_header(k) { req = req.header(k.as_str(), v.as_str()); }
         }
+        for (name, value) in protocol_headers { req = req.header(name, value); }
         if let Some(authority) = scoped.as_ref() {
-            let token = authority.bearer.as_bytes();
-            if token.is_empty()
-                || token.iter().any(|byte| {
-                    !byte.is_ascii() || byte.is_ascii_control() || byte.is_ascii_whitespace()
-                })
-            {
-                return Err(McpError::Io("invalid scoped MCP bearer".into()));
-            }
-            let mut bytes = b"Bearer ".to_vec();
-            bytes.extend_from_slice(token);
-            let header = reqwest::header::HeaderValue::from_bytes(&bytes);
-            bytes.fill(0);
-            let mut header =
-                header.map_err(|_| McpError::Io("invalid scoped MCP bearer".into()))?;
-            header.set_sensitive(true);
-            req = req.header(reqwest::header::AUTHORIZATION, header);
+            req = req.header(reqwest::header::AUTHORIZATION, legacy_http::bearer_header(&authority.bearer)?);
         }
-        if let Some(sid) = session_id {
+        if !modern && let Some(sid) = session_id {
             req = req.header("mcp-session-id", sid.as_str());
         }
         let is_scoped = scoped.is_some();
-        req.json(frame).send().await.map_err(|e| {
+        req.json(frame).send().await.map_err(|_| {
             if is_scoped {
                 McpError::Io("scoped MCP HTTP request failed".into())
             } else {
-                McpError::Io(e.to_string())
+                McpError::Io("MCP HTTP request failed".into())
             }
         })
     }

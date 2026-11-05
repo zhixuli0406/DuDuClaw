@@ -2213,6 +2213,7 @@ name = "duduclaw-llm"
 version = "1.79.3"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "duduclaw-core",
  "duduclaw-security",
  "futures-util",

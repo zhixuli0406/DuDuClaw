@@ -71,9 +71,11 @@ pub use tool_loop::{
 };
 
 #[cfg(feature = "mcp-client")]
+pub use mcp_client::protocol as mcp_protocol;
+#[cfg(feature = "mcp-client")]
 pub use mcp_client::{
     ClientCallBoundary, ClientCallLease, ClosedClientTarget, OwnedScopedFailure, OwnedScopedOperation, OwnedScopedReply,
-    DEFAULT_MCP_TIMEOUT, McpClient, McpError, McpSourceVerifier, McpToolDef, RegistryClient,
+    DEFAULT_MCP_TIMEOUT, McpClient, McpError, McpInputHandler, McpSourceVerifier, McpToolDef, RegistryClient,
     ScopedHttpRecipe, ToolCallResult, ToolFilter, ToolRegistry, VerifiedMcpSource,
     build_initialize_request, build_initialized_notification, build_tools_call_request,
     build_tools_list_request, parse_tool_call_result, parse_tools_list_response,

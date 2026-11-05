@@ -198,7 +198,7 @@ pub async fn pinned_client(
     if let Some(Host::Domain(d)) = url.host() {
         builder = builder.resolve_to_addrs(d, &addrs);
     }
-    builder.build().map_err(|e| format!("http client init failed: {e}"))
+    builder.build().map_err(|_| "http client init failed".to_string())
 }
 
 #[cfg(test)]

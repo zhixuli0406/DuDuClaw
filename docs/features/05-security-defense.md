@@ -6,6 +6,35 @@ Enterprise [team-history API](68-manager-team-history.md) (v1.76.0): live report
 
 ---
 
+## Remote MCP protocol and OAuth boundaries
+
+The dual-generation MCP client keeps existing tool filters and third-party effect
+classification. Invalid `x-mcp-header` schemas are excluded. Initial discovery may
+select a supported legacy revision; after connection, the bridge refuses `-32022`
+and invalidates the connection without replaying the operation. Restarting the
+conversation must negotiate, list tools and apply the gates again. The API client
+also terminates `tools/call` on `-32022` and refuses all further requests on that
+client until its host creates a new connection, lists tools and applies the gates
+again. Initial handshake and standalone list recovery remain available. HTTP+SSE
+fallback confines the announced endpoint to the authenticated origin. Each new
+API HTTP connection performs independent discovery with no global URL-only version
+cache; the bridge retains only its own connection's negotiation state.
+
+OAuth callback issuer validation precedes code exchange and error display. CIMD
+uses an administrator-configured public HTTPS document with an exact client ID
+and allowed callback URI; a selected but invalid document is refused. Discovered
+and stored OAuth resources must exactly match the MCP endpoint's canonical
+resource, including its path, with no query or fragment. Another path on the same
+origin is refused; mismatched saved credentials require reconnection. PKCE,
+encrypted per-server credentials and outbound URL screening remain in force.
+
+The API client's MRTR inputs require host-declared capabilities and never grant
+automatic consent. The bridge declares no modern interactive capabilities and
+refuses all `input_required` results, including state-only results, and downstream
+requests containing `requestState` or `inputResponses`. Bridge MRTR remains disabled
+until complete continuation payloads can pass egress and approval checks bound to
+the original approved call generation. See [MCP client protocol versions](../guides/mcp-tools.md).
+
 ## Machine access and the person directing it
 
 Giving an AI employee Bash or machine tools lets anyone bound to that employee direct those tools. Bind it only to people who should have that authority. Admin-granted native tools remain available to ordinary AI employees.

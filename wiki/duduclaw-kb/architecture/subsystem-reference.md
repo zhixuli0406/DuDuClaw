@@ -173,3 +173,32 @@ Key architectural decisions:
 ### Autonomy pause (unreleased, 2026-10-28)
 
 `duduclaw-core::autonomy_gate` owns versioned `autonomy_pause.json` plus initialization marker, locked atomic writes and live operational status checks. Gateway WS `autonomy.pause/resume/status` uses live role/binding authorization and scoped `autonomy.changed` push. Goal rounds pause as `operator_paused` after the current turn; direct human conversation bypasses the autonomy gate. See the three-language continuous responsibilities guide for scope and downgrade limitations. This admission gate is not process cancellation or isolation from unrestricted same-user shell access.
+
+
+### Unreleased: dual-generation MCP clients (2026-11-05)
+
+`duduclaw-llm::mcp_client` now prefers 2026-07-28 discovery/per-request metadata,
+with 2025-11-25 and 2025-06-18 initialization fallback. Shared wire helpers live
+in `mcp_client/protocol.rs`; negotiation, bounded MRTR and deprecated HTTP+SSE
+fallback have separate modules. The remote MCP bridge uses those wire helpers
+while retaining ThirdPartyGate admission and response accounting. Each new API
+HTTP connection discovers independently; there is no global URL-only version
+cache. Bridge negotiation state remains local to its connection. After connection,
+a bridge `-32022` invalidates that connection without replay or legacy selection;
+a conversation restart must negotiate, list tools and apply the gates again.
+The generic API client also terminates `tools/call` on `-32022`, sets
+`requires_reconnect` and rejects all subsequent requests on that client. The host
+must create a new connection, list tools and apply the gates again. Initial
+handshake and standalone list recovery retain their version negotiation.
+The bridge declares no modern interactive capabilities and refuses every
+`input_required` result (including state-only results) and downstream requests
+containing `requestState` or `inputResponses`. Bridge MRTR is disabled until
+complete continuation payloads have egress/approval checks bound to the original
+approved generation; the generic API client retains its bounded MRTR handler.
+OAuth prefers pre-registration, configured CIMD, then DCR; callback issuer is
+validated before code exchange. Discovered and stored resource indicators must
+exactly equal `canonical_resource(mcp_url)`, including path, with no query or
+fragment; mismatched stored credentials require reconnection.
+Public configuration and limitations are in `docs/guides/mcp-tools.md`.
+Local llm compilation and offline/stdio tests are separate from gateway/CLI build,
+HTTP mock execution and real-provider acceptance; see the implementation handoff.

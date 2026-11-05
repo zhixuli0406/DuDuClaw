@@ -8,6 +8,52 @@ DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋
 要新增工具請先看 [custom-mcp-tool.md](../custom-mcp-tool.md)；這頁講的是宣告面，不是實作。不裝 gateway、單獨使用 MCP server，見 [mcp-standalone.md](mcp-standalone.md)。
 
 
+## MCP 用戶端協定版本
+
+API／openai-compat 用戶端與遠端 MCP bridge 優先使用 **2026-07-28**：先以
+`server/discover` 探測，每次請求攜帶版本、用戶端能力與身分 metadata。HTTP 請求
+包含 `MCP-Protocol-Version`、`Mcp-Method`，以及適用時的 `Mcp-Name`。
+`x-mcp-header` 標註的工具參數會同步放入標頭；標註不合法的工具不列出。
+中文等非 ASCII 標頭值使用協定規定的 Base64 編碼。
+
+舊伺服器回退至 **2025-11-25** 或 **2025-06-18**，使用 `initialize`、
+`notifications/initialized` 與協商後的 session 標頭。初次探測收到 `-32022` 時，
+選擇雙方共同支援的最新版本；連線建立後 bridge 收到同一錯誤會拒絕當次操作並
+停用該連線，須重新啟動對話，重新協商、列舉工具及檢查權限，不會跨版本重送呼叫。
+API 用戶端的 `tools/call` 收到 `-32022` 也會終止當次呼叫，並拒絕該用戶端的後續請求；
+host 須重新連線、列舉工具及檢查權限。初次握手及獨立列舉工具時的版本恢復仍保留。
+明確的新版能力或標頭錯誤不會觸發降版。每條新的 API HTTP 連線都獨立探測，
+不使用以網址為鍵的全域版本快取；bridge 只保留自身連線的協商狀態。
+憑證、session 與工具清單不會跨身分共用。API 用戶端在舊版 initialize
+仍回覆 400／404／405 時，也會嘗試舊式 HTTP+SSE；其 `endpoint` 必須與原設定同源。
+
+API 用戶端的新版 MRTR 每回合使用新 ID、原始工具參數，並原樣回傳伺服器的 `requestState`，
+且有回合上限。API 用戶端提供 host input handler 接口；未註冊時不宣告互動能力，
+拒絕非預期的輸入要求。本次沒有新增同意介面，也不會自動接受 elicitation。
+Tasks、採樣與根目錄能力預設不啟用。遠端 bridge 不宣告新版互動能力，拒絕所有
+`input_required` 回覆，包括只有狀態的回覆；下游請求若含 `requestState` 或
+`inputResponses`，也會在送出前拒絕。完整續傳資料的外送、審批與原核准呼叫綁定
+保護完成前，bridge 不開放 MRTR。工具回應串流中斷會回報錯誤，不會悄悄重送
+結果不明的操作。原有工具過濾與第三方工具分類仍然適用。
+
+遠端 OAuth 優先使用已註冊的憑證。管理員如有現成的公開 HTTPS metadata 文件，
+可設定 CIMD：
+
+```toml
+[remote_mcp]
+client_metadata_url = "https://your-domain.example/mcp-client.json"
+```
+
+授權伺服器支援 CIMD 時，文件須以該網址為 client ID、允許既定 callback URI，
+並使用公開用戶端驗證（`token_endpoint_auth_method = "none"`）。選中的文件驗證
+失敗便拒絕連線；未設定或授權伺服器不支援時，仍回退動態註冊並送出
+`application_type`。PKCE 與 resource indicator 保留；交換授權碼前驗證 callback
+的 `iss`，已保存憑證維持與 issuer 綁定。探測取得及已儲存的 OAuth resource 都必須
+精確符合 MCP 端點的 canonical resource（scheme、host、port 與移除結尾斜線的 path）。
+resource 不可帶 query、fragment，也不可指向同源的其他路徑；不符的舊憑證須重新連線。
+尚未實作 403 自動 scope step-up 與
+CIMD `private_key_jwt`。
+
 ## 會議逐字稿
 
 `meeting_transcribe` 接受呼叫員工自己附件中的 `source_path`，以及選用的 `engine`、

@@ -35,6 +35,7 @@ async fn mcp_post(State(s): State<S>, headers: HeaderMap, body: String) -> Respo
     }
     let frame: Value = serde_json::from_str(&body).unwrap();
     let method = frame["method"].as_str().unwrap_or("").to_string();
+    if method == "server/discover" { return StatusCode::BAD_REQUEST.into_response(); }
     if frame.get("id").is_none() {
         return StatusCode::ACCEPTED.into_response();
     }
@@ -179,6 +180,7 @@ type R = Arc<Mutex<Resume>>;
 async fn resume_post(State(s): State<R>, body: String) -> Response {
     let frame: Value = serde_json::from_str(&body).unwrap();
     let method = frame["method"].as_str().unwrap_or("").to_string();
+    if method == "server/discover" { return StatusCode::BAD_REQUEST.into_response(); }
     if frame.get("id").is_none() {
         return StatusCode::ACCEPTED.into_response();
     }

@@ -6,6 +6,28 @@
 
 ---
 
+## 遠端 MCP 協定與 OAuth 邊界
+
+雙世代 MCP 用戶端保留原有工具過濾與第三方效果分類。不合法的 `x-mcp-header`
+schema 不列入工具清單。初次探測可選擇支援的舊版本；連線建立後 bridge 收到
+`-32022` 會拒絕操作並停用連線，不會重送。須重新啟動對話，重新協商、列舉工具
+及檢查權限。API 用戶端的 `tools/call` 收到 `-32022` 也會終止呼叫，並拒絕該用戶端
+後續所有請求；host 須重新連線、列舉工具及檢查權限。初次握手及獨立列舉工具時的
+版本恢復仍保留。舊式 HTTP+SSE 只接受與認證目標同源的 endpoint。每條新的 API HTTP
+連線獨立探測，不使用以網址為鍵的全域版本快取；bridge 只保留自身連線的協商狀態。
+
+OAuth 在交換授權碼與顯示錯誤之前驗證 callback 的 issuer。CIMD 使用管理員設定的
+公開 HTTPS 文件，要求精確的 client ID 與允許的 callback URI；選中的文件不合法便
+拒絕。探測取得及已儲存的 OAuth resource 必須精確符合 MCP 端點的 canonical resource，
+包含 path，且不得帶 query 或 fragment；即使同源，其他路徑也會拒絕，不符的舊憑證
+須重新連線。PKCE、每伺服器加密憑證與對外網址檢查仍然生效。
+
+API 用戶端的 MRTR 輸入須符合 host 宣告的能力，不會自動代替使用者同意。bridge
+不宣告新版互動能力，拒絕所有 `input_required` 回覆（含只有狀態的回覆），也拒絕
+下游傳入 `requestState` 或 `inputResponses`。完整續傳資料的外送、審批與原核准呼叫
+綁定保護完成前，bridge 不開放 MRTR。詳見
+[MCP 用戶端協定版本](../../guides/zh-TW/mcp-tools.md)。
+
 ## 機器操作與下指令的人
 
 給 AI 員工 Bash 或機器操作工具，就代表綁定這位員工的人可以指揮它使用這些工具。請只綁定應該有這份權限的人。管理員授予一般 AI 員工的原生工具仍可照常使用。
