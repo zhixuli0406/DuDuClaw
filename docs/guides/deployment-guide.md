@@ -335,9 +335,18 @@ on its final step.
 
 Creates `~/Library/LaunchAgents/com.duduclaw.gateway.plist`
 
-After updating a macOS LaunchAgent, use `duduclaw service restart` to unload
-and bootstrap the job against its plist. If `duduclaw doctor` reports launchd
+After a verified gateway update, a separate one-shot LaunchAgent automatically
+re-registers and restarts the running gateway. It first allows up to 55 seconds
+for the gateway to flush and drain, then unloads and bootstraps the job. The
+helper runs the installed binary and bounds re-registration to 90 seconds. If
+the original process has not exited within 55 seconds, it refuses forced unload.
+It does not retry indefinitely. Its log is `~/.duduclaw-update-relaunch/relaunch.log`; its private
+plist is removed when consumed. An exited helper registration is inert and is
+replaced at the next update. If automatic relaunch fails, use
+`duduclaw service restart`. If `duduclaw doctor` reports launchd
 exit code 78, run that command to re-register the job with the updated binary.
+The first upgrade from a version without this fix can still need a manual
+restart: the new behavior starts once the fixed gateway is running.
 
 ### Linux (systemd)
 
@@ -363,9 +372,10 @@ the same pipeline:
    tampered releases are rejected, no override)
 3. Verify the new binary executes (`duduclaw version`), then atomically
    swap it in place (backup + rename, auto-rollback on failure)
-4. Graceful shutdown, then **re-exec the new binary in-process** — the PID
-   is preserved on macOS/Linux, so launchd/systemd keep supervising, and
-   unsupervised foreground runs (npm wrapper, `duduclaw run`) restart too
+4. On macOS, a gateway managed by the standard or legacy DuDuClaw LaunchAgent
+   is re-registered by the independent helper described above. Other installs
+   keep graceful shutdown followed by in-process re-exec (PID preserved on
+   Unix). Desktop sidecars continue to be updated and restarted by the app.
 5. Open dashboard tabs show a restart banner and reload automatically
 
 Enable unattended updates:

@@ -338,9 +338,16 @@ duduclaw service uninstall
 
 `~/Library/LaunchAgents/com.duduclaw.gateway.plist` を作成します。
 
-macOS の LaunchAgent を更新した後は `duduclaw service restart` を実行し、
-plist に従ってジョブを再登録してください。`duduclaw doctor` が launchd の
-終了コード 78 を報告した場合も、このコマンドで新しい binary を登録します。
+gateway の更新検証とファイル置換が成功すると、独立した一度だけ実行する
+LaunchAgent が自動的に再登録・再起動します。helper は gateway の保存と接続終了を
+最大 55 秒待ってからジョブをアンロードし、再登録します。インストール済みの
+binary を使い、再登録処理の制限時間は 90 秒です。無限には再試行しません。
+元のプロセスが 55 秒以内に終了しない場合は、強制アンロードせず停止します。
+ログは `~/.duduclaw-update-relaunch/relaunch.log` に保存され、非公開の plist は
+実行開始時に削除されます。終了した helper の登録は再実行されず、次の更新で置換されます。
+自動再起動に失敗した場合や `duduclaw doctor` が launchd の終了コード 78 を報告した
+場合は、`duduclaw service restart` で新しい binary を再登録してください。
+この修正を含まない旧版からの最初の更新では、手動の再起動が必要な場合があります。新しい gateway が起動してから新方式が有効になります。
 
 ### Linux（systemd）
 
@@ -370,10 +377,9 @@ gateway は 6 時間ごとに GitHub Releases を確認し、ダッシュボー�
 3. 新しいバイナリが実際に実行できるか（`duduclaw version`）を確認したうえ
    で、アトミックにその場で入れ替えます（バックアップ＋リネーム、失敗時は
    自動ロールバック）。
-4. グレースフルシャットダウン後、**同一プロセス内で新しいバイナリを再実
-   行**します。macOS/Linux では PID がそのまま維持されるため launchd/systemd
-   の監視は継続し、監視されていないフォアグラウンド実行（npm wrapper、
-   `duduclaw run`）も再起動されます。
+4. macOS の DuDuClaw 標準・旧 LaunchAgent では上記の独立した helper が再登録します。
+   他のインストール方法では、これまでどおり終了処理後に同一プロセス内で再実行します
+   （Unix では PID を維持）。デスクトップアプリのサイドカーは引き続きアプリが更新・再起動します。
 5. 開いているダッシュボードのタブには再起動バナーが表示され、自動的にリ
    ロードされます。
 

@@ -369,7 +369,7 @@ impl MethodHandler {
             Ok(result) => {
                 *self.pending_update.write().await = None;
 
-                if result.needs_restart {
+                if result.success && result.needs_restart {
                     self.schedule_update_restart(&pending.version, &result.message)
                         .await;
                 }
@@ -416,7 +416,7 @@ impl MethodHandler {
 
     /// Broadcast `system.update_installed` to ALL dashboard tabs (not just the
     /// RPC caller) so every client can wait out the restart and reload, then
-    /// shut down gracefully and re-exec the binary now on disk.
+    /// restart using the install mode (launchd re-registration or graceful exec).
     async fn schedule_update_restart(&self, version: &str, message: &str) {
         if let Some(tx) = self.event_tx.read().await.clone() {
             let frame = WsFrame::Event {
@@ -435,10 +435,9 @@ impl MethodHandler {
         tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             tracing::info!(
-                "Shutting down for update — will re-exec new binary after graceful shutdown"
+                "Restarting after update using the current install mode"
             );
-            duduclaw_core::platform::request_restart_after_shutdown();
-            duduclaw_core::platform::self_interrupt();
+            crate::updater::restart_after_update().await;
         });
     }
 

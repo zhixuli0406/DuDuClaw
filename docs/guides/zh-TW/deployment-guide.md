@@ -313,9 +313,15 @@ duduclaw service uninstall
 
 會建立 `~/Library/LaunchAgents/com.duduclaw.gateway.plist`
 
-macOS LaunchAgent 更新後，請執行 `duduclaw service restart`，讓 launchd
-依 plist 卸載並重新載入工作。若 `duduclaw doctor` 顯示 launchd exit code 78，
-也請執行此命令，讓新版 binary 重新註冊。
+gateway 通過更新驗證並換檔後，會由獨立的一次性 LaunchAgent 自動重新註冊與啟動。
+helper 先讓 gateway 最多有 55 秒完成狀態寫入與連線關閉，再卸載並重新載入工作，
+執行的是已安裝的 binary，重新註冊流程限時 90 秒，不會無限重試。
+若 55 秒內仍未結束原程序，helper 會停止，不強制卸載。
+日誌位於 `~/.duduclaw-update-relaunch/relaunch.log`，私有 plist 在開始執行時移除；
+結束後留下的 helper 註冊不會再執行，下次更新會替換它。
+若自動重啟失敗，或 `duduclaw doctor` 顯示 launchd 結束碼 78，
+請執行 `duduclaw service restart`，讓新版 binary 重新註冊。
+從尚未包含這項修正的舊版升級時，舊 updater 仍可能需要這次手動重啟；新流程從新版 gateway 執行後生效。
 
 ### Linux（systemd）
 
@@ -338,9 +344,9 @@ gateway 每 6 小時會檢查一次 GitHub Releases，儀表板（設定 → 更
    執行檔中，未簽章或遭竄改的版本一律拒絕，沒有例外）
 3. 驗證新執行檔可正常執行（`duduclaw version`），再原子性地就地替換（備份＋改名，
    失敗自動回滾）
-4. 優雅關閉後，**在同一個行程內重新執行新版執行檔**，macOS/Linux 上會保留原本的
-   PID，因此 launchd/systemd 仍會持續監控；沒有監控的前景執行方式（npm wrapper、
-   `duduclaw run`）也會一併重新啟動
+4. macOS 使用 DuDuClaw 標準或舊版 LaunchAgent 的 gateway，由上述獨立 helper
+   重新註冊。其他安裝方式維持優雅關閉後在同一行程重新執行（Unix 保留 PID）；
+   桌面 App 自帶 gateway 仍由 App 更新及重啟。
 5. 已開啟的儀表板分頁會顯示重啟橫幅並自動重新載入
 
 要開啟無人值守更新：

@@ -1238,6 +1238,34 @@ async fn apply_update_inner(
     })
 }
 
+/// Called only after a successful verified install (or the explicit on-disk
+/// update restart gate). A launchd helper owns shutdown; never exec on failure.
+pub async fn restart_after_update() {
+    #[cfg(target_os = "macos")]
+    match duduclaw_core::autostart::update_restart::schedule_if_managed(
+        detect_install_method() == InstallMethod::Desktop,
+    ).await {
+        Ok(true) => {
+            info!("Update installed — independent launchd helper scheduled to re-register and restart gateway");
+            // If launchd accepts the plist but cannot execute the new binary,
+            // no helper can write its own failure log. This old process remains
+            // alive and supplies the manual recovery hint after the deadline.
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(100)).await;
+                warn!("Update installed successfully, restart required; launchd relaunch did not stop this gateway; run `duduclaw service restart`");
+            });
+            return;
+        }
+        Err(error) => {
+            warn!(%error, "Update installed successfully, restart required; run `duduclaw service restart`");
+            return;
+        }
+        Ok(false) => {}
+    }
+    duduclaw_core::platform::request_restart_after_shutdown();
+    duduclaw_core::platform::self_interrupt();
+}
+
 pub fn macos_launchd_restart_hint() -> Option<&'static str> {
     #[cfg(target_os = "macos")]
     {
