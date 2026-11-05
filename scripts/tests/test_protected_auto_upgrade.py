@@ -1,6 +1,7 @@
 """Exercise the root helper in isolation; never invoke the real upgrade."""
 
 import json
+import os
 from pathlib import Path
 import shlex
 import shutil
@@ -165,6 +166,131 @@ class ArtifactTests(unittest.TestCase):
                 str(Path(temp) / "duduclaw-auto-upgrade.timer")
             ], text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class InstallerPrerequisiteTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.source = self.root / "source"
+        shutil.copytree(SOURCE, self.source)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.calls = self.root / "calls"
+        self.owner = self.root / "owner"
+        self.owner.write_text("0:0")
+        self.state = self.root / "state"
+        self.state.write_text("active")
+        self.launcher = self.root / "usr/libexec/duduclaw-updated-launch"
+        self.launcher.parent.mkdir(parents=True)
+        self.launcher.write_text("#!/bin/sh\nexit 99\n")
+        self.launcher.chmod(0o755)
+        gateway = self.root / "opt/duduclaw/bin/duduclaw"
+        gateway.parent.mkdir(parents=True)
+        gateway.write_text("#!/bin/sh\nexit 99\n")
+        gateway.chmod(0o755)
+        (self.root / "run").mkdir()
+        self.stub("id", "printf '0\\n'\n")
+        stat_script = ("#!" + sys.executable + "\nimport os, stat, sys\n"
+            f"root = {str(self.root)!r}\nlauncher = {str(self.launcher)!r}\n"
+            "path = sys.argv[-1]\ninfo = os.lstat(path)\n"
+            "format = sys.argv[2]\n"
+            "if format == '%h': print(info.st_nlink)\n"
+            "elif format == '%s': print(info.st_size)\n"
+            "else:\n"
+            "    mode = stat.S_IMODE(info.st_mode) if path == root or path.startswith(root + '/') else 0o755\n"
+            f"    owner = open({str(self.owner)!r}).read() if path == launcher else '0:0'\n"
+            "    print('{}:{:o}'.format(owner, mode))\n")
+        (self.bin / "stat").write_text(stat_script)
+        (self.bin / "stat").chmod(0o755)
+        self.stub("systemctl", f"printf 'systemctl %s\\n' \"$*\" >> {shlex.quote(str(self.calls))}\n"
+            f"if [ \"$1\" = show ]; then cat {shlex.quote(str(self.state))}; fi\n")
+        self.stub("install", f"printf 'install %s\\n' \"$*\" >> {shlex.quote(str(self.calls))}\n")
+        self.script = self.source / "install.sh"
+        text = self.script.read_text().replace("PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+            f"PATH={shlex.quote(str(self.bin))}:/usr/bin:/bin")
+        for prefix in ("/usr/libexec/", "/opt/duduclaw/", "/usr/local/sbin/", "/etc/systemd/", "/run"):
+            text = text.replace(prefix, str(self.root) + prefix)
+        self.script.write_text(text)
+
+    def stub(self, name, body):
+        path = self.bin / name
+        path.write_text("#!/bin/sh\nset -eu\n" + body)
+        path.chmod(0o755)
+
+    def run_install(self):
+        return subprocess.run(["sh", str(self.script)], text=True, capture_output=True)
+
+    def assert_blocked_before_install(self):
+        result = self.run_install()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls.read_text() if self.calls.exists() else ""
+        self.assertNotIn("install ", calls)
+        self.assertNotIn("enable", calls)
+        self.assertNotIn("--check-latest", calls)
+        return result
+
+    def test_missing_launcher_blocks_before_any_install(self):
+        self.launcher.unlink()
+        self.assertIn("Unsafe protected updater", self.assert_blocked_before_install().stderr)
+
+    def test_nonexecutable_launcher_blocks(self):
+        self.launcher.chmod(0o644)
+        self.assertIn("not executable", self.assert_blocked_before_install().stderr)
+
+    def test_untrusted_owner_and_mode_block(self):
+        self.owner.write_text("1000:0")
+        self.assertIn("root:root", self.assert_blocked_before_install().stderr)
+        self.owner.write_text("0:0")
+        self.launcher.chmod(0o775)
+        self.assertIn("group/other writable", self.assert_blocked_before_install().stderr)
+
+    def test_symlink_and_hardlink_launchers_block(self):
+        target = self.launcher.with_name("real")
+        self.launcher.rename(target)
+        self.launcher.symlink_to(target)
+        self.assertIn("symlink", self.assert_blocked_before_install().stderr)
+        self.launcher.unlink()
+        os.link(target, self.launcher)
+        self.assertIn("exactly one link", self.assert_blocked_before_install().stderr)
+
+    def test_writable_or_symlink_ancestor_blocks(self):
+        self.launcher.parent.chmod(0o777)
+        self.assertIn("group/other writable", self.assert_blocked_before_install().stderr)
+        self.launcher.parent.chmod(0o755)
+        real = self.root / "real-libexec"
+        self.launcher.parent.rename(real)
+        self.launcher.parent.symlink_to(real, target_is_directory=True)
+        self.assertIn("symlink", self.assert_blocked_before_install().stderr)
+
+    def test_service_missing_inactive_or_unknown_blocks(self):
+        for state in ("inactive", "failed", "activating", "", "active\nunknown"):
+            with self.subTest(state=state):
+                self.state.write_text(state)
+                self.assertIn("must be active", self.assert_blocked_before_install().stderr)
+        self.stub("systemctl", "exit 1\n")
+        self.assertIn("Cannot read", self.assert_blocked_before_install().stderr)
+
+    def test_active_trusted_updater_allows_timer_without_requesting_upgrade(self):
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(calls[0], "systemctl show -p ActiveState --value duduclaw-updated.service")
+        self.assertEqual(calls[-2:], ["systemctl show -p ActiveState --value duduclaw-updated.service",
+                                    "systemctl enable --now duduclaw-auto-upgrade.timer"])
+        self.assertFalse(any("--check-latest" in call for call in calls))
+
+    def test_service_stopping_during_install_prevents_timer_enable(self):
+        self.stub("systemctl", f"printf 'systemctl %s\\n' \"$*\" >> {shlex.quote(str(self.calls))}\n"
+            f"if [ \"$1\" = show ]; then cat {shlex.quote(str(self.state))}; fi\n"
+            f"if [ \"$1\" = daemon-reload ]; then printf inactive > {shlex.quote(str(self.state))}; fi\n")
+        result = self.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.calls.read_text()
+        self.assertIn("install ", calls)
+        self.assertNotIn("enable", calls)
+        self.assertNotIn("--check-latest", calls)
 
 
 if __name__ == "__main__":

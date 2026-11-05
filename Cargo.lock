@@ -1842,6 +1842,7 @@ dependencies = [
  "duduclaw-llm",
  "duduclaw-mcp-boundary",
  "duduclaw-memory",
+ "duduclaw-migration",
  "duduclaw-odoo",
  "duduclaw-os",
  "duduclaw-parse-worker",

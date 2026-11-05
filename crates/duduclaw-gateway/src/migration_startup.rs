@@ -1,7 +1,7 @@
 //! Exclusive import boot. This branch runs before normal gateway initialization,
 //! so no public listener, channel, timer, model runtime or employee loader exists.
 use std::path::Path;
-use duduclaw_migration::{Error, import_manifest::{ImportManifest, IMPORT_MANIFEST}};
+use duduclaw_migration::{Error, import_manifest::{ImportManifest, IMPORT_MANIFEST, DURABLE_IMPORT_MANIFEST}};
 pub use duduclaw_migration::import_manifest::IMPORT_ONLY_ENV;
 
 fn gateway_error(_: Error) -> duduclaw_core::error::DuDuClawError {
@@ -14,7 +14,7 @@ pub async fn maybe_run(home: &Path) -> duduclaw_core::error::Result<bool> {
     let requested = std::env::var_os(IMPORT_ONLY_ENV);
     #[cfg(target_os = "linux")]
     {
-        let manifest = linux::read_manifest(Path::new(IMPORT_MANIFEST)).map_err(gateway_error)?;
+        let manifest = linux::read_boot_manifest().map_err(gateway_error)?;
         use duduclaw_migration::import_manifest::{boot_decision,ImportBootDecision};
         match boot_decision(requested.as_deref(),manifest.as_ref(),home).map_err(gateway_error)? {
             ImportBootDecision::Normal => Ok(false),
@@ -32,12 +32,35 @@ pub async fn maybe_run(home: &Path) -> duduclaw_core::error::Result<bool> {
     }
 }
 
+/// Read the root-authenticated completed import identity for first-admin setup.
+/// An unfinished manifest never authorizes normal/bootstrap startup.
+pub(crate) fn completed_manifest(home: &Path) -> Result<Option<ImportManifest>, Error> {
+    #[cfg(target_os = "linux")]
+    {
+        let manifest = linux::read_boot_manifest()?;
+        match manifest {
+            Some(value) if value.home == home => {
+                if !value.completed { return Err(Error::Authentication); }
+                Ok(Some(value))
+            }
+            _ => Ok(None),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = home; Ok(None) }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
     use std::{fs::OpenOptions, io::Read, os::{fd::{AsRawFd, FromRawFd}, unix::{fs::{FileTypeExt, MetadataExt, OpenOptionsExt}, net::UnixListener}}, path::PathBuf};
     use duduclaw_migration::{import_manifest::MAX_MANIFEST_BYTES, import_receiver::{ImportGrant, ImportedBlob}};
     use crate::migration_import::{GatewayImportWriter, ImportModeGate, serve_import_connection};
+
+    pub(super) fn read_boot_manifest() -> Result<Option<ImportManifest>, Error> {
+        duduclaw_migration::import_manifest::select_boot_manifest(
+            read_manifest(Path::new(IMPORT_MANIFEST))?, read_manifest(Path::new(DURABLE_IMPORT_MANIFEST))?)
+    }
 
     pub(super) fn read_manifest(path: &Path) -> Result<Option<ImportManifest>, Error> {
         match std::fs::symlink_metadata(path) {

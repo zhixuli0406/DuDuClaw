@@ -1,149 +1,122 @@
-# ネイティブ Linux サービスで個人アカウントを接続する
+# ネイティブ Linux の保護サービス
 
-> 以下のインストールとユーザーデータ移行は既存 v1.79.3 サービスの手順です。開発中の更新経路は別の未完成実装です。既存環境を変更する前に[更新とアンインストール](#更新とアンインストール)を確認してください。
+v1.80 の構成では、gateway、AI 社員、文書解析、特権更新を分離します。確認済みの社員には永続的な Linux ID を割り当て、実行ごとにプロセス、ファイルシステム、ネットワークの namespace を作成します。必要な隔離コンポーネントが利用できなければ社員の実行を拒否します。
 
-公式 Linux CLI バイナリには **glibc ≥ 2.31** が必要です。Ubuntu 20.04+、Debian 11+、RHEL/Rocky Linux 9+ をサポートします。古いシステムでは Docker を使用してください。この基準は CLI/gateway（デスクトップ版の CLI sidecar を含む）に適用され、デスクトップ GUI には別途 WebKitGTK などのシステムライブラリが必要です。
+**開発状況：** 署名検証後の未有効化世代の配置、インストーラーから移行への接続、最初の管理者設定、読み取り専用の導入検査、固定パスの協調削除を実装しました。完全な新規導入、署名済み世代の有効化、移行プラットフォーム、gateway の総合準備検査は未完了です。今回 root 実機での導入・削除は検証していません。サービスの `active` や世代の配置だけでは隔離の準備完了を示しません。[実装と検証記録](../../architecture/native-linux-isolation.md)を参照してください。
 
-このモードでは、ネイティブ Linux の「自分の接続」で個人 Google とリモート MCP OAuth を利用できます。gateway は専用の `duduclaw` アカウントで動作し、起動時に root が用意した鍵を受け取ります。通常のユーザーサービスには鍵を渡しません。[個人 Google 接続](google-personal-connections.md)も参照してください。
+## 利用者にとっての変更
 
-## ホストの準備
+- 隔離が必須の場合、社員は gateway のアカウントで実行されません。同じ社員は同時に一つの仕事を実行し、追加の会話やスケジュールは待機します。
+- 社員は自分の CLI ログイントークンを読めます。隔離された実行経路では他の社員の home や gateway の認証情報にアクセスできません。個人接続は所有者が一人の確認済み Personal 社員に限り、Shared 社員は個人認証情報を使えません。
+- 外向き通信は専用プロキシを通り、プライベートネットワーク、ホストの loopback、クラウド metadata を拒否します。公開宛先を制限するドメイン許可リストはありません。プロキシ非対応のツールは接続に失敗します。
+- 信頼できない文書は使い捨ての低権限ワーカーで解析します。ネットワークはなく、サイズ制限付きの入力をファイル記述子で受け取ります。
+- 更新は独立した root サービスと署名済みコンポーネントマニフェストを使います。アーカイブの取得や要求の受理は更新完了を意味しません。
+- v1.79.3 からの移行には新しい認証情報と管理者の確認が必要です。旧アカウント、紐付け、ポリシー、hook、MCP サーバー、スケジュールは、取り込んだだけでは有効になりません。
 
-PID 1 が systemd、単一の cgroup v2 階層を使う Linux が必要です。GNU coreutils、GNU tar、curl、minisign、`getent`、`id`、`useradd`、util-linux の `setpriv` を用意してください。AI セッションやコンテナの外で、人間の運用者が端末から sudo でインストールします。初期 user namespace が必要です。`/proc/self/uid_map` と `/proc/self/gid_map` はそれぞれ `0 0 4294967295` の 1 行だけを含む必要があります（空白幅は任意）。Rootless コンテナや ID を再マッピングした user namespace は拒否します。
+保護は kernel、systemd、gateway、起動サービス、trampoline、egress サービス、更新サービスが信頼できることを前提とします。VM レベルの敵対的マルチテナント隔離やホスト root の侵害への保護ではありません。同じ社員の永続ファイルは実行間で共有します。通常のユーザーインストールにはこの隔離保証がありません。
 
-専用アカウントの uid/gid は 0 以外、シェルは `nologin` または `false` とし、sudo のコマンド権限と linger を与えないでください。`sudo`、`wheel`、`admin`、`adm`、`docker`、`lxd`、`incus`、`libvirt` グループへの所属は禁止です。`systemd-journal` は許可されます。他のサービスとこのアカウントを共用しないでください。鍵を渡す前に、同じ uid のゾンビ以外の全プロセスを終了します。
+## 対象ホストと確認済みテスト
 
-## インストールと起動
+ネイティブ Linux、PID 1 としての systemd、統一 cgroup v2、初期 user namespace が必要です。コンテナ、ID 再マッピング／rootless namespace、cgroup v1／混在構成は拒否します。公式 CLI バイナリは glibc 2.31 以降を必要としますが、この最低条件だけでは隔離のサポートを示しません。
 
-`X.Y.Z` を公開済みバージョンに置き換えてください。`/opt` と全祖先ディレクトリが root 所有で、他のアカウントに書き込みを許さないことを確認します。以下の sudo コマンドは、root 所有・0700 の `/opt` 内の一時ディレクトリに公式アーカイブと `.minisig` を取得し、公開鍵でアーカイブ全体のバイト列を検証してから実行ファイルを展開します。検証済みファイルだけを、その root シェル内で実行します。Linux の配布名は `duduclaw-linux-x64.tar.gz` と `duduclaw-linux-arm64.tar.gz` で、それぞれ同名の `.minisig` が付属します。
+対象ディストリビューションは Ubuntu 22.04、Ubuntu 24.04、Debian 12 です。2026-11-05 の **パッケージ単位** root テスト記録は次のとおりです。
+
+| ディストリビューション | テストした kernel | systemd | Landlock ABI | 結果 |
+| --- | --- | --- | --- | --- |
+| Ubuntu 22.04 | 5.15.0-1120-gcp | 249.11 | 1 | パッケージテスト 66/66 成功 |
+| Ubuntu 22.04、GCP 既定／HWE | 6.8.0-1070-gcp | 249.11 | 4 | パッケージテスト 66/66 成功 |
+| Ubuntu 24.04 | 6.8.0-1071-gcp | 255.4 | 4 | パッケージテスト 66/66 成功 |
+| Ubuntu 24.04、GCP イメージ既定 | 7.0.0-1014-gcp | 255.4 | 8 | 非対応：trampoline の 16 件すべて拒否、他の 50 件は成功 |
+| Debian 12 | 6.1.0-54-cloud-amd64 | 252.39 | 2 | パッケージテスト 66/66 成功 |
+
+Kernel 7.0 は**現在受け入れられません**。Trampoline は 7 より大きい Landlock ABI を拒否します。ディストリビューションや GCP イメージの名前ではなく、実際に起動した kernel を確認してください。検証には受け入れ可能な kernel 構成を使い、Landlock の無効化や ABI 検査の緩和を行わないでください。上記は完全なインストール、実際のベンダー CLI、完全な移行、更新復旧の検証ではありません。
+
+`getent`、`id`、`useradd`、util-linux、systemd ツール、curl などの信頼できるシステムツールが必要です。社員の loop ストレージには ext4 または XFS、対応する非 thin provisioning の下位デバイス構成、社員のクォータと TCB の予約容量が必要です。不明な構成や容量不足は準備完了を拒否します。外部 IAM／NSS は社員 UID 範囲を永続的に予約する必要があります。
+
+## インストールと準備完了の確認
+
+管理者自身の端末で、AI セッションの外から操作します。x86_64 または aarch64 の完全なリリースを取得し、root 所有で全祖先が他のアカウントに書き込みを許さないステージング領域で検証してから root で実行してください。Linux アーカイブは個別のコンポーネントバイナリを含みます。`duduclaw` だけをコピーしても、この構成はインストールできません。
+
+完全なインストールには次の状態が必要です。
+
+| 項目 | 必要な状態 |
+| --- | --- |
+| システム ID | `duduclaw`、`duduclaw-runsup`、`duduclaw-egress`、`duduclaw-dl`、`duduclaw-dns`。`SYS_UID_MAX` 未満で DynamicUser／社員範囲外の静的 ID |
+| 社員 ID | 永続的な登録、通常 70000–99999。社員の確認後にのみ割り当て |
+| 信頼するプログラム | Gateway、spawnd、trampoline、egress／forwarder／DNS broker、更新サービス／固定ランチャー、解析器、インポーター、移行コマンド、MCP stdio ブリッジ。root 所有の実行ファイル |
+| サービス | Gateway、spawnd socket／service、egress socket／service、任意の DNS broker、更新サービス、parse socket／template、TCB／社員 slice |
+| 解析用 root | `/usr/lib/duduclaw/parse-root` と `/usr/lib/duduclaw/parse-root-tree`。root:root 0755、初期状態は空、ホストデータを置かない |
+| 署名済み状態 | Bootstrap の信頼、互換性のある世代、runtime 登録、更新スロット／状態、移行／準備完了の連携 |
+
+解析器は[インストール参考](../../../crates/duduclaw-parse-worker/README.md)に記載された既知の空マウントポイントを残す場合があります。予期しない内容は調査し、解析用 root を再帰的に削除しないでください。Spawnd が社員の SSH、cron、at、user manager を封鎖し、ホストの実効状態を検証します。検査に通すために制御を緩和しないでください。
+
+インストーラーは固定パスの完全なコンポーネント群を検証してから、アカウント、ディレクトリ、unit を準備します。Linux 配布物には固定更新ランチャーも含まれ、オフラインツールは署名済み情報とファイルから bootstrap inbox を作成できます。独立に認証された `duduclaw-updated --bootstrap-stage` は、コンパイル時の root 指紋、root 閾値署名、target 署名、全ファイルのハッシュを検証し、**未有効化の世代**を配置します。`current` の選択、trust／state／slots の作成、旧版移行の二重署名検証、サービス有効化は行いません。完全な新規導入の手順はまだ提供していません。
+
+`sudo duduclaw service readiness --protected-linux`（`ops` は同じ入口の別名）は、実行ファイル、システムアカウント、ディレクトリ権限、unit 本文、systemd の実際の属性を読み取り専用で検査し、個別に報告します。I1 の総合検査アダプターは未接続のため、`MissingComposite` が必ず拒否し、社員実行を許可しません。カスタム DNS drop-in は未対応で unit 検査を拒否します。すでに新方式で管理される世代の再インストールは、この読み取り専用検査のみを行い、実行ファイルや unit を書き換えません。
+
+## v1.79.3 からの移行
+
+旧バイナリをその場で交換したり、旧データベースを新しい home にコピーしたりしないでください。旧環境は社員と UID を共有するため、旧権限データは信頼できません。インストーラーは v1.79.3 から v1.80 への境界（旧バージョン下限不明を含む）を G の移行処理へ渡し、root 所有の固定計画 `/var/lib/duduclaw-migrate/plan.json` を読みます。計画が欠落・不正なら旧サービス停止前に拒否し、旧方式の上書き更新には戻りません。
+
+管理者の手順は次のとおりです。
+
+1. 公式サイトと認証済みライセンス console の両方から、bootstrap 検証プログラムと移行パッケージの SHA-256、および root metadata の指紋を取得し、一致を確認します。root 所有の 0700 ディレクトリへファイルとして保存し、検証プログラムの実行前にシステムの `sha256sum -c` で照合します。旧アーカイブの署名だけでは新しい信頼を確立できません。ダウンロードを shell へパイプしないでください。
+2. 検証済みインストーラーが bootstrap 署名とプラットフォームを確認し、root 所有の不変な移行計画を作成します。計画を編集して権限や成功証跡を作らないでください。
+3. 移行プログラムは**旧サービスを停止する前に**プラットフォームを検証します。その後、旧起動経路の無効化、旧データの隔離、検証済み暗号化スナップショット、新しい鍵、空の取り込み専用 gateway を準備します。低権限インポーターは既知の内容を制限付きレコードへ変換し、権限データは無効な提案として保存します。
+4. 隔離の検証後、インストーラーの設定手順で新しい管理者を作成します。旧 session、パスワード、MFA、CLI ログイン状態は復元されません。高リスク項目の確認前に MFA を登録します。
+5. **システム → 移行の確認**で完全な値を確認し、承認／拒否、適用失敗の再試行、認証情報の交換を行います。社員 ID とストレージは確認後に割り当て、個人アカウントは新しい所有者として再接続します。
+6. 実際の適用結果を読み戻し、未確認・未交換の項目がなくなって初めて完了します。`AwaitingAdministrator` は管理者待ちです。root 専用の復旧スナップショットは保存期限と復旧検証の条件を満たすまで保持します。
+
+完全に検証済みのインストールでは、既存 runner のインターフェースは次の形です。
 
 ```sh
-sudo /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/sh -eu <<'ROOT'
-version=X.Y.Z
-case "$(uname -m)" in
-  x86_64) asset=duduclaw-linux-x64.tar.gz ;;
-  aarch64|arm64) asset=duduclaw-linux-arm64.tar.gz ;;
-  *) echo 'Unsupported architecture' >&2; exit 1 ;;
-esac
-umask 077
-stage=$(mktemp -d /opt/duduclaw-install.XXXXXXXX)
-trap 'rm -f -- "$stage/$asset" "$stage/$asset.minisig" "$stage/duduclaw"; rmdir -- "$stage"' EXIT
-cd "$stage"
-base="https://github.com/zhixuli0406/DuDuClaw/releases/download/v$version"
-curl -q --proto '=https' --tlsv1.2 -fL "$base/$asset" -o "$asset"
-curl -q --proto '=https' --tlsv1.2 -fL "$base/$asset.minisig" -o "$asset.minisig"
-minisign -Vm "$asset" -x "$asset.minisig" \
-  -P 'RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh'
-tar -xzf "$asset" --no-same-owner --no-same-permissions duduclaw
-chown root:root duduclaw
-chmod 0755 duduclaw
-"$stage/duduclaw" service install --protected-linux --enable-now
-ROOT
-sudo systemctl status duduclaw-gateway.service
-sudo journalctl -u duduclaw-gateway.service -n 100 --no-pager
+sudo /usr/lib/duduclaw/current/duduclaw-migrate run --plan /var/lib/duduclaw-migrate/plan.json
+sudo /usr/lib/duduclaw/current/duduclaw-migrate status --plan /var/lib/duduclaw-migrate/plan.json
 ```
 
-ユーザーが書き込める npm インストール先やホームから sudo で実行しないでください。カーネルが root として起動する前に、AI 社員がプログラムを置き換える可能性があります。実行中ファイルの解決先や祖先が root 所有でない、または非 root が書き込める場合、インストーラーは警告し `--i-verified-this-binary` を要求します。この確認では、すでに root で実行された不正なファイルを安全にできません。上記の検証・展開手順を使用してください。
+これはインターフェース例であり、**端から端まで検証済みの配備手順ではありません**。検証済みインストーラーが固定計画と署名済みプラットフォームを用意する必要があり、完全な導入成果物は未完成です。`duduclaw-migration-platform` がなければ runner は停止前に拒否します。最初の管理者の発行は root 相手を認証する Unix socket と loopback 設定ページへ接続され、token は URL fragment で渡し、アカウントと新しいパスワードを一つのトランザクションで作成します。リモート管理者は該当ポートへの SSH トンネルが必要です。root 所有の `/etc/duduclaw/migration-import.json` は移行モードを永続化し、再起動で `/run` 情報が消えても通常の管理者初期化へ戻ることを防ぎます。これらの接続だけで完全な移行成功とは扱いません。`prepare --stop-after-keys` は意図的にオフライン状態を残すため、アップグレードの近道として使わないでください。
 
-`--enable-now` を省略するとインストールだけを行います。後から `sudo systemctl enable --now duduclaw-gateway.service` で起動できます。ダッシュボードでセットアップを済ませ、「セキュリティ → 認証情報の保護」を有効にしてください。「独立した鍵（AI 社員は読み取れません）」を確認してから個人アカウントを接続します。CLI プロセスには gateway の鍵を渡さないため、端末の認証情報ステータスは gateway の状態を示しません。
-
-root 所有の実行ファイルは `/opt/duduclaw/bin/duduclaw`、組み込みランチャーの配置先は `/usr/local/libexec/duduclaw/protected-launcher`、ユニットは `/etc/systemd/system/duduclaw-gateway.service` です。データは `/var/lib/duduclaw/.duduclaw`、ルートキーは `/var/lib/duduclaw-protected/root.key`（root:root、0400、リンク数 1、32 バイト）に置きます。ユニットは `KillMode=control-group` を使用し、システムを読み取り専用にしてデータと鍵のディレクトリだけを書き込み可能にします。
-
-## ユーザーインストールから移行する
-
-旧データをバックアップし、旧 gateway を停止します。旧ユーザーサービスの所有者として実行してください。
-
-```sh
-systemctl --user stop duduclaw.service
-systemctl --user disable duduclaw.service
-sudo /opt/duduclaw/bin/duduclaw service install --protected-linux \
-  --migrate-from "$HOME/.duduclaw" --enable-now
-```
-
-先に上記の検証済みインストールを完了してください。初回起動前に移行する場合、インストール時は `--enable-now` を省略します。新 gateway がすでにデータを作成した場合はバックアップを保持し、置き換え時に `--force-migrate` を明示してください。移行は元のユーザー自身の端末から実行し、root ログインシェルは使いません。`SUDO_UID` と `SUDO_GID` は存在し、有効かつ 0 以外である必要があります。`getpwuid` でその UID のホームを取得し、その `.duduclaw` だけを受け入れます。指定パスの正規化結果が一致し、全ソースディレクトリとファイルが `SUDO_UID` の所有である必要があります。`/var/lib/duduclaw-protected`、`/var/lib/duduclaw`、`/etc`、`/root`、`/proc`、`/sys` 以下は拒否します。ファイル記述子を固定する `openat` の走査では、祖先も含めシンボリックリンクを拒否します。
-
-インストーラーが別ユーザーの代わりに最初の 2 コマンドを実行することはありません。そのディレクトリを `/var/lib/duduclaw/.duduclaw` にコピーし、専用アカウントの所有にします。移行先が存在する場合は `--force-migrate` を明示しない限り拒否します。`--force-migrate` は旧移行先を `/var/lib/duduclaw/.duduclaw.previous-<UUID>` として保持します。シンボリックリンク、ハードリンク、特殊ファイルは拒否します。置き換える前にシステムサービスを停止し、バックアップを保存してください。設定内の絶対パスも確認します。`ProtectHome=yes` により旧ユーザーのホーム以下にはアクセスできません。
-
-認証情報の保護を再設定し、各利用者に個人 Google とリモート MCP を再接続してもらってください。旧暗号文は別の鍵に結び付いており、新環境の鍵では復号できません。AI runtime は root 管理のシステムパスに配置してください。旧ユーザーの CLI、ログインファイル、シェル起動ファイルは自動的には引き継ぎません。
+レビューページには有効な Admin session、パスワード、登録済み認証アプリの新しいコードが必要です。認可は session に紐付き、五分間有効です。高リスク項目は個別承認が必要で、一括承認は低リスクに限ります。承認と適用成功は別の状態です。未対応カテゴリはブロックしたまま、対応する手順で再入力します。旧保留承認が新しい認可に変わることはありません。
 
 ## 更新とアンインストール
 
-**開発ブランチ：保護された更新はまだ導入できません。** ダッシュボードと CLI は、独立した root 更新サービスへ要求を送る方式に変わりました。隔離移行パッケージによるサービス、アカウント、信頼ルートの準備が必要です。v1.79.3 の実行ファイルや timer だけを置き換えても準備は完了しません。
-
-Admin はダッシュボードから新しい安定版を要求し、永続化された要求 ID で結果を追跡できます。CLI ではバージョンの明示が必要です。
+移行と更新サービスの完全な準備後、Admin はダッシュボードで安定版を要求するか、インストール済み CLI を使います。
 
 ```sh
-sudo duduclaw service upgrade --protected-linux --version X.Y.Z
+sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux --version X.Y.Z
 ```
 
-更新サービスの socket に渡すのはバージョンと要求 ID だけです。呼び出し側はパス、URL、コマンド、信頼鍵を指定できません。サービスは相手の身分、署名付きマニフェスト、ファイルのハッシュ、アーキテクチャ、有効期限、バージョン下限と連番を検証します。受理、ダウンロード、ステージングはインストール成功を意味しません。応答が途切れてもダッシュボードは ID を保持して追跡し、`committed` だけを成功として表示します。サービスに接続できない場合、旧インストーラには戻りません。
+更新境界を通るのはバージョンと要求 ID だけです。サービスは署名済み metadata、ハッシュ、プラットフォーム、期限、バージョン下限、通し番号を検証し、完全な世代へ切り替え、実際のバージョン／プロトコルを読み戻してから commit します。再起動後も同じ要求を追跡し、`committed` だけを成功とします。サービス、信頼、準備完了情報がなければ拒否し、旧インストーラーを呼びません。通常の更新では降格できず、緊急ロールバックには別の署名認可が必要です。
 
-Linux アダプタは世代を切り替え、固定サービスを再起動し、実際のバージョン・プロトコル・実行ファイルを照合した後に下限を更新します。中断された処理を再開し、準備完了を確認できない場合は作業受付を閉じたままにします。パッケージ間の排出・移行／runtime・準備完了エンドポイントの接続は必要で、不足すれば更新を拒否します。移行 bootstrap の二重署名手順、実物の FIDO2 署名、Linux 実機の更新受け入れ試験も未完了です。このソースの無人更新を有効にしないでください。
+削除入口は `sudo duduclaw service uninstall --protected-linux` です。隔離環境では unit を `/var/lib/duduclaw-protected/uninstall-units` に保存し、永続的な `/etc` mask を作成して読み戻し、timer、socket、サービスを停止します。停止済み unit、既知の空 cgroup、サービス／社員プロセスがないこと、既知のストレージ root にマウントがないことを確認した後で、固定パスの実行ファイルだけを削除します。強制・lazy unmount は行いません。鍵、データ、システムアカウント、永続 UID 対応、更新状態／世代、バージョン下限は復旧用に保持し、mask は自動再起動を防ぐため残します。H の任意カスタムストレージ root アダプターは未接続のため、その構成での完全な削除検証ではありません。今回は root 実機で削除していません。旧 uninstaller や保存状態の削除で拒否を回避しないでください。
 
-既存の **v1.79.3 インストール**は、検証済みの固定した v1.79.3 実行ファイルと対応する運用手順を維持してください。その旧版は minisign 署名付きアーカイブを検証し、実行ファイルを原子的に置き換え、稼働中のサービスを再起動します。ダッシュボードは手動更新のみです。root 管理の `version-floor` と `version-pending` は通常のダウングレードを防ぎ、中断した対象を記録します。これらは新しい更新サービスの状態・信頼ストアではありません。
+## 毎晩の自動更新
 
-既存の v1.79.3 のアンインストールコマンドは次のとおりです。
+Timer はホストの現地時間 03:30 に独立した更新サービスへ要求し、最大 20 分のランダムな遅延を加えます。`Persistent=false` により、夜間に停止していた場合でも朝の起動時に補完実行しません。固定 helper は `/usr/libexec/duduclaw-updated-launch --check-latest` を呼び、`--dry-run` では候補だけを調べて Apply を送信しません。
+
+候補検索は `duduclaw-dl` で実行します。未署名のリリース索引は非 draft の安定版候補を選ぶだけで、root サービスは署名済みマニフェストを検証します。要求側は取得したプログラムをインストールせず、旧方式へ戻りません。完全な更新サービスと信頼状態を導入・検証した後にのみ予定を有効化してください。開発中の helper を v1.79.3 にコピーしないでください。移動する `main` ではなく、レビュー済みの固定版 [timer インストーラー](../../../scripts/linux-protected/auto-upgrade/README.md)を使用します。
+
+## 準備完了エラーの調査
+
+次のコマンドはインストール済みコンポーネントの調査用であり、完全なインストールを認証するものではありません。
 
 ```sh
-sudo /opt/duduclaw/bin/duduclaw service uninstall --protected-linux
+sudo duduclaw service readiness --protected-linux
+sudo /usr/lib/duduclaw/duduclaw-spawnd --check
+sudo systemctl status duduclaw-gateway.service duduclaw-spawnd.service duduclaw-egress.service duduclaw-updated.service
+sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duduclaw-egress.service -u duduclaw-updated.service -n 100 --no-pager
 ```
 
-旧システムサービスを停止・無効化し、unit、実行ファイル、ランチャーを削除します。root 鍵を含む `/var/lib/duduclaw` と `/var/lib/duduclaw-protected` は**削除せず**、旧バージョン下限と保留記録だけを除去します。このコマンドを新しい隔離インストールの削除・復旧手順として使わないでください。導入前に、移行パッケージによる新環境の移行・復旧手順が必要です。
+| 症状 | 対応 |
+| --- | --- |
+| `UnsupportedKernel` | 起動 kernel と Landlock ABI を確認。ABI 8／kernel 7.0 は現在拒否するため、検査を維持する。 |
+| 準備情報が欠落、古い、非互換 | 完全な世代、プロトコル、アカウント登録、全サービスを確認。`active` だけでは不十分。 |
+| UID／アカウント／SSH／IAM 失敗 | 予約範囲の衝突、別名、補助グループ、ログイン／cron／at、linger を解決。外部 IAM の予約には管理者の証跡が必要。 |
+| ストレージ／クォータ失敗 | 下位デバイス構成、強制クォータ、空き容量、ホスト予約容量を確認。ディスク使用量ポーリングで代替しない。 |
+| DNS／egress 失敗 | root が選んだ resolved Varlink／DNS broker 経路を確認。egress に私設 resolver IP の例外を追加しない。 |
+| 解析 root 失敗 | 両 root の所有者、モード、予期しない内容を調査。ホスト `/etc` やデータをコピーしない。 |
+| 移行プラットフォーム／設定リンクなし | 既存環境を保持し、完全な検証済み連携を取得。旧権限データのコピーや移行ゲート迂回をしない。 |
+| 確認／交換待ち | 移行の確認で対応項目の確認、再試行、新しい認証情報設定を完了。承認だけでは移行完了にならない。 |
+| 更新受理済みだが未 committed | 永続的な要求状態と準備エラーを追跡し、手動バイナリ交換を並行実行しない。 |
 
-## 自動更新（開発用のみ）
-
-現在の `scripts/linux-protected/auto-upgrade/` は既存 timer の時刻を維持します。現地時刻 03:30 に最大 20 分のランダムな遅延を加え、`Persistent=false` により朝の起動時に未実行分を補いません。helper は固定の root 管理コマンド `/usr/libexec/duduclaw-updated-launch --check-latest` を呼びます。`--dry-run` は候補の照会だけを行い、Apply を送りません。
-
-候補照会は非特権の `duduclaw-dl` アカウントで curl を実行し、継承した設定を消去します。API 応答は 1 MiB 以下で、JSON 全体を解析します。最新リリースの記録には `draft=false`、`prerelease=false`、安定版の形式が必要です。未署名の索引は候補の選択にしか使わず、インストールには root サービスによる公式署名付きマニフェストの検証が必要です。同じ版や古い版には要求を送りません。接続、アカウント、状態、サービスの異常は要求を停止し、旧経路には戻りません。要求側 unit のタイムアウトは 6 分で、リリースファイルを書き込みません。
-
-この開発中 helper を v1.79.3 にコピーしたり、timer を有効にしたりしないでください。既存 v1.79.3 の夜間運用では、完全な隔離移行が提供されるまで、以前に確認した固定版 helper を維持してください。運用コードを移動する `main` から取得しないでください。
-
-ソースのインストーラは引き続き root:root 所有、通常ファイル、他者が書き込めない祖先ディレクトリを検査し、symlink と sticky `/tmp` を拒否して root 専用スナップショットからインストールします。この検査はコードの出所を証明しません。将来の導入前にも正確な commit と root 管理のコピーを確認し、ユーザーが書き込める checkout から root インストーラを実行しないでください。[helper README](../../../scripts/linux-protected/auto-upgrade/README.md) を参照してください。
-
-導入済みのスケジュールだけを削除して gateway とデータを残すには、確認済みインストーラのコピーを使います。
-
-```sh
-sudo sh /root/duduclaw-auto-upgrade/install.sh --uninstall
-```
-
-更新が進行中なら timer を無効化した後、削除を拒否します。完了を待って再実行してください。
-
-## 保護範囲と制限
-
-**機能制限：** 保護されたネイティブモードでは、`InaccessiblePaths` でコンテナエンジンを遮断し、`PrivateDevices` でデバイスを隔離します。そのため、コンテナを使うタスクサンドボックス、コンピューター操作、ハードウェアに依存する機能は利用できません。AI 社員がコンテナエンジンにアクセスできないようにするための意図的な制限です。
-
-ランチャーは実行ファイルと全祖先ディレクトリ、自身の配置先が root 所有で他のユーザーに書き込みを許さないことを確認します。アカウントを検査して同 uid の残存プロセスを終了した後に鍵を開き、uid/gid を変更し、補助グループと全 capabilities を削除して `no_new_privs` を設定します。gateway は鍵を受け取る前に non-dumpable にし、systemd の親プロセス、正確な cgroup v2 行 `0::/system.slice/duduclaw-gateway.service`、実行ファイルとプロセスの権限、自身から鍵のパスを開けないことを検証します。ネイティブインストーラー、鍵を開く前のランチャー、Rust の検証はいずれも初期以外の user namespace を拒否します。`/run/.containerenv`、`/run/systemd/container`、PID 1 の環境内の `container=` も拒否理由です。root のインストーラーとランチャーは `/proc/1/environ` を読める必要があり、非特権 gateway は権限不足の場合だけその読み取りを省略できます。コンテナでは従来のコンテナ規則を適用し、モード変数でネイティブ保護を取得することはできません。
-
-既知の Docker／Podman／containerd ソケットは存在しないか、アクセス不能でなければなりません。書き込みアクセス検査と非ブロッキング接続の両方が拒否される必要があります。`DOCKER_HOST` は設定しないでください。独自 slice、cgroup v1／混在方式、想定外の sudo 出力、結果不明の検査はすべて拒否します。理由は journal または認証情報カードに表示されます。権限を緩めて回避しないでください。
-
-ユニットには次の設定も適用します。
-
-```ini
-InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock -/run/containerd -/run/podman -/var/run/podman -/run/user -/run/docker
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-SystemCallArchitectures=native
-```
-
-[systemd.exec](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html) の仕様に従い、各 `-` 接頭辞は存在しないパスを無視します。一般的なエンジンの接続先を隠し、ハードウェアを隔離し、カーネル／モジュール／cgroup の変更と set-ID ファイルの作成を禁止して、実行モードと syscall アーキテクチャを制限します。`RestrictNamespaces` は設定しません。gateway の Codex／bwrap タスクサンドボックスは user、mount、PID、network namespace を必要とします。
-
-起動時と 60 秒ごとに、一般的なエンジンソケットへの到達性と補助グループを検査します。定期検査に失敗すると保持中の鍵をその場でゼロ化し、保護状態を拒否に変更して警告を記録します。個人接続は再起動まで利用できません。`/proc/net/unix` の待ち受け中の abstract socket も検査します。`/` で区切られた名前の要素が `docker`、`containerd`、`podman`、`buildkit`、`lxd` と完全一致するか、その名前の直後に `.`、`-`、`_` が続く場合に候補とします。任意の部分文字列では一致させません。 名前の一致だけでは拒否しません。短いタイムアウトの非ブロッキング接続で `SO_PEERCRED` を取得し、接続できた相手の uid が 0 の場合だけリスクと判断します。到達不能な候補と無関係な行の解析エラーは無視します。鍵の受け取り時に `/proc/net/unix` を読めない場合は拒否します。定期検査中の読み取り失敗では警告を記録し、その検査項目だけ以前の判定を維持します。パスとグループの検査は引き続き実行します。
-
-AI 社員の Bash／ツールは gateway と同じ uid で動作します。保護は non-dumpable、root 所有の鍵とプログラム、sudo／linger がないこと、エンジンソケットへのアクセス拒否に依存します。社員は書き込み可能なデータを変更し、gateway を停止し、許可された操作を要求し、自分のターンで発行されたアクセストークンを読めます。ホストは `duduclaw` アカウントにコンテナエンジンや他の特権ブローカーへのアクセスを与えてはいけません。起動時と毎分の検査は一般的な接続先を対象とし、無条件の隔離を保証しません。未識別名の abstract socket、別パスのエンジンソケット、特権ブローカー、その他の権限昇格経路、ホスト root の侵害、gateway 内ですでに動いている悪意あるコードは対象外です。検査の間に新しいアクセス経路が生じる可能性もあります。実行ファイルの所有者検査はサービス uid による改変を防ぐもので、悪意ある root 管理者が渡すファイルの署名検証ではありません。
-
-この鍵は汎用サンドボックスではありません。鍵を保持する間は gateway 内の ONNX 読み込み禁止も適用され、NER マスキング、ローカル embedding、Kokoro は使えません。必要に応じて正規表現のマスキングを使用してください。データとルートキーの両方を含むバックアップは認証情報を復号できます。ダッシュボードの保護キーだけを替えても旧データの復元は防げません。漏えいが疑われる場合、ホスト管理者はサービスを停止し、安全にルートキーを交換し、保護の再設定とアカウントの再接続を行ってください。
-
-ネイティブ systemd のインストール、sudo の各バージョン、ソケット検査は対象ディストリビューションでの実測が必要です。単体テストや macOS のコンパイル成功を Linux 実機の検証と同一視しないでください。
-
-## v1.80への移行境界（開発中）
-
-旧版の保護インストーラーは、v1.80より前の版からv1.80以降へのバイナリ置換による直接更新を拒否します。プレリリースも対象です。バージョン下限の記録がない場合も拒否し、更新時には実行中の版と記録済みの下限の両方を確認します。v1.80の新規導入には新しいインストーラーが必要です。独立して検証された移行・ブートストラップ処理はまだ接続されていません。この拒否を回避するために旧データベースを新しい環境へコピーしないでください。
-
-管理者は「システム → 移行の確認」を開き、アカウントのセキュリティ画面で二要素認証を登録してから、パスワードと新しい認証コードを入力します。承認前に内容を確認してください。低リスク項目だけ一括承認でき、未適用項目は一括拒否できます。再読み込みで実際の適用結果を確認し、失敗・中断した処理は同じ提案で再試行できます。対応する設定の認証情報は適用後に更新できます。旧値を維持すると移行は未完了のままです。未対応の種類は承認できません。root 移行コマンドと gateway 起動の統合は未リリースです。署名済みインストーラーと Linux 実機検証が完了するまで既存環境で実行しないでください。[実装ノート](../../architecture/native-linux-isolation.md)を参照してください。
-
-未リリースのインポーターに低権限ランチャーと専用の取り込み起動を追加しました。旧アカウントと MCP 設定は確認リストに入り、自動では有効になりません。承認後の stdio MCP とスタッフ指示ファイルは製品の検証・公開・読み戻し処理を使用します。認証情報を含む項目や未対応の項目は再入力が必要、または適用を拒否します。未確認スタッフの内容はアーカイブに保持されます。完全なアップグレードには署名済みプラットフォームの統合と Linux のエンドツーエンド検証が必要です。
-
-スキル、hook、一部のポリシーにも製品の検証と操作に紐づく読み戻しを適用します。通常の編集で置き換えられたファイルや部門は補償で変更しません。旧承認はすべて失効します。Telegram の紐づけ、時刻スケジュール、データベース読み取り権限には Shared スタッフの実際の割り当て検証も必要で、分離基盤の統合がない場合は適用を拒否します。
+保護された社員環境ではコンテナエンジンやホストハードウェア依存の機能を提供しません。作業再開前に全必須コンポーネントの検査が必要です。パッケージテストの成功や本ガイドを本番環境の受け入れ完了とは扱わないでください。

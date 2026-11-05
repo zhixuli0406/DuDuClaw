@@ -5,7 +5,7 @@ use serde::{Serialize,Deserialize};
 use sha2::{Digest,Sha256};
 use super::{RootMigrationIntegration,RootPlan,native_stop::NativeIntegration,Error,Evidence,StageOperation,MigrationState,
     private_dir,publish,read_private,trusted_parents,path_metadata,sync_parent};
-use crate::{root_sources::{self,Source},import_manifest::{ImportManifest,ManifestGrant,PendingProposal,IMPORT_MANIFEST,MAX_MANIFEST_BYTES},
+use crate::{root_sources::{self,Source},import_manifest::{ImportManifest,ManifestGrant,PendingProposal,IMPORT_MANIFEST,DURABLE_IMPORT_MANIFEST,MAX_MANIFEST_BYTES},
     import_receiver::{ImportGrant,ContentClass,StagedImport,send_import_stream},ids::Sha256Digest};
 
 const SOCKET_UNIT:&str="duduclaw-migrate-import.socket";
@@ -77,8 +77,8 @@ fn manifest(plan:&RootPlan)->Result<ImportManifest,Error>{
     let value:ImportManifest=serde_json::from_slice(&read_private(&plan.state_dir.join("import-plan.json"),MAX_MANIFEST_BYTES,0)?)?;
     value.validate()?;if value.migration_id!=plan.migration || value.home!=plan.legacy_home || value.gateway_uid!=plan.gateway_uid {return Err(Error::Conflict);}Ok(value)
 }
-fn runtime_manifest(value:&ImportManifest,gateway_gid:u32)->Result<(),Error>{
-    let path=Path::new(IMPORT_MANIFEST);let dir=path.parent().ok_or(Error::Invalid)?;
+fn publish_boot_manifest(path:&Path,value:&ImportManifest,gateway_gid:u32)->Result<(),Error>{
+    let dir=path.parent().ok_or(Error::Invalid)?;
     trusted_parents(dir)?;
     match fs::create_dir(dir){Ok(())=>fs::set_permissions(dir,fs::Permissions::from_mode(0o755))?,Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>{},Err(e)=>return Err(e.into())}
     path_metadata(dir,true,0)?;
@@ -92,6 +92,31 @@ fn runtime_manifest(value:&ImportManifest,gateway_gid:u32)->Result<(),Error>{
     if unsafe {libc::fchown(stage.as_file().as_raw_fd(),0,gateway_gid)}!=0 {return Err(Error::Storage);}
     stage.as_file().set_permissions(fs::Permissions::from_mode(0o640))?;stage.as_file().sync_all()?;
     stage.persist(path).map_err(|_|Error::Storage)?;sync_parent(path)
+}
+fn runtime_manifest(value:&ImportManifest,gateway_gid:u32)->Result<(),Error>{
+    // Persist before /run: a reboot can never reopen ordinary admin bootstrap.
+    publish_boot_manifest(Path::new(DURABLE_IMPORT_MANIFEST),value,gateway_gid)?;
+    publish_boot_manifest(Path::new(IMPORT_MANIFEST),value,gateway_gid)
+}
+fn ensure_boot_fence(plan:&RootPlan)->Result<(),Error>{
+    let path=Path::new(DURABLE_IMPORT_MANIFEST);
+    match fs::symlink_metadata(path) {
+        Ok(meta)=>{
+            trusted_parents(path)?;path_metadata(path,false,0)?;
+            if meta.len()>MAX_MANIFEST_BYTES || meta.mode()&0o7777!=0o640 {return Err(Error::Invalid);}
+            let bytes=fs::read(path)?;
+            let existing:ImportManifest=serde_json::from_slice(&bytes)?;existing.validate()?;
+            if existing.migration_id!=plan.migration || existing.home!=plan.legacy_home
+                || existing.gateway_uid!=plan.gateway_uid {return Err(Error::Conflict);}
+            Ok(())
+        }
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{
+            let value=ImportManifest{schema_version:1,migration_id:plan.migration,home:plan.legacy_home.clone(),
+                gateway_uid:plan.gateway_uid,grants:vec![],pending_proposals:vec![],completed:false};
+            publish_boot_manifest(path,&value,plan.gateway_gid)
+        }
+        Err(error)=>Err(error.into()),
+    }
 }
 fn worker_shape(source:&Source)->Result<(String,String),Error>{
     let basename=source.relative.file_name().and_then(|s|s.to_str()).ok_or(Error::Invalid)?;
@@ -276,7 +301,8 @@ fn import(plan:&RootPlan)->Result<(),Error>{
 impl<P:MigrationPlatform> RootMigrationIntegration for InstalledIntegration<P> {
     fn preflight(&mut self,plan:&RootPlan)->Result<(),Error>{
         import_layout(plan)?;installed("duduclaw-import")?;installed("duduclaw")?;
-        self.platform.preflight(plan)
+        self.platform.preflight(plan)?;
+        ensure_boot_fence(plan)
     }
     fn gateway_denied_legacy(&mut self,plan:&RootPlan)->Result<bool,Error>{NativeIntegration.gateway_denied_legacy(plan)}
     fn perform(&mut self,op:StageOperation,plan:&RootPlan)->Result<(),Error>{match op.target{

@@ -91,7 +91,7 @@ jobs:
 
       - name: Build binary (cross-compile — skip desktop feature, Wayland unavailable in cross)
         if: runner.os == 'Linux'
-        run: cross build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
+        run: python3 scripts/package-linux-release.py --target ${{ matrix.target }} --build-only
         env:
           PKG_CONFIG_ALLOW_CROSS: 1
 

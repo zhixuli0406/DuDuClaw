@@ -317,22 +317,7 @@ fn cleanup_generations(shared: &Arc<Mutex<Service>>, root: &Directory, generatio
     Ok(())
 }
 pub fn artifact_name(target: &InstallTarget) -> Result<String> {
-    Ok(match target {
-        InstallTarget::Gateway => "duduclaw".into(),
-        InstallTarget::Spawnd => "duduclaw-spawnd".into(),
-        InstallTarget::Trampoline => "duduclaw-run".into(),
-        InstallTarget::Egress => "duduclaw-egress".into(),
-        InstallTarget::EgressForwarder => "duduclaw-egress-forwarder".into(),
-        InstallTarget::McpBridge => "duduclaw-mcp-bridge".into(),
-        InstallTarget::ParseWorker => "duduclaw-work".into(),
-        InstallTarget::Importer => "duduclaw-import".into(),
-        InstallTarget::Migration => "duduclaw-migrate".into(),
-        InstallTarget::UpdateSlot => "duduclaw-updated".into(),
-        InstallTarget::RuntimeEntry { registry_id } => {
-            if registry_id.is_empty() || registry_id.len() > 128 || !registry_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')) { return Err(Error::Invalid); }
-            format!("runtime-{registry_id}")
-        },
-    })
+    crate::publication::artifact_name(target)
 }
 /// Operator-only nightly discovery. The unsigned index only selects a candidate;
 /// Apply still verifies an official manifest and monotonic root-owned floor.

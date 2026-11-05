@@ -5,6 +5,15 @@ use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 #[path = "protected_linux_install.rs"]
 mod linux;
+#[cfg(any(target_os = "linux", test))]
+#[path = "protected_linux_layout.rs"]
+mod layout;
+#[cfg(any(target_os = "linux", test))]
+#[path = "protected_linux_lifecycle.rs"]
+mod lifecycle;
+#[cfg(target_os = "linux")]
+#[path = "protected_linux_migration.rs"]
+mod native_migration;
 #[cfg(target_os = "linux")]
 #[path = "protected_linux_migrate.rs"]
 mod migrate;
@@ -52,6 +61,14 @@ pub(crate) fn uninstall() -> Result<()> {
     operator_gate()?;
     #[cfg(target_os = "linux")]
     { linux::uninstall() }
+    #[cfg(not(target_os = "linux"))]
+    { Err(refused("--protected-linux requires native Linux")) }
+}
+
+pub(crate) fn readiness() -> Result<()> {
+    operator_gate()?;
+    #[cfg(target_os = "linux")]
+    { linux::readiness() }
     #[cfg(not(target_os = "linux"))]
     { Err(refused("--protected-linux requires native Linux")) }
 }

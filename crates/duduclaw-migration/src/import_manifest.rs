@@ -6,6 +6,7 @@ use crate::{Error, import_receiver::ImportGrant};
 use crate::contract::{ConfirmationCategory, ProposalField};
 use crate::ids::RequestId;
 
+pub const DURABLE_IMPORT_MANIFEST: &str = "/etc/duduclaw/migration-import.json";
 pub const IMPORT_MANIFEST: &str = "/run/duduclaw-migrate/manifest.json";
 pub const IMPORT_ONLY_ENV: &str = "DUDUCLAW_MIGRATION_IMPORT_ONLY";
 pub const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
@@ -13,6 +14,20 @@ pub const MAX_AUTHORITY_RECORD_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportBootDecision { Normal, ImportOnly }
+
+/// The durable root-owned copy fences ordinary startup across a reboot. Runtime
+/// state may disappear with /run, but can never override or exist without its
+/// durable counterpart. Publication mismatches refuse until the root retry lands.
+pub fn select_boot_manifest(runtime: Option<ImportManifest>, durable: Option<ImportManifest>)
+    -> Result<Option<ImportManifest>, Error> {
+    for value in [&runtime, &durable].into_iter().flatten() { value.validate()?; }
+    match (runtime, durable) {
+        (None, None) => Ok(None),
+        (None, Some(value)) => Ok(Some(value)),
+        (Some(runtime), Some(durable)) if runtime == durable => Ok(Some(durable)),
+        _ => Err(Error::Authentication),
+    }
+}
 
 /// Decide before any ordinary startup side effect. The Linux caller first loads
 /// and authenticates the root-owned manifest; this function performs no I/O.
@@ -171,4 +186,21 @@ mod tests {
         assert_eq!(boot_decision(None,Some(&complete),home),Ok(ImportBootDecision::Normal));
         assert!(boot_decision(Some(OsStr::new("1")),Some(&complete),home).is_err());
     }
+    #[test]
+    fn migration_boot_fence_survives_runtime_loss_and_refuses_mismatch() {
+        let mut plan = ImportManifest { schema_version: 1, migration_id: RequestId([4;16]),
+            home: PathBuf::from("/var/lib/duduclaw/.duduclaw"), gateway_uid: 991,
+            grants: vec![], pending_proposals: vec![], completed: false };
+        let selected = select_boot_manifest(None, Some(plan.clone())).unwrap().unwrap();
+        assert!(boot_decision(None, Some(&selected), &plan.home).is_err());
+        plan.completed = true;
+        let selected = select_boot_manifest(None, Some(plan.clone())).unwrap().unwrap();
+        assert_eq!(selected.migration_id, plan.migration_id);
+        assert!(selected.completed); // first-admin service stays selected after reboot
+        assert!(select_boot_manifest(Some(plan.clone()), None).is_err());
+        let mut stale = plan.clone(); stale.completed = false;
+        assert!(select_boot_manifest(Some(stale), Some(plan.clone())).is_err());
+        assert_eq!(select_boot_manifest(Some(plan.clone()), Some(plan.clone())).unwrap(), Some(plan));
+    }
+
 }
