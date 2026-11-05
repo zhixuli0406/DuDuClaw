@@ -25,6 +25,8 @@ members = [
     "crates/duduclaw-updated",
     "crates/duduclaw-isolation-storage",
     "crates/duduclaw-mcp-boundary",
+    "crates/duduclaw-migration",
+    "crates/duduclaw-import",
     "crates/duduclaw-auth",
     "crates/duduclaw-gateway",
     "crates/duduclaw-security",

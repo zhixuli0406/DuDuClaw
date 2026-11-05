@@ -234,6 +234,22 @@ impl CronScheduler {
         self.reload_notify.notify_one();
     }
 
+    /// Await the same loader used by the running scheduler and inspect its
+    /// effective cache. Merely signalling reload is insufficient for migration.
+    pub(crate) async fn migration_reload_readback(&self,row:&CronTaskRow,enabled:bool)->Result<(),String> {
+        self.store.list_enabled().await?;
+        self.reload().await;
+        let live=self.tasks.read().await;
+        let found=live.iter().find(|t|t.task.id==row.id);
+        if !enabled {return if found.is_none() {Ok(())} else {Err("schedule remains in live cache".into())};}
+        let task=&found.ok_or("schedule missing from live cache")?.task;
+        if task.name!=row.name || task.agent_id!=row.agent_id || task.cron!=row.cron || task.task!=row.task
+            || task.cron_timezone!=row.cron_timezone || task.on_behalf_of!=row.on_behalf_of || task.trigger_kind!="time" {
+            return Err("effective schedule differs".into());
+        }
+        Ok(())
+    }
+
     /// Trigger a **single immediate execution** of the task with `task_id`
     /// ("run now" / "test execution"). The run goes through the exact same
     /// [`dispatch_cron_task`] path a scheduled fire uses — same trigger gate,

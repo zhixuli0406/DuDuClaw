@@ -427,6 +427,7 @@ mod backup_restore_boot_tests {
 
 /// Start the WebSocket RPC gateway and block until it shuts down.
 pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Result<()> {
+    if crate::migration_startup::maybe_run(&config.home_dir).await? { return Ok(()); }
     // Initialise the log broadcast channel (must happen before subscribers connect).
     let log_tx = crate::log::init_log_broadcaster();
     let tx = log_tx;

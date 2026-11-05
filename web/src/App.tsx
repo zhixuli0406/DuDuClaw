@@ -112,6 +112,7 @@ const DevicePage = lazyPage(() => import('./pages/DevicePage'), 'DevicePage');
 // WP9 (2026-08-04 IA rework): full conversation history + the two management
 // surfaces lifted out of billing / settings + the 進階設定 index.
 const ConversationsPage = lazyPage(() => import('./pages/ConversationsPage'), 'ConversationsPage');
+const MigrationConfirmationsPage = lazyPage(() => import('./pages/MigrationConfirmationsPage'), 'MigrationConfirmationsPage');
 const SystemUpdatePage = lazyPage(() => import('./pages/SystemUpdatePage'), 'SystemUpdatePage');
 const ManageAdvancedPage = lazyPage(() => import('./pages/ManageAdvancedPage'), 'ManageAdvancedPage');
 
@@ -330,6 +331,7 @@ export function App() {
                   <Route index element={<SystemHomePage />} />
                   <Route path="device" element={<DevicePage />} />
                   <Route path="updates" element={<SystemUpdatePage />} />
+                  <Route path="migration" element={<MigrationConfirmationsPage />} />
                   <Route path="accounts" element={<AccountsPage />} />
                   <Route path="security" element={<SecurityPage />} />
                   <Route path="causal" element={<CausalCurationPage />} />

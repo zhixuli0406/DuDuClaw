@@ -139,7 +139,10 @@ pub fn create_department(
         return Err(format!("部門「{name}」已存在"));
     }
     let dir = wiki_departments_root(home_dir).join(name);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("建立部門目錄失敗：{e}"))
+    duduclaw_core::with_file_lock(&dir,|| {
+        if let Some(parent)=dir.parent() {std::fs::create_dir_all(parent)?;}
+        std::fs::create_dir(&dir)
+    }).map_err(|e| format!("建立部門目錄失敗：{e}"))
 }
 
 /// Remove a department. Fail-safe ordering:
@@ -168,16 +171,19 @@ pub fn remove_department(
             info.wiki_pages, info.skills,
         ));
     }
+    let anchor=wiki_departments_root(home_dir).join(name);
+    duduclaw_core::with_file_lock(&anchor,|| {
     for root in [
         wiki_departments_root(home_dir),
         skills_departments_root(home_dir),
     ] {
         let dir = root.join(name);
         if dir.exists() {
-            std::fs::remove_dir_all(&dir).map_err(|e| format!("刪除部門目錄失敗：{e}"))?;
+            std::fs::remove_dir_all(&dir)?;
         }
     }
     Ok(())
+    }).map_err(|e|format!("刪除部門目錄失敗：{e}"))
 }
 
 #[cfg(test)]

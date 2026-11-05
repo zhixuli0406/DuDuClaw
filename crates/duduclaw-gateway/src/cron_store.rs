@@ -439,43 +439,7 @@ impl CronStore {
     /// Insert a new row. Fails if `id` already exists.
     pub async fn insert(&self, row: &CronTaskRow) -> Result<(), String> {
         let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO cron_tasks
-                (id, name, agent_id, cron, task, enabled,
-                 created_at, updated_at, last_run_at, last_status, last_error,
-                 run_count, failure_count,
-                 notify_channel, notify_chat_id, notify_thread_id,
-                 cron_timezone,
-                 trigger_kind, condition_script, condition_state, watch_command, on_behalf_of)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
-            params![
-                row.id,
-                row.name,
-                row.agent_id,
-                row.cron,
-                row.task,
-                if row.enabled { 1 } else { 0 },
-                row.created_at,
-                row.updated_at,
-                row.last_run_at,
-                row.last_status,
-                row.last_error,
-                row.run_count,
-                row.failure_count,
-                row.notify_channel,
-                row.notify_chat_id,
-                row.notify_thread_id,
-                row.cron_timezone,
-                row.trigger_kind,
-                row.condition_script,
-                row.condition_state,
-                row.watch_command,
-                row.on_behalf_of,
-            ],
-        )
-        .map_err(|e| format!("insert cron task: {e}"))?;
-        Ok(())
+        insert_cron_row(&conn,row)
     }
 
     /// Update the editable fields of a task (name, agent_id, cron, task, enabled).
@@ -1258,3 +1222,47 @@ mod tests {
     }
 
 }
+
+// Shared writer used by ordinary creation and migration transactions.
+fn insert_cron_row(conn:&Connection,row:&CronTaskRow)->Result<(),String> {
+        conn.execute(
+            "INSERT INTO cron_tasks
+                (id, name, agent_id, cron, task, enabled,
+                 created_at, updated_at, last_run_at, last_status, last_error,
+                 run_count, failure_count,
+                 notify_channel, notify_chat_id, notify_thread_id,
+                 cron_timezone,
+                 trigger_kind, condition_script, condition_state, watch_command, on_behalf_of)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+            params![
+                row.id,
+                row.name,
+                row.agent_id,
+                row.cron,
+                row.task,
+                if row.enabled { 1 } else { 0 },
+                row.created_at,
+                row.updated_at,
+                row.last_run_at,
+                row.last_status,
+                row.last_error,
+                row.run_count,
+                row.failure_count,
+                row.notify_channel,
+                row.notify_chat_id,
+                row.notify_thread_id,
+                row.cron_timezone,
+                row.trigger_kind,
+                row.condition_script,
+                row.condition_state,
+                row.watch_command,
+                row.on_behalf_of,
+            ],
+        )
+        .map_err(|e| format!("insert cron task: {e}"))?;
+        Ok(())
+}
+
+#[path="cron_store_migration.rs"]
+mod migration;

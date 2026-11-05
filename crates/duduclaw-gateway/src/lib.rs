@@ -36,6 +36,8 @@ pub mod isolation_resources;
 pub mod isolation_connectors;
 pub mod isolation_connector_clients;
 pub mod isolation_execution;
+pub mod migration_import;
+pub mod migration_startup;
 
 // The live-test seams (in-memory credential protection, Google REST base
 // override) must never reach a shipped binary.

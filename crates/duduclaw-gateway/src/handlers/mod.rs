@@ -529,6 +529,14 @@ impl MethodHandler {
             return enterprise_only_reject_frame();
         }
 
+        // Migration review is gateway-owned; plugins cannot replace its gates.
+        if method.split('.').take(2).eq(["migration", "confirmations"]) {
+            if let Err(error) = acl::require_role(ctx, UserRole::Admin) {
+                return WsFrame::error_response("", &error);
+            }
+            return self.handle_migration_confirmations(method, params, ctx).await;
+        }
+
         // MFA is a gateway-owned authentication namespace, never delegated to
         // plugins. Every allowed method has an explicit authorization entry.
         if method.split('.').next() == Some("mfa") || matches!(method, "users.mfa_reset" | "users.mfa_enrollment_code") {
@@ -587,3 +595,6 @@ impl MethodHandler {
 }
 
 mod mfa_rpc;
+mod migration_confirmations_rpc;
+mod migration_authority;
+pub(crate) use migration_authority::stage_import_proposals;

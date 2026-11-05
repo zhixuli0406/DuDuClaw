@@ -117,6 +117,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | Document | Description | Status |
 |----------|-------------|--------|
 | [architecture/native-linux-isolation.md](architecture/native-linux-isolation.md) | Native Linux isolation implementation: Package C egress, DNS and integration seams (internal; not enabled) | In development |
+| [architecture/native-linux-isolation.md](architecture/native-linux-isolation.md) | Native Linux isolation implementation boundaries and package G integration status | In development |
 | [architecture/overview.md](architecture/overview.md) | System architecture overview | Current |
 | [architecture/native-linux-isolation.md](architecture/native-linux-isolation.md) | Native execution backends and spawn inventory; integration incomplete | Unreleased |
 | [architecture/native-linux-isolation.md](architecture/native-linux-isolation.md) | Native Linux isolation implementation boundaries and pending acceptance | In development |
