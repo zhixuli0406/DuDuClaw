@@ -2997,6 +2997,38 @@ or proof that the eventual protected boot has supplied every operation factory.
 No commits, merges, deployment or production-data changes were made.
 ## Package G — migration from v1.79.3
 
+### Migration security correction (2026-11-05)
+
+The migration security patch separates `ContentArchived` (authenticated streams
+persisted, no content claim) from `ContentImported` after administrator decisions.
+Root resumes confirmed employees in batches, binding all product writes and blob
+copies to proposal operation/digest and a live confirmed allocation. Per-record
+materialization, blob-copy and readback receipts are durable; a crash repeats the
+same identity and cannot rebind to another allocation. The dashboard reports
+rejected employees as not migrated. Rejected plaintext archive payloads are
+securely deleted before their terminal receipts; originals remain in the encrypted
+snapshot until expiry. Details and the additional signed-platform allocation
+protocol are in [the migration README](../../crates/duduclaw-migration/README.md#post-confirmation-content-and-recovery).
+
+Cleanup requires all proposals and all accepted records to be terminal even past
+the deadline. With a verified snapshot it removes `legacy` and extracted streams
+early, retaining encrypted recovery until expiry. Key readback atomically removes
+`fresh-keys`, retaining only non-secret digests and receipts. Legacy archive-only
+Complete journals are corrected, while old manifests lacking the v2 inventory
+seal refuse cleanup because their attachment/work-product inventory is incomplete.
+
+Authority adapters now commit intents before external calls and CAS receipts
+outside any SQLite writer transaction. One 30-second deadline covers the async
+bridge and nested synchronous product file-lock waits, including publication and
+compensation after async calls return.
+
+This is component implementation, not native deployment acceptance. The signed
+`duduclaw-migration-platform` executable and production Employee allocation backend
+are still absent from this worktree; the new materialization path requires their
+live stopped-process, UID, mount and quota proof. Gateway/CLI were not built in
+this security task, and real Linux root materialization remains unverified.
+The prior round notes below are historical evidence, not this patch's test results.
+
 ### Round 3b status (2026-11-05)
 
 Phase 1 completed: inspected the inherited tracked diff and untracked Package G

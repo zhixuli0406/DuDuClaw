@@ -159,7 +159,7 @@ impl ProfilePlan {
         let path=agent_files::file_path(home,&self.agent,&key).map_err(|_|Error::Invalid)?;
         let current=agent_files::read_or_empty(&path).map_err(|_|Error::Storage)?;
         if current==*after {return if rollback||self.owns(home,&key) {Ok(())}else{Err(Error::Stale)};}if current!=*before || (rollback&&!self.owns(home,&key)) {return Err(Error::Stale);}
-        live.handle.block_on(async {
+        bounded(&live.handle,async {
             tokio::time::timeout(std::time::Duration::from_secs(30),async {
                 let fresh=flow::require_live_agent_access(home,&live.context,&self.agent,duduclaw_auth::AccessLevel::Owner).map_err(|_|Error::Denied)?;
                 if !fresh.is_admin() {return Err(Error::Denied);}
@@ -174,7 +174,7 @@ impl ProfilePlan {
                 let result=flow::save(&caller,input).await.map_err(|_|Error::Apply)?;
                 if matches!(result.get("status").and_then(serde_json::Value::as_str),Some("applied"|"unchanged")) {Ok(())}else{Err(Error::Apply)}
             }).await.map_err(|_|Error::Apply)?
-        })
+        })?
     }
     pub(super) fn publish(&self,home:&Path,live:&LiveAuthority)->Result<()> {self.apply(home,live,false)}
     pub(super) fn read_back(&self,home:&Path,live:&LiveAuthority,rollback:bool)->Result<()> {
@@ -182,13 +182,13 @@ impl ProfilePlan {
         let key=crate::agent_files::FileKey::parse(&self.key).map_err(|_|Error::Invalid)?;
         let path=crate::agent_files::file_path(home,&self.agent,&key).map_err(|_|Error::Invalid)?;
         if crate::agent_files::read_or_empty(&path).map_err(|_|Error::Storage)?!=*expected || (!rollback&&!self.owns(home,&key)) {return Err(Error::Apply);}
-        live.handle.block_on(async {
+        bounded(&live.handle,async {
             let mut registry=live.registry.write().await;registry.scan().await.map_err(|_|Error::Apply)?;
             let agent=registry.get(&self.agent).ok_or(Error::Apply)?;
             let actual=match self.key.as_str() {"soul"=>agent.soul.as_deref(),"identity"=>agent.identity.as_deref(),"instructions"=>agent.instructions.as_deref(),
                 "contract"=>{let contract:duduclaw_agent::contract::Contract=toml::from_str(expected).map_err(|_|Error::Apply)?;if serde_json::to_value(&contract).map_err(|_|Error::Apply)?!=serde_json::to_value(&agent.contract).map_err(|_|Error::Apply)? {return Err(Error::Apply);}return Ok(());},_=>return Err(Error::Invalid)};
             if actual.unwrap_or("")!=expected {return Err(Error::Apply);}Ok(())
-        })
+        })?
     }
     pub(super) fn disable(&self,home:&Path,live:&LiveAuthority)->Result<()> {self.apply(home,live,true)?;self.read_back(home,live,true)}
 }

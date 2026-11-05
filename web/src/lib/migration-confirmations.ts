@@ -12,6 +12,7 @@ export interface ConfirmationItem {
   high_risk: boolean;
   apply_available: boolean;
   rotation_pending: boolean;
+  content_status?: 'not_migrated_rejected' | 'awaiting_materialization' | 'migrated';
   fields: Array<{ name: string; value: { kind: 'text'; value: string } | { kind: 'secret_fingerprint'; keyed_fingerprint: number[]; needs_rotation: boolean } }>;
 }
 export interface ConfirmationList {

@@ -8,7 +8,7 @@ pub(super) fn grant_plan(home:&Path,item:&ConfirmationItem,live:&LiveAuthority)-
     let agent=text(item,"employee_id")?;let source=text(item,"name")?;
     if !duduclaw_core::is_valid_agent_id(agent) || text(item,"grants")?!="read_only" || item.fields.iter().any(|f|f.name=="settings") {return Err(Error::Invalid);}
     let path=home.join("agents").join(agent).join("agent.toml");validate_parents(home,&path)?;regular(&path)?;
-    let normalized=live.handle.block_on(crate::db_source_grants::validate_capability_grants(home,&serde_json::json!([source]))).map_err(|_|Error::Denied)?;
+    let normalized=bounded(&live.handle,crate::db_source_grants::validate_capability_grants(home,&serde_json::json!([source])))?.map_err(|_|Error::Denied)?;
     if normalized!=vec![source.to_string()] {return Err(Error::Invalid);}
     let before=read_optional(&path)?;let mut table:toml::Table=before.parse().map_err(|_|Error::Invalid)?;
     let config: duduclaw_core::types::AgentConfig=toml::Value::Table(table.clone()).try_into().map_err(|_|Error::Invalid)?;
@@ -28,8 +28,8 @@ impl GrantPlan {
         let current=read_optional(&path)?;
         if current==*target {return if rollback||self.owns(home) {Ok(())} else {Err(Error::Stale)};}
         if current!=*expected || (rollback&&!self.owns(home)) {return Err(Error::Stale);}
-        if !rollback {live.handle.block_on(crate::db_source_grants::validate_capability_grants(home,&serde_json::json!([self.source]))).map_err(|_|Error::Denied)?;}
-        live.handle.block_on(async {
+        if !rollback {bounded(&live.handle,crate::db_source_grants::validate_capability_grants(home,&serde_json::json!([self.source])))?.map_err(|_|Error::Denied)?;}
+        bounded(&live.handle,async {
             let mut meta=crate::agent_files::writer::CommitMeta::new(&live.context.user_id,"migration.confirmations");meta.approval_id=Some(self.receipt.clone());
             let outcome=crate::agent_files::writer::commit(&live.registry,crate::agent_files::writer::Commit {home,agent_id:&self.agent,key:crate::agent_files::FileKey::AgentToml,
                 expected_hash:Some(&config_commit::content_hash(expected)),meta,baseline:crate::agent_files::writer::Baseline::Accept},
@@ -39,19 +39,19 @@ impl GrantPlan {
                     Ok(())
                 }).await.map_err(|_|Error::Apply)?;
             if !outcome.registry_reloaded {return Err(Error::Apply);}Ok(())
-        })
+        })?
     }
     pub(super) fn publish(&self,home:&Path,live:&LiveAuthority)->Result<()> {self.apply(home,live,false)}
     pub(super) fn read_back(&self,home:&Path,live:&LiveAuthority,rollback:bool)->Result<()> {
         let expected=if rollback {&self.before} else {&self.after};
         if read_optional(&home.join("agents").join(&self.agent).join("agent.toml"))?!=*expected || (!rollback&&!self.owns(home)) {return Err(Error::Apply);}
-        if !rollback {live.handle.block_on(crate::db_source_grants::validate_capability_grants(home,&serde_json::json!([self.source]))).map_err(|_|Error::Apply)?;}
+        if !rollback {bounded(&live.handle,crate::db_source_grants::validate_capability_grants(home,&serde_json::json!([self.source])))?.map_err(|_|Error::Apply)?;}
         let disk=duduclaw_core::agent_toml::load(&home.join("agents").join(&self.agent));
         if disk.capabilities.db_source_granted(&self.source)==rollback {return Err(Error::Apply);}
-        live.handle.block_on(async {
+        bounded(&live.handle,async {
             let mut reg=live.registry.write().await;reg.scan().await.map_err(|_|Error::Apply)?;
             if reg.get(&self.agent).ok_or(Error::Apply)?.config.capabilities.db_source_granted(&self.source)==rollback {return Err(Error::Apply);}Ok(())
-        })
+        })?
     }
     pub(super) fn disable(&self,home:&Path,live:&LiveAuthority)->Result<()> {self.apply(home,live,true)?;self.read_back(home,live,true)}
 }

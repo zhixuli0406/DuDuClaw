@@ -5,6 +5,7 @@ pub mod journal;
 pub mod confirmation;
 pub mod import_receiver;
 pub mod import_manifest;
+pub mod materialization;
 #[cfg(any(target_os = "linux", test))]
 mod import_profile;
 #[cfg(target_os = "linux")]
@@ -22,6 +23,7 @@ pub mod snapshot;
 /// Opaque failures, safe for logs: never expose old data or secret values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
+    #[error("migration waiting for administrator confirmation")] AwaitingConfirmation,
     #[error("migration storage unavailable")] Storage,
     #[error("migration input rejected")] Invalid,
     #[error("legacy source rejected by isolated parser")] SourceRejected,

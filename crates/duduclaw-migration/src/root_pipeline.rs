@@ -18,6 +18,9 @@ const INSTALLED:&str="/usr/lib/duduclaw/current";
 /// dashboard parameter, executable from the legacy tree or arbitrary shell text.
 pub trait MigrationPlatform {
     fn preflight(&mut self,plan:&RootPlan)->Result<(),Error>;
+    /// Must return a live, stopped allocation bound to the approved operation.
+    fn allocation(&mut self, _plan:&RootPlan, _item:&crate::contract::ConfirmationItem)
+        ->Result<crate::materialization::ConfirmedAllocation,Error>{Err(Error::Unavailable)}
     fn perform(&mut self,op:StageOperation,plan:&RootPlan)->Result<(),Error>;
     fn readback(&mut self,op:StageOperation,plan:&RootPlan)->Result<Option<Evidence>,Error>;
 }
@@ -31,6 +34,8 @@ struct PlatformCall<'a> { version:u16, action:&'a str, operation:Option<StageOpe
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PlatformReply { version:u16,ready:bool,evidence:Option<Evidence> }
+#[path = "root_materialization.rs"]
+mod materialize;
 fn installed(name:&str)->Result<PathBuf,Error> {
     let path=fs::canonicalize(Path::new(INSTALLED).join(name))?;
     trusted_parents(&path)?;
@@ -55,6 +60,9 @@ fn platform_call(action:&str,operation:Option<StageOperation>,plan:&RootPlan)->R
     if reply.version!=1 || !reply.ready {return Err(Error::Unavailable);}Ok(reply)
 }
 impl MigrationPlatform for InstalledPlatform {
+    fn allocation(&mut self,plan:&RootPlan,item:&crate::contract::ConfirmationItem)->Result<crate::materialization::ConfirmedAllocation,Error>{
+        materialize::installed_allocation(plan,item)
+    }
     fn preflight(&mut self,plan:&RootPlan)->Result<(),Error>{platform_call("preflight",None,plan)?;Ok(())}
     fn perform(&mut self,op:StageOperation,plan:&RootPlan)->Result<(),Error>{platform_call("perform",Some(op),plan)?;Ok(())}
     fn readback(&mut self,op:StageOperation,plan:&RootPlan)->Result<Option<Evidence>,Error>{Ok(platform_call("readback",Some(op),plan)?.evidence)}
@@ -65,7 +73,7 @@ impl Default for InstalledIntegration<InstalledPlatform> {fn default()->Self{Sel
 impl<P:MigrationPlatform> InstalledIntegration<P> {pub fn new(platform:P)->Self{Self{platform}}}
 #[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ImportReceipt { complete:bool,proposal_count:u64,pending_count:u64,expired_approvals:u64,authority_inactive:bool,imported_streams:u64,imported_records:u64 }
+struct ImportReceipt { complete:bool,archived_complete:bool,proposal_count:u64,pending_count:u64,expired_approvals:u64,authority_inactive:bool,archived_streams:u64,archived_records:u64,imported_records:u64 }
 fn control(plan:&RootPlan,args:&[&str])->Result<String,Error>{super::native_stop::checked(plan,"systemctl",args)}
 fn inactive(plan:&RootPlan)->Result<bool,Error>{
     for unit in [SERVICE_UNIT,SOCKET_UNIT] {
@@ -173,10 +181,11 @@ fn worker_shape(source:&Source)->Result<(String,String),Error>{
 }
 fn class(kind:&str)->Result<ContentClass,Error>{Ok(match kind{
     "memory_text"|"memory_sqlite"=>ContentClass::Memory,"sessions_sqlite"|"conversation_text"=>ContentClass::Conversation,
+    "attachment"=>ContentClass::Attachment,"work_product"=>ContentClass::WorkProduct,
     "wiki_text"=>ContentClass::WikiPage,"task_archive"=>ContentClass::TaskHistory,"audit_archive"=>ContentClass::LegacyAuditArchive,_=>return Err(Error::Invalid),
 })}
 fn prepare_sources(plan:&RootPlan)->Result<(),Error>{
-    if plan.state_dir.join("import-plan.json").try_exists()? {manifest(plan)?;return Ok(());}
+    if plan.state_dir.join("import-plan.json").try_exists()? {materialize::verify_inventory(plan)?;return Ok(());}
     let root=root_sources::open_root(&plan.state_dir.join("legacy"))?;
     let inventory=root_sources::inventory(&root)?;
     let streams=plan.state_dir.join("streams");private_dir(&streams)?;
@@ -207,7 +216,7 @@ fn prepare_sources(plan:&RootPlan)->Result<(),Error>{
             }
         }else{None};
         let request=serde_json::json!({"version":1,"migration_id":plan.migration,"employee":source.agent.as_ref().map(|a|root_sources::employee_id(plan.migration,a)),
-            "source_id":id,"kind":kind,"title":title,"legacy_agent":source.agent,"has_wal":wal.is_some(),"blob_handle":null});
+            "source_id":id,"kind":kind,"title":title,"legacy_agent":source.agent,"has_wal":wal.is_some(),"blob_handle":if matches!(source.kind.as_str(),"attachment"|"work_product"){Some(materialize::blob_handle(plan.migration,&id))}else{None}});
         let mut fds=vec![&file];if let Some(wal)=&wal{fds.push(wal);}
         let bytes=match crate::import_launcher::launch_protected(&worker,&serde_json::to_vec(&request)?,&fds,&[&plan.legacy_home,&plan.state_dir]) {
             Ok(bytes)=>bytes,
@@ -235,7 +244,7 @@ fn prepare_sources(plan:&RootPlan)->Result<(),Error>{
                 records:bytes.split_inclusive(|b|*b==b'\n').count() as u64,stream_sha256:Sha256Digest(Sha256::digest(&bytes).into())};
             StagedImport::receive(grant.clone(),bytes.as_slice(),true)?;
             publish(&streams.join(&id),&bytes,0,0,false)?;
-            result.grants.push(ManifestGrant{grant,target_agent:None});
+            result.grants.push(ManifestGrant{grant,target_agent:None,materialization:None,blob_receipts:vec![]});
         }
         result.validate()?;
     }
@@ -244,6 +253,9 @@ fn prepare_sources(plan:&RootPlan)->Result<(),Error>{
     let encoded=serde_json::to_vec(&result)?;if encoded.len() as u64>MAX_MANIFEST_BYTES{return Err(Error::Limit);}
     publish(&plan.state_dir.join("source-inventory.json"),&serde_json::to_vec(&inventory)?,0,0,false)?;
     publish(&plan.state_dir.join("source-rejections.json"),&serde_json::to_vec(&rejected)?,0,0,false)?;
+    // Version 2 inventories include attachment and work-product streams. Old
+    // archive-only manifests cannot authorize deletion of unenumerated blobs.
+    materialize::seal_inventory(plan,&encoded)?;
     publish(&plan.state_dir.join("import-plan.json"),&encoded,0,0,false)
 }
 fn unit_path(value:&Path)->Result<&str,Error>{let s=value.to_str().ok_or(Error::Invalid)?;
@@ -286,10 +298,10 @@ fn import(plan:&RootPlan)->Result<(),Error>{
             send_import_stream(item.grant.clone(),bytes.as_slice(),true,plan.gateway_uid)?;
         }
         let status=import_status(plan)?;
-        if !status.complete||!status.authority_inactive||status.proposal_count!=value.pending_proposals.len() as u64
+        if !status.archived_complete||!status.authority_inactive||status.proposal_count!=value.pending_proposals.len() as u64
             ||status.expired_approvals!=value.pending_proposals.iter().filter(|p|p.category==crate::contract::ConfirmationCategory::LegacyApproval).count() as u64
             ||status.pending_count+status.expired_approvals!=status.proposal_count
-            ||status.imported_streams!=value.grants.len() as u64||status.imported_records!=value.grants.iter().map(|g|g.grant.records).sum::<u64>() {return Err(Error::Readback);}
+            ||status.archived_streams!=value.grants.len() as u64||status.archived_records!=value.grants.iter().map(|g|g.grant.records).sum::<u64>() {return Err(Error::Readback);}
         value.completed=true;runtime_manifest(&value,plan.gateway_gid)?;
         control(plan,&["stop",SOCKET_UNIT,SERVICE_UNIT])?;
         if !inactive(plan)?{return Err(Error::Readback);}
@@ -299,6 +311,8 @@ fn import(plan:&RootPlan)->Result<(),Error>{
     result
 }
 impl<P:MigrationPlatform> RootMigrationIntegration for InstalledIntegration<P> {
+    fn materialization_ready(&mut self,plan:&RootPlan)->Result<bool,Error>{materialize::ready(plan)}
+    fn retention_ready(&mut self,plan:&RootPlan)->Result<bool,Error>{materialize::terminal(plan)}
     fn preflight(&mut self,plan:&RootPlan)->Result<(),Error>{
         import_layout(plan)?;installed("duduclaw-import")?;installed("duduclaw")?;
         self.platform.preflight(plan)?;
@@ -314,9 +328,11 @@ impl<P:MigrationPlatform> RootMigrationIntegration for InstalledIntegration<P> {
             publish(&plan.state_dir.join("credential-obligations.json"),&serde_json::to_vec(&report)?,0,0,false)
         }
         MigrationState::EmployeeProposalsStaged=>prepare_sources(plan),
-        MigrationState::ContentImported=>import(plan),
+        MigrationState::ContentArchived=>import(plan),
+        MigrationState::ContentImported=>materialize::run(&mut self.platform,op,plan),
         MigrationState::ConfirmationReady=>if self.readback(op,plan)?.is_some(){Ok(())}else{Err(Error::Readback)},
-        MigrationState::IsolationVerified|MigrationState::AwaitingAdministrator|MigrationState::Complete=>self.platform.perform(op,plan),
+        MigrationState::Complete=>{if !materialize::terminal(plan)? {return Err(Error::Readback);} self.platform.perform(op,plan)},
+        MigrationState::IsolationVerified|MigrationState::AwaitingAdministrator=>self.platform.perform(op,plan),
         _=>Err(Error::Invalid),
     }}
     fn readback(&mut self,op:StageOperation,plan:&RootPlan)->Result<Option<Evidence>,Error>{match op.target{
@@ -334,14 +350,16 @@ impl<P:MigrationPlatform> RootMigrationIntegration for InstalledIntegration<P> {
             if plan.legacy_home.join("agents").try_exists()? {return Err(Error::Readback);}
             Ok(Some(Evidence::Employees{count,no_resources_allocated:true}))
         }
-        MigrationState::ContentImported|MigrationState::ConfirmationReady=>{
+        MigrationState::ContentArchived|MigrationState::ConfirmationReady=>{
             let path=plan.state_dir.join("import-receipt.json");if !path.try_exists()?{return Ok(None);}
             let receipt:ImportReceipt=serde_json::from_slice(&read_private(&path,4096,0)?)?;
-            if !receipt.complete||!receipt.authority_inactive||!inactive(plan)?{return Err(Error::Readback);}
-            Ok(Some(if op.target==MigrationState::ContentImported {Evidence::Content{root_only_endpoint:true,source_labels_stamped:true,import_mode_stopped:true}}
+            if !receipt.archived_complete||!receipt.authority_inactive||!inactive(plan)?{return Err(Error::Readback);}
+            Ok(Some(if op.target==MigrationState::ContentArchived {Evidence::Content{root_only_endpoint:true,source_labels_stamped:true,import_mode_stopped:true}}
                 else{Evidence::Confirmation{authority_inactive:true,legacy_approvals_expired:true}}))
         }
-        MigrationState::IsolationVerified|MigrationState::AwaitingAdministrator|MigrationState::Complete=>self.platform.readback(op,plan),
+        MigrationState::ContentImported=>if materialize::terminal(plan)? {Ok(Some(Evidence::Materialized{all_records_terminal:true}))}else{Ok(None)},
+        MigrationState::Complete=>if materialize::terminal(plan)? {self.platform.readback(op,plan)}else{Ok(None)},
+        MigrationState::IsolationVerified|MigrationState::AwaitingAdministrator=>self.platform.readback(op,plan),
         _=>Err(Error::Invalid),
     }}
 }
