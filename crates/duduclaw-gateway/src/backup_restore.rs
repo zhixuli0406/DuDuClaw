@@ -1455,14 +1455,22 @@ mod tests {
             let holder_before = std::fs::read(duduclaw_core::gateway_instance::holder_path(home)).unwrap();
             std::fs::write(home.join("locks/keep"), b"live lock data").unwrap();
             let staging = staging_dir(home);
+            std::fs::create_dir_all(&staging).unwrap();
+            // Preserve literal trailing dots/spaces instead of Win32 final-component normalization.
+            #[cfg(windows)]
+            let staging = staging.canonicalize().unwrap();
             std::fs::create_dir_all(staging.join(archived_name)).unwrap();
             std::fs::write(staging.join(archived_name).join("gateway.lock"), b"archived lock").unwrap();
+            assert!(std::fs::read_dir(&staging).unwrap().any(|entry| entry.unwrap().file_name() == archived_name));
             std::fs::write(staging.join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
             write_marker(home, &RestoreMarker {
                 staged_at: Utc::now(), source_filename: "locks.tar.gz".into(),
             }).unwrap();
 
             let report = perform_pending_restore_swap(home, "stable-lock").unwrap().unwrap();
+            assert_eq!(report.entries_swapped, 1);
+            assert!(!staging.exists(), "skipped lock aliases must not prevent staging cleanup");
+            assert!(read_marker(home).is_none());
             assert!(!report.preserved_dir.join("locks").exists());
             assert_eq!(std::fs::read(home.join("locks/keep")).unwrap(), b"live lock data");
             assert_eq!(std::fs::read(duduclaw_core::gateway_instance::holder_path(home)).unwrap(), holder_before);
