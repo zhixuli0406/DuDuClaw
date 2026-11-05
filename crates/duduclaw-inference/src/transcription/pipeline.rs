@@ -419,6 +419,26 @@ pub async fn prepare_audio_bound_with_memory_limit(source: &Path, max_bytes: u64
     }).await.map_err(|_| "準備錄音失敗")??;
     // Verify the private copy that ffmpeg actually consumes, not an earlier pathname read.
     if let Some((digest,size))=binding { verify_snapshot(&snapshot,digest,size)?; }
+    if duduclaw_parse_worker::client::required() {
+        // Protected jobs never invoke gateway-uid ffmpeg/ffprobe. E inspects
+        // the exact private snapshot that the host later sends to the provider.
+        // Large/multi-chunk recordings await a real isolated media producer.
+        let input = snapshot.clone();
+        let (format, duration_ms) = tokio::task::spawn_blocking(move || {
+            let mut file = open_read(&input)?;
+            duduclaw_parse_worker::adapters::inspect_audio_file(&mut file)
+                .map_err(|_| "隔離服務無法辨識錄音，已停止轉錄。".to_string())
+        }).await.map_err(|_| "隔離音訊處理失敗。")??;
+        let expected = match format {
+            duduclaw_parse_worker::worker::AudioFormat::Wav => "wav",
+            duduclaw_parse_worker::worker::AudioFormat::Mp3 => "mp3",
+        };
+        if ext != expected || duration_ms > CHUNK_SECONDS * 1000 {
+            return Err("隔離轉錄目前支援 30 分鐘內、25 MiB 以下的 WAV／MP3；請先分割錄音。".into());
+        }
+        return Ok(PreparedAudio { chunks: vec![AudioChunk { path: snapshot, offset_ms: 0 }],
+            duration_ms, _temporary: temporary });
+    }
     let mut probe = tokio::process::Command::new("ffmpeg");
     probe.arg("-version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
     restrict_media_process_with_memory_limit(&mut probe, 10, memory_bytes);

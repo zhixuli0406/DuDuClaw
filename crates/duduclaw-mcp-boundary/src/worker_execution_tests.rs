@@ -169,3 +169,124 @@ async fn isolated_worker_rejects_other_calls_regular_file_before_invoke() {
         Arc::new(|_| panic!("another call's input reached worker")));
     assert_eq!(bridge.execute(&context(), "skill_security_scan", &json!({})).await["isError"], true);
 }
+
+struct StatefulFactory;
+impl WorkerPlanFactory for StatefulFactory {
+    fn supports(&self, name: &str) -> bool { name == "skill_security_scan" }
+    fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn prepare<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, WorkerPlan> {
+        Box::pin(async move { Ok(plan_for(call)) })
+    }
+    fn prepare_with_state<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, (WorkerPlan, Value)> {
+        Box::pin(async move { Ok((plan_for(call), call.arguments()["marker"].clone())) })
+    }
+    fn finish<'a>(&'a self, _: &'a AuthorizedToolCall, _: WorkerReply) -> PolicyFuture<'a, Value> {
+        Box::pin(async { panic!("stateful completion must not lose host metadata") })
+    }
+    fn finish_with_state<'a>(&'a self, _: &'a AuthorizedToolCall, _: WorkerReply, state: Value) -> PolicyFuture<'a, Value> {
+        Box::pin(async move { Ok(json!({"marker":state})) })
+    }
+}
+
+#[tokio::test]
+async fn isolated_worker_host_metadata_stays_request_local_across_concurrent_calls() {
+    let bridge = WorkerToolBridge::new(Arc::new(StatefulFactory),
+        Arc::new(Resolver { calls: AtomicUsize::new(0), changes: false }),
+        Arc::new(|plan| Ok(reply(&plan.request))));
+    let context = context();
+    let first = json!({"marker":"first"});
+    let second = json!({"marker":"second"});
+    let (a, b) = tokio::join!(bridge.execute(&context, "skill_security_scan", &first),
+        bridge.execute(&context, "skill_security_scan", &second));
+    assert_eq!(a["marker"], "first");
+    assert_eq!(b["marker"], "second");
+}
+
+#[tokio::test]
+async fn i1c_composite_keeps_primary_refusal_and_never_falls_through_after_selection() {
+    let primary = Arc::new(Factory { refused: true, finishes: AtomicUsize::new(0) });
+    let fallback = Arc::new(Factory { refused: false, finishes: AtomicUsize::new(0) });
+    let composite = Arc::new(CompositeWorkerPlans::new(vec![primary.clone(), fallback.clone()]).unwrap());
+    assert!(composite.supports("skill_security_scan"));
+    assert!(!composite.supports("missing"));
+    assert!(CompositeWorkerPlans::new(vec![]).is_err());
+    let bridge = WorkerToolBridge::new(composite, Arc::new(Resolver { calls: AtomicUsize::new(0), changes: false }),
+        Arc::new(|_| panic!("primary refusal must stop before E")));
+    assert_eq!(bridge.execute(&context(), "skill_security_scan", &json!({})).await["isError"], true);
+    assert_eq!(primary.finishes.load(Ordering::SeqCst), 0);
+    assert_eq!(fallback.finishes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn isolated_worker_revoked_before_prepare_has_no_host_effect() {
+    struct Revoked;
+    impl duduclaw_isolation::capability::LiveRequestVerifier for Revoked {
+        fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> {
+            Err(VerificationError::Revoked)
+        }
+    }
+    struct HostEffect(Arc<AtomicUsize>);
+    impl WorkerPlanFactory for HostEffect {
+        fn supports(&self, _: &str) -> bool { true }
+        fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn prepare<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, WorkerPlan> {
+            Box::pin(async move {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(plan_for(call))
+            })
+        }
+        fn finish<'a>(&'a self, _: &'a AuthorizedToolCall, _: WorkerReply) -> PolicyFuture<'a, Value> {
+            panic!("revoked request reached finish")
+        }
+    }
+    let effects = Arc::new(AtomicUsize::new(0));
+    let bridge = WorkerToolBridge::new(Arc::new(HostEffect(effects.clone())),
+        Arc::new(Resolver { calls: AtomicUsize::new(0), changes: false }),
+        Arc::new(|_| panic!("revoked request reached E")));
+    let context = RequestContext::with_live_verifier(context().record().clone(), Arc::new(Revoked));
+    assert_eq!(bridge.execute(&context, "skill_security_scan", &json!({})).await["isError"], true);
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn isolated_worker_prepare_carries_live_authority_across_await() {
+    struct Changing(Arc<std::sync::atomic::AtomicBool>);
+    impl duduclaw_isolation::capability::LiveRequestVerifier for Changing {
+        fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> {
+            if self.0.load(Ordering::SeqCst) { Ok(()) } else { Err(VerificationError::Revoked) }
+        }
+    }
+    struct HostEffect { live: Arc<std::sync::atomic::AtomicBool>, effects: Arc<AtomicUsize> }
+    impl WorkerPlanFactory for HostEffect {
+        fn supports(&self, _: &str) -> bool { true }
+        fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn prepare<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, WorkerPlan> {
+            Box::pin(async move {
+                assert!(crate::io_authority::is_scoped());
+                tokio::task::yield_now().await;
+                self.live.store(false, Ordering::SeqCst);
+                crate::io_authority::verify_before_io()?;
+                self.effects.fetch_add(1, Ordering::SeqCst);
+                Ok(plan_for(call))
+            })
+        }
+        fn finish<'a>(&'a self, _: &'a AuthorizedToolCall, _: WorkerReply) -> PolicyFuture<'a, Value> {
+            panic!("revoked request reached finish")
+        }
+    }
+    let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let effects = Arc::new(AtomicUsize::new(0));
+    let bridge = WorkerToolBridge::new(Arc::new(HostEffect { live: live.clone(), effects: effects.clone() }),
+        Arc::new(Resolver { calls: AtomicUsize::new(0), changes: false }),
+        Arc::new(|_| panic!("revoked request reached E")));
+    let context = RequestContext::with_live_verifier(context().record().clone(), Arc::new(Changing(live)));
+    assert_eq!(bridge.execute(&context, "skill_security_scan", &json!({})).await["isError"], true);
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+    assert!(!crate::io_authority::is_scoped());
+}

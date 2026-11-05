@@ -320,3 +320,41 @@ fn overbroad_resolver_cannot_replace_explicit_or_ambiguous_workspace_selection()
     // even though the capability itself still grants both work and other.
     assert!(roots.authorize_workspace(&baseline, "work").is_ok());
 }
+
+#[test]
+fn host_snapshots_bind_selected_origin_call_and_operation() {
+    use crate::tool_policy::{authorize, ResourceResolver, ToolPolicy};
+    use duduclaw_isolation::worker::ParseOperation;
+    use serde_json::{Value, json};
+    struct Live;
+    impl LiveRequestVerifier for Live {
+        fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> { Ok(()) }
+    }
+    struct Selected(Vec<ResourceGrant>);
+    impl ResourceResolver for Selected {
+        fn resolve(&self, _: &RequestContext, _: &ToolPolicy, _: &Value) -> Result<Vec<ResourceGrant>, VerificationError> {
+            Ok(self.0.clone())
+        }
+    }
+    let mut record = context().record().clone();
+    record.expires_at = u64::MAX - 1;
+    record.tools = List::new(vec![Text::new("web_extract".into()).unwrap()]).unwrap();
+    let employee = ResourceGrant::Employee { id: record.employee };
+    let origin = ResourceGrant::UrlOrigin { origin: Text::new("https://example.com".into()).unwrap() };
+    let other = ResourceGrant::UrlOrigin { origin: Text::new("https://other.example".into()).unwrap() };
+    record.resources = List::new(vec![employee.clone(), origin.clone(), other]).unwrap();
+    let context = RequestContext::with_live_verifier(record, std::sync::Arc::new(Live));
+    let resolver = Selected(vec![employee, origin]);
+    let call = authorize(&context, "web_extract", &json!({"url":"https://example.com/a"}), &resolver).unwrap();
+    let token = AuthorizedFile::from_host_snapshot(&call, HostSnapshotSource::WebFetch { url: "https://example.com/a" }, b"real body").unwrap();
+    assert!(token.verify(&call).is_ok());
+    assert!(token.verify_operation(ParseOperation::ExtractHtml).is_ok());
+    assert!(token.verify_operation(ParseOperation::InspectAudio).is_err());
+    let next = authorize(&context, "web_extract", &json!({"url":"https://example.com/b"}), &resolver).unwrap();
+    assert!(token.verify(&next).is_err());
+    assert!(AuthorizedFile::from_host_snapshot(&call,
+        HostSnapshotSource::WebFetch { url: "https://other.example/a" }, b"wrong").is_err());
+    assert!(AuthorizedFile::from_host_snapshot(&call, HostSnapshotSource::InlineAudio, b"wrong").is_err());
+    assert!(AuthorizedFile::from_host_snapshot(&call,
+        HostSnapshotSource::WebFetch { url: "https://example.com/a" }, &vec![0; 5 * 1024 * 1024 + 1]).is_err());
+}

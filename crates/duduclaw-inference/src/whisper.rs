@@ -1,14 +1,5 @@
 //! Local Whisper transcription via whisper-rs (whisper.cpp binding).
 
-use std::sync::LazyLock;
-
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .unwrap_or_default()
-});
-
 /// Whisper transcription backend supporting API and Local modes.
 pub enum WhisperMode {
     /// OpenAI Whisper API (requires OPENAI_API_KEY).
@@ -54,8 +45,10 @@ async fn transcribe_api(audio_data: &[u8], language: Option<&str>) -> Result<Str
     };
 
     let form = api_form(audio_data.to_vec(), file_name, mime_type, lang)?;
-    let resp = HTTP_CLIENT
-        .post("https://api.openai.com/v1/audio/transcriptions")
+    let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(60)).build()
+        .map_err(|_| "Whisper HTTP client unavailable".to_string())?;
+    let resp = client.post("https://api.openai.com/v1/audio/transcriptions")
         .header("Authorization", format!("Bearer {api_key}"))
         .multipart(form)
         .send().await
@@ -63,25 +56,38 @@ async fn transcribe_api(audio_data: &[u8], language: Option<&str>) -> Result<Str
     if !resp.status().is_success() {
         return Err(format!("Whisper API {}", resp.status()));
     }
-    let result: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    read_transcription_response(resp).await
+}
+
+async fn read_transcription_response(resp: reqwest::Response) -> Result<String, String> {
+    read_transcription_chunks(resp.content_length(), resp.bytes_stream()).await
+}
+
+async fn read_transcription_chunks<T: AsRef<[u8]>, E>(length: Option<u64>,
+    mut chunks: impl futures_util::Stream<Item = Result<T, E>> + Unpin) -> Result<String, String> {
+    use futures_util::StreamExt;
+    const RESPONSE_LIMIT: usize = 256 * 1024;
+    if length.is_some_and(|length| length > RESPONSE_LIMIT as u64) {
+        return Err("Whisper response too large".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|_| "Whisper response unavailable".to_string())?;
+        let chunk = chunk.as_ref();
+        if chunk.len() > RESPONSE_LIMIT.saturating_sub(bytes.len()) { return Err("Whisper response too large".into()); }
+        bytes.extend_from_slice(chunk);
+    }
+    let result: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "Invalid Whisper response".to_string())?;
     result.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
         .ok_or("No text".to_string())
 }
 
-fn api_form(
-    audio_data: Vec<u8>,
-    file_name: &str,
-    mime_type: &str,
-    language: &str,
-) -> Result<reqwest::multipart::Form, String> {
-    let part = reqwest::multipart::Part::bytes(audio_data)
-        .file_name(file_name.to_owned())
-        .mime_str(mime_type)
-        .map_err(|_| "Invalid audio MIME type".to_string())?;
+fn api_form(audio_data: Vec<u8>, file_name: &str, mime_type: &str, language: &str)
+    -> Result<reqwest::multipart::Form, String> {
+    let part = reqwest::multipart::Part::bytes(audio_data).file_name(file_name.to_owned())
+        .mime_str(mime_type).map_err(|_| "Invalid audio MIME type".to_string())?;
     let mut form = reqwest::multipart::Form::new().text("model", "whisper-1").part("file", part);
-    if !language.is_empty() {
-        form = form.text("language", language.to_owned());
-    }
+    if !language.is_empty() { form = form.text("language", language.to_owned()); }
     Ok(form)
 }
 
@@ -160,4 +166,25 @@ fn transcribe_local(
         }
     }
     Ok(text.trim().to_string())
+}
+
+#[cfg(test)]
+mod i1c_tests {
+    use super::*;
+    #[tokio::test]
+    async fn i1c_whisper_rejects_declared_and_streamed_oversize_without_credentials() {
+        let empty = futures_util::stream::iter(Vec::<Result<Vec<u8>, ()>>::new());
+        assert_eq!(read_transcription_chunks(Some(9999999), empty).await.unwrap_err(), "Whisper response too large");
+        let chunks = futures_util::stream::iter(vec![Ok::<_, ()>(vec![b'x'; 200 * 1024]), Ok(vec![b'x'; 100 * 1024])]);
+        assert_eq!(read_transcription_chunks(None, chunks).await.unwrap_err(), "Whisper response too large");
+    }
+    #[tokio::test]
+    async fn i1c_whisper_bounded_response_preserves_transcript_and_rejects_invalid_json() {
+        let chunks = futures_util::stream::iter(vec![Ok::<_, ()>(br#"{"text":"hello"}"#.to_vec())]);
+        assert_eq!(read_transcription_chunks(None, chunks).await.unwrap(), "hello");
+        let invalid = futures_util::stream::iter(vec![Ok::<_, ()>(vec![b'{'])]);
+        assert!(read_transcription_chunks(None, invalid).await.is_err());
+        let truncated = futures_util::stream::iter(vec![Ok(br#"{"text":"hello"}"#.to_vec()), Err(())]);
+        assert!(read_transcription_chunks(None, truncated).await.is_err());
+    }
 }

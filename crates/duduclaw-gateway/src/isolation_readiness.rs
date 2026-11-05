@@ -46,7 +46,7 @@ impl Components {
         let host = if host_was_verified && spawnd_verified() { ComponentState::Ready }
             else { ComponentState::Unavailable };
         Self { launch_service: host, sandbox: host, network: host, storage: host,
-            parse_worker: integration.parse_worker,
+            parse_worker: combined_worker_state(integration.parse_worker, parse_worker_state()),
             update_service: if generation.is_some() && current == generation {
                 ComponentState::Ready
             } else { ComponentState::Unavailable },
@@ -112,6 +112,27 @@ fn current_generation() -> Option<duduclaw_isolation::ids::Sha256Digest> {
         .then_some(observation.evidence.generation)
 }
 
+fn combined_worker_state(integration: ComponentState, producers: ComponentState) -> ComponentState {
+    if producers != ComponentState::Ready { ComponentState::Unavailable } else { integration }
+}
+
+fn parse_worker_state() -> ComponentState {
+    #[cfg(all(target_os = "linux", feature = "isolation-worker-integration"))]
+    if duduclaw_parse_worker::client::launcher_installed()
+        && crate::isolation_mcp::boot_status().constructed
+        && update_service_state() == ComponentState::Ready {
+        return ComponentState::Ready;
+    }
+    ComponentState::Unavailable
+}
+
+fn update_service_state() -> ComponentState {
+    match UPDATE_OBSERVATION.lock() {
+        Ok(value) if value.as_ref().is_some_and(|v| compatible_update(&v.evidence)
+            && update_fresh(Some(v.observed), Instant::now())) => ComponentState::Ready,
+        _ => ComponentState::Unavailable,
+    }
+}
 #[cfg(target_os = "linux")]
 fn start_update_probe() {
     // One bounded blocking client, off every execution/admission thread. A
@@ -213,7 +234,7 @@ mod tests {
         for verified in [false, true] {
             let components = Components::current(verified);
             assert!(!components.all_ready());
-            assert_eq!(components.parse_worker, ComponentState::PendingIntegration);
+            assert_eq!(components.parse_worker, ComponentState::Unavailable);
             assert_eq!(components.update_service, ComponentState::Unavailable);
             assert_eq!(components.mcp_boundary, ComponentState::PendingIntegration);
             assert_eq!(components.runtime_adapters, ComponentState::PendingIntegration);
@@ -228,6 +249,17 @@ mod tests {
         assert!(update_fresh(Some(now), now + Duration::from_secs(2)));
         assert!(!update_fresh(Some(now), now + Duration::from_millis(2001)));
         assert!(!update_fresh(Some(now + Duration::from_millis(1)), now));
+    }
+
+    #[test]
+    fn worker_readiness_requires_real_producers_and_integration_evidence() {
+        for integration in [ComponentState::Ready, ComponentState::Unavailable, ComponentState::PendingIntegration] {
+            for producers in [ComponentState::Ready, ComponentState::Unavailable, ComponentState::PendingIntegration] {
+                let state = combined_worker_state(integration, producers);
+                assert_eq!(state == ComponentState::Ready,
+                    integration == ComponentState::Ready && producers == ComponentState::Ready);
+            }
+        }
     }
 
     #[test]

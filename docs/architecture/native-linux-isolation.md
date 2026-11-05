@@ -6541,3 +6541,637 @@ package,inventory-tests,inventory}.log`.
 
 No unfinished worktree was removed: it was supplied by the owning session and
 contains both requested uncommitted rounds. This session created no worktree.
+## Package I1c: production E web plans and host control routes (2026-11-05)
+
+**Status: PARTIAL.** This package closes the source-level web extraction producer
+and corrects five operations that do not consume parser files. It does not close
+all 18 E inventory entries, make protected boot ready, or establish native Linux
+acceptance. No commits, local gateway/CLI package builds, runtime installations,
+provider calls or privileged tests were performed.
+
+### Implemented source paths
+
+- `isolation_worker_plans.rs`: `GatewayWorkerPlans` implements
+  `WorkerPlanFactory` for **only** `web_extract`. The existing dispatcher first
+  runs scope, employee, approval, redaction and egress gates. D resolves and
+  rechecks the signed origin. The factory fetches using the host network policy,
+  writes actual HTML bytes into an anonymous host-owned temporary `File`, rewinds
+  it, and prepares `ExtractHtml` with the existing bounded `HtmlQuery` schema.
+  The existing installed E invocation handles admission, snapshot, fd exchange,
+  response validation and retirement. No parser runs in the factory. Results
+  retain URL, selector, match count, cache status and the original response text
+  cap; returned HTML/JSON remains data and never names a path or operation.
+- `WorkerPlanFactory::prepare_with_state` / `finish_with_state` are additive
+  host-side methods with defaults preserving existing factories. Fetch metadata
+  stays on the individual bridge invocation's stack, outside the parse request
+  and response. It cannot be supplied by the worker or shared across concurrent
+  calls. Existing request binding and before/after resource checks remain.
+- `web_fetch_protected_cached` uses a separate
+  `web_cache/protected-no-redirect-v1` cache. It rejects URL credentials before
+  cache access, disables redirects and environment proxies, and retains the
+  existing public-address DNS pin, timeout and 5 MiB stream ceiling. Cache reads
+  cap metadata at 16 KiB and body at 5 MiB before decoding, require exact URL and
+  successful status, and reject expired/future entries. Exact metadata matching
+  prevents legacy trailing-slash/query-order key normalization from returning a
+  different URL. A collision can cause a cache miss, never a different page hit.
+- `web_fetch_cached` is a host service, not a file parser. Its original CLI
+  handler explicitly calls `authorize_async` before and after protected fetches;
+  missing resolver, changed resources or an ungranted origin refuse. Its list gate
+  still requires Employee + UrlOrigin grants and an installed resolver; the
+  service manifest reports missing resolver rather than Ready. Fetch and
+  extraction share a process-wide **10 requests/minute** budget including cache
+  hits, across employees and factory instances. This is intentionally narrower
+  than separate legacy stdio-process budgets. Workflow reads retain their fresh,
+  uncached no-redirect behavior.
+- `meeting_upload_link`, `meeting_transcribe_status`,
+  `meeting_transcribe_cancel` and `route_query` now use `Route::Service`.
+  Meeting control reaches the existing signed `/api/internal/meeting-jobs`
+  route through request-local gateway identity and retains server ownership and
+  tool gates. `route_query` uses config-only inference routing. These routes do
+  not create fake files or enter E. GatewayHandler routes rely on original
+  handler policy; this change does not claim generic finite-resource checks for
+  every service.
+- `fill_installed_sources` installs this real partial factory only when an
+  explicit trusted `worker_plans` source was not supplied. The original full
+  dispatcher manifest/completeness check is unchanged: the other E and A gaps
+  continue to refuse protected boot. Worker service readiness stays pending.
+
+**CONTRACT CHANGE: none to isolation wire formats, canonical bytes or limits.**
+Only the host-side factory trait receives backward-compatible default methods.
+No dependencies or workspace members were added. The temporary source harness
+is an external test artifact, not a shipped crate.
+
+### All 18 original E inventory entries
+
+| Original operation | State after I1c | Remaining integration |
+| --- | --- | --- |
+| `skill_extract` | Missing; Worker retained | Host recording/source authority, isolated parsing/distillation result, original publication/approval pipeline. |
+| `shared_skill_adopt` | Missing; Worker retained | Authorized shared skill read descriptor, scanner/parser, explicit adoption write and readback. |
+| `skill_from_recording` | Missing; Worker retained | Recording ownership/finalization, real media descriptor and bounded distillation, approval then publication. |
+| `skill_security_scan` | Missing; Worker retained | Authorized local/global skill fd plus host CONTRACT restrictions; typed scanner result and existing audit. `InspectSkillArchive` is not a Markdown security scan. |
+| `skill_graduate` | Missing; Worker retained | Existing graduation eligibility, isolated scanner result, approval and atomic activation/publication. |
+| `skill_synthesis_run` | Missing; Worker retained | Authorized source collection, bounded synthesis/scanner stages, provider calls on host and approved publication. |
+| `skill_hub_install` | Missing; Worker retained | Host SSRF/egress fetch and existing hub approval; E archive inspection, trusted extraction destination and publication readback. |
+| `skill_curator_status` | Missing; Worker retained | Separate status-only control from `run=true`, which scans/archives global and other employee skill trees; do not blanket-forward its mutation branch. |
+| `transcribe_audio` | Missing; Worker retained | Bound base64 input, real decoded audio fd, isolated media validation/preprocessing, host credential/provider call, bounded transcript and costs. E currently refuses unsupported transcription operations. |
+| `meeting_transcribe` | Missing; Worker retained | Preserve authenticated create/upload and ownership; migrate actual media probe/chunk helpers to accepted E/A protocols and keep provider keys on host. Existing job-control availability does not prove media isolation. |
+| `meeting_upload_link` | Host Service source wired | Product route, expiry/rate and request-local identity integration tests on real gateway still required. |
+| `meeting_transcribe_status` | Host Service source wired | Real gateway own-job versus another employee's job acceptance still required. |
+| `meeting_transcribe_cancel` | Host Service source wired | Real gateway cancellation/ownership/teardown acceptance still required. |
+| `synthesize_speech` | Missing; Worker retained | Keep provider credentials on host; separate text preparation/provider request from untrusted returned media handling, retain output/cost policy. E currently refuses unsupported speech synthesis operations. |
+| `knowledge_add_source` | Missing; Worker retained | Existing tool files an approval proposal through signed knowledge RPC. Bind any file source to authorized descriptors; preserve requester/collection/source approval, then reuse E knowledge extraction and existing indexing pipeline. Do not replace proposal acceptance with an extraction result. |
+| `web_fetch_cached` | Host Service source wired | Full CLI/gateway compilation and actual signed-origin, redirect/proxy/cache/revocation product tests. |
+| `web_extract` | Concrete production WorkerPlanFactory wired | Real E transport/retirement and live product path; no fixture result may count as isolated parsing acceptance. |
+| `route_query` | Host Service source wired | Original-handler listing/call parity in full CLI tests. |
+
+### Validation and remote handoff
+
+All local commands use `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and
+`CARGO_TARGET_DIR=/private/tmp/iso-i1c-boundary-target`.
+
+- `cargo test -p duduclaw-mcp-boundary tool_policy --offline`: **18 passed,
+  0 failed** after the five route changes. The first new route regression was
+  observed failing before its policy change (expected test-first red).
+- `cargo test -p duduclaw-mcp-boundary worker_execution --offline`:
+  **7 passed, 0 failed**, including concurrent host-metadata separation.
+- `cargo test -p duduclaw-mcp-boundary --lib --offline --locked`:
+  **63 passed, 0 failed** on the final boundary diff. Log:
+  `/private/tmp/iso-i1c-boundary-tests.log`.
+- `cargo check -p duduclaw-mcp-boundary --target x86_64-unknown-linux-gnu
+  --offline --locked`: **passed**; existing unsafe-code warnings in
+  `config_fd.rs` / MCP bridge remain.
+- `cargo test --manifest-path /private/tmp/iso-i1c-source-harness/Cargo.toml
+  --lib --offline --locked`: **36 passed, 0 failed**. The harness starts from
+  this worktree's Cargo.lock and includes the actual gateway `web_fetch.rs`,
+  `isolation_worker_plans.rs`, core `net_addr.rs` and real boundary/isolation
+  dependencies. Seven tests have `i1c_` names; the other tests cover existing
+  fetch/cache/SSRF and address classification. The product-factory test uses a
+  real cached HTML `File` and a **fixture transport response**, not a worker
+  process. Log: `/private/tmp/iso-i1c-source-tests.log`.
+- `cargo check --manifest-path /private/tmp/iso-i1c-source-harness/Cargo.toml
+  --offline --locked`: **passed**, also type-checking the actual CLI
+  `mcp/web.rs` against the real web-fetch and boundary code. Unrelated workflow,
+  current-call selection and legacy HTML APIs are facades in that harness; this
+  is not a CLI package build. Log: `/private/tmp/iso-i1c-cli-source-check.log`.
+- Added CLI regressions `i1c_protected_fetch_without_origin_resolver_never_uses_legacy_fetch`
+  and `i1c_protected_fetch_listing_still_requires_origin_and_resolver_without_worker`
+  for the remote builder; **not run locally**.
+- Full gateway/CLI builds, native Linux, real worker parsing, actual HTTP
+  redirect/proxy behavior, original product list/call parity and Daybreak review
+  are **not verified** locally. Cross-target boundary checking is not a Linux
+  product execution test.
+
+Run on the owner's remote builder with the normal feature flags:
+
+```sh
+cargo test -p duduclaw-mcp-boundary tool_policy
+cargo test -p duduclaw-mcp-boundary worker_execution
+cargo test -p duduclaw-gateway i1c_
+cargo test -p duduclaw-gateway web_fetch::tests
+cargo test -p duduclaw-gateway isolation_mcp::boot
+cargo test -p duduclaw-cli mcp_isolation
+cargo test -p duduclaw-cli meeting_tools
+cargo check -p duduclaw-gateway --features isolation-worker-integration
+cargo check -p duduclaw-cli
+```
+
+The CLI protected `fetch_for_tool` branch currently authorizes the exact
+`web_fetch_cached` name; `web_extract` uses its dedicated producer and does not
+call that helper. If the helper is reused for another protected tool later,
+carry its actual tool name rather than borrowing fetch permission.
+
+### Precise remaining work for I1c
+
+1. Implement the **12 Missing entries** above with their original policy,
+   lifecycle and publication boundaries; introduce only a reviewed additive
+   protocol if E lacks the real operation. Do not map incompatible operations
+   to archive/HTML parsers or fabricate files for job control.
+2. Preserve/combine explicitly injected factories when other E producers land;
+   the default producer currently supports only `web_extract`. Do not report
+   WorkerPlans object presence as per-tool completeness.
+3. Run full remote compilation, original list/call parity and authenticated
+   service/ownership tests. Exercise revoked origin, redirect to another origin,
+   environment proxy, oversized/truncated HTML and worker retirement through the
+   actual gateway and E services, then obtain the assigned Daybreak review.
+4. I1a still owns ingress/composite readiness/Claude acceptance; I1b owns A tool
+   producers; I1d owns other runtimes; I1e owns PTY. This package does not alter
+   their readiness evidence or claim any of their acceptance gates.
+
+### Changed files for I1c review
+
+| File | Change |
+| --- | --- |
+| `crates/duduclaw-gateway/src/isolation_worker_plans.rs` | New concrete host-fetch → real HTML file → E plan → bounded result producer. |
+| `crates/duduclaw-gateway/src/isolation_worker_plans_tests.rs` | Real fd/options, bounds, selector rejection and result-shape tests. |
+| `crates/duduclaw-gateway/src/web_fetch.rs` | Protected no-redirect/no-proxy cache path, exact bounded cache reads, shared tool rate budget and regressions. |
+| `crates/duduclaw-gateway/src/lib.rs` | Export the production factory module. |
+| `crates/duduclaw-gateway/src/isolation_mcp/boot.rs` | Inject the partial real factory when none supplied; completeness unchanged. |
+| `crates/duduclaw-mcp-boundary/src/worker_execution.rs` | Keep per-request trusted metadata outside the worker protocol. |
+| `crates/duduclaw-mcp-boundary/src/worker_execution_tests.rs` | Concurrent metadata separation regression. |
+| `crates/duduclaw-mcp-boundary/src/tool_policy.rs` | Five justified host-service routes; parsing tools remain Worker. |
+| `crates/duduclaw-mcp-boundary/src/tool_policy_tests.rs` | Control/fetch versus parser routing regressions. |
+| `crates/duduclaw-cli/src/mcp/web.rs` | Explicit protected origin authorization around original host fetch behavior. |
+| `crates/duduclaw-cli/src/mcp_isolation.rs` | Preserve web-fetch list grants and resolver readiness after moving to Service. |
+| `crates/duduclaw-cli/src/mcp_isolation_tests.rs` | Missing-resolver refusal and list grant/resolver parity regressions (remote only). |
+| `docs/features/05-security-defense.md` | English integration and non-acceptance boundary. |
+| `docs/features/zh-TW/05-security-defense.md` | Traditional Chinese integration and non-acceptance boundary. |
+| `docs/features/ja-JP/05-security-defense.md` | Japanese integration and non-acceptance boundary. |
+| `CHANGELOG.md` | Self-contained Unreleased development-status entry. |
+| `docs/architecture/native-linux-isolation.md` | This complete I1c implementation/test/remaining-work handoff. |
+
+### I1c round 2 handoff — skill files and media producers (2026-11-05)
+
+**Status: PARTIAL, timeboxed continuation; uncommitted.** This section supersedes
+round 1's per-tool state above. Seven of the twelve requested tools now have a
+concrete source path, with the compatibility limits below; **five tools remain
+missing**. This is not closure of all twelve, a complete product build, protected
+boot readiness, native Linux acceptance, or permission to merge/release. The
+existing completeness gate remains in place. No gateway/CLI package was built,
+no `cargo fmt`, installation, provider call or commit was performed.
+
+#### Current twelve-tool inventory
+
+| Tool | Round 2 implementation / exact limit |
+| --- | --- |
+| `skill_extract` | Boot-bound own employee and own Wiki grant/root; actual nested `SKILL.md`, flat `.md` or raw-stem file, bounded E `ExtractSkill`, original concept/entity/source rules shared with legacy; host validates page scopes, unique names, fixed source summary and related-page set, then uses the original verifier and WikiStore writer. All body pages must count and read back before writing the source completion marker. Native publication remains unrun. |
+| `shared_skill_adopt` | Actual shared skill file → E scan and frontmatter removal → host atomic **new** own skill and fd-anchored readback. Cross-agent targets and overwrite refuse. **Partial compatibility:** shared `usage_count`/`adopted_by` are deliberately not updated; result says `shared_metadata_updated:false`. The worker has no shared-source overwrite field or authority. |
+| `skill_security_scan` | Actual own flat skill file, with global fallback only on absence; bound employee only; bounded strict host CONTRACT restrictions → E's existing deterministic scanner → typed verdict/findings and original audit emission. Unsafe/unreadable local files cannot trigger global fallback. |
+| `skill_graduate` | Actual own flat skill file → same E scan plus metadata preparation → host new global skill, fsync/atomic no-clobber/readback and locked/fsynced original-format graduation log. Manual graduation retains the original zero-lift/no-load-count semantics and upstream Admin/approval gates; no new automatic eligibility or approval bypass. Existing global skill refuses overwrite. |
+| `skill_from_recording` | **MISSING**. Recording ownership/finalization, HAR redaction/action parsing, bounded distillation, original pending-approval draft pipeline still need a real producer. |
+| `skill_synthesis_run` | **MISSING**. The existing pipeline reads event/trajectory files and model output; all parser stages still need E, while caller/autonomy/provider/approval/publication remain host-owned. |
+| `skill_hub_install` | **MISSING**. Separate bounded host hub fetch and current signature/source trust, E scan/manifest parsing, original install approval and locked publication/readback. Do not call `fetch_and_gate` unchanged on protected TEAM: its scan/manifest parsing still runs on the host. |
+| `skill_curator_status` | **MISSING**, retained Worker route. Status-only has no file and should become a conditional authenticated control path; `run=true` recursively loads global/other employee skills and archives them, so forwarding the whole handler remains unsafe. |
+| `transcribe_audio` | Bounded decoded real audio → E `InspectAudio` → existing host Whisper API, with no provider credentials or network inside E. Provider responses now stream under a 256 KiB ceiling before JSON decoding. **Compatibility limit:** structurally checked WAV/MP3 only; OGG/FLAC and other formats refuse. This is container/frame inspection, not decoding or a promise of codec safety. |
+| `synthesize_speech` | Host configured TtsRouter, filtered to existing official cloud providers only → real returned audio file → E WAV/MP3 structure inspection → bounded base64 result. Local/command providers stay unavailable until A producers exist. Generated audio over **128 KiB refuses after the provider may already have billed**; provider errors, invalid media, revocation and uncertain completion never claim success. |
+| `meeting_transcribe` | **MISSING**. Authenticated create/upload control exists, but actual media probing/chunking/provider workflow still needs E/A routing. Do not forward the existing create path and count its background helper as isolated. |
+| `knowledge_add_source` | Host Service for existing signed text/URL **approval proposals**, not an extraction result. Protected non-null `path` is refused before network/staging; retained authorized-file descriptor staging remains unfinished. Existing approved knowledge ingestion already uses E (`knowledge/extract_spawn.rs`, `knowledge::extract`); this round does not equate a filed proposal with ingestion/index completion. |
+
+#### Boundaries and implementation details
+
+- `GatewayWorkerPlans::for_employee` binds skill subject selection to the trusted
+  launch employee; product `agent_id` is accepted only as that exact target on
+  these three tools, never as caller identity. `target_agent` on adoption is
+  likewise restricted to self. Unknown fields, slugs and malformed CONTRACTs
+  refuse. Skill snapshots are at most 64 KiB; every host source path component
+  uses Linux no-follow directory/file opens, regular-file and single-link checks,
+  and a bounded read from that descriptor. Temporary worker inputs contain actual
+  source/provider bytes; no fake file or parser result is installed.
+- `CompositeWorkerPlans` preserves explicit producer precedence and fills only
+  unsupported tools with per-launch defaults. Refusal from the selected producer
+  never falls through to another one. Host metadata remains request-local and
+  does not cross the E wire. Runtime/worker retirement/composite readiness gates
+  are unchanged.
+- The scanner and sensitive patterns compile from the existing shared source
+  only in E's `engine` feature. Extraction's pure rules moved to
+  `skill_lifecycle/extraction_logic.rs`, used by both legacy extraction and E's
+  bounded data-model adapter. The gateway does not enable E's engine feature.
+- Host publication never accepts a worker-selected destination/employee. Adoption
+  and graduation recheck the original source digest under a publication lock,
+  use new-file publication and exact bounded readback. Graduation's log is a
+  separately locked append. A log/fsync failure after the skill lands is
+  **unconfirmed**, not a rollback; a retry may encounter the no-clobber refusal.
+- Wiki publication remains a **non-transactional batch**. Partial body pages can
+  remain after an error. The source completion marker is written separately,
+  only after all body writes and readbacks succeed, so a failed body batch is
+  not silently marked complete. A pre-existing source marker keeps legacy
+  already-extracted behavior. Concurrent publication, root replacement and
+  fault-injected writer behavior still require real product tests.
+- Existing scope/employee/capability/approval/egress/redaction gates still run in
+  the original dispatcher before the worker bridge. Host resource checks run
+  around E. No failed protected call falls back to a legacy gateway parser.
+
+**CONTRACT CHANGE:** additive worker operations `InspectAudio`, `ScanSkill`,
+`PrepareSkill`, `ExtractSkill`; bounded options and result variants plus
+`AudioFormat`, `SkillAction`, `SkillPage`. No existing variant, canonical signing
+bytes, protocol version or hard limit was changed. Older E implementations do
+not understand these operations and must refuse; deploy the matching verified
+component generation, never a mixed binary set. `duduclaw-parse-worker` adds only
+`tracing`, already locked in the workspace; no new external package version or
+workspace member was added.
+
+#### Validation evidence and limitations
+
+Commands used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and
+`CARGO_TARGET_DIR=/private/tmp/iso-i1c-boundary-target`:
+
+- `cargo test -p duduclaw-isolation --lib --offline`: **32 passed**.
+- `cargo test -p duduclaw-mcp-boundary --lib --offline`: **65 passed**.
+- `cargo test -p duduclaw-parse-worker --features engine --lib --offline --locked`:
+  **79 passed**; log `/private/tmp/iso-i1c-r2-worker-tests.log`.
+- `cargo test --manifest-path /private/tmp/iso-i1c-source-harness/Cargo.toml
+  --lib --offline`: **57 passed**. This includes the actual factory, Whisper
+  source and legacy extraction pure rules. TTS, WikiStore, verifier, identity
+  helpers and audit are facades; no provider or real publication runs there.
+- `cargo check --manifest-path /private/tmp/iso-i1c-source-harness/Cargo.toml
+  --tests --target x86_64-unknown-linux-gnu --offline`: **passed**. Includes the
+  Linux-only source opens/publication code and its test syntax. The harness
+  disables reqwest's TLS backend for cross-type-checking after native OpenSSL
+  cross discovery failed; this is not TLS/network verification or a gateway build.
+- `cargo check -p duduclaw-mcp-boundary --target x86_64-unknown-linux-gnu
+  --offline --locked`: **passed**.
+- `cargo check -p duduclaw-parse-worker --features engine
+  --target x86_64-unknown-linux-gnu --offline --locked`: **passed**. Logs are
+  `/private/tmp/iso-i1c-r2-boundary-linux-check.log` and
+  `/private/tmp/iso-i1c-r2-worker-linux-check.log`.
+- An early audio negative test mutated a byte that was already zero; the fixture
+  was corrected. Early TCP-based Whisper tests could not bind in the sandbox;
+  they were replaced with deterministic chunk streams exercising the same
+  production bounded collector. The final passing counts exclude no tests.
+- Independent read-only code review found and prompted fixes for path-based
+  knowledge staging, unbounded Whisper responses, malformed CONTRACT fallback,
+  shared-source overwrite authority and premature wiki completion marking.
+  Final review found no new High in that diff. **This was not Daybreak review**;
+  the assigned Daybreak/security and full product acceptance gates remain open.
+
+Remote owner commands (normal feature flags; do not substitute the harness):
+
+```sh
+cargo check -p duduclaw-gateway --features isolation-worker-integration
+cargo check -p duduclaw-cli
+cargo test -p duduclaw-gateway i1c_
+cargo test -p duduclaw-gateway skill_lifecycle::extraction
+cargo test -p duduclaw-gateway tts
+cargo test -p duduclaw-gateway isolation_mcp::boot
+cargo test -p duduclaw-cli mcp_isolation
+cargo test -p duduclaw-cli knowledge_client
+cargo test -p duduclaw-inference i1c_whisper
+cargo test -p duduclaw-parse-worker --features engine
+cargo test -p duduclaw-mcp-boundary
+cargo test -p duduclaw-isolation
+```
+
+The Linux `i1c_` tests additionally exercise symlink/hardlink/size refusal and
+source-digest/no-clobber publication; they were **cross-checked, not executed**
+on this macOS host. Still needed: actual worker transport/admission/retirement,
+live host policy revocation, provider media and billing behavior, original
+list/call parity, no-key local TTS refusal, WikiStore fault injection/root
+replacement, full Linux installation and assigned security review. No root test
+or live-provider result was fabricated.
+
+#### Round 2 file ownership / next continuation
+
+Paths below are relative to `crates/` unless prefixed `docs/` or named at the repository root. Round-1 changes not listed here remain untouched in this continuation.
+
+| File | Round 2 change |
+| --- | --- |
+| `duduclaw-gateway/src/isolation_worker_plans.rs` | Extend real plans with boot-bound skill and host-provider media stages and checked host publication. |
+| `duduclaw-gateway/src/isolation_worker_plans_tests.rs` | Real decoded fd, target/CONTRACT/result checks and Linux source/publication regressions. |
+| `duduclaw-gateway/src/isolation_mcp/boot.rs` | Compose per-launch employee/root defaults after explicitly installed producers. |
+| `duduclaw-gateway/src/skill_lifecycle/extraction.rs` | Keep legacy API, publication and tests while delegating pure rules. |
+| `duduclaw-gateway/src/skill_lifecycle/extraction_logic.rs` | New shared pure extraction implementation used by legacy and E. |
+| `duduclaw-gateway/src/tts.rs` | Filter protected TTS to configured existing official cloud providers. |
+| `duduclaw-inference/src/whisper.rs` | Fixed no-proxy/no-redirect client, bounded response stream and collector tests. |
+| `duduclaw-cli/src/mcp/knowledge_client.rs` | Refuse protected file proposals before the signed request. |
+| `duduclaw-cli/src/mcp_isolation.rs` | Treat exact skill target fields as product data, retaining identity-override denial. |
+| `duduclaw-isolation/src/worker.rs` | Add bounded skill/audio operations, options and correlated result types. |
+| `duduclaw-mcp-boundary/src/tool_policy.rs` | Host proposal route, extraction Wiki grant and exact skill target argument handling. |
+| `duduclaw-mcp-boundary/src/tool_policy_tests.rs` | Guard proposal/control classification and extraction Wiki requirement. |
+| `duduclaw-mcp-boundary/src/worker_execution.rs` | Compose trusted factories without refusal fallthrough. |
+| `duduclaw-mcp-boundary/src/worker_execution_tests.rs` | Ensure explicit primary refusal cannot invoke fallback or E. |
+| `duduclaw-parse-worker/Cargo.toml` | Reuse the workspace tracing dependency for the shared scanner. |
+| `duduclaw-parse-worker/src/parsers.rs` | Route real skill/audio buffers to bounded engine implementations. |
+| `duduclaw-parse-worker/src/parsers/tests.rs` | Exercise real input files and request-bound scan, prepare and extraction results. |
+| `duduclaw-parse-worker/src/parsers/audio.rs` | New bounded WAV container and MP3 frame inspection with malformed-input tests. |
+| `duduclaw-parse-worker/src/parsers/skill_text.rs` | New own-skill body and graduation metadata preparation; no shared overwrite. |
+| `duduclaw-parse-worker/src/parsers/skill_knowledge.rs` | New bounded data adapter for the shared extraction rules. |
+| `Cargo.lock` | Record tracing as an existing parse-worker dependency. |
+| `CHANGELOG.md` | Update the self-contained Unreleased implementation/remaining-gates entry. |
+| `docs/features/05-security-defense.md` | English implementation limits and non-acceptance boundary. |
+| `docs/features/zh-TW/05-security-defense.md` | Matching Traditional Chinese implementation limits. |
+| `docs/features/ja-JP/05-security-defense.md` | Matching Japanese implementation limits. |
+| `docs/architecture/native-linux-isolation.md` | This current tool matrix, evidence and next-owner handoff. |
+
+**Next required work:** implement the five MISSING rows without shrinking their
+inventory; then finish descriptor-staged knowledge file proposals, shared
+adoption statistics under field-limited host authority, other media formats and
+bulk TTS output delivery, and the remote/real-service gates above. I1a/I1b/I1d/I1e
+ownership is unchanged. No worktree was created by this continuation; this
+owner-supplied dirty worktree is intentionally retained for the next round.
+
+
+### I1c round 3 handoff — remaining lifecycle controls (2026-11-05)
+
+**Status: PARTIAL; uncommitted; all-E readiness NOT flipped.** This section
+supersedes round 2 for its last five tools. The user timebox takes precedence
+over completing unsafe sinks. No gateway/CLI build, `cargo fmt`, commit,
+installation, model/provider request, production-home write or release occurred.
+The pre-existing worktree and rounds 1–2 edits remain in place.
+
+#### Current last-five inventory
+
+| Tool | Concrete round-3 behavior | Remaining / limits |
+| --- | --- | --- |
+| `skill_from_recording` | Authenticated host Service route; no fabricated parser input. Linux no-follow opens of every recording component, regular/single-link/capped files, exact metadata id/owner and finalization marker. Raw HAR/actions/desktop JSONL snapshots are reduced in E; host utility retains caller/autonomy/runtime/provider controls; actual model bytes receive E scan before the original custom-skill draft + pending approval flow. | No native end-to-end draft/approval/install acceptance. Existing dashboard approval side-effect remains a separate downstream path; its own parser isolation was not closed here. HAR URL userinfo/fragments and query values plus goto URLs are sanitized; normal screen/selector/title text may still contain secrets. The HAR/action envelope refuses before serialization when the conservative sixfold JSON-escape bound exceeds 64 MiB (about 10.6 MiB raw aggregate). |
+| `skill_hub_install` | Authenticated host Service route and original post-scan install approval. Configured `anthropic-skills` only, using the registry's existing immutable commit constant. Bounded pinned public fetch, no redirects/proxies, require 2xx; E full YAML/loader-field-type validation, exact requested name and deterministic scan. Existing trust/history lock order and signature rechecks retained; exact approved bytes are E-checked again, new-file publication is fd-anchored/fsynced/no-clobber/read back, then curation/signature metadata is recorded. | Community hubs are explicitly unavailable until their manifest fetch/JSON stages are isolated. Existing destinations refuse overwrite. A failure after file publication but before curation is unconfirmed, not rollback. No live fetch/approval/publication was run. |
+| `skill_curator_status` | Authenticated host status route, strict optional boolean `run`; no artificial file. | **Full producer MISSING.** `run=true` refuses before opening the store. `curator::run_pass` itself refuses when E isolation is required, covering scheduler/direct callers too. Recursive discovery and fd-bound archive/report publication still need implementation. Manifest stays `MissingFactory` even though status can work. |
+| `skill_synthesis_run` | Authenticated host orchestration with existing caller/subject/autonomy gates. Preview reads only host-selected dated files through no-follow regular/single-link bounded snapshots. E parses actual JSONL, normalizes the original AuditEvent schema to bounded trajectory evidence, and returns it for the original host scoring. No API key enters E. | **Full producer MISSING.** Protected full mode refuses before reading events or billing a model. Model-response parsing/scanning, graduation transformation, approval/policy semantics and checked publication still need a complete producer. Manifest stays `MissingFactory`; preview alone is not readiness. Evidence cap: 8 MiB/file, 64 KiB/line, 1,000 normalized events/file, 5,000/run, original lookback <=30 days. |
+| `meeting_transcribe` | Authenticated host job creation/upload/ownership/approval/cancel/accounting flows retained. The actual private media snapshot, after original digest binding, is E-inspected; duration comes from validated sample/frame counts. Existing configured provider credentials and transcript persistence stay host-side. | WAV/MP3 only, matching extension, <=25 MiB and <=30 min. Unsupported/large/video/chunked media refuses before provider dispatch; protected path never calls gateway-uid ffmpeg/ffprobe. Full ffmpeg media chunking still needs E/A. No job/provider/cancellation live acceptance was run. |
+
+`tool_policy` moves these orchestration/control entry points to Service without
+removing a single advertised tool or resource requirement. List and call still
+require resource eligibility for these host controls. This is not proof of
+parser readiness: Service manifest checks require the installed parser for the
+implemented data workflows and explicitly report synthesis/curator as missing.
+`isolation_readiness::Components::current().parse_worker` remains
+`PendingIntegration`; the comprehensive protected boot gate remains closed.
+The two remaining missing full producers must not be hidden or relabeled ready.
+
+#### Contract and dependencies
+
+**CONTRACT CHANGE (additive only):** `SummarizeRecording`,
+`InspectSkillManifest`, `ReadEvolutionEvents`; bounded Recording/SkillManifest
+options, `RecordingSummary` and the correlated Recording result. Evolution
+normalization uses bounded Text items and remains subject to response/frame
+budgets. No canonical signing bytes, protocol version or existing hard ceiling
+changed. Matching verified E binary generation is still required; older workers
+must reject the new operations.
+
+E adds optional `url` and `serde_yaml`, and enables chrono's existing clock
+feature for the reused event schema. These are already locked workspace package
+versions, not new external versions. Inference now depends on E's client-only
+crate; no `engine` feature is enabled in the host. Recording reduction deliberately
+has a stricter URL sanitizer than legacy, but currently duplicates legacy pure
+rules; consolidating the source without weakening that sanitizer is follow-up
+maintenance.
+
+#### Round-3 file map
+
+| File under `crates/` unless stated | Change |
+| --- | --- |
+| `duduclaw-cli/src/mcp_recording_distill.rs` | Host-owned recording snapshots, E evidence reduction/scan, original utility and pending-approval staging. |
+| `duduclaw-cli/src/mcp/skills.rs` | Reject protected curator mutation before store access. |
+| `duduclaw-cli/src/mcp_isolation.rs`, `_tests.rs` | Typed curator control args, parser requirement for implemented host controls, explicit missing full synthesis/curator manifests. |
+| `duduclaw-agent/src/skill_hub.rs` | Export the existing official repo/pin constants, preserving a single source pin. |
+| `duduclaw-gateway/src/isolation_worker_plans.rs`, `_tests.rs` | Secure recording and absolute evidence snapshots; shared fd-bound new-file publication sink and path/owner regressions. |
+| `duduclaw-gateway/src/skill_lifecycle/hub_install.rs` | Protected official-source fetch/E scan/approval-separated install with trust/history locks and curation. |
+| `duduclaw-gateway/src/skill_lifecycle/curator.rs` | Guard scheduler/direct protected passes until isolated archive/report sink exists. |
+| `duduclaw-gateway/src/skill_synthesis_pipeline/pipeline.rs` | E-backed preview evidence; full protected mode refuses before model dispatch. |
+| `duduclaw-inference/Cargo.toml`, `src/transcription/pipeline.rs` | Client-only E dependency and protected real-snapshot media branch, no local probe/chunk helper. |
+| `duduclaw-isolation/src/worker.rs` | Additive bounded recording/manifest/event protocol and result validation. |
+| `duduclaw-mcp-boundary/src/tool_policy.rs`, `_tests.rs` | Authenticated host orchestration routes with unchanged resource inventory. |
+| `duduclaw-parse-worker/Cargo.toml`, `src/adapters.rs` | Existing-version parser dependencies and bounded recording/manifest/event/audio adapters. |
+| `duduclaw-parse-worker/src/parsers.rs`, `parsers/tests.rs` | Real fd operations and request-bound regressions. |
+| `duduclaw-parse-worker/src/parsers/recording.rs` (new) | HAR/action/event parsing, secret URL reduction, prompt summary, placeholder backstop and regressions. |
+| `duduclaw-parse-worker/src/parsers/evolution.rs` (new) | Bounded JSONL reduction using the original event schema. |
+| `duduclaw-parse-worker/src/parsers/skill_text.rs` | Full YAML install validation against supported loader field types. |
+| `Cargo.lock`, `CHANGELOG.md`, security feature docs (en/zh-TW/ja-JP), this note | Dependency edges and accurate partial integration boundaries. |
+
+#### Validation and follow-up commands
+
+All commands use `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and
+`CARGO_TARGET_DIR=/private/tmp/iso-i1c-boundary-target`:
+
+- `cargo test -p duduclaw-parse-worker --features engine --lib --offline --locked`:
+  **125 passed**, log `/private/tmp/iso-i1c-r3-worker.log`. This includes tests
+  imported with the shared event schema, not 125 newly authored tests.
+- `cargo test -p duduclaw-mcp-boundary --lib --offline`: **66 passed**, log
+  `/private/tmp/iso-i1c-r3-boundary.log`.
+- `cargo test -p duduclaw-isolation --lib --offline --locked`: **32 passed**,
+  log `/private/tmp/iso-i1c-r3-contract.log`.
+- `cargo check -p duduclaw-parse-worker --features engine --target
+  x86_64-unknown-linux-gnu --offline --locked`: **passed**, log
+  `/private/tmp/iso-i1c-r3-worker-linux.log`.
+- Standalone source harness `/private/tmp/iso-i1c-r3-source-harness`:
+  `cargo check --manifest-path /private/tmp/iso-i1c-r3-source-harness/Cargo.toml --lib --offline` and
+  `cargo check --manifest-path /private/tmp/iso-i1c-r3-source-harness/Cargo.toml --tests --target
+  x86_64-unknown-linux-gnu --offline`: **passed**. It checks the actual recording
+  handler, gateway snapshots and exact copied protected hub/audio/evidence
+  function bodies. Unrelated gateway/CLI APIs are facades; this is **not** full
+  product compilation or publication/provider behavior. The TLS backend is
+  disabled in the harness; this is not a network/TLS check.
+- `cargo test --manifest-path /private/tmp/iso-i1c-r3-source-harness/Cargo.toml --lib --offline`:
+  **71 passed**. The full recording handler's original product tests are
+  deliberately excluded from harness test mode. Linux-only snapshot regressions
+  were cross-type-checked, not executed on macOS.
+- `git diff --check`: passed. Early source-harness offline resolution rejected a
+  yanked transitive version without the workspace lock; reusing the workspace
+  lock fixed resolution. Missing harness facades were added before the passing
+  checks. An initial shared schema build needed chrono clock, now explicit.
+- Independent read-only review prompted fixes for recording URL userinfo/
+  encoded query values, URL-only placeholder bookkeeping, hub non-2xx handling,
+  actual YAML validation (including explicit-null enum refusal), retained host-control resource eligibility and keeping unsafe curator sinks disabled. Final review
+  found no uncorrected definite High/Critical. **Not Daybreak review**; the
+  assigned security review and product/native/provider gates remain open.
+
+Owner remote builder (normal production feature flags; do not substitute facades):
+
+```sh
+cargo check -p duduclaw-gateway --features isolation-worker-integration
+cargo check -p duduclaw-cli
+cargo test -p duduclaw-gateway i1c_
+cargo test -p duduclaw-gateway skill_lifecycle::hub_install
+cargo test -p duduclaw-gateway skill_lifecycle::curator
+cargo test -p duduclaw-gateway skill_synthesis_pipeline
+cargo test -p duduclaw-cli mcp_recording_distill
+cargo test -p duduclaw-cli mcp_isolation
+cargo test -p duduclaw-cli wp5_install_approval
+cargo test -p duduclaw-inference transcription
+cargo test -p duduclaw-parse-worker --features engine
+cargo test -p duduclaw-mcp-boundary
+cargo test -p duduclaw-isolation
+```
+
+**Next blocking work:** complete synthesis's model-result and checked graduation
+stages; complete curator's recursive E discovery plus fd-bound archive/report
+sinks; then test all E inventory paths and only then update the readiness hook.
+Also retain round-2 follow-ups: knowledge authorized-file staging, shared-adoption
+metadata, richer media/chunking, real transport/retirement/provider/publication,
+matching-generation deployment and root-capable native Linux acceptance.
+
+### I1c round 4 handoff — synthesis and curator publication (2026-11-05)
+
+**Status: both remaining E producers implemented; uncommitted.** This section
+supersedes round 3's synthesis/curator missing-producer notes. This is source
+integration with bounded supported inputs, not native Linux acceptance or a
+full gateway/CLI build. Rounds 1–3 remain in the same working tree. No commit,
+`cargo fmt`, gateway/CLI local build, production-home write, deployment, model
+request, provider request, real approval or release was performed.
+
+#### Completed product paths
+
+- **Synthesis:** original event scoring, subject/caller autonomy admission,
+  budget and provider dispatch remain host-owned. Protected full mode now
+  stages the exact actual model response and its first generation timestamp
+  outside loader roots. Retries reuse that response instead of billing a model
+  again while a matching proposal is pending. The key includes host subject,
+  evidence and prompt. E parses the model's YAML, validates install field types,
+  transforms graduation metadata, validates the effective YAML again and scans
+  the final artifact. The host independently validates the returned publication
+  name and binds the preview bytes/name/subject to a one-use dashboard Admin
+  approval. Only after approval and renewed subject/caller admission does the
+  host publish a new global skill with no-clobber, fsync and readback, followed
+  by a separate publication receipt. Protected synthesis writes directly to
+  global scope after approval, rather than temporarily activating a local copy.
+  Successful receipt replay skips that evidence; legacy mode keeps its original
+  local-to-global flow. The generation timestamp is preserved across retries;
+  `validated_lift` remains zero because trajectory quality is not measured lift.
+- **Curator:** `run=true` and scheduled/direct `run_pass` now use the real
+  protected maintenance path. Host enumeration retains directory descriptors,
+  refuses symlinks/hardlinks/special skill files and checks entry/file/depth
+  bounds before allocation. E parses actual skill snapshots. Loader identities
+  come from host-selected layouts, not YAML name: root Markdown and nested
+  case-insensitive SKILL.md only; hidden/reference Markdown is ignored, plain
+  legacy files work, SKILL.md wins over same-name flat files. Multiple spec
+  layouts for one case-insensitive name refuse as ambiguous. The approval
+  preview describes actual stale/reactivate/archive/remove-missing/unmanaged
+  actions, bound to snapshot hashes, ordered curation records, usage and strict
+  live settings. The host repeats discovery/config/state checks after consuming
+  approval and rechecks each row's pin/usage before mutation. No baseline rows
+  are inserted before approval. Flat artifacts archive using fd-anchored
+  `renameat2(RENAME_NOREPLACE)`, fsync and content readback; a durable intent is
+  saved first. Nested artifacts are marked unmanaged rather than moved. Reports
+  are unique no-clobber files with readback, not an unsafe read/append overwrite.
+- **Approval/readiness:** `isolated_skill_publication` reuses the existing
+  persisted shared gate with exact content/state binding, single consumption,
+  30-minute post-decision validity, pending/push caps and Admin-only dashboard
+  decisions through the existing registry. Full previews remain in the host
+  dashboard; channel notices contain no model body. All five host E controls
+  require an installed parser in the CLI manifest; synthesis/curator no longer
+  return `MissingFactory`. The gateway's E component is Ready only with an
+  explicit installed launcher, constructed/healthy boot composition and fresh
+  authenticated updated generation evidence; otherwise Unavailable. Other
+  composite readiness gates remain unchanged and can still block execution.
+
+#### Contract and changed-file map (round 4 only)
+
+**CONTRACT CHANGE (additive):** `ReadSkillIdentity`,
+`PrepareSynthesizedSkill`, bounded `SkillIdentity`/`SynthesizedSkill` options;
+existing Text/PreparedSkill result kinds gain correlated operation validation.
+No canonical bytes, version or existing hard ceiling changed. A matching worker
+binary generation must be deployed; an old worker rejects new operations. No
+new production dependency was added this round.
+
+| File under `crates/` unless stated | Round-4 change |
+| --- | --- |
+| `duduclaw-isolation/src/worker.rs` | Additive bounded identity/synthesis operation/options and result correlation. |
+| `duduclaw-parse-worker/src/parsers.rs`, `parsers/skill_text.rs`, `parsers/tests.rs`, `adapters.rs` | Actual-file parsing, final-artifact scan, strict typed host adapters and regressions. |
+| `duduclaw-parse-worker/src/client.rs` | Read-only explicit-launcher installation observation. |
+| `duduclaw-gateway/src/skill_lifecycle/isolated.rs` (new) | Host approval spec, bounded fd inventory/archive, durable archive intents, generation cache/publication receipts and Linux regressions. |
+| `duduclaw-gateway/src/skill_lifecycle/curator_protected.rs` (new), `curator.rs`, `mod.rs` | Actual approved protected curator pass and module wiring. |
+| `duduclaw-gateway/src/skill_synthesis_pipeline/pipeline.rs` | Isolated generation preview, retry cache, host approval and checked publication. |
+| `duduclaw-gateway/src/approval/operator_cli_gate.rs`, `_tests.rs` | Registry-driven dashboard/Admin gate and bound/single-use regression. |
+| `duduclaw-gateway/src/isolation_worker_plans.rs` | Share bounded host snapshot reader; independently reject unsafe publication path components. |
+| `duduclaw-gateway/src/isolation_readiness.rs` | Conditional installed E readiness, no unconditional Ready. |
+| `duduclaw-cli/src/mcp/skills.rs`, `mcp_isolation.rs` | Remove protected mutation refusal and missing-factory special cases, retain parser/resource authorization. |
+| `CHANGELOG.md`, security feature docs (en/zh-TW/ja-JP), this note | Current source behavior and honest remaining acceptance gates. |
+
+#### Validation evidence
+
+Commands use `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` and
+`CARGO_TARGET_DIR=/private/tmp/iso-i1c-boundary-target`:
+
+- `cargo test -p duduclaw-parse-worker --features engine --lib --offline --locked`:
+  **129 passed**; `/private/tmp/iso-i1c-r4-worker.log`.
+- `cargo test -p duduclaw-mcp-boundary --lib --offline --locked`:
+  **66 passed**; `/private/tmp/iso-i1c-r4-boundary.log`.
+- `cargo test -p duduclaw-isolation --lib --offline --locked`:
+  **32 passed**; `/private/tmp/iso-i1c-r4-contract.log`.
+- `cargo check -p duduclaw-parse-worker --features engine --target
+  x86_64-unknown-linux-gnu --offline --locked`: passed;
+  `/private/tmp/iso-i1c-r4-worker-linux.log`.
+- Source harness `/private/tmp/iso-i1c-r4-source-harness`: macOS `cargo check
+  --lib --offline`, Linux `cargo check --lib --target x86_64-unknown-linux-gnu
+  --offline`, and Linux `cargo check --tests --target x86_64-unknown-linux-gnu
+  --offline` passed. The actual full pipeline, protected curator, host filesystem
+  helpers and actual custom-skill store production bodies are checked, with
+  unrelated runtime/approval/provider APIs supplied by fail-closed facades.
+  For test mode, legacy curator/custom-store tests are excluded from temporary
+  source copies; this is not their product test acceptance. Linux checks use
+  `LIBSQLITE3_SYS_USE_PKG_CONFIG=1 PKG_CONFIG_ALLOW_CROSS=1` to avoid compiling
+  SQLite C with the macOS compiler: Rust metadata only, no Linux linking or
+  execution is claimed. Logs: `/private/tmp/iso-i1c-r4-source.log`,
+  `-source-linux.log`, `-source-linux-tests.log`.
+- Harness `cargo test --lib i1c_ --offline`: **14 passed**, 140 filtered;
+  `/private/tmp/iso-i1c-r4-source-tests.log`. Linux-only archive/snapshot/cache
+  regressions were cross-type-checked, not executed on this Mac.
+- `git diff --check`: passed. Early E negative test used an injection string
+  rated Medium by the existing scanner; replaced with the existing blocked
+  secret-exfiltration pattern (policy unchanged). Initial Linux source harness
+  bundled SQLite C build failed without a cross C toolchain; metadata-only
+  pkg-config configuration above then passed. Early harness missing API facades
+  were corrected before passing; no gateway/CLI build was used.
+- Independent read-only code review caught loader identity/reference-file
+  incompatibility, bounded enumeration, accurate action previews, strict config,
+  live-state check ordering, generation time and archive cancellation recovery
+  evidence; corrected. Final review found no definite remaining High/Critical.
+  **Not Daybreak review**; assigned security/native/product review stays open.
+
+#### Remaining acceptance and explicit limitations
+
+1. Owner remote builder must compile real gateway/CLI with production features;
+   the source harness is not a substitute. Run:
+   `cargo check -p duduclaw-gateway --features isolation-worker-integration`,
+   `cargo check -p duduclaw-cli`,
+   `cargo test -p duduclaw-gateway i1c_`,
+   `cargo test -p duduclaw-gateway skill_lifecycle::curator`,
+   `cargo test -p duduclaw-gateway skill_synthesis_pipeline`,
+   `cargo test -p duduclaw-gateway approval::operator_cli_gate`,
+   `cargo test -p duduclaw-gateway isolation_readiness`,
+   `cargo test -p duduclaw-cli mcp_isolation`, plus round-3 commands for other
+   E workflows. Run E/contract/boundary suites on matching native Linux too.
+2. Exercise actual pending/deny/expiry/approve/replay, cancellation, destination
+   collision and policy/source changes through authenticated transport and the
+   real dashboard. No live model, credentials, provider billing or publication
+   was exercised this round. Matching generation deployment and root retirement
+   evidence remain separate acceptance gates.
+3. Archive intents are not automatically reconciled or cleared. If cancellation
+   or DB failure occurs after rename but before Archived is recorded, a later
+   pass detects the missing source plus intent and pauses rather than deleting
+   tracking. An Admin must inspect the receipt and archive, then reconcile.
+   Restore/re-archive after changed content can also require manual intent
+   reconciliation. Source publication, archive DB update and report publication
+   are not one atomic cross-store transaction: partial application is reported
+   as unconfirmed/failure, never as rolled back or complete. Report bytes over
+   the 64 KiB host publication ceiling fail explicitly.
+4. Generation cache/publication receipts persist without automatic GC. A crash
+   after global publication but before its receipt can leave a landed skill
+   reported unconfirmed; no-clobber prevents a retry from replacing it. Global
+   publication intentionally does not activate a temporary agent-local skill or
+   append the legacy unanchored graduation JSONL; the separate durable receipt
+   and normal success event carry protected completion evidence.
+5. Retain previous bounded refusals: protected knowledge **file** staging,
+   community hub manifests, command/local TTS and larger/video/chunked media;
+   shared-adoption usage metadata is not updated. These are explicit supported-
+   subset boundaries, not fabricated successful producers. No Linux root,
+   native transport/retirement, provider, publication or customer acceptance has
+   been established by the checks above.

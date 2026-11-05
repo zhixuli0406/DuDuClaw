@@ -85,9 +85,16 @@ pub fn install_boot_sources(sources: BootSources) -> Result<(), VerificationErro
     *slot = Some(sources);
     Ok(())
 }
-fn fill_installed_sources(sources: &mut BootSources) {
+fn fill_installed_sources(sources: &mut BootSources, home: &Path) {
     let generation = crate::isolation_readiness::verified_generation();
     sources.installed_generation = generation;
+    if sources.worker_plans.is_none() {
+        // A real partial producer, not a completeness bypass: the dispatcher
+        // still refuses boot until every remaining product tool is wired.
+        if let Ok(factory) = crate::isolation_worker_plans::GatewayWorkerPlans::new(home.to_owned()) {
+            sources.worker_plans = Some(Arc::new(factory));
+        }
+    }
     if sources.main_plans.is_none() {
         if let Some(generation) = generation {
             if let Ok(factory) = duduclaw_spawnd::gateway_plan::InstalledMainPlanFactory::new(
@@ -143,7 +150,7 @@ pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agen
         if crate::isolation_readiness::verified_generation().is_some() { break; }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    fill_installed_sources(&mut sources);
+    fill_installed_sources(&mut sources, home);
     let backend = duduclaw_execution::selection::protected_backend_for_boot();
     // Reuse the gateway's initialized users.db and confirmed employee registry.
     // No parallel principal/binding database is created for the boundary.
@@ -408,9 +415,13 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
     let resolver = Arc::new(resolver);
     #[cfg(feature = "isolation-worker-integration")]
     {
+        let defaults = crate::isolation_worker_plans::GatewayWorkerPlans::for_employee(
+            owner.home.clone(), input.agent.clone(), input.plan.employee)?.with_roots(input.roots.clone());
+        let worker_plans = Arc::new(duduclaw_mcp_boundary::worker_execution::CompositeWorkerPlans::new(
+            vec![owner.worker_plans.clone(), Arc::new(defaults)])?);
         let factories = GatewayFactories::assemble(Some(owner.backend.clone()), Some(owner.execution_plans.clone()),
             resolver.clone(), Some(owner.worker.parser.clone()))?
-            .with_worker(owner.worker.tools(owner.worker_plans.clone(), resolver.clone()));
+            .with_worker(owner.worker.tools(worker_plans, resolver.clone()));
         let dispatcher_input = DispatcherInput {
             home: owner.home.clone(), employee: input.plan.employee, agent: input.agent,
             roots: input.roots, resolver, factories, turns: owner.turns.clone(), connectors: owner.connectors.clone(),

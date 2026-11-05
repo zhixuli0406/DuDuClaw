@@ -120,6 +120,11 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
+fn verify_tts_authority() -> Result<(), String> {
+    duduclaw_mcp_boundary::io_authority::verify_before_io()
+        .map_err(|_| "Isolated TTS authority unavailable".into())
+}
+
 // ── Provider trait ──────────────────────────────────────────────
 
 /// Abstract TTS provider.
@@ -215,6 +220,7 @@ impl TtsProvider for MiniMaxTts {
             output_format: "mp3".to_string(),
         };
 
+        verify_tts_authority()?;
         let response = http_client()
             .post(MINIMAX_T2A_URL)
             .header("Authorization", format!("Bearer {}", self.api_key))
@@ -321,6 +327,7 @@ impl TtsProvider for AzureTts {
             .timeout(std::time::Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .build().map_err(|_| "Azure Speech HTTP client initialization failed".to_string())?;
+        verify_tts_authority()?;
         let response = client
             .post(format!("https://{}.tts.speech.microsoft.com/cognitiveservices/v1", self.region))
             .header("Ocp-Apim-Subscription-Key", &self.api_key)
@@ -408,6 +415,7 @@ impl TtsProvider for OpenAiTtsProvider {
             "response_format": "mp3",
         });
 
+        verify_tts_authority()?;
         let resp = http_client()
             .post("https://api.openai.com/v1/audio/speech")
             .header("Authorization", format!("Bearer {}", self.api_key))
@@ -632,6 +640,14 @@ impl TtsRouter {
         router
     }
 
+    /// Protected E tools may use official HTTP providers only. Configured
+    /// local/command selection stays unavailable until A has a concrete plan.
+    pub fn for_protected_home(home: &std::path::Path) -> Self {
+        let mut router = Self::for_home(home);
+        router.providers.retain(|provider| matches!(provider.name(), "minimax" | "azure" | "openai-tts"));
+        router
+    }
+
     fn load_inference_config(home: &std::path::Path) -> Result<toml::Table, ()> {
         let config_path = home.join("inference.toml");
         match std::fs::read_to_string(&config_path) {
@@ -755,6 +771,7 @@ impl TtsProvider for TtsRouter {
                 let policy = crate::product_policy::load(home)?;
                 if policy.require_provider(provider.name()).is_err() { continue; }
             }
+            verify_tts_authority()?;
             match provider.synthesize(text, voice).await {
                 Ok(audio) if audio.len() > MAX_TTS_AUDIO_BYTES => return Err(audio_limit_error()),
                 Ok(audio) if !audio.is_empty() => {

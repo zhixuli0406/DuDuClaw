@@ -38,11 +38,26 @@ pub(crate) fn boundary_route(name: &str) -> Option<BoundaryRoute> {
     })
 }
 
+fn host_e_control(name: &str) -> bool {
+    matches!(name, "skill_from_recording" | "skill_hub_install" | "skill_curator_status" | "skill_synthesis_run" | "meeting_transcribe")
+}
+
 /// Target fields in the original tool schema are data, never caller identity.
 /// Preserve them for the existing record/delegation/scope policy. Other routes
 /// still prohibit host path and execution identity overrides.
 pub(crate) fn check_tool_arguments(name: &str, arguments: &Value) -> Result<(), VerificationError> {
+    if name == "skill_curator_status" {
+        let fields = arguments.as_object().ok_or(VerificationError::Invalid)?;
+        if fields.keys().any(|key| key != "run") || fields.get("run").is_some_and(|v| v.as_bool().is_none()) {
+            return Err(VerificationError::Invalid);
+        }
+    }
     if !matches!(boundary_route(name), Some(BoundaryRoute::Resource)) {
+        if matches!(name, "skill_security_scan" | "skill_graduate" | "skill_extract") {
+            let mut data = arguments.clone();
+            data.as_object_mut().ok_or(VerificationError::Invalid)?.remove("agent_id");
+            return duduclaw_mcp_boundary::check_arguments(&data);
+        }
         return duduclaw_mcp_boundary::check_arguments(arguments);
     }
     let fields = arguments.as_object().ok_or(VerificationError::Invalid)?;
@@ -187,7 +202,9 @@ pub(crate) fn tool_allowed(name: &str, principal: &Principal) -> bool {
         Some(BoundaryRoute::File) => name == "file_read" || call.parser.is_some(),
         Some(BoundaryRoute::Worker) => call.worker.as_ref().is_some_and(|bridge| bridge.supports(name)),
         Some(BoundaryRoute::Execution) => call.execution.as_ref().is_some_and(|bridge| bridge.supports(name)),
-        Some(BoundaryRoute::Resource) => call.services.as_ref().is_some_and(|service| service.supports(name)),
+        Some(BoundaryRoute::Resource) => call.services.as_ref().is_some_and(|service| service.supports(name))
+            && (!host_e_control(name) || call.parser.is_some())
+            && (name != "web_fetch_cached" || call.record_resolver.is_some()),
         None => false,
     };
     supported && duduclaw_mcp_boundary::tool_policy::eligible(&call.context, name)
@@ -234,7 +251,9 @@ impl IsolationDispatcher {
             } else {
                 let ready = match boundary_route(name) {
                     Some(BoundaryRoute::File) => name == "file_read" || self.parser.is_some(),
-                    Some(BoundaryRoute::Resource) => self.services.as_ref().is_some_and(|s| s.supports(name)),
+                    Some(BoundaryRoute::Resource) => self.services.as_ref().is_some_and(|s| s.supports(name))
+                        && (!host_e_control(name) || self.parser.is_some())
+                        && (name != "web_fetch_cached" || self.record_resolver.is_some()),
                     Some(BoundaryRoute::Execution) => self.execution.as_ref().is_some_and(|s| s.supports(name)),
                     Some(BoundaryRoute::Worker) => self.worker.as_ref().is_some_and(|s| s.supports(name)),
                     None => false,
@@ -427,6 +446,9 @@ impl IsolationDispatcher {
 
 fn project_tool_schema(tool: &mut Value) {
     let name = tool["name"].as_str().unwrap_or("").to_owned();
+    // Skill producers validate this schema's agent selector against the bound
+    // employee; it is data and must not be rewritten into another field.
+    if matches!(name.as_str(), "skill_security_scan" | "skill_graduate" | "skill_extract") { return; }
     if matches!(boundary_route(&name), Some(BoundaryRoute::Resource)) {
         if duduclaw_gateway::isolation_connectors::provider_for_tool(&name).is_some() {
             if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {

@@ -115,22 +115,101 @@ impl duduclaw_isolation::execution::ExecutionAuthority for AuthorizedWorkspace {
     }
 }
 
-/// A regular-file descriptor selected through the call's workspace dirfd. Its
-/// grant, call binding and dev/inode travel together through worker admission.
+/// A regular-file descriptor selected through a workspace dirfd or a reviewed
+/// host snapshot source. Its selected grant, call binding and dev/inode travel
+/// together through worker admission.
 pub struct AuthorizedFile {
     binding: CallBinding,
     grant: ResourceGrant,
     file: File,
     identity: (u64, u64),
     invocation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    operation: Option<duduclaw_isolation::worker::ParseOperation>,
+}
+/// Reviewed gateway snapshots. A snapshot is bound to the exact call and its
+/// selected source grant; arbitrary descriptors cannot acquire worker authority.
+pub enum HostSnapshotSource<'a> {
+    WebFetch { url: &'a str },
+    InlineAudio,
+    SynthesizedSpeech,
+    Skill { agent: &'a str, name: &'a str },
 }
 impl AuthorizedFile {
+    pub fn from_host_snapshot(call: &crate::tool_policy::AuthorizedToolCall,
+        source: HostSnapshotSource<'_>, bytes: &[u8]) -> Result<Self, VerificationError> {
+        use duduclaw_isolation::worker::ParseOperation;
+        use std::io::{Seek, SeekFrom, Write};
+        call.context().verify_live(crate::authority::now_seconds()?)?;
+        let own = ResourceGrant::Employee { id: call.context().record().employee };
+        if !call.resources().contains(&own) { return Err(VerificationError::BindingMismatch); }
+        let (grant, operation, cap) = match source {
+            HostSnapshotSource::WebFetch { url } => {
+                if call.name() != "web_extract" || call.arguments().get("url").and_then(serde_json::Value::as_str) != Some(url) {
+                    return Err(VerificationError::BindingMismatch);
+                }
+                let parsed = url::Url::parse(url).map_err(|_| VerificationError::Invalid)?;
+                if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none()
+                    || !parsed.username().is_empty() || parsed.password().is_some() {
+                    return Err(VerificationError::Invalid);
+                }
+                let origin = parsed.origin().ascii_serialization();
+                let grant = call.resources().iter().find(|r| matches!(r,
+                    ResourceGrant::UrlOrigin { origin: selected } if selected.as_str() == origin))
+                    .ok_or(VerificationError::BindingMismatch)?.clone();
+                (grant, ParseOperation::ExtractHtml, 5 * 1024 * 1024)
+            }
+            HostSnapshotSource::InlineAudio => {
+                if call.name() != "transcribe_audio"
+                    || call.arguments().get("audio_base64").and_then(serde_json::Value::as_str).is_none() {
+                    return Err(VerificationError::BindingMismatch);
+                }
+                (own, ParseOperation::InspectAudio, 25 * 1024 * 1024)
+            }
+            HostSnapshotSource::SynthesizedSpeech => {
+                if call.name() != "synthesize_speech"
+                    || call.arguments().get("text").and_then(serde_json::Value::as_str).is_none() {
+                    return Err(VerificationError::BindingMismatch);
+                }
+                (own, ParseOperation::InspectAudio, 128 * 1024)
+            }
+            HostSnapshotSource::Skill { agent, name } => {
+                let operation = match call.name() {
+                    "skill_security_scan" => ParseOperation::ScanSkill,
+                    "skill_extract" => ParseOperation::ExtractSkill,
+                    "shared_skill_adopt" | "skill_graduate" => ParseOperation::PrepareSkill,
+                    _ => return Err(VerificationError::BindingMismatch),
+                };
+                if call.arguments().get("skill_name").and_then(serde_json::Value::as_str) != Some(name)
+                    || ["agent_id", "target_agent"].iter().filter_map(|key| call.arguments().get(key))
+                        .any(|value| value.as_str() != Some(agent)) {
+                    return Err(VerificationError::BindingMismatch);
+                }
+                let workspaces = call.resources().iter().filter(|r| matches!(r, ResourceGrant::Workspace { .. })).collect::<Vec<_>>();
+                let [grant] = workspaces.as_slice() else { return Err(VerificationError::BindingMismatch); };
+                ((*grant).clone(), operation, 64 * 1024)
+            }
+        };
+        if bytes.len() > cap { return Err(VerificationError::Invalid); }
+        let mut file = tempfile::tempfile().map_err(|_| VerificationError::Unavailable)?;
+        file.write_all(bytes).map_err(|_| VerificationError::Unavailable)?;
+        file.seek(SeekFrom::Start(0)).map_err(|_| VerificationError::Unavailable)?;
+        let mut token = Self::from_opened(CallBinding::new(call), grant, file)?;
+        token.operation = Some(operation);
+        Ok(token)
+    }
+    pub(crate) fn verify_operation(&self, operation: duduclaw_isolation::worker::ParseOperation)
+        -> Result<(), VerificationError> {
+        if self.operation.is_some_and(|selected| selected != operation) {
+            return Err(VerificationError::BindingMismatch);
+        }
+        Ok(())
+    }
     fn from_opened(binding: CallBinding, grant: ResourceGrant, file: File) -> Result<Self, VerificationError> {
         if !file.metadata().map_err(|_| VerificationError::Unavailable)?.is_file() {
             return Err(VerificationError::Invalid);
         }
         let identity = file_identity(&file)?;
-        Ok(Self { binding, grant, file, identity, invocation: None })
+        Ok(Self { binding, grant, file, identity, invocation: None, operation: None })
     }
     pub fn metadata(&self) -> Result<std::fs::Metadata, VerificationError> {
         self.file.metadata().map_err(|_| VerificationError::Unavailable)

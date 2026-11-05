@@ -271,3 +271,17 @@ fn the_registry_feeds_reminders_and_dashboard_only_kinds() {
     assert!(!no_reminder(crate::channel_ingress::cli_approval::ACTION_KIND));
     assert!(spec_for("tool_call").is_none());
 }
+
+#[tokio::test]
+async fn i1c_skill_publication_approval_is_registered_bound_and_single_use() {
+    let (_home, broker) = broker();
+    let spec = &crate::skill_lifecycle::isolated::SPEC;
+    assert_eq!(spec_for(spec.kind).unwrap().kind, spec.kind);
+    assert!(crate::approval_notify::is_dashboard_only_kind(spec.kind));
+    let binding = bind("alice:notes", "actual-output-sha256", "exact-source-and-policy");
+    let id = requested(run(&broker, spec, &binding).await);
+    broker.decide(&id, true, "dashboard:admin").await.unwrap();
+    assert!(matches!(run(&broker, spec, &binding).await, Gate::Proceed(_)));
+    assert!(!matches!(run(&broker, spec, &binding).await, Gate::Proceed(_)));
+    assert!(!matches!(run(&broker, spec, &bind("alice:notes", "changed-output", "exact-source-and-policy")).await, Gate::Proceed(_)));
+}

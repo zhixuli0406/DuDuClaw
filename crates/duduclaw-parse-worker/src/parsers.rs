@@ -12,6 +12,17 @@ use duduclaw_isolation::worker::{ContentFormat, ParseError, ParseOperation, Pars
 
 pub(crate) mod archive;
 mod document;
+mod audio;
+mod recording;
+mod evolution;
+mod skill_text;
+mod skill_knowledge;
+// Compile the existing deterministic scanner only in the disposable E engine.
+// Keep one ruleset for the legacy host path and protected worker path.
+#[path = "../../duduclaw-gateway/src/skill_lifecycle/security_scanner.rs"]
+mod security_scanner;
+#[path = "../../duduclaw-gateway/src/skill_lifecycle/sensitive_patterns.rs"]
+mod sensitive_patterns;
 
 pub const MAX_PARSE_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
@@ -57,6 +68,71 @@ fn parse_inner(request: &ParseRequest, inputs: &mut [File])
             .map_err(|_| ParseError::InvalidContent)?;
         if bytes.len() as u64 != declared.size_bytes { return Err(ParseError::InvalidContent); }
         let slot = declared.slot;
+        if request.operation == ParseOperation::ReadSkillIdentity {
+            if declared.format != ContentFormat::Text { return Err(ParseError::InvalidContent); }
+            let name = if let Some(duduclaw_isolation::worker::ParseOptions::SkillIdentity { name }) = &request.options {
+                skill_text::inspect_identity(&bytes, name.as_str())?
+            } else { skill_text::identity(&bytes)? };
+            output.text(slot, None, &name)?;
+            continue;
+        }
+        if let Some(duduclaw_isolation::worker::ParseOptions::SynthesizedSkill { agent, at }) = &request.options {
+            if declared.format != ContentFormat::Text { return Err(ParseError::InvalidContent); }
+            let content = skill_text::synthesize(&bytes, agent.as_str(), at.as_str())?;
+            output.item(ParsedItem::PreparedSkill { input_slot: slot,
+                content: Text::new(content).map_err(|_| ParseError::LimitExceeded)? })?;
+            continue;
+        }
+        if request.operation == ParseOperation::ReadEvolutionEvents {
+            if declared.format != ContentFormat::Text { return Err(ParseError::InvalidContent); }
+            output.text(slot, None, &evolution::normalize(&bytes)?)?;
+            continue;
+        }
+
+        if let Some(duduclaw_isolation::worker::ParseOptions::Recording { desktop, name }) = &request.options {
+            if declared.format != ContentFormat::Text { return Err(ParseError::InvalidContent); }
+            output.item(ParsedItem::Recording { input_slot: slot, summary: recording::summarize(&bytes, *desktop, name.as_str())? })?;
+            continue;
+        }
+        if let Some(duduclaw_isolation::worker::ParseOptions::SkillKnowledge { name, agent, at }) = &request.options {
+            if declared.format != ContentFormat::Text || bytes.len() > 64 * 1024 { return Err(ParseError::LimitExceeded); }
+            output.item(skill_knowledge::extract(&bytes, slot, name.as_str(), agent.as_str(), at.as_str())?)?;
+            continue;
+        }
+        if let Some(duduclaw_isolation::worker::ParseOptions::SkillManifest { name }) = &request.options {
+            if declared.format != ContentFormat::Text || bytes.len() > 64 * 1024 { return Err(ParseError::LimitExceeded); }
+            let content = std::str::from_utf8(&bytes).map_err(|_| ParseError::InvalidContent)?;
+            skill_text::validate_manifest(content, name.as_str())?;
+            let scan = security_scanner::scan_skill(content, None);
+            let findings = scan.findings.iter().map(|f| Text::new(f.description.clone()).map_err(|_| ParseError::LimitExceeded))
+                .collect::<Result<Vec<_>, _>>()?;
+            output.item(ParsedItem::SkillScan { input_slot: slot, passed: scan.passed,
+                risk: Text::new(format!("{:?}", scan.risk_level)).map_err(|_| ParseError::LimitExceeded)?,
+                findings: List::new(findings).map_err(|_| ParseError::LimitExceeded)? })?;
+            continue;
+        }
+        if let Some(duduclaw_isolation::worker::ParseOptions::SkillScan { must_not }
+            | duduclaw_isolation::worker::ParseOptions::SkillPrepare { must_not, .. }) = &request.options {
+            if declared.format != ContentFormat::Text || bytes.len() > 64 * 1024 { return Err(ParseError::LimitExceeded); }
+            let content = std::str::from_utf8(&bytes).map_err(|_| ParseError::InvalidContent)?;
+            let patterns: Vec<String> = must_not.as_slice().iter().map(|p| p.as_str().to_owned()).collect();
+            let scan = security_scanner::scan_skill(content, Some(&patterns));
+            let findings = scan.findings.iter().map(|f| Text::new(format!("[{:?}] {:?} (line {}): {} [pattern: {}]",
+                f.severity, f.category, f.line_number.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                f.description, f.matched_pattern)).map_err(|_| ParseError::LimitExceeded))
+                .collect::<Result<Vec<_>, _>>()?;
+            let risk = Text::new(format!("{:?}", scan.risk_level)).map_err(|_| ParseError::LimitExceeded)?;
+            output.item(ParsedItem::SkillScan { input_slot: slot, passed: scan.passed, risk,
+                findings: List::new(findings).map_err(|_| ParseError::LimitExceeded)? })?;
+            if scan.passed {
+                if let Some(duduclaw_isolation::worker::ParseOptions::SkillPrepare { action, agent, at, .. }) = &request.options {
+                    let content = skill_text::prepare(content, *action, agent.as_str(), at.as_str())?;
+                    output.item(ParsedItem::PreparedSkill { input_slot: slot,
+                        content: Text::new(content).map_err(|_| ParseError::LimitExceeded)? })?;
+                }
+            }
+            continue;
+        }
         if request.options.is_some() {
             output.items.push(crate::adapter_engine::parse(request, &bytes)?);
             continue;
@@ -64,6 +140,9 @@ fn parse_inner(request: &ParseRequest, inputs: &mut [File])
         match (request.operation, declared.format) {
             (ParseOperation::ExtractDocument, format) => {
                 document::extract(format, &bytes, slot, &mut output)?;
+            }
+            (ParseOperation::InspectAudio, ContentFormat::Audio) => {
+                output.item(audio::inspect(&bytes, slot)?)?;
             }
             (ParseOperation::InspectImage, ContentFormat::Image) => {
                 let (width, height) = image_dimensions(&bytes)?;

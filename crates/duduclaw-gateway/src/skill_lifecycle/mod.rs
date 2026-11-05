@@ -7,6 +7,7 @@
 pub mod activation;
 pub mod compression;
 pub mod curator;
+pub mod isolated;
 pub mod diagnostician;
 pub mod distillation;
 pub mod extraction;

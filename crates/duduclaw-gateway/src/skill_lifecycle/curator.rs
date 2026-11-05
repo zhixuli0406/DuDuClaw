@@ -32,6 +32,8 @@
 //! (the same `reports/skill-pipeline/` convention the repo wiki uses).
 
 use std::path::{Path, PathBuf};
+#[path = "curator_protected.rs"]
+mod protected;
 
 use chrono::{DateTime, Utc};
 use tracing::{info, warn};
@@ -394,6 +396,9 @@ pub async fn run_pass(
     cfg: &CuratorConfig,
     now: DateTime<Utc>,
 ) -> Result<CuratorReport, String> {
+    if duduclaw_parse_worker::client::required() {
+        return protected::run(home_dir, store, cfg, now).await;
+    }
     let now_str = now.to_rfc3339();
     let mut report = CuratorReport {
         ran_at: now_str.clone(),

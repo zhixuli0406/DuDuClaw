@@ -164,9 +164,30 @@ fn high_risk_tools_are_never_classified_as_plain_gateway_services() {
     for name in ["code_map", "codrive_run", "execute_program", "fork_run", "spawn_agent", "os_open"] {
         assert_eq!(policy(name).unwrap().route, Route::Execution);
     }
-    for name in ["meeting_transcribe", "transcribe_audio", "model_load", "llamafile_start", "skill_hub_install"] {
+    for name in ["transcribe_audio", "model_load", "llamafile_start"] {
         assert_eq!(policy(name).unwrap().route, Route::Worker);
     }
+}
+
+#[test]
+fn job_control_and_pure_routing_do_not_require_parser_inputs() {
+    for name in ["meeting_upload_link", "meeting_transcribe_status", "meeting_transcribe_cancel", "route_query"] {
+        let entry = policy(name).unwrap();
+        assert_eq!(entry.route, Route::Service, "{name}");
+        assert_eq!(entry.required, &[ResourceKind::Employee], "{name}");
+    }
+    // Creation is authenticated job control; the background media stage requires E.
+    assert_eq!(policy("meeting_transcribe").unwrap().route, Route::Service);
+}
+
+#[test]
+fn raw_web_fetch_keeps_origin_authority_and_html_parsing_requires_worker() {
+    let fetch = policy("web_fetch_cached").unwrap();
+    assert_eq!(fetch.route, Route::Service);
+    assert_eq!(fetch.required, &[ResourceKind::Employee, ResourceKind::UrlOrigin]);
+    let extract = policy("web_extract").unwrap();
+    assert_eq!(extract.route, Route::Worker);
+    assert_eq!(extract.required, fetch.required);
 }
 
 #[test]
@@ -325,4 +346,50 @@ fn employee_scope_worker_outputs_need_separate_confined_grants() {
         &Fixed(vec![employee(), wiki, connector])).is_ok());
     assert!(authorize(&ctx, "meeting_transcribe", &json!({"write_wiki":true}),
         &Fixed(vec![employee(), ResourceGrant::Wiki { namespace: text("shared") }])).is_err());
+}
+
+#[test]
+fn i1c_source_proposals_are_host_control_and_skill_extraction_requires_own_wiki_grant() {
+    assert_eq!(policy("knowledge_add_source").unwrap().route, Route::Service);
+    for tool in ["skill_extract"] {
+        assert_eq!(policy(tool).unwrap().route, Route::Worker, "{tool}");
+    }
+    let without_wiki = vec![employee(), ResourceGrant::Workspace { handle: text("work") }];
+    assert!(!eligible(&context("skill_extract", without_wiki), "skill_extract"));
+    let with_wiki = vec![employee(), ResourceGrant::Workspace { handle: text("work") }, ResourceGrant::Wiki { namespace: text("agent:alice") }];
+    assert!(eligible(&context("skill_extract", with_wiki), "skill_extract"));
+}
+
+#[test]
+fn i1c_host_controls_keep_real_worker_stages_and_original_resource_grants() {
+    for name in ["skill_from_recording", "skill_hub_install", "meeting_transcribe", "skill_curator_status", "skill_synthesis_run"] {
+        assert_eq!(policy(name).unwrap().route, Route::Service);
+        assert!(policy(name).unwrap().required.contains(&ResourceKind::Employee));
+    }
+    // Parser stages stay in the background/control implementation. Routing
+    // alone is never evidence that full synthesis or protected boot is ready.
+}
+
+#[test]
+fn i1c_host_control_routes_cannot_widen_employee_scope() {
+    for name in ["skill_from_recording", "skill_synthesis_run", "skill_hub_install",
+        "skill_curator_status", "meeting_transcribe", "meeting_transcribe_status",
+        "meeting_transcribe_cancel", "meeting_upload_link", "knowledge_add_source",
+        "web_fetch_cached", "route_query"] {
+        let ctx = context(name, vec![ResourceGrant::EmployeeScope { id: EmployeeId([2;16]) }]);
+        assert!(!eligible(&ctx, name), "{name}");
+        assert!(authorize(&ctx, name, &json!({}), &UnusedResolver).is_err(), "{name}");
+    }
+}
+
+#[test]
+fn i1c_curator_run_flag_is_data_and_keeps_finite_grants() {
+    let resources = vec![employee(), ResourceGrant::Workspace { handle: text("work") }];
+    let ctx = context("skill_curator_status", resources.clone());
+    for args in [json!({}), json!({"run":true}), json!({"run":false})] {
+        assert!(authorize(&ctx, "skill_curator_status", &args, &Fixed(resources.clone())).is_ok());
+    }
+    for args in [json!({"run":"true"}), json!({"run":null}), json!({"agent_id":"other"})] {
+        assert!(authorize(&ctx, "skill_curator_status", &args, &Fixed(resources.clone())).is_err());
+    }
 }
