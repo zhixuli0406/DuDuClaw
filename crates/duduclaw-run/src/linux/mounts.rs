@@ -186,9 +186,36 @@ pub fn build_root(inputs: MountInputs, config: &RootConfig) -> Result<PreparedRo
     // SAFETY: a newly created root-owned directory, changed before privilege drop.
     unsafe { cvt(libc::fchown(xdg.as_raw_fd(), config.employee_uid, config.employee_gid), MountError::Directory)?; }
     drop(xdg);
+    native_project(root.as_raw_fd(), run.as_raw_fd())?;
     drop(run);
     let (devpts_mount_id, pty) = build_devices(root.as_raw_fd(), config)?;
     Ok(PreparedRoot { root, pty, runtime_mount_id, devpts_mount_id })
+}
+
+/// Native CLIs start in a root-owned project, so writable work/home files
+/// cannot add another MCP configuration. The workspace stays reachable by link.
+fn native_project(root: RawFd, run: RawFd) -> Result<(), MountError> {
+    let config = open_dir(root, c"config")?;
+    let has = |name: &CStr| -> Result<bool, MountError> {
+        let fd = unsafe { libc::openat(config.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd >= 0 { drop(owned(fd as _, MountError::Directory)?); return Ok(true); }
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) { return Ok(false); }
+        Err(MountError::Directory)
+    };
+    let codex = has(c"codex-home.toml")?;
+    let grok = has(c"grok-home.toml")?;
+    if !codex && !grok { return Ok(()); }
+    if codex && grok { return Err(MountError::InvalidPolicy); }
+    mkdir(run, c"native-project", 0o755)?;
+    let project = open_dir(run, c"native-project")?;
+    symlink(project.as_raw_fd(), c"/work", c"workspace")?;
+    if grok {
+        mkdir(project.as_raw_fd(), c".grok", 0o755)?;
+        let native = open_dir(project.as_raw_fd(), c".grok")?;
+        symlink(native.as_raw_fd(), c"/config/grok-project.toml", c"config.toml")?;
+        symlink(project.as_raw_fd(), c"/config/project-mcp.json", c".mcp.json")?;
+    }
+    Ok(())
 }
 
 /// PID 1 calls this after clone3 and before dropping privileges (§4 step 8a).

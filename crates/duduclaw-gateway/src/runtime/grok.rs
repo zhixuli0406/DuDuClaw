@@ -380,7 +380,21 @@ impl AgentRuntime for GrokRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
+        #[cfg(not(target_os = "linux"))]
         super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::Grok)?;
+        #[cfg(target_os = "linux")]
+        if duduclaw_core::execution_gate::isolation_required() {
+            crate::explore_lane::refuse_unsupported_runtime("grok")?;
+            let payload = build_prompt(context, prompt);
+            let out = crate::isolation_mcp::runtime::execute_native(
+                duduclaw_isolation::execution::RuntimeKind::Grok, payload.clone(), context).await?;
+            let stdout = std::str::from_utf8(&out).map_err(|_| "invalid isolated Grok output")?;
+            let content = salvage_pty_stdout(stdout, &[payload.clone()])?;
+            return Ok(RuntimeResponse { partial_timeout_secs: None,
+                input_tokens: crate::prompt_compression::estimate_tokens(&payload),
+                output_tokens: crate::prompt_compression::estimate_tokens(&content), content,
+                cache_read_tokens: 0, model_used: context.model.clone(), runtime_name: "grok".into() });
+        }
         if crate::runtime_dispatch::in_utility_call() {
             return Err("Grok utility calls refused: no verified tool-free mode".into());
         }
@@ -784,6 +798,12 @@ impl AgentRuntime for GrokRuntime {
     }
 
     async fn is_available(&self) -> bool {
+        if duduclaw_core::execution_gate::isolation_required() {
+            #[cfg(target_os = "linux")]
+            { return crate::isolation_mcp::runtime::available(duduclaw_isolation::execution::RuntimeKind::Grok).await; }
+            #[cfg(not(target_os = "linux"))]
+            return false;
+        }
         let mut cmd = tokio::process::Command::new(&self.grok_path);
         duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
         cmd.arg("--version");
@@ -875,7 +895,6 @@ impl GrokRuntime {
         prompt: &str,
         context: &super::RuntimeContext,
     ) -> Result<Vec<super::RuntimeChunk>, String> {
-        super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::Grok)?;
         let response = self.execute(prompt, context).await?;
         Ok(vec![super::RuntimeChunk::Done(response)])
     }

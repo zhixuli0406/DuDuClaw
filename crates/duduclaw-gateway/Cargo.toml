@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+duduclaw-api-worker = { path = "../duduclaw-api-worker" }
 duduclaw-parse-worker = { workspace = true }
 duduclaw-mcp-boundary = { workspace = true, features = ["binding-store", "execution-integration"] }
 duduclaw-migration = { path = "../duduclaw-migration" }

@@ -49,6 +49,7 @@ impl ProtectedMcpLaunch {
         plan: SpawnPolicy, grant: GrantPolicy, origin: WaitOrigin, caller: Option<EmployeeId>)
         -> Result<Arc<Self>, BackendError> {
         if !plan.capabilities.mcp_bridge || matches!(plan.runtime, RuntimeKind::Registered(_))
+            && crate::config::registered_cli_name(&plan.runtime).is_none()
             || matches!(origin, WaitOrigin::Run(_)) && caller.is_none()
             || matches!(origin, WaitOrigin::Gateway) && caller.is_some() {
             return Err(BackendError::Denied);

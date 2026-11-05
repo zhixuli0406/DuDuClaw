@@ -6155,3 +6155,365 @@ creation/removal, signed installation changes or live-provider calls were made.
 3. Obtain the required formal Daybreak security review of the new activity TCB
    boundary, reserved Resize semantics, private master provenance and teardown.
    Keep full readiness and missing-factory gates fail closed throughout integration.
+## Package I1d — other runtimes (2026-11-05)
+
+**Round-2 status and current remaining work are in the final subsection below.**
+The following initial implementation/validation report is preserved as history.
+
+**PARTIAL / NOT READY.** This worktree adds a real isolated API-worker source and
+registered generic-CLI protocol consumers. It does **not** complete item 5:
+Codex/Grok home/project overlays and their consumers remain refused; generic
+vendor adapters and the installed API runtime publication/acceptance are absent.
+No production employee, provider, signed installation or root full chain was run.
+Composite readiness, the 22 A / 18 E product-tool inventories and ingress
+requirements are unchanged. No fabricated policy, acceptance receipt, no-op
+producer or gateway-UID fallback was introduced. Work stayed in the assigned
+`feat/iso-i1d-20261105` worktree; no commit, worktree creation or `cargo fmt`.
+
+### Implemented source paths
+
+- `InstalledMainPlanFactory::other_runtime` rereads the root publication under
+  its boot generation pin and derives an entitled employee runtime. It accepts
+  only exact API-worker or versioned generic-adapter argv, supported main-work
+  classes, MCP-enabled profiles and bounded input. D appends the same fixed
+  protocol arguments once; native Command arguments/environment remain markers.
+- `RuntimeKind::OpenAiCompat` now projects the exact `openai-compat-v1` worker
+  arguments and `/config/mcp.json`. The new `duduclaw-api-worker` binary performs
+  provider HTTP, provider-response parsing and the tool loop **inside the
+  employee main run**, under B's uid/namespaces/egress/resources. It is not a
+  DynamicUser parser. This selects the isolated-worker alternative in design §6.
+- API credentials are **not** taken from gateway provider accounts, config or
+  environment and are **not** included in the request. The worker reads only
+  separately provisioned employee-owned
+  `/home/employee/.duduclaw-api/providers.json`. Its own key is readable by that
+  employee, as with design §7 CLI logins. Provisioning must not copy a gateway
+  shared key. Provider selection is exact and vendor-neutral; ambiguous/missing
+  credentials, non-HTTPS endpoints, userinfo, redirects and malformed data deny.
+- The worker checks exact argv/config, a sealed fd 4 and identical stdin/EOF,
+  then starts only `/runtime/duduclaw-mcp-bridge` with this run's fd 3. D owns
+  initialization, tool discovery and every call. A complete model-call batch is
+  checked before any side effect; unknown tools, duplicate call ids, non-object
+  arguments, partial completions and missing usage refuse. Responses are bounded
+  at 4 MiB, conversations at 16 MiB, batches at 16 and rounds at 50. D endpoint
+  closure interrupts in-flight provider I/O; a final answer requires another
+  live MCP request. Errors do not interpolate credentials, provider bodies,
+  internal paths or stderr.
+- Gateway API execution consumes one host authorization **before** any provider
+  path. Unsupported utility/effort/workspace/policy/redaction/CCR modes refuse.
+  The protected SSE entry uses the same buffered worker result. Availability
+  comes from fresh accepted root runtime registration, not gateway credentials.
+- Generic CLIs request `Registered("generic-cli-v1.<catalog-id>")`. Only this
+  anchored, bounded ASCII namespace receives a D projection. A signed ELF
+  adapter must accept the exact fixed protocol and one JSON stdin document
+  (`protocol`, `runtime`, `model`, `system_prompt`, `history`, `prompt`,
+  `max_tokens`), then emit its catalog's text/JSON/JSONL output. **No such vendor
+  adapter is supplied here**; ordinary vendor print-mode binaries do not meet
+  this protocol. Missing publication/acceptance still refuses. Root publication
+  must prove native MCP/config behavior for each exact adapter, not a shell
+  fixture or an unconditional supports flag.
+- Shared launch handling retains one-shot authority, bounded concurrent input,
+  autonomy handoff and BackendChild cancellation/retirement. Successful generic
+  output keeps the existing catalog parser and estimated-token behavior.
+- The spawn inventory adds exactly the worker's contained shim-child site and
+  renames the refactored main-launch site. `isolated_child` is accepted only for
+  that exact employee symbol and API count; it cannot exempt arbitrary gateway
+  spawns. This is a classification of a child already inside B's run, not a
+  second host launch or proof of root acceptance. Inventory size increased.
+
+### Files changed or added
+
+| Path | Change |
+| --- | --- |
+| `Cargo.toml`, `Cargo.lock` | Register the API worker and existing-version dependency edges. |
+| `crates/duduclaw-api-worker/Cargo.toml` | Small worker package; existing reqwest/Tokio/serde/libc/rustix versions only, default native TLS. |
+| `crates/duduclaw-api-worker/src/lib.rs` | Bounded request, employee credentials, MCP config, tool and provider-step validation; five pure tests. |
+| `crates/duduclaw-api-worker/src/main.rs` | Linux-only execution; fixed sanitized failure on other platforms. |
+| `crates/duduclaw-api-worker/src/linux.rs` | Sealed input, fixed shim, bounded MCP/HTTP loop and authority-close cancellation. |
+| `crates/duduclaw-api-worker/README.md` | Protocol, credential ownership, installation prerequisites and limitations. |
+| `crates/duduclaw-spawnd/Cargo.toml` | Make the existing boundary dependency available to portable pure plan tests. |
+| `crates/duduclaw-spawnd/src/gateway_plan.rs` | Fresh entitled API/registered main plans and two additional plan tests. |
+| `crates/duduclaw-mcp-boundary/src/config.rs` | Exact API and registered protocols, immutable flat config projection. |
+| `crates/duduclaw-mcp-boundary/src/config_tests.rs` | Three additional tests for protocol/registration/readback rejection. |
+| `crates/duduclaw-mcp-boundary/src/protected_launch.rs` | Permit only the versioned registered-adapter namespace; all existing grants/readbacks remain. |
+| `crates/duduclaw-gateway/Cargo.toml` | Share the worker's request/response protocol types. |
+| `crates/duduclaw-gateway/src/isolation_mcp/boot.rs` | Add fresh other-runtime plan and accepted-registration availability seams. |
+| `crates/duduclaw-gateway/src/isolation_mcp/runtime.rs` | Shared protected spawn/collection, registered/API consumers, two source tests. |
+| `crates/duduclaw-gateway/src/process_group.rs` | Reuse the existing bounded drain within the crate. |
+| `crates/duduclaw-gateway/src/runtime/generic_cli.rs` | Protected registered consumer and root-based availability; preserve local path. |
+| `crates/duduclaw-gateway/src/runtime/openai_compat.rs` | Protected worker entry for both execution methods; no protected gateway-key lookup or HTTP. |
+| `scripts/ci/check_spawn_inventory.py` | Exact contained-child classification, without skipping any discovered site. |
+| `scripts/ci/privileged_effects.json` | Classify the new worker site and refactored launch site. |
+| `scripts/ci/test_spawn_inventory.py` | Reject attempts to use the child classification for gateway/other symbols/effects. |
+| `docs/features/{,zh-TW/,ja-JP/}05-security-defense.md` | Matching development behavior and explicit remaining gates. |
+| `CHANGELOG.md` | Self-contained zh-TW unreleased entry. |
+| `docs/architecture/native-linux-isolation.md` | This handoff. |
+
+### Validation actually performed
+
+Commands below ran with `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0` for Cargo. Named
+nonzero test counts exclude empty binary/doc/filtered integration targets.
+
+| Command | Result |
+| --- | --- |
+| `cargo test -p duduclaw-api-worker --offline` | 5 passed, 0 failed. Pure protocol/credentials/provider-step tests; no network. |
+| `cargo test -p duduclaw-spawnd gateway_plan --offline` | 4 passed, 0 failed (two existing Claude tests plus API/registered plans). |
+| `cargo test -p duduclaw-mcp-boundary config::tests --offline` | 7 passed, 0 failed. |
+| `cargo test -p duduclaw-isolation --lib --offline` | 32 passed, 0 failed. |
+| `cargo check -p duduclaw-api-worker --target x86_64-unknown-linux-gnu --no-default-features --offline` | Passed; checks Linux Rust code without TLS. Three documented unsafe fd operations warn under workspace lints. |
+| `cargo check -p duduclaw-mcp-boundary --features execution-integration --target x86_64-unknown-linux-gnu --offline` | Passed, including the changed ProtectedMcpLaunch path. Existing warnings remain. |
+| `cargo check -p duduclaw-api-worker --target x86_64-unknown-linux-gnu --offline` | Blocked at openssl-sys: this Mac lacks a Linux OpenSSL sysroot. This is not a default-TLS binary pass. |
+| `cargo check -p duduclaw-spawnd --target x86_64-unknown-linux-gnu --offline` | Blocked at libsqlite3-sys: `x86_64-linux-gnu-gcc` is absent. No fake host library/sysroot was substituted. |
+| `python3 -m unittest discover -s scripts/ci -p test_spawn_inventory.py -v` | 18 passed, 0 failed. |
+| `python3 scripts/ci/check_spawn_inventory.py --require-migrated` | 499 functions classified, 0 migrations pending. Coverage only, not runtime acceptance. |
+| `git diff --check` | Passed. |
+
+Raw local logs: `/private/tmp/iso-i1d-{api-tests,main-plan-tests,boundary-tests,contract-tests,linux-check,boundary-linux-check,inventory-tests,inventory-final}.log`.
+No gateway/CLI/workspace build, root test, live provider request, deployment,
+Daybreak review or independent Claude review was performed. No new third-party
+dependency version, isolation wire/canonical-byte/hard-limit change or readiness
+promotion was made. The API worker introduces a separate explicitly versioned
+runtime-input protocol; its changed projection digest requires new acceptance.
+
+### Remaining work (in dependency order)
+
+1. **Codex and Grok remain unimplemented.** Keep their current terminal entry
+   fences. Implement root-owned per-run home/project config overlays, preserve
+   employee-only login/cache behavior, retain PL-0 external-config detection,
+   and prove exclusive config plus fd-3 inheritance with the exact CLI versions.
+   B1 currently refuses non-flat RunConfig projections. Do not replace that
+   refusal by accepting writable native files or gateway credentials. Then add
+   exact root-derived main plans and their execute/stream consumers. Grok PTY
+   stays in I1e; no local PTY retry may bypass protected launch.
+2. **Generic vendor adapters:** implement and sign real ELF adapters for each
+   catalog runtime, including exact stdin/output protocol, exclusive MCP config,
+   vendor config detection and fd inheritance. No supplied vendor binary is
+   currently known to implement `generic-cli-v1`; this consumer alone is not
+   generic runtime support.
+3. **API signed publication/installation:** publish the actual worker ELF,
+   seccomp/runtime profile, entitlement/resources and exact argv through the
+   existing signed runtime mechanism; do not add a synthetic receipt. Provision
+   employee-owned provider credentials through an authorized login flow. The
+   worker currently refuses uid ranges outside the default 70000–99999.
+4. **Compile actual gateway integration on the Linux builder**, then test:
+
+   ```sh
+   cargo test -p duduclaw-gateway isolation_mcp::runtime::tests --lib
+   cargo test -p duduclaw-gateway runtime::isolation_gate::tests --lib
+   cargo test -p duduclaw-gateway runtime::generic_cli::tests --lib
+   cargo test -p duduclaw-gateway runtime::openai_compat::tests --lib
+   cargo test -p duduclaw-api-worker
+   cargo test -p duduclaw-spawnd gateway_plan --lib
+   cargo test -p duduclaw-mcp-boundary --features execution-integration
+   ```
+
+   The two added gateway tests are
+   `other_runtimes_refuse_missing_authority_before_boot_credentials_or_spawn`
+   and `api_authority_is_one_shot_and_rejects_context_identity_mismatch`.
+   They are written but not compiled or run here.
+5. **API behavior still not closed:** provider-specific compatibility; real TLS
+   and egress behavior; own-credential provisioning/renewal; utility/effort and
+   custom uid profiles; redaction/CCR/policy adapters; thinking/native-tool-event
+   reporting; streaming; measured usage when a multi-round run fails after a
+   paid request. These modes must remain refused or explicitly unsupported;
+   existing responsibility reservation charges are not measured provider usage.
+6. **Native acceptance:** add ignored `iso_root_` tests for actual signed
+   API/generic runs through production boot/ingress/dispatcher, proving MCP
+   tools, exclusive config, shim-child fd inheritance, caller/delegation/budget
+   identity, authority revocation during HTTP, blocked private/metadata targets,
+   output limits, cancellation and full cgroup retirement. None was written or
+   run in this round; there is no honest exact root-chain filter yet. Test the
+   three target distributions, then run formal Daybreak security review.
+
+This package does not close I1a ingress/readiness, I1b/I1c product-tool producers
+or I1e PTY, and does not change their ownership or acceptance requirements.
+
+### I1d round 2 — native projections, API vendor adapters and signed packaging (2026-11-05)
+
+**SOURCE WIRED / ACCEPTANCE NOT READY.** This section supersedes the round-1
+remaining-work list above; its historical test results are not new acceptance.
+The native runtime blanket entry fences are replaced on Linux by actual
+one-shot protected consumers. Missing publication/acceptance and unsupported
+modes still return terminal spawn-gate refusals. Non-Linux protected requests
+still refuse. No gateway-UID retry, synthetic receipt, readiness promotion,
+production credential, commit, merge or deployment was introduced.
+
+#### Native CLI path
+
+- D maps the closed native config destinations to flat root publication names:
+  `codex-home.toml`, `grok-home.toml`, `grok-project.toml`, `project-mcp.json`.
+  Config bytes point only at `/runtime/duduclaw-mcp-bridge`, with no gateway
+  identity/env/key. B1 atomically publishes exact files, removes only known
+  obsolete runtime projection names, and verifies the actual readonly mount.
+- B1 builds a private 16 MiB / 4096-inode tmpfs home for native runs, explicitly
+  private and nosuid/nodev/noexec. Root owns the home and native config
+  ancestors. Fixed config links resolve into `/config`; named session/cache
+  directories are employee-writable and ephemeral. The original H home is a
+  subordinate private mount at `/home/employee/data`, preserving its filesystem
+  limits. Login links reference only that employee's `.codex/auth.json` or
+  `.grok/auth.json`. Root never reads those credential files. The actual home
+  owner/mode/config links are read back before a per-run MCP receipt is issued.
+- B2 creates root-owned `/run/native-project`, with `workspace -> /work` and,
+  for Grok, both the project native config and `.mcp.json` pointing to D.
+  Native processes start there instead of the employee-writable work root.
+  Neither an employee home/project config nor a gateway config is merged.
+- PL-0 is retained conservatively: an external `CODEX_HOME`, even empty, refuses
+  before a launch; B1 refuses any `.codex` entry in the employee work root,
+  including dangling links, without resolving employee paths as root. The
+  minimal `/etc` and new project/home have no host Codex configuration sources.
+- The new `duduclaw-runtime-adapter` ELF uses exactly
+  `--duduclaw-protocol codex-v1` or `grok-v1`. A bounded sealed fd-4 JSON request
+  contains only protocol, model and a framed prompt (64 KiB maximum). Codex
+  also validates identical stdin/EOF; its vendor stdin is then closed. Grok
+  reads no PTY input, so the JSON request is never echoed into its terminal.
+  It execs only the signed `runtime-vendor-codex` / `runtime-vendor-grok` entry
+  inside the employee process, keeping D's fd 3 and fencing fd 4 on exec.
+- Codex uses the existing JSON response parser; Grok uses the existing PTY
+  prompt-salvage parser. Streaming entries call these same buffered consumers.
+  Availability reads accepted root registration instead of probing host CLIs.
+  Native consumers enforce runtime/model product policy and reject CCR,
+  redaction/interceptor, utility, effort, workspace override, explore, native
+  tool allow/deny, scoped/approval/irreversibility and capability-policy modes
+  until corresponding adapters exist. These restrictions must not be silently
+  removed to make a production-shaped employee pass.
+- Grok's root plan requires a real PTY entitlement, timeout and resources.
+  Gateway consumption uses existing `duduclaw_execution::command::spawn_pty`,
+  `PtyChild`/RunHandle I/O, timeout, cancellation and retirement. **Merge I1e
+  `feat/iso-i1e-20261105` before running Grok**: this worktree intentionally
+  retains the base A/B PTY refusal and does not copy I1e's implementation.
+
+#### API vendor adapters
+
+The employee credential file can select `protocol` (default
+`chat_completions`), `responses`, `anthropic`, or `gemini`; the gateway request
+cannot choose endpoint, credential or dialect. Each adapter translates native
+requests/tool results and normalizes complete provider responses before the
+common full-batch validator. Native reasoning/signature blocks are retained for
+replay only. HTTPS, no redirects, bounded transport, measured usage, advertised
+object-argument tools, authority-close cancellation and final authority recheck
+remain shared. Gemini model path segments are strictly validated; native
+partial finishes, unsupported blocks, malformed tools and missing usage refuse.
+No vendor API was called and no compatibility claim is inferred from fixtures.
+
+#### Signed install/publication path
+
+The existing `RuntimeEntry` install target is reused (no isolation contract
+wire/canonical/hard-limit change). The Linux packager explicitly builds both new
+ELFs with worker TLS enabled, accepts multiple distinct runtime targets, stages
+reviewed policy/vendor files from `--runtime-artifacts-dir`, signs frozen bytes
+with the existing external signer, and carries all artifacts into the inactive
+bootstrap inbox. It does not generate acceptance or activate the installation.
+The bootstrap verifier now admits the complete ten-service base plus bounded
+signed runtime entries with exact modes; it previously required exactly ten
+artifacts and could not carry the policy B1 consumes.
+
+| Registry ID | Installed generation filename | Mode/source |
+| --- | --- | --- |
+| `api-worker-v1` | `runtime-api-worker-v1` | 0755, built API worker |
+| `native-adapter-v1` | `runtime-native-adapter-v1` | 0755, built native adapter |
+| `vendor-codex` / `vendor-grok` | `runtime-vendor-codex` / `runtime-vendor-grok` | 0755, explicit reviewed vendor ELF |
+| `isolation-policy-v1` | `runtime-isolation-policy-v1` | 0444, explicit reviewed policy, at most 1 MiB |
+
+B1 matches runtime entries/digests/modes to the signed generation. Native records
+add optional `vendor_digest` (required for Codex/Grok only); it is included in
+`McpAcceptance.launch_policy_digest`, so a changed vendor invalidates prior
+acceptance even when the adapter ELF is unchanged. Non-native records omit the
+field, preserving their existing launch-policy encoding. Actual signatures,
+root provisioning, entitlements, seccomp profiles and MCP acceptance remain
+external production inputs. The package tests use clearly disposable fixture
+keys/files; they do not create an installed/runtime acceptance receipt.
+
+#### Round-2 files
+
+- `crates/duduclaw-api-worker/`: shared sealed input, native adapter binary/input
+  types, four API dialect adapters, fixtures, and protocol/install README.
+- `crates/duduclaw-mcp-boundary/src/{config.rs,config_tests.rs}`: native adapter
+  arguments and closed projection publication-name mapping.
+- `crates/duduclaw-spawnd/src/{installed.rs,bootstrap_mounts.rs,native_home.rs,
+  gateway_plan.rs,gateway_mcp.rs,lib.rs}`, its `Cargo.toml` and `Cargo.lock`:
+  native projections/readbacks, signed vendor binding, PTY plan and tests.
+  `tempfile` is a Linux test dependency at its already-locked version.
+- `crates/duduclaw-run/src/linux/{mounts.rs,runner.rs}`: root-created native
+  project and fixed cwd selection. I1e's same-file edits need an additive merge.
+- `crates/duduclaw-gateway/src/runtime/{codex.rs,grok.rs}` and
+  `isolation_mcp/runtime.rs`: protected native consumers and availability;
+  Linux-only calls are cfg-guarded; local paths keep their existing builders.
+- `crates/duduclaw-updated/src/publication.rs`: complete base plus signed runtime
+  bootstrap validation, exact names/modes and regression test.
+- `scripts/package-linux-release.py`, `scripts/tests/test_package_linux_release.py`:
+  runtime source selection, signing/staging/bootstrap inputs and regressions.
+- `scripts/ci/{check_spawn_inventory.py,privileged_effects.json,
+  test_spawn_inventory.py}`: exactly classify the contained native exec and
+  protected PTY marker; no arbitrary employee/gateway exemption.
+- `CHANGELOG.md`, security feature pages in all three languages and this handoff:
+  source behavior and explicit acceptance boundaries.
+
+#### Validation actually performed in round 2
+
+All Cargo commands used `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0`. No local
+`duduclaw-gateway`, `duduclaw-cli` or workspace build/test and no `cargo fmt` ran.
+
+| Command/filter | Result |
+| --- | --- |
+| `cargo test -p duduclaw-api-worker --offline` | 7 passed; protocol/native argv/vendor translation fixtures, no HTTP. |
+| `cargo test -p duduclaw-mcp-boundary --features execution-integration --offline` | 64 library + 1 bridge integration passed; no privileged Linux test executed. |
+| `cargo test -p duduclaw-spawnd gateway_plan --offline` | 5 passed, including both native plan protocols and required Grok PTY entitlement. |
+| `cargo test -p duduclaw-updated publication --offline` | 4 passed. |
+| `cargo check -p duduclaw-api-worker -p duduclaw-run --tests --target x86_64-unknown-linux-gnu --no-default-features --offline` | Passed; Linux sources/tests, worker TLS disabled for this cross-check only. |
+| `cargo check -p duduclaw-spawnd --tests --target x86_64-unknown-linux-gnu --offline` | Passed with real Zig Linux C toolchain; includes installed/native-home test sources and updater integration. Existing warnings remain. |
+| `python3 -m unittest discover -s scripts/tests -p test_package_linux_release.py` | 19 passed, including fixture-key signing of policy/worker/vendor artifacts through bootstrap inbox. |
+| `python3 -m unittest discover -s scripts/ci -p test_spawn_inventory.py` | 19 passed. |
+| `python3 scripts/ci/check_spawn_inventory.py --require-migrated` | 501 functions classified, zero pending; coverage only. |
+| `git diff --check` | Passed. |
+
+B1 cross-check environment: `CC_x86_64_unknown_linux_gnu=/private/tmp/iso-i1d-zig-cc`
+and `AR_x86_64_unknown_linux_gnu=/private/tmp/iso-i1d-zig-ar`. Wrappers invoke
+`/opt/homebrew/bin/zig cc -target x86_64-linux-gnu` (removing cc-rs's incompatible
+Rust target spelling) and `zig ar`, using a writable temporary Zig cache. No host
+SQLite library or fake sysroot was substituted. Initial checks found and fixed
+a misplaced `pty` identifier and missing Linux `tempfile` dev edge. Raw final
+logs: `/private/tmp/iso-i1d-r2-{api,boundary-full,plan,publication,linux,b1-linux,
+package,inventory-tests,inventory}.log`.
+
+#### Required follow-up / remaining boundaries
+
+1. Merge I1e additively, then compile/test the actual gateway and CLI on Linux.
+   The gateway changes are source-reviewed only here, not compiled. Run:
+   `cargo test -p duduclaw-gateway isolation_mcp::runtime::tests --lib`,
+   `cargo test -p duduclaw-gateway runtime::codex::tests --lib`,
+   `cargo test -p duduclaw-gateway runtime::grok::tests --lib`,
+   `cargo test -p duduclaw-gateway runtime::openai_compat::tests --lib`.
+   New gateway filter: `native_runtimes_refuse_missing_authority_before_boot_config_or_spawn`.
+2. On native Linux, run B1 `gateway_plan`,
+   `native_home::tests::external_codex_detection_refuses_any_project_entry_without_following_it`,
+   `installed::tests::native_runtime_publication_requires_signed_adapter_and_matching_vendor_digest`,
+   then the ignored root test
+   `cargo test -p duduclaw-spawnd iso_root_native_home_projects_root_configs_and_refuses_external_codex --lib -- --ignored`.
+   The last test proves actual detached mounts/readback only, not a vendor CLI.
+   All these Linux-only test bodies cross-compiled; none executed on this Mac.
+3. **Native login/state remains an acceptance blocker.** Exercise exact Codex
+   and Grok startup-state writers, login reads and atomic refresh/renewal under
+   the private root-owned config directories. The login link is root-owned;
+   a vendor that replaces that entry atomically will be refused. Session/cache
+   directories are ephemeral; persistent refresh synchronization is not supplied.
+   Adapt the signed private-home projection if needed, with explicit review;
+   do not weaken it to employee-writable MCP config or copy gateway credentials.
+4. Generate real version/digest-specific MCP/launch acceptance only from actual
+   vendor runs (exclusive config, fd 3 across adapter/vendor/MCP-child exec,
+   tools, caller/delegation/budget identity, output, cancellation and full cgroup
+   retirement). Publish actual vendor ELFs/policy/entitlements via authorized
+   signing and installation. No production key/signature/install was used here.
+5. Worker default TLS and all four real provider paths still need Linux/egress
+   tests (including tool replay, revoked authority during HTTP, blocked private/
+   metadata targets, errors and bounded output). Credential provisioning/renewal,
+   failed paid-run measured usage, true streaming, custom uid ranges and the
+   explicitly refused modes remain open. Generic CLI vendor adapter ELFs are
+   still absent; round 2 implemented API dialect adapters, not those unrelated
+   native vendor wrappers.
+6. Independent Claude review and designated Daybreak security review remain
+   required. The available tools had no callable Daybreak/baton reviewer; the
+   final local `security-review` skill pass is a self-check, not independent
+   security approval. Full three-distribution production boot/ingress/dispatcher
+   acceptance remains separate from every source/test result above.
+
+No unfinished worktree was removed: it was supplied by the owning session and
+contains both requested uncommitted rounds. This session created no worktree.

@@ -55,7 +55,7 @@ const MAX_STDERR_BYTES: usize = 64 * 1024;
 
 /// Always consume EOF, retaining either a bounded prefix (stdout) or bounded
 /// tail (diagnostics). Returning early on overflow would deadlock the writer.
-async fn drain_bounded<R: tokio::io::AsyncRead + Unpin>(
+pub(crate) async fn drain_bounded<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     retained: &mut Vec<u8>,
     limit: usize,

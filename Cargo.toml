@@ -17,6 +17,7 @@ exclude = [
 members = [
     "crates/duduclaw-core",
     "crates/duduclaw-isolation",
+    "crates/duduclaw-api-worker",
     "crates/duduclaw-execution",
     "crates/duduclaw-spawnd",
     "crates/duduclaw-run",

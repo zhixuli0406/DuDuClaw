@@ -45,3 +45,6 @@ pub mod gateway_mcp;
 
 #[cfg(any(target_os = "linux", test))]
 pub mod gateway_plan;
+
+#[cfg(target_os = "linux")]
+mod native_home;

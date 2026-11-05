@@ -484,7 +484,13 @@ fn execute_runtime(program: &Program, exec: OwnedFd, script: Option<OwnedFd>, pr
     attachments: Vec<OwnedFd>, stdin: Option<OwnedFd>, mcp: Option<OwnedFd>, slave: Option<OwnedFd>, exec_done: OwnedFd, filter: &Filter,
     mut machine: Machine, failure: FailurePage) -> Result<()> {
     super::checked(unsafe { libc::setsid() }, Error::Process)?;
-    super::checked(unsafe { libc::chdir(c"/work".as_ptr()) }, Error::Process)?;
+    let native = std::fs::symlink_metadata("/run/native-project");
+    let cwd = match native {
+        Ok(metadata) if metadata.is_dir() => c"/run/native-project",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => c"/work",
+        _ => return Err(Error::Process),
+    };
+    super::checked(unsafe { libc::chdir(cwd.as_ptr()) }, Error::Process)?;
     machine.advance(Stage::RuntimeSession)?;
     let mut owned = Vec::new(); let mut sources = Vec::new();
     let mut add = |fd: OwnedFd, destination: Destination| {

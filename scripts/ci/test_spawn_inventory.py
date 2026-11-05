@@ -19,6 +19,32 @@ class SpawnInventoryTests(unittest.TestCase):
             identity="employee", migration="pending", rationale="Must use backend",
         ) for s in sites]}
 
+    def test_isolated_child_classification_is_exact_and_cannot_exempt_gateway_spawns(self):
+        sites = scan_text('impl Bridge { async fn connect() { Command::new("fixed").spawn(); } }',
+                          "crates/duduclaw-api-worker/src/linux.rs")
+        registry = self.registry(sites)
+        entry = registry["entries"][0]
+        entry["migration"] = "isolated_child"
+        self.assertEqual(check(sites, registry), [])
+        entry["identity"] = "gateway"
+        self.assertTrue(any("invalid isolated runtime child" in error for error in check(sites, registry)))
+        entry["identity"] = "employee"
+        entry["symbol"] = "crates/example/src/lib.rs::Bridge::connect"
+        self.assertTrue(any("invalid isolated runtime child" in error for error in check(sites, registry)))
+        entry["symbol"] = sites[0].symbol
+        entry["apis"]["terminal_output"] = 1
+        self.assertTrue(any("invalid isolated runtime child" in error for error in check(sites, registry)))
+
+    def test_native_adapter_exec_classification_is_exact(self):
+        sites = scan_text('fn run() { std::process::Command::new("fixed").exec(); }',
+                          "crates/duduclaw-api-worker/src/native_main.rs")
+        registry = self.registry(sites)
+        entry = registry["entries"][0]
+        entry["migration"] = "isolated_child"
+        self.assertEqual(check(sites, registry), [])
+        entry["symbol"] = "crates/duduclaw-gateway/src/runtime/codex.rs::run"
+        self.assertTrue(any("invalid isolated runtime child" in error for error in check(sites, registry)))
+
     def test_array_signature_and_macro_body_are_not_skipped(self):
         sites = self.scan('fn run() -> [u8; 4] { Command::new("x").spawn(); [0; 4] }')
         self.assertEqual(sites[0].apis, {"command_constructor": 1, "terminal_spawn": 1})

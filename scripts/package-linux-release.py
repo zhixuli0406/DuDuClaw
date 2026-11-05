@@ -35,6 +35,8 @@ BIN_PACKAGES = {
     "duduclaw-import": "duduclaw-import",
     "duduclaw-migrate": "duduclaw-migration",
     "duduclaw-mcp-bridge": "duduclaw-mcp-boundary",
+    "duduclaw-api-worker": "duduclaw-api-worker",
+    "duduclaw-runtime-adapter": "duduclaw-api-worker",
 }
 INSTALL_BINARIES = {
     "gateway": "duduclaw", "spawnd": "duduclaw-spawnd",
@@ -68,8 +70,9 @@ def build_command(target, tool):
     command = [tool, "build", "--locked", "--release", "--target", target,
                "--no-default-features", "--features",
                "duduclaw-gateway/dashboard,duduclaw-cli/dashboard,"
-               "duduclaw-gateway/vendored-openssl,duduclaw-parse-worker/engine"]
-    for package in [*BIN_PACKAGES.values(), "duduclaw-gateway"]:
+               "duduclaw-gateway/vendored-openssl,duduclaw-parse-worker/engine,"
+               "duduclaw-api-worker/native-tls"]
+    for package in dict.fromkeys([*BIN_PACKAGES.values(), "duduclaw-gateway"]):
         command.extend(["-p", package])
     for name in BIN_PACKAGES:
         command.extend(["--bin", name])
@@ -134,7 +137,52 @@ def create_archive(binary_dir, python_dir, target, output_dir):
     return archive
 
 
-def sign_release(binary_dir, target, output_dir, template, key, ssh_keygen):
+def runtime_target(artifact):
+    target = artifact.get("install_target", {})
+    if target.get("kind") != "runtime_entry":
+        raise ValueError("expected runtime entry")
+    registry_id = target.get("registry_id")
+    if (not isinstance(registry_id, str) or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", registry_id) is None
+            or registry_id in (".", "..") or set(target) != {"kind", "registry_id"}):
+        raise ValueError("invalid runtime registry identifier")
+    mode = 0o444 if registry_id == "isolation-policy-v1" else 0o755
+    if artifact.get("mode") != mode:
+        raise ValueError("invalid runtime artifact mode")
+    return registry_id
+
+
+def validate_targets(artifacts):
+    if not isinstance(artifacts, list) or not len(REQUIRED_TARGETS) <= len(artifacts) <= 128:
+        raise ValueError("incomplete bootstrap component set")
+    identities = set()
+    required = set()
+    for artifact in artifacts:
+        kind = artifact.get("install_target", {}).get("kind")
+        if kind == "runtime_entry":
+            identity = (kind, runtime_target(artifact))
+        elif kind in REQUIRED_TARGETS and artifact.get("mode") == 0o755:
+            identity = (kind,)
+            required.add(kind)
+        else:
+            raise ValueError("unknown release target or mode")
+        if identity in identities:
+            raise ValueError("duplicate release target")
+        identities.add(identity)
+    if required != REQUIRED_TARGETS:
+        raise ValueError("incomplete bootstrap component set")
+
+
+def runtime_source(artifact, binary_dir, runtime_dir):
+    registry = runtime_target(artifact)
+    builtin = {"api-worker-v1": "duduclaw-api-worker", "native-adapter-v1": "duduclaw-runtime-adapter"}
+    if registry in builtin:
+        return binary_dir / builtin[registry]
+    if runtime_dir is None:
+        raise ValueError("signed vendor/config artifacts require --runtime-artifacts-dir")
+    return runtime_dir / ("runtime-" + registry)
+
+
+def sign_release(binary_dir, target, output_dir, template, key, ssh_keygen, runtime_dir=None):
     if key is None:
         if template is not None:
             raise ValueError("--manifest-template requires an offline --signing-key")
@@ -161,10 +209,7 @@ def sign_release(binary_dir, target, output_dir, template, key, ssh_keygen):
             or document.get("schema_version") != 1 or document.get("channel") != "stable"):
         raise ValueError("release template must match this workspace version/product/schema/channel")
     artifacts = document.get("artifacts", [])
-    kinds = [artifact.get("install_target", {}).get("kind") for artifact in artifacts]
-    if (not REQUIRED_TARGETS.issubset(kinds) or len(kinds) != len(set(kinds))
-            or any(kind not in INSTALL_BINARIES for kind in kinds)):
-        raise ValueError("template must include one of every required isolation component")
+    validate_targets(artifacts)
     prefix = f"isolated-linux-{arch}-"
     output_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="isolation-release-", dir=output_dir) as temporary:
@@ -175,10 +220,19 @@ def sign_release(binary_dir, target, output_dir, template, key, ssh_keygen):
             name = artifact.get("id")
             # Reuse the signer's identifier rule before using an ID as a path.
             if (not isinstance(name, str) or signer.re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name) is None
-                    or name in (".", "..") or artifact.get("mode") != 0o755):
+                    or name in (".", "..")):
                 raise ValueError("invalid release artifact ID/mode")
-            source = binary_dir / INSTALL_BINARIES[artifact["install_target"]["kind"]]
-            validate_binary(source)
+            kind = artifact["install_target"]["kind"]
+            source = runtime_source(artifact, binary_dir, runtime_dir) if kind == "runtime_entry" else binary_dir / INSTALL_BINARIES[kind]
+            if artifact["mode"] == 0o755:
+                validate_binary(source)
+            else:
+                metadata = source.lstat()
+                if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                        or not 0 < metadata.st_size <= 1024 * 1024):
+                    raise ValueError("invalid signed runtime policy file")
+            # The signer rechecks immutable staged bytes, hashes and sizes. No
+            # acceptance or policy is inferred from the local build outputs.
             shutil.copyfile(source, raw_artifacts / name)
         manifest_name = prefix + "manifest.json"
         names = [manifest_name, manifest_name + ".signatures.json"] + [prefix + a["id"] for a in artifacts]
@@ -235,9 +289,7 @@ def create_bootstrap_inbox(target, output_dir, root_path, root_signatures_path):
             or not isinstance(signatures, list) or len(signatures) != 1 or not isinstance(signatures[0], str)):
         raise ValueError("expected canonical signed target manifest")
     artifacts = manifest.get("artifacts", [])
-    if (len(artifacts) != len(REQUIRED_TARGETS)
-            or {item.get("install_target", {}).get("kind") for item in artifacts} != REQUIRED_TARGETS):
-        raise ValueError("incomplete bootstrap component set")
+    validate_targets(artifacts)
     with tempfile.TemporaryDirectory(prefix="bootstrap-inbox-", dir=output_dir) as temporary:
         stage = Path(temporary) / "inbox"
         stage.mkdir(mode=0o700)
@@ -272,6 +324,8 @@ def main():
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--manifest-template", type=Path)
+    parser.add_argument("--runtime-artifacts-dir", type=Path,
+                        help="reviewed runtime-<registry_id> ELF/policy files; no acceptance is generated")
     parser.add_argument("--signing-key", type=Path)
     parser.add_argument("--ssh-keygen", default="ssh-keygen")
     parser.add_argument("--bootstrap-root", type=Path, help="externally signed canonical root metadata for an inactive bootstrap inbox")
@@ -300,7 +354,7 @@ def main():
             subprocess.run([sys.executable, str(ROOT / "scripts/check_glibc.py"),
                             str(snapshot / name)], check=True)
         signed = sign_release(snapshot, args.target, args.output_dir,
-                              args.manifest_template, args.signing_key, args.ssh_keygen)
+                              args.manifest_template, args.signing_key, args.ssh_keygen, args.runtime_artifacts_dir)
         archive = create_archive(snapshot, ROOT / "python", args.target, args.output_dir)
         if args.bootstrap_root:
             create_bootstrap_inbox(args.target, args.output_dir, args.bootstrap_root, args.bootstrap_root_signatures)

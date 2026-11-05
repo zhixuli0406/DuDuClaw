@@ -342,9 +342,30 @@ pub(super) async fn claude_plan(home: PathBuf, agent: String, class: duduclaw_is
     }).await
 }
 
-/// Trusted runtime entry points call this with host-selected policy and roots,
-/// then scope the returned launch with execution::command::with_context. It is
-/// never exposed as RPC/MCP input. Native command arguments are not policy.
+/// Derive only from the fresh root publication and the confirmed employee.
+pub(super) async fn other_runtime_plan(home: PathBuf, agent: String,
+    class: duduclaw_isolation::execution::ExecutionClass,
+    runtime: duduclaw_isolation::execution::RuntimeKind, request: Vec<u8>) -> Result<SpawnPolicy, VerificationError> {
+    crate::isolation_readiness::check_execution().map_err(|_| VerificationError::Unavailable)?;
+    let owner = OWNER.get().cloned().ok_or(VerificationError::Unavailable)?;
+    if owner.home != home { return Err(VerificationError::BindingMismatch); }
+    duduclaw_mcp_boundary::authority::verify_blocking(move || {
+        let employee = crate::handlers::resolve_confirmed_employee(&owner.home, &agent)
+            .map_err(|_| VerificationError::Unavailable)?;
+        owner.main_plans.other_runtime(employee.employee, class, runtime, request)
+            .map_err(|_| VerificationError::Unavailable)
+    }).await
+}
+
+pub(super) async fn runtime_available(runtime: duduclaw_isolation::execution::RuntimeKind) -> bool {
+    let Some(owner) = OWNER.get().cloned() else { return false; };
+    if crate::isolation_readiness::check_execution().is_err() { return false; }
+    duduclaw_mcp_boundary::authority::verify_blocking(move || owner.registry.registration(&runtime))
+        .await.is_ok()
+}
+
+/// Trusted runtime entry points supply host-selected policy and resource roots.
+/// Native command arguments and environment never become launch authority.
 pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_execution::command::ProtectedLaunch>, VerificationError> {
     crate::isolation_readiness::check_execution().map_err(|_| VerificationError::Unavailable)?;
     let owner = OWNER.get().cloned().ok_or(VerificationError::Unavailable)?;
