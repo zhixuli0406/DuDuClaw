@@ -3,6 +3,10 @@ import { useIntl } from 'react-intl';
 import { AlertTriangle, X } from 'lucide-react';
 import { api, type LicenseSnapshot } from '@/lib/api';
 import { useCommercialContact } from '@/lib/commercial-contact';
+import { useAuthStore } from '@/stores/auth-store';
+import { useConnectionStore } from '@/stores/connection-store';
+import { useLocation } from 'react-router';
+import { LicenseValidationWarning } from './LicenseValidationWarning';
 
 type Urgency = 'expired' | 'critical' | 'warning' | null;
 
@@ -39,19 +43,24 @@ const MESSAGE_ID: Record<Exclude<Urgency, null>, string> = {
  * expiry so an operator is never surprised by a downgrade — the passive
  * LicensePage countdown alone is easy to miss.
  *
- * Best-effort: `license.status` is manager-gated, so for non-managers (or any
- * RPC error) the fetch fails and the banner simply renders nothing. Dismissal
- * is keyed by urgency so an escalation (warning → critical → expired) re-shows.
+ * Best-effort: fetch only for authenticated managers/admins, on reconnect and
+ * every minute. Validation failures are admin-only and cannot be dismissed.
+ * Expiry dismissal is keyed by urgency so an escalation re-shows the banner.
  */
 export function LicenseExpiryBanner() {
   const intl = useIntl();
   const contact = useCommercialContact();
+  const role = useAuthStore(s => s.user?.role);
+  const connectionState = useConnectionStore(s => s.state);
+  const { pathname } = useLocation();
   const [snapshot, setSnapshot] = useState<LicenseSnapshot | null>(null);
   const [dismissed, setDismissed] = useState<Urgency>(null);
 
   useEffect(() => {
+    setSnapshot(null);
+    if (connectionState !== 'authenticated' || (role !== 'admin' && role !== 'manager')) return;
     let active = true;
-    api.license
+    const load = () => api.license
       .status()
       .then((s) => {
         if (active) setSnapshot(s);
@@ -59,10 +68,19 @@ export function LicenseExpiryBanner() {
       .catch(() => {
         /* manager-gated / offline — no banner */
       });
+    void load();
+    const timer = window.setInterval(() => void load(), 60_000);
     return () => {
       active = false;
+      window.clearInterval(timer);
     };
-  }, []);
+  }, [connectionState, role]);
+
+  if (snapshot?.validation_warning) {
+    // LicensePage uses its own refreshed snapshot, avoiding a duplicate banner.
+    if (pathname === '/app/system/license') return null;
+    return <LicenseValidationWarning snapshot={snapshot} />;
+  }
 
   const urgency = classify(snapshot);
   if (!urgency || dismissed === urgency) return null;

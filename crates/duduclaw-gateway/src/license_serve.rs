@@ -19,6 +19,8 @@
 //!     30/min/IP, crl 60/min/IP.
 //!   - The issuer private key is read per request, never logged, never echoed in
 //!     any response; a key-read failure is a bare 500.
+//!   - Refresh requires a bounded, non-empty nonce; active and revoked replies
+//!     carry a v2 signature over the full request context and response state.
 //!   - `refresh` NEVER extends validity (re-issue is the renewal path); it only
 //!     advances `last_phone_home`.
 
@@ -178,68 +180,40 @@ async fn refresh_handler(
         None => return not_found(),
     };
 
-    let subscription_id = body
-        .get("subscription_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let machine_fingerprint = body
-        .get("machine_fingerprint")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    // Optional anti-replay nonce (gateway client sends it; CLI client does not).
-    let nonce = body
-        .get("nonce")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    // `telemetry` is accepted but ignored (P3).
-
-    if subscription_id.is_empty() || machine_fingerprint.is_empty() {
-        return (
+    let request = match parse_refresh_request(&body) {
+        Ok(request) => request,
+        Err(()) => return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "subscription_id and machine_fingerprint are required" })),
-        )
-            .into_response();
-    }
-
-    let store = store_for(&state.home_dir);
-    let rec = match store.get_license_by_subscription_id(&subscription_id) {
-        Some(r) => r,
-        None => return not_found(),
+            Json(json!({ "error": "invalid_refresh_request" })),
+        ).into_response(),
     };
+    // Telemetry is accepted but ignored. A proposed binding is authenticated in
+    // the reply only; this issuer never changes the ledger binding on refresh.
 
-    // Three rejection gates (revoked → fingerprint → expired), spec §9.2.
-    match refresh_decision(&rec, &machine_fingerprint, Utc::now()) {
-        RefreshDecision::Revoked { effective_from } => {
-            return (
-                StatusCode::OK,
-                Json(json!({
-                    "status": "revoked",
-                    "reason": "license_revoked",
-                    "effective_from": effective_from,
-                })),
-            )
-                .into_response();
-        }
-        RefreshDecision::Forbidden => {
-            return (StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden" }))).into_response();
-        }
-        RefreshDecision::Proceed => {}
-    }
-
-    // Load the issuer seed per request; a read failure is a bare 500.
+    // Load the key before acquiring the SQLite writer lock. The ledger read,
+    // validity decision and both signatures then share one transaction.
     let seed = match crate::distributor_store::load_issuer_signing_seed(Path::new(&key_path)) {
-        Ok(s) => s,
+        Ok(seed) => seed,
         Err(_) => return internal_error(),
     };
-
+    let store = store_for(&state.home_dir);
     let registry = crate::license_runtime::production_registry();
-    let (license, _blob) =
-        match crate::distributor_store::resign_license_for_refresh(&seed, &registry, &rec) {
-            Ok(v) => v,
-            Err(_) => return internal_error(),
-        };
+    let (rec, response) = match store.with_refresh_license(request.subscription_id, |rec| {
+        refresh_response_for_record(&seed, &registry, rec, &request)
+            .map(|response| (rec.clone(), response))
+    }) {
+        Ok(Some(result)) => result,
+        Ok(None) => return not_found(),
+        Err(_) => return internal_error(),
+    };
+    let response = match response {
+        Some(response) => response,
+        None => return (StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden" })))
+            .into_response(),
+    };
+    if rec.status == "revoked" {
+        return (StatusCode::OK, Json(response)).into_response();
+    }
 
     // Best-effort ledger update (still-alive signal). Never blocks the response.
     let _ = store.touch_refresh(&rec.id);
@@ -259,20 +233,100 @@ async fn refresh_handler(
         ),
     );
 
-    let license_v = match serde_json::to_value(&license) {
-        Ok(v) => v,
-        Err(_) => return internal_error(),
-    };
-    let mut resp = json!({
-        "status": "active",
-        "license": license_v,
-        "warnings": [],
-    });
-    // Echo the request nonce verbatim (anti-replay) when present.
-    if let (Some(n), Some(obj)) = (nonce, resp.as_object_mut()) {
-        obj.insert("nonce".into(), Value::String(n));
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Called only inside `with_refresh_license`: no signature may escape the
+/// transaction's status snapshot before its commit succeeds.
+fn refresh_response_for_record(
+    seed: &[u8; 32],
+    registry: &duduclaw_license::PublicKeyRegistry,
+    rec: &IssuedLicense,
+    request: &RefreshRequest<'_>,
+) -> Result<Option<Value>, String> {
+    match refresh_decision(rec, request.original_fingerprint, Utc::now()) {
+        RefreshDecision::Revoked { effective_from } => {
+            signed_refresh_response(seed, request, "revoked", "license_revoked",
+                &effective_from, None).map(Some)
+        }
+        RefreshDecision::Forbidden => Ok(None),
+        RefreshDecision::Proceed => {
+            let (license, _blob) = crate::distributor_store::resign_license_for_refresh(
+                seed, registry, rec)?;
+            signed_refresh_response(seed, request, "active", "",
+                &license.last_phone_home.to_rfc3339(), Some(&license)).map(Some)
+        }
     }
-    (StatusCode::OK, Json(resp)).into_response()
+}
+
+struct RefreshRequest<'a> {
+    subscription_id: &'a str,
+    original_fingerprint: &'a str,
+    proposed_fingerprint: &'a str,
+    nonce: &'a str,
+}
+
+fn parse_refresh_request(body: &Value) -> Result<RefreshRequest<'_>, ()> {
+    fn required<'a>(body: &'a Value, name: &str) -> Result<&'a str, ()> {
+        body.get(name).and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty() && value.len() <= 256
+                && !value.chars().any(char::is_control))
+            .ok_or(())
+    }
+    let original_fingerprint = required(body, "machine_fingerprint")?;
+    Ok(RefreshRequest {
+        subscription_id: required(body, "subscription_id")?,
+        original_fingerprint,
+        proposed_fingerprint: if body.get("new_fingerprint").is_some() {
+            required(body, "new_fingerprint")?
+        } else { original_fingerprint },
+        nonce: required(body, "nonce")?,
+    })
+}
+
+/// Use the same canonical envelope as the client; no unsigned state changes.
+fn signed_refresh_response(
+    signing_seed: &[u8; 32],
+    request: &RefreshRequest<'_>,
+    status: &str,
+    reason: &str,
+    effective_from: &str,
+    license: Option<&duduclaw_license::License>,
+) -> Result<Value, String> {
+    use duduclaw_license::refresh::{license_digest, response_payload};
+    use ed25519_dalek::{Signer, SigningKey};
+    match (status, license) {
+        ("active", Some(license)) if license.subscription_id == request.subscription_id
+            && license.machine_fingerprint == request.original_fingerprint
+            && license.public_key_id == ISSUER_KEY_ID => {}
+        ("revoked", None) => {}
+        _ => return Err("invalid refresh response".into()),
+    }
+    DateTime::parse_from_rfc3339(effective_from).map_err(|_| "invalid effective time")?;
+    let digest = license.map(license_digest).transpose()
+        .map_err(|error| error.to_string())?.unwrap_or_default();
+    let payload = response_payload(status, reason, effective_from, request.nonce,
+        request.subscription_id, request.original_fingerprint,
+        request.proposed_fingerprint, &digest).map_err(|error| error.to_string())?;
+    let signature = SigningKey::from_bytes(signing_seed).sign(&payload);
+    let mut response = json!({
+        "status": status,
+        "reason": reason,
+        "effective_from": effective_from,
+        "nonce": request.nonce,
+        "subscription_id": request.subscription_id,
+        "original_fingerprint": request.original_fingerprint,
+        "proposed_fingerprint": request.proposed_fingerprint,
+        "license_digest": digest,
+        "public_key_id": ISSUER_KEY_ID,
+        "response_signature_version": 2,
+        "response_signature": BASE64.encode(signature.to_bytes()),
+    });
+    if let Some(license) = license {
+        response["license"] = serde_json::to_value(license).map_err(|error| error.to_string())?;
+        response["warnings"] = json!([]);
+    }
+    Ok(response)
 }
 
 // ── GET /v1/license/crl ──────────────────────────────────────────────────────
@@ -388,6 +442,87 @@ mod tests {
     use rand::rngs::OsRng;
 
     #[test]
+    fn owner_refresh_active_v2_verifies_and_preserves_binding() {
+        use duduclaw_license::{License, LicenseTier, refresh::validate_response};
+        use ed25519_dalek::Signer;
+        let signing = SigningKey::generate(&mut OsRng);
+        let registry = PublicKeyRegistry::new().with_key("v2", signing.verifying_key().to_bytes());
+        let mut license = License::new("sub-owner", "customer", LicenseTier::Oem,
+            "original", chrono::Duration::days(30), "v2");
+        license.signature = signing.sign(&license.canonical_payload().unwrap()).to_bytes().to_vec();
+        let request = RefreshRequest { subscription_id: "sub-owner",
+            original_fingerprint: "original", proposed_fingerprint: "proposed", nonce: "nonce-1" };
+        let body = signed_refresh_response(&signing.to_bytes(), &request, "active", "",
+            &license.last_phone_home.to_rfc3339(), Some(&license)).unwrap();
+        let verify = |body: &Value| {
+            let artifact: License = serde_json::from_value(body["license"].clone()).unwrap();
+            validate_response(&registry, &artifact, body, "nonce-1", "sub-owner", "original", "proposed")
+        };
+        assert!(verify(&body).is_ok());
+        assert_eq!(body["license"]["machine_fingerprint"], "original");
+        assert_eq!(body["proposed_fingerprint"], "proposed");
+        for field in ["status", "reason", "effective_from", "nonce", "subscription_id",
+            "original_fingerprint", "proposed_fingerprint", "license_digest", "response_signature"] {
+            let mut tampered = body.clone();
+            tampered[field] = json!("tampered");
+            assert!(verify(&tampered).is_err(), "{field}");
+        }
+        let mut tampered = body.clone();
+        tampered["license"]["control_url"] = json!("https://attacker.invalid");
+        assert!(verify(&tampered).is_err());
+        let mut rebound = license.clone();
+        rebound.machine_fingerprint = "proposed".into();
+        assert!(signed_refresh_response(&signing.to_bytes(), &request, "active", "",
+            &license.last_phone_home.to_rfc3339(), Some(&rebound)).is_err());
+    }
+
+    #[test]
+    fn owner_refresh_revoked_v2_verifies_and_rejects_tampering() {
+        use duduclaw_license::refresh::validate_status_response;
+        let signing = SigningKey::generate(&mut OsRng);
+        let registry = PublicKeyRegistry::new().with_key("v2", signing.verifying_key().to_bytes());
+        let request = RefreshRequest { subscription_id: "sub-owner",
+            original_fingerprint: "original", proposed_fingerprint: "proposed", nonce: "nonce-1" };
+        let body = signed_refresh_response(&signing.to_bytes(), &request, "revoked",
+            "license_revoked", "2026-01-01T00:00:00Z", None).unwrap();
+        let verify = |body: &Value| validate_status_response(&registry, body, "revoked",
+            "nonce-1", "sub-owner", "original", "proposed");
+        assert!(verify(&body).is_ok());
+        assert!(body.get("license").is_none());
+        assert_eq!(body["license_digest"], "");
+        for field in ["status", "reason", "effective_from", "nonce", "subscription_id",
+            "original_fingerprint", "proposed_fingerprint", "license_digest", "response_signature"] {
+            let mut tampered = body.clone();
+            tampered[field] = json!("tampered");
+            assert!(verify(&tampered).is_err(), "{field}");
+        }
+        let mut unsigned = body.clone();
+        unsigned.as_object_mut().unwrap().remove("response_signature_version");
+        assert!(verify(&unsigned).is_err());
+        unsigned["response_signature_version"] = json!(1);
+        assert!(verify(&unsigned).is_err());
+    }
+
+    #[test]
+    fn owner_refresh_requires_bounded_nonce_and_strict_request_fields() {
+        let valid = json!({"subscription_id":"sub-owner", "machine_fingerprint":"original",
+            "nonce":"nonce-1"});
+        let parsed = parse_refresh_request(&valid).unwrap();
+        assert_eq!(parsed.proposed_fingerprint, "original");
+        for field in ["subscription_id", "machine_fingerprint", "nonce", "new_fingerprint"] {
+            for value in [json!(null), json!(""), json!(" "), json!(1),
+                json!("x".repeat(257)), json!("line\nfeed")] {
+                let mut invalid = valid.clone();
+                invalid[field] = value;
+                assert!(parse_refresh_request(&invalid).is_err(), "{field}");
+            }
+        }
+        let mut absent = valid.clone();
+        absent.as_object_mut().unwrap().remove("nonce");
+        assert!(parse_refresh_request(&absent).is_err());
+    }
+
+    #[test]
     fn signed_crl_verifies_with_matching_key() {
         let signing = SigningKey::generate(&mut OsRng);
         let seed: [u8; 32] = signing.to_bytes();
@@ -453,6 +588,65 @@ mod tests {
             license_blob: "blob".into(),
             last_refresh_at: None,
         }
+    }
+
+    #[test]
+    fn owner_refresh_serializes_signing_with_revoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("distributor.db");
+        let store = DistributorStore::new(&path);
+        let rec = rec_with("active", "fp-a", Utc::now() + chrono::Duration::days(30));
+        store.add_license(&rec).unwrap();
+        let signing = SigningKey::generate(&mut OsRng);
+        let registry = PublicKeyRegistry::new().with_key("v2", signing.verifying_key().to_bytes());
+        let request = RefreshRequest { subscription_id: &rec.subscription_id,
+            original_fingerprint: "fp-a", proposed_fingerprint: "fp-a", nonce: "nonce-race" };
+
+        let response = store.with_refresh_license(&rec.subscription_id, |snapshot| {
+            // Deterministic second-connection revoke attempt at the old race
+            // point: after reading active, before either signature is made.
+            let revoke_conn = rusqlite::Connection::open(&path).unwrap();
+            revoke_conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let error = revoke_conn.execute(
+                "UPDATE issued_licenses SET status = 'revoked' WHERE id = ?1",
+                [&rec.id],
+            ).unwrap_err();
+            assert_eq!(error.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy));
+            refresh_response_for_record(&signing.to_bytes(), &registry, snapshot, &request)
+        }).unwrap().unwrap().unwrap();
+        assert_eq!(response["status"], "active");
+        let license = serde_json::from_value(response["license"].clone()).unwrap();
+        assert!(duduclaw_license::refresh::validate_response(&registry, &license, &response,
+            request.nonce, request.subscription_id, "fp-a", "fp-a").is_ok());
+
+        // Once both signatures are committed, revocation can proceed normally.
+        store.revoke_license(&rec.id).unwrap();
+        assert_eq!(store.get_license(&rec.id).unwrap().status, "revoked");
+    }
+
+    #[test]
+    fn owner_refresh_sees_revoke_committed_after_an_earlier_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("distributor.db");
+        let store = DistributorStore::new(&path);
+        let rec = rec_with("active", "fp-a", Utc::now() + chrono::Duration::days(30));
+        store.add_license(&rec).unwrap();
+        let old_snapshot = store.get_license_by_subscription_id(&rec.subscription_id).unwrap();
+        assert_eq!(old_snapshot.status, "active");
+        let other_store = DistributorStore::new(&path);
+        other_store.revoke_license(&rec.id).unwrap();
+
+        let signing = SigningKey::generate(&mut OsRng);
+        let registry = PublicKeyRegistry::new().with_key("v2", signing.verifying_key().to_bytes());
+        let request = RefreshRequest { subscription_id: &rec.subscription_id,
+            original_fingerprint: "fp-a", proposed_fingerprint: "fp-a", nonce: "nonce-revoked" };
+        let response = store.with_refresh_license(&rec.subscription_id, |snapshot| {
+            refresh_response_for_record(&signing.to_bytes(), &registry, snapshot, &request)
+        }).unwrap().unwrap().unwrap();
+        assert_eq!(response["status"], "revoked");
+        assert!(response.get("license").is_none());
+        assert!(duduclaw_license::refresh::validate_status_response(&registry, &response,
+            "revoked", request.nonce, request.subscription_id, "fp-a", "fp-a").is_ok());
     }
 
     #[test]

@@ -102,6 +102,13 @@ API 用戶端的 MRTR 輸入須符合 host 宣告的能力，不會自動代替�
 
 五個範本 RPC（`templates.catalog/get/copy/save/apply`）均要求目前具 Admin 身分。公司範本存於 `<home>/company_templates/`，採原子儲存、整隊單一版本，稽核不含文件內文。內建唯讀，付費複本仍需授權。團隊複製包含主管與下屬（最多 50 人），保留內部匯報關係。編輯只允許移除技能／成員、縮減工具允許清單或增加禁止項目；移除主管須一併移除下屬。停用技能維持停用。自訂腳本不複製；未改動的內建辦公技能可復原官方附帶資產。公司複本不含付費包知識附件或評測題庫。
 
+## 授權綁定與更新
+
+所有 MAC 候選都視為 Weak，僅供遷移辨識，包含全球管理的 MAC：主機名稱與 MAC 都能在另一台機器重現。MAC 第一個位元組的 `0x02` 位元為 1 時，也不納入主要 MAC 選擇。只靠 MAC 證據，即使與已簽章授權相符，也不啟用綁定機器的付費功能；目前 Linux／Windows 的 hostname + MAC 路徑同樣受影響，須等到支援強身分的核准遷移可用前，都維持 OpenSource。舊 UUID 綁定與刻意不綁機器的 OEM 保留既有規則。換綁需要帳號持有人在控制台核准；待核准回應不替換授權。
+
+為相容既有格式，授權簽章仍不涵蓋 `control_url`，因此它只是未受信任的端點提示。Gateway／CLI 的 refresh、換綁、status、CRL、經銷商品牌與公告請求，送出前都須經共用傳輸層檢查：僅限 HTTPS、443 埠、不得包含使用者資訊／query／fragment，主機名稱必須完整符合固定清單 `api.duduclaw.dudustudio.monster`。自訂簽發端須在客戶端本機明確設定環境變數 `DUDUCLAW_CONTROL_URL=https://issuer.example.com`；只在授權檔內放自訂網址不會獲得允許。此設定只允許該 origin，不放寬 HTTPS、埠、IP literal、localhost 或 DNS 限制。所有 DNS 回傳位址都必須是公開位址，連線固定使用已檢查的結果；停用重新導向與自動代理。驗證失敗不送出授權請求。Owner gateway 在同一個 SQLite `BEGIN IMMEDIATE` 交易內讀取授權狀態並簽署授權與第 2 版回應：撤銷先提交就回 revoked，簽署先取得鎖則撤銷須等待簽署交易完成；交易提交後的網路送達時間不在此保證範圍。
+
+Refresh 接受回應前核對原訂閱、原／提案綁定、nonce、授權簽章及部署型態。active、revoked 與 pending 僅接受回應簽章第 2 版；簽章涵蓋狀態、原因、生效時間、nonce、訂閱、兩個綁定值與完整授權摘要，包含 `control_url`。缺少版本或舊版一律拒絕，撤銷生效時間尚未到達也不套用。Gateway 與 CLI 寫入共用跨程序 advisory lock，網路回應後比對完整授權檔與撤銷標記摘要；Gateway 另比對記憶體 revision。持久化使用唯一暫存檔與 fsync。忽略 advisory lock 的直接寫入仍在保護範圍外。詳見[簽發契約與限制](../../guides/zh-TW/personal-edition-portability.md#macos-授權指紋與重新綁定)。控制平面實際部署／核准／簽章、Windows 原生持久化及客戶遷移仍須另外驗收。
 
 ## 機器操作與下指令的人
 

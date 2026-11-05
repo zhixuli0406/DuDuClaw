@@ -2358,6 +2358,8 @@ export interface LicenseSnapshot {
   days_since_phone_home?: number | null;
   /** `true` when the license fingerprint matches the current machine. */
   fingerprint_match?: boolean | null;
+  /** Admin-only validation failure reason; absent for a healthy or unlicensed host. */
+  validation_warning?: string | null;
   /**
    * NFR (Not-For-Resale) internal-test license. Renders a badge that
    * must remain visible as the anti-resale watermark.

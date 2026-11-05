@@ -10659,6 +10659,7 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
             format!("公司層腳本有衝突，這些副本不會執行：{}", office_conflicts.join("；"))
         },
     ));
+    checks.push(license::doctor_check(&home));
 
     // Check 4f: responsibilities whose runtimes may not report usage (M3-2).
     checks.push(responsibility_usage_check(&home).await);

@@ -266,12 +266,8 @@ async fn fetch_inner(
         "{}/v1/license/distributor-brand",
         control_url.trim_end_matches('/')
     );
-    let client = reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .build()
-        .map_err(|e| e.to_string())?;
-    let response = client
-        .post(&endpoint)
+    let response = crate::license_transport::request(reqwest::Method::POST, &endpoint, FETCH_TIMEOUT)
+        .await?
         .json(&serde_json::json!({
             "subscription_id": subscription_id,
             "machine_fingerprint": machine_fingerprint,
