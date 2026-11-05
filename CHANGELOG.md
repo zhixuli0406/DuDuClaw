@@ -4,6 +4,8 @@
 
 ### Added
 
+- Email 兩步驟驗證新增授權代寄：未設定 SMTP 時，有效的非 OpenSource 授權可透過控制平面寄送固定格式驗證碼；可用 `[mfa] email_relay = false` 關閉。Email 與通行金鑰選項停用時，儀表板會說明原因與啟用方式。
+
 - 原生 Linux 受保護服務新增容器引擎政策：預設仍停用個人帳號，主機管理員可在確認風險後改為只警告。政策由 root 管理並留下稽核記錄；儀表板顯示持續警告、風險及切換指令，其他保護檢查不受影響。
 - 新增 `google_chat_spaces` 與 `google_chat_messages` 唯讀工具，可讀取已連結 Google 帳號的聊天室與近期訊息。管理員需先啟用「Google Chat 讀取」，使用者再重新連結並同意額外權限；沿用 Gmail 身分與私有資料閘，回傳內容經注入掃描，稽核不保存訊息文字。
 - Google Chat 新增 Pub/Sub 連線模式，共用與員工專屬應用程式可透過向外拉取通知收訊，不需公開 HTTPS gateway；支援 CLI／Cloud Shell 建立與匯入，Google 設定頁仍需手動儲存與實測。

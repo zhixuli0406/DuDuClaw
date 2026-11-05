@@ -45,7 +45,12 @@ pub(super) async fn send(State(state):State<Arc<AppState>>,ConnectInfo(addr):Con
     match result {
         Ok(Ok((email,code)))=>match crate::mfa_email::send_code(&state.home_dir,&state.user_db,&token,&email,&code).await {
             Ok(())=>response(serde_json::json!({"sent":true,"expires_in":600})),
-            Err(_)=>unavailable(),
+            Err(error)=>{
+                let status=if error==crate::mfa_email::RATE_LIMITED {axum::http::StatusCode::TOO_MANY_REQUESTS} else {axum::http::StatusCode::SERVICE_UNAVAILABLE};
+                let mut reply=(status,Json(serde_json::json!({"error":error}))).into_response();
+                reply.headers_mut().insert(axum::http::header::CACHE_CONTROL,axum::http::HeaderValue::from_static("no-store"));
+                reply
+            },
         },
         _=>denied(),
     }

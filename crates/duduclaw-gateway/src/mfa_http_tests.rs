@@ -211,6 +211,7 @@ async fn mfa_password_and_channel_otp_return_no_token_in_entire_body() {
     assert_eq!(response["factors"], json!({"totp":true,"email":false,"passkey":false}));
     assert_eq!(response["last_used"], "totp");
     assert_eq!(response["email_available"], false);
+    assert_eq!(response["email_unavailable_reason"], "no_smtp_no_relay");
     assert_eq!(response["mfa_required"], true);
     assert!(!response.to_string().contains("token"));
 }
@@ -243,8 +244,9 @@ async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
     let old = state.jwt_config.issue_session_tokens(&user, &[]).unwrap();
     let (_, response) = login(&state, 184).await;
     assert_eq!(response.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["challenge_ref", "email_available", "enrollment_token", "mfa_enrollment_required"]);
+        vec!["challenge_ref", "email_available", "email_unavailable_reason", "enrollment_token", "mfa_enrollment_required"]);
     assert_eq!(response["email_available"], false);
+    assert_eq!(response["email_unavailable_reason"], "no_smtp_no_relay");
     assert_eq!(response["mfa_enrollment_required"], true);
     assert!(response.get("access_token").is_none() && response.get("refresh_token").is_none());
     let token = response["enrollment_token"].as_str().unwrap().to_owned();

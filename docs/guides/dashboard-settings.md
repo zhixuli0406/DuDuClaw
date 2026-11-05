@@ -581,7 +581,7 @@ The work timeline answers who finished what, who is stuck, and what needs your d
 mfa_enforced = true
 ```
 
-New team installs enforce MFA by default. Existing installs keep their current policy, including legacy stores without MFA policy records. An Admin enables or disables enforcement with the dashboard toggle under **Users → Two-factor login management**. On a new team install, the first Admin must use a host-issued enrollment code (`duduclaw ops users mfa-enrollment-code <email> <challenge_ref>`) after password login, then complete authenticator enrollment; without a configured Email factor, the dashboard alone cannot finish this first enrollment. For existing installs with enforcement off, check `mfa.overview`, channel delivery and host recovery before enabling. Both dashboard config writers require a current active Admin. Enrollment and later credential changes invalidate older JWTs through a per-user epoch; enforcement alone lets existing access tokens expire naturally and refuses unenrolled refresh. Legacy shared-token WebSocket login is refused when enforced.
+New team installs enforce MFA by default. Existing installs keep their current policy, including legacy stores without MFA policy records. An Admin enables or disables enforcement with the dashboard toggle under **Users → Two-factor login management**. On a new team install, after password login, the first Admin can complete first enrollment through mailbox verification when SMTP or licensed relay is available. Otherwise, a host operator must issue an enrollment code with `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>`, and the Admin must use it to complete authenticator enrollment; the dashboard alone cannot finish that enrollment. For existing installs with enforcement off, check `mfa.overview`, channel delivery and host recovery before enabling. Both dashboard config writers require a current active Admin. Enrollment and later credential changes invalidate older JWTs through a per-user epoch; enforcement alone lets existing access tokens expire naturally and refuses unenrolled refresh. Legacy shared-token WebSocket login is refused when enforced.
 
 Configuration is an in-memory snapshot, loaded at boot and after dashboard writes; external file changes reload every 30 seconds. A failed reload warns and preserves the last good value; every edition with no valid snapshot fails closed; an existing unreadable or corrupt policy store also refuses boot. A missing `[auth]` table or key retains the durable policy; new team provisioning explicitly records true in both config and the identity store. Enforcement follows the stored policy in every edition, including license expiry, license fallback and an explicit Personal override; only an Admin deliberately turning it off disables it. Fresh Personal installs without a policy store stay unenforced. Local auto-login cannot bypass enforced MFA. Host recovery works under Personal too. See [Security defense](../features/05-security-defense.md) for proof fields, session binding and `duduclaw ops users mfa-reset` / `mfa-enrollment-code` host recovery. Key rotation is out of scope.
 
@@ -595,7 +595,22 @@ Every boot attempts singleton ownership exactly once, early, even without a pend
 
 ### Email codes, passkeys and keep me signed in (since v1.80.0)
 
-In **Settings → Account**, you can keep the existing authenticator app and add **Email verification code** or one or more named **Passkeys**. Enter your current password before adding or removing a method. Email setup sends a six-digit code to the account email; the factor is activated only after successful verification. Administrators must configure the existing `[channels.email]` SMTP sender (`smtp_host`, `from_addr` and, when required, SMTP credentials). Without a usable sender, the option is unavailable. Factor changes are audited and trigger an email notice when system email is configured.
+In **Settings → Account**, you can keep the existing authenticator app and add **Email verification code** or one or more named **Passkeys**. Enter your current password before adding or removing a method. Email setup sends a six-digit code to the account email; the factor is activated only after successful verification. The system prefers the existing `[channels.email]` SMTP sender (`smtp_host`, `from_addr` and, when required, SMTP credentials). Without SMTP, a valid non-OpenSource license can relay verification codes through DuDuClaw, provided a control-plane URL passes the existing license-refresh host policy and relay is enabled below. Factor changes are audited; security-change notices still use configured SMTP only.
+
+#### Email verification relay configuration
+
+Set this in the gateway's `config.toml`:
+
+```toml
+[mfa]
+email_relay = true
+```
+
+`email_relay` defaults to `true`. Setting it to `false` disables licensed relay only; it does not disable your SMTP sender or MFA enforcement. OpenSource, invalid or expired licenses, and missing control-plane URLs allowed by the existing host policy cannot use relay. `DUDUCLAW_CONTROL_URL` follows the license-refresh restrictions and cannot select an arbitrary delivery host.
+
+Relay sends the installed signed license, validated machine fingerprint, recipient address and one-time code to the control plane. It sends only a fixed verification-code template, without custom subjects or body text. Codes are never logged, and delivery audit records retain recipients as hashes only. The control plane applies additional delivery limits. If delivery is too frequent, wait before retrying; for other delivery failures, retry later or contact an administrator. Local eligibility does not establish delivery; real relay delivery still needs acceptance testing.
+
+When Email is disabled, the dashboard explains that neither a configured sender nor eligible licensed relay is available, or that relay is disabled, and tells an administrator to configure SMTP. Disabled passkeys distinguish an insecure connection from an unsupported browser. For an `http://` LAN address, use the configured HTTPS dashboard URL or localhost on the gateway host; for an unsupported browser, switch to one that supports passkeys.
 
 After your password, choose an enrolled verification method; the last successful method is selected by default. Email codes expire in 10 minutes, are single-use and allow five attempts for a challenge. Resending is limited to once per minute and five times per account per hour. Passkeys use your device's screen lock, biometric verification or a security key. Set `[dashboard] public_url` to the public dashboard URL and open that exact HTTPS origin; HTTP only works on localhost. Each passkey has a name and can be removed separately. Keep another method available if you lose access to your device. A first passkey enrollment does not issue recovery codes; existing authenticator recovery codes remain valid. First Email enrollment shows recovery codes once, and you must acknowledge saving them before continuing.
 
@@ -617,7 +632,7 @@ Refresh uses an authenticated family generation, with one current token hash per
 
 The persistent credential is not available to JavaScript or stored in localStorage: the cookie is HttpOnly, SameSite=Strict, scoped to `/api/session` and Secure on HTTPS. The server stores only hashes, rotates on use and revokes a family on reuse of an older credential. Cookie endpoints check Origin; dashboard WebSocket upgrades also validate Origin.
 
-Acceptance remains pending for real SMTP delivery, browser/platform passkey registration and login, cross-platform Rust builds, dependency audit and full gateway integration tests. UI code and written tests alone do not establish those results.
+Acceptance remains pending for real SMTP and licensed-relay delivery, browser/platform passkey registration and login, cross-platform Rust builds, dependency audit and full gateway integration tests. UI code and written tests alone do not establish those results.
 
 ### Dashboard two-factor login
 

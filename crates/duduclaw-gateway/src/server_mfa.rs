@@ -73,7 +73,9 @@ async fn first_factor_response(
                 factors["challenge_id"]=serde_json::json!(challenge);
                 factors
             } else {serde_json::json!({"mfa_enrollment_required":true,"enrollment_token":challenge,"challenge_ref":duduclaw_auth::mfa::enrollment_challenge_ref(&challenge)})};
-            payload["email_available"]=serde_json::json!(crate::mfa_email::available(&state.home_dir));
+            let reason=crate::mfa_email::unavailable_reason(&state.home_dir);
+            payload["email_available"]=serde_json::json!(reason.is_none());
+            payload["email_unavailable_reason"]=serde_json::json!(reason);
             Ok(Some(payload))
         }
         Ok(Ok(None)) => Ok(None),

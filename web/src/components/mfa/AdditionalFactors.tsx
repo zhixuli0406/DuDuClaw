@@ -1,3 +1,4 @@
+import { DisabledFactorExplanation } from './DisabledFactorExplanation';
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Button, Input } from '@/components/mds';
@@ -16,7 +17,7 @@ export function AdditionalFactors({ status, onChange }: { status: MfaStatus; onC
   const [code, setCode] = useState('');
   const [enrollment, setEnrollment] = useState('');
   const [passkeys, setPasskeys] = useState<Passkey[]>([]);
-  const [available, setAvailable] = useState(false);
+  const [available, setAvailable] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [codes, setCodes] = useState<string[] | null>(null);
@@ -59,7 +60,7 @@ export function AdditionalFactors({ status, onChange }: { status: MfaStatus; onC
     <label className="block space-y-2">{t('mfa.factorPassword')}<Input type="password" autoComplete="current-password" maxLength={4096} value={password} onChange={e => setPassword(e.target.value)} /></label>
     <div className="space-y-3">
       <h4>{t('mfa.factor.email')}</h4>
-      {!status.email_available && <p role="status" className="text-sm">{t('mfa.email.unavailable')}</p>}
+      {!status.email_available && <DisabledFactorExplanation factor="email" reason={status.email_unavailable_reason} />}
       {status.factors?.email ? <Button variant="outline" disabled={busy || !password || removeDisabled} onClick={() => void run(async () => replace(await mfaApi.emailRemove(password)))}>{t('mfa.email.remove')}</Button> : <>
         <p className="text-sm">{t('mfa.email.enrollHint')}</p>
         {enrollment && <label className="block space-y-2">{t('mfa.factor.email')}<Input autoComplete="one-time-code" inputMode="numeric" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} /></label>}
@@ -72,7 +73,7 @@ export function AdditionalFactors({ status, onChange }: { status: MfaStatus; onC
     </div>
     <div className="space-y-3">
       <h4>{t('mfa.factor.passkey')}</h4>
-      {(!available || !passkeyAvailable()) && <p role="status" className="text-sm">{t('mfa.passkey.unavailable')}</p>}
+      {(available === false || !passkeyAvailable()) && <DisabledFactorExplanation factor="passkey" />}
       <label className="block space-y-2">{t('mfa.passkey.name')}<Input maxLength={80} value={name} onChange={e => setName(e.target.value)} /></label>
       {passkeyEnrollment && <>
         <p className="text-sm">{t('mfa.proof.hint')}</p>

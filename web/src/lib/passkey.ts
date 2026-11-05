@@ -15,8 +15,13 @@ export type RequestOptionsJSON = Omit<PublicKeyCredentialRequestOptions, 'challe
   challenge: string; allowCredentials?: DescriptorJSON[];
 };
 const descriptors = (values?: DescriptorJSON[]) => values?.map(value => ({ ...value, id: decodeBase64url(value.id) }));
+export function passkeyUnavailableReason(): 'insecure_context' | 'unsupported_browser' | null {
+  if (!window.isSecureContext) return 'insecure_context';
+  if (typeof PublicKeyCredential === 'undefined' || !navigator.credentials) return 'unsupported_browser';
+  return null;
+}
 export function passkeyAvailable(): boolean {
-  return window.isSecureContext && typeof PublicKeyCredential !== 'undefined' && !!navigator.credentials;
+  return passkeyUnavailableReason() === null;
 }
 function serialize(credential: PublicKeyCredential) {
   const response = credential.response;
