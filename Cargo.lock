@@ -1990,8 +1990,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "duduclaw-execution"
 name = "duduclaw-egress"
+version = "1.79.3"
+dependencies = [
+ "duduclaw-isolation",
+ "libc",
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "duduclaw-execution"
 version = "1.79.3"
 dependencies = [
  "duduclaw-isolation",
@@ -2003,7 +2014,6 @@ dependencies = [
  "tokio",
  "uuid",
  "windows-sys 0.59.0",
- "serde",
 ]
 
 [[package]]
