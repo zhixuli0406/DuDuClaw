@@ -17,6 +17,7 @@ ring = { workspace = true }
 hmac = "0.12"
 sha1 = "0.10"
 subtle = "2"
+webauthn-rs = { version = "=0.5.5", features = ["danger-allow-state-serialisation", "danger-credential-internals"] }
 
 # Password hashing
 argon2 = { version = "0.5", features = ["std"] }

@@ -781,6 +781,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     // Install operator-configured extra allowed Origins for dashboard WS/CORS.
     // Empty by default => built-in loopback origins only (no behaviour change).
+    remembered_sessions::set_origins(&config.allowed_origins, Some(config.port));
     let extra_origins = init_allowed_origins(config.allowed_origins.clone());
     if extra_origins.is_empty() {
         info!("dashboard WS/CORS: loopback origins only (localhost / 127.0.0.1 / [::1])");
@@ -2667,12 +2668,25 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/mfa/verify", post(server_mfa::verify))
         .route("/api/mfa/enroll/begin", post(server_mfa::enroll_begin))
         .route("/api/mfa/enroll/confirm", post(server_mfa::enroll_confirm))
+        .route("/api/mfa/email/send", post(server_mfa_email::send))
+        .route("/api/mfa/email/verify", post(server_mfa_email::verify))
+        .route("/api/mfa/passkey/list", post(server_mfa_passkey::list))
+        .route("/api/mfa/passkey/register/begin", post(server_mfa_passkey::register_begin))
+        .route("/api/mfa/passkey/register/finish", post(server_mfa_passkey::register_finish))
+        .route("/api/mfa/passkey/login/begin", post(server_mfa_passkey::login_begin))
+        .route("/api/mfa/passkey/login/finish", post(server_mfa_passkey::login_finish))
+        .route("/api/mfa/passkey/delete", post(server_mfa_passkey::delete))
         .route("/api/channel-identity/bind", post(handle_channel_bind))
         .route(
             "/api/channel-identity/list",
             get(handle_channel_identity_list),
         )
         .route("/api/refresh", post(handle_refresh))
+        .route("/api/session/remember", post(remembered_sessions::remember))
+        .route("/api/session/refresh", post(remembered_sessions::refresh))
+        .route("/api/session/logout", post(remembered_sessions::logout))
+        .route("/api/session/devices", get(remembered_sessions::devices))
+        .route("/api/session/revoke", post(remembered_sessions::revoke))
         .route("/api/me", get(handle_me))
         .route("/api/change-password", post(handle_change_password))
         .route("/api/brand", get(handle_public_brand))
@@ -3543,15 +3557,11 @@ async fn handle_login(
         return response;
     }
 
-    let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
-    let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
-        .iter()
-        .map(|b| (b.agent_name.clone(), b.access_level))
-        .collect();
+    let policy_exempt = state.handler.resolve_edition_profile().await.is_personal();
 
     // Issue tokens
     let (access_token, refresh_token) =
-        match state.user_db.mfa_issue_if_unenrolled(&user.id, || state.jwt_config.issue_session_tokens(&user, &agent_access)) {
+        match state.user_db.mfa_issue_if_unenrolled(&user.id, user.credential_epoch, policy_exempt, |current, access| state.jwt_config.issue_session_tokens(current, access)) {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to issue access token: {e}");
@@ -3701,14 +3711,10 @@ async fn handle_otp_verify(
         return response;
     }
 
-    let bindings = state.user_db.get_user_agents(&user.id).unwrap_or_default();
-    let agent_access: Vec<(String, duduclaw_auth::AccessLevel)> = bindings
-        .iter()
-        .map(|b| (b.agent_name.clone(), b.access_level))
-        .collect();
+    let policy_exempt = state.handler.resolve_edition_profile().await.is_personal();
 
     let (access_token, refresh_token) =
-        match state.user_db.mfa_issue_if_unenrolled(&user.id, || state.jwt_config.issue_session_tokens(&user, &agent_access)) {
+        match state.user_db.mfa_issue_if_unenrolled(&user.id, user.credential_epoch, policy_exempt, |current, access| state.jwt_config.issue_session_tokens(current, access)) {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to issue access token: {e}");
@@ -4044,6 +4050,11 @@ async fn handle_refresh(
         }
     };
 
+    if state.user_db.remember_login_exchanged(claims.jti.as_deref()).unwrap_or(true) {
+        return (axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error":"refresh credential was exchanged"}))).into_response();
+    }
+
     // Fetch fresh user data and bindings
     let user = match state.user_db.get_user(&claims.sub) {
         Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active && duduclaw_auth::mfa::credential_epoch_matches(claims.credential_epoch, u.credential_epoch) => u,
@@ -4063,8 +4074,8 @@ async fn handle_refresh(
             Json(serde_json::json!({"error": "請重新登入並完成雙因素驗證註冊。"}))).into_response();
     }
 
-    let access_token = match state.user_db.mfa_issue_refresh(
-        &user.id, claims.credential_epoch,
+    let access_token = match state.user_db.mfa_refresh_and_issue(
+        &user.id, claims.credential_epoch, claims.jti.as_deref(), false,
         |user, access| state.jwt_config.issue_access_token_in_session(user, access, claims.jti.as_deref()),
     ) {
         Ok(t) => t,
@@ -4932,6 +4943,7 @@ pub(crate) fn init_allowed_origins(raw: Vec<String>) -> Vec<String> {
 /// are normalized, empties dropped, deduped (config first, then env). Returns the
 /// resulting live list.
 pub(crate) fn set_allowed_origins(config_entries: Vec<String>) -> Vec<String> {
+    remembered_sessions::set_origins(&config_entries, None);
     let mut merged: Vec<String> = config_entries
         .iter()
         .filter_map(|s| normalize_origin_entry(s))
@@ -5065,10 +5077,13 @@ fn authorize_file_access(
     // The token proves identity only. Like RPC live_context, rebuild all
     // authority from one current users.db snapshot, never JWT bindings.
     // This also refuses inactive users and database errors without a fallback.
-    let claims = state.jwt_config.verify_access_token(token).map_err(|_| unauthorized())?;
-    let ctx = crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &claims.sub)
+    let authenticated = authenticate_jwt(state, token).map_err(|_| unauthorized())?;
+    let ctx = crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &authenticated.user_id)
         .map_err(|_| unauthorized())?
         .ok_or_else(unauthorized)?;
+    if !duduclaw_auth::mfa::credential_epoch_matches(authenticated.credential_epoch, ctx.credential_epoch) {
+        return Err(unauthorized());
+    }
     require_password_changed(&ctx)?;
 
     let allowed = match agent {
@@ -16637,6 +16652,16 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
     });
     macro_rules! socket_output_gate {
         ($heartbeat:expr, $drops_output:expr) => {
+            if !remembered_sessions::dashboard_socket_age_valid(dashboard_session.is_some(), conn_start.elapsed().as_secs()) {
+                let _ = sink.send(Message::Close(None)).await;
+                break;
+            }
+            if let Some((user, session)) = dashboard_session.as_ref() {
+                if !state.user_db.remember_session_valid(Some(session), user, chrono::Utc::now().timestamp()).unwrap_or(false) {
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                }
+            }
             let validity = server_mfa::socket_validity(
                 &state, &user_ctx, access_expires, legacy_admin_authenticated, $heartbeat,
             ).await;
@@ -17097,6 +17122,9 @@ fn jwt_account_gate(
 /// Single DB lookup, fail-closed on error (R2 fix for double-lookup + fail-open).
 fn authenticate_jwt(state: &AppState, jwt_str: &str) -> Result<UserContext, String> {
     let claims = state.jwt_config.verify_access_token(jwt_str)?;
+    if !state.user_db.remember_session_valid(claims.jti.as_deref(), &claims.sub, chrono::Utc::now().timestamp())? {
+        return Err("登入裝置已登出，請重新登入。".into());
+    }
 
     // Single DB lookup — fail-closed: DB error = reject.
     let must_change_password = match state.user_db.get_user(&claims.sub) {
@@ -19277,3 +19305,11 @@ mod tts_limit_tests {
         assert!(limiter.take("extra", now + std::time::Duration::from_secs(60)));
     }
 }
+
+#[path = "remembered_sessions.rs"]
+mod remembered_sessions;
+
+#[path = "server_mfa_email.rs"]
+mod server_mfa_email;
+#[path = "server_mfa_passkey.rs"]
+mod server_mfa_passkey;

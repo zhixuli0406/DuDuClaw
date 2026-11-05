@@ -37,6 +37,9 @@ impl UserDb {
     /// session identity comes from the transport, never from RPC parameters.
     pub fn mfa_password_challenge(&self, user: &str, password: &str, session: &str, now: i64) -> Result<String> {
         if session.is_empty() || password.is_empty() || password.len()>4096 { return Err(DENIED.into()); }
+        if self.mfa_active(user)? {
+            return self.mfa_factor_password_challenge(user, password, session, now);
+        }
         let account = self.get_user(user)?.ok_or(DENIED)?;
         let password_snapshot: String=self.conn().query_row("SELECT password_hash FROM users WHERE id=?1",[user],|r|r.get(0)).map_err(|_|DENIED)?;
         let verified = self.verify_password(&account.email, password)?;
@@ -80,6 +83,10 @@ impl UserDb {
              ORDER BY channel,channel_user_id LIMIT 1", [&user], |r|Ok((r.get(0)?,r.get(1)?)))
             .optional().map_err(|e|e.to_string())?;
         let old: Option<String> = tx.query_row("SELECT kind FROM mfa_enrollment_proofs WHERE token_hash=?1", [token_hash(token)], |r|r.get(0)).optional().map_err(|e|e.to_string())?;
+        if old.as_deref()==Some("password") && any_factor(&tx,&user)? && proof_verified(&tx,token)? {
+            tx.commit().map_err(|e|e.to_string())?;
+            return Ok(None);
+        }
         if old.as_deref().is_some_and(|v|v!="pending") { return Err(DENIED.into()); }
         let kind = if !required { "password" } else if channel.is_some() { "channel" } else { "admin" };
         tx.execute("INSERT INTO mfa_enrollment_proofs(token_hash,code_hash,kind,verified) VALUES(?1,?2,?3,?4)
@@ -150,7 +157,8 @@ impl UserDb {
 }
 
 pub(super) fn require_independent_proof(conn: &Connection, token: &str, now: i64) -> Result<()> {
-    challenge_user(conn,token,"enroll",now)?;
+    let user=challenge_user(conn,token,"enroll",now)?;
+    if any_factor(conn,&user)? && proof_verified(conn,token)? { return Ok(()); }
     let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM mfa_enrollment_proofs WHERE token_hash=?1 AND verified=1 AND kind IN ('channel','admin'))",
         [token_hash(token)],|r|r.get(0)).map_err(|e|e.to_string())?;
     if valid { Ok(()) } else { Err("請重新開始註冊並完成獨立身分驗證。".into()) }

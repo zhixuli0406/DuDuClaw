@@ -69,7 +69,8 @@ export function MfaEnrollment({ initial, begin, confirm, onSaved, onCancel }: {
       if (enrollment?.secret) {
         const result = await confirm({ ...input, code });
         if (!mounted.current) return;
-        setCodes(result.recovery_codes);
+        if (result.recovery_codes.length) setCodes(result.recovery_codes);
+        else await onSaved();
         setEnrollment(undefined); setPassword(''); setProof(''); setCode('');
       } else {
         const result = await begin(input);

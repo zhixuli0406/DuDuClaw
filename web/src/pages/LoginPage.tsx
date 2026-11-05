@@ -35,6 +35,7 @@ export function LoginPage() {
   const [mode, setMode] = useState<Mode>('password');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [remember, setRemember] = useState(false);
   const [error, setError] = useState('');
 
   // First-run onboarding: an unclaimed instance lets the first (localhost)
@@ -116,7 +117,7 @@ export function LoginPage() {
     e.preventDefault();
     setError('');
     try {
-      const result = await login(email, password);
+      const result = await login(email, password, remember);
       setPassword('');
       if (result) setMfa(result);
       else navigate(returnTo, { replace: true });
@@ -145,7 +146,7 @@ export function LoginPage() {
     e.preventDefault();
     setError('');
     try {
-      const result = await otpVerify(challengeId, code);
+      const result = await otpVerify(challengeId, code, remember);
       setCode(''); setChallengeId('');
       if (result) setMfa(result);
       else navigate(returnTo, { replace: true });
@@ -194,6 +195,10 @@ export function LoginPage() {
             </div>
           )}
 
+          {!mfa && !firstRun && <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} />
+            {intl.formatMessage({ id: 'login.remember' })}
+          </label>}
           {mfa ? (
             <LoginMfa challenge={mfa} onComplete={() => navigate(returnTo, { replace: true })}
               onCancel={() => { setMfa(null); setOtpStep('email'); setError(''); }} />

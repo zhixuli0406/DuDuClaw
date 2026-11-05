@@ -88,6 +88,7 @@ impl MethodHandler {
 
         match method {
             "mfa.status" | "mfa.enroll_begin" | "mfa.enroll_confirm"
+            | "mfa.email_begin" | "mfa.email_confirm" | "mfa.email_remove"
             | "mfa.recovery_regenerate" | "mfa.disable" => {
                 self.handle_mfa_rpc(method, params, ctx).await
             }

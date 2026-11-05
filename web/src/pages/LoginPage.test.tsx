@@ -71,3 +71,16 @@ describe('<LoginPage> first-run claim', () => {
     expect(screen.queryByPlaceholderText('admin@local')).not.toBeInTheDocument();
   });
 });
+
+it('keeps persistence opt-in and passes the checked choice to password login', async () => {
+  const login = vi.fn().mockResolvedValue({ mfa_required: true, challenge_id: 'pending' });
+  useAuthStore.setState({ login, tryLocalSession: vi.fn().mockResolvedValue(false) });
+  renderWithProviders(<LoginPage />);
+  const checkbox = await screen.findByLabelText('Keep me signed in (180 days by default)');
+  expect(checkbox).not.toBeChecked();
+  fireEvent.click(checkbox);
+  fireEvent.change(screen.getByLabelText('Email'), { target: { value: 'owner@example.com' } });
+  fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'current-password' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Sign In' }));
+  await waitFor(() => expect(login).toHaveBeenCalledWith('owner@example.com', 'current-password', true));
+});

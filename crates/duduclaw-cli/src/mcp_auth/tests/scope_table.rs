@@ -761,3 +761,10 @@ fn cached_auth_fails_closed_when_reload_hits_io_error() {
         "an I/O error on reload must deny outright, never reuse the previously-cached principal"
     );
 }
+
+#[test]
+fn session_administration_requires_admin_scope() {
+    for method in ["sessions.policy", "sessions.policy_update", "users.revoke_sessions"] {
+        assert_eq!(tool_requires_scope(method), Some(Scope::Admin));
+    }
+}
