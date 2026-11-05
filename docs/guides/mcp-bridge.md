@@ -6,7 +6,7 @@ external server's tools without a hand-written Rust connector. This is how you
 wire Plane, Chatwoot, Invoice Ninja, Gmail/Calendar, WooCommerce, and any other
 MCP server into an agent.
 
-## Third-party tool checks (unreleased)
+## Third-party tool checks (since v1.80.0)
 
 Both stdio and Streamable HTTP `[[mcp.external]]` mounts use the same annotation-based `ThirdPartyGate` as managed MCP proxies. The server's tool allowlist/denylist still narrows its tools; employee name restrictions, effect rules and approval requirements also apply to listing and calling them. Annotations can only raise the Modify default to Delete; read-only claims never lower risk, even with the legacy server trust setting. A tool refused by the gate is not exposed to the model.
 

@@ -6,10 +6,10 @@ DuDuClaw has separate interfaces for IDE conversations and external task submiss
 |---|---|---|
 | Agent Client Protocol v1 | `duduclaw acp`, stdio | IDE sessions and prompt turns |
 | Legacy A2A command | `duduclaw acp server`, stdio | Existing local scripts using `agent/discover`, `message/send`, `tasks/send` / `tasks/get` / `tasks/cancel` |
-| A2A v1.0 JSON-RPC, unreleased | Gateway `POST /a2a` | Authenticated external task-board goals |
+| A2A v1.0 JSON-RPC, since v1.80.0 | Gateway `POST /a2a` | Authenticated external task-board goals |
 | MCP | `duduclaw mcp-server` or the separate HTTP server | Tools for AI runtimes and MCP clients |
 
-## Gateway A2A v1.0 (unreleased)
+## Gateway A2A v1.0 (since v1.80.0)
 
 The gateway publishes a signed Agent Card at `/.well-known/agent-card.json`. It advertises the JSON-RPC interface, protocol version `1.0`, the actual enabled skills of employees explicitly exposed by the operator, and Dashboard Bearer JWT authentication. Signing protects card integrity; it does not authenticate a caller or grant access to a skill. The card advertises no streaming or push notification support. Only enabled skills with nonempty names and descriptions are published, tagged `employee:<id>` for their actual employee. If no employee is exposed or no publishable skill exists, the public card returns HTTP 503; an authenticated caller with no available skills receives `-32007` from `GetExtendedAgentCard`. `SendMessage` requires an exposed employee with at least one publishable skill. If the signing key is unavailable, discovery returns HTTP 503 rather than an unsigned card.
 
@@ -77,8 +77,6 @@ Existing `keys/a2a-signing.ed25519` keys must be regular files, not symbolic lin
 | Blocking responses, task continuation, push notification configuration | Unsupported |
 
 JSON-RPC protocol errors use the standard error codes. A2A errors use `-32001` through `-32009` where applicable, with `error.data` as an array of typed `google.rpc.ErrorInfo` details. Unauthenticated and unauthorized requests use HTTP 401/403. Input screening, method authorization and security audit apply before task operations. Public discovery, rejected authentication and authenticated RPC each have separate 120 requests/minute IP buckets. Their separate global limits are 600, 600 and 1,200 requests/minute respectively; RPC also retains the 60/minute caller limit. Anonymous traffic cannot spend the authenticated RPC budget. Each IP/caller limiter holds at most 10,000 keys; saturation refuses new keys, and stale-key cleanup is throttled. This interface is HTTP-only; WebSocket `a2a.*` calls are refused. See [Security defense](05-security-defense.md).
-
-Tests cover the HTTP contract and access boundaries. The security crate’s six focused rate-limiter tests passed locally. Gateway/CLI compilation and tests, a renewed Daybreak review after these fixes, and live client/reverse-proxy acceptance remain pending. The 2026-11-05 follow-up Daybreak review found two Medium and three Low issues; fixes and regression tests have been added, but the revised patch has not received security sign-off.
 
 ## IDE Agent Client Protocol
 

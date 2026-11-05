@@ -6,10 +6,10 @@ DuDuClaw 分別提供 IDE 對話與外部任務介面，各自有不同的傳輸
 |---|---|---|
 | Agent Client Protocol v1 | `duduclaw acp`，stdio | IDE 工作階段與提示回合 |
 | 既有 A2A 指令 | `duduclaw acp server`，stdio | 使用 `agent/discover`、`message/send`、`tasks/send` / `tasks/get` / `tasks/cancel` 的本機腳本 |
-| A2A v1.0 JSON-RPC，尚未發版 | Gateway `POST /a2a` | 經認證的外部任務看板目標 |
+| A2A v1.0 JSON-RPC，v1.80.0 起 | Gateway `POST /a2a` | 經認證的外部任務看板目標 |
 | MCP | `duduclaw mcp-server` 或獨立 HTTP server | 提供 AI runtime 與 MCP client 使用的工具 |
 
-## Gateway A2A v1.0（尚未發版）
+## Gateway A2A v1.0（v1.80.0 起）
 
 Gateway 在 `/.well-known/agent-card.json` 提供有簽章的 Agent Card，列出 JSON-RPC 介面、協定版本 `1.0`、管理員明確公開之員工實際啟用的技能，以及 Dashboard Bearer JWT 認證方式。簽章用來驗證卡片完整性，不會授予呼叫者任何技能權限。卡片不宣告串流或推播通知支援。僅公開名稱與說明皆非空的已啟用技能，並標記實際員工的 `employee:<id>`。未公開員工或沒有可公開技能時，公開卡片回覆 HTTP 503；登入者沒有可用技能時，`GetExtendedAgentCard` 回覆 `-32007`。`SendMessage` 只接受至少有一項可公開技能的已公開員工。簽章金鑰不可用時，探索端點回覆 HTTP 503，不會提供未簽章卡片。
 
@@ -77,8 +77,6 @@ curl --fail-with-body 'https://host.example/a2a' \
 | 等待完成才回覆、接續既有任務、推播通知設定 | 不支援 |
 
 JSON-RPC 協定錯誤使用標準錯誤碼；A2A 錯誤依情況使用 `-32001` 至 `-32009`，`error.data` 是含 `google.rpc.ErrorInfo` 型別資訊的陣列。未認證與未授權請求使用 HTTP 401/403。任務操作前會檢查輸入與方法權限，並留下安全稽核紀錄。公開探索、認證失敗與已認證 RPC 各自使用獨立的 IP 額度，每個 IP 每分鐘限 120 次；三類全域上限依序為每分鐘 600、600、1,200 次，RPC 另有每個呼叫者每分鐘 60 次的限制。匿名流量不會扣除已認證 RPC 額度。每個 IP／呼叫者限流器最多保存 10,000 個鍵，滿額拒絕新鍵，過期清理另有頻率限制。此介面僅提供 HTTP，WebSocket 的 `a2a.*` 呼叫會被拒絕。詳見[安全防護](05-security-defense.md)。
-
-此未發版變更已提供 HTTP 契約與存取邊界測試，security crate 的 6 項限流測試已在本機通過。Gateway／CLI 編譯與測試、修補後的 Daybreak 再審、真實 client 與反向代理驗收仍待執行。2026-11-05 後續 Daybreak 審查發現 2 項 Medium、3 項 Low；本次已補修正與回歸測試，但修補後版本尚未取得安全審查放行。
 
 ## IDE Agent Client Protocol
 

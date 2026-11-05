@@ -89,9 +89,9 @@ Provider は `verify_release_archive_with_pubkey(bytes, checksum, signature, pin
 
 ## 自動更新（任意）
 
-`scripts/linux-protected/auto-upgrade/` は v1.79.3 より後のソースに追加された任意の夜間更新スクリプトです。既存の `service upgrade --protected-linux --version` だけを呼び出すため、v1.79.3 の保護インストールでも使えます。ホストの現地時刻で毎日 03:30 に、最大 20 分のランダムな遅延を加えて実行します。既存の署名検証付き更新コマンドで、新しい公式署名済みリリースだけをインストールし、稼働中の gateway を再起動します。作業のない時間に設定してください。`Persistent=false` により、朝の起動後に夜間の未実行分を補って営業時間中に再起動することはありません。ダッシュボードは v1.80.0 まで手動コマンドを表示します。未導入時は手動更新のままです。
+`scripts/linux-protected/auto-upgrade/` は v1.80.0 からソースに含まれる任意の夜間更新スクリプトです。既存の `service upgrade --protected-linux --version` だけを呼び出すため、v1.79.3 の保護インストールでも使えます。ホストの現地時刻で毎日 03:30 に、最大 20 分のランダムな遅延を加えて実行します。既存の署名検証付き更新コマンドで、新しい公式署名済みリリースだけをインストールし、稼働中の gateway を再起動します。作業のない時間に設定してください。`Persistent=false` により、朝の起動後に夜間の未実行分を補って営業時間中に再起動することはありません。このモードではダッシュボードから更新を実行できず、タイマーの有無にかかわらず新しいバージョンと手動の `sudo` コマンドを表示します。未導入時は手動更新のままです。
 
-v1.79.3 のソースタグにはこのディレクトリがなく、現時点では公開済みタグにも含まれていません。含まれるリリースタグが出るまでは、固定の完全なコミット SHA（以下では `<commit>` と表記。確認したコミットに置き換えてください）から取得し、確認してください。移動する `main` から取得しないでください（[ソースの場所](https://github.com/zhixuli0406/DuDuClaw/tree/<commit>/scripts/linux-protected/auto-upgrade)）。Linux リリースアーカイブには `scripts/` がありません。4 個のスクリプト／ユニットファイルを確認してから、`/root/duduclaw-auto-upgrade` など root だけが書き込める場所にコピーします。ファイルとすべての親ディレクトリが root 管理であることを確認して実行します。
+v1.79.3 以前のソースタグにはこのディレクトリがなく、v1.80.0 以降のリリースタグには含まれます。`v1.80.0` タグが指すコミットなど、固定の完全なコミット SHA（以下では `<commit>` と表記。確認したコミットに置き換えてください）から取得し、確認してください。移動する `main` から取得しないでください（[ソースの場所](https://github.com/zhixuli0406/DuDuClaw/tree/<commit>/scripts/linux-protected/auto-upgrade)）。Linux リリースアーカイブには `scripts/` がありません。4 個のスクリプト／ユニットファイルを確認してから、`/root/duduclaw-auto-upgrade` など root だけが書き込める場所にコピーします。ファイルとすべての親ディレクトリが root 管理であることを確認して実行します。
 
 ```sh
 # Replace <commit> with the reviewed full commit SHA; obtain files from that SHA.

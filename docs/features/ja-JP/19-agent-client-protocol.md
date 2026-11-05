@@ -6,10 +6,10 @@ DuDuClaw は IDE の会話と外部からのタスク送信に別々のインタ
 |---|---|---|
 | Agent Client Protocol v1 | `duduclaw acp`、stdio | IDE セッションとプロンプトのターン |
 | 既存の A2A コマンド | `duduclaw acp server`、stdio | `agent/discover`、`message/send`、`tasks/send` / `tasks/get` / `tasks/cancel` を使うローカルスクリプト |
-| A2A v1.0 JSON-RPC、未リリース | Gateway `POST /a2a` | 認証済みクライアントによるタスクボードの目標作成 |
+| A2A v1.0 JSON-RPC、v1.80.0 から | Gateway `POST /a2a` | 認証済みクライアントによるタスクボードの目標作成 |
 | MCP | `duduclaw mcp-server` または独立した HTTP server | AI runtime と MCP client 向けのツール |
 
-## Gateway A2A v1.0（未リリース）
+## Gateway A2A v1.0（v1.80.0 から）
 
 Gateway は `/.well-known/agent-card.json` に署名付き Agent Card を公開します。JSON-RPC インターフェース、プロトコルバージョン `1.0`、管理者が明示的に公開した社員の実際に有効なスキル、Dashboard Bearer JWT 認証を記載します。署名はカードの完全性を確認するもので、呼び出し元への権限付与にはなりません。ストリーミングやプッシュ通知の対応は宣言しません。名前と説明が空でない有効なスキルのみ公開し、実際の社員を示す `employee:<id>` タグを付けます。公開社員や公開可能なスキルがない場合、公開カードは HTTP 503 を返します。認証済みの呼び出し元に利用可能なスキルがなければ、`GetExtendedAgentCard` は `-32007` を返します。`SendMessage` の対象は、公開可能なスキルが少なくとも一つある公開社員に限ります。署名鍵が利用できない場合、探索エンドポイントは HTTP 503 を返し、未署名のカードは提供しません。
 
@@ -77,8 +77,6 @@ curl --fail-with-body 'https://host.example/a2a' \
 | 完了まで待機する応答、既存タスクの継続、プッシュ通知設定 | 非対応 |
 
 JSON-RPC のプロトコルエラーには標準コードを使います。A2A エラーは該当する `-32001` から `-32009` を使い、`error.data` は型付き `google.rpc.ErrorInfo` の配列です。未認証・未認可のリクエストには HTTP 401/403 を使用します。タスク操作前に入力スキャン、メソッド認可、安全監査を適用します。公開探索、認証失敗、認証済み RPC は、それぞれ独立した IP ごとの毎分 120 件の枠を使います。全体の上限も分離し、順に毎分 600、600、1,200 件です。RPC には呼び出し元ごとの毎分 60 件の制限も適用します。匿名の通信は認証済み RPC の枠を消費しません。各 IP／呼び出し元 limiter は最大 10,000 キーを保持し、満杯では新規キーを拒否します。期限切れキーの削除にも実行頻度の上限があります。HTTP 専用で、WebSocket の `a2a.*` 呼び出しは拒否します。[セキュリティ防御](05-security-defense.md)も参照してください。
-
-この未リリース変更には HTTP 契約とアクセス境界のテストを用意しています。security crate のレート制限テスト 6 件はローカルで成功しました。Gateway／CLI のコンパイルとテスト、修正後の Daybreak 再レビュー、実クライアントとリバースプロキシでの受け入れは未実施です。2026-11-05 の再レビューでは Medium 2 件、Low 3 件が見つかりました。修正と回帰テストは追加済みですが、修正後の安全性はまだ承認されていません。
 
 ## IDE Agent Client Protocol
 

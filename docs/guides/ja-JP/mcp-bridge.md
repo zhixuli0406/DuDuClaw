@@ -2,7 +2,7 @@
 
 DuDuClawは、サードパーティの [Model Context Protocol](https://modelcontextprotocol.io) サーバーを、内蔵MCPサーバーと並べてマウントできます。これにより、Rustで手書きのコネクタを書かなくても、エージェントのツールループが外部サーバーのツールを獲得します。Plane、Chatwoot、Invoice Ninja、Gmail/Calendar、WooCommerce、その他あらゆるMCPサーバーをエージェントに接続する方法がこれです。
 
-## 外部ツールの検査（未リリース）
+## 外部ツールの検査（v1.80.0 から）
 
 `[[mcp.external]]` の stdio と Streamable HTTP マウントは、管理対象 MCP プロキシと同じ `ThirdPartyGate` を使い、ツールの宣言から効果を分類します。サーバー単位の許可／拒否リストに加え、スタッフの名前制限、動作ルール、承認要件を一覧と呼び出しに適用します。アノテーションは既定の Modify を Delete に引き上げる場合だけ採用し、読み取り専用の自己申告では分類を下げません。拒否されたツールはモデルに公開しません。
 

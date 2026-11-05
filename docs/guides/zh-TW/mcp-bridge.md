@@ -2,7 +2,7 @@
 
 DuDuClaw 可以把第三方 [Model Context Protocol](https://modelcontextprotocol.io) 伺服器掛載在自己內建的 MCP server 旁邊，讓 agent 的工具迴圈直接拿到外部伺服器的工具，不必手刻一支 Rust 連接器。Plane、Chatwoot、Invoice Ninja、Gmail/Calendar、WooCommerce，以及其他任何 MCP server，都是這樣接進 agent 的。
 
-## 第三方工具檢查（尚未發佈）
+## 第三方工具檢查（v1.80.0 起）
 
 `[[mcp.external]]` 的 stdio 與 Streamable HTTP 掛載都採用與受管理 MCP 代理相同的 `ThirdPartyGate`，依工具宣告判定影響類別。伺服器的工具允許／拒絕清單仍會限縮工具，員工的名稱限制、動作規則與審批要求也會套用到清單與呼叫。annotations 只能將預設 Modify 提高為 Delete，唯讀宣稱即使搭配舊信任設定也不得降低風險；遭拒的工具不會提供給模型。
 

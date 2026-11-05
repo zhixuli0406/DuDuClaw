@@ -1,6 +1,6 @@
 # マルチランタイムエージェント実行
 
-**Codex の外部設定検査（未リリース）：** 外部設定がないか MCP を定義していなければ、通常の社員、Explore、utility、Task Sandbox、Discovery は実行できます。MCP の検出、既存設定の読み取り・解析失敗ではソース名を示して拒否します。明示した Codex judge の拒否は判定失敗となり、既定の judge では再試行しません。起動前のローカル／キャッシュのスナップショット検査であり、その後のクラウド更新を完全に隔離する保証はありません。[検査対象と制限](../../architecture/extension-gates.md)。
+**Codex の外部設定検査（v1.80.0 から）：** 外部設定がないか MCP を定義していなければ、通常の社員、Explore、utility、Task Sandbox、Discovery は実行できます。MCP の検出、既存設定の読み取り・解析失敗ではソース名を示して拒否します。明示した Codex judge の拒否は判定失敗となり、既定の judge では再試行しません。起動前のローカル／キャッシュのスナップショット検査であり、その後のクラウド更新を完全に隔離する保証はありません。[検査対象と制限](../../architecture/extension-gates.md)。
 
 > 1つのプラットフォームに 11 のランタイム ID：10 の CLI バックエンド（Claude、Codex、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode）と、任意の OpenAI 互換エンドポイントに HTTP で接続する `openai_compat` です。
 

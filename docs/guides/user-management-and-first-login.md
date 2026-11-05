@@ -16,7 +16,7 @@ The live preview and delivered email use the same renderer. Text is escaped, pai
 
 ## First login
 
-After an invited person sets their password and signs in, their home page shows **A few steps left**:
+After an invited person sets their password and signs in, their home page shows the **A few steps left** onboarding card (same title as the personal connections card; it contains the five items below):
 
 - Password setup is checked from the account's state.
 - Channel binding is done by an administrator after checking the person's channel identity; it can be skipped.

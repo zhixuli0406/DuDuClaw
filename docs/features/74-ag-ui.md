@@ -2,7 +2,7 @@
 
 External frontends can send a message to an AI employee and receive an AG-UI 1.0 event stream through `POST /api/ag-ui/agents/{agent_id}/runs`. This implements the HTTP/SSE subset described below. It does not implement all 32 event types.
 
-Status: unreleased. The first Daybreak review reported four findings; fixes are in this patch. Gateway compilation, live frontend/provider acceptance and Daybreak re-review remain pending.
+Available since v1.80.0.
 
 ## Send a message
 

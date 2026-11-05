@@ -16,7 +16,7 @@ Every raw SOUL, contract and skill document is scanned before saving, and the ac
 
 All five library RPCs (`templates.catalog/get/copy/save/apply`) require a current Admin. Company templates live under `<home>/company_templates/`, with atomic saves, one revision per team, and audit records without document contents. Built-ins are read-only; premium copies retain their license requirement. A team copy includes its leader and descendants (up to 50), preserving internal reporting relationships. Edits may remove skills/members, reduce explicit tool allowlists or add denials, never widen permissions; removing a leader requires removing their descendants. Disabled skills remain disabled. Custom scripts are excluded; pristine bundled office skills restore their bundled assets. Company copies exclude pack knowledge extras and evaluation suites.
 
-Apply asks for employee ids and display names, plus department and active-user Operator bindings in the company edition. Existing creation, product and license limits still apply. Partial results list committed employees and never automatically retry the whole team. Remote gateway compilation/tests, browser acceptance and the required Daybreak Blue follow-up review remain pending; see the [security follow-up handoff](../../wiki/reports/RM-025-template-library-handoff.md) for exact local validation.
+Apply asks for employee ids and display names, plus department and active-user Operator bindings in the company edition. Existing creation, product and license limits still apply. Partial results list committed employees and never automatically retry the whole team.
 
 
 ## The Metaphor: Restaurant Set Menus vs. A La Carte

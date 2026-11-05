@@ -18,7 +18,7 @@ Provider 整合需改用 `verify_release_archive_with_pubkey(bytes, checksum, si
 Google Cloud 會議轉錄使用管理員另行安裝、加密儲存的服務帳戶金鑰，不繼承員工或 Workspace 憑證。設定／清除憑證的專屬 RPC 在 extension 路由前驗證即時管理員身分；通用設定更新拒絕憑證欄位，原始編輯器只允許保留遮罩或清除。音訊上傳至指定 GCS 儲存桶前，先以檔案鎖寫入持久化清理紀錄；刪除失敗採有上限的退避重試，並保留待清理紀錄，供啟動及定期掃描重試至成功或 HTTP 404。清理仍需要有效憑證與儲存桶權限，生命週期到期規則提供額外備援。原始音訊上傳前不會遮罩。詳見[會議逐字稿](73-meeting-transcripts.md)。
 
 轉錄設定與原始設定寫入在提交鎖內重查即時管理員權限，使用者資料庫不可用時拒絕寫入。憑證設定／清除嘗試記錄操作者、動作與結果，不記錄秘密。清理僅刪除目前設定的儲存桶物件；不符的紀錄原樣保留，警告只記數量。Unix 清理目錄權限為 0700，紀錄與鎖檔為 0600，開啟時拒絕符號連結及非一般檔案。OAuth token 回應採型別化可清零儲存，並清零可取得所有權的回應緩衝區。
-## Gateway A2A 存取（尚未發版）
+## Gateway A2A 存取（v1.80.0 起）
 
 `POST /a2a` 沿用 Dashboard Bearer JWT 認證，檢查帳號啟用狀態、憑證撤銷與強制換密碼限制，不接受舊版共用管理員 token 或 MCP HTTP-server API key。任務操作經過方法權限表、即時員工權限、輸入檢查、來源 IP 與呼叫者速率限制，以及安全稽核。`[a2a] exposed_agents` 公開名單預設為空，只能縮小存取範圍；設定無效或無法讀取時拒絕存取。
 
@@ -36,13 +36,13 @@ Google Cloud 會議轉錄使用管理員另行安裝、加密儲存的服務帳�
 
 登入帳號與 `messageId` 組成持久化唯一鍵。以相同完整 `params` 重送會回傳原任務；同一 id 搭配不同參數會被拒絕，JSON 物件欄位順序不影響判定。刪除任務不會釋出該 id，也不會因重送而重建任務；重送仍須通過目前授權。
 
-僅接受版本 `1.0`；版本缺漏、為空或不支援時回覆 `-32009`。串流、推播回呼、等待完成才回覆及任務接續均不支援。此未發版變更已提供 HTTP 契約與存取邊界測試，security crate 的 6 項限流測試已在本機通過。Gateway／CLI 編譯與測試、修補後的 Daybreak 再審、真實 client 與反向代理驗收仍待執行。2026-11-05 後續 Daybreak 審查發現 2 項 Medium、3 項 Low；本次已補修正與回歸測試，但修補後版本尚未取得安全審查放行。設定與請求範例見 [ACP 與 A2A](19-agent-client-protocol.md)。
+僅接受版本 `1.0`；版本缺漏、為空或不支援時回覆 `-32009`。串流、推播回呼、等待完成才回覆及任務接續均不支援。設定與請求範例見 [ACP 與 A2A](19-agent-client-protocol.md)。
 WebChat 等連線可寫入後，再次確認使用者能否使用實際回答的 AI 員工。短暫的 `BEGIN IMMEDIATE` 交易會比對 ACL 版本，並涵蓋同步的 `start_send`，讓權限變更與訊框交付有明確先後；交易不等待連線，也不跨越後續非同步 flush。權限已撤銷或無法讀取時拒絕交付；先獲准交付的資料無法因之後的撤銷收回。
 
 非 Admin 的 Dashboard 回覆在同一個最後屏障內，還會取得設定寫入者共用的 `config.toml.lock` 共享鎖與 registry 讀鎖，重新確認目前的 default 員工、角色、狀態及可呼叫權限，並持鎖到 `start_send` 或助理歷史公開完成。鎖競爭時直接拒絕，不等待；這是持共享鎖重驗的方案，不另外維護 policy 版本計數。`config.toml` 遺失或無效時拒絕非 Admin 的目標授權；新安裝須明確建立有效的最小設定檔。Admin 與匿名 widget 的既有路由規則維持原樣。檔案鎖保護遵循鎖協定的產品寫入路徑，不涵蓋忽略鎖的外部直接改檔。
 
 助理歷史列寫入時帶有待確認的隱藏標記，最後權限與來源檢查通過後才公開。拒絕交付的列即使清除內容失敗，也持續隱藏，日後重新授權不會讓它出現；單純傳送失敗仍保留已授權回覆。使用者訊息會保存 `client_msg_id`，即使 `turn_accepted` 遺失，也能依精確的對話與使用者訊息識別復原，不以文字或前綴配對。
-**Codex 外部設定檢查（尚未發佈）：** 外部設定不存在或未定義 MCP 時，一般員工、Explore、utility、Task Sandbox 與 Discovery 可執行；偵測到 MCP 或既有設定無法讀取／解析時，回報來源並拒絕。明確指定的 Codex 判官遭拒時，驗收失敗，不改用預設判官。這是啟動前的本機／快取快照檢查，無法保證後續雲端更新的完整隔離；[來源範圍與限制](../../architecture/extension-gates.md)。
+**Codex 外部設定檢查（v1.80.0 起）：** 外部設定不存在或未定義 MCP 時，一般員工、Explore、utility、Task Sandbox 與 Discovery 可執行；偵測到 MCP 或既有設定無法讀取／解析時，回報來源並拒絕。明確指定的 Codex 判官遭拒時，驗收失敗，不改用預設判官。這是啟動前的本機／快取快照檢查，無法保證後續雲端更新的完整隔離；[來源範圍與限制](../../architecture/extension-gates.md)。
 
 企業版[團隊對話 API](68-manager-team-history.md)（v1.76.0）以即時報告線獨立判斷，不放寬原本的員工存取權。外部文字在讀取時遮蔽，每次揭露都要完成雜湊鏈稽核；設定關閉、來源不明、已裝模型故障或稽核失敗都不回對話內容。只跑 regex 時會明示 `ner: false`，姓名與地址仍可能漏遮。直接主機／資料庫存取仍在產品入口保護範圍外。
 
@@ -58,6 +58,8 @@ OAuth 每組授權最多保留 2,048 筆存取／刷新紀錄（含已使用的�
 ## MCP 員工身分驗證
 
 `DUDUCLAW_AGENT_TOKEN` 以 HMAC-SHA256 將員工宣告的 `DUDUCLAW_AGENT_ID` 綁定到安裝環境的 `identity.key`。`[delegation] require_identity_token` 預設改為 `true`，既有安裝未填此設定時也適用。缺少或無效權杖會拒絕 MCP 啟動；設定檔讀不到、TOML 格式錯誤或設定值不是布林值時，即使權杖有效也拒絕。共用驗證層同時拒絕系統與保留的佇列寄件者名稱，因此有簽章的 `dashboard`、`cron` 也無法取得員工命名空間或啟動 MCP。
+
+**委派脈絡。** 稽核歸屬與授權分開：臨時員工只繼承已驗證執行員工的能力，團隊交接與人機共駕也依執行員工判斷權限。主機簽章綁定版本、執行員工、委派者、來源、深度、可取得的執行／任務／回合識別、到期時間及隨機 nonce；系統與保留名稱不能作為員工身分。憑證缺少、遭竄改、過期或重播時不能繼續委派，一般工具仍以執行員工身分使用。同一 nonce 只允許一個 MCP 行程領取，該行程可在到期前重複呼叫工具；MCP 子行程重啟後，請重新啟動員工取得新憑證。領取紀錄保存在 `delegation-context-claims/`，目前尚無自動清理。憑證透過秘密環境變數傳遞，不放在命令列參數；第三方 MCP 上游不會收到憑證或委派資訊。Claude 只注入 DuDuClaw MCP 子行程，不支援秘密環境變數傳遞的舊版 Codex 無法委派。這不涵蓋可不受限存取 gateway 作業系統帳號或簽署金鑰的行程。
 
 寬鬆模式必須同時設定 `require_identity_token = false` 與 `[delegation] identity_token_grace_until`：後者須為加引號的 RFC3339 UTC 時間（`Z` 或 `+00:00`），晚於現在且不超過未來 30 天。缺少、無效、非 UTC、過期或超過上限時會恢復嚴格模式，每個行程只記錄一次錯誤。身分驗證會重查期限，即使呼叫端曾快取寬鬆模式也一樣。Unix 另從已開啟的檔案描述元要求擁有者等於有效 UID、硬連結數為 1；macOS 拒絕任何延伸 ACL 項目，ACL 查詢失敗也拒絕（ENOENT 表示沒有 ACL）。其他 Unix 的延伸 ACL 未檢查。一旦觀察到某個 home 的期限過期或無效，該行程就會持續對此 home 強制嚴格模式；回撥時鐘或修改期限都無法重新放寬。此鎖定不會跨行程重啟保存。
 
@@ -110,7 +112,7 @@ API 用戶端的 MRTR 輸入須符合 host 宣告的能力，不會自動代替�
 為相容既有格式，授權簽章仍不涵蓋 `control_url`，因此它只是未受信任的端點提示。Gateway／CLI 的 refresh、換綁、status、CRL、經銷商品牌與公告請求，送出前都須經共用傳輸層檢查：僅限 HTTPS、443 埠、不得包含使用者資訊／query／fragment，主機名稱必須完整符合固定清單 `api.duduclaw.dudustudio.monster`。自訂簽發端須在客戶端本機明確設定環境變數 `DUDUCLAW_CONTROL_URL=https://issuer.example.com`；只在授權檔內放自訂網址不會獲得允許。此設定只允許該 origin，不放寬 HTTPS、埠、IP literal、localhost 或 DNS 限制。所有 DNS 回傳位址都必須是公開位址，連線固定使用已檢查的結果；停用重新導向與自動代理。驗證失敗不送出授權請求。Owner gateway 在同一個 SQLite `BEGIN IMMEDIATE` 交易內讀取授權狀態並簽署授權與第 2 版回應：撤銷先提交就回 revoked，簽署先取得鎖則撤銷須等待簽署交易完成；交易提交後的網路送達時間不在此保證範圍。
 
 Refresh 接受回應前核對原訂閱、原／提案綁定、nonce、授權簽章及部署型態。active、revoked 與 pending 僅接受回應簽章第 2 版；簽章涵蓋狀態、原因、生效時間、nonce、訂閱、兩個綁定值與完整授權摘要，包含 `control_url`。缺少版本或舊版一律拒絕，撤銷生效時間尚未到達也不套用。Gateway 與 CLI 寫入共用跨程序 advisory lock，網路回應後比對完整授權檔與撤銷標記摘要；Gateway 另比對記憶體 revision。持久化使用唯一暫存檔與 fsync。忽略 advisory lock 的直接寫入仍在保護範圍外。詳見[簽發契約與限制](../../guides/zh-TW/personal-edition-portability.md#macos-授權指紋與重新綁定)。控制平面實際部署／核准／簽章、Windows 原生持久化及客戶遷移仍須另外驗收。
-## 擴充功能與第三方工具的權限邊界（尚未發佈）
+## 擴充功能與第三方工具的權限邊界（v1.80.0 起）
 
 核心 RPC 一律由核心處理。擴充功能必須列出自己提供的方法，且名稱位於 `ext.<extension-id>.<method>`；註冊名稱衝突、重複或不合法時，會停用該擴充功能的 RPC 註冊並記錄警告。未宣告的方法不會交給擴充功能。
 
@@ -325,7 +327,7 @@ action_rules = [
 
 **動作審查。** `config.toml [action_review] mode = "off" | "shadow" | "enforce"`，預設 `off`，每次呼叫都重讀（`system.update_config` 接受 `action_review.mode`，變更記為受保護鍵）。只在所有靜態閘門都判定可自動執行、且工具有副作用時才審查。審查者是 utility 模型，透過封閉選項的 `decide()`（`duduclaw-gateway/src/decide.rs`）：回覆必須剛好是 `{"choice":"allow"|"ask"|"block"}` 並符合嚴格 JSON 契約，其他一律視為沒有判定。輸入只有結構化資料：工具名稱、類型、參數的鍵（不像識別字的鍵只計數）、ActionGuard 的封閉 finding token，以及員工 `CONTRACT.toml` 的 `must_not`。參數值不會進入提示。`shadow` 不改變結果，只在 `tool_calls.jsonl` 寫一列，`action_review` 欄位是判定或 `unavailable`。`enforce` 遇到 `block` 拒絕，遇到 `ask` 或沒有判定時透過 ApprovalBroker 問人。不認得的 mode 值，或 `config.toml` 存在但讀不到、無法解析時，視為 `enforce`。2026-10-08 收尾起，審查也會對 OS 動作工具（情境分類器放行之後）、`skill_hub_install`（在它安全掃描後的安裝核准之前），以及 gateway 電腦操作路由中沒有被任何核准清單送去問人的 `computer_*`、`computer_workspace_*` 工具執行；其餘不變（只有結構化輸入、`shadow` 只記錄、`enforce` 遇到 `block` 拒絕，其他問人）。有一個 dispatcher 測試以固定的審查回答（block、ask 後核准、ask 後拒絕、沒有判定）對真實的行程內核准資料庫跑完整流程。
 
-**第三方 MCP 工具（2026-10-08）。** 員工其他 MCP 伺服器的工具，在 DuDuClaw 位於其路徑上的地方分類：`duduclaw mcp-proxy`（`.mcp.json` 啟動的伺服器）與 `duduclaw mcp-remote-bridge`（遠端伺服器），兩者都經 `duduclaw-gateway/src/third_party_tools.rs`。分類預設為 `modify`；`destructiveHint: true` 提高為 `delete`。上游 `readOnlyHint` 不得降低風險，即使伺服器列在舊的 `trusted_read_hint_servers` 設定中也一樣；該設定不再影響分類。目前沒有主機管理的唯讀例外，探索通道不開放第三方工具。`action_rules` 與 DuDuClaw 自己的工具同樣適用（工具規則寫 `<伺服器>.<工具>`、`mcp__<伺服器>__<工具>` 或 `<伺服器>.*`）：`block` 會從員工看到的清單隱藏該工具，呼叫在送到伺服器前以 `-32003` 回覆（稽核 `third_party_tool_refused`）；`ask` 讓呼叫等待 ApprovalBroker 決定，核准系統無法使用、請求失敗、被拒或逾時都會拒絕（稽核 `third_party_tool_approval`）。探索通道中只列出、只能呼叫 `read` 工具。所有受管理的 runtime 都讓 `.mcp.json` 的 stdio 伺服器經過 proxy，不受遮蔽或 `action_rules` 是否啟用影響；受管理的遠端連線走橋接。直接 `url`／`type` 項目遭拒。`[[mcp.external]]` 的 stdio 與 HTTP 掛載透過行程內工具註冊表使用同一閘門，保留 annotations 並檢查清單與執行；utility 與探索通道維持不掛載 `[[mcp.external]]` 伺服器。儀表板（`mcp.tool_effects`）依目前設定重新計算，顯示每個伺服器最近一次列出的工具與類型、決定。說明：`docs/guides/mcp-ecosystem.md` 第 4 節。
+**第三方 MCP 工具（2026-10-08）。** 員工其他 MCP 伺服器的工具，在 DuDuClaw 位於其路徑上的地方分類：`duduclaw mcp-proxy`（`.mcp.json` 啟動的伺服器）與 `duduclaw mcp-remote-bridge`（遠端伺服器），兩者都經閘道內同一道第三方工具閘門。分類預設為 `modify`；`destructiveHint: true` 提高為 `delete`。上游 `readOnlyHint` 不得降低風險，即使伺服器列在舊的 `trusted_read_hint_servers` 設定中也一樣；該設定不再影響分類。目前沒有主機管理的唯讀例外，探索通道不開放第三方工具。`action_rules` 與 DuDuClaw 自己的工具同樣適用（工具規則寫 `<伺服器>.<工具>`、`mcp__<伺服器>__<工具>` 或 `<伺服器>.*`）：`block` 會從員工看到的清單隱藏該工具，呼叫在送到伺服器前以 `-32003` 回覆（稽核 `third_party_tool_refused`）；`ask` 讓呼叫等待 ApprovalBroker 決定，核准系統無法使用、請求失敗、被拒或逾時都會拒絕（稽核 `third_party_tool_approval`）。探索通道中只列出、只能呼叫 `read` 工具。所有受管理的 runtime 都讓 `.mcp.json` 的 stdio 伺服器經過 proxy，不受遮蔽或 `action_rules` 是否啟用影響；受管理的遠端連線走橋接。直接 `url`／`type` 項目遭拒。`[[mcp.external]]` 的 stdio 與 HTTP 掛載透過行程內工具註冊表使用同一閘門，保留 annotations 並檢查清單與執行；utility 與探索通道維持不掛載 `[[mcp.external]]` 伺服器。儀表板（`mcp.tool_effects`）依目前設定重新計算，顯示每個伺服器最近一次列出的工具與類型、決定。說明：[MCP 生態系](../../guides/zh-TW/mcp-ecosystem.md)第 4 節。
 
 **涵蓋範圍。** 其他 MCP server 的工具只經 proxy 與橋接分類（見上）。內建工具的規則只在以 DuDuClaw 工具旗標啟動 Claude CLI 的地方生效；其他 runtime 沒有 Claude Code 內建工具。分類以工具名稱為準，所以效果隨參數改變的工具一律取較嚴格的類型。這幾層都還沒在真的 gateway 與真的模型上跑過，目前只有單元測試與 dispatcher 層級的測試。
 
@@ -383,7 +385,7 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 **每 agent 金鑰隔離** — MCP API key 與連接器憑證都是 per-agent，經 `secret_ref` 解析，所以單一 agent 外洩不等於平台外洩。通道憑證分兩種：LINE、WhatsApp、飛書、Google Chat、Teams、企業微信、釘釘使用 `config.toml [channels]` 裡整個部署共用的憑證；只有 Telegram、Discord、Slack 有員工專屬的 bot token（員工沒有自己的 token 時沿 `reports_to` 往上找，最後用全域 token）。
 
-**Google Chat Pub/Sub（未發行）** — Pub/Sub 通知不作為 Chat 傳訊者的身分證明。閘道嚴格驗證訊息資源名稱，先以應用程式的 `chat.bot` 向 Chat API 回讀，再建立回合；傳訊者、聊天室、本文、附件與討論串均取自 API，回應名稱與聊天室必須符合資源及通知聊天室。既有傳訊者存取、配對與核准規則仍生效。回讀失敗（包括 403／404）或沒有訊息的事件不建立回合。匯入與啟動時驗證訂閱指向服務帳戶專案的固定主題，拉取另用只有 `pubsub` scope 的權杖。僅支援 Unix 的持久化收件匣只存資源參照，不存本文、傳訊者資料或附件；以事件類型與資源名稱去重七天，API 建立時間超過七天的訊息在清理後仍拒絕。每個 app stream（員工／共用 app 與專案編號）上限為 1,000 筆、10 筆 pending／queued／running，避免單一 stream 用盡部署容量；全域硬上限仍為 10,000 筆、100 筆待處理或執行中事件，每筆參照 2 KiB、資料庫 64 MiB；正在排隊或執行的紀錄不淘汰，中斷的執行標為 uncertain 且不自動重跑。佇列滿時確認收件並丟棄，不啟動回合。資料庫與附屬檔案均驗證私密權限，其他平台在具備等價防護前拒絕 Pub/Sub。Pub/Sub 建立腳本先驗證雲端資源再建立金鑰，破壞性的復原指令只列出供人工處理。見[設定與投遞限制](../../guides/zh-TW/channels-googlechat-teams.md)。 匯入與 worker 啟動均拒絕啟用 exactly-once（恰好一次投遞）的訂閱，請在 Google Cloud 關閉該選項。ACK 無效或過期（HTTP 400）時只清除舊投遞批次並重新拉取，持久化去重紀錄仍保留；暫時性 ACK 失敗則保留批次重試。
+**Google Chat Pub/Sub（v1.80.0 起）** — Pub/Sub 通知不作為 Chat 傳訊者的身分證明。閘道嚴格驗證訊息資源名稱，先以應用程式的 `chat.bot` 向 Chat API 回讀，再建立回合；傳訊者、聊天室、本文、附件與討論串均取自 API，回應名稱與聊天室必須符合資源及通知聊天室。既有傳訊者存取、配對與核准規則仍生效。回讀失敗（包括 403／404）或沒有訊息的事件不建立回合。匯入與啟動時驗證訂閱指向服務帳戶專案的固定主題，拉取另用只有 `pubsub` scope 的權杖。僅支援 Unix 的持久化收件匣只存資源參照，不存本文、傳訊者資料或附件；以事件類型與資源名稱去重七天，API 建立時間超過七天的訊息在清理後仍拒絕。每個 app stream（員工／共用 app 與專案編號）上限為 1,000 筆、10 筆 pending／queued／running，避免單一 stream 用盡部署容量；全域硬上限仍為 10,000 筆、100 筆待處理或執行中事件，每筆參照 2 KiB、資料庫 64 MiB；正在排隊或執行的紀錄不淘汰，中斷的執行標為 uncertain 且不自動重跑。佇列滿時確認收件並丟棄，不啟動回合。資料庫與附屬檔案均驗證私密權限，其他平台在具備等價防護前拒絕 Pub/Sub。Pub/Sub 建立腳本先驗證雲端資源再建立金鑰，破壞性的復原指令只列出供人工處理。見[設定與投遞限制](../../guides/zh-TW/channels-googlechat-teams.md)。 匯入與 worker 啟動均拒絕啟用 exactly-once（恰好一次投遞）的訂閱，請在 Google Cloud 關閉該選項。ACK 無效或過期（HTTP 400）時只清除舊投遞批次並重新拉取，持久化去重紀錄仍保留；暫時性 ACK 失敗則保留批次重試。
 
 **通道上的聊天指令（v1.68.0）** — `!STOP`、`!STOP ALL`、`!RESUME`、`/model <名稱>` 需要管理員。WhatsApp、飛書、Teams、企業微信、Google Chat、釘釘以前對每位傳訊者都傳 `is_admin = true`，能傳訊給 bot 的人都能停止或恢復它。現在這些通道用該通道的 `admin_users` 設定（全域範圍；Google Chat 與 Teams 也能設定了）完全比對傳訊者 id 或對話 id，沒有清單就沒有人是管理員。WebChat 只有啟用中、角色為管理員的儀表板帳號算數，網站聊天元件的訪客一律不算。
 
@@ -552,7 +554,7 @@ MFA 設定在啟動時載入有效的記憶體快照，dashboard 設定寫入後
 
 JWT epoch 必須完全相等。Dashboard 每次心跳重查；WebChat 在心跳及每次 user_message 前檢查，沿用共用身分讀取器與兩秒 socket 快取，心跳強制重查 generation，訊息另行檢查適用的到期時間。電腦畫面與接管 ticket 保留原 JWT epoch 及期限，在入場及每 30 秒重驗時拒絕已退休憑證，也不會延長原 JWT 壽命。兩個設定寫入路徑都在設定鎖內重新確認有效 Admin。若最後有效設定是 false，重載失敗仍保留 false 並顯示警告；正常 `system.status` 欄位保持不變。
 
-### Email 驗證碼、通行金鑰與保持登入（未發行）
+### Email 驗證碼、通行金鑰與保持登入（v1.80.0 起）
 
 在「設定 → 帳號」可保留原有驗證器 App，再加入 Email 驗證碼或多把具名的通行金鑰（Passkey）。新增或移除前需輸入目前密碼。Email 設定會將六位數代碼寄到帳號信箱，驗證成功才啟用。管理員需先完成既有 `[channels.email]` SMTP 寄信設定（`smtp_host`、`from_addr`，以及寄信服務需要的帳密）；未設定可用的寄信服務時，介面會顯示無法使用。因素變更會留下稽核，已設定寄信時也會通知本人。
 
@@ -649,13 +651,13 @@ Unix 附件寫入會逐層拒絕目錄符號連結，再相對於固定的目錄
 
 [AG-UI HTTP/SSE 端點](74-ag-ui.md)只接受儀表板 access JWT，沿用即時帳號／雙因子檢查與 WebChat 員工授權；非 Admin 呼叫者須有綁定或有效團隊授權，不能存取主要／預設員工。伺服器對話識別隔離呼叫者、員工與 thread，使用 WebChat 所有者命名空間內的獨立 AG-UI 區段；`/ws/chat` 不能續接。只有最後一則 user 文字會進入既有受保護的回覆管線；client history、tools、context、state 與 forwarded properties 不會增加權限，也不能執行前端自訂工具。
 
-核准中斷依 broker 持久保存的對話／回合來源關聯判斷。只有有效 Admin 可在此決定一般、未綁定特定執行身分的 `mcp_call` 或 `mcp_install`，並檢查到期、所有權、限定儀表板與 `forbid_self_approval` 政策。其他種類只通知，限定儀表板的要求不能在此決定；顯示用 metadata 不具授權效力。請求大小、同時執行、生命週期及事件佇列都有上限；斷線會中止進行中的交付並撤回該回合待核准要求。正常送出 interrupt 後只在期限內保留回合。核准紀錄可跨重啟保留，記憶體中的 runtime 續跑狀態不能。SQLite 准入紀錄阻止 24 小時內重複 run ID，最多保留 4,096 筆。重啟後，未完成 thread 在原本 15 分鐘期限內仍被擋住；之後的新 run 須先撤回舊回合待核准要求。同一 process 內的 resume 收據不會重跑工具，也不證明執行成功。本入口仍待遠端建置／測試、真實驗收及Daybreak 複審。
+核准中斷依 broker 持久保存的對話／回合來源關聯判斷。只有有效 Admin 可在此決定一般、未綁定特定執行身分的 `mcp_call` 或 `mcp_install`，並檢查到期、所有權、限定儀表板與 `forbid_self_approval` 政策。其他種類只通知，限定儀表板的要求不能在此決定；顯示用 metadata 不具授權效力。請求大小、同時執行、生命週期及事件佇列都有上限；斷線會中止進行中的交付並撤回該回合待核准要求。正常送出 interrupt 後只在期限內保留回合。核准紀錄可跨重啟保留，記憶體中的 runtime 續跑狀態不能。SQLite 准入紀錄阻止 24 小時內重複 run ID，最多保留 4,096 筆。重啟後，未完成 thread 在原本 15 分鐘期限內仍被擋住；之後的新 run 須先撤回舊回合待核准要求。同一 process 內的 resume 收據不會重跑工具，也不證明執行成功。
 
-同一次 resume 的決定改為原子提交，任一卡片衝突就回滾整批。原介面已同意或拒絕的卡片，可由仍有員工存取權的呼叫者（包含非 Admin）在新連線確認相同結果後續跑；重新核對原始要求與回合來源，保留外部決定者。未知的孤立 resume 不會新增准入紀錄。每帳號跨員工與 thread 合計最多保留 256 筆 run／thread 紀錄、滾動 60 秒最多准入 32 次，收據請求也計入；配額跨重啟保留，超限回 HTTP 429。未知 JSON 欄位只在 debug 記錄數量，每個 gateway process 最多每分鐘一次，不記名稱或值。第一輪 Daybreak 的四項問題已有修補，遠端測試與 Daybreak 複審仍待完成。
+同一次 resume 的決定改為原子提交，任一卡片衝突就回滾整批。原介面已同意或拒絕的卡片，可由仍有員工存取權的呼叫者（包含非 Admin）在新連線確認相同結果後續跑；重新核對原始要求與回合來源，保留外部決定者。未知的孤立 resume 不會新增准入紀錄。每帳號跨員工與 thread 合計最多保留 256 筆 run／thread 紀錄、滾動 60 秒最多准入 32 次，收據請求也計入；配額跨重啟保留，超限回 HTTP 429。未知 JSON 欄位只在 debug 記錄數量，每個 gateway process 最多每分鐘一次，不記名稱或值。
 
 ## 企業版合規報表匯出
 
-企業版管理員可在 **稽核日誌 → 合規報表** 產生 CSV、XLSX 與可列印 HTML。閘道重新確認管理員權限與解析出的版本，預設遮罩個資；只有明確勾選才包含來源中未遮罩的值。每次匯出皆先寫入稽核，失敗即拒絕交付。報表只涵蓋已記錄的外送閘門決策、審批、行動審查與資料來源存取；決策不等於成功送出，缺少的欄位留空，零筆也不代表沒有存取。下載副本請依組織保存政策管理。日期邊界、上限與遮罩範圍見 [企業版合規報表](74-compliance-reports.md)。
+企業版管理員可在 **稽核日誌 → 合規報表** 產生 CSV、XLSX 與可列印 HTML。閘道重新確認管理員權限與解析出的版本，預設遮罩個資；只有明確勾選才包含來源中未遮罩的值。每次匯出皆先寫入稽核，失敗即拒絕交付。報表只涵蓋已記錄的外送閘門決策、審批、行動審查與資料來源存取；決策不等於成功送出，缺少的欄位留空，零筆也不代表沒有存取。下載副本請依組織保存政策管理。日期邊界、上限與遮罩範圍見 [企業版合規報表](75-compliance-reports.md)。
 
 報表讀取與稽核寫入共用跨程序鎖，涵蓋輪替與追加，避免匯出時因輪替漏讀目前這一代紀錄。保留的兩代工具稽核紀錄皆以報表實際使用的有大小限制快照驗證雜湊鏈；鏈結損壞、紀錄格式錯誤或讀取／鎖定失敗時拒絕匯出。有效的舊格式前綴仍可讀取，但無法獨立驗證真實性。雜湊鏈無法證明尾端完整性，也不提供外部可信錨點的真實性保證。
 ## 個人 Drive 錄影匯入
@@ -681,7 +683,7 @@ Gateway 分別保存基本服務、會議錄影與員工 Drive 工具的本機�
 已匯入副本及完成的逐字稿與 Google 連線分開，不會因斷線自動撤回。Google 端撤銷透過 API 拒絕或更新後的權限資訊偵測，不是即時推播。這是產品入口授權，不是對與 gateway 同 OS 使用者、且不受限制的程序提供隔離。真實 OAuth／Picker 與供應商處理仍須另行驗收。詳見[會議逐字稿](73-meeting-transcripts.md)及[個人連線設定](../../guides/zh-TW/google-personal-connections.md)。
 ## 一般同仁自動化與最近技能權限（v1.80.0）
 
-Dashboard RPC 最低角色由 `handlers/dashboard_scope.rs` 在 extension 分派之前執行，與 MCP scope 表分開。本輪方法逐一登記；未登記的 `cron.*`、`reminders.*`、`assign_schedules.*`、`agents.org_chart.*`、`skills.recent.*` 預設需要 Admin，其餘既有命名空間仍走原分派權限。逐筆處理器保留 Viewer／Operator 與建立者檢查。每次請求重新讀取帳號狀態及直接綁定；無法確認授權時拒絕。
+Dashboard RPC 最低角色由專屬角色表在 extension 分派之前執行，與 MCP scope 表分開。相關方法逐一登記；未登記的 `cron.*`、`reminders.*`、`assign_schedules.*`、`agents.org_chart.*`、`skills.recent.*` 預設需要 Admin，其餘既有命名空間仍走原分派權限。逐筆處理器保留 Viewer／Operator 與建立者檢查。每次請求重新讀取帳號狀態及直接綁定；無法確認授權時拒絕。
 
 | Dashboard RPC | 範圍 |
 | --- | --- |

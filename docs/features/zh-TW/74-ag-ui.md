@@ -2,7 +2,7 @@
 
 外部前端可透過 `POST /api/ag-ui/agents/{agent_id}/runs` 傳訊息給 AI 員工，並接收 AG-UI 1.0 事件串流。目前實作範圍是本文列出的 HTTP/SSE 子集，沒有支援全部 32 種事件。
 
-狀態：尚未發布。第一輪 Daybreak 審查提出四項問題，本次 patch 已加入修補；Gateway 編譯、真實前端與模型供應商驗收、Daybreak 複審仍待完成。
+v1.80.0 起提供。
 
 ## 傳送訊息
 
