@@ -1392,7 +1392,7 @@ fn read_last_seen_crl(home_dir: &Path) -> Option<chrono::DateTime<Utc>> {
 /// Persist the last-seen CRL `generated_at` timestamp (RFC3339) under
 /// `home_dir`. Best-effort; callers log but do not propagate failures.
 fn write_last_seen_crl(home_dir: &Path, ts: chrono::DateTime<Utc>) -> std::io::Result<()> {
-    std::fs::create_dir_all(home_dir)?;
+    duduclaw_core::config::create_home_dir(home_dir)?;
     let path = home_dir.join(LAST_CRL_FILENAME);
     std::fs::write(path, ts.to_rfc3339())
 }

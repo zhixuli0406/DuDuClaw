@@ -121,7 +121,7 @@ pub fn read_marker(home: &Path) -> MarkerRead {
 
 /// Write the marker atomically with owner-only permissions.
 pub fn write_marker(home: &Path, marker: &Marker) -> Result<(), String> {
-    std::fs::create_dir_all(home).map_err(|e| format!("cannot create home: {e}"))?;
+    duduclaw_core::config::create_home_dir(home).map_err(|e| format!("cannot create home: {e}"))?;
     let body = serde_json::to_vec_pretty(marker).map_err(|e| format!("marker encode: {e}"))?;
     let path = marker_path(home);
     // Random suffix + create_new: a pre-planted file or symlink at the

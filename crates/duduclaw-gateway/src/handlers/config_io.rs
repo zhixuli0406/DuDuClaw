@@ -210,6 +210,15 @@ impl MethodHandler {
             }));
         }
 
+        if let Some(message) = duduclaw_core::config::home_permissions_warning(&self.home_dir) {
+            checks.push(json!({
+                "name": "home_permissions",
+                "status": "warn",
+                "message": message,
+                "can_repair": false,
+            }));
+        }
+
         // Local auto-login exposure (G8 residual-risk finding): passwordless
         // local login is only safe on a loopback bind — flag the dangerous
         // combination before any request ever proves it in production.

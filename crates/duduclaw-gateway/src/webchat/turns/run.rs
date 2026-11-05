@@ -62,6 +62,15 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
                 save_webchat_attachments(&attach_base, &attachments),
             )
             .await;
+        let refs = match refs {
+            Ok(refs) => refs,
+            Err(_) => {
+                sink.frame(ChatMessage::error_coded(
+                    "附件無法上傳，請減少檔案數量或大小，或稍後再試。", "attachment_upload_refused",
+                )).await;
+                return;
+            }
+        };
         if !refs.is_empty() {
             if !full_content.trim().is_empty() {
                 full_content.push_str("\n\n");

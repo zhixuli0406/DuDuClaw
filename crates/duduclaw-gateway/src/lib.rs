@@ -360,6 +360,7 @@ pub mod failover;
 pub mod fault_attribution;
 pub mod feishu;
 pub mod files_api;
+pub(crate) mod chat_attachments;
 pub(crate) mod fs_safe;
 pub mod governance;
 pub mod gvu;

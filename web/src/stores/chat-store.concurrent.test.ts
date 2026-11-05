@@ -43,6 +43,16 @@ afterEach(() => {
 });
 
 describe('concurrent WebChat frame attribution', () => {
+  it('localizes upload refusal and ends only the matching turn', () => {
+    const turn = send('upload');
+    deliver({ type: 'error', code: 'attachment_upload_refused', conv: turn.conv, msg_id: 'other', message: 'internal detail' });
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    deliver({ type: 'error', code: 'attachment_upload_refused', conv: turn.conv, msg_id: turn.msg_id, message: 'internal detail' });
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(useChatStore.getState().messages.at(-1)?.content).toBe(lookupMessage('webchat.attachmentUploadRefused'));
+    expect(useChatStore.getState().messages.some(message => message.content === 'internal detail')).toBe(false);
+  });
+
   it('keeps the foreground turn running when another session reports cancellation or a limit', () => {
     const first = send('first');
     useChatStore.getState().reset();

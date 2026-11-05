@@ -63,7 +63,7 @@ async fn fixture() -> Fx {
 }
 
 async fn fixture_with_manager_id(manager_id: Option<&str>) -> Fx {
-    let home = tempfile::tempdir().unwrap();
+    let home = crate::fs_safe::private_test_home().unwrap();
     std::fs::write(
         home.path().join("config.toml"),
         "[people]\nmanager_team_history=true",
@@ -1085,4 +1085,133 @@ async fn webchat_queued_cancel_creates_no_session_and_checks_existing_owner() {
     assert_eq!(sessions.acquire().await.query_row(
         "SELECT COUNT(*) FROM webchat_turn_cancellations", [], |row| row.get::<_, i64>(0),
     ).unwrap(), 0);
+}
+
+#[cfg(unix)]
+async fn chat_attachment_fixture_row(f: &Fx, session: &str) -> (i64, String) {
+    let dir = f.home.path().join("agents/sales/attachments");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(f.employee.clone(), async {
+        crate::media::save_webchat_attachment_in_base(
+            dir.parent().unwrap(), b"%PDF-1.7\nfixture attachment\n", "報告 (1).pdf",
+        ).await.unwrap()
+    }).await;
+    let text = format!("Please read\n[📎 報告 (1).pdf (file)]({})", path.display());
+    let rc = f.handler.reply_ctx.read().await.clone().unwrap();
+    let c = rc.session_manager.acquire().await;
+    c.execute(
+        "INSERT INTO session_messages(session_id,role,content,timestamp) VALUES (?1,'user',?2,?3)",
+        params![session, text, chrono::Utc::now().to_rfc3339()],
+    ).unwrap();
+    (c.last_insert_rowid(), path.to_string_lossy().into_owned())
+}
+
+#[cfg(unix)]
+async fn chat_attachment_id(f: &Fx, ctx: &UserContext, session: &str, row_id: i64) -> String {
+    let p = payload(f.handler.handle_chat_sessions_history(json!({"session_id":session}), ctx).await);
+    let row = p["messages"].as_array().unwrap().iter().find(|row| row["id"] == row_id).unwrap();
+    assert!(!row.to_string().contains(f.home.path().to_str().unwrap()), "host paths must not reach the browser");
+    assert_eq!(row["attachments"][0]["name"], "報告 (1).pdf");
+    assert_eq!(row["attachments"][0]["mime"], "application/pdf");
+    assert_eq!(row["attachments"][0]["size"], b"%PDF-1.7\nfixture attachment\n".len());
+    row["attachments"][0]["id"].as_str().unwrap().to_string()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chat_attachment_full_history_admin_and_own_operator_can_read_legacy_file() {
+    use std::io::Read;
+    let f = fixture().await;
+    let (row, path) = chat_attachment_fixture_row(&f, "report").await;
+    let employee = f.db.live_user_context(&f.employee).unwrap().unwrap();
+    for ctx in [&f.admin, &employee] {
+        let id = chat_attachment_id(&f, ctx, "report", row).await;
+        assert_ne!(id, path);
+        assert!(!id.contains("report.pdf"));
+        let (mut file, _) = f.handler.open_history_attachment(ctx, &id).await.unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"%PDF-1.7\nfixture attachment\n");
+        assert!(f.handler.open_history_attachment(ctx, &path).await.is_err());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chat_attachment_handle_is_user_bound_and_revocation_is_live() {
+    let f = fixture().await;
+    let (row, _) = chat_attachment_fixture_row(&f, "report").await;
+    let employee = f.db.live_user_context(&f.employee).unwrap().unwrap();
+    let id = chat_attachment_id(&f, &employee, "report", row).await;
+    assert!(f.handler.open_history_attachment(&f.manager, &id).await.is_err());
+    assert!(f.handler.open_history_attachment(&f.admin, &id).await.is_err());
+    f.db.unbind_agent(&employee.user_id, "sales").unwrap();
+    assert!(f.handler.open_history_attachment(&employee, &id).await.is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chat_attachment_hidden_or_undone_message_invalidates_existing_handle() {
+    let f = fixture().await;
+    let (row, _) = chat_attachment_fixture_row(&f, "report").await;
+    let id = chat_attachment_id(&f, &f.admin, "report", row).await;
+    let rc = f.handler.reply_ctx.read().await.clone().unwrap();
+    rc.session_manager.acquire().await.execute("UPDATE session_messages SET hidden=1 WHERE id=?1", [row]).unwrap();
+    assert!(f.handler.open_history_attachment(&f.admin, &id).await.is_err());
+    rc.session_manager.acquire().await.execute("UPDATE session_messages SET hidden=0,undone_at='2026-11-05T00:00:00Z' WHERE id=?1", [row]).unwrap();
+    assert!(f.handler.open_history_attachment(&f.admin, &id).await.is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chat_attachment_conversation_ownership_change_invalidates_existing_handle() {
+    let f = fixture().await;
+    let (row, _) = chat_attachment_fixture_row(&f, "report").await;
+    let employee = f.db.live_user_context(&f.employee).unwrap().unwrap();
+    let id = chat_attachment_id(&f, &employee, "report", row).await;
+    let rc = f.handler.reply_ctx.read().await.clone().unwrap();
+    rc.session_manager.acquire().await.execute("UPDATE sessions SET owner_user_id='stranger' WHERE id='report'", []).unwrap();
+    assert!(f.handler.open_history_attachment(&employee, &id).await.is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chat_attachment_external_masked_history_does_not_expose_files() {
+    let f = fixture().await;
+    let (row, path) = chat_attachment_fixture_row(&f, &f.external).await;
+    let admin_id = chat_attachment_id(&f, &f.admin, &f.external, row).await;
+    let employee = f.db.live_user_context(&f.employee).unwrap().unwrap();
+    let p = payload(f.handler.handle_chat_sessions_history(json!({"session_id":f.external}), &employee).await);
+    assert_eq!(p["privacy_mode"], "masked");
+    assert!(!p.to_string().contains(&path));
+    assert!(!p.to_string().contains("報告 (1).pdf"));
+    for message in p["messages"].as_array().unwrap() {
+        assert!(message.get("attachments").is_none_or(|a| a.as_array().is_some_and(Vec::is_empty)));
+    }
+    assert!(f.handler.open_history_attachment(&employee, &admin_id).await.is_err());
+    assert!(f.handler.open_history_attachment(&employee, &path).await.is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chat_attachment_unattributed_legacy_file_is_admin_only_not_a_typed_path_grant() {
+    let f = fixture().await;
+    let (row, path) = chat_attachment_fixture_row(&f, "report").await;
+    let employee = f.db.live_user_context(&f.employee).unwrap().unwrap();
+    let owner_id = chat_attachment_id(&f, &employee, "report", row).await;
+    std::fs::remove_file(f.home.path().join("artifacts.jsonl")).unwrap();
+    assert!(f.handler.open_history_attachment(&employee, &owner_id).await.is_ok(), "audit retention does not revoke a durable owner binding");
+    // A genuinely legacy transcript has a path but no durable content/owner binding.
+    let authority = rusqlite::Connection::open(f.home.path().join("artifact_provenance.db")).unwrap();
+    let name = std::path::Path::new(&path).file_name().unwrap().to_str().unwrap();
+    assert_eq!(authority.execute("DELETE FROM artifact_provenance WHERE agent='sales' AND name=?1", [name]).unwrap(), 1);
+    assert!(f.handler.open_history_attachment(&employee, &owner_id).await.is_err());
+    let id = chat_attachment_id(&f, &f.admin, "report", row).await;
+    assert!(f.handler.open_history_attachment(&f.admin, &id).await.is_ok());
+    let employee = f.db.live_user_context(&f.employee).unwrap().unwrap();
+    let p = payload(f.handler.handle_chat_sessions_history(json!({"session_id":"report"}), &employee).await);
+    let row = p["messages"].as_array().unwrap().iter().find(|r| r["id"] == row).unwrap();
+    assert!(row.get("attachments").is_none_or(|a| a.as_array().is_some_and(Vec::is_empty)));
+    assert!(!row.to_string().contains(f.home.path().to_str().unwrap()));
+    assert!(f.handler.open_history_attachment(&employee, &id).await.is_err());
 }

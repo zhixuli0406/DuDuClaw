@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { parseHistoryAttachments, type HistoryAttachment } from '@/lib/history-attachments';
 import { useAuthStore } from './auth-store';
 import { useSystemStore } from './system-store';
 import type { VisemeShape } from '@/components/mascot';
@@ -66,8 +67,8 @@ export interface ChatMessage {
   readonly deliveryError?: string;
   readonly liveActivity?: TurnActivity;
   readonly tokens?: number;
-  /** Files attached to a user message (display chips). */
-  readonly attachments?: readonly ChatAttachmentMeta[];
+  /** Pending uploads use chips; server-issued history references use file cards. */
+  readonly attachments?: readonly (ChatAttachmentMeta | HistoryAttachment)[];
   /**
    * A structured result/confirmation card (O-3) an assistant reply carries
    * alongside its plain text — see `@/components/console/artifact-types.ts`
@@ -461,6 +462,7 @@ function finishMessage(messages: readonly ChatMessage[], turnId: string | null, 
 
 /** The wire shape of one message returned by `chat.sessions.history`. */
 export interface HistoryMessageWire {
+  readonly attachments?: unknown;
   readonly notice_kind?: string | null;
   readonly role: string;
   readonly content: string;
@@ -494,6 +496,7 @@ export function historyToMessages(raw: readonly HistoryMessageWire[]): ChatMessa
       m.notice_kind === 'turn_failure' ? 'system' : m.role === 'assistant' ? 'assistant' : m.role === 'system' ? 'system' : 'user';
     const ts = Date.parse(m.timestamp);
     const artifact = role === 'assistant' ? parseChatArtifact(m.artifact) : undefined;
+    const attachments = parseHistoryAttachments(m.attachments);
     return {
       id: nextId(),
       role,
@@ -501,6 +504,7 @@ export function historyToMessages(raw: readonly HistoryMessageWire[]): ChatMessa
       timestamp: Number.isFinite(ts) ? ts : Date.now(),
       ...(typeof m.tokens === 'number' ? { tokens: m.tokens } : {}),
       ...(artifact ? { artifact } : {}),
+      ...(attachments.length ? { attachments } : {}),
       ...(typeof m.id === 'number' && Number.isFinite(m.id) ? { historyId: m.id } : {}),
     };
   });
@@ -837,6 +841,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
               set(state => {
                 const accessKey = chatAccessMessageKey(data.code, data.reason);
                 const error = data.code === 'turn_limit' ? lookupMessage('webchat.turnLimit')
+                  : data.code === 'attachment_upload_refused' ? lookupMessage('webchat.attachmentUploadRefused')
                   : accessKey ? lookupMessage(accessKey) : mentionErrorText(data) ?? data.message;
                 const messages = finishMessage(state.messages, targetTurnId, data.code === 'cancelled' ? 'cancelled' : 'failed')
                   .map(m => m.role === 'user' && m.turnId === targetTurnId ? { ...m, ...(data.code === 'turn_limit' ? { deliveryError: error } : {}) } : m);

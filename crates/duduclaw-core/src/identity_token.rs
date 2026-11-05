@@ -116,7 +116,7 @@ pub fn ensure_key(home_dir: &Path) -> std::io::Result<Vec<u8>> {
     // A wrong-length (corrupt) file reaches here too; regenerating is correct —
     // it was unusable, and nothing could have been verified against it.
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::config::create_home_dir(parent)?;
     }
 
     let mut key = vec![0u8; IDENTITY_KEY_LEN];

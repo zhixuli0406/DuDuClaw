@@ -9915,5 +9915,11 @@
   "sessions.revokeUser": "Logout from all devices",
   "sessions.revokeConfirm": "Log {name} out of every device now? They will need to sign in again, including on devices that keep them signed in.",
   "sessions.revoked": "All devices have been signed out.",
-  "sessions.policy.updated": "Sign-in duration saved."
+  "sessions.policy.updated": "Sign-in duration saved.",
+  "webchat.attachmentUploadRefused": "Attachments could not be uploaded. Reduce the number or size of files, or try again later.",
+  "webchat.attachment.download": "Download",
+  "webchat.attachment.downloadToOpen": "Download to open in your document viewer.",
+  "webchat.attachment.previewTooLarge": "Images larger than 2 MiB can be downloaded to view.",
+  "webchat.attachment.tooLarge": "This attachment exceeds the 20 MiB download limit.",
+  "webchat.attachment.unavailable": "This attachment is unavailable or you no longer have access."
 }

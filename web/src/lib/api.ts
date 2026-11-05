@@ -5938,6 +5938,7 @@ export interface ChatSessionSummary {
 }
 
 export interface ChatSessionMessage {
+  attachments?: unknown;
   notice_kind?: string | null;
   sender_label?: string;
   parts?: TeamHistoryPart[];

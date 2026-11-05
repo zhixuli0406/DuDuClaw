@@ -9915,5 +9915,11 @@
   "sessions.revokeUser": "登出此同仁的所有裝置",
   "sessions.revokeConfirm": "確定立即登出「{name}」的所有裝置？包含已勾選保持登入的裝置，都需要重新登入。",
   "sessions.revoked": "已登出所有裝置。",
-  "sessions.policy.updated": "已儲存保持登入天數。"
+  "sessions.policy.updated": "已儲存保持登入天數。",
+  "webchat.attachmentUploadRefused": "附件無法上傳，請減少檔案數量或大小，或稍後再試。",
+  "webchat.attachment.download": "下載",
+  "webchat.attachment.downloadToOpen": "下載後使用文件閱讀器開啟。",
+  "webchat.attachment.previewTooLarge": "超過 2 MiB 的圖片請下載後檢視。",
+  "webchat.attachment.tooLarge": "此附件超過 20 MiB 的下載上限。",
+  "webchat.attachment.unavailable": "附件無法讀取，或你已無權存取。"
 }

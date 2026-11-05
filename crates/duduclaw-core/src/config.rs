@@ -10,6 +10,9 @@
 use crate::error::{DuDuClawError, Result};
 use std::path::Path;
 
+mod home;
+pub use home::{create_home_dir, home_permissions_warning};
+
 /// Factory-default HTTP/WebSocket port for the gateway.
 ///
 /// Explicit `DUDUCLAW_PORT` and `[gateway] port` values always take priority,
@@ -38,7 +41,7 @@ pub const DEFAULT_GATEWAY_PORT: u16 = 18889;
 /// first; this function always overwrites, so don't call it when a config the
 /// user authored already exists.
 pub fn write_minimal_config(home: &Path, bind: &str, port: u16) -> Result<()> {
-    std::fs::create_dir_all(home)?;
+    create_home_dir(home)?;
 
     let content = format!(
         "# DuDuClaw configuration (auto-created on first run).\n\

@@ -9915,5 +9915,11 @@
   "sessions.revokeUser": "このユーザーのすべての端末からログアウト",
   "sessions.revokeConfirm": "「{name}」をすべての端末から今すぐログアウトしますか？ログイン状態を保持している端末も、再ログインが必要になります。",
   "sessions.revoked": "すべての端末からログアウトしました。",
-  "sessions.policy.updated": "ログイン状態を保持する日数を保存しました。"
+  "sessions.policy.updated": "ログイン状態を保持する日数を保存しました。",
+  "webchat.attachmentUploadRefused": "添付ファイルをアップロードできません。ファイル数やサイズを減らすか、しばらくしてから再試行してください。",
+  "webchat.attachment.download": "ダウンロード",
+  "webchat.attachment.downloadToOpen": "ダウンロードしてドキュメントビューアーで開いてください。",
+  "webchat.attachment.previewTooLarge": "2 MiB を超える画像はダウンロードしてご覧ください。",
+  "webchat.attachment.tooLarge": "この添付ファイルはダウンロード上限の 20 MiB を超えています。",
+  "webchat.attachment.unavailable": "添付ファイルを読み込めないか、アクセス権がありません。"
 }

@@ -213,7 +213,7 @@ impl WikiDeliveryFence {
     }
 
     fn open_lock(&self) -> Result<File> {
-        std::fs::create_dir_all(&self.home_dir).map_err(|e| {
+        duduclaw_core::config::create_home_dir(&self.home_dir).map_err(|e| {
             DuDuClawError::Memory(format!(
                 "create wiki fence home {}: {e}",
                 self.home_dir.display()
