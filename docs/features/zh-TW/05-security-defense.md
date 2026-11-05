@@ -567,3 +567,10 @@ Unix 附件寫入會逐層拒絕目錄符號連結，再相對於固定的目錄
 `users.create_members` 與 `invitation.get/update/preview` 明列為 Admin 權限並重查有效帳號。建立同仁及修改邀請信的寫入交易內會再核對憑證版本。每位同仁的帳號、綁定、主要對象、選用邀請、進度與稽核一起提交。SMTP 在交易外執行，寄送失敗不刪除已建立的帳號，複製與重寄仍限管理員。信件先跳脫所有管理員文字，只解讀粗體與換行；選填課程網址限 HTTPS，不接受內嵌帳密。預覽不產生憑證。`onboarding.get/update` 固定使用目前登入者身分與憑證版本，更新不接受指定他人 ID。連線步驟由伺服器紀錄確認，引導完成不授予任何權限。見[使用指南](../../guides/zh-TW/user-management-and-first-login.md)。
 
 邀請、首次登入與新增同仁 RPC 命名空間中的未知方法，在核心派送前要求 Admin，且不會交給 extension。主要員工的寫入與讀取要求直接 Owner／Operator 綁定；控制台聊天候選與續接目標拒絕僅有 Viewer 的權限。邀請與課程網址一律要求 HTTPS 且不得內含帳密，localhost 亦同；郵件標頭欄位移除控制字元。
+## AG-UI 外部前端
+
+[AG-UI HTTP/SSE 端點](74-ag-ui.md)只接受儀表板 access JWT，沿用即時帳號／雙因子檢查與 WebChat 員工授權；非 Admin 呼叫者須有綁定或有效團隊授權，不能存取主要／預設員工。伺服器對話識別隔離呼叫者、員工與 thread，使用 WebChat 所有者命名空間內的獨立 AG-UI 區段；`/ws/chat` 不能續接。只有最後一則 user 文字會進入既有受保護的回覆管線；client history、tools、context、state 與 forwarded properties 不會增加權限，也不能執行前端自訂工具。
+
+核准中斷依 broker 持久保存的對話／回合來源關聯判斷。只有有效 Admin 可在此決定一般、未綁定特定執行身分的 `mcp_call` 或 `mcp_install`，並檢查到期、所有權、限定儀表板與 `forbid_self_approval` 政策。其他種類只通知，限定儀表板的要求不能在此決定；顯示用 metadata 不具授權效力。請求大小、同時執行、生命週期及事件佇列都有上限；斷線會中止進行中的交付並撤回該回合待核准要求。正常送出 interrupt 後只在期限內保留回合。核准紀錄可跨重啟保留，記憶體中的 runtime 續跑狀態不能。SQLite 准入紀錄阻止 24 小時內重複 run ID，最多保留 4,096 筆。重啟後，未完成 thread 在原本 15 分鐘期限內仍被擋住；之後的新 run 須先撤回舊回合待核准要求。同一 process 內的 resume 收據不會重跑工具，也不證明執行成功。本入口仍待遠端建置／測試、真實驗收及Daybreak 複審。
+
+同一次 resume 的決定改為原子提交，任一卡片衝突就回滾整批。原介面已同意或拒絕的卡片，可由仍有員工存取權的呼叫者（包含非 Admin）在新連線確認相同結果後續跑；重新核對原始要求與回合來源，保留外部決定者。未知的孤立 resume 不會新增准入紀錄。每帳號跨員工與 thread 合計最多保留 256 筆 run／thread 紀錄、滾動 60 秒最多准入 32 次，收據請求也計入；配額跨重啟保留，超限回 HTTP 429。未知 JSON 欄位只在 debug 記錄數量，每個 gateway process 最多每分鐘一次，不記名稱或值。第一輪 Daybreak 的四項問題已有修補，遠端測試與 Daybreak 複審仍待完成。

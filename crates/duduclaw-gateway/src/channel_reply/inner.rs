@@ -3876,6 +3876,7 @@ pub(super) async fn build_reply_with_session_inner(
     super::health::mark(&agent_id, Some(if mcp_gate_refused { "gate_refused" } else { super::health::reason(reason) }));
     let diagnostic = failure.audit();
     let err_str = diagnostic.to_string();
+    super::failure::mark_runtime_failure();
     warn!(
         agent = %name,
         reason = ?reason,

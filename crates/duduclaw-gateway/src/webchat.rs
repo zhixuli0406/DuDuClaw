@@ -314,6 +314,7 @@ impl ChatMessage {
     }
 }
 
+pub(crate) mod ag_ui;
 mod liveness;
 mod turns;
 
@@ -1124,7 +1125,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         let owned_resume = custom_session.as_deref()
                                             .map(str::trim)
                                             .filter(|sid| !sid.is_empty() && *sid != session_id)
-                                            .is_some_and(|sid| owns_webchat_session(sid, &owner_tag));
+                                            .is_some_and(|sid| owns_webchat_session(sid, &owner_tag) && !ag_ui::is_session(sid));
                                         let defer_to_stored_partner = owned_resume
                                             && !is_widget_visitor(&auth_user)
                                             && !matches!(state.acl_snapshot(&auth_user).await,
@@ -1239,7 +1240,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     // on a fresh one — it fails closed here. That is the
                                     // cost of closing the cross-user read/write hole
                                     // until webchat gains a real authenticated user id.
-                                    let owns_session = owns_webchat_session(&want, &owner_tag);
+                                    let owns_session = owns_webchat_session(&want, &owner_tag) && !ag_ui::is_session(&want);
                                     if !owns_session {
                                         warn!(
                                             "WebChat resume denied: session {want} not owned by this user"

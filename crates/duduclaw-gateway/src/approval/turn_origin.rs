@@ -156,6 +156,41 @@ pub struct TurnWithdrawal {
 pub(crate) const WEBCHAT_CANCELS_PER_HOUR: i64 = 100;
 
 impl ApprovalBroker {
+    /// Read only cards correlated by the host to this live turn. Keyed cards
+    /// may have several origins; the first origin on the card is not authority.
+    pub(crate) async fn records_for_turn(
+        &self, session: &str, turn: &str,
+    ) -> Result<Vec<ApprovalRecord>, String> {
+        let (session, turn) = checked_origin(session.into(), turn.into())?;
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = store.conn.blocking_lock();
+            let tx = conn.transaction().map_err(|e| format!("begin turn approval read: {e}"))?;
+            let ids = {
+                let mut stmt = tx.prepare(
+                    "SELECT a.id FROM approval_turn_origins o JOIN approvals a ON a.id=o.approval_id
+                     WHERE o.session_id=?1 AND o.turn_id=?2
+                     AND NOT EXISTS (SELECT 1 FROM cancelled_approval_turns c
+                         WHERE c.session_id=o.session_id AND c.turn_id=o.turn_id)
+                     ORDER BY a.id LIMIT 257",
+                ).map_err(|e| format!("prepare turn approval read: {e}"))?;
+                stmt.query_map(params![session, turn], |r| r.get::<_, String>(0))
+                    .map_err(|e| format!("query turn approvals: {e}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("read turn approval ids: {e}"))?
+            };
+            if ids.len() > 256 { return Err("too many approvals for this turn".into()); }
+            let mut records = Vec::with_capacity(ids.len());
+            for id in ids {
+                let record = super::store::record_in_connection(&tx, &ApprovalId::from(id))?
+                    .ok_or_else(|| "turn approval disappeared".to_string())?;
+                records.push(record);
+            }
+            tx.commit().map_err(|e| format!("finish turn approval read: {e}"))?;
+            Ok(records)
+        }).await.map_err(|e| format!("turn approval read task: {e}"))?
+    }
+
     /// Gateway maintenance owns the schedule; dashboard polling does not sweep.
     pub(crate) async fn sweep_cancelled_turns(&self) -> Result<(), String> {
         let store = self.store.clone();
@@ -239,6 +274,53 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn records_for_turn_isolates_sessions_and_turns_and_keeps_terminal_records() {
+        let broker = ApprovalBroker::new(std::sync::Arc::new(ApprovalStore::open_in_memory().unwrap()));
+        let pending = request(&broker, "session-a", "turn-1").await;
+        let approved = request(&broker, "session-a", "turn-1").await;
+        broker.decide(&approved, true, "human:test").await.unwrap();
+        request(&broker, "session-b", "turn-1").await;
+        request(&broker, "session-a", "turn-2").await;
+        broker.request("bot", "test", "unscoped", Value::Null, 600).await.unwrap();
+        let rows = broker.records_for_turn("session-a", "turn-1").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r.id == pending && r.status == ApprovalStatus::Pending));
+        assert!(rows.iter().any(|r| r.id == approved && r.status == ApprovalStatus::Approved));
+        assert!(broker.records_for_turn("unknown", "turn-1").await.unwrap().is_empty());
+        assert!(broker.records_for_turn("", "turn-1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn records_for_turn_follows_keyed_origins_and_excludes_cancelled_origin() {
+        let broker = ApprovalBroker::new(std::sync::Arc::new(ApprovalStore::open_in_memory().unwrap()));
+        let id = request(&broker, "session", "first").await;
+        let record = broker.get(&id).await.unwrap().unwrap();
+        assert!(!scope_turn("session", "second", broker.store.insert_if_absent(&record)).await.unwrap());
+        for turn in ["first", "second"] {
+            let rows = broker.records_for_turn("session", turn).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, id);
+        }
+        broker.withdraw_turn("session", "first").await.unwrap();
+        assert!(broker.records_for_turn("session", "first").await.unwrap().is_empty());
+        let rows = broker.records_for_turn("session", "second").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].status, ApprovalStatus::Pending);
+        broker.withdraw_turn("session", "second").await.unwrap();
+        assert!(broker.records_for_turn("session", "second").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn records_for_turn_refuses_overflow_without_truncating() {
+        let broker = ApprovalBroker::new(std::sync::Arc::new(ApprovalStore::open_in_memory().unwrap()));
+        for _ in 0..256 { request(&broker, "session", "turn").await; }
+        assert_eq!(broker.records_for_turn("session", "turn").await.unwrap().len(), 256);
+        request(&broker, "session", "turn").await;
+        assert!(broker.records_for_turn("session", "turn").await.is_err());
     }
 
     #[tokio::test]
