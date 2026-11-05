@@ -2179,6 +2179,7 @@ dependencies = [
  "unicode-segmentation",
  "url",
  "uuid",
+ "vt100",
  "zbus",
  "zeroize",
  "zip",
