@@ -9,6 +9,10 @@ pub const KEY_PATH: &str = "/var/lib/duduclaw-protected/root.key";
 pub const RECOVERY_RESTART_EXIT_CODE: i32 = 75;
 #[path = "root_key_recovery.rs"]
 pub mod recovery;
+#[path = "root_key_policy.rs"]
+pub mod policy;
+#[path = "root_key_recovery_files.rs"]
+mod state_files;
 
 #[derive(Debug)]
 pub(super) struct Refusal { reason: &'static str, detail: Option<String> }
@@ -69,6 +73,7 @@ fn revoke_state(state: &mut State, reason: &'static str) {
     if let State::Held(key) = state { key.as_mut().zeroize(); }
     *state = State::Refused(reason);
     recovery::record_refusal(reason, None);
+    policy::observe(policy::EngineSocketAction::Revoke, None);
 }
 
 // Called with the state lock held: the Held check and zeroization are one transition.
@@ -131,9 +136,19 @@ pub struct AttestationInputs {
 }
 
 pub fn attest(i: &AttestationInputs) -> Result<(), &'static str> {
+    attest_with_policy(i, policy::EngineSocketAction::Revoke)
+}
+
+pub fn attest_with_policy(i: &AttestationInputs, action: policy::EngineSocketAction) -> Result<(), &'static str> {
     match i.mode {
         AttestationMode::Container if i.pid != 1 => return Err("not_pid_one"),
-        AttestationMode::NativeSystemd => native::attest(&i.native)?,
+        AttestationMode::NativeSystemd => {
+            let mut native = i.native.clone();
+            if action == policy::EngineSocketAction::Warn && native.engine_scan_complete {
+                native.engine_sockets_denied = true;
+            }
+            native::attest(&native)?;
+        }
         AttestationMode::Invalid => return Err("mode"),
         AttestationMode::Container => (),
     }
@@ -170,7 +185,11 @@ pub(crate) fn intake(hardening_failure: Option<&'static str>) {
                     std::thread::sleep(std::time::Duration::from_secs(60));
                     let Some(mut state) = locked_state() else { break; };
                     // Keep key borrowers out through the probe and zeroization.
-                    let result = native::reattest(uid);
+                    let action = policy::read().action;
+                    let probe = native::reattest(uid);
+                    let warning = probe.as_ref().err().filter(|f| f.reason == "engine_socket_reachable")
+                        .and_then(|f| f.detail.clone());
+                    let result = native::periodic_decision(probe, action);
                     if let Err(failure) = &result {
                         let was_held = revoke_if_held(&mut state, failure.reason);
                         // A new non-transient failure permanently stops recovery,
@@ -189,6 +208,9 @@ pub(crate) fn intake(hardening_failure: Option<&'static str>) {
                         State::Refused(reason) => (StateKind::Refused, Some(*reason)),
                         State::NotOffered => (StateKind::NotOffered, None),
                     };
+                    policy::observe(action, if kind == StateKind::Held && action == policy::EngineSocketAction::Warn && result.is_ok() {
+                        warning.as_deref()
+                    } else { None });
                     recovery::tick(kind, reason, result.is_ok(), &mut counter);
                 }
             }).is_err() { revoke("reattest_unavailable"); }
@@ -343,10 +365,17 @@ mod linux {
             read += n as usize;
         }
         let inputs = gather()?;
-        if let Err(reason) = attest(&inputs) {
-            return Err(Refusal { reason, detail: if reason == "engine_socket_reachable" {
+        let action = if inputs.mode == AttestationMode::NativeSystemd { policy::read().action }
+            else { policy::EngineSocketAction::Revoke };
+        if let Err(reason) = attest_with_policy(&inputs, action) {
+            return Err(Refusal { reason, detail: if matches!(reason, "engine_socket_reachable" | "engine_socket_probe_failed") {
                 inputs.native.engine_socket_detail
             } else { None } });
+        }
+        if inputs.mode == AttestationMode::NativeSystemd {
+            policy::observe(action, if action == policy::EngineSocketAction::Warn && !inputs.native.engine_sockets_denied {
+                inputs.native.engine_socket_detail.as_deref()
+            } else { None });
         }
         // Best effort only: cap_drop ALL usually prevents locking large regions.
         unsafe { libc::mlock(key.as_ptr().cast(), 32); }

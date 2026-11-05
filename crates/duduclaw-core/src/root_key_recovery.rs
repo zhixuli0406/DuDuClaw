@@ -13,9 +13,7 @@ static RUNTIME: OnceLock<Mutex<Runtime>> = OnceLock::new();
 
 // These files are advisory diagnostics in the service UID's home. Only the
 // root-managed systemd start limit is authoritative against same-UID tampering.
-#[path = "root_key_recovery_files.rs"]
-mod files;
-use files::StateDir;
+use super::state_files::StateDir;
 #[path = "root_key_recovery_unit.rs"]
 mod unit;
 pub use unit::{protected_content_differs, protected_unit_text, protected_properties_bounded};
@@ -53,6 +51,7 @@ diagnostic_enum! { RevocationReason {
     ExeAncestorWritable => "exe_ancestor_writable",
     SupplementaryGroups => "supplementary_groups",
     EngineSocketReachable => "engine_socket_reachable",
+    EngineSocketProbeFailed => "engine_socket_probe_failed",
     EngineSocket => "engine_socket",
     MountScanIncomplete => "mount_scan_incomplete",
     Inactive => "inactive",
@@ -164,7 +163,11 @@ fn runtime() -> std::sync::MutexGuard<'static, Runtime> {
 pub fn restart_requested() -> bool { REQUESTED.load(Ordering::Acquire) }
 
 /// An original non-transient refusal is never eligible, even if later probes pass.
-pub(super) fn recoverable(reason: &str) -> bool { reason == "engine_socket_reachable" }
+// Probe failures previously shared the reachable code. Keep their existing
+// recovery eligibility while refusing them under both administrator policies.
+pub(super) fn recoverable(reason: &str) -> bool {
+    matches!(reason, "engine_socket_reachable" | "engine_socket_probe_failed")
+}
 
 #[derive(Default)]
 pub(super) struct ConsecutivePasses { passes: u8, triggered: bool }
@@ -213,6 +216,7 @@ pub fn initialize(home: &Path) {
         || std::env::var_os(super::MODE_ENV).as_deref() != Some(std::ffi::OsStr::new("native-systemd")) {
         return;
     }
+    super::policy::initialize(home);
     let mut rt = runtime();
     if rt.home.is_some() { return; }
     rt.home = Some(home.to_path_buf());
@@ -405,6 +409,7 @@ mod tests {
     #[test]
     fn root_key_reason_allowlist_and_config() {
         assert!(recoverable("engine_socket_reachable"));
+        assert!(recoverable("engine_socket_probe_failed"));
         for reason in ["engine_socket", "supplementary_groups", "exe_owner", "exe_writable", "cgroup_unit",
             "user_namespace", "container_environment", "key_path_accessible", "unknown"] {
             assert!(!recoverable(reason));

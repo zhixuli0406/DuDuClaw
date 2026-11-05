@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen } from '@testing-library/react';
+import { screen, within } from '@testing-library/react';
 import { IntlProvider } from 'react-intl';
 import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
@@ -323,5 +323,61 @@ describe('container credential protection', () => {
     expect(screen.queryByText(/system keychain/i)).toBeNull();
     const buttons = screen.getAllByRole('button', { name: 'Turn off' });
     expect(buttons[buttons.length - 1]).toBeDisabled();
+  });
+});
+
+
+describe('native Linux engine socket policy', () => {
+  const policy = {
+    action: 'warn' as const,
+    warning_active: true,
+    detail: '@/containerd-shim/example: peer uid=0 (root)',
+    risk_zh: 'Backend Chinese text is localized by the panel.',
+    command_warn: 'sudo duduclaw service protected-linux policy engine-socket warn --yes',
+    command_revoke: 'sudo duduclaw service protected-linux policy engine-socket revoke',
+  };
+
+  it.each([['en', en], ['zh-TW', zhTW], ['ja-JP', jaJP]] as const)(
+    'keeps the warning visible for ready personal accounts and shows a read-only command in %s',
+    async (locale, messages) => {
+      mockProtection(status({ ...READY, backend: 'container_root_key', engine_socket_policy: policy }));
+      renderWithProviders(
+        <IntlProvider locale={locale} messages={messages}><CredentialProtectionPanel /></IntlProvider>,
+      );
+      const panel = await screen.findByTestId('credential-protection-engine-policy');
+      expect(within(panel).getByRole('alert')).toHaveTextContent(messages['security.credentialProtection.enginePolicy.active']);
+      expect(panel).toHaveTextContent(messages['security.credentialProtection.enginePolicy.warn']);
+      expect(panel).toHaveTextContent(messages['security.credentialProtection.enginePolicy.risk']);
+      expect(panel).toHaveTextContent(policy.detail);
+      expect(panel).toHaveTextContent(policy.command_revoke);
+      expect(panel).not.toHaveTextContent(policy.command_warn);
+      expect(within(panel).queryByRole('button')).toBeNull();
+      expect(mockWsClient.call).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('shows the conservative default and explicit acknowledgement command without an active warning', async () => {
+    mockProtection(status({ engine_socket_policy: { ...policy, action: 'revoke', warning_active: false, detail: null } }));
+    renderWithProviders(<CredentialProtectionPanel />);
+    const panel = await screen.findByTestId('credential-protection-engine-policy');
+    expect(panel).toHaveTextContent(en['security.credentialProtection.enginePolicy.revoke']);
+    expect(panel).toHaveTextContent(policy.command_warn);
+    expect(within(panel).queryByRole('alert')).toBeNull();
+  });
+
+  it('keeps warn policy visible after the exposure ends without claiming an active exposure', async () => {
+    mockProtection(status({ engine_socket_policy: { ...policy, warning_active: false, detail: null } }));
+    renderWithProviders(<CredentialProtectionPanel />);
+    const panel = await screen.findByTestId('credential-protection-engine-policy');
+    expect(panel).toHaveTextContent(en['security.credentialProtection.enginePolicy.warn']);
+    expect(panel).toHaveTextContent(en['security.credentialProtection.enginePolicy.risk']);
+    expect(within(panel).queryByRole('alert')).toBeNull();
+  });
+
+  it('does not show a native policy for other protection backends', async () => {
+    mockProtection(status({ engine_socket_policy: null }));
+    renderWithProviders(<CredentialProtectionPanel />);
+    await screen.findByTestId('credential-protection-line');
+    expect(screen.queryByTestId('credential-protection-engine-policy')).toBeNull();
   });
 });

@@ -743,6 +743,15 @@ export interface CredentialProtectionStatus {
     latest_revocation: { reason: string; detail: string | null; timestamp: string } | null;
     recovery: string;
   } | null;
+  /** Root-managed native Linux policy; display only, never dashboard-writable. */
+  engine_socket_policy?: {
+    action: 'revoke' | 'warn';
+    warning_active: boolean;
+    detail: string | null;
+    risk_zh: string;
+    command_warn: string;
+    command_revoke: string;
+  } | null;
   /** zh-TW one-liner from the gateway (CLI uses the same text). */
   summary: string;
   detail: string;

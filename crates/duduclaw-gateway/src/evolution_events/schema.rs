@@ -35,6 +35,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditEventType {
+    EngineSocketPolicyChangeRequested,
+    EngineSocketPolicyChanged,
+    EngineSocketWarningStarted,
+    EngineSocketWarningEnded,
     // ── P0 variants (UNCHANGED) ───────────────────────────────────────────────
     /// A skill was activated for an agent.
     SkillActivate,
@@ -149,6 +153,10 @@ impl std::fmt::Display for AuditEventType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Matches the snake_case serde serialisation.
         let s = match self {
+            Self::EngineSocketPolicyChangeRequested => "engine_socket_policy_change_requested",
+            Self::EngineSocketPolicyChanged => "engine_socket_policy_changed",
+            Self::EngineSocketWarningStarted => "engine_socket_warning_started",
+            Self::EngineSocketWarningEnded => "engine_socket_warning_ended",
             // P0
             Self::SkillActivate => "skill_activate",
             Self::SkillDeactivate => "skill_deactivate",

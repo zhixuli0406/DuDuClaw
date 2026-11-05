@@ -3647,6 +3647,11 @@ mod compat_feature_gate_tests {
 
 #[derive(Subcommand)]
 enum ServiceCommands {
+    /// Read or change root-managed native Linux protection policies
+    ProtectedLinux {
+        #[command(subcommand)]
+        command: service::protected_linux::policy::ProtectedLinuxCommand,
+    },
     /// Install DuDuClaw as a system service
     Install {
         /// Install the root-protected native Linux system service (requires sudo)
@@ -5589,6 +5594,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             },
         },
         Commands::Ops(OpsCommands::Service { command }) => match command {
+            ServiceCommands::ProtectedLinux { command } => {
+                service::protected_linux::policy::handle(command)
+            }
             ServiceCommands::Install { protected_linux, enable_now, migrate_from, force_migrate, i_verified_this_binary, allow_missing_runtime } => {
                 if protected_linux {
                     service::protected_linux::install(service::protected_linux::InstallOptions {

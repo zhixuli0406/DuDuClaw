@@ -209,6 +209,10 @@ impl MethodHandler {
                 Ok::<_, String>(Arc::new(idx))
             })
             .await?;
+        // Root policy rows are re-derived before every consumer, even when
+        // the general JSONL index remains background-synced. A failed rebuild
+        // must not let a consumer serve stale service-owned root cache rows.
+        crate::protected_policy_audit::drain(&self.home_dir, idx).await?;
         Ok(idx.clone())
     }
 

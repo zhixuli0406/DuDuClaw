@@ -456,3 +456,26 @@ fn recovery_diagnostic_messages_escape_terminal_and_bidi_controls() {
         assert!(text.contains(escaped), "missing {escaped}");
     }
 }
+
+#[test]
+fn engine_socket_warning_is_persistent_without_lowering_the_account_gate() {
+    use duduclaw_core::root_key::policy::{EngineSocketAction, PolicyStatus};
+    let policy = PolicyStatus { action: EngineSocketAction::Warn, warning_active: true,
+        detail: Some("@docker: peer uid=0 (root)".into()), risk_zh: "容器風險".into(),
+        command_warn: "sudo duduclaw service protected-linux policy engine-socket warn --yes".into(),
+        command_revoke: "sudo duduclaw service protected-linux policy engine-socket revoke".into() };
+    let mut summary = "憑證保護".to_owned();
+    let mut detail = "個人帳號可使用".to_owned();
+    apply_engine_socket_warning(&mut summary, &mut detail, Some(&policy));
+    assert!(summary.contains("依管理員設定僅警告，未停用個人帳號"));
+    assert!(detail.contains("容器風險"));
+    assert!(detail.contains("@docker"));
+    let mut inactive = policy;
+    inactive.warning_active = false;
+    let original = (summary.clone(), detail.clone());
+    apply_engine_socket_warning(&mut summary, &mut detail, Some(&inactive));
+    assert_eq!((summary, detail), original);
+    let home = TempHome::new("policy-unprotected");
+    let (cp, _) = protection(&home);
+    assert!(cp.status().engine_socket_policy.is_none());
+}
