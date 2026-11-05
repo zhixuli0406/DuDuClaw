@@ -33,6 +33,10 @@ fn no_external_codex(directory: BorrowedFd<'_>) -> io::Result<()> {
 }
 pub(super) fn prepare(persistent: OwnedFd, work: BorrowedFd<'_>, projection: BorrowedFd<'_>, uid: u32, gid: u32)
     -> io::Result<OwnedFd> {
+    prepare_with(persistent, work, projection, uid, gid, attach_data)
+}
+fn prepare_with(persistent: OwnedFd, work: BorrowedFd<'_>, projection: BorrowedFd<'_>, uid: u32, gid: u32,
+    compose: fn(BorrowedFd<'_>, BorrowedFd<'_>) -> io::Result<()>) -> io::Result<OwnedFd> {
     let codex = exists(projection, "codex-home.toml")?;
     let grok = exists(projection, "grok-home.toml")?;
     if !codex && !grok { return Ok(persistent); }
@@ -57,11 +61,53 @@ pub(super) fn prepare(persistent: OwnedFd, work: BorrowedFd<'_>, projection: Bor
         libc::AT_EMPTY_PATH as u32 | 0x8000, &private, std::mem::size_of::<Attr>()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // The source is a detached private clone. Attaching it inside another
-    // detached tree cannot mutate the original H mount or its propagation.
+    // Probe exactly this composition once. Older kernels require the target in
+    // the caller's namespace (do_move_mount/check_mnt), not an anonymous tree.
+    // Never retry permission/resource errors or change the original H mount.
     directory(home.as_fd(), "data", 0, 0)?;
+    if crate::native_home_strategy::needs_attached_composition(compose(persistent.as_fd(), home.as_fd()))? {
+        return compose_attached(persistent, home, codex, uid, gid);
+    }
+    configure(home.as_fd(), codex, uid, gid)?;
+    Ok(home)
+}
+fn attach_data(persistent: BorrowedFd<'_>, home: BorrowedFd<'_>) -> io::Result<()> {
     if unsafe { libc::syscall(libc::SYS_move_mount, persistent.as_raw_fd(), c"".as_ptr(),
         home.as_raw_fd(), c"data".as_ptr(), 4) } != 0 { return Err(io::Error::last_os_error()); }
+    Ok(())
+}
+
+/// Compose in a disposable namespace, then return a recursive detached clone.
+/// Only this fresh thread changes namespaces: the lifecycle worker and B2 retain
+/// their existing contract. No employee process is started in this namespace.
+fn compose_attached(persistent: OwnedFd, home: OwnedFd, codex: bool, uid: u32, gid: u32) -> io::Result<OwnedFd> {
+    std::thread::Builder::new().name("native-home-mount".into()).spawn(move || {
+        // CLONE_FS unshares the filesystem context shared by Rust threads;
+        // without it CLONE_NEWNS is refused. Never setns back into the daemon.
+        if unsafe { libc::unshare(libc::CLONE_FS | libc::CLONE_NEWNS) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE, std::ptr::null()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Overmount an existing directory only in this private namespace. No
+        // host scratch directory or persistent inode is created/modified. Pin
+        // the target after unshare and refuse symlinks (including /tmp itself).
+        let target = owned(unsafe { libc::open(c"/tmp".as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) } as _)?;
+        if unsafe { libc::syscall(libc::SYS_move_mount, home.as_raw_fd(), c"".as_ptr(),
+            target.as_raw_fd(), c"".as_ptr(), 4 | 0x40) } != 0 { return Err(io::Error::last_os_error()); }
+        attach_data(persistent.as_fd(), home.as_fd())?;
+        configure(home.as_fd(), codex, uid, gid)?;
+        // Preserve each mount's flags (home noexec, persistent data unchanged).
+        // On success or error the thread exits and its namespace is destroyed;
+        // only the completed, private detached clone can reach the caller/B2.
+        crate::bootstrap_mounts::detached_clone(home.as_fd(), 0)
+    })?.join().map_err(|_| io::Error::other("native home mount worker panicked"))?
+}
+
+fn configure(home: BorrowedFd<'_>, codex: bool, uid: u32, gid: u32) -> io::Result<()> {
     let native = if codex { ".codex" } else { ".grok" };
     let config = directory(home.as_fd(), native, 0, 0)?;
     link(config.as_fd(), if codex { "/config/codex-home.toml" } else { "/config/grok-home.toml" }, "config.toml")?;
@@ -75,7 +121,7 @@ pub(super) fn prepare(persistent: OwnedFd, work: BorrowedFd<'_>, projection: Bor
         for entry in ["sessions", "cache", "logs"] { directory(config.as_fd(), entry, uid, gid)?; }
     }
     for entry in [".cache", ".local"] { directory(home.as_fd(), entry, uid, gid)?; }
-    Ok(home)
+    Ok(())
 }
 
 /// Read back the actual home handed to B2, in addition to the immutable /config
@@ -100,45 +146,5 @@ pub(super) fn verify(home: BorrowedFd<'_>, projection: BorrowedFd<'_>) -> io::Re
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::symlink;
-    #[test]
-    fn external_codex_detection_refuses_any_project_entry_without_following_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let fd = std::fs::File::open(dir.path()).unwrap();
-        assert!(no_external_codex(fd.as_fd()).is_ok());
-        symlink("/definitely-missing-config",dir.path().join(".codex")).unwrap();
-        assert!(no_external_codex(fd.as_fd()).is_err());
-    }
-    #[test]
-    #[ignore = "requires root with mount API privileges; detached native home, no provider"]
-    fn iso_root_native_home_projects_root_configs_and_refuses_external_codex() {
-        use std::io::Write;
-        assert_eq!(unsafe { libc::geteuid() }, 0);
-        let root = tempfile::tempdir().unwrap();
-        for kind in ["codex", "grok"] {
-            let base = root.path().join(kind);
-            std::fs::create_dir(&base).unwrap();
-            for name in ["home", "work", "projection"] { std::fs::create_dir(base.join(name)).unwrap(); }
-            let projection_path = base.join("projection");
-            let mut file = std::fs::File::create(projection_path.join(format!("{kind}-home.toml"))).unwrap();
-            file.write_all(b"test-only-root-config").unwrap();
-            drop(file);
-            let projection = std::fs::File::open(&projection_path).unwrap();
-            let work = std::fs::File::open(base.join("work")).unwrap();
-            let persistent = std::fs::File::open(base.join("home")).unwrap();
-            let cloned = crate::bootstrap_mounts::detached_clone(persistent.as_fd(), 2 | 4).unwrap();
-            let home = prepare(cloned, work.as_fd(), projection.as_fd(), 70000, 70000).unwrap();
-            verify(home.as_fd(),projection.as_fd()).unwrap();
-            let path = format!("/proc/self/fd/{}/.{kind}/config.toml",home.as_raw_fd());
-            assert_eq!(std::fs::read_link(path).unwrap(),std::path::PathBuf::from(format!("/config/{kind}-home.toml")));
-            if kind == "codex" {
-                symlink("/missing",base.join("work/.codex")).unwrap();
-                let cloned = crate::bootstrap_mounts::detached_clone(persistent.as_fd(), 2 | 4).unwrap();
-                assert!(prepare(cloned,work.as_fd(),projection.as_fd(),70000,70000).is_err());
-            }
-        }
-    }
-
-}
+#[path = "native_home_tests.rs"]
+mod tests;

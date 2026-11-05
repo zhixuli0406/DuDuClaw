@@ -22,6 +22,42 @@ employee execution closed. This wiring is not production acceptance.
 See [Package B1](../../docs/architecture/native-linux-isolation.md#package-b1)
 for adapter contracts and remaining cross-package acceptance.
 
+### Native CLI home on older kernels
+
+Codex/Grok homes first try composing the persistent private clone beneath the
+detached tmpfs. Linux 6.8 `do_move_mount()` requires the target in the caller's
+mount namespace; Linux 6.15 permits eligible anonymous targets via
+`may_use_mount()`. Only `EINVAL` from that composition selects the compatibility
+path; kernel version strings are never consulted and other errors fail closed.
+
+The compatibility worker unshares `CLONE_FS | CLONE_NEWNS`, makes its namespace
+recursively private, and attaches the home over its own `/tmp` before adding
+`data` and the root-owned config directories/links. It returns a recursive private
+detached clone and exits, destroying the temporary namespace on success or error.
+No host scratch directory is created, no original persistent mount or propagation
+is changed, and no employee process enters the composition namespace. B2 receives
+only the complete tree through the existing descriptor/readback contract. Cache
+ownership, external Codex refusal and the prohibition on gateway env copying stay
+unchanged. A missing/non-directory/symlink `/tmp` or denied namespace operation
+refuses the launch.
+
+The root test below exercises automatic selection and a forced `EINVAL` path for
+both runtimes, including config/cache ownership, mount flags, persistent data,
+unchanged source propagation and attachment in a subsequent namespace. Run on
+each supported kernel; compilation and portable selection tests are not root
+acceptance:
+
+```sh
+cargo test -p duduclaw-spawnd --lib native_home::tests::iso_root_native_home_projects_root_configs_and_refuses_external_codex -- --ignored --exact --test-threads=1 --nocapture
+```
+
+The related-call audit found no other detached-target composition in
+`duduclaw-spawnd`, `duduclaw-run`, `duduclaw-isolation-storage` or
+`duduclaw-execution`. Spawnd's bootstrap/storage `open_tree` sites only clone;
+run's root is attached before its input, system, certificate, tmpfs and device
+submounts, and proc is attached after pivot. Run's probes use invalid descriptors
+and its root fixtures only clone. The latter two crates contain neither syscall.
+
 ## Build and verification
 
 Only Linux runs the service. The policy and admission tests are portable.

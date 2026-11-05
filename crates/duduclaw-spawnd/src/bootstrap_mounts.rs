@@ -186,7 +186,7 @@ pub(super) fn detached_clone(source: BorrowedFd<'_>, attributes: u64) -> io::Res
     // Detached mounts must not be visible in the caller's mount namespace.
     let id = crate::fds::mount_id(clone.as_fd())?;
     let mut table = String::new();
-    File::open("/proc/self/mountinfo")?.take(16 * 1024 * 1024 + 1).read_to_string(&mut table)?;
+    File::open("/proc/thread-self/mountinfo")?.take(16 * 1024 * 1024 + 1).read_to_string(&mut table)?;
     if table.len() > 16 * 1024 * 1024 || table.lines().any(|line| line.split_whitespace().next()
         .and_then(|value| value.parse::<u64>().ok()) == Some(id)) { return Err(invalid()); }
     Ok(clone)

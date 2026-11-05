@@ -48,3 +48,6 @@ pub mod gateway_plan;
 
 #[cfg(target_os = "linux")]
 mod native_home;
+
+#[cfg(any(target_os = "linux", test))]
+mod native_home_strategy;
