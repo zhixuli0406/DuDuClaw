@@ -727,7 +727,7 @@ pub async fn api_get(token: &str, url: &str) -> Result<Value, GoogleApiError> {
 }
 
 fn http_client() -> Result<reqwest::Client, GoogleApiError> {
-    reqwest::Client::builder()
+    crate::isolation_connector_clients::client_builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .redirect(crate::isolation_connector_clients::redirects())
         .build()

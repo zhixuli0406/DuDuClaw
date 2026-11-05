@@ -6,6 +6,7 @@ use super::*;
 impl ApprovalStore {
     /// Open (or create) the store at `<home>/approvals.db`.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
+        verify_live_io()?;
         // SQLite NOFOLLOW rejects symlinked parent components too (e.g. macOS
         // /var -> /private/var). Resolve the trusted home, while still refusing
         // a symlink at the actual database or sidecar path.
@@ -86,13 +87,15 @@ impl ApprovalStore {
         })
     }
 
-    fn init_schema(conn: &Connection) -> Result<(), String> {
+    fn init_schema(connection: &Connection) -> Result<(), String> {
+        verify_live_io()?;
+        connection.execute_batch("PRAGMA secure_delete=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .map_err(|e| e.to_string())?;
+        verify_live_io()?;
+        let tx = connection.unchecked_transaction().map_err(|e| e.to_string())?;
+        let conn = &tx;
         conn.execute_batch(
-            "PRAGMA secure_delete=ON;
-             PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;
-
-             CREATE TABLE IF NOT EXISTS approvals (
+            "CREATE TABLE IF NOT EXISTS approvals (
                  id           TEXT PRIMARY KEY,
                  agent_id     TEXT NOT NULL,
                  action_kind  TEXT NOT NULL,
@@ -113,7 +116,7 @@ impl ApprovalStore {
         Self::migrate(conn)?;
         Self::init_operations(conn)?;
         Self::migrate_workflow_authority(conn)?;
-        Ok(())
+        commit_live_write(tx)
     }
 
     /// Idempotent additive migration (same shape as `task_store`): every column
@@ -235,6 +238,8 @@ impl ApprovalStore {
             None
         };
         let mut conn = self.conn.lock().await;
+        verify_live_io()?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
         if let Some(path) = &quarantine_bus {
             conn.execute("ATTACH DATABASE ?1 AS quarantine_live_events", params![path.to_string_lossy()])
                 .map_err(|e| format!("attach quarantine event store: {e}"))?;
@@ -249,8 +254,8 @@ impl ApprovalStore {
             if if_absent { " ON CONFLICT(id) DO NOTHING" } else { "" }
         );
         let result = (|| {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| format!("begin approval insert: {e}"))?;
+            let tx = begin_live_write(&mut conn)?;
+            duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
             if if_absent {
                 let existing: Option<(String, String, Option<String>, String)> = tx.query_row(
                     "SELECT agent_id, request_kind, binding_json, payload FROM approvals WHERE id=?1",
@@ -277,7 +282,8 @@ impl ApprovalStore {
                                 [rec.id.as_str()]).map_err(|e| e.to_string())?;
                         }
                     }
-                    tx.commit().map_err(|e| e.to_string())?;
+                    duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+                    commit_live_write(tx)?;
                     return Ok(false);
                 }
             }
@@ -290,6 +296,7 @@ impl ApprovalStore {
                     return Err("approval turn was cancelled".into());
                 }
             }
+            duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
             let inserted = tx.execute(
                 &sql,
                 params![
@@ -327,7 +334,8 @@ impl ApprovalStore {
             if inserted && quarantine_bus.is_some() {
                 Self::insert_quarantine_creation_event(&tx, rec)?;
             }
-            tx.commit().map_err(|e| format!("commit approval insert: {e}"))?;
+            duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+            commit_live_write(tx)?;
             Ok::<_, String>(inserted)
         })();
         // Detach after both success and rollback, before reusing this connection.
@@ -351,12 +359,18 @@ impl ApprovalStore {
         channel: &str,
         chat_id: &str,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut conn = self.conn.lock().await;
+        verify_live_io()?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        let tx = begin_live_write(&mut conn)?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        tx.execute(
             "UPDATE approvals SET notify_channel = ?1, notify_chat_id = ?2 WHERE id = ?3",
             params![channel, chat_id, id.as_str()],
         )
         .map_err(|e| format!("set notify target: {e}"))?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        commit_live_write(tx)?;
         Ok(())
     }
 
@@ -365,14 +379,20 @@ impl ApprovalStore {
     /// pollers (gateway sweep + a blocked MCP process) cannot both send.
     /// Returns `true` when THIS caller won and should actually push.
     pub(super) async fn claim_reminder(&self, id: &ApprovalId, at: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
-        let n = conn
+        let mut conn = self.conn.lock().await;
+        verify_live_io()?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        let tx = begin_live_write(&mut conn)?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        let n = tx
             .execute(
                 "UPDATE approvals SET reminded_at = ?1
                  WHERE id = ?2 AND reminded_at IS NULL AND status = 'pending'",
                 params![at, id.as_str()],
             )
             .map_err(|e| format!("claim reminder: {e}"))?;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        commit_live_write(tx)?;
         Ok(n > 0)
     }
 
@@ -394,6 +414,7 @@ impl ApprovalStore {
 
     pub(super) async fn get(&self, id: &ApprovalId) -> Result<Option<ApprovalRecord>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             "SELECT id, agent_id, action_kind, summary, payload, status,
                     created_at, decided_at, decided_by, ttl_seconds,
@@ -420,8 +441,10 @@ impl ApprovalStore {
     ) -> Result<usize, String> {
         let (n, rec) = {
             let mut conn = self.conn.lock().await;
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| format!("begin approval decision: {e}"))?;
+            verify_live_io()?;
+            duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+            let tx = begin_live_write(&mut conn)?;
+            duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
             let rec = record_in_connection(&tx, id)?;
             // Check inside the same write transaction as the decision: a
             // concurrent privacy scrub cannot change the reviewed payload.
@@ -444,7 +467,8 @@ impl ApprovalStore {
                     live_origin = super::turn_origin::LIVE_ORIGIN_SQL),
                 params![status.as_str(), decided_by, decided_at, id.as_str()],
             ).map_err(|e| format!("decide approval: {e}"))?;
-            tx.commit().map_err(|e| format!("commit approval decision: {e}"))?;
+            duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+            commit_live_write(tx)?;
             (n, rec)
         };
         if n > 0 {
@@ -463,6 +487,7 @@ impl ApprovalStore {
     /// Every approval of one `action_kind`, any status (GDPR scrub).
     pub(super) async fn list_by_kind(&self, kind: &str) -> Result<Vec<ApprovalRecord>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, agent_id, action_kind, summary, payload, status,
@@ -489,15 +514,19 @@ impl ApprovalStore {
         payload: &Value,
     ) -> Result<usize, String> {
         require_credential_free_payload(payload)?;
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
+        let result = conn.execute(
             "UPDATE approvals SET summary = ?1, payload = ?2, simulation = NULL,
              status = CASE WHEN binding_json IS NOT NULL THEN 'invalidated' ELSE status END,
              invalidated_reason = CASE WHEN binding_json IS NOT NULL THEN 'payload_scrubbed' ELSE invalidated_reason
                 END WHERE id = ?3",
             params![duduclaw_security::credential_detect::mask(summary), payload.to_string(), id.as_str()],
         )
-        .map_err(|e| format!("scrub approval: {e}"))
+        .map_err(|e| format!("scrub approval: {e}"))?;
+        commit_live_write(conn)?;
+        Ok(result)
     }
 
     pub(super) async fn list_pending(
@@ -505,6 +534,7 @@ impl ApprovalStore {
         agent_id: Option<&str>,
     ) -> Result<Vec<ApprovalRecord>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         match agent_id {
             Some(aid) => {
                 let mut stmt = conn

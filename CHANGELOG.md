@@ -27,6 +27,7 @@
 
 ### Security
 
+- 原生 Linux 隔離安全修補（尚未完成產品接線）：capability canonical encoding 升為 v2，新增明確的員工權限範圍；具體資源授權在舊處理器前檢查，連接器缺少選帳政策或 executor 會拒絕啟動。新增撤銷通知與即時權威檢查、綁定本次資源的工作區／檔案型別、egress 全域連線上限，以及 parse worker 最小 runtime tree。第二輪補上 DB／Odoo 帳號綁定 adapter、memory／FTS 與衍生工作的撤銷檢查、解析請求逾時取消與 transport 最後送出前重驗，以及驗簽後 runtime tree 安裝／讀回。第三輪補上剩餘 12 個 connector executor、受限單表 SQL 與其他有限集合查詢、Google gateway-only 憑證橋接、正式 boot 組裝入口、延後提醒失去原授權即拒絕、memory decay／lifecycle 交易撤權回滾，以及 Spawnd root-workspace receipt 掛鉤；production boot caller、Google 完整 requester／非 OAuth 來源與 root receipt producer 仍待整合。執行 backend 未實作工作區權威交付時拒絕啟動；完整 connector parity、所有 Service I/O、首次安裝／世代更新整合與 Linux 實機驗收仍未完成，不能宣告隔離安全審查通過。
 - 首位管理員設定連結改為原子領取，避免同一連結並行建立多個管理員；有效期限改為 30 分鐘，新連結撤銷舊連結，並限制嘗試次數。資料庫升級時會撤銷舊有未區分設定與復原用途的連結。
 - 舊版原生 Linux 受保護安裝器拒絕直接跨入 v1.80 的程式替換升級，缺少版本紀錄也不放行，避免跳過必要的資料與權限遷移。
 - 遷移匯入新增低權限隔離程序與專用啟動模式，舊管理員與 MCP 設定不會在確認前啟用；舊核准一律失效，未知設定與舊憑證不直接沿用。stdio MCP、員工指示、技能、hook 與部分設定加入核准後的套用及讀回；操作收據避免重試或補償誤改其他正常寫入。通道綁定、時間排程與資料庫唯讀授權仍須隔離平台的員工身分驗證，完整升級尚未開放。

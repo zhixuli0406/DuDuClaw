@@ -59,13 +59,28 @@ const ID_CHUNK: usize = 500;
 /// score each with Ebbinghaus retrievability in Rust, and archive the ones
 /// below the threshold atomically (INSERT archive + FTS cleanup + DELETE).
 /// Phase 2: Delete entries from archive past the delete threshold.
+/// Both phases and archive schema initialization commit in one checked
+/// transaction; any refusal rolls back the complete maintenance operation.
 ///
 /// High-importance entries and entries with high retrievability (recently or
 /// frequently accessed) are preserved regardless of age. Semantic-layer
 /// memories are never archived.
 pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) -> DecayReport {
     let weights = engine.retrieval_weights.clone();
-    let conn = engine.conn_for_maintenance().await;
+    let connection = engine.conn_for_maintenance().await;
+    if let Err(error) = crate::isolation_io::verify() {
+        warn!("Decay authority refused after connection wait: {error}");
+        return DecayReport::default();
+    }
+    let transaction = match rusqlite::Transaction::new_unchecked(&connection, rusqlite::TransactionBehavior::Immediate) {
+        Ok(tx) => tx,
+        Err(error) => { warn!("Decay transaction unavailable: {error}"); return DecayReport::default(); }
+    };
+    if let Err(error) = crate::isolation_io::verify() {
+        warn!("Decay authority refused after SQLite wait: {error}");
+        return DecayReport::default();
+    }
+    let conn = &transaction;
     let mut report = DecayReport::default();
 
     // Ensure archive table exists
@@ -110,7 +125,7 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
             Ok(s) => s,
             Err(e) => {
                 warn!("Decay candidate query failed: {e}");
-                return report;
+                return DecayReport::default();
             }
         };
         let rows = stmt.query_map(
@@ -129,7 +144,7 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
             Ok(r) => r,
             Err(e) => {
                 warn!("Decay candidate scan failed: {e}");
-                return report;
+                return DecayReport::default();
             }
         };
         rows.filter_map(|r| r.ok())
@@ -154,9 +169,6 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
         // Using ids (not a repeated WHERE) guarantees INSERT/FTS/DELETE
         // operate on exactly the same rows.
         let phase1_result: std::result::Result<u64, String> = (|| {
-            conn.execute_batch("BEGIN IMMEDIATE")
-                .map_err(|e| format!("BEGIN failed: {e}"))?;
-
             let mut archived_total: u64 = 0;
             for chunk in candidates.chunks(ID_CHUNK) {
                 let placeholders: Vec<String> =
@@ -167,6 +179,7 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
 
                 // INSERT OR IGNORE: tolerate re-runs if a previous attempt
                 // archived but failed to delete (PRIMARY KEY conflict prevention).
+                crate::isolation_io::verify().map_err(|e| e.to_string())?;
                 let archived = conn
                     .execute(
                         &format!(
@@ -181,12 +194,14 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
                     )
                     .map_err(|e| format!("Archive INSERT failed: {e}"))?;
 
+                crate::isolation_io::verify().map_err(|e| e.to_string())?;
                 conn.execute(
                     &format!("DELETE FROM memories_fts WHERE memory_id IN ({in_list})"),
                     bind.as_slice(),
                 )
                 .map_err(|e| format!("FTS cleanup failed: {e}"))?;
 
+                crate::isolation_io::verify().map_err(|e| e.to_string())?;
                 conn.execute(
                     &format!("DELETE FROM memories WHERE id IN ({in_list})"),
                     bind.as_slice(),
@@ -195,10 +210,6 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
 
                 archived_total += archived as u64;
             }
-
-            conn.execute_batch("COMMIT")
-                .map_err(|e| format!("COMMIT failed: {e}"))?;
-
             Ok(archived_total)
         })();
 
@@ -208,8 +219,7 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
             }
             Err(e) => {
                 warn!("Archive phase failed: {e}");
-                let _ = conn.execute_batch("ROLLBACK");
-                return report;
+                return DecayReport::default();
             }
         }
     }
@@ -220,19 +230,13 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
     // A record survives: archive_after_days (in memories) + delete_after_days (in archive).
     // Wrapped in a transaction so a partial delete is rolled back on error.
     let phase2_result: std::result::Result<u64, String> = (|| {
-        conn.execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| format!("BEGIN phase2 failed: {e}"))?;
+        crate::isolation_io::verify().map_err(|e| e.to_string())?;
         let count = conn
             .execute(
                 "DELETE FROM memories_archive WHERE archived_at < ?1",
                 params![delete_cutoff],
             )
-            .map_err(|e| {
-                let _ = conn.execute_batch("ROLLBACK");
-                format!("Delete phase failed: {e}")
-            })?;
-        conn.execute_batch("COMMIT")
-            .map_err(|e| format!("COMMIT phase2 failed: {e}"))?;
+            .map_err(|e| format!("Delete phase failed: {e}"))?;
         Ok(count as u64)
     })();
 
@@ -242,8 +246,19 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
         }
         Err(e) => {
             warn!("{e}");
+            return DecayReport::default();
         }
     }
+
+    if let Err(error) = crate::isolation_io::verify() {
+        warn!("Decay publication refused: {error}");
+        return DecayReport::default();
+    }
+    if let Err(error) = transaction.commit() {
+        warn!("Decay commit failed: {error}");
+        return DecayReport::default();
+    }
+    drop(connection);
 
     if report.archived > 0 || report.deleted > 0 {
         info!(
@@ -257,7 +272,6 @@ pub async fn run_decay(engine: &SqliteMemoryEngine, policy: &MemoryDecayPolicy) 
     // any cached SPO graph is now stale. This maintenance path bypasses the
     // per-agent write bumps, so invalidate every cached agent graph.
     if report.archived > 0 {
-        drop(conn);
         engine.invalidate_all_graph_caches();
     }
 
@@ -354,5 +368,64 @@ mod tests {
         let remaining = engine.list_recent(agent, 10).await.unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].access_count, 50);
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    use std::{future::Future, sync::{Arc, atomic::{AtomicBool,AtomicUsize,Ordering}}, task::Poll};
+    use duduclaw_mcp_boundary::{io_authority,RequestContext,VerificationError};
+    use duduclaw_isolation::capability::{CapabilityRecord,LiveRequestVerifier};
+    use duduclaw_core::traits::MemoryEngine;
+    struct Counted { count:Arc<AtomicUsize>, deny_at:usize }
+    impl LiveRequestVerifier for Counted {
+        fn verify_live(&self,_:&CapabilityRecord,_:u64)->Result<(),VerificationError> {
+            if self.count.fetch_add(1,Ordering::SeqCst)+1 >= self.deny_at { Err(VerificationError::Revoked) } else { Ok(()) }
+        }
+    }
+    fn counted(count:Arc<AtomicUsize>,deny_at:usize)->RequestContext {
+        let base=crate::isolation_io::test_context(Arc::new(AtomicBool::new(true)));
+        RequestContext::with_live_verifier(base.record().clone(),Arc::new(Counted{count,deny_at}))
+    }
+    async fn seed(engine:&SqliteMemoryEngine) {
+        let memory=duduclaw_core::types::MemoryEntry {
+            id:uuid::Uuid::new_v4().to_string(),agent_id:"test".into(),content:"old low value".into(),
+            timestamp:Utc::now()-chrono::Duration::days(100),tags:vec![],embedding:None,
+            layer:duduclaw_core::types::MemoryLayer::Episodic,importance:1.0,access_count:0,last_accessed:None,source_event:"test".into(),
+        };
+        engine.store("test",memory).await.unwrap();
+    }
+    #[tokio::test]
+    async fn decay_revoked_at_mutex_wait_never_initializes_archive() {
+        let engine=SqliteMemoryEngine::in_memory().unwrap();seed(&engine).await;
+        let live=Arc::new(AtomicBool::new(true));
+        let held=engine.conn_for_maintenance().await;
+        let policy=MemoryDecayPolicy::default();
+        let work=io_authority::scope(crate::isolation_io::test_context(live.clone()),run_decay(&engine,&policy));
+        tokio::pin!(work);
+        std::future::poll_fn(|cx|{assert!(work.as_mut().poll(cx).is_pending());Poll::Ready(())}).await;
+        live.store(false,Ordering::SeqCst);drop(held);
+        assert_eq!(work.await.archived,0);
+        let conn=engine.conn_for_maintenance().await;
+        let archive:i64=conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='memories_archive'",[],|r|r.get(0)).unwrap();
+        assert_eq!(archive,0);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM memories",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+    #[tokio::test]
+    async fn decay_final_authority_refusal_rolls_back_archive_fts_delete_and_schema() {
+        let policy=MemoryDecayPolicy::default();
+        let probe=SqliteMemoryEngine::in_memory().unwrap();seed(&probe).await;
+        let count=Arc::new(AtomicUsize::new(0));
+        assert_eq!(io_authority::scope(counted(count.clone(),usize::MAX),run_decay(&probe,&policy)).await.archived,1);
+        let last=count.load(Ordering::SeqCst);
+        assert!(last>=6,"must check every archive effect and final publication");
+        let engine=SqliteMemoryEngine::in_memory().unwrap();seed(&engine).await;
+        let report=io_authority::scope(counted(Arc::new(AtomicUsize::new(0)),last),run_decay(&engine,&policy)).await;
+        assert_eq!((report.archived,report.deleted),(0,0));
+        let conn=engine.conn_for_maintenance().await;
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM memories",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM memories_fts",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='memories_archive'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
     }
 }

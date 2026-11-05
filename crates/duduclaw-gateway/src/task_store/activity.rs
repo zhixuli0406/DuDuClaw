@@ -5,8 +5,9 @@ use super::*;
 
 impl TaskStore {
     pub async fn append_activity(&self, row: &ActivityRow) -> Result<(), String> {
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut conn = self.conn.lock().await;
+        let tx = begin_live_write(&mut conn)?;
+        tx.execute(
             "INSERT INTO activity (id, event_type, agent_id, task_id, summary, timestamp, metadata)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -20,6 +21,7 @@ impl TaskStore {
             ],
         )
         .map_err(|e| format!("append activity: {e}"))?;
+        commit_live_write(tx)?;
         Ok(())
     }
 
@@ -150,7 +152,8 @@ impl TaskStore {
     /// Append a comment. Caller is responsible for verifying the task exists and
     /// that `body` is non-empty and length-capped.
     pub async fn insert_comment(&self, row: &CommentRow) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
         conn.execute(
             "INSERT INTO task_comments (id, task_id, author_user, body, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -163,6 +166,7 @@ impl TaskStore {
             ],
         )
         .map_err(|e| format!("insert comment: {e}"))?;
+        commit_live_write(conn)?;
         Ok(())
     }
 

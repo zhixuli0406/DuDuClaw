@@ -194,11 +194,28 @@ pub trait ExecutionBackend: Send + Sync {
     fn reserve(&self, employee: EmployeeId) -> BackendFuture<'_, RunHandle>;
     /// Consume policy.run's reservation and return the same handle, even queued.
     fn spawn(&self, policy: SpawnPolicy) -> BackendFuture<'_, RunHandle>;
+    /// Protected tool execution needs the selected workspace, not just a handle
+    /// that a backend might reinterpret. Unsupported backends stay unavailable.
+    fn supports_authorized_workspace(&self) -> bool { false }
+    /// Implementations must retain the actual root used for execution, compare
+    /// it with `authority.verify_workspace`, and recheck live authority after
+    /// admission/input waits immediately before handing work to the host. They
+    /// must never reopen or replace the checked root between check and use.
+    fn spawn_authorized(&self, _policy: SpawnPolicy, _authority: std::sync::Arc<dyn ExecutionAuthority>)
+        -> BackendFuture<'_, RunHandle> { Box::pin(async { Err(BackendError::Denied) }) }
     fn wait(&self, run: RunHandle, origin: WaitOrigin) -> BackendFuture<'_, RunOutcome>;
     fn kill(&self, run: RunHandle) -> BackendFuture<'_, ()>;
     fn take_stdio(&self, run: RunHandle) -> BackendFuture<'_, RunStdio>;
     fn take_pty(&self, run: RunHandle) -> BackendFuture<'_, RunPty>;
     fn resize(&self, run: RunHandle, size: PtySize) -> BackendFuture<'_, ()>;
+}
+
+/// Boundary-owned selection token passed intact to a protected tool backend.
+/// A backend validates its real execution root against this authority; an
+/// implementation that only compares workspace names does not satisfy it.
+pub trait ExecutionAuthority: Send + Sync {
+    fn verify_live(&self) -> Result<(), BackendError>;
+    fn verify_workspace(&self, handle: &str, directory: &std::fs::File) -> Result<(), BackendError>;
 }
 
 /// Effects that require an explicit CI inventory entry (§4.1).

@@ -61,6 +61,9 @@ pub mod mcp_isolation; // Native Linux connection-bound adapter, sharing the exi
 pub mod mcp_isolation_execution;
 pub mod mcp_isolation_disposition;
 pub mod mcp_isolation_resources;
+pub mod mcp_isolation_connector_odoo;
+pub mod mcp_isolation_connector_channel;
+pub mod mcp_isolation_boot;
 pub mod mcp_files; // §14.2 WP-F2: local data-file MCP tools (file/csv/xlsx read)
 pub mod mcp_fork; // RFC-26 P3: Live Run Forking tool surface
 pub mod mcp_fork_exec; // RFC-26 P4: real branch execution + background driver

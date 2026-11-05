@@ -4,8 +4,12 @@ use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, Capab
     EmployeeBinding, Lane, Principal, ResourceGrant}, ids::{EmployeeId, RunId, Sha256Digest}};
 use crate::{parsing::{TableKind, TableOptions, table_request}, tool_policy::ToolPolicy};
 
+struct TestLive;
+impl duduclaw_isolation::capability::LiveRequestVerifier for TestLive {
+    fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> { Ok(()) }
+}
 fn context() -> RequestContext {
-    RequestContext::from_verified_record(CapabilityRecord {
+    RequestContext::with_live_verifier(CapabilityRecord {
         id: CapabilityId(Sha256Digest([1; 32])), employee: EmployeeId([2; 16]), run: RunId([3; 16]),
         task: None, principal: Principal::Human { user_id: Text::new("owner".into()).unwrap(), generation: 1 },
         employee_binding: EmployeeBinding::Personal(Text::new("owner".into()).unwrap()), lane: Lane::Standard,
@@ -13,9 +17,9 @@ fn context() -> RequestContext {
         resources: List::new(vec![ResourceGrant::Employee { id: EmployeeId([2; 16]) },
             ResourceGrant::Workspace { handle: Text::new("work".into()).unwrap() },
             ResourceGrant::Workspace { handle: Text::new("other".into()).unwrap() }]).unwrap(),
-        policy_revision: 1, gateway_epoch: [4; 16], issued_at: 1, not_before: 1, expires_at: 2,
+        policy_revision: 1, gateway_epoch: [4; 16], issued_at: 1, not_before: 1, expires_at: u64::MAX - 1,
         nonce: [5; 32], jti: [6; 16],
-    })
+    }, Arc::new(TestLive))
 }
 struct Resolver { calls: AtomicUsize, changes: bool }
 impl ResourceResolver for Resolver {
@@ -32,8 +36,8 @@ impl WorkerPlanFactory for Factory {
     fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
         Box::pin(async move { if self.refused { Err(VerificationError::Invalid) } else { Ok(()) } })
     }
-    fn prepare<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, WorkerPlan> {
-        Box::pin(async { Ok(plan()) })
+    fn prepare<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, WorkerPlan> {
+        Box::pin(async move { Ok(plan_for(call)) })
     }
     fn finish<'a>(&'a self, _: &'a AuthorizedToolCall, _: WorkerReply) -> PolicyFuture<'a, Value> {
         Box::pin(async move {
@@ -42,11 +46,16 @@ impl WorkerPlanFactory for Factory {
         })
     }
 }
-fn plan() -> WorkerPlan {
+fn call() -> AuthorizedToolCall {
+    tool_policy::authorize(&context(), "skill_security_scan", &json!({}),
+        &Resolver { calls: AtomicUsize::new(0), changes: false }).unwrap()
+}
+fn plan() -> WorkerPlan { plan_for(&call()) }
+fn plan_for(call: &AuthorizedToolCall) -> WorkerPlan {
     let input = tempfile::tempfile().unwrap();
     let request = table_request(&input, &TableOptions { kind: TableKind::Csv, delimiter: b',',
         has_header: true, offset: 0, limit: 2, sheet: None }).unwrap();
-    WorkerPlan { request, input }
+    WorkerPlan::new(request, crate::resources::AuthorizedFile::for_test(call, input)).unwrap()
 }
 fn reply(request: &ParseRequest) -> WorkerReply {
     WorkerReply { response: ParseResponse { version: request.version, request_id: request.request_id,
@@ -106,9 +115,11 @@ async fn isolated_worker_factory_rejects_forged_result_before_finish() {
 fn isolated_worker_factory_bounds_plan_and_output_bytes() {
     let mut plan = plan();
     assert!(validate_plan(&plan).is_ok());
-    plan.input.set_len(64 * 1024 * 1024 + 1).unwrap();
+    let oversized = tempfile::tempfile().unwrap();
+    oversized.set_len(64 * 1024 * 1024 + 1).unwrap();
+    plan.input = crate::resources::AuthorizedFile::for_test(&call(), oversized);
     assert!(validate_plan(&plan).is_err());
-    plan.input.set_len(0).unwrap();
+    plan.input = crate::resources::AuthorizedFile::for_test(&call(), tempfile::tempfile().unwrap());
     plan.request.limits.wall_time_ms = 30_001.try_into().unwrap();
     assert!(validate_plan(&plan).is_err());
     let plan = self::plan();
@@ -132,4 +143,29 @@ fn isolated_worker_factory_checks_output_artifact_digest() {
     assert!(validate_reply(&request, &result).is_ok());
     result.outputs[0][0] = b'x';
     assert!(validate_reply(&request, &result).is_err());
+}
+
+#[tokio::test]
+async fn isolated_worker_rejects_other_calls_regular_file_before_invoke() {
+    struct WrongInput;
+    impl WorkerPlanFactory for WrongInput {
+        fn supports(&self, _: &str) -> bool { true }
+        fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn prepare<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, WorkerPlan> {
+            Box::pin(async {
+                let other = tool_policy::authorize(&context(), "skill_security_scan", &json!({}),
+                    &Resolver { calls: AtomicUsize::new(2), changes: true })?;
+                Ok(plan_for(&other))
+            })
+        }
+        fn finish<'a>(&'a self, _: &'a AuthorizedToolCall, _: WorkerReply) -> PolicyFuture<'a, Value> {
+            panic!("another call's input reached finish")
+        }
+    }
+    let bridge = WorkerToolBridge::new(Arc::new(WrongInput),
+        Arc::new(Resolver { calls: AtomicUsize::new(0), changes: false }),
+        Arc::new(|_| panic!("another call's input reached worker")));
+    assert_eq!(bridge.execute(&context(), "skill_security_scan", &json!({})).await["isError"], true);
 }

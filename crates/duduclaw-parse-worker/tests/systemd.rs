@@ -145,6 +145,16 @@ fn mountinfo_rejects_writable_disk_and_sys_mounts() {
 fn iso_root_systemd_identity_namespaces_limits_and_disconnect_cleanup() {
     let _guard = ROOT_LOCK.lock().unwrap();
     require_root();
+    // These host files must not leak into the worker's minimal runtime root.
+    // Exclusive creation and Drop cleanup never overwrite operator data.
+    struct Sentinel(std::path::PathBuf);
+    impl Drop for Sentinel { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+    let sentinels: Vec<_> = ["/usr/local", "/usr/lib/duduclaw"].into_iter().map(|directory| {
+        let path = std::path::Path::new(directory).join(format!("parse-worker-sentinel-{}", std::process::id()));
+        let mut file = std::fs::File::options().write(true).create_new(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut file, b"host-only sentinel").unwrap();
+        Sentinel(path)
+    }).collect();
     let previous = worker_units();
     let connection = duduclaw_parse_worker::transport::connect().unwrap();
     let (unit, pid) = await_worker(&previous);
@@ -169,6 +179,12 @@ fn iso_root_systemd_identity_namespaces_limits_and_disconnect_cleanup() {
             std::fs::read_link(format!("/proc/self/ns/{namespace}")).unwrap());
     }
     let worker_root = std::path::PathBuf::from(format!("/proc/{pid}/root"));
+    for sentinel in &sentinels {
+        assert!(sentinel.0.is_file());
+        let path = worker_root.join(sentinel.0.strip_prefix("/").unwrap());
+        let error = std::fs::symlink_metadata(path).expect_err("host sentinel visible in worker root");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
     for hidden in ["etc", "etc/shadow", "etc/passwd", "home", "root", "var/lib/duduclaw",
         "run/dbus", "run/dbus/system_bus_socket", "run/docker.sock"] {
         let error = std::fs::symlink_metadata(worker_root.join(hidden)).expect_err(&format!("visible {hidden}"));

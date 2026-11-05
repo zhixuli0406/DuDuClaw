@@ -90,12 +90,11 @@ impl ApprovalBroker {
             .ok_or("legacy approval cannot prepare execution")?;
         binding.validate(&rec.payload)?;
         let mut conn = self.store.conn.lock().await;
+        verify_live_io()?;
         if binding.run_origin_kind == "workflow" && binding.resume_handler == "workflow_v1" {
             self.attach_workflow_reader(&conn)?;
         }
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+        let tx = begin_live_write(&mut conn)?;
         // A prepared row is only a reservation: it is created while the card
         // is still pending (computer-use registers the operation before the
         // human answers) and cannot start anything. `claim_operation` checks
@@ -163,7 +162,7 @@ impl ApprovalBroker {
         if frozen_run != run_authority {
             return Err("step workflow authority changed".into());
         }
-        tx.commit().map_err(|e| e.to_string())?;
+        commit_live_write(tx)?;
         Ok(existing)
     }
 
@@ -171,6 +170,7 @@ impl ApprovalBroker {
     /// under an attached DB read lock in the same transaction as the claim CAS.
     async fn operation_context(&self, id: &str, expected: &ExecutionBinding) -> Result<(), String> {
         let conn = self.store.conn.lock().await;
+        verify_live_io()?;
         let payload: String = conn
             .query_row(
                 "SELECT payload_json FROM approval_operations WHERE operation_id=?1",
@@ -272,6 +272,7 @@ impl ApprovalBroker {
         }
         self.operation_context(id, expected).await?;
         let mut conn = self.store.conn.lock().await;
+        verify_live_io()?;
         self.attach_tasks(&conn, expected)?;
         if conn
             .query_row(
@@ -285,9 +286,7 @@ impl ApprovalBroker {
         {
             self.attach_workflow_reader(&conn)?;
         }
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+        let tx = begin_live_write(&mut conn)?;
         Self::check_task(&tx, expected)?;
         Self::check_operation_authority(&tx, id, expected)?;
         let token = uuid::Uuid::new_v4().to_string();
@@ -330,7 +329,7 @@ impl ApprovalBroker {
                 |r| r.get(0),
             )
             .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
+        commit_live_write(tx)?;
         Ok(OperationClaim {
             operation_id: id.into(),
             token,
@@ -347,6 +346,7 @@ impl ApprovalBroker {
     ) -> Result<(), String> {
         self.operation_context(&claim.operation_id, current).await?;
         let mut conn = self.store.conn.lock().await;
+        verify_live_io()?;
         self.attach_tasks(&conn, current)?;
         if conn
             .query_row(
@@ -360,9 +360,7 @@ impl ApprovalBroker {
         {
             self.attach_workflow_reader(&conn)?;
         }
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+        let tx = begin_live_write(&mut conn)?;
         Self::check_task(&tx, current)?;
         Self::check_operation_authority(&tx, &claim.operation_id, current)?;
         let n = tx
@@ -384,7 +382,7 @@ impl ApprovalBroker {
         if n != 1 {
             return Err("execution authorization revoked or fenced".into());
         }
-        tx.commit().map_err(|e| e.to_string())
+        commit_live_write(tx)
     }
     pub async fn settle_operation(
         &self,
@@ -400,7 +398,9 @@ impl ApprovalBroker {
         {
             return Err("terminal result requires an actual receipt".into());
         }
-        let conn = self.store.conn.lock().await;
+        let mut connection = self.store.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let n = conn
             .execute(
                 "UPDATE approval_operations SET state=?1,receipt_json=?2,error_code=?3,finished_at=?4
@@ -422,6 +422,7 @@ impl ApprovalBroker {
         if n != 1 {
             return Err("stale execution receipt refused by fence".into());
         }
+        commit_live_write(conn)?;
         Ok(())
     }
     pub async fn list_operations(&self) -> Result<Vec<OperationRecord>, String> {
@@ -453,6 +454,7 @@ impl ApprovalBroker {
     ) -> Result<(Vec<OperationRecord>, Option<i64>), String> {
         let limit = limit.clamp(1, 500);
         let conn = self.store.conn.lock().await;
+        verify_live_io()?;
         let mut q = conn
             .prepare("SELECT operation_id,run_id,step_key,approval_id,binding_json,state,fence,lease_owner,
                 lease_until,provider_key,receipt_json,error_code,rowid,operator_resolution_json,authority_source,
@@ -535,24 +537,32 @@ impl ApprovalBroker {
     }
     /// Boot/recovery never repeats a potentially submitted action.
     pub async fn recover_operations(&self) -> Result<usize, String> {
-        let conn = self.store.conn.lock().await;
-        conn.execute(
+        let mut connection = self.store.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
+        let result = conn.execute(
             "UPDATE approval_operations SET state='uncertain',error_code='execution_lease_lost'
                 WHERE state='executing' AND lease_until<=?1",
             params![Utc::now().timestamp()]
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        commit_live_write(conn)?;
+        Ok(result)
     }
     /// Called once by the gateway boot owner, never by a CLI opening the store.
     pub async fn invalidate_live_on_restart(&self) -> Result<(), String> {
-        let conn = self.store.conn.lock().await;
-        conn.execute_batch("UPDATE approvals SET status='invalidated',invalidated_reason='restart_requires_reobserve'
+        let mut connection = self.store.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
+        let result = conn.execute_batch("UPDATE approvals SET status='invalidated',invalidated_reason='restart_requires_reobserve'
             WHERE status IN ('pending','approved') AND json_extract(binding_json,
             '$.resume_handler') IN ('computer_reobserve_v1','live_only_v1');
             UPDATE approval_operations SET state='uncertain',error_code='gateway_restarted_during_execution'
             WHERE state='executing' AND json_extract(binding_json,'$.resume_handler') IN ('computer_reobserve_v1',
             'live_only_v1');")
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        commit_live_write(conn)?;
+        Ok(result)
     }
     /// Admin reconciliation records evidence and actor, never resets to prepared.
     pub async fn resolve_uncertain(
@@ -569,7 +579,9 @@ impl ApprovalBroker {
         }
         let receipt = masked_approval_value(&receipt);
         let reason = duduclaw_security::credential_detect::mask(reason);
-        let conn = self.store.conn.lock().await;
+        let mut connection = self.store.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
         let decision = serde_json::json!({
             "actor": actor,
             "reason": reason,
@@ -593,6 +605,7 @@ impl ApprovalBroker {
         if n != 1 {
             return Err("reconciliation state changed".into());
         }
+        commit_live_write(conn)?;
         Ok(())
     }
 }
@@ -610,6 +623,7 @@ impl ApprovalBroker {
     ) -> Result<(Vec<ApprovalId>, Vec<(String, OperationState)>), String> {
         let ids = serde_json::to_string(task_ids).map_err(|e| e.to_string())?;
         let conn = self.store.conn.lock().await;
+        verify_live_io()?;
         let mut q = conn
             .prepare(
                 "SELECT id FROM approvals WHERE status = 'pending'

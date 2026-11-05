@@ -29,6 +29,18 @@ use duduclaw_core::error::{DuDuClawError, Result};
 use rusqlite::{params, Connection};
 use std::path::Path;
 
+fn verify_live_io() -> std::result::Result<(), String> {
+    crate::isolation_io::verify().map_err(|error| error.to_string())
+}
+
+struct AttachedDestination<'a>(&'a Connection);
+impl Drop for AttachedDestination<'_> {
+    fn drop(&mut self) {
+        // Detach is cleanup, including after revocation or rollback.
+        let _ = self.0.execute_batch("DETACH DATABASE hdst");
+    }
+}
+
 /// How many rows moved, per physical table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ReassignSummary {
@@ -72,6 +84,7 @@ fn collect_fenced(
     forgotten: Option<&str>,
     has_archive: bool,
 ) -> std::result::Result<u64, String> {
+    verify_live_io()?;
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS reassign_fenced (store TEXT NOT NULL, id TEXT NOT NULL,
                                                          PRIMARY KEY (store, id));
@@ -101,6 +114,7 @@ fn collect_fenced(
                 )
             })
             .unwrap_or_default();
+        verify_live_io()?;
         conn.execute(
             &format!(
                 "INSERT OR IGNORE INTO temp.reassign_fenced (store, id)
@@ -145,12 +159,15 @@ pub async fn reassign_agent(
         ));
     }
     let conn = engine.conn_for_maintenance().await;
+    crate::isolation_io::verify()?;
     let has_archive = archive_table_exists(&conn);
 
     let txn: std::result::Result<ReassignSummary, String> = (|| {
-        conn.execute_batch("BEGIN IMMEDIATE")
+        verify_live_io()?;
+        let transaction = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("BEGIN failed: {e}"))?;
-
+        verify_live_io()?;
+        let conn = &transaction;
         crate::lineage::db::copy_tombstones(
             &conn,
             "main.forgotten_sources",
@@ -168,6 +185,7 @@ pub async fn reassign_agent(
             has_archive,
         )?;
 
+        verify_live_io()?;
         let memories = conn
             .execute(
                 &format!(
@@ -181,6 +199,7 @@ pub async fn reassign_agent(
         // memories_fts is a standalone fts5 table with an UNINDEXED agent_id
         // column that search filters on — it MUST be re-keyed too or the moved
         // rows become unfindable under the new agent.
+        verify_live_io()?;
         conn.execute(
             &format!(
                 "UPDATE memories_fts SET agent_id = ?1 WHERE agent_id = ?2{}",
@@ -190,6 +209,7 @@ pub async fn reassign_agent(
         )
         .map_err(|e| format!("memories_fts re-key failed: {e}"))?;
 
+        verify_live_io()?;
         let key_facts = conn
             .execute(
                 &format!(
@@ -203,7 +223,8 @@ pub async fn reassign_agent(
         // so re-keying the base table is sufficient.
 
         let archived = if has_archive {
-            conn.execute(
+            verify_live_io()?;
+        conn.execute(
                 &format!(
                     "UPDATE memories_archive SET agent_id = ?1 WHERE agent_id = ?2{}",
                     not_fenced("id", "archive")
@@ -216,6 +237,7 @@ pub async fn reassign_agent(
         };
 
         // Lineage of every moved row (rows fenced above keep theirs).
+        verify_live_io()?;
         conn.execute(
             "UPDATE memory_origins SET agent_id = ?1
              WHERE agent_id = ?2
@@ -224,8 +246,8 @@ pub async fn reassign_agent(
         )
         .map_err(|e| format!("lineage re-key failed: {e}"))?;
 
-        conn.execute_batch("COMMIT")
-            .map_err(|e| format!("COMMIT failed: {e}"))?;
+        verify_live_io()?;
+        transaction.commit().map_err(|e| format!("COMMIT failed: {e}"))?;
         Ok(ReassignSummary {
             memories,
             key_facts,
@@ -244,7 +266,6 @@ pub async fn reassign_agent(
             Ok(summary)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
             Err(DuDuClawError::Memory(format!("reassign_agent failed: {e}")))
         }
     }
@@ -272,18 +293,42 @@ pub async fn reassign_agent_cross_db(
     to_agent: &str,
 ) -> Result<ReassignSummary> {
     let conn = from_engine.conn_for_maintenance().await;
+    crate::isolation_io::verify()?;
     let has_archive = archive_table_exists(&conn);
 
-    // ATTACH cannot run inside a transaction — do it first.
+    // ATTACH cannot run inside a transaction — do it first. Scoped calls
+    // require the documented existing-schema destination before this I/O;
+    // unscoped host calls retain their previous attach/error behavior.
+    crate::isolation_io::verify()?;
+    if duduclaw_mcp_boundary::io_authority::is_scoped() && !to_db_path.is_file() {
+        return Err(DuDuClawError::Memory("destination database must already exist".into()));
+    }
     conn.execute(
         "ATTACH DATABASE ?1 AS hdst",
         params![to_db_path.to_string_lossy()],
     )
     .map_err(|e| DuDuClawError::Memory(format!("attach destination db failed: {e}")))?;
-    // Destination needs the archive table before we can copy into it.
-    if has_archive {
-        let _ = conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS hdst.memories_archive (
+    let attached = AttachedDestination(&conn);
+
+    let txn: std::result::Result<ReassignSummary, String> = (|| {
+        verify_live_io()?;
+        // Fail closed: a destination without the lineage tables (an older
+        // schema) cannot hold tombstones, so nothing is moved.
+        if !crate::lineage::db::table_exists(&conn, "hdst", "forgotten_sources")
+            .map_err(|e| e.to_string())?
+        {
+            return Err("destination database has no lineage tables".to_string());
+        }
+        verify_live_io()?;
+        let transaction = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("BEGIN failed: {e}"))?;
+        verify_live_io()?;
+        let conn = &transaction;
+        // Destination needs the archive table before we can copy into it.
+        if has_archive {
+            verify_live_io()?;
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS hdst.memories_archive (
                 id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL,
                 content TEXT NOT NULL,
@@ -296,19 +341,8 @@ pub async fn reassign_agent_cross_db(
                 source_event TEXT DEFAULT '',
                 archived_at TEXT NOT NULL DEFAULT (datetime('now'))
             )",
-        );
-    }
-
-    let txn: std::result::Result<ReassignSummary, String> = (|| {
-        // Fail closed: a destination without the lineage tables (an older
-        // schema) cannot hold tombstones, so nothing is moved.
-        if !crate::lineage::db::table_exists(&conn, "hdst", "forgotten_sources")
-            .map_err(|e| e.to_string())?
-        {
-            return Err("destination database has no lineage tables".to_string());
+            ).map_err(|e| format!("destination archive schema: {e}"))?;
         }
-        conn.execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| format!("BEGIN failed: {e}"))?;
 
         crate::lineage::db::copy_tombstones(
             &conn,
@@ -332,6 +366,7 @@ pub async fn reassign_agent_cross_db(
 
         // Copy memories into the destination re-tagged. A genuine id collision
         // (UUID clash) aborts here rather than silently skipping — honest fail.
+        verify_live_io()?;
         let memories = conn
             .execute(
                 &format!(
@@ -353,6 +388,7 @@ pub async fn reassign_agent_cross_db(
             .map_err(|e| format!("memories copy failed: {e}"))? as u64;
 
         // Destination FTS for exactly the copied rows.
+        verify_live_io()?;
         conn.execute(
             &format!(
                 "INSERT INTO hdst.memories_fts (content, agent_id, memory_id)
@@ -362,6 +398,7 @@ pub async fn reassign_agent_cross_db(
         )
         .map_err(|e| format!("memories_fts copy failed: {e}"))?;
 
+        verify_live_io()?;
         let key_facts = conn
             .execute(
                 &format!(
@@ -378,6 +415,7 @@ pub async fn reassign_agent_cross_db(
 
         // key_facts_fts is rowid-linked; use the destination rowids of the rows
         // we just inserted (matched by their globally-unique ids).
+        verify_live_io()?;
         conn.execute(
             &format!(
                 "INSERT INTO hdst.key_facts_fts (rowid, fact)
@@ -390,7 +428,8 @@ pub async fn reassign_agent_cross_db(
         .map_err(|e| format!("key_facts_fts copy failed: {e}"))?;
 
         let archived = if has_archive {
-            conn.execute(
+            verify_live_io()?;
+        conn.execute(
                 &format!(
                     "INSERT INTO hdst.memories_archive
                     (id, agent_id, content, timestamp, tags, layer, importance,
@@ -417,6 +456,7 @@ pub async fn reassign_agent_cross_db(
                 String::new()
             }
         };
+        verify_live_io()?;
         conn.execute(
             &format!("INSERT OR IGNORE INTO hdst.memory_origins
                 (memory_store, memory_id, agent_id, source_kind, source_session,
@@ -438,6 +478,7 @@ pub async fn reassign_agent_cross_db(
         .map_err(|e| format!("lineage copy failed: {e}"))?;
 
         // Delete the moved rows from the source (FTS first to avoid orphans).
+        verify_live_io()?;
         conn.execute(
             &format!(
                 "DELETE FROM main.memories_fts WHERE agent_id = ?1{}",
@@ -446,6 +487,7 @@ pub async fn reassign_agent_cross_db(
             params![from_agent],
         )
         .map_err(|e| format!("source memories_fts delete failed: {e}"))?;
+        verify_live_io()?;
         conn.execute(
             &format!(
                 "DELETE FROM main.memory_origins
@@ -461,11 +503,13 @@ pub async fn reassign_agent_cross_db(
             params![from_agent],
         )
         .map_err(|e| format!("source lineage delete failed: {e}"))?;
+        verify_live_io()?;
         conn.execute(
             &format!("DELETE FROM main.memories WHERE agent_id = ?1{nf_mem}"),
             params![from_agent],
         )
         .map_err(|e| format!("source memories delete failed: {e}"))?;
+        verify_live_io()?;
         conn.execute(
             &format!(
                 "DELETE FROM main.key_facts_fts
@@ -474,21 +518,23 @@ pub async fn reassign_agent_cross_db(
             params![from_agent],
         )
         .map_err(|e| format!("source key_facts_fts delete failed: {e}"))?;
+        verify_live_io()?;
         conn.execute(
             &format!("DELETE FROM main.key_facts WHERE agent_id = ?1{nf_facts}"),
             params![from_agent],
         )
         .map_err(|e| format!("source key_facts delete failed: {e}"))?;
         if has_archive {
-            conn.execute(
+            verify_live_io()?;
+        conn.execute(
                 &format!("DELETE FROM main.memories_archive WHERE agent_id = ?1{nf_arch}"),
                 params![from_agent],
             )
             .map_err(|e| format!("source memories_archive delete failed: {e}"))?;
         }
 
-        conn.execute_batch("COMMIT")
-            .map_err(|e| format!("COMMIT failed: {e}"))?;
+        verify_live_io()?;
+        transaction.commit().map_err(|e| format!("COMMIT failed: {e}"))?;
         Ok(ReassignSummary {
             memories,
             key_facts,
@@ -500,14 +546,13 @@ pub async fn reassign_agent_cross_db(
     let result = match txn {
         Ok(summary) => Ok(summary),
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
             Err(DuDuClawError::Memory(format!(
                 "reassign_agent_cross_db failed: {e}"
             )))
         }
     };
     // Always detach, even on failure, so the guard drops clean.
-    let _ = conn.execute_batch("DETACH DATABASE hdst");
+    drop(attached);
     drop(conn);
     // D3.1: the source engine lost all of `from_agent`'s rows — invalidate its
     // cached SPO graph. (The destination is a freshly-opened engine with no
@@ -690,4 +735,106 @@ mod tests {
             .unwrap();
         assert_eq!(again.memories, 0);
     }
+    #[tokio::test]
+    async fn revoked_lifecycle_calls_waiting_on_engine_mutex_do_not_attach_or_move() {
+        use std::{future::Future,sync::{Arc,atomic::{AtomicBool,Ordering}},task::Poll};
+        use duduclaw_mcp_boundary::io_authority;
+        for cross in [false,true] {
+            let dir=tempfile::tempdir().unwrap();
+            let destination=dir.path().join("destination.db");
+            let engine=SqliteMemoryEngine::in_memory().unwrap();
+            seed(&engine,"alice").await;
+            let live=Arc::new(AtomicBool::new(true));
+            let held=engine.conn_for_maintenance().await;
+            let work=io_authority::scope(crate::isolation_io::test_context(live.clone()),async {
+                if cross { reassign_agent_cross_db(&engine,&destination,"alice","bob").await }
+                else { reassign_agent(&engine,"alice","bob").await }
+            });
+            tokio::pin!(work);
+            std::future::poll_fn(|cx|{assert!(work.as_mut().poll(cx).is_pending());Poll::Ready(())}).await;
+            live.store(false,Ordering::SeqCst);drop(held);
+            assert!(work.await.unwrap_err().to_string().contains("revoked"));
+            assert!(!destination.exists(),"a refused call must not ATTACH/create its destination");
+            assert_eq!(engine.list_recent("alice",10).await.unwrap().len(),2);
+            assert!(engine.list_recent("bob",10).await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn reassign_final_authority_refusal_rolls_back_both_databases_and_detaches() {
+        use std::sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}};
+        use duduclaw_mcp_boundary::{io_authority,RequestContext,VerificationError};
+        use duduclaw_isolation::capability::{CapabilityRecord,LiveRequestVerifier};
+        struct Counted{count:Arc<AtomicUsize>,deny_at:usize}
+        impl LiveRequestVerifier for Counted {
+            fn verify_live(&self,_:&CapabilityRecord,_:u64)->std::result::Result<(),VerificationError>{
+                if self.count.fetch_add(1,Ordering::SeqCst)+1>=self.deny_at{Err(VerificationError::Revoked)}else{Ok(())}
+            }
+        }
+        let context=|count:Arc<AtomicUsize>,deny_at:usize| {
+            let base=crate::isolation_io::test_context(Arc::new(AtomicBool::new(true)));
+            RequestContext::with_live_verifier(base.record().clone(),Arc::new(Counted{count,deny_at}))
+        };
+        for cross in [false,true] {
+            let dir=tempfile::tempdir().unwrap();
+            let mut checks=0;
+            for pass in 0..2 {
+                let engine=SqliteMemoryEngine::in_memory().unwrap();seed(&engine,"alice").await;
+                let destination=dir.path().join(format!("destination-{pass}.db"));
+                drop(SqliteMemoryEngine::new(&destination).unwrap());
+                let count=Arc::new(AtomicUsize::new(0));
+                let result=io_authority::scope(context(count.clone(),if pass==0{usize::MAX}else{checks}),async {
+                    if cross{reassign_agent_cross_db(&engine,&destination,"alice","bob").await}
+                    else{reassign_agent(&engine,"alice","bob").await}
+                }).await;
+                if pass==0 {
+                    assert_eq!(result.unwrap().memories,2);checks=count.load(Ordering::SeqCst);
+                    assert!(checks>=8,"must check moved rows and final publication");
+                } else {
+                    assert!(result.unwrap_err().to_string().contains("revoked"));
+                    assert_eq!(engine.list_recent("alice",10).await.unwrap().len(),2);
+                    assert!(engine.list_recent("bob",10).await.unwrap().is_empty());
+                    let conn=engine.conn_for_maintenance().await;
+                    assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_database_list WHERE name='hdst'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+                    drop(conn);
+                    let dest=SqliteMemoryEngine::new(&destination).unwrap();
+                    assert!(dest.list_recent("bob",10).await.unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reassign_rechecks_authority_after_sqlite_begin_wait() {
+        use std::sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering},mpsc};
+        use duduclaw_mcp_boundary::{io_authority,RequestContext,VerificationError};
+        use duduclaw_isolation::capability::{CapabilityRecord,LiveRequestVerifier};
+        struct AtBegin { live:Arc<AtomicBool>, checks:AtomicUsize, signal:std::sync::Mutex<Option<mpsc::Sender<()>>> }
+        impl LiveRequestVerifier for AtBegin {
+            fn verify_live(&self,_:&CapabilityRecord,_:u64)->std::result::Result<(),VerificationError>{
+                if self.checks.fetch_add(1,Ordering::SeqCst)==1 {
+                    if let Some(signal)=self.signal.lock().unwrap().take(){signal.send(()).unwrap();}
+                }
+                if self.live.load(Ordering::SeqCst){Ok(())}else{Err(VerificationError::Revoked)}
+            }
+        }
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("source.db");
+        let engine=SqliteMemoryEngine::new(&path).unwrap();seed(&engine,"alice").await;
+        let (held_tx,held_rx)=mpsc::channel();let (begin_tx,begin_rx)=mpsc::channel();
+        let live=Arc::new(AtomicBool::new(true));let thread_live=live.clone();
+        let writer=std::thread::spawn(move||{
+            let conn=Connection::open(path).unwrap();conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            held_tx.send(()).unwrap();begin_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            thread_live.store(false,Ordering::SeqCst);conn.execute_batch("COMMIT").unwrap();
+        });
+        held_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let base=crate::isolation_io::test_context(live.clone());
+        let context=RequestContext::with_live_verifier(base.record().clone(),Arc::new(AtBegin{live,checks:AtomicUsize::new(0),signal:std::sync::Mutex::new(Some(begin_tx))}));
+        assert!(io_authority::scope(context,reassign_agent(&engine,"alice","bob")).await.unwrap_err().to_string().contains("revoked"));
+        writer.join().unwrap();
+        assert_eq!(engine.list_recent("alice",10).await.unwrap().len(),2);
+        assert!(engine.list_recent("bob",10).await.unwrap().is_empty());
+    }
+
 }

@@ -4,7 +4,7 @@
 use super::*;
 use std::{collections::BTreeSet, sync::Mutex};
 use duduclaw_isolation::execution::*;
-use duduclaw_mcp_boundary::{execution::{ExecutionPlanFactory, PolicyFuture},
+use duduclaw_mcp_boundary::{execution::{AuthorizedExecutionPlan, ExecutionPlanFactory, PolicyFuture},
     factories::{GatewayFactories, GatewayTableParser},
     tool_policy::{AuthorizedToolCall, Route},
     worker_execution::{WorkerPlan, WorkerPlanFactory, WorkerReply, WorkerToolBridge}};
@@ -13,6 +13,7 @@ use duduclaw_mcp_boundary::{execution::{ExecutionPlanFactory, PolicyFuture},
 // panic if the production list/manifest accidentally crosses that boundary.
 struct ListingBackend;
 impl ExecutionBackend for ListingBackend {
+    fn supports_authorized_workspace(&self) -> bool { true }
     fn reserve(&self, _: EmployeeId) -> BackendFuture<'_, RunHandle> { panic!("listing reserved a run") }
     fn spawn(&self, _: SpawnPolicy) -> BackendFuture<'_, RunHandle> { panic!("listing spawned a run") }
     fn wait(&self, _: RunHandle, _: WaitOrigin) -> BackendFuture<'_, RunOutcome> { panic!("listing waited") }
@@ -22,16 +23,39 @@ impl ExecutionBackend for ListingBackend {
     fn resize(&self, _: RunHandle, _: PtySize) -> BackendFuture<'_, ()> { panic!("listing resized a pty") }
 }
 
+// Discovery-only double: parity is an inventory assertion, not provider acceptance.
+struct ListingConnectors;
+impl duduclaw_gateway::isolation_connectors::BoundConnectorExecutor for ListingConnectors {
+    fn supports(&self, tool: &str) -> bool {
+        duduclaw_gateway::isolation_connectors::provider_for_tool(tool).is_some()
+    }
+    fn execute<'a>(&'a self, _: duduclaw_gateway::isolation_connectors::SelectedConnector,
+        _: AuthorizedToolCall) -> PolicyFuture<'a, Value> {
+        panic!("listing executed a connector")
+    }
+}
+
+struct ListingSelection;
+impl duduclaw_gateway::isolation_connectors::LiveConnectorSelectionPolicy for ListingSelection {
+    fn supports(&self, tool: &str) -> bool {
+        duduclaw_gateway::isolation_connectors::provider_for_tool(tool).is_some()
+    }
+    fn candidates(&self, _: &RequestContext, _: &str, _: &str)
+        -> Result<Vec<duduclaw_gateway::isolation_connectors::ProductConnectorAccount>, VerificationError> {
+        panic!("listing selected credentials")
+    }
+}
+
 struct ListingPlans;
 impl ExecutionPlanFactory for ListingPlans {
     fn supports(&self, tool: &str) -> bool {
         duduclaw_mcp_boundary::tool_policy::policy(tool).is_some_and(|p| p.route == Route::Execution)
             || matches!(tool, "hardware_info" | "model_search" | "model_recommend")
     }
-    fn authorize_handler<'a>(&'a self, _: &'a RequestContext, _: &'a str, _: &'a Value) -> PolicyFuture<'a, ()> {
+    fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
         panic!("listing authorized execution")
     }
-    fn prepare<'a>(&'a self, _: &'a RequestContext, _: &'a str, _: &'a Value, _: RunHandle) -> PolicyFuture<'a, SpawnPolicy> {
+    fn prepare<'a>(&'a self, _: &'a AuthorizedToolCall, _: RunHandle) -> PolicyFuture<'a, AuthorizedExecutionPlan> {
         panic!("listing prepared execution")
     }
 }
@@ -190,25 +214,27 @@ enabled = true
     record.resources = List::new(vec![
         ResourceGrant::Employee { id: record.employee },
         ResourceGrant::Workspace { handle: Text::new("work".into()).unwrap() },
-        ResourceGrant::Wiki { namespace: Text::new("agent:main".into()).unwrap() },
-        ResourceGrant::Connector { account: Text::new("model-catalog".into()).unwrap(), binding: record.employee_binding.clone() },
+        ResourceGrant::EmployeeScope { id: record.employee },
         ResourceGrant::UrlOrigin { origin: Text::new("https://example.com".into()).unwrap() },
     ]).unwrap();
     for resource in record.resources.as_slice() {
         duduclaw_mcp_boundary::tool_policy::validate_resource(resource).unwrap();
     }
-    let context = RequestContext::from_verified_record(record);
+    let context = live_context(record);
     let mut bindings = duduclaw_mcp_boundary::bindings::BindingStore::new(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
     bindings.register_principal(&context.record().principal).unwrap();
     bindings.create_employee(context.record().employee, &context.record().employee_binding).unwrap();
     let resolver = Arc::new(duduclaw_gateway::isolation_resources::GatewayResourceResolver::new(
-        home.to_owned(), context.record().employee, "main".into(), Arc::new(Mutex::new(bindings))).unwrap());
+        home.to_owned(), context.record().employee, "main".into(), Arc::new(Mutex::new(bindings))).unwrap()
+        .with_connector_catalog(Arc::new(duduclaw_gateway::isolation_connectors::ConnectorCatalog::new(
+            rusqlite::Connection::open_in_memory().unwrap()).unwrap()))
+        .with_connector_selection_policy(Arc::new(ListingSelection)));
     let parser = Arc::new(GatewayTableParser::new(Arc::new(|_, _, _| panic!("listing parsed a file"))));
     let factories = GatewayFactories::assemble(Some(Arc::new(ListingBackend)), Some(Arc::new(ListingPlans)),
         resolver.clone(), Some(parser)).unwrap().with_worker(Arc::new(WorkerToolBridge::new(
             Arc::new(ListingPlans), resolver.clone(), Arc::new(|_| panic!("listing launched a parser")))));
     let dispatcher = IsolationDispatcher::new(home.to_owned(), context.record().employee, "main".into(),
-        principal, Arc::new(ResourceRoots::default())).unwrap().with_gateway_services(resolver, factories, None);
+        principal, Arc::new(ResourceRoots::default())).unwrap().with_gateway_services(resolver, factories, Some(Arc::new(ListingConnectors)));
     (dispatcher, context)
 }
 
@@ -278,7 +304,7 @@ async fn employee_tool_parity(home: &std::path::Path) {
 async fn isolated_round5_gateway_handler_dispatch_keeps_existing_capability_denials() {
     let home = tempfile::tempdir().unwrap();
     let (dispatcher, context) = fixture(home.path());
-    for tool in ["plan_start", "db_sources"] {
+    for tool in ["plan_start", "belief_stats"] {
         let mut request = json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":tool}});
         if tool == "plan_start" { request["params"]["arguments"] = json!({"task":"parity plan"}); }
         let ordinary = dispatcher.dispatcher.dispatch_tool_call(&dispatcher.principal, &dispatcher.namespace,
@@ -339,4 +365,50 @@ async fn isolated_round5_background_memory_store_reuses_handler_with_dispatch_pr
          AND source_kind='dispatch_run' AND source_session='cron:main' AND source_message='run:parity-run'",
         [id], |row| row.get(0)).unwrap();
     assert_eq!(dispatch_origin, 1, "background memory must retain its gateway-issued dispatch source");
+}
+
+#[test]
+fn every_connector_requires_an_installed_executor_at_boot() {
+    let home = tempfile::tempdir().unwrap();
+    let (mut dispatcher, _) = fixture(home.path());
+    assert!(dispatcher.require_complete_services().is_ok());
+    struct WithoutOne { omitted: &'static str, inner: Arc<dyn ResourceToolService> }
+    impl ResourceToolService for WithoutOne {
+        fn supports(&self, name: &str) -> bool { name != self.omitted && self.inner.supports(name) }
+        fn resolver(&self) -> &dyn duduclaw_mcp_boundary::tool_policy::ResourceResolver { self.inner.resolver() }
+        fn check_handler_policy<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+            self.inner.check_handler_policy(call)
+        }
+        fn execute<'a>(&'a self, call: AuthorizedToolCall) -> PolicyFuture<'a, Value> { self.inner.execute(call) }
+    }
+    let complete = dispatcher.services.clone().unwrap();
+    let connectors: Vec<_> = duduclaw_mcp_boundary::tool_policy::POLICIES.iter()
+        .filter(|p| p.route == Route::Connector).collect();
+    assert!(connectors.len() > 28, "must cover providers beyond Google/Notion/GitHub");
+    for policy in connectors {
+        assert!(duduclaw_gateway::isolation_connectors::provider_for_tool(policy.name).is_some(), "{}", policy.name);
+        dispatcher.services = Some(Arc::new(WithoutOne { omitted: policy.name, inner: complete.clone() }));
+        assert!(dispatcher.require_complete_services().is_err(), "{}", policy.name);
+        assert_eq!(dispatcher.service_manifest().iter().find(|(n, _)| *n == policy.name).unwrap().1,
+            ServiceState::MissingFactory);
+    }
+}
+
+
+#[test]
+fn startup_readiness_checks_finite_adapter_coverage_for_the_actual_capability_mode() {
+    let home = tempfile::tempdir().unwrap();
+    let (dispatcher, scope) = fixture(home.path());
+    assert!(dispatcher.require_complete_services().is_ok());
+    assert!(dispatcher.require_context_services(&scope).is_ok());
+    for name in ["tasks_list", "activity_list", "tasks_update", "goals_list", "list_cron_tasks", "list_reminders", "responsibility_get", "db_query"] {
+        let mut record = scope.record().clone();
+        record.tools = List::new(vec![Text::new(name.into()).unwrap()]).unwrap();
+        record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee },
+            if name == "db_query" { ResourceGrant::DatabaseTable { database: Text::new("source".into()).unwrap(), table: Text::new("customers".into()).unwrap() } }
+            else { ResourceGrant::Task { id: Text::new("task-a".into()).unwrap() } }]).unwrap();
+        let context = live_context(record);
+        assert!(dispatcher.require_context_services(&context).is_ok(), "{name}");
+        assert!(duduclaw_mcp_boundary::server::Dispatcher::require_context_services(&dispatcher, &context).is_ok(), "trait admission for {name}");
+    }
 }

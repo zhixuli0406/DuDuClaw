@@ -6,7 +6,7 @@ use duduclaw_mcp_boundary::{bindings::BindingStore, tool_policy::{ResourceKind, 
     RequestContext, VerificationError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
-use crate::isolation_connectors::{ConnectorCatalog, SelectedConnector};
+use crate::isolation_connectors::{ConnectorCatalog, LiveConnectorSelectionPolicy, SelectedConnector};
 
 pub struct GatewayResourceResolver {
     home: PathBuf,
@@ -14,6 +14,7 @@ pub struct GatewayResourceResolver {
     agent: String,
     bindings: Arc<Mutex<BindingStore>>,
     connectors: Option<Arc<ConnectorCatalog>>,
+    connector_policy: Option<Arc<dyn LiveConnectorSelectionPolicy>>,
 }
 impl GatewayResourceResolver {
     pub fn new(home: PathBuf, employee: EmployeeId, agent: String,
@@ -22,16 +23,23 @@ impl GatewayResourceResolver {
             || agent == duduclaw_core::UNTRUSTED_AGENT_ID || !home.is_absolute() {
             return Err(VerificationError::Invalid);
         }
-        Ok(Self { home, employee, agent, bindings, connectors: None })
+        Ok(Self { home, employee, agent, bindings, connectors: None, connector_policy: None })
     }
     pub fn with_connector_catalog(mut self, catalog: Arc<ConnectorCatalog>) -> Self {
         self.connectors = Some(catalog); self
     }
+    pub fn with_connector_selection_policy(mut self, policy: Arc<dyn LiveConnectorSelectionPolicy>) -> Self {
+        self.connector_policy = Some(policy); self
+    }
+    pub fn connector_selection_ready(&self, tool: &str) -> bool {
+        self.connectors.is_some() && self.connector_policy.as_ref().is_some_and(|policy| policy.supports(tool))
+    }
     pub fn connector(&self, context: &RequestContext, tool: &str, arguments: &Value)
         -> Result<SelectedConnector, VerificationError> {
         self.identity(context)?;
-        SelectedConnector::select(context, tool, arguments, self.bindings.clone(),
-            self.connectors.clone().ok_or(VerificationError::Unavailable)?)
+        let policy = self.connector_policy.clone().ok_or(VerificationError::Unavailable)?;
+        SelectedConnector::select_with_policy(context, tool, arguments, self.bindings.clone(),
+            self.connectors.clone().ok_or(VerificationError::Unavailable)?, Some(policy))
     }
     fn identity(&self, context: &RequestContext) -> Result<(), VerificationError> {
         let record = context.record();
@@ -81,7 +89,12 @@ impl GatewayResourceResolver {
         let selector = match domain { "cron" | "reminder" => "id", "plan" => "plan_id",
             "responsibility" => "responsibility_id", _ => "task_id" };
         if domain != "task" {
-            if let Some(id) = string(args, selector)? { selected.push(format!("{domain}:{id}")); }
+            if let Some(id) = string(args, selector)? {
+                let id = if policy.name == "responsibility_get" { id.trim() } else { id };
+                if policy.name != "responsibility_get" || !id.is_empty() {
+                    selected.push(format!("{domain}:{id}"));
+                }
+            }
         }
         if policy.name == "plan_update_step" {
             let step = string(args, "step_id")?.ok_or(VerificationError::Invalid)?;
@@ -101,14 +114,14 @@ impl GatewayResourceResolver {
         }
         // Legacy defaults re-query the latest plan or all responsibilities.
         // A signed finite grant can only authorize an explicit immutable id.
-        if matches!(policy.name, "plan_get" | "responsibility_get")
+        if matches!(policy.name, "plan_get")
             && string(args, selector)?.is_none_or(str::is_empty) {
             return Err(VerificationError::Invalid);
         }
-        let collection = matches!(policy.name, "tasks_list" | "activity_list" | "list_cron_tasks" | "list_reminders");
+        let collection = matches!(policy.name, "tasks_list" | "activity_list" | "goals_list" | "list_cron_tasks" | "list_reminders" | "responsibility_get");
         let mut resources = Vec::new();
         if selected.is_empty() && !collection { return Err(VerificationError::Invalid); }
-        for grant in context.record().resources.as_slice() {
+        for grant in context.record().io_resources() {
             if let ResourceGrant::Task { id } = grant {
                 if (selected.is_empty() || selected.iter().any(|s| s == id.as_str())) && self.task_owned(policy.name, id.as_str())? {
                     resources.push(grant.clone());
@@ -182,6 +195,11 @@ impl ResourceResolver for GatewayResourceResolver {
         -> Result<Vec<ResourceGrant>, VerificationError> {
         self.identity(context)?;
         let object = args.as_object().ok_or(VerificationError::Invalid)?;
+        if context.record().employee_scope() && policy.route == duduclaw_mcp_boundary::tool_policy::Route::Connector {
+            let selected = self.connector(context, policy.name, args)?;
+            return Ok(vec![ResourceGrant::Employee { id: self.employee }, ResourceGrant::Connector {
+                account: text(selected.account().to_owned())?, binding: selected.binding().clone() }]);
+        }
         if let Some(value) = object.get("assigned_to") {
             let assigned = value.as_str().ok_or(VerificationError::Invalid)?;
             if assigned != self.agent && !(policy.name == "tasks_list" && assigned == "*") {
@@ -202,7 +220,7 @@ impl ResourceResolver for GatewayResourceResolver {
         if wants(ResourceKind::Connector) || object.contains_key("drive_file_id") {
             let selected = self.connector(context, policy.name, args)?;
             resources.push(ResourceGrant::Connector { account: text(selected.account().to_owned())?,
-                binding: context.record().employee_binding.clone() });
+                binding: selected.binding().clone() });
         }
         if wants(ResourceKind::DatabaseTable) {
             if let Some(table) = local_table(policy.name) {
@@ -210,7 +228,7 @@ impl ResourceResolver for GatewayResourceResolver {
             } else {
                 let source = string(args, "source")?;
                 let table = string(args, "table")?;
-                for grant in context.record().resources.as_slice() {
+                for grant in context.record().io_resources() {
                     if let ResourceGrant::DatabaseTable { database, table: allowed } = grant {
                         if source.is_none_or(|s| database.as_str() == s) && table.is_none_or(|t| allowed.as_str() == t) {
                             resources.push(grant.clone());
@@ -252,7 +270,7 @@ impl ResourceResolver for GatewayResourceResolver {
         let workspace = string(args, "workspace")?.or(string(args, "workspace_id")?);
         if wants(ResourceKind::Workspace) || workspace.is_some() || ["path", "file", "source_path", "scope_dir", "page_path", "output_path", "directory", "folder", "attachments"]
             .iter().any(|key| object.contains_key(*key) && !(policy.name == "wiki_read" && *key == "page_path")) {
-            for grant in context.record().resources.as_slice() {
+            for grant in context.record().io_resources() {
                 if let ResourceGrant::Workspace { handle } = grant {
                     if workspace.is_none_or(|w| w == handle.as_str()) { resources.push(grant.clone()); }
                 }

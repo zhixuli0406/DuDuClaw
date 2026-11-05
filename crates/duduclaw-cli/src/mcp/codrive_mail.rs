@@ -182,12 +182,14 @@ pub(crate) async fn handle_mail_list(args: &Value, home_dir: &Path, default_agen
         .unwrap_or(20);
 
     let home = home_dir.to_path_buf();
-    let result = tokio::task::spawn_blocking(move || {
-        duduclaw_gateway::mail::list_inbox(&home, Some(&target), include_archived, limit)
-    })
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let result = tokio::task::spawn_blocking(move || authority.run(|| {
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        Ok::<_, String>(duduclaw_gateway::mail::list_inbox(&home, Some(&target), include_archived, limit))
+    }))
     .await;
     match result {
-        Ok(items) => {
+        Ok(Ok(items)) => {
             // Bodies are deliberately NOT included in the list view: a listing
             // is navigation, and shipping every body would both blow the
             // context budget and splash untrusted text across a tool result
@@ -211,6 +213,7 @@ pub(crate) async fn handle_mail_list(args: &Value, home_dir: &Path, default_agen
                 .collect();
             tool_text(&serde_json::json!({ "count": rows.len(), "messages": rows }).to_string())
         }
+        Ok(Err(e)) => tool_error(&e),
         Err(e) => tool_error(&format!("mail_list join error: {e}")),
     }
 }
@@ -235,7 +238,9 @@ pub(crate) async fn handle_mail_read(args: &Value, home_dir: &Path, default_agen
 
     let home = home_dir.to_path_buf();
     let reader = default_agent.to_string();
-    let result = tokio::task::spawn_blocking(move || {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let result = tokio::task::spawn_blocking(move || authority.run(|| {
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
         let Some(item) = duduclaw_gateway::mail::get_inbox_item(&home, &mail_id) else {
             return Err(format!("找不到這封信：{mail_id}"));
         };
@@ -245,9 +250,9 @@ pub(crate) async fn handle_mail_read(args: &Value, home_dir: &Path, default_agen
         if !item.agent_id.is_empty() && item.agent_id != target {
             return Err("這封信不屬於你可以讀取的信箱。".to_string());
         }
-        duduclaw_gateway::mail::mark_read(&home, &mail_id, &reader);
+        duduclaw_gateway::mail::mark_read_checked(&home, &mail_id, &reader)?;
         Ok(item)
-    })
+    }))
     .await;
 
     match result {
@@ -342,8 +347,9 @@ pub(crate) async fn handle_mail_send(args: &Value, home_dir: &Path, default_agen
     let agent = default_agent.to_string();
     let approval_str = approval_id.as_str().to_string();
     let (to_c, subj_c, body_c, reply_c) = (to.clone(), subject.clone(), body, in_reply_to);
-    let mail_id = tokio::task::spawn_blocking(move || {
-        duduclaw_gateway::mail::record_outbox_draft(
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let mail_id = tokio::task::spawn_blocking(move || authority.run(|| {
+        duduclaw_gateway::mail::record_outbox_draft_checked(
             &home,
             &cfg,
             &agent,
@@ -353,10 +359,11 @@ pub(crate) async fn handle_mail_send(args: &Value, home_dir: &Path, default_agen
             &approval_str,
             reply_c.as_deref(),
         )
-    })
+    }))
     .await;
     let mail_id = match mail_id {
-        Ok(id) => id,
+        Ok(Ok(id)) => id,
+        Ok(Err(e)) => return tool_error(&format!("mail_send refused: {e}")),
         Err(e) => return tool_error(&format!("mail_send join error: {e}")),
     };
 

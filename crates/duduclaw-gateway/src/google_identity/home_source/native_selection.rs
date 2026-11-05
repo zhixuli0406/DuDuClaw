@@ -96,6 +96,16 @@ pub(crate) fn prepare_home_native_selection(
     home: &Path,
     tool: &str,
 ) -> Result<NativeHomeSelection> {
+    capture_home_native_selection(home, tool, true)
+}
+
+/// Read-only selection for isolation authorization/recheck. Initial metadata
+/// migration belongs to explicit gateway lifecycle/boot, never a candidate read.
+pub(crate) fn read_home_native_selection(home: &Path, tool: &str) -> Result<NativeHomeSelection> {
+    capture_home_native_selection(home, tool, false)
+}
+
+fn capture_home_native_selection(home: &Path, tool: &str, migrate: bool) -> Result<NativeHomeSelection> {
     if duduclaw_core::google_identity::native_google_scope(tool).is_none() {
         return Err(Error::Invalid);
     }
@@ -109,12 +119,12 @@ pub(crate) fn prepare_home_native_selection(
         let (receipt, purpose) = if tool == "google_status" {
             // Empty scopes are metadata-only here, never a material purpose.
             (
-                selection(g, source, &[], true)?,
+                selection(g, source, &[], migrate)?,
                 NativeHomePurpose::MetadataStatus,
             )
         } else {
             let scope = home_store::native_scope_witness(g, source, tool)?;
-            let receipt = selection(g, source, &[scope.as_str()], true)?;
+            let receipt = selection(g, source, &[scope.as_str()], migrate)?;
             (
                 receipt,
                 NativeHomePurpose::Http {

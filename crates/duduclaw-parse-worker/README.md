@@ -13,34 +13,58 @@ arbitrary systemd units.
 
 ## Installation (root, systemd 249 or newer)
 
-Install the binary at `/usr/libexec/duduclaw/duduclaw-parse-worker` (root:root,
-0755) and the socket/template under `systemd/` into `/etc/systemd/system/`
-(root:root, 0644). Before enabling the socket, create **both** dedicated roots:
+After verifying the release signature, install the manifest-pinned binary at
+`/usr/libexec/duduclaw/duduclaw-parse-worker` (root:root, 0755) and the supplied
+socket/template into `/etc/systemd/system/` (root:root, 0644). The protected Linux
+installer now invokes its embedded tree builder after authenticating the selected
+generation's recorded manifest under the updater lock. Missing trust/state,
+pending updates, or a worker that differs from the signed artifact refuse tree
+preparation. The managed reinstall path prepares a missing tree, verifies an
+existing one, then runs readiness without replacing signed service units.
+
+For standalone staging after release verification, the root installer must build
+a **new minimal runtime tree** before enabling the socket:
 
 ```sh
 install -d -o root -g root -m 0755 /usr/lib/duduclaw/parse-root
-install -d -o root -g root -m 0755 /usr/lib/duduclaw/parse-root-tree
+python3 crates/duduclaw-parse-worker/scripts/build-runtime-tree.py \
+  --worker-sha256 "$VERIFIED_MANIFEST_WORKER_SHA256"
 ```
 
-Both paths must be real directories with root-owned, non-writable ancestors.
-They must start empty and must never contain application data, configuration,
-user homes or sockets. On reuse, reject unexpected contents; do not recursively
-delete an existing directory. systemd may leave empty mountpoint directories in
-the tree (`.tmp`, `dev`, `lib`, `lib64`, `proc`, `run`, `sys`, `tmp`, `usr`,
-`var/tmp`) and base directories in the staging root. Do not copy `/etc`, `/var`, `/home` or `/root`
-into either directory. Then run `systemctl daemon-reload` and
-`systemctl enable --now duduclaw-parse.socket`. The root VM acceptance suite must
-be rerun after installing these inputs; this README is not a live acceptance
-receipt. An external installer must create these two directories as well as
-installing the units and executable; this crate does not implement that installer.
+`VERIFIED_MANIFEST_WORKER_SHA256` must come from the already-verified release
+manifest. The helper is an installation input; it does not authenticate releases
+or activate services. It requires root-owned, non-writable inputs/ancestors,
+checks the worker digest, resolves its ELF interpreter and exact dependency
+closure with the trusted loader's `--list` mode under a clean environment, and
+copies only those files. `/usr/bin/readelf` is required on the install host.
+Unresolved dependencies, unexpected loader output, unsupported interpreters,
+non-system library paths and an existing destination in standalone build mode are refused. Supported
+interpreters are the Linux x86_64 and aarch64 glibc loaders; static ELF is accepted.
+
+The tree has no host `/usr`, `/lib` or `/lib64` binds. It contains the fixed worker
+path and individual runtime library files; merged-/usr symlinks are resolved at
+installation and copies are placed at the required in-root paths. `/usr/local`
+and unrelated `/usr/lib/duduclaw` components remain hidden. Installer mode builds
+and fsyncs a private staging tree, verifies it, then atomically publishes over a
+missing or empty destination. A populated tree is reused only after a bounded
+inventory and content comparison against the verified worker and exact current
+library closure. Unknown entries, symlinks, hard links, changed files, unsafe
+ownership/modes and nested mounts refuse reuse; failed staging stays inactive.
+Readiness distinguishes this populated tree from the empty `parse-root` staging
+skeleton and revalidates it against signed state.
+
+Replacing an existing tree for a new worker or runtime library version still
+requires the signed generation coordinator to close admission, stop workers and
+publish a new checked tree. The installer deliberately refuses a mismatch and
+preserves the old tree. First bootstrap before recorded state exists, automatic
+update-time replacement, and root-VM startup/roundtrips remain integration and
+acceptance requirements.
 
 `parse-root` is the `RootDirectory` staging mountpoint. A nonrecursive read-only
-bind of `parse-root-tree` replaces its contents before the worker starts. This
-also hides the base directories that systemd 249 creates in a bare
-`RootDirectory`; `/var` is recreated only for the bounded `/var/tmp` mount. Nonrecursive `/usr`, `/lib` and optional `/lib64` binds
-provide the fixed executable and runtime libraries. systemd resolves bind source
-symlinks on the host, so merged-/usr distributions need no copied loader or
-installer-created `lib` symlinks. The tree's bind destinations are directories.
+bind of `parse-root-tree` replaces its contents before the worker starts, hiding
+base directories that systemd 249 creates in a bare `RootDirectory`. The staging
+root must be root-owned with non-writable ancestors. Only empty mountpoints may
+be added by systemd; never put configuration, user data, homes or sockets there.
 
 `DynamicUser` forces `ProtectSystem=strict` and `PrivateTmp` in systemd 249.
 Its read-only `/` rule overrides a tmpfs at `/`, and its private `/tmp` rule
@@ -53,8 +77,7 @@ mountpoint for the bounded `/var/tmp`, with no other entries. `/sys` remains a
 read-only sysfs projection forced by systemd kernel protections; all mounts
 below it must also be read-only. Every host-disk filesystem projection must be
 read-only. `InaccessiblePaths` cannot suppress these implicit `/var/tmp` and
-`/sys` mounts. Module paths under the separate `/lib` and `/lib64` projections are hidden too, preserving
-`ProtectKernelModules` across these aliases. `/run` is read-only and contains
+`/sys` mounts. Module paths are absent from the minimal runtime tree and remain explicitly hidden. `/run` is read-only and contains
 only systemd's empty `/run/systemd/incoming` mount-propagation endpoint; systemd
 249 requires this mount even for a private root. No host runtime sockets are
 projected. `/proc` retains the process visibility restrictions, and `/dev` uses
@@ -82,9 +105,18 @@ cannot be reset. This is not a protected-readiness check or a migration switch.
 Unsupported operations fail closed; legacy installations retain their old path.
 
 The named A/B lifecycle seam is `WorkerLauncher` / `WorkerSession`, installed once
-through `install_launcher`. The default fixed socket launcher has process-local
-admission and failure quarantine, but does not provide host-wide cancellation
-receipts. Output memfds are sealed before size and SHA-256 verification.
+through `install_launcher`. Protected gateway installation requires
+`supports_live_authority()`, and protected calls use `exchange_checked`; its
+default implementation refuses rather than invoking a legacy unchecked session.
+The fixed socket session rechecks the retained caller authority after poll and
+immediately before sending or receiving descriptors. Silent peers are polled in
+at most 50 ms intervals so revocation also ends blocked transport waits. Legacy
+unprotected calls retain their original exchange API.
+
+The default fixed socket launcher has process-local admission and failure
+quarantine, but does not provide host-wide cancellation receipts. Closing a
+revoked transport does not prove that systemd has retired the worker. Output
+memfds are sealed before size and SHA-256 verification.
 
 ## Development
 

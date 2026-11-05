@@ -151,6 +151,7 @@ impl ApprovalBroker {
     /// landed. Silent no-op for in-memory stores and for kinds that own their
     /// own notification ([`SELF_NOTIFYING_KINDS`]).
     pub(super) async fn push_new_request(&self, rec: &ApprovalRecord) {
+        if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return; }
         if SELF_NOTIFYING_KINDS.contains(&rec.action_kind.as_str()) {
             return;
         }
@@ -203,6 +204,7 @@ impl ApprovalBroker {
         // strictly better than a reminder storm.
         match self.store.claim_reminder(&rec.id, &now.to_rfc3339()).await {
             Ok(true) => {
+                if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return; }
                 // B5: an admin who already has the dashboard open in a
                 // browser tab gets routed straight to the inbox row at the
                 // exact instant the channel nudge fires below — no reason
@@ -438,7 +440,8 @@ impl ApprovalBroker {
                 // API. The once-only DB claim inside `maybe_remind` still
                 // guarantees a single send per approval.
                 let broker = self.clone();
-                tokio::spawn(async move { broker.maybe_remind(&rec, now).await });
+                let authority = duduclaw_mcp_boundary::io_authority::capture();
+                tokio::spawn(async move { authority.scope(broker.maybe_remind(&rec, now)).await });
             }
         }
         if expired > 0 {

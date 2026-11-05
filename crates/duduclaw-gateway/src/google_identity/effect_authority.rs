@@ -163,6 +163,7 @@ impl GoogleCallContext {
     }
 
     fn validate(&self) -> Result<(), Refusal> {
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|_| changed())?;
         let (home, dir, agent) = Self::canonical(&self.home, &self.agent_dir)?;
         if home != self.home || dir != self.agent_dir || agent != self.agent {
             return Err(changed());

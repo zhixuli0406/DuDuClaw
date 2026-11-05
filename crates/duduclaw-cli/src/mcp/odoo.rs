@@ -7,8 +7,34 @@ pub(crate) async fn handle_odoo_tool(
     odoo: &OdooState,
     caller_agent: &str,
 ) -> Value {
+    handle_odoo_tool_with_connector(tool, params, home_dir, odoo, caller_agent, None).await
+}
+
+/// Isolation supplies the already selected connector; no account resolution or
+/// pool lookup is allowed on this path. Business gates below remain shared.
+pub(crate) async fn handle_bound_odoo_tool(
+    tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState, caller_agent: &str,
+    connector: std::sync::Arc<duduclaw_odoo::OdooConnector>,
+) -> Value {
+    handle_odoo_tool_with_connector(tool, params, home_dir, odoo, caller_agent, Some(connector)).await
+}
+
+async fn handle_odoo_tool_with_connector(
+    tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState, caller_agent: &str,
+    bound: Option<std::sync::Arc<duduclaw_odoo::OdooConnector>>,
+) -> Value {
     use duduclaw_odoo::connector::OdooConnector;
     use duduclaw_odoo::models::{accounting, crm, inventory, sale};
+
+    if let Some(connector) = &bound {
+        if connector.verify_io().is_err() { return mcp_error("Odoo authority revoked"); }
+        if matches!(tool, "odoo_connect" | "odoo_status") {
+            let key = odoo.pool_key(caller_agent).await;
+            if connector.verify_io().is_err() { return mcp_error("Odoo authority revoked"); }
+            return tool_text(&odoo_connect_text(&connector.status(), &key.0, &key.1));
+        }
+    }
+
 
     // odoo_connect doesn't require an existing connection
     if tool == "odoo_connect" {
@@ -104,7 +130,7 @@ pub(crate) async fn handle_odoo_tool(
     // All other tools require an active per-agent connection. Use the
     // pool's cache fast-path; the decrypt closure is unreachable here
     // because cold-connect is owned by `handle_odoo_connect`.
-    let conn_arc = match odoo
+    let conn_arc = if let Some(connector) = bound { connector } else { match odoo
         .get_or_connect(caller_agent, |_: String| async {
             Err::<String, String>("Odoo connector not initialised — call odoo_connect first".into())
         })
@@ -116,7 +142,8 @@ pub(crate) async fn handle_odoo_tool(
                 "Odoo not connected for agent '{caller_agent}'. Call odoo_connect first."
             ));
         }
-    };
+    }};
+    if conn_arc.verify_io().is_err() { return mcp_error("Odoo authority revoked"); }
     let conn: &OdooConnector = conn_arc.as_ref();
     // ── per-call audit attribution (RFC-21 §2 acceptance) ────────────────
     // Surface caller_agent + profile + tool + params summary to
@@ -130,6 +157,7 @@ pub(crate) async fn handle_odoo_tool(
     let result: std::result::Result<String, String> = match tool {
         "odoo_schema_overview" => {
             let profile = conn.schema_profile(&_audit_profile);
+            if conn.verify_io().is_err() { return mcp_error("Odoo authority revoked"); }
             match duduclaw_odoo::schema::load_snapshot(home_dir, &profile) {
                 Ok(Some(snapshot)) if snapshot.connection_identity == conn.connection_identity() => {
                     let cfg = odoo.agent_override(caller_agent).await;

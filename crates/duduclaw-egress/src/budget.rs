@@ -2,6 +2,11 @@
 use std::time::Instant;
 use duduclaw_isolation::egress::{EgressError, EgressLimits};
 
+// One daemon-wide ceiling covers pending DNS/connect and established tunnels.
+// A separate configuration bound limits per-run bookkeeping reservations.
+pub const MAX_GLOBAL_TUNNELS: usize = 64;
+pub const MAX_CONFIGURED_TUNNELS: u32 = 1024;
+
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunCaps {

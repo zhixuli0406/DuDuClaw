@@ -2347,6 +2347,8 @@ dependencies = [
  "chrono",
  "csv",
  "duduclaw-core",
+ "duduclaw-isolation",
+ "duduclaw-mcp-boundary",
  "duduclaw-memory",
  "duduclaw-security",
  "fs2",

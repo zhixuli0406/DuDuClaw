@@ -374,11 +374,10 @@ impl ApprovalBroker {
             return Err("workflow operation policy changed".into());
         }
         let mut conn = self.store.conn.lock().await;
+        verify_live_io()?;
         self.attach_workflow_reader(&conn)?;
         self.attach_tasks(&conn, binding)?;
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+        let tx = begin_live_write(&mut conn)?;
         Self::check_granted_material(&tx, reference, step_key, payload, binding)?;
         Self::check_task(&tx, binding)?;
         let id = uuid::Uuid::new_v4().to_string();
@@ -443,7 +442,7 @@ impl ApprovalBroker {
         {
             return Err("step already has different effect authority or contract".into());
         }
-        tx.commit().map_err(|e| e.to_string())?;
+        commit_live_write(tx)?;
         Ok(existing.0)
     }
     /// Capture server-owned run authority; human approval never replaces this fence.

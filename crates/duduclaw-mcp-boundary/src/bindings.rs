@@ -257,6 +257,27 @@ impl BindingStore {
         Ok(())
     }
 
+    /// A trusted live product-selection adapter has explicitly selected the
+    /// installed shared home account. This does not select or discover accounts.
+    /// Personal credentials remain exclusive to their owner's Personal employee;
+    /// Shared employees cannot cross tenants. Callers must repeat product policy
+    /// checks immediately before invoking this method and every credential use.
+    pub fn authorize_product_home_connector(&self, employee: EmployeeId, binding: &EmployeeBinding,
+        principal: &Principal, account: &str, home_binding: &EmployeeBinding) -> Result<()> {
+        identifier(account)?;
+        let EmployeeBinding::Shared(home_tenant) = home_binding else { return Err(BindingError::Denied); };
+        if matches!(binding, EmployeeBinding::Shared(tenant) if tenant != home_tenant) {
+            return Err(BindingError::Denied);
+        }
+        let tx = self.connection.unchecked_transaction().map_err(|_| BindingError::Unavailable)?;
+        self.validate(employee, binding, principal)?;
+        let found = tx.query_row(
+            "SELECT 1 FROM iso_connectors WHERE account=?1 AND kind='shared' AND binding_id=?2 AND revoked=0",
+            params![account, home_tenant.as_str()], |_| Ok(())).optional().map_err(|_| BindingError::Unavailable)?;
+        if found.is_none() { return Err(BindingError::Denied); }
+        tx.commit().map_err(|_| BindingError::Unavailable)
+    }
+
     /// Caller still needs a matching ResourceGrant::Connector and existing tool
     /// policy gates. This check never hands out credential material by itself.
     pub fn authorize_connector(&self, employee: EmployeeId, binding: &EmployeeBinding,

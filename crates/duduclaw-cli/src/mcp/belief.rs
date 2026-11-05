@@ -44,10 +44,11 @@ pub(crate) async fn handle_belief_submit(args: &Value, home_dir: &Path, default_
         ref_value,
         source_goal_id: None,
     };
-    let result = tokio::task::spawn_blocking(move || {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let result = tokio::task::spawn_blocking(move || authority.run(|| {
         let db_path = home.join("prediction.db");
         duduclaw_gateway::prediction::belief::submit(&db_path, belief)
-    })
+    }))
     .await
     .unwrap_or_else(|e| Err(format!("belief_submit join error: {e}")));
     match result {
@@ -76,7 +77,8 @@ pub(crate) async fn handle_belief_settle(args: &Value, home_dir: &Path, default_
     };
     let home = home_dir.to_path_buf();
     let agent = default_agent.to_string();
-    let result = tokio::task::spawn_blocking(move || {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let result = tokio::task::spawn_blocking(move || authority.run(|| {
         let db_path = home.join("prediction.db");
         // No cross-check happens on this path: the MCP server process has no
         // TickHub access and no other verified-price source exists, so
@@ -91,7 +93,7 @@ pub(crate) async fn handle_belief_settle(args: &Value, home_dir: &Path, default_
             realized_value,
             None,
         )
-    })
+    }))
     .await
     .unwrap_or_else(|e| Err(format!("belief_settle join error: {e}")));
     match result {
@@ -119,10 +121,11 @@ pub(crate) async fn handle_belief_settle(args: &Value, home_dir: &Path, default_
 pub(crate) async fn handle_belief_stats(home_dir: &Path, default_agent: &str) -> Value {
     let home = home_dir.to_path_buf();
     let agent = default_agent.to_string();
-    let result = tokio::task::spawn_blocking(move || {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
+    let result = tokio::task::spawn_blocking(move || authority.run(|| {
         let db_path = home.join("prediction.db");
         duduclaw_gateway::prediction::belief::stats(&db_path, &agent)
-    })
+    }))
     .await;
     match result {
         Ok(stats) => {

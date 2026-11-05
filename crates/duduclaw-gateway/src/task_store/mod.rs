@@ -50,6 +50,8 @@ pub(crate) use discovery::DiscoveryDecisionReceipt;
 mod goals;
 mod iterations;
 mod isolation_queries;
+mod live_io;
+use live_io::{begin_live_write, commit_live_write, verify_live_io};
 mod plans;
 mod principal;
 mod pure;

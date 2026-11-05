@@ -247,6 +247,7 @@ impl CodeMap {
     /// Build the symbol map by walking `config.root` (gitignore-aware,
     /// skipping `.git`, `target`, `node_modules`, etc. via the `ignore` crate).
     pub fn build(config: &CodeMapConfig) -> Result<CodeMap> {
+        crate::isolation_io::verify()?;
         if !config.root.exists() {
             return Err(DuDuClawError::Memory(format!(
                 "code_map root does not exist: {}",
@@ -263,6 +264,7 @@ impl CodeMap {
             .build();
 
         for entry in walker.flatten() {
+            crate::isolation_io::verify()?;
             let path = entry.path();
             if !path.is_file() {
                 continue;
@@ -285,6 +287,7 @@ impl CodeMap {
             if meta.len() as usize > config.max_file_bytes {
                 continue;
             }
+            crate::isolation_io::verify()?;
             let source = match std::fs::read_to_string(path) {
                 Ok(s) => s,
                 Err(_) => continue, // binary / non-UTF8: skip

@@ -2,6 +2,7 @@
 //! Moved verbatim out of `task_store.rs`.
 
 use super::*;
+use duduclaw_mcp_boundary::io_authority::verify_before_io;
 
 /// Fields of an occurrence task nobody may change through `update_task`.
 pub(crate) const OCCURRENCE_FROZEN_FIELDS: [&str; 11] = [
@@ -199,8 +200,10 @@ impl TaskStore {
     }
 
     pub async fn insert_task(&self, row: &TaskRow) -> Result<(), String> {
-        let conn = self.conn.lock().await;
-        insert_task_tx(&conn, row)
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        insert_task_tx(&conn, row)?;
+        commit_live_write(conn)
     }
 
     /// Freeze this task's team spec, **once**.
@@ -217,7 +220,9 @@ impl TaskStore {
     /// There is deliberately **no** setter that overwrites an existing value.
     pub async fn freeze_team_spec(&self, id: &str, spec_json: &str) -> Result<bool, String> {
         require_safe_contract(spec_json)?;
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_before_io().map_err(|e| e.to_string())?;
         let n = conn
             .execute(
                 "UPDATE tasks SET team_spec_json = ?2, updated_at = ?3
@@ -225,6 +230,7 @@ impl TaskStore {
                 params![id, spec_json, Utc::now().to_rfc3339()],
             )
             .map_err(|e| format!("freeze team spec: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n == 1)
     }
 
@@ -247,13 +253,16 @@ impl TaskStore {
     /// `assigned_to` — only succeeds if the task is currently unassigned (`''`).
     /// Returns `true` if this caller won the claim, `false` if already assigned.
     pub async fn claim_task(&self, id: &str, agent_id: &str, now: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_before_io().map_err(|e| e.to_string())?;
         let n = conn
             .execute(
                 "UPDATE tasks SET assigned_to=?2, updated_at=?3 WHERE id=?1 AND assigned_to='' AND kind IN ('task','goal')",
                 params![id, agent_id, now],
             )
             .map_err(|e| format!("claim task: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n > 0)
     }
 
@@ -272,7 +281,9 @@ impl TaskStore {
         to_agent: &str,
         now: &str,
     ) -> Result<u64, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_before_io().map_err(|e| e.to_string())?;
         let n = conn
             .execute(
                 "UPDATE tasks
@@ -285,6 +296,7 @@ impl TaskStore {
                 params![from_agent, to_agent, now],
             )
             .map_err(|e| format!("reassign open tasks: {e}"))?;
+        commit_live_write(conn)?;
         Ok(n as u64)
     }
 
@@ -351,6 +363,7 @@ impl TaskStore {
         // Scoped block ensures all non-Send refs are dropped before the next await.
         {
             let mut conn = self.conn.lock().await;
+            verify_before_io().map_err(|e| e.to_string())?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| format!("update task: begin: {e}"))?;
@@ -498,8 +511,10 @@ impl TaskStore {
                 .iter()
                 .map(|s| s as &dyn rusqlite::types::ToSql)
                 .collect();
+            verify_before_io().map_err(|e| e.to_string())?;
             tx.execute(&sql, params_ref.as_slice())
                 .map_err(|e| format!("update task: {e}"))?;
+            verify_before_io().map_err(|e| e.to_string())?;
             tx.commit()
                 .map_err(|e| format!("update task: commit: {e}"))?;
         }
@@ -519,12 +534,15 @@ impl TaskStore {
         id: &str,
         state_json: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_before_io().map_err(|e| e.to_string())?;
         conn.execute(
             "UPDATE tasks SET goal_state_json = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, state_json.map(mask_derived_text), Utc::now().to_rfc3339()],
         )
         .map_err(|e| format!("set goal_state_json: {e}"))?;
+        commit_live_write(conn)?;
         Ok(())
     }
 
@@ -560,7 +578,8 @@ impl TaskStore {
         id: &str,
         f: impl FnOnce(&mut serde_json::Value),
     ) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
         let current: Option<String> = conn
             .query_row(
                 "SELECT goal_state_json FROM tasks WHERE id = ?1",
@@ -581,11 +600,13 @@ impl TaskStore {
         duduclaw_security::credential_detect::mask_json(&mut value);
         let new_json = serde_json::to_string(&value)
             .map_err(|e| format!("merge_goal_state_json serialize: {e}"))?;
+        verify_before_io().map_err(|e| e.to_string())?;
         conn.execute(
             "UPDATE tasks SET goal_state_json = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, new_json, Utc::now().to_rfc3339()],
         )
         .map_err(|e| format!("merge_goal_state_json write: {e}"))?;
+        commit_live_write(conn)?;
         Ok(())
     }
 
@@ -594,7 +615,9 @@ impl TaskStore {
     /// (same rule as [`Self::update_task`]); the kind check and the delete are
     /// one statement, so no concurrent writer can slip a discovery row through.
     pub async fn remove_task(&self, id: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_before_io().map_err(|e| e.to_string())?;
         let count = conn
             .execute(
                 "DELETE FROM tasks WHERE id = ?1 AND kind <> 'discovery'",
@@ -612,6 +635,7 @@ impl TaskStore {
                 return Err("discovery tasks require the dedicated lifecycle service".into());
             }
         }
+        commit_live_write(conn)?;
         Ok(count > 0)
     }
 
@@ -762,6 +786,7 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
     } else {
         row.kind
     };
+    verify_before_io().map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO tasks
             (id, title, description, status, priority, assigned_to, created_by,

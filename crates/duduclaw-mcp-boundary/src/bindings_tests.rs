@@ -129,3 +129,24 @@ fn binding_checked_authority_observes_durable_revocation() {
     bindings.lock().unwrap().revoke_principal(&human("alice", 1)).unwrap();
     assert!(authority.snapshot(employee, run).is_err());
 }
+
+#[test]
+fn product_home_selection_preserves_personal_ownership_and_shared_tenant_boundaries() {
+    let mut store = fixture();
+    let personal_employee = EmployeeId([1; 16]);
+    store.register_connector("company-home", &shared("company")).unwrap();
+    store.register_connector("bob-private", &personal("bob")).unwrap();
+    assert!(store.authorize_product_home_connector(personal_employee, &personal("alice"),
+        &human("alice", 1), "company-home", &shared("company")).is_ok());
+    assert!(store.authorize_product_home_connector(personal_employee, &personal("alice"),
+        &human("alice", 1), "bob-private", &personal("bob")).is_err());
+    let principal = Principal::Background { tenant_id: Text::new("other".into()).unwrap(), generation: 1 };
+    store.register_principal(&principal).unwrap();
+    let shared_employee = EmployeeId([2; 16]);
+    store.create_employee(shared_employee, &shared("other")).unwrap();
+    assert!(store.authorize_product_home_connector(shared_employee, &shared("other"),
+        &principal, "company-home", &shared("company")).is_err());
+    store.revoke_connector("company-home").unwrap();
+    assert!(store.authorize_product_home_connector(personal_employee, &personal("alice"),
+        &human("alice", 1), "company-home", &shared("company")).is_err());
+}

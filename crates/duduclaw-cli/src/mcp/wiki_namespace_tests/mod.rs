@@ -95,6 +95,7 @@ fn make_minimal_agent(home: &std::path::Path, name: &str) {
 }
 
 mod part1;
+mod isolation_io;
 mod part2;
 mod part3;
 mod part4;

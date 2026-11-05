@@ -1,7 +1,7 @@
 //! One host-bound connection. Dropping this future aborts every owned tunnel.
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 use duduclaw_isolation::{bounded::List, egress::*, ids::RunId};
-use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt}, net::TcpStream, sync::{mpsc, watch}, task::{AbortHandle, JoinSet}};
+use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt}, net::TcpStream, sync::{mpsc, watch, Semaphore, OwnedSemaphorePermit}, task::{AbortHandle, JoinSet}};
 use crate::{budget::{RunBudget, RunCaps}, policy::{Host, authorize_answers, normalize_host}, resolver::Resolver, transport::CheckedSocket};
 
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R, limits: &EgressLimits) -> Result<EgressMessage, EgressError> {
@@ -74,17 +74,25 @@ pub async fn serve_run(socket: CheckedSocket, run: RunId, profile: EgressProfile
 }
 
 pub async fn serve_run_cancel(socket: CheckedSocket, run: RunId, profile: EgressProfile, caps: RunCaps, resolver: Arc<dyn Resolver>, cancel: watch::Receiver<bool>) -> AuditRecord {
+    // Standalone callers share the same process-wide ceiling too. The host
+    // daemon passes its own authority-owned pool through serve_run_limited.
+    static GLOBAL: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+    let global = GLOBAL.get_or_init(|| Arc::new(Semaphore::new(crate::budget::MAX_GLOBAL_TUNNELS))).clone();
+    serve_run_limited(socket, run, profile, caps, resolver, cancel, global).await
+}
+
+pub async fn serve_run_limited(socket: CheckedSocket, run: RunId, profile: EgressProfile, caps: RunCaps, resolver: Arc<dyn Resolver>, cancel: watch::Receiver<bool>, global: Arc<Semaphore>) -> AuditRecord {
     let mut budget = match RunBudget::new(&profile.limits, caps, Instant::now()) {
         Ok(b) => b,
         Err(code) => return AuditRecord { run_id: run, profile_id: profile.id, bytes: 0, connection_attempts: 0, terminal_code: code },
     };
-    let result = run_loop(socket, &profile, resolver, &mut budget, cancel).await;
+    let result = run_loop(socket, &profile, resolver, &mut budget, cancel, global).await;
     let (bytes, connection_attempts) = budget.totals();
     AuditRecord { run_id: run, profile_id: profile.id, bytes, connection_attempts,
         terminal_code: result.err().unwrap_or(EgressError::Unavailable) }
 }
 
-async fn run_loop(socket: CheckedSocket, profile: &EgressProfile, resolver: Arc<dyn Resolver>, budget: &mut RunBudget, mut cancel: watch::Receiver<bool>) -> Result<(), EgressError> {
+async fn run_loop(socket: CheckedSocket, profile: &EgressProfile, resolver: Arc<dyn Resolver>, budget: &mut RunBudget, mut cancel: watch::Receiver<bool>, global: Arc<Semaphore>) -> Result<(), EgressError> {
     let (mut reader, mut writer) = tokio::io::split(socket);
     let (events, mut incoming) = mpsc::channel(16);
     let mut tasks = JoinSet::new();
@@ -122,11 +130,24 @@ async fn run_loop(socket: CheckedSocket, profile: &EgressProfile, resolver: Arc<
                     if highest.is_some_and(|id| tunnel_id.0 <= id) { return Err(EgressError::InvalidRequest); }
                     highest = Some(tunnel_id.0);
                     budget.open()?;
+                    // Acquire before allocating/spawning the DNS/connect future.
+                    // Refuse immediately instead of making an unbounded waiter queue.
+                    let permit = match global.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            budget.close();
+                            closed.insert(tunnel_id.0, false);
+                            tokio::time::timeout(timeout, write_frame(&mut writer,
+                                EgressMessage::Refused { tunnel_id, code: EgressError::ResourceLimit },
+                                &profile.limits)).await.map_err(|_| EgressError::Timeout)??;
+                            continue;
+                        }
+                    };
                     let (tx, rx) = mpsc::channel(4);
                     let events = events.clone();
                     let resolver = resolver.clone();
                     let profile = profile.clone();
-                    let task = tasks.spawn(async move { tunnel(tunnel_id, target, profile, resolver, rx, events).await; });
+                    let task = tasks.spawn(async move { tunnel(tunnel_id, target, profile, resolver, rx, events, permit).await; });
                     tunnels.insert(tunnel_id.0, Tunnel { input: tx, task, connected: false });
                 }
                 EgressMessage::Data { tunnel_id, bytes } => {
@@ -173,7 +194,7 @@ async fn run_loop(socket: CheckedSocket, profile: &EgressProfile, resolver: Arc<
     result
 }
 
-async fn tunnel(id: TunnelId, target: ConnectTarget, profile: EgressProfile, resolver: Arc<dyn Resolver>, mut input: mpsc::Receiver<Vec<u8>>, events: mpsc::Sender<Event>) {
+async fn tunnel(id: TunnelId, target: ConnectTarget, profile: EgressProfile, resolver: Arc<dyn Resolver>, mut input: mpsc::Receiver<Vec<u8>>, events: mpsc::Sender<Event>, _permit: OwnedSemaphorePermit) {
     let mut socket = match connect(resolver.as_ref(), &target, &profile).await {
         Ok(s) => s,
         Err(code) => { let _ = events.send(Event::Output(EgressMessage::Refused { tunnel_id: id, code })).await; return; }

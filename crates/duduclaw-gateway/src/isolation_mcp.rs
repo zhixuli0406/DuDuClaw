@@ -55,8 +55,11 @@ mod linux {
         pub fn attach(&self, capability: CapabilityId, reservation: &Reservation,
             delivery: duduclaw_mcp_boundary::socket::McpDelivery, dispatcher: Arc<dyn Dispatcher>)
             -> Result<McpRunSession, VerificationError> {
+            dispatcher.require_complete_services()?;
             let connection = self.boundary.activate(capability, reservation, delivery,
                 duduclaw_mcp_boundary::authority::now_seconds()?)?;
+            let context = connection.context(duduclaw_mcp_boundary::authority::now_seconds()?)?;
+            dispatcher.require_context_services(&context)?;
             let task = tokio::spawn(async move {
                 duduclaw_mcp_boundary::server::serve(connection, dispatcher.as_ref()).await
             });

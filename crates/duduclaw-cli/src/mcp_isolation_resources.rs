@@ -84,7 +84,8 @@ fn check_live_wiki_trust(home: &std::path::Path, agent: &str, page: &str) -> Res
 impl crate::mcp_isolation::ResourceToolService for GatewayResourceToolService {
     fn supports(&self, tool: &str) -> bool {
         if crate::mcp_isolation_disposition::intentional_refusal(tool).is_some() { return false; }
-        tool == "wiki_read" || self.connectors.as_ref().is_some_and(|executor| executor.supports(tool)
+        crate::mcp_isolation::legacy_resource_handler(tool) || self.connectors.as_ref().is_some_and(|executor| executor.supports(tool)
+            && self.resolver.connector_selection_ready(tool)
             && duduclaw_gateway::isolation_connectors::provider_for_tool(tool).is_some())
     }
     fn resolver(&self) -> &dyn ResourceResolver { self.resolver.as_ref() }
@@ -92,7 +93,7 @@ impl crate::mcp_isolation::ResourceToolService for GatewayResourceToolService {
         -> Pin<Box<dyn Future<Output = Result<(), VerificationError>> + Send + 'a>> {
         Box::pin(async move {
             if !self.supports(call.name()) { return Err(VerificationError::Unavailable); }
-            if call.name() != "wiki_read" {
+            if duduclaw_gateway::isolation_connectors::provider_for_tool(call.name()).is_some() {
                 self.resolver.connector(call.context(), call.name(), call.arguments())?.recheck()?;
             }
             Ok(())
@@ -105,7 +106,7 @@ impl crate::mcp_isolation::ResourceToolService for GatewayResourceToolService {
             let executor = self.connectors.as_ref().filter(|e| e.supports(call.name()))
                 .ok_or(VerificationError::Unavailable)?;
             let selected = self.resolver.connector(call.context(), call.name(), call.arguments())?;
-            selected.recheck()?;
+            selected.verify_call(&call)?;
             executor.execute(selected, call).await
         })
     }

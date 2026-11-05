@@ -1,6 +1,8 @@
-use std::{fs::File, io::Read, sync::Arc};
+use std::{io::Read, sync::Arc};
+#[cfg(test)]
+use std::fs::File;
 use duduclaw_mcp_boundary::{VerificationError, factories::GatewayTableParser,
-    parsing::{FileParser, TableKind, TableOptions}, tool_policy::ResourceResolver,
+    parsing::{FileParser, TableKind, TableOptions}, resources::AuthorizedFile, tool_policy::ResourceResolver,
     worker_execution::{WorkerPlan, WorkerReply, WorkerInvoke, WorkerToolBridge, WorkerPlanFactory}};
 use duduclaw_parse_worker::{client::{self, WorkerLauncher}, worker::{self, ParseRequest, ParseResponse,
     ParseOperation, ParseOptions, ParseResult, ParsedItem, TableCell}};
@@ -30,6 +32,7 @@ impl InstalledWorkerServices {
 /// operations. A missing per-tool factory entry remains absent from tools/list.
 pub fn install_worker_services(launcher: Box<dyn WorkerLauncher>)
     -> Result<InstalledWorkerServices, VerificationError> {
+    if !launcher.supports_live_authority() { return Err(VerificationError::Unavailable); }
     client::install_launcher(launcher).map_err(|_| VerificationError::Unavailable)?;
     client::require_isolation();
     Ok(InstalledWorkerServices {
@@ -39,16 +42,21 @@ pub fn install_worker_services(launcher: Box<dyn WorkerLauncher>)
 }
 
 fn invoke_operation(plan: WorkerPlan) -> Result<WorkerReply, VerificationError> {
-    duduclaw_parse_worker::policy::validate(&plan.request).map_err(|_| VerificationError::Invalid)?;
-    if plan.request.inputs.as_slice().len() != 1 { return Err(VerificationError::Invalid); }
-    let mut input = LimitedInput { file: plan.input,
-        remaining: plan.request.inputs.as_slice()[0].size_bytes.try_into().map_err(|_| VerificationError::Invalid)? };
-    let (response, outputs) = client::invoke_output_reader(&plan.request, &mut input)
+    let (request, file) = plan.into_parts()?;
+    invoke_authorized_input(request, file)
+}
+
+fn invoke_authorized_input(request: ParseRequest, file: AuthorizedFile) -> Result<WorkerReply, VerificationError> {
+    duduclaw_parse_worker::policy::validate(&request).map_err(|_| VerificationError::Invalid)?;
+    if request.inputs.as_slice().len() != 1 { return Err(VerificationError::Invalid); }
+    let mut input = LimitedInput { file,
+        remaining: request.inputs.as_slice()[0].size_bytes.try_into().map_err(|_| VerificationError::Invalid)? };
+    let (response, outputs) = client::invoke_output_reader_checked(&request, &mut input, verify_input)
         .map_err(|_| VerificationError::Unavailable)?;
     Ok(WorkerReply { response, outputs })
 }
 
-fn invoke_table(mut request: ParseRequest, file: File, options: TableOptions)
+fn invoke_table(mut request: ParseRequest, file: AuthorizedFile, options: TableOptions)
     -> Result<Value, VerificationError> {
     options.validate()?;
     request.operation = ParseOperation::ReadTable;
@@ -66,16 +74,20 @@ fn invoke_table(mut request: ParseRequest, file: File, options: TableOptions)
     // sealed snapshot and exchanging it with its injected WorkerSession.
     let cap = match options.kind { TableKind::Csv => 64 * 1024 * 1024, TableKind::Spreadsheet => 32 * 1024 * 1024 };
     let mut input = LimitedInput { file, remaining: cap };
-    let (response, outputs) = client::invoke_output_reader(&request, &mut input)
+    let (response, outputs) = client::invoke_output_reader_checked(&request, &mut input, verify_input)
         .map_err(|_| VerificationError::Unavailable)?;
     if !outputs.is_empty() { return Err(VerificationError::Invalid); }
     table_value(&request, &options, response)
 }
 
+fn verify_input(input: &LimitedInput<AuthorizedFile>) -> Result<(), worker::ParseError> {
+    input.file.verify_live().map_err(|_| worker::ParseError::Unavailable)
+}
+
 /// Stop growth between metadata authorization and E's snapshot. A limit hit is
 /// an error, never EOF/truncation that could be mistaken for a complete table.
-struct LimitedInput { file: File, remaining: usize }
-impl Read for LimitedInput {
+struct LimitedInput<R> { file: R, remaining: usize }
+impl<R: Read> Read for LimitedInput<R> {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
         if output.is_empty() { return Ok(0); }
         if self.remaining == 0 {

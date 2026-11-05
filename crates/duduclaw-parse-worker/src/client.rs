@@ -67,6 +67,10 @@ pub fn invoke(request: &ParseRequest, files: Vec<File>) -> Result<ParseResponse,
 /// on transport failure; it does not claim a synchronous cancellation receipt.
 /// No local parser fallback is permitted.
 pub trait WorkerLauncher: Send + Sync {
+    /// Protected startup must refuse launchers whose sessions cannot recheck
+    /// authority at the final transport I/O and while waiting for a response.
+    fn supports_live_authority(&self) -> bool { false }
+
     /// Reader adapters learn the exact length while snapshotting. Reserve the
     /// supplied ceiling before returning; do not account only the initial
     /// request size (which may be zero). exchange preserves id/options and
@@ -77,6 +81,12 @@ pub trait WorkerLauncher: Send + Sync {
 
 pub trait WorkerSession: Send {
     fn exchange(&mut self, request: &ParseRequest, files: &[File]) -> Result<ParseResponse, ParseError>;
+    /// Never fall back to an unchecked exchange for an isolated invocation.
+    /// Implementors call verify after blocking waits and just before each I/O.
+    fn exchange_checked(&mut self, _request: &ParseRequest, _files: &[File],
+        _verify: &dyn Fn() -> Result<(), ParseError>) -> Result<ParseResponse, ParseError> {
+        Err(ParseError::Unavailable)
+    }
 }
 
 static LAUNCHER: std::sync::OnceLock<Box<dyn WorkerLauncher>> = std::sync::OnceLock::new();
@@ -90,6 +100,8 @@ pub fn install_launcher(launcher: Box<dyn WorkerLauncher>) -> Result<(), ParseEr
 pub struct SocketActivatedLauncher;
 
 impl WorkerLauncher for SocketActivatedLauncher {
+    fn supports_live_authority(&self) -> bool { true }
+
     fn launch(&self, request: &ParseRequest, _input_reservation_bytes: u64)
         -> Result<Box<dyn WorkerSession>, ParseError> {
         crate::policy::validate(request)?;
@@ -131,10 +143,15 @@ impl Drop for SocketSession {
 #[cfg(target_os = "linux")]
 impl WorkerSession for SocketSession {
     fn exchange(&mut self, request: &ParseRequest, files: &[File]) -> Result<ParseResponse, ParseError> {
+        self.exchange_checked(request, files, &|| Ok(()))
+    }
+    fn exchange_checked(&mut self, request: &ParseRequest, files: &[File],
+        verify: &dyn Fn() -> Result<(), ParseError>) -> Result<ParseResponse, ParseError> {
         use crate::transport;
         let payload = serde_json::to_vec(request).map_err(|_| ParseError::InvalidContent)?;
-        transport::send(&self.fd, &payload, files, self.deadline)?;
-        let (payload, returned) = transport::receive(&self.fd, 0, self.deadline)?;
+        transport::send_checked(&self.fd, &payload, files, self.deadline, verify)?;
+        let (payload, returned) = transport::receive_checked(&self.fd, 0, self.deadline, verify)?;
+        verify()?;
         if !returned.is_empty() { return Err(ParseError::InvalidContent); }
         let response = ParseResponse::decode_payload(&payload, request).map_err(|_| ParseError::InvalidContent)?;
         self.received_response = true;
@@ -159,13 +176,22 @@ fn launch_with(launcher: &dyn WorkerLauncher, request: &ParseRequest)
 fn exchange(session: &mut dyn WorkerSession, request: &ParseRequest, files: Vec<File>)
     -> Result<(ParseResponse, Vec<File>), ParseError>
 {
+    exchange_inner(session, request, files, None)
+}
+
+fn exchange_inner(session: &mut dyn WorkerSession, request: &ParseRequest, files: Vec<File>,
+    verify: Option<&dyn Fn() -> Result<(), ParseError>>) -> Result<(ParseResponse, Vec<File>), ParseError>
+{
     #[cfg(target_os = "linux")]
     let files = {
         let mut files = files;
         crate::transport::validate_inputs(request, &mut files)?;
         files
     };
-    let response = session.exchange(request, &files)?;
+    let response = match verify {
+        Some(verify) => { verify()?; session.exchange_checked(request, &files, verify)? },
+        None => session.exchange(request, &files)?,
+    };
     // A custom launcher remains a transport, not a trusted result producer.
     let encoded = crate::response::encode(&response, request)?;
     let response = ParseResponse::decode_payload(&encoded, request).map_err(|_| ParseError::InvalidContent)?;
@@ -194,25 +220,49 @@ pub(crate) fn invoke_reader(request: &ParseRequest, reader: &mut impl std::io::R
 pub fn invoke_output_reader(request: &ParseRequest, reader: &mut impl std::io::Read)
     -> Result<(ParseResponse, Vec<Vec<u8>>), ParseError>
 {
+    invoke_output_reader_inner(request, reader, |_| Ok(()), false)
+}
+
+/// The gateway supplies its retained live authority, including for a job queued
+/// on a blocking pool. Never rely on a check made before launch admission or
+/// before snapshotting: either stage can wait while the caller is revoked.
+pub fn invoke_output_reader_checked<R: std::io::Read>(request: &ParseRequest, reader: &mut R,
+    verify: impl Fn(&R) -> Result<(), ParseError>) -> Result<(ParseResponse, Vec<Vec<u8>>), ParseError>
+{
+    invoke_output_reader_inner(request, reader, verify, true)
+}
+
+fn invoke_output_reader_inner<R: std::io::Read>(request: &ParseRequest, reader: &mut R,
+    verify: impl Fn(&R) -> Result<(), ParseError>, guarded: bool) -> Result<(ParseResponse, Vec<Vec<u8>>), ParseError>
+{
+    verify(reader)?;
+    if guarded && !LAUNCHER.get().map_or_else(|| SocketActivatedLauncher.supports_live_authority(),
+        |launcher| launcher.supports_live_authority()) { return Err(ParseError::Unavailable); }
     let _admission = Admission::acquire()?;
+    verify(reader)?;
     let session = launch(request)?;
+    verify(reader)?;
     #[cfg(target_os = "linux")]
     {
         let mut session = session;
         use crate::transport;
         if request.inputs.as_slice().len() != 1 { return Err(ParseError::InvalidContent); }
-        let snapshot = transport::snapshot(reader)?;
+        let snapshot = transport::snapshot(&mut *reader)?;
         let mut request = request.clone();
         let mut input = request.inputs.as_slice()[0].clone();
         input.size_bytes = snapshot.metadata().map_err(|_| ParseError::InvalidContent)?.len();
         request.inputs = List::new(vec![input]).map_err(|_| ParseError::InvalidContent)?;
         let mut files = vec![snapshot];
         for _ in request.outputs.as_slice() { files.push(transport::output_file()?); }
-        let (response, files) = exchange(&mut *session, &request, files)?;
+        verify(reader)?;
+        let live = || verify(&*reader);
+        let verifier: Option<&dyn Fn() -> Result<(), ParseError>> = if guarded { Some(&live) } else { None };
+        let (response, files) = exchange_inner(&mut *session, &request, files, verifier)?;
         // The worker closes all writable fds before sending its response. Sealing
         // fails closed if any writer retained a writable mapping. From this point
         // onward the checksum and bytes cannot change under the gateway.
         let outputs = transport::verified_outputs(&request, &response, files)?;
+        verify(reader)?;
         Ok((response, outputs))
     }
     #[cfg(not(target_os = "linux"))]
@@ -328,6 +378,31 @@ mod tests {
         let request = request(ParseOperation::ExtractDocument, ContentFormat::Text, 0);
         assert!(launch_with(&Recorder(recorded.clone()), &request).is_err());
         assert_eq!(recorded.load(Ordering::SeqCst), crate::policy::MAX_FILE_BYTES);
+    }
+
+    #[test]
+    fn checked_session_never_falls_back_to_legacy_exchange() {
+        struct Legacy;
+        impl WorkerSession for Legacy {
+            fn exchange(&mut self, _: &ParseRequest, _: &[File]) -> Result<ParseResponse, ParseError> {
+                panic!("unchecked transport reached by protected call")
+            }
+        }
+        let request = request(ParseOperation::ExtractDocument, ContentFormat::Text, 0);
+        assert_eq!(Legacy.exchange_checked(&request, &[], &|| Ok(())), Err(ParseError::Unavailable));
+    }
+
+    #[test]
+    fn revoked_reader_is_refused_before_admission_or_reading() {
+        struct Unreadable;
+        impl std::io::Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("revoked input was read")
+            }
+        }
+        let request = request(ParseOperation::ExtractDocument, ContentFormat::Text, 0);
+        assert_eq!(invoke_output_reader_checked(&request, &mut Unreadable,
+            |_| Err(ParseError::Unavailable)), Err(ParseError::Unavailable));
     }
 
 }

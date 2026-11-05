@@ -214,3 +214,92 @@ fn wiki_page_uses_wiki_grant_and_still_rejects_path_escape() {
         assert!(authorize(&ctx, "wiki_read", &json!({"page_path":path}), &Fixed(resources.clone())).is_err());
     }
 }
+
+#[test]
+fn explicit_task_grants_refuse_other_task_before_handler() {
+    let resources = vec![employee(), ResourceGrant::Task { id: text("task-a") }];
+    let ctx = context("tasks_update", resources.clone());
+    let mut handler_calls = 0;
+    for (task, allowed) in [("task-b", false), ("task-a", true)] {
+        let resolved = vec![employee(), ResourceGrant::Task { id: text(task) }];
+        let result = authorize(&ctx, "tasks_update", &json!({"task_id":task}), &Fixed(resolved));
+        assert_eq!(result.is_ok(), allowed);
+        if result.is_ok() { handler_calls += 1; }
+    }
+    assert_eq!(handler_calls, 1);
+}
+
+struct UnusedResolver;
+impl ResourceResolver for UnusedResolver {
+    fn resolve(&self, _: &RequestContext, _: &ToolPolicy, _: &Value) -> Result<Vec<ResourceGrant>, VerificationError> {
+        panic!("employee-scope service uses the live legacy handler policy")
+    }
+}
+#[test]
+fn employee_scope_retains_verified_identity_and_live_service_authority() {
+    let ctx = context("tasks_update", vec![ResourceGrant::EmployeeScope { id: EmployeeId([2;16]) }]);
+    let call = authorize(&ctx, "tasks_update", &json!({"task_id":"task-b"}), &UnusedResolver).unwrap();
+    assert!(call.employee_scope());
+    assert_eq!(call.context().record().employee, ctx.record().employee);
+    assert_eq!(call.arguments()["task_id"], "task-b");
+    for key in ["principal", "root", "cwd", "employee_id", "run_id"] {
+        assert!(authorize(&ctx, "tasks_update", &json!({key:"forged"}), &UnusedResolver).is_err());
+    }
+    assert!(!eligible(&ctx, "agent_remove"));
+}
+#[test]
+fn employee_scope_does_not_grant_files_workers_or_execution() {
+    for tool in ["file_read", "execute_program", "skill_hub_install"] {
+        let ctx = context(tool, vec![ResourceGrant::EmployeeScope { id: EmployeeId([2;16]) }]);
+        assert!(!eligible(&ctx, tool));
+    }
+}
+#[test]
+fn employee_scope_connectors_still_require_selected_account() {
+    let ctx = context("google_status", vec![ResourceGrant::EmployeeScope { id: EmployeeId([2;16]) }]);
+    assert!(authorize(&ctx, "google_status", &json!({}), &Fixed(vec![employee()])).is_err());
+    let selected = vec![employee(), ResourceGrant::Connector { account: text("personal"),
+        binding: EmployeeBinding::Personal(text("owner")) }];
+    assert!(authorize(&ctx, "google_status", &json!({}), &Fixed(selected)).is_ok());
+}
+
+#[test]
+fn employee_scope_keeps_explicit_file_and_worker_confinement() {
+    let scope = ResourceGrant::EmployeeScope { id: EmployeeId([2;16]) };
+    let workspace = ResourceGrant::Workspace { handle: text("work") };
+    let origin = ResourceGrant::UrlOrigin { origin: text("https://example.com") };
+    let ctx = context("file_read", vec![scope.clone(), workspace.clone()]);
+    assert!(authorize(&ctx, "file_read", &json!({"workspace":"work","path":"note.txt"}),
+        &Fixed(vec![workspace])).is_ok());
+    let ctx = context("web_extract", vec![scope, employee(), origin.clone()]);
+    assert!(authorize(&ctx, "web_extract", &json!({"url":"https://example.com/page"}),
+        &Fixed(vec![employee(), origin.clone()])).is_ok());
+    assert!(authorize(&ctx, "web_extract", &json!({"url":"https://other.example/page"}),
+        &Fixed(vec![employee(), origin])).is_err());
+}
+#[test]
+fn employee_scope_database_calls_keep_selected_account_and_live_table_policy() {
+    let ctx = context("db_select", vec![ResourceGrant::EmployeeScope { id: EmployeeId([2;16]) }]);
+    let selected = vec![employee(), ResourceGrant::Connector { account: text("database"),
+        binding: EmployeeBinding::Personal(text("owner")) }];
+    assert!(authorize(&ctx, "db_select", &json!({"source":"sales","table":"orders"}), &Fixed(selected.clone())).is_ok());
+    assert!(authorize(&ctx, "db_select", &json!({"connector_account":"other"}), &Fixed(selected)).is_err());
+}
+
+#[test]
+fn employee_scope_worker_outputs_need_separate_confined_grants() {
+    let scope = ResourceGrant::EmployeeScope { id: EmployeeId([2;16]) };
+    let wiki = ResourceGrant::Wiki { namespace: text("agent:worker") };
+    let connector = ResourceGrant::Connector { account: text("google"), binding: EmployeeBinding::Personal(text("owner")) };
+    let ctx = context("meeting_transcribe", vec![scope.clone(), employee()]);
+    assert!(authorize(&ctx, "meeting_transcribe", &json!({"write_wiki":true}),
+        &Fixed(vec![employee(), wiki.clone()])).is_err());
+    let ctx = context("meeting_transcribe", vec![scope, employee(),
+        ResourceGrant::Confined { resource: Box::new(wiki.clone()) },
+        ResourceGrant::Confined { resource: Box::new(connector.clone()) }]);
+    ctx.record().canonical_bytes().unwrap();
+    assert!(authorize(&ctx, "meeting_transcribe", &json!({"write_wiki":true,"drive_file_id":"file-a"}),
+        &Fixed(vec![employee(), wiki, connector])).is_ok());
+    assert!(authorize(&ctx, "meeting_transcribe", &json!({"write_wiki":true}),
+        &Fixed(vec![employee(), ResourceGrant::Wiki { namespace: text("shared") }])).is_err());
+}

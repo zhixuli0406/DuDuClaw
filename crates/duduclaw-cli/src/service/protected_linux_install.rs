@@ -154,6 +154,65 @@ fn atomic_install(path: &str, mode: u32, write: impl FnOnce(&mut fs::File) -> Re
     Ok(())
 }
 
+const PARSE_RUNTIME_TREE: &str = "/usr/lib/duduclaw/parse-root-tree";
+const PARSE_WORKER: &str = "/usr/libexec/duduclaw/duduclaw-parse-worker";
+const PARSE_RUNTIME_BUILDER: &str = include_str!("../../../duduclaw-parse-worker/scripts/build-runtime-tree.py");
+
+// The published worker's own digest cannot establish trust. Read the current
+// generation through F's root-owned state and authenticate its recorded signed
+// manifest before asking the embedded helper to inspect/copy any executable.
+fn parse_runtime_tree(install: bool) -> Result<()> {
+    use duduclaw_updated::linux::{files::Directory, activation, trust_admin};
+    use duduclaw_isolation::update::InstallTarget;
+    let state_root = Directory::open(Path::new(duduclaw_updated::linux::STATE_ROOT))
+        .map_err(|_| refused("缺少已驗證的隔離安裝狀態，未建立解析執行環境。"))?;
+    let _update_lock = state_root.lock().map_err(|_| refused("隔離更新進行中，稍後再準備解析執行環境。"))?;
+    let state: duduclaw_updated::state::State = state_root.json("state.json").map_err(refused)?;
+    state.validate().map_err(refused)?;
+    let current = activation::read_current().map_err(refused)?;
+    if state.pending.is_some() || current != state.effective_digest() {
+        return Err(refused("隔離世代尚未完成更新，未變更解析執行環境。"));
+    }
+    let generation = Directory::open(Path::new(duduclaw_updated::linux::INSTALL_ROOT)).map_err(refused)?
+        .child("generations").map_err(refused)?.child(&hex::encode(current.0)).map_err(refused)?;
+    let bytes = generation.bytes("manifest.json", duduclaw_updated::metadata::MAX_METADATA_BYTES).map_err(refused)?;
+    if duduclaw_updated::publication::manifest_digest(&bytes) != current {
+        return Err(refused("隔離世代的簽章文件不符。"));
+    }
+    let signature = generation.bytes("manifest.json.sig", 16 * 1024).map_err(refused)?;
+    let signature = std::str::from_utf8(&signature).map_err(refused)?;
+    let manifest = trust_admin::verify_recorded(&bytes, signature).map_err(refused)?;
+    if manifest.product != state.product || manifest.arch != state.arch
+        || manifest.version != state.running_version.unwrap_or(state.floor) {
+        return Err(refused("解析元件與已啟用世代不符。"));
+    }
+    let worker = manifest.artifacts.iter().find(|artifact| artifact.install_target == InstallTarget::ParseWorker)
+        .ok_or_else(|| refused("簽章文件缺少解析元件。"))?;
+    if worker.mode != 0o755 || worker.size_bytes == 0 || worker.size_bytes > 256 * 1024 * 1024 {
+        return Err(refused("簽章文件的解析元件規格不符。"));
+    }
+    let source = Path::new(PARSE_WORKER);
+    parents(source)?;
+    trusted(source, false)?;
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.len() != worker.size_bytes || metadata.nlink() != 1 || metadata.mode() & 0o7777 != 0o755 {
+        return Err(refused("已發布解析元件與簽章文件不符。"));
+    }
+    if install {
+        mkdir("/usr/lib/duduclaw/parse-root", 0o755)?;
+        if !layout::parse_root_is_reusable(Path::new("/usr/lib/duduclaw/parse-root"), 0, 0)? {
+            return Err(refused("解析服務掛載目錄含有非預期內容。"));
+        }
+    }
+    let digest = hex::encode(worker.sha256.0);
+    // -I ignores Python user paths and environment. The program is part of this
+    // signed CLI, not a mutable helper selected from the caller's filesystem.
+    checked("python3", &["-I", "-c", PARSE_RUNTIME_BUILDER,
+        "--worker", PARSE_WORKER, "--worker-sha256", &digest,
+        "--destination", PARSE_RUNTIME_TREE, if install { "--install" } else { "--verify" }])?;
+    Ok(())
+}
+
 const VERSION_FLOOR: &str = "/var/lib/duduclaw-protected/version-floor";
 const VERSION_PENDING: &str = "/var/lib/duduclaw-protected/version-pending";
 
@@ -165,6 +224,7 @@ const SPAWND_BINARY: &str = "/usr/lib/duduclaw/duduclaw-spawnd";
 fn install_isolation_support_if_published() -> Result<()> {
     // Validate every file and ancestor before any accounts or units change.
     if !layout::published_components(Path::new("/"), 0, 0)? { return Ok(()); }
+    parse_runtime_tree(true)?;
     let defs = fs::read_to_string("/etc/login.defs")?;
     // Validate explicit host ranges before useradd can allocate anything.
     layout::system_id_limit(&defs, "SYS_UID_MAX").map_err(refused)?;
@@ -181,7 +241,7 @@ fn install_isolation_support_if_published() -> Result<()> {
     }
     for (path, mode) in layout::DIRECTORIES {
         mkdir(path, *mode)?;
-        if matches!(*path, "/usr/lib/duduclaw/parse-root" | "/usr/lib/duduclaw/parse-root-tree")
+        if *path == "/usr/lib/duduclaw/parse-root"
             && !layout::parse_root_is_reusable(Path::new(path), 0, 0)? {
             return Err(refused("parse worker roots contain unexpected content; stop workers and inspect the directory"));
         }
@@ -381,6 +441,7 @@ pub(super) fn install(options: InstallOptions) -> Result<()> {
     if managed_install()? {
         // The invoking CLI's templates may be older than F's committed
         // generation. A reinstall cannot replace signed service policy.
+        parse_runtime_tree(true)?;
         return readiness::check(&mut readiness::MissingComposite);
     }
     let floor = read_version_file(VERSION_FLOOR)?;

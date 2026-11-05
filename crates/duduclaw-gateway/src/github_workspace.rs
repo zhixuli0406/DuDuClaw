@@ -316,7 +316,7 @@ pub async fn get_valid_github_token(home_dir: &Path) -> Result<String, GithubAut
 // ── HTTP plumbing ───────────────────────────────────────────────────────────
 
 fn http_client() -> Result<reqwest::Client, GithubApiError> {
-    reqwest::Client::builder()
+    crate::isolation_connector_clients::client_builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .redirect(crate::isolation_connector_clients::redirects())
         .build()

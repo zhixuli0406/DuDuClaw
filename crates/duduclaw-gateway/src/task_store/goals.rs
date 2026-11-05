@@ -10,9 +10,7 @@ impl TaskStore {
     /// in one IMMEDIATE transaction so they cannot be raced apart (TOCTOU).
     pub async fn insert_goal(&self, row: &GoalRow) -> Result<(), String> {
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("insert goal: begin: {e}"))?;
+        let tx = begin_live_write(&mut conn)?;
         if let Some(parent) = row.parent_goal_id.as_deref() {
             if get_goal_conn(&tx, parent)?.is_none() {
                 return Err(format!("parent goal not found: {parent}"));
@@ -38,18 +36,19 @@ impl TaskStore {
             ],
         )
         .map_err(|e| format!("insert goal: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("insert goal: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(())
     }
 
     pub async fn get_goal(&self, id: &str) -> Result<Option<GoalRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         get_goal_conn(&conn, id)
     }
 
     pub async fn list_goals(&self, status: Option<&str>) -> Result<Vec<GoalRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let (sql, binds): (String, Vec<String>) = match status {
             Some(s) => (
                 "SELECT id, title, description, parent_goal_id, status, created_at
@@ -79,6 +78,26 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// A finite task grant exposes only goals linked directly to those tasks.
+    /// The owner and the signed IDs are predicates in the same SQL snapshot;
+    /// a later task/goal or reassignment cannot widen this collection.
+    pub async fn list_goals_isolated(&self, agent: &str, task_ids: &[String], status: Option<&str>) -> Result<Vec<GoalRow>, String> {
+        let conn = self.conn.lock().await;
+        verify_live_io()?;
+        super::isolation_queries::validate_scope(agent, task_ids)?;
+        let ids = serde_json::to_string(task_ids).map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(
+            "SELECT g.id,g.title,g.description,g.parent_goal_id,g.status,g.created_at
+             FROM goals g WHERE (?3 IS NULL OR g.status=?3)
+               AND EXISTS (SELECT 1 FROM tasks t WHERE t.goal_id=g.id AND t.assigned_to=?1
+                 AND t.id IN (SELECT value FROM json_each(?2))) ORDER BY g.created_at ASC")
+            .map_err(|e| format!("prepare finite goals: {e}"))?;
+        let rows = stmt.query_map(params![agent, ids, status], row_to_goal)
+            .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        verify_live_io()?;
+        Ok(rows)
+    }
+
     /// Update mutable goal fields. Re-parenting goes through the same
     /// fail-closed cycle gate as `insert_goal`, inside one IMMEDIATE
     /// transaction (check + write cannot be raced apart — TOCTOU).
@@ -89,9 +108,7 @@ impl TaskStore {
     ) -> Result<Option<GoalRow>, String> {
         {
             let mut conn = self.conn.lock().await;
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|e| format!("update goal: begin: {e}"))?;
+            let tx = begin_live_write(&mut conn)?;
             if let Some(new_parent) = fields.get("parent_goal_id").and_then(|v| v.as_str()) {
                 if get_goal_conn(&tx, new_parent)?.is_none() {
                     return Err(format!("parent goal not found: {new_parent}"));
@@ -128,8 +145,7 @@ impl TaskStore {
                 .collect();
             tx.execute(&sql, params_ref.as_slice())
                 .map_err(|e| format!("update goal: {e}"))?;
-            tx.commit()
-                .map_err(|e| format!("update goal: commit: {e}"))?;
+            commit_live_write(tx)?;
         }
         self.get_goal(id).await
     }
@@ -137,6 +153,7 @@ impl TaskStore {
     /// All `(goal_id, parent_goal_id)` edges — for cycle detection.
     pub async fn goal_parent_edges(&self) -> Result<Vec<(String, Option<String>)>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         goal_parent_edges_conn(&conn)
     }
 
@@ -166,6 +183,7 @@ impl TaskStore {
     /// All `(task_id, depends_on ids)` edges — for dependency cycle detection.
     pub async fn depends_edges(&self) -> Result<Vec<(String, Vec<String>)>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         depends_edges_conn(&conn)
     }
 

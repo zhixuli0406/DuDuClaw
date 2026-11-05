@@ -202,3 +202,78 @@ async fn iso_root_unregister_ack_follows_data_socket_eof() {
     drop(control);
     assert!(tokio::time::timeout(Duration::from_secs(1),task).await.unwrap().unwrap().is_err());
 }
+
+#[test]
+fn config_bounds_aggregate_tunnel_reservations() {
+    let mut config = duduclaw_egress::daemon::Config {
+        profiles: List::new(vec![profile()]).unwrap(),
+        run_caps: RunCaps { total_bytes: 1024, total_connections: 2 }, max_runs: 64,
+    };
+    assert!(config.validate().is_ok()); // 64 * 16 = 1024
+    config.max_runs = 65;
+    assert_eq!(config.validate(), Err(EgressError::ResourceLimit));
+    let mut large = profile();
+    large.id = ProfileId(Sha256Digest([2; 32]));
+    large.limits.max_tunnels = 256.try_into().unwrap();
+    config.max_runs = 5;
+    config.profiles = List::new(vec![profile(), large]).unwrap();
+    assert_eq!(config.validate(), Err(EgressError::ResourceLimit));
+    config.max_runs = 4;
+    assert!(config.validate().is_ok());
+}
+
+#[tokio::test]
+async fn global_tunnel_limit_precedes_dns_across_runs_and_cancel_returns_permit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Waiting { started: Arc<tokio::sync::Notify>, calls: Arc<AtomicUsize> }
+    impl Resolver for Waiting {
+        fn resolve<'a>(&'a self, _: &'a str, _: DnsRoute) -> std::pin::Pin<Box<dyn std::future::Future<Output=Result<Vec<IpAddr>,EgressError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.started.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+    let global = Arc::new(tokio::sync::Semaphore::new(1));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = Arc::new(Waiting { started: started.clone(), calls: calls.clone() });
+    let mut clients = Vec::new();
+    let mut runs = Vec::new();
+    for id in 1..=8 {
+        let (client, host) = sockets();
+        let (cancel, receiver) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(duduclaw_egress::session::serve_run_limited(host, RunId([id;16]),
+            profile(), RunCaps { total_bytes: 1024, total_connections: 8 }, resolver.clone(), receiver, global.clone()));
+        clients.push(client);
+        runs.push((cancel, task));
+    }
+    write_frame(&mut clients[0], EgressMessage::Connect { tunnel_id: TunnelId(1), target: target() }, &default_limits()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), started.notified()).await.unwrap();
+    assert_eq!(global.available_permits(), 0);
+    for client in clients.iter_mut().skip(1) {
+        write_frame(client, EgressMessage::Connect { tunnel_id: TunnelId(1), target: target() }, &default_limits()).await.unwrap();
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(1), read_frame(client, &default_limits())).await.unwrap().unwrap(),
+            EgressMessage::Refused { code: EgressError::ResourceLimit, .. }));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "refused runs must not start DNS");
+    let (cancel, task) = runs.remove(0);
+    cancel.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+    assert_eq!(global.available_permits(), 1, "cancellation ACK must follow permit release");
+    write_frame(&mut clients[1], EgressMessage::Connect { tunnel_id: TunnelId(2), target: target() }, &default_limits()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), started.notified()).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(global.available_permits(), 0);
+    // Client Close aborts a pending DNS future and also returns its permit.
+    write_frame(&mut clients[1], EgressMessage::Close { tunnel_id: TunnelId(2) }, &default_limits()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while global.available_permits() != 1 { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    for (cancel, task) in runs {
+        cancel.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+    }
+    assert_eq!(global.available_permits(), 1);
+}

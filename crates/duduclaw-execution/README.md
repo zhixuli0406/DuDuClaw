@@ -34,6 +34,21 @@ Tokio runtime. Local PIDs are diagnostic only; protected runs expose no PID.
 Cancelled writes with unacknowledged data must not be retried with different bytes;
 the adapter reports an error rather than acknowledging the wrong buffer.
 
+`SpawndBackend::with_workspace_bridge` is the explicit hookup for protected
+`AuthorizedWorkspace` plans. The installed `RootWorkspaceBridge` must return a
+root-attested receipt bound to the exact reservation, employee, registered runtime,
+workspace handle and relative cwd, retaining the actual work directory and its
+root mount generation. The backend verifies the boundary token against that held
+directory after receipt/input waits and immediately before root IPC. It retains
+the live authority, checks later I/O/status/waits, and cancels the run on revocation.
+A cancel acknowledgement or closed connection is not a root cleanup receipt.
+
+The default `SpawndBackend::connect` has no workspace bridge and refuses protected
+workspace plans. This crate supplies the hookup and checks, not B/H's production
+receipt producer: root IPC v1 still has no workspace selector or receipt RPC.
+A gateway path lookup or capability workspace name cannot stand in for a root
+attestation. No A execution producers are implemented by this hookup.
+
 This crate alone does not enable employee isolation. Package D's capability
 implementation, daemon readiness, migration and runtime registration must all be
 connected before protected execution is available. Cross-target checks do not

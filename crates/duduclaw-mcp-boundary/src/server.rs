@@ -8,6 +8,16 @@ pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Implemented by CLI's adapter around McpDispatcher; the gateway cannot depend
 /// on the CLI crate. Implementors must retain every legacy dispatch gate.
 pub trait Dispatcher: Send + Sync {
+    /// Startup admission is fail-closed unless the concrete dispatcher proves
+    /// that every non-refused tool has its installed policy and executor.
+    fn require_complete_services(&self) -> Result<(), VerificationError> { Err(VerificationError::Unavailable) }
+
+    /// A complete employee-scope implementation may still lack a finite-grant
+    /// adapter. Admission must verify the exact activated capability mode.
+    fn require_context_services(&self, _context: &RequestContext) -> Result<(), VerificationError> {
+        self.require_complete_services()
+    }
+
     fn dispatch<'a>(&'a self, context: RequestContext, agent_slug: &'a str, request: Value)
         -> Pin<Box<dyn Future<Output = Result<Option<Value>, VerificationError>> + Send + 'a>>;
 }
@@ -55,12 +65,15 @@ pub async fn serve(mut connection: crate::Connection, dispatcher: &dyn Dispatche
     -> Result<(), VerificationError> {
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let context = connection.context(crate::authority::now_seconds()?)?;
+    dispatcher.require_context_services(&context)?;
     let socket = connection.socket.take().ok_or(VerificationError::Invalid)?;
     socket.set_nonblocking(true).map_err(|_| VerificationError::Unavailable)?;
     let socket = tokio::net::UnixStream::from_std(socket).map_err(|_| VerificationError::Unavailable)?;
     let (reader, mut writer) = socket.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
     let agent_slug = connection.agent_slug()?;
+    let mut revoked = connection.revocation()?;
     let mut watch = tokio::time::interval(Duration::from_millis(100));
     watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut window = tokio::time::Instant::now();
@@ -71,6 +84,8 @@ pub async fn serve(mut connection: crate::Connection, dispatcher: &dyn Dispatche
             tokio::pin!(read);
             loop {
                 tokio::select! {
+                    biased;
+                    _ = wait_revoked(&mut revoked) => return Err(VerificationError::Revoked),
                     result = &mut read => break result?,
                     _ = watch.tick() => { connection.context(crate::authority::now_seconds()?)?; }
                 }
@@ -92,6 +107,7 @@ pub async fn serve(mut connection: crate::Connection, dispatcher: &dyn Dispatche
         let response = loop {
             tokio::select! {
                 biased;
+                _ = wait_revoked(&mut revoked) => return Err(VerificationError::Revoked),
                 _ = watch.tick() => { connection.context(crate::authority::now_seconds()?)?; }
                 result = &mut call => break result?,
                 next = reader.fill_buf() => {
@@ -110,6 +126,7 @@ pub async fn serve(mut connection: crate::Connection, dispatcher: &dyn Dispatche
             loop {
                 tokio::select! {
                     biased;
+                    _ = wait_revoked(&mut revoked) => return Err(VerificationError::Revoked),
                     _ = watch.tick() => { connection.context(crate::authority::now_seconds()?)?; }
                     result = &mut write => {
                         result.map_err(|_| VerificationError::Unavailable)?
@@ -119,6 +136,16 @@ pub async fn serve(mut connection: crate::Connection, dispatcher: &dyn Dispatche
                 }
             }
         }
+    }
+}
+
+/// Authority-owned sticky cancellation. A closed authority channel also denies.
+/// This is independent of the periodic live-store sweep and its timer.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) async fn wait_revoked(revoked: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *revoked.borrow_and_update() { return; }
+        if revoked.changed().await.is_err() { return; }
     }
 }
 
@@ -143,6 +170,47 @@ pub fn encode_response(value: &Value) -> Result<Vec<u8>, VerificationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Incomplete;
+    impl Dispatcher for Incomplete {
+        fn dispatch<'a>(&'a self, _: RequestContext, _: &'a str, _: Value)
+            -> Pin<Box<dyn Future<Output = Result<Option<Value>, VerificationError>> + Send + 'a>> {
+            panic!("an incomplete dispatcher must not receive calls")
+        }
+    }
+    fn context() -> RequestContext {
+        use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord,
+            EmployeeBinding, Lane, Principal}, ids::{EmployeeId, RunId, Sha256Digest}};
+        RequestContext::from_verified_record(CapabilityRecord {
+            id: CapabilityId(Sha256Digest([1; 32])), employee: EmployeeId([2; 16]), run: RunId([3; 16]),
+            task: None, principal: Principal::Human { user_id: Text::new("owner".into()).unwrap(), generation: 1 },
+            employee_binding: EmployeeBinding::Personal(Text::new("owner".into()).unwrap()), lane: Lane::Standard,
+            tools: List::new(vec![]).unwrap(), resources: List::new(vec![]).unwrap(), policy_revision: 1,
+            gateway_epoch: [4; 16], issued_at: 1, not_before: 1, expires_at: u64::MAX,
+            nonce: [5; 32], jti: [6; 16],
+        })
+    }
+    #[test]
+    fn missing_readiness_implementation_refuses_startup() {
+        assert_eq!(Incomplete.require_complete_services(), Err(VerificationError::Unavailable));
+        assert_eq!(Incomplete.require_context_services(&context()), Err(VerificationError::Unavailable));
+    }
+    #[test]
+    fn default_context_readiness_delegates_to_complete_services() {
+        struct Ready(std::sync::atomic::AtomicUsize);
+        impl Dispatcher for Ready {
+            fn require_complete_services(&self) -> Result<(), VerificationError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst); Ok(())
+            }
+            fn dispatch<'a>(&'a self, _: RequestContext, _: &'a str, _: Value)
+                -> Pin<Box<dyn Future<Output = Result<Option<Value>, VerificationError>> + Send + 'a>> {
+                panic!("readiness must not execute a handler")
+            }
+        }
+        let ready = Ready(std::sync::atomic::AtomicUsize::new(0));
+        let dispatcher: &dyn Dispatcher = &ready;
+        assert!(dispatcher.require_context_services(&context()).is_ok());
+        assert_eq!(ready.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
     #[test]
     fn forged_identity_and_batch_frames_are_refused() {
         for line in [r#"[]"#, r#"{"jsonrpc":"2.0","method":"tools/list","principal":"admin"}"#,

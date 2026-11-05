@@ -4,10 +4,10 @@
 //! the existing handler's policy checks and its trusted operation-to-plan adapter;
 //! knowing a tool's effect class alone is never sufficient to execute it.
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
-use duduclaw_isolation::{capability::ResourceGrant, execution::{
+use duduclaw_isolation::{execution::{
     ExecutionBackend, ExecutionClass, NetworkPolicy, RunHandle, RuntimeKind, SpawnPolicy,
 }};
-use crate::{RequestContext, VerificationError, tool_policy::{self, Route}};
+use crate::{RequestContext, VerificationError, tool_policy::{self, AuthorizedToolCall, ResourceResolver, Route}, resources::AuthorizedWorkspace};
 use serde_json::{Value, json};
 
 pub type PolicyFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, VerificationError>> + Send + 'a>>;
@@ -21,25 +21,42 @@ pub type PolicyFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, Verificatio
 /// There is intentionally no default implementation or blanket support claim.
 pub trait ExecutionPlanFactory: Send + Sync {
     fn supports(&self, tool: &str) -> bool;
-    fn authorize_handler<'a>(&'a self, context: &'a RequestContext, tool: &'a str,
-        arguments: &'a Value) -> PolicyFuture<'a, ()>;
-    fn prepare<'a>(&'a self, context: &'a RequestContext, tool: &'a str,
-        arguments: &'a Value, reservation: RunHandle) -> PolicyFuture<'a, SpawnPolicy>;
+    fn authorize_handler<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()>;
+    fn prepare<'a>(&'a self, call: &'a AuthorizedToolCall,
+        reservation: RunHandle) -> PolicyFuture<'a, AuthorizedExecutionPlan>;
+}
+
+/// Adapters cannot return a raw SpawnPolicy. Construction consumes a selected
+/// workspace token; final admission compares it with this call again.
+pub struct AuthorizedExecutionPlan {
+    policy: SpawnPolicy,
+    workspace: AuthorizedWorkspace,
+}
+impl AuthorizedExecutionPlan {
+    pub fn new(workspace: AuthorizedWorkspace, policy: SpawnPolicy) -> Result<Self, VerificationError> {
+        if workspace.handle() != policy.workspace.workspace.as_str() {
+            return Err(VerificationError::BindingMismatch);
+        }
+        Ok(Self { policy, workspace })
+    }
 }
 
 pub struct ExecutionToolBridge {
     backend: Arc<dyn ExecutionBackend>,
     factory: Arc<dyn ExecutionPlanFactory>,
+    resolver: Arc<dyn ResourceResolver>,
 }
 
 impl ExecutionToolBridge {
-    pub fn new(backend: Arc<dyn ExecutionBackend>, factory: Arc<dyn ExecutionPlanFactory>) -> Self {
-        Self { backend, factory }
+    pub fn new(backend: Arc<dyn ExecutionBackend>, factory: Arc<dyn ExecutionPlanFactory>,
+        resolver: Arc<dyn ResourceResolver>) -> Self {
+        Self { backend, factory, resolver }
     }
 
     /// Use this same predicate for tools/list and tools/call.
     pub fn supports(&self, name: &str) -> bool {
         execution_route(name).is_some() && self.factory.supports(name)
+            && self.backend.supports_authorized_workspace()
     }
 
     /// Called only after the shared MCP dispatcher gates. Same-employee runs
@@ -47,9 +64,10 @@ impl ExecutionToolBridge {
     /// accepted handle, never fabricate the old synchronous tool result.
     pub async fn execute(&self, context: &RequestContext, name: &str, arguments: &Value) -> Value {
         let Some(route) = execution_route(name) else { return refused(); };
-        if !self.supports(name) || !tool_policy::eligible(context, name)
-            || crate::check_arguments(arguments).is_err()
-            || self.factory.authorize_handler(context, name, arguments).await.is_err() {
+        let call = match tool_policy::authorize(context, name, arguments, self.resolver.as_ref()) {
+            Ok(call) => call, Err(_) => return refused(),
+        };
+        if !self.supports(name) || self.factory.authorize_handler(&call).await.is_err() {
             return refused();
         }
         let reservation = match self.backend.reserve(context.record().employee).await {
@@ -59,11 +77,21 @@ impl ExecutionToolBridge {
             _ => return refused(),
         };
         let mut guard = ReservationGuard::new(self.backend.clone(), reservation);
-        let plan = match self.factory.prepare(context, name, arguments, reservation).await {
-            Ok(plan) if valid_plan(context, route, reservation, &plan) => plan,
+        let plan = match self.factory.prepare(&call, reservation).await {
+            Ok(plan) if valid_plan(&call, route, reservation, &plan) => plan,
             _ => return if guard.cancel().await { refused() } else { uncertain() },
         };
-        match self.backend.spawn(plan).await {
+        let checked = match tool_policy::authorize(context, name, arguments, self.resolver.as_ref()) {
+            Ok(checked) if valid_plan(&checked, route, reservation, &plan) => checked,
+            _ => return if guard.cancel().await { refused() } else { uncertain() },
+        };
+        if self.factory.authorize_handler(&checked).await.is_err() {
+            return if guard.cancel().await { refused() } else { uncertain() };
+        }
+        if crate::authority::now_seconds().and_then(|now| checked.context().verify_live(now)).is_err() {
+            return if guard.cancel().await { refused() } else { uncertain() };
+        }
+        match self.backend.spawn_authorized(plan.policy, Arc::new(plan.workspace)).await {
             Ok(run) if run == reservation => {
                 guard.disarm();
                 json!({"content":[{"type":"text", "text":json!({
@@ -79,7 +107,7 @@ impl ExecutionToolBridge {
 }
 
 fn execution_route(name: &str) -> Option<Route> {
-    if matches!(name, "hardware_info" | "model_search" | "model_recommend") {
+    if name == "hardware_info" {
         return Some(Route::Execution);
     }
     match tool_policy::policy(name)?.route {
@@ -88,7 +116,9 @@ fn execution_route(name: &str) -> Option<Route> {
     }
 }
 
-fn valid_plan(context: &RequestContext, route: Route, reservation: RunHandle, plan: &SpawnPolicy) -> bool {
+fn valid_plan(call: &AuthorizedToolCall, route: Route, reservation: RunHandle, authorized: &AuthorizedExecutionPlan) -> bool {
+    let context = call.context();
+    let plan = &authorized.policy;
     let expected = match route {
         Route::Execution => ExecutionClass::EmployeeTool,
         Route::Worker => ExecutionClass::ParseWorker,
@@ -100,8 +130,8 @@ fn valid_plan(context: &RequestContext, route: Route, reservation: RunHandle, pl
         && !plan.pty && !plan.capabilities.mcp_bridge
         && (plan.workspace.relative_cwd.as_str() == "."
             || crate::resources::relative_path(plan.workspace.relative_cwd.as_str()).is_ok())
-        && context.record().resources.as_slice().iter().any(|grant|
-            matches!(grant, ResourceGrant::Workspace { handle } if handle == &plan.workspace.workspace))
+        && authorized.workspace.verify(call).is_ok()
+        && authorized.workspace.handle() == plan.workspace.workspace.as_str()
 }
 
 fn refused() -> Value {

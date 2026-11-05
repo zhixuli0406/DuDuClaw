@@ -10,6 +10,7 @@ use duduclaw_isolation::{bounded::{List, Text}, execution::*, ids::{EmployeeId, 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use transport::{Connection, Packet};
+use crate::workspace::{RootWorkspaceBridge, RootWorkspaceRequest, WorkspaceGuard, checked_wait};
 
 const MAX_TRACKED_RUNS: usize = 1024;
 const TERMINAL_RETENTION: Duration = Duration::from_secs(300);
@@ -21,6 +22,7 @@ const MAX_MEMFD_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 pub struct SpawndBackend {
     runs: StdMutex<BTreeMap<RunId, Arc<Entry>>>,
     slots: Arc<Semaphore>,
+    workspace_bridge: Option<Arc<dyn RootWorkspaceBridge>>,
 }
 
 struct Entry {
@@ -44,6 +46,7 @@ struct State {
     mcp_fd: Option<OwnedFd>,
     outcome: Option<RunOutcome>,
     terminal_at: Option<Instant>,
+    workspace: Option<Arc<WorkspaceGuard>>,
 }
 
 impl SpawndBackend {
@@ -51,7 +54,14 @@ impl SpawndBackend {
     /// Package B performs readiness checks for the trampoline, egress and quotas.
     pub async fn connect() -> Result<Self, BackendError> {
         let _probe = transport::connect()?;
-        Ok(Self { runs: StdMutex::new(BTreeMap::new()), slots: Arc::new(Semaphore::new(MAX_TRACKED_RUNS)) })
+        Ok(Self { runs: StdMutex::new(BTreeMap::new()), slots: Arc::new(Semaphore::new(MAX_TRACKED_RUNS)), workspace_bridge: None })
+    }
+
+    /// Install only the trusted B/H receipt producer. This does not add a root
+    /// mount selector to IPC or enable a pathname-based workspace fallback.
+    pub fn with_workspace_bridge(mut self, bridge: Arc<dyn RootWorkspaceBridge>) -> Self {
+        self.workspace_bridge = Some(bridge);
+        self
     }
 
     fn entry(&self, run: RunHandle) -> Result<Arc<Entry>, BackendError> {
@@ -90,7 +100,8 @@ impl SpawndBackend {
     /// Public queue status contains no PID, path, command or secret.
     pub async fn status(&self, run: RunHandle) -> Result<RunStatus, BackendError> {
         let entry = self.entry(run)?;
-        let Packet { response, .. } = entry.connection.request(SpawnRequest::Status { run }, &[]).await?;
+        let workspace = entry.state.lock().await.workspace.clone();
+        let Packet { response, .. } = request_checked(&entry, SpawnRequest::Status { run }, &[], workspace.as_deref()).await?;
         match response {
             SpawnResponse::Status { status, .. } => {
                 if let RunStatus::Ended(ref outcome) = status {
@@ -106,9 +117,10 @@ impl SpawndBackend {
     }
 
     async fn receive_io(entry: &Entry, run: RunHandle, state: &mut State) -> Result<(), BackendError> {
+        if let Some(workspace) = &state.workspace { workspace.verify()?; }
         if state.io_received { return Ok(()); }
         if !state.started || state.outcome.is_some() { return Err(BackendError::Denied); }
-        let packet = entry.connection.request(SpawnRequest::TakeIo { run }, &[]).await?;
+        let packet = request_checked(entry, SpawnRequest::TakeIo { run }, &[], state.workspace.as_deref()).await?;
         let SpawnResponse::Io { delivery, .. } = packet.response else { return Err(BackendError::Protocol); };
         if delivery.pty != state.pty || delivery.mcp != state.mcp {
             entry.connection.close().await;
@@ -120,6 +132,12 @@ impl SpawndBackend {
             Ok(io) => io,
             Err(error) => { entry.connection.close().await; return Err(error); }
         };
+        if let Some(workspace) = &state.workspace {
+            if let Err(error) = workspace.verify() {
+                entry.connection.close().await;
+                return Err(error);
+            }
+        }
         match io {
             fd_io::DeliveredIo::Stdio(stdio) => state.stdio = Some(stdio),
             fd_io::DeliveredIo::Pty(terminal) => state.terminal = Some(terminal),
@@ -140,6 +158,49 @@ impl SpawndBackend {
         Self::receive_io(&entry, run, &mut state).await?;
         state.mcp_fd.take().ok_or(BackendError::Denied)
     }
+    async fn spawn_inner(&self, policy: SpawnPolicy, workspace: Option<Arc<WorkspaceGuard>>) -> Result<RunHandle, BackendError> {
+        let entry = self.entry(policy.run)?;
+        let mut state = entry.state.lock().await;
+        if entry.employee != policy.employee || state.started || state.expires <= Instant::now() {
+            return Err(BackendError::Denied);
+        }
+        if policy.resources.output_total_bytes == 0 || policy.resources.output_buffer_bytes == 0
+            || policy.resources.memfd_total_bytes == 0 {
+            return Err(BackendError::Denied);
+        }
+        // Preparation cannot outlive the server reservation or hold a local
+        // reservation indefinitely through an adversarial input stream.
+        let budget = policy.resources.memfd_total_bytes.min(MAX_MEMFD_TOTAL_BYTES);
+        let expires = state.expires;
+        let prepare = async move {
+            tokio::time::timeout_at(expires, prepare_inputs(policy.inputs, budget))
+                .await.map_err(|_| BackendError::Timeout)?
+        };
+        let prepared = match &workspace {
+            Some(workspace) => workspace.checked(prepare).await?,
+            None => prepare.await?,
+        };
+        let request = SpawnRequest::StartRun { run: policy.run, employee_id: policy.employee,
+            runtime_request: policy.runtime, task_ref: state.task_ref.clone(), prompt_bytes: prepared.prompt_bytes,
+            input_fds: List::new(prepared.attachments).map_err(|_| BackendError::Denied)?, pty: policy.pty };
+        request.validate().map_err(|_| BackendError::Denied)?;
+        let packet = request_checked(&entry, request, &prepared.fds, workspace.as_deref()).await?;
+        let SpawnResponse::Accepted { status, .. } = packet.response else { return Err(BackendError::Protocol); };
+        state.workspace = workspace.clone();
+        state.started = true;
+        state.pty = policy.pty;
+        state.mcp = policy.capabilities.mcp_bridge;
+        state.output_bytes = policy.resources.output_total_bytes;
+        state.output_buffer = policy.resources.output_buffer_bytes;
+        if let RunStatus::Ended(outcome) = status {
+            state.outcome = Some(outcome);
+            state.terminal_at = Some(Instant::now());
+        }
+        drop(state);
+        if let Some(workspace) = workspace { monitor_workspace(&entry, policy.run, workspace); }
+        Ok(policy.run)
+    }
+
 }
 
 impl ExecutionBackend for SpawndBackend {
@@ -158,7 +219,7 @@ impl ExecutionBackend for SpawndBackend {
             let entry = Arc::new(Entry { employee, connection, _permit: permit, state: Mutex::new(State {
                 expires: Instant::now() + Duration::from_millis(remaining as u64), started: false, task_ref: None,
                 pty: false, mcp: false, output_bytes: 0, output_buffer: 0,
-                io_received: false, stdio: None, terminal: None, mcp_fd: None, outcome: None, terminal_at: None,
+                io_received: false, stdio: None, terminal: None, mcp_fd: None, outcome: None, terminal_at: None, workspace: None,
             }) });
             let mut runs = self.runs.lock().map_err(|_| BackendError::Unavailable)?;
             if runs.contains_key(&run.0)
@@ -173,37 +234,33 @@ impl ExecutionBackend for SpawndBackend {
     }
 
     fn spawn(&self, policy: SpawnPolicy) -> BackendFuture<'_, RunHandle> {
+        Box::pin(self.spawn_inner(policy, None))
+    }
+
+    fn supports_authorized_workspace(&self) -> bool { self.workspace_bridge.is_some() }
+
+    fn spawn_authorized(&self, policy: SpawnPolicy, authority: Arc<dyn ExecutionAuthority>)
+        -> BackendFuture<'_, RunHandle> {
         Box::pin(async move {
+            authority.verify_live()?;
+            let bridge = self.workspace_bridge.as_ref().ok_or(BackendError::Unavailable)?;
+            let request = RootWorkspaceRequest::from_policy(&policy)?;
             let entry = self.entry(policy.run)?;
-            let mut state = entry.state.lock().await;
-            if entry.employee != policy.employee || state.started || state.expires <= Instant::now() {
-                return Err(BackendError::Denied);
-            }
-            if policy.resources.output_total_bytes == 0 || policy.resources.output_buffer_bytes == 0
-                || policy.resources.memfd_total_bytes == 0 {
-                return Err(BackendError::Denied);
-            }
-            // Preparation cannot outlive the server reservation or hold a local
-            // reservation indefinitely through an adversarial input stream.
-            let budget = policy.resources.memfd_total_bytes.min(MAX_MEMFD_TOTAL_BYTES);
-            let prepared = tokio::time::timeout_at(state.expires, prepare_inputs(policy.inputs, budget))
-                .await.map_err(|_| BackendError::Timeout)??;
-            let request = SpawnRequest::StartRun { run: policy.run, employee_id: policy.employee,
-                runtime_request: policy.runtime, task_ref: state.task_ref.clone(), prompt_bytes: prepared.prompt_bytes,
-                input_fds: List::new(prepared.attachments).map_err(|_| BackendError::Denied)?, pty: policy.pty };
-            request.validate().map_err(|_| BackendError::Denied)?;
-            let packet = entry.connection.request(request, &prepared.fds).await?;
-            let SpawnResponse::Accepted { status, .. } = packet.response else { return Err(BackendError::Protocol); };
-            state.started = true;
-            state.pty = policy.pty;
-            state.mcp = policy.capabilities.mcp_bridge;
-            state.output_bytes = policy.resources.output_total_bytes;
-            state.output_buffer = policy.resources.output_buffer_bytes;
-            if let RunStatus::Ended(outcome) = status {
-                state.outcome = Some(outcome);
-                state.terminal_at = Some(Instant::now());
-            }
-            Ok(policy.run)
+            let expires = {
+                let state = entry.state.lock().await;
+                if entry.employee != policy.employee || state.started || state.expires <= Instant::now() {
+                    return Err(BackendError::Denied);
+                }
+                state.expires
+            };
+            // Receipt production is bounded by the reservation and by live
+            // authority, including while an adapter waits on root admission.
+            let receipt = checked_wait(|| authority.verify_live(), async {
+                tokio::time::timeout_at(expires, bridge.prepare(request.clone())).await
+                    .map_err(|_| BackendError::Timeout)?
+            }).await?;
+            let workspace = Arc::new(WorkspaceGuard::new(request, receipt, authority)?);
+            self.spawn_inner(policy, Some(workspace)).await
         })
     }
 
@@ -215,7 +272,11 @@ impl ExecutionBackend for SpawndBackend {
                 if caller.employee == entry.employee { return Err(BackendError::WouldDeadlock); }
             }
             loop {
-                if let Some(outcome) = entry.state.lock().await.outcome.clone() { return Ok(outcome); }
+                {
+                    let state = entry.state.lock().await;
+                    if let Some(workspace) = &state.workspace { workspace.verify()?; }
+                    if let Some(outcome) = state.outcome.clone() { return Ok(outcome); }
+                }
                 // Status polling releases the transaction lock between requests;
                 // Cancel never waits behind a server-side blocking Wait call.
                 if let RunStatus::Ended(outcome) = self.status(run).await? { return Ok(outcome); }
@@ -258,11 +319,43 @@ impl ExecutionBackend for SpawndBackend {
         Box::pin(async move {
             size.validate().map_err(|_| BackendError::Denied)?;
             let entry = self.entry(run)?;
-            if !entry.state.lock().await.pty { return Err(BackendError::Denied); }
-            entry.connection.request(SpawnRequest::Resize { run, size }, &[]).await?;
+            let workspace = {
+                let state = entry.state.lock().await;
+                if !state.pty { return Err(BackendError::Denied); }
+                state.workspace.clone()
+            };
+            request_checked(&entry, SpawnRequest::Resize { run, size }, &[], workspace.as_deref()).await?;
             Ok(())
         })
     }
+}
+
+async fn request_checked(entry: &Entry, request: SpawnRequest, fds: &[OwnedFd],
+    workspace: Option<&WorkspaceGuard>) -> Result<Packet, BackendError> {
+    match workspace {
+        Some(workspace) => workspace.checked(entry.connection.request_checked(request, fds, &|| workspace.verify())).await,
+        None => entry.connection.request(request, fds).await,
+    }
+}
+
+fn monitor_workspace(entry: &Arc<Entry>, run: RunHandle, workspace: Arc<WorkspaceGuard>) {
+    let entry = Arc::downgrade(entry);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let Some(entry) = entry.upgrade() else { return; };
+            if entry.connection.is_closed() { return; }
+            if workspace.verify().is_err() {
+                // Cancellation remains available after authority is revoked.
+                // Ack is not a cleanup receipt; closing also fences root's
+                // authenticated control connection and leaves teardown to B/H.
+                let _ = entry.connection.request(SpawnRequest::Cancel { run }, &[]).await;
+                entry.connection.close().await;
+                return;
+            }
+            if entry.state.try_lock().is_ok_and(|state| state.outcome.is_some()) { return; }
+        }
+    });
 }
 
 fn retain_state(state: &State, now: Instant) -> bool {
@@ -337,7 +430,7 @@ mod tests {
             Box::pin(async move { Read::read(&mut self.0, bytes).map_err(|_| BackendError::Io) })
         }
     }
-    fn input(bytes: &[u8], max_bytes: u64) -> RunInput {
+    pub(super) fn input(bytes: &[u8], max_bytes: u64) -> RunInput {
         RunInput { reader: Box::new(Bytes(std::io::Cursor::new(bytes.to_vec()))), max_bytes }
     }
 
@@ -346,7 +439,7 @@ mod tests {
         let mut state = State {
             expires: Instant::now() + Duration::from_secs(30), started: false, task_ref: None,
             pty: false, mcp: false, output_bytes: 1, output_buffer: 1,
-            io_received: false, stdio: None, terminal: None, mcp_fd: None, outcome: None, terminal_at: None,
+            io_received: false, stdio: None, terminal: None, mcp_fd: None, outcome: None, terminal_at: None, workspace: None,
         };
         let task = Some(Text::new("task-1".into()).unwrap());
         bind_task(&mut state, task.clone()).unwrap();
@@ -365,7 +458,7 @@ mod tests {
         let mut state = State {
             expires: now, started: true, task_ref: None, pty: false, mcp: false,
             output_bytes: 1, output_buffer: 1, io_received: false, stdio: None,
-            terminal: None, mcp_fd: None, outcome: None, terminal_at: None,
+            terminal: None, mcp_fd: None, outcome: None, terminal_at: None, workspace: None,
         };
         assert!(retain_state(&state, now + TERMINAL_RETENTION));
         state.outcome = Some(RunOutcome::Exited(0));
@@ -403,3 +496,7 @@ mod tests {
         assert_eq!(prepared.attachments, vec![ipc::InputFd::SealedMemfd { bytes: 1 }]);
     }
 }
+
+#[cfg(test)]
+#[path = "spawnd/authorized_tests.rs"]
+mod authorized_tests;

@@ -3,8 +3,20 @@ use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
 use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord,
     EmployeeBinding, Lane, Principal, ResourceGrant}, ids::{EmployeeId, RunId, Sha256Digest}};
 use duduclaw_mcp_boundary::{bindings::BindingStore, tool_policy::{ResourceResolver, ToolPolicy, authorize}, RequestContext};
-use crate::isolation_connectors::ConnectorCatalog;
+use crate::isolation_connectors::{ConnectorCatalog, LiveConnectorSelectionPolicy, ProductConnectorAccount};
 use rusqlite::Connection;
+struct FixtureAuthority;
+impl duduclaw_isolation::capability::LiveRequestVerifier for FixtureAuthority {
+    fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> { Ok(()) }
+}
+struct FixtureSelection;
+impl LiveConnectorSelectionPolicy for FixtureSelection {
+    fn supports(&self, tool: &str) -> bool { tool == "google_status" }
+    fn candidates(&self, _: &RequestContext, _: &str, _: &str)
+        -> Result<Vec<ProductConnectorAccount>, VerificationError> {
+        Ok(vec![ProductConnectorAccount::Personal { account: "alice-google".into(), owner: "alice".into() }])
+    }
+}
 fn text<const N: usize>(value: &str) -> Text<N> { Text::new(value.into()).unwrap() }
 struct Fixed;
 impl ResourceResolver for Fixed {
@@ -23,7 +35,7 @@ fn fixture() -> (Arc<Mutex<BindingStore>>, SelectedConnector, AuthorizedToolCall
     let bindings = Arc::new(Mutex::new(store));
     let catalog = Arc::new(ConnectorCatalog::new(Connection::open_in_memory().unwrap()).unwrap());
     catalog.register("alice-google", "google").unwrap();
-    let context = RequestContext::from_verified_record(CapabilityRecord {
+    let context = RequestContext::with_live_verifier(CapabilityRecord {
         id: CapabilityId(Sha256Digest([1; 32])), employee, run: RunId([3; 16]), task: None,
         principal, employee_binding: binding.clone(), lane: Lane::Standard,
         tools: List::new(vec![text("google_status")]).unwrap(),
@@ -31,8 +43,9 @@ fn fixture() -> (Arc<Mutex<BindingStore>>, SelectedConnector, AuthorizedToolCall
             account: text("alice-google"), binding }]).unwrap(),
         policy_revision: 1, gateway_epoch: [0; 16], issued_at: 1, not_before: 1, expires_at: u64::MAX,
         nonce: [0; 32], jti: [0; 16],
-    });
-    let selected = SelectedConnector::select(&context, "google_status", &json!({}), bindings.clone(), catalog).unwrap();
+    }, Arc::new(FixtureAuthority));
+    let selected = SelectedConnector::select_with_policy(&context, "google_status", &json!({}), bindings.clone(), catalog,
+        Some(Arc::new(FixtureSelection))).unwrap();
     let call = authorize(&context, "google_status", &json!({}), &Fixed).unwrap();
     (bindings, selected, call)
 }

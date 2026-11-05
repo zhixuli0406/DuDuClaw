@@ -28,6 +28,7 @@
 //! - `wecom_callback_token` (`_enc`) — callback Token (signature key)
 //! - `wecom_encoding_aes_key` (`_enc`) — 43-char EncodingAESKey
 
+use crate::isolation_http::LiveRequest;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -350,9 +351,9 @@ async fn fetch_access_token(
     let resp: serde_json::Value = http
         .get(format!("{WECOM_API}/gettoken"))
         .query(&[("corpid", corp_id), ("corpsecret", corp_secret)])
-        .send()
+        .send_authorized()
         .await
-        .map_err(|e| format!("WeCom gettoken failed: {}", scrub_reqwest_err(e)))?
+        .map_err(|e| format!("WeCom gettoken failed: {}", e))?
         .json()
         .await
         .map_err(|e| format!("WeCom gettoken parse failed: {}", scrub_reqwest_err(e)))?;
@@ -807,7 +808,7 @@ async fn send_wecom_msg(
             .post(format!("{WECOM_API}/message/send"))
             .query(&[("access_token", token.as_str())])
             .json(&body)
-            .send()
+            .send_authorized()
             .await;
         match resp {
             Ok(r) => {
@@ -830,7 +831,7 @@ async fn send_wecom_msg(
                 }
             }
             Err(e) => {
-                warn!("WeCom send error: {}", scrub_reqwest_err(e));
+                warn!("WeCom send error: {}", e);
                 return false;
             }
         }
@@ -874,9 +875,9 @@ pub async fn send_text_via_config(home_dir: &Path, touser: &str, text: &str) -> 
             .post(format!("{WECOM_API}/message/send"))
             .query(&[("access_token", token.as_str())])
             .json(&body)
-            .send()
+            .send_authorized()
             .await
-            .map_err(|e| format!("wecom send chunk {}: {}", i + 1, scrub_reqwest_err(e)))?
+            .map_err(|e| format!("wecom send chunk {}: {}", i + 1, e))?
             .json()
             .await
             .map_err(|e| format!("wecom send parse chunk {}: {}", i + 1, scrub_reqwest_err(e)))?;
@@ -931,9 +932,9 @@ pub async fn send_photo_via_config(
         .post(format!("{WECOM_API}/media/upload"))
         .query(&[("access_token", token.as_str()), ("type", "image")])
         .multipart(form)
-        .send()
+        .send_authorized()
         .await
-        .map_err(|e| format!("wecom media upload: {}", scrub_reqwest_err(e)))?
+        .map_err(|e| format!("wecom media upload: {}", e))?
         .json()
         .await
         .map_err(|e| format!("wecom media upload parse: {}", scrub_reqwest_err(e)))?;
@@ -961,9 +962,9 @@ pub async fn send_photo_via_config(
         .post(format!("{WECOM_API}/message/send"))
         .query(&[("access_token", token.as_str())])
         .json(&body)
-        .send()
+        .send_authorized()
         .await
-        .map_err(|e| format!("wecom sendImage: {}", scrub_reqwest_err(e)))?
+        .map_err(|e| format!("wecom sendImage: {}", e))?
         .json()
         .await
         .map_err(|e| format!("wecom sendImage parse: {}", scrub_reqwest_err(e)))?;

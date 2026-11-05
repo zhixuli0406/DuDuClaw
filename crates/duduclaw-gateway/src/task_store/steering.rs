@@ -185,9 +185,8 @@ impl TaskStore {
         require_safe_contract(new.body)?;
         let now_s = resp_ts(now);
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("submit steering: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         if let Some(existing) = tx
             .query_row(
                 &format!(
@@ -271,14 +270,14 @@ impl TaskStore {
                 row_to_steering,
             )
             .map_err(|e| format!("submit steering: reload: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("submit steering: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(SteeringSubmit::Created(row))
     }
 
     /// Every steering entry of a task, oldest first.
     pub async fn list_steering(&self, task_id: &str) -> Result<Vec<SteeringRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         steering_for_task_conn(
             &conn,
             task_id,
@@ -293,8 +292,10 @@ impl TaskStore {
         &self,
         now: DateTime<Utc>,
     ) -> Result<usize, String> {
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
+        let result = conn.execute(
             "UPDATE task_steering SET state='discarded', updated_at=?1,
                     discard_reason = CASE
                       WHEN (SELECT status FROM tasks WHERE id = task_steering.task_id) = 'cancelled'
@@ -304,12 +305,15 @@ impl TaskStore {
                     IN ('done','failed','cancelled')",
             params![resp_ts(now)],
         )
-        .map_err(|e| format!("discard finished steering: {e}"))
+        .map_err(|e| format!("discard finished steering: {e}"))?;
+        commit_live_write(conn)?;
+        Ok(result)
     }
 
     /// Facts the driver needs to decide whether a round is durable.
     pub async fn durable_info(&self, task_id: &str) -> Result<DurableInfo, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let occurrence = {
             let occ = conn
                 .query_row(
@@ -370,9 +374,8 @@ impl TaskStore {
     ) -> Result<IntentBegin, String> {
         let now_s = resp_ts(now);
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("begin intent: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         let task: Option<(String, i64, bool)> = tx
             .query_row(
                 &format!(
@@ -444,8 +447,7 @@ impl TaskStore {
             .into_iter()
             .filter(|s| s.intent_id.as_deref() == Some(intent.intent_id.as_str()))
             .collect();
-        tx.commit()
-            .map_err(|e| format!("begin intent: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(IntentBegin::Ready { intent, steering })
     }
 
@@ -462,9 +464,8 @@ impl TaskStore {
     ) -> Result<usize, String> {
         let now_s = resp_ts(now);
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("complete intent: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         tx.execute(
             "UPDATE task_dispatch_intents SET state='enqueued', updated_at=?2
               WHERE intent_id=?1 AND state='intended'",
@@ -481,8 +482,7 @@ impl TaskStore {
                 params![intent_id, applied_round, now_s],
             )
             .map_err(|e| format!("complete intent: steering: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("complete intent: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(applied)
     }
 
@@ -495,9 +495,8 @@ impl TaskStore {
     ) -> Result<bool, String> {
         let now_s = resp_ts(now);
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("abandon intent: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         let n = tx
             .execute(
                 "UPDATE task_dispatch_intents SET state='abandoned', updated_at=?2
@@ -516,8 +515,7 @@ impl TaskStore {
             params![intent_id, now_s],
         )
         .map_err(|e| format!("abandon intent: steering: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("abandon intent: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(n == 1)
     }
 
@@ -527,6 +525,7 @@ impl TaskStore {
         state: &str,
     ) -> Result<Vec<DispatchIntentRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {INTENT_COLUMNS} FROM task_dispatch_intents WHERE state = ?1
@@ -544,6 +543,7 @@ impl TaskStore {
         intent_id: &str,
     ) -> Result<Option<DispatchIntentRow>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             &format!("SELECT {INTENT_COLUMNS} FROM task_dispatch_intents WHERE intent_id = ?1"),
             params![intent_id],
@@ -560,6 +560,7 @@ impl TaskStore {
     /// Every other answer, including a read error, is a refusal.
     pub async fn fence_goal_dispatch(&self, intent_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let row: Option<(String, String)> = conn
             .query_row(
                 "SELECT state, task_id FROM task_dispatch_intents WHERE intent_id = ?1",
@@ -596,11 +597,13 @@ impl TaskStore {
     /// so such an occurrence still reaches `needs_human` at its deadline.
     pub async fn fence_candidate(&self, task_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         task_dispatchable_conn(&conn, task_id)
     }
 
     pub async fn fence_plain_goal_dispatch(&self, task_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         task_dispatchable_conn(&conn, task_id)?;
         occurrence_gate_conn(&conn, task_id)?
             .map_err(|reason| format!("stale_dispatch_fenced: {reason}"))
@@ -646,9 +649,8 @@ impl TaskStore {
     ) -> Result<usize, String> {
         let now_s = resp_ts(now);
         let mut conn = self.conn.lock().await;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| format!("unrun round: begin: {e}"))?;
+        verify_live_io()?;
+        let tx = begin_live_write(&mut conn)?;
         // M3-1: a round the dispatcher marked as started did run (the model
         // may have been called, its directions were in the prompt): it stays
         // counted and its directions stay delivered.
@@ -679,8 +681,7 @@ impl TaskStore {
                 params![message_id, now_s],
             )
             .map_err(|e| format!("unrun round: steering: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("unrun round: commit: {e}"))?;
+        commit_live_write(tx)?;
         Ok(n)
     }
 
@@ -692,20 +693,25 @@ impl TaskStore {
         intent_id: &str,
         now: DateTime<Utc>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().await;
-        conn.execute(
+        let mut connection = self.conn.lock().await;
+        let conn = begin_live_write(&mut connection)?;
+        verify_live_io()?;
+        let result = conn.execute(
             "UPDATE task_dispatch_intents SET started_at = COALESCE(started_at, ?2)
               WHERE intent_id = ?1",
             params![intent_id, resp_ts(now)],
         )
         .map(|n| n > 0)
-        .map_err(|e| format!("mark round started: {e}"))
+        .map_err(|e| format!("mark round started: {e}"))?;
+        commit_live_write(conn)?;
+        Ok(result)
     }
 
     /// M3-1: whether any round of this task was handed to a runtime (the
     /// durable start mark), whatever happened to its queue message since.
     pub async fn any_round_started(&self, task_id: &str) -> Result<bool, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM task_dispatch_intents
                             WHERE task_id = ?1 AND started_at IS NOT NULL)",
@@ -718,6 +724,7 @@ impl TaskStore {
     /// Ids of this task's `enqueued` (sent, not abandoned) round intents.
     pub async fn enqueued_intent_ids(&self, task_id: &str) -> Result<Vec<String>, String> {
         let conn = self.conn.lock().await;
+        verify_live_io()?;
         let mut stmt = conn
             .prepare(
                 "SELECT intent_id FROM task_dispatch_intents WHERE task_id = ?1 AND state = 'enqueued'",

@@ -412,6 +412,10 @@ pub(crate) async fn handle_list_cron_tasks(
             .collect()
     };
 
+    render_cron_tasks(&tasks, agent_id_filter)
+}
+
+pub(crate) fn render_cron_tasks(tasks: &[duduclaw_gateway::cron_store::CronTaskRow], agent_id_filter: &str) -> Value {
     if tasks.is_empty() {
         let scope = if agent_id_filter.is_empty() {
             "any agent".to_string()
@@ -425,13 +429,13 @@ pub(crate) async fn handle_list_cron_tasks(
 
     let mut lines = Vec::with_capacity(tasks.len() + 1);
     lines.push(format!("Found {} cron task(s):\n", tasks.len()));
-    for t in &tasks {
+    for t in tasks {
         let status_icon = if t.enabled { "▶" } else { "⏸" };
         let last_run = t.last_run_at.as_deref().unwrap_or("never");
         let last_status = t.last_status.as_deref().unwrap_or("-");
         lines.push(format!(
             "{status_icon} [{id}] {name}\n  cron: {cron} | agent: {agent} | runs: {runs} (fail: {fail})\n  last_run: {last_run} | last_status: {last_status}\n  task: {task}\n",
-            id = &t.id[..8],
+            id = truncate_bytes(&t.id, 8),
             name = t.name,
             cron = t.cron,
             agent = t.agent_id,

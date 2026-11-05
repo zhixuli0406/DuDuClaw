@@ -5,13 +5,14 @@ use std::{fs::File, future::Future, pin::Pin, sync::atomic::{AtomicUsize, Orderi
 
 struct Parser { calls: AtomicUsize, wrong_table: bool }
 impl FileParser for Parser {
-    fn parse<'a>(&'a self, context: RequestContext, request: ParseRequest, mut input: File,
+    fn parse<'a>(&'a self, call: duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall, request: ParseRequest,
+        mut input: duduclaw_mcp_boundary::resources::AuthorizedFile,
         _options: TableOptions)
         -> Pin<Box<dyn Future<Output = Result<ParseResponse, VerificationError>> + Send + 'a>> {
         Box::pin(async move {
             use std::io::Read;
             self.calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(context.record().employee, EmployeeId([2; 16]));
+            assert_eq!(call.context().record().employee, EmployeeId([2; 16]));
             let mut bytes = String::new();
             input.read_to_string(&mut bytes).unwrap();
             assert_eq!(bytes, "name\nAlice\n");
@@ -55,6 +56,9 @@ async fn isolated_table_reader_passes_only_authorized_fd_and_rebuilds_redaction_
         roots.insert("work".into(), EmployeeId([2; 16]), File::open(work.path()).unwrap()).unwrap();
         let inner = Arc::get_mut(&mut call).unwrap();
         inner.roots = Arc::new(roots);
+        let mut record = inner.context.record().clone();
+        record.tools = List::new(vec![Text::new("csv_read".into()).unwrap(), Text::new("xlsx_read".into()).unwrap()]).unwrap();
+        inner.context = live_context(record);
         inner.parser = Some(parser.clone());
         ISOLATED_CALL.scope(call, async {
             for args in [json!({"workspace":"other","path":"customers.csv"}),

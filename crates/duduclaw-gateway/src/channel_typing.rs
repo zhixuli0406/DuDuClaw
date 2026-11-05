@@ -14,6 +14,7 @@
 //! `TypingGuard` owns a refresh loop and stops it on drop (RAII, panic-safe)
 //! — same pattern as the original Discord implementation.
 
+use crate::isolation_http::LiveRequest;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -43,15 +44,17 @@ impl TypingGuard {
     {
         let active = Arc::new(AtomicBool::new(true));
         let flag = active.clone();
-        let handle = tokio::spawn(async move {
+        let authority = duduclaw_mcp_boundary::io_authority::capture();
+        let handle = tokio::spawn(async move { authority.scope(async move {
             loop {
-                if !flag.load(Ordering::Acquire) {
+                if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err()
+                    || !flag.load(Ordering::Acquire) {
                     break;
                 }
                 refresh().await;
                 tokio::time::sleep(interval).await;
             }
-        });
+        }).await });
         Self { active, handle }
     }
 }
@@ -71,7 +74,7 @@ pub fn telegram_typing(
             if let Some(tid) = message_thread_id {
                 body["message_thread_id"] = serde_json::json!(tid);
             }
-            let _ = client.post(&url).json(&body).send().await;
+            let _ = client.post(&url).json(&body).send_authorized().await;
         }
     })
 }
@@ -93,7 +96,7 @@ pub fn line_loading(
                 .post("https://api.line.me/v2/bot/chat/loading/start")
                 .bearer_auth(&token)
                 .json(&serde_json::json!({ "chatId": chat_id, "loadingSeconds": 60 }))
-                .send()
+                .send_authorized()
                 .await;
         }
     })
@@ -118,7 +121,7 @@ pub async fn whatsapp_typing_once(
             "message_id": inbound_message_id,
             "typing_indicator": { "type": "text" }
         }))
-        .send()
+        .send_authorized()
         .await;
 }
 
@@ -149,7 +152,7 @@ pub fn slack_status(
                     "thread_ts": ts,
                     "status": "正在思考…"
                 }))
-                .send()
+                .send_authorized()
                 .await;
         }
     })
@@ -250,5 +253,35 @@ mod tests {
         let client = reqwest::Client::new();
         let guard = typing_guard_for(client, "telegram", "-1001234567890", Some("7"), "tok");
         assert!(guard.is_some());
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    #[tokio::test]
+    async fn spawned_typing_loop_retains_authority_and_stops_after_revocation() {
+        let live = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = calls.clone();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let signal = Arc::new(std::sync::Mutex::new(Some(sent)));
+        let guard = duduclaw_mcp_boundary::io_authority::scope(
+            crate::isolation_io_test_support::context(live.clone()), async {
+                TypingGuard::start(Duration::from_millis(1), move || {
+                    let recorded = recorded.clone(); let signal = signal.clone();
+                    async move {
+                        recorded.fetch_add(1, Ordering::SeqCst);
+                        if let Some(sent) = signal.lock().unwrap().take() { let _ = sent.send(()); }
+                    }
+                })
+            }).await;
+        received.await.unwrap();
+        live.store(false, Ordering::SeqCst);
+        let before = calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), before);
+        drop(guard);
     }
 }

@@ -30,6 +30,15 @@ fn principal() -> Principal {
         scopes: [crate::mcp_auth::Scope::FilesRead].into_iter().collect(),
         is_external: false, created_at: chrono::Utc::now() }
 }
+struct TestLiveAuthority;
+impl duduclaw_isolation::capability::LiveRequestVerifier for TestLiveAuthority {
+    fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> { Ok(()) }
+}
+fn live_context(mut record: CapabilityRecord) -> RequestContext {
+    record.not_before = 1;
+    record.expires_at = u64::MAX;
+    RequestContext::with_live_verifier(record, Arc::new(TestLiveAuthority))
+}
 fn context() -> RequestContext {
     RequestContext::from_verified_record(CapabilityRecord {
         id: CapabilityId(Sha256Digest([1; 32])), employee: EmployeeId([2; 16]), run: RunId([3; 16]),
@@ -157,7 +166,7 @@ async fn isolated_file_read_uses_granted_fd_and_keeps_bounded_result() {
     std::fs::write(work.path().join("note.txt"), "abcdef").unwrap();
     let mut roots = ResourceRoots::default();
     roots.insert("work".into(), EmployeeId([2; 16]), std::fs::File::open(work.path()).unwrap()).unwrap();
-    let call = Arc::new(IsolatedCall { home: PathBuf::new(), execution: None, worker: None, record_resolver: None, context: context(), agent: "main".into(), roots: Arc::new(roots), parser: None, services: None });
+    let call = Arc::new(IsolatedCall { home: PathBuf::new(), execution: None, worker: None, record_resolver: None, context: live_context(context().record().clone()), agent: "main".into(), roots: Arc::new(roots), parser: None, services: None });
     ISOLATED_CALL.scope(call, async {
         let value = crate::mcp_files::handle_file_read(
             &json!({"workspace":"work", "path":"note.txt", "max_bytes":3}), home.path(), "main");
@@ -208,13 +217,13 @@ fn isolated_every_tool_def_has_exact_boundary_route_and_effect() {
     for name in ["unknown", "tasks_list_extra", "xmemory_search", "TASKS_LIST"] {
         assert_eq!(boundary_route(name), None);
     }
-    for name in ["hardware_info", "model_search", "model_recommend", "execute_program"] {
+    for name in ["hardware_info", "execute_program"] {
         assert_eq!(boundary_route(name), Some(BoundaryRoute::Execution));
     }
     for name in ["cost_recent", "cost_users", "wiki_read", "identity_resolve", "computer_session_start", "computer_workspace_write"] {
-        assert!(matches!(boundary_route(name), Some(BoundaryRoute::GatewayHandler(_))));
+        assert!(matches!(boundary_route(name), Some(BoundaryRoute::Resource)));
     }
-    assert!(matches!(boundary_route("google_status"), Some(BoundaryRoute::GatewayHandler(_))));
+    assert!(matches!(boundary_route("google_status"), Some(BoundaryRoute::Resource)));
 }
 
 struct RecordProbe;
@@ -229,20 +238,34 @@ impl duduclaw_mcp_boundary::tool_policy::ResourceResolver for RecordProbe {
     }
 }
 
+impl ResourceToolService for RecordProbe {
+    fn supports(&self, name: &str) -> bool { legacy_resource_handler(name) }
+    fn resolver(&self) -> &dyn duduclaw_mcp_boundary::tool_policy::ResourceResolver { self }
+    fn check_handler_policy<'a>(&'a self, _: &'a duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall)
+        -> Pin<Box<dyn Future<Output = Result<(), VerificationError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn execute<'a>(&'a self, _: duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall)
+        -> Pin<Box<dyn Future<Output = Result<Value, VerificationError>> + Send + 'a>> {
+        Box::pin(async { Err(VerificationError::Unavailable) })
+    }
+}
+
 #[tokio::test]
-async fn isolated_records_use_employee_authority_not_run_record_grants() {
+async fn isolated_records_enforce_explicit_run_grants_before_the_handler() {
     let home = tempfile::tempdir().unwrap();
     let mut record = context().record().clone();
     record.lane = Lane::Standard;
     record.tools = List::new(vec![Text::new("tasks_update".into()).unwrap()]).unwrap();
     record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee },
         ResourceGrant::Task { id: Text::new("task-a".into()).unwrap() }]).unwrap();
-    let call = Arc::new(IsolatedCall { home: home.path().into(), context: RequestContext::from_verified_record(record),
+    let call = Arc::new(IsolatedCall { home: home.path().into(), context: live_context(record),
         agent: "main".into(), roots: Arc::new(ResourceRoots::default()), parser: None,
-        services: None, execution: None, worker: None, record_resolver: Some(Arc::new(RecordProbe)) });
+        services: Some(Arc::new(RecordProbe)), execution: None, worker: None, record_resolver: Some(Arc::new(RecordProbe)) });
     ISOLATED_CALL.scope(call, async {
-        assert!(dispatch_resource_tool(home.path(), "tasks_update", &json!({"task_id":"task-a"})).await.is_none());
-        assert!(dispatch_resource_tool(home.path(), "tasks_update", &json!({"task_id":"task-b"})).await.is_none());
+        let allowed = authorize_gateway_handler(home.path(), "tasks_update", &json!({"task_id":"task-a"})).await.unwrap();
+        assert_eq!(allowed.arguments()["task_id"], "task-a");
+        assert!(authorize_gateway_handler(home.path(), "tasks_update", &json!({"task_id":"task-b"})).await.is_err());
         // The original handler still checks record ownership/delegation.
         let denied = dispatch_resource_tool(home.path(), "tasks_update", &json!({"principal":"operator"})).await.unwrap();
         assert_eq!(denied["isError"], true);
@@ -254,7 +277,7 @@ async fn isolated_record_route_reuses_original_dispatch_and_handler() {
     let home = tempfile::tempdir().unwrap();
     let mut adapter = adapter(home.path());
     adapter.principal.scopes = [crate::mcp_auth::Scope::Admin].into_iter().collect();
-    adapter = adapter.with_record_resolver(Arc::new(RecordProbe));
+    adapter = adapter.with_record_resolver(Arc::new(RecordProbe)).with_resource_services(Arc::new(RecordProbe));
     std::fs::write(home.path().join("agents/main/agent.toml"),
         "[agent]\nname = \"main\"\n[capabilities]\nallowed_tools = [\"mcp__duduclaw__*\"]\n").unwrap();
     let mut record = context().record().clone();
@@ -262,14 +285,14 @@ async fn isolated_record_route_reuses_original_dispatch_and_handler() {
     record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee }]).unwrap();
     let request = json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
         "params":{"name":"plan_start","arguments":{"task":"isolation plan"}}});
-    let response = adapter.dispatch(RequestContext::from_verified_record(record.clone()), "main", request.clone()).await.unwrap().unwrap();
+    let response = adapter.dispatch(live_context(record.clone()), "main", request.clone()).await.unwrap().unwrap();
     assert!(response.get("error").is_none(), "{response}");
     let body: Value = serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(body["task"], "isolation plan");
     assert_eq!(body["clarify_first"], true);
     std::fs::write(home.path().join("agents/main/agent.toml"),
         "[agent]\nname = \"main\"\n[capabilities]\ndenied_tools = [\"plan_start\"]\n").unwrap();
-    let response = adapter.dispatch(RequestContext::from_verified_record(record), "main", request).await.unwrap().unwrap();
+    let response = adapter.dispatch(live_context(record), "main", request).await.unwrap().unwrap();
     assert!(response.get("error").is_some(), "{response}");
 }
 
@@ -282,7 +305,7 @@ fn isolated_round4_inventory_has_no_implicit_resource_fallback() {
         let route = boundary_route(tool.name).expect("exact route");
         if intentional_refusal(tool.name).is_some() { continue; }
         if route == BoundaryRoute::Resource {
-            assert!(tool.name == "wiki_read"
+            assert!(legacy_resource_handler(tool.name)
                 || duduclaw_gateway::isolation_connectors::provider_for_tool(tool.name).is_some(),
                 "resource tool has neither production adapter nor intentional refusal: {}", tool.name);
         }
@@ -297,7 +320,7 @@ async fn isolated_round4_intentional_refusals_stay_hidden_with_grants() {
             let mut record = context().record().clone();
             record.tools = List::new(vec![Text::new(tool.name.into()).unwrap()]).unwrap();
             record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee }]).unwrap();
-            let call = Arc::new(IsolatedCall { home: PathBuf::new(), context: RequestContext::from_verified_record(record),
+            let call = Arc::new(IsolatedCall { home: PathBuf::new(), context: live_context(record),
                 agent: "main".into(), roots: Arc::new(ResourceRoots::default()), parser: None,
                 services: None, execution: None, worker: None, record_resolver: Some(Arc::new(RecordProbe)) });
             ISOLATED_CALL.scope(call, async {
@@ -347,7 +370,7 @@ async fn isolated_mail_read_preserves_original_employee_ownership_rule() {
 #[tokio::test]
 async fn isolated_round5_workflow_session_is_host_only_and_bound_to_one_run() {
     let home = tempfile::tempdir().unwrap();
-    let mut adapter = adapter(home.path());
+    let mut adapter = adapter(home.path()).with_resource_services(Arc::new(RecordProbe));
     adapter.principal.scopes = [crate::mcp_auth::Scope::Admin].into_iter().collect();
     std::fs::write(home.path().join("agents/main/agent.toml"),
         "[agent]\nname = \"main\"\n[capabilities]\nallowed_tools = [\"mcp__duduclaw__*\"]\n").unwrap();
@@ -363,12 +386,12 @@ async fn isolated_round5_workflow_session_is_host_only_and_bound_to_one_run() {
             "session_id":"different-session", "expires_at":"2099-01-01T00:00:00Z", "mac":"invalid"
         }}}
     }});
-    let matching = adapter.dispatch(RequestContext::from_verified_record(record.clone()), "main", request.clone())
+    let matching = adapter.dispatch(live_context(record.clone()), "main", request.clone())
         .await.unwrap().unwrap();
     assert!(matching.to_string().contains("workflow session mismatch"), "{matching}");
     assert!(!matching.to_string().contains(&secret));
     record.run = RunId([9; 16]);
-    let other = adapter.dispatch(RequestContext::from_verified_record(record), "main", request)
+    let other = adapter.dispatch(live_context(record), "main", request)
         .await.unwrap().unwrap();
     assert!(other.to_string().contains("workflow extension unavailable"), "{other}");
     assert!(!other.to_string().contains(&secret));

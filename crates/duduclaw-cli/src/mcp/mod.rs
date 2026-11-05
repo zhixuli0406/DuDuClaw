@@ -167,6 +167,11 @@ mod decision_tools;
 mod delegation;
 mod discovery;
 mod group_history;
+
+pub(crate) async fn handle_bound_group_history(args: &serde_json::Value, home: &std::path::Path, employee: &str) -> serde_json::Value {
+    group_history::handle_for_employee(args, home, employee).await
+}
+
 mod dispatch;
 mod evolution;
 mod exec;
