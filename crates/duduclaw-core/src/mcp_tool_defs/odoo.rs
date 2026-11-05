@@ -29,7 +29,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "limit",
-                description: "Max results (default 20)",
+                description: "Positive integer or numeric string (default 20, max 100)",
                 required: false,
             },
         ],
@@ -60,7 +60,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "expected_revenue",
-                description: "Expected revenue",
+                description: "Positive number or numeric string; decimals allowed",
                 required: false,
             },
         ],
@@ -71,7 +71,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
         params: &[
             ParamDef {
                 name: "lead_id",
-                description: "Lead ID",
+                description: "Lead ID: positive integer or numeric string",
                 required: true,
             },
             ParamDef {
@@ -92,7 +92,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "limit",
-                description: "Max results (default 20)",
+                description: "Positive integer or numeric string (default 20, max 100)",
                 required: false,
             },
         ],
@@ -103,17 +103,17 @@ pub(super) const TOOLS: &[ToolDef] = &[
         params: &[
             ParamDef {
                 name: "partner_id",
-                description: "Customer partner ID",
+                description: "Customer partner ID: positive integer or numeric string",
                 required: true,
             },
             ParamDef {
                 name: "product_id",
-                description: "Product ID",
+                description: "Product ID: positive integer or numeric string",
                 required: true,
             },
             ParamDef {
                 name: "quantity",
-                description: "Quantity (default 1)",
+                description: "Positive number or numeric string (default 1); decimals allowed",
                 required: false,
             },
         ],
@@ -123,14 +123,19 @@ pub(super) const TOOLS: &[ToolDef] = &[
         description: "Confirm a quotation into a sale order",
         params: &[ParamDef {
             name: "order_id",
-            description: "Sale order ID to confirm",
+            description: "Sale order ID to confirm: positive integer or numeric string",
             required: true,
         }],
     },
     ToolDef {
         name: "odoo_inventory_products",
-        description: "Search products with stock levels in Odoo",
+        description: "Search all product types with stock levels; optionally restrict to storable products",
         params: &[
+            ParamDef {
+                name: "storable_only",
+                description: "Boolean (default false). Only storable products when true; uses the server's available stockable field",
+                required: false,
+            },
             ParamDef {
                 name: "query",
                 description: "Product name search",
@@ -138,17 +143,17 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "limit",
-                description: "Max results (default 20)",
+                description: "Positive integer or numeric string (default 20, max 100)",
                 required: false,
             },
         ],
     },
     ToolDef {
         name: "odoo_inventory_check",
-        description: "Check real-time stock level for a specific product",
+        description: "Return product name, on-hand/forecast totals, and up to 10 stock location details",
         params: &[ParamDef {
             name: "product_id",
-            description: "Product ID",
+            description: "Product ID: positive integer or numeric string",
             required: true,
         }],
     },
@@ -163,7 +168,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "limit",
-                description: "Max results (default 20)",
+                description: "Positive integer or numeric string (default 20, max 100)",
                 required: false,
             },
         ],
@@ -173,7 +178,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
         description: "Check payment status for an invoice",
         params: &[ParamDef {
             name: "invoice_id",
-            description: "Invoice ID",
+            description: "Invoice ID: positive integer or numeric string",
             required: true,
         }],
     },
@@ -198,7 +203,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "limit",
-                description: "Max results (default 20)",
+                description: "Positive integer or numeric string (default 20, max 100)",
                 required: false,
             },
         ],
@@ -235,7 +240,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "record_id",
-                description: "Record ID",
+                description: "Record ID: positive integer or numeric string",
                 required: true,
             },
         ],
@@ -251,7 +256,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "limit",
-                description: "Max results (default 10, max 40)",
+                description: "Positive integer or numeric string (default 10, max 40)",
                 required: false,
             },
         ],
