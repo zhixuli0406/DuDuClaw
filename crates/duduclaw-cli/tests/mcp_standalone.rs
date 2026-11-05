@@ -374,3 +374,37 @@ fn mcp_server_without_key_names_the_init_command() {
         "missing hint: {all}"
     );
 }
+
+#[test]
+fn standalone_delegation_sender_cannot_spoof_audit_actor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = home.join(".duduclaw");
+    let cwd = tmp.path().join("work");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut env = init_env(&home, &data);
+    let client = env.iter().find(|(k, _)| k == duduclaw_core::ENV_AGENT_ID).unwrap().1.clone();
+    env.push((duduclaw_core::ENV_DELEGATION_SENDER.to_string(), "sales".to_string()));
+    // A malformed proof cannot promote an external principal either.
+    env.push((duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN.to_string(), "forged".to_string()));
+    let mut server = Server::start(&home, &data, &env, &cwd);
+    let result = server.call("memory_store", json!({"content": "Audit attribution regression marker"}));
+    assert!(result.get("error").is_none(), "{result}");
+    assert_ne!(result["result"]["isError"], true, "{result}");
+    let rows = std::fs::read_to_string(data.join("tool_calls.jsonl")).unwrap();
+    let audit: Vec<Value> = rows.lines().map(|l| serde_json::from_str(l).unwrap())
+        .filter(|r: &Value| r["tool_name"] == "memory_store").collect();
+    assert!(!audit.is_empty(), "missing memory_store audit: {rows}");
+    for row in audit { assert_eq!(row["agent_id"], client, "{row}"); }
+    let db = rusqlite::Connection::open(data.join("events.db")).unwrap();
+    let payload: String = db.query_row("SELECT payload FROM events WHERE event = 'memory.changed' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    let feedback: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(feedback["agent_id"], client, "{feedback}");
+    // Rejected calls must use the same authenticated actor too.
+    server.call("tasks_list", json!({}));
+    let rows = std::fs::read_to_string(data.join("tool_calls.jsonl")).unwrap();
+    for row in rows.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()) {
+        assert_ne!(row["agent_id"], "sales", "{row}");
+    }
+}

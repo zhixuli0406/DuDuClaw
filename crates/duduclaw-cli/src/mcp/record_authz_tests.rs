@@ -1163,7 +1163,7 @@ async fn paused_verified_caller_cannot_create_background_work_for_another_agent(
                 &odoo,
                 &ns,
                 &quota,
-                "sales-rep",
+                &audit_test_principal("sales-rep", false),
                 false,
             )
             .await;
@@ -1216,7 +1216,7 @@ async fn paused_verified_caller_cannot_create_background_work_for_another_agent(
             &odoo,
             &ns,
             &quota,
-            "sales-rep",
+            &audit_test_principal("sales-rep", false),
             false,
         )
         .await;

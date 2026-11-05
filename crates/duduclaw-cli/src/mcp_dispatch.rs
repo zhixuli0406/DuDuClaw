@@ -579,12 +579,13 @@ impl McpDispatcher {
     /// call and an executed call attribute to the same identity.
     fn audit_dispatch_denial(
         &self,
+        principal: &Principal,
         tool_name: &str,
         params: &Value,
         error_class: &str,
         detail: &str,
     ) {
-        let agent_id = crate::mcp::resolve_audit_agent(|| self.default_agent.clone());
+        let agent_id = crate::mcp::resolve_audit_agent(&self.home_dir, Some(principal), &self.default_agent);
         // `computer_type`'s text is reduced to its length here too (F5).
         let arguments = params
             .get("arguments")
@@ -1002,6 +1003,7 @@ impl McpDispatcher {
                 // Exactly one bounded receipt: no caller-controlled arguments,
                 // state contents, or arbitrarily long denial details.
                 self.audit_dispatch_denial(
+                    principal,
                     tool_name,
                     &Value::Null,
                     "autonomy_pause",
@@ -1032,7 +1034,7 @@ impl McpDispatcher {
                     ),
                 );
             } else {
-                self.audit_dispatch_denial(tool_name, &params_owned, error_class, &detail);
+                self.audit_dispatch_denial(principal, tool_name, &params_owned, error_class, &detail);
             }
             return response;
         }
@@ -1098,6 +1100,7 @@ impl McpDispatcher {
         if let Some(removed) = removed_reply {
             duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
             self.audit_dispatch_denial(
+                principal,
                 tool_name,
                 params,
                 "removed_tool",
@@ -1413,7 +1416,7 @@ impl McpDispatcher {
             && !crate::mcp::check_system_operation_principal(&self.home_dir, gate_agent).await
         {
             duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
-            self.audit_dispatch_denial(tool_name, &params_owned, "system_operation_human_denied", "A live administrator or proven background context is required");
+            self.audit_dispatch_denial(principal, tool_name, &params_owned, "system_operation_human_denied", "A live administrator or proven background context is required");
             let language = duduclaw_gateway::prompt_identity::read_default_language(&self.home_dir).await;
             let message = match language.as_deref() {
                 Some("en") => "Only an administrator can operate the machine.",
@@ -1436,6 +1439,7 @@ impl McpDispatcher {
                  [capabilities] codrive = true 後再使用。"
             );
             self.audit_dispatch_denial(
+                principal,
                 tool_name,
                 &params_owned,
                 "codrive_capability_missing",
@@ -1463,6 +1467,7 @@ impl McpDispatcher {
                  授權會寫入該員工的 [capabilities] db_sources（名稱對應 config.toml 的 [db_sources.<名稱>]）。"
             );
             self.audit_dispatch_denial(
+                principal,
                 tool_name,
                 &params_owned,
                 "db_sources_capability_missing",
@@ -1573,6 +1578,7 @@ impl McpDispatcher {
                          capability_request（附 tool 與 reason）取得人工核准後再執行。"
                     );
                     self.audit_dispatch_denial(
+                        principal,
                         tool_name,
                         &params_owned,
                         "capability_grant_missing",
@@ -1591,6 +1597,7 @@ impl McpDispatcher {
         ) {
             if !principal.scopes.contains(&required) && !principal.scopes.contains(&Scope::Admin) {
                 self.audit_dispatch_denial(
+                    principal,
                     tool_name,
                     &params_owned,
                     "insufficient_scope",
@@ -1617,7 +1624,7 @@ impl McpDispatcher {
                         // Other unavailable-state failures retain the existing
                         // combined approval/audit path, but cannot dispatch.
                         if reason == duduclaw_gateway::egress_guard::READ_DURING_SINK {
-                            self.audit_dispatch_denial(tool_name, &params_owned, "egress_guard", &message);
+                            self.audit_dispatch_denial(principal, tool_name, &params_owned, "egress_guard", &message);
                             return jsonrpc_error(id, -32003, &message);
                         }
                         private_read_failure = Some(message);
@@ -1656,7 +1663,7 @@ impl McpDispatcher {
                 Ok(Some(reason)) => { params_owned["egress_guard"] = reason; }
                 Ok(None) => {}
                 Err(message) => {
-                    self.audit_dispatch_denial(tool_name, &params_owned, "egress_guard", &message);
+                    self.audit_dispatch_denial(principal, tool_name, &params_owned, "egress_guard", &message);
                     return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
                 }
             }
@@ -1836,7 +1843,7 @@ impl McpDispatcher {
                 &self.odoo,
                 ns_ctx,
                 &self.daily_quota,
-                &principal.client_id,
+                principal,
                 caller_is_admin,
             ),
         );

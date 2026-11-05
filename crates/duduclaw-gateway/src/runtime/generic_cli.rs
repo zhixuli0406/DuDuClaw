@@ -615,6 +615,7 @@ impl GenericCliRuntime {
             for (k, v) in duduclaw_core::mcp_forward_env_vars() {
                 cmd.env(k, v);
             }
+            cmd.envs(crate::claude_runner::delegation_audit_env(&context.home_dir, &context.agent_id));
             // P2-B N4: the turn/run source identity, same channel as the id.
             // N13: this CLI inherits the gateway's environment, so a
             // `DUDUCLAW_UPSTREAM_UNKNOWN` the operator happened to export

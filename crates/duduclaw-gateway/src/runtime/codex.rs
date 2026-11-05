@@ -477,15 +477,29 @@ fn mcp_override_args_with(
     home_dir: &std::path::Path,
     supports_env_vars: bool,
 ) -> McpOverrides {
+    mcp_override_args_with_extra_env(agent_id, home_dir, supports_env_vars, &[])
+}
+
+fn mcp_override_args_with_extra_env(
+    agent_id: &str,
+    home_dir: &std::path::Path,
+    supports_env_vars: bool,
+    extra: &[(String, String)],
+) -> McpOverrides {
     if !supports_env_vars {
+        // Old Codex cannot forward secrets privately. Do not disclose a new
+        // delegation proof through argv; audit falls back to the worker.
         return McpOverrides {
             args: mcp_override_args(agent_id, home_dir),
             process_env: Vec::new(),
         };
     }
-    let Some(def) = super::duduclaw_mcp_server_json_for_home(agent_id, home_dir) else {
+    let Some(mut def) = super::duduclaw_mcp_server_json_for_home(agent_id, home_dir) else {
         return McpOverrides::default();
     };
+    if let Some(env) = def.get_mut("env").and_then(|e| e.as_object_mut()) {
+        for (key, value) in extra { env.insert(key.clone(), serde_json::json!(value)); }
+    }
     let mut args = mcp_override_base_args(&def);
     let mut process_env: Vec<(String, String)> = Vec::new();
     if let Some(env) = def.get("env").and_then(|e| e.as_object()) {
@@ -1600,8 +1614,10 @@ impl AgentRuntime for CodexRuntime {
         // path per process; env passthrough alone falls back on probe failure.
         // The required employee permission profile was checked above.
         let supports_env_vars = codex_supports_env_vars(&self.codex_path).await;
-        let mcp_overrides =
-            mcp_override_args_with(&context.agent_id, &context.home_dir, supports_env_vars);
+        let audit_env = crate::claude_runner::delegation_audit_env(&context.home_dir, &context.agent_id);
+        let mcp_overrides = mcp_override_args_with_extra_env(
+            &context.agent_id, &context.home_dir, supports_env_vars, &audit_env,
+        );
         // Values first: on the `env_vars` branch Codex copies these out of its
         // OWN environment, so they must be set before it runs. They never
         // appear in `argv` (only their names do).
@@ -1926,6 +1942,31 @@ pub(crate) mod third_party;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegation_proof_uses_secret_env_vars() {
+        let home = tempfile::tempdir().unwrap();
+        let _key = zeroize::Zeroizing::new(duduclaw_core::identity_token::ensure_key(home.path()).unwrap());
+        let baseline = mcp_override_args_with("tester", home.path(), true);
+        assert!(!baseline.args.is_empty(), "MCP server must be resolvable");
+        assert!(baseline.process_env.iter().any(|(key, _)| key == duduclaw_core::ENV_AGENT_TOKEN));
+        let name = duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN;
+        let proof = "host-proof-do-not-expose";
+        let extra = vec![(name.to_string(), proof.to_string()),
+                         (duduclaw_core::ENV_DELEGATION_SENDER.to_string(), "researcher".to_string())];
+        let merged = mcp_override_args_with_extra_env("tester", home.path(), true, &extra);
+        assert!(merged.process_env.contains(&(name.to_string(), proof.to_string())));
+        let names: Vec<_> = merged.args.iter().filter(|a| a.starts_with("mcp_servers.duduclaw.env_vars=")).collect();
+        assert_eq!(names.len(), 1, "secret names must be merged, never overwritten");
+        assert!(names[0].contains(name));
+        for (key, value) in baseline.process_env {
+            assert!(names[0].contains(&key));
+            assert!(merged.process_env.contains(&(key, value)));
+        }
+        assert!(!merged.args.iter().any(|a| a.contains(proof)));
+        let legacy = mcp_override_args_with_extra_env("tester", home.path(), false, &extra);
+        assert!(!legacy.args.iter().any(|a| a.contains(proof)));
+    }
 
     #[test]
     fn test_parse_codex_event() {

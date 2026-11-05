@@ -233,6 +233,7 @@ fn clear_delegation_env() {
         std::env::remove_var(duduclaw_core::ENV_DELEGATION_DEPTH);
         std::env::remove_var(duduclaw_core::ENV_DELEGATION_ORIGIN);
         std::env::remove_var(duduclaw_core::ENV_DELEGATION_SENDER);
+        std::env::remove_var(duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN);
     }
 }
 
@@ -245,8 +246,22 @@ fn clear_delegation_env() {
 /// dispatch path (not a hand-written fixture) and returns the resulting
 /// `tool_calls.jsonl` line. Caller sets/clears `DUDUCLAW_DELEGATION_SENDER`
 /// under `ENV_LOCK` around the call.
-async fn dispatch_pairing_manage_list_and_read_audit_line(default_agent: &str) -> String {
+async fn dispatch_pairing_manage_list_and_read_audit_line(default_agent: &str, signed_sender: Option<&str>) -> String {
     let tmp = TempDir::new();
+    if let Some(sender) = signed_sender {
+        let key = zeroize::Zeroizing::new(duduclaw_core::identity_token::ensure_key(tmp.path()).unwrap());
+        let context = std::collections::HashMap::from([
+            (duduclaw_core::ENV_DELEGATION_SENDER.to_string(), sender.to_string()),
+        ]);
+        let env = duduclaw_gateway::claude_runner::DELEGATION_ENV.scope(context, async {
+            duduclaw_gateway::claude_runner::delegation_audit_env(tmp.path(), default_agent)
+        }).await;
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_AGENT_ID, default_agent);
+            std::env::set_var(duduclaw_core::ENV_AGENT_TOKEN, duduclaw_core::mint_identity_token(&key, default_agent));
+            for (k, v) in env { std::env::set_var(k, v); }
+        }
+    }
     let memory = SqliteMemoryEngine::new(&tmp.path().join("memory.db")).expect("memory engine");
     let odoo: OdooState = std::sync::Arc::new(crate::odoo_pool::OdooConnectorPool::default());
     let ns = crate::mcp_namespace::NamespaceContext {
@@ -270,11 +285,15 @@ async fn dispatch_pairing_manage_list_and_read_audit_line(default_agent: &str) -
         &odoo,
         &ns,
         &quota,
-        "default",
+        &audit_test_principal("default", false),
         true,
     )
     .await;
 
+    if signed_sender.is_some() { unsafe {
+        std::env::remove_var(duduclaw_core::ENV_AGENT_ID);
+        std::env::remove_var(duduclaw_core::ENV_AGENT_TOKEN);
+    } }
     let body = fs::read_to_string(tmp.path().join("tool_calls.jsonl"))
         .expect("audit record must be written for a state-changing tool");
     body.lines()

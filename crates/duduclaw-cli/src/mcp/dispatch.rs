@@ -10,9 +10,10 @@ pub(crate) async fn handle_tools_call(
     odoo: &OdooState,
     ns_ctx: &crate::mcp_namespace::NamespaceContext,
     daily_quota: &crate::mcp_memory_quota::DailyQuota,
-    caller_client_id: &str,
+    principal: &crate::mcp_auth::Principal,
     caller_is_admin: bool,
 ) -> Value {
+    let caller_client_id = principal.client_id.as_str();
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let arguments = params
         .get("arguments")
@@ -818,18 +819,14 @@ pub(crate) async fn handle_tools_call(
     };
 
     // ── Tool call audit trail (L1 anti-hallucination) ──────────
-    // Use the actual EXECUTING agent's ID, not just default_agent verbatim.
-    // In a genuine agent-to-agent delegation, DUDUCLAW_DELEGATION_SENDER
-    // identifies the real caller; when it is a system/scheduler sender
-    // (goal-loop-driver / cron / heartbeat / autopilot / dashboard / webhook)
-    // it names who dispatched the work, not who is executing this tool call —
-    // see `resolve_audit_agent` (WP-A10 BUG-1 fix).
+    // External calls retain the authenticated client id. Internal delegation
+    // attribution requires the host proof bound to the verified worker.
     if is_state_changing {
         let success = !result
             .get("isError")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let actual_agent = resolve_audit_agent(|| default_agent.to_string());
+        let actual_agent = resolve_audit_agent(home_dir, Some(principal), default_agent);
         let params_summary = build_params_summary(tool_name, &arguments);
         // R4 (TraceElephant): capture the tool's INPUT arguments, not just the
         // outcome summary — masked (secret keys/values), size-capped, and
@@ -883,8 +880,9 @@ pub(crate) async fn handle_tools_call(
     // results here; state-changing calls already have their canonical audit.
     let pruning_success = !result.get("isError").and_then(Value::as_bool).unwrap_or(false);
     if pruning_success {
-        let actual_agent = resolve_audit_agent(|| default_agent.to_string());
-        let pruning_agent = acting_agent_id(caller_client_id, default_agent);
+        let actual_agent = resolve_audit_agent(home_dir, Some(principal), default_agent);
+        let pruning_agent = if principal.is_external { caller_client_id }
+            else { acting_agent_id(caller_client_id, default_agent) };
         if !is_state_changing || actual_agent != pruning_agent {
             duduclaw_security::audit::append_tool_call_with_extras(
                 home_dir, pruning_agent, tool_name, "usage", true,
@@ -904,19 +902,8 @@ pub(crate) async fn handle_tools_call(
     // `spawn_events_db_poll` tail pushes it to every connected dashboard,
     // which refetches the matching page. Best-effort: never affects `result`.
     //
-    // The caller agent is resolved the same way the audit trail resolves it
-    // (`resolve_audit_agent` — a genuine agent-to-agent delegation is
-    // attributed to the real sender, a system/scheduler sender is not) and
-    // falls back to the memory write namespace, which is exactly the key
-    // `memory.db` rows are stored under and therefore exactly what
-    // MemoryBrowser filters on.
-    let feedback_agent = resolve_audit_agent(|| {
-        if ns_ctx.write_namespace.is_empty() {
-            default_agent.to_string()
-        } else {
-            ns_ctx.write_namespace.clone()
-        }
-    });
+    // Feedback and audit share the same authenticated attribution.
+    let feedback_agent = resolve_audit_agent(home_dir, Some(principal), default_agent);
     duduclaw_gateway::dashboard_feedback::emit_for_tool(
         home_dir,
         tool_name,

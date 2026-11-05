@@ -1754,6 +1754,20 @@ fn mcp_client_envs(agent_id: &str) -> Vec<(String, String)> {
     mcp_client_envs_in(agent_id, &duduclaw_core::platform::duduclaw_home())
 }
 
+/// Per-spawn audit context comes only from the host dispatcher task-local.
+/// Empty pairs clear inherited proof on non-delegated invocations.
+pub fn delegation_audit_env(home: &Path, worker: &str) -> Vec<(String, String)> {
+    use duduclaw_core::identity_token::{ENV_DELEGATION_AUDIT_TOKEN, mint_delegation_audit_token};
+    let sender = DELEGATION_ENV.try_with(|env| env.get(duduclaw_core::ENV_DELEGATION_SENDER).cloned())
+        .ok().flatten().unwrap_or_default();
+    let token = if duduclaw_core::is_valid_agent_id(&sender) && !duduclaw_core::is_system_sender(&sender) {
+        duduclaw_core::load_identity_key(home).map(zeroize::Zeroizing::new)
+            .map(|key| mint_delegation_audit_token(&key, worker, &sender)).unwrap_or_default()
+    } else { String::new() };
+    vec![(duduclaw_core::ENV_DELEGATION_SENDER.to_string(), sender),
+         (ENV_DELEGATION_AUDIT_TOKEN.to_string(), token)]
+}
+
 fn mcp_client_envs_in(agent_id: &str, home: &Path) -> Vec<(String, String)> {
     // Identity pair: id + (when `<home>/identity.key` exists) the WP21 debt ⑧
     // `DUDUCLAW_AGENT_TOKEN`. Without the token this path is the one MCP
@@ -1769,6 +1783,7 @@ fn mcp_client_envs_in(agent_id: &str, home: &Path) -> Vec<(String, String)> {
         .filter(|(key, _)| key != "DUDUCLAW_HOME"));
     envs.push(("DUDUCLAW_HOME".into(), home.to_string_lossy().into_owned()));
     // P2-A H-2: the round this tool loop runs for (openai-compat runtime).
+    envs.extend(delegation_audit_env(home, agent_id));
     envs.extend(crate::runtime::round_task_env());
     // The explore lane (`crate::explore_lane`, either source): the
     // openai-compat runtime has no built-ins, the MCP server is the gate.
@@ -4448,6 +4463,9 @@ fn prepare_claude_cmd(
             debug!("No DELEGATION_ENV task-local — delegation depth tracking inactive");
         }
     }
+
+    let audit_worker = config_dir.and_then(|d| d.file_name()).and_then(|s| s.to_str()).unwrap_or("");
+    cmd.envs(delegation_audit_env(home_dir, audit_worker));
 
     // Inject channel reply context so `send_to_agent` MCP tool can register
     // delegation callbacks for sub-agent response forwarding.

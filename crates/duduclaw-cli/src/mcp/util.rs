@@ -171,46 +171,39 @@ pub(crate) fn shared_wiki_reader<'a>(
     }
 }
 
-/// Resolve the agent identity to stamp on execution-attribution records for
-/// this MCP call — `tool_calls.jsonl` audit rows and dashboard live-feedback
-/// events. NOT for delegation-policy decisions (see below).
-///
-/// `DUDUCLAW_DELEGATION_SENDER` (`duduclaw_core::ENV_DELEGATION_SENDER`)
-/// answers a *policy* question — "who delegated this work?" — injected by
-/// `dispatcher.rs`'s `DelegationEnv` (and `cron_scheduler.rs`) into every
-/// spawned Claude CLI subprocess so the WP21 delegation gate can judge the
-/// request. Every scheduler-driven dispatch path (goal-loop, cron, heartbeat,
-/// autopilot) as well as the two human-interface paths (dashboard, webhook)
-/// stamps one of the six `duduclaw_core::SYSTEM_SENDERS` ids as the sender —
-/// these are schedulers / human interfaces, never agents, and never call an
-/// MCP tool themselves. The *worker* agent's own subprocess — whose MCP
-/// server resolves `default_agent` from `DUDUCLAW_AGENT_ID` — is what
-/// actually dials `tools/call`.
-///
-/// Before this fix, execution attribution stamped the sender verbatim, so
-/// every tool call a goal-loop worker made was recorded under
-/// `goal-loop-driver` in `tool_calls.jsonl` instead of the worker's own id.
-/// That starved `task_observe`/A3/A4 of any evidence (every round settled
-/// `Unobservable`, so `task_prediction_log` never closed and no task-rule was
-/// ever induced), left the B3 grounding pre-check permanently `Skip`, and
-/// made the MAV acceptance judge treat honest tool-backed work as an
-/// unverifiable claim — see `wiki/reports/memory-quality/2026-08/wp-a10-live-test-2026-08-06.md`
-/// BUG-1. Because all of those dispatch paths funnel through this single
-/// read site, fixing it here covers every one of them; `goal_loop.rs`,
-/// `cron_scheduler.rs`, `dispatcher.rs` and friends are unchanged.
-///
-/// A genuine agent-to-agent delegation (the sender is a real agent id, not a
-/// reserved system sender) is unaffected: the sender IS the actual caller in
-/// that case, so it is still what gets stamped. Delegation-POLICY decisions
-/// (e.g. `handle_spawn_ephemeral`'s capability envelope / org-placement
-/// `parent`) intentionally do NOT go through this helper — they must keep
-/// reading `DUDUCLAW_DELEGATION_SENDER` verbatim, because "who is allowed to
-/// delegate here" and "who executed this tool call" are different questions.
-pub(crate) fn resolve_audit_agent(fallback: impl FnOnce() -> String) -> String {
-    match std::env::var(duduclaw_core::ENV_DELEGATION_SENDER) {
-        Ok(sender) if !sender.is_empty() && !duduclaw_core::is_system_sender(&sender) => sender,
-        _ => fallback(),
+/// Audit attribution is bound to authenticated transport identity. An external
+/// client never inherits an employee or ambient delegation sender. Internal
+/// senders require a host MAC bound to the strictly verified worker identity;
+/// identity-token grace does not authenticate delegation context.
+pub(crate) fn resolve_audit_agent(
+    home: &Path,
+    principal: Option<&crate::mcp_auth::Principal>,
+    default_agent: &str,
+) -> String {
+    let Some(principal) = principal else { return default_agent.to_string(); };
+    if principal.is_external {
+        return principal.client_id.clone();
     }
+    let worker = default_agent;
+    let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    let identity = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
+    let sender = std::env::var(duduclaw_core::ENV_DELEGATION_SENDER).unwrap_or_default();
+    let token = std::env::var(duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN).unwrap_or_default();
+    if claimed == worker && !duduclaw_core::is_system_sender(&sender)
+        && let Some(key) = duduclaw_core::load_identity_key(home).map(zeroize::Zeroizing::new)
+        && duduclaw_core::verify_identity_token(&key, worker, &identity)
+        && duduclaw_core::identity_token::verify_delegation_audit_token(&key, worker, &sender, &token)
+    {
+        return sender;
+    }
+    worker.to_string()
+}
+
+/// In-handler callers use the already authenticated request scope, never
+/// re-authenticate an ambient API key or interpret a sender as a principal.
+pub(crate) fn current_audit_agent(home: &Path, default_agent: &str) -> String {
+    let call = crate::mcp_auth::current_authenticated_call();
+    resolve_audit_agent(home, call.as_ref().map(|c| c.principal()), default_agent)
 }
 
 /// Which agent is actually acting behind `caller_client_id`?
@@ -497,5 +490,13 @@ mod meeting_audit_tests {
             assert!(!log.contains(secret), "leaked {secret}");
         }
         assert_eq!(meeting_audit_arguments(&serde_json::json!({"job_id":"https://evil/#token"}))["job_prefix"], Value::Null);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn audit_test_principal(client_id: &str, is_external: bool) -> crate::mcp_auth::Principal {
+    crate::mcp_auth::Principal {
+        client_id: client_id.to_string(), is_external,
+        scopes: Default::default(), created_at: chrono::Utc::now(),
     }
 }

@@ -340,6 +340,19 @@ pub fn verify_token(key: &[u8], agent_id: &str, token: &str) -> bool {
     mac.verify_slice(&bytes).is_ok()
 }
 
+/// Host proof binding an audit delegation sender to its executing employee.
+/// Domain separation and NUL delimiters prevent reuse as an identity token.
+pub const ENV_DELEGATION_AUDIT_TOKEN: &str = "DUDUCLAW_DELEGATION_AUDIT_TOKEN";
+
+pub fn mint_delegation_audit_token(key: &[u8], worker: &str, sender: &str) -> String {
+    mint_token(key, &format!("delegation-audit-v1\0{worker}\0{sender}"))
+}
+
+pub fn verify_delegation_audit_token(key: &[u8], worker: &str, sender: &str, token: &str) -> bool {
+    crate::is_valid_agent_id(worker) && crate::is_valid_agent_id(sender)
+        && verify_token(key, &format!("delegation-audit-v1\0{worker}\0{sender}"), token)
+}
+
 // ── Signed internal requests ─────────────────────────────────────────────────
 
 fn hex_lower(bytes: &[u8]) -> String {
