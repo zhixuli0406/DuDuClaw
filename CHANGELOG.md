@@ -16,6 +16,7 @@
 ### Changed
 
 - 「保持登入」改採滑動續期，管理員可在安全設定保存 1–365 天（預設 180）；既有到期日於下次成功續期套用新值，包含縮短天數。政策永久保存，讀取失敗使用 180 天。
+- **行為變更**：新員工不再取得個人層的預設技能副本；Word、PDF、PowerPoint、Excel 四項技能改由公司層安裝一次並共用。程式審查、Git 工作流程、重構與測試撰寫改為選用，可透過既有技能市集安裝。既有副本全部保留，doctor 提供比對與封存清理提示，不會自動刪除。
 
 - 終端控制室的命令面板依結果調整高度、分類顯示並標示實際快捷鍵；操作說明分組並醒目標示按鍵，任務與執行紀錄的空白提示及狀態列更清楚。
 
@@ -55,6 +56,15 @@
 
 - Email 驗證碼綁定登入挑戰、雜湊保存、限用一次並限制嘗試與重寄；通行金鑰使用 WebAuthn 驗證並要求裝置使用者驗證。因素變更需再次驗證密碼，強制兩步驟驗證時保留至少一種因素。保持登入採 HttpOnly、SameSite=Strict Cookie 與伺服器端雜湊、輪替及重用撤銷，登出、密碼與因素變更等操作會撤銷裝置；Cookie 端點與 WebSocket 升級驗證 Origin。實際寄信、跨平台通行金鑰及完整整合驗收仍待完成。
 - 修正個人授權可透過環境變數或嵌入主程式設定開啟多人管理功能的問題：所有建置以有效授權為版本上限，設定只能降級；沒有有效授權時維持個人版。忽略升級要求時，每個來源每個行程警告一次；即使 release 啟用 Debug assertions 也不能升級；獨立測試 API 另需明確啟用測試 feature，發版建置會拒絕該 feature。
+- 修正 office_script 共用 uv 快取可被解析器污染、跨員工傳遞資料的問題：可信 base 僅由不含使用者輸入的 host 暖快取建立，沙箱只讀 base，改用本次工作區內的獨立快取副本並於執行結束清除；保留明確 unsandboxed fallback，且不沿用舊可寫快取作為可信來源。
+
+- 修正 `office_script` HN2 runtime 根目錄重疊：Linux bwrap 與 macOS SBPL 建立前解析 home、私人工作／輸出、輸入、腳本、快取及 runtime 允許根目錄，雙向檢查相等或祖先重疊（含別名與 canonical 目標）。重疊或解析失敗預設拒絕，避免自訂 home 位於 `/usr/local`、`/opt/homebrew` 等目錄時暴露全域與其他員工資料；沿用既有明確 unsandboxed 豁免及一次性警告。
+
+- 修正 `office_script` HN2：隔離不可用時預設拒絕。Linux 改用 bwrap 強制檔案系統／網路隔離與 2 GiB RLIMIT_AS；macOS 以 deny-by-default sandbox-exec profile 限制檔案讀寫、禁止網路，嘗試 DATA／RSS 上限並驗證超限配置會遭拒。沿用 `[container.sandbox] script_when_unavailable = "run_unsandboxed"` 明確豁免，每個主機程序警告一次；不新增設定。隔離執行的 uv 一律離線，缺少套件快取時失敗。
+- `office_script` 固定直接 Python 依賴與套件發布截止時間，禁止 source build／自動下載 Python；system Python fallback 核對直接依賴版本。保留 CPU／檔案／程序／fd 上限、process group 清理及 stdout／stderr 各 32 KiB 限制，啟動前重驗腳本 hash 與 no-follow 私有路徑。**剩餘風險**：同 UID 主機程序仍可競態置換 pathname／快取；遞迴依賴尚無完整 hash lock。DATA／RSS 不保證所有 Darwin 主機可用，無效時拒絕；本機 sandbox-exec 被環境拒絕，成功隔離與真實 LibreOffice／Linux 驗收仍待完成。完整邊界見 `docs/features/05-security-defense.md`。
+
+- 辦公文件工具只執行通過編譯時 SHA-256 manifest 的內嵌腳本；個人、部門與公司技能只能覆蓋提示文字。輸入採 no-follow 快照，參數按腳本區分旗標與輸入／輸出，拒絕 `--out=/...` 等合併寫法；輸出由 Rust 以排他建立、no-follow 寫入員工目錄的新檔案，保留既有權限與文件限制。安全執行目前僅支援 Linux 與 macOS，其他平台拒絕。
+- 技能層根目錄與路徑元件拒絕符號連結；部門技能改讀權威 `org.toml` 並核對員工設定副本，無法驗證或不一致即排除部門層。公司層四項辦公技能的腳本全部通過 manifest 才寫入 migration 完成標記；衝突副本保留但永不執行，日誌與 doctor 顯示衝突。
 
 ## [1.79.3] - 2026-11-04 — 原生 Linux 我的連線、群組對話與會議逐字稿
 

@@ -567,7 +567,7 @@ async fn listed_skills(home_dir: &Path, agent_name: &str) -> Vec<(&'static str, 
     use duduclaw_agent::registry::AgentRegistry;
     let agent_dir = home_dir.join("agents").join(agent_name);
     let global = AgentRegistry::load_skills(&home_dir.join("skills")).await;
-    let dept = agent_department(&agent_dir).await;
+    let dept = duduclaw_agent::skill_loader::authoritative_department(home_dir, agent_name);
     let dept_skills = match &dept {
         Some(d) => AgentRegistry::load_skills(&duduclaw_agent::skill_loader::department_skills_dir(home_dir, d)).await,
         None => Vec::new(),
@@ -597,14 +597,6 @@ async fn listed_skills(home_dir: &Path, agent_name: &str) -> Vec<(&'static str, 
             (layer, format!("- {}: {}{}{}", meta.display_name(locale), meta.display_description(locale), tag, suffix))
         })
         .collect()
-}
-
-/// The employee's department from its `agent.toml`, when valid.
-async fn agent_department(agent_dir: &Path) -> Option<String> {
-    let text = tokio::fs::read_to_string(agent_dir.join("agent.toml")).await.ok()?;
-    let table: toml::Table = text.parse().ok()?;
-    let dept = table.get("agent")?.get("department")?.as_str()?.trim().to_string();
-    (!dept.is_empty() && duduclaw_core::is_valid_department(&dept)).then_some(dept)
 }
 
 #[cfg(test)]
@@ -644,10 +636,11 @@ mod skill_list_b8_tests {
     /// for the calling employee by default.
     #[tokio::test]
     async fn lists_what_the_employee_loads() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let home = tmp.path();
         agent(home, "alice", "sales");
         agent(home, "bob", "");
+        std::fs::write(home.join("org.toml"), "schema = 1\n[agents.alice]\ndepartment = 'sales'\n").unwrap();
         std::fs::create_dir_all(home.join("skills")).unwrap();
         std::fs::write(home.join("skills/tone.md"), "company voice").unwrap();
         let dept = duduclaw_agent::skill_loader::department_skills_dir(home, "sales");
@@ -672,7 +665,7 @@ mod skill_list_b8_tests {
 
     #[tokio::test]
     async fn rejects_a_path_shaped_agent_id() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let v = handle_skill_list(&json!({ "agent_id": "../x" }), tmp.path(), "").await;
         assert_eq!(v["isError"], true);
     }

@@ -1,8 +1,7 @@
 //! B8 — per-employee skill switches, removal and the permission-filtered
 //! `skills.list`, end to end through `MethodHandler::handle` with a real
-//! `users.db`. Both employees are created through `agents.create`, so each
-//! gets the same seeded built-in skills (`docx`, `pdf`, …): same-named skills
-//! on two employees are the default fixture here, not a special case.
+//! `users.db`. Explicit legacy personal copies keep removal/restore coverage
+//! independent of the shared defaults used for new employees.
 use super::*;
 
 fn ok(frame: &WsFrame) -> Value {
@@ -53,10 +52,16 @@ struct Fx {
 async fn fixture() -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().canonicalize().unwrap();
+    // Simulate a legacy installation whose default migration already ran.
+    std::fs::create_dir_all(home.join("migrations")).unwrap();
+    for marker in ["wp19-builtin-skills-seed.done", "g1-connect-google-seed-v1.done"] {
+        std::fs::write(home.join("migrations").join(marker), "done").unwrap();
+    }
     let h = MethodHandler::new(home.clone()).await;
     let system = UserContext::admin_fallback();
     for (id, name) in [("a1", "Alice"), ("b1", "Bob")] {
         ok(&h.handle_agents_create_as(json!({ "name": id, "display_name": name }), Some(&system)).await);
+        duduclaw_agent::builtin_skills::install_builtin_skills(&home.join("agents").join(id).join("SKILLS")).unwrap();
     }
     // A company-wide skill both employees load.
     std::fs::create_dir_all(home.join("skills")).unwrap();

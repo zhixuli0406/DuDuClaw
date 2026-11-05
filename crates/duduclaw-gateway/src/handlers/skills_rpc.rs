@@ -6,29 +6,9 @@ use super::*;
 impl MethodHandler {
     // ── Skills ──────────────────────────────────────────────
 
-    /// Seed the bundled skills (docx / xlsx / pptx / pdf / …) into a freshly
-    /// created staffer's `SKILLS/`.
-    ///
-    /// This used to happen on exactly one of the five agent-creation paths —
-    /// the MCP `create_agent` tool. Anyone who onboarded through the dashboard,
-    /// `duduclaw onboard`, or the industry wizard got an empty `SKILLS/` and,
-    /// since nothing else ever writes `<home>/skills/` either, a permanently
-    /// blank Skills page. "The skill library shows nothing" was literally true
-    /// and had nothing to do with the page's read path.
-    ///
-    /// Best-effort by design: seeding is a nicety, and an unwritable skills dir
-    /// must not fail agent creation. `install_builtin_skills` never overwrites
-    /// an existing `<name>/SKILL.md`, so calling it again is a no-op.
-    pub(crate) fn seed_builtin_skills(skills_dir: &std::path::Path) {
-        match duduclaw_agent::builtin_skills::install_builtin_skills(skills_dir) {
-            Ok(names) if !names.is_empty() => {
-                info!(dir = %skills_dir.display(), skills = ?names, "seeded built-in skills");
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!(dir = %skills_dir.display(), error = %e, "failed to seed built-in skills");
-            }
-        }
+    /// Run the one-time company-wide backfill, never seed the employee layer.
+    pub(crate) fn seed_builtin_skills(home: &std::path::Path) {
+        crate::builtin_skills_seed_migration::run(home);
     }
 
     /// Installed skills matching `query` (name or content), only on the

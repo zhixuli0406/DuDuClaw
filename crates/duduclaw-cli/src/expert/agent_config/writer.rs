@@ -746,7 +746,7 @@ mod tests {
         assert_ne!(before, planned_effects(&source, "worker", "", home.path()));
         assert!(std::str::from_utf8(&plan.skills[0].1["SKILL.md"]).unwrap().contains("Original body"));
         assert!(plan.files.contains_key(".mcp.json"));
-        assert!(plan.files.contains_key("SKILLS/code-review/SKILL.md"));
+        assert!(!plan.files.keys().any(|name| name.starts_with("SKILLS/")));
     }
 
     #[test]

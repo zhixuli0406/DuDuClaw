@@ -16,7 +16,7 @@ display:
 
 處理 `.docx` 檔案的三件事：**讀取抽取**、**建立**、**轉換 PDF**。所有腳本用
 `uv run` 執行，依賴以 PEP 723 inline metadata 宣告（`python-docx`），uv 會自動
-建立隔離環境；`uv` 不存在時改用 `pip install python-docx` 後 `python3` 執行。
+建立隔離環境；`uv` 不存在時改用 `pip install python-docx==1.2.0` 後 `python3` 執行。
 
 ## 何時使用
 
@@ -31,7 +31,7 @@ Bash 工具擇一：**
 
 - **有 Bash / shell 工具** → 直接跑 `uv run scripts/<script>.py ...`（見下方各節）。
 - **沒有 Bash / shell 工具（API 模式後端，如 Grok / DeepSeek / MiniMax）** → **不要**只回文字，
-  改用 `office_script` MCP 工具在伺服器端跑同一支腳本：
+  改用 `office_script` MCP 工具執行主程式內嵌、通過雜湊驗證的腳本（Linux／macOS）：
   - `skill`：`docx`
   - `script`：`create` / `extract` / `to_pdf`（不含路徑，`.py` 可省略）
   - `args`：字串陣列，等同 `uv run` 後面那串參數；任何路徑須落在你的 agent 目錄或其 `attachments/`。
@@ -43,7 +43,9 @@ Bash 工具擇一：**
    "args": ["report.md", "--out", "/你的agent目錄/attachments/report.docx"]}
   ```
 
-  工具以 `uv run`（uv 不存在時退回 `python3`）在你的 agent 目錄內執行並回傳腳本 stdout；
+  工具在私有目錄執行內嵌腳本，技能目錄中的腳本不會執行；個人／部門／公司層只能覆蓋提示文字。
+  旗標和值必須分開（拒絕 `--out=...`），輸出須為你的 agent 目錄內的新檔案，父目錄須已存在；
+  輸入拒絕符號連結與硬連結，輸出不覆寫既有檔案。成功後工具回傳實際輸出路徑；
   產出檔案後**務必**依下方 📎DELIVER 協定交付。
 
 ### 1. 讀取抽取 — `extract.py`

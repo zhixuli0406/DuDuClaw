@@ -1,8 +1,26 @@
 # Office 文件套件
 
+四項辦公技能只在公司層 `<home>/skills/` 安裝一次，不再複製到每位新員工。既有副本會保留；程式技能選用與清理方式見[技能生命週期](15-skill-lifecycle.md)。
+
 > Agent 交到你手上的是真正的 .docx,不是一段描述它的文字:靠一套 marker 協議、一道 fail-closed 路徑圍欄,以及模型忘了 marker 那天用的安全網。
 
 ---
+
+## 辦公文件腳本的信任範圍
+
+`office_script` 只執行目前主程式內嵌的 Python 腳本，每支腳本都必須符合編譯時的 SHA-256 manifest；主程式版本與腳本雜湊共同識別版本。個人、部門與公司技能只能覆蓋 **SKILL.md 提示文字**，即使目錄裡有同名腳本，也不會拿來執行。
+
+每次呼叫都由 gateway／MCP 行程在 `<home>/.office-execution/` 下建立屬於自身 uid、權限 `0700` 的私有目錄，以排他建立、no-follow 與 `0500` 權限寫入已驗證的腳本。輸入檔逐層以 no-follow 開啟、確認正規路徑未越界後，複製到私有目錄。既有文件資源限制檢查同一份快照；Python 在該目錄執行，清除繼承環境，不讀員工的專案設定或匯入員工目錄的模組。
+
+參數按腳本分別驗證：只能有一份輸入；`create` 必填 `--out`；`to_pdf` 可填 `--outdir`；`--format` 只接受該腳本列出的值。旗標和值須分開傳送，例如 `"--out", "report.pdf"`；拒絕 `--out=/路徑`、未知或重複旗標及多餘輸入。輸入限員工自己的目錄或 `<home>/attachments/`；輸出限**員工自己目錄下的新檔案**，副檔名須符合文件格式，父目錄須已存在。既有檔案、受保護結構檔名、符號連結、硬連結與路徑穿越均拒絕。轉 PDF 未指定 `--outdir` 時採原輸入檔的父目錄，該目錄也必須位於員工目錄內。Python 只寫暫存輸出，成功後由 Rust 重新逐層檢查目的地，先在私有暫存區完成複製與同步，再以不可覆寫的排他 rename 寫入經 no-follow 開啟的目的目錄；暫存區與輸出必須位於同一檔案系統，失敗時不留下部分目的檔。
+
+技能層根目錄與各路徑元件均拒絕符號連結。部門提示必須由權威 `org.toml` 查到，且與 `agent.toml` 副本一致；資料無法讀取或不一致時不載入部門層。四個公司技能目錄的腳本全部符合 manifest，才寫入辦公技能 migration 完成標記。衝突副本會保留、排除於執行來源，並寫入日誌及顯示於 `duduclaw doctor`；舊 migration 標記不代表腳本已驗證。
+
+既有 MCP 權限、核准、技能停用與文件資源限制維持有效。`office_script` 僅支援 Linux 與 macOS；檔案系統、網路及記憶體隔離未全部成立時，預設拒絕執行。Linux 需要 bwrap，僅將系統／runtime／輸入唯讀掛載，私有輸出與快取可寫，強制網路／PID namespace，並套用 2 GiB RLIMIT_AS。macOS 使用 deny-by-default 的 sandbox-exec profile，禁止網路、限制讀寫範圍，嘗試 DATA／RSS 上限並探測是否真的拒絕超限配置；無法套用或無效即拒絕。CPU／檔案／程序／fd 限制及 process group 清理保留。host 暖快取步驟只在獨立暫存目錄執行已驗證 wrapper 的 `--help`，不提供使用者檔案；僅此步驟可連網下載依賴到 `<home>/.office-execution/uv-base-v1/`。沙箱將 base 掛為唯讀，並以 `UV_CACHE_DIR` 指向 `<私人工作區>/uv-cache` 的獨立副本，搭配 `UV_LINK_MODE=copy` 與離線模式。快取連結會改指向副本，執行環境在副本內離線重建。工作區、輸出暫存與快取於發布或失敗後清除；舊的解析器可寫快取不會升格為可信 base，明確 unsandboxed fallback 保留原快取行為。沿用 `config.toml [container.sandbox] script_when_unavailable = "run_unsandboxed"`，僅在管理員明確設定時允許隔離不可用的 fallback，每個主機程序警告一次；`sandbox_enabled = false` 不構成隱含豁免。同 UID 的 pathname／快取競態，以及遞迴依賴尚無完整 hash lock 的殘餘風險，仍記錄於[安全防護](../05-security-defense.md)。Linux／macOS 隔離成功路徑、真實 LibreOffice 與 gateway／CLI 整合須另行驗收；本機開發環境拒絕 sandbox-exec，不能視為成功隔離驗證。
+
+執行器已固定直接依賴版本及套件發布截止時間，禁止 source build／自動下載 Python；uv 在不含使用者輸入的 host 暖快取完成後採離線模式，system Python 必須符合直接依賴版本。Unix 資源限制及 stdout／stderr 各 32 KiB 串流上限會在超限或逾時時終止群組；執行前重驗路徑與 hash。仍未提供完整遞迴依賴 hash 與同 UID 主機程序隔離；明確選用 unsandboxed fallback 時也不保證斷網。精確限制、快取復原及剩餘風險見 [Security Defense](../05-security-defense.md#office-parser-limits-and-remaining-trust-boundary)。
+
+建立 Linux 掛載或 macOS profile 前，會解析 home、工作／輸出目錄、輸入、腳本、base／單次快取及所有現存 runtime 允許根目錄的 canonical 路徑。私人路徑與 runtime 根目錄（含原始別名及解析目標）只要相等，或任一方是另一方的祖先，就拒絕隔離；解析失敗也會拒絕。base 不得與可寫工作區重疊，單次快取必須位於本次工作區內。這可避免 `/usr/local`、`/opt/homebrew` 下的自訂 home，或移入 runtime 目錄的私人工作區／快取，透過廣泛讀取權限暴露其他員工。只有既有的 `script_when_unavailable = "run_unsandboxed"` 明確豁免可允許降級，並沿用原有警告。
 
 ## 這是什麼
 

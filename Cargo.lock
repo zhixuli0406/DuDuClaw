@@ -1850,6 +1850,7 @@ dependencies = [
  "duduclaw-core",
  "duduclaw-memory",
  "duduclaw-security",
+ "libc",
  "reqwest",
  "ring",
  "rusqlite",
@@ -1861,6 +1862,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 
