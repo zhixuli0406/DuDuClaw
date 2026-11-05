@@ -489,7 +489,7 @@ fn mac_strength(mac: &[u8; 6]) -> FingerprintStrength {
     if mac[0] & 0x02 != 0 { FingerprintStrength::Instance } else { FingerprintStrength::Hardware }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(any(not(target_os = "windows"), test))]
 fn is_usable_mac(mac: &[u8; 6]) -> bool {
     mac_strength(mac) != FingerprintStrength::Weak
 }
