@@ -29,7 +29,7 @@ impl RootWorkspaceBridge for Bridge {
     }
 }
 fn policy() -> SpawnPolicy {
-    SpawnPolicy { run: RunHandle(RunId([1; 16])), employee: EmployeeId([2; 16]),
+    SpawnPolicy { workspace_delivery: None, run: RunHandle(RunId([1; 16])), employee: EmployeeId([2; 16]),
         class: ExecutionClass::EmployeeTool, runtime: RuntimeKind::Registered(Text::new("fixture".into()).unwrap()),
         argv_allowlist: vec![], environment_allowlist: BTreeMap::new(),
         workspace: WorkspacePolicy { workspace: Text::new("selected".into()).unwrap(), relative_cwd: Text::new(".".into()).unwrap() },

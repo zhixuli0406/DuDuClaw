@@ -49,6 +49,8 @@ pub mod isolation_connector_registry;
 pub mod isolation_connector_search;
 pub mod isolation_execution;
 pub mod isolation_worker_plans;
+#[cfg(target_os = "linux")]
+pub mod isolation_forks;
 pub mod isolation_readiness;
 pub mod migration_import;
 pub mod migration_startup;

@@ -251,6 +251,7 @@ CREATE TABLE IF NOT EXISTS discovery_artifacts (
 /// the online orchestrator) lives here rather than in the CREATE so the
 /// migration path is exercised from the first release; later packages append.
 const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
+    ("discovery_artifacts", "manifest_json", "manifest_json TEXT"),
     ("discovery_nodes", "isolation_backend", "isolation_backend TEXT"),
     ("discovery_nodes", "usd_source", "usd_source TEXT NOT NULL DEFAULT 'unknown'"),
     ("discovery_nodes", "unknown_calls", "unknown_calls INTEGER NOT NULL DEFAULT 0"),

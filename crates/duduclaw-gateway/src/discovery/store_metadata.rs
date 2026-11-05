@@ -320,4 +320,32 @@ impl DiscoveryStore {
             params![run_id, cell_id], |row| row.get(0),
         ).optional()?)
     }
+
+    /// Publish the bounded manifest and checkpoint digest in one immutable
+    /// host-owned row. Existing checkpoints without manifests are never
+    /// backfilled by walking an employee output tree during a protected read.
+    pub fn record_artifact_manifest(&self, run_id: &str, cell_id: &str,
+        manifest: &super::super::artifact_manifest::ArtifactManifest) -> Result<(), StoreError> {
+        let encoded = manifest.encode().map_err(StoreError::Corrupt)?;
+        self.conn.execute(
+            "INSERT INTO discovery_artifacts(run_id,cell_id,sha256,created_at,manifest_json) VALUES(?1,?2,?3,?4,?5)",
+            params![run_id, cell_id, manifest.digest(), chrono::Utc::now().to_rfc3339(), encoded],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_artifact_manifest(&self, run_id: &str, cell_id: &str)
+        -> Result<Option<super::super::artifact_manifest::ArtifactManifest>, StoreError> {
+        let row: Option<(String, Option<String>)> = self.conn.query_row(
+            "SELECT sha256, CASE WHEN length(CAST(manifest_json AS BLOB)) <= ?3 THEN manifest_json ELSE NULL END
+             FROM discovery_artifacts WHERE run_id=?1 AND cell_id=?2",
+            params![run_id, cell_id, super::super::artifact_manifest::MAX_MANIFEST_BYTES],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        match row {
+            Some((digest, Some(encoded))) => Ok(Some(super::super::artifact_manifest::ArtifactManifest::decode(
+                &encoded, &digest).map_err(StoreError::Corrupt)?)),
+            _ => Ok(None),
+        }
+    }
 }

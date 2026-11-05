@@ -192,7 +192,7 @@ def scan_text(source: str, path: str) -> list[Site]:
             elif token in raw_aliases and tokens[i + 1:i + 2] == ["("] and tokens[i - 1:i] != ["fn"]:
                 effects["raw_" + raw_aliases[token]] += 1
             elif i > 0 and tokens[i - 1] == "." and tokens[i + 1:i + 2] == ["("]:
-                if token in {"spawn", "spawn_command", "exec"}:
+                if token in {"spawn", "spawn_authorized", "spawn_command", "exec"}:
                     effects["terminal_" + token] += 1
                 elif token == "openpty":
                     effects["pty_openpty"] += 1
@@ -228,7 +228,7 @@ def check(sites: list[Site], registry: dict) -> list[str]:
     entries = registry.get("entries", [])
     indexed = {}
     identities = {"gateway", "employee", "parse_worker", "import_worker", "spawn_daemon", "trampoline", "egress", "updater", "downloader", "operator", "test", "host_service"}
-    migrations = {"pending", "backend", "gateway_exception", "privileged_service", "isolated_child", "not_process", "test_only", "other_package"}
+    migrations = {"pending", "backend", "gateway_exception", "privileged_service", "isolated_child", "isolated_helper", "not_process", "test_only", "other_package"}
     for entry in entries:
         symbol = entry.get("symbol")
         if not symbol or symbol in indexed:
@@ -253,6 +253,14 @@ def check(sites: list[Site], registry: dict) -> list[str]:
             "spawn_daemon", "trampoline", "updater", "downloader", "host_service",
         }:
             errors.append(f"invalid privileged service exemption: {symbol}")
+        if entry.get("migration") == "isolated_helper" and (
+            entry.get("identity") != "employee"
+            or symbol not in {
+                "crates/duduclaw-execution/src/program_helper.rs::execute_command",
+                "crates/duduclaw-execution/src/recording_helper.rs::run_driver",
+            }
+        ):
+            errors.append(f"invalid isolated helper exemption: {symbol}")
     observed = {site.symbol: site for site in sites}
     for symbol, site in observed.items():
         if symbol not in indexed:

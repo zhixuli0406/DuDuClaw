@@ -254,9 +254,9 @@ fn checkpoint(home: &Path, world_dir: &Path, config: &DiscoveryConfig, direction
     }
     if let Some(candidate) = &candidate {
         candidate.guard.verify().map_err(|e|e.to_string())?;
-        let hash = super::workspace::directory_sha256(&candidate.artifact).map_err(|e|e.to_string())?;
+        let manifest = candidate.guard.checkpoint_manifest()?;
         candidate.guard.verify().map_err(|e|e.to_string())?;
-        store.record_verified_artifact(&node.run_id, &node.cell_id, &hash).map_err(|e|e.to_string())?;
+        store.record_artifact_manifest(&node.run_id, &node.cell_id, &manifest).map_err(|e|e.to_string())?;
     }
     append_node(&world_dir.join("tree.jsonl"), node, isolation)?;
     if let Some(candidate) = candidate { *current = Some(candidate); }

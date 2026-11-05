@@ -11,6 +11,8 @@ use crate::{VerificationError, execution::{ExecutionPlanFactory, ExecutionToolBr
 /// Missing A or E deliberately leaves the corresponding routes unavailable.
 #[derive(Default)]
 pub struct GatewayFactories {
+    #[cfg(feature = "binding-store")]
+    pub forks: Option<Arc<dyn crate::forks::ForkToolService>>,
     pub execution: Option<Arc<ExecutionToolBridge>>,
     pub parser: Option<Arc<dyn FileParser>>,
     pub worker: Option<Arc<crate::worker_execution::WorkerToolBridge>>,
@@ -19,17 +21,52 @@ pub struct GatewayFactories {
 impl GatewayFactories {
     pub fn assemble(backend: Option<Arc<dyn ExecutionBackend>>,
         plans: Option<Arc<dyn ExecutionPlanFactory>>, resolver: Arc<dyn ResourceResolver>,
-        parser: Option<Arc<dyn FileParser>>) -> Result<Self, VerificationError> {
+        parser: Option<Arc<dyn FileParser>>, roots: Arc<crate::resources::ResourceRoots>) -> Result<Self, VerificationError> {
         let execution = match (backend, plans) {
-            (Some(backend), Some(plans)) => Some(Arc::new(ExecutionToolBridge::new(backend, plans, resolver))),
+            (Some(backend), Some(plans)) => Some(Arc::new(ExecutionToolBridge::new(backend, Arc::new(RootedPlans { plans, roots }), resolver))),
             (None, None) => None,
             _ => return Err(VerificationError::Unavailable),
         };
-        Ok(Self { execution, parser, worker: None })
+        Ok(Self { execution, parser, worker: None, #[cfg(feature = "binding-store")] forks: None })
+    }
+
+    pub fn with_execution_jobs(mut self, jobs: Arc<dyn crate::execution_jobs::ExecutionJobs>) -> Self {
+        if let Some(bridge) = self.execution.take() {
+            self.execution = Some(Arc::new(bridge.with_jobs(jobs)));
+        }
+        self
+    }
+
+    #[cfg(feature = "binding-store")]
+    pub fn with_forks(mut self, forks: Arc<dyn crate::forks::ForkToolService>) -> Self {
+        self.forks = Some(forks); self
     }
 
     pub fn with_worker(mut self, worker: Arc<crate::worker_execution::WorkerToolBridge>) -> Self {
         self.worker = Some(worker); self
+    }
+}
+
+/// Supplies only boot-owned roots; authorization and final plan/resource checks
+/// remain in ExecutionToolBridge, including after producer awaits.
+struct RootedPlans {
+    plans: Arc<dyn ExecutionPlanFactory>,
+    roots: Arc<crate::resources::ResourceRoots>,
+}
+impl ExecutionPlanFactory for RootedPlans {
+    fn supports(&self, name: &str) -> bool { self.plans.supports(name) }
+    fn collects_results(&self, name: &str) -> bool { self.plans.collects_results(name) }
+    fn cooperative_stop(&self, name: &str) -> bool { self.plans.cooperative_stop(name) }
+    fn decode_result(&self, name: &str, stdout: &[u8], stderr: &[u8], outcome: &duduclaw_isolation::execution::RunOutcome)
+        -> Result<Value, VerificationError> { self.plans.decode_result(name, stdout, stderr, outcome) }
+    fn authorize_control<'a>(&'a self, context: &'a crate::RequestContext, name: &'a str, arguments: &'a Value)
+        -> PolicyFuture<'a, ()> { self.plans.authorize_control(context, name, arguments) }
+    fn authorize_handler<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+        self.plans.authorize_handler(call)
+    }
+    fn prepare<'a>(&'a self, call: &'a AuthorizedToolCall, run: duduclaw_isolation::execution::RunHandle)
+        -> PolicyFuture<'a, crate::execution::AuthorizedExecutionPlan> {
+        self.plans.prepare_with_roots(call, run, self.roots.clone())
     }
 }
 

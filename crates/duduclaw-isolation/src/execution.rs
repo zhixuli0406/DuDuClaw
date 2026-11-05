@@ -70,6 +70,31 @@ pub struct WorkspacePolicy {
     pub relative_cwd: Text<4096>,
 }
 
+/// Owned host proof retained until root has validated and mounted the same H directory.
+/// Never deserialized; only a trusted resource authorization path should construct it.
+pub struct WorkspaceDelivery {
+    pub employee: EmployeeId,
+    pub run: RunId,
+    pub policy: WorkspacePolicy,
+    pub directory: std::fs::File,
+}
+impl WorkspaceDelivery {
+    pub fn selection(&self) -> Result<crate::ipc::WorkspaceSelection, BackendError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let stat = self.directory.metadata().map_err(|_| BackendError::Io)?;
+            if !stat.is_dir() { return Err(BackendError::Denied); }
+            let value = crate::ipc::WorkspaceSelection { handle: self.policy.workspace.clone(),
+                relative_cwd: self.policy.relative_cwd.clone(), device: stat.dev(), inode: stat.ino() };
+            value.validate().map_err(|_| BackendError::Denied)?;
+            Ok(value)
+        }
+        #[cfg(not(unix))]
+        { Err(BackendError::Unavailable) }
+    }
+}
+
 /// Connection capabilities requested by internal policy (§4 fd matrix, §6.1).
 /// No capability secrets travel in argv/env. Egress belongs to the forwarder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +115,7 @@ pub struct SpawnPolicy {
     pub argv_allowlist: Vec<Text<4096>>,
     pub environment_allowlist: BTreeMap<String, Text<4096>>,
     pub workspace: WorkspacePolicy,
+    pub workspace_delivery: Option<WorkspaceDelivery>,
     pub resources: ResourceLimits,
     pub network: NetworkPolicy,
     pub pty: bool,

@@ -35,7 +35,7 @@ fn current(home: &Path, tasks: &[&str], scope: bool) -> (Arc<IsolatedCall>, Arc<
         resources: List::new(resources).unwrap(), policy_revision: 1, gateway_epoch: [4; 16],
         issued_at: 1, not_before: 1, expires_at: u64::MAX - 1, nonce: [5; 32], jti: [6; 16],
     }, Arc::new(Live(live.clone())));
-    (Arc::new(IsolatedCall { home: home.to_owned(), context, agent: "alice".into(),
+    (Arc::new(IsolatedCall { forks: None, home: home.to_owned(), context, agent: "alice".into(),
         roots: Arc::new(ResourceRoots::default()), parser: None, services: None,
         worker: None, execution: None, record_resolver: None }), live)
 }

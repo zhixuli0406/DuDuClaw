@@ -358,3 +358,40 @@ fn host_snapshots_bind_selected_origin_call_and_operation() {
     assert!(AuthorizedFile::from_host_snapshot(&call,
         HostSnapshotSource::WebFetch { url: "https://example.com/a" }, &vec![0; 5 * 1024 * 1024 + 1]).is_err());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn helper_workspace_token_binds_owner_run_and_relative_directory() {
+    use duduclaw_isolation::execution::WorkspacePolicy;
+    let directory = tempfile::tempdir_in("/dev/shm").unwrap();
+    std::fs::create_dir(directory.path().join("notes")).unwrap();
+    let context = context();
+    let mut roots = ResourceRoots::default();
+    roots.insert("work".into(), context.record().employee, File::open(directory.path()).unwrap()).unwrap();
+    let policy = WorkspacePolicy { workspace: Text::new("work".into()).unwrap(),
+        relative_cwd: Text::new("notes".into()).unwrap() };
+    let proof = roots.authorize_helper_workspace(&context, &policy).unwrap();
+    assert!(proof.permits(&context, &policy));
+    let child = duduclaw_isolation::execution::RunHandle(RunId([9; 16]));
+    let delivery = proof.delivery_for(child).unwrap();
+    assert_eq!(delivery.run, child.0);
+    assert_ne!(delivery.run, context.record().run);
+    assert_eq!(delivery.employee, context.record().employee);
+    assert_eq!(delivery.policy, policy);
+    assert_eq!(file_identity(&delivery.directory).unwrap(), file_identity(&File::open(directory.path().join("notes")).unwrap()).unwrap());
+    // Producing child delivery does not rebind the source authorization proof.
+    assert!(proof.permits(&context, &policy));
+    let mut other_run = context.record().clone();
+    other_run.run = child.0;
+    assert!(!proof.permits(&RequestContext::from_verified_record(other_run), &policy));
+    assert!(proof.delivery_for(duduclaw_isolation::execution::RunHandle(context.record().run)).is_err());
+    let mut wrong = policy.clone();
+    wrong.relative_cwd = Text::new("../private".into()).unwrap();
+    assert!(!proof.permits(&context, &wrong));
+    assert!(roots.authorize_helper_workspace(&context, &wrong).is_err());
+    std::os::unix::fs::symlink("notes", directory.path().join("link")).unwrap();
+    wrong.relative_cwd = Text::new("link".into()).unwrap();
+    assert!(roots.authorize_helper_workspace(&context, &wrong).is_err());
+    wrong.workspace = Text::new("unregistered".into()).unwrap();
+    assert!(roots.authorize_helper_workspace(&context, &wrong).is_err());
+}

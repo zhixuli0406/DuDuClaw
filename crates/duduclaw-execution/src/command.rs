@@ -269,7 +269,7 @@ fn monitor(backend: Arc<dyn ExecutionBackend>, run: RunHandle,
 
 fn local_policy(run: RunHandle, class: ExecutionClass, pty: bool) -> SpawnPolicy {
     SpawnPolicy {
-        run, employee: EmployeeId([0; 16]), class, runtime: capture_runtime(),
+        workspace_delivery: None, run, employee: EmployeeId([0; 16]), class, runtime: capture_runtime(),
         // These fields are not used to reconstruct a registered native builder.
         argv_allowlist: vec![], environment_allowlist: Default::default(),
         workspace: WorkspacePolicy { workspace: Text::new("native-builder".into()).expect("constant"), relative_cwd: Text::new(String::new()).expect("constant") },

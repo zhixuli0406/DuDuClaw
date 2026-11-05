@@ -10,3 +10,9 @@ pub use duduclaw_mcp_boundary::factories::GatewayFactories;
 mod worker;
 #[cfg(feature = "isolation-worker-integration")]
 pub use worker::{install_worker, install_worker_services, InstalledWorkerServices};
+
+#[cfg(target_os = "linux")]
+#[path = "isolation_execution_program.rs"]
+mod program;
+#[cfg(target_os = "linux")]
+pub use program::InstalledProgramPlans;

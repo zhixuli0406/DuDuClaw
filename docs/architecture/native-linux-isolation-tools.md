@@ -1,4 +1,5 @@
 # Native Linux MCP resource routes (security revision, 2026-11-05)
+# Native Linux tool dispositions — I1b round 6 (v1.80.0)
 
 **PARTIAL: full product parity is not ready.** Employee permissions remain the product contract; missing adapters are startup failures, not newly acceptable product restrictions. The endpoint now invokes `require_complete_services()` before admitting MCP traffic. The inventory tests use explicit discovery doubles for missing connectors and do not prove provider execution or production boot readiness.
 
@@ -17,6 +18,17 @@ Existing scope, allowed/denied tools, permissions, approvals, record/audience, e
 | Existing Admin/operator gate | The original employee policy decides access. |
 | HostAuthority | A run cannot control or observe the host desktop, devices, power, network configuration or local model services. |
 | Missing adapter | Boot fails; this is unfinished parity, not an intentional tool restriction. |
+| ForkNextRelease | v1.80.0 protected TEAM only: `fork_run`, `merge_or_select`, `terminate_branch` are deferred until fresh child capability/account/budget authority and immutable result apply are complete. Non-protected installations retain their existing behavior. |
+
+`Refused: HostAuthority` and `Refused: ForkNextRelease` rows below are the complete isolation exception set. Every other row is served subject to the same original employee gates, even when its scope is Admin. The three deferred fork tools remain in this inventory, are hidden from protected tools/list, and return a localized refusal on tools/call; an injected service cannot enable them. Apart from that explicit v1.80.0 deferral, missing A/E factories are wiring errors: `require_complete_services()` rejects incomplete boot assembly. The matrix and tests describe implementation, not live provider or native acceptance.
+
+A readiness excludes exactly the three deferred mutations and requires all five signed helper/control producers plus the three host fork readers. An absent or changed signed helper publication still blocks readiness. This does not enable the other composite components, claim native/provider acceptance, or remove any of the original 22 A tools from the inventory.
+
+Operator/user messages follow `[general] default_language`:
+
+- zh-TW: 受保護模式下的分支試算將於下一版開放。
+- en: Branch trials in protected mode will be available in the next release.
+- ja: 保護モードでの分岐試行は次のバージョンで利用可能になります。
 
 | Tool | Disposition |
 | --- | --- |
@@ -117,6 +129,27 @@ Existing scope, allowed/denied tools, permissions, approvals, record/audience, e
 | `terminate_branch` | A ExecutionBackend + ExecutionPlanFactory |
 | `fork_cost` | A ExecutionBackend + ExecutionPlanFactory |
 | `credential_declare` | Resource → AuthorizedToolCall → original live employee handler |
+| `skill_bank_feedback` | Original gateway handler; existing employee gates |
+| `computer_screenshot` | Original gateway container/workspace handler; existing session and lease gates |
+| `computer_click` | Original gateway container/workspace handler; existing session and lease gates |
+| `computer_type` | Original gateway container/workspace handler; existing session and lease gates |
+| `computer_login` | Original gateway container/workspace handler; existing session and lease gates |
+| `computer_key` | Original gateway container/workspace handler; existing session and lease gates |
+| `computer_scroll` | Original gateway container/workspace handler; existing session and lease gates |
+| `computer_session_start` | Original gateway container/workspace handler; existing session and lease gates |
+| `computer_navigate` | Original gateway container/workspace handler; existing session and lease gates |
+| `computer_session_stop` | Original gateway container/workspace handler; existing session and lease gates |
+| `computer_workspace_list` | Original gateway container/workspace handler; existing session and lease gates |
+| `computer_workspace_read` | Original gateway container/workspace handler; existing session and lease gates |
+| `computer_workspace_write` | Original gateway container/workspace handler; existing session and lease gates |
+| `session_restore_context` | Original gateway handler; existing employee gates |
+| `fork_run` | Refused: ForkNextRelease — protected TEAM v1.80.0 limitation; unchanged on non-protected installations. |
+| `inspect_branches` | Host fork store; exact actor/generation and workspace grants; no legacy-row import. |
+| `diff_branches` | Host recorded-manifest comparison; exact actor/grants; not live or immutable byte verification. |
+| `merge_or_select` | Refused: ForkNextRelease — protected TEAM v1.80.0 limitation; unchanged on non-protected installations. |
+| `terminate_branch` | Refused: ForkNextRelease — protected TEAM v1.80.0 limitation; unchanged on non-protected installations. |
+| `fork_cost` | Host owner-checked query; measurement_status=unavailable and null spend until measured usage is implemented; never fabricated zero. |
+| `credential_declare` | Original gateway handler; existing employee gates |
 | `discovery_catalog` | A ExecutionBackend + ExecutionPlanFactory |
 | `discovery_list` | A ExecutionBackend + ExecutionPlanFactory |
 | `discovery_tree` | A ExecutionBackend + ExecutionPlanFactory |

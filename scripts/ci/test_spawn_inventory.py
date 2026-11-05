@@ -146,6 +146,29 @@ class SpawnInventoryTests(unittest.TestCase):
             entry["identity"] = identity
             self.assertEqual(check(sites, registry), [])
 
+    def test_isolated_helper_exception_cannot_exempt_gateway_or_another_symbol(self):
+        sites = self.scan('fn start() { Command::new("x").spawn(); }')
+        registry = self.registry(sites)
+        entry = registry["entries"][0]
+        entry["migration"] = "isolated_helper"
+        entry["identity"] = "employee"
+        self.assertTrue(any("invalid isolated helper exemption" in error
+                            for error in check(sites, registry)))
+        entry["symbol"] = "crates/duduclaw-execution/src/program_helper.rs::execute_command"
+        for identity in ("gateway", "operator", "host_service", "test"):
+            entry["identity"] = identity
+            self.assertTrue(any("invalid isolated helper exemption" in error
+                                for error in check(sites, registry)))
+        entry["identity"] = "employee"
+        self.assertFalse(any("invalid isolated helper exemption" in error
+                             for error in check(sites, registry)))
+        entry["symbol"] = "crates/duduclaw-execution/src/recording_helper.rs::run_driver"
+        self.assertFalse(any("invalid isolated helper exemption" in error
+                             for error in check(sites, registry)))
+        entry["symbol"] = "crates/duduclaw-execution/src/recording_helper.rs::main_entry"
+        self.assertTrue(any("invalid isolated helper exemption" in error
+                            for error in check(sites, registry)))
+
     def test_platform_factories_and_raw_exec_are_counted(self):
         sites = self.scan('''fn start() {
           let cmd = duduclaw_core::platform::async_command_for("x");
@@ -183,6 +206,13 @@ class SpawnInventoryTests(unittest.TestCase):
           async fn run(cmd: &mut TokioCommand) { ManagedChild::spawn_class(cmd, Mail).await; }
         ''')
         self.assertEqual(sites[0].apis, {"backend_spawn_class": 1})
+
+    def test_authorized_backend_dispatch_remains_inventoried(self):
+        sites = self.scan('async fn execute(backend: Backend) { backend.spawn_authorized(policy, authority).await; }')
+        self.assertEqual(sites[0].apis, {"terminal_spawn_authorized": 1})
+        changed = self.scan('async fn execute(backend: Backend) { backend.spawn(policy).await; }')
+        self.assertTrue(any("changed process effects" in error
+                            for error in check(changed, self.registry(sites))))
 
     def test_backend_adapters_are_inventoried_without_native_spawn(self):
         sites = self.scan('''async fn start(cmd: &mut Command) {

@@ -58,13 +58,75 @@ impl ExecutionPlanFactory for Plans {
 
 #[test]
 fn isolated_boot_missing_factories_stay_unavailable() {
-    let factories = GatewayFactories::assemble(None, None, resolver(false, false), None).unwrap();
+    let factories = GatewayFactories::assemble(None, None, resolver(false, false), None, Arc::new(crate::resources::ResourceRoots::default())).unwrap();
     assert!(factories.execution.is_none());
     assert!(factories.parser.is_none());
     assert!(GatewayFactories::assemble(None, Some(Arc::new(Plans(AtomicUsize::new(0)))),
-        resolver(false, false), None).is_err());
+        resolver(false, false), None, Arc::new(crate::resources::ResourceRoots::default())).is_err());
 }
 
+// The bridge now performs the resource rechecks that were formerly in
+// ResourceCheckedPlans, while factories return only authority-bearing plans.
+#[tokio::test]
+async fn isolated_boot_resource_authorization_precedes_factory() {
+    let plans = Arc::new(Plans(AtomicUsize::new(0)));
+    let factories = GatewayFactories::assemble(Some(Arc::new(TestBackend)), Some(plans.clone()),
+        resolver(false, true), None, Arc::new(crate::resources::ResourceRoots::default())).unwrap();
+    assert_eq!(factories.execution.unwrap().execute(&context("execute_program"), "execute_program", &json!({})).await["isError"], true);
+    assert_eq!(plans.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn isolated_boot_resource_change_during_factory_is_refused() {
+    struct ChangedPlans(Arc<AtomicUsize>);
+    impl ExecutionPlanFactory for ChangedPlans {
+        fn supports(&self, name: &str) -> bool { name == "execute_program" }
+        fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
+            Box::pin(async move { self.0.fetch_add(1, Ordering::SeqCst); Ok(()) })
+        }
+        fn prepare<'a>(&'a self, call: &'a AuthorizedToolCall, run: duduclaw_isolation::execution::RunHandle)
+            -> PolicyFuture<'a, AuthorizedExecutionPlan> {
+            Box::pin(async move {
+                let mut roots = crate::resources::ResourceRoots::default();
+                roots.insert("work".into(), call.context().record().employee, std::fs::File::open(tempfile::tempdir().unwrap().path()).unwrap())?;
+                let policy = super::super::execution::tests::plan(call.context(), call.name(), run);
+                AuthorizedExecutionPlan::new(roots.authorize_workspace(call, "work")?, policy)
+            })
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factories = GatewayFactories::assemble(Some(Arc::new(TestBackend)), Some(Arc::new(ChangedPlans(calls.clone()))),
+        resolver(true, false), None, Arc::new(crate::resources::ResourceRoots::default())).unwrap();
+    assert_eq!(factories.execution.unwrap().execute(&context("execute_program"), "execute_program", &json!({})).await["isError"], true);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn isolated_boot_plan_cannot_select_workspace_outside_resolved_grants() {
+    let context = context("execute_program");
+    let call = crate::tool_policy::authorize(&context, "execute_program", &json!({}), resolver(false, false).as_ref()).unwrap();
+    let mut roots = crate::resources::ResourceRoots::default();
+    let directory = tempfile::tempdir().unwrap();
+    roots.insert("other".into(), context.record().employee, std::fs::File::open(directory.path()).unwrap()).unwrap();
+    // Both workspaces occur in the capability, but this operation resolves only work.
+    assert!(matches!(roots.authorize_workspace(&call, "other"), Err(VerificationError::BindingMismatch)));
+}
+
+struct TestBackend;
+impl duduclaw_isolation::execution::ExecutionBackend for TestBackend {
+    fn supports_authorized_workspace(&self) -> bool { true }
+    fn reserve(&self, _: EmployeeId) -> duduclaw_isolation::execution::BackendFuture<'_, duduclaw_isolation::execution::RunHandle> {
+        Box::pin(async { Ok(duduclaw_isolation::execution::RunHandle(RunId([9;16]))) })
+    }
+    fn spawn(&self, _: duduclaw_isolation::execution::SpawnPolicy) -> duduclaw_isolation::execution::BackendFuture<'_, duduclaw_isolation::execution::RunHandle> {
+        Box::pin(async { panic!("unauthorized spawn") })
+    }
+    fn wait(&self, _: duduclaw_isolation::execution::RunHandle, _: duduclaw_isolation::execution::WaitOrigin) -> duduclaw_isolation::execution::BackendFuture<'_, duduclaw_isolation::execution::RunOutcome> { Box::pin(async { panic!("unexpected wait") }) }
+    fn kill(&self, _: duduclaw_isolation::execution::RunHandle) -> duduclaw_isolation::execution::BackendFuture<'_, ()> { Box::pin(async { Ok(()) }) }
+    fn take_stdio(&self, _: duduclaw_isolation::execution::RunHandle) -> duduclaw_isolation::execution::BackendFuture<'_, duduclaw_isolation::execution::RunStdio> { Box::pin(async { panic!("unexpected io") }) }
+    fn take_pty(&self, _: duduclaw_isolation::execution::RunHandle) -> duduclaw_isolation::execution::BackendFuture<'_, duduclaw_isolation::execution::RunPty> { Box::pin(async { panic!("unexpected pty") }) }
+    fn resize(&self, _: duduclaw_isolation::execution::RunHandle, _: duduclaw_isolation::execution::PtySize) -> duduclaw_isolation::execution::BackendFuture<'_, ()> { Box::pin(async { panic!("unexpected resize") }) }
+}
 
 fn options() -> TableOptions {
     TableOptions { kind: TableKind::Csv, delimiter: b',', has_header: true, offset: 0, limit: 2, sheet: None }

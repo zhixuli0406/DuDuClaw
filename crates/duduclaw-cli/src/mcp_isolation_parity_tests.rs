@@ -74,13 +74,16 @@ impl WorkerPlanFactory for ListingPlans {
     }
 }
 
-fn host_tools() -> BTreeSet<String> {
+fn documented_refusals() -> BTreeSet<String> {
     // Independent of the implementation's refusal predicate: an accidental new
     // refusal must change the reviewed product matrix before it can pass parity.
     let matrix = include_str!("../../../docs/architecture/native-linux-isolation-tools.md");
-    let names: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && line.contains("Refused: HostAuthority"))
+    let names: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && (line.contains("Refused: HostAuthority") || line.contains("Refused: ForkNextRelease")))
         .filter_map(|line| line.split('`').nth(1)).map(str::to_owned).collect();
     assert!(names.contains("os_power"), "matrix must enumerate the host-authority exception");
+    let deferred: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && line.contains("Refused: ForkNextRelease"))
+        .filter_map(|line| line.split('`').nth(1)).collect();
+    assert_eq!(deferred, BTreeSet::from(["fork_run", "merge_or_select", "terminate_branch"]));
     assert!(!names.contains("computer_session_start"));
     assert!(!names.contains("computer_workspace_write"));
     names
@@ -208,7 +211,7 @@ enabled = true
         record.principal = RunPrincipal::Background { tenant_id: Text::new("tenant".into()).unwrap(), generation: 1 };
         record.employee_binding = EmployeeBinding::Shared(Text::new("tenant".into()).unwrap());
     }
-    let host = host_tools();
+    let host = documented_refusals();
     record.tools = List::new(crate::mcp::tools().filter(|tool| !host.contains(tool.name))
         .map(|tool| Text::new(tool.name.into()).unwrap()).collect()).unwrap();
     record.resources = List::new(vec![
@@ -231,7 +234,11 @@ enabled = true
         .with_connector_selection_policy(Arc::new(ListingSelection)));
     let parser = Arc::new(GatewayTableParser::new(Arc::new(|_, _, _| panic!("listing parsed a file"))));
     let factories = GatewayFactories::assemble(Some(Arc::new(ListingBackend)), Some(Arc::new(ListingPlans)),
-        resolver.clone(), Some(parser)).unwrap().with_worker(Arc::new(WorkerToolBridge::new(
+        resolver.clone(), Some(parser), Arc::new(ResourceRoots::default())).unwrap()
+        .with_forks(Arc::new(duduclaw_mcp_boundary::forks::ForkHostControl {
+            store: duduclaw_mcp_boundary::forks::ForkStore::open(&home.join("isolation-forks.db")).unwrap(),
+            backend: Arc::new(ListingBackend),
+        })).with_worker(Arc::new(WorkerToolBridge::new(
             Arc::new(ListingPlans), resolver.clone(), Arc::new(|_| panic!("listing launched a parser")))));
     let dispatcher = IsolationDispatcher::new(home.to_owned(), context.record().employee, "main".into(),
         principal, Arc::new(ResourceRoots::default())).unwrap().with_gateway_services(resolver, factories, Some(Arc::new(ListingConnectors)));
@@ -245,7 +252,7 @@ fn names(response: &Value) -> BTreeSet<String> {
 }
 
 #[test]
-fn isolated_round5_employee_tool_parity_matches_nonisolated_except_documented_host_authority() {
+fn isolated_round6_employee_tool_parity_matches_documented_exceptions() {
     // A dedicated test process models a real gateway-spawned MCP child, including
     // signed employee identity, without racing global env mutations in libtest.
     if let Some(home) = std::env::var_os("DUDUCLAW_PARITY_CHILD_HOME") {
@@ -255,7 +262,7 @@ fn isolated_round5_employee_tool_parity_matches_nonisolated_except_documented_ho
     let home = tempfile::tempdir().unwrap();
     let key = duduclaw_core::identity_token::ensure_key(home.path()).unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("isolated_round5_employee_tool_parity_matches_nonisolated_except_documented_host_authority")
+        .arg("isolated_round6_employee_tool_parity_matches_documented_exceptions")
         .arg("--test-threads=1").arg("--nocapture")
         .env("DUDUCLAW_PARITY_CHILD_HOME", home.path())
         .env(duduclaw_core::ENV_AGENT_ID, "main")
@@ -272,7 +279,7 @@ async fn employee_tool_parity(home: &std::path::Path) {
     let (dispatcher, context) = fixture(home);
     assert_eq!(crate::mcp_namespace::verified_employee_from_env(home).as_deref(), Some("main"));
     dispatcher.require_complete_services().unwrap();
-    let host = host_tools();
+    let host = documented_refusals();
     for extra in ["", "denied_tools = [\"odoo_search\", \"wiki_write\", \"send_to_agent\"]\naction_rules = [{tool=\"plan_start\", verdict=\"block\"}]"] {
         std::fs::write(home.join("agents/main/agent.toml"), employee_config(extra)).unwrap();
         let ordinary = names(&crate::mcp::handle_tools_list_for_agent(&json!(1), &dispatcher.principal, home, "main").await);
@@ -280,6 +287,10 @@ async fn employee_tool_parity(home: &std::path::Path) {
             "method":"tools/list"})).await.unwrap().unwrap());
         let expected = ordinary.difference(&host).cloned().collect::<BTreeSet<_>>();
         assert_eq!(isolated, expected, "transport must preserve existing employee gates");
+        for tool in ["fork_run", "merge_or_select", "terminate_branch"] {
+            assert!(ordinary.contains(tool), "non-protected installations retain {tool}");
+            assert!(!isolated.contains(tool), "protected TEAM defers {tool}");
+        }
         if extra.is_empty() {
             for tool in ["odoo_connect", "odoo_execute", "send_message", "send_photo", "send_sticker", "channel_status",
                 "send_to_agent", "team_handoff", "plan_start", "task_status", "session_restore_context", "memory_improve",

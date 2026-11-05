@@ -277,6 +277,33 @@ fn file_identity(file: &File) -> Result<(u64, u64), VerificationError> {
     { let _ = file; Err(VerificationError::Unavailable) }
 }
 
+/// An owned authorization proof for a helper's workspace. Only ResourceRoots
+/// can construct it; no pathname, environment variable or MCP value can mint it.
+/// Root reopens the fixed handle under H and verifies this directory identity.
+pub struct AuthorizedHelperWorkspace {
+    employee: EmployeeId,
+    run: duduclaw_isolation::ids::RunId,
+    policy: duduclaw_isolation::execution::WorkspacePolicy,
+    _directory: File,
+}
+impl AuthorizedHelperWorkspace {
+    /// Keep the proof bound to the caller while delivering its directory only
+    /// for the separately reserved child run that root will admit.
+    pub fn delivery_for(&self, run: duduclaw_isolation::execution::RunHandle)
+        -> Result<duduclaw_isolation::execution::WorkspaceDelivery, VerificationError> {
+        if run.0 == self.run { return Err(VerificationError::BindingMismatch); }
+        Ok(duduclaw_isolation::execution::WorkspaceDelivery { employee: self.employee, run: run.0,
+            policy: self.policy.clone(), directory: self._directory.try_clone().map_err(|_| VerificationError::Unavailable)? })
+    }
+
+    pub fn permits(&self, context: &RequestContext,
+        policy: &duduclaw_isolation::execution::WorkspacePolicy) -> bool {
+        self.employee == context.record().employee && self.run == context.record().run
+            && self.policy == *policy && context.record().resources.as_slice().iter().any(|resource|
+                matches!(resource, ResourceGrant::Workspace { handle } if handle == &policy.workspace))
+    }
+}
+
 /// Server-owned roots, scoped to an employee. Register from trusted mount/dirfd
 /// delivery only; never open a path supplied by an MCP client as a root.
 #[derive(Default)]
@@ -400,6 +427,15 @@ impl ResourceRoots {
         let path = match relative { Some(path) => relative_path(path)?, None => Path::new(".") };
         let root = self.authorized_root(context, handle)?;
         open_resource(root, path, true)
+    }
+
+    pub fn authorize_helper_workspace(&self, context: &RequestContext,
+        policy: &duduclaw_isolation::execution::WorkspacePolicy) -> Result<AuthorizedHelperWorkspace, VerificationError> {
+        let cwd = policy.relative_cwd.as_str();
+        let directory = self.open_directory(context, policy.workspace.as_str(),
+            if cwd.is_empty() || cwd == "." { None } else { Some(cwd) })?;
+        Ok(AuthorizedHelperWorkspace { employee: context.record().employee, run: context.record().run,
+            policy: policy.clone(), _directory: directory })
     }
 
     fn authorized_root(&self, context: &RequestContext, handle: &str) -> Result<&File, VerificationError> {

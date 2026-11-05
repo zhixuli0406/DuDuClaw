@@ -753,7 +753,7 @@
       "rationale": "Operator standalone MCP installation command; updates CLI registration rather than running employee work."
     },
     {
-      "symbol": "crates/duduclaw-cli/src/mcp_isolation_parity_tests.rs::isolated_round5_employee_tool_parity_matches_nonisolated_except_documented_host_authority",
+      "symbol": "crates/duduclaw-cli/src/mcp_isolation_parity_tests.rs::isolated_round6_employee_tool_parity_matches_documented_exceptions",
       "apis": {
         "command_constructor": 1,
         "terminal_output": 1
@@ -5142,6 +5142,30 @@
     {
       "symbol": "crates/duduclaw-mcp-boundary/src/execution.rs::ExecutionToolBridge::execute",
       "apis": {
+        "terminal_spawn_authorized": 1
+      },
+      "effects": [
+        "backend_dispatch"
+      ],
+      "identity": "employee",
+      "migration": "backend",
+      "rationale": "Calls Arc<dyn ExecutionBackend>::spawn_authorized with the authorized typed SpawnPolicy and retained workspace authority after reservation, handler authorization and immutable context/plan validation. No native Command or gateway-uid fallback."
+    },
+    {
+      "symbol": "crates/duduclaw-mcp-boundary/src/forks.rs::DropforLaunchGuard::drop",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "Tokio task retries cancellation of an owned backend reservation or authenticated branch handle on future drop. No OS process is created."
+    },
+    {
+      "symbol": "crates/duduclaw-mcp-boundary/src/forks.rs::launch_branch",
+      "apis": {
         "terminal_spawn": 1
       },
       "effects": [
@@ -5149,7 +5173,7 @@
       ],
       "identity": "employee",
       "migration": "backend",
-      "rationale": "Calls Arc<dyn ExecutionBackend>::spawn with the authorized typed SpawnPolicy after reservation, handler authorization and immutable context/plan validation. No native Command or gateway-uid fallback."
+      "rationale": "ExecutionBackend spawn with owned reservation, exact actor/branch/workspace binding and AuthorizedWorkspace. This uninstalled driver still requires a root workspace-delivery factory; inventory classification does not claim readiness."
     },
     {
       "symbol": "crates/duduclaw-memory/src/engine.rs::call_claude_summarize",
@@ -6223,6 +6247,68 @@
       "rationale": "G root materialization coordinator invokes only the root-trusted installed platform allocation readback with fixed migration-v1 argv, bounded JSON and a 30-second deadline. The reply must bind the confirmed proposal and prove stopped execution and verified quota; no employee process is launched."
     },
     {
+      "symbol": "crates/duduclaw-execution/src/program_helper.rs::execute_command",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "employee",
+      "migration": "isolated_helper",
+      "rationale": "Private employee-side program helper, entered only through the Linux sealed-fd/uid/NNP/fixed-workspace binary protocol after root-registered backend launch. No gateway invocation or local fallback; B2 owns namespace/cgroup descendant retirement. Test-only calls use a disposable directory."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/recording_helper.rs::run_driver",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "employee",
+      "migration": "isolated_helper",
+      "rationale": "Private employee-side headless recording helper after sealed-fd/uid/NNP/workspace verification. Fixed Node/Playwright/Chromium digests and driver, bound egress only, no host display, no gateway-uid invocation. Root owns namespace and descendant retirement; actual signed browser profile acceptance is still required."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/isolation_forks.rs::InstalledForkSnapshots::run",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "employee",
+      "migration": "backend",
+      "rationale": "Signed fixed fork snapshot helper runs only through ExecutionBackend; bounded collector waits as gateway, retaining D8 queue and exact reservation. No native spawn or local fallback."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/isolation_forks.rs::DropforCleanup::drop",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "Tokio cleanup task cancels the owned backend RunHandle on dropped collection; no OS process launch and no retirement claim."
+    },
+    {
+      "symbol": "crates/duduclaw-mcp-boundary/src/fork_queue.rs::DropforActiveBranch::drop",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "Tokio drop guard persists uncertain state and cancels only its owned fork RunHandle when the host collector is interrupted. No OS process creation and no retirement claim."
+    },
+    {
       "symbol": "crates/duduclaw-api-worker/src/linux.rs::Bridge::connect",
       "apis": {
         "command_constructor": 1,
@@ -6259,6 +6345,42 @@
         "process_spawn"
       ],
       "rationale": "A protected PTY marker only; one-shot authorization and fresh root plan are required. RunHandle lifecycle owns terminal IO, cancellation and retirement; no local PTY fallback."
+    },
+    {
+      "symbol": "crates/duduclaw-mcp-boundary/src/execution_tests.rs::ExecutionBackendforBackend::spawn_authorized",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "backend_dispatch"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only mock backend delegates authorized launch to its in-memory spawn counter after verifying live workspace authority; no native process creation."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/spawnd/authorized_tests.rs::authorized_spawn_holds_live_authority_and_cancels_queued_run_on_revoke",
+      "apis": {
+        "terminal_spawn_authorized": 1
+      },
+      "effects": [
+        "backend_dispatch"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only authenticated workspace bridge fixture exercises retained live authority and cancellation against the fake root protocol; no production launch."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/spawnd/authorized_tests.rs::authorized_spawn_requires_explicit_bridge_and_exact_root_receipt",
+      "apis": {
+        "terminal_spawn_authorized": 2
+      },
+      "effects": [
+        "backend_dispatch"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only authenticated workspace bridge fixture asserts missing bridge and forged receipt refuse authorized launch; no production launch."
     }
   ]
 }

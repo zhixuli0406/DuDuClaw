@@ -132,6 +132,31 @@ pub fn prepare(plan: &BootstrapPlan, storage: &AttachedStorage, anchors: &RootPu
     Ok(PreparedMounts { home, work, projection, etc, runtime, executable, script, projection_run: plan.run })
 }
 
+/// Resolve only a reviewed workspace selector under the just-attached H work
+/// filesystem. The fd remains pinned across open_tree; no gateway host path or
+/// supplied mount descriptor is trusted. The selected cwd becomes /work.
+pub fn select_workspace(storage: &mut AttachedStorage, selection: &duduclaw_isolation::ipc::WorkspaceSelection,
+    uid: u32) -> io::Result<()> {
+    let fd = workspace_directory(storage.work.as_fd(), &storage.receipt, selection, uid)?;
+    storage.work = detached_clone(fd.as_fd(), MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC)?;
+    Ok(())
+}
+fn workspace_directory(work: BorrowedFd<'_>, receipt: &crate::storage::Attachment,
+    selection: &duduclaw_isolation::ipc::WorkspaceSelection, uid: u32) -> io::Result<OwnedFd> {
+    let relative = selection.storage_relative().map_err(|_| invalid())?;
+    let name = CString::new(relative).map_err(|_| invalid())?;
+    let how = OpenHow { flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+        mode: 0, resolve: 0x08 | 0x04 | 0x02 | 0x01 };
+    let fd = owned(unsafe { libc::syscall(libc::SYS_openat2, work.as_raw_fd(), name.as_ptr(),
+        &how, mem::size_of::<OpenHow>()) })?;
+    let stat = metadata(&fd)?;
+    if !stat.is_dir() || stat.uid() != uid || stat.dev() != selection.device || stat.ino() != selection.inode
+        || libc::major(stat.dev()) != receipt.device_major || libc::minor(stat.dev()) != receipt.device_minor {
+        return Err(invalid());
+    }
+    Ok(fd)
+}
+
 /// F/G publishes a root-owned immutable projection for each employee beneath
 /// this anchor. The identity selects an exact hex component; no gateway path,
 /// employee workspace or symlink can become the projection source.
@@ -328,6 +353,30 @@ pub fn cleanup_projection(anchors: &RootPublicationAnchors, run: RunHandle) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn workspace_selection_reopens_only_the_exact_h_directory() {
+        use duduclaw_isolation::{bounded::Text, ids::{RunId, RequestId}, ipc::WorkspaceSelection};
+        let base = std::env::temp_dir().join(format!("duduclaw-workspace-r5-{}", std::process::id()));
+        fs::create_dir(&base).unwrap();
+        let forks = base.join(".forks"); fs::create_dir(&forks).unwrap();
+        let branch = forks.join("a".repeat(32)); fs::create_dir(&branch).unwrap();
+        let root = File::open(&base).unwrap();
+        let stat = fs::metadata(&branch).unwrap();
+        let receipt = crate::storage::Attachment { employee: EmployeeId([1;16]), run: RunHandle(RunId([2;16])),
+            token: RequestId([3;16]), device_major: libc::major(stat.dev()), device_minor: libc::minor(stat.dev()) };
+        let mut selection = WorkspaceSelection { handle: Text::new(format!("fork-{}", "a".repeat(32))).unwrap(),
+            relative_cwd: Text::new(".".into()).unwrap(), device: stat.dev(), inode: stat.ino() };
+        assert!(workspace_directory(root.as_fd(), &receipt, &selection, stat.uid()).is_ok());
+        selection.inode += 1;
+        assert!(workspace_directory(root.as_fd(), &receipt, &selection, stat.uid()).is_err());
+        selection.inode -= 1;
+        assert!(workspace_directory(root.as_fd(), &receipt, &selection, stat.uid().saturating_add(1)).is_err());
+        let saved = forks.join("saved"); fs::rename(&branch, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &branch).unwrap();
+        assert!(workspace_directory(root.as_fd(), &receipt, &selection, stat.uid()).is_err());
+        fs::remove_file(&branch).unwrap(); fs::remove_dir(&saved).unwrap();
+        fs::remove_dir(&forks).unwrap(); fs::remove_dir(&base).unwrap();
+    }
     #[test]
     fn publication_anchor_rejects_relative_and_symlink_paths() {
         assert!(trusted_directory(Path::new("relative")).is_err());

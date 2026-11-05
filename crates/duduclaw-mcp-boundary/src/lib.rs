@@ -3,11 +3,15 @@ pub mod authority;
 pub mod io_authority;
 pub mod config;
 pub mod execution;
+pub mod execution_jobs;
+pub mod fork_policy;
 #[cfg(all(target_os = "linux", feature = "execution-integration"))]
 pub mod protected_launch;
 pub mod factories;
 pub mod worker_execution;
 pub mod resources;
+#[cfg(feature = "binding-store")]
+pub mod forks;
 pub mod parsing;
 pub mod tool_policy;
 pub mod server;
@@ -29,3 +33,6 @@ pub fn check_arguments(arguments: &serde_json::Value) -> Result<(), Verification
     }
     Ok(())
 }
+
+#[cfg(feature = "binding-store")]
+pub mod fork_queue;

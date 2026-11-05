@@ -296,10 +296,48 @@ impl duduclaw_fork::judge::LlmCaller for UtilityJudgeCaller {
     }
 }
 
+/// Closed inventory shared by routing and readiness; never narrow it to hide a missing producer.
+pub(crate) fn is_fork_tool(name: &str) -> bool {
+    matches!(name, "fork_run" | "inspect_branches" | "diff_branches" | "merge_or_select" | "terminate_branch" | "fork_cost")
+}
+
+/// Keep the original per-employee opt-in and authenticated scope gates before
+/// entering the host-owned store. Protected reads never import legacy rows.
+async fn protected_fork(name: &str, args: &Value, home: &Path, agent: &str) -> Option<Value> {
+    // A host-injected service cannot enable the deferred v1.80 mutations.
+    // Check before opt-in reads, legacy stores, account lookup or publication.
+    if duduclaw_mcp_boundary::fork_policy::deferred(name)
+        && (crate::mcp_isolation::current().is_some()
+            || duduclaw_gateway::isolation_readiness::status().is_some()) {
+        return Some(err(crate::mcp_isolation::refusal_message(home,
+            crate::mcp_isolation_disposition::Refusal::ForkNextRelease).await));
+    }
+    let Some(call) = crate::mcp_isolation::current() else {
+        return duduclaw_core::execution_gate::isolation_required().then(||
+            err("受保護的分支執行服務尚未就緒，已拒絕操作。"));
+    };
+    let settings = load_fork_settings(home, agent);
+    if let Some(error) = require_enabled(&settings) { return Some(error); }
+    if call.home != home || call.agent != agent
+        || !duduclaw_mcp_boundary::tool_policy::eligible(&call.context, name) {
+        return Some(err("無法確認這次操作的員工身分與授權。"));
+    }
+    let Some(service) = call.forks.as_ref().filter(|service| service.supports(name)) else {
+        return Some(err("受保護的分支執行服務尚未就緒，已拒絕操作。"));
+    };
+    // Scope, approval and irreversible-action checks already ran in the common
+    // dispatcher. The service independently validates current policy and actor.
+    Some(match service.execute(&call.context, name, args).await {
+        Ok(value) => ok_json(value),
+        Err(_) => err("分支操作未通過授權、狀態或版本檢查。"),
+    })
+}
+
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 /// `fork_run` — split the current task into N competing branches.
 pub async fn handle_fork_run(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if let Some(result) = protected_fork("fork_run", args, home_dir, agent_id).await { return result; }
     let settings = load_fork_settings(home_dir, agent_id);
     if let Some(e) = require_enabled(&settings) {
         return e;
@@ -484,6 +522,7 @@ pub async fn handle_fork_run(args: &Value, home_dir: &Path, agent_id: &str) -> V
 
 /// `inspect_branches` — list a fork's branches + state + spend.
 pub async fn handle_inspect_branches(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if let Some(result) = protected_fork("inspect_branches", args, home_dir, agent_id).await { return result; }
     let settings = load_fork_settings(home_dir, agent_id);
     if let Some(e) = require_enabled(&settings) {
         return e;
@@ -497,11 +536,15 @@ pub async fn handle_inspect_branches(args: &Value, home_dir: &Path, agent_id: &s
         None => return err("fork_id is required"),
     };
     let fork = match store.get_fork(fork_id) {
-        Ok(Some(f)) => f,
+        Ok(Some(f)) if f.agent_id == agent_id => f,
+        Ok(Some(_)) => return err("fork is unavailable to this agent"),
         Ok(None) => return err(format!("fork not found: {fork_id}")),
         Err(e) => return err(format!("store error: {e}")),
     };
-    let branches = store.list_branches(fork_id).unwrap_or_default();
+    let branches = match store.list_branches(fork_id) {
+        Ok(branches) => branches,
+        Err(e) => return err(format!("store error: {e}")),
+    };
     let decision = match store.resolution_decision(fork_id) {
         Ok(decision) => decision,
         Err(error) => return err(format!("store error: {error}")),
@@ -524,6 +567,7 @@ pub async fn handle_inspect_branches(args: &Value, home_dir: &Path, agent_id: &s
 
 /// `diff_branches` — show outputs of two branches side by side.
 pub async fn handle_diff_branches(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if let Some(result) = protected_fork("diff_branches", args, home_dir, agent_id).await { return result; }
     let settings = load_fork_settings(home_dir, agent_id);
     if let Some(e) = require_enabled(&settings) {
         return e;
@@ -536,6 +580,13 @@ pub async fn handle_diff_branches(args: &Value, home_dir: &Path, agent_id: &str)
         Some(f) => f,
         None => return err("fork_id is required"),
     };
+    // Authorize the parent before reading branch output. A branch selector is
+    // data, never caller identity or authority to inspect another employee.
+    match store.get_fork(fork_id) {
+        Ok(Some(fork)) if fork.agent_id == agent_id => {},
+        Ok(_) => return err("fork is unavailable to this agent"),
+        Err(e) => return err(format!("store error: {e}")),
+    }
     let (a, b) = match (
         args.get("branch_a").and_then(|v| v.as_str()),
         args.get("branch_b").and_then(|v| v.as_str()),
@@ -569,6 +620,7 @@ pub async fn handle_diff_branches(args: &Value, home_dir: &Path, agent_id: &str)
 /// the parent is gone, the call errors and the fork stays unresolved — it never
 /// reports a promotion that did not happen.
 pub async fn handle_merge_or_select(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if let Some(result) = protected_fork("merge_or_select", args, home_dir, agent_id).await { return result; }
     let settings = load_fork_settings(home_dir, agent_id);
     if let Some(e) = require_enabled(&settings) {
         return e;
@@ -687,6 +739,7 @@ pub async fn handle_merge_or_select(args: &Value, home_dir: &Path, agent_id: &st
 
 /// `terminate_branch` — mark a branch terminated (kills its subprocess in P4 follow-up).
 pub async fn handle_terminate_branch(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if let Some(result) = protected_fork("terminate_branch", args, home_dir, agent_id).await { return result; }
     let settings = load_fork_settings(home_dir, agent_id);
     if let Some(e) = require_enabled(&settings) {
         return e;
@@ -753,6 +806,7 @@ pub async fn handle_terminate_branch(args: &Value, home_dir: &Path, agent_id: &s
 
 /// `fork_cost` — aggregate + per-branch spend.
 pub async fn handle_fork_cost(args: &Value, home_dir: &Path, agent_id: &str) -> Value {
+    if let Some(result) = protected_fork("fork_cost", args, home_dir, agent_id).await { return result; }
     let settings = load_fork_settings(home_dir, agent_id);
     if let Some(e) = require_enabled(&settings) {
         return e;
@@ -768,8 +822,12 @@ pub async fn handle_fork_cost(args: &Value, home_dir: &Path, agent_id: &str) -> 
     match store.get_fork(fork_id) {
         Ok(None) => err(format!("fork not found: {fork_id}")),
         Err(e) => err(format!("store error: {e}")),
+        Ok(Some(fork)) if fork.agent_id != agent_id => err("fork is unavailable to this agent"),
         Ok(Some(_)) => {
-            let branches = store.list_branches(fork_id).unwrap_or_default();
+            let branches = match store.list_branches(fork_id) {
+                Ok(branches) => branches,
+                Err(e) => return err(format!("store error: {e}")),
+            };
             let aggregate: f64 = branches.iter().map(|b| b.spent_usd).sum();
             ok_json(json!({
                 "fork_id": fork_id,
@@ -1304,6 +1362,33 @@ test_timeout_s = 60
         )
         .await;
         assert!(is_error(&m));
+    }
+
+    #[tokio::test]
+    async fn isolated_fork_reads_require_owner_before_returning_records() {
+        let home = enabled_home();
+        std::fs::create_dir_all(home.path().join("agents/a2")).unwrap();
+        std::fs::write(home.path().join("agents/a2/agent.toml"),
+            "[agent]\nstatus = \"active\"\n[fork]\nenabled = true\n").unwrap();
+        let (fork_id, first) = fork_two(home.path()).await;
+        let store = open_store(home.path()).unwrap();
+        let branches = store.list_branches(&fork_id).unwrap();
+        let second = branches.iter().find(|branch| branch.branch_id != first).unwrap().branch_id.clone();
+        store.update_branch(&first, "finished", 0.42, "OWNER_ONLY_OUTPUT", Some(0)).unwrap();
+        let args = json!({"fork_id":fork_id,"branch_a":first,"branch_b":second,"agent_id":"a1"});
+        let denied = [handle_inspect_branches(&args, home.path(), "a2").await,
+            handle_diff_branches(&args, home.path(), "a2").await,
+            handle_fork_cost(&args, home.path(), "a2").await];
+        for value in denied {
+            assert!(is_error(&value), "{value}");
+            assert!(!text(&value).contains("OWNER_ONLY_OUTPUT"));
+            assert!(!text(&value).contains("0.42"));
+        }
+        for value in [handle_inspect_branches(&args, home.path(), "a1").await,
+            handle_diff_branches(&args, home.path(), "a1").await,
+            handle_fork_cost(&args, home.path(), "a1").await] {
+            assert!(!is_error(&value), "{value}");
+        }
     }
 
     #[tokio::test]

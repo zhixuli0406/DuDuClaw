@@ -24,6 +24,7 @@ impl DispatcherFactory for CliDispatcherFactory {
             if crate::mcp_isolation_disposition::intentional_refusal(tool.name).is_some() { continue; }
             let ready = match crate::mcp_isolation::boundary_route(tool.name) {
                 Some(BoundaryRoute::File) => true,
+                Some(BoundaryRoute::GatewayHandler(_)) => true,
                 Some(BoundaryRoute::Resource) => {
                     if duduclaw_gateway::isolation_connectors::provider_for_tool(tool.name).is_some() {
                         connectors.supports(tool.name) && selection.supports(tool.name)

@@ -51,8 +51,14 @@ impl Components {
                 ComponentState::Ready
             } else { ComponentState::Unavailable },
             mcp_boundary: integration.mcp_boundary,
-            runtime_adapters: integration.runtime_adapters }
+            runtime_adapters: combined_worker_state(integration.runtime_adapters, runtime_adapters_state()) }
     }
+}
+
+fn runtime_adapters_state() -> ComponentState {
+    #[cfg(target_os = "linux")]
+    if crate::isolation_mcp::a_producers_ready() { return ComponentState::Ready; }
+    ComponentState::PendingIntegration
 }
 
 #[derive(Clone, Debug, Serialize)]

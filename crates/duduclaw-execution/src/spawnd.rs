@@ -17,6 +17,12 @@ const TERMINAL_RETENTION: Duration = Duration::from_secs(300);
 const MAX_MEMFD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MEMFD_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
+fn validate_workspace(workspace: &WorkspacePolicy) -> Result<(), BackendError> {
+    if workspace.workspace.as_str() == "employee-work" && matches!(workspace.relative_cwd.as_str(), "" | ".") {
+        Ok(())
+    } else { Err(BackendError::Denied) }
+}
+
 /// Spawnd is mandatory in protected mode; construction never chooses a local
 /// backend. The endpoint and root peer identity are not configurable by a caller.
 pub struct SpawndBackend {
@@ -196,7 +202,9 @@ impl SpawndBackend {
     async fn receive_io(entry: &Entry, run: RunHandle, state: &mut State) -> Result<(), BackendError> {
         if let Some(workspace) = &state.workspace { workspace.verify()?; }
         if state.io_received { return Ok(()); }
-        if !state.started || state.outcome.is_some() { return Err(BackendError::Denied); }
+        // Root retains exited/signalled output for one-shot TakeIo even when a
+        // fast helper has already ended. Retain live workspace checks throughout.
+        if !state.started { return Err(BackendError::Denied); }
         let packet = request_checked(entry, SpawnRequest::TakeIo { run }, &[], state.workspace.as_ref()).await?;
         let SpawnResponse::Io { delivery, .. } = &packet.response else { return Err(BackendError::Protocol); };
         if delivery.pty != state.pty || delivery.mcp != state.mcp {
@@ -242,6 +250,16 @@ impl SpawndBackend {
     }
     async fn spawn_inner(&self, policy: SpawnPolicy, workspace: Option<Arc<WorkspaceGuard>>) -> Result<RunHandle, BackendError> {
         self.check_admission()?;
+        // Only D's retained directory proof may request an H workspace mount.
+        let selection = match &policy.workspace_delivery {
+            Some(delivery) if delivery.employee == policy.employee && delivery.run == policy.run.0
+                && delivery.policy == policy.workspace => Some(delivery.selection()?),
+            Some(_) => return Err(BackendError::Denied),
+            None => {
+                if workspace.is_none() { validate_workspace(&policy.workspace)?; }
+                None
+            },
+        };
         let entry = self.entry(policy.run)?;
         let mut state = entry.state.lock().await;
         if entry.employee != policy.employee || state.started || state.expires <= Instant::now() {
@@ -259,12 +277,15 @@ impl SpawndBackend {
             tokio::time::timeout_at(expires, prepare_inputs(policy.inputs, budget))
                 .await.map_err(|_| BackendError::Timeout)?
         };
-        let prepared = match &workspace {
+        let mut prepared = match &workspace {
             Some(workspace) => workspace.checked(prepare).await?,
             None => prepare.await?,
         };
+        if let Some(delivery) = &policy.workspace_delivery {
+            prepared.fds.push(delivery.directory.try_clone().map_err(|_| BackendError::Io)?.into());
+        }
         let request = SpawnRequest::StartRun { run: policy.run, employee_id: policy.employee,
-            runtime_request: policy.runtime, task_ref: state.task_ref.clone(), prompt_bytes: prepared.prompt_bytes,
+            runtime_request: policy.runtime, workspace: selection, task_ref: state.task_ref.clone(), prompt_bytes: prepared.prompt_bytes,
             input_fds: List::new(prepared.attachments).map_err(|_| BackendError::Denied)?, pty: policy.pty };
         request.validate().map_err(|_| BackendError::Denied)?;
         if let Err(error) = self.check_admission() {
@@ -339,6 +360,11 @@ impl ExecutionBackend for SpawndBackend {
         -> BackendFuture<'_, RunHandle> {
         Box::pin(async move {
             authority.verify_live()?;
+            if let Some(delivery) = &policy.workspace_delivery {
+                if delivery.employee != policy.employee || delivery.run != policy.run.0
+                    || delivery.policy != policy.workspace { return Err(BackendError::Denied); }
+                authority.verify_workspace(delivery.policy.workspace.as_str(), &delivery.directory)?;
+            }
             let bridge = self.workspace_bridge.as_ref().ok_or(BackendError::Unavailable)?;
             let request = RootWorkspaceRequest::from_policy(&policy)?;
             let entry = self.entry(policy.run)?;
@@ -357,6 +383,7 @@ impl ExecutionBackend for SpawndBackend {
             }).await?;
             let workspace = Arc::new(WorkspaceGuard::new(request, receipt, authority)?);
             self.spawn_inner(policy, Some(workspace)).await
+
         })
     }
 
@@ -569,6 +596,20 @@ mod tests {
     }
     pub(super) fn input(bytes: &[u8], max_bytes: u64) -> RunInput {
         RunInput { reader: Box::new(Bytes(std::io::Cursor::new(bytes.to_vec()))), max_bytes }
+    }
+
+    #[test]
+    fn spawnd_workspace_policy_rejects_undelivered_branch_roots_and_cwd() {
+        for cwd in ["", "."] {
+            assert!(validate_workspace(&WorkspacePolicy { workspace: Text::new("employee-work".into()).unwrap(),
+                relative_cwd: Text::new(cwd.into()).unwrap() }).is_ok());
+        }
+        for (workspace, cwd) in [("branch-work", "."), ("employee-work", "branch"),
+            ("employee-work", "forks/branch"), ("employee-work", "../branch"),
+            ("/work", "."), ("employee-work-extra", "."), ("employee-work", "/work")] {
+            assert_eq!(validate_workspace(&WorkspacePolicy { workspace: Text::new(workspace.into()).unwrap(),
+                relative_cwd: Text::new(cwd.into()).unwrap() }), Err(BackendError::Denied));
+        }
     }
 
     async fn metadata_fixture() -> (SpawndBackend, RunHandle, Arc<Entry>, OwnedFd) {

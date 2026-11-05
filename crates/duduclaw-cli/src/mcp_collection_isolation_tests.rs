@@ -15,7 +15,7 @@ fn call(home: &std::path::Path) -> Arc<IsolatedCall> {
         }]).unwrap(), policy_revision: 1, gateway_epoch: [4; 16], issued_at: 1,
         not_before: 1, expires_at: 2, nonce: [5; 32], jti: [6; 16],
     });
-    Arc::new(IsolatedCall { home: home.to_owned(), context, agent: "alice".into(),
+    Arc::new(IsolatedCall { forks: None, home: home.to_owned(), context, agent: "alice".into(),
         roots: Arc::new(ResourceRoots::default()), parser: None, services: None,
         execution: None, worker: None, record_resolver: None })
 }

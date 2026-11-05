@@ -733,7 +733,7 @@ mod tests {
     fn text<const N: usize>(value: &str) -> Text<N> { Text::new(value.into()).unwrap() }
     fn policy(run: RunHandle, employee: EmployeeId) -> SpawnPolicy {
         SpawnPolicy {
-            run, employee, class: ExecutionClass::EmployeeMain, runtime: RuntimeKind::Claude,
+            workspace_delivery: None, run, employee, class: ExecutionClass::EmployeeMain, runtime: RuntimeKind::Claude,
             argv_allowlist: vec![text("unused")], environment_allowlist: BTreeMap::new(),
             workspace: WorkspacePolicy { workspace: text(if cfg!(windows) { "C:\\" } else { "/" }), relative_cwd: text("") },
             resources: ResourceLimits { memory_bytes: 1024, cpu_quota_percent: 100, tasks: 16,

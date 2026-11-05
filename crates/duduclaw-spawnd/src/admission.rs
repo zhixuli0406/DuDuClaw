@@ -202,7 +202,7 @@ impl<H: Host> Coordinator<H> {
         });
         let pending: u64 = self.entries.values().map(|entry| entry.input_bytes).sum();
         if input_bytes > self.limits.pending_input_bytes.saturating_sub(pending) { return Err(ErrorCode::ResourceLimit); }
-        let descriptors = 1 + input_fds.as_slice().len();
+        let descriptors = request.fd_plan().map_err(|_| ErrorCode::InvalidRequest)?.len();
         let held: usize = self.entries.values().map(|entry| entry.input_descriptors).sum();
         if descriptors > self.limits.input_descriptors.saturating_sub(held) { return Err(ErrorCode::ResourceLimit); }
         let deadline = now.checked_add(policy.queue_ms).ok_or(ErrorCode::InvalidRequest)?;
