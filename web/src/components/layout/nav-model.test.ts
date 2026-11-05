@@ -578,3 +578,25 @@ describe('task navigation hidden for all roles and editions', () => {
     expect(navGroups.flatMap(group => group.items).some(item => item.to === '/foresight')).toBe(true);
   });
 });
+
+
+describe('advanced and company settings navigation', () => {
+  it('shows one Admin-only versioned entry per page in both editions', () => {
+    for (const personal of [false, true]) {
+      const items = navGroupsForEdition(personal).flatMap((group) => group.items);
+      for (const page of ['advanced', 'company']) {
+        const entries = items.filter((item) => item.to === `/app/system/settings/${page}`);
+        expect(entries).toHaveLength(1);
+        expect(entries[0].newIn).toBe('1.80.0');
+        expect(isVisible(entries[0], 'admin', personal)).toBe(true);
+        expect(isVisible(entries[0], 'manager', personal)).toBe(false);
+        expect(isVisible(entries[0], 'employee', personal)).toBe(false);
+      }
+    }
+  });
+
+  it('uses the new page label rather than the parent settings breadcrumb', () => {
+    expect(crumbsFor('/app/system/settings/advanced').at(-1)?.labelId).toBe('advancedSettings.title');
+    expect(crumbsFor('/app/system/settings/company').at(-1)?.labelId).toBe('companyInfo.title');
+  });
+});

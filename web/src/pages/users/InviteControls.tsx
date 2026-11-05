@@ -2,15 +2,18 @@ import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Badge, Button, Dialog, DialogContent, DialogHeader, DialogTitle, Input } from '@/components/mds';
 import type { UserInviteState } from '@/lib/api';
-import { useEffectiveName } from '@/lib/product-identity';
+import { CompanyLogo, useCompanyName } from '@/components/brand/CompanyLogo';
+import { useCompanyStore } from '@/stores/company-store';
 import { toast } from '@/lib/toast';
 
 /** Shown before the operator creates or reissues the invitation. */
 export function InviteEmailPreview({ email }: { email: string }) {
   const intl = useIntl();
-  const product = useEffectiveName();
+  const product = useCompanyName();
+  const logo = useCompanyStore((state) => state.company.logo_url);
   return <div className="space-y-2 rounded-lg border border-border bg-muted/40 p-3 text-sm">
     <p className="font-medium">{intl.formatMessage({ id: 'users.invite.preview' })}</p>
+    {logo && <CompanyLogo size={48} />}
     <p>{intl.formatMessage({ id: 'users.invite.recipient' }, { email })}</p>
     <p className="whitespace-pre-line">{intl.formatMessage({ id: 'users.invite.emailPreview' }, { product })}</p>
   </div>;

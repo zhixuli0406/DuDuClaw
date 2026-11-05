@@ -96,7 +96,7 @@ export function GroupContextSettings({ platform, active }: { platform: string; a
         <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'channels.groupContext.disclosure' }, { hours, count })}</p>
         {redactionOn !== true && <div role="status" className="rounded-lg border p-3 text-sm">
           <p>{t(redactionOn === false ? 'channels.groupContext.redactionOff' : 'channels.groupContext.redactionUnknown')}</p>
-          <Link className="text-brand underline underline-offset-2" to="/app/system/settings?tab=redaction">{t('channels.groupContext.redactionSettings')}</Link>
+          <Link className="text-brand underline underline-offset-2" to="/app/system/settings/advanced#redaction">{t('channels.groupContext.redactionSettings')}</Link>
         </div>}
         <Button variant="brand" size="sm" onClick={() => void save(false)} disabled={busy || !group.trim() || (platform === 'discord' && !scope.trim()) || !Number.isInteger(hours) || hours < 1 || hours > 168 || !Number.isInteger(count) || count < 1 || count > 200}>{t('channels.groupContext.enable')}</Button>
       </>}

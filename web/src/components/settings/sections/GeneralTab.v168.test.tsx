@@ -22,13 +22,15 @@ beforeEach(() => {
 });
 
 describe('<GeneralTab> v1.68', () => {
-  it('reads log_level and strategy from their own sections, not look-alike keys', async () => {
+  it('keeps migrated log and rotation controls out of common settings and does not rewrite them', async () => {
     // `[redaction] level` and `[tick] strategy` used to win the unanchored regex.
     configMock.mockResolvedValue({
       config: '[redaction]\nlevel = "trace"\n\n[general]\nlog_level = "warn"\n\n[tick]\nstrategy = "aggressive"\n\n[rotation]\nstrategy = "round_robin"\n',
     });
     renderWithProviders(<GeneralTab />);
-    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Log Level' })).toHaveTextContent('Warnings'));
+    await waitFor(() => expect(configMock).toHaveBeenCalled());
+    expect(screen.queryByRole('combobox', { name: 'Log Level' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: 'Account Rotation Strategy' })).not.toBeInTheDocument();
     // Saving without edits sends nothing — proving the loaded values match.
     fireEvent.click(await screen.findByRole('button', { name: 'Save' }));
     await new Promise((r) => setTimeout(r, 20));

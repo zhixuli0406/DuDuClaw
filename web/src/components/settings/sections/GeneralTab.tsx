@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState, useRef } from 'react';
 import { useIntl } from 'react-intl';
+import { Link } from 'react-router';
+import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useTourStore } from '@/stores/tour-store';
 import { api } from '@/lib/api';
@@ -12,7 +14,7 @@ import {
   SettingsRow,
   SettingsSaveState,
 } from '@/components/mds';
-import { AdvancedSection, type SelectOption } from '@/components/settings/controls';
+import { type SelectOption } from '@/components/settings/controls';
 import { RowSelect, RowSwitch } from '@/pages/agent-form/form-rows';
 import { SettingRow } from './shared';
 import { changedPayload, parseTomlSubset, tomlStr, type FlatValues } from '@/lib/config-toml';
@@ -22,8 +24,7 @@ export function GeneralTab() {
   const intl = useIntl();
   const { status } = useSystemStore();
   const startTour = useTourStore((s) => s.start);
-  const [logLevel, setLogLevel] = useState('info');
-  const [rotationStrategy, setRotationStrategy] = useState('priority');
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [defaultLanguage, setDefaultLanguage] = useState('');
   // Login/boot autostart — applied immediately via system.autostart.set (it is
   // an OS-level registration, not a config.toml field, so it bypasses Save).
@@ -51,13 +52,9 @@ export function GeneralTab() {
         // v1.68: read each key from its own section (the old unanchored
         // regexes could pick up `level` / `strategy` from another table).
         const tables = parseTomlSubset(raw);
-        const level = tomlStr(tables, 'general', 'log_level', 'info');
-        const strategy = tomlStr(tables, 'rotation', 'strategy', 'priority');
         const language = tomlStr(tables, 'general', 'default_language', '');
-        setLogLevel(level);
-        setRotationStrategy(strategy);
         setDefaultLanguage(language);
-        initialRef.current = { log_level: level, rotation_strategy: strategy, default_language: language };
+        initialRef.current = { default_language: language };
       }
     }).catch((e) => {
       console.warn("[api]", e);
@@ -94,8 +91,6 @@ export function GeneralTab() {
 
   const handleSave = async () => {
     const current: FlatValues = {
-      log_level: logLevel,
-      rotation_strategy: rotationStrategy,
       default_language: defaultLanguage,
     };
     const payload = changedPayload(initialRef.current, current);
@@ -122,16 +117,6 @@ export function GeneralTab() {
     }
   };
 
-  const logLevelOptions: SelectOption[] = ['trace', 'debug', 'info', 'warn', 'error'].map((l) => ({
-    value: l,
-    label: intl.formatMessage({ id: `settings.logLevel.${l}` }),
-    raw: l,
-  }));
-  const rotationOptions: SelectOption[] = ['priority', 'round_robin', 'least_cost', 'failover'].map((s) => ({
-    value: s,
-    label: intl.formatMessage({ id: `settings.rotation.${s}` }),
-    raw: s,
-  }));
   // Empty string = "follow the user's input language" (pre-existing
   // behaviour, unchanged). Non-empty pins a global default reply language.
   const languageOptions: SelectOption[] = ['', 'zh-TW', 'en', 'ja-JP'].map((code) => ({
@@ -169,14 +154,6 @@ export function GeneralTab() {
 
       <SettingsSection>
         <SettingsCard>
-          {/* Editable: Log Level */}
-          <RowSelect
-            label={intl.formatMessage({ id: 'settings.general.logLevel' })}
-            description={`${intl.formatMessage({ id: 'settings.general.logLevel.help' })} ${intl.formatMessage({ id: 'settings.general.logLevel.liveNote' })}`}
-            value={logLevel}
-            onChange={setLogLevel}
-            options={logLevelOptions}
-          />
           {/* Editable: default reply language */}
           <RowSelect
             label={intl.formatMessage({ id: 'settings.general.defaultLanguage' })}
@@ -203,18 +180,16 @@ export function GeneralTab() {
         </SettingsCard>
       </SettingsSection>
 
-      {/* Advanced: account rotation strategy — everyday users don't touch it */}
-      <AdvancedSection storageKey="settings.general">
-        <SettingsCard>
-          <RowSelect
-            label={intl.formatMessage({ id: 'settings.general.rotationStrategy' })}
-            description={intl.formatMessage({ id: 'settings.general.rotationStrategy.help' })}
-            value={rotationStrategy}
-            onChange={setRotationStrategy}
-            options={rotationOptions}
-          />
-        </SettingsCard>
-      </AdvancedSection>
+      {isAdmin && (
+        <div className="flex flex-wrap gap-4 text-sm">
+          <Link className="text-primary underline underline-offset-4" to="/app/system/settings/advanced#rotation">
+            {intl.formatMessage({ id: 'settings.general.rotationStrategy' })}
+          </Link>
+          <Link className="text-primary underline underline-offset-4" to="/app/system/settings/advanced#logging">
+            {intl.formatMessage({ id: 'settings.general.logLevel' })}
+          </Link>
+        </div>
+      )}
 
       {/* Save — a failed write stays on screen next to the button that caused
           it, so the user knows the form still holds unsaved edits. */}

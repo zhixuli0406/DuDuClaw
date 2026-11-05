@@ -411,3 +411,17 @@ describe('admin enterprise setup route', () => {
     expect(screen.getByTestId('loc').textContent).toBe('/');
   });
 });
+
+
+describe('advanced and company settings routes', () => {
+  for (const edition of ['personal', 'enterprise'] as const) {
+    for (const role of ['manager', 'employee'] as const) {
+      it.each(['advanced', 'company'])(`${edition} ${role} cannot open settings/%s`, async (page) => {
+        setEdition(edition);
+        setRole(role);
+        renderAppAt(`/app/system/settings/${page}`);
+        await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent(/^\/$/));
+      });
+    }
+  }
+});

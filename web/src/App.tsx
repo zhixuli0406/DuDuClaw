@@ -336,6 +336,8 @@ export function App() {
                   <Route path="decision-lab" element={<DecisionLabPage />} />
                   <Route path="ccr" element={<CcrDashboardPage />} />
                   <Route path="settings" element={<SettingsPage />} />
+                  <Route path="settings/advanced" element={<SettingsPage />} />
+                  <Route path="settings/company" element={<SettingsPage />} />
                 </Route>
                 <Route element={<RoleGuard minRole="manager" />}>
                   <Route path="license" element={<LicenseShell />} />

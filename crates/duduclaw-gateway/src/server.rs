@@ -1,3 +1,5 @@
+#[path = "server_company.rs"]
+mod server_company;
 mod data_exports_http;
 #[path = "server_invites.rs"]
 mod server_invites;
@@ -2673,6 +2675,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/me", get(handle_me))
         .route("/api/change-password", post(handle_change_password))
         .route("/api/brand", get(handle_public_brand))
+        .route("/api/company", get(server_company::company))
+        .route("/api/company/logo", server_company::upload_route())
+        .route("/api/company/logo/{filename}", get(server_company::logo))
         .route("/api/first-run/status", get(handle_first_run_status))
         .route("/api/first-run/claim", post(handle_first_run_claim))
         // D4a: OOBE pre-auth network setup — see `first_run_network_gate`'s

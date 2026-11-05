@@ -1,3 +1,4 @@
+import { loadPublicCompany } from '@/stores/company-store';
 import { loadPublicBrand, refreshBrandRevision, useBrandStore } from '@/stores/brand-store';
 import { create } from 'zustand';
 import { api, type DoctorCheck, type SystemStatus } from '@/lib/api';
@@ -25,6 +26,7 @@ export const useSystemStore = create<SystemStore>((set) => {
     set({ status: data });
     useBrandStore.getState().setBrand(null);
     void loadPublicBrand();
+    void loadPublicCompany();
   });
 
   return {
@@ -66,11 +68,13 @@ useConnectionStore.subscribe((state, previous) => {
   void useSystemStore.getState().fetchStatus();
   useBrandStore.getState().setBrand(null);
   void refreshBrandRevision();
+  void loadPublicCompany();
 });
 
 // Returning to a long-lived tab must also notice gateway polling updates.
 if (typeof window !== 'undefined') {
   window.addEventListener('focus', () => {
+    void loadPublicCompany();
     if (useConnectionStore.getState().state === 'authenticated') void refreshBrandRevision();
   });
 }

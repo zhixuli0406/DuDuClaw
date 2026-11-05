@@ -15,6 +15,11 @@ const filled: SetupData = {
 };
 
 describe('setup checklist table', () => {
+  it('reads the customer name from the company settings source', async () => {
+    vi.mocked(client.call).mockImplementation(async method => method === 'company.get' ? { name: 'Customer' } : {});
+    expect((await loadSetupData()).company).toBe('Customer');
+    expect(setupItems.find(item => item.id === 'company')?.to).toBe('/app/system/settings/company');
+  });
   it.each(setupItems)('$id checks empty and populated data', item => {
     expect(item.check(empty)).toBe(item.id === 'permissions');
     expect(item.check(filled)).toBe(true);

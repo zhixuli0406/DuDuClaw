@@ -1,113 +1,62 @@
 import { useEffect } from 'react';
 import { useIntl } from 'react-intl';
-import { useNavigate, useSearchParams } from 'react-router';
-import {
-  Settings,
-  Container,
-  HeartPulse,
-  Stethoscope,
-  Mic,
-  Zap,
-  Workflow,
-  Globe,
-  Server,
-  Sparkles,
-  EyeOff,
-  KeyRound,
-  Bot,
-  Share2,
-  Gauge,
-  FileCode,
-  BookSearch,
-} from 'lucide-react';
-import {
-  SettingsShell,
-  SettingsTab,
-  type SettingsNavGroup,
-} from '@/components/mds';
+import { useLocation, useNavigate, useSearchParams } from 'react-router';
+import { Settings, Mic, Zap, KeyRound, SlidersHorizontal, Building2 } from 'lucide-react';
+import { SettingsShell, SettingsTab, type SettingsNavGroup } from '@/components/mds';
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { isNewFeature } from '@/apps/registry';
-
-/** v1.68 (W2): 設定檔進階編輯 tab — new-feature chip. */
-const CONFIG_RAW_NEW_IN = '1.68.0';
-const KNOWLEDGE_SEARCH_NEW_IN = '1.76.0';
 import { GeneralTab } from '@/components/settings/sections/GeneralTab';
 import { AccountTab } from '@/components/settings/sections/AccountTab';
-import { SystemTab } from '@/components/settings/sections/SystemTab';
-import { ContainerTab } from '@/components/settings/sections/ContainerTab';
-import { HeartbeatTab } from '@/components/settings/sections/HeartbeatTab';
 import { VoiceTab } from '@/components/settings/sections/VoiceTab';
 import { ProactiveTab } from '@/components/settings/sections/ProactiveTab';
-import { AutopilotTab } from '@/components/settings/sections/AutopilotTab';
-import { SkillSynthesisTab } from '@/components/settings/sections/SkillSynthesisTab';
-import { RedactionTab } from '@/components/settings/sections/RedactionTab';
-import { EmbeddingSettingsCard } from '@/components/knowledge/EmbeddingSettingsCard';
-import { DoctorTab } from '@/components/settings/sections/DoctorTab';
-import { BrowserTab } from '@/components/settings/sections/BrowserTab';
-import { AutomationTab } from '@/components/settings/sections/AutomationTab';
-import { DelegationTab } from '@/components/settings/sections/DelegationTab';
-import { CalibrationTab } from '@/components/settings/sections/CalibrationTab';
-import { ConfigRawTab } from '@/components/settings/sections/ConfigRawTab';
+import { AdvancedSettings } from '@/components/settings/AdvancedSettings';
+import { CompanySettings } from '@/components/settings/CompanySettings';
+import { ADVANCED_SETTINGS_PATH, LEGACY_ADVANCED_TABS } from '@/components/settings/advanced-settings-catalog';
 import { RestartRequiredBanner } from '@/components/settings/RestartRequiredBanner';
 
-/** Settings sub-tab whitelist (spec §5.3 式3). `?tab=` is validated against this
- *  set; unknown values fall back to `general`. */
-const VALID_TABS = [
-  'general', 'account', 'system', 'container', 'heartbeat', 'voice',
-  'proactive', 'automation', 'delegation', 'calibration', 'autopilot', 'skillSynthesis', 'redaction', 'doctor', 'browser',
-  // 1.76: knowledge-base meaning-based search (embedding models), admin-only.
-  'knowledgeSearch',
-  // v1.68 (W2): raw config.toml / inference.toml / agent.toml editor, admin-only.
-  'configRaw',
-] as const;
+const SETTINGS_PATH = '/app/system/settings';
+const COMPANY_PATH = `${SETTINGS_PATH}/company`;
+const VALID_TABS = ['general', 'account', 'voice', 'proactive', 'advanced', 'company'] as const;
 type TabId = (typeof VALID_TABS)[number];
 
-/**
- * SettingsPage (WP4.2) — the system settings surface rebuilt as a Multica
- * Settings-式 shell (spec §5.3 式3): a grouped left rail (常用 / 進階, vertical
- * ≥md, horizontal-scroll on mobile) driving a `max-w-3xl` scrolling content pane
- * of 13 section panels. Replaces the former Calm Glass Page/PageHeader/Tabs +
- * ChevronDown "advanced" disclosure; the `?tab=` whitelist and the legacy
- * cron deep-link redirects are preserved.
- */
+/** Common settings stay short; uncommon settings share one searchable Admin page. */
 export function SettingsPage() {
   const intl = useIntl();
   const navigate = useNavigate();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const { pathname } = useLocation();
+  const [searchParams] = useSearchParams();
   const tabParam = searchParams.get('tab');
-
-  // Legacy deep-link redirects (bookmarks / older links) instead of a blank tab:
-  //  - the cron/排程任務 settings tab was unified into the /routines page.
-  //  - 系統更新 became its own management entry (2026-08-04, D18), then
-  //    relocated again to `/app/system/updates` (N-3, 2026-08).
-  useEffect(() => {
-    if (tabParam === 'cron') {
-      navigate('/routines', { replace: true });
-    } else if (tabParam === 'update') {
-      navigate('/app/system/updates', { replace: true });
-    }
-  }, [tabParam, navigate]);
-
-  // 委派權限 is owner/admin-only (WP21 §2.8): the rail entry, the panel and the
-  // `?tab=delegation` deep link all disappear for anyone else. The gateway
-  // gates `delegation.get/set` too — this is the courtesy layer.
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const version = useSystemStore((s) => s.status?.version ?? null);
+  const requested = pathname === ADVANCED_SETTINGS_PATH ? 'advanced' : pathname === COMPANY_PATH ? 'company' : tabParam;
+  const tabAllowed = (tab: string | null): tab is TabId =>
+    (VALID_TABS as readonly (string | null)[]).includes(tab) && (isAdmin || (tab !== 'advanced' && tab !== 'company'));
+  const activeTab: TabId = tabAllowed(requested) ? requested : 'general';
 
-  const ADMIN_ONLY_TABS = ['delegation', 'calibration', 'configRaw', 'knowledgeSearch'];
-  const tabAllowed = (tab: string) =>
-    (VALID_TABS as readonly string[]).includes(tab) && (!ADMIN_ONLY_TABS.includes(tab) || isAdmin);
-  const activeTab: TabId = tabAllowed(tabParam ?? '') ? (tabParam as TabId) : 'general';
+  useEffect(() => {
+    if (tabParam === 'cron') navigate('/routines', { replace: true });
+    else if (tabParam === 'update') navigate('/app/system/updates', { replace: true });
+    else if (isAdmin && (LEGACY_ADVANCED_TABS as readonly (string | null)[]).includes(tabParam)) {
+      navigate(`${ADVANCED_SETTINGS_PATH}#${tabParam}`, { replace: true });
+    } else if (isAdmin && tabParam === 'advanced' && pathname !== ADVANCED_SETTINGS_PATH) {
+      navigate(ADVANCED_SETTINGS_PATH, { replace: true });
+    } else if (isAdmin && tabParam === 'company' && pathname !== COMPANY_PATH) {
+      navigate(COMPANY_PATH, { replace: true });
+    }
+  }, [tabParam, pathname, isAdmin, navigate]);
+
   const setTab = (next: string) => {
-    const nextParams = new URLSearchParams(searchParams);
-    nextParams.set('tab', next);
-    setSearchParams(nextParams, { replace: true });
+    if (!tabAllowed(next)) return;
+    navigate(next === 'advanced' ? ADVANCED_SETTINGS_PATH : next === 'company' ? COMPANY_PATH : `${SETTINGS_PATH}?tab=${next}`);
   };
-
   const t = (id: string) => intl.formatMessage({ id });
-
-  // Rail groups mirror the former everyday / advanced split.
+  const newLabel = (id: string) => isNewFeature('1.80.0', version) ? (
+    <span className="flex items-center gap-1.5">
+      {t(id)}
+      <span className="rounded border border-surface-border px-1.5 py-0.5 text-xs text-muted-foreground">{t('nav.badge.new')}</span>
+    </span>
+  ) : t(id);
   const navGroups: SettingsNavGroup[] = [
     {
       label: t('settings.everyday'),
@@ -116,136 +65,25 @@ export function SettingsPage() {
         { value: 'account', label: t('settings.account'), icon: KeyRound },
         { value: 'voice', label: t('settings.voice'), icon: Mic },
         { value: 'proactive', label: t('settings.proactive'), icon: Zap },
-        // 系統更新 moved to its own management entry (2026-08-04, D18) —
-        // `?tab=update` redirects there, see the effect above.
+        ...(isAdmin ? [{ value: 'company', label: newLabel('companyInfo.title'), icon: Building2 }] : []),
       ],
     },
-    {
+    ...(isAdmin ? [{
       label: t('settings.advanced'),
-      items: [
-        { value: 'system', label: t('settings.system'), icon: Server },
-        { value: 'container', label: t('settings.container'), icon: Container },
-        { value: 'heartbeat', label: t('settings.heartbeat'), icon: HeartPulse },
-        { value: 'automation', label: t('settings.automation.tab'), icon: Bot },
-        ...(isAdmin
-          ? [
-              { value: 'delegation', label: t('settings.delegation'), icon: Share2 },
-              { value: 'calibration', label: t('settings.calibration'), icon: Gauge },
-            ]
-          : []),
-        { value: 'autopilot', label: t('settings.autopilot'), icon: Workflow },
-        { value: 'skillSynthesis', label: t('settings.skillSynthesis'), icon: Sparkles },
-        { value: 'redaction', label: t('settings.redaction'), icon: EyeOff },
-        ...(isAdmin
-          ? [{
-              value: 'knowledgeSearch',
-              label: isNewFeature(KNOWLEDGE_SEARCH_NEW_IN, version) ? (
-                <span className="flex items-center gap-1.5">
-                  {t('settings.knowledgeSearch')}
-                  <span className="rounded border border-surface-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                    {t('nav.badge.new')}
-                  </span>
-                </span>
-              ) : t('settings.knowledgeSearch'),
-              icon: BookSearch,
-            }]
-          : []),
-        { value: 'doctor', label: t('settings.doctor'), icon: Stethoscope },
-        { value: 'browser', label: t('settings.browser'), icon: Globe },
-        ...(isAdmin
-          ? [{
-              value: 'configRaw',
-              // New-feature chip, same convention as the nav (`newIn` +
-              // `isNewFeature`): shown through the 1.68 release line only.
-              label: isNewFeature(CONFIG_RAW_NEW_IN, version) ? (
-                <span className="flex items-center gap-1.5">
-                  {t('settings.configRaw')}
-                  <span className="rounded border border-surface-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                    {t('nav.badge.new')}
-                  </span>
-                </span>
-              ) : t('settings.configRaw'),
-              icon: FileCode,
-            }]
-          : []),
-      ],
-    },
+      items: [{ value: 'advanced', label: newLabel('advancedSettings.title'), icon: SlidersHorizontal }],
+    }] : []),
   ];
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      {/* v1.68 (W2): settings saved here that only apply after a restart. */}
-      <div className="px-4 pt-3 empty:hidden">
-        <RestartRequiredBanner />
-      </div>
+      <div className="px-4 pt-3 empty:hidden"><RestartRequiredBanner /></div>
       <SettingsShell value={activeTab} onValueChange={setTab} groups={navGroups}>
-        <SettingsTab value="general" title={t('settings.general')}>
-          <GeneralTab />
-        </SettingsTab>
-        <SettingsTab value="account" title={t('settings.account.title')}>
-          <AccountTab />
-        </SettingsTab>
-        <SettingsTab value="system" title={t('settings.system')} description={t('settings.system.desc')}>
-          <SystemTab />
-        </SettingsTab>
-        <SettingsTab value="container" title={t('settings.container')} description={t('settings.container.desc')}>
-          <ContainerTab />
-        </SettingsTab>
-        <SettingsTab value="heartbeat" title={t('settings.heartbeat')} description={t('settings.heartbeat.desc')}>
-          <HeartbeatTab />
-        </SettingsTab>
-        <SettingsTab value="voice" title={t('voice.title')}>
-          <VoiceTab />
-        </SettingsTab>
-        <SettingsTab value="proactive" title={t('proactive.title')}>
-          <ProactiveTab />
-        </SettingsTab>
-        <SettingsTab value="automation" title={t('settings.automation.tab')} description={t('settings.automation.tab.desc')}>
-          <AutomationTab />
-        </SettingsTab>
-        {isAdmin && (
-          <SettingsTab
-            value="delegation"
-            title={t('settings.delegation')}
-            description={t('settings.delegation.desc')}
-          >
-            <DelegationTab />
-          </SettingsTab>
-        )}
-        {isAdmin && (
-          <SettingsTab
-            value="calibration"
-            title={t('settings.calibration')}
-            description={t('settings.calibration.desc')}
-          >
-            <CalibrationTab />
-          </SettingsTab>
-        )}
-        <SettingsTab value="autopilot" title={t('settings.autopilot')} description={t('settings.autopilot.desc')}>
-          <AutopilotTab />
-        </SettingsTab>
-        <SettingsTab value="skillSynthesis" title={t('settings.skillSynthesis')} description={t('skillSynthesis.desc')}>
-          <SkillSynthesisTab />
-        </SettingsTab>
-        <SettingsTab value="redaction" title={t('settings.redaction')}>
-          <RedactionTab />
-        </SettingsTab>
-        {isAdmin && (
-          <SettingsTab value="knowledgeSearch" title={t('settings.knowledgeSearch')} description={t('settings.knowledgeSearch.desc')}>
-            <EmbeddingSettingsCard />
-          </SettingsTab>
-        )}
-        <SettingsTab value="doctor" title={t('settings.doctor')} description={t('settings.doctor.desc')}>
-          <DoctorTab />
-        </SettingsTab>
-        <SettingsTab value="browser" title={t('settings.browser')} description={t('settings.browser.desc')}>
-          <BrowserTab />
-        </SettingsTab>
-        {isAdmin && (
-          <SettingsTab value="configRaw" title={t('settings.configRaw')} description={t('settings.configRaw.desc')}>
-            <ConfigRawTab />
-          </SettingsTab>
-        )}
+        <SettingsTab value="general" title={t('settings.general')}><GeneralTab /></SettingsTab>
+        <SettingsTab value="account" title={t('settings.account.title')}><AccountTab /></SettingsTab>
+        <SettingsTab value="voice" title={t('voice.title')}><VoiceTab /></SettingsTab>
+        <SettingsTab value="proactive" title={t('proactive.title')}><ProactiveTab /></SettingsTab>
+        {isAdmin && <SettingsTab value="company" title={t('companyInfo.title')} description={t('companyInfo.description')}><CompanySettings /></SettingsTab>}
+        {isAdmin && <SettingsTab value="advanced" title={t('advancedSettings.title')} description={t('advancedSettings.description')}><AdvancedSettings /></SettingsTab>}
       </SettingsShell>
     </div>
   );
