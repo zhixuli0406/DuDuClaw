@@ -49,7 +49,7 @@ impl RuntimeBridgeRegistry for InstalledRuntimeRegistry {
         -> Result<ProjectionReceipt, VerificationError> {
         let publication = self.publication()?;
         let policy = publication.policy().map_err(|_| VerificationError::Unavailable)?;
-        let (runtime, _) = policy.derive(employee, &projection.registration.runtime, false)
+        let (runtime, _) = policy.derive(employee, &projection.registration.runtime, projection.registration.runtime == RuntimeKind::Grok)
             .map_err(|_| VerificationError::BindingMismatch)?;
         let record = publication.runtimes.iter().find(|record| record.profile == runtime.profile)
             .ok_or(VerificationError::Unavailable)?;

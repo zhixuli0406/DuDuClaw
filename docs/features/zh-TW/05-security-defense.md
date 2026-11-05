@@ -2,7 +2,7 @@
 
 ## 尚未發行的原生 Linux 隔離整合
 
-Codex、Grok、通用 CLI 與 OpenAI 相容執行環境的隔離接線尚未完成，因此受保護 TEAM 會明確停止工作，請管理員確認支援狀態，不會改用 gateway 身分重試。Claude 缺少單次執行授權，或要求尚未支援的執行選項時，也會拒絕執行。Claude 正式全鏈與 PTY 支援仍未完成，受保護 TEAM 目前仍無法執行員工工作。
+I1d 開發接線已加入隔離 API 工作者的 Chat Completions、Responses、Anthropic、Gemini 轉接，以及 Codex／Grok 的私有 home／專案設定投影與原生轉接器；通用 CLI 仍使用版本化註冊轉接協定。各路徑都要求新鮮的 root 簽署發布、單次主機授權及相符的 MCP 驗收紀錄。原生轉接器只使用該員工的登入資料，API 工作者只讀取員工自己的供應商憑證，不會複製 gateway 金鑰。Grok 使用 I1e 的受保護 PTY 介面，須先合併該套件。簽署打包及 bootstrap 路徑可攜帶工作者、轉接器、廠商 ELF 與唯讀政策檔，廠商執行檔的精確雜湊也會綁入驗收。缺少驗收、有外部 Codex 設定或使用尚未支援的模式時仍會停止。原生登入更新與啟動狀態寫入、通用 CLI 廠商轉接器、gateway 編譯、正式簽署安裝及實際 runtime／provider 驗收仍未完成或未驗證，受保護 TEAM 就緒狀態不變。參見 [I1d 交接](../../architecture/native-linux-isolation.md#package-i1d--other-runtimes-2026-11-05)。
 
 受保護啟動流程已可讀取綁定更新世代的 root runtime 發布資料；工具連線取得檔案描述符後，還須核對該次執行的唯讀 MCP 設定收據。解析工作者會保留全主機資源名額，直到確認程序與 cgroup 已退場；清理結果不明時維持占用。缺少安裝測量或 runtime 驗收仍拒絕工作。使用者／政策權威、runtime 執行上下文、PTY 全鏈與完整員工回合驗收仍未完成。
 

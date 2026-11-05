@@ -17,7 +17,7 @@ pub fn artifact_name(target: &InstallTarget) -> Result<String> {
         InstallTarget::Migration => "duduclaw-migrate".into(),
         InstallTarget::UpdateSlot => "duduclaw-updated".into(),
         InstallTarget::RuntimeEntry { registry_id } => {
-            if registry_id.is_empty() || registry_id.len() > 128 || !registry_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')) { return Err(Error::Invalid); }
+            if registry_id.is_empty() || matches!(registry_id.as_str(), "." | "..") || registry_id.len() > 128 || !registry_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')) { return Err(Error::Invalid); }
             format!("runtime-{registry_id}")
         },
     })
@@ -34,7 +34,15 @@ pub fn validate_bootstrap_manifest(manifest: &ReleaseManifest, arch: Architectur
     let required = [InstallTarget::Gateway, InstallTarget::Spawnd, InstallTarget::Trampoline,
         InstallTarget::Egress, InstallTarget::EgressForwarder, InstallTarget::McpBridge,
         InstallTarget::ParseWorker, InstallTarget::Importer, InstallTarget::Migration, InstallTarget::UpdateSlot];
-    if manifest.artifacts.len() != required.len() { return Err(Error::Incompatible); }
+    if manifest.artifacts.len() < required.len() || manifest.artifacts.len() > 128 { return Err(Error::Incompatible); }
+    for artifact in &manifest.artifacts {
+        if let InstallTarget::RuntimeEntry { registry_id } = &artifact.install_target {
+            artifact_name(&artifact.install_target)?;
+            let mode = if registry_id == "isolation-policy-v1" { 0o444 } else { 0o755 };
+            if artifact.mode != mode || artifact.size_bytes == 0 || artifact.size_bytes >= 200 * 1024 * 1024
+                || registry_id == "isolation-policy-v1" && artifact.size_bytes > 1024 * 1024 { return Err(Error::Incompatible); }
+        }
+    }
     for target in required {
         if !manifest.artifacts.iter().any(|artifact| artifact.install_target == target
             && artifact.mode == 0o755 && artifact.size_bytes > 0 && artifact.size_bytes < 200 * 1024 * 1024) {
@@ -94,6 +102,19 @@ pub(crate) mod tests {
             assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
         }
         let mut bad = good; bad.protocols.importer = 2;
+        assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
+    }
+    #[test]
+    fn bootstrap_accepts_signed_runtime_policy_and_elf_entries_with_exact_modes() {
+        let mut manifest = manifest();
+        for (id, mode) in [("isolation-policy-v1", 0o444), ("api-worker-v1", 0o755), ("native-adapter-v1", 0o755), ("vendor-codex", 0o755)] {
+            manifest.artifacts.push(ReleaseArtifact { id: id.into(), sha256: manifest_digest(b"fixture"),
+                size_bytes: 7, mode, install_target: InstallTarget::RuntimeEntry { registry_id: id.into() } });
+        }
+        validate_bootstrap_manifest(&manifest, Architecture::X86_64).unwrap();
+        let mut bad = manifest.clone(); bad.artifacts[10].mode = 0o755;
+        assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
+        let mut bad = manifest; bad.artifacts[11].mode = 0o444;
         assert!(validate_bootstrap_manifest(&bad, Architecture::X86_64).is_err());
     }
     #[test]

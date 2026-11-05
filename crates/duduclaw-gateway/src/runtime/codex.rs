@@ -1389,7 +1389,19 @@ impl AgentRuntime for CodexRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
+        #[cfg(not(target_os = "linux"))]
         super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::Codex)?;
+        #[cfg(target_os = "linux")]
+        if duduclaw_core::execution_gate::isolation_required() {
+            let payload = super::generic_cli::build_prompt(context, prompt, "codex");
+            let out = crate::isolation_mcp::runtime::execute_native(
+                duduclaw_isolation::execution::RuntimeKind::Codex, payload, context).await?;
+            let stdout = std::str::from_utf8(&out).map_err(|_| "invalid isolated Codex output")?;
+            let (content, input_tokens, output_tokens, _) = parse_codex_stdout(stdout);
+            if content.trim().is_empty() { return Err("isolated Codex returned no answer".into()); }
+            return Ok(RuntimeResponse { partial_timeout_secs: None, content, input_tokens, output_tokens,
+                cache_read_tokens: 0, model_used: context.model.clone(), runtime_name: "codex".into() });
+        }
         if crate::runtime_dispatch::in_utility_call() {
             let (mut cmd, _work_dir, _schema_file) = self.prepare_utility_command(prompt, context)?;
             return execute_codex_command(&mut cmd, context).await;
@@ -1674,6 +1686,12 @@ impl AgentRuntime for CodexRuntime {
     }
 
     async fn is_available(&self) -> bool {
+        if duduclaw_core::execution_gate::isolation_required() {
+            #[cfg(target_os = "linux")]
+            { return crate::isolation_mcp::runtime::available(duduclaw_isolation::execution::RuntimeKind::Codex).await; }
+            #[cfg(not(target_os = "linux"))]
+            return false;
+        }
         probe_codex_version_output(&self.codex_path).await.is_some()
     }
 }
@@ -1764,7 +1782,6 @@ impl CodexRuntime {
         prompt: &str,
         context: &super::RuntimeContext,
     ) -> Result<Vec<super::RuntimeChunk>, String> {
-        super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::Codex)?;
         let response = self.execute(prompt, context).await?;
         Ok(vec![super::RuntimeChunk::Done(response)])
     }

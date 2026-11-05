@@ -33,6 +33,48 @@ fn claude_selects_the_config_path_visible_inside_the_run() {
 }
 
 #[test]
+fn registered_cli_projection_requires_versioned_adapter_and_exact_fixed_protocol() {
+    let runtime = RuntimeKind::Registered(Text::new("generic-cli-v1.qwen".into()).unwrap());
+    let projection = runtime_projection(registration(runtime.clone())).unwrap();
+    assert_eq!(registered_cli_name(&runtime), Some("qwen"));
+    assert_eq!(projection.arguments, ["--duduclaw-protocol", "generic-cli-v1", "--runtime", "qwen",
+        "--mcp-config", "/config/mcp.json"]);
+    assert_eq!(projection.files.len(), 1);
+    assert_eq!(projection.files[0].destination, ConfigDestination::RunConfig);
+    assert_eq!(projection.files[0].relative_target, "mcp.json");
+    for name in ["qwen", "generic-cli-v2.qwen", "generic-cli-v1.", "generic-cli-v1../qwen",
+        "generic-cli-v1.Qwen", "generic-cli-v1.qwen\n", "xgeneric-cli-v1.qwen"] {
+        let runtime = RuntimeKind::Registered(Text::new(name.into()).unwrap());
+        assert!(registered_cli_name(&runtime).is_none(), "{name}");
+        assert!(runtime_projection(registration(runtime)).is_err(), "{name}");
+    }
+}
+
+#[test]
+fn api_worker_projection_binds_its_exact_protocol_and_native_acceptance() {
+    let projection = runtime_projection(registration(RuntimeKind::OpenAiCompat)).unwrap();
+    assert_eq!(projection.arguments, ["--duduclaw-protocol", "openai-compat-v1", "--mcp-config", "/config/mcp.json"]);
+    assert_eq!(projection.files.len(), 1);
+    let run = RunHandle(RunId([3; 16]));
+    let employee = EmployeeId([4; 16]);
+    assert!(prepare(&Registry { fault: 0 }, &RuntimeKind::OpenAiCompat, run, employee).is_ok());
+    for fault in 1..=13 {
+        assert!(prepare(&Registry { fault }, &RuntimeKind::OpenAiCompat, run, employee).is_err(), "fault {fault}");
+    }
+}
+
+#[test]
+fn registered_cli_preparation_retains_every_native_acceptance_gate() {
+    let kind = RuntimeKind::Registered(Text::new("generic-cli-v1.qwen".into()).unwrap());
+    let run = RunHandle(RunId([3; 16]));
+    let employee = EmployeeId([4; 16]);
+    assert!(prepare(&Registry { fault: 0 }, &kind, run, employee).is_ok());
+    for fault in 1..=13 {
+        assert!(prepare(&Registry { fault }, &kind, run, employee).is_err(), "fault {fault}");
+    }
+}
+
+#[test]
 fn every_native_projection_is_fresh_secret_free_and_bound_to_binary_bytes() {
     for runtime in [RuntimeKind::Claude, RuntimeKind::Codex, RuntimeKind::Grok, RuntimeKind::OpenAiCompat] {
         let projection = runtime_projection(registration(runtime)).unwrap();
@@ -105,4 +147,21 @@ fn runtime_preparation_refuses_every_missing_or_mismatched_readback() {
     }
     #[cfg(not(target_os = "linux"))]
     assert!(prepare_runtime_bridge(&Registry { fault: 0 }, &RuntimeKind::Claude, run, employee).is_err());
+}
+
+#[test]
+fn native_cli_projections_have_closed_names_and_exact_adapter_protocols() {
+    for (kind, protocol, names) in [
+        (RuntimeKind::Codex, "codex-v1", vec!["codex-home.toml"]),
+        (RuntimeKind::Grok, "grok-v1", vec!["grok-home.toml", "grok-project.toml", "project-mcp.json"]),
+    ] {
+        let projection = runtime_projection(registration(kind)).unwrap();
+        assert_eq!(projection.arguments, ["--duduclaw-protocol",protocol]);
+        assert_eq!(projection.files.iter().map(|f| projection_name(f).unwrap()).collect::<Vec<_>>(), names);
+        let mut bad = projection.files[0].clone();
+        bad.relative_target = "../config.toml";
+        assert!(projection_name(&bad).is_err());
+        bad.relative_target = "mcp.json";
+        assert!(projection_name(&bad).is_err());
+    }
 }

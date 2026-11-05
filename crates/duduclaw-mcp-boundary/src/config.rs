@@ -6,6 +6,48 @@ use crate::VerificationError;
 
 pub const MCP_FD: i32 = 3;
 
+pub fn api_worker_arguments() -> Vec<String> {
+    ["--duduclaw-protocol", "openai-compat-v1", "--mcp-config", "/config/mcp.json"]
+        .into_iter().map(str::to_owned).collect()
+}
+
+/// Registered generic adapters use a versioned stdin JSON protocol. The root
+/// publication must pin an adapter implementing this protocol, not a vendor
+/// binary accepting arbitrary print-mode arguments. Unknown registrations deny.
+pub fn registered_cli_name(runtime: &RuntimeKind) -> Option<&str> {
+    let RuntimeKind::Registered(name) = runtime else { return None; };
+    let id = name.as_str().strip_prefix("generic-cli-v1.")?;
+    if id.is_empty() || id.len() > 40 || !id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+        return None;
+    }
+    Some(id)
+}
+
+pub fn registered_cli_arguments(runtime: &RuntimeKind) -> Result<Vec<String>, VerificationError> {
+    let id = registered_cli_name(runtime).ok_or(VerificationError::Unavailable)?;
+    Ok(vec!["--duduclaw-protocol".into(), "generic-cli-v1".into(), "--runtime".into(), id.into(),
+        "--mcp-config".into(), "/config/mcp.json".into()])
+}
+
+/// Exact ELF adapter protocol; vendor argv is constructed only inside the run.
+pub fn native_cli_arguments(runtime: &RuntimeKind) -> Result<Vec<String>, VerificationError> {
+    let protocol = match runtime { RuntimeKind::Codex => "codex-v1", RuntimeKind::Grok => "grok-v1",
+        _ => return Err(VerificationError::Invalid) };
+    Ok(vec!["--duduclaw-protocol".into(), protocol.into()])
+}
+
+/// Closed publication names prevent a projection destination becoming a path.
+pub fn projection_name(file: &ProjectionFile) -> Result<&'static str, VerificationError> {
+    match (&file.destination, file.relative_target) {
+        (ConfigDestination::RunConfig, "mcp.json") => Ok("mcp.json"),
+        (ConfigDestination::RuntimeHome, ".codex/config.toml") => Ok("codex-home.toml"),
+        (ConfigDestination::RuntimeHome, ".grok/config.toml") => Ok("grok-home.toml"),
+        (ConfigDestination::WorkingDirectory, ".grok/config.toml") => Ok("grok-project.toml"),
+        (ConfigDestination::WorkingDirectory, ".mcp.json") => Ok("project-mcp.json"),
+        _ => Err(VerificationError::Invalid),
+    }
+}
+
 /// The root registry verifies this executable against the release manifest.
 /// This helper checks syntax only; `prepare_runtime_bridge` also requires a
 /// matching publication and runtime inheritance receipt from the registry.
@@ -167,21 +209,29 @@ pub fn runtime_projection(registration: RuntimeRegistration) -> Result<RuntimePr
         RuntimeKind::Codex => (vec![ProjectionFile {
             destination: ConfigDestination::RuntimeHome, relative_target: ".codex/config.toml",
             contents: format!("[mcp_servers.duduclaw]\ncommand = {command}\nargs = []\nenv_vars = []\ndefault_tools_approval_mode = \"auto\"\n"),
-        }], vec!["--dangerously-bypass-approvals-and-sandbox".into()]),
+        }], native_cli_arguments(&RuntimeKind::Codex)?),
         RuntimeKind::Grok => {
             let contents = format!("[mcp_servers.duduclaw]\ncommand = {command}\nargs = []\nenabled = true\nenv = {{}}\n");
             (vec![ProjectionFile {
                 destination: ConfigDestination::RuntimeHome, relative_target: ".grok/config.toml", contents: contents.clone(),
             }, ProjectionFile {
                 destination: ConfigDestination::WorkingDirectory, relative_target: ".grok/config.toml", contents,
-            }], Vec::new())
+            }, ProjectionFile { destination: ConfigDestination::WorkingDirectory, relative_target: ".mcp.json",
+                contents: serde_json::json!({"mcpServers": {"duduclaw": server}}).to_string(),
+            }], native_cli_arguments(&RuntimeKind::Grok)?)
         },
         // A's API tool loop starts the bridge itself with the explicit fd handoff.
         RuntimeKind::OpenAiCompat => (vec![ProjectionFile {
             destination: ConfigDestination::RunConfig, relative_target: "mcp.json",
             contents: serde_json::json!({"mcpServers": {"duduclaw": server}}).to_string(),
-        }], Vec::new()),
-        RuntimeKind::Registered(_) => return Err(VerificationError::Unavailable),
+        }], api_worker_arguments()),
+        RuntimeKind::Registered(_) => {
+            let arguments = registered_cli_arguments(&registration.runtime)?;
+            (vec![ProjectionFile {
+                destination: ConfigDestination::RunConfig, relative_target: "mcp.json",
+                contents: serde_json::json!({"mcpServers": {"duduclaw": server}}).to_string(),
+            }], arguments)
+        },
     };
     Ok(RuntimeProjection { registration, files, arguments, inherited_mcp_fd: MCP_FD })
 }

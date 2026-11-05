@@ -216,6 +216,27 @@ class LinuxReleaseTests(unittest.TestCase):
                 "install_target": {"kind": kind}} for kind, name in
                 ((kind, kind) for kind in PACKAGE.INSTALL_BINARIES)]}
 
+    def test_signed_runtime_targets_are_distinct_and_have_fixed_sources_and_modes(self):
+        document = self.manifest()
+        for registry, mode in [("isolation-policy-v1", 0o444), ("api-worker-v1", 0o755),
+                               ("native-adapter-v1", 0o755), ("vendor-codex", 0o755), ("vendor-grok", 0o755)]:
+            document["artifacts"].append({"id": registry, "mode": mode,
+                "install_target": {"kind": "runtime_entry", "registry_id": registry}})
+        PACKAGE.validate_targets(document["artifacts"])
+        self.assertEqual(PACKAGE.runtime_source(document["artifacts"][11], self.binaries, None),
+                         self.binaries / "duduclaw-api-worker")
+        with self.assertRaises(ValueError):
+            PACKAGE.runtime_source(document["artifacts"][10], self.binaries, None)
+        self.assertEqual(PACKAGE.runtime_source(document["artifacts"][10], self.binaries, self.root),
+                         self.root / "runtime-isolation-policy-v1")
+        duplicate = document["artifacts"] + [document["artifacts"][-1]]
+        with self.assertRaises(ValueError):
+            PACKAGE.validate_targets(duplicate)
+        for registry, mode in [("../vendor", 0o755), ("vendor-grok", 0o444), ("isolation-policy-v1", 0o755)]:
+            bad = {"mode": mode, "install_target": {"kind": "runtime_entry", "registry_id": registry}}
+            with self.assertRaises(ValueError):
+                PACKAGE.runtime_target(bad)
+
     def test_wrong_arch_product_version_and_incomplete_template_refused(self):
         template = self.root / "template.json"
         for field, value in (("arch", "aarch64"), ("product", "duduclaw_pro"),
@@ -256,6 +277,38 @@ class LinuxReleaseTests(unittest.TestCase):
             "-n", "duduclaw-release-manifest-v1@dudustudio", "-s", str(detached)],
             input=manifest.read_bytes(), capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("ssh-keygen"), "requires OpenSSH")
+    def test_signed_runtime_policy_and_worker_publish_through_bootstrap_inbox(self):
+        key = self.root / "runtime-test-key"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+        runtime_dir = self.root / "runtime"
+        runtime_dir.mkdir()
+        (runtime_dir / "runtime-isolation-policy-v1").write_text('{"fixture_only":true}')
+        (runtime_dir / "runtime-vendor-codex").write_bytes(b"\x7fELF-test-only-vendor")
+        (runtime_dir / "runtime-vendor-codex").chmod(0o755)
+        document = self.manifest()
+        for registry, mode in [("isolation-policy-v1", 0o444), ("api-worker-v1", 0o755),
+                               ("native-adapter-v1", 0o755), ("vendor-codex", 0o755)]:
+            document["artifacts"].append({"id":registry,"mode":mode,
+                "install_target":{"kind":"runtime_entry","registry_id":registry}})
+        template = self.root / "runtime-template.json"
+        template.write_text(json.dumps(document))
+        with patch.dict(os.environ, {"CI":"", "GITHUB_ACTIONS":""}):
+            outputs = PACKAGE.sign_release(self.binaries,TARGET,self.output,template,key,"ssh-keygen",runtime_dir)
+        self.assertEqual(len(outputs),16)
+        canonical = lambda value: json.dumps(value,sort_keys=True,separators=(",", ":")).encode()
+        root = self.root / "root.json"
+        root.write_bytes(canonical({"schema_version":1,"version":1}))
+        signatures = self.root / "root.signatures.json"
+        signatures.write_text('["root-fixture-a","root-fixture-b"]')
+        inbox = PACKAGE.create_bootstrap_inbox(TARGET,self.output,root,signatures)
+        manifest = json.loads((inbox / "manifest.json").read_bytes())
+        self.assertEqual(len(list((inbox / "artifacts").iterdir())),14)
+        for artifact in manifest["artifacts"]:
+            payload = (inbox / "artifacts" / artifact["id"]).read_bytes()
+            self.assertEqual(artifact["sha256"],list(hashlib.sha256(payload).digest()))
+            self.assertEqual(artifact["size_bytes"],len(payload))
 
     def test_release_entrypoint_and_workflow_share_helper(self):
         result = subprocess.run(["bash", str(ROOT / "scripts/release.sh"), "linux-assets", "--help"],

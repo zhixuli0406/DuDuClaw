@@ -185,6 +185,8 @@ struct HostPublication { version: u16, generation: Sha256Digest, entitlements: V
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vendor_digest: Option<Sha256Digest>,
     profile: ProfileId, runtime: duduclaw_run::seccomp::RuntimeProfile, runtime_digest: Sha256Digest,
     forwarder: Option<ForwarderRecord>, tmpfs_bytes: u64, tmpfs_inodes: u64, proc_subset_pid: bool,
 }
@@ -239,6 +241,7 @@ fn bundle() -> io::Result<Bundle> {
     if bytes.len() as u64 != artifact.size_bytes || Sha256Digest(Sha256::digest(&bytes).into()) != artifact.sha256 { return Err(denied()); }
     let policy: SignedPolicy = serde_json::from_slice(&bytes).map_err(|_| denied())?;
     if policy.version != 1 || policy.native.len() != policy.runtimes.len() { return Err(denied()); }
+    validate_runtime_artifacts(&policy, &manifest)?;
     let mut ids = std::collections::BTreeSet::new();
     for profile in &policy.native {
         if !ids.insert((profile.profile.0).0) || !policy.runtimes.iter().any(|r| r.profile == profile.profile) { return Err(denied()); }
@@ -247,6 +250,31 @@ fn bundle() -> io::Result<Bundle> {
     }
     Ok(Bundle { generation, manifest, directory, host, policy })
 }
+/// A native acceptance binds the exact vendor ELF as part of its launch-policy
+/// digest. Replacing either adapter or vendor requires new signed acceptance.
+fn validate_runtime_artifacts(policy: &SignedPolicy, manifest: &ReleaseManifest) -> io::Result<()> {
+    for runtime in &policy.runtimes {
+        let native = policy.native.iter().find(|n| n.profile == runtime.profile).ok_or_else(denied)?;
+        let (entry, digest) = match &runtime.executable {
+            ExecutableRecord::Elf { entry, digest } => (entry.as_str(), *digest),
+            ExecutableRecord::Script { .. } => continue,
+        };
+        let artifact = manifest.artifacts.iter().find(|a| artifact_name(&a.install_target).is_ok_and(|name| name == entry))
+            .ok_or_else(denied)?;
+        if artifact.sha256 != digest || artifact.mode != 0o755 { return Err(denied()); }
+        let vendor = match runtime.runtime { RuntimeKind::Codex => Some("vendor-codex"),
+            RuntimeKind::Grok => Some("vendor-grok"), _ => None };
+        if let Some(vendor) = vendor {
+            if entry != "runtime-native-adapter-v1" { return Err(denied()); }
+            let artifact = manifest.artifacts.iter().find(|a| a.install_target == InstallTarget::RuntimeEntry { registry_id: vendor.into() })
+                .ok_or_else(denied)?;
+            if artifact.mode != 0o755 || native.vendor_digest != Some(artifact.sha256) { return Err(denied()); }
+        } else if native.vendor_digest.is_some() { return Err(denied()); }
+        if runtime.runtime == RuntimeKind::OpenAiCompat && entry != "runtime-api-worker-v1" { return Err(denied()); }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct InstalledPublication { generation: Option<Sha256Digest> }
 impl InstalledPublication {
@@ -321,8 +349,6 @@ impl crate::host::Publication for InstalledPublication {
         os(acceptance.validate(&projection))?;
         let native = b.policy.native.iter().find(|n| n.profile == runtime.profile).ok_or(ErrorCode::RuntimeDenied)?;
         os(acceptance.validate_launch(record, native))?;
-        if projection.files.iter().any(|file| file.destination != duduclaw_mcp_boundary::config::ConfigDestination::RunConfig
-            || file.relative_target.contains('/')) { return Err(ErrorCode::RuntimeDenied); }
         let anchor = Path::new(ROOT).join("projections");
         os(crate::registry::root_path(&anchor, true))?;
         let hex: String = plan.employee.0.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -335,8 +361,18 @@ impl crate::host::Publication for InstalledPublication {
         os(crate::registry::root_path(&path, true))?;
         os(File::open(&path).and_then(|f| f.set_permissions(fs::Permissions::from_mode(0o755))))?;
         let directory = os(Directory::open(&path))?;
+        let names: Vec<_> = projection.files.iter().map(duduclaw_mcp_boundary::config::projection_name)
+            .collect::<std::result::Result<_, _>>().map_err(|_| ErrorCode::RuntimeDenied)?;
+        for name in ["mcp.json", "codex-home.toml", "grok-home.toml", "grok-project.toml", "project-mcp.json"] {
+            if names.contains(&name) { continue; }
+            match directory.remove(name) {
+                Ok(()) => {}, Err(duduclaw_updated::Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => {},
+                Err(_) => return Err(ErrorCode::IsolationUnavailable),
+            }
+        }
         for file in projection.files {
-            let temporary = format!("{}.next", file.relative_target);
+            let name = os(duduclaw_mcp_boundary::config::projection_name(&file))?;
+            let temporary = format!("{name}.next");
             match directory.remove(&temporary) {
                 Ok(()) => {}, Err(duduclaw_updated::Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => {},
                 Err(_) => return Err(ErrorCode::IsolationUnavailable),
@@ -345,7 +381,7 @@ impl crate::host::Publication for InstalledPublication {
             os(output.write_all(file.contents.as_bytes()))?;
             os(output.set_permissions(fs::Permissions::from_mode(0o444)))?;
             os(output.sync_all())?;
-            os(directory.rename(&temporary, &directory, file.relative_target, true))?;
+            os(directory.rename(&temporary, &directory, name, true))?;
         }
         Ok(())
     }
@@ -530,6 +566,40 @@ mod tests {
                 io_write_ops_per_sec: 10, output_buffer_bytes: 4096, output_total_bytes: 4096, memfd_total_bytes: 4096 },
             timeouts: RunTimeouts { queue_ms: 1000, startup_ms: 1000, runtime_ms: 1000, pty_idle_ms: None, termination_grace_ms: 100 },
             network: NetworkPolicy::Offline, mcp: true, pty_allowed: false, queue_class: QueueClass::Background, mcp_acceptance: None }
+    }
+    #[test]
+    fn native_runtime_publication_requires_signed_adapter_and_matching_vendor_digest() {
+        use duduclaw_isolation::update::*;
+        let version = duduclaw_updated::parse_version(env!("CARGO_PKG_VERSION")).unwrap();
+        let artifact = |id: &str, digest| ReleaseArtifact { id: id.into(), sha256: digest, size_bytes: 7, mode: 0o755,
+            install_target: InstallTarget::RuntimeEntry { registry_id: id.into() } };
+        for kind in [RuntimeKind::Codex, RuntimeKind::Grok] {
+            let vendor = if kind == RuntimeKind::Codex { "vendor-codex" } else { "vendor-grok" };
+            let mut record = runtime_record();
+            record.runtime = kind;
+            record.executable = ExecutableRecord::Elf { entry: Text::new("runtime-native-adapter-v1".into()).unwrap(),digest: Sha256Digest([2;32]) };
+            let mut policy = SignedPolicy { version: 1, runtimes: vec![record.clone()], native: vec![NativeRecord {
+                vendor_digest: Some(Sha256Digest([3;32])), profile: record.profile,
+                runtime: duduclaw_run::seccomp::RuntimeProfile { allowed_syscalls: vec![0] },
+                runtime_digest: Sha256Digest([4;32]), forwarder: None, tmpfs_bytes: 4096,
+                tmpfs_inodes: 32, proc_subset_pid: true }] };
+            let mut manifest = ReleaseManifest { schema_version: 1, product: Product::Duduclaw, version,
+                channel: ReleaseChannel::Stable, os: OperatingSystem::Linux, arch: Architecture::X86_64,
+                minimum_version: version, serial: 1, created_at_unix: 1, expires_at_unix: 2,
+                artifacts: vec![artifact("native-adapter-v1",Sha256Digest([2;32])),artifact(vendor,Sha256Digest([3;32]))],
+                protocols: ProtocolCompatibility { gateway: 1,spawnd: 1,trampoline: 1,egress: 1,updated: 1,mcp_bridge: 1,parse_worker: 1,importer: 1 },migrations: vec![] };
+            validate_runtime_artifacts(&policy,&manifest).unwrap();
+            policy.native[0].vendor_digest = None;
+            assert!(validate_runtime_artifacts(&policy,&manifest).is_err());
+            policy.native[0].vendor_digest = Some(Sha256Digest([3;32]));
+            manifest.artifacts[1].sha256 = Sha256Digest([9;32]);
+            assert!(validate_runtime_artifacts(&policy,&manifest).is_err());
+            manifest.artifacts[1].sha256 = Sha256Digest([3;32]);
+            manifest.artifacts[1].mode = 0o444;
+            assert!(validate_runtime_artifacts(&policy,&manifest).is_err());
+            manifest.artifacts.pop();
+            assert!(validate_runtime_artifacts(&policy,&manifest).is_err());
+        }
     }
     #[test]
     fn publication_generation_pin_refuses_native_policy_replacement_until_restart() {

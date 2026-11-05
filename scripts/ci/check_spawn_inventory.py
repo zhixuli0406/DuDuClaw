@@ -228,7 +228,7 @@ def check(sites: list[Site], registry: dict) -> list[str]:
     entries = registry.get("entries", [])
     indexed = {}
     identities = {"gateway", "employee", "parse_worker", "import_worker", "spawn_daemon", "trampoline", "egress", "updater", "downloader", "operator", "test", "host_service"}
-    migrations = {"pending", "backend", "gateway_exception", "privileged_service", "not_process", "test_only", "other_package"}
+    migrations = {"pending", "backend", "gateway_exception", "privileged_service", "isolated_child", "not_process", "test_only", "other_package"}
     for entry in entries:
         symbol = entry.get("symbol")
         if not symbol or symbol in indexed:
@@ -241,6 +241,14 @@ def check(sites: list[Site], registry: dict) -> list[str]:
             errors.append(f"missing effect/rationale: {symbol}")
         if entry.get("migration") == "gateway_exception" and entry.get("identity") not in {"gateway", "operator"}:
             errors.append(f"invalid gateway exemption: {symbol}")
+        if entry.get("migration") == "isolated_child" and (
+            entry.get("identity") != "employee"
+            or entry.get("apis") != {
+                "crates/duduclaw-api-worker/src/linux.rs::Bridge::connect": {"command_constructor": 1, "terminal_spawn": 1},
+                "crates/duduclaw-api-worker/src/native_main.rs::run": {"command_constructor": 1, "terminal_exec": 1},
+            }.get(symbol)
+        ):
+            errors.append(f"invalid isolated runtime child: {symbol}")
         if entry.get("migration") == "privileged_service" and entry.get("identity") not in {
             "spawn_daemon", "trampoline", "updater", "downloader", "host_service",
         }:

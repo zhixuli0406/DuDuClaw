@@ -22,7 +22,7 @@ struct MountAttr { attr_set: u64, attr_clr: u64, propagation: u64, userns_fd: u6
 struct OpenHow { flags: u64, mode: u64, resolve: u64 }
 fn invalid() -> io::Error { io::Error::new(io::ErrorKind::InvalidData, "invalid bootstrap publication") }
 fn c_name(name: &OsStr) -> io::Result<CString> { CString::new(name.as_bytes()).map_err(|_| invalid()) }
-fn owned(raw: libc::c_long) -> io::Result<OwnedFd> {
+pub(super) fn owned(raw: libc::c_long) -> io::Result<OwnedFd> {
     if raw < 0 { return Err(io::Error::last_os_error()); }
     Ok(unsafe { OwnedFd::from_raw_fd(raw as i32) })
 }
@@ -111,7 +111,7 @@ pub fn prepare(plan: &BootstrapPlan, storage: &AttachedStorage, anchors: &RootPu
     if unsafe { libc::geteuid() } != 0 { return Err(io::ErrorKind::PermissionDenied.into()); }
     plan.validate().map_err(|_| invalid())?;
     storage.receipt.check(plan.employee, plan.run).map_err(|_| invalid())?;
-    let home = detached_clone(storage.home.as_fd(), MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)?;
+    let persistent_home = detached_clone(storage.home.as_fd(), MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)?;
     // The initial B1 seam narrows all work mounts to noexec. Profiles requiring
     // executable workspace content must declare a reviewed explicit policy.
     let work = detached_clone(storage.work.as_fd(), MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC)?;
@@ -119,6 +119,7 @@ pub fn prepare(plan: &BootstrapPlan, storage: &AttachedStorage, anchors: &RootPu
     let readonly = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOSYMFOLLOW;
     let runtime = detached_clone(runtime_anchor.as_fd(), readonly)?;
     let projection = employee_projection(anchors, plan.employee)?;
+    let home = super::native_home::prepare(persistent_home, work.as_fd(), projection.as_fd(), plan.uid, plan.gid)?;
     let etc_anchor = publish_projection(anchors, plan)?;
     let etc = detached_clone(etc_anchor.as_fd(), readonly | MOUNT_ATTR_NOEXEC)?;
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -143,7 +144,7 @@ fn employee_projection(anchors: &RootPublicationAnchors, employee: EmployeeId) -
 
 /// Clone first, then change propagation/attributes: a bad H descriptor can never
 /// cause mount_setattr to modify its original attached host mount.
-fn detached_clone(source: BorrowedFd<'_>, attributes: u64) -> io::Result<OwnedFd> {
+pub(super) fn detached_clone(source: BorrowedFd<'_>, attributes: u64) -> io::Result<OwnedFd> {
     let clone = owned(unsafe { libc::syscall(libc::SYS_open_tree, source.as_raw_fd(), c"".as_ptr(),
         OPEN_TREE_CLONE | libc::O_CLOEXEC as u32 | AT_RECURSIVE | libc::AT_EMPTY_PATH as u32) })?;
     let private = MountAttr { attr_set: 0, attr_clr: 0, propagation: libc::MS_PRIVATE, userns_fd: 0 };
@@ -254,18 +255,18 @@ fn verify_projection_entries(directory: BorrowedFd<'_>, expected: &BTreeMap<&str
 }
 
 /// Read exact immutable MCP bytes from the detached mount which B2 receives.
-/// Only flat RunConfig projections are currently implemented. No writable HOME
-/// or project configuration is treated as an equivalent overlay.
+/// Native destinations have closed flat publication names; their actual home
+/// ancestors are read back separately. Writable native config is never accepted.
 pub(crate) fn verify_mcp_projection(mounts: &PreparedMounts,
     projection: &duduclaw_mcp_boundary::config::RuntimeProjection) -> io::Result<u64> {
-    use duduclaw_mcp_boundary::config::ConfigDestination;
     let mut expected = BTreeMap::new();
     for entry in &projection.files {
-        if entry.destination != ConfigDestination::RunConfig || entry.relative_target.contains('/')
-            || expected.insert(entry.relative_target, entry.contents.clone()).is_some() { return Err(invalid()); }
+        let name = duduclaw_mcp_boundary::config::projection_name(entry).map_err(|_| invalid())?;
+        if expected.insert(name, entry.contents.clone()).is_some() { return Err(invalid()); }
     }
     if expected.is_empty() { return Err(invalid()); }
     verify_projection_entries(mounts.projection.as_fd(), &expected)?;
+    super::native_home::verify(mounts.home.as_fd(), mounts.projection.as_fd())?;
     let mut flags: libc::statvfs = unsafe { mem::zeroed() };
     if unsafe { libc::fstatvfs(mounts.projection.as_raw_fd(), &mut flags) } != 0
         || flags.f_flag & libc::ST_RDONLY == 0 { return Err(invalid()); }

@@ -766,17 +766,33 @@ impl AgentRuntime for GenericCliRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
-        super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::GenericCli)?;
         if crate::runtime_dispatch::in_utility_call() {
             return Err("generic CLI utility calls refused: no verified tool-free mode".into());
         }
         // P5: this runtime cannot carry the read-only explore lane.
         crate::explore_lane::refuse_unsupported_runtime("generic CLI")?;
         crate::product_policy::require_runtime(&context.home_dir, self.spec.id)?;
+        if duduclaw_core::execution_gate::isolation_required() {
+            #[cfg(target_os = "linux")]
+            return crate::isolation_mcp::runtime::execute_registered_cli(
+                self.spec.id, prompt, context, self.spec.headless.output).await;
+            #[cfg(not(target_os = "linux"))]
+            return super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::GenericCli)
+                .and_then(|_| Err("protected runtime unavailable on this platform".into()));
+        }
         self.run(prompt, context).await.map_err(Into::into)
     }
 
     async fn is_available(&self) -> bool {
+        if duduclaw_core::execution_gate::isolation_required() {
+            #[cfg(target_os = "linux")]
+            {
+                let Ok(name) = duduclaw_isolation::bounded::Text::new(format!("generic-cli-v1.{}", self.spec.id)) else { return false; };
+                return crate::isolation_mcp::runtime::available(duduclaw_isolation::execution::RuntimeKind::Registered(name)).await;
+            }
+            #[cfg(not(target_os = "linux"))]
+            return false;
+        }
         // Path check only — deliberately NOT a `--version` spawn. Several of
         // these CLIs start their TUI when invoked without a recognised flag,
         // and the registry builds this for every catalog entry at startup.

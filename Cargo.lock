@@ -1787,6 +1787,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-api-worker"
+version = "1.79.3"
+dependencies = [
+ "libc",
+ "reqwest",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "duduclaw-auth"
 version = "1.79.3"
 dependencies = [
@@ -2059,6 +2071,7 @@ dependencies = [
  "csv",
  "dirs 5.0.1",
  "duduclaw-agent",
+ "duduclaw-api-worker",
  "duduclaw-auth",
  "duduclaw-cli",
  "duduclaw-cli-runtime",
@@ -2615,6 +2628,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "zbus",

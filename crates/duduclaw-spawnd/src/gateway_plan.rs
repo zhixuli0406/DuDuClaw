@@ -21,6 +21,46 @@ impl InstalledMainPlanFactory {
         let policy = publication.policy().map_err(|_| BackendError::Denied)?;
         claude_plan(&policy, employee, class, prompt, system_prompt, model)
     }
+
+    #[cfg(target_os = "linux")]
+    pub fn other_runtime(&self, employee: EmployeeId, class: ExecutionClass,
+        runtime: RuntimeKind, request: Vec<u8>) -> Result<SpawnPolicy, BackendError> {
+        let publication = crate::installed::GatewayPublication::read(self.gateway_gid)
+            .map_err(|_| BackendError::Unavailable)?;
+        if publication.generation != self.generation { return Err(BackendError::Denied); }
+        let policy = publication.policy().map_err(|_| BackendError::Denied)?;
+        other_runtime_plan(&policy, employee, class, runtime, request)
+    }
+}
+
+fn other_runtime_plan(policy: &RootPolicy, employee: EmployeeId, class: ExecutionClass,
+    kind: RuntimeKind, request: Vec<u8>) -> Result<SpawnPolicy, BackendError> {
+    if !matches!(class, ExecutionClass::EmployeeMain | ExecutionClass::Scheduled | ExecutionClass::Dispatch
+        | ExecutionClass::Heartbeat | ExecutionClass::Mail | ExecutionClass::Reminder)
+        || request.is_empty() || request.len() > duduclaw_isolation::ipc::MAX_PROMPT_BYTES as usize {
+        return Err(BackendError::Denied);
+    }
+    let expected = match kind {
+        RuntimeKind::OpenAiCompat => duduclaw_mcp_boundary::config::api_worker_arguments(),
+        RuntimeKind::Codex | RuntimeKind::Grok => duduclaw_mcp_boundary::config::native_cli_arguments(&kind)
+            .map_err(|_| BackendError::Denied)?,
+        _ => duduclaw_mcp_boundary::config::registered_cli_arguments(&kind).map_err(|_| BackendError::Denied)?,
+    };
+    let pty = kind == RuntimeKind::Grok;
+    let (runtime, _) = policy.derive(employee, &kind, pty).map_err(|_| BackendError::Denied)?;
+    if !runtime.mcp || runtime.fixed_args.iter().map(|arg| arg.as_str()).ne(expected.iter().map(String::as_str))
+        || request.len() as u64 > runtime.resources.memfd_total_bytes {
+        return Err(BackendError::Denied);
+    }
+    // D adds the complete fixed protocol suffix from the same projection.
+    Ok(SpawnPolicy { run: RunHandle(RunId([0; 16])), employee, class, runtime: kind,
+        argv_allowlist: vec![], environment_allowlist: Default::default(),
+        workspace: WorkspacePolicy { workspace: Text::new("employee-work".into()).map_err(|_| BackendError::Denied)?,
+            relative_cwd: Text::new(String::new()).map_err(|_| BackendError::Denied)? },
+        resources: runtime.resources.clone(), network: runtime.network.clone(), pty,
+        capabilities: CapabilityHandover { mcp_bridge: true,
+            egress_forwarder: matches!(runtime.network, NetworkPolicy::Egress(_)) },
+        timeouts: runtime.timeouts.clone(), inputs: RunInputs { prompt: input(request), attachments: vec![] } })
 }
 
 /// The signed runtime must already contain this exact input protocol. These
@@ -142,4 +182,75 @@ mod tests {
         assert!(claude_arguments("model\n--flag").is_err());
         assert!(InstalledMainPlanFactory::new(Sha256Digest([0; 32]), 100).is_err());
     }
+
+    #[test]
+    fn other_runtime_plan_requires_signed_protocol_and_employee_entitlement() {
+        let (employee, mut runtime) = fixture();
+        let kind = RuntimeKind::Registered(Text::new("generic-cli-v1.qwen".into()).unwrap());
+        runtime.runtime = kind.clone();
+        runtime.fixed_args = duduclaw_mcp_boundary::config::registered_cli_arguments(&kind).unwrap()
+            .into_iter().map(|arg| Text::new(arg).unwrap()).collect();
+        let good = policy(employee, runtime.clone());
+        let plan = other_runtime_plan(&good, employee, ExecutionClass::Dispatch, kind.clone(), b"request".to_vec()).unwrap();
+        assert_eq!(plan.runtime, kind);
+        assert!(plan.argv_allowlist.is_empty());
+        assert!(plan.environment_allowlist.is_empty());
+        assert_eq!(plan.resources, runtime.resources);
+        assert_eq!(plan.inputs.prompt.max_bytes, 7);
+        assert!(plan.inputs.attachments.is_empty());
+        for (who, class, request) in [(EmployeeId([9; 16]), ExecutionClass::Dispatch, vec![1]),
+            (employee, ExecutionClass::EmployeeTool, vec![1]), (employee, ExecutionClass::Judge, vec![1]),
+            (employee, ExecutionClass::Dispatch, vec![]), (employee, ExecutionClass::Dispatch, vec![1; 4097])] {
+            assert!(other_runtime_plan(&good, who, class, kind.clone(), request).is_err());
+        }
+        let mut changed = runtime.clone();
+        changed.fixed_args.push(Text::new("--other-config".into()).unwrap());
+        assert!(other_runtime_plan(&policy(employee, changed), employee, ExecutionClass::Dispatch,
+            kind.clone(), vec![1]).is_err());
+        runtime.mcp = false;
+        assert!(other_runtime_plan(&policy(employee, runtime), employee, ExecutionClass::Dispatch, kind, vec![1]).is_err());
+    }
+
+    #[test]
+    fn api_worker_plan_requires_exact_signed_worker_and_input_budget() {
+        let (employee, mut runtime) = fixture();
+        runtime.runtime = RuntimeKind::OpenAiCompat;
+        runtime.fixed_args = duduclaw_mcp_boundary::config::api_worker_arguments().into_iter()
+            .map(|arg| Text::new(arg).unwrap()).collect();
+        let good = policy(employee, runtime.clone());
+        let plan = other_runtime_plan(&good, employee, ExecutionClass::EmployeeMain,
+            RuntimeKind::OpenAiCompat, vec![1]).unwrap();
+        assert_eq!(plan.runtime, RuntimeKind::OpenAiCompat);
+        assert!(plan.environment_allowlist.is_empty());
+        assert!(plan.argv_allowlist.is_empty());
+        assert!(plan.capabilities.mcp_bridge);
+        runtime.fixed_args.clear();
+        assert!(other_runtime_plan(&policy(employee, runtime), employee, ExecutionClass::EmployeeMain,
+            RuntimeKind::OpenAiCompat, vec![1]).is_err());
+        assert!(other_runtime_plan(&good, employee, ExecutionClass::EmployeeMain,
+            RuntimeKind::OpenAiCompat, vec![1; 4097]).is_err());
+        assert!(other_runtime_plan(&good, employee, ExecutionClass::Judge,
+            RuntimeKind::OpenAiCompat, vec![1]).is_err());
+    }
+    #[test]
+    fn native_cli_plans_bind_adapter_protocol_and_require_grok_pty_entitlement() {
+        let (employee, base) = fixture();
+        for kind in [RuntimeKind::Codex, RuntimeKind::Grok] {
+            let mut runtime = base.clone();
+            runtime.runtime = kind.clone();
+            runtime.fixed_args = duduclaw_mcp_boundary::config::native_cli_arguments(&kind).unwrap()
+                .into_iter().map(|v| Text::new(v).unwrap()).collect();
+            let grok = kind == RuntimeKind::Grok;
+            if grok {
+                assert!(other_runtime_plan(&policy(employee,runtime.clone()),employee,ExecutionClass::Dispatch,kind.clone(),vec![1]).is_err());
+                runtime.pty_allowed = true;
+                runtime.timeouts.pty_idle_ms = Some(1000);
+            }
+            let plan = other_runtime_plan(&policy(employee,runtime),employee,ExecutionClass::Dispatch,kind.clone(),vec![1]).unwrap();
+            assert_eq!(plan.pty,grok);
+            assert!(plan.argv_allowlist.is_empty());
+            assert!(plan.environment_allowlist.is_empty());
+        }
+    }
+
 }

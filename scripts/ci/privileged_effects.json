@@ -6185,7 +6185,7 @@
       "rationale": "Protected Claude marker builder is consumed only by the trusted root-derived launch context; it is never spawned locally. Existing local runtime path is unchanged."
     },
     {
-      "symbol": "crates/duduclaw-gateway/src/isolation_mcp/runtime.rs::spawn_claude",
+      "symbol": "crates/duduclaw-gateway/src/isolation_mcp/runtime.rs::spawn_plan",
       "apis": {
         "backend_spawn_class": 1,
         "command_constructor": 1
@@ -6195,7 +6195,7 @@
       "effects": [
         "process_spawn"
       ],
-      "rationale": "One-shot host authorization and fresh root publication prepare the Claude main run; SpawndBackend owns execution and teardown. The native marker has no authority and cannot run on the gateway uid."
+      "rationale": "One-shot host authorization and fresh root publication prepare an isolated main run; SpawndBackend owns execution and teardown. The native marker has no authority and cannot run on the gateway uid."
     },
     {
       "symbol": "crates/duduclaw-spawnd/src/bin/d8-fixture.rs::main",
@@ -6221,6 +6221,44 @@
       "identity": "host_service",
       "migration": "privileged_service",
       "rationale": "G root materialization coordinator invokes only the root-trusted installed platform allocation readback with fixed migration-v1 argv, bounded JSON and a 30-second deadline. The reply must bind the confirmed proposal and prove stopped execution and verified quota; no employee process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-api-worker/src/linux.rs::Bridge::connect",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "employee",
+      "migration": "isolated_child",
+      "rationale": "Fixed root-published MCP shim launched only inside the API employee run, after sealed input, employee UID and immutable config checks. The child inherits only this run MCP fd; it has no gateway keys or host execution path. B owns the cgroup and retirement."
+    },
+    {
+      "symbol": "crates/duduclaw-api-worker/src/native_main.rs::run",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_exec": 1
+      },
+      "identity": "employee",
+      "migration": "isolated_child",
+      "effects": [
+        "process_spawn"
+      ],
+      "rationale": "Fixed native vendor ELF replaces the already isolated adapter process inside B uid/namespaces/cgroup; bounded sealed request cannot choose an executable or config. Signed launch acceptance binds the vendor digest."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/isolation_mcp/runtime.rs::collect_native_pty",
+      "apis": {
+        "command_constructor": 1
+      },
+      "identity": "employee",
+      "migration": "backend",
+      "effects": [
+        "process_spawn"
+      ],
+      "rationale": "A protected PTY marker only; one-shot authorization and fresh root plan are required. RunHandle lifecycle owns terminal IO, cancellation and retirement; no local PTY fallback."
     }
   ]
 }

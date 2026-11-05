@@ -28,6 +28,31 @@ use super::{AgentRuntime, RuntimeContext, RuntimeResponse};
 pub struct OpenAiCompatRuntime;
 
 impl OpenAiCompatRuntime {
+    #[cfg(target_os = "linux")]
+    async fn execute_protected(&self, prompt: &str, context: &RuntimeContext) -> Result<RuntimeResponse, String> {
+        let authorization = crate::isolation_mcp::runtime::authorize_api(context)?;
+        let refusal = || duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+            "所選隔離執行設定尚未支援這次工作，請由管理員確認服務與資料保護設定。");
+        validate_model(&context.model)?;
+        crate::product_policy::require_runtime(&context.home_dir, "openai_compat")?;
+        crate::product_policy::require_model(crate::product_policy::load(&context.home_dir)?, &context.model)?;
+        // No silent loss of host interceptors or disclosure leases. These modes
+        // need a separate typed worker adapter before protected API execution.
+        if crate::ccr_runtime::for_agent(&context.home_dir, &context.agent_id).is_some()
+            || crate::redaction_proxy::try_build_interceptor(&context.home_dir, &context.agent_id,
+                &crate::redaction_proxy::current_session_id()).map_err(|_| refusal())?.is_some() {
+            return Err(refusal());
+        }
+        let mut messages = vec![duduclaw_api_worker::Message { role: "system".into(), content: context.system_prompt.clone() }];
+        messages.extend(context.conversation_history.iter().map(|turn| duduclaw_api_worker::Message {
+            role: turn.role.clone(), content: turn.content.clone() }));
+        messages.push(duduclaw_api_worker::Message { role: "user".into(), content: prompt.into() });
+        let request = duduclaw_api_worker::Request { protocol: duduclaw_api_worker::PROTOCOL.into(),
+            provider: context.preferred_provider.clone(), model: context.model.clone(), messages, max_tokens: context.max_tokens,
+            timeout_secs: crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref()) };
+        crate::isolation_mcp::runtime::execute_api_worker(authorization, request, context).await
+    }
+
     pub fn new() -> Self {
         Self
     }
@@ -142,7 +167,13 @@ impl AgentRuntime for OpenAiCompatRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
-        super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::OpenAiCompat)?;
+        if duduclaw_core::execution_gate::isolation_required() {
+            #[cfg(target_os = "linux")]
+            return self.execute_protected(prompt, context).await;
+            #[cfg(not(target_os = "linux"))]
+            return super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::OpenAiCompat)
+                .and_then(|_| Err("protected runtime unavailable on this platform".into()));
+        }
         // APIs require a concrete model; unlike CLI runtimes there is no
         // vendor-selected default to use when both agent model keys are blank.
         validate_model(&context.model)?;
@@ -192,6 +223,12 @@ impl AgentRuntime for OpenAiCompatRuntime {
     }
 
     async fn is_available(&self) -> bool {
+        if duduclaw_core::execution_gate::isolation_required() {
+            #[cfg(target_os = "linux")]
+            return crate::isolation_mcp::runtime::available(duduclaw_isolation::execution::RuntimeKind::OpenAiCompat).await;
+            #[cfg(not(target_os = "linux"))]
+            return false;
+        }
         // Check if any OpenAI-compatible provider API key is configured.
         // WP-8B (credentials doctrine P3): derived from the canonical
         // `duduclaw_core::provider_env` table for every provider this
@@ -962,7 +999,13 @@ impl OpenAiCompatRuntime {
         prompt: &str,
         context: &super::RuntimeContext,
     ) -> Result<super::RuntimeResponse, String> {
-        super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::OpenAiCompat)?;
+        if duduclaw_core::execution_gate::isolation_required() {
+            #[cfg(target_os = "linux")]
+            return self.execute_protected(prompt, context).await;
+            #[cfg(not(target_os = "linux"))]
+            return super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::OpenAiCompat)
+                .and_then(|_| Err("protected runtime unavailable on this platform".into()));
+        }
         crate::product_policy::require_model(crate::product_policy::load(&context.home_dir)?, &context.model)?;
         let (api_key, base_url, _provider_name) = resolve_provider_config(
             &context.home_dir,
