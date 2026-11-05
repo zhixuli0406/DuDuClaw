@@ -60,6 +60,7 @@ pub fn validate_mfa_import_policy(home: &std::path::Path, after: &str, personal:
 }
 
 pub mod a2a_signing;
+mod a2a;
 pub mod access_control;
 pub mod group_context;
 pub mod agent_binding;

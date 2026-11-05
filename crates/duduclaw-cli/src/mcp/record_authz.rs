@@ -454,3 +454,165 @@ pub(crate) fn changes_background_work(tool: &str, args: &Value) -> bool {
                 .iter()
                 .any(|key| args.get(*key).is_some()))
 }
+
+/// A2A tasks belong to a dashboard principal. MCP has no such principal;
+/// only the cryptographically verified assigned worker may operate on them.
+/// Tombstones keep removed-task activity private, including from MCP admins.
+pub(crate) fn a2a_task_access_allowed(
+    home: &Path,
+    actor: RecordActor<'_>,
+    task_id: &str,
+    task: Option<&duduclaw_gateway::task_store::TaskRow>,
+) -> bool {
+    let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
+    a2a_task_access_with_identity(home, actor, task_id, task, &claimed, &token)
+}
+
+pub(crate) fn verified_a2a_worker<'a>(home: &Path, actor: RecordActor<'a>) -> Option<&'a str> {
+    let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
+    verified_a2a_worker_with_identity(home, actor, &claimed, &token)
+}
+
+fn verified_a2a_worker_with_identity<'a>(
+    home: &Path, actor: RecordActor<'a>, claimed: &str, token: &str,
+) -> Option<&'a str> {
+    let worker = actor.agent()?;
+    (!worker.is_empty()
+        && !duduclaw_core::is_system_sender(worker)
+        && !duduclaw_core::is_reserved_queue_sender(worker)
+        && worker != duduclaw_core::UNTRUSTED_AGENT_ID
+        && claimed == worker
+        && duduclaw_core::verify_identity_claim(home, claimed, token, true)
+            == duduclaw_core::IdentityVerdict::Verified).then_some(worker)
+}
+
+fn a2a_task_access_with_identity(
+    home: &Path,
+    actor: RecordActor<'_>,
+    task_id: &str,
+    task: Option<&duduclaw_gateway::task_store::TaskRow>,
+    claimed: &str,
+    token: &str,
+) -> bool {
+    let owner = match duduclaw_gateway::task_store::TaskStore::a2a_owner_readonly(home, task_id) {
+        Ok(None) => return task.is_none_or(|row| row.a2a_owner.is_none()),
+        Ok(Some(owner)) => owner,
+        Err(_) => return false,
+    };
+    let (Some(worker), Some(task)) = (verified_a2a_worker_with_identity(home, actor, claimed, token), task)
+        else { return false };
+    task.id == task_id
+        && task.a2a_owner.as_deref() == Some(owner.as_str())
+        && task.assigned_to == worker
+}
+
+pub(crate) async fn check_a2a_task_access(
+    home: &Path,
+    store: &duduclaw_gateway::task_store::TaskStore,
+    actor: RecordActor<'_>,
+    task_id: &str,
+) -> std::result::Result<(), Value> {
+    let task = store.get_task(task_id).await.map_err(|_| tool_error("permission denied"))?;
+    if a2a_task_access_allowed(home, actor, task_id, task.as_ref()) {
+        Ok(())
+    } else {
+        Err(tool_error("permission denied"))
+    }
+}
+
+#[cfg(test)]
+mod a2a_access_tests {
+    use super::*;
+    use duduclaw_gateway::task_store::{TaskRow, TaskStore};
+
+    async fn fixture() -> (tempfile::TempDir, TaskStore, TaskRow) {
+        let home = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(home.path()).unwrap();
+        let mut task = TaskRow::new("a2a-private".into(), "Private title".into(),
+            "Private description".into(), "medium".into(), "sales".into(), "a2a:user:alice".into());
+        task.a2a_owner = Some("user:alice".into());
+        store.insert_task(&task).await.unwrap();
+        (home, store, task)
+    }
+
+    fn data(value: Value) -> Value {
+        assert_ne!(value["isError"], true, "{value}");
+        serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a2a_worker_requires_verified_exact_executor_and_rejects_operator() {
+        let (home, _store, task) = fixture().await;
+        let key = duduclaw_core::identity_token::ensure_key(home.path()).unwrap();
+        let token = duduclaw_core::mint_identity_token(&key, "sales");
+        let allows = |actor, claimed, proof| a2a_task_access_with_identity(
+            home.path(), actor, &task.id, Some(&task), claimed, proof);
+        assert!(allows(RecordActor::Agent("sales"), "sales", &token));
+        assert!(!allows(RecordActor::Operator("sales"), "sales", &token));
+        assert!(!allows(RecordActor::Agent("sales"), "sales", ""));
+        assert!(!allows(RecordActor::Agent("sales"), "sales", "forged"));
+        assert!(!allows(RecordActor::Agent("sales"), "other", &token));
+        let other = duduclaw_core::mint_identity_token(&key, "other");
+        assert!(!allows(RecordActor::Agent("other"), "other", &other));
+        assert!(!a2a_task_access_with_identity(home.path(), RecordActor::Agent("sales"),
+            &task.id, None, "sales", &token));
+    }
+
+    #[tokio::test]
+    async fn a2a_mcp_list_mutations_and_activity_refuse_operator_and_other_worker() {
+        let (home, store, task) = fixture().await;
+        for actor in [RecordActor::Operator("operator"), RecordActor::Agent("other")] {
+            let listing = data(handle_tasks_list(&serde_json::json!({"assigned_to":"*"}),
+                home.path(), actor.id(), actor).await);
+            assert_eq!(listing["tasks"], serde_json::json!([]));
+            assert_eq!(listing["total"], 0);
+            for response in [
+                handle_tasks_update(&serde_json::json!({"task_id":task.id,"status":"done"}), home.path(), actor).await,
+                handle_tasks_claim(&serde_json::json!({"task_id":task.id}), home.path(), actor).await,
+                handle_tasks_renew(&serde_json::json!({"task_id":task.id}), home.path(), actor.id()).await,
+                handle_tasks_complete(&serde_json::json!({"task_id":task.id,"summary":"changed"}), home.path(), actor).await,
+                handle_tasks_block(&serde_json::json!({"task_id":task.id,"reason":"changed"}), home.path(), actor).await,
+                handle_activity_post(&serde_json::json!({"task_id":task.id,"summary":"changed"}), home.path(), actor).await,
+            ] {
+                assert_eq!(response["isError"], true, "{response}");
+            }
+            assert!(resolve_parent(home.path(), actor,
+                &serde_json::json!({"parent_task_id":task.id}), None).await.is_err());
+        }
+        assert_eq!(store.get_task(&task.id).await.unwrap().unwrap().status, task.status);
+        assert!(store.list_activity_for_task(&task.id, 100).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a2a_activity_tombstone_hides_removed_task_from_all_mcp_callers() {
+        let (home, store, task) = fixture().await;
+        append_activity(&store, "task_completed", "sales", Some(&task.id),
+            "Private outcome", None).await;
+        assert!(store.remove_task(&task.id).await.unwrap());
+        assert_eq!(TaskStore::a2a_owner_readonly(home.path(), &task.id).unwrap(), task.a2a_owner);
+        for actor in [RecordActor::Operator("operator"), RecordActor::Agent("other"),
+            RecordActor::Agent("sales")] {
+            let listing = data(handle_activity_list(&serde_json::json!({"agent_id":"*"}),
+                home.path(), actor.id(), actor).await);
+            assert_eq!(listing["activities"], serde_json::json!([]));
+            assert_eq!(listing["total"], 0);
+            assert_eq!(handle_activity_post(&serde_json::json!({"task_id":task.id,"summary":"changed"}),
+                home.path(), actor).await["isError"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn a2a_access_errors_fail_closed_but_ordinary_tasks_keep_existing_policy() {
+        let (home, store, task) = fixture().await;
+        let normal = TaskRow::new("normal".into(), "Normal".into(), String::new(),
+            "medium".into(), "sales".into(), "operator".into());
+        store.insert_task(&normal).await.unwrap();
+        assert!(a2a_task_access_with_identity(home.path(), RecordActor::Operator("operator"),
+            &normal.id, Some(&normal), "", ""));
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!a2a_task_access_with_identity(empty.path(), RecordActor::Operator("operator"),
+            &task.id, Some(&task), "", ""));
+    }
+}

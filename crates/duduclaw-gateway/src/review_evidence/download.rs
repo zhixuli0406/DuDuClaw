@@ -91,7 +91,8 @@ async fn authorize_indexed(
         );
         // Admins read through any AI-written audience; an unreadable packet
         // set denies everyone else.
-        if !task_allowed
+        if !crate::task_store::TaskStore::a2a_principal_allows(home, &task_id, &format!("user:{}", ctx.user_id))
+            || !task_allowed
             || !dashboard_may_read(ctx, &audience)
             || !dashboard_may_read_task(ctx, &task_audience(home, &task_id))
         {

@@ -57,10 +57,16 @@ pub(crate) fn live_reader_context(home: &Path, ctx: &UserContext) -> Result<User
     crate::review_evidence::audience::fresh_dashboard_context(home, ctx).map_err(|_| ())
 }
 
+/// Host-stamped principals narrow every dashboard path, including Admin.
+pub(crate) fn a2a_owner_allows(home: &Path, live: &UserContext, task_id: &str) -> bool {
+    TaskStore::a2a_principal_allows(home, task_id, &format!("user:{}", live.user_id))
+}
+
 /// `true` when the task's packet audience (if any) admits this live reader.
 /// An unreadable or corrupt packet set denies.
 pub(crate) fn task_audience_allows(home: &Path, live: &UserContext, task_id: &str) -> bool {
-    crate::review_evidence::audience::dashboard_may_read_task(
+    a2a_owner_allows(home, live, task_id)
+        && crate::review_evidence::audience::dashboard_may_read_task(
         live,
         &crate::review_evidence::audience::task_audience(home, task_id),
     )
@@ -149,7 +155,7 @@ impl<'a> TaskReader<'a> {
     pub(crate) fn can_read_owned(&self, task_id: &str, owner: Option<&str>) -> bool {
         match owner {
             Some(owner) => self.can_read(task_id, owner),
-            None => self.live.is_admin(),
+            None => self.live.is_admin() && a2a_owner_allows(self.home, &self.live, task_id),
         }
     }
 
@@ -160,7 +166,8 @@ impl<'a> TaskReader<'a> {
     /// work to a report's employee can follow what they asked for without
     /// gaining that employee's other tasks.
     pub(crate) fn can_read_row(&self, row: &TaskRow) -> bool {
-        self.can_read(&row.id, &row.assigned_to) || self.assigned_by_reader(row)
+        a2a_owner_allows(self.home, &self.live, &row.id)
+            && (self.can_read(&row.id, &row.assigned_to) || self.assigned_by_reader(row))
     }
 
     fn assigned_by_reader(&self, row: &TaskRow) -> bool {
@@ -228,6 +235,7 @@ impl MethodHandler {
     ) -> Result<(TaskRow, UserContext), WsFrame> {
         let denied = || WsFrame::error_response("", PERMISSION_DENIED);
         let live = live_reader_context(&self.home_dir, ctx).map_err(|_| denied())?;
+        if !a2a_owner_allows(&self.home_dir, &live, task_id) { return Err(denied()); }
         let task = match store.get_task(task_id).await {
             Ok(Some(row)) => row,
             Ok(None) if live.is_admin() => {
@@ -240,7 +248,8 @@ impl MethodHandler {
             Err(e) => return Err(WsFrame::error_response("", &format!("get task: {e}"))),
         };
         let audience = crate::review_evidence::audience::task_audience(&self.home_dir, task_id);
-        if !live.has_agent_access(&task.assigned_to, level)
+        if !a2a_owner_allows(&self.home_dir, &live, task_id)
+            || !live.has_agent_access(&task.assigned_to, level)
             || !crate::review_evidence::audience::dashboard_may_read_task(&live, &audience)
         {
             return Err(denied());
@@ -267,7 +276,7 @@ impl MethodHandler {
         let denied = || WsFrame::error_response("", PERMISSION_DENIED);
         if matches!(store.get_task(task_id).await, Ok(None)) {
             let live = live_reader_context(&self.home_dir, ctx).map_err(|_| denied())?;
-            return if live.is_admin() { Ok(()) } else { Err(denied()) };
+            return if live.is_admin() && a2a_owner_allows(&self.home_dir, &live, task_id) { Ok(()) } else { Err(denied()) };
         }
         self.authorize_private_task_read(store, ctx, task_id, level)
             .await

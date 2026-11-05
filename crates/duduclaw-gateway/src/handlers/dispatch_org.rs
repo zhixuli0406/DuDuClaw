@@ -545,7 +545,7 @@ impl MethodHandler {
             }
             "tasks.flow_metrics" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                boxed_frame(|| self.handle_tasks_flow_metrics(params)).await
+                boxed_frame(|| self.handle_tasks_flow_metrics(params, ctx)).await
             }
 
             // ── Co-edited plans (U4, Cocoa arXiv:2412.10999) ──

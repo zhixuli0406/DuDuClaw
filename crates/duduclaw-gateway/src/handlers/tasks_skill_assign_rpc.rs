@@ -283,6 +283,8 @@ impl MethodHandler {
             source: None,
             task_id: None,
             grant_via: crate::trigger_route::assign::dashboard_grant_via(ctx, &runner.agent_id),
+            a2a_owner: None,
+            a2a_request: None,
         };
         let created =
             match crate::goal_create_core::create_goal_task(&self.home_dir, &store, req).await {

@@ -393,6 +393,8 @@ async fn create_run(
                 source,
                 task_id: Some(task_id.to_string()),
                 grant_via: Some(via.to_string()),
+                a2a_owner: None,
+                a2a_request: None,
             };
             create_scheduled_goal_task(home, store, req, slot)
                 .await

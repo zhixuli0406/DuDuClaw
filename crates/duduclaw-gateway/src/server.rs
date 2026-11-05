@@ -1,6 +1,7 @@
 #[path = "server_company.rs"]
 mod server_company;
 mod data_exports_http;
+mod a2a_http;
 #[path = "server_invites.rs"]
 mod server_invites;
 #[cfg(test)]
@@ -3129,6 +3130,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             "/api/voice/config",
             get(handle_voice_config_get).post(handle_voice_config_set),
         )
+        .route("/a2a", post(a2a_http::rpc))
+        .route("/.well-known/agent-card.json", get(a2a_http::card))
+        .route("/.well-known/agent.json", get(a2a_http::card))
         .with_state(state)
         .merge(auth_router)
         .merge(webchat_router)
@@ -3277,10 +3281,6 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             "/.well-known/mcp-server.json",
             get(well_known_mcp_server_card),
         )
-        // A2A v1.0 signed Agent Card (G6). `agent-card.json` is the v1.0 path;
-        // `agent.json` is kept as a legacy alias. Both serve the signed card.
-        .route("/.well-known/agent-card.json", get(well_known_agent_card))
-        .route("/.well-known/agent.json", get(well_known_agent_card))
         // JWKS advertising the A2A signing public key for card verification.
         .route("/.well-known/jwks.json", get(well_known_jwks));
 
@@ -18253,9 +18253,8 @@ mod pre_auth_handshake_tests {
 }
 
 /// Process-wide A2A signer, initialized once from the on-disk key (generating it
-/// on first use). `None` means key load/generation failed — the card is served
-/// unsigned (fail-open on availability, fail-closed on integrity: an unsigned
-/// card is honest about its lack of a signature). A warning is logged once.
+/// on first use). `None` means key load/generation failed; card endpoints
+/// refuse to serve an unsigned replacement. A warning is logged once.
 fn a2a_signer() -> Option<&'static crate::a2a_signing::A2aSigner> {
     use std::sync::OnceLock;
     static SIGNER: OnceLock<Option<crate::a2a_signing::A2aSigner>> = OnceLock::new();
@@ -18274,51 +18273,12 @@ fn a2a_signer() -> Option<&'static crate::a2a_signing::A2aSigner> {
                     Some(signer)
                 }
                 Err(e) => {
-                    warn!("A2A 簽章金鑰不可用，Agent Card 將以未簽章方式提供：{e}");
+                    warn!("A2A 簽章金鑰不可用，暫停提供 Agent Card：{e}");
                     None
                 }
             }
         })
         .as_ref()
-}
-
-/// Build the unsigned A2A Agent Card body (existing fields, unchanged).
-fn build_agent_card() -> serde_json::Value {
-    serde_json::json!({
-        "name": "DuDuClaw Agent",
-        "description": "AI agent with channel routing, memory, and self-evolution",
-        // Same shared resolver `duduclaw run` uses (env > config.toml
-        // [gateway] port > default) — this used to read `DUDUCLAW_PORT` only
-        // and default to a stale 3000 (the gateway's actual default is
-        // 18889), so an unconfigured A2A client following this card's `url`
-        // with no env var set landed on a dead port.
-        "url": format!(
-            "http://localhost:{}",
-            duduclaw_core::gateway_port_for_home(&duduclaw_core::duduclaw_home()).0
-        ),
-        "version": crate::updater::current_version(),
-        "capabilities": {
-            "streaming": true,
-            "multi_turn": true,
-            "tool_use": true,
-        },
-        "skills": [
-            {"name": "chat", "description": "Multi-turn conversation", "tags": ["conversation"]},
-            {"name": "channel_messaging", "description": "Telegram/LINE/Discord messaging", "tags": ["messaging"]},
-            {"name": "memory", "description": "Search and store memories", "tags": ["memory"]},
-        ],
-    })
-}
-
-async fn well_known_agent_card() -> axum::Json<serde_json::Value> {
-    let mut card = build_agent_card();
-    // A2A v1.0 signature — only added when a signer is available; original
-    // fields are never modified (only-add invariant). Fail-closed on error =>
-    // serve the unsigned card rather than a 500.
-    if let Some(signer) = a2a_signer() {
-        signer.sign_card(&mut card);
-    }
-    axum::Json(card)
 }
 
 /// JWKS endpoint advertising the A2A signing public key (RFC 8037 OKP/Ed25519).

@@ -20,25 +20,8 @@ impl MethodHandler {
         task_id: &str,
         level: AccessLevel,
     ) -> Result<TaskRow, WsFrame> {
-        match store.get_task(task_id).await {
-            Ok(Some(row)) => {
-                if let Err(e) = acl::require_agent_access(ctx, &row.assigned_to, level) {
-                    return Err(WsFrame::error_response("", &e));
-                }
-                Ok(row)
-            }
-            Ok(None) => {
-                if ctx.is_admin() {
-                    Err(WsFrame::error_response(
-                        "",
-                        &format!("Task not found: {task_id}"),
-                    ))
-                } else {
-                    Err(WsFrame::error_response("", "permission denied"))
-                }
-            }
-            Err(e) => Err(WsFrame::error_response("", &format!("get task: {e}"))),
-        }
+        self.authorize_private_task_read(store, ctx, task_id, level)
+            .await.map(|(row, _)| row)
     }
 
     pub(crate) async fn handle_tasks_comment(&self, params: Value, ctx: &UserContext) -> WsFrame {
@@ -513,6 +496,8 @@ impl MethodHandler {
             source: None,
             task_id: None,
             grant_via: crate::trigger_route::assign::dashboard_grant_via(ctx, agent_id),
+            a2a_owner: None,
+            a2a_request: None,
         };
         let created = match crate::goal_create_core::create_goal_task(
             &self.home_dir,
@@ -768,14 +753,23 @@ impl MethodHandler {
     /// rounds, dual-clock means, review queue depth, WIP limit + 7-day accept
     /// throughput for the Little's-Law wait estimate). Non-admins pass an
     /// `agent_id` (check_agent_filter) and see only that agent's slice; admins
-    /// see all agents.
-    pub(crate) async fn handle_tasks_flow_metrics(&self, params: Value) -> WsFrame {
+    /// see all agents. A2A tasks count only for their authenticated owner.
+    pub(crate) async fn handle_tasks_flow_metrics(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let live = match task_privacy::live_reader_context(&self.home_dir, ctx) {
+            Ok(live) => live,
+            Err(()) => return WsFrame::error_response("", PERMISSION_DENIED),
+        };
+        if !live.is_admin() && !params.get("agent_id").and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty() && live.has_agent_access(id, AccessLevel::Viewer))
+        {
+            return WsFrame::error_response("", PERMISSION_DENIED);
+        }
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,
         };
         let now = Utc::now().to_rfc3339();
-        let metrics = match store.flow_metrics(&now).await {
+        let metrics = match store.flow_metrics(&now, &format!("user:{}", live.user_id)).await {
             Ok(m) => m,
             Err(e) => return WsFrame::error_response("", &format!("flow metrics: {e}")),
         };

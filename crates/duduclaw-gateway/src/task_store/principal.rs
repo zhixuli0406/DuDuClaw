@@ -64,7 +64,7 @@ impl TaskStore {
             String::new()
         };
         let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM tasks WHERE on_behalf_of = ?1 AND archived = 0{status_clause} \
+            "SELECT {TASK_COLUMNS} FROM tasks WHERE on_behalf_of = ?1 AND (a2a_owner IS NULL OR a2a_owner = ?1) AND archived = 0{status_clause} \
              ORDER BY updated_at DESC LIMIT {}",
             limit.clamp(1, 200)
         );
@@ -95,7 +95,7 @@ impl TaskStore {
         offset: i64,
     ) -> Result<(Vec<TaskRow>, i64), String> {
         let mut binds: Vec<String> = vec![principal.to_string()];
-        let mut filter = String::from(" WHERE on_behalf_of = ?1");
+        let mut filter = String::from(" WHERE on_behalf_of = ?1 AND (a2a_owner IS NULL OR a2a_owner = ?1)");
         if let Some(s) = status {
             binds.push(s.to_string());
             filter.push_str(&format!(" AND status = ?{}", binds.len()));

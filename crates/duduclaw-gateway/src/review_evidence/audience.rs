@@ -584,6 +584,7 @@ pub async fn authorize_workflow_audience(
         None => is_overseer(&ctx),
     };
     if !allowed
+        || !crate::task_store::TaskStore::a2a_principal_allows(home, source_task, &format!("user:{}", ctx.user_id))
         || !dashboard_may_read(&ctx, saved_audience)
         || !dashboard_may_read_task(&ctx, &task_audience(home, source_task))
     {
