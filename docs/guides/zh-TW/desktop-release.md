@@ -34,7 +34,7 @@ cargo tauri signer generate -w ~/.tauri/duduclaw.key
 `src-tauri/entitlements.plist`）並送公證。若要手動處理某個 artifact，用
 [`scripts/desktop/sign-notarize-macos.sh`](../../../scripts/desktop/sign-notarize-macos.sh)。
 
-**驗收標準（§D4.1）：**在一台從未接觸過該憑證的機器上下載 `.dmg`，應該可以
+**驗收標準（§D4.1）**：在一台從未接觸過該憑證的機器上下載 `.dmg`，應該可以
 直接開啟，不會跳出 Gatekeeper 的「無法識別開發者」警告。
 
 ## 3. Windows：Authenticode
@@ -42,7 +42,7 @@ cargo tauri signer generate -w ~/.tauri/duduclaw.key
 所需 secrets 為 `WINDOWS_CERT_PFX_BASE64` ／ `WINDOWS_CERT_PASSWORD`。workflow
 會透過
 [`scripts/desktop/sign-windows.ps1`](../../../scripts/desktop/sign-windows.ps1)
-簽署 `.msi`。**驗收標準（§D4.2）：**SmartScreen 不會擋下（EV 憑證＝立即信
+簽署 `.msi`。**驗收標準（§D4.2）**：SmartScreen 不會擋下（EV 憑證＝立即信
 任）。
 
 ## 4. Linux

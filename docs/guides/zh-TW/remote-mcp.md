@@ -94,7 +94,7 @@ OAuth 簽發的存取權杖**永遠是「外部客戶端」等級**，與對外�
 
 客戶端可透過 HTTPS 呼叫 `POST /oauth/revoke`，以 `application/x-www-form-urlencoded` 傳入 `client_id`、`token` 及選填的 `token_type_hint`。僅支援 public client（驗證方式 `none`，與 token endpoint 相同），並核對權杖所屬客戶端。撤銷 access token 或 refresh token 都會撤銷整個家族。不認識的權杖或其他客戶端的權杖回傳 HTTP 200，不會更動他人的授權；未提供 client ID 或 token 則拒絕。伺服器可忽略 hint。探索文件會公布 `revocation_endpoint` 與 `revocation_endpoint_auth_methods_supported`。規格見 [RFC 7009](https://www.rfc-editor.org/rfc/rfc7009)。
 
-**升級注意：**舊版缺少同意金鑰與家族關聯的 OAuth 授權碼、權杖一律拒絕，應用程式須重新連線授權。共用儲存層會鎖住完整的讀取、修改與寫入操作，並行刷新、註冊及儀表板撤銷不會把已撤銷的授權寫回；儲存檔損壞或無法讀取時拒絕操作。
+**升級注意**：舊版缺少同意金鑰與家族關聯的 OAuth 授權碼、權杖一律拒絕，應用程式須重新連線授權。共用儲存層會鎖住完整的讀取、修改與寫入操作，並行刷新、註冊及儀表板撤銷不會把已撤銷的授權寫回；儲存檔損壞或無法讀取時拒絕操作。
 
 `duduclaw mcp issue-refresh-token` 簽發的 `ddc_refresh_*` 是另一種**僅供 stdio 使用**的憑證，搭配 `duduclaw mcp-server`。發行指令會顯示警告，HTTP Bearer 與 SSE 查詢參數驗證會拒絕並說明用途。`http-server` 請使用靜態 MCP API 金鑰或 OAuth，沿用現有驗證入口。CLI 刷新憑證不能送到 `/oauth/token` 交換；stdio 仍會逐次檢查權限、到期與撤銷狀態。
 
