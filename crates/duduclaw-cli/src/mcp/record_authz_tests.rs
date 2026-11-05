@@ -1123,10 +1123,51 @@ async fn activity_post_refuses_reserved_event_types() {
     }
 }
 
+// Process identity must not leak into concurrently running authorization tests.
+fn signed_delegation_test_child(test: &str) -> bool {
+    const CHILD: &str = "DUDUCLAW_TEST_RECORD_AUTHZ_DELEGATION_CHILD";
+    if std::env::var(CHILD).ok().as_deref() == Some(test) { return true; }
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", test, "--nocapture"]).env(CHILD, test);
+    for name in [duduclaw_core::ENV_AGENT_ID, duduclaw_core::ENV_AGENT_TOKEN,
+        duduclaw_core::ENV_DELEGATION_SENDER, duduclaw_core::ENV_DELEGATION_ORIGIN,
+        duduclaw_core::ENV_DELEGATION_DEPTH, duduclaw_core::ENV_DISPATCH_RUN_ID,
+        duduclaw_core::ENV_TASK_ID, duduclaw_core::ENV_TRUST_TURN_ID,
+        duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT,
+        duduclaw_core::identity_token::ENV_DELEGATION_AUDIT_TOKEN] {
+        command.env_remove(name);
+    }
+    assert!(command.status().unwrap().success());
+    false
+}
+
+fn install_test_worker_identity(home: &std::path::Path) -> zeroize::Zeroizing<Vec<u8>> {
+    let key = zeroize::Zeroizing::new(duduclaw_core::ensure_identity_key(home).unwrap());
+    unsafe {
+        std::env::set_var(duduclaw_core::ENV_AGENT_ID, "sales-rep");
+        std::env::set_var(duduclaw_core::ENV_AGENT_TOKEN,
+            duduclaw_core::mint_identity_token(&key, "sales-rep"));
+    }
+    key
+}
+
+fn install_test_root_delegation_context(key: &[u8], origin: &str) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let token = duduclaw_core::identity_token::mint_delegation_context(
+        key, "sales-rep", "sales-rep", origin, 0, None, now + 300,
+    ).unwrap();
+    unsafe { std::env::set_var(duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT, token); }
+}
+
 #[tokio::test]
 async fn paused_verified_caller_cannot_create_background_work_for_another_agent() {
+    if !signed_delegation_test_child(
+        "mcp::record_authz_tests::paused_verified_caller_cannot_create_background_work_for_another_agent",
+    ) { return; }
     let home = Home::new();
     let h = home.path();
+    let key = install_test_worker_identity(h);
+    install_test_root_delegation_context(&key, "sales-rep");
     let memory = SqliteMemoryEngine::new(&h.join("memory.db")).unwrap();
     let odoo: OdooState = std::sync::Arc::new(crate::odoo_pool::OdooConnectorPool::default());
     let ns = crate::mcp_namespace::NamespaceContext {
@@ -1226,6 +1267,45 @@ async fn paused_verified_caller_cannot_create_background_work_for_another_agent(
         );
     }
     assert!(h.join("bus_queue.jsonl").is_file());
+}
+
+#[tokio::test]
+async fn verified_worker_send_to_agent_requires_signed_depth_zero_context() {
+    if !signed_delegation_test_child(
+        "mcp::record_authz_tests::verified_worker_send_to_agent_requires_signed_depth_zero_context",
+    ) { return; }
+    let home = Home::new();
+    let h = home.path();
+    let key = install_test_worker_identity(h);
+    let memory = SqliteMemoryEngine::new(&h.join("memory.db")).unwrap();
+    let odoo: OdooState = std::sync::Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+    let ns = crate::mcp_namespace::NamespaceContext {
+        write_namespace: "internal/sales-rep".into(),
+        read_namespaces: vec!["internal/sales-rep".into()],
+    };
+    let quota = crate::mcp_memory_quota::DailyQuota::new();
+    let http = reqwest::Client::new();
+    let principal = audit_test_principal("sales-rep", false);
+    let params = serde_json::json!({"name": "send_to_agent", "arguments": {
+        "agent_id": "sales-rep2", "prompt": "work"
+    }});
+    let queue = duduclaw_gateway::message_queue::MessageQueue::open(h).unwrap();
+    let refused = handle_tools_call(&serde_json::json!(1), &params, h, &http, &memory,
+        "sales-rep2", &odoo, &ns, &quota, &principal, false).await;
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert!(refused["result"]["content"][0]["text"].as_str().unwrap().contains("delegation depth limit"));
+    assert!(queue.pending_messages(10).await.unwrap().is_empty());
+
+    // Signed source provenance must not replace the employee queue chain root.
+    install_test_root_delegation_context(&key, "cron");
+    let allowed = handle_tools_call(&serde_json::json!(2), &params, h, &http, &memory,
+        "sales-rep2", &odoo, &ns, &quota, &principal, false).await;
+    assert_ne!(allowed["result"]["isError"], true, "{allowed}");
+    let queued = queue.pending_messages(10).await.unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].sender_agent.as_deref(), Some("sales-rep"));
+    assert_eq!(queued[0].origin_agent.as_deref(), Some("sales-rep"));
+    assert_eq!(queued[0].delegation_depth, 1);
 }
 
 #[test]

@@ -384,12 +384,19 @@ fn delegation_employee_id(id: &str) -> bool {
     crate::is_valid_agent_id(id) && !crate::delegation_policy::is_reserved_agent_id(id)
 }
 
+/// Exact host source labels, never employee identities or authorization actors.
+pub fn is_system_delegation_origin(origin: &str) -> bool {
+    crate::SYSTEM_SENDERS.contains(&origin) || crate::RESERVED_QUEUE_SENDERS.contains(&origin)
+}
+
 impl DelegationContext {
     fn well_formed(&self) -> bool {
         self.version == 1
             && delegation_employee_id(&self.worker)
             && delegation_employee_id(&self.sender)
-            && delegation_employee_id(&self.origin)
+            && (delegation_employee_id(&self.origin)
+                || (self.depth == 0 && self.sender == self.worker
+                    && is_system_delegation_origin(&self.origin)))
             && self.depth <= crate::MAX_DELEGATION_DEPTH
             && self.run_id.as_ref().is_none_or(|id|
                 !id.is_empty() && id.len() <= 4096 && !id.contains('\0'))
@@ -1014,6 +1021,25 @@ mod tests {
         assert!(verify_delegation_context(&[9; 32], "worker", Some(&run), &token, 999).is_none());
         assert!(verify_delegation_context(&key, "worker", Some(&run),
             &mint_token(&key, "delegation-audit-v1\0worker\0sender"), 999).is_none());
+    }
+
+    #[test]
+    fn delegation_context_system_origins_are_only_self_attributed_roots() {
+        let key = key();
+        for origin in crate::SYSTEM_SENDERS.iter().chain(crate::RESERVED_QUEUE_SENDERS.iter()) {
+            let token = mint_delegation_context(&key, "worker", "worker", origin, 0, None, 1000).unwrap();
+            let context = verify_delegation_context(&key, "worker", None, &token, 999).unwrap();
+            assert_eq!(context.origin, *origin);
+            for (sender, depth) in [("worker", 1), ("other", 0)] {
+                assert!(mint_delegation_context(&key, "worker", sender, origin, depth, None, 1000).is_none());
+                let mut signed: SignedDelegationContext = serde_json::from_str(&token).unwrap();
+                signed.context.sender = sender.into();
+                signed.context.depth = depth;
+                signed.signature = mint_token(&key, &signed.context.mac_payload());
+                assert!(verify_delegation_context(&key, "worker", None,
+                    &serde_json::to_string(&signed).unwrap(), 999).is_none());
+            }
+        }
     }
 
     #[test]

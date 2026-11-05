@@ -63,7 +63,14 @@ impl DelegationContext {
     /// still run as the verified worker, but cannot start a new delegation.
     fn from_env(home: &Path, worker: &str) -> Self {
         match verified_delegation_context(home, worker) {
-            Some(context) => Self { depth: context.depth, origin: Some(context.origin) },
+            Some(context) => Self {
+                depth: context.depth,
+                // The signed root records its host source. Queue origin must
+                // remain the employee chain root for pause and lease fencing.
+                origin: Some(if duduclaw_core::identity_token::is_system_delegation_origin(&context.origin) {
+                    worker.to_string()
+                } else { context.origin }),
+            },
             None => Self { depth: duduclaw_core::MAX_DELEGATION_DEPTH, origin: None },
         }
     }

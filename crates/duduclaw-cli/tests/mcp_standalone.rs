@@ -38,15 +38,23 @@ fn init_env(home: &Path, data: &Path) -> Vec<(String, String)> {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    ["DUDUCLAW_MCP_API_KEY", duduclaw_core::ENV_AGENT_ID, duduclaw_core::ENV_AGENT_TOKEN]
-        .into_iter()
-        .map(|key| {
-            let marker = format!("{key}=");
-            let start = stdout.find(&marker).expect("credential in init output") + marker.len();
-            let value = stdout[start..].split_whitespace().next().unwrap().trim_matches('\'');
-            (key.to_string(), value.to_string())
-        })
-        .collect()
+    parse_init_env(&stdout)
+}
+
+fn parse_init_env(stdout: &str) -> Vec<(String, String)> {
+    // Print includes shell commands, TOML and JSON. Read the JSON entry so
+    // quoting, escaped paths and platform-specific shell syntax are irrelevant.
+    let json_start = stdout.split_inclusive('\n').scan(0, |offset, line| {
+        let start = *offset;
+        *offset += line.len();
+        Some((start, line))
+    }).find(|(_, line)| line.trim() == "{").expect("Cursor JSON in init output").0;
+    let config: Value = serde_json::Deserializer::from_str(&stdout[json_start..])
+        .into_iter().next().expect("Cursor JSON value").expect("valid Cursor JSON");
+    config["mcpServers"]["duduclaw"]["env"].as_object().expect("client env")
+        .iter().map(|(name, value)| {
+            (name.clone(), value.as_str().expect("string env value").to_string())
+        }).collect()
 }
 
 struct Server {
@@ -165,7 +173,8 @@ fn standalone_init_key_lists_only_callable_tools_and_round_trips() {
     std::fs::create_dir_all(&cwd).unwrap();
 
     let env = init_env(&home, &data);
-    assert!(env[0].1.starts_with("ddc_refresh_"));
+    assert!(env.iter().find(|(name, _)| name == "DUDUCLAW_MCP_API_KEY")
+        .expect("API key in init output").1.starts_with("ddc_refresh_"));
     assert!(data.join("mcp_tokens.db").is_file());
 
     let mut server = Server::start(&home, &data, &env, &cwd);

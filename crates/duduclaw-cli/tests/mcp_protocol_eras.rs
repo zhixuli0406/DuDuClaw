@@ -341,17 +341,7 @@ fn base_command(home: &Path, data: &Path) -> Command {
     cmd
 }
 
-fn server_command(home: &Path, data: &Path) -> Command {
-    // R-5 requires a host-signed identity even in an isolated test home.
-    let key = duduclaw_core::identity_token::ensure_key(data).unwrap();
-    let agent = "mcp-protocol-test";
-    let mut cmd = base_command(home, data);
-    cmd.env(duduclaw_core::ENV_AGENT_ID, agent)
-        .env(duduclaw_core::ENV_AGENT_TOKEN, duduclaw_core::mint_identity_token(&key, agent));
-    cmd
-}
-
-fn init_token(home: &Path, data: &Path) -> String {
+fn init_env(home: &Path, data: &Path) -> Vec<(String, String)> {
     let out = base_command(home, data)
         .args(["mcp", "init", "--client", "print"])
         .output()
@@ -362,14 +352,56 @@ fn init_token(home: &Path, data: &Path) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let marker = "DUDUCLAW_MCP_API_KEY=";
-    let start = stdout.find(marker).expect("key in output") + marker.len();
-    stdout[start..]
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .trim_matches('\'')
-        .to_string()
+    parse_init_env(&stdout)
+}
+
+fn parse_init_env(stdout: &str) -> Vec<(String, String)> {
+    // Print includes shell commands, TOML and JSON. Read the JSON entry so
+    // quoting, escaped paths and platform-specific shell syntax are irrelevant.
+    let json_start = stdout.split_inclusive('\n').scan(0, |offset, line| {
+        let start = *offset;
+        *offset += line.len();
+        Some((start, line))
+    }).find(|(_, line)| line.trim() == "{").expect("Cursor JSON in init output").0;
+    let config: Value = serde_json::Deserializer::from_str(&stdout[json_start..])
+        .into_iter().next().expect("Cursor JSON value").expect("valid Cursor JSON");
+    config["mcpServers"]["duduclaw"]["env"].as_object().expect("client env")
+        .iter().map(|(name, value)| {
+            (name.clone(), value.as_str().expect("string env value").to_string())
+        }).collect()
+}
+
+#[test]
+fn printed_client_env_handles_lf_crlf_and_json_escaping() {
+    let expected = json!({
+        "DUDUCLAW_MCP_API_KEY": "test-key",
+        "DUDUCLAW_AGENT_ID": "standalone-print",
+        "DUDUCLAW_AGENT_TOKEN": "signed-client-token",
+        "DUDUCLAW_HOME": "C:\\Users\\測試 user\\DuDuClaw's data",
+    });
+    let config = serde_json::to_string_pretty(&json!({
+        "mcpServers": {"duduclaw": {"env": expected}}
+    })).unwrap();
+    for newline in ["\n", "\r\n"] {
+        let output = format!("Claude command and Codex TOML\nCursor configuration:\n{config}\nAfter JSON\n")
+            .replace('\n', newline);
+        let parsed: serde_json::Map<String, Value> = parse_init_env(&output).into_iter()
+            .map(|(name, value)| (name, Value::String(value))).collect();
+        assert_eq!(Value::Object(parsed), expected);
+    }
+}
+
+fn external_server_command(home: &Path, data: &Path) -> Command {
+    let env = init_env(home, data);
+    assert!(
+        env.iter().any(|(name, _)| name == "DUDUCLAW_MCP_API_KEY"),
+        "mcp init output must include the API key"
+    );
+    let mut cmd = base_command(home, data);
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
+    cmd
 }
 
 struct Stdio_ {
@@ -380,9 +412,7 @@ struct Stdio_ {
 
 impl Stdio_ {
     fn start(home: &Path, data: &Path) -> Self {
-        let token = init_token(home, data);
-        let mut child = server_command(home, data)
-            .env("DUDUCLAW_MCP_API_KEY", token)
+        let mut child = external_server_command(home, data)
             .arg("mcp-server")
             .current_dir(data)
             .stdin(Stdio::piped())
@@ -524,15 +554,14 @@ fn stdio_legacy_initialize_negotiates_and_keeps_ping() {
     assert_eq!(s.next()["result"]["protocolVersion"], "2024-11-05");
 }
 
-fn write_key(data: &Path, scopes: &str) {
-    let created_at = chrono::Utc::now().to_rfc3339();
-    std::fs::write(
-        data.join("config.toml"),
-        format!(
-            "[mcp_keys.\"{KEY}\"]\nclient_id = \"era-client\"\nscopes = [{scopes}]\ncreated_at = \"{created_at}\"\nis_external = true\n"
-        ),
-    )
-    .unwrap();
+fn narrow_init_token_scopes(data: &Path, scopes: &str) {
+    // Keep the init-issued credential and matching reserved client identity.
+    // This isolated home contains exactly one token issued by init.
+    let db = rusqlite::Connection::open(data.join("mcp_tokens.db")).unwrap();
+    assert_eq!(db.execute(
+        "UPDATE refresh_tokens SET scopes = ?1 WHERE client_id = 'standalone-print' AND revoked_at IS NULL",
+        [scopes],
+    ).unwrap(), 1);
 }
 
 /// A modern subscriber learns about a changed tool set only through its
@@ -543,9 +572,7 @@ fn stdio_modern_subscription_receives_tagged_list_changed() {
     let (home, data) = (tmp.path().join("home"), tmp.path().join("data"));
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&data).unwrap();
-    write_key(&data, "\"memory:read\", \"memory:write\"");
-    let mut child = server_command(&home, &data)
-        .env("DUDUCLAW_MCP_API_KEY", KEY)
+    let mut child = external_server_command(&home, &data)
         .arg("mcp-server")
         .current_dir(&data)
         .stdin(Stdio::piped())
@@ -592,9 +619,8 @@ fn stdio_modern_subscription_receives_tagged_list_changed() {
         "notifications/subscriptions/acknowledged"
     );
 
-    // Narrow the key: memory_store leaves the listing.
-    std::thread::sleep(Duration::from_millis(1100)); // distinct mtime
-    write_key(&data, "\"memory:read\"");
+    // Narrow the init-issued token: memory_store leaves the listing.
+    narrow_init_token_scopes(&data, "memory:read");
     let changed =
         s.rx.recv_timeout(Duration::from_secs(20))
             .expect("a list_changed within 20s");
@@ -665,9 +691,7 @@ fn stdio_listen_refuses_when_authentication_fails() {
     let (home, data) = (tmp.path().join("home"), tmp.path().join("data"));
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&data).unwrap();
-    write_key(&data, "\"memory:read\"");
-    let mut child = server_command(&home, &data)
-        .env("DUDUCLAW_MCP_API_KEY", KEY)
+    let mut child = external_server_command(&home, &data)
         .arg("mcp-server")
         .current_dir(&data)
         .stdin(Stdio::piped())
@@ -695,8 +719,9 @@ fn stdio_listen_refuses_when_authentication_fails() {
         "params": {"_meta": modern_meta()}}),
     );
     assert_eq!(s.next()["id"], "boot");
-    std::thread::sleep(Duration::from_millis(1100));
-    std::fs::write(data.join("config.toml"), "").unwrap();
+    let tokens = duduclaw_cli::mcp_refresh::list_tokens(&data).unwrap();
+    assert_eq!(tokens.len(), 1);
+    assert!(duduclaw_cli::mcp_refresh::revoke_token(&data, &tokens[0].jti).unwrap());
     s.send(
         json!({"jsonrpc": "2.0", "id": "sub", "method": "subscriptions/listen",
         "params": {"_meta": modern_meta(), "notifications": {"toolsListChanged": true}}}),

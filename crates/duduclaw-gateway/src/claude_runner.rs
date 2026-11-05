@@ -1765,13 +1765,28 @@ pub fn delegation_context_env(home: &Path, worker: &str, timeout_secs: u64) -> V
         && !duduclaw_core::is_reserved_queue_sender(id);
     let sender = scoped.as_ref().and_then(|env| env.get(duduclaw_core::ENV_DELEGATION_SENDER))
         .filter(|id| employee(id)).cloned().unwrap_or_else(|| worker.to_string());
-    let origin = scoped.as_ref().and_then(|env| env.get(duduclaw_core::ENV_DELEGATION_ORIGIN))
-        .filter(|id| employee(id)).cloned().unwrap_or_else(|| worker.to_string());
     let depth = match scoped.as_ref() {
         Some(env) => env.get(duduclaw_core::ENV_DELEGATION_DEPTH)
             .and_then(|value| value.parse::<u8>().ok()).unwrap_or(duduclaw_core::MAX_DELEGATION_DEPTH),
         None => 0,
     };
+    // The requester is host-resolved before every channel/dashboard runtime,
+    // including local/API tool loops; never infer source from inherited env.
+    let root_source = crate::knowledge::turn_requesters::CURRENT_REQUESTER.try_with(|requester| {
+        use duduclaw_knowledge::requester::RequesterIdentity;
+        match requester {
+            RequesterIdentity::DashboardUser { .. } => Some("dashboard"),
+            RequesterIdentity::ChannelUser { .. } => Some("webhook"),
+            _ => None,
+        }
+    }).ok().flatten();
+    let origin = scoped.as_ref().and_then(|env| env.get(duduclaw_core::ENV_DELEGATION_ORIGIN))
+        .filter(|id| employee(id) || (depth == 0 && sender == worker
+            && duduclaw_core::identity_token::is_system_delegation_origin(id)))
+        .cloned().unwrap_or_else(|| {
+            if scoped.is_none() { root_source.map(str::to_string).unwrap_or_else(|| worker.to_string()) }
+            else { worker.to_string() }
+        });
     let run = crate::memory_provenance::DISPATCH_RUN.try_with(Clone::clone).ok().flatten()
         .map(|(_, run)| run);
     let task = crate::runtime::round_task_env().map(|(_, task)| task);
@@ -1854,6 +1869,58 @@ mod delegation_context_tests {
             assert_eq!(context.sender, "worker");
             assert_eq!(context.origin, "worker");
             assert_eq!(context.depth, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_and_dashboard_root_mcp_config_has_signed_delegation_context() {
+        let home = tempfile::tempdir().unwrap();
+        let key = zeroize::Zeroizing::new(duduclaw_core::identity_token::ensure_key(home.path()).unwrap());
+        let dir = home.path().join("agents/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".mcp.json"), r#"{"mcpServers":{"duduclaw":{"command":"duduclaw","args":["mcp-server"],"env":{}}}}"#).unwrap();
+        use duduclaw_knowledge::requester::RequesterIdentity;
+        for (requester, origin) in [
+            (RequesterIdentity::DashboardUser { user_id: "operator".into() }, "dashboard"),
+            (RequesterIdentity::ChannelUser { channel: "telegram".into(), chat: "123".into(),
+                sender: "person".into(), user_id: None }, "webhook"),
+        ] {
+            let (args, _guard) = crate::knowledge::turn_requesters::CURRENT_REQUESTER.scope(requester, async {
+                signed_mcp_config_cli_args(home.path(), Some(&dir), Some(&dir), None).unwrap().unwrap()
+            }).await;
+            assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
+            let config: serde_json::Value = serde_json::from_slice(&std::fs::read(&args[1]).unwrap()).unwrap();
+            let mut count = 0;
+            for (name, server) in config["mcpServers"].as_object().unwrap() {
+                if !duduclaw_core::mcp_proxy_rewrite::is_builtin_slot_name(name) { continue; }
+                let token = server["env"][ENV_DELEGATION_CONTEXT].as_str().unwrap();
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                let context = verify_delegation_context(&key, "worker", None, token, now).unwrap();
+                assert_eq!(context.depth, 0);
+                assert_eq!(context.sender, "worker");
+                assert_eq!(context.origin, origin);
+                count += 1;
+            }
+            assert!(count > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn system_root_delegation_context_retains_source_for_api_tool_loops() {
+        let home = tempfile::tempdir().unwrap();
+        let key = zeroize::Zeroizing::new(duduclaw_core::identity_token::ensure_key(home.path()).unwrap());
+        for origin in ["cron", "goal-loop-driver", "heartbeat", "workflow"] {
+            let scoped = std::collections::HashMap::from([
+                (duduclaw_core::ENV_DELEGATION_SENDER.into(), origin.into()),
+                (duduclaw_core::ENV_DELEGATION_ORIGIN.into(), origin.into()),
+                (duduclaw_core::ENV_DELEGATION_DEPTH.into(), "0".into()),
+            ]);
+            let env = DELEGATION_ENV.scope(scoped, async { mcp_client_envs_in("worker", home.path()) }).await;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let context = verify_delegation_context(&key, "worker", None, proof(&env), now).unwrap();
+            assert_eq!(context.sender, "worker");
+            assert_eq!(context.origin, origin);
+            assert_eq!(context.depth, 0);
         }
     }
 
@@ -4283,6 +4350,23 @@ fn mcp_config_cli_args(
     )))
 }
 
+/// Shared by dispatcher and channel/dashboard Claude spawns. Keep delegation
+/// proofs in the frozen built-in MCP entries, never the parent process env.
+pub(crate) fn signed_mcp_config_cli_args(
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    config_dir: Option<&Path>,
+    explicit: Option<&Path>,
+) -> Result<Option<(Vec<String>, Option<tempfile::TempPath>)>, String> {
+    let worker = config_dir.and_then(|dir| dir.file_name()).and_then(|id| id.to_str()).unwrap_or("");
+    let Some((mut args, guard)) = mcp_config_cli_args(home_dir, work_dir, explicit)? else {
+        return Ok(None);
+    };
+    let guard = bind_delegation_mcp_config(&mut args, guard,
+        || delegation_context_env(home_dir, worker, HARD_MAX_TIMEOUT_SECS))?;
+    Ok(Some((args, guard)))
+}
+
 /// Bind only the DuDuClaw entry, keeping the proof out of Claude's process
 /// env and argv. A new mode-0600 temp file never alters persistent agent config.
 fn bind_delegation_mcp_config(
@@ -4425,11 +4509,10 @@ fn prepare_claude_cmd(
     // RFC-23 §13.6: override that auto-discovery with a proxied copy when
     // the managed MCP gate runs (see `mcp_proxy_cli_args`). `None` ⇒ no flags at
     // all, auto-discovery unchanged.
-    let worker = config_dir.and_then(|d| d.file_name()).and_then(|s| s.to_str()).unwrap_or("");
-    let mcp_proxy_guard = match mcp_config_cli_args(home_dir, work_dir, identity.mcp_config)? {
-        Some((mut args, guard)) => {
-            let guard = bind_delegation_mcp_config(&mut args, guard,
-                || delegation_context_env(home_dir, worker, HARD_MAX_TIMEOUT_SECS))?;
+    let mcp_proxy_guard = match signed_mcp_config_cli_args(
+        home_dir, work_dir, config_dir, identity.mcp_config,
+    )? {
+        Some((args, guard)) => {
             cmd.args(&args);
             guard
         }
@@ -6100,7 +6183,8 @@ mod inference_shadow_flush_tests {
 mod instructions_slot_tests {
     #[tokio::test]
     async fn dispatch_profile_keeps_contract_after_skills_memory_and_wiki() {
-        let tmp = tempfile::tempdir().unwrap();
+        // The skill loader refuses symlinked ancestors, including macOS /var.
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let dir = tmp.path().join("agents").join("advisor");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -6128,7 +6212,8 @@ mod instructions_slot_tests {
         let rules = p.find("# Instructions").unwrap();
         let contract = p.find("CONTRACT-BODY").unwrap();
         for marker in ["SKILL-BODY", "MEMORY-BODY", "WIKI-BODY"] {
-            assert!(p.find(marker).unwrap() < contract, "{marker} must precede contract: {p}");
+            let position = p.find(marker).unwrap_or_else(|| panic!("missing {marker}: {p}"));
+            assert!(position < contract, "{marker} must precede contract: {p}");
         }
         assert!(p.find("Your name is").unwrap() < p.find("SOUL-BODY").unwrap());
         assert!(ident < user && user < rules && rules < contract, "{p}");
