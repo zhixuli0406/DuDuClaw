@@ -9135,9 +9135,8 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
         home_dir: home,
         allowed_origins,
         extension: Arc::new(duduclaw_gateway::NullExtension),
-        // Self-host default: resolve form-factor per-request from
-        // DUDUCLAW_EDITION env > license tier > Personal. Cloud control-plane
-        // sets the env var per managed tenant instead.
+        // Resolve per request; env/config can only narrow the verified
+        // license edition in all builds (no valid license => Personal).
         edition: None,
     };
 

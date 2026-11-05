@@ -86,7 +86,7 @@ async fn fixture() -> Fx {
         )
         .await;
     handler
-        .set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise))
+        .set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise))
         .await;
     for name in ["a1", "a2"] {
         ok(&handler

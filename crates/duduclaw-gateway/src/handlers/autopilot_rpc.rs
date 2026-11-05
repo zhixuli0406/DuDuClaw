@@ -219,7 +219,7 @@ mod tests {
             }
         }
         for edition in [duduclaw_core::EditionProfile::Personal, duduclaw_core::EditionProfile::Enterprise] {
-            f.handler.set_edition_override(Some(edition)).await;
+            f.handler.set_test_edition(Some(edition)).await;
             let frame = f.handler.handle("autopilot.breakers", json!({}), &root).await;
             assert!(matches!(frame, WsFrame::Response {ok:false, error:Some(ref e), ..}
                 if e == "Autopilot engine unavailable"), "{frame:?}");

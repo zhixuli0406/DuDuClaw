@@ -46,7 +46,7 @@ async fn fx() -> Fx {
     db.bind_agent(&viewer.id, "sales", AccessLevel::Viewer)
         .unwrap();
     let handler = MethodHandler::new(home.clone()).await;
-    handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
     let tasks = Arc::new(TaskStore::open(&home).unwrap());
     handler.set_task_store(tasks.clone()).await;
     handler

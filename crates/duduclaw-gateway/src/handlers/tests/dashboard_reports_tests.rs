@@ -8,7 +8,7 @@ async fn dashboard_picker_and_view_follow_manager_links_and_target_layout() {
         Arc::new(UserDb::new(&f.home.join("users.db")).unwrap()),
         Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!")),
     ).await;
-    f.h.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    f.h.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
     let conn = rusqlite::Connection::open(f.home.join("users.db")).unwrap();
     conn.execute("UPDATE users SET role='manager' WHERE id=?1", [&f.operator.user_id]).unwrap();
     conn.execute("UPDATE users SET manager_user_id=?1 WHERE id=?2", params![f.operator.user_id, f.owner_a.user_id]).unwrap();

@@ -1545,7 +1545,8 @@ mod tests {
             assert!(crate::mfa::boot_policy(home.path(), edition.is_personal()).unwrap());
             assert!(crate::mfa::enforced(home.path(), edition.is_personal()).unwrap());
             assert!(runtime.boot_edition(None, Some(EditionProfile::Personal)).await.is_personal());
-            assert!(!runtime.boot_edition(Some("enterprise"), Some(EditionProfile::Personal)).await.is_personal());
+            assert_eq!(runtime.boot_edition(Some("enterprise"), Some(EditionProfile::Personal)).await.is_personal(),
+                personal);
         }
     }
 

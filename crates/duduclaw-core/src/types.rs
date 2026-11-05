@@ -1272,20 +1272,18 @@ impl RuntimeType {
 /// tier (which controls which `commercial/` modules unlock) and to the
 /// CE/Pro source split.
 ///
-/// `EditionProfile` only changes **defaults and UI presentation** — it never
-/// gates a core feature (design rule "畫法 A"). A [`Personal`] deployment hides
-/// the multi-seat / audit-management surfaces by default; an [`Enterprise`]
-/// deployment shows them. Both run the exact same Apache-2.0 core.
+/// `EditionProfile` controls defaults, UI presentation and management RPC gates.
+/// A [`Personal`] deployment refuses multi-seat management surfaces; an
+/// [`Enterprise`] deployment enables them. Overrides can only narrow
+/// the edition derived from the verified license.
 ///
 /// The `Personal` profile is also the *unit of tenancy* for managed ("代管")
 /// personal hosting — a managed personal instance is the same artifact a user
 /// could self-host.
 ///
-/// Resolution precedence (see [`EditionProfile::resolve`]):
-/// `DUDUCLAW_EDITION` env  >  license tier  >  default ([`Personal`]).
-/// `resolve` also takes an explicit override between the two (the gateway's
-/// `GatewayConfig.edition`, meant for an embedding host); the shipped CLI
-/// always passes `None`, and no `agent.toml` key feeds it.
+/// Resolution: license tier (default [`Personal`]) is the ceiling.
+/// Within that ceiling, `DUDUCLAW_EDITION` precedes `GatewayConfig.edition`.
+/// The shipped CLI passes no config override, and no `agent.toml` key feeds it.
 ///
 /// [`Personal`]: EditionProfile::Personal
 /// [`Enterprise`]: EditionProfile::Enterprise
@@ -1358,25 +1356,43 @@ impl EditionProfile {
         }
     }
 
-    /// Resolve the active edition using the documented precedence:
-    /// env override > explicit override > license tier > default.
+    /// Resolve the active edition, always capped by the verified license.
+    /// Env precedes config; an elevation attempt is ignored with a warning
+    /// once per source per process, regardless of build profile or test features.
     ///
     /// - `env`: value of `DUDUCLAW_EDITION` (`None` if unset).
-    /// - `config`: an explicit override from the caller (the gateway passes
-    ///   `GatewayConfig.edition`, which the shipped CLI leaves `None`; no
-    ///   `agent.toml` key is read for it).
-    /// - `tier_key`: the active license tier's TOML key (`None` for open-source).
+    /// - `config`: `GatewayConfig.edition`; no `agent.toml` key is read.
+    /// - `tier_key`: verified license tier (`None` for no valid license).
     pub fn resolve(env: Option<&str>, config: Option<&str>, tier_key: Option<&str>) -> Self {
-        if let Some(e) = env.map(str::trim).filter(|s| !s.is_empty()) {
-            return Self::parse(e);
-        }
-        if let Some(c) = config.map(str::trim).filter(|s| !s.is_empty()) {
-            return Self::parse(c);
-        }
-        if let Some(t) = tier_key.map(str::trim).filter(|s| !s.is_empty()) {
-            return Self::from_tier_key(t);
-        }
-        Self::Personal
+        Self::resolve_with_policy(env, config, tier_key, false)
+    }
+
+    /// Explicit fixture-only elevation; never used by the production resolver.
+    #[cfg(all(feature = "test-edition-override", debug_assertions))]
+    pub fn resolve_for_test(env: Option<&str>, config: Option<&str>, tier_key: Option<&str>) -> Self {
+        Self::resolve_with_policy(env, config, tier_key, true)
+    }
+
+    fn resolve_with_policy(
+        env: Option<&str>, config: Option<&str>, tier_key: Option<&str>, allow_elevation: bool,
+    ) -> Self {
+        static ENV_ELEVATION_WARNING: std::sync::Once = std::sync::Once::new();
+        static CONFIG_ELEVATION_WARNING: std::sync::Once = std::sync::Once::new();
+        let licensed = tier_key.map(Self::from_tier_key).unwrap_or_default();
+        let narrow = |value: Option<&str>, warning: &std::sync::Once, source: &str| {
+            let requested = value.map(str::trim).filter(|s| !s.is_empty()).map(Self::parse)?;
+            if !allow_elevation && licensed.is_personal() && !requested.is_personal() {
+                warning.call_once(|| {
+                    tracing::warn!(source, "edition override exceeds the verified license; ignoring override");
+                });
+                None
+            } else {
+                Some(requested)
+            }
+        };
+        let env = narrow(env, &ENV_ELEVATION_WARNING, "DUDUCLAW_EDITION");
+        let config = narrow(config, &CONFIG_ELEVATION_WARNING, "GatewayConfig.edition");
+        env.or(config).unwrap_or(licensed)
     }
 
     /// Convenience wrapper reading `DUDUCLAW_EDITION` from the process env as
@@ -1423,6 +1439,40 @@ impl EditionProfile {
 #[cfg(test)]
 mod edition_cap_tests {
     use super::EditionProfile;
+
+    #[test]
+    fn edition_release_precedence_matrix() {
+        use EditionProfile::{Enterprise, Personal};
+        for (env, config, tier, expected) in [
+            (Some("enterprise"), None, Some("personal_pro_self_host"), Personal),
+            (Some("team"), None, Some("personal_pro_self_host"), Personal),
+            (Some("team"), None, None, Personal),
+            (Some("personal"), None, Some("business"), Personal),
+            (Some("enterprise"), None, None, Personal),
+            (None, Some("enterprise"), None, Personal),
+            (None, Some("enterprise"), Some("personal_pro_self_host"), Personal),
+            (None, Some("personal"), Some("business"), Personal),
+            (Some("enterprise"), Some("personal"), Some("business"), Enterprise),
+            (Some("personal"), Some("enterprise"), Some("business"), Personal),
+            (Some("enterprise"), Some("enterprise"), Some("invalid"), Personal),
+            (Some("team"), None, Some("business"), Personal),
+            (Some("invalid"), None, Some("business"), Personal),
+            (Some(" "), Some("personal"), Some("business"), Personal),
+            (None, None, Some("business"), Enterprise),
+            (None, None, None, Personal),
+        ] {
+            assert_eq!(EditionProfile::resolve(env, config, tier), expected,
+                "env={env:?}, config={config:?}, tier={tier:?}");
+        }
+    }
+
+    #[cfg(all(feature = "test-edition-override", debug_assertions))]
+    #[test]
+    fn edition_test_elevation_requires_explicit_api() {
+        assert_eq!(EditionProfile::resolve_for_test(Some("enterprise"), None, None), EditionProfile::Enterprise);
+        assert_eq!(EditionProfile::resolve_for_test(None, Some("enterprise"), None), EditionProfile::Enterprise);
+        assert_eq!(EditionProfile::resolve(Some("enterprise"), None, None), EditionProfile::Personal);
+    }
 
     #[test]
     fn personal_cap_default_is_unlimited() {
@@ -4891,15 +4941,14 @@ mod tests {
 
     #[test]
     fn edition_profile_resolve_precedence() {
-        // env wins over everything
+        // Production resolution never elevates, even in debug fixtures.
         assert_eq!(
             EditionProfile::resolve(Some("enterprise"), Some("personal"), Some("solo")),
-            EditionProfile::Enterprise
+            EditionProfile::Personal
         );
-        // config wins over tier when env absent
         assert_eq!(
             EditionProfile::resolve(None, Some("enterprise"), Some("solo")),
-            EditionProfile::Enterprise
+            EditionProfile::Personal
         );
         // tier used when env + config absent
         assert_eq!(

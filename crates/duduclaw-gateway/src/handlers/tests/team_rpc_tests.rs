@@ -106,7 +106,7 @@ async fn fixture(edition: duduclaw_core::EditionProfile) -> Fixture {
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     let jwt = Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"));
     handler.set_user_db(db.clone(), jwt).await;
-    handler.set_edition_override(Some(edition)).await;
+    handler.set_test_edition(Some(edition)).await;
     let store = Arc::new(TaskStore::open(home.path()).unwrap());
     handler.set_task_store(store.clone()).await;
     Fixture {

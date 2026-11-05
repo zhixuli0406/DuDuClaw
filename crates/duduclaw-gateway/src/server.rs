@@ -166,9 +166,9 @@ pub struct GatewayConfig {
     pub allowed_origins: Vec<String>,
     /// Plugin extension point. Defaults to [`NullExtension`].
     pub extension: Arc<dyn GatewayExtension>,
-    /// Explicit product form-factor override. `None` means resolve at request
-    /// time from `DUDUCLAW_EDITION` env > license tier > `Personal`. Cloud
-    /// control-plane sets `Some(..)` (or the env var) per managed tenant.
+    /// Product form-factor restriction, always capped by the verified license.
+    /// `None` resolves per request from the license and `DUDUCLAW_EDITION`.
+    /// Debug assertions never permit elevation.
     pub edition: Option<duduclaw_core::EditionProfile>,
 }
 

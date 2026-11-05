@@ -79,7 +79,7 @@ async fn fixture() -> Fixture {
     let jwt = Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"));
     handler.set_user_db(db.clone(), jwt).await;
     handler
-        .set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise))
+        .set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise))
         .await;
     Fixture { handler, db, home }
 }

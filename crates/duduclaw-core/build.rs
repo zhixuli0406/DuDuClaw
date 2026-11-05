@@ -3,6 +3,14 @@ mod installation_policy_build;
 
 fn main() {
     use std::path::{Path, PathBuf};
+    // Refuse test edition hooks in release artifacts, including releases with assertions.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TEST_EDITION_OVERRIDE");
+    println!("cargo:rerun-if-env-changed=PROFILE");
+    if std::env::var_os("CARGO_FEATURE_TEST_EDITION_OVERRIDE").is_some()
+        && std::env::var("PROFILE").as_deref() == Ok("release")
+    {
+        panic!("test-edition-override must never be enabled for release artifacts");
+    }
     println!("cargo:rerun-if-env-changed=DUDUCLAW_INSTALLATION_POLICY_PATH");
     println!("cargo:rerun-if-changed=src/installation_policy_build.rs");
     let policy = match std::env::var_os("DUDUCLAW_INSTALLATION_POLICY_PATH") {
