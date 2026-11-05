@@ -376,6 +376,20 @@ the same pipeline:
    is re-registered by the independent helper described above. Other installs
    keep graceful shutdown followed by in-process re-exec (PID preserved on
    Unix). Desktop sidecars continue to be updated and restarted by the app.
+3. Verify the new binary executes (`duduclaw version`), then replace it.
+   On Unix, staging is created exclusively in the install directory with mode
+   `0755`, flushed, and installed by one rename over the old path, followed by
+   a directory sync. A hard-link or flushed copy preserves the old binary first;
+   rollback also uses one rename. Windows uses `ReplaceFileW` with a backup,
+   then tries `MoveFileExW` with replacement and write-through. If a running
+   executable blocks both, the rename-aside fallback restores the old file on
+   a reported install failure; a crash between those moves can still leave the
+   install path empty. Rollback uses native replacement only; if blocked, it reports a retained recovery copy.
+   CLI self-update uses this same pipeline. Protected Linux service upgrades
+   and desktop updates have separate installers.
+4. Graceful shutdown, then **re-exec the new binary in-process** — the PID
+   is preserved on macOS/Linux, so launchd/systemd keep supervising, and
+   unsupervised foreground runs (npm wrapper, `duduclaw run`) restart too
 5. Open dashboard tabs show a restart banner and reload automatically
 
 Enable unattended updates:

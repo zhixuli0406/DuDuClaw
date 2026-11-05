@@ -13,7 +13,7 @@
 //! - [H5] Separate archive, binary and total decompression limits [R2:NC2]
 //! - [M1] release_notes truncated to 8 KB
 //! - [M3] Pre-release tag tolerance in semver comparison
-//! - [M4] All filesystem ops use `tokio::fs` (async)
+//! - [M4] Binary replacement runs on the blocking pool (including fsync)
 //! - [R2:NH3] Reject absolute paths, symlinks, hard links in tar/zip
 //! - [R2:NH4] Cleanup tmp on set_permissions failure
 //! - [R2:NM2] Redirect policy with URL re-validation
@@ -966,9 +966,16 @@ async fn install_archive_bytes(
     current_exe: &std::path::Path,
     exe_dir: &std::path::Path,
 ) -> Result<ApplyResult, String> {
-    // Stream into a private, exclusively created staging file; never buffer the binary.
-    let mut staged = tempfile::Builder::new().prefix(".duduclaw-update-")
-        .tempfile_in(exe_dir).map_err(|e| format!("Failed to stage binary: {e}"))?;
+    // Stream into a same-directory, exclusively created staging file; never buffer the binary.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".duduclaw-update-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o755));
+    }
+    let mut staged = builder.tempfile_in(exe_dir)
+        .map_err(|e| format!("Failed to stage binary: {e}"))?;
     extract_binary_to(archive_bytes, archive_binary_name(current_exe), staged.as_file_mut())?;
     staged.as_file().sync_all().map_err(|e| format!("Failed to sync binary: {e}"))?;
     let tmp_path = staged.into_temp_path();
@@ -1190,43 +1197,15 @@ async fn apply_update_inner(
         }
     }
 
-    // [H4] Remove old backup if it exists
-    // [R3:M3] Use OsString to avoid lossy conversion on non-UTF-8 paths
-    let mut backup_os = current_exe.as_os_str().to_owned();
-    backup_os.push(".bak");
-    let backup_path = PathBuf::from(backup_os);
-    if backup_path.exists() {
-        let _ = tokio::fs::remove_file(&backup_path).await;
-    }
-
-    // Backup current binary
-    if let Err(e) = tokio::fs::rename(current_exe, &backup_path).await {
-        return Err(format!("Failed to backup current binary: {e}"));
-    }
-
-    // Move new binary into place
-    if let Err(e) = tokio::fs::rename(tmp_path, current_exe).await {
-        warn!("Failed to install new binary, rolling back: {e}");
-        // [R3:H2] Rollback — report failure explicitly if rollback also fails
-        if let Err(rb_err) = tokio::fs::rename(&backup_path, current_exe).await {
-            tracing::error!(
-                backup = %backup_path.display(),
-                target = %current_exe.display(),
-                rollback_error = %rb_err,
-                "CRITICAL: rollback failed — binary is at backup path, manual recovery needed"
-            );
-            return Err(format!(
-                "Failed to install AND rollback failed: {e}. Binary is at: {}. Manual recovery required: {rb_err}",
-                backup_path.display()
-            ));
-        }
-        return Err(format!(
-            "Failed to install new binary (rolled back successfully): {e}"
-        ));
-    }
-
-    // [H4] Clean up backup
-    let _ = tokio::fs::remove_file(&backup_path).await;
+    // Flush permissions as well as contents, preserve the old binary, then
+    // replace the install path without first removing it on Unix.
+    let staged = tmp_path.to_path_buf();
+    let target = current_exe.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        duduclaw_core::binary_replace::replace_verified_binary(&staged, &target)
+    })
+    .await
+    .map_err(|e| format!("Binary replacement task panicked: {e}"))??;
 
     info!("Update installed successfully, restart required");
 
@@ -1277,6 +1256,39 @@ pub fn macos_launchd_restart_hint() -> Option<&'static str> {
     }
     #[cfg(not(target_os = "macos"))]
     { None }
+}
+
+#[cfg(all(test, unix))]
+mod atomic_install_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn atomic_install_replaces_verified_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("duduclaw");
+        let staged = dir.path().join("new");
+        std::fs::write(&target, b"old binary").unwrap();
+        let script = b"#!/bin/sh\necho test-version\n";
+        std::fs::write(&staged, script).unwrap();
+        let result = apply_update_inner(&staged, &target, dir.path()).await.unwrap();
+        assert!(result.success && result.needs_restart);
+        assert_eq!(std::fs::read(target).unwrap(), script);
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn atomic_install_failed_verification_keeps_old_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("duduclaw");
+        let staged = dir.path().join("new");
+        std::fs::write(&target, b"old binary").unwrap();
+        std::fs::write(&staged, b"#!/bin/sh\nexit 1\n").unwrap();
+        let error = apply_update_inner(&staged, &target, dir.path()).await.unwrap_err();
+        assert!(error.contains("verification failed"));
+        assert_eq!(std::fs::read(target).unwrap(), b"old binary");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
 }
 
 #[cfg(test)]
