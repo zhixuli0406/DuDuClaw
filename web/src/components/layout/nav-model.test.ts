@@ -578,3 +578,19 @@ describe('task navigation hidden for all roles and editions', () => {
     expect(navGroups.flatMap(group => group.items).some(item => item.to === '/foresight')).toBe(true);
   });
 });
+
+describe('employee health visibility', () => {
+  it('keeps the new page in both editions with manager access and the release badge', () => {
+    const team = navGroups.flatMap(group => group.items).find(item => item.to === '/employee-health')!;
+    const personal = personalAdvancedGroup.items.find(item => item.to === '/employee-health')!;
+    for (const entry of [team, personal]) {
+      expect(entry).toBeDefined();
+      expect(entry.newIn).toBe('1.80.0');
+      for (const isPersonal of [false, true]) {
+        expect(isVisible(entry, 'manager', isPersonal)).toBe(true);
+        expect(isVisible(entry, 'admin', isPersonal)).toBe(true);
+        expect(isVisible(entry, 'employee', isPersonal)).toBe(false);
+      }
+    }
+  });
+});

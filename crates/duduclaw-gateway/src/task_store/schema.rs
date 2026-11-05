@@ -419,6 +419,11 @@ impl TaskStore {
         .map_err(|e| format!("task timeout trigger: {e}"))?;
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_discovery_run ON tasks(discovery_run_id) WHERE discovery_run_id IS NOT NULL", [])
             .map_err(|e| format!("index discovery run: {e}"))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_employee_health ON tasks(assigned_to, goal_mode, status)",
+            [],
+        ).map_err(|e| format!("create employee health index: {e}"))?;
+
         // Index for the dispatcher's zombie scan (status + lease).
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_lease ON tasks(status, lease_expires_at)",

@@ -227,6 +227,7 @@ mod failure;
 mod failure_message;
 mod guarded;
 mod history;
+mod health;
 mod inner;
 pub mod interim;
 mod progress;

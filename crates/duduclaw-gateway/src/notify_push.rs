@@ -294,3 +294,50 @@ mod tests {
         assert_eq!(r.outcome, DeliverOutcome::Failed);
     }
 }
+
+/// Employee health is a notice, not an approval: reuse verified-user DM token
+/// resolution and quiet-hour deferral without inventing decision buttons.
+pub(crate) async fn push_health_notice(
+    home: &Path,
+    _agent_id: &str,
+    text: &str,
+    targets: Vec<(String, String)>,
+) -> Receipt {
+    let mut receipt = Receipt::empty();
+    let Ok(http) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() else { return receipt; };
+    let level = crate::notify_governance::NotifyLevel::Confirm;
+    let policy = crate::notify_governance::QuietPolicy {
+        window: crate::notify_governance::load_global_window(home),
+        tz: crate::notify_governance::NotifyTz::System,
+    };
+    for (channel, chat_id) in targets {
+        let outcome = if let Some(until) = policy.decide(level, chrono::Utc::now()) {
+            let queued = crate::notify_governance::enqueue(home, crate::notify_governance::DeferredNotice {
+                id: uuid::Uuid::new_v4().to_string(), agent_id: String::new(),
+                channel: channel.clone(), chat_id: chat_id.clone(),
+                level: level.as_str().into(), notify_type: "employee.health".into(),
+                queued_at: chrono::Utc::now().to_rfc3339(), deliver_after: until.to_rfc3339(),
+                kind: crate::notify_governance::NoticeKind::Plain, text: text.into(), link: None,
+                no_button_hint: None, decision_source: None, decision_id: None,
+            });
+            if queued { DeliverOutcome::Deferred } else { DeliverOutcome::Failed }
+        } else {
+            let tokens = crate::config_crypto::channel_dm_token_candidates(home, &channel).await;
+            let mut outcome = DeliverOutcome::Failed;
+            for token in tokens {
+                receipt.attempted += 1;
+                if crate::channel_sender::send_plain_text(home, &http, &channel, &token, &chat_id, text).await {
+                    outcome = DeliverOutcome::Sent;
+                    crate::notify_stats::record_push(home, "employee.health", level, None);
+                    break;
+                }
+            }
+            outcome
+        };
+        if receipt.delivered.is_none() && outcome != DeliverOutcome::Failed {
+            receipt.delivered = Some((channel, chat_id));
+        }
+        receipt.outcome = merge(receipt.outcome, outcome);
+    }
+    receipt
+}

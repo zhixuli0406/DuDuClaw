@@ -57,6 +57,10 @@ impl MethodHandler {
             // including a Manager's team (`agents_callable_rpc.rs`). Any
             // signed-in account, both editions.
             "agents.callable" => boxed_frame(|| self.handle_agents_callable(ctx, params)).await,
+            "agents.health" => {
+                require_manager!();
+                boxed_frame(|| self.handle_agents_health(ctx, params)).await
+            }
             "agents.status" => {
                 let _ = check_agent!(AccessLevel::Viewer);
                 boxed_frame(|| self.handle_agents_status(params)).await

@@ -71,6 +71,7 @@ pub mod workflow_draft_context;
 pub mod workflow_drafts;
 // ── D7: "every Claude account failed authentication" alarm bell ──────────
 pub mod auth_outage;
+pub(crate) mod employee_health;
 // ── WP-B: appliance-image device management (`device.*` dashboard RPCs) ──
 pub mod device;
 // ── System-settings app: `device.about` / `device.timedate*` data ─────────

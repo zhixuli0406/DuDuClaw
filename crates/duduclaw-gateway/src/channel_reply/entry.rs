@@ -208,16 +208,25 @@ pub(crate) fn check_outbound_with(text: &str, rules: &OutboundRules) -> Outbound
 /// The output guardrail (opt-in `[guardrails]`) runs first. The checks
 /// themselves live in [`check_outbound_text`]; this wrapper adds the logs,
 /// the audit row, the security event and the canned replacement.
+#[cfg(test)]
 pub(super) async fn enforce_contract(
     final_text: String,
     home_dir: &std::path::Path,
     agent_id: &str,
 ) -> String {
+    enforce_contract_with_status(final_text, home_dir, agent_id).await.0
+}
+
+pub(super) async fn enforce_contract_with_status(
+    final_text: String,
+    home_dir: &std::path::Path,
+    agent_id: &str,
+) -> (String, bool) {
     match check_outbound_text(&final_text, home_dir, agent_id) {
-        OutboundVerdict::Allow => final_text,
+        OutboundVerdict::Allow => (final_text, false),
         OutboundVerdict::Redacted(t) => {
             warn!(agent = %agent_id, "guardrail redacted PII in outgoing reply");
-            t
+            (t, false)
         }
         OutboundVerdict::Blocked(block) => {
             match &block {
@@ -236,10 +245,11 @@ pub(super) async fn enforce_contract(
             );
             // C1 producer 甲 companion — see `security_autopilot.rs`.
             crate::security_autopilot::emit_contract_violation(agent_id);
-            match block {
+            let refusal = match block {
                 OutboundBlock::Guardrail(_) => crate::guardrail::blocked_reply(),
                 OutboundBlock::Contract(_) => CONTRACT_BLOCK_MESSAGE.to_string(),
-            }
+            };
+            (refusal, true)
         }
     }
 }
