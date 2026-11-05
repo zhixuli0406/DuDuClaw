@@ -11,7 +11,7 @@ mod migrate;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[path = "protected_linux_runtime.rs"]
-mod runtime;
+pub(crate) mod runtime;
 
 #[path = "protected_linux_policy.rs"]
 pub(crate) mod policy;

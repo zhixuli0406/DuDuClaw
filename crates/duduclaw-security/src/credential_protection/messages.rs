@@ -175,7 +175,7 @@ pub(super) fn recovery_detail(
     }
     if currently_refused {
         text.push_str(match status.recovery.as_str() {
-            "unit_upgrade_required" => " 尚未安裝可驗證的服務啟動上限，因此不會自動重啟。請由管理者執行 service upgrade --protected-linux，更新受保護服務後再試。",
+            "unit_upgrade_required" => " 尚未安裝可驗證的服務啟動上限，因此不會自動重啟。請由管理者執行 sudo /opt/duduclaw/bin/duduclaw service install --protected-linux，重新安裝受保護服務單元後再試。",
             "disabled" => " 自動恢復已關閉；排除原因後，請由管理者重新啟動受保護服務。",
             "waiting" | "monitoring" => " 每分鐘重新檢查，連續三次通過後會重新啟動服務，重新執行完整金鑰交接檢查。",
             "budget_exhausted" => " 已用完每小時四次自動重啟的建議額度；系統服務管理員另限制每小時的啟動總數，一般故障重啟也會計入。達到系統限制後，請由管理者確認環境並重新啟動。",
