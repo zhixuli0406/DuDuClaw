@@ -421,6 +421,8 @@ export const navGroups: NavGroup[] = [
       { to: '/me/account', icon: KeyRound, label: 'nav.account', desc: 'nav.account.desc', ownScope: true, newIn: '1.78.0' },
       { to: '/my/history-views', icon: Eye, label: 'nav.myHistoryViews', desc: 'nav.myHistoryViews.desc', ownScope: true, enterprise: true, newIn: '1.76.0' },
       manageEntry,
+      { to: '/app/system/settings/company', icon: Building2, label: 'companyInfo.title', desc: 'companyInfo.description', minRole: 'admin', newIn: '1.80.0' },
+      { to: '/app/system/settings/advanced', icon: Settings, label: 'advancedSettings.title', desc: 'advancedSettings.description', minRole: 'admin', newIn: '1.80.0' },
       // 關於 — brand info + fixed upstream-vendor block. Open to every user.
       { to: '/about', icon: Info, label: 'nav.about', desc: 'nav.about.desc' },
     ],
@@ -773,12 +775,10 @@ export function crumbsFor(pathname: string): Array<{ labelId: string; to?: strin
   // just points here now), `device` lives in `navGroups` instead (it was
   // never a 管理 row). Check both so every migrated page still gets a trail
   // instead of silently falling through to the empty-array default below.
-  if (pathname.startsWith('/app/system')) {
-    const fromManage = allManageNav.find((i) => pathname.startsWith(i.to));
-    const fromNav = navGroups
-      .flatMap((g) => g.items)
-      .find((i) => i.to !== '/' && pathname.startsWith(i.to));
-    const item = fromManage ?? fromNav;
+  if (pathname === '/app/system' || pathname.startsWith('/app/system/')) {
+    const item = [...allManageNav, ...navGroups.flatMap((g) => g.items)]
+      .filter((entry) => pathname === entry.to || pathname.startsWith(`${entry.to}/`))
+      .sort((a, b) => b.to.length - a.to.length)[0];
     return [
       { labelId: 'app.system.name', to: '/app/system' },
       ...(item ? [{ labelId: item.crumb ?? item.label }] : []),

@@ -1,3 +1,4 @@
+import { useCompanyStore } from '@/stores/company-store';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -40,6 +41,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   useBrandStore.setState({ brand: null });
+  useCompanyStore.getState().setCompany(null);
   useAuthStore.setState({
     user: { display_name: 'Boss', role: 'admin' } as never,
     bindings: [],
@@ -53,6 +55,24 @@ beforeEach(() => {
 });
 
 describe('AppSidebar (Multica shell)', () => {
+  it('shows the company identity while preserving the distributor fallback', () => {
+    useBrandStore.getState().setBrand({ product_name: 'Partner Desk', logo_light: 'data:image/png;base64,iVBORw0KGgo=' });
+    const logo = `/api/company/logo/${'a'.repeat(64)}.png`;
+    useCompanyStore.getState().setCompany({ name: 'Acme Team', logo_url: logo });
+    renderSidebar();
+    expect(screen.getByRole('img', { name: 'Acme Team' })).toHaveAttribute('src', logo);
+    expect(screen.getByText('Acme Team')).toBeInTheDocument();
+    expect(screen.queryByText('Partner Desk')).toBeNull();
+  });
+
+  it('uses the distributor logo when no customer logo is configured', () => {
+    const logo = 'data:image/png;base64,iVBORw0KGgo=';
+    useBrandStore.getState().setBrand({ product_name: 'Partner Desk', logo_light: logo });
+    renderSidebar();
+    expect(screen.getByRole('img', { name: 'Partner Desk' })).toHaveAttribute('src', logo);
+    expect(screen.getByText('Partner Desk')).toBeInTheDocument();
+  });
+
   // Multica IA (spec §5.1): flat daily row + 工作 / 公司 / 設定 groups + a live
   // 員工 zone. Home is the single spine.
   it('renders the flat daily items and the three collapsible group labels', () => {
@@ -315,6 +335,7 @@ describe('employee sidebar', () => {
     useSystemStore.setState({ status: { edition_profile: 'enterprise', version: '1.79.0' } as never });
     useAuthStore.setState({ user: { id: 'employee', display_name: 'Alice', role: 'employee', email: 'alice@example.com', department: 'Sales' } as never });
     useBrandStore.setState({ brand: null });
+  useCompanyStore.getState().setCompany(null);
     vi.spyOn(api.personalGoogle, 'status').mockRejectedValue(new Error('offline'));
   });
 

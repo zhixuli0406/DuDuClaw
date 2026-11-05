@@ -141,6 +141,7 @@ mod widgets_custom;
 mod departments_rpc;
 mod users_rpc;
 mod user_invites_rpc;
+pub(crate) mod company_rpc;
 mod users_org;
 mod team_rpc;
 pub(crate) mod live_context;
@@ -538,6 +539,18 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return self.dispatch_org(method, params, ctx, conn).await;
+        }
+
+        // Customer identity is gateway-owned; extensions never intercept uploads.
+        if method.split('.').next() == Some("company") {
+            let Some(role) = company_rpc::minimum_role(method) else {
+                return WsFrame::error_response("", "不支援此公司資訊操作。");
+            };
+            if let Err(e) = acl::require_role(ctx, role) {
+                company_rpc::audit(&self.home_dir, &ctx.user_id, method, "refused");
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.handle_company(method, params, ctx)).await;
         }
 
         // Invitations are gateway-owned authentication methods. An extension

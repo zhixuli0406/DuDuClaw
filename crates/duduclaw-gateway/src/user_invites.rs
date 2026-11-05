@@ -66,18 +66,57 @@ pub(crate) async fn send(home: &Path, to: &str, link: &str) -> Value {
     if !crate::mail::is_plausible_address(to) || !crate::mail::address_allowed(to, &policy.allowed_recipients) {
         return delivery_payload(false, "mail_recipient_refused", link);
     }
-    let brand = crate::distributor_brand::product_name();
-    let subject = format!("邀請您加入 {brand}");
-    let plain = format!("您受邀加入 {brand}。\n請透過邀請連結設定密碼，再使用一般登入流程登入。\n{link}\n連結有效期限為 7 天，僅能使用一次。\n如果您未預期收到這封信，請忽略。");
-    let html = format!("<p>您受邀加入 {}。</p><p>請透過邀請連結設定密碼，再使用一般登入流程登入。</p><p><a href=\"{}\">設定密碼</a></p><p>連結有效期限為 7 天，僅能使用一次。</p><p>如果您未預期收到這封信，請忽略。</p>", escape_html(&brand), escape_html(link));
+    let (subject, plain, html) = invitation_content(home, link);
     let sent = matches!(tokio::time::timeout(std::time::Duration::from_secs(30),
         crate::email::send_email_alternative(&cfg, to, &subject, &plain, &html)).await, Ok(Ok(())));
     delivery_payload(sent, "mail_send_failed", link)
 }
 
+fn invitation_content(home: &Path, link: &str) -> (String, String, String) {
+    let company = crate::company_info::read(home).unwrap_or_default();
+    let brand = if company.name.is_empty() { crate::distributor_brand::product_name() } else { company.name };
+    let logo = company.logo_url.and_then(|path| {
+        // Only a server-built content-addressed path on the invitation's own
+        // operator-approved origin is embedded; no uploaded URL is accepted.
+        let base = reqwest::Url::parse(link).ok()?;
+        let relative = path.strip_prefix('/').unwrap_or(&path);
+        let url = base.join(relative).ok()?;
+        (url.origin() == base.origin()).then(|| format!(
+            "<p><img src=\"{}\" alt=\"{}\" width=\"64\" height=\"64\"></p>",
+            escape_html(url.as_str()), escape_html(&brand),
+        ))
+    }).unwrap_or_default();
+    let subject = format!("邀請您加入 {brand}");
+    let plain = format!("您受邀加入 {brand}。\n請透過邀請連結設定密碼，再使用一般登入流程登入。\n{link}\n連結有效期限為 7 天，僅能使用一次。\n如果您未預期收到這封信，請忽略。");
+    let html = format!("{logo}<p>您受邀加入 {}。</p><p>請透過邀請連結設定密碼，再使用一般登入流程登入。</p><p><a href=\"{}\">設定密碼</a></p><p>連結有效期限為 7 天，僅能使用一次。</p><p>如果您未預期收到這封信，請忽略。</p>", escape_html(&brand), escape_html(link));
+    (subject, plain, html)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invitation_customer_name_is_escaped_and_logo_uses_own_origin() {
+        let home = tempfile::tempdir().unwrap();
+        let link = "https://trusted.test/invite#secret";
+        let (subject, _, html) = invitation_content(home.path(), link);
+        assert_eq!(subject, format!("邀請您加入 {}", crate::distributor_brand::product_name()));
+        assert!(!html.contains("<img"));
+        let hash = "a".repeat(64);
+        std::fs::write(home.path().join("config.toml"), format!(
+            "[company]\nname = '<script>範例 & 公司</script>'\nlogo_hash = '{hash}'\n",
+        )).unwrap();
+        let (subject, plain, html) = invitation_content(home.path(), link);
+        assert!(subject.contains("範例"));
+        assert!(plain.contains(link));
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;範例 &amp; 公司&lt;/script&gt;"));
+        assert!(html.contains(&format!("https://trusted.test/api/company/logo/{hash}.png")));
+        assert_eq!(html.matches("#secret").count(), 1);
+        let (_, _, html) = invitation_content(home.path(), "https://trusted.test/agents/invite#secret");
+        assert!(html.contains(&format!("https://trusted.test/agents/api/company/logo/{hash}.png")));
+        assert!(!html.contains("https://trusted.test/api/company/logo/"));
+    }
     #[test]
     fn explicit_url_only_never_headers() {
         assert_eq!(public_base_url(Some("https://trusted.test/"), Some("https://forged.test")), Ok("https://trusted.test".into()));

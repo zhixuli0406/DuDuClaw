@@ -42,7 +42,7 @@ export function OrgHistorySettings() {
       {settings && <Switch aria-labelledby="team-history-setting-label" checked={settings.manager_team_history} disabled={busy} onCheckedChange={enabled => void update(enabled)} />}
     </div>
     <p className="text-xs text-muted-foreground">{text('settings.notice')}</p>
-    <Link className="text-sm text-brand underline underline-offset-2" to="/app/system/settings?tab=redaction">{text('settings.detection')}</Link>
+    <Link className="text-sm text-brand underline underline-offset-2" to="/app/system/settings/advanced#redaction">{text('settings.detection')}</Link>
     {error && <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">{text('unavailable')}<Button variant="outline" size="sm" onClick={() => setRevision(n => n + 1)}>{text('refresh')}</Button></div>}
   </section>;
 }

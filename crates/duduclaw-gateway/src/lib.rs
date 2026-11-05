@@ -656,6 +656,7 @@ mod egress_registry;
 pub(crate) mod live_events;
 
 pub(crate) mod user_invites;
+pub(crate) mod company_info;
 
 /// Gateway-owned meeting transcription execution.
 pub mod meeting_transcription;
