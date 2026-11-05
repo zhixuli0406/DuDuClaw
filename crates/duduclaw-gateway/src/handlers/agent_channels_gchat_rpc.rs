@@ -18,7 +18,7 @@ impl MethodHandler {
             return WsFrame::error_response("", &e);
         }
         if let Some(fields) = params.as_object() {
-            if let Err(error) = googlechat_config::validate_fields(fields.keys().map(String::as_str), &["agent_id", "project_number", "service_account_json"]) {
+            if let Err(error) = googlechat_config::validate_fields(fields.keys().map(String::as_str), &["agent_id", "project_number", "service_account_json", "connection", "pubsub_subscription"]) {
                 return WsFrame::error_response("", &error);
             }
         }
@@ -42,11 +42,37 @@ impl MethodHandler {
             .filter(|s| !s.is_empty());
         // Bind lock covers the stored key snapshot, validation and final write.
         let _bind = agent_channels::binding_lock().await;
+        let stored = store::agent_chat_app(&self.home_dir, agent_id).await;
+        let connection = match params.get("connection") {
+            Some(Value::String(s)) => s.clone(),
+            Some(_) => return WsFrame::error_response("", "connection must be a string"),
+            None => stored.as_ref().map(|s| s.connection.clone()).unwrap_or_else(|| "http".into()),
+        };
+        let subscription = match params.get("pubsub_subscription") {
+            Some(Value::String(s)) => s.clone(),
+            Some(_) => return WsFrame::error_response("", "pubsub_subscription must be a string"),
+            None => stored.as_ref().map(|s| s.pubsub_subscription.clone()).unwrap_or_default(),
+        };
+        let candidate = raw_key.or_else(|| stored.as_ref().map(|s| s.service_account.expose())).unwrap_or("");
+        if let Err(e) = googlechat_config::validate_connection(&connection, &subscription, candidate) {
+            return WsFrame::error_response("", &e);
+        }
+        if raw_key.is_some() || stored.as_ref().is_some_and(|s| s.connection != connection) {
+            if let Err(e) = crate::googlechat::verify_import_key(candidate, connection == "pubsub").await {
+                return WsFrame::error_response("", &e);
+            }
+        }
+        // Recheck even when only the subscription changes (or the key is kept).
+        if connection == "pubsub" {
+            let Some(creds) = crate::googlechat::GoogleChatCreds::candidate(candidate) else {
+                return WsFrame::error_response("", "服務帳戶金鑰格式不正確。");
+            };
+            if let Err(e) = googlechat_config::verify_subscription(&creds, candidate, &subscription).await {
+                return WsFrame::error_response("", &e);
+            }
+        }
         let sa_enc = match raw_key {
             Some(json) => {
-                if let Err(e) = crate::googlechat::verify_import_key(json).await {
-                    return WsFrame::error_response("", &e);
-                }
                 if let Err(e) = googlechat_config::validate_service_account_json(json) {
                     return WsFrame::error_response("", &e);
                 }
@@ -86,7 +112,8 @@ impl MethodHandler {
                 Some(live),
                 Some(session),
                 move |t| {
-                    store::apply_googlechat(t, &project_for_write, sa_enc.as_deref())
+                    store::apply_googlechat(t, &project_for_write, sa_enc.as_deref())?;
+                    store::apply_googlechat_transport(t, &connection, &subscription)
                 },
             )
             .await

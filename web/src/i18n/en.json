@@ -9785,5 +9785,9 @@
   "meeting.state.cancelled": "Cancelled",
   "meeting.sizeError": "Choose a non-empty recording within the file size limit.",
   "meeting.requestFailed": "Unable to complete the request. Try again shortly; uploaded parts are retained.",
-  "meeting.fileChanged": "This file differs from the earlier upload. Select the original file, or rename it to start a new upload."
+  "meeting.fileChanged": "This file differs from the earlier upload. Select the original file, or rename it to start a new upload.",
+  "googlechat.setup.connection": "Connection type",
+  "googlechat.setup.pubsubHint": "Pub/Sub needs no public URL. DuDuClaw re-reads every message from Google Chat before processing its content and sender. Google Chat dialogs are not supported.",
+  "googlechat.setup.subscription": "Full Pub/Sub subscription name",
+  "googlechat.setup.topicFromScript": "Use the topic name printed by the setup script"
 }

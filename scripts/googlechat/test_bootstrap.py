@@ -23,6 +23,59 @@ class BootstrapTests(unittest.TestCase):
             self.assertIn('Authentication Audience: Project number', result.stdout)
             self.assertFalse(out.exists())
 
+    def test_pubsub_dry_run_needs_no_endpoint_or_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / 'never-created'
+            result = self.run_script('--dry-run', '--connection', 'pubsub', '--project-id', 'demo-chat-123', '--out', str(out))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('services enable chat.googleapis.com pubsub.googleapis.com', result.stdout)
+            self.assertIn('Cloud Pub/Sub topic: projects/demo-chat-123/topics/duduclaw-chat-events', result.stdout)
+            self.assertIn('--connection pubsub --subscription projects/demo-chat-123/subscriptions/duduclaw-chat-events-sub', result.stdout)
+            self.assertIn('chat.bot', result.stdout)
+            self.assertNotIn('HTTP endpoint URL:', result.stdout)
+            self.assertFalse(out.exists())
+
+    def test_pubsub_resource_validation_precedes_key_creation(self):
+        for failure in ['', 'topic', 'grant']:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as td:
+                env = self.fake_environment(td, failure)
+                out = Path(td)/'output'
+                result = self.run_script('--connection', 'pubsub', '--project-id', 'demo-chat-123', '--out', str(out), env=env)
+                calls = [json.loads(x) for x in Path(env['GCLOUD_TEST_LOG']).read_text().splitlines()]
+                keys = [i for i, c in enumerate(calls) if c[:4] == ['iam', 'service-accounts', 'keys', 'create']]
+                self.assertFalse(any(c[:4] == ['iam', 'service-accounts', 'keys', 'delete'] for c in calls))
+                self.assertFalse(any(c[:3] == ['pubsub', 'subscriptions', 'update'] for c in calls))
+                if failure:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(keys)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(keys, [len(calls) - 1])
+                    summary = json.loads((out/'bootstrap-result.json').read_text())
+                    self.assertEqual(summary['connection'], 'pubsub')
+                    self.assertEqual(summary['subscription'], 'projects/demo-chat-123/subscriptions/duduclaw-chat-events-sub')
+                    self.assertEqual(summary['key_id'], 'a'*40)
+
+    def test_pubsub_failure_only_prints_revocation_and_preserves_key(self):
+        for failure in ['result', 'install', 'chmod', 'partial']:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as td:
+                env = self.fake_environment(td, failure)
+                out = Path(td)/'output'
+                if failure == 'result':
+                    out.mkdir(mode=0o700)
+                    (out/'bootstrap-result.json').mkdir()
+                if failure in ['install', 'chmod']:
+                    command = Path(td)/'bin'/('ln' if failure == 'install' else 'chmod')
+                    command.write_text('#!/bin/sh\nexit 1\n')
+                    command.chmod(0o700)
+                result = self.run_script('--connection', 'pubsub', '--project-id', 'demo-chat-123', '--out', str(out), env=env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('gcloud iam service-accounts keys delete', result.stderr)
+                self.assertIn('Key file retained for manual recovery:', result.stderr)
+                self.assertTrue((out/'service-account.json').exists() or list(out.glob('.bootstrap.*/key.json')))
+                calls = [json.loads(x) for x in Path(env['GCLOUD_TEST_LOG']).read_text().splitlines()]
+                self.assertFalse(any(c[:4] == ['iam', 'service-accounts', 'keys', 'delete'] for c in calls))
+
     def test_http_agent_dry_run_preserves_literal_name(self):
         result = self.run_script('--dry-run', '--project-id', 'demo-chat-123', '--endpoint-url',
                                  'https://chat.example.com/webhook/googlechat/agents/alice',
@@ -73,6 +126,11 @@ elif args[:2] == ['projects', 'describe']:
 elif args[:2] == ['projects', 'create']: pathlib.Path(os.environ['GCLOUD_TEST_LOG']+'.created').touch()
 elif args[:2] == ['projects', 'get-iam-policy']:
     print(json.dumps({'bindings': [{'role': 'roles/owner', 'members': ['user:operator@example.com']}] if os.environ.get('FAIL') != 'owner' else []}))
+elif args[:3] == ['pubsub', 'topics', 'describe']: sys.exit(1)
+elif args[:3] == ['pubsub', 'subscriptions', 'describe']:
+    if os.environ.get('FAIL') == 'topic': print('projects/other-project/topics/other')
+    else: sys.exit(1)
+elif args[:3] == ['pubsub', 'subscriptions', 'add-iam-policy-binding'] and os.environ.get('FAIL') == 'grant': sys.exit(1)
 elif args[:3] == ['iam', 'service-accounts', 'describe']: sys.exit(1)
 elif args[:4] == ['iam', 'service-accounts', 'keys', 'create']:
     if os.environ.get('FAIL') == 'key':

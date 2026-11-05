@@ -3297,14 +3297,17 @@ pub struct DingTalkChannelConfig {
 
 /// Per-agent Google Chat channel settings.
 ///
-/// The Chat app is configured in the Google Cloud console with an HTTP
-/// endpoint URL pointing at `POST /webhook/googlechat`. Inbound requests
+/// The Chat app uses an HTTP endpoint or a Pub/Sub pull subscription.
+/// HTTP requests to `POST /webhook/googlechat`
 /// carry a JWT issued by `chat@system.gserviceaccount.com` whose audience
 /// is the Cloud **project number**. Outbound (async) sends authenticate
-/// with a service-account key (scope `chat.bot`).
+/// with a service-account key (scope `chat.bot`). Pub/Sub notifications are
+/// re-read through the Chat API before the sender and content are trusted.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GoogleChatChannelConfig {
+    pub connection: String,
+    pub pubsub_subscription: String,
     /// Google Cloud project number (JWT audience for inbound verification).
     pub project_number: String,
     /// Service-account JSON key (full JSON content, encrypted at rest).
@@ -3314,20 +3317,33 @@ pub struct GoogleChatChannelConfig {
 
 impl<'de> Deserialize<'de> for GoogleChatChannelConfig {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Default, Deserialize)]
+        #[derive(Deserialize)]
         #[serde(default)]
         struct Fields {
+            #[serde(default = "default_googlechat_connection")]
+            connection: String,
+            pubsub_subscription: String,
             project_number: String,
             service_account_json: String,
             service_account_json_enc: Option<String>,
             #[serde(flatten)]
             unknown: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
         }
+        impl Default for Fields {
+            fn default() -> Self {
+                Self { connection: default_googlechat_connection(), pubsub_subscription: String::new(), project_number: String::new(), service_account_json: String::new(), service_account_json_enc: None, unknown: Default::default() }
+            }
+        }
         let fields = Fields::deserialize(deserializer)?;
         if let Some(field) = fields.unknown.keys().next() {
             return Err(serde::de::Error::custom(format!("Google Chat 設定包含不支援的欄位「{field}」，請移除後再試。")));
         }
+        if !matches!(fields.connection.as_str(), "http" | "pubsub") {
+            return Err(serde::de::Error::custom("Google Chat 連線類型必須是 http 或 pubsub。"));
+        }
         Ok(Self {
+            connection: fields.connection,
+            pubsub_subscription: fields.pubsub_subscription,
             project_number: fields.project_number,
             service_account_json: fields.service_account_json,
             service_account_json_enc: fields.service_account_json_enc,
@@ -3335,9 +3351,37 @@ impl<'de> Deserialize<'de> for GoogleChatChannelConfig {
     }
 }
 
+fn default_googlechat_connection() -> String { "http".into() }
+
 impl Default for GoogleChatChannelConfig {
     fn default() -> Self {
-        Self { project_number: String::new(), service_account_json: String::new(), service_account_json_enc: None }
+        Self { connection: default_googlechat_connection(), pubsub_subscription: String::new(), project_number: String::new(), service_account_json: String::new(), service_account_json_enc: None }
+    }
+}
+
+#[cfg(test)]
+mod googlechat_config_tests {
+    use super::GoogleChatChannelConfig;
+
+    #[test]
+    fn googlechat_transport_config_defaults_and_roundtrips() {
+        let http: GoogleChatChannelConfig = toml::from_str("project_number = \"123456789\"").unwrap();
+        assert_eq!(http.connection, "http");
+        assert!(http.pubsub_subscription.is_empty());
+        let raw = "connection = \"pubsub\"\npubsub_subscription = \"projects/test-project/subscriptions/chat-events\"";
+        let config: GoogleChatChannelConfig = toml::from_str(raw).unwrap();
+        let roundtrip: GoogleChatChannelConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(roundtrip.connection, "pubsub");
+        assert_eq!(roundtrip.pubsub_subscription, config.pubsub_subscription);
+    }
+
+    #[test]
+    fn googlechat_transport_config_refuses_unknown_fields_modes_and_wrong_types() {
+        for raw in ["connection = \"other\"", "connection = 123", "pubsub_subscription = false", "unknown = \"value\""] {
+            assert!(toml::from_str::<GoogleChatChannelConfig>(raw).is_err(), "{raw}");
+        }
+        let error = toml::from_str::<GoogleChatChannelConfig>("unknown = \"value\"").unwrap_err();
+        assert!(error.to_string().contains("不支援的欄位「unknown」"));
     }
 }
 

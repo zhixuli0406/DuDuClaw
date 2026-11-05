@@ -132,6 +132,8 @@ pub mod google_personal;
 pub mod google_service_account;
 pub mod google_workspace;
 pub mod googlechat;
+pub mod googlechat_pubsub;
+mod googlechat_inbox;
 pub mod googlechat_agents;
 pub mod killswitch_triggers;
 pub mod markdown_render;

@@ -9785,5 +9785,9 @@
   "meeting.state.cancelled": "已取消",
   "meeting.sizeError": "請選擇未超過大小上限的非空錄音或影片。",
   "meeting.requestFailed": "目前無法完成，請稍後再試；已上傳的部分會保留。",
-  "meeting.fileChanged": "檔案內容與先前上傳的版本不同，請使用原始檔案或更名後重新上傳。"
+  "meeting.fileChanged": "檔案內容與先前上傳的版本不同，請使用原始檔案或更名後重新上傳。",
+  "googlechat.setup.connection": "連線方式",
+  "googlechat.setup.pubsubHint": "Pub/Sub 不需要公開網址；DuDuClaw 會向 Google Chat 重新讀取每則訊息，再處理內容與傳送者身分。不支援 Google Chat 對話方塊。",
+  "googlechat.setup.subscription": "Pub/Sub 訂閱完整名稱",
+  "googlechat.setup.topicFromScript": "請使用設定腳本輸出的主題名稱"
 }

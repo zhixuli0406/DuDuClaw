@@ -9785,5 +9785,9 @@
   "meeting.state.cancelled": "取り消しました",
   "meeting.sizeError": "上限以内の空でない録音や動画を選んでください。",
   "meeting.requestFailed": "処理を完了できませんでした。しばらくして再試行してください。送信済みの部分は保持されます。",
-  "meeting.fileChanged": "以前アップロードしたファイルと内容が異なります。元のファイルを選ぶか、名前を変更して新しく送信してください。"
+  "meeting.fileChanged": "以前アップロードしたファイルと内容が異なります。元のファイルを選ぶか、名前を変更して新しく送信してください。",
+  "googlechat.setup.connection": "接続方法",
+  "googlechat.setup.pubsubHint": "Pub/Sub は公開 URL が不要です。DuDuClaw は Google Chat から各メッセージを再取得し、本文と送信者を確認して処理します。Google Chat のダイアログには対応していません。",
+  "googlechat.setup.subscription": "Pub/Sub サブスクリプションの完全名",
+  "googlechat.setup.topicFromScript": "設定スクリプトが表示するトピック名を使用してください"
 }

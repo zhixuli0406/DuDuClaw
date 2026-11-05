@@ -45,10 +45,17 @@ impl MethodHandler {
         };
         let token = token.as_str();
 
+        let gc_connection = config_obj.get("connection").and_then(Value::as_str).unwrap_or("http");
+        let gc_subscription = config_obj.get("pubsub_subscription").and_then(Value::as_str).unwrap_or("");
         if channel_type == "googlechat" {
             if let Some(fields) = config_obj.as_object() {
-                if let Err(error) = crate::agent_channels::googlechat_config::validate_fields(fields.keys().map(String::as_str), &["token", "secret"]) {
+                if let Err(error) = crate::agent_channels::googlechat_config::validate_fields(fields.keys().map(String::as_str), &["token", "secret", "connection", "pubsub_subscription"]) {
                     return WsFrame::error_response("", &error);
+                }
+            }
+            for field in ["connection", "pubsub_subscription"] {
+                if config_obj.get(field).is_some_and(|v| !v.is_string()) {
+                    return WsFrame::error_response("", &format!("{field} must be a string"));
                 }
             }
             // Preserve external secret references: validate their resolved
@@ -58,8 +65,19 @@ impl MethodHandler {
                 Some(key) => key,
                 None => return WsFrame::error_response("", "無法讀取 Google Chat 服務帳戶金鑰。"),
             };
-            if let Err(e) = crate::googlechat::verify_import_key(candidate.expose()).await {
+            if let Err(e) = crate::agent_channels::googlechat_config::validate_connection(gc_connection, gc_subscription, candidate.expose()) {
                 return WsFrame::error_response("", &e);
+            }
+            if let Err(e) = crate::googlechat::verify_import_key(candidate.expose(), gc_connection == "pubsub").await {
+                return WsFrame::error_response("", &e);
+            }
+            if gc_connection == "pubsub" {
+                let Some(creds) = crate::googlechat::GoogleChatCreds::candidate(candidate.expose()) else {
+                    return WsFrame::error_response("", "服務帳戶金鑰格式不正確。");
+                };
+                if let Err(e) = crate::agent_channels::googlechat_config::verify_subscription(&creds, candidate.expose(), gc_subscription).await {
+                    return WsFrame::error_response("", &e);
+                }
             }
         }
 
@@ -268,6 +286,11 @@ impl MethodHandler {
             }
         };
 
+        if channel_type == "googlechat" {
+            channels.insert("googlechat_connection".into(), toml::Value::String(gc_connection.into()));
+            channels.insert("googlechat_pubsub_subscription".into(), toml::Value::String(gc_subscription.into()));
+        }
+
         // MED-B (extended to all channels, 2026-07 nit sweep): secrets never
         // persist a plaintext copy when encryption succeeds. Every read path
         // (`config_crypto::read_encrypted_config_field` / `decrypt_config_field`,
@@ -424,7 +447,33 @@ mod googlechat_import_tests {
     use crate::agent_channels::e2e_gchat_tests;
 
     #[tokio::test]
-    async fn googlechat_import_validates_candidate_and_commits_encrypted_key() {
+    async fn googlechat_http_import_preserves_legacy_and_explicit_mode() {
+        for explicit_http in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let fake = e2e_gchat_tests::start_fake().await;
+            let email = format!("http-import-{}@test-project.iam.gserviceaccount.com", uuid::Uuid::new_v4().simple());
+            let raw_key = e2e_gchat_tests::service_account(&fake, &email);
+            let handler = MethodHandler::new(home.path().to_path_buf()).await;
+            let mut params = json!({"type":"googlechat", "config":{"token":raw_key,"secret":"123456789"}});
+            if explicit_http {
+                params["config"]["connection"] = json!("http");
+                params["config"]["pubsub_subscription"] = json!("");
+            }
+            let result = handler.handle_channels_add(params).await;
+            assert!(matches!(result, WsFrame::Response { ok: true, .. }), "{result:?}");
+            let stored = tokio::fs::read_to_string(home.path().join("config.toml")).await.unwrap();
+            let table: toml::Table = stored.parse().unwrap();
+            let channels = table["channels"].as_table().unwrap();
+            assert_eq!(channels["googlechat_connection"].as_str(), Some("http"));
+            assert_eq!(channels["googlechat_pubsub_subscription"].as_str(), Some(""));
+            assert!(channels.get("googlechat_service_account_json").is_none());
+            assert!(!stored.contains("PRIVATE KEY"));
+            assert_eq!(crate::config_crypto::read_encrypted_config_field(home.path(), "channels", "googlechat_service_account_json").await.as_deref(), Some(raw_key.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn googlechat_import_validates_candidate_and_commits_encrypted_transport() {
         let home = tempfile::tempdir().unwrap();
         let fake = e2e_gchat_tests::start_fake().await;
         let email = format!("import-{}@test-project.iam.gserviceaccount.com", uuid::Uuid::new_v4().simple());
@@ -432,7 +481,7 @@ mod googlechat_import_tests {
         key["project_id"] = json!("test-project");
         let raw_key = key.to_string();
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
-        let params = json!({"type":"googlechat", "config":{"token":raw_key,"secret":"123456789"}});
+        let params = json!({"type":"googlechat", "config":{"token":raw_key,"secret":"123456789","connection":"pubsub","pubsub_subscription":"projects/test-project/subscriptions/chat-events"}});
         let result = handler.handle_channels_add(params.clone()).await;
         assert!(matches!(result, WsFrame::Response { ok: true, .. }), "{result:?}");
         let stored = tokio::fs::read_to_string(home.path().join("config.toml")).await.unwrap();
@@ -440,9 +489,15 @@ mod googlechat_import_tests {
         let channels = table["channels"].as_table().unwrap();
         assert!(channels.get("googlechat_service_account_json").is_none());
         assert!(!stored.contains("PRIVATE KEY"));
+        assert_eq!(channels["googlechat_connection"].as_str(), Some("pubsub"));
         let restored = crate::config_crypto::read_encrypted_config_field(home.path(), "channels", "googlechat_service_account_json").await.unwrap();
         assert_eq!(restored, raw_key);
-        for (field, value) in [("secret", "invalid-number"), ("token", "{}"), ("connection", "invalid")] {
+        e2e_gchat_tests::set_subscription_topic(&fake, "projects/test-project/topics/attacker-events");
+        let rejected_topic = handler.handle_channels_add(params.clone()).await;
+        assert!(matches!(rejected_topic, WsFrame::Response { ok: false, .. }), "{rejected_topic:?}");
+        assert_eq!(tokio::fs::read_to_string(home.path().join("config.toml")).await.unwrap(), stored);
+        e2e_gchat_tests::set_subscription_topic(&fake, "projects/test-project/topics/duduclaw-chat-events");
+        for (field, value) in [("secret", "invalid-number"), ("pubsub_subscription", "projects/other-project/subscriptions/chat-events"), ("token", "{}"), ("connection", "invalid")] {
             let mut bad = params.clone();
             bad["config"][field] = json!(value);
             let result = handler.handle_channels_add(bad).await;

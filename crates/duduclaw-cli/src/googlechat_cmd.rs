@@ -1,7 +1,7 @@
 //! Operator Google Chat setup. All persistent writes go through the authenticated
 //! gateway Admin RPCs, including MFA and the live account authorization checks.
 use std::{ffi::OsString, io::{Read, Write}, path::{Path, PathBuf}, time::Duration};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use duduclaw_core::error::{DuDuClawError as Error, Result};
 use duduclaw_gateway::agent_channels::googlechat_config;
 use duduclaw_tui::{auth::{AuthClient, LoginMode, disable_core_dumps}, client::{Client, ClientOptions, ConnectionState, RpcReply}, transport::GatewayUrl};
@@ -30,10 +30,22 @@ pub enum GoogleChatCommands {
     /// 驗證金鑰並經管理員登入匯入；不會將明文金鑰寫入設定
     Import(ImportArgs),
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Connection {
+    #[default]
+    Http,
+    Pubsub,
+}
+impl Connection {
+    fn as_str(self) -> &'static str { match self { Self::Http => "http", Self::Pubsub => "pubsub" } }
+}
 #[derive(Args)]
 pub struct BootstrapArgs {
     #[arg(long)]
     project_id: Option<String>,
+    #[arg(long, value_enum, default_value = "http")]
+    connection: Connection,
     #[arg(long)]
     endpoint_url: Option<String>,
     #[arg(long)]
@@ -53,6 +65,10 @@ pub struct ImportArgs {
     /// 金鑰須為一般檔案；Windows 必須存放在自己的使用者設定檔目錄並限制存取權限
     #[arg(long)]
     key_file: PathBuf,
+    #[arg(long, value_enum, default_value = "http")]
+    connection: Connection,
+    #[arg(long)]
+    subscription: Option<String>,
     #[arg(long)]
     agent: Option<String>,
 }
@@ -81,13 +97,17 @@ pub async fn run(home: &Path, command: ChannelsCommands) -> Result<()> {
     }
 }
 fn script_args(args: &BootstrapArgs) -> Result<Vec<OsString>> {
+    #[cfg(not(unix))]
+    if args.connection == Connection::Pubsub && !args.dry_run {
+        return Err(Error::Security("此平台尚未支援 Pub/Sub 金鑰檔權限驗證，請改在 Unix 主機建立與匯入。".into()));
+    }
     validate_agent(args.agent.as_deref())?;
     let has_controls = |value: &str| value.chars().any(|c| c.is_control());
     if args.app_name.as_deref().is_some_and(|name| has_controls(name) || name.chars().count() > 25)
         || args.out.as_ref().is_some_and(|out| out.to_str().is_none_or(has_controls)) {
         return Err(Error::Config("應用程式名稱最多 25 字；名稱與輸出路徑不可包含控制字元。".into()));
     }
-    let mut values = Vec::new();
+    let mut values = vec![OsString::from("--connection"), args.connection.as_str().into()];
     if let Some(out) = &args.out { values.extend([OsString::from("--out"), out.as_os_str().to_owned()]); }
     for (flag, value) in [("--project-id", &args.project_id), ("--endpoint-url", &args.endpoint_url), ("--agent", &args.agent), ("--app-name", &args.app_name)] {
         if let Some(value) = value { values.extend([flag.into(), value.into()]); }
@@ -119,9 +139,12 @@ async fn bootstrap(home: &Path, mut args: BootstrapArgs) -> Result<()> {
         .map_err(|_| bootstrap_review_error(args.project_id.as_deref()))?;
     let validated = validate_bootstrap_result(result, &out, args.project_id.as_deref())?;
     let result = &validated.0;
+    if result.connection != args.connection {
+        return Err(bootstrap_review_error(args.project_id.as_deref()));
+    }
     finish_bootstrap_import(&validated, args.project_id.as_deref().unwrap(), args.agent.as_deref(), |raw| import_bytes(home, ImportArgs {
         project_number: result.project_number.clone(), key_file: result.key_file.clone(),
-        agent: args.agent.clone(),
+        agent: args.agent.clone(), connection: result.connection, subscription: Some(result.subscription.clone()),
     }, raw)).await
 }
 
@@ -145,6 +168,10 @@ struct BootstrapResult {
     service_account_email: String,
     key_id: String,
     created_this_run: bool,
+    #[serde(default)]
+    connection: Connection,
+    #[serde(default)]
+    subscription: String,
     #[serde(default, rename = "agent")]
     _agent: String,
 }
@@ -195,6 +222,9 @@ fn validate_bootstrap_result(result: BootstrapResult, out: &Path, expected_proje
             || result.service_account_email != format!("duduclaw-chat@{}.iam.gserviceaccount.com", result.project_id) {
             return Err(bootstrap_review_error(expected_project));
         }
+        googlechat_config::validate_connection(result.connection.as_str(), &result.subscription,
+            &json!({"project_id": result.project_id, "client_email": result.service_account_email}).to_string())
+            .map_err(Error::Config)?;
         let root = std::fs::canonicalize(out)?;
         let parent = std::fs::canonicalize(result.key_file.parent().unwrap_or(Path::new(".")))?;
         if !parent.starts_with(&root) {
@@ -257,6 +287,9 @@ async fn finish_bootstrap_import<'a, F: std::future::Future<Output = Result<()>>
         let key_id = key["private_key_id"].as_str().expect("validated key ID");
         let mut retry = format!("duduclaw channels googlechat import --project-number {} --key-file {:?}",
             shell_quote(&result.project_number), result.key_file);
+        if result.connection == Connection::Pubsub {
+            retry.push_str(&format!(" --connection pubsub --subscription {}", shell_quote(&result.subscription)));
+        }
         if let Some(agent) = agent { retry.push_str(&format!(" --agent {}", shell_quote(agent))); }
         let key_status = if result.created_this_run { "本次已建立新的服務帳戶金鑰，仍然有效。" }
             else { "本次沿用的服務帳戶金鑰仍然有效。" };
@@ -314,10 +347,19 @@ fn import_request(args: &ImportArgs, raw: &str) -> Result<(&'static str, Value)>
     validate_agent(args.agent.as_deref())?;
     let project = googlechat_config::validate_project_number(&args.project_number).map_err(Error::Config)?;
     googlechat_config::validate_service_account_json(raw).map_err(Error::Config)?;
-    Ok(match &args.agent {
-        Some(agent) => ("agents.channels.googlechat.set", json!({"agent_id": agent, "project_number": project, "service_account_json": raw})),
-        None => ("channels.add", json!({"type": "googlechat", "config": {"token": raw, "secret": project}})),
-    })
+    let subscription = args.subscription.as_deref().unwrap_or("");
+    googlechat_config::validate_connection(args.connection.as_str(), subscription, raw).map_err(Error::Config)?;
+    #[cfg(not(unix))]
+    if args.connection == Connection::Pubsub {
+        return Err(Error::Security("此平台尚未支援 Pub/Sub 金鑰檔權限驗證，請改在 Unix 主機匯入。".into()));
+    }
+    Ok(import_payload(args, raw, &project, subscription))
+}
+fn import_payload(args: &ImportArgs, raw: &str, project: &str, subscription: &str) -> (&'static str, Value) {
+    match &args.agent {
+        Some(agent) => ("agents.channels.googlechat.set", json!({"agent_id": agent, "project_number": project, "service_account_json": raw, "connection": args.connection.as_str(), "pubsub_subscription": subscription})),
+        None => ("channels.add", json!({"type": "googlechat", "config": {"token": raw, "secret": project, "connection": args.connection.as_str(), "pubsub_subscription": subscription}})),
+    }
 }
 async fn import(home: &Path, args: ImportArgs) -> Result<()> {
     let raw = read_bounded(&args.key_file)?;
@@ -368,7 +410,7 @@ mod tests {
         std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
         BootstrapResult { project_number: "123456789".into(), key_file,
             project_id: "demo-chat-123".into(), service_account_email: "duduclaw-chat@demo-chat-123.iam.gserviceaccount.com".into(),
-            key_id: "a".repeat(40), created_this_run: true, _agent: String::new() }
+            key_id: "a".repeat(40), created_this_run: true, connection: Connection::Http, subscription: String::new(), _agent: String::new() }
     }
     #[cfg(unix)]
     #[tokio::test]
@@ -492,6 +534,38 @@ mod tests {
         assert!(outcome.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "replacement must survive");
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn googlechat_pubsub_import_failure_keeps_transport_in_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut result = bootstrap_fixture(dir.path());
+        result.connection = Connection::Pubsub;
+        result.subscription = "projects/demo-chat-123/subscriptions/events".into();
+        let path = result.key_file.clone();
+        let validated = validate_bootstrap_result(result, dir.path(), Some("demo-chat-123")).unwrap();
+        let error = finish_bootstrap_import(&validated, "demo-chat-123", Some("alice"), |_| async {
+            Err(Error::Config("RPC refused".into()))
+        }).await.unwrap_err().to_string();
+        assert!(error.contains("--connection pubsub --subscription 'projects/demo-chat-123/subscriptions/events' --agent 'alice'"));
+        assert!(error.contains("gcloud iam service-accounts keys delete"));
+        assert!(path.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn googlechat_pubsub_result_reuses_validators_and_binds_subscription() {
+        for subscription in ["projects/other-project/subscriptions/events", "projects/demo-chat-123/subscriptions/../events", ""] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut result = bootstrap_fixture(dir.path());
+            result.connection = Connection::Pubsub;
+            result.subscription = subscription.into();
+            assert!(validate_bootstrap_result(result, dir.path(), Some("demo-chat-123")).is_err());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut result = bootstrap_fixture(dir.path());
+        result.connection = Connection::Pubsub;
+        result.subscription = "projects/demo-chat-123/subscriptions/events".into();
+        assert!(validate_bootstrap_result(result, dir.path(), Some("demo-chat-123")).is_ok());
+    }
     #[test]
     fn googlechat_result_rejects_unknown_fields() {
         let value = json!({"project_number": "123456789", "key_file": "key.json",
@@ -508,10 +582,12 @@ mod tests {
         assert!(run_bootstrap_script(&script, &[]).await.is_err());
     }
     #[test]
-    fn googlechat_cli_parses_http_flows_and_refuses_unknown_connection() {
+    fn googlechat_cli_parses_transports_and_refuses_unknown_connection() {
         assert!(TestCli::try_parse_from(["channels", "googlechat", "import", "--project-number", "123456789", "--key-file", "key.json", "--agent", "alice"]).is_ok());
         assert!(TestCli::try_parse_from(["channels", "googlechat", "bootstrap", "--dry-run", "--endpoint-url", "https://chat.example.com/webhook/googlechat"]).is_ok());
         assert!(TestCli::try_parse_from(["channels", "googlechat", "bootstrap", "--connection", "typo"]).is_err());
+        assert!(TestCli::try_parse_from(["channels", "googlechat", "bootstrap", "--connection", "pubsub", "--dry-run"]).is_ok());
+        assert!(TestCli::try_parse_from(["channels", "googlechat", "import", "--connection", "pubsub", "--subscription", "projects/demo-chat-123/subscriptions/events", "--project-number", "123456789", "--key-file", "key.json"]).is_ok());
     }
     #[test]
     fn googlechat_operator_refuses_even_empty_identity() {
@@ -531,7 +607,7 @@ mod tests {
     }
     #[test]
     fn googlechat_script_arguments_are_not_shell_interpolated() {
-        let args = BootstrapArgs { project_id: None, endpoint_url: None, agent: Some("alice".into()), app_name: Some("$(touch /tmp/never) ' app".into()), out: Some("dir with spaces".into()), dry_run: true };
+        let args = BootstrapArgs { connection: Connection::Http, project_id: None, endpoint_url: None, agent: Some("alice".into()), app_name: Some("$(touch /tmp/never) ' app".into()), out: Some("dir with spaces".into()), dry_run: true };
         let argv = script_args(&args).unwrap();
         assert!(argv.contains(&OsString::from("$(touch /tmp/never) ' app")));
         assert!(argv.contains(&OsString::from("dir with spaces")));
@@ -539,7 +615,7 @@ mod tests {
     }
     #[test]
     fn googlechat_bootstrap_defaults_follow_each_project_and_preserve_explicit_output() {
-        let new_args = || BootstrapArgs { project_id: None, endpoint_url: None, agent: None, app_name: None, out: None, dry_run: true };
+        let new_args = || BootstrapArgs { connection: Connection::Http, project_id: None, endpoint_url: None, agent: None, app_name: None, out: None, dry_run: true };
         let mut first = new_args();
         let first_out = resolve_bootstrap_defaults(&mut first);
         let project = first.project_id.as_ref().unwrap();
@@ -554,8 +630,33 @@ mod tests {
         assert_eq!(resolve_bootstrap_defaults(&mut second), PathBuf::from("explicit-output"));
     }
     #[test]
+    fn googlechat_import_payload_uses_gateway_transport_field_names() {
+        for connection in [Connection::Http, Connection::Pubsub] {
+            for agent in [None, Some("alice".to_string())] {
+                let args = ImportArgs { connection, subscription: None, project_number: "123456789".into(), key_file: "unused".into(), agent };
+                let subscription = if connection == Connection::Pubsub { "projects/demo-chat-123/subscriptions/events" } else { "" };
+                let (method, payload) = import_payload(&args, "test key", "123456789", subscription);
+                let config = if args.agent.is_some() {
+                    assert_eq!(method, "agents.channels.googlechat.set");
+                    googlechat_config::validate_fields(payload.as_object().unwrap().keys().map(String::as_str),
+                        &["agent_id", "project_number", "service_account_json", "connection", "pubsub_subscription"]).unwrap();
+                    &payload
+                } else {
+                    assert_eq!(method, "channels.add");
+                    let config = &payload["config"];
+                    googlechat_config::validate_fields(config.as_object().unwrap().keys().map(String::as_str),
+                        &["token", "secret", "connection", "pubsub_subscription"]).unwrap();
+                    config
+                };
+                assert_eq!(config["connection"], connection.as_str());
+                assert_eq!(config["pubsub_subscription"], subscription);
+                assert!(config.get("subscription").is_none());
+            }
+        }
+    }
+    #[test]
     fn googlechat_import_rejects_invalid_project_key_and_agent_before_network() {
-        let mut args = ImportArgs { project_number: "project-id".into(), key_file: "unused".into(), agent: None };
+        let mut args = ImportArgs { connection: Connection::Http, subscription: None, project_number: "project-id".into(), key_file: "unused".into(), agent: None };
         assert!(import_request(&args, "{}").is_err());
         args.project_number = "123456789".into();
         assert!(import_request(&args, "{}").is_err());
@@ -599,7 +700,7 @@ mod tests {
     }
     #[test]
     fn googlechat_bootstrap_rejects_control_characters_before_spawn() {
-        let mut args = BootstrapArgs { project_id: None, endpoint_url: None, agent: None, app_name: None, out: None, dry_run: true };
+        let mut args = BootstrapArgs { connection: Connection::Http, project_id: None, endpoint_url: None, agent: None, app_name: None, out: None, dry_run: true };
         for value in ["bad\0name", "bad\nname", "bad\u{85}name", "abcdefghijklmnopqrstuvwxyz"] {
             args.app_name = Some(value.into());
             assert!(script_args(&args).is_err());

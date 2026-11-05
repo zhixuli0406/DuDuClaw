@@ -22,6 +22,12 @@ bash scripts/googlechat/bootstrap.sh --endpoint-url https://chat.example.com/web
 
 員工專屬應用程式加 `--agent alice`，HTTP 端點改為 `/webhook/googlechat/agents/alice`。每位員工要有自己的專案。加 `--dry-run` 可先預覽，完全不執行 gcloud 或寫檔；`--project-id` 可指定專案。`--out` 指定私密輸出目錄。金鑰是最後一個雲端建立步驟；建立後若後續步驟失敗，腳本會嘗試撤銷新金鑰並刪除本機檔案，撤銷失敗會明確提示。金鑰政策阻擋時，將印出的指令交給組織政策管理員審核；不要把政策拒絕當成登入問題重試。
 
+## 不需公開網址的 Pub/Sub 模式
+
+在 Cloud Shell 執行 `bash scripts/googlechat/bootstrap.sh --connection pubsub`。腳本會先準備並確認專用主題、拉取訂閱與權限，再建立金鑰。此模式失敗時保留金鑰並只列出手動撤銷指令，不執行破壞性的 gcloud 指令，也不會自動修改既有訂閱的保留期。下載後在 Unix DuDuClaw 主機執行摘要中的 `--connection pubsub --subscription …` 匯入指令；非 Unix 平台在具備等價的金鑰與收件匣權限驗證前拒絕此模式。
+
+gateway 會以應用程式的 `chat.bot` 向 Google Chat 回讀每則訊息，傳訊者、本文與附件均以 API 回應為準。Pub/Sub 僅提供訊息資源名稱線索，拉取權杖另用 `pubsub` scope。403／404、格式或聊天室不符會丟棄且不建立回合；檢查日誌提示與應用程式權限。收件匣以 Chat 資源名稱去重七天，超過七天的訊息建立時間也會拒絕；佇列滿會確認收件並丟棄。詳見[三語指南](../../docs/guides/zh-TW/channels-googlechat-teams.md)。
+
 ## 完成 Chat 設定頁
 
 **建立時請取消勾選「以 Google Workspace 外掛程式建構這個 Chat 應用程式」（Build this Chat app as a Google Workspace add-on）。** DuDuClaw 接收一般 Chat 事件，不支援外掛程式事件格式。
@@ -29,6 +35,7 @@ bash scripts/googlechat/bootstrap.sh --endpoint-url https://chat.example.com/web
 開啟腳本印出的 Configuration 連結，填名稱（最多 25 字）、公開頭像網址與說明，開啟 Interactive features、一對一及聊天室。
 
 - HTTP：貼上端點，Authentication Audience 選 Project number。
+- Pub/Sub：連線方式選 Cloud Pub/Sub，貼上摘要中的主題，不需要公開 HTTP 端點。
 - Visibility：填自己的 Workspace email，儲存。
 
 這個設定頁沒有可用的自動設定 API，所以仍需手動儲存。
@@ -50,12 +57,12 @@ python3 -m unittest discover -s scripts/googlechat -p 'test_*.py' -v
 shellcheck scripts/googlechat/bootstrap.sh
 ```
 
-手動驗收需另用測試專案，分別測試 HTTP、重跑沿用資源、組織金鑰政策與帳務拒絕，以及從 Cloud Shell 下載後匯入的完整流程。不要把離線模擬測試當成真實 Google 連線驗收。
+手動驗收需另用測試專案，分別測試 HTTP、Pub/Sub、Chat API 回讀 403／404、重跑沿用資源、組織金鑰政策與帳務拒絕，以及從 Cloud Shell 下載後匯入的完整流程。不要把離線模擬測試當成真實 Google 連線驗收。
 
 ### CLI 匯入失敗時的手動處理
 
 腳本一律寫入 `bootstrap-result.json`，只包含專案、金鑰 ID、檔案路徑等中繼資料，不含私鑰。CLI 讀取結果檔後，驗證金鑰檔的擁有者、權限、一般檔案與連結狀態；Unix 保留 `O_NOFOLLOW`／檔案 handle 檢查。驗證後的金鑰內容保留在記憶體中供匯入，不會重新開啟金鑰路徑。
 
-腳本內部建立金鑰後若失敗，仍會嘗試撤銷該次新建金鑰並清理檔案。腳本成功後，CLI 若匯入失敗，會保留金鑰檔並以非零狀態結束；新建的服務帳戶金鑰仍然有效。CLI 會顯示檔案路徑，以及可直接複製的重試匯入與手動撤銷指令，不會自動執行撤銷或刪檔。撤銷指令的專案與服務帳戶取自 CLI 執行參數，金鑰 ID 取自已驗證的金鑰內容。員工專屬設定的重試指令會保留 `--agent`。
+HTTP 模式的腳本內部建立金鑰後若失敗，仍會嘗試撤銷該次新建金鑰並清理檔案；Pub/Sub 模式只列出人工撤銷指令並保留金鑰。腳本成功後，CLI 若匯入失敗，會保留金鑰檔並以非零狀態結束；新建的服務帳戶金鑰仍然有效。CLI 會顯示檔案路徑，以及可直接複製的重試匯入與手動撤銷指令，不會自動執行撤銷或刪檔。撤銷指令的專案與服務帳戶取自 CLI 執行參數，金鑰 ID 取自已驗證的金鑰內容。員工專屬設定的重試指令會保留 `--agent`。
 
 Windows 原生驗收須另行執行，離線測試不代表已通過。
