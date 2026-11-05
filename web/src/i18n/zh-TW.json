@@ -9795,5 +9795,9 @@
   "mcpKeys.oauth.neverUsed": "尚未使用",
   "mcpKeys.oauth.revokeTitle": "撤銷連線授權",
   "mcpKeys.oauth.confirm": "確定撤銷「{client}」的授權？此應用程式將無法再以這次授權存取資料。",
-  "mcpKeys.oauth.revoked": "已撤銷連線授權"
+  "mcpKeys.oauth.revoked": "已撤銷連線授權",
+  "googlechat.setup.connection": "連線方式",
+  "googlechat.setup.pubsubHint": "Pub/Sub 不需要公開網址；DuDuClaw 會向 Google Chat 重新讀取每則訊息，再處理內容與傳送者身分。不支援 Google Chat 對話方塊。",
+  "googlechat.setup.subscription": "Pub/Sub 訂閱完整名稱",
+  "googlechat.setup.topicFromScript": "請使用設定腳本輸出的主題名稱"
 }

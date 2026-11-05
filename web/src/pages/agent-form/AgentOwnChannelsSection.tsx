@@ -5,7 +5,7 @@ import { Button, Input, SettingsCard, SettingsSection, Textarea } from '@/compon
 import { ConfirmDialog } from '@/components/settings/controls';
 import { api, type AgentOwnChannels, type AgentOwnChannelState } from '@/lib/api';
 import { formatError, toast } from '@/lib/toast';
-import { GoogleChatSetup } from '@/components/channels/GoogleChatSetup';
+import { GoogleChatSetup, type GoogleChatConnection } from '@/components/channels/GoogleChatSetup';
 import { cn } from '@/lib/utils';
 
 const DOCS_BASE = 'https://github.com/zhixuli0406/DuDuClaw/blob/main/docs/guides';
@@ -221,6 +221,12 @@ function GoogleChatCard({
   const t = (id: string, v?: Record<string, string | number>) => intl.formatMessage({ id }, v);
   const [project, setProject] = useState(data.project_number ?? '');
   const [keyJson, setKeyJson] = useState('');
+  const [connection, setConnection] = useState<GoogleChatConnection>(data.connection ?? 'http');
+  const [subscription, setSubscription] = useState(data.pubsub_subscription ?? '');
+  useEffect(() => {
+    setConnection(data.connection ?? 'http');
+    setSubscription(data.pubsub_subscription ?? '');
+  }, [data.connection, data.pubsub_subscription]);
   const [saving, setSaving] = useState(false);
   useEffect(() => setProject(data.project_number ?? ''), [data.project_number]);
 
@@ -228,7 +234,7 @@ function GoogleChatCard({
     if (!project.trim()) return;
     setSaving(true);
     try {
-      const r = await api.channels.agentGoogleChatSet(agentId, project.trim(), keyJson);
+      const r = await api.channels.agentGoogleChatSet(agentId, project.trim(), keyJson, connection, subscription.trim());
       setKeyJson('');
       if (r.verified) toast.success(t('agentChannels.googlechat.saved'));
       else toast.error(t('agentChannels.googlechat.savedNotVerified', { error: r.error ?? '' }));
@@ -275,7 +281,7 @@ function GoogleChatCard({
         )}
         {data.can_edit ? (
           <>
-            <GoogleChatSetup agentId={agentId} projectNumber={data.project_number} projectId={data.project_id} onRefresh={onChanged} />
+            <GoogleChatSetup connection={connection} onConnectionChange={setConnection} subscription={subscription} onSubscriptionChange={setSubscription} agentId={agentId} projectNumber={data.project_number} projectId={data.project_id} onRefresh={onChanged} />
             <details className="space-y-3">
               <summary className="cursor-pointer text-sm">{t('googlechat.setup.manual')}</summary>
             <Input

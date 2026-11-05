@@ -20,7 +20,7 @@ import {
 import { SecretSourceField } from '@/components/shared/SecretSourceField';
 import { normalizeRestartRequired } from '@/lib/config-toml';
 import { useRestartRequiredStore } from '@/stores/restart-required-store';
-import { GoogleChatSetup } from './GoogleChatSetup';
+import { GoogleChatSetup, type GoogleChatConnection } from './GoogleChatSetup';
 import { AlertTriangle } from 'lucide-react';
 
 /** Channel type picker options — value ⇒ human label (spec §4 Select). */
@@ -166,6 +166,8 @@ export function AddChannelDialog({
   const [wecomAgentId, setWecomAgentId] = useState('');
   const [wecomCallbackToken, setWecomCallbackToken] = useState('');
   const [wecomAesKey, setWecomAesKey] = useState('');
+  const [googlechatConnection, setGooglechatConnection] = useState<GoogleChatConnection>('http');
+  const [googlechatSubscription, setGooglechatSubscription] = useState('');
   const [googlechatManual, setGooglechatManual] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
@@ -189,6 +191,10 @@ export function AddChannelDialog({
       }
       if (channelType === 'feishu' && feishuVerifyToken.trim()) {
         config.feishu_verification_token = feishuVerifyToken.trim();
+      }
+      if (channelType === 'googlechat') {
+        config.connection = googlechatConnection;
+        config.pubsub_subscription = googlechatConnection === 'pubsub' ? googlechatSubscription.trim() : '';
       }
       if (channelType === 'teams' && teamsTenantId.trim()) {
         config.teams_tenant_id = teamsTenantId.trim();
@@ -410,7 +416,7 @@ export function AddChannelDialog({
           )}
 
           {/* Setup guide */}
-          {channelType === 'googlechat' ? <GoogleChatSetup projectNumber={secret.trim()} /> : <div className="rounded-lg bg-warning/10 p-3 text-xs text-warning">
+          {channelType === 'googlechat' ? <GoogleChatSetup connection={googlechatConnection} onConnectionChange={setGooglechatConnection} subscription={googlechatSubscription} onSubscriptionChange={setGooglechatSubscription} projectNumber={secret.trim()} /> : <div className="rounded-lg bg-warning/10 p-3 text-xs text-warning">
             <p className="mb-1 font-medium">{intl.formatMessage({ id: 'channels.dialog.setupGuide' })}</p>
             {steps.map((step) => {
               const isWarning = step.id.toLowerCase().includes('warning');

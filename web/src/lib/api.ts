@@ -246,6 +246,8 @@ export interface AgentOwnChannels {
     service_account_email: string | null;
     endpoint_path: string;
     project_id?: string | null;
+    connection?: 'http' | 'pubsub';
+    pubsub_subscription?: string | null;
     error: string | null;
     last_event: string | null;
     shared_app_configured: boolean;
@@ -6742,10 +6744,12 @@ export const api = {
       }>,
     agentTelegramRemove: (agentId: string) =>
       client.call('agents.channels.telegram.remove', { agent_id: agentId }) as Promise<{ success: boolean }>,
-    agentGoogleChatSet: (agentId: string, projectNumber: string, serviceAccountJson?: string) =>
+    agentGoogleChatSet: (agentId: string, projectNumber: string, serviceAccountJson?: string, connection: 'http' | 'pubsub' = 'http', pubsubSubscription?: string) =>
       client.call('agents.channels.googlechat.set', {
         agent_id: agentId,
         project_number: projectNumber,
+        connection,
+        pubsub_subscription: connection === 'pubsub' ? pubsubSubscription ?? '' : '',
         ...(serviceAccountJson && serviceAccountJson.trim() ? { service_account_json: serviceAccountJson } : {}),
       }) as Promise<{
         success: boolean;

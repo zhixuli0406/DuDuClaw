@@ -3,7 +3,7 @@
 Google Chat チャネルの認証情報は Chat アプリ（`chat.bot`）用で、Gmail、Drive、Calendar は接続しません。データツールは [Google 接続](google-setup.md)で別途設定します。ダッシュボードの保存は即時反映し、設定ファイルを手編集した場合は再起動します。
 
 DuDuClawはGoogle ChatとMicrosoft Teamsを、Telegram／LINE／Discord／Slack／
-WhatsApp／Feishu／WebChat と並ぶチャネルとしてサポートしています。Teams と Google Chat は公開 HTTPS URL が必要です。
+WhatsApp／Feishu／WebChat と並ぶチャネルとしてサポートしています。Teams と Google Chat HTTP モードは公開 HTTPS URL が必要です。Google Chat Pub/Sub モードは不要です。
 
 両チャネルとも以下を備えています。
 
@@ -22,7 +22,7 @@ WhatsApp／Feishu／WebChat と並ぶチャネルとしてサポートしてい�
 
 ### 前提条件
 
-Chat が有効な Google Workspace Business／Enterprise アカウントと、Chat アプリを許可する管理者が必要です。Cloud プロジェクトの作成または直接所有、Chat API の有効化、サービスアカウントとキーの作成ができる必要があります。ローカルでは Bash、Python 3、`gcloud` と自分の `gcloud auth login` が必要です。Cloud Shell にはこれらのツールがあります。gateway は公開 HTTPS URL が必要です。公開 URL が不要な Pub/Sub モードは今後のバージョンで提供予定です。
+Chat が有効な Google Workspace Business／Enterprise アカウントと、Chat アプリを許可する管理者が必要です。Cloud プロジェクトの作成または直接所有、Chat API の有効化、サービスアカウントとキーの作成ができる必要があります。ローカルでは Bash、Python 3、`gcloud` と自分の `gcloud auth login` が必要です。Cloud Shell にはこれらのツールがあります。HTTP モードには公開 HTTPS URL が必要です。Pub/Sub モードは外向き接続のみで動作し、公開 URL は不要です。
 
 ### ワンステップで作成・インポート
 
@@ -35,7 +35,7 @@ Chat が有効な Google Workspace Business／Enterprise アカウントと、Ch
 duduclaw channels googlechat bootstrap --endpoint-url https://chat.example.com/webhook/googlechat
 ```
 
-プロジェクト、Chat API、サービスアカウントを準備し、最後のクラウド操作で非公開 JSON キーを作成してから設定をインポートします。`--project-id your-project-id` は直接所有する既存プロジェクトを再利用します。グループや継承による所有権は安全側で拒否します。追加オプションは `--app-name`、`--agent`、`--out`、`--dry-run`（クラウドもローカルも変更しません）です。既定 ID は `duduclaw-chat-<random6>`。キーは専用出力ディレクトリの `service-account.json` に 0600 で保存します。再実行では一致するキーを再利用します。インポートした認証情報は暗号化して保存します。作成後に後続のスクリプト処理が失敗した場合、新しいクラウドキーの取り消しとローカルファイルの削除を試みます。取り消しに失敗した場合やキー ID を読み取れない場合は、手動対応が必要であることを表示します。 スクリプト成功後に CLI のインポートが失敗した場合、CLI はキーファイルを保持して非ゼロで終了します。新しいサービスアカウントキーは引き続き有効です。エラーにはファイルパス、再インポートと手動取り消しの完全なコマンドが表示されます。CLI はキーの取り消しやキーファイルの削除を自動実行しません。
+プロジェクト、Chat API、サービスアカウントを準備し、最後のクラウド操作で非公開 JSON キーを作成してから設定をインポートします。`--project-id your-project-id` は直接所有する既存プロジェクトを再利用します。グループや継承による所有権は安全側で拒否します。追加オプションは `--app-name`、`--agent`、`--out`、`--dry-run`（クラウドもローカルも変更しません）です。既定 ID は `duduclaw-chat-<random6>`。キーは専用出力ディレクトリの `service-account.json` に 0600 で保存します。再実行では一致するキーを再利用します。インポートした認証情報は暗号化して保存します。HTTP モードで作成後に後続のスクリプト処理が失敗した場合、新しいクラウドキーの取り消しとローカルファイルの削除を試みます。取り消しに失敗した場合やキー ID を読み取れない場合は、手動対応が必要であることを表示します。 スクリプト成功後に CLI のインポートが失敗した場合、CLI はキーファイルを保持して非ゼロで終了します。新しいサービスアカウントキーは引き続き有効です。エラーにはファイルパス、再インポートと手動取り消しの完全なコマンドが表示されます。CLI はキーの取り消しやキーファイルの削除を自動実行しません。
 
 ローカルに gcloud がない場合は [Cloud Shell を開き](https://shell.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/zhixuli0406/DuDuClaw&cloudshell_tutorial=scripts/googlechat/cloudshell-tutorial.md&show=terminal)、`bash scripts/googlechat/bootstrap.sh --endpoint-url https://chat.example.com/webhook/googlechat` を実行します。キーを安全に DuDuClaw ホストへダウンロードし、`chmod 600 /private/path/service-account.json` で権限を制限してから、ローカルパスでインポートします。Windows では通常のキーファイルを自分のユーザープロファイル内に保存してください。再解析ポイントは拒否しますが、所有者と ACL 権限は検証しません。
 
@@ -68,6 +68,24 @@ managed constraint はインストール済み gcloud の対応を管理者が�
 ### 付録：手動設定
 
 プロジェクト、Chat API、サービスアカウントと JSON キーを作成し、上記の Chat 設定を行います。「チャネル → Google Chat を追加 → 手動設定」にプロジェクト番号と JSON キー全体を入力します。保存後にメッセージをテストします。HTTP は `chat@system.gserviceaccount.com` とプロジェクト番号の JWT を検証します。未対応の Workspace アドオン形式には、アドオン設定を外すよう診断を表示します。
+
+### Pub/Sub：公開 gateway URL は不要
+
+Unix の DuDuClaw ホストで実行します。
+
+```bash
+duduclaw channels googlechat bootstrap --connection pubsub
+# 作成済みのキーと pull subscription をインポートする場合:
+duduclaw channels googlechat import --connection pubsub --project-number 123456789012 --key-file /private/path/service-account.json --subscription projects/your-project-id/subscriptions/duduclaw-chat-events-sub
+```
+
+Cloud Shell では `bash scripts/googlechat/bootstrap.sh --connection pubsub` を使い、キーを安全にダウンロードしてからホストで表示されたインポートコマンドを実行します。社員専用アプリには `--agent alice` を追加し、アプリごとに専用プロジェクトを使います。スクリプトは Chat と Pub/Sub API、`projects/<project-id>/topics/duduclaw-chat-events`、配信保持期間 1 日の pull subscription を準備します。Google Chat の発行元にトピックへの発行権限、アプリのサービスアカウントにそのサブスクリプションの購読・メタデータ読取権限を付与します。リソース検証と IAM 設定を終えてからキーを作成します。既存のサブスクリプションは指定トピックと一致する必要があり、設定は自動変更しません。インポート時と worker 起動時にも Google からサブスクリプションを読み戻します。Pub/Sub 設定に失敗した場合、キーを保持して手動取り消しコマンドを表示し、破壊的な gcloud コマンドは実行しません。
+
+Chat Configuration で **Build this Chat app as a Google Workspace add-on** をオフにし、**Cloud Pub/Sub** を選んで表示されたトピックを貼り付けます。公開 HTTP エンドポイントは不要です。その他のアプリ・可視性設定を完了し、実際にメッセージを送ってください。gateway は Google OAuth、Pub/Sub、Chat API への HTTPS 接続が必要です。
+
+gateway は [`spaces.messages.get`](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/get) で毎回 Google Chat からメッセージを読み直します。アプリ認証の `https://www.googleapis.com/auth/chat.bot` を使い、管理者承認が必要な Chat スコープは要求しません。pull 用トークンは別途 `https://www.googleapis.com/auth/pubsub` のみを使います。Pub/Sub 本文は信頼しない通知として扱い、厳密に検証した Chat メッセージのリソース名だけを検索に使用します。送信者、スペース、本文、添付、スレッドはすべて API 応答から取得し、その送信者に許可リスト・ペアリング・承認ルールを適用します。メッセージが存在しない、アクセスできない（403／404 を含む）、形式やスペースが一致しない場合は診断を記録して破棄し、ターンを作成しません。診断が出た場合はアプリのアクセス権と `chat.bot` を確認してください。スペース追加など取得可能なメッセージを持たないイベントは社員ターンを開始しません。
+
+永続 inbox はイベント種別と Chat メッセージのリソース名で重複を除去します。新しい Pub/Sub message ID で再発行しても、保持中のイベントは再実行されません。記録は 7 日間保持し、API の作成時刻が 7 日より古いメッセージは削除後も拒否します。受理したイベントは保存後に ACK します。再起動後は未開始の処理を再開でき、実行中に中断した処理は uncertain として自動再実行しません。キューが満杯なら ACK して破棄し、ターンを開始しません。これはエンドツーエンドの exactly-once 保証ではありません。Unix 専用 inbox はリソース参照のみを保存し、本文・送信者情報・添付を保存しません。アプリ stream（社員／共有アプリとプロジェクト番号）ごとに 1,000 行、pending／queued／running 10 件を上限とし、他の stream 用の容量を確保します。全体の上限は引き続き 10,000 行、処理待ち・実行中 100 件、参照 2 KiB、データベース 64 MiB で、実行中・待機中の記録は削除しません。Unix 以外では同等の所有者／ACL 検証が整うまで Pub/Sub のキーファイルのインポートを拒否します。Google API の読み戻しと実際の送受信は別途実機確認が必要です。 インポート時と worker 起動時は exactly-once 配信が有効なサブスクリプションを拒否するため、Google Cloud で無効にしてください。無効・期限切れ ACK（HTTP 400）では古い配信バッチのみを破棄して再取得し、永続重複除去記録は保持します。一時的な ACK 失敗ではバッチを保持して再試行します。
 
 ## Microsoft Teams
 

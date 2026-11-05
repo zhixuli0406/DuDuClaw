@@ -179,6 +179,7 @@ pub(crate) async fn handle(
     let Some(app) = crate::agent_channels::store::agent_chat_app(&ctx.home_dir, agent).await else {
         return unauthorized();
     };
+    if app.connection != "http" { return unauthorized(); }
     let Some(creds) = creds_for(&ctx.home_dir, agent, app.service_account.expose()) else {
         warn!(agent, "Google Chat (own app): stored service-account key is unusable — rejecting");
         return unauthorized();
@@ -192,6 +193,7 @@ pub(crate) async fn handle(
         return unauthorized();
     };
     if current.project_number != app.project_number { return unauthorized(); }
+    if current.connection != "http" { return unauthorized(); }
     let label = crate::agent_channels::label("googlechat", agent);
     set_channel_connected(&ctx.channel_status, &label, true, None, Some(&ctx.event_tx)).await;
     let state = Arc::new(GoogleChatState {

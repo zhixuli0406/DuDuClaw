@@ -68,6 +68,13 @@ pub fn apply_googlechat(
     Ok(())
 }
 
+pub fn apply_googlechat_transport(table: &mut toml::Table, connection: &str, subscription: &str) -> Result<(), String> {
+    let section = channel_section(table, "googlechat")?;
+    section.insert("connection".into(), toml::Value::String(connection.into()));
+    section.insert("pubsub_subscription".into(), toml::Value::String(subscription.into()));
+    Ok(())
+}
+
 /// Remove `[channels.<channel>]`. `true` when something was removed.
 pub fn remove_channel(table: &mut toml::Table, channel: &str) -> bool {
     table
@@ -78,6 +85,8 @@ pub fn remove_channel(table: &mut toml::Table, channel: &str) -> bool {
 
 /// An employee's own Google Chat app as configured on disk right now.
 pub struct AgentChatApp {
+    pub connection: String,
+    pub pubsub_subscription: String,
     pub project_number: String,
     pub service_account: Secret,
 }
@@ -99,6 +108,12 @@ fn googlechat_section(home: &Path, agent_id: &str) -> Option<toml::Table> {
         .cloned()
 }
 
+/// Cheap transport selector for the receiver supervisor; do not resolve
+/// external credentials for employees using the HTTP transport.
+pub(crate) fn agent_uses_pubsub(home: &Path, agent_id: &str) -> bool {
+    googlechat_section(home, agent_id).and_then(|s| s.get("connection").and_then(|v| v.as_str()).map(str::to_string)).as_deref() == Some("pubsub")
+}
+
 /// Whether the employee's `agent.toml` has a `[channels.googlechat]` section
 /// at all (configured, even if its key cannot be resolved right now).
 pub fn agent_has_googlechat_section(home: &Path, agent_id: &str) -> bool {
@@ -110,7 +125,7 @@ pub fn agent_has_googlechat_section(home: &Path, agent_id: &str) -> bool {
 /// be resolved — callers fail closed.
 pub async fn agent_chat_app(home: &Path, agent_id: &str) -> Option<AgentChatApp> {
     let section = googlechat_section(home, agent_id)?;
-    if let Err(error) = super::googlechat_config::validate_fields(section.keys().map(String::as_str), &["project_number", "service_account_json", "service_account_json_enc"]) {
+    if let Err(error) = super::googlechat_config::validate_fields(section.keys().map(String::as_str), &["project_number", "service_account_json", "service_account_json_enc", "connection", "pubsub_subscription"]) {
         tracing::warn!(agent_id, "{error}");
         return None;
     }
@@ -131,7 +146,18 @@ pub async fn agent_chat_app(home: &Path, agent_id: &str) -> Option<AgentChatApp>
     );
     let sm_cfg = SecretManagerConfig::load_from_home(home).await;
     let service_account = reference.resolve(&sm_cfg, home).await?;
+    let connection = match section.get("connection") {
+        None => "http",
+        Some(v) => v.as_str()?,
+    }.to_string();
+    let pubsub_subscription = match section.get("pubsub_subscription") {
+        None => "",
+        Some(v) => v.as_str()?,
+    }.to_string();
+    super::googlechat_config::validate_connection(&connection, &pubsub_subscription, service_account.expose()).ok()?;
     Some(AgentChatApp {
+        connection,
+        pubsub_subscription,
         project_number,
         service_account,
     })

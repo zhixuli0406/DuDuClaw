@@ -9795,5 +9795,9 @@
   "mcpKeys.oauth.neverUsed": "Not used yet",
   "mcpKeys.oauth.revokeTitle": "Revoke connection",
   "mcpKeys.oauth.confirm": "Revoke access for {client}? This application will no longer be able to use this grant to access data.",
-  "mcpKeys.oauth.revoked": "Connection revoked"
+  "mcpKeys.oauth.revoked": "Connection revoked",
+  "googlechat.setup.connection": "Connection type",
+  "googlechat.setup.pubsubHint": "Pub/Sub needs no public URL. DuDuClaw re-reads every message from Google Chat before processing its content and sender. Google Chat dialogs are not supported.",
+  "googlechat.setup.subscription": "Full Pub/Sub subscription name",
+  "googlechat.setup.topicFromScript": "Use the topic name printed by the setup script"
 }

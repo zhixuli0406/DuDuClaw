@@ -4,7 +4,7 @@ Google Chat channel credentials authorize the Chat application (`chat.bot`). The
 
 DuDuClaw supports Google Chat and Microsoft Teams as first-class channels
 (alongside Telegram / LINE / Discord / Slack / WhatsApp / Feishu / WebChat).
-Teams and Google Chat need a public HTTPS gateway.
+Teams and Google Chat HTTP mode need a public HTTPS gateway; Google Chat Pub/Sub mode does not.
 
 Both channels include:
 
@@ -22,7 +22,7 @@ Both channels include:
 
 ### Before you start
 
-Use a Business or Enterprise Google Workspace account with Chat enabled and an administrator who allows Chat apps. You need permission to create or directly own a Cloud project, enable Chat API, and create a service account and key. Local setup needs Bash, Python 3, `gcloud`, your own `gcloud auth login`, and a public HTTPS gateway URL; Cloud Shell supplies the command-line tools. A Pub/Sub mode that works without a public URL is planned for a later release.
+Use a Business or Enterprise Google Workspace account with Chat enabled and an administrator who allows Chat apps. You need permission to create or directly own a Cloud project, enable Chat API, and create a service account and key. Local setup needs Bash, Python 3, `gcloud`, your own `gcloud auth login`, and, for HTTP mode, a public HTTPS gateway URL; Cloud Shell supplies the command-line tools. Pub/Sub mode uses outbound connections without a public URL.
 
 ### One-step setup
 
@@ -35,7 +35,7 @@ The automatic import requires a running DuDuClaw gateway and an administrator lo
 duduclaw channels googlechat bootstrap --endpoint-url https://chat.example.com/webhook/googlechat
 ```
 
-The command creates a project, enables Chat API, and prepares a service account before creating its private JSON key as the last cloud step. It then imports the settings. `--project-id your-project-id` reuses a project you directly own; group or inherited ownership is conservatively refused. Optional flags: `--app-name`, `--agent`, `--out`, and `--dry-run` (no cloud or local changes). The default project ID is `duduclaw-chat-<random6>`. The private output directory stores `service-account.json` with mode 0600. A rerun reuses a matching key. Imported credentials are encrypted at rest. If a later script step fails after key creation, it attempts to revoke the new cloud key and remove the local file. Revocation failures or an unreadable key ID are reported for manual follow-up. If the script succeeds but CLI import fails, the CLI keeps the key file and exits non-zero. The new service-account key remains valid; the error includes the file path and exact commands to retry the import or revoke the key manually. The CLI never revokes keys or deletes key files automatically.
+The command creates a project, enables Chat API, and prepares a service account before creating its private JSON key as the last cloud step. It then imports the settings. `--project-id your-project-id` reuses a project you directly own; group or inherited ownership is conservatively refused. Optional flags: `--app-name`, `--agent`, `--out`, and `--dry-run` (no cloud or local changes). The default project ID is `duduclaw-chat-<random6>`. The private output directory stores `service-account.json` with mode 0600. A rerun reuses a matching key. Imported credentials are encrypted at rest. In HTTP mode, if a later script step fails after key creation, it attempts to revoke the new cloud key and remove the local file. Revocation failures or an unreadable key ID are reported for manual follow-up. If the script succeeds but CLI import fails, the CLI keeps the key file and exits non-zero. The new service-account key remains valid; the error includes the file path and exact commands to retry the import or revoke the key manually. The CLI never revokes keys or deletes key files automatically.
 
 If you do not have local gcloud, [open Cloud Shell](https://shell.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/zhixuli0406/DuDuClaw&cloudshell_tutorial=scripts/googlechat/cloudshell-tutorial.md&show=terminal) and run `bash scripts/googlechat/bootstrap.sh --endpoint-url https://chat.example.com/webhook/googlechat`. Download the key securely to your DuDuClaw host, set `chmod 600 /private/path/service-account.json`, and run the printed import command with its local path. On Windows, keep the plain regular key file inside your own user profile directory. Reparse points are refused; owner and ACL permissions are not verified.
 
@@ -68,6 +68,24 @@ For the managed constraint, an administrator should verify support in their inst
 ### Appendix: manual setup
 
 Create a project, enable Chat API, create a service account and JSON key, and configure the Chat page as above. In **Channels → Add Google Chat → Manual setup**, enter the project number and full JSON key. Save and test a message. HTTP verifies the inbound JWT against `chat@system.gserviceaccount.com` and your project number. Unsupported Workspace add-on payloads produce a diagnostic asking you to uncheck the add-on option.
+
+### Pub/Sub: no public gateway URL
+
+On a Unix DuDuClaw host, run:
+
+```bash
+duduclaw channels googlechat bootstrap --connection pubsub
+# Or import a previously created key and pull subscription:
+duduclaw channels googlechat import --connection pubsub --project-number 123456789012 --key-file /private/path/service-account.json --subscription projects/your-project-id/subscriptions/duduclaw-chat-events-sub
+```
+
+Cloud Shell uses `bash scripts/googlechat/bootstrap.sh --connection pubsub`; download the key securely and run the printed import command on your host. Add `--agent alice` for an employee-specific app, using a dedicated project for each app. The script enables Chat and Pub/Sub APIs, creates `projects/<project-id>/topics/duduclaw-chat-events` and a pull subscription with one-day delivery retention, grants the Google Chat publisher access to the topic, and grants the app service account subscriber and metadata-read access to that subscription. Resource checks and IAM grants finish before key creation. Existing subscriptions must point at the canonical topic; their settings are not changed automatically. Both import and worker startup re-read the subscription from Google. Pub/Sub setup failures print manual revocation commands and retain the key; destructive gcloud commands are never executed in this mode.
+
+In Chat Configuration, turn off **Build this Chat app as a Google Workspace add-on**, choose **Cloud Pub/Sub**, and paste the topic from the summary. No public HTTP endpoint is required. Keep the other app/visibility settings above and test an actual message. The gateway needs outbound HTTPS access to Google OAuth, Pub/Sub and Chat APIs.
+
+The gateway re-reads every message from Google Chat with [`spaces.messages.get`](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/get), using app authentication and `https://www.googleapis.com/auth/chat.bot`. No administrator-approved Chat scope is requested. The pull token separately uses only `https://www.googleapis.com/auth/pubsub`. Pub/Sub content is an untrusted notification: only a strictly validated Chat message resource name is used for the lookup. Sender, space, text, attachments and thread come from the API response. Sender allowlists, pairing and approval rules apply to that fetched identity. A missing/inaccessible message (including 403/404), invalid resource or mismatched space is dropped with a diagnostic and creates no turn. Check app access and the `chat.bot` scope when the operator hint appears. Events without a fetchable message, including app-added events, do not start employee turns.
+
+A bounded persistent inbox deduplicates by event type and Chat message resource name, so republishing with a new Pub/Sub message ID does not rerun a retained event. Records are retained for seven days; messages whose API creation time is older than seven days are refused even after pruning. Accepted events are stored before acknowledgement. After a restart, not-started work may resume, while interrupted running work is marked uncertain and is not automatically rerun. Full queues are acknowledged and dropped without starting a turn. This is not an end-to-end exactly-once delivery guarantee. The Unix-only inbox stores only resource references, never message text, sender details or attachments. Each app stream (employee/shared app and project number) is capped at 1,000 rows and 10 pending/queued/running entries, reserving capacity for other streams; global hard caps remain 10,000 rows and 100 active entries, 2 KiB per reference and a 64 MiB database; live queued/running entries are not evicted. Pub/Sub key-file import is refused on non-Unix platforms until equivalent owner/ACL validation is available. Google-side message retrieval and round trips still require live acceptance. Import and worker startup reject subscriptions with exactly-once delivery enabled; keep that option disabled in Google Cloud. An invalid/expired ACK response (HTTP 400) discards only the old delivery batch and pulls again; durable deduplication records remain intact. Transient ACK failures retain the batch for retry.
 
 ## Microsoft Teams
 

@@ -1519,6 +1519,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // (crate::googlechat_agents); credentials are checked in the background.
     let googlechat_agents_router = crate::googlechat_agents::router(reply_ctx.clone());
     crate::googlechat_agents::spawn_boot_probes(reply_ctx.clone());
+    crate::googlechat_pubsub::spawn(reply_ctx.clone());
     // Odoo website Live Chat: the bot answers as an Odoo operator. Always
     // spawned; it idles until `[odoo_livechat] enabled = true`, so the
     // dashboard can switch it on without a restart (crate::odoo_livechat).

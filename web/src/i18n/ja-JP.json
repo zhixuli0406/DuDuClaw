@@ -9795,5 +9795,9 @@
   "mcpKeys.oauth.neverUsed": "未使用",
   "mcpKeys.oauth.revokeTitle": "接続の認可を取り消す",
   "mcpKeys.oauth.confirm": "{client} の認可を取り消しますか？このアプリは、この認可を使ってデータにアクセスできなくなります。",
-  "mcpKeys.oauth.revoked": "接続の認可を取り消しました"
+  "mcpKeys.oauth.revoked": "接続の認可を取り消しました",
+  "googlechat.setup.connection": "接続方法",
+  "googlechat.setup.pubsubHint": "Pub/Sub は公開 URL が不要です。DuDuClaw は Google Chat から各メッセージを再取得し、本文と送信者を確認して処理します。Google Chat のダイアログには対応していません。",
+  "googlechat.setup.subscription": "Pub/Sub サブスクリプションの完全名",
+  "googlechat.setup.topicFromScript": "設定スクリプトが表示するトピック名を使用してください"
 }
