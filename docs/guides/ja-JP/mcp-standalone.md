@@ -30,8 +30,12 @@ npx duduclaw mcp init --client codex
 [mcp_servers.duduclaw]
 command = "npx"
 args = ["-y", "duduclaw@<バージョン>", "mcp-server"]
-env = { DUDUCLAW_MCP_API_KEY = "ddc_refresh_prod_…" }
+env = { DUDUCLAW_MCP_API_KEY = "ddc_refresh_prod_…", DUDUCLAW_AGENT_ID = "standalone-codex", DUDUCLAW_AGENT_TOKEN = "<generated identity token>" }
 ```
+
+この署名済み ID は standalone クライアント専用です。従業員や remote bridge の認証には使用できません。
+
+生成された環境変数をすべてコピーしてください。厳格モードでの起動には API キーとホスト署名済みの ID が必要です。既存のクライアントは更新後に `mcp init` を再実行し、ID 検証を無効にしないでください。
 
 `<バージョン>` は `mcp init` を実行したバージョン（`duduclaw --version` の表示）です。設定はこのバージョンに固定されるので、クライアントが起動するサーバーはキーを発行したものと同じです。アップグレード後は `mcp init` を再実行してください。
 

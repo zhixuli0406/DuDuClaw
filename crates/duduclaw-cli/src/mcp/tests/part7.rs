@@ -23,6 +23,8 @@ impl Drop for HostPrincipal {
 
 fn home_with_queue() -> TempDir {
     let tmp = TempDir::new();
+    // Main-target admission fails closed if the gateway config is missing.
+    fs::write(tmp.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
     let agents_dir = tmp.path().join("agents");
     fs::create_dir_all(&agents_dir).unwrap();
     create_test_agent(&agents_dir, "main", "");
@@ -130,6 +132,7 @@ async fn tasks_create_records_the_principal_from_the_host_only() {
     let _lock = OBO_LOCK.lock().await;
     let tmp = TempDir::new();
     let home = tmp.path();
+    fs::write(home.join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
     create_test_agent(&home.join("agents"), "agnes", "");
     let principal = account_principal(home, "manager", duduclaw_auth::UserRole::Manager);
     let _host = HostPrincipal::set(&principal);

@@ -323,11 +323,20 @@ pub(crate) fn prepare(
     let scopes = validate_scopes(&opts.scopes).map_err(DuDuClawError::Config)?;
     ensure_home(home)?;
     let client_id = opts.client.client_id();
+    // Operator-only initialization provisions the same signed identity that
+    // strict MCP startup verifies; never repair or replace an existing key.
+    let identity_key = duduclaw_core::identity_token::ensure_key(home)
+        .map_err(|e| DuDuClawError::Config(format!("initialize MCP identity failed: {e}")))?;
+    // This reserved API-client identity can never be an employee or bridge
+    // identity; stdio verifies it together with its matching external API key.
+    let identity_token = duduclaw_core::mint_identity_token(&identity_key, &client_id);
     let (token, meta) =
         crate::mcp_refresh::issue_refresh_token(home, TOKEN_ENV_LABEL, &client_id, &scopes, true)
             .map_err(|e| DuDuClawError::Config(format!("issue refresh token failed: {e}")))?;
     let launch = launch_for_exe(exe);
-    let env = client_env(&token, custom_home);
+    let mut env = client_env(&token, custom_home);
+    env.push((duduclaw_core::ENV_AGENT_ID.into(), client_id.clone()));
+    env.push((duduclaw_core::ENV_AGENT_TOKEN.into(), identity_token));
     Ok(InitPlan {
         client_id,
         jti: meta.jti,
@@ -921,7 +930,15 @@ mod tests {
         assert!(p.is_external);
         assert_eq!(p.client_id, "standalone-claude-code");
         assert_eq!(p.scopes, validate_scopes(STANDALONE_SCOPES).unwrap());
-        assert_eq!(plan.env, vec![("DUDUCLAW_MCP_API_KEY".into(), token)]);
+        let env: std::collections::HashMap<_, _> = plan.env.iter().cloned().collect();
+        assert_eq!(env[duduclaw_core::ENV_AGENT_ID], plan.client_id);
+        assert_eq!(duduclaw_core::identity_token::verify_claim(
+            &home, &env[duduclaw_core::ENV_AGENT_ID], &env[duduclaw_core::ENV_AGENT_TOKEN], true,
+        ), duduclaw_core::IdentityVerdict::Rejected, "standalone credentials cannot become employee/bridge identities");
+        assert!(duduclaw_core::verify_identity_token(
+            &duduclaw_core::load_identity_key(&home).unwrap(),
+            &env[duduclaw_core::ENV_AGENT_ID], &env[duduclaw_core::ENV_AGENT_TOKEN],
+        ));
         assert_eq!(plan.launch.args, vec!["mcp-server".to_string()]);
     }
 
@@ -935,6 +952,29 @@ mod tests {
         assert_eq!(l.args, vec!["-y", pinned.as_str(), "mcp-server"]);
         let l = launch_for_exe(Path::new("/usr/local/lib/node_modules/x_npx/bin/duduclaw"));
         assert_eq!(l.command, "/usr/local/lib/node_modules/x_npx/bin/duduclaw");
+    }
+
+    #[test]
+    fn prepare_refuses_a_lost_initialized_identity_key_without_replacing_it() {
+        let home = tempfile::tempdir().unwrap();
+        duduclaw_core::identity_token::ensure_key(home.path()).unwrap();
+        std::fs::remove_file(home.path().join("identity.key")).unwrap();
+        let error = prepare(home.path(), &opts(InitClient::Print),
+            Path::new("/opt/bin/duduclaw"), None, &[]).unwrap_err();
+        assert!(error.to_string().contains("initialize MCP identity failed"));
+        assert!(!home.path().join("identity.key").exists());
+        assert!(!home.path().join("mcp_tokens.db").exists());
+    }
+
+    #[test]
+    fn prepare_refuses_a_damaged_identity_key_without_issuing_credentials() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("identity.key"), b"damaged").unwrap();
+        let error = prepare(home.path(), &opts(InitClient::Print),
+            Path::new("/opt/bin/duduclaw"), None, &[]).unwrap_err();
+        assert!(error.to_string().contains("initialize MCP identity failed"));
+        assert_eq!(std::fs::read(home.path().join("identity.key")).unwrap(), b"damaged");
+        assert!(!home.path().join("mcp_tokens.db").exists());
     }
 
     #[test]

@@ -355,6 +355,25 @@ pub fn caller_identity_verdict(home_dir: &Path) -> duduclaw_core::IdentityVerdic
             return duduclaw_core::IdentityVerdict::Rejected;
         }
     };
+    let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    let claimed = claimed.trim();
+    if claimed.starts_with(duduclaw_core::STANDALONE_CLIENT_PREFIX) {
+        // Standalone transport identities occupy the reserved API-client
+        // namespace, never the employee/remote-bridge namespace. Require both
+        // live external API authentication for this exact client and a valid
+        // host signature, even during an employee-token grace period.
+        let authenticated = crate::mcp_auth::authenticate_from_env(home_dir)
+            .is_ok_and(|principal| principal.is_external && principal.client_id == claimed);
+        let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
+        let signed = duduclaw_core::is_valid_agent_id(claimed)
+            && duduclaw_core::load_identity_key(home_dir)
+                .is_some_and(|key| duduclaw_core::verify_identity_token(&key, claimed, &token));
+        return if authenticated && signed {
+            duduclaw_core::IdentityVerdict::Verified
+        } else {
+            duduclaw_core::IdentityVerdict::Rejected
+        };
+    }
     duduclaw_core::verify_env_identity(home_dir, require)
 }
 

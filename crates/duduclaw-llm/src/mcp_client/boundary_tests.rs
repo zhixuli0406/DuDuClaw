@@ -167,6 +167,9 @@ for line in sys.stdin:
     req = json.loads(line)
     if 'id' not in req: continue
     method = req.get('method')
+    if method == 'server/discover':
+        print(json.dumps({'jsonrpc':'2.0','id':req['id'],'error':{'code':-32601,'message':'legacy'}}), flush=True)
+        continue
     if method == 'initialize':
         result = {'protocolVersion':'2025-06-18','capabilities':{'tools':{}},'serverInfo':{'name':'test','version':'1'}}
     elif method == 'tools/list':

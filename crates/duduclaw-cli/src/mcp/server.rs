@@ -10,6 +10,15 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     // running as `__untrusted__` and answering every tool call with a
     // confusing "not in your team".
     if caller_identity_verdict(home_dir) == duduclaw_core::IdentityVerdict::Rejected {
+        // A fresh standalone install lacks both credentials. Keep the identity
+        // refusal first, while still pointing the operator to initialization.
+        let init_hint = if std::env::var_os("DUDUCLAW_MCP_API_KEY").is_none()
+            && std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default().trim().is_empty()
+        {
+            " Run: duduclaw mcp init --client claude-code"
+        } else {
+            ""
+        };
         return Err(DuDuClawError::Gateway(format!(
             "MCP caller identity rejected: cannot verify {} against {} using {}. \
              The signing key must be readable, contain exactly 32 bytes, and have \
@@ -17,7 +26,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
              it is damaged. Identity enforcement defaults to strict; the policy \
              must be readable and valid, and system/queue sender names are refused. \
              After repairing the key or policy, restart the gateway to re-issue \
-             agent MCP configs.",
+             agent MCP configs.{init_hint}",
             duduclaw_core::ENV_AGENT_TOKEN,
             duduclaw_core::ENV_AGENT_ID,
             duduclaw_core::identity_key_path(home_dir).display(),
@@ -55,6 +64,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     let auth_cache = crate::mcp_auth::KeyRegistryCache::new();
     let principal = crate::mcp_auth::authenticate_from_env_cached(home_dir, &auth_cache)
         .map_err(|e| DuDuClawError::Gateway(startup_auth_error(&e)))?;
+
     // Memory namespace unification (v1.68.0): an internal-key caller whose
     // `DUDUCLAW_AGENT_ID` is proven by `DUDUCLAW_AGENT_TOKEN` reads and writes
     // memory under the bare employee id — the same rows the gateway distils,

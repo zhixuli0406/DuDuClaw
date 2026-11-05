@@ -27,7 +27,7 @@ fn base_command(home: &Path, data: &Path) -> Command {
 }
 
 /// Run `duduclaw mcp init --client print` and take the key from its output.
-fn init_token(home: &Path, data: &Path) -> String {
+fn init_env(home: &Path, data: &Path) -> Vec<(String, String)> {
     let out = base_command(home, data)
         .args(["mcp", "init", "--client", "print"])
         .output()
@@ -38,14 +38,15 @@ fn init_token(home: &Path, data: &Path) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let marker = "DUDUCLAW_MCP_API_KEY=";
-    let start = stdout.find(marker).expect("key in output") + marker.len();
-    stdout[start..]
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .trim_matches('\'')
-        .to_string()
+    ["DUDUCLAW_MCP_API_KEY", duduclaw_core::ENV_AGENT_ID, duduclaw_core::ENV_AGENT_TOKEN]
+        .into_iter()
+        .map(|key| {
+            let marker = format!("{key}=");
+            let start = stdout.find(&marker).expect("credential in init output") + marker.len();
+            let value = stdout[start..].split_whitespace().next().unwrap().trim_matches('\'');
+            (key.to_string(), value.to_string())
+        })
+        .collect()
 }
 
 struct Server {
@@ -56,9 +57,9 @@ struct Server {
 }
 
 impl Server {
-    fn start(home: &Path, data: &Path, token: &str, cwd: &Path) -> Self {
+    fn start(home: &Path, data: &Path, env: &[(String, String)], cwd: &Path) -> Self {
         let mut child = base_command(home, data)
-            .env("DUDUCLAW_MCP_API_KEY", token)
+            .envs(env.iter().cloned())
             .arg("mcp-server")
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -163,11 +164,11 @@ fn standalone_init_key_lists_only_callable_tools_and_round_trips() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&cwd).unwrap();
 
-    let token = init_token(&home, &data);
-    assert!(token.starts_with("ddc_refresh_"), "{token}");
+    let env = init_env(&home, &data);
+    assert!(env[0].1.starts_with("ddc_refresh_"));
     assert!(data.join("mcp_tokens.db").is_file());
 
-    let mut server = Server::start(&home, &data, &token, &cwd);
+    let mut server = Server::start(&home, &data, &env, &cwd);
     let list = server.request("tools/list", json!({}));
     let names: Vec<String> = list["result"]["tools"]
         .as_array()
@@ -265,6 +266,45 @@ fn standalone_init_key_lists_only_callable_tools_and_round_trips() {
         !data.join("agents/dudu").exists(),
         "nothing may be written for the default agent"
     );
+}
+
+#[test]
+fn standalone_api_key_does_not_bypass_strict_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = home.join(".duduclaw");
+    let env = init_env(&home, &data);
+    let bridge = base_command(&home, &data)
+        .envs(env.iter().cloned())
+        .args(["mcp-remote-bridge", "--agent", "standalone-print", "--server", "test"])
+        .stdin(Stdio::null())
+        .output().unwrap();
+    assert_eq!(bridge.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bridge.stderr)
+        .contains("MCP remote bridge requires a verified identity matching --agent"));
+    for case in ["missing_token", "wrong_agent", "other_standalone_client", "damaged_key"] {
+        let mut supplied = env.clone();
+        match case {
+            "missing_token" => supplied.retain(|(key, _)| key != duduclaw_core::ENV_AGENT_TOKEN),
+            "wrong_agent" => supplied.iter_mut()
+                .find(|(key, _)| key == duduclaw_core::ENV_AGENT_ID).unwrap().1 = "other-agent".into(),
+            "other_standalone_client" => {
+                let key = duduclaw_core::load_identity_key(&data).unwrap();
+                supplied.iter_mut().find(|(key, _)| key == duduclaw_core::ENV_AGENT_ID)
+                    .unwrap().1 = "standalone-codex".into();
+                supplied.iter_mut().find(|(key, _)| key == duduclaw_core::ENV_AGENT_TOKEN)
+                    .unwrap().1 = duduclaw_core::mint_identity_token(&key, "standalone-codex");
+            }
+            _ => std::fs::write(data.join("identity.key"), b"damaged").unwrap(),
+        }
+        let out = base_command(&home, &data)
+            .envs(supplied)
+            .arg("mcp-server")
+            .stdin(Stdio::null())
+            .output().unwrap();
+        assert!(!out.status.success(), "{case}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("MCP caller identity rejected"), "{case}");
+    }
 }
 
 #[test]

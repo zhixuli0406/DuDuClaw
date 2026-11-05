@@ -341,6 +341,16 @@ fn base_command(home: &Path, data: &Path) -> Command {
     cmd
 }
 
+fn server_command(home: &Path, data: &Path) -> Command {
+    // R-5 requires a host-signed identity even in an isolated test home.
+    let key = duduclaw_core::identity_token::ensure_key(data).unwrap();
+    let agent = "mcp-protocol-test";
+    let mut cmd = base_command(home, data);
+    cmd.env(duduclaw_core::ENV_AGENT_ID, agent)
+        .env(duduclaw_core::ENV_AGENT_TOKEN, duduclaw_core::mint_identity_token(&key, agent));
+    cmd
+}
+
 fn init_token(home: &Path, data: &Path) -> String {
     let out = base_command(home, data)
         .args(["mcp", "init", "--client", "print"])
@@ -371,7 +381,7 @@ struct Stdio_ {
 impl Stdio_ {
     fn start(home: &Path, data: &Path) -> Self {
         let token = init_token(home, data);
-        let mut child = base_command(home, data)
+        let mut child = server_command(home, data)
             .env("DUDUCLAW_MCP_API_KEY", token)
             .arg("mcp-server")
             .current_dir(data)
@@ -534,7 +544,7 @@ fn stdio_modern_subscription_receives_tagged_list_changed() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&data).unwrap();
     write_key(&data, "\"memory:read\", \"memory:write\"");
-    let mut child = base_command(&home, &data)
+    let mut child = server_command(&home, &data)
         .env("DUDUCLAW_MCP_API_KEY", KEY)
         .arg("mcp-server")
         .current_dir(&data)
@@ -656,7 +666,7 @@ fn stdio_listen_refuses_when_authentication_fails() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&data).unwrap();
     write_key(&data, "\"memory:read\"");
-    let mut child = base_command(&home, &data)
+    let mut child = server_command(&home, &data)
         .env("DUDUCLAW_MCP_API_KEY", KEY)
         .arg("mcp-server")
         .current_dir(&data)
