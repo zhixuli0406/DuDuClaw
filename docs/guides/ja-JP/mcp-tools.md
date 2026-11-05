@@ -8,6 +8,56 @@ DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言し�
 ツールを追加する場合は先に [custom-mcp-tool.md](../custom-mcp-tool.md) を読んでください。このページは実装ではなく宣言面の話です。gateway なしで MCP サーバーだけを使う場合は [mcp-standalone.md](mcp-standalone.md) を参照してください。
 
 
+## MCP クライアントのプロトコルバージョン
+
+API／openai-compat クライアントとリモート MCP bridge は **2026-07-28** を優先します。
+`server/discover` で確認し、各リクエストにバージョン、クライアント機能、識別情報の
+metadata を付けます。HTTP では `MCP-Protocol-Version`、`Mcp-Method`、必要に応じて
+`Mcp-Name` を送信します。`x-mcp-header` 付きの引数をヘッダーへ反映し、不正な注釈の
+ツールは一覧から除外します。非 ASCII の値は規定の Base64 形式で送信します。
+
+旧サーバーには **2025-11-25** または **2025-06-18** で接続し、`initialize`、
+`notifications/initialized`、合意した session ヘッダーを使用します。初回の探測で
+`-32022` を受けた場合は共通の最新バージョンを選択します。接続後に bridge が
+同じエラーを受けると、操作を拒否して接続を無効にします。会話を再起動し、再協商、
+ツール一覧の取得、権限検査をやり直す必要があり、別バージョンで呼び出しを再送しません。
+API クライアントも `tools/call` で `-32022` を受けた場合は呼び出しを終了し、そのクライアントの
+後続リクエストを拒否します。host は再接続、ツール一覧の取得、権限検査をやり直す必要が
+あります。初回のハンドシェイクと独立した一覧取得時のバージョン復旧は維持します。
+明示的な modern の機能／ヘッダーエラーではダウングレードしません。新しい API HTTP
+接続は毎回独立して探測し、URL をキーとしたグローバルなバージョンキャッシュを使いません。
+bridge は自身の接続の協商状態だけを保持します。認証情報、session、ツール一覧を
+別の利用者と共有しません。API クライアントは旧 initialize も
+400／404／405 になると旧 HTTP+SSE を試しますが、`endpoint` は設定元と同一 origin に限定します。
+
+API クライアントの MRTR は各回で新しい ID と元の引数を使い、`requestState` を変更せず返し、回数を制限します。
+API クライアントには host input handler 接口があります。未登録の場合は対話機能を宣言せず、
+予期しない入力要求を拒否します。同意画面は追加しておらず、elicitation を自動承認しません。
+Tasks、sampling、roots は既定で無効です。リモート bridge は modern の対話機能を宣言せず、
+状態だけの応答を含むすべての `input_required` を拒否します。下流からのリクエストに
+`requestState` または `inputResponses` が含まれる場合も、送信前に拒否します。継続データ
+全体の外部送信・承認検査を元の承認済み呼び出しに結び付ける保護が整うまで、bridge の
+MRTR は利用できません。応答ストリームが切れた場合はエラーにし、結果が不明な操作を
+黙って再実行しません。既存のツール制限と第三者ツール分類は維持されます。
+
+リモート OAuth は事前登録済みの認証情報を優先します。CIMD を使う管理者は既存の公開
+HTTPS metadata 文書を設定できます。
+
+```toml
+[remote_mcp]
+client_metadata_url = "https://your-domain.example/mcp-client.json"
+```
+
+認可サーバーが CIMD をサポートする場合、文書の client ID はこの URL と一致し、既定の
+callback URI を許可し、公開クライアント認証（`token_endpoint_auth_method = "none"`）を
+使用する必要があります。選択した文書の検証失敗時は拒否します。未設定または非対応なら
+`application_type` を付けた動的登録にフォールバックします。PKCE と resource indicator を
+維持し、コード交換前に callback の `iss` を検証します。保存した認証情報は issuer に結び付けます。
+探測時と保存済みの OAuth resource は、MCP エンドポイントの canonical resource
+（scheme、host、port、末尾のスラッシュを除いた path）と完全に一致する必要があります。
+resource の query、fragment、同一 origin の別パスは拒否し、不一致の古い認証情報は再接続が必要です。
+403 の自動 scope step-up と CIMD `private_key_jwt` は未実装です。
+
 ## 会議の文字起こし
 
 `meeting_transcribe` は呼び出す従業員自身の添付ファイルの `source_path` と、任意の

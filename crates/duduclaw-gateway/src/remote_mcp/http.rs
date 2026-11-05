@@ -30,7 +30,7 @@ pub async fn read_capped(mut resp: reqwest::Response, max: usize) -> Result<Vec<
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| format!("reading the response failed: {e}"))?
+        .map_err(|_| "reading the response failed".to_string())?
     {
         if out.len() + chunk.len() > max {
             return Err(format!("response too large (over {max} bytes)"));
@@ -65,7 +65,7 @@ pub async fn get_json(
             .header("Accept", "application/json")
             .send()
             .await
-            .map_err(|e| format!("request to {} failed: {e}", host_label(&current)))?;
+            .map_err(|_| format!("request to {} failed", host_label(&current)))?;
         let status = resp.status();
         if status.is_redirection() {
             let loc = resp
@@ -102,7 +102,7 @@ pub async fn post_form(
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("request to {} failed: {e}", host_label(url)))?;
+        .map_err(|_| format!("request to {} failed", host_label(url)))?;
     let status = resp.status().as_u16();
     let bytes = read_capped(resp, MAX_JSON_BODY).await?;
     Ok((status, body_json(&bytes)))
@@ -117,7 +117,7 @@ pub async fn post_json(url: &Url, policy: OutboundPolicy, body: &Value) -> Resul
         .json(body)
         .send()
         .await
-        .map_err(|e| format!("request to {} failed: {e}", host_label(url)))?;
+        .map_err(|_| format!("request to {} failed", host_label(url)))?;
     let status = resp.status().as_u16();
     let bytes = read_capped(resp, MAX_JSON_BODY).await?;
     Ok((status, body_json(&bytes)))
@@ -133,24 +133,6 @@ pub fn host_label(url: &Url) -> String {
     }
 }
 
-/// A short, safe excerpt of an OAuth error answer (`error` /
-/// `error_description`), never the whole body.
-pub fn oauth_error_text(body: &Value) -> String {
-    let err = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
-    let desc = body
-        .get("error_description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let joined = match (err.is_empty(), desc.is_empty()) {
-        (true, true) => "no error details".to_string(),
-        (false, true) => err.to_string(),
-        (true, false) => desc.to_string(),
-        (false, false) => format!("{err}: {desc}"),
-    };
-    let cleaned: String = joined.chars().filter(|c| !c.is_control()).collect();
-    duduclaw_core::truncate_chars(&cleaned, 200)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,13 +143,22 @@ mod tests {
         assert_eq!(host_label(&u), "mcp.example.com:8443");
     }
 
-    #[test]
-    fn oauth_error_text_is_bounded_and_clean() {
-        let body = serde_json::json!({"error": "invalid_grant", "error_description": "x\u{7}y".repeat(200)});
-        let t = oauth_error_text(&body);
-        assert!(t.starts_with("invalid_grant: "));
-        assert!(!t.contains('\u{7}'));
-        assert!(t.chars().count() <= 200);
-        assert_eq!(oauth_error_text(&Value::Null), "no error details");
+    #[tokio::test]
+    async fn failed_requests_never_expose_secret_url_paths() {
+        // Keep the port bound but not listening: connect fails without a port race.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let url = Url::parse(&format!("http://{}/api/SECRET_PATH?key=SECRET_QUERY", socket.local_addr().unwrap())).unwrap();
+        let policy = OutboundPolicy::for_mcp_url(&url);
+        let errors = [
+            get_json(&url, policy, MAX_JSON_BODY).await.unwrap_err(),
+            post_form(&url, policy, &[], None).await.unwrap_err(),
+            post_json(&url, policy, &serde_json::json!({})).await.unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(error, format!("request to {} failed", host_label(&url)));
+            assert!(!error.contains("SECRET"));
+            assert!(!error.contains("/api/"));
+        }
     }
 }

@@ -17442,22 +17442,32 @@ fn remote_mcp_result_page(ok: bool, message: &str, back: Option<&str>) -> axum::
 /// `mcp.remote_connect`.
 async fn handle_remote_mcp_oauth_callback(
     State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::Query(pairs): axum::extract::Query<Vec<(String, String)>>,
 ) -> axum::response::Response {
     use crate::remote_mcp;
     let home = state.handler.home_dir().to_path_buf();
-    let st = params.get("state").map(String::as_str).unwrap_or("");
-    if let Some(err) = params.get("error") {
-        let pending = remote_mcp::connect::cancel_pending(st);
-        let back = pending.as_ref().map(|p| p.dashboard_base.clone());
-        if let Some(p) = &pending {
-            remote_mcp::audit(
-                &home,
-                remote_mcp::AUDIT_CONNECT_FAILED,
-                &p.agent_id,
-                serde_json::json!({ "agent_id": p.agent_id, "server": p.server, "error": duduclaw_core::truncate_chars(err, 100) }),
-            );
+    let mut params = std::collections::HashMap::new();
+    for (key, value) in pairs {
+        if params.insert(key.clone(), value).is_some()
+            && matches!(key.as_str(), "state" | "code" | "error" | "iss")
+        {
+            return remote_mcp_result_page(false, "The sign-in response contains repeated parameters.", None);
         }
+    }
+    let st = params.get("state").map(String::as_str).unwrap_or("");
+    let issuer = params.get("iss").map(String::as_str);
+    if let Some(err) = params.get("error") {
+        let pending = match remote_mcp::connect::cancel_pending_with_issuer(st, issuer) {
+            Ok(pending) => pending,
+            Err(error) => return remote_mcp_result_page(false, &error, None),
+        };
+        let back = pending.dashboard_base.clone();
+        remote_mcp::audit(
+            &home,
+            remote_mcp::AUDIT_CONNECT_FAILED,
+            &pending.agent_id,
+            serde_json::json!({ "agent_id": pending.agent_id, "server": pending.server, "error": duduclaw_core::truncate_chars(err, 100) }),
+        );
         let desc = params
             .get("error_description")
             .map(String::as_str)
@@ -17466,10 +17476,10 @@ async fn handle_remote_mcp_oauth_callback(
             &format!("The authorization server answered: {err} {desc}"),
             300,
         );
-        return remote_mcp_result_page(false, &msg, back.as_deref());
+        return remote_mcp_result_page(false, &msg, Some(&back));
     }
     let code = params.get("code").map(String::as_str).unwrap_or("");
-    match remote_mcp::connect::complete_callback(&home, st, code).await {
+    match remote_mcp::connect::complete_callback_with_issuer(&home, st, code, issuer).await {
         Ok(done) => match crate::handlers::finish_remote_sign_in(&home, &done).await {
             Ok(()) => {
                 info!(agent = %done.agent_id, server = %done.server, "remote MCP sign-in completed");

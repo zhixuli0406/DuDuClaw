@@ -23,6 +23,8 @@ const CLOSE_TOOL: usize = 11;
 const REVOKE_BEFORE_REPLY: usize = 12;
 const ECHO_BEARER: usize = 13;
 const HANG_SSE: usize = 14;
+// These tests assert authority and wire behavior, not loopback throughput.
+const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct ObservedRequest {
@@ -63,6 +65,7 @@ struct State {
     deny_tool: AtomicBool,
     prepare_delay_ms: AtomicUsize,
     release: Notify,
+    response_wait_ready: Notify,
 }
 
 struct Fixture {
@@ -117,7 +120,27 @@ impl Fixture {
             vec![],
         )
         .await
-        .unwrap()
+        .unwrap_or_else(|error| {
+            let methods: Vec<_> = self.state.requests.lock().unwrap()
+                .iter().map(|request| request.method.clone()).collect();
+            panic!("scoped fixture discovery failed: {error}; mode={}; posts={}; methods={methods:?}",
+                self.state.mode.load(Ordering::SeqCst),
+                self.state.received_posts.load(Ordering::SeqCst));
+        })
+    }
+
+    async fn registry_with_call_timeout(&self, timeout: Duration) -> ToolRegistry {
+        // Fixture setup includes discovery and must not consume the short
+        // deadline of the operation this test is meant to exercise.
+        let mut registry = self.registry(Duration::from_secs(10)).await;
+        let mut slot = registry.clients[0].lock().await;
+        let RegistryClient::ScopedHttp(client) = &mut *slot else {
+            panic!("expected scoped HTTP fixture");
+        };
+        client.recipe.operation_timeout = timeout;
+        drop(slot);
+        registry.scoped_operation_timeouts.insert(0, timeout);
+        registry
     }
 
     async fn wait_for_calls(&self, count: usize) {
@@ -226,10 +249,12 @@ async fn serve(mut socket: tokio::net::TcpStream, state: Arc<State>) {
                 return;
             }
             if mode == HANG_TOOL {
+                state.response_wait_ready.notify_one();
                 state.release.notified().await;
             }
             if mode == HANG_SSE {
                 let _ = socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 4096\r\n\r\ndata: ").await;
+                state.response_wait_ready.notify_one();
                 state.release.notified().await;
                 return;
             }
@@ -450,7 +475,7 @@ async fn initialization_revocation_prevents_the_next_post() {
     let result = registry.call("echo", json!({})).await;
     assert!(result.is_err() || result.is_ok_and(|value| value.is_error));
     assert_eq!(fixture.state.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(fixture.state.requests.lock().unwrap().len(), 4);
+    assert_eq!(fixture.state.requests.lock().unwrap().len(), 6);
     assert_eq!(fixture.state.active.load(Ordering::SeqCst), 0);
 }
 
@@ -482,7 +507,7 @@ async fn errors_are_single_attempt_and_release_the_lease() {
         REDIRECT,
     ] {
         let fixture = Fixture::new().await;
-        let registry = fixture.registry(Duration::from_secs(1)).await;
+        let registry = fixture.registry(FIXTURE_TIMEOUT).await;
         fixture.state.mode.store(mode, Ordering::SeqCst);
         let result = registry.call("echo", json!({})).await;
         let text = match result {
@@ -510,7 +535,7 @@ async fn errors_are_single_attempt_and_release_the_lease() {
 #[tokio::test]
 async fn success_redacts_the_current_bearer_from_provider_content() {
     let fixture = Fixture::new().await;
-    let registry = fixture.registry(Duration::from_secs(1)).await;
+    let registry = fixture.registry(FIXTURE_TIMEOUT).await;
     fixture.state.mode.store(ECHO_BEARER, Ordering::SeqCst);
     let result = registry.call("echo", json!({})).await.unwrap();
     assert!(!result.content.contains("scope-token-1"));
@@ -572,7 +597,7 @@ async fn deadline_covers_prepare_and_handshake_and_releases_owned_values() {
 #[tokio::test]
 async fn deadline_also_bounds_waiting_for_the_exact_client_lock() {
     let fixture = Fixture::new().await;
-    let registry = fixture.registry(Duration::from_millis(500)).await;
+    let registry = fixture.registry_with_call_timeout(Duration::from_millis(500)).await;
     let held = registry.clients[0].lock().await;
     let result = tokio::time::timeout(Duration::from_secs(1), registry.call("echo", json!({})))
         .await
@@ -617,7 +642,7 @@ async fn colliding_names_keep_the_first_route_guard_and_notice() {
             (
                 "same".into(),
                 RegistryClient::scoped_http(
-                    ScopedHttpRecipe::new(first.url.clone(), vec![], Duration::from_secs(1))
+                    ScopedHttpRecipe::new(first.url.clone(), vec![], FIXTURE_TIMEOUT)
                         .unwrap(),
                     Arc::new(HostGuard(first.state.clone())),
                 ),
@@ -625,7 +650,7 @@ async fn colliding_names_keep_the_first_route_guard_and_notice() {
             (
                 "same".into(),
                 RegistryClient::scoped_http(
-                    ScopedHttpRecipe::new(second.url.clone(), vec![], Duration::from_secs(1))
+                    ScopedHttpRecipe::new(second.url.clone(), vec![], FIXTURE_TIMEOUT)
                         .unwrap(),
                     Arc::new(HostGuard(second.state.clone())),
                 ),
@@ -798,11 +823,26 @@ async fn a_missing_proof_after_discovery_does_not_send_another_request() {
 async fn a_tools_response_or_sse_timeout_releases_authority_without_replay() {
     for mode in [HANG_TOOL, HANG_SSE] {
         let fixture = Fixture::new().await;
-        let registry = fixture.registry(Duration::from_millis(500)).await;
+        let registry = fixture.registry(FIXTURE_TIMEOUT).await;
         fixture.state.mode.store(mode, Ordering::SeqCst);
-        let result = tokio::time::timeout(Duration::from_secs(2), registry.call("echo", json!({})))
+        let running = tokio::spawn(async move { registry.call("echo", json!({})).await });
+        // A scoped call creates a fresh client and repeats discovery/initialize.
+        // Wait for the actual response stall before advancing its deadline;
+        // a wall-clock 500 ms budget can expire before tools/call on a busy host.
+        tokio::time::timeout(FIXTURE_TIMEOUT, fixture.state.response_wait_ready.notified())
             .await
+            .expect("fixture did not reach the tools/call response stall");
+        assert_eq!(fixture.state.active.load(Ordering::SeqCst), 1, "mode={mode}");
+        assert_eq!(fixture.state.calls.load(Ordering::SeqCst), 1, "mode={mode}");
+        let posts_at_stall = fixture.state.received_posts.load(Ordering::SeqCst);
+        assert!(!running.is_finished(), "mode={mode}");
+        tokio::time::pause();
+        tokio::time::advance(FIXTURE_TIMEOUT + Duration::from_millis(1)).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("scoped call did not terminate at its deadline")
             .unwrap();
+        tokio::time::resume();
         let text = match result {
             Ok(result) => {
                 assert!(result.is_error);
@@ -810,9 +850,11 @@ async fn a_tools_response_or_sse_timeout_releases_authority_without_replay() {
             }
             Err(error) => error,
         };
-        assert!(text.contains("unconfirmed"));
-        assert_eq!(fixture.state.active.load(Ordering::SeqCst), 0);
-        assert_eq!(fixture.state.calls.load(Ordering::SeqCst), 1);
+        assert!(text.contains("unconfirmed"), "mode={mode}: {text}");
+        assert_eq!(fixture.state.active.load(Ordering::SeqCst), 0, "mode={mode}");
+        assert_eq!(fixture.state.calls.load(Ordering::SeqCst), 1, "mode={mode}");
+        assert_eq!(fixture.state.received_posts.load(Ordering::SeqCst), posts_at_stall,
+            "deadline must not replay any request; mode={mode}");
         fixture.state.release.notify_one();
     }
 }
@@ -901,27 +943,31 @@ async fn revocation_after_owned_prepare_prevents_even_the_first_initialize_post(
 #[tokio::test]
 async fn revocation_after_a_successful_validation_blocks_notification_and_list_posts() {
     for (checkpoint, expected_methods) in [
-        ("initialize", vec!["initialize"]),
+        ("initialize", vec!["server/discover", "initialize"]),
         (
             "notifications/initialized",
-            vec!["initialize", "notifications/initialized"],
+            vec!["server/discover", "initialize", "notifications/initialized"],
         ),
     ] {
         let fixture = Fixture::new().await;
         *fixture.state.pause_validation_after_method.lock().unwrap() = Some(checkpoint.into());
         let slot = RegistryClient::scoped_http(
-            ScopedHttpRecipe::new(fixture.url.clone(), vec![], Duration::from_secs(2)).unwrap(),
+            ScopedHttpRecipe::new(fixture.url.clone(), vec![], FIXTURE_TIMEOUT).unwrap(),
             Arc::new(HostGuard(fixture.state.clone())),
         );
         let running = tokio::spawn(async move {
             ToolRegistry::from_client_slots_named(vec![("scoped".into(), slot)], vec![]).await
         });
         tokio::time::timeout(
-            Duration::from_secs(1),
+            FIXTURE_TIMEOUT,
             fixture.state.validation_ready.notified(),
         )
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            let methods: Vec<_> = fixture.state.requests.lock().unwrap()
+                .iter().map(|request| request.method.clone()).collect();
+            panic!("did not reach {checkpoint} validation: {error}; methods={methods:?}");
+        });
         assert_eq!(fixture.state.active.load(Ordering::SeqCst), 1);
         assert_eq!(
             fixture.state.received_posts.load(Ordering::SeqCst),
@@ -982,13 +1028,13 @@ async fn revocation_after_notification_validation_prevents_the_tools_call_post()
     }
     assert_eq!(
         fixture.state.received_posts.load(Ordering::SeqCst),
-        before_posts + 2
+        before_posts + 3
     );
     let methods: Vec<_> = fixture.state.requests.lock().unwrap()[before_requests..]
         .iter()
         .map(|request| request.method.clone())
         .collect();
-    assert_eq!(methods, ["initialize", "notifications/initialized"]);
+    assert_eq!(methods, ["server/discover", "initialize", "notifications/initialized"]);
     assert_eq!(fixture.state.calls.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.state.active.load(Ordering::SeqCst), 0);
     assert_eq!(

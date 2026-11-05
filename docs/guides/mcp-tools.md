@@ -12,6 +12,63 @@ declaration surface, not the implementation. To run the server on its own,
 without the gateway, see [mcp-standalone.md](mcp-standalone.md).
 
 
+## MCP client protocol versions
+
+The API/openai-compat client and remote MCP bridge prefer **2026-07-28**. They
+probe with `server/discover` and put the revision, client capabilities and client
+identity in each request. HTTP requests include `MCP-Protocol-Version`, `Mcp-Method`
+and, where required, `Mcp-Name`. Valid `x-mcp-header` tool arguments are mirrored
+into headers; tools with invalid annotations are hidden. Unicode header values
+use the protocol's Base64 encoding.
+
+Older servers fall back to **2025-11-25** or **2025-06-18** with `initialize`,
+`notifications/initialized` and the negotiated session header. During initial
+discovery, `-32022` selects the newest mutually supported revision. Once connected,
+the bridge refuses `-32022`, invalidates the connection and requires a conversation
+restart to negotiate, list tools and apply the gates again; it never replays the
+call under a different revision. The API client also terminates a `tools/call`
+that receives `-32022` and refuses all subsequent requests on that client. Its host
+must reconnect, list tools and apply the gates again; initial handshake and
+standalone list recovery remain available. Explicit modern capability/header errors do not
+trigger a downgrade. Each new API HTTP connection performs its own discovery;
+there is no global URL-only version cache. The bridge retains negotiation state
+only for its own connection. Credentials, sessions and tool lists are not shared
+between principals. The API client also tries deprecated HTTP+SSE if legacy initialization returns 400/404/405, accepting
+an `endpoint` only on the configured origin.
+
+The API client's modern MRTR uses a fresh request ID, the original tool arguments
+and the server's unchanged `requestState` for each retry, with a finite round limit. It
+supports a host-provided input handler; without one it declares no interactive
+capabilities and refuses unsolicited input requests. There is no new consent UI
+or automatic acceptance of elicitation. Tasks, sampling and roots are not enabled
+by default. The remote bridge declares no modern interactive capabilities and
+refuses every `input_required` result, including state-only results. It also
+refuses downstream requests containing `requestState` or `inputResponses` before
+sending them upstream. Bridge MRTR remains unavailable until the complete
+continuation payload can pass egress and approval checks bound to the original
+approved call generation. A broken tool response is an error; an uncertain side
+effect is not silently replayed. Tool filters and third-party classification still apply.
+
+Remote OAuth uses pre-registered credentials first. To use CIMD, an administrator
+may configure an existing public HTTPS metadata document:
+
+```toml
+[remote_mcp]
+client_metadata_url = "https://your-domain.example/mcp-client.json"
+```
+
+When the authorization server supports CIMD, the document must identify that exact
+URL, allow the configured callback URI and use public-client authentication
+(`token_endpoint_auth_method = "none"`). Invalid selected metadata fails closed.
+Otherwise dynamic registration remains the fallback, with `application_type`.
+PKCE and resource indicators remain required; callback `iss` is checked before
+code exchange, and saved credentials remain bound to their issuer. Both discovered
+and stored OAuth resources must exactly match the MCP endpoint's canonical
+resource (scheme, host, port and path, with trailing slashes removed). Resource
+query strings, fragments and other paths on the same origin are refused. Older
+stored credentials that do not match require reconnection. Automatic
+403 scope step-up and CIMD `private_key_jwt` are not implemented.
+
 ## Meeting transcription
 
 `meeting_transcribe` takes `source_path` from the calling employee's own attachments,

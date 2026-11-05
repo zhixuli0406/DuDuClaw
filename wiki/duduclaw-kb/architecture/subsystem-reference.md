@@ -196,3 +196,31 @@ Gateway `install_archive_bytes` / `apply_update_inner` (also CLI self-update) de
 ### Unreleased: edition licence ceiling (R-1)
 
 Production `EditionProfile::resolve` caps env/config overrides at the verified licence edition, with a once-per-source process warning for ignored elevation. Missing/invalid licences imply Personal. The production resolver never elevates, including debug/assertion-enabled release builds. A separate `resolve_for_test` API requires the non-default `test-edition-override` feature AND debug assertions; the build script refuses that feature in release artifacts. RPC fixtures and the live-test script use signed disposable licences. Boot, live requests and disk-based caps share this resolver; `agent.toml [edition]` has no reader. `team` is not an edition value (only personal/enterprise and their existing aliases parse). Gateway regression cases use separate processes and signed disposable Personal/Business licences, plus missing/invalid licence cases; remote builder execution remains pending.
+
+### Unreleased: dual-generation MCP clients (2026-11-05)
+
+`duduclaw-llm::mcp_client` now prefers 2026-07-28 discovery/per-request metadata,
+with 2025-11-25 and 2025-06-18 initialization fallback. Shared wire helpers live
+in `mcp_client/protocol.rs`; negotiation, bounded MRTR and deprecated HTTP+SSE
+fallback have separate modules. The remote MCP bridge uses those wire helpers
+while retaining ThirdPartyGate admission and response accounting. Each new API
+HTTP connection discovers independently; there is no global URL-only version
+cache. Bridge negotiation state remains local to its connection. After connection,
+a bridge `-32022` invalidates that connection without replay or legacy selection;
+a conversation restart must negotiate, list tools and apply the gates again.
+The generic API client also terminates `tools/call` on `-32022`, sets
+`requires_reconnect` and rejects all subsequent requests on that client. The host
+must create a new connection, list tools and apply the gates again. Initial
+handshake and standalone list recovery retain their version negotiation.
+The bridge declares no modern interactive capabilities and refuses every
+`input_required` result (including state-only results) and downstream requests
+containing `requestState` or `inputResponses`. Bridge MRTR is disabled until
+complete continuation payloads have egress/approval checks bound to the original
+approved generation; the generic API client retains its bounded MRTR handler.
+OAuth prefers pre-registration, configured CIMD, then DCR; callback issuer is
+validated before code exchange. Discovered and stored resource indicators must
+exactly equal `canonical_resource(mcp_url)`, including path, with no query or
+fragment; mismatched stored credentials require reconnection.
+Public configuration and limitations are in `docs/guides/mcp-tools.md`.
+Local llm compilation and offline/stdio tests are separate from gateway/CLI build,
+HTTP mock execution and real-provider acceptance; see the implementation handoff.

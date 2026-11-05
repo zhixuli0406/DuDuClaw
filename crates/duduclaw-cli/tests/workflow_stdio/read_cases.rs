@@ -51,6 +51,7 @@ async fn workflow_stdio_userinfo_rpc_denial_before_network() {
                 McpError::Closed => "closed",
                 McpError::Spawn(_) => "spawn",
                 McpError::Io(_) => "io",
+                McpError::HttpStatus(_) => "http_status",
                 McpError::Parse(_) => "parse",
                 McpError::Rpc { .. } => unreachable!(),
             };

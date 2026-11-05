@@ -64,6 +64,34 @@ Key creation uses a cross-process lock, an unpredictable exclusive temporary fil
 **Upgrade and recovery:** retain the original 32-byte key and its initialization marker in backups. Restart the gateway to re-issue employee MCP configurations, then restart older employee processes. An installation without an explicit setting becomes strict immediately; if a short transition is needed, explicitly set `false` with a valid grace deadline, complete the restart, then restore `true` or remove the setting. Restore a lost/damaged key and its permissions instead of deleting the marker. The marker is flushed before a new key is published: interruption in that interval intentionally requires operator recovery. For a confirmed never-used fresh installation only, an operator may remove the orphaned marker and retry; never do this to recover an established installation.
 
 The marker and lock are protected by the identity-file hook. This is not OS-account isolation: a process with unrestricted access as the gateway account can still change both files, read the key or mint tokens. Windows reparse/ACL tests have been cross-compiled but not run natively in this repair round.
+## Remote MCP protocol and OAuth boundaries
+
+The dual-generation MCP client keeps existing tool filters and third-party effect
+classification. Invalid `x-mcp-header` schemas are excluded. Initial discovery may
+select a supported legacy revision; after connection, the bridge refuses `-32022`
+and invalidates the connection without replaying the operation. Restarting the
+conversation must negotiate, list tools and apply the gates again. The API client
+also terminates `tools/call` on `-32022` and refuses all further requests on that
+client until its host creates a new connection, lists tools and applies the gates
+again. Initial handshake and standalone list recovery remain available. HTTP+SSE
+fallback confines the announced endpoint to the authenticated origin. Each new
+API HTTP connection performs independent discovery with no global URL-only version
+cache; the bridge retains only its own connection's negotiation state.
+
+OAuth callback issuer validation precedes code exchange and error display. CIMD
+uses an administrator-configured public HTTPS document with an exact client ID
+and allowed callback URI; a selected but invalid document is refused. Discovered
+and stored OAuth resources must exactly match the MCP endpoint's canonical
+resource, including its path, with no query or fragment. Another path on the same
+origin is refused; mismatched saved credentials require reconnection. PKCE,
+encrypted per-server credentials and outbound URL screening remain in force.
+
+The API client's MRTR inputs require host-declared capabilities and never grant
+automatic consent. The bridge declares no modern interactive capabilities and
+refuses all `input_required` results, including state-only results, and downstream
+requests containing `requestState` or `inputResponses`. Bridge MRTR remains disabled
+until complete continuation payloads can pass egress and approval checks bound to
+the original approved call generation. See [MCP client protocol versions](../guides/mcp-tools.md).
 
 ## Machine access and the person directing it
 
