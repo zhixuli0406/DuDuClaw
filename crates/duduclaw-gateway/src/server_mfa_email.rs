@@ -32,9 +32,15 @@ fn response(value:serde_json::Value)->axum::response::Response {
 
 pub(super) async fn send(State(state):State<Arc<AppState>>,ConnectInfo(addr):ConnectInfo<SocketAddr>,Json(body):Json<EmailBody>)->axum::response::Response {
     if !check_otp_verify_rate_limit(addr.ip()) || !check_login_rate_limit(addr.ip(),"mfa") {return denied();}
-    if !crate::mfa_email::available(&state.home_dir) {return unavailable();}
     let Some((token,enrollment))=body.capability() else {return denied();};
     let token=token.to_owned();
+    let check=state.clone();
+    let capability=token.clone();
+    let password=body.password.clone();
+    let checked=tokio::task::spawn_blocking(move || check.user_db.mfa_email_http_capability(
+        &capability,enrollment,password.as_deref(),chrono::Utc::now().timestamp())).await;
+    if !matches!(checked,Ok(Ok(()))) {return denied();}
+    if !crate::mfa_email::available(&state.home_dir) {return unavailable();}
     let work=state.clone();
     let capability=token.clone();
     let result=tokio::task::spawn_blocking(move ||->Result<(String,String),String> {
@@ -58,11 +64,16 @@ pub(super) async fn send(State(state):State<Arc<AppState>>,ConnectInfo(addr):Con
 
 pub(super) async fn verify(State(state):State<Arc<AppState>>,ConnectInfo(addr):ConnectInfo<SocketAddr>,Json(body):Json<EmailBody>)->axum::response::Response {
     if !check_otp_verify_rate_limit(addr.ip()) || !check_login_rate_limit(addr.ip(),"mfa") {return denied();}
-    if !crate::mfa_email::available(&state.home_dir) {return unavailable();}
-    let personal=state.handler.resolve_edition_profile().await.is_personal();
-    if crate::mfa::enforced(&state.home_dir,personal).is_err() {return denied();}
     let Some((token,enrollment))=body.capability() else {return denied();};
     let token=token.to_owned();
+    let check=state.clone();
+    let capability=token.clone();
+    let password=body.password.clone();
+    let checked=tokio::task::spawn_blocking(move || check.user_db.mfa_email_http_capability(
+        &capability,enrollment,password.as_deref(),chrono::Utc::now().timestamp())).await;
+    if !matches!(checked,Ok(Ok(()))) {return denied();}
+    let personal=state.handler.resolve_edition_profile().await.is_personal();
+    if crate::mfa::enforced(&state.home_dir,personal).is_err() {return denied();}
     let work=state.clone();
     let result=tokio::task::spawn_blocking(move ||->Result<serde_json::Value,String> {
         let now=chrono::Utc::now().timestamp();

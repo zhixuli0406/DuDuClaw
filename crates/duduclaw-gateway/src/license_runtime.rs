@@ -795,44 +795,51 @@ fn read_validated_license_locked(home_dir: &Path, registry: &PublicKeyRegistry, 
 /// A fresh, validated relay artifact. Keep the original JSON (including unknown
 /// fields and signature) rather than reconstructing it from the typed license.
 /// The shared disk lock binds validation, fingerprint and artifact to one read.
-pub(crate) fn mfa_relay_license(home: &Path) -> Option<(serde_json::Value, String, String)> {
+pub(crate) fn mfa_relay_license(home: &Path) -> Result<(serde_json::Value, String), &'static str> {
+    let unavailable = "no_smtp_no_relay";
     let path = home.join(storage::DEFAULT_LICENSE_FILENAME);
-    if !path.try_exists().ok()? { return None; }
+    if !path.try_exists().map_err(|_| unavailable)? { return Err(unavailable); }
     let registry;
     let gate;
     let (registry_ref, gate_ref) = if let Some(runtime) = global() {
         (runtime.registry.as_ref(), runtime.gate.as_ref())
     } else {
         registry = production_registry();
-        gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML).ok()?;
+        gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML).map_err(|_| unavailable)?;
         (&registry, &gate)
     };
     mfa_relay_license_with(home, registry_ref, gate_ref)
 }
 
-fn mfa_relay_license_with(home: &Path, registry: &PublicKeyRegistry, gate: &FeatureGate)
-    -> Option<(serde_json::Value, String, String)> {
-    let path = home.join(storage::DEFAULT_LICENSE_FILENAME);
-    if !path.try_exists().ok()? { return None; }
-    let store = storage::LockedLicenseStore::acquire(&path).ok()?;
-    let license = read_validated_license_locked(home, registry, gate, &store).ok()??;
-    if license.tier == LicenseTier::OpenSource { return None; }
-    let matched = license.validate_any(cached_candidates(), gate.phone_home_interval_days(license.tier),
-        gate.grace_period_days(license.tier)).ok()?;
-    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
-    // Cooperative writers hold the same lock; also fail closed on a mismatched read.
-    let parsed: License = serde_json::from_value(raw.clone()).ok()?;
-    if serde_json::to_value(&parsed).ok()? != serde_json::to_value(&license).ok()? { return None; }
-    let local_override = std::env::var("DUDUCLAW_CONTROL_URL").ok();
-    let endpoint = mfa_relay_endpoint(license.tier, &resolve_control_url(Some(&license)), local_override.as_deref())?;
-    Some((raw, matched.fingerprint, endpoint))
+fn mfa_relay_tier_eligibility(tier: LicenseTier, nfr: bool) -> Result<(), &'static str> {
+    // Legacy Partner artifacts may omit the NFR bit; the tier is still free.
+    if nfr || tier.is_partner() { return Err("relay_nfr"); }
+    if !tier.is_paid() { return Err("no_smtp_no_relay"); }
+    Ok(())
 }
 
-fn mfa_relay_endpoint(tier: LicenseTier, control_url: &str, local_override: Option<&str>) -> Option<String> {
-    if tier == LicenseTier::OpenSource || control_url.trim().is_empty() { return None; }
-    let endpoint = format!("{}/api/v1/relay/mfa-email", control_url.trim_end_matches('/'));
-    duduclaw_license::control_url::validate_control_url(&endpoint, local_override).ok()?;
-    Some(endpoint)
+fn mfa_relay_license_with(home: &Path, registry: &PublicKeyRegistry, gate: &FeatureGate)
+    -> Result<(serde_json::Value, String), &'static str> {
+    let unavailable = "no_smtp_no_relay";
+    let path = home.join(storage::DEFAULT_LICENSE_FILENAME);
+    if !path.try_exists().map_err(|_| unavailable)? { return Err(unavailable); }
+    let store = storage::LockedLicenseStore::acquire(&path).map_err(|_| unavailable)?;
+    let license = read_validated_license_locked(home, registry, gate, &store)
+        .map_err(|_| unavailable)?.ok_or(unavailable)?;
+    mfa_relay_tier_eligibility(license.tier, license.nfr)?;
+    if license.machine_fingerprint.is_empty() { return Err("relay_unbound"); }
+    let matched = license.validate_any(cached_candidates(), gate.phone_home_interval_days(license.tier),
+        gate.grace_period_days(license.tier)).map_err(|_| unavailable)?;
+    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).map_err(|_| unavailable)?)
+        .map_err(|_| unavailable)?;
+    // Cooperative writers hold the same lock; also fail closed on a mismatched read.
+    let parsed: License = serde_json::from_value(raw.clone()).map_err(|_| unavailable)?;
+    if serde_json::to_value(&parsed).map_err(|_| unavailable)? != serde_json::to_value(&license).map_err(|_| unavailable)? {
+        return Err(unavailable);
+    }
+    // Enrollment identity only. The relay transport owns its compile-time destination;
+    // neither the license's unsigned control_url nor environment overrides select it.
+    Ok((raw, matched.fingerprint))
 }
 
 async fn load_and_validate(home_dir: &Path, registry: &PublicKeyRegistry, gate: &FeatureGate) -> (Option<License>, Option<&'static str>) {
@@ -1891,14 +1898,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn mfa_relay_endpoint_requires_paid_tier_and_allowed_control_url() {
-        assert!(mfa_relay_endpoint(LicenseTier::SelfHostPro, DEFAULT_CONTROL_URL, None).is_some());
-        assert!(mfa_relay_endpoint(LicenseTier::OpenSource, DEFAULT_CONTROL_URL, None).is_none());
-        for url in ["", "http://issuer.example.com", "https://attacker.example.com", "https://127.0.0.1"] {
-            assert!(mfa_relay_endpoint(LicenseTier::SelfHostPro, url, None).is_none());
+    fn mfa_relay_tiers_require_paid_and_non_nfr() {
+        for tier in [LicenseTier::OpenSource, LicenseTier::Hobby, LicenseTier::Solo,
+            LicenseTier::Studio, LicenseTier::Business, LicenseTier::Partner,
+            LicenseTier::PersonalProSelfHost, LicenseTier::SelfHostPro, LicenseTier::Oem] {
+            assert_eq!(mfa_relay_tier_eligibility(tier, false).is_ok(), tier.is_paid());
+            assert_eq!(mfa_relay_tier_eligibility(tier, true), Err("relay_nfr"));
         }
-        assert!(mfa_relay_endpoint(LicenseTier::SelfHostPro, "https://issuer.example.com/base",
-            Some("https://issuer.example.com")).unwrap().ends_with("/base/api/v1/relay/mfa-email"));
+        assert_eq!(mfa_relay_tier_eligibility(LicenseTier::Partner, false), Err("relay_nfr"));
     }
 
     #[tokio::test]
@@ -1909,38 +1916,56 @@ pub(crate) mod tests {
             let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
             let gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML).unwrap();
             let path = home.path().join("license.json");
-            assert!(mfa_relay_license_with(home.path(), &registry, &gate).is_none());
+            assert!(mfa_relay_license_with(home.path(), &registry, &gate).is_err());
             assert!(!path.with_file_name("license.json.lock").exists());
             let mut license = valid_license_for(TEST_HARDWARE_FINGERPRINT);
-            license.control_url = Some(DEFAULT_CONTROL_URL.into());
+            license.control_url = Some("https://attacker.example.com".into());
             sign_license(&mut license, &kp);
             storage::save_to(&license, &path).unwrap();
             let mut original = serde_json::to_value(&license).unwrap();
             original["future_metadata"] = json!({"preserved":true});
             std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
-            let (raw, fingerprint, _) = mfa_relay_license_with(home.path(), &registry, &gate).unwrap();
+            let (raw, fingerprint) = mfa_relay_license_with(home.path(), &registry, &gate).unwrap();
             assert_eq!(raw, original);
             assert_eq!(fingerprint, TEST_HARDWARE_FINGERPRINT);
             let mut oem = fake_license(LicenseTier::Oem, "");
             sign_license(&mut oem, &kp);
             storage::save_to(&oem, &path).unwrap();
-            assert_eq!(mfa_relay_license_with(home.path(), &registry, &gate).unwrap().1, TEST_HARDWARE_FINGERPRINT);
+            assert_eq!(mfa_relay_license_with(home.path(), &registry, &gate).unwrap_err(), "relay_unbound");
+            oem.machine_fingerprint = TEST_HARDWARE_FINGERPRINT.into();
+            sign_license(&mut oem, &kp);
+            storage::save_to(&oem, &path).unwrap();
+            assert!(mfa_relay_license_with(home.path(), &registry, &gate).is_ok());
+            let mut partner = fake_license(LicenseTier::Partner, TEST_HARDWARE_FINGERPRINT);
+            assert!(!partner.nfr);
+            sign_license(&mut partner, &kp);
+            storage::save_to(&partner, &path).unwrap();
+            assert_eq!(mfa_relay_license_with(home.path(), &registry, &gate).unwrap_err(), "relay_nfr");
+            let mut nfr = license.clone();
+            nfr.nfr = true;
+            sign_license(&mut nfr, &kp);
+            storage::save_to(&nfr, &path).unwrap();
+            assert_eq!(mfa_relay_license_with(home.path(), &registry, &gate).unwrap_err(), "relay_nfr");
+            nfr.nfr = false;
+            storage::save_to(&nfr, &path).unwrap();
+            assert_eq!(mfa_relay_license_with(home.path(), &registry, &gate).unwrap_err(), "no_smtp_no_relay");
             for mut denied in [
                 fake_license(LicenseTier::OpenSource, TEST_HARDWARE_FINGERPRINT),
+                fake_license(LicenseTier::Hobby, TEST_HARDWARE_FINGERPRINT),
                 valid_license_for("another-machine"),
                 { let mut l=license.clone(); l.expires_at=Utc::now()-ChronoDuration::days(1); l },
             ] {
                 sign_license(&mut denied, &kp);
                 storage::save_to(&denied, &path).unwrap();
-                assert!(mfa_relay_license_with(home.path(), &registry, &gate).is_none());
+                assert!(mfa_relay_license_with(home.path(), &registry, &gate).is_err());
             }
             let mut tampered = license.clone();
             tampered.subscription_id = "tampered".into();
             storage::save_to(&tampered, &path).unwrap();
-            assert!(mfa_relay_license_with(home.path(), &registry, &gate).is_none());
+            assert!(mfa_relay_license_with(home.path(), &registry, &gate).is_err());
             storage::save_to(&license, &path).unwrap();
             std::fs::write(home.path().join(REVOKED_FILENAME), "revoked").unwrap();
-            assert!(mfa_relay_license_with(home.path(), &registry, &gate).is_none());
+            assert!(mfa_relay_license_with(home.path(), &registry, &gate).is_err());
         }).await;
     }
 

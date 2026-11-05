@@ -19,6 +19,19 @@ it.each(['en', 'zh-TW', 'ja-JP'] as const)('explains missing SMTP and relay, wit
   expect(message).toHaveTextContent(catalogues[locale]['mfa.email.unavailable']);
   expect(message).toHaveTextContent('SMTP');
 });
+it.each([
+  ['en', 'relay_nfr', 'mfa.email.relayNfr'],
+  ['zh-TW', 'relay_nfr', 'mfa.email.relayNfr'],
+  ['ja-JP', 'relay_nfr', 'mfa.email.relayNfr'],
+  ['en', 'relay_unbound', 'mfa.email.relayUnbound'],
+  ['zh-TW', 'relay_unbound', 'mfa.email.relayUnbound'],
+  ['ja-JP', 'relay_unbound', 'mfa.email.relayUnbound'],
+] as const)('explains excluded license types in %s for %s', (locale, reason, id) => {
+  const message = explanation(locale, 'email', reason);
+  expect(message).toHaveTextContent(catalogues[locale][id]);
+  expect(message).toHaveTextContent('SMTP');
+  expect(message).not.toHaveTextContent(reason);
+});
 it('explains an explicitly disabled relay and does not render unknown reason text', () => {
   expect(explanation('en', 'email', 'relay_disabled')).toHaveTextContent('administrator has disabled');
   cleanup();

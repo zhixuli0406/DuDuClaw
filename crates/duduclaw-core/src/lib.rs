@@ -35,6 +35,8 @@ pub mod fs_lock;
 pub mod owner_lock;
 pub mod grounding;
 pub mod identity_token;
+#[cfg(windows)]
+pub mod windows_private_state;
 pub mod keychain;
 pub mod knowledge_agent;
 pub mod lenient;
