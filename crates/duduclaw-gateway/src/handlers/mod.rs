@@ -614,6 +614,8 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return boxed_frame(|| self.dispatch_system(method, params, ctx, conn)).await;
+        }
+
         if let Some(request) = credential_request {
             if let Err(e) = acl::require_role(ctx, UserRole::Admin) {
                 request.audit(&self.home_dir, &ctx.user_id, "refused");
