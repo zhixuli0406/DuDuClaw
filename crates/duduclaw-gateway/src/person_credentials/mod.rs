@@ -32,6 +32,9 @@ pub struct Metadata {
     pub google_sub: String,
     pub hosted_domain: Option<String>,
     pub granted_scopes: Vec<String>,
+    /// Gateway-recorded purpose consent; provider scopes cannot create this grant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_purposes: Vec<String>,
     pub status: Status,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_before_suspension: Option<Status>,
@@ -70,6 +73,8 @@ struct Binding {
     hosted_domain: Option<String>,
     oauth_client_id: String,
     granted_scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    local_purposes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     google_data_consent: Option<crate::google_data_consent::Evidence>,
 }
@@ -84,6 +89,7 @@ impl From<&Metadata> for Binding {
             hosted_domain: m.hosted_domain.clone(),
             oauth_client_id: m.oauth_client_id.clone(),
             granted_scopes: m.granted_scopes.clone(),
+            local_purposes: m.local_purposes.clone(),
             google_data_consent: m.google_data_consent.clone(),
         }
     }
@@ -184,6 +190,8 @@ fn valid_metadata(m: &Metadata) -> bool {
         && !m.oauth_client_id.is_empty()
         && m.oauth_client_id.len() <= 1024
         && !m.oauth_client_id.chars().any(char::is_control)
+        && m.local_purposes.len() <= 3
+        && m.local_purposes.iter().all(|purpose| matches!(purpose.as_str(), "base" | "meeting_recordings" | "drive_tools"))
         && m.granted_scopes.len() <= 128
         && m.granted_scopes.iter().all(|scope| {
             !scope.is_empty() && scope.len() <= 2048 && !scope.chars().any(char::is_whitespace)
@@ -260,6 +268,9 @@ pub struct CredentialAuthority {
     pub hosted_domain: Option<String>,
     pub oauth_client_id: String,
     pub granted_scopes: Vec<String>,
+    /// Gateway-recorded purpose consent; provider scopes cannot create this grant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_purposes: Vec<String>,
     pub status: Status,
     pub epoch: u64,
     pub google_data_consent: Option<crate::google_data_consent::Evidence>,
@@ -278,6 +289,7 @@ impl CredentialAuthority {
             hosted_domain: metadata.hosted_domain.clone(),
             oauth_client_id: metadata.oauth_client_id.clone(),
             granted_scopes: scopes,
+            local_purposes: metadata.local_purposes.clone(),
             status: metadata.status,
             epoch,
             google_data_consent: metadata.google_data_consent.clone(),
@@ -371,8 +383,32 @@ pub fn connect(
     secret: &Secret,
     expected_epoch: u64,
 ) -> Result<(), String> {
+    connect_with_previous(home, key, metadata, secret, expected_epoch, None)
+}
+
+/// Compare the incremental flow's original credential under the publication lock.
+/// A concurrent refresh/change must not be overwritten, even with the same epoch.
+pub(crate) fn connect_with_previous(
+    home: &Path,
+    key: &ProtectedKey,
+    metadata: Metadata,
+    secret: &Secret,
+    expected_epoch: u64,
+    previous: Option<&Metadata>,
+) -> Result<(), String> {
     let sealed = seal(key, &metadata, secret)?;
     modify(home, |store| {
+        if let Some(previous) = previous {
+            let current = store.records.iter().find(|r| r.metadata.owner_id == metadata.owner_id)
+                .ok_or("原有 Google 連線已變更，請重新開始。")?;
+            if !matching(current, previous)
+                || current.metadata.status != previous.status
+                || Binding::from(&current.metadata) != Binding::from(previous)
+                || !previous.granted_scopes.iter().all(|scope| metadata.granted_scopes.contains(scope))
+            {
+                return Err("原有 Google 連線或授權範圍已變更，這次沒有取代既有憑證。".into());
+            }
+        }
         if store.epochs.get(&metadata.owner_id).copied() != Some(expected_epoch) {
             return Err("這次連結已被較新的操作取代，請重新開始。".into());
         }

@@ -79,6 +79,7 @@ impl Fixture {
             account_email: "alice@unit.test".into(),
             google_sub: "unit-sub".into(),
             hosted_domain: None,
+            local_purposes: vec!["base".into(), "drive_tools".into()],
             granted_scopes: scopes,
             status: Status::Connected,
             status_before_suspension: None,

@@ -20,6 +20,42 @@
 4. 核對連上的 Google 信箱，可能和 DuDuClaw 登入信箱不同。
 5. 本人逐一允許或拒絕員工。管理員選定帳號，不代表本人已經同意。
 
+## 另外開啟會議錄影匯入
+
+帳號本人到「我的連線」開啟會議錄影存取，完成獨立的同意步驟。一般初次連結個人帳號不會要求 Drive 或 Meet 權限；只有啟用這項功能，才在既有 Google 授權上加上 `https://www.googleapis.com/auth/drive.file` 與 `https://www.googleapis.com/auth/meetings.space.readonly`。拒絕其中一項就不能匯入，既有較廣的授權也不會自動撤銷。
+
+需要既有員工 Drive 工具或 Google 遠端 MCP 時，帳號本人可在完成連線後，另外於「我的連線」選擇「啟用員工的 Drive 工具」。這會要求 `https://www.googleapis.com/auth/drive.readonly`，允許唯讀存取該 Google 帳號可存取的所有 Drive 檔案。這是獨立的同意步驟，不是錄影匯入的必要條件；員工仍受本人使用同意與角色權限限制。每次請完成一種額外授權流程。
+
+Gateway 分別保存基本服務、會議錄影與員工 Drive 工具的本機用途同意，並綁定封存憑證及其授權紀錄。每項能力都必須同時符合 Google 實際範圍與本機用途同意；會議授權額外回傳 `drive.readonly` 或 `drive`，也不會啟用員工 Drive 工具。增量授權保留先前用途，但必須完整保留舊有 Google 範圍，保存時也會比對原憑證版本；缺少範圍或憑證已被其他操作更新，就拒絕取代舊憑證。沒有本機用途同意的舊紀錄須重新連結。重新連結基本服務會將本機用途重設為基本服務，之後須另行開啟會議錄影與員工 Drive 工具。
+
+`drive.file` 搭配 Google Picker 可選取不是由應用程式建立的既有錄影，因此匯入不要求 `drive.readonly`。Google 的 `drive.file` 權限也允許建立與修改選取／分享的檔案，但 DuDuClaw 匯入只執行讀取。DuDuClaw 內的搜尋只列出已分享給應用程式的音訊／影片，其他檔案（包括尚未分享的近期 Meet 錄影）可透過 Google Picker 選取。詳見 [Google 權限範圍說明](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)與 [Picker 設定](https://developers.google.com/workspace/drive/picker/guides/web-picker)。
+
+管理員須在 OAuth 應用程式所屬 Google Cloud 專案啟用 **Google Drive API**、**Google Meet API** 與 **Google Picker API**。使用網頁應用程式 OAuth 用戶端，把控制台來源加入允許的 JavaScript 來源，並保留前述個人連線的完整 callback URI。在 `config.toml` 設定瀏覽器金鑰與數字專案編號：
+
+```toml
+[integrations.google_meeting_picker]
+developer_key = "your-browser-restricted-google-picker-key"
+app_id = "123456789012" # Google Cloud project number, not project ID
+```
+
+金鑰與專案編號是會送至瀏覽器的公開設定，不是 OAuth 用戶端秘密；必須與 Google OAuth 用戶端使用同一專案。將金鑰限制為 Google Picker API 與必要的網站來源；Google 目前的 Picker 指南也要求允許 `https://docs.google.com/*`，因為 Picker 在該來源的 iframe 中執行。不要填入伺服器或轉錄服務的 API 金鑰。缺少或無效的設定會使 Picker 維持不可用。
+
+Picker 透過 Google Identity Services 要求僅含 `drive.file`、`include_granted_scopes=false` 的短期瀏覽器權杖，可能再次請本人確認。這個權杖只用於選檔流程，不寫入瀏覽器儲存；gateway 保存的存取／更新權杖不會送到瀏覽器。匯入使用目前登入者在 gateway 的個人連線，在 Google 視窗切換帳號不會讓 gateway 改用另一個人的帳號。
+
+本人在「會議逐字稿」選取檔案，再確認傳給指定員工與設定的轉錄供應商；這不會授予員工瀏覽 Drive 的能力。Meet 參照須符合 Google 本身的存取規則，錄影檔可能仍需另外分享。詳見 [Google 會議產物存取說明](https://developers.google.com/workspace/meet/api/guides/artifacts)與[會議逐字稿](../../features/zh-TW/73-meeting-transcripts.md)。
+
+每次匯入都需要伺服器簽發的確認收據。它證明經 JWT 驗證的控制台使用者，在最近五分鐘內明確登記並確認將這個確切的 Drive 檔案 ID 交給這位接收員工；員工／MCP 權杖不能登記收據。收據限用一次，綁定該使用者、員工與檔案 ID；同一使用者對同一員工的新確認會取代上一張收據。控制台只在使用者確認匯入時登記檔案。缺少、過期、已用過或綁定不符的收據會遭拒。進入匯入程序後，即使後續檢查失敗也會用掉收據，重試須重新確認。伺服器另以該使用者的 Google 連線檢查 Drive 中繼資料，要求 `isAppAuthorized=true`。收據與這個 Google 旗標都不能證明曾在 Google Picker 點擊；控制台呼叫者可用已知 ID 明確確認先前已授權給應用程式的檔案。
+
+僅供控制台使用的 `POST /api/meeting-drive/selection` 必須提供 `agent_id`、`file_id` 與 `confirm: true`，回傳 `selection_receipt` 及 `expires_in`。每位使用者每分鐘最多登記請求 20 次，最多保留八張未過期收據；`POST /api/meeting-drive/import` 必須附上該收據。
+
+`google_status` 只讀取帳號、狀態與依本機用途篩選的範圍中繼資料，不解封憑證、不更新權杖，也不回傳 bearer。Token 端點使用明確的工具允許清單，個人憑證須同時符合對應本機用途與 Google 範圍；狀態查詢與未知工具不能取得 bearer。
+
+本機 Drive 來源紀錄含選取帳號、Google 信箱、檔案 ID 與版本。取消、失敗及上傳過期時，來源紀錄會與對應狀態變更在同一資料庫交易內刪除。其餘來源紀錄（含成功匯入）自 `imported_at` 起保留 30 天，期限到後由 gateway 執行期間每 60 秒的既有清理程序刪除；停機後於下一輪清理執行。逐字稿檔案與稽核日誌有各自的保存規則，不會隨這項來源中繼資料清理一併刪除。
+
+`user.google_connect` 稽核記錄授權用途、回傳範圍集合的雜湊摘要及非預期範圍；Drive／Meet 清單讀取與早期拒絕也會記錄。這些事件不保存權杖與檔案內容，匯入識別碼使用雜湊。
+
+中斷個人 Google 連線後，本機會拒絕後續匯入存取。要撤銷新增的 Google 授權，請到 Google 已連結應用程式檢查，再以需要的服務重新連線。匯入時持續檢查本機連線與實際授權範圍；Google 端撤銷會在 API 拒絕存取，或更新後的權限反映變更時生效。斷線不會撤回已匯入副本、逐字稿或已送至轉錄供應商的資料。OAuth、Picker 與供應商流程仍須用真實帳號驗收。
+
 ## 選擇員工與分享範圍
 
 1. 開啟員工的「連線」分頁，選「跟隨主要負責人」或「指定同事」。對方必須仍有效，並直接綁定為這位員工的 Owner。

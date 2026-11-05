@@ -6,9 +6,17 @@ use serde::Deserialize;
 use std::path::Path;
 
 pub type Authenticate=Arc<dyn Fn(&HeaderMap)->Result<UserContext,Response>+Send+Sync>;
-struct RouteState{service:Arc<Service>,authenticate:Authenticate}
+#[path = "drive_http.rs"]
+mod drive_http;
+struct RouteState{service:Arc<Service>,authenticate:Authenticate,user_db:Option<Arc<duduclaw_auth::UserDb>>,selection_rate:super::selection::RegistrationRate}
 use super::traffic::{UPLOAD_SLOTS,DOWNLOAD_SLOTS,Flight,read_body};
 pub fn router(service:Arc<Service>,authenticate:Authenticate)->Router{
+    routes(service,authenticate,None)
+}
+pub fn router_with_google(service:Arc<Service>,authenticate:Authenticate,user_db:Arc<duduclaw_auth::UserDb>)->Router{
+    routes(service,authenticate,Some(user_db))
+}
+fn routes(service:Arc<Service>,authenticate:Authenticate,user_db:Option<Arc<duduclaw_auth::UserDb>>)->Router{
     Router::new()
         .route("/api/meeting-uploads",post(create))
         .route("/api/meeting-uploads/{id}",get(status))
@@ -18,7 +26,8 @@ pub fn router(service:Arc<Service>,authenticate:Authenticate)->Router{
         .route("/api/meeting-jobs",get(list))
         .route("/api/meeting-jobs/{id}/cancel",post(cancel))
         .route("/api/meeting-jobs/{id}/download",get(download))
-        .with_state(Arc::new(RouteState{service,authenticate}))
+        .merge(drive_http::routes())
+        .with_state(Arc::new(RouteState{service,authenticate,user_db,selection_rate:Default::default()}))
 }
 fn error(code:StatusCode,message:&str)->Response{(code,Json(json!({"error":message}))).into_response()}
 fn result(value:Result<Value,String>)->Response{match value{Ok(value)=>Json(value).into_response(),Err(message)=>error(if message==store::NOT_FOUND{StatusCode::NOT_FOUND}else{StatusCode::BAD_REQUEST},&message)}}
@@ -251,4 +260,59 @@ async fn download(State(st):State<Arc<RouteState>>,RoutePath(id):RoutePath<Strin
         assert!(f.service.manager.list("alice").unwrap().is_empty());
     }
 
+
+    #[tokio::test]
+    async fn drive_import_refuses_employee_tokens_before_reading_body(){
+        let f=fixture().await;
+        for path in ["/api/meeting-drive/import","/api/meeting-drive/selection"]{
+        for token in [None,Some("Bearer employee-mcp-token")]{
+            let read=Arc::new(AtomicBool::new(false));let marker=read.clone();
+            let body=Body::from_stream(futures_util::stream::once(async move{marker.store(true,Ordering::SeqCst);Ok::<_,std::io::Error>(Bytes::from_static(b"untrusted"))}));
+            let mut request=Request::builder().method("POST").uri(path);
+            if let Some(token)=token{request=request.header(header::AUTHORIZATION,token);}
+            let response=app(&f).oneshot(request.body(body).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::UNAUTHORIZED);assert!(!read.load(Ordering::SeqCst));
+        }
+        }
+        let audit=std::fs::read_to_string(f.service.manager.home.join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("meeting_drive_import_request") && audit.contains("meeting_drive_selection"));
+        assert!(audit.contains("authentication_refused") && !audit.contains("employee-mcp-token"));
+    }
+    #[tokio::test]
+    async fn drive_import_requires_selection_confirmation_and_rejects_owner_override(){
+        let f=fixture().await;
+        for body in [
+            json!({"agent_id":"alice","file_id":"recording_123456","confirm":false}),
+            json!({"agent_id":"alice","file_id":"https://drive.google.com/file/d/123","confirm":true}),
+            json!({"agent_id":"alice","file_id":"recording_123456","confirm":true,"owner":"other"}),
+        ]{
+            assert_eq!(app(&f).oneshot(req("POST","/api/meeting-drive/import",Body::from(body.to_string()))).await.unwrap().status(),StatusCode::BAD_REQUEST);
+        }
+        assert!(f.service.manager.list("alice").unwrap().is_empty());
+        let audit=std::fs::read_to_string(f.service.manager.home.join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("meeting_drive_import_request") && audit.contains("request_refused"));
+    }
+    #[tokio::test]
+    async fn drive_routes_require_live_operator_binding_before_google_access(){
+        let f=fixture().await;
+        for agent in ["other","main"]{
+            let body=json!({"agent_id":agent,"file_id":"recording_123456","confirm":true});
+            assert_eq!(app(&f).oneshot(req("POST","/api/meeting-drive/import",Body::from(body.to_string()))).await.unwrap().status(),StatusCode::NOT_FOUND);
+            let selection=json!({"agent_id":agent,"file_id":"recording_123456","confirm":true});
+            assert_eq!(app(&f).oneshot(req("POST","/api/meeting-drive/selection",Body::from(selection.to_string()))).await.unwrap().status(),StatusCode::NOT_FOUND);
+        }
+        f.db.unbind_agent(&f.ctx.user_id,"alice").unwrap();
+        assert_eq!(app(&f).oneshot(req("GET","/api/meeting-drive/files?agent=alice",Body::empty())).await.unwrap().status(),StatusCode::NOT_FOUND);
+    }
+    #[tokio::test]
+    async fn drive_list_query_rejections_are_audited_without_query_content(){
+        let f=fixture().await;
+        for path in ["files","recordings"]{
+            let uri=format!("/api/meeting-drive/{path}?agent=alice&unexpected=private-search-value");
+            assert_eq!(app(&f).oneshot(req("GET",&uri,Body::empty())).await.unwrap().status(),StatusCode::BAD_REQUEST);
+        }
+        let audit=std::fs::read_to_string(f.service.manager.home.join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("meeting_drive_list") && audit.contains("meeting_meet_list") && audit.contains("query_refused"));
+        assert!(!audit.contains("private-search-value"));
+    }
 }

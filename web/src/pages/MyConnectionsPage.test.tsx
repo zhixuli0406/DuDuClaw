@@ -6,12 +6,23 @@ import { renderWithProviders } from '@/test/render';
 import { api, type PersonalGoogleStatus } from '@/lib/api';
 import { MyConnectionsPage } from './MyConnectionsPage';
 
-const status: PersonalGoogleStatus = { connection: { owner_id: 'alice', account_email: 'other@gmail.com', granted_scopes: ['https://www.googleapis.com/auth/gmail.readonly'], status: 'connected', connected_at: '2026-10-23T00:00:00Z' }, login_email: 'alice@example.com', client_configured: true, integration_enabled: false, requires_login: false,
+const status: PersonalGoogleStatus = { connection: { owner_id: 'alice', account_email: 'other@gmail.com', granted_scopes: ['https://www.googleapis.com/auth/gmail.readonly'], local_purposes: ['base'], status: 'connected', connected_at: '2026-10-23T00:00:00Z' }, login_email: 'alice@example.com', client_configured: true, integration_enabled: false, requires_login: false,
   requests: [{ agent_id: 'helper', allowed: null, requesters: 'bound_people', bound_people: [{ user_id:'bob', name:'Bob', email:'bob@example.com' }], channels: ['line'], public_visitors_allowed:false }], delegated: [], recent_usage: [] };
 
 beforeEach(() => { vi.restoreAllMocks(); vi.spyOn(api.personalGoogle,'status').mockResolvedValue(status); });
 
 describe('MyConnectionsPage', () => {
+  it('does not advertise employee Drive access from extra provider scopes alone', async () => {
+    vi.mocked(api.personalGoogle.status).mockResolvedValue({...status, connection: {...status.connection!,
+      local_purposes: ['base', 'meeting_recordings'],
+      granted_scopes: ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/drive.readonly'],
+    }});
+    renderWithProviders(<MyConnectionsPage/>);
+    const services = await screen.findByText(/^Available services:/);
+    expect(services).toHaveTextContent('Gmail');
+    expect(services).not.toHaveTextContent('Drive');
+  });
+
   it('requires an in-product Google data disclosure acknowledgement before OAuth starts', async () => {
     vi.mocked(api.personalGoogle.status).mockResolvedValue({...status, connection: null});
     const start = vi.spyOn(api.personalGoogle,'start').mockResolvedValue({authorization_url:'https://accounts.google.com/fixture',state:'fixture',completion:'paste',redirect_uri:'http://127.0.0.1:18889/api/me/google/callback',expires_in:600});
@@ -30,6 +41,37 @@ describe('MyConnectionsPage', () => {
     expect(connect).toBeEnabled();
     await user.click(connect);
     await waitFor(()=>expect(start).toHaveBeenCalledTimes(1));
+    expect(start).toHaveBeenCalledWith(true, false, false);
+  });
+
+  it('requires a separate consent before requesting recording scopes', async () => {
+    const start = vi.spyOn(api.personalGoogle, 'start').mockResolvedValue({ authorization_url: 'https://accounts.google.com/fixture', state: 'fixture', completion: 'paste', redirect_uri: 'http://127.0.0.1:18889/api/me/google/callback', expires_in: 600 });
+    vi.spyOn(window, 'open').mockReturnValue({ opener: null, location: { replace: vi.fn() }, close: vi.fn() } as never);
+    const user = userEvent.setup(); renderWithProviders(<MyConnectionsPage />);
+    const authorize = await screen.findByRole('button', { name: 'Authorize recording imports separately' });
+    expect(authorize).toBeDisabled();
+    expect(screen.getByText('https://www.googleapis.com/auth/drive.file')).toBeInTheDocument();
+    expect(screen.getByText('https://www.googleapis.com/auth/meetings.space.readonly')).toBeInTheDocument();
+    await user.click(screen.getByRole('checkbox', { name: /understand how my Google data is accessed/i }));
+    expect(authorize).toBeDisabled();
+    await user.click(screen.getByRole('checkbox', { name: /agree to these additional recording import permissions/i }));
+    await user.click(authorize);
+    await waitFor(() => expect(start).toHaveBeenCalledWith(true, true, false));
+  });
+
+  it('requires an independent broad Drive consent and does not request recording scopes with it', async () => {
+    const start = vi.spyOn(api.personalGoogle, 'start').mockResolvedValue({ authorization_url: 'https://accounts.google.com/fixture', state: 'fixture', completion: 'paste', redirect_uri: 'http://127.0.0.1:18889/api/me/google/callback', expires_in: 600 });
+    vi.spyOn(window, 'open').mockReturnValue({ opener: null, location: { replace: vi.fn() }, close: vi.fn() } as never);
+    const user = userEvent.setup(); renderWithProviders(<MyConnectionsPage />);
+    const authorize = await screen.findByRole('button', { name: 'Enable employee Drive tools' });
+    expect(authorize).toBeDisabled();
+    expect(screen.getByText('https://www.googleapis.com/auth/drive.readonly')).toBeInTheDocument();
+    await user.click(screen.getByRole('checkbox', { name: /understand how my Google data is accessed/i }));
+    await user.click(screen.getByRole('checkbox', { name: /agree to these additional recording import permissions/i }));
+    expect(authorize).toBeDisabled();
+    await user.click(screen.getByRole('checkbox', { name: /allow read-only access to all Drive files my Google account can access/i }));
+    await user.click(authorize);
+    await waitFor(() => expect(start).toHaveBeenCalledWith(true, false, true));
   });
 
   it('shows that Anyone includes external tools while public visitors remain excluded',async()=>{

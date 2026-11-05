@@ -1,9 +1,11 @@
 //! Bounded resumable uploads. Dashboard and capability-link routes share only
 //! this already-authorized owner/employee service; authentication stays outside.
 mod store;
+mod drive;
+mod selection;
 pub(crate) mod traffic;
 pub(crate) mod http;
-pub use http::{router,Authenticate};
+pub use http::{router,router_with_google,Authenticate};
 pub use store::{CHUNK_SIZE,Upload};
 use std::{path::PathBuf,sync::Arc,io::{Seek,SeekFrom,Write}};
 use axum::body::Bytes;
@@ -177,6 +179,7 @@ impl Service {
         Ok(json!({"upload_id":id,"state":"cancelled"}))
     }
     fn sweep(&self)->Result<(),String>{
+        selection::purge_expired(&self.manager.home)?;
         for u in self.store.expired()?{
             self.store.expire(&u.id)?;
             let path=self.staged(&u.id)?;

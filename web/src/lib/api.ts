@@ -5937,7 +5937,7 @@ export interface UserInviteResult {
 export type UserInviteState = 'none' | 'pending' | 'expired' | 'used';
 
 export interface PersonalGoogleStatus {
-  connection: { owner_id: string; account_email: string; granted_scopes: string[]; status: 'connected' | 'needs_reconnect' | 'suspended'; connected_at: string } | null;
+  connection: { owner_id: string; account_email: string; granted_scopes: string[]; local_purposes?: string[]; status: 'connected' | 'needs_reconnect' | 'suspended'; connected_at: string } | null;
   login_email: string;
   client_configured: boolean;
   integration_enabled: boolean;
@@ -8068,7 +8068,7 @@ export const api = {
   },
   personalGoogle: {
     status: () => client.call('me.google.status') as Promise<PersonalGoogleStatus>,
-    start: (acknowledgeGoogleData: boolean) => client.call('me.google.connect_start', { redirect_origin: window.location.origin, acknowledge_google_data: acknowledgeGoogleData }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
+    start: (acknowledgeGoogleData: boolean, meetingRecordings = false, driveTools = false) => client.call('me.google.connect_start', { redirect_origin: window.location.origin, acknowledge_google_data: acknowledgeGoogleData, ...(meetingRecordings ? { meeting_recordings: true } : {}), ...(driveTools ? { drive_tools: true } : {}) }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
     finish: (state: string) => client.call('me.google.connect_finish', { state }),
     paste: (url: string) => client.call('me.google.connect_paste', { url }),
     disconnect: () => client.call('me.google.disconnect', { confirm: true }).then(notifyDisconnectForget) as Promise<{provider_revoked:boolean;provider_note:string|null}>,

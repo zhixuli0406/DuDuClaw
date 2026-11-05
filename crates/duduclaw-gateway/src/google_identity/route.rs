@@ -13,9 +13,11 @@
 //! |---|---|
 //! | `{ok, mode: "delegate", access_token, expires_in, account_email}` | use this token |
 //! | `{ok, mode: "home", fallback, notice?}` | use the home account in-process |
+//! | `{ok, mode: "metadata", account_email?, status, granted_scopes}` | local status only; no bearer |
 //! | `{ok: false, code, message}` (403) | refused; `code` ∈ [`super::REFUSAL_CODES`] |
 //!
-//! Every decision is one `google_token` row in `tool_calls.jsonl` (no token).
+//! `google_status` returns metadata only, never a bearer or a refresh.
+//! Every token decision is one `google_token` row in `tool_calls.jsonl` (no token).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -176,6 +178,20 @@ pub(crate) async fn serve(
     tool: &str,
     requester: &RequesterIdentity,
 ) -> Result<Value, Refusal> {
+    if tool == "google_status" {
+        let outcome = status_metadata(state, agent, requester);
+        duduclaw_security::audit::append_tool_call_with_extras(
+            &state.home, agent, "google_status", "metadata_only", outcome.is_ok(),
+            &[("requester_kind", json!(requester.kind())),
+              ("reason", json!(outcome.as_ref().err().map(|r| r.code)))],
+        );
+        return outcome;
+    }
+    if !crate::google_personal::scopes::token_tool(tool) {
+        let outcome = Err(Refusal::hard("scope_missing", "這項操作不能取得 Google 權杖。"));
+        audit_issue(&state.home, agent, tool, requester.kind(), &outcome);
+        return outcome.map(|_| Value::Null);
+    }
     #[cfg(test)]
     if super::route_test_probe::refuse_work(&state.home, super::route_test_probe::Work::Token) {
         return Err(Refusal::hard(
@@ -219,5 +235,46 @@ pub(crate) async fn serve(
             "fallback": fallback,
             "notice": notice,
         })),
+    }
+}
+
+/// Read the account's local authority only. No key, token resolver, provider
+/// request or fallback-account acquisition is reachable from this path.
+fn status_metadata(
+    state: &GoogleTokenRouteState,
+    agent: &str,
+    requester: &RequesterIdentity,
+) -> Result<Value, Refusal> {
+    use duduclaw_core::google_identity::{self as gi, Effective};
+    if !crate::google_workspace::integration_enabled(&state.home) {
+        return Err(Refusal::hard("disabled", "管理員尚未開啟 Google 整合。"));
+    }
+    let effective = gi::effective_for(&state.home, Some(agent));
+    let people = people_for(&state.home, state.users.as_ref());
+    match &effective.effective {
+        Effective::Personal { .. } => {
+            let selected = crate::google_personal::authority::PersonalSelection::capture(
+                &state.home, agent, requester, people.as_ref(), "google_status",
+            )?;
+            selected.ensure_healthy_personal()?;
+            let metadata = crate::person_credentials::authority_state(
+                &state.home, selected.user_id().ok_or_else(|| Refusal::hard("not_connected", "尚未連線。"))?,
+            ).map_err(|_| Refusal::hard("config_invalid", "無法讀取連線狀態。"))?
+                .metadata.ok_or_else(|| Refusal::hard("not_connected", "尚未連線。"))?;
+            selected.validate(&state.home, agent, requester, people.as_ref(), "google_status")?;
+            Ok(json!({"ok":true, "mode":"metadata", "identity_kind":"personal",
+                "account_email":selected.account_email(), "status":metadata.status,
+                "granted_scopes":crate::google_personal::scopes::visible_scopes(&metadata)}))
+        }
+        Effective::Delegate { email } => {
+            super::requester_gate::check(effective.requesters, requester, agent, email, people.as_ref())?;
+            super::resolve::precheck(&state.home, email, people.as_ref())?;
+            Ok(json!({"ok":true, "mode":"metadata", "identity_kind":"delegate",
+                "account_email":email, "status":"configured", "granted_scopes":[]}))
+        }
+        Effective::Home => Ok(json!({"ok":true, "mode":"metadata", "identity_kind":"home",
+            "status":"configured", "granted_scopes":[]})),
+        other => Err(super::resolve::refusal_for(other)
+            .unwrap_or_else(|| Refusal::hard("config_invalid", "Google 設定錯誤。"))),
     }
 }
