@@ -161,10 +161,11 @@ pub(super) fn private_dir(path: &Path, create: bool) -> io::Result<File> {
             if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) { return Err(step_error("create_journal_dir", error)); }
         }
     }
-    // Keeping this handle prevents deletion/rename and denies data-write opens.
+    // Keeping this handle prevents deletion/rename of the directory itself.
+    // It allows adding/renaming files inside (required for atomic journal replacement).
     // This is not isolation from same-user attribute-only or ancestor changes.
     let file = OpenOptions::new().access_mode(FILE_GENERIC_READ)
-        .share_mode(FILE_SHARE_READ)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS).open(path)
         .map_err(|e| step_error("open_journal_dir", e))?;
     validate_entry(&file, true).map_err(|e| step_error("validate_journal_dir_type", e))?;
@@ -302,6 +303,18 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         let file = private_file(&entry, false).unwrap();
         assert_private(&file);
+    }
+
+    #[test]
+    fn transcription_google_cleanup_windows_directory_guard_allows_child_rename() {
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join("private");
+        let _guard = private_dir(&directory, true).unwrap();
+        let source = home.path().join("journal.tmp");
+        let target = directory.join("journal.json");
+        std::fs::write(&source, b"journal").unwrap();
+        std::fs::rename(&source, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"journal");
     }
 
     #[test]
