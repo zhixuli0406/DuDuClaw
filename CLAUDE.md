@@ -21,6 +21,8 @@ This file is loaded into every session, so it keeps only the map, the cross-cutt
 - `wiki/duduclaw-kb/architecture/release-implementation-notes.md`: developer notes for v1.67.0 → v1.72.0, one block per feature batch, including each batch's "not verified" list.
 - Public docs: `docs/features/` and `docs/guides/` (three languages), `docs/features/05-security-defense.md` (canonical security description), `docs/guides/deprecations.md`, `docs/guides/dashboard-settings.md`, `docs/guides/mcp-tools.md`, `SECURITY.md`.
 
+`AGENTS.md` is the short file Codex loads: it repeats "Highest directive", "Cross-cutting rules", "Coding Conventions" and "Documentation Classification & Placement" from this file and points here for the rest. When you change one of those four sections, change it in `AGENTS.md` too, and keep `AGENTS.md` under 12 KB.
+
 When a change lands: write the detail into `CHANGELOG.md` and the wiki reference; touch the map below only when one of its lines becomes wrong or a new subsystem appears. Keep this file short (target under 40 KB).
 
 ## Current state (v1.72.2, 2026-10-11)
