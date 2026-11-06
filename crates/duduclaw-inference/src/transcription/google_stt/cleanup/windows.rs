@@ -291,7 +291,8 @@ mod tests {
         let path = home.path().join("private");
         let directory = private_dir(&path, true).unwrap();
         assert_private(&directory);
-        assert!(OpenOptions::new().write(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        // The guard shares write for child renames, but withholds delete sharing for the directory itself.
+        assert!(OpenOptions::new().access_mode(DELETE).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).open(&path).is_err());
         let entry = path.join("record");
         let file = private_file(&entry, true).unwrap();
