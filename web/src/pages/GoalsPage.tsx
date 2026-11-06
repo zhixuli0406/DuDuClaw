@@ -1,4 +1,4 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -342,7 +342,7 @@ export function GoalsPage() {
   const openAssign = useOpenAssign();
   const connState = useConnectionStore((s) => s.state);
   const { fetchAgents, loaded: agentsLoaded } = useAgentsStore();
-  const agents = useVisibleAgents(false);
+  const agents = useSelectableAgents(false);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [searchParams] = useSearchParams();
   const [tasks, setTasks] = useState<TaskInfo[]>([]);

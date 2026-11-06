@@ -236,7 +236,7 @@ describe('WebChatPage', () => {
 
     // Escape closes the list for a bare @.
     fireEvent.change(input, { target: { value: '@', selectionStart: 1 } });
-    expect(screen.getAllByRole('option')).toHaveLength(2);
+    expect(await screen.findAllByRole('option')).toHaveLength(2);
     fireEvent.keyDown(input, { key: 'Escape' });
     expect(screen.queryByRole('listbox')).toBeNull();
   });

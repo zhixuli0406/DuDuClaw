@@ -3,7 +3,7 @@ import type { AgentDetail, AgentInfo, CallableAgent } from '@/lib/api';
 import type { UserRole, AgentBinding } from '@/stores/auth-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useCallableAgents } from '@/stores/callable-agents-store';
+import { useCallableAgents, useSelectableCallableAgents } from '@/stores/callable-agents-store';
 
 /**
  * Data-scope layer (dashboard-redesign §3.4 WP11-T11.3). Turns a viewer's role
@@ -53,6 +53,18 @@ export function useVisibleAgents(includeTeam = true, sessionId?: string | null):
   const { agents: callable, unrestricted } = useCallableAgents(sessionId);
   return useMemo(() => selectVisibleAgents(agents, callable, unrestricted, includeTeam),
     [unrestricted, agents, callable, includeTeam]);
+}
+
+/** Selection never consumes retained display grants. Each activation waits for a new response.
+ * Gesture refreshes in callable-agents-store also fence native and MDS selects.
+ */
+export function useSelectableAgents(includeTeam: false, sessionId?: string | null, active?: boolean): ReadonlyArray<AgentDetail>;
+export function useSelectableAgents(includeTeam?: true, sessionId?: string | null, active?: boolean): ReadonlyArray<VisibleAgent>;
+export function useSelectableAgents(includeTeam = true, sessionId?: string | null, active = true): ReadonlyArray<VisibleAgent> {
+  const agents = useAgentsStore(s => s.agents);
+  const grants = useSelectableCallableAgents(sessionId, active);
+  return useMemo(() => selectVisibleAgents(agents, grants.agents, grants.unrestricted, includeTeam),
+    [agents, grants.agents, grants.unrestricted, includeTeam]);
 }
 
 /** Shared projection for React pickers and the read-only custom-widget bridge. */

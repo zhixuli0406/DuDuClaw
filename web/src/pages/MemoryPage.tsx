@@ -1,4 +1,4 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { hasMinRole } from '@/lib/roles';
@@ -99,7 +99,7 @@ export function MemoryPage() {
   const canReadEvolution = hasMinRole(useAuthStore(s => s.user?.role), 'manager');
   const requestedView = parseView(params.get('tab'));
   const view = requestedView === 'evolution' && !canReadEvolution ? 'memories' : requestedView;
-  const agents = useVisibleAgents(false);
+  const agents = useSelectableAgents(false);
   const fetchAgents = useAgentsStore(s => s.fetchAgents);
   const [selectedAgent, setSelectedAgent] = useState('');
   // W3-3 (state-as-URL): the memories search term starts from `?q=` so a

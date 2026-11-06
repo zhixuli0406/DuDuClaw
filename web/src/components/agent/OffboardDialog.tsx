@@ -1,3 +1,5 @@
+import { useSelectableAgents } from '@/lib/data-scope';
+import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Archive, Trash2, ArrowRightLeft, AlertTriangle } from 'lucide-react';
@@ -48,6 +50,8 @@ export function OffboardDialog({
   const intl = useIntl();
   const { archiveAgent, removeAgent, handoffAgent } = useAgentsStore();
 
+  const selectable = useSelectableAgents(false, undefined, open);
+  const selectionCandidates = candidates.filter(a => selectable.some(s => s.name === a.name));
   const [mode, setMode] = useState<OffboardMode>('archive');
   const [target, setTarget] = useState('');
   const [moveMemory, setMoveMemory] = useState(true);
@@ -73,10 +77,11 @@ export function OffboardDialog({
 
   const busyAll = busy || submitting;
   const removeReady = mode !== 'remove' || typed.trim() === agent.display_name.trim();
-  const handoffReady = mode !== 'handoff' || target !== '';
+  const handoffReady = mode !== 'handoff' || selectionCandidates.some(a => a.name === target);
   const canSubmit = !busyAll && removeReady && handoffReady;
 
   const handleSubmit = async () => {
+    if (!canSubmit || (mode === 'handoff' && !canSelectAgent(target))) return;
     setErrors(null);
     setSubmitting(true);
     try {
@@ -186,7 +191,7 @@ export function OffboardDialog({
                 onChange={(e) => setTarget(e.target.value)}
                 className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
               >
-                {candidates.map((c) => (
+                {selectionCandidates.map((c) => (
                   <option key={c.name} value={c.name}>{c.display_name}</option>
                 ))}
               </select>

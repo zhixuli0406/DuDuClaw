@@ -1,4 +1,4 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { Link } from 'react-router';
@@ -124,6 +124,7 @@ export function MySkillsTab({ filter }: { filter: string }) {
   const connectionState = useConnectionStore((s) => s.state);
   const { fetchAgents } = useAgentsStore();
   const agents = useVisibleAgents(false);
+  const selectableAgents = useSelectableAgents(false);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   // Defaults to the aggregate view (the first agent of the gateway's map
   // order was unrelated to the staffer the customer talks to).
@@ -288,7 +289,7 @@ export function MySkillsTab({ filter }: { filter: string }) {
             <AgentSelect
               value={selectedAgent}
               onValueChange={setSelectedAgent}
-              agents={agents}
+              agents={selectableAgents}
               placeholder={intl.formatMessage({ id: 'skills.my.selectAgent' })}
               allOption={intl.formatMessage({ id: 'skills.my.allAgents' })}
             />

@@ -1,10 +1,13 @@
+import { mockWsClient } from '@/test/mocks';
 import { act, fireEvent, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mockWsClient } from '@/test/mocks';
+import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
+import { useAgentsStore } from './agents-store';
 import { useAuthStore } from './auth-store';
-import { CALLABLE_REFRESH_INTERVAL_MS, useCallableAgents, useCallableAgentsStore } from './callable-agents-store';
+import { CALLABLE_TIMEOUT_MS, canSelectAgent, CALLABLE_REFRESH_INTERVAL_MS, useCallableAgents, useCallableAgentsStore } from './callable-agents-store';
 
 beforeEach(() => {
+  vi.restoreAllMocks();
   vi.useFakeTimers();
   vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
   useAuthStore.setState({ user: { id: 'viewer', role: 'admin' } as never, bindings: [] });
@@ -35,8 +38,9 @@ it('refreshes every 60 seconds while visible, pauses hidden, and refreshes on re
   expect(mockWsClient.call).toHaveBeenCalledTimes(4);
 });
 
-it('retains same-identity confirmed grants during refresh, then drops all grants on failure', async () => {
-  const { result } = renderHook(() => useCallableAgents());
+it('retains display grants but empties selection during refresh and clears both on failure', async () => {
+  useAgentsStore.setState({ agents: [{ name: 'mine' }] as never });
+  const { result } = renderHook(() => ({ ...useCallableAgents(), display: useVisibleAgents(), selection: useSelectableAgents() }));
   await act(async () => {});
   const confirmed = result.current.agents;
   let reject!: (error: Error) => void;
@@ -45,8 +49,11 @@ it('retains same-identity confirmed grants during refresh, then drops all grants
   expect(result.current.loading).toBe(true);
   expect(result.current.agents).toBe(confirmed);
   expect(result.current.unrestricted).toBe(true);
+  expect(result.current.display.map(a => a.name)).toEqual(['mine']);
+  expect(result.current.selection).toEqual([]);
+  expect(canSelectAgent('mine')).toBe(false);
   await act(async () => { reject(new Error('revoked')); });
-  expect(result.current).toMatchObject({ agents: null, loading: false, unrestricted: false });
+  expect(result.current).toMatchObject({ agents: null, loading: false, unrestricted: false, display: [], selection: [] });
 });
 
 it('refreshes when a picker opens by pointer or keyboard', async () => {
@@ -72,4 +79,33 @@ it('never restores unrestricted access from an old identity response', async () 
   await act(async () => { resolve({ agents: [{ name: 'old' }], unrestricted: true }); });
   expect(result.current).toMatchObject({ agents: [], unrestricted: false });
   expect(Object.values(useCallableAgentsStore.getState().entries)).toHaveLength(1);
+});
+
+it('requires a response after activation even for previously unrestricted grants, including demotion', async () => {
+  useAgentsStore.setState({ agents: [{ name: 'old' }, { name: 'mine' }] as never });
+  const { result, rerender } = renderHook(({ open }) => ({ display: useVisibleAgents(), selection: useSelectableAgents(true, undefined, open) }), { initialProps: { open: false } });
+  await act(async () => {});
+  let resolve!: (value: unknown) => void;
+  mockWsClient.call.mockImplementationOnce(() => new Promise(yes => { resolve = yes; }));
+  rerender({ open: true });
+  expect(result.current.selection).toEqual([]);
+  expect(result.current.display.map(a => a.name)).toContain('old');
+  expect(canSelectAgent('old')).toBe(false);
+  await act(async () => { resolve({ agents: [{ name: 'mine', via: 'binding', selectable: true }], unrestricted: false }); });
+  expect(result.current.selection.map(a => a.name)).toEqual(['mine']);
+  expect(canSelectAgent('old')).toBe(false);
+  expect(canSelectAgent('mine')).toBe(true);
+});
+
+it('clears display and selection on timeout and ignores the late response', async () => {
+  useAgentsStore.setState({ agents: [{ name: 'mine' }] as never });
+  const { result } = renderHook(() => ({ display: useVisibleAgents(), selection: useSelectableAgents() }));
+  await act(async () => {});
+  let resolve!: (value: unknown) => void;
+  mockWsClient.call.mockImplementationOnce(() => new Promise(yes => { resolve = yes; }));
+  act(() => { void useCallableAgentsStore.getState().load(Object.keys(useCallableAgentsStore.getState().entries)[0], null, true); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(CALLABLE_TIMEOUT_MS); });
+  expect(result.current).toEqual({ display: [], selection: [] });
+  await act(async () => { resolve({ agents: [], unrestricted: true }); });
+  expect(result.current).toEqual({ display: [], selection: [] });
 });

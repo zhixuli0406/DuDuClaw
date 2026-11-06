@@ -1,4 +1,4 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Link } from 'react-router';
@@ -512,7 +512,9 @@ function CreateDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const selectableAgents = useSelectableAgents(false);
   const submit = async () => {
+    if (!selectableAgents.some(a => a.name === form.ownerAgentId)) return;
     setBusy(true);
     setError(null);
     try {
@@ -559,7 +561,7 @@ function CreateDialog({
                 value={form.ownerAgentId}
                 onChange={(e) => set('ownerAgentId', e.target.value)}
               >
-                {agents.map((a) => (
+                {selectableAgents.map(({ name: a }) => (
                   <option key={a} value={a}>
                     {a}
                   </option>

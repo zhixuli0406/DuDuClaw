@@ -1,4 +1,4 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -747,7 +747,7 @@ export function ForesightPage() {
   const errorText = useErrorMessage();
   const connState = useConnectionStore((s) => s.state);
   const { fetchAgents } = useAgentsStore();
-  const agents = useVisibleAgents(false);
+  const agents = useSelectableAgents(false);
   const openAssign = useOpenAssign();
   const [selectedAgent, setSelectedAgent] = useState('');
   useEffect(() => {

@@ -1,4 +1,5 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -84,7 +85,7 @@ export function SkillWizard() {
   const t = (id: string) => intl.formatMessage({ id });
   const navigate = useNavigate();
   const { fetchAgents } = useAgentsStore();
-  const agents = useVisibleAgents(false);
+  const agents = useSelectableAgents(false);
 
   const [step, setStep] = useState<WizardStep>('describe');
   const [record, setRecord] = useState<CustomSkillRecord | null>(null);
@@ -156,7 +157,7 @@ export function SkillWizard() {
 
   // ── Step 1 → 2: create the record + kick off generation ──
   const handleStart = useCallback(async () => {
-    if (!canStartGeneration(description, builderAgent) || starting) return;
+    if (!canStartGeneration(description, builderAgent) || !canSelectAgent(builderAgent) || starting) return;
     setStarting(true);
     try {
       const provisional = description.trim().split('\n')[0].slice(0, 60) || t('skills.new.defaultName');

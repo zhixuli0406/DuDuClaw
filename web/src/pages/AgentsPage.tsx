@@ -103,6 +103,7 @@ export function AgentsPage() {
     clearError,
   } = useAgentsStore();
   const agents = useVisibleAgents();
+  const agentsForHandoff = useVisibleAgents(false);
   const isAdmin = useAuthStore(s => s.user?.role === 'admin');
   const { tasks, fetchTasks, error: tasksError, tasksPartialError, loading: tasksLoading } = useTasksStore();
 
@@ -255,7 +256,7 @@ export function AgentsPage() {
         <OffboardDialog
           open
           agent={offboardTarget}
-          candidates={agents.filter((a) => a.name !== offboardTarget.name && !a.archived)}
+          candidates={agentsForHandoff.filter((a) => a.name !== offboardTarget.name && !a.archived)}
           onClose={() => setOffboardTarget(null)}
           onDone={() => {
             setOffboardTarget(null);

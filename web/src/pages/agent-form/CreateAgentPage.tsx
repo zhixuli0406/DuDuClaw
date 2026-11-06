@@ -1,4 +1,5 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -40,7 +41,7 @@ export function CreateAgentPage() {
   const intl = useIntl();
   const navigate = useNavigate();
   const { fetchAgents } = useAgentsStore();
-  const agents = useVisibleAgents(false);
+  const agents = useSelectableAgents(false);
   const [name, setName] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [role, setRole] = useState('specialist');
@@ -162,7 +163,7 @@ export function CreateAgentPage() {
   };
 
   const handleSubmit = async () => {
-    if (!name.trim() || !displayName.trim()) return;
+    if (!name.trim() || !displayName.trim() || (reportsTo && !canSelectAgent(reportsTo))) return;
     setError(null);
     setErrorState(null);
     setSubmitting(true);

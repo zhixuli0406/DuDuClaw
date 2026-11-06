@@ -1,4 +1,5 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useUrlStateNullable } from '@/lib/use-url-state';
 import { useIntl } from 'react-intl';
@@ -85,7 +86,7 @@ function AssigneePicker({
   onPick: (kind: 'user' | 'agent', assignee: string) => void;
 }) {
   const intl = useIntl();
-  const agents = useVisibleAgents(false);
+  const agents = useSelectableAgents(false);
   const currentUser = useAuthStore((s) => s.user);
 
   const agent = step.assignee_kind === 'agent' ? agents.find((a) => a.name === step.assignee) : undefined;
@@ -119,7 +120,7 @@ function AssigneePicker({
           {intl.formatMessage({ id: 'plans.step.assignee.user' })}
         </DropdownMenuItem>
         {agents.map((a) => (
-          <DropdownMenuItem key={a.name} onClick={() => onPick('agent', a.name)}>
+          <DropdownMenuItem key={a.name} onClick={() => { if (canSelectAgent(a.name)) onPick('agent', a.name); }}>
             <ActorAvatar actorType="agent" size="xs" name={a.display_name} />
             <span className="truncate">{a.display_name}</span>
           </DropdownMenuItem>
@@ -597,7 +598,7 @@ function CreatePlanDialog({
   onCreate: (title: string, agentId: string) => Promise<void>;
 }) {
   const intl = useIntl();
-  const agents = useVisibleAgents(false);
+  const agents = useSelectableAgents(false, undefined, open);
   const [title, setTitle] = useState('');
   const [agentId, setAgentId] = useState('');
   const [busy, setBusy] = useState(false);
@@ -605,9 +606,9 @@ function CreatePlanDialog({
   useEffect(() => {
     if (open) {
       setTitle('');
-      setAgentId(agents[0]?.name ?? '');
+      setAgentId('');
     }
-  }, [open, agents]);
+  }, [open]);
 
   const current = agents.find((a) => a.name === agentId);
 
@@ -621,7 +622,7 @@ function CreatePlanDialog({
           className="space-y-4"
           onSubmit={async (e) => {
             e.preventDefault();
-            if (!title.trim() || !agentId || busy) return;
+            if (!title.trim() || !current || !canSelectAgent(agentId) || busy) return;
             setBusy(true);
             try {
               await onCreate(title.trim(), agentId);

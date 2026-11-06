@@ -1,3 +1,4 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
 import { TASK_ENTRY_POINTS_HIDDEN } from '@/lib/task-entry-visibility';
 import { PlanReview } from '@/components/task/PlanReview';
 import { TaskWorkflowReview } from '@/components/workflow/TaskWorkflowReview';
@@ -175,7 +176,7 @@ export function TaskDetailPage() {
   );
   const applyAssign = useCallback(
     (agentName: string) => {
-      if (task) assignTask(task.id, agentName);
+      if (task && canSelectAgent(agentName)) assignTask(task.id, agentName);
     },
     [task, assignTask],
   );

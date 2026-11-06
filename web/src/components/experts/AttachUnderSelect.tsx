@@ -1,4 +1,4 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { useEffect, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -31,7 +31,7 @@ export function AttachUnderSelect({
 }) {
   const intl = useIntl();
   const { fetchAgents, loaded } = useAgentsStore();
-  const agents = useVisibleAgents(false);
+  const agents = useSelectableAgents(false);
 
   useEffect(() => {
     if (!loaded) fetchAgents();

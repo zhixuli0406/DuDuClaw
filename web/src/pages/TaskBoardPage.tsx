@@ -1,5 +1,5 @@
 import { useAuthStore } from '@/stores/auth-store';
-import { useVisibleAgents } from '@/lib/data-scope';
+import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { TASK_ENTRY_POINTS_HIDDEN, chatEntryLabel } from '@/lib/task-entry-visibility';
 import { DataExportButton } from '@/components/DataExportButton';
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
@@ -757,6 +757,7 @@ export function TaskBoardPage() {
   } = useTasksStore();
   const { fetchAgents } = useAgentsStore();
   const agents = useVisibleAgents(false);
+  const selectableAgents = useSelectableAgents(false);
   const filterAgent = useAuthStore(s => s.user?.role) === 'admin' || agents.some(a => a.name === requestedAgent) ? requestedAgent : null;
 
   const [view, setView] = useState<ViewMode>(() => readPref(VIEW_KEY, ['kanban', 'list'] as const, 'kanban'));
@@ -1135,7 +1136,7 @@ export function TaskBoardPage() {
           {intl.formatMessage({ id: 'tasks.scope.all' })}
         </span>
         <FilterMenu
-          agents={agents}
+          agents={selectableAgents}
           filterAgent={filterAgent}
           filterPriority={filterPriority}
           setFilterAgent={setFilterAgent}

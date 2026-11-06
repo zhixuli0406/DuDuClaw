@@ -1,4 +1,5 @@
-import { useVisibleAgents, useAgentVisibilityUnrestricted } from '@/lib/data-scope';
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents, useVisibleAgents, useAgentVisibilityUnrestricted } from '@/lib/data-scope';
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { FileAudio, Download, RefreshCw, X } from 'lucide-react';
@@ -16,6 +17,7 @@ export function MeetingTranscriptsPage() {
   const user = useAuthStore(s => s.user);
   const [meetingAgents, setAgents] = useState<CallableAgent[]>([]);
   const visibleAgents = useVisibleAgents();
+  const selectableAgents = useSelectableAgents();
   const unrestricted = useAgentVisibilityUnrestricted();
   const agents = meetingAgents.filter(a => unrestricted || visibleAgents.some(v => v.name === a.name));
   const [requestedAgent, setAgent] = useState('');
@@ -61,6 +63,7 @@ export function MeetingTranscriptsPage() {
     return () => { alive = false; window.clearInterval(timer); };
   }, [agent, revision]); // eslint-disable-line react-hooks/exhaustive-deps
   async function submit() {
+    if (!canSelectAgent(agent)) return;
     if (!file || !agent || active || !user) return;
     if (file.size === 0 || file.size > maxBytes) { setError(t('meeting.sizeError')); return; }
     setError(''); setProgress(0); setPath(null); setPhase('preparing');
@@ -86,7 +89,7 @@ export function MeetingTranscriptsPage() {
         <select id="meeting-agent" value={agent} disabled={active || agents.length === 0} onChange={e => { setAgent(e.target.value); setError(''); }}
           className="h-10 w-full rounded-lg border border-input bg-background px-3 text-sm focus-visible:outline-2 focus-visible:outline-ring">
           {agents.length === 0 && <option value="">{t('meeting.noEmployees')}</option>}
-          {agents.map(item => <option key={item.name} value={item.name}>{item.display_name || item.name}</option>)}
+          {agents.filter(a => selectableAgents.some(s => s.name === a.name)).map(item => <option key={item.name} value={item.name}>{item.display_name || item.name}</option>)}
         </select>
       </div>
       <div className="space-y-3 border-y border-border py-5">
@@ -106,7 +109,7 @@ export function MeetingTranscriptsPage() {
         {phase !== 'idle' && <Button variant="ghost" onClick={() => controller.current?.abort()}>{t('meeting.pauseUpload')}</Button>}
         <span className="text-xs text-muted-foreground">{t('meeting.resumeHint')}</span>
       </div>
-      {!isPersonal && user && <MeetingDrivePicker key={`${user.id}:${agent}`} agent={agent} agentName={agents.find(item => item.name === agent)?.display_name || agent} disabled={phase !== 'idle'} onBusy={setDriveBusy} onImported={() => setRevision(value => value + 1)} />}
+      {!isPersonal && user && <MeetingDrivePicker key={`${user.id}:${agent}`} agent={agent} agentName={agents.find(item => item.name === agent)?.display_name || agent} disabled={phase !== 'idle' || !selectableAgents.some(a => a.name === agent)} onBusy={setDriveBusy} onImported={() => setRevision(value => value + 1)} />}
     </section>
     <section aria-labelledby="meeting-jobs-title" className="space-y-3">
       <div className="flex items-center justify-between gap-3">

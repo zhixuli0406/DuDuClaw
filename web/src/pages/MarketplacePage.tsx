@@ -1,4 +1,5 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useCallback, useEffect, useMemo, useState, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
@@ -140,9 +141,9 @@ export function MarketplacePage() {
   const [installError, setInstallError] = useState<string | null>(null);
   const [servers, setServers] = useState<ReadonlyArray<MarketplaceServer>>([]);
   const [loading, setLoading] = useState(true);
-  const agents = useVisibleAgents(false);
   const fetchAgents = useAgentsStore(s => s.fetchAgents);
   const [installTarget, setInstallTarget] = useState<string | null>(null);
+  const agents = useSelectableAgents(false, undefined, installTarget !== null);
   const [installAgent, setInstallAgent] = useState('');
   // v1.68: typed values for the target item's required env names. Cleared
   // as soon as the dialog closes or the install succeeds.
@@ -205,7 +206,7 @@ export function MarketplacePage() {
   };
 
   const confirmInstall = async () => {
-    if (!installTarget || !installAgent || envMissing) return;
+    if (!installTarget || !installAgent || !canSelectAgent(installAgent) || envMissing) return;
     setInstalling(true);
     setInstallError(null);
     try {

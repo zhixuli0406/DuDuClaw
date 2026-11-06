@@ -1,3 +1,4 @@
+import { canSelectAgent, useSelectableCallableAgents } from '@/stores/callable-agents-store';
 import { useVisibleAgents } from '@/lib/data-scope';
 import { useCallableAgents } from '@/stores/callable-agents-store';
 import { RecentSkillChips } from '@/components/skills/RecentSkillChips';
@@ -109,6 +110,7 @@ function InteractiveWebChatPage() {
   } = useChatStore();
 
   const agents = useVisibleAgents(true, chatSessionId);
+  const staffGrants = useSelectableCallableAgents(chatSessionId);
   const agentsLoaded = useAgentsStore((s) => s.loaded);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
 
@@ -227,8 +229,8 @@ function InteractiveWebChatPage() {
   // to it), so it gets no duplicate employee chip in the row. Only staff the
   // server accepts as an explicit partner get a chip (own and team staff).
   const staffAgents = useMemo<readonly EmployeeRowAgent[]>(() => {
-    if (callable) {
-      return callable
+    if (staffGrants.agents) {
+      return staffGrants.agents
         .filter((a) => a.selectable && a.role !== 'main')
         .map((a) => ({
           name: a.name,
@@ -237,8 +239,8 @@ function InteractiveWebChatPage() {
           manager_may_read: a.manager_may_read === true,
         }));
     }
-    return agents.filter((a) => a.role !== 'main');
-  }, [agents, callable]);
+    return [];
+  }, [staffGrants.agents]);
 
   /**
    * Every user-driven partner switch goes through here so the store and the URL
@@ -247,10 +249,11 @@ function InteractiveWebChatPage() {
    */
   const handleSelectAgent = useCallback(
     (id: string | null) => {
+      if (id && !canSelectAgent(id, chatSessionId)) return;
       selectAgent(id);
       setAgentParam(id);
     },
-    [selectAgent, setAgentParam],
+    [selectAgent, setAgentParam, chatSessionId],
   );
 
   // A restored/preselected selection (e.g. `?agent=<main>`) may point at the main
@@ -353,6 +356,7 @@ function InteractiveWebChatPage() {
   // the popup refreshes the list so an org change shows up without a reload.
   const activeMention = useMemo(() => findActiveMention(input, caret), [input, caret]);
   const mentionTyping = activeMention !== null;
+  const mentionGrants = useSelectableCallableAgents(chatSessionId, mentionTyping && !mentionDismissed);
   useEffect(() => {
     if (mentionTyping) loadCallable();
   }, [mentionTyping, loadCallable]);
@@ -360,10 +364,10 @@ function InteractiveWebChatPage() {
   // task; the gateway checks the right again when the command arrives.
   const assigning = isAssignCommand(input);
   const mentionSource = useMemo<readonly MentionAgent[]>(() => {
-    const visible = new Set(agents.map(a => a.name));
-    const all = (assignedOnly ? (callable ?? []).filter(a => visible.has(a.name)) : callable ?? agents) as readonly MentionAgent[];
+    const visible = new Set((mentionGrants.agents ?? []).filter(a => a.selectable).map(a => a.name));
+    const all = (mentionGrants.unrestricted ? mentionGrants.agents ?? [] : (mentionGrants.agents ?? []).filter(a => visible.has(a.name))) as readonly MentionAgent[];
     return assigning ? assignableAgents(all) : all;
-  }, [callable, agents, assigning, assignedOnly]);
+  }, [mentionGrants.agents, mentionGrants.unrestricted, assigning]);
   const mentionCandidates = useMemo(
     () => (activeMention ? orderMentionCandidates(filterMentionCandidates(mentionSource, activeMention.query)) : []),
     [activeMention, mentionSource],
@@ -371,9 +375,12 @@ function InteractiveWebChatPage() {
   const mentionOpen = activeMention !== null && !mentionDismissed && (agentsLoaded || callable !== null);
   const safeMentionIndex = mentionCandidates.length ? Math.min(mentionIndex, mentionCandidates.length - 1) : 0;
 
+  const chosenMentions = useRef(new Map<string, string>());
   const pickMention = (agent: MentionAgent) => {
-    if (!activeMention) return;
-    const next = applyMention(input, activeMention, mentionText(agent, mentionSource));
+    if (!activeMention || !mentionSource.some(a => a.name === agent.name)) return;
+    const call = mentionText(agent, mentionSource);
+    chosenMentions.current.set(agent.name, call);
+    const next = applyMention(input, activeMention, call);
     setInput(next.text);
     setCaret(next.caret);
     setMentionIndex(0);
@@ -387,8 +394,14 @@ function InteractiveWebChatPage() {
 
   const handleSend = () => {
     const text = input.trim();
+    for (const [name, call] of chosenMentions.current) {
+      if (text.includes(call) && !canSelectAgent(name, chatSessionId)) return;
+    }
+    if (selectedAgentId && !canSelectAgent(selectedAgentId, chatSessionId)) return;
+    if (mentionTyping && !mentionSource.length) return;
     if ((!text && attachments.length === 0) || connectionState !== 'connected' || assignmentBlocked) return;
     send(text, attachments);
+    chosenMentions.current.clear();
     setInput('');
     setAttachments([]);
     inputRef.current?.focus();

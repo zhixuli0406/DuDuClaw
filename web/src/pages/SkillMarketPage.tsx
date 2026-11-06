@@ -1,4 +1,4 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useSearchParams } from 'react-router';
@@ -538,6 +538,7 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
   const intl = useIntl();
   const { fetchAgents } = useAgentsStore();
   const agents = useVisibleAgents(false);
+  const selectableAgents = useSelectableAgents(false);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [scope, setScope] = useState('global');
   const [scanning, setScanning] = useState(false);
@@ -640,7 +641,7 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
                 )}
                 <SelectGroup>
                   <SelectLabel>{intl.formatMessage({ id: 'skills.install.scopeAgentGroup' })}</SelectLabel>
-                  {sortAgentsByName(agents, intl.locale).map((agent) => (
+                  {sortAgentsByName(selectableAgents, intl.locale).map((agent) => (
                     <SelectItem key={agent.name} value={agent.name}>
                       {intl.formatMessage(
                         { id: 'skills.install.scopeAgent' },

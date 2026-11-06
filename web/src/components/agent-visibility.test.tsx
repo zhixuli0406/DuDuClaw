@@ -86,6 +86,7 @@ for (const surface of surfaces) describe(surface.name, () => {
     if (surface.name === 'automation picker') await surface.open();
     await waitFor(() => expect(Object.values(useCallableAgentsStore.getState().entries).some(e => !e.loading)).toBe(true));
     if (surface.name !== 'automation picker') await surface.open();
+    await act(async () => {});
     if (mode === 'admin') {
       expect(screen.getAllByText('MainStaff', { exact: false }).length).toBeGreaterThan(0);
       expect(screen.getAllByText('OtherStaff', { exact: false }).length).toBeGreaterThan(0);
@@ -112,4 +113,20 @@ it('new chat clears a stale main selection for a member', () => {
   useChatStore.setState({ selectedAgentId: 'MainStaff' });
   useConversationsStore.getState().startNew();
   expect(useChatStore.getState().selectedAgentId).toBeNull();
+});
+
+it('an unrestricted picker opened during demotion never offers or submits the revoked employee', async () => {
+  useAuthStore.setState(s => ({ user: { ...s.user!, role: 'admin' } }));
+  const onChange = vi.fn();
+  renderWithProviders(<AgentModelPicker value="OtherStaff" onChange={onChange} />);
+  await act(async () => {});
+  let resolve!: (value: unknown) => void;
+  mockWsClient.call.mockImplementationOnce(() => new Promise(yes => { resolve = yes; }));
+  fireEvent.click(screen.getByRole('button'));
+  expect(screen.queryByRole('menuitemradio', { name: /OtherStaff/ })).toBeNull();
+  expect(onChange).not.toHaveBeenCalled();
+  await act(async () => { resolve({ agents: callable, unrestricted: false }); });
+  expect(screen.queryByRole('menuitemradio', { name: /OtherStaff/ })).toBeNull();
+  fireEvent.click(screen.getByText('AllowedStaff'));
+  expect(onChange).toHaveBeenCalledWith('AllowedStaff');
 });

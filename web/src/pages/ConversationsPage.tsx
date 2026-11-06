@@ -1,4 +1,5 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { useSelectableCallableAgents } from '@/stores/callable-agents-store';
+import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
@@ -63,8 +64,10 @@ export function ConversationsPage() {
   const role = useAuthStore((s) => s.user?.role);
   const subject = useAuthStore(conversationIdentityKey);
   const userStatus = useAuthStore((s) => s.user?.status);
+  const selectionGrants = useSelectableCallableAgents();
   const canListAll = hasMinRole(role, 'admin');
   const agents = useVisibleAgents();
+  const selectableAgents = useSelectableAgents();
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const connectionState = useConnectionStore((s) => s.state);
   const activeSessionId = useChatStore((s) => s.sessionId);
@@ -246,7 +249,7 @@ export function ConversationsPage() {
             everyone. For anyone else the listing is scoped server-side to one
             employee, so the trigger names that employee instead of promising a
             breadth the RPC would refuse (2026-08-04 review, FINDING-4). */}
-        <Select value={agentFilter} onValueChange={(v) => setAgentFilter(String(v))}>
+        <Select value={agentFilter} onValueChange={(v) => { if ((v === 'all' && selectionGrants.unrestricted) || selectableAgents.some(a => a.name === v)) setAgentFilter(String(v)); }}>
           <SelectTrigger className="w-48" aria-label={intl.formatMessage({ id: 'conversations.filter.agent' })}>
             <SelectValue>
               {agentFilter !== 'all'
@@ -259,12 +262,12 @@ export function ConversationsPage() {
             </SelectValue>
           </SelectTrigger>
           <SelectContent>
-            {canListAll && (
+            {canListAll && selectionGrants.unrestricted && (
               <SelectItem value="all">
                 {intl.formatMessage({ id: 'conversations.filter.allAgents' })}
               </SelectItem>
             )}
-            {agents.map((a) => (
+            {selectableAgents.map((a) => (
               <SelectItem key={a.name} value={a.name}>
                 {a.display_name || a.name}
               </SelectItem>

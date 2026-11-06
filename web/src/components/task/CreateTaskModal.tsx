@@ -1,3 +1,5 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import {
@@ -28,7 +30,7 @@ import { formatError, formatErrorDetail } from '@/lib/toast';
 export function CreateTaskModal({
   open,
   onClose,
-  agents,
+  agents: displayAgents,
   onCreate,
   parentTaskId,
   defaultAssignee,
@@ -41,6 +43,8 @@ export function CreateTaskModal({
   defaultAssignee?: string;
 }) {
   const intl = useIntl();
+  const selectable = useSelectableAgents(false, undefined, open);
+  const agents = displayAgents.filter(a => selectable.some(grant => grant.name === a.name));
   const wasOpen = useRef(false);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -73,7 +77,7 @@ export function CreateTaskModal({
 
   const handleSubmit = useCallback(async () => {
     if (!title.trim()) return;
-    if (!visibleAssignee) {
+    if (!visibleAssignee || !canSelectAgent(visibleAssignee)) {
       setAssigneeMissing(true);
       return;
     }

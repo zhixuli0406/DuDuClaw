@@ -4,7 +4,7 @@ import { useIntl } from 'react-intl';
 import { Download, Eye, FolderOpen, Search } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useDataScope, useVisibleAgents } from '@/lib/data-scope';
+import { useDataScope, useSelectableAgents } from '@/lib/data-scope';
 import {
   PageHeader,
   Badge,
@@ -105,7 +105,7 @@ export function FilesPage() {
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const agentsLoaded = useAgentsStore((s) => s.loaded);
   const scope = useDataScope();
-  const visibleAgents = useVisibleAgents(false);
+  const visibleAgents = useSelectableAgents(false);
 
   // Admins may browse the shared bucket; scoped users start on their first
   // visible AI staff member (the gateway fails closed without an agent).

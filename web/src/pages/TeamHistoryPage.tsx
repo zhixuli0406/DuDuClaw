@@ -1,4 +1,4 @@
-import { useVisibleAgents, useAgentVisibilityUnrestricted } from '@/lib/data-scope';
+import { useSelectableAgents, useVisibleAgents, useAgentVisibilityUnrestricted } from '@/lib/data-scope';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl, type IntlShape } from 'react-intl';
 import { useSearchParams } from 'react-router';
@@ -46,6 +46,7 @@ export function TeamHistoryPage() {
   }, [refresh, intl]);
 
   const visibleAgents = useVisibleAgents();
+  const selectableAgents = useSelectableAgents();
   const unrestricted = useAgentVisibilityUnrestricted();
   const agents = useMemo(() => {
     const all = team?.members.flatMap(m => m.agents.filter(a => a.history_readable === true && (unrestricted || visibleAgents.some(v => v.name === a.name)))) ?? [];
@@ -130,7 +131,7 @@ export function TeamHistoryPage() {
       : <>
         <div className="grid gap-3 sm:grid-cols-3">
           <label className="space-y-1 text-sm">{msg('agent')}<select aria-label={msg('agent')} className={selectClass} value={chosenAgent} onChange={e => { setAgent(e.target.value); setReport(''); setSelected(''); }}>
-            {agents.map(a => <option key={a.name} value={a.name}>{a.display_name}</option>)}
+            {agents.filter(a => selectableAgents.some(s => s.name === a.name)).map(a => <option key={a.name} value={a.name}>{a.display_name}</option>)}
           </select></label>
           <label className="space-y-1 text-sm">{msg('report')}<select aria-label={msg('report')} className={selectClass} value={chosenReport} onChange={e => { setReport(e.target.value); setSelected(''); }}>
             <option value="">{msg('allReports')}</option>{reports.map(r => <option key={r.id} value={r.id}>{r.display_name}</option>)}

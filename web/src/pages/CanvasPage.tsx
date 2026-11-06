@@ -7,7 +7,7 @@ import { canvasSrcDoc, CANVAS_SANDBOX } from '@/lib/canvas-doc';
 import { client } from '@/lib/ws-client';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useDataScope, useVisibleAgents } from '@/lib/data-scope';
+import { useDataScope, useSelectableAgents } from '@/lib/data-scope';
 import {
   PageHeader,
   Card,
@@ -49,7 +49,7 @@ export function CanvasPage() {
   const agents = useAgentsStore((s) => s.agents);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const scope = useDataScope();
-  const visibleAgents = useVisibleAgents(false);
+  const visibleAgents = useSelectableAgents(false);
 
   // P11 (state-as-URL): whose canvas, and which version of it, are both page
   // state — `?agent=<id>&seq=<n>` makes "look at this version" a link.

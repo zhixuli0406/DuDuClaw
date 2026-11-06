@@ -1,8 +1,9 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Download } from 'lucide-react';
 import { Button, Dialog, DialogContent, DialogHeader, DialogTitle, Input } from '@/components/mds';
-import { useVisibleAgents } from '@/lib/data-scope';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { useAgentsStore } from '@/stores/agents-store';
 import { dataExports, downloadDataExport, exportDateRange, type ExportDataset, type ExportFormat, type ExportJob } from '@/lib/data-exports';
 
@@ -16,7 +17,7 @@ export function DataExportButton({ dataset, agentId='', scope='agent' }: {datase
   const [format,setFormat]=useState<ExportFormat>('xlsx');
   const [agent,setAgent]=useState(agentId);
   const [wikiScope,setWikiScope]=useState(scope);
-  const agents=useVisibleAgents(false);
+  const agents=useSelectableAgents(false, undefined, open);
   const fetchAgents=useAgentsStore(s=>s.fetchAgents);
   const [start,setStart]=useState(''); const [end,setEnd]=useState('');
   const [job,setJob]=useState<ExportJob|null>(null);
@@ -43,6 +44,7 @@ export function DataExportButton({ dataset, agentId='', scope='agent' }: {datase
   const requiresAgent=selected==='memories' || (selected==='wiki' && wikiScope==='agent');
   const active=!!job && ['queued','running'].includes(job.state);
   const create=async()=>{
+    if(agent && !canSelectAgent(agent)) return;
     setBusy(true);setError(null);setJob(null);const run=++sequence.current;
     try {
       const created=await dataExports.create({dataset:selected,format,...exportDateRange(start,end),...(agent && !(selected==='wiki' && wikiScope==='shared') ? {agent_id:agent}:{}),...(selected==='wiki'?{scope:wikiScope}:{})});

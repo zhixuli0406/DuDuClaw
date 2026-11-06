@@ -69,6 +69,7 @@ const REJECTS_TO_SAFE_DEFAULT = new Set([
   'dashboard.layout.get',
   'widgets.custom.list',
   'users.subordinates',
+  'users.my_team',
 ]);
 
 beforeEach(() => {

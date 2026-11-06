@@ -163,7 +163,7 @@ function AgentDetailPageContent() {
   const errorText = useErrorMessage();
   const connectionState = useConnectionStore((s) => s.state);
   const { pauseAgent, resumeAgent, archiveAgent, unarchiveAgent, fetchAgents } = useAgentsStore();
-  const agents = useVisibleAgents(false);
+  const agentsForHandoff = useVisibleAgents(false);
   const setAvatarCache = useAgentAvatarStore((s) => s.set);
 
   const [detail, setDetail] = useState<AgentDetail | null>(null);
@@ -645,7 +645,7 @@ function AgentDetailPageContent() {
       <OffboardDialog
         open={showOffboard}
         agent={detail}
-        candidates={agents.filter((a) => a.name !== id && !a.archived)}
+        candidates={agentsForHandoff.filter((a) => a.name !== id && !a.archived)}
         busy={busy}
         onClose={() => setShowOffboard(false)}
         onDone={() => {

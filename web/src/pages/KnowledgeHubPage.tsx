@@ -1,4 +1,4 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { useAgentsStore } from '@/stores/agents-store';
 import { DataExportButton } from '@/components/DataExportButton';
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
@@ -74,7 +74,7 @@ function namespaceOf(path: string): string {
 export function KnowledgeHubPage({ embedded = false }: { embedded?: boolean }) {
   const intl = useIntl();
   const [view, setView] = useState<ViewId>('browse');
-  const agents = useVisibleAgents(false);
+  const agents = useSelectableAgents(false);
   const fetchAgents = useAgentsStore(s => s.fetchAgents);
   const [selectedAgent, setSelectedAgent] = useState('');
   // A node clicked in the topic map (graph view) hands its page path here so

@@ -1,4 +1,5 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Clock, Play, Pause, Trash2, Plus, Pencil, MoreHorizontal, FlaskConical } from 'lucide-react';
@@ -81,7 +82,7 @@ const ROUTINE_COLUMNS =
 function AgentSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const intl = useIntl();
   const { fetchAgents } = useAgentsStore();
-  const agents = useVisibleAgents(false);
+  const agents = useSelectableAgents(false);
   useEffect(() => {
     fetchAgents();
   }, [fetchAgents]);
@@ -161,7 +162,7 @@ function RoutineFormDialog({
   const canSave = !!schedule.trim() && (isEdit || !!name.trim()) && (!employee || !!agent.trim());
 
   const handleSave = async () => {
-    if (!canSave) return;
+    if ((agent && !canSelectAgent(agent)) || !canSave) return;
     setSaving(true);
     try {
       if (isEdit && task) {
