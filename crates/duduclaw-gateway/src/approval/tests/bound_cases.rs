@@ -95,6 +95,7 @@ fn binding(home: &Path, payload: &Value, handler: &str) -> ExecutionBinding {
 }
 fn unseeded_binding(home: &Path, payload: &Value, handler: &str) -> ExecutionBinding {
     ExecutionBinding {
+        conversation_audience: Default::default(),
         schema_version: 1,
         run_id: uuid::Uuid::new_v4().to_string(),
         run_origin_kind: "workflow".into(),

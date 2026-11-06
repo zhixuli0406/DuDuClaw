@@ -685,6 +685,24 @@ describe('<ApprovalDetailPanel> agent_file_change', () => {
 
 
 describe('<ApprovalDetailPanel> egress review', () => {
+  it.each([false, true])('shows server-resolved mail decision authority (requester=%s)', (eligible) => {
+    const approval = genericApproval({
+      mail_requester_approval_eligible: eligible,
+      decided_in_dashboard_only: !eligible,
+      payload: {
+        name: 'mail_send', arguments: { to: 'recipient@example.com', subject: 'Review', body: 'Message' },
+        egress_guard: { sources: ['mail_read'] },
+        action_grant: { tool: 'mail_send', effect: 'send', args_digest: 'abc123', args_summary: [] },
+      },
+    });
+    renderWithProviders(<ApprovalDetailPanel approval={approval} onApprove={vi.fn()} onReject={vi.fn()} />);
+    const authority = screen.getByTestId('approval-decision-authority');
+    expect(authority).toHaveTextContent(eligible
+      ? 'Who may decide: the verified requester in the original conversation'
+      : 'Who may decide: an Admin in the dashboard.');
+    expect(screen.getByTestId('approval-full-content')).toHaveTextContent('recipient@example.com');
+  });
+
   it.each(['read', 'draft'])('shows the matching rule and expiry for %s approvals without full arguments', (effect) => {
     const approval = genericApproval({
       expires_at: 1793210400,

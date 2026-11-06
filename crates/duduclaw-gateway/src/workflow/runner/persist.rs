@@ -18,6 +18,7 @@ impl WorkflowRunner {
             .clone()
             .ok_or("workflow trusted decision context unavailable")?;
         Ok(ExecutionBinding {
+            conversation_audience: Default::default(),
             schema_version: 1,
             run_id: run.run_id.clone(),
             run_origin_kind: "workflow".into(),

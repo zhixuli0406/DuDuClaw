@@ -46,7 +46,7 @@ pub(crate) fn decision_digest_with_activation(rec: &ApprovalRecord, facts: &Valu
         "expires_at": rec.expires_at_epoch(),
         "simulation": rec.simulation,
         "workflow_activation": facts,
-        "decided_in_dashboard_only": crate::approval_notify::is_dashboard_only_record(rec),
+        "decided_in_dashboard_only": crate::approval_notify::is_dashboard_only_record(None, rec),
     }))
 }
 

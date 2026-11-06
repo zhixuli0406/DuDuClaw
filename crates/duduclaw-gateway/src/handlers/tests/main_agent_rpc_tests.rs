@@ -381,6 +381,7 @@ async fn bound_approval_decisions_gate_main_before_the_early_return() {
         for agent in ["a1", "z1"] {
             let payload = json!({"name": "test_effect"});
             let binding = ExecutionBinding {
+                conversation_audience: Default::default(),
                 schema_version: 1,
                 run_id: uuid::Uuid::new_v4().to_string(),
                 run_origin_kind: "ingress".into(),

@@ -347,6 +347,7 @@ async fn fixture() -> (
         "fixtures_digest": spec.fixtures_digest
     });
     let binding = ExecutionBinding {
+        conversation_audience: Default::default(),
         schema_version: 1,
         run_id: uuid::Uuid::new_v4().to_string(),
         run_origin_kind: "workflow".into(),
@@ -489,6 +490,7 @@ async fn operation(
         .unwrap();
     let payload = json!({"name":"tasks_update","arguments":run.input});
     let binding = ExecutionBinding {
+        conversation_audience: Default::default(),
         schema_version: 1,
         run_id: run.run_id,
         run_origin_kind: "workflow".into(),

@@ -535,6 +535,12 @@ fn mark_permissions_if_edited(new_text: &str, stored: &str) -> Result<String, St
 /// Validate a `config.toml` with the section validators the gateway itself
 /// applies when it reads each section.
 pub(crate) fn validate_config_table(table: &toml::Table) -> Result<(), String> {
+    if let Some(security) = table.get("security") {
+        let security = security.as_table().ok_or("[security] must be a table")?;
+        if security.get("mail_requester_approval").is_some_and(|v| !v.is_bool()) {
+            return Err("security.mail_requester_approval must be a boolean".into());
+        }
+    }
     if let Some(people)=table.get("people") {
         let people=people.as_table().ok_or("[people] must be a table")?;
         if people.get("manager_team_history").is_some_and(|v|!v.is_bool()) {return Err("people.manager_team_history must be a boolean".into());}
@@ -1507,6 +1513,16 @@ OPENAI_API_KEY = "sk-env-secret"
         assert!(err.contains("line 2"), "{err}");
         let err = validate_raw(&RawFile::Config, "a = 1\nb = \n").unwrap_err();
         assert!(err.contains("line 2"), "{err}");
+    }
+
+    #[test]
+    fn mail_requester_approval_raw_config_requires_boolean() {
+        for raw in ["[security]\nmail_requester_approval='true'", "[security]\nmail_requester_approval=1", "security=false"] {
+            assert!(validate_raw(&RawFile::Config, raw).is_err());
+        }
+        for raw in ["[security]\nmail_requester_approval=true", "[security]\nmail_requester_approval=false"] {
+            assert!(validate_raw(&RawFile::Config, raw).is_ok());
+        }
     }
 
     #[test]
