@@ -83,8 +83,10 @@ export function LoginPage() {
       return;
     }
     try {
-      await firstRunClaim(ownerEmail, newPassword);
-      navigate('/', { replace: true });
+      const result = await firstRunClaim(ownerEmail, newPassword);
+      setFirstRun(false);
+      if (result) setMfa(result);
+      else navigate('/', { replace: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message.toLowerCase() : '';
       let id = 'login.claim.failed';
@@ -201,7 +203,7 @@ export function LoginPage() {
           </label>}
           {mfa ? (
             <LoginMfa challenge={mfa} onComplete={() => navigate(returnTo, { replace: true })}
-              onCancel={() => { setMfa(null); setOtpStep('email'); setError(''); }} />
+              onCancel={() => { setMfa(null); setFirstRun(false); setOtpStep('email'); setError(''); }} />
           ) : firstRun ? (
             <form onSubmit={handleClaim} className="space-y-4">
               <p className="text-sm text-muted-foreground">
