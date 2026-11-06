@@ -24,7 +24,7 @@ describe('meeting transcripts', () => {
   });
   it('shows only selectable employees with work access to non-admins and reports upload progress', async () => {
     useAuthStore.setState({ user: { id: 'person', role: 'employee', email: '', display_name: 'Person', status: 'active' } });
-    vi.spyOn(api.agents, 'callable').mockResolvedValue({ default_agent: 'main', agents: [
+    vi.spyOn(api.agents, 'callable').mockResolvedValue({ unrestricted: false, default_agent: 'main', agents: [
       { name: 'alice', display_name: 'Alice', call_text: '@alice', via: 'binding', level: 'operator', assignable: true, selectable: true },
       { name: 'main', display_name: 'Main', call_text: '@main', role: 'main', via: 'binding', level: 'owner', assignable: true, selectable: true },
       { name: 'bob', display_name: 'Bob', call_text: '@bob', via: 'team', level: 'operator', assignable: true, selectable: false },

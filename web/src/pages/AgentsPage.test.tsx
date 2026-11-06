@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { useAuthStore } from '@/stores/auth-store';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
@@ -183,3 +184,6 @@ it('shows unavailable task counts for team AI staff rather than zero', async () 
   expect(screen.getByText('Report’s AI employee')).toHaveAttribute('title', expect.stringContaining('Memory and settings require direct access'));
   expect(screen.queryByText('0')).not.toBeInTheDocument();
 });
+
+// Start these component scenarios after the gateway confirmed the admin roster.
+beforeEach(() => setConfirmedCallableAgents(true));

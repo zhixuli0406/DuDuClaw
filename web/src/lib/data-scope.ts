@@ -3,7 +3,6 @@ import type { AgentDetail, AgentInfo, CallableAgent } from '@/lib/api';
 import type { UserRole, AgentBinding } from '@/stores/auth-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useSystemStore } from '@/stores/system-store';
 import { useCallableAgents } from '@/stores/callable-agents-store';
 
 /**
@@ -42,19 +41,16 @@ export type VisibleAgent = AgentInfo & Partial<AgentDetail> & {
   teamMember?: string;
 };
 
-/** Personal installations and administrators retain their existing full roster. */
-export function useAgentVisibilityUnrestricted(): boolean {
-  const role = useAuthStore(s => s.user?.role);
-  const personal = useSystemStore(s => s.status?.edition_profile) === 'personal';
-  return role === 'admin' || personal;
+/** Full-roster visibility must be confirmed by the gateway's live identity. */
+export function useAgentVisibilityUnrestricted(sessionId?: string | null): boolean {
+  return useCallableAgents(sessionId).unrestricted;
 }
 
 export function useVisibleAgents(includeTeam: false, sessionId?: string | null): ReadonlyArray<AgentDetail>;
 export function useVisibleAgents(includeTeam?: true, sessionId?: string | null): ReadonlyArray<VisibleAgent>;
 export function useVisibleAgents(includeTeam = true, sessionId?: string | null): ReadonlyArray<VisibleAgent> {
   const agents = useAgentsStore((s) => s.agents);
-  const unrestricted = useAgentVisibilityUnrestricted();
-  const { agents: callable } = useCallableAgents(sessionId);
+  const { agents: callable, unrestricted } = useCallableAgents(sessionId);
   return useMemo(() => selectVisibleAgents(agents, callable, unrestricted, includeTeam),
     [unrestricted, agents, callable, includeTeam]);
 }

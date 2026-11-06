@@ -7,6 +7,7 @@ import { useIntl } from 'react-intl';
 import { Link, useNavigate, useParams } from 'react-router';
 import { useTasksStore } from '@/stores/tasks-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useVisibleAgents } from '@/lib/data-scope';
 import { useAuthStore } from '@/stores/auth-store';
 import {
   BreadcrumbHeader,
@@ -104,7 +105,8 @@ export function TaskDetailPage() {
     fetchComments,
     addComment,
   } = useTasksStore();
-  const { agents, fetchAgents } = useAgentsStore();
+  const { fetchAgents } = useAgentsStore();
+  const agents = useVisibleAgents(false);
   const currentUser = useAuthStore((s) => s.user);
   const { setPanel, clearPanel, setSheetOpen, toggleCollapsed } = usePanel();
 
@@ -662,7 +664,7 @@ export function TaskDetailPage() {
         agents={agents}
         onCreate={createTask}
         parentTaskId={task.id}
-        defaultAssignee={task.assigned_to}
+        defaultAssignee={agents.some(a => a.name === task.assigned_to) ? task.assigned_to : undefined}
       />
 
       {/* Delete confirmation */}

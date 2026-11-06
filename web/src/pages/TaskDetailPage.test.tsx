@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route } from 'react-router';
@@ -8,6 +8,9 @@ import { mockWsClient } from '@/test/mocks';
 import { TaskDetailPage } from './TaskDetailPage';
 import { useTasksStore } from '@/stores/tasks-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { PanelProvider, usePanel } from '@/components/ui';
+import { useAuthStore } from '@/stores/auth-store';
+import { callableSubject, useCallableAgentsStore } from '@/stores/callable-agents-store';
 import type { TaskInfo } from '@/lib/api';
 
 const AGENTS = [{ name: 'nova', display_name: 'Nova', status: 'active', role: 'main', sandboxed: false }];
@@ -40,6 +43,8 @@ function renderAt(id: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
+  useCallableAgentsStore.setState({ entries: { [JSON.stringify([callableSubject(), null])]: { agents: [], unrestricted: true, loading: false } } });
   mockWsClient.call.mockResolvedValue({ tasks: [TASK], agents: AGENTS, events: [], comments: [] });
   useTasksStore.setState({ tasks: [TASK], comments: {}, activities: [], loading: false });
   useAgentsStore.setState({ agents: AGENTS as never[], loading: false });
@@ -602,5 +607,97 @@ describe('TaskDetailPage — WP-G2 criteria ledger', () => {
     expect(group).toHaveTextContent('Fail');
     expect(group).toHaveTextContent('no chart in report');
     expect(group).not.toHaveTextContent('correctness');
+  });
+});
+
+function PropertiesProbe() {
+  return <aside data-testid="properties">{usePanel().content}</aside>;
+}
+function renderWithProperties() {
+  return render(
+    <IntlProvider messages={en} locale="en" defaultLocale="en">
+      <MemoryRouter initialEntries={[`/tasks/${TASK.id}`]}>
+        <PanelProvider>
+          <Routes><Route path="/tasks/:id" element={<TaskDetailPage />} /></Routes>
+          <PropertiesProbe />
+        </PanelProvider>
+      </MemoryRouter>
+    </IntlProvider>,
+  );
+}
+
+describe('TaskDetailPage — callable assignees', () => {
+  const roster = [
+    { ...AGENTS[0], role: 'worker' },
+    { ...AGENTS[0], name: 'hidden', display_name: 'Hidden Staff' },
+    { ...AGENTS[0], name: 'team', display_name: 'Team Staff', role: 'worker' },
+  ];
+  function setup(role: 'employee' | 'manager', assignedTo = 'nova', failed = false) {
+    const task = { ...TASK, assigned_to: assignedTo };
+    useAuthStore.setState({ user: { id: 'member', role } as never, bindings: [{ agent_name: assignedTo, access_level: 'operator' }] as never });
+    useTasksStore.setState({ tasks: [task] });
+    useAgentsStore.setState({ agents: roster as never });
+    mockWsClient.call.mockImplementation(async (method: string) => {
+      if (method === 'agents.callable') {
+        if (failed) throw new Error('offline');
+        return { unrestricted: false, agents: [
+          { ...roster[0], via: 'binding', selectable: true },
+          ...(role === 'manager' ? [{ ...roster[2], via: 'team', selectable: true }] : []),
+        ] };
+      }
+      return { tasks: [task], agents: roster, events: [], comments: [] };
+    });
+  }
+  it.each(['employee', 'manager'] as const)('%s gets only visible direct assignees in both pickers', async role => {
+    setup(role);
+    const user = userEvent.setup();
+    renderWithProperties();
+    const properties = within(screen.getByTestId('properties'));
+    await user.click(await properties.findByRole('button', { name: /Nova/ }));
+    expect(properties.getAllByRole('menuitemradio')).toHaveLength(1);
+    expect(properties.getByRole('menuitemradio', { name: /Nova/ })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Add subtask' }));
+    const dialog = within(screen.getByRole('dialog'));
+    await user.click(dialog.getByRole('button', { name: /Nova/ }));
+    expect(dialog.getAllByRole('menuitemradio')).toHaveLength(1);
+    expect(dialog.getByRole('menuitemradio', { name: /Nova/ })).toBeInTheDocument();
+    expect(screen.queryByText('Hidden Staff')).toBeNull();
+    expect(screen.queryByText('Team Staff')).toBeNull();
+  });
+  it.each([false, true])('keeps a stale assignee as text and never defaults or submits it (failure=%s)', async failed => {
+    setup('employee', 'hidden', failed);
+    const user = userEvent.setup();
+    renderWithProperties();
+    await waitFor(() => expect(Object.values(useCallableAgentsStore.getState().entries)[0]?.loading).toBe(false));
+    const properties = within(screen.getByTestId('properties'));
+    expect(properties.getByText('hidden')).toBeInTheDocument();
+    await user.click(properties.getByRole('button', { name: 'Assign' }));
+    expect(properties.queryByRole('menuitemradio', { name: /Hidden/ })).toBeNull();
+    if (failed) expect(properties.queryAllByRole('menuitemradio')).toHaveLength(0);
+    await user.click(screen.getByRole('button', { name: 'Add subtask' }));
+    const dialog = within(screen.getByRole('dialog'));
+    expect(dialog.queryByText('hidden')).toBeNull();
+    await user.type(dialog.getByPlaceholderText('Task title'), 'Follow up');
+    await user.click(dialog.getByRole('button', { name: 'New Task' }));
+    expect(dialog.getByRole('alert')).toBeInTheDocument();
+    expect(mockWsClient.call.mock.calls.some(([method]) => method === 'tasks.create')).toBe(false);
+  });
+  it('does not submit a selection revoked while the subtask modal is open', async () => {
+    setup('employee');
+    const user = userEvent.setup();
+    renderWithProperties();
+    await within(screen.getByTestId('properties')).findByRole('button', { name: /Nova/ });
+    await user.click(screen.getByRole('button', { name: 'Add subtask' }));
+    const dialog = within(screen.getByRole('dialog'));
+    await user.type(dialog.getByPlaceholderText('Task title'), 'Follow up');
+    await act(async () => {
+      const key = JSON.stringify([callableSubject(), null]);
+      useCallableAgentsStore.setState({ entries: { [key]: { agents: [], unrestricted: false, loading: false } } });
+    });
+    expect(dialog.queryByRole('button', { name: /Nova/ })).toBeNull();
+    expect(dialog.getByPlaceholderText('Task title')).toHaveValue('Follow up');
+    await user.click(dialog.getByRole('button', { name: 'New Task' }));
+    expect(dialog.getByRole('alert')).toBeInTheDocument();
+    expect(mockWsClient.call.mock.calls.some(([method]) => method === 'tasks.create')).toBe(false);
   });
 });

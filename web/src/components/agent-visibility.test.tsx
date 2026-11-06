@@ -50,7 +50,7 @@ beforeEach(() => {
   mockWsClient.call.mockImplementation(async (method: string) => {
     if (method === 'agents.callable') {
       if (failed) throw new Error('unavailable');
-      return { agents: callable, default_agent: null };
+      return { agents: callable, default_agent: null, unrestricted: useAuthStore.getState().user?.role === 'admin' };
     }
     if (method === 'agents.list') return { agents: roster };
     return { agents: [], sessions: [], skills: [], items: [], plans: [], tasks: [], pages: [], files: [], hits: [], routines: [], predictions: [], states: [], counts: {}, entries: [], sources: [] };

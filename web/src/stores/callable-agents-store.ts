@@ -8,12 +8,15 @@ import { useSystemStore } from './system-store';
 interface Entry {
   agents: readonly CallableAgent[] | null;
   loading: boolean;
+  unrestricted: boolean;
 }
 interface CallableStore {
   entries: Record<string, Entry>;
   load: (key: string, sessionId?: string | null, refresh?: boolean) => Promise<void>;
 }
-const empty: Entry = { agents: null, loading: false };
+const empty: Entry = { agents: null, loading: false, unrestricted: false };
+export const CALLABLE_REFRESH_INTERVAL_MS = 60_000;
+let refreshTimer: ReturnType<typeof setInterval> | undefined;
 const sessions = new Map<string, string | null | undefined>();
 let generation = 0;
 export const useCallableAgentsStore = create<CallableStore>((set, get) => ({
@@ -22,15 +25,20 @@ export const useCallableAgentsStore = create<CallableStore>((set, get) => ({
     const entry = get().entries[key];
     if (entry?.loading || (entry && !refresh)) return;
     sessions.set(key, sessionId);
+    syncRefreshTimer();
     const ticket = generation;
-    set(s => ({ entries: { ...s.entries, [key]: { agents: null, loading: true } } }));
+    set(s => ({ entries: { ...s.entries, [key]: { ...(entry ?? empty), loading: true } } }));
     let agents: readonly CallableAgent[] | null = null;
+    let unrestricted = false;
     try {
       const result = await api.agents.callable(sessionId);
-      if (Array.isArray(result?.agents)) agents = result.agents;
+      if (Array.isArray(result?.agents)) {
+        agents = result.agents;
+        unrestricted = result.unrestricted === true;
+      }
     } catch { /* Failed grants never fall back to the detailed roster. */ }
     if (ticket !== generation) return;
-    set(s => ({ entries: { ...s.entries, [key]: { agents, loading: false } } }));
+    set(s => ({ entries: { ...s.entries, [key]: { agents, unrestricted, loading: false } } }));
   },
 }));
 
@@ -43,6 +51,7 @@ export function callableSubject() {
 function invalidate() {
   generation++;
   sessions.clear();
+  syncRefreshTimer();
   useCallableAgentsStore.setState({ entries: {} });
 }
 useAuthStore.subscribe((next, prev) => {
@@ -55,9 +64,38 @@ async function refresh() {
   await Promise.all([...sessions].map(([key, session]) => useCallableAgentsStore.getState().load(key, session, true)));
 }
 subscribeInvalidations(['agent.status_changed', 'events_lost', 'connection.ready'], refresh);
-if (typeof window !== 'undefined') window.addEventListener('focus', refresh);
+function syncRefreshTimer() {
+  const visible = typeof document !== 'undefined' && document.visibilityState === 'visible';
+  if ((!visible || sessions.size === 0) && refreshTimer !== undefined) {
+    clearInterval(refreshTimer);
+    refreshTimer = undefined;
+  }
+  if (visible && sessions.size > 0 && refreshTimer === undefined) {
+    refreshTimer = setInterval(() => { void refresh(); }, CALLABLE_REFRESH_INTERVAL_MS);
+  }
+}
+if (typeof window !== 'undefined') window.addEventListener('focus', () => {
+  if (document.visibilityState === 'visible') void refresh();
+});
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    syncRefreshTimer();
+    if (document.visibilityState === 'visible') void refresh();
+  });
+  // Native selects, MDS selects and custom agent popovers share these semantics.
+  // Refresh on opening gestures, not on option selection or text entry.
+  const onPickerOpen = (event: Event) => {
+    if (event instanceof KeyboardEvent && !['Enter', ' ', 'ArrowDown', 'ArrowUp'].includes(event.key)) return;
+    const trigger = event.target instanceof Element
+      ? event.target.closest('select, [role="combobox"], [aria-haspopup="listbox"], [aria-haspopup="menu"]')
+      : null;
+    if (trigger && trigger.getAttribute('aria-expanded') !== 'true') void refresh();
+  };
+  document.addEventListener('pointerdown', onPickerOpen, true);
+  document.addEventListener('keydown', onPickerOpen, true);
+}
 
-/** Shared, identity-fenced grants. Loading and failure both expose no grants. */
+/** Identity-fenced grants. Initial loads and failures expose no grants; refreshes retain confirmed grants. */
 export function useCallableAgents(sessionId?: string | null) {
   useAuthStore(s => s.user);
   useAuthStore(s => s.bindings);

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import {
   Button,
@@ -41,6 +41,7 @@ export function CreateTaskModal({
   defaultAssignee?: string;
 }) {
   const intl = useIntl();
+  const wasOpen = useRef(false);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [assignedTo, setAssignedTo] = useState('');
@@ -56,7 +57,7 @@ export function CreateTaskModal({
   // without `assigned_to` (`tasks.create` in handlers/dispatch_org.rs). A
   // subtask still inherits its parent's assignee via `defaultAssignee`.
   useEffect(() => {
-    if (open) {
+    if (open && !wasOpen.current) {
       setTitle('');
       setDescription('');
       setPriority('medium');
@@ -64,11 +65,15 @@ export function CreateTaskModal({
       setAssigneeMissing(false);
       setCreateError(null);
     }
+    wasOpen.current = open;
   }, [open, defaultAssignee]);
+
+  // A grant can disappear while the form is open. Never submit a stale selection.
+  const visibleAssignee = agents.some(a => a.name === assignedTo) ? assignedTo : '';
 
   const handleSubmit = useCallback(async () => {
     if (!title.trim()) return;
-    if (!assignedTo) {
+    if (!visibleAssignee) {
       setAssigneeMissing(true);
       return;
     }
@@ -78,7 +83,7 @@ export function CreateTaskModal({
       const created = await onCreate({
         title: title.trim(),
         description: description.trim() || undefined,
-        assigned_to: assignedTo,
+        assigned_to: visibleAssignee,
         priority,
         ...(parentTaskId ? { parent_task_id: parentTaskId } : {}),
       });
@@ -94,7 +99,7 @@ export function CreateTaskModal({
     } finally {
       setSubmitting(false);
     }
-  }, [title, description, assignedTo, priority, parentTaskId, onCreate, onClose]);
+  }, [title, description, visibleAssignee, priority, parentTaskId, onCreate, onClose]);
 
   const dialogTitle = parentTaskId
     ? intl.formatMessage({ id: 'tasks.subtask.add' })
@@ -130,7 +135,7 @@ export function CreateTaskModal({
             <div className="rounded-lg border border-input px-1 py-1">
               <AssigneePopover
                 agents={agents}
-                value={assignedTo || null}
+                value={visibleAssignee || null}
                 onChange={(name) => {
                   setAssignedTo(name);
                   if (name) setAssigneeMissing(false);

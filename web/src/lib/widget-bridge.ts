@@ -12,8 +12,6 @@
 import { api } from '@/lib/api';
 import { selectVisibleAgents } from '@/lib/data-scope';
 import { callableSubject, useCallableAgentsStore } from '@/stores/callable-agents-store';
-import { useAuthStore } from '@/stores/auth-store';
-import { useSystemStore } from '@/stores/system-store';
 
 /** Messages the iframe sends up. */
 interface RpcRequest {
@@ -39,12 +37,12 @@ const RATE_LIMIT_PER_SECOND = 10;
 const BRIDGE_METHODS: Record<string, () => Promise<unknown>> = {
   'agents.summary': async () => {
     const subject = callableSubject();
-    const unrestricted = useAuthStore.getState().user?.role === 'admin'
-      || useSystemStore.getState().status?.edition_profile === 'personal';
     const key = JSON.stringify([subject, null]);
     const [r] = await Promise.all([api.agents.list(),
-      unrestricted ? Promise.resolve() : useCallableAgentsStore.getState().load(key)]);
-    const grants = useCallableAgentsStore.getState().entries[key]?.agents ?? null;
+      useCallableAgentsStore.getState().load(key)]);
+    const entry = useCallableAgentsStore.getState().entries[key];
+    const grants = entry?.agents ?? null;
+    const unrestricted = entry?.unrestricted === true;
     const agents = subject === callableSubject() ? selectVisibleAgents(r.agents, grants, unrestricted) : [];
     return {
       agents: agents.map((a) => ({

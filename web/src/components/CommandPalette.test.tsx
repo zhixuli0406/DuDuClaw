@@ -55,7 +55,7 @@ function mockIdLookupCalls(overrides: Partial<Record<string, unknown>> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [{ name: 'sales', display_name: 'Sales', role: 'worker', via: 'binding', selectable: true }], default_agent: null } as never);
+  vi.spyOn(api.agents, 'callable').mockImplementation(async () => ({ agents: [{ name: 'sales', display_name: 'Sales', role: 'worker', via: 'binding', selectable: true }], unrestricted: useAuthStore.getState().user?.role === 'admin', default_agent: null }) as never);
   useCommandPaletteStore.setState({ open: true, recent: [] });
   useAgentsStore.setState({ agents: [], loading: false } as never);
   useTasksStore.setState({ tasks: [], loading: false } as never);

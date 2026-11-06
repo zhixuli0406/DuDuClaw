@@ -10,7 +10,6 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router';
 import { useChatStore, chatAccessMessageKey, type PendingAttachment } from '@/stores/chat-store';
 import { takeChatAttachments } from '@/lib/chat-handoff';
 import { useAuthStore } from '@/stores/auth-store';
-import { useSystemStore } from '@/stores/system-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useConversationsStore } from '@/stores/conversations-store';
 import { cn } from '@/lib/utils';
@@ -77,8 +76,9 @@ export function WebChatPage() {
 function InteractiveWebChatPage() {
   const intl = useIntl();
   const user = useAuthStore(s => s.user);
-  const isPersonal = useSystemStore(s => s.status?.edition_profile) === 'personal';
-  const assignedOnly = user !== null && user.role !== 'admin' && !isPersonal;
+  const chatSessionId = useChatStore((s) => s.sessionId);
+  const { agents: callable, refresh: loadCallable, unrestricted } = useCallableAgents(chatSessionId);
+  const assignedOnly = !unrestricted;
   const {
     messages,
     steps,
@@ -108,7 +108,6 @@ function InteractiveWebChatPage() {
     selectAgent,
   } = useChatStore();
 
-  const chatSessionId = useChatStore((s) => s.sessionId);
   const agents = useVisibleAgents(true, chatSessionId);
   const agentsLoaded = useAgentsStore((s) => s.loaded);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
@@ -138,13 +137,17 @@ function InteractiveWebChatPage() {
   useEffect(() => {
     if (connectionState === 'disconnected') connect();
     if (!agentsLoaded) fetchAgents();
-    const preselect = searchParams.get('agent');
-    if (preselect && !assignedOnly) selectAgent(preselect);
     // Keep the session alive across unmounts — no disconnect here.
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Direct entry to a fresh chat uses the account preference. Non-admin
   // enterprise users get their primary from the server's assignment resolver.
+  useEffect(() => {
+    if (assignedOnly) return;
+    const preselect = searchParams.get('agent');
+    if (preselect) selectAgent(preselect);
+  }, [assignedOnly, searchParams, selectAgent]);
+
   const primaryApplied = useRef(false);
   useEffect(() => {
     if (assignedOnly || !agentsLoaded || !user || primaryApplied.current) return;
@@ -190,7 +193,7 @@ function InteractiveWebChatPage() {
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   }, [input]);
 
-  const { agents: callable, refresh: loadCallable } = useCallableAgents(chatSessionId);
+
 
   // The chosen partner (an AI staff member) or DuDu (the office assistant).
   const partner = useMemo(() => {
@@ -212,7 +215,7 @@ function InteractiveWebChatPage() {
   const assignmentMessage = intl.formatMessage({ id: assignmentMessageKey });
 
   useEffect(() => {
-    if (!assignedOnly) return;
+    if (!assignedOnly || callable === null) return;
     if (callable !== null && selectedAgentId && !agents.some(a => a.name === selectedAgentId)) selectAgent(null);
     const requested = searchParams.get('agent');
     if (requested && (requested !== resolvedAgent?.id || !agents.some(a => a.name === requested))) {

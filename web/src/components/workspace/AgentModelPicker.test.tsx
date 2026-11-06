@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { useAuthStore } from '@/stores/auth-store';
 import { setStandardProductPolicyFixture } from '@/test/product-policy';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
@@ -40,3 +41,6 @@ describe('AgentModelPicker', () => {
 
 // This suite exercises the standard installation catalog.
 beforeEach(setStandardProductPolicyFixture);
+
+// Start these component scenarios after the gateway confirmed the admin roster.
+beforeEach(() => setConfirmedCallableAgents(true));

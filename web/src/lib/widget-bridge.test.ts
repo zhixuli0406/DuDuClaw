@@ -66,14 +66,14 @@ const { useAuthStore } = await import('@/stores/auth-store');
 const { useSystemStore } = await import('@/stores/system-store');
 const { useCallableAgentsStore } = await import('@/stores/callable-agents-store');
 
-it.each(['employee', 'manager', 'admin', 'failure'])('filters widget agent summaries for %s', async mode => {
-  useAuthStore.setState({ user: { id: mode, role: mode === 'failure' ? 'employee' : mode } as never });
+it.each(['employee', 'manager', 'admin', 'failure', 'stale-admin'])('filters widget agent summaries for %s', async mode => {
+  useAuthStore.setState({ user: { id: mode, role: mode === 'failure' ? 'employee' : mode === 'stale-admin' ? 'admin' : mode } as never });
   useSystemStore.setState({ status: null });
   useCallableAgentsStore.setState({ entries: {} });
   const roster = ['mine', 'main', 'other'].map(name => ({ name, display_name: name, role: name === 'main' ? 'main' : 'worker' }));
   vi.mocked(api.agents.list).mockResolvedValue({ agents: roster } as never);
   if (mode === 'failure') vi.mocked(api.agents.callable).mockRejectedValue(new Error('offline'));
-  else vi.mocked(api.agents.callable).mockResolvedValue({ agents: [{ ...roster[0], selectable: true, via: 'binding' }], default_agent: null } as never);
+  else vi.mocked(api.agents.callable).mockResolvedValue({ agents: [{ ...roster[0], selectable: true, via: 'binding' }], default_agent: null, unrestricted: mode === 'admin' } as never);
   const result = await handleWidgetMessage({ type: 'duduclaw:rpc', seq: 1, method: 'agents.summary' }, []);
   const names = (result?.result as { agents: { name: string }[] }).agents.map(a => a.name);
   expect(names).toEqual(mode === 'admin' ? ['mine', 'main', 'other'] : mode === 'failure' ? [] : ['mine']);

@@ -40,7 +40,7 @@ function precedes(a: Element, b: Element): boolean {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  vi.spyOn(api.agents, 'callable').mockImplementation(async () => ({ agents: useAgentsStore.getState().agents.filter(a => useAuthStore.getState().bindings.some(b => b.agent_name === a.name)).map(a => ({ ...a, via: 'binding', selectable: true })), default_agent: null }) as never);
+  vi.spyOn(api.agents, 'callable').mockImplementation(async () => ({ agents: useAgentsStore.getState().agents.filter(a => useAuthStore.getState().bindings.some(b => b.agent_name === a.name)).map(a => ({ ...a, via: 'binding', selectable: true })), unrestricted: useAuthStore.getState().user?.role === 'admin', default_agent: null }) as never);
   localStorage.clear();
   useBrandStore.setState({ brand: null });
   useCompanyStore.getState().setCompany(null);
@@ -130,7 +130,7 @@ describe('AppSidebar (Multica shell)', () => {
   // D6 (09-edition-split-features.md §4): the org chart is a progressive-
   // disclosure surface now, not a `personalHidden` one — it waits for the
   // roster to clear ORG_CHART_MIN_AGENTS, on EITHER edition.
-  it('org chart discloses itself once the roster reaches ORG_CHART_MIN_AGENTS', () => {
+  it('org chart discloses itself once the roster reaches ORG_CHART_MIN_AGENTS', async () => {
     useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
     useAgentsStore.setState({ agents: makeAgents(ORG_CHART_MIN_AGENTS - 1) as never });
     const { unmount } = renderSidebar();
@@ -139,7 +139,7 @@ describe('AppSidebar (Multica shell)', () => {
 
     useAgentsStore.setState({ agents: makeAgents(ORG_CHART_MIN_AGENTS) as never });
     renderSidebar();
-    expect(screen.getByRole('link', { name: /^Team$/i })).toBeInTheDocument();
+    expect(await screen.findByRole('link', { name: /^Team$/i })).toBeInTheDocument();
   });
 
   it('personal edition: org chart is folded into 進階, not shown before the roster is big enough', async () => {
@@ -238,13 +238,14 @@ describe('AppSidebar (Multica shell)', () => {
   // the same order. This is the Enterprise half of the pair; the Personal half
   // is asserted in the personal-IA case above, using the same rendered-order
   // read so neither can drift without the other failing.
-  it('enterprise edition: 公司 group follows the same 技能庫→記憶→AI 員工→世界 order', () => {
+  it('enterprise edition: 公司 group follows the same 技能庫→記憶→AI 員工→世界 order', async () => {
     useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
     // D6: 'Team' (the org chart) only shows once the roster clears the
     // progressive-disclosure threshold — this assertion is about ordering,
     // not disclosure, so seed enough agents for it to actually be present.
     useAgentsStore.setState({ agents: makeAgents(ORG_CHART_MIN_AGENTS) as never });
     renderSidebar();
+    await screen.findByRole('link', { name: /^Team$/i });
     const order = screen
       .getAllByRole('link')
       .map((el) => el.textContent?.trim())

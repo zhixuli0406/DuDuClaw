@@ -42,13 +42,14 @@ for (const role of ['employee', 'manager']) describe(role, () => {
     expect(result.current).toEqual([]);
   });
 });
-it.each(['admin', 'personal'])('%s keeps the full roster even on failure', async mode => {
+it.each(['admin', 'personal'])('%s fails closed without server confirmation', async mode => {
   if (mode === 'admin') useAuthStore.setState({ user: { id: 'a', role: 'admin' } as never });
   else useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
   mockWsClient.call.mockRejectedValue(new Error('offline'));
   const { result } = renderHook(() => useVisibleAgents());
-  expect(result.current).toEqual(roster);
+  expect(result.current).toEqual([]);
   await act(async () => {});
+  expect(result.current).toEqual([]);
 });
 it('accepts main only with an explicit selectable grant', async () => {
   mockWsClient.call.mockResolvedValue({ agents: [grant('main')] });
@@ -64,12 +65,24 @@ it('ignores an old account response and deduplicates concurrent consumers', asyn
   await waitFor(() => expect(result.current[0].map(a => a.name)).toEqual(['mine', 'team']));
   expect(result.current[1]).toEqual(result.current[0]);
 });
-it('drops stale grants during refresh and after failure', async () => {
+it('keeps confirmed grants during refresh but drops them after failure', async () => {
   const { result } = renderHook(() => useVisibleAgents());
   await waitFor(() => expect(result.current.length).toBe(2));
   mockWsClient.call.mockRejectedValue(new Error('revoked'));
   act(() => window.dispatchEvent(new Event('focus')));
-  expect(result.current).toEqual([]);
+  expect(result.current.length).toBe(2);
   await act(async () => {});
   expect(result.current).toEqual([]);
+});
+
+it('uses only server-confirmed unrestricted access, and accepts a live demotion', async () => {
+  useAuthStore.setState({ user: { id: 'a', role: 'admin' } as never });
+  useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+  mockWsClient.call.mockResolvedValue({ agents: [], unrestricted: true });
+  const { result } = renderHook(() => useVisibleAgents());
+  expect(result.current).toEqual([]);
+  await waitFor(() => expect(result.current).toEqual(roster));
+  mockWsClient.call.mockResolvedValue({ agents: [grant('mine')], unrestricted: false });
+  await act(async () => { window.dispatchEvent(new Event('focus')); });
+  expect(result.current).toEqual([roster[0]]);
 });

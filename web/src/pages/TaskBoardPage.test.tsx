@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -572,3 +573,6 @@ describe('TaskBoardPage — batch polish (L2 round 7)', () => {
     off();
   });
 });
+
+// Start these component scenarios after the gateway confirmed the admin roster.
+beforeEach(() => setConfirmedCallableAgents(true));

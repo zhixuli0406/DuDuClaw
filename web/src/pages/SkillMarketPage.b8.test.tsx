@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, waitFor, within, render } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -269,3 +270,6 @@ describe('Skill library — B3 scopes', () => {
     expect(screen.getByText(messages['skills.my.scopeHint'])).toBeInTheDocument();
   });
 });
+
+// Start these component scenarios after the gateway confirmed the admin roster.
+beforeEach(() => setConfirmedCallableAgents(true));

@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -237,3 +238,6 @@ describe('SkillMarketPage', () => {
 });
 
 import { useAuthStore } from '@/stores/auth-store';
+
+// Start these component scenarios after the gateway confirmed the admin roster.
+beforeEach(() => setConfirmedCallableAgents(true));
