@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { act, cleanup, screen } from '@testing-library/react';
+import { act, cleanup, screen, fireEvent } from '@testing-library/react';
 import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { WebChatPage } from '@/pages/WebChatPage';
 import { api, type ChatSessionHistory } from '@/lib/api';
+import { toast } from '@/lib/toast';
 import { useChatStore } from './chat-store';
 import { useAuthStore } from './auth-store';
 import { useAgentsStore } from './agents-store';
@@ -398,4 +399,197 @@ it('requires the exact acknowledged row even when an old row has identical conte
   ] });
   await useConversationsStore.getState().refreshUnanswered(() => true);
   expect(useChatStore.getState().messages.at(-1)?.content).toBe('Correct new answer');
+});
+
+it.each([['close', true], ['visible', true], ['close', false], ['visible', false]] as const)('continues the original conversation after %s (acknowledged: %s)', (mode, acknowledged) => {
+  if (acknowledged) sendAccepted('question');
+  else useChatStore.getState().send('question');
+  const original = current().sent.at(-1)!;
+  if (mode === 'close') { current().close(); vi.advanceTimersByTime(1_000); }
+  else visible();
+  current().open(); hello(current(), 'webchat:new');
+  useChatStore.getState().send('follow up');
+  expect(current().sent.at(-1)).toMatchObject({ type: 'user_message', session_id: saved.session_id, conv: original.conv });
+  expect(useChatStore.getState().ownSessionId).toBe('webchat:new');
+});
+
+it('adopts the new connection session for an empty page', () => {
+  current().close(); vi.advanceTimersByTime(1_000);
+  current().open(); hello(current(), 'webchat:new');
+  useChatStore.getState().send('first question');
+  expect(current().sent.at(-1)).toMatchObject({ session_id: 'webchat:new' });
+  expect(current().sent.some(frame => frame.type === 'subscribe')).toBe(false);
+});
+
+it('refuses an offline send visibly without hiding an earlier accepted reply', async () => {
+  sendAccepted('question');
+  current().close();
+  const notice = vi.spyOn(toast, 'error');
+  expect(useChatStore.getState().send('keep this draft')).toBe(false);
+  expect(notice).toHaveBeenCalledWith(expect.any(String));
+  vi.advanceTimersByTime(1_000);
+  current().open(); hello(current(), 'webchat:new');
+  current().receive({ type: 'subscribed', session_id: saved.session_id, conv: 'view' });
+  await Promise.resolve(); await Promise.resolve();
+  expect(useChatStore.getState().messages.at(-1)?.content).toBe(saved.messages[1].content);
+});
+
+it('keeps the composer draft when the transport closes before the close callback runs', () => {
+  renderWithProviders(<WebChatPage />);
+  const input = screen.getByRole('combobox');
+  fireEvent.change(input, { target: { value: 'keep this draft' } });
+  current().readyState = 3;
+  fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' });
+  expect(input).toHaveValue('keep this draft');
+  expect(useChatStore.getState().messages).toEqual([]);
+});
+
+it('bounds an interrupted turn even when no replacement socket opens, and accepts its late reply', () => {
+  sendAccepted('question');
+  const request = current().sent.at(-1)!;
+  current().close();
+  vi.advanceTimersByTime(10_000);
+  expect(useChatStore.getState().isStreaming).toBe(false);
+  expect(useChatStore.getState().activeMessageId).toBeNull();
+  expect(useChatStore.getState().messages[0]).toMatchObject({ delivery: 'failed', deliveryError: expect.any(String) });
+  current().open(); hello(current(), 'webchat:new');
+  current().receive({ type: 'assistant_done', session_id: saved.session_id, conv: request.conv,
+    msg_id: request.msg_id, content: 'late answer', tokens_used: 2 });
+  expect(useChatStore.getState().messages[0]).toMatchObject({ delivery: 'done' });
+  expect(useChatStore.getState().messages[0].deliveryError).toBeUndefined();
+  expect(useChatStore.getState().messages.at(-1)?.content).toBe('late answer');
+});
+
+it('preserves a turn that resumes delivering before the disconnect deadline', () => {
+  sendAccepted('question');
+  const request = current().sent.at(-1)!;
+  current().close(); vi.advanceTimersByTime(1_000);
+  current().open(); hello(current(), 'webchat:new');
+  current().receive({ type: 'assistant_chunk', session_id: saved.session_id, conv: request.conv,
+    msg_id: request.msg_id, content: 'working' });
+  vi.advanceTimersByTime(10_000);
+  expect(useChatStore.getState().isStreaming).toBe(true);
+  current().receive({ type: 'assistant_done', session_id: saved.session_id, conv: request.conv,
+    msg_id: request.msg_id, content: 'finished', tokens_used: 2 });
+  expect(useChatStore.getState().messages[0].delivery).toBe('done');
+});
+
+function exhaustReconnects() {
+  current().close();
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    vi.advanceTimersByTime(30_000);
+    current().close();
+  }
+}
+
+it.each(['online', 'pageshow', 'visible'])('restarts an exhausted retry budget on %s and removes listeners on disconnect', event => {
+  exhaustReconnects();
+  const count = Socket.instances.length;
+  vi.advanceTimersByTime(60_000);
+  expect(Socket.instances).toHaveLength(count);
+  const wake = () => event === 'visible' ? visible() : window.dispatchEvent(new Event(event));
+  wake();
+  expect(Socket.instances).toHaveLength(count + 1);
+  current().close(); vi.advanceTimersByTime(1_000);
+  expect(Socket.instances).toHaveLength(count + 2);
+  useChatStore.getState().disconnect();
+  wake(); vi.advanceTimersByTime(60_000);
+  expect(Socket.instances).toHaveLength(count + 2);
+});
+
+
+it('restarts slow history recovery when the interruption deadline changes the transcript', async () => {
+  const finish: ((value: ChatSessionHistory) => void)[] = [];
+  vi.mocked(api.chatSessions.history).mockImplementation(() => new Promise(resolve => finish.push(resolve)));
+  sendAccepted('question');
+  const request = current().sent.at(-1)!;
+  current().receive({ type: 'assistant_chunk', session_id: saved.session_id, conv: request.conv,
+    msg_id: request.msg_id, content: 'partial' });
+  current().close(); vi.advanceTimersByTime(1_000);
+  current().open(); hello(current(), 'webchat:new');
+  current().receive({ type: 'subscribed', session_id: saved.session_id, conv: 'view' });
+  expect(finish).toHaveLength(1);
+  vi.advanceTimersByTime(9_000);
+  expect(finish).toHaveLength(2);
+  for (const resolve of finish) resolve(saved);
+  await Promise.resolve(); await Promise.resolve();
+  expect(useChatStore.getState().messages.at(-1)?.content).toBe(saved.messages[1].content);
+  expect(useChatStore.getState().isStreaming).toBe(false);
+});
+
+it('shows an interruption notice without offering to duplicate the still-running request', () => {
+  sendAccepted('question');
+  renderWithProviders(<WebChatPage />);
+  act(() => { current().close(); vi.advanceTimersByTime(10_000); });
+  expect(screen.getByText(/The connection was interrupted/)).toBeVisible();
+  expect(screen.queryByRole('button', { name: /Resend/i })).not.toBeInTheDocument();
+});
+
+it('manual reconnect resets the exhausted budget and does not duplicate lifecycle listeners', () => {
+  exhaustReconnects();
+  useChatStore.getState().reconnect();
+  const count = Socket.instances.length;
+  current().open(); hello(current(), 'webchat:manual');
+  window.dispatchEvent(new Event('online'));
+  expect(Socket.instances).toHaveLength(count + 1);
+  current().close(); vi.advanceTimersByTime(1_000);
+  expect(Socket.instances).toHaveLength(count + 2);
+});
+
+it('does not apply an old interruption deadline to a new conversation', () => {
+  sendAccepted('question'); current().close();
+  useChatStore.getState().reset();
+  vi.advanceTimersByTime(1_000);
+  current().open(); hello(current(), 'webchat:new');
+  useChatStore.getState().send('new conversation');
+  vi.advanceTimersByTime(10_000);
+  expect(useChatStore.getState().messages).toHaveLength(1);
+  expect(useChatStore.getState().messages[0].delivery).toBe('running');
+  expect(useChatStore.getState().isStreaming).toBe(true);
+});
+
+
+it('reports a synchronous socket send failure without creating a phantom running turn', () => {
+  const notice = vi.spyOn(toast, 'error');
+  vi.spyOn(current(), 'send').mockImplementation(() => { throw new Error('closed'); });
+  expect(useChatStore.getState().send('keep this draft')).toBe(false);
+  expect(notice).toHaveBeenCalledWith(expect.any(String));
+  expect(useChatStore.getState().messages).toEqual([]);
+  expect(useChatStore.getState().isStreaming).toBe(false);
+});
+
+
+it('RM-122 continues a completed conversation after reconnect hello changes the connection session id', () => {
+  const firstSocket = current();
+  expect(useChatStore.getState().sessionId).toBe('webchat:old');
+  expect(useChatStore.getState().send('First question')).toBe(true);
+  const first = firstSocket.sent.at(-1)!;
+  expect(first).toMatchObject({ type: 'user_message', session_id: 'webchat:old', conv: 'view' });
+  // The first send's base session, partner and nonce resolve to this server bucket.
+  const conversationSessionId = `${first.session_id}#agent:sales#conv:${first.conv}`;
+  const turn = { session_id: conversationSessionId, conv: first.conv, msg_id: first.msg_id };
+  firstSocket.receive({ type: 'turn_accepted', ...turn, user_row_id: 1 });
+  firstSocket.receive({ type: 'assistant_chunk', ...turn, content: 'First answer' });
+  firstSocket.receive({ type: 'assistant_done', ...turn, content: 'First answer', tokens_used: 5 });
+  expect(useChatStore.getState().isStreaming).toBe(false);
+  expect(useChatStore.getState().acceptedSessionId).toBe(conversationSessionId);
+
+  renderWithProviders(<WebChatPage />);
+  expect(screen.getByText('First question')).toBeVisible();
+  expect(screen.getByText('First answer')).toBeVisible();
+  act(() => firstSocket.close());
+  act(() => vi.advanceTimersByTime(1_000));
+  const next = current();
+  expect(next).not.toBe(firstSocket);
+  act(() => { next.open(); hello(next, 'webchat:new'); });
+  expect(useChatStore.getState().ownSessionId).toBe('webchat:new');
+  expect(next.sent.at(-1)).toEqual({ type: 'subscribe', session_id: conversationSessionId, conv: first.conv });
+
+  act(() => { expect(useChatStore.getState().send('Second question')).toBe(true); });
+  const second = next.sent.at(-1)!;
+  expect(second).toMatchObject({ type: 'user_message', session_id: conversationSessionId, conv: first.conv });
+  expect(second.session_id).not.toBe('webchat:new');
+  expect(screen.getByText('First question')).toBeVisible();
+  expect(screen.getByText('First answer')).toBeVisible();
+  expect(screen.getByText('Second question')).toBeVisible();
 });
