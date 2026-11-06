@@ -365,6 +365,8 @@ pub mod feishu;
 pub mod files_api;
 pub(crate) mod chat_attachments;
 pub(crate) mod fs_safe;
+#[doc(hidden)]
+pub use fs_safe::sqlite::database_path as secure_database_path;
 pub mod governance;
 pub mod gvu;
 pub mod install_notify;

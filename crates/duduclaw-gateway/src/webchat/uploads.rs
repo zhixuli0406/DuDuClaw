@@ -185,12 +185,21 @@ mod tests {
         assert!(std::path::Path::new(&references[0].1).starts_with(home.join("attachments")));
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     #[test]
     fn webchat_upload_quota_fails_closed_without_creating_database() {
         let home = crate::fs_safe::private_test_home().unwrap();
         assert!(reserve(home.path(), "alice", 1, 1, 100).is_err());
         assert!(!home.path().join("webchat_upload_quota.db").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn webchat_upload_quota_creates_secure_database() {
+        let home = crate::fs_safe::private_test_home().unwrap();
+        reserve(home.path(), "alice", 1, 1, 100).unwrap();
+        let database = crate::secure_database_path(home.path(), "webchat_upload_quota.db");
+        assert!(database.exists());
     }
 
     fn file(data: &[u8]) -> ChatAttachment {

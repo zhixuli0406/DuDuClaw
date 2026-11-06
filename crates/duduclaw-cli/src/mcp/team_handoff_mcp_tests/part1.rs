@@ -105,15 +105,16 @@ async fn writes_a_provenance_row_and_an_audit_event() {
     .await;
     assert!(!is_error(&out), "{out}");
 
-    // Durable artifact authority deliberately fails closed outside Unix.
+    // Durable artifact authority is supported on Unix and Windows.
     // Packet creation and the security audit remain supported on every OS.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
-        assert!(!tmp.path().join("artifact_provenance.db").exists());
+        assert!(!duduclaw_gateway::secure_database_path(tmp.path(), "artifact_provenance.db").exists());
         assert!(!tmp.path().join("artifacts.jsonl").exists());
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
+        assert!(duduclaw_gateway::secure_database_path(tmp.path(), "artifact_provenance.db").is_file());
         let ledger = fs::read_to_string(tmp.path().join("artifacts.jsonl")).unwrap();
         let row: Value = serde_json::from_str(ledger.lines().next().unwrap()).unwrap();
         assert_eq!(row["origin"], "produced");
@@ -440,15 +441,16 @@ async fn a_role_member_under_the_ephemeral_layout_can_file_a_packet() {
     );
     // And the provenance row still attributes to the member, at the home's
     // ledger — not to an empty id inside the scaffold.
-    // Durable artifact authority deliberately fails closed outside Unix.
+    // Durable artifact authority is supported on Unix and Windows.
     // Packet creation and the security audit remain supported on every OS.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
-        assert!(!tmp.path().join("artifact_provenance.db").exists());
+        assert!(!duduclaw_gateway::secure_database_path(tmp.path(), "artifact_provenance.db").exists());
         assert!(!tmp.path().join("artifacts.jsonl").exists());
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
+        assert!(duduclaw_gateway::secure_database_path(tmp.path(), "artifact_provenance.db").is_file());
         let ledger = fs::read_to_string(tmp.path().join("artifacts.jsonl")).unwrap();
         let row: Value = serde_json::from_str(ledger.lines().next().unwrap()).unwrap();
         assert_eq!(row["agent_id"], id);

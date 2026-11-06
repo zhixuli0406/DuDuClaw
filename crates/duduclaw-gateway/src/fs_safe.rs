@@ -12,8 +12,10 @@
 //! between "check" and "use" cannot redirect the operation. Temp files get a
 //! random name and `O_CREAT|O_EXCL|O_NOFOLLOW`.
 //!
-//! Other platforms: best-effort path checks with `symlink_metadata` plus a
-//! canonical-containment check (no fd-relative API in std).
+//! Windows: open children relative to pinned directory handles with NtCreateFile;
+//! enumerate, rename and delete by handle. Reject reparse points on opened handles.
+//! Directory handles deny delete sharing; write sharing is needed by native rename.
+//! Other platforms retain best-effort path checks and canonical containment.
 
 use std::io;
 
@@ -49,6 +51,17 @@ fn check_name(name: &str) -> io::Result<()> {
         || name.contains('\0')
     {
         return Err(refused(format!("invalid path component {name:?}")));
+    }
+    #[cfg(windows)]
+    {
+        let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ').to_ascii_uppercase();
+        let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || ["COM", "LPT"].iter().any(|prefix| stem.strip_prefix(prefix).is_some_and(|suffix|
+                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")));
+        if name.contains([':', '<', '>', '"', '|', '?', '*']) || name.chars().any(|c| c.is_ascii_control())
+            || name.ends_with(['.', ' ']) || device {
+            return Err(refused(format!("invalid Windows path component {name:?}")));
+        }
     }
     Ok(())
 }
@@ -510,7 +523,374 @@ mod imp {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod imp {
+    use super::{EntryInfo, EntryKind, WriteStep, check_name, refused, tmp_name};
+    use std::fs::{File, Metadata, OpenOptions};
+    use std::io::{self, Read, Write};
+    use std::os::windows::{fs::{MetadataExt, OpenOptionsExt}, io::{AsRawHandle, FromRawHandle}};
+    use std::path::{Component, Path, PathBuf, Prefix};
+    use std::sync::{Arc, Mutex};
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{NtCreateFile, NtSetInformationFile,
+        FILE_CREATE, FILE_OPEN, FILE_OPEN_IF, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, FILE_RENAME_INFORMATION, FileRenameInformation};
+    use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, UNICODE_STRING, ERROR_NO_MORE_FILES};
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle,
+        GetFileInformationByHandleEx, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ID_BOTH_DIR_INFO, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
+        FILE_DISPOSITION_INFO, FileDispositionInfo, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, DELETE, SYNCHRONIZE};
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    // Every child access is a single-component NtCreateFile relative to an
+    // already opened directory handle. Enumeration and rename use handles too;
+    // pathname checks or share flags are not the reparse-race boundary.
+    pub(crate) struct SafeDir {
+        dir: Arc<File>,
+        ancestors: Vec<Arc<File>>,
+        enumeration: Mutex<()>,
+    }
+
+    fn nt_result(status: i32) -> io::Result<()> {
+        if status < 0 {
+            return Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32));
+        }
+        Ok(())
+    }
+
+    fn link_count(file: &File) -> io::Result<u64> {
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        // SAFETY: live handle and writable output buffer; read only after success.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(u64::from(unsafe { info.assume_init() }.nNumberOfLinks))
+    }
+
+    fn real_file(file: &File, directory: bool, single_link: bool) -> io::Result<Metadata> {
+        let meta = file.metadata()?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || meta.is_dir() != directory {
+            return Err(refused("reparse point or wrong file type"));
+        }
+        if !directory && !meta.is_file() { return Err(refused("regular file required")); }
+        if single_link && link_count(file)? != 1 { return Err(refused("single-link file required")); }
+        Ok(meta)
+    }
+
+    fn delete(file: &File) -> io::Result<()> {
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+        // SAFETY: live handle with DELETE access and a correctly sized input buffer.
+        if unsafe { SetFileInformationByHandle(file.as_raw_handle(), FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(), std::mem::size_of_val(&disposition) as u32) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    impl SafeDir {
+        pub(crate) fn open_root(path: &Path) -> io::Result<Self> {
+            Self::open_nofollow(&path.canonicalize()?, false)
+        }
+
+        pub(crate) fn open_nofollow(path: &Path, create: bool) -> io::Result<Self> {
+            let absolute = if path.is_absolute() { path.to_owned() } else { std::env::current_dir()?.join(path) };
+            let mut parts = absolute.components();
+            let prefix = match parts.next() {
+                Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) => prefix,
+                _ => return Err(refused("directory must be on a local drive")),
+            };
+            if parts.next() != Some(Component::RootDir) { return Err(refused("directory must be absolute")); }
+            let mut root = PathBuf::from(prefix.as_os_str());
+            root.push(std::path::MAIN_SEPARATOR_STR);
+            // Only the drive root is opened by path. Keep no delete sharing.
+            // Native rename opens its target directory with FILE_WRITE_DATA, so
+            // denying write sharing would break replacement (FILE_RENAME_INFORMATION
+            // RootDirectory contract). Handle-relative access is the race boundary.
+            let file = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).open(root)?;
+            real_file(&file, true, false)?;
+            let mut dir = Self { dir: Arc::new(file), ancestors: Vec::new(), enumeration: Mutex::new(()) };
+            for part in parts {
+                let Component::Normal(name) = part else { return Err(refused("invalid directory component")) };
+                let name = name.to_str().ok_or_else(|| refused("non-UTF-8 directory"))?;
+                dir = dir.child_dir(name, create)?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            }
+            Ok(dir)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn metadata(&self) -> io::Result<Metadata> { self.dir.metadata() }
+
+        pub(super) fn directory_file(&self) -> &File { &self.dir }
+
+        fn relative(&self, value: &str, access: u32, disposition: u32, options: u32) -> io::Result<File> {
+            self.relative_secure(value, access, disposition, options, None)
+        }
+
+        // The descriptor is borrowed only for this synchronous NtCreateFile call.
+        pub(super) fn relative_secure(&self, value: &str, access: u32, disposition: u32,
+            options: u32, security: Option<&windows_sys::Win32::Security::SECURITY_DESCRIPTOR>) -> io::Result<File> {
+            check_name(value)?;
+            real_file(&self.dir, true, false)?;
+            let mut wide: Vec<u16> = value.encode_utf16().collect();
+            let length = u16::try_from(wide.len() * 2).map_err(|_| refused("name too long"))?;
+            let name = UNICODE_STRING { Length: length, MaximumLength: length, Buffer: wide.as_mut_ptr() };
+            let attributes = OBJECT_ATTRIBUTES {
+                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+                RootDirectory: self.dir.as_raw_handle(), ObjectName: &name,
+                // entry() must inspect the final reparse point itself. Typed opens
+                // also use OBJ_DONT_REPARSE, as in skill_loader::safe_dir.
+                Attributes: 0x40 | if options == 0 { 0 } else { 0x1000 },
+                SecurityDescriptor: security.map_or(std::ptr::null(), |sd| std::ptr::from_ref(sd).cast()), SecurityQualityOfService: std::ptr::null(),
+            };
+            let mut handle = std::ptr::null_mut();
+            let mut status_block = std::mem::MaybeUninit::<IO_STATUS_BLOCK>::zeroed();
+            // SAFETY: live parent, single-component counted UTF-16 name and live
+            // output buffers. FILE_OPEN_REPARSE_POINT never follows the leaf.
+            let status = unsafe { NtCreateFile(&mut handle, access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                &attributes, status_block.as_mut_ptr(), std::ptr::null(), 0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, // Native rename needs a target-directory writer; never share DELETE.
+                disposition, FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | options,
+                std::ptr::null(), 0) };
+            nt_result(status)?;
+            // SAFETY: NtCreateFile returned a new, uniquely owned successful handle.
+            Ok(unsafe { File::from_raw_handle(handle) })
+        }
+
+        pub(crate) fn entry(&self, name: &str) -> io::Result<Option<EntryInfo>> {
+            let file = match self.relative(name, FILE_READ_ATTRIBUTES, FILE_OPEN, 0) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let meta = file.metadata()?;
+            let kind = if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 { EntryKind::Other }
+                else if meta.is_file() { EntryKind::File }
+                else if meta.is_dir() { EntryKind::Dir } else { EntryKind::Other };
+            Ok(Some(EntryInfo { name: name.to_string(), kind, size: meta.len(), nlink: link_count(&file)? }))
+        }
+
+        pub(crate) fn child_dir(&self, name: &str, create: bool) -> io::Result<Option<Self>> {
+            let file = match self.relative(name, FILE_GENERIC_READ,
+                if create { FILE_OPEN_IF } else { FILE_OPEN }, FILE_DIRECTORY_FILE) {
+                Ok(file) => file,
+                Err(e) if !create && e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            self.pinned_child(file).map(Some)
+        }
+
+        pub(super) fn child_dir_secure(&self, name: &str,
+            security: &windows_sys::Win32::Security::SECURITY_DESCRIPTOR) -> io::Result<Self> {
+            let file = self.relative_secure(name, FILE_GENERIC_READ, FILE_OPEN_IF,
+                FILE_DIRECTORY_FILE, Some(security))?;
+            self.pinned_child(file)
+        }
+
+        fn pinned_child(&self, file: File) -> io::Result<Self> {
+            real_file(&file, true, false)?;
+            let mut ancestors = self.ancestors.clone();
+            ancestors.push(self.dir.clone());
+            Ok(Self { dir: Arc::new(file), ancestors, enumeration: Mutex::new(()) })
+        }
+
+        pub(crate) fn open_read_checked(&self, name: &str, single_link: bool) -> io::Result<Option<File>> {
+            let file = match self.relative(name, FILE_GENERIC_READ, FILE_OPEN, FILE_NON_DIRECTORY_FILE) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            real_file(&file, false, single_link)?;
+            Ok(Some(file))
+        }
+
+        pub(crate) fn read_bytes(&self, name: &str, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
+            self.read_bytes_checked(name, max_bytes, false)
+        }
+
+        pub(crate) fn read_bytes_checked(&self, name: &str, max_bytes: u64, single_link: bool) -> io::Result<Option<Vec<u8>>> {
+            let Some(file) = self.open_read_checked(name, single_link)? else { return Ok(None) };
+            if file.metadata()?.len() > max_bytes { return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large")); }
+            let mut out = Vec::new();
+            file.take(max_bytes.saturating_add(1)).read_to_end(&mut out)?;
+            if out.len() as u64 > max_bytes { return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large")); }
+            Ok(Some(out))
+        }
+
+        pub(crate) fn read_file(&self, name: &str) -> io::Result<Option<String>> {
+            self.read_bytes(name, u64::MAX)?.map(|bytes| String::from_utf8(bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8"))).transpose()
+        }
+
+        pub(crate) fn open_create_new(&self, name: &str) -> io::Result<File> {
+            let file = self.relative(name, FILE_GENERIC_WRITE, FILE_CREATE, FILE_NON_DIRECTORY_FILE)?;
+            real_file(&file, false, true)?;
+            Ok(file)
+        }
+
+        pub(crate) fn create_file_new(&self, name: &str, contents: &[u8]) -> io::Result<bool> {
+            let mut file = match self.open_create_new(name) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    return match self.entry(name)? {
+                        Some(entry) if entry.kind == EntryKind::File && entry.nlink == 1 => Ok(false),
+                        _ => Err(refused("existing file is not a regular, single-link file")),
+                    };
+                }
+                Err(e) => return Err(e),
+            };
+            file.write_all(contents)?;
+            file.sync_all()?;
+            Ok(true)
+        }
+
+        fn target_permissions(&self, name: &str) -> io::Result<Option<std::fs::Permissions>> {
+            let file = match self.relative(name, FILE_READ_ATTRIBUTES, FILE_OPEN, FILE_NON_DIRECTORY_FILE) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            Ok(Some(real_file(&file, false, false)?.permissions()))
+        }
+
+        fn rename(&self, file: &File, name: &str) -> io::Result<()> {
+            check_name(name)?;
+            real_file(&self.dir, true, false)?;
+            let wide: Vec<u16> = name.encode_utf16().collect();
+            let name_bytes = u32::try_from(wide.len() * 2).map_err(|_| refused("name too long"))?;
+            let size = std::mem::size_of::<FILE_RENAME_INFORMATION>() + name_bytes as usize;
+            // u64 storage supplies native alignment and room for the variable name.
+            let mut storage = vec![0u64; size.div_ceil(8)];
+            let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+            // SAFETY: aligned, zeroed buffer large enough for the header and name;
+            // the source and target parent handles stay live for the synchronous call.
+            unsafe {
+                (*rename).Anonymous.ReplaceIfExists = 1;
+                (*rename).RootDirectory = self.dir.as_raw_handle();
+                (*rename).FileNameLength = name_bytes;
+                let target = storage.as_mut_ptr().cast::<u8>()
+                    .add(std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName)).cast::<u16>();
+                std::ptr::copy_nonoverlapping(wide.as_ptr(), target, wide.len());
+                let mut status = std::mem::MaybeUninit::<IO_STATUS_BLOCK>::zeroed();
+                nt_result(NtSetInformationFile(file.as_raw_handle(), status.as_mut_ptr(),
+                    rename.cast(), size as u32, FileRenameInformation))
+            }
+        }
+
+        pub(crate) fn write_bytes_atomic_with(&self, name: &str, contents: &[u8], tmp: &str,
+            fault: &dyn Fn(WriteStep) -> io::Result<()>) -> io::Result<()> {
+            check_name(name)?;
+            check_name(tmp)?;
+            let perms = self.target_permissions(name)?;
+            let mut file = self.relative(tmp, FILE_GENERIC_WRITE | DELETE, FILE_CREATE, FILE_NON_DIRECTORY_FILE)?;
+            let res = (|| -> io::Result<()> {
+                real_file(&file, false, true)?;
+                fault(WriteStep::Write)?;
+                file.write_all(contents)?;
+                if let Some(perms) = perms { file.set_permissions(perms)?; }
+                fault(WriteStep::Sync)?;
+                file.sync_all()?;
+                fault(WriteStep::Rename)?;
+                // Repeat the no-follow target check immediately before replacement.
+                // A later leaf swap cannot redirect the handle-relative rename.
+                self.target_permissions(name)?;
+                self.rename(&file, name)
+            })();
+            if res.is_err() {
+                // A copied read-only attribute must not prevent deleting our temp.
+                if let Ok(meta) = file.metadata() {
+                    let mut perms = meta.permissions();
+                    if perms.readonly() {
+                        perms.set_readonly(false);
+                        let _ = file.set_permissions(perms);
+                    }
+                }
+                let _ = delete(&file);
+                return res;
+            }
+            let _ = fault(WriteStep::AfterRename);
+            Ok(())
+        }
+
+        pub(crate) fn write_file_atomic(&self, name: &str, contents: &str) -> io::Result<()> {
+            self.write_bytes_atomic_with(name, contents.as_bytes(), &tmp_name(name), &super::no_fault)
+        }
+
+        pub(crate) fn remove_file(&self, name: &str) -> io::Result<()> {
+            let file = self.relative(name, FILE_READ_ATTRIBUTES | DELETE, FILE_OPEN, FILE_NON_DIRECTORY_FILE)?;
+            real_file(&file, false, false)?;
+            delete(&file)
+        }
+
+        pub(crate) fn list(&self) -> io::Result<Vec<EntryInfo>> {
+            // Restart/continuation share a handle cursor, so serialize each full scan.
+            let _guard = self.enumeration.lock().map_err(|_| io::Error::other("directory enumeration poisoned"))?;
+            real_file(&self.dir, true, false)?;
+            let mut storage = vec![0u64; 8192];
+            let bytes_len = storage.len() * 8;
+            let mut out = Vec::new();
+            let mut first = true;
+            loop {
+                storage.fill(0);
+                // SAFETY: live directory and aligned writable enumeration buffer.
+                let ok = unsafe { GetFileInformationByHandleEx(self.dir.as_raw_handle(),
+                    if first { FileIdBothDirectoryRestartInfo } else { FileIdBothDirectoryInfo },
+                    storage.as_mut_ptr().cast(), bytes_len as u32) };
+                first = false;
+                if ok == 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) { break; }
+                    return Err(error);
+                }
+                let mut offset = 0;
+                loop {
+                    let header = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+                    if offset + std::mem::size_of::<FILE_ID_BOTH_DIR_INFO>() > bytes_len {
+                        return Err(io::Error::other("invalid directory enumeration"));
+                    }
+                    // SAFETY: aligned offset and checked header/name bounds in this buffer.
+                    let entry = unsafe { &*(storage.as_ptr().cast::<u8>().add(offset).cast::<FILE_ID_BOTH_DIR_INFO>()) };
+                    let length = entry.FileNameLength as usize;
+                    if length % 2 != 0 || offset + header + length > bytes_len {
+                        return Err(io::Error::other("invalid directory name length"));
+                    }
+                    let wide = unsafe { std::slice::from_raw_parts(
+                        storage.as_ptr().cast::<u8>().add(offset + header).cast::<u16>(), length / 2) };
+                    let value = String::from_utf16(wide);
+                    if !matches!(value.as_deref(), Ok("." | "..")) {
+                        let unnamed = EntryInfo { name: String::new(), kind: EntryKind::Other, size: 0, nlink: 1 };
+                        match value {
+                            Ok(name) if check_name(&name).is_ok() => {
+                                if entry.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                                    out.push(EntryInfo { name, ..unnamed });
+                                } else {
+                                    match self.entry(&name) {
+                                        Ok(Some(info)) => out.push(info),
+                                        Ok(None) => {},
+                                        Err(_) => out.push(unnamed),
+                                    }
+                                }
+                            }
+                            _ => out.push(unnamed),
+                        }
+                    }
+                    let next = entry.NextEntryOffset as usize;
+                    if next == 0 { break; }
+                    if next < header + length || next % 8 != 0 || offset + next >= bytes_len {
+                        return Err(io::Error::other("invalid directory entry offset"));
+                    }
+                    offset += next;
+                }
+            }
+            out.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(out)
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 mod imp {
     use super::{EntryInfo, EntryKind, WriteStep, check_name, refused, tmp_name};
     use std::io::{self, Read, Write};
@@ -552,6 +932,8 @@ mod imp {
                 root: canon,
             })
         }
+
+        pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> { std::fs::metadata(&self.path) }
 
         fn meta(&self, name: &str) -> io::Result<Option<std::fs::Metadata>> {
             match std::fs::symlink_metadata(self.path.join(name)) {
@@ -605,28 +987,26 @@ mod imp {
             &self,
             name: &str,
             max_bytes: u64,
-            _single_link: bool,
+            single_link: bool,
         ) -> io::Result<Option<Vec<u8>>> {
-            check_name(name)?;
-            match self.meta(name)? {
-                None => Ok(None),
-                Some(m) if m.file_type().is_symlink() || !m.is_file() => {
-                    Err(refused(format!("{name} is not a regular file")))
+            let file = {
+                let _ = single_link;
+                check_name(name)?;
+                match self.meta(name)? {
+                    None => return Ok(None),
+                    Some(m) if m.file_type().is_symlink() || !m.is_file() => return Err(refused(format!("{name} is not a regular file"))),
+                    Some(_) => std::fs::File::open(self.path.join(name))?,
                 }
-                Some(m) if m.len() > max_bytes => {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"))
-                }
-                Some(_) => {
-                    let mut out = Vec::new();
-                    std::fs::File::open(self.path.join(name))?
-                        .take(max_bytes.saturating_add(1))
-                        .read_to_end(&mut out)?;
-                    if out.len() as u64 > max_bytes {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
-                    }
-                    Ok(Some(out))
-                }
+            };
+            if file.metadata()?.len() > max_bytes {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
             }
+            let mut out = Vec::new();
+            file.take(max_bytes.saturating_add(1)).read_to_end(&mut out)?;
+            if out.len() as u64 > max_bytes {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
+            }
+            Ok(Some(out))
         }
 
         pub(crate) fn open_nofollow(_path: &Path, _create: bool) -> io::Result<Self> {
@@ -651,8 +1031,20 @@ mod imp {
         }
 
         /// Refuse creation where fd-relative no-follow operations are unavailable.
-        pub(crate) fn create_file_new(&self, _name: &str, _contents: &[u8]) -> io::Result<bool> {
-            Err(io::Error::new(io::ErrorKind::Unsupported, "secure skill creation requires no-follow directory handles"))
+        pub(crate) fn create_file_new(&self, name: &str, contents: &[u8]) -> io::Result<bool> {
+            let mut file = match self.open_create_new(name) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    return match self.entry(name)? {
+                        Some(entry) if entry.kind == EntryKind::File && entry.nlink == 1 => Ok(false),
+                        _ => Err(refused("existing file is not a regular, single-link file")),
+                    };
+                }
+                Err(e) => return Err(e),
+            };
+            file.write_all(contents)?;
+            file.sync_all()?;
+            Ok(true)
         }
 
         pub(crate) fn write_bytes_atomic_with(
@@ -680,7 +1072,7 @@ mod imp {
                 fault(WriteStep::Write)?;
                 f.write_all(contents)?;
                 if let Some(p) = perms {
-                    std::fs::set_permissions(&tmp, p)?;
+                    f.set_permissions(p)?;
                 }
                 fault(WriteStep::Sync)?;
                 f.sync_all()?;
@@ -722,8 +1114,9 @@ mod imp {
                     });
                     continue;
                 };
-                match std::fs::symlink_metadata(entry.path()) {
-                    Ok(m) => out.push(info(&name, &m)),
+                match self.entry(&name) {
+                    Ok(Some(info)) => out.push(info),
+                    Ok(None) => {},
                     Err(_) => out.push(EntryInfo {
                         name: String::new(),
                         kind: EntryKind::Other,
@@ -739,6 +1132,10 @@ mod imp {
 }
 
 pub(crate) use imp::SafeDir;
+
+#[cfg(all(test, windows))]
+#[path = "fs_safe/windows_tests.rs"]
+mod windows_tests;
 
 impl SafeDir {
     /// Walk `components` from this directory, never following a symlink.

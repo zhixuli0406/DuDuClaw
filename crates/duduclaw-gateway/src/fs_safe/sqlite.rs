@@ -2,12 +2,35 @@
 //! layers. SQLite opens by pathname (including later journals), so every
 //! ancestor must prevent another uid from replacing the next path component.
 use std::path::Path;
-use rusqlite::Connection;
+#[cfg(not(windows))]
+pub(crate) use rusqlite::Connection;
+#[cfg(windows)]
+#[path = "sqlite_windows.rs"]
+mod windows;
+#[cfg(windows)]
+pub(crate) use windows::Connection;
+
+// Windows databases and SQLite sidecars live below this protected DACL
+// boundary, so later changes to the home's inherited ACL cannot expose them.
+#[cfg(windows)]
+pub(super) const PRIVATE_DIRECTORY: &str = "secure-db";
+
+/// Resolve the platform layout for diagnostics and cross-crate tests only.
+/// This does not validate the path or replace the secure open operation.
+#[doc(hidden)]
+pub fn database_path(home: &Path, name: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    { home.join(PRIVATE_DIRECTORY).join(name) }
+    #[cfg(not(windows))]
+    { home.join(name) }
+}
 
 pub(crate) fn open(home: &Path, name: &str) -> Result<Connection, String> {
     #[cfg(unix)]
     { open_with(home, name, || {}) }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    { windows::open(home, name) }
+    #[cfg(not(any(unix, windows)))]
     { let _ = (home, name); Err("secure database open unavailable".into()) }
 }
 
@@ -345,7 +368,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, not(any(unix, windows))))]
 #[test]
 fn private_sqlite_fails_closed_without_creating_database() {
     let home = crate::fs_safe::private_test_home().unwrap();

@@ -64,9 +64,12 @@ fn group_context_retention_count_age_threads_and_disable() {
 #[test]
 fn group_context_read_enforces_age_before_and_limit_without_sweeper() {
     let home=home(); set(home.path(),&config()).unwrap();
-    insert(home.path(),"global",&message(1,"new")).unwrap();
-    let now=chrono::Utc::now().timestamp();
+    let row=message(1,"new");
+    let now=row.timestamp;
+    insert(home.path(),"global",&row).unwrap();
+    // Use the stored timestamp: setup may cross a wall-clock second.
     assert!(read(home.path(),"telegram","-100",None,50,Some(now)).unwrap().is_empty());
+    assert_eq!(read(home.path(),"telegram","-100",None,50,Some(now+1)).unwrap().len(),1);
     assert!(read(home.path(),"telegram","-100",None,101,None).is_err());
     buffer_db(home.path(),true).unwrap().execute("UPDATE group_context_messages SET timestamp=?1",[now-86401]).unwrap();
     assert!(read(home.path(),"telegram","-100",None,50,None).unwrap().is_empty());

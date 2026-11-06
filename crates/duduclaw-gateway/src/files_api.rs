@@ -790,7 +790,7 @@ mod attachment_fd_tests {
     }
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, not(any(unix, windows))))]
 #[test]
 fn files_attachment_open_fails_closed_without_nofollow_support() {
     let home = tempfile::tempdir().unwrap();
