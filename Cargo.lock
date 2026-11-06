@@ -1876,6 +1876,7 @@ dependencies = [
  "duduclaw-core",
  "hmac",
  "jsonwebtoken",
+ "openssl",
  "password-hash",
  "ring",
  "rusqlite",
@@ -2234,6 +2235,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "whisper-rs",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 

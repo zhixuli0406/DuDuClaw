@@ -94,12 +94,14 @@ pub struct TranscriptionResult {
 #[derive(Debug, Clone)]
 pub struct TranscriptionError {
     pub message: String,
+    // Internal diagnostics only; Display and user-facing payloads use message.
+    pub(crate) detail: Option<String>,
     pub usage: Vec<TranscriptionUsage>,
 }
 
 impl TranscriptionError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), usage: Vec::new() }
+        Self { message: message.into(), detail: None, usage: Vec::new() }
     }
 }
 

@@ -127,6 +127,22 @@ mod imp {
         fd: OwnedFd,
     }
 
+    #[cfg(target_os = "macos")]
+    fn macos_system_path(path: &Path) -> io::Result<std::borrow::Cow<'_, Path>> {
+        use std::os::unix::fs::MetadataExt;
+        for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp"), ("/etc", "/private/etc")] {
+            if let Ok(tail) = path.strip_prefix(alias) {
+                let metadata = std::fs::symlink_metadata(alias)?;
+                if metadata.file_type().is_symlink() && metadata.uid() == 0
+                    && Path::new("/").join(std::fs::read_link(alias)?) == Path::new(target) {
+                    return Ok(std::borrow::Cow::Owned(Path::new(target).join(tail)));
+                }
+                break;
+            }
+        }
+        Ok(std::borrow::Cow::Borrowed(path))
+    }
+
     impl SafeDir {
         /// Open a trusted root chosen by the gateway (symlinks in the root path
         /// itself are followed: the root is not agent-planted).
@@ -149,6 +165,10 @@ mod imp {
         pub(crate) fn open_nofollow(path: &Path, create: bool) -> io::Result<Self> {
             use std::path::Component;
             let absolute = if path.is_absolute() { path.to_owned() } else { std::env::current_dir()?.join(path) };
+            // Resolve only macOS root-owned system aliases; the target and
+            // entire suffix still use O_NOFOLLOW, never untrusted symlinks.
+            #[cfg(target_os = "macos")]
+            let absolute = macos_system_path(&absolute)?;
             let mut dir = Self::open_root(Path::new("/"))?;
             for component in absolute.components() {
                 match component {
@@ -751,6 +771,22 @@ impl SafeDir {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_system_aliases_keep_the_suffix_nofollow() {
+        for parent in [std::env::temp_dir(), std::path::PathBuf::from("/tmp")] {
+            let temp = tempfile::tempdir_in(parent).unwrap();
+            let root = temp.path();
+            let dir = SafeDir::open_nofollow(root, false).unwrap();
+            let real = dir.child_dir("real", true).unwrap().unwrap();
+            real.child_dir("nested", true).unwrap().unwrap();
+            assert!(SafeDir::open_nofollow(&root.join("real"), false).is_ok());
+            symlink("real", root.join("linked")).unwrap();
+            assert!(SafeDir::open_nofollow(&root.join("linked"), false).is_err());
+            assert!(SafeDir::open_nofollow(&root.join("linked/nested"), false).is_err());
+        }
+    }
 
     #[test]
     fn symlinked_child_dir_is_refused_and_nothing_is_created_outside() {

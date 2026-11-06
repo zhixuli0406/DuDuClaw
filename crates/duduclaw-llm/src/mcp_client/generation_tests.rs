@@ -366,7 +366,13 @@ async fn failed_http_connection_never_exposes_secret_url() {
     socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let url = format!("http://{}/api/SECRET_PATH?key=SECRET_QUERY", socket.local_addr().unwrap());
     let error = McpClient::connect_http(&url, &[], Duration::from_secs(2)).await.err().unwrap();
-    assert_eq!(error.to_string(), McpError::Io("MCP HTTP request failed".into()).to_string());
+    // A refused local connection may reach the request deadline on Windows.
+    assert!(matches!(&error, McpError::Timeout)
+        || matches!(&error, McpError::Io(message) if message == "MCP HTTP request failed"));
+    let message = error.to_string();
+    assert!(!message.contains("SECRET_PATH"));
+    assert!(!message.contains("SECRET_QUERY"));
+    assert!(!message.contains(&url));
     let error = McpClient::connect_http("http://remote.example/SECRET_PATH", &[], Duration::from_secs(2)).await.err().unwrap();
     assert!(!error.to_string().contains("SECRET_PATH"));
 }

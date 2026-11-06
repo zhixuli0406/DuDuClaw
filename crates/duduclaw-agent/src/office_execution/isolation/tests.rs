@@ -25,6 +25,7 @@ fn only_the_existing_script_escape_hatch_opts_out() {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn profile_paths_cannot_inject_rules() {
     let injection = Path::new("/private/work/\") (allow default) ; \\path");
@@ -52,6 +53,7 @@ fn profile_paths_cannot_inject_rules() {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn profile_denies_default_and_network_and_scopes_reads_and_writes() {
     let profile = macos_profile(&builder_paths("/Users/user/.duduclaw")).unwrap();
@@ -188,7 +190,8 @@ fn linux_command_requires_namespaces_and_never_mounts_host_root() {
     assert_eq!(Path::new(&args[args.len() - 1]), program.canonicalize().unwrap());
 }
 
-// Pure builder fixtures represent canonical paths, independent of host OS/layout.
+// Pure builder fixtures represent canonical Unix paths without touching the host layout.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn builder_paths(home: &str) -> SandboxPaths {
     SandboxPaths {
         home: home.into(), workspace: "/private/work".into(), base_cache: "/private/base-cache".into(),
@@ -199,6 +202,7 @@ fn builder_paths(home: &str) -> SandboxPaths {
     }
 }
 
+#[cfg(unix)]
 fn assert_builders_refuse(paths: &SandboxPaths) {
     for error in [bwrap_args(paths).unwrap_err(), macos_profile(paths).unwrap_err()] {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -206,6 +210,7 @@ fn assert_builders_refuse(paths: &SandboxPaths) {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn pure_builders_grant_writes_only_to_the_disposable_workspace() {
     let paths = builder_paths("/Users/user/.duduclaw");
@@ -224,6 +229,7 @@ fn pure_builders_grant_writes_only_to_the_disposable_workspace() {
     assert!(profile.contains(&format!("(allow file-read* (subpath {}))", quote_path(&paths.base_cache).unwrap())));
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn both_builders_refuse_base_workspace_overlap_and_relocated_run_cache() {
     for base in ["/private/work", "/private/work/base", "/private"] {
@@ -238,6 +244,7 @@ fn both_builders_refuse_base_workspace_overlap_and_relocated_run_cache() {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn both_builders_refuse_custom_home_under_runtime_roots() {
     for home in ["/usr/local/share/duduclaw", "/opt/homebrew/var/duduclaw",
@@ -252,6 +259,7 @@ fn both_builders_refuse_custom_home_under_runtime_roots() {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn both_builders_refuse_private_grants_overlapping_runtime_roots() {
     for private in ["/usr/local/private", "/opt/homebrew/private", "/usr", "/opt"] {
@@ -269,6 +277,7 @@ fn both_builders_refuse_private_grants_overlapping_runtime_roots() {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn both_builders_check_runtime_alias_and_canonical_target() {
     let mut paths = builder_paths("/srv/duduclaw");
@@ -331,6 +340,7 @@ async fn canonicalization_failure_only_downgrades_with_explicit_opt_out() {
     assert!(!select(&prepared, &absent_program).await.unwrap().is_isolated());
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn production_runtime_allowlists_protect_custom_homes() {
     let mut paths = builder_paths("/usr/local/share/duduclaw");

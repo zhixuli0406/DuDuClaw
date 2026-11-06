@@ -180,7 +180,7 @@ impl TranscriptionEngine for GoogleSttEngine {
             Err(mut error) => { error.usage = usage; return Err(error); }
         };
         if !cleaned {
-            return Err(TranscriptionError { message: "無法確認雲端錄音已刪除；請管理員檢查儲存桶保留政策，轉錄要求可能已計費。".into(), usage });
+            return Err(TranscriptionError { detail: None, message: "無法確認雲端錄音已刪除；請管理員檢查儲存桶保留政策，轉錄要求可能已計費。".into(), usage });
         }
         match result {
             Ok(transcript) => Ok(TranscriptionResult { transcript, usage }),

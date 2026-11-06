@@ -209,7 +209,7 @@ async fn transcription_chunks_are_sequential_offset_and_reuse_speaker_labels() {
 
 #[tokio::test]
 async fn transcription_chunks_preserve_failed_request_usage_and_stop() {
-    let error = TranscriptionError { message: "mock failure".into(), usage: vec![TranscriptionUsage {
+    let error = TranscriptionError { detail: None, message: "mock failure".into(), usage: vec![TranscriptionUsage {
         model: "failed".into(), input_tokens: 200, ..Default::default()
     }] };
     let engine = MockEngine { results: Mutex::new(VecDeque::from([success("first"), Err(error), success("never-called")])), ..Default::default() };
@@ -396,7 +396,7 @@ async fn transcription_underreported_usage_is_bounded_before_accounting_success_
     let gemini = TranscriptionUsage { model: "gemini/gemini-3.5-flash".into(), input_tokens: 1, input_audio_tokens: 1, ..Default::default() };
     let engine = MockEngine { results: Mutex::new(VecDeque::from([
         Ok(TranscriptionResult { transcript: sample(), usage: vec![whisper] }),
-        Err(TranscriptionError { message: "refused".into(), usage: vec![gemini] }),
+        Err(TranscriptionError { detail: None, message: "refused".into(), usage: vec![gemini] }),
     ])), ..Default::default() };
     let usage = UsageLog::default();
     let mut audio = prepared(2);
