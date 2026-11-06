@@ -4055,7 +4055,7 @@ pub(crate) fn is_runtime_substitution(requested: &str, actual: &str) -> bool {
 /// the dispatcher path already enforces via `trigger::maybe_run_gvu` — this
 /// channel path was the one caller missing it
 /// (`TODO-evolution-v3-2026-08.md` WP0.3). Fail-closed: missing file /
-/// malformed TOML / absent key all deny (see `agent_gvu_enabled` doc).
+/// malformed TOML deny; an absent key defaults to on (see `agent_gvu_enabled` doc).
 pub(crate) fn channel_gvu_trigger_allowed(agent_dir: &std::path::Path) -> bool {
     crate::gvu::trigger::agent_gvu_enabled(agent_dir)
 }

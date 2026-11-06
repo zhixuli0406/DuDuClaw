@@ -169,8 +169,17 @@ pub fn project(source: &str) -> Result<String, String> {
         .insert("account_pool".into(), toml::Value::Array(vec![]));
     output.get_mut("heartbeat").and_then(toml::Value::as_table_mut).unwrap()
         .insert("enabled".into(), false.into());
+    if source.get("evolution").is_some_and(|v| !v.is_table()) {
+        return Err("Invalid [evolution] section".into());
+    }
     let evolution = output.get_mut("evolution").and_then(toml::Value::as_table_mut).unwrap();
-    for key in ["enabled", "skill_auto_activate", "gvu_enabled"] { evolution.insert(key.into(), false.into()); }
+    for key in ["enabled", "gvu_enabled"] {
+        let value = source.get("evolution").and_then(|e| e.get(key))
+            .map(|v| v.as_bool().ok_or("Invalid evolution switch"))
+            .transpose()?.unwrap_or(true);
+        evolution.insert(key.into(), value.into());
+    }
+    evolution.insert("skill_auto_activate".into(), false.into());
     let capabilities = output.entry("capabilities").or_insert_with(|| toml::Value::Table(toml::Table::new()))
         .as_table_mut().ok_or("Invalid capability policy")?;
     capabilities.insert("git_credentials".into(), false.into());
@@ -706,6 +715,35 @@ allowed = ["owner"]
         assert!(saved.premium);
         assert!(!serde_json::to_string(&saved).unwrap().contains(secret));
         assert!(create_team(home.path(), "Nested", "", vec![saved]).is_err());
+    }
+
+    #[test]
+    fn company_templates_evolution_defaults_on_and_preserves_opt_outs() {
+        for enabled in [None, Some(false), Some(true)] {
+            for gvu in [None, Some(false), Some(true)] {
+                let mut source: toml::Table = SOURCE.parse().unwrap();
+                let evo = source["evolution"].as_table_mut().unwrap();
+                evo.insert("skill_auto_activate".into(), true.into());
+                for (key, value) in [("enabled", enabled), ("gvu_enabled", gvu)] {
+                    evo.remove(key);
+                    if let Some(value) = value { evo.insert(key.into(), value.into()); }
+                }
+                let home = tempfile::tempdir().unwrap();
+                let saved = create(home.path(), "Evolution", "", &toml::to_string(&source).unwrap(),
+                    "Helpful", "", BTreeMap::new(), false, vec![]).unwrap();
+                let loaded = get(home.path(), &saved.id).unwrap();
+                let config: toml::Table = loaded.agent_toml.parse().unwrap();
+                assert_eq!(config["evolution"]["enabled"].as_bool(), Some(enabled.unwrap_or(true)));
+                assert_eq!(config["evolution"]["gvu_enabled"].as_bool(), Some(gvu.unwrap_or(true)));
+                assert_eq!(config["evolution"]["skill_auto_activate"].as_bool(), Some(false));
+                assert_eq!(config["heartbeat"]["enabled"].as_bool(), Some(false));
+            }
+        }
+        let source = SOURCE.replace("gvu_enabled = false", "gvu_enabled = 'true'");
+        assert!(project(&source).is_err());
+        for raw in ["evolution = false", "evolution = 'bad'", "evolution = []"] {
+            assert!(project(raw).is_err());
+        }
     }
 
     #[test]

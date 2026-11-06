@@ -67,13 +67,12 @@ mod channel_gvu_gate_tests {
     }
 
     #[test]
-    fn missing_key_blocks_channel_gvu_trigger_fail_closed() {
-        // No [evolution] section at all — R3's exact failure shape (silent
-        // DENY, not silent ALLOW). Confirms the channel path inherits the
-        // fail-closed posture, not an accidentally-permissive one.
+    fn missing_key_allows_channel_gvu_trigger() {
+        // Existing dashboard agents inherit the owner's default-on decision.
+        // File/read/parse failures still deny at the shared runtime gate.
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("agent.toml"), "[agent]\nname = \"x\"\n").unwrap();
-        assert!(!channel_gvu_trigger_allowed(tmp.path()));
+        assert!(channel_gvu_trigger_allowed(tmp.path()));
     }
 
     #[test]

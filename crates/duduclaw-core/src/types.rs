@@ -2533,18 +2533,10 @@ pub struct EvolutionConfig {
 
     /// Enable GVU (Generator-Verifier-Updater) loop for evolution proposals.
     ///
-    /// **Default `false` (WP0.1, 2026-08-06 — fixes root cause R3).** Before
-    /// this fix the struct default was `true` while the actual runtime gate
-    /// (`gvu::trigger::agent_gvu_enabled` in duduclaw-gateway, which reads
-    /// `agent.toml` directly rather than through this struct) defaulted a
-    /// missing/absent key to `false`. The two defaults pointed opposite
-    /// directions: dashboard code paths that render this struct's default
-    /// showed GVU as "on", while the agent silently never ran it — 19 of 20
-    /// production template agents were affected. Fail-closed opt-in wins:
-    /// GVU only runs for agents whose `agent.toml` explicitly sets
-    /// `gvu_enabled = true`. Template/scaffold generators must write the key
-    /// explicitly (even when `false`) so the toggle is visible, not implicit.
-    #[serde(default)]
+    /// Defaults to `true`, including a missing key (owner decision, 2026-11-06).
+    /// An explicit `false` opts out; `enabled = false` remains the master switch.
+    /// Scaffolds write the key explicitly so the toggle is visible in agent.toml.
+    #[serde(default = "default_true")]
     pub gvu_enabled: bool,
 
     /// DEPRECATED (D7, 2026-08-04): the cognitive memory layer is now a
@@ -2711,9 +2703,7 @@ impl Default for EvolutionConfig {
             skill_auto_activate: false,
             skill_security_scan: true,
             external_factors: Default::default(),
-            // WP0.1 (2026-08-06): default false — see field doc on
-            // `gvu_enabled` above for the R3 root-cause writeup.
-            gvu_enabled: false,
+            gvu_enabled: true,
             cognitive_memory: true,
             max_silence_hours: 12.0,
             skill_token_budget: 2500,
@@ -3128,6 +3118,19 @@ mod stagnation_tests {
     }
 
     #[test]
+    fn evolution_gvu_defaults_on_and_respects_explicit_false() {
+        assert!(EvolutionConfig::default().gvu_enabled);
+        let missing: EvolutionConfig = toml::from_str("").unwrap();
+        assert!(missing.gvu_enabled);
+        let disabled: EvolutionConfig = toml::from_str("gvu_enabled = false").unwrap();
+        assert!(!disabled.gvu_enabled);
+        let frozen: EvolutionConfig = toml::from_str("enabled = false").unwrap();
+        assert!(frozen.gvu_enabled);
+        assert!(!frozen.is_any_evolution_enabled());
+        assert!(toml::from_str::<EvolutionConfig>("gvu_enabled = 'true'").is_err());
+    }
+
+    #[test]
     fn test_evolution_config_has_stagnation_detection() {
         let cfg = EvolutionConfig::default();
         // stagnation_detection field must be present with defaults.
@@ -3484,8 +3487,8 @@ pub struct AgentInfo {
 //
 // 1. **Missing-key defaults are reproduced exactly, never "corrected".**
 //    Several of these directions contradict each other (`[guardrails]
-//    enabled` ⇒ false but `block_secrets` ⇒ true; `[evolution] enabled` ⇒
-//    true but `gvu_enabled` ⇒ false). That inconsistency is historical fact.
+//    enabled` ⇒ false but `block_secrets` ⇒ true). Evolution's `gvu_enabled`
+//    was deliberately changed to true by the owner on 2026-11-06.
 //    Changing it is a separate, deliberate decision — not a side effect of a
 //    schema refactor. The `default_direction_*` tests lock each one down.
 // 2. **Tolerance is preserved.** Every field uses `crate::lenient`, so a

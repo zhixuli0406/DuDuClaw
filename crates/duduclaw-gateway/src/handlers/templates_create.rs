@@ -386,9 +386,37 @@ impl MethodHandler {
 /// Same final-document preparation used by the licensed template writer.
 pub(super) fn prepare_template_runtime(home: &Path, original: &str) -> Result<(String,crate::runtime_config::ModelRuntimeAlignment),String> {
     let mut table:toml::Table=original.parse().map_err(|e|format!("Invalid agent.toml: {e}"))?;
+    let evolution = table.entry("evolution").or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut().ok_or("Invalid [evolution] section")?;
+    for key in ["enabled", "gvu_enabled"] {
+        evolution.entry(key).or_insert(true.into());
+        if evolution[key].as_bool().is_none() { return Err("Invalid evolution switch".into()); }
+    }
     let alignment=crate::runtime_config::align_model_runtime(&mut table)?;
     let rendered=super::config_commit::render_preserving(original,&table)?;
     let final_table:toml::Table=rendered.parse().map_err(|e|format!("Invalid agent.toml: {e}"))?;
     crate::product_policy::load(home).and_then(|policy|crate::product_policy::validate_table(policy,&final_table))?;
     Ok((rendered,alignment))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn templates_create_evolution_defaults_on_and_preserves_explicit_false() {
+        let home = tempfile::tempdir().unwrap();
+        for (settings, enabled, gvu) in [
+            ("", true, true),
+            ("[evolution]\n", true, true),
+            ("[evolution]\nenabled = false\n", false, true),
+            ("[evolution]\ngvu_enabled = false\n", true, false),
+        ] {
+            let raw = format!("[runtime]\nprovider = 'claude'\n[model]\npreferred = 'claude-sonnet-4-6'\n{settings}");
+            let (rendered, _) = prepare_template_runtime(home.path(), &raw).unwrap();
+            let config: toml::Table = rendered.parse().unwrap();
+            assert_eq!(config["evolution"]["enabled"].as_bool(), Some(enabled));
+            assert_eq!(config["evolution"]["gvu_enabled"].as_bool(), Some(gvu));
+        }
+    }
 }
