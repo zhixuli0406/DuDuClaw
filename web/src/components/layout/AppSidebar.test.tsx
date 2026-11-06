@@ -1,7 +1,7 @@
 import { useCompanyStore } from '@/stores/company-store';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { useLocation } from 'react-router';
-import { screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
@@ -506,4 +506,23 @@ it('opens language settings from the employee menu and keeps the version out of 
   await user.click(screen.getByRole('button', { name: 'Alice' }));
   await user.click(await screen.findByRole('menuitem', { name: 'Switch language' }));
   expect(screen.getByTestId('menu-location')).toHaveTextContent('/me/account#language');
+});
+
+import { callableSubject, useCallableAgentsStore } from '@/stores/callable-agents-store';
+
+it('does not set a primary employee revoked while its menu is open', async () => {
+  const user = userEvent.setup();
+  useAgentsStore.setState({ agents: makeAgents(1) as never });
+  useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never,
+    bindings: [{ agent_name: 'agent-0', access_level: 'owner' }] as never });
+  renderSidebar();
+  await user.click(await screen.findByRole('button', { name: 'Set as primary' }));
+  const item = await screen.findByRole('menuitem', { name: 'Set as primary' });
+  await waitFor(() => expect(item).not.toHaveAttribute('aria-disabled', 'true'));
+  act(() => {
+    const key = JSON.stringify([callableSubject(), null]);
+    useCallableAgentsStore.setState({ entries: { [key]: { agents: [], unrestricted: false, loading: false, confirmedAt: Date.now() + 1 } } });
+    fireEvent.click(item);
+  });
+  expect(mockWsClient.call.mock.calls.some(([method]) => method === 'users.set_primary_agent')).toBe(false);
 });

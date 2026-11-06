@@ -1,4 +1,5 @@
 {
+  "agent.selection.revoked": "This AI employee is no longer available. Please select again.",
   "settings.update.failure.download": "Unable to download the update. Check your connection and check for updates again.",
   "settings.update.failure.verify": "Update verification failed; installation was stopped. Download the official release again.",
   "settings.update.failure.extract": "Unable to extract the update. Download the official release again.",

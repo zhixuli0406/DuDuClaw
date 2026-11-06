@@ -1,3 +1,4 @@
+import { canSelectAgent, useSelectableCallableAgents } from '@/stores/callable-agents-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useVisibleAgents } from '@/lib/data-scope';
 import { chatEntryLabel } from '@/lib/task-entry-visibility';
@@ -251,8 +252,11 @@ function AgentDetailPageContent() {
     goTab(next);
   };
 
+  useSelectableCallableAgents();
+
   const lifecycleAction = useCallback(
     async (fn: () => Promise<void>, successId: string) => {
+      if (!canSelectAgent(id)) return;
       setBusy(true);
       try {
         await fn();
@@ -284,6 +288,7 @@ function AgentDetailPageContent() {
       try {
         const b64 = await readFileAsBase64(file);
         const dataUri = `data:${file.type};base64,${b64}`;
+        if (!canSelectAgent(id)) return;
         await api.agents.setAvatar(id, dataUri);
         setAvatarCache(id, dataUri);
         setDetail((d) => (d ? { ...d, avatar: dataUri, has_avatar: true } : d));
@@ -300,6 +305,7 @@ function AgentDetailPageContent() {
   const handleAvatarClear = useCallback(async () => {
     setAvatarBusy(true);
     try {
+      if (!canSelectAgent(id)) return;
       await api.agents.clearAvatar(id);
       setAvatarCache(id, null);
       setDetail((d) => (d ? { ...d, avatar: null, has_avatar: false } : d));
@@ -443,7 +449,7 @@ function AgentDetailPageContent() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => navigate(`/chat?agent=${encodeURIComponent(id)}`)}
+                onClick={() => { if (canSelectAgent(id)) navigate(`/chat?agent=${encodeURIComponent(id)}`); }}
               >
                 <MessageSquare />
                 {intl.formatMessage({ id: 'agentDetail.action.chat' })}

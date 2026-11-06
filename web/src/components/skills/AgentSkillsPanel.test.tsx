@@ -1,3 +1,4 @@
+import { useAuthStore } from '@/stores/auth-store';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -27,7 +28,10 @@ function setup(canManage: boolean) {
   });
 }
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
+});
 
 describe('AgentSkillsPanel', () => {
   it('loads the employee effective list and labels every scope', async () => {

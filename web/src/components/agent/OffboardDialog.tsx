@@ -81,7 +81,7 @@ export function OffboardDialog({
   const canSubmit = !busyAll && removeReady && handoffReady;
 
   const handleSubmit = async () => {
-    if (!canSubmit || (mode === 'handoff' && !canSelectAgent(target))) return;
+    if (!canSubmit || !canSelectAgent(agent.name) || (mode === 'handoff' && !canSelectAgent(target))) return;
     setErrors(null);
     setSubmitting(true);
     try {

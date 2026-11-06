@@ -1,3 +1,4 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useIntl } from 'react-intl';
@@ -540,7 +541,12 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
   const agents = useVisibleAgents(false);
   const selectableAgents = useSelectableAgents(false);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
-  const [scope, setScope] = useState('global');
+  const [scope, setScope] = useState<string | null>('global');
+  const agentScope = scope !== null && scope !== 'global' && !scope.startsWith('department:');
+  const validScope = scope !== null && (!agentScope || canSelectAgent(scope ?? ''));
+  useEffect(() => {
+    if (agentScope && !selectableAgents.some(a => a.name === scope)) setScope(null);
+  }, [agentScope, scope, selectableAgents]);
   const [scanning, setScanning] = useState(false);
   const [scanResult, setScanResult] = useState<VetResponse | null>(null);
   const [installing, setInstalling] = useState(false);
@@ -568,7 +574,7 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
   }, [skill.url]);
 
   const handleInstall = useCallback(async () => {
-    if (!scanResult?.passed || !skill.url) return;
+    if (!scanResult?.passed || !skill.url || !scope || (agentScope && !canSelectAgent(scope ?? ''))) return;
     setInstalling(true);
     setError(null);
     try {
@@ -585,7 +591,7 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
     } finally {
       setInstalling(false);
     }
-  }, [scanResult, skill.url, scope, isAdmin]);
+  }, [scanResult, skill.url, scope, isAdmin, agentScope]);
 
   const scanPassed = scanResult?.passed === true;
   const scanFailed = scanResult !== null && !scanResult.passed;
@@ -621,9 +627,11 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
             <label className="text-xs font-medium text-muted-foreground">
               {intl.formatMessage({ id: 'skills.install.scope' })}
             </label>
-            <Select value={scope} onValueChange={(v) => setScope(String(v))}>
+            <Select value={scope} onValueChange={(v, details) => {
+              if (details.reason === 'item-press' || details.reason === 'list-navigation') setScope(typeof v === 'string' ? v : null);
+            }}>
               <SelectTrigger className="w-full">
-                <SelectValue>{scopeLabel(scope)}</SelectValue>
+                <SelectValue>{scope === null ? intl.formatMessage({ id: 'skills.install.scope' }) : scopeLabel(scope)}</SelectValue>
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="global">
@@ -745,7 +753,7 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
             <Button
               variant="brand"
               onClick={handleInstall}
-              disabled={!scanPassed || installing}
+              disabled={!scanPassed || installing || !validScope}
               title={!scanPassed ? intl.formatMessage({ id: 'skills.install.requireScan' }) : undefined}
             >
               {installing ? <Loader2 className="animate-spin" /> : <Download />}

@@ -42,6 +42,7 @@ export function InstalledSkillRow({
   owner,
   shared,
   canManage,
+  canShare = true,
   selectable,
   selected,
   onSelect,
@@ -54,6 +55,7 @@ export function InstalledSkillRow({
   owner: string;
   shared: boolean;
   canManage: boolean;
+  canShare?: boolean;
   selectable: boolean;
   selected: boolean;
   onSelect: (v: boolean) => void;
@@ -177,7 +179,7 @@ export function InstalledSkillRow({
               </DropdownMenuItem>
             )}
             {/* A company-wide skill has no owning staffer to share from. */}
-            <DropdownMenuItem onClick={onShare} disabled={shared || !skill.agent_id}>
+            <DropdownMenuItem onClick={onShare} disabled={shared || !skill.agent_id || !canShare}>
               {shared ? <CheckCircle /> : <Share2 />}
               {intl.formatMessage({ id: shared ? 'skills.my.shared' : 'skills.shared.share' })}
             </DropdownMenuItem>

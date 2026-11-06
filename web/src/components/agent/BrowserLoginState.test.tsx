@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { beforeEach, expect, it } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -10,7 +11,7 @@ const SAVED = { enabled: false, saved: true, sealed_bytes: 1048576, updated_at: 
 function show() {
   return render(<IntlProvider locale="en" messages={en}><BrowserLoginState agentId="alice" /></IntlProvider>);
 }
-beforeEach(() => mockWsClient.call.mockReset());
+beforeEach(() => { mockWsClient.call.mockReset(); setConfirmedCallableAgents(true); });
 
 it('shows retained saved state while persistence is disabled', async () => {
   mockWsClient.call.mockResolvedValue(SAVED);

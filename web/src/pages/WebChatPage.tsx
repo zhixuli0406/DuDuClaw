@@ -121,6 +121,8 @@ function InteractiveWebChatPage() {
   const [, setAgentParam] = useUrlStateNullable('agent');
   const navigate = useNavigate();
   const [input, setInput] = useState('');
+  const [prefilledDraft, setPrefilledDraft] = useState<string | null>(null);
+  const chosenMentions = useRef(new Map<string, string>());
   // `@` autocomplete: caret position, highlighted row, and whether Escape
   // closed the popup for the mention being typed.
   const [caret, setCaret] = useState(0);
@@ -175,12 +177,38 @@ function InteractiveWebChatPage() {
     const draft = typeof state?.draft === 'string' && state.draft.trim().length > 0 ? state.draft : null;
     const handed = takeChatAttachments(state?.attachmentsKey);
     if (!draft && handed.length === 0) return;
-    if (draft) setInput((prev) => (prev ? prev : draft));
+    if (draft) setPrefilledDraft(draft);
     if (handed.length > 0) setAttachments((prev) => [...prev, ...handed]);
     navigate(location.pathname + location.search, { replace: true, state: null });
     inputRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.key]);
+
+  // Handoff text waits for this surface's fresh grants, just like a picker.
+  useEffect(() => {
+    if (prefilledDraft === null || staffGrants.loading) return;
+    let draft = prefilledDraft;
+    const known = [...(callable ?? []), ...useAgentsStore.getState().agents, ...(staffGrants.agents ?? [])];
+    const mentions = known.flatMap(a => ['call_text' in a ? a.call_text : undefined, `@${a.display_name}`, `@${a.name}`]
+      .filter((call): call is string => !!call).map(call => ({ name: a.name, call })));
+    mentions.sort((a, b) => b.call.length - a.call.length);
+    const accepted = new Map<string, string>();
+    const alternatives = [...new Set(mentions.map(m => m.call))]
+      .map(call => call.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const pattern = new RegExp(`(^|[\\s(])(${[...alternatives.map(call => `${call}(?=\\s|$)`), '[@＠]\\S+'].join('|')})`, 'g');
+    draft = draft.replace(pattern, (_whole, prefix: string, call: string) => {
+      const match = mentions.find(m => m.call === call && canSelectAgent(m.name, chatSessionId));
+      if (!match) return prefix;
+      accepted.set(match.name, call);
+      return prefix + call;
+    });
+    setInput(prev => {
+      if (prev) return prev;
+      for (const [name, call] of accepted) chosenMentions.current.set(name, call);
+      return draft;
+    });
+    setPrefilledDraft(null);
+  }, [prefilledDraft, staffGrants.loading, staffGrants.agents, callable, chatSessionId]);
 
   // Auto-scroll to bottom on new content.
   useEffect(() => {
@@ -375,7 +403,6 @@ function InteractiveWebChatPage() {
   const mentionOpen = activeMention !== null && !mentionDismissed && (agentsLoaded || callable !== null);
   const safeMentionIndex = mentionCandidates.length ? Math.min(mentionIndex, mentionCandidates.length - 1) : 0;
 
-  const chosenMentions = useRef(new Map<string, string>());
   const pickMention = (agent: MentionAgent) => {
     if (!activeMention || !mentionSource.some(a => a.name === agent.name)) return;
     const call = mentionText(agent, mentionSource);

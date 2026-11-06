@@ -512,3 +512,24 @@ describe('WebChatPage primary preference', () => {
     expect(select).not.toHaveBeenCalled();
   });
 });
+
+it('drops a revoked prefilled mention before sending the handoff draft', async () => {
+  useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never });
+  useAgentsStore.setState({ loaded: true, agents: [{ name: 'sales', display_name: 'Sales', status: 'active' }] as never });
+  useChatStore.setState({ connectionState: 'connected', selectedAgentId: null, resolvedAgent: { id: 'other', name: 'Other', icon: '' }, assignmentError: null });
+  let resolve!: (value: unknown) => void;
+  vi.spyOn(api.agents, 'callable').mockImplementation(() => new Promise(r => { resolve = r; }) as never);
+  const send = vi.spyOn(useChatStore.getState(), 'send').mockImplementation(() => {});
+  render(
+    <IntlProvider messages={en} locale="en" defaultLocale="en">
+      <MemoryRouter initialEntries={[{ pathname: '/chat', state: { draft: '@Sales prepare a quote' } }]}>
+        <WebChatPage />
+      </MemoryRouter>
+    </IntlProvider>,
+  );
+  expect(screen.getByRole('combobox')).not.toHaveValue('@Sales prepare a quote');
+  await act(async () => resolve({ agents: [], unrestricted: false, default_agent: null }));
+  await waitFor(() => expect(screen.getByRole('combobox')).toHaveValue(' prepare a quote'));
+  expect(send).not.toHaveBeenCalled();
+  send.mockRestore();
+});

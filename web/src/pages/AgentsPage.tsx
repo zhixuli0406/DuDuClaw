@@ -1,3 +1,4 @@
+import { canSelectAgent, useSelectableCallableAgents } from '@/stores/callable-agents-store';
 import { chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useVisibleAgents, type VisibleAgent } from '@/lib/data-scope';
 import { useAuthStore } from '@/stores/auth-store';
@@ -103,6 +104,7 @@ export function AgentsPage() {
     clearError,
   } = useAgentsStore();
   const agents = useVisibleAgents();
+  useSelectableCallableAgents();
   const agentsForHandoff = useVisibleAgents(false);
   const isAdmin = useAuthStore(s => s.user?.role === 'admin');
   const { tasks, fetchTasks, error: tasksError, tasksPartialError, loading: tasksLoading } = useTasksStore();
@@ -136,6 +138,7 @@ export function AgentsPage() {
    */
   const runLifecycle = useCallback(
     async (fn: () => Promise<void>, successId: string, agent: VisibleAgent) => {
+      if (!canSelectAgent(agent.name)) return;
       clearError();
       try {
         await fn();

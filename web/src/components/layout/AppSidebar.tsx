@@ -1,3 +1,4 @@
+import { canSelectAgent, useSelectableCallableAgents } from '@/stores/callable-agents-store';
 import { TASK_ENTRY_POINTS_HIDDEN, chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useVisibleAgents } from '@/lib/data-scope';
 import { useEffect, useMemo, useState } from 'react';
@@ -239,10 +240,12 @@ function StaffZone({
 }) {
   const intl = useIntl();
   const agents = useVisibleAgents();
+  const selection = useSelectableCallableAgents();
   const bindings = useAuthStore((s) => s.bindings);
   const primaryAgent = useAuthStore((s) => s.user?.primary_agent_id);
   const [settingPrimary, setSettingPrimary] = useState(false);
   const setPrimary = async (agent: string) => {
+    if (!canSelectAgent(agent)) return;
     setSettingPrimary(true);
     const subject = useAuthStore.getState().user?.id;
     try {
@@ -338,7 +341,7 @@ function StaffZone({
                     <MoreHorizontal className="size-4" />
                   </DropdownMenuTrigger>
                   <DropdownMenuContent>
-                    <DropdownMenuItem disabled={settingPrimary || a.name === primaryAgent} onClick={() => void setPrimary(a.name)}>
+                    <DropdownMenuItem disabled={settingPrimary || a.name === primaryAgent || !(selection.unrestricted || selection.agents?.some(g => g.name === a.name && g.selectable))} onClick={() => void setPrimary(a.name)}>
                       {intl.formatMessage({ id: 'sidebar.setPrimaryAgent' })}
                     </DropdownMenuItem>
                   </DropdownMenuContent>

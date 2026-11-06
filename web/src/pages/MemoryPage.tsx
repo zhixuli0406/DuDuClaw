@@ -1,3 +1,4 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
@@ -738,6 +739,7 @@ function PlaybookCard({ agentId }: { agentId: string }) {
   useEffect(() => { load(); }, [load]);
 
   const handleExport = async () => {
+    if (!canSelectAgent(agentId)) return;
     try {
       const res = await api.playbook.export(agentId);
       const blob = new Blob([JSON.stringify(res, null, 2)], { type: 'application/json' });
@@ -754,7 +756,7 @@ function PlaybookCard({ agentId }: { agentId: string }) {
   };
 
   const handleRetireConfirm = async () => {
-    if (!retireTarget) return;
+    if (!retireTarget || !canSelectAgent(agentId)) return;
     setRetiring(true);
     try {
       const res = await api.playbook.retire(agentId, retireTarget.id, reason);

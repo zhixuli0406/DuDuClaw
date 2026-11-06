@@ -72,6 +72,7 @@ export function MeetingTranscriptsPage() {
       const prepared = await prepareMeetingAudio(file, abort.signal);
       abort.signal.throwIfAborted();
       setPath(prepared.path); setPhase('uploading');
+      if (!canSelectAgent(agent)) return;
       await uploadMeeting(prepared.file, agent, user.id, setProgress, abort.signal);
       setFile(null); if (fileInput.current) fileInput.current.value = ''; setRevision(value => value + 1);
     } catch (e) { if (!abort.signal.aborted) showError(e); }
@@ -116,8 +117,8 @@ export function MeetingTranscriptsPage() {
         <h2 id="meeting-jobs-title" className="text-lg font-medium">{t('meeting.jobs')}</h2>
         <Button variant="ghost" size="sm" disabled={!agent} onClick={() => setRevision(value => value + 1)}><RefreshCw aria-hidden="true" />{t('meeting.refresh')}</Button>
       </div>
-      <MeetingJobList jobs={jobs} onCancel={async id => { try { await meetingApi.cancel(agent, id); setRevision(value => value + 1); } catch (e) { showError(e); } }}
-        onDownload={async (id, format) => { try { await meetingApi.download(agent, id, format); } catch (e) { showError(e); } }} />
+      <MeetingJobList jobs={jobs} onCancel={async id => { try { if (!canSelectAgent(agent)) return; await meetingApi.cancel(agent, id); setRevision(value => value + 1); } catch (e) { showError(e); } }}
+        onDownload={async (id, format) => { try { if (!canSelectAgent(agent)) return; await meetingApi.download(agent, id, format); } catch (e) { showError(e); } }} />
     </section>
   </main>;
 }

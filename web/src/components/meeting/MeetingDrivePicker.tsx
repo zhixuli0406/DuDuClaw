@@ -1,3 +1,4 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Link } from 'react-router';
@@ -129,8 +130,10 @@ export function MeetingDrivePicker({ agent, agentName, disabled, onBusy, onImpor
               // Register this exact file and employee only after explicit confirmation.
               // A failed import consumes its receipt; another attempt needs confirmation again.
               setSelected(null);
+              if (!canSelectAgent(agent)) return;
               const registered = await meetingDriveApi.registerSelection(agent, selected.id, signal);
               if (signal.aborted) return;
+              if (!canSelectAgent(agent)) return;
               await meetingDriveApi.import(agent, selected.id, registered.selection_receipt, signal);
               if (!signal.aborted) onImported();
             })}>{t('meeting.drive.confirm')}</Button>

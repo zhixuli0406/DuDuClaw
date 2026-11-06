@@ -902,6 +902,7 @@ function EditAgentPageContent() {
     let contractApplied = true;
     try {
       if (hasChanges) {
+        if (!canSelectAgent(agent.name)) throw new Error(intl.formatMessage({ id: 'common.error' }));
         // updateAgent re-fetches the roster internally. Autosave never
         // navigates away — the header SettingsSaveState is the only feedback.
         if (payload.reports_to && !canSelectAgent(payload.reports_to)) throw new Error(intl.formatMessage({ id: 'common.error' }));
@@ -943,6 +944,7 @@ function EditAgentPageContent() {
       // CON — a dirty contract writes through its own RPC, which checks the
       // change first and may hold it for a confirmation or a review.
       if (doContract) {
+        if (!canSelectAgent(agent.name)) throw new Error(intl.formatMessage({ id: 'common.error' }));
         const sent = contract;
         const baseHash = contractHashRef.current;
         const res = baseHash
@@ -987,6 +989,7 @@ function EditAgentPageContent() {
       setContractReviewBusy(true);
       setContractReviewError(null);
       try {
+        if (!canSelectAgent(agent.name)) throw new Error(intl.formatMessage({ id: 'common.error' }));
         const analysisId = held.review?.analysis_id ?? undefined;
         const res = await api.contract.update(agent.name, sent, {
           action,

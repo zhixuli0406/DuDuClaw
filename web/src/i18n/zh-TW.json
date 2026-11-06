@@ -1,4 +1,5 @@
 {
+  "agent.selection.revoked": "目前無法使用這位 AI 員工，請重新選擇。",
   "settings.update.failure.download": "無法下載更新。請確認網路連線後重新檢查更新。",
   "settings.update.failure.verify": "更新檔驗證未通過，已停止安裝。請重新下載官方版本。",
   "settings.update.failure.extract": "無法解壓縮更新檔。請重新下載官方版本。",

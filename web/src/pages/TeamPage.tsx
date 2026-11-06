@@ -1,4 +1,4 @@
-import { useVisibleAgents, useAgentVisibilityUnrestricted } from '@/lib/data-scope';
+import { canSelectAgent, useSelectableCallableAgents } from '@/stores/callable-agents-store';
 import { TASK_ENTRY_POINTS_HIDDEN, chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useOpenAssign } from '@/hooks/useOpenAssign';
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -77,8 +77,9 @@ export function TeamPage() {
     void load();
   }, [load]);
 
-  const visibleAgents = useVisibleAgents();
-  const unrestricted = useAgentVisibilityUnrestricted();
+  const grants = useSelectableCallableAgents();
+  const visibleAgents = (grants.agents ?? []).filter(a => a.selectable);
+  const unrestricted = grants.unrestricted;
   const visibleMembers = useMemo(() => team?.members.map(m => ({ ...m, agents: m.agents.filter(a => unrestricted || visibleAgents.some(v => v.name === a.name)) })) ?? [], [team, visibleAgents, unrestricted]);
   const tree = useMemo(
     () => (team ? nestTeam(visibleMembers, team.manager?.id ?? null) : []),
@@ -90,6 +91,7 @@ export function TeamPage() {
   );
 
   const openChat = (agent: TeamAgent) => {
+    if (!canSelectAgent(agent.name)) return;
     navigate('/chat', { state: { draft: `${agent.call_text} ` } });
   };
 
@@ -135,9 +137,11 @@ export function TeamPage() {
                 <TeamBranch
                   node={node}
                   onChat={openChat}
-                  onAssign={(agent, report) => TASK_ENTRY_POINTS_HIDDEN
-                    ? openAssign({ description: `${agent.call_text} ` })
-                    : setAssigning({ agent, report })}
+                  onAssign={(agent, report) => {
+                    if (!canSelectAgent(agent.name)) return;
+                    if (TASK_ENTRY_POINTS_HIDDEN) openAssign({ description: `${agent.call_text} ` });
+                    else setAssigning({ agent, report });
+                  }}
                   onHistory={(agent, report) => navigate(`/team/conversations?${new URLSearchParams({ agent: agent.name, report })}`)}
                 />
               </li>

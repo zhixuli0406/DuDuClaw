@@ -1,4 +1,5 @@
 {
+  "agent.selection.revoked": "この AI スタッフは現在利用できません。選び直してください。",
   "settings.update.failure.download": "更新をダウンロードできません。接続を確認し、更新を再確認してください。",
   "settings.update.failure.verify": "更新ファイルの検証に失敗したため、インストールを停止しました。公式版を再ダウンロードしてください。",
   "settings.update.failure.extract": "更新ファイルを展開できません。公式版を再ダウンロードしてください。",

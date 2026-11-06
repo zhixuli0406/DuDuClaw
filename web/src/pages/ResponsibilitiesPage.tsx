@@ -1,3 +1,4 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -514,7 +515,7 @@ function CreateDialog({
 
   const selectableAgents = useSelectableAgents(false);
   const submit = async () => {
-    if (!selectableAgents.some(a => a.name === form.ownerAgentId)) return;
+    if (!selectableAgents.some(a => a.name === form.ownerAgentId) || !canSelectAgent(form.ownerAgentId)) return;
     setBusy(true);
     setError(null);
     try {

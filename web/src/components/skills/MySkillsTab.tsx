@@ -1,3 +1,4 @@
+import { canSelectAgent, useSelectableCallableAgents } from '@/stores/callable-agents-store';
 import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useIntl } from 'react-intl';
@@ -126,10 +127,13 @@ export function MySkillsTab({ filter }: { filter: string }) {
   const agents = useVisibleAgents(false);
   const selectableAgents = useSelectableAgents(false);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
+  const grants = useSelectableCallableAgents();
+  const canMutate = useCallback((agent: string) => useAuthStore.getState().user?.role === 'admin' || canSelectAgent(agent), [isAdmin]);
+  const grantsReady = isAdmin || (!grants.loading && grants.agents !== null);
   // Defaults to the aggregate view (the first agent of the gateway's map
   // order was unrelated to the staffer the customer talks to).
   const [requestedAgent, setSelectedAgent] = useState<string>(ALL_AGENTS);
-  const selectedAgent = agents.some(a => a.name === requestedAgent) ? requestedAgent : ALL_AGENTS;
+  const selectedAgent = (isAdmin ? agents : selectableAgents).some(a => a.name === requestedAgent) ? requestedAgent : ALL_AGENTS;
   const [data, setData] = useState<Loaded>(EMPTY);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -190,11 +194,16 @@ export function MySkillsTab({ filter }: { filter: string }) {
   }, [selectedAgent, loadSkills, connectionState]);
 
   const refresh = useCallback(() => void loadSkills(false), [loadSkills]);
-  const actions = useSkillActions(refresh);
+  const actions = useSkillActions(refresh, canMutate);
+
+  useEffect(() => {
+    if (!grantsReady || (removeTargets && !removeTargets.every(t => canMutate(t.agent_id)))) setRemoveTargets(null);
+    if (!grantsReady || (usageFor && !switchTargetsOf(usageFor).every(t => canMutate(t.agent_id)))) setUsageFor(null);
+  }, [grantsReady, grants.agents, removeTargets, usageFor, canMutate]);
 
   const handleShare = useCallback(
     async (skill: SkillInfo) => {
-      if (!skill.agent_id) return;
+      if (!skill.agent_id || !canMutate(skill.agent_id)) return;
       try {
         await api.sharedSkills.share(skill.agent_id, skill.name);
         // Keyed by row (owner + name), not by name alone.
@@ -205,7 +214,7 @@ export function MySkillsTab({ filter }: { filter: string }) {
         toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
       }
     },
-    [intl],
+    [intl, canMutate],
   );
 
   const ownerOf = useCallback(
@@ -220,9 +229,9 @@ export function MySkillsTab({ filter }: { filter: string }) {
   const canManageRow = useCallback(
     (s: SkillInfo) => {
       const targets = switchTargetsOf(s);
-      return targets.length > 0 && targets.every((t) => data.canManage[t.agent_id] === true);
+      return targets.length > 0 && grantsReady && targets.every((t) => data.canManage[t.agent_id] === true && canMutate(t.agent_id));
     },
-    [data.canManage],
+    [data.canManage, grantsReady, canMutate],
   );
 
   const holdersOf = useCallback(
@@ -237,7 +246,7 @@ export function MySkillsTab({ filter }: { filter: string }) {
             enabled: h.enabled,
             use_count: h.use_count,
             last_used_at: h.last_used_at,
-            can_manage: data.canManage[h.agent_id] === true,
+            can_manage: grantsReady && data.canManage[h.agent_id] === true && canMutate(h.agent_id),
           })),
         );
       const own = data.rows
@@ -249,7 +258,7 @@ export function MySkillsTab({ filter }: { filter: string }) {
           enabled: r.enabled !== false,
           use_count: r.use_count ?? 0,
           last_used_at: r.last_used_at,
-          can_manage: data.canManage[r.agent_id as string] === true,
+          can_manage: grantsReady && data.canManage[r.agent_id as string] === true && canMutate(r.agent_id as string),
         }));
       const collator = collatorFor(intl.locale);
       return [...own, ...fromGlobal].sort(
@@ -258,7 +267,7 @@ export function MySkillsTab({ filter }: { filter: string }) {
           (a.agent_id < b.agent_id ? -1 : a.agent_id > b.agent_id ? 1 : 0),
       );
     },
-    [data.rows, data.canManage, displayNameOf, intl.locale],
+    [data.rows, data.canManage, displayNameOf, intl.locale, grantsReady, canMutate],
   );
 
   const selectedRows = useMemo(() => visible.filter((s) => selected.has(rowKey(s))), [visible, selected]);
@@ -393,6 +402,7 @@ export function MySkillsTab({ filter }: { filter: string }) {
                     owner={ownerOf(skill)}
                     shared={shareSuccess === key}
                     canManage={canManageRow(skill)}
+                    canShare={grantsReady && !!skill.agent_id && canMutate(skill.agent_id)}
                     selectable={isAdmin}
                     selected={selected.has(key)}
                     onSelect={(v) => toggleSelected(key, v)}
@@ -415,7 +425,7 @@ export function MySkillsTab({ filter }: { filter: string }) {
           skillName={usageFor.display_name || usageFor.name}
           description={usageFor.description}
           holders={holdersOf(usageFor)}
-          busy={actions.busy}
+          busy={actions.busy || !grantsReady}
           onToggle={(agentId, on) =>
             void actions.setEnabled([{ agent_id: agentId, skill_name: usageFor.name }], on)
           }
@@ -426,7 +436,7 @@ export function MySkillsTab({ filter }: { filter: string }) {
         <RemoveSkillsDialog
           targets={removeTargets}
           nameOf={displayNameOf}
-          busy={actions.busy}
+          busy={actions.busy || !grantsReady}
           onConfirm={() => void actions.remove(removeTargets).then(() => {
             setRemoveTargets(null);
             afterBulk();

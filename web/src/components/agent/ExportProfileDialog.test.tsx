@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { api } from '@/lib/api';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '@/test/render';
@@ -7,6 +8,10 @@ import en from '@/i18n/en.json';
 vi.mock('@/lib/ws-client', () => ({ client: { call: vi.fn(), subscribe: vi.fn() } }));
 import { client } from '@/lib/ws-client';
 import { ExportProfileDialog } from './ExportProfileDialog';
+
+beforeEach(() => {
+  vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [], unrestricted: true, default_agent: null });
+});
 
 afterEach(() => vi.mocked(client.call).mockReset());
 

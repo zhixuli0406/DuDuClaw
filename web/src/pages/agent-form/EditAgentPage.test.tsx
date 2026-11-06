@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { setStandardProductPolicyFixture } from '@/test/product-policy';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
@@ -607,3 +608,5 @@ it('does not load settings for an AI employee accessed through a team member', (
   expect(screen.getByRole('note')).toHaveTextContent('Memory and settings require direct access');
   expect(mockWsClient.call.mock.calls.every(([method]) => method === 'agents.callable')).toBe(true);
 });
+
+beforeEach(() => setConfirmedCallableAgents(true));

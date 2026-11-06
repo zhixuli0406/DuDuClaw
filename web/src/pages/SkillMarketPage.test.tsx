@@ -1,6 +1,6 @@
 import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
@@ -241,3 +241,41 @@ import { useAuthStore } from '@/stores/auth-store';
 
 // Start these component scenarios after the gateway confirmed the admin roster.
 beforeEach(() => setConfirmedCallableAgents(true));
+
+import { api } from '@/lib/api';
+import { useAgentsStore } from '@/stores/agents-store';
+import { canSelectAgent, callableSubject, useCallableAgentsStore } from '@/stores/callable-agents-store';
+
+it('clears a revoked installation scope and does not submit an approval request', async () => {
+  const user = userEvent.setup();
+  useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never,
+    bindings: [{ agent_name: 'agnes', access_level: 'owner' }] as never });
+  useAgentsStore.setState({ agents: [{ name: 'agnes', display_name: 'Agnes' }] as never, fetchAgents: vi.fn() });
+  vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [{ name: 'agnes', display_name: 'Agnes', via: 'binding', selectable: true }], unrestricted: false, default_agent: null } as never);
+  vi.spyOn(api.skillMarket, 'search').mockResolvedValue({ skills: [{ name: 'Test skill', url: 'https://example.com/skill', tags: [] }], total_indexed: 1 } as never);
+  vi.spyOn(api.skills, 'vet').mockResolvedValue({ passed: true, content: 'safe', vet_result: { score: 100, findings: [] } } as never);
+  const request = vi.spyOn(api.skills, 'installRequest').mockResolvedValue({ stage: 'awaiting_admin' } as never);
+  renderWithProviders(<SkillMarketPage />);
+  await user.click(screen.getByText('security'));
+  await user.click(await screen.findByRole('button', { name: 'Install' }));
+  const dialog = await screen.findByRole('dialog');
+  await user.click(within(dialog).getByRole('combobox'));
+  await user.click(await screen.findByRole('option', { name: 'Agent: Agnes' }));
+  await waitFor(() => expect(within(dialog).getByRole('combobox')).toHaveTextContent('Agent: Agnes'));
+  await user.click(within(dialog).getByRole('button', { name: 'Run Security Scan' }));
+  const submit = within(dialog).getByRole('button', { name: 'Submit for approval' });
+  await waitFor(() => expect(submit).toBeEnabled());
+  vi.mocked(api.agents.callable).mockResolvedValue({ agents: [], unrestricted: false, default_agent: null });
+  act(() => {
+    const key = JSON.stringify([callableSubject(), null]);
+    useCallableAgentsStore.setState({ entries: { [key]: { agents: [], unrestricted: false, loading: false, confirmedAt: Date.now() + 1 } } });
+    fireEvent.click(submit);
+  });
+  expect(request).not.toHaveBeenCalled();
+  await waitFor(() => expect({
+    scope: within(dialog).getByRole('combobox').textContent,
+    allowed: canSelectAgent('agnes'),
+    disabled: screen.getByRole<HTMLButtonElement>('button', { name: 'Submit for approval' }).disabled,
+  }).toEqual({ scope: 'Install Scope', allowed: false, disabled: true }));
+  expect(within(dialog).getByRole('combobox')).not.toHaveTextContent('Agnes');
+});
