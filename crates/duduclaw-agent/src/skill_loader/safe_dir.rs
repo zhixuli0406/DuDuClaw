@@ -34,11 +34,33 @@ mod imp {
         { Err(io::Error::new(io::ErrorKind::Unsupported, "directory enumeration errno unavailable")) }
     }
 
+    #[cfg(target_os = "macos")]
+    fn macos_system_path(path: &Path) -> io::Result<std::borrow::Cow<'_, Path>> {
+        for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp"), ("/etc", "/private/etc")] {
+            if let Ok(tail) = path.strip_prefix(alias) {
+                let metadata = std::fs::symlink_metadata(alias)?;
+                if metadata.file_type().is_symlink() && metadata.uid() == 0
+                    && Path::new("/").join(std::fs::read_link(alias)?) == Path::new(target) {
+                    return Ok(std::borrow::Cow::Owned(Path::new(target).join(tail)));
+                }
+                break;
+            }
+        }
+        Ok(std::borrow::Cow::Borrowed(path))
+    }
+
     impl SafeDir {
         pub fn open(path: &Path) -> io::Result<Self> {
             if !path.is_absolute() {
                 return Err(refused("absolute directory required"));
             }
+            // macOS exposes system directories through root-owned aliases.
+            // Resolve only that fixed prefix, never an untrusted layer or
+            // ancestor. The target and the entire suffix still use O_NOFOLLOW.
+            #[cfg(target_os = "macos")]
+            let system_path = macos_system_path(path)?;
+            #[cfg(target_os = "macos")]
+            let path = system_path.as_ref();
             let mut dir = Self(File::open("/")?);
             for component in path.components() {
                 match component {
@@ -362,6 +384,31 @@ pub use imp::SafeDir;
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_system_aliases_keep_the_suffix_nofollow() {
+        use std::os::unix::fs::MetadataExt;
+        for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp"), ("/etc", "/private/etc")] {
+            let actual = SafeDir::open(Path::new(alias)).unwrap().metadata().unwrap();
+            let expected = SafeDir::open(Path::new(target)).unwrap().metadata().unwrap();
+            assert_eq!((actual.dev(), actual.ino()), (expected.dev(), expected.ino()));
+        }
+        // Exercise both temp-dir spellings without canonicalizing the fixture.
+        for parent in [std::env::temp_dir(), std::path::PathBuf::from("/tmp")] {
+            let temp = tempfile::tempdir_in(parent).unwrap();
+            let root = temp.path();
+            let dir = SafeDir::open(root).unwrap().mkdir_child("real", 0o700).unwrap();
+            dir.mkdir_child("nested", 0o700).unwrap();
+            dir.create_new("SKILL.md", 0o600).unwrap();
+            assert!(SafeDir::open(&root.join("real")).unwrap().read_file("SKILL.md").is_ok());
+            symlink("real", root.join("skills")).unwrap();
+            assert!(SafeDir::open(&root.join("skills")).is_err());
+            assert!(SafeDir::open(&root.join("skills/nested")).is_err());
+            symlink("real/SKILL.md", root.join("linked.md")).unwrap();
+            assert!(SafeDir::open(root).unwrap().read_file("linked.md").is_err());
+        }
+    }
+
     #[test]
     fn layer_roots_and_ancestors_refuse_symlinks() {
         let temp = tempfile::tempdir().unwrap();
