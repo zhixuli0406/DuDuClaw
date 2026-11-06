@@ -275,3 +275,44 @@ fn readonly_target_failure_cleans_up_the_temporary_file() {
     perms.set_readonly(false);
     std::fs::set_permissions(temp.path().join("readonly"), perms).unwrap();
 }
+
+#[tokio::test]
+async fn attachment_callers_save_and_open_with_windows_nofollow_handles() {
+    for agent in [None, Some("sales")] {
+        let home = private_test_home().unwrap();
+        let base = match agent {
+            Some(agent) => crate::media::agent_attachment_base(home.path(), agent),
+            None => home.path().to_path_buf(),
+        };
+        // Exercise the filesystem contract independently of the security DB,
+        // whose Windows implementation still deliberately fails closed.
+        let path = crate::media::save_attachment_in_base_untracked(&base, b"private", "交付.txt").await.unwrap();
+        assert_eq!(path.parent(), Some(base.join("attachments").as_path()));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let file = crate::files_api::open_attachment(home.path(), agent, name).unwrap();
+        assert_eq!(crate::chat_attachments::snapshot(file, 100).unwrap().0, b"private");
+        std::fs::hard_link(&path, path.with_file_name("alias.txt")).unwrap();
+        assert!(crate::files_api::open_attachment(home.path(), agent, name).is_err());
+        assert!(crate::files_api::open_attachment(home.path(), agent, "alias.txt").is_err());
+    }
+}
+
+#[tokio::test]
+async fn attachment_callers_refuse_junctions_without_outside_access() {
+    for part in ["agents", "agents/sales", "agents/sales/attachments"] {
+        let home = private_test_home().unwrap();
+        let outside = private_test_home().unwrap();
+        std::fs::write(outside.path().join("victim.txt"), b"secret").unwrap();
+        let junction = home.path().join(part);
+        std::fs::create_dir_all(junction.parent().unwrap()).unwrap();
+        let output = std::process::Command::new("cmd").args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction).arg(outside.path()).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(crate::media::save_attachment_in_base_untracked(&home.path().join("agents/sales"),
+            b"bad", "new.txt").await.is_err());
+        assert!(crate::files_api::open_attachment(home.path(), Some("sales"), "victim.txt").is_err());
+        assert_eq!(std::fs::read(outside.path().join("victim.txt")).unwrap(), b"secret");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+        std::fs::remove_dir(&junction).unwrap();
+    }
+}

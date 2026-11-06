@@ -2,12 +2,20 @@
 //! layers. SQLite opens by pathname (including later journals), so every
 //! ancestor must prevent another uid from replacing the next path component.
 use std::path::Path;
-use rusqlite::Connection;
+#[cfg(not(windows))]
+pub(crate) use rusqlite::Connection;
+#[cfg(windows)]
+#[path = "sqlite_windows.rs"]
+mod windows;
+#[cfg(windows)]
+pub(crate) use windows::Connection;
 
 pub(crate) fn open(home: &Path, name: &str) -> Result<Connection, String> {
     #[cfg(unix)]
     { open_with(home, name, || {}) }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    { windows::open(home, name) }
+    #[cfg(not(any(unix, windows)))]
     { let _ = (home, name); Err("secure database open unavailable".into()) }
 }
 
@@ -345,7 +353,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, not(any(unix, windows))))]
 #[test]
 fn private_sqlite_fails_closed_without_creating_database() {
     let home = crate::fs_safe::private_test_home().unwrap();

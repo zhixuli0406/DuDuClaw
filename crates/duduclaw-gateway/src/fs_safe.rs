@@ -622,7 +622,15 @@ mod imp {
 
         pub(crate) fn metadata(&self) -> io::Result<Metadata> { self.dir.metadata() }
 
+        pub(super) fn directory_file(&self) -> &File { &self.dir }
+
         fn relative(&self, value: &str, access: u32, disposition: u32, options: u32) -> io::Result<File> {
+            self.relative_secure(value, access, disposition, options, None)
+        }
+
+        // The descriptor is borrowed only for this synchronous NtCreateFile call.
+        pub(super) fn relative_secure(&self, value: &str, access: u32, disposition: u32,
+            options: u32, security: Option<&windows_sys::Win32::Security::SECURITY_DESCRIPTOR>) -> io::Result<File> {
             check_name(value)?;
             real_file(&self.dir, true, false)?;
             let mut wide: Vec<u16> = value.encode_utf16().collect();
@@ -634,7 +642,7 @@ mod imp {
                 // entry() must inspect the final reparse point itself. Typed opens
                 // also use OBJ_DONT_REPARSE, as in skill_loader::safe_dir.
                 Attributes: 0x40 | if options == 0 { 0 } else { 0x1000 },
-                SecurityDescriptor: std::ptr::null(), SecurityQualityOfService: std::ptr::null(),
+                SecurityDescriptor: security.map_or(std::ptr::null(), |sd| std::ptr::from_ref(sd).cast()), SecurityQualityOfService: std::ptr::null(),
             };
             let mut handle = std::ptr::null_mut();
             let mut status_block = std::mem::MaybeUninit::<IO_STATUS_BLOCK>::zeroed();
