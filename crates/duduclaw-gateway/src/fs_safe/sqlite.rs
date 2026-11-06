@@ -10,6 +10,21 @@ mod windows;
 #[cfg(windows)]
 pub(crate) use windows::Connection;
 
+// Windows databases and SQLite sidecars live below this protected DACL
+// boundary, so later changes to the home's inherited ACL cannot expose them.
+#[cfg(windows)]
+pub(super) const PRIVATE_DIRECTORY: &str = "secure-db";
+
+/// Resolve the platform layout for diagnostics and cross-crate tests only.
+/// This does not validate the path or replace the secure open operation.
+#[doc(hidden)]
+pub fn database_path(home: &Path, name: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    { home.join(PRIVATE_DIRECTORY).join(name) }
+    #[cfg(not(windows))]
+    { home.join(name) }
+}
+
 pub(crate) fn open(home: &Path, name: &str) -> Result<Connection, String> {
     #[cfg(unix)]
     { open_with(home, name, || {}) }

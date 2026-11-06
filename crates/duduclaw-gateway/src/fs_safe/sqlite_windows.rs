@@ -51,8 +51,8 @@ fn token_information(class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<usize>> {
 fn user_sid(user: &[usize]) -> PSID { unsafe { (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid } }
 struct SecurityDescriptor {
     descriptor: SECURITY_DESCRIPTOR,
-    // The absolute descriptor borrows its DACL from this allocation.
-    _dacl: LocalAllocation,
+    // Own both the DACL and the copied TokenUser owner SID referenced above.
+    _security: LocalAllocation,
 }
 #[cfg(test)]
 impl SecurityDescriptor {
@@ -70,7 +70,7 @@ fn descriptor(user: &[usize], directory: bool) -> io::Result<SecurityDescriptor>
     drop(allocation);
     // Directory ACEs also protect newly created temp files before they contain data.
     let flags = if directory { "OICI" } else { "" };
-    let sddl: Vec<u16> = format!("D:P(A;{flags};FA;;;{sid})(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)")
+    let sddl: Vec<u16> = format!("O:{sid}D:P(A;{flags};FA;;;{sid})(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)")
         .encode_utf16().chain(Some(0)).collect();
     let mut security = null_mut();
     if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut security, null_mut()) } == 0 {
@@ -84,17 +84,22 @@ fn descriptor(user: &[usize], directory: bool) -> io::Result<SecurityDescriptor>
         return Err(io::Error::last_os_error());
     }
     if present == 0 || acl.is_null() { return Err(denied()); }
+    let mut owner = null_mut();
+    if unsafe { GetSecurityDescriptorOwner(security, &mut owner, &mut defaulted) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if owner.is_null() { return Err(denied()); }
     let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
     let raw = std::ptr::addr_of_mut!(descriptor).cast();
     if unsafe { InitializeSecurityDescriptor(raw, 1) } == 0 { return Err(io::Error::last_os_error()); }
     // Explicit TokenUser ownership also works with elevated tokens whose default
     // owner is Administrators. Any failure (including ERROR_INVALID_OWNER) is fatal.
-    if unsafe { SetSecurityDescriptorOwner(raw, user_sid(user), 0) } == 0 { return Err(io::Error::last_os_error()); }
+    if unsafe { SetSecurityDescriptorOwner(raw, owner, 0) } == 0 { return Err(io::Error::last_os_error()); }
     if unsafe { SetSecurityDescriptorDacl(raw, 1, acl, 0) } == 0 { return Err(io::Error::last_os_error()); }
     if unsafe { SetSecurityDescriptorControl(raw, SE_DACL_PROTECTED, SE_DACL_PROTECTED) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(SecurityDescriptor { descriptor, _dacl: allocation })
+    Ok(SecurityDescriptor { descriptor, _security: allocation })
 }
 fn validate_entry(file: &File, directory: bool) -> io::Result<()> {
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -161,7 +166,8 @@ fn validate_security(file: &File, user: &[usize], require_protected: bool) -> io
     // DACL for new journals, which we have not authorized.
     if directory && !file_inherits_acl { return Err(denied()); }
     if !acl_allowed(sid_bytes(owner)?, sid_bytes(user_sid(user))?,
-        !require_protected || control & SE_DACL_PROTECTED != 0, require_protected, aces) { return Err(denied()); }
+        !require_protected || control & SE_DACL_PROTECTED != 0,
+        require_protected && !directory, aces) { return Err(denied()); }
     Ok(())
 }
 
@@ -225,18 +231,20 @@ fn open_inner(home: &Path, name: &str) -> io::Result<Connection> {
     // Never canonicalize an untrusted home: walk every component no-follow.
     let directory = SafeDir::open_nofollow(&home, false)?;
     let user = token_information(TokenUser)?;
-    // The parent protects future journal names as well as their inherited ACLs.
-    // Directories and SQLite-created journals may have an elevated token's
-    // default SYSTEM/Administrators owner; the main DB always requires TokenUser.
-    // Do not rewrite an existing directory's owner or permissions.
-    validate_security(directory.directory_file(), &user, false)?;
+    // Home may inherit public read grants. The protected child blocks future
+    // inheritance changes from home or its ancestors, including for sidecars
+    // SQLite creates after this open. Never repair an existing child's ACL.
+    let security = descriptor(&user, true)?;
+    let directory = directory.child_dir_secure(super::PRIVATE_DIRECTORY, &security.descriptor)?;
+    validate_entry(directory.directory_file(), true)?;
+    validate_security(directory.directory_file(), &user, true)?;
     let security = descriptor(&user, false)?;
     let file = directory.relative_secure(name, FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL,
         FILE_OPEN_IF, FILE_NON_DIRECTORY_FILE, Some(&security.descriptor))?;
     validate_entry(&file, false)?;
     validate_security(&file, &user, true)?;
     verify_journals(&directory, name, &user)?;
-    let path = home.join(name);
+    let path = super::database_path(&home, name);
     let connection = rusqlite::Connection::open_with_flags(&path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
         .map_err(|_| denied())?;

@@ -30,6 +30,106 @@ fn dacl(file: &File) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), (*acl).AclSize as usize).to_vec() }
 }
 
+fn directory_acl_handle(path: &Path) -> File {
+    OpenOptions::new().access_mode(READ_CONTROL | WRITE_DAC)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path).unwrap()
+}
+
+fn add_inheritable_users_read(file: &File) {
+    let mut acl = null_mut();
+    let mut security = null_mut();
+    check(unsafe { GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+        null_mut(), null_mut(), &mut acl, null_mut(), &mut security) }).unwrap();
+    let _security = LocalAllocation(security);
+    let mut users = [0u32; 17];
+    let mut size = std::mem::size_of_val(&users) as u32;
+    assert_ne!(unsafe { CreateWellKnownSid(WinBuiltinUsersSid, null_mut(), users.as_mut_ptr().cast(), &mut size) }, 0);
+    let grant = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_GENERIC_READ, grfAccessMode: GRANT_ACCESS,
+        grfInheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        Trustee: TRUSTEE_W { pMultipleTrustee: null_mut(), MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID, TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+            ptstrName: users.as_mut_ptr().cast() },
+    };
+    let mut expanded = null_mut();
+    check(unsafe { SetEntriesInAclW(1, &grant, acl, &mut expanded) }).unwrap();
+    let _expanded = LocalAllocation(expanded.cast());
+    // SetSecurityInfo propagates this grant to existing unprotected children.
+    check(unsafe { SetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+        null_mut(), null_mut(), expanded, null_mut()) }).unwrap();
+}
+
+#[test]
+fn private_sqlite_blocks_late_home_acl_inheritance_for_database_and_sidecars() {
+    for wal in [false, true] {
+        let home = home();
+        let db = open(home.path(), "state.db").unwrap();
+        db.execute_batch("CREATE TABLE example(value)").unwrap();
+        let user = token_information(TokenUser).unwrap();
+        let private = db._directory.directory_file();
+        let before_acl = dacl(private);
+        // This sibling proves the ACL update really propagated, rather than
+        // passing only because open handles prevented all propagation.
+        let control = home.path().join("inheritance-control");
+        std::fs::create_dir(&control).unwrap();
+        validate_security(&directory_acl_handle(&control), &user, false).unwrap();
+        add_inheritable_users_read(&directory_acl_handle(home.path()));
+        assert!(validate_security(&directory_acl_handle(&control), &user, false).is_err());
+        assert_eq!(dacl(private), before_acl);
+        validate_security(private, &user, true).unwrap();
+        if wal { db.execute_batch("PRAGMA journal_mode=WAL").unwrap(); }
+        db.execute_batch("BEGIN IMMEDIATE; INSERT INTO example VALUES(1)").unwrap();
+        for suffix in if wal { vec!["", "-wal", "-shm"] } else { vec!["", "-journal"] } {
+            let file = db._directory.open_read_checked(&format!("state.db{suffix}"), true)
+                .unwrap().expect("write transaction must create the sidecar");
+            validate_entry(&file, false).unwrap();
+            validate_security(&file, &user, suffix.is_empty()).unwrap();
+        }
+        db.execute_batch("COMMIT").unwrap();
+    }
+}
+
+#[test]
+fn private_sqlite_accepts_home_with_inheritable_users_read() {
+    let home = home();
+    let home_handle = directory_acl_handle(home.path());
+    add_inheritable_users_read(&home_handle);
+    let before_acl = dacl(&home_handle);
+    let db = open(home.path(), "state.db").unwrap();
+    db.execute_batch("CREATE TABLE example(value); INSERT INTO example VALUES(1)").unwrap();
+    validate_security(db._directory.directory_file(), &token_information(TokenUser).unwrap(), true).unwrap();
+    assert_eq!(dacl(&home_handle), before_acl);
+}
+
+#[test]
+fn private_sqlite_refuses_unprotected_directory_without_repair() {
+    let home = home();
+    let path = home.path().join(super::super::PRIVATE_DIRECTORY);
+    std::fs::create_dir(&path).unwrap();
+    let file = directory_acl_handle(&path);
+    let user = token_information(TokenUser).unwrap();
+    // The inherited ACL is otherwise trusted; only protection is missing.
+    validate_security(&file, &user, false).unwrap();
+    assert!(validate_security(&file, &user, true).is_err());
+    let before_acl = dacl(&file);
+    assert!(open(home.path(), "state.db").is_err());
+    assert_eq!(dacl(&file), before_acl);
+    assert!(validate_security(&file, &user, true).is_err());
+    assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
+}
+
+#[test]
+fn private_sqlite_refuses_secure_directory_junction() {
+    let home = home();
+    let outside = crate::fs_safe::private_test_home().unwrap();
+    let path = home.path().join(super::super::PRIVATE_DIRECTORY);
+    junction(outside.path(), &path);
+    assert!(open(home.path(), "state.db").is_err());
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    std::fs::remove_dir(&path).unwrap();
+}
+
 #[test]
 fn private_sqlite_creates_private_database_and_reopens() {
     // Exercise the real inherited temp ACL, including elevated default owners.
@@ -83,8 +183,9 @@ fn private_sqlite_refuses_ancestor_and_database_junctions() {
     assert!(open(&alias, "state.db").is_err());
     assert!(!outside.join("state.db").exists());
     std::fs::remove_dir(&alias).unwrap();
+    drop(open(home.path(), "prepare.db").unwrap());
     for suffix in ["", "-journal", "-wal", "-shm"] {
-        let entry = home.path().join(format!("state.db{suffix}"));
+        let entry = super::super::database_path(home.path(), &format!("state.db{suffix}"));
         junction(&outside, &entry);
         assert!(open(home.path(), "state.db").is_err(), "{suffix}");
         std::fs::remove_dir(entry).unwrap();
@@ -96,7 +197,7 @@ fn private_sqlite_refuses_ancestor_and_database_junctions() {
 fn private_sqlite_refuses_hardlinked_database() {
     let home = home();
     drop(open(home.path(), "state.db").unwrap());
-    let path = home.path().join("state.db");
+    let path = super::super::database_path(home.path(), "state.db");
     let before = std::fs::read(&path).unwrap();
     std::fs::hard_link(&path, home.path().join("alias")).unwrap();
     assert!(open(home.path(), "state.db").is_err());
@@ -107,7 +208,7 @@ fn private_sqlite_refuses_hardlinked_database() {
 fn private_sqlite_refuses_extra_ace_without_repairing_it() {
     let home = home();
     drop(open(home.path(), "state.db").unwrap());
-    let path = home.path().join("state.db");
+    let path = super::super::database_path(home.path(), "state.db");
     let file = OpenOptions::new().access_mode(READ_CONTROL | WRITE_DAC)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(&path).unwrap();
     let user = token_information(TokenUser).unwrap();
@@ -146,11 +247,12 @@ fn private_sqlite_pins_database_and_ancestor_chain_until_close() {
     let home = ancestor.join("home");
     std::fs::create_dir_all(&home).unwrap();
     let db = open(&home, "state.db").unwrap();
-    assert!(std::fs::rename(home.join("state.db"), home.join("moved.db")).is_err());
+    assert!(std::fs::rename(super::super::database_path(&home, "state.db"), home.join("moved.db")).is_err());
+    assert!(std::fs::rename(home.join(super::super::PRIVATE_DIRECTORY), home.join("moved-secure-db")).is_err());
     assert!(std::fs::rename(&home, ancestor.join("moved")).is_err());
     assert!(std::fs::rename(&ancestor, root.path().join("moved")).is_err());
     drop(db);
-    std::fs::rename(home.join("state.db"), home.join("moved.db")).unwrap();
+    std::fs::rename(super::super::database_path(&home, "state.db"), home.join("moved.db")).unwrap();
     std::fs::rename(&ancestor, root.path().join("moved")).unwrap();
 }
 
@@ -180,20 +282,3 @@ fn private_sqlite_acl_policy_rejects_foreign_owner_and_unprotected_database() {
     assert!(!acl_allowed(user, user, true, true, [(0, b"foreign".as_slice())]));
 }
 
-#[test]
-fn private_sqlite_refuses_public_home_without_changing_acl() {
-    let home = home();
-    let file = OpenOptions::new().access_mode(READ_CONTROL | WRITE_DAC)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(home.path()).unwrap();
-    let text: Vec<u16> = "D:P(A;OICI;FA;;;WD)".encode_utf16().chain(Some(0)).collect();
-    let mut raw = null_mut();
-    assert_ne!(unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        text.as_ptr(), 1, &mut raw, null_mut()) }, 0);
-    let _security = LocalAllocation(raw);
-    set_acl(&file, raw);
-    let before = dacl(&file);
-    assert!(open(home.path(), "state.db").is_err());
-    assert!(!home.path().join("state.db").exists());
-    assert_eq!(dacl(&file), before);
-}

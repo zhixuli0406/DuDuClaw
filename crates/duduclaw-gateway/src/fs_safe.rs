@@ -620,6 +620,7 @@ mod imp {
             Ok(dir)
         }
 
+        #[cfg(test)]
         pub(crate) fn metadata(&self) -> io::Result<Metadata> { self.dir.metadata() }
 
         pub(super) fn directory_file(&self) -> &File { &self.dir }
@@ -678,10 +679,21 @@ mod imp {
                 Err(e) if !create && e.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e),
             };
+            self.pinned_child(file).map(Some)
+        }
+
+        pub(super) fn child_dir_secure(&self, name: &str,
+            security: &windows_sys::Win32::Security::SECURITY_DESCRIPTOR) -> io::Result<Self> {
+            let file = self.relative_secure(name, FILE_GENERIC_READ, FILE_OPEN_IF,
+                FILE_DIRECTORY_FILE, Some(security))?;
+            self.pinned_child(file)
+        }
+
+        fn pinned_child(&self, file: File) -> io::Result<Self> {
             real_file(&file, true, false)?;
             let mut ancestors = self.ancestors.clone();
             ancestors.push(self.dir.clone());
-            Ok(Some(Self { dir: Arc::new(file), ancestors, enumeration: Mutex::new(()) }))
+            Ok(Self { dir: Arc::new(file), ancestors, enumeration: Mutex::new(()) })
         }
 
         pub(crate) fn open_read_checked(&self, name: &str, single_link: bool) -> io::Result<Option<File>> {
