@@ -11242,6 +11242,9 @@ mod planned_scaffold_tests {
             soul_body: Some("Approved persona".into()),
         };
         let mut files = super::scaffold_agent_files(&scaffold).unwrap();
+        let config: toml::Table = std::str::from_utf8(&files["agent.toml"]).unwrap().parse().unwrap();
+        assert_eq!(config["evolution"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["evolution"]["gvu_enabled"].as_bool(), Some(true));
         assert!(!files.keys().any(|name| name.starts_with("SKILLS/")));
         for (name, content) in [("IDENTITY.md", "Approved identity"), ("USER.md", "User data"),
             ("INSTRUCTIONS.md", "Approved rules"), ("CONTRACT.toml", "[boundaries]\nmust_not = ['refund']\n")] {
@@ -15367,6 +15370,8 @@ allowed_channels = ["*"]
 permissions_enforced_since = "1.68.0"
 
 [evolution]
+enabled = true
+gvu_enabled = true
 skill_auto_activate = false
 skill_security_scan = true
 "#

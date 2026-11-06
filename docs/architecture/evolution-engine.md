@@ -661,7 +661,7 @@ Location: `crates/duduclaw-security/src/soul_guard.rs`
 [evolution]
 skill_auto_activate = true
 skill_security_scan = true
-gvu_enabled = true                 # Enable the GVU self-play loop (default false, opt-in — see guides/evolution-switches.md)
+gvu_enabled = true                 # Enable the GVU self-play loop (default true; set false to opt out — see guides/evolution-switches.md)
 gvu_cooldown_minutes = 60          # Per-agent GVU run cooldown, covers all trigger paths (default 60 minutes)
 max_silence_hours = 12.0           # Silence-breaker threshold
 max_gvu_generations = 3            # Maximum GVU attempt rounds

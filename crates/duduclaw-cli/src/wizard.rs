@@ -879,9 +879,8 @@ malicious_key = "pwned"#;
 
     /// K2 (2026-09-29): a scaffolded agent evolves from day one.
     ///
-    /// The key must be written **explicitly** — an absent key still reads as
-    /// `false` at the runtime gate (`gvu::trigger::agent_gvu_enabled`), so
-    /// "the default is on" has to be visible in the file, not implied.
+    /// The key is written explicitly so the default is visible in the file.
+    /// Valid files with an absent key also default to on since 2026-11-06.
     #[test]
     fn generated_agent_toml_ships_evolution_enabled() {
         let out = generate_agent_toml("acme", "Acme Co", "LINE", &[]);

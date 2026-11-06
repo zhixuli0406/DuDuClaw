@@ -227,6 +227,7 @@ impl MethodHandler {
             // readonly_project / additional_mounts`).
             [evolution]
             enabled = true
+            gvu_enabled = true
         };
 
         // Optional `[runtime]` (provider/fallback) from the create params — lets

@@ -136,3 +136,17 @@ async fn allows_non_colliding_name() {
     );
     assert!(home.path().join("agents").join("brand-new-agent").exists());
 }
+
+#[tokio::test]
+async fn agents_create_evolution_is_explicitly_enabled() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let frame = handler.handle_agents_create(json!({ "name": "learner", "display_name": "Learner" })).await;
+    assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+    let dir = home.path().join("agents/learner");
+    let raw = std::fs::read_to_string(dir.join("agent.toml")).unwrap();
+    let config: toml::Table = raw.parse().unwrap();
+    assert_eq!(config["evolution"]["enabled"].as_bool(), Some(true));
+    assert_eq!(config["evolution"]["gvu_enabled"].as_bool(), Some(true));
+    assert!(crate::gvu::trigger::agent_gvu_enabled(&dir));
+}
