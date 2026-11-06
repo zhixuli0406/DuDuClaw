@@ -1,7 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeActions, parseActions, partialRead, reconcileUnblocks } from './permissions';
+import { normalizeActions, parseActions, partialRead, reconcileUnblocks, serializeRules } from './permissions';
 
 describe('Odoo permission storage', () => {
+  it('round trips button grants separately from other methods', () => {
+    const entries = ['action', 'action:sale.order', 'execute', 'execute:sale.order'];
+    const { rules, other } = parseActions(entries);
+    expect(rules).toEqual([
+      { model: '', verbs: ['action', 'execute'] },
+      { model: 'sale.order', verbs: ['action', 'execute'] },
+    ]);
+    expect(other).toEqual([]);
+    const serialized = serializeRules(rules, other);
+    expect(serialized).toEqual(['action', 'execute', 'action:sale.order', 'execute:sale.order']);
+    expect(parseActions(serialized)).toEqual({ rules, other });
+    expect(normalizeActions(entries)).toEqual(serialized);
+    expect(parseActions(['action:', 'action:bad/model', 'action:sale.order:extra']).other).toHaveLength(3);
+  });
   it('groups bare and model actions without losing unknown tokens', () => {
     const parsed = parseActions(['read', 'write:crm.lead', 'search:crm.lead', 'read:crm.lead', 'future:x', 'read:bad/model', 'read:', '', ' read']);
     expect(parsed.rules).toEqual([{ model: '', verbs: ['read'] }, { model: 'crm.lead', verbs: ['write', 'search', 'read'] }]);
@@ -23,7 +37,7 @@ describe('Odoo permission storage', () => {
   });
 });
 
-it('counts a legacy action:model in Other settings as a real table use', () => {
+it('counts a button action:model as a real table use', () => {
   const before = { allowed_models: ['hr.employee'], allowed_actions: ['action:hr.employee'], unblock_models: ['hr.employee'] };
   const next = { ...before, allowed_models: [] };
   expect(reconcileUnblocks(before, next, ['hr.employee'])).toEqual(['hr.employee']);
@@ -38,6 +52,11 @@ describe('Odoo account action mapping', () => {
     expect(actionAccess(access, 'create')).toBe(false);
     expect(actionAccess(access, 'write')).toBeNull();
     expect(actionAccess(access, 'unlink')).toBe(false);
+    expect(actionAccess(access, 'action')).toBeNull();
+    expect(actionAccess({ ...access, write: false }, 'action')).toBe(false);
+    expect(actionAccess({ ...access, write: true }, 'action')).toBe(true);
+    expect(actionAccess(undefined, 'action')).toBeNull();
+    expect(actionAccess(null, 'action')).toBeNull();
     expect(actionAccess(access, 'execute')).toBeNull();
     expect(actionAccess({ ...access, write: false }, 'execute')).toBe(false);
     expect(actionAccess({ ...access, write: true }, 'execute')).toBe(true);

@@ -27,9 +27,9 @@ describe('<WifiPasswordRequestCard> — T1 secure password hand-off', () => {
     // Default: no matching network found — the security-hint enrichment is
     // best-effort and must never block or alter the base render.
     vi.spyOn(api.network, 'wifiScan').mockResolvedValue({ networks: [], scanning: false });
-    sendMock = vi.fn<(text: string, attachments?: readonly PendingAttachment[]) => boolean>();
-    // `send()` is a no-op without a live WebSocket (`wsRef` stays null in a
-    // unit test), so the real implementation can never be exercised here —
+    sendMock = vi.fn<(text: string, attachments?: readonly PendingAttachment[]) => boolean>().mockReturnValue(true);
+    // `send()` refuses without a live WebSocket (`wsRef` stays null in a
+    // unit test), so observe calls through a mock here —
     // replace it via zustand's own `setState` (not a property mutation)
     // so the component's `useChatStore((s) => s.send)` selector picks up
     // the replacement on its next read.

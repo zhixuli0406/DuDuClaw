@@ -78,7 +78,7 @@ export function MessageBubble({
         {isUser && message.deliveryError && (
           <div className="mt-2 text-xs" role="status">
             {message.deliveryError}
-            {message.delivery === 'failed' && onRetry && <button type="button" className="ml-2 underline" onClick={onRetry}>
+            {message.delivery === 'failed' && !message.interrupted && onRetry && <button type="button" className="ml-2 underline" onClick={onRetry}>
               {intl.formatMessage({ id: 'webchat.resend' })}
             </button>}
           </div>

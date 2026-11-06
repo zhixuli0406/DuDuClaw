@@ -189,7 +189,7 @@ describe('streaming silence', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('keeps counting across disconnect and reconnect when the turn is gone', async () => {
+  it('ends streaming and reports an interrupted turn when reconnect cannot recover it', async () => {
     useAuthStore.setState({ jwt: 'test-token' });
     useChatStore.getState().send('question');
     renderWithProviders(<ChatWaitingNotice />);
@@ -199,8 +199,9 @@ describe('streaming silence', () => {
     act(() => FakeSocket.last.onopen?.());
     deliver({ type: 'session_info', session_id: 'webchat:reconnected', agent_name: 'DuDu' });
     await advance(20_000);
-    expect(useChatStore.getState().isStreaming).toBe(true);
-    expect(screen.getByRole('status')).toHaveTextContent('Waiting for 1 min');
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(useChatStore.getState().messages[0]).toMatchObject({ delivery: 'failed', interrupted: true, deliveryError: expect.any(String) });
+    expect(screen.getByRole('status')).toHaveTextContent('This message has no reply yet');
   });
 });
 

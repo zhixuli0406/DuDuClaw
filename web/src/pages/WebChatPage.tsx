@@ -100,6 +100,8 @@ function InteractiveWebChatPage() {
     supportsVision,
     model,
     connectionState,
+    reconnectExhausted,
+    reconnect,
     isRecording,
     ttsEnabled,
     setTtsEnabled,
@@ -573,10 +575,12 @@ function InteractiveWebChatPage() {
 
   // ── Conversation status dot ───────────────────────────────────────────────────
   const statusTone =
-    connectionState === 'connected' ? 'bg-success' : connectionState === 'connecting' ? 'bg-warning' : 'bg-muted-foreground';
+    connectionState === 'connected' ? 'bg-success' : connectionState !== 'disconnected' ? 'bg-warning' : 'bg-muted-foreground';
   const statusText =
     connectionState === 'connected'
       ? intl.formatMessage({ id: 'webchat.connected', defaultMessage: 'Connected' })
+      : connectionState === 'reconnecting'
+        ? intl.formatMessage({ id: 'webchat.reconnecting' })
       : connectionState === 'connecting'
         ? intl.formatMessage({ id: 'webchat.connecting', defaultMessage: 'Connecting…' })
         : intl.formatMessage({ id: 'webchat.disconnected', defaultMessage: 'Disconnected' });
@@ -716,6 +720,16 @@ function InteractiveWebChatPage() {
       {/* Composer — pinned to the bottom. */}
       <div className="shrink-0 border-t border-surface-border px-4 py-3">
         <div className="mx-auto max-w-3xl space-y-2">
+          {(connectionState === 'reconnecting' || connectionState === 'disconnected' || reconnectExhausted) && (
+            <div className="flex items-center justify-between gap-3 rounded-md border border-surface-border bg-secondary px-3 py-2 text-sm" role="status">
+              <span>{reconnectExhausted
+                ? intl.formatMessage({ id: 'webchat.reconnectExhausted' })
+                : `${statusText} ${intl.formatMessage({ id: 'webchat.draftKept' })}`}</span>
+              <Button variant="outline" size="sm" onClick={reconnect}>
+                {intl.formatMessage({ id: 'webchat.reconnect' })}
+              </Button>
+            </div>
+          )}
           {/* Capability + model + Talk Mode live state */}
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             {supportsVision ? (

@@ -961,7 +961,8 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     // Heartbeat: send ping every 30s, close if no pong in 60s
     let mut heartbeat_interval = tokio::time::interval(liveness::PING_INTERVAL);
     // B10: liveness counts every frame read and every finished turn (see
-    // `liveness`), not only pongs, which stay unread while a turn runs.
+    // `liveness`). Turns run independently, so this loop also reads pongs
+    // while a reply is in flight.
     let live = liveness::Liveness::new();
 
     let (out_tx, mut out_rx) = turns::outbound_channel();
@@ -2363,9 +2364,9 @@ mod tests {
 
     #[test]
     fn conv_bucket_id_is_distinct_per_conversation_and_owned() {
-        // Two conversations on the same connection compose distinct buckets, both
-        // still owned by (prefixed with) the connection's session id — so the
-        // resume-ownership guard (`starts_with("{session_id}#")`) accepts them.
+        // Two conversations compose distinct buckets. Resume ownership uses the
+        // authenticated owner tag, not the connection suffix, so the same
+        // owner can resume either bucket from a replacement connection.
         let connection = "webchat:webchat:127.0.0.1:00c7766f";
         let a = format!(
             "{connection}#conv:{}",
@@ -2376,8 +2377,9 @@ mod tests {
             sanitize_conv_nonce(Some("B2")).unwrap()
         );
         assert_ne!(a, b, "distinct conversations → distinct session buckets");
-        assert!(a.starts_with(&format!("{connection}#")));
-        assert!(b.starts_with(&format!("{connection}#")));
+        assert!(owns_webchat_session(&a, "127.0.0.1"));
+        assert!(owns_webchat_session(&b, "127.0.0.1"));
+        assert!(!owns_webchat_session(&a, "another-owner"));
         assert_eq!(
             a.split(':').next(),
             Some("webchat"),

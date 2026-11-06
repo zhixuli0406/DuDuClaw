@@ -34,6 +34,7 @@ beforeEach(() => {
     sessionId: null,
     sessionsRevision: 0,
     connectionState: 'connected' as never,
+    reconnectExhausted: false,
     agentName: 'DuDuClaw',
     agentIcon: '',
     resolvedAgent: undefined,
@@ -47,7 +48,7 @@ describe('WebChatPage', () => {
     useAuthStore.setState({ user: { id: 'employee-a', role: 'employee' } as never });
     // Changing accounts disconnects chat; seed the completed employee handshake.
     useChatStore.setState({ connectionState: 'connected', selectedAgentId: 'sales', resolvedAgent: { id: 'sales', name: 'Sales', icon: '' } });
-    const send = vi.spyOn(useChatStore.getState(), 'send').mockImplementation(() => true);
+    const send = vi.spyOn(useChatStore.getState(), 'send').mockReturnValue(true);
     const recent = vi.spyOn(api.skills, 'recent').mockResolvedValue({ skills: [
       { name: 'quote', display_name: 'Quote', description: 'Prepare a quote' },
       { name: 'pdf', display_name: 'PDF', description: 'Read a PDF' },
@@ -128,6 +129,7 @@ describe('WebChatPage', () => {
     renderWithProviders(<WebChatPage />);
     act(() => useChatStore.setState({
       connectionState: 'connected' as never,
+      reconnectExhausted: false,
       isStreaming: true,
       activeMessageId: 'turn-1',
       messages: [{ id: 'user-1', role: 'user', content: 'Hello', timestamp: Date.now(), turnId: 'turn-1', delivery: 'running' }],
@@ -531,5 +533,55 @@ it('drops a revoked prefilled mention before sending the handoff draft', async (
   await act(async () => resolve({ agents: [], unrestricted: false, default_agent: null }));
   await waitFor(() => expect(screen.getByRole('combobox')).toHaveValue(' prepare a quote'));
   expect(send).not.toHaveBeenCalled();
+  send.mockRestore();
+});
+
+it('shows the initial connecting status without a reconnect banner', () => {
+  useChatStore.setState({ connectionState: 'connecting' });
+  renderWithProviders(<WebChatPage />);
+  expect(screen.getByText('Connecting…')).toBeVisible();
+  expect(screen.queryByText(/Your draft is kept/)).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Reconnect' })).not.toBeInTheDocument();
+});
+
+it.each([
+  ['reconnecting', 'Reconnecting…'],
+  ['disconnected', 'Disconnected'],
+] as const)('shows %s beside the composer and keeps the unsent draft', (state, label) => {
+  renderWithProviders(<WebChatPage />);
+  const input = screen.getByRole('combobox');
+  fireEvent.change(input, { target: { value: 'unsent draft' } });
+  act(() => useChatStore.setState({ connectionState: state }));
+  expect(screen.getByText(`${label} Your draft is kept. You can send it when the connection returns.`)).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toBeVisible();
+  fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' });
+  expect(input).toHaveValue('unsent draft');
+});
+
+it('offers manual reconnect when automatic retries stop', () => {
+  const reconnect = vi.spyOn(useChatStore.getState(), 'reconnect').mockImplementation(() => {});
+  renderWithProviders(<WebChatPage />);
+  act(() => useChatStore.setState({ connectionState: 'disconnected', reconnectExhausted: true }));
+  expect(screen.getByText(/Automatic retries have stopped/)).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }));
+  expect(reconnect).toHaveBeenCalledTimes(1);
+  reconnect.mockRestore();
+});
+
+it('retains handed-over attachments when send reports a transport failure', async () => {
+  const send = vi.spyOn(useChatStore.getState(), 'send').mockReturnValue(false);
+  const attachmentsKey = stashChatAttachments([{ name: 'brief.txt', mime: 'text/plain', dataBase64: 'aGk=' }]);
+  render(
+    <IntlProvider messages={en} locale="en" defaultLocale="en">
+      <MemoryRouter initialEntries={[{ pathname: '/chat', state: { draft: 'keep this', attachmentsKey } }]}>
+        <WebChatPage />
+      </MemoryRouter>
+    </IntlProvider>,
+  );
+  const input = await screen.findByDisplayValue('keep this');
+  fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' });
+  expect(send).toHaveBeenCalledWith('keep this', [{ name: 'brief.txt', mime: 'text/plain', dataBase64: 'aGk=' }]);
+  expect(input).toHaveValue('keep this');
+  expect(screen.getByText('brief.txt')).toBeVisible();
   send.mockRestore();
 });

@@ -177,6 +177,8 @@ Odoo 升級或客製後，管理員可以在 Odoo 頁按「**重新掃描 Odoo �
 
 `allowed_models`、`allowed_actions` 空清單代表不增加員工限制。功能模組關閉、通用工具的內建封鎖清單、MCP scope／工具白名單及 Odoo 自己的 ACL 仍會拒絕。查 `res.partner` 這類預設封鎖模型的業務資料，需要管理員在儀表板選取標示「敏感」的資料表並確認，畫面才會自動加入 `unblock_models`；直接編輯設定檔時，只加入 `allowed_models` 不會解除封鎖。移除最後一個資料表選取或動作規則時，也會移除畫面管理的例外。「查詢與讀取」同時儲存 `read`、`search`；只有其中一個動詞的舊規則會標示「僅部分」，儲存時補齊。只要員工有覆寫設定，其中的 `unblock_models` 就取代全域值，即使它是空清單。專用 `odoo_partner_search` 維持固定的安全欄位範圍。
 
+動作編輯器提供 `read`／`search`（查詢與讀取）、`create`（新增）、`write`（修改）、`unlink`（刪除）、`action`（按鈕動作）及 `execute`（其他方法）。通用 `odoo_execute` 呼叫的按鈕動作涵蓋確認、驗證、封存等 `action_*`、`button_*`、`toggle_*` 方法，其餘方法使用 `execute`。所有資料表用 `action`，指定資料表用 `action:sale.order`。兩種方法都以修改權限作為提示，實際操作仍由 Odoo 檢查。
+
 DuDuClaw 的拒絕訊息會指出是哪一道關卡與對應設定。唯讀 SQL 連接器的 `allowed_tables` 語義不同：必須非空，儲存 RPC 會拒絕空清單，不能套用 Odoo 模型白名單的解讀。
 
 ### 版本偵測

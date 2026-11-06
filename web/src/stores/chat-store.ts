@@ -66,6 +66,8 @@ export interface ChatMessage {
   readonly turnId?: string;
   readonly delivery?: 'queued' | 'running' | 'done' | 'cancelled' | 'failed';
   readonly deliveryError?: string;
+  /** Transport progress was lost; a correlated late reply can still complete it. */
+  readonly interrupted?: boolean;
   readonly liveActivity?: TurnActivity;
   readonly tokens?: number;
   /** Pending uploads use chips; server-issued history references use file cards. */
@@ -297,7 +299,8 @@ interface ChatStore {
   readonly supportsVision: boolean;
   /** The agent's preferred model id (from session_info). */
   readonly model: string;
-  readonly connectionState: 'disconnected' | 'connecting' | 'connected';
+  readonly connectionState: 'disconnected' | 'connecting' | 'reconnecting' | 'connected';
+  readonly reconnectExhausted: boolean;
 
   // ── Voice (openhuman-parity B) ──────────────────────────────
   /** True while the mic is actively capturing a push-to-talk clip. Drives the
@@ -310,7 +313,9 @@ interface ChatStore {
   readonly ttsEnabled: boolean;
 
   connect: () => void;
+  reconnect: () => void;
   disconnect: () => void;
+  /** False means the composer must retain its draft and attachments. */
   send: (text: string, attachments?: readonly PendingAttachment[]) => boolean;
   cancel: (msgId?: string) => void;
   reset: () => void;
@@ -442,7 +447,7 @@ export function shouldRenderChatFrame(
   if (frame.type === 'error' && (frame.code === 'turn_limit' || frame.code === 'identity_unavailable') && !msg) return false;
   if (conv && conv !== current.convId) return false;
   if (msg && msg !== current.activeMessageId && !current.messages?.some(m =>
-    m.role === 'user' && m.turnId === msg && (m.delivery === 'queued' || m.delivery === 'running'))) return false;
+    m.role === 'user' && m.turnId === msg && (m.delivery === 'queued' || m.delivery === 'running' || m.interrupted))) return false;
   if (conv || msg) return true;
   if (frame.type !== 'session_info' && typeof frame.session_id === 'string' && frame.session_id) {
     const composed = current.resumedExplicitly
@@ -461,7 +466,8 @@ function replySlot(messages: readonly ChatMessage[], turnId: string | null): num
 }
 
 function finishMessage(messages: readonly ChatMessage[], turnId: string | null, delivery: 'done' | 'failed' | 'cancelled') {
-  return messages.map(m => m.role === 'user' && m.turnId === turnId ? { ...m, delivery, liveActivity: undefined } : m);
+  return messages.map(m => m.role === 'user' && m.turnId === turnId ? { ...m, delivery, liveActivity: undefined,
+    ...(m.interrupted ? { interrupted: undefined, deliveryError: undefined } : {}) } : m);
 }
 
 /** The wire shape of one message returned by `chat.sessions.history`. */
@@ -536,6 +542,16 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempt = 0;
 let intentionalDisconnect = false;
 let visibilityListener: (() => void) | null = null;
+let recoveryListener: (() => void) | null = null;
+let turnRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+const recoveringTurns = new Set<string>();
+const TURN_RECOVERY_MS = 10_000;
+
+function clearTurnRecovery() {
+  if (turnRecoveryTimer) clearTimeout(turnRecoveryTimer);
+  turnRecoveryTimer = null;
+  recoveringTurns.clear();
+}
 
 function subscribeCurrentConversation() {
   if (!wsRef || wsRef.readyState !== WebSocket.OPEN) return;
@@ -559,7 +575,11 @@ function clearVisemeIdle() {
 
 function scheduleReconnect(connectFn: () => void) {
   if (intentionalDisconnect) return;
-  if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) return;
+  if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+    useChatStore.setState({ connectionState: 'disconnected', reconnectExhausted: true });
+    return;
+  }
+  useChatStore.setState({ connectionState: 'reconnecting' });
 
   const delay = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
   reconnectAttempt += 1;
@@ -570,21 +590,62 @@ function scheduleReconnect(connectFn: () => void) {
 }
 
 export const useChatStore = create<ChatStore>((set, get) => {
+  function awaitTurnRecovery() {
+    const state = get();
+    for (const message of state.messages) {
+      if (message.turnId && (message.delivery === 'running' || message.delivery === 'queued')) {
+        recoveringTurns.add(message.turnId);
+      }
+    }
+    if (state.activeMessageId) recoveringTurns.add(state.activeMessageId);
+    if (turnRecoveryTimer || (!recoveringTurns.size && !state.isStreaming)) return;
+    turnRecoveryTimer = setTimeout(() => {
+      const interrupted = new Set(recoveringTurns);
+      clearTurnRecovery();
+      clearVisemeIdle();
+      set(current => {
+        const messages = current.messages.map(message => message.role === 'user' && message.turnId
+          && interrupted.has(message.turnId) && (message.delivery === 'running' || message.delivery === 'queued')
+          ? { ...message, delivery: 'failed' as const, interrupted: true, liveActivity: undefined,
+            deliveryError: lookupMessage('webchat.interrupted') } : message);
+        const changed = messages.some((message, index) => message !== current.messages[index]);
+        if (!changed && !current.isStreaming && !current.activeMessageId) return {};
+        return { messages,
+          // Marking delivery changes the history request's snapshot fence. Start
+          // a new recovery so a slow reply cannot strand a partial transcript.
+          ...(changed && (current.isStreaming || current.activeMessageId)
+            && current.resumedExplicitly && current.connectionState === 'connected'
+            ? { historyReconnectRevision: current.historyReconnectRevision + 1 } : {}),
+          ...(!current.activeMessageId || interrupted.has(current.activeMessageId)
+            ? { steps: [], stepTree: [], ...remainingActivity(messages, 'error') } : {}),
+        };
+      });
+    }, TURN_RECOVERY_MS);
+  }
+
+  function reconnect() {
+    // Replace even OPEN transports: browser lifecycle events may follow sleep
+    // before the browser notices that the underlying connection has died.
+    const previous = wsRef;
+    wsRef = null;
+    previous?.close();
+    awaitTurnRecovery();
+    reconnectAttempt = 0;
+    set({ reconnectExhausted: false });
+    connect();
+  }
+
   function connect() {
     if (wsRef && (wsRef.readyState === WebSocket.OPEN || wsRef.readyState === WebSocket.CONNECTING)) return;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (!visibilityListener) {
       visibilityListener = () => {
-        if (document.visibilityState !== 'visible' || intentionalDisconnect) return;
-        // A suspended tab may still report OPEN for a dead transport. Replace it
-        // immediately, without waiting for a delayed close event or backoff.
-        const previous = wsRef;
-        wsRef = null;
-        previous?.close();
-        reconnectAttempt = 0;
-        connect();
+        if (document.visibilityState === 'visible' && !intentionalDisconnect) reconnect();
       };
+      recoveryListener = () => { if (!intentionalDisconnect) reconnect(); };
       document.addEventListener('visibilitychange', visibilityListener);
+      window.addEventListener('online', recoveryListener);
+      window.addEventListener('pageshow', recoveryListener);
     }
 
     intentionalDisconnect = false;
@@ -595,7 +656,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
       const sessionId = resume ? state.acceptedSessionId ?? (state.resumedExplicitly ? state.sessionId
         : `${state.sessionId}${state.selectedAgentId ? `#agent:${state.selectedAgentId}` : ''}#conv:${state.convId}`)
         : state.sessionId;
-      return { connectionState: 'connecting', ownSessionId: null,
+      return { connectionState: reconnectAttempt > 0 || resume ? 'reconnecting' : 'connecting', ownSessionId: null,
+        reconnectExhausted: false,
         ...(resume ? { sessionId, resumedExplicitly: true } : { resolvedAgent: undefined, assignmentError: null }),
       };
     });
@@ -607,7 +669,6 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
     socket.onopen = () => {
       if (wsRef !== socket) return;
-      reconnectAttempt = 0;
       // C5: the server now requires the first frame to authenticate the
       // connection with the current access token before any message is accepted.
       const jwt = useAuthStore.getState().jwt;
@@ -659,11 +720,13 @@ export const useChatStore = create<ChatStore>((set, get) => {
           ? data.request_id ?? data.msg_id : data.msg_id;
         const targetTurnId = typeof frameTurnId === 'string' ? frameTurnId : get().activeMessageId;
         if ((IN_TURN_FRAME_TYPES.has(data.type) || data.type === 'assistant_done') && targetTurnId) {
+          recoveringTurns.delete(targetTurnId);
+          if (!recoveringTurns.size) clearTurnRecovery();
           const user = get().messages.find(m => m.role === 'user' && m.turnId === targetTurnId);
           if (user && targetTurnId !== get().activeMessageId) {
             clearVisemeIdle();
             set(state => ({
-              messages: state.messages.map(m => m === user ? { ...m, delivery: 'running' as const }
+              messages: state.messages.map(m => m === user ? { ...m, delivery: 'running' as const, interrupted: undefined, deliveryError: undefined }
                 : m.role === 'user' && m.turnId === state.activeMessageId
                   ? { ...m, liveActivity: currentActivity(state) } : m),
               activeMessageId: targetTurnId, isStreaming: true,
@@ -720,6 +783,10 @@ export const useChatStore = create<ChatStore>((set, get) => {
               break;
             }
             const hello = get().ownSessionId === null;
+            if (hello) {
+              reconnectAttempt = 0;
+              set({ reconnectExhausted: false });
+            }
             set((state) => ({
               ownSessionId:
                 state.ownSessionId === null && typeof data.session_id === 'string'
@@ -984,6 +1051,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
       if (wsRef !== socket) return;
       if (wsRef === socket) wsRef = null;
       set({ connectionState: 'disconnected' });
+      if (!intentionalDisconnect) awaitTurnRecovery();
       scheduleReconnect(connect);
     };
 
@@ -1021,11 +1089,13 @@ export const useChatStore = create<ChatStore>((set, get) => {
     supportsVision: false,
     model: '',
     connectionState: 'disconnected',
+    reconnectExhausted: false,
     isRecording: false,
     isTranscribing: false,
     ttsEnabled: loadTtsEnabled(),
 
     connect,
+    reconnect,
 
     setRecording: (v: boolean) => set({ isRecording: v }),
     setTranscribing: (v: boolean) => set({ isTranscribing: v }),
@@ -1117,6 +1187,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
       intentionalDisconnect = true;
       if (visibilityListener) document.removeEventListener('visibilitychange', visibilityListener);
       visibilityListener = null;
+      if (recoveryListener) {
+        window.removeEventListener('online', recoveryListener);
+        window.removeEventListener('pageshow', recoveryListener);
+      }
+      recoveryListener = null;
+      clearTurnRecovery();
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -1130,12 +1206,15 @@ export const useChatStore = create<ChatStore>((set, get) => {
     },
 
     send: (text: string, attachments?: readonly PendingAttachment[]) => {
-      if (!wsRef || wsRef.readyState !== WebSocket.OPEN) return false;
+      if (!wsRef || wsRef.readyState !== WebSocket.OPEN) {
+        toast.error(lookupMessage('webchat.notSent'));
+        return false;
+      }
       if (requiresAssignedChatAgent() && (!get().resolvedAgent || get().assignmentError)) return false;
       const agentId = requiresAssignedChatAgent() && !get().resumedExplicitly ? null : get().selectedAgentId;
       const sessionId = get().sessionId;
       if (agentId && !canSelectAgent(agentId, sessionId)) {
-        toast.error('員工操作權限尚未確認或已撤銷，正在重新整理，請稍後再試。');
+        toast.error(lookupMessage('webchat.agentAccessPending'));
         void refreshCallableGrants(sessionId);
         return false;
       }
@@ -1143,18 +1222,23 @@ export const useChatStore = create<ChatStore>((set, get) => {
       const atts = attachments ?? [];
       const msgId = newClientMessageId();
 
-      wsRef.send(
-        JSON.stringify(
-          buildUserMessageFrame({
-            content: text,
-            sessionId: get().sessionId,
-            agentId,
-            attachments: atts,
-            convId: get().convId,
-            msgId,
-          }),
-        ),
-      );
+      try {
+        wsRef.send(
+          JSON.stringify(
+            buildUserMessageFrame({
+              content: text,
+              sessionId,
+              agentId,
+              attachments: atts,
+              convId: get().convId,
+              msgId,
+            }),
+          ),
+        );
+      } catch {
+        toast.error(lookupMessage('webchat.notSent'));
+        return false;
+      }
 
       // Add user message to local state immediately (with attachment chips)
       set((state) => ({
@@ -1238,7 +1322,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
 // View changes replace the socket subscription; they never cancel accepted turns.
 useChatStore.subscribe((next, previous) => {
-  if (next.convId !== previous.convId && next.connectionState === 'connected') {
-    subscribeCurrentConversation();
+  if (next.convId !== previous.convId) {
+    clearTurnRecovery();
+    if (next.connectionState === 'connected') subscribeCurrentConversation();
   }
 });
