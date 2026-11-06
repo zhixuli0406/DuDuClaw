@@ -126,7 +126,7 @@ Remote bridge 使用每次呼叫獨有的 generation wire ID，丟棄過期回�
 
 ## 由伺服器綁定收件對象
 
-僅 `mail_send` 可依[寄信交辦人規則](05-security-defense.md#寄信由交辦人在原對話確認)在一對一對話或已登入的儀表板 WebChat 核准；表中其他外送對象仍由儀表板 Admin 決定。 僅通道證實的一對一對話或已登入的儀表板 WebChat 適用。群組對話與未知聊天類型仍須儀表板 Admin 核准，公開 WebChat 小工具訪客不適用。不符資格的通道通知不含收件人、主旨或內文，完整內容只留在儀表板。
+僅 `mail_send` 可依[寄信交辦人規則](05-security-defense.md#寄信由交辦人在原對話確認)在一對一對話或已登入的儀表板 WebChat 核准；表中其他外送對象仍由儀表板 Admin 決定。群組對話與未知聊天類型仍須儀表板 Admin 核准，公開 WebChat 小工具訪客不適用。不符資格的通道通知不含收件人、主旨或內文，完整內容只留在儀表板。
 
 收件對象防護不以「讀過私人資料」為前提。`config.toml [security] recipient_guard` 支援 `off`、`shadow`（預設）與 `ask`；未知值會警告並採用 `ask`。員工層 `[capabilities] recipient_guard` 只能收緊全域設定（`off < shadow < ask`）。安全頁「資料外送防護」可調整全域設定；Admin 可在員工編輯頁「工具與權限 → 允許的收件對象」設定額外清單。
 
