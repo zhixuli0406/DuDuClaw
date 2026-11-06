@@ -36,7 +36,7 @@ mod imp {
 
     #[cfg(target_os = "macos")]
     fn macos_system_path(path: &Path) -> io::Result<std::borrow::Cow<'_, Path>> {
-        for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp"), ("/etc", "/private/etc")] {
+        for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
             if let Ok(tail) = path.strip_prefix(alias) {
                 let metadata = std::fs::symlink_metadata(alias)?;
                 if metadata.file_type().is_symlink() && metadata.uid() == 0
@@ -388,11 +388,20 @@ mod tests {
     #[test]
     fn macos_system_aliases_keep_the_suffix_nofollow() {
         use std::os::unix::fs::MetadataExt;
-        for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp"), ("/etc", "/private/etc")] {
+        // The check/readlink TOCTOU is harmless: the walk opens the fixed /private/... target from / with O_NOFOLLOW, never the alias.
+        for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
             let actual = SafeDir::open(Path::new(alias)).unwrap().metadata().unwrap();
             let expected = SafeDir::open(Path::new(target)).unwrap().metadata().unwrap();
             assert_eq!((actual.dev(), actual.ino()), (expected.dev(), expected.ino()));
         }
+        assert!(SafeDir::open(Path::new("/etc")).is_err());
+        let unknown_error = match SafeDir::open(Path::new("/variable-does-not-exist")) {
+            Ok(_) => panic!("unknown path unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert_eq!(unknown_error.kind(), io::ErrorKind::NotFound);
+        assert!(SafeDir::open(Path::new("/var/../tmp")).is_err());
+        assert!(SafeDir::open(Path::new("/tmp/..")).is_err());
         // Exercise both temp-dir spellings without canonicalizing the fixture.
         for parent in [std::env::temp_dir(), std::path::PathBuf::from("/tmp")] {
             let temp = tempfile::tempdir_in(parent).unwrap();
