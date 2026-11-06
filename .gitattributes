@@ -7,3 +7,6 @@
 /scripts/googlechat/bootstrap.sh text eol=lf
 # Signed pack fixture bytes are covered by the manifest and signature.
 /crates/duduclaw-core/src/pack/fixtures/signed-pack/** -text
+# Embedded Office scripts are SHA-256 pinned by the manifest; keep LF on every checkout.
+/crates/duduclaw-agent/src/builtin_skills/*/scripts/*.py text eol=lf
+/crates/duduclaw-agent/src/office_execution/manifest.rs text eol=lf

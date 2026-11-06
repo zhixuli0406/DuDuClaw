@@ -217,7 +217,8 @@ mod imp {
     use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, UNICODE_STRING, ERROR_NO_MORE_FILES};
     use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle,
         GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_ID_BOTH_DIR_INFO,
-        FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+        FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_READ_ATTRIBUTES};
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     // Every child access is a single-component NtCreateFile relative to an
@@ -285,7 +286,9 @@ mod imp {
             let mut handle = std::ptr::null_mut();
             let mut status_block = std::mem::MaybeUninit::<IO_STATUS_BLOCK>::zeroed();
             let status = unsafe { NtCreateFile(&mut handle,
-                if write { FILE_GENERIC_WRITE } else { FILE_GENERIC_READ },
+                // real_file validates the newly opened handle before returning it.
+                // FILE_GENERIC_WRITE alone does not permit querying its attributes.
+                if write { FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES } else { FILE_GENERIC_READ },
                 &attributes, status_block.as_mut_ptr(), std::ptr::null(), 0, 1,
                 disposition, FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
                     | if directory { FILE_DIRECTORY_FILE } else { FILE_NON_DIRECTORY_FILE },
@@ -450,6 +453,24 @@ mod tests {
 mod windows_tests {
     use super::*;
     use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn created_file_can_be_validated_written_and_reopened() {
+        use std::io::{Read, Write};
+        let temp = tempfile::tempdir().unwrap();
+        let root = SafeDir::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let dir = root.mkdir_child("skills", 0o700).unwrap();
+        let mut file = dir.create_new("SKILL.md", 0o600).unwrap();
+        assert!(file.metadata().unwrap().is_file());
+        file.write_all(b"operator content").unwrap();
+        drop(file);
+        assert_eq!(dir.create_new("SKILL.md", 0o600).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        let mut content = String::new();
+        dir.read_file("SKILL.md").unwrap().read_to_string(&mut content).unwrap();
+        assert_eq!(content, "operator content");
+        std::fs::hard_link(temp.path().join("skills/SKILL.md"), temp.path().join("alias")).unwrap();
+        assert!(dir.read_file("SKILL.md").is_err());
+    }
 
     #[test]
     fn directory_handle_refuses_concurrent_writers_and_child_links() {

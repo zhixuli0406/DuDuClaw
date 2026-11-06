@@ -105,12 +105,22 @@ async fn writes_a_provenance_row_and_an_audit_event() {
     .await;
     assert!(!is_error(&out), "{out}");
 
-    let ledger = fs::read_to_string(tmp.path().join("artifacts.jsonl")).unwrap();
-    let row: Value = serde_json::from_str(ledger.lines().next().unwrap()).unwrap();
-    assert_eq!(row["origin"], "produced");
-    assert_eq!(row["task_id"], TASK);
-    assert_eq!(row["round"], 1);
-    assert_eq!(row["agent_id"], "exec-1");
+    // Durable artifact authority deliberately fails closed outside Unix.
+    // Packet creation and the security audit remain supported on every OS.
+    #[cfg(not(unix))]
+    {
+        assert!(!tmp.path().join("artifact_provenance.db").exists());
+        assert!(!tmp.path().join("artifacts.jsonl").exists());
+    }
+    #[cfg(unix)]
+    {
+        let ledger = fs::read_to_string(tmp.path().join("artifacts.jsonl")).unwrap();
+        let row: Value = serde_json::from_str(ledger.lines().next().unwrap()).unwrap();
+        assert_eq!(row["origin"], "produced");
+        assert_eq!(row["task_id"], TASK);
+        assert_eq!(row["round"], 1);
+        assert_eq!(row["agent_id"], "exec-1");
+    }
 
     let audit = fs::read_to_string(tmp.path().join("security_audit.jsonl")).unwrap();
     let ev: Value = serde_json::from_str(
@@ -430,10 +440,20 @@ async fn a_role_member_under_the_ephemeral_layout_can_file_a_packet() {
     );
     // And the provenance row still attributes to the member, at the home's
     // ledger — not to an empty id inside the scaffold.
-    let ledger = fs::read_to_string(tmp.path().join("artifacts.jsonl")).unwrap();
-    let row: Value = serde_json::from_str(ledger.lines().next().unwrap()).unwrap();
-    assert_eq!(row["agent_id"], id);
-    assert_eq!(row["task_id"], TASK);
+    // Durable artifact authority deliberately fails closed outside Unix.
+    // Packet creation and the security audit remain supported on every OS.
+    #[cfg(not(unix))]
+    {
+        assert!(!tmp.path().join("artifact_provenance.db").exists());
+        assert!(!tmp.path().join("artifacts.jsonl").exists());
+    }
+    #[cfg(unix)]
+    {
+        let ledger = fs::read_to_string(tmp.path().join("artifacts.jsonl")).unwrap();
+        let row: Value = serde_json::from_str(ledger.lines().next().unwrap()).unwrap();
+        assert_eq!(row["agent_id"], id);
+        assert_eq!(row["task_id"], TASK);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

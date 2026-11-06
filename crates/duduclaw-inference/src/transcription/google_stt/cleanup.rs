@@ -1,9 +1,19 @@
 //! Durable deletion intents. No audio, keys, tokens or provider bodies are stored.
 //! Stable sharded OS locks survive record replacement and exclude active uploads.
-use std::{fs::{self, File, OpenOptions}, io::{self, Read, Write}, path::{Path, PathBuf}};
+use std::{fs::{self, File}, io::{self, Read, Write}, path::{Path, PathBuf}};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use super::{GoogleSttEngine, TranscriptionError, Duration};
+
+#[cfg(windows)]
+mod windows;
+
+#[cfg(windows)]
+type DirectoryGuard = File;
+#[cfg(not(windows))]
+type DirectoryGuard = ();
 
 const DIRECTORY: &str = "google_stt_cleanup";
 // Upload HTTP requests have a 600-second total timeout. Unknown generations
@@ -42,7 +52,11 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 
 // Follow the private-directory convention used by mcp_secret_store. The
 // helpers there are private; verify the opened inode as well as the path here.
-fn private_dir(dir: &Path, create: bool) -> io::Result<()> {
+#[cfg(windows)]
+fn private_dir(dir: &Path, create: bool) -> io::Result<DirectoryGuard> { windows::private_dir(dir, create) }
+
+#[cfg(not(windows))]
+fn private_dir(dir: &Path, create: bool) -> io::Result<DirectoryGuard> {
     if create {
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)] {
@@ -70,7 +84,15 @@ fn private_dir(dir: &Path, create: bool) -> io::Result<()> {
 }
 
 fn private_file(path: &Path, create: bool) -> io::Result<File> {
-    private_dir(path.parent().ok_or_else(|| io::Error::other("missing parent"))?, false)?;
+    let _directory = private_dir(path.parent().ok_or_else(|| io::Error::other("missing parent"))?, false)?;
+    private_file_in_directory(path, create)
+}
+
+#[cfg(windows)]
+fn private_file_in_directory(path: &Path, create: bool) -> io::Result<File> { windows::private_file(path, create) }
+
+#[cfg(not(windows))]
+fn private_file_in_directory(path: &Path, create: bool) -> io::Result<File> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
             return Err(io::Error::other("cleanup entry is not a regular file"));
@@ -105,7 +127,10 @@ fn lock_record(path: &Path) -> Result<Option<duduclaw_core::owner_lock::OwnerLoc
     let file = private_file(&lock_path, true).map_err(|_| error())?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(duduclaw_core::owner_lock::OwnerLock::new(file))),
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        // Windows reports ERROR_LOCK_VIOLATION, not ErrorKind::WouldBlock.
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock
+            || (e.raw_os_error().is_some()
+                && e.raw_os_error() == fs2::lock_contended_error().raw_os_error()) => Ok(None),
         Err(_) => Err(error()),
     }
 }
@@ -113,7 +138,7 @@ fn lock_record(path: &Path) -> Result<Option<duduclaw_core::owner_lock::OwnerLoc
 impl PendingObject {
     pub(super) fn create(home: &Path, bucket: &str, object: &str) -> Result<Self, TranscriptionError> {
         let dir = home.join(DIRECTORY);
-        private_dir(&dir, true).map_err(|_| error())?;
+        let _directory = private_dir(&dir, true).map_err(|_| error())?;
         // Persist the new directory itself before any upload can start.
         sync_dir(home).map_err(|_| error())?;
         for _ in 0..32 {
@@ -142,7 +167,7 @@ impl PendingObject {
     }
     fn persist(&self) -> Result<(), TranscriptionError> {
         let dir = self.path.parent().ok_or_else(error)?;
-        private_dir(dir, false).map_err(|_| error())?;
+        let _directory = private_dir(dir, false).map_err(|_| error())?;
         // Refuse existing links/special files rather than silently replacing them.
         match private_file(&self.path, false) {
             Ok(_) => {},
@@ -154,7 +179,8 @@ impl PendingObject {
             use std::os::unix::fs::PermissionsExt;
             temp.as_file().set_permissions(fs::Permissions::from_mode(0o600)).map_err(|_| error())?;
         }
-        #[cfg(not(unix))] duduclaw_core::platform::set_owner_only(temp.path()).map_err(|_| error())?;
+        #[cfg(windows)] drop(windows::private_file(temp.path(), false).map_err(|_| error())?);
+        #[cfg(not(any(unix, windows)))] duduclaw_core::platform::set_owner_only(temp.path()).map_err(|_| error())?;
         serde_json::to_writer(&mut temp, &self.record).map_err(|_| error())?;
         temp.flush().and_then(|_| temp.as_file().sync_all()).map_err(|_| error())?;
         temp.persist(&self.path).map_err(|_| error())?;
@@ -178,12 +204,20 @@ impl PendingObject {
 }
 
 fn paths(home: &Path) -> Result<Vec<PathBuf>, TranscriptionError> {
-    let dir = home.join(DIRECTORY);
-    match private_dir(&dir, false) {
-        Ok(()) => {},
+    // Windows can report NotFound for `regular-file/child`. Only a genuinely
+    // absent home or journal means there is no pending cleanup.
+    match fs::metadata(home) {
+        Ok(metadata) if metadata.is_dir() => {},
+        Ok(_) => return Err(error()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(_) => return Err(error()),
     }
+    let dir = home.join(DIRECTORY);
+    let _directory = match private_dir(&dir, false) {
+        Ok(directory) => directory,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(error()),
+    };
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),

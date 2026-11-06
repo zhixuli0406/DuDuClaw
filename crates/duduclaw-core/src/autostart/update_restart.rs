@@ -297,6 +297,7 @@ mod tests {
     fn ok(text: &str) -> Reply { Reply { success: true, stdout: text.into(), stderr: String::new() } }
     fn absent() -> Reply { Reply { success: false, stdout: String::new(), stderr: "Could not find service \"test\" in domain for user gui: 501".into() } }
     #[test]
+    #[cfg(target_os = "macos")]
     fn plist_uses_installed_exe_fixed_args_and_single_run() {
         let p = helper_plist(Path::new("/Users/a & b/bin/duduclaw"), Path::new("/Users/a & b"), Path::new("/tmp/isolated-state"), LAUNCHD_LABEL, 42).unwrap();
         assert!(p.contains("<string>/Users/a &amp; b/bin/duduclaw</string><string>service</string><string>restart</string><string>--from-updater</string><string>com.duduclaw.gateway</string>"));

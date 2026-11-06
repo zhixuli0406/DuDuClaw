@@ -48,6 +48,13 @@ fn transcription_google_cleanup_intent_is_durable_and_contains_no_credential() {
     assert!(GoogleSttEngine::has_pending_cleanup(home.path()).unwrap());
 }
 
+#[test]
+fn transcription_google_cleanup_missing_home_and_journal_are_empty() {
+    let home = tempfile::tempdir().unwrap();
+    assert!(!GoogleSttEngine::has_pending_cleanup(home.path()).unwrap());
+    assert!(!GoogleSttEngine::has_pending_cleanup(&home.path().join("missing")).unwrap());
+}
+
 #[tokio::test]
 async fn transcription_google_cleanup_restarts_retries_and_deletes_exact_generation() {
     let home = tempfile::tempdir().unwrap();
