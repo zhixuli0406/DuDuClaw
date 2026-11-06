@@ -20,14 +20,14 @@ import { useChatStore, type PendingAttachment } from '@/stores/chat-store';
  *     `source: 'operator_console_prompted'`.
  */
 describe('<WifiPasswordRequestCard> — T1 secure password hand-off', () => {
-  let sendMock: ReturnType<typeof vi.fn<(text: string, attachments?: readonly PendingAttachment[]) => void>>;
+  let sendMock: ReturnType<typeof vi.fn<(text: string, attachments?: readonly PendingAttachment[]) => boolean>>;
 
   beforeEach(() => {
     vi.restoreAllMocks();
     // Default: no matching network found — the security-hint enrichment is
     // best-effort and must never block or alter the base render.
     vi.spyOn(api.network, 'wifiScan').mockResolvedValue({ networks: [], scanning: false });
-    sendMock = vi.fn<(text: string, attachments?: readonly PendingAttachment[]) => void>();
+    sendMock = vi.fn<(text: string, attachments?: readonly PendingAttachment[]) => boolean>();
     // `send()` is a no-op without a live WebSocket (`wsRef` stays null in a
     // unit test), so the real implementation can never be exercised here —
     // replace it via zustand's own `setState` (not a property mutation)

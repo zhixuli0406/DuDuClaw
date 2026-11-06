@@ -427,7 +427,7 @@ function InteractiveWebChatPage() {
     if (selectedAgentId && !canSelectAgent(selectedAgentId, chatSessionId)) return;
     if (mentionTyping && !mentionSource.length) return;
     if ((!text && attachments.length === 0) || connectionState !== 'connected' || assignmentBlocked) return;
-    send(text, attachments);
+    if (send(text, attachments) === false) return;
     chosenMentions.current.clear();
     setInput('');
     setAttachments([]);

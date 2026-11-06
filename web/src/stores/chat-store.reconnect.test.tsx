@@ -5,6 +5,7 @@ import { renderWithProviders } from '@/test/render';
 import { WebChatPage } from '@/pages/WebChatPage';
 import { api, type ChatSessionHistory } from '@/lib/api';
 import { useChatStore } from './chat-store';
+import { callableSubject, useCallableAgentsStore } from './callable-agents-store';
 import { useAuthStore } from './auth-store';
 import { useAgentsStore } from './agents-store';
 import { useConversationsStore } from './conversations-store';
@@ -56,6 +57,12 @@ beforeEach(() => {
   useChatStore.getState().connect();
   current().open();
   hello(current(), 'webchat:old');
+  // Explicit chat routes require a confirmed session-scoped grant before sending.
+  useCallableAgentsStore.setState({ entries: Object.fromEntries(
+    ['webchat:old', 'webchat:new', saved.session_id].map(session => [JSON.stringify([callableSubject(), session]), {
+      agents: [{ name: 'sales', display_name: 'Sales', call_text: '@sales', via: 'binding' as const, level: 'operator' as const, selectable: true, assignable: true }], unrestricted: false, loading: false, confirmedAt: Date.now(),
+    }]),
+  ) });
 });
 afterEach(() => {
   cleanup();

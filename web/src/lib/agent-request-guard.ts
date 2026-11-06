@@ -65,7 +65,7 @@ export const AGENT_GUARD_READ_ONLY_METHODS = new Set([
   'knowledge.passage.get', 'knowledge.principals.search', 'knowledge.search',
   'knowledge.sources.list', 'license.fingerprint', 'license.status',
   'localmodels.installed', 'localmodels.quants', 'localmodels.search',
-  'mail.list', 'mail.outbox', 'mail.read',
+  'mail.list', 'mail.outbox',
   'mail.status', 'maintenance.history', 'maintenance.status',
   'marketplace.list', 'mcp.events_list', 'mcp.list',
   'mcp.oauth.status', 'mcp.remote_status', 'mcp.tool_effects',
@@ -108,6 +108,7 @@ export const AGENT_GUARD_READ_ONLY_METHODS = new Set([
   'wiki.trust_audit', 'wiki.trust_history', 'wiki_scope.get',
 ]);
 
+// mail.read marks mail as read; its normal params carry no agent id.
 // Registration avoids a transport -> store -> api -> transport initialization cycle.
 // There is no permissive fallback, including for a locally cached admin role.
 interface AgentRequestAuthorizer {
@@ -125,8 +126,8 @@ export function setAgentRequestAuthorizer(authorize: AgentRequestAuthorizer): vo
 }
 
 // Exempt requests return synchronously and never wait for callable discovery.
-export function assertAgentRequestAllowed(method: string, params: object, sessionId?: string | null): Promise<void> | void {
-  if (AGENT_GUARD_BOOTSTRAP_METHODS.has(method) || AGENT_GUARD_READ_ONLY_METHODS.has(method)) return;
+export function withAgentRequestAllowed<T>(method: string, params: object, send: () => T, sessionId?: string | null): T | Promise<T> {
+  if (AGENT_GUARD_BOOTSTRAP_METHODS.has(method) || AGENT_GUARD_READ_ONLY_METHODS.has(method)) return send();
   const targets: unknown[] = [];
   const check = (value: unknown) => {
     // Empty optional targets mean "no explicit agent"; the server resolves defaults.
@@ -147,7 +148,7 @@ export function assertAgentRequestAllowed(method: string, params: object, sessio
     }
   };
   visit(params);
-  if (targets.length === 0) return;
+  if (targets.length === 0) return send();
   return (async () => {
     for (;;) {
       const current = authorizer;
@@ -157,19 +158,29 @@ export function assertAgentRequestAllowed(method: string, params: object, sessio
       if (targets.some(target => typeof target !== 'string' || !current.canSelectAgent(target, sessionId))) {
         throw new Error(`Agent access is unavailable or revoked; reload your employee permissions before ${method}.`);
       }
-      return;
+      // No await between the final identity check and starting the transport.
+      if (current !== authorizer || identity !== current.identity()) continue;
+      return send();
     }
   })();
 }
 
+export function assertAgentRequestAllowed(method: string, params: object, sessionId?: string | null): Promise<void> | void {
+  return withAgentRequestAllowed(method, params, () => {}, sessionId);
+}
+
 /** HTTP clients share the same fence, including targets carried in query strings. */
-export function assertAgentHttpRequestAllowed(path: string, init: RequestInit): Promise<void> | void {
+export function withAgentHttpRequestAllowed<T>(path: string, init: RequestInit, send: () => T): T | Promise<T> {
   const verb = (init.method ?? 'GET').toUpperCase();
-  if (verb === 'GET' || verb === 'HEAD' || verb === 'OPTIONS') return;
+  if (verb === 'GET' || verb === 'HEAD' || verb === 'OPTIONS') return send();
   const url = new URL(path, 'http://dashboard.local');
   const method = `${verb} ${url.pathname}`;
   // Evaluate query and body targets together against the same identity/grants.
   const targets: object[] = [...url.searchParams].map(([key, value]) => ({ [key]: value }));
   if (typeof init.body === 'string') targets.push(JSON.parse(init.body) as object);
-  return assertAgentRequestAllowed(method, targets);
+  return withAgentRequestAllowed(method, targets, send);
+}
+
+export function assertAgentHttpRequestAllowed(path: string, init: RequestInit): Promise<void> | void {
+  return withAgentHttpRequestAllowed(path, init, () => {});
 }

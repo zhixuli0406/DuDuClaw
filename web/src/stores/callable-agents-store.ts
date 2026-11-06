@@ -147,8 +147,14 @@ export function useCallableAgents(sessionId?: string | null) {
 export function canSelectAgent(name: string, sessionId?: string | null): boolean {
   const key = JSON.stringify([callableSubject(), sessionId ?? null]);
   const entry = useCallableAgentsStore.getState().entries[key];
-  return !!entry && !entry.loading && entry.agents !== null &&
+  return !!entry && !entry.loading && entry.confirmedAt !== undefined && entry.agents !== null &&
     (entry.unrestricted || entry.agents.some(a => a.name === name && a.selectable === true));
+}
+
+/** Start/join a refresh without allowing stale synchronous chat sends. */
+export function refreshCallableGrants(sessionId?: string | null): Promise<void> {
+  const key = JSON.stringify([callableSubject(), sessionId ?? null]);
+  return useCallableAgentsStore.getState().load(key, sessionId, true);
 }
 
 /** Wait for a confirmed response, joining refreshes without using stale grants. */

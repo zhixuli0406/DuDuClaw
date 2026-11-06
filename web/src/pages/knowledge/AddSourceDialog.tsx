@@ -45,10 +45,12 @@ export function looksLikeWebAddress(raw: string): boolean {
  */
 export function AddSourceDialog({
   collection,
+  agentId,
   onClose,
   onAdded,
 }: {
   collection: KbCollection;
+  agentId?: string;
   onClose: () => void;
   onAdded: () => void;
 }) {
@@ -86,6 +88,7 @@ export function AddSourceDialog({
   const maxFiles = limits?.max_files_per_upload ?? KB_MAX_FILES_PER_UPLOAD;
   const accept = limits ? limits.extensions.map((e) => `.${e}`).join(',') : KB_UPLOAD_ACCEPT;
   const abortRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => { abortRef.current?.(); }, []);
 
   const addFiles = (list: FileList | null) => {
     if (!list) return;
@@ -115,7 +118,7 @@ export function AddSourceDialog({
     setBusy(true);
     setUploadError(null);
     setProgress(0);
-    const handle = uploadSources(collection.id, files, setProgress);
+    const handle = uploadSources(collection.id, files, setProgress, agentId ?? collection.own_agent?.agent_id);
     abortRef.current = handle.abort;
     try {
       const r = await handle.promise;

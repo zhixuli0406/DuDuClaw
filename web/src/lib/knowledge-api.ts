@@ -10,6 +10,7 @@
  * `POST /api/knowledge/upload` (multipart, `collection_id` before the
  * files) and `GET /api/knowledge/sources/{id}/original`.
  */
+import { withAgentRequestAllowed } from './agent-request-guard';
 import { client } from './ws-client';
 import { useAuthStore } from '@/stores/auth-store';
 
@@ -429,16 +430,19 @@ export function uploadSources(
   collectionId: string,
   files: readonly File[],
   onProgress?: (fraction: number) => void,
+  agentId?: string,
 ): UploadHandle {
   const xhr = new XMLHttpRequest();
+  let aborted = false;
+  let rejectUpload: (error: Error) => void = () => {};
   const promise = new Promise<KbUploadFileResult[]>((resolve, reject) => {
+    rejectUpload = reject;
     const form = new FormData();
     // The gateway checks the collection before it stores any byte, so the
     // id must come first.
     form.append('collection_id', collectionId);
     for (const f of files) form.append('file', f, f.name);
-    xhr.open('POST', '/api/knowledge/upload');
-    for (const [k, v] of Object.entries(authHeader())) xhr.setRequestHeader(k, v);
+
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onProgress) onProgress(e.total > 0 ? e.loaded / e.total : 0);
     };
@@ -456,9 +460,14 @@ export function uploadSources(
     };
     xhr.onerror = () => reject(new KbHttpError('Connection lost', 0));
     xhr.onabort = () => reject(new KbHttpError('aborted', 0));
-    xhr.send(form);
+    void Promise.resolve().then(() => withAgentRequestAllowed('POST /api/knowledge/upload', { agent_id: agentId }, () => {
+      if (aborted) throw new KbHttpError('aborted', 0);
+      xhr.open('POST', '/api/knowledge/upload');
+      for (const [k, v] of Object.entries(authHeader())) xhr.setRequestHeader(k, v);
+      xhr.send(form);
+    })).catch(reject);
   });
-  return { promise, abort: () => xhr.abort() };
+  return { promise, abort: () => { aborted = true; xhr.abort(); rejectUpload(new KbHttpError('aborted', 0)); } };
 }
 
 /** How long a downloaded file's object URL stays valid. */

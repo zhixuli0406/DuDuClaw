@@ -2,7 +2,8 @@ import { CALLABLE_REFRESH_INTERVAL_MS, CALLABLE_TIMEOUT_MS, callableSubject, use
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { api, type CallableAgent } from './api';
-import { AGENT_TARGET_KEYS, assertAgentRequestAllowed, assertAgentHttpRequestAllowed } from './agent-request-guard';
+import { AGENT_TARGET_KEYS, AGENT_GUARD_READ_ONLY_METHODS, assertAgentRequestAllowed, assertAgentHttpRequestAllowed, withAgentRequestAllowed } from './agent-request-guard';
+import { uploadSources } from './knowledge-api';
 import { callTaskRpc } from './task-rpc';
 import { meetingApi } from './meeting/api';
 import { causalApi } from './causal-api';
@@ -279,4 +280,68 @@ it('checks HTTP query targets and JSON bodies but permits reads', async () => {
   await expect(assertAgentHttpRequestAllowed('/api/meeting-jobs/id/cancel?agent=alice', { method: 'POST' })).rejects.toThrow('revoked');
   await expect(assertAgentHttpRequestAllowed('/api/meeting-uploads', { method: 'POST', body: JSON.stringify({ agent_id: 'alice' }) })).rejects.toThrow('revoked');
   expect(assertAgentHttpRequestAllowed('/api/meeting-jobs?agent=alice', {})).toBeUndefined();
+});
+
+it('cannot send using grants from an identity switched before the guard continuation', async () => {
+  grants(['alice']);
+  const send = vi.fn();
+  const result = withAgentRequestAllowed('agents.pause', { agent_id: 'alice' }, send);
+  // ensureFreshGrants has resolved, but the guard has not resumed yet.
+  useAuthStore.setState({ jwt: 'other-identity' });
+  await expect(result).rejects.toThrow('revoked');
+  expect(send).not.toHaveBeenCalled();
+});
+
+it('starts send in the final guard continuation before a queued identity switch', async () => {
+  grants(['alice']);
+  const send = vi.fn(() => useAuthStore.getState().jwt);
+  const result = withAgentRequestAllowed('agents.pause', { agent_id: 'alice' }, send);
+  queueMicrotask(() => {
+    // An await of the old assertion would resume the transport after this switch.
+    expect(send).toHaveBeenCalledTimes(1);
+    useAuthStore.setState({ jwt: 'other-identity' });
+  });
+  await result;
+  expect(send).toHaveReturnedWith(null);
+});
+
+it('does not exempt mail.read, which mutates read status', async () => {
+  expect(AGENT_GUARD_READ_ONLY_METHODS.has('mail.read')).toBe(false);
+  await expect(assertAgentRequestAllowed('mail.read', { agent_id: 'revoked' })).rejects.toThrow('revoked');
+  // Production params identify only the mail; the server resolves its owner.
+  expect(assertAgentRequestAllowed('mail.read', { id: 'mail-1' })).toBeUndefined();
+});
+
+it('never sends a knowledge XHR for a revoked owning agent', async () => {
+  const send = vi.fn();
+  vi.stubGlobal('XMLHttpRequest', class {
+    upload = {};
+    send = send;
+    open = vi.fn();
+    setRequestHeader = vi.fn();
+    abort = vi.fn();
+  });
+  const upload = uploadSources('collection', [new File(['data'], 'a.txt')], undefined, 'revoked');
+  await expect(upload.promise).rejects.toThrow('revoked');
+  expect(send).not.toHaveBeenCalled();
+});
+
+it('cancels a knowledge upload while its grants are pending', async () => {
+  const pending = deferredGrants();
+  vi.mocked(api.agents.callable).mockReturnValueOnce(pending.promise);
+  const send = vi.fn();
+  vi.stubGlobal('XMLHttpRequest', class {
+    upload = {};
+    send = send;
+    open = vi.fn();
+    setRequestHeader = vi.fn();
+    abort = vi.fn();
+  });
+  const upload = uploadSources('collection', [], undefined, 'alice');
+  await settle();
+  upload.abort();
+  await expect(upload.promise).rejects.toThrow('aborted');
+  pending.resolve(response(['alice']));
+  await settle();
+  expect(send).not.toHaveBeenCalled();
 });

@@ -47,7 +47,7 @@ describe('WebChatPage', () => {
     useAuthStore.setState({ user: { id: 'employee-a', role: 'employee' } as never });
     // Changing accounts disconnects chat; seed the completed employee handshake.
     useChatStore.setState({ connectionState: 'connected', selectedAgentId: 'sales', resolvedAgent: { id: 'sales', name: 'Sales', icon: '' } });
-    const send = vi.spyOn(useChatStore.getState(), 'send').mockImplementation(() => {});
+    const send = vi.spyOn(useChatStore.getState(), 'send').mockImplementation(() => true);
     const recent = vi.spyOn(api.skills, 'recent').mockResolvedValue({ skills: [
       { name: 'quote', display_name: 'Quote', description: 'Prepare a quote' },
       { name: 'pdf', display_name: 'PDF', description: 'Read a PDF' },
@@ -519,7 +519,7 @@ it('drops a revoked prefilled mention before sending the handoff draft', async (
   useChatStore.setState({ connectionState: 'connected', selectedAgentId: null, resolvedAgent: { id: 'other', name: 'Other', icon: '' }, assignmentError: null });
   let resolve!: (value: unknown) => void;
   vi.spyOn(api.agents, 'callable').mockImplementation(() => new Promise(r => { resolve = r; }) as never);
-  const send = vi.spyOn(useChatStore.getState(), 'send').mockImplementation(() => {});
+  const send = vi.spyOn(useChatStore.getState(), 'send').mockImplementation(() => true);
   render(
     <IntlProvider messages={en} locale="en" defaultLocale="en">
       <MemoryRouter initialEntries={[{ pathname: '/chat', state: { draft: '@Sales prepare a quote' } }]}>

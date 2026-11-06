@@ -1,3 +1,4 @@
+import { canSelectAgent, refreshCallableGrants } from './callable-agents-store';
 import { create } from 'zustand';
 import { parseHistoryAttachments, type HistoryAttachment } from '@/lib/history-attachments';
 import { useAuthStore } from './auth-store';
@@ -310,7 +311,7 @@ interface ChatStore {
 
   connect: () => void;
   disconnect: () => void;
-  send: (text: string, attachments?: readonly PendingAttachment[]) => void;
+  send: (text: string, attachments?: readonly PendingAttachment[]) => boolean;
   cancel: (msgId?: string) => void;
   reset: () => void;
   /** Pick the conversation partner (null → DuDu). Visual only for now. */
@@ -1129,11 +1130,31 @@ export const useChatStore = create<ChatStore>((set, get) => {
     },
 
     send: (text: string, attachments?: readonly PendingAttachment[]) => {
-      if (!wsRef || wsRef.readyState !== WebSocket.OPEN) return;
-      if (requiresAssignedChatAgent() && (!get().resolvedAgent || get().assignmentError)) return;
+      if (!wsRef || wsRef.readyState !== WebSocket.OPEN) return false;
+      if (requiresAssignedChatAgent() && (!get().resolvedAgent || get().assignmentError)) return false;
+      const agentId = requiresAssignedChatAgent() && !get().resumedExplicitly ? null : get().selectedAgentId;
+      const sessionId = get().sessionId;
+      if (agentId && !canSelectAgent(agentId, sessionId)) {
+        toast.error('員工操作權限尚未確認或已撤銷，正在重新整理，請稍後再試。');
+        void refreshCallableGrants(sessionId);
+        return false;
+      }
 
       const atts = attachments ?? [];
       const msgId = newClientMessageId();
+
+      wsRef.send(
+        JSON.stringify(
+          buildUserMessageFrame({
+            content: text,
+            sessionId: get().sessionId,
+            agentId,
+            attachments: atts,
+            convId: get().convId,
+            msgId,
+          }),
+        ),
+      );
 
       // Add user message to local state immediately (with attachment chips)
       set((state) => ({
@@ -1165,19 +1186,6 @@ export const useChatStore = create<ChatStore>((set, get) => {
       }));
       if (get().activeMessageId === msgId) clearVisemeIdle();
 
-      wsRef.send(
-        JSON.stringify(
-          buildUserMessageFrame({
-            content: text,
-            sessionId: get().sessionId,
-            agentId: requiresAssignedChatAgent() && !get().resumedExplicitly ? null : get().selectedAgentId,
-            attachments: atts,
-            convId: get().convId,
-            msgId,
-          }),
-        ),
-      );
-
       // The user message is what creates/updates the server-side session
       // bucket — the conversation should appear in the list as soon as the
       // input lands, not only after the reply completes. The sessions.list
@@ -1187,6 +1195,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
       // persistence-confirmed refresh (see onmessage).
       awaitingFirstServerFrame = true;
       set((state) => ({ sessionsRevision: state.sessionsRevision + 1 }));
+      return true;
     },
 
     cancel: (msgId = get().activeMessageId ?? undefined) => {

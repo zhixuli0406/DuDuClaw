@@ -119,6 +119,7 @@ export function AgentSourcesTab({ agentId, agentName }: { agentId: string; agent
       )}
       {selectable && adding && (
         <AddSourceDialog
+          agentId={agentId}
           collection={adding}
           onClose={() => setAdding(null)}
           onAdded={() => void load()}
