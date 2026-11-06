@@ -115,7 +115,11 @@ export function RunsPage() {
   // W3-3 / P11 (state-as-URL): the agent filter *lives* in `?agent=<id>` — the
   // URL is the state, not a copy of it, so a bookmarked/shared link opens the
   // same view and no mirror effect can fall out of sync.
-  const [agentFilter, setAgentFilter] = useUrlState('agent', '');
+  const [requestedAgent, setAgentFilter] = useUrlState('agent', '');
+  const agentFilter = scope === 'all' || visibleAgents.some(a => a.name === requestedAgent) ? requestedAgent : '';
+  useEffect(() => {
+    if (requestedAgent !== agentFilter) setAgentFilter(agentFilter);
+  }, [requestedAgent, agentFilter, setAgentFilter]);
   const [runState, setRunState] = useState<{key:string;rows:RunSummary[]} | null>(null);
   const [listError, setListError] = useState<unknown>(null);
   const [listLoaded, setListLoaded] = useState(false);

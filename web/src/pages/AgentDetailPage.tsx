@@ -1,3 +1,5 @@
+import { useSystemStore } from '@/stores/system-store';
+import { useVisibleAgents } from '@/lib/data-scope';
 import { chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
@@ -129,6 +131,11 @@ export function AgentDetailPage() {
   const { id } = useParams();
   const user = useAuthStore(s => s.user);
   const bindings = useAuthStore(s => s.bindings);
+  const visible = useVisibleAgents();
+  const isPersonal = useSystemStore(s => s.status?.edition_profile) === 'personal';
+  if (user?.role !== 'admin' && !isPersonal && !visible.some(a => a.name === id)) {
+    return <div role="note" className="p-6 text-sm text-muted-foreground">{intl.formatMessage({ id: 'agents.teamReadOnly' })}</div>;
+  }
   // Team access is display-only; do not mount editors or memory loaders.
   if (user?.role === 'manager' && !bindings.some(b => b.agent_name === id)) {
     return <div role="note" className="p-6 text-sm text-muted-foreground">{intl.formatMessage({ id: 'agents.teamReadOnly' })}</div>;
@@ -155,7 +162,8 @@ function AgentDetailPageContent() {
 
   const errorText = useErrorMessage();
   const connectionState = useConnectionStore((s) => s.state);
-  const { pauseAgent, resumeAgent, archiveAgent, unarchiveAgent, agents, fetchAgents } = useAgentsStore();
+  const { pauseAgent, resumeAgent, archiveAgent, unarchiveAgent, fetchAgents } = useAgentsStore();
+  const agents = useVisibleAgents(false);
   const setAvatarCache = useAgentAvatarStore((s) => s.set);
 
   const [detail, setDetail] = useState<AgentDetail | null>(null);

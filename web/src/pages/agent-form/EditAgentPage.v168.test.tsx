@@ -85,6 +85,7 @@ let updateAgent: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   useProductPolicyStore.setState({policy:{profile:'standard',blocked_channels:[],blocked_runtimes:[],blocked_providers:[]},loading:false,error:false});
   vi.clearAllMocks();
+  vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [{ ...BASE, via: 'binding', selectable: true }], default_agent: null } as never);
   setRole('admin');
   mockWsClient.call.mockResolvedValue({ ...FULL });
   updateAgent = vi.fn().mockResolvedValue({ success: true });
@@ -608,3 +609,5 @@ describe('boundaries (contract) review', () => {
     useAuthStore.setState({ bindings: [] } as never);
   });
 });
+
+import { api } from '@/lib/api';

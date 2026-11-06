@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Download } from 'lucide-react';
 import { Button, Dialog, DialogContent, DialogHeader, DialogTitle, Input } from '@/components/mds';
-import { api } from '@/lib/api';
+import { useVisibleAgents } from '@/lib/data-scope';
+import { useAgentsStore } from '@/stores/agents-store';
 import { dataExports, downloadDataExport, exportDateRange, type ExportDataset, type ExportFormat, type ExportJob } from '@/lib/data-exports';
 
 const datasets: ExportDataset[] = ['tasks','conversations','usage','memories','wiki'];
@@ -15,7 +16,8 @@ export function DataExportButton({ dataset, agentId='', scope='agent' }: {datase
   const [format,setFormat]=useState<ExportFormat>('xlsx');
   const [agent,setAgent]=useState(agentId);
   const [wikiScope,setWikiScope]=useState(scope);
-  const [agents,setAgents]=useState<{name:string;display_name:string}[]>([]);
+  const agents=useVisibleAgents(false);
+  const fetchAgents=useAgentsStore(s=>s.fetchAgents);
   const [start,setStart]=useState(''); const [end,setEnd]=useState('');
   const [job,setJob]=useState<ExportJob|null>(null);
   const [busy,setBusy]=useState(false); const [error,setError]=useState<string|null>(null);
@@ -25,12 +27,8 @@ export function DataExportButton({ dataset, agentId='', scope='agent' }: {datase
     const code=message.match(/\bEXPORT_[A-Z_]+\b/)?.[0] ?? '';
     setError(knownErrors.has(code)?code:'generic');
   };
-  useEffect(()=>{
-    if(!open) return;
-    let alive=true;
-    api.agents.list().then(r=>{if(alive) setAgents(r?.agents??[]);}).catch(()=>{});
-    return ()=>{alive=false;};
-  },[open]);
+  useEffect(()=>{ if(open) void fetchAgents(); },[open,fetchAgents]);
+  useEffect(()=>{ if(agent && !agents.some(a=>a.name===agent)) setAgent(''); },[agent,agents]);
   useEffect(()=>{
     if(!open || !job || !['queued','running'].includes(job.state)) return;
     let alive=true; let polling=false;

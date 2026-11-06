@@ -1,3 +1,4 @@
+import { useVisibleAgents, useAgentVisibilityUnrestricted } from '@/lib/data-scope';
 import { TASK_ENTRY_POINTS_HIDDEN, chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useOpenAssign } from '@/hooks/useOpenAssign';
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -76,13 +77,16 @@ export function TeamPage() {
     void load();
   }, [load]);
 
+  const visibleAgents = useVisibleAgents();
+  const unrestricted = useAgentVisibilityUnrestricted();
+  const visibleMembers = useMemo(() => team?.members.map(m => ({ ...m, agents: m.agents.filter(a => unrestricted || visibleAgents.some(v => v.name === a.name)) })) ?? [], [team, visibleAgents, unrestricted]);
   const tree = useMemo(
-    () => (team ? nestTeam(team.members, team.manager?.id ?? null) : []),
-    [team],
+    () => (team ? nestTeam(visibleMembers, team.manager?.id ?? null) : []),
+    [team, visibleMembers],
   );
   const agentCount = useMemo(
-    () => new Set(team?.members.flatMap((m) => m.agents.map((a) => a.name)) ?? []).size,
-    [team],
+    () => new Set(visibleMembers.flatMap((m) => m.agents.map((a) => a.name)) ?? []).size,
+    [team, visibleMembers],
   );
 
   const openChat = (agent: TeamAgent) => {

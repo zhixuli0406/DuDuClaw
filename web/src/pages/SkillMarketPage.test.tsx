@@ -11,6 +11,7 @@ import { SkillMarketPage } from './SkillMarketPage';
 const wsHandlers = new Map<string, (payload: unknown) => void>();
 
 beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never, bindings: [] });
   vi.clearAllMocks();
   wsHandlers.clear();
   // Every RPC resolves to an empty envelope so the page renders empty states.
@@ -234,3 +235,5 @@ describe('SkillMarketPage', () => {
     expect(screen.queryByText('No matching skills found')).not.toBeInTheDocument();
   });
 });
+
+import { useAuthStore } from '@/stores/auth-store';

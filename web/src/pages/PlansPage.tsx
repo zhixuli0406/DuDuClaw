@@ -1,3 +1,4 @@
+import { useVisibleAgents } from '@/lib/data-scope';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useUrlStateNullable } from '@/lib/use-url-state';
 import { useIntl } from 'react-intl';
@@ -84,7 +85,7 @@ function AssigneePicker({
   onPick: (kind: 'user' | 'agent', assignee: string) => void;
 }) {
   const intl = useIntl();
-  const { agents } = useAgentsStore();
+  const agents = useVisibleAgents(false);
   const currentUser = useAuthStore((s) => s.user);
 
   const agent = step.assignee_kind === 'agent' ? agents.find((a) => a.name === step.assignee) : undefined;
@@ -136,7 +137,8 @@ export function PlansPage() {
   // had landed. Read it, show it, and let the user retry.
   const { plans, steps, loading, error, partialError, clearError, fetchPlans, fetchPlan, createPlan, updatePlan, removePlan, addStep, updateStep, removeStep } =
     usePlansStore();
-  const { agents, fetchAgents } = useAgentsStore();
+  const { fetchAgents } = useAgentsStore();
+  const agents = useVisibleAgents(false);
 
   // P11 (state-as-URL): the open plan lives in `?plan=<id>` (id only), so a
   // refresh or a shared link lands on the same plan instead of the newest one.
@@ -595,7 +597,7 @@ function CreatePlanDialog({
   onCreate: (title: string, agentId: string) => Promise<void>;
 }) {
   const intl = useIntl();
-  const { agents } = useAgentsStore();
+  const agents = useVisibleAgents(false);
   const [title, setTitle] = useState('');
   const [agentId, setAgentId] = useState('');
   const [busy, setBusy] = useState(false);

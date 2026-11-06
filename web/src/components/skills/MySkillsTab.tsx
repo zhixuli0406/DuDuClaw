@@ -1,3 +1,4 @@
+import { useVisibleAgents } from '@/lib/data-scope';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { Link } from 'react-router';
@@ -121,11 +122,13 @@ async function fetchSkills(agent: string): Promise<Loaded> {
 export function MySkillsTab({ filter }: { filter: string }) {
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);
-  const { agents, fetchAgents } = useAgentsStore();
+  const { fetchAgents } = useAgentsStore();
+  const agents = useVisibleAgents(false);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   // Defaults to the aggregate view (the first agent of the gateway's map
   // order was unrelated to the staffer the customer talks to).
-  const [selectedAgent, setSelectedAgent] = useState<string>(ALL_AGENTS);
+  const [requestedAgent, setSelectedAgent] = useState<string>(ALL_AGENTS);
+  const selectedAgent = agents.some(a => a.name === requestedAgent) ? requestedAgent : ALL_AGENTS;
   const [data, setData] = useState<Loaded>(EMPTY);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);

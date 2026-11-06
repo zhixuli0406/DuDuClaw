@@ -444,11 +444,11 @@ describe('server-resolved non-admin chat', () => {
     expect(screen.getByText(en['webchat.assignment.unavailable'])).toBeInTheDocument();
     expect(screen.queryByText(en['webchat.assignment.none'])).not.toBeInTheDocument();
   });
-  it('keeps the historical main identity in the header instead of the current primary', () => {
+  it('hides an unavailable historical main selection', () => {
     assigned();
     useChatStore.setState({ resumedExplicitly: true, selectedAgentId: 'main', agentName: 'Main' });
     renderWithProviders(<WebChatPage />);
-    expect(screen.getByRole('heading', { name: 'Main' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Main' })).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Sales' })).not.toBeInTheDocument();
   });
   it('ignores a main-agent URL preselection', () => {

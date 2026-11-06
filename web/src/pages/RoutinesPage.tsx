@@ -1,3 +1,4 @@
+import { useVisibleAgents } from '@/lib/data-scope';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Clock, Play, Pause, Trash2, Plus, Pencil, MoreHorizontal, FlaskConical } from 'lucide-react';
@@ -79,17 +80,21 @@ const ROUTINE_COLUMNS =
 /** Agent picker shared by the routine create/edit dialog (MDS Select). */
 function AgentSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const intl = useIntl();
-  const { agents, fetchAgents } = useAgentsStore();
+  const { fetchAgents } = useAgentsStore();
+  const agents = useVisibleAgents(false);
   useEffect(() => {
     fetchAgents();
   }, [fetchAgents]);
   const { user, bindings } = useAuthStore();
   const selectable = !user || user.role === 'admin' ? agents : agents.filter((a) =>
     bindings.some((b) => b.agent_name === a.name && b.access_level !== 'viewer'));
+  useEffect(() => {
+    if (value && !selectable.some(a => a.name === value)) onChange('');
+  }, [value, selectable, onChange]);
   const current = agents.find((a) => a.name === value);
   const label = current
     ? `${glyphText(current.icon)} ${current.display_name || current.name}`
-    : value || intl.formatMessage({ id: 'settings.system.none' });
+    : intl.formatMessage({ id: 'settings.system.none' });
   return (
     <Select value={value} onValueChange={(v) => onChange(String(v))}>
       <SelectTrigger className="w-full">
@@ -98,9 +103,6 @@ function AgentSelect({ value, onChange }: { value: string; onChange: (v: string)
         </SelectValue>
       </SelectTrigger>
       <SelectContent>
-        {value && !agents.some((a) => a.name === value) && (
-          <SelectItem value={value}>{value}</SelectItem>
-        )}
         {selectable.map((a) => (
           <SelectItem key={a.name} value={a.name}>
             {glyphText(a.icon) + ' ' + (a.display_name || a.name)}

@@ -1,5 +1,7 @@
 # Security Defense
 
+Enterprise members (Employee and Manager) see only employees explicitly marked selectable by `agents.callable` in the sidebar, conversation filters, command palette, WebChat `@` suggestions and other employee pickers. The main AI employee stays hidden unless that response explicitly makes it selectable. Loading or failed permission reads show no employees. Admin accounts and Personal editions keep the full roster. File and settings pickers additionally require direct access; team calling rights do not grant file or configuration access. New conversations continue to use the server assignment resolver. This dashboard filtering does not change RPC authorization.
+
 ## Customer company identity (v1.80.0)
 
 Customer company name and logo are separate from signed distributor branding. `company.get` and `company.update` are explicit Admin RPCs; `company.update` accepts only the name and optional logo removal, and rejects the former `logo_base64` field. Company names reject control, line-separator and Unicode format (`Cf`, including bidi override/isolate) characters. Updates repeat the live identity check under the existing configuration write lock. The `company_info` audit records actor, method and outcome without the image or name. Advanced settings navigation and routes are Admin-only; moving controls there does not relax their existing RPC permissions.

@@ -1,8 +1,10 @@
 import { useMemo } from 'react';
-import type { AgentDetail, AgentInfo } from '@/lib/api';
+import type { AgentDetail, AgentInfo, CallableAgent } from '@/lib/api';
 import type { UserRole, AgentBinding } from '@/stores/auth-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useSystemStore } from '@/stores/system-store';
+import { useCallableAgents } from '@/stores/callable-agents-store';
 
 /**
  * Data-scope layer (dashboard-redesign §3.4 WP11-T11.3). Turns a viewer's role
@@ -40,32 +42,41 @@ export type VisibleAgent = AgentInfo & Partial<AgentDetail> & {
   teamMember?: string;
 };
 
-export function useVisibleAgents(includeTeam: false): ReadonlyArray<AgentDetail>;
-export function useVisibleAgents(includeTeam?: true): ReadonlyArray<VisibleAgent>;
-export function useVisibleAgents(includeTeam = true): ReadonlyArray<VisibleAgent> {
-  const scope = useDataScope();
+/** Personal installations and administrators retain their existing full roster. */
+export function useAgentVisibilityUnrestricted(): boolean {
+  const role = useAuthStore(s => s.user?.role);
+  const personal = useSystemStore(s => s.status?.edition_profile) === 'personal';
+  return role === 'admin' || personal;
+}
+
+export function useVisibleAgents(includeTeam: false, sessionId?: string | null): ReadonlyArray<AgentDetail>;
+export function useVisibleAgents(includeTeam?: true, sessionId?: string | null): ReadonlyArray<VisibleAgent>;
+export function useVisibleAgents(includeTeam = true, sessionId?: string | null): ReadonlyArray<VisibleAgent> {
   const agents = useAgentsStore((s) => s.agents);
-  const teamAgents = useAgentsStore((s) => s.teamAgents);
-  const teamSubject = useAgentsStore((s) => s.teamSubject);
-  const user = useAuthStore((s) => s.user);
-  const bindings = useAuthStore((s) => s.bindings);
-  return useMemo(() => {
-    if (scope === 'own') {
-      const owned = ownedAgentNames(bindings);
-      return agents.filter((a) => owned.has(a.name));
-    }
-    if (scope !== 'reports') return agents;
-    const owned = ownedAgentNames(bindings);
-    const directAgents = agents.filter(a => owned.has(a.name));
-    if (!includeTeam || teamSubject !== JSON.stringify([user?.id, user?.role])) return directAgents;
-    const direct = new Set(directAgents.map(a => a.name));
-    const team: VisibleAgent[] = (teamAgents ?? []).filter(a => a.via === 'team' && !direct.has(a.name)).map(a => ({
-      name: a.name, display_name: a.display_name, department: a.department,
-      role: a.role === 'main' || a.role === 'specialist' ? a.role : 'worker',
-      status: a.status === 'active' || a.status === 'paused' ? a.status : 'terminated',
-      trigger: a.trigger ?? '', icon: a.icon ?? '', reports_to: '',
-      readOnly: true, teamMember: a.via_user_name || a.via_user || '',
-    }));
-    return [...directAgents, ...team];
-  }, [scope, agents, bindings, includeTeam, teamAgents, teamSubject, user?.id, user?.role]);
+  const unrestricted = useAgentVisibilityUnrestricted();
+  const { agents: callable } = useCallableAgents(sessionId);
+  return useMemo(() => selectVisibleAgents(agents, callable, unrestricted, includeTeam),
+    [unrestricted, agents, callable, includeTeam]);
+}
+
+/** Shared projection for React pickers and the read-only custom-widget bridge. */
+export function selectVisibleAgents(
+  agents: readonly AgentDetail[], callable: readonly CallableAgent[] | null,
+  unrestricted: boolean, includeTeam = true,
+): readonly VisibleAgent[] {
+  if (unrestricted) return agents;
+  // Only an explicit selectable grant may expose an employee, including main.
+  const allowed = (callable ?? []).filter(a => a.selectable === true);
+  const directIds = new Set(allowed.filter(a => a.via === 'binding').map(a => a.name));
+  const direct = agents.filter(a => directIds.has(a.name));
+  if (!includeTeam) return direct;
+  const detailed = new Set(direct.map(a => a.name));
+  const display: VisibleAgent[] = allowed.filter(a => !detailed.has(a.name)).map(a => ({
+    name: a.name, display_name: a.display_name, department: a.department,
+    role: a.role === 'main' || a.role === 'specialist' ? a.role : 'worker',
+    status: a.status === 'active' || a.status === 'paused' ? a.status : 'terminated',
+    trigger: a.trigger ?? '', icon: a.icon ?? '', reports_to: '', has_avatar: a.has_avatar,
+    readOnly: true, teamMember: a.via_user_name || a.via_user || '',
+  }));
+  return [...direct, ...display];
 }

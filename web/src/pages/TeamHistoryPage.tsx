@@ -1,3 +1,4 @@
+import { useVisibleAgents, useAgentVisibilityUnrestricted } from '@/lib/data-scope';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl, type IntlShape } from 'react-intl';
 import { useSearchParams } from 'react-router';
@@ -44,12 +45,14 @@ export function TeamHistoryPage() {
     return () => { active = false; };
   }, [refresh, intl]);
 
+  const visibleAgents = useVisibleAgents();
+  const unrestricted = useAgentVisibilityUnrestricted();
   const agents = useMemo(() => {
-    const all = team?.members.flatMap(m => m.agents.filter(a => a.history_readable === true)) ?? [];
+    const all = team?.members.flatMap(m => m.agents.filter(a => a.history_readable === true && (unrestricted || visibleAgents.some(v => v.name === a.name)))) ?? [];
     return [...new Map(all.map(a => [a.name, a])).values()];
-  }, [team]);
+  }, [team, visibleAgents, unrestricted]);
   const chosenAgent = agents.some(a => a.name === agent) ? agent : agents[0]?.name ?? '';
-  const reports = team?.members.filter(m => m.agents.some(a => a.name === chosenAgent && a.history_readable === true)) ?? [];
+  const reports = team?.members.filter(m => m.agents.some(a => a.name === chosenAgent && a.history_readable === true && (unrestricted || visibleAgents.some(v => v.name === a.name)))) ?? [];
   const chosenReport = reports.some(m => m.id === report) ? report : '';
   const scope = JSON.stringify([chosenAgent, chosenReport, kind, refresh]);
   const currentPage = page?.key === scope ? page.data : null;

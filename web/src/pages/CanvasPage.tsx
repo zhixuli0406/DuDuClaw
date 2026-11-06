@@ -53,7 +53,11 @@ export function CanvasPage() {
 
   // P11 (state-as-URL): whose canvas, and which version of it, are both page
   // state — `?agent=<id>&seq=<n>` makes "look at this version" a link.
-  const [agentFilter, setAgentFilter] = useUrlState('agent', '');
+  const [requestedAgent, setAgentFilter] = useUrlState('agent', '');
+  const agentFilter = scope === 'all' || visibleAgents.some(a => a.name === requestedAgent) ? requestedAgent : '';
+  useEffect(() => {
+    if (requestedAgent !== agentFilter) setAgentFilter(agentFilter);
+  }, [requestedAgent, agentFilter, setAgentFilter]);
   /** null = live current version; a number = pinned history version. */
   const [seqParam, setSeqParam] = useUrlStateNullable('seq');
   const viewSeq = seqParam != null && /^\d+$/.test(seqParam) ? Number(seqParam) : null;

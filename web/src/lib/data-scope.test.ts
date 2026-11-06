@@ -1,71 +1,75 @@
-import { renderHook } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 import { mockWsClient } from '@/test/mocks';
 import { useAuthStore } from '@/stores/auth-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useSystemStore } from '@/stores/system-store';
+import { useCallableAgentsStore } from '@/stores/callable-agents-store';
 import type { AgentDetail, CallableAgent } from '@/lib/api';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { scopeForRole, ownedAgentNames, useVisibleAgents } from './data-scope';
-import type { AgentBinding } from '@/stores/auth-store';
 
-describe('data-scope (dashboard-redesign WP11-T11.3)', () => {
-  it('scopeForRole maps roles to breadth, fail-closed for unknown', () => {
-    expect(scopeForRole('admin')).toBe('all');
-    expect(scopeForRole('manager')).toBe('reports');
-    expect(scopeForRole('employee')).toBe('own');
-    expect(scopeForRole(undefined)).toBe('own'); // fail-closed
-  });
-
-  it('ownedAgentNames collects bound agent names', () => {
-    const bindings: AgentBinding[] = [
-      { user_id: 'u', agent_name: 'alice', access_level: 'owner', bound_at: '' },
-      { user_id: 'u', agent_name: 'bob', access_level: 'viewer', bound_at: '' },
-    ];
-    const set = ownedAgentNames(bindings);
-    expect(set.has('alice')).toBe(true);
-    expect(set.has('bob')).toBe(true);
-    expect(set.has('carol')).toBe(false);
-    expect(set.size).toBe(2);
-  });
+const roster = ['mine', 'other', 'main'].map(name => ({ name, display_name: name, role: name === 'main' ? 'main' : 'worker', status: 'active' })) as AgentDetail[];
+const grant = (name: string, extra = {}): CallableAgent => ({ name, display_name: name, role: name === 'main' ? 'main' : 'worker', status: 'active', via: 'binding', selectable: true, assignable: true, level: 'operator', call_text: `@${name}`, ...extra });
+beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'u', role: 'employee' } as never, bindings: [] });
+  useSystemStore.setState({ status: null });
+  useCallableAgentsStore.setState({ entries: {} });
+  useAgentsStore.setState({ agents: roster });
+  mockWsClient.call.mockImplementation(async () => ({ agents: [grant('mine'), grant('main', { selectable: false }), grant('public', { via: 'public', selectable: false }), grant('team', { via: 'team', via_user_name: 'Report' })] }));
 });
-
-
-describe('useVisibleAgents', () => {
-  const direct = { name: 'mine', display_name: 'Mine' } as AgentDetail;
-  const other = { name: 'other', display_name: 'Other' } as AgentDetail;
-  const team = { name: 'team', display_name: 'Team', via: 'team', via_user_name: 'Report', level: 'operator' } as CallableAgent;
-  beforeEach(() => {
-    useAuthStore.setState({ user: { id: 'u', role: 'manager' } as never, bindings: [{ user_id: 'u', agent_name: 'mine', access_level: 'operator', bound_at: '' }] });
-    useAgentsStore.setState({ agents: [direct], teamAgents: [team, { ...team, name: 'public', via: 'public' }], teamSubject: JSON.stringify(['u', 'manager']) });
-  });
-  it('employee sees only directly bound agents even if the detailed roster over-returns', () => {
-    useAuthStore.setState({ user: { id: 'u', role: 'employee' } as never, bindings: [{ user_id: 'u', agent_name: 'mine', access_level: 'operator', bound_at: '' }] });
-    useAgentsStore.setState({ agents: [direct, other] });
-    const { result } = renderHook(() => useVisibleAgents());
-    expect(result.current.map(a => a.name)).toEqual(['mine']);
-  });
-  it('manager gets only team grants as display-only entries without sensitive fields', () => {
-    const { result } = renderHook(() => useVisibleAgents());
-    expect(result.current.map(a => a.name)).toEqual(['mine', 'team']);
-    expect(result.current[1]).toMatchObject({ readOnly: true, teamMember: 'Report' });
-    expect(result.current[1]).not.toHaveProperty('budget');
-    expect(result.current[1]).not.toHaveProperty('model');
-  });
-  it('direct-only surfaces omit team entries, duplicate direct entries are not replaced', () => {
-    useAgentsStore.setState({ teamAgents: [team, { ...team, name: 'mine' }] });
-    const { result } = renderHook(() => useVisibleAgents(false));
-    expect(result.current).toEqual([direct]);
-    const merged = renderHook(() => useVisibleAgents());
-    expect(merged.result.current.filter(a => a.name === 'mine')).toEqual([direct]);
-  });
-  it('drops team entries when the viewer changes', () => {
-    useAuthStore.setState({ user: { id: 'new', role: 'manager' } as never, bindings: [] });
+it('maps scope and direct binding names', () => {
+  expect(['admin', 'manager', 'employee', undefined].map(r => scopeForRole(r as never))).toEqual(['all', 'reports', 'own', 'own']);
+  expect(ownedAgentNames([{ agent_name: 'mine' } as never])).toEqual(new Set(['mine']));
+});
+for (const role of ['employee', 'manager']) describe(role, () => {
+  beforeEach(() => useAuthStore.setState({ user: { id: 'u', role } as never }));
+  it('fails closed while loading, then uses only selectable grants, with team display data only', async () => {
     const { result } = renderHook(() => useVisibleAgents());
     expect(result.current).toEqual([]);
+    await waitFor(() => expect(result.current.map(a => a.name)).toEqual(['mine', 'team']));
+    expect(result.current[1]).toMatchObject({ readOnly: true, teamMember: 'Report' });
+    expect(result.current[1]).not.toHaveProperty('model');
+    expect(result.current[1]).not.toHaveProperty('budget');
   });
-  it('fetches detailed data directly and limits callable entries to team grants', async () => {
-    mockWsClient.call.mockImplementation(async (method: string) => method === 'agents.callable' ? { agents: [team, { ...team, name: 'public', via: 'public' }] } : { agents: [direct] });
-    await useAgentsStore.getState().fetchAgents();
-    expect(useAgentsStore.getState().agents).toEqual([direct]);
-    expect(useAgentsStore.getState().teamAgents).toEqual([team]);
+  it('keeps file/settings pickers direct-only', async () => {
+    const { result } = renderHook(() => useVisibleAgents(false));
+    await waitFor(() => expect(result.current).toEqual([roster[0]]));
   });
+  it('shows no agents on callable failure', async () => {
+    mockWsClient.call.mockRejectedValue(new Error('offline'));
+    const { result } = renderHook(() => useVisibleAgents());
+    await waitFor(() => expect(Object.values(useCallableAgentsStore.getState().entries)[0]?.loading).toBe(false));
+    expect(result.current).toEqual([]);
+  });
+});
+it.each(['admin', 'personal'])('%s keeps the full roster even on failure', async mode => {
+  if (mode === 'admin') useAuthStore.setState({ user: { id: 'a', role: 'admin' } as never });
+  else useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+  mockWsClient.call.mockRejectedValue(new Error('offline'));
+  const { result } = renderHook(() => useVisibleAgents());
+  expect(result.current).toEqual(roster);
+  await act(async () => {});
+});
+it('accepts main only with an explicit selectable grant', async () => {
+  mockWsClient.call.mockResolvedValue({ agents: [grant('main')] });
+  const { result } = renderHook(() => useVisibleAgents());
+  await waitFor(() => expect(result.current.map(a => a.name)).toEqual(['main']));
+});
+it('ignores an old account response and deduplicates concurrent consumers', async () => {
+  let resolve!: (value: unknown) => void;
+  mockWsClient.call.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+  const { result } = renderHook(() => [useVisibleAgents(), useVisibleAgents()]);
+  act(() => useAuthStore.setState({ user: { id: 'new', role: 'employee' } as never }));
+  await act(async () => resolve({ agents: [grant('other')] }));
+  await waitFor(() => expect(result.current[0].map(a => a.name)).toEqual(['mine', 'team']));
+  expect(result.current[1]).toEqual(result.current[0]);
+});
+it('drops stale grants during refresh and after failure', async () => {
+  const { result } = renderHook(() => useVisibleAgents());
+  await waitFor(() => expect(result.current.length).toBe(2));
+  mockWsClient.call.mockRejectedValue(new Error('revoked'));
+  act(() => window.dispatchEvent(new Event('focus')));
+  expect(result.current).toEqual([]);
+  await act(async () => {});
+  expect(result.current).toEqual([]);
 });

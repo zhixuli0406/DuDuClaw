@@ -1,3 +1,4 @@
+import { useVisibleAgents } from '@/lib/data-scope';
 import { chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -340,16 +341,18 @@ export function GoalsPage() {
   // Entry policy keeps the legacy assignment surface available for restoration.
   const openAssign = useOpenAssign();
   const connState = useConnectionStore((s) => s.state);
-  const { agents, fetchAgents, loaded: agentsLoaded } = useAgentsStore();
+  const { fetchAgents, loaded: agentsLoaded } = useAgentsStore();
+  const agents = useVisibleAgents(false);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [searchParams] = useSearchParams();
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   // `/goals?assigned=me` (the WebChat task card) opens the "assigned by me" view.
-  const [agentFilter, setAgentFilter] = useState(() =>
+  const [requestedAgent, setAgentFilter] = useState(() =>
     searchParams.get('assigned') === 'me' ? ASSIGNED_BY_ME : '',
   );
+  const agentFilter = isAdmin || requestedAgent === ASSIGNED_BY_ME || agents.some(a => a.name === requestedAgent) ? requestedAgent : '';
   const mine = agentFilter === ASSIGNED_BY_ME;
   const realAgent = mine ? '' : agentFilter;
   const [search, setSearch] = useState('');

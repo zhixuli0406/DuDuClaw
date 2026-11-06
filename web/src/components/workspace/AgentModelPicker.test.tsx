@@ -1,3 +1,4 @@
+import { useAuthStore } from '@/stores/auth-store';
 import { setStandardProductPolicyFixture } from '@/test/product-policy';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen } from '@testing-library/react';
@@ -14,6 +15,7 @@ const ROSTER = [
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
   localStorage.clear();
   useAgentsStore.setState({ agents: ROSTER as never, loaded: true });
 });

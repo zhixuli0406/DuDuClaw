@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, screen, waitFor } from '@testing-library/react';
 import { mockWsClient } from '@/test/mocks';
+import { api } from '@/lib/api';
 import { renderWithProviders } from '@/test/render';
 import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
@@ -20,6 +21,7 @@ const structure = [{ name: 'finance', display_name: 'Finance assistant', departm
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: structure.map(a => ({ ...a, selectable: true, via: 'binding' })), default_agent: null } as never);
   useAuthStore.setState({ user: { id: 'employee-one', email: 'one@test.invalid', display_name: 'Reader',
     role: 'employee', status: 'active' }, bindings: [] });
   useConnectionStore.setState({ state: 'authenticated' });
@@ -31,7 +33,7 @@ describe('employee organization chart', () => {
     renderWithProviders(<OrgChartPage />);
     expect(await screen.findByText('Finance assistant')).toBeInTheDocument();
     expect(mockWsClient.call).toHaveBeenCalledWith('agents.org_chart', {});
-    expect(mockWsClient.call.mock.calls.every(([method]) => method === 'agents.org_chart')).toBe(true);
+    expect(mockWsClient.call.mock.calls.some(([method]) => ['agents.list', 'agents.inspect'].includes(String(method)))).toBe(false);
     expect(chart.mock.calls.at(-1)?.[0].onNodeClick).toBeUndefined();
     expect(screen.queryByRole('link')).not.toBeInTheDocument();
   });
@@ -49,9 +51,9 @@ describe('employee organization chart', () => {
     await screen.findByText('Finance assistant');
     act(() => useConnectionStore.setState({ state: 'disconnected' }));
     expect(screen.queryByText('Finance assistant')).not.toBeInTheDocument();
-    expect(mockWsClient.call).toHaveBeenCalledTimes(1);
+    expect(mockWsClient.call.mock.calls.filter(([method]) => method === 'agents.org_chart')).toHaveLength(1);
     act(() => useConnectionStore.setState({ state: 'authenticated' }));
-    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mockWsClient.call.mock.calls.filter(([method]) => method === 'agents.org_chart')).toHaveLength(2));
   });
 
   it('discards an old account response after switching accounts', async () => {
@@ -59,9 +61,9 @@ describe('employee organization chart', () => {
     mockWsClient.call.mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve; }));
     mockWsClient.call.mockResolvedValueOnce({ agents: [] });
     renderWithProviders(<OrgChartPage />);
-    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(mockWsClient.call.mock.calls.filter(([method]) => method === 'agents.org_chart')).toHaveLength(1));
     act(() => useAuthStore.setState(s => ({ user: { ...s.user!, id: 'employee-two' } })));
-    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mockWsClient.call.mock.calls.filter(([method]) => method === 'agents.org_chart')).toHaveLength(2));
     await act(async () => resolveOld({ agents: structure }));
     expect(screen.queryByText('Finance assistant')).not.toBeInTheDocument();
   });

@@ -1,3 +1,5 @@
+import { useAuthStore } from '@/stores/auth-store';
+import { useVisibleAgents } from '@/lib/data-scope';
 import { TASK_ENTRY_POINTS_HIDDEN, chatEntryLabel } from '@/lib/task-entry-visibility';
 import { DataExportButton } from '@/components/DataExportButton';
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
@@ -748,12 +750,14 @@ export function TaskBoardPage() {
     createTask,
     moveTask,
     removeTask,
-    filterAgent,
+    filterAgent: requestedAgent,
     filterPriority,
     setFilterAgent,
     setFilterPriority,
   } = useTasksStore();
-  const { agents, fetchAgents } = useAgentsStore();
+  const { fetchAgents } = useAgentsStore();
+  const agents = useVisibleAgents(false);
+  const filterAgent = useAuthStore(s => s.user?.role) === 'admin' || agents.some(a => a.name === requestedAgent) ? requestedAgent : null;
 
   const [view, setView] = useState<ViewMode>(() => readPref(VIEW_KEY, ['kanban', 'list'] as const, 'kanban'));
   const [group, setGroup] = useState<GroupMode>(() => readPref(GROUP_KEY, ['status', 'assignee'] as const, 'status'));
@@ -786,7 +790,7 @@ export function TaskBoardPage() {
   }, [searchParams]);
 
   // `?assignee=<id>` (employee-detail "交辦" button) preselects the assignee.
-  const defaultAssignee = searchParams.get('assignee') || undefined;
+  const defaultAssignee = agents.find(a => a.name === searchParams.get('assignee'))?.name;
 
   // W3-3 (state-as-URL, Stripe pattern B4): seed the agent/priority filters
   // from the URL once on mount so a bookmarked/shared `/tasks?agent=…` link

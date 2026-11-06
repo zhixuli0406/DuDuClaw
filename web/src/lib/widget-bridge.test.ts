@@ -7,7 +7,7 @@ vi.mock('@/lib/api', async (importOriginal) => {
     api: {
       ...original.api,
       system: { ...original.api.system, status: vi.fn() },
-      agents: { ...original.api.agents, list: vi.fn() },
+      agents: { ...original.api.agents, list: vi.fn(), callable: vi.fn() },
     },
   };
 });
@@ -60,4 +60,26 @@ describe('widget-bridge cache', () => {
     // Sanity: the allowlist itself is non-empty and doesn't include it.
     expect(BRIDGE_METHOD_NAMES).not.toContain('agents.deleteEveryone');
   });
+});
+
+const { useAuthStore } = await import('@/stores/auth-store');
+const { useSystemStore } = await import('@/stores/system-store');
+const { useCallableAgentsStore } = await import('@/stores/callable-agents-store');
+
+it.each(['employee', 'manager', 'admin', 'failure'])('filters widget agent summaries for %s', async mode => {
+  useAuthStore.setState({ user: { id: mode, role: mode === 'failure' ? 'employee' : mode } as never });
+  useSystemStore.setState({ status: null });
+  useCallableAgentsStore.setState({ entries: {} });
+  const roster = ['mine', 'main', 'other'].map(name => ({ name, display_name: name, role: name === 'main' ? 'main' : 'worker' }));
+  vi.mocked(api.agents.list).mockResolvedValue({ agents: roster } as never);
+  if (mode === 'failure') vi.mocked(api.agents.callable).mockRejectedValue(new Error('offline'));
+  else vi.mocked(api.agents.callable).mockResolvedValue({ agents: [{ ...roster[0], selectable: true, via: 'binding' }], default_agent: null } as never);
+  const result = await handleWidgetMessage({ type: 'duduclaw:rpc', seq: 1, method: 'agents.summary' }, []);
+  const names = (result?.result as { agents: { name: string }[] }).agents.map(a => a.name);
+  expect(names).toEqual(mode === 'admin' ? ['mine', 'main', 'other'] : mode === 'failure' ? [] : ['mine']);
+  // An account transition cannot reuse the previous summary's cached projection.
+  useAuthStore.setState({ user: { id: 'next', role: 'employee' } as never });
+  vi.mocked(api.agents.callable).mockRejectedValue(new Error('revoked'));
+  const next = await handleWidgetMessage({ type: 'duduclaw:rpc', seq: 2, method: 'agents.summary' }, []);
+  expect(next?.result).toEqual({ agents: [] });
 });

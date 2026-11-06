@@ -36,6 +36,7 @@ const SEED: TaskInfo[] = [
 ];
 
 beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never, bindings: [] });
   vi.clearAllMocks();
   try {
     localStorage.clear();

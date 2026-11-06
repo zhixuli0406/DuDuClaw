@@ -80,7 +80,11 @@ export function TimelinePage() {
   const scope = useDataScope();
   const visibleAgents = useVisibleAgents();
   const [range, setRange] = useUrlState('range', '24h', { allowed: RANGE_KEYS });
-  const [agentFilter, setAgentFilter] = useUrlState('agent', '');
+  const [requestedAgent, setAgentFilter] = useUrlState('agent', '');
+  const agentFilter = scope === 'all' || visibleAgents.some(a => a.name === requestedAgent) ? requestedAgent : '';
+  useEffect(() => {
+    if (requestedAgent !== agentFilter) setAgentFilter(agentFilter);
+  }, [requestedAgent, agentFilter, setAgentFilter]);
   const [filter, setFilter] = useState<Bucket | null>(null);
   const [chartOpen, setChartOpen] = useState(false);
   const [result, setResult] = useState<TimelineListResult | null>(null);

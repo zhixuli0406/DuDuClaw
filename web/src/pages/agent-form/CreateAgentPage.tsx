@@ -1,3 +1,4 @@
+import { useVisibleAgents } from '@/lib/data-scope';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -38,7 +39,8 @@ import { sanitizeErrorDetail } from '@/lib/error-message';
 export function CreateAgentPage() {
   const intl = useIntl();
   const navigate = useNavigate();
-  const { agents, fetchAgents } = useAgentsStore();
+  const { fetchAgents } = useAgentsStore();
+  const agents = useVisibleAgents(false);
   const [name, setName] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [role, setRole] = useState('specialist');

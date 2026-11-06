@@ -21,6 +21,8 @@ const detail = (id: string) => ({ session_id: id, agent_id: 'sales', class: 'ext
   ] });
 
 beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'mgr', role: 'manager' } as never });
+  vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: team.members.flatMap(m => m.agents.map(a => ({ ...a, via: 'team', selectable: true }))), default_agent: null } as never);
   vi.clearAllMocks();
   mockWsClient.call.mockImplementation((method: string, params?: Record<string, unknown>) => {
     if (method === 'users.my_team') return Promise.resolve(team);
@@ -159,3 +161,6 @@ describe('TeamHistoryPage', () => {
     expect(mockWsClient.call).not.toHaveBeenCalledWith('users.team_history.get', expect.anything());
   });
 });
+
+import { api } from '@/lib/api';
+import { useAuthStore } from '@/stores/auth-store';

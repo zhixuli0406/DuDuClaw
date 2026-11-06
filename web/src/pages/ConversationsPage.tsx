@@ -1,3 +1,4 @@
+import { useVisibleAgents } from '@/lib/data-scope';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
@@ -63,11 +64,12 @@ export function ConversationsPage() {
   const subject = useAuthStore(conversationIdentityKey);
   const userStatus = useAuthStore((s) => s.user?.status);
   const canListAll = hasMinRole(role, 'admin');
-  const agents = useAgentsStore((s) => s.agents);
+  const agents = useVisibleAgents();
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const connectionState = useConnectionStore((s) => s.state);
   const activeSessionId = useChatStore((s) => s.sessionId);
   const selectedAgentId = useChatStore((s) => s.selectedAgentId);
+  const resolvedAgentId = useChatStore((s) => s.resolvedAgent?.id);
   const resume = useConversationsStore((s) => s.resume);
   const startNew = useConversationsStore((s) => s.startNew);
 
@@ -77,7 +79,11 @@ export function ConversationsPage() {
   // P11 (state-as-URL): search / employee scope / page all live in the query
   // string, so a filtered listing is bookmarkable and survives a refresh.
   const [query, setQuery] = useUrlState('q', '');
-  const [agentFilter, setAgentFilter] = useUrlState('agent', 'all');
+  const [requestedAgent, setAgentFilter] = useUrlState('agent', 'all');
+  const agentFilter = canListAll || agents.some(a => a.name === requestedAgent) ? requestedAgent : 'all';
+  useEffect(() => {
+    if (requestedAgent !== agentFilter) setAgentFilter(agentFilter);
+  }, [requestedAgent, agentFilter, setAgentFilter]);
   // The URL carries the 1-based page the user sees; the slice math stays 0-based.
   const [pageParam, setPageParam] = useUrlNumberState('page', 1, { min: 1 });
   const page = pageParam - 1;
@@ -90,7 +96,9 @@ export function ConversationsPage() {
     [agents],
   );
   // The scope a non-admin listing falls back to when no employee is picked.
-  const defaultAgentId = selectedAgentId ?? mainAgentId;
+  const defaultAgentId = (agents.some(a => a.name === selectedAgentId) ? selectedAgentId : null)
+    ?? (agents.some(a => a.name === resolvedAgentId) ? resolvedAgentId : null)
+    ?? mainAgentId;
   const scopedAgentId = agentFilter !== 'all' ? agentFilter : canListAll ? null : defaultAgentId;
   const listKey = JSON.stringify([subject, connectionState, scopedAgentId, reloadNonce]);
   const currentKey = useRef(listKey);

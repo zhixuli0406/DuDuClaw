@@ -40,6 +40,7 @@ function precedes(a: Element, b: Element): boolean {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.spyOn(api.agents, 'callable').mockImplementation(async () => ({ agents: useAgentsStore.getState().agents.filter(a => useAuthStore.getState().bindings.some(b => b.agent_name === a.name)).map(a => ({ ...a, via: 'binding', selectable: true })), default_agent: null }) as never);
   localStorage.clear();
   useBrandStore.setState({ brand: null });
   useCompanyStore.getState().setCompany(null);
@@ -387,11 +388,12 @@ describe('employee sidebar', () => {
     expect(document.querySelector('svg.lucide-bell')).not.toBeNull();
   });
 
-  it('marks and sorts the primary employee before an Owner binding', () => {
+  it('marks and sorts the primary employee before an Owner binding', async () => {
     useAgentsStore.setState({ agents: makeAgents(2) as never });
     useAuthStore.setState({ user: { id: 'employee', role: 'employee', primary_agent_id: 'agent-1' } as never,
       bindings: [{ agent_name: 'agent-0', access_level: 'owner' }, { agent_name: 'agent-1', access_level: 'operator' }] as never });
     renderSidebar();
+    await screen.findByText('Agent 0');
     const links = screen.getAllByRole('link').filter(link => /^\/agents\//.test(link.getAttribute('href') ?? ''));
     expect(links.map(link => link.getAttribute('href'))).toEqual(['/agents/agent-1', '/agents/agent-0']);
     expect(links[0]).toHaveTextContent('Primary');
@@ -412,7 +414,7 @@ describe('employee sidebar', () => {
     const me = vi.spyOn(api.users, 'me').mockImplementation(() => refreshing as ReturnType<typeof api.users.me>);
     renderSidebar();
     const staffLinks = () => screen.getAllByRole('link').filter(link => /^\/agents\//.test(link.getAttribute('href') ?? ''));
-    expect(staffLinks()[0]).toHaveAttribute('href', '/agents/agent-0');
+    await waitFor(() => expect(staffLinks()[0]).toHaveAttribute('href', '/agents/agent-0'));
     await user.click(screen.getAllByRole('button', { name: 'Set as primary' })[1]);
     await user.click(await screen.findByRole('menuitem', { name: 'Set as primary' }));
     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('users.set_primary_agent', { agent_id: 'agent-1' }));
@@ -429,19 +431,20 @@ describe('employee sidebar', () => {
     me.mockRestore();
   });
 
-  it('does not offer a primary selection for Viewer bindings', () => {
+  it('does not offer a primary selection for Viewer bindings', async () => {
     useAgentsStore.setState({ agents: makeAgents(2) as never });
     useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never,
       bindings: [{ agent_name: 'agent-0', access_level: 'viewer' }, { agent_name: 'agent-1', access_level: 'operator' }] as never });
     renderSidebar();
-    expect(screen.getAllByRole('button', { name: 'Set as primary' })).toHaveLength(1);
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'Set as primary' })).toHaveLength(1));
   });
 
-  it('sorts bound staff by owner, operator, viewer and limits the list to eight', () => {
+  it('sorts bound staff by owner, operator, viewer and limits the list to eight', async () => {
     const agents = makeAgents(10);
     useAgentsStore.setState({ agents: agents as never });
     useAuthStore.setState({ bindings: agents.map((a, index) => ({ agent_name: a.name, access_level: index === 9 ? 'owner' : index === 8 ? 'operator' : 'viewer' })) as never });
     renderSidebar();
+    await screen.findByText('Agent 0');
     const links = screen.getAllByRole('link').filter(link => /^\/agents\//.test(link.getAttribute('href') ?? ''));
     expect(links).toHaveLength(8);
     expect(links.slice(0, 2).map(link => link.getAttribute('href'))).toEqual(['/agents/agent-9', '/agents/agent-8']);

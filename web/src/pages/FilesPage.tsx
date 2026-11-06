@@ -144,7 +144,11 @@ export function FilesPage() {
 
   // Resolve the effective selection once agents load.
   const effective =
-    selected || (scope === 'all' ? SHARED : (visibleAgents[0]?.name ?? ''));
+    (scope === 'all' || visibleAgents.some(a => a.name === selected) ? selected : '')
+    || (scope === 'all' ? SHARED : (visibleAgents[0]?.name ?? ''));
+  useEffect(() => {
+    if (scope !== 'all' && selected && !visibleAgents.some(a => a.name === selected)) setSelected('');
+  }, [scope, selected, visibleAgents, setSelected]);
 
   const dateFmt = useMemo(
     () =>

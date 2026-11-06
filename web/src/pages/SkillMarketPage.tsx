@@ -1,3 +1,4 @@
+import { useVisibleAgents } from '@/lib/data-scope';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useSearchParams } from 'react-router';
@@ -535,7 +536,8 @@ function severityBadgeClass(sev: string): { variant: 'secondary' | 'destructive'
 
 function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: () => void }) {
   const intl = useIntl();
-  const { agents, fetchAgents } = useAgentsStore();
+  const { fetchAgents } = useAgentsStore();
+  const agents = useVisibleAgents(false);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [scope, setScope] = useState('global');
   const [scanning, setScanning] = useState(false);

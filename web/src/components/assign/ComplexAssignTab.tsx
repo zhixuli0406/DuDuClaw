@@ -1,3 +1,4 @@
+import { useVisibleAgents } from '@/lib/data-scope';
 import { RecentSkillChips } from '@/components/skills/RecentSkillChips';
 import { useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -71,12 +72,15 @@ export function ComplexAssignTab({
   const intl = useIntl();
   const navigate = useNavigate();
 
-  const agents = useAgentsStore((s) => s.agents);
+  const agents = useVisibleAgents(false);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const loaded = useAgentsStore((s) => s.loaded);
 
   const [mode, setMode] = useState<AssignMode>(prefill?.mode ?? 'assign');
   const [agentId, setAgentId] = useState(prefill?.agentId ?? '');
+  useEffect(() => {
+    if (agentId && !agents.some(a => a.name === agentId)) setAgentId('');
+  }, [agentId, agents]);
   const [description, setDescription] = useState(prefill?.description ?? '');
   const [criteria, setCriteria] = useState(prefill?.acceptanceCriteria ?? '');
   const [outputFormat, setOutputFormat] = useState<OutputFormat>('unspecified');

@@ -1,3 +1,4 @@
+import { useVisibleAgents } from '@/lib/data-scope';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Link } from 'react-router';
@@ -157,10 +158,11 @@ export function ResponsibilitiesPage() {
       bindings.some((b) => b.agent_name === agent && (b.access_level === 'operator' || b.access_level === 'owner')),
     [isAdmin, bindings],
   );
+  const visibleAgents = useVisibleAgents();
   const operableAgents = useMemo(
     () =>
-      [...new Set(bindings.filter((b) => b.access_level !== 'viewer').map((b) => b.agent_name))].sort(),
-    [bindings],
+      [...new Set(bindings.filter((b) => b.access_level !== 'viewer' && visibleAgents.some(a => a.name === b.agent_name)).map((b) => b.agent_name))].sort(),
+    [bindings, visibleAgents],
   );
 
   const load = useCallback(async () => {

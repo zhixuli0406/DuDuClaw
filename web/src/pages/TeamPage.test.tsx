@@ -90,6 +90,8 @@ function answer(team: MyTeam) {
 }
 
 beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'mgr', role: 'manager' } as never });
+  vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: TEAM.members.flatMap(m => m.agents.map(a => ({ ...a, via: 'team', selectable: true }))), default_agent: null } as never);
   vi.clearAllMocks();
   entryPolicy.hidden = true;
   answer(TEAM);
@@ -227,3 +229,6 @@ it('replaces team assignment with a new chat draft and never creates a task', as
   expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   expect(mockWsClient.call.mock.calls.some(([method]) => method === 'tasks.create')).toBe(false);
 });
+
+import { api } from '@/lib/api';
+import { useAuthStore } from '@/stores/auth-store';

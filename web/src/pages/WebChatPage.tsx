@@ -1,3 +1,5 @@
+import { useVisibleAgents } from '@/lib/data-scope';
+import { useCallableAgents } from '@/stores/callable-agents-store';
 import { RecentSkillChips } from '@/components/skills/RecentSkillChips';
 import { ChatWaitingNotice } from '@/components/chat/ChatWaitingNotice';
 import { ReadOnlyHistoryView } from '@/components/chat/ReadOnlyHistoryView';
@@ -56,7 +58,6 @@ import {
   orderMentionCandidates,
   type MentionAgent,
 } from '@/lib/mention';
-import { api, type CallableAgent } from '@/lib/api';
 import { PRODUCT_NAME, useEffectiveName } from '@/lib/product-identity';
 import { ManagerReadNotice } from '@/components/chat/ManagerReadNotice';
 
@@ -107,7 +108,8 @@ function InteractiveWebChatPage() {
     selectAgent,
   } = useChatStore();
 
-  const agents = useAgentsStore((s) => s.agents);
+  const chatSessionId = useChatStore((s) => s.sessionId);
+  const agents = useVisibleAgents(true, chatSessionId);
   const agentsLoaded = useAgentsStore((s) => s.loaded);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
 
@@ -188,32 +190,13 @@ function InteractiveWebChatPage() {
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   }, [input]);
 
-  // Who this account may call (`agents.callable`: own staff, a manager's
-  // team, the default and public staff). `null` until loaded or when the RPC
-  // fails; the page then falls back to `agents.list` (own staff only, a
-  // subset of what the server lets through).
-  const [callable, setCallable] = useState<readonly CallableAgent[] | null>(null);
-  const callableRequest = useRef(0);
-  const chatSessionId = useChatStore((s) => s.sessionId);
-  const loadCallable = useCallback(() => {
-    const request = ++callableRequest.current;
-    api.agents
-      .callable(chatSessionId)
-      .then((r) => { if (request === callableRequest.current) setCallable(Array.isArray(r?.agents) ? r.agents : null); })
-      .catch(() => { if (request === callableRequest.current) setCallable(null); });
-  }, [chatSessionId]);
-  useEffect(() => {
-    loadCallable();
-    window.addEventListener('focus', loadCallable);
-    return () => { ++callableRequest.current; window.removeEventListener('focus', loadCallable); };
-  }, [loadCallable, selectedAgentId]);
+  const { agents: callable, refresh: loadCallable } = useCallableAgents(chatSessionId);
 
   // The chosen partner (an AI staff member) or DuDu (the office assistant).
   const partner = useMemo(() => {
     if (!selectedAgentId) return null;
     return (
       agents.find((a) => a.name === selectedAgentId)
-      ?? callable?.find((a) => a.name === selectedAgentId)
       ?? null
     );
   }, [agents, callable, selectedAgentId]);
@@ -230,11 +213,12 @@ function InteractiveWebChatPage() {
 
   useEffect(() => {
     if (!assignedOnly) return;
+    if (callable !== null && selectedAgentId && !agents.some(a => a.name === selectedAgentId)) selectAgent(null);
     const requested = searchParams.get('agent');
-    if (requested && (requested !== resolvedAgent?.id || !callable?.some(a => a.name === requested))) {
+    if (requested && (requested !== resolvedAgent?.id || !agents.some(a => a.name === requested))) {
       setAgentParam(null);
     }
-  }, [assignedOnly, searchParams, resolvedAgent?.id, callable, setAgentParam]);
+  }, [assignedOnly, searchParams, resolvedAgent?.id, agents, callable, selectedAgentId, selectAgent, setAgentParam]);
 
   // The main agent is already represented by the leading DuDu chip (which routes
   // to it), so it gets no duplicate employee chip in the row. Only staff the
@@ -297,12 +281,12 @@ function InteractiveWebChatPage() {
 
   const productName = useEffectiveName();
   const partnerName = assignedOnly && resumedExplicitly
-    ? partner?.display_name ?? selectedAgentId ?? agentName
+    ? partner?.display_name ?? intl.formatMessage({ id: 'webchat.assignment.title' })
     : assignedOnly
     ? resolvedAgent?.name ?? intl.formatMessage({ id: 'webchat.assignment.title' })
     : partner?.display_name ?? (agentName === PRODUCT_NAME ? productName : agentName);
 
-  const avatarAgentId = assignedOnly && !resumedExplicitly ? resolvedAgent?.id ?? null : selectedAgentId;
+  const avatarAgentId = assignedOnly && !resumedExplicitly ? resolvedAgent?.id ?? null : partner?.name ?? null;
 
   // Recording drives the `listening` face just like typing does.
   const face = useChatFace(phase, input.trim().length > 0 || isRecording, messages.length > 0);
@@ -373,7 +357,8 @@ function InteractiveWebChatPage() {
   // task; the gateway checks the right again when the command arrives.
   const assigning = isAssignCommand(input);
   const mentionSource = useMemo<readonly MentionAgent[]>(() => {
-    const all = (callable ?? (assignedOnly ? [] : agents)) as readonly MentionAgent[];
+    const visible = new Set(agents.map(a => a.name));
+    const all = (assignedOnly ? (callable ?? []).filter(a => visible.has(a.name)) : callable ?? agents) as readonly MentionAgent[];
     return assigning ? assignableAgents(all) : all;
   }, [callable, agents, assigning, assignedOnly]);
   const mentionCandidates = useMemo(

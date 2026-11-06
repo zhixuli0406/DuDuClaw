@@ -1,6 +1,8 @@
+import { useVisibleAgents } from '@/lib/data-scope';
+import { useAgentsStore } from '@/stores/agents-store';
 import { useCallback, useEffect, useMemo, useState, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
-import { api, type AgentInfo, type MarketplaceServer } from '@/lib/api';
+import { api, type MarketplaceServer } from '@/lib/api';
 import { RequiredEnvFields, missingRequiredEnv, requiredEnvPayload } from '@/components/shared/RequiredEnvFields';
 import {
   Badge,
@@ -138,7 +140,8 @@ export function MarketplacePage() {
   const [installError, setInstallError] = useState<string | null>(null);
   const [servers, setServers] = useState<ReadonlyArray<MarketplaceServer>>([]);
   const [loading, setLoading] = useState(true);
-  const [agents, setAgents] = useState<ReadonlyArray<AgentInfo>>([]);
+  const agents = useVisibleAgents(false);
+  const fetchAgents = useAgentsStore(s => s.fetchAgents);
   const [installTarget, setInstallTarget] = useState<string | null>(null);
   const [installAgent, setInstallAgent] = useState('');
   // v1.68: typed values for the target item's required env names. Cleared
@@ -147,17 +150,11 @@ export function MarketplacePage() {
   const [installing, setInstalling] = useState(false);
   const [loadError, setLoadError] = useState<unknown>(null);
 
+  useEffect(() => { void fetchAgents(); }, [fetchAgents]);
   useEffect(() => {
-    api.agents.list().then((res) => {
-      const list = res?.agents ?? [];
-      setAgents(list);
-      if (list.length > 0) {
-        setInstallAgent((prev) => prev || list[0].name);
-      }
-    }).catch(() => {
-      // Agent list failure surfaces when the install dialog opens (empty select).
-    });
-  }, []);
+    setInstallAgent(prev => agents.some(a => a.name === prev) ? prev : agents[0]?.name ?? '');
+  }, [agents]);
+
 
   // Fetch the catalog (including backend-derived `installed_by`) so the
   // "installed" state survives reloads and reflects real `.mcp.json` content.

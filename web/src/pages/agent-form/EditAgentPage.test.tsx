@@ -605,5 +605,5 @@ it('does not load settings for an AI employee accessed through a team member', (
   useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [] });
   renderAt('/agents/team-agent/edit');
   expect(screen.getByRole('note')).toHaveTextContent('Memory and settings require direct access');
-  expect(mockWsClient.call).not.toHaveBeenCalled();
+  expect(mockWsClient.call.mock.calls.every(([method]) => method === 'agents.callable')).toBe(true);
 });

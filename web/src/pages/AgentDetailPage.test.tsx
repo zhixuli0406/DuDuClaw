@@ -49,6 +49,7 @@ function renderAt(id: string) {
 }
 
 beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never, bindings: [] });
   vi.clearAllMocks();
   // Combined payload: inspect reads the whole object; tasks.list / activity.list
   // pick their `.tasks` / `.events` fields off the same envelope.
@@ -219,5 +220,5 @@ it('shows a team read-only message before any private loader mounts', () => {
   useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [] });
   renderAt('team-agent');
   expect(screen.getByRole('note')).toHaveTextContent('Memory and settings require direct access');
-  expect(mockWsClient.call).not.toHaveBeenCalled();
+  expect(mockWsClient.call.mock.calls.every(([method]) => method === 'agents.callable')).toBe(true);
 });

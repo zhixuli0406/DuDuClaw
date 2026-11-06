@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { fireEvent, screen, waitFor, act } from '@testing-library/react';
 import { useLocation } from 'react-router';
 import { mockWsClient } from '@/test/mocks';
+import { api } from '@/lib/api';
 import { renderWithProviders } from '@/test/render';
 import { CommandPalette } from './CommandPalette';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
@@ -54,6 +55,7 @@ function mockIdLookupCalls(overrides: Partial<Record<string, unknown>> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [{ name: 'sales', display_name: 'Sales', role: 'worker', via: 'binding', selectable: true }], default_agent: null } as never);
   useCommandPaletteStore.setState({ open: true, recent: [] });
   useAgentsStore.setState({ agents: [], loading: false } as never);
   useTasksStore.setState({ tasks: [], loading: false } as never);
@@ -284,7 +286,7 @@ describe('CommandPalette restricted conversation results',()=>{
   const hit={source:'conversation',id:'opaque-ref',title:'Masked external match',snippet:'UniquePrivacyQuery',agent_id:'sales',timestamp:'2026-10-24T00:00:00Z',jump:{session_id:alias,channel:'whatsapp',read_only:true,ner:false}};
   function viewer(id='viewer-a'){
     useAuthStore.setState({user:{id,display_name:id,role:'employee',status:'active'},bindings:[{user_id:id,agent_name:'sales',access_level:'viewer',bound_at:''}]} as never);
-    useAgentsStore.setState({agents:[{name:'sales',display_name:'Sales',role:'main',status:'active'}],loaded:true} as never);
+    useAgentsStore.setState({agents:[{name:'sales',display_name:'Sales',role:'worker',status:'active'}],loaded:true} as never);
   }
   it('states the regex-only boundary before a masked search snippet is read',async()=>{
     viewer();mockIdLookupCalls({'search.query':{hits:[hit]}});renderPalette();

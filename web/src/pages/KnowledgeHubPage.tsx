@@ -1,3 +1,5 @@
+import { useVisibleAgents } from '@/lib/data-scope';
+import { useAgentsStore } from '@/stores/agents-store';
 import { DataExportButton } from '@/components/DataExportButton';
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useIntl } from 'react-intl';
@@ -72,7 +74,8 @@ function namespaceOf(path: string): string {
 export function KnowledgeHubPage({ embedded = false }: { embedded?: boolean }) {
   const intl = useIntl();
   const [view, setView] = useState<ViewId>('browse');
-  const [agents, setAgents] = useState<ReadonlyArray<{ name: string; display_name: string }>>([]);
+  const agents = useVisibleAgents(false);
+  const fetchAgents = useAgentsStore(s => s.fetchAgents);
   const [selectedAgent, setSelectedAgent] = useState('');
   // A node clicked in the topic map (graph view) hands its page path here so
   // the browse view can open straight into the reading view for that page
@@ -80,13 +83,11 @@ export function KnowledgeHubPage({ embedded = false }: { embedded?: boolean }) {
   // looked live but did nothing, UX audit §2-5).
   const [graphSelectedPath, setGraphSelectedPath] = useState<string | null>(null);
 
+  useEffect(() => { void fetchAgents(); }, [fetchAgents]);
   useEffect(() => {
-    api.agents.list().then((res) => {
-      const list = res?.agents ?? [];
-      setAgents(list);
-      if (list.length > 0) setSelectedAgent((prev) => prev || list[0].name);
-    }).catch(() => { /* ignore — empty state covers it */ });
-  }, []);
+    setSelectedAgent(prev => agents.some(a => a.name === prev) ? prev : agents[0]?.name ?? '');
+  }, [agents]);
+
 
   const viewOptions: SegmentedOption<ViewId>[] = [
     { value: 'browse', label: intl.formatMessage({ id: 'wiki.tab.browse' }) },

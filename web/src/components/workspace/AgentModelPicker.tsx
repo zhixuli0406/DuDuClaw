@@ -1,3 +1,4 @@
+import { useVisibleAgents } from '@/lib/data-scope';
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { ChevronDown, Check } from 'lucide-react';
@@ -24,7 +25,7 @@ export function AgentModelPicker({
   onChange: (agentId: string) => void;
 }) {
   const intl = useIntl();
-  const agents = useAgentsStore((s) => s.agents);
+  const agents = useVisibleAgents(false);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const loaded = useAgentsStore((s) => s.loaded);
   const brandName = useEffectiveName();

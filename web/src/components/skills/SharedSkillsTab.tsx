@@ -1,3 +1,4 @@
+import { useVisibleAgents } from '@/lib/data-scope';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { Download, Share2, CheckCircle } from 'lucide-react';
@@ -29,11 +30,15 @@ const SHARED_SORTS: readonly SkillSortKey[] = ['name', 'mostUsed', 'recentlyAdde
 /** Team (shared) skills: search across name, description and tags; sortable. */
 export function SharedSkillsTab({ filter }: { filter: string }) {
   const intl = useIntl();
-  const { agents, fetchAgents } = useAgentsStore();
+  const { fetchAgents } = useAgentsStore();
+  const agents = useVisibleAgents(false);
   const [sharedSkills, setSharedSkills] = useState<SharedSkillInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [adoptTarget, setAdoptTarget] = useState<SharedSkillInfo | null>(null);
   const [adoptAgent, setAdoptAgent] = useState('');
+  useEffect(() => {
+    if (adoptAgent && !agents.some(a => a.name === adoptAgent)) setAdoptAgent('');
+  }, [adoptAgent, agents]);
   const [adoptSuccess, setAdoptSuccess] = useState<string | null>(null);
   const [sort, setSort] = useSkillSort('shared');
 

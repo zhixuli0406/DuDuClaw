@@ -226,6 +226,7 @@ export const useConversationsStore = create<ConversationsState>((set, get) => {
       set({ ...emptyView });
       const previousChat = useChatStore.getState();
       useChatStore.getState().reset();
+      if (requiresAssignedChatAgent()) useChatStore.getState().selectAgent(null);
       if (!requiresAssignedChatAgent()) {
         const primary = useAgentsStore.getState().agents.find(agent =>
           agent.name === useAuthStore.getState().user?.primary_agent_id);

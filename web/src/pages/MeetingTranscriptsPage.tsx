@@ -1,3 +1,4 @@
+import { useVisibleAgents, useAgentVisibilityUnrestricted } from '@/lib/data-scope';
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { FileAudio, Download, RefreshCw, X } from 'lucide-react';
@@ -13,8 +14,12 @@ export function MeetingTranscriptsPage() {
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
   const user = useAuthStore(s => s.user);
-  const [agents, setAgents] = useState<CallableAgent[]>([]);
-  const [agent, setAgent] = useState('');
+  const [meetingAgents, setAgents] = useState<CallableAgent[]>([]);
+  const visibleAgents = useVisibleAgents();
+  const unrestricted = useAgentVisibilityUnrestricted();
+  const agents = meetingAgents.filter(a => unrestricted || visibleAgents.some(v => v.name === a.name));
+  const [requestedAgent, setAgent] = useState('');
+  const agent = agents.some(a => a.name === requestedAgent) ? requestedAgent : agents[0]?.name ?? '';
   const [file, setFile] = useState<File | null>(null);
   const [maxBytes, setMaxBytes] = useState(4 * 1024 ** 3);
   const [jobs, setJobs] = useState<MeetingJob[]>([]);

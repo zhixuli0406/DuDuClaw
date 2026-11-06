@@ -18,6 +18,7 @@ describe('required env helpers', () => {
 
 describe('MarketplacePage install with required env', () => {
   beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
     vi.clearAllMocks();
     useConnectionStore.setState({ state: 'authenticated' as never, error: null });
     mockWsClient.call.mockImplementation(async (method: string) => {
@@ -53,3 +54,5 @@ describe('MarketplacePage install with required env', () => {
     expect(params).toEqual({ id: 'browserbase', agent_id: 'sam', env: { BROWSERBASE_API_KEY: 'bb-secret' } });
   });
 });
+
+import { useAuthStore } from '@/stores/auth-store';
