@@ -35,7 +35,7 @@ it('starts a new chat with a server-provided example without sending it', async 
   renderWithProviders(<><FirstLoginCard enabled /><Location /></>);
   fireEvent.click(await screen.findByRole('button', { name: 'Try example 2' }));
   await waitFor(() => expect(fresh).toHaveBeenCalledOnce());
-  expect(screen.getByTestId('location')).toHaveTextContent('["/chat",{"draft":"Draft a reply."}]');
+  await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('["/chat",{"draft":"Draft a reply."}]'));
   expect(mockWsClient.call.mock.calls.map(([method]) => method)).not.toContain('chat.send');
 });
 it('requires opening the help panel and confirming it before marking reading done', async () => {
