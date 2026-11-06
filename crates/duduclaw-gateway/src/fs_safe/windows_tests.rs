@@ -140,23 +140,40 @@ fn set_junction(path: &Path, target: &Path, access: u32) -> io::Result<()> {
 
 #[test]
 fn in_place_junction_conversion_cannot_redirect_a_pinned_empty_directory() {
-    use windows_sys::Win32::{Foundation::GENERIC_WRITE, Storage::FileSystem::FILE_WRITE_ATTRIBUTES};
-    for access in [GENERIC_WRITE, FILE_WRITE_ATTRIBUTES] {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::{Foundation::GENERIC_WRITE, Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA}};
+    struct JunctionGuard(std::path::PathBuf);
+    impl Drop for JunctionGuard {
+        fn drop(&mut self) {
+            // Nonrecursive removal deletes only the junction, never its target.
+            if let Err(error) = std::fs::remove_dir(&self.0) {
+                if !std::thread::panicking() { panic!("junction cleanup failed: {error}"); }
+                eprintln!("junction cleanup failed during panic: {error}");
+            }
+        }
+    }
+    for access in [GENERIC_WRITE, FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA] {
         let temp = private_test_home().unwrap();
         let outside = private_test_home().unwrap();
         std::fs::write(outside.path().join("victim"), b"secret").unwrap();
         std::fs::create_dir(outside.path().join("subdir")).unwrap();
         // Prove the reparse buffer works on this filesystem before testing the
-        // pinned object. The attribute-only attempt also exercises share-mode gaps.
+        // pinned object. Both writable access masks must exercise the attack.
         let control = temp.path().join("control");
         std::fs::create_dir(&control).unwrap();
+        let control_cleanup = JunctionGuard(control.clone());
         set_junction(&control, outside.path(), GENERIC_WRITE).unwrap();
         assert_eq!(std::fs::read(control.join("victim")).unwrap(), b"secret");
-        std::fs::remove_dir(&control).unwrap();
+        drop(control_cleanup);
         let path = temp.path().join("pinned");
         std::fs::create_dir(&path).unwrap();
+        // Drop SafeDir first so its no-delete-sharing handles cannot block cleanup.
+        let _cleanup = JunctionGuard(path.clone());
         let dir = SafeDir::open_nofollow(&path, false).unwrap();
-        let converted = set_junction(&path, outside.path(), access).is_ok();
+        set_junction(&path, outside.path(), access).unwrap();
+        assert_ne!(std::fs::symlink_metadata(&path).unwrap().file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT, 0);
+        assert_eq!(std::fs::read(path.join("victim")).unwrap(), b"secret");
         assert!(!matches!(dir.entry("victim"), Ok(Some(_))));
         assert!(!matches!(dir.open_read_checked("victim", true), Ok(Some(_))));
         assert!(!matches!(dir.read_bytes_checked("victim", 100, true), Ok(Some(_))));
@@ -172,7 +189,6 @@ fn in_place_junction_conversion_cannot_redirect_a_pinned_empty_directory() {
         assert_eq!(std::fs::read(outside.path().join("victim")).unwrap(), b"secret");
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 2);
         drop(dir);
-        if converted { std::fs::remove_dir(&path).unwrap(); }
     }
 }
 
