@@ -23,8 +23,12 @@ fn token_information(class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<usize>> {
     }
     let token = unsafe { OwnedHandle::from_raw_handle(raw) };
     let mut size = 0;
-    unsafe { GetTokenInformation(token.as_raw_handle(), class, null_mut(), 0, &mut size); }
-    let minimum = if class == TokenOwner { std::mem::size_of::<TOKEN_OWNER>() } else { std::mem::size_of::<TOKEN_USER>() };
+    if unsafe { GetTokenInformation(token.as_raw_handle(), class, null_mut(), 0, &mut size) } != 0 {
+        return Err(denied());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) { return Err(error); }
+    let minimum = std::mem::size_of::<TOKEN_USER>();
     if (size as usize) < minimum { return Err(denied()); }
     let mut value = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
     if unsafe { GetTokenInformation(token.as_raw_handle(), class, value.as_mut_ptr().cast(), size, &mut size) } == 0 {
@@ -33,7 +37,17 @@ fn token_information(class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<usize>> {
     Ok(value)
 }
 fn user_sid(user: &[usize]) -> PSID { unsafe { (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid } }
-fn descriptor(user: &[usize], directory: bool) -> io::Result<LocalAllocation> {
+struct SecurityDescriptor {
+    descriptor: SECURITY_DESCRIPTOR,
+    // The absolute descriptor borrows its DACL from this allocation.
+    _dacl: LocalAllocation,
+}
+impl SecurityDescriptor {
+    fn as_ptr(&self) -> PSECURITY_DESCRIPTOR {
+        std::ptr::addr_of!(self.descriptor).cast_mut().cast()
+    }
+}
+fn descriptor(user: &[usize], directory: bool) -> io::Result<SecurityDescriptor> {
     let mut raw = null_mut();
     if unsafe { ConvertSidToStringSidW(user_sid(user), &mut raw) } == 0 { return Err(io::Error::last_os_error()); }
     let allocation = LocalAllocation(raw.cast());
@@ -43,13 +57,31 @@ fn descriptor(user: &[usize], directory: bool) -> io::Result<LocalAllocation> {
     drop(allocation);
     // Directory ACEs also protect newly created temp files before they contain data.
     let flags = if directory { "OICI" } else { "" };
-    let sddl: Vec<u16> = format!("O:{sid}D:P(A;{flags};FA;;;{sid})(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)")
+    let sddl: Vec<u16> = format!("D:P(A;{flags};FA;;;{sid})(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)")
         .encode_utf16().chain(Some(0)).collect();
     let mut security = null_mut();
     if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut security, null_mut()) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(LocalAllocation(security))
+    let allocation = LocalAllocation(security);
+    let mut acl = null_mut();
+    let mut present = 0;
+    let mut defaulted = 0;
+    if unsafe { GetSecurityDescriptorDacl(security, &mut present, &mut acl, &mut defaulted) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if present == 0 || acl.is_null() { return Err(denied()); }
+    let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    let raw = std::ptr::addr_of_mut!(descriptor).cast();
+    if unsafe { InitializeSecurityDescriptor(raw, 1) } == 0 { return Err(io::Error::last_os_error()); }
+    // Explicit TokenUser ownership also works with elevated tokens whose default
+    // owner is Administrators. Any failure (including ERROR_INVALID_OWNER) is fatal.
+    if unsafe { SetSecurityDescriptorOwner(raw, user_sid(user), 0) } == 0 { return Err(io::Error::last_os_error()); }
+    if unsafe { SetSecurityDescriptorDacl(raw, 1, acl, 0) } == 0 { return Err(io::Error::last_os_error()); }
+    if unsafe { SetSecurityDescriptorControl(raw, SE_DACL_PROTECTED, SE_DACL_PROTECTED) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(SecurityDescriptor { descriptor, _dacl: allocation })
 }
 fn validate_entry(file: &File, directory: bool) -> io::Result<()> {
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -60,36 +92,41 @@ fn validate_entry(file: &File, directory: bool) -> io::Result<()> {
         || (!directory && info.nNumberOfLinks != 1) { return Err(denied()); }
     Ok(())
 }
-fn protect(file: &File, user: &[usize], security: &LocalAllocation) -> io::Result<()> {
-    // Accept the current account or its token default owner (Administrators on
-    // elevated Windows runners), never a foreign owner. Do not take ownership.
+fn owner_allowed(owner_sid: &[u8], token_user_sid: &[u8]) -> bool {
+    owner_sid == token_user_sid
+}
+fn protect(file: &File, user: &[usize], security: &SecurityDescriptor) -> io::Result<()> {
+    // All objects must belong to TokenUser before changing their DACL.
     let mut owner = null_mut();
     let mut existing = null_mut();
     check(unsafe { GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
         &mut owner, null_mut(), null_mut(), null_mut(), &mut existing) })?;
     let _existing = LocalAllocation(existing);
-    let default_owner = token_information(TokenOwner)?;
-    let default_sid = unsafe { (*(default_owner.as_ptr().cast::<TOKEN_OWNER>())).Owner };
-    if owner.is_null() || unsafe { IsValidSid(owner) } == 0
-        || (unsafe { EqualSid(owner, user_sid(user)) } == 0 && unsafe { EqualSid(owner, default_sid) } == 0) {
+    let sid_bytes = |sid: PSID| -> io::Result<&[u8]> {
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 { return Err(denied()); }
+        Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), GetLengthSid(sid) as usize) })
+    };
+    if !owner_allowed(sid_bytes(owner)?, sid_bytes(user_sid(user))?) {
         return Err(denied());
     }
     // SetSecurityInfo would recursively propagate inheritable ACEs to existing
     // children before their reparse/hardlink checks. Only change this handle.
     let status = unsafe { NtSetSecurityObject(file.as_raw_handle(),
-        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, security.0) };
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, security.as_ptr()) };
     if status < 0 {
         Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32))
     } else { Ok(()) }
 }
 
 pub(super) fn private_dir(path: &Path, create: bool) -> io::Result<File> {
+    // Deferred to v1.81.0: walk from a trusted root with NtCreateFile RootDirectory +
+    // OBJ_DONT_REPARSE for full ancestor-junction protection, and use handle-based temp rename.
     let user = token_information(TokenUser)?;
     let security = descriptor(&user, true)?;
     if create {
         let path = wide(path)?;
         let attributes = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: security.0, bInheritHandle: 0 };
+            lpSecurityDescriptor: security.as_ptr(), bInheritHandle: 0 };
         if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) { return Err(error); }
@@ -110,14 +147,22 @@ pub(super) fn private_file(path: &Path, create: bool) -> io::Result<File> {
     let security = descriptor(&user, false)?;
     let path = wide(path)?;
     let attributes = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: security.0, bInheritHandle: 0 };
-    let raw = unsafe { CreateFileW(path.as_ptr(), GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
+        lpSecurityDescriptor: security.as_ptr(), bInheritHandle: 0 };
+    let mut raw = unsafe { CreateFileW(path.as_ptr(), GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        if create { &attributes } else { null() }, if create { OPEN_ALWAYS } else { OPEN_EXISTING },
+        if create { &attributes } else { null() }, if create { CREATE_NEW } else { OPEN_EXISTING },
         FILE_FLAG_OPEN_REPARSE_POINT, null_mut()) };
+    if create && raw == INVALID_HANDLE_VALUE {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_FILE_EXISTS as i32) { return Err(error); }
+        raw = unsafe { CreateFileW(path.as_ptr(), GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, null(), OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT, null_mut()) };
+    }
     if raw == INVALID_HANDLE_VALUE { return Err(io::Error::last_os_error()); }
     let file = unsafe { File::from_raw_handle(raw) };
     validate_entry(&file, false)?;
+    // Validate and protect the very same handle returned by CREATE_NEW; no reopen.
     protect(&file, &user, &security)?;
     Ok(file)
 }
@@ -125,6 +170,17 @@ pub(super) fn private_file(path: &Path, create: bool) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcription_google_cleanup_windows_owner_requires_token_user() {
+        // Pure SID comparisons avoid requiring owner-changing privileges in CI.
+        let user = b"token-user";
+        let default_owner = b"administrators";
+        let foreign = b"foreign-owner";
+        assert!(owner_allowed(user, user));
+        assert!(!owner_allowed(default_owner, user));
+        assert!(!owner_allowed(foreign, user));
+    }
 
     fn assert_private(file: &File) {
         let mut acl = null_mut();
