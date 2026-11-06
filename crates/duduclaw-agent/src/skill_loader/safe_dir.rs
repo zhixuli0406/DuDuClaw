@@ -468,7 +468,12 @@ mod windows_tests {
         let mut content = String::new();
         dir.read_file("SKILL.md").unwrap().read_to_string(&mut content).unwrap();
         assert_eq!(content, "operator content");
+        // Creating a hard link mutates directory metadata. Release the safe
+        // directory chain (which denies writers) before preparing this fixture.
+        drop(dir);
+        drop(root);
         std::fs::hard_link(temp.path().join("skills/SKILL.md"), temp.path().join("alias")).unwrap();
+        let dir = SafeDir::open(&temp.path().join("skills").canonicalize().unwrap()).unwrap();
         assert!(dir.read_file("SKILL.md").is_err());
     }
 

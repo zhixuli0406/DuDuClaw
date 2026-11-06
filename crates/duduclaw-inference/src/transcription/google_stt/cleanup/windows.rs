@@ -1,6 +1,5 @@
 //! Private journal I/O: never follow a final reparse point or change a hard link's ACL.
 use std::{fs::{File, OpenOptions}, io, os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::{AsRawHandle, FromRawHandle, OwnedHandle}}, path::Path, ptr::{null, null_mut}};
-use windows_sys::Wdk::Storage::FileSystem::NtSetSecurityObject;
 use windows_sys::Win32::{Foundation::*, Security::{*, Authorization::*}, Storage::FileSystem::*, System::Threading::*};
 
 struct LocalAllocation(*mut std::ffi::c_void);
@@ -92,78 +91,118 @@ fn validate_entry(file: &File, directory: bool) -> io::Result<()> {
         || (!directory && info.nNumberOfLinks != 1) { return Err(denied()); }
     Ok(())
 }
+// Binary forms of S-1-5-18 and S-1-5-32-544. No token group membership
+// or default-owner privileges are needed to validate an existing object.
+const SYSTEM_SID: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+const ADMINISTRATORS_SID: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
 fn owner_allowed(owner_sid: &[u8], token_user_sid: &[u8]) -> bool {
-    owner_sid == token_user_sid
+    owner_sid == token_user_sid || owner_sid == SYSTEM_SID || owner_sid == ADMINISTRATORS_SID
 }
-fn protect(file: &File, user: &[usize], security: &SecurityDescriptor) -> io::Result<()> {
-    // All objects must belong to TokenUser before changing their DACL.
+fn acl_allowed<'a>(owner: &[u8], user: &[u8], protected: bool,
+    aces: impl IntoIterator<Item = (u8, &'a [u8])>) -> bool {
+    protected && owner_allowed(owner, user) && aces.into_iter().all(|(kind, sid)| match kind {
+        0 => owner_allowed(sid, user), // ACCESS_ALLOWED_ACE_TYPE
+        1 => true, // ACCESS_DENIED_ACE_TYPE cannot grant access.
+        _ => false, // Unsupported object/callback ACEs fail closed.
+    })
+}
+fn validate_security(file: &File, user: &[usize]) -> io::Result<()> {
     let mut owner = null_mut();
+    let mut acl = null_mut();
     let mut existing = null_mut();
-    check(unsafe { GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
-        &mut owner, null_mut(), null_mut(), null_mut(), &mut existing) })?;
+    check(unsafe { GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        &mut owner, null_mut(), &mut acl, null_mut(), &mut existing) })?;
     let _existing = LocalAllocation(existing);
     let sid_bytes = |sid: PSID| -> io::Result<&[u8]> {
         if sid.is_null() || unsafe { IsValidSid(sid) } == 0 { return Err(denied()); }
         Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), GetLengthSid(sid) as usize) })
     };
-    if !owner_allowed(sid_bytes(owner)?, sid_bytes(user_sid(user))?) {
-        return Err(denied());
+    let mut control = 0;
+    let mut revision = 0;
+    if unsafe { GetSecurityDescriptorControl(existing, &mut control, &mut revision) } == 0 {
+        return Err(io::Error::last_os_error());
     }
-    // SetSecurityInfo would recursively propagate inheritable ACEs to existing
-    // children before their reparse/hardlink checks. Only change this handle.
-    let status = unsafe { NtSetSecurityObject(file.as_raw_handle(),
-        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, security.as_ptr()) };
-    if status < 0 {
-        Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32))
-    } else { Ok(()) }
+    // A NULL DACL grants everyone access; never accept or repair it.
+    if acl.is_null() || unsafe { IsValidAcl(acl) } == 0 { return Err(denied()); }
+    let mut aces = Vec::new();
+    for index in 0..unsafe { (*acl).AceCount } {
+        let mut raw = null_mut();
+        if unsafe { GetAce(acl, index as u32, &mut raw) } == 0 { return Err(io::Error::last_os_error()); }
+        let header = unsafe { &*raw.cast::<ACE_HEADER>() };
+        if header.AceType > 1 { return Err(denied()); }
+        let offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+        if (header.AceSize as usize) < offset + 8 { return Err(denied()); }
+        let sid = unsafe { raw.cast::<u8>().add(offset) };
+        let length = 8 + 4 * unsafe { *sid.add(1) } as usize;
+        if offset + length > header.AceSize as usize { return Err(denied()); }
+        aces.push((header.AceType, sid_bytes(sid.cast())?));
+    }
+    if !acl_allowed(sid_bytes(owner)?, sid_bytes(user_sid(user))?,
+        control & SE_DACL_PROTECTED != 0, aces) { return Err(denied()); }
+    Ok(())
+}
+fn step_error(step: &'static str, source: io::Error) -> io::Error {
+    tracing::warn!(step, os_error = ?source.raw_os_error(), error = %source, "Google STT cleanup I/O failed");
+    io::Error::new(source.kind(), format!("step={step} os_error={:?}: {source}", source.raw_os_error()))
 }
 
 pub(super) fn private_dir(path: &Path, create: bool) -> io::Result<File> {
     // Deferred to v1.81.0: walk from a trusted root with NtCreateFile RootDirectory +
     // OBJ_DONT_REPARSE for full ancestor-junction protection, and use handle-based temp rename.
-    let user = token_information(TokenUser)?;
-    let security = descriptor(&user, true)?;
+    let user = token_information(TokenUser).map_err(|e| step_error("query_token_user", e))?;
     if create {
+        let security = descriptor(&user, true).map_err(|e| step_error("directory_security_descriptor", e))?;
         let path = wide(path)?;
         let attributes = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: security.as_ptr(), bInheritHandle: 0 };
         if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) { return Err(error); }
+            if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) { return Err(step_error("create_journal_dir", error)); }
         }
     }
     // Keeping this handle prevents deletion/rename and denies data-write opens.
     // This is not isolation from same-user attribute-only or ancestor changes.
-    let file = OpenOptions::new().access_mode(FILE_GENERIC_READ | WRITE_DAC)
+    let file = OpenOptions::new().access_mode(FILE_GENERIC_READ)
         .share_mode(FILE_SHARE_READ)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS).open(path)?;
-    validate_entry(&file, true)?;
-    protect(&file, &user, &security)?;
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS).open(path)
+        .map_err(|e| step_error("open_journal_dir", e))?;
+    validate_entry(&file, true).map_err(|e| step_error("validate_journal_dir_type", e))?;
+    validate_security(&file, &user).map_err(|e| step_error("validate_journal_dir_acl", e))?;
     Ok(file)
 }
 
 pub(super) fn private_file(path: &Path, create: bool) -> io::Result<File> {
-    let user = token_information(TokenUser)?;
-    let security = descriptor(&user, false)?;
+    open_file(path, create, true)
+}
+
+pub(super) fn new_temp_file(path: &Path) -> io::Result<File> {
+    // tempfile's builder retries collisions; never open an existing candidate.
+    open_file(path, true, false)
+}
+
+fn open_file(path: &Path, create: bool, open_existing: bool) -> io::Result<File> {
+    let user = token_information(TokenUser).map_err(|e| step_error("query_token_user", e))?;
+    let security = descriptor(&user, false).map_err(|e| step_error("file_security_descriptor", e))?;
     let path = wide(path)?;
     let attributes = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: security.as_ptr(), bInheritHandle: 0 };
-    let mut raw = unsafe { CreateFileW(path.as_ptr(), GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
+    let mut raw = unsafe { CreateFileW(path.as_ptr(), GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         if create { &attributes } else { null() }, if create { CREATE_NEW } else { OPEN_EXISTING },
         FILE_FLAG_OPEN_REPARSE_POINT, null_mut()) };
-    if create && raw == INVALID_HANDLE_VALUE {
+    if create && open_existing && raw == INVALID_HANDLE_VALUE {
         let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_FILE_EXISTS as i32) { return Err(error); }
-        raw = unsafe { CreateFileW(path.as_ptr(), GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
+        if error.raw_os_error() != Some(ERROR_FILE_EXISTS as i32) { return Err(step_error("create_journal_file", error)); }
+        raw = unsafe { CreateFileW(path.as_ptr(), GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, null(), OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT, null_mut()) };
     }
-    if raw == INVALID_HANDLE_VALUE { return Err(io::Error::last_os_error()); }
+    if raw == INVALID_HANDLE_VALUE { return Err(step_error("open_journal_file", io::Error::last_os_error())); }
     let file = unsafe { File::from_raw_handle(raw) };
-    validate_entry(&file, false)?;
-    // Validate and protect the very same handle returned by CREATE_NEW; no reopen.
-    protect(&file, &user, &security)?;
+    validate_entry(&file, false).map_err(|e| step_error("validate_journal_file_type", e))?;
+    // Only inspect the opened handle. Existing owners and DACLs are never rewritten.
+    validate_security(&file, &user).map_err(|e| step_error("validate_journal_file_acl", e))?;
     Ok(file)
 }
 
@@ -172,14 +211,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transcription_google_cleanup_windows_owner_requires_token_user() {
+    fn transcription_google_cleanup_windows_owner_accepts_only_trusted_sids() {
         // Pure SID comparisons avoid requiring owner-changing privileges in CI.
         let user = b"token-user";
-        let default_owner = b"administrators";
+        let default_owner = ADMINISTRATORS_SID;
         let foreign = b"foreign-owner";
         assert!(owner_allowed(user, user));
-        assert!(!owner_allowed(default_owner, user));
+        assert!(owner_allowed(default_owner, user));
+        assert!(owner_allowed(SYSTEM_SID, user));
         assert!(!owner_allowed(foreign, user));
+    }
+
+    #[test]
+    fn transcription_google_cleanup_windows_acl_validator_is_fail_closed() {
+        let user = b"token-user".as_slice();
+        let foreign = b"foreign".as_slice();
+        let trusted = [(0, user), (0, SYSTEM_SID), (0, ADMINISTRATORS_SID)];
+        for owner in [user, SYSTEM_SID, ADMINISTRATORS_SID] {
+            assert!(acl_allowed(owner, user, true, trusted));
+        }
+        assert!(!acl_allowed(foreign, user, true, trusted));
+        assert!(!acl_allowed(user, user, false, trusted));
+        assert!(!acl_allowed(user, user, true, [(0, foreign)]));
+        assert!(!acl_allowed(user, user, true, [(5, user)]));
+        assert!(acl_allowed(user, user, true, [(1, foreign)]));
     }
 
     fn assert_private(file: &File) {
@@ -206,6 +261,27 @@ mod tests {
                 || IsWellKnownSid(sid, WinLocalSystemSid) != 0
                 || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0 });
         }
+    }
+
+    #[test]
+    fn transcription_google_cleanup_windows_temp_creation_is_private_and_exclusive() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("temp");
+        let mut file = new_temp_file(&path).unwrap_or_else(|e| panic!("create private temp: {e:?}"));
+        assert_private(&file);
+        let user = token_information(TokenUser).unwrap();
+        let mut owner = null_mut();
+        let mut raw = null_mut();
+        check(unsafe { GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+            &mut owner, null_mut(), null_mut(), null_mut(), &mut raw) }).unwrap();
+        let _security = LocalAllocation(raw);
+        assert_ne!(unsafe { EqualSid(owner, user_sid(&user)) }, 0);
+        std::io::Write::write_all(&mut file, b"unchanged").unwrap();
+        assert_eq!(new_temp_file(&path).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"unchanged");
+        let existing = private_file(&path, false).unwrap();
+        assert_private(&existing);
     }
 
     #[test]
@@ -246,8 +322,12 @@ mod tests {
         std::fs::write(&outside, b"unchanged").unwrap();
         let outside = File::open(&outside).unwrap();
         let before = dacl(&outside);
+        // Preparing the hard-link fixture requires a directory mutation handle.
+        // Release the share guard, then reopen it for the actual validation.
+        drop(_directory);
         std::fs::hard_link(home.path().join("outside"), path.join("linked")).unwrap();
-        drop(private_dir(&path, false).unwrap());
+        let directory = private_dir(&path, false).unwrap_or_else(|e| panic!("reopen cleanup directory: {e:?}"));
+        assert_private(&directory);
         assert_eq!(dacl(&outside), before);
         assert!(private_file(&path.join("linked"), false).is_err());
         assert_eq!(dacl(&outside), before);

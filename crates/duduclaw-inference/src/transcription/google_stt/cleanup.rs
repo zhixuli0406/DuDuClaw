@@ -22,6 +22,12 @@ const DIRECTORY: &str = "google_stt_cleanup";
 const UPLOAD_SETTLE_SECS: u64 = 900;
 
 fn error() -> TranscriptionError { TranscriptionError::new("無法讀寫雲端錄音清理紀錄；請檢查資料目錄。") }
+fn io_error(step: &'static str, source: io::Error) -> TranscriptionError {
+    tracing::warn!(step, os_error = ?source.raw_os_error(), error = ?source, "Google STT cleanup I/O failed");
+    let mut error = error();
+    error.detail = Some(format!("step={step} os_error={:?}: {source:?}", source.raw_os_error()));
+    error
+}
 fn now() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
 
 #[derive(Serialize, Deserialize)]
@@ -124,23 +130,23 @@ fn lock_record(path: &Path) -> Result<Option<duduclaw_core::owner_lock::OwnerLoc
     let id = uuid::Uuid::parse_str(name).map_err(|_| error())?;
     // At most 256 permanent sidecars; never unlink an OS lock inode.
     let lock_path = path.parent().ok_or_else(error)?.join(format!("{:02x}.lock", id.as_bytes()[0]));
-    let file = private_file(&lock_path, true).map_err(|_| error())?;
+    let file = private_file(&lock_path, true).map_err(|e| io_error("open_record_lock", e))?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(duduclaw_core::owner_lock::OwnerLock::new(file))),
         // Windows reports ERROR_LOCK_VIOLATION, not ErrorKind::WouldBlock.
         Err(e) if e.kind() == io::ErrorKind::WouldBlock
             || (e.raw_os_error().is_some()
                 && e.raw_os_error() == fs2::lock_contended_error().raw_os_error()) => Ok(None),
-        Err(_) => Err(error()),
+        Err(e) => Err(io_error("lock_record", e)),
     }
 }
 
 impl PendingObject {
     pub(super) fn create(home: &Path, bucket: &str, object: &str) -> Result<Self, TranscriptionError> {
         let dir = home.join(DIRECTORY);
-        let _directory = private_dir(&dir, true).map_err(|_| error())?;
+        let _directory = private_dir(&dir, true).map_err(|e| io_error("create_journal_dir", e))?;
         // Persist the new directory itself before any upload can start.
-        sync_dir(home).map_err(|_| error())?;
+        sync_dir(home).map_err(|e| io_error("sync_home", e))?;
         for _ in 0..32 {
             let path = dir.join(format!("{}.json", uuid::Uuid::new_v4()));
             let Some(lock) = lock_record(&path)? else { continue; };
@@ -167,24 +173,28 @@ impl PendingObject {
     }
     fn persist(&self) -> Result<(), TranscriptionError> {
         let dir = self.path.parent().ok_or_else(error)?;
-        let _directory = private_dir(dir, false).map_err(|_| error())?;
+        let _directory = private_dir(dir, false).map_err(|e| io_error("open_journal_dir", e))?;
         // Refuse existing links/special files rather than silently replacing them.
         match private_file(&self.path, false) {
             Ok(_) => {},
             Err(e) if e.kind() == io::ErrorKind::NotFound => {},
-            Err(_) => return Err(error()),
+            Err(e) => return Err(io_error("validate_existing_journal", e)),
         }
-        let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(|_| error())?;
+        #[cfg(windows)]
+        let mut temp = tempfile::Builder::new().make_in(dir, windows::new_temp_file)
+            .map_err(|e| io_error("create_journal_temp", e))?;
+        #[cfg(not(windows))]
+        let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(|e| io_error("create_journal_temp", e))?;
         #[cfg(unix)] {
             use std::os::unix::fs::PermissionsExt;
-            temp.as_file().set_permissions(fs::Permissions::from_mode(0o600)).map_err(|_| error())?;
+            temp.as_file().set_permissions(fs::Permissions::from_mode(0o600)).map_err(|e| io_error("protect_journal_temp", e))?;
         }
-        #[cfg(windows)] drop(windows::private_file(temp.path(), false).map_err(|_| error())?);
-        #[cfg(not(any(unix, windows)))] duduclaw_core::platform::set_owner_only(temp.path()).map_err(|_| error())?;
-        serde_json::to_writer(&mut temp, &self.record).map_err(|_| error())?;
-        temp.flush().and_then(|_| temp.as_file().sync_all()).map_err(|_| error())?;
-        temp.persist(&self.path).map_err(|_| error())?;
-        sync_dir(dir).map_err(|_| error())
+        #[cfg(not(any(unix, windows)))] duduclaw_core::platform::set_owner_only(temp.path()).map_err(|e| io_error("protect_journal_temp", e))?;
+        let bytes = serde_json::to_vec(&self.record).map_err(|_| error())?;
+        temp.write_all(&bytes).map_err(|e| io_error("write_journal_temp", e))?;
+        temp.flush().and_then(|_| temp.as_file().sync_all()).map_err(|e| io_error("sync_journal_temp", e))?;
+        temp.persist(&self.path).map_err(|e| io_error("persist_journal", e.error))?;
+        sync_dir(dir).map_err(|e| io_error("sync_journal_dir", e))
     }
     pub(super) fn set_generation(&mut self, generation: Option<&str>) -> Result<(), TranscriptionError> {
         if let Some(generation) = generation {
@@ -198,8 +208,8 @@ impl PendingObject {
         // A missing upload response leaves its generation unknown. Keep the
         // intent until the grace window closes to catch late upload completion.
         if self.record.generation.is_none() && now() < self.record.settle_after { return Ok(()); }
-        fs::remove_file(&self.path).map_err(|_| error())?;
-        sync_dir(self.path.parent().ok_or_else(error)?).map_err(|_| error())
+        fs::remove_file(&self.path).map_err(|e| io_error("remove_journal", e))?;
+        sync_dir(self.path.parent().ok_or_else(error)?).map_err(|e| io_error("sync_journal_dir", e))
     }
 }
 
@@ -210,22 +220,22 @@ fn paths(home: &Path) -> Result<Vec<PathBuf>, TranscriptionError> {
         Ok(metadata) if metadata.is_dir() => {},
         Ok(_) => return Err(error()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => return Err(error()),
+        Err(e) => return Err(io_error("read_home_metadata", e)),
     }
     let dir = home.join(DIRECTORY);
     let _directory = match private_dir(&dir, false) {
         Ok(directory) => directory,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => return Err(error()),
+        Err(e) => return Err(io_error("open_journal_dir", e)),
     };
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => return Err(error()),
+        Err(e) => return Err(io_error("read_journal_dir", e)),
     };
     let mut paths = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|_| error())?;
+        let entry = entry.map_err(|e| io_error("read_journal_entry", e))?;
         if entry.path().extension().and_then(|s| s.to_str()) == Some("json") { paths.push(entry.path()); }
     }
     paths.sort();
@@ -250,26 +260,27 @@ impl GoogleSttEngine {
 
     pub async fn reconcile_cleanup(&self) -> Result<usize, TranscriptionError> {
         let mut token = None;
-        let mut failed = false;
+        let mut failure = None;
         let mut bucket_mismatches = 0usize;
         for path in paths(&self.cleanup_home)? {
             let lock = match lock_record(&path) {
                 Ok(Some(lock)) => lock,
                 Ok(None) => continue,
-                Err(_) => { failed = true; continue; }
+                Err(e) => { failure.get_or_insert(e); continue; }
             };
             let file = match private_file(&path, false) {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(_) => { failed = true; continue; }
+                Err(e) => { failure.get_or_insert(io_error("open_journal_record", e)); continue; }
             };
             let mut bytes = Vec::new();
-            if file.take(4097).read_to_end(&mut bytes).is_err() || bytes.len() > 4096 {
-                failed = true; continue;
+            if let Err(e) = file.take(4097).read_to_end(&mut bytes) {
+                failure.get_or_insert(io_error("read_journal_record", e)); continue;
             }
-            let record: Record = match serde_json::from_slice(&bytes) { Ok(record) => record, Err(_) => { failed = true; continue; } };
+            if bytes.len() > 4096 { failure.get_or_insert_with(error); continue; }
+            let record: Record = match serde_json::from_slice(&bytes) { Ok(record) => record, Err(_) => { failure.get_or_insert_with(error); continue; } };
             let mut pending = PendingObject { path, record, _lock: lock };
-            if pending.validate().is_err() { failed = true; continue; }
+            if let Err(e) = pending.validate() { failure.get_or_insert(e); continue; }
             if pending.record.bucket != self.config.bucket {
                 bucket_mismatches += 1;
                 continue;
@@ -278,15 +289,19 @@ impl GoogleSttEngine {
             if token.is_none() {
                 match self.access_token().await {
                     Ok(value) => token = Some(value),
-                    Err(_) => { failed = true; break; },
+                    Err(e) => { failure.get_or_insert(e); break; },
                 }
             }
-            if self.cleanup_object(&mut pending, token.as_ref().unwrap()).await.is_err() { failed = true; }
+            if let Err(e) = self.cleanup_object(&mut pending, token.as_ref().unwrap()).await { failure.get_or_insert(e); }
         }
         if bucket_mismatches > 0 {
             tracing::warn!(count = bucket_mismatches, "Google STT cleanup bucket mismatch; records retained");
         }
-        if failed { return Err(error()); }
+        if let Some(failure) = failure {
+            let mut error = error();
+            error.detail = failure.detail;
+            return Err(error);
+        }
         Ok(paths(&self.cleanup_home)?.len())
     }
 

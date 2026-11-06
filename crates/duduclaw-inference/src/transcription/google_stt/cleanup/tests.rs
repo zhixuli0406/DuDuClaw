@@ -34,7 +34,7 @@ fn engine(home: &Path, base: String) -> GoogleSttEngine {
 #[test]
 fn transcription_google_cleanup_intent_is_durable_and_contains_no_credential() {
     let home = tempfile::tempdir().unwrap();
-    let pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap();
+    let pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap_or_else(|e| panic!("create cleanup journal: {e:?}"));
     let raw = fs::read_to_string(&pending.path).unwrap();
     let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(value["bucket"], "meeting-audio");
@@ -58,7 +58,7 @@ fn transcription_google_cleanup_missing_home_and_journal_are_empty() {
 #[tokio::test]
 async fn transcription_google_cleanup_restarts_retries_and_deletes_exact_generation() {
     let home = tempfile::tempdir().unwrap();
-    let mut pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap();
+    let mut pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap_or_else(|e| panic!("create cleanup journal: {e:?}"));
     pending.set_generation(Some("123456789")).unwrap();
     drop(pending);
     let (base, task) = mock(vec![503, 429, 204]).await;
@@ -76,8 +76,8 @@ async fn transcription_google_cleanup_restarts_retries_and_deletes_exact_generat
 #[tokio::test]
 async fn transcription_google_cleanup_preserves_failure_for_next_reconcile() {
     let home = tempfile::tempdir().unwrap();
-    let mut pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap();
-    pending.set_generation(Some("123")).unwrap();
+    let mut pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap_or_else(|e| panic!("create cleanup journal: {e:?}"));
+    pending.set_generation(Some("123")).unwrap_or_else(|e| panic!("persist cleanup generation: {e:?}"));
     let path = pending.path.clone();
     drop(pending);
     let (base, task) = mock(vec![503, 503, 503]).await;
@@ -93,8 +93,8 @@ async fn transcription_google_cleanup_preserves_failure_for_next_reconcile() {
 #[tokio::test]
 async fn transcription_google_cleanup_does_not_touch_active_uploads() {
     let home = tempfile::tempdir().unwrap();
-    let mut pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap();
-    pending.set_generation(Some("123")).unwrap();
+    let mut pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap_or_else(|e| panic!("create cleanup journal: {e:?}"));
+    pending.set_generation(Some("123")).unwrap_or_else(|e| panic!("persist cleanup generation: {e:?}"));
     assert_eq!(engine(home.path(), "http://127.0.0.1:1".into()).reconcile_cleanup().await.unwrap(), 1);
     assert_eq!(pending.record.attempts, 0);
     drop(pending);
@@ -103,7 +103,7 @@ async fn transcription_google_cleanup_does_not_touch_active_uploads() {
 #[tokio::test]
 async fn transcription_google_cleanup_unknown_generation_survives_early_404() {
     let home = tempfile::tempdir().unwrap();
-    let mut pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap();
+    let mut pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap_or_else(|e| panic!("create cleanup journal: {e:?}"));
     let (base, task) = mock(vec![404]).await;
     assert!(engine(home.path(), base).cleanup_object(&mut pending, "test-token").await.unwrap());
     assert!(pending.path.exists());
@@ -124,7 +124,7 @@ async fn transcription_google_cleanup_unknown_generation_survives_early_404() {
 #[tokio::test]
 async fn transcription_google_cleanup_corrupt_state_is_retained_and_reported() {
     let home = tempfile::tempdir().unwrap();
-    let pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap();
+    let pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap_or_else(|e| panic!("create cleanup journal: {e:?}"));
     let path = pending.path.clone();
     drop(pending);
     fs::write(&path, b"malformed").unwrap();
@@ -180,7 +180,8 @@ async fn transcription_google_cleanup_journal_precedes_actual_upload_request() {
     engine.config.bucket = "meeting-audio".into();
     let audio = home.path().join("audio.m4a");
     fs::write(&audio, b"audio").unwrap();
-    assert!(engine.transcribe(&audio, "zh-TW", &[]).await.is_err());
+    let error = engine.transcribe(&audio, "zh-TW", &[]).await.unwrap_err();
+    assert!(error.detail.is_none(), "upload stopped at cleanup journal: {error:?}");
     tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap();
     assert!(GoogleSttEngine::has_pending_cleanup(home.path()).unwrap());
 }
@@ -188,8 +189,8 @@ async fn transcription_google_cleanup_journal_precedes_actual_upload_request() {
 #[tokio::test]
 async fn transcription_google_cleanup_corrupt_filename_does_not_block_valid_records() {
     let home = tempfile::tempdir().unwrap();
-    let mut pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap();
-    pending.set_generation(Some("123")).unwrap();
+    let mut pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap_or_else(|e| panic!("create cleanup journal: {e:?}"));
+    pending.set_generation(Some("123")).unwrap_or_else(|e| panic!("persist cleanup generation: {e:?}"));
     let path = pending.path.clone();
     drop(pending);
     let corrupt = home.path().join(DIRECTORY).join("000-invalid.json");
@@ -205,8 +206,8 @@ async fn transcription_google_cleanup_corrupt_filename_does_not_block_valid_reco
 async fn transcription_google_cleanup_bucket_mismatch_keeps_record_without_network() {
     for configured in ["meeting-audio", ""] {
         let home = tempfile::tempdir().unwrap();
-        let mut pending = PendingObject::create(home.path(), "other-bucket", &object()).unwrap();
-        pending.set_generation(Some("123")).unwrap();
+        let mut pending = PendingObject::create(home.path(), "other-bucket", &object()).unwrap_or_else(|e| panic!("create cleanup journal: {e:?}"));
+        pending.set_generation(Some("123")).unwrap_or_else(|e| panic!("persist cleanup generation: {e:?}"));
         let path = pending.path.clone();
         let before = fs::read(&path).unwrap();
         let mut engine = engine(home.path(), "http://127.0.0.1:1".into());
@@ -226,7 +227,7 @@ async fn transcription_google_cleanup_bucket_mismatch_keeps_record_without_netwo
 fn transcription_google_cleanup_private_permissions_and_legacy_modes() {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();
-    let mut pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap();
+    let mut pending = PendingObject::create(home.path(), "meeting-audio", &object()).unwrap_or_else(|e| panic!("create cleanup journal: {e:?}"));
     let dir = home.path().join(DIRECTORY);
     assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
     for entry in fs::read_dir(&dir).unwrap() {
@@ -237,7 +238,7 @@ fn transcription_google_cleanup_private_permissions_and_legacy_modes() {
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-    pending.set_generation(Some("123")).unwrap();
+    pending.set_generation(Some("123")).unwrap_or_else(|e| panic!("persist cleanup generation: {e:?}"));
     assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
     assert_eq!(fs::metadata(&pending.path).unwrap().permissions().mode() & 0o777, 0o600);
 }
@@ -278,4 +279,14 @@ async fn transcription_google_cleanup_rejects_links_and_special_files() {
     assert!(private_file(&path, false).is_err());
     assert!(engine(home.path(), "http://127.0.0.1:1".into()).reconcile_cleanup().await.is_err());
     assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+}
+
+#[test]
+fn transcription_google_cleanup_io_diagnostics_keep_public_message_sanitized() {
+    let error = io_error("open_journal_dir", io::Error::from_raw_os_error(5));
+    assert_eq!(error.to_string(), "無法讀寫雲端錄音清理紀錄；請檢查資料目錄。");
+    let diagnostic = format!("{error:?}");
+    assert!(diagnostic.contains("step=open_journal_dir"));
+    assert!(diagnostic.contains("os_error=Some(5)"));
+    assert!(!error.message.contains("open_journal_dir"));
 }
