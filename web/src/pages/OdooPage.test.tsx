@@ -264,15 +264,16 @@ describe('OdooPage permission choices and summary', () => {
     mockWsClient.call.mockImplementation((method: string) => {
       if (method === 'odoo.config') return Promise.resolve({ url: 'https://erp.example.com', db: 'prod', blocked_models: ['hr.employee', 'ir.model'], read_only_models: ['ir.model'], unblock_models: [] });
       if (method === 'agents.list') return Promise.resolve({ agents: [{ name: 'bot-1', display_name: 'Bot One' }] });
-      if (method === 'odoo.agent_config_get') return Promise.resolve({ configured: true, allowed_actions: ['read:hr.employee', 'search:hr.employee', 'write:hr.employee', 'read', 'action:crm.lead'], allowed_models: [] });
+      if (method === 'odoo.agent_config_get') return Promise.resolve({ configured: true, allowed_actions: ['read:hr.employee', 'search:hr.employee', 'write:hr.employee', 'read', 'action:crm.lead', 'frobnicate:crm.lead'], allowed_models: [] });
       return Promise.resolve({ connected: false });
     });
   });
   it('renders model/action summary with a partial legacy note and unknown settings', async () => {
     renderWithProviders(<OdooPage />);
     expect(await screen.findByText('hr.employee：Search and read、Update')).toBeInTheDocument();
+    expect(screen.getByText('crm.lead：Button actions')).toBeInTheDocument();
     expect(screen.getByText('All tables：Search and read (Partial only)')).toBeInTheDocument();
-    expect(screen.getByText('Other settings：action:crm.lead')).toBeInTheDocument();
+    expect(screen.getByText('Other settings：frobnicate:crm.lead')).toBeInTheDocument();
   });
   it('confirms global sensitive selection before saving and allows removal', async () => {
     const user = (await import('@testing-library/user-event')).default.setup();

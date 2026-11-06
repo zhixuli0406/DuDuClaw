@@ -233,7 +233,7 @@ agent's key again for the new server. The whole `[odoo]` table is admin-only.
 - **Bare verbs** — `"read"`, `"search"`, `"create"`, `"write"`, `"unlink"`, `"action"`, `"execute"`. The verb applies to all models.
 - **Qualified verbs** — `"write:crm.lead"`, `"execute:sale.order"`. The verb applies *only* to that model.
 
-`action` / `action:model` cover generic `odoo_execute` calls to `action_*`, `button_*` and `toggle_*` methods. This runtime verb is separate from `execute`. The dashboard keeps existing `action` rules under **Other settings**; its **Execute actions** checkbox continues to save `execute`.
+`action` / `action:model` cover generic `odoo_execute` calls to `action_*`, `button_*` and `toggle_*` methods. This runtime verb is separate from `execute`. The dashboard offers **Button actions** for `action` / `action:model` and **Other methods** for `execute` / `execute:model`. Existing button grants are editable in their table rule.
 
 Mix freely:
 
