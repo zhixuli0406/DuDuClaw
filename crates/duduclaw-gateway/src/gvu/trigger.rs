@@ -101,9 +101,9 @@ fn category_warrants_gvu(category: ErrorCategory) -> bool {
 
 /// Read `[evolution] gvu_enabled` from the agent's `agent.toml`.
 ///
-/// Returns `false` for missing files / malformed TOML / absent key. The
-/// default is intentionally restrictive so a config typo doesn't accidentally
-/// burn LLM budget. Operators opt in via `agent.toml [evolution] gvu_enabled = true`.
+/// A valid file with an absent section/key defaults to `true` (2026-11-06).
+/// Missing/unreadable files, malformed TOML and wrong-typed switches fail closed.
+/// Explicit `gvu_enabled = false` opts out; `enabled = false` disables evolution.
 pub fn agent_gvu_enabled(agent_dir: &Path) -> bool {
     let path = agent_dir.join("agent.toml");
     let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -112,11 +112,15 @@ pub fn agent_gvu_enabled(agent_dir: &Path) -> bool {
     let Ok(value) = raw.parse::<toml::Value>() else {
         return false;
     };
-    value
-        .get("evolution")
-        .and_then(|e| e.get("gvu_enabled"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    let Some(evolution) = value.get("evolution") else { return true; };
+    let Some(evolution) = evolution.as_table() else { return false; };
+    if evolution.get("enabled").is_some_and(|v| v.as_bool() != Some(true)) {
+        return false;
+    }
+    match evolution.get("gvu_enabled") {
+        None => true,
+        Some(value) => value.as_bool().unwrap_or(false),
+    }
 }
 
 /// Read `[evolution] gvu_cooldown_minutes` from the agent's `agent.toml`.
@@ -362,12 +366,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_gvu_enabled_returns_false_when_evolution_section_missing() {
+    fn agent_gvu_enabled_returns_true_when_evolution_section_missing() {
         let tmp =
             std::env::temp_dir().join(format!("gvu-trig-no-section-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("agent.toml"), "[agent]\nname = \"test\"\n").unwrap();
-        assert!(!agent_gvu_enabled(&tmp));
+        assert!(agent_gvu_enabled(&tmp));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -378,6 +382,25 @@ mod tests {
         std::fs::write(tmp.join("agent.toml"), "bad = [toml").unwrap();
         assert!(!agent_gvu_enabled(&tmp));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn agent_gvu_enabled_missing_key_defaults_on_but_invalid_switches_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (raw, expected) in [
+            ("[evolution]\nenabled = true\n", true),
+            ("[evolution]\nenabled = false\ngvu_enabled = true\n", false),
+            ("[evolution]\nenabled = false\n", false),
+            ("[evolution]\ngvu_enabled = 'true'\n", false),
+            ("evolution = false\n", false),
+            ("[evolution]\nenabled = 'true'\n", false),
+        ] {
+            std::fs::write(tmp.path().join("agent.toml"), raw).unwrap();
+            assert_eq!(agent_gvu_enabled(tmp.path()), expected, "{raw}");
+        }
+        std::fs::remove_file(tmp.path().join("agent.toml")).unwrap();
+        std::fs::create_dir(tmp.path().join("agent.toml")).unwrap();
+        assert!(!agent_gvu_enabled(tmp.path()));
     }
 
     #[test]

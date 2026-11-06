@@ -854,6 +854,8 @@ async fn create_agent_omitted_reports_to_defaults_to_non_main_caller() {
     let cfg: duduclaw_core::types::AgentConfig =
         toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
     assert_eq!(cfg.agent.reports_to, "sales-rep");
+    assert!(cfg.evolution.enabled);
+    assert!(cfg.evolution.gvu_enabled);
 }
 
 #[tokio::test]

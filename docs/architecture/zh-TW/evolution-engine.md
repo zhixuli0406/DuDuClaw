@@ -674,7 +674,7 @@ AEE 的 `G-Contract` 閘門以 `must_not`（加上內建預設）檢查每個候
 [evolution]
 skill_auto_activate = true
 skill_security_scan = true
-gvu_enabled = true                 # 啟用 GVU 自我博弈迴圈（預設 false，opt-in，見 guides/evolution-switches.md）
+gvu_enabled = true                 # 啟用 GVU 自我博弈迴圈（預設 true，設 false 可退出，見 guides/evolution-switches.md）
 gvu_cooldown_minutes = 60          # 每 agent GVU 執行冷卻時間，涵蓋所有觸發路徑（預設 60 分鐘）
 max_silence_hours = 12.0           # 靜默破壞器閾值
 max_gvu_generations = 3            # GVU 最大嘗試輪數

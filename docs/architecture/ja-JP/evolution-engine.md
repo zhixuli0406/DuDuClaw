@@ -661,7 +661,7 @@ AEEの `G-Contract` ゲートは、候補のplaybookエントリをすべて `mu
 [evolution]
 skill_auto_activate = true
 skill_security_scan = true
-gvu_enabled = true                 # GVUセルフプレイループを有効化（デフォルトfalse、opt-in、guides/evolution-switches.md参照）
+gvu_enabled = true                 # GVUセルフプレイループを有効化（デフォルトtrue、falseで停止、guides/evolution-switches.md参照）
 gvu_cooldown_minutes = 60          # agentごとのGVU実行クールダウン、すべてのトリガー経路をカバー（デフォルト60分）
 max_silence_hours = 12.0           # サイレンスブレーカーのしきい値
 max_gvu_generations = 3            # GVU最大試行ラウンド数
