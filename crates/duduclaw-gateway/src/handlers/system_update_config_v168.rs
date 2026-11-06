@@ -60,6 +60,7 @@ const PROTECTED_KEYS: &[&str] = &[
     "action_review.mode",
     "security.egress_guard",
     "security.recipient_guard",
+    "security.mail_requester_approval",
     "security.chat_credentials",
 ];
 
@@ -371,6 +372,7 @@ fn apply_files(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -
 /// Plain booleans whose readers re-read `config.toml` per use.
 fn apply_simple_bools(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -> Result<(), String> {
     const KEYS: &[(&str, &[&str], &str)] = &[
+        ("security.mail_requester_approval", &["security"], "mail_requester_approval"),
         ("night.llm_enabled", &["night"], "llm_enabled"),
         ("acp.trusted", &["acp"], "trusted"),
         ("integrations.github", &["integrations"], "github"),
@@ -775,6 +777,18 @@ mod tests {
         assert_eq!(p["rotation_strategy"], "priority", "flat name wins");
         assert_eq!(p["log_format"], "pretty");
     }
+    #[test]
+    fn mail_requester_approval_setting_is_boolean_and_immediate() {
+        for enabled in [true, false] {
+            let (table, outcome) = apply(json!({"security.mail_requester_approval": enabled})).unwrap();
+            assert_eq!(table["security"]["mail_requester_approval"].as_bool(), Some(enabled));
+            assert!(outcome.applied_immediate);
+        }
+        for invalid in [json!("true"), json!(1), json!([])] {
+            assert!(apply(json!({"security.mail_requester_approval": invalid})).is_err());
+        }
+    }
+
     #[test]
     fn recipient_guard_setting_accepts_only_known_modes() {
         for mode in ["off", "shadow", "ask"] {

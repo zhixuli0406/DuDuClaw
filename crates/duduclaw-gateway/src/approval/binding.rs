@@ -62,6 +62,18 @@ impl DecisionContext {
 
 tokio::task_local! { pub static CURRENT_DECISION_CONTEXT: Option<DecisionContext>; }
 
+/// Captured only from authenticated adapter metadata; absent/unknown is never private.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationAudience {
+    Private,
+    #[default]
+    MultiParty,
+}
+impl ConversationAudience {
+    pub fn is_multi_party(&self) -> bool { *self == Self::MultiParty }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionBinding {
     pub schema_version: u32,
@@ -69,6 +81,8 @@ pub struct ExecutionBinding {
     #[serde(default)]
     pub run_origin_kind: String,
     pub actor_principal: String,
+    #[serde(default, skip_serializing_if = "ConversationAudience::is_multi_party")]
+    pub conversation_audience: ConversationAudience,
     pub decision_context: DecisionContext,
     pub task_id: Option<String>,
     pub task_revision: Option<i64>,
@@ -278,7 +292,7 @@ impl ApprovalBroker {
         })
     }
 
-    async fn validate_task_snapshot(&self, binding: &ExecutionBinding) -> Result<(), String> {
+    pub(super) async fn validate_task_snapshot(&self, binding: &ExecutionBinding) -> Result<(), String> {
         if let Some(id) = binding.task_id.as_ref() {
             let home = self.home_dir().ok_or("task requires durable store")?;
             let store = crate::task_store::TaskStore::open(&home)?;
@@ -357,8 +371,11 @@ impl ApprovalBroker {
         }
         let rec = self.get(id).await?.ok_or("request not found")?;
         if rec.payload.get("egress_guard").is_some() {
-            let ctx = dashboard.ok_or("outgoing data approval requires a dashboard Admin")?;
-            self.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin)?;
+            if let Some(ctx) = dashboard {
+                self.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin)?;
+            } else if !self.home_dir().is_some_and(|home| super::mail_requester::eligible(&home, &rec)) {
+                return Err("outgoing data approval requires a dashboard Admin".into());
+            }
         }
         let binding = rec
             .binding
@@ -379,6 +396,13 @@ impl ApprovalBroker {
         if let Some(home) = self.home_dir() {
             if policy_revision(&home, &binding.actor_principal)? != binding.policy_revision {
                 return Err("policy changed; request a new approval".into());
+            }
+        }
+        if rec.payload["name"] == "mail_send" && rec.payload.get("egress_guard").is_some()
+            && binding.run_origin_kind == "ingress" && binding.resume_handler == "live_only_v1" {
+            let home = self.home_dir().ok_or("mail policy home unavailable")?;
+            if super::mail_requester::environment_hash(&home, &rec.agent_id, &binding.run_id)? != binding.environment_hash {
+                return Err("mail policy changed; request a new approval".into());
             }
         }
         binding.validate_host_files()?;
@@ -409,7 +433,9 @@ impl ApprovalBroker {
                         Utc::now().to_rfc3339(),
                         dashboard
                             .map(|c| format!("dashboard:{}", c.user_id))
-                            .unwrap_or_else(|| format!("{}:{}", context.channel, context.principal_id)),
+                            .unwrap_or_else(|| if rec.payload.get("egress_guard").is_some() {
+                                format!("requester:{}:{}", context.channel, context.principal_id)
+                            } else { format!("{}:{}", context.channel, context.principal_id) }),
                         answer.map(|v| v.to_string()),
                         id.as_str(),
                         kind.as_str(),

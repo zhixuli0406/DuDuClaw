@@ -669,6 +669,7 @@ async fn authorized_ticket(
         principal_id: fixture_principal(home),
     };
     let binding = ExecutionBinding {
+        conversation_audience: Default::default(),
         schema_version: 1,
         run_id: prepare.effective.run_id.clone(),
         run_origin_kind: "workflow".into(),

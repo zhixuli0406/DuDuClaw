@@ -1233,7 +1233,7 @@ async fn apply_bound_request(
         return Ok("已記錄答案；尚未授權任何動作。".into());
     }
     let auth = authorize_press(role, identity_active, true);
-    if auth != PressAuth::Allow {
+    if auth != PressAuth::Allow && !crate::approval::mail_requester::eligible(home, &rec) {
         return Err(refusal_text(auth, "核准"));
     }
     broker
@@ -1623,6 +1623,7 @@ pub(crate) mod native_loop_fixture {
         use crate::approval::*;
         let payload = serde_json::json!({"action":"native-acl-fixture"});
         let binding = ExecutionBinding {
+            conversation_audience: Default::default(),
             schema_version: 1,
             run_id: uuid::Uuid::new_v4().to_string(),
             run_origin_kind: "workflow".into(),

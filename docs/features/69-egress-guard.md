@@ -73,7 +73,7 @@ Clearing a lease removes its protection against concurrent private reads. Restar
 
 ## Review before approving
 
-Only a current Admin may decide an outgoing-data approval, including requests without a workflow binding. Channel decisions are refused. The Admin-only dashboard outgoing-data approval shows the destination, full arguments expanded in a scrollable panel, source tools and expiry. Send, Publish and Purchase approvals also show full arguments. One approval binds one employee, tool and digest of the complete canonical arguments and can be used once. An action-rule approval and the outgoing-data reason share one request.
+Outgoing-data approvals require a current dashboard Admin, except eligible `mail_send` requests: the verified turn requester with current Operator access may decide in the original one-to-one conversation or authenticated dashboard WebChat when `[security] mail_requester_approval` allows it. See [requester rules and configuration failures](05-security-defense.md#requester-confirmation-for-mail). Other channel decisions are refused. The Admin-only dashboard outgoing-data approval shows the destination, full arguments expanded in a scrollable panel, source tools and expiry. Send, Publish and Purchase approvals also show full arguments. One approval binds one employee, tool and digest of the complete canonical arguments and can be used once. An action-rule approval and the outgoing-data reason share one request.
 
 Action-rule approvals show the matching tool or effect rule, including for read and draft calls. Purchase and Delete actions cannot receive new standing capability or workflow grants; grants saved before this feature are ignored without changing the stored records. Other gates and explicit approvals still apply.
 
@@ -103,6 +103,8 @@ Cron, dispatch, reminder, mail, heartbeat and ephemeral execution entry points n
 DuDuClaw does not guarantee that Grok alias matching or environment propagation matches the real CLI. Generic CLI native tools remain outside this guard.
 
 ## Server-bound recipients
+
+For `mail_send` only, the verified requester may use the original conversation under the [mail-requester rule](05-security-defense.md#requester-confirmation-for-mail). All other targets in the table retain dashboard Admin approval. Only an adapter-attested one-to-one conversation or authenticated dashboard WebChat is eligible. Group chats and unknown chat types still need a dashboard Admin; public WebChat widget visitors are never eligible. Channel notices for ineligible requests contain no recipients, subject or body; full content stays in the dashboard.
 
 Recipient protection is independent of whether private data was read. Set `config.toml [security] recipient_guard` to `off`, `shadow` (default), or `ask`. An unknown value warns and behaves as `ask`. An employee's `[capabilities] recipient_guard` can only tighten the global setting (`off < shadow < ask`). In the dashboard, use Security → Outgoing data guard → Recipient guard; an Admin edits additional recipients under the employee's Tools & permissions → Allowed recipients.
 

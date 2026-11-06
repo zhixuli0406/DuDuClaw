@@ -1982,6 +1982,10 @@ async fn handle_message_create(
     );
     let on_progress = thinking.wrap(on_progress);
 
+    // No guild ID also describes group DMs. Only a fresh authenticated
+    // channel lookup can attest a one-to-one audience for mail confirmation.
+    let private_mail_chat = guild_id.is_empty() && reply_channel_id == channel_id
+        && discord_private_mail_chat(http, token, channel_id).await;
     let context = crate::approval::DecisionContext {
         channel: "discord".into(),
         account_id: app_id.into(),
@@ -1996,6 +2000,7 @@ async fn handle_message_create(
     )
     .map(|target| {
         target
+            .with_chat_type(private_mail_chat.then_some("1"))
             .with_user_access_policy(user_access_policy)
             .with_decision_access_scope(crate::decision_notify::DecisionAccessScope {
                 channel_id: (!guild_id.is_empty()).then_some(channel_id),
@@ -2541,6 +2546,18 @@ pub(crate) mod attachment_download_probe {
     pub(crate) fn count(token: &str) -> usize {
         counts().lock().unwrap().get(token).copied().unwrap_or(0)
     }
+}
+
+async fn discord_private_mail_chat(http: &reqwest::Client, token: &str, channel_id: &str) -> bool {
+    let url = format!("{DISCORD_API}/channels/{channel_id}");
+    #[cfg(test)]
+    let url = crate::test_channel_provider::url(token, &url);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        http.get(url).header("Authorization", format!("Bot {token}"))
+            .send().await?.error_for_status()?.json::<Value>().await
+    }).await;
+    matches!(result, Ok(Ok(channel)) if channel["id"].as_str() == Some(channel_id)
+        && channel["type"].as_u64() == Some(1) && channel["guild_id"].is_null())
 }
 
 fn discord_bound_text(text: &str) -> bool {
@@ -4702,5 +4719,27 @@ mod group_context_parent_tests {
         assert_eq!(discord_context_group(&json!({"parent_id":"category"}), "C1", false).as_deref(), Some("C1"));
         assert_eq!(discord_context_group(&json!({}), "T1", true), None);
         assert_eq!(discord_context_group(&json!({"parent_id":""}), "T1", true), None);
+    }
+}
+
+#[cfg(test)]
+mod mail_requester_audience_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mail_requester_discord_requires_verified_individual_dm_type() {
+        let provider = crate::test_channel_provider::TestChannelProvider::start().await;
+        for (metadata, expected) in [
+            (serde_json::json!({"id":"dm","type":1}), true),
+            (serde_json::json!({"id":"dm","type":3}), false),
+            (serde_json::json!({"id":"dm","type":0,"guild_id":"guild"}), false),
+            (serde_json::json!({"id":"dm"}), false),
+            (serde_json::json!({"id":"other","type":1}), false),
+        ] {
+            provider.enqueue_response("/channels/dm", metadata);
+            assert_eq!(discord_private_mail_chat(&reqwest::Client::new(), &provider.token, "dm").await, expected);
+        }
+        provider.refuse();
+        assert!(!discord_private_mail_chat(&reqwest::Client::new(), &provider.token, "dm").await);
     }
 }

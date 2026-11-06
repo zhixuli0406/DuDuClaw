@@ -28,7 +28,7 @@ pub(super) async fn replay(connection: Connection) {
 pub(super) fn may_decide(record: &ApprovalRecord, admin: bool) -> bool {
     admin && record.request_kind == RequestKind::Approval && record.binding.is_none()
         && matches!(record.action_kind.as_str(), "mcp_call" | "mcp_install")
-        && !crate::approval_notify::is_dashboard_only_record(record)
+        && !crate::approval_notify::is_dashboard_only_record(None, record)
         && record.payload.get("scope_epoch").is_none()
 }
 

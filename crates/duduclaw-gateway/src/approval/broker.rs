@@ -150,7 +150,7 @@ impl ApprovalBroker {
     /// WP20: push the freshly-filed approval to a channel and record where it
     /// landed. Silent no-op for in-memory stores and for kinds that own their
     /// own notification ([`SELF_NOTIFYING_KINDS`]).
-    pub(super) async fn push_new_request(&self, rec: &ApprovalRecord) {
+    pub(crate) async fn push_new_request(&self, rec: &ApprovalRecord) {
         if SELF_NOTIFYING_KINDS.contains(&rec.action_kind.as_str()) {
             return;
         }

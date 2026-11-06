@@ -940,7 +940,8 @@ async fn handle_event(
         thread_ts.clone(),
     )
     .map(|target| {
-        target.with_decision_access_scope(crate::decision_notify::DecisionAccessScope {
+        target.with_chat_type(event.get("channel_type").and_then(serde_json::Value::as_str))
+        .with_decision_access_scope(crate::decision_notify::DecisionAccessScope {
             channel_id: (!is_dm).then_some(channel),
             guild_id: None,
             session_id: Some(&session_id),

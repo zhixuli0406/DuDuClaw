@@ -708,14 +708,14 @@ async fn detail_handler(
         // R-L2: a dashboard-only kind carries a claim and a protected value
         // in its summary; the Mini App shows only the plain notice.
         summary: detail_summary(&rec),
-        trajectory: if crate::approval_notify::is_dashboard_only_record(&rec) {
+        trajectory: if crate::approval_notify::is_dashboard_only_record(None, &rec) {
             None
         } else {
             trajectory
         },
         status: rec.status.as_str().to_string(),
         settled: rec.status.is_terminal(),
-        decided_in_dashboard_only: crate::approval_notify::is_dashboard_only_record(&rec),
+        decided_in_dashboard_only: crate::approval_notify::is_dashboard_only_record(None, &rec),
         expires_at_epoch: rec.expires_at_epoch(),
         ttl_seconds: rec.ttl_seconds,
     };
@@ -726,7 +726,7 @@ async fn detail_handler(
 /// claim and a protected value in its summary, so only the plain notice (the
 /// same text the channel gets) is returned for it.
 fn detail_summary(rec: &crate::approval::ApprovalRecord) -> String {
-    if crate::approval_notify::is_dashboard_only_record(rec) {
+    if crate::approval_notify::is_dashboard_only_record(None, rec) {
         crate::approval_notify::dashboard_only_notice_body(rec, false)
     } else {
         duduclaw_core::truncate_chars(&rec.summary, SUMMARY_MAX_CHARS)

@@ -739,6 +739,7 @@ function EgressGuardSection({ status, onSaved }: { status: SecurityStatus | null
   const form = useConfigForm((tables) => ({
     'security.egress_guard': tables.security?.egress_guard ?? 'shadow',
     'security.recipient_guard': tables.security?.recipient_guard ?? 'shadow',
+    'security.mail_requester_approval': tables.security?.mail_requester_approval ?? true,
   }));
   const mode = vStr(form.values, 'security.egress_guard');
   const modes = ['off', 'shadow', 'ask', 'block'];
@@ -766,6 +767,16 @@ function EgressGuardSection({ status, onSaved }: { status: SecurityStatus | null
           disabled={!form.loaded || form.saving || form.loadError != null}
         />
         <p className="text-xs text-muted-foreground">{t('security.recipient.description')}</p>
+        <div className="flex items-center justify-between gap-3">
+          <label htmlFor="mail-requester-approval" className="text-sm">{t('security.mailRequester.label')}</label>
+          <Switch
+            id="mail-requester-approval"
+            checked={form.values['security.mail_requester_approval'] === true}
+            onCheckedChange={(value) => form.set('security.mail_requester_approval', value)}
+            disabled={!form.loaded || form.saving || form.loadError != null}
+          />
+        </div>
+        <p className="text-xs text-muted-foreground">{t('security.mailRequester.description')}</p>
         {status?.egress_bash_exposure && status.egress_bash_exposure.length > 0 && (
           <div role="alert" className="space-y-2 rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm">
             <p>{t('security.egress.bashWarning')}</p>

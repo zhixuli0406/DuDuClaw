@@ -1355,7 +1355,8 @@ async fn process_telegram_message(
         thread_id.map(|t| t.to_string()),
     )
     .map(|target| {
-        target.with_decision_access_scope(crate::decision_notify::DecisionAccessScope {
+        target.with_chat_type(msg.chat.chat_type.as_deref())
+        .with_decision_access_scope(crate::decision_notify::DecisionAccessScope {
             channel_id: (msg.chat.chat_type.as_deref() != Some("private"))
                 .then_some(chat_scope.as_str()),
             guild_id: None,

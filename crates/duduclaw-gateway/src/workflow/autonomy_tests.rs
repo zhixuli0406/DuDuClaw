@@ -55,6 +55,7 @@ async fn activation_card(
     };
     let environment = service.runner.executor.environment("alice").unwrap();
     let binding = ExecutionBinding {
+        conversation_audience: Default::default(),
         schema_version: 1,
         run_id: format!("{activation_id}-request"),
         run_origin_kind: "workflow".into(),
