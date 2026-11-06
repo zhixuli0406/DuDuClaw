@@ -5707,6 +5707,8 @@ export interface ApprovalItem {
   may_decide?: boolean;
   /** Decided in the dashboard only; channel presses never decide it. */
   decided_in_dashboard_only?: boolean;
+  /** The verified turn requester may decide this mail in its original conversation. */
+  mail_requester_approval_eligible?: boolean;
   /** Activation submitted by the viewer (self-approval is allowed, shown). */
   submitter_is_viewer?: boolean;
   /** Activation card facts; null unless the viewer may decide. */

@@ -642,6 +642,12 @@ function GenericApprovalView({
         </div>
       </Section>
 
+      {(approval.mail_requester_approval_eligible === true || (approval.decided_in_dashboard_only === true && actionGrant?.tool === 'mail_send')) && (
+        <p className="rounded-lg border p-3 text-sm" data-testid="approval-decision-authority">
+          {t(approval.mail_requester_approval_eligible === true ? 'approval.authority.mailRequester' : 'approval.authority.dashboardAdmin')}
+        </p>
+      )}
+
       {actionGrant && <ActionGrantSection grant={actionGrant} expiresAt={expiresAtEpoch} t={t} />}
 
       {disconnectForget && <DisconnectForgetFacts payload={disconnectPayload} />}

@@ -3,7 +3,10 @@
 mod lease_store;
 pub mod recovery;
 mod hook;
+mod mail_approval;
 mod connectors;
+
+pub const MAIL_APPROVAL_ROUTE: &str = "/api/internal/egress-guard/mail-approval";
 
 pub const HOOK_CHECK_ROUTE: &str = "/api/internal/egress-guard/hook-check";
 
@@ -644,6 +647,7 @@ pub fn router(state: Arc<RouteState>) -> Router {
         .route(RELEASE_SINK_ROUTE, post(release_sink))
         .layer(DefaultBodyLimit::max(4096))
         .route(HOOK_CHECK_ROUTE, post(hook::check).layer(DefaultBodyLimit::max(128 * 1024)))
+        .route(MAIL_APPROVAL_ROUTE, post(mail_approval::request).layer(DefaultBodyLimit::max(128 * 1024)))
         .with_state(state)
 }
 

@@ -7,6 +7,7 @@ use async_trait::async_trait;
 #[derive(Clone)]
 pub(crate) struct TrustedReplyTarget {
     pub context: DecisionContext,
+    pub conversation_audience: super::ConversationAudience,
     token: String,
     chat_id: String,
     thread_id: Option<String>,
@@ -126,6 +127,7 @@ impl TrustedReplyTarget {
             return Err("confirmation conversation does not match transport target".into());
         }
         Ok(Self {
+            conversation_audience: Default::default(),
             context,
             token,
             chat_id,
@@ -134,6 +136,14 @@ impl TrustedReplyTarget {
             decision_access_scope: None,
             user_access_policy: None,
         })
+    }
+    /// The caller must supply the chat type from its authenticated adapter,
+    /// never from message text, tool arguments or a missing-group heuristic.
+    pub(crate) fn with_chat_type(mut self, chat_type: Option<&str>) -> Self {
+        self.conversation_audience = super::mail_requester::adapter_audience(
+            &self.context.channel, chat_type,
+        );
+        self
     }
     pub(crate) fn with_user_access_policy(
         mut self,

@@ -528,9 +528,19 @@ Claude/Grok web tools and literal Bash network commands use a gateway-backed app
 
 ## Server-bound recipients
 
-The separate recipient guard defaults to `shadow`: targets outside the current server-owned source conversation, verified owners and the employee's `[capabilities] recipients` list are audited without blocking. In `ask`, they need a dashboard Admin's single-use approval; if outgoing-data protection also asks, both reasons share one card and one argument-bound ActionGrant. Unknown modes use `ask`; employee overrides can only tighten the global setting. The whole capabilities table is frozen against employee edits, including `recipient_guard` and `recipients`.
+The separate recipient guard defaults to `shadow`: targets outside the current server-owned source conversation, verified owners and the employee's `[capabilities] recipients` list are audited without blocking. In `ask`, they need a dashboard Admin's single-use approval (with the `mail_send` requester exception below); if outgoing-data protection also asks, both reasons share one card and one argument-bound ActionGrant. Unknown modes use `ask`; employee overrides can only tighten the global setting. The whole capabilities table is frozen against employee edits, including `recipient_guard` and `recipients`.
 
 Owners come only from `users.db` `AccessLevel::Owner` bindings resolved to verified channel identities. Employee-editable `[proactive]` targets never confer permission. MCP sends an opaque turn ID to a signed gateway route; forged reply-channel environment values do not change the source, and an unknown turn has none. Scheduled notification recipients are checked at creation and at fire time; fires have no source conversation. Scope and tool decisions are documented in [Outgoing data guard](69-egress-guard.md#server-bound-recipients).
+
+## Requester confirmation for mail
+
+When `mail_send` is held by the recipient or outgoing-data guard, the verified company account that started the turn may decide the confirmation card in that same one-to-one conversation or authenticated dashboard WebChat. The gateway must attest the requester; their account must still exist in `users.db` and have Operator access to this AI employee when deciding. Group conversations, an external or unverified sender (including LINE OA and `odoolivechat:` visitors), another AI employee, cron and heartbeat cannot use this exception. A dashboard Admin can still decide.
+
+The card shows every full recipient address, the subject, a body summary and whether this turn read private data. The card is a plain-text message with no buttons; reply with the decision verb and the full request UUID; an AI employee claiming “the user approved” has no effect. The existing single-use ActionGrant binds the final arguments. Before dispatch, policy revision and recipients are checked again; changed arguments require a new approval, a second use is refused and expiry denies. The record identifies the requester or dashboard Admin who decided.
+
+`config.toml [security] mail_requester_approval` is a boolean, default `true` by owner decision. A missing file or key uses that default; unreadable or malformed configuration, an invalid value, or `false` keeps the request dashboard-Admin-only. Admins can turn it off in Security settings. This exception applies only to `mail_send`; messages, calendar operations, third-party MCP, CLI outgoing operations and workflow activation retain their existing Admin-only outgoing approvals. Only an adapter-attested one-to-one conversation or authenticated dashboard WebChat is eligible. Group chats and unknown chat types still need a dashboard Admin; public WebChat widget visitors are never eligible. Channel notices for ineligible requests contain no recipients, subject or body; full content stays in the dashboard.
+
+The audience check accepts authenticated dashboard WebChat, but the current non-Admin WebChat confirmation UI/decision entry point is not yet wired; those users still need an Admin to complete the approval.
 
 ## Connection deletion approvals and receipts
 

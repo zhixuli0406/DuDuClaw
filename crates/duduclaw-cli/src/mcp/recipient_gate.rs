@@ -115,7 +115,7 @@ fn record_decision(home: &Path, agent: &str, tool: &str, decision: Decision, cal
     }
 }
 
-/// Use the existing Admin-only egress approval envelope so both gates share
+/// Use the existing egress approval envelope so both gates share
 /// one request and the same single-use binding over the final arguments.
 pub(crate) fn merge_reason(payload: &mut Value, reason: Value) {
     if payload.get("egress_guard").is_none() {
@@ -130,7 +130,13 @@ pub(crate) fn approval_summary(tool: &str, payload: &Value) -> String {
     let recipient = payload["egress_guard"].get("recipient_guard").is_some();
     let mut summary = format!("工具「{tool}」需確認完整內容與目的地。");
     if private_data { summary.push_str("\n本回合已讀取私人資料，這次動作將向外傳送資料（egress_guard）。"); }
-    if recipient { summary.push_str("\n目標不是來源對話也不在允許清單（含已驗證擁有者），需要管理員核准（recipient_guard）。"); }
+    if recipient {
+        summary.push_str(if tool == "mail_send" {
+            "\n收件人不在允許範圍；符合資格的交辦者可在原對話確認，否則由管理員核准（recipient_guard）。"
+        } else {
+            "\n目標不是來源對話也不在允許清單（含已驗證擁有者），需要管理員核准（recipient_guard）。"
+        });
+    }
     summary
 }
 
@@ -235,6 +241,53 @@ mod tests {
         assert!(verify_and_consume(&broker, &id, &ActionGrant::build("alice", "send_message", &payload)).await.is_err());
         assert!(verify_and_consume(&broker, &id, &grant).await.is_ok());
         assert!(verify_and_consume(&broker, &id, &grant).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mail_approval_gate_allows_one_dispatch_and_refuses_recipient_replacement() {
+        use crate::mcp::approval::{run_approval_bound, ApprovalSubject};
+        use crate::mcp::InstallApprovalOutcome;
+        use duduclaw_gateway::approval::{ApprovalBroker, action_grant::{ActionGrant, verify_and_consume}};
+        let home = tempfile::tempdir().unwrap();
+        let broker = ApprovalBroker::open(home.path()).unwrap();
+        let mut payload = json!({"name":"mail_send", "arguments":{
+            "to":"recipient@example.com", "subject":"Status", "body":"Report"}});
+        merge_reason(&mut payload, json!({"reason":"outside_allowed_recipients"}));
+        let grant = ActionGrant::build("alice", "mail_send", &payload);
+        let deciding = broker.clone();
+        let expected = grant.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let decision = tokio::spawn(async move {
+            for _ in 0..1000 {
+                let cards = deciding.list_pending(Some("alice")).await.unwrap();
+                if let Some(card) = cards.first() {
+                    assert!(card.binding.is_none(), "unattested CLI callers remain Admin-only");
+                    assert!(deciding.decide(&card.id, true, "agent:alice").await.is_err());
+                    deciding.decide_egress_dashboard(&card.id, &duduclaw_auth::UserContext::admin_fallback(), true).await.unwrap();
+                    let mut changed = card.payload.clone();
+                    changed["arguments"]["to"] = json!("replacement@example.com");
+                    assert!(verify_and_consume(&deciding, &card.id, &ActionGrant::build("alice", "mail_send", &changed)).await.is_err());
+                    assert!(expected.matches_stored(&card.payload["action_grant"]));
+                    tx.send(card.id.clone()).unwrap();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("mail approval was not filed");
+        });
+        let outcome = run_approval_bound(&broker, "alice", ApprovalSubject::ToolCall("mail_send"),
+            &approval_summary("mail_send", &payload), payload.clone(), 60,
+            std::time::Duration::from_millis(10), None, Some(&grant)).await;
+        let mut dispatches = 0;
+        if matches!(outcome, InstallApprovalOutcome::Proceed) { dispatches += 1; }
+        assert_eq!(dispatches, 1);
+        confirm_dispatch(home.path(), "alice", "mail_send", &payload, true, false).await.unwrap();
+        let id = rx.await.unwrap();
+        let replay = verify_and_consume(&broker, &id, &grant).await;
+        if replay.is_ok() { dispatches += 1; }
+        assert!(replay.is_err());
+        assert_eq!(dispatches, 1, "only the successful gate reaches the mail handler; no SMTP is exercised");
+        decision.await.unwrap();
     }
 
     #[test]
