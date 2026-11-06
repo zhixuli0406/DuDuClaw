@@ -187,6 +187,8 @@ Built-in reads resolve each model's live field names once per connection with `f
 
 An empty `allowed_models` or `allowed_actions` list adds no employee restriction. It does not disable other gates: a disabled **功能模組 / Feature modules** switch, the generic-tool block list, MCP scopes / tool allowlists, and Odoo's own ACLs can still refuse the query. For a blocked model such as `res.partner`, generic record access needs an administrator to confirm the sensitive-table selection in the dashboard, which adds `unblock_models` automatically. Editing `allowed_models` alone in a configuration file does not unblock it. Removing the last table selection or action rule removes the dashboard-managed exception. **Query and read** saves both `read` and `search`; older single-verb rules are shown as partial and normalized on save. An employee override's `unblock_models`, including an empty list, replaces the global value. The dedicated `odoo_partner_search` keeps its fixed safe projection.
 
+The action editor offers `read`/`search` (Search and read), `create`, `write`, `unlink`, `action` (Button actions) and `execute` (Other methods). For generic `odoo_execute` calls, `action` covers `action_*`, `button_*` and `toggle_*` methods such as confirm, validate and archive; `execute` covers other methods. Use `action` for all tables or `action:sale.order` for one table. Both method categories use write access as a hint; Odoo still checks each operation.
+
 DuDuClaw denial messages identify the relevant gate and setting. The separate read-only SQL connector has different semantics: `allowed_tables` must be non-empty, and its save RPC rejects an empty list. It is not the Odoo model allowlist.
 
 ### Edition Detection
