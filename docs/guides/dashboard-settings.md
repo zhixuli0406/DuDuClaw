@@ -207,6 +207,8 @@ Explicit logout or an account switch sends `{"type":"logout"}` before closing th
 
 Both WebChat and the dashboard RPC socket already send protocol ping frames every 30 seconds and count pong as liveness (60 seconds of silence, checked on the heartbeat tick). Browser JavaScript timers are not needed to answer protocol pings; OS sleep can still interrupt networking. Returning to a visible dashboard tab now reconnects immediately, resubscribes to the current conversation and reloads its history. A saved reply replaces the waiting state; an unanswered conversation uses the existing bounded history polling.
 
+WebChat keeps the conversation and its server session across reconnects, including the next message you send; an empty new conversation gets the new connection’s session. The composer shows connecting, reconnecting or disconnected status at all screen sizes. Unsent text and attachments stay in the composer, with a notice if sending fails. If an interrupted turn does not resume within 10 seconds, its waiting indicator stops and a notice explains that the AI may still be processing it. A later reply can still arrive or be recovered from history; the interruption does not cancel the server’s work or resend the message. After automatic retries stop, choose **Reconnect**. Going online, returning to a visible tab or restoring a page from the browser’s back/forward cache resets the retry budget and reconnects immediately.
+
 Existing frame fields are unchanged. Turn frames add `session_id`, `conv` and `msg_id` so clients can route progress, replies and errors to the originating turn. Send a unique `msg_id` with each `user_message`; use the returned session id when targeting a turn:
 
 ```json
