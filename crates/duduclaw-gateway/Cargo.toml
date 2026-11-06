@@ -152,7 +152,7 @@ tracing-opentelemetry = { version = "0.33", default-features = false, optional =
 tonic = { version = "0.14", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Kernel", "Win32_System_Ioctl", "Wdk_Foundation", "Wdk_Storage_FileSystem"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
