@@ -151,6 +151,9 @@ tracing-opentelemetry = { version = "0.33", default-features = false, optional =
 # directly only for tonic::metadata::MetadataKey (non-panicking header insert).
 tonic = { version = "0.14", default-features = false, optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 # "fs" (statvfs) + "net" (ifaddrs) added for WP-B appliance `device.status`

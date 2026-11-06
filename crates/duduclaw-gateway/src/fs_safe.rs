@@ -12,8 +12,9 @@
 //! between "check" and "use" cannot redirect the operation. Temp files get a
 //! random name and `O_CREAT|O_EXCL|O_NOFOLLOW`.
 //!
-//! Other platforms: best-effort path checks with `symlink_metadata` plus a
-//! canonical-containment check (no fd-relative API in std).
+//! Windows: pin every directory from the drive root without delete sharing,
+//! reject reparse points, and verify opened file handles before reading.
+//! Other platforms retain best-effort path checks and canonical containment.
 
 use std::io;
 
@@ -49,6 +50,10 @@ fn check_name(name: &str) -> io::Result<()> {
         || name.contains('\0')
     {
         return Err(refused(format!("invalid path component {name:?}")));
+    }
+    #[cfg(windows)]
+    if name.contains(':') || name.ends_with(['.', ' ']) {
+        return Err(refused(format!("invalid Windows path component {name:?}")));
     }
     Ok(())
 }
@@ -516,15 +521,54 @@ mod imp {
     use std::io::{self, Read, Write};
     use std::path::{Path, PathBuf};
 
-    /// Path-based fallback: checks with `symlink_metadata` before every use
-    /// and verifies canonical containment in the root.
+    #[cfg(windows)]
+    use std::os::windows::{fs::{MetadataExt, OpenOptionsExt}, io::AsRawHandle};
+    #[cfg(windows)]
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    /// Windows keeps every ancestor pinned; other platforms check paths only.
     pub(crate) struct SafeDir {
         path: PathBuf,
         root: PathBuf,
+        #[cfg(windows)]
+        handles: Vec<std::sync::Arc<std::fs::File>>,
+    }
+
+    fn reparse(m: &std::fs::Metadata) -> bool {
+        #[cfg(windows)]
+        { m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 }
+        #[cfg(not(windows))]
+        { m.file_type().is_symlink() }
+    }
+
+    #[cfg(windows)]
+    fn link_count(file: &std::fs::File) -> io::Result<u64> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is live and info is a writable output buffer.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(u64::from(info.nNumberOfLinks))
+    }
+
+    #[cfg(windows)]
+    fn pin_directory(path: &Path) -> io::Result<std::sync::Arc<std::fs::File>> {
+        let meta = std::fs::symlink_metadata(path)?;
+        if reparse(&meta) || !meta.is_dir() { return Err(refused("not a real directory")); }
+        let file = std::fs::OpenOptions::new().read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).open(path)?;
+        let meta = file.metadata()?;
+        if reparse(&meta) || !meta.is_dir() { return Err(refused("not a real directory")); }
+        Ok(std::sync::Arc::new(file))
     }
 
     fn info(name: &str, m: &std::fs::Metadata) -> EntryInfo {
-        let kind = if m.file_type().is_symlink() {
+        let kind = if reparse(m) {
             EntryKind::Other
         } else if m.is_file() {
             EntryKind::File
@@ -544,13 +588,24 @@ mod imp {
     impl SafeDir {
         pub(crate) fn open_root(path: &Path) -> io::Result<Self> {
             let canon = path.canonicalize()?;
+            #[cfg(windows)]
+            { return Self::open_nofollow(&canon, false); }
+            #[cfg(not(windows))]
             if !canon.is_dir() {
                 return Err(refused("root is not a directory"));
             }
+            #[cfg(not(windows))]
             Ok(Self {
                 path: canon.clone(),
                 root: canon,
             })
+        }
+
+        pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+            #[cfg(windows)]
+            { self.handles.last().ok_or_else(|| refused("directory is not pinned"))?.metadata() }
+            #[cfg(not(windows))]
+            { std::fs::metadata(&self.path) }
         }
 
         fn meta(&self, name: &str) -> io::Result<Option<std::fs::Metadata>> {
@@ -563,7 +618,22 @@ mod imp {
 
         pub(crate) fn entry(&self, name: &str) -> io::Result<Option<EntryInfo>> {
             check_name(name)?;
-            Ok(self.meta(name)?.map(|m| info(name, &m)))
+            #[cfg(windows)]
+            {
+                let file = match std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                    .open(self.path.join(name)) {
+                    Ok(file) => file,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                let mut entry = info(name, &file.metadata()?);
+                entry.nlink = link_count(&file)?;
+                Ok(Some(entry))
+            }
+            #[cfg(not(windows))]
+            { Ok(self.meta(name)?.map(|m| info(name, &m))) }
         }
 
         pub(crate) fn child_dir(&self, name: &str, create: bool) -> io::Result<Option<SafeDir>> {
@@ -578,15 +648,17 @@ mod imp {
                     }
                 })?,
                 None => return Ok(None),
-                Some(m) if m.file_type().is_symlink() || !m.is_dir() => {
+                Some(m) if reparse(&m) || !m.is_dir() => {
                     return Err(refused(format!("{name} is not a real directory")));
                 }
                 Some(_) => {}
             }
             let m = std::fs::symlink_metadata(&p)?;
-            if m.file_type().is_symlink() || !m.is_dir() {
+            if reparse(&m) || !m.is_dir() {
                 return Err(refused(format!("{name} is not a real directory")));
             }
+            #[cfg(windows)]
+            let handle = pin_directory(&p)?;
             let canon = p.canonicalize()?;
             if !canon.starts_with(&self.root) {
                 return Err(refused(format!("{name} resolves outside the root")));
@@ -594,6 +666,12 @@ mod imp {
             Ok(Some(SafeDir {
                 path: canon,
                 root: self.root.clone(),
+                #[cfg(windows)]
+                handles: {
+                    let mut handles = self.handles.clone();
+                    handles.push(handle);
+                    handles
+                },
             }))
         }
 
@@ -605,34 +683,82 @@ mod imp {
             &self,
             name: &str,
             max_bytes: u64,
-            _single_link: bool,
+            single_link: bool,
         ) -> io::Result<Option<Vec<u8>>> {
-            check_name(name)?;
-            match self.meta(name)? {
-                None => Ok(None),
-                Some(m) if m.file_type().is_symlink() || !m.is_file() => {
-                    Err(refused(format!("{name} is not a regular file")))
+            #[cfg(windows)]
+            let Some(file) = self.open_read_checked(name, single_link)? else { return Ok(None) };
+            #[cfg(not(windows))]
+            let file = {
+                let _ = single_link;
+                check_name(name)?;
+                match self.meta(name)? {
+                    None => return Ok(None),
+                    Some(m) if reparse(&m) || !m.is_file() => return Err(refused(format!("{name} is not a regular file"))),
+                    Some(_) => std::fs::File::open(self.path.join(name))?,
                 }
-                Some(m) if m.len() > max_bytes => {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"))
-                }
-                Some(_) => {
-                    let mut out = Vec::new();
-                    std::fs::File::open(self.path.join(name))?
-                        .take(max_bytes.saturating_add(1))
-                        .read_to_end(&mut out)?;
-                    if out.len() as u64 > max_bytes {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
-                    }
-                    Ok(Some(out))
-                }
+            };
+            if file.metadata()?.len() > max_bytes {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
             }
+            let mut out = Vec::new();
+            file.take(max_bytes.saturating_add(1)).read_to_end(&mut out)?;
+            if out.len() as u64 > max_bytes {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
+            }
+            Ok(Some(out))
         }
 
+        #[cfg(windows)]
+        pub(crate) fn open_nofollow(path: &Path, create: bool) -> io::Result<Self> {
+            use std::path::{Component, Prefix};
+            let absolute = if path.is_absolute() { path.to_owned() } else { std::env::current_dir()?.join(path) };
+            let mut parts = absolute.components();
+            let prefix = match parts.next() {
+                Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) => prefix,
+                _ => return Err(refused("directory must be on a local drive")),
+            };
+            if parts.next() != Some(Component::RootDir) { return Err(refused("directory must be absolute")); }
+            let mut root = PathBuf::from(prefix.as_os_str());
+            root.push(std::path::MAIN_SEPARATOR_STR);
+            let handle = pin_directory(&root)?;
+            let root = root.canonicalize()?;
+            let mut dir = Self { path: root.clone(), root, handles: vec![handle] };
+            for part in parts {
+                let Component::Normal(name) = part else { return Err(refused("invalid directory component")) };
+                let name = name.to_str().ok_or_else(|| refused("non-UTF-8 directory"))?;
+                dir = dir.child_dir(name, create)?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            }
+            dir.root = dir.path.clone();
+            Ok(dir)
+        }
+
+        #[cfg(not(windows))]
         pub(crate) fn open_nofollow(_path: &Path, _create: bool) -> io::Result<Self> {
             Err(io::Error::new(io::ErrorKind::Unsupported, "secure attachment directories require no-follow handles"))
         }
 
+        #[cfg(windows)]
+        pub(crate) fn open_read_checked(&self, name: &str, single_link: bool) -> io::Result<Option<std::fs::File>> {
+            check_name(name)?;
+            match self.meta(name)? {
+                None => return Ok(None),
+                Some(m) if reparse(&m) || !m.is_file() => return Err(refused(format!("{name} is not a regular file"))),
+                Some(_) => {}
+            }
+            let file = match std::fs::OpenOptions::new().read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(self.path.join(name)) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let meta = file.metadata()?;
+            if reparse(&meta) || !meta.is_file() { return Err(refused(format!("{name} is not a regular file"))); }
+            if single_link && link_count(&file)? > 1 { return Err(refused(format!("{name} has several hard links"))); }
+            Ok(Some(file))
+        }
+
+        #[cfg(not(windows))]
         pub(crate) fn open_read_checked(&self, _name: &str, _single_link: bool) -> io::Result<Option<std::fs::File>> {
             Err(io::Error::new(io::ErrorKind::Unsupported, "secure attachment reads require no-follow directory handles"))
         }
@@ -646,13 +772,32 @@ mod imp {
             }
         }
 
+        #[cfg(windows)]
+        pub(crate) fn open_create_new(&self, name: &str) -> io::Result<std::fs::File> {
+            check_name(name)?;
+            std::fs::OpenOptions::new().write(true).create_new(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(self.path.join(name))
+        }
+
+        #[cfg(not(windows))]
         pub(crate) fn open_create_new(&self, _name: &str) -> io::Result<std::fs::File> {
             Err(io::Error::new(io::ErrorKind::Unsupported, "secure attachment creation requires no-follow directory handles"))
         }
 
-        /// Refuse creation where fd-relative no-follow operations are unavailable.
-        pub(crate) fn create_file_new(&self, _name: &str, _contents: &[u8]) -> io::Result<bool> {
-            Err(io::Error::new(io::ErrorKind::Unsupported, "secure skill creation requires no-follow directory handles"))
+        pub(crate) fn create_file_new(&self, name: &str, contents: &[u8]) -> io::Result<bool> {
+            let mut file = match self.open_create_new(name) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    return match self.entry(name)? {
+                        Some(entry) if entry.kind == EntryKind::File && entry.nlink == 1 => Ok(false),
+                        _ => Err(refused("existing file is not a regular, single-link file")),
+                    };
+                }
+                Err(e) => return Err(e),
+            };
+            file.write_all(contents)?;
+            file.sync_all()?;
+            Ok(true)
         }
 
         pub(crate) fn write_bytes_atomic_with(
@@ -666,12 +811,15 @@ mod imp {
             check_name(tmp)?;
             let perms = match self.meta(name)? {
                 None => None,
-                Some(m) if m.file_type().is_symlink() || !m.is_file() => {
+                Some(m) if reparse(&m) || !m.is_file() => {
                     return Err(refused(format!("{name} is not a regular file")));
                 }
                 Some(m) => Some(m.permissions()),
             };
+            #[cfg(windows)]
+            let mut f = self.open_create_new(tmp)?;
             let tmp = self.path.join(tmp);
+            #[cfg(not(windows))]
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -680,7 +828,7 @@ mod imp {
                 fault(WriteStep::Write)?;
                 f.write_all(contents)?;
                 if let Some(p) = perms {
-                    std::fs::set_permissions(&tmp, p)?;
+                    f.set_permissions(p)?;
                 }
                 fault(WriteStep::Sync)?;
                 f.sync_all()?;
@@ -706,7 +854,25 @@ mod imp {
 
         pub(crate) fn remove_file(&self, name: &str) -> io::Result<()> {
             check_name(name)?;
-            std::fs::remove_file(self.path.join(name))
+            #[cfg(windows)]
+            {
+                use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle};
+                let file = std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES | DELETE)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                    .open(self.path.join(name))?;
+                let meta = file.metadata()?;
+                if reparse(&meta) || !meta.is_file() { return Err(refused(format!("{name} is not a regular file"))); }
+                let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+                // SAFETY: live handle with DELETE access and a correctly sized input buffer.
+                if unsafe { SetFileInformationByHandle(file.as_raw_handle(), FileDispositionInfo,
+                    (&disposition as *const FILE_DISPOSITION_INFO).cast(), std::mem::size_of_val(&disposition) as u32) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            }
+            #[cfg(not(windows))]
+            { std::fs::remove_file(self.path.join(name)) }
         }
 
         pub(crate) fn list(&self) -> io::Result<Vec<EntryInfo>> {
@@ -722,8 +888,9 @@ mod imp {
                     });
                     continue;
                 };
-                match std::fs::symlink_metadata(entry.path()) {
-                    Ok(m) => out.push(info(&name, &m)),
+                match self.entry(&name) {
+                    Ok(Some(info)) => out.push(info),
+                    Ok(None) => {},
                     Err(_) => out.push(EntryInfo {
                         name: String::new(),
                         kind: EntryKind::Other,
@@ -739,6 +906,10 @@ mod imp {
 }
 
 pub(crate) use imp::SafeDir;
+
+#[cfg(all(test, windows))]
+#[path = "fs_safe/windows_tests.rs"]
+mod windows_tests;
 
 impl SafeDir {
     /// Walk `components` from this directory, never following a symlink.

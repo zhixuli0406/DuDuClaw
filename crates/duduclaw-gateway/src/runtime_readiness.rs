@@ -189,6 +189,7 @@ mod tests {
         assert!(protected_binary_in_path("../claude", PROTECTED_SERVICE_PATH).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn protected_canonical_path_rejects_hidden_intermediate_links() {
         let inspect = |path: &Path| -> std::io::Result<Option<PathBuf>> {
