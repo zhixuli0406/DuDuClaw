@@ -26,6 +26,10 @@ password-hash = "0.5"
 # JWT
 jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 
+# webauthn-rs pulls in OpenSSL; Windows runners lack system OpenSSL, and vendoring needs Perl provided by GitHub Windows runners.
+[target.'cfg(windows)'.dependencies]
+openssl = { version = "=0.10.81", features = ["vendored"] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
