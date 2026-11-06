@@ -1,3 +1,4 @@
+import { assertAgentRequestAllowed } from './agent-request-guard';
 import { client } from './ws-client';
 import { useAuthStore } from '@/stores/auth-store';
 
@@ -27,6 +28,7 @@ export async function callTaskRpc<T>(
   if (!attachments || attachments.length === 0) {
     return client.call(method, rest) as Promise<T>;
   }
+  await assertAgentRequestAllowed(method, params);
   const jwt = useAuthStore.getState().jwt;
   const res = await fetch(TASK_RPC_PATH, {
     method: 'POST',

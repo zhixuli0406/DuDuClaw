@@ -1,3 +1,4 @@
+import { assertAgentRequestAllowed } from './agent-request-guard';
 import { useAuthStore } from '@/stores/auth-store';
 
 export interface CausalScope { tenant_id: string; acl: string }
@@ -115,6 +116,7 @@ export interface ImportedSource {
 }
 
 async function request<T>(path: string, body?: object): Promise<T> {
+  if (body) await assertAgentRequestAllowed(`POST ${path}`, body);
   const jwt = useAuthStore.getState().jwt;
   const response = await fetch(path, {
     method: body ? 'POST' : 'GET',

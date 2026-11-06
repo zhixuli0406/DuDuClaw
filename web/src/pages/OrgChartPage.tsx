@@ -1,3 +1,4 @@
+import { canSelectAgent, useAgentGrantPresent } from '@/stores/callable-agents-store';
 import { useVisibleAgents, useAgentVisibilityUnrestricted } from '@/lib/data-scope';
 import { Link } from 'react-router';
 import { useEffect, useState } from 'react';
@@ -91,10 +92,20 @@ function ManagedOrgChart() {
     fetchAgents();
   }, [fetchAgents]);
 
+  const selectedAllowed = useAgentGrantPresent(selectedAgent?.name);
+  useEffect(() => {
+    if (selectedAgent && !selectedAllowed) {
+      setSelectedAgent(null);
+      clearPanel();
+      setSheetOpen(false);
+    }
+  }, [selectedAgent, selectedAllowed, clearPanel, setSheetOpen]);
+
   // Clear the right panel when leaving the page.
   useEffect(() => () => clearPanel(), [clearPanel]);
 
   const handleNodeClick = (agentName: string) => {
+    if (!canSelectAgent(agentName)) return;
     const agent = agents.find((a) => a.name === agentName) ?? null;
     setSelectedAgent(agent);
     if (agent) setSheetOpen(true); // mobile: open the bottom sheet
@@ -102,7 +113,7 @@ function ManagedOrgChart() {
 
   // Push the selected staff card into the shared right PropertiesPanel (§5.4 T6.3).
   useEffect(() => {
-    if (!selectedAgent) return;
+    if (!selectedAgent || !selectedAllowed) return;
     setPanel({
       title: selectedAgent.display_name,
       content: (
@@ -117,6 +128,7 @@ function ManagedOrgChart() {
             navigate(`/agents/${encodeURIComponent(selectedAgent.name)}/edit`);
           }}
           onPause={async () => {
+            if (!canSelectAgent(selectedAgent.name)) return;
             try {
               await pauseAgent(selectedAgent.name);
             } catch (e) {
@@ -128,6 +140,7 @@ function ManagedOrgChart() {
             setSelectedAgent((prev) => (prev ? { ...prev, status: 'paused' } : null));
           }}
           onResume={async () => {
+            if (!canSelectAgent(selectedAgent.name)) return;
             try {
               await resumeAgent(selectedAgent.name);
             } catch (e) {
@@ -141,7 +154,7 @@ function ManagedOrgChart() {
         />
       ),
     });
-  }, [selectedAgent, setPanel, clearPanel, navigate, pauseAgent, resumeAgent, intl, errorText]);
+  }, [selectedAgent, selectedAllowed, setPanel, clearPanel, navigate, pauseAgent, resumeAgent, intl, errorText]);
 
   return (
     <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">

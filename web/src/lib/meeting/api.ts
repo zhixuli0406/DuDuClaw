@@ -1,3 +1,4 @@
+import { assertAgentHttpRequestAllowed } from '../agent-request-guard';
 import { useAuthStore } from '@/stores/auth-store';
 import { chunkSha256 } from './sha256';
 
@@ -13,6 +14,8 @@ export interface MeetingJob {
 export interface UploadReceipt { upload_id: string; chunk_size: number; received: number[]; hashes?: Record<string, string>; expires_at?: number }
 export class MeetingHttpError extends Error { constructor(message: string, readonly status: number) { super(message); } }
 export async function meetingFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const authorization = assertAgentHttpRequestAllowed(path, init);
+  if (authorization) await authorization;
   const jwt = useAuthStore.getState().jwt;
   const headers = new Headers(init.headers);
   if (jwt) headers.set('Authorization', `Bearer ${jwt}`);

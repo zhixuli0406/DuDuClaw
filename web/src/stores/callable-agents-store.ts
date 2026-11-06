@@ -1,3 +1,4 @@
+import { setAgentRequestAuthorizer } from '@/lib/agent-request-guard';
 import { useCallback, useEffect, useRef } from 'react';
 import { flushSync } from 'react-dom';
 import { create } from 'zustand';
@@ -21,36 +22,50 @@ const empty: Entry = { agents: null, loading: false, unrestricted: false };
 export const CALLABLE_REFRESH_INTERVAL_MS = 60_000;
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
 const sessions = new Map<string, string | null | undefined>();
+const pendingLoads = new Map<string, Promise<void>>();
 let generation = 0;
 let confirmation = 0;
 export const CALLABLE_TIMEOUT_MS = 15_000;
 export const useCallableAgentsStore = create<CallableStore>((set, get) => ({
   entries: {},
-  load: async (key, sessionId, refresh = false) => {
+  load: (key, sessionId, refresh = false) => {
+    const pending = pendingLoads.get(key);
+    if (pending) return pending;
     const entry = get().entries[key];
-    if (entry?.loading || (entry && !refresh)) return;
+    if (entry && !entry.loading && !refresh) return Promise.resolve();
     sessions.set(key, sessionId);
     syncRefreshTimer();
     const ticket = generation;
+    // Publish the promise before loading state so reentrant callers also join it.
+    let settle!: (result: Promise<void>) => void;
+    const request = new Promise<void>(resolve => { settle = resolve; }).finally(() => {
+      if (pendingLoads.get(key) === request) pendingLoads.delete(key);
+    });
+    pendingLoads.set(key, request);
     set(s => ({ entries: { ...s.entries, [key]: { ...(entry ?? empty), loading: true } } }));
-    let agents: readonly CallableAgent[] | null = null;
-    let unrestricted = false;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const result = await Promise.race([
-        api.agents.callable(sessionId),
-        new Promise<never>((_, reject) => {
-          timeout = setTimeout(() => reject(new Error('Callable grants timed out')), CALLABLE_TIMEOUT_MS);
-        }),
-      ]);
-      if (Array.isArray(result?.agents)) {
-        agents = result.agents;
-        unrestricted = result.unrestricted === true;
-      }
-    } catch { /* Failed grants never fall back to the detailed roster. */ }
-    finally { clearTimeout(timeout); }
-    if (ticket !== generation) return;
-    set(s => ({ entries: { ...s.entries, [key]: { agents, unrestricted, loading: false, confirmedAt: (confirmation = Math.max(Date.now(), confirmation + 1)) } } }));
+    // Start discovery synchronously, preserving picker activation semantics.
+    settle((async () => {
+      if (ticket !== generation) return;
+      let agents: readonly CallableAgent[] | null = null;
+      let unrestricted = false;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const result = await Promise.race([
+          api.agents.callable(sessionId),
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => reject(new Error('Callable grants timed out')), CALLABLE_TIMEOUT_MS);
+          }),
+        ]);
+        if (Array.isArray(result?.agents)) {
+          agents = result.agents;
+          unrestricted = result.unrestricted === true;
+        }
+      } catch { /* Failed grants never fall back to the detailed roster. */ }
+      finally { clearTimeout(timeout); }
+      if (ticket !== generation) return;
+      set(s => ({ entries: { ...s.entries, [key]: { agents, unrestricted, loading: false, confirmedAt: (confirmation = Math.max(Date.now(), confirmation + 1)) } } }));
+    })());
+    return request;
   },
 }));
 
@@ -62,6 +77,7 @@ export function callableSubject() {
 }
 function invalidate() {
   generation++;
+  pendingLoads.clear();
   sessions.clear();
   syncRefreshTimer();
   useCallableAgentsStore.setState({ entries: {} });
@@ -133,6 +149,35 @@ export function canSelectAgent(name: string, sessionId?: string | null): boolean
   const entry = useCallableAgentsStore.getState().entries[key];
   return !!entry && !entry.loading && entry.agents !== null &&
     (entry.unrestricted || entry.agents.some(a => a.name === name && a.selectable === true));
+}
+
+/** Wait for a confirmed response, joining refreshes without using stale grants. */
+export async function ensureFreshGrants(sessionId?: string | null): Promise<void> {
+  for (;;) {
+    const ticket = generation;
+    const key = JSON.stringify([callableSubject(), sessionId ?? null]);
+    const entry = useCallableAgentsStore.getState().entries[key];
+    if (!entry || entry.loading || entry.confirmedAt === undefined || entry.agents === null) {
+      await useCallableAgentsStore.getState().load(key, sessionId, true);
+    }
+    // A response for an earlier identity must never authorize the current one.
+    if (ticket !== generation || key !== JSON.stringify([callableSubject(), sessionId ?? null])) continue;
+    if (useCallableAgentsStore.getState().entries[key]?.loading) continue;
+    return;
+  }
+}
+
+// Imported unconditionally by main.tsx; isolated transports still default to deny.
+setAgentRequestAuthorizer({ ensureFreshGrants, canSelectAgent, identity: () => generation });
+
+/** Display fence: retain an open editor during a refresh, but clear it on a
+ * confirmed revocation, failed load or identity change. Mutations MUST still use
+ * the async transport guard before sending; retained grants cannot authorize them.
+ */
+export function useAgentGrantPresent(name: string | null | undefined): boolean {
+  const { agents, unrestricted } = useCallableAgents();
+  return !!name && agents !== null &&
+    (unrestricted || agents.some(agent => agent.name === name && agent.selectable === true));
 }
 
 /** A selection activation must observe a response newer than its opening render. */

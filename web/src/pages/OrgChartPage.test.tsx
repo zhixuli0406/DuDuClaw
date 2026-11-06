@@ -1,12 +1,18 @@
+import { mockWsClient } from '@/test/mocks';
+import { mockCallableGrants } from '@/test/callable-grants';
+import { useAgentsStore } from '@/stores/agents-store';
+import type { ReactElement } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, screen, waitFor } from '@testing-library/react';
-import { mockWsClient } from '@/test/mocks';
 import { api } from '@/lib/api';
 import { renderWithProviders } from '@/test/render';
 import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import type { OrgChartAgent } from '@/lib/api';
 import { OrgChartPage } from './OrgChartPage';
+
+const panel = vi.hoisted(() => ({ setPanel: vi.fn(), clearPanel: vi.fn(), setSheetOpen: vi.fn() }));
+vi.mock('@/components/ui', () => ({ usePanel: () => panel }));
 
 const chart = vi.hoisted(() => vi.fn());
 vi.mock('@/components/OrgChart', () => ({
@@ -67,4 +73,25 @@ describe('employee organization chart', () => {
     await act(async () => resolveOld({ agents: structure }));
     expect(screen.queryByText('Finance assistant')).not.toBeInTheDocument();
   });
+});
+
+it('clears a selected manager panel and fences retained pause/resume callbacks after revocation', async () => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager', status: 'active' } } as never);
+  mockCallableGrants(['finance']);
+  useAgentsStore.setState({ agents: structure, loaded: true, loading: false } as never);
+  renderWithProviders(<OrgChartPage />);
+  await screen.findByText('Finance assistant');
+  act(() => chart.mock.calls.at(-1)![0].onNodeClick('finance'));
+  const content = panel.setPanel.mock.calls.at(-1)![0].content as ReactElement<{
+    onPause: () => Promise<void>; onResume: () => Promise<void>;
+  }>;
+  panel.clearPanel.mockClear();
+  await act(async () => {
+    mockCallableGrants([]);
+    await content.props.onPause();
+    await content.props.onResume();
+  });
+  expect(panel.clearPanel).toHaveBeenCalled();
+  expect(panel.setSheetOpen).toHaveBeenLastCalledWith(false);
+  expect(mockWsClient.call.mock.calls.some(([m]) => m === 'agents.pause' || m === 'agents.resume')).toBe(false);
 });

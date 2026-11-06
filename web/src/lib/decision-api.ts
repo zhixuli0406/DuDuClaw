@@ -1,3 +1,4 @@
+import { assertAgentRequestAllowed } from './agent-request-guard';
 import { useAuthStore } from '@/stores/auth-store';
 
 export interface DecisionArtifact {
@@ -760,6 +761,7 @@ export type SyntheticLifecycleKind = 'acl_lost' | 'deleted' | 'quarantined' | 'v
 export type SyntheticLifecycleStageOutcome = 'staged' | 'already_staged' | 'already_completed';
 
 async function request<T>(path: string, body?: object): Promise<T> {
+  if (body) await assertAgentRequestAllowed(`POST ${path}`, body);
   const jwt = useAuthStore.getState().jwt;
   const response = await fetch(path, {
     method: body ? 'POST' : 'GET',
