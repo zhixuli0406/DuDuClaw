@@ -7,7 +7,7 @@ pub(super) const DB_FILE: &str = "artifact_provenance.db";
 const MIGRATION_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const ROW_MAX_BYTES: u64 = 64 * 1024;
 
-pub(super) fn open(home: &Path) -> Result<Connection, String> {
+pub(super) fn open(home: &Path) -> Result<crate::fs_safe::sqlite::Connection, String> {
     let mut connection = crate::fs_safe::sqlite::open(home, DB_FILE)
         .map_err(|_| "artifact authority unavailable")?;
     connection.busy_timeout(std::time::Duration::from_secs(1)).map_err(|_| "artifact authority unavailable")?;

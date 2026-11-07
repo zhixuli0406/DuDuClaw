@@ -52,6 +52,7 @@ const goalTask = {
 };
 
 beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never, bindings: [] });
   vi.clearAllMocks();
   useConnectionStore.setState({ state: 'authenticated' as never, error: null });
   mockWsClient.call.mockImplementation((method: string) => {
@@ -428,3 +429,5 @@ describe('GoalsPage — goal cost cap', () => {
     }
   });
 });
+
+import { useAuthStore } from '@/stores/auth-store';

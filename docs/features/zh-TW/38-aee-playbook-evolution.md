@@ -72,7 +72,7 @@ enabled = true        # 總開關（master switch）
 gvu_enabled = true     # 學習迴圈本身
 ```
 
-經由首次設定、產業板模精靈或 `create_agent` 工具建立的 AI 員工，`agent.toml` 會直接寫入 `gvu_enabled = true`（2026-09-29 起）。執行期的閘門沒有變：缺鍵或格式錯誤一律讀成 `false`。手寫的 `agent.toml`，或在那之前建立、沒有這一行的員工，要自己補上才會開始學習。
+儀表板、CLI、MCP、範本與專家匯入建立員工時，會明寫 `gvu_enabled = true`。自 2026-11-06 起，有效 `agent.toml` 缺少這個鍵也會讀成 `true`，既有從儀表板建立的員工升級後也會開始學習。公司範本保留來源員工明確的停用設定；要退出，設 `gvu_enabled = false`，全部演化仍受 `[evolution] enabled = false` 總開關控制。檔案不存在、無法讀取、TOML 損壞或開關型別錯誤仍拒絕演化。系統員工與短期 helper 維持停用。
 
 其他常用設定：
 

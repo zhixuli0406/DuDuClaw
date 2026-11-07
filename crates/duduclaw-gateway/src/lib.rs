@@ -365,6 +365,8 @@ pub mod feishu;
 pub mod files_api;
 pub(crate) mod chat_attachments;
 pub(crate) mod fs_safe;
+#[doc(hidden)]
+pub use fs_safe::sqlite::database_path as secure_database_path;
 pub mod governance;
 pub mod gvu;
 pub mod install_notify;
@@ -417,6 +419,8 @@ pub mod secret_redact;
 pub mod server;
 mod mfa;
 mod mfa_email;
+/// Installation Ed25519 key and the shared descriptor-pinned `state/` store.
+pub mod installation_identity;
 pub mod session;
 pub mod session_origin;
 pub mod session_portability;

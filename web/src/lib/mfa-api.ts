@@ -24,7 +24,13 @@ export interface MfaOverview {
     channel: string; channel_user_id: string; verified: boolean; verified_at: number | null;
   }> }>;
 }
-export interface MfaStatus extends FactorAvailability { enabled: boolean; enforced: boolean; email_hint?: string }
+export interface MfaStatus extends FactorAvailability {
+  enabled: boolean;
+  enforced: boolean;
+  email_hint?: string;
+  /** Admin-only SAS of the installation key when the relay awaits console approval. */
+  relay_key_fingerprint?: string | null;
+}
 export async function accountRequest<T>(path: string, body?: Record<string, unknown>): Promise<T> {
   const jwt = useAuthStore.getState().jwt;
   if (!jwt) throw new ApiError(401, 'Session expired');

@@ -1,3 +1,4 @@
+import { canSelectAgent, useAgentGrantPresent } from '@/stores/callable-agents-store';
 import { useProductPolicy } from '@/lib/product-policy';
 import { useEffect, useState, type ReactNode } from 'react';
 import { useIntl, type IntlShape } from 'react-intl';
@@ -171,6 +172,15 @@ export function AddChannelDialog({
   const [googlechatManual, setGooglechatManual] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
+  const targetAgent = lockedAgent || parsedAgent || selectedAgent;
+  const selectable = useAgentGrantPresent(targetAgent);
+  useEffect(() => {
+    if (open && targetAgent && !selectable) {
+      setToken('');
+      setSecret('');
+      onClose();
+    }
+  }, [open, targetAgent, selectable, onClose]);
 
   const close = () => {
     if (channelType === 'googlechat') onCreated('googlechat');
@@ -204,7 +214,8 @@ export function AddChannelDialog({
         if (wecomCallbackToken.trim()) config.wecom_callback_token = wecomCallbackToken.trim();
         if (wecomAesKey.trim()) config.wecom_encoding_aes_key = wecomAesKey.trim();
       }
-      const res = await api.channels.add(channelType, config, selectedAgent || undefined);
+      if (targetAgent && !canSelectAgent(targetAgent)) return;
+      const res = await api.channels.add(channelType, config, targetAgent || undefined);
       reportChannelStart(channelType, res, intl);
       onCreated(channelType);
       onClose();
@@ -344,7 +355,7 @@ export function AddChannelDialog({
     : '';
 
   return (
-    <Dialog open={open} onOpenChange={(o) => !o && close()}>
+    <Dialog open={open && (!targetAgent || selectable)} onOpenChange={(o) => !o && close()}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>

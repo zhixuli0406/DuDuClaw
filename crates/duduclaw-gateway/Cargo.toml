@@ -110,7 +110,8 @@ minisign-verify = "0.2"
 # A2A v1.0 signed Agent Card — EdDSA/JWS signing (a2a_signing.rs). Same crate
 # convention as duduclaw-license; `rand_core` enables SigningKey::generate for
 # first-run key material. Signing (not just verify) so full feature set here.
-ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+# `zeroize` clears SigningKey seeds (A2A and MFA relay installation.key) on drop.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "zeroize"] }
 rand = "0.8"
 
 duduclaw-inference = { workspace = true }
@@ -150,6 +151,9 @@ tracing-opentelemetry = { version = "0.33", default-features = false, optional =
 # Already in the otel tree via opentelemetry-otlp's grpc-tonic transport; named
 # directly only for tonic::metadata::MetadataKey (non-panicking header insert).
 tonic = { version = "0.14", default-features = false, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Kernel", "Win32_System_Ioctl", "Wdk_Foundation", "Wdk_Storage_FileSystem"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

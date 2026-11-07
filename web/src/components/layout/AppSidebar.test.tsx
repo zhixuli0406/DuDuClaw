@@ -1,7 +1,7 @@
 import { useCompanyStore } from '@/stores/company-store';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { useLocation } from 'react-router';
-import { screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
@@ -40,6 +40,7 @@ function precedes(a: Element, b: Element): boolean {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.spyOn(api.agents, 'callable').mockImplementation(async () => ({ agents: useAgentsStore.getState().agents.filter(a => useAuthStore.getState().bindings.some(b => b.agent_name === a.name)).map(a => ({ ...a, via: 'binding', selectable: true })), unrestricted: useAuthStore.getState().user?.role === 'admin', default_agent: null }) as never);
   localStorage.clear();
   useBrandStore.setState({ brand: null });
   useCompanyStore.getState().setCompany(null);
@@ -129,7 +130,7 @@ describe('AppSidebar (Multica shell)', () => {
   // D6 (09-edition-split-features.md §4): the org chart is a progressive-
   // disclosure surface now, not a `personalHidden` one — it waits for the
   // roster to clear ORG_CHART_MIN_AGENTS, on EITHER edition.
-  it('org chart discloses itself once the roster reaches ORG_CHART_MIN_AGENTS', () => {
+  it('org chart discloses itself once the roster reaches ORG_CHART_MIN_AGENTS', async () => {
     useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
     useAgentsStore.setState({ agents: makeAgents(ORG_CHART_MIN_AGENTS - 1) as never });
     const { unmount } = renderSidebar();
@@ -138,7 +139,7 @@ describe('AppSidebar (Multica shell)', () => {
 
     useAgentsStore.setState({ agents: makeAgents(ORG_CHART_MIN_AGENTS) as never });
     renderSidebar();
-    expect(screen.getByRole('link', { name: /^Team$/i })).toBeInTheDocument();
+    expect(await screen.findByRole('link', { name: /^Team$/i })).toBeInTheDocument();
   });
 
   it('personal edition: org chart is folded into 進階, not shown before the roster is big enough', async () => {
@@ -237,13 +238,14 @@ describe('AppSidebar (Multica shell)', () => {
   // the same order. This is the Enterprise half of the pair; the Personal half
   // is asserted in the personal-IA case above, using the same rendered-order
   // read so neither can drift without the other failing.
-  it('enterprise edition: 公司 group follows the same 技能庫→記憶→AI 員工→世界 order', () => {
+  it('enterprise edition: 公司 group follows the same 技能庫→記憶→AI 員工→世界 order', async () => {
     useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
     // D6: 'Team' (the org chart) only shows once the roster clears the
     // progressive-disclosure threshold — this assertion is about ordering,
     // not disclosure, so seed enough agents for it to actually be present.
     useAgentsStore.setState({ agents: makeAgents(ORG_CHART_MIN_AGENTS) as never });
     renderSidebar();
+    await screen.findByRole('link', { name: /^Team$/i });
     const order = screen
       .getAllByRole('link')
       .map((el) => el.textContent?.trim())
@@ -387,11 +389,12 @@ describe('employee sidebar', () => {
     expect(document.querySelector('svg.lucide-bell')).not.toBeNull();
   });
 
-  it('marks and sorts the primary employee before an Owner binding', () => {
+  it('marks and sorts the primary employee before an Owner binding', async () => {
     useAgentsStore.setState({ agents: makeAgents(2) as never });
     useAuthStore.setState({ user: { id: 'employee', role: 'employee', primary_agent_id: 'agent-1' } as never,
       bindings: [{ agent_name: 'agent-0', access_level: 'owner' }, { agent_name: 'agent-1', access_level: 'operator' }] as never });
     renderSidebar();
+    await screen.findByText('Agent 0');
     const links = screen.getAllByRole('link').filter(link => /^\/agents\//.test(link.getAttribute('href') ?? ''));
     expect(links.map(link => link.getAttribute('href'))).toEqual(['/agents/agent-1', '/agents/agent-0']);
     expect(links[0]).toHaveTextContent('Primary');
@@ -412,7 +415,7 @@ describe('employee sidebar', () => {
     const me = vi.spyOn(api.users, 'me').mockImplementation(() => refreshing as ReturnType<typeof api.users.me>);
     renderSidebar();
     const staffLinks = () => screen.getAllByRole('link').filter(link => /^\/agents\//.test(link.getAttribute('href') ?? ''));
-    expect(staffLinks()[0]).toHaveAttribute('href', '/agents/agent-0');
+    await waitFor(() => expect(staffLinks()[0]).toHaveAttribute('href', '/agents/agent-0'));
     await user.click(screen.getAllByRole('button', { name: 'Set as primary' })[1]);
     await user.click(await screen.findByRole('menuitem', { name: 'Set as primary' }));
     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('users.set_primary_agent', { agent_id: 'agent-1' }));
@@ -429,19 +432,20 @@ describe('employee sidebar', () => {
     me.mockRestore();
   });
 
-  it('does not offer a primary selection for Viewer bindings', () => {
+  it('does not offer a primary selection for Viewer bindings', async () => {
     useAgentsStore.setState({ agents: makeAgents(2) as never });
     useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never,
       bindings: [{ agent_name: 'agent-0', access_level: 'viewer' }, { agent_name: 'agent-1', access_level: 'operator' }] as never });
     renderSidebar();
-    expect(screen.getAllByRole('button', { name: 'Set as primary' })).toHaveLength(1);
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'Set as primary' })).toHaveLength(1));
   });
 
-  it('sorts bound staff by owner, operator, viewer and limits the list to eight', () => {
+  it('sorts bound staff by owner, operator, viewer and limits the list to eight', async () => {
     const agents = makeAgents(10);
     useAgentsStore.setState({ agents: agents as never });
     useAuthStore.setState({ bindings: agents.map((a, index) => ({ agent_name: a.name, access_level: index === 9 ? 'owner' : index === 8 ? 'operator' : 'viewer' })) as never });
     renderSidebar();
+    await screen.findByText('Agent 0');
     const links = screen.getAllByRole('link').filter(link => /^\/agents\//.test(link.getAttribute('href') ?? ''));
     expect(links).toHaveLength(8);
     expect(links.slice(0, 2).map(link => link.getAttribute('href'))).toEqual(['/agents/agent-9', '/agents/agent-8']);
@@ -502,4 +506,23 @@ it('opens language settings from the employee menu and keeps the version out of 
   await user.click(screen.getByRole('button', { name: 'Alice' }));
   await user.click(await screen.findByRole('menuitem', { name: 'Switch language' }));
   expect(screen.getByTestId('menu-location')).toHaveTextContent('/me/account#language');
+});
+
+import { callableSubject, useCallableAgentsStore } from '@/stores/callable-agents-store';
+
+it('does not set a primary employee revoked while its menu is open', async () => {
+  const user = userEvent.setup();
+  useAgentsStore.setState({ agents: makeAgents(1) as never });
+  useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never,
+    bindings: [{ agent_name: 'agent-0', access_level: 'owner' }] as never });
+  renderSidebar();
+  await user.click(await screen.findByRole('button', { name: 'Set as primary' }));
+  const item = await screen.findByRole('menuitem', { name: 'Set as primary' });
+  await waitFor(() => expect(item).not.toHaveAttribute('aria-disabled', 'true'));
+  act(() => {
+    const key = JSON.stringify([callableSubject(), null]);
+    useCallableAgentsStore.setState({ entries: { [key]: { agents: [], unrestricted: false, loading: false, confirmedAt: Date.now() + 1 } } });
+    fireEvent.click(item);
+  });
+  expect(mockWsClient.call.mock.calls.some(([method]) => method === 'users.set_primary_agent')).toBe(false);
 });

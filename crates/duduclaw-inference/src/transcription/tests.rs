@@ -352,7 +352,7 @@ async fn transcription_google_stt_auth_quota_errors_are_sanitized_and_cleaned() 
         std::fs::write(&audio, b"audio").unwrap();
         let error = engine.transcribe(&audio, "cmn-Hant-TW", &[]).await.unwrap_err();
         assert!(!error.message.contains("secret-provider-diagnostic"));
-        assert!(error.message.contains(if status == 429 { "配額" } else { "權限" }));
+        assert!(error.message.contains(if status == 429 { "配額" } else { "權限" }), "{error:?}");
         assert_eq!(error.usage.len(), 1);
         assert_eq!(server.finish().await.len(), 3);
     }
@@ -382,7 +382,7 @@ async fn transcription_google_stt_upload_errors_cleanup_without_recognition_usag
         std::fs::write(&audio, b"audio").unwrap();
         let error = engine.transcribe(&audio, "cmn-Hant-TW", &[]).await.unwrap_err();
         assert!(!error.message.contains("secret-upload-diagnostic"));
-        assert!(error.message.contains(if status == 429 { "配額" } else { "權限" }));
+        assert!(error.message.contains(if status == 429 { "配額" } else { "權限" }), "{error:?}");
         assert!(error.usage.is_empty());
         let requests = server.finish().await;
         assert_eq!(requests.len(), 2);
@@ -400,7 +400,7 @@ async fn transcription_google_stt_cleanup_failure_preserves_paid_attempt_usage()
     let audio = dir.path().join("sample.m4a");
     std::fs::write(&audio, b"audio").unwrap();
     let error = engine.transcribe(&audio, "cmn-Hant-TW", &[]).await.unwrap_err();
-    assert!(error.message.contains("無法確認雲端錄音已刪除"));
+    assert!(error.message.contains("無法確認雲端錄音已刪除"), "{error:?}");
     assert!(!error.message.contains("secret-delete-diagnostic"));
     assert_eq!(error.usage.len(), 1);
     assert_eq!(error.usage[0].model, "google-stt/chirp_2");

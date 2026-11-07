@@ -186,16 +186,16 @@ fn enrollment_budget_is_hourly_backward_safe_and_persisted_across_restart() {
     let home = tempfile::tempdir().unwrap();
     let store = Store::open(home.path()).unwrap();
     let mut state = store.state().unwrap();
-    let installation_id = state.installation_id.clone();
-    assert!(uuid::Uuid::parse_str(&installation_id).is_ok());
     assert_eq!(state.last_enrollment_attempt, None);
     state.reserve(10_000).unwrap();
     store.save_state(&state).unwrap();
     assert_eq!(std::fs::metadata(home.path().join("state").join(STATE_FILE)).unwrap().mode() & 0o7777, 0o600);
+    // The server derives installation ids from the public key; none is persisted.
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(home.path().join("state").join(STATE_FILE)).unwrap()).unwrap();
+    assert_eq!(saved, serde_json::json!({"last_enrollment_attempt":10_000}));
     drop(store);
     let store = Store::open(home.path()).unwrap();
     let mut state = store.state().unwrap();
-    assert_eq!(state.installation_id, installation_id);
     assert_eq!(state.last_enrollment_attempt, Some(10_000));
     for now in [i64::MIN, 9_999, 10_000, 13_599] {
         assert!(state.reserve(now).is_err());
@@ -208,7 +208,17 @@ fn enrollment_budget_is_hourly_backward_safe_and_persisted_across_restart() {
     let mut state = store.state().unwrap();
     assert!(state.reserve(13_600).is_err());
     assert_eq!(state.last_enrollment_attempt, Some(13_600));
-    assert_eq!(state.installation_id, installation_id);
+}
+
+#[test]
+fn legacy_state_with_random_installation_id_still_loads() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    private_file(&home.path().join("state").join(STATE_FILE),
+        br#"{"installation_id":"5f0c7d36-9a7f-4c1f-8f43-0e5d1c4c2b10","last_enrollment_attempt":42}"#);
+    assert_eq!(store.state().unwrap().last_enrollment_attempt, Some(42));
+    private_file(&home.path().join("state").join(STATE_FILE), br#"{"last_enrollment_attempt":1,"other":true}"#);
+    assert!(store.state().is_err());
 }
 
 #[cfg(target_os = "macos")]

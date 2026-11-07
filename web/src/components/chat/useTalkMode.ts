@@ -283,10 +283,10 @@ export function useTalkMode(opts: {
           return;
         }
         const store = useChatStore.getState();
-        store.send(text); // normal user message through the normal send path
-        if (!useChatStore.getState().isStreaming) {
-          // send() no-ops when the socket is down — don't wait for a reply
-          // that will never come.
+        // Re-check current grants in send() after the STT await, even during a running turn.
+        const sent = store.send(text); // normal user message through the normal send path
+        if (sent === false || !useChatStore.getState().isStreaming) {
+          // A refused send has no reply to wait for, even if an older turn runs.
           cbRef.current.onError?.('disconnected');
           recover(gen);
         }

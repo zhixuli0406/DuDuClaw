@@ -37,7 +37,7 @@ pub(crate) fn unavailable_reason(home: &Path) -> Option<&'static str> {
     let smtp = crate::mail_worker::resolve_smtp_config(home).is_some();
     let enabled = relay_enabled(home);
     let eligibility = if smtp || !enabled { Ok(()) }
-        else if !cfg!(any(unix, windows)) { Err("no_smtp_no_relay") }
+        else if !cfg!(any(unix, windows)) { Err("no_smtp") }
         else { crate::license_runtime::mfa_relay_license(home).map(|_| ()) };
     availability_reason(smtp, enabled, eligibility)
 }
@@ -48,19 +48,38 @@ mod transport;
 mod store;
 mod relay;
 
+/// Resolve an eligible, key-bound relay license BEFORE touching the relay
+/// store. Unbound or mismatched installation keys never reach the network
+/// and never consume the enrollment budget.
+fn prepare_relay(home: &Path,
+    resolve: impl FnOnce(&Path) -> Result<crate::license_runtime::RelayLicense, &'static str>)
+    -> Result<(store::Store, crate::license_runtime::RelayLicense), &'static str> {
+    let relay = resolve(home).map_err(|_| DELIVERY_FAILED)?;
+    let store = store::open_wait(home, transport::TIMEOUT).map_err(|_| DELIVERY_FAILED)?;
+    Ok((store, relay))
+}
+
 async fn send_relay(home: &Path, email: &str, code: &str) -> Result<(), &'static str> {
     if !relay_enabled(home) { return Err(DELIVERY_FAILED); }
     let home = home.to_path_buf();
     tokio::time::timeout(transport::TIMEOUT, async {
-        let (store, license, fingerprint) = tokio::task::spawn_blocking(move || {
-            let (license, fingerprint) = crate::license_runtime::mfa_relay_license(&home)
-                .map_err(|_| DELIVERY_FAILED)?;
-            let store = store::open_wait(&home, transport::TIMEOUT).map_err(|_| DELIVERY_FAILED)?;
-            Ok::<_, &'static str>((store, license, fingerprint))
-        }).await.map_err(|_| DELIVERY_FAILED)??;
-        relay::deliver(&store, license, &fingerprint, email, code,
+        let (store, relay) = tokio::task::spawn_blocking(move ||
+            prepare_relay(&home, crate::license_runtime::mfa_relay_license))
+            .await.map_err(|_| DELIVERY_FAILED)??;
+        relay::deliver(&store, &relay, email, code,
             chrono::Utc::now().timestamp(), transport::exchange).await
     }).await.map_err(|_| DELIVERY_FAILED)?
+}
+
+/// Inline (no blocking pool) variant so tests can inject the license resolver
+/// and a recording exchange.
+#[cfg(test)]
+pub(crate) async fn relay_send_for_test<R, F, Fut>(home: &Path, email: &str, code: &str, now: i64,
+    resolve: R, exchange: F) -> Result<(), &'static str>
+where R: FnOnce(&Path) -> Result<crate::license_runtime::RelayLicense, &'static str>,
+      F: FnMut(transport::Call) -> Fut, Fut: std::future::Future<Output = Result<transport::Reply, &'static str>> {
+    let (store, relay) = prepare_relay(home, resolve)?;
+    relay::deliver(&store, &relay, email, code, now, exchange).await
 }
 
 fn recipient_digest(home: &Path, email: &str) -> String {

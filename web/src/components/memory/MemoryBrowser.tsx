@@ -1,3 +1,4 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { useSearchParams } from 'react-router';
@@ -539,6 +540,7 @@ function ForgetButton({
   const run = async () => {
     setBusy(true);
     try {
+      if (!canSelectAgent(entry.agent_id)) return;
       await api.memory.forget(entry.agent_id, entry.id);
       toast.success(intl.formatMessage({ id: 'memory.forget.done' }));
       setConfirming(false);

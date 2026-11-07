@@ -468,7 +468,10 @@ async fn dispatch(
         None,
     )
     .map(|target| {
-        target.with_decision_access_scope(crate::decision_notify::DecisionAccessScope {
+        target.with_chat_type(event.source.as_ref().filter(|source|
+            source.group_id.is_none() && source.room_id.is_none()
+        ).and_then(|source| source.source_type.as_deref()))
+        .with_decision_access_scope(crate::decision_notify::DecisionAccessScope {
             channel_id: event
                 .source
                 .as_ref()

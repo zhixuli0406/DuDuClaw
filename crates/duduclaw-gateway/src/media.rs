@@ -699,7 +699,7 @@ mod tests {
 
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, not(any(unix, windows))))]
 #[tokio::test]
 async fn attachment_save_fails_closed_without_nofollow_support() {
     let home = crate::fs_safe::private_test_home().unwrap();

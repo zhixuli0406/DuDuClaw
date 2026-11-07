@@ -1,3 +1,4 @@
+import { canSelectAgent, useAgentGrantPresent } from '@/stores/callable-agents-store';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -518,6 +519,15 @@ function AutoPagesTab({ agentId }: { agentId: string }) {
   const [promoteTarget, setPromoteTarget] = useState<AutoWikiPage | null>(null);
   const [removeTarget, setRemoveTarget] = useState<AutoWikiPage | null>(null);
   const [purgeOpen, setPurgeOpen] = useState(false);
+  const selectable = useAgentGrantPresent(agentId);
+  useEffect(() => {
+    if (!selectable) {
+      setPromoteTarget(null);
+      setRemoveTarget(null);
+      setPurgeOpen(false);
+      setPreview(null);
+    }
+  }, [selectable, agentId]);
 
   const [loadError, setLoadError] = useState<unknown>(null);
 
@@ -540,6 +550,7 @@ function AutoPagesTab({ agentId }: { agentId: string }) {
 
   const run = useCallback(
     async (path: string, action: () => Promise<unknown>, successId?: string) => {
+      if (!canSelectAgent(agentId)) return;
       setBusyPath(path);
       setError('');
       setNotice('');
@@ -556,7 +567,7 @@ function AutoPagesTab({ agentId }: { agentId: string }) {
         fetchPages();
       }
     },
-    [fetchPages, intl],
+    [agentId, fetchPages, intl],
   );
 
   const view = useCallback(
@@ -577,6 +588,8 @@ function AutoPagesTab({ agentId }: { agentId: string }) {
     },
     [agentId, intl, preview],
   );
+
+  if (!selectable) return null;
 
   if (pages === null) {
     return (

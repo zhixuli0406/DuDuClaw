@@ -1,6 +1,6 @@
 # Extension gates and independent entry points
 
-PL-0 reserves core RPC handling, validates extension HTTP registration and closes managed third-party MCP transport gaps. These are product entry-point controls. A native `GatewayExtension` still runs inside the gateway process; it is trusted code, not a sandboxed plugin. A feature-family switch cannot be enforced merely by hiding dashboard navigation or intercepting extension RPC calls.
+Since v1.80.0, the gateway reserves core RPC handling, validates extension HTTP registration and closes managed third-party MCP transport gaps. These are product entry-point controls. A native `GatewayExtension` still runs inside the gateway process; it is trusted code, not a sandboxed plugin. A feature-family switch cannot be enforced merely by hiding dashboard navigation or intercepting extension RPC calls.
 
 This inventory records the entry points reviewed for the Odoo Live Chat and voice families, plus the shared extension/MCP boundaries. It includes related Odoo events and meeting transcription because they reach the same external systems or audio providers independently. “Outside the extension gate” means the call does not traverse that gate; it does **not** mean the call is unauthenticated. Existing guards are listed separately. Source locations are a review snapshot for this change and should be refreshed when moving these functions.
 
@@ -18,7 +18,7 @@ Extensions declare individual `http_routes()` entries, each carrying a literal p
 
 Every extension route requires live bearer authentication, password-state checks and the declared minimum role before its handler runs. `ExtensionRoute::new(path, methods)` defaults to Admin; choosing Manager or Employee requires an explicit `minimum_role` declaration. The core re-reads the user's role on every request, so a stale Admin JWT cannot retain access after demotion. The outer gate also checks origin and enforces a hard 2 MiB request-body limit. There is no Public mode or extension webhook exemption. An extension cannot remove that outer gate with its own inner middleware; resource and business authorization remain the handler's responsibility.
 
-Opaque `extra_routes()` routers cannot be inspected safely and are refused at startup. Existing wrappers must migrate to the declared route API before upgrading. PL-0 does not modify or validate any out-of-tree wrapper.
+Opaque `extra_routes()` routers cannot be inspected safely and are refused at startup. Existing wrappers must migrate to the declared route API before upgrading. These checks do not modify or validate any out-of-tree wrapper.
 
 ### Third-party MCP
 
@@ -109,6 +109,6 @@ No dedicated inbound Live Chat HTTP route was found: visitor messages arrive thr
 
 ## Validation boundary
 
-The inventory is based on source inspection, not live Odoo, voice-provider or third-party-server acceptance. PL-0 adds regression tests for routing collisions, unauthenticated extension requests and MCP transport gate coverage. Gateway/CLI compilation and those tests must run on the designated remote builder; this worktree's local build restrictions prohibit running them here. A passing source inspection or test does not establish compatibility with an out-of-tree extension.
+The inventory is based on source inspection, not live Odoo, voice-provider or third-party-server acceptance. Regression tests cover routing collisions, unauthenticated extension requests and MCP transport gate coverage. A passing source inspection or test does not establish compatibility with an out-of-tree extension.
 
-A later family-wide enable/disable design must choose a shared admission point for each row, define how active work is stopped, and preserve required cleanup. PL-0 intentionally leaves those existing product paths and their independent authorization policies in place.
+A later family-wide enable/disable design must choose a shared admission point for each row, define how active work is stopped, and preserve required cleanup. The v1.80.0 gates intentionally leave those existing product paths and their independent authorization policies in place.

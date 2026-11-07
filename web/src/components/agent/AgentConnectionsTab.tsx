@@ -1,3 +1,4 @@
+import { canSelectAgent, useAgentGrantPresent } from '@/stores/callable-agents-store';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Link } from 'react-router';
@@ -96,6 +97,18 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
     agentId: string; userId: string; name: string;
   } | null>(null);
 
+  const selectable = useAgentGrantPresent(agentId);
+  useEffect(() => {
+    if (!selectable) {
+      setEditing(false);
+      setPrimaryPending(null);
+      setConfirmed(false);
+      setAnyoneConfirmed(false);
+      setEmail('');
+      setSelectedUser('');
+    }
+  }, [selectable, agentId]);
+
   const live = useRef(true);
   const loadEpoch = useRef(0);
   useLayoutEffect(() => {
@@ -126,7 +139,7 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
   }, [load]);
 
   const startEdit = () => {
-    if (!view) return;
+    if (!view || !canSelectAgent(agentId)) return;
     setChoice(isAdmin ? choiceOf(view) : view.kind==='none' ? 'none' : 'mine');
     setEmail(view.email ?? '');
     setFallback(view.fallback === 'home');
@@ -138,7 +151,7 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
   };
 
   const save = async () => {
-    if (!isCurrent()) return;
+    if (!isCurrent() || !canSelectAgent(agentId)) return;
     const identity =
       choice === 'delegate' ? `delegate:${email.trim()}` : choice==='user' ? `user:${selectedUser}` : choice==='mine' ? `user:${userId}` : choice;
     const personal = ['owner','user','mine'].includes(choice);
@@ -154,7 +167,7 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
           ...(confirmed ? {confirm_shared_access:true} : {}),
         } : {}),
       });
-      if (!isCurrent()) return;
+      if (!isCurrent() || !canSelectAgent(agentId)) return;
       setView(v);
       setEditing(false);
       setSteps(null);
@@ -167,7 +180,7 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
   };
 
   const runTest = async () => {
-    if (!isCurrent()) return;
+    if (!isCurrent() || !canSelectAgent(agentId)) return;
     setBusy('testing');
     try {
       const r = await api.googleIdentity.test(agentId);
@@ -180,7 +193,7 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
   };
 
   const confirmPrimaryOwner = async () => {
-    if (!isCurrent() || !primaryPending || primaryPending.agentId !== agentId || !isAdmin || !enterprise || busy !== 'idle') return;
+    if (!canSelectAgent(agentId) || !isCurrent() || !primaryPending || primaryPending.agentId !== agentId || !isAdmin || !enterprise || busy !== 'idle') return;
     setBusy('saving');
     try {
       await api.personalGoogle.primaryOwner(primaryPending.agentId, primaryPending.userId);
@@ -194,6 +207,7 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
     }
   };
 
+  if (!selectable) return null;
   if (error) return <ErrorState error={error} onRetry={() => void load()} />;
   if (!view) return <Skeleton className="h-40 w-full" />;
 

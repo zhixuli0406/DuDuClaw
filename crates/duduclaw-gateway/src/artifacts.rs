@@ -670,7 +670,7 @@ pub(crate) fn archive_for_history_source(home: &Path, agent: &str, source: &Path
 /// A request-local connection for bounded, indexed authority lookups. It never
 /// loads an agent's entire history or falls back to the rotating audit tail.
 pub(crate) struct HistoryIndex {
-    connection: std::sync::Mutex<Option<rusqlite::Connection>>,
+    connection: std::sync::Mutex<Option<crate::fs_safe::sqlite::Connection>>,
     agent: String,
 }
 impl HistoryIndex {

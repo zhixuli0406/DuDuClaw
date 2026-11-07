@@ -1,3 +1,5 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -38,7 +40,8 @@ import { sanitizeErrorDetail } from '@/lib/error-message';
 export function CreateAgentPage() {
   const intl = useIntl();
   const navigate = useNavigate();
-  const { agents, fetchAgents } = useAgentsStore();
+  const { fetchAgents } = useAgentsStore();
+  const agents = useSelectableAgents(false);
   const [name, setName] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [role, setRole] = useState('specialist');
@@ -160,7 +163,7 @@ export function CreateAgentPage() {
   };
 
   const handleSubmit = async () => {
-    if (!name.trim() || !displayName.trim()) return;
+    if (!name.trim() || !displayName.trim() || (reportsTo && !canSelectAgent(reportsTo))) return;
     setError(null);
     setErrorState(null);
     setSubmitting(true);
@@ -213,6 +216,7 @@ export function CreateAgentPage() {
   const showRosterNotes = usingTemplate && roster?.industry != null;
 
   const t = (key: string) => intl.formatMessage({ id: key });
+  const errorSeparator = error ? /: |：/.exec(error) : null;
 
   const roleOptions: SelectOption[] = ['main', 'specialist', 'worker', 'developer', 'qa', 'planner'].map(
     (r) => ({ value: r, label: t(`agents.role.${r}`), raw: r }),
@@ -407,8 +411,8 @@ export function CreateAgentPage() {
         {error && (
           <div role="alert" className="text-sm text-destructive">
             <p>{error}</p>
-            {error.includes(': ') && (
-              <p className="mt-1 text-xs text-muted-foreground">{error.slice(error.indexOf(': ') + 2)}</p>
+            {errorSeparator && (
+              <p className="mt-1 text-xs text-muted-foreground">{error.slice(errorSeparator.index! + errorSeparator[0].length)}</p>
             )}
           </div>
         )}

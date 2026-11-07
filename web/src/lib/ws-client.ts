@@ -1,3 +1,5 @@
+import { withAgentRequestAllowed } from './agent-request-guard';
+
 // WebSocket client matching the Rust WsFrame protocol
 // (crates/duduclaw-gateway/src/protocol.rs)
 
@@ -351,18 +353,21 @@ export class DuDuClawClient {
       });
     };
 
-    return waitForReady().then(() => new Promise((resolve, reject) => {
-      const id = String(++this.requestId);
-      const timeout = setTimeout(() => {
-        this.pendingRequests.delete(id);
-        reject(new Error(`Request timeout: ${method}`));
-      }, timeoutMs);
+    return waitForReady().then(() => {
+      // Load/join grants before allocating a request ID or a response timeout.
+      return withAgentRequestAllowed(method, params, () => new Promise((resolve, reject) => {
+        const id = String(++this.requestId);
+        const timeout = setTimeout(() => {
+          this.pendingRequests.delete(id);
+          reject(new Error(`Request timeout: ${method}`));
+        }, timeoutMs);
 
-      this.pendingRequests.set(id, { resolve, reject, timeout });
+        this.pendingRequests.set(id, { resolve, reject, timeout });
 
-      const frame: WsFrame = { type: 'req', id, method, params };
-      this.ws!.send(JSON.stringify(frame));
-    }));
+        const frame: WsFrame = { type: 'req', id, method, params };
+        this.ws!.send(JSON.stringify(frame));
+      }));
+    });
   }
 
   subscribe(event: string, handler: EventHandler): () => void {

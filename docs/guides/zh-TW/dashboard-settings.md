@@ -38,6 +38,8 @@
 
 一般員工可在側欄 AI 員工的選單中選「設為主要」。該員工會標示「主要」並排在最前面。已登入使用者可透過 `users.set_primary_agent {agent_id}` 選擇目前已綁定的員工，傳入 `{agent_id: null}` 可清除偏好；這不會新增權限或變更綁定。非管理員開始網頁新對話時，伺服器優先使用仍已綁定、可呼叫、已載入且不是主代理的主要員工；否則只在恰好有一位可呼叫的非主代理時使用該員工。沒有符合的員工或有多位可選時，不會開始對話。有多位時請先在一般員工側欄「設為主要」；若你的角色看不到此選項，或沒有可用員工，請聯絡管理員。
 
+非管理員成員（Employee、Manager）在側欄、對話篩選、指令面板、WebChat 的 `@` 建議與其他員工選擇器，只會看到 `agents.callable` 明確標示可選取的員工。主 AI 員工預設不顯示，除非該回應明確允許選取。只有 `agents.callable` 依即時 Admin 身分確認 `unrestricted: true` 後，才顯示完整名單，包含個人版的本機管理員。所有帳號在初次載入或讀取失敗時都不顯示員工。頁面可見時每 60 秒、恢復可見及開啟選單時會刷新權限；刷新期間保留同一身分已確認的名單，失敗則清空。檔案與設定選擇器另須直接存取權，團隊呼叫權不會增加檔案或設定權限。新對話仍由伺服器決定指派對象。這次 dashboard 過濾不變更 RPC 授權。
+
 ## 員工健康（v1.80.0）
 
 管理員與主管可在兩種版本開啟「員工健康」（`/employee-health`）。頁面先顯示摘要，展開各位員工後可查看最近一次有紀錄的回覆、過去 24 小時或 7 天的失敗分類、等你決定或暫停中的目標，以及帳號可用狀態。失敗分成空白回覆、額度或預算限制、請求過於頻繁、認證失效、逾時、權限檢查拒絕、傳送失敗與其他錯誤。帳號狀態只反映符合員工明確設定 `account_pool` 的帳號；未設定帳號池時顯示無法確認，也不會測試 CLI 本身的登入狀態或即時連線服務商。
@@ -207,6 +209,8 @@ max_global_turns = 10
 
 WebChat 與儀表板 RPC 連線原本就由伺服器每 30 秒送出 WebSocket protocol ping，收到 pong 算存活；超過 60 秒無回應時於心跳檢查關閉。protocol pong 不需要網頁 JavaScript 計時器，作業系統休眠仍可能中斷網路。現在分頁回到前景會立即重連、重新訂閱目前對話並讀取歷史；已有回覆就結束等待顯示，尚未回覆則沿用有期限的歷史輪詢。
 
+網頁聊天重連後會保留原本對話與伺服器端工作階段，下一則訊息也會接續；空白的新對話則採用新連線的工作階段。輸入框旁會顯示連線中、重新連線中或已斷線，手機也看得到。送出失敗時會提示，未送出的文字與附件仍留在輸入框。回覆因斷線中斷且 10 秒內未恢復時，會停止等待動畫並提示 AI 可能仍在處理；後續回覆仍可收到或從歷史補回，不會因此取消伺服器工作或自動重送。自動重試停止後可按「重新連線」。網路恢復、分頁回到前景或從瀏覽器上一頁／下一頁快取還原時，都會重設重試次數並立即重連。
+
 既有訊框欄位不變。回合訊框增加 `session_id`、`conv` 與 `msg_id`，供用戶端把進度、回覆及錯誤送回原本的回合。每個 `user_message` 應使用不同的 `msg_id`；若以 session 指定回合，使用伺服器回傳的 session id：
 
 ```json
@@ -243,15 +247,15 @@ WebChat 與儀表板 RPC 連線原本就由伺服器每 30 秒送出 WebSocket p
 
 ## 整合 → Odoo → 員工權限
 
-到員工編輯頁勾選可用資料表，並新增動作規則。沒有勾選資料表代表不增加資料表限制；沒有動作規則代表不增加動作限制。Odoo 自己的 ACL、功能模組開關與內建敏感資料表封鎖仍然有效。每條規則選擇一個資料表（或「所有資料表」）及動作：「查詢與讀取」同時儲存 `read`、`search`；「新增」、「修改」、「刪除」、「執行動作」分別儲存 `create`、`write`、`unlink`、`execute`。設定格式不變：所有資料表用單一動詞，指定資料表用 `verb:model`，例如 `read:hr.employee`、`search:hr.employee`。
+到員工編輯頁勾選可用資料表，並新增動作規則。沒有勾選資料表代表不增加資料表限制；沒有動作規則代表不增加動作限制。Odoo 自己的 ACL、功能模組開關與內建敏感資料表封鎖仍然有效。每條規則選擇一個資料表（或「所有資料表」）及動作：「查詢與讀取」同時儲存 `read`、`search`；「新增」、「修改」、「刪除」、「按鈕動作」、「其他方法」分別儲存 `create`、`write`、`unlink`、`action`、`execute`。通用 `odoo_execute` 呼叫的按鈕動作包含確認、驗證、封存等 `action_*`、`button_*`、`toggle_*` 方法；所有資料表用 `action`，指定資料表用 `action:sale.order`。其餘方法仍使用 `execute`。設定格式不變：所有資料表用單一動詞，指定資料表用 `verb:model`，例如 `read:hr.employee`、`search:hr.employee`。
 
 `hr.employee` 等標示「敏感」的資料表含有敏感資料，選取時需要確認。在資料表清單勾選或在動作規則選取，確認後都會自動加入該員工的封鎖例外；移除最後一個使用處時，會一起移除例外。員工頁不再有獨立的解鎖欄位。`ir.model`、`ir.model.fields`、`ir.attachment` 即使確認後仍然唯讀。全域 Odoo 頁也改用敏感資料表核取清單與相同確認流程；它影響全域連線，員工覆寫的例外清單則會取代全域值。
 
 資料表選項使用已存全域連線的 `odoo.schema_scan` 快照。管理員專用的 `odoo.permission_options` RPC 驗證連線後讀取既有快取（連線最多等 10 秒），回傳資料表名稱、標籤及快取的帳號權限；`odoo.config` 也會回傳後端維護的敏感與唯讀清單。開啟編輯頁會沿用快取；首次連線若沒有帳號權限資料，會排程背景掃描。尚未掃描或連線失敗時可按掃描按鈕，已設定的資料表與敏感資料表仍會保留在畫面上。若員工連到其他資料庫，也能保留全域掃描未列出的既有資料表名稱。
 
-可用動作來自連線所用 Odoo 帳號本身的讀取、新增、修改與刪除權限，於連線或結構掃描時探測，並連同時間戳記快取。若在 Odoo 調整帳號權限，請按「重新掃描」。執行動作以修改權限作為可用提示，實際能執行哪些按鈕由 Odoo 判斷，資料列規則仍由 Odoo 檢查。沒有權限的動作無法勾選；無法確認的動作保留可選並顯示提示。已儲存但無權限的動作保留勾選與警告，可取消勾選移除。「所有資料表」不限制勾選，因各表實際權限不同；DuDuClaw 禁止讀取的資料表不會送出探測。 動作可用性使用已儲存的全域連線；若員工使用獨立連線、憑證或公司範圍，編輯器會顯示無法確認，不會套用其他帳號的拒絕結果。
+可用動作來自連線所用 Odoo 帳號本身的讀取、新增、修改與刪除權限，於連線或結構掃描時探測，並連同時間戳記快取。若在 Odoo 調整帳號權限，請按「重新掃描」。按鈕動作與其他方法都以修改權限作為可用提示，實際能執行哪些操作由 Odoo 判斷，資料列規則仍由 Odoo 檢查。沒有權限的動作無法勾選；無法確認的動作保留可選並顯示提示。已儲存但無權限的動作保留勾選與警告，可取消勾選移除。「所有資料表」不限制勾選，因各表實際權限不同；DuDuClaw 禁止讀取的資料表不會送出探測。 動作可用性使用已儲存的全域連線；若員工使用獨立連線、憑證或公司範圍，編輯器會顯示無法確認，不會套用其他帳號的拒絕結果。
 
-舊規則依資料表分組。只有 `read` 或 `search` 的舊設定顯示「查詢與讀取／僅部分」，儲存時補成一對。既有 `action` 規則（執行時對應 `action_*`、`button_*`、`toggle_*` 方法）與不認得的項目列在唯讀的「其他設定」，可逐項移除；未移除就原樣保留。伺服器只允許保留已存在的舊值，新增的不合法規則仍會拒絕。Odoo 總覽以「資料表：動作、動作」呈現每條規則。
+舊規則依資料表分組。只有 `read` 或 `search` 的舊設定顯示「查詢與讀取／僅部分」，儲存時補成一對。既有 `action` 規則顯示為可編輯的「按鈕動作」。不認得的項目列在唯讀的「其他設定」，可逐項移除；未移除就原樣保留。伺服器只允許保留已存在的舊值，新增的不合法規則仍會拒絕。Odoo 總覽以「資料表：動作、動作」呈現每條規則。
 
 ## 整合 → Odoo → 網站線上客服
 
@@ -444,14 +448,14 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 
 位置：系統設定 → 進階設定 → 設定檔進階編輯。只有管理員看得到，RPC 是 `config.raw.get` / `config.raw.set`。
 
-- **可編輯的檔案：**系統設定（`config.toml`）、推理設定（`inference.toml`），以及每位 AI 員工的 `agent.toml`（必須是 `agents/` 底下的實際目錄，不接受符號連結）。
-- **密鑰遮罩：**鍵名以 `_enc` 結尾、名為 `key` 或以 `_key` 結尾、或含 token、secret、password、passwd、api_key、apikey、widget_key、private_key、credential、service_account_json 的值，以及 `headers`、`otlp_headers`、`env` 表格裡的每個值、帶密碼的網址，都顯示成 `«set»`。存檔時原樣保留 `«set»` 就保留原值；原本沒有值卻寫 `«set»` 會被拒絕。`[mcp_keys]` 整段不顯示。
-- **驗證：**先檢查 TOML 語法，錯誤會指出第幾行第幾欄；再用對應的型別（系統設定的各區段驗證、`InferenceConfig`、`AgentConfig`）檢查，失敗就不寫入。不能在這裡改員工的 `[agent] name`。
-- **文件知識庫：**集合、文件、分享與存取紀錄在側邊欄「公司 → 文件知識庫」管理；`[knowledge]` 這些全域上限還沒有設定頁，它的各個鍵（`enabled`、`max_source_bytes`、`max_source_chars`、`max_sources_per_collection`、`max_collections`、`max_chunks_total`、`extract_timeout_secs`、`extract_memory_mb`、`access_log_retention_days`、`max_collection_bytes`、`max_total_bytes`，`extract_when_unavailable` = `refuse`／`run_unsandboxed`、`auto_retrieve`、`inject_budget_chars_max`）在這裡會檢查型別。`[knowledge.embedding]` 的各個鍵（`provider` = `local`／`openai`／`gemini`／`none`、`local_model`、`cloud_model`、`cloud_account`、`cloud_base_url`、`allow_private_endpoint`、`batch_size`、`threads`、`max_vector_rows`、`idle_unload_minutes`）也一樣；揭露確認紀錄 `cloud_disclosure_ack` 不能在這裡改（存檔會被拒絕），只能經由「文件知識庫搜尋」的揭露對話框寫入。員工的 `[knowledge] collections` 在「AI 員工 → 編輯設定 → 工具與權限 → 文件知識庫」設定（只能選已分享給它的集合），也可以直接改該員工的 `agent.toml`；回覆相關的 `auto_retrieve`、`answer_mode` = `assist`／`kb_only`、`top_k`、`inject_budget_chars` 也在那裡。詳見[文件知識庫](../../features/zh-TW/63-knowledge-base.md)。
-- **衝突：**開啟時取得檔案內容的雜湊值，存檔時帶回。檔案在這段時間被改過就拒絕，請重新載入再改。
-- **備份：**寫入前備份成 `<檔名>.bak-<Unix 時間>`（權限 0600），保留最近 5 份。
-- **稽核：**每次寫入記 `config_raw_edited`。改到 `[delegation]`、`[acp]`，或員工的 `[agent]`、`[capabilities]`、`sandbox_enabled`、`network_access`、`can_modify_own_soul` 時等級為 Warning。
-- **重啟清單：**存檔後列出需要重啟的部分。`config.toml` 的 `[gateway]`、`[server]`、`[telemetry]`、`[logging]`、`[channels]`、`[wiki]`、`[relay]`、`[decision]` 只在開機時讀；`general.name`、`rotation.health_check_interval_seconds`、`goal_loop.resume_on_restart`、`knowledge.max_source_bytes`（上傳路由的大小上限依它決定）也要重啟；日誌等級、常駐感知、去識別化能立即套用時就不列。`inference.toml` 存檔後一律立即重設推理引擎。員工檔案只有 `heartbeat.max_concurrent_runs` 需要重啟。
+- **可編輯的檔案**：系統設定（`config.toml`）、推理設定（`inference.toml`），以及每位 AI 員工的 `agent.toml`（必須是 `agents/` 底下的實際目錄，不接受符號連結）。
+- **密鑰遮罩**：鍵名以 `_enc` 結尾、名為 `key` 或以 `_key` 結尾、或含 token、secret、password、passwd、api_key、apikey、widget_key、private_key、credential、service_account_json 的值，以及 `headers`、`otlp_headers`、`env` 表格裡的每個值、帶密碼的網址，都顯示成 `«set»`。存檔時原樣保留 `«set»` 就保留原值；原本沒有值卻寫 `«set»` 會被拒絕。`[mcp_keys]` 整段不顯示。
+- **驗證**：先檢查 TOML 語法，錯誤會指出第幾行第幾欄；再用對應的型別（系統設定的各區段驗證、`InferenceConfig`、`AgentConfig`）檢查，失敗就不寫入。不能在這裡改員工的 `[agent] name`。
+- **文件知識庫**：集合、文件、分享與存取紀錄在側邊欄「公司 → 文件知識庫」管理；`[knowledge]` 這些全域上限還沒有設定頁，它的各個鍵（`enabled`、`max_source_bytes`、`max_source_chars`、`max_sources_per_collection`、`max_collections`、`max_chunks_total`、`extract_timeout_secs`、`extract_memory_mb`、`access_log_retention_days`、`max_collection_bytes`、`max_total_bytes`，`extract_when_unavailable` = `refuse`／`run_unsandboxed`、`auto_retrieve`、`inject_budget_chars_max`）在這裡會檢查型別。`[knowledge.embedding]` 的各個鍵（`provider` = `local`／`openai`／`gemini`／`none`、`local_model`、`cloud_model`、`cloud_account`、`cloud_base_url`、`allow_private_endpoint`、`batch_size`、`threads`、`max_vector_rows`、`idle_unload_minutes`）也一樣；揭露確認紀錄 `cloud_disclosure_ack` 不能在這裡改（存檔會被拒絕），只能經由「文件知識庫搜尋」的揭露對話框寫入。員工的 `[knowledge] collections` 在「AI 員工 → 編輯設定 → 工具與權限 → 文件知識庫」設定（只能選已分享給它的集合），也可以直接改該員工的 `agent.toml`；回覆相關的 `auto_retrieve`、`answer_mode` = `assist`／`kb_only`、`top_k`、`inject_budget_chars` 也在那裡。詳見[文件知識庫](../../features/zh-TW/63-knowledge-base.md)。
+- **衝突**：開啟時取得檔案內容的雜湊值，存檔時帶回。檔案在這段時間被改過就拒絕，請重新載入再改。
+- **備份**：寫入前備份成 `<檔名>.bak-<Unix 時間>`（權限 0600），保留最近 5 份。
+- **稽核**：每次寫入記 `config_raw_edited`。改到 `[delegation]`、`[acp]`，或員工的 `[agent]`、`[capabilities]`、`sandbox_enabled`、`network_access`、`can_modify_own_soul` 時等級為 Warning。
+- **重啟清單**：存檔後列出需要重啟的部分。`config.toml` 的 `[gateway]`、`[server]`、`[telemetry]`、`[logging]`、`[channels]`、`[wiki]`、`[relay]`、`[decision]` 只在開機時讀；`general.name`、`rotation.health_check_interval_seconds`、`goal_loop.resume_on_restart`、`knowledge.max_source_bytes`（上傳路由的大小上限依它決定）也要重啟；日誌等級、常駐感知、去識別化能立即套用時就不列。`inference.toml` 存檔後一律立即重設推理引擎。員工檔案只有 `heartbeat.max_concurrent_runs` 需要重啟。
 
 ## 維修 SSH 儀表板（v1.75.0）
 
@@ -511,9 +515,15 @@ IPv4 位址、技術人員與本機指紋、到期時間、連線與登入失敗
 
 安全頁可把 `config.toml [security] egress_guard` 設成四種值：**關閉**（`off`）、**僅記錄**（`shadow`，預設）、**先詢問**（`ask`）、**直接阻擋**（`block`）。存檔沿用既有加鎖的 `system.update_config` 寫入；每次呼叫時由防護讀取設定。員工的 `agent.toml [capabilities] egress_guard` 只能更嚴格（`off < shadow < ask < block`）。沒有 `config.toml` 時採用預設的僅記錄；設定無效或讀不到時，該次呼叫會被阻擋。
 
-AI 員工在同一回合成功讀過私人資料後，之後的外送呼叫會先經過防護。僅記錄會在稽核寫下 `would_ask` 與讀過的工具，照常執行；先詢問會開出一次性的核准單，列出目的地、完整內容、讀過的工具與到期時間，只有目前具 Admin 權限的儀表板帳號能核准（通道按鈕與聊天回覆都不行）；直接阻擋則拒絕。涵蓋平台 MCP 呼叫與第三方 MCP 代理，不涵蓋 Claude CLI 內建工具與其他 runtime 的原生工具；以回合為單位追蹤。詳見[資料外送防護](../../features/zh-TW/69-egress-guard.md)。
+AI 員工在同一回合成功讀過私人資料後，之後的外送呼叫會先經過防護。僅記錄會在稽核寫下 `would_ask` 與讀過的工具，照常執行；先詢問會開出一次性的核准單，列出目的地、完整內容、讀過的工具與到期時間，由目前具 Admin 權限的儀表板帳號核准；符合下方資格的 `mail_send` 交辦人也僅可在一對一對話或已登入的儀表板 WebChat 確認；直接阻擋則拒絕。涵蓋平台 MCP 呼叫與第三方 MCP 代理，不涵蓋 Claude CLI 內建工具與其他 runtime 的原生工具；以回合為單位追蹤。詳見[資料外送防護](../../features/zh-TW/69-egress-guard.md)。
 
 設定下方的僅 Admin 可讀觀察報表，可選最近 7 或 30 天，查看去重後的預估核准單數、員工／工具／來源／日期分類，以及 CLI 內建工具與 MCP 入口的數量。原本會拒絕的紀錄不增加預估開單數；沒有觀察紀錄或收集失敗不代表安全。`duduclaw doctor` 可看租約健康；停止所有 gateway 與外送動作後，可用 `duduclaw egress-leases list` 取得確認 token，再用 `clear` 離線復原。完整步驟見資料外送防護的復原章節。
+
+## 安全 → 寄信交辦人核准
+
+**讓寄信交辦人在對話中確認** 透過限 Admin 的鎖定寫入流程 `system.update_config` 保存 `config.toml [security] mail_requester_approval`。只接受布林值，預設 `true`；檔案或鍵不存在時使用預設。設定無法讀取、格式錯誤、值無效或設為 `false` 時，恢復僅儀表板 Admin 核准。
+
+開啟時，只有 gateway 證實為發起本回合、已驗證的公司帳號，且目前仍有該 AI 員工 Operator 操作權限的人，僅可在一對一對話或已登入的儀表板 WebChat 確認等待核准的 `mail_send`。卡片顯示完整收件人、主旨、內文摘要及私人資料讀取狀態。群組其他人、外部或未驗證使用者、自動回合都不能決定；儀表板 Admin 仍可決定。其他外送工具維持原規則，參數綁定、單次使用、執行前重驗與逾期拒絕均保留。詳見[完整規則](../../features/zh-TW/05-security-defense.md#寄信由交辦人在原對話確認)。群組對話與未知聊天類型仍須儀表板 Admin 核准，公開 WebChat 小工具訪客不適用。不符資格的通道通知不含收件人、主旨或內文，完整內容只留在儀表板。
 
 ## 安全 → 資料刪除收據
 
@@ -582,11 +592,37 @@ email_relay = true
 
 `email_relay` 預設為 `true`。設為 `false` 只停用授權代寄，不會停用自有 SMTP，也不會關閉兩步驟驗證強制政策。OpenSource、Hobby 試用版、Partner、NFR、未綁定機器的 OEM、無效或過期授權都不能代寄，請設定 SMTP。Partner 即使是標示 `nfr = false` 的舊授權，也不提供代寄。代寄使用編譯時固定的官方主機，與授權更新設定分開；`DUDUCLAW_CONTROL_URL`、授權中的 `control_url`、設定檔及環境變數都不能變更代寄目的地。專用傳輸只使用 HTTPS 443、釘選公開 DNS 解析結果、禁用 proxy 與重新導向，逾時為 10 秒，回應上限為 4 KiB。
 
-第一次符合資格的寄送會以簽章授權、機器指紋、安裝識別碼、隨機 nonce 與簽發時間註冊，取得代寄憑證。憑證存於 `<home>/state/mfa-relay.json`，僅限擁有者存取：Unix 使用 0600 權限，macOS 另拒絕擴充 ACL；Windows 使用私有 DACL 與釘選控制代碼。寫入透過釘選目錄控制代碼、拒絕符號連結，再以原子改名發布。後續寄送只包含收件信箱、驗證碼與語言，HMAC 簽章綁定方法、路徑、時間、nonce 及實際請求內容，不會再次傳送授權。所有註冊嘗試共用持久保存的每小時一次上限，初次註冊失敗也計入，重啟 gateway 不會重設額度。收到 `403 relay_not_allowed` 時，若額度允許，該次寄送最多重新註冊並重送一次。每份訂閱只保留一組有效代寄憑證，另一個安裝重新註冊會使先前憑證失效。
+第一次符合資格的寄送會以挑戰－回應方式註冊：gateway 先為所屬訂閱取得一次性 challenge，再送出簽章授權、機器指紋、challenge 與簽發時間，並附上安裝金鑰（見下節）的 Ed25519 簽章；安裝識別碼由伺服器依核准的公鑰推導。註冊會取代既有代寄憑證時，請求另以同一份簽章內容的 HMAC 證明持有該憑證。回應內容存放在固定容量、釋放時清零的緩衝區；HTTP 與 TLS 函式庫內部的副本無法清除。憑證存於 `<home>/state/mfa-relay.json`，僅限擁有者存取：Unix 使用 0600 權限，macOS 另拒絕擴充 ACL；Windows 使用私有 DACL 與釘選控制代碼。寫入透過釘選目錄控制代碼、拒絕符號連結，再以原子改名發布。後續寄送只包含收件信箱、驗證碼與語言，HMAC 簽章綁定方法、路徑、時間、nonce 及實際請求內容，不會再次傳送授權。所有註冊嘗試共用持久保存的每小時一次上限，初次註冊失敗也計入，重啟 gateway 不會重設額度。收到 `403 relay_not_allowed` 時，若額度允許，該次寄送最多重新註冊並重送一次。每份訂閱只保留一組有效代寄憑證，且只有帳號擁有者核准其金鑰的安裝能註冊。
+
+#### 安裝金鑰與授權控制台核准
+
+每個安裝都有自己的 Ed25519 金鑰，存於 `<home>/state/installation.key`（32 bytes 種子，與代寄憑證相同的僅限擁有者存取保護），與 `identity.key` 分開。只有檔案不存在時才會建立：執行 `duduclaw license activate`、授權更新（gateway 自動更新或 `duduclaw license refresh`），或執行 `duduclaw license installation-key` 時。無法讀取、格式錯誤或不安全的檔案（擁有者或權限不符、符號連結、多重硬連結、擴充 ACL）只會回報錯誤，絕不覆寫；修正或還原前代寄維持不可用。AI 員工無法透過檔案守門讀取 `state/` 下的任何檔案。備份資料目錄時請一併保留此金鑰。
+
+授權更新與換綁請求會以 `installation_pubkey` 送出公鑰。授權內含相同的已簽章公鑰後才能代寄。授權服務未見過的金鑰會在授權控制台建立待核准申請，並通知帳號擁有者。等待核准期間付費功能照常運作，SMTP 也仍可寄送驗證碼，只有代寄需要等待。每個既有安裝都要核准一次。
+
+核准前請比對金鑰指紋。在 gateway 主機執行：
+
+```bash
+duduclaw license installation-key
+```
+
+第一行是 16 字元指紋，例如 `1a2b-3c4d-5e6f-7a8b`：對 32 bytes 原始公鑰計算 SHA-256 後取前 16 個十六進位字元，每 4 個一組。公鑰與核准狀態等詳細資訊輸出到 stderr。等待核准期間，管理員也會在「設定 → 帳號」的 Email 說明下方看到此指紋。只有控制台顯示的指紋相同時才核准；不認得的申請代表有人持有授權檔副本，請拒絕。
+
+金鑰遺失時（例如換機但沒有帶走資料目錄），下一次授權更新會產生新金鑰並重新申請核准。已登入的帳號擁有者可在控制台預先授權一個指紋，24 小時內相同指紋的更新會自動核准。若只遺失代寄憑證，可在控制台使用「重設代寄憑證」，下一次註冊視為首次註冊。
+
+等待核准時，Email 說明會顯示此安裝正等待核准（授權尚未含金鑰），或此安裝的金鑰與核准的金鑰不同（例如還原到另一台機器）。
 
 代寄僅使用固定驗證碼信件，不能自訂主旨或內文。驗證碼與代寄秘密不寫入日誌；gateway 的收件者紀錄使用既有每個資料目錄專屬的稽核金鑰，以獨立用途標記計算 HMAC，無法取得金鑰時只記錄固定值 `unavailable`。控制平面另有寄送額度；看到「寄送太頻繁，請稍後再試」時請等待，其他寄送失敗可稍後再試或聯絡管理員。已在本機簽發的驗證碼，即使之後寄送服務不可用，仍可驗證。代寄的可用資格不保證信件已送達，實際代寄仍須另行驗收。
 
-Email 選項停用時，介面會說明沒有可用寄信方式、代寄已關閉，或此授權類型不提供代寄（NFR 或未綁定的 OEM），並提示管理員設定 SMTP。通行金鑰停用時，介面會區分非安全連線與瀏覽器不支援：以 `http://` 區網位址開啟者，請改用設定好的 HTTPS 網址或在 gateway 主機使用 localhost；瀏覽器不支援者，請改用支援通行金鑰的瀏覽器。
+Email 選項停用時，介面會說明沒有可用寄信方式、代寄已關閉、此授權類型不提供代寄（NFR 或未綁定的 OEM），或安裝金鑰正等待授權控制台核准，並提示管理員在此之前先設定 SMTP。通行金鑰停用時，介面會區分非安全連線與瀏覽器不支援：以 `http://` 區網位址開啟者，請改用設定好的 HTTPS 網址或在 gateway 主機使用 localhost；瀏覽器不支援者，請改用支援通行金鑰的瀏覽器。
+
+各選項需要的條件：
+
+- **驗證器 App**：可產生六位數 TOTP 代碼的 App；強制註冊時也需要畫面要求的獨立通道／管理員證明。
+- **Email 驗證碼**：能收取帳號信箱的郵件，且伺服器已設定 SMTP。管理員可到「設定 → 進階 → 設定檔進階編輯」（`/app/system/settings/advanced#configRaw`），在 `[channels.email]` 設定 `smtp_host`、`from_addr` 與必要的 SMTP 憑證。尚未設定時，停用選項旁會說明設定位置。
+- **通行金鑰**：支援 WebAuthn 的瀏覽器，以及 HTTPS 網址；localhost 可用 HTTP。`http://` 區網位址不符合安全連線條件，畫面會提示改用 HTTPS；瀏覽器不支援時會顯示另一則原因。伺服器也須完成下方說明的通行金鑰來源／RP 設定。
+
+登入、註冊與帳號設定都會顯示停用原因。Email 缺少寄件設定時僅回傳 `no_smtp` 原因碼；可用狀態不代表信件已實際送達。
 
 輸入密碼後，可選擇已設定的驗證方式，預選上次成功使用的方式。Email 驗證碼限用一次、10 分鐘到期，每次登入挑戰最多嘗試五次；每分鐘可重寄一次，每個帳號每小時最多五次。通行金鑰使用裝置鎖定、指紋、臉部辨識或安全金鑰驗證。管理員需將公開儀表板網址設定於 `[dashboard] public_url`，並以完全相同的 HTTPS 來源開啟儀表板；只有本機 localhost 可用 HTTP。每把金鑰可命名、個別移除，建議另留一種驗證方式，以免失去裝置後無法登入。首次只註冊通行金鑰不會產生復原碼，既有驗證器復原碼維持有效。首次 Email 註冊會顯示一次復原碼，確認保存後才能繼續。
 

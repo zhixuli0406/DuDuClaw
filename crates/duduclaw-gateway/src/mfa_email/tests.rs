@@ -29,7 +29,7 @@ use std::{io::Write, sync::{Arc, Mutex}};
             let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
                 .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
             let result = tracing::subscriber::with_default(subscriber, ||
-                finish_delivery(dir.path(), &db, &token, &email, &code, relay::sent(&transport::Reply {status, body:body.to_vec()})));
+                finish_delivery(dir.path(), &db, &token, &email, &code, relay::sent(&transport::Reply::new(status, body))));
             assert_eq!(result.as_ref().err().map(String::as_str), expected);
             let verified = db.mfa_email_verify_and_issue(&token, &code, true, 1001, |_,_,_|Ok(()));
             assert_eq!(verified.is_ok(), expected.is_none());
@@ -42,9 +42,9 @@ use std::{io::Write, sync::{Arc, Mutex}};
             assert!(!logs.contains(&token));
             if expected.is_some() { assert!(logs.contains("recipient_hash=")); }
         }
-        assert_eq!(relay::sent(&transport::Reply {status:202, body:vec![b' ';4097]}), Err(DELIVERY_FAILED));
+        assert_eq!(relay::sent(&transport::Reply::new(202, &[b' ';4097])), Err(DELIVERY_FAILED));
         for status in [200, 301, 302, 400, 500] {
-            assert_eq!(relay::sent(&transport::Reply {status, body:br#"{"sent":true}"#.to_vec()}), Err(DELIVERY_FAILED));
+            assert_eq!(relay::sent(&transport::Reply::new(status, br#"{"sent":true}"#)), Err(DELIVERY_FAILED));
         }
     }
 
@@ -52,7 +52,8 @@ use std::{io::Write, sync::{Arc, Mutex}};
 fn availability_matrix_and_config_fail_closed() {
     for smtp in [false, true] {
         for enabled in [false, true] {
-            for eligibility in [Ok(()), Err("no_smtp_no_relay"), Err("relay_nfr"), Err("relay_unbound")] {
+            for eligibility in [Ok(()), Err("no_smtp"), Err("relay_nfr"), Err("relay_unbound"),
+                Err("relay_key_unbound"), Err("relay_key_mismatch")] {
                 assert_eq!(availability_reason(smtp, enabled, eligibility).is_none(), smtp || enabled && eligibility.is_ok());
                 if !smtp && enabled { assert_eq!(availability_reason(smtp, enabled, eligibility), eligibility.err()); }
             }
@@ -65,11 +66,34 @@ fn availability_matrix_and_config_fail_closed() {
     }
     let home = tempfile::tempdir().unwrap();
     assert!(relay_enabled(home.path()));
-    assert_eq!(unavailable_reason(home.path()), Some("no_smtp_no_relay"));
+    assert_eq!(unavailable_reason(home.path()), Some("no_smtp"));
     std::fs::write(home.path().join("config.toml"), "[mfa]\nemail_relay = false").unwrap();
     assert_eq!(unavailable_reason(home.path()), Some("relay_disabled"));
     std::fs::write(home.path().join("config.toml"), "[mfa]\nemail_relay = false\n[channels.email]\nsmtp_host = 'smtp.example.com'\nfrom_addr = 'security@example.com'").unwrap();
     assert!(available(home.path()));
+}
+
+#[test]
+fn smtp_availability_has_only_a_safe_reason_code() {
+    // Released v1.80 contract: SMTP needs host and sender; anything else
+    // (including invalid TOML) reports a safe code, never configuration text.
+    let home = tempfile::tempdir().unwrap();
+    assert_eq!(unavailable_reason(home.path()), Some("no_smtp"));
+    std::fs::write(home.path().join("config.toml"), "[channels.email]\nsmtp_host='127.0.0.1'\n").unwrap();
+    assert_eq!(unavailable_reason(home.path()), Some("no_smtp"));
+    std::fs::write(home.path().join("config.toml"), "[channels.email]\nsmtp_host='127.0.0.1'\nfrom_addr='sender@example.test'\n").unwrap();
+    assert_eq!(unavailable_reason(home.path()), None);
+    std::fs::write(home.path().join("config.toml"), "invalid toml").unwrap();
+    assert_eq!(unavailable_reason(home.path()), Some("relay_disabled"));
+}
+
+#[test]
+fn unbound_or_mismatched_key_never_opens_the_relay_store() {
+    let home = tempfile::tempdir().unwrap();
+    for reason in ["relay_key_unbound", "relay_key_mismatch"] {
+        assert_eq!(prepare_relay(home.path(), |_| Err(reason)).err(), Some(DELIVERY_FAILED));
+        assert!(!home.path().join("state/mfa-relay.lock").exists());
+    }
 }
 
 #[test]

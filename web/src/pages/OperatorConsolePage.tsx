@@ -107,7 +107,7 @@ export function OperatorConsolePage() {
   const handleSend = () => {
     const text = input.trim();
     if (!text || isStreaming) return;
-    send(text, []);
+    if (send(text, []) === false) return;
     setInput('');
     inputRef.current?.focus();
   };

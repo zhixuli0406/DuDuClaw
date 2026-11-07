@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import '@/test/mocks';
 import { useChatStore } from './chat-store';
+import { callableSubject, useCallableAgentsStore } from './callable-agents-store';
+import { api } from '@/lib/api';
 import { useAuthStore } from './auth-store';
 class Socket {
   static OPEN=1;
@@ -14,7 +16,7 @@ class Socket {
   constructor(_url:string){Socket.instances.push(this);}
 }
 beforeEach(()=>{vi.stubGlobal('WebSocket',Socket);Socket.instances=[];useChatStore.getState().disconnect();useAuthStore.setState({jwt:'synthetic-token',user:{id:'viewer',email:'viewer@test.invalid',display_name:'Viewer',role:'employee',status:'active'},bindings:[{user_id:'viewer',agent_name:'sales',access_level:'viewer',bound_at:''}]});useChatStore.setState({selectedAgentId:'sales',resolvedAgent:{id:'sales',name:'Sales',icon:''},assignmentError:null,messages:[],sessionId:'webchat:viewer',ownSessionId:'webchat:viewer',resumedExplicitly:false,isStreaming:false});});
-afterEach(()=>{useChatStore.getState().disconnect();vi.unstubAllGlobals();});
+afterEach(()=>{useChatStore.getState().disconnect();vi.restoreAllMocks();vi.unstubAllGlobals();});
 it('does not block a directly bound Viewer from sending an own WebChat message',()=>{
   useChatStore.getState().connect();const socket=Socket.instances.at(-1)!;socket.onopen?.();
   socket.onmessage?.({data:JSON.stringify({type:'session_info',session_id:'webchat:viewer',agent_name:'Sales',agent_icon:'',resolved_agent:{id:'sales',name:'Sales',icon:''},assignment_error:null})});
@@ -60,6 +62,7 @@ it('renders a structured main-session refusal as a readable message and stops se
   socket.onmessage?.({ data: JSON.stringify({ type: 'session_info', session_id: 'webchat:viewer', agent_name: 'Sales', agent_icon: '', resolved_agent: { id: 'sales', name: 'Sales', icon: '' }, assignment_error: null }) });
   useChatStore.getState().resumeSession('webchat:old-main', []);
   useChatStore.setState({ selectedAgentId: 'main' });
+  allowChatAgent('main');
   useChatStore.getState().send('continue');
   const sent = JSON.parse(socket.send.mock.calls.at(-1)![0]);
   expect(sent.agent).toBe('main');
@@ -102,8 +105,56 @@ it('keeps a resumed non-main conversation usable when the default assignment req
   useChatStore.setState({ resumedExplicitly: true, sessionId: 'webchat:old-sales', selectedAgentId: 'sales', resolvedAgent: { id: 'sales', name: 'Sales', icon: '' }, assignmentError: null });
   socket.onmessage?.({ data: JSON.stringify({ type: 'session_info', session_id: 'webchat:base', agent_name: '', agent_icon: '', resolved_agent: null, assignment_error: { code: 'no_assigned_agent', reason: 'multiple_agents', message: '' } }) });
   expect(useChatStore.getState().assignmentError).toBeNull();
+  allowChatAgent('sales');
   useChatStore.getState().send('continue sales');
   const sent = JSON.parse(socket.send.mock.calls.at(-1)![0]);
   expect(sent.agent).toBe('sales');
   expect(sent.session_id).toBe('webchat:old-sales');
+});
+
+function allowChatAgent(name: string) {
+  const key = JSON.stringify([callableSubject(), useChatStore.getState().sessionId]);
+  useCallableAgentsStore.setState({ entries: { [key]: {
+    agents: [{ name, selectable: true } as never], unrestricted: false, loading: false, confirmedAt: Date.now(),
+  } } });
+}
+
+it('returns false without a frame or local message for a revoked explicit agent and refreshes chat grants', async () => {
+  const callable = vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [], unrestricted: false, default_agent: null });
+  useChatStore.getState().connect();
+  const socket = Socket.instances.at(-1)!;
+  socket.onopen?.();
+  socket.onmessage?.({ data: JSON.stringify({ type: 'session_info', session_id: 'webchat:viewer', resolved_agent: { id: 'sales', name: 'Sales', icon: '' }, assignment_error: null }) });
+  useChatStore.setState({ resumedExplicitly: true, selectedAgentId: 'revoked' });
+  useCallableAgentsStore.setState({ entries: { [JSON.stringify([callableSubject(), useChatStore.getState().sessionId])]: {
+    agents: [], unrestricted: false, loading: false, confirmedAt: Date.now(),
+  } } });
+  const count = socket.send.mock.calls.length;
+  expect(useChatStore.getState().send('keep my draft')).toBe(false);
+  expect(socket.send).toHaveBeenCalledTimes(count);
+  expect(useChatStore.getState().messages).toEqual([]);
+  expect(callable).toHaveBeenCalledWith(useChatStore.getState().sessionId);
+  await Promise.resolve();
+  callable.mockRestore();
+});
+
+it('returns true and sends a frame without an explicit agent even without callable grants', () => {
+  useChatStore.getState().connect();
+  const socket = Socket.instances.at(-1)!;
+  socket.onopen?.();
+  socket.onmessage?.({ data: JSON.stringify({ type: 'session_info', session_id: 'webchat:viewer', resolved_agent: { id: 'sales', name: 'Sales', icon: '' }, assignment_error: null }) });
+  useCallableAgentsStore.setState({ entries: {} });
+  expect(useChatStore.getState().send('use assigned agent')).toBe(true);
+  expect(JSON.parse(socket.send.mock.calls.at(-1)![0])).toMatchObject({ type: 'user_message', content: 'use assigned agent' });
+  expect(JSON.parse(socket.send.mock.calls.at(-1)![0]).agent).toBeUndefined();
+});
+
+it('uses only fresh grants for the current chat session', () => {
+  useChatStore.getState().connect();
+  const socket = Socket.instances.at(-1)!;
+  socket.onopen?.();
+  socket.onmessage?.({ data: JSON.stringify({ type: 'session_info', session_id: 'webchat:viewer', resolved_agent: { id: 'sales', name: 'Sales', icon: '' }, assignment_error: null }) });
+  useChatStore.setState({ resumedExplicitly: true });
+  allowChatAgent('sales');
+  expect(useChatStore.getState().send('allowed')).toBe(true);
 });

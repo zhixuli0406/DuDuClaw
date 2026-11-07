@@ -76,7 +76,8 @@ async fn templates_library_builtin_detail_copy_apply_share_skills() {
     let written = std::fs::read_to_string(home.path().join("agents/quality/agent.toml")).unwrap();
     let table:toml::Table=written.parse().unwrap();
     assert_eq!(table["agent"]["department"].as_str(),Some("quality"));
-    assert_eq!(table["evolution"]["enabled"].as_bool(),Some(false));
+    assert_eq!(table["evolution"]["enabled"].as_bool(),Some(true));
+    assert_eq!(table["evolution"]["gvu_enabled"].as_bool(),Some(false));
     assert!(handler.registry.read().await.get("quality").is_some());
 }
 

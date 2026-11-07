@@ -1,3 +1,6 @@
+import { canSelectAgent, useSelectableCallableAgents } from '@/stores/callable-agents-store';
+import { useVisibleAgents } from '@/lib/data-scope';
+import { useCallableAgents } from '@/stores/callable-agents-store';
 import { RecentSkillChips } from '@/components/skills/RecentSkillChips';
 import { ChatWaitingNotice } from '@/components/chat/ChatWaitingNotice';
 import { ReadOnlyHistoryView } from '@/components/chat/ReadOnlyHistoryView';
@@ -8,7 +11,6 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router';
 import { useChatStore, chatAccessMessageKey, type PendingAttachment } from '@/stores/chat-store';
 import { takeChatAttachments } from '@/lib/chat-handoff';
 import { useAuthStore } from '@/stores/auth-store';
-import { useSystemStore } from '@/stores/system-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useConversationsStore } from '@/stores/conversations-store';
 import { cn } from '@/lib/utils';
@@ -56,7 +58,6 @@ import {
   orderMentionCandidates,
   type MentionAgent,
 } from '@/lib/mention';
-import { api, type CallableAgent } from '@/lib/api';
 import { PRODUCT_NAME, useEffectiveName } from '@/lib/product-identity';
 import { ManagerReadNotice } from '@/components/chat/ManagerReadNotice';
 
@@ -76,8 +77,9 @@ export function WebChatPage() {
 function InteractiveWebChatPage() {
   const intl = useIntl();
   const user = useAuthStore(s => s.user);
-  const isPersonal = useSystemStore(s => s.status?.edition_profile) === 'personal';
-  const assignedOnly = user !== null && user.role !== 'admin' && !isPersonal;
+  const chatSessionId = useChatStore((s) => s.sessionId);
+  const { agents: callable, refresh: loadCallable, unrestricted } = useCallableAgents(chatSessionId);
+  const assignedOnly = !unrestricted;
   const {
     messages,
     steps,
@@ -98,6 +100,8 @@ function InteractiveWebChatPage() {
     supportsVision,
     model,
     connectionState,
+    reconnectExhausted,
+    reconnect,
     isRecording,
     ttsEnabled,
     setTtsEnabled,
@@ -107,7 +111,8 @@ function InteractiveWebChatPage() {
     selectAgent,
   } = useChatStore();
 
-  const agents = useAgentsStore((s) => s.agents);
+  const agents = useVisibleAgents(true, chatSessionId);
+  const staffGrants = useSelectableCallableAgents(chatSessionId);
   const agentsLoaded = useAgentsStore((s) => s.loaded);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
 
@@ -118,6 +123,8 @@ function InteractiveWebChatPage() {
   const [, setAgentParam] = useUrlStateNullable('agent');
   const navigate = useNavigate();
   const [input, setInput] = useState('');
+  const [prefilledDraft, setPrefilledDraft] = useState<string | null>(null);
+  const chosenMentions = useRef(new Map<string, string>());
   // `@` autocomplete: caret position, highlighted row, and whether Escape
   // closed the popup for the mention being typed.
   const [caret, setCaret] = useState(0);
@@ -136,13 +143,17 @@ function InteractiveWebChatPage() {
   useEffect(() => {
     if (connectionState === 'disconnected') connect();
     if (!agentsLoaded) fetchAgents();
-    const preselect = searchParams.get('agent');
-    if (preselect && !assignedOnly) selectAgent(preselect);
     // Keep the session alive across unmounts — no disconnect here.
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Direct entry to a fresh chat uses the account preference. Non-admin
   // enterprise users get their primary from the server's assignment resolver.
+  useEffect(() => {
+    if (assignedOnly) return;
+    const preselect = searchParams.get('agent');
+    if (preselect) selectAgent(preselect);
+  }, [assignedOnly, searchParams, selectAgent]);
+
   const primaryApplied = useRef(false);
   useEffect(() => {
     if (assignedOnly || !agentsLoaded || !user || primaryApplied.current) return;
@@ -168,12 +179,38 @@ function InteractiveWebChatPage() {
     const draft = typeof state?.draft === 'string' && state.draft.trim().length > 0 ? state.draft : null;
     const handed = takeChatAttachments(state?.attachmentsKey);
     if (!draft && handed.length === 0) return;
-    if (draft) setInput((prev) => (prev ? prev : draft));
+    if (draft) setPrefilledDraft(draft);
     if (handed.length > 0) setAttachments((prev) => [...prev, ...handed]);
     navigate(location.pathname + location.search, { replace: true, state: null });
     inputRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.key]);
+
+  // Handoff text waits for this surface's fresh grants, just like a picker.
+  useEffect(() => {
+    if (prefilledDraft === null || staffGrants.loading) return;
+    let draft = prefilledDraft;
+    const known = [...(callable ?? []), ...useAgentsStore.getState().agents, ...(staffGrants.agents ?? [])];
+    const mentions = known.flatMap(a => ['call_text' in a ? a.call_text : undefined, `@${a.display_name}`, `@${a.name}`]
+      .filter((call): call is string => !!call).map(call => ({ name: a.name, call })));
+    mentions.sort((a, b) => b.call.length - a.call.length);
+    const accepted = new Map<string, string>();
+    const alternatives = [...new Set(mentions.map(m => m.call))]
+      .map(call => call.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const pattern = new RegExp(`(^|[\\s(])(${[...alternatives.map(call => `${call}(?=\\s|$)`), '[@＠]\\S+'].join('|')})`, 'g');
+    draft = draft.replace(pattern, (_whole, prefix: string, call: string) => {
+      const match = mentions.find(m => m.call === call && canSelectAgent(m.name, chatSessionId));
+      if (!match) return prefix;
+      accepted.set(match.name, call);
+      return prefix + call;
+    });
+    setInput(prev => {
+      if (prev) return prev;
+      for (const [name, call] of accepted) chosenMentions.current.set(name, call);
+      return draft;
+    });
+    setPrefilledDraft(null);
+  }, [prefilledDraft, staffGrants.loading, staffGrants.agents, callable, chatSessionId]);
 
   // Auto-scroll to bottom on new content.
   useEffect(() => {
@@ -188,32 +225,13 @@ function InteractiveWebChatPage() {
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   }, [input]);
 
-  // Who this account may call (`agents.callable`: own staff, a manager's
-  // team, the default and public staff). `null` until loaded or when the RPC
-  // fails; the page then falls back to `agents.list` (own staff only, a
-  // subset of what the server lets through).
-  const [callable, setCallable] = useState<readonly CallableAgent[] | null>(null);
-  const callableRequest = useRef(0);
-  const chatSessionId = useChatStore((s) => s.sessionId);
-  const loadCallable = useCallback(() => {
-    const request = ++callableRequest.current;
-    api.agents
-      .callable(chatSessionId)
-      .then((r) => { if (request === callableRequest.current) setCallable(Array.isArray(r?.agents) ? r.agents : null); })
-      .catch(() => { if (request === callableRequest.current) setCallable(null); });
-  }, [chatSessionId]);
-  useEffect(() => {
-    loadCallable();
-    window.addEventListener('focus', loadCallable);
-    return () => { ++callableRequest.current; window.removeEventListener('focus', loadCallable); };
-  }, [loadCallable, selectedAgentId]);
+
 
   // The chosen partner (an AI staff member) or DuDu (the office assistant).
   const partner = useMemo(() => {
     if (!selectedAgentId) return null;
     return (
       agents.find((a) => a.name === selectedAgentId)
-      ?? callable?.find((a) => a.name === selectedAgentId)
       ?? null
     );
   }, [agents, callable, selectedAgentId]);
@@ -229,19 +247,20 @@ function InteractiveWebChatPage() {
   const assignmentMessage = intl.formatMessage({ id: assignmentMessageKey });
 
   useEffect(() => {
-    if (!assignedOnly) return;
+    if (!assignedOnly || callable === null) return;
+    if (callable !== null && selectedAgentId && !agents.some(a => a.name === selectedAgentId)) selectAgent(null);
     const requested = searchParams.get('agent');
-    if (requested && (requested !== resolvedAgent?.id || !callable?.some(a => a.name === requested))) {
+    if (requested && (requested !== resolvedAgent?.id || !agents.some(a => a.name === requested))) {
       setAgentParam(null);
     }
-  }, [assignedOnly, searchParams, resolvedAgent?.id, callable, setAgentParam]);
+  }, [assignedOnly, searchParams, resolvedAgent?.id, agents, callable, selectedAgentId, selectAgent, setAgentParam]);
 
   // The main agent is already represented by the leading DuDu chip (which routes
   // to it), so it gets no duplicate employee chip in the row. Only staff the
   // server accepts as an explicit partner get a chip (own and team staff).
   const staffAgents = useMemo<readonly EmployeeRowAgent[]>(() => {
-    if (callable) {
-      return callable
+    if (staffGrants.agents) {
+      return staffGrants.agents
         .filter((a) => a.selectable && a.role !== 'main')
         .map((a) => ({
           name: a.name,
@@ -250,8 +269,8 @@ function InteractiveWebChatPage() {
           manager_may_read: a.manager_may_read === true,
         }));
     }
-    return agents.filter((a) => a.role !== 'main');
-  }, [agents, callable]);
+    return [];
+  }, [staffGrants.agents]);
 
   /**
    * Every user-driven partner switch goes through here so the store and the URL
@@ -260,10 +279,11 @@ function InteractiveWebChatPage() {
    */
   const handleSelectAgent = useCallback(
     (id: string | null) => {
+      if (id && !canSelectAgent(id, chatSessionId)) return;
       selectAgent(id);
       setAgentParam(id);
     },
-    [selectAgent, setAgentParam],
+    [selectAgent, setAgentParam, chatSessionId],
   );
 
   // A restored/preselected selection (e.g. `?agent=<main>`) may point at the main
@@ -297,12 +317,12 @@ function InteractiveWebChatPage() {
 
   const productName = useEffectiveName();
   const partnerName = assignedOnly && resumedExplicitly
-    ? partner?.display_name ?? selectedAgentId ?? agentName
+    ? partner?.display_name ?? intl.formatMessage({ id: 'webchat.assignment.title' })
     : assignedOnly
     ? resolvedAgent?.name ?? intl.formatMessage({ id: 'webchat.assignment.title' })
     : partner?.display_name ?? (agentName === PRODUCT_NAME ? productName : agentName);
 
-  const avatarAgentId = assignedOnly && !resumedExplicitly ? resolvedAgent?.id ?? null : selectedAgentId;
+  const avatarAgentId = assignedOnly && !resumedExplicitly ? resolvedAgent?.id ?? null : partner?.name ?? null;
 
   // Recording drives the `listening` face just like typing does.
   const face = useChatFace(phase, input.trim().length > 0 || isRecording, messages.length > 0);
@@ -366,6 +386,7 @@ function InteractiveWebChatPage() {
   // the popup refreshes the list so an org change shows up without a reload.
   const activeMention = useMemo(() => findActiveMention(input, caret), [input, caret]);
   const mentionTyping = activeMention !== null;
+  const mentionGrants = useSelectableCallableAgents(chatSessionId, mentionTyping && !mentionDismissed);
   useEffect(() => {
     if (mentionTyping) loadCallable();
   }, [mentionTyping, loadCallable]);
@@ -373,9 +394,10 @@ function InteractiveWebChatPage() {
   // task; the gateway checks the right again when the command arrives.
   const assigning = isAssignCommand(input);
   const mentionSource = useMemo<readonly MentionAgent[]>(() => {
-    const all = (callable ?? (assignedOnly ? [] : agents)) as readonly MentionAgent[];
+    const visible = new Set((mentionGrants.agents ?? []).filter(a => a.selectable).map(a => a.name));
+    const all = (mentionGrants.unrestricted ? mentionGrants.agents ?? [] : (mentionGrants.agents ?? []).filter(a => visible.has(a.name))) as readonly MentionAgent[];
     return assigning ? assignableAgents(all) : all;
-  }, [callable, agents, assigning, assignedOnly]);
+  }, [mentionGrants.agents, mentionGrants.unrestricted, assigning]);
   const mentionCandidates = useMemo(
     () => (activeMention ? orderMentionCandidates(filterMentionCandidates(mentionSource, activeMention.query)) : []),
     [activeMention, mentionSource],
@@ -384,8 +406,10 @@ function InteractiveWebChatPage() {
   const safeMentionIndex = mentionCandidates.length ? Math.min(mentionIndex, mentionCandidates.length - 1) : 0;
 
   const pickMention = (agent: MentionAgent) => {
-    if (!activeMention) return;
-    const next = applyMention(input, activeMention, mentionText(agent, mentionSource));
+    if (!activeMention || !mentionSource.some(a => a.name === agent.name)) return;
+    const call = mentionText(agent, mentionSource);
+    chosenMentions.current.set(agent.name, call);
+    const next = applyMention(input, activeMention, call);
     setInput(next.text);
     setCaret(next.caret);
     setMentionIndex(0);
@@ -399,8 +423,14 @@ function InteractiveWebChatPage() {
 
   const handleSend = () => {
     const text = input.trim();
+    for (const [name, call] of chosenMentions.current) {
+      if (text.includes(call) && !canSelectAgent(name, chatSessionId)) return;
+    }
+    if (selectedAgentId && !canSelectAgent(selectedAgentId, chatSessionId)) return;
+    if (mentionTyping && !mentionSource.length) return;
     if ((!text && attachments.length === 0) || connectionState !== 'connected' || assignmentBlocked) return;
-    send(text, attachments);
+    if (send(text, attachments) === false) return;
+    chosenMentions.current.clear();
     setInput('');
     setAttachments([]);
     inputRef.current?.focus();
@@ -545,10 +575,12 @@ function InteractiveWebChatPage() {
 
   // ── Conversation status dot ───────────────────────────────────────────────────
   const statusTone =
-    connectionState === 'connected' ? 'bg-success' : connectionState === 'connecting' ? 'bg-warning' : 'bg-muted-foreground';
+    connectionState === 'connected' ? 'bg-success' : connectionState !== 'disconnected' ? 'bg-warning' : 'bg-muted-foreground';
   const statusText =
     connectionState === 'connected'
       ? intl.formatMessage({ id: 'webchat.connected', defaultMessage: 'Connected' })
+      : connectionState === 'reconnecting'
+        ? intl.formatMessage({ id: 'webchat.reconnecting' })
       : connectionState === 'connecting'
         ? intl.formatMessage({ id: 'webchat.connecting', defaultMessage: 'Connecting…' })
         : intl.formatMessage({ id: 'webchat.disconnected', defaultMessage: 'Disconnected' });
@@ -688,6 +720,16 @@ function InteractiveWebChatPage() {
       {/* Composer — pinned to the bottom. */}
       <div className="shrink-0 border-t border-surface-border px-4 py-3">
         <div className="mx-auto max-w-3xl space-y-2">
+          {(connectionState === 'reconnecting' || connectionState === 'disconnected' || reconnectExhausted) && (
+            <div className="flex items-center justify-between gap-3 rounded-md border border-surface-border bg-secondary px-3 py-2 text-sm" role="status">
+              <span>{reconnectExhausted
+                ? intl.formatMessage({ id: 'webchat.reconnectExhausted' })
+                : `${statusText} ${intl.formatMessage({ id: 'webchat.draftKept' })}`}</span>
+              <Button variant="outline" size="sm" onClick={reconnect}>
+                {intl.formatMessage({ id: 'webchat.reconnect' })}
+              </Button>
+            </div>
+          )}
           {/* Capability + model + Talk Mode live state */}
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             {supportsVision ? (

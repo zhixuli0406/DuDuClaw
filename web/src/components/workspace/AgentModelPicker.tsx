@@ -1,3 +1,5 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { ChevronDown, Check } from 'lucide-react';
@@ -24,7 +26,6 @@ export function AgentModelPicker({
   onChange: (agentId: string) => void;
 }) {
   const intl = useIntl();
-  const agents = useAgentsStore((s) => s.agents);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const loaded = useAgentsStore((s) => s.loaded);
   const brandName = useEffectiveName();
@@ -32,6 +33,8 @@ export function AgentModelPicker({
   const fallbackIcon = DEFAULT_AGENT_GLYPH;
 
   const [open, setOpen] = useState(false);
+  const agents = useSelectableAgents(false, undefined, open);
+  const displayAgents = useVisibleAgents(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -54,7 +57,7 @@ export function AgentModelPicker({
     };
   }, [open]);
 
-  const selected = agents.find((a) => a.name === value) ?? null;
+  const selected = displayAgents.find((a) => a.name === value) ?? null;
   const triggerLabel = selected
     ? selected.display_name || selected.name
     : intl.formatMessage({ id: 'assign.agentPlaceholder' });
@@ -97,6 +100,7 @@ export function AgentModelPicker({
                 role="menuitemradio"
                 aria-checked={active}
                 onClick={() => {
+                  if (!canSelectAgent(a.name)) return;
                   onChange(a.name);
                   setOpen(false);
                 }}

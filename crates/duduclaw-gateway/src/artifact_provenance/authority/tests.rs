@@ -53,7 +53,7 @@ fn malformed_or_oversized_migration_rolls_back_all_authority_rows() {
         bytes.extend(if oversized { vec![b'x'; ROW_MAX_BYTES as usize + 1] } else { b"malformed\n".to_vec() });
         std::fs::write(home.path().join(ARTIFACTS_FILE), bytes).unwrap();
         assert!(open(home.path()).is_err());
-        let connection = Connection::open(home.path().join(DB_FILE)).unwrap();
+        let connection = Connection::open(crate::fs_safe::sqlite::database_path(home.path(), DB_FILE)).unwrap();
         let count: i64 = connection.query_row("SELECT count(*) FROM artifact_provenance", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 0);
         assert!(HistoryIndex::load(home.path(), Some("sales")).provenance_checked("old.txt").is_err());
@@ -102,7 +102,7 @@ fn migration_refuses_oversized_files_without_partial_import() {
     std::fs::write(home.path().join("artifacts.jsonl.1"), format!("{}\n", row("old.txt", "/work/report.txt", "alice").to_json())).unwrap();
     std::fs::File::create(home.path().join(ARTIFACTS_FILE)).unwrap().set_len(MIGRATION_MAX_BYTES + 1).unwrap();
     assert!(open(home.path()).is_err());
-    let connection = Connection::open(home.path().join(DB_FILE)).unwrap();
+    let connection = Connection::open(crate::fs_safe::sqlite::database_path(home.path(), DB_FILE)).unwrap();
     assert_eq!(connection.query_row("SELECT count(*) FROM artifact_provenance", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
 }
 
@@ -111,7 +111,7 @@ fn query_failure_is_not_treated_as_an_unbound_public_file() {
     let home = crate::fs_safe::private_test_home().unwrap();
     write(home.path(), &[row("old.txt", "/work/report.txt", "alice").to_json()], true).unwrap();
     let index = HistoryIndex::load(home.path(), Some("sales"));
-    Connection::open(home.path().join(DB_FILE)).unwrap().execute("DROP TABLE artifact_provenance", []).unwrap();
+    Connection::open(crate::fs_safe::sqlite::database_path(home.path(), DB_FILE)).unwrap().execute("DROP TABLE artifact_provenance", []).unwrap();
     assert!(index.provenance_checked("old.txt").is_err());
 }
 
@@ -123,10 +123,10 @@ fn durable_authority_refuses_symlink_database_and_creates_private_mode() {
     let home = home.path().canonicalize().unwrap();
     let outside = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(outside.path(), b"untouched").unwrap();
-    symlink(outside.path(), home.join(DB_FILE)).unwrap();
+    symlink(outside.path(), crate::fs_safe::sqlite::database_path(&home, DB_FILE)).unwrap();
     assert!(open(&home).is_err());
     assert_eq!(std::fs::read(outside.path()).unwrap(), b"untouched");
-    std::fs::remove_file(home.join(DB_FILE)).unwrap();
+    std::fs::remove_file(crate::fs_safe::sqlite::database_path(&home, DB_FILE)).unwrap();
     open(&home).unwrap();
-    assert_eq!(std::fs::metadata(home.join(DB_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(crate::fs_safe::sqlite::database_path(&home, DB_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
 }

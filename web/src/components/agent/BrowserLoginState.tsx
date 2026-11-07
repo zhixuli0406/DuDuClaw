@@ -1,3 +1,4 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Button, Card, CardContent, CardHeader, CardTitle, useErrorMessage } from '@/components/mds';
@@ -32,6 +33,7 @@ export function BrowserLoginState({ agentId }: { agentId: string }) {
     return () => clearInterval(timer);
   }, [refresh]);
   const reset = async () => {
+    if (!canSelectAgent(agentId)) return;
     setBusy(true);
     try {
       await client.call('computer_profiles.reset', { agent_id: agentId, confirm: true });

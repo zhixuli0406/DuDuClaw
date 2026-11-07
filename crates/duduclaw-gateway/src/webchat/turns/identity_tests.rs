@@ -177,12 +177,14 @@ async fn delivery_checks_refuse_without_content_at_both_stages() {
 #[tokio::test]
 async fn unavailable_and_revoked_remove_only_owned_archives() {
     for validity in [SocketValidity::Unavailable, SocketValidity::Revoked] {
-        let archive = tempfile::NamedTempFile::new().unwrap();
-        let original = tempfile::NamedTempFile::new().unwrap();
+        // Production archives are closed before rollback. A live Windows file
+        // handle can keep a deleted file visible until the last handle closes.
+        let archive = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let original = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let mut recovery = SocketRecovery::default();
-        assert!(!rollback_before_final_reply(validity, &mut recovery, &[archive.path().into()]).await);
-        assert!(!archive.path().exists());
-        assert!(original.path().exists());
+        assert!(!rollback_before_final_reply(validity, &mut recovery, &[archive.to_path_buf()]).await);
+        assert!(!archive.exists());
+        assert!(original.exists());
         assert_eq!(recovery.closed(), validity == SocketValidity::Revoked);
     }
 }

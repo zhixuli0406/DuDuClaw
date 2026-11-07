@@ -675,6 +675,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn expert_import_evolution_defaults_on_and_preserves_opt_out() {
+        let home = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        for (settings, expected) in [("", true), ("[evolution]\ngvu_enabled = false", false)] {
+            let source = AgentDraft { id_hint: "learner".into(), display_name: "Learner".into(),
+                settings: toml::from_str(settings).unwrap(), ..Default::default() };
+            let plan = plan_agent(&source, "learner", "", "claude-subagent", "team", stage.path(),
+                &mut NameBook::load(home.path()), &mut Report::default()).unwrap();
+            let config: toml::Table = std::str::from_utf8(&plan.files["agent.toml"]).unwrap().parse().unwrap();
+            assert_eq!(config["evolution"]["enabled"].as_bool(), Some(true));
+            assert_eq!(config["evolution"]["gvu_enabled"].as_bool(), Some(expected));
+        }
+    }
+
+    #[test]
     fn known_tools() {
         assert!(is_known_tool("Read"));
         assert!(is_known_tool("mcp__duduclaw__wiki_read"));

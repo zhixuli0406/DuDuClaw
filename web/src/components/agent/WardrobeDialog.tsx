@@ -1,3 +1,4 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api } from '@/lib/api';
@@ -58,6 +59,7 @@ export function WardrobeDialog({
   };
 
   const handleSave = async () => {
+    if (!canSelectAgent(agentId)) return;
     setSaving(true);
     try {
       await api.agents.setOutfit(agentId, cleared ? null : draft);

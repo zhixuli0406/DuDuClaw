@@ -167,3 +167,14 @@ describe('AddSourceDialog', () => {
     expect(names).toEqual(['a.pdf', 'b.md']);
   });
 });
+
+it('aborts an in-flight file upload when the dialog unmounts', async () => {
+  const user = userEvent.setup();
+  const { unmount } = renderAt(<AddSourceDialog collection={collection()} onClose={vi.fn()} onAdded={vi.fn()} />);
+  fireEvent.drop(await screen.findByTestId('kb-dropzone'), { dataTransfer: { files: [file('a.pdf')] } });
+  await user.click(screen.getByRole('button', { name: /upload/i }));
+  await waitFor(() => expect(FakeXhr.last?.body).toBeInstanceOf(FormData));
+  const abort = vi.spyOn(FakeXhr.last!, 'abort');
+  unmount();
+  expect(abort).toHaveBeenCalledTimes(1);
+});

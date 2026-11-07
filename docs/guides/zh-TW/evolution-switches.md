@@ -38,7 +38,7 @@ enabled = true   # master kill-switch (default: true)
 
 **`gvu_enabled` 自 2026-09-29（K2）起出廠即為 `true`。** 有兩件事讓這個改變站得住腳。第一，引擎不再改寫 `SOUL.md`，舊路徑已於同日移除（S11），現在演化的對象是 playbook：一條條可獨立退場的行為規則，每條都綁至少一個 eval case，經過觀察窗後各自對照該 case 定案；`SOUL.md` 對 agent 維持唯讀。第二，一輪的成本兩頭都有界：`gvu_cooldown_minutes` 節制多久才能起一輪，零 LLM 成本的 Gate 會在付判官錢之前就否決注定失敗的候選。
 
-每一份 scaffold 仍會把這個鍵明確寫進 `agent.toml`，開關看得見，不是靠「鍵不存在＝關閉」。既有 `agent.toml` 維持原值（缺鍵仍讀成 `false`，執行期的 fail-closed 閘門沒有改變）。要讓某位 AI 員工退出，設 `gvu_enabled = false`。
+自 2026-11-06 起，只要 `agent.toml` 存在且有效，缺少 `gvu_enabled` 也會讀成 `true`，既有從儀表板建立的員工會在升級後開始學習。建立流程會明寫開關，公司範本會保留來源員工明確設定的 `false`。要退出自主進化，設 `gvu_enabled = false`；要凍結全部演化，設 `[evolution] enabled = false`。檔案不存在、無法讀取、TOML 損壞或開關型別錯誤仍拒絕演化。評估員、系統操作員與短期 helper 維持停用。
 
 同日（H3）另有四個 per-agent 技能旋鈕開始真正生效，在此之前它們由儀表板寫入，卻沒有任何讀取端：
 

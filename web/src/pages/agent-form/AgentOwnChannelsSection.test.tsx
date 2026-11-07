@@ -1,7 +1,8 @@
+import '@/test/mocks';
+import { mockCallableGrants } from '@/test/callable-grants';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { callsOf, mockRpc } from '@/pages/knowledge/test-fixtures';
 import type { AgentOwnChannels } from '@/lib/api';
@@ -23,7 +24,7 @@ function status(canEdit: boolean, over: Partial<AgentOwnChannels> = {}): AgentOw
   };
 }
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => { vi.clearAllMocks(); mockCallableGrants(['a1']); });
 
 describe('AgentOwnChannelsSection', () => {
   it('lets an admin connect a bot and shows who it is', async () => {

@@ -1,3 +1,4 @@
+import { canSelectAgent, useAgentGrantPresent } from '@/stores/callable-agents-store';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -33,6 +34,13 @@ export function AgentSourcesTab({ agentId, agentName }: { agentId: string; agent
   const [creating, setCreating] = useState(false);
   const [adding, setAdding] = useState<KbCollection | null>(null);
   const [opening, setOpening] = useState(false);
+  const selectable = useAgentGrantPresent(agentId);
+  useEffect(() => {
+    if (!selectable) {
+      setCreating(false);
+      setAdding(null);
+    }
+  }, [selectable, agentId]);
 
   const load = useCallback(async () => {
     try {
@@ -59,6 +67,7 @@ export function AgentSourcesTab({ agentId, agentName }: { agentId: string; agent
   // The own collection exists: confirm it (and the employee's settings
   // using it) once more, then open the upload dialog on it.
   const openAdd = async () => {
+    if (!canSelectAgent(agentId)) return;
     if (!data?.own) {
       setCreating(true);
       return;
@@ -66,7 +75,7 @@ export function AgentSourcesTab({ agentId, agentName }: { agentId: string; agent
     setOpening(true);
     try {
       const r = await knowledgeApi.ensureOwnCollection(agentId);
-      setAdding(r.collection);
+      if (canSelectAgent(agentId)) setAdding(r.collection);
     } catch (e) {
       toast.error(formatError(e));
     } finally {
@@ -93,7 +102,7 @@ export function AgentSourcesTab({ agentId, agentName }: { agentId: string; agent
       {data.binding === 'unreadable' && <Notice tone="warn" text={t('agentSources.binding.unreadable')} />}
       <OwnSection data={data} agentName={agentName} opening={opening} onAdd={() => void openAdd()} onChanged={() => void load()} />
       <SharedSection collections={others} self={{ id: agentId, name: agentName }} />
-      {creating && (
+      {selectable && creating && (
         <CreateOwnDialog
           agentId={agentId}
           agentName={agentName}
@@ -101,14 +110,16 @@ export function AgentSourcesTab({ agentId, agentName }: { agentId: string; agent
           onClose={() => setCreating(false)}
           onReady={(c, bindingChanged) => {
             setCreating(false);
+            if (!canSelectAgent(agentId)) return;
             if (bindingChanged) toast.info(t('agentSources.create.bindingChanged'));
             setAdding(c);
             void load();
           }}
         />
       )}
-      {adding && (
+      {selectable && adding && (
         <AddSourceDialog
+          agentId={agentId}
           collection={adding}
           onClose={() => setAdding(null)}
           onAdded={() => void load()}

@@ -12,7 +12,7 @@
 use std::{fs::File, io::{self, Read, Write}, path::{Component, Path, PathBuf, Prefix}, ptr::{null, null_mut}};
 use std::os::windows::{ffi::OsStrExt, io::{AsRawHandle, FromRawHandle}};
 use crate::identity_token::windows as acl;
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE,
@@ -175,6 +175,29 @@ impl SecureDirectory {
         file.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
         if bytes.len() > MAX_BYTES { return Err(io::ErrorKind::InvalidData.into()); }
         Ok(Some(bytes))
+    }
+
+    /// Create a file that must not already exist (`CREATE_NEW`, the Win32
+    /// counterpart of `O_CREAT|O_EXCL`) with the private DACL, then write and
+    /// flush it. An existing entry returns `AlreadyExists` and is never touched.
+    /// On a write failure the new object is deleted through its own handle.
+    /// Callers serialize creation and reads with a lock file.
+    pub fn create_new(&self, filename: &str, bytes: &[u8]) -> io::Result<()> {
+        name(filename)?;
+        if bytes.len() > MAX_BYTES { return Err(io::ErrorKind::InvalidData.into()); }
+        let mut file = match self.file(filename, true, true, true, false) {
+            Ok(file) => file,
+            Err(e) if e.raw_os_error() == Some(ERROR_FILE_EXISTS as i32)
+                || e.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) => return Err(io::ErrorKind::AlreadyExists.into()),
+            Err(e) => return Err(e),
+        };
+        let result = file.write_all(bytes).and_then(|()| file.sync_all());
+        if result.is_err() {
+            let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+            unsafe { SetFileInformationByHandle(file.as_raw_handle(), FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(), std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32); }
+        }
+        result
     }
 
     /// Write, flush and replace using the source handle and pinned directory.
@@ -350,6 +373,17 @@ mod tests {
         assert!(store.read("credential.json").is_err());
         assert!(store.write_atomic("credential.json", b"replacement").is_err());
         assert_eq!(std::fs::read(target).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn windows_private_state_create_new_never_replaces_existing_files() {
+        let home = private_home();
+        let store = SecureDirectory::open(home.path(), "state").unwrap();
+        store.create_new("installation.key", b"first").unwrap();
+        assert_eq!(store.create_new("installation.key", b"second").unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(store.read("installation.key").unwrap().unwrap().as_slice(), b"first");
+        assert!(store.create_new("too-large.key", &vec![0; MAX_BYTES + 1]).is_err());
+        assert!(store.read("too-large.key").unwrap().is_none());
     }
 
     #[test]

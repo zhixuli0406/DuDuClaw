@@ -1,3 +1,4 @@
+import { withAgentRequestAllowed } from './agent-request-guard';
 import { useAuthStore } from '@/stores/auth-store';
 
 export interface DecisionArtifact {
@@ -760,14 +761,16 @@ export type SyntheticLifecycleKind = 'acl_lost' | 'deleted' | 'quarantined' | 'v
 export type SyntheticLifecycleStageOutcome = 'staged' | 'already_staged' | 'already_completed';
 
 async function request<T>(path: string, body?: object): Promise<T> {
-  const jwt = useAuthStore.getState().jwt;
-  const response = await fetch(path, {
-    method: body ? 'POST' : 'GET',
-    headers: {
-      ...(jwt ? { Authorization: `Bearer ${jwt}` } : {}),
-      ...(body ? { 'Content-Type': 'application/json' } : {}),
-    },
-    ...(body ? { body: JSON.stringify(body) } : {}),
+  const response = await withAgentRequestAllowed(`POST ${path}`, body ?? {}, () => {
+    const jwt = useAuthStore.getState().jwt;
+    return fetch(path, {
+      method: body ? 'POST' : 'GET',
+      headers: {
+        ...(jwt ? { Authorization: `Bearer ${jwt}` } : {}),
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
   });
   if (!response.ok) {
     const payload: unknown = await response.json().catch(() => null);

@@ -792,11 +792,22 @@ fn read_validated_license_locked(home_dir: &Path, registry: &PublicKeyRegistry, 
     Ok(Some(license))
 }
 
+/// Everything the relay client needs, produced only when the license is
+/// eligible AND its signed `installation_pubkey` equals the local key.
+/// No `Debug`: carries the installation signing key.
+pub(crate) struct RelayLicense {
+    /// Original JSON (including unknown fields and signature).
+    pub artifact: serde_json::Value,
+    pub fingerprint: String,
+    pub subscription_id: String,
+    pub key: crate::installation_identity::InstallationKey,
+}
+
 /// A fresh, validated relay artifact. Keep the original JSON (including unknown
 /// fields and signature) rather than reconstructing it from the typed license.
 /// The shared disk lock binds validation, fingerprint and artifact to one read.
-pub(crate) fn mfa_relay_license(home: &Path) -> Result<(serde_json::Value, String), &'static str> {
-    let unavailable = "no_smtp_no_relay";
+pub(crate) fn mfa_relay_license(home: &Path) -> Result<RelayLicense, &'static str> {
+    let unavailable = "no_smtp";
     let path = home.join(storage::DEFAULT_LICENSE_FILENAME);
     if !path.try_exists().map_err(|_| unavailable)? { return Err(unavailable); }
     let registry;
@@ -814,13 +825,13 @@ pub(crate) fn mfa_relay_license(home: &Path) -> Result<(serde_json::Value, Strin
 fn mfa_relay_tier_eligibility(tier: LicenseTier, nfr: bool) -> Result<(), &'static str> {
     // Legacy Partner artifacts may omit the NFR bit; the tier is still free.
     if nfr || tier.is_partner() { return Err("relay_nfr"); }
-    if !tier.is_paid() { return Err("no_smtp_no_relay"); }
+    if !tier.is_paid() { return Err("no_smtp"); }
     Ok(())
 }
 
 fn mfa_relay_license_with(home: &Path, registry: &PublicKeyRegistry, gate: &FeatureGate)
-    -> Result<(serde_json::Value, String), &'static str> {
-    let unavailable = "no_smtp_no_relay";
+    -> Result<RelayLicense, &'static str> {
+    let unavailable = "no_smtp";
     let path = home.join(storage::DEFAULT_LICENSE_FILENAME);
     if !path.try_exists().map_err(|_| unavailable)? { return Err(unavailable); }
     let store = storage::LockedLicenseStore::acquire(&path).map_err(|_| unavailable)?;
@@ -837,9 +848,24 @@ fn mfa_relay_license_with(home: &Path, registry: &PublicKeyRegistry, gate: &Feat
     if serde_json::to_value(&parsed).map_err(|_| unavailable)? != serde_json::to_value(&license).map_err(|_| unavailable)? {
         return Err(unavailable);
     }
+    // Owner-approved installation key (design §2.1). The paid tier itself is
+    // unaffected; only the relay is withheld until the key is bound and present.
+    let key = crate::installation_identity::relay_key_status(license.installation_pubkey.as_deref(),
+        crate::installation_identity::load(home))?;
     // Enrollment identity only. The relay transport owns its compile-time destination;
     // neither the license's unsigned control_url nor environment overrides select it.
-    Ok((raw, matched.fingerprint))
+    Ok(RelayLicense { artifact: raw, fingerprint: matched.fingerprint,
+        subscription_id: license.subscription_id, key })
+}
+
+/// Relay key reason for a freshly refreshed license: `None` when the signed key
+/// equals the local one. Never a reason to reject the license.
+fn refreshed_relay_key_reason(license: &License, local_pubkey: Option<&str>) -> Option<&'static str> {
+    match (license.installation_pubkey.as_deref(), local_pubkey) {
+        (None, _) => Some("relay_key_unbound"),
+        (Some(bound), Some(local)) if bound == local => None,
+        _ => Some("relay_key_mismatch"),
+    }
 }
 
 async fn load_and_validate(home_dir: &Path, registry: &PublicKeyRegistry, gate: &FeatureGate) -> (Option<License>, Option<&'static str>) {
@@ -1089,7 +1115,13 @@ impl LicenseRuntime {
     }
 
     async fn do_phone_home_once(&self) -> Result<(), PhoneHomeError> {
+        // Generated only when absent; any other key-store failure omits the
+        // field (the refresh still renews the tier, the relay stays unbound).
+        let key_home = self.home_dir.clone();
+        let installation_pubkey = tokio::task::spawn_blocking(move ||
+            crate::installation_identity::ensure_public_key_hex(&key_home)).await.ok().flatten();
         let mut request = self.refresh_snapshot().await?;
+        request.installation_pubkey = installation_pubkey;
         request.proposed_fingerprint = duduclaw_license::fingerprint::refresh_fingerprint(&request.machine_fingerprint)
             .map_err(|e| PhoneHomeError::Rejected(e.to_string()))?;
         let subscription_id = &request.subscription_id;
@@ -1114,6 +1146,12 @@ impl LicenseRuntime {
         // re-bind in the console. An old fingerprint is not authentication.
         if proposed != machine_fingerprint {
             request_body["new_fingerprint"] = json!(proposed);
+        }
+        // Capability signal (design §2.3): the issuer only adds the signed
+        // `installation_pubkey` to licenses for requests that carry it. An
+        // unknown key becomes an owner-approval request in the license console.
+        if let Some(pubkey) = request.installation_pubkey.as_deref() {
+            request_body["installation_pubkey"] = json!(pubkey);
         }
 
         let response = crate::license_transport::request(reqwest::Method::POST, &endpoint, PHONE_HOME_TIMEOUT)
@@ -1164,7 +1202,7 @@ impl LicenseRuntime {
                 // decision is pure and unit-testable.
                 let phone_home = self.gate.phone_home_interval_days(new_license.tier);
                 let grace = self.gate.grace_period_days(new_license.tier);
-                let matched = accept_refreshed_license(
+                let accepted = accept_refreshed_license(
                     &self.registry,
                     &new_license,
                     cached_candidates(),
@@ -1172,8 +1210,15 @@ impl LicenseRuntime {
                     grace,
                     &request, &nonce, &body,
                 )?;
-                self.apply_refresh(&request, new_license, &matched).await?;
+                self.apply_refresh(&request, new_license, &accepted.matched).await?;
                 info!("phone-home succeeded; license refreshed");
+                if let Some(reason) = accepted.relay_key_reason {
+                    // The SAS is a public-key digest, not a secret.
+                    let fingerprint = request.installation_pubkey.as_deref()
+                        .and_then(crate::installation_identity::sas_for_hex).unwrap_or_default();
+                    info!(reason, installation_key_fingerprint = %fingerprint,
+                        "MFA email relay unavailable until the account owner approves this installation key in the license console");
+                }
                 Ok(())
             }
             Some("revoked") => {
@@ -1220,6 +1265,7 @@ impl LicenseRuntime {
             revision: inner.revision,
             disk: store.snapshot().map_err(|e| PhoneHomeError::Save(e.to_string()))?,
             is_self_host: is_self_host_deployment(),
+            installation_pubkey: None,
         })
     }
 
@@ -1325,6 +1371,8 @@ struct RefreshSnapshot {
     revision: u64,
     disk: storage::LicenseSnapshot,
     is_self_host: bool,
+    /// Local installation public key sent with the request, if available.
+    installation_pubkey: Option<String>,
 }
 
 impl RefreshSnapshot {
@@ -1335,7 +1383,17 @@ impl RefreshSnapshot {
     }
 }
 
+/// An accepted refresh: the binding match plus the MFA relay key reason
+/// (`None` when the signed installation key equals the requesting key).
+struct RefreshAccepted {
+    matched: duduclaw_license::FingerprintMatch,
+    relay_key_reason: Option<&'static str>,
+}
+
 /// Validate the signed artifact, request identity and deployment before CAS.
+/// A license whose `installation_pubkey` is absent or differs from the local
+/// key is still accepted (tier and binding are unaffected); only the relay
+/// reason is set, and the relay stays unavailable.
 #[allow(clippy::too_many_arguments)]
 fn accept_refreshed_license(
     registry: &PublicKeyRegistry,
@@ -1346,14 +1404,16 @@ fn accept_refreshed_license(
     request: &RefreshSnapshot,
     nonce: &str,
     body: &serde_json::Value,
-) -> Result<duduclaw_license::FingerprintMatch, PhoneHomeError> {
+) -> Result<RefreshAccepted, PhoneHomeError> {
     duduclaw_license::refresh::validate_response(registry, new_license, body, nonce,
         &request.subscription_id, &request.machine_fingerprint, &request.proposed_fingerprint)
         .map_err(|e| PhoneHomeError::Rejected(e.to_string()))?;
     new_license.validate_tier_deployment_binding(request.is_self_host)
         .map_err(|e| PhoneHomeError::Rejected(e.to_string()))?;
-    new_license.validate_any(candidates, phone_home_days, grace_days)
-        .map_err(|e| PhoneHomeError::Rejected(e.to_string()))
+    let matched = new_license.validate_any(candidates, phone_home_days, grace_days)
+        .map_err(|e| PhoneHomeError::Rejected(e.to_string()))?;
+    Ok(RefreshAccepted { matched,
+        relay_key_reason: refreshed_relay_key_reason(new_license, request.installation_pubkey.as_deref()) })
 }
 
 // ── CRL loop ──────────────────────────────────────────────────
@@ -1918,37 +1978,44 @@ pub(crate) mod tests {
             let path = home.path().join("license.json");
             assert!(mfa_relay_license_with(home.path(), &registry, &gate).is_err());
             assert!(!path.with_file_name("license.json.lock").exists());
+            let (key, _) = crate::installation_identity::load_or_create(home.path()).unwrap();
+            let bound = Some(key.public_key_hex());
             let mut license = valid_license_for(TEST_HARDWARE_FINGERPRINT);
             license.control_url = Some("https://attacker.example.com".into());
+            license.installation_pubkey = bound.clone();
             sign_license(&mut license, &kp);
             storage::save_to(&license, &path).unwrap();
             let mut original = serde_json::to_value(&license).unwrap();
             original["future_metadata"] = json!({"preserved":true});
             std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
-            let (raw, fingerprint) = mfa_relay_license_with(home.path(), &registry, &gate).unwrap();
-            assert_eq!(raw, original);
-            assert_eq!(fingerprint, TEST_HARDWARE_FINGERPRINT);
+            let relay = mfa_relay_license_with(home.path(), &registry, &gate).unwrap();
+            assert_eq!(relay.artifact, original);
+            assert_eq!(relay.fingerprint, TEST_HARDWARE_FINGERPRINT);
+            assert_eq!(relay.subscription_id, license.subscription_id);
+            assert_eq!(relay.key.public_key_hex(), key.public_key_hex());
             let mut oem = fake_license(LicenseTier::Oem, "");
+            oem.installation_pubkey = bound.clone();
             sign_license(&mut oem, &kp);
             storage::save_to(&oem, &path).unwrap();
-            assert_eq!(mfa_relay_license_with(home.path(), &registry, &gate).unwrap_err(), "relay_unbound");
+            assert_eq!(mfa_relay_license_with(home.path(), &registry, &gate).err().unwrap(), "relay_unbound");
             oem.machine_fingerprint = TEST_HARDWARE_FINGERPRINT.into();
             sign_license(&mut oem, &kp);
             storage::save_to(&oem, &path).unwrap();
             assert!(mfa_relay_license_with(home.path(), &registry, &gate).is_ok());
             let mut partner = fake_license(LicenseTier::Partner, TEST_HARDWARE_FINGERPRINT);
             assert!(!partner.nfr);
+            partner.installation_pubkey = bound.clone();
             sign_license(&mut partner, &kp);
             storage::save_to(&partner, &path).unwrap();
-            assert_eq!(mfa_relay_license_with(home.path(), &registry, &gate).unwrap_err(), "relay_nfr");
+            assert_eq!(mfa_relay_license_with(home.path(), &registry, &gate).err().unwrap(), "relay_nfr");
             let mut nfr = license.clone();
             nfr.nfr = true;
             sign_license(&mut nfr, &kp);
             storage::save_to(&nfr, &path).unwrap();
-            assert_eq!(mfa_relay_license_with(home.path(), &registry, &gate).unwrap_err(), "relay_nfr");
+            assert_eq!(mfa_relay_license_with(home.path(), &registry, &gate).err().unwrap(), "relay_nfr");
             nfr.nfr = false;
             storage::save_to(&nfr, &path).unwrap();
-            assert_eq!(mfa_relay_license_with(home.path(), &registry, &gate).unwrap_err(), "no_smtp_no_relay");
+            assert_eq!(mfa_relay_license_with(home.path(), &registry, &gate).err().unwrap(), "no_smtp");
             for mut denied in [
                 fake_license(LicenseTier::OpenSource, TEST_HARDWARE_FINGERPRINT),
                 fake_license(LicenseTier::Hobby, TEST_HARDWARE_FINGERPRINT),
@@ -1966,6 +2033,68 @@ pub(crate) mod tests {
             storage::save_to(&license, &path).unwrap();
             std::fs::write(home.path().join(REVOKED_FILENAME), "revoked").unwrap();
             assert!(mfa_relay_license_with(home.path(), &registry, &gate).is_err());
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn relay_requires_bound_matching_installation_key_without_changing_tier() {
+        with_hardware_fixture(async {
+            let home = tempfile::tempdir().unwrap();
+            let (kp, pubkey) = gen_issuer_keypair();
+            let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+            let gate = FeatureGate::from_str(EMBEDDED_FEATURES_TOML).unwrap();
+            let path = home.path().join("license.json");
+            let save = |pubkey: Option<String>| {
+                let mut license = valid_license_for(TEST_HARDWARE_FINGERPRINT);
+                license.installation_pubkey = pubkey;
+                sign_license(&mut license, &kp);
+                storage::save_to(&license, &path).unwrap();
+            };
+            let tier = || read_validated_license(home.path(), &registry, &gate).unwrap().unwrap().tier;
+            let reason = || mfa_relay_license_with(home.path(), &registry, &gate).err();
+
+            // Unbound license: relay off, paid tier intact, no key generated.
+            save(None);
+            assert_eq!(reason(), Some("relay_key_unbound"));
+            assert_eq!(tier(), LicenseTier::SelfHostPro);
+            assert!(!home.path().join("state/installation.key").exists());
+
+            // Bound, but the local key is missing (e.g. restored to a new machine).
+            save(Some("ab".repeat(32)));
+            assert_eq!(reason(), Some("relay_key_mismatch"));
+            assert_eq!(tier(), LicenseTier::SelfHostPro);
+            assert!(!home.path().join("state/installation.key").exists(), "availability never generates keys");
+
+            // A local key that differs from the signed one.
+            let (key, created) = crate::installation_identity::load_or_create(home.path()).unwrap();
+            assert!(created);
+            assert_eq!(reason(), Some("relay_key_mismatch"));
+            assert_eq!(tier(), LicenseTier::SelfHostPro);
+
+            // Bound to this installation.
+            save(Some(key.public_key_hex()));
+            assert_eq!(reason(), None);
+
+            // The relay cannot reach the network without an eligible RelayLicense.
+            save(None);
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+            let seen = calls.clone();
+            let result = crate::mfa_email::relay_send_for_test(home.path(), "x@y.test", "123456", 10_000,
+                |home| mfa_relay_license_with(home, &registry, &gate), move |_call| {
+                    *seen.lock().unwrap() += 1;
+                    std::future::ready(Err("unexpected relay request"))
+                }).await;
+            assert!(result.is_err());
+            assert_eq!(*calls.lock().unwrap(), 0, "no challenge or enroll call when unbound");
+            assert!(!home.path().join("state/mfa-relay-state.json").exists(), "enrollment budget untouched");
+            save(Some("cd".repeat(32)));
+            let seen = calls.clone();
+            assert!(crate::mfa_email::relay_send_for_test(home.path(), "x@y.test", "123456", 10_000,
+                |home| mfa_relay_license_with(home, &registry, &gate), move |_call| {
+                    *seen.lock().unwrap() += 1;
+                    std::future::ready(Err("unexpected relay request"))
+                }).await.is_err());
+            assert_eq!(*calls.lock().unwrap(), 0, "no challenge or enroll call on key mismatch");
         }).await;
     }
 
@@ -2038,7 +2167,7 @@ pub(crate) mod tests {
             machine_fingerprint: license.machine_fingerprint.clone(),
             proposed_fingerprint: license.machine_fingerprint.clone(), revision: 0,
             disk: storage::LockedLicenseStore::acquire(&tempfile::tempdir().unwrap().path().join("license.json"))
-                .unwrap().snapshot().unwrap(), is_self_host: true }
+                .unwrap().snapshot().unwrap(), is_self_host: true, installation_pubkey: None }
     }
 
     fn signed_response(kp: &ring::signature::Ed25519KeyPair, license: Option<&License>,
@@ -2062,6 +2191,33 @@ pub(crate) mod tests {
         let request = test_refresh_snapshot(license);
         let body = signed_response(kp, Some(license), &request, "active", "nonce");
         accept_refreshed_license(registry, license, candidates, ph, grace, &request, "nonce", &body)
+            .map(|accepted| accepted.matched)
+    }
+
+    #[test]
+    fn accept_refreshed_license_keeps_unbound_or_mismatched_installation_key() {
+        let (kp, pubkey) = gen_issuer_keypair();
+        let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+        let candidates = [FingerprintCandidate::for_test(TEST_HARDWARE_FINGERPRINT,
+            duduclaw_license::FingerprintStrength::Hardware)];
+        let local = "ab".repeat(32);
+        for (bound, sent, expected) in [
+            (None, Some(local.clone()), Some("relay_key_unbound")),
+            (Some("cd".repeat(32)), Some(local.clone()), Some("relay_key_mismatch")),
+            (Some(local.clone()), None, Some("relay_key_mismatch")),
+            (Some(local.clone()), Some(local.clone()), None),
+        ] {
+            let mut license = valid_license_for(TEST_HARDWARE_FINGERPRINT);
+            license.installation_pubkey = bound;
+            sign_license(&mut license, &kp);
+            let mut request = test_refresh_snapshot(&license);
+            request.installation_pubkey = sent;
+            let body = signed_response(&kp, Some(&license), &request, "active", "n");
+            let accepted = accept_refreshed_license(&registry, &license, &candidates, 7, 14, &request, "n", &body)
+                .expect("the paid license is accepted regardless of the relay key");
+            assert_eq!(accepted.relay_key_reason, expected);
+            assert_eq!(accepted.matched.fingerprint, TEST_HARDWARE_FINGERPRINT);
+        }
     }
 
     #[test]

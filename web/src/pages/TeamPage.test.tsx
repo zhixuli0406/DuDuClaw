@@ -5,7 +5,7 @@ vi.mock('@/lib/task-entry-visibility', async (importOriginal) => ({
   chatEntryLabel: (previous: string) => entryPolicy.hidden ? 'nav.newChat' : previous,
 }));
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
@@ -90,6 +90,8 @@ function answer(team: MyTeam) {
 }
 
 beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'mgr', role: 'manager' } as never });
+  vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: TEAM.members.flatMap(m => m.agents.map(a => ({ ...a, via: 'team', selectable: true }))), default_agent: null } as never);
   vi.clearAllMocks();
   entryPolicy.hidden = true;
   answer(TEAM);
@@ -226,4 +228,28 @@ it('replaces team assignment with a new chat draft and never creates a task', as
   expect(navigate).toHaveBeenCalledWith('/chat', { state: { draft: '@HR Helper ' } });
   expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   expect(mockWsClient.call.mock.calls.some(([method]) => method === 'tasks.create')).toBe(false);
+});
+
+import { api } from '@/lib/api';
+import { useAuthStore } from '@/stores/auth-store';
+
+import { callableSubject, useCallableAgentsStore } from '@/stores/callable-agents-store';
+
+it('closes an open assignment without creating a goal after revocation', async () => {
+  entryPolicy.hidden = false;
+  const user = userEvent.setup();
+  renderWithProviders(<TeamPage />);
+  const wang = await screen.findByRole('region', { name: 'Wang' });
+  await user.click(within(wang).getAllByRole('button', { name: 'Assign' })[0]);
+  const dialog = await screen.findByRole('dialog');
+  await user.type(within(dialog).getByLabelText('What should be done'), 'Prepare a quote');
+  const submit = within(dialog).getByRole('button', { name: 'Assign' });
+  await waitFor(() => expect(submit).toBeEnabled());
+  act(() => {
+    const key = JSON.stringify([callableSubject(), null]);
+    useCallableAgentsStore.setState({ entries: { [key]: { agents: [], unrestricted: false, loading: false, confirmedAt: Date.now() + 1 } } });
+    fireEvent.click(submit);
+  });
+  expect(mockWsClient.call.mock.calls.some(([method]) => method === 'tasks.create')).toBe(false);
+  await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
 });

@@ -143,7 +143,8 @@ impl MethodHandler {
                         "binding": if may_decide { json!(r.binding) } else { Value::Null },
                         "answer": if may_decide { json!(r.answer) } else { Value::Null },
                         "may_decide": may_decide,
-                        "decided_in_dashboard_only": crate::approval_notify::is_dashboard_only_record(r),
+                        "mail_requester_approval_eligible": crate::approval::mail_requester::eligible(&self.home_dir, r),
+                        "decided_in_dashboard_only": crate::approval_notify::is_dashboard_only_record(Some(&self.home_dir), r),
                         "submitter_is_viewer": activation
                             && super::approval_decider::submitter_is_decider(r, &fresh),
                         // A-H-1: what an Admin accepts — each effect and the

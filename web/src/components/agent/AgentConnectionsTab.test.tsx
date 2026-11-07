@@ -1,7 +1,8 @@
+import '@/test/mocks';
+import { mockCallableGrants } from '@/test/callable-grants';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen, waitFor, within, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { AgentConnectionsTab } from './AgentConnectionsTab';
 import { api, type AgentGoogleIdentity } from '@/lib/api';
@@ -25,6 +26,7 @@ function setRole(role: 'admin' | 'manager' | 'employee') {
 beforeEach(() => {
   vi.restoreAllMocks();
   useAuthStore.setState({bindings:[]});
+  mockCallableGrants(['bot', 'other']);
 });
 
 describe('AgentConnectionsTab', () => {
@@ -217,4 +219,20 @@ describe('AgentConnectionsTab', () => {
     expect(list).toHaveTextContent('授權清單完整');
     expect(list).toHaveTextContent('Google 管理員還沒授權這組服務');
   });
+});
+
+it('clears primary-owner confirmation on grant revocation and rejects its retained callback', async () => {
+  setRole('admin');
+  mockCallableGrants(['bot']);
+  vi.spyOn(api.googleIdentity, 'get').mockResolvedValue({ ...HOME, owners: [
+    { user_id: 'alice', name: 'Alice', email: 'alice@test.invalid', is_primary: true },
+    { user_id: 'bob', name: 'Bob', email: 'bob@test.invalid', is_primary: false },
+  ] });
+  const save = vi.spyOn(api.personalGoogle, 'primaryOwner').mockResolvedValue({});
+  renderWithProviders(<AgentConnectionsTab agentId="bot" />);
+  await userEvent.click((await screen.findAllByRole('button', { name: 'Set primary owner' }))[1]);
+  const confirm = within(await screen.findByRole('dialog')).getByRole('button', { name: 'Confirm' });
+  await act(async () => { mockCallableGrants([]); confirm.click(); });
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  expect(save).not.toHaveBeenCalled();
 });

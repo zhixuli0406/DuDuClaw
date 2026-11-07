@@ -119,9 +119,9 @@ fn report_office_conflicts(skills_dir: &Path, report: &mut SeedReport) -> bool {
 /// suppress newly bundled skills. Neither pass overwrites operator content.
 pub fn run(home_dir: &Path) -> SeedReport {
     let google = run_google_setup(home_dir);
-    // On Unix, reject unsafe skills paths before the legacy installer runs.
-    // Unsupported secure creation elsewhere must not suppress legacy skills.
-    if cfg!(unix) && google.error.is_some() {
+    // Google backfill always runs. On Unix and Windows, a Google error also
+    // stops legacy seeding; unsupported secure creation elsewhere does not.
+    if cfg!(any(unix, windows)) && google.error.is_some() {
         return google;
     }
     let mut report = run_legacy(home_dir);
@@ -137,23 +137,29 @@ const GOOGLE_MARKER_NAME: &str = "g1-connect-google-seed-v1.done";
 
 fn run_google_setup(home_dir: &Path) -> SeedReport {
     let mut report = SeedReport::default();
-    let marker = home_dir.join("migrations").join(GOOGLE_MARKER_NAME);
-    if marker.exists() {
-        report.already_done = true;
-        return report;
-    }
     let result = (|| -> std::io::Result<()> {
+        let root = crate::fs_safe::SafeDir::open_root(home_dir)?;
+        let migrations = root.child_dir("migrations", false)?;
+        if let Some(dir) = &migrations {
+            if dir.open_read_checked(GOOGLE_MARKER_NAME, true)?.is_some() {
+                report.already_done = true;
+                return Ok(());
+            }
+        }
         let (_, body) = duduclaw_agent::builtin_skills::BUILTIN_SKILLS.iter()
             .find(|(name, _)| *name == "connect-google")
             .expect("connect-google must be bundled");
-        let root = crate::fs_safe::SafeDir::open_root(home_dir)?;
         let dir = root.open_path(&["skills", "connect-google"], true)?
             .ok_or_else(|| crate::fs_safe::refused("missing skills directory"))?;
         if dir.create_file_new("SKILL.md", body.as_bytes())? {
             report.seeded.push("connect-google".to_string());
         }
-        std::fs::create_dir_all(home_dir.join("migrations"))?;
-        std::fs::write(&marker, "g1-connect-google-seed-v1\n")?;
+        let migrations = match migrations {
+            Some(dir) => dir,
+            None => root.child_dir("migrations", true)?
+                .ok_or_else(|| crate::fs_safe::refused("missing migrations directory"))?,
+        };
+        migrations.create_file_new(GOOGLE_MARKER_NAME, b"g1-connect-google-seed-v1\n")?;
         Ok(())
     })();
     if let Err(e) = result {
@@ -201,7 +207,7 @@ fn write_marker(marker: &Path, report: &SeedReport) {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn google_backfill_runs_after_legacy_marker_and_preserves_operator_changes() {
         let home = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
@@ -222,7 +228,56 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap(), "operator edition");
     }
 
-    // Not run: reject both directory components and the final file.
+    #[cfg(windows)]
+    #[test]
+    fn google_backfill_refuses_junction_before_legacy_seeding() {
+        for component in ["skills", "skills/connect-google"] {
+            let home = crate::fs_safe::private_test_home().unwrap();
+            let outside = crate::fs_safe::private_test_home().unwrap();
+            let junction = home.path().join(component);
+            std::fs::create_dir_all(junction.parent().unwrap()).unwrap();
+            let output = std::process::Command::new("cmd").args(["/d", "/c", "mklink", "/J"])
+                .arg(&junction).arg(outside.path()).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let report = run(home.path());
+            assert!(report.error.is_some());
+            assert!(report.seeded.is_empty());
+            assert!(!home.path().join("migrations").exists());
+            assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+            std::fs::remove_dir(&junction).unwrap();
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn google_backfill_refuses_migrations_link_with_or_without_outside_marker() {
+        for existing_marker in [false, true] {
+            let home = crate::fs_safe::private_test_home().unwrap();
+            let outside = crate::fs_safe::private_test_home().unwrap();
+            let marker = outside.path().join(GOOGLE_MARKER_NAME);
+            if existing_marker { std::fs::write(&marker, b"outside marker").unwrap(); }
+            let link = home.path().join("migrations");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            #[cfg(windows)]
+            {
+                let output = std::process::Command::new("cmd").args(["/d", "/c", "mklink", "/J"])
+                    .arg(&link).arg(outside.path()).output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            }
+            let report = run(home.path());
+            assert!(report.error.is_some());
+            assert!(!report.already_done, "outside marker must not suppress migration");
+            assert!(report.seeded.is_empty());
+            assert!(!home.path().join("skills").exists());
+            assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), usize::from(existing_marker));
+            if existing_marker { assert_eq!(std::fs::read(&marker).unwrap(), b"outside marker"); }
+            #[cfg(windows)]
+            std::fs::remove_dir(&link).unwrap();
+        }
+    }
+
+    // Reject both directory components and the final file.
     #[cfg(unix)]
     #[test]
     fn google_backfill_refuses_symlinks_without_writing_outside() {
@@ -316,9 +371,9 @@ mod tests {
         let report = run(home.path());
 
         assert!(!report.already_done);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         assert!(report.error.is_none());
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         assert!(report.error.is_some(), "Google backfill must fail closed without secure creation");
         assert!(
             !report.seeded.is_empty(),
@@ -331,7 +386,7 @@ mod tests {
         for dev in ["code-review", "refactor", "test-writer", "git-workflow"] {
             assert!(!on_disk.contains(&dev.to_string()));
         }
-        if cfg!(unix) { assert!(on_disk.contains(&"connect-google".to_string())); }
+        if cfg!(any(unix, windows)) { assert!(on_disk.contains(&"connect-google".to_string())); }
         // The multi-file office skills (docx / xlsx / pptx / pdf) are the ones
         // the customer was actually missing — "make me a spreadsheet" is the
         // request that failed. They ship a SKILL.md *plus* the scripts it calls,
@@ -376,7 +431,7 @@ mod tests {
         std::fs::remove_dir_all(&victim).unwrap();
 
         let second = run(home.path());
-        assert_eq!(second.already_done, cfg!(unix));
+        assert_eq!(second.already_done, cfg!(any(unix, windows)));
         assert!(second.seeded.is_empty());
         assert!(
             !victim.exists(),

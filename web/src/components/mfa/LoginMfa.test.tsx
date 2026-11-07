@@ -124,9 +124,9 @@ it('cannot invoke email delivery when the server reports unavailable SMTP', asyn
 
 it('explains disabled email and passkey enrollment choices on an insecure connection', () => {
   vi.stubGlobal('isSecureContext', false);
-  renderWithProviders(<LoginMfa challenge={{ mfa_enrollment_required: true, enrollment_token: 'enroll', challenge_ref: 'ref', email_available: false, email_unavailable_reason: 'no_smtp_no_relay' }} onComplete={vi.fn()} onCancel={vi.fn()} />);
+  renderWithProviders(<LoginMfa challenge={{ mfa_enrollment_required: true, enrollment_token: 'enroll', challenge_ref: 'ref', email_available: false, email_unavailable_reason: 'no_smtp' }} onComplete={vi.fn()} onCancel={vi.fn()} />);
   expect(screen.getByRole('option', { name: 'Email verification code' })).toBeDisabled();
   expect(screen.getByRole('option', { name: 'Passkey' })).toBeDisabled();
-  expect(screen.getByText(/server has no email delivery configured/)).toHaveTextContent('SMTP');
+  expect(screen.getByText(/server has no outgoing email/)).toHaveTextContent('SMTP');
   expect(screen.getByText(/Passkeys require HTTPS or localhost/)).toHaveTextContent('http://');
 });

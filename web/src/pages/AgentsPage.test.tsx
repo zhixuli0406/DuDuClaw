@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { useAuthStore } from '@/stores/auth-store';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
@@ -174,7 +175,7 @@ it('shows unavailable task counts for team AI staff rather than zero', async () 
   useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [] });
   useTasksStore.setState({ tasks: [], error: null, tasksPartialError: null, loading: false });
   mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'agents.callable'
-    ? { agents: [{ name: 'team-bot', display_name: 'Team Bot', via: 'team', via_user_name: 'Report', status: 'active', role: 'worker' }] }
+    ? { agents: [{ name: 'team-bot', display_name: 'Team Bot', via: 'team', selectable: true, via_user_name: 'Report', status: 'active', role: 'worker' }] }
     : method === 'agents.list' ? { agents: [] } : { tasks: [] }));
   renderWithProviders(<AgentsPage />);
   expect(await screen.findByText('Team Bot')).toBeInTheDocument();
@@ -183,3 +184,6 @@ it('shows unavailable task counts for team AI staff rather than zero', async () 
   expect(screen.getByText('Report’s AI employee')).toHaveAttribute('title', expect.stringContaining('Memory and settings require direct access'));
   expect(screen.queryByText('0')).not.toBeInTheDocument();
 });
+
+// Start these component scenarios after the gateway confirmed the admin roster.
+beforeEach(() => setConfirmedCallableAgents(true));

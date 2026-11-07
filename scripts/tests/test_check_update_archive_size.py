@@ -53,6 +53,60 @@ class UpdateArchiveSizeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("no duduclaw update binary", result.stderr)
 
+    def test_nested_python_package_dir_ignored_tar_and_zip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tar = Path(directory) / "release.tar.gz"
+            with tarfile.open(tar, "w:gz") as archive:
+                entry = tarfile.TarInfo("duduclaw")
+                entry.size = 4
+                archive.addfile(entry, io.BytesIO(b"test"))
+                for name in ("python", "python/duduclaw"):
+                    d = tarfile.TarInfo(name)
+                    d.type = tarfile.DIRTYPE
+                    archive.addfile(d)
+                f = tarfile.TarInfo("python/duduclaw/__init__.py")
+                f.size = 1
+                archive.addfile(f, io.BytesIO(b"#"))
+            checker.check_archive(tar)
+            result = subprocess.run([sys.executable, str(SCRIPT), str(tar)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            zip_path = Path(directory) / "release.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("duduclaw.exe", b"test")
+                archive.writestr("python/duduclaw/", b"")
+                archive.writestr("python/duduclaw/__init__.py", b"#")
+            checker.check_archive(zip_path)
+
+    def test_nested_dir_does_not_weaken_other_checks(self):
+        self.assertFalse(checker.check_member("python/duduclaw", 0, False, True))
+        self.assertFalse(checker.check_member("python/duduclaw/", 0, False, True))
+        with self.assertRaisesRegex(ValueError, "archive root"):
+            checker.check_member("python/duduclaw", 4, True, False)
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            checker.check_member("duduclaw", 0, False, True)
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            checker.check_member("./duduclaw/", 0, False, True)
+        with self.assertRaisesRegex(ValueError, "unsafe"):
+            checker.check_member("../python/duduclaw", 0, False, True)
+        with self.assertRaisesRegex(ValueError, "<=1.79.2"):
+            checker.check_member("duduclaw", checker.LEGACY_BINARY_LIMIT, True)
+        with tempfile.TemporaryDirectory() as directory:
+            tar = Path(directory) / "release.tar.gz"
+            with tarfile.open(tar, "w:gz") as archive:
+                for name in ("duduclaw", "python/duduclaw"):
+                    entry = tarfile.TarInfo(name)
+                    entry.size = 4
+                    archive.addfile(entry, io.BytesIO(b"test"))
+            with self.assertRaisesRegex(ValueError, "archive root"):
+                checker.check_archive(tar)
+            zip_path = Path(directory) / "release.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("duduclaw.exe", b"test")
+                archive.writestr("python/duduclaw", b"test")
+            with self.assertRaisesRegex(ValueError, "archive root"):
+                checker.check_archive(zip_path)
+
     def test_symlink_binary_rejected(self):
         with self.assertRaisesRegex(ValueError, "regular file"):
             checker.check_member("duduclaw", 0, False)

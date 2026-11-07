@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, screen, waitFor } from '@testing-library/react';
 import '@/test/mocks';
@@ -10,6 +11,7 @@ vi.mock('@/lib/meeting/picker', () => ({ prepareGooglePicker: vi.fn().mockResolv
 const status: MeetingDriveStatus = { connected: true, authorized: true, picker_configured: true, client_id: 'client', developer_key: 'public-key', app_id: '123', account_email: 'owner@example.com' };
 beforeEach(() => {
   vi.clearAllMocks();
+  setConfirmedCallableAgents(true);
   vi.mocked(pickGoogleRecording).mockResolvedValue({ id: 'abcdefghij123', name: 'Team meeting.mp4' });
   vi.mocked(meetingDriveApi.registerSelection).mockResolvedValue({ selection_receipt: 'selection-receipt', expires_in: 300 });
   vi.mocked(meetingDriveApi.status).mockResolvedValue(status);

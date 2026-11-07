@@ -7,7 +7,7 @@ import { api, type TimelineListResult, type TimelineRow } from '@/lib/api';
 import { buildLanes, timeTicks, xForMs } from '@/lib/timeline-layout';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useDataScope, useVisibleAgents } from '@/lib/data-scope';
+import { useDataScope, useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import {
   PageHeader, Card, CardContent, CardHeader, CardTitle, CardDescription,
   Segmented, Empty, ErrorState, Skeleton, ActorAvatar, Badge, Button,
@@ -79,8 +79,13 @@ export function TimelinePage() {
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const scope = useDataScope();
   const visibleAgents = useVisibleAgents();
+  const selectableAgents = useSelectableAgents();
   const [range, setRange] = useUrlState('range', '24h', { allowed: RANGE_KEYS });
-  const [agentFilter, setAgentFilter] = useUrlState('agent', '');
+  const [requestedAgent, setAgentFilter] = useUrlState('agent', '');
+  const agentFilter = scope === 'all' || visibleAgents.some(a => a.name === requestedAgent) ? requestedAgent : '';
+  useEffect(() => {
+    if (requestedAgent !== agentFilter) setAgentFilter(agentFilter);
+  }, [requestedAgent, agentFilter, setAgentFilter]);
   const [filter, setFilter] = useState<Bucket | null>(null);
   const [chartOpen, setChartOpen] = useState(false);
   const [result, setResult] = useState<TimelineListResult | null>(null);
@@ -181,7 +186,7 @@ export function TimelinePage() {
           </SelectTrigger>
           <SelectContent>
             {scope === 'all' && <SelectItem value="">{intl.formatMessage({ id: 'timeline.allAgents' })}</SelectItem>}
-            {visibleAgents.filter((agent) => agent.name !== 'channel_alert').map((agent) => <SelectItem key={agent.name} value={agent.name}>{agent.display_name || agent.name}{agent.readOnly ? ` · ${intl.formatMessage({ id: 'agents.teamMember' }, { name: agent.teamMember })}` : ''}</SelectItem>)}
+            {selectableAgents.filter((agent) => agent.name !== 'channel_alert').map((agent) => <SelectItem key={agent.name} value={agent.name}>{agent.display_name || agent.name}{agent.readOnly ? ` · ${intl.formatMessage({ id: 'agents.teamMember' }, { name: agent.teamMember })}` : ''}</SelectItem>)}
           </SelectContent>
         </Select>
         {!loaded ? <div className="space-y-3" aria-busy="true"><Skeleton className="h-16 w-full" /><Skeleton className="h-32 w-full" /></div>

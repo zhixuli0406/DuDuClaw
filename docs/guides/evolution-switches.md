@@ -54,11 +54,13 @@ read-only for the agent. Second, the cost of a round is bounded on both sides:
 `gvu_cooldown_minutes` throttles how often a round may start, and the
 zero-LLM Gate rejects a doomed candidate *before* any judge call is paid for.
 
-The value is still written explicitly by every scaffold, so the toggle is
-visible in `agent.toml` rather than an absent key. An agent whose
-`agent.toml` predates this change keeps whatever it already has (a missing key
-still reads as `false` — the runtime gate is unchanged and fail-closed).
-Set `gvu_enabled = false` to opt an agent out.
+Since 2026-11-06, a present, valid `agent.toml` with no `gvu_enabled` key
+also defaults to `true`. Existing dashboard-created employees therefore begin
+learning after upgrading. Creation paths write the key explicitly; company
+templates preserve an explicit `false` from the source employee. Set
+`gvu_enabled = false` to opt out, or `[evolution] enabled = false` to freeze
+all evolution. Missing/unreadable files, malformed TOML and wrong-typed switches
+still fail closed. Evaluator, system-operator and ephemeral helpers stay off.
 
 Four per-agent skill-lifecycle knobs became live on the same date (H3).
 Before it they were written by the dashboard and read by nobody:

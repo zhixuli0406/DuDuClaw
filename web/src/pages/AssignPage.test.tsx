@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { useConnectionStore } from '@/stores/connection-store';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
@@ -468,6 +469,7 @@ describe('複雜任務 tab', () => {
 
   it('defaults to the primary employee without replacing an entry-point selection', async () => {
     useAuthStore.setState({ user: { role: 'admin', primary_agent_id: 'nova' } as never });
+    setConfirmedCallableAgents(true);
     const user = userEvent.setup();
     openComplex();
     await user.type(screen.getByLabelText('What should the AI employee do?'), 'Use my primary');
@@ -477,6 +479,7 @@ describe('複雜任務 tab', () => {
 
   it('keeps the explicit employee when the primary differs', async () => {
     useAuthStore.setState({ user: { role: 'admin', primary_agent_id: 'nova' } as never });
+    setConfirmedCallableAgents(true);
     const user = userEvent.setup();
     renderAt({ pathname: '/assign', state: { assignPrefill: { agentId: 'scout', description: 'Explicit selection' } } });
     await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
@@ -569,3 +572,6 @@ describe('employee task navigation preference', () => {
     expect(screen.getByRole('tab', { name: en['assign.tab.complex'] })).toHaveAttribute('aria-selected', 'true');
   });
 });
+
+// Start these component scenarios after the gateway confirmed the admin roster.
+beforeEach(() => setConfirmedCallableAgents(true));

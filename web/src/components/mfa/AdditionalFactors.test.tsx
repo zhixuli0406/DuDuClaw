@@ -29,9 +29,23 @@ it('preserves the password and displays the independent proof reference before s
 it('explains why email and passkey enrollment are disabled in account settings', async () => {
   vi.stubGlobal('isSecureContext', false);
   vi.spyOn(transport, 'accountRequest').mockResolvedValue({ passkeys: [], available: true });
-  renderWithProviders(<AdditionalFactors status={{ enabled: false, enforced: false, factors: { totp: false, email: false, passkey: false }, email_available: false, email_unavailable_reason: 'relay_disabled' }} onChange={vi.fn()} />);
+  renderWithProviders(<AdditionalFactors status={{ enabled: false, enforced: false, factors: { totp: false, email: false, passkey: false }, email_available: false, email_unavailable_reason: 'no_smtp' }} onChange={vi.fn()} />);
   await waitFor(() => expect(screen.getByRole('button', { name: 'Add a passkey' })).toBeDisabled());
   expect(screen.getByRole('button', { name: 'Set up email verification' })).toBeDisabled();
-  expect(screen.getByText(/administrator has disabled the licensed email relay/)).toHaveTextContent('SMTP');
+  expect(screen.getByText(/server has no outgoing email/)).toHaveTextContent('SMTP');
   expect(screen.getByText(/Passkeys require HTTPS or localhost/)).toBeInTheDocument();
+});
+
+it('explains an administrator-disabled relay in account settings', async () => {
+  vi.spyOn(transport, 'accountRequest').mockResolvedValue({ passkeys: [], available: true });
+  renderWithProviders(<AdditionalFactors status={{ enabled: false, enforced: false, factors: { totp: false, email: false, passkey: false }, email_available: false, email_unavailable_reason: 'relay_disabled' }} onChange={vi.fn()} />);
+  expect(await screen.findByText(/administrator has disabled the licensed email relay/)).toHaveTextContent('SMTP');
+  expect(screen.getByRole('button', { name: 'Set up email verification' })).toBeDisabled();
+});
+
+it('shows the installation key fingerprint while the relay awaits console approval', async () => {
+  vi.spyOn(transport, 'accountRequest').mockResolvedValue({ passkeys: [], available: true });
+  renderWithProviders(<AdditionalFactors status={{ enabled: false, enforced: false, factors: { totp: false, email: false, passkey: false }, email_available: false, email_unavailable_reason: 'relay_key_unbound', relay_key_fingerprint: '1a2b-3c4d-5e6f-7a8b' }} onChange={vi.fn()} />);
+  expect(await screen.findByText(/approve this installation in the license console/)).toBeInTheDocument();
+  expect(screen.getByTestId('relay-key-fingerprint')).toHaveTextContent('Installation key fingerprint: 1a2b-3c4d-5e6f-7a8b');
 });

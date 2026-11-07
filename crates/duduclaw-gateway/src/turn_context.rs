@@ -107,7 +107,8 @@ pub fn register(agent_id: &str, turn_id: &str, reply_channel: &str) -> Option<Tu
             crate::approval::CURRENT_DECISION_CONTEXT
                 .try_with(Clone::clone)
                 .ok()
-                .flatten(),
+                .flatten()
+                .or_else(authenticated_webchat_context),
             crate::approval::CURRENT_TRUSTED_REPLY_TARGET
                 .try_with(Clone::clone)
                 .ok()
@@ -118,6 +119,24 @@ pub fn register(agent_id: &str, turn_id: &str, reply_channel: &str) -> Option<Tu
     Some(TurnGuard { key, id,
         _watch_socket: crate::computer_watch_links::delivery::register_socket(agent_id, turn_id),
     })
+}
+
+/// Both values are scoped by the authenticated dashboard reply pipeline.
+/// Widget identities, arbitrary session names and client claims grant nothing.
+fn authenticated_webchat_context() -> Option<crate::approval::DecisionContext> {
+    use duduclaw_knowledge::requester::RequesterIdentity;
+    let RequesterIdentity::DashboardUser { user_id } =
+        crate::knowledge::turn_requesters::CURRENT_REQUESTER.try_with(Clone::clone).ok()? else { return None; };
+    let principal = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
+        .try_with(Clone::clone).ok()?;
+    if principal != user_id || principal.starts_with("widget-visitor:") { return None; }
+    let session = duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(Clone::clone).ok().flatten()?;
+    let context = crate::approval::DecisionContext {
+        channel: "webchat".into(), account_id: "gateway".into(),
+        conversation_id: session, principal_id: user_id,
+    };
+    context.validate().ok()?;
+    Some(context)
 }
 
 /// The reply channel of `agent_id`'s live turn `turn_id` (the newest
@@ -206,6 +225,26 @@ mod tests {
         assert!(register("turns-carol", "t", "").is_none());
         assert!(register("turns-carol", "t", "telegram:1\r\n").is_none());
         assert_eq!(reply_channel_for("turns-carol", "t"), None);
+    }
+
+    #[tokio::test]
+    async fn mail_approval_webchat_context_requires_authenticated_dashboard_identity() {
+        use duduclaw_knowledge::requester::RequesterIdentity;
+        for (principal, requester, expected) in [
+            ("human", RequesterIdentity::DashboardUser { user_id:"human".into() }, true),
+            ("other", RequesterIdentity::DashboardUser { user_id:"human".into() }, false),
+            ("widget-visitor:public", RequesterIdentity::DashboardUser { user_id:"widget-visitor:public".into() }, false),
+            ("human", RequesterIdentity::Unknown, false),
+        ] {
+            crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(principal.into(),
+                crate::knowledge::turn_requesters::CURRENT_REQUESTER.scope(requester,
+                    duduclaw_memory::feedback::CURRENT_SESSION_ID.scope(Some("webchat-session".into()), async {
+                        let _turn = register("webchat-audience", "turn", "webchat:webchat-session").unwrap();
+                        assert_eq!(decision_context_for("webchat-audience", "turn").is_some(), expected);
+                    }),
+                ),
+            ).await;
+        }
     }
 
     #[tokio::test]

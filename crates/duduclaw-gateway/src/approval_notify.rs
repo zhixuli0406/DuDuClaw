@@ -133,6 +133,10 @@ pub(crate) fn approval_body_with(
     reminder: bool,
     assigner: Option<&str>,
 ) -> String {
+    // Private mail details have a separate, audience-gated renderer.
+    if rec.payload.get("egress_guard").is_some() {
+        return dashboard_only_notice_body(rec, reminder);
+    }
     let head = if reminder {
         "⏰ 這項核可快到期了，逾時會自動拒絕"
     } else {
@@ -216,10 +220,11 @@ pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
 }
 
 /// Record-level restrictions also cover outbound guards on arbitrary kinds.
-pub(crate) fn is_dashboard_only_record(rec: &ApprovalRecord) -> bool {
+pub(crate) fn is_dashboard_only_record(home: Option<&Path>, rec: &ApprovalRecord) -> bool {
     is_dashboard_only_kind(&rec.action_kind)
         || rec.action_kind == crate::approval::cli_egress::KIND
-        || rec.payload.get("egress_guard").is_some()
+        || (rec.payload.get("egress_guard").is_some()
+            && !home.is_some_and(|home| crate::approval::mail_requester::eligible(home, rec)))
 }
 
 /// What the dashboard answers when a dashboard-only card is decided after it
@@ -451,8 +456,19 @@ async fn push_dashboard_only(
 }
 
 async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(String, String)> {
-    if is_dashboard_only_record(rec) {
+    if is_dashboard_only_record(Some(home_dir), rec) {
         return push_dashboard_only(home_dir, rec, reminder).await;
+    }
+    if rec.payload.get("egress_guard").is_some() {
+        // A config/identity change between checks must never enter the legacy
+        // fallback chain with private mail content.
+        if !crate::approval::mail_requester::eligible(home_dir, rec) { return None; }
+        let binding = rec.binding.as_ref()?;
+        let target = crate::turn_context::target_for(&rec.agent_id, &binding.run_id)?;
+        if target.context != binding.decision_context
+            || target.conversation_audience != crate::approval::ConversationAudience::Private { return None; }
+        let body = crate::approval::mail_requester::card_body(rec);
+        return crate::notify_push::push_exact_confirmation(&target, &body).await;
     }
     // A reminder retraces the delivered destination; a first push resolves the
     // chain. (`notify_channel` is only ever set after a successful delivery.)
@@ -581,7 +597,7 @@ pub(crate) async fn apply_decision(
     }
     // H1: decided in the dashboard only — an older card's button, a crafted
     // callback or a text reply never decides it; the approval stays pending.
-    if is_dashboard_only_record(&rec) {
+    if is_dashboard_only_record(Some(home_dir), &rec) {
         return Err(dashboard_only_refusal(&rec.action_kind).into());
     }
     if rec.status.is_terminal() {
@@ -699,6 +715,9 @@ fn settled_verb_for(rec: &ApprovalRecord, approve: bool) -> crate::decision_card
 /// decision alike) so the collapsed card always reads the same regardless of
 /// where the decision was made.
 fn approval_collapse_summary(rec: &ApprovalRecord) -> String {
+    if rec.payload.get("egress_guard").is_some() {
+        return "郵件或對外操作審核".into();
+    }
     format!(
         "🔔 {}：{}",
         zh_action_kind(&rec.action_kind),
@@ -1315,6 +1334,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mail_requester_admin_notice_transport_contains_no_mail_details() {
+        let home = tempfile::tempdir().unwrap();
+        let provider = crate::test_channel_provider::TestChannelProvider::start().await;
+        let dir = home.path().join("agents/sales-bot");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"),
+            "[proactive]\nnotify_channel='telegram'\nnotify_chat_id='555'\n").unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            format!("[channels]\ntelegram_bot_token='{}'\n", provider.token)).unwrap();
+        let mut record = rec("mcp_call");
+        record.summary = "recipient@example.com secret subject secret body".into();
+        record.payload = json!({"name":"mail_send", "egress_guard":{}, "arguments":{
+            "to":"recipient@example.com", "subject":"secret subject", "body":"secret body"}});
+        for reminder in [false, true] {
+            assert_eq!(push(home.path(), &record, reminder).await, Some(("telegram".into(), "555".into())));
+            record.notify_channel = Some("telegram".into());
+            record.notify_chat_id = Some("555".into());
+        }
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let text = request.body["text"].as_str().unwrap();
+            assert!(text.contains("管理員") && text.contains("儀表板"));
+            for secret in ["recipient@example.com", "secret subject", "secret body"] { assert!(!text.contains(secret)); }
+            assert!(request.body.get("reply_markup").is_none());
+        }
+    }
+
+    #[test]
+    fn mail_requester_channel_updates_never_reveal_mail_content() {
+        let mut record = rec("bound_action");
+        record.summary = "recipient@example.com secret subject secret body".into();
+        record.payload = json!({"name":"mail_send", "egress_guard":{}, "arguments":{
+            "to":"recipient@example.com", "subject":"secret subject", "body":"secret body"}});
+        for text in [dashboard_only_notice_body(&record, false), dashboard_only_notice_body(&record, true),
+            approval_collapse_summary(&record), approval_body(&record, false),
+            crate::approval::pending_summary_for_channel(&record)] {
+            for secret in ["recipient@example.com", "secret subject", "secret body"] { assert!(!text.contains(secret)); }
+        }
+    }
+
+    #[tokio::test]
     async fn outbound_records_get_only_dashboard_notices_and_refuse_channel_decisions() {
         let dir = tempfile::tempdir().unwrap();
         let broker = ApprovalBroker::open(dir.path()).unwrap();
@@ -1324,7 +1385,7 @@ mod tests {
         ] {
             let id = broker.request("sales", kind, "secret outbound content", payload, 300).await.unwrap();
             let record = broker.get(&id).await.unwrap().unwrap();
-            assert!(is_dashboard_only_record(&record));
+            assert!(is_dashboard_only_record(None, &record));
             for reminder in [false, true] {
                 let notice = dashboard_only_notice_body(&record, reminder);
                 assert!(notice.contains("對外操作") && notice.contains("儀表板"));
@@ -1335,7 +1396,7 @@ mod tests {
                 .await.unwrap(), Err(DASHBOARD_ONLY_REFUSAL.to_string()));
             assert_eq!(broker.poll(&id).await.unwrap(), ApprovalStatus::Pending);
         }
-        assert!(!is_dashboard_only_record(&rec("mcp_call")));
+        assert!(!is_dashboard_only_record(None, &rec("mcp_call")));
     }
 
     #[test]

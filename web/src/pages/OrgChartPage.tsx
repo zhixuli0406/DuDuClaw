@@ -1,4 +1,5 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { canSelectAgent, useAgentGrantPresent } from '@/stores/callable-agents-store';
+import { useVisibleAgents, useAgentVisibilityUnrestricted } from '@/lib/data-scope';
 import { Link } from 'react-router';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -30,7 +31,10 @@ export function OrgChartPage() {
 function EmployeeOrgChart() {
   const intl = useIntl();
   const connection = useConnectionStore(s => s.state);
-  const [agents, setAgents] = useState<OrgChartAgent[]>([]);
+  const [directoryAgents, setAgents] = useState<OrgChartAgent[]>([]);
+  const visible = useVisibleAgents();
+  const unrestricted = useAgentVisibilityUnrestricted();
+  const agents = directoryAgents.filter(a => unrestricted || visible.some(v => v.name === a.name));
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown>(null);
   const [attempt, setAttempt] = useState(0);
@@ -76,8 +80,9 @@ function ManagedOrgChart() {
   // `error` was never destructured here (P05 Blocker, phase-4 audit): a failed
   // roster fetch fell through to the "還沒有 AI 員工？" empty state, telling the
   // user to hire someone when the real problem was the connection.
-  const { agents, fetchAgents, pauseAgent, resumeAgent, loading, loaded, error, clearError } =
+  const { fetchAgents, pauseAgent, resumeAgent, loading, loaded, error, clearError } =
     useAgentsStore();
+  const agents = useVisibleAgents(false);
   const visibleAgents = useVisibleAgents();
   const teamAgents = visibleAgents.filter(a => a.readOnly);
   const [selectedAgent, setSelectedAgent] = useState<AgentDetail | null>(null);
@@ -87,10 +92,20 @@ function ManagedOrgChart() {
     fetchAgents();
   }, [fetchAgents]);
 
+  const selectedAllowed = useAgentGrantPresent(selectedAgent?.name);
+  useEffect(() => {
+    if (selectedAgent && !selectedAllowed) {
+      setSelectedAgent(null);
+      clearPanel();
+      setSheetOpen(false);
+    }
+  }, [selectedAgent, selectedAllowed, clearPanel, setSheetOpen]);
+
   // Clear the right panel when leaving the page.
   useEffect(() => () => clearPanel(), [clearPanel]);
 
   const handleNodeClick = (agentName: string) => {
+    if (!canSelectAgent(agentName)) return;
     const agent = agents.find((a) => a.name === agentName) ?? null;
     setSelectedAgent(agent);
     if (agent) setSheetOpen(true); // mobile: open the bottom sheet
@@ -98,7 +113,7 @@ function ManagedOrgChart() {
 
   // Push the selected staff card into the shared right PropertiesPanel (§5.4 T6.3).
   useEffect(() => {
-    if (!selectedAgent) return;
+    if (!selectedAgent || !selectedAllowed) return;
     setPanel({
       title: selectedAgent.display_name,
       content: (
@@ -113,6 +128,7 @@ function ManagedOrgChart() {
             navigate(`/agents/${encodeURIComponent(selectedAgent.name)}/edit`);
           }}
           onPause={async () => {
+            if (!canSelectAgent(selectedAgent.name)) return;
             try {
               await pauseAgent(selectedAgent.name);
             } catch (e) {
@@ -124,6 +140,7 @@ function ManagedOrgChart() {
             setSelectedAgent((prev) => (prev ? { ...prev, status: 'paused' } : null));
           }}
           onResume={async () => {
+            if (!canSelectAgent(selectedAgent.name)) return;
             try {
               await resumeAgent(selectedAgent.name);
             } catch (e) {
@@ -137,7 +154,7 @@ function ManagedOrgChart() {
         />
       ),
     });
-  }, [selectedAgent, setPanel, clearPanel, navigate, pauseAgent, resumeAgent, intl, errorText]);
+  }, [selectedAgent, selectedAllowed, setPanel, clearPanel, navigate, pauseAgent, resumeAgent, intl, errorText]);
 
   return (
     <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">

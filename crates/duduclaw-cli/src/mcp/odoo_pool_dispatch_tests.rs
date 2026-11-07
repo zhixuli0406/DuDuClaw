@@ -530,3 +530,17 @@ fn odoo_numeric_parameters_accept_numbers_and_strings_and_reject_invalid_values(
         assert_eq!(odoo_decimal(&json!({"amount":value}), "amount", 1.0).unwrap(), 1.25);
     }
 }
+
+#[test]
+fn odoo_method_to_verb_distinguishes_buttons_from_other_methods() {
+    for method in ["action_confirm", "button_validate", "toggle_active", "action_archive"] {
+        assert_eq!(super::odoo::odoo_method_to_verb(method), "action", "{method}");
+        assert_eq!(classify_odoo_call("odoo_execute", &serde_json::json!({
+            "model": "sale.order", "method": method,
+        })), Some(("action", "sale.order".to_string())));
+    }
+    for (method, verb) in [("read", "read"), ("create", "create"), ("write", "write"),
+        ("unlink", "unlink"), ("custom_method", "execute")] {
+        assert_eq!(super::odoo::odoo_method_to_verb(method), verb, "{method}");
+    }
+}

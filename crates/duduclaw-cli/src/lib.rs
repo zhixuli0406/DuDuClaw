@@ -6538,14 +6538,17 @@ async fn cmd_hook_agent_file_guard(
     };
 
     // Claude Code PreToolUse envelope shapes:
-    //   Write / Edit / MultiEdit → tool_input.file_path
-    //   Bash                     → tool_input.command
+    //   Write / Edit / MultiEdit / Read → tool_input.file_path
+    //   Bash                            → tool_input.command
     let tool_name = envelope
         .get("tool_name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    if !matches!(tool_name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "Bash") {
+    // `Read` is in the installed matcher and judged by the credential /
+    // private-state read rule in `agent_file_guard_decision`; it must not be
+    // dropped here.
+    if !matches!(tool_name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "Read" | "Bash") {
         return Ok(());
     }
     let cwd = envelope
@@ -10528,6 +10531,14 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
         checks.push(("訂閱帳號政策風險".into(), CheckStatus::Warn, message));
     }
 
+    // Read-only check for the protected systemd service's runtime search path.
+    // Never invokes sudo or a runtime binary; root-only unit details get an
+    // actionable install command instead of turning doctor into a failure.
+    #[cfg(target_os = "linux")]
+    if std::path::Path::new("/etc/systemd/system/duduclaw-gateway.service").exists() {
+        checks.push(protected_service_runtime_check(&home));
+    }
+
     // Check 3: Claude Code CLI
     match duduclaw_core::which_claude() {
         Some(path) => {
@@ -10711,6 +10722,36 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     mcp_server_diagnostic(&home).await;
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn protected_service_runtime_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    let name = "受保護服務 AI CLI 路徑".to_string();
+    let configured = match service::protected_linux::runtime::configured(home) {
+        Ok(runtimes) => runtimes,
+        Err(error) => return (name, CheckStatus::Warn, format!("無法讀取 runtime 設定；請由管理者檢查：{error}")),
+    };
+    let mut missing = Vec::new();
+    for (provider, required) in configured {
+        let binaries = match service::protected_linux::runtime::binary_names(&provider) {
+            Ok(binaries) => binaries,
+            Err(error) => return (name, CheckStatus::Warn, format!("無法辨識 runtime {provider}；請由管理者檢查：{error}")),
+        };
+        let found = binaries.iter().any(|binary| {
+            ["/usr/sbin", "/usr/bin", "/sbin", "/bin"].iter().any(|dir| {
+                let path = Path::new(dir).join(binary);
+                std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            })
+        });
+        if !found && required { missing.push(format!("{provider} ({})", binaries.join("/"))); }
+    }
+    if missing.is_empty() {
+        (name, CheckStatus::Pass, "已設定的必要 AI CLI 位於服務系統 PATH；doctor 未執行 CLI 或檢查登入狀態。".into())
+    } else {
+        (name, CheckStatus::Warn, format!("服務帳號無法從 /usr/sbin:/usr/bin:/sbin:/bin 找到必要 CLI：{}。請管理員安裝到 /usr/bin；Claude 可執行 sudo -H npm install -g --prefix /usr @anthropic-ai/claude-code@<ver>。完整指引：docs/guides/linux-protected-service.md", missing.join(", ")))
+    }
 }
 
 /// Verbose Grok CLI runtime diagnostic for `duduclaw doctor`.
@@ -11204,6 +11245,9 @@ mod planned_scaffold_tests {
             soul_body: Some("Approved persona".into()),
         };
         let mut files = super::scaffold_agent_files(&scaffold).unwrap();
+        let config: toml::Table = std::str::from_utf8(&files["agent.toml"]).unwrap().parse().unwrap();
+        assert_eq!(config["evolution"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["evolution"]["gvu_enabled"].as_bool(), Some(true));
         assert!(!files.keys().any(|name| name.starts_with("SKILLS/")));
         for (name, content) in [("IDENTITY.md", "Approved identity"), ("USER.md", "User data"),
             ("INSTRUCTIONS.md", "Approved rules"), ("CONTRACT.toml", "[boundaries]\nmust_not = ['refund']\n")] {
@@ -15269,6 +15313,21 @@ mod credential_read_lane_tests {
             &duduclaw_core::HookCaller::Agent("tester".into())).unwrap();
         assert!(!decision.is_allowed());
     }
+
+    #[test]
+    fn native_read_cannot_read_installation_key_or_relay_state() {
+        let home = std::path::Path::new("/tmp/credential-read-lane-test");
+        for rel in ["state/installation.key", "state/mfa-relay.json"] {
+            let envelope = serde_json::json!({"tool_input":{"file_path":home.join(rel)}});
+            let decision = agent_file_guard_decision("Read", &envelope, home,
+                &duduclaw_core::HookCaller::Agent("tester".into())).unwrap();
+            assert!(!decision.is_allowed(), "{rel}");
+        }
+        let relative = serde_json::json!({"cwd": home.join("agents/tester"),
+            "tool_input":{"file_path":"../../state/installation.key"}});
+        assert!(!agent_file_guard_decision("Read", &relative, home,
+            &duduclaw_core::HookCaller::Agent("tester".into())).unwrap().is_allowed());
+    }
 }
 
 fn scaffold_agent_toml(s: &AgentScaffold) -> String {
@@ -15329,6 +15388,8 @@ allowed_channels = ["*"]
 permissions_enforced_since = "1.68.0"
 
 [evolution]
+enabled = true
+gvu_enabled = true
 skill_auto_activate = false
 skill_security_scan = true
 "#

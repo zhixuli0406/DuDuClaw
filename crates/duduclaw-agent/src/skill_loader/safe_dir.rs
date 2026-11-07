@@ -34,11 +34,33 @@ mod imp {
         { Err(io::Error::new(io::ErrorKind::Unsupported, "directory enumeration errno unavailable")) }
     }
 
+    #[cfg(target_os = "macos")]
+    fn macos_system_path(path: &Path) -> io::Result<std::borrow::Cow<'_, Path>> {
+        for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+            if let Ok(tail) = path.strip_prefix(alias) {
+                let metadata = std::fs::symlink_metadata(alias)?;
+                if metadata.file_type().is_symlink() && metadata.uid() == 0
+                    && Path::new("/").join(std::fs::read_link(alias)?) == Path::new(target) {
+                    return Ok(std::borrow::Cow::Owned(Path::new(target).join(tail)));
+                }
+                break;
+            }
+        }
+        Ok(std::borrow::Cow::Borrowed(path))
+    }
+
     impl SafeDir {
         pub fn open(path: &Path) -> io::Result<Self> {
             if !path.is_absolute() {
                 return Err(refused("absolute directory required"));
             }
+            // macOS exposes system directories through root-owned aliases.
+            // Resolve only that fixed prefix, never an untrusted layer or
+            // ancestor. The target and the entire suffix still use O_NOFOLLOW.
+            #[cfg(target_os = "macos")]
+            let system_path = macos_system_path(path)?;
+            #[cfg(target_os = "macos")]
+            let path = system_path.as_ref();
             let mut dir = Self(File::open("/")?);
             for component in path.components() {
                 match component {
@@ -195,7 +217,8 @@ mod imp {
     use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, UNICODE_STRING, ERROR_NO_MORE_FILES};
     use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle,
         GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION, FILE_ID_BOTH_DIR_INFO,
-        FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+        FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_READ_ATTRIBUTES};
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     // Every child access is a single-component NtCreateFile relative to an
@@ -263,7 +286,9 @@ mod imp {
             let mut handle = std::ptr::null_mut();
             let mut status_block = std::mem::MaybeUninit::<IO_STATUS_BLOCK>::zeroed();
             let status = unsafe { NtCreateFile(&mut handle,
-                if write { FILE_GENERIC_WRITE } else { FILE_GENERIC_READ },
+                // real_file validates the newly opened handle before returning it.
+                // FILE_GENERIC_WRITE alone does not permit querying its attributes.
+                if write { FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES } else { FILE_GENERIC_READ },
                 &attributes, status_block.as_mut_ptr(), std::ptr::null(), 0, 1,
                 disposition, FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
                     | if directory { FILE_DIRECTORY_FILE } else { FILE_NON_DIRECTORY_FILE },
@@ -362,6 +387,40 @@ pub use imp::SafeDir;
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_system_aliases_keep_the_suffix_nofollow() {
+        use std::os::unix::fs::MetadataExt;
+        // The check/readlink TOCTOU is harmless: the walk opens the fixed /private/... target from / with O_NOFOLLOW, never the alias.
+        for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp")] {
+            let actual = SafeDir::open(Path::new(alias)).unwrap().metadata().unwrap();
+            let expected = SafeDir::open(Path::new(target)).unwrap().metadata().unwrap();
+            assert_eq!((actual.dev(), actual.ino()), (expected.dev(), expected.ino()));
+        }
+        assert!(SafeDir::open(Path::new("/etc")).is_err());
+        let unknown_error = match SafeDir::open(Path::new("/variable-does-not-exist")) {
+            Ok(_) => panic!("unknown path unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert_eq!(unknown_error.kind(), io::ErrorKind::NotFound);
+        assert!(SafeDir::open(Path::new("/var/../tmp")).is_err());
+        assert!(SafeDir::open(Path::new("/tmp/..")).is_err());
+        // Exercise both temp-dir spellings without canonicalizing the fixture.
+        for parent in [std::env::temp_dir(), std::path::PathBuf::from("/tmp")] {
+            let temp = tempfile::tempdir_in(parent).unwrap();
+            let root = temp.path();
+            let dir = SafeDir::open(root).unwrap().mkdir_child("real", 0o700).unwrap();
+            dir.mkdir_child("nested", 0o700).unwrap();
+            dir.create_new("SKILL.md", 0o600).unwrap();
+            assert!(SafeDir::open(&root.join("real")).unwrap().read_file("SKILL.md").is_ok());
+            symlink("real", root.join("skills")).unwrap();
+            assert!(SafeDir::open(&root.join("skills")).is_err());
+            assert!(SafeDir::open(&root.join("skills/nested")).is_err());
+            symlink("real/SKILL.md", root.join("linked.md")).unwrap();
+            assert!(SafeDir::open(root).unwrap().read_file("linked.md").is_err());
+        }
+    }
+
     #[test]
     fn layer_roots_and_ancestors_refuse_symlinks() {
         let temp = tempfile::tempdir().unwrap();
@@ -394,6 +453,29 @@ mod tests {
 mod windows_tests {
     use super::*;
     use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn created_file_can_be_validated_written_and_reopened() {
+        use std::io::{Read, Write};
+        let temp = tempfile::tempdir().unwrap();
+        let root = SafeDir::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let dir = root.mkdir_child("skills", 0o700).unwrap();
+        let mut file = dir.create_new("SKILL.md", 0o600).unwrap();
+        assert!(file.metadata().unwrap().is_file());
+        file.write_all(b"operator content").unwrap();
+        drop(file);
+        assert_eq!(dir.create_new("SKILL.md", 0o600).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        let mut content = String::new();
+        dir.read_file("SKILL.md").unwrap().read_to_string(&mut content).unwrap();
+        assert_eq!(content, "operator content");
+        // Creating a hard link mutates directory metadata. Release the safe
+        // directory chain (which denies writers) before preparing this fixture.
+        drop(dir);
+        drop(root);
+        std::fs::hard_link(temp.path().join("skills/SKILL.md"), temp.path().join("alias")).unwrap();
+        let dir = SafeDir::open(&temp.path().join("skills").canonicalize().unwrap()).unwrap();
+        assert!(dir.read_file("SKILL.md").is_err());
+    }
 
     #[test]
     fn directory_handle_refuses_concurrent_writers_and_child_links() {

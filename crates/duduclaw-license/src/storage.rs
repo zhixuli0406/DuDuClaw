@@ -218,8 +218,38 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(parent_dir(path)?).map_err(storage_error)?;
     temporary.write_all(bytes).map_err(storage_error)?;
     temporary.as_file().sync_all().map_err(storage_error)?;
-    temporary.persist(path).map_err(storage_error)?;
+    persist_temporary(temporary, path)?;
     sync_parent(path)
+}
+
+fn persist_temporary(temporary: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    #[cfg(not(windows))]
+    temporary.persist(path).map_err(storage_error)?;
+    #[cfg(windows)]
+    {
+        // MoveFileExW can fail while a lock-free reader or scanner holds the
+        // destination. Keep the same flushed file and the caller's advisory
+        // lock; never delete/truncate the destination to force replacement.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut temporary = temporary;
+        loop {
+            match temporary.persist(path) {
+                Ok(_) => break,
+                Err(error) => {
+                    // ACCESS_DENIED, SHARING_VIOLATION, LOCK_VIOLATION. A real
+                    // ACL denial still fails closed when the deadline expires.
+                    if !matches!(error.error.raw_os_error(), Some(5 | 32 | 33))
+                        || std::time::Instant::now() >= deadline
+                    {
+                        return Err(storage_error(error));
+                    }
+                    temporary = error.file;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn sync_parent(path: &Path) -> Result<()> {
@@ -339,6 +369,43 @@ mod tests {
         let count = fs::read_dir(tmp.path()).unwrap().count();
         assert!(atomic_write(&occupied, b"cannot replace directory").is_err());
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), count);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_retries_until_a_windows_reader_releases_the_destination() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("license.json");
+        save_to(&fixture_license(), &path).unwrap();
+        // Deliberately omit FILE_SHARE_DELETE, as an external reader may do.
+        let reader = fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(&path).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(reader);
+        });
+        let mut replacement = fixture_license();
+        replacement.subscription_id = "replacement".into();
+        save_to(&replacement, &path).unwrap();
+        release.join().unwrap();
+        assert_eq!(load_from(&path).unwrap().subscription_id, "replacement");
+        assert_eq!(load_from(&path.with_file_name(BACKUP_LICENSE_FILENAME)).unwrap().subscription_id, "sub_storage_test");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistent_windows_sharing_denial_preserves_the_license_and_cleans_tempfiles() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("license.json");
+        save_to(&fixture_license(), &path).unwrap();
+        let reader = fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        let count = fs::read_dir(tmp.path()).unwrap().count();
+        assert!(atomic_write(&path, b"replacement").is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), count);
+        drop(reader);
     }
 
     #[test]
