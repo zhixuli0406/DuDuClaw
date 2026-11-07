@@ -3,8 +3,10 @@ use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
 use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord,
     EmployeeBinding, Lane, Principal, ResourceGrant}, ids::{EmployeeId, RunId, Sha256Digest}};
 use duduclaw_mcp_boundary::{bindings::BindingStore, tool_policy::{ResourceResolver, ToolPolicy, authorize}, RequestContext};
-use crate::isolation_connectors::{ConnectorCatalog, LiveConnectorSelectionPolicy, ProductConnectorAccount};
+use crate::isolation_connectors::{ConnectorCatalog, ConnectorKind, LiveConnectorSelectionPolicy, ProductConnectorAccount};
 use rusqlite::Connection;
+/// Catalog account id (production format) shared with the binding double.
+const ALICE_GOOGLE: &str = concat!("a11ce000", "00000000", "00000000", "00000001");
 struct FixtureAuthority;
 impl duduclaw_isolation::capability::LiveRequestVerifier for FixtureAuthority {
     fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> { Ok(()) }
@@ -14,7 +16,7 @@ impl LiveConnectorSelectionPolicy for FixtureSelection {
     fn supports(&self, tool: &str) -> bool { tool == "google_status" }
     fn candidates(&self, _: &RequestContext, _: &str, _: &str)
         -> Result<Vec<ProductConnectorAccount>, VerificationError> {
-        Ok(vec![ProductConnectorAccount::Personal { account: "alice-google".into(), owner: "alice".into() }])
+        Ok(vec![ProductConnectorAccount::Personal { account: ALICE_GOOGLE.into(), owner: "alice".into() }])
     }
 }
 fn text<const N: usize>(value: &str) -> Text<N> { Text::new(value.into()).unwrap() }
@@ -31,16 +33,16 @@ fn fixture() -> (Arc<Mutex<BindingStore>>, SelectedConnector, AuthorizedToolCall
     let mut store = BindingStore::new(Connection::open_in_memory().unwrap()).unwrap();
     store.register_principal(&principal).unwrap();
     store.create_employee(employee, &binding).unwrap();
-    store.register_connector("alice-google", &binding).unwrap();
+    store.register_connector(ALICE_GOOGLE, &binding).unwrap();
     let bindings = Arc::new(Mutex::new(store));
     let catalog = Arc::new(ConnectorCatalog::new(Connection::open_in_memory().unwrap()).unwrap());
-    catalog.register("alice-google", "google").unwrap();
+    catalog.register_fixture(ALICE_GOOGLE, "google", ConnectorKind::Personal, &binding).unwrap();
     let context = RequestContext::with_live_verifier(CapabilityRecord {
         id: CapabilityId(Sha256Digest([1; 32])), employee, run: RunId([3; 16]), task: None,
         principal, employee_binding: binding.clone(), lane: Lane::Standard,
         tools: List::new(vec![text("google_status")]).unwrap(),
         resources: List::new(vec![ResourceGrant::Employee { id: employee }, ResourceGrant::Connector {
-            account: text("alice-google"), binding }]).unwrap(),
+            account: text(ALICE_GOOGLE), binding }]).unwrap(),
         policy_revision: 1, gateway_epoch: [0; 16], issued_at: 1, not_before: 1, expires_at: u64::MAX,
         nonce: [0; 32], jti: [0; 16],
     }, Arc::new(FixtureAuthority));
@@ -62,7 +64,7 @@ impl AccountCredentialProvider for SpyProvider {
         -> Pin<Box<dyn Future<Output = Result<AccountCredential, VerificationError>> + Send + 'a>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(account, "alice-google");
+            assert_eq!(account, ALICE_GOOGLE);
             assert_eq!(provider, "google");
             tokio::task::yield_now().await;
             if let Some(bindings) = &self.revoke_during_acquire { bindings.lock().unwrap().revoke_connector(account).unwrap(); }
@@ -86,8 +88,8 @@ fn executor(provider: Arc<dyn AccountCredentialProvider>) -> ClientFixture {
 #[tokio::test]
 async fn isolated_native_connector_revocation_prevents_credential_acquisition() {
     let (bindings, selected, call) = fixture();
-    bindings.lock().unwrap().revoke_connector("alice-google").unwrap();
-    let provider = Arc::new(SpyProvider::new("alice-google"));
+    bindings.lock().unwrap().revoke_connector(ALICE_GOOGLE).unwrap();
+    let provider = Arc::new(SpyProvider::new(ALICE_GOOGLE));
     assert!(executor(provider.clone()).execute(selected, call).await.is_err());
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
 }
@@ -98,16 +100,16 @@ async fn isolated_native_connector_rechecks_after_await_and_returned_account() {
     assert!(executor(provider.clone()).execute(selected, call).await.is_err());
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     let (bindings, selected, call) = fixture();
-    let mut provider = SpyProvider::new("alice-google");
+    let mut provider = SpyProvider::new(ALICE_GOOGLE);
     provider.revoke_during_acquire = Some(bindings);
     assert!(executor(Arc::new(provider)).execute(selected, call).await.is_err());
 }
 #[tokio::test]
 async fn isolated_native_connector_status_is_account_specific_without_token_output() {
     let (_, selected, call) = fixture();
-    let provider = Arc::new(SpyProvider::new("alice-google"));
+    let provider = Arc::new(SpyProvider::new(ALICE_GOOGLE));
     let result = executor(provider).execute(selected, call).await.unwrap().to_string();
-    assert!(result.contains("alice-google"));
+    assert!(result.contains(ALICE_GOOGLE));
     assert!(!result.contains("fixture-secret-token"));
     assert!(result.contains("provider_verified"));
 }
@@ -122,7 +124,7 @@ async fn isolated_native_connector_every_http_hop_rechecks_binding_origin_and_ex
         }
         assert!(before_request("github", "https://api.github.com/").is_err());
         CREDENTIAL_EXPIRY.scope(1, async { assert!(before_request("google", "https://gmail.googleapis.com/").is_err()); }).await;
-        bindings.lock().unwrap().revoke_connector("alice-google").unwrap();
+        bindings.lock().unwrap().revoke_connector(ALICE_GOOGLE).unwrap();
         assert!(before_request("google", "https://gmail.googleapis.com/").is_err());
     }))).await;
     assert!(!active());
@@ -140,11 +142,11 @@ fn isolated_native_connector_support_is_exact_and_has_no_other_provider_fallback
 async fn isolated_native_connector_vault_is_exact_and_expires_closed() {
     let vault = AccountCredentialVault::default();
     assert!(vault.acquire("missing", "google").await.is_err());
-    vault.install(AccountCredential::new("alice-google".into(), "google".into(), "token".into(), 1).unwrap()).unwrap();
+    vault.install(AccountCredential::new(ALICE_GOOGLE.into(), "google".into(), "token".into(), 1).unwrap()).unwrap();
     let (_, selected, _) = fixture();
     assert!(credential(&selected, &vault).await.is_err());
-    assert!(vault.acquire("alice-google", "github").await.is_err());
-    assert!(vault.install(AccountCredential::new("alice-google".into(), "github".into(), "token".into(), u64::MAX).unwrap()).is_err());
+    assert!(vault.acquire(ALICE_GOOGLE, "github").await.is_err());
+    assert!(vault.install(AccountCredential::new(ALICE_GOOGLE.into(), "github".into(), "token".into(), u64::MAX).unwrap()).is_err());
 }
 
 #[test]
@@ -159,14 +161,14 @@ fn isolated_native_credential_rejects_json_escaping_and_non_bearer_alphabet() {
 async fn isolated_native_connector_disabled_or_invalid_integration_never_acquires_credential() {
     for config in ["[integrations]\ngoogle_workspace=false\n", "[integrations]\ngoogle_workspace='true'\n", "invalid ["] {
         let (_, selected, call) = fixture();
-        let provider = Arc::new(SpyProvider::new("alice-google"));
+        let provider = Arc::new(SpyProvider::new(ALICE_GOOGLE));
         let client = executor(provider.clone());
         std::fs::write(client.home.path().join("config.toml"), config).unwrap();
         assert!(client.execute(selected, call).await.is_err());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     }
     let (_, selected, call) = fixture();
-    let provider = Arc::new(SpyProvider::new("alice-google"));
+    let provider = Arc::new(SpyProvider::new(ALICE_GOOGLE));
     let client = executor(provider.clone());
     std::fs::remove_file(client.home.path().join("config.toml")).unwrap();
     assert!(client.execute(selected, call).await.is_err());
@@ -177,7 +179,7 @@ async fn isolated_native_connector_disabled_or_invalid_integration_never_acquire
 async fn isolated_native_connector_google_none_or_invalid_employee_never_acquires_credential() {
     for employee in ["[google]\nidentity='none'\n", "[google]\nidentity=12\n", "invalid ["] {
         let (_, selected, call) = fixture();
-        let provider = Arc::new(SpyProvider::new("alice-google"));
+        let provider = Arc::new(SpyProvider::new(ALICE_GOOGLE));
         let client = executor(provider.clone());
         std::fs::write(client.home.path().join("agents/employee-a/agent.toml"), employee).unwrap();
         assert!(client.execute(selected, call).await.is_err());
