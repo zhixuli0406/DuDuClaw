@@ -8,7 +8,7 @@ fn snapshot() -> duduclaw_auth::IsolationAuthoritySnapshot {
             user_id: "owner".into(), credential_epoch: 3, email: "owner@example.invalid".into(),
             role: duduclaw_auth::UserRole::Admin, agent_access: Default::default(),
             team_access: Default::default(), must_change_password: false, acl_generation: 7,
-        }) }
+        }), personal_owner: None, agent_member_count: 1 }
 }
 fn issue(home: &Path, current: &duduclaw_auth::IsolationAuthoritySnapshot, expiry: Option<u64>)
     -> Result<super::super::RuntimeAuthorization, VerificationError> {

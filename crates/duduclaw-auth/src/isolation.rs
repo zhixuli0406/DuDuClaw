@@ -57,6 +57,13 @@ pub struct IsolationAuthoritySnapshot {
     pub policy_epoch: u64,
     /// None is a background run. It never creates or impersonates a user.
     pub human: Option<UserContext>,
+    /// Owner recorded in the `isolation_personal_agents` mirror; None means
+    /// the agent has no Personal mirror row. Evidence only: callers compare it
+    /// with the confirmed employee lifecycle and never trust it alone.
+    pub personal_owner: Option<String>,
+    /// Number of users bound to the agent (any access level), read in the
+    /// same transaction as every other field.
+    pub agent_member_count: u32,
 }
 
 /// Read-only, including when the supplied connection was opened read-only.
@@ -74,6 +81,14 @@ pub fn read_isolation_authority(conn: &mut Connection, user_id: Option<&str>, ag
     let tenant_id = read_tenant(&tx)?;
     let acl_generation = crate::user_row::read_acl_generation(&tx)?;
     let policy_epoch = read_policy_epoch(&tx)?;
+    // A missing/unreadable mirror is unavailable, never "not Personal".
+    let personal_owner = crate::db::personal_agent_owner(&tx, agent)
+        .map_err(|_| "isolation authority unavailable".to_string())?;
+    let agent_member_count: i64 = tx.query_row(
+        "SELECT count(*) FROM user_agent_bindings WHERE agent_name=?1", [agent], |row| row.get(0))
+        .map_err(|_| "isolation authority unavailable".to_string())?;
+    let agent_member_count = u32::try_from(agent_member_count)
+        .map_err(|_| "isolation authority unavailable".to_string())?;
     let human = if let Some(user_id) = user_id {
         let (user, access) = crate::org::load_access_on(&tx, user_id)?
             .ok_or_else(|| "isolation principal denied".to_string())?;
@@ -84,7 +99,8 @@ pub fn read_isolation_authority(conn: &mut Connection, user_id: Option<&str>, ag
         Some(UserContext::from_live(&user, &access))
     } else { None };
     tx.finish().map_err(|_| "isolation authority unavailable".to_string())?;
-    Ok(IsolationAuthoritySnapshot { tenant_id, acl_generation, policy_epoch, human })
+    Ok(IsolationAuthoritySnapshot { tenant_id, acl_generation, policy_epoch, human,
+        personal_owner, agent_member_count })
 }
 
 impl UserDb {
