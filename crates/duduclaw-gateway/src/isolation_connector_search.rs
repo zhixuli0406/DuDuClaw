@@ -19,8 +19,7 @@ impl SearchConnectorProvider {
         if !matches!(account, ProductConnectorAccount::SharedHome { .. }) || account.account().is_empty() {
             return Err(VerificationError::Invalid);
         }
-        let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).no_proxy().retry(reqwest::retry::never())
-            .timeout(std::time::Duration::from_secs(10)).build().map_err(|_| VerificationError::Unavailable)?;
+        let http = search_http_client()?;
         Ok(Self { employee, account, http })
     }
     async fn run(&self, selected: SelectedConnector, call: AuthorizedToolCall) -> Result<Value, VerificationError> {
@@ -53,6 +52,10 @@ impl SearchConnectorProvider {
         Ok(json!({"content":[{"type":"text","text":result}]}))
     }
 }
+pub(crate) fn search_http_client() -> Result<reqwest::Client, VerificationError> {
+    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).no_proxy().retry(reqwest::retry::never())
+        .timeout(std::time::Duration::from_secs(10)).build().map_err(|_| VerificationError::Unavailable)
+}
 fn search_url(query: &str) -> Result<url::Url, VerificationError> {
     let mut url = url::Url::parse("https://html.duckduckgo.com/html/").map_err(|_| VerificationError::Invalid)?;
     url.query_pairs_mut().append_pair("q", query);
@@ -80,17 +83,24 @@ fn parse(mut input: SearchInput) -> Result<String, VerificationError> {
         .map_err(|_| VerificationError::Unavailable)?;
     if !outputs.is_empty() { return Err(VerificationError::Invalid); }
     let ParseResult::Complete { items } = response.result else { return Err(VerificationError::Unavailable); };
+    let result = format_search_items(items.as_slice())?;
+    verify_input(&input).map_err(|_| VerificationError::Unavailable)?;
+    Ok(result)
+}
+pub(crate) fn format_search_items(items: &[ParsedItem]) -> Result<String, VerificationError> {
     let mut lines = Vec::new();
-    for (index, item) in items.as_slice().iter().enumerate() {
+    // SearchHtml emits at most five snippets. Enforce the same output cap here
+    // instead of failing the whole search if a worker returns additional items.
+    for (index, item) in items.iter().take(5).enumerate() {
         let ParsedItem::Html { input_slot:0, query, value } = item else { return Err(VerificationError::Invalid); };
-        if query.as_str() != "search" || index >= 5 { return Err(VerificationError::Invalid); }
+        if query.as_str() != "search" { return Err(VerificationError::Invalid); }
         let value: Value = serde_json::from_str(value.as_str()).map_err(|_| VerificationError::Invalid)?;
         let text = value.as_str().ok_or(VerificationError::Invalid)?;
         lines.push(format!("{}. {}", index + 1, text));
     }
-    verify_input(&input).map_err(|_| VerificationError::Unavailable)?;
     Ok(if lines.is_empty() { "No results found.".into() } else { lines.join("\n\n") })
 }
+
 impl LiveConnectorSelectionPolicy for SearchConnectorProvider {
     fn supports(&self, tool: &str) -> bool { tool == "web_search" }
     fn candidates(&self, context: &RequestContext, tool: &str, provider: &str)

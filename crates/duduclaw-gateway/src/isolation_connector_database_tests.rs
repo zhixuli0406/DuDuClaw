@@ -179,3 +179,55 @@ async fn finite_sql_lowers_to_a_single_exact_granted_table_and_keeps_literals_bo
     let(selected,call)=fixture.call("db_query",json!({"source":"demo","sql":"SELECT * FROM customers","limit":1}));
     fixture.live.store(false,Ordering::SeqCst);assert!(fixture.provider.execute(selected,call).await.is_err());
 }
+
+#[tokio::test]
+async fn database_policy_select_only_and_redacted_errors() {
+    for employee_scope in [false, true] {
+        let fixture = Fixture::new(employee_scope);
+        // A missing SQLite file is a connection sentinel: policy failures must
+        // be Invalid, not the Unavailable returned by an attempted connection.
+        std::fs::remove_file(fixture.home.path().join("demo.sqlite")).unwrap();
+        for sql in [
+            "DELETE FROM customers", "UPDATE customers SET name='x'",
+            "INSERT INTO customers VALUES (2,'x')", "DROP TABLE customers",
+            "WITH x AS (DELETE FROM customers RETURNING *) SELECT * FROM x",
+            "WITH x AS (SELECT 1) UPDATE customers SET name='x'",
+            "SELECT * FROM customers; DELETE FROM customers",
+            "SELECT * FROM customers; SELECT * FROM customers",
+            "/* SELECT 1 */ DELETE FROM customers", "-- SELECT 1\nDELETE FROM customers",
+            "/* outer /* nested */ comment */ UPDATE customers SET name='x'",
+            "SELECT 1 /*! INTO OUTFILE '/tmp/never-write' */",
+            "SELECT * FROM customers /* unterminated",
+            "SELECT 1 /* outer /* inner */ ; DELETE FROM customers */",
+            "SELECT 1 /*M! INTO OUTFILE '/tmp/never-write' */",
+        ] {
+            let (selected, call) = fixture.call("db_query", json!({"source":"demo","sql":sql}));
+            assert!(matches!(fixture.provider.execute(selected, call).await,
+                Err(VerificationError::Invalid)), "scope={employee_scope}, sql={sql}");
+        }
+    }
+    let fixture = Fixture::new(true);
+    for sql in ["SELECT * FROM customers", "/* ordinary comment */ SELECT * FROM customers",
+        "WITH x AS (SELECT * FROM customers) SELECT * FROM x",
+        "SELECT 'DELETE; UPDATE /* not a comment */' FROM customers"] {
+        let (selected, call) = fixture.call("db_query", json!({"source":"demo","sql":sql}));
+        assert!(fixture.provider.execute(selected, call).await.is_ok(), "{sql}");
+    }
+    // Force a real query error containing secret-shaped text in an identifier.
+    let canary = "postgres://PRIVATE-USER:PRIVATE-PASSWORD@PRIVATE-HOST/PRIVATE-DSN";
+    let (selected, call) = fixture.call("db_query", json!({"source":"demo",
+        "sql":format!("SELECT * FROM \"{canary}\"")}));
+    let error = fixture.provider.execute(selected, call).await.unwrap_err();
+    assert!(matches!(error, VerificationError::Unavailable));
+    let returned = format!("{error} {error:?}");
+    for secret in [canary, "PRIVATE-USER", "PRIVATE-PASSWORD", "PRIVATE-HOST", "PRIVATE-DSN"] {
+        assert!(!returned.contains(secret));
+    }
+    // The same boundary also hides connection errors and the actual source URL.
+    let path = fixture.home.path().join("demo.sqlite");
+    std::fs::remove_file(&path).unwrap();
+    let (selected, call) = fixture.call("db_query", json!({"source":"demo","sql":"SELECT * FROM customers"}));
+    let error = fixture.provider.execute(selected, call).await.unwrap_err();
+    assert!(matches!(error, VerificationError::Unavailable));
+    assert!(!format!("{error} {error:?}").contains(path.to_str().unwrap()));
+}

@@ -138,3 +138,65 @@ fn home_sender_factory_never_substitutes_an_ambient_home(){
     assert!(factory.contains("create_googlechat_sender(\n            home_dir.to_path_buf()"));
     assert!(factory.contains("create_teams_sender(\n            home_dir.to_path_buf()"));
 }
+
+#[tokio::test]
+async fn channel_audience_refuses_unbound_recipient() {
+    let f = Fixture::new();
+    let provider = f.channels("123456789012345678");
+    for tool in ["send_message", "send_photo", "send_sticker"] {
+        for recipient in ["987654321098765432", "123456789012345678.evil", "*", ""] {
+            let args = json!({"channel":"discord","chat_id":recipient,"text":"never send",
+                "url":"https://example.invalid/photo","sticker_id":"sticker"});
+            assert!(SelectedConnector::select_with_policy(&f.context, tool, &args,
+                f.bindings.clone(), f.catalog.clone(), Some(provider.clone())).is_err());
+            // Bypass selection filtering with a fixture policy to exercise the
+            // executor's independent audience check, with live authority intact.
+            struct Unfiltered(Arc<ChannelConnectorProvider>);
+            impl LiveConnectorSelectionPolicy for Unfiltered {
+                fn supports(&self, tool: &str) -> bool { CHANNEL_TOOLS.contains(&tool) }
+                fn candidates(&self, context: &RequestContext, tool: &str, provider: &str)
+                    -> Result<Vec<ProductConnectorAccount>, VerificationError> {
+                    self.0.candidates(context, tool, provider)
+                }
+            }
+            let (selected, call) = f.call(Arc::new(Unfiltered(provider.clone())), tool, args);
+            assert!(matches!(provider.execute(selected, call).await, Err(VerificationError::BindingMismatch)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn computer_login_scoped_to_employee_credentials() {
+    use crate::isolation_connector_computer::ComputerConnectorProvider;
+    let f = Fixture::new();
+    let account = f.account("computer", "computer");
+    let store = |label: &str, agent: &str| crate::website_credentials::upsert(f.home.path(),
+        crate::website_credentials::Upsert { id:None, label:label.into(),
+            login_url:"https://example.invalid/login".into(), allowed_paths:vec![],
+            username:format!("{agent}-private-user"), password:format!("{agent}-PASSWORD-CANARY"),
+            allowed_agents:vec![agent.into()] }, "owner").unwrap();
+    let own = store("alice-login", "alice");
+    let other = store("bob-login", "bob");
+    let sessions = crate::computer_use_sessions::ComputerUseSessions::new(f.home.path().into());
+    // Even trusted boot input cannot attach Bob's credential to Alice.
+    assert!(matches!(ComputerConnectorProvider::new(f.home.path().into(), "alice".into(),
+        f.context.record().employee, vec![(account.clone(), other.id.clone())], sessions.clone()),
+        Err(VerificationError::BindingMismatch)));
+    let provider = Arc::new(ComputerConnectorProvider::new(f.home.path().into(), "alice".into(),
+        f.context.record().employee, vec![(account, own.id.clone())], sessions).unwrap());
+    let (selected, call) = f.call(provider.clone(), "computer_login", json!({"credential":"alice-login"}));
+    assert_eq!(selected.account(), "computer");
+    assert!(!call.arguments().to_string().contains("PASSWORD-CANARY"));
+    for credential in ["bob-login", other.id.as_str(), "alice-login/bob-login"] {
+        assert!(SelectedConnector::select_with_policy(&f.context, "computer_login",
+            &json!({"credential":credential,"connector_account":"computer"}),
+            f.bindings.clone(), f.catalog.clone(), Some(provider.clone())).is_err());
+    }
+    // Removing the employee grant after selection fences the use-time path
+    // before a browser session or decrypted credential is requested.
+    crate::website_credentials::upsert(f.home.path(), crate::website_credentials::Upsert {
+        id:Some(own.id), label:"alice-login".into(), login_url:"https://example.invalid/login".into(),
+        allowed_paths:vec![], username:"alice-private-user".into(), password:"alice-PASSWORD-CANARY".into(),
+        allowed_agents:vec!["bob".into()] }, "owner").unwrap();
+    assert!(provider.execute(selected, call).await.is_err());
+}

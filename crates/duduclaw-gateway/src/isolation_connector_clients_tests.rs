@@ -208,3 +208,71 @@ fn isolated_native_google_recipients_are_single_strings_not_silently_ignored_arr
         assert!(validate_google_recipients(&json!({(key):"one@example.org"})).is_ok());
     }
 }
+
+#[tokio::test]
+async fn search_output_bounded_and_no_redirect() {
+    use crate::isolation_connector_search::{format_search_items, search_http_client};
+    use duduclaw_isolation::worker::ParsedItem;
+    use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
+    let snippets: Vec<String> = (0..8).map(|index| format!("搜尋結果{index}：{}", "繁體中文🦀".repeat(100))).collect();
+    let items: Vec<_> = snippets.iter().map(|snippet| ParsedItem::Html { input_slot:0,
+        query:text("search"), value:text(&serde_json::to_string(snippet).unwrap()) }).collect();
+    let rendered = format_search_items(&items).unwrap();
+    // SearchHtml's documented cap is five results. Preserve complete Unicode
+    // snippets while discarding results past the cap, including their canaries.
+    assert_eq!(rendered, snippets.iter().take(5).enumerate()
+        .map(|(index, snippet)| format!("{}. {snippet}", index + 1)).collect::<Vec<_>>().join("\n\n"));
+    assert!(!rendered.contains("搜尋結果5"));
+    assert!(!rendered.contains('\u{fffd}'));
+    assert_eq!(format_search_items(&[]).unwrap(), "No results found.");
+    let invalid = ParsedItem::Html { input_slot:0, query:text("other"), value:text("\"private\"") };
+    assert!(format_search_items(&[invalid]).is_err());
+
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", origin.local_addr().unwrap());
+    let redirect = format!("http://localhost:{}/must-not-receive", destination.local_addr().unwrap().port());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = origin.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+            let mut buffer = [0;1024];
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0 && request.len() < 16_384);
+            request.extend_from_slice(&buffer[..count]);
+        }
+        socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {redirect}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    });
+    // This is the production search client's redirect policy, not a separately
+    // configured test client. No worker or external search endpoint is used.
+    let response = search_http_client().unwrap().get(&url).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    assert_eq!(response.url().as_str(), url);
+    assert!(!response.status().is_success());
+    server.await.unwrap();
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(100), destination.accept()).await.is_err());
+}
+
+#[tokio::test]
+async fn odoo_disallowed_operation_refused_before_auth() {
+    use crate::isolation_connector_odoo::OdooConnectorProvider;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("agents/employee-a")).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    std::fs::write(home.path().join("config.toml"), format!(
+        "[odoo]\nurl='http://{}'\ndb='demo'\nusername='shared'\napi_key_enc='unused-reference'\nfeatures_crm=true\n",
+        listener.local_addr().unwrap())).unwrap();
+    // Deliberately unusable secret: refusal must come from operation policy,
+    // not credential decoding or an authentication handshake.
+    std::fs::write(home.path().join("agents/employee-a/agent.toml"),
+        "[odoo]\nusername='alice'\napi_key_enc='invalid-secret-reference'\nallowed_models=['crm.lead']\nallowed_actions=['read','search']\n").unwrap();
+    let provider = OdooConnectorProvider::new(home.path().into(), "employee-a".into(), EmployeeId([2;16]),
+        ProductConnectorAccount::Personal { account:"alice-odoo".into(), owner:"alice".into() }).unwrap();
+    assert!(provider.check_operation(Some(("search", "crm.lead".into()))).is_ok());
+    for (verb, model) in [("write", "crm.lead"), ("create", "crm.lead"), ("unlink", "crm.lead"),
+        ("read", "res.partner"), ("search", "res.users")] {
+        assert!(matches!(provider.check_operation(Some((verb, model.into()))), Err(VerificationError::BindingMismatch)),
+            "{verb} {model}");
+    }
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await.is_err());
+}
