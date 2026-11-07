@@ -123,7 +123,7 @@ mod isolation_tenant_tests {
             proposal_id:duduclaw_migration::ids::RequestId([1;16]),revision:1 },
             proposal_digest:Sha256Digest([2;32]) }, label:"sales".into(),
             employee:duduclaw_isolation::ids::EmployeeId([employee;16]),uid:70001,
-            bytes:67108864,inodes:4096,disabled }
+            bytes:67108864,inodes:4096,disabled,principal_binding:None }
     }
     #[test]
     fn isolation_tenant_pin_refuses_transfer_backfill_and_resurrection() {

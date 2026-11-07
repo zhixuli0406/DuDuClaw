@@ -96,7 +96,10 @@ fn fields_for(category: ConfirmationCategory) -> &'static [&'static str] {
         User => &["name", "display_name", "role"],
         Role => &["name", "permissions"],
         Department => &["name", "display_name"],
-        Employee => &["employee_id", "runtime", "model", "capabilities", "permissions", "account_pool", "disk_bytes", "settings"],
+        // binding_kind/owner_id/tenant_id: immutable principal binding, parsed
+        // and strictly validated by allocation::specification (v1.81).
+        Employee => &["employee_id", "runtime", "model", "capabilities", "permissions", "account_pool", "disk_bytes", "settings",
+            "binding_kind", "owner_id", "tenant_id"],
         EmployeeInstructions => &["employee_id", "instruction_kind", "text"],
         UserAgentBinding => &["employee_id", "owner_id", "binding_kind"],
         ChannelBinding => &["employee_id", "channel", "binding"],
