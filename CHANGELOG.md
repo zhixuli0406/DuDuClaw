@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.80.1] - 2026-11-07 — macOS／Windows 下載版修正
+
 ### Fixed
 
 - macOS 與 Windows 下載版現在已內建 OpenSSL，不需另外安裝任何元件即可使用。
