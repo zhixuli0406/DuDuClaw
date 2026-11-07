@@ -601,6 +601,12 @@ pub(crate) fn validate_config_table(table: &toml::Table) -> Result<(), String> {
     if let Some(err) = db.errors.first() {
         return Err(format!("[db_sources.{}]: {}", err.name, err.message));
     }
+    // RM-039: the gate falls back to the defaults on an invalid section (fail
+    // closed), so a typo would silently re-enable categories the admin
+    // unticked — refuse it at write time instead.
+    if table.contains_key(crate::memory_privacy::SECTION) {
+        crate::memory_privacy::MemoryPrivacyConfig::from_table(table)?;
+    }
     Ok(())
 }
 
@@ -1393,6 +1399,24 @@ mod tests {
         let bad="[people]\nbound_history_privacy='false'".parse::<toml::Table>().unwrap();
         assert!(validate_config_table(&bad).is_err());
         assert!(RAW_CONFIG_SENSITIVE_KEYS.contains(&"people.bound_history_privacy"));
+    }
+
+    #[test]
+    fn memory_privacy_section_is_validated_on_write() {
+        let ok = "[memory_privacy]\nexcluded_categories = [\"health\", \"salary\"]\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        assert!(validate_config_table(&ok).is_ok());
+        let unknown = "[memory_privacy]\nexcluded_categories = [\"religion\"]\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        let e = validate_config_table(&unknown).unwrap_err();
+        assert!(e.contains("memory_privacy") && e.contains("religion"), "{e}");
+        let custom = "[memory_privacy]\nexcluded_categories = [\"religion\"]\n\
+                      [memory_privacy.custom_keywords]\nreligion = [\"宗教\"]\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        assert!(validate_config_table(&custom).is_ok());
     }
 
 

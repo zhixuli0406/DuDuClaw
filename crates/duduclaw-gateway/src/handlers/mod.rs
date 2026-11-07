@@ -96,6 +96,7 @@ mod channels_hot;
 mod accounts_basic;
 mod memory_rpc;
 mod memory_history_rpc;
+pub(crate) mod my_memory_rpc;
 mod wiki_rpc;
 mod shared_wiki_rpc;
 pub(crate) use shared_wiki_rpc::SharedWikiReader;
@@ -584,6 +585,19 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return boxed_frame(|| self.handle_company(method, params, ctx)).await;
+        }
+
+        // RM-039 "my memory" is gateway-owned self-service: an extension must
+        // never answer it, and every method has an explicit role entry. The
+        // handler scopes every read and delete to the caller's own subjects.
+        if method.starts_with("me.memory.") {
+            let Some(role) = my_memory_rpc::minimum_role(method) else {
+                return WsFrame::error_response("", "不支援此操作。");
+            };
+            if let Err(e) = acl::require_role(ctx, role) {
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.handle_my_memory_rpc(method, params, ctx)).await;
         }
 
         // Invitations are gateway-owned authentication methods. An extension

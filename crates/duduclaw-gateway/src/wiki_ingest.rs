@@ -698,11 +698,26 @@ pub fn extract_local_facts(user_text: &str, _assistant_reply: &str) -> Vec<Disti
 /// Used when `IngestTier::Cloud` — the caller sends this through the utility
 /// dispatch and parses the response with [`parse_cloud_ingest_response`].
 pub fn build_cloud_ingest_prompt(user_text: &str, assistant_reply: &str) -> String {
+    build_cloud_ingest_prompt_with_privacy(user_text, assistant_reply, None)
+}
+
+/// [`build_cloud_ingest_prompt`] plus the RM-039 privacy instruction
+/// (`crate::memory_privacy::prompt_line`). `None` yields exactly the plain
+/// prompt. The instruction is defence in depth only — `persist_facts` filters
+/// deterministically whatever the model returns.
+pub fn build_cloud_ingest_prompt_with_privacy(
+    user_text: &str,
+    assistant_reply: &str,
+    privacy_line: Option<&str>,
+) -> String {
     // Case-insensitive XML tag escape to prevent prompt injection
     // Handles Unicode case folding; see `crate::xml_fence`.
     use crate::xml_fence::escape_xml_tag;
     let safe_user = escape_xml_tag(user_text, "user");
     let safe_assistant = escape_xml_tag(assistant_reply, "assistant");
+    let privacy = privacy_line
+        .map(|l| format!("{l}\n\n"))
+        .unwrap_or_default();
 
     format!(
         "You are a fact extraction engine. Analyze this conversation and extract \
@@ -713,7 +728,7 @@ pub fn build_cloud_ingest_prompt(user_text: &str, assistant_reply: &str) -> Stri
          Extract only knowledge that stays true beyond this conversation \
          (preferences, decisions, domain rules, entity attributes). Skip \
          small talk, one-off details, and anything already restated verbatim.\n\n\
-         For each fact:\n\
+         {privacy}For each fact:\n\
          - content (required): one standalone sentence stating the fact.\n\
          - subject / predicate / object (optional): include ALL THREE only when \
          the fact decomposes cleanly into a triple, e.g. subject \"user:alice\", \
@@ -880,9 +895,22 @@ impl KnowledgeFields {
 /// [`build_cloud_ingest_prompt`]: the plain prompt stays byte-identical for
 /// the ordinary tier so its prompt cache and its tests are untouched.
 pub fn build_cloud_ingest_prompt_with_knowledge(user_text: &str, assistant_reply: &str) -> String {
+    build_cloud_ingest_prompt_with_knowledge_and_privacy(user_text, assistant_reply, None)
+}
+
+/// [`build_cloud_ingest_prompt_with_knowledge`] plus the RM-039 privacy
+/// instruction in Job 1; `None` yields exactly the plain prompt.
+pub fn build_cloud_ingest_prompt_with_knowledge_and_privacy(
+    user_text: &str,
+    assistant_reply: &str,
+    privacy_line: Option<&str>,
+) -> String {
     use crate::xml_fence::escape_xml_tag;
     let safe_user = escape_xml_tag(user_text, "user");
     let safe_assistant = escape_xml_tag(assistant_reply, "assistant");
+    let privacy = privacy_line
+        .map(|l| format!("{l}\n"))
+        .unwrap_or_default();
 
     format!(
         "You are a fact extraction and document classification engine. \
@@ -894,7 +922,7 @@ pub fn build_cloud_ingest_prompt_with_knowledge(user_text: &str, assistant_reply
          Extract only knowledge that stays true beyond this conversation \
          (preferences, decisions, domain rules, entity attributes). Skip \
          small talk, one-off details, and anything already restated verbatim.\n\
-         For each fact:\n\
+         {privacy}For each fact:\n\
          - content (required): one standalone sentence stating the fact.\n\
          - subject / predicate / object (optional): include ALL THREE only when \
          the fact decomposes cleanly into a triple. Reuse stable subject and \
@@ -1062,7 +1090,12 @@ async fn run_knowledge_branch(
     let response = match utility_override {
         Some(r) => r,
         None => {
-            let prompt = build_cloud_ingest_prompt_with_knowledge(user_text, assistant_reply);
+            let privacy = crate::memory_privacy::prompt_line(home_dir);
+            let prompt = build_cloud_ingest_prompt_with_knowledge_and_privacy(
+                user_text,
+                assistant_reply,
+                privacy.as_deref(),
+            );
             let agent_dir = home_dir.join("agents").join(agent_id);
             crate::runtime_dispatch::run_utility_prompt(
                 home_dir,
@@ -1686,7 +1719,12 @@ async fn run_ingest_inner(
         }
         IngestTier::Cloud => {
             info!(agent = agent_id, "Conversation distill: cloud extraction");
-            let prompt = build_cloud_ingest_prompt(user_text, assistant_reply);
+            let privacy = crate::memory_privacy::prompt_line(home_dir);
+            let prompt = build_cloud_ingest_prompt_with_privacy(
+                user_text,
+                assistant_reply,
+                privacy.as_deref(),
+            );
 
             // Utility dispatch (RFC-25 N2): this agent's `[runtime] provider` +
             // `[model] utility`, falling back to global config then Claude.
@@ -1788,6 +1826,39 @@ pub(crate) async fn existing_fact_content(
     }
 }
 
+/// RM-039: drop distilled facts that fall in an excluded privacy category or
+/// repeat a fact its subject deleted (`crate::memory_privacy`). Only counts
+/// and category names are logged.
+fn filter_private_facts(
+    home_dir: &Path,
+    agent_id: &str,
+    facts: Vec<DistilledFact>,
+) -> Vec<DistilledFact> {
+    let gate = crate::memory_privacy::PrivacyGate::for_home(home_dir);
+    let mut report = crate::memory_privacy::FilterReport::default();
+    let kept: Vec<DistilledFact> = facts
+        .into_iter()
+        .filter(|f| {
+            let (subject, predicate, object) = match f.triple() {
+                Some((s, p, o)) => (Some(s), Some(p), Some(o)),
+                None => (
+                    f.subject.as_deref(),
+                    f.predicate.as_deref(),
+                    f.object.as_deref(),
+                ),
+            };
+            report.record(gate.check(&crate::memory_privacy::FactParts {
+                content: &f.content,
+                subject,
+                predicate,
+                object,
+            }))
+        })
+        .collect();
+    report.log(agent_id, "conversation_distill");
+    kept
+}
+
 /// Persist facts into the agent's memory database on a blocking thread.
 ///
 /// `SqliteMemoryEngine` is `!Send` (rusqlite), so the engine is opened and
@@ -1811,6 +1882,16 @@ async fn persist_facts(
         );
         return;
     };
+    // RM-039: facts about an excluded personal topic (health, family, …) or
+    // a fact its subject deleted from "my memory" never reach the store.
+    let facts = filter_private_facts(home_dir, agent_id, facts);
+    if facts.is_empty() {
+        info!(
+            agent = agent_id,
+            "Conversation distill: nothing to store (memory privacy)"
+        );
+        return;
+    }
     let agent = agent_id.to_string();
     let home = home_dir.to_path_buf();
     let db = memory_db.to_path_buf();
@@ -3095,6 +3176,10 @@ pub async fn file_migration_held_claims(
 #[cfg(test)]
 #[path = "wiki_ingest_p2b_tests.rs"]
 mod p2b_tests;
+
+#[cfg(test)]
+#[path = "wiki_ingest_privacy_tests.rs"]
+mod privacy_tests;
 
 #[cfg(test)]
 mod tests {

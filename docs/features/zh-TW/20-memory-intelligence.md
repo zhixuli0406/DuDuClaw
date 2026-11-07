@@ -154,6 +154,34 @@ D1 讓你能*撤銷*一個投毒來源；D2 則在源頭就攔下大部分毒物
 
 **排序端信任。**`origin_trust` 現在會參與取回排序（權重 `w_trust`，預設 0.10）：每個候選的分數會乘上 `(1 − w_trust) + w_trust · origin_trust`，讓未經驗證的頻道蒸餾事實（trust 0.3）無法勝過策展過的事實（trust 1.0）。在 HippoRAG-lite graph 中，一個三元組的邊會依其 `origin_trust` 加權，縮小低信任事實的 Personalized-PageRank 質量，直接抑制「單一投毒三元組被 PPR 放大兩跳」這條路徑。舊資料列（trust 1.0）的排序與 D2 之前逐位元組相同。
 
+### 自動記憶不保存的個人話題（RM-039）
+
+管理員排除的個人話題，自動記憶不會保存相關事實。涵蓋範圍：對話蒸餾、個人偏好（「叫我…」「我喜歡…」）、數位足跡蒸餾、Reflexion 規則彙整，以及 persona-induction 的 `key_facts` 橋接。內建四個類別，預設全部排除，新安裝與尚未設定 `[memory_privacy]` 的既有安裝都適用：`health`（健康）、`family`（家庭）、`personal_finance`（個人財務）、`salary`（薪資）。
+
+```toml
+[memory_privacy]
+excluded_categories = ["health", "family", "personal_finance", "salary"]  # 設為 [] 即關閉過濾
+
+[memory_privacy.custom_keywords]
+health = ["復健"]                    # 替內建類別加關鍵字
+legal_dispute = ["訴訟", "lawsuit"]  # 新類別；要列入 excluded_categories 才會生效
+```
+
+- **怎麼判斷。** 每個類別有固定的繁體中文與英文關鍵字清單，分別比對事實的內容、主詞、述詞、受詞，每一項各自檢查。英文只比對完整單字（`salary` 會比中 `monthly_salary`，不會比中 `salaryman`）。中文都是兩字以上的詞，例如 `生病`，不會只放 `病`，因為 `病毒` 是電腦病毒。判斷不經過模型。擷取用的提示詞也會要求模型不要擷取這些話題，但這只是第二層；關鍵字比對會套用在模型回傳的所有內容上。
+- **取捨。** 比對的是話題，不是意圖，所以提到這些話題的工作內容也會被略過，例如「健康檢查報告模板放在共用槽」或「銀行客戶推出新的貸款方案」。一般事實如「客戶要求下週交貨」不受影響。
+- **明確要求仍會保存。** 同仁明確請 AI 員工記住的內容（`memory_store`、`user_profile_record`）不論話題都會保存，並在該筆資料的 metadata 標記 `"explicit": true`。
+- **失敗時從嚴。** `config.toml` 讀不到、解析失敗或這個區段無效時，一律套用四個預設類別並記錄警告；設定壞掉只會讓過濾更嚴格，不會更寬鬆。從 Dashboard 儲存（`system.update_config`、進階設定編輯器）時，未知的類別名稱會被拒絕，除非已在 `custom_keywords` 定義。
+- **日誌**只記錄筆數與類別名稱，不記錄事實內容。
+- **不在範圍內。** 自動歸檔的知識頁（下方 WP5c 的文件）本身不過濾，但跟著擷取出來的事實會過濾。這項功能上線前已存下的記憶不會被刪除。
+
+**「我的記憶」（目前只有 RPC，Dashboard 頁面之後再做）。** 任何已登入的 Dashboard 使用者都能呼叫 `me.memory.list` 與 `me.memory.forget`。兩者都只看得到主詞是呼叫者本人的事實，橫跨所有 AI 員工：
+
+- `user:<Dashboard 使用者 id>`
+- 呼叫者的 WebChat 身分
+- 每個**已驗證**綁定的通道身分（`user:<通道使用者 id>`、`user:<通道>:<通道使用者 id>`）
+
+這些主詞由伺服器解析，用戶端送什麼都無法擴大範圍。不屬於呼叫者的 id，回覆和不存在的 id 完全相同。`me.memory.forget` 會用和 `memory.forget` 相同的方式封存該筆資料，寫入 `memory_self_forgotten` 安全稽核事件（只記 id），並把這筆事實的主詞、述詞、值的單向摘要寫入 `memory_privacy_forgotten.jsonl`。有了這個摘要，自動記憶就不會再存回同一筆事實；換了新的值（例如新的稱呼）仍會學到。限制：沒有人員主詞的事實（一般對話事實、明確 `memory_store` 的筆記）不會列出；刪除只移除目前這筆，被它取代的舊版本仍留在該事實的歷史紀錄中。
+
 ### 取代時的可信度檢查（v1.67.1）
 
 v1.67.1 之前，同一個 `(agent, subject, predicate)` 的新事實一定會取代目前的事實，不管來源。從聊天對話萃取的事實（可信度 0.3）會蓋掉同一 subject 與 predicate 的現有事實，不論它的可信度，例如 AI 員工自己推得的事實或沒有記錄來源的舊資料（0.6），鍵值相同時也包括匯入的事實（0.7）。操作者核准過的事實（1.0）從 v1.67.1 起才有，由下方的審核核准寫入，並受這項檢查保護。現在 `store_temporal` 在取代之前會先比較可信度（`duduclaw-memory/src/supersession_guard.rs`）：

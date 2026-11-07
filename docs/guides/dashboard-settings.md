@@ -172,6 +172,16 @@ Global background tasks without an assigned employee (such as employee selection
 
 `[general] log_level` (Settings → Advanced → Security and records → Log Level) applies as soon as it is saved, unless the environment variable `RUST_LOG` is set, in which case the save reports a restart. Saving the account rotation strategy or the rate-limit cooldown clears the rotation cache, so the next call uses the new value (before, the change could lag by up to 30 minutes).
 
+## Settings → Advanced → Security and records → Memory: personal topics
+
+| Control | Key | Takes effect |
+|---|---|---|
+| Personal topics automatic memory never keeps → Health and medical / Family and marriage / Personal finances / Salary and bonuses | `[memory_privacy] excluded_categories` (`health`, `family`, `personal_finance`, `salary`) | Immediately (read per write; the next message uses it) |
+
+All four switches are on by default, including on existing installs whose `config.toml` has no `[memory_privacy]` section. A ticked topic is never stored by automatic memory: conversation distillation, profile traits, footprint distillation, Reflexion rules and the persona-induction bridge. When a colleague explicitly asks an AI employee to remember something, it is stored anyway. Matching is keyword-based, so work content that names a topic can be skipped too (for example a "health check report template"). Saving requires admin access. Toggling the switches keeps any custom categories and keywords.
+
+Custom categories and extra keywords are set in the advanced config editor under `[memory_privacy.custom_keywords]` (for example `legal_dispute = ["訴訟", "lawsuit"]`), then listed in `excluded_categories`. An unknown category name is refused on save. If `config.toml` cannot be read or the section is invalid, the gateway applies the four defaults and logs a warning; `system.config` then reports `memory_privacy.load_state = "failed_closed"`. Details and the "my memory" RPCs: [Memory Intelligence](../features/20-memory-intelligence.md#personal-topics-automatic-memory-never-keeps-rm-039).
+
 ## Channels
 
 - Group "mention only" (`mention_only`, per group): since v1.76 a LINE group with it on answers only messages that call an AI employee by `@` (or ask for the `@` list) and the one message a called employee is waiting for; before, it silenced the group entirely. The shared Telegram bot also accepts employee mentions. See [Calling AI staff with `@`](../features/62-calling-ai-staff.md).

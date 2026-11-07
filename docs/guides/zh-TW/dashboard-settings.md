@@ -172,6 +172,16 @@ npm 未安裝或安裝失敗時，提示會提供完整的手動指令與複製�
 
 `[general] log_level`（設定 → 進階 → 安全與紀錄 → 日誌等級）存檔後立即套用；只有在環境變數 `RUST_LOG` 已設定時無法套用，這時回報需要重啟。帳號輪替策略與限流冷卻時間存檔後會清掉輪替快取，下一次呼叫就用新設定（之前最多延遲 30 分鐘）。
 
+## 設定 → 進階 → 安全與紀錄 → 記憶：個人話題
+
+| 控制項 | 設定鍵 | 生效時機 |
+|---|---|---|
+| 自動記憶不保存的個人話題 → 健康與醫療／家庭與婚姻／個人財務／薪資與獎金 | `[memory_privacy] excluded_categories`（`health`、`family`、`personal_finance`、`salary`） | 立即（每次寫入時讀取，下一則訊息就套用） |
+
+四個開關預設全開，`config.toml` 沒有 `[memory_privacy]` 區段的既有安裝也一樣。勾選的話題，自動記憶一律不保存，包括對話蒸餾、個人偏好、數位足跡蒸餾、Reflexion 規則與 persona-induction 橋接。同仁明確要求 AI 員工記住的內容仍會保存。比對依關鍵字進行，所以提到這些話題的工作內容也可能被略過（例如「健康檢查報告模板」）。儲存需要管理員權限。切換開關時，既有的自訂類別與關鍵字會保留。
+
+自訂類別與額外關鍵字在進階設定編輯器的 `[memory_privacy.custom_keywords]` 設定（例如 `legal_dispute = ["訴訟", "lawsuit"]`），再列入 `excluded_categories`。未知的類別名稱在儲存時會被拒絕。`config.toml` 讀不到或區段無效時，閘道會套用四個預設類別並記錄警告，`system.config` 會回報 `memory_privacy.load_state = "failed_closed"`。細節與「我的記憶」RPC 見[記憶智慧](../../features/zh-TW/20-memory-intelligence.md)中的「自動記憶不保存的個人話題」一節。
+
 ## 通道管理
 
 - 群組「只回提及」（`mention_only`，每個群組各自設定）：v1.76 起，LINE 群組開啟後只回應用 `@` 叫 AI 員工（或要 @ 名單）的訊息，以及被點名員工正在等的那一則；以前開了會整個群組沒有回應。Telegram 共用 bot 也接受員工名字。見[用 @ 呼叫 AI 員工](../../features/zh-TW/62-calling-ai-staff.md)。

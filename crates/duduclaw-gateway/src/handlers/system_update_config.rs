@@ -418,6 +418,70 @@ impl MethodHandler {
             }
         }
 
+        // ── RM-039 [memory_privacy] (automatic-memory topic exclusions) ──
+        // `{"memory_privacy": {"excluded_categories": [...], "custom_keywords":
+        // {...}}}`. Each key given replaces that key; a key left out keeps its
+        // current value (so toggling categories never wipes custom keywords).
+        // Validated with the same rules as the raw editor (unknown category ⇒
+        // refused). Read per write by every automatic memory writer, so it
+        // applies on the next turn — no restart.
+        if let Some(v) = params.get("memory_privacy") {
+            let Some(obj) = v.as_object() else {
+                return WsFrame::error_response("", "[memory_privacy] 必須是物件");
+            };
+            if let Some(k) = obj
+                .keys()
+                .find(|k| !matches!(k.as_str(), "excluded_categories" | "custom_keywords"))
+            {
+                return WsFrame::error_response("", &format!("[memory_privacy] 不支援的欄位：{k}"));
+            }
+            // Current section as written (an invalid one starts from defaults).
+            let mut cfg = crate::memory_privacy::MemoryPrivacyConfig::from_table(&table)
+                .unwrap_or_default();
+            if let Some(ex) = obj.get("excluded_categories") {
+                match serde_json::from_value::<Vec<String>>(ex.clone()) {
+                    Ok(list) => cfg.excluded_categories = list,
+                    Err(_) => {
+                        return WsFrame::error_response(
+                            "",
+                            "[memory_privacy] excluded_categories 必須是字串陣列",
+                        )
+                    }
+                }
+            }
+            if let Some(ck) = obj.get("custom_keywords") {
+                match serde_json::from_value::<std::collections::BTreeMap<String, Vec<String>>>(
+                    ck.clone(),
+                ) {
+                    Ok(map) => cfg.custom_keywords = map,
+                    Err(_) => {
+                        return WsFrame::error_response(
+                            "",
+                            "[memory_privacy] custom_keywords 必須是「類別 → 字串陣列」的物件",
+                        )
+                    }
+                }
+            }
+            if let Err(e) = cfg.validate() {
+                return WsFrame::error_response("", &format!("[memory_privacy] {e}"));
+            }
+            match toml::Value::try_from(&cfg) {
+                Ok(section) => {
+                    table.insert(crate::memory_privacy::SECTION.into(), section);
+                    changes.push(format!(
+                        "memory_privacy.excluded_categories = [{}]",
+                        cfg.excluded_categories.join(", ")
+                    ));
+                }
+                Err(e) => {
+                    return WsFrame::error_response(
+                        "",
+                        &format!("[memory_privacy] 無法寫入設定：{e}"),
+                    )
+                }
+            }
+        }
+
         // ── S20 [miniapp] enabled (Telegram Mini App approval screen) ──
         // Until 2026-09 `[miniapp] enabled` had no dashboard surface at all, so
         // the feature was only reachable by hand-editing `config.toml`. The

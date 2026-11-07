@@ -167,6 +167,8 @@ export function SystemTab({ section = 'all' }: { section?: 'all' | 'system' | 's
   const [originDraft, setOriginDraft] = useState('');
   // [memory] novelty_gate — B1 write-time memory dedup gate (default: on).
   const [noveltyGate, setNoveltyGate] = useState(true);
+  // RM-039 [memory_privacy] excluded_categories (default: all four built-ins).
+  const [privacyExcluded, setPrivacyExcluded] = useState<string[]>([...MEMORY_PRIVACY_BUILTINS]);
   // S20: `[miniapp] enabled` — the Telegram Mini App approval screen. Default
   // off; before 2026-09 it had no dashboard surface at all.
   const [miniappEnabled, setMiniappEnabled] = useState(false);
@@ -245,6 +247,9 @@ export function SystemTab({ section = 'all' }: { section?: 'all' | 'system' | 's
       setOrigins(Array.isArray(ao) ? (ao.filter((v) => typeof v === 'string') as string[]) : []);
       // novelty_gate_enabled comes back structured too (not parsed from TOML).
       setNoveltyGate(res.novelty_gate_enabled ?? true);
+      // RM-039: an older gateway omits memory_privacy ⇒ the gateway defaults.
+      const privacy = canonicalPrivacy(res.memory_privacy?.excluded_categories ?? [...MEMORY_PRIVACY_BUILTINS]);
+      setPrivacyExcluded(privacy);
       // miniapp_enabled likewise; an older gateway omits it ⇒ off (the
       // same fail-closed default `miniapp::enabled` uses).
       setMiniappEnabled(res.miniapp_enabled ?? false);
@@ -278,6 +283,7 @@ export function SystemTab({ section = 'all' }: { section?: 'all' | 'system' | 's
         vaultMount: m(/vault_mount\s*=\s*"([^"]*)"/) ?? '',
         origins: Array.isArray(ao) ? (ao.filter((v) => typeof v === 'string') as string[]) : [],
         noveltyGate: res.novelty_gate_enabled ?? true,
+        privacyExcluded: privacy,
         miniappEnabled: res.miniapp_enabled ?? false,
         dailyDigest: res.daily_digest_enabled ?? false,
         dailyDigestAt: res.daily_digest_at ?? '09:00',
@@ -333,7 +339,7 @@ export function SystemTab({ section = 'all' }: { section?: 'all' | 'system' | 's
       name: name.trim(), mdnsAdvertise, bind: bind.trim(), port: port.trim(),
       healthInterval: healthInterval.trim(), cooldown: cooldown.trim(), defaultAgent,
       inferenceMode, logFormat, smBackend, vaultAddr, vaultMount, origins, noveltyGate,
-      miniappEnabled, dailyDigest,
+      privacyExcluded, miniappEnabled, dailyDigest,
       // An empty native time input must not be sent as "" — the gateway
       // rejects an unparseable daily_digest_at outright (fail-closed).
       dailyDigestAt: dailyDigestAt.trim() !== '' ? dailyDigestAt : '09:00',
@@ -657,6 +663,21 @@ export function SystemTab({ section = 'all' }: { section?: 'all' | 'system' | 's
             onChange={setNoveltyGate}
           />
         </SettingsCard>
+        {/* RM-039 — topics automatic memory never stores */}
+        <SettingsCard>
+          <p className="text-sm font-medium">{intl.formatMessage({ id: 'settings.system.memoryPrivacy' })}</p>
+          <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'settings.system.memoryPrivacy.help' })}</p>
+          {MEMORY_PRIVACY_BUILTINS.map((cat) => (
+            <RowSwitch
+              key={cat}
+              label={intl.formatMessage({ id: `settings.system.memoryPrivacy.category.${cat}` })}
+              checked={privacyExcluded.includes(cat)}
+              onChange={(on: boolean) => setPrivacyExcluded((prev) => canonicalPrivacy(
+                on ? [...prev, cat] : prev.filter((c) => c !== cat),
+              ))}
+            />
+          ))}
+        </SettingsCard>
       </SettingsSection>
 
       </>}
@@ -824,10 +845,23 @@ interface SystemSnapshotInput {
   vaultMount: string;
   origins: string[];
   noveltyGate: boolean;
+  privacyExcluded: string[];
   miniappEnabled: boolean;
   dailyDigest: boolean;
   dailyDigestAt: string;
   extra: FlatValues;
+}
+
+/** RM-039 built-in categories, in display order (all excluded by default). */
+const MEMORY_PRIVACY_BUILTINS = ['health', 'family', 'personal_finance', 'salary'] as const;
+
+/** Stable order (built-ins first, then custom categories as given, no
+ *  duplicates) so toggling a switch off and on again is not a "change". */
+function canonicalPrivacy(list: readonly string[]): string[] {
+  const builtins: readonly string[] = MEMORY_PRIVACY_BUILTINS;
+  const set = new Set(list);
+  const custom = list.filter((c, i) => !builtins.includes(c) && list.indexOf(c) === i);
+  return [...builtins.filter((c) => set.has(c)), ...custom];
 }
 
 /** Flatten the form into `system.update_config` param paths. Blank numeric
@@ -844,6 +878,7 @@ function snapshotSystem(v: SystemSnapshotInput): FlatValues {
     'secret_manager.vault_mount': v.vaultMount,
     allowed_origins: v.origins,
     novelty_gate_enabled: v.noveltyGate,
+    'memory_privacy.excluded_categories': v.privacyExcluded,
     miniapp_enabled: v.miniappEnabled,
     daily_digest: v.dailyDigest,
     daily_digest_at: v.dailyDigestAt,

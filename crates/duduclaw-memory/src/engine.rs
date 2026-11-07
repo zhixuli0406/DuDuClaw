@@ -5005,6 +5005,9 @@ pub use namespace_migration::{MigrationDisposition, NamespaceRow, OnRefused};
 
 pub mod forget_source;
 
+pub mod subject_listing;
+pub use subject_listing::SubjectFact;
+
 #[cfg(test)]
 mod tests {
     use super::*;
