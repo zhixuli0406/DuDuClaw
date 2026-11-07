@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- 新增 ModuleLease 核心 API 與跨程序狀態儲存試作，僅為模組化的內部基礎建設，尚未接入功能入口，沒有使用者可見變更。
+
 ## [1.80.1] - 2026-11-07 — macOS／Windows 下載版修正
 
 ### Fixed
