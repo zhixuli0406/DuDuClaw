@@ -348,6 +348,12 @@ export type IsolationComponentState = 'ready' | 'unavailable' | 'pending_integra
 export interface IsolationReadiness {
   required: boolean;
   ready: boolean;
+  reasons?: Array<{
+    code: 'binding_evidence_missing' | 'connector_setup_required' | 'personal_binding_conflict' |
+      'revoked' | 'service_unavailable';
+    provider?: string;
+  }>;
+  correlation_id?: string;
   components: Record<'launch_service' | 'sandbox' | 'network' | 'storage' |
     'parse_worker' | 'update_service' | 'mcp_boundary' | 'runtime_adapters', IsolationComponentState>;
 }

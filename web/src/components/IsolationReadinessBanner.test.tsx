@@ -72,4 +72,77 @@ describe('IsolationReadinessBanner', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Employee work, including API-only model calls, cannot start');
     expect(screen.queryByText('Service details')).not.toBeInTheDocument();
   });
+
+  it('explains missing bindings and connector setup using provider family names', () => {
+    setReadiness({ ...readiness(), reasons: [
+      { code: 'binding_evidence_missing' },
+      { code: 'connector_setup_required', provider: 'google' },
+    ] });
+    renderWithProviders(<IsolationReadinessBanner />);
+    expect(screen.getByRole('alert')).toHaveTextContent('No protected external connection requests have been sent');
+    expect(screen.getByText('Account binding setup is not complete.')).toBeInTheDocument();
+    expect(screen.getByText('Google connection setup is not complete.')).toBeInTheDocument();
+  });
+
+  it.each([
+    ['notion', 'Notion'], ['github', 'GitHub'], ['odoo', 'Odoo'],
+    ['database', 'Database'], ['channel', 'Messaging channel'], ['search', 'Search'],
+    ['model', 'Model'], ['computer_login', 'Computer login'],
+  ])('names the %s provider family', (provider, label) => {
+    setReadiness({ ...readiness(), reasons: [{ code: 'connector_setup_required', provider }] });
+    renderWithProviders(<IsolationReadinessBanner />);
+    expect(screen.getByText(`${label} connection setup is not complete.`)).toBeInTheDocument();
+  });
+
+  it.each(['revoked', 'personal_binding_conflict'] as const)('explains revoked access: %s', code => {
+    setReadiness({ ...readiness(), reasons: [{ code }] });
+    renderWithProviders(<IsolationReadinessBanner />);
+    expect(screen.getByRole('alert')).toHaveTextContent(code === 'revoked'
+      ? 'Access has been revoked'
+      : 'This AI employee’s dedicated account binding cannot currently be used in protected mode');
+  });
+
+  it('explains temporary service unavailability', () => {
+    setReadiness({ ...readiness(), reasons: [{ code: 'service_unavailable' }] });
+    renderWithProviders(<IsolationReadinessBanner />);
+    expect(screen.getByText('The service is temporarily unavailable. Check again later.')).toBeInTheDocument();
+  });
+
+  it('uses the Personal account notice on Personal installations', () => {
+    setReadiness({ ...readiness(), reasons: [] });
+    useSystemStore.setState({ status: { ...useSystemStore.getState().status!, edition_profile: 'personal' } });
+    renderWithProviders(<IsolationReadinessBanner />);
+    expect(screen.getByRole('alert')).toHaveTextContent('This AI employee’s dedicated account binding cannot currently be used in protected mode');
+  });
+
+  it('shows administrators the support reference and existing security settings route', () => {
+    setReadiness({ ...readiness(), reasons: [{ code: 'service_unavailable' }], correlation_id: 'support-ref-123' });
+    renderWithProviders(<IsolationReadinessBanner />);
+    expect(screen.getByText('Reference number: support-ref-123')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'View isolation status and settings' }))
+      .toHaveAttribute('href', '/app/system/security');
+  });
+
+  it.each(['employee', 'manager', undefined] as const)('hides internal details and support references from non-admins: %s', role => {
+    useAuthStore.setState({ user: role ? { ...useAuthStore.getState().user!, role } : null });
+    setReadiness({ ...readiness(), reasons: [
+      { code: 'connector_setup_required', provider: 'google' },
+      { code: 'connector_setup_required', provider: 'internal-connector-42' },
+    ], correlation_id: 'private-reference' });
+    renderWithProviders(<IsolationReadinessBanner />);
+    expect(screen.getByText('Google connection setup is not complete.')).toBeInTheDocument();
+    expect(screen.getByText('External connection service setup is not complete.')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).not.toHaveTextContent('internal-connector-42');
+    expect(screen.getByRole('alert')).not.toHaveTextContent('private-reference');
+    expect(screen.queryByText(/Reference number/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.queryByText('Service details')).not.toBeInTheDocument();
+  });
+
+  it('preserves the legacy description when reasons are absent', () => {
+    renderWithProviders(<IsolationReadinessBanner />);
+    expect(screen.getByRole('alert')).toHaveTextContent('Required isolation services are not ready.');
+    expect(screen.queryByText(/No protected external connection requests/)).not.toBeInTheDocument();
+  });
+
 });
