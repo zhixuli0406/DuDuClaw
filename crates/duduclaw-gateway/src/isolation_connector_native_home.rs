@@ -27,7 +27,8 @@ use duduclaw_isolation::ids::EmployeeId;
 use duduclaw_mcp_boundary::{RequestContext, VerificationError};
 use zeroize::{Zeroize, Zeroizing};
 use crate::isolation_connector_clients::{AccountCredential, AccountCredentialProvider};
-use crate::isolation_connectors::{LiveConnectorSelectionPolicy, ProductConnectorAccount, provider_for_tool};
+use crate::isolation_connectors::{AccountId, ConnectorCatalog, ConnectorKind, LiveConnectorSelectionPolicy,
+    ProductConnectorAccount, provider_for_tool};
 
 pub const NOTION: &str = "notion";
 pub const GITHUB: &str = "github";
@@ -53,6 +54,16 @@ const LEASE_SECS: u64 = 60;
 ///   and must not call back into product selection.
 pub trait HomeRouteCheck: Send + Sync {
     fn is_active_home_route(&self, account: &str, provider: &str) -> Result<bool, VerificationError>;
+}
+
+impl HomeRouteCheck for ConnectorCatalog {
+    /// Reads the current row on every call (no cache). A string that is not a
+    /// catalog id is an unknown account (`Ok(false)`); a store error is `Err`.
+    fn is_active_home_route(&self, account: &str, provider: &str) -> Result<bool, VerificationError> {
+        let Ok(account) = AccountId::parse(account) else { return Ok(false) };
+        Ok(self.route(&account)?.is_some_and(|route|
+            route.active && route.kind == ConnectorKind::SharedHome && route.provider == provider))
+    }
 }
 
 /// Source of the home-wide provider token. Production is [`OAuthVaultHomeTokens`];
@@ -410,15 +421,54 @@ mod tests {
         let mut store = BindingStore::new(Connection::open_in_memory().unwrap()).unwrap();
         store.register_principal(&principal).unwrap();
         store.create_employee(EMPLOYEE, &binding).unwrap();
-        store.register_connector("home-notion", &binding).unwrap();
         let catalog = Arc::new(ConnectorCatalog::new(Connection::open_in_memory().unwrap()).unwrap());
-        catalog.register("home-notion", "notion").unwrap();
+        let id = catalog.register("home-notion", "notion", ConnectorKind::SharedHome, &binding).unwrap();
+        store.register_connector(id.as_str(), &binding).unwrap();
+        let ctx = context("notion_search", id.as_str());
+        let policy = NotionPolicy::new(home.path().into(), "employee-a".into(), EMPLOYEE, shared(id.as_str()),
+            catalog.clone()).unwrap();
         let selected = SelectedConnector::select_with_policy(&ctx, "notion_search", &json!({"query":"plan"}),
-            Arc::new(Mutex::new(store)), catalog, Some(Arc::new(notion(&home, routes.clone())))).unwrap();
-        assert_eq!((selected.account(), selected.provider()), ("home-notion", "notion"));
+            Arc::new(Mutex::new(store)), catalog.clone(), Some(Arc::new(policy))).unwrap();
+        assert_eq!((selected.account(), selected.provider()), (id.as_str(), "notion"));
         assert!(selected.recheck().is_ok());
-        routes.clear();
+        catalog.revoke(&id).unwrap();
         assert!(selected.recheck().is_err());
+    }
+
+    #[test]
+    fn catalog_home_route_check_follows_current_state() {
+        let catalog = ConnectorCatalog::new(Connection::open_in_memory().unwrap()).unwrap();
+        let shared_binding = EmployeeBinding::Shared(text("company"));
+        let home_notion = catalog.register("home-notion", "notion", ConnectorKind::SharedHome, &shared_binding).unwrap();
+        let tenant_notion = catalog.register("tenant-notion", "notion", ConnectorKind::SharedTenant, &shared_binding).unwrap();
+        let personal = catalog.register("alice-notion", "notion", ConnectorKind::Personal,
+            &EmployeeBinding::Personal(text("alice"))).unwrap();
+        assert_eq!(catalog.is_active_home_route(home_notion.as_str(), "notion"), Ok(true));
+        // Other provider, non-home kinds, unknown and malformed ids are all false.
+        assert_eq!(catalog.is_active_home_route(home_notion.as_str(), "github"), Ok(false));
+        assert_eq!(catalog.is_active_home_route(tenant_notion.as_str(), "notion"), Ok(false));
+        assert_eq!(catalog.is_active_home_route(personal.as_str(), "notion"), Ok(false));
+        assert_eq!(catalog.is_active_home_route(&"0".repeat(32), "notion"), Ok(false));
+        assert_eq!(catalog.is_active_home_route("home-notion", "notion"), Ok(false));
+        assert_eq!(catalog.is_active_home_route("", "notion"), Ok(false));
+        // Current state is read each time: advance keeps it, revoke ends it.
+        catalog.advance(&home_notion).unwrap();
+        assert_eq!(catalog.is_active_home_route(home_notion.as_str(), "notion"), Ok(true));
+        catalog.revoke(&home_notion).unwrap();
+        assert_eq!(catalog.is_active_home_route(home_notion.as_str(), "notion"), Ok(false));
+    }
+
+    #[test]
+    fn catalog_home_route_check_store_error_is_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        let catalog = ConnectorCatalog::new(Connection::open(&path).unwrap()).unwrap();
+        let id = catalog.register("home-notion", "notion", ConnectorKind::SharedHome,
+            &EmployeeBinding::Shared(text("company"))).unwrap();
+        assert_eq!(catalog.is_active_home_route(id.as_str(), "notion"), Ok(true));
+        // Damage the store through another connection: never Ok(false)/Ok(true).
+        Connection::open(&path).unwrap().execute_batch("DROP TABLE isolation_connector_routes").unwrap();
+        assert!(catalog.is_active_home_route(id.as_str(), "notion").is_err());
     }
 
     #[test]
