@@ -53,10 +53,20 @@ impl MethodHandler {
 
             // ── Agent methods (filtered by binding) ──────────
             "agents.list" => boxed_frame(|| self.handle_agents_list_filtered(ctx, params)).await,
+            "agents.org_chart" => {
+                if let Err(e) = acl::require_role(ctx, UserRole::Employee) {
+                    return WsFrame::error_response("", &e);
+                }
+                boxed_frame(|| self.handle_agents_org_chart(ctx)).await
+            }
             // The WebChat `@` list / staff picker: what the caller may call,
             // including a Manager's team (`agents_callable_rpc.rs`). Any
             // signed-in account, both editions.
             "agents.callable" => boxed_frame(|| self.handle_agents_callable(ctx, params)).await,
+            "agents.health" => {
+                require_manager!();
+                boxed_frame(|| self.handle_agents_health(ctx, params)).await
+            }
             "agents.status" => {
                 let _ = check_agent!(AccessLevel::Viewer);
                 boxed_frame(|| self.handle_agents_status(params)).await
@@ -168,6 +178,10 @@ impl MethodHandler {
             }
 
             // ── Premium team templates (dashboard onboarding staging flow) ──
+            "templates.catalog" | "templates.get" | "templates.copy" | "templates.save" | "templates.apply" => {
+                require_admin!();
+                boxed_frame(|| self.handle_template_library(method, params, ctx)).await
+            }
             "templates.industries" => {
                 require_admin!();
                 boxed_frame(|| self.handle_templates_industries()).await
@@ -404,6 +418,19 @@ impl MethodHandler {
             }
 
             // ── MCP API keys (global config.toml [mcp_keys], MK.1–MK.4) ──
+            "mcp_oauth_grants.list" => {
+                require_admin!();
+                boxed_frame(|| self.handle_mcp_oauth_grants_list()).await
+            }
+            "mcp_oauth_grants.revoke" => {
+                if let Err(e) = acl::require_role(ctx, UserRole::Admin) {
+                    let id = params.get("id").and_then(Value::as_str)
+                        .and_then(|id| uuid::Uuid::parse_str(id).ok()).map(|id| id.to_string());
+                    self.audit_mcp_oauth_revoke(ctx, id.as_deref(), "denied", None).await;
+                    return WsFrame::error_response("", &e);
+                }
+                boxed_frame(|| self.handle_mcp_oauth_grants_revoke(params, ctx)).await
+            }
             "mcp_keys.list" => {
                 require_admin!();
                 boxed_frame(|| self.handle_mcp_keys_list()).await
@@ -528,7 +555,7 @@ impl MethodHandler {
             // show to anyone who can already see operational metrics.
             "license.status" => {
                 require_manager!();
-                boxed_frame(|| self.handle_license_status()).await
+                boxed_frame(|| self.handle_license_status(ctx.is_admin())).await
             }
             // Dashboard upgrade flow — install/redeem a commercial license
             // without touching the CLI. Admin-only: this changes what the

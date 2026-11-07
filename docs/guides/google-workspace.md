@@ -1,10 +1,10 @@
 # Google Workspace tools and security
 
-For setup, use [Connect Google](google-setup.md). Native REST tools cover eight services and nineteen tools. The Apps Script path covers three services and eight actions including status. The dashboard remains visible with the integration disabled; tools are hidden until `[integrations] google_workspace = true`. DuDuClaw does not ship shared OAuth credentials.
+For setup, use [Connect Google](google-setup.md). Native REST tools cover nine services and twenty-one tools. The Apps Script path covers three services and eight actions including status. The dashboard remains visible with the integration disabled; tools are hidden until `[integrations] google_workspace = true`. DuDuClaw does not ship shared OAuth credentials.
 
 ## What you get
 
-Nineteen agent-facing MCP tools, gated by two scopes (`google:read` /
+Twenty-one agent-facing MCP tools, gated by two scopes (`google:read` /
 `google:write`):
 
 | Tool | Class | What it does |
@@ -12,6 +12,8 @@ Nineteen agent-facing MCP tools, gated by two scopes (`google:read` /
 | `google_status` | read | Identity and credential diagnostics; output depends on the account path. Does not prove per-service access. Hidden while Google integration or the employee identity is disabled. |
 | `gmail_search` | read | Search the mailbox using Gmail query syntax (`from:… is:unread`, etc.). Returns sender/subject/date/snippet. |
 | `gmail_read` | read | Read one message in full: headers, plain-text body (truncated if long), attachment manifest (filename + size only — never downloaded). |
+| `google_chat_spaces` | read | List the connected user's spaces, group chats and DMs; requires Chat read opt-in. |
+| `google_chat_messages` | read | Read recent Chat messages; scanned reference data, attachment names only. |
 | `gmail_create_draft` | write | Create a Gmail **draft**. Never sends — sending stays a manual human action. |
 | `calendar_list_events` | read | List primary-calendar events (defaults to the next 7 days). |
 | `calendar_create_event` | write | Create a real, externally-visible event; optional Google Meet link. |
@@ -63,6 +65,21 @@ which is why they are served natively here.
   [capabilities]
   approval_required_tools = ["gmail_create_draft", "calendar_create_event", "sheets_append", "gtasks_create", "gtasks_complete", "docs_append"]
   ```
+
+## Read personal Google Chat conversations (opt-in)
+
+`google_chat_spaces` lists spaces the connected user belongs to: resource name, display name, type and last active time when Google supplies it. `limit` defaults to 20 (1–50); `filter` accepts exactly `SPACE`, `GROUP_CHAT` or `DIRECT_MESSAGE`.
+
+`google_chat_messages` reads recent messages from a strict `spaces/...` resource name, newest first. `limit` defaults to 30 (1–100); optional `since` must be RFC3339 and `thread` must be a thread resource within that space. Each message includes its sender, creation time, text (at most 2,000 characters), thread and attachment names. Attachments are never downloaded. Sender names use Google's returned display name or the `users/...` resource; no People API or extra membership permission is used. The complete returned content is capped at 30,000 characters.
+
+1. An administrator enables **Google Chat read** in the dashboard under Manage → Integrations → Google (`[google] chat_read = true`, default false).
+2. The user reconnects their own Google account in **My connections** and selects both Chat read permissions. The optional scopes are `https://www.googleapis.com/auth/chat.spaces.readonly` and `https://www.googleapis.com/auth/chat.messages.readonly`; existing users are not asked for them while the switch is off.
+3. In the OAuth client's Google Cloud project, enable **Google Chat API** and configure a **Chat app**, even for user authentication. A Workspace administrator may also need to allow the OAuth app.
+
+These tools use the same employee/account ownership, scope, approval and private-data egress gates as Gmail reads. They read the account selected by that existing identity policy; they do not accept a user/account argument. Apps Script does not support these Chat reads. This is separate from the Chat bot channel's DMs and mentions. Disabling the switch blocks new Chat reads, including existing tokens; it does not revoke Google's previously granted permissions.
+
+Returned content is untrusted reference data, wrapped and scanned with the group-history policy. Any injection hit refuses the whole response with `not available`. Audit entries retain space identifiers and counts, never message text. Fixture and local tests do not establish real-account access; verify consent and reading with the customer's account before acceptance.
+
 
 ## Per-employee Google accounts (company delegation, v1.76.0)
 
@@ -136,7 +153,7 @@ allowed_subject_domains = ["customer.com"]
 ```
 
 An employee without `[google]` uses `default_identity`, so an existing
-installation behaves exactly as before. `none` hides the 19 Google tools
+installation behaves exactly as before. `none` hides the 21 Google tools
 from that employee and refuses calls to them. A value that cannot be read
 (a typo, an unknown key) refuses Google for that employee; it never turns
 into the shared account. Enterprise employees may use `owner` or `user:<id>`

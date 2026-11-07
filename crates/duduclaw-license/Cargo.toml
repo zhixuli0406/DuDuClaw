@@ -9,6 +9,10 @@ description = "DuDuClaw license client — parse, verify, gate features. Apache 
 [lints]
 workspace = true
 
+[features]
+# Synthetic fingerprint constructors; only downstream dev-dependencies enable this.
+test-support = []
+
 [dependencies]
 # Crypto: verification only (signing key stays in commercial/duduclaw-license)
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
@@ -25,6 +29,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # Encoding
 base64 = "0.22"
 hex = "0.4"
+url = "2"
 
 # Machine identity
 gethostname = "0.4"
@@ -35,8 +40,12 @@ thiserror = { workspace = true }
 
 # Filesystem
 dirs = "5"
+fs2 = "0.4"
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["iphlpapi", "iptypes", "ws2def", "winerror"] }
 
 [dev-dependencies]
-tempfile = "3"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
 rand = "0.8"

@@ -4554,6 +4554,8 @@ mod tests {
     /// reporting relation between them.
     fn seed_two_department_home() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
+        // Main-target admission requires readable gateway configuration.
+        std::fs::write(tmp.path().join("config.toml"), "").unwrap();
         let agents = tmp.path().join("agents");
         for (name, department) in [("sales_rep", "業務"), ("mkt_rep", "行銷")] {
             crate::trigger_route::tests::write_agent(&agents, name, name, "", "worker", "");

@@ -42,7 +42,7 @@ async fn skills_are_listed_and_readable_by_every_bound_role() {
     seed(&f);
     let list = ok(&f.call("agent_files.list", json!({ "agent_id": "a1" }), &f.viewer).await);
     let skills: Vec<&Value> = list["files"].as_array().unwrap().iter().filter(|x| x["label_key"] == "agentFiles.file.skill").collect();
-    // `agents.create` seeds the built-in skills too; look at the seeded `quote`.
+    // Only the explicitly seeded personal quote files belong here.
     let skills: Vec<&Value> = skills.into_iter().filter(|x| x["file"].as_str().unwrap().starts_with("skill:quote/")).collect();
     let names: Vec<&str> = skills.iter().map(|x| x["file"].as_str().unwrap()).collect();
     assert_eq!(names, vec!["skill:quote/SKILL.md", "skill:quote/references/prices.md"], "scripts are not listed");

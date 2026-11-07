@@ -380,7 +380,7 @@ async fn discovery_catalog_and_create_share_the_production_runtime_capability_ga
     let caller=user("manager",UserRole::Manager);
     assert_eq!(catalog(&home,&caller,"worker").unwrap()["runtimes"],json!(["claude"]));
     let store=TaskStore::open(&home).unwrap();
-    for runtime in ["grok","cursor"] {
+    for runtime in ["codex","grok","cursor"] {
         spec.runtime=runtime.into();
         assert!(create(&home,&store,&broker,&caller,"worker","Explore","Improve fixture",spec.clone()).await.is_err(),"{runtime} must be refused");
     }

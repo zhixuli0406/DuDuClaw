@@ -1287,6 +1287,28 @@ pub fn append_fork_history(home_dir: &Path, entry: &ForkHistoryEntry) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn pl0_fork_refuses_direct_remote_without_guard_opt_in() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
+        let agent = home.path().join("agents/alice");
+        let workspace = home.path().join("branch");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let path = workspace.join(".mcp.json");
+        let raw = serde_json::json!({"mcpServers": {
+            "remote": {"type":"sse","url":"https://example.invalid/mcp"},
+            "stdio": {"command":"test-upstream"}
+        }}).to_string();
+        std::fs::write(&path, &raw).unwrap();
+        let mut cmd = tokio::process::Command::new("claude");
+        let guard = super::prepare_fork_mcp_proxy(home.path(), &agent, &workspace, &mut cmd).unwrap().unwrap();
+        let effective: serde_json::Value = serde_json::from_slice(&std::fs::read(&guard).unwrap()).unwrap();
+        assert!(effective["mcpServers"].get("remote").is_none());
+        assert_eq!(effective["mcpServers"]["stdio"]["args"][0], "mcp-proxy");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+    }
+
+    #[test]
     fn copied_fork_secret_config_is_proxied_for_the_child_lifetime() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\n").unwrap();
@@ -1294,7 +1316,7 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let agent_dir = home.path().join("agents/alice");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(home.path().join("identity.key"), [7u8; 32]).unwrap();
+        duduclaw_core::ensure_identity_key(home.path()).unwrap();
         let exe = duduclaw_core::resolve_duduclaw_bin();
         let own = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(home.path(), "alice", &exe);
         assert!(own["env"]["DUDUCLAW_AGENT_TOKEN"].as_str().is_some());

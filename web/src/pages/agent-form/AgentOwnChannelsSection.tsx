@@ -1,3 +1,4 @@
+import { canSelectAgent, useAgentGrantPresent } from '@/stores/callable-agents-store';
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { ExternalLink, Trash2 } from 'lucide-react';
@@ -5,7 +6,7 @@ import { Button, Input, SettingsCard, SettingsSection, Textarea } from '@/compon
 import { ConfirmDialog } from '@/components/settings/controls';
 import { api, type AgentOwnChannels, type AgentOwnChannelState } from '@/lib/api';
 import { formatError, toast } from '@/lib/toast';
-import { GoogleChatSetup } from '@/components/channels/GoogleChatSetup';
+import { GoogleChatSetup, type GoogleChatConnection } from '@/components/channels/GoogleChatSetup';
 import { cn } from '@/lib/utils';
 
 const DOCS_BASE = 'https://github.com/zhixuli0406/DuDuClaw/blob/main/docs/guides';
@@ -42,6 +43,10 @@ export function AgentOwnChannelsSection({ agentId }: { agentId: string }) {
   const [hidden, setHidden] = useState(false);
   const [removing, setRemoving] = useState<Removing>(null);
   const [busy, setBusy] = useState(false);
+  const selectable = useAgentGrantPresent(agentId);
+  useEffect(() => {
+    if (!selectable) setRemoving(null);
+  }, [selectable, agentId]);
 
   const load = useCallback(async () => {
     try {
@@ -58,7 +63,7 @@ export function AgentOwnChannelsSection({ agentId }: { agentId: string }) {
   }, [load]);
 
   const remove = async () => {
-    if (!removing) return;
+    if (!removing || !canSelectAgent(agentId)) return;
     setBusy(true);
     try {
       if (removing === 'telegram') await api.channels.agentTelegramRemove(agentId);
@@ -73,7 +78,7 @@ export function AgentOwnChannelsSection({ agentId }: { agentId: string }) {
     }
   };
 
-  if (hidden || !data) return null;
+  if (hidden || !data || !selectable) return null;
   return (
     <SettingsSection title={t('agentChannels.title')} description={t('agentChannels.desc')}>
       <TelegramCard data={data.telegram} agentId={agentId} onChanged={load} onRemove={() => setRemoving('telegram')} />
@@ -136,7 +141,7 @@ function TelegramCard({
   const [saving, setSaving] = useState(false);
 
   const save = async () => {
-    if (!token.trim()) return;
+    if (!token.trim() || !canSelectAgent(agentId)) return;
     setSaving(true);
     try {
       const r = await api.channels.agentTelegramSet(agentId, token.trim());
@@ -221,14 +226,20 @@ function GoogleChatCard({
   const t = (id: string, v?: Record<string, string | number>) => intl.formatMessage({ id }, v);
   const [project, setProject] = useState(data.project_number ?? '');
   const [keyJson, setKeyJson] = useState('');
+  const [connection, setConnection] = useState<GoogleChatConnection>(data.connection ?? 'http');
+  const [subscription, setSubscription] = useState(data.pubsub_subscription ?? '');
+  useEffect(() => {
+    setConnection(data.connection ?? 'http');
+    setSubscription(data.pubsub_subscription ?? '');
+  }, [data.connection, data.pubsub_subscription]);
   const [saving, setSaving] = useState(false);
   useEffect(() => setProject(data.project_number ?? ''), [data.project_number]);
 
   const save = async () => {
-    if (!project.trim()) return;
+    if (!project.trim() || !canSelectAgent(agentId)) return;
     setSaving(true);
     try {
-      const r = await api.channels.agentGoogleChatSet(agentId, project.trim(), keyJson);
+      const r = await api.channels.agentGoogleChatSet(agentId, project.trim(), keyJson, connection, subscription.trim());
       setKeyJson('');
       if (r.verified) toast.success(t('agentChannels.googlechat.saved'));
       else toast.error(t('agentChannels.googlechat.savedNotVerified', { error: r.error ?? '' }));
@@ -275,7 +286,7 @@ function GoogleChatCard({
         )}
         {data.can_edit ? (
           <>
-            <GoogleChatSetup agentId={agentId} projectNumber={data.project_number} projectId={data.project_id} onRefresh={onChanged} />
+            <GoogleChatSetup connection={connection} onConnectionChange={setConnection} subscription={subscription} onSubscriptionChange={setSubscription} agentId={agentId} projectNumber={data.project_number} projectId={data.project_id} onRefresh={onChanged} />
             <details className="space-y-3">
               <summary className="cursor-pointer text-sm">{t('googlechat.setup.manual')}</summary>
             <Input

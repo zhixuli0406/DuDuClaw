@@ -24,6 +24,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::google_apps_script;
+pub mod chat_read;
 pub(crate) mod native_call;
 pub(crate) mod native_legacy;
 
@@ -180,6 +181,56 @@ pub const REQUIRED_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/tasks",
     "https://www.googleapis.com/auth/userinfo.email",
 ];
+
+/// Optional user-authenticated Chat access; never part of the default scopes.
+pub const CHAT_READ_SCOPES: &[&str] = &[
+    "https://www.googleapis.com/auth/chat.spaces.readonly",
+    "https://www.googleapis.com/auth/chat.messages.readonly",
+];
+
+pub fn chat_read_enabled(home: &Path) -> bool {
+    std::fs::read_to_string(home.join("config.toml")).ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("google")?.get("chat_read")?.as_bool())
+        .unwrap_or(false)
+}
+
+/// Whether a native Google Chat read tool may be listed or dispatched.
+/// Unknown tool names return false so callers cannot accidentally widen the
+/// Chat gate by passing an unrecognized tool.
+pub fn chat_read_tool_available(home: &Path, tool: &str) -> bool {
+    matches!(tool, "google_chat_spaces" | "google_chat_messages") && chat_read_enabled(home)
+}
+
+pub fn requested_scopes(home: &Path) -> Vec<&'static str> {
+    let mut scopes = REQUIRED_SCOPES.to_vec();
+    if chat_read_enabled(home) { scopes.extend_from_slice(CHAT_READ_SCOPES); }
+    scopes
+}
+
+/// Use the same locked, compare-and-swap config writer as the integration gate.
+pub fn set_chat_read_enabled(home: &Path, enabled: bool) -> Result<bool, String> {
+    let path = home.join("config.toml");
+    let raw = crate::handlers::config_commit::read_text_or_empty(&path)?;
+    let mut changed = false;
+    crate::handlers::config_commit::commit_rendered_locked(
+        &path, &crate::handlers::config_commit::content_hash(&raw), |current| {
+            let mut doc: toml_edit::DocumentMut = current.parse()
+                .map_err(|_| "config.toml 格式錯誤，未變更設定。".to_string())?;
+            let google = doc.as_table_mut().entry("google").or_insert(toml_edit::table())
+                .as_table_mut().ok_or("google 必須是設定表格。")?;
+            let previous = match google.get("chat_read") {
+                None => false,
+                Some(value) => value.as_bool().ok_or("chat_read 必須是布林值。")?,
+            };
+            if previous == enabled { return Ok(current.to_owned()); }
+            google.insert("chat_read", toml_edit::value(enabled));
+            changed = true;
+            Ok(doc.to_string())
+        },
+    )?;
+    Ok(changed)
+}
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -1431,6 +1482,42 @@ fn days_until(time_max: Option<&str>) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn google_chat_opt_in_preserves_config_and_default_scopes() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!super::chat_read_enabled(home.path()));
+        assert_eq!(super::requested_scopes(home.path()), super::REQUIRED_SCOPES);
+        for scope in super::CHAT_READ_SCOPES { assert!(!super::REQUIRED_SCOPES.contains(scope)); }
+        std::fs::write(home.path().join("config.toml"), "# keep comment\n[google]\nother = 'keep'\n").unwrap();
+        assert!(super::set_chat_read_enabled(home.path(), true).unwrap());
+        assert!(super::chat_read_enabled(home.path()));
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(raw.contains("# keep comment"));
+        assert!(raw.contains("other = 'keep'"));
+        assert!(!super::set_chat_read_enabled(home.path(), true).unwrap());
+        for scope in super::CHAT_READ_SCOPES { assert!(super::requested_scopes(home.path()).contains(scope)); }
+        assert!(super::set_chat_read_enabled(home.path(), false).unwrap());
+        assert!(!super::chat_read_enabled(home.path()));
+        for bad in ["[google]\nchat_read = 'true'", "google = true", "invalid = ["] {
+            std::fs::write(home.path().join("config.toml"), bad).unwrap();
+            assert!(!super::chat_read_enabled(home.path()));
+            assert!(super::set_chat_read_enabled(home.path(), true).is_err());
+            assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), bad);
+        }
+    }
+
+    #[test]
+    fn chat_tool_availability_is_fail_closed_and_tool_specific() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!super::chat_read_tool_available(home.path(), "google_chat_spaces"));
+        std::fs::write(home.path().join("config.toml"), "[google]\nchat_read = 'true'\n").unwrap();
+        assert!(!super::chat_read_tool_available(home.path(), "google_chat_messages"));
+        std::fs::write(home.path().join("config.toml"), "[google]\nchat_read = true\n").unwrap();
+        assert!(super::chat_read_tool_available(home.path(), "google_chat_spaces"));
+        assert!(super::chat_read_tool_available(home.path(), "google_chat_messages"));
+        assert!(!super::chat_read_tool_available(home.path(), "gmail_read"));
+    }
+
     use super::*;
 
     #[tokio::test]

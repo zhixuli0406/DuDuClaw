@@ -74,6 +74,7 @@ pub(super) struct Fixture {
 /// manager). Employees: main (default), finance, sales, hr, faq (public).
 pub(super) async fn fixture() -> Fixture {
     let home = tempfile::tempdir().unwrap();
+    duduclaw_core::write_minimal_config(home.path(), "127.0.0.1", 18889).unwrap();
     seed_agent(home.path(), "main", "嘟嘟總機", "main", "");
     seed_agent(home.path(), "finance", "財務小幫手", "specialist", "");
     seed_agent(home.path(), "sales", "業務專員", "specialist", "");
@@ -107,7 +108,7 @@ pub(super) async fn fixture() -> Fixture {
     let jwt = Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"));
     handler.set_user_db(db.clone(), jwt).await;
     handler
-        .set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise))
+        .set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise))
         .await;
     handler
         .set_task_store(Arc::new(TaskStore::open(home.path()).unwrap()))
@@ -349,7 +350,7 @@ async fn callable_main_stays_admin_only_across_edition_overrides() {
     f.handler.set_edition_override(Some(duduclaw_core::EditionProfile::Personal)).await;
     let personal = callable(&f, &ctx).await;
     assert_eq!(names(&personal), vec!["faq", "finance"]);
-    f.handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    f.handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
     assert!(!callable(&f, &ctx).await.contains_key("main"));
 }
 
@@ -620,4 +621,29 @@ async fn callable_hides_bound_main_and_configured_default_only_from_non_admins()
     let admin = callable(&f, &jwt_ctx(&f.admin, UserRole::Admin)).await;
     assert_eq!(admin["main"]["assignable"], true);
     assert_eq!(admin["finance"]["assignable"], true);
+}
+
+#[tokio::test]
+async fn callable_unrestricted_follows_live_role_not_stale_jwt_or_edition() {
+    let f = fixture().await;
+    let admin = jwt_ctx(&f.admin, UserRole::Admin);
+    for (id, role, expected) in [
+        (&f.admin, UserRole::Admin, true),
+        (&f.mgr, UserRole::Manager, false),
+        (&f.emp1, UserRole::Employee, false),
+    ] {
+        let response = f.handler.handle("agents.callable", json!({}), &jwt_ctx(id, role)).await;
+        assert_eq!(ok_payload(&response)["unrestricted"], expected);
+    }
+    f.db.update_user(&f.admin, None, Some(UserRole::Employee), None).unwrap();
+    let demoted = f.handler.handle("agents.callable", json!({}), &admin).await;
+    assert_eq!(ok_payload(&demoted)["unrestricted"], false);
+    f.handler.set_edition_override(Some(duduclaw_core::EditionProfile::Personal)).await;
+    let personal_member = f.handler.handle("agents.callable", json!({}), &admin).await;
+    assert_eq!(ok_payload(&personal_member)["unrestricted"], false);
+    let local = f.handler.handle("agents.callable", json!({}), &UserContext::admin_fallback()).await;
+    assert_eq!(ok_payload(&local)["unrestricted"], true);
+    f.db.set_user_status(&f.admin, duduclaw_auth::UserStatus::Suspended).unwrap();
+    let disabled = f.handler.handle("agents.callable", json!({}), &admin).await;
+    assert!(matches!(disabled, WsFrame::Response { ok: false, .. }));
 }

@@ -51,7 +51,7 @@ pub(crate) struct ActionGuardOutcome {
     findings: Vec<duduclaw_gateway::approval::ActionGuardFinding>,
 }
 
-/// Delegation context read from environment variables (or injected for testing).
+/// Verified host delegation metadata; tests may inject a context directly.
 #[derive(Debug, Clone)]
 pub(crate) struct DelegationContext {
     depth: u8,
@@ -59,17 +59,42 @@ pub(crate) struct DelegationContext {
 }
 
 impl DelegationContext {
-    /// Read from env vars set by the dispatcher. This is the ONLY trusted source
-    /// in production — tool params are ignored to prevent LLM agents from spoofing.
-    fn from_env() -> Self {
-        let depth = crate::mcp_isolation_identity::var(duduclaw_core::ENV_DELEGATION_DEPTH)
-            .ok()
-            .and_then(|v| v.parse::<u8>().ok())
-            .unwrap_or(0);
-        let origin = crate::mcp_isolation_identity::var(duduclaw_core::ENV_DELEGATION_ORIGIN)
-            .ok()
-            .filter(|s| !s.is_empty());
-        Self { depth, origin }
+    /// An unsigned/expired context has no delegation headroom. Ordinary tools
+    /// still run as the verified worker, but cannot start a new delegation.
+    fn from_env(home: &Path, worker: &str) -> Self {
+        // MERGE-NOTE: origin/main requires a signed DUDUCLAW_DELEGATION_CONTEXT
+        // from the process env; native Linux isolated calls have no process
+        // env and instead carry host-registered run metadata (the ISO side
+        // read depth/origin through `mcp_isolation_identity::var`). Inside an
+        // isolated call the connection-bound host mapping is authoritative; a
+        // home/worker mismatch or missing mapping leaves no headroom.
+        if let Some(call) = crate::mcp_isolation::current() {
+            if call.home.as_path() != home || call.agent != worker {
+                return Self { depth: duduclaw_core::MAX_DELEGATION_DEPTH, origin: None };
+            }
+            let depth = crate::mcp_isolation_identity::var(duduclaw_core::ENV_DELEGATION_DEPTH)
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(duduclaw_core::MAX_DELEGATION_DEPTH);
+            let origin = crate::mcp_isolation_identity::var(duduclaw_core::ENV_DELEGATION_ORIGIN)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|origin| if duduclaw_core::identity_token::is_system_delegation_origin(&origin) {
+                    worker.to_string()
+                } else { origin });
+            return Self { depth, origin };
+        }
+        match verified_delegation_context(home, worker) {
+            Some(context) => Self {
+                depth: context.depth,
+                // The signed root records its host source. Queue origin must
+                // remain the employee chain root for pause and lease fencing.
+                origin: Some(if duduclaw_core::identity_token::is_system_delegation_origin(&context.origin) {
+                    worker.to_string()
+                } else { context.origin }),
+            },
+            None => Self { depth: duduclaw_core::MAX_DELEGATION_DEPTH, origin: None },
+        }
     }
 }
 

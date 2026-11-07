@@ -85,6 +85,7 @@ pub(crate) fn admit_viewer(
         .tickets
         .consume(token, now)
         .ok_or(StatusCode::UNAUTHORIZED)?;
+    if !ticket.credential_valid(sessions.home()) { return Err(StatusCode::UNAUTHORIZED); }
     let live = live_identity(sessions.home(), &ticket.ctx).ok_or(StatusCode::FORBIDDEN)?;
     if !authorize(&live, &ticket.agent_id, LiveAction::Watch) {
         return Err(StatusCode::FORBIDDEN);
@@ -265,7 +266,7 @@ async fn run_bridge(socket: WebSocket, sessions: &ComputerUseSessions, admitted:
                 }
                 if last_auth.elapsed() >= REAUTH_INTERVAL {
                     last_auth = Instant::now();
-                    let still = admitted.ticket.credential_unexpired() && live_identity(sessions.home(), &admitted.ticket.ctx)
+                    let still = admitted.ticket.credential_valid(sessions.home()) && live_identity(sessions.home(), &admitted.ticket.ctx)
                         .is_some_and(|l| authorize(&l, &admitted.ticket.agent_id, LiveAction::Watch));
                     if !still {
                         break;
@@ -342,6 +343,27 @@ mod tests {
 mod mfa_tests {
     use super::*;
     #[test]
+    fn remembered_computer_view_ticket_rechecks_family_and_preserves_legacy() {
+        let home=tempfile::tempdir().unwrap();
+        let db=duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let user=db.create_user("remember-viewer@example.test","Viewer","password-test",duduclaw_auth::UserRole::Admin).unwrap();
+        let jwt=duduclaw_auth::JwtConfig::new(b"remember-viewer-long-enough-test-secret");
+        let now=chrono::Utc::now().timestamp();
+        let session=uuid::Uuid::new_v4().to_string();
+        let (token,_,_)=db.remember_create(&user.id,0,&session,"Browser",None,180,now,false,
+            |user,access,id|jwt.issue_access_token_in_session(user,access,Some(id))).unwrap();
+        let claims=jwt.verify_access_token(&token).unwrap();
+        let ticket=ViewTicket {agent_id:"alice".into(),session_id:"cu-1".into(),
+            ctx:duduclaw_auth::UserContext::from_claims(&claims,false).unwrap(),
+            expires:Instant::now()+Duration::from_secs(30),access_expires:Some(claims.exp),dashboard_session:Some(session.clone())};
+        assert!(ticket.credential_valid(home.path()));
+        db.remember_revoke(&user.id,Some(&session)).unwrap();
+        assert!(!ticket.credential_valid(home.path()));
+        let mut legacy=ticket.clone();legacy.dashboard_session=None;
+        assert!(legacy.credential_valid(home.path()));
+        assert!(!ticket.credential_valid(&home.path().join("missing")));
+    }
+    #[test]
     fn computer_use_mfa_viewer_revalidates_epoch_and_original_jwt_expiry() {
         let home=tempfile::tempdir().unwrap();
         let db=duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
@@ -352,7 +374,7 @@ mod mfa_tests {
         let claims=jwt.verify_access_token(&jwt.issue_access_token(&user,&[]).unwrap()).unwrap();
         let ctx=duduclaw_auth::UserContext::from_claims(&claims,false).unwrap();
         assert_eq!(live_identity(home.path(),&ctx).unwrap().credential_epoch,1);
-        let mut ticket=ViewTicket { agent_id:"alice".into(),session_id:"cu-1".into(),ctx:ctx.clone(),expires:Instant::now()+Duration::from_secs(30),access_expires:Some(1) };
+        let mut ticket=ViewTicket { agent_id:"alice".into(),session_id:"cu-1".into(),ctx:ctx.clone(),expires:Instant::now()+Duration::from_secs(30),access_expires:Some(1),dashboard_session:None };
         assert!(!ticket.credential_unexpired());
         ticket.access_expires=Some(u64::MAX);
         assert!(ticket.credential_unexpired());

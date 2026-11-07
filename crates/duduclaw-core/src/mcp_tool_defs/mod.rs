@@ -124,6 +124,22 @@ pub const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 /// spelled out on every one of them. `param_types_name_real_params` keeps
 /// each row pointing at a parameter that exists.
 pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
+    ("odoo_inventory_products", "storable_only", "boolean"),
+    ("odoo_crm_leads", "limit", "integer"),
+    ("odoo_crm_create_lead", "expected_revenue", "number"),
+    ("odoo_crm_update_stage", "lead_id", "integer"),
+    ("odoo_sale_orders", "limit", "integer"),
+    ("odoo_sale_create_quotation", "partner_id", "integer"),
+    ("odoo_sale_create_quotation", "product_id", "integer"),
+    ("odoo_sale_create_quotation", "quantity", "number"),
+    ("odoo_sale_confirm", "order_id", "integer"),
+    ("odoo_inventory_products", "limit", "integer"),
+    ("odoo_inventory_check", "product_id", "integer"),
+    ("odoo_invoice_list", "limit", "integer"),
+    ("odoo_payment_status", "invoice_id", "integer"),
+    ("odoo_search", "limit", "integer"),
+    ("odoo_report", "record_id", "integer"),
+    ("odoo_partner_search", "limit", "integer"),
     ("group_history_read", "limit", "integer"),
     ("group_history_read", "before", "integer"),
     ("tasks_create", "cost_cap_cents", "integer"),
@@ -148,6 +164,8 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("code_map", "chat_files", "array"),
     ("memory_fetch_batch", "ids", "array"),
     ("memory_fetch_batch", "include_metadata", "boolean"),
+    ("google_chat_spaces", "limit", "integer"),
+    ("google_chat_messages", "limit", "integer"),
     ("memory_improve", "limit", "integer"),
     ("memory_search", "limit", "integer"),
     ("memory_search", "tags", "array"),
@@ -218,6 +236,16 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
             },"required":["approved_root_id","evaluator","runtime","model","branch_count","refine_count","max_parallelism","budget"]
         }));
     }
+    if matches!(tool.name, "google_chat_spaces" | "google_chat_messages") {
+        let spaces = tool.name == "google_chat_spaces";
+        properties.insert("limit".into(), serde_json::json!({
+            "type":"integer", "minimum":1, "maximum":if spaces { 50 } else { 100 },
+            "default":if spaces { 20 } else { 30 },
+        }));
+        if spaces {
+            properties.get_mut("filter").unwrap()["enum"] = serde_json::json!(["SPACE", "GROUP_CHAT", "DIRECT_MESSAGE"]);
+        }
+    }
     if tool.name == "group_history_read" {
         properties.insert("limit".into(), serde_json::json!({
             "type":"integer", "minimum":1, "maximum":100, "default":50,
@@ -244,6 +272,14 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
 #[cfg(test)]
 mod registration_tests {
     use super::{build_tool_schema, tools, EXTERNAL_TOOLS_WHITELIST, PARAM_TYPES, TOOL_GROUPS};
+
+    #[test]
+    fn odoo_schemas_declare_numeric_and_boolean_parameters() {
+        for (tool, param, ty) in PARAM_TYPES.iter().filter(|(tool, _, _)| tool.starts_with("odoo_")) {
+            let definition = tools().find(|definition| definition.name == *tool).unwrap();
+            assert_eq!(build_tool_schema(definition)["inputSchema"]["properties"][*param]["type"], *ty);
+        }
+    }
 
     #[test]
     fn param_types_name_real_params() {

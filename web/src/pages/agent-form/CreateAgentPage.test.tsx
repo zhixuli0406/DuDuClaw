@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route } from 'react-router';
 import en from '@/i18n/en.json';
+import zhTW from '@/i18n/zh-TW.json';
 import { mockWsClient } from '@/test/mocks';
 import { SidebarProvider } from '@/components/mds';
 import { CreateAgentPage } from './CreateAgentPage';
@@ -98,6 +99,82 @@ describe('CreateAgentPage', () => {
         expect.objectContaining({ name: 'coder', model_preferred: 'opus' }),
       ),
     );
+  });
+
+  async function submitAgentCreateFailure(message: string | Error) {
+    mockWsClient.call.mockImplementation((method) => {
+      if (method === 'agents.create') return Promise.reject(message);
+      return Promise.resolve({
+        roles: [],
+        departments: [],
+        models: [{ id: 'opus', label: 'Opus', type: 'cloud', provider: 'anthropic' }],
+      });
+    });
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Basics')).toBeInTheDocument());
+
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText('coder'), 'louis');
+    await user.type(screen.getByPlaceholderText('Coder'), 'Louis');
+    await user.selectOptions(screen.getByLabelText('Model'), 'opus');
+    await user.click(screen.getByRole('button', { name: 'Create Agent' }));
+    await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
+  }
+
+  it('keeps the localized name-format message for backend format errors', async () => {
+    await submitAgentCreateFailure(
+      'Agent name must be lowercase alphanumeric with hyphens, max 64 chars',
+    );
+
+    expect(screen.getByText('Failed to create agent. Please check the name format.')).toBeInTheDocument();
+  });
+
+  it('localizes duplicate-name errors from either backend wording', async () => {
+    await submitAgentCreateFailure("Agent 'louis' already exists");
+
+    expect(screen.getByText('An agent with this name already exists. Choose another name.')).toBeInTheDocument();
+  });
+
+  it('shows cloud agent-cap messages from the backend as-is', async () => {
+    const message = '雲端方案最多可建立 5 位 AI 員工';
+    await submitAgentCreateFailure(message);
+
+    expect(screen.getByText(`Failed to create agent: ${message}`)).toBeInTheDocument();
+    expect(screen.getByText(message)).toHaveClass('text-muted-foreground');
+  });
+
+  it('splits full-width-colon backend errors into summary and detail', async () => {
+    const message = '建立員工失敗：服務帳號缺少執行權限';
+    mockWsClient.call.mockImplementation((method) => {
+      if (method === 'agents.create') return Promise.reject(message);
+      return Promise.resolve({ roles: [], departments: [], models: [{ id: 'opus', label: 'Opus', type: 'cloud', provider: 'anthropic' }] });
+    });
+    render(
+      <IntlProvider messages={zhTW} locale="zh-TW" defaultLocale="zh-TW">
+        <MemoryRouter initialEntries={['/agents/new']}>
+          <SidebarProvider><Routes><Route path="/agents/new" element={<CreateAgentPage />} /></Routes></SidebarProvider>
+        </MemoryRouter>
+      </IntlProvider>,
+    );
+    await waitFor(() => expect(screen.getByText('基本資料')).toBeInTheDocument());
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText('coder'), 'louis');
+    await user.type(screen.getByPlaceholderText('Coder'), 'Louis');
+    await user.selectOptions(screen.getByLabelText('使用的模型'), 'opus');
+    await user.click(screen.getByRole('button', { name: '新增 AI 員工' }));
+    await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
+
+    const alert = screen.getByRole('alert');
+    expect(alert.children[0]).toHaveTextContent('新增 AI 員工失敗：');
+    expect(alert.children[1]).toHaveTextContent('服務帳號缺少執行權限');
+    expect(alert.children[1]).toHaveClass('text-muted-foreground');
+  });
+
+  it('shows unknown backend errors with sanitized detail and no stack trace', async () => {
+    await submitAgentCreateFailure(new Error('Policy load failed\n    at createAgent (gateway.js:42)'));
+
+    expect(screen.getByText('Failed to create agent: Policy load failed')).toBeInTheDocument();
+    expect(screen.queryByText(/at createAgent/)).not.toBeInTheDocument();
   });
 });
 

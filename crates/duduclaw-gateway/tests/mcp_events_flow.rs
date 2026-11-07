@@ -32,13 +32,17 @@ async fn mcp(State(s): State<S>, body: String) -> Response {
         return axum::http::StatusCode::ACCEPTED.into_response();
     }
     let result = match method.as_str() {
-        "initialize" => {
+        "server/discover" | "initialize" => {
             let caps = if s.lock().unwrap().events_capability {
                 json!({ "tools": {}, "events": { "listChanged": true } })
             } else {
                 json!({ "tools": {} })
             };
-            json!({ "protocolVersion": "2025-06-18", "capabilities": caps, "serverInfo": { "name": "fake", "version": "1" } })
+            if method == "server/discover" {
+                json!({ "resultType": "complete", "supportedVersions": ["2026-07-28"], "capabilities": caps })
+            } else {
+                json!({ "protocolVersion": "2025-06-18", "capabilities": caps, "serverInfo": { "name": "fake", "version": "1" } })
+            }
         }
         "events/subscribe" => {
             let p = &frame["params"];
@@ -285,6 +289,7 @@ async fn mcp2(State(s): State<S2>, body: String) -> Response {
     let p = frame["params"].clone();
     let mut f = s.lock().unwrap();
     let result = match method.as_str() {
+        "server/discover" => json!({ "resultType": "complete", "supportedVersions": ["2026-07-28"], "capabilities": { "events": { "listChanged": true } } }),
         "initialize" => json!({ "protocolVersion": "2025-06-18", "capabilities": { "events": { "listChanged": true } }, "serverInfo": { "name": "fake2", "version": "1" } }),
         "events/list" => {
             f.list_pages += 1;

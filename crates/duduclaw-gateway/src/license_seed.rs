@@ -123,16 +123,26 @@ fn seed_license_using(
         return LicenseSeedOutcome::VerifyFailed { source };
     }
 
-    // Verified → persist atomically (tmp + rename, chmod 0600 on Unix). The
-    // signature is over the canonical payload (not the file bytes), so a
-    // re-serialised copy still verifies at bootstrap.
-    if let Err(e) = storage::save_to(&license, &dest) {
-        warn!(
-            source = %source.display(),
-            error = %e,
-            "failed to persist seeded license — not seeded"
-        );
-        return LicenseSeedOutcome::VerifyFailed { source };
+    // Serialize the absence check with every installation and revocation.
+    let result = (|| -> duduclaw_license::Result<bool> {
+        let store = storage::LockedLicenseStore::acquire(&dest)?;
+        for path in [&dest, &home_dir.join(storage::REVOKED_FILENAME)] {
+            match path.try_exists() {
+                Ok(true) => return Ok(false),
+                Ok(false) => {},
+                Err(error) => return Err(duduclaw_license::LicenseError::ParseError(error.to_string())),
+            }
+        }
+        store.save(&license)?;
+        Ok(true)
+    })();
+    match result {
+        Ok(true) => {},
+        Ok(false) => return LicenseSeedOutcome::AlreadyPresent,
+        Err(error) => {
+            warn!(error = %error, "failed to persist seeded license — not seeded");
+            return LicenseSeedOutcome::VerifyFailed { source };
+        }
     }
 
     info!(
@@ -221,6 +231,22 @@ mod tests {
         // Original bytes preserved.
         let bytes = std::fs::read(home.join("license.json")).unwrap();
         assert_eq!(bytes, b"{\"pre\":\"existing\"}");
+    }
+
+    #[test]
+    fn revoked_installation_is_never_seeded_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (kp, pubkey) = gen_issuer_keypair();
+        let registry = PublicKeyRegistry::new().with_key("v1", pubkey);
+        let home = tmp.path().join("home");
+        let store = storage::LockedLicenseStore::acquire(&home.join("license.json")).unwrap();
+        store.revoke("cancelled").unwrap();
+        drop(store);
+        let src = tmp.path().join("mounted-license.json");
+        std::fs::write(&src, serde_json::to_vec(&signed_oem_license(&kp)).unwrap()).unwrap();
+        assert_eq!(seed_license_using(&home, &registry, Some(src)), LicenseSeedOutcome::AlreadyPresent);
+        assert!(!home.join("license.json").exists());
+        assert!(home.join(storage::REVOKED_FILENAME).exists());
     }
 
     #[test]

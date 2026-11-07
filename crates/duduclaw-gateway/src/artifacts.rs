@@ -30,15 +30,17 @@
 //!   file), [`Attribution::Inferred`] when only the (agent, claim→review
 //!   window) convention places it there — the same window `task_changes` uses
 //!   for its MCP half. The UI never presents an inference as a fact.
-//! - Every failure (missing dir, lock error, malformed line) degrades to
-//!   "fewer/no rows". Recording provenance must never break a delivery that
-//!   already succeeded.
+//! - Authorization uses durable content bindings, independently of JSONL audit
+//!   rotation. Missing or unreadable bindings never grant a restricted read.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use duduclaw_core::truncate_bytes;
 use tracing::{debug, warn};
+
+#[path = "artifact_provenance/authority.rs"]
+mod authority;
 
 /// Durable provenance ledger, next to `tool_calls.jsonl` / `task_changes.jsonl`.
 pub const ARTIFACTS_FILE: &str = "artifacts.jsonl";
@@ -154,13 +156,14 @@ pub struct ArtifactEvidenceRef {
 /// One provenance row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactRecord {
+    pub content_hash: Option<String>,
     /// RFC3339 UTC — when the file landed in `attachments/`.
     /// Host-stamped signed-in WebChat owner; never inferred from file text.
     pub owner_user_id: Option<String>,
     pub produced_at: String,
     /// Owning agent, or empty for the shared (`<home>/attachments/`) bucket.
     pub agent_id: String,
-    /// The on-disk name inside `attachments/` (`<ts>_<sanitized>`), i.e. the
+    /// The on-disk UUID-prefixed name (or legacy timestamp name), i.e. the
     /// key `/api/files` lists and `/api/files/download` accepts.
     pub archived_name: String,
     /// The original, human-meaningful filename.
@@ -179,6 +182,7 @@ pub struct ArtifactRecord {
 impl ArtifactRecord {
     fn to_json(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
+        if let Some(hash) = &self.content_hash { map.insert("content_hash".into(), hash.clone().into()); }
         if let Some(owner)=&self.owner_user_id { map.insert("owner_user_id".into(),owner.clone().into()); }
         map.insert("produced_at".into(), self.produced_at.clone().into());
         map.insert("agent_id".into(), self.agent_id.clone().into());
@@ -210,6 +214,7 @@ impl ArtifactRecord {
     fn from_line(line: &str) -> Option<Self> {
         let v: serde_json::Value = serde_json::from_str(line).ok()?;
         Some(ArtifactRecord {
+            content_hash: v.get("content_hash").and_then(|v| v.as_str()).map(str::to_owned),
             owner_user_id: v.get("owner_user_id").and_then(|v|v.as_str()).filter(|s|!s.trim().is_empty()).map(str::to_owned),
             evidence: v.get("evidence").cloned().and_then(|e| serde_json::from_value(e).ok()),
             produced_at: v.get("produced_at").and_then(|x| x.as_str())?.to_string(),
@@ -317,6 +322,12 @@ pub fn split_archived_name(archived: &str) -> Option<(u64, &str)> {
     Some((millis, rest))
 }
 
+fn archived_original(archived: &str) -> Option<&str> {
+    if let Some((_, original)) = split_archived_name(archived) { return Some(original); }
+    let (id, original) = archived.split_once('_')?;
+    if uuid::Uuid::parse_str(id).is_ok() && !original.is_empty() { Some(original) } else { None }
+}
+
 /// Derive `(home_dir, agent_id)` from an attachment base directory.
 ///
 /// `<home>/agents/<id>` ⇒ `(home, id)`; anything else is treated as the shared
@@ -413,8 +424,8 @@ pub fn is_internal_agent_path(path: &str) -> bool {
 /// `<base_dir>/attachments/`.
 ///
 /// `saved_path` is the concrete archived path; `display_name` the original
-/// filename. Entirely best-effort — a lock failure or a serialization error
-/// drops the row rather than disturbing the delivery.
+/// filename. An already completed delivery is not undone on indexing failure,
+/// but the failure is logged and no restricted-read grant is created.
 pub fn record_saved(
     base_dir: &Path,
     saved_path: &Path,
@@ -422,15 +433,47 @@ pub fn record_saved(
     size: u64,
     ctx: &SaveContext<'_>,
 ) {
-    let Some(archived_name) = saved_path.file_name().and_then(|n| n.to_str()) else {
-        return;
-    };
+    let hash = saved_content_hash(saved_path);
+    if let Err(error) = record_saved_with_hash(base_dir, saved_path, display_name, size, ctx, hash) {
+        warn!(%error, "artifact authority recording failed");
+    }
+}
+
+/// Inbound adapters bind the bytes received, not a later reopening of the name.
+pub(crate) fn record_saved_bytes(base_dir: &Path, saved_path: &Path, display_name: &str, data: &[u8], ctx: &SaveContext<'_>) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    record_saved_with_hash(base_dir, saved_path, display_name, data.len() as u64, ctx,
+        Some(hex::encode(Sha256::digest(data))))
+}
+
+fn saved_content_hash(path: &Path) -> Option<String> {
+    use std::io::Read;
+    use sha2::{Digest, Sha256};
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > crate::media::MAX_FILE_SIZE { return None; }
+    let mut bytes = Vec::new();
+    file.take(crate::media::MAX_FILE_SIZE + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > crate::media::MAX_FILE_SIZE { return None; }
+    Some(hex::encode(Sha256::digest(&bytes)))
+}
+
+fn record_saved_with_hash(base_dir: &Path, saved_path: &Path, display_name: &str, size: u64, ctx: &SaveContext<'_>, content_hash: Option<String>) -> Result<(), String> {
+    let archived_name = saved_path.file_name().and_then(|n| n.to_str()).ok_or("invalid archive name")?;
     let (home, agent_id) = derive_home_and_agent(base_dir);
     let owner_user_id = if ctx.channel==Some("webchat") {
         crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone).ok()
             .filter(|u|!u.trim().is_empty() && !crate::webchat::is_widget_visitor(u))
     } else {None};
     let rec = ArtifactRecord {
+        content_hash,
         owner_user_id,
         evidence: None,
         produced_at: chrono::Utc::now().to_rfc3339(),
@@ -447,7 +490,7 @@ pub fn record_saved(
             .and_then(|p| p.to_str())
             .map(|p| truncate_bytes(p, NAME_MAX_BYTES).to_string()),
     };
-    append_rows(&home, std::slice::from_ref(&rec.to_json()));
+    append_rows_durable(&home, std::slice::from_ref(&rec.to_json()))
 }
 
 /// Append a reference only after the immutable review snapshot was committed.
@@ -462,6 +505,7 @@ pub fn record_review_reference(
         return;
     };
     let record = ArtifactRecord {
+        content_hash: reference.content_hash.clone(),
         owner_user_id:None,
         produced_at: row.produced_at.clone(),
         agent_id: row.agent_id.clone(),
@@ -479,11 +523,19 @@ pub fn record_review_reference(
 }
 
 fn append_rows(home_dir: &Path, rows: &[serde_json::Value]) {
-    if rows.is_empty() {
-        return;
+    if let Err(error) = append_rows_durable(home_dir, rows) {
+        warn!(%error, "artifact authority recording failed");
     }
+}
+
+fn append_rows_durable(home_dir: &Path, rows: &[serde_json::Value]) -> Result<(), String> {
+    append_rows_durable_mode(home_dir, rows, true)
+}
+
+fn append_rows_durable_mode(home_dir: &Path, rows: &[serde_json::Value], replace: bool) -> Result<(), String> {
+    if rows.is_empty() { return Ok(()); }
+    authority::write(home_dir, rows, replace)?;
     let path = home_dir.join(ARTIFACTS_FILE);
-    maybe_rotate(&path);
     let mut body = String::new();
     for row in rows {
         if let Ok(line) = serde_json::to_string(row) {
@@ -491,13 +543,12 @@ fn append_rows(home_dir: &Path, rows: &[serde_json::Value]) {
             body.push('\n');
         }
     }
-    if body.is_empty() {
-        return;
-    }
+    if body.is_empty() { return Ok(()); }
     // Cross-process advisory lock (coding convention 3): the ledger sits in a
     // directory several processes append to.
-    let _ = duduclaw_core::with_file_lock(&path, || {
+    let audit = duduclaw_core::with_file_lock(&path, || {
         use std::io::Write as _;
+        maybe_rotate(&path);
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).append(true);
         // Rows carry filenames a customer sent in — never world-readable.
@@ -520,6 +571,8 @@ fn append_rows(home_dir: &Path, rows: &[serde_json::Value]) {
         }
         f.write_all(body.as_bytes())
     });
+    if let Err(error) = audit { warn!(%error, "artifact audit append failed"); }
+    Ok(())
 }
 
 fn maybe_rotate(path: &Path) {
@@ -547,7 +600,7 @@ fn read_ledger(home_dir: &Path) -> Vec<ArtifactRecord> {
         return Vec::new();
     }
     let mut raw = Vec::new();
-    if file.read_to_end(&mut raw).is_err() {
+    if file.take(TAIL_READ_BYTES).read_to_end(&mut raw).is_err() {
         return Vec::new();
     }
     let text = String::from_utf8_lossy(&raw);
@@ -608,9 +661,47 @@ pub fn find_delivered(home_dir: &Path, agent: &str, archived_name: &str) -> Opti
         .find(|r| r.agent_id == agent && r.archived_name == archived_name && r.origin.is_outbound())
 }
 
+/// Exact host-recorded outbound source mapping for historical DELIVER rows.
+/// Never infer an archive from a basename or read the source file itself.
+pub(crate) fn archive_for_history_source(home: &Path, agent: &str, source: &Path) -> Option<String> {
+    HistoryIndex::load(home, Some(agent)).archive_for_source(source)
+}
+
+/// A request-local connection for bounded, indexed authority lookups. It never
+/// loads an agent's entire history or falls back to the rotating audit tail.
+pub(crate) struct HistoryIndex {
+    connection: std::sync::Mutex<Option<crate::fs_safe::sqlite::Connection>>,
+    agent: String,
+}
+impl HistoryIndex {
+    pub(crate) fn load(home: &Path, agent: Option<&str>) -> Self {
+        let connection = authority::open(home).map_err(|error| {
+            warn!(%error, "artifact authority read unavailable");
+        }).ok();
+        Self { connection: std::sync::Mutex::new(connection), agent: agent.unwrap_or("").into() }
+    }
+    pub(crate) fn available(&self) -> bool {
+        self.connection.lock().is_ok_and(|connection| connection.is_some())
+    }
+    pub(crate) fn provenance(&self, name: &str) -> Option<FileProvenance> {
+        self.provenance_checked(name).ok().flatten()
+    }
+    pub(crate) fn provenance_checked(&self, name: &str) -> Result<Option<FileProvenance>, String> {
+        let connection = self.connection.lock().map_err(|_| "artifact authority unavailable")?;
+        authority::get(connection.as_ref().ok_or("artifact authority unavailable")?, &self.agent, name)
+            .map(|record| record.map(FileProvenance::from_record))
+    }
+    pub(crate) fn archive_for_source(&self, source: &Path) -> Option<String> {
+        let connection = self.connection.lock().ok()?;
+        authority::source(connection.as_ref()?, &self.agent, source)
+    }
+}
+
 /// Provenance for one archived file, as `/api/files` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileProvenance {
+    pub content_hash: Option<String>,
+    pub size: u64,
     /// A real save recorded a source and task. Basename-only backfill has
     /// no source and is attribution evidence, never a positive read grant.
     pub saved_task_archive: bool,
@@ -622,30 +713,24 @@ pub struct FileProvenance {
     pub channel: Option<String>,
 }
 
+impl FileProvenance {
+    fn from_record(rec: ArtifactRecord) -> Self {
+        Self {
+            content_hash: rec.content_hash, size: rec.size,
+            saved_task_archive: rec.task_id.is_some() && rec.source_path.is_some() && rec.origin.is_outbound(),
+            owner_user_id: rec.owner_user_id, origin: rec.origin, task_id: rec.task_id,
+            round: rec.round, display_name: rec.display_name, channel: rec.channel,
+        }
+    }
+}
+
 /// Build the `archived_name → provenance` index for one bucket
 /// (`Some(agent)` or the shared bucket). Later rows win, so a backfilled
 /// `unknown` row is superseded by a real one written afterwards.
 pub fn provenance_index(home_dir: &Path, agent: Option<&str>) -> BTreeMap<String, FileProvenance> {
-    let want = agent.unwrap_or("");
-    let mut out = BTreeMap::new();
-    for rec in read_ledger(home_dir) {
-        if rec.agent_id != want {
-            continue;
-        }
-        out.insert(
-            rec.archived_name.clone(),
-            FileProvenance {
-                saved_task_archive:rec.task_id.is_some() && rec.source_path.is_some() && rec.origin.is_outbound(),
-                owner_user_id:rec.owner_user_id,
-                origin: rec.origin,
-                task_id: rec.task_id,
-                round: rec.round,
-                display_name: rec.display_name,
-                channel: rec.channel,
-            },
-        );
-    }
-    out
+    // Presentation only: authorization always performs an exact durable lookup.
+    read_ledger(home_dir).into_iter().filter(|r| r.agent_id == agent.unwrap_or(""))
+        .map(|r| (r.archived_name.clone(), FileProvenance::from_record(r))).collect()
 }
 
 /// One row of the task detail page's 「產物」tab.
@@ -984,21 +1069,19 @@ pub fn backfill(home_dir: &Path) -> BackfillReport {
 
     for (agent, dir) in buckets {
         let agent_id = agent.clone().unwrap_or_default();
-        let known: std::collections::BTreeSet<String> =
-            provenance_index(home_dir, agent.as_deref())
-                .into_keys()
-                .collect();
+        let known = HistoryIndex::load(home_dir, agent.as_deref());
+        if !known.available() { continue; }
         let mut rows: Vec<serde_json::Value> = Vec::new();
         for entry in list_bucket(&dir) {
             report.scanned += 1;
             let (archived_name, size, mtime_ms) = entry;
-            if known.contains(&archived_name) {
+            if known.provenance(&archived_name).is_some() {
                 report.already_known += 1;
                 continue;
             }
             let (millis, sanitized) = match split_archived_name(&archived_name) {
                 Some((m, rest)) => (Some(m), rest.to_string()),
-                None => (None, sanitize_name(&archived_name)),
+                None => (None, archived_original(&archived_name).map(str::to_owned).unwrap_or_else(|| sanitize_name(&archived_name))),
             };
             let produced_at = millis
                 .or(Some(mtime_ms))
@@ -1011,6 +1094,7 @@ pub fn backfill(home_dir: &Path) -> BackfillReport {
                 Some((task_id, round)) => {
                     report.attributed += 1;
                     ArtifactRecord {
+                        content_hash: None,
                         owner_user_id:None,
                         evidence: None,
                         produced_at,
@@ -1028,6 +1112,7 @@ pub fn backfill(home_dir: &Path) -> BackfillReport {
                 None => {
                     report.unknown += 1;
                     ArtifactRecord {
+                        content_hash: None,
                         owner_user_id:None,
                         evidence: None,
                         produced_at,
@@ -1045,7 +1130,9 @@ pub fn backfill(home_dir: &Path) -> BackfillReport {
             };
             rows.push(rec.to_json());
         }
-        append_rows(home_dir, &rows);
+        if let Err(error) = append_rows_durable_mode(home_dir, &rows, false) {
+            warn!(%error, "artifact backfill authority recording failed");
+        }
     }
     report
 }
@@ -1180,7 +1267,7 @@ pub struct GoalArchiveReport {
 
 /// True when `dir` already holds an archived copy of `display_name` with
 /// `size` bytes — the goal-loop counterpart of `office_docs::already_archived`
-/// (private to that module), reusing the same `<ts>_<sanitized>` name+size
+/// (private to that module), accepting UUID and legacy timestamp name+size
 /// match so a task settled twice (or a file also delivered via the
 /// declared/swept path earlier in the same round) does not duplicate the
 /// copy on disk.
@@ -1188,7 +1275,7 @@ fn goal_archive_already_present(dir: &Path, display_name: &str, size: u64) -> bo
     let target = sanitize_name(display_name);
     list_bucket(dir).into_iter().any(|(name, entry_size, _)| {
         entry_size == size
-            && split_archived_name(&name).is_some_and(|(_, sanitized)| sanitized == target)
+            && archived_original(&name).is_some_and(|sanitized| sanitized == target)
     })
 }
 
@@ -1512,6 +1599,17 @@ mod tests {
     }
 
     #[test]
+    fn uuid_archives_keep_backfill_names_and_goal_deduplication() {
+        let home = crate::fs_safe::private_test_home().unwrap();
+        let name = format!("{}_report.docx", uuid::Uuid::new_v4());
+        std::fs::write(home.path().join(&name), b"same").unwrap();
+        assert_eq!(archived_original(&name), Some("report.docx"));
+        assert!(goal_archive_already_present(home.path(), "report.docx", 4));
+        assert!(!goal_archive_already_present(home.path(), "report.docx", 5));
+        assert_eq!(archived_original("not-a-uuid_report.docx"), None);
+    }
+
+    #[test]
     fn sanitize_and_split_round_trip_the_archive_convention() {
         // One replacement per char (not per byte) — CJK collapses hard, which
         // is exactly why sanitized names are only a secondary merge key.
@@ -1556,7 +1654,7 @@ mod tests {
 
     #[test]
     fn record_and_index_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         let base = home.join("agents").join("sales");
         std::fs::create_dir_all(base.join("attachments")).unwrap();
@@ -1579,7 +1677,7 @@ mod tests {
 
     #[test]
     fn uploaded_rows_are_labelled_inbound_and_never_inferred_into_a_task() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         let base = home.join("agents").join("sales");
         std::fs::create_dir_all(base.join("attachments")).unwrap();
@@ -1610,7 +1708,7 @@ mod tests {
 
     #[test]
     fn exact_task_rows_beat_the_window_and_are_labelled_exact() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         let rows = [
             serde_json::json!({
@@ -1678,7 +1776,7 @@ mod tests {
 
     #[test]
     fn unparseable_window_drops_the_inferred_half_instead_of_widening_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         std::fs::write(
             home.join(ARTIFACTS_FILE),
@@ -1699,7 +1797,7 @@ mod tests {
 
     #[test]
     fn round_written_files_surface_as_produced_and_merge_with_their_archive() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         // The task's round wrote two files: one deliverable, one machinery.
         crate::task_changes::record_round_changes(
@@ -1768,7 +1866,7 @@ mod tests {
     /// the primary key is the real basename precisely to prevent that.
     #[test]
     fn distinct_cjk_names_never_false_merge() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         crate::task_changes::record_round_changes(
             home,
@@ -1798,7 +1896,7 @@ mod tests {
 
     #[test]
     fn no_evidence_is_an_honest_empty_result() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let ev = collect_task_artifacts(
             dir.path(),
             "task-1",
@@ -1818,7 +1916,7 @@ mod tests {
 
     #[test]
     fn malformed_ledger_lines_are_skipped_not_fatal() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         let mut body = serde_json::json!({
             "produced_at": "2026-08-15T10:01:00+00:00",
@@ -1840,7 +1938,7 @@ mod tests {
 
     #[test]
     fn backfill_attributes_what_it_can_and_marks_the_rest_unknown() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         let base = home.join("agents").join("sales");
         let attach = base.join("attachments");
@@ -1896,7 +1994,7 @@ mod tests {
 
     #[test]
     fn backfill_never_overwrites_a_real_row() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         let base = home.join("agents").join("sales");
         let attach = base.join("attachments");
@@ -1922,7 +2020,7 @@ mod tests {
 
     #[test]
     fn backfill_of_an_empty_home_is_a_no_op() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let r = backfill(dir.path());
         assert_eq!(r, BackfillReport::default());
         assert!(!dir.path().join(ARTIFACTS_FILE).exists());
@@ -1932,7 +2030,7 @@ mod tests {
 
     #[tokio::test]
     async fn team_packet_artifact_without_native_write_is_downloadable_after_settle() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         let agent_dir = home.join("agents/sales");
         std::fs::create_dir_all(agent_dir.join("notes")).unwrap();
@@ -1983,7 +2081,7 @@ mod tests {
     /// covered the `../secret.txt` containment escape.
     #[tokio::test]
     async fn a_packet_cannot_declare_agent_machinery_as_a_downloadable_artifact() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         let agent_dir = home.join("agents/sales");
         std::fs::create_dir_all(agent_dir.join("notes")).unwrap();
@@ -2065,7 +2163,7 @@ mod tests {
 
     #[tokio::test]
     async fn goal_archive_copies_cjk_named_produced_file_with_exact_attribution() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         let agent_dir = home.join("agents").join("sales");
         std::fs::create_dir_all(&agent_dir).unwrap();
@@ -2110,7 +2208,7 @@ mod tests {
 
     #[tokio::test]
     async fn goal_archive_skips_oversize_file_and_counts_it_not_silently() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         let agent_dir = home.join("agents").join("sales");
         std::fs::create_dir_all(&agent_dir).unwrap();
@@ -2149,7 +2247,7 @@ mod tests {
     #[tokio::test]
     async fn goal_archive_rejects_symlink_escape() {
         use std::os::unix::fs::symlink;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         let agent_dir = home.join("agents").join("sales");
         std::fs::create_dir_all(&agent_dir).unwrap();
@@ -2189,7 +2287,7 @@ mod tests {
 
     #[tokio::test]
     async fn goal_archive_rejects_path_outside_agent_workspace() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         let agent_dir = home.join("agents").join("sales");
         std::fs::create_dir_all(&agent_dir).unwrap();
@@ -2223,7 +2321,7 @@ mod tests {
 
     #[tokio::test]
     async fn goal_archive_of_no_evidence_is_a_no_op() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_safe::private_test_home().unwrap();
         let home = dir.path();
         std::fs::create_dir_all(home.join("agents").join("sales")).unwrap();
         let report = archive_goal_task_artifacts(home, "task-1", "sales").await;
@@ -2245,7 +2343,7 @@ mod bound_history_owner_tests {
     use super::*;
     #[tokio::test]
     async fn only_host_webchat_principal_stamps_an_attachment_owner() {
-        let home=tempfile::tempdir().unwrap();let base=home.path().join("agents/sales");std::fs::create_dir_all(base.join("attachments")).unwrap();
+        let home=crate::fs_safe::private_test_home().unwrap();let base=home.path().join("agents/sales");std::fs::create_dir_all(base.join("attachments")).unwrap();
         let path=base.join("attachments/1_report.txt");std::fs::write(&path,b"test").unwrap();
         crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope("alice".into(),async {
             record_saved(&base,&path,"report.txt",4,&SaveContext::uploaded(Some("webchat")));

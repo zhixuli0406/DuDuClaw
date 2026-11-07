@@ -4,6 +4,68 @@
 use super::*;
 
 impl MethodHandler {
+    pub(crate) async fn handle_mcp_oauth_grants_list(&self) -> WsFrame {
+        let home = self.home_dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            duduclaw_core::mcp_oauth_store::load_store(&home)?.active_grants(&home)
+        }).await;
+        match result {
+            Ok(Ok(grants)) => WsFrame::ok_response("", json!({ "grants": grants })),
+            _ => WsFrame::error_response("", "OAuth grants or key configuration unavailable"),
+        }
+    }
+
+    pub(crate) async fn audit_mcp_oauth_revoke(
+        &self, ctx: &UserContext, id: Option<&str>, outcome: &str,
+        grant: Option<&duduclaw_core::mcp_oauth_store::Grant>,
+    ) -> bool {
+        let event = duduclaw_security::audit::AuditEvent::new(
+            "mcp_oauth_grant_revoke", "dashboard", duduclaw_security::audit::Severity::Info,
+            json!({
+                "actor": ctx.user_id, "family_id": id, "outcome": outcome,
+                "client_name": grant.map(|g| g.client_name.as_str()),
+                "scopes": grant.map(|g| g.scope.split_whitespace().collect::<Vec<_>>()),
+            }),
+        );
+        let home = self.home_dir.clone();
+        matches!(tokio::task::spawn_blocking(move || {
+            duduclaw_security::audit::try_append_audit_event(&home, &event)
+        }).await, Ok(Ok(())))
+    }
+
+    pub(crate) async fn handle_mcp_oauth_grants_revoke(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let id = params.get("id").and_then(Value::as_str)
+            .and_then(|id| uuid::Uuid::parse_str(id).ok()).map(|id| id.to_string());
+        let Some(id) = id else {
+            if !self.audit_mcp_oauth_revoke(ctx, None, "invalid_request", None).await {
+                return WsFrame::error_response("", "OAuth revocation refused; audit unavailable");
+            }
+            return WsFrame::error_response("", "Valid grant id required");
+        };
+        let home = self.home_dir.clone();
+        let target = id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            duduclaw_core::mcp_oauth_store::update_store(&home, |store| {
+                let grant = store.grants.get(&target).cloned();
+                let revoked = store.revoke_family(&target);
+                (revoked, grant)
+            })
+        }).await;
+        match result {
+            Ok(Ok((revoked, grant))) => {
+                let outcome = if revoked { "revoked" } else { "not_found" };
+                if !self.audit_mcp_oauth_revoke(ctx, Some(&id), outcome, grant.as_ref()).await {
+                    return WsFrame::error_response("", "OAuth revocation processed; audit unavailable");
+                }
+                WsFrame::ok_response("", json!({ "success": true, "revoked": revoked }))
+            }
+            _ => {
+                self.audit_mcp_oauth_revoke(ctx, Some(&id), "store_unavailable", None).await;
+                WsFrame::error_response("", "OAuth grant store unavailable")
+            }
+        }
+    }
+
     // ── MK: global [mcp_keys] in config.toml ──────────────────────────────────
 
     /// `mcp_keys.list` — list MCP API keys. NEVER returns cleartext keys; each

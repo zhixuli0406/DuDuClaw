@@ -2,11 +2,11 @@ use super::*;
 
 /// Send a message to another agent via the bus queue.
 pub(crate) async fn handle_send_to_agent(params: &Value, home_dir: &Path, caller: &str) -> Value {
-    send_to_agent_with_ctx(params, home_dir, caller, DelegationContext::from_env()).await
+    send_to_agent_with_ctx(params, home_dir, caller, DelegationContext::from_env(home_dir, caller)).await
 }
 
 /// Core implementation with injectable delegation context.
-/// Production callers use `DelegationContext::from_env()`;
+/// Production callers use `DelegationContext::from_env(home_dir, caller)`;
 /// tests inject a specific context to avoid unsafe env var mutation.
 pub(crate) async fn send_to_agent_with_ctx(
     params: &Value,

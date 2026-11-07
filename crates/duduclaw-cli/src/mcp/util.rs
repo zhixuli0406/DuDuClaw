@@ -171,47 +171,64 @@ pub(crate) fn shared_wiki_reader<'a>(
     }
 }
 
-/// Resolve the agent identity to stamp on execution-attribution records for
-/// this MCP call — `tool_calls.jsonl` audit rows and dashboard live-feedback
-/// events. NOT for delegation-policy decisions (see below).
-///
-/// `DUDUCLAW_DELEGATION_SENDER` (`duduclaw_core::ENV_DELEGATION_SENDER`)
-/// answers a *policy* question — "who delegated this work?" — injected by
-/// `dispatcher.rs`'s `DelegationEnv` (and `cron_scheduler.rs`) into every
-/// spawned Claude CLI subprocess so the WP21 delegation gate can judge the
-/// request. Every scheduler-driven dispatch path (goal-loop, cron, heartbeat,
-/// autopilot) as well as the two human-interface paths (dashboard, webhook)
-/// stamps one of the six `duduclaw_core::SYSTEM_SENDERS` ids as the sender —
-/// these are schedulers / human interfaces, never agents, and never call an
-/// MCP tool themselves. The *worker* agent's own subprocess — whose MCP
-/// server resolves `default_agent` from `DUDUCLAW_AGENT_ID` — is what
-/// actually dials `tools/call`.
-///
-/// Before this fix, execution attribution stamped the sender verbatim, so
-/// every tool call a goal-loop worker made was recorded under
-/// `goal-loop-driver` in `tool_calls.jsonl` instead of the worker's own id.
-/// That starved `task_observe`/A3/A4 of any evidence (every round settled
-/// `Unobservable`, so `task_prediction_log` never closed and no task-rule was
-/// ever induced), left the B3 grounding pre-check permanently `Skip`, and
-/// made the MAV acceptance judge treat honest tool-backed work as an
-/// unverifiable claim — see `wiki/reports/memory-quality/2026-08/wp-a10-live-test-2026-08-06.md`
-/// BUG-1. Because all of those dispatch paths funnel through this single
-/// read site, fixing it here covers every one of them; `goal_loop.rs`,
-/// `cron_scheduler.rs`, `dispatcher.rs` and friends are unchanged.
-///
-/// A genuine agent-to-agent delegation (the sender is a real agent id, not a
-/// reserved system sender) is unaffected: the sender IS the actual caller in
-/// that case, so it is still what gets stamped. Delegation-POLICY decisions
-/// (e.g. `handle_spawn_ephemeral`'s capability envelope / org-placement
-/// `parent`) intentionally do NOT go through this helper — they must keep
-/// reading `DUDUCLAW_DELEGATION_SENDER` verbatim, because "who is allowed to
-/// delegate here" and "who executed this tool call" are different questions.
-pub(crate) fn resolve_audit_agent(fallback: impl FnOnce() -> String) -> String {
-    if let Some(call) = crate::mcp_isolation::current() { return call.agent.clone(); }
-    match std::env::var(duduclaw_core::ENV_DELEGATION_SENDER) {
-        Ok(sender) if !sender.is_empty() && !duduclaw_core::is_system_sender(&sender) => sender,
-        _ => fallback(),
+/// Verify host delegation independently of audit attribution. Raw sender,
+/// origin and depth variables never confer authority.
+pub(crate) fn verified_delegation_context(
+    home: &Path,
+    worker: &str,
+) -> Option<duduclaw_core::identity_token::DelegationContext> {
+    use duduclaw_core::identity_token::{
+        claim_delegation_context, delegation_run_binding, verify_delegation_context,
+        ENV_DELEGATION_CONTEXT,
+    };
+    let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).ok()?;
+    let identity = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).ok()?;
+    if claimed != worker { return None; }
+    let key = zeroize::Zeroizing::new(duduclaw_core::load_identity_key(home)?);
+    if !duduclaw_core::verify_identity_token(&key, worker, &identity) { return None; }
+    let run = std::env::var(duduclaw_core::ENV_DISPATCH_RUN_ID).ok();
+    let task = std::env::var(duduclaw_core::ENV_TASK_ID).ok();
+    let turn = std::env::var(duduclaw_core::ENV_TRUST_TURN_ID).ok();
+    let binding = delegation_run_binding(run.as_deref(), task.as_deref(), turn.as_deref());
+    let token = std::env::var(ENV_DELEGATION_CONTEXT).ok()?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let context = verify_delegation_context(&key, worker, binding.as_deref(), &token, now)?;
+    claim_delegation_context(home, &context).then_some(context)
+}
+
+/// Authorization uses the authenticated worker/client, never audit attribution.
+/// The request dispatcher already resolved and verified the employee identity.
+pub(crate) fn resolve_authorizing_agent(
+    home: &Path,
+    principal: Option<&crate::mcp_auth::Principal>,
+    default_agent: &str,
+) -> String {
+    match principal {
+        Some(p) if p.is_external => p.client_id.clone(),
+        Some(p) => record_actor_for(home, &p.client_id, default_agent).id().to_string(),
+        None => default_agent.to_string(),
     }
+}
+
+pub(crate) fn current_authorizing_agent(home: &Path, default_agent: &str) -> String {
+    let call = crate::mcp_auth::current_authenticated_call();
+    resolve_authorizing_agent(home, call.as_ref().map(|c| c.principal()), default_agent)
+}
+
+/// Audit-only attribution. Callers: tool success/denial logs, usage evidence
+/// comparisons and dashboard feedback. Never use this result for authorization.
+pub(crate) fn resolve_audit_agent(
+    home: &Path,
+    principal: Option<&crate::mcp_auth::Principal>,
+    default_agent: &str,
+) -> String {
+    // A native Linux isolated call is attributed to its connection-bound employee.
+    if let Some(call) = crate::mcp_isolation::current() { return call.agent.clone(); }
+    let Some(principal) = principal else { return default_agent.to_string(); };
+    if principal.is_external { return principal.client_id.clone(); }
+    verified_delegation_context(home, default_agent)
+        .map(|context| context.sender)
+        .unwrap_or_else(|| default_agent.to_string())
 }
 
 /// Which agent is actually acting behind `caller_client_id`?
@@ -274,7 +291,7 @@ pub(crate) fn meeting_audit_tool(tool_name: &str) -> bool {
 }
 
 pub(crate) fn audit_result_text(tool_name: &str, result: &Value) -> Option<String> {
-    if meeting_audit_tool(tool_name) { None } else { extract_tool_result_text(result) }
+    if meeting_audit_tool(tool_name) || matches!(tool_name, "google_chat_spaces" | "google_chat_messages") { None } else { extract_tool_result_text(result) }
 }
 
 fn meeting_audit_arguments(args: &Value) -> Value {
@@ -291,6 +308,11 @@ fn meeting_audit_arguments(args: &Value) -> Value {
 pub(crate) fn audit_safe_arguments(tool_name: &str, args: &Value) -> Value {
     if meeting_audit_tool(tool_name) { return meeting_audit_arguments(args); }
     match tool_name {
+        "google_chat_spaces" | "google_chat_messages" => {
+            let space = args.get("space").and_then(Value::as_str)
+                .filter(|s| duduclaw_gateway::google_workspace::chat_read::valid_space(s));
+            serde_json::json!({"space":space})
+        }
         "credential_declare" => serde_json::json!({"redacted":true}),
         "computer_login" => serde_json::json!({"credential": args.get("credential").and_then(Value::as_str)}),
         "computer_type" => {
@@ -498,5 +520,28 @@ mod meeting_audit_tests {
             assert!(!log.contains(secret), "leaked {secret}");
         }
         assert_eq!(meeting_audit_arguments(&serde_json::json!({"job_id":"https://evil/#token"}))["job_prefix"], Value::Null);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn audit_test_principal(client_id: &str, is_external: bool) -> crate::mcp_auth::Principal {
+    crate::mcp_auth::Principal {
+        client_id: client_id.to_string(), is_external,
+        scopes: Default::default(), created_at: chrono::Utc::now(),
+    }
+}
+
+#[cfg(test)]
+mod google_chat_audit_tests {
+    use super::*;
+
+    #[test]
+    fn google_chat_audit_retains_only_validated_space() {
+        for tool in ["google_chat_spaces", "google_chat_messages"] {
+            let args = serde_json::json!({"space":"spaces/AAAA", "text":"private text", "since":"private timestamp", "thread":"private thread"});
+            assert_eq!(audit_safe_arguments(tool, &args), serde_json::json!({"space":"spaces/AAAA"}));
+            assert_eq!(audit_safe_arguments(tool, &serde_json::json!({"space":"spaces/private text"})), serde_json::json!({"space":null}));
+            assert!(audit_result_text(tool, &serde_json::json!({"content":[{"type":"text","text":"private message"}]})).is_none());
+        }
     }
 }

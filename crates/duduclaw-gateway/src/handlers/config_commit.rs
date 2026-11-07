@@ -484,7 +484,7 @@ pub(crate) fn commit_boot_config<T>(
     render: impl FnOnce(&str, bool) -> Result<(T, Option<String>), String>,
     after_write: impl FnOnce(&T) -> Result<(), String>,
 ) -> Result<T, String> {
-    std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
+    duduclaw_core::config::create_home_dir(home).map_err(|e| e.to_string())?;
     crate::google_identity::home_source::with_source_guard(home, |_| {
         Ok(duduclaw_core::with_file_lock(&home.join("config.toml"), || {
             let path = home.join("config.toml");

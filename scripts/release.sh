@@ -459,6 +459,11 @@ else
         || PRO_MISSING+=("commercial/duduclaw-pro-gateway checkout (private repository)")
     [[ -f "$HOME/.minisign/duduclaw-pro-release.key" ]] \
         || PRO_MISSING+=("Pro signing key ~/.minisign/duduclaw-pro-release.key")
+    # Linux Pro is extracted from an image with its own Cargo profile. Resolve
+    # the cross-format stripper before creating any release or publishing assets.
+    PRO_STRIP_TOOL="${DUDUCLAW_LLVM_STRIP:-llvm-strip}"
+    command -v "$PRO_STRIP_TOOL" >/dev/null 2>&1 \
+        || PRO_MISSING+=("llvm-strip (install LLVM or set DUDUCLAW_LLVM_STRIP)")
     for PRO_TOOL in minisign gcloud docker; do
         command -v "$PRO_TOOL" >/dev/null 2>&1 || PRO_MISSING+=("$PRO_TOOL on PATH")
     done
@@ -905,12 +910,30 @@ package_and_upload_pro_bin() {
     local tar_path="${staged_dir}/${tar_name}"
     local dest="gs://${PRO_BIN_BUCKET}/duduclaw-pro-bin/v${version}/"
 
+    # Darwin was stripped by Cargo before its final code signature. Do not
+    # mutate that Mach-O again here: stripping can invalidate the arm64 seal.
+    # Linux comes from a private image with its own profile, so strip the staged
+    # ELF explicitly before hashing/signing. The tool is checked at preflight.
+    if [[ "$plat" == linux-* ]]; then
+        local strip_tool="${DUDUCLAW_LLVM_STRIP:-llvm-strip}"
+        if ! "$strip_tool" --strip-all "$staged_dir/$plat/duduclaw-pro"; then
+            echo "  ERROR: stripping $plat failed."
+            return 1
+        fi
+    fi
     if ! ( cd "$staged_dir/$plat" && tar czf "$tar_path" duduclaw-pro ); then
         echo "  WARNING: failed to package $tar_name — skipping."
         return 1
     fi
+    # Hard failure, not a best-effort Pro upload: never publish an update that
+    # strands <=1.79.2 installations on their legacy 200 MiB extraction limit.
+    python3 "$(dirname "$0")/check_update_archive_size.py" "$tar_path" || exit 1
     if ! shasum -a 256 "$tar_path" > "${tar_path}.sha256"; then
         echo "  WARNING: sha256 failed for $tar_name — skipping."
+        return 1
+    fi
+    if ! python3 scripts/verify_release_marker.py --tag "v$version" --archive "$tar_path"; then
+        echo "  WARNING: release identity check failed for $tar_name — refusing signing/upload."
         return 1
     fi
     if ! minisign -S -s "$PRO_BIN_KEY" -m "$tar_path" -t "duduclaw-pro v$version $tar_name"; then
@@ -974,6 +997,11 @@ if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
             # The distributor build also embeds the About-page distributor
             # notice when the private checkout has exported one
             # (distributor-notice.html, validated by build-policy.py --check).
+            # vendored-openssl statically links OpenSSL: without it the binary
+            # links Homebrew's openssl@N dylib, which customers do not have.
+            # check_portable_binary.py then fails the build if any non-system
+            # dylib still sneaks in.
+            PORTABLE_CHECK="$PWD/scripts/check_portable_binary.py"
             if ( cd commercial/duduclaw-pro-gateway &&
                  python3 build-policy.py --check &&
                  notice_env=() &&
@@ -981,7 +1009,8 @@ if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
                    notice_env=("DUDUCLAW_DISTRIBUTOR_NOTICE_PATH=$PWD/distributor-notice.html"); } &&
                  env ${notice_env[@]+"${notice_env[@]}"} \
                      DUDUCLAW_INSTALLATION_POLICY_PATH="$PWD/installation-policy.json" \
-                     cargo build --release --locked --bin duduclaw-pro &&
+                     CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release --locked --features vendored-openssl --bin duduclaw-pro &&
+                 python3 "$PORTABLE_CHECK" "$PRO_DARWIN_BIN" &&
                  "$PRO_DARWIN_BIN" --version >/dev/null ); then
                 mkdir -p "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL"
                 if cp "$PRO_DARWIN_BIN" "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL/duduclaw-pro"; then

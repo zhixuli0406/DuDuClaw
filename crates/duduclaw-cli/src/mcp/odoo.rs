@@ -1,5 +1,39 @@
 use super::*;
 
+fn odoo_numeric<T: std::str::FromStr>(params: &Value, name: &str) -> std::result::Result<T, String> {
+    let value = params.get(name).ok_or_else(|| format!("{name} is required"))?;
+    let text = match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        _ => return Err(format!("{name} must be a number or numeric string")),
+    };
+    text.parse().map_err(|_| format!("{name} must be a valid number or numeric string"))
+}
+
+pub(super) fn odoo_positive_integer(params: &Value, name: &str) -> std::result::Result<i64, String> {
+    let value = odoo_numeric::<i64>(params, name)
+        .map_err(|error| format!("{error}; expected a positive integer (1..={})", i64::MAX))?;
+    if value <= 0 {
+        return Err(format!("{name} must be a positive integer"));
+    }
+    Ok(value)
+}
+
+pub(super) fn odoo_limit(params: &Value, default: usize, cap: usize) -> std::result::Result<usize, String> {
+    if params.get("limit").is_none() { return Ok(default); }
+    let value = odoo_positive_integer(params, "limit")?;
+    Ok(value.min(cap as i64) as usize)
+}
+
+pub(super) fn odoo_decimal(params: &Value, name: &str, default: f64) -> std::result::Result<f64, String> {
+    if params.get(name).is_none() { return Ok(default); }
+    let value = odoo_numeric::<f64>(params, name)?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!("{name} must be a finite positive number"));
+    }
+    Ok(value)
+}
+
 pub(crate) async fn handle_odoo_tool(
     tool: &str,
     params: &Value,
@@ -180,11 +214,10 @@ async fn handle_odoo_tool_with_connector(
         }
         "odoo_crm_leads" => {
             let stage = params.get("stage").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = params
-                .get("limit")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(20usize);
+            let limit = match odoo_limit(params, 20, 100) {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
             let mut domain = vec![];
             if !stage.is_empty() {
                 domain.push(serde_json::json!(["stage_id.name", "ilike", stage]));
@@ -220,12 +253,12 @@ async fn handle_odoo_tool_with_connector(
             if let Some(v) = params.get("phone").and_then(|v| v.as_str()) {
                 vals["phone"] = serde_json::json!(v);
             }
-            if let Some(v) = params
-                .get("expected_revenue")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f64>().ok())
-            {
-                vals["expected_revenue"] = serde_json::json!(v);
+            if params.get("expected_revenue").is_some() {
+                let value = match odoo_decimal(params, "expected_revenue", 1.0) {
+                    Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+                };
+                vals["expected_revenue"] = serde_json::json!(value);
             }
             match conn.create("crm.lead", vals).await {
                 Ok(id) => Ok(format!("CRM lead created (ID: {id})")),
@@ -233,16 +266,15 @@ async fn handle_odoo_tool_with_connector(
             }
         }
         "odoo_crm_update_stage" => {
-            let lead_id = params
-                .get("lead_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
+            let lead_id = match odoo_positive_integer(params, "lead_id") {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
             let stage_name = params
                 .get("stage_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if lead_id == 0 || stage_name.is_empty() {
+            if stage_name.is_empty() {
                 return mcp_error("lead_id and stage_name are required");
             }
             // Find stage ID by name
@@ -281,11 +313,10 @@ async fn handle_odoo_tool_with_connector(
         }
         "odoo_sale_orders" => {
             let status = params.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = params
-                .get("limit")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(20usize);
+            let limit = match odoo_limit(params, 20, 100) {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
             let mut domain = vec![];
             if !status.is_empty() {
                 domain.push(serde_json::json!(["state", "=", status]));
@@ -307,24 +338,18 @@ async fn handle_odoo_tool_with_connector(
             }
         }
         "odoo_sale_create_quotation" => {
-            let partner_id = params
-                .get("partner_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            let product_id = params
-                .get("product_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            let qty = params
-                .get("quantity")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(1.0);
-            if partner_id == 0 || product_id == 0 {
-                return mcp_error("partner_id and product_id are required");
-            }
+            let partner_id = match odoo_positive_integer(params, "partner_id") {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
+            let product_id = match odoo_positive_integer(params, "product_id") {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
+            let qty = match odoo_decimal(params, "quantity", 1.0) {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
             let vals = serde_json::json!({
                 "partner_id": partner_id,
                 "order_line": [[0, 0, {"product_id": product_id, "product_uom_qty": qty}]],
@@ -335,14 +360,10 @@ async fn handle_odoo_tool_with_connector(
             }
         }
         "odoo_sale_confirm" => {
-            let order_id = params
-                .get("order_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            if order_id == 0 {
-                return mcp_error("order_id is required");
-            }
+            let order_id = match odoo_positive_integer(params, "order_id") {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
             match conn
                 .execute_kw(
                     "sale.order",
@@ -358,64 +379,51 @@ async fn handle_odoo_tool_with_connector(
         }
         "odoo_inventory_products" => {
             let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = params
-                .get("limit")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(20usize);
-            let mut domain = vec![serde_json::json!(["detailed_type", "=", "product"])];
-            if !query.is_empty() {
-                domain.push(serde_json::json!(["name", "ilike", query]));
-            }
-            match conn
-                .search_read("product.product", domain, inventory::PRODUCT_FIELDS, limit)
-                .await
-            {
-                Ok(data) => {
-                    let products: Vec<inventory::Product> = data
-                        .as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .map(inventory::map_product)
-                        .collect();
-                    Ok(serde_json::to_string_pretty(&products).unwrap_or_default())
-                }
-                Err(e) => Err(e),
-            }
+            let limit = match odoo_limit(params, 20, 100) {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
+            let storable_only = match params.get("storable_only") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return mcp_error("storable_only must be a boolean"),
+            };
+            async {
+                let domain = conn.inventory_product_domain(query, storable_only).await?;
+                let data = conn.search_read(
+                    "product.product", domain, inventory::PRODUCT_FIELDS, limit,
+                ).await?;
+                let products: Vec<inventory::Product> = data
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .map(inventory::map_product)
+                    .collect();
+                Ok(serde_json::to_string_pretty(&products).unwrap_or_default())
+            }.await
         }
         "odoo_inventory_check" => {
-            let product_id = params
-                .get("product_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            if product_id == 0 {
-                return mcp_error("product_id is required");
+            let product_id = match odoo_positive_integer(params, "product_id") {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
+            // This tool also reads product totals; preserve both model gates.
+            if let Err(module) = odoo.feature_gate("product.product").await {
+                return mcp_error(&format!("Odoo feature_gate: module '{module}' is switched off"));
             }
-            let domain = vec![serde_json::json!(["product_id", "=", product_id])];
-            match conn
-                .search_read("stock.quant", domain, inventory::STOCK_QUANT_FIELDS, 10)
-                .await
-            {
-                Ok(data) => {
-                    let quants: Vec<inventory::StockQuant> = data
-                        .as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .map(inventory::map_stock_quant)
-                        .collect();
-                    Ok(serde_json::to_string_pretty(&quants).unwrap_or_default())
-                }
-                Err(e) => Err(e),
+            let cfg = odoo.agent_override(caller_agent).await;
+            if let Err(reason) = crate::odoo_pool::check_action_permission(cfg.as_ref(), "search", "product.product") {
+                return mcp_error(&format!("Odoo permission denied: {reason}"));
             }
+            conn.inventory_check(product_id).await
+                .map(|data| serde_json::to_string_pretty(&data).unwrap_or_default())
         }
         "odoo_invoice_list" => {
             let status = params.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = params
-                .get("limit")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(20usize);
+            let limit = match odoo_limit(params, 20, 100) {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
             let mut domain = vec![serde_json::json!([
                 "move_type",
                 "in",
@@ -446,14 +454,10 @@ async fn handle_odoo_tool_with_connector(
             }
         }
         "odoo_payment_status" => {
-            let invoice_id = params
-                .get("invoice_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            if invoice_id == 0 {
-                return mcp_error("invoice_id is required");
-            }
+            let invoice_id = match odoo_positive_integer(params, "invoice_id") {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
             match conn
                 .search_read(
                     "account.move",
@@ -498,11 +502,10 @@ async fn handle_odoo_tool_with_connector(
                 .and_then(|v| v.as_str())
                 .unwrap_or("id,name");
             let fields: Vec<&str> = fields_str.split(',').map(|s| s.trim()).collect();
-            let limit = params
-                .get("limit")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(20usize);
+            let limit = match odoo_limit(params, 20, 100) {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
             match conn.search_read(model, domain, &fields, limit).await {
                 Ok(data) => Ok(serde_json::to_string_pretty(&data).unwrap_or_default()),
                 Err(e) => Err(e),
@@ -561,12 +564,11 @@ async fn handle_odoo_tool_with_connector(
                 .get("report_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let record_id = params
-                .get("record_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            if report_name.is_empty() || record_id == 0 {
+            let record_id = match odoo_positive_integer(params, "record_id") {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
+            if report_name.is_empty() {
                 return mcp_error("report_name and record_id are required");
             }
             // Reports use a special render method
@@ -594,12 +596,10 @@ async fn handle_odoo_tool_with_connector(
             // generic block list because the field set is hard-coded; still
             // gated by OdooRead scope + per-agent read permission upstream.
             let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = params
-                .get("limit")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(10)
-                .clamp(1, 40);
+            let limit = match odoo_limit(params, 10, 40) {
+                Ok(value) => value,
+                Err(error) => return mcp_error(&error),
+            };
             match conn.partner_search(query, limit).await {
                 Ok(data) => Ok(serde_json::to_string_pretty(&data).unwrap_or_default()),
                 Err(e) => Err(e),

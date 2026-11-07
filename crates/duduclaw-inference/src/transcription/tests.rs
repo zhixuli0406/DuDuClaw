@@ -204,12 +204,6 @@ async fn transcription_whisper_mock_uses_verbose_segments() {
     assert!(!body.contains("zh-TW"));
 }
 
-#[tokio::test]
-async fn transcription_google_stt_explicitly_unsupported() {
-    let error = GoogleSttEngine.transcribe(Path::new("unused.wav"), "zh-TW", &[]).await.unwrap_err();
-    assert!(error.message.starts_with("Unsupported"));
-}
-
 #[test]
 fn transcription_hostile_usage_is_replaced_by_bounded_estimates() {
     let huge = TranscriptionUsage { model: "gemini/test".into(), input_tokens: u64::MAX,
@@ -265,4 +259,166 @@ fn transcription_gemini_one_token_uses_local_audio_estimate() {
     let below = TranscriptionUsage { input_tokens: 9599, input_audio_tokens: 9599, ..usage };
     assert!(bounded_usage(&below, Some(600_000)).estimated);
     assert!(bounded_usage(&boundary, None).estimated);
+}
+
+fn google_config() -> config::GoogleSttConfig {
+    config::GoogleSttConfig { project_id: "meeting-project".into(), bucket: "meeting-audio".into(), ..Default::default() }
+}
+
+fn google_response() -> Value {
+    json!({"results":{"gs://meeting-audio/duduclaw-meetings/test.m4a":{
+        "inlineResult":{"transcript":{"results":[{"alternatives":[{"transcript":"會議開始。", "words":[
+            {"word":"會議", "startOffset":"0.125s", "endOffset":"0.7s"},
+            {"word":"開始", "startOffset":"0.7s", "endOffset":"1.250s"}]}]}]}}
+    }}})
+}
+
+#[test]
+fn transcription_google_stt_request_config_and_mapping() {
+    let engine = GoogleSttEngine::for_test("http://127.0.0.1".into(), google_config());
+    let body = engine.batch_request("gs://meeting-audio/test.m4a");
+    assert_eq!(body["config"]["model"], "chirp_2");
+    assert_eq!(body["config"]["languageCodes"][0], "cmn-Hant-TW");
+    assert_eq!(body["recognitionOutputConfig"], json!({"inlineResponseConfig":{}}));
+    assert!(body["config"]["features"].get("diarizationConfig").is_none());
+    let mapped = google_stt::map_response(&google_response(), "gs://meeting-audio/duduclaw-meetings/test.m4a", "cmn-Hant-TW").unwrap();
+    assert_eq!(mapped.segments[0].start_ms, 125);
+    assert_eq!(mapped.segments[0].end_ms, 1250);
+    assert_eq!(mapped.segments[0].speaker, None);
+    assert!(google_stt::map_response(&google_response(), "gs://different/file", "cmn-Hant-TW").is_err());
+    for value in ["NaNs", "-1s", "1802s", "1", "1e99s"] {
+        let mut response = google_response();
+        response["results"]["gs://meeting-audio/duduclaw-meetings/test.m4a"]["inlineResult"]["transcript"]["results"][0]["alternatives"][0]["words"][0]["startOffset"] = json!(value);
+        assert!(google_stt::map_response(&response, "gs://meeting-audio/duduclaw-meetings/test.m4a", "cmn-Hant-TW").is_err());
+    }
+}
+
+#[test]
+fn transcription_google_stt_rejects_config_and_untrusted_operations() {
+    let config = google_config();
+    assert!(config.validate().is_ok());
+    for field in ["project", "bucket", "location", "model", "language", "diarization"] {
+        let mut cfg = config.clone();
+        match field { "project" => cfg.project_id = "../other".into(), "bucket" => cfg.bucket = "bucket?name".into(),
+            "location" => cfg.location = "host.evil.test".into(), "model" => cfg.model = "long".into(),
+            "language" => cfg.language = "en-US".into(), _ => cfg.diarization = true }
+        assert!(cfg.validate().is_err(), "{field}");
+    }
+    let engine = GoogleSttEngine::for_test("http://127.0.0.1".into(), config);
+    assert!(engine.operation_path("projects/meeting-project/locations/asia-southeast1/operations/abc-12").is_ok());
+    for name in ["https://evil.test", "projects/other/locations/asia-southeast1/operations/a",
+        "projects/meeting-project/locations/asia-southeast1/operations/../../evil",
+        "projects/meeting-project/locations/asia-southeast1/operations/a?key=secret"] {
+        assert!(engine.operation_path(name).is_err());
+    }
+    assert!(google_stt::validate_service_account_json("{\"api_key\":\"secret\"}").is_err());
+    let usage = bounded_usage(&TranscriptionUsage { model: "google-stt/chirp_2".into(), estimated: true, ..Default::default() }, Some(31_250));
+    assert_eq!(usage.audio_seconds, Some(31.25));
+    assert_eq!(usage.input_tokens, 0);
+    assert!(usage.estimated);
+}
+
+#[tokio::test]
+async fn transcription_google_stt_batch_upload_poll_and_cleanup() {
+    let server = MockServer::start(vec![Reply::json(json!({"name":"uploaded"})),
+        Reply::json(json!({"name":"projects/meeting-project/locations/asia-southeast1/operations/one"})),
+        Reply::json(json!({"done":true,"response":google_response()})), Reply::json(json!({}))]).await;
+    let engine = GoogleSttEngine::for_test(server.base.clone(), google_config());
+    let dir = tempfile::tempdir().unwrap();
+    let audio = dir.path().join("sample.m4a");
+    std::fs::write(&audio, b"audio bytes").unwrap();
+    let result = engine.transcribe(&audio, "zh-TW", &[]).await.unwrap();
+    assert_eq!(result.transcript.language, "cmn-Hant-TW");
+    assert_eq!(result.usage[0].model, "google-stt/chirp_2");
+    let requests = server.finish().await;
+    assert_eq!(requests.len(), 4);
+    let upload = String::from_utf8_lossy(&requests[0]);
+    assert!(upload.contains("ifGenerationMatch=0"));
+    assert!(upload.contains("test-token"));
+    assert_eq!(request_body(&requests[0]), b"audio bytes");
+    let body: Value = serde_json::from_slice(request_body(&requests[1])).unwrap();
+    assert_eq!(body["files"][0]["uri"], "gs://meeting-audio/duduclaw-meetings/test.m4a");
+    assert!(String::from_utf8_lossy(&requests[3]).starts_with("DELETE /storage/v1/b/meeting-audio/o/duduclaw-meetings%2Ftest.m4a"));
+}
+
+#[tokio::test]
+async fn transcription_google_stt_auth_quota_errors_are_sanitized_and_cleaned() {
+    for status in [401, 403, 429] {
+        let server = MockServer::start(vec![Reply::json(json!({"name":"uploaded"})),
+            Reply { status, headers: vec![], body:"secret-provider-diagnostic".into() }, Reply::json(json!({}))]).await;
+        let engine = GoogleSttEngine::for_test(server.base.clone(), google_config());
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("sample.m4a");
+        std::fs::write(&audio, b"audio").unwrap();
+        let error = engine.transcribe(&audio, "cmn-Hant-TW", &[]).await.unwrap_err();
+        assert!(!error.message.contains("secret-provider-diagnostic"));
+        assert!(error.message.contains(if status == 429 { "配額" } else { "權限" }), "{error:?}");
+        assert_eq!(error.usage.len(), 1);
+        assert_eq!(server.finish().await.len(), 3);
+    }
+}
+
+#[test]
+fn transcription_google_stt_silence_requires_transcript_object() {
+    let uri = "gs://meeting-audio/duduclaw-meetings/test.m4a";
+    for transcript in [json!({}), json!({"results":[]})] {
+        let response = json!({"results":{(uri):{"inlineResult":{"transcript":transcript}}}});
+        assert!(google_stt::map_response(&response, uri, "cmn-Hant-TW").unwrap().segments.is_empty());
+    }
+    for file in [json!({}), json!({"inlineResult":{}}), json!({"inlineResult":{"transcript":null}}),
+        json!({"inlineResult":{"transcript":{"results":null}}})] {
+        assert!(google_stt::map_response(&json!({"results":{(uri):file}}), uri, "cmn-Hant-TW").is_err());
+    }
+}
+
+#[tokio::test]
+async fn transcription_google_stt_upload_errors_cleanup_without_recognition_usage() {
+    for status in [401, 403, 429] {
+        let server = MockServer::start(vec![Reply { status, headers: vec![], body:"secret-upload-diagnostic".into() },
+            Reply::json(json!({}))]).await;
+        let engine = GoogleSttEngine::for_test(server.base.clone(), google_config());
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("sample.m4a");
+        std::fs::write(&audio, b"audio").unwrap();
+        let error = engine.transcribe(&audio, "cmn-Hant-TW", &[]).await.unwrap_err();
+        assert!(!error.message.contains("secret-upload-diagnostic"));
+        assert!(error.message.contains(if status == 429 { "配額" } else { "權限" }), "{error:?}");
+        assert!(error.usage.is_empty());
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 2);
+        assert!(String::from_utf8_lossy(&requests[1]).starts_with("DELETE "));
+    }
+}
+
+#[tokio::test]
+async fn transcription_google_stt_cleanup_failure_preserves_paid_attempt_usage() {
+    let server = MockServer::start(vec![Reply::json(json!({"name":"uploaded"})),
+        Reply::json(json!({"done":true,"response":google_response()})),
+        Reply { status: 403, headers: vec![], body:"secret-delete-diagnostic".into() }]).await;
+    let engine = GoogleSttEngine::for_test(server.base.clone(), google_config());
+    let dir = tempfile::tempdir().unwrap();
+    let audio = dir.path().join("sample.m4a");
+    std::fs::write(&audio, b"audio").unwrap();
+    let error = engine.transcribe(&audio, "cmn-Hant-TW", &[]).await.unwrap_err();
+    assert!(error.message.contains("無法確認雲端錄音已刪除"), "{error:?}");
+    assert!(!error.message.contains("secret-delete-diagnostic"));
+    assert_eq!(error.usage.len(), 1);
+    assert_eq!(error.usage[0].model, "google-stt/chirp_2");
+    assert_eq!(server.finish().await.len(), 3);
+}
+
+#[tokio::test]
+async fn transcription_google_stt_empty_and_oversize_audio_refused_before_http() {
+    let server = MockServer::start(vec![]).await;
+    let engine = GoogleSttEngine::for_test(server.base.clone(), google_config());
+    let dir = tempfile::tempdir().unwrap();
+    let audio = dir.path().join("sample.m4a");
+    let file = std::fs::File::create(&audio).unwrap();
+    for length in [0, 25 * 1024 * 1024 + 1] {
+        file.set_len(length).unwrap();
+        let error = engine.transcribe(&audio, "cmn-Hant-TW", &[]).await.unwrap_err();
+        assert!(error.message.contains("25 MB"));
+        assert!(error.usage.is_empty());
+    }
+    assert!(server.finish().await.is_empty());
 }

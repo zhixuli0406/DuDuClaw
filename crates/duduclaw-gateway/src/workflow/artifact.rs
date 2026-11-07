@@ -174,6 +174,18 @@ pub async fn verify_download(
     agent: Option<&str>,
     name: &str,
 ) -> Result<(), String> {
+    let agent_id = agent.unwrap_or("");
+    let records = download_receipts(store, agent, name).await?;
+    if records.is_empty() { return check_pending_download(store, agent, name).await; }
+    let root = crate::files_api::attachments_dir(home, Some(agent_id))
+        .ok_or("workflow artifact owner refused")?;
+    let path = crate::files_api::resolve_attachment_file(&root, name)
+        .map_err(|_| "workflow artifact destination refused")?;
+    let (hash, size) = file_hash(&path)?;
+    verify_receipts(&records, &hash, size)
+}
+
+async fn download_receipts(store: &WorkflowStore, agent: Option<&str>, name: &str) -> Result<Vec<String>, String> {
     let agent = agent.unwrap_or("");
     let records: Vec<String> = store
         .with_connection(|c| {
@@ -187,38 +199,114 @@ pub async fn verify_download(
                 .map_err(|e| e.to_string())
         })
         .await?;
-    if records.is_empty() {
-        let pending: bool = store
-            .with_connection(|c|
-                c.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM review_artifact_audiences WHERE agent_id=?1 AND archived_name=?2
-                        AND snapshot_id GLOB 'workflow-artifact:*')",
-                    [agent, name],
-                    |r| r.get(0)
-                )
-                .map_err(|e| e.to_string())
+    Ok(records)
+}
+
+async fn check_pending_download(store: &WorkflowStore, agent: Option<&str>, name: &str) -> Result<(), String> {
+    let agent = agent.unwrap_or("");
+    let pending: bool = store
+        .with_connection(|c|
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM review_artifact_audiences WHERE agent_id=?1 AND archived_name=?2
+                    AND snapshot_id GLOB 'workflow-artifact:*')",
+                [agent, name],
+                |r| r.get(0)
             )
-            .await?;
-        return if pending {
-            Err("workflow artifact commit pending".into())
-        } else {
-            Ok(())
-        };
+            .map_err(|e| e.to_string())
+        )
+        .await?;
+    if pending {
+        Err("workflow artifact commit pending".into())
+    } else {
+        Ok(())
     }
+}
+
+/// History metadata never exposes a pending or ambiguous workflow artifact.
+pub(crate) async fn verify_download_metadata(store: &WorkflowStore, agent: Option<&str>, name: &str) -> Result<(), String> {
+    let records = download_receipts(store, agent, name).await?;
+    if records.is_empty() { return check_pending_download(store, agent, name).await; }
+    if records.len() != 1 { return Err("workflow artifact receipt ambiguous".into()); }
+    let receipt: Value = serde_json::from_str(&records[0]).map_err(|_| "workflow artifact receipt corrupt")?;
+    if receipt.get("file_hash").and_then(Value::as_str).is_none()
+        || receipt.get("bytes").and_then(Value::as_u64).is_none() {
+        return Err("workflow artifact receipt corrupt".into());
+    }
+    Ok(())
+}
+
+pub(crate) async fn has_committed_receipt(store: &WorkflowStore, agent: Option<&str>, name: &str) -> Result<bool, String> {
+    Ok(download_receipts(store, agent, name).await?.len() == 1)
+}
+
+pub(crate) async fn verify_download_hash(store: &WorkflowStore, agent: Option<&str>, name: &str, hash: &str, size: u64) -> Result<(), String> {
+    let records = download_receipts(store, agent, name).await?;
+    if records.is_empty() { return check_pending_download(store, agent, name).await; }
+    verify_receipts(&records, hash, size)
+}
+
+fn verify_receipts(records: &[String], hash: &str, size: u64) -> Result<(), String> {
     if records.len() != 1 {
         return Err("workflow artifact receipt ambiguous".into());
     }
     let receipt: Value =
         serde_json::from_str(&records[0]).map_err(|_| "workflow artifact receipt corrupt")?;
-    let root = crate::files_api::attachments_dir(home, Some(agent))
-        .ok_or("workflow artifact owner refused")?;
-    let path = crate::files_api::resolve_attachment_file(&root, name)
-        .map_err(|_| "workflow artifact destination refused")?;
-    let (hash, size) = file_hash(&path)?;
-    if receipt.get("file_hash").and_then(Value::as_str) != Some(hash.as_str())
+    if receipt.get("file_hash").and_then(Value::as_str) != Some(hash)
         || receipt.get("bytes").and_then(Value::as_u64) != Some(size)
     {
         return Err("workflow artifact receipt no longer matches file".into());
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod download_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_verifies_opened_snapshot_after_path_replacement() {
+        use std::io::Read;
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("report.json");
+        std::fs::write(&path, b"original").unwrap();
+        let mut opened = std::fs::File::open(&path).unwrap();
+        let replacement = home.path().join("replacement.json");
+        std::fs::write(&replacement, b"private replacement").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let mut snapshot = Vec::new();
+        opened.read_to_end(&mut snapshot).unwrap();
+        let hash = hex::encode(Sha256::digest(&snapshot));
+        let receipts = vec![json!({"file_hash":hash,"bytes":snapshot.len()}).to_string()];
+        assert!(verify_receipts(&receipts, &hash, snapshot.len() as u64).is_ok());
+        let changed = std::fs::read(&path).unwrap();
+        assert!(verify_receipts(&receipts, &hex::encode(Sha256::digest(&changed)), changed.len() as u64).is_err());
+        assert!(verify_receipts(&receipts, &hash, 1).is_err());
+        assert!(verify_receipts(&[receipts[0].clone(), receipts[0].clone()], &hash, snapshot.len() as u64).is_err());
+    }
+
+    #[tokio::test]
+    async fn history_metadata_refuses_pending_and_ambiguous_workflow_receipts() {
+        let home = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open(home.path()).unwrap();
+        store.initialize_evidence().await.unwrap();
+        store.bind_artifact_audience("workflow-artifact:run:step", "task", "sales", "report.json", &[]).await.unwrap();
+        assert!(verify_download_metadata(&store, Some("sales"), "report.json").await.is_err());
+        assert!(verify_download_hash(&store, Some("sales"), "report.json", "hash", 4).await.is_err());
+        for id in ["first", "second"] {
+            store.with_connection(|c| {
+                c.execute("INSERT INTO workflow_artifact_commits VALUES (?1,'run','step','content','{}','[]',?2)",
+                    rusqlite::params![id, json!({"agent_id":"sales","archived_name":"report.json","file_hash":"hash","bytes":4}).to_string()])
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }).await.unwrap();
+            if id == "first" {
+                assert!(verify_download_metadata(&store, Some("sales"), "report.json").await.is_ok());
+                assert!(verify_download_hash(&store, Some("sales"), "report.json", "hash", 4).await.is_ok());
+                assert!(verify_download_hash(&store, Some("sales"), "report.json", "changed", 4).await.is_err());
+            }
+        }
+        assert!(verify_download_metadata(&store, Some("sales"), "report.json").await.is_err());
+        assert!(verify_download_hash(&store, Some("sales"), "report.json", "hash", 4).await.is_err());
+    }
+
 }

@@ -35,6 +35,7 @@ pub(crate) fn confirmed_sink_completion(tool: &str, response: &Value) -> bool {
         | "transcribe_audio" | "meeting_transcribe" | "synthesize_speech" | "db_query" | "db_select" | "db_tables"
         | "calendar_create_event" | "calendar_list_events" | "docs_append" | "docs_read"
         | "drive_read" | "drive_search" | "forms_get" | "forms_list_responses"
+        | "google_chat_spaces" | "google_chat_messages"
         | "gmail_create_draft" | "gmail_read" | "gmail_search" | "gtasks_complete"
         | "gtasks_create" | "gtasks_list" | "sheets_append" | "sheets_read" | "slides_read"
         | "mail_send" | "wiki_write" | "wiki_share" | "shared_skill_share"

@@ -68,6 +68,26 @@ async fn handler_with_edition(
     home: &std::path::Path,
     edition: EditionProfile,
 ) -> MethodHandler {
+    // All tests share a verified Business/OEM entitlement; Personal is an explicit downgrade.
+    // Initialize once so parallel tests cannot race the process-global license runtime.
+    static LICENSE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    LICENSE.get_or_init(|| async {
+        use duduclaw_license::{License, LicenseTier, PublicKeyRegistry};
+        use duduclaw_gateway::license_runtime::{self, LicenseRuntime};
+        use ed25519_dalek::Signer;
+        let license_home = tempfile::tempdir().unwrap();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let registry = PublicKeyRegistry::new().with_key("edition-fixture", key.verifying_key().to_bytes().to_vec());
+        let tier = if license_runtime::is_self_host_deployment() { LicenseTier::Oem } else { LicenseTier::Business };
+        let mut license = License::new("sub_edition_fixture", "fixture", tier,
+            duduclaw_license::generate_fingerprint(), chrono::Duration::days(1), "edition-fixture");
+        license.nfr = true;
+        license.signature = key.sign(&license.canonical_payload().unwrap()).to_bytes().to_vec();
+        duduclaw_license::storage::save_to(&license, &license_home.path().join("license.json")).unwrap();
+        let runtime = LicenseRuntime::bootstrap(license_home.path().into(), registry).await;
+        assert_eq!(runtime.current_tier().await, tier);
+        license_runtime::set_global(runtime);
+    }).await;
     let handler = MethodHandler::new(home.to_path_buf()).await;
     handler.set_edition_override(Some(edition)).await;
     handler

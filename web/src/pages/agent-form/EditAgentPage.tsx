@@ -1,3 +1,5 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useProductPolicy } from '@/lib/product-policy';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
@@ -226,6 +228,11 @@ export function EditAgentPage() {
   const { id } = useParams();
   const user = useAuthStore(s => s.user);
   const bindings = useAuthStore(s => s.bindings);
+  const visible = useVisibleAgents();
+  const isPersonal = useSystemStore(s => s.status?.edition_profile) === 'personal';
+  if (user?.role !== 'admin' && !isPersonal && !visible.some(a => a.name === id)) {
+    return <div role="note" className="p-6 text-sm text-muted-foreground">{intl.formatMessage({ id: 'agents.teamReadOnly' })}</div>;
+  }
   // Team access is display-only; do not mount editors or memory loaders.
   if (user?.role === 'manager' && !bindings.some(b => b.agent_name === id)) {
     return <div role="note" className="p-6 text-sm text-muted-foreground">{intl.formatMessage({ id: 'agents.teamReadOnly' })}</div>;
@@ -240,7 +247,8 @@ function EditAgentPageContent() {
   const navigate = useNavigate();
   const { id } = useParams<{ id: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
-  const { updateAgent, agents, fetchAgents } = useAgentsStore();
+  const { updateAgent, fetchAgents } = useAgentsStore();
+  const agents = useSelectableAgents(false);
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
 
   // Sub-tab state lives in `?tab=` (replace + whitelist).
@@ -894,8 +902,10 @@ function EditAgentPageContent() {
     let contractApplied = true;
     try {
       if (hasChanges) {
+        if (!canSelectAgent(agent.name)) throw new Error(intl.formatMessage({ id: 'common.error' }));
         // updateAgent re-fetches the roster internally. Autosave never
         // navigates away — the header SettingsSaveState is the only feedback.
+        if (payload.reports_to && !canSelectAgent(payload.reports_to)) throw new Error(intl.formatMessage({ id: 'common.error' }));
         const res = await updateAgent(agent.name, payload as AgentUpdateParams);
         sectionsSaved = true;
         if (res?.success && payload.odoo?.allowed_actions) {
@@ -934,6 +944,7 @@ function EditAgentPageContent() {
       // CON — a dirty contract writes through its own RPC, which checks the
       // change first and may hold it for a confirmation or a review.
       if (doContract) {
+        if (!canSelectAgent(agent.name)) throw new Error(intl.formatMessage({ id: 'common.error' }));
         const sent = contract;
         const baseHash = contractHashRef.current;
         const res = baseHash
@@ -978,6 +989,7 @@ function EditAgentPageContent() {
       setContractReviewBusy(true);
       setContractReviewError(null);
       try {
+        if (!canSelectAgent(agent.name)) throw new Error(intl.formatMessage({ id: 'common.error' }));
         const analysisId = held.review?.analysis_id ?? undefined;
         const res = await api.contract.update(agent.name, sent, {
           action,
@@ -1157,14 +1169,11 @@ function EditAgentPageContent() {
   const statusOptions: SelectOption[] = ['active', 'paused', 'terminated'].map((s) => ({ value: s, label: intl.formatMessage({ id: `status.${s}` }), raw: s }));
 
   // 上級 dropdown — existing agents (excluding self); keep the current value even
-  // if it isn't in the live roster so it is never silently dropped.
+  // Labels may retain the current value; options require fresh grants.
   const reportsToOptions: SelectOption[] = [
     { value: '', label: intl.formatMessage({ id: 'agents.edit.reportsTo.none' }), raw: '' },
     ...sortAgentsByName(agents.filter((a) => a.name !== agent.name), intl.locale).map((a) => ({ value: a.name, label: a.display_name || a.name, raw: a.name })),
   ];
-  if (form.reports_to && !reportsToOptions.some((o) => o.value === form.reports_to)) {
-    reportsToOptions.push({ value: form.reports_to, label: form.reports_to, raw: form.reports_to });
-  }
 
   // WP7 — in-use departments ∪ pre-created registry departments, for the
   // free-input datalist.

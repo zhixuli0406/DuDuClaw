@@ -25,6 +25,12 @@ jobs:
     needs: delivery-gate
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      # MSVC symbols live in separate PDBs; retain the existing Windows output.
+      CARGO_PROFILE_RELEASE_STRIP: ${{ startsWith(matrix.os, 'windows') && 'none' || 'symbols' }}
+      # Windows only: <=1.79.2 updaters reject an extracted binary >= 200 MiB, and the
+      # 1.80.0 MSVC exe was 210,997,248 bytes at opt-level 3. Optimise for size there.
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ startsWith(matrix.os, 'windows') && 's' || '3' }}
     permissions:
       contents: write
       id-token: write   # cosign keyless (Sigstore OIDC) signing
@@ -94,7 +100,21 @@ jobs:
 
       - name: Build binary (macOS/Windows — with desktop feature)
         if: matrix.target != 'aarch64-unknown-linux-gnu' && runner.os != 'Linux'
-        run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-gateway/desktop,duduclaw-cli/dashboard
+        # vendored-openssl: webauthn-rs needs OpenSSL, and runners/customers have no
+        # usable system copy. openssl-src needs perl + make (macOS) or perl + nmake +
+        # NASM (Windows MSVC); all are preinstalled on GitHub-hosted runners, and the
+        # Windows build already vendored OpenSSL via duduclaw-auth, so no extra env.
+        run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-gateway/desktop,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
+
+      - name: Check binary is portable (macOS)
+        if: runner.os == 'macOS'
+        run: python3 scripts/check_portable_binary.py target/${{ matrix.target }}/release/duduclaw
+
+      - name: Check binary is portable (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python scripts/check_portable_binary.py target/${{ matrix.target }}/release/duduclaw.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package Linux binaries and check glibc baseline
         if: runner.os == 'Linux'
@@ -111,6 +131,7 @@ jobs:
           cd _pkg
           tar czf ../${{ matrix.artifact }}.tar.gz duduclaw python
           cd ..
+          python3 scripts/check_update_archive_size.py ${{ matrix.artifact }}.tar.gz
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
           rm -rf _pkg
 
@@ -131,6 +152,8 @@ jobs:
           cd _pkg
           7z a ../${{ matrix.artifact }}.zip duduclaw.exe python
           cd ..
+          python scripts/check_update_archive_size.py ${{ matrix.artifact }}.zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # Standard "hash  filename" layout so the in-app updater can parse it
           $hash = (Get-FileHash ${{ matrix.artifact }}.zip -Algorithm SHA256).Hash.ToLower()
           "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii ${{ matrix.artifact }}.zip.sha256
@@ -155,9 +178,12 @@ jobs:
             duduclaw-*.pem
 
   release:
-    needs: build
+    needs: [build, delivery-gate]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          ref: ${{ needs.delivery-gate.outputs.commit }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
         with:
           merge-multiple: true
@@ -180,6 +206,7 @@ jobs:
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           for f in duduclaw-*.tar.gz duduclaw-*.zip; do
             [ -f "$f" ] || continue
+            python3 scripts/verify_release_marker.py --tag "$TAG" --archive "$f"
             minisign -S -s /tmp/minisign.key -m "$f" -t "duduclaw $TAG $f" -x "$f.minisig"
           done
           rm -f /tmp/minisign.key

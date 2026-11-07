@@ -2,7 +2,7 @@
 
 [English](../73-meeting-transcripts.md) · [日本語](../ja-JP/73-meeting-transcripts.md)
 
-將 Meet、Zoom、Teams 等平台下載的錄影或錄音，轉成臺灣繁體中文 Markdown 與 JSON，附上時間戳及可辨識的講者標籤。本功能處理已錄好的檔案，不會加入或錄製即時會議，也不會直接讀取 Google Drive；沒有新增 OAuth 權限。
+將 Meet、Zoom、Teams 等平台已錄好的錄影或錄音，轉成臺灣繁體中文 Markdown 與 JSON，附上時間戳及可辨識的講者標籤。可上傳本機檔案，Enterprise 也可從自己的 Google 雲端硬碟連線選取檔案；本功能不會加入或錄製即時會議。
 
 ## 大檔案上傳
 
@@ -11,6 +11,35 @@
 支援 WebCodecs 的瀏覽器會嘗試將 MP4／MOV 的 AAC-LC 音軌轉成單聲道、約 48 kbps 的 AAC，再上傳較小的音訊。WebM、其他音軌格式、瀏覽器不支援或轉換失敗時，上傳原檔；頁面會顯示採用哪一種方式。媒體解析使用固定版本的 mp4box.js（BSD-3-Clause）。這是盡力縮檔，不保證每部影片都能在瀏覽器轉換。
 
 上傳完成後，工作列表會顯示排隊、準備音訊、正在轉錄的段落、完成、失敗或取消。完成後可下載 `.md` 與 `.json`。取消會阻止下一段開始；已送到服務商的那一段會先結束並記錄可取得的費用，不保證免除已發生的費用。
+
+## 從 Google 雲端硬碟與 Meet 匯入（Enterprise）
+
+先到「我的連線」，為自己的 Google 連線開啟會議錄影存取，完成獨立的同意步驟。初次連結個人帳號不會要求 Drive 或 Meet 權限；啟用匯入時才額外要求：
+
+- `https://www.googleapis.com/auth/drive.file`：存取你透過 Google Picker 選取或分享給應用程式的檔案。這個 Google 權限也允許建立與修改檔案，但本功能只執行讀取請求。
+- `https://www.googleapis.com/auth/meetings.space.readonly`：列出近期會議及其錄影參照。
+
+Gateway 分別保存基本服務、會議錄影與員工 Drive 工具的本機用途同意，並綁定封存憑證及其授權紀錄。每項能力都必須同時符合 Google 實際範圍與本機用途同意；會議授權額外回傳 `drive.readonly` 或 `drive`，也不會啟用員工 Drive 工具。增量授權保留先前用途，但必須完整保留舊有 Google 範圍，保存時也會比對原憑證版本；缺少範圍或憑證已被其他操作更新，就拒絕取代舊憑證。沒有本機用途同意的舊紀錄須重新連結。重新連結基本服務會將本機用途重設為基本服務，之後須另行開啟會議錄影與員工 Drive 工具。
+
+開啟「會議逐字稿」，選擇員工，再按「從 Google 雲端硬碟選擇」。近期 Meet 錄影來自 Meet API，選取後須在 Google Picker 確認檔案存取。也可搜尋先前已分享給應用程式的音訊／影片，或開啟 Google Picker 選取其他錄影。確認檔案與接收員工後才匯入；音訊會送至管理員設定的轉錄供應商，沿用上傳的隱私與資料外送檢查。
+
+每次匯入都需要伺服器簽發的確認收據。它證明經 JWT 驗證的控制台使用者，在最近五分鐘內明確登記並確認將這個確切的 Drive 檔案 ID 交給這位接收員工；員工／MCP 權杖不能登記收據。收據限用一次，綁定該使用者、員工與檔案 ID；同一使用者對同一員工的新確認會取代上一張收據。控制台只在使用者確認匯入時登記檔案。缺少、過期、已用過或綁定不符的收據會遭拒。進入匯入程序後，即使後續檢查失敗也會用掉收據，重試須重新確認。伺服器另以該使用者的 Google 連線檢查 Drive 中繼資料，要求 `isAppAuthorized=true`。收據與這個 Google 旗標都不能證明曾在 Google Picker 點擊；控制台呼叫者可用已知 ID 明確確認先前已授權給應用程式的檔案。
+
+僅供控制台使用的 `POST /api/meeting-drive/selection` 必須提供 `agent_id`、`file_id` 與 `confirm: true`，回傳 `selection_receipt` 及 `expires_in`。每位使用者每分鐘最多登記請求 20 次，最多保留八張未過期收據；`POST /api/meeting-drive/import` 必須附上該收據。
+
+`google_status` 只讀取帳號、狀態與依本機用途篩選的範圍中繼資料，不解封憑證、不更新權杖，也不回傳 bearer。Token 端點使用明確的工具允許清單，個人憑證須同時符合對應本機用途與 Google 範圍；狀態查詢與未知工具不能取得 bearer。
+
+Meet 錄影通常位於主辦者雲端硬碟的「Meet Recordings」資料夾，名稱可能因語系不同。查得到會議參照不代表有權讀取錄影檔。近期清單每頁最多讀取 10 場會議、每場 5 筆錄影；有下一頁時可繼續查閱。出現結果受限提示時，清單可能未包含所有錄影，請改用 Google Picker 尋找檔案。
+
+Gateway 以每段最多 8 MiB 將原檔下載到既有上傳暫存，仍受檔案大小、暫存配額、內容格式與長度限制；Drive 匯入不使用瀏覽器縮小音軌。下載總時限為 30 分鐘，每個 30 秒區間須達到平均 32 KiB/s。離開頁面或中斷瀏覽器 HTTP 連線，不保證伺服器停止匯入；請回工作列表確認，必要時取消已建立的工作。伺服器拒絕或取消匯入處理時會清理暫存；gateway 異常結束後，未完成匯入依既有 2 小時上傳閒置期限回收。
+
+本功能不新增讓 AI 員工瀏覽或抓取你的 Drive 的工具，只接受本人登入的控制台、有效個人連線與明確選取。中斷連線、偵測到撤銷權限，或本機存取政策改變後，會停止後續存取；已匯入副本及完成的逐字稿不會因此自動撤回。升級不會自動撤銷既有較廣的 Google 授權。Picker 設定與撤銷方式見[個人 Google 連線指南](../../guides/zh-TW/google-personal-connections.md)。
+
+本機 Drive 來源紀錄含選取帳號、Google 信箱、檔案 ID 與版本。取消、失敗及上傳過期時，來源紀錄會與對應狀態變更在同一資料庫交易內刪除。其餘來源紀錄（含成功匯入）自 `imported_at` 起保留 30 天，期限到後由 gateway 執行期間每 60 秒的既有清理程序刪除；停機後於下一輪清理執行。逐字稿檔案與稽核日誌有各自的保存規則，不會隨這項來源中繼資料清理一併刪除。
+
+`user.google_connect` 稽核記錄授權用途、回傳範圍集合的雜湊摘要及非預期範圍；Drive／Meet 清單讀取與早期拒絕也會記錄。這些事件不保存權杖與檔案內容，匯入識別碼使用雜湊。
+
+真實 Google OAuth／Picker 操作、Drive／Meet 存取及供應商轉錄仍須另行驗收；模擬測試與原始碼檢查不能代表這些流程已通過。
 
 ## 在對話中使用
 
@@ -34,7 +63,7 @@
 
 ```toml
 [transcription]
-engine = "gemini" # gemini、whisper；google_stt 尚未實作
+engine = "gemini" # gemini、whisper、google_stt
 # model = "gemini/<登錄表中支援音訊與結構化輸出的模型>"
 max_bytes = 4294967296 # 1～4294967296，預設 4 GiB
 staging_quota_bytes = 10737418240 # 預設 10 GiB，所有工作與上傳共用
@@ -42,13 +71,35 @@ media_memory_limit_bytes = 2147483648 # 2 GiB
 max_concurrent_jobs = 1 # 只接受 1 或 2
 ```
 
-Gemini 使用設定的模型，未設定時從 ModelRegistry 選擇支援音訊與結構化輸出的 Gemini 模型；Whisper 使用現有 OpenAI 憑證，不提供講者辨識。Gemini 可能誤聽，且跨段講者標籤可能不一致。`google_stt` 明確回覆尚未支援，不會偷偷改用其他服務。員工不能以工具參數更換管理員選定的服務商。
+Gemini 使用設定的模型，未設定時從 ModelRegistry 選擇支援音訊與結構化輸出的 Gemini 模型；Whisper 使用現有 OpenAI 憑證，不提供講者辨識。Gemini 可能誤聽，且跨段講者標籤可能不一致。員工不能以工具參數更換管理員選定的服務商。
 
 主機需安裝 **ffmpeg 與 ffprobe** 才能抽取影片音軌及自動分段。每段約 30 分鐘，最多 96 段／48 小時；沒有 ffmpeg 時，音訊須符合服務商檔案上限，且 ffprobe 必須確認長度不超過 30 分鐘；長度未知或過長時拒絕轉錄。所有結果經 OpenCC `s2twp` 轉成臺灣用語；這不是外語翻譯。
 
 待處理上傳只預留檔案大小加 64 KiB；每位上傳者、每位員工最多 2 筆，且各自最多占總配額一半。取消或過期立即釋放預留額度。建立工作後另預留來源快照、處理副本、轉檔及輸出空間；完成後保留的逐字稿仍按實際檔案大小計入配額。工作結束後刪除上傳來源與音訊暫存，保留逐字稿；原先透過一般附件提交的原始檔不會刪除。未完成工作在閘道重啟後從頭重跑，輸出使用固定工作編號覆寫，不保證避免重複的服務商費用。已回報費用會累計保留，中斷中的請求可能有無法計量的費用。
 
 工作與音訊只由持有執行鎖的閘道處理。員工暫停會阻止新增及後續段落；權限、外送或遮罩政策變更時，舊工作會停止，須重新提交。控制台／連結上傳遇到需要額外核准的轉錄政策時會拒絕，不會略過核准；這一版尚未把網頁上傳接入互動審批流程。
+
+### Google Cloud Speech-to-Text v2
+
+`google_stt` 使用 `asia-southeast1` 的 `chirp_2`，語言預設為 `cmn-Hant-TW`。[Google 的 Chirp 2 文件](https://docs.cloud.google.com/speech-to-text/docs/models/chirp-2)列出臺灣華語與批次辨識，但不支援講者分離。本引擎目前只接受 `cmn-Hant-TW` 與 `chirp_2`，並拒絕開啟講者分離，不會悄悄忽略。地區限 `asia-southeast1`、`us-central1`、`europe-west4`。每段音訊在本機限制為 25 MiB；ffmpeg 產生的 30 分鐘 AAC 分段可符合此上限。單字時間對應到逐字稿段落，講者欄位留空。管理員設定的語言優先於個別工作的語言提示。
+
+1. 在已啟用帳單的 Google Cloud 專案啟用 Cloud Speech-to-Text 與 Cloud Storage，建立相容地區的私人儲存桶。
+2. 建立專用服務帳戶，授予 Speech Client（`roles/speech.client`）及限於該儲存桶的物件建立、讀取與刪除權限。必要時（尤其跨專案）也要授予該專案的 Speech 服務代理讀取儲存桶的權限。不使用 Workspace OAuth 或 Gemini API key。
+3. 在「設定 → 語音 → 會議逐字稿」選擇 Google Cloud Speech-to-Text，填入專案 ID、地區、儲存桶名稱（不含 `gs://`）、語言與 `chirp_2`。將服務帳戶 JSON 貼入只供寫入的憑證欄位；閘道沿用機器金鑰加密，留白保留現有憑證。金鑰不會回傳控制台或員工，按「移除已儲存的金鑰」可清除。控制台使用閘道專屬的 `transcription_credentials.set`（`google_stt_key`）與 `.clear` RPC；兩者都在 extension 路由前確認目前仍為管理員。通用 `system.update_config` 拒絕憑證欄位；原始設定編輯器只允許保留遮罩或清除，不接受新增明文或自行提供的密文，並驗證轉錄設定。儲存時只做本機格式檢查，尚未驗證真實 IAM 權限。
+4. 先提交短錄音，再驗收長錄音、權限及帳單。本次實作未使用真實 Google 服務驗收。
+
+```toml
+[transcription.google_stt]
+project_id = "your-project-id"
+location = "asia-southeast1"
+bucket = "your-private-meeting-bucket"
+language = "cmn-Hant-TW"
+model = "chirp_2"
+diarization = false
+```
+
+[BatchRecognize 的音訊輸入必須放在 GCS](https://docs.cloud.google.com/speech-to-text/docs/batch-recognize)，inline 只省去結果儲存桶。每個音訊片段上傳前，閘道會以檔案鎖保護的持久化紀錄，在 home 目錄記下儲存桶、隨機物件名稱、generation（上傳回覆前為未知）與清理狀態，檔案位於 `<home>/google_stt_cleanup/<uuid>.json`，不含音訊或憑證。上傳及辨識期間持續持有 OS 鎖，掃描會跳過；已知 generation 時只刪除該版本。上傳回覆遺失時，即使提早刪除成功或收到 HTTP 404，仍保留紀錄至 900 秒等待期結束後再次確認。暫時性失敗每輪最多嘗試三次，間隔 1、2 秒；待清理紀錄會保留至重啟後，並在啟動及每 60 秒掃描時重試，直到刪除成功或回傳 HTTP 404。清理僅限目前設定的儲存桶；不符的紀錄會原樣保留，警告只記數量。變更儲存桶前請先完成清理，或恢復先前的儲存桶設定後重試；單獨切換引擎不會停止清理。清理完成前仍須保留有效憑證與刪除權限。Unix 清理目錄權限為 0700，紀錄及鎖檔為 0600，拒絕符號連結與非一般檔案。請同時設定儲存桶生命週期到期規則，作為憑證失效或長期清理失敗的備援；取消不會撤回已送出的辨識或費用。輪詢有時間上限，重啟可能重複產生費用。費用以 V2 標準牌價每分鐘 0.016 美元、秒數無條件進位估算，未計折扣、儲存、網路與其他雲端費用；紀錄標為估算，不能當成帳單。參考 [Google 定價](https://cloud.google.com/speech-to-text/pricing)。辨識品質、地區可用性、真實 IAM、清理及費用仍待活體驗證。
+
 
 ## 指令列與隱私
 

@@ -264,7 +264,7 @@ impl WikiTrustStore {
         let path = path.as_ref();
         let home = path.parent()
             .ok_or_else(|| DuDuClawError::Memory("trust db path has no home directory".into()))?;
-        std::fs::create_dir_all(home)
+        duduclaw_core::config::create_home_dir(home)
             .map_err(|e| DuDuClawError::Memory(format!("create trust db dir: {e}")))?;
         // Home-level: the probe and any schema migration affect every agent's
         // trust rows at once, so they are not attributable to one Wiki root.

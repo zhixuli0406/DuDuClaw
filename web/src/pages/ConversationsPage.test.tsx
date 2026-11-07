@@ -33,6 +33,7 @@ const AGENTS = [
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [{ ...AGENTS[1], via: 'binding', selectable: true }], default_agent: null } as never);
   // The page refreshes the roster on mount; without this the display names
   // would be replaced by raw ids and the label assertions would be vacuous.
   vi.spyOn(api.agents, 'list').mockResolvedValue({ agents: AGENTS } as never);
@@ -79,21 +80,19 @@ describe('ConversationsPage (full history, D17)', () => {
   });
 
   it('scopes the listing for a non-admin, who may not enumerate everyone', async () => {
-    // `chat.sessions.list` is fail-closed: a non-admin MUST name an employee or
-    // the gateway rejects the call. The page therefore scopes to the employee
-    // the chat view is pointed at (falling back to the main agent) rather than
-    // firing an unscoped request and showing an error.
+    // Non-admin history uses a visible assigned employee, never the main fallback.
     useAuthStore.setState({ user: { display_name: 'E', role: 'employee' } as never });
+    useChatStore.setState({ selectedAgentId: 'sales' });
     const list = vi
       .spyOn(api.chatSessions, 'list')
       .mockResolvedValue({ sessions: fakeSessions(2) } as never);
     renderWithProviders(<ConversationsPage />);
-    await waitFor(() => expect(list).toHaveBeenCalledWith({ agent_id: 'main', limit: 200 }));
+    await waitFor(() => expect(list).toHaveBeenCalledWith({ agent_id: 'sales', limit: 200 }));
     expect(list).not.toHaveBeenCalledWith({ limit: 200 });
 
     // …and the filter must not advertise a breadth the RPC would refuse: it
     // names the employee actually in scope instead of "All AI staff".
-    expect(screen.getByRole('combobox')).toHaveTextContent('嘟嘟');
+    expect(screen.getByRole('combobox')).toHaveTextContent('業務小美');
     expect(screen.queryByText(/All AI staff/i)).not.toBeInTheDocument();
   });
 

@@ -402,7 +402,7 @@ async fn flow_metrics_computes_first_pass_yield_and_review_depth() {
     store.insert_task(&goal_review_task("r1")).await.unwrap();
 
     let m = store
-        .flow_metrics(&chrono::Utc::now().to_rfc3339())
+        .flow_metrics(&chrono::Utc::now().to_rfc3339(), "user:alice")
         .await
         .unwrap();
     assert_eq!(m.review_queue_depth, 1);
@@ -418,4 +418,29 @@ async fn flow_metrics_computes_first_pass_yield_and_review_depth() {
         "rounds 1 and 2 → avg 1.5"
     );
     assert_eq!(alice.review_queue_depth, 1);
+
+    // Hidden A2A rows must not affect counts, timing, yield or rounds, even
+    // when they share the visible tasks' employee. Children inherit the gate.
+    let baseline = serde_json::to_value(&m).unwrap();
+    let mut hidden = goal_review_task("hidden-done");
+    hidden.a2a_owner = Some("user:bob".into());
+    hidden.status = "done".into();
+    hidden.completed_at = Some(chrono::Utc::now().to_rfc3339());
+    hidden.revision_round = 19;
+    hidden.agent_seconds = 9000;
+    store.insert_task(&hidden).await.unwrap();
+    let mut child = goal_review_task("hidden-review");
+    child.parent_task_id = Some(hidden.id.clone());
+    store.insert_task(&child).await.unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    for principal in ["user:alice", "user:system"] {
+        let filtered = store.flow_metrics(&now, principal).await.unwrap();
+        assert_eq!(serde_json::to_value(filtered).unwrap(), baseline);
+    }
+    let owner = store.flow_metrics(&now, "user:bob").await.unwrap();
+    assert_eq!(owner.review_queue_depth, 2);
+    assert_eq!(owner.accepts_last_7d, 3);
+    assert_eq!(owner.agents[0].finished, 3);
+    assert!(owner.agents[0].avg_rounds > m.agents[0].avg_rounds);
+    assert!(owner.agents[0].avg_agent_seconds > m.agents[0].avg_agent_seconds);
 }

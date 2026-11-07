@@ -159,7 +159,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "db_tables" | "decision_list" | "diff_branches" | "docs_read" | "drive_read"
         | "drive_search" | "evolution_status" | "file_read" | "fork_cost" | "forms_get"
         | "forms_list_responses" | "github_issue_read" | "github_pr_read"
-        | "github_search_issues" | "github_status" | "gmail_read" | "gmail_search"
+        | "github_search_issues" | "github_status" | "gmail_read" | "gmail_search" | "google_chat_spaces" | "google_chat_messages"
         | "goals_list" | "google_status" | "gtasks_list" | "gtasks_lists" | "hardware_info"
         | "identity_resolve" | "inference_mode" | "inference_status" | "inspect_branches"
         | "knowledge_get_passage" | "knowledge_list_collections" | "knowledge_search"
@@ -263,7 +263,7 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "discovery_list" | "discovery_tree" | "docs_read" | "drive_read" | "drive_search"
         | "evolution_status" | "execute_program" | "file_read" | "fork_cost" | "fork_run"
         | "forms_get" | "forms_list_responses" | "github_issue_read" | "github_pr_read"
-        | "github_search_issues" | "github_status" | "gmail_read" | "gmail_search"
+        | "github_search_issues" | "github_status" | "gmail_read" | "gmail_search" | "google_chat_spaces" | "google_chat_messages"
         | "goals_list" | "google_status" | "gtasks_list" | "gtasks_lists" | "hardware_info"
         | "identity_resolve" | "inference_mode" | "inference_status" | "inspect_branches"
         | "knowledge_get_passage" | "knowledge_list_collections" | "knowledge_search"
@@ -349,6 +349,8 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
     "github_search_issues",
     "gmail_create_draft",
     "gmail_read",
+    "google_chat_spaces",
+    "google_chat_messages",
     "gmail_search",
     "gtasks_complete",
     "gtasks_create",
@@ -862,27 +864,13 @@ pub fn third_party_tool_ref(server: &str, tool: &str) -> String {
     format!("mcp__{server}__{tool}")
 }
 
-/// The class of a third-party tool from its annotations.
-///
-/// - `destructiveHint: true` ⇒ [`ToolEffect::Delete`] (believed from every
-///   server: it can only make the tool stricter);
-/// - `readOnlyHint: true` ⇒ [`ToolEffect::Read`] **only** when
-///   `trust_read_hint` (the operator listed the server in
-///   `[capabilities] trusted_read_hint_servers`), otherwise
-///   [`ToolEffect::Modify`];
-/// - anything else, including absent annotations ⇒ [`ToolEffect::Modify`].
-///
-/// Why `read` needs an opt-in: a malicious or careless server can declare
-/// `readOnlyHint: true` on a tool that deletes things. Believed, that tool
-/// would pass every `read` rule and the explore lane. Not believed, the
-/// cost is that a genuinely read-only tool of an untrusted server is treated
-/// like a write (asked, blocked or hidden wherever `modify` is).
-pub fn effect_from_annotations(ann: &ToolAnnotations, trust_read_hint: bool) -> ToolEffect {
+/// Upstream annotations may raise the default Modify classification, never lower it.
+/// `destructiveHint: true` raises it to Delete, even with a read-only claim.
+/// The legacy trust argument is retained for API compatibility and ignored.
+/// A server-wide trust list cannot authorize a read exception.
+pub fn effect_from_annotations(ann: &ToolAnnotations, _trust_read_hint: bool) -> ToolEffect {
     if ann.destructive == Some(true) {
         return ToolEffect::Delete;
-    }
-    if ann.read_only == Some(true) && trust_read_hint {
-        return ToolEffect::Read;
     }
     ToolEffect::Modify
 }
@@ -918,17 +906,18 @@ pub enum ThirdPartyDecision {
 }
 
 /// One employee's policy for tools of servers other than DuDuClaw's own:
-/// its `action_rules` plus the servers whose read-only hint it believes.
+/// its `action_rules` plus an inert legacy trust list.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ThirdPartyPolicy {
     pub rules: ActionRules,
+    /// Retained for config compatibility; never authorizes an annotation downgrade.
     pub trusted_read_hint_servers: Vec<String>,
 }
 
 impl ThirdPartyPolicy {
-    /// Does this employee believe `server`'s `readOnlyHint`? Exact name.
-    pub fn trusts_read_hint(&self, server: &str) -> bool {
-        self.trusted_read_hint_servers.iter().any(|s| s == server)
+    /// Legacy compatibility query: upstream read-only claims are never trusted.
+    pub fn trusts_read_hint(&self, _server: &str) -> bool {
+        false
     }
 
     /// The class this employee gives `server`'s `tool`.
@@ -1112,6 +1101,8 @@ mod tests {
             "browser_record_start",
             "os_open",
             "gmail_search",
+            "google_chat_spaces",
+            "google_chat_messages",
             "docs_append",
         ] {
             assert_eq!(super::egress_capable(name), Some(true), "{name}");
@@ -1270,11 +1261,11 @@ mod tests {
     }
 
     #[test]
-    fn third_party_annotations_classify_and_read_needs_trust() {
+    fn third_party_annotations_never_lower_risk_even_with_legacy_trust() {
         let ann = |v: serde_json::Value| ToolAnnotations::from_tool(&serde_json::json!({ "annotations": v }));
         let ro = ann(serde_json::json!({ "readOnlyHint": true }));
         assert_eq!(effect_from_annotations(&ro, false), ToolEffect::Modify);
-        assert_eq!(effect_from_annotations(&ro, true), ToolEffect::Read);
+        assert_eq!(effect_from_annotations(&ro, true), ToolEffect::Modify);
         let del = ann(serde_json::json!({ "readOnlyHint": true, "destructiveHint": true }));
         assert_eq!(effect_from_annotations(&del, true), ToolEffect::Delete);
         // Non-boolean hints count as absent; absent never classifies as read.
@@ -1298,14 +1289,14 @@ mod tests {
         };
         assert!(p.has_rules());
         let n = ProcessLane::Normal;
-        assert_eq!(p.decide("github", "get_issue", &ro, &n), ThirdPartyDecision::Allow);
+        assert_eq!(p.decide("github", "get_issue", &ro, &n), ThirdPartyDecision::Ask);
         assert_eq!(p.decide("github", "create_issue", &none, &n), ThirdPartyDecision::Ask);
         assert_eq!(p.decide("github", "delete_repo", &ro, &n), ThirdPartyDecision::Block(ThirdPartyBlock::Rule));
         // Untrusted server: its read-only claim is a modify.
         assert_eq!(p.decide("evil", "wipe", &ro, &n), ThirdPartyDecision::Ask);
         assert_eq!(p.decide("notion", "write_page", &none, &n), ThirdPartyDecision::Allow);
         let e = ProcessLane::Explore;
-        assert_eq!(p.decide("github", "get_issue", &ro, &e), ThirdPartyDecision::Allow);
+        assert_eq!(p.decide("github", "get_issue", &ro, &e), ThirdPartyDecision::Block(ThirdPartyBlock::Lane));
         assert_eq!(p.decide("evil", "wipe", &ro, &e), ThirdPartyDecision::Block(ThirdPartyBlock::Lane));
         assert_eq!(p.decide("notion", "write_page", &none, &e), ThirdPartyDecision::Block(ThirdPartyBlock::Lane));
         assert_eq!(p.decide("github", "get_issue", &ro, &ProcessLane::Invalid), ThirdPartyDecision::Block(ThirdPartyBlock::Lane));

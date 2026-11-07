@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { fireEvent, screen, within } from '@testing-library/react';
 import { mockWsClient } from '@/test/mocks';
@@ -146,3 +147,5 @@ it('counts ready-to-start tasks as unfinished, never as in progress', async () =
   expect(screen.getByRole('button', { name: 'Completed 1' })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Waiting for you 1' })).toBeInTheDocument();
 });
+
+beforeEach(() => setConfirmedCallableAgents(true));

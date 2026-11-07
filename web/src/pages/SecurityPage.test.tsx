@@ -5,6 +5,8 @@ import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { SecurityPage } from './SecurityPage';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAuthStore } from '@/stores/auth-store';
+import { mfaApi } from '@/lib/mfa-api';
 import { useSystemStore } from '@/stores/system-store';
 
 /** Shared response shape — satisfies security.status() / auditLog() /
@@ -134,6 +136,26 @@ describe('SecurityPage', () => {
   });
 });
 
+
+describe('Mail requester approval setting', () => {
+  it('defaults on and saves only the explicit Admin opt-out', async () => {
+    mockWsClient.call.mockResolvedValue({ ...SECURITY_RESPONSE, config: '[security]\n', success: true });
+    renderWithProviders(<SecurityPage />);
+    const toggle = await screen.findByRole('switch', { name: 'Let the requester confirm outgoing mail' });
+    await waitFor(() => expect(toggle).toBeChecked());
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole('button', { name: 'Save outgoing data guard' }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('system.update_config', { security: { mail_requester_approval: false } }));
+  });
+
+  it.each(['false', '"invalid"'])('shows %s as Admin-only', async (value) => {
+    mockWsClient.call.mockResolvedValue({ ...SECURITY_RESPONSE, config: `[security]\nmail_requester_approval=${value}` });
+    renderWithProviders(<SecurityPage />);
+    const toggle = await screen.findByRole('switch', { name: 'Let the requester confirm outgoing mail' });
+    await waitFor(() => expect(toggle).toBeEnabled());
+    expect(toggle).not.toBeChecked();
+  });
+});
 
 describe('Recipient guard setting', () => {
   it('defaults to shadow and writes only the recipient setting', async () => {
@@ -283,4 +305,20 @@ describe('Egress shadow report', () => {
     expect(await screen.findByText('Could not load observations. Try again later.')).toBeInTheDocument();
     expect(screen.queryByText('No observations in this period')).not.toBeInTheDocument();
   });
+});
+
+it('keeps the existing MFA policy switch reachable on Personal for an Admin', async () => {
+  const previousUser = useAuthStore.getState().user;
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
+  useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+  mockWsClient.call.mockResolvedValue(SECURITY_RESPONSE);
+  const overview = vi.spyOn(mfaApi, 'overview').mockResolvedValue({ enforced: true, policy: { degraded: false }, users: [] });
+  try {
+    renderWithProviders(<SecurityPage />);
+    expect(await screen.findByRole('switch', { name: 'Stop requiring two-factor login' })).toBeEnabled();
+    expect(screen.queryByText('Role permissions')).toBeNull();
+  } finally {
+    useAuthStore.setState({ user: previousUser });
+    overview.mockRestore();
+  }
 });

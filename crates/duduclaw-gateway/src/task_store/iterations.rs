@@ -221,7 +221,9 @@ impl TaskStore {
     /// Board level also returns the `review` WIP total and the 7-day acceptance
     /// throughput (for the Little's-Law wait estimate). `accepts_last_7d` counts
     /// goal tasks whose `completed_at` is within the last 7 days.
-    pub async fn flow_metrics(&self, now: &str) -> Result<FlowMetrics, String> {
+    /// A2A ownership is filtered before every per-agent and board aggregate.
+    /// `principal` must come from the authenticated caller, including Admin.
+    pub async fn flow_metrics(&self, now: &str, principal: &str) -> Result<FlowMetrics, String> {
         let tasks = self.list_tasks(None, None, None).await?;
         let cutoff = DateTime::parse_from_rfc3339(now)
             .map(|n| n.with_timezone(&Utc) - chrono::Duration::days(7));
@@ -232,7 +234,7 @@ impl TaskStore {
         let mut accepts_7d = 0i64;
 
         for t in &tasks {
-            if !t.goal_mode {
+            if !t.goal_mode || t.a2a_owner.as_deref().is_some_and(|owner| owner != principal) {
                 continue;
             }
             let e = per.entry(t.assigned_to.clone()).or_default();

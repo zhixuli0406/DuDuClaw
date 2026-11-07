@@ -85,7 +85,7 @@ pub fn verified_employee(home_dir: &std::path::Path, claimed: &str, token: &str)
     {
         return None;
     }
-    let require = duduclaw_core::require_identity_token_from_home(home_dir);
+    let require = duduclaw_core::require_identity_token_from_home(home_dir).ok()?;
     match duduclaw_core::verify_identity_claim(home_dir, claimed, token, require) {
         duduclaw_core::IdentityVerdict::Verified => Some(claimed.to_string()),
         _ => None,

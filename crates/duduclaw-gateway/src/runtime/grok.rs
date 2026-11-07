@@ -449,7 +449,7 @@ impl AgentRuntime for GrokRuntime {
         // MCP wiring: register the duduclaw MCP server before spawning. Grok is
         // MCP-native; the config format is verified (`[mcp_servers.duduclaw]`
         // TOML) but per-agent project-local discovery is the one residual — so we
-        // ALSO forward the agent identity via spawn env below. Warn-not-fatal.
+        // ALSO forward the agent identity via spawn env below. Fail closed.
         // Skipped when `third_party::prepare` already wrote the config.
         if let Some(ref dir) = context.agent_dir {
             if third_party.managed {
@@ -461,8 +461,11 @@ impl AgentRuntime for GrokRuntime {
                     runtime = "grok",
                     agent = %context.agent_id,
                     error = %e,
-                    "failed to write grok MCP config — continuing without it"
+                    "failed to write grok MCP config — refusing spawn"
                 );
+                return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+                    "無法建立受保護的 Grok MCP 設定，這次不啟動。",
+                ));
             }
             // Custom sandbox profiles (duduclaw state dir writable) — see the
             // --sandbox mapping below for why the built-ins are unusable.
@@ -554,6 +557,7 @@ impl AgentRuntime for GrokRuntime {
         // the PTY retry so both spawns look at the same credential root.
         let user_home = resolve_user_home(&context.home_dir, std::env::var("HOME").ok().as_deref());
         let grok_home_override = std::env::var("GROK_HOME").ok();
+        third_party::refuse_global_sources(&user_home, grok_home_override.as_deref())?;
         let mut home_env = build_home_env(&user_home, grok_home_override.as_deref());
         // Folder-trust gate (2026-07-28, verified `grok inspect`: "Project
         // trusted: no"): the per-agent `.grok/config.toml` this runtime writes
@@ -624,9 +628,11 @@ impl AgentRuntime for GrokRuntime {
                         runtime = "grok",
                         agent = %context.agent_id,
                         error = %e,
-                        "failed to write grok MCP config in the overridden work root — \
-                         the member may run without duduclaw tools"
+                        "failed to write grok MCP config in the overridden work root — refusing spawn"
                     );
+                    return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+                        "無法建立工作目錄的受保護 Grok MCP 設定，這次不啟動。",
+                    ));
                 }
                 if let Err(e) = Self::ensure_sandbox_profiles(root, &context.home_dir).await {
                     warn!(
@@ -851,6 +857,12 @@ impl GrokRuntime {
         for (k, v) in duduclaw_core::mcp_forward_env_vars() {
             cmd.env(k, v);
         }
+        for name in [duduclaw_core::ENV_DISPATCH_RUN_ID, duduclaw_core::ENV_TASK_ID,
+            duduclaw_core::ENV_TRUST_TURN_ID] {
+            cmd.env_remove(name);
+        }
+        cmd.envs(crate::claude_runner::delegation_context_env(&context.home_dir, &context.agent_id,
+            crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref())));
         // P2-B N4: the turn/run source identity, same channel as the id. Grok
         // may hand its MCP child only the declared config env, in which case
         // this does not arrive (unverified); the persisted config is not used
@@ -942,7 +954,13 @@ impl GrokRuntime {
         env.extend(duduclaw_core::agent_identity_env_vars_default(
             &context.agent_id,
         ));
+        for name in [duduclaw_core::ENV_DISPATCH_RUN_ID, duduclaw_core::ENV_TASK_ID,
+            duduclaw_core::ENV_TRUST_TURN_ID] {
+            env.remove(name);
+        }
         env.extend(crate::memory_provenance::turn_source_env_pairs());
+        env.extend(crate::claude_runner::delegation_context_env(&context.home_dir, &context.agent_id,
+            deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs()));
         for var in ["DUDUCLAW_HOME", "DUDUCLAW_PORT", "DUDUCLAW_INSTANCE"] {
             if let Ok(v) = std::env::var(var) {
                 if !v.trim().is_empty() {
@@ -1270,6 +1288,11 @@ mod tests {
             .env("XAI_API_KEY", "fixture-key")
             .env(duduclaw_core::ENV_AGENT_ID, "test")
             .envs(duduclaw_core::mcp_forward_env_vars())
+            .env_remove(duduclaw_core::ENV_DISPATCH_RUN_ID)
+            .env_remove(duduclaw_core::ENV_TASK_ID)
+            .env_remove(duduclaw_core::ENV_TRUST_TURN_ID)
+            .envs(crate::claude_runner::delegation_context_env(home.path(), &context.agent_id,
+                crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref())))
             .env_remove(duduclaw_core::ENV_ON_BEHALF_OF)
             .env_remove(crate::on_behalf_of::context::ENV_CONTEXT)
             .env("DUDUCLAW_HOME", home.path())

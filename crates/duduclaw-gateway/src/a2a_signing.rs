@@ -13,10 +13,12 @@
 //!
 //! Key material lives at `<duduclaw_home>/keys/a2a-signing.ed25519` (32 raw
 //! private-key bytes, `chmod 600`). Missing key ⇒ generated on first use.
+//! Existing keys must be regular non-symlink files; Unix additionally requires
+//! the effective user's ownership and mode exactly `0600`.
 //!
 //! **Fail-closed:** every function here returns `Result`/`Option`; a key-load or
-//! generation failure never panics. The HTTP layer falls back to an unsigned
-//! card (see `server.rs`) rather than returning 500.
+//! generation failure never panics. The HTTP layer refuses to serve a card
+//! when signing is unavailable, rather than serving an unsigned replacement.
 //!
 //! All the wire-format helpers (canonical JSON, JWS assembly, base64url) are
 //! pure functions with unit tests, including a sign→verify roundtrip.
@@ -48,10 +50,27 @@ impl A2aSigner {
 
     /// Load the signing key from `path`, generating (and persisting) it on first
     /// run. Returns an error string on any IO / format failure so the caller can
-    /// fall back to serving an unsigned card.
+    /// refuse discovery when signing is unavailable.
     pub fn load_or_generate(path: &Path) -> Result<(Self, bool), String> {
-        match std::fs::read(path) {
-            Ok(bytes) => {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                validate_key_metadata(&metadata)?;
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+                }
+                let file = options.open(path)
+                    .map_err(|e| format!("讀取 A2A 簽章私鑰失敗（{}）：{e}", path.display()))?;
+                // Validate the opened object as well, before reading any secret.
+                validate_key_metadata(&file.metadata()
+                    .map_err(|e| format!("檢查 A2A 私鑰檔失敗：{e}"))?)?;
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                file.take(33).read_to_end(&mut bytes)
+                    .map_err(|e| format!("讀取 A2A 簽章私鑰失敗：{e}"))?;
                 let secret: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
                     format!(
                         "A2A 簽章私鑰長度不符（預期 32 bytes，實際 {}）",
@@ -111,6 +130,27 @@ impl A2aSigner {
     }
 }
 
+fn validate_key_metadata(metadata: &std::fs::Metadata) -> Result<(), String> {
+    if !metadata.file_type().is_file() {
+        return Err("A2A 私鑰必須是一般檔案，不可使用符號連結".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        validate_unix_key_permissions(metadata.uid(), metadata.mode())?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_unix_key_permissions(owner: u32, mode: u32) -> Result<(), String> {
+    // SAFETY: geteuid has no preconditions.
+    if owner != unsafe { libc::geteuid() } || mode & 0o7777 != 0o600 {
+        return Err("A2A 私鑰必須由目前使用者擁有，且權限必須為 0600".into());
+    }
+    Ok(())
+}
+
 /// Generate a fresh key, persist it with `0600` perms, return the signer.
 fn generate_and_persist(path: &Path) -> Result<A2aSigner, String> {
     use rand::rngs::OsRng;
@@ -128,44 +168,27 @@ fn generate_and_persist(path: &Path) -> Result<A2aSigner, String> {
 ///
 /// On Unix the file is created atomically with mode `0600` (the mode is applied
 /// at `open` time, closing the window that `write()` + later `chmod` leaves — a
-/// local user could read the key in between). `set_owner_only_permissions` is
-/// still called afterwards to re-assert `0600` in the rare case the file
-/// pre-existed with looser perms (where the create-time mode is ignored).
+/// local user could read the key in between). Exclusive creation refuses a
+/// key or symlink installed after the initial missing-file check.
 fn write_key_owner_only(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|e| format!("開啟 A2A 私鑰檔失敗（{}）：{e}", path.display()))?;
-        f.write_all(bytes)
-            .map_err(|e| format!("寫入 A2A 簽章私鑰失敗（{}）：{e}", path.display()))?;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-            .map_err(|e| format!("寫入 A2A 簽章私鑰失敗（{}）：{e}", path.display()))?;
-    }
-    set_owner_only_permissions(path)
-}
-
-/// Restrict the key file to owner read/write (`chmod 600` on Unix).
-fn set_owner_only_permissions(path: &Path) -> Result<(), String> {
+    let mut file = options.open(path)
+        .map_err(|e| format!("開啟 A2A 私鑰檔失敗（{}）：{e}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("設定 A2A 私鑰權限失敗（{}）：{e}", path.display()))?;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
+    file.write_all(bytes)
+        .map_err(|e| format!("寫入 A2A 簽章私鑰失敗（{}）：{e}", path.display()))?;
     Ok(())
 }
 
@@ -454,7 +477,65 @@ mod tests {
     fn load_rejects_wrong_length_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.ed25519");
-        std::fs::write(&path, b"too short").unwrap();
-        assert!(A2aSigner::load_or_generate(&path).is_err());
+        write_key_owner_only(&path, b"too short").unwrap();
+        let error = A2aSigner::load_or_generate(&path).err().unwrap();
+        assert!(error.contains("長度不符"));
+    }
+
+    #[test]
+    fn load_rejects_directory_and_generation_never_overwrites_existing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(A2aSigner::load_or_generate(dir.path()).is_err());
+        let path = dir.path().join("existing.ed25519");
+        write_key_owner_only(&path, &[7; 32]).unwrap();
+        assert!(write_key_owner_only(&path, &[9; 32]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), vec![7; 32]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_insecure_modes_without_repairing_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.ed25519");
+        write_key_owner_only(&path, &[7; 32]).unwrap();
+        for mode in [0o400, 0o640, 0o644, 0o660, 0o700, 0o4600] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(A2aSigner::load_or_generate(&path).is_err(), "mode {mode:o}");
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777, mode);
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(A2aSigner::load_or_generate(&path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_permissions_reject_a_foreign_owner() {
+        // Exercise the same predicate as the metadata gate without requiring
+        // root privileges to chown a fixture to a different account.
+        // SAFETY: geteuid has no preconditions.
+        let current = unsafe { libc::geteuid() };
+        assert!(validate_unix_key_permissions(current, 0o100600).is_ok());
+        assert!(validate_unix_key_permissions(current.wrapping_add(1), 0o100600).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_symlinks_dangling_links_and_special_files() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.ed25519");
+        write_key_owner_only(&target, &[7; 32]).unwrap();
+        let link = dir.path().join("link.ed25519");
+        symlink(&target, &link).unwrap();
+        assert!(A2aSigner::load_or_generate(&link).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), vec![7; 32]);
+        std::fs::remove_file(&target).unwrap();
+        assert!(A2aSigner::load_or_generate(&link).is_err());
+        assert!(!target.exists(), "a dangling symlink must not generate its target");
+
+        let socket = dir.path().join("socket.ed25519");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(A2aSigner::load_or_generate(&socket).is_err());
     }
 }

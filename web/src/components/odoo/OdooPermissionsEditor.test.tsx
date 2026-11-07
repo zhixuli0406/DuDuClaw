@@ -19,6 +19,31 @@ beforeEach(() => {
 });
 
 describe('Odoo permissions editor', () => {
+  it('offers all verbs and saves bare and table-specific button grants separately', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<Harness initial={{ allowed_actions: ['execute', 'execute:sale.order'] }} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Add rule' })).toBeEnabled());
+    const first = screen.getByRole('group', { name: 'Rule 1' });
+    expect(within(first).getAllByRole('checkbox')).toHaveLength(6);
+    for (const name of ['Search and read', 'Create', 'Update', 'Delete', 'Button actions', 'Other methods']) {
+      expect(within(first).getByRole('checkbox', { name })).toBeInTheDocument();
+    }
+    await user.click(within(first).getByRole('checkbox', { name: 'Button actions' }));
+    await user.click(within(screen.getByRole('group', { name: 'Rule 2' })).getByRole('checkbox', { name: 'Button actions' }));
+    expect(changed.mock.lastCall?.[0].allowed_actions).toEqual(['execute', 'action', 'execute:sale.order', 'action:sale.order']);
+    await user.click(within(first).getByRole('checkbox', { name: 'Other methods' }));
+    expect(changed.mock.lastCall?.[0].allowed_actions).toEqual(['action', 'execute:sale.order', 'action:sale.order']);
+  });
+
+  it('loads existing button grants as editable checked rules', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<Harness initial={{ allowed_actions: ['action', 'action:sale.order'] }} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Add rule' })).toBeEnabled());
+    expect(screen.getAllByRole('checkbox', { name: 'Button actions' }).every((box) => box.getAttribute('aria-checked') === 'true')).toBe(true);
+    expect(screen.queryByText('Other settings')).not.toBeInTheDocument();
+    await user.click(within(screen.getByRole('group', { name: 'Rule 2' })).getByRole('checkbox', { name: 'Button actions' }));
+    expect(changed.mock.lastCall?.[0].allowed_actions).toEqual(['action']);
+  });
   it('explains empty permissions and retains configured tables when the scan fails', async () => {
     mockWsClient.call.mockImplementation((method: string) => method === 'odoo.permission_options'
       ? Promise.reject(new Error('offline')) : Promise.resolve(policy));
@@ -147,7 +172,8 @@ describe('Odoo account rights', () => {
     const user = userEvent.setup();
     renderWithProviders(<Harness initial={{ allowed_actions: ['write:crm.lead'] }} />);
     await waitFor(() => expect(screen.getByRole('checkbox', { name: 'Create' })).toHaveAttribute('aria-disabled', 'true'));
-    expect(screen.getByRole('checkbox', { name: 'Execute action' })).toHaveAttribute('aria-disabled', 'true');
+    expect(screen.getByRole('checkbox', { name: 'Other methods' })).toHaveAttribute('aria-disabled', 'true');
+    expect(screen.getByRole('checkbox', { name: 'Button actions' })).toHaveAttribute('aria-disabled', 'true');
     await user.click(screen.getByRole('checkbox', { name: 'Create' }));
     expect(changed).not.toHaveBeenCalled();
     expect(screen.getByRole('checkbox', { name: 'Delete' })).not.toHaveAttribute('aria-disabled', 'true');
@@ -165,7 +191,7 @@ describe('Odoo account rights', () => {
     await waitFor(() => expect(screen.getByRole('checkbox', { name: 'Create' })).not.toHaveAttribute('aria-disabled', 'true'));
     for (const checkbox of within(screen.getByRole('group', { name: 'Rule 1' })).getAllByRole('checkbox')) expect(checkbox).not.toHaveAttribute('aria-disabled', 'true');
     expect(screen.getByText('Actual account permissions differ per table.')).toBeInTheDocument();
-    expect(screen.getByText('Odoo determines which buttons can actually run.')).toBeInTheDocument();
+    expect(screen.getByText(/Button actions cover confirm, validate and archive/)).toBeInTheDocument();
   });
 
   it('reads cached rights on load and refreshes only after explicit rescan', async () => {
@@ -192,5 +218,5 @@ it('never applies global account denials to a separate employee connection', asy
   for (const checkbox of within(screen.getByRole('group', { name: 'Rule 1' })).getAllByRole('checkbox')) {
     expect(checkbox).not.toHaveAttribute('aria-disabled', 'true');
   }
-  expect(screen.getAllByText('Could not confirm Odoo permissions')).toHaveLength(5);
+  expect(screen.getAllByText('Could not confirm Odoo permissions')).toHaveLength(6);
 });

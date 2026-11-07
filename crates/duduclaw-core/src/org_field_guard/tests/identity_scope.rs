@@ -21,6 +21,11 @@ fn classifies_the_three_identity_surfaces() {
         classify_identity_surface(&h.join("identity.key"), &h),
         Some(ProtectedSurface::IdentityKey)
     );
+    for name in [crate::identity_token::IDENTITY_INITIALIZED_FILE, crate::identity_token::IDENTITY_LOCK_FILE] {
+        assert_eq!(classify_identity_surface(&h.join(name), &h), Some(ProtectedSurface::IdentityKey));
+        assert!(matches!(check_identity_surface_write(&h.join(name), &h, None, Some("x")),
+            GuardDecision::BlockedIdentitySurface { .. }));
+    }
     // Out of scope: a user project's own files, and a settings.json that
     // is not under an agent's `.claude/`.
     for p in [
@@ -163,8 +168,8 @@ fn hook_settings_and_identity_key_are_refused_outright() {
         GuardDecision::BlockedIdentitySurface { .. }
     ));
 
-    // A wrong-length identity.key silently downgrades strict mode to
-    // `Disabled` — the cheapest possible disable of the whole feature.
+    // Corrupting identity.key must remain blocked even though verification
+    // now rejects a corrupt key in both strict and soft modes.
     let k = home().join("identity.key");
     assert!(matches!(
         check_identity_surface_write(&k, &home(), None, Some("x")),

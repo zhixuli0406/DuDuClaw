@@ -348,6 +348,8 @@ pub(super) async fn build_reply_with_session_inner(
     if let Some(dir) = agent_dir.as_deref() {
         let settings = crate::runtime_config::load_runtime_settings(dir);
         if let Err(error) = crate::runtime_config::ensure_model_provider(&model, settings.provider) {
+            super::health::receive(ctx, &agent_id, session_id).await;
+            super::health::mark(&agent_id, Some("other"));
             return if public_visitor { crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into() } else { format!("⚠️ {error}") };
         }
     }
@@ -665,6 +667,8 @@ pub(super) async fn build_reply_with_session_inner(
         use duduclaw_security::failsafe::FailsafeLevel;
         match effective_level {
             FailsafeLevel::L4Halted => {
+                super::health::receive(ctx, &agent_id, session_id).await;
+                super::health::mark(&agent_id, Some("gate_refused"));
                 // Halted: reply with canned message
                 return failsafe
                     .canned_reply(effective_level)
@@ -672,6 +676,8 @@ pub(super) async fn build_reply_with_session_inner(
                     .to_string();
             }
             FailsafeLevel::L3Muted => {
+                super::health::receive(ctx, &agent_id, session_id).await;
+                super::health::mark(&agent_id, Some("gate_refused"));
                 // Muted: silent drop, no reply
                 record_silent_reply(
                     &ctx.home_dir,
@@ -682,6 +688,8 @@ pub(super) async fn build_reply_with_session_inner(
                 return String::new();
             }
             FailsafeLevel::L2Restricted => {
+                super::health::receive(ctx, &agent_id, session_id).await;
+                super::health::mark(&agent_id, Some("gate_refused"));
                 // Restricted: return canned reply, don't call AI
                 return failsafe
                     .canned_reply(effective_level)
@@ -702,6 +710,8 @@ pub(super) async fn build_reply_with_session_inner(
         let decision = match super::breaker_wait::check_inbound_waiting(cb_registry, session_id, text).await {
             super::breaker_wait::Admission::Decision(d) => d,
             super::breaker_wait::Admission::Refused { notify } => {
+                super::health::receive(ctx, &agent_id, session_id).await;
+                super::health::mark(&agent_id, Some("rate_limited"));
                 record_silent_reply(
                     &ctx.home_dir,
                     session_id,
@@ -724,6 +734,8 @@ pub(super) async fn build_reply_with_session_inner(
                 // Allow through but mark for defensive prompt injection later
             }
             duduclaw_security::circuit_breaker::BreakerDecision::Deny(_) => {
+                super::health::receive(ctx, &agent_id, session_id).await;
+                super::health::mark(&agent_id, Some("gate_refused"));
                 debug!(session_id, "Circuit breaker denied — message dropped");
                 record_silent_reply(
                     &ctx.home_dir,
@@ -734,6 +746,8 @@ pub(super) async fn build_reply_with_session_inner(
                 return String::new(); // silent drop
             }
             duduclaw_security::circuit_breaker::BreakerDecision::Trip(reason) => {
+                super::health::receive(ctx, &agent_id, session_id).await;
+                super::health::mark(&agent_id, Some("gate_refused"));
                 warn!(session_id, reason = %reason, "Circuit breaker tripped");
                 // Audit log
                 duduclaw_security::audit::log_circuit_breaker_trip(
@@ -766,6 +780,8 @@ pub(super) async fn build_reply_with_session_inner(
     if let Some(stop) =
         crate::killswitch_triggers::gate_before_reply(ctx, session_id, user_id, &agent_id).await
     {
+        super::health::receive(ctx, &agent_id, session_id).await;
+        super::health::mark(&agent_id, Some("gate_refused"));
         return stop;
     }
 
@@ -778,6 +794,8 @@ pub(super) async fn build_reply_with_session_inner(
         if let Err(refusal) = crate::budget::gate_before_spawn(
             &ctx.home_dir, agent_dir.as_deref(), &agent_id, "channel_reply",
         ).await {
+            super::health::receive(ctx, &agent_id, session_id).await;
+            super::health::mark(&agent_id, Some("quota"));
             return refusal.to_string();
         }
     }
@@ -793,6 +811,8 @@ pub(super) async fn build_reply_with_session_inner(
         &agent_id,
     );
     if scan.blocked {
+        super::health::receive(ctx, &agent_id, session_id).await;
+        super::health::mark(&agent_id, Some("gate_refused"));
         warn!(
             agent = %agent_id,
             score = scan.risk_score,
@@ -828,6 +848,8 @@ pub(super) async fn build_reply_with_session_inner(
         Ok(t) => t,
         Err(e) => {
             warn!(session_id, error = %e, "redaction of user input failed — turn stopped");
+            super::health::receive(ctx, &agent_id, session_id).await;
+            super::health::mark(&agent_id, Some("gate_refused"));
             return REDACTION_FAILED_REPLY.to_string();
         }
     };
@@ -936,8 +958,9 @@ pub(super) async fn build_reply_with_session_inner(
 
     // Append user message to session using improved CJK-aware token estimate
     let user_tokens = estimate_tokens(&sanitized_text);
+    let client_msg_id = super::WEBCHAT_TURN_DELIVERY.try_with(|turn| turn.client_msg_id.clone()).ok();
     let user_message_id = match session_mgr
-        .append_message_with_id(session_id, "user", &sanitized_text, user_tokens)
+        .append_delivery_message(session_id, "user", &sanitized_text, user_tokens, client_msg_id.as_deref(), false)
         .await
     {
         Ok(id) => Some(id),
@@ -947,7 +970,13 @@ pub(super) async fn build_reply_with_session_inner(
         }
     };
     if let Some(id) = user_message_id {
+        let _ = super::WEBCHAT_TURN_DELIVERY.try_with(|turn| turn.accepted.try_send((session_id.to_owned(), id)));
         crate::credential_ledger::bind_message(&ctx.home_dir, &credential_source, session_id, id);
+        if let Ok(user) = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone) {
+            if !crate::webchat::is_widget_visitor(&user) {
+                crate::recent_skills::record_chat(&ctx.home_dir, &ctx.registry, &user, &agent_id, text).await;
+            }
+        }
     }
     // P2-B: the turn's memory sources are the stored rows' ids (host-made,
     // never from the model). A message that could not be saved has none.
@@ -1425,6 +1454,8 @@ pub(super) async fn build_reply_with_session_inner(
         Ok(p) => p,
         Err(e) => {
             warn!(session_id, error = %e, "redaction of system prompt failed — turn stopped");
+            super::health::receive(ctx, &agent_id, session_id).await;
+            super::health::mark(&agent_id, Some("gate_refused"));
             return REDACTION_FAILED_REPLY.to_string();
         }
     };
@@ -1473,6 +1504,8 @@ pub(super) async fn build_reply_with_session_inner(
         };
     }
 
+    super::health::receive(ctx, &agent_id, session_id).await;
+
     // 1. Try `claude` CLI with multi-account rotation (OAuth + API keys)
     // Wrap in REPLY_CHANNEL scope so `send_to_agent` MCP tool can register
     // delegation callbacks for sub-agent response forwarding.
@@ -1503,13 +1536,15 @@ pub(super) async fn build_reply_with_session_inner(
         None => Default::default(),
     };
     if let Some(direct) = turn_knowledge.direct_reply.clone() {
-        match session_mgr
-            .append_message_with_id(session_id, "assistant", &direct, estimate_tokens(&direct))
+        if !super::webchat_commit_allowed(&agent_id).await { return String::new(); }
+        match super::append_turn_assistant(session_mgr, session_id, &direct, estimate_tokens(&direct))
             .await
         {
             Ok(id) => super::record_turn_assistant_message(session_id, id),
             Err(e) => warn!("Failed to save assistant message to session: {e}"),
         }
+        super::health::mark(&agent_id, None);
+        if !super::webchat_commit_allowed(&agent_id).await { return String::new(); }
         return direct;
     }
     let full_system_prompt =
@@ -1559,6 +1594,7 @@ pub(super) async fn build_reply_with_session_inner(
     // `AgentPrompt.runtime_settings` instead of re-reading inside the choke-point.
     if let Some(dir) = agent_dir.as_deref() {
         if let Err(e) = crate::runtime_config::ensure_active_agent_provider(dir) {
+            super::health::mark(&agent_id, Some("other"));
             return format!("⚠️ {e}");
         }
     }
@@ -1570,6 +1606,7 @@ pub(super) async fn build_reply_with_session_inner(
         .and_then(|s| s.non_claude_provider());
     if let Some(settings)=&runtime_settings {
         if let Err(error)=crate::runtime_config::ensure_model_provider(&model,settings.provider) {
+            super::health::mark(&agent_id, Some("other"));
             return if public_visitor {crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into()} else {format!("⚠️ {error}")};
         }
     }
@@ -1924,6 +1961,10 @@ pub(super) async fn build_reply_with_session_inner(
             )
             .await
             {
+                Ok(local_reply) if local_reply.trim().is_empty() => {
+                    last_cli_error = Some(ReplyFailure::simple(ReplyOrigin::Local, "Empty response".into()));
+                    None
+                }
                 Ok(local_reply) => {
                     info!("Replied via local model ({} chars)", local_reply.len());
                     let notice = last_cli_error.as_ref().map(ReplyFailure::local_notice)
@@ -1981,7 +2022,7 @@ pub(super) async fn build_reply_with_session_inner(
             } else {
                 None
             };
-            if let Some(text) = operator_tool_reply {
+            if let Some(text) = operator_tool_reply.filter(|text| !text.trim().is_empty()) {
                 Some(text)
             } else {
                 match crate::direct_api::call_direct_api(
@@ -1993,6 +2034,10 @@ pub(super) async fn build_reply_with_session_inner(
                 )
                 .await
                 {
+                    Ok(resp) if resp.text.trim().is_empty() => {
+                        last_cli_error = Some(ReplyFailure::simple(ReplyOrigin::AnthropicApi, "Empty response".into()));
+                        None
+                    }
                     Ok(resp) => {
                         info!("Claude replied via Direct API ({} chars)", resp.text.len());
                         Some(resp.text)
@@ -2145,15 +2190,16 @@ pub(super) async fn build_reply_with_session_inner(
             }
         }
 
+        if !super::webchat_commit_allowed(&agent_id).await { return String::new(); }
+
         // Save assistant reply to session.
         //
         // This runs BEFORE the CCR delivery lease is rechecked (that happens
         // in `GuardedReply::new`, after this whole function returns), so the
-        // row id is registered with the turn's delivery gate: a refused
-        // delivery revokes and overwrites it instead of leaving
-        // source-derived wording in the conversation history.
-        match session_mgr
-            .append_message_with_id(session_id, "assistant", &reply, reply_tokens)
+        // row id is registered with the turn's delivery gate. WebChat inserts
+        // it tombstoned until final publication; refusal scrubs its content,
+        // and even a failed scrub cannot expose it in history.
+        match super::append_turn_assistant(session_mgr, session_id, &reply, reply_tokens)
             .await
         {
             Ok(message_id) => {
@@ -2174,6 +2220,8 @@ pub(super) async fn build_reply_with_session_inner(
             }
             Err(e) => warn!("Failed to save assistant message to session: {e}"),
         }
+
+        if !super::webchat_commit_allowed(&agent_id).await { return String::new(); }
 
         // Notify dashboard clients that a session gained a turn, so the
         // conversation sidebar re-lists without a webchat-local trigger.
@@ -3741,10 +3789,22 @@ pub(super) async fn build_reply_with_session_inner(
         let home_for_compress = ctx.home_dir.clone();
         let agent_dir_for_compress = agent_dir.clone();
         let agent_for_compress = agent_id.clone();
+        let compression_verdict = ccr_delivery_verdict();
         tokio::spawn(async move {
+            if let Some(verdict) = compression_verdict {
+                if !matches!(verdict.await, Ok(true)) { return; }
+            }
             if sm.should_compress(&sid).await {
-                // Gather last messages to summarise
-                let msgs = sm.get_messages(&sid).await.unwrap_or_default();
+                // Capture ids before reading text; the final transaction refuses
+                // any intervening turn or visibility change instead of deleting it.
+                let expected_ids = match sm.get_message_ids(&sid).await {
+                    Ok(ids) => ids,
+                    Err(_) => return,
+                };
+                let msgs = match sm.get_messages(&sid).await {
+                    Ok(messages) => messages,
+                    Err(_) => return,
+                };
                 let transcript = {
                     let mut buf = String::with_capacity(msgs.len() * 350);
                     for m in &msgs {
@@ -3791,7 +3851,7 @@ pub(super) async fn build_reply_with_session_inner(
                             .to_string()
                     }
                 };
-                if let Err(e) = sm.compress(&sid, &summary).await {
+                if let Err(e) = sm.compress_if_unchanged(&sid, &summary, &expected_ids).await {
                     warn!("Session compression failed: {e}");
                 }
             }
@@ -3822,6 +3882,7 @@ pub(super) async fn build_reply_with_session_inner(
         )
         .await;
 
+        super::health::mark(&agent_id, None);
         return reply;
     }
 
@@ -3835,8 +3896,10 @@ pub(super) async fn build_reply_with_session_inner(
 
     let failure = last_cli_error.unwrap_or_else(||ReplyFailure::simple(ReplyOrigin::Unknown,"No error info".into()));
     let reason = failure.reason();
+    super::health::mark(&agent_id, Some(if mcp_gate_refused { "gate_refused" } else { super::health::reason(reason) }));
     let diagnostic = failure.audit();
     let err_str = diagnostic.to_string();
+    super::failure::mark_runtime_failure();
     warn!(
         agent = %name,
         reason = ?reason,
@@ -3992,7 +4055,7 @@ pub(crate) fn is_runtime_substitution(requested: &str, actual: &str) -> bool {
 /// the dispatcher path already enforces via `trigger::maybe_run_gvu` — this
 /// channel path was the one caller missing it
 /// (`TODO-evolution-v3-2026-08.md` WP0.3). Fail-closed: missing file /
-/// malformed TOML / absent key all deny (see `agent_gvu_enabled` doc).
+/// malformed TOML deny; an absent key defaults to on (see `agent_gvu_enabled` doc).
 pub(crate) fn channel_gvu_trigger_allowed(agent_dir: &std::path::Path) -> bool {
     crate::gvu::trigger::agent_gvu_enabled(agent_dir)
 }

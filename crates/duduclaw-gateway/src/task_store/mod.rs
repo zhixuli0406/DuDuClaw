@@ -23,7 +23,7 @@ pub(crate) const TASK_COLUMNS: &str = "id, title, description, status, priority,
      source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline, \
      pause_reason, plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json,
      discovery_run_id, discovery_approval_id, criteria_ledger, authority_revision, \
-     on_behalf_of, created_via, cost_cap_cents, timeout_secs, plan_review";
+     on_behalf_of, created_via, cost_cap_cents, timeout_secs, plan_review, a2a_owner";
 
 /// I-3a marker stamped onto `judge_feedback` by [`TaskStore::continue_from_terminal`]
 /// so [`crate::goal_loop::GoalLoopDriver::enqueue_work`] can tell a dashboard
@@ -40,7 +40,9 @@ pub(crate) const CONTINUE_MESSAGE_PREFIX: &str = "\u{0}duduclaw:continue\u{0}";
 
 // ── Task row ────────────────────────────────────────────────
 
+mod a2a;
 mod activity;
+mod access;
 mod assign_schedules;
 pub(crate) use assign_schedules::AssignScheduleSlot;
 mod authority;
@@ -158,6 +160,9 @@ pub struct TaskRow {
     pub priority: String, // low | medium | high | urgent
     pub assigned_to: String,
     pub created_by: String,
+    /// Immutable dashboard principal for A2A work, inherited by descendants.
+    #[serde(default)]
+    pub a2a_owner: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// Host-controlled contract/authority epoch for bound decisions. Unlike
@@ -485,6 +490,7 @@ impl TaskRow {
             pause_reason: None,
             plan_pending: None,
             plan_review: None,
+            a2a_owner: None,
             archived: false,
             pinned: false,
             team_spec_json: None,

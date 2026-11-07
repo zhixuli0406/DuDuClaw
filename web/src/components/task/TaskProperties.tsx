@@ -209,7 +209,12 @@ export function TaskProperties({
               {agents.find((a) => a.name === task.assigned_to)?.display_name || task.assigned_to || '—'}
             </span>
           ) : (
-            <AssigneePopover agents={agents} value={task.assigned_to || null} onChange={onAssign} align="right" />
+            <>
+              {task.assigned_to && !agents.some(a => a.name === task.assigned_to) && (
+                <span className="text-sm text-muted-foreground">{task.assigned_to}</span>
+              )}
+              <AssigneePopover agents={agents} value={agents.some(a => a.name === task.assigned_to) ? task.assigned_to : null} onChange={onAssign} align="right" />
+            </>
           )}
         </PropRow>
       </PropSection>

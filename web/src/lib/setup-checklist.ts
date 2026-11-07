@@ -1,6 +1,5 @@
 import { TASK_ENTRY_POINTS_HIDDEN } from '@/lib/task-entry-visibility';
 import { client } from '@/lib/ws-client';
-import { parseTomlSubset, tomlStr } from '@/lib/config-toml';
 
 const SETUP_READ_TIMEOUT_MS = 10_000;
 
@@ -32,7 +31,7 @@ const positive = (count: number | null | undefined) => count == null ? count : c
 
 /** One table owns the checks, grouping, destinations and progress membership. */
 export const setupItems: readonly SetupItem[] = [
-  { id: 'company', label: 'setup.companyName', to: '/app/system/settings', section: 'company', check: d => d.company == null ? d.company : d.company.trim().length > 0 },
+  { id: 'company', label: 'setup.companyName', to: '/app/system/settings/company', section: 'company', check: d => d.company == null ? d.company : d.company.trim().length > 0 },
   { id: 'knowledge', label: 'setup.knowledge', to: '/knowledge-base', section: 'company', check: d => positive(d.knowledge) },
   { id: 'accounts', label: 'setup.accounts', to: '/app/system/accounts', section: 'company', check: d => d.accounts === undefined || d.accounts === null ? null : d.accounts > 0 },
   { id: 'google', label: 'setup.google', to: '/manage/integrations?tab=google', section: 'company', optional: true, check: d => d.google },
@@ -71,10 +70,10 @@ export async function loadSetupData(onProgress?: SetupDataProgress): Promise<Set
     onProgress?.(key, value);
   });
   await Promise.all([
-    collect('company', read('system.config', value => {
-      const config = record(value);
-      if (typeof config.config !== 'string') throw new Error('Invalid config response');
-      return tomlStr(parseTomlSubset(config.config), 'general', 'name', '');
+    collect('company', read('company.get', value => {
+      const company = record(value);
+      if (typeof company.name !== 'string') throw new Error('Invalid company response');
+      return company.name;
     })),
     collect('knowledge', read('knowledge.collections.list', value => record(value).collections.length)),
     collect('runtime', read('runtime.detect', value => {

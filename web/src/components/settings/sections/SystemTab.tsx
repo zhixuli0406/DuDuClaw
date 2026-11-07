@@ -138,7 +138,7 @@ const SANDBOX_NUMERIC_KEYS = [
 
 // ── G — System tab (gateway / rotation / general / logging / secret_manager) ──
 
-export function SystemTab() {
+export function SystemTab({ section = 'all' }: { section?: 'all' | 'system' | 'security' | 'models' }) {
   const intl = useIntl();
   const { agents, fetchAgents, loaded: agentsLoaded, error: agentsError } = useAgentsStore();
   // [server] — display name + LAN advertising (restart required).
@@ -185,6 +185,7 @@ export function SystemTab() {
   // Loaded values, flattened — a save sends only what differs (plan principle 3).
   const initialRef = useRef<FlatValues>({});
 
+  const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   // P05: 20+ fields render from compiled-in defaults when the read fails, so a
@@ -209,6 +210,7 @@ export function SystemTab() {
   // (auth_token / vault_token) are write-only — left blank, only sent if typed.
   const load = useCallback(() => {
     setLoadError(null);
+    setLoaded(false);
     api.system.config().then((res) => {
       const raw = (res as Record<string, unknown>)?.config;
       if (typeof raw !== 'string') return;
@@ -281,6 +283,7 @@ export function SystemTab() {
         dailyDigestAt: res.daily_digest_at ?? '09:00',
         extra: v168,
       });
+      setLoaded(true);
     }).catch((e) => {
       console.warn('[api]', e);
       setLoadError(e);
@@ -304,22 +307,23 @@ export function SystemTab() {
   };
 
   const handleSave = async () => {
+    if (!loaded || loadError != null) return;
     // Fail-closed on a custom bind IP before touching the network — instant
     // feedback; the gateway re-validates server-side regardless.
-    if (bindMode === 'custom' && bind.trim() !== '' && !isValidIp(bind)) {
+    if ((section === 'all' || section === 'system') && bindMode === 'custom' && bind.trim() !== '' && !isValidIp(bind)) {
       toast.error(intl.formatMessage({ id: 'settings.system.bind.invalid' }));
       return;
     }
     // v1.68: the sandbox limits are validated as a whole server-side; catch
     // the two mistakes the form can make before sending anything.
-    if (SANDBOX_NUMERIC_KEYS.some((k) => {
+    if ((section === 'all' || section === 'security') && SANDBOX_NUMERIC_KEYS.some((k) => {
       const n = extra[k];
       return typeof n !== 'number' || !Number.isFinite(n) || n <= 0;
     })) {
       toast.error(intl.formatMessage({ id: 'settings.sandbox.invalidNumber' }));
       return;
     }
-    if (sandboxSizesInvalid(extra)) {
+    if ((section === 'all' || section === 'security') && sandboxSizesInvalid(extra)) {
       toast.error(intl.formatMessage({ id: 'settings.sandbox.sizeConstraint' }));
       return;
     }
@@ -409,6 +413,7 @@ export function SystemTab() {
         />
       )}
 
+      {(section === 'all' || section === 'system') && <>
       {/* Server — display name + LAN binding/broadcast (mostly restart-required) */}
       <SettingsSection
         title={intl.formatMessage({ id: 'settings.system.server' })}
@@ -450,6 +455,9 @@ export function SystemTab() {
         </DangerZone>
       </SettingsSection>
 
+      </>}
+
+      {(section === 'all' || section === 'security') && <>
       {/* Gateway network binding — restart-required, can lock you out */}
       <SettingsSection title={intl.formatMessage({ id: 'settings.system.gateway' })}>
         <DangerZone
@@ -469,6 +477,9 @@ export function SystemTab() {
         </SettingsCard>
       </SettingsSection>
 
+      </>}
+
+      {(section === 'all' || section === 'security') && <>
       {/* Remote-access allowlist — non-secret, hot-applied (no restart) */}
       <SettingsSection
         title={intl.formatMessage({ id: 'settings.system.remoteAccess' })}
@@ -538,6 +549,9 @@ export function SystemTab() {
         </SettingsCard>
       </SettingsSection>
 
+      </>}
+
+      {(section === 'all' || section === 'system') && <>
       {/* Rotation */}
       <SettingsSection title={intl.formatMessage({ id: 'settings.system.rotation' })}>
         <SettingsCard>
@@ -550,6 +564,9 @@ export function SystemTab() {
         </SettingsCard>
       </SettingsSection>
 
+      </>}
+
+      {(section === 'all' || section === 'system') && <>
       {/* General + Logging */}
       <SettingsSection title={intl.formatMessage({ id: 'settings.system.general' })}>
         <SettingsCard>
@@ -577,6 +594,9 @@ export function SystemTab() {
         </SettingsCard>
       </SettingsSection>
 
+      </>}
+
+      {(section === 'all' || section === 'models') && <>
       {/* Global utility provider and model */}
       <SettingsSection title={intl.formatMessage({ id: 'settings.utility.title' })}>
         <SettingsCard>
@@ -624,6 +644,9 @@ export function SystemTab() {
           )}
       </SettingsSection>
 
+      </>}
+
+      {(section === 'all' || section === 'security') && <>
       {/* Memory — B1 write-time dedup gate */}
       <SettingsSection title={intl.formatMessage({ id: 'settings.system.memory' })}>
         <SettingsCard>
@@ -636,15 +659,27 @@ export function SystemTab() {
         </SettingsCard>
       </SettingsSection>
 
+      </>}
+
+      {(section === 'all' || section === 'security') && <>
       {/* v1.68 (W2) — memory trust guard, tracing, GitHub tools, A2A trust */}
       <TrustAndObservabilitySection values={extra} set={setExtraKey} otelCompiled={otelCompiled} isAdmin={isAdmin} />
 
+      </>}
+
+      {(section === 'all' || section === 'security') && <>
       {/* v1.68 (W2) — local-file roots for file_read / csv_read / xlsx_read */}
       <FilesRootsSection values={extra} set={setExtraKey} />
 
+      </>}
+
+      {(section === 'all' || section === 'security') && <>
       {/* v1.68 (W2) — task sandbox + computer-use image */}
       <SandboxSection values={extra} set={setExtraKey} />
 
+      </>}
+
+      {(section === 'all' || section === 'system') && <>
       {/* S20 — Telegram Mini App approval screen. Off by default; needs an
           https dashboard URL to render a button at all. */}
       <SettingsSection title={intl.formatMessage({ id: 'settings.system.miniapp' })}>
@@ -658,6 +693,9 @@ export function SystemTab() {
         </SettingsCard>
       </SettingsSection>
 
+      </>}
+
+      {(section === 'all' || section === 'system') && <>
       {/* Daily digest — W2-8, the second of the two notification channels
           (event-driven pushes above, a scheduled roll-up here). Off by
           default; "無事不寄" — a quiet day sends nothing at all. */}
@@ -689,6 +727,9 @@ export function SystemTab() {
         </SettingsCard>
       </SettingsSection>
 
+      </>}
+
+      {(section === 'all' || section === 'security') && <>
       {/* Secret manager — advanced */}
       <SettingsSection title={intl.formatMessage({ id: 'settings.system.secrets' })}>
         <AdvancedSection storageKey="settings.system.secrets" label={intl.formatMessage({ id: 'settings.system.vaultSection' })}>
@@ -726,6 +767,8 @@ export function SystemTab() {
         </AdvancedSection>
       </SettingsSection>
 
+      </>}
+
       {saveError != null && (
         <ErrorState
           variant="inline"
@@ -758,7 +801,7 @@ export function SystemTab() {
           savingLabel={intl.formatMessage({ id: 'common.saving' })}
           savedLabel={intl.formatMessage({ id: 'settings.general.saved' })}
         />
-        <Button variant="brand" size="sm" onClick={handleSave} disabled={saving}>
+        <Button variant="brand" size="sm" onClick={handleSave} disabled={!loaded || loadError != null || saving}>
           {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
         </Button>
       </div>

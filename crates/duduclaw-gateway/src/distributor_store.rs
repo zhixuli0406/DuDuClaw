@@ -397,6 +397,31 @@ impl DistributorStore {
         .flatten()
     }
 
+    /// Read and sign a refresh under the same writer lock as revocation.
+    /// The callback must finish both artifact and envelope signing before this
+    /// transaction commits. A revoke that committed first is visible here;
+    /// a competing revoke cannot commit between this read and either signature.
+    pub(crate) fn with_refresh_license<T>(
+        &self,
+        subscription_id: &str,
+        sign: impl FnOnce(&IssuedLicense) -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        let mut conn = self.open_conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("begin license refresh: {e}"))?;
+        let rec = tx.query_row(
+            "SELECT id, distributor_id, subscription_id, customer_id, tier,
+                    machine_fingerprint, issued_at, expires_at, status,
+                    revoked_at, license_blob, last_refresh_at
+             FROM issued_licenses WHERE subscription_id = ?1",
+            params![subscription_id],
+            row_to_license,
+        ).optional().map_err(|e| format!("read refresh license: {e}"))?;
+        let result = rec.as_ref().map(sign).transpose()?;
+        tx.commit().map_err(|e| format!("commit license refresh: {e}"))?;
+        Ok(result)
+    }
+
     /// Record a successful control-plane refresh (P2 phone-home) for a license,
     /// stamping `last_refresh_at = now`. Best-effort ledger update — never
     /// blocks the re-signed response. Returns `Err` only on a DB failure.
@@ -594,7 +619,8 @@ pub fn issue_signed_distributor_license(
         key_id,
     );
     // §10.5: bake the owner-gateway URL into the key so the client phones home
-    // without needing DUDUCLAW_CONTROL_URL. Not part of the signed payload.
+    // as an untrusted hint. Custom hosts need client-local DUDUCLAW_CONTROL_URL.
+    // Not part of the signed payload.
     license.control_url = control_url.map(str::to_string);
     // P-License: the signed per-license agent-count quota. `None` = no override
     // (tier default applies); `Some(n)` = grant exactly N (`Some(0)` = unlimited).

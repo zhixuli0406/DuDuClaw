@@ -7,6 +7,8 @@ import { useAuthStore, type LoginChallenge } from '@/stores/auth-store';
 import { Card, Button, Input, Spinner } from '@/components/mds';
 import { Field } from '@/components/onboarding';
 import { ProductMascot as DuDu } from '@/components/brand/ProductLogo';
+import { CompanyLogo, useCompanyName } from '@/components/brand/CompanyLogo';
+import { useCompanyStore } from '@/stores/company-store';
 import { useEffectiveName } from '@/lib/product-identity';
 
 type Mode = 'password' | 'otp';
@@ -18,6 +20,9 @@ export function LoginPage() {
   const location = useLocation();
   const returnTo = browserWatchReturn((location.state as { from?: unknown } | null)?.from) ?? '/';
   const brandName = useEffectiveName();
+  const companyName = useCompanyName();
+  const company = useCompanyStore((state) => state.company);
+  const hasCompany = Boolean(company.name || company.logo_url);
   const login = useAuthStore((s) => s.login);
   const otpRequest = useAuthStore((s) => s.otpRequest);
   const otpVerify = useAuthStore((s) => s.otpVerify);
@@ -30,6 +35,7 @@ export function LoginPage() {
   const [mode, setMode] = useState<Mode>('password');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [remember, setRemember] = useState(false);
   const [error, setError] = useState('');
 
   // First-run onboarding: an unclaimed instance lets the first (localhost)
@@ -77,8 +83,10 @@ export function LoginPage() {
       return;
     }
     try {
-      await firstRunClaim(ownerEmail, newPassword);
-      navigate('/', { replace: true });
+      const result = await firstRunClaim(ownerEmail, newPassword);
+      setFirstRun(false);
+      if (result) setMfa(result);
+      else navigate('/', { replace: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message.toLowerCase() : '';
       let id = 'login.claim.failed';
@@ -111,7 +119,7 @@ export function LoginPage() {
     e.preventDefault();
     setError('');
     try {
-      const result = await login(email, password);
+      const result = await login(email, password, remember);
       setPassword('');
       if (result) setMfa(result);
       else navigate(returnTo, { replace: true });
@@ -140,7 +148,7 @@ export function LoginPage() {
     e.preventDefault();
     setError('');
     try {
-      const result = await otpVerify(challengeId, code);
+      const result = await otpVerify(challengeId, code, remember);
       setCode(''); setChallengeId('');
       if (result) setMfa(result);
       else navigate(returnTo, { replace: true });
@@ -172,8 +180,8 @@ export function LoginPage() {
     <div className="flex min-h-screen items-center justify-center bg-app-shell p-4">
       <div className="w-full max-w-sm">
         <div className="mb-8 flex flex-col items-center text-center">
-          <DuDu face="waving" size={72} label="DuDu" />
-          <h1 className="mt-3 text-base font-medium text-foreground">{brandName}</h1>
+          {hasCompany ? <CompanyLogo size={72} /> : <DuDu face="waving" size={72} label="DuDu" />}
+          <h1 className="mt-3 text-base font-medium text-foreground">{companyName}</h1>
           <p className="mt-1 text-sm text-muted-foreground" data-testid="login-subtitle">
             {intl.formatMessage({ id: 'login.subtitle' })}
           </p>
@@ -189,9 +197,13 @@ export function LoginPage() {
             </div>
           )}
 
+          {!mfa && !firstRun && <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} />
+            {intl.formatMessage({ id: 'login.remember' })}
+          </label>}
           {mfa ? (
             <LoginMfa challenge={mfa} onComplete={() => navigate(returnTo, { replace: true })}
-              onCancel={() => { setMfa(null); setOtpStep('email'); setError(''); }} />
+              onCancel={() => { setMfa(null); setFirstRun(false); setOtpStep('email'); setError(''); }} />
           ) : firstRun ? (
             <form onSubmit={handleClaim} className="space-y-4">
               <p className="text-sm text-muted-foreground">
@@ -352,6 +364,7 @@ export function LoginPage() {
           )}
         </Card>
 
+        {hasCompany && <p className="mt-6 text-center text-xs text-muted-foreground">{brandName}</p>}
         {!firstRun && (
           <p className="mt-6 text-center text-xs text-muted-foreground">
             {intl.formatMessage({ id: 'login.footer' })}

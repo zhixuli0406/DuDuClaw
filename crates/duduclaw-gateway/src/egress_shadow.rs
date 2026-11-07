@@ -65,7 +65,7 @@ fn private_files(path: &Path, create: bool) -> Result<(), String> {
 struct Store(Connection);
 impl Store {
     fn open(home: &Path) -> Result<Self, String> {
-        std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
+        duduclaw_core::config::create_home_dir(home).map_err(|e| e.to_string())?;
         // Resolve the trusted home, including macOS /var, while retaining
         // NOFOLLOW and hard-link checks on the database and its sidecars.
         let home = std::fs::canonicalize(home).map_err(|e| e.to_string())?;

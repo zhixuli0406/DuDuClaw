@@ -209,7 +209,7 @@ async fn transcription_chunks_are_sequential_offset_and_reuse_speaker_labels() {
 
 #[tokio::test]
 async fn transcription_chunks_preserve_failed_request_usage_and_stop() {
-    let error = TranscriptionError { message: "mock failure".into(), usage: vec![TranscriptionUsage {
+    let error = TranscriptionError { detail: None, message: "mock failure".into(), usage: vec![TranscriptionUsage {
         model: "failed".into(), input_tokens: 200, ..Default::default()
     }] };
     let engine = MockEngine { results: Mutex::new(VecDeque::from([success("first"), Err(error), success("never-called")])), ..Default::default() };
@@ -396,7 +396,7 @@ async fn transcription_underreported_usage_is_bounded_before_accounting_success_
     let gemini = TranscriptionUsage { model: "gemini/gemini-3.5-flash".into(), input_tokens: 1, input_audio_tokens: 1, ..Default::default() };
     let engine = MockEngine { results: Mutex::new(VecDeque::from([
         Ok(TranscriptionResult { transcript: sample(), usage: vec![whisper] }),
-        Err(TranscriptionError { message: "refused".into(), usage: vec![gemini] }),
+        Err(TranscriptionError { detail: None, message: "refused".into(), usage: vec![gemini] }),
     ])), ..Default::default() };
     let usage = UsageLog::default();
     let mut audio = prepared(2);
@@ -470,4 +470,21 @@ fn transcription_unsegmented_audio_requires_known_bounded_local_duration() {
     assert!(unsegmented_duration(Some(CHUNK_SECONDS * 1000 + 1)).unwrap_err().contains("ffmpeg"));
     assert_eq!(unsegmented_duration(Some(CHUNK_SECONDS * 1000)).unwrap(), CHUNK_SECONDS * 1000);
     assert_eq!(unsegmented_duration(Some(1500)).unwrap(), 1500);
+}
+
+#[tokio::test]
+async fn transcription_google_stt_chunks_use_local_duration_and_offsets() {
+    let engine = MockEngine { results: Mutex::new(VecDeque::from([
+        success("google-stt/chirp_2"), success("google-stt/chirp_2")
+    ])), ..Default::default() };
+    let mut audio = prepared(2);
+    audio.duration_ms = CHUNK_SECONDS * 1000 + 31_250;
+    let usage = UsageLog::default();
+    let transcript = transcribe_chunks(&engine, &audio, "zh-TW", &usage).await.unwrap();
+    assert_eq!(transcript.segments[1].start_ms, CHUNK_SECONDS * 1000 + 1000);
+    let usage = usage.0.lock().unwrap();
+    assert_eq!(usage.len(), 2);
+    assert_eq!(usage[0].audio_seconds, Some(1800.0));
+    assert_eq!(usage[1].audio_seconds, Some(31.25));
+    assert!(usage.iter().all(|item| item.estimated && item.input_tokens == 0 && item.output_tokens == 0));
 }

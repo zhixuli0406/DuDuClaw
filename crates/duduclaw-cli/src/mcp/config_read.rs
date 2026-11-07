@@ -248,9 +248,11 @@ mod decrypt_channel_token_tests {
 ///
 /// | `identity.key` | token | `[delegation] require_identity_token` | result |
 /// |---|---|---|---|
-/// | absent | — | — | unchanged (feature not enabled) |
+/// | absent, never initialized | — | `false` | unchanged (explicit legacy mode) |
+/// | absent | — | `true` | untrusted sentinel |
+/// | unreadable/malformed/unsafe permissions | — | either | untrusted sentinel |
 /// | present | valid | — | unchanged, now *proven* |
-/// | present | missing/invalid | `false` (default) | unchanged + one `warn!` per process |
+/// | present | missing/invalid | `false` (explicit opt-out) | unchanged + one `warn!` per process |
 /// | present | missing/invalid | `true` | [`duduclaw_core::UNTRUSTED_AGENT_ID`] |
 ///
 /// The sentinel is not an agent id, is nobody's ancestor, shares no department
@@ -271,6 +273,14 @@ pub async fn get_default_agent(home_dir: &Path) -> String {
         return employee.unwrap_or_else(|_| duduclaw_core::UNTRUSTED_AGENT_ID.to_owned());
     }
     if caller_identity_verdict(home_dir) == duduclaw_core::IdentityVerdict::Rejected {
+        if let Ok(claimed) = std::env::var(duduclaw_core::ENV_AGENT_ID) {
+            let claimed = claimed.trim();
+            if duduclaw_core::is_system_sender(claimed)
+                || duduclaw_core::is_reserved_queue_sender(claimed)
+            {
+                audit_system_sender_identity_once(home_dir, claimed, "env");
+            }
+        }
         return duduclaw_core::UNTRUSTED_AGENT_ID.to_string();
     }
 
@@ -341,11 +351,50 @@ fn audit_system_sender_identity_once(home_dir: &Path, claimed: &str, source: &st
 /// site; both are cheap file reads and `get_default_agent` runs a handful of
 /// times per process, not per tool call.
 pub fn caller_identity_verdict(home_dir: &Path) -> duduclaw_core::IdentityVerdict {
+    // A native Linux isolated call carries its connection-bound employee; no
+    // process environment participates.
     if let Some(employee) = crate::mcp_isolation_identity::verified_employee(home_dir) {
         return if employee.is_ok() { duduclaw_core::IdentityVerdict::Verified }
             else { duduclaw_core::IdentityVerdict::Rejected };
     }
-    let require = duduclaw_core::require_identity_token_from_home(home_dir);
+    // Authenticate before interpreting the untrusted claim. External clients
+    // must never inherit an employee identity through the grace-period path.
+    let principal = crate::mcp_auth::authenticate_from_env(home_dir);
+    let require = match duduclaw_core::require_identity_token_from_home(home_dir) {
+        Ok(require) => require,
+        Err(error) => {
+            tracing::error!(%error, "MCP caller identity rejected: cannot read identity policy");
+            return duduclaw_core::IdentityVerdict::Rejected;
+        }
+    };
+    let claimed = std::env::var(duduclaw_core::ENV_AGENT_ID).unwrap_or_default();
+    let claimed = claimed.trim();
+    if let Ok(principal) = principal
+        && principal.is_external
+    {
+        // Standalone transport identities occupy the reserved API-client
+        // namespace, never the employee/remote-bridge namespace. Require both
+        // live external API authentication for this exact client and a valid
+        // host signature, even during an employee-token grace period.
+        if !principal.client_id.starts_with(duduclaw_core::STANDALONE_CLIENT_PREFIX)
+            || claimed != principal.client_id
+        {
+            return duduclaw_core::IdentityVerdict::Rejected;
+        }
+        let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
+        let signed = duduclaw_core::is_valid_agent_id(claimed)
+            && duduclaw_core::load_identity_key(home_dir)
+                .map(zeroize::Zeroizing::new)
+                .is_some_and(|key| duduclaw_core::verify_identity_token(&key, claimed, &token));
+        return if signed {
+            duduclaw_core::IdentityVerdict::Verified
+        } else {
+            duduclaw_core::IdentityVerdict::Rejected
+        };
+    }
+    if claimed.starts_with(duduclaw_core::STANDALONE_CLIENT_PREFIX) {
+        return duduclaw_core::IdentityVerdict::Rejected;
+    }
     duduclaw_core::verify_env_identity(home_dir, require)
 }
 

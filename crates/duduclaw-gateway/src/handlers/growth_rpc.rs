@@ -382,7 +382,7 @@ mod snapshot_authorization_tests {
         let employee = db.live_user_context(&user.id).unwrap().unwrap();
         let handler = MethodHandler::new(home.path().into()).await;
         handler.set_user_db(db.clone(), Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"))).await;
-        handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+        handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
 
         let reduced = payload(handler.handle("growth.snapshot", json!({}), &employee).await);
         assert_eq!(reduced.as_object().unwrap().len(), 4);

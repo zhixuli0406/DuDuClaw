@@ -734,6 +734,17 @@ fn render_merged(items: &[&DeferredNotice]) -> String {
 
 // ── Drainer ──────────────────────────────────────────────────────────────
 
+#[derive(Debug, PartialEq, Eq)]
+enum PlainTokenSource<'a> {
+    LinkedUsers,
+    Agent(&'a str),
+}
+
+fn plain_token_source(agent_id: &str) -> PlainTokenSource<'_> {
+    if agent_id.is_empty() { PlainTokenSource::LinkedUsers } else { PlainTokenSource::Agent(agent_id) }
+}
+
+
 /// Delivers deferred notices once their quiet window has passed.
 ///
 /// Runs on its own interval rather than hooking the gate: a notice queued at
@@ -761,26 +772,37 @@ impl DeferredNotifyDrainer {
 
         // Plain notices → one merged message per destination.
         for batch in merge_plain(&due) {
-            let Some(token) =
-                crate::goal_notify::channel_token(&self.home_dir, &batch.agent_id, &batch.channel)
-                    .await
-            else {
+            let tokens = match plain_token_source(&batch.agent_id) {
+                PlainTokenSource::LinkedUsers => {
+                    crate::config_crypto::channel_dm_token_candidates(&self.home_dir, &batch.channel).await
+                }
+                PlainTokenSource::Agent(agent_id) => {
+                    crate::goal_notify::channel_token(&self.home_dir, agent_id, &batch.channel)
+                        .await.into_iter().collect()
+                }
+            };
+            if tokens.is_empty() {
                 warn!(
                     channel = %batch.channel,
                     count = batch.notify_types.len(),
                     "notify-governance: 延後通知找不到 bot token，未能投遞"
                 );
                 continue;
-            };
-            let ok = crate::channel_sender::send_plain_text(
-                &self.home_dir,
-                &http,
-                &batch.channel,
-                &token,
-                &batch.chat_id,
-                &batch.text,
-            )
-            .await;
+            }
+            let mut ok = false;
+            for token in tokens {
+                if crate::channel_sender::send_plain_text(
+                    &self.home_dir,
+                    &http,
+                    &batch.channel,
+                    &token,
+                    &batch.chat_id,
+                    &batch.text,
+                ).await {
+                    ok = true;
+                    break;
+                }
+            }
             if ok {
                 delivered += batch.notify_types.len();
                 for (t, lvl) in &batch.notify_types {
@@ -1417,6 +1439,13 @@ pub(crate) mod tests {
         let (kept, stale, _) = prune(vec![bad], now);
         assert!(kept.is_empty());
         assert_eq!(stale, 1);
+    }
+
+    #[test]
+    fn deferred_plain_empty_agent_uses_linked_user_tokens() {
+        assert_eq!(plain_token_source(""), PlainTokenSource::LinkedUsers);
+        assert_eq!(plain_token_source("agnes"), PlainTokenSource::Agent("agnes"));
+        assert_eq!(plain_token_source(" "), PlainTokenSource::Agent(" "));
     }
 
     // ── merging ──────────────────────────────────────────────────

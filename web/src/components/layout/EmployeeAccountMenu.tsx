@@ -4,9 +4,7 @@ import { useIntl } from 'react-intl';
 import { ChevronsUpDown, Languages, LogOut, Monitor, Moon, Sun } from 'lucide-react';
 import { api, type PersonalGoogleStatus } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
-import { useBrandStore } from '@/stores/brand-store';
 import { useThemeStore } from '@/stores/theme-store';
-import { useLocaleStore, localeNames } from '@/i18n';
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
   DropdownMenuLabel, DropdownMenuSeparator,
@@ -24,11 +22,9 @@ export function EmployeeAccountMenu({ collapsed }: { collapsed: boolean }) {
   const navigate = useNavigate();
   const user = useAuthStore(s => s.user);
   const logout = useAuthStore(s => s.logout);
-  const brand = useBrandStore(s => s.brand);
   const theme = useThemeStore(s => s.theme);
   const cycleTheme = useThemeStore(s => s.cycleTheme);
-  const locale = useLocaleStore(s => s.locale);
-  const setLocale = useLocaleStore(s => s.setLocale);
+  const [distributorHelp, setDistributorHelp] = useState(false);
   const [missing, setMissing] = useState(false);
   const mounted = useRef(false);
   const mountRequest = useRef<Promise<PersonalGoogleStatus> | null>(null);
@@ -44,6 +40,9 @@ export function EmployeeAccountMenu({ collapsed }: { collapsed: boolean }) {
   }, []);
   useEffect(() => {
     mounted.current = true;
+    void api.about.get().then(about => {
+      if (mounted.current) setDistributorHelp(Boolean(about.distributor_notice?.trim()));
+    }).catch(() => {});
     mountRequest.current ??= api.personalGoogle.status();
     applyRequest(mountRequest.current);
     return () => { mounted.current = false; };
@@ -74,15 +73,14 @@ export function EmployeeAccountMenu({ collapsed }: { collapsed: boolean }) {
           <ThemeIcon />{t('sidebar.employeeTheme')}
         </DropdownMenuItem>
         <DropdownMenuSeparator />
-        <DropdownMenuLabel><Languages className="mr-2 inline size-4" />{t('header.language')}</DropdownMenuLabel>
-        {Object.entries(localeNames).map(([code, name]) => (
-          <DropdownMenuItem key={code} onClick={() => setLocale(code)}>
-            <span className="flex-1">{name}</span>{locale === code && <span aria-hidden="true">•</span>}
-          </DropdownMenuItem>
-        ))}
-        {!brand && <DropdownMenuItem onClick={() => window.open('https://github.com/zhixuli0406/DuDuClaw/tree/main/docs/guides', '_blank', 'noopener,noreferrer')}>
+        <DropdownMenuItem onClick={() => navigate('/me/account#language')}>
+          <Languages />{t('header.language')}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => distributorHelp
+          ? navigate('/about#distributor-support')
+          : window.open('https://github.com/zhixuli0406/DuDuClaw/tree/main/docs/guides', '_blank', 'noopener,noreferrer')}>
           {t('sidebar.employeeHelp')}
-        </DropdownMenuItem>}
+        </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem variant="destructive" onClick={() => logout()}><LogOut />{t('auth.logout')}</DropdownMenuItem>
       </DropdownMenuContent>

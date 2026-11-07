@@ -4,6 +4,84 @@
 use super::*;
 
 impl MethodHandler {
+    /// Organization structure only. This does not grant access to an agent's
+    /// configuration, conversations or actions; those retain binding checks.
+    pub(crate) async fn handle_agents_org_chart(&self, ctx: &UserContext) -> WsFrame {
+        // A human's department comes from users.db, never their bound agent,
+        // request parameters or the connection's stale identity snapshot.
+        let department = if ctx.is_admin() {
+            None
+        } else {
+            let Some(db) = self.user_db.read().await.clone() else {
+                return WsFrame::error_response("", PERMISSION_DENIED);
+            };
+            let user_id = ctx.user_id.clone();
+            match tokio::task::spawn_blocking(move || db.get_user(&user_id)).await {
+                Ok(Ok(Some(user))) if user.status == duduclaw_auth::UserStatus::Active
+                    && !user.must_change_password => user.department.filter(|d| !d.is_empty()),
+                _ => return WsFrame::error_response("", PERMISSION_DENIED),
+            }
+        };
+        let mut reg = match tokio::time::timeout(
+            std::time::Duration::from_millis(500), self.registry.write(),
+        ).await {
+            Ok(reg) => reg,
+            Err(_) => return WsFrame::error_response("", "Organization is temporarily unavailable"),
+        };
+        if reg.scan().await.is_err() {
+            return WsFrame::error_response("", "Organization is temporarily unavailable");
+        }
+        let listed = reg.list();
+        let listable: std::collections::HashMap<&str, _> = listed.iter()
+            .filter(|a| a.config.agent.status.is_listable(false))
+            .filter(|a| ctx.is_admin() || !crate::machine_employee::requires_admin_for_id(
+                &self.home_dir, &a.config.agent.name,
+            ))
+            .map(|a| (a.config.agent.name.as_str(), a)).collect();
+        let full: std::collections::HashSet<&str> = listable.iter()
+            .filter(|(name, a)| ctx.is_admin()
+                || ctx.has_agent_access(name, AccessLevel::Viewer)
+                || department.as_deref().is_some_and(|d| d == a.config.agent.department))
+            .map(|(name, _)| *name).collect();
+        let mut visible = full.clone();
+        // Bound the walk by visited names; malformed cycles cannot loop or
+        // pull in descendants/siblings. Hidden ancestors stop the chain.
+        for name in &full {
+            let mut cursor = *name;
+            let mut seen = std::collections::HashSet::new();
+            while seen.insert(cursor) {
+                let Some(agent) = listable.get(cursor) else { break; };
+                let parent = agent.config.agent.reports_to.as_str();
+                if !listable.contains_key(parent) { break; }
+                visible.insert(parent);
+                cursor = parent;
+            }
+        }
+        let agents: Vec<Value> = listed.iter()
+            .filter(|a| visible.contains(a.config.agent.name.as_str()))
+            .map(|a| {
+                let cfg = &a.config.agent;
+                if !full.contains(cfg.name.as_str()) {
+                    // Ancestors outside the reader's scope are name + role
+                    // only: no department, status, display name or parent.
+                    return json!({ "name": cfg.name,
+                        "role": format!("{:?}", cfg.role).to_lowercase() });
+                }
+                json!({
+                    "name": cfg.name,
+                    "display_name": cfg.display_name,
+                    "department": cfg.department,
+                    "role": format!("{:?}", cfg.role).to_lowercase(),
+                    "status": format!("{:?}", cfg.status).to_lowercase(),
+                    "icon": cfg.icon,
+                    "reports_to": if visible.contains(cfg.reports_to.as_str()) {
+                        cfg.reports_to.as_str()
+                    } else { "" },
+                })
+            }).collect();
+        WsFrame::ok_response("", json!({ "agents": agents }))
+    }
+
     // ── Filtered agent list (respects UserContext) ────────────
 
     /// Agents the caller is directly bound to (all of them for an Admin).

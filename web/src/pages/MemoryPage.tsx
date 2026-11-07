@@ -1,3 +1,6 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
+import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { hasMinRole } from '@/lib/roles';
 import { DataExportButton } from '@/components/DataExportButton';
@@ -92,13 +95,13 @@ function parseView(raw: string | null): ViewId {
 
 export function MemoryPage() {
   const intl = useIntl();
-  const errorText = useErrorMessage();
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
   const [params, setParams] = useSearchParams();
   const canReadEvolution = hasMinRole(useAuthStore(s => s.user?.role), 'manager');
   const requestedView = parseView(params.get('tab'));
   const view = requestedView === 'evolution' && !canReadEvolution ? 'memories' : requestedView;
-  const [agents, setAgents] = useState<ReadonlyArray<{ name: string; display_name: string }>>([]);
+  const agents = useSelectableAgents(false);
+  const fetchAgents = useAgentsStore(s => s.fetchAgents);
   const [selectedAgent, setSelectedAgent] = useState('');
   // W3-3 (state-as-URL): the memories search term starts from `?q=` so a
   // bookmarked/shared search opens with the same query already typed.
@@ -116,18 +119,11 @@ export function MemoryPage() {
     setParams((prev) => withParam(prev, 'q', query), { replace: true });
   }, [query, setParams]);
 
+  useEffect(() => { void fetchAgents(); }, [fetchAgents]);
   useEffect(() => {
-    api.agents.list().then((res) => {
-      const list = res?.agents ?? [];
-      setAgents(list);
-      if (list.length > 0) setSelectedAgent((prev) => prev || list[0].name);
-    }).catch((e) => {
-      console.warn('[api]', e);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: errorText(e) }));
-    });
-    // Run once on mount; intl is stable from context.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    setSelectedAgent(prev => agents.some(a => a.name === prev) ? prev : agents[0]?.name ?? '');
+  }, [agents]);
+
 
   const viewOptions: SegmentedOption<ViewId>[] = useMemo(() => {
     const opts: SegmentedOption<ViewId>[] = [
@@ -348,7 +344,9 @@ interface EvolutionAgent {
 function EvolutionView({ selectedAgent }: { selectedAgent: string }) {
   const intl = useIntl();
   const errorText = useErrorMessage();
-  const [agents, setAgents] = useState<EvolutionAgent[]>([]);
+  const [allAgents, setAgents] = useState<ReadonlyArray<EvolutionAgent>>([]);
+  const visibleAgents = useVisibleAgents(false);
+  const agents = allAgents.filter(a => visibleAgents.some(v => v.name === a.agent_id));
   const [mode, setMode] = useState('');
   const [enabled, setEnabled] = useState(false);
   const [gvuEnabledCount, setGvuEnabledCount] = useState(0);
@@ -741,6 +739,7 @@ function PlaybookCard({ agentId }: { agentId: string }) {
   useEffect(() => { load(); }, [load]);
 
   const handleExport = async () => {
+    if (!canSelectAgent(agentId)) return;
     try {
       const res = await api.playbook.export(agentId);
       const blob = new Blob([JSON.stringify(res, null, 2)], { type: 'application/json' });
@@ -757,7 +756,7 @@ function PlaybookCard({ agentId }: { agentId: string }) {
   };
 
   const handleRetireConfirm = async () => {
-    if (!retireTarget) return;
+    if (!retireTarget || !canSelectAgent(agentId)) return;
     setRetiring(true);
     try {
       const res = await api.playbook.retire(agentId, retireTarget.id, reason);

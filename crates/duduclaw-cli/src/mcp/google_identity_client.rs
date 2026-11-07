@@ -527,19 +527,17 @@ pub(crate) async fn status_header(home: &Path, caller: &GoogleCaller) -> (String
                 },
                 _ => "設定已變更".into(),
             };
-            let (identity, state) = match fetch(home, &agent, "google_status").await {
-                Ok(Fetched::Token { account, kind, .. }) => (
-                    if kind == "delegate" {
-                        configured
-                    } else {
-                        format!("個人 Google 帳號 {account}")
-                    },
-                    "已連線；各工具仍依本人實際開放的服務判斷".to_string(),
+            // Status has a distinct metadata response; never parse it as a token.
+            let body = json!({"tool":"google_status",
+                "turn_id":env_trimmed(duduclaw_core::ENV_TRUST_TURN_ID),
+                "run_id":env_trimmed(duduclaw_core::ENV_DISPATCH_RUN_ID)});
+            let (identity, state) = match post(home, &agent, &body).await {
+                Ok(value) if value["mode"] == "metadata" && value.get("access_token").is_none() => (
+                    value["account_email"].as_str().map(|email| format!("Google 帳號 {email}"))
+                        .unwrap_or(configured),
+                    "已讀取本機連線紀錄；未取得權杖或連線測試 Google，各工具仍依本人開放的用途與服務判斷".to_string(),
                 ),
-                Ok(Fetched::Home { notice, .. }) => (
-                    "公司共用帳號".into(),
-                    notice.unwrap_or_else(|| "改用公司共用帳號".into()),
-                ),
+                Ok(_) => (configured, "狀態回應格式不正確".into()),
                 Err(m) => (configured, format!("目前不能使用：{m}")),
             };
             (format!("目前代表：{identity}。\n狀態：{state}\n"), false)

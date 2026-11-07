@@ -225,3 +225,27 @@ describe('<SystemTab> v1.68', () => {
     expect(updateConfigMock.mock.calls[0][0]).toEqual({ files: { allowed_roots: ['/srv/exports'] } });
   });
 });
+
+
+describe('SystemTab advanced section views', () => {
+  it('saves a model edit without validating or writing hidden sandbox fields', async () => {
+    configMock.mockResolvedValue({ config: BASE.replace('memory_bytes = 1073741824', 'memory_bytes = 1') + '\n[runtime]\nutility_provider = "codex"\nutility_model = "old-model"\n' });
+    renderWithProviders(<SystemTab section="models" />);
+    const model = screen.getByRole('textbox', { name: 'Global utility model' });
+    await waitFor(() => expect(model).toHaveValue('old-model'));
+    expect(screen.queryByRole('switch', { name: 'Memory trust guard' })).not.toBeInTheDocument();
+    fireEvent.change(model, { target: { value: 'new-model' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalledWith({ runtime: { utility_model: 'new-model' } }));
+  });
+
+  it('retains sandbox validation in the security section', async () => {
+    configMock.mockResolvedValue({ config: BASE.replace('memory_bytes = 1073741824', 'memory_bytes = 1') });
+    renderWithProviders(<SystemTab section="security" />);
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'GitHub tools' })).toBeChecked());
+    expect(screen.queryByRole('textbox', { name: 'Global utility model' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('switch', { name: 'Memory trust guard' }));
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+    expect(updateConfigMock).not.toHaveBeenCalled();
+  });
+});

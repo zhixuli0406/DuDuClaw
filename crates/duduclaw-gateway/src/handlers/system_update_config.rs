@@ -3,6 +3,22 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Config commits never trust the connection's cached role or a missing user DB.
+/// The gateway token is not a database principal, but still requires a readable
+/// authority database here; dashboard users also re-check status and token epoch.
+pub(super) fn require_live_admin_at_commit(home: &Path, ctx: &UserContext) -> Result<(), String> {
+    let db = crate::review_evidence::audience::readonly_db(&home.join("users.db"))
+        .map_err(|_| "無法讀取帳號資料。")?;
+    db.query_row("SELECT count(*) FROM users", [], |row| row.get::<_, i64>(0))
+        .map_err(|_| "無法讀取帳號資料。")?;
+    if crate::computer_use_sessions::live_ops::live_identity(home, ctx)
+        .is_some_and(|live| live.is_admin()) {
+        Ok(())
+    } else {
+        Err("需要目前的管理員權限。".into())
+    }
+}
+
 impl MethodHandler {
     // ── System Config Update ─────────────────────────────────
 
@@ -10,13 +26,16 @@ impl MethodHandler {
     ///
     /// Only allows safe, non-sensitive fields: `log_level`, `rotation_strategy`.
     /// Uses atomic write (temp + rename) and never touches token/key fields.
-    pub(crate) async fn handle_system_update_config(&self, params: Value, ctx: &UserContext) -> WsFrame {
+    pub(crate) async fn handle_system_update_config(&self, mut params: Value, ctx: &UserContext) -> WsFrame {
+        if super::transcription_credentials_rpc::reject_generic_credentials(&mut params) {
+            return WsFrame::error_response("", "請使用專用的會議轉錄憑證設定操作。");
+        }
         if params.get("product").is_some() || params.get("product.profile").is_some() || params.get("product_profile").is_some() {
             return WsFrame::error_response("", "product.profile is installation-owned and read-only");
         }
         // v1.68: the contract names parameters after their TOML path and may
         // send them nested; map those onto the flat names this handler reads.
-        let params = super::system_update_config_v168::normalize_legacy_aliases(&params);
+        let params = super::system_update_config_v168::normalize_legacy_aliases(params);
         let config_path = self.home_dir.join("config.toml");
         // Read the text (not just the table) so the commit below can refuse
         // to overwrite a file another writer changed in the meantime. A
@@ -984,7 +1003,13 @@ impl MethodHandler {
         let actor = ctx.user_id.clone();
         let config_path_for_guard = config_path.clone();
         let expected_state = params.get("expected_state").and_then(Value::as_bool);
+        let transcription_change = params.get("transcription").is_some();
+        let commit_home = self.home_dir.clone();
+        let commit_actor = ctx.clone();
         let guard = move || {
+                if transcription_change {
+                    require_live_admin_at_commit(&commit_home, &commit_actor)?;
+                }
                 if security_change {
                     crate::mfa::require_admin(db.as_deref().ok_or("無法讀取帳號資料。")?, &actor)?;
                     let expected = expected_state

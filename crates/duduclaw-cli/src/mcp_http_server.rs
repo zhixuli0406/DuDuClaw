@@ -9,7 +9,7 @@
 // W22-P0 ADR-002: All responses carry x-duduclaw-version + x-duduclaw-capabilities headers
 // via the inject_capability_headers + negotiate_capabilities middleware stack.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +39,9 @@ use crate::mcp_sse_store::SseEventStore;
 #[derive(Clone)]
 pub struct HttpServerConfig {
     pub bind: SocketAddr,
+    pub public_origin: Option<String>,
+    pub trusted_proxies: Vec<IpAddr>,
+    pub allow_insecure_lan: bool,
     pub home_dir: std::path::PathBuf,
     pub enable_sse: bool,
     /// Request timeout for tool calls (default 30s).
@@ -49,10 +52,34 @@ impl HttpServerConfig {
     pub fn new(bind: SocketAddr, home_dir: std::path::PathBuf) -> Self {
         Self {
             bind,
+            public_origin: None,
+            trusted_proxies: Vec::new(),
+            allow_insecure_lan: false,
             home_dir,
             enable_sse: true,
             call_timeout: Duration::from_secs(30),
         }
+    }
+
+    /// Pin discovery and audiences to operator configuration, never request headers.
+    pub fn external_origin(&self) -> Result<String, String> {
+        let origin = match &self.public_origin {
+            Some(raw) => {
+                let url = url::Url::parse(raw).map_err(|_| "Invalid MCP public origin")?;
+                if url.scheme() != "https" || url.host_str().is_none()
+                    || !url.username().is_empty() || url.password().is_some()
+                    || url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+                    return Err("MCP public origin must be an HTTPS origin without credentials, path, query or fragment".into());
+                }
+                url.origin().ascii_serialization()
+            }
+            None => format!("http://{}", self.bind),
+        };
+        if !self.bind.ip().is_loopback() && !self.allow_insecure_lan
+            && (self.public_origin.is_none() || self.trusted_proxies.is_empty()) {
+            return Err("Non-loopback MCP HTTP requires --public-origin https://HOST and --trusted-proxy IP; insecure LAN requires explicit --allow-insecure-lan".into());
+        }
+        Ok(origin)
     }
 }
 
@@ -60,10 +87,306 @@ impl HttpServerConfig {
 
 #[derive(Clone)]
 pub struct HttpState {
+    pub external_origin: String,
+    pub resource: String,
     pub dispatcher: Arc<McpDispatcher>,
     pub sse_store: Arc<SseEventStore>,
     pub call_timeout: Duration,
     pub home_dir: std::path::PathBuf,
+}
+
+// Bounded process-local tables. Anonymous, registration and authenticated
+// identities use separate storage so anonymous churn cannot fill principal slots.
+#[derive(Default)]
+pub(crate) struct Admission {
+    buckets: std::collections::HashMap<String, (std::time::Instant, u32)>,
+}
+
+impl Admission {
+    pub(crate) fn allow(&mut self, key: String, limit: u32) -> bool {
+        let now = std::time::Instant::now();
+        self.buckets.retain(|_, (start, _)| now.duration_since(*start) < Duration::from_secs(60));
+        if !self.buckets.contains_key(&key) && self.buckets.len() >= 4096 { return false; }
+        let (_, count) = self.buckets.entry(key).or_insert((now, 0));
+        if *count >= limit { return false; }
+        *count += 1;
+        true
+    }
+}
+
+fn admission() -> &'static std::sync::Mutex<Admission> {
+    static TABLE: std::sync::OnceLock<std::sync::Mutex<Admission>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(Default::default)
+}
+
+pub(crate) fn oauth_client_admitted(home: &std::path::Path, client: &str, source: &str) -> bool {
+    let key = format!("oauth:{}:{}:{source}", home.display(), duduclaw_core::mcp_oauth_store::digest(client));
+    admission().lock().map(|mut t| {
+        t.allow(format!("oauth-ip:{}:{source}", home.display()), 120) && t.allow(key, 12)
+    }).unwrap_or(false)
+}
+
+fn busy_response(status: StatusCode) -> Response {
+    let mut response = (status, Json(serde_json::json!({"error":"temporarily_unavailable"}))).into_response();
+    response.headers_mut().insert("Retry-After", "60".parse().unwrap());
+    response.headers_mut().insert("Cache-Control", "no-store".parse().unwrap());
+    response
+}
+
+fn http_rate_response() -> Response {
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(crate::mcp_dispatch::jsonrpc_error(
+        &Value::Null, -32029, "HTTP rate limit exceeded, retry after 60 seconds",
+    ))).into_response();
+    response.headers_mut().insert("Retry-After", "60".parse().unwrap());
+    response.headers_mut().insert("Cache-Control", "no-store".parse().unwrap());
+    response
+}
+
+#[derive(Clone)]
+struct AdmissionState {
+    anonymous: Arc<std::sync::Mutex<Admission>>,
+    principals: Arc<std::sync::Mutex<Admission>>,
+    registration: Arc<std::sync::Mutex<Admission>>,
+    hints: Arc<std::sync::Mutex<CredentialHints>>,
+    trusted_proxies: Vec<IpAddr>,
+    http: HttpState,
+}
+
+/// Walk XFF from the immediate peer back to the first untrusted hop. A proxy
+/// must append the actual connecting address, or replace XFF, at its boundary.
+fn client_ip(peer: Option<IpAddr>, headers: &HeaderMap, trusted: &[IpAddr]) -> String {
+    let Some(peer) = peer else { return "unknown-peer".into(); };
+    if !trusted.contains(&peer) { return peer.to_string(); }
+    let mut chain = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        let Ok(value) = value.to_str() else { return peer.to_string(); };
+        for part in value.split(',') {
+            let Ok(ip) = part.trim().parse::<IpAddr>() else { return peer.to_string(); };
+            chain.push(ip);
+            if chain.len() > 32 { return peer.to_string(); }
+        }
+    }
+    chain.into_iter().rev().find(|ip| !trusted.contains(ip)).unwrap_or(peer).to_string()
+}
+
+#[derive(Clone)]
+pub(crate) struct SourceIp(pub String);
+
+#[derive(Clone, Default)]
+pub(crate) struct RegistrationBudget(Arc<std::sync::Mutex<Admission>>);
+
+impl RegistrationBudget {
+    pub(crate) fn admit_creation(&self) -> bool {
+        self.0.lock().map(|mut t| t.allow("global".into(), 10)).unwrap_or(false)
+    }
+}
+
+#[derive(Clone)]
+struct ProxyBoundary {
+    required: bool,
+    trusted: Vec<IpAddr>,
+}
+
+// Outermost layer: no headers, body, quota, credential or store processing
+// until the actual TCP peer passes. Missing ConnectInfo fails closed.
+async fn require_proxy_peer(
+    State(boundary): State<ProxyBoundary>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if boundary.required && !request.extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .is_some_and(|peer| boundary.trusted.contains(&peer.0.ip())) {
+        return (StatusCode::FORBIDDEN, "Trusted proxy connection required").into_response();
+    }
+    next.run(request).await
+}
+
+// This cache ONLY selects a quota bucket. It never authenticates a request.
+// Every protected handler still performs live authentication after admission.
+// One router reloads at most once per second, with at most one reload in flight:
+// random bearer strings cannot trigger per-request store/config deserialization.
+#[derive(Default)]
+struct CredentialHints {
+    refreshed: Option<std::time::Instant>,
+    loading: bool,
+    principals: std::collections::HashMap<String, String>,
+    #[cfg(test)]
+    reloads: usize,
+}
+
+impl CredentialHints {
+    fn start_reload(&mut self, now: std::time::Instant) -> bool {
+        if self.loading || self.refreshed.is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(1)) {
+            return false;
+        }
+        self.loading = true;
+        #[cfg(test)]
+        { self.reloads += 1; }
+        true
+    }
+}
+
+// Deliberately only a bounded lookup candidate, not the key format validator.
+fn static_hint_candidate(raw: &str) -> bool {
+    raw.len() <= 64 && ["ddc_dev_", "ddc_prod_", "ddc_staging_"].iter().any(|prefix| raw.starts_with(prefix))
+}
+
+fn load_credential_hints(home: &std::path::Path, resource: &str) -> std::collections::HashMap<String, String> {
+    use duduclaw_core::mcp_oauth_store::{digest, load_store, scope_subset, MAX_TOKEN_ROWS};
+    use std::io::Read;
+    const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+    const MAX_STATIC_HINTS: usize = 4096;
+    let mut hints = std::collections::HashMap::new();
+    let now = chrono::Utc::now();
+    if let Ok(store) = load_store(home) {
+        for (hash, token) in store.tokens.iter().take(MAX_TOKEN_ROWS) {
+            if let Some(grant) = store.grants.get(&token.family_id)
+                && !token.used && token.expires_unix > now.timestamp()
+                && token.resource == resource && grant.resource == resource && !resource.is_empty()
+                && token.client_id == grant.client_id && scope_subset(&token.scope, &grant.scope) {
+                hints.insert(hash.clone(), format!("oauth_{}", token.client_id));
+            }
+        }
+    }
+    // Oversized/invalid configuration gets no hint; its keys can still pass the
+    // anonymous gate and reach the normal live authenticator.
+    if let Ok(file) = std::fs::File::open(home.join("config.toml")) {
+        let mut bytes = Vec::new();
+        if file.take(MAX_CONFIG_BYTES as u64 + 1).read_to_end(&mut bytes).is_ok()
+            && bytes.len() <= MAX_CONFIG_BYTES
+            && let Ok(raw) = std::str::from_utf8(&bytes)
+            && let Ok(config) = toml::from_str::<toml::Value>(raw)
+            && let Some(keys) = config.get("mcp_keys").and_then(|v| v.as_table()) {
+            for (key, entry) in keys.iter().take(MAX_STATIC_HINTS) {
+                if !static_hint_candidate(key) { continue; }
+                let Some(client) = entry.get("client_id").and_then(|v| v.as_str()) else { continue; };
+                let Some(created) = entry.get("created_at").and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) else { continue; };
+                if now.signed_duration_since(created).num_days().max(0) <= 30 {
+                    hints.insert(digest(key), client.to_string());
+                }
+            }
+        }
+    }
+    hints
+}
+
+async fn admission_principal(headers: &HeaderMap, state: &AdmissionState) -> Result<Option<String>, Response> {
+    let Some(raw) = headers.get("authorization").and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|raw| crate::mcp_oauth_server::is_oauth_access_token(raw) || static_hint_candidate(raw))
+        else { return Ok(None); };
+    let hash = duduclaw_core::mcp_oauth_store::digest(raw);
+    let reload = state.hints.lock().map(|mut hints| hints.start_reload(std::time::Instant::now()))
+        .unwrap_or(false);
+    if reload {
+        let cache = state.hints.clone();
+        let home = state.http.home_dir.clone();
+        let resource = state.http.resource.clone();
+        // Await the first caller's reload so a cold cache does not require the
+        // anonymous quota. Concurrent callers may use the preceding snapshot.
+        tokio::task::spawn_blocking(move || {
+            let principals = load_credential_hints(&home, &resource);
+            if let Ok(mut hints) = cache.lock() {
+                hints.principals = principals;
+                hints.refreshed = Some(std::time::Instant::now());
+                hints.loading = false;
+            }
+        }).await.map_err(|_| busy_response(StatusCode::SERVICE_UNAVAILABLE))?;
+    }
+    Ok(state.hints.lock().ok().and_then(|hints| hints.principals.get(&hash).cloned()))
+}
+
+async fn pre_auth_admission(
+    State(state): State<AdmissionState>,
+    mut request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    if path != "/healthz" {
+        let peer = request.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .map(|p| p.0.ip());
+        let peer = client_ip(peer, request.headers(), &state.trusted_proxies);
+        // Registration always consumes its dedicated budget, even with a bearer.
+        if path == "/oauth/register" && !state.registration.lock().map(|mut t| t.allow(format!("ip:{peer}"), 3)).unwrap_or(false) {
+            return busy_response(StatusCode::TOO_MANY_REQUESTS);
+        }
+        let principal = if request.headers().contains_key("authorization") {
+            match admission_principal(request.headers(), &state).await {
+                Ok(principal) => principal,
+                Err(response) => return response,
+            }
+        } else { None };
+        let allowed = if let Some(principal) = principal {
+            state.principals.lock().map(|mut t| t.allow(principal, 60)).unwrap_or(false)
+        } else {
+            state.anonymous.lock().map(|mut t| t.allow(peer.clone(), 120)).unwrap_or(false)
+        };
+        if !allowed {
+            return if path.starts_with("/oauth/") {
+                busy_response(StatusCode::TOO_MANY_REQUESTS)
+            } else { http_rate_response() };
+        }
+        request.extensions_mut().insert(SourceIp(peer));
+        request.extensions_mut().insert(RegistrationBudget(state.registration.clone()));
+    }
+    next.run(request).await
+}
+
+// Keep the permit inside the blocking job, including when its HTTP future is
+// cancelled. An attacker cannot accumulate unbounded queued flock waiters.
+pub(crate) async fn blocking_io<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, Response> {
+    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let permit = SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
+        .clone().try_acquire_owned().map_err(|_| busy_response(StatusCode::SERVICE_UNAVAILABLE))?;
+    tokio::task::spawn_blocking(move || { let _permit = permit; work() }).await
+        .map_err(|_| busy_response(StatusCode::SERVICE_UNAVAILABLE))
+}
+
+pub(crate) async fn blocking_http(work: impl FnOnce() -> Response + Send + 'static) -> Response {
+    blocking_io(work).await.unwrap_or_else(|r| r)
+}
+
+pub(crate) async fn authenticate_http_call(
+    headers: &HeaderMap, state: &HttpState,
+) -> Result<(crate::mcp_auth::AuthenticatedCall, NamespaceContext), Response> {
+    let headers = headers.clone();
+    let home = state.home_dir.clone();
+    let resource = state.resource.clone();
+    let limiter = state.dispatcher.rate_limiter.clone();
+    blocking_io(move || {
+        let result = authenticate_bearer_call(&headers, &home, &resource)?;
+        if limiter.check(&result.0.principal().client_id, OpType::HttpRequest).is_err() {
+            return Err(http_rate_response());
+        }
+        if let Some(raw) = headers.get("authorization").and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            && crate::mcp_oauth_server::is_oauth_access_token(raw) {
+            crate::mcp_oauth_server::note_oauth_use(raw, &home);
+        }
+        Ok(result)
+    }).await?
+}
+
+async fn authenticate_http_stream(
+    headers: &HeaderMap, query: Option<&str>, state: &HttpState,
+) -> Result<(Principal, NamespaceContext), Response> {
+    if headers.contains_key("authorization") {
+        return authenticate_http_call(headers, state).await.map(|(a, n)| (a.principal().clone(), n));
+    }
+    let headers = headers.clone();
+    let query = query.map(str::to_owned);
+    let home = state.home_dir.clone();
+    let resource = state.resource.clone();
+    let limiter = state.dispatcher.rate_limiter.clone();
+    blocking_io(move || {
+        let result = authenticate_bearer_or_query(&headers, query.as_deref(), &home, &resource)?;
+        if limiter.check(&result.0.client_id, OpType::HttpRequest).is_err() {
+            return Err(http_rate_response());
+        }
+        Ok(result)
+    }).await?
 }
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
@@ -73,14 +396,16 @@ pub struct HttpState {
 pub(crate) fn authenticate_bearer(
     headers: &HeaderMap,
     home_dir: &std::path::Path,
+    resource: &str,
 ) -> Result<(Principal, NamespaceContext), Response> {
-    authenticate_bearer_call(headers, home_dir)
+    authenticate_bearer_call(headers, home_dir, resource)
         .map(|(call, namespace)| (call.principal().clone(), namespace))
 }
 
 pub(crate) fn authenticate_bearer_call(
     headers: &HeaderMap,
     home_dir: &std::path::Path,
+    resource: &str,
 ) -> Result<(crate::mcp_auth::AuthenticatedCall, NamespaceContext), Response> {
     let auth_header = headers
         .get("Authorization")
@@ -123,12 +448,18 @@ pub(crate) fn authenticate_bearer_call(
                 .into_response()
         })?;
 
+    if crate::mcp_refresh::is_refresh_token_format(raw_key) {
+        return Err((StatusCode::UNAUTHORIZED, Json(crate::mcp_dispatch::jsonrpc_error(
+            &Value::Null, -32003, crate::mcp_refresh::STDIO_ONLY_NOTICE,
+        ))).into_response());
+    }
+
     // WP3.1-T2: OAuth-issued access tokens share the Bearer surface but live
     // in their own store (hashed at rest); everything else stays the static
     // mcp_keys path. Both produce a Principal that flows through the SAME
     // scope/namespace enforcement below.
-    let auth_result = if raw_key.starts_with(crate::mcp_oauth_server::OAUTH_TOKEN_PREFIX) {
-        crate::mcp_oauth_server::validate_oauth_token(raw_key, home_dir)
+    let auth_result = if crate::mcp_oauth_server::is_oauth_access_token(raw_key) {
+        crate::mcp_oauth_server::validate_oauth_token(raw_key, home_dir, resource)
             .map(crate::mcp_auth::AuthenticatedCall::without_reference)
     } else {
         crate::mcp_auth::authenticate_with_key_call(raw_key, home_dir)
@@ -176,13 +507,19 @@ fn authenticate_bearer_or_query(
     headers: &HeaderMap,
     query_api_key: Option<&str>,
     home_dir: &std::path::Path,
+    resource: &str,
 ) -> Result<(Principal, NamespaceContext), Response> {
     // Prefer Authorization header; fall back to query param (SSE only)
     if headers.contains_key("Authorization") {
-        return authenticate_bearer(headers, home_dir);
+        return authenticate_bearer(headers, home_dir, resource);
     }
 
     if let Some(raw_key) = query_api_key.filter(|k| !k.is_empty()) {
+        if crate::mcp_refresh::is_refresh_token_format(raw_key) {
+            return Err((StatusCode::UNAUTHORIZED, Json(crate::mcp_dispatch::jsonrpc_error(
+                &Value::Null, -32003, crate::mcp_refresh::STDIO_ONLY_NOTICE,
+            ))).into_response());
+        }
         let principal = authenticate_with_key(raw_key, home_dir).map_err(|e| {
             (
                 StatusCode::UNAUTHORIZED,
@@ -234,7 +571,10 @@ fn authenticate_bearer_or_query(
 /// Build the Axum router with all MCP HTTP routes attached to `state`.
 /// Extracted from `run` so integration tests can call routes without binding a port.
 pub fn build_router(cfg: &HttpServerConfig, dispatcher: McpDispatcher) -> Router {
+    let origin = cfg.external_origin().expect("invalid MCP HTTP configuration");
     let state = HttpState {
+        resource: format!("{origin}/mcp"),
+        external_origin: origin,
         dispatcher: Arc::new(dispatcher),
         sse_store: Arc::new(SseEventStore::new()),
         call_timeout: cfg.call_timeout,
@@ -246,6 +586,14 @@ pub fn build_router(cfg: &HttpServerConfig, dispatcher: McpDispatcher) -> Router
 /// Build the router from a pre-constructed `HttpState` (so the SSE store can be
 /// shared with the background idle-eviction task in `run`).
 fn build_router_with_state(cfg: &HttpServerConfig, state: HttpState) -> Router {
+    let admission_state = AdmissionState {
+        anonymous: Arc::new(std::sync::Mutex::new(Admission::default())),
+        principals: Arc::new(std::sync::Mutex::new(Admission::default())),
+        registration: Arc::new(std::sync::Mutex::new(Admission::default())),
+        hints: Arc::new(std::sync::Mutex::new(CredentialHints::default())),
+        trusted_proxies: cfg.trusted_proxies.clone(),
+        http: state.clone(),
+    };
     let mut router = Router::new()
         .route("/healthz", get(healthz_handler))
         // WP3.1-T1: standard MCP Streamable HTTP endpoint (spec transport for
@@ -280,6 +628,7 @@ fn build_router_with_state(cfg: &HttpServerConfig, state: HttpState) -> Router {
             post(crate::mcp_oauth_server::decision_handler),
         )
         .route("/oauth/token", post(crate::mcp_oauth_server::token_handler))
+        .route("/oauth/revoke", post(crate::mcp_oauth_server::revoke_handler))
         .route("/mcp/v1/call", post(call_handler))
         // WP2.12: wearable-transcript ingest (vendor-webhook-friendly shape).
         .route("/ingest/transcript", post(ingest_transcript_handler));
@@ -290,14 +639,20 @@ fn build_router_with_state(cfg: &HttpServerConfig, state: HttpState) -> Router {
             .route("/mcp/v1/stream/call", post(stream_call_handler));
     }
 
-    // W22-P0 ADR-002: inject x-duduclaw-version + x-duduclaw-capabilities into all responses.
+    // W22-P0 ADR-002: capability headers cover requests admitted by the proxy boundary.
     // Layer order (axum: last .layer() = outermost = runs first on request, last on response):
-    //   outer: inject_capability_headers — adds standard headers to ALL responses (incl. 422)
+    //   outermost: require_proxy_peer — refuses untrusted TCP peers before processing
+    //   next: inject_capability_headers — adds standard headers (incl. 422)
     //   inner: negotiate_capabilities   — validates client's x-duduclaw-capabilities header
     router
         .with_state(state)
+        .layer(middleware::from_fn_with_state(admission_state, pre_auth_admission))
         .layer(middleware::from_fn(negotiate_capabilities)) // inner
-        .layer(middleware::from_fn(inject_capability_headers)) // outer
+        .layer(middleware::from_fn(inject_capability_headers))
+        .layer(middleware::from_fn_with_state(ProxyBoundary {
+            required: !cfg.bind.ip().is_loopback() && !cfg.allow_insecure_lan,
+            trusted: cfg.trusted_proxies.clone(),
+        }, require_proxy_peer)) // outermost, including health checks and fallback routes
 }
 
 // ── Server entry point ────────────────────────────────────────────────────────
@@ -314,7 +669,16 @@ impl Drop for LicenseTasks {
     }
 }
 
-pub async fn run(cfg: HttpServerConfig, dispatcher: McpDispatcher) -> Result<(), String> {
+pub async fn run(mut cfg: HttpServerConfig, dispatcher: McpDispatcher) -> Result<(), String> {
+    cfg.external_origin()?;
+    if cfg.allow_insecure_lan {
+        tracing::warn!("INSECURE MCP LAN OPT-IN: HTTP carries operator keys and OAuth tokens in plaintext; use only on an isolated trusted network");
+        eprintln!("WARNING: --allow-insecure-lan permits plaintext MCP/OAuth credentials on the network.");
+    }
+    let listener = tokio::net::TcpListener::bind(&cfg.bind)
+        .await.map_err(|e| format!("Failed to bind {}: {e}", cfg.bind))?;
+    cfg.bind = listener.local_addr().map_err(|e| format!("Failed to read MCP listener address: {e}"))?;
+    let origin = cfg.external_origin()?;
     // OAuth pages also run without start_gateway. Use the same verified local
     // license and cached distributor document; network refresh runs separately
     // and never delays serving the HTTP routes or changes their authentication.
@@ -327,6 +691,8 @@ pub async fn run(cfg: HttpServerConfig, dispatcher: McpDispatcher) -> Result<(),
     let _license_tasks = LicenseTasks(license_runtime.spawn_background_tasks());
 
     let state = HttpState {
+        resource: format!("{origin}/mcp"),
+        external_origin: origin,
         dispatcher: Arc::new(dispatcher),
         sse_store: Arc::new(SseEventStore::new()),
         call_timeout: cfg.call_timeout,
@@ -347,11 +713,7 @@ pub async fn run(cfg: HttpServerConfig, dispatcher: McpDispatcher) -> Result<(),
 
     info!(bind = %cfg.bind, "MCP HTTP server listening");
 
-    let listener = tokio::net::TcpListener::bind(&cfg.bind)
-        .await
-        .map_err(|e| format!("Failed to bind {}: {e}", cfg.bind))?;
-
-    axum::serve(listener, router)
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .map_err(|e| format!("HTTP server error: {e}"))
 }
@@ -372,7 +734,7 @@ async fn call_handler(
     Json(body): Json<Value>,
 ) -> Response {
     // Authenticate (header only — no query param to prevent access log leakage)
-    let (authenticated, ns_ctx) = match authenticate_bearer_call(&headers, &state.home_dir) {
+    let (authenticated, ns_ctx) = match authenticate_http_call(&headers, &state).await {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -395,30 +757,6 @@ async fn call_handler(
                 -32601,
                 &format!("Method not found: '{method}'. Use 'tools/call'"),
             ));
-        }
-
-        // ── HTTP rate gate: 60 req/min per API key ────────────────────────────────
-        if let Err(e) = state
-            .dispatcher
-            .rate_limiter
-            .check(&principal.client_id, OpType::HttpRequest)
-        {
-            let mut resp = into_axum_response(crate::mcp_dispatch::jsonrpc_error(
-                &id,
-                -32029,
-                &format!(
-                    "HTTP rate limit exceeded, retry after {} seconds",
-                    e.retry_after_secs
-                ),
-            ));
-            resp.headers_mut().insert(
-                "Retry-After",
-                e.retry_after_secs
-                    .to_string()
-                    .parse()
-                    .unwrap_or_else(|_| "1".parse().unwrap()),
-            );
-            return resp;
         }
 
         let params = body.get("params").cloned().unwrap_or(Value::Null);
@@ -460,26 +798,13 @@ async fn ingest_transcript_handler(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Response {
-    let (authenticated, ns_ctx) = match authenticate_bearer_call(&headers, &state.home_dir) {
+    let (authenticated, ns_ctx) = match authenticate_http_call(&headers, &state).await {
         Ok(p) => p,
         Err(r) => return r,
     };
     let principal = authenticated.principal().clone();
     crate::mcp_auth::with_authenticated_call(authenticated, async {
-        if let Err(e) = state
-            .dispatcher
-            .rate_limiter
-            .check(&principal.client_id, OpType::HttpRequest)
-        {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "stored": false,
-                    "error": format!("rate limited, retry after {}s", e.retry_after_secs),
-                })),
-            )
-                .into_response();
-        }
+
 
         let Some(text) = extract_transcript_text(&payload) else {
             return (
@@ -616,34 +941,10 @@ async fn stream_handler(
 ) -> impl IntoResponse {
     // Auth: Bearer header OR ?api_key= (SSE clients may not support custom headers)
     let (principal, _ns_ctx) =
-        match authenticate_bearer_or_query(&headers, query.api_key.as_deref(), &state.home_dir) {
+        match authenticate_http_stream(&headers, query.api_key.as_deref(), &state).await {
             Ok(p) => p,
             Err(r) => return r,
         };
-
-    // HP2: rate-gate the SSE endpoint just like the JSON-RPC endpoints.
-    if let Err(e) = state
-        .dispatcher
-        .rate_limiter
-        .check(&principal.client_id, OpType::HttpRequest)
-    {
-        let mut resp = into_axum_response(crate::mcp_dispatch::jsonrpc_error(
-            &Value::Null,
-            -32029,
-            &format!(
-                "HTTP rate limit exceeded, retry after {} seconds",
-                e.retry_after_secs
-            ),
-        ));
-        resp.headers_mut().insert(
-            "Retry-After",
-            e.retry_after_secs
-                .to_string()
-                .parse()
-                .unwrap_or_else(|_| "1".parse().unwrap()),
-        );
-        return resp;
-    }
 
     let conn_id = query
         .conn_id
@@ -713,7 +1014,7 @@ async fn stream_call_handler(
     Query(query): Query<StreamCallQuery>,
     Json(body): Json<Value>,
 ) -> Response {
-    let (authenticated, ns_ctx) = match authenticate_bearer_call(&headers, &state.home_dir) {
+    let (authenticated, ns_ctx) = match authenticate_http_call(&headers, &state).await {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -721,22 +1022,6 @@ async fn stream_call_handler(
     crate::mcp_auth::with_authenticated_call(authenticated, async {
         let id = body.get("id").cloned().unwrap_or(Value::Null);
         let params = body.get("params").cloned().unwrap_or(Value::Null);
-
-        // HTTP rate gate
-        if let Err(e) = state
-            .dispatcher
-            .rate_limiter
-            .check(&principal.client_id, OpType::HttpRequest)
-        {
-            return into_axum_response(crate::mcp_dispatch::jsonrpc_error(
-                &id,
-                -32029,
-                &format!(
-                    "HTTP rate limit exceeded, retry after {} seconds",
-                    e.retry_after_secs
-                ),
-            ));
-        }
 
         let conn_id = query.conn_id.clone();
 
@@ -807,6 +1092,341 @@ pub mod tests {
     use crate::mcp_dispatch::McpDispatcher;
     use crate::mcp_memory_quota::DailyQuota;
     use crate::mcp_rate_limit::RateLimiter;
+
+    #[tokio::test]
+    async fn ddc_refresh_is_stdio_only_on_http_and_sse() {
+        let home = tempfile::tempdir().unwrap();
+        let scopes = crate::mcp_auth::parse_scopes("memory:read").unwrap();
+        let (raw, meta) = crate::mcp_refresh::issue_refresh_token(
+            home.path(), "dev", "external-client", &scopes, true,
+        ).unwrap();
+        let principal = crate::mcp_refresh::authenticate_with_refresh_token(&raw, home.path()).unwrap();
+        assert_eq!(principal.scopes, scopes);
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {raw}").parse().unwrap());
+        let rejected = [
+            authenticate_bearer(&headers, home.path(), "http://127.0.0.1:8765/mcp").unwrap_err(),
+            authenticate_bearer_or_query(&HeaderMap::new(), Some(&raw), home.path(), "http://127.0.0.1:8765/mcp").unwrap_err(),
+        ];
+        for response in rejected {
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let body = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+            let error: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["error"]["message"], crate::mcp_refresh::STDIO_ONLY_NOTICE);
+        }
+        crate::mcp_refresh::revoke_token(home.path(), &meta.jti).unwrap();
+        assert!(crate::mcp_refresh::authenticate_with_refresh_token(&raw, home.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn oauth_revocation_endpoint_is_routed() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = HttpServerConfig::new("127.0.0.1:0".parse().unwrap(), home.path().to_path_buf());
+        let router = build_router(&cfg, make_test_dispatcher());
+        let request = Request::builder().method("POST").uri("/oauth/revoke")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("client_id=public-client&token=unknown&token_type_hint=unknown")).unwrap();
+        assert_eq!(router.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn http_admission_bounds_identities_and_oauth_client_refresh_rate() {
+        let mut table = Admission::default();
+        for _ in 0..12 { assert!(table.allow("refresh-client".into(), 12)); }
+        assert!(!table.allow("refresh-client".into(), 12));
+        assert!(table.allow("another-client".into(), 12));
+        for n in table.buckets.len()..4096 { assert!(table.allow(n.to_string(), 120)); }
+        assert!(!table.allow("overflow".into(), 120));
+        assert_eq!(table.buckets.len(), 4096);
+        for (start, _) in table.buckets.values_mut() { *start -= Duration::from_secs(61); }
+        assert!(table.allow("overflow".into(), 120));
+        assert_eq!(table.buckets.len(), 1);
+        let home = tempfile::tempdir().unwrap();
+        for _ in 0..12 { assert!(oauth_client_admitted(home.path(), "client", "192.0.2.1")); }
+        assert!(!oauth_client_admitted(home.path(), "client", "192.0.2.1"));
+        assert!(oauth_client_admitted(home.path(), "other", "192.0.2.1"));
+    }
+
+    #[tokio::test]
+    async fn http_pre_auth_rate_gate_covers_all_routes_and_ignores_forwarded_ip() {
+        let home = tempfile::tempdir().unwrap();
+        // Corruption must never be read after the IP allowance is exhausted.
+        std::fs::write(home.path().join("mcp_oauth_issued.json"), "broken").unwrap();
+        let cfg = HttpServerConfig::new("127.0.0.1:0".parse().unwrap(), home.path().into());
+        let router = build_router(&cfg, make_test_dispatcher());
+        for n in 0..120 {
+            let request = Request::builder().uri("/.well-known/oauth-protected-resource")
+                .header("x-forwarded-for", format!("192.0.2.{}", n + 1))
+                .body(Body::empty()).unwrap();
+            assert_eq!(router.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
+        }
+        for (method, uri) in [("POST", "/oauth/token"), ("POST", "/oauth/revoke"),
+            ("POST", "/mcp"), ("POST", "/mcp/v1/call"), ("GET", "/mcp/v1/stream"),
+            ("POST", "/mcp/v1/stream/call"), ("POST", "/ingest/transcript")] {
+            let request = Request::builder().method(method).uri(uri)
+                .header("x-forwarded-for", "198.51.100.1").body(Body::empty()).unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{uri}");
+            assert_eq!(response.headers()["retry-after"], "60");
+            if uri == "/mcp/v1/call" {
+                let bytes = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+                let error: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(error["error"]["code"], -32029);
+            }
+        }
+        assert_eq!(router.oneshot(healthz_request()).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn http_peer_allowances_are_independent_and_token_exchange_is_client_limited() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = HttpServerConfig::new("127.0.0.1:0".parse().unwrap(), home.path().into());
+        let router = build_router(&cfg, make_test_dispatcher());
+        for n in 0..122 {
+            let peer = if n == 121 { "192.0.2.2:1234" } else { "192.0.2.1:1234" };
+            let mut request = Request::builder().uri("/.well-known/oauth-protected-resource")
+                .body(Body::empty()).unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+            let expected = if n == 120 { StatusCode::TOO_MANY_REQUESTS } else { StatusCode::OK };
+            assert_eq!(router.clone().oneshot(request).await.unwrap().status(), expected);
+        }
+        // The unique home isolates process-global exchange buckets from other tests.
+        // Exhaust one (client, IP) pair, then check both dimensions independently.
+        for n in 0..16 {
+            let (client, peer, expected) = match n {
+                12 | 15 => ("rate-client", "198.51.100.1:1234", StatusCode::TOO_MANY_REQUESTS),
+                13 => ("rate-client", "198.51.100.2:1234", StatusCode::BAD_REQUEST),
+                14 => ("other-rate-client", "198.51.100.1:1234", StatusCode::BAD_REQUEST),
+                _ => ("rate-client", "198.51.100.1:1234", StatusCode::BAD_REQUEST),
+            };
+            let mut request = Request::builder().method("POST").uri("/oauth/token")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(format!("client_id={client}&grant_type=unsupported"))).unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+            assert_eq!(router.clone().oneshot(request).await.unwrap().status(), expected,
+                "token exchange attempt {n}: client={client}, peer={peer}");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_principal_gate_covers_initialize_and_shared_client_keys() {
+        let home = tempfile::tempdir().unwrap();
+        let key_a = "ddc_dev_0123456789abcdef0123456789abcdef";
+        let key_b = "ddc_dev_1123456789abcdef0123456789abcdef";
+        let mut config = String::new();
+        for key in [key_a, key_b] { config.push_str(&format!(
+            "[mcp_keys.{key}]\nclient_id='shared-client'\nscopes=['memory:read']\nis_external=true\ncreated_at='{}'\n",
+            chrono::Utc::now().to_rfc3339(),
+        )); }
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        let cfg = HttpServerConfig::new("127.0.0.1:0".parse().unwrap(), home.path().into());
+        let dispatcher = make_test_dispatcher();
+        let limiter = dispatcher.rate_limiter.clone();
+        let router = build_router(&cfg, dispatcher);
+        for (key, expected) in [(key_a, StatusCode::OK), (key_b, StatusCode::TOO_MANY_REQUESTS)] {
+            if key == key_b {
+                for _ in 0..59 { limiter.check("shared-client", OpType::HttpRequest).unwrap(); }
+            }
+            let request = Request::builder().method("POST").uri("/mcp")
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)).unwrap();
+            assert_eq!(router.clone().oneshot(request).await.unwrap().status(), expected);
+        }
+    }
+
+    #[test]
+    fn non_loopback_requires_https_proxy_or_explicit_insecure_opt_in() {
+        let mut cfg = HttpServerConfig::new("0.0.0.0:8765".parse().unwrap(), "/tmp".into());
+        assert!(cfg.external_origin().is_err());
+        cfg.public_origin = Some("https://mcp.example.com/".into());
+        assert!(cfg.external_origin().is_err());
+        cfg.trusted_proxies.push("127.0.0.1".parse().unwrap());
+        assert_eq!(cfg.external_origin().unwrap(), "https://mcp.example.com");
+        for invalid in ["http://mcp.example.com", "https://user:pass@mcp.example.com", "https://mcp.example.com/mcp", "https://mcp.example.com/?x=1", "https://mcp.example.com/#fragment"] {
+            cfg.public_origin = Some(invalid.into());
+            assert!(cfg.external_origin().is_err(), "{invalid}");
+        }
+        cfg.public_origin = None;
+        cfg.trusted_proxies.clear();
+        cfg.allow_insecure_lan = true;
+        assert_eq!(cfg.external_origin().unwrap(), "http://0.0.0.0:8765");
+        let cfg = HttpServerConfig::new("[::1]:8765".parse().unwrap(), "/tmp".into());
+        assert_eq!(cfg.external_origin().unwrap(), "http://[::1]:8765");
+    }
+
+    #[test]
+    fn trusted_proxy_uses_last_untrusted_hop_and_rejects_spoofing() {
+        let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        let relay: IpAddr = "192.0.2.10".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.99, 198.51.100.5, 192.0.2.10".parse().unwrap());
+        assert_eq!(client_ip(Some(proxy), &headers, &[]), "127.0.0.1");
+        assert_eq!(client_ip(Some(proxy), &headers, &[proxy]), "192.0.2.10");
+        assert_eq!(client_ip(Some(proxy), &headers, &[proxy, relay]), "198.51.100.5");
+        headers.insert("x-forwarded-for", "bad, 198.51.100.5".parse().unwrap());
+        assert_eq!(client_ip(Some(proxy), &headers, &[proxy]), "127.0.0.1");
+        assert_eq!(client_ip(None, &headers, &[proxy]), "unknown-peer");
+    }
+
+    #[tokio::test]
+    async fn canonical_discovery_ignores_host_and_forwarded_proto() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cfg = HttpServerConfig::new("127.0.0.1:8765".parse().unwrap(), home.path().into());
+        for configured in [false, true] {
+            if configured {
+                cfg.public_origin = Some("https://mcp.example.com".into());
+                cfg.trusted_proxies.push("127.0.0.1".parse().unwrap());
+            }
+            let base = if configured { "https://mcp.example.com" } else { "http://127.0.0.1:8765" };
+            let router = build_router(&cfg, make_test_dispatcher());
+            for path in ["/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource"] {
+                let request = Request::builder().uri(path).header("host", "attacker.example")
+                    .header("x-forwarded-proto", "https").body(Body::empty()).unwrap();
+                let response = router.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                if path.ends_with("authorization-server") {
+                    assert_eq!(value["issuer"], base);
+                    assert_eq!(value["token_endpoint"], format!("{base}/oauth/token"));
+                    assert_eq!(value["revocation_endpoint"], format!("{base}/oauth/revoke"));
+                } else { assert_eq!(value["resource"], format!("{base}/mcp")); }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_principal_survives_exhausted_proxy_ip_budget() {
+        let home = tempfile::tempdir().unwrap();
+        let key = "ddc_dev_0123456789abcdef0123456789abcdef";
+        std::fs::write(home.path().join("config.toml"), format!(
+            "[mcp_keys.{key}]\nclient_id='separate-principal'\nscopes=['memory:read']\nis_external=true\ncreated_at='{}'\n",
+            chrono::Utc::now().to_rfc3339(),
+        )).unwrap();
+        let cfg = HttpServerConfig::new("127.0.0.1:8765".parse().unwrap(), home.path().into());
+        let router = build_router(&cfg, make_test_dispatcher());
+        for _ in 0..120 {
+            let request = Request::builder().uri("/.well-known/oauth-protected-resource")
+                .body(Body::empty()).unwrap();
+            assert_eq!(router.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
+        }
+        let request = Request::builder().uri("/.well-known/oauth-protected-resource")
+            .body(Body::empty()).unwrap();
+        assert_eq!(router.clone().oneshot(request).await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+        let request = Request::builder().method("POST").uri("/mcp")
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)).unwrap();
+        assert_eq!(router.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn registration_has_dedicated_global_creation_limit() {
+        let budget = RegistrationBudget::default();
+        for _ in 0..10 { assert!(budget.admit_creation()); }
+        assert!(!budget.admit_creation());
+        for (start, _) in budget.0.lock().unwrap().buckets.values_mut() { *start -= Duration::from_secs(61); }
+        assert!(budget.admit_creation());
+    }
+
+    #[tokio::test]
+    async fn registration_is_limited_before_store_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = HttpServerConfig::new("127.0.0.1:8765".parse().unwrap(), home.path().into());
+        let router = build_router(&cfg, make_test_dispatcher());
+        for n in 0..4 {
+            let request = Request::builder().method("POST").uri("/oauth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"redirect_uris":["https://client.example/cb"]}"#)).unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), if n < 3 { StatusCode::CREATED } else { StatusCode::TOO_MANY_REQUESTS });
+        }
+        assert_eq!(duduclaw_core::mcp_oauth_store::load_store(home.path()).unwrap().clients.len(), 3);
+    }
+
+    fn hint_test_state(home: &std::path::Path) -> AdmissionState {
+        AdmissionState {
+            anonymous: Arc::new(std::sync::Mutex::new(Admission::default())),
+            principals: Arc::new(std::sync::Mutex::new(Admission::default())),
+            registration: Arc::new(std::sync::Mutex::new(Admission::default())),
+            hints: Arc::new(std::sync::Mutex::new(CredentialHints::default())),
+            trusted_proxies: vec![],
+            http: HttpState {
+                external_origin: "http://127.0.0.1:8765".into(),
+                resource: "http://127.0.0.1:8765/mcp".into(),
+                home_dir: home.into(),
+                dispatcher: Arc::new(make_test_dispatcher()),
+                sse_store: Arc::new(SseEventStore::new()),
+                call_timeout: Duration::from_secs(30),
+            },
+        }
+    }
+
+    #[test]
+    fn credential_hint_reload_is_single_flight_and_time_bounded() {
+        let mut cache = CredentialHints::default();
+        let now = std::time::Instant::now();
+        assert!(cache.start_reload(now));
+        assert!(!cache.start_reload(now + Duration::from_secs(10)));
+        cache.loading = false;
+        cache.refreshed = Some(now);
+        for _ in 0..1000 { assert!(!cache.start_reload(now + Duration::from_millis(999))); }
+        assert_eq!(cache.reloads, 1);
+        assert!(cache.start_reload(now + Duration::from_secs(1)));
+        assert_eq!(cache.reloads, 2);
+    }
+
+    #[tokio::test]
+    async fn unknown_bearers_cannot_force_reload_after_anonymous_exhaustion() {
+        let home = tempfile::tempdir().unwrap();
+        let state = hint_test_state(home.path());
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer ddc_oauth_{:064x}", 0).parse().unwrap());
+        assert!(admission_principal(&headers, &state).await.unwrap().is_none());
+        // Freeze the refresh clock in this test; no request may bypass the
+        // one-second reload decision merely by changing its token string.
+        state.hints.lock().unwrap().refreshed = Some(std::time::Instant::now() + Duration::from_secs(60));
+        std::fs::write(home.path().join("mcp_oauth_issued.json"), "broken").unwrap();
+        let router = Router::new().route("/mcp", post(crate::mcp_streamable::mcp_post_handler))
+            .with_state(state.http.clone())
+            .layer(middleware::from_fn_with_state(state.clone(), pre_auth_admission));
+        for n in 0..125 {
+            let request = Request::builder().method("POST").uri("/mcp")
+                .header("authorization", format!("Bearer ddc_oauth_{n:064x}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)).unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), if n < 120 { StatusCode::UNAUTHORIZED } else { StatusCode::TOO_MANY_REQUESTS });
+        }
+        assert_eq!(state.hints.lock().unwrap().reloads, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_credential_hint_never_bypasses_live_authentication() {
+        let home = tempfile::tempdir().unwrap();
+        let key = "ddc_dev_0123456789abcdef0123456789abcdef";
+        std::fs::write(home.path().join("config.toml"), format!(
+            "[mcp_keys.{key}]\nclient_id='revoked-principal'\nscopes=['memory:read']\nis_external=true\ncreated_at='{}'\n",
+            chrono::Utc::now().to_rfc3339(),
+        )).unwrap();
+        let state = hint_test_state(home.path());
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
+        assert_eq!(admission_principal(&headers, &state).await.unwrap().as_deref(), Some("revoked-principal"));
+        state.hints.lock().unwrap().refreshed = Some(std::time::Instant::now() + Duration::from_secs(60));
+        std::fs::remove_file(home.path().join("config.toml")).unwrap();
+        for _ in 0..120 { assert!(state.anonymous.lock().unwrap().allow("unknown-peer".into(), 120)); }
+        let router = Router::new().route("/mcp", post(crate::mcp_streamable::mcp_post_handler))
+            .with_state(state.http.clone())
+            .layer(middleware::from_fn_with_state(state.clone(), pre_auth_admission));
+        let request = Request::builder().method("POST").uri("/mcp")
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)).unwrap();
+        assert_eq!(router.oneshot(request).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state.hints.lock().unwrap().reloads, 1);
+    }
 
     // ── Header name constants (mirrors mcp_capability.rs) ─────────────────────
 
@@ -1199,4 +1819,109 @@ pub mod tests {
             "stream/call endpoint must be absent when SSE disabled"
         );
     }
+    #[tokio::test]
+    async fn proxy_boundary_rejects_untrusted_or_missing_peer_before_body_and_headers() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cfg = HttpServerConfig::new("0.0.0.0:8765".parse().unwrap(), home.path().into());
+        cfg.public_origin = Some("https://mcp.example.com".into());
+        cfg.trusted_proxies = vec!["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()];
+        let router = build_router(&cfg, make_test_dispatcher());
+        for peer in [None, Some("192.0.2.8:1234"), Some("[2001:db8::8]:1234")] {
+            for path in ["/healthz", "/oauth/register", "/oauth/token", "/mcp", "/missing"] {
+                let stream = tokio_stream::iter(std::iter::from_fn(|| -> Option<Result<&'static str, std::io::Error>> {
+                    panic!("untrusted request body was polled");
+                }));
+                let mut request = Request::builder().method("POST").uri(path)
+                    .header("x-forwarded-for", "127.0.0.1")
+                    .header("x-duduclaw-capabilities", "invalid")
+                    .header("content-type", "application/json").body(Body::from_stream(stream)).unwrap();
+                if let Some(peer) = peer {
+                    request.extensions_mut().insert(axum::extract::ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+                }
+                let response = router.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert!(!response.headers().contains_key("x-duduclaw-version"));
+            }
+        }
+        for peer in ["127.0.0.1:1234", "[::1]:1234"] {
+            let mut request = Request::builder().uri("/healthz").body(Body::empty()).unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+            assert_eq!(router.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
+        }
+        // Both explicitly insecure LAN and loopback proxy deployments still work.
+        for (bind, insecure) in [("0.0.0.0:8765", true), ("127.0.0.1:8765", false), ("[::1]:8765", false)] {
+            cfg.bind = bind.parse().unwrap(); cfg.allow_insecure_lan = insecure;
+            let router = build_router(&cfg, make_test_dispatcher());
+            let request = Request::builder().uri("/healthz").body(Body::empty()).unwrap();
+            assert_eq!(router.oneshot(request).await.unwrap().status(), StatusCode::OK);
+        }
+        assert!(!home.path().join("mcp_oauth_issued.json").exists());
+    }
+
+    #[tokio::test]
+    async fn malformed_registration_cannot_consume_global_creation_quota() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = HttpServerConfig::new("127.0.0.1:8765".parse().unwrap(), home.path().into());
+        let router = build_router(&cfg, make_test_dispatcher());
+        for n in 0..20 {
+            let invalid = if n % 2 == 0 { "{" } else { r#"{"redirect_uris":[]}"# };
+            let mut request = Request::builder().method("POST").uri("/oauth/register")
+                .header("content-type", "application/json").body(Body::from(invalid)).unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([192, 0, 2, n], 1234))));
+            assert!(router.clone().oneshot(request).await.unwrap().status().is_client_error());
+        }
+        assert!(!home.path().join("mcp_oauth_issued.json").exists());
+        for n in 0..11 {
+            let mut request = Request::builder().method("POST").uri("/oauth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"redirect_uris":["https://client.example/cb"]}"#)).unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from(([198, 51, 100, n], 1234))));
+            assert_eq!(router.clone().oneshot(request).await.unwrap().status(),
+                if n < 10 { StatusCode::CREATED } else { StatusCode::TOO_MANY_REQUESTS });
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_token_probes_cannot_starve_same_client_at_another_proxy_source() {
+        use duduclaw_core::mcp_oauth_store::{Consent, Grant, IssuedToken, digest, update_store};
+        let home = tempfile::tempdir().unwrap();
+        let key = "ddc_dev_0123456789abcdef0123456789abcdef";
+        std::fs::write(home.path().join("config.toml"), format!(
+            "[mcp_keys.{key}]\nclient_id='operator'\nscopes=['memory:read']\nis_external=false\ncreated_at='{}'\n",
+            chrono::Utc::now().to_rfc3339(),
+        )).unwrap();
+        let mut cfg = HttpServerConfig::new("0.0.0.0:8765".parse().unwrap(), home.path().into());
+        cfg.public_origin = Some("https://mcp.example.com".into());
+        cfg.trusted_proxies.push("127.0.0.1".parse().unwrap());
+        update_store(home.path(), |store| {
+            store.grants.insert("family".into(), Grant {
+                resource: "https://mcp.example.com/mcp".into(), client_id: "client".into(),
+                client_name: "Example".into(), scope: "memory:read".into(),
+                issued_unix: chrono::Utc::now().timestamp(), last_used_unix: None,
+                consent: Consent::capture(home.path(), key, "memory:read").unwrap(),
+            });
+            store.refresh.insert(digest("valid-refresh"), IssuedToken {
+                resource: "https://mcp.example.com/mcp".into(), client_id: "client".into(),
+                client_name: "Example".into(), scope: "memory:read".into(),
+                expires_unix: chrono::Utc::now().timestamp() + 3600, family_id: "family".into(), used: false,
+            });
+        }).unwrap();
+        let router = build_router(&cfg, make_test_dispatcher());
+        for n in 0..14 {
+            let (source, token) = if n == 13 { ("198.51.100.2", "valid-refresh") } else { ("192.0.2.1", "invalid") };
+            let mut request = Request::builder().method("POST").uri("/oauth/token")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("x-forwarded-for", source)
+                .body(Body::from(format!("grant_type=refresh_token&client_id=client&refresh_token={token}"))).unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), match n { 13 => StatusCode::OK, 12 => StatusCode::TOO_MANY_REQUESTS, _ => StatusCode::BAD_REQUEST });
+        }
+        // Changing claimed client IDs cannot evade the dedicated source bound.
+        let other_home = tempfile::tempdir().unwrap();
+        for n in 0..120 { assert!(oauth_client_admitted(other_home.path(), &n.to_string(), "192.0.2.1")); }
+        assert!(!oauth_client_admitted(other_home.path(), "another", "192.0.2.1"));
+        assert!(oauth_client_admitted(other_home.path(), "another", "198.51.100.2"));
+    }
+
 }

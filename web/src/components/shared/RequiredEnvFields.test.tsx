@@ -18,9 +18,11 @@ describe('required env helpers', () => {
 
 describe('MarketplacePage install with required env', () => {
   beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
     vi.clearAllMocks();
     useConnectionStore.setState({ state: 'authenticated' as never, error: null });
     mockWsClient.call.mockImplementation(async (method: string) => {
+      if (method === 'agents.callable') return { agents: [], unrestricted: true, default_agent: null };
       if (method === 'agents.list') return { agents: [{ name: 'sam', display_name: 'Sam' }] };
       if (method === 'marketplace.list') {
         return {
@@ -45,6 +47,7 @@ describe('MarketplacePage install with required env', () => {
     const field = within(dialog).getByLabelText('BROWSERBASE_API_KEY') as HTMLInputElement;
     expect(field.type).toBe('password');
     fireEvent.change(field, { target: { value: 'bb-secret' } });
+    await waitFor(() => expect(confirm).toBeEnabled());
     fireEvent.click(confirm);
     await waitFor(() =>
       expect(mockWsClient.call.mock.calls.some(([m]) => m === 'marketplace.install')).toBe(true),
@@ -53,3 +56,5 @@ describe('MarketplacePage install with required env', () => {
     expect(params).toEqual({ id: 'browserbase', agent_id: 'sam', env: { BROWSERBASE_API_KEY: 'bb-secret' } });
   });
 });
+
+import { useAuthStore } from '@/stores/auth-store';

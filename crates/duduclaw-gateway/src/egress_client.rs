@@ -475,12 +475,8 @@ async fn exchange_connector_value(
         return crate::egress_guard::isolated_exchange(home, agent, turn, op,
             source, reservation, payload, own_read, connector_ref, remote_server);
     }
-    let key = std::env::var(duduclaw_core::ENV_MCP_API_KEY).map_err(|_| "missing gateway key")?;
-    let token =
-        std::env::var(duduclaw_core::ENV_AGENT_TOKEN).map_err(|_| "missing employee token")?;
-    if key.is_empty() || token.is_empty() || !duduclaw_core::is_valid_agent_id(agent) {
-        return Err("missing or invalid identity".into());
-    }
+    // The gateway key / employee token identity check now lives in
+    // `exchange_signed_body`, shared with `request_mail_approval`.
     let route = match op {
         "recipients" => crate::egress_guard::RECIPIENTS_ROUTE,
         "mark" => crate::egress_guard::MARK_ROUTE,
@@ -495,6 +491,41 @@ async fn exchange_connector_value(
         "connector_ref": connector_ref, "remote_server": remote_server,
         "stamp_only": connector_ref.is_some() || remote_server.is_some()
     })).map_err(|_| "bad request")?;
+    exchange_signed_body(home, agent, route, body).await
+}
+
+/// A mail confirmation is filed by the gateway from its live turn registry.
+/// No requester, decision context or reply destination is supplied by the caller.
+pub async fn request_mail_approval(
+    home: &Path, agent: &str, summary: &str, payload: &serde_json::Value,
+    ttl_seconds: i64, simulation: Option<&serde_json::Value>,
+) -> Result<Option<crate::approval::ApprovalId>, String> {
+    let turn = match checked_turn_id() {
+        Ok(turn) => turn,
+        Err(_) => return Ok(None),
+    };
+    let body = serde_json::to_vec(&serde_json::json!({
+        "turn_id": turn, "summary": summary, "payload": payload,
+        "ttl_seconds": ttl_seconds, "simulation": simulation,
+    })).map_err(|_| "invalid mail approval request")?;
+    let response = exchange_signed_body(home, agent, crate::egress_guard::MAIL_APPROVAL_ROUTE, body).await?;
+    match response.get("approval_id") {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(id)) if uuid::Uuid::parse_str(id).is_ok() =>
+            Ok(Some(crate::approval::ApprovalId::from(id.clone()))),
+        _ => Err("invalid mail approval response".into()),
+    }
+}
+
+async fn exchange_signed_body(
+    home: &Path, agent: &str, route: &str, body: Vec<u8>,
+) -> Result<serde_json::Value, String> {
+    let key = std::env::var(duduclaw_core::ENV_MCP_API_KEY).map_err(|_| "missing gateway key")?;
+    let token =
+        std::env::var(duduclaw_core::ENV_AGENT_TOKEN).map_err(|_| "missing employee token")?;
+    if key.is_empty() || token.is_empty() || !duduclaw_core::is_valid_agent_id(agent) {
+        return Err("missing or invalid identity".into());
+    }
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

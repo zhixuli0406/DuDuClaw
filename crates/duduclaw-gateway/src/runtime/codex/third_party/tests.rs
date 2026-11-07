@@ -107,6 +107,43 @@ fn config_toml_holds_duduclaw_and_the_proxied_third_party_server() {
     assert!(!CodexRuntime::write_spawn_mcp_config(&dir, &own, &servers).unwrap());
 }
 
+#[test]
+fn signed_bridge_identity_is_per_spawn_only_in_codex() {
+    let body = json!({"mcpServers": {
+        "bridge": {"command":EXE,
+            "args":["mcp-remote-bridge","--agent","trader","--server","bridge"]}
+    }}).to_string();
+    let (home, dir) = employee(Some(&body));
+    let own = own_server(home.path());
+    let mut servers = gated_servers(&dir, home.path(), &own, false).unwrap();
+    let mut wrapped = servers["bridge"].clone();
+    wrapped.args = vec!["mcp-proxy".into(), "--server".into(), "wrapped".into(),
+        "--".into(), EXE.into(), "mcp-remote-bridge".into(), "--agent".into(),
+        "trader".into(), "--server".into(), "wrapped".into()];
+    wrapped.env.insert(PROXY_UPSTREAM_ENV_VAR.into(), "{}".into());
+    servers.insert("wrapped".into(), wrapped);
+
+    assert!(CodexRuntime::write_spawn_mcp_config(&dir, &own, &servers).unwrap());
+    let config = config_toml(&dir);
+    for name in ["bridge", "wrapped"] {
+        let env = config["mcp_servers"][name]["env"].as_table().unwrap();
+        assert!(!env.contains_key(duduclaw_core::ENV_AGENT_TOKEN));
+        assert!(!env.contains_key(PROXY_UPSTREAM_ENV_VAR));
+        assert_eq!(env["DUDUCLAW_AGENT_ID"].as_str(), Some("trader"));
+    }
+    // This changes only third-party entries, not the existing built-in writer.
+    assert_eq!(config["mcp_servers"]["duduclaw"]["env"]["DUDUCLAW_AGENT_TOKEN"].as_str(),
+        Some("mac-do-not-forward"));
+    let overrides = override_args(&servers, true, None, &[], home.path()).unwrap();
+    assert!(overrides.process_env.iter().any(|(key, value)|
+        key == duduclaw_core::ENV_AGENT_TOKEN && value == "mac-do-not-forward"));
+    for name in ["bridge", "wrapped"] {
+        assert!(overrides.args.iter().any(|arg|
+            arg.starts_with(&format!("mcp_servers.{name}.env_vars="))
+                && arg.contains(duduclaw_core::ENV_AGENT_TOKEN)));
+    }
+}
+
 /// M2: written owner-only from creation, and an up-to-date file that lost
 /// its owner-only mode is reset to it.
 #[cfg(unix)]
@@ -226,10 +263,23 @@ fn a_server_named_like_duduclaw_cannot_override_it() {
 }
 
 #[test]
+fn commandless_entry_refuses_spawn_without_changing_files() {
+    let body = json!({"mcpServers": {
+        "no_command": {"args": ["x"]},
+        "valid": {"command": "python3", "args": ["-m", "m"]}
+    }}).to_string();
+    let (home, dir) = employee(Some(&body));
+    let error = gated_servers(&dir, home.path(), &own_server(home.path()), false).unwrap_err();
+    assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{error}");
+    assert!(error.contains("no_command") && error.contains("unsupported or ambiguous stdio transport"), "{error}");
+    assert_eq!(std::fs::read_to_string(dir.join(".mcp.json")).unwrap(), body);
+    assert!(!dir.join(".codex").exists());
+}
+
+#[test]
 fn ungateable_entries_are_dropped_never_passed_through() {
     let body = json!({ "mcpServers": {
         "remote_erp": { "type": "http", "url": "https://erp.example.com/mcp" },
-        "no_command": { "args": ["x"] },
         "bad name": { "command": "npx", "args": [] },
         "dotted.name": { "command": "npx", "args": [] },
         "bridge": { "command": EXE, "args": ["mcp-remote-bridge", "--agent", "trader", "--server", "bridge"] },
@@ -252,7 +302,7 @@ fn ungateable_entries_are_dropped_never_passed_through() {
         bridge_env.get("DUDUCLAW_MCP_API_KEY").map(String::as_str),
         Some(API_KEY)
     );
-    assert!(!bridge_env.contains_key("DUDUCLAW_AGENT_TOKEN"));
+    assert_eq!(bridge_env.get("DUDUCLAW_AGENT_TOKEN").map(String::as_str), Some("mac-do-not-forward"));
     assert_eq!(servers["spoofed_bridge"].args[0], "mcp-proxy");
 }
 
@@ -564,15 +614,15 @@ fn a_symlinked_env_dir_is_refused() {
 }
 
 /// Live check (manual, `--ignored`): drive the real `CodexRuntime::execute`
-/// path against an isolated home with a stand-in `codex` executable that
-/// records its argv and never calls a model. Inputs come only from the
+/// path against an isolated home. Native MCP isolation is not verified, so
+/// a detected unmanaged MCP source must refuse the stand-in executable. Inputs come only from the
 /// environment, so nothing here touches a real home by default:
 /// `DUDUCLAW_LIVE_CODEX_HOME` (an isolated home, never `~/.duduclaw`),
 /// `DUDUCLAW_LIVE_CODEX_AGENT` (employee id), `DUDUCLAW_LIVE_CODEX_SHIM`
 /// (the stand-in executable).
 #[tokio::test]
 #[ignore = "manual live check; needs DUDUCLAW_LIVE_CODEX_* env"]
-async fn live_codex_spawn_registers_third_party_servers() {
+async fn live_codex_spawn_refuses_external_native_mcp() {
     use crate::runtime::AgentRuntime;
     let (Ok(home), Ok(agent), Ok(shim)) = (
         std::env::var("DUDUCLAW_LIVE_CODEX_HOME"),
@@ -597,8 +647,13 @@ async fn live_codex_spawn_registers_third_party_servers() {
         effort: None,
         allow_cross_family_failover: true,
     };
-    let reply = runtime.execute("live check", &ctx).await.expect("spawn");
-    assert_eq!(reply.content, "shim-ok");
+    let layer_dir = tempfile::tempdir().unwrap();
+    let layer = layer_dir.path().join("managed_config.toml");
+    std::fs::write(&layer, "[mcp_servers.native]\ncommand='unsafe'\n").unwrap();
+    let error = super::super::MCP_CONFIG_TEST_PATHS.scope(vec![layer],
+        runtime.execute("live check", &ctx)).await.unwrap_err();
+    assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+    assert!(error.contains("managed_config.toml"));
 }
 
 #[test]

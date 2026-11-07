@@ -135,7 +135,9 @@ impl MethodHandler {
             let ok = reader.can_read_owned(task_id, owner.as_deref());
             readable.insert(task_id.to_string(), ok);
         }
-        runs_json.extend(dispatch_runs.iter().map(|r| {
+        runs_json.extend(dispatch_runs.iter().filter(|r| r.task_id.as_deref().is_none_or(|id| {
+            task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), id)
+        })).map(|r| {
             // A round prompt of a task the reader may not read: no preview.
             let preview = match r.task_id.as_deref() {
                 Some(t) if !readable.get(t).copied().unwrap_or(false) => None,
@@ -186,6 +188,9 @@ impl MethodHandler {
             let Ok(Some(run)) = store.get_dispatch_run(id) else {
                 return WsFrame::error_response("", "Run not found");
             };
+            if run.task_id.as_deref().is_some_and(|id| !task_privacy::a2a_owner_allows(&self.home_dir, ctx, id)) {
+                return WsFrame::error_response("", PERMISSION_DENIED);
+            }
             if !ctx.has_agent_access(&run.agent_id, AccessLevel::Viewer)
                 && team_visibility::may_monitor(ctx, &run.agent_id)
             {

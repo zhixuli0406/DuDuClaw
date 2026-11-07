@@ -49,6 +49,17 @@ describe('LogsPage', () => {
     expect(event.agent_id).toBe(agentId);
   });
 
+  it.each(['root', 'runtime'])('shows the protected policy source %s', async (source) => {
+    mockWsClient.call.mockResolvedValue({ events: [{
+      timestamp: '2026-11-05T00:00:00Z', source: 'security',
+      event_type: source === 'root' ? 'engine_socket_policy_changed' : 'engine_socket_warning_started',
+      agent_id: 'protected-linux', severity: 'warning', summary: '',
+      details: { policy_event_source: source },
+    }] });
+    renderWithProviders(<LogsPage />);
+    expect(await screen.findByText(source)).toBeInTheDocument();
+  });
+
   it('resolves realtime agent labels without changing their stored ids', async () => {
     useLogsStore.setState({ entries: [{ timestamp: '2026-10-31T00:00:00Z', level: 'warn', target: 'channel_reply', agent_id: 'worker', message: 'Reply failed' }] });
     mockWsClient.call.mockImplementation(async (method: string) => method === 'agents.list'

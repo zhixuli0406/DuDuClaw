@@ -338,9 +338,16 @@ duduclaw service uninstall
 
 `~/Library/LaunchAgents/com.duduclaw.gateway.plist` を作成します。
 
-macOS の LaunchAgent を更新した後は `duduclaw service restart` を実行し、
-plist に従ってジョブを再登録してください。`duduclaw doctor` が launchd の
-終了コード 78 を報告した場合も、このコマンドで新しい binary を登録します。
+gateway の更新検証とファイル置換が成功すると、独立した一度だけ実行する
+LaunchAgent が自動的に再登録・再起動します。helper は gateway の保存と接続終了を
+最大 55 秒待ってからジョブをアンロードし、再登録します。インストール済みの
+binary を使い、再登録処理の制限時間は 90 秒です。無限には再試行しません。
+元のプロセスが 55 秒以内に終了しない場合は、強制アンロードせず停止します。
+ログは `~/.duduclaw-update-relaunch/relaunch.log` に保存され、非公開の plist は
+実行開始時に削除されます。終了した helper の登録は再実行されず、次の更新で置換されます。
+自動再起動に失敗した場合や `duduclaw doctor` が launchd の終了コード 78 を報告した
+場合は、`duduclaw service restart` で新しい binary を再登録してください。
+この修正を含まない旧版からの最初の更新では、手動の再起動が必要な場合があります。新しい gateway が起動してから新方式が有効になります。
 
 ### Linux（systemd）
 
@@ -370,6 +377,18 @@ gateway は 6 時間ごとに GitHub Releases を確認し、ダッシュボー�
 3. 新しいバイナリが実際に実行できるか（`duduclaw version`）を確認したうえ
    で、アトミックにその場で入れ替えます（バックアップ＋リネーム、失敗時は
    自動ロールバック）。
+4. macOS の DuDuClaw 標準・旧 LaunchAgent では上記の独立した helper が再登録します。
+   他のインストール方法では、これまでどおり終了処理後に同一プロセス内で再実行します
+   （Unix では PID を維持）。デスクトップアプリのサイドカーは引き続きアプリが更新・再起動します。
+3. 新しいバイナリが実行できるか（`duduclaw version`）を確認してから置き換えます。
+   Unix ではインストール先と同じディレクトリに権限 `0755` の一時ファイルを排他的に作成し、
+   同期後に一度のリネームで既存パスを置き換え、ディレクトリも同期します。事前にハードリンク
+   または同期済みコピーで旧版を保存し、復元も一度のリネームで行います。Windows はバックアップ付き
+   `ReplaceFileW`、続いて置換・書き込み完了待ちを指定した `MoveFileExW` を試します。
+   実行中のファイルが両方を妨げる場合は旧版を退避してから新版を移動し、失敗が返ったら旧版を復元します。
+   この二つの移動の間でクラッシュすると、インストール先が空になる可能性は残ります。
+   復元はネイティブの置換だけを使い、妨げられた場合は復旧用コピーを保持して報告します。CLI の自己更新も同じ処理です。
+   保護された Linux サービスとデスクトップ版は別のインストーラーを使います。
 4. グレースフルシャットダウン後、**同一プロセス内で新しいバイナリを再実
    行**します。macOS/Linux では PID がそのまま維持されるため launchd/systemd
    の監視は継続し、監視されていないフォアグラウンド実行（npm wrapper、
@@ -394,6 +413,62 @@ auto_update = true   # default: false — dashboard notification only
 | Standalone／npm | その場で自己アップデートします（npm レジストリのメタデータは次回の `npm i -g duduclaw` まで古いままになりますが、無害です） |
 | Homebrew（提供終了） | 自己アップデートを拒否します。この tap はすでに廃止され、新しいバージョンが配信されることはありません。npm かデスクトップアプリで再インストールしてください。 |
 | ソースからのビルド（`cargo`/`target/`） | 自己アップデートは可能ですが、再ビルドすると上書きされます |
+
+### トラブルシューティング：v1.79.2 以前から v1.79.3 へのダッシュボード更新が失敗する
+
+macOS Apple Silicon 向けの初期 v1.79.3 実行ファイルは 210,561,920 bytes
+（200.8 MiB）で、v1.79.2 以前の更新プログラムの展開上限 200 MiB
+（209,715,200 bytes）を超えています。再試行しても失敗し、古いダッシュボードには
+「更新失敗」だけが表示される場合があります。新しい版で上限を引き上げても、現在
+動作中の古い更新プログラムには反映されません。今後のリリースではシンボルを削除し、
+公開前にアーカイブ内の実行ファイルサイズを確認して互換性を維持します。
+
+通常のスタンドアロン環境では、一度だけ実行ファイルを手動で交換してください。
+
+1. [GitHub Releases](https://github.com/zhixuli0406/DuDuClaw/releases) から、
+   対象バージョン・OS・CPU のアーカイブと同名の `.sha256`、`.minisig` を取得します。
+   必要なら先に `minisign` をインストールしてください。macOS Apple Silicon の
+   v1.79.3 の例です。
+
+```sh
+version=1.79.3
+asset=duduclaw-darwin-arm64.tar.gz
+stage=$(mktemp -d)
+cd "$stage"
+base="https://github.com/zhixuli0406/DuDuClaw/releases/download/v$version"
+curl -fL "$base/$asset" -o "$asset"
+curl -fL "$base/$asset.sha256" -o "$asset.sha256"
+curl -fL "$base/$asset.minisig" -o "$asset.minisig"
+shasum -a 256 -c "$asset.sha256" &&
+  minisign -Vm "$asset" -x "$asset.minisig" \
+    -P 'RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh'
+```
+
+2. **両方の検証に成功した場合だけ**続行します。上記の鍵は更新プログラムにも埋め
+   込まれた公式リリース公開鍵です。アーカイブと一緒に取得した未知の鍵に置き換えない
+   でください。`tar -xzf "$asset" duduclaw` で展開し、`./duduclaw version` で
+   バージョンを確認します。
+3. 第 7 節の launchd plist または systemd unit でサービスが使用する実行ファイルの
+   パスを確認し、シンボリックリンクを解決します。npm の `duduclaw` コマンドは
+   JavaScript ラッパーの場合があり、ネイティブ実行ファイルで上書きしてはいけません。
+   実際の実行ファイルを `<binary>.pre-upgrade` などにコピーして保存します。
+4. サービスを停止して停止状態を確認します。macOS はインストール済み実行ファイルの
+   `service stop`、Linux は `systemctl --user stop duduclaw` を使用します。
+   フォアグラウンド実行なら元の端末で停止します。検証済みの `./duduclaw` を実際の
+   実行ファイルのパスへコピーし、`chmod 755 <binary>` で実行権限を戻します。
+   データディレクトリはそのまま残します。
+5. 同じサービスを起動します。macOS は `<binary> service restart` で登録済み
+   LaunchAgent を再読み込みし、Linux は `systemctl --user start duduclaw` を実行
+   します。フォアグラウンドなら従来の起動コマンドを使います。サービス状態とダッシュ
+   ボードのバージョンを確認します。起動に失敗した場合は停止して保存した実行ファイルを
+   戻し、再起動してください。確認が終わるまでバックアップを残します。
+
+Linux のアーカイブは `duduclaw-linux-x64.tar.gz` または
+`duduclaw-linux-arm64.tar.gz` です。`shasum` がなければ `sha256sum -c` を使います。
+この手順は通常のインストール向けです。デスクトップアプリはアプリの更新機能を、
+保護された Linux サービスは[専用のアップグレード手順](linux-protected-service.md)を
+使用してください。
+
 
 ---
 

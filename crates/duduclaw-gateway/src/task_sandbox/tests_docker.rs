@@ -12,7 +12,7 @@
 //! `DUDU_TASK_SANDBOX_IMAGE=ghcr.io/zhixuli0406/duduclaw:v<version> cargo test -p duduclaw-gateway --lib --no-default-features -- --ignored --test-threads=1 task_sandbox::tests_docker`
 //!
 //! Local validation image (CLIs live under /usr/local/bin):
-//! `DUDU_TASK_SANDBOX_IMAGE=sha256:be45dfabcca9ecb7c783fd06b08a98bc33ab37255684cf14bed46327f8d98776 DUDU_TASK_SANDBOX_EXECUTABLES=codex=/usr/local/bin/codex cargo test -p duduclaw-gateway --lib --no-default-features -- --ignored --test-threads=1 task_sandbox::tests_docker`
+//! `DUDU_TASK_SANDBOX_IMAGE=sha256:be45dfabcca9ecb7c783fd06b08a98bc33ab37255684cf14bed46327f8d98776 DUDU_TASK_SANDBOX_EXECUTABLES=grok=/usr/local/bin/grok cargo test -p duduclaw-gateway --lib --no-default-features -- --ignored --test-threads=1 task_sandbox::tests_docker`
 use duduclaw_agent::account_rotator::{Account, AccountRotator, RotationStrategy};
 use serde_json::json;
 
@@ -24,7 +24,7 @@ fn image() -> String {
 }
 
 /// Product defaults for every executable path, plus the optional overrides
-/// from `DUDU_TASK_SANDBOX_EXECUTABLES` (`codex=/usr/local/bin/codex,...`).
+/// from `DUDU_TASK_SANDBOX_EXECUTABLES` (`grok=/usr/local/bin/grok,...`).
 fn settings() -> SandboxSettings {
     let mut s = SandboxSettings { image: image(), max_turns: 3, ..SandboxSettings::default() };
     let Ok(raw) = std::env::var("DUDU_TASK_SANDBOX_EXECUTABLES") else { return s };
@@ -95,12 +95,6 @@ async fn fake_key_run(runtime: RuntimeType, provider: &str, key: &str, model: &s
     assert!(leftovers(&agent).trim().is_empty(), "leftover container for {agent}");
     let runs = std::fs::read_dir(h.home.join("sandbox/runs")).map(|d| d.count()).unwrap_or(0);
     assert_eq!(runs, 0, "per-task directory left behind");
-}
-
-#[tokio::test]
-#[ignore = "requires Docker and DUDU_TASK_SANDBOX_IMAGE"]
-async fn real_codex_fake_key_is_an_authentication_error() {
-    fake_key_run(RuntimeType::Codex, "openai", "sk-proj-FAKEdudutasksandbox0000000000", "gpt-5.1-codex").await;
 }
 
 #[tokio::test]

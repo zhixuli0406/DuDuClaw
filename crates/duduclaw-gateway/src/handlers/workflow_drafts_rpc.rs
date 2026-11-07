@@ -655,6 +655,7 @@ impl MethodHandler {
             )?;
             let environment = service.runner.executor.environment(&draft.owner)?;
             let binding = crate::approval::ExecutionBinding {
+                conversation_audience: Default::default(),
                 schema_version: 1,
                 run_id: activation_id,
                 run_origin_kind: "workflow".into(),

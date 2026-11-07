@@ -10,7 +10,8 @@ fn restricted_tools_and_selected_credentials_are_not_ambient() {
     let selected=selected(&[("OPENAI_API_KEY","selected"),("ANTHROPIC_API_KEY","foreign"),("LD_PRELOAD","evil"),("HOME","/real-home")]);
     let env=environment(RuntimeFamily::Codex,&selected);
     assert_eq!(env["OPENAI_API_KEY"],"selected");assert!(!env.contains_key("ANTHROPIC_API_KEY"));assert!(!env.contains_key("LD_PRELOAD"));assert_ne!(env["HOME"],"/real-home");
-    let args=RuntimeFamily::Codex.argv("test",2,Path::new("/work"));assert!(args.contains(&"--ignore-user-config".into()));assert!(args.contains(&"web_search=\"disabled\"".into()));assert!(!args.contains(&"--add-dir".into()));
+    let args=RuntimeFamily::Codex.argv("test",2,Path::new("/work")).unwrap();
+    assert!(args.contains(&"--ignore-user-config".into()));
 }
 
 #[test]
@@ -32,22 +33,20 @@ fn every_family_parses_with_aliases_and_unknown_names_are_refused() {
 #[test]
 fn argv_is_pinned_per_family() {
     let node=Path::new("/runs/r/ws");
-    let codex=RuntimeFamily::Codex.argv("gpt-5.4",3,node);
-    assert_eq!(&codex[..12],&["exec","--json","--strict-config","--ignore-user-config","--ignore-rules","--ephemeral",
-        "--skip-git-repo-check","--dangerously-bypass-approvals-and-sandbox","--model","gpt-5.4","--cd","/runs/r/ws"].map(String::from));
-    let settings=codex.windows(2).filter(|p|p[0]=="-c").map(|p|p[1].as_str()).collect::<Vec<_>>();
-    assert_eq!(settings,["approval_policy=\"never\"","mcp_servers={}","web_search=\"disabled\"","features.multi_agent=false",
-        "features.hooks=false","features.plugins=false","features.memories=false","project_doc_max_bytes=0","features.apps=false",
-        "check_for_update_on_startup=false","analytics.enabled=false"]);
-    assert_eq!(codex.last().map(String::as_str),Some("-"));
-    let grok=RuntimeFamily::Grok.argv("grok-4.7",4,node);
+    let codex=RuntimeFamily::Codex.argv("gpt-5.4",3,node).unwrap();
+    assert!(codex.contains(&"mcp_servers={}".into()));
+    let (program, checked)=codex_container_command(Path::new("/opt/codex"),codex);
+    assert_eq!(program,Path::new("/usr/local/bin/python3"));
+    assert_eq!(checked[5],"/opt/codex");
+    assert!(checked[4].contains("/etc/codex"));
+    let grok=RuntimeFamily::Grok.argv("grok-4.7",4,node).unwrap();
     assert_eq!(grok,["--prompt-file","/dudu-runtime/prompt.txt","--output-format","streaming-messages-json","--cwd","/runs/r/ws",
         "-m","grok-4.7","--max-turns","4","--permission-mode","bypassPermissions",
         "--tools","run_terminal_command,read_file,search_replace,list_dir,grep,write",
         "--disallowed-tools","todo_write,monitor,search_tool,use_tool,workflow,enter_plan_mode,exit_plan_mode,ask_user_question,send_feedback,image_gen,image_edit,image_to_video,reference_to_video,spawn_subagent,scheduler_create,scheduler_delete,scheduler_list,kill_command_or_subagent,get_command_or_subagent_output",
         "--disable-web-search","--no-subagents","--no-plan","--no-auto-update"].map(String::from));
     assert!(!grok.iter().any(|a|a=="--trust"),"workspace hooks must not load");
-    assert!(RuntimeFamily::Claude.argv("m",2,node).contains(&"--safe-mode".into()));
+    assert!(RuntimeFamily::Claude.argv("m",2,node).unwrap().contains(&"--safe-mode".into()));
 }
 
 #[test]
@@ -146,4 +145,65 @@ fn grok_model_is_adopted_only_when_well_formed() {
     let result=adapter.normalize(RuntimeFamily::Grok,json!({"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":2,"total_cost_usd":0.03283448,"usage":{"input_tokens":35627,"output_tokens":817,"cache_read_input_tokens":40832,"cache_creation_input_tokens":0}}));
     let summary=super::super::agent_spawn::parse_stream(&result.to_string());
     assert_eq!(super::super::agent_spawn::call_cost("grok-4.7",&summary).source,super::super::tree::CostSource::Reported);
+}
+
+#[cfg(unix)]
+#[test]
+fn container_codex_gate_allows_absent_layers_and_refuses_native_or_unreadable_layers() {
+    use std::os::unix::fs::PermissionsExt;
+    let root=tempfile::tempdir().unwrap();
+    let layers=root.path().join("system");
+    std::fs::create_dir(&layers).unwrap();
+    let home=root.path().join("codex-home");
+    std::fs::create_dir(&home).unwrap();
+    let marker=root.path().join("spawned");
+    let bin=root.path().join("codex");
+    std::fs::write(&bin,format!("#!/bin/sh\ntouch '{}'\n",marker.display())).unwrap();
+    std::fs::set_permissions(&bin,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let script=CODEX_CONTAINER_GATE.replace("/etc/codex",layers.to_str().unwrap());
+    let run=||std::process::Command::new("python3").args(["-I","-S","-B","-c",&script])
+        .arg(&bin).current_dir(root.path()).env("CODEX_HOME",&home).output().unwrap();
+    assert!(run().status.success(),"absent layers permit the configured Codex executable");
+    assert!(marker.exists());
+    std::fs::remove_file(&marker).unwrap();
+    let system=layers.join("config.toml");
+    std::fs::write(&system,"[mcp_servers.native]\ncommand = \"unsafe\"\n").unwrap();
+    let blocked=run();
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains(system.to_str().unwrap()));
+    assert!(!marker.exists());
+    std::fs::remove_file(&system).unwrap();
+    // A directory is deterministically unreadable as a config even under uid 0.
+    std::fs::create_dir(&system).unwrap();
+    let unreadable=run();
+    assert!(!unreadable.status.success());
+    assert!(String::from_utf8_lossy(&unreadable.stderr).contains(system.to_str().unwrap()));
+    assert!(!marker.exists());
+    std::fs::remove_dir(&system).unwrap();
+    std::fs::write(&system,"mcp_servers = {}\nmodel = \"test\"\n").unwrap();
+    assert!(run().status.success(),"empty MCP tables do not define a server");
+    std::fs::remove_file(&marker).unwrap();
+    let profile=home.join("selected.config.toml");
+    std::fs::write(&profile,"[profiles.strict.mcp_servers.native]\ncommand = \"unsafe\"\n").unwrap();
+    let blocked=run();
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains(profile.to_str().unwrap()));
+    assert!(!marker.exists());
+    std::fs::remove_file(&profile).unwrap();
+    let project=root.path().join(".codex");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("config.toml"),"[mcp_servers.native]\ncommand = \"unsafe\"\n").unwrap();
+    let blocked=run();
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains(project.to_str().unwrap()));
+    assert!(!marker.exists());
+    std::fs::remove_file(project.join("config.toml")).unwrap();
+    let cache=home.join("cloud-config-bundle-cache.json");
+    std::fs::write(&cache,serde_json::json!({"signed_payload":{"bundle":{
+        "config_toml":{"enterprise_managed":[{"contents":"[mcp_servers.cloud]\ncommand = \"unsafe\"\n"}]}
+    }}}).to_string()).unwrap();
+    let blocked=run();
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains(cache.to_str().unwrap()));
+    assert!(!marker.exists());
 }

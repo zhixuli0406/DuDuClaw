@@ -52,7 +52,7 @@ async fn state_changing_call_captures_masked_input_in_audit_trail() {
         &odoo,
         &ns,
         &quota,
-        "default",
+        &audit_test_principal("default", false),
         true,
     )
     .await;
@@ -115,7 +115,7 @@ async fn state_changing_call_result_text_activates_grounding_evidence() {
         &odoo,
         &ns,
         &quota,
-        "default",
+        &audit_test_principal("default", false),
         true,
     )
     .await;
@@ -211,7 +211,7 @@ async fn tasks_complete_self_echo_never_captured_as_grounding_evidence() {
         &odoo,
         &ns,
         &quota,
-        "default",
+        &audit_test_principal("default", false),
         true,
     )
     .await;
@@ -239,7 +239,7 @@ async fn tasks_complete_self_echo_never_captured_as_grounding_evidence() {
         &odoo,
         &ns,
         &quota,
-        "default",
+        &audit_test_principal("default", false),
         true,
     )
     .await;
@@ -423,7 +423,7 @@ async fn db_tools_resolve_the_internal_key_to_the_default_agent() {
             &odoo,
             &ns,
             &quota,
-            client_id,
+            &audit_test_principal(client_id, false),
             true,
         )
         .await

@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { createIntl } from 'react-intl';
 import en from './en.json';
 import zhTW from './zh-TW.json';
 import jaJP from './ja-JP.json';
@@ -28,4 +29,36 @@ describe('i18n catalogue parity', () => {
       expect(empty).toEqual([]);
     }
   });
+});
+
+describe('MCP redirect address help', () => {
+  it.each([
+    ['en', en, '<dashboard>/oauth/mcp/callback'],
+    ['zh-TW', zhTW, '<儀表板網址>/oauth/mcp/callback'],
+    ['ja-JP', jaJP, '<ダッシュボード>/oauth/mcp/callback'],
+  ] as const)('formats the literal redirect address in %s without ICU errors', (locale, messages, address) => {
+    const onError = vi.fn();
+    const intl = createIntl({ locale, messages, onError });
+    expect(intl.formatMessage({ id: 'mcp.remote.ownClientHelp' })).toContain(address);
+    expect(onError).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('literal command and HTML help', () => {
+  it.each([['en', en], ['zh-TW', zhTW], ['ja-JP', jaJP]] as const)(
+    'formats literal angle brackets in %s without ICU errors', (locale, messages) => {
+      const onError = vi.fn();
+      const intl = createIntl({ locale, messages, onError });
+      for (const [id, literal] of [
+        ['channels.detail.access.requirePairing.help', '/pair <'],
+        ['distributor.issue.result.guide', 'duduclaw license activate <blob>'],
+        ['widgets.compose.htmlHint', '<html>/<head>/<body>'],
+        ['secaudit.list.empty.desc', 'duduclaw secaudit <repo> --save'],
+      ]) {
+        expect(intl.formatMessage({ id })).toContain(literal);
+      }
+      expect(onError).not.toHaveBeenCalled();
+    },
+  );
 });

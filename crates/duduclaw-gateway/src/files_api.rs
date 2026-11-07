@@ -91,6 +91,18 @@ pub fn attachments_dir(home: &Path, agent: Option<&str>) -> Option<PathBuf> {
     }
 }
 
+/// Open the attachment once through pinned no-follow directories. All reads,
+/// hashes and responses must use this descriptor, never the validated pathname.
+pub(crate) fn open_attachment(home: &Path, agent: Option<&str>, name: &str) -> Result<std::fs::File, ResolveError> {
+    if !is_safe_filename(name) { return Err(ResolveError::BadRequest); }
+    let path = attachments_dir(home, agent).ok_or(ResolveError::BadRequest)?;
+    let map_error = |e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::NotFound { ResolveError::NotFound } else { ResolveError::Denied }
+    };
+    let directory = crate::fs_safe::SafeDir::open_nofollow(&path, false).map_err(map_error)?;
+    directory.open_read_checked(name, true).map_err(map_error)?.ok_or(ResolveError::NotFound)
+}
+
 /// List the regular files directly inside `dir`, newest-first.
 ///
 /// A missing directory yields an empty vec (not an error): an agent that has
@@ -579,6 +591,8 @@ mod tests {
         index.insert(
             "1_a.docx".to_string(),
             crate::artifacts::FileProvenance {
+                content_hash: None,
+                size: 1,
                 saved_task_archive:false,
                 owner_user_id:None,
                 origin: crate::artifacts::ArtifactOrigin::Declared,
@@ -744,4 +758,43 @@ mod tests {
         assert_eq!(encode_filename_star("報告.pdf"), "%E5%A0%B1%E5%91%8A.pdf");
         assert_eq!(encode_filename_star("a b.pdf"), "a%20b.pdf");
     }
+}
+
+#[cfg(all(test, unix))]
+mod attachment_fd_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn files_attachment_fd_survives_swap_and_refuses_links() {
+        for agent in [None, Some("sales")] {
+            let home = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let dir = attachments_dir(home.path(), agent).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("file.png");
+            std::fs::write(&path, b"original").unwrap();
+            let file = open_attachment(home.path(), agent, "file.png").unwrap();
+            let outside = home.path().join("secret");
+            std::fs::write(&outside, b"secret").unwrap();
+            std::fs::remove_file(&path).unwrap();
+            symlink(&outside, &path).unwrap();
+            assert_eq!(crate::chat_attachments::snapshot(file, 100).unwrap().0, b"original");
+            assert!(open_attachment(home.path(), agent, "file.png").is_err());
+            std::fs::remove_file(&path).unwrap();
+            std::fs::hard_link(&outside, &path).unwrap();
+            assert!(open_attachment(home.path(), agent, "file.png").is_err());
+            std::fs::rename(&dir, dir.with_file_name("old")).unwrap();
+            symlink(home.path(), &dir).unwrap();
+            assert!(open_attachment(home.path(), agent, "secret").is_err());
+        }
+    }
+}
+
+#[cfg(all(test, not(any(unix, windows))))]
+#[test]
+fn files_attachment_open_fails_closed_without_nofollow_support() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(home.path().join("attachments")).unwrap();
+    std::fs::write(home.path().join("attachments/file.txt"), b"private").unwrap();
+    assert!(open_attachment(home.path(), None, "file.txt").is_err());
 }

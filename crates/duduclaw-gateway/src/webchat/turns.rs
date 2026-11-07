@@ -8,6 +8,10 @@ use tokio_util::sync::CancellationToken;
 
 mod run;
 mod progress;
+mod subscriptions;
+mod writer;
+pub(super) use writer::{GuardedSocket, SocketGate};
+pub(super) use subscriptions::Subscriptions;
 mod identity;
 pub(super) mod downstream;
 pub(super) use identity::IdentityUnavailable;
@@ -32,10 +36,13 @@ enum CancelCause { Person, CredentialRevoked, CredentialUnavailable }
 
 struct Entry {
     user: String,
+    agent: Option<String>,
+    origin: Option<String>,
     sid: String,
     conv: Option<String>,
     msg_id: String,
     cancel: CancellationToken,
+    delivery_cancel: CancellationToken,
     cancel_request_id: Option<String>,
     cancel_cause: CancelCause,
     delivering: bool,
@@ -48,6 +55,7 @@ pub(super) struct Ticket {
     registry: Arc<Registry>,
     pub id: String,
     pub cancel: CancellationToken,
+    pub delivery_cancel: CancellationToken,
     principal: String,
     lineage_principal: Option<String>,
     started: AtomicBool,
@@ -61,6 +69,25 @@ pub(super) fn cancel_principal(user: &str, peer_ip: std::net::IpAddr) -> String 
 }
 
 impl Registry {
+    pub(super) fn logout_origin(&self, user: &str, origin: &str, resumed: &[(String, Option<String>)]) {
+        for entry in self.entries.lock().unwrap().values_mut() {
+            if entry.admitted && entry.user == user && (entry.origin.as_deref() == Some(origin)
+                || resumed.iter().any(|(sid, conv)| entry.sid == *sid && entry.conv == *conv && conv.is_some())) {
+                entry.cancel_cause = CancelCause::CredentialRevoked;
+                entry.delivery_cancel.cancel();
+                // Let a delivery already in progress finish recording its row
+                // before rollback; dropping an in-flight DB write loses its id.
+                if !entry.delivering { entry.cancel.cancel(); }
+            }
+        }
+    }
+
+    pub(super) fn pending_agent(&self, user: &str, sid: &str) -> Option<String> {
+        self.entries.lock().unwrap().values()
+            .find(|entry| entry.admitted && entry.user == user && entry.sid == sid && !entry.cancel.is_cancelled())
+            .and_then(|entry| entry.agent.clone())
+    }
+
     /// Queued turns reserve capacity too: no hidden, unbounded queue.
     fn reserve(
         self: &Arc<Self>,
@@ -83,14 +110,18 @@ impl Registry {
         }
         let id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
+        let delivery_cancel = CancellationToken::new();
         entries.insert(
             id.clone(),
             Entry {
                 user: user.into(),
+                agent: None,
+                origin: None,
                 sid: sid.into(),
                 conv,
                 msg_id: msg_id.into(),
                 cancel: cancel.clone(),
+                delivery_cancel: delivery_cancel.clone(),
                 cancel_request_id: None,
                 cancel_cause: CancelCause::Person,
                 delivering: false,
@@ -103,6 +134,7 @@ impl Registry {
             registry: self.clone(),
             id,
             cancel,
+            delivery_cancel,
             principal: format!("user:{user}"),
             lineage_principal: None,
             started: AtomicBool::new(false),
@@ -171,6 +203,13 @@ impl Registry {
 }
 
 impl Ticket {
+    pub(super) fn set_origin(&self, agent: &str, origin: &str) {
+        let mut entries = self.registry.entries.lock().unwrap();
+        let entry = entries.get_mut(&self.id).unwrap();
+        entry.agent = Some(agent.into());
+        entry.origin = Some(origin.into());
+    }
+
     fn join_lane(&mut self, sid: &str) {
         let mut entries = self.registry.entries.lock().unwrap();
         self.predecessor = entries.values_mut()
@@ -319,6 +358,7 @@ impl<S: futures_util::Sink<Message> + Unpin> BoundedSocketSink<S> {
 
 /// Only the socket writer owns the sink. Detached turns enqueue additive envelopes.
 pub(super) struct Outbound {
+    pub route: Option<subscriptions::Route>,
     pub message: Message,
     pub ack: Option<oneshot::Sender<bool>>,
     pub deadline: Option<tokio::time::Instant>,
@@ -326,6 +366,66 @@ pub(super) struct Outbound {
 }
 
 impl Outbound {
+    /// Prepare live authority, then let GuardedSocket enforce its generation
+    /// below every buffered adapter. Backpressure never holds the ACL lease.
+    pub(super) async fn deliver_live<S: futures_util::Sink<Message> + Unpin>(
+        self, state: &WebChatState, credential: Option<&duduclaw_auth::jwt::Claims>,
+        recovery: &mut crate::handlers::live_context::SocketRecovery,
+        sink: &mut BoundedSocketSink<S>, gate: &SocketGate,
+    ) -> Result<(), ()> {
+        use std::pin::Pin;
+        let Some(route) = self.route.as_ref() else {
+            let validity = state.credential_validity(credential, true).await;
+            return self.deliver_authorized(validity, recovery, sink).await;
+        };
+        if !route.live() || !route.authorized(state).await {
+            if let Some(ack) = self.ack { let _ = ack.send(false); }
+            return Ok(());
+        }
+        let deadline = self.deadline.unwrap_or_else(|| tokio::time::Instant::now() + SEND_TIMEOUT);
+        if self.ack.as_ref().is_some_and(|ack| ack.is_closed())
+            || tokio::time::Instant::now() >= deadline {
+            if let Some(ack) = self.ack { let _ = ack.send(false); }
+            return Ok(());
+        }
+        let ready = std::future::poll_fn(|cx| Pin::new(&mut sink.0).poll_ready(cx));
+        if !matches!(tokio::time::timeout_at(deadline, ready).await, Ok(Ok(()))) {
+            if let Some(ack) = self.ack { let _ = ack.send(false); }
+            return Err(());
+        }
+        // Capture the generation BEFORE all final authority reads. Any write
+        // during those reads invalidates the delivery, even if it grants access.
+        let check = async {
+            let db = state.user_db.clone();
+            let generation = tokio::task::spawn_blocking(move || db.acl_generation())
+                .await.ok().and_then(Result::ok);
+            let validity = state.credential_validity(credential, true).await;
+            if generation.is_none() {
+                route.source.refuse();
+                return None;
+            }
+            if !recovery.observe(validity, false) || !route.authorized(state).await { return None; }
+            let policy = state.target_policy(&route.user, &route.agent, true).await.ok()?;
+            Some((generation?, policy))
+        };
+        let generation = tokio::time::timeout_at(deadline, check).await.ok().flatten();
+        let Some((generation, policy)) = generation else {
+            if let Some(ack) = self.ack { let _ = ack.send(false); }
+            return if recovery.closed() { Err(()) } else { Ok(()) };
+        };
+        *gate.lock().unwrap() = Some(writer::WritePermit {
+            users: state.user_db.clone(), generation, policy, route: route.clone(), deadline,
+            home: state.ctx.home_dir.clone(), receiving_credential: credential.cloned(),
+        });
+        // SplitSink::start_send only buffers a slot. The permit is enforced by
+        // GuardedSocket below that adapter, when its flush reaches the socket.
+        let sent = tokio::time::timeout_at(deadline, sink.0.send(self.message)).await;
+        gate.lock().unwrap().take();
+        let result = if matches!(sent, Ok(Ok(()))) { Ok(()) } else { Err(()) };
+        if let Some(ack) = self.ack { let _ = ack.send(result.is_ok()); }
+        result
+    }
+
     /// Recheck queued frames at the writer, after all queueing delays. Rejected
     /// terminal acknowledgements make the turn roll back its owned archives.
     pub(super) async fn deliver_authorized<S: futures_util::Sink<Message> + Unpin>(
@@ -334,6 +434,10 @@ impl Outbound {
         recovery: &mut crate::handlers::live_context::SocketRecovery,
         sink: &mut BoundedSocketSink<S>,
     ) -> Result<(), ()> {
+        if self.route.as_ref().is_some_and(|route| !route.live()) {
+            if let Some(ack) = self.ack { let _ = ack.send(false); }
+            return Ok(());
+        }
         if !recovery.observe(validity, false) {
             let notice_live = self.deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline)
                 && self.ack.as_ref().is_none_or(|ack| !ack.is_closed());

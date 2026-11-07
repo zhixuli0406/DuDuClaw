@@ -611,7 +611,7 @@ printf '%s\n' '{"type":"result","result":"done","total_cost_usd":0.01}'
 }
 
 #[test]
-fn every_family_runs_in_a_container_under_the_host_contract() {
+fn supported_families_run_in_a_container() {
     let mut attempt=AttemptSettings::default();
     for name in ["claude","codex","grok","openai-compat"] {
         attempt.runtimes.insert(name.into(),super::super::config::AttemptRuntimeConfig {
@@ -629,7 +629,7 @@ fn every_family_runs_in_a_container_under_the_host_contract() {
     attempt.runtimes.remove("grok");
     assert_eq!(AttemptRunnerFactory::check_runtime_capability(&attempt,"grok").err(),Some(AttemptInfraError::IsolationUnavailable));
     attempt.strict_usd=true;
-    for runtime in ["claude","codex"] {
+    for runtime in ["claude","grok"] {
         assert!(matches!(AttemptRunnerFactory::check_runtime_capability(&attempt,runtime),Err(AttemptInfraError::StrictUsdUnsupported(_))));
     }
 }
@@ -700,24 +700,19 @@ fn read_lines(dir:&tempfile::TempDir,name:&str)->Vec<String> {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn codex_host_step_limit_is_a_scored_outcome_without_retry() {
-    use serde_json::json;
-    let events=[json!({"type":"thread.started","thread_id":"t"}),json!({"type":"turn.started"}),
-        json!({"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I will edit the parser."}}),
-        json!({"type":"item.started","item":{"id":"item_1","type":"command_execution","status":"in_progress"}}),
-        json!({"type":"item.completed","item":{"id":"item_1","type":"command_execution","exit_code":0}}),
-        json!({"type":"item.started","item":{"id":"item_2","type":"file_change","status":"in_progress"}}),
-        json!({"type":"item.completed","item":{"id":"item_9","type":"mcp_tool_call"}})];
-    let (dir,runner,request,budget)=scripted_container("codex","openai","fake-key",&events,1).await;
-    let started=std::time::Instant::now();
-    let outcome=runner.run_attempt(&request).await.unwrap();
-    assert!(started.elapsed()<Duration::from_secs(8),"the host stops the container at the ceiling");
-    assert_eq!(outcome.runtime,"codex");assert!(!outcome.timed_out);assert_eq!(outcome.infra_retries,0);
-    assert!(outcome.model.is_empty(),"codex reports no model; none is invented");
-    assert_eq!(outcome.final_text,"I will edit the parser.","the step-limit result carries the last agent message");
-    assert_eq!(outcome.cost.usd_source,CostSource::Unknown,"codex reports usage only at turn end");
-    assert_eq!(std::fs::read_to_string(dir.path().join("tools/starts")).unwrap(),"start\n");
-    assert_eq!(budget.snapshot().agent_calls,1);
+async fn codex_direct_runner_still_requires_budget() {
+    let dir=tempfile::tempdir().unwrap();
+    let factory=AttemptRunnerFactory {home_dir:dir.path().join("missing-home"),
+        attempt:AttemptSettings::default(),quota:Default::default(),allow_unconfined:false,
+        operator_identity:false,budget:None,account_rotator:None,extra_read_paths:vec![],max_concurrency:1};
+    let runner=ContainerAttemptRunner {factory,family:super::super::attempt_adapter::RuntimeFamily::Codex,
+        image:super::super::config::AttemptRuntimeConfig {image:"invalid".into(),executable:"/missing".into(),base_url:None,provider:None}};
+    let request=AttemptRequest {run_id:"run".into(),cell_id:"cell".into(),node_dir:dir.path().join("missing-node"),
+        run_dir:dir.path().join("missing-run"),read_workspaces:vec![],prompt:"must not run".into(),
+        agent_id:"test".into(),model:None,timeout:Duration::ZERO,max_turns:0,account_pool:vec![]};
+    let error=runner.run_attempt(&request).await.unwrap_err();
+    assert_eq!(error,AttemptInfraError::BudgetExhausted);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(),0);
 }
 
 #[cfg(unix)]
@@ -826,16 +821,14 @@ async fn grok_native_max_turns_after_tool_use_is_a_scored_reported_outcome() {
 #[tokio::test]
 async fn rejected_credentials_are_never_replayed_and_the_next_account_is_tried() {
     use serde_json::json;
-    // Container probe shape: codex 0.159.2 with a fake key.
-    let mut stream=String::new();
-    for n in 1..=3 { stream.push_str(&json!({"type":"error","message":format!("Reconnecting... {n}/5 (unexpected status 401 Unauthorized: Incorrect API key provided: fake****)")}).to_string()); stream.push('\n'); }
-    stream.push_str(&json!({"type":"item.completed","item":{"id":"item_0","type":"error","message":"unexpected status 401 Unauthorized"}}).to_string());stream.push('\n');
-    stream.push_str(&json!({"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized: Incorrect API key provided: fake****"}}).to_string());stream.push('\n');
-    let (dir,runner,request,budget)=scripted("codex","openai",&[("only",false,"key-one")],&stream,"exit 1",3).await;
+    // Provider authentication errors must rotate accounts, regardless of family.
+    let stream=json!({"type":"result","is_error":true,
+        "errors":["401 Unauthorized: Incorrect API key provided: fake****"]}).to_string()+"\n";
+    let (dir,runner,request,budget)=scripted("grok","xai",&[("only",false,"key-one")],&stream,"exit 1",3).await;
     assert_eq!(runner.run_attempt(&request).await.err(),Some(AttemptInfraError::NoAccount));
     assert_eq!(read_lines(&dir,"starts").len(),1,"a dead credential is not replayed");
     assert!(!budget.rate_limit_stopped());
-    let (dir,runner,request,_budget)=scripted("codex","openai",&[("first",false,"key-one"),("second",false,"key-two")],&stream,"exit 1",3).await;
+    let (dir,runner,request,_budget)=scripted("grok","xai",&[("first",false,"key-one"),("second",false,"key-two")],&stream,"exit 1",3).await;
     assert_eq!(runner.run_attempt(&request).await.err(),Some(AttemptInfraError::NoAccount));
     assert_eq!(read_lines(&dir,"keys"),["key-one","key-two"],"the second account is tried once");
 }
@@ -844,16 +837,13 @@ async fn rejected_credentials_are_never_replayed_and_the_next_account_is_tried()
 #[tokio::test]
 async fn unusable_seats_are_skipped_for_a_usable_account_in_the_pool() {
     use serde_json::json;
-    let stream=[json!({"type":"item.started","item":{"id":"i1","type":"command_execution"}}),
-        json!({"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"DONE"}}),
-        json!({"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":2}})]
-        .iter().map(|e|e.to_string()+"\n").collect::<String>();
-    let (dir,runner,request,_budget)=scripted("codex","openai",&[("bad-doc",true,"not json"),("no-doc",true,""),("key",false,"key-valid")],&stream,"exit 0",3).await;
+    let stream=json!({"type":"result","result":"DONE","is_error":false}).to_string()+"\n";
+    let (dir,runner,request,_budget)=scripted("grok","xai",&[("bad-doc",true,"not json"),("no-doc",true,""),("key",false,"key-valid")],&stream,"exit 0",3).await;
     let outcome=runner.run_attempt(&request).await.unwrap();
     assert_eq!(outcome.final_text,"DONE");
     assert_eq!(read_lines(&dir,"keys"),["key-valid"]);
     // A valid login document is delivered instead of a key.
-    let (dir,runner,request,_budget)=scripted("codex","openai",&[("seat",true,"{\"auth_mode\": \"chatgpt\"}")],&stream,"exit 0",3).await;
+    let (dir,runner,request,_budget)=scripted("grok","xai",&[("seat",true,"{\"auth_mode\": \"chatgpt\"}")],&stream,"exit 0",3).await;
     runner.run_attempt(&request).await.unwrap();
     assert_eq!(read_lines(&dir,"keys"),["{\"auth_mode\":\"chatgpt\"}"]);
 }
@@ -862,15 +852,13 @@ async fn unusable_seats_are_skipped_for_a_usable_account_in_the_pool() {
 #[tokio::test]
 async fn unparsable_stdout_beyond_three_lines_voids_the_attempt() {
     use serde_json::json;
-    let tail=[json!({"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"DONE"}}),
-        json!({"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":2}})]
-        .iter().map(|e|e.to_string()+"\n").collect::<String>();
+    let tail=json!({"type":"result","result":"DONE","is_error":false}).to_string()+"\n";
     let tolerated=format!("warning: banner\n\n   \n[1,2]\nnot json either\n{tail}");
-    let (_dir,runner,request,_budget)=scripted("codex","openai",&[("test",false,"k")],&tolerated,"exit 0",3).await;
+    let (_dir,runner,request,_budget)=scripted("grok","xai",&[("test",false,"k")],&tolerated,"exit 0",3).await;
     assert_eq!(runner.run_attempt(&request).await.unwrap().final_text,"DONE","three non-JSON lines and blank lines are tolerated");
     let voided=format!("a\nb\nc\nd\n{tail}");
-    let (dir,runner,request,_budget)=scripted("codex","openai",&[("test",false,"k")],&voided,"exit 0",3).await;
-    assert_eq!(runner.run_attempt(&request).await.err(),Some(AttemptInfraError::ToolSurfaceViolation {runtime:"codex".into(),tool:"unparsable_stream".into()}));
+    let (dir,runner,request,_budget)=scripted("grok","xai",&[("test",false,"k")],&voided,"exit 0",3).await;
+    assert_eq!(runner.run_attempt(&request).await.err(),Some(AttemptInfraError::ToolSurfaceViolation {runtime:"grok".into(),tool:"unparsable_stream".into()}));
     assert_eq!(read_lines(&dir,"starts").len(),1);
 }
 
@@ -891,20 +879,20 @@ fn discovery_removed_attempt_runtimes_are_refused() {
         executable:"/opt/runtime".into(),base_url:None,provider:None,
     };
     let mut attempt=AttemptSettings {sandbox:AttemptSandbox::Container,..Default::default()};
-    attempt.runtimes.insert("codex".into(), image.clone());
-    assert!(AttemptRunnerFactory::check_runtime_capability(&attempt,"codex").is_ok());
+    attempt.runtimes.insert("grok".into(), image.clone());
+    assert!(AttemptRunnerFactory::check_runtime_capability(&attempt,"grok").is_ok());
     for id in ["gemini", "antigravity", "agy"] {
         let error = AttemptRunnerFactory::check_runtime_capability(&attempt,id).unwrap_err().to_string();
         assert!(error.contains("removed") && error.contains("choose a supported runtime"), "{error}");
         attempt.runtimes.insert(id.into(), image.clone());
-        let error = AttemptRunnerFactory::check_runtime_capability(&attempt,"codex").unwrap_err().to_string();
+        let error = AttemptRunnerFactory::check_runtime_capability(&attempt,"grok").unwrap_err().to_string();
         assert!(error.contains("config.toml") && error.contains("removed"), "{error}");
         attempt.runtimes.remove(id);
     }
     for id in ["antigravity", "agy"] {
-        attempt.runtimes.get_mut("codex").unwrap().provider = Some(id.into());
-        assert!(AttemptRunnerFactory::check_runtime_capability(&attempt,"codex").unwrap_err().to_string().contains("removed"));
+        attempt.runtimes.get_mut("grok").unwrap().provider = Some(id.into());
+        assert!(AttemptRunnerFactory::check_runtime_capability(&attempt,"grok").unwrap_err().to_string().contains("removed"));
     }
-    attempt.runtimes.get_mut("codex").unwrap().provider = Some("gemini".into());
-    assert!(AttemptRunnerFactory::check_runtime_capability(&attempt,"codex").is_ok());
+    attempt.runtimes.get_mut("grok").unwrap().provider = Some("gemini".into());
+    assert!(AttemptRunnerFactory::check_runtime_capability(&attempt,"grok").is_ok());
 }

@@ -1,3 +1,5 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
+import { useConnectionStore } from '@/stores/connection-store';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -91,9 +93,12 @@ const SKILLS: SkillsListAll = {
 
 const CREATED = { task: { id: 'gt-9', title: 'x' }, iteration_cap: 8, dispatch_enabled: true, plan_first: false };
 
+let recentSkills: Array<{ name: string; display_name: string; description: string }> = [];
+
 function mockRpc(skills: SkillsListAll = SKILLS) {
   mockWsClient.call.mockImplementation((method: string) => {
     if (method === 'skills.list') return Promise.resolve(skills);
+    if (method === 'skills.recent') return Promise.resolve({ skills: recentSkills });
     if (method === 'tasks.goal_create' || method === 'tasks.skill_assign') return Promise.resolve(CREATED);
     return Promise.resolve({});
   });
@@ -124,10 +129,12 @@ function fileInput(): HTMLInputElement {
 const fetchMock = vi.fn();
 
 beforeEach(() => {
+  useConnectionStore.setState({ state: 'authenticated' });
   vi.clearAllMocks();
   useAgentsStore.setState({ agents: ROSTER as never, loaded: true });
   useSystemStore.setState({ status: { edition_profile: 'personal', channels_connected: 0 } as never });
   useAuthStore.setState({ jwt: 'test-jwt', user: { role: 'admin', display_name: 'Boss' } as never });
+  recentSkills = [];
   mockRpc();
   fetchMock.mockResolvedValue({
     ok: true,
@@ -232,7 +239,10 @@ describe('一般 tab', () => {
 
   it('inserts and toggles recent skill chips in the note', async () => {
     const user = userEvent.setup();
-    window.localStorage.setItem('assign.recentSkills', JSON.stringify(['quote', 'beta']));
+    recentSkills = [
+      { name: 'quote', display_name: 'Quote', description: 'Make a quote' },
+      { name: 'beta', display_name: 'Beta skill', description: 'Never run' },
+    ];
     renderAt('/assign');
     const quote = await screen.findByRole('button', { name: /Quote.*Make a quote/ });
     expect(quote).toHaveAttribute('aria-pressed', 'false');
@@ -246,19 +256,23 @@ describe('一般 tab', () => {
 
   it('supports multiple selected chips and submits the first chip skill', async () => {
     const user = userEvent.setup();
-    window.localStorage.setItem('assign.recentSkills', JSON.stringify(['quote', 'beta']));
+    recentSkills = [
+      { name: 'quote', display_name: 'Quote', description: 'Make a quote' },
+      { name: 'beta', display_name: 'Beta skill', description: 'Never run' },
+    ];
     renderAt('/assign');
     await user.click(await screen.findByRole('button', { name: /Quote.*Make a quote/ }));
     await user.click(screen.getByRole('button', { name: /Beta skill.*Never run/ }));
     await user.type(screen.getByLabelText('Anything to add? (optional)'), 'more detail');
     await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('tasks.skill_assign', {
-      skill_name: 'quote', note: '/quote /beta more detail',
+      skill_name: 'quote', skill_names: ['quote', 'beta'], note: '/quote /beta more detail',
     }));
   });
 
-  it('drops recent names missing from the available skill list', async () => {
-    window.localStorage.setItem('assign.recentSkills', JSON.stringify(['removed', 'quote']));
+  it('uses only the current account server history, ignoring browser history', async () => {
+    window.localStorage.setItem('assign.recentSkills', JSON.stringify(['removed']));
+    recentSkills = [{ name: 'quote', display_name: 'Quote', description: 'Make a quote' }];
     renderAt('/assign');
     expect(await screen.findByRole('button', { name: /Quote.*Make a quote/ })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /removed/i })).not.toBeInTheDocument();
@@ -455,6 +469,7 @@ describe('複雜任務 tab', () => {
 
   it('defaults to the primary employee without replacing an entry-point selection', async () => {
     useAuthStore.setState({ user: { role: 'admin', primary_agent_id: 'nova' } as never });
+    setConfirmedCallableAgents(true);
     const user = userEvent.setup();
     openComplex();
     await user.type(screen.getByLabelText('What should the AI employee do?'), 'Use my primary');
@@ -464,6 +479,7 @@ describe('複雜任務 tab', () => {
 
   it('keeps the explicit employee when the primary differs', async () => {
     useAuthStore.setState({ user: { role: 'admin', primary_agent_id: 'nova' } as never });
+    setConfirmedCallableAgents(true);
     const user = userEvent.setup();
     renderAt({ pathname: '/assign', state: { assignPrefill: { agentId: 'scout', description: 'Explicit selection' } } });
     await user.click(within(visiblePanel()).getByRole('button', { name: 'Assign task' }));
@@ -556,3 +572,6 @@ describe('employee task navigation preference', () => {
     expect(screen.getByRole('tab', { name: en['assign.tab.complex'] })).toHaveAttribute('aria-selected', 'true');
   });
 });
+
+// Start these component scenarios after the gateway confirmed the admin roster.
+beforeEach(() => setConfirmedCallableAgents(true));

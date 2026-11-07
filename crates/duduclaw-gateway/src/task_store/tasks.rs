@@ -123,6 +123,16 @@ impl TaskStore {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<TaskRow>, i64), String> {
+        self.list_tasks_page_for_principal(status, agent_id, priority, goal_mode, archived, limit, offset, None).await
+    }
+
+    /// Dashboard pagination applies the owner restriction before LIMIT and COUNT.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn list_tasks_page_for_principal(
+        &self, status: Option<&str>, agent_id: Option<&str>, priority: Option<&str>,
+        goal_mode: Option<bool>, archived: Option<bool>, limit: i64, offset: i64,
+        principal: Option<&str>,
+    ) -> Result<(Vec<TaskRow>, i64), String> {
         let conn = self.conn.lock().await;
         let mut count_sql = "SELECT COUNT(*) FROM tasks WHERE 1=1".to_string();
         let mut query_sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE 1=1");
@@ -161,6 +171,13 @@ impl TaskStore {
         };
         count_sql.push_str(archived_clause);
         query_sql.push_str(archived_clause);
+
+        if let Some(principal) = principal {
+            binds.push(principal.to_string());
+            let clause = format!(" AND (a2a_owner IS NULL OR a2a_owner = ?{})", binds.len());
+            count_sql.push_str(&clause);
+            query_sql.push_str(&clause);
+        }
 
         let bounded_limit = limit.clamp(1, 200);
         let bounded_offset = offset.max(0);
@@ -342,6 +359,12 @@ impl TaskStore {
         fields: &serde_json::Value,
         employee_default_cap: Option<u64>,
     ) -> Result<Option<TaskRow>, String> {
+        // These creation-time fields are not part of the update whitelist.
+        // Refuse them explicitly: silently dropping a reparent request would
+        // report success without ever exercising the A2A SQL owner guard.
+        if fields.get("parent_task_id").is_some() || fields.get("a2a_owner").is_some() {
+            return Err("parent_task_id and a2a_owner cannot be updated".into());
+        }
         let cost_cap_cents = crate::goal_create_core::parse_cost_cap_cents(fields)?;
         // depends_on rewires the dependency graph — gate it fail-closed at the
         // store boundary: must be a JSON array of ids, no self-dependency, and
@@ -690,6 +713,7 @@ pub(crate) fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         pause_reason: row.get(36)?,
         plan_pending: row.get(37)?,
         plan_review: row.get(51)?,
+        a2a_owner: row.get(52)?,
         archived: row.get::<_, i64>(38)? != 0,
         pinned: row.get::<_, i64>(39)? != 0,
         team_spec_json: row.get(40)?,
@@ -798,11 +822,11 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
              revision_round, diminishing, agent_seconds, source_discord_guild_id,
              deadline_at, risk_boundary, acceptance_criteria_baseline, pause_reason,
              plan_pending, archived, pinned, team_spec_json, kind, discovery_spec_json, discovery_run_id, discovery_approval_id, criteria_ledger, authority_revision,
-             on_behalf_of, created_via, cost_cap_cents, timeout_secs, plan_review)
+             on_behalf_of, created_via, cost_cap_cents, timeout_secs, plan_review, a2a_owner)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                  ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
                  ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46,
-                 ?47, ?48, ?49, ?50, ?51)",
+                 ?47, ?48, ?49, ?50, ?51, ?52)",
         params![
             row.id,
             mask_derived_text(&row.title),
@@ -855,6 +879,7 @@ pub(super) fn insert_task_tx(conn: &Connection, row: &TaskRow) -> Result<(), Str
             row.cost_cap_cents,
             row.timeout_secs,
             row.plan_review.as_deref().map(mask_derived_text),
+            row.a2a_owner,
         ],
     )
     .map_err(|e| format!("insert task: {e}"))?;

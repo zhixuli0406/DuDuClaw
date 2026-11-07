@@ -28,8 +28,8 @@ impl MethodHandler {
 
     /// Read `[distributor] public_url` from config.toml — the owner gateway's
     /// externally-reachable base URL, baked into issued keys as
-    /// `license.control_url` (§10.5) so distributor instances phone home without
-    /// `DUDUCLAW_CONTROL_URL`. Returns `None` when unset/empty or when the value
+    /// `license.control_url` (§10.5) as an endpoint hint. Custom hosts still need
+    /// client-local `DUDUCLAW_CONTROL_URL`. Returns `None` when unset/empty or when the value
     /// is not an http(s) URL (fail-safe: a malformed URL is treated as unset
     /// rather than embedding a broken endpoint).
     pub(crate) async fn distributor_public_url(&self) -> Option<String> {
@@ -273,15 +273,13 @@ impl MethodHandler {
         );
 
         let record_v = serde_json::to_value(&record).unwrap_or_else(|_| json!({}));
-        // §10.5: when public_url is configured, the key carries its own
-        // control-plane address (no env needed). Otherwise fall back to the §9.3
-        // guidance to set DUDUCLAW_CONTROL_URL.
+        // The unsigned URL is a hint, never permission to contact a custom host.
         let warnings = match &public_url {
             Some(url) => vec![format!(
-                "金鑰已內建續期端點（{url}）：客戶 instance 無需設定 DUDUCLAW_CONTROL_URL，即會自動 phone-home 續期並接收撤銷（CRL）"
+                "金鑰已內建續期端點（{url}）；若為自訂簽發端，客戶 instance 仍須在本機設定 DUDUCLAW_CONTROL_URL 才能續期及接收撤銷（CRL）。端點須使用 HTTPS／443，且 DNS 僅解析至公開位址。"
             )],
             None => vec![
-                "請經銷商在其 DuDuClaw instance 設定環境變數 DUDUCLAW_CONTROL_URL 指向本 owner gateway（例如 https://your-gateway.example.com），授權即會自動 phone-home 續期並接收撤銷（CRL）；未設定時仍會在 60 天無 phone-home 後降級為 OpenSource。或在 config.toml 設定 [distributor] public_url 讓後續簽發的金鑰自帶續期端點".to_string(),
+                "請經銷商在其 DuDuClaw instance 本機設定環境變數 DUDUCLAW_CONTROL_URL 指向本 owner gateway（例如 https://your-gateway.example.com）；端點須使用 HTTPS／443，且 DNS 僅解析至公開位址。設定 [distributor] public_url 只會讓授權攜帶端點提示，不會替客戶端允許自訂主機。無法續期超過離線寬限期後會降級為 OpenSource。".to_string(),
             ],
         };
         WsFrame::ok_response(

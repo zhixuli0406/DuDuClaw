@@ -470,6 +470,46 @@ fn parse_error(text: &str, e: &toml_edit::TomlError) -> String {
     format!("TOML parse error at line {line}, column {col}: {}", e.message())
 }
 
+/// Credential replacement belongs to the gateway-owned credential RPC. Check
+/// the submitted representation before restoring masks, so even a ciphertext
+/// copied from elsewhere cannot be injected through the raw editor.
+fn prepare_google_stt_credential_edit(submitted: &str) -> Result<String, String> {
+    let mut doc: DocumentMut = submitted.parse().map_err(|e: toml_edit::TomlError| {
+        // Preserve useful locations without echoing secret-bearing input.
+        let offset = e.span().map_or(0, |span| span.start.min(submitted.len()));
+        let before = &submitted[..offset];
+        format!("Invalid config TOML at line {}, column {}",
+            before.matches('\n').count() + 1,
+            before.rsplit('\n').next().map_or(1, |line| line.chars().count() + 1))
+    })?;
+    if let Some(section) = doc.get_mut("transcription_credentials") {
+        let section = section.as_table_like_mut()
+            .ok_or("[transcription_credentials] must be a table")?;
+        for key in ["google_stt_key", "google_stt_key_enc"] {
+            let Some(value) = section.get(key) else { continue };
+            match value.as_str() {
+                Some(RAW_SECRET_MASK) => {}
+                Some("") => { section.remove(key); }
+                _ => return Err("Google STT credentials can only be kept masked or cleared here; use Meeting transcription settings to replace them".into()),
+            }
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// Clearing an old plaintext value must not copy it into a new backup.
+/// Existing backups are left untouched; this only sanitizes the new backup.
+fn google_stt_safe_backup(stored: &str) -> Result<String, String> {
+    let mut doc: DocumentMut = stored.parse()
+        .map_err(|_| "The stored config does not parse".to_string())?;
+    if let Some(section) = doc.get_mut("transcription_credentials").and_then(Item::as_table_like_mut) {
+        if section.remove("google_stt_key").is_some() {
+            return Ok(doc.to_string());
+        }
+    }
+    Ok(stored.to_string())
+}
+
 /// An agent's `[permissions]` edited here is an operator decision: add the
 /// v1.68 marker so the boot migration never resets it.
 fn mark_permissions_if_edited(new_text: &str, stored: &str) -> Result<String, String> {
@@ -495,6 +535,12 @@ fn mark_permissions_if_edited(new_text: &str, stored: &str) -> Result<String, St
 /// Validate a `config.toml` with the section validators the gateway itself
 /// applies when it reads each section.
 pub(crate) fn validate_config_table(table: &toml::Table) -> Result<(), String> {
+    if let Some(security) = table.get("security") {
+        let security = security.as_table().ok_or("[security] must be a table")?;
+        if security.get("mail_requester_approval").is_some_and(|v| !v.is_bool()) {
+            return Err("security.mail_requester_approval must be a boolean".into());
+        }
+    }
     if let Some(people)=table.get("people") {
         let people=people.as_table().ok_or("[people] must be a table")?;
         if people.get("manager_team_history").is_some_and(|v|!v.is_bool()) {return Err("people.manager_team_history must be a boolean".into());}
@@ -591,6 +637,13 @@ pub(crate) fn validate_raw(file: &RawFile, text: &str) -> Result<toml::Table, St
         RawFile::Config => {
             super::config_schema::check_config_types(text, &table)?;
             validate_config_table(&table)?;
+            duduclaw_inference::transcription::config::TranscriptionConfig::from_toml(text)?;
+            if let Some(credentials) = table.get("transcription_credentials") {
+                let credentials = credentials.as_table().ok_or("[transcription_credentials] must be a table")?;
+                if credentials.contains_key("google_stt_key") {
+                    return Err("Plaintext Google STT credentials cannot be saved; clear the field and use Meeting transcription settings".into());
+                }
+            }
         }
         RawFile::Inference => {
             let cfg: duduclaw_inference::config::InferenceConfig = toml::Value::Table(table.clone())
@@ -840,6 +893,13 @@ impl MethodHandler {
         if base != stored_hash {
             return Err(format!("{file} changed since it was opened — reload and try again").into());
         }
+        let prepared;
+        let submitted = if matches!(kind, RawFile::Config) {
+            prepared = prepare_google_stt_credential_edit(submitted)?;
+            prepared.as_str()
+        } else {
+            submitted
+        };
         let mut rctx = RestoreCtx::default();
         let mut new_text = restore_raw_toml_ctx(submitted, &stored, &mut rctx)?;
         if matches!(kind, RawFile::Agent(_)) {
@@ -943,6 +1003,7 @@ impl MethodHandler {
                 },
                 move |_| Ok(text),
                 || {
+                    super::system_update_config::require_live_admin_at_commit(&self.home_dir, ctx)?;
                     // The writer holds the profile lock and lifecycle barrier here.
                     // A drain timeout must neither create nor prune raw backups.
                     if !stored.is_empty() {
@@ -954,11 +1015,28 @@ impl MethodHandler {
             .await
             .map_err(|e| rctx.scrub(&e.message()))?;
         } else {
-            if !stored.is_empty() {
-                backup = Some(write_backup(&path, &stored, chrono::Utc::now().timestamp())?);
-            }
+            let backup_text = if stored.is_empty() {
+                None
+            } else if matches!(kind, RawFile::Config) {
+                Some(google_stt_safe_backup(&stored)?)
+            } else {
+                Some(stored.clone())
+            };
             let (p, h, t) = (path.clone(), stored_hash.clone(), new_text.clone());
-            tokio::task::spawn_blocking(move || commit_text_locked_with_guard(&p, &h, &t, || Ok(())))
+            let home = self.home_dir.clone();
+            let actor = ctx.clone();
+            backup = tokio::task::spawn_blocking(move || {
+                let mut backup = None;
+                commit_text_locked_with_guard(&p, &h, &t, || {
+                    super::system_update_config::require_live_admin_at_commit(&home, &actor)?;
+                    // Authorization and the file CAS precede backup creation/pruning.
+                    if let Some(text) = backup_text {
+                        backup = Some(write_backup(&p, &text, chrono::Utc::now().timestamp())?);
+                    }
+                    Ok(())
+                })?;
+                Ok::<_, String>(backup)
+            })
                 .await
                 .map_err(|e| format!("write task failed: {e}"))??;
         }
@@ -1157,6 +1235,7 @@ mod tests {
     async fn config_raw_lifecycle_timeout_leaves_backups_and_profile_unchanged() {
         use duduclaw_core::autonomy_gate::{admit, AutonomyPath};
         let home = tempfile::tempdir().unwrap();
+        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
         let created = handler.handle_agents_create_as(
             json!({"name": "a1", "display_name": "A1"}), Some(&UserContext::admin_fallback()),
@@ -1201,6 +1280,108 @@ mod tests {
         assert_eq!(after.len(), before.len());
         assert_ne!(after, before);
         assert!(after.iter().any(|(_, bytes)| bytes == original.as_bytes()));
+    }
+
+    #[test]
+    fn raw_google_stt_credentials_accept_only_masks_or_clear() {
+        for field in ["google_stt_key", "google_stt_key_enc"] {
+            for value in ["'private-key-canary'", "'copied-ciphertext'", "42", "[]", "{}"] {
+                let submitted = format!("[transcription_credentials]\n{field}={value}");
+                let error = prepare_google_stt_credential_edit(&submitted).unwrap_err();
+                assert!(!error.contains("private-key-canary"));
+                assert!(!error.contains("copied-ciphertext"));
+            }
+            assert!(prepare_google_stt_credential_edit(&format!(
+                "transcription_credentials={{ {field}='private-key-canary' }}"
+            )).is_err());
+            let cleared = prepare_google_stt_credential_edit(&format!(
+                "[transcription_credentials]\n{field}=''"
+            )).unwrap();
+            assert!(!cleared.contains(field));
+        }
+        let stored = "[transcription_credentials]\ngoogle_stt_key_enc='existing-ciphertext'";
+        let (masked, _, _) = mask_raw_toml(stored).unwrap();
+        let prepared = prepare_google_stt_credential_edit(&masked).unwrap();
+        let restored = restore_raw_toml(&prepared, stored).unwrap();
+        assert!(restored.contains("existing-ciphertext"));
+        assert!(validate_raw(&RawFile::Config, &restored).is_ok());
+        assert!(restore_raw_toml(&prepared, "").is_err());
+        assert!(prepare_google_stt_credential_edit(stored).is_err(), "even an existing raw ciphertext must be masked");
+        let plaintext = "[transcription_credentials]\ngoogle_stt_key='private-key-canary'";
+        assert!(validate_raw(&RawFile::Config, plaintext).is_err());
+        assert!(!google_stt_safe_backup(plaintext).unwrap().contains("private-key-canary"));
+    }
+
+    #[test]
+    fn raw_transcription_validation_rejects_invalid_policy() {
+        for text in [
+            "[transcription]\nengine='typo'",
+            "[transcription]\nmax_bytes=0",
+            "[transcription]\nmax_concurrent_jobs=3",
+            "[transcription]\nengine='google_stt'",
+            "[transcription]\nengine='google_stt'\n[transcription.google_stt]\nproject_id='project-a'\nbucket='meeting-audio'\nlocation='evil.test'",
+            "[transcription]\nengine='google_stt'\n[transcription.google_stt]\nproject_id='project-a'\nbucket='meeting-audio'\ndiarization=true",
+        ] {
+            assert!(validate_raw(&RawFile::Config, text).is_err(), "{text}");
+        }
+        assert!(validate_raw(&RawFile::Config,
+            "[transcription]\nengine='google_stt'\n[transcription.google_stt]\nproject_id='project-a'\nbucket='meeting-audio'"
+        ).is_ok());
+    }
+
+    #[tokio::test]
+    async fn raw_google_stt_injection_never_writes_or_creates_backups() {
+        let home = tempfile::tempdir().unwrap();
+        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let path = home.path().join("config.toml");
+        let original = "[transcription_credentials]\ngoogle_stt_key_enc='existing-ciphertext'\n";
+        std::fs::write(&path, original).unwrap();
+        for field in ["google_stt_key", "google_stt_key_enc"] {
+            let response = handler.handle_config_raw_set(json!({
+                "file": "config", "base_hash": content_hash(original),
+                "content": format!("[transcription_credentials]\n{field}='private-key-canary'"),
+            }), &UserContext::admin_fallback()).await;
+            assert!(matches!(response, WsFrame::Response { ok: false, .. }));
+            assert!(!serde_json::to_string(&response).unwrap().contains("private-key-canary"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert!(!std::fs::read_dir(home.path()).unwrap().any(|e| {
+                e.unwrap().file_name().to_string_lossy().starts_with("config.toml.bak-")
+            }));
+        }
+        let response = handler.handle_config_raw_set(json!({
+            "file": "config", "base_hash": content_hash(original),
+            "content": "[transcription_credentials]\ngoogle_stt_key_enc='«set»'",
+        }), &UserContext::admin_fallback()).await;
+        assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let response = handler.handle_config_raw_set(json!({
+            "file": "config", "base_hash": content_hash(original),
+            "content": "[transcription_credentials]\ngoogle_stt_key_enc=''",
+        }), &UserContext::admin_fallback()).await;
+        assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("google_stt_key_enc"));
+    }
+
+    #[tokio::test]
+    async fn raw_clearing_legacy_google_stt_plaintext_sanitizes_new_backup() {
+        let home = tempfile::tempdir().unwrap();
+        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let path = home.path().join("config.toml");
+        let original = "[transcription_credentials]\ngoogle_stt_key='legacy-private-key-canary'\n";
+        std::fs::write(&path, original).unwrap();
+        let response = handler.handle_config_raw_set(json!({
+            "file": "config", "base_hash": content_hash(original),
+            "content": "[transcription_credentials]\ngoogle_stt_key=''",
+        }), &UserContext::admin_fallback()).await;
+        assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("legacy-private-key-canary"));
+        let backups: Vec<_> = std::fs::read_dir(home.path()).unwrap().map(Result::unwrap)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("config.toml.bak-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert!(!std::fs::read_to_string(backups[0].path()).unwrap().contains("legacy-private-key-canary"));
     }
 
     #[test]
@@ -1332,6 +1513,16 @@ OPENAI_API_KEY = "sk-env-secret"
         assert!(err.contains("line 2"), "{err}");
         let err = validate_raw(&RawFile::Config, "a = 1\nb = \n").unwrap_err();
         assert!(err.contains("line 2"), "{err}");
+    }
+
+    #[test]
+    fn mail_requester_approval_raw_config_requires_boolean() {
+        for raw in ["[security]\nmail_requester_approval='true'", "[security]\nmail_requester_approval=1", "security=false"] {
+            assert!(validate_raw(&RawFile::Config, raw).is_err());
+        }
+        for raw in ["[security]\nmail_requester_approval=true", "[security]\nmail_requester_approval=false"] {
+            assert!(validate_raw(&RawFile::Config, raw).is_ok());
+        }
     }
 
     #[test]

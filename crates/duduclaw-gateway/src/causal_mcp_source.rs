@@ -391,6 +391,12 @@ mod tests {
         Json(frame): Json<Value>,
     ) -> Json<Value> {
         let result = match frame["method"].as_str() {
+            Some("initialize") => serde_json::json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "causal-fixture", "version": "1"}
+            }),
+            Some("notifications/initialized") => serde_json::json!({}),
             Some("tools/list") => serde_json::json!({
                 "tools": [{
                     "name": "get_source",
@@ -412,7 +418,13 @@ mod tests {
                     }
                 }
             }),
-            _ => serde_json::json!({}),
+            // This fixture implements legacy MCP. An empty successful discovery
+            // result incorrectly claims modern support and must be rejected.
+            _ => return Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": frame["id"],
+                "error": {"code": -32601, "message": "Method not found"}
+            })),
         };
         Json(serde_json::json!({
             "jsonrpc": "2.0",
@@ -453,6 +465,7 @@ mod tests {
         let client = McpClient::connect_http(&endpoint, &[], std::time::Duration::from_secs(5))
             .await
             .unwrap();
+        assert_eq!(client.protocol_version(), "2025-06-18");
         let mut registry =
             ToolRegistry::from_clients_named(vec![("causal-mcp".into(), client)], Vec::new())
                 .await

@@ -2090,6 +2090,7 @@ impl ComputerUseSessions {
         let action_hash = crate::approval::payload_hash(&payload["action"]);
         payload["action_hash"] = json!(action_hash);
         let binding = ExecutionBinding {
+            conversation_audience: Default::default(),
             schema_version: 1,
             run_id: ingress_run_id.clone().unwrap_or_else(|| session.session_id.clone()),
             run_origin_kind: if ingress_run_id.is_some() { "ingress" } else { "computer_session" }.into(),

@@ -1,3 +1,4 @@
+import { setAgentRequestAuthorizer } from '../agent-request-guard';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('@/stores/auth-store', () => ({ useAuthStore: { getState: () => ({ jwt: 'session-token' }) } }));
 import { uploadMeeting, uploadStorageKey } from './api';
@@ -9,6 +10,11 @@ function recording(): File {
   } as File;
 }
 beforeEach(() => {
+  setAgentRequestAuthorizer({
+    ensureFreshGrants: async () => {},
+    canSelectAgent: name => name === 'alice',
+    identity: () => 'meeting-test',
+  });
   localStorage.clear();
   vi.stubGlobal('crypto', { subtle: { digest: vi.fn().mockResolvedValue(new Uint8Array([1, 2]).buffer) } });
 });

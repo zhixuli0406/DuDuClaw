@@ -385,7 +385,7 @@ fn mutate<T>(
     f: impl FnOnce(&mut OrgStore) -> T,
 ) -> io::Result<T> {
     let path = org_store_path(home);
-    std::fs::create_dir_all(home)?;
+    crate::config::create_home_dir(home)?;
     with_file_lock(&path, || {
         let mut store = match std::fs::read_to_string(&path) {
             Ok(content) => match parse(&content) {

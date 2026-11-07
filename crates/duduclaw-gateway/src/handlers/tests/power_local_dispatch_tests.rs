@@ -46,7 +46,10 @@ fn lan_conn(pre_auth: bool) -> RpcConnInfo {
 
 async fn handler() -> (tempfile::TempDir, MethodHandler) {
     let home = tempfile::tempdir().unwrap();
+    // Model a booted home with MFA disabled; new() loads the policy snapshot.
+    std::fs::write(home.path().join("config.toml"), "[auth]\nmfa_enforced=false\n").unwrap();
     let h = MethodHandler::new(home.path().to_path_buf()).await;
+    assert_eq!(crate::mfa::enforced(home.path(), true), Ok(false));
     (home, h)
 }
 

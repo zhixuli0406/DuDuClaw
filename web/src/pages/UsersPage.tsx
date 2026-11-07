@@ -5,9 +5,10 @@ import { api, type UserDetail, type UserInviteState } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import { InviteEmailPreview, InviteLinkDialog, InviteStatusChip } from './users/InviteControls';
 import { useAuthStore } from '@/stores/auth-store';
+import { AddMembersPage } from './users/AddMembersPage';
 import { OrgChartView } from './users/OrgChartView';
 import { OrgHistorySettings } from './users/OrgHistorySettings';
-import { CreateUserDialog, EditUserDialog } from './users/UserFormDialogs';
+import { EditUserDialog } from './users/UserFormDialogs';
 import { BindAgentDialog, BindChannelIdentityDialog } from './users/AccessDialogs';
 import { OffboardDialog, RemoveUserDialog } from './users/LifecycleDialogs';
 import {
@@ -130,6 +131,8 @@ export function UsersPage() {
     finally { setInviting(false); }
   };
 
+  if (showCreate && isAdmin) return <AddMembersPage onBack={() => setShowCreate(false)} onCreated={() => void fetchUsers()} />;
+
   return (
     <div className="mx-auto w-full max-w-[1200px] space-y-6">
       {/* Header */}
@@ -142,9 +145,9 @@ export function UsersPage() {
           </div>
         </div>
         <div className="flex gap-2">
-          <Button variant="brand" size="sm" onClick={() => setShowCreate(true)}>
+          <Button variant="brand" size="sm" disabled={!isAdmin} onClick={() => setShowCreate(true)}>
             <UserPlus />
-            <span className="hidden sm:inline">{intl.formatMessage({ id: 'users.create' })}</span>
+            <span className="hidden sm:inline">{intl.formatMessage({ id: 'members.title' })}</span>
           </Button>
         </div>
       </div>
@@ -277,19 +280,6 @@ export function UsersPage() {
           <DialogFooter><Button variant="outline" disabled={inviting} onClick={() => setInviteUser(null)}>{intl.formatMessage({ id: 'common.cancel' })}</Button><Button disabled={inviting} onClick={() => void sendInvite()}>{intl.formatMessage({ id: 'users.invite.send' })}</Button></DialogFooter>
         </DialogContent>
       </Dialog>}
-      {/* Create User Dialog */}
-      {showCreate && (
-        <CreateUserDialog
-          users={users}
-          onClose={() => setShowCreate(false)}
-          onCreated={(result) => {
-            setShowCreate(false);
-            if (result && !result.sent && result.link) setInviteLink(result.link);
-            fetchUsers();
-          }}
-        />
-      )}
-
       {/* Edit User Dialog */}
       {showEdit && (
         <EditUserDialog

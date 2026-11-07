@@ -202,7 +202,7 @@ impl MethodHandler {
         })
         .await;
         match result {
-            Ok(mut rows) => {
+            Ok(rows) => {
                 let reader = match TaskReader::new(&self.home_dir, ctx) {
                     Ok(r) => r,
                     Err(f) => return f,
@@ -210,7 +210,8 @@ impl MethodHandler {
                 // F5-D: a row belongs to its task. Rows of a task the reader
                 // may not read (no binding on its employee, outside its
                 // audience) are left out; rows of a removed task stay for
-                // admins only. Titles are resolved for the rows kept.
+                // admins only, still bound to any A2A owner tombstone.
+                // Titles are resolved for the rows kept.
                 let mut seen: std::collections::HashMap<String, Option<String>> =
                     std::collections::HashMap::new();
                 let store = self.task_store().await.ok();
@@ -226,7 +227,7 @@ impl MethodHandler {
                             let visible: Option<String> = match task {
                                 Some(t) if reader.can_read(&t.id, &t.assigned_to) => Some(t.title),
                                 Some(_) => None,
-                                None if reader.live().is_admin() => Some(String::new()),
+                                None if reader.can_read_owned(&row.task_id, None) => Some(String::new()),
                                 None => None,
                             };
                             seen.insert(row.task_id.clone(), visible.clone());
@@ -260,9 +261,13 @@ impl MethodHandler {
         };
         // One task's predicted vs observed rounds are task content: the task
         // gate applies while the task exists; a removed task's chain stays
-        // admin-only.
+        // admin-only and bound to any retained A2A owner.
         let store = match self.task_store().await {
             Ok(s) => s,
+            Err(f) => return f,
+        };
+        let reader = match TaskReader::new(&self.home_dir, ctx) {
+            Ok(r) => r,
             Err(f) => return f,
         };
         match store.get_task(&task_id).await {
@@ -274,7 +279,7 @@ impl MethodHandler {
                     return f;
                 }
             }
-            _ if ctx.is_admin() => {}
+            Ok(None) if reader.can_read_owned(&task_id, None) => {}
             _ => return WsFrame::error_response("", PERMISSION_DENIED),
         }
         let db_path = self.home_dir.join("prediction.db");

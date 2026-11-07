@@ -503,3 +503,44 @@ fn odoo_schema_fields_uses_untrusted_metadata_envelope_with_omission_counts() {
     assert_eq!(value["truncated"], true);
     assert_eq!(value["fields"][0]["label_flagged"], true);
 }
+
+#[test]
+fn odoo_numeric_parameters_accept_numbers_and_strings_and_reject_invalid_values() {
+    use super::odoo::{odoo_positive_integer, odoo_limit, odoo_decimal};
+    use serde_json::json;
+    for value in [json!(7), json!("7")] {
+        let params = json!({"id":value,"limit":value,"amount":value});
+        assert_eq!(odoo_positive_integer(&params, "id").unwrap(), 7);
+        assert_eq!(odoo_limit(&params, 20, 100).unwrap(), 7);
+        assert_eq!(odoo_decimal(&params, "amount", 1.0).unwrap(), 7.0);
+    }
+    for value in [json!(0), json!(-1), json!(1.5), json!("1.5"), json!("bad"),
+        json!(true), json!(null), json!(18446744073709551615u64)] {
+        let params = json!({"id":value,"limit":value});
+        assert!(odoo_positive_integer(&params, "id").unwrap_err().contains("id"));
+        assert!(odoo_limit(&params, 20, 100).is_err());
+    }
+    assert_eq!(odoo_limit(&json!({}), 20, 100).unwrap(), 20);
+    assert_eq!(odoo_limit(&json!({"limit":101}), 20, 100).unwrap(), 100);
+    assert!(odoo_positive_integer(&json!({}), "id").unwrap_err().contains("required"));
+    for value in [json!(0), json!(-1), json!("NaN"), json!("inf"), json!(true), json!(null)] {
+        assert!(odoo_decimal(&json!({"amount":value}), "amount", 1.0).is_err());
+    }
+    for value in [json!(1.25), json!("1.25")] {
+        assert_eq!(odoo_decimal(&json!({"amount":value}), "amount", 1.0).unwrap(), 1.25);
+    }
+}
+
+#[test]
+fn odoo_method_to_verb_distinguishes_buttons_from_other_methods() {
+    for method in ["action_confirm", "button_validate", "toggle_active", "action_archive"] {
+        assert_eq!(super::odoo::odoo_method_to_verb(method), "action", "{method}");
+        assert_eq!(classify_odoo_call("odoo_execute", &serde_json::json!({
+            "model": "sale.order", "method": method,
+        })), Some(("action", "sale.order".to_string())));
+    }
+    for (method, verb) in [("read", "read"), ("create", "create"), ("write", "write"),
+        ("unlink", "unlink"), ("custom_method", "execute")] {
+        assert_eq!(super::odoo::odoo_method_to_verb(method), verb, "{method}");
+    }
+}

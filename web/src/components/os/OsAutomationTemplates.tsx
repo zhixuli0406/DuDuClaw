@@ -136,7 +136,7 @@ export function OsAutomationTemplates({
       // operator straight at SettingsPage's autopilot tab, the only place it
       // can be reviewed, edited, or deleted.
       toast.success(t('os.templates.applied'), {
-        action: { label: t('os.templates.manageLink'), onClick: () => navigate('/manage/system?tab=autopilot') },
+        action: { label: t('os.templates.manageLink'), onClick: () => navigate('/app/system/settings/advanced#autopilot') },
       });
       setOpen(null);
       onApplied?.();

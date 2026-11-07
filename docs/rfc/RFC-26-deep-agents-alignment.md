@@ -117,7 +117,7 @@ A `plan_start` MCP tool + `[planner] clarify_first = true`: before executing an 
 ❌ **REMOVED** — The `duduclaw-durability/checkpoint.rs` module (which would have provided `fork(checkpoint_id) -> new_id` and `rewind(task_id, checkpoint_id)` with a durable SQLite backend) was removed in commit `b0639b96` on 2026-07-04. The entire `duduclaw-durability` crate was found to have zero call sites in the production codebase. This capability is not available in the current codebase. Checkpoint save/rewind/fork functionality does not exist.
 
 ### 4.3 Built-in skill set parity
-Ship `code-review`, `refactor`, `test-writer`, `git-workflow` as first-class bundled `SKILL.md` files in the skill registry so a fresh agent has the deep-agents default toolbox.
+Ship `code-review`, `refactor`, `test-writer`, `git-workflow` as first-class bundled `SKILL.md` files in the skill registry as optional programming capabilities. Office defaults now live only in the company-wide layer; new employees receive no personal bundled copies (B4, 2026-11-05).
 
 ### 4.4 Memory `/improve`
 A `memory_improve` MCP tool that runs GVU's reflection over recent sessions and proposes (not auto-applies) MEMORY/SOUL updates — bringing the existing GVU machinery to a user-invokable surface.

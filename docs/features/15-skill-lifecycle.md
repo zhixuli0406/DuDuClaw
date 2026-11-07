@@ -2,6 +2,14 @@
 
 > Six stages from raw conversation to refined, reusable skill.
 
+New employees share the four office skills (`docx`, `pdf`, `pptx`, `xlsx`) from `<home>/skills/`; creation no longer copies bundled skills into personal `SKILLS/`. The first onboarding or gateway start installs missing office defaults once. The migration marker prevents reinstalling deliberately removed defaults. Existing company and personal files are preserved. `connect-google` keeps its independent company-wide backfill.
+
+Programming skills (`code-review`, `git-workflow`, `refactor`, `test-writer`) are optional. In **Skills → Marketplace**, search for the required skill (or install from its source URL), review its source and security scan, then select the company-wide, department or employee scope. Marketplace availability depends on the configured sources. Explicit skills included in an imported team/industry pack remain part of that reviewed installation; template recommendations do not automatically install them.
+
+For existing personal copies, compare every file's content hash, including scripts and attachments, with the company copy before removing anything. Use the employee's **Remove** action to archive a confirmed duplicate, and **Restore** to recover it. A personal skill overrides a same-named department or company skill; removing that override exposes the shared version again. Doctor provides this cleanup guidance only; it does not detect duplicates or delete them automatically.
+
+Installed files do not each reserve an activation slot. Same-named layers are merged once (employee > department > company). `[evolution] max_active_skills` limits lifecycle activation (default 5), while `skill_token_budget` limits progressive skill context (default 2500 tokens).
+
 ---
 
 ## The Metaphor: An Apprentice Becoming a Master
@@ -268,6 +276,8 @@ The marketplace is accessible through MCP:
 ## The Skill Library page (v1.76.0)
 
 The dashboard's **Skills** page has four tabs: Market, Team Skills, My Skills and Leaderboard. The open tab is part of the address (`/skills?tab=shared`, `?tab=mySkills`, `?tab=leaderboard`), so a link or a reload lands on the same tab.
+
+**Scope.** My Skills labels each row as Company-wide, Department or Personal. The all-staff view lists each company-wide skill once, alongside the department and personal skills of employees you may view. Select an employee, or open Skills on their settings page, to see their complete composed list: personal skills override same-named department skills, which override company-wide skills. Disabled skills remain listed with their switch off. Employee rows, company-wide holder details and scanned employee paths are filtered by your current access; unreadable permissions refuse the request. The aggregate `skills.list {}` response puts company-wide rows in `global_skills`, not in each employee’s `agents[].skills`; clients must combine both fields.
 
 **Order.** Lists are sorted in the browser with the page language's collation rules: case does not matter, `step-2` comes before `step-10`, and Chinese names follow the language's usual order instead of byte order. Pick an order with the sort menu: by name, recently used, most used or recently added. The choice is remembered per browser. Rows that tie keep a fixed order. The gateway also returns employees in name order, so nothing reshuffles after a restart.
 

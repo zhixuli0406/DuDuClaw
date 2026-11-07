@@ -563,6 +563,13 @@ impl GenericCliRuntime {
             for (k, v) in duduclaw_core::mcp_forward_env_vars() {
                 cmd.env(k, v);
             }
+            for name in [duduclaw_core::ENV_DISPATCH_RUN_ID, duduclaw_core::ENV_TASK_ID,
+                duduclaw_core::ENV_TRUST_TURN_ID] {
+                cmd.env_remove(name);
+            }
+            // Generic CLIs cannot isolate each third-party MCP child's env.
+            // Do not mint delegation authority here: ordinary worker tools still
+            // authenticate, but delegation must fail closed for these runtimes.
             // P2-B N4: the turn/run source identity, same channel as the id.
             // N13: this CLI inherits the gateway's environment, so a
             // `DUDUCLAW_UPSTREAM_UNKNOWN` the operator happened to export
@@ -574,6 +581,13 @@ impl GenericCliRuntime {
                 cmd.env(k, v);
             }
         }
+
+        // Strip ambient and explicitly configured variants, including future names.
+        let delegation_names: Vec<_> = std::env::vars_os().map(|(k, _)| k)
+            .chain(cmd.as_std().get_envs().map(|(k, _)| k.to_owned()))
+            .filter(|k| k.to_string_lossy().to_ascii_uppercase().starts_with("DUDUCLAW_DELEGATION_"))
+            .collect();
+        for name in delegation_names { cmd.env_remove(name); }
 
         cmd
     }
@@ -1128,9 +1142,17 @@ mod tests {
             }
             expected.envs(duduclaw_core::agent_identity_env_vars_default("tester"))
                 .envs(duduclaw_core::mcp_forward_env_vars())
+                .env_remove(duduclaw_core::ENV_DISPATCH_RUN_ID)
+                .env_remove(duduclaw_core::ENV_TASK_ID)
+                .env_remove(duduclaw_core::ENV_TRUST_TURN_ID)
                 .env_remove(duduclaw_core::ENV_UPSTREAM_UNKNOWN)
                 .env_remove(duduclaw_core::ENV_ON_BEHALF_OF)
                 .env_remove(crate::on_behalf_of::context::ENV_CONTEXT);
+            for (name, _) in std::env::vars_os() {
+                if name.to_string_lossy().to_ascii_uppercase().starts_with("DUDUCLAW_DELEGATION_") {
+                    expected.env_remove(name);
+                }
+            }
             assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected), "{id}");
             assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
         }
@@ -1157,6 +1179,22 @@ mod tests {
         let fut = duduclaw_memory::feedback::CURRENT_TURN_ID.scope(Some("t-77".into()), fut);
         let resp = fut.await.unwrap();
         assert_eq!(resp.content, "t-77|telegram:9|abc123");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegation_authority_is_absent_from_generic_cli_spawn_env() {
+        let dir = tempfile::tempdir().unwrap();
+        duduclaw_core::ensure_identity_key(dir.path()).unwrap();
+        let bin = fake_bin(dir.path(), "copilot",
+            "if env | /usr/bin/grep -qi '^DUDUCLAW_DELEGATION_'; then echo leaked; else echo clean; fi");
+        let mut spec = *spec_for("copilot").unwrap();
+        spec.headless.extra_env = &[
+            ("DUDUCLAW_DELEGATION_CONTEXT", "must-not-leak"),
+            ("dUdUcLaW_dElEgAtIoN_FUTURE_SUFFIX", "must-not-leak"),
+        ];
+        let rt = GenericCliRuntime::with_program(Box::leak(Box::new(spec)), bin.to_string_lossy());
+        assert_eq!(rt.execute("hi", &ctx(dir.path())).await.unwrap().content, "clean");
     }
 
     #[cfg(unix)]

@@ -1,4 +1,4 @@
-//! Google Chat channel — HTTP-endpoint Chat app.
+//! Google Chat channel — HTTP endpoint or authoritative Pub/Sub notifications.
 //!
 //! Inbound: Google POSTs interaction events to `POST /webhook/googlechat`,
 //! authenticated with a JWT signed by `chat@system.gserviceaccount.com`
@@ -97,6 +97,7 @@ pub struct GoogleChatCreds {
     token_uri: String,
     /// Cached OAuth token (access_token, fetched_at).
     token: RwLock<(String, std::time::Instant)>,
+    pubsub_token: RwLock<(String, std::time::Instant)>,
     pub(crate) http: reqwest::Client,
     source: CredSource,
 }
@@ -139,6 +140,7 @@ impl GoogleChatCreds {
             private_key,
             token_uri,
             token: RwLock::new((String::new(), std::time::Instant::now())),
+            pubsub_token: RwLock::new((String::new(), std::time::Instant::now())),
             // 30s request timeout like every other channel client. A bare
             // `Client::new()` has NO request timeout, and `get_token()` is
             // awaited directly on the gateway boot path — an unresponsive
@@ -225,6 +227,10 @@ impl GoogleChatCreds {
 
     pub(crate) fn candidate(raw: &str) -> Option<Self> {
         Self::with_source(raw, Path::new(""), CredSource::Candidate)
+    }
+
+    pub(crate) async fn pubsub_token(&self) -> Result<String, String> {
+        self.get_scoped_token("https://www.googleapis.com/auth/pubsub", &self.pubsub_token).await
     }
 
     async fn get_scoped_token(&self, scope: &str, cache: &RwLock<(String, std::time::Instant)>) -> Result<String, String> {
@@ -316,18 +322,19 @@ impl GoogleChatCreds {
 }
 
 /// Verify the candidate key itself before saving; never reuse the installed key.
-pub async fn verify_import_key(raw: &str) -> Result<(), String> {
+pub async fn verify_import_key(raw: &str, pubsub: bool) -> Result<(), String> {
     crate::agent_channels::googlechat_config::validate_service_account_json(raw)?;
     let creds = GoogleChatCreds::with_source(raw, Path::new(""), CredSource::Candidate)
         .ok_or("服務帳戶金鑰格式不正確")?;
     creds.token().await?;
+    if pubsub { creds.pubsub_token().await?; }
     Ok(())
 }
 
 /// Read config and build the Google Chat webhook router. Returns `None`
 /// when the channel isn't configured.
 pub async fn start_googlechat_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -> Option<Router> {
-    if !shared_settings_valid(home_dir).await { return None; }
+    if !shared_settings_valid(home_dir).await || !crate::googlechat_pubsub::shared_http_enabled(home_dir).await { return None; }
     let project_number = read_config(home_dir, "googlechat_project_number").await?;
     if project_number.trim().is_empty() {
         return None;
@@ -382,13 +389,13 @@ pub async fn start_googlechat_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -
     )
 }
 
-async fn shared_settings_valid(home_dir: &Path) -> bool {
+pub(crate) async fn shared_settings_valid(home_dir: &Path) -> bool {
     let Ok(raw) = tokio::fs::read_to_string(home_dir.join("config.toml")).await else { return false; };
     let Ok(table) = raw.parse::<toml::Table>() else { return false; };
     let Some(channels) = table.get("channels").and_then(toml::Value::as_table) else { return false; };
     let fields = channels.keys().filter_map(|field| field.strip_prefix("googlechat_"));
     if let Err(error) = crate::agent_channels::googlechat_config::validate_fields(fields,
-        &["project_number", "service_account_json", "service_account_json_enc"]) {
+        &["project_number", "service_account_json", "service_account_json_enc", "connection", "pubsub_subscription"]) {
         warn!("{error}");
         return false;
     }
@@ -404,7 +411,7 @@ async fn webhook_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    if !shared_settings_valid(&state.ctx.home_dir).await {
+    if !shared_settings_valid(&state.ctx.home_dir).await || !crate::googlechat_pubsub::shared_http_enabled(&state.ctx.home_dir).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     // ── Verify the Google-signed JWT (fail closed) ──
@@ -431,6 +438,7 @@ async fn webhook_handler(
     }
     let _bind = crate::agent_channels::binding_lock().await;
     if !shared_settings_valid(&state.ctx.home_dir).await
+        || !crate::googlechat_pubsub::shared_http_enabled(&state.ctx.home_dir).await
         || read_config(&state.ctx.home_dir, "googlechat_project_number").await.as_deref() != Some(project_number.as_str()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -472,6 +480,13 @@ pub(crate) async fn report_addon(state: &GoogleChatState) {
     warn!(channel = label, "{ADDON_DIAGNOSTIC}");
     set_channel_connected(&state.ctx.channel_status, &label, false,
         Some(ADDON_DIAGNOSTIC.into()), Some(&state.ctx.event_tx)).await;
+}
+
+/// Only the Pub/Sub worker supplies this event, rebuilt from spaces.messages.get.
+pub(crate) async fn process_pubsub_event(state: &Arc<GoogleChatState>, event: &serde_json::Value) {
+    let space = event_space(event);
+    crate::agent_channels::gchat_spaces::record(&state.ctx.home_dir, &space, state.agent.as_deref());
+    handle_message(state, event).await;
 }
 
 async fn dispatch_transport_event(state: Arc<GoogleChatState>, body: Bytes) -> axum::response::Response {

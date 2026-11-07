@@ -12,6 +12,8 @@ use crate::trigger_route::{access, pending};
 
 /// mgr (Manager, `U_mgr`) → lead → emp1 (sales-rep Owner); peer (`U_peer`).
 fn org(home: &Path) -> (String, String) {
+    // Main-target admission requires readable gateway configuration.
+    std::fs::write(home.join("config.toml"), "").unwrap();
     crate::team_edition::record(home, duduclaw_core::EditionProfile::Enterprise);
     let db = UserDb::new(&home.join("users.db")).unwrap();
     let mk = |name: &str, role| {

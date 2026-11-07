@@ -1,9 +1,12 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor, within, render } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within, render } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, useLocation } from 'react-router';
 import en from '@/i18n/en.json';
+import zh from '@/i18n/zh-TW.json';
+import ja from '@/i18n/ja-JP.json';
 import { mockWsClient } from '@/test/mocks';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAuthStore } from '@/stores/auth-store';
@@ -239,4 +242,59 @@ describe('SkillMarketPage — B8', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('loads no skills'));
     expect(screen.getByText('not valid JSON')).toBeInTheDocument();
   });
+});
+
+describe('Skill library — B3 scopes', () => {
+  it.each([
+    ['en', en, ['Company-wide', 'Department', 'Personal']],
+    ['zh-TW', zh, ['全公司', '部門', '個人']],
+    ['ja-JP', ja, ['全社', '部門', '個人']],
+  ] as const)('labels all three scopes in %s and lists global skills once', async (locale, messages, labels) => {
+    const payload = aggregate();
+    payload.agents[0].skills.push({ name: 'sales-guide', content: '', scope: 'department', agent_id: 'agnes', enabled: true, description: '', security_status: 'pass' });
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'skills.list') return Promise.resolve(payload);
+      if (method === 'agents.list') return Promise.resolve({ agents: twoAgents });
+      return Promise.resolve({});
+    });
+    render(
+      <IntlProvider messages={messages} locale={locale}>
+        <MemoryRouter initialEntries={['/skills?tab=mySkills']}><SkillMarketPage /></MemoryRouter>
+      </IntlProvider>,
+    );
+    await screen.findByText('sales-guide');
+    expect(screen.getAllByText('Tone')).toHaveLength(1);
+    for (const [name, label] of [['Tone', labels[0]], ['sales-guide', labels[1]], ['alpha', labels[2]]]) {
+      expect(within(screen.getByText(name).closest('[role="row"]') as HTMLElement).getByText(label)).toBeInTheDocument();
+    }
+    expect(screen.getByText(messages['skills.my.scopeHint'])).toBeInTheDocument();
+  });
+});
+
+// Start these component scenarios after the gateway confirmed the admin roster.
+beforeEach(() => setConfirmedCallableAgents(true));
+
+import { api } from '@/lib/api';
+import { callableSubject, useCallableAgentsStore } from '@/stores/callable-agents-store';
+
+it('closes an open skill removal and sends no mutation after employee revocation', async () => {
+  const user = userEvent.setup();
+  useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never,
+    bindings: [{ agent_name: 'agnes', access_level: 'owner' }] as never });
+  vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [{ name: 'agnes', display_name: 'agnes', via: 'binding', selectable: true }], unrestricted: false, default_agent: null } as never);
+  renderAt('/skills?tab=mySkills');
+  const row = (await screen.findAllByRole('row')).find(r => within(r).queryByText('quote') && within(r).queryByText('agnes'));
+  await waitFor(() => expect(screen.getAllByText('quote')).toHaveLength(2));
+  const ownRow = row ?? screen.getAllByRole('row').find(r => within(r).queryByText('quote') && within(r).queryByText('agnes'))!;
+  await user.click(within(ownRow).getByRole('button', { name: 'More actions' }));
+  await user.click(await screen.findByRole('menuitem', { name: 'Remove' }));
+  const dialog = await screen.findByRole('dialog');
+  const submit = within(dialog).getByRole('button', { name: 'Remove' });
+  act(() => {
+    const key = JSON.stringify([callableSubject(), null]);
+    useCallableAgentsStore.setState({ entries: { [key]: { agents: [], unrestricted: false, loading: false, confirmedAt: Date.now() + 1 } } });
+    fireEvent.click(submit);
+  });
+  expect(mockWsClient.call.mock.calls.some(([method]) => method === 'skills.remove')).toBe(false);
+  await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
 });

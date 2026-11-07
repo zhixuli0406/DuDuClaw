@@ -1,37 +1,30 @@
 //! Versioned backfills for bundled skills: WP19 for older installs, then G1
 //! for the Google setup guide. Each step keeps its own completion marker.
 //!
-//! **Why this exists.** Every new AI staffer is supposed to start with the
-//! bundled document skills (docx / xlsx / pptx / pdf). Up to v1.51.0 the
-//! seeding call was wired to exactly one of the five agent-creation paths —
-//! the MCP `create_agent` tool. Anyone who onboarded through the dashboard,
-//! `duduclaw onboard`, `duduclaw agent create`, or the industry wizard got an
-//! empty `SKILLS/`; and since nothing ever writes `<home>/skills/` either,
-//! their Skills page was blank. The customer report "the skill library shows
-//! nothing" was literally true and had nothing to do with the page's read path.
-//!
-//! Wiring the remaining four creation paths (v1.51.1) fixes agents created
-//! *from now on*. It does nothing for the staffer already sitting in a
-//! customer's `~/.duduclaw` — hence this migration.
+//! **Defaults.** Only docx / xlsx / pptx / pdf are seeded by WP19.
+//! Programming skills are optional. Employee creation uses this company-wide
+//! backfill instead of copying bundled skills into each personal SKILLS folder.
+//! Existing personal and company-wide skills are never removed.
 //!
 //! **Where it seeds.** `<home>/skills/`, the company-wide layer, not each
 //! agent's `SKILLS/`. One write instead of N, every existing and future
 //! staffer picks it up through `compose_skill_layers`, and it matches what the
 //! skills actually are: shared capability, not one employee's private notes.
 //!
-//! **Safety.** Runs once (marker file), never overwrites an existing
-//! `<name>/SKILL.md` (operator edits win), and never blocks boot: every failure
-//! degrades to a `warn!`. The marker is the load-bearing part — without it an
-//! operator who deliberately deletes a bundled skill would find it resurrected
-//! on the next restart, forever.
+//! **Safety.** Never overwrites operator content. A versioned marker is written
+//! only after all four office bundles match the embedded script manifest.
+//! Existing markers prevent re-seeding deliberate deletions, while every boot
+//! still reports manifest conflicts. Scripts in skill layers never execute.
+//! Failures warn without blocking boot.
 
 use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
-/// Marker filename under `<home>/migrations/`. Its presence — regardless of
-/// contents — suppresses re-runs.
-const MARKER_NAME: &str = "wp19-builtin-skills-seed.done";
+/// Versioned manifest-verification marker. The old WP19 marker still prevents
+/// re-seeding deliberate deletions, but never certifies executable content.
+const MARKER_NAME: &str = "office-script-manifest-v1.done";
+const LEGACY_MARKER_NAME: &str = "wp19-builtin-skills-seed.done";
 
 /// Outcome of one migration pass (returned for tests + boot logging).
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -48,6 +41,12 @@ fn marker_path(home_dir: &Path) -> PathBuf {
     home_dir.join("migrations").join(MARKER_NAME)
 }
 
+fn safe_marker_exists(home: &Path, name: &str) -> bool {
+    duduclaw_agent::skill_loader::safe_dir::SafeDir::open(home)
+        .and_then(|root| root.child("migrations"))
+        .and_then(|dir| dir.read_file(name)).is_ok()
+}
+
 /// Run the migration if it has not run before.
 ///
 /// Never returns an error: a wedged migration must not stop the gateway from
@@ -55,13 +54,19 @@ fn marker_path(home_dir: &Path) -> PathBuf {
 fn run_legacy(home_dir: &Path) -> SeedReport {
     let mut report = SeedReport::default();
     let marker = marker_path(home_dir);
-    if marker.exists() {
+    let skills_dir = home_dir.join("skills");
+    let previously_seeded = safe_marker_exists(home_dir, MARKER_NAME)
+        || safe_marker_exists(home_dir, LEGACY_MARKER_NAME);
+    if safe_marker_exists(home_dir, MARKER_NAME) {
         report.already_done = true;
+        report_office_conflicts(&skills_dir, &mut report);
         return report;
     }
 
-    let skills_dir = home_dir.join("skills");
-    match duduclaw_agent::builtin_skills::install_legacy_builtin_skills(&skills_dir) {
+    let seed = if previously_seeded { Ok(Vec::new()) } else {
+        duduclaw_agent::builtin_skills::install_office_skills(&skills_dir)
+    };
+    match seed {
         Ok(names) => {
             report.seeded = names.iter().map(|n| n.to_string()).collect();
             if report.seeded.is_empty() {
@@ -93,17 +98,30 @@ fn run_legacy(home_dir: &Path) -> SeedReport {
         }
     }
 
+    if report_office_conflicts(&skills_dir, &mut report) {
+        return report;
+    }
     write_marker(&marker, &report);
     report
+}
+
+fn report_office_conflicts(skills_dir: &Path, report: &mut SeedReport) -> bool {
+    let conflicts = duduclaw_agent::builtin_skills::office_script_conflicts(skills_dir);
+    if conflicts.is_empty() { return false; }
+    for conflict in &conflicts {
+        warn!(%conflict, "office script conflict: company copy ignored; execution uses embedded scripts only");
+    }
+    report.error = Some(format!("office script conflicts: {}", conflicts.join("; ")));
+    true
 }
 
 /// Run both independently versioned backfills; an old WP19 marker must not
 /// suppress newly bundled skills. Neither pass overwrites operator content.
 pub fn run(home_dir: &Path) -> SeedReport {
     let google = run_google_setup(home_dir);
-    // On Unix, reject unsafe skills paths before the legacy installer runs.
-    // Unsupported secure creation elsewhere must not suppress legacy skills.
-    if cfg!(unix) && google.error.is_some() {
+    // Google backfill always runs. On Unix and Windows, a Google error also
+    // stops legacy seeding; unsupported secure creation elsewhere does not.
+    if cfg!(any(unix, windows)) && google.error.is_some() {
         return google;
     }
     let mut report = run_legacy(home_dir);
@@ -119,23 +137,29 @@ const GOOGLE_MARKER_NAME: &str = "g1-connect-google-seed-v1.done";
 
 fn run_google_setup(home_dir: &Path) -> SeedReport {
     let mut report = SeedReport::default();
-    let marker = home_dir.join("migrations").join(GOOGLE_MARKER_NAME);
-    if marker.exists() {
-        report.already_done = true;
-        return report;
-    }
     let result = (|| -> std::io::Result<()> {
+        let root = crate::fs_safe::SafeDir::open_root(home_dir)?;
+        let migrations = root.child_dir("migrations", false)?;
+        if let Some(dir) = &migrations {
+            if dir.open_read_checked(GOOGLE_MARKER_NAME, true)?.is_some() {
+                report.already_done = true;
+                return Ok(());
+            }
+        }
         let (_, body) = duduclaw_agent::builtin_skills::BUILTIN_SKILLS.iter()
             .find(|(name, _)| *name == "connect-google")
             .expect("connect-google must be bundled");
-        let root = crate::fs_safe::SafeDir::open_root(home_dir)?;
         let dir = root.open_path(&["skills", "connect-google"], true)?
             .ok_or_else(|| crate::fs_safe::refused("missing skills directory"))?;
         if dir.create_file_new("SKILL.md", body.as_bytes())? {
             report.seeded.push("connect-google".to_string());
         }
-        std::fs::create_dir_all(home_dir.join("migrations"))?;
-        std::fs::write(&marker, "g1-connect-google-seed-v1\n")?;
+        let migrations = match migrations {
+            Some(dir) => dir,
+            None => root.child_dir("migrations", true)?
+                .ok_or_else(|| crate::fs_safe::refused("missing migrations directory"))?,
+        };
+        migrations.create_file_new(GOOGLE_MARKER_NAME, b"g1-connect-google-seed-v1\n")?;
         Ok(())
     })();
     if let Err(e) = result {
@@ -149,17 +173,11 @@ fn run_google_setup(home_dir: &Path) -> SeedReport {
 /// what was written and why, in plain language, next to the timestamp.
 ///
 /// A failure here only risks the migration running once more on the next boot,
-/// which is harmless — `install_builtin_skills` skips every skill whose
+/// which is harmless — `install_office_skills` skips every skill whose
 /// `SKILL.md` already exists.
 fn write_marker(marker: &Path, report: &SeedReport) {
-    if let Some(parent) = marker.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        warn!(error = %e, "WP19 migration: could not create migrations dir — marker not written");
-        return;
-    }
     let record = serde_json::json!({
-        "migration": "wp19-builtin-skills-seed",
+        "migration": "office-script-manifest-v1",
         "completed_at": chrono::Utc::now().to_rfc3339(),
         "seeded_skills": report.seeded,
         "target": "<home>/skills (company-wide layer)",
@@ -170,7 +188,17 @@ fn write_marker(marker: &Path, report: &SeedReport) {
                    所有現有與未來的員工都會看到。已存在的同名技能一律不覆寫。\
                    本檔存在即代表回填做過了；之後刻意刪掉的技能不會被蓋回來。",
     });
-    if let Err(e) = std::fs::write(marker, format!("{record}\n")) {
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let home = marker.parent().and_then(Path::parent)
+            .ok_or_else(|| std::io::Error::other("missing migration parent"))?;
+        let root = duduclaw_agent::skill_loader::safe_dir::SafeDir::open(home)?;
+        let migrations = root.mkdir_child("migrations", 0o700)?;
+        let mut file = migrations.create_new(MARKER_NAME, 0o600)?;
+        file.write_all(format!("{record}\n").as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(e) = result {
         warn!(error = %e, "WP19 migration: could not write completion marker — may re-run next boot");
     }
 }
@@ -179,10 +207,10 @@ fn write_marker(marker: &Path, report: &SeedReport) {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn google_backfill_runs_after_legacy_marker_and_preserves_operator_changes() {
-        let home = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         std::fs::create_dir_all(home.path().join("migrations")).unwrap();
         std::fs::write(marker_path(home.path()), "legacy").unwrap();
         assert_eq!(run(home.path()).seeded, ["connect-google"]);
@@ -192,7 +220,7 @@ mod tests {
         assert!(run(home.path()).already_done);
         assert!(!file.exists(), "deliberate deletion must survive restart");
 
-        let other = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let dir = other.path().join("skills/connect-google");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SKILL.md"), "operator edition").unwrap();
@@ -200,14 +228,63 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap(), "operator edition");
     }
 
-    // Not run: reject both directory components and the final file.
+    #[cfg(windows)]
+    #[test]
+    fn google_backfill_refuses_junction_before_legacy_seeding() {
+        for component in ["skills", "skills/connect-google"] {
+            let home = crate::fs_safe::private_test_home().unwrap();
+            let outside = crate::fs_safe::private_test_home().unwrap();
+            let junction = home.path().join(component);
+            std::fs::create_dir_all(junction.parent().unwrap()).unwrap();
+            let output = std::process::Command::new("cmd").args(["/d", "/c", "mklink", "/J"])
+                .arg(&junction).arg(outside.path()).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let report = run(home.path());
+            assert!(report.error.is_some());
+            assert!(report.seeded.is_empty());
+            assert!(!home.path().join("migrations").exists());
+            assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+            std::fs::remove_dir(&junction).unwrap();
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn google_backfill_refuses_migrations_link_with_or_without_outside_marker() {
+        for existing_marker in [false, true] {
+            let home = crate::fs_safe::private_test_home().unwrap();
+            let outside = crate::fs_safe::private_test_home().unwrap();
+            let marker = outside.path().join(GOOGLE_MARKER_NAME);
+            if existing_marker { std::fs::write(&marker, b"outside marker").unwrap(); }
+            let link = home.path().join("migrations");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            #[cfg(windows)]
+            {
+                let output = std::process::Command::new("cmd").args(["/d", "/c", "mklink", "/J"])
+                    .arg(&link).arg(outside.path()).output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            }
+            let report = run(home.path());
+            assert!(report.error.is_some());
+            assert!(!report.already_done, "outside marker must not suppress migration");
+            assert!(report.seeded.is_empty());
+            assert!(!home.path().join("skills").exists());
+            assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), usize::from(existing_marker));
+            if existing_marker { assert_eq!(std::fs::read(&marker).unwrap(), b"outside marker"); }
+            #[cfg(windows)]
+            std::fs::remove_dir(&link).unwrap();
+        }
+    }
+
+    // Reject both directory components and the final file.
     #[cfg(unix)]
     #[test]
     fn google_backfill_refuses_symlinks_without_writing_outside() {
         use std::os::unix::fs::symlink;
         for component in ["skills", "connect-google", "SKILL.md"] {
-            let home = tempfile::tempdir().unwrap();
-            let outside = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let outside = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
             let target = match component {
                 "skills" => home.path().join("skills"),
                 "connect-google" => {
@@ -233,8 +310,8 @@ mod tests {
     #[test]
     fn legacy_backfill_cannot_bypass_google_marker_with_a_symlink() {
         use std::os::unix::fs::symlink;
-        let home = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let outside = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         std::fs::create_dir_all(home.path().join("migrations")).unwrap();
         std::fs::write(home.path().join("migrations").join(GOOGLE_MARKER_NAME), "done").unwrap();
         std::fs::create_dir(home.path().join("skills")).unwrap();
@@ -242,6 +319,33 @@ mod tests {
         let report = run(home.path());
         assert!(!report.seeded.contains(&"connect-google".to_string()));
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn office_conflict_never_gets_completion_marker() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        duduclaw_agent::builtin_skills::install_office_skills(&home.join("skills")).unwrap();
+        let script = home.join("skills/pdf/scripts/create.py");
+        std::fs::write(&script, "print('attacker')").unwrap();
+        let report = run(&home);
+        assert!(report.error.as_deref().unwrap().contains("office script conflicts"));
+        assert!(!marker_path(&home).exists());
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), "print('attacker')");
+        assert!(run(&home).error.is_some(), "conflicts must remain observable on retry");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_marker_does_not_certify_modified_scripts() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(home.join("migrations")).unwrap();
+        std::fs::write(home.join("migrations").join(LEGACY_MARKER_NAME), "legacy").unwrap();
+        assert!(run(&home).error.is_some());
+        assert!(!marker_path(&home).exists());
+        assert!(!home.join("skills/pdf").exists(), "old marker still prevents restoring deleted skills");
     }
 
     fn seeded_names(skills_dir: &Path) -> Vec<String> {
@@ -261,15 +365,15 @@ mod tests {
     /// `<home>/skills/` at all, and must come out of this with the bundled set.
     #[test]
     fn first_run_backfills_the_company_wide_layer() {
-        let home = tempfile::TempDir::new().unwrap();
+        let home = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         assert!(!home.path().join("skills").exists(), "precondition");
 
         let report = run(home.path());
 
         assert!(!report.already_done);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         assert!(report.error.is_none());
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         assert!(report.error.is_some(), "Google backfill must fail closed without secure creation");
         assert!(
             !report.seeded.is_empty(),
@@ -279,13 +383,10 @@ mod tests {
 
         let skills_root = home.path().join("skills");
         let on_disk = seeded_names(&skills_root);
-        for (name, _) in duduclaw_agent::builtin_skills::BUILTIN_SKILLS {
-            if !cfg!(unix) && *name == "connect-google" { continue; }
-            assert!(
-                on_disk.contains(&name.to_string()),
-                "bundled skill `{name}` must be backfilled, got {on_disk:?}"
-            );
+        for dev in ["code-review", "refactor", "test-writer", "git-workflow"] {
+            assert!(!on_disk.contains(&dev.to_string()));
         }
+        if cfg!(any(unix, windows)) { assert!(on_disk.contains(&"connect-google".to_string())); }
         // The multi-file office skills (docx / xlsx / pptx / pdf) are the ones
         // the customer was actually missing — "make me a spreadsheet" is the
         // request that failed. They ship a SKILL.md *plus* the scripts it calls,
@@ -322,7 +423,7 @@ mod tests {
     /// resurrected on the next start.
     #[test]
     fn marker_prevents_a_second_run() {
-        let home = tempfile::TempDir::new().unwrap();
+        let home = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let first = run(home.path());
         assert!(!first.seeded.is_empty());
 
@@ -330,7 +431,7 @@ mod tests {
         std::fs::remove_dir_all(&victim).unwrap();
 
         let second = run(home.path());
-        assert_eq!(second.already_done, cfg!(unix));
+        assert_eq!(second.already_done, cfg!(any(unix, windows)));
         assert!(second.seeded.is_empty());
         assert!(
             !victim.exists(),
@@ -342,7 +443,7 @@ mod tests {
     /// byte-for-byte.
     #[test]
     fn existing_skill_file_is_never_overwritten() {
-        let home = tempfile::TempDir::new().unwrap();
+        let home = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let (name, _) = duduclaw_agent::builtin_skills::BUILTIN_SKILLS[0];
         let dir = home.path().join("skills").join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -369,7 +470,7 @@ mod tests {
     #[test]
     fn seed_failure_does_not_panic_and_leaves_no_marker() {
         use std::os::unix::fs::PermissionsExt;
-        let home = tempfile::TempDir::new().unwrap();
+        let home = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let mut perms = std::fs::metadata(home.path()).unwrap().permissions();
         perms.set_mode(0o500); // r-x: create_dir_all("skills") will fail
         std::fs::set_permissions(home.path(), perms).unwrap();
@@ -395,7 +496,7 @@ mod tests {
     #[test]
     fn marker_write_failure_is_not_fatal() {
         use std::os::unix::fs::PermissionsExt;
-        let home = tempfile::TempDir::new().unwrap();
+        let home = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         // Pre-create `migrations/` read-only so the marker write fails while
         // the seed itself succeeds.
         let migrations = home.path().join("migrations");

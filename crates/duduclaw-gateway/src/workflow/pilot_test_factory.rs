@@ -502,6 +502,7 @@ impl Pilot {
     pub fn binding(&self, request: &ActivationRequest) -> ExecutionBinding {
         let environment = self.service.runner.executor.environment("alice").unwrap();
         ExecutionBinding {
+            conversation_audience: Default::default(),
             schema_version: 1,
             run_id: "pilot-activation-request".into(),
             run_origin_kind: "workflow".into(),

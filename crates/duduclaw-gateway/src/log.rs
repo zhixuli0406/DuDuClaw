@@ -72,12 +72,14 @@ pub fn init_tracing_stack(home_dir: &std::path::Path) {
     // Persistent file log — same fallible builder as the CLI (2026-07-28
     // incident: `rolling::daily` panics on an unwritable dir).
     let log_dir = home_dir.join("logs");
-    let _ = std::fs::create_dir_all(&log_dir);
-    let file_writer = match tracing_appender::rolling::Builder::new()
+    let file_writer = match duduclaw_core::config::create_home_dir(home_dir)
+        .and_then(|_| std::fs::create_dir_all(&log_dir))
+        .map_err(|e| e.to_string())
+        .and_then(|_| tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("gateway.log")
         .max_log_files(FILE_LOG_MAX_FILES)
-        .build(&log_dir)
+        .build(&log_dir).map_err(|e| e.to_string()))
     {
         Ok(appender) => {
             let (non_blocking, guard) = tracing_appender::non_blocking(appender);

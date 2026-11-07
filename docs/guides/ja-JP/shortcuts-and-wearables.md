@@ -1,9 +1,6 @@
 # 手首とウェアラブル：Shortcutsショートカット、AI録音ペンダントの連携
 
-> 前提条件：`duduclaw http-server --bind 127.0.0.1:8765` がすでに起動しており、
-> `duduclaw mcp issue-refresh-token` または `~/.duduclaw/mcp_keys.toml` からBearerキーを
-> 取得済みであること。スマートフォン／ウェアラブルからこのアドレスに到達できる必要がある
-> （家庭内ネットワークのIP、またはTailscale）。
+> 前提条件：`duduclaw http-server --bind 127.0.0.1:8765` が起動済みであること。「管理 → 統合 → MCP API キー」でショートカットに必要な権限の静的 MCP API キーを作成し、Bearer 認証情報として使います。`duduclaw mcp issue-refresh-token` は stdio 専用で HTTP では使えません。スマートフォン／ウェアラブルからサーバーのアドレス（家庭内 IP または Tailscale）に到達できる必要があります。[リモート MCP](remote-mcp.md) を参照してください。
 
 ## 1. iPhone／Apple Watchのショートカット（配布審査もアプリ提出も不要）
 

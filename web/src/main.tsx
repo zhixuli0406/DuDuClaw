@@ -1,3 +1,5 @@
+// Register the transport authorizer before any page can issue a mutation.
+import './stores/callable-agents-store';
 import { StrictMode, useEffect, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { IntlProvider } from 'react-intl';
@@ -6,6 +8,7 @@ import { App } from './App';
 import { ToastProvider } from './components/Toast';
 import { AppErrorBoundary } from './components/layout/AppErrorBoundary';
 import { brandedMessages, useLocaleStore } from './i18n';
+import { loadPublicCompany } from './stores/company-store';
 import { loadPublicBrand, useBrandStore } from './stores/brand-store';
 import { useDarkAppearance } from './components/brand/ProductLogo';
 import { applyDocumentBrand } from './lib/brand-document';
@@ -24,6 +27,7 @@ applyTheme(useThemeStore.getState().theme);
 installExternalLinkInterceptor();
 
 void loadPublicBrand();
+void loadPublicCompany();
 
 function Root() {
   const locale = useLocaleStore((s) => s.locale);

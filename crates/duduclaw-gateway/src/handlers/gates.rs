@@ -89,6 +89,9 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
     // dispatch_system separately requires Admin for both RPCs.
     if matches!(method, "odoo.schema_scan" | "odoo.permission_options") { return false; }
     if method.split('.').take(2).eq(["me", "google"]) || method == "agents.primary_owner_set" { return true; }
+    // Existing MFA recovery must remain available after an edition downgrade.
+    // dispatch_org still requires a current Admin for these exact methods.
+    if matches!(method, "users.mfa_reset" | "users.mfa_enrollment_code") { return false; }
     // ── Self-service carve-outs inside an otherwise Enterprise family ──────
     // Checked first so the family rule below cannot swallow them.
     if matches!(method, "users.me" | "users.change_password" | "users.change_email" | "users.set_primary_agent") {
@@ -107,6 +110,7 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
         | "distributor"
         // 身分解析 — 把不同通道上的「人」對到同一身分
         | "identity"
+        | "compliance"
     ) {
         return true;
     }
@@ -236,13 +240,15 @@ pub(crate) fn setup_token_error_frame(
     code: crate::setup_token_wizard::SetupTokenErrorCode,
     message: &str,
 ) -> WsFrame {
+    let protected_missing = code.as_str() == "not_installed" && crate::runtime_readiness::is_protected_linux();
+    let protected_message = protected_missing.then(|| crate::runtime_readiness::protected_runtime_guidance("claude"));
     WsFrame::Response {
         id: String::new(),
         ok: false,
         payload: None,
         error: Some(json!({
-            "code": code.as_str(),
-            "message": message,
+            "code": if protected_missing { "protected_runtime_missing" } else { code.as_str() },
+            "message": protected_message.as_deref().unwrap_or(message),
         })),
     }
 }

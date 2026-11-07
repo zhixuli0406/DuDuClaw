@@ -120,9 +120,10 @@ impl MethodHandler {
         let local_dir = agent.dir.join("SKILLS");
         let local_skills = AgentRegistry::load_skills(&local_dir).await;
 
-        let dept = agent.config.agent.department.trim();
-        let dept_dir = (!dept.is_empty() && duduclaw_core::is_valid_department(dept))
-            .then(|| duduclaw_agent::skill_loader::department_skills_dir(&self.home_dir, dept));
+        let department = agent.dir.file_name().and_then(|name| name.to_str())
+            .and_then(|id| duduclaw_agent::skill_loader::authoritative_department(&self.home_dir, id));
+        let dept_dir = department.as_deref()
+            .map(|dept| duduclaw_agent::skill_loader::department_skills_dir(&self.home_dir, dept));
         let dept_skills = match &dept_dir {
             Some(d) => AgentRegistry::load_skills(d).await,
             None => Vec::new(),
@@ -148,7 +149,7 @@ impl MethodHandler {
                 let (scope, layer) = if local_names.contains(&s.name) {
                     ("agent", format!("agent:{agent_id}"))
                 } else if dept_names.contains(&s.name) {
-                    ("department", format!("department:{dept}"))
+                    ("department", format!("department:{}", department.as_deref().unwrap_or_default()))
                 } else {
                     ("global", "global".to_string())
                 };

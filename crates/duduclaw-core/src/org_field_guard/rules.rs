@@ -238,10 +238,8 @@ pub enum ProtectedSurface {
     /// that may delete this entry may then rewrite everything above.
     HookSettings,
     /// `<home>/identity.key` — the HMAC key. Overwriting it with a
-    /// wrong-length blob makes [`crate::identity_token::load_key`] return
-    /// `None`, which silently downgrades `require_identity_token = true` to
-    /// [`crate::IdentityVerdict::Disabled`]; overwriting it with a *known* key
-    /// lets the writer mint tokens for any id.
+    /// wrong-length blob now makes identity verification reject every claim;
+    /// overwriting it with a known key lets the writer mint tokens for any id.
     IdentityKey,
     /// `<home>/org.toml` — WP22 T1's authoritative org record (see
     /// [`crate::org_store`]). `agent.toml`'s org fields are only a display

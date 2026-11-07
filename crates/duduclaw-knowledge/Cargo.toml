@@ -33,7 +33,7 @@ unicode-normalization = "0.1.25"
 # Office containers: deflate only, same as the rest of the workspace.
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 quick-xml = "=0.41.0"
-calamine = { version = "=0.36.1", default-features = false, features = ["dates"] }
+calamine = { version = "=0.38.0", default-features = false, features = ["dates"] }
 csv = "1"
 encoding_rs = "0.8"
 scraper = "0.22"

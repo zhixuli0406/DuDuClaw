@@ -1,12 +1,13 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor, within } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
 import '@/test/mocks';
+import { mockCallableGrants } from '@/test/callable-grants';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { act, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { callsOf, collection, mockRpc, renderAt, source } from '@/pages/knowledge/test-fixtures';
 import type { KbAgentDataSources, KbAgentTabCollection } from '@/lib/knowledge-api';
 import { AgentSourcesTab } from './AgentSourcesTab';
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => { vi.clearAllMocks(); mockCallableGrants(['a1']); });
 
 function tabCollection(over: Partial<KbAgentTabCollection> = {}): KbAgentTabCollection {
   return {
@@ -190,4 +191,30 @@ describe('AgentSourcesTab', () => {
     render();
     expect(await screen.findByRole('button', { name: /retry|try again/i })).toBeInTheDocument();
   });
+});
+
+it('closes collection creation on revocation and does not submit its captured agent', async () => {
+  mockRpc({ 'knowledge.agent.data_sources': () => data({ can_manage: true, manage_blocked: null }) });
+  render();
+  await userEvent.click(await screen.findByRole('button', { name: 'Add files' }));
+  const confirm = within(await screen.findByRole('dialog')).getByRole('button', { name: 'Create and choose files' });
+  await act(async () => { mockCallableGrants([]); confirm.click(); });
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  expect(callsOf('knowledge.agent.own.ensure')).toEqual([]);
+});
+
+it('does not reopen the upload dialog when collection confirmation finishes after revocation', async () => {
+  let finish!: (v: unknown) => void;
+  mockRpc({
+    'knowledge.agent.data_sources': () => data({ can_manage: true, manage_blocked: null,
+      own: { collection: OWN, sources: [], archived: false, share_chat_users: true } }),
+    'knowledge.agent.own.ensure': () => new Promise(resolve => { finish = resolve; }),
+  });
+  render();
+  await userEvent.click(await screen.findByRole('button', { name: 'Add files' }));
+  await act(async () => {
+    mockCallableGrants([]);
+    finish({ collection: collection(), binding_changed: false });
+  });
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
 });

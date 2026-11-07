@@ -3,6 +3,12 @@
 
 use super::*;
 
+enum ActivityAccess<'a> {
+    All,
+    Principal(&'a str),
+    Worker(Option<&'a str>),
+}
+
 impl TaskStore {
     pub async fn append_activity(&self, row: &ActivityRow) -> Result<(), String> {
         let mut conn = self.conn.lock().await;
@@ -32,6 +38,31 @@ impl TaskStore {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<ActivityRow>, i64), String> {
+        self.list_activity_for_principal(agent_id, event_type, limit, offset, None).await
+    }
+
+    pub(crate) async fn list_activity_for_principal(
+        &self, agent_id: Option<&str>, event_type: Option<&str>, limit: i64,
+        offset: i64, principal: Option<&str>,
+    ) -> Result<(Vec<ActivityRow>, i64), String> {
+        let access = principal.map(ActivityAccess::Principal).unwrap_or(ActivityAccess::All);
+        self.list_activity_with_access(agent_id, event_type, limit, offset, access).await
+    }
+
+    /// `worker` must be the caller's verified executor identity. No worker
+    /// means an external MCP caller; removed A2A tasks are never admitted.
+    pub async fn list_activity_for_worker(
+        &self, agent_id: Option<&str>, event_type: Option<&str>, limit: i64,
+        offset: i64, worker: Option<&str>,
+    ) -> Result<(Vec<ActivityRow>, i64), String> {
+        self.list_activity_with_access(agent_id, event_type, limit, offset,
+            ActivityAccess::Worker(worker)).await
+    }
+
+    async fn list_activity_with_access(
+        &self, agent_id: Option<&str>, event_type: Option<&str>, limit: i64,
+        offset: i64, access: ActivityAccess<'_>,
+    ) -> Result<(Vec<ActivityRow>, i64), String> {
         let conn = self.conn.lock().await;
 
         // Count total
@@ -52,6 +83,22 @@ impl TaskStore {
             count_sql.push_str(&clause);
             query_sql.push_str(&clause);
         }
+        let access_clause = match access {
+            ActivityAccess::All => String::new(),
+            ActivityAccess::Principal(principal) => {
+                binds.push(principal.to_string());
+                format!(" AND NOT EXISTS (SELECT 1 FROM task_access_principals p WHERE p.task_id = activity.task_id AND p.principal <> ?{})", binds.len())
+            }
+            ActivityAccess::Worker(None) => {
+                " AND NOT EXISTS (SELECT 1 FROM task_access_principals p WHERE p.task_id = activity.task_id)".into()
+            }
+            ActivityAccess::Worker(Some(worker)) => {
+                binds.push(worker.to_string());
+                format!(" AND NOT EXISTS (SELECT 1 FROM task_access_principals p WHERE p.task_id = activity.task_id AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = p.task_id AND t.a2a_owner = p.principal AND t.assigned_to = ?{}))", binds.len())
+            }
+        };
+        count_sql.push_str(&access_clause);
+        query_sql.push_str(&access_clause);
         query_sql.push_str(&format!(
             " ORDER BY timestamp DESC LIMIT {} OFFSET {}",
             limit, offset
@@ -196,4 +243,61 @@ impl TaskStore {
     }
 
     // ── U4 co-edited plans ──────────────────────────────────
+}
+
+#[cfg(test)]
+mod a2a_activity_worker_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn worker_filter_precedes_limit_and_count_and_honors_tombstones() {
+        let home = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(home.path()).unwrap();
+        let mut private = TaskRow::new("private".into(), "Private".into(), String::new(),
+            "medium".into(), "sales".into(), "a2a:user:alice".into());
+        private.a2a_owner = Some("user:alice".into());
+        store.insert_task(&private).await.unwrap();
+        for (id, task, timestamp) in [
+            ("older", None, "2026-11-05T00:00:00Z"),
+            ("newer", None, "2026-11-05T00:01:00Z"),
+            ("secret", Some("private"), "2026-11-05T00:02:00Z"),
+        ] {
+            store.append_activity(&ActivityRow {
+                id: id.into(), event_type: "task_completed".into(), agent_id: "sales".into(),
+                task_id: task.map(str::to_string), summary: id.into(), timestamp: timestamp.into(), metadata: None,
+            }).await.unwrap();
+        }
+        for worker in [None, Some("other")] {
+            let (page, total) = store.list_activity_for_worker(None, None, 1, 0, worker).await.unwrap();
+            assert_eq!(total, 2);
+            assert_eq!(page[0].id, "newer");
+            let (page, total) = store.list_activity_for_worker(None, None, 1, 1, worker).await.unwrap();
+            assert_eq!(total, 2);
+            assert_eq!(page[0].id, "older");
+        }
+        let (page, total) = store.list_activity_for_worker(None, None, 1, 0, Some("sales")).await.unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(page[0].id, "secret");
+        store.remove_task("private").await.unwrap();
+        let (page, total) = store.list_activity_for_worker(None, None, 1, 0, Some("sales")).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(page[0].id, "newer");
+    }
+
+    #[tokio::test]
+    async fn ordinary_activity_total_remains_full_count_beyond_page() {
+        let home = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(home.path()).unwrap();
+        for id in ["one", "two", "three"] {
+            store.append_activity(&ActivityRow {
+                id: id.into(), event_type: "agent_comment".into(), agent_id: "sales".into(),
+                task_id: None, summary: id.into(), timestamp: "2026-11-05T00:00:00Z".into(), metadata: None,
+            }).await.unwrap();
+        }
+        let (rows, total) = store.list_activity_for_worker(Some("sales"), Some("agent_comment"), 1, 0, None)
+            .await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(total, 3);
+        assert_eq!(store.list_activity(Some("sales"), Some("agent_comment"), 1, 0).await.unwrap().1, total);
+    }
 }

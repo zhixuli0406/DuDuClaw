@@ -939,3 +939,20 @@ async fn gateway_backend_for_agent_mail() {
     assert_eq!(delegate_email_of(home.p(), Some("off")), None);
     assert_eq!(delegate_email_of(home.p(), None), None);
 }
+
+#[tokio::test]
+async fn delegate_status_and_unknown_tools_never_enter_token_work() {
+    let home = Home::new();
+    home.domains(&["c.test"]);
+    home.agent("bot", "[google]\nidentity='delegate:status@c.test'\nrequesters='anyone'\n");
+    let state = route::GoogleTokenRouteState::new(home.p().to_path_buf(), None);
+    // No delegation key or protected credential is installed in this fixture.
+    let probe = super::route_test_probe::Guard::install(home.p());
+    let status = route::serve(&state, "bot", "google_status", &RequesterIdentity::Unknown).await.unwrap();
+    assert_eq!(status["mode"], "metadata");
+    assert_eq!(status["status"], "configured");
+    assert!(status.get("access_token").is_none());
+    assert_eq!(route::serve(&state, "bot", "unknown_google_tool", &RequesterIdentity::Unknown)
+        .await.unwrap_err().code, "scope_missing");
+    assert_eq!(probe.counts(), [0, 0]);
+}

@@ -41,6 +41,7 @@ COPY templates/ templates/
 # (CCR / causal / decision-twin lines, 2026-09); the lib does not compile without
 # this tree — the v1.66.0 tag build failed exactly here.
 COPY fixtures/ fixtures/
+COPY tests/fixtures/license_response_v2.json tests/fixtures/license_response_v2.json
 COPY docs/README.md docs/README.md
 # duduclaw-cli embeds scripts/googlechat/bootstrap.sh via include_str! for
 # `duduclaw channels googlechat bootstrap`, since v1.79.3.

@@ -313,9 +313,15 @@ duduclaw service uninstall
 
 會建立 `~/Library/LaunchAgents/com.duduclaw.gateway.plist`
 
-macOS LaunchAgent 更新後，請執行 `duduclaw service restart`，讓 launchd
-依 plist 卸載並重新載入工作。若 `duduclaw doctor` 顯示 launchd exit code 78，
-也請執行此命令，讓新版 binary 重新註冊。
+gateway 通過更新驗證並換檔後，會由獨立的一次性 LaunchAgent 自動重新註冊與啟動。
+helper 先讓 gateway 最多有 55 秒完成狀態寫入與連線關閉，再卸載並重新載入工作，
+執行的是已安裝的 binary，重新註冊流程限時 90 秒，不會無限重試。
+若 55 秒內仍未結束原程序，helper 會停止，不強制卸載。
+日誌位於 `~/.duduclaw-update-relaunch/relaunch.log`，私有 plist 在開始執行時移除；
+結束後留下的 helper 註冊不會再執行，下次更新會替換它。
+若自動重啟失敗，或 `duduclaw doctor` 顯示 launchd 結束碼 78，
+請執行 `duduclaw service restart`，讓新版 binary 重新註冊。
+從尚未包含這項修正的舊版升級時，舊 updater 仍可能需要這次手動重啟；新流程從新版 gateway 執行後生效。
 
 ### Linux（systemd）
 
@@ -338,6 +344,16 @@ gateway 每 6 小時會檢查一次 GitHub Releases，儀表板（設定 → 更
    執行檔中，未簽章或遭竄改的版本一律拒絕，沒有例外）
 3. 驗證新執行檔可正常執行（`duduclaw version`），再原子性地就地替換（備份＋改名，
    失敗自動回滾）
+4. macOS 使用 DuDuClaw 標準或舊版 LaunchAgent 的 gateway，由上述獨立 helper
+   重新註冊。其他安裝方式維持優雅關閉後在同一行程重新執行（Unix 保留 PID）；
+   桌面 App 自帶 gateway 仍由 App 更新及重啟。
+3. 驗證新執行檔可正常執行（`duduclaw version`），再就地替換。
+   Unix 在安裝目錄獨占建立權限 `0755` 的暫存檔、同步寫入後，以一次改名覆蓋舊路徑，
+   再同步目錄；替換前先以硬連結或已同步的副本保留舊版，回復也以一次改名覆蓋。
+   Windows 優先使用附備份的 `ReplaceFileW`，再嘗試帶覆蓋與寫穿旗標的 `MoveFileExW`。
+   若執行中的程式阻擋這兩種方式，才先移開舊檔再放入新檔；收到安裝失敗時會嘗試放回舊檔，
+   但這兩次移動之間若當機，安裝路徑仍可能暫時缺檔。回復僅使用原生覆蓋方式；被阻擋時會保留復原副本並回報。
+   CLI 自我更新共用此流程；受保護 Linux 服務升級與桌面版各有獨立安裝流程。
 4. 優雅關閉後，**在同一個行程內重新執行新版執行檔**，macOS/Linux 上會保留原本的
    PID，因此 launchd/systemd 仍會持續監控；沒有監控的前景執行方式（npm wrapper、
    `duduclaw run`）也會一併重新啟動
@@ -360,6 +376,53 @@ auto_update = true   # default: false — dashboard notification only
 | Standalone／npm | 就地自我更新（npm registry 的中繼資料會暫時過期，直到下次 `npm i -g duduclaw`，無傷大雅） |
 | Homebrew（已停止維護） | 拒絕自我更新；這個 tap 已經停用，不會再收到新版本，請改用 npm 或桌面應用程式重新安裝 |
 | 原始碼（`cargo`/`target/`） | 允許自我更新，但重新編譯會覆蓋掉它 |
+
+### 疑難排解：從 v1.79.2 或更舊版以儀表板更新至 v1.79.3 失敗
+
+macOS Apple Silicon 原始的 v1.79.3 執行檔為 210,561,920 bytes（200.8 MiB），
+超過 v1.79.2 與更舊版更新器的解壓縮上限 200 MiB（209,715,200 bytes），因此重試
+也會失敗。舊版儀表板可能只顯示「更新失敗」。新版提高上限，無法改變目前還在執行的
+舊版更新器。後續發版會移除符號並檢查更新包中的執行檔大小，維持舊更新器的相容性。
+
+一般獨立安裝可手動替換一次執行檔：
+
+1. 從 [GitHub Releases](https://github.com/zhixuli0406/DuDuClaw/releases)
+   下載目標版本、作業系統與 CPU 對應的壓縮檔，以及同名的 `.sha256` 與 `.minisig`。
+   如尚未安裝 `minisign`，請先安裝。以下以 macOS Apple Silicon 的 v1.79.3 為例：
+
+```sh
+version=1.79.3
+asset=duduclaw-darwin-arm64.tar.gz
+stage=$(mktemp -d)
+cd "$stage"
+base="https://github.com/zhixuli0406/DuDuClaw/releases/download/v$version"
+curl -fL "$base/$asset" -o "$asset"
+curl -fL "$base/$asset.sha256" -o "$asset.sha256"
+curl -fL "$base/$asset.minisig" -o "$asset.minisig"
+shasum -a 256 -c "$asset.sha256" &&
+  minisign -Vm "$asset" -x "$asset.minisig" \
+    -P 'RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh'
+```
+
+2. **兩項驗證都成功**才繼續。上述公鑰是更新器內建的官方發版公鑰，不要改用與壓縮檔
+   一起下載的未知公鑰。執行 `tar -xzf "$asset" duduclaw` 解壓縮，再用
+   `./duduclaw version` 確認版本。
+3. 從第 7 節的 launchd plist 或 systemd unit 確認服務實際使用的執行檔路徑，並解析
+   符號連結。npm 的 `duduclaw` 指令可能指向 JavaScript 包裝程式，不能用原生執行檔
+   覆蓋它。先將實際執行檔另存一份，例如 `<binary>.pre-upgrade`。
+4. 停止服務並確認已停止：macOS 使用已安裝執行檔的 `service stop`；Linux 使用
+   `systemctl --user stop duduclaw`。若在前景執行，回原終端停止該行程。
+   將已驗證的 `./duduclaw` 複製到實際執行檔路徑，並恢復執行權限
+   （`chmod 755 <binary>`）；保留原資料目錄。
+5. 啟動原服務：macOS 執行 `<binary> service restart`，重新載入已註冊的
+   LaunchAgent；Linux 執行 `systemctl --user start duduclaw`。前景安裝則使用
+   原本的啟動指令。確認服務狀態與儀表板版本；若啟動失敗，先停止、還原備份的執行檔，
+   再啟動。驗證成功前保留備份。
+
+Linux 壓縮檔名稱為 `duduclaw-linux-x64.tar.gz` 或 `duduclaw-linux-arm64.tar.gz`；
+沒有 `shasum` 時可用 `sha256sum -c`。以上適用一般安裝；桌面應用程式使用應用程式
+更新器，受保護 Linux 服務請依[專用升級步驟](linux-protected-service.md)操作。
+
 
 ---
 

@@ -33,7 +33,7 @@ pub(crate) async fn handle_codrive_run(args: &Value, home_dir: &Path, default_ag
             Err(e) => return tool_error(&format!("script does not match the expected shape: {e}")),
         };
 
-    let caller_agent_id = resolve_audit_agent(|| default_agent.to_string());
+    let caller_agent_id = current_authorizing_agent(home_dir, default_agent);
     let requested_agent = args.get("agent").and_then(|v| v.as_str());
     let agent_id = match duduclaw_gateway::codrive::resolve_run_identity(
         home_dir,
@@ -80,7 +80,7 @@ pub(crate) async fn handle_codrive_run(args: &Value, home_dir: &Path, default_ag
 /// wider convention for read tools); a capability refusal is, exactly like
 /// `codrive_run`'s.
 pub(crate) async fn handle_codrive_status(home_dir: &Path, default_agent: &str) -> Value {
-    let caller_agent_id = resolve_audit_agent(|| default_agent.to_string());
+    let caller_agent_id = current_authorizing_agent(home_dir, default_agent);
     match duduclaw_gateway::codrive::resolve_run_identity(home_dir, &caller_agent_id, None) {
         Ok(_) => {}
         Err(duduclaw_gateway::codrive::RunIdentityError::InvalidAgentId) => {

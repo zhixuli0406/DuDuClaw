@@ -1,3 +1,4 @@
+import { canSelectAgent, useAgentGrantPresent } from '@/stores/callable-agents-store';
 import { useProductPolicy } from '@/lib/product-policy';
 import { useEffect, useState, type ReactNode } from 'react';
 import { useIntl, type IntlShape } from 'react-intl';
@@ -20,7 +21,7 @@ import {
 import { SecretSourceField } from '@/components/shared/SecretSourceField';
 import { normalizeRestartRequired } from '@/lib/config-toml';
 import { useRestartRequiredStore } from '@/stores/restart-required-store';
-import { GoogleChatSetup } from './GoogleChatSetup';
+import { GoogleChatSetup, type GoogleChatConnection } from './GoogleChatSetup';
 import { AlertTriangle } from 'lucide-react';
 
 /** Channel type picker options — value ⇒ human label (spec §4 Select). */
@@ -166,9 +167,20 @@ export function AddChannelDialog({
   const [wecomAgentId, setWecomAgentId] = useState('');
   const [wecomCallbackToken, setWecomCallbackToken] = useState('');
   const [wecomAesKey, setWecomAesKey] = useState('');
+  const [googlechatConnection, setGooglechatConnection] = useState<GoogleChatConnection>('http');
+  const [googlechatSubscription, setGooglechatSubscription] = useState('');
   const [googlechatManual, setGooglechatManual] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
+  const targetAgent = lockedAgent || parsedAgent || selectedAgent;
+  const selectable = useAgentGrantPresent(targetAgent);
+  useEffect(() => {
+    if (open && targetAgent && !selectable) {
+      setToken('');
+      setSecret('');
+      onClose();
+    }
+  }, [open, targetAgent, selectable, onClose]);
 
   const close = () => {
     if (channelType === 'googlechat') onCreated('googlechat');
@@ -190,6 +202,10 @@ export function AddChannelDialog({
       if (channelType === 'feishu' && feishuVerifyToken.trim()) {
         config.feishu_verification_token = feishuVerifyToken.trim();
       }
+      if (channelType === 'googlechat') {
+        config.connection = googlechatConnection;
+        config.pubsub_subscription = googlechatConnection === 'pubsub' ? googlechatSubscription.trim() : '';
+      }
       if (channelType === 'teams' && teamsTenantId.trim()) {
         config.teams_tenant_id = teamsTenantId.trim();
       }
@@ -198,7 +214,8 @@ export function AddChannelDialog({
         if (wecomCallbackToken.trim()) config.wecom_callback_token = wecomCallbackToken.trim();
         if (wecomAesKey.trim()) config.wecom_encoding_aes_key = wecomAesKey.trim();
       }
-      const res = await api.channels.add(channelType, config, selectedAgent || undefined);
+      if (targetAgent && !canSelectAgent(targetAgent)) return;
+      const res = await api.channels.add(channelType, config, targetAgent || undefined);
       reportChannelStart(channelType, res, intl);
       onCreated(channelType);
       onClose();
@@ -338,7 +355,7 @@ export function AddChannelDialog({
     : '';
 
   return (
-    <Dialog open={open} onOpenChange={(o) => !o && close()}>
+    <Dialog open={open && (!targetAgent || selectable)} onOpenChange={(o) => !o && close()}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>
@@ -410,7 +427,7 @@ export function AddChannelDialog({
           )}
 
           {/* Setup guide */}
-          {channelType === 'googlechat' ? <GoogleChatSetup projectNumber={secret.trim()} /> : <div className="rounded-lg bg-warning/10 p-3 text-xs text-warning">
+          {channelType === 'googlechat' ? <GoogleChatSetup connection={googlechatConnection} onConnectionChange={setGooglechatConnection} subscription={googlechatSubscription} onSubscriptionChange={setGooglechatSubscription} projectNumber={secret.trim()} /> : <div className="rounded-lg bg-warning/10 p-3 text-xs text-warning">
             <p className="mb-1 font-medium">{intl.formatMessage({ id: 'channels.dialog.setupGuide' })}</p>
             {steps.map((step) => {
               const isWarning = step.id.toLowerCase().includes('warning');

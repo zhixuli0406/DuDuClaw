@@ -19,6 +19,8 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let home = tempfile::tempdir().unwrap();
+    // Main-target admission requires readable gateway configuration.
+    std::fs::write(home.path().join("config.toml"), "").unwrap();
     crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
     for (id, role) in [("operator", "main"), ("ordinary", "specialist")] {
         crate::trigger_route::tests::write_agent(
@@ -362,7 +364,8 @@ fn known_identity_sources_call_the_narrowing_helper() {
         (include_str!("../recipient_guard.rs"), "crate::machine_employee::requires_admin_for_id(home, agent)"),
         (include_str!("../computer_profiles/mod.rs"), "crate::machine_employee::restriction_known(home, agent)"),
         (include_str!("../team_oversight.rs"), "crate::machine_employee::live_user_context(home, db, &ctx.user_id)"),
-        (include_str!("../server.rs"), "crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &claims.sub)"),
+        (include_str!("../server.rs"), "crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &authenticated.user_id)"),
+        (include_str!("../server.rs"), "crate::machine_employee::live_user_context(state.handler.home_dir(), &state.user_db, &identity.user_id)"),
         (include_str!("../server.rs"), ".map(|ctx| crate::machine_employee::without_restricted_access(state.handler.home_dir(), ctx))"),
     ] {
         assert!(source.contains(boundary), "missing identity narrowing: {boundary}");

@@ -379,7 +379,6 @@ pub fn append_tool_call_with_extras(
         "success",
     ];
     let path = home_dir.join("tool_calls.jsonl");
-    maybe_rotate_tool_calls(&path);
     let mut map = serde_json::Map::new();
     map.insert("timestamp".into(), Utc::now().to_rfc3339().into());
     map.insert("agent_id".into(), agent_id.into());
@@ -438,7 +437,10 @@ pub fn append_tool_call_with_extras(
     // data (e.g. Odoo reads), so the file must not be world/group-readable.
     // `append_chained_line` tightens an existing file's permissions if they
     // drifted wider (upgraded installs), same discipline as before B1.
-    if let Err(e) = crate::audit_chain::append_chained_line(&path, map, Some(0o600)) {
+    if let Err(e) = duduclaw_core::with_file_lock(&path, || {
+        maybe_rotate_tool_calls(&path);
+        crate::audit_chain::append_chained_line_locked(&path, map, Some(0o600))
+    }) {
         warn!("Failed to write tool call record to {}: {e}", path.display());
     }
 }
@@ -885,9 +887,7 @@ pub const TOOL_CALLS_ROTATION_MAX_BYTES: u64 = 16 * 1024 * 1024; // 16 MB
 /// Renames the current file to `.jsonl.old` (overwriting any previous backup)
 /// and starts a fresh file. Only checks file size every 64 calls to avoid
 /// a `metadata()` syscall on every tool call (review R3-L1).
-/// Concurrent callers may both attempt `rename` — the loser gets ENOENT
-/// which is silently ignored since a fresh file will be created on the
-/// next `append` (review R3-L4).
+/// The caller holds the stable family sidecar lock across rotation and append.
 ///
 /// B1: the hash chain deliberately does NOT continue in-band across this
 /// rotation (see `crate::audit_chain`'s module doc, "Rotation boundary
@@ -916,7 +916,7 @@ fn maybe_rotate_tool_calls(path: &std::path::Path) {
             // still starts at genesis on its own) — only the forensic
             // cross-link event is lost, not any audit data.
             let old_tail_hash = crate::audit_chain::last_line_hash(path).ok();
-            // Ignore ENOENT: a concurrent caller may have already rotated.
+            // Missing files need no rotation; the family lock serializes writers.
             match std::fs::rename(path, &backup) {
                 Ok(()) => {
                     if let Some(home_dir) = path.parent() {
@@ -1174,6 +1174,50 @@ mod strict_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_writer_family_lock_child() {
+        use std::io::Write;
+        let Some(home) = std::env::var_os("DUDUCLAW_TOOL_LOCK_TEST") else { return; };
+        println!("READY");
+        std::io::stdout().flush().unwrap();
+        super::append_tool_call(std::path::Path::new(&home), "test", "db_select", "", true);
+    }
+
+    #[test]
+    fn tool_writer_rotation_waits_for_family_snapshot_lock() {
+        use std::io::BufRead;
+        let home = fresh_home();
+        let path = home.join("tool_calls.jsonl");
+        // A valid legacy row large enough to rotate on the fresh child's first call.
+        let record = serde_json::json!({"padding":"x".repeat(super::TOOL_CALLS_ROTATION_MAX_BYTES as usize)});
+        let body = format!("{record}\n");
+        std::fs::write(&path, &body).unwrap();
+        let (mut child, _output) = duduclaw_core::with_file_lock(&path, || {
+            let mut child = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "audit::tests::tool_writer_family_lock_child", "--nocapture"])
+                .env("DUDUCLAW_TOOL_LOCK_TEST", &home)
+                .stdout(std::process::Stdio::piped()).spawn()?;
+            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            loop {
+                assert_ne!(output.read_line(&mut line)?, 0);
+                if line.trim() == "READY" { break; }
+                line.clear();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!path.with_extension("jsonl.old").exists());
+            assert_eq!(std::fs::metadata(&path)?.len(), body.len() as u64);
+            Ok((child, output))
+        }).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(std::fs::read_to_string(path.with_extension("jsonl.old")).unwrap(), body);
+        assert!(crate::audit_chain::verify_chain(&path).unwrap().is_intact());
+        let value: serde_json::Value = serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(value["tool_name"], "db_select");
+        assert_eq!(value["_prev_hash"], crate::audit_chain::genesis_hash());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
     use super::*;
 
     pub(super) fn fresh_home() -> std::path::PathBuf {

@@ -229,11 +229,8 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
         ))
     })?;
 
-    // Seed the bundled skills so a wizard-created staffer isn't born with an
-    // empty Skills page. Runs before the template copy — `install_builtin_skills`
-    // never overwrites an existing `<name>/SKILL.md`, so a premium template that
-    // ships its own version of a bundled skill still wins.
-    let _ = duduclaw_agent::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS"));
+    // Shared defaults are installed once, independently of employee templates.
+    duduclaw_gateway::builtin_skills_seed_migration::run(&home);
 
     // Copy template files if the industry has a template. Free templates
     // resolve under `templates/`; premium ones carry their own absolute path
@@ -882,9 +879,8 @@ malicious_key = "pwned"#;
 
     /// K2 (2026-09-29): a scaffolded agent evolves from day one.
     ///
-    /// The key must be written **explicitly** — an absent key still reads as
-    /// `false` at the runtime gate (`gvu::trigger::agent_gvu_enabled`), so
-    /// "the default is on" has to be visible in the file, not implied.
+    /// The key is written explicitly so the default is visible in the file.
+    /// Valid files with an absent key also default to on since 2026-11-06.
     #[test]
     fn generated_agent_toml_ships_evolution_enabled() {
         let out = generate_agent_toml("acme", "Acme Co", "LINE", &[]);

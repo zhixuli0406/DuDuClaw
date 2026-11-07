@@ -192,7 +192,7 @@ fn path_validation() {
 
 #[test]
 fn network_off_is_refused_before_anything_else() {
-    let mut s = spec(RuntimeType::Codex);
+    let mut s = spec(RuntimeType::Claude);
     s.network_access = false;
     let err = preflight(&SandboxSettings::default(), &s).unwrap_err();
     assert_eq!(err, Unavailable::NetworkDisabled);
@@ -209,7 +209,6 @@ fn generic_cli_runtimes_are_unsupported() {
     }
     for runtime in [
         RuntimeType::Claude,
-        RuntimeType::Codex,
         RuntimeType::Grok,
     ] {
         let result = preflight(&SandboxSettings::default(), &spec(runtime));
@@ -309,14 +308,14 @@ fn unavailable_fails_closed_and_is_audited() {
 fn escape_hatch_runs_unsandboxed_and_audits_every_time() {
     let home = tempfile::tempdir().unwrap();
     for _ in 0..2 {
-        let outcome = settle(home.path(), &spec(RuntimeType::Codex), WhenUnavailable::RunUnsandboxed,
+        let outcome = settle(home.path(), &spec(RuntimeType::Claude), WhenUnavailable::RunUnsandboxed,
             Err(SandboxError::Unavailable(Unavailable::ImageMissing("img".into()))));
         assert!(matches!(outcome, SandboxDispatch::RunUnsandboxed));
     }
     let audit = audit_lines(home.path());
     assert_eq!(audit.matches("task_sandbox_bypassed").count(), 2, "{audit}");
     // A task failure is never bypassed.
-    let outcome = settle(home.path(), &spec(RuntimeType::Codex), WhenUnavailable::RunUnsandboxed,
+    let outcome = settle(home.path(), &spec(RuntimeType::Claude), WhenUnavailable::RunUnsandboxed,
         Err(SandboxError::Failed(SandboxFailure::failed(failure_code::TIMEOUT, "boom"))));
     assert!(matches!(outcome, SandboxDispatch::Completed(Err(f)) if f.message == "boom" && !f.unavailable));
 }
@@ -434,4 +433,17 @@ fn script_sandbox_image_shares_the_task_sandbox_key_and_default() {
     // An invalid section fails closed (no silent fallback to the default).
     std::fs::write(home.path().join("config.toml"), "[container.sandbox]\nimage = \"-x\"\n").unwrap();
     assert!(settings::script_sandbox_image(home.path()).is_err());
+}
+
+#[test]
+fn codex_isolation_refusal_preserves_file_and_cannot_bypass() {
+    let task = spec(RuntimeType::Codex);
+    let error = Unavailable::CodexMcpIsolation("Codex MCP refused: /etc/codex/config.toml".into());
+    assert!(error.message().contains("/etc/codex/config.toml"));
+    let home = tempfile::tempdir().unwrap();
+    for policy in [WhenUnavailable::Fail, WhenUnavailable::RunUnsandboxed] {
+        assert!(matches!(settle(home.path(), &task, policy,
+            Err(SandboxError::Unavailable(error.clone()))), SandboxDispatch::Completed(Err(_))));
+    }
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
 }

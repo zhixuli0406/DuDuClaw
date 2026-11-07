@@ -43,6 +43,7 @@ pub(in crate::handlers) async fn fixture() -> Fixture {
     };
     let alice = mk("alice@test.invalid");
     let bob = mk("bob@test.invalid");
+    std::fs::write(home.join("config.toml"), "[general]\ndefault_agent = \"dudu\"\n").unwrap();
     let handler = MethodHandler::new(home.clone()).await;
     let store = Arc::new(TaskStore::open(&home).unwrap());
     handler.set_task_store(store.clone()).await;
@@ -166,7 +167,7 @@ async fn single_task_rpcs_refuse_reader_outside_audience() {
 
 #[tokio::test]
 async fn single_task_rpcs_stop_on_the_same_connection_after_revocation() {
-    let f = fixture().await;
+    let mut f = fixture().await;
     let alice_id = f.alice.user_id.clone();
     // Binding removed: the cached context still claims Operator on sales.
     f.db.unbind_agent(&alice_id, "sales").unwrap();
@@ -193,6 +194,8 @@ async fn single_task_rpcs_stop_on_the_same_connection_after_revocation() {
     }
     // Active again but a Viewer binding cannot decide (Operator needed).
     f.db.set_user_status(&alice_id, UserStatus::Active).unwrap();
+    assert!(denied(&call(&f, "tasks.changes", PRIVATE, &f.alice).await));
+    f.alice = f.db.live_user_context(&alice_id).unwrap().unwrap();
     assert!(ok(&call(&f, "tasks.changes", PRIVATE, &f.alice).await));
     assert!(denied(
         &call(&f, "tasks.goal_decide", PRIVATE, &f.alice).await

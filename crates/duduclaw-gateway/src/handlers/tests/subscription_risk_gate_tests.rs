@@ -274,6 +274,7 @@ async fn raw_hash(handler: &MethodHandler) -> Value {
 #[tokio::test]
 async fn raw_config_adding_an_oauth_account_needs_the_flag() {
     let home = tempfile::tempdir().unwrap();
+    let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
     let base = "[[accounts]]\nid = \"key\"\ntype = \"api_key\"\nprovider = \"openai\"\n";
     std::fs::write(home.path().join("config.toml"), base).unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;

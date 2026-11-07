@@ -286,7 +286,20 @@ pub(crate) async fn run_approval_bound(
         );
     }
 
-    let requested = match simulation {
+    // Only the gateway can attach a verified requester. A missing live turn,
+    // disabled setting or unavailable route retains the Admin-only envelope.
+    let requester_approval = if matches!(subject, ApprovalSubject::ToolCall("mail_send"))
+        && payload.get("egress_guard").is_some() && grant.is_some()
+    {
+        match broker.request_mail_requester(agent_id, summary, &payload, ttl_seconds, simulation.as_ref()).await {
+            Ok(id) => id,
+            Err(error) => {
+                warn!(%error, "mail requester approval unavailable; retaining dashboard Admin approval");
+                None
+            }
+        }
+    } else { None };
+    let requested = if let Some(id) = requester_approval { Ok(id) } else { match simulation {
         Some(sim) => {
             broker
                 .request_with_simulation(agent_id, kind, &summary, payload, ttl_seconds, sim)
@@ -297,7 +310,7 @@ pub(crate) async fn run_approval_bound(
                 .request(agent_id, kind, &summary, payload, ttl_seconds)
                 .await
         }
-    };
+    }};
     let approval_id = match requested {
         Ok(id) => id,
         Err(e) => {

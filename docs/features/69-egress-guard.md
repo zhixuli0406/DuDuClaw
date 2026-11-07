@@ -1,5 +1,7 @@
 # Outgoing data guard
 
+**Codex external configuration gate (since v1.80.0):** Employees, Explore, utility, Task Sandbox and Discovery may run when external layers are absent or define no MCP servers; detected MCP or unreadable/unparseable existing layers refuse launch with the source named. A refused explicit Codex judge fails acceptance without retrying the default judge. This checks a local/cache snapshot before launch, not complete isolation from subsequent cloud refresh. See [checked sources and limits](../architecture/extension-gates.md).
+
 Available from v1.77.0. The guard tracks private reads during an AI employee's turn and checks later outgoing MCP calls before execution, outside the model.
 
 ## Choose a mode
@@ -71,7 +73,7 @@ Clearing a lease removes its protection against concurrent private reads. Restar
 
 ## Review before approving
 
-Only a current Admin may decide an outgoing-data approval, including requests without a workflow binding. Channel decisions are refused. The Admin-only dashboard outgoing-data approval shows the destination, full arguments expanded in a scrollable panel, source tools and expiry. Send, Publish and Purchase approvals also show full arguments. One approval binds one employee, tool and digest of the complete canonical arguments and can be used once. An action-rule approval and the outgoing-data reason share one request.
+Outgoing-data approvals require a current dashboard Admin, except eligible `mail_send` requests: the verified turn requester with current Operator access may decide in the original one-to-one conversation or authenticated dashboard WebChat when `[security] mail_requester_approval` allows it. See [requester rules and configuration failures](05-security-defense.md#requester-confirmation-for-mail). Other channel decisions are refused. The Admin-only dashboard outgoing-data approval shows the destination, full arguments expanded in a scrollable panel, source tools and expiry. Send, Publish and Purchase approvals also show full arguments. One approval binds one employee, tool and digest of the complete canonical arguments and can be used once. An action-rule approval and the outgoing-data reason share one request.
 
 Action-rule approvals show the matching tool or effect rule, including for read and draft calls. Purchase and Delete actions cannot receive new standing capability or workflow grants; grants saved before this feature are ignored without changing the stored records. Other gates and explicit approvals still apply.
 
@@ -101,6 +103,8 @@ Cron, dispatch, reminder, mail, heartbeat and ephemeral execution entry points n
 DuDuClaw does not guarantee that Grok alias matching or environment propagation matches the real CLI. Generic CLI native tools remain outside this guard.
 
 ## Server-bound recipients
+
+For `mail_send` only, the verified requester may use the original conversation under the [mail-requester rule](05-security-defense.md#requester-confirmation-for-mail). All other targets in the table retain dashboard Admin approval. Only an adapter-attested one-to-one conversation or authenticated dashboard WebChat is eligible. Group chats and unknown chat types still need a dashboard Admin; public WebChat widget visitors are never eligible. Channel notices for ineligible requests contain no recipients, subject or body; full content stays in the dashboard.
 
 Recipient protection is independent of whether private data was read. Set `config.toml [security] recipient_guard` to `off`, `shadow` (default), or `ask`. An unknown value warns and behaves as `ask`. An employee's `[capabilities] recipient_guard` can only tighten the global setting (`off < shadow < ask`). In the dashboard, use Security → Outgoing data guard → Recipient guard; an Admin edits additional recipients under the employee's Tools & permissions → Allowed recipients.
 
@@ -137,7 +141,7 @@ This guard protects product paths; it does not isolate a process with unrestrict
 
 ## Known limitations
 
-Direct `[[mcp.external]]` mounts in the API tool loop (stdio, HTTP and the Google closed bridge) also pass the guard. Their tool registry does not retain MCP annotations, so these calls are conservatively classified as **Modify**, even when the server describes them as read-only; exact per-tool action rules still apply. The MCP proxy and remote bridge retain their annotation-based decisions with `trusted_read_hint_servers`. A tainted direct-mounted read can therefore require outgoing approval.
+Direct `[[mcp.external]]` mounts in the API tool loop (stdio, HTTP and the Google closed bridge) also pass the guard and preserve annotations. All third-party paths default to **Modify**, including tools claiming `readOnlyHint`; `destructiveHint` raises the effect to **Delete**. The legacy `trusted_read_hint_servers` setting cannot lower risk or skip sink leases. Exact per-tool action rules still apply.
 
 Taint is tracked per turn; active sink fences apply per employee. This guard does not provide a network sandbox or a runtime-wide network boundary. Private data supplied in prompts or read outside the covered MCP routes is not automatically classified. A new turn has a new ledger key; the guard does not follow information copied across turns. Turn taint is not durable across gateway restarts; active sink leases are persisted separately. Observation mode allows outgoing calls and only records what would require approval.
 

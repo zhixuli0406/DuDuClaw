@@ -39,21 +39,26 @@ impl MethodHandler {
                     {
                         return Err("請先閱讀並確認 Google 資料的存取、分享、保存與刪除說明。".into());
                     }
+                    let meeting_recordings = params.get("meeting_recordings")
+                        .map(|value| value.as_bool().ok_or("請確認要開放的 Google 服務。"))
+                        .transpose()?.unwrap_or(false);
+                    let drive_tools = params.get("drive_tools")
+                        .map(|value| value.as_bool().ok_or("請確認要開放的 Google 服務。"))
+                        .transpose()?.unwrap_or(false);
+                    if meeting_recordings && drive_tools {
+                        return Err("請分別開放會議錄影或雲端硬碟工具，每次選擇一項服務。".into());
+                    }
                     let session = google_personal::session_for(&ctx.user_id)?;
                     let origin = params
                         .get("redirect_origin")
                         .and_then(Value::as_str)
                         .ok_or("請提供目前控制台的網址。")?;
-                    flow::start(
-                        &self.home_dir,
-                        &db,
-                        &ctx.user_id,
-                        &session,
-                        origin,
-                        &crate::server::allowed_origins_snapshot(),
-                        true,
-                    )
-                    .await
+                    let allowed = crate::server::allowed_origins_snapshot();
+                    if drive_tools {
+                        flow::start_drive_tools(&self.home_dir, &db, &ctx.user_id, &session, origin, &allowed, true).await
+                    } else {
+                        flow::start_with_meetings(&self.home_dir, &db, &ctx.user_id, &session, origin, &allowed, true, meeting_recordings).await
+                    }
                 }
                 "me.google.connect_finish" => {
                     let session = google_personal::session_for(&ctx.user_id)?;
@@ -203,6 +208,7 @@ impl MethodHandler {
         requests.sort_by_key(|r| r.get("allowed").is_some_and(|v| !v.is_null()));
         Ok(
             json!({"connection":own,"login_email":ctx.email,"client_configured":crate::mcp_oauth::get_client_config(&self.home_dir,"google").is_some(),
+            "chat_read":crate::google_workspace::chat_read_enabled(&self.home_dir),
             "integration_enabled":crate::google_workspace::integration_enabled(&self.home_dir),"requests":requests,"delegated":delegated,
             "requires_login":google_personal::session_for(&ctx.user_id).is_err(),"recent_usage":google_personal::history::recent(&self.home_dir,&ctx.user_id,&ctx.email)?}),
         )

@@ -1,4 +1,5 @@
-import { useVisibleAgents } from '@/lib/data-scope';
+import { canSelectAgent, useAgentGrantPresent } from '@/stores/callable-agents-store';
+import { useVisibleAgents, useAgentVisibilityUnrestricted } from '@/lib/data-scope';
 import { Link } from 'react-router';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -6,7 +7,9 @@ import { useNavigate } from 'react-router';
 import { useAgentsStore } from '@/stores/agents-store';
 import { OrgChart } from '@/components/OrgChart';
 import { OrgNodePanel } from '@/components/agent';
-import type { AgentDetail } from '@/lib/api';
+import { api, type AgentDetail, type OrgChartAgent } from '@/lib/api';
+import { useAuthStore } from '@/stores/auth-store';
+import { useConnectionStore } from '@/stores/connection-store';
 import { Users } from 'lucide-react';
 import {
   CollectionPageHeader,
@@ -19,14 +22,67 @@ import { toast } from '@/lib/toast';
 import { usePanel } from '@/components/ui';
 
 export function OrgChartPage() {
+  const user = useAuthStore(s => s.user);
+  return user?.role === 'employee'
+    ? <EmployeeOrgChart key={user.id} />
+    : <ManagedOrgChart />;
+}
+
+function EmployeeOrgChart() {
+  const intl = useIntl();
+  const connection = useConnectionStore(s => s.state);
+  const [directoryAgents, setAgents] = useState<OrgChartAgent[]>([]);
+  const visible = useVisibleAgents();
+  const unrestricted = useAgentVisibilityUnrestricted();
+  const agents = directoryAgents.filter(a => unrestricted || visible.some(v => v.name === a.name));
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<unknown>(null);
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    let active = true;
+    setAgents([]);
+    setLoading(true);
+    setError(null);
+    if (connection === 'authenticated') {
+      void api.agents.orgChart().then(result => {
+        if (active) setAgents(result.agents);
+      }).catch(err => {
+        if (active) setError(err);
+      }).finally(() => {
+        if (active) setLoading(false);
+      });
+    }
+    return () => { active = false; };
+  }, [connection, attempt]);
+  return (
+    <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
+      <CollectionPageHeader icon={Users} title={intl.formatMessage({ id: 'nav.org' })}
+        count={agents.length} description={intl.formatMessage({ id: 'nav.org.desc' })} />
+      <div className="mx-auto w-full max-w-6xl p-6">
+        {loading ? <CollectionPageState state="loading" />
+          : error != null ? <ErrorState icon={Users} error={error} onRetry={() => setAttempt(n => n + 1)} />
+          : agents.length === 0 ? <CollectionPageState state="empty" icon={Users} title={intl.formatMessage({ id: 'agents.empty' })} />
+          : <Card className="gap-0 p-2"><OrgChart agents={agents} labels={{
+            main: intl.formatMessage({ id: 'orgchart.legend.main' }),
+            specialist: intl.formatMessage({ id: 'orgchart.legend.specialist' }),
+            worker: intl.formatMessage({ id: 'orgchart.legend.worker' }),
+            zoom: intl.formatMessage({ id: 'orgchart.zoom' }),
+          }} /></Card>}
+      </div>
+    </div>
+  );
+}
+
+function ManagedOrgChart() {
   const intl = useIntl();
   const navigate = useNavigate();
   const errorText = useErrorMessage();
   // `error` was never destructured here (P05 Blocker, phase-4 audit): a failed
   // roster fetch fell through to the "還沒有 AI 員工？" empty state, telling the
   // user to hire someone when the real problem was the connection.
-  const { agents, fetchAgents, pauseAgent, resumeAgent, loading, loaded, error, clearError } =
+  const { fetchAgents, pauseAgent, resumeAgent, loading, loaded, error, clearError } =
     useAgentsStore();
+  const agents = useVisibleAgents(false);
   const visibleAgents = useVisibleAgents();
   const teamAgents = visibleAgents.filter(a => a.readOnly);
   const [selectedAgent, setSelectedAgent] = useState<AgentDetail | null>(null);
@@ -36,10 +92,20 @@ export function OrgChartPage() {
     fetchAgents();
   }, [fetchAgents]);
 
+  const selectedAllowed = useAgentGrantPresent(selectedAgent?.name);
+  useEffect(() => {
+    if (selectedAgent && !selectedAllowed) {
+      setSelectedAgent(null);
+      clearPanel();
+      setSheetOpen(false);
+    }
+  }, [selectedAgent, selectedAllowed, clearPanel, setSheetOpen]);
+
   // Clear the right panel when leaving the page.
   useEffect(() => () => clearPanel(), [clearPanel]);
 
   const handleNodeClick = (agentName: string) => {
+    if (!canSelectAgent(agentName)) return;
     const agent = agents.find((a) => a.name === agentName) ?? null;
     setSelectedAgent(agent);
     if (agent) setSheetOpen(true); // mobile: open the bottom sheet
@@ -47,7 +113,7 @@ export function OrgChartPage() {
 
   // Push the selected staff card into the shared right PropertiesPanel (§5.4 T6.3).
   useEffect(() => {
-    if (!selectedAgent) return;
+    if (!selectedAgent || !selectedAllowed) return;
     setPanel({
       title: selectedAgent.display_name,
       content: (
@@ -62,6 +128,7 @@ export function OrgChartPage() {
             navigate(`/agents/${encodeURIComponent(selectedAgent.name)}/edit`);
           }}
           onPause={async () => {
+            if (!canSelectAgent(selectedAgent.name)) return;
             try {
               await pauseAgent(selectedAgent.name);
             } catch (e) {
@@ -73,6 +140,7 @@ export function OrgChartPage() {
             setSelectedAgent((prev) => (prev ? { ...prev, status: 'paused' } : null));
           }}
           onResume={async () => {
+            if (!canSelectAgent(selectedAgent.name)) return;
             try {
               await resumeAgent(selectedAgent.name);
             } catch (e) {
@@ -86,7 +154,7 @@ export function OrgChartPage() {
         />
       ),
     });
-  }, [selectedAgent, setPanel, clearPanel, navigate, pauseAgent, resumeAgent, intl, errorText]);
+  }, [selectedAgent, selectedAllowed, setPanel, clearPanel, navigate, pauseAgent, resumeAgent, intl, errorText]);
 
   return (
     <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">

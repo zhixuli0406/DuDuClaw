@@ -51,7 +51,7 @@ impl std::fmt::Display for RunIdentityError {
 /// is deliberately a full **identity override**, not merely a display
 /// label. When present and non-blank, it replaces `caller_agent_id` (the
 /// MCP session's own identity, already resolved by the caller — e.g.
-/// `duduclaw-cli`'s `resolve_audit_agent`) for everything that happens
+/// `duduclaw-cli`'s `current_authorizing_agent`) for everything that happens
 /// next:
 ///
 /// 1. **Capability re-check** (this function): the RETURNED id's own

@@ -1,12 +1,12 @@
 import type { OdooModelAccess } from '@/lib/api';
 
-/** Execute has no generic ACL: write is only a hint; Odoo checks each button. */
+/** Button actions and other methods have no generic ACL: write is only a hint. */
 export function actionAccess(access: OdooModelAccess | null | undefined, action: ActionGroup): boolean | null {
-  return access?.[action === 'execute' ? 'write' : action] ?? null;
+  return access?.[action === 'action' || action === 'execute' ? 'write' : action] ?? null;
 }
 
 /** Storage stays compatible with agent.toml; unknown tokens are never discarded. */
-export const ACTION_GROUPS = ['read', 'create', 'write', 'unlink', 'execute'] as const;
+export const ACTION_GROUPS = ['read', 'create', 'write', 'unlink', 'action', 'execute'] as const;
 export type ActionGroup = typeof ACTION_GROUPS[number];
 export interface OdooRule { model: string; verbs: string[] }
 export interface OdooPermissions {
@@ -14,7 +14,7 @@ export interface OdooPermissions {
   allowed_actions: string[];
   unblock_models: string[];
 }
-const VERBS = new Set(['read', 'search', 'create', 'write', 'unlink', 'execute']);
+const VERBS = new Set(['read', 'search', 'create', 'write', 'unlink', 'action', 'execute']);
 export const validModel = (model: string) => /^[a-zA-Z0-9_.]{1,128}$/.test(model);
 
 export function parseActions(entries: string[]) {

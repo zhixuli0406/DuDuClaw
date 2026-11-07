@@ -354,6 +354,8 @@ fn test_google_tools_scope_split() {
         "google_status",
         "gmail_search",
         "gmail_read",
+        "google_chat_spaces",
+        "google_chat_messages",
         "calendar_list_events",
     ] {
         assert_eq!(
@@ -760,4 +762,11 @@ fn cached_auth_fails_closed_when_reload_hits_io_error() {
         AuthError::ReloadFailed,
         "an I/O error on reload must deny outright, never reuse the previously-cached principal"
     );
+}
+
+#[test]
+fn session_administration_requires_admin_scope() {
+    for method in ["sessions.policy", "sessions.policy_update", "users.revoke_sessions"] {
+        assert_eq!(tool_requires_scope(method), Some(Scope::Admin));
+    }
 }

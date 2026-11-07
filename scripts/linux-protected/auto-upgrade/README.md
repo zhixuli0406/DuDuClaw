@@ -4,7 +4,9 @@
 
 **目前僅供開發，請勿啟用 timer。** 新更新服務已實作世代切換、固定服務重啟及健康讀回；跨套件的排空、遷移與就緒端點仍須串接，缺少端點時會回報維護，不會提交新的版本下限。遷移 bootstrap 雙簽、真實 FIDO2 與 Linux 實機更新尚未完成。只把這組檔案複製到 v1.79.3 不會安裝服務、帳號或信任根；既有夜間部署應保留先前審閱過的固定版本 helper，等待完整遷移。
 
-目前 helper 只接受無參數或 `--dry-run`，並呼叫固定的 root 管理程式 `/usr/libexec/duduclaw-updated-launch --check-latest`。`--dry-run` 只查候選版本；正式要求經 Apply RPC 排隊，排隊成功不代表安裝成功。沒有更新服務時拒絕，不退回舊的 CLI 安裝器。
+此目錄從 v1.80.0 起收錄於原始碼，v1.79.3 以前的標籤沒有它；發行 tarball 也不含 `scripts/`。請從固定的完整 commit SHA 取得並審閱，例如 `v1.80.0` 標籤指向的 commit（下方以 `<commit>` 表示，請換成你審閱過的那一筆），不要使用會移動的 `main`。
+
+v1.80.x 標籤中的版本只呼叫既有的 `service upgrade --protected-linux --version`，可搭配 v1.79.3 受保護安裝。本分支（尚未發行）的 helper 只接受無參數或 `--dry-run`，並呼叫固定的 root 管理程式 `/usr/libexec/duduclaw-updated-launch --check-latest`。`--dry-run` 只查候選版本；正式要求經 Apply RPC 排隊，排隊成功不代表安裝成功。沒有更新服務時拒絕，不退回舊的 CLI 安裝器。
 
 候選查詢由 `duduclaw-dl` 帳號執行 curl，清除繼承環境；API 回應上限 1 MiB，完整 JSON 必須有 `draft=false`、`prerelease=false` 與正式版本。未簽章索引僅選候選版本，官方簽章清單與 root 管理的版本／序號才決定能否接受。要求端 unit 逾時為六分鐘，不寫入發行檔案。固定路徑與網址不能用環境變數覆寫。
 

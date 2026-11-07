@@ -53,6 +53,7 @@ fn enterprise_surfaces_are_listed() {
         "wiki.trust_override",
         // 可靠性報告
         "audit.reliability_summary",
+        "compliance.generate",
     ] {
         assert!(
             is_enterprise_only_method(method),
@@ -188,4 +189,13 @@ fn reject_frame_is_coded_and_leak_free() {
         }
         other => panic!("expected structured error response, got {other:?}"),
     }
+}
+
+#[test]
+fn mfa_recovery_edition_exceptions_are_exact() {
+    for method in ["users.mfa_reset", "users.mfa_enrollment_code"] {
+        assert!(!is_enterprise_only_method(method));
+        assert!(is_enterprise_only_method(&format!("{method}_extra")));
+    }
+    assert!(is_enterprise_only_method("users.update"));
 }

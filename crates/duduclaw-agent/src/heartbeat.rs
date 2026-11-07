@@ -1329,8 +1329,8 @@ async fn execute_proactive_check(
             // Third-party stdio servers are routed through `duduclaw
             // mcp-proxy` (2026-10-08), which applies the explore lane to
             // their tools: only tools classed `read` are listed and callable,
-            // and a server's `readOnlyHint` counts only when the operator
-            // lists it in `[capabilities] trusted_read_hint_servers`. Remote
+            // third-party annotations never lower the Modify default, so
+            // no third-party tools qualify for this read-only lane. Remote
             // bridges gate themselves (they inherit `DUDUCLAW_LANE`). If the
             // rewritten config cannot be written the check is skipped rather
             // than started with ungated servers.
@@ -2384,6 +2384,25 @@ fn explore_lane_mcp_config(
 
 #[cfg(test)]
 mod secret_proxy_gate_tests {
+    #[test]
+    fn pl0_proactive_spawn_refuses_direct_remote_and_proxies_stdio() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".mcp.json");
+        let raw = serde_json::json!({"mcpServers": {
+            "remote": {"url":"https://example.invalid/mcp"},
+            "stdio": {"command":"test-upstream"}
+        }}).to_string();
+        std::fs::write(&path, &raw).unwrap();
+        let guard = super::explore_lane_mcp_config(home.path(), "alice", &path).unwrap().unwrap();
+        let effective: serde_json::Value = serde_json::from_slice(&std::fs::read(&guard).unwrap()).unwrap();
+        assert!(effective["mcpServers"].get("remote").is_none());
+        assert_eq!(effective["mcpServers"]["stdio"]["args"][0], "mcp-proxy");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("mcp.remote_connect"));
+        assert!(!audit.contains("example.invalid"));
+    }
+
     #[test]
     fn unrouteable_secret_references_refuse_proactive_spawn() {
         let home = tempfile::tempdir().unwrap();

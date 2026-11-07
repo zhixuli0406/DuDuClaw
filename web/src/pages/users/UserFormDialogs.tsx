@@ -21,6 +21,7 @@ import { toast } from '@/lib/toast';
 import type { UserInviteResult } from '@/lib/api';
 import { InviteEmailPreview } from './InviteControls';
 import { ManagerSelect } from './ManagerSelect';
+import { RevokeUserSessions } from '@/components/mfa/RevokeUserSessions';
 import { DialogField, DepartmentInput, roleOptions, useDepartmentNames, userWriteError } from './dialog-common';
 
 export function CreateUserDialog({
@@ -249,6 +250,7 @@ export function EditUserDialog({
               onChange={(e) => setNewPassword(e.target.value)}
             />
           </DialogField>
+          <RevokeUserSessions userId={user.id} name={user.display_name || user.email} />
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>

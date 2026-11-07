@@ -759,6 +759,8 @@ struct ContainerAttemptRunner {
 #[async_trait]
 impl AttemptRunner for ContainerAttemptRunner {
     async fn run_attempt(&self,req:&AttemptRequest)->Result<AttemptOutcome,AttemptInfraError> {
+        // Recheck even a directly constructed runner before any workspace/budget side effect.
+        super::attempt_adapter::RuntimeFamily::parse(self.family.name())?;
         let factory=&self.factory;
         let budget=factory.budget.as_ref().ok_or(AttemptInfraError::BudgetExhausted)?;
         if budget.is_cancelled() || budget.remaining_wall().is_zero() {return Err(AttemptInfraError::BudgetExhausted);}
@@ -786,15 +788,20 @@ impl AttemptRunner for ContainerAttemptRunner {
             read_guards.iter().try_for_each(super::workspace::IntegrityGuard::verify).map_err(|e|AttemptInfraError::Spawn(e.to_string()))?;
             let timeout=req.timeout.min(budget.remaining_wall());
             let (account,env)=match next.take() { Some(found)=>found, None=>self.usable_account(rotator,req,&rejected).await? };
-            let argv=self.family.argv(model,req.max_turns,&node);
+            let argv=self.family.argv(model,req.max_turns,&node)?;
             let files=super::attempt_adapter::runtime_files(self.family,&req.prompt);
+            let mut image=self.image.clone();
+            let argv=if self.family==super::attempt_adapter::RuntimeFamily::Codex {
+                let (executable, checked)=super::attempt_adapter::codex_container_command(&image.executable,argv);
+                image.executable=executable; checked
+            } else { argv };
             // The attempt runs model-driven code under --memory / --pids-limit:
             // on a rootless engine those must be shown to take effect first.
             if let Err(verdict)=crate::task_sandbox::container::resource_limits(&self.image.image).await {
                 tracing::warn!(reason=verdict.code(),"discovery attempt refused: container resource limits not enforced");
                 return Err(AttemptInfraError::IsolationUnavailable);
             }
-            let prepared=super::attempt_container::prepare_with_files(&factory.home_dir,req,&factory.attempt,factory.quota,&self.image,&argv,&env,&files,timeout)?;
+            let prepared=super::attempt_container::prepare_with_files(&factory.home_dir,req,&factory.attempt,factory.quota,&image,&argv,&env,&files,timeout)?;
             drop(env);
             let _lease=acquire_attempt_slot(&factory.home_dir,factory.max_concurrency,budget,seed_deadline).await?;
             let guard=duduclaw_core::dispatch_guard::DispatchGuardConfig::from_home(&factory.home_dir);
@@ -871,6 +878,10 @@ impl AttemptRunner for ContainerAttemptRunner {
             match result {
                 Ok(output)=>{
                     incurred.wall_secs+=output.wall_secs;
+                    if family==super::attempt_adapter::RuntimeFamily::Codex && output.status.code()==Some(78)
+                        && output.stderr.contains("Codex MCP configuration refused:") {
+                        return Err(AttemptInfraError::RuntimeUnsupported(output.stderr.trim().into()));
+                    }
                     // The trusted PID 1 refused its own setup: retrying replays the same input.
                     if output.status.code()==Some(SUPERVISOR_SETUP_FAILED) && transcript.is_empty() && unparsable==0 {
                         return Err(AttemptInfraError::Spawn("attempt supervisor setup failed".into()));

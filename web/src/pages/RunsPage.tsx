@@ -30,7 +30,7 @@ import {
 import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { useDataScope, useVisibleAgents } from '@/lib/data-scope';
+import { useDataScope, useSelectableAgents } from '@/lib/data-scope';
 import {
   PageHeader,
   Badge,
@@ -110,12 +110,16 @@ export function RunsPage() {
   const agents = useAgentsStore((s) => s.agents);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const scope = useDataScope();
-  const visibleAgents = useVisibleAgents();
+  const visibleAgents = useSelectableAgents();
 
   // W3-3 / P11 (state-as-URL): the agent filter *lives* in `?agent=<id>` — the
   // URL is the state, not a copy of it, so a bookmarked/shared link opens the
   // same view and no mirror effect can fall out of sync.
-  const [agentFilter, setAgentFilter] = useUrlState('agent', '');
+  const [requestedAgent, setAgentFilter] = useUrlState('agent', '');
+  const agentFilter = scope === 'all' || visibleAgents.some(a => a.name === requestedAgent) ? requestedAgent : '';
+  useEffect(() => {
+    if (requestedAgent !== agentFilter) setAgentFilter(agentFilter);
+  }, [requestedAgent, agentFilter, setAgentFilter]);
   const [runState, setRunState] = useState<{key:string;rows:RunSummary[]} | null>(null);
   const [listError, setListError] = useState<unknown>(null);
   const [listLoaded, setListLoaded] = useState(false);

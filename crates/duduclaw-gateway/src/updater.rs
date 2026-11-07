@@ -13,7 +13,7 @@
 //! - [H5] Separate archive, binary and total decompression limits [R2:NC2]
 //! - [M1] release_notes truncated to 8 KB
 //! - [M3] Pre-release tag tolerance in semver comparison
-//! - [M4] All filesystem ops use `tokio::fs` (async)
+//! - [M4] Binary replacement runs on the blocking pool (including fsync)
 //! - [R2:NH3] Reject absolute paths, symlinks, hard links in tar/zip
 //! - [R2:NH4] Cleanup tmp on set_permissions failure
 //! - [R2:NM2] Redirect policy with URL re-validation
@@ -37,11 +37,17 @@ const GITHUB_REPO: &str = "zhixuli0406/DuDuClaw";
 pub(crate) const UPDATE_PUBKEY: &str = duduclaw_core::publishers::OFFICIAL_PUBLISHER_KEY;
 #[path = "updater/protected_release.rs"]
 mod protected_release;
+mod failure;
+pub use failure::{failure_kind, failure_payload, failure_response, sanitize_failure_detail};
+#[path = "updater/release_identity.rs"]
+mod release_identity;
 pub use protected_release::download_protected_release;
+pub use release_identity::{VerifiedReleaseIdentity, verify_release_archive_with_pubkey};
 
 /// Current version: prefers build-time `DUDUCLAW_VERSION` env (set by Pro build script),
 /// then runtime `DUDUCLAW_VERSION` env, finally falls back to this crate's `CARGO_PKG_VERSION`.
 pub fn current_version() -> &'static str {
+    release_identity::retain_release_version();
     // 1. Build-time override (Pro binary sets this via build.rs / cargo env)
     if let Some(v) = option_env!("DUDUCLAW_VERSION") {
         return v;
@@ -294,7 +300,7 @@ pub type ProgressSink<'a> = &'a (dyn Fn(UpdateProgress) + Send + Sync);
 ///
 /// Implementors are expected to reuse the machinery this module already
 /// exposes rather than re-implement it: [`with_retries`] +
-/// [`fetch_asset_bytes`] for downloads, [`verify_archive_with_pubkey`] for
+/// [`fetch_asset_bytes`] for downloads, [`verify_release_archive_with_pubkey`] for
 /// integrity (with their OWN pinned public key — never the CE
 /// `UPDATE_PUBKEY`), and [`install_verified_binary`] for the
 /// extract → verify-run → swap → cleanup sequence.
@@ -938,7 +944,7 @@ pub async fn apply_update_with_progress(
 
     // Download + verify, retrying ONLY download-class failures. A checksum or
     // signature failure aborts on the first attempt (fail-closed [S1][C1]).
-    let bytes = with_retries(
+    let (bytes, identity) = with_retries(
         &DOWNLOAD_RETRY_DELAYS_SECS,
         &|attempt, max_attempts| {
             on_progress(UpdateProgress {
@@ -952,7 +958,7 @@ pub async fn apply_update_with_progress(
     .await
     .map_err(|e| e.message)?;
 
-    install_archive_bytes(&bytes, &current_exe, exe_dir).await
+    install_archive_bytes(&bytes, &current_exe, exe_dir, &identity).await
 }
 
 /// Install an already-verified archive over the running binary: extract →
@@ -966,16 +972,27 @@ async fn install_archive_bytes(
     archive_bytes: &[u8],
     current_exe: &std::path::Path,
     exe_dir: &std::path::Path,
+    identity: &VerifiedReleaseIdentity,
 ) -> Result<ApplyResult, String> {
-    // Stream into a private, exclusively created staging file; never buffer the binary.
-    let mut staged = tempfile::Builder::new().prefix(".duduclaw-update-")
-        .tempfile_in(exe_dir).map_err(|e| format!("Failed to stage binary: {e}"))?;
-    extract_binary_to(archive_bytes, archive_binary_name(current_exe), staged.as_file_mut())?;
+    identity.check_archive(archive_bytes)
+        .map_err(|e| format!("Update verification failed: {e}"))?;
+    // Stream into a same-directory, exclusively created staging file; never buffer the binary.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".duduclaw-update-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o755));
+    }
+    let mut staged = builder.tempfile_in(exe_dir)
+        .map_err(|e| format!("Failed to stage binary: {e}"))?;
+    extract_binary_to(archive_bytes, archive_binary_name(current_exe), staged.as_file_mut())
+        .map_err(|e| format!("Update extraction failed: {e}"))?;
     staged.as_file().sync_all().map_err(|e| format!("Failed to sync binary: {e}"))?;
     let tmp_path = staged.into_temp_path();
 
     // [R2:NH4] From here on, any error must clean up tmp_path
-    let result = apply_update_inner(&tmp_path, current_exe, exe_dir).await;
+    let result = apply_update_inner(&tmp_path, current_exe, exe_dir, identity.version()).await;
     if result.is_err() {
         let _ = tokio::fs::remove_file(&tmp_path).await;
     }
@@ -986,9 +1003,10 @@ async fn install_archive_bytes(
 /// of an [`UpdateProvider`], shared with the CE path so both go through exactly
 /// one swap implementation.
 ///
-/// `archive_bytes` MUST already have passed integrity verification (see
-/// [`verify_archive_with_pubkey`]); this function does not and cannot know which
-/// key the caller's channel is pinned to.
+/// `identity` must come from [`verify_release_archive_with_pubkey`] using the
+/// provider's pinned key and expected release version/file. It is bound to the
+/// archive digest; another archive cannot reuse it. Binary version verification
+/// is mandatory before backup or replacement.
 ///
 /// Two environment gates fire first, both fail-closed:
 /// 1. **Container** — an image is immutable, so an in-process swap is silently
@@ -997,7 +1015,7 @@ async fn install_archive_bytes(
 /// 2. **Directory permissions** — the same [`duduclaw_core::platform::is_unsafe_update_dir`]
 ///    gate the CE path applies, so a world-writable install directory cannot be
 ///    used to land a binary.
-pub async fn install_verified_binary(archive_bytes: &[u8]) -> Result<ApplyResult, String> {
+pub async fn install_verified_binary(archive_bytes: &[u8], identity: &VerifiedReleaseIdentity) -> Result<ApplyResult, String> {
     if is_native_protected_install() { return Err(NATIVE_PROTECTED_UPDATE_HINT.into()); }
     if is_containerized() {
         return Err(
@@ -1032,7 +1050,7 @@ pub async fn install_verified_binary(archive_bytes: &[u8]) -> Result<ApplyResult
         ));
     }
 
-    install_archive_bytes(archive_bytes, &current_exe, exe_dir).await
+    install_archive_bytes(archive_bytes, &current_exe, exe_dir, identity).await
 }
 
 /// Fetch a release asset body once, classifying every failure. Network errors
@@ -1118,6 +1136,7 @@ pub fn verify_archive_with_pubkey(
 /// CE-channel integrity check: [`verify_archive_with_pubkey`] against the
 /// pinned [`UPDATE_PUBKEY`], with every failure classified
 /// [`FailureClass::Fatal`] for the retry loop.
+#[cfg(test)]
 fn verify_archive_integrity(
     bytes: &[u8],
     checksum_text: &str,
@@ -1134,7 +1153,12 @@ async fn download_and_verify_once(
     download_url: &str,
     checksum_url: &str,
     signature_url: &str,
-) -> Result<Vec<u8>, StageError> {
+) -> Result<(Vec<u8>, VerifiedReleaseIdentity), StageError> {
+    let (version, file) = release_identity::release_identity(download_url)
+        .map_err(|e| StageError::fatal(format!("Update verification failed: {e}")))?;
+    if checksum_url != format!("{download_url}.sha256") || signature_url != format!("{download_url}.minisig") {
+        return Err(StageError::fatal("Update verification failed: Release sidecars must match the archive URL"));
+    }
     let bytes = fetch_asset_bytes(client, download_url, "Update archive").await?;
     info!(size = bytes.len(), "Download complete");
 
@@ -1147,8 +1171,10 @@ async fn download_and_verify_once(
     let sig_bytes = fetch_asset_bytes(client, signature_url, "Signature file").await?;
     let sig_text = String::from_utf8_lossy(&sig_bytes).into_owned();
 
-    verify_archive_integrity(&bytes, &checksum_text, &sig_text)?;
-    Ok(bytes)
+    let identity = verify_release_archive_with_pubkey(&bytes, &checksum_text, &sig_text,
+        UPDATE_PUBKEY, &version, &file)
+        .map_err(|e| StageError::fatal(format!("Update verification failed: {e}")))?;
+    Ok((bytes, identity))
 }
 
 /// Inner apply logic after tmp file is written. Caller cleans up tmp on error.
@@ -1156,6 +1182,7 @@ async fn apply_update_inner(
     tmp_path: &std::path::Path,
     current_exe: &std::path::Path,
     _exe_dir: &std::path::Path,
+    expected_version: &str,
 ) -> Result<ApplyResult, String> {
     // Set executable permissions [M4]
     duduclaw_core::platform::set_executable(tmp_path)
@@ -1180,6 +1207,8 @@ async fn apply_update_inner(
     match verify {
         Ok(output) if output.status.success() => {
             let version_out = String::from_utf8_lossy(&output.stdout);
+            release_identity::verify_binary_version_output(&version_out, expected_version)
+                .map_err(|e| format!("Update verification failed: {e}"))?;
             info!(version = %version_out.trim(), "New binary verified");
         }
         Ok(output) => {
@@ -1191,43 +1220,15 @@ async fn apply_update_inner(
         }
     }
 
-    // [H4] Remove old backup if it exists
-    // [R3:M3] Use OsString to avoid lossy conversion on non-UTF-8 paths
-    let mut backup_os = current_exe.as_os_str().to_owned();
-    backup_os.push(".bak");
-    let backup_path = PathBuf::from(backup_os);
-    if backup_path.exists() {
-        let _ = tokio::fs::remove_file(&backup_path).await;
-    }
-
-    // Backup current binary
-    if let Err(e) = tokio::fs::rename(current_exe, &backup_path).await {
-        return Err(format!("Failed to backup current binary: {e}"));
-    }
-
-    // Move new binary into place
-    if let Err(e) = tokio::fs::rename(tmp_path, current_exe).await {
-        warn!("Failed to install new binary, rolling back: {e}");
-        // [R3:H2] Rollback — report failure explicitly if rollback also fails
-        if let Err(rb_err) = tokio::fs::rename(&backup_path, current_exe).await {
-            tracing::error!(
-                backup = %backup_path.display(),
-                target = %current_exe.display(),
-                rollback_error = %rb_err,
-                "CRITICAL: rollback failed — binary is at backup path, manual recovery needed"
-            );
-            return Err(format!(
-                "Failed to install AND rollback failed: {e}. Binary is at: {}. Manual recovery required: {rb_err}",
-                backup_path.display()
-            ));
-        }
-        return Err(format!(
-            "Failed to install new binary (rolled back successfully): {e}"
-        ));
-    }
-
-    // [H4] Clean up backup
-    let _ = tokio::fs::remove_file(&backup_path).await;
+    // Flush permissions as well as contents, preserve the old binary, then
+    // replace the install path without first removing it on Unix.
+    let staged = tmp_path.to_path_buf();
+    let target = current_exe.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        duduclaw_core::binary_replace::replace_verified_binary(&staged, &target)
+    })
+    .await
+    .map_err(|e| format!("Binary replacement task panicked: {e}"))??;
 
     info!("Update installed successfully, restart required");
 
@@ -1237,6 +1238,34 @@ async fn apply_update_inner(
         needs_restart: true,
         restart_hint: macos_launchd_restart_hint(),
     })
+}
+
+/// Called only after a successful verified install (or the explicit on-disk
+/// update restart gate). A launchd helper owns shutdown; never exec on failure.
+pub async fn restart_after_update() {
+    #[cfg(target_os = "macos")]
+    match duduclaw_core::autostart::update_restart::schedule_if_managed(
+        detect_install_method() == InstallMethod::Desktop,
+    ).await {
+        Ok(true) => {
+            info!("Update installed — independent launchd helper scheduled to re-register and restart gateway");
+            // If launchd accepts the plist but cannot execute the new binary,
+            // no helper can write its own failure log. This old process remains
+            // alive and supplies the manual recovery hint after the deadline.
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(100)).await;
+                warn!("Update installed successfully, restart required; launchd relaunch did not stop this gateway; run `duduclaw service restart`");
+            });
+            return;
+        }
+        Err(error) => {
+            warn!(%error, "Update installed successfully, restart required; run `duduclaw service restart`");
+            return;
+        }
+        Ok(false) => {}
+    }
+    duduclaw_core::platform::request_restart_after_shutdown();
+    duduclaw_core::platform::self_interrupt();
 }
 
 pub fn macos_launchd_restart_hint() -> Option<&'static str> {
@@ -1250,6 +1279,60 @@ pub fn macos_launchd_restart_hint() -> Option<&'static str> {
     }
     #[cfg(not(target_os = "macos"))]
     { None }
+}
+
+#[cfg(all(test, unix))]
+mod atomic_install_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn atomic_install_replaces_verified_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("duduclaw");
+        let staged = dir.path().join("new");
+        std::fs::write(&target, b"old binary").unwrap();
+        let script = b"#!/bin/sh\necho duduclaw 1.80.0\n";
+        std::fs::write(&staged, script).unwrap();
+        let result = apply_update_inner(&staged, &target, dir.path(), "1.80.0").await.unwrap();
+        assert!(result.success && result.needs_restart);
+        assert_eq!(std::fs::read(target).unwrap(), script);
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn atomic_install_version_mismatch_reaches_dashboard_without_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("duduclaw");
+        let staged = dir.path().join("new");
+        std::fs::write(&target, b"old binary").unwrap();
+        std::fs::write(&staged, b"#!/bin/sh\necho duduclaw 1.79.3\n").unwrap();
+        let error = apply_update_inner(&staged, &target, dir.path(), "1.80.0").await.unwrap_err();
+        assert!(error.contains("version mismatch"));
+        let payload = failure_payload(&error);
+        assert_eq!(payload["kind"], "verify");
+        let wire = serde_json::to_value(failure_response(&error)).unwrap();
+        assert_eq!(wire["error"], payload);
+        let event = crate::protocol::WsFrame::event("system.update_failed", payload.clone());
+        assert_eq!(serde_json::to_value(event).unwrap()["payload"], payload);
+        assert_eq!(std::fs::read(&target).unwrap(), b"old binary");
+        assert!(!target.with_extension("bak").exists());
+        assert!(staged.exists());
+    }
+
+    #[tokio::test]
+    async fn atomic_install_failed_verification_keeps_old_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("duduclaw");
+        let staged = dir.path().join("new");
+        std::fs::write(&target, b"old binary").unwrap();
+        std::fs::write(&staged, b"#!/bin/sh\nexit 1\n").unwrap();
+        let error = apply_update_inner(&staged, &target, dir.path(), "1.80.0").await.unwrap_err();
+        assert!(error.contains("verification failed"));
+        assert_eq!(failure_payload(&error)["kind"], "verify");
+        assert_eq!(std::fs::read(target).unwrap(), b"old binary");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
 }
 
 #[cfg(test)]
@@ -1813,6 +1896,60 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         }
     }
 
+    #[tokio::test]
+    async fn updater_install_failure_reaches_dashboard_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("duduclaw");
+        let (archive, identity) = release_identity::tests::verified_fixture();
+        // A mismatched proof must fail before even trying to create a staging file.
+        let missing_dir = dir.path().join("missing");
+        let error = install_archive_bytes(b"not a gzip archive", &target, &missing_dir, &identity)
+            .await.unwrap_err();
+        assert_eq!(failure_payload(&error)["kind"], "verify");
+        assert!(error.contains("different archive"));
+        let payload = failure_payload(&error);
+        assert_eq!(serde_json::to_value(failure_response(&error)).unwrap()["error"], payload);
+        let event = crate::protocol::WsFrame::event("system.update_failed", payload.clone());
+        assert_eq!(serde_json::to_value(event).unwrap()["payload"], payload);
+        assert!(!missing_dir.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let corrupt = extract_binary_to(b"not a gzip archive", binary_name(), &mut Vec::new())
+            .unwrap_err();
+        assert_eq!(failure_payload(&format!("Update extraction failed: {corrupt}"))["kind"], "extract");
+        // The verified CE archive has no Pro entry: retain the install-path
+        // extraction failure and staging cleanup coverage behind the identity gate.
+        let pro_target = dir.path().join("duduclaw-pro");
+        let error = install_archive_bytes(archive, &pro_target, dir.path(), &identity)
+            .await.unwrap_err();
+        let payload = failure_payload(&error);
+        assert_eq!(payload["kind"], "extract");
+        assert_eq!(payload["detail"], error);
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let missing_dir = dir.path().join("missing");
+        let error = install_archive_bytes(archive, &target, &missing_dir, &identity).await.unwrap_err();
+        assert_eq!(failure_payload(&error)["kind"], "write");
+        assert!(error.starts_with("Failed to stage binary:"));
+    }
+
+    #[test]
+    fn updater_write_failure_reaches_dashboard_payload() {
+        struct DiskFull;
+        impl std::io::Write for DiskFull {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let error = copy_binary(&mut b"binary".as_slice(), &mut DiskFull, 100).unwrap_err();
+        assert_eq!(failure_payload(&error)["kind"], "write");
+        assert!(failure_payload(&error)["detail"].as_str().unwrap().contains("disk full"));
+        let size_error = copy_binary(&mut b"binary".as_slice(), &mut Vec::new(), 1).unwrap_err();
+        assert_eq!(failure_payload(&size_error)["kind"], "size");
+    }
+
     #[test]
     fn updater_tar_budget_walks_entries_after_binary() {
         use std::io::Write;
@@ -2231,9 +2368,10 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
     async fn install_verified_binary_refuses_inside_container() {
         let prev = std::env::var("DUDUCLAW_IN_CONTAINER").ok();
         unsafe { std::env::set_var("DUDUCLAW_IN_CONTAINER", "1") };
-        // Garbage bytes: the container gate must fire BEFORE any extraction, so
-        // the error is the container refusal, never "binary not found in archive".
-        let err = install_verified_binary(b"not an archive")
+        // The container gate must fire before extraction, even with an authentic
+        // release identity.
+        let (bytes, identity) = release_identity::tests::verified_fixture();
+        let err = install_verified_binary(bytes, &identity)
             .await
             .unwrap_err();
         match prev {

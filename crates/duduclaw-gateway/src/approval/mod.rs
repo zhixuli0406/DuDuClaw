@@ -111,6 +111,7 @@ fn masked_approval_value(value: &Value) -> Value {
 // ── Types ───────────────────────────────────────────────────
 
 pub mod action_grant;
+pub(crate) mod mail_requester;
 pub(crate) mod cli_egress;
 mod action_guard;
 mod binding;
@@ -120,6 +121,8 @@ pub mod policy_snapshot;
 mod delivery;
 pub(crate) use delivery::{CURRENT_TRUSTED_REPLY_TARGET, TrustedReplyTarget, scope_trusted_reply};
 mod broker;
+mod ag_ui;
+pub(crate) use ag_ui::same_ag_ui_request;
 mod turn_origin;
 pub(crate) use turn_origin::scope_turn;
 pub(crate) use binding::require_current_dashboard_role_in_home;
@@ -131,7 +134,7 @@ pub use workflow_grants::{
     RevisionGrantReadError,
 };
 pub use binding::{
-    CURRENT_DECISION_CONTEXT, DecisionContext, ExecutionBinding, RequestKind, payload_hash,
+    CURRENT_DECISION_CONTEXT, ConversationAudience, DecisionContext, ExecutionBinding, RequestKind, payload_hash,
     policy_revision, strict_policy_revision, WORKFLOW_ACTIVATION_KIND,
 };
 pub use operations::{OPERATION_LEASE_HELD, OperationClaim, OperationRecord, OperationState};

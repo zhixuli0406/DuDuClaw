@@ -31,7 +31,7 @@ async fn fixture(main_role: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().canonicalize().unwrap();
     let handler = MethodHandler::new(home.clone()).await;
-    handler.set_edition_override(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
     let system = UserContext::admin_fallback();
     for (id, role) in [("a1", if main_role { "main" } else { "specialist" }), ("z1", "specialist")] {
         ok(handler.handle_agents_create_as(json!({"name": id, "role": role}), Some(&system)).await);
@@ -281,7 +281,7 @@ async fn agents_update_refuses_all_main_updates_even_with_owner_access() {
         }
         let owner = db.live_user_context(&f.employee.user_id).unwrap().unwrap();
         for edition in [duduclaw_core::EditionProfile::Enterprise, duduclaw_core::EditionProfile::Personal] {
-            f.handler.set_edition_override(Some(edition)).await;
+            f.handler.set_test_edition(Some(edition)).await;
             let path = f.home.join("agents/a1/agent.toml");
             let before = std::fs::read(&path).unwrap();
             for fields in [
@@ -381,6 +381,7 @@ async fn bound_approval_decisions_gate_main_before_the_early_return() {
         for agent in ["a1", "z1"] {
             let payload = json!({"name": "test_effect"});
             let binding = ExecutionBinding {
+                conversation_audience: Default::default(),
                 schema_version: 1,
                 run_id: uuid::Uuid::new_v4().to_string(),
                 run_origin_kind: "ingress".into(),

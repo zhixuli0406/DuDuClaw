@@ -178,7 +178,7 @@ impl MethodHandler {
             .collect();
         WsFrame::ok_response(
             "",
-            json!({ "agents": agents, "default_agent": default_id }),
+            json!({ "agents": agents, "default_agent": default_id, "unrestricted": ctx.is_admin() }),
         )
     }
 }

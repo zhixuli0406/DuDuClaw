@@ -19,16 +19,35 @@ impl RegistryBoundary {
             server: server.into(),
             turn: crate::runtime_turn::current().or_else(||
                 duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(Clone::clone).ok().flatten()),
-            // This registry's public schemas do not retain MCP annotations.
-            // The existing decision therefore uses the conservative Modify
-            // class, while exact tool action rules remain effective.
-            gate: crate::third_party_tools::ThirdPartyGate::new(home, agent, server, "tool_loop"),
+            gate: crate::third_party_tools::ThirdPartyGate::with_lane(
+                home, agent, server, "tool_loop",
+                if crate::explore_lane::in_explore() {
+                    duduclaw_core::ProcessLane::Explore
+                } else {
+                    duduclaw_core::ProcessLane::Normal
+                },
+            ),
         }
     }
 }
 
 #[async_trait::async_trait]
 impl ClientCallBoundary for RegistryBoundary {
+    fn filter_tools(&self, tools: &mut Vec<duduclaw_llm::McpToolDef>) -> Result<(), String> {
+        let mut result = serde_json::json!({"tools": tools.iter().map(|tool| {
+            serde_json::json!({
+                "name": tool.name, "description": tool.description,
+                "annotations": tool.annotations,
+            })
+        }).collect::<Vec<_>>()});
+        self.gate.filter_list_result(&mut result);
+        let allowed: std::collections::HashSet<&str> = result["tools"].as_array()
+            .ok_or_else(|| "Third-party MCP listing could not be gated".to_string())?
+            .iter().filter_map(|tool| tool["name"].as_str()).collect();
+        tools.retain(|tool| allowed.contains(tool.name.as_str()));
+        Ok(())
+    }
+
     async fn before_call(&self, tool: &str, args: &Value) -> Result<(), String> {
         let taint = crate::egress_guard::query_turn(&self.agent, self.turn.as_deref());
         self.gate.check_call_with_taint(tool, args, taint).await.map(|_| ())
@@ -59,14 +78,20 @@ impl ClientCallBoundary for RegistryBoundary {
                 return Err(reason);
             }
         };
+        let effect = self.gate.decide(tool).0;
         if let Err(reason) = crate::recipient_guard::confirm_unadapted_effect(
-            &self.home, &self.agent, &label, duduclaw_core::ToolEffect::Modify, approved.as_ref(),
+            &self.home, &self.agent, &label, effect, approved.as_ref(),
         ) {
             if reserved { let _ = crate::egress_guard::finish_turn(&self.agent, self.turn.as_deref(), &id, false); }
             return Err(reason);
         }
-        // Registry schemas do not retain annotations: every call is both a
-        // private read and a conservative sink. Recheck after any approval wait.
+        // Read tools keep the private-read reservation without acquiring a
+        // sink lease. Upstream hints always remain at least Modify in ThirdPartyGate.
+        if effect == duduclaw_core::ToolEffect::Read {
+            crate::credential_declaration::observe_arguments(&self.home, &self.agent, args).await;
+            return Ok((reserved.then_some(id), None));
+        }
+        // Recheck sinks after any approval wait.
         let (lease, taint) = match crate::egress_client::SinkLease::direct(
             &self.home, &self.agent, self.turn.as_deref(), read_id,
         ) {
@@ -141,6 +166,85 @@ impl ClientCallBoundary for RegistryBoundary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn external_listing() -> Vec<duduclaw_llm::McpToolDef> {
+        duduclaw_llm::parse_tools_list_response(&serde_json::json!({"result": {"tools": [
+            {"name": "get", "annotations": {"readOnlyHint": true}},
+            {"name": "put"},
+            {"name": "drop", "annotations": {"destructiveHint": true}}
+        ]}})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn external_stdio_and_http_annotations_gate_listing_and_calls() {
+        for transport in ["command='never-spawn-test'", "url='https://example.invalid/mcp'"] {
+            let home = tempfile::tempdir().unwrap();
+            let dir = home.path().join("agents/bot");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='off'\nrecipient_guard='off'\n").unwrap();
+            std::fs::write(dir.join("agent.toml"), format!(
+                "[capabilities]\ntrusted_read_hint_servers=['crm']\naction_rules=[{{effect='delete',verdict='block'}},{{effect='modify',verdict='block'}}]\n[[mcp.external]]\nname='crm'\n{transport}\n",
+            )).unwrap();
+            let servers = crate::mcp_external::load_external_mcp_servers(&dir);
+            assert_eq!(servers.len(), 1);
+            let boundary = RegistryBoundary::new(home.path(), "bot", &servers[0].name);
+            let mut tools = external_listing();
+            boundary.filter_tools(&mut tools).unwrap();
+            assert!(tools.is_empty());
+            assert_eq!(boundary.gate.decide("get").0, duduclaw_core::ToolEffect::Modify);
+            assert_eq!(boundary.gate.decide("drop").0, duduclaw_core::ToolEffect::Delete);
+            for name in ["get", "put", "drop", "invented"] {
+                assert!(boundary.before_call(name, &serde_json::json!({})).await.is_err(), "{name}");
+            }
+            // Removing the inert legacy trust list cannot weaken enforcement.
+            std::fs::write(dir.join("agent.toml"), "[capabilities]\naction_rules=[{effect='modify',verdict='block'}]\n").unwrap();
+            assert!(boundary.before_call("get", &serde_json::json!({})).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn external_explore_rejects_read_claims_even_with_legacy_trust() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/bot");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[capabilities]\ntrusted_read_hint_servers=['crm']\n").unwrap();
+        let boundary = crate::explore_lane::EXPLORE.scope(true, async {
+            RegistryBoundary::new(home.path(), "bot", "crm")
+        }).await;
+        let mut tools = external_listing();
+        boundary.filter_tools(&mut tools).unwrap();
+        assert!(tools.is_empty());
+        let untrusted = crate::explore_lane::EXPLORE.scope(true, async {
+            RegistryBoundary::new(home.path(), "bot", "other")
+        }).await;
+        let mut tools = external_listing();
+        untrusted.filter_tools(&mut tools).unwrap();
+        assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn external_read_claim_with_legacy_trust_still_holds_a_sink_lease() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = format!("read-claim-{}", uuid::Uuid::new_v4());
+        let turn = uuid::Uuid::new_v4().to_string();
+        let dir = home.path().join("agents").join(&agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[capabilities]\ntrusted_read_hint_servers=['crm']\n").unwrap();
+        std::fs::write(home.path().join("config.toml"), "[security]\negress_guard='block'\nrecipient_guard='off'\n").unwrap();
+        crate::egress_guard::register_turn(&agent, &turn);
+        let boundary = RegistryBoundary {
+            home: home.path().into(), agent: agent.clone(), server: "crm".into(), turn: Some(turn.clone()),
+            gate: crate::third_party_tools::ThirdPartyGate::new(home.path(), &agent, "crm", "tool_loop"),
+        };
+        boundary.filter_tools(&mut external_listing()).unwrap();
+        let (read, lease) = boundary.begin_scoped_call("get", &serde_json::json!({})).await.unwrap();
+        let lease = lease.expect("upstream read-only claims must acquire a sink lease");
+        assert!(crate::egress_guard::reserve_turn(home.path(), &agent, Some(&turn), "memory_read", "during").is_err());
+        boundary.finish_call("get", read.as_deref(), false).await.unwrap();
+        drop(lease);
+        crate::egress_guard::reserve_turn(home.path(), &agent, Some(&turn), "memory_read", "after").unwrap();
+        crate::egress_guard::finish_turn(&agent, Some(&turn), "after", false).unwrap();
+    }
 
     #[tokio::test]
     async fn external_mount_marks_the_same_turn_and_blocks_next_call() {

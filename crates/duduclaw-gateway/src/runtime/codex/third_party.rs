@@ -14,9 +14,9 @@
 //! third-party tool gate always on): stdio servers run through `duduclaw
 //! mcp-proxy` (classification from annotations, `action_rules`, explore
 //! lane, approvals; redaction when active), DuDuClaw's remote bridges gate
-//! themselves, and direct URL entries are removed. Anything else the rewrite
-//! leaves behind (an entry without a command, a name that is not a bare TOML
-//! key) is dropped, never handed to Codex unproxied.
+//! themselves, and direct URL entries are removed. Unknown transports, including
+//! entries without a command or URL, refuse the spawn. Valid transports with a
+//! name that is not a bare TOML key are dropped, never handed to Codex unproxied.
 //!
 //! Codex runs with `approval_policy=never`, so each of these servers is
 //! registered with `default_tools_approval_mode = "auto"`, like the duduclaw
@@ -53,6 +53,8 @@ pub(crate) use crate::runtime::third_party_mcp::{GatedServer, gated_servers_for_
 /// the `-c` overrides, which Codex merges over this table. A manual `codex`
 /// run from this file alone starts the server without its declared env. The
 /// explore lane is per spawn and also travels only in the `-c` overrides.
+/// Native bridge identity tokens are also per-spawn only, including tokens on
+/// a redaction proxy wrapping a bridge; never persist them in this table.
 pub(crate) fn file_entries(servers: &BTreeMap<String, GatedServer>) -> HashMap<String, Value> {
     servers
         .iter()
@@ -60,7 +62,8 @@ pub(crate) fn file_entries(servers: &BTreeMap<String, GatedServer>) -> HashMap<S
             let env: BTreeMap<&String, &String> = s
                 .env
                 .iter()
-                .filter(|(k, _)| k.as_str() != PROXY_UPSTREAM_ENV_VAR)
+                .filter(|(k, _)| k.as_str() != PROXY_UPSTREAM_ENV_VAR
+                    && !k.eq_ignore_ascii_case(duduclaw_core::ENV_AGENT_TOKEN))
                 .collect();
             (
                 name.clone(),

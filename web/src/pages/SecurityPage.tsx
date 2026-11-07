@@ -13,7 +13,9 @@ import { useAuthStore } from '@/stores/auth-store';
 import { CredentialInventoryPanel } from '@/components/CredentialInventoryPanel';
 import { CredentialProtectionPanel } from '@/components/CredentialProtectionPanel';
 import { WebsiteCredentialsPanel } from '@/components/WebsiteCredentialsPanel';
+import { AdminMfa } from '@/components/mfa/AdminMfa';
 import { ForgetReceiptsPanel } from '@/components/ForgetReceiptsPanel';
+import { RememberedSessionPolicy } from '@/components/mfa/RememberedSessionPolicy';
 import { toast, formatError } from '@/lib/toast';
 import {
   TRIGGER_KEYS,
@@ -146,6 +148,7 @@ export function SecurityPage() {
           single-owner Personal install as to an Enterprise one, so unlike the
           cards below it does not fold behind the Personal AdvancedSection. */}
       <CredentialHygienePanel onGoToAccounts={() => navigate('/app/system/accounts')} />
+      <RememberedSessionPolicy />
 
       {/* Credential inventory (WP-H1 P1) — sits directly under hygiene because
           the two answer adjacent questions: hygiene says what is wrong, the
@@ -179,6 +182,8 @@ export function SecurityPage() {
       <EgressGuardSection status={status} onSaved={refreshSecurityStatus} />
 
       <ForgetReceiptsPanel />
+
+      {isPersonal && <AdminMfa />}
 
       {isPersonal ? (
         // Personal: everything left (audit log + kill switch) is an
@@ -681,6 +686,10 @@ function AuditRow({ event }: { event: AuditEvent }) {
             {event.event_type}
           </span>
           <Badge variant={badge.variant} className={badge.className}>{event.severity}</Badge>
+          {['engine_socket_policy_change_requested', 'engine_socket_policy_changed', 'engine_socket_warning_started', 'engine_socket_warning_ended'].includes(event.event_type)
+            && (event.details?.policy_event_source === 'root' || event.details?.policy_event_source === 'runtime') && (
+            <Badge variant="secondary">{String(event.details.policy_event_source)}</Badge>
+          )}
           {event.agent_id && (
             <span className="flex items-center gap-1 text-xs text-muted-foreground">
               <ActorAvatar actorType="agent" name={event.agent_id} size="xs" />
@@ -730,6 +739,7 @@ function EgressGuardSection({ status, onSaved }: { status: SecurityStatus | null
   const form = useConfigForm((tables) => ({
     'security.egress_guard': tables.security?.egress_guard ?? 'shadow',
     'security.recipient_guard': tables.security?.recipient_guard ?? 'shadow',
+    'security.mail_requester_approval': tables.security?.mail_requester_approval ?? true,
   }));
   const mode = vStr(form.values, 'security.egress_guard');
   const modes = ['off', 'shadow', 'ask', 'block'];
@@ -757,6 +767,16 @@ function EgressGuardSection({ status, onSaved }: { status: SecurityStatus | null
           disabled={!form.loaded || form.saving || form.loadError != null}
         />
         <p className="text-xs text-muted-foreground">{t('security.recipient.description')}</p>
+        <div className="flex items-center justify-between gap-3">
+          <label htmlFor="mail-requester-approval" className="text-sm">{t('security.mailRequester.label')}</label>
+          <Switch
+            id="mail-requester-approval"
+            checked={form.values['security.mail_requester_approval'] === true}
+            onCheckedChange={(value) => form.set('security.mail_requester_approval', value)}
+            disabled={!form.loaded || form.saving || form.loadError != null}
+          />
+        </div>
+        <p className="text-xs text-muted-foreground">{t('security.mailRequester.description')}</p>
         {status?.egress_bash_exposure && status.egress_bash_exposure.length > 0 && (
           <div role="alert" className="space-y-2 rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm">
             <p>{t('security.egress.bashWarning')}</p>

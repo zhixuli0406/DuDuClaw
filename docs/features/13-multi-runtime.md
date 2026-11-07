@@ -1,6 +1,10 @@
 # Multi-Runtime Agent Execution
 
+**Codex external configuration gate (since v1.80.0):** Employees, Explore, utility, Task Sandbox and Discovery may run when external layers are absent or define no MCP servers; detected MCP or unreadable/unparseable existing layers refuse launch with the source named. A refused explicit Codex judge fails acceptance without retrying the default judge. This checks a local/cache snapshot before launch, not complete isolation from subsequent cloud refresh. See [checked sources and limits](../architecture/extension-gates.md).
+
 > One platform, eleven runtime ids: ten CLI backends (Claude, Codex, Grok, Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode) plus `openai_compat`, which talks HTTP to any OpenAI-compatible endpoint.
+
+Managed Claude spawns use only a temporary, strict MCP configuration, even when it contains only built-in tools. Managed Grok spawns refuse unmanaged project MCP entries and global MCP definitions under the actual `HOME` or `GROK_HOME`; unreadable configurations also refuse the spawn. The effective Grok configuration root must be absolute; correct a relative `HOME` or `GROK_HOME` before retrying. Existing files are preserved: move the server definitions into the employee MCP configuration before retrying. Standalone CLI runs and native tools remain outside this boundary.
 
 ## Failure provenance and explicit fallback
 
@@ -245,7 +249,7 @@ Background decision checks, instruction pinning, fact extraction and conversatio
 
 Claude utility calls clear the inherited environment, apply the shared spawn allowlist, then inject only the Anthropic API key from the same credential source as the normal no-rotation Claude spawn (OAuth keeps its usual HOME/keychain/config directory). They use the lightweight lane and do not enter account rotation. Normal chat retains its existing account rotation.
 
-Utility calls, including classifiers and judges, use a dedicated execution profile. Claude uses the tool-free, single-turn lightweight lane; OpenAI-compatible APIs send one completion without tools and never enter the tool loop. Codex uses a restricted profile: a read-only sandbox, no DuDuClaw MCP overrides, a fresh owner-only empty temporary working directory, ignored user config, and no persisted session. The temporary directory is removed after the call, including errors and timeouts; the system prompt travels in the prompt without writing `AGENTS.md`. This also applies to explicit Codex judge and team-verifier hints. Grok and generic CLIs remain unsupported for utility execution, so employee background work resolves to the global utility provider/model (default Claude / `claude-haiku-4-5`), with one warning per employee/runtime. The global provider must be Claude, Codex or OpenAI-compatible; an unsupported global provider or explicit hint is refused. Existing higher-level judge degradation may retry without an unsupported hint, subject to these same profiles. Codex may retain built-in reading tools; see [Security defense](05-security-defense.md) for the residual risk.
+Utility calls, including classifiers and judges, use a dedicated execution profile. Claude uses the tool-free, single-turn lightweight lane; OpenAI-compatible APIs send one completion without tools and never enter the tool loop. Codex uses a restricted profile: a read-only sandbox, no DuDuClaw MCP overrides, a fresh owner-only empty temporary working directory, ignored user config, and no persisted session. The temporary directory is removed after the call, including errors and timeouts; the system prompt travels in the prompt without writing `AGENTS.md`. This also applies to explicit Codex judge and team-verifier hints. Grok and generic CLIs remain unsupported for utility execution, so employee background work resolves to the global utility provider/model (default Claude / `claude-haiku-4-5`), with one warning per employee/runtime. The global provider must be Claude, Codex or OpenAI-compatible; an unsupported global provider or explicit hint is refused. An explicit Codex judge refusal fails acceptance without retrying the default judge; other providers retain existing degradation rules. Codex may retain built-in reading tools; see [Security defense](05-security-defense.md) for the residual risk.
 
 The scheduled session summarizer and auto-titler apply the same utility provider selection and global fallback to the session owner. The stored owner must not begin with `_` or `.` and must name a non-reserved, existing employee with a matching `agent.toml`, in a non-symlink direct child of the canonical `<home>/agents` directory. A nonempty invalid owner skips the utility call with an error; only an empty owner uses the global utility settings. Protected summary sections remain excluded from the model prompt and are preserved verbatim with the existing cap. Explicit utility-model mismatches keep the saved value and emit one warning per agent/model. Agent-less work uses `[runtime] utility_provider` / `utility_model`, now editable in Settings → Advanced → System.
 
@@ -554,15 +558,13 @@ already holds), never the agent token. The upstream server starts from the
 agent-CLI allowlisted environment plus its declared env, so the CLI's own
 vendor key (`XAI_API_KEY`) does not reach it.
 
-Known limits: any entry in `.grok/config.toml` that DuDuClaw did not write (other than `duduclaw`)
-is kept as written and logged as a warning on every spawn, and the CLI starts
-it without the proxy; in a borrowed work root two employees with a server of
+Managed spawns refuse entries in `.grok/config.toml` that DuDuClaw did not write, preserving the file for operator migration. Known limits: in a borrowed work root two employees with a server of
 the same name share one entry, and the spawn that runs uses its own env file
 for it; a `.mcp.json` (or `.cursor/mcp.json`) changed between the spawn's read
 and Grok's own read is not covered; two server names that differ only in
 letter case refuse the spawn (they would share one env file on a
-case-insensitive disk); Grok's user-level `~/.grok/config.toml` is outside
-the employee directory and not shadowed. Grok's Claude- and Cursor-compat MCP
+case-insensitive disk). Global MCP entries under the actual `HOME` or
+`GROK_HOME` now refuse managed spawns instead of being started unguarded. Grok's Claude- and Cursor-compat MCP
 scanning (`~/.claude.json`, `~/.cursor/mcp.json`, `<cwd>/.cursor/mcp.json`) is
 switched off for every DuDuClaw spawn with `GROK_CLAUDE_MCPS_ENABLED=false` and
 `GROK_CURSOR_MCPS_ENABLED=false` (owner decision 2026-10-20; `grok inspect`

@@ -3,6 +3,7 @@
 set -euo pipefail
 umask 077
 project_id=''
+connection=http
 endpoint_url=''
 agent=''
 app_name=''
@@ -11,7 +12,7 @@ dry_run=false
 created_this_run=false
 usage() {
   cat <<'HELP'
-Usage: bootstrap.sh [--project-id ID]
+Usage: bootstrap.sh [--project-id ID] [--connection http|pubsub]
   [--endpoint-url HTTPS_URL] [--agent ID] [--app-name NAME] [--out DIR] [--dry-run]
 HTTP requires --endpoint-url. Requires bash, python3, and your own gcloud login.
 --dry-run prints commands without calling gcloud or writing files.
@@ -22,11 +23,11 @@ while (($#)); do
   case "$1" in
     --dry-run) dry_run=true; shift ;;
     --help|-h) usage; exit 0 ;;
-    --project-id|--endpoint-url|--agent|--app-name|--out)
+    --project-id|--connection|--endpoint-url|--agent|--app-name|--out)
       (($# >= 2)) || fail "$1 缺少值 / missing value"
       [[ -n "$2" && "$2" != --* ]] || fail "$1 缺少值 / missing value"
       case "$1" in
-        --project-id) project_id=$2 ;;
+        --project-id) project_id=$2 ;; --connection) connection=$2 ;;
         --endpoint-url) endpoint_url=$2 ;; --agent) agent=$2 ;;
         --app-name) app_name=$2 ;; --out) out=$2 ;;
       esac
@@ -34,13 +35,14 @@ while (($#)); do
     *) fail "未知參數 / unknown argument: $1" ;;
   esac
 done
+[[ "$connection" == http || "$connection" == pubsub ]] || fail 'connection 必須為 http 或 pubsub / expected http or pubsub'
 if [[ -z "$project_id" ]]; then
   project_id="duduclaw-chat-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
 fi
 [[ "$project_id" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] || fail '專案 ID 格式錯誤 / invalid project ID (6–30 lowercase letters, digits, hyphens)'
 [[ -z "$agent" || "$agent" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$ ]] || fail '員工 ID 格式錯誤 / invalid agent ID'
 command -v python3 >/dev/null || fail '請安裝 Python 3 / install Python 3'
-[[ -n "$endpoint_url" ]] || fail 'HTTP 需要 --endpoint-url / HTTP requires --endpoint-url'
+[[ "$connection" != http || -n "$endpoint_url" ]] || fail 'HTTP 需要 --endpoint-url / HTTP requires --endpoint-url'
 if [[ -n "$endpoint_url" ]]; then
   python3 -I - "$endpoint_url" <<'PY' || fail '請提供有效的公開 HTTPS URL（不可含帳密或片段）/ expected a valid public HTTPS URL without credentials or fragment'
 import sys, urllib.parse
@@ -65,6 +67,9 @@ def controls(value):
 sys.exit(1 if controls(name) or controls(path) or len(name) > 25 else 0)
 PYVALIDATE
 sa="duduclaw-chat@$project_id.iam.gserviceaccount.com"
+topic="projects/$project_id/topics/duduclaw-chat-events"
+subscription=''
+[[ "$connection" != pubsub ]] || subscription="projects/$project_id/subscriptions/duduclaw-chat-events-sub"
 print_command() { printf '%q ' "$@"; printf '\n'; }
 # Capture only command errors; never print key material or access tokens.
 gcloud_run() {
@@ -109,9 +114,27 @@ else
   fi
   [[ "$project_number" =~ ^[0-9]{6,20}$ ]] || fail '無法取得有效專案編號 / invalid project number'
 fi
-gcloud_run services enable chat.googleapis.com "--project=$project_id" --quiet
+apis=(chat.googleapis.com)
+[[ "$connection" != pubsub ]] || apis+=(pubsub.googleapis.com)
+gcloud_run services enable "${apis[@]}" "--project=$project_id" --quiet
 if "$dry_run" || ! gcloud iam service-accounts describe "$sa" "--project=$project_id" >/dev/null 2>&1; then
   gcloud_run iam service-accounts create duduclaw-chat "--display-name=$app_name" "--project=$project_id" --quiet
+fi
+if [[ "$connection" == pubsub ]]; then
+  # Verify resources and grants before creating any private key.
+  if "$dry_run" || ! gcloud pubsub topics describe "$topic" "--project=$project_id" >/dev/null 2>&1; then
+    gcloud_run pubsub topics create "$topic" "--project=$project_id" --quiet
+  fi
+  if "$dry_run" || ! current_topic=$(gcloud pubsub subscriptions describe "$subscription" "--project=$project_id" '--format=value(topic)' 2>/dev/null); then
+    gcloud_run pubsub subscriptions create "$subscription" "--topic=$topic" --ack-deadline=60 --message-retention-duration=1d "--project=$project_id" --quiet
+  else
+    [[ "$current_topic" == "$topic" ]] || fail '既有訂閱屬於不同主題 / existing subscription belongs to another topic'
+    # Never shorten retention or otherwise change an existing subscription.
+  fi
+  gcloud_run pubsub topics add-iam-policy-binding "$topic" --member=serviceAccount:chat-api-push@system.gserviceaccount.com --role=roles/pubsub.publisher "--project=$project_id" --quiet
+  gcloud_run pubsub subscriptions add-iam-policy-binding "$subscription" "--member=serviceAccount:$sa" --role=roles/pubsub.subscriber "--project=$project_id" --quiet
+  gcloud_run pubsub subscriptions add-iam-policy-binding "$subscription" "--member=serviceAccount:$sa" --role=roles/pubsub.viewer "--project=$project_id" --quiet
+  printf 'Pub/Sub 通知不作為訊息身分證明；閘道會用 chat.bot 向 Google Chat 回讀每則訊息。/ Every notification is re-read from Google Chat using chat.bot.\n'
 fi
 if "$dry_run"; then
   key_file="$out/service-account.json"
@@ -165,7 +188,10 @@ except (OSError, ValueError):
 PYKEY
         ) || key_id=''
         if [[ -n "$key_id" ]]; then
-          if ! gcloud iam service-accounts keys delete "$key_id" "--iam-account=$sa" "--project=$project_id" --quiet >/dev/null; then
+          if [[ "$connection" == pubsub ]]; then
+            printf 'Pub/Sub 設定失敗；金鑰仍有效，請人工檢查並決定是否撤銷 / Pub/Sub setup failed; key remains valid. Review before manual revocation:\n' >&2
+            print_command gcloud iam service-accounts keys delete "$key_id" "--iam-account=$sa" "--project=$project_id" --quiet >&2
+          elif ! gcloud iam service-accounts keys delete "$key_id" "--iam-account=$sa" "--project=$project_id" --quiet >/dev/null; then
             printf '金鑰撤銷失敗，請手動執行 / Key revocation failed; run: ' >&2
             printf '%q ' gcloud iam service-accounts keys delete "$key_id" "--iam-account=$sa" "--project=$project_id" --quiet >&2
             printf '\n' >&2
@@ -174,6 +200,10 @@ PYKEY
           fi
         else
           printf '無法讀取新金鑰 ID，請管理員檢查服務帳戶金鑰 / Cannot read created key ID; review service account keys.\n' >&2
+        fi
+        if [[ "$connection" == pubsub ]]; then
+          printf '保留金鑰檔供人工處理 / Key file retained for manual recovery: %q\n' "$created_key_file" >&2
+          exit "$status"
         fi
         if "$installed_key"; then rm -f -- "$key_file"; fi
       fi
@@ -197,12 +227,12 @@ PYKEY
   fi
 fi
 if ! "$dry_run"; then
-  python3 -I - "$out/bootstrap-result.json" "$project_number" "$key_file" "$agent" "$project_id" "$sa" "$created_this_run" <<'PY'
+  python3 -I - "$out/bootstrap-result.json" "$project_number" "$key_file" "$agent" "$project_id" "$sa" "$created_this_run" "$connection" "$subscription" <<'PY'
 import json, os, sys, tempfile
-path, number, key, agent, project, email, created = sys.argv[1:]
+path, number, key, agent, project, email, created, connection, subscription = sys.argv[1:]
 with open(key) as f:
     key_id = json.load(f)['private_key_id']
-result = dict(project_number=number, key_file=key, agent=agent, project_id=project, service_account_email=email, key_id=key_id, created_this_run=created == 'true')
+result = dict(project_number=number, key_file=key, agent=agent, project_id=project, service_account_email=email, key_id=key_id, created_this_run=created == 'true', connection=connection, subscription=subscription)
 fd, temp = tempfile.mkstemp(prefix='.result-', dir=os.path.dirname(path))
 try:
     with os.fdopen(fd, 'w') as f:
@@ -217,9 +247,14 @@ printf '\nGoogle Chat 設定摘要 / Setup summary\nProject ID: %s\nProject numb
 printf 'Chat Configuration: https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=%s\n' "$project_id"
 printf '建立時請取消勾選「以 Google Workspace 外掛程式建構這個 Chat 應用程式」（Build this Chat app as a Google Workspace add-on）。/ Uncheck this option when creating the app.\n'
 printf 'App name: %s\nAvatar URL: （請填入您的公開 HTTPS 頭像 / enter your public HTTPS avatar URL）\nDescription: DuDuClaw AI assistant\nInteractive features: On\n1:1 messages + spaces: On\nVisibility: %s\n' "$app_name" "$account"
-printf 'HTTP endpoint URL: %s\nAuthentication Audience: Project number (%s)\n' "$endpoint_url" "$project_number"
+if [[ "$connection" == http ]]; then
+  printf 'HTTP endpoint URL: %s\nAuthentication Audience: Project number (%s)\n' "$endpoint_url" "$project_number"
+else
+  printf 'Cloud Pub/Sub topic: %s\nPull subscription: %s\n' "$topic" "$subscription"
+fi
 printf '\n在 DuDuClaw 主機匯入（Cloud Shell 使用者請先安全下載金鑰）/ Import on the DuDuClaw host (download the key securely from Cloud Shell first):\n'
-args=(duduclaw channels googlechat import --project-number "$project_number" --key-file "$key_file")
+args=(duduclaw channels googlechat import --project-number "$project_number" --key-file "$key_file" --connection "$connection")
+[[ -z "$subscription" ]] || args+=(--subscription "$subscription")
 [[ -z "$agent" ]] || args+=(--agent "$agent")
 print_command "${args[@]}"
 printf '設定頁需手動儲存；建立資源不代表已連線。/ Save the Chat Configuration page manually; resource creation does not verify a working connection.\n'

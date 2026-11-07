@@ -283,7 +283,7 @@ pub(crate) fn write_packet_atomic(
 }
 
 pub(crate) async fn handle_team_handoff(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
-    let caller = resolve_audit_agent(|| default_agent.to_string());
+    let caller = current_authorizing_agent(home_dir, default_agent);
     // Every refusal gets an audited row carrying the stable code; the generic
     // state-changing audit in `handle_tools_call` records the call itself but
     // not *why* it failed (same shape as `codrive_run`).

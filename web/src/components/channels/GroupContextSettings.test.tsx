@@ -22,7 +22,7 @@ describe('GroupContextSettings', () => {
     expect(await screen.findByText('Keep for 24 hours, up to 50 messages')).toBeInTheDocument();
     expect(screen.getByText(/group members’ messages are retained up to 50 messages \/ 24 hours/)).toBeInTheDocument();
     expect(screen.getByText(/Passwords and keys are masked automatically/)).toBeInTheDocument();
-    expect(await screen.findByRole('link', { name: 'Open redaction settings' })).toHaveAttribute('href', '/app/system/settings?tab=redaction');
+    expect(await screen.findByRole('link', { name: 'Open redaction settings' })).toHaveAttribute('href', '/app/system/settings/advanced#redaction');
     expect(screen.getByText(/Channel input redaction is off/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Disable and clear' }));
     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('channels.group_context_remove', { channel: 'discord', group_id: '222' }));
@@ -56,5 +56,5 @@ it('keeps an actionable notice when redaction status cannot be loaded', async ()
     ? Promise.reject(new Error('unavailable')) : previous(method, ...args));
   renderWithProviders(<GroupContextSettings platform="telegram" active />);
   expect(await screen.findByText(/redaction status could not be confirmed/)).toBeInTheDocument();
-  expect(screen.getByRole('link', { name: 'Open redaction settings' })).toHaveAttribute('href', '/app/system/settings?tab=redaction');
+  expect(screen.getByRole('link', { name: 'Open redaction settings' })).toHaveAttribute('href', '/app/system/settings/advanced#redaction');
 });

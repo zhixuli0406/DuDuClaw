@@ -366,10 +366,15 @@ impl MethodHandler {
             }
         };
         match apply_result {
+            Ok(result) if !result.success => {
+                *self.pending_update.write().await = None;
+                tracing::warn!(error = %crate::updater::sanitize_failure_detail(&result.message), "Dashboard update was not applied");
+                crate::updater::failure_response(&result.message)
+            }
             Ok(result) => {
                 *self.pending_update.write().await = None;
 
-                if result.needs_restart {
+                if result.success && result.needs_restart {
                     self.schedule_update_restart(&pending.version, &result.message)
                         .await;
                 }
@@ -398,8 +403,8 @@ impl MethodHandler {
                 // [R2:NM5] Clear stale pending on failure so user must re-check
                 *self.pending_update.write().await = None;
 
-                // [R2:NM3] Sanitize error for audit log (strip ANSI/newlines)
-                let sanitized = e.replace('\n', " ").replace('\r', "").replace('\x1b', "");
+                // Share the same bounded diagnostics as the RPC and push payloads.
+                let sanitized = crate::updater::sanitize_failure_detail(&e);
                 crate::security_autopilot::audit_and_emit(
                     &self.home_dir,
                     &duduclaw_security::audit::AuditEvent::new(
@@ -409,14 +414,15 @@ impl MethodHandler {
                         json!({ "error": sanitized }),
                     ),
                 );
-                WsFrame::error_response("", &format!("Update failed: {e}"))
+                tracing::warn!(error = %sanitized, kind = crate::updater::failure_kind(&e), "Dashboard update failed");
+                crate::updater::failure_response(&e)
             }
         }
     }
 
     /// Broadcast `system.update_installed` to ALL dashboard tabs (not just the
     /// RPC caller) so every client can wait out the restart and reload, then
-    /// shut down gracefully and re-exec the binary now on disk.
+    /// restart using the install mode (launchd re-registration or graceful exec).
     async fn schedule_update_restart(&self, version: &str, message: &str) {
         if let Some(tx) = self.event_tx.read().await.clone() {
             let frame = WsFrame::Event {
@@ -435,10 +441,9 @@ impl MethodHandler {
         tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             tracing::info!(
-                "Shutting down for update — will re-exec new binary after graceful shutdown"
+                "Restarting after update using the current install mode"
             );
-            duduclaw_core::platform::request_restart_after_shutdown();
-            duduclaw_core::platform::self_interrupt();
+            crate::updater::restart_after_update().await;
         });
     }
 

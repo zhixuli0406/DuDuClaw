@@ -19,7 +19,7 @@ pub enum ServiceAction {
     Install,
     Start,
     Stop,
-    Restart,
+    Restart { from_updater: Option<String> },
     Status,
     Logs { lines: usize },
     Uninstall,
@@ -31,19 +31,28 @@ pub async fn handle_service(action: ServiceAction) -> Result<()> {
         ServiceAction::Install => install_service().await,
         ServiceAction::Start => start_service().await,
         ServiceAction::Stop => stop_service().await,
-        ServiceAction::Restart => restart_service().await,
+        ServiceAction::Restart { from_updater } => restart_service(from_updater).await,
         ServiceAction::Status => service_status().await,
         ServiceAction::Logs { lines } => service_logs(lines).await,
         ServiceAction::Uninstall => uninstall_service().await,
     }
 }
 
-async fn restart_service() -> Result<()> {
+async fn restart_service(from_updater: Option<String>) -> Result<()> {
     crate::pack_cmd::refuse_in_ai_session(&crate::ai_session_guard::command_markers())?;
     #[cfg(target_os = "macos")]
-    { launchd::restart().await }
+    {
+        if let Some(label) = from_updater {
+            return duduclaw_core::autostart::update_restart::run_helper(&label).await
+                .map_err(|e| DuDuClawError::Gateway(format!("Update installed successfully, restart required; run `duduclaw service restart`: {e}")));
+        }
+        launchd::restart().await
+    }
     #[cfg(not(target_os = "macos"))]
-    { Err(DuDuClawError::Gateway("`duduclaw service restart` is unsupported on this platform".into())) }
+    {
+        let _ = from_updater;
+        Err(DuDuClawError::Gateway("`duduclaw service restart` is unsupported on this platform".into()))
+    }
 }
 
 // ---------------------------------------------------------------------------

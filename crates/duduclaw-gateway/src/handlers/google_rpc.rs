@@ -23,6 +23,18 @@ impl MethodHandler {
     /// while the tools behind it refused every call on a stock install. The
     /// page now reads the flag and offers this.
     pub(crate) async fn handle_google_integration_set(&self, params: Value) -> WsFrame {
+        if let Some(value) = params.get("chat_read") {
+            let Some(enabled) = value.as_bool() else {
+                return WsFrame::error_response("", "Google Chat 讀取設定必須是布林值。");
+            };
+            if params.get("enabled").is_some() {
+                return WsFrame::error_response("", "請分別更新 Google 整合與 Chat 讀取設定。");
+            }
+            return match crate::google_workspace::set_chat_read_enabled(&self.home_dir, enabled) {
+                Ok(changed) => WsFrame::ok_response("", json!({"chat_read": enabled, "changed": changed})),
+                Err(error) => WsFrame::error_response("", &error),
+            };
+        }
         let Some(enabled) = params.get("enabled").and_then(|v| v.as_bool()) else {
             return WsFrame::error_response("", "Missing boolean 'enabled' parameter");
         };
@@ -75,6 +87,7 @@ impl MethodHandler {
             json!({
                 "integration_enabled":
                     crate::google_workspace::integration_enabled(&self.home_dir),
+                "chat_read": crate::google_workspace::chat_read_enabled(&self.home_dir),
                 "effective": effective,
                 "service_account": {
                     "configured": sa_configured,

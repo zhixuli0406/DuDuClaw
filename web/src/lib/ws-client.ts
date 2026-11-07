@@ -1,3 +1,5 @@
+import { withAgentRequestAllowed } from './agent-request-guard';
+
 // WebSocket client matching the Rust WsFrame protocol
 // (crates/duduclaw-gateway/src/protocol.rs)
 
@@ -60,6 +62,8 @@ export class DuDuClawClient {
   private getToken?: TokenGetter;
   private authRefreshHook?: AuthRefreshHook;
   private needsAuthRefresh = false;
+  private connectionGeneration = 0;
+  private visibilityListener: (() => void) | null = null;
   // WP-0 (bootstrap-admin recovery): whether the currently-authenticated
   // account still must change its password. Captured from the `connect`
   // handshake response's `must_change_password` field, AND kept in sync by
@@ -112,10 +116,26 @@ export class DuDuClawClient {
     this.getToken = getToken;
     this.authRefreshHook = authRefreshHook;
     this.maxReconnectAttempts = 10;
+    if (!this.visibilityListener) {
+      this.visibilityListener = () => {
+        if (document.visibilityState !== 'visible' || this.maxReconnectAttempts === 0) return;
+        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+        this.stopHeartbeat();
+        const previous = this.ws;
+        this.ws = null;
+        previous?.close();
+        this.rejectAllPending('Connection resumed');
+        this.reconnectAttempt = 0;
+        void this.doConnect().catch(() => { /* onclose schedules retries */ });
+      };
+      document.addEventListener('visibilitychange', this.visibilityListener);
+    }
     return this.doConnect();
   }
 
   private async doConnect(): Promise<void> {
+    const generation = ++this.connectionGeneration;
     // If the previous handshake failed with an auth error, refresh the
     // token before re-opening the socket so getToken() returns a fresh JWT.
     if (this.needsAuthRefresh && this.authRefreshHook) {
@@ -123,6 +143,7 @@ export class DuDuClawClient {
       try { await this.authRefreshHook(); } catch { /* refresh failure → use whatever getToken returns */ }
     }
 
+    if (generation !== this.connectionGeneration) return;
     return new Promise((resolve, reject) => {
       this.setState('connecting');
 
@@ -134,8 +155,10 @@ export class DuDuClawClient {
         return;
       }
 
+      const socket = this.ws;
       // Set ALL handlers before the connection opens
-      this.ws.onmessage = (event) => {
+      socket.onmessage = (event) => {
+        if (this.ws !== socket) return;
         try {
           const frame: WsFrame = JSON.parse(event.data);
           this.handleFrame(frame);
@@ -144,7 +167,8 @@ export class DuDuClawClient {
         }
       };
 
-      this.ws.onclose = () => {
+      socket.onclose = () => {
+        if (this.ws !== socket) return;
         this.stopHeartbeat();
         if (this.ws === null) return; // Intentional disconnect — skip
         this.setState('disconnected');
@@ -152,11 +176,12 @@ export class DuDuClawClient {
         this.scheduleReconnect();
       };
 
-      this.ws.onerror = () => {
+      socket.onerror = () => {
         // onclose will fire after this
       };
 
-      this.ws.onopen = async () => {
+      socket.onopen = async () => {
+        if (this.ws !== socket) return;
         this.reconnectAttempt = 0;
         this.setState('connected');
 
@@ -172,10 +197,12 @@ export class DuDuClawClient {
             const payload = (await this.call('connect', params, true)) as
               | { must_change_password?: boolean; boot_id?: string }
               | undefined;
+            if (this.ws !== socket) { resolve(); return; }
             this.observeBoot(payload?.boot_id);
             this.setMustChangePassword(payload?.must_change_password === true);
             this.setState('authenticated');
           } catch (e) {
+            if (this.ws !== socket) { resolve(); return; }
             // H10 fix: do NOT set authenticated on failure
             // If the failure looks like an auth error, flag for token refresh
             // before the next reconnect attempt.
@@ -193,10 +220,12 @@ export class DuDuClawClient {
             const payload = (await this.call('connect', { version: '0.6.5' }, true)) as
               | { must_change_password?: boolean; boot_id?: string }
               | undefined;
+            if (this.ws !== socket) { resolve(); return; }
             this.observeBoot(payload?.boot_id);
             this.setMustChangePassword(payload?.must_change_password === true);
             this.setState('authenticated');
           } catch {
+            if (this.ws !== socket) { resolve(); return; }
             // H10 fix: if server requires auth and we have no token, don't fake authenticated
             // Only allow local-only mode if server explicitly accepts it
             this.setState('disconnected');
@@ -214,7 +243,7 @@ export class DuDuClawClient {
   private startHeartbeat() {
     this.stopHeartbeat();
     // Send a ping every 25s to keep the connection alive
-    // (server expects activity within 60s)
+    // (fallback alongside the server protocol ping/pong heartbeat)
     this.heartbeatTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
         // Send an application-level ping since browser WebSocket
@@ -324,18 +353,21 @@ export class DuDuClawClient {
       });
     };
 
-    return waitForReady().then(() => new Promise((resolve, reject) => {
-      const id = String(++this.requestId);
-      const timeout = setTimeout(() => {
-        this.pendingRequests.delete(id);
-        reject(new Error(`Request timeout: ${method}`));
-      }, timeoutMs);
+    return waitForReady().then(() => {
+      // Load/join grants before allocating a request ID or a response timeout.
+      return withAgentRequestAllowed(method, params, () => new Promise((resolve, reject) => {
+        const id = String(++this.requestId);
+        const timeout = setTimeout(() => {
+          this.pendingRequests.delete(id);
+          reject(new Error(`Request timeout: ${method}`));
+        }, timeoutMs);
 
-      this.pendingRequests.set(id, { resolve, reject, timeout });
+        this.pendingRequests.set(id, { resolve, reject, timeout });
 
-      const frame: WsFrame = { type: 'req', id, method, params };
-      this.ws!.send(JSON.stringify(frame));
-    }));
+        const frame: WsFrame = { type: 'req', id, method, params };
+        this.ws!.send(JSON.stringify(frame));
+      }));
+    });
   }
 
   subscribe(event: string, handler: EventHandler): () => void {
@@ -349,6 +381,9 @@ export class DuDuClawClient {
   }
 
   disconnect() {
+    ++this.connectionGeneration;
+    if (this.visibilityListener) document.removeEventListener('visibilitychange', this.visibilityListener);
+    this.visibilityListener = null;
     this.stopHeartbeat();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -376,6 +411,7 @@ export class DuDuClawClient {
     this.reconnectAttempt++;
 
     this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
       this.doConnect().catch(() => { /* reconnect will retry */ });
     }, delay);
   }

@@ -259,9 +259,13 @@ impl MethodHandler {
                     other => other, // propagate the accounts.add error verbatim
                 }
             }
-            crate::setup_token_wizard::SubmitOutcome::NoToken => setup_token_error_frame(
-                crate::setup_token_wizard::SetupTokenErrorCode::ValidationFailed,
-                "登入流程完成了，但沒有取得授權憑證，請重新開始。",
+            crate::setup_token_wizard::SubmitOutcome::CaptureFailed => setup_token_error_frame(
+                crate::setup_token_wizard::SetupTokenErrorCode::CaptureFailed,
+                crate::setup_token_wizard::CAPTURE_FAILED_MESSAGE,
+            ),
+            crate::setup_token_wizard::SubmitOutcome::AuthenticationRejected => setup_token_error_frame(
+                crate::setup_token_wizard::SetupTokenErrorCode::AuthenticationRejected,
+                crate::setup_token_wizard::AUTHENTICATION_REJECTED,
             ),
             crate::setup_token_wizard::SubmitOutcome::ValidationFailed(reason) => {
                 warn!(target: "setup_token_wizard", reason = %reason, "captured token failed live validation");

@@ -473,7 +473,8 @@ impl OdooConnector {
         rpc::execute_kw(&self.http, &self.url, &self.db, uid, &self.credential, model, method, args, kwargs).await
     }
 
-    async fn compatible_fields(&self, model: &str, requested: &[String]) -> Result<Vec<String>, String> {
+    /// Cached live field names; domains must be built from these explicitly.
+    async fn available_fields(&self, model: &str) -> Result<HashSet<String>, String> {
         let mut cache = self.field_cache.lock().await;
         if !cache.contains_key(model) {
             let raw = self.raw_execute_kw(model, "fields_get", vec![json!([])], json!({"attributes": ["type"]})).await
@@ -481,7 +482,11 @@ impl OdooConnector {
             let obj = raw.as_object().ok_or_else(|| format!("Odoo field compatibility: invalid fields_get response for '{model}'"))?;
             cache.insert(model.to_string(), obj.keys().cloned().collect());
         }
-        let available = cache.get(model).expect("metadata inserted");
+        Ok(cache.get(model).expect("metadata inserted").clone())
+    }
+
+    async fn compatible_fields(&self, model: &str, requested: &[String]) -> Result<Vec<String>, String> {
+        let available = self.available_fields(model).await?;
         let mut selected = Vec::new();
         for field in requested {
             if available.contains(field) {
@@ -494,6 +499,46 @@ impl OdooConnector {
             return Err(format!("No requested fields exist on Odoo model '{model}'; refusing an unrestricted read"));
         }
         Ok(selected)
+    }
+
+    /// Include every product type unless the caller explicitly requests stockables.
+    pub async fn inventory_product_domain(&self, query: &str, storable_only: bool) -> Result<Vec<Value>, String> {
+        let fields = self.available_fields("product.product").await?;
+        let mut domain = Vec::new();
+        if storable_only {
+            if fields.contains("is_storable") {
+                domain.push(json!(["is_storable", "=", true]));
+            } else if fields.contains("detailed_type") {
+                domain.push(json!(["detailed_type", "=", "product"]));
+            } else {
+                return Err("此 Odoo 未提供可辨識的儲存型產品欄位，無法套用 storable_only 篩選。".into());
+            }
+        }
+        if !query.is_empty() {
+            if !fields.contains("name") {
+                return Err("此 Odoo 未提供產品名稱欄位，無法依名稱搜尋。".into());
+            }
+            domain.push(json!(["name", "ilike", query]));
+        }
+        Ok(domain)
+    }
+
+    /// Totals come from the product, never from the bounded location sample.
+    /// Callers must authorize both product.product and stock.quant first.
+    pub async fn inventory_check(&self, product_id: i64) -> Result<Value, String> {
+        use crate::models::inventory;
+        let products = self.search_read("product.product", vec![json!(["id", "=", product_id])],
+            &["id", "name", "qty_available", "virtual_available"], 1).await?;
+        let product = products.as_array().and_then(|rows| rows.first())
+            .ok_or_else(|| format!("找不到產品 {product_id}，或目前帳號無權讀取此產品。"))?;
+        let data = self.search_read("stock.quant", vec![json!(["product_id", "=", product_id])],
+            inventory::STOCK_QUANT_FIELDS, 10).await
+            .map_err(|_| "無法讀取庫存明細（stock.quant）。請確認 Odoo 已安裝庫存功能，且目前帳號具有庫存讀取權限。".to_string())?;
+        let rows = data.as_array().ok_or("Odoo 庫存明細回應格式不正確，請稍後重試。")?;
+        let quants: Vec<_> = rows.iter().map(inventory::map_stock_quant).collect();
+        Ok(json!({"product_id": product_id, "name": product["name"],
+            "qty_available": product["qty_available"], "virtual_available": product["virtual_available"],
+            "quants": quants, "quants_limit": 10}))
     }
 
     #[cfg(test)]

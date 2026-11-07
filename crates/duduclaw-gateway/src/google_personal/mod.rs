@@ -7,6 +7,7 @@ pub mod flow;
 pub mod grants;
 pub mod history;
 pub mod lifecycle;
+pub(crate) mod meeting_access;
 #[cfg(test)]
 mod mail_tests;
 pub mod oauth;

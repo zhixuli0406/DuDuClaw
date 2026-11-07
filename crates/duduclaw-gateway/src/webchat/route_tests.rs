@@ -14,6 +14,7 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
+    duduclaw_core::write_minimal_config(dir.path(), "127.0.0.1", 18889).unwrap();
     crate::team_edition::record(dir.path(), duduclaw_core::EditionProfile::Enterprise);
     let agents = dir.path().join("agents");
     write_agent(&agents, "dudu", "嘟嘟總機", "@嘟嘟總機", "main", "");
@@ -295,6 +296,30 @@ async fn primary_selection_never_guesses_among_multiple_or_stale_bindings() {
     db.unbind_agent(&f.emp, "finance").unwrap();
     assert_eq!(f.state.resolve_new_agent(&f.emp).await.unwrap().as_deref(), Some("sales-rep"));
     db.unbind_agent(&f.emp, "sales-rep").unwrap();
+    assert_eq!(f.state.resolve_new_agent(&f.emp).await, Err("no_agents"));
+}
+
+#[tokio::test]
+async fn viewer_bindings_and_downgraded_primary_never_become_chat_candidates() {
+    let f = fixture().await;
+    let db = &f.state.user_db;
+    db.set_primary_agent(&f.emp, Some("finance")).unwrap();
+    db.bind_agent(&f.emp, "finance", AccessLevel::Viewer).unwrap();
+    assert!(db.set_primary_agent(&f.emp, Some("finance")).is_err());
+    assert_eq!(f.state.resolve_new_agent(&f.emp).await, Err("no_agents"));
+    assert!(f.state.authorize_target(&f.emp, "finance", false).await.is_err());
+    assert!(f.state.authorize_resume_target(&f.emp, "finance").await.is_err());
+    // The synchronous publication/socket fence shares the admission floor.
+    let policy = f.state.target_policy(&f.emp, "finance", true).await.unwrap();
+    assert!(policy.with_current(|| ()).is_err());
+    db.bind_agent(&f.emp, "faq", AccessLevel::Viewer).unwrap();
+    assert!(f.state.authorize_target(&f.emp, "faq", true).await.is_err());
+    let policy = f.state.target_policy(&f.emp, "faq", true).await.unwrap();
+    assert!(policy.with_current(|| ()).is_err());
+    db.bind_agent(&f.emp, "sales-rep", AccessLevel::Operator).unwrap();
+    assert_eq!(f.state.resolve_new_agent(&f.emp).await.unwrap().as_deref(), Some("sales-rep"));
+    db.set_primary_agent(&f.emp, Some("sales-rep")).unwrap();
+    db.bind_agent(&f.emp, "sales-rep", AccessLevel::Viewer).unwrap();
     assert_eq!(f.state.resolve_new_agent(&f.emp).await, Err("no_agents"));
 }
 
@@ -637,4 +662,66 @@ async fn assignment_commands_hide_unavailable_names_and_private_exact_matches() 
     let reg = f.state.ctx.registry.read().await;
     assert_eq!(assign::plan(&reg, Lang::ZhTw, &command, &caller), with_hidden,
         "a private exact match must not shadow the visible partial match");
+}
+
+#[tokio::test]
+async fn missing_gateway_config_denies_non_admin_even_after_binding() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let f = fixture().await;
+        assert!(f.state.authorize_target(&f.emp, "finance", false).await.is_ok());
+        std::fs::remove_file(f._dir.path().join("config.toml")).unwrap();
+        assert!(crate::webchat::access::gateway_default_id(f._dir.path()).await.is_err());
+        assert!(f.state.authorize_target(&f.emp, "finance", false).await.is_err());
+        assert_eq!(f.state.resolve_new_agent(&f.emp).await, Err("unavailable"));
+        // Bootstrap writes an explicit valid policy; reads never create one.
+        assert!(!f._dir.path().join("config.toml").exists());
+        duduclaw_core::write_minimal_config(f._dir.path(), "127.0.0.1", 18889).unwrap();
+        assert!(f.state.authorize_target(&f.emp, "finance", false).await.is_ok());
+    }).await.expect("missing-config authorization must be bounded");
+}
+
+#[tokio::test]
+async fn final_policy_holds_both_writer_locks_through_callback_and_releases_them() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let f = fixture().await;
+        let policy = f.state.target_policy(&f.emp, "finance", true).await.unwrap();
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+            .open(f._dir.path().join("config.toml.lock")).unwrap();
+        let result = policy.with_current(|| {
+            assert!(f.state.ctx.registry.try_write().is_err());
+            assert!(fs2::FileExt::try_lock_exclusive(&lock).is_err());
+            Err::<(), ()>(())
+        });
+        assert_eq!(result, Ok(Err(())));
+        assert!(f.state.ctx.registry.try_write().is_ok());
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    }).await.expect("final policy locks must not wait");
+}
+
+
+#[tokio::test]
+async fn edition_downgrade_invalidates_warm_acl_cache_without_generation_change() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let f = fixture().await;
+        let (mgr, _lead) = team(&f);
+        let enterprise = f.state.acl_snapshot(&mgr).await.unwrap();
+        assert!(enterprise.access.direct.is_empty());
+        assert!(enterprise.access.may_call("sales-rep"));
+        assert!(f.state.acl_cache.lock().await.contains_key(&mgr));
+        let generation = f.state.user_db.acl_generation().unwrap();
+        crate::team_edition::record(f._dir.path(), duduclaw_core::EditionProfile::Personal);
+        assert_eq!(f.state.user_db.acl_generation().unwrap(), generation);
+        assert!(!enterprise.edition.is_current());
+        let personal = f.state.acl_snapshot(&mgr).await.unwrap();
+        assert_eq!(personal.generation(), generation);
+        assert!(personal.edition.is_current());
+        assert!(personal.access.team.is_empty());
+        assert!(!personal.access.may_call("sales-rep"));
+        assert_eq!(code(&route_as(&f, &mgr, "@sales-rep 報價").await.unwrap_err()), Some("agent_unavailable"));
+        // A new snapshot may use restored grants; the old lease stays revoked.
+        crate::team_edition::record(f._dir.path(), duduclaw_core::EditionProfile::Enterprise);
+        assert!(!enterprise.edition.is_current());
+        assert!(!personal.edition.is_current());
+        assert!(f.state.acl_snapshot(&mgr).await.unwrap().access.may_call("sales-rep"));
+    }).await.expect("edition cache test timed out");
 }

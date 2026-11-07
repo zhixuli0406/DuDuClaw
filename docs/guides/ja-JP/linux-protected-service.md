@@ -78,6 +78,23 @@ sudo /usr/lib/duduclaw/current/duduclaw-migrate status --plan /var/lib/duduclaw-
 
 レビューページには有効な Admin session、パスワード、登録済み認証アプリの新しいコードが必要です。認可は session に紐付き、五分間有効です。高リスク項目は個別承認が必要で、一括承認は低リスクに限ります。承認と適用成功は別の状態です。未対応カテゴリはブロックしたまま、対応する手順で再入力します。旧保留承認が新しい認可に変わることはありません。
 
+## サービスアカウント用の AI CLI をインストールする
+
+サービスは `duduclaw` アカウントで動作し、`HOME=/var/lib/duduclaw`、`PATH=/usr/sbin:/usr/bin:/sbin:/bin` を使用します。AI CLI はこれらのシステム PATH ディレクトリのいずれかにインストールし、サービスアカウントが読み取り・実行できる必要があります。`ProtectHome=yes` は `/home`、`/root`、`/run/user` を隠します。root が `/home/operator/.local/bin/claude` を見つけてもサービスからは利用できません。システムディレクトリから隠されたホームへのシンボリックリンクも使えません。
+
+Claude Code では、実行前に `<ver>` をインストールするバージョンに置き換えてください。
+
+```sh
+cd / && sudo -H npm install -g --prefix /usr @anthropic-ai/claude-code@<ver>
+sudo -u duduclaw -H claude auth login
+```
+
+`-H` と `--prefix /usr` は両方必要です。省略すると、元ユーザーの `~/.npmrc` の prefix 設定により CLI が再びユーザーのホームにインストールされる場合があります。Codex、Grok、AGY、Gemini を設定している場合も、サービスから読める同じシステム PATH にインストールし、各 CLI の手順でサービスアカウントとしてログインしてください。
+
+`service install --protected-linux` と `service upgrade --protected-linux` の最後に、設定された主要推論 runtime と各社員の `agent.toml` が選択する runtime を検査します。移行時は移行先の設定を読みます。サービスアカウントとサービス PATH で実行権限を確認し、隠されたパスを除外します。元ユーザーのホームにしかない CLI はサービスで利用できないと表示します。主要 runtime がない場合は警告を表示し、非ゼロで終了します。後で runtime を設定する場合に限り、どちらのコマンドにも `--allow-missing-runtime` を指定できます。このフラグは CLI のインストールやログインを行いません。検査の失敗は、すでに行ったインストールやアップグレードを元に戻しません。下記の独立した更新サービス経由で更新する場合、`service upgrade --protected-linux` は要求を送信する前にこの検査を行い、失敗した場合は送信しません。
+
+移行でコピーするのは `.duduclaw` のデータだけで、**AI CLI 本体やログイン認証情報は移行しません**。Claude があってもサービスアカウントが未ログインの場合、インストール時に上記のログインコマンドを表示します。元ユーザーのホームから認証情報をコピーせず、個別にログインしてください。gateway の起動時に設定された推論バイナリが見つからない場合は、修復手順を含む ERROR を記録します。runtime の状態と doctor にも保護サービス用の手順を表示します。
+
 ## 更新とアンインストール
 
 移行と更新サービスの完全な準備後、Admin はダッシュボードで安定版を要求するか、インストール済み CLI を使います。
@@ -120,3 +137,112 @@ sudo journalctl -u duduclaw-gateway.service -u duduclaw-spawnd.service -u duducl
 | 更新受理済みだが未 committed | 永続的な要求状態と準備エラーを追跡し、手動バイナリ交換を並行実行しない。 |
 
 保護された社員環境ではコンテナエンジンやホストハードウェア依存の機能を提供しません。作業再開前に全必須コンポーネントの検査が必要です。パッケージテストの成功や本ガイドを本番環境の受け入れ完了とは扱わないでください。
+
+## リリース済み v1.80.x の単一実行ファイル保護サービス
+
+以下の各節は、v1.80.x リリースの保護サービスを説明します。gateway は root がインストールした単一の実行ファイルで、`service upgrade --protected-linux` はプロセス内で検証して置き換えます。これらはそのリリースと、隔離アーキテクチャでも維持する認証情報保護の制御（エンジンソケットポリシーと自動復旧）の参照情報です。この開発ブランチからビルドした版では、`service upgrade --protected-linux` は上記の独立した更新サービスへ要求を送信し、実行ファイルを自ら置き換えません。
+
+公式 GitHub 更新は minisign の trusted comment `duduclaw v{version} {archive-file-name}` をプラットフォーム・アーキテクチャまで厳密に照合します。Pro 更新は `duduclaw-pro` と独自の固定公開鍵を使います。ペイロード署名とコメントを保護する global signature の両方が必要です。すべてのアーカイブ導入経路で、検証器が生成した `VerifiedReleaseIdentity` が必須となり、アーカイブのダイジェスト、版、ファイル名、署名済みコメントを結び付けます。整合性確認だけでは導入できません。置換前に実行ファイルの版も確認します。保護アップグレードでは root でダウンロードしたコードを実行せず、ビルド時の固定形式レコードを読みます。ヘッダー `NUL + DUDUCLAW_RELEASE_ID:V1:`、安定版 `X.Y.Z`、末尾 `NUL + DUDUCLAW_RELEASE_END + NUL` の完全なレコードが正確に一つ必要です。すべての `DUDUCLAW_RELEASE_ID` がこの形式に一致しなければなりません。欠落、不正、重複、競合、マーカーのない旧版は拒否します。署名前に実際のアーカイブ内の実行ファイルを解析し、tag と照合します。Pro のパッケージ作成にも適用します。通常更新は `version` 出力を確認します。不一致は置換および保護版の intent/floor 更新前に中止します。この検査には修正済みの更新プログラムが必要です。旧版の更新プログラムは管理者が確認した手動導入で先に更新してください。
+
+Provider は `verify_release_archive_with_pubkey(bytes, checksum, signature, pinned_key, expected_version, expected_file)` の結果を `install_verified_binary(bytes, &identity)` に渡してください。期待する版とファイル名は選択したリリース情報から取得し、ダウンロードした署名から流用しないでください。旧来の一引数の導入 API は廃止しました。
+
+## 自動更新（任意）
+
+`scripts/linux-protected/auto-upgrade/` は v1.80.0 からソースに含まれる任意の夜間更新スクリプトです。既存の `service upgrade --protected-linux --version` だけを呼び出すため、v1.79.3 の保護インストールでも使えます。ホストの現地時刻で毎日 03:30 に、最大 20 分のランダムな遅延を加えて実行します。既存の署名検証付き更新コマンドで、新しい公式署名済みリリースだけをインストールし、稼働中の gateway を再起動します。作業のない時間に設定してください。`Persistent=false` により、朝の起動後に夜間の未実行分を補って営業時間中に再起動することはありません。このモードではダッシュボードから更新を実行できず、タイマーの有無にかかわらず新しいバージョンと手動の `sudo` コマンドを表示します。未導入時は手動更新のままです。
+
+v1.79.3 以前のソースタグにはこのディレクトリがなく、v1.80.0 以降のリリースタグには含まれます。`v1.80.0` タグが指すコミットなど、固定の完全なコミット SHA（以下では `<commit>` と表記。確認したコミットに置き換えてください）から取得し、確認してください。移動する `main` から取得しないでください（[ソースの場所](https://github.com/zhixuli0406/DuDuClaw/tree/<commit>/scripts/linux-protected/auto-upgrade)）。Linux リリースアーカイブには `scripts/` がありません。4 個のスクリプト／ユニットファイルを確認してから、`/root/duduclaw-auto-upgrade` など root だけが書き込める場所にコピーします。ファイルとすべての親ディレクトリが root 管理であることを確認して実行します。
+
+```sh
+# Replace <commit> with the reviewed full commit SHA; obtain files from that SHA.
+# Run from the reviewed checkout; the destination must not already exist.
+sudo cp -r --no-preserve=ownership scripts/linux-protected/auto-upgrade /root/duduclaw-auto-upgrade
+sudo chown -R root:root /root/duduclaw-auto-upgrade
+sudo chmod -R go-w /root/duduclaw-auto-upgrade
+sudo sh /root/duduclaw-auto-upgrade/install.sh
+sudo /usr/local/sbin/duduclaw-auto-upgrade --dry-run
+systemctl list-timers duduclaw-auto-upgrade.timer
+sudo journalctl -u duduclaw-auto-upgrade.service
+```
+ユーザーが書き換えられるディレクトリから `install.sh` を root として直接実行しないでください。確認後からコピーまでに別のプロセスが置き換える可能性があるため、root 管理のコピーも照合してください。インストーラーはソースディレクトリと4個のファイルのシンボリックリンク、通常ファイル以外、root:root 以外の所有者、グループ／他ユーザーの書き込み権限を拒否します。解決済みディレクトリから `/` までの各親も確認し、sticky bit 付きの `/tmp` も拒否します。検証後、`/run` の root 専用 0700 一時ディレクトリへコピーし、通常ファイルかつ 1 byte～1 MiB であることを再確認してからコピーをインストールし、一時ファイルを削除します。権限検査は出所の証明にはなりません。固定コミットと root 管理のコピーを照合してください。ディレクトリ内の README も参照してください。
+
+GNU coreutils（`sort -V` を含む）、curl、grep、sed、tr、systemd と、既存更新処理のホスト準備要件が必要です。root の `version-floor` を読み取り、ファイルがない、不正、または `version-pending` が存在する場合は更新せず失敗します。手動で確認してください。GitHub の直近 30 リリースから最大の純粋な `vX.Y.Z` タグを選び、`desktop-v*` と接尾辞付きタグを除外します。同じ版か古い版なら大きなアーカイブを取得せず正常終了します。API エラーや候補なしの場合も更新しません。全履歴は検索しないため、30 件に gateway リリースがなければ手動調査が必要です。
+
+圧縮された 1 行 JSON と整形済み JSON に対応し、外側の配列と純粋なバージョンタグを確認します。JSON 文法全体と `prerelease` フラグは解析しません。`-rc` などの接尾辞は除外しますが、純粋な `vX.Y.Z` が prerelease 指定でも候補になります。未認証 API はドラフトを返しません。Linux アーカイブのアップロード完了前にリリースが公開されると、その夜の更新は失敗し、翌夜に再試行します。journal を確認してください。
+
+API 応答は 8 MiB、タイムアウトは 60 秒です。古い curl の `--max-filesize` は既知の Content-Length のみに適用されるため、応答を私有 `/tmp` の 0700 ディレクトリ内の一時ファイルに保存し、解析前に実サイズも確認して終了時に削除します。`PrivateTmp=yes` が私有の書き込み可能な `/tmp` を提供します。ホストへの書き込みは `/opt/duduclaw` と `/var/lib/duduclaw-protected` に限定し、ダウンロード再試行とインストール／再起動のため起動タイムアウトを1時間にします。純粋な `vX.Y.Z` は GitHub で prerelease とされていても、新しく署名検証に成功すればインストールされます。信頼の基点はアーカイブの minisign 署名であり、バージョンの選択自体は署名されていません。
+
+gateway とデータを残し、スケジュール、スクリプト、ユニットを削除するには以下を実行します。更新中の場合、タイマーだけを無効化して削除を拒否します。更新完了後に再実行してください。
+
+```sh
+sudo sh /root/duduclaw-auto-upgrade/install.sh --uninstall
+```
+
+## 保護範囲と制限
+
+**機能制限：** 保護されたネイティブモードでは、`InaccessiblePaths` でコンテナエンジンを遮断し、`PrivateDevices` でデバイスを隔離します。そのため、コンテナを使うタスクサンドボックス、コンピューター操作、ハードウェアに依存する機能は利用できません。AI 社員がコンテナエンジンにアクセスできないようにするための意図的な制限です。
+
+ランチャーは実行ファイルと全祖先ディレクトリ、自身の配置先が root 所有で他のユーザーに書き込みを許さないことを確認します。アカウントを検査して同 uid の残存プロセスを終了した後に鍵を開き、uid/gid を変更し、補助グループと全 capabilities を削除して `no_new_privs` を設定します。gateway は鍵を受け取る前に non-dumpable にし、systemd の親プロセス、正確な cgroup v2 行 `0::/system.slice/duduclaw-gateway.service`、実行ファイルとプロセスの権限、自身から鍵のパスを開けないことを検証します。ネイティブインストーラー、鍵を開く前のランチャー、Rust の検証はいずれも初期以外の user namespace を拒否します。`/run/.containerenv`、`/run/systemd/container`、PID 1 の環境内の `container=` も拒否理由です。root のインストーラーとランチャーは `/proc/1/environ` を読める必要があり、非特権 gateway は権限不足の場合だけその読み取りを省略できます。コンテナでは従来のコンテナ規則を適用し、モード変数でネイティブ保護を取得することはできません。
+
+既定の `revoke` ポリシーでは、既知の Docker／Podman／containerd ソケットは存在しないか、アクセス不能でなければなりません。書き込みアクセス検査と非ブロッキング接続の両方が拒否される必要があります。`DOCKER_HOST` は設定しないでください。独自 slice、cgroup v1／混在方式、想定外の sudo 出力、結果不明の検査はすべて拒否します。理由は journal または認証情報カードに表示されます。権限を緩めて回避しないでください。
+
+ユニットには次の設定も適用します。
+
+```ini
+InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock -/run/containerd -/run/podman -/var/run/podman -/run/user -/run/docker
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+```
+
+[systemd.exec](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html) の仕様に従い、各 `-` 接頭辞は存在しないパスを無視します。一般的なエンジンの接続先を隠し、ハードウェアを隔離し、カーネル／モジュール／cgroup の変更と set-ID ファイルの作成を禁止して、実行モードと syscall アーキテクチャを制限します。`RestrictNamespaces` は設定しません。gateway の Codex／bwrap タスクサンドボックスは user、mount、PID、network namespace を必要とします。
+
+起動時と 60 秒ごとに、一般的なエンジンソケットへの到達性と補助グループを検査します。既定の `revoke` ポリシーで定期検査に失敗すると、保持中の鍵をその場でゼロ化し、保護状態を拒否に変更して警告を記録します。個人接続は、新たな起動時の鍵受け取り検査に成功するまで停止します。失効後も監視を続けます。自動復旧は次の節を参照してください。`/proc/net/unix` の待ち受け中の abstract socket も検査します。`/` で区切られた名前の要素が `docker`、`containerd`、`podman`、`buildkit`、`lxd` と完全一致するか、その名前の直後に `.`、`-`、`_` が続く場合に候補とします。任意の部分文字列では一致させません。 名前の一致だけでは拒否しません。短いタイムアウトの非ブロッキング接続で `SO_PEERCRED` を取得し、接続できた相手の uid が 0 の場合だけリスクと判断します。到達不能な候補は無視します。表は生のバイト列として読み取り、非 UTF-8 名が他のソケットの検査を妨げないようにします。すべての行を完全に解析し、不正なフィールドや flags、曖昧な名前、改行による断片があれば鍵の受け取りを拒否し、保持中の鍵も失効させます。表の読み取り失敗はどの状態でも検査失敗とし、復旧時の連続成功回数もリセットします。安全と判断する前に、必須の `NETLINK_SOCK_DIAG` dump で長さ付きの `UNIX_DIAG_NAME` を調べます。非エンジン名も含めて改行を拒否するため、改行の後が正しい形式の偽造行でも見逃しません。dump が取得不能、不正、中断、8 MiB 超過、250 ms のタイムアウトの場合も拒否し、カーネルには UNIX socket diagnostics の対応が必要です。どちらの検査も定期的な観測であり、全ソケットの原子的なスナップショットではありません。
+
+`@docker_cli_` と 32 桁の小文字 16 進数に完全一致し、接続できる peer uid 0 の abstract socket は、必ずエンジンソケットと判定します。既定の `revoke` は鍵を失効させますが、管理者が選択した `warn` は鍵を保持して警告を表示し続けます。名前自体による免除はありません。名前の識別は診断のヒントにだけ使用します。通常は、このホストで誰かが root として `docker` コマンド（例：`sudo docker compose …`）を実行したことを示します。`revoke` では、実行中は個人アカウントを一時停止し、終了後に環境チェックが成功して自動復旧が利用できれば、通常は数分で復旧します。回避するには docker グループの一般ユーザーで docker を実行するか、開発用コンテナを別のホストで実行してください。
+
+AI 社員の Bash／ツールは gateway と同じ uid で動作します。保護は non-dumpable、root 所有の鍵とプログラム、sudo／linger がないこと、エンジンソケットへのアクセス拒否に依存します。社員は書き込み可能なデータを変更し、gateway を停止し、許可された操作を要求し、自分のターンで発行されたアクセストークンを読めます。ホストは `duduclaw` アカウントにコンテナエンジンや他の特権ブローカーへのアクセスを与えてはいけません。起動時と毎分の検査は一般的な接続先を対象とし、無条件の隔離を保証しません。未識別名の abstract socket、別パスのエンジンソケット、特権ブローカー、その他の権限昇格経路、ホスト root の侵害、gateway 内ですでに動いている悪意あるコードは対象外です。検査の間に新しいアクセス経路が生じる可能性もあります。実行ファイルの所有者検査はサービス uid による改変を防ぐもので、悪意ある root 管理者が渡すファイルの署名検証ではありません。
+
+この鍵は汎用サンドボックスではありません。鍵を保持する間は gateway 内の ONNX 読み込み禁止も適用され、NER マスキング、ローカル embedding、Kokoro は使えません。必要に応じて正規表現のマスキングを使用してください。データとルートキーの両方を含むバックアップは認証情報を復号できます。ダッシュボードの保護キーだけを替えても旧データの復元は防げません。漏えいが疑われる場合、ホスト管理者はサービスを停止し、安全にルートキーを交換し、保護の再設定とアカウントの再接続を行ってください。
+
+ネイティブ systemd のインストール、sudo の各バージョン、ソケット検査は対象ディストリビューションでの実測が必要です。単体テストや macOS のコンパイル成功を Linux 実機の検証と同一視しないでください。
+
+## コンテナエンジンのポリシーを選ぶ
+
+既定の `engine_socket_action = "revoke"` は、エンジン制御インターフェースにアクセスできる場合、鍵の受け取りを拒否するか、保持中の鍵を失効させます。開発用コンテナと同じホストでサービスを維持する必要がある場合、ホスト管理者は `warn` を選択できます。例外はネイティブ Linux の確認済み `engine_socket_reachable` に限り、起動時の鍵受け取りと 60 秒ごとの検査に適用します。補助グループ、実行ファイルの権限、cgroup／unit、user namespace、コンテナ環境、鍵パスへのアクセス、ソケット表の読み取り失敗や不正形式、診断の失敗など、ほかの問題では引き続き拒否・失効します。systemd の隔離設定は変わらず、コンテナに依存する機能も利用可能にはなりません。
+
+「警告のみ」に変更すると、ホスト上のプログラムがコンテナエンジンの制御インターフェースを公開しても、DuDuClaw は Google などの個人アカウントを停止しません。コンテナエンジンを操作できるプログラムは、実質的にホスト全体の最高権限を持ちます。AI 社員がアクセスできれば、復号鍵を読み取れる可能性があります。AI 社員がエンジンにアクセスできないことを確認でき、同じホストでコンテナを実行する必要がある場合に限り使用してください。開発用コンテナを別のホストに移すか、docker グループの一般ユーザーで docker を実行する方が安全です。
+
+AI セッションの外で、自分の端末から実行してください。検証済みの root 所有バイナリを使用し、root の PATH に `duduclaw` がない場合は `/opt/duduclaw/bin/duduclaw` に置き換えます。
+
+```sh
+sudo duduclaw service protected-linux policy show
+sudo duduclaw service protected-linux policy engine-socket warn --yes
+sudo duduclaw service protected-linux policy engine-socket revoke
+```
+
+コマンドは root を要求し、AI セッションでは拒否します。`warn` への変更時はリスクを表示し、`--yes` が必要です。唯一のポリシー元は `/etc/duduclaw/protected-policy.toml` で、サービスアカウントの `config.toml` は読みません。gateway は鍵の受け取り時と各定期判定前に、固定したディレクトリとファイルの記述子で読み取ります。root 所有の通常ファイル、ハードリンク数 1、サイズ制限、厳密な構文、root 所有の親ディレクトリを要求し、ファイルと親ディレクトリのグループ／他ユーザーによる書き込みを拒否します。欠落、読み取り失敗、不正なポリシーは `revoke` に戻ります。root コマンドは一時ファイルを書いて同期し、原子的に名前を変更してからディレクトリを同期します。
+
+ポリシー変更は root 所有の `/etc/duduclaw/protected-policy-audit.jsonl` に追記します。先に操作意図を同期し、ポリシーを原子的に書き込んでから変更を記録します。Gateway は次の読み取り時に安全監査インデックスへ取り込みます。`warn` でエンジンへのアクセスを検出すると、検査の詳細を含む WARN を記録し、状況が続く間、認証情報保護パネルに警告を表示します。警告の開始と終了で各 1 件の監査イベントを記録し、同じ状態を 60 秒ごとに繰り返し記録しません。パネルは現在のポリシー、リスク、切り替えコマンドを表示するだけで、変更ボタンはありません。変更は次の検査で反映します。すでに失効した鍵は、次節の復旧処理で root ランチャーから再度受け取る必要があります。
+
+警告の遷移は `<home>/state/engine-socket-warning-events.json` に同期保存し、両方の監査記録の取り込み成功後に確認して削除します。このサービス所有の日誌は診断専用で、ポリシーの権限を与えません。root の監査ログは 4 MiB が上限です。上限に達すると管理者がログを保管するまで変更を拒否します。既存のポリシーディレクトリはサービスが読み取り・通過できる必要があります。権限が厳しすぎる既存ディレクトリは、勝手に変更せず拒否します。
+
+ポリシー変更と実行時警告には別々のイベント許可リストと `root:` / `runtime:` ID 名前空間を使用します。各取り込みでは、検証済みの root 所有ログからポリシー索引を先に再構築し、その中で ID を重複排除します。サービス所有の JSONL や SQLite の受領記録で root の取り込みを省略しません。不正な実行時レコードはスキップして件数を警告し、root の取り込みを妨げません。ダッシュボードも root ログを読み直し、サービス側の変更コピーを除外して `root` / `runtime` を表示します。同じ UID のプロセスによる実行時診断の偽造は引き続き可能です。
+
+## エンジン制御ソケットの公開後に復旧する
+
+同じホストの別のプログラム（開発者が起動したコンテナなど）が、root 所有のエンジン制御インターフェースを公開することがあります。`duduclaw` が Docker グループに属していなくても起こり得ます。警告と認証情報の保護状態には、パスと条件（書き込み可能、接続成功、予期しない errno）、または abstract socket 名と peer uid を表示します。直近の失効理由、詳細、UTC 時刻を `<home>/state/root-key-status.json` に保存します。`<home>` は通常 `/var/lib/duduclaw/.duduclaw` です。鍵そのものは記録しません。表示されたインターフェースを公開したプログラムを特定して停止してください。開発用コンテナは別のホストで動かすことを推奨します。古い containerd shim が検出された場合は containerd を更新してください。
+
+自動復旧は既定で有効ですが、root 所有の再読み込み成功マーカーが unit と完全に同じ内容を持つことに加え、起動上限と終了コード 75 の再起動設定を含め、インストール済みの root 所有 unit が現在のテンプレートと完全に一致することを先に確認します。欠落、読み取り失敗、不一致の場合は自動再起動を無効にし、管理者による `service upgrade --protected-linux` が必要と表示します。アップグレードは内容が異なる unit とランチャーを原子的に置換し、`daemon-reload` を実行します。インストールとアップグレードでは unit 変更前にマーカーを無効にし、`daemon-reload` 成功後、root が `systemctl show` で drop-in を含む実効の起動間隔、起動回数上限、強制再起動の終了コードを検証した場合だけ原子的に書き込みます。検証に失敗するとマーカーは作成されず、自動復旧は無効のままです。既存のインストールもこの手順が必要です。自動復旧の対象は `engine_socket_reachable` と `engine_socket_probe_failed`（以前は検査失敗も前者のコードに含まれていました）です。どちらのポリシーでも不完全な検査は拒否または失効となり、その後の検査成功が復旧の条件です。失効後も同じ検査を 60 秒ごとに続け、3 回連続で成功すると通常の終了処理を 1 回要求します。途中で失敗すると回数をリセットします。gateway は終了処理の後に終了コード 75 で停止し、systemd が root ランチャーを再起動します。ランチャーと新しい gateway はすべての鍵受け取り検査を再実行し、成功した場合だけ鍵を受け取ります。拒否されたプロセス内で鍵を復元せず、鍵を保持しているプロセスでは復旧再起動を行いません。実行ファイルの所有者や権限、補助グループ、cgroup／unit、user namespace、コンテナ環境、鍵パスへのアクセスの問題は管理者による修復が必要で、自動復旧の対象外です。
+
+時間あたりの上限は root 管理の systemd unit の `StartLimitIntervalSec=3600` と `StartLimitBurst=4` が強制します。systemd の計数区間で起動は合計 4 回までで、復旧、通常の障害、手動起動で枠を共有します。最初の起動も 1 回に数えるため、最初の区間では追加 3 回まで、次の区間では最大 4 回です。通常の障害用の別枠は設けません。`start-limit-hit` に達すると自動再起動は止まり、待つだけでは次の試行は予約されません。原因を修復した後、ホスト管理者が制限の許す時点でサービスを起動するか、明示的に失敗状態をリセットする必要があります。[systemd の起動制限](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#StartLimitIntervalSec=interval)も参照してください。`<home>/state/root-key-recovery.json` の直近 1 時間の予算、ロック、診断履歴は補助情報です。同じ uid の社員は変更や書き込み妨害ができますが、systemd の計数はリセットできません。状態ファイルは固定したディレクトリ記述子から開き、シンボリックリンクを追わず、所有者、モード、単一ハードリンクを検査します。診断は既知の理由と復旧状態、有効な RFC3339 時刻、エスケープ後最大 512 bytes の詳細のみを受け付け、CLI、ログ、RPC では端末制御文字や不可視の書式文字を可視のエスケープ表記にします。状態ファイルを読み書きできない場合は自動復旧を止め、個人接続の停止を維持します。報告されたエラーからストレージとアクセス権を確認してください。再起動中は他の gateway 接続も短時間中断します。手動で再起動する従来の動作を使う場合は `config.toml` に次を設定します。
+
+```toml
+[credential_protection]
+auto_recover = false
+```
+
+新しくインストールした unit には `Restart=on-failure` に加えて `RestartForceExitStatus=75`、そして `[Unit]` に上記 2 項目の起動制限が含まれます。`service upgrade --protected-linux` が書き込む unit とランチャーのテンプレートは、**更新を実行するバージョン**に組み込まれたものです。v1.79.3 からの最初の更新では旧プログラムが実行されるため、実行ファイルだけが置き換わり、旧 unit が残ります。旧 unit も `Restart=on-failure` で終了コード 75 を再起動できますが、時間あたりの制限がないため自動復旧は無効のままです。更新後に下記の `service install --protected-linux` を一度実行すると、新しい unit とランチャーが書き込まれ自動復旧が有効になります。以降の更新では、内容が異なる場合に自動で更新されます。ホスト管理者は systemd の計数をリセットできますが、home の JSON ではできません。新しいリリースを検証してインストールした後、ホスト管理者は `sudo /opt/duduclaw/bin/duduclaw service install --protected-linux` で組み込みのランチャーと unit を更新できます。データとルートキーを維持し、systemd を再読み込みし、稼働中の gateway を再起動します。ローカルの unit 上書き設定も確認してください。

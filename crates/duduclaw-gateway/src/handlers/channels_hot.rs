@@ -145,7 +145,7 @@ impl MethodHandler {
                 "whatsapp_app_secret",
             ],
             "feishu" => &["feishu_app_secret", "feishu_verification_token"],
-            "googlechat" => &["googlechat_project_number"],
+            "googlechat" => &["googlechat_project_number", "googlechat_connection", "googlechat_pubsub_subscription"],
             "teams" => &["teams_app_id", "teams_tenant_id"],
             "wecom" => &[
                 "wecom_corp_id",
@@ -247,8 +247,9 @@ impl MethodHandler {
             "whatsapp" | "feishu" | "googlechat" | "teams" | "wecom" | "dingtalk" => {
                 // Webhook paths are always mounted (crate::webhook_slots); a
                 // fresh router built from the saved config goes into the slot.
+                let pubsub = channel_type == "googlechat" && crate::googlechat_pubsub::shared_pubsub_configured(&home).await;
                 let router = crate::webhook_slots::start_webhook(channel_type, &home, ctx).await;
-                let started = router.is_some();
+                let started = router.is_some() || pubsub;
                 crate::webhook_slots::global().set(channel_type, router);
                 if started {
                     info!(channel_type, "Webhook channel hot-started");

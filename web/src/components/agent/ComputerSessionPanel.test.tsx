@@ -1,9 +1,10 @@
+import { mockWsClient } from '@/test/mocks';
+import { mockCallableGrants } from '@/test/callable-grants';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import en from '@/i18n/en.json';
-import { mockWsClient } from '@/test/mocks';
 import { ComputerSessionPanel } from './ComputerSessionPanel';
 
 // The real viewer loads noVNC; the panel tests only need to see it mount.
@@ -58,6 +59,7 @@ function renderPanel() {
 
 beforeEach(() => {
   mockWsClient.call.mockReset();
+  mockCallableGrants(['alice']);
 });
 
 describe('ComputerSessionPanel', () => {
@@ -181,4 +183,21 @@ describe('ComputerSessionPanel', () => {
     await userEvent.click(screen.getByRole('button', { name: 'End it' }));
     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('computer_sessions.stop', { agent_id: 'alice' }));
   });
+});
+
+it('closes the viewer and stop confirmation on revocation and fences a retained stop callback', async () => {
+  respond({ 'computer_sessions.status': RUNNING, 'computer_sessions.view': TICKET });
+  renderPanel();
+  await userEvent.click(await screen.findByRole('button', { name: /Watch/ }));
+  await screen.findByTestId('viewer');
+  await userEvent.click(screen.getByRole('button', { name: /Stop session/ }));
+  const confirm = screen.getByRole('button', { name: /End it/ });
+  // Revoke before React commits the effect; the callback itself must still fence.
+  await act(async () => {
+    mockCallableGrants([]);
+    confirm.click();
+  });
+  expect(screen.queryByTestId('viewer')).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: /End it/ })).not.toBeInTheDocument();
+  expect(mockWsClient.call.mock.calls.some(([method]) => method === 'computer_sessions.stop')).toBe(false);
 });

@@ -1071,6 +1071,10 @@ mod tests {
 
     async fn synthetic_mcp_rpc(State(raw): State<String>, Json(frame): Json<Value>) -> Json<Value> {
         let result = match frame["method"].as_str() {
+            Some("server/discover") => serde_json::json!({
+                "resultType": "complete", "supportedVersions": ["2026-07-28"],
+                "capabilities": {"tools": {}}
+            }),
             Some("tools/list") => serde_json::json!({
                 "tools": [{"name": TOOL, "inputSchema": {
                     "type": "object", "properties": {"page_path": {"type": "string"}},

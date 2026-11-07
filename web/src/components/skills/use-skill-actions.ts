@@ -7,7 +7,7 @@ import { failedTargets, skillsManageApi, type SkillTarget, type SkillTargetResul
  * Switch / remove actions with one summary toast per request, then
  * `onDone()` so the caller refetches. `busy` is true while a request runs.
  */
-export function useSkillActions(onDone: () => void) {
+export function useSkillActions(onDone: () => void, canMutate: (agent: string) => boolean) {
   const intl = useIntl();
   const [busy, setBusy] = useState(false);
 
@@ -53,21 +53,21 @@ export function useSkillActions(onDone: () => void) {
 
   const setEnabled = useCallback(
     (targets: SkillTarget[], enabled: boolean) =>
-      targets.length === 0
+      targets.length === 0 || !targets.every(t => canMutate(t.agent_id))
         ? Promise.resolve()
         : run(
             () => skillsManageApi.setEnabled(targets, enabled),
             enabled ? 'skills.manage.enabledDone' : 'skills.manage.disabledDone',
           ),
-    [run],
+    [run, canMutate],
   );
 
   const remove = useCallback(
     (targets: SkillTarget[]) =>
-      targets.length === 0
+      targets.length === 0 || !targets.every(t => canMutate(t.agent_id))
         ? Promise.resolve()
         : run(() => skillsManageApi.remove(targets), 'skills.manage.removedDone'),
-    [run],
+    [run, canMutate],
   );
 
   return { busy, setEnabled, remove };

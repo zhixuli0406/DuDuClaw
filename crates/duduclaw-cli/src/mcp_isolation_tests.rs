@@ -68,8 +68,8 @@ async fn isolated_identity_lane_and_scope_do_not_leak() {
     ISOLATED_CALL.scope(call(), async {
         assert_eq!(process_lane(), duduclaw_core::ProcessLane::Explore);
         assert!(crate::mcp::employee_process_from_env());
-        assert_eq!(crate::mcp::resolve_audit_agent(|| "wrong".into()), "main");
         let home = tempfile::tempdir().unwrap();
+        assert_eq!(crate::mcp::resolve_audit_agent(home.path(), None, "wrong"), "main");
         let actor = crate::mcp::record_actor_for(home.path(), "gateway-internal", "main");
         assert_eq!(actor.agent(), Some("main"));
         let wrong = crate::mcp::record_actor_for(home.path(), "gateway-internal", "other");

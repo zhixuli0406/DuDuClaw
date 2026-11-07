@@ -14,6 +14,7 @@ COPY vendor/ vendor/
 COPY templates/ templates/
 # duduclaw-gateway embeds synthetic fixtures via include_str!.
 COPY fixtures/ fixtures/
+COPY tests/fixtures/license_response_v2.json tests/fixtures/license_response_v2.json
 COPY docs/README.md docs/README.md
 # duduclaw-cli embeds scripts/googlechat/bootstrap.sh via include_str! for
 # `duduclaw channels googlechat bootstrap`, since v1.79.3.

@@ -43,7 +43,6 @@ use serde_json::{Value, json};
 use crate::mcp_dispatch::{jsonrpc_error, jsonrpc_response};
 use crate::mcp_http_server::HttpState;
 use crate::mcp_protocol::RequestEra;
-use crate::mcp_rate_limit::OpType;
 
 // ── Origin validation ─────────────────────────────────────────────────────────
 
@@ -169,11 +168,11 @@ pub(crate) async fn mcp_post_handler(
     //    MCP endpoint carries `WWW-Authenticate` pointing at the RFC 9728
     //    resource-metadata document so clients can discover the OAuth flow.
     let (authenticated, ns_ctx) =
-        match crate::mcp_http_server::authenticate_bearer_call(&headers, &state.home_dir) {
+        match crate::mcp_http_server::authenticate_http_call(&headers, &state).await {
             Ok(p) => p,
             Err(mut r) => {
                 if r.status() == StatusCode::UNAUTHORIZED {
-                    if let Ok(v) = crate::mcp_oauth_server::www_authenticate_value(&headers).parse()
+                    if let Ok(v) = crate::mcp_oauth_server::www_authenticate_value(&state.external_origin).parse()
                     {
                         r.headers_mut().insert("WWW-Authenticate", v);
                     }
@@ -284,7 +283,7 @@ pub(crate) async fn mcp_post_handler(
     .await
 }
 
-/// `tools/call` with the per-key rate gate and the call timeout. `Err` is
+/// `tools/call` after transport authentication/rate admission, with the call timeout. `Err` is
 /// the number of seconds the caller must wait (rate limited).
 async fn call_tool(
     state: &HttpState,
@@ -293,14 +292,6 @@ async fn call_tool(
     params: &Value,
     id: &Value,
 ) -> Result<Value, u64> {
-    // Same per-key rate gate as the legacy call route.
-    if let Err(e) = state
-        .dispatcher
-        .rate_limiter
-        .check(&principal.client_id, OpType::HttpRequest)
-    {
-        return Err(e.retry_after_secs);
-    }
     Ok(
         match tokio::time::timeout(
             duduclaw_core::tool_catalog::builtin_mcp_call_timeout(

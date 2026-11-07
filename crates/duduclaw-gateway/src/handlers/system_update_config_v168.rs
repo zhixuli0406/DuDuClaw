@@ -60,6 +60,7 @@ const PROTECTED_KEYS: &[&str] = &[
     "action_review.mode",
     "security.egress_guard",
     "security.recipient_guard",
+    "security.mail_requester_approval",
     "security.chat_credentials",
 ];
 
@@ -85,8 +86,8 @@ const SANDBOX_INT_KEYS: &[&str] = &[
 /// Translate nested / contract spellings of the pre-1.68 parameters into the
 /// flat names the original handler reads (`general.log_level` → `log_level`,
 /// `rotation.strategy` → `rotation_strategy`, `logging.format` →
-/// `log_format` …). A flat name already present wins. Returns a new value.
-pub(crate) fn normalize_legacy_aliases(params: &Value) -> Value {
+/// `log_format` …). A flat name already present wins. Moves the request map.
+pub(crate) fn normalize_legacy_aliases(params: Value) -> Value {
     const ALIASES: &[(&str, &str)] = &[
         ("general.log_level", "log_level"),
         ("general.name", "name"),
@@ -109,15 +110,13 @@ pub(crate) fn normalize_legacy_aliases(params: &Value) -> Value {
         ("skills.gap_digest_enabled", "gap_digest_enabled"),
         ("logging.format", "log_format"),
     ];
-    let Some(obj) = params.as_object() else {
-        return params.clone();
-    };
-    let mut out = obj.clone();
+    let mut out = params;
+    if !out.is_object() { return out; }
     for (path, flat) in ALIASES {
-        if out.contains_key(*flat) {
+        if out.get(*flat).is_some() {
             continue;
         }
-        if let Some(v) = param_at(params, path) {
+        if let Some(v) = param_at(&out, path) {
             // `logging.format` is `plain|json` in the contract; the original
             // handler (and the reader, which treats non-json as plain) spells
             // the plain value `pretty`.
@@ -125,10 +124,10 @@ pub(crate) fn normalize_legacy_aliases(params: &Value) -> Value {
                 ("log_format", Some("plain")) => Value::String("pretty".into()),
                 _ => v.clone(),
             };
-            out.insert((*flat).to_string(), v);
+            out.as_object_mut().unwrap().insert((*flat).to_string(), v);
         }
     }
-    Value::Object(out)
+    out
 }
 
 /// Keys among the pre-1.68 parameters that only take effect after a restart,
@@ -373,6 +372,7 @@ fn apply_files(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -
 /// Plain booleans whose readers re-read `config.toml` per use.
 fn apply_simple_bools(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -> Result<(), String> {
     const KEYS: &[(&str, &[&str], &str)] = &[
+        ("security.mail_requester_approval", &["security"], "mail_requester_approval"),
         ("night.llm_enabled", &["night"], "llm_enabled"),
         ("acp.trusted", &["acp"], "trusted"),
         ("integrations.github", &["integrations"], "github"),
@@ -767,7 +767,7 @@ mod tests {
 
     #[test]
     fn aliases_map_contract_names_to_legacy_params() {
-        let p = normalize_legacy_aliases(&json!({
+        let p = normalize_legacy_aliases(json!({
             "general": {"log_level": "info"},
             "rotation": {"strategy": "failover"},
             "logging": {"format": "plain"},
@@ -777,6 +777,18 @@ mod tests {
         assert_eq!(p["rotation_strategy"], "priority", "flat name wins");
         assert_eq!(p["log_format"], "pretty");
     }
+    #[test]
+    fn mail_requester_approval_setting_is_boolean_and_immediate() {
+        for enabled in [true, false] {
+            let (table, outcome) = apply(json!({"security.mail_requester_approval": enabled})).unwrap();
+            assert_eq!(table["security"]["mail_requester_approval"].as_bool(), Some(enabled));
+            assert!(outcome.applied_immediate);
+        }
+        for invalid in [json!("true"), json!(1), json!([])] {
+            assert!(apply(json!({"security.mail_requester_approval": invalid})).is_err());
+        }
+    }
+
     #[test]
     fn recipient_guard_setting_accepts_only_known_modes() {
         for mode in ["off", "shadow", "ask"] {

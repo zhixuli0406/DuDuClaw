@@ -383,9 +383,18 @@ pub struct ViewTicket {
     pub expires: Instant,
     /// Original access-token expiry, retained for the entire viewer connection.
     pub access_expires: Option<u64>,
+    /// Verified dashboard JWT session, carried into derivative viewer credentials.
+    pub dashboard_session: Option<String>,
 }
 
 impl ViewTicket {
+    pub(crate) fn credential_valid(&self, home: &std::path::Path) -> bool {
+        if !self.credential_unexpired() { return false; }
+        let Some(session) = self.dashboard_session.as_deref() else { return true; };
+        let Ok(conn) = rusqlite::Connection::open_with_flags(home.join("users.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return false; };
+        duduclaw_auth::remembered_sessions::session_valid(&conn, Some(session), &self.ctx.user_id,
+            chrono::Utc::now().timestamp()).unwrap_or(false)
+    }
     pub(crate) fn credential_unexpired(&self) -> bool {
         self.access_expires.is_none_or(|exp| (chrono::Utc::now().timestamp().max(0) as u64) < exp)
     }
@@ -500,6 +509,7 @@ mod tests {
             ctx: ctx(UserRole::Admin, &[]),
             expires: now + TICKET_TTL,
             access_expires: None,
+            dashboard_session: None,
         };
         let token = book.issue(t.clone(), now);
         assert!(book.consume(&token, now).is_some());

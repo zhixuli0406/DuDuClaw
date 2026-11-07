@@ -42,6 +42,16 @@ impl MethodHandler {
         &self, params: &Value, caller: &UserContext, premium_dir: &Path,
         role_id: &str, assembled: &crate::premium_templates::AssembledRole,
     ) -> WsFrame {
+        self.create_template_with_skills(params, caller, premium_dir, role_id, assembled, None, true, true, &[]).await
+    }
+
+    /// Shared commit path for company and bundled templates. Skills are written
+    /// before the registry-visible configuration, with the same rollback boundary.
+    pub(super) async fn create_template_with_skills(
+        &self, params: &Value, caller: &UserContext, premium_dir: &Path,
+        role_id: &str, assembled: &crate::premium_templates::AssembledRole,
+        skills: Option<&std::collections::BTreeMap<String, String>>, premium: bool, install_evals: bool, disabled_skills: &[String],
+    ) -> WsFrame {
         use crate::premium_templates as pt;
         if !caller.is_admin() { return WsFrame::error_response("", "Administrator required"); }
         if let Err(error) = self.validate_template_policy(assembled) {
@@ -58,6 +68,21 @@ impl MethodHandler {
                 "",
                 "Agent name must be lowercase alphanumeric with hyphens, max 64 chars",
             );
+        }
+        if duduclaw_core::is_reserved_agent_id(&name) {
+            return WsFrame::error_response("", "Reserved employee name");
+        }
+        if self.registry.read().await.list().iter().any(|a| {
+            a.config.agent.name == name || a.dir.file_name().and_then(|v| v.to_str()) == Some(name.as_str())
+        }) {
+            return WsFrame::error_response("", "Employee name already exists");
+        }
+        if let Some(skills) = skills {
+            for key in skills.keys() {
+                if crate::company_templates::validate_skill_name(key).is_err() {
+                    return WsFrame::error_response("", "Invalid template skill name");
+                }
+            }
         }
         let display_name = params
             .get("display_name")
@@ -121,6 +146,17 @@ impl MethodHandler {
         }
         if let Err(e) = contract_toml.parse::<toml::Table>() {
             return WsFrame::error_response("", &format!("CONTRACT.toml 格式錯誤，未寫入：{e}"));
+        }
+
+        // Inspect every document before directory creation, demotion or writes.
+        // Legacy callers seed bundled skills; scan those exact documents too.
+        let bundled;
+        let documents = match skills {
+            Some(value) => value,
+            None => { bundled = super::templates_library::bundled_skills(); &bundled }
+        };
+        if let Err(error) = crate::company_templates::scan_documents(&soul_md, &contract_toml, documents) {
+            return WsFrame::error_response("", &error);
         }
 
         // agent.toml: parse-validate + force identity fields.
@@ -207,7 +243,24 @@ impl MethodHandler {
             tokio::fs::create_dir_all(agent_dir.join("SKILLS"))
                 .await
                 .map_err(|e| format!("Failed to create directory: {e}"))?;
-            Self::seed_builtin_skills(&agent_dir.join("SKILLS"));
+            Self::seed_builtin_skills(&self.home_dir);
+            if let Some(skills) = skills {
+                let bundled = super::templates_library::bundled_skills();
+                for (name, content) in skills {
+                    // Pristine creation defaults come from the company layer.
+                    // Keep custom overrides and explicitly selected optional skills.
+                    let company_default = name == "connect-google"
+                        || duduclaw_agent::builtin_skills::BUILTIN_SKILL_FILES.iter()
+                            .any(|(builtin, _)| name == builtin);
+                    if company_default && bundled.get(name) == Some(content) { continue; }
+                    let dir = agent_dir.join("SKILLS").join(name);
+                    tokio::fs::create_dir(&dir).await.map_err(|_| "Unable to create template skill")?;
+                    tokio::fs::write(dir.join("SKILL.md"), content).await.map_err(|_| "Unable to write template skill")?;
+                }
+            }
+            tokio::fs::write(agent_dir.join(".template-origin.json"),
+                serde_json::to_vec(&json!({"premium":premium})).map_err(|_| "Invalid template origin")?)
+                .await.map_err(|_| "Unable to write template origin")?;
             tokio::fs::write(agent_dir.join("SOUL.md"), &soul_md)
                 .await
                 .map_err(|e| format!("Failed to write SOUL.md: {e}"))?;
@@ -224,6 +277,11 @@ impl MethodHandler {
                     warn!(agent = %name, error = %e, "template extras copy failed");
                     extras_warning = Some("知識檔（FAQ/wiki）複製失敗，可稍後手動補上".to_string());
                 }
+            }
+
+            if !disabled_skills.is_empty() {
+                duduclaw_agent::skill_state::set_disabled(&self.home_dir, &name, disabled_skills, true)
+                    .map_err(|_| "Unable to preserve disabled template skills")?;
             }
 
             let agent_toml_path = agent_dir.join("agent.toml");
@@ -288,7 +346,7 @@ impl MethodHandler {
         // `<home>/evals/<name>/`(預設 eval_suites_root),讓包裝出的
         // AI 員工第一天就有 AEE case 維度與 E1 斷言重放的真實基線。
         // 非致命:沒有題庫(免費角色/自建)或安裝失敗都不影響建立。
-        let eval_suite_cases = match pt::install_eval_suite(
+        let eval_suite_cases = if premium && install_evals && pt::is_safe_slug(&assembled.name) { match pt::install_eval_suite(
             &premium_dir,
             &assembled.name,
             &name,
@@ -301,7 +359,7 @@ impl MethodHandler {
                 warn!(agent = %name, error = %e, "eval suite install failed on templates.create_agent");
                 None
             }
-        };
+        } } else { None };
         if let Some(n) = eval_suite_cases {
             info!(agent = %name, cases = n, "installed premium eval suite");
         }
@@ -328,9 +386,37 @@ impl MethodHandler {
 /// Same final-document preparation used by the licensed template writer.
 pub(super) fn prepare_template_runtime(home: &Path, original: &str) -> Result<(String,crate::runtime_config::ModelRuntimeAlignment),String> {
     let mut table:toml::Table=original.parse().map_err(|e|format!("Invalid agent.toml: {e}"))?;
+    let evolution = table.entry("evolution").or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut().ok_or("Invalid [evolution] section")?;
+    for key in ["enabled", "gvu_enabled"] {
+        evolution.entry(key).or_insert(true.into());
+        if evolution[key].as_bool().is_none() { return Err("Invalid evolution switch".into()); }
+    }
     let alignment=crate::runtime_config::align_model_runtime(&mut table)?;
     let rendered=super::config_commit::render_preserving(original,&table)?;
     let final_table:toml::Table=rendered.parse().map_err(|e|format!("Invalid agent.toml: {e}"))?;
     crate::product_policy::load(home).and_then(|policy|crate::product_policy::validate_table(policy,&final_table))?;
     Ok((rendered,alignment))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn templates_create_evolution_defaults_on_and_preserves_explicit_false() {
+        let home = tempfile::tempdir().unwrap();
+        for (settings, enabled, gvu) in [
+            ("", true, true),
+            ("[evolution]\n", true, true),
+            ("[evolution]\nenabled = false\n", false, true),
+            ("[evolution]\ngvu_enabled = false\n", true, false),
+        ] {
+            let raw = format!("[runtime]\nprovider = 'claude'\n[model]\npreferred = 'claude-sonnet-4-6'\n{settings}");
+            let (rendered, _) = prepare_template_runtime(home.path(), &raw).unwrap();
+            let config: toml::Table = rendered.parse().unwrap();
+            assert_eq!(config["evolution"]["enabled"].as_bool(), Some(enabled));
+            assert_eq!(config["evolution"]["gvu_enabled"].as_bool(), Some(gvu));
+        }
+    }
 }

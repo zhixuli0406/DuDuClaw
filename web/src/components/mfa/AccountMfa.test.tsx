@@ -19,15 +19,22 @@ beforeEach(() => {
   useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
 });
 afterEach(() => { originalAuth.logout(); });
-it('hides MFA on unenrolled Personal but displays an existing enrollment', async () => {
+it('offers voluntary MFA on Personal and displays an existing enrollment', async () => {
   useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
   const status = vi.spyOn(mfaApi, 'status').mockResolvedValue({ enabled: false, enforced: false });
   const first = renderWithProviders(<AccountMfa />);
   await waitFor(() => expect(status).toHaveBeenCalled());
-  expect(screen.queryByText('Two-factor authentication')).toBeNull();
+  expect(await screen.findByRole('button', { name: 'Set up two-factor login' })).toBeInTheDocument();
   first.unmount(); status.mockResolvedValue({ enabled: true, enforced: false });
   renderWithProviders(<AccountMfa />);
   expect(await screen.findByText('Enrolled')).toBeInTheDocument();
+});
+it('offers enrollment on Personal when the stored policy requires MFA', async () => {
+  useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
+  vi.spyOn(mfaApi, 'status').mockResolvedValue({ enabled: false, enforced: true });
+  renderWithProviders(<AccountMfa />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Set up two-factor login' }));
+  expect(screen.getByLabelText('Current password')).toBeInTheDocument();
 });
 it('offers password enrollment for an unenrolled Enterprise account', async () => {
   vi.spyOn(mfaApi, 'status').mockResolvedValue({ enabled: false, enforced: false });
@@ -101,4 +108,19 @@ it('replaces session tokens while AuthGuard keeps recovery codes mounted until s
   expect(screen.queryByLabelText('Recovery codes')).toBeNull();
   expect(useAuthStore.getState().isAuthenticated).toBe(true);
   expect(disconnect).not.toHaveBeenCalled();
+});
+
+it('lets an Email-only account replace recovery codes using an unused recovery code', async () => {
+  vi.spyOn(mfaApi, 'status').mockResolvedValue({ enabled: true, enforced: true,
+    factors: { totp: false, email: true, passkey: false }, email_available: true });
+  const regenerate = vi.spyOn(mfaApi, 'regenerate').mockResolvedValue({ recovery_codes: ['replacement-recovery'] });
+  renderWithProviders(<AccountMfa />);
+  const replace = await screen.findByRole('button', { name: 'Replace recovery codes' });
+  expect(replace).toBeDisabled();
+  expect(screen.queryByRole('button', { name: 'Disable two-factor login' })).toBeNull();
+  fireEvent.change(screen.getByLabelText('Recovery code'), { target: { value: 'unused-recovery' } });
+  fireEvent.click(replace);
+  expect(await screen.findByLabelText('Recovery codes')).toHaveTextContent('replacement-recovery');
+  expect(regenerate).toHaveBeenCalledWith('unused-recovery');
+  expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
 });

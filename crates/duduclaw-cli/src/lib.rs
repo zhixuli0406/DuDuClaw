@@ -2548,6 +2548,18 @@ enum MaintenanceCommands {
         #[arg(long, default_value = "127.0.0.1:8765")]
         bind: String,
 
+        /// Canonical public HTTPS origin used by MCP/OAuth discovery and audiences
+        #[arg(long)]
+        public_origin: Option<String>,
+
+        /// Trusted reverse proxy IP (repeat for each hop); proxy must sanitize/append XFF
+        #[arg(long = "trusted-proxy")]
+        trusted_proxies: Vec<std::net::IpAddr>,
+
+        /// UNSAFE: permit plaintext HTTP on non-loopback networks
+        #[arg(long)]
+        allow_insecure_lan: bool,
+
         /// Disable SSE endpoints (only POST /mcp/v1/call and GET /healthz)
         #[arg(long)]
         no_sse: bool,
@@ -3652,6 +3664,11 @@ enum ServiceCommands {
         #[arg(long, required = true)]
         protected_linux: bool,
     },
+    /// Read or change root-managed native Linux protection policies
+    ProtectedLinux {
+        #[command(subcommand)]
+        command: service::protected_linux::policy::ProtectedLinuxCommand,
+    },
     /// Install DuDuClaw as a system service
     Install {
         /// Install the root-protected native Linux system service (requires sudo)
@@ -3669,6 +3686,9 @@ enum ServiceCommands {
         /// Preserve the existing destination as a backup and replace it
         #[arg(long, requires = "migrate_from")]
         force_migrate: bool,
+        /// Keep installation successful even if a configured AI CLI is missing
+        #[arg(long, requires = "protected_linux")]
+        allow_missing_runtime: bool,
     },
 
     /// Upgrade using the already installed, root-owned protected executable
@@ -3678,6 +3698,9 @@ enum ServiceCommands {
         /// Official release version (X.Y.Z); defaults to latest
         #[arg(long)]
         version: Option<String>,
+        /// Keep upgrade successful even if a configured AI CLI is missing
+        #[arg(long, requires = "protected_linux")]
+        allow_missing_runtime: bool,
     },
 
     /// Start the background service
@@ -3687,7 +3710,11 @@ enum ServiceCommands {
     Stop,
 
     /// Restart the background service
-    Restart,
+    Restart {
+        /// Internal one-shot launchd update helper
+        #[arg(long, hide = true)]
+        from_updater: Option<String>,
+    },
 
     /// Show service status
     Status,
@@ -3970,7 +3997,7 @@ enum McpCommands {
         replace: bool,
     },
 
-    /// Issue a new refresh token for an MCP client.
+    /// Issue a stdio-only refresh token for an MCP client (not http-server).
     ///
     /// The raw token is printed to stdout once — capture it immediately and
     /// paste into the client config. Only its SHA-256 hash is persisted in
@@ -4282,13 +4309,16 @@ pub async fn entry_point() {
     // failed: Broken pipe" and the agent lost its entire tool surface over a
     // diagnostics convenience. Use the fallible builder and degrade to
     // stderr-only logging instead.
-    let log_dir = duduclaw_home().join("logs");
-    let _ = std::fs::create_dir_all(&log_dir);
-    let file_writer = match tracing_appender::rolling::Builder::new()
+    let home = duduclaw_home();
+    let log_dir = home.join("logs");
+    let file_writer = match duduclaw_core::config::create_home_dir(&home)
+        .and_then(|_| std::fs::create_dir_all(&log_dir))
+        .map_err(|e| e.to_string())
+        .and_then(|_| tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("gateway.log")
         .max_log_files(duduclaw_gateway::log::FILE_LOG_MAX_FILES)
-        .build(&log_dir)
+        .build(&log_dir).map_err(|e| e.to_string()))
     {
         Ok(appender) => {
             let (non_blocking, guard) = tracing_appender::non_blocking(appender);
@@ -5602,21 +5632,26 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         },
         Commands::Ops(OpsCommands::Service { command }) => match command {
             ServiceCommands::Readiness { protected_linux: _ } => service::protected_linux::readiness(),
-            ServiceCommands::Install { protected_linux, enable_now, migrate_from, force_migrate, i_verified_this_binary } => {
+            ServiceCommands::ProtectedLinux { command } => {
+                service::protected_linux::policy::handle(command)
+            }
+            ServiceCommands::Install { protected_linux, enable_now, migrate_from, force_migrate, i_verified_this_binary, allow_missing_runtime } => {
                 if protected_linux {
                     service::protected_linux::install(service::protected_linux::InstallOptions {
-                        enable_now, migrate_from, force_migrate, i_verified_this_binary,
+                        enable_now, migrate_from, force_migrate, i_verified_this_binary, allow_missing_runtime,
                     })
                 } else {
                     service::handle_service(service::ServiceAction::Install).await
                 }
             }
-            ServiceCommands::Upgrade { protected_linux: _, version } => {
-                service::protected_linux::upgrade(version.as_deref()).await
+            ServiceCommands::Upgrade { protected_linux: _, version, allow_missing_runtime } => {
+                service::protected_linux::upgrade(version.as_deref(), allow_missing_runtime).await
             }
             ServiceCommands::Start => service::handle_service(service::ServiceAction::Start).await,
             ServiceCommands::Stop => service::handle_service(service::ServiceAction::Stop).await,
-            ServiceCommands::Restart => service::handle_service(service::ServiceAction::Restart).await,
+            ServiceCommands::Restart { from_updater } => {
+                service::handle_service(service::ServiceAction::Restart { from_updater }).await
+            },
             ServiceCommands::Status => {
                 service::handle_service(service::ServiceAction::Status).await
             }
@@ -5768,21 +5803,20 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         }
         Commands::Tooling(ToolingCommands::McpRemoteBridge { agent, server }) => {
             // stdout is the JSON-RPC channel; tracing goes to stderr.
-            // A process started for one employee must not borrow another
-            // employee's connection.
-            if let Some(own) = std::env::var_os("DUDUCLAW_AGENT_ID")
-                && !own.is_empty()
-                && own.to_str() != Some(agent.as_str())
-            {
-                eprintln!("mcp-remote-bridge: refusing --agent {agent}: this process runs as a different employee");
-                std::process::exit(2);
-            }
             let home = duduclaw_home();
+            let token = match duduclaw_core::identity_token::verified_bridge_env_token(&home, &agent) {
+                Ok(token) => token,
+                Err(message) => {
+                    eprintln!("mcp-remote-bridge: {message}");
+                    std::process::exit(2);
+                }
+            };
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
             let code = duduclaw_gateway::remote_mcp::bridge::run_bridge(
                 &home,
                 &agent,
                 &server,
+                &token,
                 stdin,
                 tokio::io::stdout(),
             )
@@ -5976,10 +6010,10 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             Some(AcpCommands::Server) => acp::server::run_acp_server(&duduclaw_home()).await,
         },
         Commands::Maintenance(MaintenanceCommands::HttpServer {
-            bind,
+            bind, public_origin, trusted_proxies, allow_insecure_lan,
             no_sse,
             timeout_secs,
-        }) => cmd_http_server(&bind, no_sse, timeout_secs).await,
+        }) => cmd_http_server(&bind, public_origin, trusted_proxies, allow_insecure_lan, no_sse, timeout_secs).await,
         Commands::Maintenance(MaintenanceCommands::Proxy {
             bind,
             key,
@@ -7064,7 +7098,10 @@ fn resolve_hook_caller(
         return duduclaw_core::HookCaller::Absent;
     }
     let token = std::env::var(duduclaw_core::ENV_AGENT_TOKEN).unwrap_or_default();
-    let require = duduclaw_core::require_identity_token_from_home(home);
+    let require = match duduclaw_core::require_identity_token_from_home(home) {
+        Ok(require) => require,
+        Err(_) => return duduclaw_core::HookCaller::Untrusted(claimed.to_string()),
+    };
     match duduclaw_core::verify_identity_claim(home, claimed, token.trim(), require) {
         duduclaw_core::IdentityVerdict::Rejected => {
             duduclaw_core::HookCaller::Untrusted(claimed.to_string())
@@ -7102,6 +7139,8 @@ mod resolve_hook_caller_tests {
     fn agent_flag_takes_priority_over_env_id() {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"),
+            format!("[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n", (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339())).unwrap();
         clear_env();
         // SAFETY: serialized via ENV_LOCK.
         unsafe {
@@ -7128,6 +7167,8 @@ mod resolve_hook_caller_tests {
         // (or not-yet-upgraded) call sites.
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"),
+            format!("[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n", (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339())).unwrap();
         clear_env();
         unsafe {
             std::env::set_var(duduclaw_core::ENV_AGENT_ID, "env-only-agent");
@@ -7148,6 +7189,8 @@ mod resolve_hook_caller_tests {
         // missing flag, matching the existing empty-env-var handling.
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"),
+            format!("[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n", (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339())).unwrap();
         clear_env();
         unsafe {
             std::env::set_var(duduclaw_core::ENV_AGENT_ID, "env-only-agent");
@@ -7164,12 +7207,13 @@ mod resolve_hook_caller_tests {
 
     #[test]
     fn agent_flag_without_env_token_is_soft_mode_agent() {
-        // Soft mode (the default — no config.toml at all here, so
-        // `require_identity_token` defaults to false): an --agent claim with
+        // Explicit soft mode: an --agent claim with
         // no DUDUCLAW_AGENT_TOKEN in env is `Unverified`, which is still
         // trusted — exactly how an env-only claim behaved before this fix.
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"),
+            format!("[delegation]\nrequire_identity_token = false\nidentity_token_grace_until = {:?}\n", (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339())).unwrap();
         clear_env();
         duduclaw_core::ensure_identity_key(tmp.path()).unwrap();
 
@@ -7405,6 +7449,9 @@ mod resolve_hook_caller_tests {
         let res = super::scaffold_agent_dir(home.path(), &scaffold_for("writer")).await;
         assert!(res.is_ok(), "{res:?}");
         assert!(home.path().join("agents/writer/agent.toml").exists());
+        assert_eq!(std::fs::read_dir(home.path().join("agents/writer/SKILLS")).unwrap().count(), 0);
+        assert!(home.path().join("skills/pdf/SKILL.md").exists());
+        assert!(!home.path().join("skills/code-review").exists());
     }
 }
 
@@ -8538,6 +8585,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
     );
 
     // Create directory structure
+    duduclaw_core::config::create_home_dir(&home)?;
     let agent_dir = home.join("agents").join(&agent_name);
     for dir in &[
         home.clone(),
@@ -8550,11 +8598,8 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
             DuDuClawError::Config(format!("Failed to create directory {}: {e}", dir.display()))
         })?;
     }
-    // Seed the bundled skills. Previously only the MCP `create_agent` tool did
-    // this, so an operator who onboarded from the CLI or the dashboard ended up
-    // with an empty SKILLS/ and a blank Skills page. Best-effort — never fail
-    // onboarding over a nicety.
-    let _ = duduclaw_agent::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS"));
+    // Shared defaults are installed once; personal skills are opt-in.
+    duduclaw_gateway::builtin_skills_seed_migration::run(&home);
 
     // config.toml — encrypt API key with AES-256-GCM (M-4)
     let config_path = home.join("config.toml");
@@ -9028,7 +9073,7 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
     // zero-prompt bootstrap already satisfies.
     let _ = yes;
     if !home.join("config.toml").exists() {
-        std::fs::create_dir_all(&home)?;
+        duduclaw_core::config::create_home_dir(&home)?;
         let content = format!(
         "# DuDuClaw configuration (auto-created on first run).\n\
          # Finish setup in the dashboard — no need to edit this by hand.\n\
@@ -9157,9 +9202,8 @@ async fn cmd_run_server(yes: bool) -> duduclaw_core::error::Result<()> {
         home_dir: home,
         allowed_origins,
         extension: Arc::new(duduclaw_gateway::NullExtension),
-        // Self-host default: resolve form-factor per-request from
-        // DUDUCLAW_EDITION env > license tier > Personal. Cloud control-plane
-        // sets the env var per managed tenant instead.
+        // Resolve per request; env/config can only narrow the verified
+        // license edition in all builds (no valid license => Personal).
         edition: None,
     };
 
@@ -10436,6 +10480,8 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
 
     let mut checks: Vec<(String, CheckStatus, String)> = Vec::new();
 
+    println!("技能提示：新員工共用公司層的四項辦公技能。舊個人副本不會自動刪除；請逐檔比對內容雜湊（含腳本），確認相同後在技能頁移除並封存，必要時還原。");
+
     // Check 1: config.toml exists
     let config_path = home.join("config.toml");
     if config_path.exists() {
@@ -10488,6 +10534,10 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
         ));
     }
 
+    if let Some(message) = duduclaw_core::config::home_permissions_warning(&home) {
+        checks.push(("資料目錄權限".into(), CheckStatus::Warn, message));
+    }
+
     // Check 2b (WP22 T1): organisational authority + mirror drift.
     checks.push(org_authority_check(&home));
 
@@ -10519,6 +10569,14 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // with the dashboard `system.doctor` card `subscription_login_risk`.
     if let Some(message) = duduclaw_gateway::doctor_probes::subscription_risk_notice(&home) {
         checks.push(("訂閱帳號政策風險".into(), CheckStatus::Warn, message));
+    }
+
+    // Read-only check for the protected systemd service's runtime search path.
+    // Never invokes sudo or a runtime binary; root-only unit details get an
+    // actionable install command instead of turning doctor into a failure.
+    #[cfg(target_os = "linux")]
+    if std::path::Path::new("/etc/systemd/system/duduclaw-gateway.service").exists() {
+        checks.push(protected_service_runtime_check(&home));
     }
 
     // Check 3: Claude Code CLI
@@ -10657,6 +10715,17 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // write (they run as the operator's OS user at every spawn).
     checks.push(doctor_mcp_servers::mcp_servers_check(&home));
     checks.push(doctor_egress_leases::check(&home));
+    let office_conflicts = duduclaw_agent::builtin_skills::office_script_conflicts(&home.join("skills"));
+    checks.push((
+        "辦公文件腳本".into(),
+        if office_conflicts.is_empty() { CheckStatus::Pass } else { CheckStatus::Warn },
+        if office_conflicts.is_empty() {
+            "公司層腳本符合內建版本；執行時只使用程式內建腳本".into()
+        } else {
+            format!("公司層腳本有衝突，這些副本不會執行：{}", office_conflicts.join("；"))
+        },
+    ));
+    checks.push(license::doctor_check(&home));
 
     // Check 4f: responsibilities whose runtimes may not report usage (M3-2).
     checks.push(responsibility_usage_check(&home).await);
@@ -10693,6 +10762,36 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     mcp_server_diagnostic(&home).await;
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn protected_service_runtime_check(home: &std::path::Path) -> (String, CheckStatus, String) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    let name = "受保護服務 AI CLI 路徑".to_string();
+    let configured = match service::protected_linux::runtime::configured(home) {
+        Ok(runtimes) => runtimes,
+        Err(error) => return (name, CheckStatus::Warn, format!("無法讀取 runtime 設定；請由管理者檢查：{error}")),
+    };
+    let mut missing = Vec::new();
+    for (provider, required) in configured {
+        let binaries = match service::protected_linux::runtime::binary_names(&provider) {
+            Ok(binaries) => binaries,
+            Err(error) => return (name, CheckStatus::Warn, format!("無法辨識 runtime {provider}；請由管理者檢查：{error}")),
+        };
+        let found = binaries.iter().any(|binary| {
+            ["/usr/sbin", "/usr/bin", "/sbin", "/bin"].iter().any(|dir| {
+                let path = Path::new(dir).join(binary);
+                std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            })
+        });
+        if !found && required { missing.push(format!("{provider} ({})", binaries.join("/"))); }
+    }
+    if missing.is_empty() {
+        (name, CheckStatus::Pass, "已設定的必要 AI CLI 位於服務系統 PATH；doctor 未執行 CLI 或檢查登入狀態。".into())
+    } else {
+        (name, CheckStatus::Warn, format!("服務帳號無法從 /usr/sbin:/usr/bin:/sbin:/bin 找到必要 CLI：{}。請管理員安裝到 /usr/bin；Claude 可執行 sudo -H npm install -g --prefix /usr @anthropic-ai/claude-code@<ver>。完整指引：docs/guides/linux-protected-service.md", missing.join(", ")))
+    }
 }
 
 /// Verbose Grok CLI runtime diagnostic for `duduclaw doctor`.
@@ -11099,14 +11198,6 @@ pub(crate) fn scaffold_agent_files(
     for filename in provider_context_filenames(*provider) {
         files.insert(filename.to_string(), context_md.as_bytes().to_vec());
     }
-    for (name, body) in duduclaw_agent::builtin_skills::BUILTIN_SKILLS {
-        files.insert(format!("SKILLS/{name}/SKILL.md"), body.as_bytes().to_vec());
-    }
-    for (name, entries) in duduclaw_agent::builtin_skills::BUILTIN_SKILL_FILES {
-        for (rel, body) in *entries {
-            files.insert(format!("SKILLS/{name}/{rel}"), body.as_bytes().to_vec());
-        }
-    }
     Ok(files)
 }
 
@@ -11125,6 +11216,7 @@ pub(crate) async fn scaffold_planned_agent_dir(
     let config = std::str::from_utf8(config).map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     duduclaw_gateway::product_policy::validate_write(home, &agent_dir.join("agent.toml"), "", config)
         .map_err(DuDuClawError::Agent)?;
+    duduclaw_core::config::create_home_dir(home)?;
     std::fs::create_dir_all(home.join("agents"))
         .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     // Exclusive directory creation refuses a destination created after planning.
@@ -11193,6 +11285,10 @@ mod planned_scaffold_tests {
             soul_body: Some("Approved persona".into()),
         };
         let mut files = super::scaffold_agent_files(&scaffold).unwrap();
+        let config: toml::Table = std::str::from_utf8(&files["agent.toml"]).unwrap().parse().unwrap();
+        assert_eq!(config["evolution"]["enabled"].as_bool(), Some(true));
+        assert_eq!(config["evolution"]["gvu_enabled"].as_bool(), Some(true));
+        assert!(!files.keys().any(|name| name.starts_with("SKILLS/")));
         for (name, content) in [("IDENTITY.md", "Approved identity"), ("USER.md", "User data"),
             ("INSTRUCTIONS.md", "Approved rules"), ("CONTRACT.toml", "[boundaries]\nmust_not = ['refund']\n")] {
             files.insert(name.into(), content.as_bytes().to_vec());
@@ -11249,6 +11345,7 @@ pub(crate) async fn scaffold_agent_dir(
     }
 
     // Create directory structure
+    duduclaw_core::config::create_home_dir(home)?;
     for dir in &[
         agent_dir.clone(),
         agent_dir.join("SKILLS"),
@@ -11259,8 +11356,8 @@ pub(crate) async fn scaffold_agent_dir(
             DuDuClawError::Agent(format!("Failed to create {}: {e}", dir.display()))
         })?;
     }
-    // Same seeding as the MCP `create_agent` path — see `duduclaw onboard`.
-    let _ = duduclaw_agent::builtin_skills::install_builtin_skills(&agent_dir.join("SKILLS"));
+    // Shared defaults are installed once; personal skills are opt-in.
+    duduclaw_gateway::builtin_skills_seed_migration::run(home);
 
     let AgentScaffold {
         name: agent_name,
@@ -11610,7 +11707,7 @@ async fn cmd_redteam(
     let home = duduclaw_home();
     let agent = match agent {
         Some(a) => a,
-        None => mcp::get_default_agent(&home).await,
+        None => default_agent_for_command(&home).await?,
     };
     let agent_dir = home.join("agents").join(&agent);
     let contract = duduclaw_agent::contract::load_contract(&agent_dir);
@@ -11798,10 +11895,42 @@ async fn open_memory_engine() -> duduclaw_core::error::Result<duduclaw_memory::S
         .map_err(|e| DuDuClawError::Memory(format!("open memory.db: {e}")))
 }
 
-async fn resolve_agent_arg(agent: Option<String>) -> String {
+/// Operator commands select a configured employee without claiming to be that
+/// employee. AI-session callers still pass through the MCP identity gate.
+pub(crate) async fn default_agent_for_command(home: &std::path::Path) -> duduclaw_core::error::Result<String> {
+    default_agent_for_command_with_session(home, !ai_session_guard::markers().is_empty()).await
+}
+
+async fn default_agent_for_command_with_session(home: &std::path::Path, in_session: bool) -> duduclaw_core::error::Result<String> {
+    if in_session {
+        let agent = mcp::get_default_agent(home).await;
+        if agent == duduclaw_core::UNTRUSTED_AGENT_ID {
+            return Err(DuDuClawError::Config("MCP caller identity rejected".into()));
+        }
+        return Ok(agent);
+    }
+    let path = home.join("config.toml");
+    let table = match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(error) => return Err(DuDuClawError::Config(error.to_string())),
+        Ok(_) => std::fs::read_to_string(&path)
+            .map_err(|e| DuDuClawError::Config(e.to_string()))?
+            .parse::<toml::Table>().map_err(|e| DuDuClawError::Config(e.to_string()))?,
+    };
+    let agent = table.get("general").and_then(|v| v.get("default_agent"))
+        .and_then(|v| v.as_str()).unwrap_or("dudu");
+    if !duduclaw_core::is_valid_agent_id(agent) || duduclaw_core::is_reserved_agent_id(agent)
+        || duduclaw_core::is_system_sender(agent) || duduclaw_core::is_reserved_queue_sender(agent)
+    {
+        return Err(DuDuClawError::Config("Invalid default employee identity".into()));
+    }
+    Ok(agent.to_string())
+}
+
+async fn resolve_agent_arg(agent: Option<String>) -> duduclaw_core::error::Result<String> {
     match agent {
-        Some(a) => a,
-        None => mcp::get_default_agent(&duduclaw_home()).await,
+        Some(a) => Ok(a),
+        None => default_agent_for_command(&duduclaw_home()).await,
     }
 }
 
@@ -11847,7 +11976,7 @@ async fn cmd_gdpr_export(
     // Refuse a blank or too-short contact before opening any store: it would
     // become a `%…%` pattern matching most of the employee's data.
     let contact = duduclaw_memory::gdpr_validate_contact(&contact)?.to_string();
-    let agent = resolve_agent_arg(agent).await;
+    let agent = resolve_agent_arg(agent).await?;
     let engine = open_memory_engine().await?;
     let mut bundle = duduclaw_memory::gdpr_export(&engine, &agent, &contact).await?;
     let (sessions, session_count) = gdpr_session_bundle(&contact).await?;
@@ -11891,7 +12020,7 @@ async fn cmd_gdpr_erase(
     // any store is opened: an empty contact matches every memory of the
     // employee, and the session and review-store steps use the same text.
     let contact = duduclaw_memory::gdpr_validate_contact(&contact)?.to_string();
-    let agent = resolve_agent_arg(agent).await;
+    let agent = resolve_agent_arg(agent).await?;
     let engine = open_memory_engine().await?;
 
     // Fail-closed: without --confirm this is a dry-run preview only.
@@ -12122,6 +12251,9 @@ async fn cmd_import_data(file: PathBuf, force: bool) -> duduclaw_core::error::Re
 /// to `mcp_http_server::run()` which binds an Axum listener.
 async fn cmd_http_server(
     bind: &str,
+    public_origin: Option<String>,
+    trusted_proxies: Vec<std::net::IpAddr>,
+    allow_insecure_lan: bool,
     no_sse: bool,
     timeout_secs: u64,
 ) -> duduclaw_core::error::Result<()> {
@@ -12134,6 +12266,15 @@ async fn cmd_http_server(
     let bind_addr: std::net::SocketAddr = bind
         .parse()
         .map_err(|e| DuDuClawError::Gateway(format!("Invalid bind address '{bind}': {e}")))?;
+
+    let cfg = crate::mcp_http_server::HttpServerConfig {
+        bind: bind_addr,
+        public_origin, trusted_proxies, allow_insecure_lan,
+        home_dir: home.clone(),
+        enable_sse: !no_sse,
+        call_timeout: std::time::Duration::from_secs(timeout_secs),
+    };
+    cfg.external_origin().map_err(DuDuClawError::Gateway)?;
 
     // Initialize HTTP client
     let http = reqwest::Client::builder()
@@ -12149,7 +12290,7 @@ async fn cmd_http_server(
         &home,
     );
 
-    let default_agent = mcp::get_default_agent(&home).await;
+    let default_agent = default_agent_for_command(&home).await?;
 
     // P2-4: initialise the RFC-23 egress layer for the HTTP/SSE transport too.
     // `None` ⇒ redaction not enabled in config.toml (zero-overhead skip). An
@@ -12184,13 +12325,6 @@ async fn cmd_http_server(
         crate::mcp_memory_quota::DailyQuota::new(),
     )
     .with_redaction(redaction_layer.map(Arc::new));
-
-    let cfg = crate::mcp_http_server::HttpServerConfig {
-        bind: bind_addr,
-        home_dir: home,
-        enable_sse: !no_sse,
-        call_timeout: std::time::Duration::from_secs(timeout_secs),
-    };
 
     println!("DuDuClaw MCP HTTP server starting on http://{bind_addr}");
     if !no_sse {
@@ -12258,6 +12392,7 @@ async fn cmd_mcp(cmd: McpCommands, home: &std::path::Path) -> duduclaw_core::err
             })?;
 
             println!();
+            eprintln!("Warning: {}", mcp_refresh::STDIO_ONLY_NOTICE);
             println!("🔑 Refresh token issued — copy NOW (it will not be shown again):");
             println!();
             println!("    {token}");
@@ -15278,6 +15413,8 @@ allowed_channels = ["*"]
 permissions_enforced_since = "1.68.0"
 
 [evolution]
+enabled = true
+gvu_enabled = true
 skill_auto_activate = false
 skill_security_scan = true
 "#

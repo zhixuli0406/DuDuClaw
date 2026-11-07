@@ -1,3 +1,4 @@
+import { canSelectAgent, useAgentGrantPresent } from '@/stores/callable-agents-store';
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { Eye, Hand, MonitorPlay, PlayCircle, ShieldAlert, Square, Undo2 } from 'lucide-react';
@@ -55,6 +56,16 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
   const [confirmStop, setConfirmStop] = useState(false);
   const [keepLogin, setKeepLogin] = useState(false);
   const [note, setNote] = useState('');
+  const selectable = useAgentGrantPresent(agentId);
+  useEffect(() => {
+    if (!selectable) {
+      setTicket(null);
+      setConfirmStop(false);
+      setKeepLogin(false);
+      setNote('');
+      setEnded(null);
+    }
+  }, [selectable, agentId]);
 
   const refresh = useCallback(async () => {
     try {
@@ -74,6 +85,7 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
   }, [refresh]);
 
   const run = async (fn: () => Promise<unknown>, done?: string) => {
+    if (!canSelectAgent(agentId)) return;
     setBusy(true);
     try {
       await fn();
@@ -89,12 +101,14 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
   const watch = () =>
     run(async () => {
       setEnded(null);
-      setTicket(await computerSessionApi.view(agentId));
+      const next = await computerSessionApi.view(agentId);
+      if (canSelectAgent(agentId)) setTicket(next);
     });
   const takeOver = () =>
     run(async () => {
       setEnded(null);
-      setTicket(await computerSessionApi.takeover(agentId));
+      const next = await computerSessionApi.takeover(agentId);
+      if (canSelectAgent(agentId)) setTicket(next);
     }, 'computerSession.takeover.done');
   const handBack = () =>
     run(async () => {
@@ -113,7 +127,7 @@ export function ComputerSessionPanel({ agentId }: { agentId: string }) {
       setKeepLogin(false);
     });
 
-  if (denied) {
+  if (denied || !selectable) {
     return (
       <div className="mx-auto w-full max-w-[1440px] p-4 sm:p-6">
         <Empty icon={MonitorPlay} variant="dashed" title={t('computerSession.denied')} />

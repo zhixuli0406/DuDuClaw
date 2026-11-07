@@ -1184,6 +1184,33 @@ pub async fn cancel_reminder(
     .map_err(|e| format!("spawn_blocking: {e}"))?
 }
 
+/// Dashboard reads fail closed on corrupt or unreadable persistence.
+pub(crate) async fn dashboard_reminders(home: &Path, ctx: &duduclaw_auth::UserContext, cancel: Option<&str>) -> Result<Vec<Reminder>, String> {
+    let home = home.to_path_buf();
+    let ctx = ctx.clone();
+    let cancel = cancel.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        let _lock = acquire_lock(&home)?;
+        let text = match std::fs::read_to_string(home.join("reminders.jsonl")) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.to_string()),
+        };
+        let mut rows = text.lines().filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str::<Reminder>).collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        let principal = format!("user:{}", ctx.user_id);
+        let allowed = |r: &Reminder, level| ctx.is_admin() || r.on_behalf_of.as_deref() == Some(principal.as_str())
+            || ctx.has_agent_access(&r.agent_id, level);
+        if let Some(id) = cancel {
+            let row = rows.iter_mut().find(|r| r.id == id && r.status == ReminderStatus::Pending
+                && allowed(r, duduclaw_auth::AccessLevel::Operator)).ok_or("permission denied")?;
+            row.status = ReminderStatus::Cancelled;
+            save_reminders_sync(&home, &rows)?;
+        }
+        Ok(rows.into_iter().filter(|r| allowed(r, duduclaw_auth::AccessLevel::Viewer)).collect())
+    }).await.map_err(|e| e.to_string())?
+}
+
 // ── Entry point ─────────────────────────────────────────────
 
 /// Start the reminder scheduler as a background task.

@@ -195,7 +195,7 @@ fn valid_native() -> AttestationInputs {
         native: NativeInputs {
             initial_user_namespace: true, container_environment_absent: true,
             ppid: 1, cgroup: CgroupState::Unit, executable: ExecutableState::Protected,
-            supplementary_groups: Some(0), engine_sockets_denied: true,
+            supplementary_groups: Some(0), engine_sockets_denied: true, engine_scan_complete: true, engine_socket_detail: None,
         },
         pid: 1234, sockets_absent: false, ..valid()
     }
@@ -372,4 +372,58 @@ fn root_key_failed_reattest_atomically_revokes_only_held_state() {
     let mut absent = State::NotOffered;
     assert!(!revoke_if_held(&mut absent, "other_failure"));
     assert!(matches!(absent, State::NotOffered));
+}
+
+
+#[test]
+fn root_key_warn_policy_intake_keeps_only_confirmed_socket_exception() {
+    use policy::EngineSocketAction::{Revoke, Warn};
+    let mut reachable = valid_native();
+    reachable.native.engine_sockets_denied = false;
+    reachable.native.engine_socket_detail = Some("@docker: peer uid=0 (root)".into());
+    assert_eq!(attest_with_policy(&reachable, Revoke), Err("engine_socket_reachable"));
+    assert_eq!(attest_with_policy(&reachable, Warn), Ok(()));
+    // Simultaneous failures must be checked even after accepting the socket.
+    let cases: &[(&str, fn(&mut AttestationInputs))] = &[
+        ("user_namespace", |i| i.native.initial_user_namespace = false),
+        ("container_environment", |i| i.native.container_environment_absent = false),
+        ("not_systemd_child", |i| i.native.ppid = 2),
+        ("cgroup_v1", |i| i.native.cgroup = CgroupState::V1),
+        ("cgroup_unit", |i| i.native.cgroup = CgroupState::Invalid),
+        ("exe_owner", |i| i.native.executable = ExecutableState::Owner),
+        ("exe_writable", |i| i.native.executable = ExecutableState::Writable),
+        ("supplementary_groups", |i| i.native.supplementary_groups = Some(1)),
+        ("engine_socket_probe_failed", |i| i.native.engine_scan_complete = false),
+        ("key_path_accessible", |i| i.key_path_denied = false),
+        ("no_new_privs", |i| i.no_new_privs = Some(0)),
+        ("dumpable", |i| i.dumpable = 1),
+        ("docker_host", |i| i.docker_host_absent = false),
+        ("user_ids", |i| i.uids = Some([0; 3])),
+        ("group_ids", |i| i.gids = Some([0; 3])),
+        ("proc_status", |i| i.no_new_privs = None),
+    ];
+    for (reason, change) in cases {
+        let mut inputs = reachable.clone(); change(&mut inputs);
+        assert_eq!(attest_with_policy(&inputs, Warn), Err(*reason));
+    }
+    for (n, reason) in ["cap_inh", "cap_prm", "cap_eff", "cap_bnd", "cap_amb"].into_iter().enumerate() {
+        let mut inputs = reachable.clone(); inputs.capabilities[n] = Some(1);
+        assert_eq!(attest_with_policy(&inputs, Warn), Err(reason));
+    }
+    reachable.mode = AttestationMode::Container; reachable.pid = 1;
+    assert_eq!(attest_with_policy(&reachable, Warn), Err("engine_socket"));
+}
+
+#[test]
+fn root_key_warn_policy_periodic_decision_table() {
+    use policy::EngineSocketAction::{Revoke, Warn};
+    for action in [Revoke, Warn] {
+        assert!(native::periodic_decision(Ok(()), action).is_ok());
+        for reason in ["engine_socket_reachable", "engine_socket_probe_failed", "supplementary_groups",
+            "exe_owner", "exe_writable", "cgroup_unit", "user_namespace", "container_environment",
+            "key_path_accessible", "engine_socket", "unknown"] {
+            let result = native::periodic_decision(Err(Refusal { reason, detail: Some("probe".into()) }), action);
+            assert_eq!(result.is_ok(), action == Warn && reason == "engine_socket_reachable", "{reason}");
+        }
+    }
 }

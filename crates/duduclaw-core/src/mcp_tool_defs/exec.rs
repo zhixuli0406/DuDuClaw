@@ -47,7 +47,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "office_script",
-        description: "Run a bundled office skill's Python script (docx/xlsx/pptx/pdf) to read or create a document. Use instead of Bash when you have no shell. End your reply with `DELIVER:<absolute path>` to hand it over.",
+        description: "Run a verified bundled office script (docx/xlsx/pptx/pdf) on Linux/macOS. Skill folders change prompts, not code. Use `DELIVER:<absolute path>` to hand over output.",
         params: &[
             ParamDef {
                 name: "skill",
@@ -56,12 +56,12 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "script",
-                description: "Script name without any path: create, extract, or to_pdf (the .py suffix is optional)",
+                description: "Script: create, extract, or to_pdf; optional .py suffix, no path",
                 required: true,
             },
             ParamDef {
                 name: "args",
-                description: "JSON array of string arguments, e.g. [\"outline.md\", \"--out\", \"/abs/agent-dir/attachments/deck.pptx\"]. Any path must resolve inside your agent directory.",
+                description: "JSON string array of args. Input: agent dir or shared attachments. Output: new file in agent dir, existing parent, matching extension. Split flags/values; no --key=value, symlinks or traversal.",
                 required: false,
             },
         ],

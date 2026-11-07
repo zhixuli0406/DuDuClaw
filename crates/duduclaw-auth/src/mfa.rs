@@ -111,6 +111,8 @@ pub(crate) fn migrate(conn: &Connection, enforced: bool) -> Result<()> {
             .map_err(|e| e.to_string())?;
         tracing::warn!("Legacy unseeded MFA policy row was initialized as not enforced");
     }
+    email::migrate(conn)?;
+    passkey::migrate(conn)?;
     read_enforcement(conn)?;
     tx.commit().map_err(|e| e.to_string())
 }
@@ -280,9 +282,20 @@ fn check_factor(
     cipher: &dyn MfaCipher,
     now: i64,
 ) -> Result<()> {
-    let (enc, last, failures, window): (String, i64, i64, i64) = tx.query_row(
+    let credential: Option<(String, i64, i64, i64)> = tx.query_row(
         "SELECT secret_enc,last_step,failed_attempts,failure_window FROM mfa_credentials WHERE user_id=?1", [user],
-        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|_| DENIED)?;
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|_| DENIED)?;
+    let (enc, last, failures, window) = match credential {
+        Some(value) => value,
+        None if recovery && any_factor(tx, user)? => {
+            let (failures, window) = tx.query_row(
+                "SELECT attempts,window FROM mfa_factor_failures WHERE user_id=?1", [user],
+                |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).optional()
+                .map_err(|e|e.to_string())?.unwrap_or((0,0));
+            (String::new(), -1, failures, window)
+        }
+        None => return Err(DENIED.into()),
+    };
     if window > now - 900 && failures >= 5 {
         return Err(DENIED.into());
     }
@@ -338,6 +351,10 @@ fn check_factor(
         ],
     )
     .map_err(|e| e.to_string())?;
+    tx.execute("INSERT INTO mfa_factor_failures(user_id,attempts,window) VALUES(?1,?2,?3)
+        ON CONFLICT(user_id) DO UPDATE SET attempts=excluded.attempts,window=excluded.window",
+        params![user,if verified {0} else if window<=now-900 {1} else {failures+1},if window<=now-900 {now} else {window}])
+        .map_err(|e|e.to_string())?;
     if verified { Ok(()) } else { Err(DENIED.into()) }
 }
 fn challenge_user(tx: &Connection, token: &str, purpose: &str, now: i64) -> Result<String> {
@@ -346,40 +363,86 @@ fn challenge_user(tx: &Connection, token: &str, purpose: &str, now: i64) -> Resu
 }
 
 impl UserDb {
-    /// Serialize legacy token issuance with enrollment, so activation cannot
-    /// race the first-factor check and accidentally mint a one-factor session.
+    /// Serialize legacy token issuance with enrollment and policy changes.
+    /// `epoch` comes from first-factor verification; the issuer must not re-enter UserDb.
     pub fn mfa_issue_if_unenrolled<T>(
         &self,
         user: &str,
-        issue: impl FnOnce() -> Result<T>,
+        epoch: u64,
+        policy_exempt: bool,
+        issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)]) -> Result<T>,
     ) -> Result<T> {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        active_user(&tx, user)?;
-        let active: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM mfa_credentials WHERE user_id=?1)",
-                [user],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if active {
+        let current = issuance_user(&tx, user, epoch, policy_exempt)?;
+        let active = any_factor(&tx, user)?;
+        if policy_enforced(&tx)? || active {
             return Err(DENIED.into());
         }
-        let result = issue()?;
+        let bindings = crate::org::direct_bindings(&tx, user)?.into_iter().collect::<Vec<_>>();
+        let result = issue(&current, &bindings)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(result)
+    }
+
+    /// The verified refresh credential's epoch proves it survived the last
+    /// factor change. Check policy and session exchange while issuance is locked.
+    /// The compatibility edition flag is ignored; do not re-enter UserDb.
+    pub fn mfa_refresh_and_issue<T>(
+        &self,
+        user: &str,
+        epoch: u64,
+        session: Option<&str>,
+        policy_exempt: bool,
+        issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)]) -> Result<T>,
+    ) -> Result<T> {
+        // The compatibility edition flag never exempts a stored policy.
+        let _ = policy_exempt;
+        self.mfa_issue_session(user, epoch, true, session, issue)
+    }
+    /// Enforced refresh requires current enrollment and a matching credential epoch.
+    pub fn mfa_issue_refresh<T>(
+        &self, user: &str, epoch: u64,
+        issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)]) -> Result<T>,
+    ) -> Result<T> {
+        self.mfa_issue_session(user, epoch, true, None, issue)
+    }
+    /// Local auto-login has no second factor, even for an enrolled owner.
+    pub fn mfa_issue_local_session<T>(
+        &self, user: &str, epoch: u64,
+        issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)]) -> Result<T>,
+    ) -> Result<T> {
+        self.mfa_issue_session(user, epoch, false, None, issue)
+    }
+    fn mfa_issue_session<T>(
+        &self, user: &str, epoch: u64, refresh: bool, session: Option<&str>,
+        issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)]) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let required = policy_enforced(&tx)?;
+        active_user(&tx, user)?;
+        let enrolled = any_factor(&tx, user)?;
+        if required && !(refresh && enrolled) { return Err(DENIED.into()); }
+        if refresh {
+            let exchanged: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM remembered_families WHERE login_session=?1)",
+                [session], |r| r.get(0),
+            ).map_err(|e| e.to_string())?;
+            if exchanged { return Err(DENIED.into()); }
+        }
+        let result = issue_mfa_result(&tx, user, Vec::new(), |user, access, _| {
+            if !credential_epoch_matches(epoch, user.credential_epoch)
+                || (!refresh && user.must_change_password) { return Err(DENIED.into()); }
+            issue(user, access)
+        })?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(result)
     }
     pub fn mfa_active(&self, user: &str) -> Result<bool> {
-        self.conn()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM mfa_credentials WHERE user_id=?1)",
-                [user],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())
+        any_factor(&self.conn(), user)
     }
     pub fn mfa_challenge(
         &self,
@@ -394,13 +457,7 @@ impl UserDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         active_user(&tx, user)?;
-        let enrolled: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM mfa_credentials WHERE user_id=?1)",
-                [user],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
+        let enrolled = any_factor(&tx, user)?;
         if enrolled == enrollment {
             return Err(DENIED.into());
         }
@@ -468,13 +525,12 @@ impl UserDb {
         cipher: &dyn MfaCipher,
         now: i64,
     ) -> Result<Vec<String>> {
-        self.mfa_confirm_and_issue(user, enrollment, code, cipher, now, false, |_, _, codes| Ok(codes))
+        self.mfa_confirm_and_issue(user, enrollment, code, cipher, now, |_, _, codes| Ok(codes))
     }
 
     /// Issue the replacement session while enrollment, recovery codes and epoch
     /// are still uncommitted. An issuer error rolls back all of them.
     /// The callback must not re-enter UserDb (the connection is locked).
-    /// `policy_exempt` is only for the installation-owned Personal edition.
     #[allow(clippy::too_many_arguments)]
     pub fn mfa_confirm_and_issue<T>(
         &self,
@@ -483,7 +539,6 @@ impl UserDb {
         code: &str,
         cipher: &dyn MfaCipher,
         now: i64,
-        policy_exempt: bool,
         issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>,
     ) -> Result<T> {
         if enrollment.is_none() { return Err(DENIED.into()); }
@@ -492,7 +547,7 @@ impl UserDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         active_user(&tx, user)?;
-        if !policy_exempt && policy_enforced(&tx)? {
+        if policy_enforced(&tx)? && !any_factor(&tx, user)? {
             enrollment::require_independent_proof(&tx, enrollment.ok_or(DENIED)?, now)?;
         }
         if let Some(token) = enrollment {
@@ -531,7 +586,8 @@ impl UserDb {
             params![user, encrypted, step],
         )
         .map_err(|_| DENIED)?;
-        let codes = replace_recovery(&tx, user)?;
+        let has_codes: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM mfa_recovery_codes WHERE user_id=?1)", [user], |r|r.get(0)).map_err(|e|e.to_string())?;
+        let codes = if has_codes { Vec::new() } else { replace_recovery(&tx, user)? };
         tx.execute("DELETE FROM mfa_pending WHERE user_id=?1", [user])
             .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM mfa_challenges WHERE user_id=?1", [user])
@@ -569,6 +625,7 @@ impl UserDb {
             )
             .map_err(|e| e.to_string())?;
             audit(&tx, &user, "mfa.login", None)?;
+            if !recovery { set_last_factor(&tx, &user, "totp")?; }
         } else {
             audit(&tx, &user, "mfa.verification_failed", None)?;
         }
@@ -584,12 +641,11 @@ impl UserDb {
         cipher: &dyn MfaCipher,
         now: i64,
     ) -> Result<Vec<String>> {
-        self.mfa_change_and_issue(user, code, disable, cipher, now, false, |_, _, codes| Ok(codes))
+        self.mfa_change_and_issue(user, code, disable, cipher, now, |_, _, codes| Ok(codes))
     }
 
     /// As with enrollment, failed session issuance rolls back a disable,
     /// including factor consumption and the credential epoch.
-    /// `policy_exempt` is only for the installation-owned Personal edition.
     #[allow(clippy::too_many_arguments)]
     pub fn mfa_change_and_issue<T>(
         &self,
@@ -598,7 +654,6 @@ impl UserDb {
         disable: bool,
         cipher: &dyn MfaCipher,
         now: i64,
-        policy_exempt: bool,
         issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>,
     ) -> Result<T> {
         let mut conn = self.conn();
@@ -606,7 +661,7 @@ impl UserDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         active_user(&tx, user)?;
-        if disable && !policy_exempt && policy_enforced(&tx)? {
+        if disable && policy_enforced(&tx)? && factor_count(&tx, user)? <= 1 {
             return Err("管理員已要求雙因素驗證，無法停用。".into());
         }
         if check_factor(&tx, user, code, code.len() != 6, cipher, now).is_err() {
@@ -615,7 +670,13 @@ impl UserDb {
             return Err(DENIED.into());
         }
         let codes = if disable {
-            clear(&tx, user)?;
+            tx.execute("DELETE FROM mfa_credentials WHERE user_id=?1", [user]).map_err(|e|e.to_string())?;
+            tx.execute("DELETE FROM mfa_pending WHERE user_id=?1", [user]).map_err(|e|e.to_string())?;
+            tx.execute("DELETE FROM mfa_challenges WHERE user_id=?1", [user]).map_err(|e|e.to_string())?;
+            if !any_factor(&tx, user)? {
+                tx.execute("DELETE FROM mfa_recovery_codes WHERE user_id=?1", [user]).map_err(|e|e.to_string())?;
+            }
+            bump_epoch(&tx, user)?;
             Vec::new()
         } else {
             replace_recovery(&tx, user)?
@@ -685,6 +746,25 @@ impl UserDb {
         tx.commit().map_err(|e| e.to_string())
     }
 }
+/// Call only inside the immediate transaction that also invokes the issuer.
+/// Enrollment and factor changes bump the epoch, invalidating one-factor tokens
+/// minted before enrollment. Even Personal refuses an unreadable policy store.
+pub(crate) fn issuance_user(
+    tx: &Connection,
+    user: &str,
+    epoch: u64,
+    _policy_exempt: bool,
+) -> Result<crate::User> {
+    let current = crate::user_row::load_user(tx, user)?.ok_or(DENIED)?;
+    if current.status != crate::UserStatus::Active || current.credential_epoch != epoch {
+        return Err(DENIED.into());
+    }
+    let enforced = read_enforcement(tx)?;
+    let enrolled = any_factor(tx, user)?;
+    if enforced && !enrolled { return Err(DENIED.into()); }
+    Ok(current)
+}
+
 fn issue_mfa_result<T>(
     tx: &Connection,
     user: &str,
@@ -700,6 +780,30 @@ fn bump_epoch(tx: &Connection, user: &str) -> Result<()> {
     tx.execute("UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", [user]).map_err(|e|e.to_string())?;
     crate::user_row::bump_acl_generation(tx).map_err(|e|e.to_string())
 }
+
+pub(super) fn factor_count(conn: &Connection, user: &str) -> Result<i64> {
+    conn.query_row("SELECT (SELECT COUNT(*) FROM mfa_credentials WHERE user_id=?1)
+        + (SELECT COUNT(*) FROM mfa_email_credentials e JOIN users u ON u.id=e.user_id WHERE e.user_id=?1 AND e.email=u.email)
+        + (SELECT COUNT(*) FROM mfa_passkeys WHERE user_id=?1)", [user], |r|r.get(0)).map_err(|e|e.to_string())
+}
+pub(crate) fn any_factor(conn: &Connection, user: &str) -> Result<bool> {
+    Ok(factor_count(conn, user)? > 0)
+}
+pub(super) fn set_last_factor(conn: &Connection, user: &str, factor: &str) -> Result<()> {
+    conn.execute("INSERT INTO mfa_factor_preferences(user_id,last_used) VALUES(?1,?2)
+        ON CONFLICT(user_id) DO UPDATE SET last_used=excluded.last_used", params![user,factor])
+        .map_err(|e|e.to_string())?;
+    Ok(())
+}
+
+pub(super) fn check_reauth(conn: &Connection, user: &str, token: &str, session: &str, now: i64) -> Result<()> {
+    active_user(conn, user)?;
+    if session.is_empty() || challenge_user(conn, token, "enroll", now)? != user { return Err(DENIED.into()); }
+    let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM mfa_enrollment_proofs
+        WHERE token_hash=?1 AND session=?2 AND verified=1)", params![token_hash(token),session], |r|r.get(0))
+        .map_err(|e|e.to_string())?;
+    if valid { Ok(()) } else { Err(DENIED.into()) }
+}
 fn clear(tx: &Connection, user: &str) -> Result<()> {
     bump_epoch(tx, user)?;
     for table in [
@@ -708,6 +812,12 @@ fn clear(tx: &Connection, user: &str) -> Result<()> {
         "mfa_recovery_codes",
         "mfa_challenges",
         "mfa_enrollment_codes",
+        "mfa_email_credentials",
+        "mfa_email_codes",
+        "mfa_factor_preferences",
+        "mfa_factor_failures",
+        "mfa_passkeys",
+        "mfa_passkey_ceremonies",
     ] {
         tx.execute(&format!("DELETE FROM {table} WHERE user_id=?1"), [user])
             .map_err(|e| e.to_string())?;
@@ -718,7 +828,12 @@ fn clear(tx: &Connection, user: &str) -> Result<()> {
 mod enrollment;
 mod migration;
 pub use migration::MigrationConfirmationSession;
+pub mod email;
+pub mod passkey;
 use enrollment::proof_verified;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod issuance_tests;

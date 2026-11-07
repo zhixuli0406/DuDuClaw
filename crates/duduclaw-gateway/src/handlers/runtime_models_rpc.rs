@@ -31,7 +31,7 @@ impl MethodHandler {
         let mut claude_bin: Option<String> = None;
         for spec in duduclaw_core::runtime_catalog::cli_specs_for_profile(policy) {
             if policy.require_runtime(spec.id).is_err() { continue; }
-            let found = duduclaw_core::detect_runtime(spec.id, &user_home);
+            let found = crate::runtime_readiness::detect_runtime(spec.id, &user_home);
             if spec.id == "claude" {
                 claude_bin = found.clone();
             }
@@ -46,7 +46,14 @@ impl MethodHandler {
                     crate::runtime::codex::probe_codex_version_output(bin).await
                 } else { None }
             } else { None };
-            rows.push(runtime_detect_row(spec, found.as_deref(), cred_present, version.as_deref()));
+            let mut row = runtime_detect_row(spec, found.as_deref(), cred_present, version.as_deref());
+            if crate::runtime_readiness::is_protected_linux() && found.is_none() {
+                row["repair_hint"] = Value::String(crate::runtime_readiness::protected_runtime_guidance(spec.binary));
+                if spec.id == "claude" {
+                    row["install_command"] = Value::String("cd / && sudo -H npm install -g --prefix /usr @anthropic-ai/claude-code@<ver>".into());
+                }
+            }
+            rows.push(row);
         }
         let (claude_oauth, claude_subscription) = detect_claude_oauth(claude_bin.as_deref()).await;
 

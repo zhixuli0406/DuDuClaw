@@ -70,6 +70,7 @@ use Ty::*;
 
 /// `(section path, key, type)` for every typed key a reader consumes.
 pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
+    ("security", "mail_requester_approval", Bool),
     ("auth", "mfa_enforced", Bool),
     ("product", "profile", OneOf(&["standard", "restricted"])),
     ("general", "log_level", Str),

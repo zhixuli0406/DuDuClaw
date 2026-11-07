@@ -76,6 +76,7 @@ export function GoogleIntegrationPage() {
   // than guessing, so a transient RPC failure never claims the integration is
   // off when it is on.
   const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [chatRead, setChatRead] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [advanced, setAdvanced] = useState(false);
@@ -85,8 +86,10 @@ export function GoogleIntegrationPage() {
     try {
       const status = await api.googleCredentials.get();
       setEnabled(status.integration_enabled);
+      setChatRead(status.chat_read === true);
     } catch {
       setEnabled(null);
+      setChatRead(null);
     }
   }, []);
 
@@ -161,6 +164,20 @@ export function GoogleIntegrationPage() {
           </CardContent>
         </Card>
       )}
+
+      {admin && chatRead !== null && <Card><CardContent className="space-y-3 py-4">
+        <label className="flex items-center gap-2 text-sm font-medium">
+          <input type="checkbox" checked={chatRead} disabled={busy} onChange={event => {
+            const next = event.target.checked;
+            setBusy(true);
+            void api.googleCredentials.setChatRead(next).then(result => setChatRead(result.chat_read))
+              .catch(error => toast.error(formatError(error))).finally(() => setBusy(false));
+          }} />
+          {t('google.chatRead.title', 'Google Chat 讀取')}
+        </label>
+        <p className="text-sm text-muted-foreground">{t('google.chatRead.hint', '開啟後，請使用者到「我的連線」重新連結 Google，並勾選 Chat 權限。AI 員工可讀取該帳號加入的聊天室與最近訊息；不會傳送訊息或下載附件。')}</p>
+        <p className="text-sm text-muted-foreground">{t('google.chatRead.setup', 'OAuth 用戶端所屬的 Google Cloud 專案須啟用 Google Chat API 並完成 Chat 應用程式設定；Workspace 管理員可能還須允許此應用程式。')}</p>
+      </CardContent></Card>}
 
       {advanced && <div id="google-advanced-settings" className="space-y-4">
       <IntegrationConnectPanel

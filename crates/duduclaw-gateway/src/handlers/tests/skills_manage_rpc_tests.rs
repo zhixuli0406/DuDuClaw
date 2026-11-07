@@ -1,8 +1,7 @@
 //! B8 — per-employee skill switches, removal and the permission-filtered
 //! `skills.list`, end to end through `MethodHandler::handle` with a real
-//! `users.db`. Both employees are created through `agents.create`, so each
-//! gets the same seeded built-in skills (`docx`, `pdf`, …): same-named skills
-//! on two employees are the default fixture here, not a special case.
+//! `users.db`. Explicit legacy personal copies keep removal/restore coverage
+//! independent of the shared defaults used for new employees.
 use super::*;
 
 fn ok(frame: &WsFrame) -> Value {
@@ -53,10 +52,17 @@ struct Fx {
 async fn fixture() -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().canonicalize().unwrap();
+    // Simulate a legacy installation whose default migration already ran.
+    std::fs::create_dir_all(home.join("migrations")).unwrap();
+    for marker in ["wp19-builtin-skills-seed.done", "g1-connect-google-seed-v1.done"] {
+        std::fs::write(home.join("migrations").join(marker), "done").unwrap();
+    }
+    std::fs::write(home.join("config.toml"), "[general]\ndefault_agent = \"dudu\"\n").unwrap();
     let h = MethodHandler::new(home.clone()).await;
     let system = UserContext::admin_fallback();
     for (id, name) in [("a1", "Alice"), ("b1", "Bob")] {
         ok(&h.handle_agents_create_as(json!({ "name": id, "display_name": name }), Some(&system)).await);
+        duduclaw_agent::builtin_skills::install_builtin_skills(&home.join("agents").join(id).join("SKILLS")).unwrap();
     }
     // A company-wide skill both employees load.
     std::fs::create_dir_all(home.join("skills")).unwrap();
@@ -102,6 +108,59 @@ fn item(agent: &str, skill: &str) -> Value {
 
 fn entry<'a>(skills: &'a [Value], name: &str) -> &'a Value {
     skills.iter().find(|s| s["name"] == name).unwrap_or_else(|| panic!("{name} not listed"))
+}
+
+#[tokio::test]
+async fn recent_skills_filter_other_users_disabled_skills_and_live_bindings() {
+    let f = fixture().await;
+    crate::recent_skills::record(&f.home, &f.owner_a.user_id, "a1", &["tone".into(), "pdf".into()]).unwrap();
+    assert_eq!(ok(&f.call("skills.recent", json!({ "user_id": f.owner_a.user_id }), &f.viewer_a).await)["skills"], json!([]));
+    let p = ok(&f.call("skills.recent", json!({ "agent_id": "a1", "assigning": true }), &f.owner_a).await);
+    assert_eq!(p["skills"][0]["name"], "tone");
+    assert_eq!(p["skills"][1]["name"], "pdf");
+    assert!(p["skills"][0].get("content").is_none());
+    duduclaw_agent::skill_state::set_disabled(&f.home, "a1", &["tone".into()], true).unwrap();
+    let p = ok(&f.call("skills.recent", json!({ "agent_id": "a1" }), &f.owner_a).await);
+    assert_eq!(p["skills"].as_array().unwrap().len(), 1);
+    assert_eq!(p["skills"][0]["name"], "pdf");
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap()
+        .execute("DELETE FROM user_agent_bindings WHERE user_id=?1", [&f.owner_a.user_id]).unwrap();
+    assert_eq!(ok(&f.call("skills.recent", json!({}), &f.owner_a).await)["skills"], json!([]));
+    assert_eq!(err(&f.call("skills.recent", json!({ "agent_id": "a1" }), &f.owner_a).await), "permission denied");
+}
+
+#[tokio::test]
+async fn recent_skills_viewer_can_reuse_in_chat_but_not_assign() {
+    let f = fixture().await;
+    crate::recent_skills::record(&f.home, &f.viewer_a.user_id, "a1", &["tone".into()]).unwrap();
+    let p = ok(&f.call("skills.recent", json!({ "agent_id": "a1" }), &f.viewer_a).await);
+    assert_eq!(p["skills"][0]["name"], "tone");
+    assert_eq!(ok(&f.call("skills.recent", json!({ "assigning": true }), &f.viewer_a).await)["skills"], json!([]));
+}
+
+#[tokio::test]
+async fn recent_skills_returns_at_most_five_accessible_names() {
+    let f = fixture().await;
+    let mut names = Vec::new();
+    for n in 0..7 {
+        let name = format!("recent-{n}");
+        std::fs::write(f.home.join(format!("skills/{name}.md")), format!("---\nname: {name}\ndescription: short description\n---\nWork." )).unwrap();
+        names.push(name);
+    }
+    crate::recent_skills::record(&f.home, &f.owner_a.user_id, "a1", &names).unwrap();
+    let p = ok(&f.call("skills.recent", json!({}), &f.owner_a).await);
+    assert_eq!(p["skills"].as_array().unwrap().len(), 5);
+    assert_eq!(p["skills"][0]["name"], "recent-0");
+    assert_eq!(p["skills"][4]["name"], "recent-4");
+}
+
+#[tokio::test]
+async fn recent_skills_chat_records_only_loaded_enabled_skill_tokens() {
+    let f = fixture().await;
+    duduclaw_agent::skill_state::set_disabled(&f.home, "a1", &["pdf".into()], true).unwrap();
+    crate::recent_skills::record_chat(&f.home, &f.h.registry, &f.owner_a.user_id, "a1",
+        "/tone /pdf /not-installed extra details").await;
+    assert_eq!(crate::recent_skills::list(&f.home, &f.owner_a.user_id).unwrap(), vec![("a1".into(), "tone".into())]);
 }
 
 #[tokio::test]
@@ -279,4 +338,76 @@ async fn failed_reload_is_an_error_not_a_success() {
     assert!(duduclaw_agent::skill_state::read_disabled(&f.home, "a1").is_disabled("pdf"));
     ok(&f.call("skills.set_enabled", json!({ "items": [item("a1", "pdf")], "enabled": false }), &f.admin).await);
     assert!(!f.loaded("a1").await.contains(&"pdf".to_string()));
+}
+
+// B3: the aggregate contract separates global rows from per-employee rows.
+#[tokio::test]
+async fn skills_list_b3_composes_three_scopes_without_global_duplicates() {
+    let f = fixture().await;
+    let config = f.home.join("agents/a1/agent.toml");
+    let mut agent: toml::Value = toml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    agent["agent"]["department"] = toml::Value::String("sales".into());
+    std::fs::write(config, toml::to_string(&agent).unwrap()).unwrap();
+    std::fs::write(f.home.join("org.toml"), "schema = 1\n[agents.a1]\ndepartment = \"sales\"\n").unwrap();
+    let dept = duduclaw_agent::skill_loader::department_skills_dir(&f.home, "sales");
+    std::fs::create_dir_all(&dept).unwrap();
+    std::fs::write(dept.join("sales-guide.md"), "# Sales guide\n").unwrap();
+    // A personal copy overrides the department copy, which overrides global.
+    std::fs::write(f.home.join("skills/override.md"), "# Global copy\n").unwrap();
+    std::fs::write(dept.join("override.md"), "# Department copy\n").unwrap();
+    std::fs::write(f.home.join("agents/a1/SKILLS/override.md"), "# Personal copy\n").unwrap();
+    f.h.registry.write().await.scan().await.unwrap();
+
+    let all = ok(&f.call("skills.list", json!({}), &f.admin).await);
+    let globals = all["global_skills"].as_array().unwrap();
+    assert_eq!(globals.len(), 2);
+    assert!(globals.iter().all(|s| s["scope"] == "global"));
+    assert_eq!(globals.iter().filter(|s| s["name"] == "tone").count(), 1);
+    for a in all["agents"].as_array().unwrap() {
+        assert!(a["skills"].as_array().unwrap().iter().all(|s| s["scope"] != "global"));
+    }
+    let one = ok(&f.call("skills.list", json!({"agent_id": "a1"}), &f.viewer_a).await);
+    let skills = one["skills"].as_array().unwrap();
+    assert_eq!(entry(skills, "tone")["scope"], "global");
+    assert_eq!(entry(skills, "sales-guide")["scope"], "department");
+    assert_eq!(entry(skills, "pdf")["scope"], "agent");
+    assert_eq!(skills.iter().filter(|s| s["name"] == "override").count(), 1);
+    assert_eq!(entry(skills, "override")["scope"], "agent");
+    assert_eq!(entry(skills, "override")["content"], "# Personal copy\n");
+
+    std::fs::remove_file(f.home.join("agents/a1/SKILLS/override.md")).unwrap();
+    let one = ok(&f.call("skills.list", json!({"agent_id": "a1"}), &f.viewer_a).await);
+    let skills = one["skills"].as_array().unwrap();
+    assert_eq!(entry(skills, "override")["scope"], "department");
+    assert_eq!(entry(skills, "override")["content"], "# Department copy\n");
+
+    // Hidden employees must not leak via holders, paths, or personal rows.
+    let visible = ok(&f.call("skills.list", json!({}), &f.viewer_a).await);
+    assert_eq!(visible["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(visible["agents"][0]["agent_id"], "a1");
+    for skill in visible["global_skills"].as_array().unwrap() {
+        assert!(skill["holders"].as_array().unwrap().iter().all(|h| h["agent_id"] == "a1"));
+    }
+    for diag in visible["scanned"].as_array().unwrap() {
+        assert!(!Path::new(diag["path"].as_str().unwrap()).starts_with(f.home.join("agents/b1")));
+    }
+}
+
+#[tokio::test]
+async fn skills_list_b3_rechecks_revoked_access_and_fails_closed() {
+    let f = fixture().await;
+    // Keep the stale socket context but revoke its live employee binding.
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap()
+        .execute("DELETE FROM user_agent_bindings WHERE user_id = ?1", ["viewer-a"])
+        .unwrap();
+    let e = err(&f.call("skills.list", json!({"agent_id": "a1"}), &f.viewer_a).await);
+    assert!(e.contains("permission"), "{e}");
+    let all = ok(&f.call("skills.list", json!({}), &f.viewer_a).await);
+    assert!(all["agents"].as_array().unwrap().is_empty());
+    assert!(all["global_skills"].as_array().unwrap().iter()
+        .all(|s| s["holders"].as_array().unwrap().is_empty()));
+    std::fs::rename(f.home.join("users.db"), f.home.join("users.saved.db")).unwrap();
+    std::fs::create_dir(f.home.join("users.db")).unwrap();
+    let e = err(&f.call("skills.list", json!({}), &f.viewer_a).await);
+    assert!(e.contains("permission"), "{e}");
 }

@@ -901,7 +901,7 @@ pub fn delegation_routing_enabled(home_dir: &Path, agent_dir: &Path) -> bool {
 // operator-level default from `<home>/config.toml [runtime]`:
 //
 //   [runtime]
-//   utility_provider = "claude"   # claude | codex | openai_compat
+//   utility_provider = "claude"   # claude | openai_compat
 //   utility_model    = "claude-haiku-4-5"
 //
 // An absent/malformed file keeps Claude / DEFAULT_UTILITY_MODEL. With another
@@ -1021,10 +1021,15 @@ fn validate_utility_config(path: &Path, key: &str, optional: bool) -> Result<(),
 }
 
 /// Only these runtimes implement the mandatory utility execution profile.
-/// Claude/API are tool-free; Codex uses the owner-approved restricted profile.
+/// Claude/API are tool-free; Codex checks external MCP configuration before spawn.
 /// Unknown/new CLI providers remain denied until a utility lane is verified.
 pub(crate) fn utility_profile_supported(provider: RuntimeType) -> bool {
-    matches!(provider, RuntimeType::Claude | RuntimeType::OpenAiCompat | RuntimeType::Codex)
+    matches!(provider, RuntimeType::Claude | RuntimeType::Codex | RuntimeType::OpenAiCompat)
+}
+
+/// Share the Codex spawn-gate refusal across selection and direct dispatch.
+pub(crate) fn utility_profile_refusal(provider: RuntimeType) -> String {
+    format!("utility runtime {} has no supported utility profile", provider.as_str())
 }
 
 /// Resolve execution, keeping explicit judge hints fail-closed. Only an
@@ -1052,7 +1057,7 @@ pub(crate) fn resolve_utility_profile(
     }
     if utility_profile_supported(spec.provider) { return Ok(spec); }
     if explicit_hint || agent.is_none() {
-        return Err(format!("utility runtime {} has no supported utility profile", spec.provider.as_str()));
+        return Err(utility_profile_refusal(spec.provider));
     }
     validate_utility_config(&home.join("config.toml"), "utility_provider", true)?;
     ensure_active_utility_provider(home)?;
@@ -1067,7 +1072,7 @@ pub(crate) fn resolve_utility_profile(
             "utility runtime has no supported utility profile; using global background settings only if a utility profile is supported");
     }
     if !utility_profile_supported(fallback.provider) {
-        return Err(format!("global utility runtime {} has no supported utility profile", fallback.provider.as_str()));
+        return Err(utility_profile_refusal(fallback.provider));
     }
     Ok(fallback)
 }
@@ -1141,6 +1146,14 @@ mod tests {
         assert_eq!(resolve_utility_profile(home.path(), Some(agent.path()),
             UtilitySpec { provider: RuntimeType::Grok, model: "grok".into() }, false).unwrap(),
             UtilitySpec { provider: RuntimeType::OpenAiCompat, model: "fixture-model".into() });
+    }
+
+    #[test]
+    fn codex_utility_profile_is_supported_without_provider_substitution() {
+        let home = TempDir::new().unwrap();
+        let spec = UtilitySpec { provider: RuntimeType::Codex, model: "gpt-5.4-mini".into() };
+        assert!(utility_profile_supported(RuntimeType::Codex));
+        assert_eq!(resolve_utility_profile(home.path(), None, spec.clone(), true).unwrap(), spec);
     }
 
     #[test]

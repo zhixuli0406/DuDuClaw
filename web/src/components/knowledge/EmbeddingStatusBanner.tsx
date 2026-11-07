@@ -44,7 +44,7 @@ export function EmbeddingStatusBanner() {
         {isAdmin && (
           <p>
             {status.reason ? `${status.reason}　` : ''}
-            <Link to="/settings?tab=knowledgeSearch" className="font-medium text-brand underline-offset-4 hover:underline">
+            <Link to="/app/system/settings/advanced#knowledgeSearch" className="font-medium text-brand underline-offset-4 hover:underline">
               {intl.formatMessage({ id: 'kb.embedding.setUp' })}
             </Link>
           </p>

@@ -12,6 +12,7 @@ use rusqlite::OptionalExtension;
 struct TaskVisibility {
     owner: Result<Option<String>, String>,
     audience: TaskAudience,
+    a2a_owner: Result<Option<String>, String>,
 }
 
 impl TaskVisibility {
@@ -19,6 +20,7 @@ impl TaskVisibility {
         Self {
             owner: TaskStore::live_metadata(home, id).map(|r| r.map(|(owner, _)| owner)),
             audience: task_audience(home, id),
+            a2a_owner: TaskStore::a2a_owner_readonly(home, id),
         }
     }
 
@@ -28,7 +30,9 @@ impl TaskVisibility {
             Ok(None) => allow_removed_for_admin && fresh.is_admin(),
             Err(_) => false,
         };
-        owner_allowed && dashboard_may_read_task(fresh, &self.audience)
+        owner_allowed
+            && self.a2a_owner.as_ref().is_ok_and(|p| p.as_ref().is_none_or(|p| p == &format!("user:{}", fresh.user_id)))
+            && dashboard_may_read_task(fresh, &self.audience)
     }
 }
 

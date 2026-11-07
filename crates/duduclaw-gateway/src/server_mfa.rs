@@ -34,9 +34,23 @@ pub(super) async fn after_first_factor(
     first: FirstFactor,
 ) -> Option<axum::response::Response> {
     let personal = state.handler.resolve_edition_profile().await.is_personal();
+    let required = match enforced(&state.home_dir, personal) { Ok(v)=>v, Err(_)=>return Some(denied()) };
+    first_factor_response(state, user, first, required).await
+}
+
+/// The issuance transaction refused a one-factor session. Do not consult the
+/// cached policy again: another connection may have enabled the durable policy.
+pub(super) async fn require_after_first_factor(
+    state: &AppState, user: &duduclaw_auth::User, first: FirstFactor,
+) -> axum::response::Response {
+    first_factor_response(state, user, first, true).await.unwrap_or_else(denied)
+}
+
+async fn first_factor_response(
+    state: &AppState, user: &duduclaw_auth::User, first: FirstFactor, required: bool,
+) -> Option<axum::response::Response> {
     let work = state.user_db.clone();
     let user_id = user.id.clone();
-    let required = match enforced(&state.home_dir, personal) { Ok(v)=>v, Err(_)=>return Some(denied()) };
     let result = tokio::task::spawn_blocking(move || -> Result<_, String> {
         let active = work.mfa_active(&user_id)?;
         if !active && !required { return Ok(None); }
@@ -53,8 +67,16 @@ pub(super) async fn after_first_factor(
                     return Some(denied());
                 }
             }
-            Ok(Some(if active { serde_json::json!({"mfa_required":true,"challenge_id":challenge}) }
-                else { serde_json::json!({"mfa_enrollment_required":true,"enrollment_token":challenge,"challenge_ref":duduclaw_auth::mfa::enrollment_challenge_ref(&challenge)}) }))
+            let mut payload=if active {
+                let mut factors=match state.user_db.mfa_factors(&user.id) {Ok(v)=>v,Err(_)=>return Some(denied())};
+                factors["mfa_required"]=serde_json::json!(true);
+                factors["challenge_id"]=serde_json::json!(challenge);
+                factors
+            } else {serde_json::json!({"mfa_enrollment_required":true,"enrollment_token":challenge,"challenge_ref":duduclaw_auth::mfa::enrollment_challenge_ref(&challenge)})};
+            let reason=crate::mfa_email::unavailable_reason(&state.home_dir);
+            payload["email_available"]=serde_json::json!(reason.is_none());
+            payload["email_unavailable_reason"]=serde_json::json!(reason);
+            Ok(Some(payload))
         }
         Ok(Ok(None)) => Ok(None),
         _ => Err(()),
@@ -80,10 +102,10 @@ pub(super) async fn refresh_allowed(state: &AppState, user: &str) -> bool {
     }
 }
 
-/// Do not interrupt work at the policy toggle. Enterprise JWT sockets under
+/// Do not interrupt work at the policy toggle. JWT sockets under
 /// MFA close only after their own access-token expiry (next 30-second tick).
 /// Identity read failures pause traffic and use the caller's recovery window.
-/// Unenrolled accounts with enforcement off and Personal keep their old behavior.
+/// Personal keeps its legacy expiry behavior only when enforcement is off.
 pub(super) async fn socket_validity(state: &AppState, ctx: &UserContext, expires: Option<u64>, legacy: bool, heartbeat: bool) -> crate::handlers::live_context::SocketValidity {
     use crate::handlers::live_context::SocketValidity;
     if legacy {
@@ -100,11 +122,10 @@ pub(super) async fn socket_validity(state: &AppState, ctx: &UserContext, expires
     if (chrono::Utc::now().timestamp().max(0) as u64) < expires {
         return SocketValidity::Valid;
     }
-    if state.handler.resolve_edition_profile().await.is_personal() {
-        return SocketValidity::Valid;
-    }
-    match enforced(&state.home_dir, false) {
+    let personal = state.handler.resolve_edition_profile().await.is_personal();
+    match enforced(&state.home_dir, personal) {
         Ok(true) => SocketValidity::Revoked,
+        Ok(false) if personal => SocketValidity::Valid,
         Ok(false) => match state.user_db.mfa_active(&ctx.user_id) {
             Ok(true) => SocketValidity::Revoked,
             Ok(false) => SocketValidity::Valid,
@@ -122,7 +143,8 @@ async fn socket_expired(state: &AppState, ctx: &UserContext, expires: Option<u64
 /// Only these two short local operations must exclude interleaved socket
 /// gates between their commit and handover. Long-running RPCs stay spawned.
 pub(super) fn is_session_handover(method: &str) -> bool {
-    matches!(method, "mfa.enroll_confirm" | "mfa.disable")
+    matches!(method, "mfa.enroll_confirm" | "mfa.disable" | "mfa.email_confirm" | "mfa.email_remove"
+        | "mfa.passkey_register_finish" | "mfa.passkey_delete")
 }
 
 pub(super) struct MfaRpcResult {
@@ -315,7 +337,6 @@ async fn enroll(
                 body.code.as_deref().unwrap_or(""),
                 &cipher,
                 now,
-                personal,
                 |user, access, codes| crate::mfa::replacement_session(
                     &work.jwt_config, user, access, epoch, codes, true,
                 ),
@@ -343,6 +364,9 @@ async fn enroll(
                     .and_then(serde_json::Value::as_str)
                 {
                     reset_login_rate_limit(addr.ip(), email);
+                }
+                if let Some(id)=body.get("user").and_then(|u|u.get("id")).and_then(serde_json::Value::as_str) {
+                    crate::mfa_email::notify_change(&state.home_dir,&state.user_db,id,"新增驗證器");
                 }
             }
             json_response(body)

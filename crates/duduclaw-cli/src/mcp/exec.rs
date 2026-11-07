@@ -82,61 +82,9 @@ pub(crate) async fn handle_execute_program(args: &Value, home_dir: &Path, defaul
 }
 
 // ── office_script handler ───────────────────────────────────────
-//
-// Server-side execution of a bundled office skill's vetted `scripts/*.py`
-// (docx/xlsx/pptx/pdf) so API-mode agents that have no Bash tool can still
-// produce document files. Fail-closed on every input:
-//   - `skill` must be one of the four bundled office skills.
-//   - `script` must be a bare stem (alnum / `_` / `-`) resolving to an existing
-//     `<agent>/SKILLS/<skill>/scripts/<script>.py`.
-//   - every path-shaped argument must resolve inside the caller's agent dir or
-//     the shared `{home}/attachments` root — the same sandbox the outbound
-//     `📎DELIVER:` validator trusts.
-// The agent id comes from the caller context (`default_agent`), never from
-// arguments, so an agent can only ever run scripts in its own directory.
-
-/// The four bundled office skills whose scripts `office_script` may run.
+// Skill layers override prompt text only. Executable bytes and argument schemas
+// come exclusively from the binary's versioned, SHA-256-verified manifest.
 pub(crate) const OFFICE_SCRIPT_SKILLS: &[&str] = &["docx", "xlsx", "pptx", "pdf"];
-
-/// Whether a single script argument is allowed. A bare flag/value with no path
-/// separator (`--format`, `json`) always passes UNLESS its basename is a
-/// protected agent-structure file (WP1.1 — see below); a path-shaped argument
-/// must normalise to inside `agent_root` or `attach_root` and must not target
-/// a protected basename either. Validation is lexical (no `canonicalize`)
-/// because an `--out` file does not exist yet.
-///
-/// WP1.1 (SOUL.md 唯讀化) follow-up: `office_script` runs a bundled
-/// docx/xlsx/pptx/pdf skill script with `cwd = agent_root` and previously only
-/// checked that path-shaped arguments stayed *inside* the agent's own
-/// directory — it never excluded the DuDuClaw-specific structure files that
-/// live there. A bare `--out SOUL.md` (or `--out agent.toml`) argument passed
-/// the old check trivially (no `/` at all) and would let the office script
-/// overwrite a protected file with arbitrary bytes, sidestepping the C1–C4
-/// gates entirely (none of which watch this tool). `AGENT_STRUCTURE_FILES` is
-/// the exact same list `check_agent_file_write` protects on the Write/Edit/
-/// Bash hook lane; this closes the same class of gap for `office_script`.
-pub(crate) fn office_arg_within_sandbox(arg: &str, agent_root: &Path, attach_root: &Path) -> bool {
-    let has_sep = arg.contains('/') || arg.contains('\\');
-    let p = Path::new(arg);
-    let abs = if !has_sep || p.is_relative() {
-        agent_root.join(p)
-    } else {
-        p.to_path_buf()
-    };
-    let norm = duduclaw_core::agent_guard::lexical_normalize(&abs);
-    if let Some(basename) = norm.file_name().and_then(|n| n.to_str()) {
-        if duduclaw_core::AGENT_STRUCTURE_FILES
-            .iter()
-            .any(|protected| protected.eq_ignore_ascii_case(basename))
-        {
-            return false;
-        }
-    }
-    if !has_sep {
-        return true;
-    }
-    norm.starts_with(agent_root) || norm.starts_with(attach_root)
-}
 
 pub(crate) async fn handle_office_script(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
     // 1. skill allowlist (fail-closed).
@@ -169,32 +117,13 @@ pub(crate) async fn handle_office_script(args: &Value, home_dir: &Path, default_
         );
     }
 
-    // 3. resolve the script inside the CALLER's own agent dir (never from args).
-    // W3-3b (a): `.ephemeral/` included — a role member's SKILLS live in its
-    // own scaffold, and the bare registry path made every bundled office
-    // script report "Script not found" for team members.
-    // B8: a skill switched off for this employee is not loaded, so its
-    // scripts are not callable either (listing ⇔ callable).
+    // Keep the per-employee skill switch in addition to the central MCP gates.
     if duduclaw_agent::skill_state::read_disabled(home_dir, default_agent).is_disabled(skill) {
         return tool_error(&format!(
             "Skill '{skill}' is switched off for agent '{default_agent}'."
         ));
     }
     let agent_dir = caller_agent_dir(home_dir, default_agent);
-    let script_path = agent_dir
-        .join("SKILLS")
-        .join(skill)
-        .join("scripts")
-        .join(format!("{stem}.py"));
-    if !script_path.is_file() {
-        return tool_error(&format!(
-            "Script not found: SKILLS/{skill}/scripts/{stem}.py (agent '{default_agent}'). \
-             Available office scripts: create, extract, to_pdf."
-        ));
-    }
-
-    // 4. validate every path-shaped argument stays inside the sandbox.
-    let attach_root = home_dir.join("attachments");
     let script_args: Vec<String> = match args.get("args") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(a)) => {
@@ -203,12 +132,6 @@ pub(crate) async fn handle_office_script(args: &Value, home_dir: &Path, default_
                 let Some(s) = v.as_str() else {
                     return tool_error("Every element of 'args' must be a string.");
                 };
-                if !office_arg_within_sandbox(s, &agent_dir, &attach_root) {
-                    return tool_error(&format!(
-                        "Argument path escapes the agent sandbox: {s}. Inputs and --out must \
-                         live under your agent directory or its attachments/."
-                    ));
-                }
                 out.push(s.to_string());
             }
             out
@@ -216,101 +139,45 @@ pub(crate) async fn handle_office_script(args: &Value, home_dir: &Path, default_
         Some(_) => return tool_error("'args' must be a JSON array of strings."),
     };
 
-    // 5. WP-4G: resource ceilings on every INPUT document before a parser runs.
-    //
-    // `.docx` / `.xlsx` / `.pptx` are zip containers, and the file an agent
-    // points at here is routinely something a stranger sent into a channel.
-    // The skill scripts hand those bytes to python-docx / openpyxl /
-    // python-pptx, none of which bound decompression or XML nesting: a zip
-    // bomb takes the host's RAM with it, and a deeply-nested part crashes a
-    // recursive-descent parser. Gate before spawning; fail-closed.
-    //
-    // Only *existing* files are inspected, so `--out` targets (not yet
-    // created) and bare flags (`--format`) fall through untouched, and a
-    // non-zip input (`.csv`, `.pdf`, legacy `.doc`) is out of scope by design.
+    let prepared = match duduclaw_agent::office_execution::PreparedOffice::new(
+        home_dir, &agent_dir, skill, stem, &script_args,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => return tool_error(&format!("office_script refused: {error}")),
+    };
+    // Apply the existing document resource gate to the exact private snapshot
+    // that Python will read, never a mutable source pathname.
     let limits = duduclaw_gateway::document_limits::DocumentLimits::from_home(home_dir);
-    for arg in &script_args {
-        let p = Path::new(arg);
-        let abs = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            agent_dir.join(p)
-        };
-        if !abs.is_file() {
-            continue;
-        }
-        if let Err(v) = duduclaw_gateway::document_limits::guard_document_path(&abs, &limits) {
-            let shown = abs.file_name().and_then(|n| n.to_str()).unwrap_or("input");
-            tracing::warn!(
-                file = %shown,
-                violation = v.kind(),
-                "office_script: refused — input document exceeds resource limits"
-            );
-            return tool_error(&v.user_message(shown));
-        }
+    if let Err(v) = duduclaw_gateway::document_limits::guard_document_path(prepared.input(), &limits) {
+        tracing::warn!(violation = v.kind(), "office_script: input exceeds resource limits");
+        return tool_error(&v.user_message("input"));
     }
-
-    // 6. run the script (cwd = agent dir so relative paths stay in the sandbox).
-    run_office_script(&script_path, &script_args, &agent_dir).await
+    run_office_script(&prepared).await
 }
 
-/// Spawn `uv run <script> <args...>` (PEP 723 deps auto-resolved), falling back
-/// to the system python3 when `uv` is not installed. `kill_on_drop` guarantees a
-/// timed-out child is reaped. Returns the script's stdout on success, or a
-/// diagnostic error with stdout+stderr on non-zero exit.
-fn office_command(program: &str, prefix: &[&str], script: &Path, args: &[String], cwd: &Path)
-    -> tokio::process::Command
-{
-    let mut command = tokio::process::Command::new(program);
-    command.current_dir(cwd).kill_on_drop(true);
-    command.args(prefix).arg(script).args(args)
-        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-    command
-}
-
-pub(crate) async fn run_office_script(script_path: &Path, script_args: &[String], cwd: &Path) -> Value {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-    const MAX_OUT: usize = 32_768;
-
-
-    let py = duduclaw_core::platform::python3_command();
-    let (used, child) = match duduclaw_core::execution_gate::with_runtime(
-        duduclaw_core::execution_gate::RuntimeKind::Registered(
-            duduclaw_core::execution_gate::Text::new("office-script".into()).expect("constant runtime id")),
-        duduclaw_core::execution_gate::spawn(&mut office_command("uv", &["run"], script_path, script_args, cwd),
-        duduclaw_core::execution_gate::ExecutionClass::EmployeeTool)).await {
-        Ok(c) => ("uv run", c),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match duduclaw_core::execution_gate::with_runtime(
-        duduclaw_core::execution_gate::RuntimeKind::Registered(
-            duduclaw_core::execution_gate::Text::new("office-script".into()).expect("constant runtime id")),
-        duduclaw_core::execution_gate::spawn(&mut office_command(py, &[], script_path, script_args, cwd),
-            duduclaw_core::execution_gate::ExecutionClass::EmployeeTool)).await {
-            Ok(c) => (py, c),
-            Err(e2) => {
-                return tool_error(&format!(
-                    "Neither 'uv' nor '{py}' could be spawned to run the office script: {e2}. \
-                     Install uv (https://docs.astral.sh/uv/) or the script's Python deps."
-                ));
-            }
-        },
-        Err(e) => return tool_error(&format!("Failed to spawn 'uv run': {e}")),
+/// Execute through the shared bounded runner; publication remains in Rust.
+/// The runner's `ManagedChild::spawn` passes `execution_gate::check_local`, so a
+/// protected Linux install refuses this local spawn (fail-closed).
+pub(crate) async fn run_office_script(prepared: &duduclaw_agent::office_execution::PreparedOffice) -> Value {
+    const MAX_OUT: usize = duduclaw_agent::office_execution::process::MAX_PIPE_BYTES;
+    let result = match duduclaw_agent::office_execution::process::run(prepared).await {
+        Ok(result) => result,
+        Err(error) => return tool_error(&format!("office script execution refused: {error}")),
     };
-
-    let output = match tokio::time::timeout(TIMEOUT, child.wait_with_output()).await {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => return tool_error(&format!("office script execution error ({used}): {e}")),
-        // Timeout drops `child`; kill_on_drop reaps the subprocess.
-        Err(_) => {
-            return tool_error(&format!(
-                "office script timed out after {}s ({used})",
-                TIMEOUT.as_secs()
-            ));
-        }
-    };
+    let used = result.used;
+    let output = result.output;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if output.status.success() {
-        let body = duduclaw_core::truncate_bytes(stdout.trim(), MAX_OUT);
+        let published = match prepared.publish() {
+            Ok(path) => path,
+            Err(error) => return tool_error(&format!("office_script output refused: {error}")),
+        };
+        let body = if let Some(path) = published {
+            format!("Created {}", path.display())
+        } else {
+            duduclaw_core::truncate_bytes(stdout.trim(), MAX_OUT).to_string()
+        };
         tool_text(&format!(
             "office_script ok ({used}, exit 0).\n{body}\n\nIf a file was produced, end your \
              reply with a line `📎DELIVER:<absolute path>` so it reaches the user."
@@ -373,31 +240,5 @@ mod tests {
         assert!(text.contains("Script sandbox unavailable (invalid_config)"), "{text}");
         assert!(text.contains("The script was not run"), "{text}");
         assert!(text.contains("Fix the [container.sandbox] section of config.toml"), "{text}");
-    }
-}
-
-#[cfg(test)]
-mod execution_backend_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn office_backend_command_matches_legacy_argv_env_cwd() {
-        let cwd = Path::new("workspace with spaces");
-        let script = Path::new("office.py");
-        let args = vec!["繁體中文 $HOME;\nnext".to_owned(), "".to_owned()];
-        for (program, prefix) in [("uv", vec!["run"]), ("python3", vec![])] {
-            let command = office_command(program, &prefix, script, &args, cwd);
-            let mut expected = tokio::process::Command::new(program);
-            expected.current_dir(cwd).kill_on_drop(true);
-            for arg in &prefix { expected.arg(arg); }
-            expected.arg(script).args(&args)
-                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-            assert_eq!(command.as_std().get_program(), expected.as_std().get_program());
-            assert_eq!(command.as_std().get_args().collect::<Vec<_>>(), expected.as_std().get_args().collect::<Vec<_>>());
-            assert_eq!(command.as_std().get_envs().collect::<Vec<_>>(), expected.as_std().get_envs().collect::<Vec<_>>());
-            assert_eq!(command.as_std().get_current_dir(), expected.as_std().get_current_dir());
-        assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(),
-            duduclaw_core::execution_gate::command_snapshot(&expected));
-        }
     }
 }

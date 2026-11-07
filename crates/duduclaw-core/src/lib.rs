@@ -8,6 +8,7 @@ pub mod agent_trash;
 pub mod agent_toml;
 pub mod appliance;
 pub mod autostart;
+pub mod binary_replace;
 // S15 (2026-09-29): OS-only. Only DuDuClaw OS ships `compat.d` and the shell
 // that launches its runners, so the platform binary leaves this out. Turned on
 // by `duduclaw-cli`'s `app-compat` feature, which the OS recipe passes.
@@ -1481,3 +1482,5 @@ pub mod execution_blocking;
 pub mod mcp_tool_defs;
 
 pub mod tool_pruning;
+
+pub mod mcp_oauth_store;

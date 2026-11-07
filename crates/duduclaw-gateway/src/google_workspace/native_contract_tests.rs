@@ -32,13 +32,15 @@ fn valid_cases() -> Vec<(&'static str, Value)> {
         ("docs_read", json!({"document_id":"d"})),
         ("docs_append", json!({"document_id":"d","text":"x"})),
         ("slides_read", json!({"presentation_id":"p"})),
+        ("google_chat_spaces", json!({})),
+        ("google_chat_messages", json!({"space":"spaces/AAA"})),
     ]
 }
 
 #[test]
-fn all_eighteen_native_inputs_are_frozen_without_status_or_remote_aliases() {
+fn all_twenty_native_inputs_are_frozen_without_status_or_remote_aliases() {
     let cases = valid_cases();
-    assert_eq!(cases.len(), 18);
+    assert_eq!(cases.len(), 20);
     for (tool, arguments) in cases {
         let call = NativeCallTemplate::prepare(tool, &arguments).unwrap();
         assert_eq!(call.tool(), tool);

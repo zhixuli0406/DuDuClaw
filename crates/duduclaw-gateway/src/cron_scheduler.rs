@@ -39,6 +39,31 @@ pub trait AgentInvoker: Send + Sync {
     ) -> Result<String, String>;
 }
 
+/// Employee dashboard cron uses the existing host runtime, so it may never
+/// bypass an agent's task sandbox. Unknown agents fail closed. The same runner
+/// still applies the agent's native sandbox, capabilities and runtime settings.
+pub(crate) fn scoped_cron_target_allowed(registry: &AgentRegistry, agent: &str) -> bool {
+    if agent == "default" { return false; }
+    let Some(agent) = registry.get(agent) else { return false };
+    if agent.config.container.sandbox_enabled { return false; }
+    // Read the same effective configuration as runtime setup, not just a
+    // potentially stale registry snapshot. Invalid/unreadable config is denied.
+    duduclaw_core::agent_toml::read_effective_text(&agent.dir).ok()
+        .and_then(|text| toml::from_str::<duduclaw_core::types::AgentConfig>(&text).ok())
+        .is_some_and(|config| !config.container.sandbox_enabled)
+}
+
+/// Legacy/externally edited human-origin rows cannot bypass store admission.
+/// Log counts only: never expose principal, id, cron text or prompt on refusal.
+fn scoped_schedule_allowed(row: &CronTaskRow) -> bool {
+    if crate::cron_store::requires_admission(row)
+        && crate::cron_store::validate_scoped_schedule(row).is_err() {
+        warn!(count = 1u64, "scoped cron schedule refused; execution skipped");
+        return false;
+    }
+    true
+}
+
 /// Production [`AgentInvoker`]: routes through the normal per-agent Claude
 /// dispatch (`call_claude_for_agent_with_type`) tagged as a `Cron` request.
 /// Zero-sized, so it is cheap to construct per spawned task.
@@ -79,6 +104,8 @@ impl AgentInvoker for RealAgentInvoker {
 /// Maximum concurrent cron task executions.
 const MAX_CONCURRENT_CRON: usize = 4;
 
+mod run_now_admission;
+
 /// Baseline reload/fire-check interval. Hot reload via [`CronScheduler::reload_now`]
 /// will wake the loop earlier; this interval is the safety net that picks up
 /// changes made by *other processes* (e.g. the MCP subprocess writing directly
@@ -111,6 +138,7 @@ pub struct CronScheduler {
     registry: Arc<RwLock<AgentRegistry>>,
     tasks: Arc<RwLock<Vec<LiveTask>>>,
     semaphore: Arc<tokio::sync::Semaphore>,
+    run_now_admission: Arc<run_now_admission::RunNowAdmission>,
     /// Fired by [`CronScheduler::reload_now`] to wake the run loop for an
     /// immediate reload. Consumed inside a `tokio::select!`.
     reload_notify: Arc<Notify>,
@@ -129,6 +157,7 @@ impl CronScheduler {
             registry,
             tasks: Arc::new(RwLock::new(Vec::new())),
             semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CRON)),
+            run_now_admission: Arc::new(run_now_admission::RunNowAdmission::default()),
             reload_notify: Arc::new(Notify::new()),
             workflow_service: None,
         }
@@ -154,6 +183,7 @@ impl CronScheduler {
         let mut runs = Vec::new();
         let mut errors = Vec::new();
         for row in self.store.list_enabled().await? {
+            if !scoped_schedule_allowed(&row) { continue; }
             let Some((_, material_hash)) = self.store.workflow_binding(&row.id).await? else { continue };
             let outcome: Result<Option<String>, String> = async {
                 let mut cursor = self.store.routine_cursor(&row.id, &material_hash).await?;
@@ -274,6 +304,28 @@ impl CronScheduler {
         self.run_now_legacy(task_id).await
     }
 
+    /// Admit before spawning; scoped manual work never waits in a semaphore queue.
+    /// The dispatched snapshot is checked again immediately before execution.
+    pub(crate) async fn run_now_scoped(&self, row: CronTaskRow, principal: &str) -> Result<String, String> {
+        if self.store.workflow_binding(&row.id).await
+            .map_err(|_| "Automation admission unavailable; try again later")?.is_some() {
+            return Err("permission denied".into());
+        }
+        let user = principal.strip_prefix("user:").filter(|u| !u.is_empty())
+            .ok_or("Automation user is required")?;
+        let admission = self.run_now_admission.admit(user, &row.id, &self.semaphore)?;
+        let name = row.name.clone();
+        let home = self.home_dir.clone();
+        let registry = self.registry.clone();
+        let store = self.store.clone();
+        let principal = principal.to_string();
+        tokio::spawn(async move {
+            let _admission = admission;
+            dispatch_cron_task_checked(&home, &store, &registry, &row, &RealAgentInvoker, None, Some(&principal)).await;
+        });
+        Ok(name)
+    }
+
     async fn run_now_legacy(&self, task_id: &str) -> Result<String, String> {
         let row = self
             .store
@@ -316,6 +368,7 @@ impl CronScheduler {
 
         let mut new_live = Vec::with_capacity(raw_tasks.len());
         for task in raw_tasks {
+            if !scoped_schedule_allowed(&task) { continue; }
             // Typed routines use the durable occurrence cursor in tick_at, not
             // legacy last_run_at (which manual executions also modify).
             match self.store.workflow_binding(&task.id).await {
@@ -540,6 +593,7 @@ async fn enqueue_routine_trigger(
 ) -> Result<String, String> {
     let task = store.get(task_id).await?.ok_or("workflow cron missing")?;
     if !task.enabled { return Err("workflow cron disabled".into()); }
+    if !scoped_schedule_allowed(&task) { return Err("Automation schedule refused".into()); }
     if !cron_principal_allowed(home_dir, store, registry, &task).await {
         return Err("workflow cron principal refused".into());
     }
@@ -623,8 +677,15 @@ async fn dispatch_cron_task_with_slot(
     home_dir:&std::path::Path,store:&Arc<CronStore>,registry:&Arc<RwLock<AgentRegistry>>,
     task:&CronTaskRow,invoker:&dyn AgentInvoker,slot:Option<String>,
 ) {
+    dispatch_cron_task_checked(home_dir, store, registry, task, invoker, slot, None).await;
+}
+async fn dispatch_cron_task_checked(
+    home_dir:&std::path::Path,store:&Arc<CronStore>,registry:&Arc<RwLock<AgentRegistry>>,
+    task:&CronTaskRow,invoker:&dyn AgentInvoker,slot:Option<String>, scoped_principal:Option<&str>,
+) {
     // Cached schedules must not run an older prompt without a newly stored origin.
-    let task = match store.get(&task.id).await {
+    let mut task = match store.get(&task.id).await {
+        Ok(Some(row)) if scoped_principal.is_some() && serde_json::to_value(&row).ok() != serde_json::to_value(task).ok() => return,
         // A paused cached occurrence must not run; explicit manual runs may
         // start from a row that was already disabled when the caller read it.
         Ok(Some(row)) if task.enabled && !row.enabled => return,
@@ -635,6 +696,19 @@ async fn dispatch_cron_task_with_slot(
             return;
         }
     };
+    if let Some(principal) = scoped_principal {
+        if !matches!(store.workflow_binding(&task.id).await, Ok(None)) { return; }
+        task.on_behalf_of = Some(principal.into());
+        task.scoped_by_user_id = principal.strip_prefix("user:").map(str::to_string);
+    }
+    if !scoped_schedule_allowed(&task) { return; }
+    // Dashboard-created or manually run work must retain a current direct Operator binding.
+    if task.created_by_user_id.is_some() || task.scoped_by_user_id.is_some() || scoped_principal.is_some() {
+        let Some(user) = scoped_principal.and_then(|p| p.strip_prefix("user:"))
+            .or(task.scoped_by_user_id.as_deref()).or(task.created_by_user_id.as_deref()) else { return };
+        let Ok(ctx) = crate::review_evidence::audience::trusted_dashboard_principal(home_dir, user) else { return };
+        if !ctx.has_agent_access(&task.agent_id, duduclaw_auth::AccessLevel::Operator) { return; }
+    }
     let principal = crate::on_behalf_of::from_stored(
         home_dir, task.on_behalf_of.as_deref(), &task.agent_id, "cron_task",
     );
@@ -854,6 +928,27 @@ async fn cron_principal_allowed(
 ) -> bool {
     let current = crate::on_behalf_of::current();
     let registry = registry.read().await;
+    // Only a verified live Admin may retain the human-origin host exception.
+    // In particular, unmapped principals are not Admins even though the
+    // main-agent restriction allows them under its separate policy.
+    let human_requires_host_target = [current.as_deref(), task.on_behalf_of.as_deref()]
+        .into_iter().flatten().any(|principal| {
+            !matches!(crate::on_behalf_of::PrincipalState::from_wire(Some(principal)),
+                crate::on_behalf_of::PrincipalState::Human(duduclaw_core::HumanPrincipal::User(_)))
+                || !matches!(crate::on_behalf_of::access::requires_main_restriction(home, Some(principal)), Ok(false))
+        });
+    if (task.created_by_user_id.is_some() || task.scoped_by_user_id.is_some() || human_requires_host_target)
+        && !scoped_cron_target_allowed(&registry, &task.agent_id) {
+        warn!(count = 1u64, "cron host target refused; execution skipped");
+        let reason = "Employee automation refused: target unavailable or task sandbox enabled";
+        if store.set_enabled(&task.id, false).await.is_err() {
+            warn!(count = 1u64, "cron sandbox refusal could not pause task");
+        }
+        if store.record_autonomy_skip(&task.id, reason).await.is_err() {
+            warn!(count = 1u64, "cron sandbox refusal could not be recorded");
+        }
+        return false;
+    }
     for principal in [current.as_deref(), task.on_behalf_of.as_deref()] {
         let result = match crate::on_behalf_of::access::requires_main_restriction(home, principal) {
             Ok(false) => Ok(()),
@@ -975,6 +1070,7 @@ async fn execute_cron_task(
     if record_autonomy_skip(home_dir, store, task).await {
         return;
     }
+    if !cron_principal_allowed(home_dir, store, registry, task).await { return; }
     let dispatch_fut = crate::claude_runner::DELEGATION_ENV.scope(delegation_env, async {
         match prompt_result {
             Ok(prompt) => {

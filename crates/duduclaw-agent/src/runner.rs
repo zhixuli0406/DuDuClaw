@@ -820,7 +820,7 @@ mod interactive_budget_tests {
 mod instructions_slot_tests {
     #[tokio::test]
     async fn profile_order_keeps_contract_after_skills_memory_and_wiki() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let dir = tmp.path().join("agents").join("advisor");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(

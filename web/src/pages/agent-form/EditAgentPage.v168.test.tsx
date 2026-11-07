@@ -1,6 +1,6 @@
 import { useProductPolicyStore } from '@/lib/product-policy';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { act, render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route } from 'react-router';
@@ -85,6 +85,7 @@ let updateAgent: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   useProductPolicyStore.setState({policy:{profile:'standard',blocked_channels:[],blocked_runtimes:[],blocked_providers:[]},loading:false,error:false});
   vi.clearAllMocks();
+  vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [{ ...BASE, via: 'binding', selectable: true }], default_agent: null } as never);
   setRole('admin');
   mockWsClient.call.mockResolvedValue({ ...FULL });
   updateAgent = vi.fn().mockResolvedValue({ success: true });
@@ -509,43 +510,50 @@ describe('boundaries (contract) review', () => {
   };
 
   it('opens the review dialog on needs_confirmation and confirms with the analysis id', async () => {
-    const user = userEvent.setup();
-    mockContract((p) => (p.action === 'confirm'
-      ? { status: 'applied', file: 'contract', agent_id: 'my-bot', hash: 'h2' }
-      : held));
-    renderAt('/agents/my-bot/edit?tab=tools');
+    // Control the autosave clock instead of spending the test timeout on sleeps.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTimeAsync });
+      mockContract((p) => (p.action === 'confirm'
+        ? { status: 'applied', file: 'contract', agent_id: 'my-bot', hash: 'h2' }
+        : held));
+      renderAt('/agents/my-bot/edit?tab=tools');
 
-    const box = await screen.findByRole('textbox', { name: en['agents.contract.mustNot'] });
-    await user.type(box, 'share prices');
-    const dialog = await screen.findByRole('dialog', {}, { timeout: 3000 });
-    expect(dialog).toHaveAccessibleName(en['agentFiles.review.title.needsConfirmation']);
-    expect(contractCalls()).toHaveLength(1);
-    expect(contractCalls()[0][1]).toEqual({
-      agent_id: 'my-bot',
-      must_not: ['share prices'],
-      must_always: [],
-      max_tool_calls_per_turn: 0,
-      base_hash: 'h1',
-    });
+      const box = await screen.findByRole('textbox', { name: en['agents.contract.mustNot'] });
+      await user.type(box, 'share prices');
+      await act(() => vi.advanceTimersByTimeAsync(1000));
+      const dialog = await screen.findByRole('dialog', {}, { timeout: 3000 });
+      expect(dialog).toHaveAccessibleName(en['agentFiles.review.title.needsConfirmation']);
+      expect(contractCalls()).toHaveLength(1);
+      expect(contractCalls()[0][1]).toEqual({
+        agent_id: 'my-bot',
+        must_not: ['share prices'],
+        must_always: [],
+        max_tool_calls_per_turn: 0,
+        base_hash: 'h1',
+      });
 
-    await user.type(screen.getByLabelText(en['agentFiles.review.reasonLabel']), 'the shop wants it');
-    await user.click(screen.getByRole('button', { name: en['agentFiles.review.confirm'] }));
+      await user.type(screen.getByLabelText(en['agentFiles.review.reasonLabel']), 'the shop wants it');
+      await user.click(screen.getByRole('button', { name: en['agentFiles.review.confirm'] }));
 
-    await waitFor(() => expect(contractCalls()).toHaveLength(2));
-    expect(contractCalls()[1][1]).toEqual({
-      agent_id: 'my-bot',
-      must_not: ['share prices'],
-      must_always: [],
-      max_tool_calls_per_turn: 0,
-      action: 'confirm',
-      analysis_id: 'an-7',
-      reason: 'the shop wants it',
-      base_hash: 'h1',
-    });
-    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
-    // The held answer is not re-sent by the autosave.
-    await new Promise((r) => setTimeout(r, 1300));
-    expect(contractCalls()).toHaveLength(2);
+      await waitFor(() => expect(contractCalls()).toHaveLength(2));
+      expect(contractCalls()[1][1]).toEqual({
+        agent_id: 'my-bot',
+        must_not: ['share prices'],
+        must_always: [],
+        max_tool_calls_per_turn: 0,
+        action: 'confirm',
+        analysis_id: 'an-7',
+        reason: 'the shop wants it',
+        base_hash: 'h1',
+      });
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+      // The held answer is not re-sent by the autosave.
+      await act(() => vi.advanceTimersByTimeAsync(1300));
+      expect(contractCalls()).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('sends a non-admin owner\'s request to an admin', async () => {
@@ -601,3 +609,5 @@ describe('boundaries (contract) review', () => {
     useAuthStore.setState({ bindings: [] } as never);
   });
 });
+
+import { api } from '@/lib/api';

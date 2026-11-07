@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["python-docx>=1.1"]
+# dependencies = ["python-docx==1.2.0"]
 # ///
 """Extract text and tables from a .docx file, in document order.
 

@@ -29,7 +29,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use regex::Regex;
@@ -165,6 +165,95 @@ pub fn extract_oauth_token(raw: &str) -> Option<String> {
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
     (tok.len() >= 24).then_some(tok)
+}
+
+// Match the actual PTY dimensions; 600 columns leave room for the token and label.
+const AUTH_PTY_ROWS: u16 = 40;
+const AUTH_PTY_COLS: u16 = 600;
+
+/// Compatibility envelope from the existing synthetic fixtures (shortest: 30
+/// bytes), not a claim about a fixed upstream token length. Allow up to 256
+/// bytes, still well below the PTY width. OAuth payloads use base64url characters.
+pub fn valid_oauth_token_shape(token: &str) -> bool {
+    (30..=256).contains(&token.len())
+        && token.starts_with("sk-ant-oat01-")
+        && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn oauth_candidates(text: &str) -> Vec<String> {
+    text.match_indices("sk-ant-").map(|(i, _)| {
+        text[i..].chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect()
+    }).collect()
+}
+
+fn token_prefix_class(token: &str) -> &'static str {
+    if token.starts_with("sk-ant-oat01-") { "sk-ant-oat01-" }
+    else if token.starts_with("sk-ant-at01-") { "sk-ant-at01-" }
+    else { "other" }
+}
+
+/// Never derive Debug: this state contains credentials. Raw PTY bytes must be
+/// parsed incrementally, including escape sequences split between reads.
+struct TokenCapture {
+    parser: vt100::Parser,
+    primary: Option<String>,
+    secondary: Option<String>,
+    diagnostics: Vec<(&'static str, usize)>,
+    version: Option<String>,
+    updated_at: Instant,
+}
+
+impl TokenCapture {
+    fn new() -> Self {
+        Self {
+            parser: vt100::Parser::new(AUTH_PTY_ROWS, AUTH_PTY_COLS, 200),
+            primary: None, secondary: None, diagnostics: Vec::new(),
+            version: None, updated_at: Instant::now(),
+        }
+    }
+
+    fn process(&mut self, raw: &[u8], tail: &str) {
+        self.updated_at = Instant::now();
+        self.parser.process(raw);
+        let mut candidates = oauth_candidates(&self.parser.screen().contents());
+        let mut newest = candidates.iter().rev().find(|t| valid_oauth_token_shape(t)).cloned();
+        // Walk newest to oldest so scrollback cannot replace a newer token
+        // with a prior redraw or partial candidate. Restore the live viewport.
+        for offset in (usize::from(AUTH_PTY_ROWS)..=200).step_by(usize::from(AUTH_PTY_ROWS)) {
+            self.parser.screen_mut().set_scrollback(offset);
+            let older = oauth_candidates(&self.parser.screen().contents());
+            if newest.is_none() {
+                newest = older.iter().rev().find(|t| valid_oauth_token_shape(t)).cloned();
+            }
+            candidates.extend(older);
+            if self.parser.screen().scrollback() < offset { break; }
+        }
+        self.parser.screen_mut().set_scrollback(0);
+        if let Some(token) = newest {
+            self.primary = Some(token);
+        }
+        // Legacy stream extraction is a secondary candidate only. Never let a
+        // differential redraw overwrite a token read from reconstructed cells.
+        let legacy = oauth_candidates(&strip_ansi_keep_case(tail));
+        self.secondary = legacy.iter().rev().find(|t| valid_oauth_token_shape(t)).cloned();
+        candidates.extend(legacy);
+        candidates.sort();
+        candidates.dedup();
+        self.diagnostics = candidates.iter().map(|t| (token_prefix_class(t), t.len())).collect();
+        static VERSION: OnceLock<Regex> = OnceLock::new();
+        let re = VERSION.get_or_init(|| Regex::new(r"(?:Claude Code v?|v)([0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4})\b").unwrap());
+        // A read can end mid-version. Refresh from the growing tail rather than
+        // permanently retaining an early partial match such as 2.1.2.
+        if let Some(version) = re.captures(&strip_ansi_keep_case(tail)) {
+            self.version = Some(version[1].to_string());
+        }
+    }
+
+    fn token(&self) -> Option<String> {
+        self.primary.as_ref().or(self.secondary.as_ref()).cloned()
+    }
 }
 
 fn url_regex() -> &'static Regex {
@@ -390,6 +479,9 @@ fn auth_markers(runtime: RuntimeType) -> (Vec<String>, Vec<String>) {
 /// `which_*` match. `openai_compat` has no binary, so it resolves to `None`
 /// structurally rather than by a special case.
 pub fn resolve_program(runtime: RuntimeType) -> Option<String> {
+    if crate::runtime_readiness::is_protected_linux() {
+        return crate::runtime_readiness::detect_runtime(runtime.as_str(), std::path::Path::new("/var/lib/duduclaw"));
+    }
     duduclaw_core::which_runtime(runtime.as_str())
 }
 
@@ -560,7 +652,7 @@ pub struct AuthSession {
     _master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
     // Long-lived OAuth token scraped from the output (`claude setup-token` prints
     // it once and never persists it). Used to register an account on success.
-    token: Arc<Mutex<Option<String>>>,
+    token: Arc<Mutex<TokenCapture>>,
     // Sign-in URL scraped from the output (see `extract_auth_url`). Lets a
     // caller (e.g. the "訂閱帳號" setup wizard, `setup_token_wizard.rs`) return
     // it synchronously from a status RPC instead of parsing the streamed byte
@@ -587,8 +679,8 @@ impl AuthSession {
         // keeps the URL on a single line so the frontend can extract it cleanly.
         let pair = pty_system
             .openpty(PtySize {
-                rows: 40,
-                cols: 600,
+                rows: AUTH_PTY_ROWS,
+                cols: AUTH_PTY_COLS,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -634,7 +726,7 @@ impl AuthSession {
             duduclaw_core::runtime_catalog::LoginMethod::DeviceCode { .. }
         );
         let status = Arc::new(AtomicU8::new(ST_RUNNING));
-        let token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let token = Arc::new(Mutex::new(TokenCapture::new()));
         let url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         // Success-file watcher: the most reliable signal that login succeeded is
@@ -695,15 +787,11 @@ impl AuthSession {
                             let _ = tx.send(chunk.to_vec());
                             tail.push_str(&String::from_utf8_lossy(chunk));
                             if tail.len() > 16384 {
-                                let cut = tail.len() - 8192;
+                                let mut cut = tail.len() - 8192;
+                                while !tail.is_char_boundary(cut) { cut += 1; }
                                 tail.drain(..cut);
                             }
-                            // Scrape the long-lived OAuth token (printed once by
-                            // `setup-token`). Re-extract each chunk so a token that
-                            // arrives split across reads converges to the full value.
-                            if let Some(t) = extract_oauth_token(&tail) {
-                                *token_store.lock().unwrap() = Some(t);
-                            }
+                            token_store.lock().unwrap().process(chunk, &tail);
                             // Sign-in URL: same rolling-tail scan, see extract_auth_url.
                             if let Some(u) = extract_auth_url(&tail) {
                                 *url_store.lock().unwrap() = Some(u);
@@ -760,7 +848,22 @@ impl AuthSession {
 
     /// The long-lived OAuth token scraped from the login output, if any.
     pub fn captured_token(&self) -> Option<String> {
-        self.token.lock().unwrap().clone()
+        self.token.lock().unwrap().token()
+    }
+
+    /// Wait for a quiet screen after a success marker: the token may arrive in
+    /// later PTY reads. The wizard separately bounds this wait by SUBMIT_WAIT.
+    pub fn token_capture_is_quiet(&self) -> bool {
+        self.token.lock().unwrap().updated_at.elapsed() >= Duration::from_millis(750)
+    }
+
+    pub fn log_capture_failure(&self) {
+        let capture = self.token.lock().unwrap();
+        tracing::warn!(target: "setup_token_wizard",
+            candidate_count = capture.diagnostics.len(),
+            candidates = ?capture.diagnostics,
+            claude_code_version = capture.version.as_deref().unwrap_or("unknown"),
+            "OAuth token capture failed");
     }
 
     /// The sign-in URL scraped from the login output, if any. See
@@ -806,6 +909,86 @@ impl AuthSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REDRAW_TOKEN: &str = "sk-ant-oat01-AbC123_def-456GHI";
+
+    #[test]
+    fn oauth_shape_checks_prefix_charset_and_length() {
+        for token in [REDRAW_TOKEN.to_string(), format!("sk-ant-oat01-{}", "a".repeat(243))] {
+            assert!(valid_oauth_token_shape(&token));
+        }
+        for token in [
+            REDRAW_TOKEN.replacen("oat01", "at01", 1),
+            REDRAW_TOKEN.replacen("oat01", "api03", 1),
+            "sk-ant-oat01-short".to_string(),
+            format!("sk-ant-oat01-{}", "a".repeat(16)),
+            format!("sk-ant-oat01-{}", "a".repeat(244)),
+            format!("{REDRAW_TOKEN}="), format!("{REDRAW_TOKEN}é"),
+            format!("{REDRAW_TOKEN}\n"), format!(" {REDRAW_TOKEN}"),
+        ] { assert!(!valid_oauth_token_shape(&token)); }
+    }
+
+    #[test]
+    fn differential_redraw_transcripts_reconstruct_exact_token() {
+        // Synthetic PTY fixtures: unchanged cells supply characters omitted by
+        // CUF, CUP and EL redraws. The legacy stream alone loses the prefix 'o'.
+        for transcript in [
+            include_bytes!("../tests/fixtures/setup_token_cuf.pty").as_slice(),
+            include_bytes!("../tests/fixtures/setup_token_cup_el.pty").as_slice(),
+        ] {
+            assert_ne!(extract_oauth_token(&String::from_utf8_lossy(transcript)).as_deref(), Some(REDRAW_TOKEN));
+            // Every possible two-read split, including inside CSI and token.
+            for split in 0..=transcript.len() {
+                let mut capture = TokenCapture::new();
+                capture.process(&transcript[..split], &String::from_utf8_lossy(&transcript[..split]));
+                capture.process(&transcript[split..], &String::from_utf8_lossy(transcript));
+                assert_eq!(capture.token().as_deref(), Some(REDRAW_TOKEN));
+                assert_eq!(capture.primary.as_deref(), Some(REDRAW_TOKEN));
+                assert_eq!(capture.version.as_deref(), Some("2.1.296"));
+            }
+        }
+    }
+
+    #[test]
+    fn screen_candidate_wins_over_legacy_and_survives_scrollback() {
+        let mut capture = TokenCapture::new();
+        let raw = format!("{REDRAW_TOKEN}\r\n{}", "\r\n".repeat(60));
+        capture.process(raw.as_bytes(), "sk-ant-oat01-WrongButWellFormed000000");
+        assert_eq!(capture.token().as_deref(), Some(REDRAW_TOKEN));
+        assert_eq!(capture.parser.screen().scrollback(), 0);
+        capture.process(b"\x1b[2J\x1b[H", "");
+        assert_eq!(capture.token().as_deref(), Some(REDRAW_TOKEN));
+    }
+
+    #[test]
+    fn stripped_stream_is_only_a_secondary_candidate() {
+        let mut capture = TokenCapture::new();
+        let raw = format!("{REDRAW_TOKEN}\x1b[2J\x1b[H");
+        capture.process(raw.as_bytes(), &raw);
+        assert!(capture.primary.is_none());
+        assert_eq!(capture.token().as_deref(), Some(REDRAW_TOKEN));
+    }
+
+    #[test]
+    fn newest_scrollback_token_wins() {
+        let mut capture = TokenCapture::new();
+        let old = "sk-ant-oat01-OldToken000000000000000";
+        let raw = format!("{old}\r\n{}{REDRAW_TOKEN}\r\n{}", "\r\n".repeat(50), "\r\n".repeat(60));
+        capture.process(raw.as_bytes(), "");
+        assert_eq!(capture.token().as_deref(), Some(REDRAW_TOKEN));
+        capture.process(b"\r\n", "");
+        assert_eq!(capture.token().as_deref(), Some(REDRAW_TOKEN));
+    }
+
+    #[test]
+    fn malformed_capture_has_redacted_diagnostics_and_no_token() {
+        let mut capture = TokenCapture::new();
+        let raw = b"sk-ant-at01-PrivatePayload000000";
+        capture.process(raw, &String::from_utf8_lossy(raw));
+        assert!(capture.token().is_none());
+        assert!(capture.diagnostics.iter().all(|(prefix, len)| *prefix == "sk-ant-at01-" && *len == raw.len()));
+        assert_eq!(token_prefix_class("sk-ant-api03-private"), "other");
+    }
 
     #[cfg(unix)]
     #[test]

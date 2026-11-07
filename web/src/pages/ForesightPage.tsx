@@ -1,3 +1,4 @@
+import { useSelectableAgents } from '@/lib/data-scope';
 import { chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -745,9 +746,13 @@ export function ForesightPage() {
   const intl = useIntl();
   const errorText = useErrorMessage();
   const connState = useConnectionStore((s) => s.state);
-  const { agents, fetchAgents } = useAgentsStore();
+  const { fetchAgents } = useAgentsStore();
+  const agents = useSelectableAgents(false);
   const openAssign = useOpenAssign();
   const [selectedAgent, setSelectedAgent] = useState('');
+  useEffect(() => {
+    if (selectedAgent && !agents.some(a => a.name === selectedAgent)) setSelectedAgent('');
+  }, [selectedAgent, agents]);
   const [summaries, setSummaries] = useState<ForwardAgentSummary[]>([]);
   const [rows, setRows] = useState<ForwardPredictionRow[]>([]);
   const [windowScanned, setWindowScanned] = useState(0);

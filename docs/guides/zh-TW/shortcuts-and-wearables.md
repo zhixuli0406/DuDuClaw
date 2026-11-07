@@ -1,6 +1,6 @@
 # 手腕與穿戴：Shortcuts 捷徑、AI 錄音吊墜接入
 
-> 前置：`duduclaw http-server --bind 127.0.0.1:8765` 已啟動，並用 `duduclaw mcp issue-refresh-token` 或 `~/.duduclaw/mcp_keys.toml` 取得 Bearer key。手機/穿戴要打得到這個位址（家內網 IP 或 Tailscale）。
+> 前置：`duduclaw http-server --bind 127.0.0.1:8765` 已啟動。在「管理 → 整合 → MCP API 金鑰」建立具有捷徑所需權限的靜態 MCP API 金鑰，作為 Bearer 憑證。`duduclaw mcp issue-refresh-token` 只產生 stdio 憑證，不能用於 HTTP。手機／穿戴裝置須能連到伺服器位址（家內網 IP 或 Tailscale）。詳見[遠端 MCP](remote-mcp.md)。
 
 ## 1. iPhone／Apple Watch 捷徑（零上架、零審查）
 

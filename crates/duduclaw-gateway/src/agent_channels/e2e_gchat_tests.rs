@@ -65,6 +65,10 @@ struct FakeGoogle {
     calls: Mutex<Vec<(String, String, String, Value)>>,
     first_message_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     first_message_started: tokio::sync::Notify,
+    subscription_topic: Mutex<Option<String>>,
+    subscription_exactly_once: Mutex<Option<Value>>,
+    jwks_requests: std::sync::atomic::AtomicUsize,
+    token_scopes: Mutex<Vec<String>>,
 }
 
 async fn fake_google(
@@ -76,6 +80,7 @@ async fn fake_google(
 ) -> axum::Json<Value> {
     let path = uri.path().to_string();
     if path == "/jwks" {
+        f.jwks_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let k = test_key();
         return axum::Json(
             json!({"keys": [{"kty": "RSA", "kid": "test-kid", "alg": "RS256", "n": k.n, "e": k.e}]}),
@@ -92,6 +97,7 @@ async fn fake_google(
         let payload = assertion.split('.').nth(1).unwrap_or("");
         let claims: Value =
             serde_json::from_slice(&B64URL.decode(payload).unwrap_or_default()).unwrap_or_default();
+        f.token_scopes.lock().unwrap().push(claims["scope"].as_str().unwrap_or("").to_string());
         let iss = claims["iss"].as_str().unwrap_or("?");
         return axum::Json(
             json!({"access_token": format!("tok-{iss}"), "expires_in": 3600, "token_type": "Bearer"}),
@@ -108,6 +114,15 @@ async fn fake_google(
         calls.push((method.to_string(), path.clone(), bearer, body));
         calls.len()
     };
+    if method == Method::GET && path.starts_with("/v1/projects/") && path.contains("/subscriptions/") {
+        let topic = f.subscription_topic.lock().unwrap().clone()
+            .unwrap_or_else(|| "projects/test-project/topics/duduclaw-chat-events".into());
+        let mut subscription = json!({"name": path.trim_start_matches("/v1/"), "topic": topic});
+        if let Some(value) = f.subscription_exactly_once.lock().unwrap().clone() {
+            subscription["enableExactlyOnceDelivery"] = value;
+        }
+        return axum::Json(subscription);
+    }
     let gate = if method == Method::POST && path.ends_with("/messages") {
         f.first_message_gate.lock().unwrap().take()
     } else {
@@ -136,6 +151,14 @@ pub(crate) async fn start_fake() -> Fake {
     let origin = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     Fake { state, origin }
+}
+
+pub(crate) fn set_subscription_topic(fake: &Fake, topic: &str) {
+    *fake.state.subscription_topic.lock().unwrap() = Some(topic.to_string());
+}
+
+pub(crate) fn set_subscription_exactly_once(fake: &Fake, value: Option<Value>) {
+    *fake.state.subscription_exactly_once.lock().unwrap() = value;
 }
 
 pub(crate) fn service_account(fake: &Fake, email: &str) -> String {
@@ -429,6 +452,68 @@ async fn removing_an_app_closes_its_endpoint() {
             .is_err(),
         "no own app and no shared app: nothing is sent"
     );
+}
+
+#[tokio::test]
+async fn googlechat_pubsub_switch_disables_verified_own_webhook() {
+    let home = tempfile::tempdir().unwrap();
+    let fake = start_fake().await;
+    let email = format!("switch-{}@test-project.iam.gserviceaccount.com", uuid::Uuid::new_v4().simple());
+    let mut key: Value = serde_json::from_str(&service_account(&fake, &email)).unwrap();
+    key["project_id"] = json!("test-project");
+    let http = googlechat_section(home.path(), "123456789", &key.to_string());
+    let agents = home.path().join("agents");
+    crate::trigger_route::tests::write_agent(&agents, "sales", "業務", "@sales", "specialist", &http);
+    let ctx = super::e2e_tests::reply_ctx(home.path()).await;
+    let app = crate::googlechat_agents::router(ctx);
+    let added = json!({"type":"ADDED_TO_SPACE", "space":{"name":"spaces/AAA"}, "user":{"name":"users/42"}});
+    assert_eq!(post(&app, "sales", Some(&chat_jwt("123456789")), &added).await, StatusCode::OK);
+    let section = format!("{http}connection = \"pubsub\"\npubsub_subscription = \"projects/test-project/subscriptions/chat-events\"\n");
+    crate::trigger_route::tests::write_agent(&agents, "sales", "業務", "@sales", "specialist", &section);
+    let event = message_event("spaces/AAA", "hello");
+    assert_eq!(post(&app, "sales", Some(&chat_jwt("123456789")), &event).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(post(&app, "sales", Some(&chat_jwt("999999999")), &event).await, StatusCode::UNAUTHORIZED);
+    assert!(texts_with_bearer(&fake, &format!("Bearer tok-{email}")).is_empty());
+}
+
+#[tokio::test]
+async fn googlechat_pubsub_own_webhook_refuses_before_jwks_and_matches_unknown_agent() {
+    let home = tempfile::tempdir().unwrap();
+    let fake = start_fake().await;
+    let email = format!("early-{}@test-project.iam.gserviceaccount.com", uuid::Uuid::new_v4().simple());
+    let mut key: Value = serde_json::from_str(&service_account(&fake, &email)).unwrap();
+    key["project_id"] = json!("test-project");
+    let section = format!("{}connection = \"pubsub\"\npubsub_subscription = \"projects/test-project/subscriptions/chat-events\"\n", googlechat_section(home.path(), "123456789", &key.to_string()));
+    crate::trigger_route::tests::write_agent(&home.path().join("agents"), "sales", "業務", "@sales", "specialist", &section);
+    let ctx = super::e2e_tests::reply_ctx(home.path()).await;
+    let headers = HeaderMap::from_iter([(axum::http::header::AUTHORIZATION, format!("Bearer {}", chat_jwt("123456789")).parse().unwrap())]);
+    let event = Bytes::from(message_event("spaces/AAA", "hello").to_string());
+    let known = crate::googlechat_agents::handle(ctx.clone(), "sales", &headers, event.clone()).await;
+    let unknown = crate::googlechat_agents::handle(ctx, "missing", &headers, event).await;
+    assert_eq!(known.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(known.status(), unknown.status());
+    assert_eq!(axum::body::to_bytes(known.into_body(), 1024).await.unwrap(), axum::body::to_bytes(unknown.into_body(), 1024).await.unwrap());
+    assert_eq!(fake.state.jwks_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(fake.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn googlechat_chat_and_pubsub_tokens_use_separate_minimal_scopes() {
+    let fake = start_fake().await;
+    let email = format!("scopes-{}@test-project.iam.gserviceaccount.com", uuid::Uuid::new_v4().simple());
+    let raw = service_account(&fake, &email);
+    let creds = crate::googlechat::GoogleChatCreds::candidate(&raw).unwrap();
+    creds.token().await.unwrap();
+    creds.pubsub_token().await.unwrap();
+    assert_eq!(*fake.state.token_scopes.lock().unwrap(), vec![
+        "https://www.googleapis.com/auth/chat.bot",
+        "https://www.googleapis.com/auth/pubsub",
+    ]);
+    // Independent caches retain the correct grants instead of reusing the
+    // other transport's token or requesting a combined scope.
+    creds.token().await.unwrap();
+    creds.pubsub_token().await.unwrap();
+    assert_eq!(fake.state.token_scopes.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

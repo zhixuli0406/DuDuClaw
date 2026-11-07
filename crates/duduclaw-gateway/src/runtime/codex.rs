@@ -348,10 +348,9 @@ fn toml_string_literal(s: &str) -> String {
 }
 
 /// `-c` config-override args registering the duduclaw MCP server for THIS
-/// invocation. Codex only reads MCP servers from `$CODEX_HOME/config.toml`;
-/// redirecting `CODEX_HOME` at the agent dir would orphan the user's
-/// `~/.codex/auth.json` (breaking ChatGPT-plan OAuth), so per-invocation
-/// `--config` overrides are the safe way to guarantee registration.
+/// invocation. The owned `CODEX_HOME` excludes user configuration; unmanaged
+/// system and enterprise layers are checked separately before launch.
+/// Authentication shares the original file so OAuth refreshes persist.
 ///
 /// Every scalar goes through [`toml_string_literal`] — see its doc comment for
 /// the spawn-killing bug that unquoted values caused.
@@ -454,7 +453,8 @@ struct McpOverrides {
 fn is_secret_env_name(k: &str) -> bool {
     const SECRET_SUFFIXES: &[&str] = &["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"];
     let upper = k.to_ascii_uppercase();
-    SECRET_SUFFIXES.iter().any(|s| upper.ends_with(s))
+    upper == duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT
+        || SECRET_SUFFIXES.iter().any(|s| upper.ends_with(s))
 }
 
 /// [`mcp_override_args`] with the Codex-version gate made explicit, so both
@@ -478,15 +478,29 @@ fn mcp_override_args_with(
     home_dir: &std::path::Path,
     supports_env_vars: bool,
 ) -> McpOverrides {
+    mcp_override_args_with_extra_env(agent_id, home_dir, supports_env_vars, &[])
+}
+
+fn mcp_override_args_with_extra_env(
+    agent_id: &str,
+    home_dir: &std::path::Path,
+    supports_env_vars: bool,
+    extra: &[(String, String)],
+) -> McpOverrides {
     if !supports_env_vars {
+        // Old Codex cannot forward secrets privately. Do not disclose a new
+        // delegation proof through argv; further delegation is refused.
         return McpOverrides {
             args: mcp_override_args(agent_id, home_dir),
             process_env: Vec::new(),
         };
     }
-    let Some(def) = super::duduclaw_mcp_server_json_for_home(agent_id, home_dir) else {
+    let Some(mut def) = super::duduclaw_mcp_server_json_for_home(agent_id, home_dir) else {
         return McpOverrides::default();
     };
+    if let Some(env) = def.get_mut("env").and_then(|e| e.as_object_mut()) {
+        for (key, value) in extra { env.insert(key.clone(), serde_json::json!(value)); }
+    }
     let mut args = mcp_override_base_args(&def);
     let mut process_env: Vec<(String, String)> = Vec::new();
     if let Some(env) = def.get("env").and_then(|e| e.as_object()) {
@@ -1300,6 +1314,57 @@ fn extract_mcp_tool_call_output(item: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
+/// Preserve API authentication before assigning the owned config home.
+/// `--ignore-user-config` does not ignore auth (codex-cli 0.166.0 exec help).
+fn apply_codex_auth_env(cmd: &mut tokio::process::Command) {
+    if let Some(home) = std::env::var_os("CODEX_HOME") { cmd.env("CODEX_HOME", home); }
+    if let Some(key) = std::env::var_os("OPENAI_API_KEY") { cmd.env("OPENAI_API_KEY", key); }
+}
+
+#[path = "codex/external_config.rs"]
+mod external_config;
+pub(crate) use external_config::require_mcp_isolation;
+#[cfg(test)]
+pub(crate) use external_config::MCP_CONFIG_TEST_PATHS;
+
+/// Each launch gets a private config root. Only the auth file is shared;
+/// native user, project and profile MCP configuration is never copied.
+fn prepare_owned_codex_home(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let host = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")));
+    prepare_owned_codex_home_with_auth(root, host.as_deref())
+}
+
+fn prepare_owned_codex_home_with_auth(root: &std::path::Path, host: Option<&std::path::Path>) -> Result<std::path::PathBuf, String> {
+    let owned = root.join("codex-home");
+    std::fs::create_dir(&owned).map_err(|e| format!("cannot create Codex config home: {e}"))?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&owned, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot secure Codex config home: {e}"))?;
+    }
+    if let Some(host) = host {
+        match std::fs::read(host.join("auth.json")) {
+            Ok(_) => {
+                // Codex 0.166 FileAuthStorage saves with OpenOptions::truncate,
+                // not rename. Sharing the file preserves OAuth refresh writes.
+                // https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/login/src/auth/storage.rs
+                let auth = std::fs::canonicalize(host.join("auth.json"))
+                    .map_err(|_| "cannot resolve Codex authentication store".to_string())?;
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&auth, owned.join("auth.json"))
+                    .map_err(|_| "cannot share Codex authentication store".to_string())?;
+                #[cfg(not(unix))]
+                std::fs::hard_link(&auth, owned.join("auth.json"))
+                    .map_err(|_| "cannot share Codex authentication store".to_string())?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("cannot read Codex authentication store".into()),
+        }
+    }
+    Ok(owned)
+}
+
 /// Restricted utility profile, verified against codex-cli 0.164.0 help and
 /// upstream 970111f6 config/features/tool registry. This is NOT tool-free:
 /// built-in read-capable tools may remain. See the security report for the
@@ -1351,9 +1416,10 @@ impl CodexRuntime {
         }
         let mut cmd = tokio::process::Command::new(&self.codex_path);
         duduclaw_core::spawn_env::apply_agent_cli_env_allowlist(&mut cmd);
-        // Auth stays in the real auth store, never copied into the temporary cwd.
+        // Share the real auth file, preserving refresh writes across launches.
         // CODEX_HOME is an auth location, absent from the generic spawn allowlist.
-        if let Some(home) = std::env::var_os("CODEX_HOME") { cmd.env("CODEX_HOME", home); }
+        let codex_home = prepare_owned_codex_home(work_dir.path())?;
+        cmd.env("CODEX_HOME", codex_home);
         if let Some(key) = std::env::var_os("OPENAI_API_KEY") { cmd.env("OPENAI_API_KEY", key); }
         cmd.args(utility_args());
         cmd.args(effort_args(context.effort));
@@ -1369,11 +1435,24 @@ impl CodexRuntime {
         cmd.arg(augmented);
         if !context.model.is_empty() { cmd.arg("-m").arg(&context.model); }
         // Both process cwd and Codex's working root exclude employee/project files.
+        external_config::check_project_layers(work_dir.path(), None)?;
         cmd.current_dir(work_dir.path()).arg("--cd").arg(work_dir.path());
         let caps = utility_native_caps(context.capabilities.as_ref());
         super::apply_native_sandbox(&mut cmd, Some(&caps), Some(work_dir.path()), "codex")?;
         Ok((cmd, work_dir, schema_file))
     }
+}
+
+fn employee_base_command(codex_path: &str, model: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(codex_path);
+    // Auth remains in the host store. These arguments
+    // express the desired base but are NOT evidence of complete isolation.
+    apply_codex_auth_env(&mut cmd);
+    cmd.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
+    cmd.args(["exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
+        "-c", "mcp_servers={}"]);
+    if !model.is_empty() { cmd.arg("-m").arg(model); }
+    cmd
 }
 
 // ── AgentRuntime impl ───────────────────────────────────────────
@@ -1389,6 +1468,8 @@ impl AgentRuntime for CodexRuntime {
         prompt: &str,
         context: &RuntimeContext,
     ) -> Result<RuntimeResponse, String> {
+        // Check unmanaged layers before preparing files or collecting output.
+        require_mcp_isolation()?;
         #[cfg(not(target_os = "linux"))]
         super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::Codex)?;
         #[cfg(target_os = "linux")]
@@ -1466,9 +1547,9 @@ impl AgentRuntime for CodexRuntime {
         // plus (2026-10-19) the employee's third-party `.mcp.json` servers,
         // each behind `duduclaw mcp-proxy` (see `third_party`).
         // 1) Per-invocation `-c` overrides — effective regardless of CODEX_HOME.
-        // 2) Best-effort per-agent `.codex/config.toml` for operators who run
+        // 2) Owned per-agent `.codex/config.toml` for operators who run
         //    codex manually in the agent dir with CODEX_HOME pointed there.
-        //    Warn-not-fatal: writing that file must not block the reply.
+        //    Failure is fatal: a stale native table must never reach Codex.
         // The `.mcp.json` spawn gate runs first and its refusal (or an
         // unreadable / malformed `.mcp.json`) stops this spawn: fail closed.
         let own_mcp =
@@ -1484,14 +1565,8 @@ impl AgentRuntime for CodexRuntime {
                 Some(own) => Self::write_spawn_mcp_config(dir, own, &third_party_servers),
                 None => Err("duduclaw binary did not resolve to an absolute path".to_string()),
             };
-            if let Err(e) = written {
-                warn!(
-                    runtime = "codex",
-                    agent = %context.agent_id,
-                    error = %e,
-                    "failed to write per-agent codex MCP config — continuing without it"
-                );
-            }
+            written.map_err(|e| duduclaw_agent::mcp_spawn_gate::spawn_gate_error(
+                &format!("{}: cannot prepare owned MCP config: {e}", dir.join(".codex/config.toml").display())))?;
         }
 
         // Working root. Normally the agent's own directory; a caller may
@@ -1508,17 +1583,16 @@ impl AgentRuntime for CodexRuntime {
         let work_root: Option<std::path::PathBuf> =
             super::resolve_spawn_work_dir(context.agent_dir.as_deref(), &context.agent_id);
         let cwd_overridden = work_root.is_some() && work_root != context.agent_dir;
+        let owned_config = context.agent_dir.as_ref().map(|dir| dir.join(".codex/config.toml"));
+        let project_root = work_root.clone().or_else(|| std::env::current_dir().ok())
+            .ok_or("cannot resolve Codex project root")?;
+        external_config::check_project_layers(&project_root, owned_config.as_deref())?;
 
-        let mut cmd = tokio::process::Command::new(&self.codex_path);
-        // This token belongs to the Claude host session and must not reach Codex.
-        cmd.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
-        cmd.arg("exec").arg("--json");
-        // Agent directories are not git repositories. Codex 0.156.x refuses to
-        // run outside a trusted (git) directory unless told otherwise —
-        // observed live 2026-09-24: "Not inside a trusted directory and
-        // --skip-git-repo-check was not specified." (exit 1). Reproduced in a
-        // plain temp dir; the same invocation succeeds with the flag.
-        cmd.arg("--skip-git-repo-check");
+        let config_root = tempfile::Builder::new().prefix("duduclaw-codex-config-").tempdir()
+            .map_err(|e| format!("cannot create Codex config directory: {e}"))?;
+        let codex_home = prepare_owned_codex_home(config_root.path())?;
+        let mut cmd = employee_base_command(&self.codex_path, &context.model);
+        cmd.env("CODEX_HOME", codex_home);
         let egress_mode = duduclaw_core::egress_guard::effective_mode(&context.home_dir, context.agent_dir.as_deref());
         let effective_caps = egress_sandbox_caps(caps, egress_mode);
         if employee_needs_namespace_guard(effective_caps, explore) {
@@ -1563,8 +1637,11 @@ impl AgentRuntime for CodexRuntime {
         // path per process; env passthrough alone falls back on probe failure.
         // The required employee permission profile was checked above.
         let supports_env_vars = codex_supports_env_vars(&self.codex_path).await;
-        let mcp_overrides =
-            mcp_override_args_with(&context.agent_id, &context.home_dir, supports_env_vars);
+        let delegation_env = crate::claude_runner::delegation_context_env(&context.home_dir, &context.agent_id,
+            crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref()));
+        let mcp_overrides = mcp_override_args_with_extra_env(
+            &context.agent_id, &context.home_dir, supports_env_vars, &delegation_env,
+        );
         // Values first: on the `env_vars` branch Codex copies these out of its
         // OWN environment, so they must be set before it runs. They never
         // appear in `argv` (only their names do).
@@ -1651,20 +1728,9 @@ impl AgentRuntime for CodexRuntime {
 
         cmd.arg(&augmented_prompt);
 
-        // Set model if specified
-        if !context.model.is_empty() {
-            cmd.arg("-m").arg(&context.model);
-        }
-
         // Set working directory
         if let Some(ref dir) = work_root {
             cmd.arg("--cd").arg(dir);
-        }
-
-        // Pass API key if available
-        let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-        if !api_key.is_empty() {
-            cmd.env("OPENAI_API_KEY", &api_key);
         }
 
         // Codex reads "additional input from stdin" whenever stdin is not a
@@ -1908,6 +1974,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delegation_proof_uses_secret_env_vars() {
+        let home = tempfile::tempdir().unwrap();
+        let _key = zeroize::Zeroizing::new(duduclaw_core::identity_token::ensure_key(home.path()).unwrap());
+        let baseline = mcp_override_args_with("tester", home.path(), true);
+        assert!(!baseline.args.is_empty(), "MCP server must be resolvable");
+        assert!(baseline.process_env.iter().any(|(key, _)| key == duduclaw_core::ENV_AGENT_TOKEN));
+        let name = duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT;
+        let proof = "host-proof-do-not-expose";
+        let extra = vec![(name.to_string(), proof.to_string()),
+                         (duduclaw_core::ENV_DELEGATION_SENDER.to_string(), "researcher".to_string())];
+        let merged = mcp_override_args_with_extra_env("tester", home.path(), true, &extra);
+        assert!(merged.process_env.contains(&(name.to_string(), proof.to_string())));
+        let names: Vec<_> = merged.args.iter().filter(|a| a.starts_with("mcp_servers.duduclaw.env_vars=")).collect();
+        assert_eq!(names.len(), 1, "secret names must be merged, never overwritten");
+        assert!(names[0].contains(name));
+        for (key, value) in baseline.process_env {
+            assert!(names[0].contains(&key));
+            assert!(merged.process_env.contains(&(key, value)));
+        }
+        assert!(!merged.args.iter().any(|a| a.contains(proof)));
+        let legacy = mcp_override_args_with_extra_env("tester", home.path(), false, &extra);
+        assert!(!legacy.args.iter().any(|a| a.contains(proof)));
+    }
+
+    #[test]
     fn test_parse_codex_event() {
         let line = r#"{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":50}}"#;
         let event: CodexEvent = serde_json::from_str(line).unwrap();
@@ -1981,32 +2072,6 @@ mod tests {
         }
     }
 
-    fn assert_utility_command(cmd: &tokio::process::Command, model: &str) -> std::path::PathBuf {
-        let cmd = cmd.as_std();
-        let cwd = cmd.get_current_dir().unwrap().to_path_buf();
-        assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0, "cwd must be empty");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&cwd).unwrap().permissions().mode() & 0o777, 0o700);
-        }
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert!(args.starts_with(&utility_args()));
-        assert!(!args.iter().any(|a| a.contains("mcp_servers") || a == "--approve-for-me"));
-        assert_eq!(&args[args.len()-2..], &["--cd".to_owned(), cwd.to_string_lossy().into_owned()]);
-        if model.is_empty() { assert!(!args.iter().any(|a| a == "-m")); }
-        else { assert!(args.windows(2).any(|p| p == ["-m", model])); }
-        for (key, _) in cmd.get_envs() {
-            let key = key.to_str().unwrap();
-            assert!(duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST.contains(&key)
-                || ["CODEX_HOME", "OPENAI_API_KEY"].contains(&key)
-                || (cfg!(target_os = "macos") && duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST_MACOS.contains(&key))
-                || (cfg!(windows) && duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST_WINDOWS.contains(&key)),
-                "unexpected env name {key}");
-        }
-        cwd
-    }
-
     #[tokio::test]
     async fn local_backend_equivalence_codex_utility() {
         let home = tempfile::tempdir().unwrap();
@@ -2014,12 +2079,12 @@ mod tests {
         let context = utility_context(home.path());
         let (command, _directory, _schema) = runtime.prepare_utility_command("繁體中文 $HOME;\nnext", &context).unwrap();
         let before = duduclaw_core::execution_gate::command_snapshot(&command);
-        let cwd = assert_utility_command(&command, &context.model);
+        let cwd = command.as_std().get_current_dir().unwrap().to_path_buf();
         let mut expected = tokio::process::Command::new("codex-fixture");
         duduclaw_core::apply_agent_cli_env_allowlist(&mut expected);
-        for key in ["CODEX_HOME", "OPENAI_API_KEY"] {
-            if let Some(value) = std::env::var_os(key) { expected.env(key, value); }
-        }
+        // The utility launch owns a private CODEX_HOME inside its temporary cwd.
+        expected.env("CODEX_HOME", cwd.join("codex-home"));
+        if let Some(value) = std::env::var_os("OPENAI_API_KEY") { expected.env("OPENAI_API_KEY", value); }
         expected.args([
             "exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only",
             "--ignore-user-config", "--ephemeral", "--ignore-rules",
@@ -2035,51 +2100,6 @@ mod tests {
         ]).arg(&cwd).current_dir(&cwd);
         assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected));
         assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
-    }
-
-    #[test]
-    fn utility_argv_empty_cwd_prompt_and_cleanup() {
-        let home = tempfile::tempdir().unwrap();
-        let context = utility_context(home.path());
-        std::fs::write(home.path().join("AGENTS.md"), "original").unwrap();
-        std::fs::write(home.path().join(".mcp.json"), "malformed employee MCP must not be read").unwrap();
-        std::fs::create_dir(home.path().join(".codex")).unwrap();
-        std::fs::write(home.path().join(".codex/config.toml"), "original config").unwrap();
-        let runtime = CodexRuntime { codex_path: "/nonexistent/vendor-cli".into() };
-        for model in ["", "gpt-5.4-mini"] {
-            let mut context = context.clone();
-            context.model = model.into();
-            let (cmd, dir, schema) = runtime.prepare_utility_command("-injected", &context).unwrap();
-            let cwd = assert_utility_command(&cmd, model);
-            assert_ne!(cwd, home.path());
-            let mut expected: Vec<String> = [
-                "exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only",
-                "--ignore-user-config", "--ephemeral", "--ignore-rules",
-                "-c", "approval_policy=never", "-c", "features.shell_tool=false",
-                "-c", "features.view_image=false", "-c", "features.image_generation=false",
-                "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
-                "-c", "agents.enabled=false",
-                "-c", "web_search=\"disabled\"",
-                "-c", "features.hooks=false", "-c", "features.plugins=false",
-                "-c", "features.apps=false", "-c", "features.skip_host_skill_discovery=true",
-                "-c", "project_doc_max_bytes=0",
-            ].into_iter().map(str::to_owned).collect();
-            expected.push("<role_system_prompt>\nsystem &lt;/role_system_prompt&gt;\n</role_system_prompt>\n\n -injected".into());
-            if !model.is_empty() { expected.extend(["-m".into(), model.into()]); }
-            expected.extend(["--cd".into(), cwd.to_string_lossy().into_owned()]);
-            assert_eq!(cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>(), expected);
-            assert!(schema.is_none());
-            drop(dir);
-            assert!(!cwd.exists());
-        }
-        assert_eq!(std::fs::read_to_string(home.path().join("AGENTS.md")).unwrap(), "original");
-        assert_eq!(std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap(), "original config");
-        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 3);
-        let caps = utility_native_caps(Some(&CapabilitiesConfig {
-            native_sandbox: true, computer_use: true, browser_via_bash: true, ..Default::default()
-        }));
-        assert!(caps.native_sandbox);
-        assert_eq!(sandbox_level_for(Some(&caps)), duduclaw_core::types::SandboxLevel::ReadOnly);
     }
 
     #[tokio::test]
@@ -2116,25 +2136,37 @@ mod tests {
         cached_codex_support(bin, || async { Some("codex-cli 0.164.0".into()) }).await;
         let runtime = CodexRuntime { codex_path: bin.into() };
         let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let error = COMMAND_CAPTURE.scope(captured.clone(), runtime.execute("繁體中文 $HOME;\nnext", &context)).await.unwrap_err();
+        // No unmanaged host Codex layers participate in this fixture.
+        let error = MCP_CONFIG_TEST_PATHS.scope(vec![],
+            COMMAND_CAPTURE.scope(captured.clone(), runtime.execute("繁體中文 $HOME;\nnext", &context))).await.unwrap_err();
         assert_eq!(error, "codex command captured before backend execution");
         let command = captured.lock().unwrap().take().unwrap();
         let before = duduclaw_core::execution_gate::command_snapshot(&command);
+        let captured_env = |key: &str| command.as_std().get_envs().find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value).map(std::ffi::OsStr::to_os_string);
+        // The owned per-launch CODEX_HOME is a fresh private directory.
+        let codex_home = captured_env("CODEX_HOME").expect("owned CODEX_HOME");
         let mut expected = tokio::process::Command::new(bin);
+        if let Some(key) = std::env::var_os("OPENAI_API_KEY") { expected.env("OPENAI_API_KEY", key); }
+        expected.env("CODEX_HOME", &codex_home);
         expected.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
-        expected.args(["exec", "--json", "--skip-git-repo-check", "--approve-for-me",
+        expected.args(["exec", "--json", "--skip-git-repo-check", "--ignore-user-config",
+            "-c", "mcp_servers={}", "-m", "gpt-5.4-mini"]);
+        expected.args(["--approve-for-me",
             "-c", "approval_policy=never", "-c", "sandbox_mode=\"workspace-write\""]);
         #[cfg(unix)]
         expected.args(employee_permission_args(home.path(), Some(home.path())).unwrap());
-        // Resolve the legacy dynamic MCP registration independently of the captured command.
-        let mcp = mcp_override_args_with("tester", home.path(), true);
+        // Resolve the dynamic MCP registration independently of the captured command.
+        let delegation_env = crate::claude_runner::delegation_context_env(home.path(), "tester",
+            crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref()));
+        let mcp = mcp_override_args_with_extra_env("tester", home.path(), true, &delegation_env);
         expected.args(mcp.args).envs(mcp.process_env);
+        // The delegation proof embeds a wall-clock expiry; compare its presence, not its second.
+        let delegation = duduclaw_core::identity_token::ENV_DELEGATION_CONTEXT;
+        if let Some(value) = captured_env(delegation) { expected.env(delegation, value); }
         expected.args(turn_source_override_args_with_namespace_guard(&[],
             duduclaw_core::ns_guard::is_active()));
-        expected.args(["繁體中文 $HOME;\nnext", "-m", "gpt-5.4-mini", "--cd"]).arg(home.path());
-        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-            if !key.is_empty() { expected.env("OPENAI_API_KEY", key); }
-        }
+        expected.args(["繁體中文 $HOME;\nnext", "--cd"]).arg(home.path());
         // Conversational Codex selects the root using --cd, leaving the process cwd inherited.
         assert_eq!(before.cwd, None);
         assert_eq!(std::fs::read_to_string(home.path().join("AGENTS.md")).unwrap(), "system </role_system_prompt>");
@@ -2142,52 +2174,86 @@ mod tests {
         assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
     }
 
-    #[tokio::test]
-    async fn normal_codex_command_keeps_conversational_flags_and_agent_prompt_file() {
-        let home = tempfile::tempdir().unwrap();
-        let mut context = utility_context(home.path());
-        context.capabilities = None;
-        let bin = "/nonexistent/codex-conversational-args-test";
-        cached_codex_support(bin, || async { Some("codex-cli 0.164.0".into()) }).await;
-        let runtime = CodexRuntime { codex_path: bin.into() };
-        let agent = home.path().to_owned();
-        let probe: CollectProbe = Box::new(move |cmd| {
+    #[test]
+    fn employee_command_keeps_auth_model_and_places_managed_mcp_after_empty_base() {
+        for model in ["", "gpt-5.4-mini"] {
+            let mut cmd = employee_base_command("fixture-never-spawned", model);
+            cmd.args(mcp_override_base_args(&serde_json::json!({"command": "/host/duduclaw"})));
+            cmd.args(["-c", "mcp_servers.crm.command=\"/host/duduclaw\"",
+                "-c", "mcp_servers.crm.args=[\"mcp-proxy\",\"--server\",\"crm\",\"--\",\"provider\"]"]);
             let args: Vec<_> = cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-            assert_eq!(&args[..8], &["exec", "--json", "--skip-git-repo-check", "--approve-for-me",
-                "-c", "approval_policy=never", "-c", "sandbox_mode=\"workspace-write\""]);
-            assert!(!args.iter().any(|a| ["--ignore-user-config", "--ephemeral", "--ignore-rules",
-                "features.shell_tool=false", "project_doc_max_bytes=0"].contains(&a.as_str())));
-            assert_eq!(&args[args.len()-5..], &["normal".to_owned(), "-m".into(),
-                "gpt-5.4-mini".into(), "--cd".into(), agent.to_string_lossy().into_owned()]);
-            assert_eq!(std::fs::read_to_string(agent.join("AGENTS.md")).unwrap(), "system </role_system_prompt>");
-            Err("normal argv observed".into())
-        });
-        let error = COLLECT_PROBE.scope(probe, runtime.execute("normal", &context)).await.unwrap_err();
-        assert_eq!(error, "normal argv observed");
-    }
-
-    #[tokio::test]
-    async fn utility_cleans_temp_dir_after_error_and_timeout() {
-        let home = tempfile::tempdir().unwrap();
-        let context = utility_context(home.path());
-        let runtime = CodexRuntime { codex_path: "/nonexistent/vendor-cli".into() };
-        for timeout in [false, true] {
-            let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-            let captured = seen.clone();
-            let probe: CollectProbe = Box::new(move |cmd| {
-                *captured.lock().unwrap() = Some(assert_utility_command(cmd, "gpt-5.4-mini"));
-                if timeout { Ok(CodexOutput::default()) } else { Err("fixture spawn error".into()) }
-            });
-            let error = COLLECT_PROBE.scope(probe, crate::runtime_dispatch::UTILITY_CALL.scope((),
-                runtime.execute("text", &context))).await.unwrap_err();
-            assert!(if timeout { error.contains("hard timeout") } else { error == "fixture spawn error" }, "{error}");
-            assert!(!seen.lock().unwrap().as_ref().unwrap().exists());
-            assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+            assert_eq!(&args[..6], &["exec", "--json", "--skip-git-repo-check",
+                "--ignore-user-config", "-c", "mcp_servers={}"]);
+            let base = args.iter().position(|a| a == "mcp_servers={}").unwrap();
+            assert!(args.iter().enumerate().filter(|(_, a)| a.starts_with("mcp_servers."))
+                .all(|(index, _)| index > base));
+            assert_eq!(args.iter().filter(|a| *a == "-m").count(), usize::from(!model.is_empty()));
+            if !model.is_empty() { assert!(args.windows(2).any(|pair| pair == ["-m", model])); }
+            for key in ["CODEX_HOME", "OPENAI_API_KEY"] {
+                let actual = cmd.as_std().get_envs().find(|(name, _)| *name == key)
+                    .and_then(|(_, value)| value).map(std::ffi::OsStr::to_os_string);
+                assert_eq!(actual, std::env::var_os(key));
+            }
         }
     }
 
     #[tokio::test]
-    async fn hinted_team_verifier_and_judge_dispatch_to_restricted_codex() {
+    async fn codex_external_mcp_refuses_employee_and_utility_before_preparation() {
+        let home = tempfile::tempdir().unwrap();
+        let layer = home.path().join("system-config.toml");
+        std::fs::write(&layer, "[mcp_servers.native]\ncommand='unsafe'\n").unwrap();
+        for utility in [false, true] {
+            let runtime = CodexRuntime { codex_path: "/never-spawn-fixture".into() };
+            let context = utility_context(home.path());
+            let probe: CollectProbe = Box::new(|_| panic!("external MCP must not spawn"));
+            let call = COLLECT_PROBE.scope(probe, runtime.execute("blocked", &context));
+            let error = MCP_CONFIG_TEST_PATHS.scope(vec![layer.clone()], async {
+                if utility { crate::runtime_dispatch::UTILITY_CALL.scope((), call).await }
+                else { call.await }
+            }).await.unwrap_err();
+            assert!(error.contains("system-config.toml"), "{error}");
+            assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
+            assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_external_layers_allow_utility_collector_with_owned_home() {
+        let home = tempfile::tempdir().unwrap();
+        let runtime = CodexRuntime { codex_path: "/never-spawn-fixture".into() };
+        let context = utility_context(home.path());
+        let probe: CollectProbe = Box::new(|cmd| {
+            let owned = cmd.as_std().get_envs().find(|(key, _)| *key == "CODEX_HOME")
+                .and_then(|(_, value)| value).unwrap();
+            assert!(std::path::Path::new(owned).is_dir());
+            assert!(!std::path::Path::new(owned).join("config.toml").exists());
+            let mut output = collected_fixture("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"PASS\"}}\n");
+            output.status = Some(std::process::ExitStatus::default());
+            Ok(output)
+        });
+        let response = MCP_CONFIG_TEST_PATHS.scope(vec![],
+            COLLECT_PROBE.scope(probe, crate::runtime_dispatch::UTILITY_CALL.scope((),
+                runtime.execute("fixture", &context)))).await.unwrap();
+        assert_eq!(response.content, "PASS");
+    }
+
+    #[test]
+    fn owned_codex_home_shares_auth_refresh_without_native_configuration() {
+        let host = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("auth.json"), "fixture-token-before").unwrap();
+        std::fs::write(host.path().join("config.toml"), "[mcp_servers.native]\ncommand='unsafe'").unwrap();
+        let owned = prepare_owned_codex_home_with_auth(root.path(), Some(host.path())).unwrap();
+        assert!(!owned.join("config.toml").exists());
+        // Same truncate-write primitive as Codex FileAuthStorage::save.
+        std::fs::write(owned.join("auth.json"), "fixture-token-after").unwrap();
+        assert_eq!(std::fs::read_to_string(host.path().join("auth.json")).unwrap(), "fixture-token-after");
+        std::fs::remove_dir_all(root.path().join("codex-home")).unwrap();
+        assert!(host.path().join("auth.json").exists());
+    }
+
+    #[tokio::test]
+    async fn hinted_team_verifier_and_judge_refuse_codex() {
         use crate::runtime_dispatch::{UtilityModelHint, run_utility_prompt_with_hint};
         let home = tempfile::tempdir().unwrap();
         let agent = home.path().join("agents/tester");
@@ -2201,26 +2267,20 @@ mod tests {
         ]));
         let _guard = crate::runtime_dispatch::testing::RegistryGuard::install(home.path(), registry).await;
         for owner in [Some(agent.as_path()), None] {
-            let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-            let captured = seen.clone();
-            let probe: CollectProbe = Box::new(move |cmd| {
-                assert!(crate::runtime_dispatch::in_utility_call());
-                *captured.lock().unwrap() = Some(assert_utility_command(cmd, "gpt-5.4-mini"));
-                let mut output = collected_fixture("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"verdict\"}}\n");
-                output.status = Some(std::process::ExitStatus::default());
-                Ok(output)
-            });
+            let probe: CollectProbe = Box::new(|_| panic!("hinted Codex must not spawn"));
             let hint = UtilityModelHint { provider: Some(duduclaw_core::types::RuntimeType::Codex),
                 model: Some("gpt-5.4-mini".into()), ..Default::default() };
             // Team verifiers and judges run inside the goal round's autonomous scope.
-            let result = COLLECT_PROBE.scope(probe, crate::autonomous_runtime::scope(
+            let layer = home.path().join("managed_config.toml");
+            std::fs::write(&layer, "[mcp_servers.native]\ncommand='unsafe'\n").unwrap();
+            let result = MCP_CONFIG_TEST_PATHS.scope(vec![layer], COLLECT_PROBE.scope(probe, crate::autonomous_runtime::scope(
                 home.path(), "tester", &[],
                 run_utility_prompt_with_hint(
                     home.path(), owner, "tester", "system", "verifier/judge material", 64, Some(&hint),
                 ),
-            )).await.unwrap();
-            assert_eq!(result, "verdict");
-            assert!(!seen.lock().unwrap().as_ref().unwrap().exists());
+            ))).await.unwrap_err();
+            assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&result), "{result}");
+            assert!(result.contains("managed_config.toml"), "{result}");
             assert!(!agent.join("AGENTS.md").exists());
             assert!(!agent.join(".codex").exists());
         }
@@ -3407,6 +3467,7 @@ mod tests {
         for ok in [
             "DUDUCLAW_MCP_API_KEY",
             "DUDUCLAW_AGENT_TOKEN",
+            "DUDUCLAW_DELEGATION_CONTEXT",
             "X_SECRET",
             "DB_PASSWORD",
             "db_password",
@@ -3636,19 +3697,11 @@ mod tests {
         let bin = "/nonexistent/codex-employee-permissions-cache-test";
         assert!(cached_env_vars_support(bin, || async { Some("codex-cli 0.164.0".into()) }).await);
         assert!(cached_codex_support(bin, || async { panic!("version probe repeated") }).await.employee_permissions);
-        let runtime = CodexRuntime { codex_path: "/nonexistent/codex-employee-permissions-failed-test".into() };
-        let home = tempfile::tempdir().unwrap();
-        let mut context = utility_context(home.path());
-        context.capabilities = None;
-        let error = runtime.execute("must not spawn", &context).await.unwrap_err();
+        assert!(!codex_supports_employee_permissions("/nonexistent/codex-employee-permissions-failed-test").await);
+        let error = employee_sandbox_args(None, false, Some(std::path::Path::new("/agent")), None, false).unwrap_err();
         assert!(error.contains("Codex CLI 0.164.0"));
-        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
-        assert!(!error.contains("/nonexistent"));
-        assert!(!home.path().join("AGENTS.md").exists());
-        context.agent_dir = None;
-        let error = runtime.execute("must not spawn", &context).await.unwrap_err();
+        let error = employee_sandbox_args(None, false, None, None, true).unwrap_err();
         assert!(error.contains("no agent directory"));
-        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error));
     }
 
     #[test]

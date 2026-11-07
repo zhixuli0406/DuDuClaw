@@ -3,7 +3,7 @@
 // real credentials/keychains and every outbound address except loopback.
 // Requires Node 22+ and a debug live-test-mocks binary; never uses Google.
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync, createWriteStream } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -95,6 +95,19 @@ enabled = false
 enabled = false
 `);
 const env = Object.fromEntries(['PATH', 'TMPDIR', 'LANG'].filter((k) => process.env[k]).map((k) => [k, process.env[k]]));
+// Use a disposable signed entitlement; debug builds obey the production ceiling too.
+const fingerprint = spawnSync(binary, ['license', 'fingerprint'], { env: { ...env, HOME: home, DUDUCLAW_HOME: home }, encoding: 'utf8' });
+assert.equal(fingerprint.status, 0, fingerprint.stderr);
+const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+const issuedAt = new Date().toISOString().replace(/\.000Z$/, 'Z');
+const expiresAt = new Date(Date.now() + 86400000).toISOString().replace(/\.000Z$/, 'Z');
+// Field order matches License::canonical_payload; the private key stays in memory.
+const licensePayload = { version: 2, subscription_id: 'sub_personal_probe', customer_id: 'fixture', tier: 'oem',
+  machine_fingerprint: fingerprint.stdout.trim().split('\n')[0], issued_at: issuedAt, expires_at: expiresAt,
+  last_phone_home: issuedAt, public_key_id: 'personal_probe', nfr: true };
+const signature = sign(null, Buffer.from(JSON.stringify(licensePayload)), privateKey).toString('base64');
+writeFileSync(join(home, 'license.json'), JSON.stringify({ ...licensePayload, signature }), { mode: 0o600 });
+env.DUDUCLAW_LICENSE_PUBKEY_PERSONAL_PROBE = Buffer.from(publicKey.export({ format: 'jwk' }).x, 'base64url').toString('hex');
 Object.assign(env, { HOME: join(home, 'os-home'), DUDUCLAW_HOME: home, DUDUCLAW_EDITION: 'enterprise', DUDUCLAW_LIVE_TEST_GOOGLE_API_BASE: mockBase });
 console.log(`ARTIFACTS ${home}`);
 const gateway = spawn(binary, ['run', '--yes'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -256,7 +269,7 @@ try {
   assert(!vault.includes('bob-google@c.test'), 'offboard must remove the personal record');
   console.log('PASS real users.remove offboarding removes grant and rejects the former user');
   console.log('PASS encrypted vault and audit contain no raw access/refresh token');
-  writeFileSync(join(home, 'result.json'), JSON.stringify({ status: 'PASS_ISOLATED_MOCK', events, profile: 'debug_assertions=true; debug symbols=0' }, null, 2), { mode: 0o600 });
+  writeFileSync(join(home, 'result.json'), JSON.stringify({ status: 'PASS_ISOLATED_MOCK', events, profile: 'live-test-mocks; signed disposable OEM license' }, null, 2), { mode: 0o600 });
 } finally {
   heldRevoke = undefined;
   for (const socket of sockets) socket.close();

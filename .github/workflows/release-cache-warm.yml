@@ -47,6 +47,11 @@ jobs:
     needs: decide
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.decide.outputs.run != 'false' }}
     runs-on: ${{ matrix.os }}
+    env:
+      # MSVC symbols live in separate PDBs; retain the existing Windows output.
+      CARGO_PROFILE_RELEASE_STRIP: ${{ startsWith(matrix.os, 'windows') && 'none' || 'symbols' }}
+      # Keep in sync with release.yml (CARGO_* env is part of the rust-cache key).
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ startsWith(matrix.os, 'windows') && 's' || '3' }}
     strategy:
       fail-fast: false
       matrix:
@@ -97,7 +102,7 @@ jobs:
 
       - name: Build binary (macOS/Windows — with desktop feature)
         if: matrix.target != 'aarch64-unknown-linux-gnu' && runner.os != 'Linux'
-        run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-gateway/desktop,duduclaw-cli/dashboard
+        run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-gateway/desktop,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
 
       - name: Check Linux glibc baseline
         if: runner.os == 'Linux'
@@ -107,6 +112,9 @@ jobs:
     needs: decide
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.decide.outputs.run != 'false' }}
     runs-on: ${{ matrix.os }}
+    env:
+      # MSVC symbols live in separate PDBs; retain the existing Windows output.
+      CARGO_PROFILE_RELEASE_STRIP: ${{ startsWith(matrix.os, 'windows') && 'none' || 'symbols' }}
     strategy:
       fail-fast: false
       matrix:
@@ -174,7 +182,14 @@ jobs:
             CARGO_TARGET_DIR="$SIDECAR_TARGET_DIR" PKG_CONFIG_ALLOW_CROSS=1 cross build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }} --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
             python3 scripts/check_glibc.py "$SIDECAR_TARGET_DIR/${{ matrix.target }}/release/duduclaw"
           else
-            cargo build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }}
+            # Ship a self-contained sidecar: vendor OpenSSL (webauthn-rs) instead of
+            # linking the runner's system/Homebrew copy.
+            # Git Bash's MSYS perl lacks modules OpenSSL's Configure needs; use the
+            # runner's Strawberry Perl on Windows.
+            if [[ "${{ matrix.target }}" == *windows* ]]; then
+              export OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe
+            fi
+            cargo build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }} --features duduclaw-gateway/vendored-openssl
           fi
           mkdir -p src-tauri/binaries
           EXT=""; [[ "${{ matrix.target }}" == *windows* ]] && EXT=".exe"

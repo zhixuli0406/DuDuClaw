@@ -107,7 +107,7 @@ pub fn import_archive(archive: &Path, home: &Path, force: bool, personal: bool) 
         ));
     }
     // Create only the empty root before locking; no employee data is written.
-    fs::create_dir_all(home).map_err(|e| io_err("import mkdir home", e))?;
+    duduclaw_core::config::create_home_dir(home).map_err(|e| io_err("import mkdir home", e))?;
     let _barrier = duduclaw_core::autonomy_gate::exclusive_barrier(home)
         .map_err(|error| io_err("import", error))?;
     // The Admin toggle uses this same lock. Recheck after acquiring it and
