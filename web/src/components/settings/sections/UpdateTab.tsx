@@ -139,7 +139,7 @@ export function UpdateTab() {
         if (cancelled) return;
         if (result.protected_request_id !== protectedRequest) throw new Error('update response mismatch');
         setProtectedState(result.protected_state);
-        setError('');
+        setError(null);
         if (protectedUpdateFinished(result.protected_state)) {
           setInstalled(result.protected_state === 'committed');
           rememberProtectedUpdate(null);

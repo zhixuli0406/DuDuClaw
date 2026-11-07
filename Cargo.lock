@@ -810,24 +810,6 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "calamine"
-version = "0.36.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fa68281b1a76b54a62156474adb06bb380a67e07dd60656e3217152b42183f3"
-dependencies = [
- "atoi_simd",
- "byteorder",
- "chrono",
- "codepage",
- "encoding_rs",
- "fast-float2",
- "log",
- "quick-xml 0.41.0",
- "serde",
- "zip 8.6.0",
-]
-
-[[package]]
-name = "calamine"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f431b67cba6122a1f7d26b7adafc71bbdf07026095fe811f5efc025d8748e1d8"
@@ -841,7 +823,7 @@ dependencies = [
  "log",
  "quick-xml 0.42.0",
  "serde",
- "zip 9.0.5",
+ "zip",
 ]
 
 [[package]]
@@ -1930,7 +1912,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bollard",
- "calamine 0.38.0",
+ "calamine",
  "chrono",
  "chrono-tz",
  "clap",
@@ -2000,7 +1982,7 @@ dependencies = [
  "uuid",
  "windows-sys 0.59.0",
  "zeroize",
- "zip 9.0.5",
+ "zip",
 ]
 
 [[package]]
@@ -2167,7 +2149,7 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "base64 0.22.1",
- "calamine 0.38.0",
+ "calamine",
  "chrono",
  "chrono-tz",
  "cron",
@@ -2262,7 +2244,7 @@ dependencies = [
  "windows-sys 0.59.0",
  "zbus",
  "zeroize",
- "zip 9.0.5",
+ "zip",
 ]
 
 [[package]]
@@ -2360,7 +2342,7 @@ dependencies = [
 name = "duduclaw-knowledge"
 version = "1.80.1"
 dependencies = [
- "calamine 0.38.0",
+ "calamine",
  "chrono",
  "csv",
  "duduclaw-core",
@@ -2389,7 +2371,7 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
- "zip 9.0.5",
+ "zip",
 ]
 
 [[package]]
@@ -2556,7 +2538,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "zip 9.0.5",
+ "zip",
 ]
 
 [[package]]
@@ -2577,7 +2559,7 @@ dependencies = [
 name = "duduclaw-parse-worker"
 version = "1.80.1"
 dependencies = [
- "calamine 0.36.1",
+ "calamine",
  "chrono",
  "csv",
  "duduclaw-isolation",
@@ -2598,7 +2580,7 @@ dependencies = [
  "url",
  "uuid",
  "zbus",
- "zip 9.0.5",
+ "zip",
 ]
 
 [[package]]
@@ -2650,7 +2632,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
- "zip 9.0.5",
+ "zip",
 ]
 
 [[package]]
@@ -6046,7 +6028,6 @@ version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
- "encoding_rs",
  "memchr",
 ]
 
@@ -6668,7 +6649,7 @@ version = "0.100.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c44904ffb6c57b148ffcc8ce3011c28bc49b97e1a8343b2d632283cd566e1393"
 dependencies = [
- "zip 9.0.5",
+ "zip",
 ]
 
 [[package]]
@@ -10109,20 +10090,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "zip"
-version = "8.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
-dependencies = [
- "crc32fast",
- "flate2",
- "indexmap 2.14.0",
- "memchr",
- "typed-path",
- "zopfli",
 ]
 
 [[package]]

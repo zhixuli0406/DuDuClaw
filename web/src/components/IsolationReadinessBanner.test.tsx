@@ -47,7 +47,8 @@ describe('IsolationReadinessBanner', () => {
 
   it('shows unfinished isolation setup even when all host checks passed', () => {
     renderWithProviders(<IsolationReadinessBanner />);
-    expect(screen.getByRole('alert')).toHaveTextContent('Protected employee processes cannot start');
+    expect(screen.getByRole('alert')).toHaveTextContent('Protected TEAM work is paused');
+    expect(screen.getByRole('alert')).toHaveTextContent('Employee work, including API-only model calls, cannot start');
     expect(screen.getByText(/Document processing/)).toHaveTextContent('Setup is not complete');
     expect(screen.queryByText(/Launch service/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Check again' }));
@@ -64,10 +65,11 @@ describe('IsolationReadinessBanner', () => {
     expect(screen.getByText(/Tool authorization/)).toHaveTextContent('Setup is not complete');
   });
 
-  it('explains the process launch block to non-admins without component details', () => {
+  it('explains the employee work block to non-admins without component details', () => {
     useAuthStore.setState({ user: { ...useAuthStore.getState().user!, role: 'employee' } });
     renderWithProviders(<IsolationReadinessBanner />);
-    expect(screen.getByRole('alert')).toHaveTextContent('Protected employee processes cannot start');
+    expect(screen.getByRole('alert')).toHaveTextContent('Protected TEAM work is paused');
+    expect(screen.getByRole('alert')).toHaveTextContent('Employee work, including API-only model calls, cannot start');
     expect(screen.queryByText('Service details')).not.toBeInTheDocument();
   });
 });
