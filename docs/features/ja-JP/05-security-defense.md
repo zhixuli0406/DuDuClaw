@@ -744,3 +744,12 @@ Cron admission は `on_behalf_of`、`created_by_user_id`、`scoped_by_user_id` �
 社員 cron は UTC のみ（ゼロ時差の UTC／GMT 別名も可）です。DST による実時間の間隔短縮を避けるため、他のタイムゾーンを使う既存予定の編集・再開・手動実行は拒否します。閲覧と権限に基づく停止・削除は可能で、タイムゾーン付き予定は Admin が管理します。
 
 人間由来の MCP 予定は UTC が既定で、由来マーカーのない Admin／バックグラウンド予定はローカル時間帯の検出を維持します。
+
+## スキャン範囲、社員作成権限とチーム委任（v1.81）
+
+- **`code_map` は社員自身のディレクトリだけをスキャンします。** `root` 引数はシンボリックリンク解決後に `<home>/agents/<id>`（チームの役割メンバーは `.ephemeral/<id>`）の中になければなりません。相対パスはそのディレクトリ基準で解決し、`root` 省略時はそのディレクトリを使います。MCP サーバーの作業ディレクトリは使いません。`..`、範囲外、外部を指すリンクはエラーとなり、`tool_calls.jsonl` に `refused` 行が残ります。ディレクトリ内のシンボリックリンクのファイルはスキャン時にスキップします。社員の身元がない呼び出し（空、予約済み、無効な id）は拒否され、`code_map` は識別された AI 社員が自分のフォルダーに対してだけ使えるとエラーで説明します。`meeting_transcribe.source_path` は以前から社員自身の `attachments/` 内のファイルだけを受け付けます（`..` とシンボリックリンクは不可、MCP と gateway の両方で検査）。
+- **既定で社員を作成できるのはメインエージェントだけです。** 管理者の作成経路（ダッシュボード、`duduclaw agent create` とインポーター）は `role = "main"` のときだけ `can_create_agents = true` を書き、他の役割には明示的に `false` を書きます。プレミアムテンプレートのインストールでは非メイン役割を `false` に強制し、評価者テンプレートは `false` で出荷し、v1.68 の起動時移行も非メイン役割の `false` を `true` に戻さなくなりました。
+- **社員が作成した社員には作成権限がありません。** MCP `create_agent` は役割にかかわらず `can_create_agents = false` を書きます。`role = "main"` の社員を作成できるのは、呼び出し元自身が作成権限を持つ `main` エージェントの場合だけです。それ以外は何も書き込む前に拒否します。
+- **動作変更：未設定の `can_create_agents` は役割で決まります。** MCP ゲート（`create_agent`、`spawn_ephemeral`）は以前は明示的な `false` だけを拒否していました。現在は未設定の場合、役割の既定値になります：`role = "main"` は許可、それ以外の役割と、役割がない・読めない場合は拒否です。明示的な設定のない非メイン社員（多くは v1.68 より前に作成）は社員を作成できなくなります。Admin が明示的に設定した `true` は引き続き有効で、Admin はダッシュボードから個別に有効化できます。
+- **プランナーのパケットの `tool_scope` は実行役のツールを狭めるだけです。** 空でない `allowed` は実行役をそのツール（と `team_handoff`）に限定します。社員が持たないツールを 1 つでも挙げると、その委任は拒否され、Warning レベルの `team_tool_scope_escalation` 監査行が書かれます。`denied` は実行役のツールから除かれ、メンバーの `denied_tools` に追加されます。役割メンバー（と通常の一時ヘルパー）は社員の `approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools`、`action_rules`、`policy`、`egress_guard`、`scoped_tools` も引き継ぎ、社員と同じ承認を受けます。`grant_ttl_secs` は引き継ぎません。社員の長い期限がメンバーの許可を延ばしてしまうためです。
+- **引き継いだ承認設定がチームの引き継ぎを止めることはありません。** 役割メンバーについて、MCP ゲートは `team_handoff` に限り、引き継いだ `action_rules`、`policy`、承認リストを適用しません（`ephemeral::is_role_member_intrinsic_call`。完全な `[team_member]` レコードが必要で、その parent が `ephemeral.toml` と一致すること）。`team_handoff` を含む `scoped_tools` の項目はコピーしません。`allowed_tools`、明示的な `denied_tools`、`[permissions]`、外部送信ガードは引き続き適用されます。

@@ -246,7 +246,29 @@ impl CodeMap {
 
     /// Build the symbol map by walking `config.root` (gitignore-aware,
     /// skipping `.git`, `target`, `node_modules`, etc. via the `ignore` crate).
+    ///
+    /// Files are read with [`read_source_nofollow`]: the final component is
+    /// opened `O_NOFOLLOW` (unix) / without following a reparse point
+    /// (Windows) and must be a single-link regular file. The directories on
+    /// the way are still resolved by path, so a caller that must contain the
+    /// scan against a concurrent swap uses [`Self::build_with_reader`] with a
+    /// descriptor-relative reader (the `code_map` MCP tool does).
     pub fn build(config: &CodeMapConfig) -> Result<CodeMap> {
+        let max = config.max_file_bytes;
+        Self::build_with_reader(config, |path, _rel| read_source_nofollow(path, max))
+    }
+
+    /// [`Self::build`] with the file reads delegated to `read(path, rel)`:
+    /// `path` is the walked path, `rel` the same file relative to
+    /// `config.root`. The walk only *enumerates* names (no symlink is
+    /// followed or descended); every byte that is indexed comes from `read`,
+    /// which returns `None` to skip a file. RM-103 S1 (v1.81, Daybreak #4):
+    /// this is how a caller keeps content containment by directory
+    /// descriptor rather than by a path checked earlier.
+    pub fn build_with_reader<F>(config: &CodeMapConfig, mut read: F) -> Result<CodeMap>
+    where
+        F: FnMut(&Path, &Path) -> Option<String>,
+    {
         if !config.root.exists() {
             return Err(DuDuClawError::Memory(format!(
                 "code_map root does not exist: {}",
@@ -263,8 +285,17 @@ impl CodeMap {
             .build();
 
         for entry in walker.flatten() {
+            // Never read through a symlink: the walker already does not
+            // descend linked directories, but `is_file()` / `read_to_string`
+            // follow a linked FILE, which would let a link inside the scan
+            // root expose symbols from outside it (RM-103 S1).
+            if entry.path_is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if !path.is_file() {
+            // The walker's own (lstat) file type — `Path::is_file` would
+            // follow a link swapped in after the walk listed the entry.
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
             let ext = match path.extension().and_then(|e| e.to_str()) {
@@ -278,16 +309,14 @@ impl CodeMap {
                 Some(l) => l,
                 None => continue,
             };
-            let meta = match path.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if meta.len() as usize > config.max_file_bytes {
+            let Ok(rel) = path.strip_prefix(&config.root) else {
                 continue;
-            }
-            let source = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(_) => continue, // binary / non-UTF8: skip
+            };
+            // Unreadable, refused (link, multi-link, special file), too large,
+            // binary / non-UTF8: skip.
+            let source = match read(path, rel) {
+                Some(s) if s.len() <= config.max_file_bytes => s,
+                _ => continue,
             };
             if let Some(fs) = extract_file(&config.root, path, lang, &source) {
                 if !fs.defs.is_empty() || !fs.idents.is_empty() {
@@ -463,6 +492,59 @@ fn kind_rank(kind: SymbolKind) -> u8 {
     }
 }
 
+/// Read one source file for [`CodeMap::build`] without following a link in
+/// its last component: `O_NOFOLLOW` (unix) / `FILE_FLAG_OPEN_REPARSE_POINT`
+/// with reparse points refused (Windows). The opened file must be a regular
+/// file with exactly one link (a hard link to a file elsewhere is refused —
+/// RM-103 S1, Daybreak #4), at most `max` bytes, and UTF-8. Read from the
+/// opened handle, never by path again.
+pub fn read_source_nofollow(path: &Path, max: usize) -> Option<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > max as u64 {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() != 1 {
+            return None;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return None; // FILE_ATTRIBUTE_REPARSE_POINT
+        }
+    }
+    read_bounded_utf8(file, max)
+}
+
+/// Read at most `max` bytes from `reader` as UTF-8; `None` when it is longer,
+/// unreadable or not UTF-8.
+pub fn read_bounded_utf8(reader: impl std::io::Read, max: usize) -> Option<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    reader.take(max as u64 + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() > max {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
 /// Parse one file and extract its definitions + identifier bag.
 fn extract_file(root: &Path, path: &Path, lang: Lang, source: &str) -> Option<FileSymbols> {
     let mut parser = Parser::new();
@@ -624,6 +706,51 @@ mod tests {
             ranked[0].path, "graph_rank.rs",
             "graph_rank.rs defines TripleGraph, must rank first"
         );
+    }
+
+    /// RM-103 S1 (Daybreak #4): a hard link (nlink > 1) — which could point
+    /// at a file outside the scanned tree — is never read; a single-link file
+    /// next to it is.
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_files_are_not_indexed() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        write(outside.path(), "secret.rs", "pub fn hardlinked_secret_symbol() {}\n");
+        fs::hard_link(outside.path().join("secret.rs"), dir.path().join("linked.rs")).unwrap();
+        write(dir.path(), "own.rs", "pub fn own_symbol() {}\n");
+        let map = CodeMap::build(&CodeMapConfig::new(dir.path())).unwrap();
+        assert!(map.rank("hardlinked_secret_symbol", &[], 5).is_empty());
+        assert_eq!(map.rank("own_symbol", &[], 5)[0].path, "own.rs");
+        assert!(read_source_nofollow(&dir.path().join("linked.rs"), 1024).is_none());
+        assert!(read_source_nofollow(&dir.path().join("own.rs"), 1024).is_some());
+        // A link in the last component is refused by the open itself.
+        std::os::unix::fs::symlink(dir.path().join("own.rs"), dir.path().join("alias.rs")).unwrap();
+        assert!(read_source_nofollow(&dir.path().join("alias.rs"), 1024).is_none());
+    }
+
+    /// Every indexed byte comes from the injected reader, keyed by the
+    /// root-relative path; the walk itself reads nothing.
+    #[test]
+    fn build_with_reader_is_the_only_content_source() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a.rs", "pub fn on_disk_symbol() {}\n");
+        write(dir.path(), "sub/b.rs", "pub fn skipped_symbol() {}\n");
+        let mut seen = Vec::new();
+        let map = CodeMap::build_with_reader(&CodeMapConfig::new(dir.path()), |_, rel| {
+            seen.push(rel.to_string_lossy().replace('\\', "/"));
+            (rel == Path::new("a.rs")).then(|| "pub fn reader_symbol() {}\n".to_string())
+        })
+        .unwrap();
+        seen.sort();
+        assert_eq!(seen, vec!["a.rs".to_string(), "sub/b.rs".to_string()]);
+        assert!(map.rank("on_disk_symbol", &[], 5).is_empty());
+        assert!(map.rank("skipped_symbol", &[], 5).is_empty());
+        assert_eq!(map.rank("reader_symbol", &[], 5)[0].path, "a.rs");
+        // Over the size cap: skipped even when the reader returns it.
+        let cfg = CodeMapConfig { max_file_bytes: 4, ..CodeMapConfig::new(dir.path()) };
+        let map = CodeMap::build_with_reader(&cfg, |_, _| Some("pub fn too_long() {}\n".into())).unwrap();
+        assert_eq!(map.file_count(), 0);
     }
 
     #[test]

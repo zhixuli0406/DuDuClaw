@@ -338,6 +338,245 @@ fn role_member_scaffold_admits_the_team_intrinsic_tool() {
     assert!(err.contains("privilege escalation"), "got: {err}");
 }
 
+/// RM-103 S3: a packet's `tool_scope.denied` (carried as `extra_denied`)
+/// lands in the member's `denied_tools` after the employee's own denies,
+/// de-duplicated case-insensitively, and survives the admission-queue codec.
+#[test]
+fn role_member_scaffold_appends_packet_denies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    write_parent(home, "boss", "[capabilities]\ndenied_tools = [\"WebFetch\"]\n");
+    let mut spec = role_spec("boss", Role::Executor, "claude", "claude-opus-5");
+    spec.extra_denied = strs(&["mail_send", "webfetch", " mail_send "]);
+    let result = scaffold_role_member(home, &spec).unwrap();
+    let cfg: duduclaw_core::types::AgentConfig =
+        toml::from_str(&std::fs::read_to_string(result.dir.join("agent.toml")).unwrap())
+            .unwrap();
+    assert_eq!(cfg.capabilities.denied_tools, strs(&["WebFetch", "mail_send"]));
+
+    let back = role_member_from_payload(&role_member_payload(&spec)).unwrap();
+    assert_eq!(back.extra_denied, spec.extra_denied);
+    // A ticket queued before RM-103 has no key: read as "no extra denies".
+    let mut legacy = role_member_payload(&spec);
+    legacy.as_object_mut().unwrap().remove("extra_denied");
+    assert!(role_member_from_payload(&legacy).unwrap().extra_denied.is_empty());
+    // Present but malformed: the ticket is dropped, never guessed.
+    let mut bad = role_member_payload(&spec);
+    bad["extra_denied"] = serde_json::json!("mail_send");
+    assert!(role_member_from_payload(&bad).is_none());
+}
+
+/// RM-103 S3: a member faces every approval its employee faces — the
+/// approval lists, `action_rules` and the PolicyKernel `policy` are copied
+/// into the member's own `[capabilities]` (which is what the MCP gates read
+/// for an `.ephemeral/` caller).
+#[test]
+fn role_member_scaffold_inherits_parent_approvals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    write_parent(
+        home,
+        "boss",
+        "[capabilities]\n\
+         approval_required_tools = [\"mail_send\"]\n\
+         irreversible_tools = [\"db_query\"]\n\
+         maybe_irreversible_tools = [\"odoo_write\"]\n\
+         action_rules = [{ effect = \"send\", verdict = \"ask\" }]\n\
+         [[capabilities.policy]]\n\
+         tool = \"*\"\n\
+         effect = \"allow\"\n",
+    );
+    let spec = role_spec("boss", Role::Executor, "claude", "claude-opus-5");
+    let result = scaffold_role_member(home, &spec).unwrap();
+    let parent: toml::Value =
+        std::fs::read_to_string(home.join("agents/boss/agent.toml")).unwrap().parse().unwrap();
+    let child = member_toml(&result.dir);
+    for key in [
+        "approval_required_tools",
+        "irreversible_tools",
+        "maybe_irreversible_tools",
+        "action_rules",
+        "policy",
+    ] {
+        assert_eq!(
+            parent["capabilities"][key], child["capabilities"][key],
+            "member must inherit [capabilities] {key}"
+        );
+    }
+    let cfg: duduclaw_core::types::AgentConfig =
+        toml::from_str(&std::fs::read_to_string(result.dir.join("agent.toml")).unwrap())
+            .unwrap();
+    assert_eq!(cfg.capabilities.approval_required_tools, strs(&["mail_send"]));
+    assert_eq!(cfg.capabilities.policy.len(), 1);
+    assert!(!cfg.capabilities.action_rules.is_absent());
+
+    // A parent with none of these writes none of them (on-disk shape unchanged).
+    let tmp2 = tempfile::tempdir().unwrap();
+    write_parent(tmp2.path(), "boss", "");
+    let plain = scaffold_role_member(tmp2.path(), &spec).unwrap();
+    let child = member_toml(&plain.dir);
+    for key in [
+        "approval_required_tools",
+        "action_rules",
+        "policy",
+        "egress_guard",
+        "scoped_tools",
+        "grant_ttl_secs",
+    ] {
+        assert!(child["capabilities"].get(key).is_none(), "{key}");
+    }
+}
+
+/// RM-103 S3 (v1.81, Daybreak #2): the inherited lists are not only copied —
+/// a coarse runtime chooses its native sandbox from the scaffolded member
+/// config. An executor on codex whose employee has `modify = ask` is forced
+/// read-only (it used to get `workspace-write` because it holds `Write`); a
+/// packet narrowing of the shell refuses the role on codex; an unconstrained
+/// employee's executor is unchanged.
+#[test]
+fn coarse_runtime_sandbox_follows_the_scaffolded_member_config() {
+    use crate::runtime::coarse_native_caps;
+    use duduclaw_core::types::SandboxLevel;
+    let member_caps = |home: &std::path::Path, spec: &RoleMemberSpec| {
+        let result = scaffold_role_member(home, spec).unwrap();
+        let cfg: duduclaw_core::types::AgentConfig =
+            toml::from_str(&std::fs::read_to_string(result.dir.join("agent.toml")).unwrap()).unwrap();
+        (result.agent_id, cfg.capabilities)
+    };
+    let mut executor = role_spec("boss", Role::Executor, "codex", "gpt-5.4");
+    executor.tools = strs(&["team_handoff", "Read", "Write", "Edit", "Bash"]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_parent(
+        tmp.path(),
+        "boss",
+        "[capabilities]\naction_rules = [{ effect = \"modify\", verdict = \"ask\" }]\n",
+    );
+    let (id, caps) = member_caps(tmp.path(), &executor);
+    assert_eq!(caps.sandbox_level(), SandboxLevel::WorkspaceWrite, "the allowlist alone says writable");
+    let view = coarse_native_caps(Some(&caps), "codex", &id, true).unwrap().expect("narrowed");
+    assert_eq!(view.sandbox_level(), SandboxLevel::ReadOnly);
+
+    // A packet narrowing the shell (bare deny, or a qualified allow).
+    let plain = tempfile::tempdir().unwrap();
+    write_parent(plain.path(), "boss", "");
+    let mut denied = executor.clone();
+    denied.extra_denied = strs(&["Bash"]);
+    let mut git_only = executor.clone();
+    git_only.tools = strs(&["team_handoff", "Read", "Write", "Bash(git:*)"]);
+    for spec in [denied, git_only] {
+        let (id, caps) = member_caps(plain.path(), &spec);
+        let error = coarse_native_caps(Some(&caps), "codex", &id, true).unwrap_err();
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{error}");
+    }
+
+    // Unconstrained employee: the executor keeps workspace-write.
+    let (id, caps) = member_caps(plain.path(), &executor);
+    assert!(coarse_native_caps(Some(&caps), "codex", &id, true).unwrap().is_none());
+    assert_eq!(caps.sandbox_level(), SandboxLevel::WorkspaceWrite);
+}
+
+/// RM-103 S3 (v1.81): `egress_guard` (effective mode = max(global, employee))
+/// and `scoped_tools` (adds grant refusals) are copied because they can only
+/// narrow; `grant_ttl_secs` is not (a longer parent TTL would widen). A
+/// `scoped_tools` entry covering the intrinsic — bare, qualified or by
+/// wildcard — is dropped for a role member only.
+#[test]
+fn role_member_scaffold_copies_only_narrowing_grant_and_egress_settings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    write_parent(
+        home,
+        "boss",
+        "[capabilities]\n\
+         egress_guard = \"block\"\n\
+         grant_ttl_secs = 999999\n\
+         scoped_tools = [\"mail_send\", \"team_handoff\", \"mcp__duduclaw__team_handoff\", \
+         \"mcp__duduclaw__*\", \"team_*\", \"Bash\"]\n",
+    );
+    let spec = role_spec("boss", Role::Executor, "claude", "claude-opus-5");
+    let member = scaffold_role_member(home, &spec).unwrap();
+    let child = member_toml(&member.dir);
+    assert_eq!(child["capabilities"]["egress_guard"].as_str(), Some("block"));
+    assert!(child["capabilities"].get("grant_ttl_secs").is_none());
+    let scoped: Vec<&str> = child["capabilities"]["scoped_tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(scoped, vec!["mail_send", "Bash"]);
+    assert_eq!(
+        duduclaw_core::egress_guard::effective_mode(home, Some(&member.dir)),
+        duduclaw_core::egress_guard::Mode::Block
+    );
+
+    // An ordinary ephemeral has no intrinsics, so it keeps every entry.
+    let plain = scaffold(
+        home,
+        &EphemeralSpawnSpec {
+            parent: "boss".into(),
+            instruction: "Summarize.".into(),
+            tools: strs(&["Read"]),
+            tier: "cheap".into(),
+        },
+    )
+    .unwrap();
+    let child = member_toml(&plain.dir);
+    assert_eq!(child["capabilities"]["scoped_tools"].as_array().unwrap().len(), 6);
+    assert!(child["capabilities"].get("grant_ttl_secs").is_none());
+
+    // A malformed parent egress value keeps blocking in the member.
+    let tmp2 = tempfile::tempdir().unwrap();
+    write_parent(tmp2.path(), "boss", "[capabilities]\negress_guard = 7\n");
+    let bad = scaffold_role_member(tmp2.path(), &spec).unwrap();
+    assert_eq!(
+        duduclaw_core::egress_guard::effective_mode(tmp2.path(), Some(&bad.dir)),
+        duduclaw_core::egress_guard::Mode::Block
+    );
+}
+
+/// RM-103 S3 (v1.81): the dispatch-gate exemption predicate — only a role
+/// member's intrinsic, only with a complete `[team_member]` record whose
+/// parent matches `ephemeral.toml`.
+#[test]
+fn role_member_intrinsic_call_predicate_is_narrow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    write_parent(home, "boss", "");
+    let member = scaffold_role_member(
+        home,
+        &role_spec("boss", Role::Executor, "claude", "claude-opus-5"),
+    )
+    .unwrap();
+    let id = &member.agent_id;
+    assert!(is_role_member_intrinsic_call(home, id, "team_handoff"));
+    assert!(is_role_member_intrinsic_call(home, id, "mcp__duduclaw__team_handoff"));
+    assert!(is_role_member_intrinsic_call(home, id, " Team_Handoff "));
+    for other in ["memory_search", "send_to_agent", "team_handoffx", "mcp__other__team_handoff"] {
+        assert!(!is_role_member_intrinsic_call(home, id, other), "{other}");
+    }
+    assert!(!is_role_member_intrinsic_call(home, "boss", "team_handoff"));
+
+    let plain = scaffold(
+        home,
+        &EphemeralSpawnSpec {
+            parent: "boss".into(),
+            instruction: "Summarize.".into(),
+            tools: strs(&["Read"]),
+            tier: "cheap".into(),
+        },
+    )
+    .unwrap();
+    assert!(!is_role_member_intrinsic_call(home, &plain.agent_id, "team_handoff"));
+
+    // A `[team_member]` parent that disagrees with `ephemeral.toml`: no exemption.
+    let path = member.dir.join("agent.toml");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, raw.replace("parent = \"boss\"", "parent = \"ceo\"")).unwrap();
+    assert!(!is_role_member_intrinsic_call(home, id, "team_handoff"));
+}
+
 #[tokio::test]
 async fn autonomy_pause_ephemeral_admission_keeps_ticket_then_resume_replays() {
     let tmp = tempfile::tempdir().unwrap();

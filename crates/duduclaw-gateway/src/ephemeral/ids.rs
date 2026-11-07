@@ -117,6 +117,10 @@ pub struct RoleMemberSpec {
     /// [`check_tool_subset`] containment as any ephemeral: a role can never
     /// hold a tool its employee does not.
     pub tools: Vec<String>,
+    /// RM-103 S3: extra denies from the delegating packet's
+    /// `tool_scope.denied`, appended to the member's `[capabilities]
+    /// denied_tools` after the employee's own. Can only remove tools.
+    pub extra_denied: Vec<String>,
 }
 
 /// The `[team_member]` section read back off a scaffold.

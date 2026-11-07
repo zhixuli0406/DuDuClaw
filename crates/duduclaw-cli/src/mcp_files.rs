@@ -188,6 +188,185 @@ pub fn vet_path(raw: &str, home_dir: &Path, agent_id: &str) -> Result<PathBuf, S
     Ok(real)
 }
 
+/// The directory variant of [`vet_path`]: resolve `raw` to a real directory
+/// contained in one of `roots`.
+///
+/// Same fence as `vet_path` — `..` refused before canonicalization, then the
+/// realpath (symlinks resolved) must sit under a canonicalized root, so a
+/// symlink inside a root that points outside it is refused. Differences:
+///
+/// * An empty `raw` means "the first root" (the caller's default), not an
+///   error — directory tools have a sensible default where file tools do not.
+/// * A relative `raw` is resolved against the first root, never against the
+///   process cwd (which is whatever the MCP server happened to inherit).
+/// * An empty `roots` refuses everything — fail-closed for an unidentified
+///   caller.
+pub fn vet_dir(raw: &str, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    let raw = raw.trim();
+    let Some(default_root) = roots.first() else {
+        return Err("無法確認呼叫者的員工身分，沒有任何允許掃描的目錄。".to_string());
+    };
+    let candidate = if raw.is_empty() {
+        default_root.clone()
+    } else {
+        let p = Path::new(raw);
+        if p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "路徑「{raw}」含有 `..`，不接受相對上層路徑，請改用完整路徑。"
+            ));
+        }
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            default_root.join(p)
+        }
+    };
+    let shown = if raw.is_empty() {
+        candidate.display().to_string()
+    } else {
+        raw.to_string()
+    };
+    let real = candidate
+        .canonicalize()
+        .map_err(|e| format!("目錄「{shown}」無法讀取：{e}"))?;
+    let contained = roots.iter().any(|root| {
+        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        real.starts_with(&root)
+    });
+    if !contained {
+        return Err(format!(
+            "目錄「{shown}」不在允許的範圍內。允許的根目錄：{}。",
+            render_roots(roots)
+        ));
+    }
+    let meta = std::fs::metadata(&real).map_err(|e| format!("目錄「{shown}」無法讀取：{e}"))?;
+    if !meta.is_dir() {
+        return Err(format!("路徑「{shown}」不是目錄。"));
+    }
+    Ok(real)
+}
+
+/// RM-103 S1 (v1.81, Daybreak #4): a [`vet_dir`] result opened **once** as a
+/// directory descriptor, reached from the allowed root that contains it, with
+/// every later read made relative to that descriptor.
+///
+/// `vet_dir` proves containment of a *path* at one instant; a symlink swapped
+/// into the tree afterwards, a hard link to a file elsewhere, a bind mount or
+/// a Windows reparse point would otherwise be read through. Here:
+///
+/// * the allowed root and every component below it are opened one at a time
+///   relative to the previous descriptor, never following a link —
+///   [`duduclaw_agent::skill_loader::safe_dir::SafeDir`] (unix: `fstatat`
+///   with `AT_SYMLINK_NOFOLLOW` + `openat(O_NOFOLLOW | O_DIRECTORY)`, which is
+///   the per-component equivalent of `openat2(RESOLVE_BENEATH |
+///   RESOLVE_NO_SYMLINKS)`; Windows: `NtCreateFile` relative to the parent
+///   handle with `OBJ_DONT_REPARSE`, reparse points refused);
+/// * no component may cross onto another device (unix `st_dev`, the
+///   `RESOLVE_NO_XDEV` part — a bind mount or a mounted volume inside the
+///   tree);
+/// * a file is opened `O_NOFOLLOW` relative to its parent descriptor and must
+///   be a regular file with **exactly one link** (`nlink > 1` refused: a hard
+///   link may name a file outside the employee's directory), then read from
+///   that descriptor, bounded.
+///
+/// A platform without either primitive refuses (fail closed).
+pub(crate) struct ContainedTree {
+    dir: duduclaw_agent::skill_loader::safe_dir::SafeDir,
+    #[cfg(unix)]
+    dev: u64,
+}
+
+fn tree_refused(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, message.to_string())
+}
+
+fn normal_components(rel: &Path) -> std::io::Result<Vec<&str>> {
+    rel.components()
+        .map(|c| match c {
+            std::path::Component::Normal(part) => part.to_str().ok_or_else(|| tree_refused("non-UTF8 path component")),
+            _ => Err(tree_refused("non-normal path component")),
+        })
+        .collect()
+}
+
+impl ContainedTree {
+    /// Open `real` (a [`vet_dir`] result) by descending from the canonical
+    /// allowed root in `roots` that contains it.
+    pub(crate) fn open(roots: &[PathBuf], real: &Path) -> std::io::Result<Self> {
+        use duduclaw_agent::skill_loader::safe_dir::SafeDir;
+        let (root, rel) = roots
+            .iter()
+            .find_map(|root| {
+                let root = root.canonicalize().ok()?;
+                let rel = real.strip_prefix(&root).ok()?.to_path_buf();
+                Some((root, rel))
+            })
+            .ok_or_else(|| tree_refused("directory is outside the allowed roots"))?;
+        let mut dir = SafeDir::open(&root)?;
+        #[cfg(unix)]
+        let dev = {
+            use std::os::unix::fs::MetadataExt;
+            dir.metadata()?.dev()
+        };
+        let tree_dev = |_d: &SafeDir| -> std::io::Result<()> {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if _d.metadata()?.dev() != dev {
+                    return Err(tree_refused("directory crosses onto another device"));
+                }
+            }
+            Ok(())
+        };
+        for part in normal_components(&rel)? {
+            dir = dir.child(part)?;
+            tree_dev(&dir)?;
+        }
+        Ok(Self {
+            dir,
+            #[cfg(unix)]
+            dev,
+        })
+    }
+
+    #[cfg(unix)]
+    fn same_device(&self, meta: &std::fs::Metadata) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        if meta.dev() != self.dev {
+            return Err(tree_refused("entry crosses onto another device"));
+        }
+        Ok(())
+    }
+
+    /// Read `rel` (relative to the opened directory) as UTF-8, at most
+    /// `max_bytes`. Every directory component and the file are opened
+    /// descriptor-relative without following links.
+    pub(crate) fn read_to_string(&self, rel: &Path, max_bytes: usize) -> std::io::Result<String> {
+        let parts = normal_components(rel)?;
+        let (file_name, dirs) = parts.split_last().ok_or_else(|| tree_refused("empty path"))?;
+        let mut owned: Option<duduclaw_agent::skill_loader::safe_dir::SafeDir> = None;
+        for part in dirs {
+            let next = owned.as_ref().unwrap_or(&self.dir).child(part)?;
+            #[cfg(unix)]
+            self.same_device(&next.metadata()?)?;
+            owned = Some(next);
+        }
+        // `read_file`: O_NOFOLLOW (unix) / no reparse (Windows), regular file,
+        // exactly one link.
+        let file = owned.as_ref().unwrap_or(&self.dir).read_file(file_name)?;
+        let meta = file.metadata()?;
+        #[cfg(unix)]
+        self.same_device(&meta)?;
+        if meta.len() > max_bytes as u64 {
+            return Err(tree_refused("file exceeds the size cap"));
+        }
+        duduclaw_memory::code_map::read_bounded_utf8(file, max_bytes)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "unreadable, oversized or non-UTF8 file"))
+    }
+}
+
 /// `table` for a result: the file's basename **with** its extension, because
 /// that is the name a `db_field` rule writes (`customers.csv.name`).
 fn table_name(path: &Path) -> String {
@@ -687,7 +866,7 @@ fn cell_to_header_string(cell: &calamine::Data) -> String {
 /// to be able to see afterwards. The REQUESTED path is recorded (there is no
 /// canonical one when the fence rejected it) and nothing else — a refusal
 /// never read any content to leak.
-fn audit_refusal(home_dir: &Path, agent_id: &str, tool: &str, requested: &str) {
+pub(crate) fn audit_refusal(home_dir: &Path, agent_id: &str, tool: &str, requested: &str) {
     duduclaw_security::audit::append_tool_call_with_extras(
         home_dir,
         agent_id,

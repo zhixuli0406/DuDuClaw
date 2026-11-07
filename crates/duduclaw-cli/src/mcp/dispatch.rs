@@ -279,7 +279,16 @@ pub(crate) async fn handle_tools_call(
         "memory_search_by_layer" => {
             handle_memory_search_by_layer(&arguments, memory, default_agent).await
         }
-        "code_map" => crate::mcp_memory_handlers::handle_code_map(&arguments).await,
+        // RM-103 S1: the scan root is fenced to the CALLER's own agent dir —
+        // same caller mapping as the file_read family below.
+        "code_map" => {
+            crate::mcp_memory_handlers::handle_code_map(
+                &arguments,
+                home_dir,
+                acting_agent_id(caller_client_id, default_agent),
+            )
+            .await
+        }
         "memory_successful_conversations" => {
             handle_memory_successful_conversations(&arguments, memory, default_agent).await
         }

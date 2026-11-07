@@ -531,7 +531,7 @@ runtime 沒有回報用量時，用量欄位會整個省略。寫 `0` 等於宣�
 - **目前模型的價格仍需操作者填寫。** 矩陣在派工前載入 `<DUDUCLAW_HOME>/models.toml`，任何模型沒有價格時就拒絕 `--budget-usd`。它的估算仍無法精確封頂 provider 帳單；大型工具執行的花費可能超過執行前的預留。
 - 閘自己的校準（依結果對其決策做 Brier 評分）已設計但未接上。
 - Fan-out 是把*不同的子任務*分給同一個執行者模型上的成員。每個副本的模型多樣性在設計中，但無法用出貨的 `[team.roles.executor]` 形狀表達。
-- **封包的 `tool_scope` 與 `irreversible` 被攜帶，但沒有任何東西讀取。** 兩者都被驗證並儲存，都沒有到達任何 spawn，而 `render_packet_for_prompt` 甚至不渲染它們，所以規劃者寫 `tool_scope.denied = ["mail_send"]` 完全沒有效果。角色成員真正的工具包絡來自員工的 `[capabilities]`，透過 `check_tool_subset`，而 ActionGuard 無論旗標為何，都在呼叫點守衛不可逆的呼叫。型別文件與 [`spec/task-packet.md`](../../spec/task-packet.md) 以前宣稱的是另一回事（「這裡的拒絕是真正的拒絕」）；現在改寫為「not wired」。接上它們是未來的工作。
+- **封包的 `irreversible` 被攜帶但沒有任何東西讀取；`tool_scope` 只能縮小（v1.81）。** `irreversible` 會驗證並儲存，但不會到達任何 spawn；ActionGuard 無論旗標為何，都在呼叫點守衛不可逆的呼叫。從 v1.81 起，規劃封包的 `tool_scope` 會縮小接手的執行角色：非空的 `allowed` 只保留這些工具（加上 `team_handoff`），列出員工本身沒有的工具時該次派工被拒絕，並寫入 `team_tool_scope_escalation` 稽核紀錄；`denied` 會被移除並加入成員的 `denied_tools`。成員的工具範圍仍由 `check_tool_subset` 對照員工的 `[capabilities]`，成員也繼承員工的核准清單、`action_rules` 與 `policy`。詳見 [`spec/task-packet.md`](../../spec/task-packet.md)。
 - 閘不會評估 L0「計畫中含不可逆動作」的排除；ActionGuard 仍在呼叫點守衛不可逆的呼叫，團隊不改變這一點。
 - ~~**永不裁剪的豁免是以四個字面 markdown 標題為鍵，而不是以 composer 為鍵。**~~ 已關閉：豁免以每行程的 sentinel 標記行綁定到 composer，兩個上限則保留作縱深防禦。見「兩個值得知道的接縫」。
 - **`role_turns.jsonl` 把審核者的一列算進 `plan_round` 沒有規劃到的 spawn 預算。** 審核者是輔助呼叫，但它的帳本列帶 `member_id = "team-verifier"`，而 `spawns_used_for_task` 計入每一列有成員 id 的列，所以每一輪都比計畫預估的多花一個 spawn。

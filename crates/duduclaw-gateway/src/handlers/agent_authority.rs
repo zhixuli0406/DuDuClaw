@@ -135,10 +135,17 @@ fn effective(table: &toml::Table, key: &str) -> Value {
         | "channels.public_trigger"
         | "prompt.cli_bare_mode"
         | "budget.hard_stop" => or(Value::Bool(false)),
+        // RM-103 S2 (v1.81): an absent key follows the role (`main` only),
+        // exactly as the MCP gate resolves it — so writing `true` over an
+        // absent key on a non-main employee is a real widening (admin-only).
+        // Same-table role: a role change is itself admin-only (`RoleMain`).
+        "permissions.can_create_agents" => {
+            let role = toml_at_json(table, "agent.role");
+            Value::Bool(duduclaw_core::agent_toml::effective_can_create_agents(raw.as_bool(), role.as_str()))
+        }
         // Absent ⇒ allowed (the gate refuses only an explicit `false`);
         // `block_secrets` defaults on.
-        "permissions.can_create_agents"
-        | "permissions.can_send_cross_agent"
+        "permissions.can_send_cross_agent"
         | "permissions.can_schedule_tasks"
         | "permissions.can_modify_own_skills"
         | "guardrails.block_secrets" => or(Value::Bool(true)),
@@ -335,13 +342,42 @@ mod tests {
         }
     }
 
+    /// RM-103 S2 (Daybreak #1): an absent `can_create_agents` reads as the
+    /// MCP gate reads it — on for `main`, off for every other role.
+    #[test]
+    fn can_create_agents_absent_key_follows_the_role() {
+        let keys = |b: &toml::Table, a: &toml::Table| authority_diff(b, a).into_iter().map(|c| c.key).collect::<Vec<_>>();
+        for role in ["'specialist'", "'worker'", "' '"] {
+            let before = t(&format!("[agent]\nrole={role}\n"));
+            let grant = t(&format!("[agent]\nrole={role}\n[permissions]\ncan_create_agents=true\n"));
+            let deny = t(&format!("[agent]\nrole={role}\n[permissions]\ncan_create_agents=false\n"));
+            assert_eq!(keys(&before, &grant), vec!["permissions.can_create_agents"], "non-main missing→true needs an admin ({role})");
+            assert!(keys(&before, &deny).is_empty(), "non-main missing→false is no change ({role})");
+            assert_eq!(keys(&grant, &before), vec!["permissions.can_create_agents"], "dropping an explicit true is a change ({role})");
+        }
+        // No role at all counts as non-main (fail closed).
+        assert_eq!(keys(&t(""), &t("[permissions]\ncan_create_agents=true\n")), vec!["permissions.can_create_agents"]);
+        // A wrong-typed value reads as absent, as the gate reads it.
+        assert_eq!(
+            keys(&t("[agent]\nrole='specialist'\n[permissions]\ncan_create_agents='yes'\n"), &t("[agent]\nrole='specialist'\n[permissions]\ncan_create_agents=true\n")),
+            vec!["permissions.can_create_agents"]
+        );
+        // `main`: missing→true is a no-op, missing→false is a change.
+        let main = t("[agent]\nrole='main'\n");
+        assert!(keys(&main, &t("[agent]\nrole='main'\n[permissions]\ncan_create_agents=true\n")).is_empty(), "main missing→true is a no-op");
+        assert_eq!(keys(&main, &t("[agent]\nrole='main'\n[permissions]\ncan_create_agents=false\n")), vec!["permissions.can_create_agents"]);
+    }
+
     #[test]
     fn role_main_both_ways() {
         let s = t("[agent]\nrole='specialist'\n");
         let m = t("[agent]\nrole='main'\n");
         let w = t("[agent]\nrole='worker'\n");
-        assert_eq!(authority_diff(&s, &m).len(), 1);
-        assert_eq!(authority_diff(&m, &s).len(), 1);
+        // Becoming / leaving `main` also moves the role-default
+        // `can_create_agents` (RM-103 S2) — both are admin-only.
+        let keys = |b: &toml::Table, a: &toml::Table| authority_diff(b, a).into_iter().map(|c| c.key).collect::<Vec<_>>();
+        assert_eq!(keys(&s, &m), vec!["agent.role", "permissions.can_create_agents"]);
+        assert_eq!(keys(&m, &s), vec!["agent.role", "permissions.can_create_agents"]);
         assert!(authority_diff(&s, &w).is_empty());
     }
 

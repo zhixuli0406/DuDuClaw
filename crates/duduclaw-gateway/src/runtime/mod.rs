@@ -831,6 +831,66 @@ pub fn format_history_as_prompt(history: &[ConversationTurn], current_message: &
 
 // ── Native OS sandbox wiring ────────────────────────────────────
 
+/// RM-103 S3 (v1.81, Daybreak #2): the capabilities a coarse-grained runtime
+/// (Codex, Grok, a generic print-mode CLI — any runtime whose native file and
+/// shell tools bypass the MCP dispatch gate) must choose its sandbox from.
+///
+/// Called before the runtime prepares anything for the spawn, with the
+/// effective config of whoever runs (for a team role member that is the
+/// scaffolded `.ephemeral/<id>/agent.toml`, with the inherited approval lists,
+/// `action_rules`, `policy` and the packet's narrowing):
+///
+/// - no [`duduclaw_core::types::NativeToolConstraints`] ⇒ `Ok(None)`: use the
+///   config as it is (unchanged behaviour);
+/// - a constraint on the native **shell** ⇒ `Err` (spawn-gate class, so the
+///   loop stops instead of retrying another account): none of these runtimes
+///   has a mode without a native shell, so the role cannot run there;
+/// - a constraint on native **writes** only ⇒ `Ok(Some(view))`, a copy whose
+///   sandbox level is read-only — when `read_only_enforceable` (the runtime's
+///   read-only mode really blocks writes to the working root); otherwise
+///   `Err` as above.
+///
+/// Never just a warning: the warn line accompanies the refusal or the
+/// narrowing.
+pub(crate) fn coarse_native_caps(
+    caps: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    runtime_name: &str,
+    agent_id: &str,
+    read_only_enforceable: bool,
+) -> Result<Option<duduclaw_core::types::CapabilitiesConfig>, String> {
+    let Some(caps) = caps else { return Ok(None) };
+    let constraints = caps.native_tool_constraints();
+    if constraints.is_empty() {
+        return Ok(None);
+    }
+    let reasons = constraints.reasons();
+    if constraints.needs_no_shell() || !read_only_enforceable {
+        warn!(
+            runtime = runtime_name,
+            agent = %agent_id,
+            reasons = %reasons,
+            "native tool constraints this runtime cannot enforce — refusing to spawn"
+        );
+        let what = if constraints.needs_no_shell() {
+            "原生指令執行"
+        } else {
+            "原生檔案寫入"
+        };
+        return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+            "「{agent_id}」的設定限制了{what}（{reasons}），但 {runtime_name} 的原生工具不經過 DuDuClaw 的工具閘門，\
+             無法執行這些限制，所以這次不在 {runtime_name} 上執行。請改用 claude runtime，或請管理員調整這些限制。\
+             ({runtime_name} cannot enforce these native-tool restrictions; refusing to run.)"
+        )));
+    }
+    warn!(
+        runtime = runtime_name,
+        agent = %agent_id,
+        reasons = %reasons,
+        "native write constraints ⇒ forcing the read-only sandbox for this spawn"
+    );
+    Ok(Some(caps.read_only_native_view()))
+}
+
 /// Apply the opt-in native OS sandbox (`duduclaw-sandbox`) to a to-be-spawned
 /// agent CLI command, in place, just before spawn.
 ///

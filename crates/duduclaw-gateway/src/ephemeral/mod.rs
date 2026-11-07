@@ -158,7 +158,8 @@ pub use ids::{
 };
 pub use role_member::{
     RoleMemberAdmitted, admit_role_member, finish_role_member, has_role_member_marker,
-    is_role_member, read_role_member, role_member_from_payload, scaffold_role_member,
+    is_role_member, is_role_member_intrinsic_call, read_role_member, role_member_from_payload,
+    scaffold_role_member,
 };
 pub use scaffold::{EphemeralSpawnSpec, ScaffoldResult, parent_capabilities, scaffold};
 

@@ -252,6 +252,32 @@ async fn owner_cannot_change_authority_keys_through_agents_update() {
     assert!(fields.contains(&"form.can_create_agents") && fields.contains(&"osWatch."), "{fields:?}");
 }
 
+/// RM-103 S2 (Daybreak #1): a pre-1.68 non-main employee without the
+/// `can_create_agents` key is refused at the MCP gate, so an Owner writing an
+/// explicit `true` over the absent key widens it — that needs an admin.
+#[tokio::test]
+async fn owner_cannot_grant_can_create_agents_over_an_absent_key() {
+    let f = fixture().await;
+    let path = f.home.join("agents/a1/agent.toml");
+    let mut table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    table["agent"].as_table_mut().unwrap().insert("role".into(), toml::Value::String("specialist".into()));
+    if let Some(p) = table.get_mut("permissions").and_then(|p| p.as_table_mut()) {
+        p.remove("can_create_agents");
+    }
+    std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let frame = f.call("agents.update", json!({ "agent_id": "a1", "can_create_agents": true }), &f.owner_a).await;
+    let e = err(&frame);
+    assert!(e.contains("permissions.can_create_agents"), "{e}");
+    assert_eq!(std::fs::read(&path).unwrap(), before, "file unchanged");
+    // Writing the effective value (false) is not a change.
+    ok(&f.call("agents.update", json!({ "agent_id": "a1", "can_create_agents": false }), &f.owner_a).await);
+    // The admin may grant it.
+    ok(&f.call("agents.update", json!({ "agent_id": "a1", "can_create_agents": true }), &f.admin).await);
+    let after: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert_eq!(after["permissions"]["can_create_agents"].as_bool(), Some(true));
+}
+
 #[tokio::test]
 async fn runtime_timeout_owner_may_only_lower_admin_may_raise() {
     let f = fixture().await;

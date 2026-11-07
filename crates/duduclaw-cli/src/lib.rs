@@ -15325,6 +15325,8 @@ fn scaffold_agent_toml(s: &AgentScaffold) -> String {
     };
 
     let preferred = model_preferred.as_deref().unwrap_or("claude-sonnet-4-6");
+    // RM-103 S2: only `main` may create employees by default.
+    let can_create_agents = duduclaw_core::agent_toml::default_can_create_agents(role_str);
 
     // agent.toml
     format!(
@@ -15361,7 +15363,7 @@ warn_threshold_percent = 80
 hard_stop = true
 
 [permissions]
-can_create_agents = true
+can_create_agents = {can_create_agents}
 can_send_cross_agent = true
 can_modify_own_skills = true
 can_modify_own_soul = false
@@ -15376,6 +15378,32 @@ skill_auto_activate = false
 skill_security_scan = true
 "#
     )
+}
+
+#[cfg(test)]
+mod scaffold_create_agents_default_tests {
+    use super::*;
+
+    /// RM-103 S2: the CLI / importer scaffold turns `can_create_agents` on
+    /// for `main` only, and writes an explicit `false` otherwise.
+    #[test]
+    fn scaffold_sets_create_agents_for_main_only() {
+        for (role, expected) in [("specialist", false), ("worker", false), ("team-leader", false), ("main", true)] {
+            let s = AgentScaffold {
+                name: "probe".into(),
+                display_name: "Probe".into(),
+                role: role.into(),
+                reports_to: String::new(),
+                icon: "🤖".into(),
+                trigger: "@Probe".into(),
+                provider: duduclaw_core::types::RuntimeType::Claude,
+                model_preferred: None,
+                soul_body: None,
+            };
+            let t: toml::Table = scaffold_agent_toml(&s).parse().unwrap();
+            assert_eq!(t["permissions"]["can_create_agents"].as_bool(), Some(expected), "{role}");
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

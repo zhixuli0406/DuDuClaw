@@ -2464,6 +2464,186 @@ impl CapabilitiesConfig {
         }
         SandboxLevel::WorkspaceWrite
     }
+
+    /// RM-103 S3 (v1.81, Daybreak #2): the restrictions on the native
+    /// write / shell tools that only a per-tool gate can enforce.
+    ///
+    /// A coarse-grained runtime (Codex, Grok, a generic print-mode CLI) runs
+    /// its own native file-edit and shell tools; they never pass through the
+    /// MCP dispatch gate, the ApprovalBroker or the PolicyKernel, and
+    /// [`Self::sandbox_level`] only looks at *which* tools exist. So an
+    /// inherited `action_rules` `modify = ask`, an approval list naming
+    /// `Write`, a parameter-level `policy`, or a packet narrowing such as
+    /// `Bash(git:*)` used to collapse into `workspace-write` with an
+    /// unrestricted native shell. The spawn sites read this and either force
+    /// [`SandboxLevel::ReadOnly`] ([`NativeToolConstraints::no_write`] only)
+    /// or refuse to run ([`NativeToolConstraints::no_exec`]: none of those
+    /// runtimes has a mode without a native shell).
+    ///
+    /// Write family: `Write` / `Edit` / `MultiEdit` / `NotebookEdit` (and the
+    /// canonical `fs_write`); shell family: `Bash` / `BashOutput` /
+    /// `KillShell` (and `shell_exec`). What counts:
+    /// - an `action_rules` verdict of `ask` or `block` for a tool of either
+    ///   family (a malformed list counts: it raises every side-effecting call
+    ///   to `ask`);
+    /// - an `approval_required_tools` / `irreversible_tools` /
+    ///   `maybe_irreversible_tools` entry covering one (wildcards included);
+    /// - a `policy` (a non-empty policy is a strict allowlist the native
+    ///   tools never reach) — unless it is allow-only with an unconditional
+    ///   `tool = "*"` allow, which permits everything;
+    /// - a qualified `allowed_tools` / `denied_tools` entry (`Bash(git:*)`,
+    ///   `Write(src/**)`) — the argument part cannot be enforced natively;
+    ///   an allowlist that also holds the bare name is not narrowed by it;
+    /// - a bare `denied_tools` entry covering one of them while the level
+    ///   would still be writable (the documented coarse mapping already
+    ///   turns "no write tool at all" into read-only, whose read-only shell
+    ///   is the accepted cost of that mapping).
+    ///
+    /// Not counted (unchanged coarse mapping): a tool merely absent from a
+    /// non-empty `allowed_tools`.
+    pub fn native_tool_constraints(&self) -> NativeToolConstraints {
+        use crate::tool_effect::{ActionVerdict, effect_of_cli_builtin};
+        const WRITE: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+        const SHELL: &[&str] = &["Bash", "BashOutput", "KillShell"];
+        fn base(entry: &str) -> &str {
+            entry.split('(').next().unwrap_or(entry).trim()
+        }
+        fn qualified(entry: &str) -> bool {
+            entry.contains('(')
+        }
+        fn covers(entry: &str, family: &[&str]) -> bool {
+            let b = base(entry);
+            family.iter().any(|tool| {
+                b.eq_ignore_ascii_case(tool) || crate::tool_catalog::tool_entry_matches(b, tool)
+            })
+        }
+        fn push(list: &mut Vec<String>, reason: String) {
+            if !list.contains(&reason) {
+                list.push(reason);
+            }
+        }
+        let mut out = NativeToolConstraints::default();
+
+        for tool in WRITE {
+            if self.action_rules.resolve(tool, effect_of_cli_builtin(tool)).is_some_and(|v| v >= ActionVerdict::Ask) {
+                push(&mut out.no_write, format!("action_rules: `{tool}` needs approval or is blocked"));
+            }
+        }
+        for tool in SHELL {
+            if self.action_rules.resolve(tool, effect_of_cli_builtin(tool)).is_some_and(|v| v >= ActionVerdict::Ask) {
+                push(&mut out.no_exec, format!("action_rules: `{tool}` needs approval or is blocked"));
+            }
+        }
+
+        for (key, list) in [
+            ("approval_required_tools", &self.approval_required_tools),
+            ("irreversible_tools", &self.irreversible_tools),
+            ("maybe_irreversible_tools", &self.maybe_irreversible_tools),
+        ] {
+            for entry in list {
+                if covers(entry, WRITE) || base(entry).eq_ignore_ascii_case("fs_write") {
+                    push(&mut out.no_write, format!("{key}: `{}`", entry.trim()));
+                }
+                if covers(entry, SHELL) || base(entry).eq_ignore_ascii_case("shell_exec") {
+                    push(&mut out.no_exec, format!("{key}: `{}`", entry.trim()));
+                }
+            }
+        }
+
+        // Only allow rules including an unconditional `tool = "*"` allow
+        // permit everything, so restrict nothing; any other policy does.
+        let allow_all = self.policy.iter().all(|r| r.effect == PolicyEffect::Allow)
+            && self
+                .policy
+                .iter()
+                .any(|r| r.tool.trim() == "*" && r.when.is_empty());
+        if !self.policy.is_empty() && !allow_all {
+            push(&mut out.no_exec, format!("policy: {} parameter-level rule(s)", self.policy.len()));
+        }
+
+        for entry in self.allowed_tools.iter().filter(|e| qualified(e)) {
+            let b = base(entry);
+            let bare_too = self
+                .allowed_tools
+                .iter()
+                .any(|a| !qualified(a) && a.trim().eq_ignore_ascii_case(b));
+            if bare_too {
+                continue;
+            }
+            if covers(entry, SHELL) {
+                push(&mut out.no_exec, format!("allowed_tools narrows `{}`", entry.trim()));
+            } else if covers(entry, WRITE) {
+                push(&mut out.no_write, format!("allowed_tools narrows `{}`", entry.trim()));
+            }
+        }
+        let writable = self.sandbox_level() != SandboxLevel::ReadOnly;
+        for entry in &self.denied_tools {
+            if !qualified(entry) && !writable {
+                continue;
+            }
+            if covers(entry, SHELL) {
+                push(&mut out.no_exec, format!("denied_tools: `{}`", entry.trim()));
+            } else if covers(entry, WRITE) {
+                push(&mut out.no_write, format!("denied_tools: `{}`", entry.trim()));
+            }
+        }
+        out
+    }
+
+    /// A copy of this config whose [`Self::sandbox_level`] is
+    /// [`SandboxLevel::ReadOnly`]: every write-class native tool bare-denied,
+    /// no `computer_use` / `browser_via_bash` widening. Only for choosing a
+    /// coarse runtime's sandbox; never written back or used for MCP gates.
+    pub fn read_only_native_view(&self) -> Self {
+        let mut view = self.clone();
+        view.computer_use = false;
+        view.browser_via_bash = false;
+        for tool in ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"] {
+            if !view.denied_tools.iter().any(|d| d.trim().eq_ignore_ascii_case(tool)) {
+                view.denied_tools.push(tool.to_string());
+            }
+        }
+        debug_assert_eq!(view.sandbox_level(), SandboxLevel::ReadOnly);
+        view
+    }
+}
+
+/// What [`CapabilitiesConfig::native_tool_constraints`] found. Each list
+/// holds human-readable reasons (config keys and entries, never values).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeToolConstraints {
+    /// Native writes must not run unchecked: the sandbox must be read-only.
+    pub no_write: Vec<String>,
+    /// Native command execution must not run unchecked: the runtime needs a
+    /// mode without a native shell (implies [`Self::no_write`]).
+    pub no_exec: Vec<String>,
+}
+
+impl NativeToolConstraints {
+    /// Nothing the coarse sandbox mapping cannot already express.
+    pub fn is_empty(&self) -> bool {
+        self.no_write.is_empty() && self.no_exec.is_empty()
+    }
+
+    /// The native sandbox must be read-only.
+    pub fn needs_read_only(&self) -> bool {
+        !self.is_empty()
+    }
+
+    /// The runtime must have no native shell at all.
+    pub fn needs_no_shell(&self) -> bool {
+        !self.no_exec.is_empty()
+    }
+
+    /// Every reason, shell ones first, joined for a log line or an error.
+    pub fn reasons(&self) -> String {
+        self.no_exec
+            .iter()
+            .chain(self.no_write.iter())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 /// Coarse sandbox level for CLI runtimes that cannot enforce per-tool
@@ -3030,6 +3210,77 @@ mod sandbox_level_tests {
             caps(false, true, &["Read"], &[]).sandbox_level(),
             SandboxLevel::WorkspaceWrite
         );
+    }
+
+    /// RM-103 S3 (Daybreak #2): what a coarse runtime cannot enforce on its
+    /// native write / shell tools.
+    #[test]
+    fn native_tool_constraints_classify_write_and_shell_restrictions() {
+        let rules = |json: serde_json::Value| {
+            let mut c = caps(false, false, &[], &[]);
+            c.action_rules = crate::tool_effect::ActionRules::from_value(json);
+            c
+        };
+        // Unconstrained / plain coarse mappings: nothing.
+        for c in [
+            caps(false, false, &[], &[]),
+            caps(false, false, &["Read", "Grep"], &[]),
+            caps(true, false, &[], &[]),
+            caps(false, false, &["Read", "Bash", "Bash(git:*)"], &[]),
+            caps(false, false, &[], &["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"]),
+            caps(false, false, &[], &["mail_send"]),
+            rules(serde_json::json!([{ "effect": "send", "verdict": "ask" }])),
+            rules(serde_json::json!([{ "tool": "mail_send", "verdict": "block" }])),
+            CapabilitiesConfig {
+                policy: vec![ToolPolicy { tool: "*".into(), effect: PolicyEffect::Allow, when: vec![] }],
+                ..Default::default()
+            },
+        ] {
+            assert!(c.native_tool_constraints().is_empty(), "{c:?}: {:?}", c.native_tool_constraints());
+        }
+        // Writes only ⇒ read-only.
+        for c in [
+            rules(serde_json::json!([{ "effect": "modify", "verdict": "ask" }])),
+            rules(serde_json::json!([{ "tool": "Write", "verdict": "block" }])),
+            CapabilitiesConfig { approval_required_tools: vec!["Edit".into()], ..Default::default() },
+            CapabilitiesConfig { maybe_irreversible_tools: vec!["fs_write".into()], ..Default::default() },
+            caps(false, false, &["Read", "Write(src/**)"], &[]),
+            caps(false, false, &[], &["Write"]),
+        ] {
+            let n = c.native_tool_constraints();
+            assert!(n.needs_read_only() && !n.needs_no_shell(), "{c:?}: {n:?}");
+        }
+        // The shell ⇒ no native shell at all.
+        for c in [
+            rules(serde_json::json!([{ "effect": "admin", "verdict": "ask" }])),
+            rules(serde_json::json!([{ "tool": "Bash", "verdict": "block" }])),
+            rules(serde_json::json!("not a list")), // malformed ⇒ ask
+            CapabilitiesConfig { approval_required_tools: vec!["*".into()], ..Default::default() },
+            CapabilitiesConfig { irreversible_tools: vec!["shell_exec".into()], ..Default::default() },
+            CapabilitiesConfig {
+                policy: vec![ToolPolicy { tool: "mail_send".into(), effect: PolicyEffect::Allow, when: vec![] }],
+                ..Default::default()
+            },
+            caps(false, false, &["Read", "Write", "Bash(git:*)"], &[]),
+            caps(false, false, &[], &["Bash(rm:*)"]),
+            caps(false, false, &["Read", "Write", "Bash"], &["Bash"]),
+        ] {
+            let n = c.native_tool_constraints();
+            assert!(n.needs_no_shell() && n.needs_read_only(), "{c:?}: {n:?}");
+            assert!(!n.reasons().is_empty());
+        }
+    }
+
+    #[test]
+    fn read_only_native_view_is_read_only_and_keeps_the_rest() {
+        let mut c = caps(true, true, &["Read", "Write"], &["mail_send"]);
+        c.native_sandbox = true;
+        let view = c.read_only_native_view();
+        assert_eq!(view.sandbox_level(), SandboxLevel::ReadOnly);
+        assert!(view.native_sandbox);
+        assert_eq!(view.allowed_tools, c.allowed_tools);
+        assert!(view.denied_tools.iter().any(|d| d == "mail_send"));
+        assert_eq!(c.sandbox_level(), SandboxLevel::FullAccess, "the original is untouched");
     }
 
     #[test]

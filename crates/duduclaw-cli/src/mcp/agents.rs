@@ -113,6 +113,21 @@ pub(crate) async fn handle_create_agent(
         .get("role")
         .and_then(|v| v.as_str())
         .unwrap_or("specialist");
+    // RM-103 S2 (v1.81): `role = "main"` is the one role whose *default* is
+    // creation rights, and the gate resolves an absent key through it — so
+    // naming a child `main` must not be self-service. Only the main agent
+    // itself, with creation rights, may create another `main` (checked
+    // before any lookup or write). Case/whitespace variants count as `main`.
+    if role.trim().eq_ignore_ascii_case("main") && !caller_may_create_main_agent(home_dir, caller_agent) {
+        return serde_json::json!({
+            "content": [{"type": "text", "text":
+                "Error: 只有主代理(role = \"main\")本身、且具備建立 AI 員工權限時,\
+                 才能建立 role = \"main\" 的 AI 員工。請改用其他角色(例如 specialist),\
+                 或請管理員從儀表板建立。"
+            }],
+            "isError": true
+        });
+    }
     let reports_to = params
         .get("reports_to")
         .and_then(|v| v.as_str())
@@ -177,6 +192,12 @@ pub(crate) async fn handle_create_agent(
     // Use the toml crate to prevent injection via display_name/trigger/icon.
     // Clone values that will be consumed by the toml! macro
     let reports_to_display = reports_to.clone();
+    // RM-103 S2 (v1.81): an employee-created child never gets creation
+    // rights, whatever its role (explicit `false`, so neither the role default
+    // nor a later role edit can turn it on). Only an admin enables it, per
+    // employee, from the dashboard — whose scaffold keeps
+    // `default_can_create_agents(role)`.
+    let may_create_agents = false;
     let agent_config = toml::toml! {
         [agent]
         name = name
@@ -210,7 +231,7 @@ pub(crate) async fn handle_create_agent(
         hard_stop = true
 
         [permissions]
-        can_create_agents = true
+        can_create_agents = may_create_agents
         can_send_cross_agent = true
         can_modify_own_skills = true
         can_modify_own_soul = false
@@ -607,6 +628,37 @@ pub(crate) async fn handle_agent_status(params: &Value, home_dir: &Path, caller:
     })
 }
 
+/// RM-103 S2 (v1.81): may `caller` create a `role = "main"` agent through MCP?
+/// Only when the caller is itself a `main` agent (its own `agent.toml`, under
+/// `<home>/agents/<caller>`) **and** holds creation rights by the same rule
+/// the dispatch gate enforces (explicit value wins; absent ⇒ role default).
+/// System senders, ephemeral / invalid ids and a missing or unreadable file
+/// all fail closed.
+pub(crate) fn caller_may_create_main_agent(home_dir: &Path, caller: &str) -> bool {
+    if duduclaw_core::is_system_sender(caller)
+        || duduclaw_gateway::ephemeral::is_ephemeral_id(caller)
+        || !is_valid_agent_id(caller)
+    {
+        return false;
+    }
+    let dir = home_dir.join("agents").join(caller);
+    // `load` is total (a missing file reads as empty); require a parseable
+    // file explicitly so an unreadable one cannot look like "nothing written".
+    let Ok(text) = std::fs::read_to_string(dir.join("agent.toml")) else {
+        return false;
+    };
+    if text.parse::<toml::Table>().is_err() {
+        return false;
+    }
+    let sections = duduclaw_core::agent_toml::load(&dir);
+    let role = sections.agent.and_then(|a| a.role);
+    role.as_deref().is_some_and(duduclaw_core::agent_toml::default_can_create_agents)
+        && duduclaw_core::agent_toml::effective_can_create_agents(
+            sections.permissions.can_create_agents,
+            role.as_deref(),
+        )
+}
+
 /// Read an agent's lifecycle status from its `agent.toml` (`[agent].status`).
 /// Robust to unrelated config fields — parses only the one field. Returns
 /// `None` when the file is missing / unparseable / the field is absent, so
@@ -722,5 +774,106 @@ mod product_policy_creation_tests {
             fs::read_to_string(agent_dir.join("SOUL.md")).unwrap(),
             "Keep this valid employee's instructions."
         );
+    }
+
+    fn read_child(home: &tempfile::TempDir) -> toml::Table {
+        fs::read_to_string(home.path().join("agents/policy-candidate/agent.toml"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn write_caller(home: &tempfile::TempDir, id: &str, body: &str) {
+        let dir = home.path().join("agents").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("agent.toml"), format!("[agent]\nname = \"{id}\"\n{body}")).unwrap();
+    }
+
+    /// RM-103 S2 (v1.81): an MCP-created child is scaffolded with an explicit
+    /// `can_create_agents = false` whatever its role.
+    #[tokio::test]
+    async fn mcp_create_scaffolds_create_agents_off_for_every_role() {
+        for role in [None, Some("worker"), Some("specialist")] {
+            let home = fixture();
+            let mut p = params("anthropic/claude-sonnet-4-6");
+            if let Some(r) = role {
+                p["role"] = serde_json::json!(r);
+            }
+            let out = with_background_caller(
+                RecordActor::Operator("dashboard"),
+                handle_create_agent(&p, home.path(), "dashboard"),
+            )
+            .await;
+            assert_ne!(out["isError"], true, "{role:?}: {out}");
+            let config = read_child(&home);
+            assert_eq!(
+                config["permissions"]["can_create_agents"].as_bool(),
+                Some(false),
+                "{role:?}"
+            );
+        }
+    }
+
+    /// RM-103 S2 (v1.81): an employee (or a system sender) may not create a
+    /// `role = "main"` agent; nothing is written.
+    #[tokio::test]
+    async fn mcp_create_main_role_refused_for_non_main_or_unprivileged_callers() {
+        let callers: [(&str, Option<&str>); 6] = [
+            ("dashboard", None),
+            ("helper", Some("role = \"specialist\"\n")),
+            // An admin `true` on a non-main caller still is not "the main agent".
+            ("helper", Some("role = \"specialist\"\n[permissions]\ncan_create_agents = true\n")),
+            ("boss", Some("role = \"main\"\n[permissions]\ncan_create_agents = false\n")),
+            ("helper", Some("")),
+            ("ghost", None),
+        ];
+        for (caller, body) in callers {
+            for role in ["main", " Main ", "MAIN"] {
+                let home = fixture();
+                if let Some(body) = body {
+                    write_caller(&home, caller, body);
+                }
+                let mut p = params("anthropic/claude-sonnet-4-6");
+                p["role"] = serde_json::json!(role);
+                p["reports_to"] = serde_json::json!(caller);
+                let out = with_background_caller(
+                    RecordActor::Operator("dashboard"),
+                    handle_create_agent(&p, home.path(), caller),
+                )
+                .await;
+                assert_eq!(out["isError"], true, "{caller} {body:?} {role:?}: {out}");
+                assert!(
+                    out["content"][0]["text"].as_str().unwrap_or("").contains("role = \"main\""),
+                    "{out}"
+                );
+                assert!(!home.path().join("agents/policy-candidate").exists());
+            }
+        }
+    }
+
+    /// RM-103 S2 (v1.81): the main agent with creation rights (explicit or by
+    /// role default) may create another `main` — still without creation rights.
+    #[tokio::test]
+    async fn mcp_create_main_role_by_privileged_main_caller_is_scaffolded_off() {
+        for body in [
+            "role = \"main\"\n",
+            "role = \"main\"\n[permissions]\ncan_create_agents = true\n",
+        ] {
+            let home = fixture();
+            write_caller(&home, "boss", body);
+            assert!(caller_may_create_main_agent(home.path(), "boss"), "{body}");
+            let mut p = params("anthropic/claude-sonnet-4-6");
+            p["role"] = serde_json::json!("main");
+            p["reports_to"] = serde_json::json!("boss");
+            let out = with_background_caller(
+                RecordActor::Operator("dashboard"),
+                handle_create_agent(&p, home.path(), "boss"),
+            )
+            .await;
+            assert_ne!(out["isError"], true, "{body}: {out}");
+            let config = read_child(&home);
+            assert_eq!(config["agent"]["role"].as_str(), Some("main"));
+            assert_eq!(config["permissions"]["can_create_agents"].as_bool(), Some(false));
+        }
     }
 }

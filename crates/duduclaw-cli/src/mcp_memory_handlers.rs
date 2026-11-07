@@ -16,7 +16,7 @@ use duduclaw_core::traits::MemoryEngine;
 use duduclaw_core::types::MemoryEntry;
 use duduclaw_memory::{CodeMap, CodeMapConfig, SqliteMemoryEngine};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::mcp_memory_quota::DailyQuota;
 use crate::mcp_namespace::NamespaceContext;
@@ -1075,7 +1075,10 @@ pub async fn handle_memory_improve(
 ///
 /// # Parameters (from `params`)
 /// - `query`       : `string` — required; natural-language / identifier query.
-/// - `root`        : `string` — optional; repo root to scan (default: cwd).
+/// - `root`        : `string` — optional; directory to scan. Must resolve
+///   (realpath, symlinks followed) inside the acting agent's own directory
+///   ([`code_map_roots`]); relative paths resolve against that directory and
+///   the default IS that directory — never the MCP server's cwd.
 /// - `max_files`   : `integer` — optional (default 15, cap 100).
 /// - `chat_files`  : `array<string>` — optional; repo-relative paths already in
 ///   context; their defined symbols seed the walk (Aider personalization).
@@ -1088,7 +1091,7 @@ pub async fn handle_memory_improve(
 ///
 /// Note: the map is rebuilt per call (no cache yet); the scan is gitignore-aware
 /// and bounded by per-file size. Runs the CPU-bound parse on a blocking thread.
-pub async fn handle_code_map(params: &Value) -> Value {
+pub async fn handle_code_map(params: &Value, home_dir: &Path, agent_id: &str) -> Value {
     let query = params
         .get("query")
         .and_then(|v| v.as_str())
@@ -1101,11 +1104,42 @@ pub async fn handle_code_map(params: &Value) -> Value {
         return mcp_error("code_map requires a non-empty 'query' or 'chat_files'");
     }
 
-    let root = params
-        .get("root")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    // RM-103 S1: the scan root is fenced to the acting agent's own directory.
+    // An unconstrained root let any employee holding MemoryRead enumerate
+    // the symbols of any directory the gateway user can read (other agents'
+    // dirs, $HOME, the DuDuClaw home itself).
+    let raw_root = params.get("root").and_then(|v| v.as_str()).unwrap_or("");
+    let roots = code_map_roots(home_dir, agent_id);
+    // No employee identity ⇒ no folder to fence to ⇒ refuse (fail closed),
+    // but say why instead of a bare path refusal.
+    if roots.is_empty() {
+        crate::mcp_files::audit_refusal(home_dir, agent_id, "code_map", raw_root);
+        return mcp_error(
+            "code_map 拒絕掃描：此呼叫沒有可辨識的 AI 員工身分。code_map 只能由已識別的 AI 員工\
+             使用，且只能掃描該員工自己的資料夾（agents/<員工 ID>/）。請由 AI 員工本身呼叫，\
+             或改用儀表板／終端機檢視其他目錄。",
+        );
+    }
+    let root = match crate::mcp_files::vet_dir(raw_root, &roots) {
+        Ok(r) => r,
+        Err(msg) => {
+            crate::mcp_files::audit_refusal(home_dir, agent_id, "code_map", raw_root);
+            return mcp_error(&format!("code_map 拒絕掃描：{msg}"));
+        }
+    };
+
+    // RM-103 S1 (v1.81, Daybreak #4): `vet_dir` checked a path; the scan
+    // reads through a directory descriptor opened here, from the allowed
+    // root down, never following a link or crossing a device, and refuses
+    // hard-linked files — so a later swap inside the tree cannot redirect a
+    // read outside it.
+    let tree = match crate::mcp_files::ContainedTree::open(&roots, &root) {
+        Ok(tree) => tree,
+        Err(e) => {
+            crate::mcp_files::audit_refusal(home_dir, agent_id, "code_map", raw_root);
+            return mcp_error(&format!("code_map 拒絕掃描：目錄無法安全開啟（{e}）"));
+        }
+    };
 
     let max_files = crate::mcp_args::arg_u64(params, "max_files")
         .unwrap_or(15)
@@ -1113,7 +1147,11 @@ pub async fn handle_code_map(params: &Value) -> Value {
 
     let cfg = CodeMapConfig::new(root);
     // CPU-bound directory walk + parse: keep it off the async reactor.
-    let built = tokio::task::spawn_blocking(move || CodeMap::build(&cfg)).await;
+    let built = tokio::task::spawn_blocking(move || {
+        let max = cfg.max_file_bytes;
+        CodeMap::build_with_reader(&cfg, |_path, rel| tree.read_to_string(rel, max).ok())
+    })
+    .await;
 
     let map = match built {
         Ok(Ok(m)) => m,
@@ -1136,6 +1174,24 @@ pub async fn handle_code_map(params: &Value) -> Value {
         "indexed_symbols": map.symbol_count(),
     });
     serde_json::json!({ "content": [{ "type": "text", "text": payload.to_string() }] })
+}
+
+/// The directories `code_map` may scan for `agent_id`: the agent's own
+/// directory only (`.ephemeral/<id>` for a team role member, via
+/// [`crate::mcp::caller_agent_dir`]). The first entry is the default root.
+///
+/// Deliberately narrower than `mcp_files::allowed_roots`: no shared
+/// `<home>/attachments` and no operator `[files] allowed_roots` — those
+/// widen a data-file reader, not a source-tree walker. An invalid or reserved
+/// id yields no roots, so the caller is refused (fail-closed).
+pub(crate) fn code_map_roots(home_dir: &Path, agent_id: &str) -> Vec<PathBuf> {
+    if !duduclaw_core::is_valid_agent_id(agent_id)
+        || duduclaw_core::is_reserved_agent_id(agent_id)
+        || agent_id == duduclaw_core::UNTRUSTED_AGENT_ID
+    {
+        return Vec::new();
+    }
+    vec![crate::mcp::caller_agent_dir(home_dir, agent_id)]
 }
 
 // ── user_profile: cross-session per-user preference traits ─────────────────────
@@ -1438,16 +1494,46 @@ mod tests {
     }
 
     // ── code_map handler: live end-to-end over real crate source ──────────────
+
+    /// A temp home with `agents/<id>/repo` holding a copy of the sibling
+    /// memory crate's real Rust sources (stable, symbol-rich input).
+    fn code_map_home(agent: &str) -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let agent_dir = home.path().join("agents").join(agent);
+        let repo = agent_dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let src = PathBuf::from(format!("{}/../duduclaw-memory/src", env!("CARGO_MANIFEST_DIR")));
+        for entry in std::fs::read_dir(&src).unwrap().flatten() {
+            let p = entry.path();
+            if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                std::fs::copy(&p, repo.join(p.file_name().unwrap())).unwrap();
+            }
+        }
+        (home, agent_dir)
+    }
+
+    fn code_map_audit_rows(home: &Path) -> Vec<Value> {
+        std::fs::read_to_string(home.join("tool_calls.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect()
+    }
+
     #[tokio::test]
     async fn code_map_handler_ranks_real_source() {
-        // Point at this crate's sibling memory crate src (stable real Rust).
-        let root = format!("{}/../duduclaw-memory/src", env!("CARGO_MANIFEST_DIR"));
-        let resp = handle_code_map(&params(serde_json::json!({
-            "query": "TripleGraph personalized_pagerank",
-            "root": root,
-            "max_files": 5
-        })))
+        let (home, agent_dir) = code_map_home("dev");
+        let resp = handle_code_map(
+            &params(serde_json::json!({
+                "query": "TripleGraph personalized_pagerank",
+                "root": agent_dir.join("repo").to_str().unwrap(),
+                "max_files": 5
+            })),
+            home.path(),
+            "dev",
+        )
         .await;
+        assert!(!is_error(&resp), "{resp}");
         let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
         assert!(payload["indexed_symbols"].as_u64().unwrap() >= 50);
         let files = payload["files"].as_array().unwrap();
@@ -1458,8 +1544,227 @@ mod tests {
 
     #[tokio::test]
     async fn code_map_handler_requires_query_or_chat_files() {
-        let resp = handle_code_map(&params(serde_json::json!({}))).await;
+        let home = tempfile::tempdir().unwrap();
+        let resp = handle_code_map(&params(serde_json::json!({})), home.path(), "dev").await;
         assert!(text_of(&resp).contains("requires") || is_error(&resp));
+    }
+
+    #[tokio::test]
+    async fn code_map_default_root_is_the_agent_dir_not_cwd() {
+        let (home, _agent_dir) = code_map_home("dev");
+        // No `root`: the agent dir is scanned, so the copied sources show up
+        // under `repo/`. A cwd default would have scanned the cli crate.
+        let resp = handle_code_map(
+            &params(serde_json::json!({ "query": "personalized_pagerank" })),
+            home.path(),
+            "dev",
+        )
+        .await;
+        assert!(!is_error(&resp), "{resp}");
+        let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
+        let files = payload["files"].as_array().unwrap();
+        assert!(!files.is_empty());
+        assert!(
+            files.iter().all(|f| f["path"].as_str().unwrap().starts_with("repo")),
+            "{files:?}"
+        );
+        // Relative roots resolve against the agent dir as well.
+        let resp = handle_code_map(
+            &params(serde_json::json!({ "query": "personalized_pagerank", "root": "repo" })),
+            home.path(),
+            "dev",
+        )
+        .await;
+        assert!(!is_error(&resp), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn code_map_refuses_a_root_outside_the_agent_dir_and_audits_it() {
+        let (home, _agent_dir) = code_map_home("dev");
+        // Another agent's directory and an unrelated directory are both out.
+        let other = home.path().join("agents").join("finance");
+        std::fs::create_dir_all(&other).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        for root in [other.to_str().unwrap(), outside.path().to_str().unwrap(), "/"] {
+            let resp = handle_code_map(
+                &params(serde_json::json!({ "query": "x", "root": root })),
+                home.path(),
+                "dev",
+            )
+            .await;
+            assert!(is_error(&resp), "root {root} must be refused: {resp}");
+            assert!(text_of(&resp).contains("不在允許的範圍內"), "{resp}");
+        }
+        let rows = code_map_audit_rows(home.path());
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows.iter().all(|r| r["tool_name"] == "code_map"
+            && r["success"] == false
+            && r["refused"] == true
+            && r["agent_id"] == "dev"));
+    }
+
+    #[tokio::test]
+    async fn code_map_refuses_parent_dir_traversal() {
+        let (home, agent_dir) = code_map_home("dev");
+        for root in ["../finance", "repo/../../finance"] {
+            let resp = handle_code_map(
+                &params(serde_json::json!({ "query": "x", "root": root })),
+                home.path(),
+                "dev",
+            )
+            .await;
+            assert!(is_error(&resp) && text_of(&resp).contains(".."), "{resp}");
+        }
+        // Even an absolute path whose `..` would land back inside is refused.
+        let sneaky = format!("{}/repo/..", agent_dir.display());
+        let resp = handle_code_map(
+            &params(serde_json::json!({ "query": "x", "root": sneaky })),
+            home.path(),
+            "dev",
+        )
+        .await;
+        assert!(is_error(&resp), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn code_map_refuses_an_unidentified_caller() {
+        let (home, agent_dir) = code_map_home("dev");
+        for agent in ["", "gateway-internal/x", "../dev"] {
+            let resp = handle_code_map(
+                &params(serde_json::json!({
+                    "query": "x",
+                    "root": agent_dir.to_str().unwrap()
+                })),
+                home.path(),
+                agent,
+            )
+            .await;
+            assert!(is_error(&resp), "agent {agent:?} must be refused: {resp}");
+            // v1.81: the refusal explains the identity requirement.
+            let text = resp["content"][0]["text"].as_str().unwrap_or("");
+            assert!(
+                text.contains("AI 員工身分") && text.contains("自己的資料夾"),
+                "agent {agent:?}: {text}"
+            );
+        }
+        // Reserved / untrusted ids get the same explanation.
+        for agent in ["dashboard", duduclaw_core::UNTRUSTED_AGENT_ID] {
+            let resp = handle_code_map(
+                &params(serde_json::json!({ "query": "x" })),
+                home.path(),
+                agent,
+            )
+            .await;
+            assert!(is_error(&resp), "{agent}: {resp}");
+            assert!(
+                resp["content"][0]["text"].as_str().unwrap_or("").contains("AI 員工身分"),
+                "{agent}: {resp}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn code_map_refuses_symlink_escapes() {
+        let (home, agent_dir) = code_map_home("dev");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("secret.rs"),
+            "pub fn outside_secret_symbol() {}\n",
+        )
+        .unwrap();
+        // 1. A linked DIRECTORY as the root resolves outside → refused.
+        let link_dir = agent_dir.join("escape");
+        std::os::unix::fs::symlink(outside.path(), &link_dir).unwrap();
+        let resp = handle_code_map(
+            &params(serde_json::json!({ "query": "x", "root": "escape" })),
+            home.path(),
+            "dev",
+        )
+        .await;
+        assert!(is_error(&resp), "{resp}");
+        // 2. A linked FILE inside an allowed root is never read.
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.rs"),
+            agent_dir.join("repo").join("linked.rs"),
+        )
+        .unwrap();
+        let resp = handle_code_map(
+            &params(serde_json::json!({ "query": "outside_secret_symbol" })),
+            home.path(),
+            "dev",
+        )
+        .await;
+        assert!(!is_error(&resp), "{resp}");
+        let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
+        assert!(
+            !payload["map"].as_str().unwrap_or("").contains("outside_secret_symbol")
+                && !text_of(&resp).contains("linked.rs"),
+            "a symlinked file must not be indexed: {resp}"
+        );
+    }
+
+    /// RM-103 S1 (Daybreak #4): a hard link inside the employee's directory
+    /// to a file outside it (nlink > 1) is never indexed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn code_map_refuses_hard_linked_files() {
+        let (home, agent_dir) = code_map_home("dev");
+        let outside = tempfile::tempdir_in(home.path()).unwrap();
+        std::fs::write(outside.path().join("secret.rs"), "pub fn hardlink_secret_symbol() {}\n").unwrap();
+        std::fs::hard_link(outside.path().join("secret.rs"), agent_dir.join("repo").join("hl.rs")).unwrap();
+        let resp = handle_code_map(
+            &params(serde_json::json!({ "query": "hardlink_secret_symbol personalized_pagerank" })),
+            home.path(),
+            "dev",
+        )
+        .await;
+        assert!(!is_error(&resp), "{resp}");
+        assert!(!text_of(&resp).contains("hardlink_secret_symbol") && !text_of(&resp).contains("hl.rs"), "{resp}");
+        assert!(text_of(&resp).contains("graph_rank.rs"), "single-link files are still indexed: {resp}");
+    }
+
+    /// RM-103 S1 (Daybreak #4): symlink swaps after the containment check.
+    /// The tree is opened once; swapping the scanned directory (or a
+    /// directory inside it) for a link to an outside directory never makes a
+    /// read return outside content.
+    #[cfg(unix)]
+    #[test]
+    fn contained_tree_reads_survive_a_symlink_swap() {
+        use crate::mcp_files::ContainedTree;
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agents").join("dev");
+        std::fs::create_dir_all(agent.join("repo/sub")).unwrap();
+        std::fs::write(agent.join("repo/a.rs"), "inside").unwrap();
+        std::fs::write(agent.join("repo/sub/b.rs"), "inside-sub").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("sub")).unwrap();
+        std::fs::write(outside.path().join("a.rs"), "outside").unwrap();
+        std::fs::write(outside.path().join("sub/b.rs"), "outside-sub").unwrap();
+        let roots = vec![agent.clone()];
+        let real = crate::mcp_files::vet_dir("repo", &roots).unwrap();
+        let tree = ContainedTree::open(&roots, &real).unwrap();
+
+        // 1. A directory inside the tree is swapped for a link: refused.
+        std::fs::rename(agent.join("repo/sub"), agent.join("repo/sub-old")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("sub"), agent.join("repo/sub")).unwrap();
+        assert!(tree.read_to_string(Path::new("sub/b.rs"), 1024).is_err());
+        // 2. The scanned directory itself is swapped: reads stay on the
+        //    directory that was vetted and opened.
+        std::fs::rename(agent.join("repo"), agent.join("repo-old")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), agent.join("repo")).unwrap();
+        assert_eq!(tree.read_to_string(Path::new("a.rs"), 1024).unwrap(), "inside");
+        // 3. A linked file, `..` and a hard link are refused.
+        std::os::unix::fs::symlink(outside.path().join("a.rs"), agent.join("repo-old/link.rs")).unwrap();
+        assert!(tree.read_to_string(Path::new("link.rs"), 1024).is_err());
+        assert!(tree.read_to_string(Path::new("../repo-old/a.rs"), 1024).is_err());
+        std::fs::hard_link(agent.join("repo-old/a.rs"), agent.join("repo-old/hl.rs")).unwrap();
+        assert!(tree.read_to_string(Path::new("hl.rs"), 1024).is_err());
+        assert!(tree.read_to_string(Path::new("a.rs"), 1024).is_err(), "a.rs now has two links");
+        // 4. A path whose vetted root was itself swapped before opening is
+        //    refused (the allowed root is reached link-free).
+        let moved = crate::mcp_files::vet_dir("repo", &roots);
+        assert!(moved.is_err() || ContainedTree::open(&roots, &moved.unwrap()).is_err());
     }
 
     // ── M1-T1: Namespace injected as "external/{client_id}" ───────────────────

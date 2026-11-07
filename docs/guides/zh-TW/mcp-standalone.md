@@ -59,13 +59,12 @@ npx duduclaw mcp init --client cursor
 
 ## 拿到哪些工具
 
-金鑰帶四個 scope：`memory:read`、`memory:write`、`wiki:read`、`wiki:write`。`tools/list` 剛好列出這四個 scope 叫得動的 24 個工具：
+金鑰帶四個 scope：`memory:read`、`memory:write`、`wiki:read`、`wiki:write`。`tools/list` 剛好列出這四個 scope 叫得動的 23 個工具：
 
 | 類別 | 工具 |
 |---|---|
 | 記憶 | `memory_store`、`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_get_history`、`memory_get_at`、`memory_alias_add`、`memory_alias_list`、`memory_improve` |
 | 使用者側寫 | `user_profile_record`、`user_profile_get`、`user_code_profile` |
-| 程式碼地圖 | `code_map`（`root` 指定的目錄，沒指定時是 server 的工作目錄） |
 | Wiki | `wiki_write`、`wiki_read`、`wiki_ls`、`wiki_search`、`wiki_stats`、`wiki_lint`、`wiki_graph`、`wiki_export`、`wiki_dedup`、`wiki_rebuild_fts`、`wiki_share` |
 
 資料放在哪：
@@ -87,6 +86,7 @@ npx duduclaw mcp init --client cursor
 | `working_state_get`／`_set`／`_clear`／`_handoff` | 拒絕（`-32003`）。它們替執行 server 的 AI 員工動作（沒有員工時回 `unknown agent: dudu`） |
 | `memory_search_by_layer`、`memory_successful_conversations`、`memory_episodic_pressure`、`memory_consolidation_status` | 拒絕（`-32003`）。它們讀的是預設員工的記憶，不是用戶端的 |
 | `shared_wiki_delete`、`wiki_namespace_status`、`canvas_push`、`canvas_clear` | 拒絕（`-32003`）。它們以預設員工身分判斷或動作 |
+| `code_map` | v1.81 起拒絕（`-32003`）且不列出。它掃描呼叫者員工自己的目錄；外部金鑰永遠不是員工，即使 client id 和某位員工相同 |
 | `messaging:send`（`send_message`、`send_photo`、`send_sticker`、`synthesize_speech`、`transcribe_audio`） | 需要在 `config.toml` 設好通道（`Unknown channel`）或外部語音服務 |
 | `mail:read`／`mail:send` | 不能授予外部金鑰；`mail_*` 和上面幾列一樣會被拒絕。收發信的工作在 gateway 裡 |
 | `team:handoff` | 不能授予外部金鑰；需要 gateway goal loop 派出的任務 |

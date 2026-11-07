@@ -382,8 +382,19 @@ const ENFORCED_PERMISSION_KEYS: &[&str] =
 /// text and the keys reset, or `None` when the file needs nothing (marker
 /// present / no `[permissions]` table). Formatting is preserved. `Err` on a
 /// file that does not parse — the caller leaves it alone.
+///
+/// RM-103 S2: `can_create_agents` is the exception — it is reset to `true`
+/// only for a `role = "main"` agent ([`duduclaw_core::agent_toml::default_can_create_agents`]).
+/// For every other role (or a missing / unreadable role — fail-closed) a
+/// stored `false` stays `false`: the migration must never mint creation
+/// rights for a specialist.
 pub(crate) fn migrate_permission_flags(text: &str) -> Result<Option<(String, Vec<String>)>, String> {
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
+    let may_create_agents = doc
+        .get("agent")
+        .and_then(|a| a.get("role"))
+        .and_then(|r| r.as_str())
+        .is_some_and(duduclaw_core::agent_toml::default_can_create_agents);
     let Some(perms) = doc.get_mut("permissions").and_then(|i| i.as_table_like_mut()) else {
         return Ok(None);
     };
@@ -392,6 +403,9 @@ pub(crate) fn migrate_permission_flags(text: &str) -> Result<Option<(String, Vec
     }
     let mut reset = Vec::new();
     for key in ENFORCED_PERMISSION_KEYS {
+        if *key == "can_create_agents" && !may_create_agents {
+            continue;
+        }
         if perms.get(key).and_then(|i| i.as_bool()) == Some(false) {
             if let Some(toml_edit::Item::Value(v)) = perms.get_mut(key) {
                 let decor = v.decor().clone();
@@ -651,7 +665,7 @@ skill_security_scan = true
 
     #[test]
     fn permission_migration_resets_false_once() {
-        let text = "[permissions]\ncan_create_agents = false # note\ncan_send_cross_agent = false\ncan_modify_own_skills = false\ncan_schedule_tasks = false\ncan_modify_own_soul = false\n";
+        let text = "[agent]\nrole = \"main\"\n[permissions]\ncan_create_agents = false # note\ncan_send_cross_agent = false\ncan_modify_own_skills = false\ncan_schedule_tasks = false\ncan_modify_own_soul = false\n";
         let (out, reset) = migrate_permission_flags(text).unwrap().unwrap();
         assert_eq!(reset.len(), 4);
         let t: toml::Table = out.parse().unwrap();
@@ -665,6 +679,35 @@ skill_security_scan = true
         let marked = "[permissions]\ncan_schedule_tasks = false\npermissions_enforced_since = \"1.68.0\"\n";
         assert!(migrate_permission_flags(marked).unwrap().is_none());
         assert!(migrate_permission_flags("[permissions\nbroken").is_err());
+    }
+
+    /// RM-103 S2: the migration never mints `can_create_agents` for a
+    /// non-main role (nor for a file whose role is missing — fail-closed),
+    /// while the other three flags are still reset as before. An explicit
+    /// `true` an admin set is never touched.
+    #[test]
+    fn permission_migration_never_grants_create_agents_to_non_main() {
+        for head in ["[agent]\nrole = \"specialist\"\n", "[agent]\nrole = \"worker\"\n", ""] {
+            let text = format!(
+                "{head}[permissions]\ncan_create_agents = false\ncan_send_cross_agent = false\ncan_modify_own_skills = false\ncan_schedule_tasks = false\n"
+            );
+            let (out, reset) = migrate_permission_flags(&text).unwrap().unwrap();
+            assert!(!reset.iter().any(|k| k == "can_create_agents"), "{head:?}: {reset:?}");
+            assert_eq!(reset.len(), 3, "{head:?}");
+            let t: toml::Table = out.parse().unwrap();
+            assert_eq!(t["permissions"]["can_create_agents"].as_bool(), Some(false), "{head:?}");
+            assert_eq!(t["permissions"]["can_schedule_tasks"].as_bool(), Some(true), "{head:?}");
+            assert_eq!(t["permissions"][PERMISSIONS_MARKER_KEY].as_str(), Some("1.68.0"));
+        }
+        // An admin's explicit `true` on a specialist is left exactly as is.
+        let explicit = "[agent]\nrole = \"specialist\"\n[permissions]\ncan_create_agents = true\n";
+        let (out, reset) = migrate_permission_flags(explicit).unwrap().unwrap();
+        assert!(reset.is_empty());
+        assert!(out.contains("can_create_agents = true"));
+        // An absent key is not invented either way.
+        let absent = "[agent]\nrole = \"specialist\"\n[permissions]\ncan_schedule_tasks = true\n";
+        let (out, _) = migrate_permission_flags(absent).unwrap().unwrap();
+        assert!(!out.contains("can_create_agents"));
     }
 
     #[test]

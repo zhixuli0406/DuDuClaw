@@ -739,3 +739,12 @@ Cron admission 是所有帶 `on_behalf_of`、`created_by_user_id` 或 `scoped_by
 員工 cron 僅支援 UTC（含零時差 UTC／GMT 別名）。舊紀錄若指定其他時區，編輯、恢復與手動執行會拒絕，避免日光節約時間縮短實際間隔；仍可讀取，有權限者仍可暫停／刪除，時區排程由 Admin 管理。
 
 帶人類來源的 MCP 新增排程預設 UTC；未帶來源標記的 Admin／背景排程保留本地時區偵測。
+
+## 掃描範圍、建立員工權限與團隊派工（v1.81）
+
+- **`code_map` 只掃描員工自己的目錄。** `root` 參數解析符號連結後必須位於 `<home>/agents/<id>`（團隊角色成員為 `.ephemeral/<id>`）之內；相對路徑以該目錄為基準，未填 `root` 就是該目錄，不再使用 MCP server 的工作目錄。含 `..`、超出目錄或連結指向外部的路徑會回覆錯誤，並在 `tool_calls.jsonl` 留下 `refused` 紀錄；目錄內的符號連結檔案在掃描時略過。沒有員工身分的呼叫（空白、保留或無效 id）會被拒絕，錯誤訊息會說明 `code_map` 只能由已識別的 AI 員工掃描自己的資料夾。`meeting_transcribe.source_path` 原本就只接受員工自己 `attachments/` 內的檔案（不接受 `..` 與符號連結），MCP 與 gateway 兩端都會檢查。
+- **預設只有主代理能建立員工。** 管理員的建立入口（dashboard、`duduclaw agent create` 與匯入工具）只在 `role = "main"` 時寫入 `can_create_agents = true`，其他角色一律明確寫 `false`。進階範本安裝時非主代理角色強制為 `false`，評估員範本改為 `false`，v1.68 開機遷移也不再把非主代理角色的 `false` 改回 `true`。
+- **員工建立的員工一律沒有建立權限。** MCP `create_agent` 不論角色都寫入 `can_create_agents = false`。只有呼叫者本身是具備建立權限的 `main` 代理時，才能建立 `role = "main"` 的員工；否則在寫入任何檔案前就拒絕。
+- **行為變更：未設定的 `can_create_agents` 依角色決定。** MCP 閘（`create_agent`、`spawn_ephemeral`）原本只拒絕明確的 `false`。現在未設定時依角色預設：`role = "main"` 允許，其他角色以及角色缺漏或無法讀取時拒絕。沒有明確設定的非主代理員工（多半是 v1.68 以前建立的）不能再建立員工。Admin 明確設定的 `true` 仍然有效，Admin 也可在 dashboard 為個別員工開啟。
+- **規劃封包的 `tool_scope` 只能縮小執行角色的工具。** 非空的 `allowed` 會把執行角色限制在這些工具（加上 `team_handoff`）；只要列出員工本身沒有的工具，該次派工就會被拒絕，並寫入 Warning 等級的 `team_tool_scope_escalation` 稽核紀錄。`denied` 會從執行角色的工具中移除，並加入成員的 `denied_tools`。角色成員（以及一般臨時助手）也會繼承員工的 `approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools`、`action_rules`、`policy`、`egress_guard` 與 `scoped_tools`，與員工面對相同的核准。`grant_ttl_secs` 不繼承，因為員工較長的期限會延長成員的授權。
+- **沿用的核准設定不會擋下團隊交接。** 對角色成員，MCP 閘只在 `team_handoff` 略過沿用的 `action_rules`、`policy` 與核准清單（`ephemeral::is_role_member_intrinsic_call`；需要完整的 `[team_member]` 紀錄，且 parent 與 `ephemeral.toml` 一致）。涵蓋 `team_handoff` 的 `scoped_tools` 項目不會複製。`allowed_tools`、明確的 `denied_tools`、`[permissions]` 與對外傳送防護照常適用。

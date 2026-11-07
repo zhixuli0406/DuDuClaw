@@ -413,7 +413,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "root",
-                description: "Repository root to scan (default: current working directory)",
+                description: "Directory to scan; must be inside your own agent directory (default: your agent directory; relative paths resolve against it)",
                 required: false,
             },
             ParamDef {

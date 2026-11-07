@@ -498,6 +498,23 @@ fn patch_agent_toml(
         }
         agent["department"] = toml_edit::value(dept);
     }
+    // RM-103 S2: a template must not hand creation rights to a non-main role.
+    // Forced (not just defaulted) because the template — or an admin-edited
+    // copy of it in the create dialog — is copied verbatim otherwise; an
+    // operator can still enable it per agent afterwards. A missing or
+    // non-string role is treated as non-main (fail-closed).
+    let is_main = agent
+        .get("role")
+        .and_then(|r| r.as_str())
+        .is_some_and(duduclaw_core::agent_toml::default_can_create_agents);
+    if !is_main {
+        let perms = doc
+            .entry("permissions")
+            .or_insert(toml_edit::table())
+            .as_table_like_mut()
+            .ok_or_else(|| "template agent.toml [permissions] is not a table".to_string())?;
+        perms.insert("can_create_agents", toml_edit::value(false));
+    }
     if enable_cross_agent {
         // Team lead must be able to delegate to its workers over the bus.
         let perms = doc
@@ -1093,6 +1110,52 @@ summary = "留真人"
         // WP21: front desk lands in the same department as its workers
         // (the team's industry) so horizontal delegation is possible.
         assert!(role.agent_toml.contains("department = \"foo\""));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// RM-103 S2: template patching forces `can_create_agents = false` for
+    /// every non-main role — even when the template (or an admin-edited copy)
+    /// says `true` — and leaves a `main` template's value alone.
+    #[test]
+    fn template_patch_forces_create_agents_off_for_non_main() {
+        let worker_true = "[agent]\nname = \"w\"\nrole = \"worker\"\n[permissions]\ncan_create_agents = true # tpl\ncan_send_cross_agent = false\n";
+        let out = patch_agent_toml(worker_true, "w2", "", "", None, None, false).unwrap();
+        let t: toml::Table = out.parse().unwrap();
+        assert_eq!(t["permissions"]["can_create_agents"].as_bool(), Some(false), "{out}");
+        assert_eq!(t["permissions"]["can_send_cross_agent"].as_bool(), Some(false));
+
+        // Same through the admin-edited path used at create time.
+        let out = override_agent_identity(worker_true, "w2", "", "", None, None).unwrap();
+        let t: toml::Table = out.parse().unwrap();
+        assert_eq!(t["permissions"]["can_create_agents"].as_bool(), Some(false));
+
+        // Specialist and role-less templates (fail-closed) are forced off too,
+        // and a missing [permissions] table gets an explicit `false`.
+        for src in [
+            "[agent]\nname = \"s\"\nrole = \"specialist\"\n[permissions]\ncan_create_agents = true\n",
+            "[agent]\nname = \"s\"\n[permissions]\ncan_create_agents = true\n",
+            "[agent]\nname = \"s\"\nrole = \"worker\"\n",
+        ] {
+            let out = patch_agent_toml(src, "s", "", "", None, None, false).unwrap();
+            let t: toml::Table = out.parse().unwrap();
+            assert_eq!(t["permissions"]["can_create_agents"].as_bool(), Some(false), "{src}");
+        }
+
+        // A main template keeps what it ships.
+        let main_true = "[agent]\nname = \"m\"\nrole = \"main\"\n[permissions]\ncan_create_agents = true\n";
+        let out = patch_agent_toml(main_true, "m", "", "", None, None, true).unwrap();
+        let t: toml::Table = out.parse().unwrap();
+        assert_eq!(t["permissions"]["can_create_agents"].as_bool(), Some(true));
+    }
+
+    /// The fixture worker kit assembles with creation rights off.
+    #[test]
+    fn worker_assembly_has_create_agents_off() {
+        let tmp = fixture_premium_dir("worker-create-off");
+        let m = load_team_manifest(&tmp, "foo").unwrap();
+        let role = assemble_role(&tmp, &m, "foo-docs").unwrap();
+        let t: toml::Table = role.agent_toml.parse().unwrap();
+        assert_eq!(t["permissions"]["can_create_agents"].as_bool(), Some(false));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

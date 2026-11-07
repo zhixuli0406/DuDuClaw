@@ -380,6 +380,51 @@ mod dispatch_gate {
         );
     }
 
+    /// RM-103 S1 (Daybreak #3): an external key whose client id equals an
+    /// employee id is still not that employee — `code_map` is neither listed
+    /// nor callable for it, so it cannot walk the employee's directory. The
+    /// per-agent (internal) key for the same id keeps it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_key_with_colliding_client_id_cannot_list_or_call_code_map() {
+        let (tmp, d) = setup();
+        std::fs::write(
+            tmp.path().join("agents/scaffold/canary.rs"),
+            "pub fn canary_secret_symbol() {}\n",
+        )
+        .unwrap();
+        for scopes in ["memory:read", STANDALONE, "admin,memory:read"] {
+            let ext = principal("scaffold", scopes, true);
+            let listed = super::names(&ext, tmp.path(), "scaffold", false).await;
+            assert!(!listed.contains("code_map"), "{scopes}: listed");
+            let listed = super::names(&ext, tmp.path(), "scaffold", true).await;
+            assert!(!listed.contains("code_map"), "{scopes}: listed in an employee process");
+            let resp = call(&d, &ext, "code_map", json!({"query": "canary_secret_symbol"})).await;
+            assert_eq!(resp["error"]["code"], -32003, "{scopes}: {resp}");
+            assert!(!resp.to_string().contains("canary"), "{scopes}: {resp}");
+        }
+        assert!(
+            audit_classes(tmp.path(), "code_map")
+                .iter()
+                .all(|c| c == "process_agent_tool"),
+            "{:?}",
+            audit_classes(tmp.path(), "code_map")
+        );
+        // The proven employee (per-agent internal key) still lists and calls it.
+        let per_agent = principal("scaffold", "memory:read", false);
+        assert!(super::names(&per_agent, tmp.path(), "scaffold", false).await.contains("code_map"));
+        let resp = call(&d, &per_agent, "code_map", json!({"query": "canary_secret_symbol"})).await;
+        assert_ne!(resp["error"]["code"], -32003, "{resp}");
+        assert!(
+            !resp["error"]["message"].as_str().unwrap_or_default().contains("acts for the AI employee"),
+            "{resp}"
+        );
+        assert_eq!(
+            audit_classes(tmp.path(), "code_map").iter().filter(|c| *c == "process_agent_tool").count(),
+            3,
+            "one refusal per external call, none for the per-agent call"
+        );
+    }
+
     /// Employee callers are unaffected: the gateway-internal key acting for
     /// `dudu`, and a per-agent key whose client id is an employee.
     #[tokio::test(flavor = "current_thread")]

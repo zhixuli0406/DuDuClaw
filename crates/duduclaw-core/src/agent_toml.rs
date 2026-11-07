@@ -107,12 +107,34 @@ pub struct ContainerSectionView {
     pub sandbox_enabled: Option<bool>,
 }
 
+/// RM-103 S2: the value every scaffold, template patch and the v1.68 boot
+/// migration may give `[permissions] can_create_agents` for an agent of
+/// `role`. Only the top-level `main` agent creates employees by default; every
+/// other role is scaffolded with an explicit `false` (explicit because the
+/// MCP gate resolves an absent key through
+/// [`effective_can_create_agents`]). An operator can still turn it on per
+/// agent from the dashboard; this only governs what DuDuClaw writes on its own.
+pub fn default_can_create_agents(role: &str) -> bool {
+    role.trim() == "main"
+}
+
+/// RM-103 S2 (v1.81): what the MCP gate enforces for `can_create_agents`.
+/// An explicit value (`true` set by an admin, or `false`) wins; an absent key
+/// resolves to [`default_can_create_agents`] for the agent's `role`, and a
+/// missing / unreadable role counts as non-main (fail closed). Before v1.81 an
+/// absent key was allowed for every role, so a pre-1.68 config without the
+/// migration marker kept creation rights it was never meant to have.
+pub fn effective_can_create_agents(explicit: Option<bool>, role: Option<&str>) -> bool {
+    explicit.unwrap_or_else(|| role.is_some_and(default_can_create_agents))
+}
+
 /// `[permissions]` — the four permission flags the MCP dispatch gate
 /// enforces since v1.68 (`can_create_agents`, `can_send_cross_agent`,
 /// `can_schedule_tasks`, `can_modify_own_skills`). Each is `Option` so the
 /// gate can refuse only on an **explicit** `false`; an absent or wrong-typed
-/// key keeps the pre-1.68 behaviour (allowed, subject to every other gate).
-/// `can_modify_own_soul` is enforced elsewhere (`agent_update_soul`).
+/// key keeps the pre-1.68 behaviour (allowed, subject to every other gate) —
+/// except `can_create_agents`, whose absent value follows the role since v1.81
+/// ([`effective_can_create_agents`]). `can_modify_own_soul` is enforced elsewhere (`agent_update_soul`).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct PermissionsSectionView {
@@ -569,6 +591,20 @@ pub fn load_for_agent(home_dir: &Path, agent_id: &str) -> AgentTomlSections {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RM-103 S2 (v1.81): an absent `can_create_agents` follows the role;
+    /// an explicit value — including an admin's `true` — always wins.
+    #[test]
+    fn effective_can_create_agents_resolves_absent_key_by_role() {
+        assert!(effective_can_create_agents(None, Some("main")));
+        assert!(effective_can_create_agents(None, Some(" main ")));
+        for role in [Some("specialist"), Some("worker"), Some(""), Some("Main"), None] {
+            assert!(!effective_can_create_agents(None, role), "{role:?}");
+        }
+        assert!(effective_can_create_agents(Some(true), Some("specialist")));
+        assert!(effective_can_create_agents(Some(true), None));
+        assert!(!effective_can_create_agents(Some(false), Some("main")));
+    }
 
     #[test]
     fn action_rules_loader_is_fail_closed_on_an_unreadable_file() {

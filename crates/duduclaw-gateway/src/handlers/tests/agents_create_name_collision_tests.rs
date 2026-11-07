@@ -150,3 +150,33 @@ async fn agents_create_evolution_is_explicitly_enabled() {
     assert_eq!(config["evolution"]["gvu_enabled"].as_bool(), Some(true));
     assert!(crate::gvu::trigger::agent_gvu_enabled(&dir));
 }
+
+/// RM-103 S2: the dashboard scaffold turns `can_create_agents` on for the
+/// `main` role only; every other role (including the default) gets an
+/// explicit `false`.
+#[tokio::test]
+async fn agents_create_scaffolds_create_agents_for_main_only() {
+    for (name, role, expected) in [
+        ("plain-default", None, false),
+        ("plain-worker", Some("worker"), false),
+        ("plain-lead", Some("team-leader"), false),
+        ("new-main", Some("main"), true),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let mut params = json!({ "name": name, "display_name": name });
+        if let Some(r) = role {
+            params["role"] = json!(r);
+        }
+        let frame = handler.handle_agents_create(params).await;
+        assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{name}: {frame:?}");
+        let raw = std::fs::read_to_string(home.path().join("agents").join(name).join("agent.toml"))
+            .unwrap();
+        let config: toml::Table = raw.parse().unwrap();
+        assert_eq!(
+            config["permissions"]["can_create_agents"].as_bool(),
+            Some(expected),
+            "{name}"
+        );
+    }
+}
