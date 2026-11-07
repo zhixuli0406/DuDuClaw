@@ -834,6 +834,9 @@ pub(crate) async fn handle_skill_from_recording(
         updated_at: now,
         approved_at: None,
         usage_count: 0,
+        generation_message_id: None,
+        generation_started_at: None,
+        generation_error: None,
     };
     if let Err(e) = store.insert(&record).await {
         return rec_error(&format!("建立技能草稿記錄失敗：{e}"));
