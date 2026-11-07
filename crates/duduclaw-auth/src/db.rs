@@ -232,6 +232,7 @@ impl UserDb {
              INSERT OR IGNORE INTO auth_meta (key, value) VALUES ('acl_generation', 1);",
         )
         .map_err(|e| format!("failed to migrate auth_meta: {e}"))?;
+        migrate_isolation_personal_agents(&conn)?;
         crate::isolation::initialize_tenant(&conn)?;
         Ok(())
     }
@@ -1352,25 +1353,201 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].action, "agent.create"); // DESC order
     }
+
+    // ── Personal mirror ──────────────────────────────────────
+
+    fn personal_tx<T>(db: &UserDb, write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, PersonalAgentError>)
+        -> Result<T, PersonalAgentError> {
+        let mut conn = db.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        let result = write(&tx);
+        if result.is_ok() { tx.commit().unwrap(); }
+        result
+    }
+
+    fn members(db: &UserDb, agent: &str) -> Vec<String> {
+        let mut users: Vec<String> = db.get_agent_users(agent).unwrap().into_iter().map(|b| b.user_id).collect();
+        users.sort();
+        users
+    }
+
+    fn mirror_owner(db: &UserDb, agent: &str) -> Option<String> {
+        personal_agent_owner(&db.conn(), agent).unwrap()
+    }
+
+    #[test]
+    fn personal_agent_refuses_second_binding() {
+        let (db, _tmp) = test_db();
+        let alice = db.create_user("alice@example.com", "Alice", "password1", UserRole::Employee).unwrap();
+        let bob = db.create_user("bob@example.com", "Bob", "password1", UserRole::Admin).unwrap();
+        assert!(personal_tx(&db, |tx| insert_personal_agent_in_transaction(tx, "alice-personal", &alice.id)).unwrap());
+        db.bind_agent(&alice.id, "alice-personal", AccessLevel::Owner).unwrap();
+        let conflict = PersonalAgentError::BindingConflict.to_string();
+        for access in [AccessLevel::Viewer, AccessLevel::Operator, AccessLevel::Owner] {
+            let generation = db.acl_generation().unwrap();
+            assert_eq!(db.bind_agent(&bob.id, "alice-personal", access).unwrap_err(), conflict);
+            assert_eq!(db.acl_generation().unwrap(), generation, "a refused binding must not bump the ACL");
+        }
+        // Writers that bypass bind_agent_in_transaction are stopped by triggers.
+        for statement in [
+            "INSERT INTO user_agent_bindings(user_id,agent_name,access_level,bound_at) VALUES(?1,'alice-personal','owner','now')",
+            "INSERT OR REPLACE INTO user_agent_bindings(user_id,agent_name,access_level,bound_at) VALUES(?1,'alice-personal','owner','now')",
+        ] {
+            assert!(db.conn().execute(statement, [&bob.id]).is_err(), "{statement}");
+        }
+        assert!(db.conn().execute("UPDATE user_agent_bindings SET user_id=?1 WHERE agent_name='alice-personal'", [&bob.id]).is_err());
+        db.bind_agent(&bob.id, "team", AccessLevel::Owner).unwrap();
+        assert!(db.conn().execute("UPDATE user_agent_bindings SET agent_name='alice-personal' WHERE agent_name='team'", []).is_err());
+        assert_eq!(members(&db, "alice-personal"), vec![alice.id.clone()]);
+        assert_eq!(db.check_agent_access(&bob.id, "alice-personal").unwrap(), None);
+    }
+
+    #[test]
+    fn personal_agent_owner_rebind_is_idempotent() {
+        let (db, _tmp) = test_db();
+        let alice = db.create_user("alice@example.com", "Alice", "password1", UserRole::Employee).unwrap();
+        let bob = db.create_user("bob@example.com", "Bob", "password1", UserRole::Employee).unwrap();
+        let before = db.acl_generation().unwrap();
+        assert!(personal_tx(&db, |tx| insert_personal_agent_in_transaction(tx, "alice-personal", &alice.id)).unwrap());
+        let recorded = db.acl_generation().unwrap();
+        assert!(recorded > before, "recording a Personal owner invalidates cached ACLs");
+        assert!(!personal_tx(&db, |tx| insert_personal_agent_in_transaction(tx, "alice-personal", &alice.id)).unwrap());
+        assert_eq!(db.acl_generation().unwrap(), recorded, "idempotent re-apply writes nothing");
+        assert_eq!(personal_tx(&db, |tx| insert_personal_agent_in_transaction(tx, "alice-personal", &bob.id)),
+            Err(PersonalAgentError::OwnerConflict));
+        for access in [AccessLevel::Owner, AccessLevel::Owner, AccessLevel::Operator, AccessLevel::Viewer, AccessLevel::Owner] {
+            db.bind_agent(&alice.id, "alice-personal", access).unwrap();
+            assert_eq!(db.check_agent_access(&alice.id, "alice-personal").unwrap(), Some(access));
+        }
+        assert_eq!(members(&db, "alice-personal"), vec![alice.id.clone()]);
+        assert_eq!(mirror_owner(&db, "alice-personal").as_deref(), Some(alice.id.as_str()));
+        // The owner binding already existing is no obstacle to (re)recording.
+        assert!(!personal_tx(&db, |tx| insert_personal_agent_in_transaction(tx, "alice-personal", &alice.id)).unwrap());
+    }
+
+    #[test]
+    fn personal_mirror_insert_is_immutable() {
+        let (db, _tmp) = test_db();
+        let alice = db.create_user("alice@example.com", "Alice", "password1", UserRole::Employee).unwrap();
+        let bob = db.create_user("bob@example.com", "Bob", "password1", UserRole::Employee).unwrap();
+        personal_tx(&db, |tx| insert_personal_agent_in_transaction(tx, "alice-personal", &alice.id)).unwrap();
+        db.bind_agent(&alice.id, "alice-personal", AccessLevel::Owner).unwrap();
+        for statement in [
+            "UPDATE isolation_personal_agents SET owner_user_id=?1",
+            "UPDATE isolation_personal_agents SET created_at='later' WHERE ?1 IS NOT NULL",
+            "INSERT OR REPLACE INTO isolation_personal_agents(agent_name,owner_user_id,created_at) VALUES('alice-personal',?1,'now')",
+            "INSERT INTO isolation_personal_agents(agent_name,owner_user_id,created_at) VALUES('alice-personal',?1,'now')
+             ON CONFLICT(agent_name) DO UPDATE SET owner_user_id=excluded.owner_user_id",
+            "DELETE FROM isolation_personal_agents WHERE ?1 IS NOT NULL",
+        ] {
+            assert!(db.conn().execute(statement, [&bob.id]).is_err(), "{statement}");
+            assert_eq!(mirror_owner(&db, "alice-personal").as_deref(), Some(alice.id.as_str()));
+        }
+        assert_eq!(personal_tx(&db, |tx| remove_personal_agent_in_transaction(tx, "alice-personal", &bob.id)),
+            Err(PersonalAgentError::OwnerConflict));
+        assert_eq!(mirror_owner(&db, "alice-personal").as_deref(), Some(alice.id.as_str()));
+
+        // Tombstone: only the explicit lifecycle removal deletes the row, and
+        // it takes the agent's bindings with it.
+        let generation = db.acl_generation().unwrap();
+        assert!(personal_tx(&db, |tx| remove_personal_agent_in_transaction(tx, "alice-personal", &alice.id)).unwrap());
+        assert!(db.acl_generation().unwrap() > generation);
+        assert_eq!(mirror_owner(&db, "alice-personal"), None);
+        assert!(members(&db, "alice-personal").is_empty());
+        let grants: i64 = db.conn().query_row("SELECT count(*) FROM isolation_personal_agent_removals", [], |r| r.get(0)).unwrap();
+        assert_eq!(grants, 0, "removal grants never outlive their transaction");
+        assert!(!personal_tx(&db, |tx| remove_personal_agent_in_transaction(tx, "alice-personal", &alice.id)).unwrap());
+        // A recreated employee with the same label is a fresh record.
+        assert!(personal_tx(&db, |tx| insert_personal_agent_in_transaction(tx, "alice-personal", &bob.id)).unwrap());
+        assert_eq!(mirror_owner(&db, "alice-personal").as_deref(), Some(bob.id.as_str()));
+    }
+
+    #[test]
+    fn personal_mirror_refuses_invalid_unknown_and_existing_members() {
+        let (db, _tmp) = test_db();
+        let alice = db.create_user("alice@example.com", "Alice", "password1", UserRole::Employee).unwrap();
+        let bob = db.create_user("bob@example.com", "Bob", "password1", UserRole::Employee).unwrap();
+        for agent in ["", "../x", "__system", duduclaw_core::UNTRUSTED_AGENT_ID] {
+            assert_eq!(personal_tx(&db, |tx| insert_personal_agent_in_transaction(tx, agent, &alice.id)),
+                Err(PersonalAgentError::InvalidAgent), "{agent}");
+            assert_eq!(personal_tx(&db, |tx| remove_personal_agent_in_transaction(tx, agent, &alice.id)),
+                Err(PersonalAgentError::InvalidAgent), "{agent}");
+        }
+        for owner in ["", "missing-user"] {
+            assert_eq!(personal_tx(&db, |tx| insert_personal_agent_in_transaction(tx, "solo", owner)),
+                Err(PersonalAgentError::UnknownOwner));
+        }
+        db.bind_agent(&alice.id, "team", AccessLevel::Owner).unwrap();
+        db.bind_agent(&bob.id, "team", AccessLevel::Viewer).unwrap();
+        assert_eq!(personal_tx(&db, |tx| insert_personal_agent_in_transaction(tx, "team", &alice.id)),
+            Err(PersonalAgentError::BindingConflict));
+        assert!(db.conn().execute("INSERT INTO isolation_personal_agents(agent_name,owner_user_id,created_at) VALUES('team',?1,'now')",
+            [&alice.id]).is_err(), "the trigger refuses a mirror over existing members");
+        assert_eq!(mirror_owner(&db, "team"), None);
+        assert_eq!(mirror_owner(&db, "solo"), None);
+        // An unreadable mirror refuses every binding instead of treating the agent as Shared.
+        db.conn().execute_batch("DROP TABLE isolation_personal_agents").unwrap();
+        assert!(db.bind_agent(&alice.id, "team", AccessLevel::Owner).is_err());
+        assert!(personal_agent_owner(&db.conn(), "team").is_err());
+    }
+
+    #[test]
+    fn shared_agent_binding_behaviour_is_unchanged() {
+        let (db, _tmp) = test_db();
+        let alice = db.create_user("alice@example.com", "Alice", "password1", UserRole::Employee).unwrap();
+        let bob = db.create_user("bob@example.com", "Bob", "password1", UserRole::Employee).unwrap();
+        let carol = db.create_user("carol@example.com", "Carol", "password1", UserRole::Employee).unwrap();
+        let start = db.acl_generation().unwrap();
+        db.bind_agent(&alice.id, "team", AccessLevel::Owner).unwrap();
+        db.bind_agent(&bob.id, "team", AccessLevel::Owner).unwrap();
+        db.bind_agent(&carol.id, "team", AccessLevel::Viewer).unwrap();
+        db.bind_agent(&carol.id, "team", AccessLevel::Operator).unwrap();
+        assert_eq!(db.acl_generation().unwrap(), start + 4);
+        let mut expected = vec![alice.id.clone(), bob.id.clone(), carol.id.clone()];
+        expected.sort();
+        assert_eq!(members(&db, "team"), expected);
+        assert_eq!(db.check_agent_access(&carol.id, "team").unwrap(), Some(AccessLevel::Operator));
+        // The second Owner still promotes the single previous Owner to primary.
+        let primary: Vec<String> = db.get_agent_users("team").unwrap().into_iter()
+            .filter(|b| b.is_primary).map(|b| b.user_id).collect();
+        assert_eq!(primary, vec![alice.id.clone()]);
+        // Migration's Shared writer goes through the same function unchanged.
+        db.conn().execute("UPDATE users SET last_login='2026-11-08T00:00:00Z' WHERE id=?1", [&carol.id]).unwrap();
+        db.migration_bind_shared("abcd-1", &[7; 32], &carol.id, "other", AccessLevel::Operator).unwrap();
+        assert_eq!(db.check_agent_access(&carol.id, "other").unwrap(), Some(AccessLevel::Operator));
+        assert_eq!(mirror_owner(&db, "team"), None);
+    }
 }
 
 /// Shared ordinary/migration writer; caller owns the immediate transaction.
+///
+/// Personal exclusivity (native Linux isolation): when `agent_name` has an
+/// `isolation_personal_agents` mirror row, only the recorded owner may be
+/// bound (at any access level), and only while no other user is bound. Any
+/// other user is refused with [`PersonalAgentError::BindingConflict`] whatever
+/// level is requested. Agents without a mirror row keep the Shared behaviour
+/// unchanged. An unreadable mirror refuses every binding.
 pub(crate) fn bind_agent_in_transaction(
     tx: &rusqlite::Transaction<'_>, user_id: &str, agent_name: &str,
     access_level: AccessLevel, now: &str,
-) -> Result<(), String> {
+) -> Result<(), PersonalAgentError> {
+        if let Some(owner) = personal_agent_owner(tx, agent_name)? {
+            if owner != user_id || other_members_exist(tx, agent_name, user_id)? {
+                return Err(PersonalAgentError::BindingConflict);
+            }
+        }
         if access_level == AccessLevel::Owner {
             let owners: Vec<String> = {
                 let mut statement = tx.prepare("SELECT user_id FROM user_agent_bindings WHERE agent_name = ?1 AND access_level = 'owner' AND user_id != ?2")
-                    .map_err(|e| e.to_string())?;
-                statement.query_map(params![agent_name, user_id], |row| row.get(0)).map_err(|e| e.to_string())?
-                    .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+                    .map_err(PersonalAgentError::store)?;
+                statement.query_map(params![agent_name, user_id], |row| row.get(0)).map_err(PersonalAgentError::store)?
+                    .collect::<Result<Vec<_>, _>>().map_err(PersonalAgentError::store)?
             };
             if let [previous] = owners.as_slice() {
-                let updated = tx.execute("UPDATE user_agent_bindings SET is_primary = 1 WHERE agent_name = ?1 AND user_id = ?2 AND NOT EXISTS(SELECT 1 FROM user_agent_bindings WHERE agent_name = ?1 AND is_primary = 1)", params![agent_name, previous]).map_err(|e| e.to_string())?;
+                let updated = tx.execute("UPDATE user_agent_bindings SET is_primary = 1 WHERE agent_name = ?1 AND user_id = ?2 AND NOT EXISTS(SELECT 1 FROM user_agent_bindings WHERE agent_name = ?1 AND is_primary = 1)", params![agent_name, previous]).map_err(PersonalAgentError::store)?;
                 if updated > 0 {
                     tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp) VALUES(NULL, 'agent.primary_owner_auto', ?1, ?2, ?3)",
-                        params![agent_name, serde_json::json!({"primary_user_id": previous}).to_string(), now]).map_err(|e| e.to_string())?;
+                        params![agent_name, serde_json::json!({"primary_user_id": previous}).to_string(), now]).map_err(PersonalAgentError::store)?;
                 }
             }
         }
@@ -1380,7 +1557,216 @@ pub(crate) fn bind_agent_in_transaction(
              is_primary = CASE WHEN excluded.access_level = 'owner' THEN user_agent_bindings.is_primary ELSE 0 END",
             params![user_id, agent_name, access_level.to_string(), now],
         )
-        .map_err(|e| format!("bind error: {e}"))?;
-        bump_acl_generation(&tx).map_err(|e| format!("bind error: {e}"))?;
+        .map_err(|e| PersonalAgentError::Store(format!("bind error: {e}")))?;
+        bump_acl_generation(&tx).map_err(|e| PersonalAgentError::Store(format!("bind error: {e}")))?;
     Ok(())
+}
+
+// ── Personal employee mirror (native Linux isolation) ───────────────────
+
+/// Refusals of the users.db Personal-employee mirror and of binding writes
+/// that would break Personal exclusivity. `Display` strings are stable, so a
+/// caller holding only the `String` from [`UserDb::bind_agent`] can compare
+/// against `PersonalAgentError::BindingConflict.to_string()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersonalAgentError {
+    /// The agent is a Personal employee and the user is not its owner, or
+    /// another user is already bound to it.
+    BindingConflict,
+    /// A mirror row already exists for this agent with a different owner
+    /// (rows are immutable), or the expected owner does not match on removal.
+    OwnerConflict,
+    /// The agent id is not a valid, non-reserved employee id.
+    InvalidAgent,
+    /// No users row has the given owner id.
+    UnknownOwner,
+    /// The store could not be read or written; always a refusal.
+    Store(String),
+}
+
+impl PersonalAgentError {
+    fn store(error: impl std::fmt::Display) -> Self { Self::Store(error.to_string()) }
+}
+
+impl std::fmt::Display for PersonalAgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BindingConflict => f.write_str("personal agent binding conflict"),
+            Self::OwnerConflict => f.write_str("personal agent owner conflict"),
+            Self::InvalidAgent => f.write_str("invalid personal agent"),
+            Self::UnknownOwner => f.write_str("personal agent owner unknown"),
+            Self::Store(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for PersonalAgentError {}
+
+impl From<PersonalAgentError> for String {
+    fn from(error: PersonalAgentError) -> Self { error.to_string() }
+}
+
+/// Idempotent schema for the Personal mirror. Besides the explicit checks in
+/// the Rust writers, triggers enforce the invariants for every SQL writer in
+/// this crate (member creation, offboarding transfer, raw upserts):
+/// - mirror rows are never updated or replaced (`INSERT OR REPLACE` is caught
+///   by the BEFORE INSERT trigger, before REPLACE deletes the old row);
+/// - a mirror row is deleted only together with a same-transaction removal
+///   grant, which only [`remove_personal_agent_in_transaction`] writes;
+/// - no binding for a non-owner user can be inserted for a Personal agent, and
+///   a mirror row cannot be created while another user is bound.
+fn migrate_isolation_personal_agents(conn: &Connection) -> Result<(), String> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|e| format!("failed to migrate isolation_personal_agents: {e}"))?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS isolation_personal_agents (
+            agent_name TEXT PRIMARY KEY NOT NULL CHECK (length(agent_name) > 0),
+            owner_user_id TEXT NOT NULL CHECK (length(owner_user_id) > 0),
+            created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS isolation_personal_agent_removals (
+            agent_name TEXT PRIMARY KEY NOT NULL,
+            owner_user_id TEXT NOT NULL
+         );
+         CREATE TRIGGER IF NOT EXISTS isolation_personal_agents_no_replace
+           BEFORE INSERT ON isolation_personal_agents
+           WHEN EXISTS(SELECT 1 FROM isolation_personal_agents WHERE agent_name = NEW.agent_name)
+           BEGIN SELECT RAISE(ABORT, 'personal agent mirror is immutable'); END;
+         CREATE TRIGGER IF NOT EXISTS isolation_personal_agents_exclusive_insert
+           BEFORE INSERT ON isolation_personal_agents
+           WHEN EXISTS(SELECT 1 FROM user_agent_bindings
+                       WHERE agent_name = NEW.agent_name AND user_id != NEW.owner_user_id)
+           BEGIN SELECT RAISE(ABORT, 'personal agent binding conflict'); END;
+         CREATE TRIGGER IF NOT EXISTS isolation_personal_agents_no_update
+           BEFORE UPDATE ON isolation_personal_agents
+           BEGIN SELECT RAISE(ABORT, 'personal agent mirror is immutable'); END;
+         CREATE TRIGGER IF NOT EXISTS isolation_personal_agents_guarded_delete
+           BEFORE DELETE ON isolation_personal_agents
+           WHEN NOT EXISTS(SELECT 1 FROM isolation_personal_agent_removals
+                           WHERE agent_name = OLD.agent_name AND owner_user_id = OLD.owner_user_id)
+           BEGIN SELECT RAISE(ABORT, 'personal agent mirror removal requires the lifecycle path'); END;
+         CREATE TRIGGER IF NOT EXISTS isolation_personal_binding_insert
+           BEFORE INSERT ON user_agent_bindings
+           WHEN EXISTS(SELECT 1 FROM isolation_personal_agents
+                       WHERE agent_name = NEW.agent_name AND owner_user_id != NEW.user_id)
+           BEGIN SELECT RAISE(ABORT, 'personal agent binding conflict'); END;
+         CREATE TRIGGER IF NOT EXISTS isolation_personal_binding_update
+           BEFORE UPDATE OF user_id, agent_name ON user_agent_bindings
+           WHEN EXISTS(SELECT 1 FROM isolation_personal_agents
+                       WHERE agent_name = NEW.agent_name AND owner_user_id != NEW.user_id)
+           BEGIN SELECT RAISE(ABORT, 'personal agent binding conflict'); END;",
+    )
+    .map_err(|e| format!("failed to migrate isolation_personal_agents: {e}"))?;
+    tx.commit().map_err(|e| format!("failed to migrate isolation_personal_agents: {e}"))
+}
+
+fn is_personal_agent_id(agent: &str) -> bool {
+    duduclaw_core::is_valid_agent_id(agent) && !duduclaw_core::is_reserved_agent_id(agent)
+        && agent != duduclaw_core::UNTRUSTED_AGENT_ID
+}
+
+fn other_members_exist(conn: &Connection, agent: &str, user_id: &str) -> Result<bool, PersonalAgentError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM user_agent_bindings WHERE agent_name = ?1 AND user_id != ?2)",
+        params![agent, user_id], |row| row.get(0),
+    ).map_err(PersonalAgentError::store)
+}
+
+/// The recorded Personal owner of `agent`, or `None` when the agent has no
+/// mirror row (Shared or unknown). Evidence only: it never authenticates a
+/// user, and use-time checks compare it with the confirmed employee lifecycle.
+/// A missing or unreadable mirror table is an error, never `None`.
+pub fn personal_agent_owner(conn: &Connection, agent: &str) -> Result<Option<String>, PersonalAgentError> {
+    conn.query_row(
+        "SELECT owner_user_id FROM isolation_personal_agents WHERE agent_name = ?1",
+        [agent], |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| PersonalAgentError::Store(format!("personal agent mirror unavailable: {e}")))
+}
+
+/// Record `agent` as a Personal employee owned by `owner_user_id`.
+///
+/// This is the API for the gateway employee lifecycle apply path (A2/A4). The
+/// caller owns an IMMEDIATE transaction on users.db and commits it; nothing
+/// here commits. Returns `Ok(true)` when the row was inserted (the ACL
+/// generation is bumped in the same transaction) and `Ok(false)` when the
+/// identical owner was already recorded (idempotent re-apply, no write).
+///
+/// Refuses with:
+/// - `InvalidAgent` for an invalid, reserved or untrusted agent id;
+/// - `OwnerConflict` when a row exists for a different owner (immutable);
+/// - `UnknownOwner` when no users row has `owner_user_id`;
+/// - `BindingConflict` when any other user is bound to the agent.
+///
+/// Owner status (active, logged in, no forced password change) is the
+/// lifecycle's check, not this mirror's.
+pub fn insert_personal_agent_in_transaction(
+    tx: &rusqlite::Transaction<'_>, agent: &str, owner_user_id: &str,
+) -> Result<bool, PersonalAgentError> {
+    if !is_personal_agent_id(agent) { return Err(PersonalAgentError::InvalidAgent); }
+    if owner_user_id.is_empty() { return Err(PersonalAgentError::UnknownOwner); }
+    let existing = personal_agent_owner(tx, agent)?;
+    if existing.as_deref().is_some_and(|owner| owner != owner_user_id) {
+        return Err(PersonalAgentError::OwnerConflict);
+    }
+    let owner_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)", [owner_user_id], |row| row.get(0),
+    ).map_err(PersonalAgentError::store)?;
+    if !owner_exists { return Err(PersonalAgentError::UnknownOwner); }
+    if other_members_exist(tx, agent, owner_user_id)? { return Err(PersonalAgentError::BindingConflict); }
+    if existing.is_some() { return Ok(false); }
+    let now = Utc::now().to_rfc3339();
+    tx.execute(
+        "INSERT INTO isolation_personal_agents (agent_name, owner_user_id, created_at) VALUES (?1, ?2, ?3)",
+        params![agent, owner_user_id, now],
+    ).map_err(PersonalAgentError::store)?;
+    tx.execute(
+        "INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp)
+         VALUES(NULL, 'isolation.personal_agent_recorded', ?1, ?2, ?3)",
+        params![agent, serde_json::json!({"owner_user_id": owner_user_id}).to_string(), now],
+    ).map_err(PersonalAgentError::store)?;
+    bump_acl_generation(tx).map_err(PersonalAgentError::store)?;
+    Ok(true)
+}
+
+/// Remove the Personal mirror row of a tombstoned employee.
+///
+/// **Only the gateway employee lifecycle apply path may call this**, in the
+/// same users.db transaction in which it records the employee as tombstoned.
+/// No RPC, migration, repair or cleanup path may call it: deleting the row
+/// turns the agent name back into an unrestricted (Shared) binding target.
+///
+/// In the caller's IMMEDIATE transaction it deletes the mirror row and every
+/// `user_agent_bindings` row of the agent (a Personal binding never outlives
+/// its employee, and a recreated employee with the same label must not
+/// inherit it), audits, and bumps the ACL generation. Returns `Ok(false)`
+/// without any write when no row exists, `OwnerConflict` when the recorded
+/// owner differs from `owner_user_id`.
+pub fn remove_personal_agent_in_transaction(
+    tx: &rusqlite::Transaction<'_>, agent: &str, owner_user_id: &str,
+) -> Result<bool, PersonalAgentError> {
+    if !is_personal_agent_id(agent) { return Err(PersonalAgentError::InvalidAgent); }
+    let Some(owner) = personal_agent_owner(tx, agent)? else { return Ok(false) };
+    if owner != owner_user_id { return Err(PersonalAgentError::OwnerConflict); }
+    tx.execute(
+        "INSERT INTO isolation_personal_agent_removals (agent_name, owner_user_id) VALUES (?1, ?2)",
+        params![agent, owner_user_id],
+    ).map_err(PersonalAgentError::store)?;
+    let deleted = tx.execute(
+        "DELETE FROM isolation_personal_agents WHERE agent_name = ?1 AND owner_user_id = ?2",
+        params![agent, owner_user_id],
+    ).map_err(PersonalAgentError::store)?;
+    if deleted != 1 { return Err(PersonalAgentError::Store("personal agent mirror removal failed".into())); }
+    tx.execute("DELETE FROM isolation_personal_agent_removals WHERE agent_name = ?1", [agent])
+        .map_err(PersonalAgentError::store)?;
+    tx.execute("DELETE FROM user_agent_bindings WHERE agent_name = ?1", [agent])
+        .map_err(PersonalAgentError::store)?;
+    tx.execute(
+        "INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp)
+         VALUES(NULL, 'isolation.personal_agent_removed', ?1, ?2, ?3)",
+        params![agent, serde_json::json!({"owner_user_id": owner_user_id}).to_string(), Utc::now().to_rfc3339()],
+    ).map_err(PersonalAgentError::store)?;
+    bump_acl_generation(tx).map_err(PersonalAgentError::store)?;
+    Ok(true)
 }

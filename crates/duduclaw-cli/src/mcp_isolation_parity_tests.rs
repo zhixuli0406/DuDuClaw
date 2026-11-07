@@ -229,7 +229,8 @@ enabled = true
         must_change_password: false, team_access: Default::default(), acl_generation: 1,
     };
     let snapshot = duduclaw_auth::IsolationAuthoritySnapshot { tenant_id: "tenant".into(),
-        acl_generation: 1, policy_epoch: 1, human: Some(human) };
+        acl_generation: 1, policy_epoch: 1, human: Some(human), personal_owner: None,
+        agent_member_count: 1 };
     let employee = context().record().employee;
     let authorization = human_authorization(home.to_owned(), "main".into(), employee, "owner".into(),
         1, Lane::Standard, &snapshot,

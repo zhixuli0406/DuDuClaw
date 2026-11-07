@@ -124,6 +124,44 @@ fn isolation_authority_initialization_rejects_half_state_and_rolls_back_partial_
 }
 
 #[test]
+fn personal_agent_snapshot_reports_owner_and_member_count() {
+    let (home, db, user) = fixture();
+    let empty = db.isolation_authority_snapshot(None, "sales").unwrap();
+    assert_eq!((empty.personal_owner, empty.agent_member_count), (None, 0));
+    db.bind_agent(&user, "sales", AccessLevel::Owner).unwrap();
+    let shared = db.isolation_authority_snapshot(Some(&user), "sales").unwrap();
+    assert_eq!((shared.personal_owner, shared.agent_member_count), (None, 1));
+    {
+        let mut conn = db.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        assert!(crate::db::insert_personal_agent_in_transaction(&tx, "sales", &user).unwrap());
+        tx.commit().unwrap();
+    }
+    let personal = db.isolation_authority_snapshot(Some(&user), "sales").unwrap();
+    assert_eq!(personal.personal_owner.as_deref(), Some(user.as_str()));
+    assert_eq!(personal.agent_member_count, 1);
+    assert!(personal.acl_generation > shared.acl_generation, "recording the owner fences older snapshots");
+    let background = db.isolation_authority_snapshot(None, "sales").unwrap();
+    assert_eq!((background.personal_owner.as_deref(), background.agent_member_count), (Some(user.as_str()), 1));
+    let mut readonly = Connection::open_with_flags(home.path().join("users.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(read_isolation_authority(&mut readonly, None, "sales").unwrap().personal_owner.as_deref(), Some(user.as_str()));
+
+    // Other agents are unaffected and count every bound user at any level.
+    let other = db.create_user("other@example.test", "Other", "fixture-password", UserRole::Employee).unwrap();
+    db.bind_agent(&user, "team", AccessLevel::Owner).unwrap();
+    db.bind_agent(&other.id, "team", AccessLevel::Viewer).unwrap();
+    let team = db.isolation_authority_snapshot(None, "team").unwrap();
+    assert_eq!((team.personal_owner, team.agent_member_count), (None, 2));
+    assert!(db.bind_agent(&other.id, "sales", AccessLevel::Owner).is_err());
+    assert_eq!(db.isolation_authority_snapshot(None, "sales").unwrap().agent_member_count, 1);
+
+    // An unreadable mirror is unavailable, never "not Personal".
+    db.conn().execute_batch("DROP TABLE isolation_personal_agents").unwrap();
+    assert!(db.isolation_authority_snapshot(None, "sales").is_err());
+    assert!(db.isolation_authority_snapshot(Some(&user), "team").is_err());
+}
+
+#[test]
 fn isolation_authority_legacy_initialization_enables_standalone_policy_fence() {
     let (home, db, _) = fixture();
     db.conn().execute("DELETE FROM auth_meta WHERE key IN (?1,?2)",
