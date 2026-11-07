@@ -89,6 +89,11 @@ pub(super) async fn authorize_current(agent_dir: &Path, principal_context: Optio
         reply_channel: crate::claude_runner::REPLY_CHANNEL.try_with(Clone::clone).ok(),
         reply_sender: crate::claude_runner::REPLY_SENDER.try_with(Clone::clone).ok(),
         user_message: crate::memory_provenance::TURN_USER_MESSAGE.try_with(Clone::clone).ok().flatten(),
+        ingress: Some(match &human.source {
+            Source::Web(_) => crate::isolation_egress::IngressRequester::Dashboard,
+            Source::Channel { channel, sender } => crate::isolation_egress::IngressRequester::Channel {
+                channel: channel.clone(), sender: sender.clone() },
+        }),
         ..crate::isolation_egress::RunMetadata::root()
     };
     let lane = if crate::explore_lane::in_explore() { duduclaw_isolation::capability::Lane::Explore }
