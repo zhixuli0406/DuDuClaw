@@ -10,6 +10,8 @@
 // network call, so bridged data cannot be exfiltrated anywhere.
 
 import { api } from '@/lib/api';
+import { selectVisibleAgents } from '@/lib/data-scope';
+import { callableSubject, useCallableAgentsStore } from '@/stores/callable-agents-store';
 
 /** Messages the iframe sends up. */
 interface RpcRequest {
@@ -34,9 +36,16 @@ const RATE_LIMIT_PER_SECOND = 10;
  */
 const BRIDGE_METHODS: Record<string, () => Promise<unknown>> = {
   'agents.summary': async () => {
-    const r = await api.agents.list();
+    const subject = callableSubject();
+    const key = JSON.stringify([subject, null]);
+    const [r] = await Promise.all([api.agents.list(),
+      useCallableAgentsStore.getState().load(key)]);
+    const entry = useCallableAgentsStore.getState().entries[key];
+    const grants = entry?.agents ?? null;
+    const unrestricted = entry?.unrestricted === true;
+    const agents = subject === callableSubject() ? selectVisibleAgents(r.agents, grants, unrestricted) : [];
     return {
-      agents: r.agents.map((a) => ({
+      agents: agents.map((a) => ({
         name: a.name,
         display_name: a.display_name,
         role: a.role,
@@ -152,7 +161,9 @@ export async function handleWidgetMessage(
     return { seq: msg.seq, ok: false, error: `method '${msg.method}' is not allowed` };
   }
   try {
-    const result = await callCached(msg.method, proxy);
+    // Agent visibility is re-projected on every request; a cached projection
+    // must not outlive an identity change or a pending/failed grant refresh.
+    const result = await (msg.method === 'agents.summary' ? proxy() : callCached(msg.method, proxy));
     return { seq: msg.seq, ok: true, result };
   } catch (e) {
     return { seq: msg.seq, ok: false, error: e instanceof Error ? e.message : String(e) };

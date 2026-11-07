@@ -1,4 +1,5 @@
 {
+  "agent.selection.revoked": "This AI employee is no longer available. Please select again.",
   "settings.update.failure.download": "Unable to download the update. Check your connection and check for updates again.",
   "settings.update.failure.verify": "Update verification failed; installation was stopped. Download the official release again.",
   "settings.update.failure.extract": "Unable to extract the update. Download the official release again.",
@@ -2597,6 +2598,7 @@
   "webchat.reconnectExhausted": "Unable to connect. Automatic retries have stopped. Your draft is kept; reconnect to send it.",
   "webchat.draftKept": "Your draft is kept. You can send it when the connection returns.",
   "webchat.notSent": "Message not sent. Reconnect and try again.",
+  "webchat.agentAccessPending": "We cannot confirm your access to this AI staff member right now. Permissions are being refreshed. Please try again shortly.",
   "webchat.interrupted": "The connection was interrupted and the reply cannot be confirmed yet. The AI may still be working. We will try to recover the reply after reconnecting; please avoid sending it again for now.",
   "webchat.reset": "New conversation",
   "webchat.welcome": "Hi! How can I help you today?",

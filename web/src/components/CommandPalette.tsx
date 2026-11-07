@@ -1,3 +1,4 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
 import { TASK_ENTRY_POINTS_HIDDEN, isTaskEntryVisible } from '@/lib/task-entry-visibility';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -26,7 +27,7 @@ import { isImeComposing } from '@/lib/keyboard';
 import { fuzzyMatch, highlightSegments } from '@/lib/fuzzy';
 import { api, type SearchHit } from '@/lib/api';
 import { looksLikeIdQuery, findIdMatch, idMatchRoute } from '@/lib/id-lookup';
-import { useDataScope, useVisibleAgents } from '@/lib/data-scope';
+import { useDataScope, useSelectableAgents } from '@/lib/data-scope';
 import {
   allManageNav,
   employeeNavItems,
@@ -50,7 +51,6 @@ import { useDecisionEnabled } from '@/hooks/useDecisionEnabled';
 import { CharacterAvatar } from '@/components/character';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useSystemStore } from '@/stores/system-store';
-import { useAgentsStore } from '@/stores/agents-store';
 import { useConversationsStore } from '@/stores/conversations-store';
 import { useTasksStore } from '@/stores/tasks-store';
 import { useAuthStore } from '@/stores/auth-store';
@@ -233,7 +233,7 @@ export function CommandPalette() {
   const status = useSystemStore((s) => s.status);
   const user = useAuthStore((s) => s.user);
   const bindings = useAuthStore((s) => s.bindings);
-  const agents = useAgentsStore((s) => s.agents);
+  const agents = useSelectableAgents(true, undefined, open);
   const tasks = useTasksStore((s) => s.tasks);
   const logout = useAuthStore((s) => s.logout);
   // I-5: content search scoping — mirrors FilesPage's convention. Admins
@@ -243,7 +243,7 @@ export function CommandPalette() {
   // other role must supply one, so this defaults to the first agent the
   // viewer can see.
   const dataScope = useDataScope();
-  const visibleAgentsForSearch = useVisibleAgents(false);
+  const visibleAgentsForSearch = useSelectableAgents(false, undefined, open);
   const searchAgentId = visibleAgentsForSearch[0]?.name;
   // Operator/owner binding gates sensitive `operatorOnly` commands (fail-closed).
   const hasOperatorAccess = bindings.some(
@@ -417,13 +417,13 @@ export function CommandPalette() {
       icon: Bot,
       avatarAgentId: a.name,
       route: `/agents/${a.name}`,
-      perform: () => navigate(`/agents/${encodeURIComponent(a.name)}`),
+      perform: () => { if (canSelectAgent(a.name)) navigate(`/agents/${encodeURIComponent(a.name)}`); },
     }));
 
     // Profile files per employee: people search for the industry names
     // (agent.md / agents.md), so each employee gets one "profile files" row
     // whose keywords carry them.
-    const agentFileCommands: Command[] = agents.map((a) => ({
+    const agentFileCommands: Command[] = visibleAgentsForSearch.map((a) => ({
       id: `entity:agent-files:${a.name}`,
       groupLabel: t('cmdk.group.agents'),
       groupRoute: staffEntry.to,
@@ -432,7 +432,7 @@ export function CommandPalette() {
       keywords: `${t('cmdk.agentFiles.keywords')} ${a.name}`,
       icon: FileText,
       route: `/agents/${a.name}/files`,
-      perform: () => navigate(`/agents/${encodeURIComponent(a.name)}/files`),
+      perform: () => { if (canSelectAgent(a.name)) navigate(`/agents/${encodeURIComponent(a.name)}/files`); },
     }));
 
     // Entity search (T1.5) — jump to a task detail by fuzzy title (CJK-safe via
@@ -484,7 +484,7 @@ export function CommandPalette() {
         }];
 
     return [...navCommands, ...manageCommands, ...agentCommands, ...agentFileCommands, ...taskCommands, ...themeActions, ...localeActions, ...logoutAction];
-  }, [t, user?.role, hasOperatorAccess, forksExist, isAppliance, decisionEnabled, agents, tasks, isPersonal, navigate, setTheme, setLocale, logout]);
+  }, [t, user?.role, hasOperatorAccess, forksExist, isAppliance, decisionEnabled, agents, tasks, isPersonal, navigate, setTheme, setLocale, logout, visibleAgentsForSearch]);
 
   // Empty query → recent routes first, then all commands in natural order.
   const results = useMemo<ScoredCommand[]>(() => {

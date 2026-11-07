@@ -1,3 +1,5 @@
+// Register the transport authorizer before any page can issue a mutation.
+import './stores/callable-agents-store';
 import { StrictMode, useEffect, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { IntlProvider } from 'react-intl';

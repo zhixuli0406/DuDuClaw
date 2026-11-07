@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import { mockWsClient } from '@/test/mocks';
@@ -8,6 +9,7 @@ const AGENT = { name: 'agent-1', display_name: 'Agent One' };
 const PAGE = { path: 'notes/one.md', title: 'One', updated: '2026-08-01T00:00:00Z', tags: ['t'] };
 
 beforeEach(() => {
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
   vi.clearAllMocks();
   mockWsClient.call.mockImplementation((method: string) => {
     switch (method) {
@@ -59,3 +61,8 @@ describe('KnowledgeHubPage — topic map click opens the page (UX audit §2-5)',
     });
   });
 });
+
+import { useAuthStore } from '@/stores/auth-store';
+
+// Start these component scenarios after the gateway confirmed the admin roster.
+beforeEach(() => setConfirmedCallableAgents(true));

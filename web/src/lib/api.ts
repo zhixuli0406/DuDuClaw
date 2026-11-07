@@ -6375,6 +6375,7 @@ export const api = {
     callable: (sessionId?: string | null) =>
       client.call('agents.callable', sessionId ? { session_id: sessionId } : {}) as Promise<{
         agents: CallableAgent[];
+        unrestricted: boolean;
         default_agent: string | null;
       }>,
     status: (agentId: string) =>

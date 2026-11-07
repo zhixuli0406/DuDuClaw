@@ -1,3 +1,5 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { RecentSkillChips } from '@/components/skills/RecentSkillChips';
 import { useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -71,7 +73,7 @@ export function ComplexAssignTab({
   const intl = useIntl();
   const navigate = useNavigate();
 
-  const agents = useAgentsStore((s) => s.agents);
+  const agents = useSelectableAgents(false);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
   const loaded = useAgentsStore((s) => s.loaded);
 
@@ -115,7 +117,7 @@ export function ComplexAssignTab({
   }, [defaultAgentId]);
 
   const goalText = description.trim();
-  const canSubmit = goalText.length > 0 && (mode === 'ask' || agentId.length > 0);
+  const canSubmit = goalText.length > 0 && (mode === 'ask' || agents.some(a => a.name === agentId));
 
   /**
    * Acceptance criteria actually sent. The output format is appended as one
@@ -215,7 +217,7 @@ export function ComplexAssignTab({
   };
 
   const handleSubmit = () => {
-    if (!canSubmit || submitting) return;
+    if (!canSubmit || submitting || (agentId && !canSelectAgent(agentId))) return;
     if (mode === 'ask') submitAsk();
     else void submitAssign(mode === 'plan');
   };

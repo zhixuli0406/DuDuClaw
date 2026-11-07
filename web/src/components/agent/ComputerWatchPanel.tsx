@@ -1,3 +1,4 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Eye, Square } from 'lucide-react';
@@ -95,7 +96,7 @@ export function ComputerWatchPanel({ agentId, expectedSession, onExpired }: {
   }, [agentId, expectedSession, onExpired]);
 
   const stop = async () => {
-    if (!confirm || confirm !== status?.session_id || stopping) return;
+    if (!confirm || confirm !== status?.session_id || stopping || !canSelectAgent(agentId)) return;
     const current = epoch.current;
     const expected = confirm;
     setStopping(true);

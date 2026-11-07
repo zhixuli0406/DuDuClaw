@@ -1,3 +1,5 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { Download, Share2, CheckCircle } from 'lucide-react';
@@ -29,11 +31,15 @@ const SHARED_SORTS: readonly SkillSortKey[] = ['name', 'mostUsed', 'recentlyAdde
 /** Team (shared) skills: search across name, description and tags; sortable. */
 export function SharedSkillsTab({ filter }: { filter: string }) {
   const intl = useIntl();
-  const { agents, fetchAgents } = useAgentsStore();
+  const { fetchAgents } = useAgentsStore();
   const [sharedSkills, setSharedSkills] = useState<SharedSkillInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [adoptTarget, setAdoptTarget] = useState<SharedSkillInfo | null>(null);
+  const agents = useSelectableAgents(false, undefined, adoptTarget !== null);
   const [adoptAgent, setAdoptAgent] = useState('');
+  useEffect(() => {
+    if (adoptAgent && !agents.some(a => a.name === adoptAgent)) setAdoptAgent('');
+  }, [adoptAgent, agents]);
   const [adoptSuccess, setAdoptSuccess] = useState<string | null>(null);
   const [sort, setSort] = useSkillSort('shared');
 
@@ -75,7 +81,7 @@ export function SharedSkillsTab({ filter }: { filter: string }) {
   }, [sharedSkills, filter, sort, intl.locale]);
 
   const handleAdopt = useCallback(async () => {
-    if (!adoptTarget || !adoptAgent) return;
+    if (!adoptTarget || !adoptAgent || !canSelectAgent(adoptAgent)) return;
     try {
       await api.sharedSkills.adopt(adoptTarget.name, adoptAgent);
       setAdoptSuccess(intl.formatMessage({ id: 'skills.shared.adoptSuccess' }, { agent: adoptAgent }));

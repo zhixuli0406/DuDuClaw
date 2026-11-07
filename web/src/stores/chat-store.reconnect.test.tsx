@@ -6,6 +6,7 @@ import { WebChatPage } from '@/pages/WebChatPage';
 import { api, type ChatSessionHistory } from '@/lib/api';
 import { toast } from '@/lib/toast';
 import { useChatStore } from './chat-store';
+import { callableSubject, useCallableAgentsStore } from './callable-agents-store';
 import { useAuthStore } from './auth-store';
 import { useAgentsStore } from './agents-store';
 import { useConversationsStore } from './conversations-store';
@@ -57,6 +58,12 @@ beforeEach(() => {
   useChatStore.getState().connect();
   current().open();
   hello(current(), 'webchat:old');
+  // Explicit chat routes require a confirmed session-scoped grant before sending.
+  useCallableAgentsStore.setState({ entries: Object.fromEntries(
+    ['webchat:old', 'webchat:new', saved.session_id].map(session => [JSON.stringify([callableSubject(), session]), {
+      agents: [{ name: 'sales', display_name: 'Sales', call_text: '@sales', via: 'binding' as const, level: 'operator' as const, selectable: true, assignable: true }], unrestricted: false, loading: false, confirmedAt: Date.now(),
+    }]),
+  ) });
 });
 afterEach(() => {
   cleanup();
@@ -559,7 +566,7 @@ it('reports a synchronous socket send failure without creating a phantom running
 });
 
 
-it('RM-122 continues a completed conversation after reconnect hello changes the connection session id', () => {
+it('RM-122 continues a completed conversation after reconnect hello changes the connection session id', async () => {
   const firstSocket = current();
   expect(useChatStore.getState().sessionId).toBe('webchat:old');
   expect(useChatStore.getState().send('First question')).toBe(true);
@@ -574,14 +581,19 @@ it('RM-122 continues a completed conversation after reconnect hello changes the 
   expect(useChatStore.getState().isStreaming).toBe(false);
   expect(useChatStore.getState().acceptedSessionId).toBe(conversationSessionId);
 
-  renderWithProviders(<WebChatPage />);
+  vi.spyOn(api.agents, 'callable').mockResolvedValue({
+    agents: [{ name: 'sales', display_name: 'Sales', call_text: '@Sales', via: 'binding', level: 'operator', selectable: true, assignable: true }],
+    unrestricted: false, default_agent: null,
+  });
+  // The page refreshes grants for the conversation; wait for confirmation before sending.
+  await act(async () => { renderWithProviders(<WebChatPage />); });
   expect(screen.getByText('First question')).toBeVisible();
   expect(screen.getByText('First answer')).toBeVisible();
   act(() => firstSocket.close());
   act(() => vi.advanceTimersByTime(1_000));
   const next = current();
   expect(next).not.toBe(firstSocket);
-  act(() => { next.open(); hello(next, 'webchat:new'); });
+  await act(async () => { next.open(); hello(next, 'webchat:new'); });
   expect(useChatStore.getState().ownSessionId).toBe('webchat:new');
   expect(next.sent.at(-1)).toEqual({ type: 'subscribe', session_id: conversationSessionId, conv: first.conv });
 

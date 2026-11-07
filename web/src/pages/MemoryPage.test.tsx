@@ -57,6 +57,8 @@ describe('MemoryPage', () => {
   it('evolution tab surfaces stagnation health and the playbook section for the selected agent', async () => {
     mockWsClient.call.mockImplementation((method: unknown) => {
       switch (method) {
+        case 'agents.callable':
+          return Promise.resolve({ agents: [{ name: 'agent-a', via: 'binding', selectable: true }] });
         case 'agents.list':
           return Promise.resolve({ agents: [{ name: 'agent-a', display_name: 'Agent A' }] });
         case 'evolution.status':
@@ -109,6 +111,8 @@ describe('MemoryPage', () => {
   it('experience rule cards lead with plain language and keep the raw wording collapsed', async () => {
     mockWsClient.call.mockImplementation((method: unknown) => {
       switch (method) {
+        case 'agents.callable':
+          return Promise.resolve({ agents: [{ name: 'agent-a', via: 'binding', selectable: true }] });
         case 'agents.list':
           return Promise.resolve({ agents: [{ name: 'agent-a', display_name: 'Agent A' }] });
         case 'evolution.status':
@@ -172,6 +176,8 @@ describe('MemoryPage', () => {
   it('falls back to the raw wording, clearly labelled, when it cannot be rephrased', async () => {
     mockWsClient.call.mockImplementation((method: unknown) => {
       switch (method) {
+        case 'agents.callable':
+          return Promise.resolve({ agents: [{ name: 'agent-a', via: 'binding', selectable: true }] });
         case 'agents.list':
           return Promise.resolve({ agents: [{ name: 'agent-a', display_name: 'Agent A' }] });
         case 'evolution.status':

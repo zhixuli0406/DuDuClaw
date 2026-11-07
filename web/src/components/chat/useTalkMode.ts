@@ -283,6 +283,7 @@ export function useTalkMode(opts: {
           return;
         }
         const store = useChatStore.getState();
+        // Re-check current grants in send() after the STT await, even during a running turn.
         const sent = store.send(text); // normal user message through the normal send path
         if (sent === false || !useChatStore.getState().isStreaming) {
           // A refused send has no reply to wait for, even if an older turn runs.

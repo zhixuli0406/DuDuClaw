@@ -13,6 +13,7 @@ function jsonResponse(body: unknown) {
 }
 
 beforeEach(() => {
+  vi.spyOn(api.agents, 'callable').mockImplementation(async () => ({ agents: AGENTS.map(a => ({ ...a, via: 'binding', selectable: true })), default_agent: null }) as never);
   vi.clearAllMocks();
   // Scoped viewers need a direct binding; team visibility does not grant files.
   useAuthStore.setState({
@@ -84,7 +85,7 @@ describe('<FilesPage> — I-4 search / task / date filters', () => {
   it('shows the honest "no files at all" empty state when nothing has ever landed', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ files: [] })));
     renderWithProviders(<FilesPage />);
-    expect(await screen.findByText('No files yet')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('No files yet')).toBeInTheDocument());
   });
 
   it('shows the "filters matched nothing" empty state (not the generic one) once a search is active', async () => {
@@ -123,7 +124,7 @@ describe('<FilesPage> — I-4 search / task / date filters', () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
     renderWithProviders(<FilesPage />);
-    expect(await screen.findByText('No files yet')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('No files yet')).toBeInTheDocument());
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -135,7 +136,7 @@ describe('<FilesPage> — I-4 search / task / date filters', () => {
     expect(screen.queryByText('No files yet')).not.toBeInTheDocument();
 
     act(() => useAgentsStore.setState({ loaded: true }));
-    expect(await screen.findByText('No files yet')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('No files yet')).toBeInTheDocument());
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -164,3 +165,5 @@ describe('<FilesPage> — I-4 search / task / date filters', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });
+
+import { api } from '@/lib/api';

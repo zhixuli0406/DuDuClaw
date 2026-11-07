@@ -1,3 +1,4 @@
+import { withAgentRequestAllowed } from './agent-request-guard';
 import { client } from './ws-client';
 import { useAuthStore } from '@/stores/auth-store';
 
@@ -27,14 +28,16 @@ export async function callTaskRpc<T>(
   if (!attachments || attachments.length === 0) {
     return client.call(method, rest) as Promise<T>;
   }
-  const jwt = useAuthStore.getState().jwt;
-  const res = await fetch(TASK_RPC_PATH, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(jwt ? { Authorization: `Bearer ${jwt}` } : {}),
-    },
-    body: JSON.stringify({ method, params: { ...rest, attachments } }),
+  const res = await withAgentRequestAllowed(method, params, () => {
+    const jwt = useAuthStore.getState().jwt;
+    return fetch(TASK_RPC_PATH, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(jwt ? { Authorization: `Bearer ${jwt}` } : {}),
+      },
+      body: JSON.stringify({ method, params: { ...rest, attachments } }),
+    });
   });
   type Frame = { ok?: boolean; payload?: unknown; error?: unknown };
   const body: Frame | null = await res.json().then(

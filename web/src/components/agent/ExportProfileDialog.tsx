@@ -1,3 +1,4 @@
+import { canSelectAgent, useSelectableCallableAgents } from '@/stores/callable-agents-store';
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type AgentProfileExport, type AgentProfileFormat } from '@/lib/api';
@@ -25,7 +26,9 @@ export function ExportProfileDialog({ agentId, onClose }: { agentId: string; onC
   const [result, setResult] = useState<AgentProfileExport | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  useSelectableCallableAgents();
   const prepare = async () => {
+    if (!canSelectAgent(agentId)) return;
     setBusy(true);
     setError(null);
     setResult(null);

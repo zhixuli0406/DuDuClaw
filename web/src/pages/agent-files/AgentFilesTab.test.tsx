@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -20,6 +21,7 @@ function loginAs(role: Role) {
     user: { id: 'u1', email: 'u@example.invalid', display_name: 'U', role: role === 'admin' ? 'admin' : 'employee', status: 'active' },
     bindings: role === 'admin' ? [] : [{ user_id: 'u1', agent_name: 'a1', access_level: role, bound_at: '' }],
   } as never);
+  setConfirmedCallableAgents(true);
 }
 
 function entry(file: string, over: Partial<AgentFileListEntry> = {}): AgentFileListEntry {

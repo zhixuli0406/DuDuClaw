@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { canSelectAgent, useAgentGrantPresent } from '@/stores/callable-agents-store';
+import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import {
   Button,
@@ -43,12 +44,17 @@ export function CreateOwnDialog({
   const [sensitivity, setSensitivity] = useState<KbSensitivity>('internal');
   const [share, setShare] = useState(true);
   const [busy, setBusy] = useState(false);
+  const selectable = useAgentGrantPresent(agentId);
+  useEffect(() => {
+    if (!selectable) onClose();
+  }, [selectable, onClose]);
 
   const submit = async () => {
+    if (!canSelectAgent(agentId)) return;
     setBusy(true);
     try {
       const r = await knowledgeApi.ensureOwnCollection(agentId, { sensitivity, shareChatUsers: share });
-      onReady(r.collection, r.binding_changed);
+      if (canSelectAgent(agentId)) onReady(r.collection, r.binding_changed);
     } catch (e) {
       toast.error(formatError(e));
     } finally {
@@ -59,7 +65,7 @@ export function CreateOwnDialog({
   const names = defaults.map((d) => d.label);
 
   return (
-    <Dialog open onOpenChange={(o) => !o && onClose()}>
+    <Dialog open={selectable} onOpenChange={(o) => !o && onClose()}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>{t('agentSources.create.title')}</DialogTitle>

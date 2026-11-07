@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
@@ -14,6 +15,7 @@ const panel = (id = 'alice') => <IntlProvider locale="en" messages={en}><Compute
 
 beforeEach(() => {
   mockWsClient.call.mockReset();
+  setConfirmedCallableAgents(true);
   mockWsClient.call.mockImplementation(async (method: string) => method === 'computer_sessions.status' ? ACTIVE : SNAPSHOT);
 });
 

@@ -1,3 +1,4 @@
+import { canSelectAgent, useAgentGrantPresent } from '@/stores/callable-agents-store';
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { ExternalLink, Trash2 } from 'lucide-react';
@@ -42,6 +43,10 @@ export function AgentOwnChannelsSection({ agentId }: { agentId: string }) {
   const [hidden, setHidden] = useState(false);
   const [removing, setRemoving] = useState<Removing>(null);
   const [busy, setBusy] = useState(false);
+  const selectable = useAgentGrantPresent(agentId);
+  useEffect(() => {
+    if (!selectable) setRemoving(null);
+  }, [selectable, agentId]);
 
   const load = useCallback(async () => {
     try {
@@ -58,7 +63,7 @@ export function AgentOwnChannelsSection({ agentId }: { agentId: string }) {
   }, [load]);
 
   const remove = async () => {
-    if (!removing) return;
+    if (!removing || !canSelectAgent(agentId)) return;
     setBusy(true);
     try {
       if (removing === 'telegram') await api.channels.agentTelegramRemove(agentId);
@@ -73,7 +78,7 @@ export function AgentOwnChannelsSection({ agentId }: { agentId: string }) {
     }
   };
 
-  if (hidden || !data) return null;
+  if (hidden || !data || !selectable) return null;
   return (
     <SettingsSection title={t('agentChannels.title')} description={t('agentChannels.desc')}>
       <TelegramCard data={data.telegram} agentId={agentId} onChanged={load} onRemove={() => setRemoving('telegram')} />
@@ -136,7 +141,7 @@ function TelegramCard({
   const [saving, setSaving] = useState(false);
 
   const save = async () => {
-    if (!token.trim()) return;
+    if (!token.trim() || !canSelectAgent(agentId)) return;
     setSaving(true);
     try {
       const r = await api.channels.agentTelegramSet(agentId, token.trim());
@@ -231,7 +236,7 @@ function GoogleChatCard({
   useEffect(() => setProject(data.project_number ?? ''), [data.project_number]);
 
   const save = async () => {
-    if (!project.trim()) return;
+    if (!project.trim() || !canSelectAgent(agentId)) return;
     setSaving(true);
     try {
       const r = await api.channels.agentGoogleChatSet(agentId, project.trim(), keyJson, connection, subscription.trim());

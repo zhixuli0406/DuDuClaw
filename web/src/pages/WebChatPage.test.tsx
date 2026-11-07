@@ -23,6 +23,10 @@ beforeEach(() => {
   useBrandStore.getState().setBrand(null);
   useAuthStore.setState({ user: { id: 'admin', display_name: 'Boss', role: 'admin' } as never, bindings: [] });
   useSystemStore.setState({ status: null });
+  vi.spyOn(api.agents, 'callable').mockImplementation(async () => ({
+    agents: useAgentsStore.getState().agents.map(a => ({ ...a, via: 'admin', selectable: true, assignable: true, call_text: `@${a.display_name}` })),
+    unrestricted: true, default_agent: null,
+  }) as never);
   useConversationsStore.setState({ viewOnly: false });
   useChatStore.setState({
     messages: [],
@@ -59,11 +63,11 @@ describe('WebChatPage', () => {
     send.mockRestore();
   });
 
-  it('uses the verified product name for the default partner header and heading', () => {
+  it('uses the verified product name for the default partner header and heading', async () => {
     useBrandStore.getState().setBrand({ product_name: '晨光智能', logo_light: 'data:image/png;base64,iVBORw0KGgo=' });
     useChatStore.setState({ selectedAgentId: null, agentName: 'DuDuClaw' });
     renderWithProviders(<WebChatPage />);
-    expect(screen.getByRole('heading', { name: '晨光智能' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '晨光智能' })).toBeInTheDocument();
     expect(screen.getAllByText('晨光智能')).toHaveLength(2);
     expect(screen.queryByText('DuDuClaw')).not.toBeInTheDocument();
   });
@@ -72,11 +76,11 @@ describe('WebChatPage', () => {
     useChatStore.setState({ selectedAgentId: 'sales', sessionId: null });
     useAgentsStore.setState({ loaded: true, agents: [{ name: 'sales', display_name: 'Sales', role: 'specialist', status: 'active' }] as never });
     const sales = { name: 'sales', display_name: 'Sales', call_text: '@Sales', role: 'specialist', status: 'active', via: 'binding' as const, level: 'operator' as const, assignable: true, selectable: true, manager_may_read: true };
-    const callable = vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [sales], default_agent: null });
+    const callable = vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [sales], unrestricted: true, default_agent: null });
     renderWithProviders(<WebChatPage />);
     const notice = await screen.findByRole('link', { name: 'Your manager can read your conversations with this AI staff member (read-only).' });
     expect(notice).toHaveAttribute('href', expect.stringContaining('68-manager-team-history.md'));
-    callable.mockResolvedValue({ agents: [{ ...sales, manager_may_read: false }], default_agent: null });
+    callable.mockResolvedValue({ agents: [{ ...sales, manager_may_read: false }], unrestricted: true, default_agent: null });
     fireEvent(window, new Event('focus'));
     await waitFor(() => expect(screen.queryByRole('link', { name: /Your manager can read/ })).not.toBeInTheDocument());
   });
@@ -135,12 +139,13 @@ describe('WebChatPage', () => {
     expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument();
   });
 
-  it('does not send on Enter while a CJK IME is composing, but sends on a plain Enter', () => {
+  it('does not send on Enter while a CJK IME is composing, but sends on a plain Enter', async () => {
     const send = vi.fn();
     useChatStore.setState({ send: send as never, isStreaming: false, connectionState: 'connected' as never });
 
     renderWithProviders(<WebChatPage />);
     const input = screen.getByPlaceholderText(/message/i) as HTMLTextAreaElement;
+    await waitFor(() => expect(input).toBeEnabled());
     fireEvent.change(input, { target: { value: '你好' } });
 
     // Composing Enter — Chrome/Firefox signal (nativeEvent.isComposing).
@@ -204,7 +209,7 @@ describe('WebChatPage', () => {
     expect(input).toHaveValue('Test message');
   });
 
-  it('typing @ lists the callable AI staff and Enter inserts the picked name', () => {
+  it('typing @ lists the callable AI staff and Enter inserts the picked name', async () => {
     const send = vi.fn();
     useChatStore.setState({ send: send as never, isStreaming: false, connectionState: 'connected' as never });
     useAgentsStore.setState({
@@ -217,10 +222,10 @@ describe('WebChatPage', () => {
     renderWithProviders(<WebChatPage />);
     const input = screen.getByPlaceholderText(/message/i) as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: '@財', selectionStart: 2 } });
-    const list = screen.getByRole('listbox');
+    const list = await screen.findByRole('listbox');
     expect(list).toBeInTheDocument();
     expect(screen.getByRole('combobox')).toHaveAttribute('aria-expanded', 'true');
-    const options = screen.getAllByRole('option');
+    const options = await screen.findAllByRole('option');
     expect(options).toHaveLength(1);
     expect(options[0]).toHaveTextContent('財務小幫手');
     expect(input).toHaveAttribute('aria-activedescendant', options[0].id);
@@ -233,14 +238,14 @@ describe('WebChatPage', () => {
 
     // Escape closes the list for a bare @.
     fireEvent.change(input, { target: { value: '@', selectionStart: 1 } });
-    expect(screen.getAllByRole('option')).toHaveLength(2);
+    expect(await screen.findAllByRole('option')).toHaveLength(2);
     fireEvent.keyDown(input, { key: 'Escape' });
     expect(screen.queryByRole('listbox')).toBeNull();
   });
 
   it('lists what agents.callable returns, grouped mine / team / public, and inserts the server call text', async () => {
     const callable = vi.spyOn(api.agents, 'callable').mockResolvedValue({
-      default_agent: 'dudu',
+      unrestricted: true, default_agent: 'dudu',
       agents: [
         { name: 'dudu', display_name: '嘟嘟總機', call_text: '@嘟嘟總機', role: 'main', status: 'active', via: 'default', level: null, assignable: false, selectable: false },
         { name: 'faq', display_name: '常見問題', call_text: '@常見問題', role: 'specialist', status: 'active', via: 'public', level: null, assignable: false, selectable: false },
@@ -278,7 +283,7 @@ describe('WebChatPage', () => {
 
   it('after /交辦 the @ list offers only staff who can take a task', async () => {
     const callable = vi.spyOn(api.agents, 'callable').mockResolvedValue({
-      default_agent: 'dudu',
+      unrestricted: true, default_agent: 'dudu',
       agents: [
         { name: 'dudu', display_name: '嘟嘟總機', call_text: '@嘟嘟總機', role: 'main', status: 'active', via: 'default', level: null, assignable: false, selectable: false },
         { name: 'hr', display_name: '人資助理', call_text: '@人資助理', role: 'specialist', status: 'active', via: 'team', via_user: 'u2', via_user_name: '林小華', depth: 1, level: 'viewer', assignable: false, selectable: true },
@@ -361,13 +366,13 @@ it('preserves the composer draft during history refresh and window focus', async
 });
 
 
-it('keeps the composer and Send enabled during streaming, with a separate Stop control', () => {
+it('keeps the composer and Send enabled during streaming, with a separate Stop control', async () => {
   const send = vi.fn();
   const cancel = vi.fn();
   useChatStore.setState({ send, cancel, isStreaming: true, activeMessageId: 'running', connectionState: 'connected' });
   renderWithProviders(<WebChatPage />);
   const input = screen.getByPlaceholderText(/message/i);
-  expect(input).toBeEnabled();
+  await waitFor(() => expect(input).toBeEnabled());
   fireEvent.change(input, { target: { value: 'follow-up' } });
   expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled();
   fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
@@ -403,7 +408,7 @@ describe('server-resolved non-admin chat', () => {
     useAuthStore.setState({ user: { id: 'viewer', display_name: 'Viewer', role } as never });
     useAgentsStore.setState({ loaded: true, agents: [{ name: 'main', display_name: 'Main', role: 'main' }, sales] as never });
     useChatStore.setState({ selectedAgentId: 'main', resolvedAgent: { id: 'sales', name: 'Sales', icon: '🐦' }, connectionState: 'connected' });
-    vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [sales], default_agent: null } as never);
+    vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [sales], unrestricted: false, default_agent: null } as never);
   }
   it.each(['employee', 'manager'] as const)('hides all partner chips for %s and scopes history to the server assignment', async role => {
     assigned(role);
@@ -416,14 +421,16 @@ describe('server-resolved non-admin chat', () => {
   it('preserves the partner chips for admins', async () => {
     assigned();
     useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never });
+    vi.mocked(api.agents.callable).mockResolvedValue({ agents: [sales as never], unrestricted: true, default_agent: null });
     renderWithProviders(<WebChatPage />);
     expect(await screen.findByRole('radio', { name: /Sales/ })).toBeInTheDocument();
   });
-  it('preserves Personal edition partner chips', async () => {
+  it('does not grant Personal edition members unrestricted partner chips', async () => {
     assigned();
     useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
     renderWithProviders(<WebChatPage />);
-    expect(await screen.findByRole('radio', { name: /Sales/ })).toBeInTheDocument();
+    await act(async () => {});
+    expect(screen.queryByRole('radio')).not.toBeInTheDocument();
   });
   it('shows an actionable unassigned state and disables the composer', () => {
     assigned();
@@ -446,11 +453,11 @@ describe('server-resolved non-admin chat', () => {
     expect(screen.getByText(en['webchat.assignment.unavailable'])).toBeInTheDocument();
     expect(screen.queryByText(en['webchat.assignment.none'])).not.toBeInTheDocument();
   });
-  it('keeps the historical main identity in the header instead of the current primary', () => {
+  it('hides an unavailable historical main selection', () => {
     assigned();
     useChatStore.setState({ resumedExplicitly: true, selectedAgentId: 'main', agentName: 'Main' });
     renderWithProviders(<WebChatPage />);
-    expect(screen.getByRole('heading', { name: 'Main' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Main' })).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Sales' })).not.toBeInTheDocument();
   });
   it('ignores a main-agent URL preselection', () => {
@@ -487,9 +494,9 @@ describe('WebChatPage primary preference', () => {
     renderWithProviders(<WebChatPage />);
     expect(useChatStore.getState().selectedAgentId).toBe('history-staff');
   });
-  it('does not replace an explicit partner with the account default', () => {
+  it('does not replace an explicit partner with the account default', async () => {
     render(<IntlProvider messages={en} locale="en"><MemoryRouter initialEntries={['/chat?agent=other']}><WebChatPage /></MemoryRouter></IntlProvider>);
-    expect(useChatStore.getState().selectedAgentId).toBe('other');
+    await waitFor(() => expect(useChatStore.getState().selectedAgentId).toBe('other'));
   });
   it('restores the primary when starting another new conversation', () => {
     useChatStore.setState({ selectedAgentId: 'other', resumedExplicitly: true, messages: [{ id: 'past', role: 'user', content: 'Old question', timestamp: 0 }] });
@@ -506,6 +513,27 @@ describe('WebChatPage primary preference', () => {
     renderWithProviders(<WebChatPage />);
     expect(select).not.toHaveBeenCalled();
   });
+});
+
+it('drops a revoked prefilled mention before sending the handoff draft', async () => {
+  useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never });
+  useAgentsStore.setState({ loaded: true, agents: [{ name: 'sales', display_name: 'Sales', status: 'active' }] as never });
+  useChatStore.setState({ connectionState: 'connected', selectedAgentId: null, resolvedAgent: { id: 'other', name: 'Other', icon: '' }, assignmentError: null });
+  let resolve!: (value: unknown) => void;
+  vi.spyOn(api.agents, 'callable').mockImplementation(() => new Promise(r => { resolve = r; }) as never);
+  const send = vi.spyOn(useChatStore.getState(), 'send').mockImplementation(() => true);
+  render(
+    <IntlProvider messages={en} locale="en" defaultLocale="en">
+      <MemoryRouter initialEntries={[{ pathname: '/chat', state: { draft: '@Sales prepare a quote' } }]}>
+        <WebChatPage />
+      </MemoryRouter>
+    </IntlProvider>,
+  );
+  expect(screen.getByRole('combobox')).not.toHaveValue('@Sales prepare a quote');
+  await act(async () => resolve({ agents: [], unrestricted: false, default_agent: null }));
+  await waitFor(() => expect(screen.getByRole('combobox')).toHaveValue(' prepare a quote'));
+  expect(send).not.toHaveBeenCalled();
+  send.mockRestore();
 });
 
 it('shows the initial connecting status without a reconnect banner', () => {

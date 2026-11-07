@@ -1,3 +1,4 @@
+import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, within, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -76,6 +77,7 @@ const wsHandlers = new Map<string, (payload: unknown) => void>();
 
 beforeEach(() => {
   vi.clearAllMocks();
+  setConfirmedCallableAgents(true);
   wsHandlers.clear();
   mockCalls(ENTRIES);
   mockWsClient.subscribe.mockImplementation((event: string, handler: (p: unknown) => void) => {

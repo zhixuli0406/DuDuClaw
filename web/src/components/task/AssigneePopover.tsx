@@ -1,3 +1,5 @@
+import { canSelectAgent } from '@/stores/callable-agents-store';
+import { useSelectableAgents } from '@/lib/data-scope';
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { Check } from 'lucide-react';
@@ -19,7 +21,7 @@ export interface AssigneeOption {
  * content; if omitted a default avatar+name chip renders.
  */
 export function AssigneePopover({
-  agents,
+  agents: displayAgents,
   value,
   onChange,
   children,
@@ -41,9 +43,11 @@ export function AssigneePopover({
 }) {
   const intl = useIntl();
   const [open, setOpen] = useState(false);
+  const selectable = useSelectableAgents(false, undefined, open);
+  const agents = displayAgents.filter(a => selectable.some(grant => grant.name === a.name));
   const rootRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
-  const selected = agents.find((a) => a.name === value) ?? null;
+  const selected = displayAgents.find((a) => a.name === value) ?? null;
 
   useEffect(() => {
     if (!open) return;
@@ -130,7 +134,8 @@ export function AssigneePopover({
               role="menuitemradio"
               aria-checked={a.name === value}
               onClick={() => {
-                onChange(a.name);
+                if (!canSelectAgent(a.name)) return;
+                  onChange(a.name);
                 setOpen(false);
               }}
               className={cn(

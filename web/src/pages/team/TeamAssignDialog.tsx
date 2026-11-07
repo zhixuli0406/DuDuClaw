@@ -1,3 +1,4 @@
+import { canSelectAgent, useSelectableCallableAgents } from '@/stores/callable-agents-store';
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type TeamAgent } from '@/lib/api';
@@ -35,6 +36,7 @@ export function TeamAssignDialog({
   onClose: () => void;
 }) {
   const intl = useIntl();
+  const grants = useSelectableCallableAgents();
   const [goal, setGoal] = useState('');
   const [criteria, setCriteria] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -42,6 +44,11 @@ export function TeamAssignDialog({
 
   const handleSubmit = async () => {
     if (!goalText || submitting) return;
+    if (!canSelectAgent(agent.name)) {
+      toast.error(intl.formatMessage({ id: 'agent.selection.revoked', defaultMessage: 'This AI employee is no longer available. Please select again.' }));
+      onClose();
+      return;
+    }
     setSubmitting(true);
     try {
       const { task } = await api.tasks.createGoal({
@@ -103,7 +110,7 @@ export function TeamAssignDialog({
           <Button variant="outline" onClick={onClose}>
             {intl.formatMessage({ id: 'common.cancel' })}
           </Button>
-          <Button variant="brand" onClick={handleSubmit} disabled={!goalText || submitting}>
+          <Button variant="brand" onClick={handleSubmit} disabled={!goalText || submitting || grants.loading}>
             {intl.formatMessage({ id: 'team.action.assign' })}
           </Button>
         </DialogFooter>

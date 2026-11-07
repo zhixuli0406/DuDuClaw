@@ -1,6 +1,12 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { setAgentRequestAuthorizer } from '../agent-request-guard';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('@/stores/auth-store', () => ({ useAuthStore: { getState: () => ({ jwt: 'dashboard-session' }) } }));
 import { meetingDriveApi } from './drive';
+beforeEach(() => setAgentRequestAuthorizer({
+    ensureFreshGrants: async () => {},
+    canSelectAgent: name => name === 'alice',
+    identity: () => 'meeting-test',
+  }));
 afterEach(() => vi.unstubAllGlobals());
 describe('meeting Drive dashboard API', () => {
   it('registers the exact file and employee with dashboard authentication and explicit confirmation', async () => {

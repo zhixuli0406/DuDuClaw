@@ -1,3 +1,6 @@
+import { canSelectAgent, useSelectableCallableAgents } from '@/stores/callable-agents-store';
+import { useSystemStore } from '@/stores/system-store';
+import { useVisibleAgents } from '@/lib/data-scope';
 import { chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
@@ -129,6 +132,11 @@ export function AgentDetailPage() {
   const { id } = useParams();
   const user = useAuthStore(s => s.user);
   const bindings = useAuthStore(s => s.bindings);
+  const visible = useVisibleAgents();
+  const isPersonal = useSystemStore(s => s.status?.edition_profile) === 'personal';
+  if (user?.role !== 'admin' && !isPersonal && !visible.some(a => a.name === id)) {
+    return <div role="note" className="p-6 text-sm text-muted-foreground">{intl.formatMessage({ id: 'agents.teamReadOnly' })}</div>;
+  }
   // Team access is display-only; do not mount editors or memory loaders.
   if (user?.role === 'manager' && !bindings.some(b => b.agent_name === id)) {
     return <div role="note" className="p-6 text-sm text-muted-foreground">{intl.formatMessage({ id: 'agents.teamReadOnly' })}</div>;
@@ -155,7 +163,8 @@ function AgentDetailPageContent() {
 
   const errorText = useErrorMessage();
   const connectionState = useConnectionStore((s) => s.state);
-  const { pauseAgent, resumeAgent, archiveAgent, unarchiveAgent, agents, fetchAgents } = useAgentsStore();
+  const { pauseAgent, resumeAgent, archiveAgent, unarchiveAgent, fetchAgents } = useAgentsStore();
+  const agentsForHandoff = useVisibleAgents(false);
   const setAvatarCache = useAgentAvatarStore((s) => s.set);
 
   const [detail, setDetail] = useState<AgentDetail | null>(null);
@@ -243,8 +252,11 @@ function AgentDetailPageContent() {
     goTab(next);
   };
 
+  useSelectableCallableAgents();
+
   const lifecycleAction = useCallback(
     async (fn: () => Promise<void>, successId: string) => {
+      if (!canSelectAgent(id)) return;
       setBusy(true);
       try {
         await fn();
@@ -276,6 +288,7 @@ function AgentDetailPageContent() {
       try {
         const b64 = await readFileAsBase64(file);
         const dataUri = `data:${file.type};base64,${b64}`;
+        if (!canSelectAgent(id)) return;
         await api.agents.setAvatar(id, dataUri);
         setAvatarCache(id, dataUri);
         setDetail((d) => (d ? { ...d, avatar: dataUri, has_avatar: true } : d));
@@ -292,6 +305,7 @@ function AgentDetailPageContent() {
   const handleAvatarClear = useCallback(async () => {
     setAvatarBusy(true);
     try {
+      if (!canSelectAgent(id)) return;
       await api.agents.clearAvatar(id);
       setAvatarCache(id, null);
       setDetail((d) => (d ? { ...d, avatar: null, has_avatar: false } : d));
@@ -435,7 +449,7 @@ function AgentDetailPageContent() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => navigate(`/chat?agent=${encodeURIComponent(id)}`)}
+                onClick={() => { if (canSelectAgent(id)) navigate(`/chat?agent=${encodeURIComponent(id)}`); }}
               >
                 <MessageSquare />
                 {intl.formatMessage({ id: 'agentDetail.action.chat' })}
@@ -637,7 +651,7 @@ function AgentDetailPageContent() {
       <OffboardDialog
         open={showOffboard}
         agent={detail}
-        candidates={agents.filter((a) => a.name !== id && !a.archived)}
+        candidates={agentsForHandoff.filter((a) => a.name !== id && !a.archived)}
         busy={busy}
         onClose={() => setShowOffboard(false)}
         onDone={() => {

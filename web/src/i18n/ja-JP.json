@@ -1,4 +1,5 @@
 {
+  "agent.selection.revoked": "この AI スタッフは現在利用できません。選び直してください。",
   "settings.update.failure.download": "更新をダウンロードできません。接続を確認し、更新を再確認してください。",
   "settings.update.failure.verify": "更新ファイルの検証に失敗したため、インストールを停止しました。公式版を再ダウンロードしてください。",
   "settings.update.failure.extract": "更新ファイルを展開できません。公式版を再ダウンロードしてください。",
@@ -2597,6 +2598,7 @@
   "webchat.reconnectExhausted": "接続できないため、自動再試行を停止しました。入力内容は保持されています。再接続して送信してください。",
   "webchat.draftKept": "入力内容は保持されています。接続が戻ると送信できます。",
   "webchat.notSent": "メッセージは送信されていません。再接続後にお試しください。",
+  "webchat.agentAccessPending": "この AI スタッフを利用できるか確認できません。権限を更新しています。しばらくしてからもう一度お試しください。",
   "webchat.interrupted": "接続が切れたため、返信をまだ確認できません。AI は処理を続けている可能性があります。再接続後に返信の取得を試みるため、今は再送をお控えください。",
   "webchat.reset": "新しい会話",
   "webchat.welcome": "こんにちは！何かお手伝いできることはありますか？",

@@ -1,3 +1,4 @@
+import { canSelectAgent, refreshCallableGrants } from './callable-agents-store';
 import { create } from 'zustand';
 import { parseHistoryAttachments, type HistoryAttachment } from '@/lib/history-attachments';
 import { useAuthStore } from './auth-store';
@@ -1210,6 +1211,13 @@ export const useChatStore = create<ChatStore>((set, get) => {
         return false;
       }
       if (requiresAssignedChatAgent() && (!get().resolvedAgent || get().assignmentError)) return false;
+      const agentId = requiresAssignedChatAgent() && !get().resumedExplicitly ? null : get().selectedAgentId;
+      const sessionId = get().sessionId;
+      if (agentId && !canSelectAgent(agentId, sessionId)) {
+        toast.error(lookupMessage('webchat.agentAccessPending'));
+        void refreshCallableGrants(sessionId);
+        return false;
+      }
 
       const atts = attachments ?? [];
       const msgId = newClientMessageId();
@@ -1219,8 +1227,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
           JSON.stringify(
             buildUserMessageFrame({
               content: text,
-              sessionId: get().sessionId,
-              agentId: requiresAssignedChatAgent() && !get().resumedExplicitly ? null : get().selectedAgentId,
+              sessionId,
+              agentId,
               attachments: atts,
               convId: get().convId,
               msgId,
