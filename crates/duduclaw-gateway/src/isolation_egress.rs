@@ -58,6 +58,18 @@ pub struct RunMetadata {
     /// Triggering channel message is an atomic (sequence, RFC3339 time) pair.
     pub user_message: Option<(i64, String)>,
     pub upstream_unknown: bool,
+    /// Set only by the authenticated interactive ingress issuer. `None` is
+    /// background, scheduled, delegated or unknown work and never a person.
+    pub ingress: Option<IngressRequester>,
+}
+
+/// How the capability's Human principal was authenticated at ingress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngressRequester {
+    /// Signed-in dashboard / WebChat access token for that user.
+    Dashboard,
+    /// Messaging-app sender whose verified binding mapped to that user.
+    Channel { channel: String, sender: String },
 }
 
 impl RunMetadata {
@@ -65,7 +77,7 @@ impl RunMetadata {
     pub fn root() -> Self {
         Self { delegation_depth: 0, hop_depth: 0, delegation_origin: None,
             reply_channel: None, reply_sender: None, dispatch_run: None,
-            user_message: None, upstream_unknown: false }
+            user_message: None, upstream_unknown: false, ingress: None }
     }
 
     fn validate(&self) -> Result<(), VerificationError> {
