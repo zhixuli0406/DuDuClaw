@@ -14,17 +14,24 @@ LEGACY_BINARY_LIMIT = 209_715_200
 BINARY_NAMES = {"duduclaw", "duduclaw.exe", "duduclaw-pro", "duduclaw-pro.exe"}
 
 
-def check_member(name: str, size: int, regular: bool) -> bool:
+def check_member(name: str, size: int, regular: bool, is_dir: bool = False) -> bool:
     # Validate every member, including files the updater would otherwise skip.
     parts = name.replace("\\", "/").split("/")
     if name.startswith(("/", "\\")) or ".." in parts or (
         len(name) >= 2 and name[0].isalpha() and name[1] == ":"
     ):
         raise ValueError(f"{name}: unsafe archive member path")
+    # Zip directory entries carry a trailing slash; drop it before the basename test.
+    while len(parts) > 1 and parts[-1] == "":
+        parts.pop()
     if parts[-1] not in BINARY_NAMES:
         return False
     # Releases put binaries at the root; tar commonly prefixes them with './'.
-    if "\\" in name or any(part != "." for part in parts[:-1]):
+    nested = "\\" in name or any(part != "." for part in parts[:-1])
+    if nested and is_dir:
+        # e.g. the bundled Python package directory python/duduclaw/ is not a binary.
+        return False
+    if nested:
         raise ValueError(f"{name}: update binary must be at archive root")
     if not regular:
         raise ValueError(f"{name}: update binary must be a regular file")
@@ -41,7 +48,9 @@ def check_archive(path: Path) -> None:
     if path.name.endswith(".tar.gz"):
         with tarfile.open(path, "r:gz") as archive:
             for entry in archive:
-                found = check_member(entry.name, entry.size, entry.isfile()) or found
+                found = check_member(
+                    entry.name, entry.size, entry.isfile(), entry.isdir()
+                ) or found
             # tar stops at the end marker before gzip's trailer. Verify that too.
             while archive.fileobj.read(64 * 1024):
                 pass
@@ -50,7 +59,9 @@ def check_archive(path: Path) -> None:
             for entry in archive.infolist():
                 mode = (entry.external_attr >> 16) & 0o170000
                 regular = not entry.is_dir() and mode in (0, 0o100000)
-                found = check_member(entry.filename, entry.file_size, regular) or found
+                found = check_member(
+                    entry.filename, entry.file_size, regular, entry.is_dir()
+                ) or found
     else:
         raise ValueError(f"unsupported update archive: {path}")
     if not found:

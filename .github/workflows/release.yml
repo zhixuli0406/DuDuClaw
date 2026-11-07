@@ -28,6 +28,9 @@ jobs:
     env:
       # MSVC symbols live in separate PDBs; retain the existing Windows output.
       CARGO_PROFILE_RELEASE_STRIP: ${{ startsWith(matrix.os, 'windows') && 'none' || 'symbols' }}
+      # Windows only: <=1.79.2 updaters reject an extracted binary >= 200 MiB, and the
+      # 1.80.0 MSVC exe was 210,997,248 bytes at opt-level 3. Optimise for size there.
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ startsWith(matrix.os, 'windows') && 's' || '3' }}
     permissions:
       contents: write
       id-token: write   # cosign keyless (Sigstore OIDC) signing
@@ -97,7 +100,21 @@ jobs:
 
       - name: Build binary (macOS/Windows — with desktop feature)
         if: matrix.target != 'aarch64-unknown-linux-gnu' && runner.os != 'Linux'
-        run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-gateway/desktop,duduclaw-cli/dashboard
+        # vendored-openssl: webauthn-rs needs OpenSSL, and runners/customers have no
+        # usable system copy. openssl-src needs perl + make (macOS) or perl + nmake +
+        # NASM (Windows MSVC); all are preinstalled on GitHub-hosted runners, and the
+        # Windows build already vendored OpenSSL via duduclaw-auth, so no extra env.
+        run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-gateway/desktop,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
+
+      - name: Check binary is portable (macOS)
+        if: runner.os == 'macOS'
+        run: python3 scripts/check_portable_binary.py target/${{ matrix.target }}/release/duduclaw
+
+      - name: Check binary is portable (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python scripts/check_portable_binary.py target/${{ matrix.target }}/release/duduclaw.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check Linux glibc baseline
         if: runner.os == 'Linux'
