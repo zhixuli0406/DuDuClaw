@@ -141,6 +141,28 @@ pub(crate) async fn admit_scheduled(
         .map_err(|_| "排程通知核准已失效或使用，已停止傳送。".into())
 }
 
+/// RM-124: admission for a scheduled result aimed at a WebChat conversation.
+///
+/// A WebChat target is an internal session of the employee's own
+/// conversation with a signed-in dashboard account — the scheduled analogue
+/// of "the source conversation", which the recipient policy always allows —
+/// so it is NOT evaluated as an external recipient and never raises an
+/// approval card. What replaces the policy is the fire-time ownership
+/// re-check: the session must still exist, still belong to `agent` and to
+/// the same dashboard account, and that account must still be Active and
+/// allowed to talk to `agent`. Any miss refuses (fail closed); the caller
+/// drops the message with an audit row.
+pub(crate) async fn admit_scheduled_session(
+    home: &Path, agent: &str, session: &str,
+) -> Result<(), String> {
+    let (home, agent, session) = (home.to_path_buf(), agent.to_owned(), session.to_owned());
+    tokio::task::spawn_blocking(move || {
+        crate::scheduled_webchat::verify_delivery(&home, &agent, &session).map(|_| ())
+    })
+    .await
+    .unwrap_or_else(|_| Err("WebChat 對話擁有者檢查失敗".into()))
+}
+
 fn scheduled_request(agent: &str, targets: &[String], args: Value) -> (Value, crate::approval::action_grant::ActionGrant) {
     use crate::approval::action_grant::{ActionGrant, ACTION_GRANT_KEY};
     let mut payload = json!({"name": "scheduled_notification", "arguments": args});
@@ -312,6 +334,32 @@ recipient_guard = "ask"
         let empty = std::sync::Arc::new(tokio::sync::RwLock::new(
             duduclaw_agent::registry::AgentRegistry::new(home.path().join("empty"))));
         assert!(scheduled_agent(&empty, "default").await.is_err());
+    }
+
+    /// RM-124: a WebChat session target is admitted by ownership, not by the
+    /// external-recipient policy — even `recipient_guard='ask'` with an empty
+    /// allow-list files no approval card — and is refused once the session
+    /// owner loses access, the session moves to another employee, or it is
+    /// deleted.
+    #[tokio::test]
+    async fn webchat_session_target_is_admitted_by_ownership_not_policy() {
+        let f = crate::scheduled_webchat::tests::fixture("sales").await;
+        let h = f.home.path();
+        std::fs::create_dir_all(h.join("agents/sales")).unwrap();
+        std::fs::write(h.join("config.toml"), "[security]\nrecipient_guard='ask'\n").unwrap();
+        std::fs::write(h.join("agents/sales/agent.toml"), "[capabilities]\nrecipients=[]\n").unwrap();
+        admit_scheduled_session(h, "sales", &f.session).await.unwrap();
+        assert!(!h.join("approvals.db").exists(), "no approval card for the user's own conversation");
+        assert!(admit_scheduled_session(h, "hr", &f.session).await.is_err());
+        assert!(admit_scheduled_session(h, "sales", "webchat:webchat:000000000000:x").await.is_err());
+        let db = UserDb::new(&h.join("users.db")).unwrap();
+        db.unbind_agent(&f.user, "sales").unwrap();
+        assert!(admit_scheduled_session(h, "sales", &f.session).await.is_err());
+        db.bind_agent(&f.user, "sales", AccessLevel::Operator).unwrap();
+        db.set_user_status(&f.user, UserStatus::Suspended).unwrap();
+        assert!(admit_scheduled_session(h, "sales", &f.session).await.is_err());
+        // The external-recipient path still never accepts a webchat address.
+        assert_eq!(duduclaw_core::recipient_policy::channel_recipient("webchat", &f.session), None);
     }
 
 }

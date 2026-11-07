@@ -979,6 +979,27 @@ where
         }
     };
 
+    // RM-124: a reminder created from a WebChat conversation (only ever via
+    // the gateway-attested origin — see `mcp/reminders.rs`) is appended to
+    // that conversation after the fire-time ownership re-check.
+    if reminder.channel == crate::scheduled_webchat::CHANNEL {
+        let body = format!("⏰ {}", crate::scheduled_webchat::bound(&text));
+        let delivered = match crate::recipient_guard::admit_scheduled_session(
+            home_dir, &reminder.agent_id, &reminder.chat_id,
+        ).await {
+            Ok(()) => crate::scheduled_webchat::deliver(
+                home_dir, &reminder.agent_id, &reminder.chat_id, &body,
+            ).await,
+            Err(reason) => Err(reason),
+        };
+        if let Err(reason) = &delivered {
+            crate::scheduled_webchat::audit_drop(home_dir, &reminder.agent_id, "reminder", &reminder.id, reason);
+        }
+        delivered?;
+        info!(id = %reminder.id, channel = "webchat", mode = ?reminder.mode, "Reminder delivered");
+        return Ok(());
+    }
+
     let recipients = vec![duduclaw_core::recipient_policy::channel_recipient(&reminder.channel, &reminder.chat_id)
         .unwrap_or_default()];
     let recipient_args = serde_json::json!({"reminder_id": reminder.id, "channel": reminder.channel,

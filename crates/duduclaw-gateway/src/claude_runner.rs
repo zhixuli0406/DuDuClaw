@@ -4725,6 +4725,8 @@ fn prepare_claude_cmd(
     if let Some(sender) = reply_sender() {
         cmd.env(duduclaw_core::ENV_REPLY_SENDER, &sender);
     }
+    // RM-124: the WebChat conversation this turn answers (webchat turns only).
+    crate::scheduled_webchat::inject_env(&mut cmd);
 
     // v1.10: Inject wiki RL trust feedback context so the MCP server can
     // attach turn_id / session_id to sub-agent dispatch BusMessages.

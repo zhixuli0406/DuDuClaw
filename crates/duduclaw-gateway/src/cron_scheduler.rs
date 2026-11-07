@@ -1191,6 +1191,13 @@ async fn deliver_cron_result(
         .as_deref()
         .ok_or_else(|| "notify_chat_id missing".to_string())?;
 
+    // RM-124: a schedule created from a WebChat conversation reports back
+    // into that conversation's history. No bot token / sender is involved;
+    // the ownership re-check replaces the external-recipient policy.
+    if channel == crate::scheduled_webchat::CHANNEL {
+        return deliver_cron_result_webchat(home_dir, task, chat_id, response).await;
+    }
+
     // Discord threads are addressed as the channel_id — forwarding routes
     // a message to the thread by using the thread id as chat_id.
     let effective_chat_id = match (channel, task.notify_thread_id.as_deref()) {
@@ -1280,6 +1287,30 @@ async fn deliver_cron_result(
         .map_err(|e| format!("send_text failed: {e}"))
 }
 
+/// RM-124: append a cron result to the WebChat conversation that created
+/// the schedule. Admitted by `recipient_guard::admit_scheduled_session`
+/// (session still live, same employee, same dashboard account, account still
+/// allowed); a refusal drops the message with an audit row.
+async fn deliver_cron_result_webchat(
+    home_dir: &Path,
+    task: &CronTaskRow,
+    session: &str,
+    response: &str,
+) -> Result<(), String> {
+    let body = crate::scheduled_webchat::format_body(&task.name, response);
+    if let Err(reason) =
+        crate::recipient_guard::admit_scheduled_session(home_dir, &task.agent_id, session).await
+    {
+        crate::scheduled_webchat::audit_drop(home_dir, &task.agent_id, "cron", &task.id, &reason);
+        return Err(reason);
+    }
+    crate::scheduled_webchat::deliver(home_dir, &task.agent_id, session, &body)
+        .await
+        .inspect_err(|reason| {
+            crate::scheduled_webchat::audit_drop(home_dir, &task.agent_id, "cron", &task.id, reason);
+        })
+}
+
 /// Resolve a channel bot token for cron delivery with `reports_to` cascade.
 ///
 /// Order of preference (v1.8.28):
@@ -1359,6 +1390,12 @@ async fn build_cron_typing_guard(
 /// forwarded + session-appended instead of silently dropped.
 fn cron_reply_channel_string(task: &CronTaskRow) -> Option<String> {
     let channel = task.notify_channel.as_deref().filter(|s| !s.is_empty())?;
+    // RM-124: a WebChat conversation is a history target, not a push target —
+    // scoping it as REPLY_CHANNEL would make nested `send_to_agent` callbacks
+    // and decision pushes try to *send* to it.
+    if channel == crate::scheduled_webchat::CHANNEL {
+        return None;
+    }
     let chat = task.notify_chat_id.as_deref().filter(|s| !s.is_empty())?;
     match task.notify_thread_id.as_deref().filter(|s| !s.is_empty()) {
         Some(thread) => Some(format!("{channel}:{chat}:{thread}")),
@@ -1868,6 +1905,75 @@ mod tests {
         begin_takeover(dir.path(), "discord", "thread-42");
         let task = task_with_notify(Some("discord"), Some("parent"), Some("thread-42"));
         assert!(deliver_cron_result(dir.path(), &task, "結果").await.is_ok());
+    }
+
+    // ── RM-124: schedules created from WebChat report back into it. ──
+
+    fn webchat_task(agent: &str, session: &str) -> CronTaskRow {
+        let mut row = task_with_notify(Some("webchat"), Some(session), None);
+        row.agent_id = agent.to_string();
+        row.name = "每日摘要".to_string();
+        row
+    }
+
+    #[tokio::test]
+    async fn cron_webchat_delivery_appends_to_the_origin_conversation() {
+        let f = crate::scheduled_webchat::tests::fixture("agnes").await;
+        let task = webchat_task("agnes", &f.session);
+        deliver_cron_result(f.home.path(), &task, "今天沒有待辦").await.unwrap();
+        assert_eq!(
+            crate::scheduled_webchat::tests::messages(&f).await,
+            vec!["⏰ [每日摘要] 今天沒有待辦".to_string()]
+        );
+        // Bounded like the other channel deliveries.
+        let long = "x".repeat(crate::scheduled_webchat::MAX_RESULT_CHARS * 2);
+        deliver_cron_result(f.home.path(), &task, &long).await.unwrap();
+        let last = crate::scheduled_webchat::tests::messages(&f).await.pop().unwrap();
+        assert!(last.ends_with("[…truncated]"));
+        assert!(last.chars().count() < crate::scheduled_webchat::MAX_RESULT_CHARS + 64);
+        // Never a REPLY_CHANNEL push target.
+        assert_eq!(cron_reply_channel_string(&task), None);
+    }
+
+    #[tokio::test]
+    async fn cron_webchat_delivery_is_dropped_when_ownership_is_lost() {
+        let f = crate::scheduled_webchat::tests::fixture("agnes").await;
+        let h = f.home.path();
+        let db = duduclaw_auth::UserDb::new(&h.join("users.db")).unwrap();
+        db.unbind_agent(&f.user, "agnes").unwrap();
+        assert!(deliver_cron_result(h, &webchat_task("agnes", &f.session), "secret").await.is_err());
+        db.bind_agent(&f.user, "agnes", duduclaw_auth::AccessLevel::Operator).unwrap();
+        db.set_user_status(&f.user, duduclaw_auth::UserStatus::Suspended).unwrap();
+        assert!(deliver_cron_result(h, &webchat_task("agnes", &f.session), "secret").await.is_err());
+        db.set_user_status(&f.user, duduclaw_auth::UserStatus::Active).unwrap();
+        // A row re-pointed at another employee's schedule is dropped too.
+        assert!(deliver_cron_result(h, &webchat_task("bob", &f.session), "secret").await.is_err());
+        // Permanently deleted conversation; delete_session only archives.
+        let manager = crate::session::SessionManager::new(&h.join("sessions.db")).unwrap();
+        manager.purge_session(&f.session).await.unwrap();
+        assert!(deliver_cron_result(h, &webchat_task("agnes", &f.session), "secret").await.is_err());
+        assert!(crate::scheduled_webchat::tests::messages(&f).await.is_empty());
+        let audit = std::fs::read_to_string(h.join("tool_calls.jsonl")).unwrap();
+        assert!(audit.contains("webchat_owner_check_failed"));
+    }
+
+    #[tokio::test]
+    async fn cron_webchat_delivery_restores_an_archived_conversation() {
+        let f = crate::scheduled_webchat::tests::fixture("agnes").await;
+        let manager = crate::session::SessionManager::new(&f.home.path().join("sessions.db")).unwrap();
+        manager.delete_session(&f.session).await.unwrap();
+        deliver_cron_result(f.home.path(), &webchat_task("agnes", &f.session), "今天沒有待辦")
+            .await.unwrap();
+        assert_eq!(
+            crate::scheduled_webchat::tests::messages(&f).await,
+            vec!["⏰ [每日摘要] 今天沒有待辦".to_string()]
+        );
+        let conn = manager.acquire().await;
+        let archived_at: Option<String> = conn.query_row(
+            "SELECT archived_at FROM sessions WHERE id=?1",
+            rusqlite::params![f.session], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(archived_at, None);
     }
     #[tokio::test]
     async fn autonomy_pause_cron_records_skip_then_resume_invokes() {

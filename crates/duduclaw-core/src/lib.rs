@@ -321,6 +321,16 @@ pub const ENV_REPLY_CHANNEL: &str = "DUDUCLAW_REPLY_CHANNEL";
 /// carries it (B11).
 pub const ENV_REPLY_SENDER: &str = "DUDUCLAW_REPLY_SENDER";
 
+/// RM-124: the full composed WebChat session id
+/// (`webchat:webchat:<owner tag>:<conn>[#agent:<id>][#conv:<nonce>]`) of the
+/// dashboard-chat turn this CLI answers. Set by the gateway ONLY for
+/// `webchat:` turns. The MCP schedule / reminder tools use it as the default
+/// result destination when the model names none, after binding it to the
+/// verified acting employee; a `webchat` target the model supplies is
+/// refused. Deliberately separate from [`ENV_REPLY_CHANNEL`], which drives
+/// outbound pushes WebChat cannot receive.
+pub const ENV_ORIGIN_SESSION: &str = "DUDUCLAW_ORIGIN_SESSION";
+
 /// Wiki RL Trust Feedback context for sub-agent dispatch (v1.10).
 ///
 /// `DUDUCLAW_TURN_ID` carries the per-turn ULID used as the

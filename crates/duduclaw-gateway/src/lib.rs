@@ -403,6 +403,9 @@ pub mod ranked_wiki_injection;
 pub mod reflexion;
 pub mod relevance_ranker;
 pub mod reminder_scheduler;
+/// RM-124: schedule / reminder results delivered back into the WebChat
+/// conversation that created them (origin binding + fire-time ownership).
+pub mod scheduled_webchat;
 pub mod risk_detector;
 pub mod run_steps;
 pub(crate) mod autonomous_runtime;

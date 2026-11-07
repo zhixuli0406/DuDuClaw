@@ -342,7 +342,7 @@
 
 | 功能 | 說明 |
 |------|------|
-| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永久化（v1.8.12）；排程以 `tasks_create` + `schedule` 建立（舊的 `schedule_task` 工具已在 v1.69.0 移除） |
+| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永久化（v1.8.12）；排程以 `tasks_create` + `schedule` 建立（舊的 `schedule_task` 工具已在 v1.69.0 移除）；在 WebChat 對話中建立、未指定對象的排程，觸發時確認擁有者後把結果送回該對話；沒有任何通知對象的排程會在建立回覆中說明結果不會送到任何地方（[69-egress-guard.md](69-egress-guard.md)） |
 | ReminderScheduler | 一次性提醒（相對 `5m`/`2h`/`1d` 或 ISO 8601），`direct` / `agent_callback` 兩種模式 |
 | HeartbeatScheduler | 每 Agent 統一排程：bus polling + GVU 沉默喚醒 + cron |
 | 排程器級任務板拉取（v1.9.3） | `poll_assigned_tasks` 移入 `HeartbeatScheduler::run` tick：每 30s 掃描整個 agent registry（不再略過 `enabled=false` 的 agent）；1 小時 LIKE-marker 冷卻防止 stampede |

@@ -151,6 +151,13 @@ impl MethodHandler {
                 "notify_channel and notify_chat_id must be set together",
             );
         }
+        // RM-124: a WebChat target only ever comes from the conversation the
+        // schedule was created in, never from a form field.
+        if let Err(message) = crate::scheduled_webchat::refuse_supplied_target(
+            notify_channel.as_deref(), notify_chat_id.as_deref(), None,
+        ) {
+            return WsFrame::error_response("", message);
+        }
 
         // Optional cron_timezone — validated against the IANA database so
         // typos surface at the dashboard instead of at firing time.
@@ -303,6 +310,17 @@ impl MethodHandler {
         let normalised = crate::cron_scheduler::normalise_cron(&cron_expr);
         if normalised.parse::<cron::Schedule>().is_err() {
             return WsFrame::error_response("", &format!("Invalid cron expression: {cron_expr}"));
+        }
+        // RM-124: a WebChat target cannot be typed in; echoing the stored one
+        // back unchanged (an edit form round-trip) is fine.
+        if params.get("notify_channel").is_some() || params.get("notify_chat_id").is_some() {
+            let field = |key: &str| params.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+            if let Err(message) = crate::scheduled_webchat::refuse_supplied_target(
+                field("notify_channel"), field("notify_chat_id"),
+                Some((existing.notify_channel.as_deref(), existing.notify_chat_id.as_deref())),
+            ) {
+                return WsFrame::error_response("", message);
+            }
         }
 
         match store
