@@ -157,6 +157,8 @@ Each sub-score is clamped to `[0,1]` (out-of-range ⇒ clamp + warn; NaN ⇒ 0.0
 - **`LlmJudge<C: LlmCaller>`** — builds a multi-candidate, XML-delimited prompt (`build_judge_prompt`) with candidate-tag escaping for injection resistance; parses the response JSON-first (with fence stripping). The backend is injected so the gateway can wire the Confidence Router (local-first, escalate to Claude on low confidence). An unparseable verdict or out-of-bounds index returns an error (fail-closed).
 - **`HeuristicJudge`** — a deterministic, zero-LLM fallback judge, used when no LLM is available.
 
+`LlmJudge` judges blind: candidates are shown in a random order under anonymous labels (`Candidate A`, `B`, …) with no branch id, name, or model, and the shuffled order is recorded in the verdict rationale for audit.
+
 `test_pass_ratio` is computed from each branch's `test_exit_code` across judgeable branches, neutral (0.5) when no branch was tested.
 
 ---
