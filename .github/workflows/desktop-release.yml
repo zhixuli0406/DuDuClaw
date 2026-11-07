@@ -128,6 +128,11 @@ jobs:
           else
             # Ship a self-contained sidecar: vendor OpenSSL (webauthn-rs) instead of
             # linking the runner's system/Homebrew copy.
+            # Git Bash's MSYS perl lacks modules OpenSSL's Configure needs; use the
+            # runner's Strawberry Perl on Windows.
+            if [[ "${{ matrix.target }}" == *windows* ]]; then
+              export OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe
+            fi
             cargo build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }} --features duduclaw-gateway/vendored-openssl
           fi
           mkdir -p src-tauri/binaries
