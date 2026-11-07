@@ -72,7 +72,8 @@ pub(super) fn jsonl(input:impl Read,builder:&mut Builder<'_>)->Result<()> {
             "enabled"|"created_at"|"updated_at"|"last_run_at"|"last_status"|"last_error"|
             "run_count"|"failure_count"|"notify_channel"|"notify_chat_id"|"notify_thread_id"|
             "cron_timezone"|"trigger_kind"|"condition_script"|"condition_state"|"watch_command"|
-            "on_behalf_of"|"workflow_id"|"activation_id"|"workflow_binding"));
+            "on_behalf_of"|"created_by_user_id"|"scoped_by_user_id"|
+            "workflow_id"|"activation_id"|"workflow_binding"));
         if let Some(id)=string(&value,"id")? {
             if id.is_empty() || id.len()>128 || !seen.insert(id.to_string()) {return Err(Error::Content);}
         }
@@ -105,7 +106,7 @@ mod tests {
     #[test]
     fn authority_cron_sqlite_emits_actionable_time_schedule_without_old_state() {
         let file=db();let conn=rusqlite::Connection::open(file.path()).unwrap();
-        conn.execute_batch("INSERT INTO cron_tasks(id,name,agent_id,cron,task,created_at,updated_at,enabled,cron_timezone,trigger_kind,last_error,notify_chat_id,on_behalf_of,condition_state) VALUES ('old','Daily report','sales','0 9 * * *','Prepare report','now','now',0,'Asia/Taipei','time','SECRET-ERROR','SECRET-CHAT','SECRET-PRINCIPAL','SECRET-STATE');").unwrap();drop(conn);
+        conn.execute_batch("INSERT INTO cron_tasks(id,name,agent_id,cron,task,created_at,updated_at,enabled,cron_timezone,trigger_kind,last_error,notify_chat_id,on_behalf_of,condition_state,created_by_user_id,scoped_by_user_id) VALUES ('old','Daily report','sales','0 9 * * *','Prepare report','now','now',0,'Asia/Taipei','time','SECRET-ERROR','SECRET-CHAT','SECRET-PRINCIPAL','SECRET-STATE','SECRET-CREATOR','SECRET-SCOPER');").unwrap();drop(conn);
         let p=extract(&request(SourceKind::AuthorityCronSqlite),std::fs::File::open(file.path()).unwrap(),None).unwrap();
         assert_eq!(p.len(),1);assert_eq!(p[0].category,C::Schedule);assert_eq!(p[0].fields.len(),5);
         assert_eq!(value(&p[0],"employee_id"),"sales");assert_eq!(value(&p[0],"schedule"),"0 9 * * *");

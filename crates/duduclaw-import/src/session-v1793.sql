@@ -66,6 +66,10 @@ ALTER TABLE sessions ADD COLUMN archived_at TEXT;
 
 ALTER TABLE session_messages ADD COLUMN undone_at TEXT;
 
+ALTER TABLE session_messages ADD COLUMN delivery_pending INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE session_messages ADD COLUMN client_msg_id TEXT;
+
 ALTER TABLE sessions ADD COLUMN lineage INTEGER NOT NULL DEFAULT 1;
 
 ALTER TABLE sessions ADD COLUMN checkpoint_message_id INTEGER NOT NULL DEFAULT 0;

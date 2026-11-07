@@ -38,7 +38,9 @@ unrequested WAL descriptor, and checks required slots exist before taking Rust
 ownership. A missing close_range syscall fails closed.
 
 Supported sources are inert UTF-8 memory/wiki/conversation/task/audit text and the
-fresh-install v1.79.3 sessions and memory schemas at user_version 0. Attachment
+fresh-install sessions and memory schemas at user_version 0. The `*-v1793.sql`
+file names are historical: sessions, tasks and cron catalogs track the current
+(v1.80) fresh stores, so older variants of those stores are refused. Attachment
 and work-product sources emit only a root-bound handle, size and recomputed SHA-256;
 the root copier publishes bytes after employee allocation is confirmed. SQLite is copied into the
 worker's private temporary directory, with WAL replay only on that copy. Schema

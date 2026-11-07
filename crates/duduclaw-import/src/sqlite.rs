@@ -111,12 +111,12 @@ pub(crate) fn sessions<R: Read, W: Write>(input: R, wal: Option<&mut dyn Read>, 
         match context.action {
             AuthAction::Select => Authorization::Allow,
             AuthAction::Read { table_name: "sessions", column_name: "id" | "agent_id" }
-            | AuthAction::Read { table_name: "session_messages", column_name: "id" | "session_id" | "role" | "content" | "timestamp" | "hidden" | "undone_at" }
+            | AuthAction::Read { table_name: "session_messages", column_name: "id" | "session_id" | "role" | "content" | "timestamp" | "hidden" | "undone_at" | "delivery_pending" }
                 if context.database_name == Some("main") => Authorization::Allow,
             _ => Authorization::Deny,
         }
     }));
-    let mut stmt = conn.prepare("SELECT m.id, m.role, m.content, m.timestamp FROM main.session_messages AS m JOIN main.sessions AS s ON m.session_id = s.id WHERE s.agent_id = ?1 AND m.hidden = 0 AND m.undone_at IS NULL ORDER BY m.id")?;
+    let mut stmt = conn.prepare("SELECT m.id, m.role, m.content, m.timestamp FROM main.session_messages AS m JOIN main.sessions AS s ON m.session_id = s.id WHERE s.agent_id = ?1 AND m.hidden = 0 AND m.undone_at IS NULL AND m.delivery_pending = 0 ORDER BY m.id")?;
     let mut rows = stmt.query([emitter.request.legacy_agent.as_deref().ok_or(Error::InvalidRequest)?])?;
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;

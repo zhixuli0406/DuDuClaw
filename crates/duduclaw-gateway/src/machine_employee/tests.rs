@@ -286,6 +286,17 @@ async fn personal_machine_access_requires_single_owner_evidence() {
         let allowed = matches!(scenario, "missing" | "empty" | "admin");
         let mut reg = AgentRegistry::new(home.path().join("agents"));
         reg.scan().await.unwrap();
+        if scenario == "corrupt" {
+            // The preset-resolved policy cannot be fenced in an unreadable
+            // authority database, so the bound employee is not loaded at all.
+            // Registry-free paths still refuse it.
+            assert!(reg.get("operator").is_none(), "{scenario}");
+            assert!(requires_admin_for_id(home.path(), "operator"), "{scenario}");
+            for principal in ["unmapped:line:owner", "unmapped:telegram:owner"] {
+                assert!(check_target(home.path(), "operator", Some(principal)).is_err(), "{scenario}");
+            }
+            continue;
+        }
         let agent = reg.get("operator").unwrap();
         assert_eq!(requires_admin(agent), !allowed, "{scenario}");
         assert_eq!(requires_admin_for_id(home.path(), "operator"), !allowed, "{scenario}");
