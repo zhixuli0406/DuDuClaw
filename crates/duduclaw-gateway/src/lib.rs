@@ -42,6 +42,7 @@ pub mod isolation_connector_clients;
 pub mod isolation_connector_boot;
 pub mod isolation_connector_channel;
 pub mod isolation_connector_model;
+pub mod isolation_connector_native_home;
 pub mod isolation_connector_computer;
 pub mod isolation_connector_database;
 pub mod isolation_connector_odoo;
