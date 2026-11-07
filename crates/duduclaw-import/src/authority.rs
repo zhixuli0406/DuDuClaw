@@ -258,9 +258,10 @@ fn users_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
     #[test] fn authority_tasks_only_propose_scheduled_or_open_goal_work() {
         let file=tempfile::NamedTempFile::new().unwrap();let conn=rusqlite::Connection::open(file.path()).unwrap();
         conn.execute_batch(include_str!("tasks-v1793.sql")).unwrap();
-        conn.execute_batch("INSERT INTO tasks(id,title,description,assigned_to,created_at,updated_at,kind,goal_mode) VALUES ('old-goal','Goal','Do work','sales','now','now','goal',1); INSERT INTO tasks(id,title,assigned_to,created_at,updated_at) VALUES ('plain','Historical task','sales','now','now'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();drop(conn);
+        conn.execute_batch("INSERT INTO tasks(id,title,description,assigned_to,created_at,updated_at,kind,goal_mode) VALUES ('old-goal','Goal','Do work','sales','now','now','goal',1); INSERT INTO tasks(id,title,assigned_to,created_at,updated_at) VALUES ('plain','Historical task','sales','now','now'); INSERT INTO tasks(id,title,description,assigned_to,created_by,created_at,updated_at,kind,goal_mode,a2a_owner,created_via) VALUES ('a2a-goal','A2A-PRIVATE-CANARY','Do work','sales','a2a:user:alice','now','now','goal',1,'user:alice','a2a'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();drop(conn);
         let p=extract(&request(SourceKind::AuthorityTasksSqlite,"tasks.db"),std::fs::File::open(file.path()).unwrap(),None).unwrap();
         assert_eq!(p.len(),1);assert_eq!(p[0].category,C::Schedule);
+        assert!(!serde_json::to_string(&p).unwrap().contains("A2A-PRIVATE-CANARY"));
         assert!(p[0].fields.iter().any(|f|f.name=="employee_id"));
     }
     #[test] fn authority_secrets_in_all_reviewed_containers_never_leave_worker() {
@@ -311,13 +312,15 @@ fn tasks_sqlite(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut Builder<'
     if crate::sqlite::schema(&conn)?!=crate::sqlite::schema(&expected)? {return Err(Error::Schema);}
     conn.authorizer(Some(|c:AuthContext<'_>|match c.action {
         AuthAction::Select=>Authorization::Allow,
-        AuthAction::Read {table_name:"tasks",column_name:"id"|"title"|"description"|"assigned_to"|"kind"|"goal_mode"|"status"|"acceptance_criteria"}
+        AuthAction::Read {table_name:"tasks",column_name:"id"|"title"|"description"|"assigned_to"|"kind"|"goal_mode"|"status"|"acceptance_criteria"|"a2a_owner"|"created_via"}
         |AuthAction::Read {table_name:"assign_schedules",column_name:"id"|"agent_id"|"title"|"payload_json"|"schedule_json"|"status"|"timezone"}
         |AuthAction::Read {table_name:"responsibilities",column_name:"responsibility_id"|"owner_agent_id"|"objective"|"acceptance_template"|"scope_json"|"notification_policy_json"|"schedule_json"|"occurrence_hours"|"occurrence_cost_cap_cents"|"budget_period"|"budget_timezone"|"period_cost_limit_cents"|"period_occurrence_limit"|"min_wake_interval_secs"|"max_consecutive_failures"|"stop_at"|"state"}
             if c.database_name==Some("main") && c.accessor.is_none()=>Authorization::Allow,
         _=>Authorization::Deny,
     }));
-    let mut query=conn.prepare("SELECT id,title,description,assigned_to,acceptance_criteria FROM tasks WHERE (kind='goal' OR goal_mode=1) AND status NOT IN ('done','cancelled','failed') ORDER BY id")?;
+    // A2A-owned work is private to its external principal; republishing it as
+    // ordinary employee goals would drop that owner restriction. It stays quarantined.
+    let mut query=conn.prepare("SELECT id,title,description,assigned_to,acceptance_criteria FROM tasks WHERE (kind='goal' OR goal_mode=1) AND status NOT IN ('done','cancelled','failed') AND a2a_owner IS NULL AND created_via IS NOT 'a2a' ORDER BY id")?;
     let mut rows=query.query([])?;
     while let Some(row)=rows.next()? {
         let settings=serde_json::json!({"kind":"goal","title":row.get::<_,String>(1)?,"description":row.get::<_,String>(2)?,"acceptance_criteria":row.get::<_,Option<String>>(4)?});

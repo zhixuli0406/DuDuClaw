@@ -326,7 +326,7 @@ async fn oversized_stdio_without_newline_closes_client() {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    let mut child = ManagedChild::spawn(&mut command).unwrap();
+    let mut child = ManagedChild::spawn(&mut command).await.unwrap();
     let stdin = child.child().stdin.take().unwrap();
     let stdout = BufReader::new(child.child().stdout.take().unwrap());
     let mut client = McpClient {

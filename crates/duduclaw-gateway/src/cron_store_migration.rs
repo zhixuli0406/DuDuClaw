@@ -37,12 +37,12 @@ impl CronStore {
 fn init_receipts(conn:&Connection)->Result<(),String> {
     verify_io()?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS cron_migration_receipts(id TEXT PRIMARY KEY,operation TEXT NOT NULL,digest TEXT NOT NULL);
-    CREATE TRIGGER IF NOT EXISTS cron_migration_edit AFTER UPDATE OF name,agent_id,cron,task,enabled,notify_channel,notify_chat_id,notify_thread_id,cron_timezone,trigger_kind,condition_script,watch_command,on_behalf_of ON cron_tasks BEGIN DELETE FROM cron_migration_receipts WHERE id=OLD.id; END;
+    CREATE TRIGGER IF NOT EXISTS cron_migration_edit AFTER UPDATE OF name,agent_id,cron,task,enabled,notify_channel,notify_chat_id,notify_thread_id,cron_timezone,trigger_kind,condition_script,watch_command,on_behalf_of,created_by_user_id,scoped_by_user_id ON cron_tasks BEGIN DELETE FROM cron_migration_receipts WHERE id=OLD.id; END;
     CREATE TRIGGER IF NOT EXISTS cron_migration_delete AFTER DELETE ON cron_tasks BEGIN DELETE FROM cron_migration_receipts WHERE id=OLD.id; END;").map_err(|e|e.to_string())
 }
 fn matches_row(conn:&Connection,row:&CronTaskRow,check_enabled:bool)->Result<bool,String> {
-    conn.query_row("SELECT name=?2 AND agent_id=?3 AND cron=?4 AND task=?5 AND (NOT ?6 OR enabled=?7) AND created_at=?8 AND cron_timezone IS ?9 AND on_behalf_of IS ?10 AND trigger_kind='time' AND condition_script IS NULL AND watch_command IS NULL AND notify_channel IS NULL AND notify_chat_id IS NULL AND notify_thread_id IS NULL FROM cron_tasks WHERE id=?1",
-        params![row.id,row.name,row.agent_id,row.cron,row.task,check_enabled,row.enabled,row.created_at,row.cron_timezone,row.on_behalf_of],|r|r.get(0)).map_err(|e|e.to_string())
+    conn.query_row("SELECT name=?2 AND agent_id=?3 AND cron=?4 AND task=?5 AND (NOT ?6 OR enabled=?7) AND created_at=?8 AND cron_timezone IS ?9 AND on_behalf_of IS ?10 AND trigger_kind='time' AND condition_script IS NULL AND watch_command IS NULL AND notify_channel IS NULL AND notify_chat_id IS NULL AND notify_thread_id IS NULL AND created_by_user_id IS ?11 AND scoped_by_user_id IS ?12 FROM cron_tasks WHERE id=?1",
+        params![row.id,row.name,row.agent_id,row.cron,row.task,check_enabled,row.enabled,row.created_at,row.cron_timezone,row.on_behalf_of,row.created_by_user_id,row.scoped_by_user_id],|r|r.get(0)).map_err(|e|e.to_string())
 }
 #[cfg(test)] mod tests {
     use super::*;

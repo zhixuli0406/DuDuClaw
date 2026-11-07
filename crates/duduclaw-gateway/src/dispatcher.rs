@@ -1797,11 +1797,13 @@ async fn dispatch_to_agent_outcome(
         // same dispatch flow.
         if crate::ephemeral::is_ephemeral_id(agent_id) {
             let env_map = delegation.to_env_map();
+            // Boxed: the ephemeral loader holds a full LoadedAgent across the
+            // runtime await; inline it would dominate this dispatch frame.
             return crate::claude_runner::DELEGATION_ENV
                 .scope(
                     env_map,
                     crate::credential_ledger::DISPATCH_SCANNED.scope(true,
-                        crate::ephemeral::dispatch(home_dir, registry, agent_id, prompt)),
+                        Box::pin(crate::ephemeral::dispatch(home_dir, registry, agent_id, prompt))),
                 )
                 .await
                 .map_err(DispatchError::from_string);
@@ -1829,7 +1831,7 @@ async fn dispatch_to_agent_outcome(
                 if use_sandbox {
                     info!(agent = agent_id, "Dispatching via task sandbox");
                     // The sandbox start transport owns the admission lease.
-                    let sandbox_result = dispatch_sandboxed(home_dir, registry, agent_id, prompt).await;
+                    let sandbox_result = Box::pin(dispatch_sandboxed(home_dir, registry, agent_id, prompt)).await;
                     match sandbox_result {
                         crate::task_sandbox::SandboxDispatch::Completed(result) => {
                             return result.map_err(DispatchError::from_sandbox);

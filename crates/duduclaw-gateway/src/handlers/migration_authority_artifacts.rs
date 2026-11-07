@@ -6,8 +6,10 @@ use serde_json::Value;
 
 #[derive(Serialize,Deserialize)]
 pub(super) enum ArtifactKind { Skill {name:String}, Hook {event:String} }
+// `Plan` is internally tagged with "kind"; a field of the same name would be
+// emitted as a duplicate tag and the durable plan could never be decoded.
 #[derive(Serialize,Deserialize)]
-pub(super) struct ArtifactPlan {agent:String,relative:String,before:Option<String>,after:String,kind:ArtifactKind,prepared:Option<super::artifact_receipt::Prepared>}
+pub(super) struct ArtifactPlan {agent:String,relative:String,before:Option<String>,after:String,#[serde(rename="artifact_kind")] kind:ArtifactKind,prepared:Option<super::artifact_receipt::Prepared>}
 fn employee(home:&Path,id:&str)->Result<PathBuf> {
     if !duduclaw_core::is_valid_agent_id(id) {return Err(Error::Invalid);}
     let dir=home.join("agents").join(id);validate_parents(home,&dir.join("agent.toml"))?;regular(&dir.join("agent.toml"))?;Ok(dir)
@@ -155,6 +157,13 @@ impl ArtifactPlan {
     fn item(category:ConfirmationCategory,fields:Vec<(&str,String)>)->ConfirmationItem {
         ConfirmationItem {binding:ProposalBinding {operation_id:ProposalOperationId {proposal_id:duduclaw_migration::ids::RequestId([7;16]),revision:1},proposal_digest:Sha256Digest([8;32])},
             category,status:ConfirmationStatus::Applying,high_risk:true,fields:fields.into_iter().map(|(k,v)|ProposalField {name:k.into(),value:ProposalValue::Text {value:v}}).collect()}
+    }
+    #[test]
+    fn migration_authority_artifact_plan_round_trips_through_tagged_plan() {
+        let plan=super::super::Plan::Artifact(ArtifactPlan {agent:"sales".into(),relative:".claude/settings.json".into(),before:None,
+            after:"{}".into(),kind:ArtifactKind::Hook {event:"Stop".into()},prepared:None});
+        let bytes=serde_json::to_vec(&plan).unwrap();
+        assert!(matches!(serde_json::from_slice::<super::super::Plan>(&bytes).unwrap(),super::super::Plan::Artifact(ArtifactPlan {kind:ArtifactKind::Hook {..},..})));
     }
     #[tokio::test]
     async fn migration_authority_skill_staged_install_reads_live_registry_and_compensates() {

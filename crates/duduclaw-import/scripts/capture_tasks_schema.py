@@ -21,6 +21,8 @@ dispatch=schema.split('fn add_dispatch_columns(')[1]
 add_columns(dispatch,'tasks')
 for sql in literals(dispatch):
     if sql.startswith(('CREATE ',)):run(sql)
+access=(root/'access.rs').read_text().split('fn init_task_access_schema(')[1]
+run(next(s for s in literals(access) if s.startswith('CREATE TABLE IF NOT EXISTS task_access_principals')))
 authority=(root/'authority.rs').read_text();columns=literals(authority.split('const AUTHORITY_COLUMNS:')[1].split('];')[0])
 for sql in literals(authority.split('fn init_authority_schema(')[1]):
     if sql.startswith('CREATE TABLE IF NOT EXISTS task_authority_epochs'):run(sql)
@@ -36,5 +38,6 @@ run(next(s for s in literals(resp) if s.lstrip().startswith('CREATE TABLE IF NOT
 for sql in literals(resp.split('pub(super) fn init_responsibility_schema')[1]):
     if sql.startswith(('CREATE ','ALTER ')) and '{' not in sql:run(sql)
 assign=(root/'assign_schedules.rs').read_text();run(next(s for s in literals(assign) if s.lstrip().startswith('CREATE TABLE IF NOT EXISTS assign_schedules')))
+a2a=(root/'a2a.rs').read_text();run(next(s for s in literals(a2a) if s.startswith('CREATE TABLE IF NOT EXISTS a2a_requests')))
 pathlib.Path('crates/duduclaw-import/src/tasks-v1793.sql').write_text('-- Generated from reviewed task-store DDL.\n'+'\n'.join(s.strip()+';' if not s.rstrip().endswith(';') else s.strip() for s in statements)+'\n')
 print('schema objects:',conn.execute('SELECT count(*) FROM sqlite_schema').fetchone()[0])
