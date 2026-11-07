@@ -121,7 +121,7 @@ impl DatabaseConnectorProvider {
         if call.name() == "db_query" && call.employee_scope() && !entry.allows_all_tables() { return Err(VerificationError::Unavailable); }
         let sql = if call.name() == "db_query" && call.employee_scope() {
             let sql = call.arguments().get("sql").and_then(Value::as_str).ok_or(VerificationError::Invalid)?;
-            duduclaw_db::ensure_read_only_statement(sql).map_err(|_| VerificationError::Invalid)?;
+            select_only_before_connect(sql)?;
             Some(sql)
         } else { None };
         if !io() { return Err(VerificationError::Unavailable); }
@@ -151,6 +151,52 @@ impl DatabaseConnectorProvider {
             "isolated database read", true, &[("db_source", json!(entry.name))]);
         Ok(tool_result(result))
     }
+}
+// The DB crate's statement guard deliberately admits modifying CTEs and
+// relies on driver read-only mode. Protected calls must refuse them before
+// resolving credentials or connecting. Keep this conservative lexical fence
+// in addition to the existing statement and driver guards.
+fn select_only_before_connect(sql: &str) -> Result<(), VerificationError> {
+    duduclaw_db::ensure_read_only_statement(sql).map_err(|_| VerificationError::Invalid)?;
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' | '"' | '`' => {
+                while let Some(next) = chars.next() {
+                    if next == ch {
+                        if chars.peek() == Some(&ch) { chars.next(); } else { break; }
+                    }
+                }
+            },
+            '-' if chars.peek() == Some(&'-') => {
+                for next in chars.by_ref() { if next == '\n' { break; } }
+            },
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                // MySQL/MariaDB executable comments are SQL, not comments.
+                if matches!(chars.peek(), Some('!' | 'M' | 'm')) { return Err(VerificationError::Invalid); }
+                while let Some(next) = chars.next() {
+                    // PostgreSQL nests comments, MySQL does not. Refuse the
+                    // ambiguous form instead of hiding SQL from this guard.
+                    if next == '/' && chars.peek() == Some(&'*') { return Err(VerificationError::Invalid); }
+                    if next == '*' && chars.peek() == Some(&'/') { chars.next(); break; }
+                }
+            },
+            ch if ch.is_ascii_alphabetic() || ch == '_' => {
+                let mut word = ch.to_string();
+                while chars.peek().is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_') {
+                    word.push(chars.next().ok_or(VerificationError::Invalid)?);
+                }
+                if matches!(word.to_ascii_uppercase().as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE"
+                    | "REPLACE" | "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "INTO" | "COPY"
+                    | "CALL" | "EXECUTE" | "GRANT" | "REVOKE" | "ATTACH" | "DETACH" | "PRAGMA") {
+                    return Err(VerificationError::Invalid);
+                }
+            },
+            _ => {},
+        }
+    }
+    Ok(())
 }
 fn source_config(home: &std::path::Path, agent: &str, source: &str) -> Result<toml::Value, VerificationError> {
     let agent_dir = crate::ephemeral::resolve_agent_dir(home, agent).or_else(||
