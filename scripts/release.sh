@@ -988,6 +988,11 @@ if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
             # The distributor build also embeds the About-page distributor
             # notice when the private checkout has exported one
             # (distributor-notice.html, validated by build-policy.py --check).
+            # vendored-openssl statically links OpenSSL: without it the binary
+            # links Homebrew's openssl@N dylib, which customers do not have.
+            # check_portable_binary.py then fails the build if any non-system
+            # dylib still sneaks in.
+            PORTABLE_CHECK="$PWD/scripts/check_portable_binary.py"
             if ( cd commercial/duduclaw-pro-gateway &&
                  python3 build-policy.py --check &&
                  notice_env=() &&
@@ -995,7 +1000,8 @@ if [[ "$PRO_RELEASE" == "1" && -d "commercial/duduclaw-pro-gateway" ]]; then
                    notice_env=("DUDUCLAW_DISTRIBUTOR_NOTICE_PATH=$PWD/distributor-notice.html"); } &&
                  env ${notice_env[@]+"${notice_env[@]}"} \
                      DUDUCLAW_INSTALLATION_POLICY_PATH="$PWD/installation-policy.json" \
-                     CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release --locked --bin duduclaw-pro &&
+                     CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release --locked --features vendored-openssl --bin duduclaw-pro &&
+                 python3 "$PORTABLE_CHECK" "$PRO_DARWIN_BIN" &&
                  "$PRO_DARWIN_BIN" --version >/dev/null ); then
                 mkdir -p "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL"
                 if cp "$PRO_DARWIN_BIN" "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL/duduclaw-pro"; then

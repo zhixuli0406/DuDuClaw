@@ -126,7 +126,9 @@ jobs:
             CARGO_TARGET_DIR="$SIDECAR_TARGET_DIR" PKG_CONFIG_ALLOW_CROSS=1 cross build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }} --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
             python3 scripts/check_glibc.py "$SIDECAR_TARGET_DIR/${{ matrix.target }}/release/duduclaw"
           else
-            cargo build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }}
+            # Ship a self-contained sidecar: vendor OpenSSL (webauthn-rs) instead of
+            # linking the runner's system/Homebrew copy.
+            cargo build --release -p duduclaw-cli --bin duduclaw --target ${{ matrix.target }} --features duduclaw-gateway/vendored-openssl
           fi
           mkdir -p src-tauri/binaries
           EXT=""; [[ "${{ matrix.target }}" == *windows* ]] && EXT=".exe"
