@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- macOS／Windows 自動測試分成三片平行執行，三片都要通過，縮短測試等待時間。
+
 ## [1.80.1] - 2026-11-07 — macOS／Windows 下載版修正
 
 ### Fixed
