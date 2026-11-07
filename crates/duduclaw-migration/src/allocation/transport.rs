@@ -54,7 +54,8 @@ pub fn request(request:&Request)->Result<Receipt,Error>{
     let receipt=response.receipt.ok_or(Error::Unavailable)?;
     let spec=request.validate()?;
     if receipt.binding!=request.item.binding || receipt.label!=spec.label || receipt.employee.0==[0;16]
-        || receipt.bytes!=spec.bytes || receipt.inodes!=spec.inodes || (receipt.uid<1000 && !(receipt.disabled && receipt.uid==0))
+        || receipt.bytes!=spec.bytes || receipt.inodes!=spec.inodes || receipt.principal_binding!=spec.binding
+        || (receipt.uid<1000 && !(receipt.disabled && receipt.uid==0))
         || receipt.disabled!=(request.action==Action::Disable){return invalid()}
     Ok(receipt)
 }

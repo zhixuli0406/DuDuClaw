@@ -152,6 +152,12 @@ pub fn stage_pending_proposals(store: &mut crate::confirmation::ConfirmationStor
             if item.fields.iter().any(|field| matches!(field.value, ProposalValue::SecretFingerprint { .. })) {
                 return Err(ConfirmationError::Invalid);
             }
+            // Imported legacy data never proposes an employee principal binding;
+            // only a fresh product request (v1.81) may carry one.
+            if item.category == crate::contract::ConfirmationCategory::Employee
+                && item.fields.iter().any(|f| matches!(f.name.as_str(), "binding_kind" | "owner_id" | "tenant_id")) {
+                return Err(ConfirmationError::Invalid);
+            }
             Ok(())
         }
     }
