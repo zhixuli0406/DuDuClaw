@@ -34,7 +34,7 @@ class CiWorkflowTests(unittest.TestCase):
 
     def commands(self, job):
         return [
-            shlex.split(line)
+            shlex.split(re.sub(r"\$\{\{.*?\}\}", "", line))
             for step in self.jobs[job]["steps"]
             for line in step.get("run", "").splitlines()
             if line.strip().startswith("cargo ")
@@ -128,7 +128,9 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertIn("workflow_dispatch", self.workflow["on"])
 
     def test_required_jobs_run_even_if_settle_fails(self):
-        for job, name in (("rust", "Rust ${{ matrix.os }}"),
+        for job, name in (("rust",
+                           "Rust ${{ matrix.os }}${{ matrix.os != 'ubuntu-latest' && "
+                           "format(' (shard {0}/3)', matrix.shard) || '' }}"),
                           ("dashboard", "Dashboard"), ("python", "Python"),
                           ("security", "Security Audit")):
             with self.subTest(job=job):
@@ -152,19 +154,36 @@ class CiWorkflowTests(unittest.TestCase):
                 self.assertNotIn("if", step)
 
     def test_prs_run_linux_and_main_nightly_manual_run_all_platforms(self):
-        matrix = self.jobs["rust"]["strategy"]["matrix"]["os"]
+        matrix = self.jobs["rust"]["strategy"]["matrix"]["include"]
         expression = re.fullmatch(
             r"\$\{\{ fromJSON\(github.event_name == 'pull_request' && '(.*?)' \|\| '(.*?)'\) \}\}",
             matrix,
         )
         self.assertIsNotNone(expression, "matrix must distinguish PRs from full platform runs")
-        self.assertEqual(json.loads(expression[1]), ["ubuntu-latest"])
+        self.assertEqual(json.loads(expression[1]), [{"os": "ubuntu-latest", "shard": 1}])
         for event in ("push", "schedule", "workflow_dispatch"):
             with self.subTest(event=event):
                 self.assertIn(event, self.workflow["on"])
                 self.assertEqual(json.loads(expression[2]),
-                                 ["ubuntu-latest", "macos-latest", "windows-latest"])
+                                 [{"os": "ubuntu-latest", "shard": 1}] + [
+                                     {"os": os_name, "shard": shard}
+                                     for os_name in ("macos-latest", "windows-latest")
+                                     for shard in range(1, 4)
+                                 ])
         self.assertEqual(self.workflow["on"]["schedule"], [{"cron": "0 18 * * *"}])
+
+    def test_every_native_shard_partitions_both_nextest_suites(self):
+        suites = [s for s in self.jobs["rust"]["steps"]
+                  if s.get("id") in {"nextest_workspace", "nextest_gateway"}]
+        self.assertEqual(len(suites), 2)
+        partition = ("${{ matrix.os != 'ubuntu-latest' && "
+                     "format('--partition hash:{0}/3', matrix.shard) || '' }}")
+        for step in suites:
+            with self.subTest(suite=step["id"]):
+                self.assertTrue(step["run"].endswith(" " + partition))
+                self.assertEqual(step["run"].count("--partition"), 1)
+                self.assertNotIn("matrix.shard", step["if"])
+                self.assertNotIn("continue-on-error", step)
 
     def test_ci_and_tag_docker_cache_write_policy(self):
         rust_caches = [
@@ -356,6 +375,15 @@ class CiWorkflowTests(unittest.TestCase):
                             f" || steps.nextest_{suite}.outcome == 'failure')")
                     if name in platform:
                         gate += " && (" + platform[name] + ")"
+                    if name in {
+                        "Verify edition ceiling in release artifacts with assertions",
+                        "Check gateway with OpenTelemetry feature",
+                        "Test cli with app-compat feature (OS-only surface)",
+                        "Test workspace doctests",
+                        "Test gateway doctests",
+                        "Run every required Windows case on the native host",
+                    }:
+                        gate += " && (matrix.shard == 1)"
                     if name.startswith(("Summarize nextest", "Upload nextest")):
                         gate = "always() && " + gate
                     expected = "${{ " + gate + " }}"
@@ -442,6 +470,8 @@ class CiWorkflowTests(unittest.TestCase):
         artifact = steps[-1]
         self.assertEqual(artifact["uses"], "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9")
         self.assertIn("always()", artifact["if"])
+        self.assertEqual(artifact["with"]["name"],
+                         "nextest-${{ matrix.os }}-shard${{ matrix.shard }}")
         self.assertEqual(artifact["with"]["path"], "target/nextest/reports/*.xml")
         self.assertEqual(artifact["with"]["retention-days"], "7")
         self.assertIn("-p 'test_ci*.py'", str(self.jobs["python"]))

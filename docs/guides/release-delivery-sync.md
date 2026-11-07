@@ -65,7 +65,11 @@ image is pulled before tar creation and linux-x64 binary extraction.
 ## Main platform CI preflight
 
 PR Rust CI runs only on Ubuntu. Main pushes, the daily 18:00 UTC schedule and
-manual CI runs cover Ubuntu, macOS and Windows; Windows failures are real failures.
+manual CI runs cover Ubuntu, macOS and Windows. Ubuntu runs without partitioning;
+macOS and Windows each run workspace and gateway nextest in three parallel hash
+partitions. Each OS runs doctests, OpenTelemetry, app-compat and edition-ceiling
+verification only in shard 1; required native Windows cases also run only there.
+JUnit artifacts are named `nextest-<os>-shard<k>` (Ubuntu uses shard 1).
 Before any mutation, release preflight reads the remote main tip with `git ls-remote`
 and requires pre-bump HEAD to contain it. It queries the latest 100 `ci.yml` runs
 on main across all statuses, selects the newest push/schedule ancestor of HEAD,
@@ -74,9 +78,10 @@ run can be ignored only if a later run exists on a strictly newer main commit;
 a manual cancellation with no such successor blocks. Failures never fall back
 to older green runs. The selected run must be on remote main's tip or at most
 3 commits behind it, and no more than 36 hours old (including runs at the tip).
-Both `Rust macos-latest` and `Rust windows-latest` must be present and successful;
+All six `Rust macos-latest (shard 1/3)` through `(shard 3/3)` and
+`Rust windows-latest (shard 1/3)` through `(shard 3/3)` jobs must be present and successful;
 failed, cancelled, skipped or missing jobs block minor/major. A non-success run
-conclusion blocks even when both platform jobs succeeded. The local `origin/main`
+conclusion blocks even when all six platform shards succeeded. The local `origin/main`
 tracking ref is not used as the remote-tip authority.
 Missing `gh`, authentication/query failures or absent coverage also block.
 Hotfix prints a warning and continues. `DUDUCLAW_RELEASE_IGNORE_PLATFORM_CI="reason"`
