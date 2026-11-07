@@ -3,7 +3,10 @@ use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
 use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord, EmployeeBinding,
     Lane, LiveRequestVerifier, Principal}, ids::{EmployeeId, RunId, Sha256Digest}};
 use duduclaw_mcp_boundary::{bindings::BindingStore, tool_policy::{authorize, ResourceResolver, ToolPolicy}};
-use crate::isolation_connectors::ConnectorCatalog;
+use crate::isolation_connectors::{ConnectorCatalog, ConnectorKind};
+/// Catalog account ids (production format) shared with the binding double.
+const ALICE_DB: &str = concat!("a11ce000", "00000000", "00000000", "000000d1");
+const ALICE_OTHER: &str = concat!("a11ce000", "00000000", "00000000", "000000d2");
 struct Live(Arc<AtomicBool>);
 impl LiveRequestVerifier for Live {
     fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> {
@@ -36,10 +39,10 @@ impl Fixture {
         let principal = Principal::Human { user_id:text("alice"), generation:1 };
         let mut bindings = BindingStore::new(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
         bindings.register_principal(&principal).unwrap(); bindings.create_employee(employee, &binding).unwrap();
-        bindings.register_connector("alice-db", &binding).unwrap();
+        bindings.register_connector(ALICE_DB, &binding).unwrap();
         let catalog = Arc::new(ConnectorCatalog::new(rusqlite::Connection::open_in_memory().unwrap()).unwrap());
-        catalog.register("alice-db", "database").unwrap();
-        let resources = vec![ResourceGrant::Employee { id:employee }, ResourceGrant::Connector { account:text("alice-db"), binding:binding.clone() },
+        catalog.register_fixture(ALICE_DB, "database", ConnectorKind::Personal, &binding).unwrap();
+        let resources = vec![ResourceGrant::Employee { id:employee }, ResourceGrant::Connector { account:text(ALICE_DB), binding:binding.clone() },
             ResourceGrant::DatabaseTable { database:text("demo"), table:text("customers") }];
         let live = Arc::new(AtomicBool::new(true));
         let context = RequestContext::with_live_verifier(CapabilityRecord {
@@ -49,7 +52,7 @@ impl Fixture {
             policy_revision:1, gateway_epoch:[0;16], issued_at:1, not_before:1, expires_at:u64::MAX, nonce:[0;32], jti:[0;16],
         }, Arc::new(Live(live.clone())));
         let provider = Arc::new(DatabaseConnectorProvider::new(home.path().into(), "employee-a".into(), employee,
-            vec![(ProductConnectorAccount::Personal { account:"alice-db".into(), owner:"alice".into() }, "demo".into())]).unwrap());
+            vec![(ProductConnectorAccount::Personal { account:ALICE_DB.into(), owner:"alice".into() }, "demo".into())]).unwrap());
         Self { home, provider, context, resolver:Resolver(resources), bindings:Arc::new(Mutex::new(bindings)), catalog, live }
     }
     fn call(&self, tool: &str, args: Value) -> (SelectedConnector, AuthorizedToolCall) {
@@ -100,15 +103,16 @@ async fn database_source_argument_selects_among_multiple_product_accounts() {
     config.push_str("\n[db_sources.other]\ndriver='sqlite'\nurl='/tmp/not-opened.sqlite'\nallowed_tables=['*']\n");
     std::fs::write(&config_path, config).unwrap();
     std::fs::write(fixture.home.path().join("agents/employee-a/agent.toml"), "[capabilities]\ndb_sources=['demo','other']\n").unwrap();
-    fixture.bindings.lock().unwrap().register_connector("alice-other", &fixture.context.record().employee_binding).unwrap();
-    fixture.catalog.register("alice-other", "database").unwrap();
+    fixture.bindings.lock().unwrap().register_connector(ALICE_OTHER, &fixture.context.record().employee_binding).unwrap();
+    fixture.catalog.register_fixture(ALICE_OTHER, "database", ConnectorKind::Personal,
+        &fixture.context.record().employee_binding).unwrap();
     fixture.provider = Arc::new(DatabaseConnectorProvider::new(fixture.home.path().into(), "employee-a".into(), fixture.context.record().employee,
-        vec![(ProductConnectorAccount::Personal { account:"alice-db".into(), owner:"alice".into() }, "demo".into()),
-            (ProductConnectorAccount::Personal { account:"alice-other".into(), owner:"alice".into() }, "other".into())]).unwrap());
+        vec![(ProductConnectorAccount::Personal { account:ALICE_DB.into(), owner:"alice".into() }, "demo".into()),
+            (ProductConnectorAccount::Personal { account:ALICE_OTHER.into(), owner:"alice".into() }, "other".into())]).unwrap());
     let (selected, call) = fixture.call("db_select", json!({"source":"demo","table":"customers"}));
-    assert_eq!(selected.account(), "alice-db");
+    assert_eq!(selected.account(), ALICE_DB);
     assert!(fixture.provider.execute(selected, call).await.unwrap().to_string().contains("example"));
-    for (source, account) in [("demo","alice-db"), ("other","alice-other")] {
+    for (source, account) in [("demo",ALICE_DB), ("other",ALICE_OTHER)] {
         let args = json!({"source":source});
         let selected = SelectedConnector::select_with_policy(&fixture.context, "db_tables", &args, fixture.bindings.clone(),
             fixture.catalog.clone(), Some(fixture.provider.clone())).unwrap();

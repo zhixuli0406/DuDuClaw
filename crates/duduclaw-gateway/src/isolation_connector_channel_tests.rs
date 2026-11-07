@@ -2,7 +2,7 @@ use super::*;
 use std::sync::{Mutex,atomic::{AtomicBool,Ordering}};
 use duduclaw_isolation::{bounded::{List,Text},capability::{CapabilityId,CapabilityRecord,EmployeeBinding,Lane,LiveRequestVerifier,Principal,ResourceGrant},ids::{RunId,Sha256Digest}};
 use duduclaw_mcp_boundary::{bindings::BindingStore,tool_policy::{authorize,ResourceResolver,ToolPolicy}};
-use crate::isolation_connectors::ConnectorCatalog;
+use crate::isolation_connectors::{ConnectorCatalog, ConnectorKind};
 struct Live(Arc<AtomicBool>);
 impl LiveRequestVerifier for Live {fn verify_live(&self,_:&CapabilityRecord,_:u64)->Result<(),VerificationError>{
     if self.0.load(Ordering::SeqCst){Ok(())}else{Err(VerificationError::Revoked)}}}
@@ -27,14 +27,16 @@ impl Fixture {
         let catalog=Arc::new(ConnectorCatalog::new(rusqlite::Connection::open_in_memory().unwrap()).unwrap());
         Self{home,context,bindings:Arc::new(Mutex::new(bindings)),catalog,live}
     }
-    fn account(&self,id:&str,provider:&str)->ProductConnectorAccount {
-        self.bindings.lock().unwrap().register_connector(id,&self.context.record().employee_binding).unwrap();self.catalog.register(id,provider).unwrap();
-        ProductConnectorAccount::Personal{account:id.into(),owner:"owner".into()}
+    fn account(&self,label:&str,provider:&str)->ProductConnectorAccount {
+        let binding=&self.context.record().employee_binding;
+        let id=self.catalog.register(label,provider,ConnectorKind::Personal,binding).unwrap();
+        self.bindings.lock().unwrap().register_connector(id.as_str(),binding).unwrap();
+        ProductConnectorAccount::Personal{account:id.as_str().into(),owner:"owner".into()}
     }
     fn call(&self,provider:Arc<dyn LiveConnectorSelectionPolicy>,tool:&str,args:Value)->(SelectedConnector,AuthorizedToolCall){
         let selected=SelectedConnector::select_with_policy(&self.context,tool,&args,self.bindings.clone(),self.catalog.clone(),Some(provider)).unwrap();
         let resources=vec![ResourceGrant::Employee{id:self.context.record().employee},ResourceGrant::Connector{account:text(selected.account()),binding:selected.binding().clone()},
-            ResourceGrant::Workspace{handle:text("session-workspace")},ResourceGrant::Mailbox{id:text("account:channel")},ResourceGrant::Recipient{id:text("chat") }];
+            ResourceGrant::Workspace{handle:text("session-workspace")},ResourceGrant::Mailbox{id:text(&format!("account:{}",selected.account()))},ResourceGrant::Recipient{id:text("chat") }];
         let call=authorize(&self.context,tool,&args,&Resolver(resources)).unwrap();(selected,call)
     }
     fn channels(&self,scope:&str)->Arc<ChannelConnectorProvider>{
@@ -92,7 +94,7 @@ fn self_configuring_senders_cannot_substitute_home_credentials_for_personal_acco
 #[tokio::test]
 async fn bound_io_context_rechecks_product_and_binding_after_wait(){
     let f=Fixture::new();let provider=f.channels("chat");let(selected,_)=f.call(provider.clone(),"channel_config_list",json!({"channel":"discord","scope_id":"chat"}));
-    let selected=Arc::new(selected);let context=selected.io_context();f.bindings.lock().unwrap().revoke_connector("channel").unwrap();
+    let selected=Arc::new(selected);let context=selected.io_context();f.bindings.lock().unwrap().revoke_connector(selected.account()).unwrap();
     assert!(duduclaw_mcp_boundary::io_authority::scope(context,async{duduclaw_mcp_boundary::io_authority::verify_before_io()}).await.is_err());
 }
 #[tokio::test]
