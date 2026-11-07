@@ -237,7 +237,6 @@ pub mod delegation_gate;
 pub mod delegation_router;
 pub mod direct_api;
 pub mod discord;
-pub mod discord_voice;
 /// B0-1 exploration-tree ledger, replay simulator and policy protocol (offline only).
 pub mod discovery;
 pub mod dispatcher;

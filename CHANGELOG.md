@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Removed
+
+- 移除從未隨發行版提供的 Discord 語音頻道實驗程式碼。
+
 ## [1.80.1] - 2026-11-07 — macOS／Windows 下載版修正
 
 ### Fixed
