@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Removed
+
+- 移除 `tts_provider = "edge-tts"`／`"edge"` 相容別名；舊設定會停用 TTS 並提示改用 Kokoro，`system.update_config` 不再接受這些值。
+
 ## [1.80.1] - 2026-11-07 — macOS／Windows 下載版修正
 
 ### Fixed
@@ -290,10 +294,6 @@
 - 第三方 MCP 設定讀不到時，員工拒絕啟動，不再用未驗證的設定繼續。金鑰參照解不開時，只有那個第三方伺服器不啟動，員工照常運作，但少了它的工具。
 - 「世界」改名「AI 虛擬辦公室」，「例行工作」改名「自動化」，路由不變。
 - 側欄對話紀錄的字級與導覽項目相同。
-
-### Deprecated
-
-- `tts_provider = "edge-tts"` 與 `"edge"`：仍可解析，會警告一次並當成 `auto`，v1.81.0 移除。
 
 ### Removed
 
