@@ -235,6 +235,7 @@ mod tick_sources_rpc;
 mod channel_ingress_rpc;
 mod computer_workspaces_rpc;
 mod isolation_recording_rpc;
+mod isolation_connectors_rpc;
 mod computer_sessions_rpc;
 mod computer_team_rpc;
 mod computer_watch_links_rpc;
@@ -566,6 +567,13 @@ impl MethodHandler {
         // D8. Extensions cannot replace its fresh dashboard-role checks.
         if matches!(method, "isolation.recording_status" | "isolation.recording_stop") {
             return self.handle_isolation_recording(method, params, ctx).await;
+        }
+        // Connector routes are isolation authority; no extension sees the namespace.
+        if isolation_connectors_rpc::owns(method) {
+            if let Err(error) = acl::require_role(ctx, UserRole::Admin) {
+                return WsFrame::error_response("", &error);
+            }
+            return boxed_frame(|| self.handle_isolation_connectors(method, params, ctx)).await;
         }
 
         // Session administration cannot be replaced by an extension. The

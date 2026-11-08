@@ -50,8 +50,9 @@ impl AccountCredentialVault {
         entries.insert(credential.account.clone(), credential);
         Ok(())
     }
-    /// Revoke the BindingStore account first to fence in-flight requests, then
-    /// remove its material here. Removal alone only prevents future acquisition.
+    /// Deactivate the catalog route first to fence in-flight requests, then
+    /// remove its material here (`isolation_connector_lifecycle::revoke` does
+    /// both, in that order). Removal alone only prevents future acquisition.
     pub fn remove(&self, account: &str) -> Result<(), VerificationError> {
         self.entries.write().map_err(|_| VerificationError::Unavailable)?.remove(account);
         Ok(())

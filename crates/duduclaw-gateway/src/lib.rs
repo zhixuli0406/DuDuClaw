@@ -39,6 +39,7 @@ pub mod isolation_egress;
 pub mod isolation_resources;
 pub mod isolation_connectors;
 pub mod isolation_connector_clients;
+pub mod isolation_connector_lifecycle;
 pub mod isolation_connector_boot;
 pub mod isolation_connector_channel;
 pub mod isolation_connector_model;
