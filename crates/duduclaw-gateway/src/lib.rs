@@ -32,6 +32,8 @@
 
 pub mod isolation_mcp;
 pub mod isolation_background;
+/// H13: protected `spawn_ephemeral` children as pending jobs (D-H3, D8).
+pub mod isolation_ephemeral;
 mod isolation_http;
 #[cfg(test)]
 pub(crate) mod isolation_io_test_support;

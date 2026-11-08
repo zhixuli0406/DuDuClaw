@@ -117,7 +117,9 @@ fn pending_production_selectors() -> BTreeSet<String> {
     // H12a removed skill_extract, shared_skill_adopt, skill_security_scan,
     // skill_graduate and skill_curator_status: they select the issuer's own
     // Employee (+ own Confined wiki) under EmployeeScope, not a workspace.
-    ["spawn_agent", "spawn_ephemeral", "execute_program",
+    // H13 removed spawn_agent and spawn_ephemeral: host-queue work of the own
+    // Employee grant (live delegation/binding/task checks per call).
+    ["execute_program",
         "office_script", "inspect_branches", "diff_branches", "fork_cost", "discovery_catalog",
         "discovery_list", "discovery_tree", "discovery_artifact", "discovery_cancel",
         "browser_record_start", "browser_record_stop", "skill_from_recording",
@@ -379,6 +381,11 @@ async fn employee_tool_parity(home: &std::path::Path) {
     // nothing was appended by the test.
     for tool in ["file_read", "csv_read", "xlsx_read", "web_fetch_cached", "web_extract", "create_task"] {
         assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: H10 issuer selector missing");
+    }
+    // H13: the issuer's own Employee grant suffices (Shared employee, no task).
+    for tool in duduclaw_mcp_boundary::tool_policy::SPAWN_TOOLS {
+        assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: H13 spawn selector missing");
+        assert!(!pending.contains(tool), "{tool}");
     }
     assert!(context.record().resources.as_slice().iter().any(|grant| matches!(grant,
         ResourceGrant::NewTask { requester } if matches!(&context.record().principal,
