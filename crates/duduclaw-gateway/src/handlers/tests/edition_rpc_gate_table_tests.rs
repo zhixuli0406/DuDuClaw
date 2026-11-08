@@ -59,6 +59,12 @@ fn enterprise_surfaces_are_listed() {
         "isolation.connector_step_up",
         "isolation.connector_provision",
         "isolation.connector_revoke",
+        // 受保護員工配置提案（A4）
+        "isolation.employee_list",
+        "isolation.employee_propose",
+        "isolation.employee_tombstone",
+        "me.isolation.request_personal_employee",
+        "me.isolation.list_personal_employee_requests",
     ] {
         assert!(
             is_enterprise_only_method(method),

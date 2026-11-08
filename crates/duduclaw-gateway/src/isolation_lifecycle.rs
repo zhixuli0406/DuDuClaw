@@ -210,13 +210,16 @@ pub(crate) fn validate_proposed_binding(home: &Path, label: &str, binding: Optio
 }
 
 /// Apply path: record the Personal mirror for a confirmed allocation, after
-/// re-checking the owner in the same users.db transaction. `Ok(false)` is an
-/// idempotent re-apply. Any refusal must refuse the apply step.
+/// re-checking the owner in the same users.db transaction, and bind the owner
+/// to the employee with Owner access in that same transaction (A4), so the
+/// employee has exactly one member. `Ok(false)` is an idempotent re-apply of
+/// the mirror. Any refusal must refuse the apply step.
 pub(crate) fn record_personal_mirror(home: &Path, label: &str, owner: &str) -> Result<bool, LifecycleError> {
     let mut users = open_read_write(&home.join(USERS_DB))?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
     if !owner_eligible(&tx, owner)? { return Err(LifecycleError::Denied); }
     let inserted = duduclaw_auth::db::insert_personal_agent_in_transaction(&tx, label, owner).map_err(mirror_error)?;
+    duduclaw_auth::db::bind_personal_owner_in_transaction(&tx, label, owner).map_err(mirror_error)?;
     tx.commit().map_err(|_| LifecycleError::Unavailable)?;
     Ok(inserted)
 }

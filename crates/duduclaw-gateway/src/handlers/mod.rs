@@ -236,6 +236,7 @@ mod channel_ingress_rpc;
 mod computer_workspaces_rpc;
 mod isolation_recording_rpc;
 mod isolation_connectors_rpc;
+mod isolation_employee_rpc;
 mod computer_sessions_rpc;
 mod computer_team_rpc;
 mod computer_watch_links_rpc;
@@ -574,6 +575,11 @@ impl MethodHandler {
                 return WsFrame::error_response("", &error);
             }
             return boxed_frame(|| self.handle_isolation_connectors(method, params, ctx)).await;
+        }
+        // Protected employee proposals are isolation authority too: the
+        // handler applies the per-method role (self-service or Admin + step-up).
+        if isolation_employee_rpc::owns(method) {
+            return boxed_frame(|| self.handle_isolation_employee(method, params, ctx)).await;
         }
 
         // Session administration cannot be replaced by an extension. The

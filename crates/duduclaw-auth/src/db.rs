@@ -1376,6 +1376,29 @@ mod tests {
     }
 
     #[test]
+    fn personal_owner_binding_is_idempotent_and_exclusive() {
+        let (db, _tmp) = test_db();
+        let alice = db.create_user("alice@example.com", "Alice", "password1", UserRole::Employee).unwrap();
+        let bob = db.create_user("bob@example.com", "Bob", "password1", UserRole::Admin).unwrap();
+        // No mirror (or another owner's) is never bound.
+        assert_eq!(personal_tx(&db, |tx| bind_personal_owner_in_transaction(tx, "alice-personal", &alice.id)),
+            Err(PersonalAgentError::OwnerConflict));
+        assert!(personal_tx(&db, |tx| insert_personal_agent_in_transaction(tx, "alice-personal", &alice.id)).unwrap());
+        assert_eq!(personal_tx(&db, |tx| bind_personal_owner_in_transaction(tx, "alice-personal", &bob.id)),
+            Err(PersonalAgentError::OwnerConflict));
+        db.bind_agent(&alice.id, "alice-personal", AccessLevel::Viewer).unwrap();
+        // An existing lower binding is raised to Owner, then re-apply is a no-op.
+        assert!(personal_tx(&db, |tx| bind_personal_owner_in_transaction(tx, "alice-personal", &alice.id)).unwrap());
+        let generation = db.acl_generation().unwrap();
+        assert!(!personal_tx(&db, |tx| bind_personal_owner_in_transaction(tx, "alice-personal", &alice.id)).unwrap());
+        assert_eq!(db.acl_generation().unwrap(), generation);
+        assert_eq!(members(&db, "alice-personal"), vec![alice.id.clone()]);
+        assert_eq!(db.check_agent_access(&alice.id, "alice-personal").unwrap(), Some(AccessLevel::Owner));
+        assert_eq!(personal_tx(&db, |tx| bind_personal_owner_in_transaction(tx, "dashboard", &alice.id)),
+            Err(PersonalAgentError::InvalidAgent));
+    }
+
+    #[test]
     fn personal_agent_refuses_second_binding() {
         let (db, _tmp) = test_db();
         let alice = db.create_user("alice@example.com", "Alice", "password1", UserRole::Employee).unwrap();
@@ -1727,6 +1750,37 @@ pub fn insert_personal_agent_in_transaction(
         params![agent, serde_json::json!({"owner_user_id": owner_user_id}).to_string(), now],
     ).map_err(PersonalAgentError::store)?;
     bump_acl_generation(tx).map_err(PersonalAgentError::store)?;
+    Ok(true)
+}
+
+/// Bind the recorded Personal owner of `agent` to it with Owner access, so
+/// the employee has exactly one member (native Linux isolation v1.81, A4).
+///
+/// Gateway employee lifecycle apply path only, in the same caller-owned
+/// IMMEDIATE users.db transaction as [`insert_personal_agent_in_transaction`];
+/// nothing here commits. Returns `Ok(false)` without any write when the owner
+/// is already bound with Owner access (idempotent re-apply), `Ok(true)` after
+/// binding (the ACL generation is bumped by the binding writer).
+///
+/// Refuses with `OwnerConflict` when no mirror row names `owner_user_id`
+/// (missing or another owner) and `BindingConflict` when any other user is
+/// bound to the agent.
+pub fn bind_personal_owner_in_transaction(
+    tx: &rusqlite::Transaction<'_>, agent: &str, owner_user_id: &str,
+) -> Result<bool, PersonalAgentError> {
+    if !is_personal_agent_id(agent) { return Err(PersonalAgentError::InvalidAgent); }
+    if personal_agent_owner(tx, agent)?.as_deref() != Some(owner_user_id) {
+        return Err(PersonalAgentError::OwnerConflict);
+    }
+    if other_members_exist(tx, agent, owner_user_id)? { return Err(PersonalAgentError::BindingConflict); }
+    let current: Option<String> = tx.query_row(
+        "SELECT access_level FROM user_agent_bindings WHERE agent_name = ?1 AND user_id = ?2",
+        params![agent, owner_user_id], |row| row.get(0),
+    ).optional().map_err(PersonalAgentError::store)?;
+    if current.as_deref().and_then(|level| level.parse::<AccessLevel>().ok()) == Some(AccessLevel::Owner) {
+        return Ok(false);
+    }
+    bind_agent_in_transaction(tx, owner_user_id, agent, AccessLevel::Owner, &Utc::now().to_rfc3339())?;
     Ok(true)
 }
 
