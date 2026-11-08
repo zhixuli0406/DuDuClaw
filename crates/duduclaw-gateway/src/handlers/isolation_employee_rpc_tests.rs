@@ -536,9 +536,15 @@ fn propose_retry_accepts_own_marker() {
             &|| std::fs::write(dir.join("SKILLS/notes/SKILL.md"), "# notes\n").unwrap()),
         ("skill listing", &|| std::fs::write(dir.join("SKILLS/extra.md"), "").unwrap(),
             &|| std::fs::remove_file(dir.join("SKILLS/extra.md")).unwrap()),
-        ("org entry", &|| { duduclaw_core::org_store::upsert(home, LABEL,
-            duduclaw_core::org_store::OrgEntry::new("ceo", "")).unwrap(); },
-            &|| { duduclaw_core::org_store::remove(home, LABEL).unwrap(); }),
+        ("org entry", &|| {
+            let org = duduclaw_core::org_store::lock_org_mutations(home).unwrap();
+            duduclaw_core::org_store::upsert(&org, LABEL,
+                duduclaw_core::org_store::OrgEntry::new("ceo", "")).unwrap();
+        },
+            &|| {
+                let org = duduclaw_core::org_store::lock_org_mutations(home).unwrap();
+                duduclaw_core::org_store::remove(&org, LABEL).unwrap();
+            }),
     ];
     for (what, change, revert) in changes {
         change();
