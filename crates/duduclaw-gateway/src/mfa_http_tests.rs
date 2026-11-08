@@ -543,6 +543,27 @@ async fn mfa_degraded_is_visible_in_overview_and_system_status() {
     assert!(value["payload"]["users"][0].get("channel_bindings").is_some());
 }
 
+/// RM-155: `system.status.folder_access` appears only while macOS folder
+/// access is degraded for this home, and lists only non-granted paths.
+#[tokio::test]
+async fn folder_access_is_in_system_status_only_when_degraded() {
+    use crate::macos_folder_access::{AccessState, registry_for};
+    let (_dir,state,_user)=fixture(false,false).await;
+    assert!(state.handler.system_status_payload().await.get("folder_access").is_none());
+    let registry=registry_for(&state.home_dir);
+    registry.set_states_for_test(std::collections::BTreeMap::from([
+        (std::path::PathBuf::from("/Volumes/NAS"),AccessState::Denied),
+        (std::path::PathBuf::from("/Volumes/USB"),AccessState::Granted),
+    ]));
+    let status=state.handler.system_status_payload().await;
+    assert_eq!(status["folder_access"]["state"],"denied");
+    assert_eq!(status["folder_access"]["paths"],json!([{"path_label":"/Volumes/NAS","state":"denied"}]));
+    registry.set_states_for_test(std::collections::BTreeMap::from([
+        (std::path::PathBuf::from("/Volumes/NAS"),AccessState::Granted),
+    ]));
+    assert!(state.handler.system_status_payload().await.get("folder_access").is_none());
+}
+
 #[tokio::test]
 async fn mfa_channel_bind_refuses_enforced_self_but_accepts_other_admin() {
     for personal in [false, true] {

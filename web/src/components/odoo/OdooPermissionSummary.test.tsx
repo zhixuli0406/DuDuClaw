@@ -37,4 +37,19 @@ describe('Odoo permission summary', () => {
     expect(screen.getByText(`sale.order：${messages['odoo.permissions.action']}、${messages['odoo.permissions.execute']}`)).toBeInTheDocument();
     expect(screen.queryByText(new RegExp(messages['odoo.permissions.other']))).not.toBeInTheDocument();
   });
+  it.each([
+    { locale: 'en', messages: en },
+    { locale: 'zh-TW', messages: zhTW },
+    { locale: 'ja-JP', messages: jaJP },
+  ])('names the per-table general create / update opt-in in $locale', ({ locale, messages }) => {
+    render(<IntlProvider locale={locale} messages={messages}>
+      <OdooPermissionSummary actions={['write:crm.lead', 'generic_write:crm.lead', 'generic_write']} />
+    </IntlProvider>);
+    expect(screen.getByText(`crm.lead：${messages['odoo.permissions.write']}、${messages['odoo.permissions.genericWrite']}`)).toBeInTheDocument();
+    // A bare token is not an all-tables opt-in; it stays visible as an unknown entry.
+    expect(screen.getByText(`${messages['odoo.permissions.other']}：generic_write`)).toBeInTheDocument();
+  });
+  it('uses the owner-approved zh-TW label', () => {
+    expect(zhTW['odoo.permissions.genericWrite']).toBe('允許通用新增／修改');
+  });
 });

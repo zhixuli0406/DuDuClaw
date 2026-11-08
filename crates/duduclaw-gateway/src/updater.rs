@@ -41,6 +41,11 @@ mod failure;
 pub use failure::{failure_kind, failure_payload, failure_response, sanitize_failure_detail};
 #[path = "updater/release_identity.rs"]
 mod release_identity;
+// RM-155: `DuDuClaw Gateway.app` install/update/migration (macOS); the
+// strict extractor and swap state machine are tested on every host.
+#[path = "updater/macos_bundle.rs"]
+mod macos_bundle;
+pub use macos_bundle::{FOLDER_ACCESS_NOTICE, take_folder_access_notice};
 pub use protected_release::download_protected_release;
 pub use release_identity::{VerifiedReleaseIdentity, verify_release_archive_with_pubkey};
 
@@ -115,6 +120,12 @@ pub async fn on_disk_version() -> Option<String> {
     if exe.as_os_str().is_empty() {
         return None;
     }
+    probe_version(&exe).await
+}
+
+/// `<exe> version`, parsed — `None` when it cannot run or prints no version.
+async fn probe_version(exe: &std::path::Path) -> Option<String> {
+    let exe = exe.to_path_buf();
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(VERIFY_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
@@ -444,12 +455,34 @@ pub fn detect_install_method() -> InstallMethod {
     if exe.as_os_str().is_empty() {
         return InstallMethod::Unknown;
     }
+    // Cached per process; `None` off macOS and for every non-gateway bundle
+    // (a `.app` with id ai.duduclaw.desktop — or an unreadable id — stays
+    // Desktop through the `.app/Contents/` branch below).
+    let gateway_bundle = duduclaw_core::macos_bundle::running_gateway_bundle();
+    install_method_for(&exe, gateway_bundle.as_deref(), |path| path.exists())
+}
 
+/// Pure half of [`detect_install_method`]: `gateway_bundle` is the root of
+/// the `ai.duduclaw.gateway` bundle `exe` runs from, if any.
+fn install_method_for(
+    exe: &std::path::Path,
+    gateway_bundle: Option<&std::path::Path>,
+    exists: impl FnMut(&std::path::Path) -> bool,
+) -> InstallMethod {
     // Enterprise wrapper: checked BEFORE Desktop, because a `duduclaw-pro`
     // deployed next to a desktop bundle is still a Pro install — the update
     // channel follows the BINARY, not the directory it happens to sit in.
-    if is_pro_wrapper_exe(&exe) {
+    if is_pro_wrapper_exe(exe) {
         return InstallMethod::Pro;
+    }
+
+    // RM-155: `DuDuClaw Gateway.app` (identified by CFBundleIdentifier, not
+    // by path) is a self-updating install. Checked BEFORE the `.app/Contents/`
+    // Desktop branch; the bundle swap path (`updater/macos_bundle.rs`) keeps
+    // its signature seal intact.
+    if let Some(root) = gateway_bundle {
+        let root = root.to_string_lossy();
+        return if root.contains("/node_modules/") { InstallMethod::Npm } else { InstallMethod::Standalone };
     }
 
     let exe_str = exe.to_string_lossy();
@@ -462,7 +495,7 @@ pub fn detect_install_method() -> InstallMethod {
     if exe_str.contains(".app/Contents/") {
         return InstallMethod::Desktop;
     }
-    if has_desktop_neighbor(&exe, |path| path.exists()) {
+    if has_desktop_neighbor(exe, exists) {
         return InstallMethod::Desktop;
     }
     if exe_str.contains("/Cellar/duduclaw/")
@@ -534,6 +567,45 @@ fn is_newer(current: &str, latest: &str) -> bool {
         (major, minor, patch)
     };
     parse(latest) > parse(current)
+}
+
+/// Why an archive is being installed — decides whether the version that is
+/// already running may be installed again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallIntent {
+    /// Regular update: strictly newer than the running AND the on-disk version.
+    Update,
+    /// Explicit bare → `DuDuClaw Gateway.app` migration: the same version as
+    /// the running bare binary is allowed (it is what migration installs).
+    MigrateToBundle,
+}
+
+/// Replay/downgrade gate: a validly signed OLD release must never be
+/// installable. `target` must be newer than the running version and the
+/// version on disk (when known); equal only when `allow_equal` (migration).
+/// A running pre-release (`1.81.0-rc.1`) is older than its final release.
+fn check_version_floor(target: &str, running: &str, on_disk: Option<&str>, allow_equal: bool) -> Result<(), String> {
+    let key = |v: &str, what: &str| -> Result<(u32, u32, u32, bool), String> {
+        let (a, b, c) = parse_version_tag(v)
+            .ok_or_else(|| format!("Update verification failed: cannot parse the {what} version {v:?}"))?;
+        Ok((a, b, c, !v.contains('-')))
+    };
+    let wanted = key(target, "release")?;
+    for (what, version) in [("running", Some(running)), ("installed", on_disk)] {
+        let Some(version) = version else { continue };
+        let have = key(version, what)?;
+        if wanted < have {
+            return Err(format!(
+                "Update verification failed: refusing downgrade — release v{target} is older than the {what} v{version}"
+            ));
+        }
+        if wanted == have && !allow_equal {
+            return Err(format!(
+                "Update verification failed: refusing to reinstall v{target} — it is already the {what} version"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Strict parse of a CLI version tag (`v1.46.2`, `1.46.2`, `v2.0.0-rc.1`).
@@ -612,6 +684,46 @@ fn platform_asset_suffix() -> &'static str {
     {
         "unknown"
     }
+}
+
+/// RM-155: suffix of the Developer ID-signed `DuDuClaw Gateway.app` asset
+/// (`duduclaw[-pro]-darwin-<arch>.app.zip`). macOS only — no other platform
+/// ever selects or accepts a bundle asset.
+fn bundle_asset_suffix() -> Option<&'static str> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Some("darwin-arm64.app.zip")
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        Some("darwin-x64.app.zip")
+    }
+    #[cfg(not(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64"))))]
+    {
+        None
+    }
+}
+
+/// Which release asset this install updates from.
+///
+/// - Running from `DuDuClaw Gateway.app`: the `.app.zip` only. A bare tarball
+///   would rewrite `Contents/MacOS/*` and break the bundle's seal, so a
+///   release without the bundle asset offers no URL (fail closed).
+/// - Migrating a bare install (`want_bundle`): the `.app.zip`, falling back to
+///   nothing — migration never installs a bare binary.
+/// - Bare macOS / every other platform: the platform tarball/zip, as before
+///   (old updaters and npm keep consuming it).
+fn select_update_asset<'a>(
+    assets: &'a [GitHubAsset],
+    archive_suffix: &str,
+    bundle_suffix: Option<&str>,
+    want_bundle: bool,
+) -> Option<&'a GitHubAsset> {
+    if want_bundle {
+        let suffix = bundle_suffix?;
+        return assets.iter().find(|a| a.name.ends_with(suffix));
+    }
+    assets.iter().find(|a| a.name.ends_with(archive_suffix))
 }
 
 fn binary_name() -> &'static str {
@@ -707,6 +819,52 @@ fn extract_sha256_token(text: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 pub async fn check_update() -> Result<UpdateInfo, String> {
+    let release = fetch_latest_cli_release().await?;
+    let latest = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name);
+    let available = is_newer(current_version(), latest);
+    let install_method = detect_install_method();
+
+    let download_url = select_update_asset(
+        &release.assets,
+        platform_asset_suffix(),
+        bundle_asset_suffix(),
+        duduclaw_core::macos_bundle::running_gateway_bundle().is_some(),
+    )
+    .map(|a| a.browser_download_url.clone())
+    .unwrap_or_default();
+
+    let checksum_url = if download_url.is_empty() {
+        String::new()
+    } else {
+        format!("{download_url}.sha256")
+    };
+
+    let release_notes: String = release
+        .body
+        .clone()
+        .unwrap_or_default()
+        .chars()
+        .take(MAX_RELEASE_NOTES_CHARS)
+        .collect();
+
+    Ok(UpdateInfo {
+        available,
+        current_version: current_version().to_string(),
+        latest_version: latest.to_string(),
+        release_notes,
+        published_at: release.published_at.clone().unwrap_or_default(),
+        download_url,
+        checksum_url,
+        install_method,
+    })
+}
+
+/// The latest CLI release (API, rate-limit-immune redirect fallback, and the
+/// desktop-tag pairing) — shared by [`check_update`] and [`migrate_to_bundle`].
+async fn fetch_latest_cli_release() -> Result<GitHubRelease, String> {
     // [R3:M2] Redirect policy for check_update — only allow GitHub API/CDN
     let ver = current_version();
     let ua = format!("{}/{ver}", "duduclaw");
@@ -763,46 +921,7 @@ pub async fn check_update() -> Result<UpdateInfo, String> {
 
     // "Latest" may be claimed by a desktop installer release (desktop-v*) —
     // resolve the paired CLI release before comparing versions.
-    let release = resolve_cli_release(&client, repo, release).await?;
-
-    let latest = release
-        .tag_name
-        .strip_prefix('v')
-        .unwrap_or(&release.tag_name);
-    let available = is_newer(current_version(), latest);
-    let install_method = detect_install_method();
-
-    let suffix = platform_asset_suffix();
-    let download_url = release
-        .assets
-        .iter()
-        .find(|a| a.name.ends_with(suffix))
-        .map(|a| a.browser_download_url.clone())
-        .unwrap_or_default();
-
-    let checksum_url = if download_url.is_empty() {
-        String::new()
-    } else {
-        format!("{download_url}.sha256")
-    };
-
-    let release_notes: String = release
-        .body
-        .unwrap_or_default()
-        .chars()
-        .take(MAX_RELEASE_NOTES_CHARS)
-        .collect();
-
-    Ok(UpdateInfo {
-        available,
-        current_version: current_version().to_string(),
-        latest_version: latest.to_string(),
-        release_notes,
-        published_at: release.published_at.unwrap_or_default(),
-        download_url,
-        checksum_url,
-        install_method,
-    })
+    resolve_cli_release(&client, repo, release).await
 }
 
 // ---------------------------------------------------------------------------
@@ -907,11 +1026,225 @@ pub async fn apply_update_with_progress(
     }
 
     info!(url = download_url, "Downloading update...");
+    let client = download_client()?;
+    download_verify_install(&client, download_url, checksum_url, &current_exe, exe_dir,
+        InstallIntent::Update, on_progress).await
+}
 
+/// [S1][C1] download (retrying only download-class failures) → minisign +
+/// SHA-256 + release identity → install. URLs were validated by the caller.
+async fn download_verify_install(
+    client: &reqwest::Client,
+    download_url: &str,
+    checksum_url: &str,
+    current_exe: &std::path::Path,
+    exe_dir: &std::path::Path,
+    intent: InstallIntent,
+    on_progress: ProgressSink<'_>,
+) -> Result<ApplyResult, String> {
+    // [S1] minisign signature URL is derived, not client-supplied — validate
+    // it before any network work so a bad shape fails fast, not mid-retry.
+    let signature_url = format!("{download_url}.minisig");
+    if !is_valid_download_url(&signature_url) {
+        return Err(format!("Rejected unsafe signature URL: {signature_url}"));
+    }
+
+    // Download + verify, retrying ONLY download-class failures. A checksum or
+    // signature failure aborts on the first attempt (fail-closed [S1][C1]).
+    let (bytes, identity) = with_retries(
+        &DOWNLOAD_RETRY_DELAYS_SECS,
+        &|attempt, max_attempts| {
+            on_progress(UpdateProgress {
+                phase: "downloading",
+                attempt,
+                max_attempts,
+            })
+        },
+        |_attempt| download_and_verify_once(client, download_url, checksum_url, &signature_url),
+    )
+    .await
+    .map_err(|e| e.message)?;
+
+    install_archive_bytes(&bytes, current_exe, exe_dir, &identity, intent).await
+}
+
+/// RM-155: migrate a bare macOS install (standalone / npm) to
+/// `DuDuClaw Gateway.app` — the dashboard "migrate" action
+/// (`system.migrate_bundle`), `duduclaw service migrate-bundle`, and the
+/// one-time automatic migration on the first v1.81 boot under launchd with
+/// auto-update enabled. Installs the latest release's signed `.app.zip`
+/// through exactly the same verification as an update (minisign + SHA-256 +
+/// release identity + pinned code signature), then points the old binary
+/// path and the LaunchAgent at the bundle. The caller restarts.
+pub async fn migrate_to_bundle() -> Result<ApplyResult, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("DuDuClaw Gateway.app migration is macOS-only".into())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if is_native_protected_install() || is_containerized() {
+            return Err("This install cannot migrate to DuDuClaw Gateway.app".into());
+        }
+        if duduclaw_core::macos_bundle::running_gateway_bundle().is_some() {
+            return Err("Already running from DuDuClaw Gateway.app".into());
+        }
+        let current_exe = duduclaw_core::platform::executable_path();
+        if current_exe.as_os_str().is_empty() {
+            return Err("Cannot determine current binary path".into());
+        }
+        // The public channel only ships CE; Enterprise migrates through its
+        // own update provider (`kind: "app-bundle"`).
+        if is_pro_wrapper_exe(&current_exe) {
+            return Err("企業版 (duduclaw-pro) 透過企業更新通道遷移到 DuDuClaw Gateway.app".into());
+        }
+        match detect_install_method() {
+            InstallMethod::Standalone | InstallMethod::Npm => {}
+            other => {
+                return Err(format!(
+                    "This install ({other:?}) cannot migrate to DuDuClaw Gateway.app — reinstall with install.sh"
+                ));
+            }
+        }
+        if UPDATE_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(UPDATE_BUSY.into());
+        }
+        let _guard = UpdateGuard;
+        let exe_dir = current_exe.parent().ok_or("Cannot determine binary directory")?.to_path_buf();
+        let release = fetch_latest_cli_release().await?;
+        let latest = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
+        if is_newer(latest, current_version()) {
+            return Err(format!(
+                "Running v{} is newer than the latest release v{latest}; migrate after the next release",
+                current_version()
+            ));
+        }
+        let download_url = select_update_asset(&release.assets, platform_asset_suffix(), bundle_asset_suffix(), true)
+            .map(|a| a.browser_download_url.clone())
+            .ok_or_else(|| format!("Release v{latest} has no DuDuClaw Gateway.app asset"))?;
+        if !is_valid_download_url(&download_url) {
+            return Err(format!("Rejected unsafe download URL: {download_url}"));
+        }
+        let checksum_url = format!("{download_url}.sha256");
+        if !is_valid_download_url(&checksum_url) {
+            return Err(format!("Rejected unsafe checksum URL: {checksum_url}"));
+        }
+        info!(url = %download_url, "Migrating to DuDuClaw Gateway.app...");
+        let client = download_client()?;
+        download_verify_install(&client, &download_url, &checksum_url, &current_exe, &exe_dir,
+            InstallIntent::MigrateToBundle, &|_| {}).await
+    }
+}
+
+/// Whether the dashboard should offer `system.migrate_bundle`: a bare
+/// standalone/npm CE install on macOS. Always false elsewhere.
+pub fn bundle_migration_offered() -> bool {
+    cfg!(target_os = "macos")
+        && !is_containerized()
+        && duduclaw_core::macos_bundle::running_gateway_bundle().is_none()
+        && !is_pro_wrapper_exe(&duduclaw_core::platform::executable_path())
+        && matches!(detect_install_method(), InstallMethod::Standalone | InstallMethod::Npm)
+}
+
+/// Error text when another install holds the update slot.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const UPDATE_BUSY: &str = "Another update is already in progress";
+
+/// RM-155 boot maintenance (macOS; no-op elsewhere): rewrite LaunchAgent
+/// plists that reach this executable through another spelling, remove stale
+/// `.duduclaw-update-*` staging directories, and — once, on the first boot
+/// under launchd with auto-update enabled (owner decision D5=A) — migrate a
+/// bare install to `DuDuClaw Gateway.app` and relaunch from it.
+pub async fn macos_boot_maintenance(home_dir: PathBuf, auto_update: bool) {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (home_dir, auto_update);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let maintenance = tokio::task::spawn_blocking(|| {
+            let _ = duduclaw_core::autostart::migrate_launchd_plists();
+            let exe = duduclaw_core::platform::executable_path();
+            let parent = match duduclaw_core::macos_bundle::running_gateway_bundle() {
+                Some(bundle) => bundle.parent().map(std::path::Path::to_path_buf),
+                None => dirs::home_dir().and_then(|home| {
+                    duduclaw_core::macos_bundle::migration_target_root(&exe, &home)
+                        .parent().map(std::path::Path::to_path_buf)
+                }),
+            };
+            let has_staging = |dir: &std::path::Path| std::fs::read_dir(dir).is_ok_and(|entries| {
+                entries.flatten().any(|e| e.file_name().to_str()
+                    .is_some_and(|n| n.starts_with(duduclaw_core::macos_bundle::STAGING_PREFIX)))
+            });
+            if let Some(parent) = parent.filter(|p| has_staging(p.as_path())) {
+                // Under the cross-process bundle lock: restores a bundle an
+                // interrupted swap left only in staging, then removes stale
+                // staging. Another process mid-update → try next boot.
+                match macos_bundle::lock_bundle_parent(&parent) {
+                    Ok(_lock) => {
+                        let removed = macos_bundle::cleanup_stale_staging(&parent, &exe,
+                            std::time::Duration::from_secs(3600));
+                        if removed > 0 {
+                            info!(removed, dir = %parent.display(), "Removed stale DuDuClaw Gateway.app staging directories");
+                        }
+                    }
+                    Err(e) => info!(error = %e, dir = %parent.display(), "Skipping DuDuClaw Gateway.app staging recovery"),
+                }
+            }
+        });
+        let _ = maintenance.await;
+
+        let launchd_job = std::env::var("XPC_SERVICE_NAME").is_ok_and(|name| {
+            name == duduclaw_core::autostart::LAUNCHD_LABEL || name == duduclaw_core::autostart::LEGACY_LAUNCHD_LABEL
+        });
+        let eligible = auto_update
+            && launchd_job
+            && duduclaw_core::macos_bundle::running_gateway_bundle().is_none()
+            && !is_pro_wrapper_exe(&duduclaw_core::platform::executable_path())
+            && matches!(detect_install_method(), InstallMethod::Standalone | InstallMethod::Npm);
+        let marker = home_dir.join("state").join("macos_bundle_migration.json");
+        if !eligible || marker.exists() {
+            return;
+        }
+        // Before the auto-update loop's first check (30 s) so the two do not
+        // race for the update slot.
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        let outcome = migrate_to_bundle().await;
+        if matches!(&outcome, Err(e) if e == UPDATE_BUSY) {
+            return; // try again next boot
+        }
+        // One automatic attempt per install, success or not; afterwards the
+        // dashboard action / `duduclaw service migrate-bundle` remain.
+        let record = serde_json::json!({
+            "version": current_version(),
+            "ok": outcome.as_ref().is_ok_and(|r| r.success),
+            "error": outcome.as_ref().err().map(|e| sanitize_failure_detail(e)),
+        });
+        if let Some(dir) = marker.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&marker, record.to_string());
+        match outcome {
+            Ok(result) if result.success && result.needs_restart => {
+                info!("Migrated to DuDuClaw Gateway.app — relaunching from the bundle");
+                restart_after_update().await;
+            }
+            Ok(result) => warn!(msg = %sanitize_failure_detail(&result.message), "DuDuClaw Gateway.app migration skipped"),
+            Err(e) => warn!(error = %sanitize_failure_detail(&e), "DuDuClaw Gateway.app migration failed; use the dashboard or `duduclaw service migrate-bundle`"),
+        }
+    }
+}
+
+/// [R2:NM2] Release-download client: redirects re-validated against GitHub's
+/// release CDNs and this repository only.
+fn download_client() -> Result<reqwest::Client, String> {
     // [R2:NM2] Custom redirect policy — re-validate redirect targets
     let ver = current_version();
     let ua = format!("{}/{ver}", "duduclaw");
-    let client = reqwest::Client::builder()
+    reqwest::Client::builder()
         .user_agent(&ua)
         .timeout(std::time::Duration::from_secs(300))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
@@ -932,32 +1265,7 @@ pub async fn apply_update_with_progress(
             }
         }))
         .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
-
-    // [S1] minisign signature URL is derived, not client-supplied — validate
-    // it before any network work so a bad shape fails fast, not mid-retry.
-    let signature_url = format!("{download_url}.minisig");
-    if !is_valid_download_url(&signature_url) {
-        return Err(format!("Rejected unsafe signature URL: {signature_url}"));
-    }
-
-    // Download + verify, retrying ONLY download-class failures. A checksum or
-    // signature failure aborts on the first attempt (fail-closed [S1][C1]).
-    let (bytes, identity) = with_retries(
-        &DOWNLOAD_RETRY_DELAYS_SECS,
-        &|attempt, max_attempts| {
-            on_progress(UpdateProgress {
-                phase: "downloading",
-                attempt,
-                max_attempts,
-            })
-        },
-        |_attempt| download_and_verify_once(&client, download_url, checksum_url, &signature_url),
-    )
-    .await
-    .map_err(|e| e.message)?;
-
-    install_archive_bytes(&bytes, &current_exe, exe_dir, &identity).await
+        .map_err(|e| format!("HTTP client error: {e}"))
 }
 
 /// Install an already-verified archive over the running binary: extract →
@@ -967,14 +1275,62 @@ pub async fn apply_update_with_progress(
 /// directory permissions); this is only the swap machine. Shared by the CE
 /// GitHub path and by [`install_verified_binary`] so a provider cannot end up
 /// with a subtly different install sequence.
+///
+/// This is the single choke point every install goes through, so the
+/// replay/downgrade gate lives here: the signed release version must be newer
+/// than both the running version and the version of the binary on disk
+/// ([`check_version_floor`]); the same version only for an explicit
+/// [`InstallIntent::MigrateToBundle`] of a bare install to the `.app.zip`.
 async fn install_archive_bytes(
     archive_bytes: &[u8],
     current_exe: &std::path::Path,
     exe_dir: &std::path::Path,
     identity: &VerifiedReleaseIdentity,
+    intent: InstallIntent,
 ) -> Result<ApplyResult, String> {
     identity.check_archive(archive_bytes)
         .map_err(|e| format!("Update verification failed: {e}"))?;
+    let migrating = intent == InstallIntent::MigrateToBundle;
+    if migrating && !(release_identity::is_bundle_file(identity.file())
+        && duduclaw_core::macos_bundle::running_gateway_bundle().is_none())
+    {
+        return Err("Update verification failed: bundle migration requires the .app.zip asset and a bare install".into());
+    }
+    let on_disk = probe_version(current_exe).await;
+    check_version_floor(identity.version(), current_version(), on_disk.as_deref(), migrating)?;
+    install_floor_checked(archive_bytes, current_exe, exe_dir, identity, migrating).await
+}
+
+/// [`install_archive_bytes`] after the version floor passed (tests call this
+/// directly to exercise later stages with older signed fixtures).
+async fn install_floor_checked(
+    archive_bytes: &[u8],
+    current_exe: &std::path::Path,
+    exe_dir: &std::path::Path,
+    identity: &VerifiedReleaseIdentity,
+    allow_equal: bool,
+) -> Result<ApplyResult, String> {
+    identity.check_archive(archive_bytes)
+        .map_err(|e| format!("Update verification failed: {e}"))?;
+    // RM-155: a verified `.app.zip` goes through the bundle pipeline
+    // (strict unzip → codesign gate → atomic directory swap).
+    if release_identity::is_bundle_file(identity.file()) {
+        #[cfg(target_os = "macos")]
+        {
+            let (result, installed) =
+                macos_bundle::install_bundle_archive(archive_bytes, current_exe, identity, allow_equal).await?;
+            set_installed_exe(installed);
+            return Ok(result);
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err("App bundle updates are macOS-only".into());
+    }
+    let _ = allow_equal; // the bundle pipeline re-checks an adopted bundle's version
+    // Writing a bare binary into `Contents/MacOS/` would break the bundle's
+    // signature seal (and TCC's identity for it).
+    if duduclaw_core::macos_bundle::running_gateway_bundle().is_some() {
+        return Err("DuDuClaw Gateway.app only updates from the signed .app.zip release asset".into());
+    }
     // Stream into a same-directory, exclusively created staging file; never buffer the binary.
     let mut builder = tempfile::Builder::new();
     builder.prefix(".duduclaw-update-");
@@ -1014,7 +1370,26 @@ async fn install_archive_bytes(
 /// 2. **Directory permissions** — the same [`duduclaw_core::platform::is_unsafe_update_dir`]
 ///    gate the CE path applies, so a world-writable install directory cannot be
 ///    used to land a binary.
+///
+/// The signed version must be newer than the running and the on-disk version
+/// (downgrade / replay gate in [`install_archive_bytes`]).
 pub async fn install_verified_binary(archive_bytes: &[u8], identity: &VerifiedReleaseIdentity) -> Result<ApplyResult, String> {
+    install_verified_with_intent(archive_bytes, identity, InstallIntent::Update).await
+}
+
+/// [`install_verified_binary`] for the explicit bare → `DuDuClaw Gateway.app`
+/// migration (a provider's `.app.zip` offer to a bare install). The only
+/// provider path that may install the version that is already running;
+/// anything older is still refused, and the archive must be the bundle asset.
+pub async fn install_verified_bundle_migration(archive_bytes: &[u8], identity: &VerifiedReleaseIdentity) -> Result<ApplyResult, String> {
+    install_verified_with_intent(archive_bytes, identity, InstallIntent::MigrateToBundle).await
+}
+
+async fn install_verified_with_intent(
+    archive_bytes: &[u8],
+    identity: &VerifiedReleaseIdentity,
+    intent: InstallIntent,
+) -> Result<ApplyResult, String> {
     if is_native_protected_install() { return Err(NATIVE_PROTECTED_UPDATE_HINT.into()); }
     if is_containerized() {
         return Err(
@@ -1049,7 +1424,7 @@ pub async fn install_verified_binary(archive_bytes: &[u8], identity: &VerifiedRe
         ));
     }
 
-    install_archive_bytes(archive_bytes, &current_exe, exe_dir, identity).await
+    install_archive_bytes(archive_bytes, &current_exe, exe_dir, identity, intent).await
 }
 
 /// Fetch a release asset body once, classifying every failure. Network errors
@@ -1239,12 +1614,32 @@ async fn apply_update_inner(
     })
 }
 
+/// Executable the last successful install put in place, when it differs from
+/// this process's own path (bare → `DuDuClaw Gateway.app` migration).
+static INSTALLED_EXE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn set_installed_exe(path: PathBuf) {
+    if let Ok(mut slot) = INSTALLED_EXE.lock() {
+        *slot = Some(path);
+    }
+}
+
+/// The executable the relaunch must start: the freshly installed one, or
+/// (no install recorded) this process's own canonical path.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn installed_exe() -> PathBuf {
+    INSTALLED_EXE.lock().ok().and_then(|slot| slot.clone())
+        .unwrap_or_else(duduclaw_core::platform::executable_path)
+}
+
 /// Called only after a successful verified install (or the explicit on-disk
 /// update restart gate). A launchd helper owns shutdown; never exec on failure.
 pub async fn restart_after_update() {
     #[cfg(target_os = "macos")]
-    match duduclaw_core::autostart::update_restart::schedule_if_managed(
+    match duduclaw_core::autostart::update_restart::schedule_if_managed_for(
         detect_install_method() == InstallMethod::Desktop,
+        &installed_exe(),
     ).await {
         Ok(true) => {
             info!("Update installed — independent launchd helper scheduled to re-register and restart gateway");
@@ -1505,16 +1900,19 @@ fn tag_from_latest_location(location: &str) -> Option<String> {
 /// release object is unavailable (rate-limited API). Release notes / publish
 /// date are unavailable here — empty, never fabricated.
 fn synthesize_release(repo: &str, tag: &str) -> GitHubRelease {
-    let asset_name = format!("duduclaw-{}", platform_asset_suffix());
-    let download_url = format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}");
+    let assets = std::iter::once(platform_asset_suffix())
+        .chain(bundle_asset_suffix())
+        .map(|suffix| {
+            let name = format!("duduclaw-{suffix}");
+            let browser_download_url = format!("https://github.com/{repo}/releases/download/{tag}/{name}");
+            GitHubAsset { name, browser_download_url }
+        })
+        .collect();
     GitHubRelease {
         tag_name: tag.to_string(),
         body: None,
         published_at: None,
-        assets: vec![GitHubAsset {
-            name: asset_name,
-            browser_download_url: download_url,
-        }],
+        assets,
     }
 }
 
@@ -1760,6 +2158,42 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
     #[test]
     fn test_platform_asset_suffix() {
         assert!(!platform_asset_suffix().is_empty());
+        assert_eq!(bundle_asset_suffix().is_some(), cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn gateway_bundle_is_detected_by_id_before_the_desktop_branch() {
+        use std::path::Path;
+        let none = |_: &Path| false;
+        let app = Path::new("/Users/k/Applications/DuDuClaw Gateway.app");
+        let exe = Path::new("/Users/k/Applications/DuDuClaw Gateway.app/Contents/MacOS/duduclaw");
+        assert_eq!(install_method_for(exe, Some(app), none), InstallMethod::Standalone);
+        let npm = Path::new("/opt/homebrew/lib/node_modules/@duduclaw/darwin-arm64/DuDuClaw Gateway.app");
+        assert_eq!(install_method_for(&npm.join("Contents/MacOS/duduclaw"), Some(npm), none), InstallMethod::Npm);
+        // Same layout without the gateway id (desktop app, unreadable id) stays Desktop.
+        assert_eq!(install_method_for(exe, None, none), InstallMethod::Desktop);
+        assert_eq!(install_method_for(Path::new("/Applications/DuDuClaw.app/Contents/MacOS/duduclaw"), None, none),
+            InstallMethod::Desktop);
+        // Pro is still Pro inside the bundle (updates via its provider).
+        assert_eq!(install_method_for(&app.join("Contents/MacOS/duduclaw-pro"), Some(app), none), InstallMethod::Pro);
+        assert_eq!(install_method_for(Path::new("/Users/k/.duduclaw/bin/duduclaw"), None, none), InstallMethod::Standalone);
+    }
+
+    #[test]
+    fn bundle_installs_only_take_the_app_zip_asset() {
+        let asset = |name: &str| GitHubAsset { name: name.into(), browser_download_url: format!("https://x/{name}") };
+        let both = [asset("duduclaw-darwin-arm64.tar.gz"), asset("duduclaw-darwin-arm64.app.zip")];
+        let tar_only = [asset("duduclaw-darwin-arm64.tar.gz")];
+        let pick = |assets: &[GitHubAsset], bundle: bool| {
+            select_update_asset(assets, "darwin-arm64.tar.gz", Some("darwin-arm64.app.zip"), bundle).map(|a| a.name.clone())
+        };
+        assert_eq!(pick(&both, true).as_deref(), Some("duduclaw-darwin-arm64.app.zip"));
+        assert_eq!(pick(&both, false).as_deref(), Some("duduclaw-darwin-arm64.tar.gz"));
+        assert_eq!(pick(&tar_only, false).as_deref(), Some("duduclaw-darwin-arm64.tar.gz"));
+        // A bundle never falls back to the bare tarball (it would break the seal).
+        assert_eq!(pick(&tar_only, true), None);
+        // No bundle suffix (non-macOS) never yields a bundle.
+        assert!(select_update_asset(&both, "linux-x64.tar.gz", None, true).is_none());
     }
 
     #[test]
@@ -1902,8 +2336,8 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         let (archive, identity) = release_identity::tests::verified_fixture();
         // A mismatched proof must fail before even trying to create a staging file.
         let missing_dir = dir.path().join("missing");
-        let error = install_archive_bytes(b"not a gzip archive", &target, &missing_dir, &identity)
-            .await.unwrap_err();
+        let error = install_archive_bytes(b"not a gzip archive", &target, &missing_dir, &identity,
+            InstallIntent::Update).await.unwrap_err();
         assert_eq!(failure_payload(&error)["kind"], "verify");
         assert!(error.contains("different archive"));
         let payload = failure_payload(&error);
@@ -1919,7 +2353,9 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         // The verified CE archive has no Pro entry: retain the install-path
         // extraction failure and staging cleanup coverage behind the identity gate.
         let pro_target = dir.path().join("duduclaw-pro");
-        let error = install_archive_bytes(archive, &pro_target, dir.path(), &identity)
+        // The fixture is an OLD signed release: past the version floor only
+        // through the inner stage (the floor itself is tested separately).
+        let error = install_floor_checked(archive, &pro_target, dir.path(), &identity, false)
             .await.unwrap_err();
         let payload = failure_payload(&error);
         assert_eq!(payload["kind"], "extract");
@@ -1928,9 +2364,72 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 
         let missing_dir = dir.path().join("missing");
-        let error = install_archive_bytes(archive, &target, &missing_dir, &identity).await.unwrap_err();
+        let error = install_floor_checked(archive, &target, &missing_dir, &identity, false).await.unwrap_err();
         assert_eq!(failure_payload(&error)["kind"], "write");
         assert!(error.starts_with("Failed to stage binary:"));
+    }
+
+    #[test]
+    fn version_floor_refuses_downgrades_and_same_version_reinstalls() {
+        // Newer than both: allowed.
+        assert!(check_version_floor("1.82.0", "1.81.0", Some("1.81.0"), false).is_ok());
+        assert!(check_version_floor("1.82.0", "1.81.0", None, false).is_ok());
+        // Older than the running version (signed-archive replay): refused,
+        // even for migration.
+        for allow_equal in [false, true] {
+            let e = check_version_floor("1.80.0", "1.81.0", None, allow_equal).unwrap_err();
+            assert!(e.contains("refusing downgrade") && e.contains("running"), "{e}");
+        }
+        // Older than what is already on disk (restart pending): refused.
+        let e = check_version_floor("1.81.5", "1.81.0", Some("1.82.0"), false).unwrap_err();
+        assert!(e.contains("refusing downgrade") && e.contains("installed"), "{e}");
+        assert!(check_version_floor("1.81.5", "1.81.0", Some("1.82.0"), true).is_err());
+        // Same version: only the explicit migration may reinstall it.
+        assert!(check_version_floor("1.81.0", "1.81.0", Some("1.81.0"), false).unwrap_err().contains("reinstall"));
+        assert!(check_version_floor("1.81.0", "1.81.0", Some("1.81.0"), true).is_ok());
+        assert!(check_version_floor("1.81.0", "1.80.0", Some("1.81.0"), false).is_err());
+        // A running pre-release is older than its final release.
+        assert!(check_version_floor("1.81.0", "1.81.0-rc.1", None, false).is_ok());
+        assert!(check_version_floor("1.80.9", "1.81.0-rc.1", None, false).is_err());
+        // Numeric, not lexical.
+        assert!(check_version_floor("1.10.0", "1.9.9", None, false).is_ok());
+        // Unparseable versions fail closed.
+        assert!(check_version_floor("1.81.0", "dev", None, false).is_err());
+        assert!(check_version_floor("1.81.0", "1.80.0", Some("garbage"), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn install_refuses_a_validly_signed_old_release_before_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("duduclaw");
+        std::fs::write(&target, b"installed binary").unwrap();
+        // Signed (test key) for v1.80.0 — older than this crate's running version.
+        let (archive, identity) = release_identity::tests::verified_fixture();
+        assert!(is_newer(identity.version(), current_version()), "fixture must predate the running version");
+        for intent in [InstallIntent::Update, InstallIntent::MigrateToBundle] {
+            let error = install_archive_bytes(archive, &target, dir.path(), &identity, intent)
+                .await.unwrap_err();
+            assert!(error.starts_with("Update verification failed:"), "{error}");
+            assert_eq!(failure_payload(&error)["kind"], "verify");
+            assert_eq!(std::fs::read(&target).unwrap(), b"installed binary");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "nothing staged");
+        }
+        // Migration intent is only valid for the bundle asset.
+        let error = install_archive_bytes(archive, &target, dir.path(), &identity,
+            InstallIntent::MigrateToBundle).await.unwrap_err();
+        assert!(error.contains("bundle migration requires"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_version_reads_the_on_disk_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("duduclaw");
+        std::fs::write(&exe, b"#!/bin/sh\necho 'starting'\necho 'duduclaw 9.9.9'\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(probe_version(&exe).await.as_deref(), Some("9.9.9"));
+        assert_eq!(probe_version(&dir.path().join("missing")).await, None);
     }
 
     #[test]
@@ -2180,7 +2679,8 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
     fn synthesize_release_builds_deterministic_urls() {
         let r = synthesize_release("zhixuli0406/DuDuClaw", "v1.46.2");
         assert_eq!(r.tag_name, "v1.46.2");
-        assert_eq!(r.assets.len(), 1);
+        // macOS also synthesizes the `.app.zip` bundle asset (RM-155).
+        assert_eq!(r.assets.len(), 1 + usize::from(bundle_asset_suffix().is_some()));
         assert!(r.assets[0].browser_download_url.starts_with(
             "https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.46.2/duduclaw-"
         ));

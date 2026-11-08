@@ -66,6 +66,11 @@ pub enum DecisionSource {
     /// decision anything waits on; it shares the codec so every channel
     /// dispatcher routes the press without a new branch.
     Digest,
+    /// RM-155: a macOS folder-access (TCC) state change pushed to admins
+    /// (`macos_folder_access`). A notice, not a decision — no act is valid
+    /// for it, so no button is ever rendered or accepted. It exists as a
+    /// source so the card rides `notify_push` and its quiet-hours deferral.
+    FolderAccess,
 }
 
 impl DecisionSource {
@@ -78,6 +83,7 @@ impl DecisionSource {
             Self::Install => "inst",
             Self::Autopilot => "auto",
             Self::Digest => "dig",
+            Self::FolderAccess => "tcc",
         }
     }
 
@@ -89,6 +95,7 @@ impl DecisionSource {
             "inst" => Some(Self::Install),
             "auto" => Some(Self::Autopilot),
             "dig" => Some(Self::Digest),
+            "tcc" => Some(Self::FolderAccess),
             _ => None,
         }
     }
@@ -105,6 +112,7 @@ impl DecisionSource {
             Self::Install => "install",
             Self::Autopilot => "autopilot_circuit",
             Self::Digest => "digest_feedback",
+            Self::FolderAccess => "macos_folder_access",
         }
     }
 }
@@ -187,6 +195,8 @@ impl DecisionAct {
             }
             DecisionSource::Autopilot => matches!(self, Self::Pause),
             DecisionSource::Digest => matches!(self, Self::Up | Self::Down | Self::Changes),
+            // A notice: nothing to press.
+            DecisionSource::FolderAccess => false,
         }
     }
 }
@@ -328,14 +338,24 @@ fn parse_legacy(data: &str) -> Option<DecisionAction> {
 mod tests {
     use super::*;
 
-    const ALL_SOURCES: [DecisionSource; 6] = [
+    const ALL_SOURCES: [DecisionSource; 7] = [
         DecisionSource::Goal,
         DecisionSource::Kickoff,
         DecisionSource::Approval,
         DecisionSource::Install,
         DecisionSource::Autopilot,
         DecisionSource::Digest,
+        DecisionSource::FolderAccess,
     ];
+
+    #[test]
+    fn folder_access_notice_accepts_no_act() {
+        for act in ALL_ACTS {
+            assert!(!act.valid_for(DecisionSource::FolderAccess));
+            assert_eq!(parse(&encode(DecisionSource::FolderAccess, act, "x")), None);
+        }
+        assert_eq!(DecisionSource::from_token("tcc"), Some(DecisionSource::FolderAccess));
+    }
     const ALL_ACTS: [DecisionAct; 10] = [
         DecisionAct::Retry,
         DecisionAct::Done,

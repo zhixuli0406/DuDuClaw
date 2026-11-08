@@ -382,6 +382,20 @@ export interface SystemStatus {
   /** v1.68 W2: whether this build was compiled with OpenTelemetry tracing
    *  (`otel` cargo feature). Absent on older gateways → treat as `false`. */
   otel_compiled?: boolean;
+  /**
+   * RM-155: macOS folder access (privacy consent) for the protected folders
+   * this gateway uses. Present only while it is pending or denied; absent
+   * means healthy (or not macOS). Drives `FolderAccessBanner`.
+   */
+  folder_access?: FolderAccessStatus;
+}
+
+export type FolderAccessState = 'granted' | 'denied' | 'posix_denied' | 'pending_prompt' | 'unavailable';
+
+export interface FolderAccessStatus {
+  state: FolderAccessState;
+  paths: { path_label: string; state: FolderAccessState }[];
+  docs_url?: string;
 }
 
 /** Response of `system.autostart.status` / `system.autostart.set` — the
@@ -7862,6 +7876,24 @@ export const api = {
          * older gateways ⇒ treated as `false`.
          */
         containerized?: boolean;
+        /** macOS: running from the signed DuDuClaw Gateway.app (RM-155). */
+        macos_bundle?: boolean;
+        /** macOS bare standalone/npm install: offer `system.migrate_bundle`. */
+        macos_bundle_migratable?: boolean;
+        /** One-time notice after a migration (macOS asks for folder access once). */
+        macos_bundle_notice?: string | null;
+      }>,
+    /**
+     * macOS: move a bare install into DuDuClaw Gateway.app (same verification
+     * as an update) and relaunch. Long timeout for the same reason as
+     * `applyUpdate`.
+     */
+    migrateBundle: () =>
+      client.call('system.migrate_bundle', {}, false, 600000) as Promise<{
+        success: boolean;
+        message: string;
+        needs_restart: boolean;
+        restart_hint?: string | null;
       }>,
     /**
      * Installing an update = download + checksum + signature + extract + swap,

@@ -4009,6 +4009,17 @@ pub(super) async fn build_reply_with_session_inner(
         let language = crate::prompt_identity::resolve_fixed_message_language_for_id(
             &ctx.home_dir, &agent_id,
         ).await;
+        // RM-155: the TCC explanation carries no path or account detail, so
+        // it is safe for every non-visitor audience.
+        if reason == FailureReason::Timeout {
+            if let Some(text) = crate::macos_folder_access::channel_timeout_explanation(
+                &ctx.home_dir,
+                &name,
+                language.as_deref(),
+            ) {
+                return text;
+            }
+        }
         return end_user_failure_message(&name, reason, language.as_deref());
     }
     // The spawn gate already wrote its own audit event; the person sees the

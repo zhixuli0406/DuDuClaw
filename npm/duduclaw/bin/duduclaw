@@ -4,6 +4,7 @@
 
 const { spawnSync } = require("child_process");
 const path = require("path");
+const fs = require("fs");
 
 const PLATFORM_PACKAGES = {
   "darwin-arm64": "@duduclaw/darwin-arm64",
@@ -25,6 +26,10 @@ function getBinaryPath() {
   try {
     const pkgDir = path.dirname(require.resolve(`${pkg}/package.json`));
     const binName = process.platform === "win32" ? "duduclaw.exe" : "duduclaw";
+    if (process.platform === "darwin") {
+      const bundlePath = path.join(pkgDir, "DuDuClaw Gateway.app", "Contents", "MacOS", "duduclaw");
+      if (fs.existsSync(bundlePath)) return bundlePath;
+    }
     return path.join(pkgDir, "bin", binName);
   } catch {
     throw new Error(

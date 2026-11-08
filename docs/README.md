@@ -183,6 +183,7 @@ New: [Add teammates and first login](guides/user-management-and-first-login.md) 
 | [guides/workforce-analytics.md](guides/workforce-analytics.md) | Workforce analytics — per-user and per-channel AI usage and cost | Current |
 | [guides/editions.md](guides/editions.md) | Personal vs Enterprise edition comparison (limits, management surfaces, what decides the edition, how to upgrade; [zh-TW](guides/zh-TW/editions.md), [ja-JP](guides/ja-JP/editions.md)) | Current |
 | [guides/deployment-guide.md](guides/deployment-guide.md) | Production deployment (Tailscale/ngrok/Docker/systemd) | Current |
+| [guides/macos-folder-access.md](guides/macos-folder-access.md) | macOS folder access (privacy consent) after an update: why macOS asks again, how to re-grant, where to keep work files and `DUDUCLAW_HOME`, Full Disk Access trade-offs, enterprise PPPC profile, install.sh vs npm ([zh-TW](guides/zh-TW/macos-folder-access.md), [ja-JP](guides/ja-JP/macos-folder-access.md)) | Current |
 | [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |
 | [guides/mcp-call-lifetimes.md](guides/mcp-call-lifetimes.md) | Host API reference for scoped MCP HTTP authority and operation lifetime ([zh-TW](guides/zh-TW/mcp-call-lifetimes.md), [ja-JP](guides/ja-JP/mcp-call-lifetimes.md)); Gateway/provider integration is separate | Current (v1.76.0) |
 | [guides/custom-mcp-tool.md](guides/custom-mcp-tool.md) | Extending MCP tools — step-by-step guide | Current |

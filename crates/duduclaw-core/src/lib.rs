@@ -42,6 +42,7 @@ pub mod keychain;
 pub mod knowledge_agent;
 pub mod lenient;
 pub mod llm_contract;
+pub mod macos_bundle;
 pub mod match_utils;
 pub mod net_addr;
 pub mod mcp_scopes;
@@ -458,6 +459,17 @@ pub fn resolve_duduclaw_bin() -> std::path::PathBuf {
     {
         return std::path::PathBuf::from(override_path);
     }
+    // macOS: the canonical path (cached), so `.mcp.json` / hooks name the
+    // real file inside `DuDuClaw Gateway.app` rather than a CLI symlink.
+    #[cfg(target_os = "macos")]
+    let exe = {
+        let exe = crate::platform::executable_path();
+        if exe.as_os_str().is_empty() {
+            return std::path::PathBuf::from("duduclaw");
+        }
+        exe
+    };
+    #[cfg(not(target_os = "macos"))]
     let Ok(exe) = std::env::current_exe() else {
         return std::path::PathBuf::from("duduclaw");
     };

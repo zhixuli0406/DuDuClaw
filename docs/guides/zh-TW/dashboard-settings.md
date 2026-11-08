@@ -489,6 +489,18 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 
 磁碟上已經有較新的 gateway binary 但還沒執行時（npm 安裝、手動換檔、更新後沒重新啟動），按鈕會顯示「重新啟動 gateway 套用 v…」，呼叫 `system.restart_pending_update`（管理員）。gateway 只有在磁碟版本確實不同於執行中版本時才接受；容器與桌面 sidecar 由各自的擁有者重新啟動，這裡會拒絕。重開桌面 App 不會重啟外部 gateway。
 
+### macOS：DuDuClaw Gateway.app（v1.81.0）
+
+macOS 上的 gateway 改為已簽章的 App「DuDuClaw Gateway.app」（識別碼 `ai.duduclaw.gateway`，社群版與企業版相同）。macOS 會在更新後保留 App 的資料夾、自動化與完整磁碟取用權限，只要授權一次，不必每次發版都重新授權。App 安裝只會從發行版中已簽章的 `duduclaw-darwin-<arch>.app.zip` 更新。換上新版前，gateway 會比對簽章是否來自 DuDuClaw 開發者、是否符合目前已安裝 App 的簽章，並確認 App 的識別碼、版本與版別都和簽章的發行版一致。新版以原子方式換上並先執行一次（`version`）。任何一項檢查沒通過就不更新，已安裝的 App 維持原樣或換回。
+
+還在以單一執行檔（獨立安裝或 npm）執行的 gateway，可用三種方式移到 App：
+
+- 開啟自動更新、由登入服務（launchd）啟動時，v1.81 第一次啟動會自動移轉一次。
+- 這一頁的「移到 DuDuClaw Gateway.app」（`system.migrate_bundle`，管理員）。
+- 在終端機執行 `duduclaw service migrate-bundle`，再執行 `duduclaw service restart`。
+
+移轉會把 App 安裝到 `~/Applications/`（npm 安裝則放在 npm 平台套件內），並把原本的執行檔換成指向 App 的連結，現有指令照常可用。登入服務也會改為啟動 App，並從 App 重新啟動 gateway。之後 macOS 會針對新的 App 詢問一次資料夾存取權限，頁面會在移轉後提示一次。
+
 ## 思考過程顯示
 
 目前沒有專用控制項，請在下方的設定檔進階編輯修改。兩個檔案每輪都重新讀取，改完下一則回覆就生效。

@@ -14,6 +14,14 @@ LEGACY_BINARY_LIMIT = 209_715_200
 BINARY_NAMES = {"duduclaw", "duduclaw.exe", "duduclaw-pro", "duduclaw-pro.exe"}
 
 
+# Load by path so these standalone scripts also work under importlib-based tests.
+import importlib.util
+_bundle_spec = importlib.util.spec_from_file_location(
+    "macos_bundle_archive", Path(__file__).with_name("macos_bundle_archive.py"))
+_bundle = importlib.util.module_from_spec(_bundle_spec)
+_bundle_spec.loader.exec_module(_bundle)
+
+
 def check_member(name: str, size: int, regular: bool, is_dir: bool = False) -> bool:
     # Validate every member, including files the updater would otherwise skip.
     parts = name.replace("\\", "/").split("/")
@@ -56,6 +64,9 @@ def check_archive(path: Path) -> None:
                 pass
     elif path.suffix == ".zip":
         with zipfile.ZipFile(path) as archive:
+            if path.name.endswith(".app.zip"):
+                _bundle.bundle_executable(archive, path.name)
+                return
             for entry in archive.infolist():
                 mode = (entry.external_attr >> 16) & 0o170000
                 regular = not entry.is_dir() and mode in (0, 0o100000)

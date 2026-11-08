@@ -5065,6 +5065,7 @@ effect = "forbid"
         "notion_search",
         "notion_status",
         "odoo_connect",
+        "odoo_create",
         "odoo_crm_create_lead",
         "odoo_crm_leads",
         "odoo_crm_update_stage",
@@ -5082,6 +5083,7 @@ effect = "forbid"
         "odoo_schema_overview",
         "odoo_search",
         "odoo_status",
+        "odoo_write",
         "office_script",
         "os_apply_update",
         "os_audio_get",
@@ -5204,7 +5206,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            261,
+            263,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();

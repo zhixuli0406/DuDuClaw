@@ -2317,6 +2317,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Pro edition: auto-download + install + graceful restart (unless disabled).
     // CE edition: notify dashboard only.
     let auto_update = crate::updater::auto_update_enabled(&home_dir);
+    // RM-155 (macOS; no-op elsewhere): LaunchAgent path migration, stale
+    // bundle-staging cleanup, and the one-time bare → DuDuClaw Gateway.app
+    // migration under launchd with auto-update enabled.
+    tokio::spawn(crate::updater::macos_boot_maintenance(home_dir.clone(), auto_update));
     {
         let etx = event_tx.clone();
         let home_for_update = home_dir.clone();
@@ -2659,6 +2663,28 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                     last = now;
                 }
             }
+        });
+    }
+
+    // RM-155: macOS folder access (TCC). The first pass runs at start-up —
+    // which is exactly the restart after an update, when macOS asks again —
+    // then on demand and every 10 minutes while anything is pending/denied.
+    // A change refreshes open dashboards; a TCC summary change (never the
+    // same state twice) is pushed to admins' linked channels.
+    #[cfg(target_os = "macos")]
+    {
+        let bg_state = state.clone();
+        let home = bg_state.home_dir.clone();
+        tokio::spawn(async move {
+            crate::macos_folder_access::run_watcher(home.clone(), move |report| {
+                let bg_state = bg_state.clone();
+                let home = home.clone();
+                async move {
+                    bg_state.handler.broadcast_system_status().await;
+                    crate::macos_folder_access::notify_admins(&home, &report).await;
+                }
+            })
+            .await;
         });
     }
 

@@ -3702,6 +3702,10 @@ enum ServiceCommands {
     /// Show service status
     Status,
 
+    /// macOS: move this install into the signed `DuDuClaw Gateway.app`
+    /// (verified like an update), then point the CLI path and LaunchAgent at it
+    MigrateBundle,
+
     /// Show service logs
     Logs {
         /// Number of lines to show
@@ -5616,6 +5620,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             },
             ServiceCommands::Status => {
                 service::handle_service(service::ServiceAction::Status).await
+            }
+            ServiceCommands::MigrateBundle => {
+                service::handle_service(service::ServiceAction::MigrateBundle).await
             }
             ServiceCommands::Logs { lines } => {
                 service::handle_service(service::ServiceAction::Logs { lines }).await
