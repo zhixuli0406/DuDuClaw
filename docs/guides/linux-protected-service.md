@@ -67,6 +67,8 @@ The administrator flow is:
 5. In **System → Migration review**, inspect full values, approve or reject proposals, retry failed applications and complete required credential rotation. Employee IDs and storage are allocated only after confirmation. Reconnect personal accounts under their new owner.
 6. Completion requires fresh application readback and zero outstanding confirmations/rotation obligations. `AwaitingAdministrator` means migration is still pending. Keep the root-only recovery snapshot until the documented retention/recovery checks allow removal.
 
+Supported source versions: conversation history (`sessions.db`), goals and assignment schedules (`tasks.db`) and scheduled tasks (`cron_tasks.db`) are imported from a v1.79.3 or v1.80.x home. Each store must match one known version exactly; a database changed by hand, half-upgraded or from another release is refused as a whole, and the importer log names the closest known version and the tables, indexes or triggers that differ (never their contents). Tasks owned by an external A2A client are never imported, and a scheduled task's original requester, creator and delegate are not carried over. The v1.79.3 definitions were reconstructed from the release notes, not captured from a v1.79.3 installation; they still need verification on a real v1.79.3 home.
+
 For a complete verified installation, the existing runner interface is:
 
 ```sh

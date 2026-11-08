@@ -1,4 +1,4 @@
-//! Readers for actual v1.79.3 authority stores. Credential material is never
+//! Readers for actual v1.79.3 / v1.80.x authority stores. Credential material is never
 //! decrypted, emitted, or used as evidence of authority in the new installation.
 use super::*;
 
@@ -120,7 +120,8 @@ pub(super) fn channel_settings(input:impl Read,wal:Option<&mut dyn Read>,builder
     if let Some(wal)=wal {crate::sqlite::copy_bounded(wal,&temp.path().join("source.db-wal"))?;}
     let conn=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     crate::sqlite::harden(&conn)?;check_sqlite(&conn)?;
-    if !crate::sqlite::session_schema_variant(&conn)? {return Ok(());}
+    // Any known sessions.db version; only the shared channel_settings table is read.
+    if !crate::sqlite::session_schema_variant(&conn)?.extension {return Ok(());}
     conn.authorizer(Some(|c:AuthContext<'_>|match c.action {
         AuthAction::Select=>Authorization::Allow,
         AuthAction::Read {table_name:"channel_settings",column_name:"channel_type"}
@@ -219,7 +220,7 @@ mod tests {
     #[test]
     fn authority_session_channel_settings_need_reentry_without_exporting_values() {
         let file=tempfile::NamedTempFile::new().unwrap();let conn=rusqlite::Connection::open(file.path()).unwrap();
-        conn.execute_batch(crate::sqlite::SESSION_SCHEMA).unwrap();conn.execute_batch(crate::sqlite::CHANNEL_SETTINGS_SCHEMA).unwrap();
+        conn.execute_batch(crate::catalog::SESSION_V180).unwrap();conn.execute_batch(crate::sqlite::CHANNEL_SETTINGS_SCHEMA).unwrap();
         conn.execute_batch("INSERT INTO channel_settings VALUES('telegram','SECRET-USER','allowed_users','SECRET-VALUE','now'); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();drop(conn);
         let p=extract(&request(SourceKind::AuthoritySessionsSqlite,"sessions.db"),std::fs::File::open(file.path()).unwrap(),None).unwrap();
         assert_eq!(p.len(),1);assert_eq!(p[0].category,C::Policy);assert!(!serde_json::to_string(&p).unwrap().contains("SECRET"));

@@ -52,6 +52,8 @@ fn run() -> duduclaw_import::Result<()> { Err(duduclaw_import::Error::Isolation)
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
+        // Names only the catalog differences (object kinds and names), never source text.
+        if let Some(refusal) = duduclaw_import::take_schema_refusal() { eprintln!("{refusal}"); }
         let code = match error {
             duduclaw_import::Error::InvalidRequest | duduclaw_import::Error::Schema
                 | duduclaw_import::Error::Content | duduclaw_import::Error::Limit => 4,

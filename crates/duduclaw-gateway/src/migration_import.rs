@@ -548,14 +548,15 @@ mod tests {
         drop(crate::channel_settings::ChannelSettingsManager::from_session_db(&path).unwrap());
         let actual=Connection::open(path).unwrap();
         let expected=Connection::open_in_memory().unwrap();
-        expected.execute_batch(include_str!("../../duduclaw-import/src/session-v1793.sql")).unwrap();
+        // Fresh stores are the newest known catalog; session/cron-v1793.sql pin the older release.
+        expected.execute_batch(include_str!("../../duduclaw-import/src/session-v180.sql")).unwrap();
         expected.execute_batch(include_str!("../../duduclaw-import/src/channel-settings-v1793.sql")).unwrap();
         assert_eq!(schema(&actual),schema(&expected));
 
         drop(crate::cron_store::CronStore::open(home.path()).unwrap());
         let actual=Connection::open(home.path().join("cron_tasks.db")).unwrap();
         let expected=Connection::open_in_memory().unwrap();
-        expected.execute_batch(include_str!("../../duduclaw-import/src/cron-v1793.sql")).unwrap();
+        expected.execute_batch(include_str!("../../duduclaw-import/src/cron-v180.sql")).unwrap();
         assert_eq!(schema(&actual),schema(&expected));
 
         drop(crate::autopilot_store::AutopilotStore::open(home.path()).unwrap());

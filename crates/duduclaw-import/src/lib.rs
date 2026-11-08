@@ -4,7 +4,9 @@ use duduclaw_isolation::{ids::{EmployeeId, RequestId}, migration::{ImportBudget,
 use serde::{Deserialize, Serialize};
 
 mod sqlite;
+pub mod catalog;
 pub mod authority;
+pub use catalog::{take_schema_refusal, SchemaRefusal, SchemaVersion};
 #[cfg(target_os = "linux")]
 pub mod linux;
 
@@ -41,7 +43,13 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 impl From<std::io::Error> for Error { fn from(_: std::io::Error) -> Self { Self::Io } }
-impl From<rusqlite::Error> for Error { fn from(_: rusqlite::Error) -> Self { Self::Content } }
+impl From<rusqlite::Error> for Error {
+    fn from(_error: rusqlite::Error) -> Self {
+        // Test builds only: name the SQLite cause that `Content` otherwise hides.
+        #[cfg(test)] eprintln!("legacy sqlite error: {_error}");
+        Self::Content
+    }
+}
 
 impl ImportRequest {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -80,6 +88,7 @@ impl<W: Write> Emitter<'_, W> {
 
 /// Output must be staged by the caller until this function and worker exit succeed.
 pub fn import<R: Read, W: Write>(request: &ImportRequest, input: R, wal: Option<&mut dyn Read>, output: W) -> Result<u64> {
+    catalog::clear_schema_refusal();
     request.validate()?;
     if request.has_wal != wal.is_some() { return Err(Error::InvalidRequest); }
     if matches!(request.kind,SourceKind::AuthorityJson|SourceKind::AuthorityToml|SourceKind::AuthorityUsersSqlite|SourceKind::AuthorityTasksSqlite|SourceKind::AuthorityApprovalsSqlite|SourceKind::AuthoritySessionsSqlite|SourceKind::AuthorityCronSqlite|SourceKind::AuthorityCronJsonl|SourceKind::AuthorityAutopilotSqlite|SourceKind::AuthorityWorkflowSqlite|SourceKind::AuthorityRemindersJsonl|SourceKind::AuthorityNotice|SourceKind::AuthorityInstructions|SourceKind::AuthoritySkill) {return authority::emit(request,input,wal,output);}
