@@ -155,6 +155,40 @@ mod engine {
             assert!(expand(&archive(&[("a", b"123456")]), 5).is_err());
             assert!(expand(&archive(&[("A", b"1"), ("a", b"2")]), 10).is_err());
         }
+
+        // H12b: protected skill_hub_install expands hub archives only here.
+        #[test]
+        fn h12b_skill_archive_refuses_traversal_and_absolute_entries() {
+            for name in ["../SKILL.md", "notes/../../SKILL.md", "/etc/passwd", "notes/./SKILL.md", "C:/SKILL.md", "a\u{1}b"] {
+                let bytes = archive(&[("notes/SKILL.md", b"ok"), (name, b"evil")]);
+                assert!(expand(&bytes, MAX_PACK_BYTES).is_err(), "{name:?}");
+            }
+            assert!(expand(&archive(&[("notes/SKILL.md", b"ok")]), MAX_PACK_BYTES).is_ok());
+        }
+
+        #[test]
+        fn h12b_skill_archive_refuses_symlink_entries() {
+            let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            zip.start_file("notes/SKILL.md", zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"ok").unwrap();
+            zip.add_symlink("notes/link", "/etc/passwd", zip::write::SimpleFileOptions::default()).unwrap();
+            let bytes = zip.finish().unwrap().into_inner();
+            assert!(expand(&bytes, MAX_PACK_BYTES).is_err());
+        }
+
+        #[test]
+        fn h12b_skill_archive_refuses_zip_bomb_and_oversize() {
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            zip.start_file("notes/SKILL.md", options).unwrap();
+            zip.write_all(&vec![0u8; 8 * 1024 * 1024]).unwrap();
+            let bomb = zip.finish().unwrap().into_inner();
+            assert!(bomb.len() < 64 * 1024, "fixture must be highly compressed");
+            assert_eq!(expand(&bomb, MAX_PACK_BYTES).err(), Some(ParseError::LimitExceeded));
+            let many: Vec<(String, &[u8])> = (0..1001).map(|i| (format!("f{i}"), &b"x"[..])).collect();
+            let many: Vec<(&str, &[u8])> = many.iter().map(|(name, bytes)| (name.as_str(), *bytes)).collect();
+            assert_eq!(expand(&archive(&many), MAX_PACK_BYTES).err(), Some(ParseError::LimitExceeded));
+        }
     }
 }
 

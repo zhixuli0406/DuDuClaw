@@ -63,6 +63,10 @@ pub(crate) fn check_tool_arguments(name: &str, arguments: &Value) -> Result<(), 
     if duduclaw_mcp_boundary::tool_policy::OWN_SKILL_TOOLS.contains(&name) {
         return duduclaw_mcp_boundary::tool_policy::check_own_skill_arguments(name, arguments);
     }
+    // H12b/c/d: own-skill job tools, same rule (exact protected schema).
+    if duduclaw_mcp_boundary::tool_policy::OWN_SKILL_JOB_TOOLS.contains(&name) {
+        return duduclaw_mcp_boundary::tool_policy::check_own_skill_job_arguments(name, arguments);
+    }
     if !matches!(boundary_route(name), Some(BoundaryRoute::Resource | BoundaryRoute::GatewayHandler(_))) {
         return duduclaw_mcp_boundary::check_arguments(arguments);
     }
@@ -515,13 +519,22 @@ fn project_tool_schema(tool: &mut Value) {
     // protected schema offers no subject selector. A legacy `agent_id` is still
     // accepted as a self-reference and checked by the producer; it is never
     // rewritten into another field (no `target_employee`).
-    if duduclaw_mcp_boundary::tool_policy::OWN_SKILL_TOOLS.contains(&name.as_str()) {
+    // H12b/c/d: the same for own-skill job tools, which also lose the install
+    // target selectors (`scope`, `owner`): they publish only into own SKILLS.
+    if duduclaw_mcp_boundary::tool_policy::OWN_SKILL_TOOLS.contains(&name.as_str())
+        || duduclaw_mcp_boundary::tool_policy::OWN_SKILL_JOB_TOOLS.contains(&name.as_str()) {
+        let removed: &[&str] = if duduclaw_mcp_boundary::tool_policy::OWN_SKILL_JOB_TOOLS.contains(&name.as_str()) {
+            &["agent_id", "target_agent", "scope", "owner"]
+        } else { &["agent_id", "target_agent"] };
         if let Some(required) = tool["inputSchema"]["required"].as_array_mut() {
-            required.retain(|value| !matches!(value.as_str(), Some("agent_id" | "target_agent")));
+            required.retain(|value| !value.as_str().is_some_and(|key| removed.contains(&key)));
         }
         if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {
-            properties.remove("agent_id");
-            properties.remove("target_agent");
+            for key in removed { properties.remove(*key); }
+        }
+        if name == "skill_from_recording" {
+            tool["inputSchema"]["properties"]["id"] = json!({"type":"string","pattern":"^[0-9a-f]{32}$",
+                "description":"受保護錄製回傳的 id（必須是你自己已完成的錄製）"});
         }
         return;
     }

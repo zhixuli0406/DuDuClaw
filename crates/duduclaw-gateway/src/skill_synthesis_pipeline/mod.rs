@@ -26,6 +26,7 @@
 //! - W18 Tech Memo: Agent Handoff 2.0 — gap analysis & sprint estimates
 //! - EvolutionEvents Spec v1.0 — 8-field JSONL schema
 
+pub mod owned;
 pub mod pipeline;
 pub mod quality_scorer;
 pub mod scheduler;

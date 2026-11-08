@@ -84,6 +84,7 @@ pub mod mcp_proxy_spawn_env; // per-spawn upstream env for `mcp-proxy --spawn-sc
 pub mod mcp_rate_limit;
 pub mod mcp_recording; // WP3.3 R1/R3: browser + desktop recording capture
 pub(crate) mod mcp_recording_distill; // WP3.3 R2: HAR redaction/parsing + skill_from_recording
+pub(crate) mod mcp_skill_jobs; // H12d: protected skill_from_recording input (job store + brokered /work)
 pub mod mcp_redact;
 pub mod mcp_redaction; // RFC-23 redaction pipeline integration
 pub mod mcp_refresh; // v1.16.0: refresh-token credential type

@@ -30,13 +30,15 @@ fn unlink(root: &File, name: &str, directory: bool) {
 pub(crate) fn publish(workspace: &Path, temporary: &Path, id: &str) -> Result<Vec<Value>, ()> {
     if !crate::recording_helper::valid_id(id) { return Err(()); }
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // H12d: the layout `skill_from_recording` reads through root's broker.
+    use duduclaw_isolation::recording_layout::{ARTIFACTS, RECORDINGS_DIR};
     let root = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(workspace).map_err(|_| ())?;
-    mkdir(&root, "recordings", true)?;
-    let parent = open(&root, "recordings", flags, 0)?;
+    mkdir(&root, RECORDINGS_DIR, true)?;
+    let parent = open(&root, RECORDINGS_DIR, flags, 0)?;
     let staging = format!(".record-{}", uuid::Uuid::new_v4().simple());
     mkdir(&parent, &staging, false)?;
     let destination = open(&parent, &staging, flags, 0)?;
-    let names = ["trace.zip", "actions.json", "network.json"];
+    let names = ARTIFACTS;
     let mut published = false;
     let result = (|| {
         let source = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(temporary).map_err(|_| ())?;
@@ -89,5 +91,29 @@ mod tests {
         assert!(publish(&work, &temporary, &"cd".repeat(16)).is_err());
         assert!(!work.join("recordings").join("cd".repeat(16)).exists());
         assert_eq!(std::fs::read_dir(work.join("recordings")).unwrap().count(), 1);
+    }
+
+    /// H12d regression (writer half): the helper publishes exactly at the
+    /// shared `recording_layout::artifact_path`, the paths the protected
+    /// `skill_from_recording` reader asks root's broker for — never the old
+    /// host-side `<home>/recordings/<id>/{meta.json,done.json,session.har}`.
+    #[test]
+    fn h12d_recording_publication_matches_reader_layout() {
+        use duduclaw_isolation::recording_layout::{artifact_path, ARTIFACTS};
+        let home = tempfile::tempdir().unwrap();
+        let work = home.path().join("work"); let temporary = home.path().join("tmp");
+        std::fs::create_dir(&work).unwrap(); std::fs::create_dir(&temporary).unwrap();
+        for name in ARTIFACTS { std::fs::write(temporary.join(name), format!("{name}-bytes")).unwrap(); }
+        let id = "0f".repeat(16);
+        let artifacts = publish(&work, &temporary, &id).unwrap();
+        for (artifact, name) in artifacts.iter().zip(ARTIFACTS) {
+            assert_eq!(artifact["name"], name);
+            let relative = artifact_path(&id, name).unwrap();
+            assert_eq!(relative, format!("recordings/{id}/{name}"));
+            assert_eq!(std::fs::read(work.join(&relative)).unwrap(), format!("{name}-bytes").into_bytes());
+        }
+        for legacy in ["meta.json", "done.json", "session.har"] {
+            assert!(!work.join("recordings").join(&id).join(legacy).exists(), "{legacy}");
+        }
     }
 }

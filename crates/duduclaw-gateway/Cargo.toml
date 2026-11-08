@@ -246,6 +246,8 @@ libc = "0.2"
 
 [dev-dependencies]
 duduclaw-import = { path = "../duduclaw-import" }
+# H12d: TestWorkBroker / TestRecordingJobs for the protected skill job tests.
+duduclaw-mcp-boundary = { workspace = true, features = ["binding-store", "execution-integration", "test-support"] }
 # Deterministic per-test Home deadline checks; production Tokio features stay unchanged.
 tokio = { workspace = true, features = ["test-util"] }
 # D1 composed CLI HTTP tests: dev-cycle only, no new production dependency.

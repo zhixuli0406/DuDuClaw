@@ -5,7 +5,7 @@ pub const RUNTIME: &str = "duduclaw-browser-record-v1";
 pub const ARGUMENT: &str = "--browser-record-fd-v1";
 pub const MAX_REQUEST: usize = 32 * 1024;
 pub const MAX_RESULT: usize = 64 * 1024;
-pub const MAX_ARTIFACT: u64 = 16 * 1024 * 1024;
+pub const MAX_ARTIFACT: u64 = duduclaw_isolation::recording_layout::MAX_ARTIFACT_BYTES;
 pub const DRIVER: &str = include_str!("recording_driver.cjs");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,7 +54,7 @@ impl Request {
         request.validate()?; Ok(request)
     }
 }
-pub fn valid_id(id: &str) -> bool { id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
+pub fn valid_id(id: &str) -> bool { duduclaw_isolation::recording_layout::valid_id(id) }
 
 pub fn decode_result(bytes: &[u8]) -> Result<Value, String> {
     if bytes.len() > MAX_RESULT { return Err("recording result too large".into()); }
@@ -71,7 +71,7 @@ pub fn decode_result(bytes: &[u8]) -> Result<Value, String> {
         return Ok(value);
     }
     if artifacts.len() != 3 { return Err("invalid artifact count".into()); }
-    for (artifact, name) in artifacts.iter().zip(["trace.zip", "actions.json", "network.json"]) {
+    for (artifact, name) in artifacts.iter().zip(duduclaw_isolation::recording_layout::ARTIFACTS) {
         let fields = artifact.as_object().ok_or("invalid artifact")?;
         if fields.len() != 3 || fields.keys().any(|key| !matches!(key.as_str(), "name" | "bytes" | "sha256"))
             || artifact["name"] != name || artifact["bytes"].as_u64().is_none_or(|n| n == 0 || n > MAX_ARTIFACT)

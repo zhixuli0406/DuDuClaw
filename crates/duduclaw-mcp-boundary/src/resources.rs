@@ -952,3 +952,7 @@ fn open_resource(_root: &File, _path: &Path, _directory: bool) -> Result<File, V
 #[cfg(test)]
 #[path = "resources_tests.rs"]
 mod tests;
+
+// H12d: `ResourceRoots::read_recording_artifact`.
+#[path = "resources_recording.rs"]
+mod recording;

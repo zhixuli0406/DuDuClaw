@@ -34,6 +34,13 @@ impl ResourceKind {
 /// follows no redirect, so the grant never reaches a second origin.
 pub const PUBLIC_ORIGIN_TOOLS: &[&str] = &["web_fetch_cached", "web_extract"];
 
+#[path = "tool_policy_skill_jobs.rs"]
+mod skill_jobs;
+pub use skill_jobs::{check_own_skill_job_arguments, install_recording_jobs, own_skill_job_selector, recording_jobs,
+    RecordingArtifact, RecordingJobs, RecordingManifest, OWN_SKILL_JOB_TOOLS};
+#[cfg(any(test, feature = "test-support"))]
+pub use skill_jobs::TestRecordingJobs;
+
 /// The record's signed `PublicOrigins` grant, only for an employee-scope record.
 fn public_origins_grant(context: &RequestContext) -> Option<&ResourceGrant> {
     let record = context.record();
@@ -200,6 +207,8 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "browser_record_stop", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "desktop_record_start", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     ToolPolicy { name: "desktop_record_stop", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    // H12d: Workspace is the brokered `employee-work` root holding the
+    // recording artifacts (`own_skill_job_selector`).
     ToolPolicy { name: "skill_from_recording", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
     // memory
     ToolPolicy { name: "memory_search", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::DatabaseTable] },
@@ -241,8 +250,10 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "skill_security_scan", route: Route::Worker, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "skill_graduate", route: Route::Worker, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "skill_synthesis_status", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
-    ToolPolicy { name: "skill_synthesis_run", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
-    ToolPolicy { name: "skill_hub_install", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    // H12b/H12c: host fetch/provider call + E ops, published into own SKILLS;
+    // no workspace input. Hub install also needs the record's PublicOrigins.
+    ToolPolicy { name: "skill_synthesis_run", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "skill_hub_install", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "skill_curator_status", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "skill_pin", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     // integrations
@@ -544,6 +555,7 @@ pub fn eligible(context: &RequestContext, name: &str) -> bool {
             .any(|grant| ResourceKind::of(grant) == *kind && validate_resource(grant).is_ok()
                 && (*kind != ResourceKind::Employee || grant == &own_employee(context)))))
         && (!OWN_SKILL_TOOLS.contains(&name) || own_skill_selector(context, name).is_ok())
+        && (!OWN_SKILL_JOB_TOOLS.contains(&name) || own_skill_job_selector(context, name).is_ok())
 }
 
 fn required_for_call(policy: &ToolPolicy, arguments: &Value) -> Result<Vec<ResourceKind>, VerificationError> {
@@ -804,6 +816,8 @@ pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolv
     // curator's `run` is a typed control flag, not an execution identity.
     if OWN_SKILL_TOOLS.contains(&name) {
         check_own_skill_arguments(name, arguments)?;
+    } else if OWN_SKILL_JOB_TOOLS.contains(&name) {
+        check_own_skill_job_arguments(name, arguments)?;
     } else if context.record().employee_scope() && matches!(policy.route, Route::Service | Route::Connector) {
         let fields = arguments.as_object().ok_or(VerificationError::Invalid)?;
         if ["principal", "root", "cwd", "run", "run_id", "employee_id"].iter().any(|k| fields.contains_key(*k)) {
@@ -811,6 +825,8 @@ pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolv
         }
     } else { crate::check_arguments(arguments)?; }
     if !eligible(context, name) { return Err(VerificationError::Invalid); }
+    // H12b/c/d: exactly the record's own selection (see `skill_jobs`).
+    if OWN_SKILL_JOB_TOOLS.contains(&name) { return skill_jobs::authorize(context, policy, arguments, resolver); }
     if PUBLIC_ORIGIN_TOOLS.contains(&name) {
         if let Some(grant) = public_origins_grant(context) {
             return authorize_public_origin(context, policy, arguments, grant);
