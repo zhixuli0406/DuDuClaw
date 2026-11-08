@@ -338,24 +338,95 @@ pub(super) fn scaffold_with(
                 .collect(),
         ),
     );
-    // Inherit the parent's denies on top of the allowlist (deny wins).
+    // Inherit the parent's denies on top of the allowlist (deny wins), then
+    // (RM-103 S3) the delegating packet's `tool_scope.denied` — a role member
+    // can only ever lose tools relative to its employee, never gain one.
+    let mut denied: Vec<String> = parent_config.capabilities.denied_tools.clone();
+    if let Some(role_spec) = plan.role {
+        for extra in &role_spec.extra_denied {
+            let extra = extra.trim();
+            if !extra.is_empty() && !denied.iter().any(|d| d.trim().eq_ignore_ascii_case(extra)) {
+                denied.push(extra.to_string());
+            }
+        }
+    }
     caps_tbl.insert(
         "denied_tools".into(),
-        toml::Value::Array(
-            parent_config
-                .capabilities
-                .denied_tools
-                .iter()
-                .map(|t| toml::Value::String(t.clone()))
-                .collect(),
-        ),
+        toml::Value::Array(denied.into_iter().map(toml::Value::String).collect()),
     );
     // A helper keeps the parent's recipient boundary, including invalid raw
     // values that must continue to fail closed in the recipient guard.
-    for key in ["recipient_guard", "recipients"] {
+    //
+    // RM-103 S3: likewise every approval list the parent faces — the MCP
+    // approval / ActionGuard / PolicyKernel gates read the CALLER's own
+    // agent.toml (`.ephemeral/<id>` for a member), so without these a member
+    // ran tools without the approvals its employee must obtain. Copied raw
+    // so a malformed `action_rules` keeps failing closed exactly as it does
+    // for the parent.
+    //
+    // v1.81: those inherited approval layers never apply to a team role
+    // member's intrinsic tools ([`TEAM_INTRINSIC_TOOLS`]) — the MCP dispatch
+    // gate skips them for exactly that call
+    // ([`super::is_role_member_intrinsic_call`]), because their syntax cannot
+    // carve one tool out of a `*` / effect / canonical-family rule. Every other
+    // tool keeps the inherited approvals.
+    //
+    // Daybreak #2: the MCP gates are not the only readers. A coarse-grained
+    // runtime (codex / grok / generic CLI) runs its own native write and
+    // shell tools outside MCP dispatch, so it chooses its native sandbox from
+    // this same scaffolded config through
+    // `crate::runtime::coarse_native_caps`: a native write restriction forces
+    // read-only, a native shell restriction (including the packet's
+    // `Bash(git:*)` / denied `Bash`) refuses the role on that runtime.
+    //
+    // `egress_guard` is copied too: the effective mode is
+    // `max(global, employee)` (`duduclaw_core::egress_guard`), so the copy can
+    // only raise the member's mode, and a malformed raw value keeps blocking
+    // as it does for the parent.
+    for key in [
+        "recipient_guard",
+        "recipients",
+        "approval_required_tools",
+        "irreversible_tools",
+        "maybe_irreversible_tools",
+        "action_rules",
+        "policy",
+        "egress_guard",
+    ] {
         if let Some(value) = parent_value.get("capabilities").and_then(|caps| caps.get(key)) {
             caps_tbl.insert(key.into(), value.clone());
         }
+    }
+    // v1.81: `scoped_tools` only adds "needs an active task grant" refusals,
+    // so the copy narrows (grants are keyed by agent id; a member starts with
+    // none). Read through the parent's typed parse (fail-safe empty, as for
+    // the parent). Daybreak round 2: copied COMPLETELY — an entry covering an
+    // intrinsic (`team_handoff`, `team_*`, `mcp__duduclaw__*`, `*`) used to be
+    // dropped, and dropping a wildcard silently removed the grant requirement
+    // for every other tool it covers. The intrinsic is instead carved out at
+    // the gates (MCP dispatch §3.65 and `tools/list`), for an exact intrinsic
+    // call by a verified role member only
+    // ([`super::is_role_member_intrinsic_call`]). `grant_ttl_secs` is
+    // deliberately NOT copied: a parent TTL longer than the default would make
+    // grants minted for the member outlive the default, i.e. widen.
+    let scoped: Vec<toml::Value> = parent_config
+        .capabilities
+        .scoped_tools
+        .iter()
+        .map(|entry| toml::Value::String(entry.clone()))
+        .collect();
+    if !scoped.is_empty() {
+        caps_tbl.insert("scoped_tools".into(), toml::Value::Array(scoped));
+    }
+    // RM-103 S3 (round 3 #3): `native_sandbox` (OS-native confinement of the
+    // spawned CLI, fail-closed when it cannot apply) only narrows, and Grok /
+    // the generic CLI runtime need it to run a write-constrained member at
+    // all. Without the copy a member of an OS-sandboxed employee spawned on
+    // Codex / Grok / generic unconfined. Read through the parent's typed parse
+    // (a parent whose `[capabilities]` does not parse never gets here); only
+    // `true` is written, so an unsandboxed parent's member is unchanged.
+    if parent_config.capabilities.native_sandbox {
+        caps_tbl.insert("native_sandbox".into(), toml::Value::Boolean(true));
     }
     table.insert("capabilities".into(), toml::Value::Table(caps_tbl));
 

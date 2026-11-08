@@ -492,6 +492,33 @@ async fn role_member_tools_list_uses_ephemeral_capabilities() {
         home.path(), member, duduclaw_core::org_store::OrgEntry::new("parent", ""),
     ).unwrap();
 
+    // RM-103 S3 (Daybreak round 2 #1): an inherited wildcard `scoped_tools`
+    // entry is kept whole. Only the verified member's exact intrinsic is
+    // listed without a grant; every other covered tool stays hidden.
+    let member_toml = |scoped: &str| {
+        format!(
+            "[agent]\nstatus = \"active\"\nreports_to = 'parent'\n[team_member]\nrole = 'planner'\ntask_id = 'task-round'\nround = 1\nparent = 'parent'\n[capabilities]\nallowed_tools = [\"team_handoff\", \"memory_search\"]\nscoped_tools = [{scoped}]\n"
+        )
+    };
+    std::fs::write(dir.join("agent.toml"), member_toml("")).unwrap();
+    let unscoped = names_of(&super::handle_tools_list_for_agent(&json!(9), &principal, home.path(), member).await);
+    assert!(unscoped.contains(&"memory_search".to_string()), "{unscoped:?}");
+    assert!(unscoped.contains(&"team_handoff".to_string()), "{unscoped:?}");
+    for scoped in ["\"*\"", "\"mcp__duduclaw__*\"", "\"team_*\", \"memory_search\"", "\"team_handoff\", \"memory_*\""] {
+        std::fs::write(dir.join("agent.toml"), member_toml(scoped)).unwrap();
+        let listed = names_of(&super::handle_tools_list_for_agent(&json!(10), &principal, home.path(), member).await);
+        assert_eq!(listed, vec!["team_handoff"], "{scoped}");
+        // Not a verified role member: the intrinsic is scoped like any tool.
+        std::fs::write(
+            dir.join("agent.toml"),
+            member_toml(scoped).replace("[team_member]", "[not_a_member]"),
+        )
+        .unwrap();
+        let plain = names_of(&super::handle_tools_list_for_agent(&json!(11), &principal, home.path(), member).await);
+        assert!(!plain.contains(&"team_handoff".to_string()), "{scoped}: {plain:?}");
+        assert!(!plain.contains(&"memory_search".to_string()), "{scoped}: {plain:?}");
+    }
+
     // Syntactically valid TOML with a wrong capability type must match
     // the dispatch gate's stricter policy-only parse and expose nothing.
     std::fs::write(

@@ -819,6 +819,19 @@ impl McpDispatcher {
         } else {
             load_agent_gate_config(&self.home_dir, gate_agent).await
         };
+        // RM-103 S3 (v1.81): a team role member's intrinsic tool
+        // (`team_handoff`) is exempt from the approval layers the scaffold
+        // inherits from the employee — `action_rules` (§3.455 and the approval
+        // gate's `ask`), the PolicyKernel `policy` (§3.5) and the
+        // approval/irreversible lists (§3.7). `allowed_tools` / `denied_tools`
+        // (§3.45: an explicit deny still wins), `[permissions]` and every other
+        // gate still apply. See `ephemeral::is_role_member_intrinsic_call`.
+        let intrinsic_exempt = employee_policy_applies
+            && duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(
+                &self.home_dir,
+                gate_agent,
+                tool_name,
+            );
 
         // Evaluate scope/list/permission refusals without writing audit records.
         // Their specific response still wins, but background admission must run
@@ -977,6 +990,7 @@ impl McpDispatcher {
             // layer". The `computer_*` tools apply the same resolution in the
             // gateway (`computer_use_sessions::gates`), which owns their session.
             if employee_policy_applies
+                && !intrinsic_exempt
                 && action_rule_verdict_for_call(
                     &agent_gate.action_rules,
                     tool_name,
@@ -1195,7 +1209,7 @@ impl McpDispatcher {
         // policy → the kernel abstains (Allow). External clients aren't agents,
         // so they carry no per-agent policy. High-risk `Ask` decisions block on
         // the ApprovalBroker (fail-closed: TTL-expiry counts as denial).
-        if employee_policy_applies && !agent_gate.policy.is_empty() {
+        if employee_policy_applies && !intrinsic_exempt && !agent_gate.policy.is_empty() {
             let args_val = params_owned
                 .get("arguments")
                 .cloned()
@@ -1587,7 +1601,12 @@ impl McpDispatcher {
         // opened/queried is denied (`has_active_grant` returns false on error).
         // Zero-overhead for the vast majority of agents: an empty `scoped_tools`
         // set short-circuits before any DB work.
-        if employee_policy_applies {
+        //
+        // RM-103 S3 (Daybreak round 2): a role member inherits the employee's
+        // `scoped_tools` complete (wildcards included), so only the exact
+        // intrinsic call by a verified role member (`intrinsic_exempt`) skips
+        // this gate; every other tool a wildcard covers still needs a grant.
+        if employee_policy_applies && !intrinsic_exempt {
             // W3-3b: use the SAME acting-agent resolution as §3.4's capability
             // gate. `principal.client_id` is `gateway-internal` for every
             // MCP child the gateway spawns, so reading
@@ -1787,7 +1806,11 @@ impl McpDispatcher {
         } else {
             params_owned.clone()
         };
-        if employee_policy_applies || params_owned.get("egress_guard").is_some() {
+        // RM-103 S3: a role member's intrinsic skips this gate's inherited
+        // approval lists / action-rule `ask`; an egress-guard ask still runs.
+        if (employee_policy_applies && !intrinsic_exempt)
+            || params_owned.get("egress_guard").is_some()
+        {
             // Keyed by the ACTING agent: with the internal key the client_id
             // is `gateway-internal`, whose `agents/gateway-internal/agent.toml`
             // does not exist, so approval_required_tools / irreversible_tools /
@@ -2719,6 +2742,207 @@ mod tests {
             Some(-32003),
             "the scaffold's scoped_tools must be honoured: {result}"
         );
+    }
+
+    // ── RM-103 S3 (v1.81): inherited approvals vs. the team intrinsic ────────
+
+    const S3_MEMBER: &str = "eph-boss-r1-executor-ab12cd";
+
+    /// Write a team role member scaffold (`[team_member]` + `ephemeral.toml`,
+    /// the two records `is_role_member_intrinsic_call` requires) carrying
+    /// `caps` — standing in for what the scaffold copies from the employee.
+    fn write_s3_member(tmp: &tempfile::TempDir, caps: &str) {
+        let dir = tmp
+            .path()
+            .join("agents")
+            .join(duduclaw_gateway::ephemeral::EPHEMERAL_DIR_NAME)
+            .join(S3_MEMBER);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            format!(
+                "[agent]\nname = \"{S3_MEMBER}\"\nrole = \"worker\"\nstatus = \"active\"\n\
+                 reports_to = \"boss\"\n\
+                 [permissions]\ncan_send_cross_agent = true\ncan_create_agents = false\n\
+                 [team_member]\nrole = \"executor\"\ntask_id = \"task-1\"\nround = 1\nparent = \"boss\"\n\
+                 {caps}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ephemeral.toml"),
+            "parent = \"boss\"\ntier = \"standard\"\n\
+             created_at = \"2026-11-08T00:00:00Z\"\nexpires_at = \"2099-01-01T00:00:00Z\"\n",
+        )
+        .unwrap();
+    }
+
+    fn s3_member_principal() -> Principal {
+        Principal {
+            client_id: S3_MEMBER.to_string(),
+            scopes: [Scope::Admin].into_iter().collect(),
+            is_external: false,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A parent `policy` with no allow for `team_handoff`, an effect rule
+    /// blocking every `send` and approval lists naming it: the member can still
+    /// call `team_handoff` (no policy / action-rule refusal, no approval held),
+    /// while any other tool keeps the inherited policy.
+    #[tokio::test]
+    async fn inherited_policy_never_blocks_a_role_members_team_handoff() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_s3_member(
+            &tmp,
+            "[capabilities]\n\
+             action_rules = [{ effect = \"send\", verdict = \"block\" }]\n\
+             approval_required_tools = [\"team_handoff\"]\n\
+             irreversible_tools = [\"team_handoff\"]\n\
+             [[capabilities.policy]]\ntool = \"memory_search\"\neffect = \"allow\"\n",
+        );
+        assert!(duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(
+            tmp.path(),
+            S3_MEMBER,
+            "team_handoff"
+        ));
+        let dispatcher = make_dispatcher(&tmp).await;
+        for tool in ["team_handoff", "mcp__duduclaw__team_handoff"] {
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                dispatcher.dispatch_tool_call(
+                    &s3_member_principal(),
+                    &make_ns_ctx(false),
+                    &make_params(tool, serde_json::json!({})),
+                    &serde_json::json!(1),
+                ),
+            )
+            .await
+            .expect("an intrinsic must never be held for an inherited approval");
+            let msg = result["error"]["message"].as_str().unwrap_or("");
+            assert!(
+                !msg.contains("Denied by policy") && !msg.contains("action_rules"),
+                "{tool}: inherited policy must not block the intrinsic: {result}"
+            );
+        }
+        let broker = duduclaw_gateway::approval::ApprovalBroker::open(tmp.path()).unwrap();
+        assert!(broker.list_pending(None).await.unwrap_or_default().is_empty());
+
+        // Any other tool keeps the inherited strict-allowlist policy.
+        let other = dispatcher
+            .dispatch_tool_call(
+                &s3_member_principal(),
+                &make_ns_ctx(false),
+                &make_params("memory_store", serde_json::json!({"content": "x"})),
+                &serde_json::json!(2),
+            )
+            .await;
+        assert!(
+            other["error"]["message"].as_str().unwrap_or("").contains("Denied by policy"),
+            "{other}"
+        );
+
+        // An ordinary ephemeral (no `[team_member]` record) gets no exemption.
+        let dir = tmp
+            .path()
+            .join("agents")
+            .join(duduclaw_gateway::ephemeral::EPHEMERAL_DIR_NAME)
+            .join(S3_MEMBER);
+        let raw = std::fs::read_to_string(dir.join("agent.toml")).unwrap();
+        std::fs::write(dir.join("agent.toml"), raw.replace("[team_member]", "[not_a_member]"))
+            .unwrap();
+        assert!(!duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(
+            tmp.path(),
+            S3_MEMBER,
+            "team_handoff"
+        ));
+        let plain = dispatcher
+            .dispatch_tool_call(
+                &s3_member_principal(),
+                &make_ns_ctx(false),
+                &make_params("team_handoff", serde_json::json!({})),
+                &serde_json::json!(3),
+            )
+            .await;
+        assert_eq!(plain["error"]["code"], -32003, "{plain}");
+    }
+
+    /// A parent requiring approval for X: the member requires approval for X.
+    #[tokio::test]
+    async fn inherited_approval_still_holds_a_role_members_other_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_s3_member(&tmp, "[capabilities]\napproval_required_tools = [\"memory_search\"]\n");
+        let (rec, result) = dispatch_held_then_decide(
+            &tmp,
+            s3_member_principal(),
+            "memory_search",
+            serde_json::json!({ "query": "x" }),
+            false,
+        )
+        .await;
+        assert_eq!(rec.agent_id, S3_MEMBER);
+        assert_eq!(result["error"]["code"], -32003, "{result}");
+    }
+
+    /// Daybreak round 2 #1: the member inherits a wildcard `scoped_tools`
+    /// entry complete. Only the exact intrinsic call is carved out of the
+    /// grant gate; every other tool the wildcard covers still needs a grant,
+    /// and a non-member keeps the gate for `team_handoff` too.
+    #[tokio::test]
+    async fn inherited_wildcard_scoped_tools_exempt_only_the_exact_intrinsic() {
+        for entry in ["*", "mcp__duduclaw__*", "team_*", "team_handoff"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_s3_member(
+                &tmp,
+                &format!("[capabilities]\nscoped_tools = [\"{entry}\", \"memory_search\"]\n"),
+            );
+            let dispatcher = make_dispatcher(&tmp).await;
+            for tool in ["team_handoff", "mcp__duduclaw__team_handoff"] {
+                let result = s3_call(&dispatcher, tool, serde_json::json!({})).await;
+                let msg = result["error"]["message"].as_str().unwrap_or("");
+                assert!(
+                    !msg.contains("階段性授權"),
+                    "{entry}/{tool}: the intrinsic must not need a grant: {result}"
+                );
+            }
+            let other = s3_call(&dispatcher, "memory_search", serde_json::json!({ "query": "x" })).await;
+            assert!(
+                other["error"]["message"].as_str().unwrap_or("").contains("階段性授權"),
+                "{entry}: other scoped tools keep the grant requirement: {other}"
+            );
+            if matches!(entry, "*" | "mcp__duduclaw__*") {
+                // Covered only by the wildcard entry, which is never dropped.
+                let other =
+                    s3_call(&dispatcher, "memory_store", serde_json::json!({ "content": "x" })).await;
+                assert!(
+                    other["error"]["message"].as_str().unwrap_or("").contains("階段性授權"),
+                    "{entry}: a wildcard-covered tool keeps the grant requirement: {other}"
+                );
+            }
+
+            // Not a verified role member: the intrinsic is gated like any tool.
+            let dir = tmp
+                .path()
+                .join("agents")
+                .join(duduclaw_gateway::ephemeral::EPHEMERAL_DIR_NAME)
+                .join(S3_MEMBER);
+            let raw = std::fs::read_to_string(dir.join("agent.toml")).unwrap();
+            std::fs::write(dir.join("agent.toml"), raw.replace("[team_member]", "[not_a_member]"))
+                .unwrap();
+            let plain = s3_call(&dispatcher, "team_handoff", serde_json::json!({})).await;
+            assert_eq!(plain["error"]["code"], -32003, "{entry}: {plain}");
+        }
+    }
+
+    async fn s3_call(dispatcher: &McpDispatcher, tool: &str, args: Value) -> Value {
+        dispatcher
+            .dispatch_tool_call(
+                &s3_member_principal(),
+                &make_ns_ctx(false),
+                &make_params(tool, args),
+                &serde_json::json!(1),
+            )
+            .await
     }
 
     // ── Test: rate-limit exceeded returns JSON-RPC -32029 ────────────────────

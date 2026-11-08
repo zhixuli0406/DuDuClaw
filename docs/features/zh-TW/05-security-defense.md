@@ -22,6 +22,11 @@ v1.81 以前，`code_map` 可以掃描 MCP server 讀得到的任何目錄（預
 
 **行為變更：** `agent.toml` 沒有 `can_create_agents` 鍵的非 main 員工，v1.81 以前可以建立員工，現在會被拒絕。若要保留，請由管理員在儀表板「工具與權限」開啟。
 
+## 團隊派工沿用員工的限制（v1.81）
+
+- **規劃封包的 `tool_scope` 只能縮小執行角色的工具。** 非空的 `allowed` 會把執行角色限制在這些工具（加上 `team_handoff`）；只要列出員工本身沒有的工具，該次派工就會被拒絕，並寫入 Warning 等級的 `team_tool_scope_escalation` 稽核紀錄。`denied` 會從執行角色的工具中移除，並加入成員的 `denied_tools`。角色成員（以及一般臨時助手）也會繼承員工的 `approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools`、`action_rules`、`policy`、`egress_guard` 與 `scoped_tools`，與員工面對相同的核准。`grant_ttl_secs` 不繼承，因為員工較長的期限會延長成員的授權。
+- **沿用的核准設定不會擋下團隊交接。** 對角色成員，MCP 閘只在 `team_handoff` 略過沿用的 `action_rules`、`policy`、核准清單與 `scoped_tools` 的授權要求（`ephemeral::is_role_member_intrinsic_call`；需要完整的 `[team_member]` 紀錄，且 parent 與 `ephemeral.toml` 一致）。`scoped_tools` 會完整複製（含萬用字元），所以萬用字元涵蓋的其他工具仍需授權。`allowed_tools`、明確的 `denied_tools`、`[permissions]` 與對外傳送防護照常適用。
+
 ## 客戶公司識別（v1.80.0）
 
 公司名稱與標誌獨立於經簽章驗證的經銷商品牌。`company.get`、`company.update` 明確要求管理員；`company.update` 只接受名稱與選填的移除標誌操作，拒絕舊的 `logo_base64` 欄位。公司名稱拒絕控制字元、換行分隔字元與 Unicode 格式字元（`Cf`，包含雙向覆寫與隔離控制字元）。更新時在既有設定寫入鎖內再次查核目前身分。`company_info` 稽核記錄操作者、方法與結果，不記錄圖片或名稱。進階設定的導覽與路由也限管理員，搬動控制項不會放寬原有 RPC 權限。

@@ -659,24 +659,43 @@ impl RuntimeRegistry {
 ///
 /// Returns `None` only when `agent.toml` itself is missing (synthetic /
 /// test agent ids) — callers then keep their legacy capability-less
-/// behavior. When the file exists but `[capabilities]` is absent OR fails
-/// to deserialize, this returns `Some(CapabilitiesConfig::default())`
-/// (deny-by-default: `computer_use = false`, `browser_via_bash = false`)
-/// with a warn on the malformed case — security gates fail closed.
+/// behavior. When the file exists but `[capabilities]` is absent this returns
+/// `Some(CapabilitiesConfig::default())` (deny-by-default: `computer_use =
+/// false`, `browser_via_bash = false`).
+///
+/// RM-103 S3 (round 3 #4): when `agent.toml` or its `[capabilities]` section
+/// cannot be read, the restrictions the operator wrote are unknown, so this
+/// returns [`fail_closed_capabilities`] (with a warn) — never the plain
+/// default, which carries no restriction at all and would give a coarse
+/// runtime (Codex / Grok / generic) a writable sandbox with an unchecked
+/// native shell.
 pub fn load_agent_capabilities(
     agent_dir: &Path,
 ) -> Option<duduclaw_core::types::CapabilitiesConfig> {
     let path = agent_dir.join("agent.toml");
-    let text = std::fs::read_to_string(&path).ok()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            // Unreadable / non-UTF-8 / not a file: the operator's restrictions
+            // are unknown, so fail closed (never log file contents).
+            warn!(
+                path = %path.display(),
+                error_kind = ?e.kind(),
+                "agent.toml unreadable — applying fail-closed capabilities"
+            );
+            return Some(fail_closed_capabilities());
+        }
+    };
     let parsed = match text.parse::<toml::Value>() {
         Ok(v) => v,
         Err(e) => {
             warn!(
                 agent_dir = %agent_dir.display(),
                 error = %e,
-                "agent.toml parse failed — applying default (deny-by-default) capabilities"
+                "agent.toml parse failed — applying fail-closed capabilities"
             );
-            return Some(duduclaw_core::types::CapabilitiesConfig::default());
+            return Some(fail_closed_capabilities());
         }
     };
     let caps = match parsed.get("capabilities") {
@@ -687,13 +706,28 @@ pub fn load_agent_capabilities(
                 warn!(
                     agent_dir = %agent_dir.display(),
                     error = %e,
-                    "[capabilities] section malformed — applying default (deny-by-default) capabilities"
+                    "[capabilities] section malformed — applying fail-closed capabilities"
                 );
-                duduclaw_core::types::CapabilitiesConfig::default()
+                fail_closed_capabilities()
             }
         },
     };
     Some(caps)
+}
+
+/// The capabilities of an agent whose `[capabilities]` could not be read:
+/// the deny-by-default config with its `action_rules` marked unreadable
+/// ([`duduclaw_core::tool_effect::ActionRules::unreadable`]). A malformed rule
+/// list raises every side-effecting call to at least `ask`, so:
+/// - a coarse runtime sees a native shell **and** write constraint
+///   (`native_tool_constraints`) and refuses to spawn ([`coarse_native_caps`]);
+/// - the Claude CLI keeps its side-effecting built-ins (`Write`, `Edit`,
+///   `Bash`, …) in `--disallowedTools` (`ActionRules::builtins_refused`).
+pub fn fail_closed_capabilities() -> duduclaw_core::types::CapabilitiesConfig {
+    duduclaw_core::types::CapabilitiesConfig {
+        action_rules: duduclaw_core::tool_effect::ActionRules::unreadable(),
+        ..Default::default()
+    }
 }
 
 /// Read an agent's `[model] account_pool` from `agent.toml`.
@@ -830,6 +864,72 @@ pub fn format_history_as_prompt(history: &[ConversationTurn], current_message: &
 }
 
 // ── Native OS sandbox wiring ────────────────────────────────────
+
+/// RM-103 S3 (v1.81, Daybreak #2): the capabilities a coarse-grained runtime
+/// (Codex, Grok, a generic print-mode CLI — any runtime whose native file and
+/// shell tools bypass the MCP dispatch gate) must choose its sandbox from.
+///
+/// Called before the runtime prepares anything for the spawn, with the
+/// effective config of whoever runs (for a team role member that is the
+/// scaffolded `.ephemeral/<id>/agent.toml`, with the inherited approval lists,
+/// `action_rules`, `policy` and the packet's narrowing):
+///
+/// - no [`duduclaw_core::types::NativeToolConstraints`] ⇒ `Ok(None)`: use the
+///   config as it is (unchanged behaviour);
+/// - a constraint on the native **shell** ⇒ `Err` (spawn-gate class, so the
+///   loop stops instead of retrying another account): none of these runtimes
+///   has a mode without a native shell, so the role cannot run there;
+/// - a constraint on native **writes** only ⇒ `Ok(Some(view))`, a copy whose
+///   sandbox level is read-only — when `read_only_enforceable` (the runtime's
+///   read-only mode really blocks writes to the working root); otherwise
+///   `Err` as above.
+///
+/// Never just a warning: the warn line accompanies the refusal or the
+/// narrowing.
+///
+/// Daybreak round 2 #4: only what can reach a native tool counts — a `policy`
+/// whose rules all name MCP tools (e.g. `allow "*"` + `forbid "mail_send"`)
+/// yields no constraint here, so it no longer refuses every coarse spawn.
+/// `scoped_tools` covering a native family counts (no grant is known at
+/// spawn). See `CapabilitiesConfig::native_tool_constraints`.
+pub(crate) fn coarse_native_caps(
+    caps: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    runtime_name: &str,
+    agent_id: &str,
+    read_only_enforceable: bool,
+) -> Result<Option<duduclaw_core::types::CapabilitiesConfig>, String> {
+    let Some(caps) = caps else { return Ok(None) };
+    let constraints = caps.native_tool_constraints();
+    if constraints.is_empty() {
+        return Ok(None);
+    }
+    let reasons = constraints.reasons();
+    if constraints.needs_no_shell() || !read_only_enforceable {
+        warn!(
+            runtime = runtime_name,
+            agent = %agent_id,
+            reasons = %reasons,
+            "native tool constraints this runtime cannot enforce — refusing to spawn"
+        );
+        let what = if constraints.needs_no_shell() {
+            "原生指令執行"
+        } else {
+            "原生檔案寫入"
+        };
+        return Err(duduclaw_agent::mcp_spawn_gate::spawn_gate_error(&format!(
+            "「{agent_id}」的設定限制了{what}（{reasons}），但 {runtime_name} 的原生工具不經過 DuDuClaw 的工具閘門，\
+             無法執行這些限制，所以這次不在 {runtime_name} 上執行。請改用 claude runtime，或請管理員調整這些限制。\
+             ({runtime_name} cannot enforce these native-tool restrictions; refusing to run.)"
+        )));
+    }
+    warn!(
+        runtime = runtime_name,
+        agent = %agent_id,
+        reasons = %reasons,
+        "native write constraints ⇒ forcing the read-only sandbox for this spawn"
+    );
+    Ok(Some(caps.read_only_native_view()))
+}
 
 /// Apply the opt-in native OS sandbox (`duduclaw-sandbox`) to a to-be-spawned
 /// agent CLI command, in place, just before spawn.
@@ -1271,6 +1371,80 @@ mod tests {
         .unwrap();
         let caps = load_agent_capabilities(dir.path()).unwrap();
         assert!(!caps.computer_use, "malformed section must fail closed");
+    }
+
+    /// RM-103 S3 (round 3 #4): a malformed `[capabilities]` (or an
+    /// unparsable `agent.toml`) must not come back as the unrestricted
+    /// default — a coarse runtime refuses it, Claude loses its side-effecting
+    /// built-ins.
+    #[test]
+    fn malformed_capabilities_refuse_coarse_runtimes() {
+        let dir = tempfile::tempdir().unwrap();
+        for text in [
+            "[capabilities]\ncomputer_use = \"yes please\"\n",
+            "[capabilities]\nnative_sandbox = \"maybe\"\ndenied_tools = [\"Bash\"]\n",
+            "[capabilities\nthis is not toml",
+        ] {
+            std::fs::write(dir.path().join("agent.toml"), text).unwrap();
+            let caps = load_agent_capabilities(dir.path()).unwrap();
+            let n = caps.native_tool_constraints();
+            assert!(n.needs_no_shell() && !n.no_write.is_empty(), "{text:?}: {n:?}");
+            for runtime in ["codex", "grok", "generic"] {
+                assert!(
+                    coarse_native_caps(Some(&caps), runtime, "agnes", true).is_err(),
+                    "{text:?}: {runtime} must refuse"
+                );
+            }
+            let denied = caps.disallowed_tools();
+            for builtin in ["Bash", "Write", "Edit"] {
+                assert!(denied.iter().any(|d| d == builtin), "{text:?}: {builtin} not in {denied:?}");
+            }
+        }
+        // A well-formed section, and an absent one, are untouched.
+        for text in ["[agent]\nname = \"x\"\n", "[capabilities]\nallowed_tools = [\"Read\"]\n"] {
+            std::fs::write(dir.path().join("agent.toml"), text).unwrap();
+            let caps = load_agent_capabilities(dir.path()).unwrap();
+            assert!(caps.native_tool_constraints().is_empty(), "{text:?}");
+            assert!(coarse_native_caps(Some(&caps), "codex", "agnes", true).unwrap().is_none());
+        }
+    }
+
+    /// A read error other than NotFound (non-UTF-8 Big5 bytes, EACCES, a
+    /// directory) must fail closed; only a missing file means "no constraints".
+    #[test]
+    fn unreadable_agent_toml_fails_closed() {
+        let assert_closed = |dir: &std::path::Path, what: &str| {
+            let caps = load_agent_capabilities(dir)
+                .unwrap_or_else(|| panic!("{what}: must not be None"));
+            let n = caps.native_tool_constraints();
+            assert!(n.needs_no_shell() && !n.no_write.is_empty(), "{what}: {n:?}");
+            assert!(coarse_native_caps(Some(&caps), "codex", "agnes", true).is_err(), "{what}");
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_agent_capabilities(dir.path()).is_none(), "missing file stays None");
+
+        std::fs::write(dir.path().join("agent.toml"), [0xffu8, 0xfe, 0xa4, 0xa4]).unwrap();
+        assert_closed(dir.path(), "non-UTF-8");
+
+        // EISDIR: agent.toml is a directory.
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir2.path().join("agent.toml")).unwrap();
+        assert_closed(dir2.path(), "directory");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir3 = tempfile::tempdir().unwrap();
+            let p = dir3.path().join("agent.toml");
+            std::fs::write(&p, "[capabilities]\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root bypasses mode bits; only assert when the file is truly unreadable.
+            if std::fs::read_to_string(&p).is_err() {
+                assert_closed(dir3.path(), "0o000");
+            }
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
     }
 
     #[test]

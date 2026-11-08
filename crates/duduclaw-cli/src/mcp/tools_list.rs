@@ -469,6 +469,18 @@ pub(crate) async fn visible_tools_in_lane(
                 if !duduclaw_gateway::capability_grants::set_contains_tool(&scoped, tool.name) {
                     continue;
                 }
+                // RM-103 S3: mirror of the dispatch §3.65 exemption — only the
+                // exact intrinsic (`team_handoff`) of a verified role member;
+                // every other tool a wildcard entry covers stays hidden.
+                if gated_caller
+                    && duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(
+                        home_dir,
+                        effective_agent,
+                        tool.name,
+                    )
+                {
+                    continue;
+                }
                 let granted = match store.as_ref() {
                     Some(s) => s.has_active_grant(effective_agent, tool.name).await,
                     None => false,
@@ -584,6 +596,14 @@ pub(crate) async fn visible_tools_in_lane(
             (principal.is_external && !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
                 || crate::mcp_dispatch::action_rule_verdict(&action_rules, t.name)
                     != Some(duduclaw_core::ActionVerdict::Block)
+                // RM-103 S3: mirror of the dispatch exemption for a team role
+                // member's intrinsic (`team_handoff`).
+                || (gated_caller
+                    && duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(
+                        home_dir,
+                        effective_agent,
+                        t.name,
+                    ))
         })
         // 2026-10: read-only explore lane (mirror of dispatch §0b).
         .filter(|t| lane_refusal(lane, t.name).is_none())

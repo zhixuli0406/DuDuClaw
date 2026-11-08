@@ -22,6 +22,11 @@ v1.81 より前の `code_map` は、MCP サーバーが読めるあらゆるデ�
 
 **動作の変更：** `agent.toml` に `can_create_agents` キーがない main 以外の社員は、v1.81 より前は社員を作成できましたが、現在は拒否されます。維持するには、管理者がダッシュボードの「工具與權限」で有効にしてください。
 
+## チーム委任は社員の制限を引き継ぐ（v1.81）
+
+- **プランナーのパケットの `tool_scope` は実行役のツールを狭めるだけです。** 空でない `allowed` は実行役をそのツール（と `team_handoff`）に限定します。社員が持たないツールを 1 つでも挙げると、その委任は拒否され、Warning レベルの `team_tool_scope_escalation` 監査行が書かれます。`denied` は実行役のツールから除かれ、メンバーの `denied_tools` に追加されます。役割メンバー（と通常の一時ヘルパー）は社員の `approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools`、`action_rules`、`policy`、`egress_guard`、`scoped_tools` も引き継ぎ、社員と同じ承認を受けます。`grant_ttl_secs` は引き継ぎません。社員の長い期限がメンバーの許可を延ばしてしまうためです。
+- **引き継いだ承認設定がチームの引き継ぎを止めることはありません。** 役割メンバーについて、MCP ゲートは `team_handoff` に限り、引き継いだ `action_rules`、`policy`、承認リスト、`scoped_tools` の許可要件を適用しません（`ephemeral::is_role_member_intrinsic_call`。完全な `[team_member]` レコードが必要で、その parent が `ephemeral.toml` と一致すること）。`scoped_tools` はワイルドカードを含めて完全にコピーするため、ワイルドカードが対象とする他のツールには引き続き許可が必要です。`allowed_tools`、明示的な `denied_tools`、`[permissions]`、外部送信ガードは引き続き適用されます。
+
 ## 顧客の会社情報（v1.80.0）
 
 会社名とロゴは署名検証済みの販売代理店ブランドから分離されています。`company.get` と `company.update` は明示的な管理者 RPC です。`company.update` は名前と任意のロゴ削除だけを受け付け、旧 `logo_base64` フィールドを拒否します。会社名では制御文字、行区切り文字、Unicode 書式文字（`Cf`、双方向上書き・分離制御文字を含む）を拒否します。更新時は既存の設定書き込みロック内でも現在の本人情報を再確認します。`company_info` 監査は実行者、メソッド、結果を記録し、画像と会社名は含みません。詳細設定のナビゲーションとルートも管理者専用で、移動した設定の RPC 権限は緩和しません。

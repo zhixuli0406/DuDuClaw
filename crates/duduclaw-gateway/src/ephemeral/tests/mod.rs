@@ -118,6 +118,7 @@ fn role_spec(parent: &str, role: Role, runtime: &str, model: &str) -> RoleMember
         effort: None,
         instruction: "You verify the executor's output. 只審查，不改稿。".to_string(),
         tools: strs(&["Read"]),
+        extra_denied: Vec::new(),
     }
 }
 
