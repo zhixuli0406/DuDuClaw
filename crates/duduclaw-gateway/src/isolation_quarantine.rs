@@ -165,13 +165,17 @@ pub(crate) struct NewQuarantine<'a> {
 
 /// Insert the row once; a retried tombstone keeps the first row (and its
 /// principal snapshot, taken before users.db was touched). `Ok(true)` when
-/// this call created it.
+/// this call created it. Only the `(employee_hex, incarnation)` key conflict
+/// is ignored (`ON CONFLICT … DO NOTHING`): `INSERT OR IGNORE` would also
+/// silently skip CHECK violations (unknown seal state, bad hex), turning a
+/// refused row into `Ok(false)`.
 pub(crate) fn insert_quarantine(tx: &Connection, row: &NewQuarantine<'_>) -> Result<bool, rusqlite::Error> {
     let (dev, ino) = row.root.map_or((None, None), |(dev, ino)| (Some(dev as i64), Some(ino as i64)));
     let changed = tx.execute(
-        "INSERT OR IGNORE INTO employee_quarantine(employee_hex,incarnation,label,kind,owner_user_id,tenant_id,
+        "INSERT INTO employee_quarantine(employee_hex,incarnation,label,kind,owner_user_id,tenant_id,
             quarantined_at,dev,ino,seal,principal_snapshot,stripped)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+         ON CONFLICT(employee_hex,incarnation) DO NOTHING",
         params![hex::encode(row.employee.0), row.incarnation, row.label,
             if row.owner.is_some() { "personal" } else { "shared" }, row.owner, row.tenant, row.quarantined_at,
             dev, ino, row.seal, row.principal_snapshot.to_string(), row.stripped.to_string()])?;
@@ -184,7 +188,8 @@ pub(crate) fn insert_quarantine(tx: &Connection, row: &NewQuarantine<'_>) -> Res
 /// id (after a restore) keep the first row.
 pub(crate) fn insert_root_allocation(tx: &Connection, employee: EmployeeId, root_item: &Value) -> Result<bool, rusqlite::Error> {
     let changed = tx.execute(
-        "INSERT OR IGNORE INTO root_allocations(employee_hex,root_item,root_state) VALUES(?1,?2,'allocated')",
+        "INSERT INTO root_allocations(employee_hex,root_item,root_state) VALUES(?1,?2,'allocated')
+         ON CONFLICT(employee_hex) DO NOTHING",
         params![hex::encode(employee.0), root_item.to_string()])?;
     Ok(changed == 1)
 }
