@@ -575,7 +575,12 @@ impl MethodHandler {
             // owning agent inside the handler and fail closed (HS4).
             "plans.list" => {
                 check_agent_filter!(AccessLevel::Viewer);
-                boxed_frame(|| self.handle_plans_list(params)).await
+                // v1.81 P1d: other people's Personal employees are left out.
+                let hidden = match self.p1d_list_hidden(ctx, method, crate::personal_visibility::DataCategory::Work, &params).await {
+                    Ok(hidden) => hidden,
+                    Err(frame) => return frame,
+                };
+                boxed_frame(|| self.handle_plans_list(params, hidden)).await
             }
             "plans.get" => boxed_frame(|| self.handle_plans_get(params, ctx)).await,
             "plans.create" => {
@@ -743,10 +748,18 @@ impl MethodHandler {
                 require_manager!();
                 boxed_frame(|| self.handle_mail_status()).await
             }
-            "mail.list" => match boxed_frame(|| self.mailbox_reader_gate(ctx)).await {
-                Ok(reader) => boxed_frame(|| self.handle_mail_list(params, reader)).await,
-                Err(e) => WsFrame::error_response("", &e),
-            },
+            "mail.list" => {
+                let reader = match boxed_frame(|| self.mailbox_reader_gate(ctx)).await {
+                    Ok(reader) => reader,
+                    Err(e) => return WsFrame::error_response("", &e),
+                };
+                // v1.81 P1d: other people's Personal employees are left out.
+                let hidden = match self.p1d_list_hidden(ctx, method, crate::personal_visibility::DataCategory::Mail, &params).await {
+                    Ok(hidden) => hidden,
+                    Err(frame) => return frame,
+                };
+                boxed_frame(|| self.handle_mail_list(params, reader, hidden)).await
+            }
             "mail.read" => {
                 if let Err(e) = boxed_frame(|| self.mailbox_reader_gate(ctx)).await {
                     return WsFrame::error_response("", &e);
@@ -765,7 +778,11 @@ impl MethodHandler {
                 if let Err(e) = boxed_frame(|| self.mailbox_viewer_gate(ctx)).await {
                     return WsFrame::error_response("", &e);
                 }
-                boxed_frame(|| self.handle_mail_outbox(params)).await
+                let hidden = match self.p1d_list_hidden(ctx, method, crate::personal_visibility::DataCategory::Mail, &params).await {
+                    Ok(hidden) => hidden,
+                    Err(frame) => return frame,
+                };
+                boxed_frame(|| self.handle_mail_outbox(params, hidden)).await
             }
             "mail.decide" => {
                 require_manager!();

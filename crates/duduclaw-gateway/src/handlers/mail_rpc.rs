@@ -142,6 +142,8 @@ impl MethodHandler {
         &self,
         params: Value,
         reader: crate::google_identity::mailbox::Reader,
+        // v1.81 P1d: Personal employees the caller does not own.
+        hidden: std::collections::BTreeSet<String>,
     ) -> WsFrame {
         let agent = params
             .get("agent_id")
@@ -170,6 +172,7 @@ impl MethodHandler {
                 .inbox
                 .into_iter()
                 .filter(|m| reader.allows(m))
+                .filter(|m| !hidden.contains(&m.agent_id))
                 .filter(|m| include_archived || !m.archived)
                 .filter(|m| agent.as_deref().is_none_or(|a| m.agent_id == a))
                 .take(limit.clamp(1, crate::mail::MAX_QUERY_LIMIT))
@@ -276,7 +279,8 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_mail_outbox(&self, params: Value) -> WsFrame {
+    /// `hidden`: v1.81 P1d — Personal employees the caller does not own.
+    pub(crate) async fn handle_mail_outbox(&self, params: Value, hidden: std::collections::BTreeSet<String>) -> WsFrame {
         let agent = params
             .get("agent_id")
             .and_then(|v| v.as_str())
@@ -313,6 +317,7 @@ impl MethodHandler {
             Ok(items) => {
                 let drafts: Vec<Value> = items
                     .iter()
+                    .filter(|m| !hidden.contains(&m.agent_id))
                     .map(|m| {
                         json!({
                             "mail_id": m.mail_id,

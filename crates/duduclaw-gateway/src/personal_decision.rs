@@ -14,7 +14,8 @@
 //!   request): no step-up exists there, so only the owner's own verified,
 //!   active channel account decides ([`channel_card_refusal`],
 //!   [`channel_agent_refusal`]). An Admin who is not the owner is refused
-//!   and can decide from the dashboard with a step-up.
+//!   and can decide from the dashboard with a step-up. P1d: the refused
+//!   sender is told [`CHANNEL_CARD_NOT_FOUND`], the text of an unknown card.
 //!
 //! The card's employee is its `agent_id`; a card with a blank `agent_id`
 //! falls back to the task it was built from (binding task, or the payload's
@@ -75,6 +76,15 @@ pub(crate) fn decider_refusal(
     }
 }
 
+/// P1d: what a channel sender who is not the owner sees — the text of an
+/// unknown or expired card, so the reply never says whose card it is.
+pub(crate) const CHANNEL_CARD_NOT_FOUND: &str = "找不到這筆核可（可能已過期並被清除）";
+
+/// [`decider_refusal`] as a channel sender sees it.
+fn channel_text(refusal: Option<&'static str>) -> Option<&'static str> {
+    refusal.map(|message| if message == visibility::PERSONAL_DECISION_REFUSED { CHANNEL_CARD_NOT_FOUND } else { message })
+}
+
 /// The verified, active dashboard account behind a channel sender.
 fn channel_decider(home: &Path, channel: &str, sender: &str) -> Option<String> {
     crate::trigger_route::access::verified_user_for_channel_sender(home, channel, sender)
@@ -92,7 +102,7 @@ pub(crate) fn channel_card_refusal_with(
         return None;
     }
     match card_employee(home, rec) {
-        Ok(Some(employee)) => decider_refusal(home, true, &employee, || channel_decider(home, channel, sender)),
+        Ok(Some(employee)) => channel_text(decider_refusal(home, true, &employee, || channel_decider(home, channel, sender))),
         Ok(None) => None,
         Err(Unavailable) => Some(visibility::OWNERSHIP_UNAVAILABLE),
     }
@@ -113,7 +123,7 @@ pub(crate) fn channel_card_refusal(
 /// Like [`channel_card_refusal`] for decision cards keyed by their employee
 /// (goal kickoff approvals and needs-human goal tasks).
 pub(crate) fn channel_agent_refusal(home: &Path, agent: &str, channel: &str, sender: &str) -> Option<&'static str> {
-    decider_refusal(home, crate::runtime_readiness::is_protected_linux(), agent, || {
+    channel_text(decider_refusal(home, crate::runtime_readiness::is_protected_linux(), agent, || {
         channel_decider(home, channel, sender)
-    })
+    }))
 }

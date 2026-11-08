@@ -351,11 +351,10 @@ impl MethodHandler {
     /// not a machine-parsed DAG — and the two are independent. Operator
     /// access on the target agent.
     pub(crate) async fn handle_tasks_goal_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        let agent_id = params
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .unwrap_or("");
+        // v1.81 P1d: also reached from `tasks.create kind:"goal"`; the id is
+        // used exactly as given (canonical), owner-only for a Personal one.
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        if let Err(frame) = self.delegation_check(ctx, agent_id).await { return frame; }
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "valid agent_id is required");
         }

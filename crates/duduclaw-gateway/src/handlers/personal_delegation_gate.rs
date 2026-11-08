@@ -1,14 +1,27 @@
 //! Dashboard delegation to a Personal employee and hidden-row counts
-//! (native Linux isolation v1.81, task P1c). Protected mode only.
+//! (native Linux isolation v1.81, tasks P1c + P1d). Protected mode only,
+//! except the canonical-id rule, which always applies.
 //!
-//! - **Delegation.** `tasks.create` / `tasks.update` (`assigned_to`),
-//!   `tasks.goal_create` / `plans.create` (`agent_id`) naming another
-//!   person's Personal employee are refused before the handler: a Personal
-//!   employee takes work only from its owner (the users.db mirror owner,
-//!   read fresh, compared with the live identity's id by exact equality).
-//!   There is no Admin break-glass for delegation. `tasks.update` on a task
-//!   that already belongs to one is additionally gated on that task's
-//!   employee (`personal_data_gate::task_scoped`).
+//! - **Delegation.** Every method in [`delegation_target_keys`] —
+//!   `tasks.create` (`assigned_to`, and `agent_id` for the `kind:"goal"`
+//!   route), `tasks.update` (`assigned_to`), `tasks.assign`,
+//!   `tasks.goal_create`, `plans.create`, `agents.delegate` (`agent_id`),
+//!   `plans.add_step` / `plans.update_step` (`assignee`) and every agent
+//!   step of `plans.create` — naming another person's Personal employee is
+//!   refused before the handler: a Personal employee takes work only from its
+//!   owner (the users.db mirror owner, read fresh, compared with the live
+//!   identity's id by exact equality). There is no Admin break-glass for
+//!   delegation. `tasks.create` / `tasks.update` link fields
+//!   (`parent_task_id`, `depends_on`) attach work under the linked task's
+//!   employee and follow the same rule. `tasks.update` on a task that
+//!   already belongs to one is additionally gated on that task's employee
+//!   (`personal_data_gate::task_scoped`).
+//! - **Canonical ids (P1d).** A target with surrounding whitespace is refused
+//!   (`personal_visibility::canonical_agent`) by this gate and by the
+//!   handlers ([`MethodHandler::delegation_check`]), so the gate never checks
+//!   a different string than the handler acts on.
+//! - **Refusal text (P1d).** A non-Admin gets `permission denied` — the text
+//!   an unknown or unassignable employee gets — never the Personal text.
 //! - **Counts.** `tasks.flow_metrics` aggregates over tasks whose employee
 //!   is not hidden from the caller ([`MethodHandler::flow_metrics_hidden`]);
 //!   `tasks.list_page` / `activity.list` totals use the store's `*_hiding`
@@ -17,13 +30,63 @@
 use super::*;
 use crate::personal_visibility as visibility;
 
-/// The parameter naming the employee a dashboard method hands work to.
+/// The parameters naming the employee a dashboard method hands work to.
+/// Every listed key is checked.
+pub(super) fn delegation_target_keys(method: &str) -> &'static [&'static str] {
+    match method {
+        // `kind:"goal"` routes to `tasks.goal_create`, which reads `agent_id`.
+        "tasks.create" => &["assigned_to", "agent_id"],
+        "tasks.update" => &["assigned_to"],
+        "tasks.assign" | "tasks.goal_create" | "plans.create" | "agents.delegate" => &["agent_id"],
+        "plans.add_step" | "plans.update_step" => &["assignee"],
+        _ => &[],
+    }
+}
+
+/// The first (primary) target key of a delegation method.
 pub(super) fn delegation_target_key(method: &str) -> Option<&'static str> {
-    Some(match method {
-        "tasks.create" | "tasks.update" => "assigned_to",
-        "tasks.goal_create" | "plans.create" => "agent_id",
-        _ => return None,
-    })
+    delegation_target_keys(method).first().copied()
+}
+
+/// The targets a request names directly, canonical or refused. No I/O.
+pub(super) fn direct_targets(method: &str, params: &Value) -> Result<Vec<String>, &'static str> {
+    let mut targets = Vec::new();
+    let mut push = |raw: &str| -> Result<(), &'static str> {
+        let agent = visibility::canonical_agent(raw)?;
+        if !agent.is_empty() {
+            targets.push(agent.to_owned());
+        }
+        Ok(())
+    };
+    for key in delegation_target_keys(method) {
+        if let Some(raw) = params.get(*key).and_then(Value::as_str) {
+            push(raw)?;
+        }
+    }
+    if method == "plans.create" {
+        for step in params.get("steps").and_then(Value::as_array).into_iter().flatten() {
+            let agent_step = step.get("assignee_kind").and_then(Value::as_str).is_none_or(|kind| kind == "agent");
+            if let (true, Some(raw)) = (agent_step, step.get("assignee").and_then(Value::as_str)) {
+                push(raw)?;
+            }
+        }
+    }
+    Ok(targets)
+}
+
+/// Task ids a `tasks.create` / `tasks.update` request links its work under.
+fn link_ids(method: &str, params: &Value) -> Vec<String> {
+    if !matches!(method, "tasks.create" | "tasks.update") {
+        return Vec::new();
+    }
+    let mut ids: Vec<String> = params.get("parent_task_id").and_then(Value::as_str).map(str::to_owned).into_iter().collect();
+    match params.get("depends_on") {
+        Some(Value::Array(items)) => ids.extend(items.iter().filter_map(Value::as_str).map(str::to_owned)),
+        Some(Value::String(raw)) => ids.extend(serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()),
+        _ => {}
+    }
+    ids.retain(|id| !id.trim().is_empty());
+    ids
 }
 
 /// The decision for one delegation by `ctx` to `agent` (exact id).
@@ -46,34 +109,84 @@ pub(super) fn delegation_refusal(home: &Path, protected: bool, ctx: &UserContext
     visibility::delegation_refusal_for_user(home, true, &live.user_id, agent)
 }
 
+/// The text `ctx` sees for a delegation refusal: a non-Admin gets the text
+/// of an unknown employee (P1d), an Admin (who sees metadata) the reason.
+fn refusal_text(ctx: &UserContext, refusal: &'static str) -> &'static str {
+    if refusal == visibility::PERSONAL_DELEGATION_REFUSED && !ctx.is_admin() {
+        super::task_privacy::PERMISSION_DENIED
+    } else {
+        refusal
+    }
+}
+
+/// The whole delegation decision for one request: canonical targets
+/// (always), then — protected mode only — every direct target and the
+/// employee of every linked task. `None` = allowed.
+pub(super) fn delegation_decision(home: &Path, protected: bool, ctx: &UserContext, method: &str, params: &Value)
+    -> Option<&'static str> {
+    let mut targets = match direct_targets(method, params) {
+        Ok(targets) => targets,
+        Err(refusal) => return Some(refusal),
+    };
+    if !protected {
+        return None;
+    }
+    for id in link_ids(method, params) {
+        match super::personal_data_gate::task_employee(home, &id) {
+            Ok(Some(agent)) => targets.push(agent),
+            Ok(None) => {}
+            Err(()) => return Some(visibility::OWNERSHIP_UNAVAILABLE),
+        }
+    }
+    targets
+        .iter()
+        .find_map(|agent| delegation_refusal(home, true, ctx, agent))
+        .map(|refusal| refusal_text(ctx, refusal))
+}
+
 impl MethodHandler {
-    /// Dispatch-level delegation gate ([`delegation_target_key`]). Runs for
+    /// Dispatch-level delegation gate ([`delegation_target_keys`]). Runs for
     /// every method from `personal_gates_for_params`; a no-op for other
-    /// methods, for an absent/blank target and outside protected mode.
+    /// methods and for absent/blank targets. Canonical ids are enforced in
+    /// every mode; ownership only in protected mode.
     pub(super) async fn personal_delegation_gate(
         &self,
         method: &str,
         params: &Value,
         ctx: &UserContext,
     ) -> Result<(), WsFrame> {
-        let Some(key) = delegation_target_key(method) else {
-            return Ok(());
-        };
-        if !crate::runtime_readiness::is_protected_linux() {
+        if delegation_target_keys(method).is_empty() {
             return Ok(());
         }
-        let Some(agent) = params
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|agent| !agent.trim().is_empty())
-            .map(str::to_owned)
-        else {
-            return Ok(());
+        let refusal = if crate::runtime_readiness::is_protected_linux() {
+            let (home, session, method, params) = (self.home_dir.clone(), ctx.clone(), method.to_owned(), params.clone());
+            tokio::task::spawn_blocking(move || delegation_decision(&home, true, &session, &method, &params))
+                .await
+                .unwrap_or(Some(visibility::OWNERSHIP_UNAVAILABLE))
+        } else {
+            delegation_decision(&self.home_dir, false, ctx, method, params)
         };
-        let (home, session) = (self.home_dir.clone(), ctx.clone());
-        let refusal = tokio::task::spawn_blocking(move || delegation_refusal(&home, true, &session, &agent))
-            .await
-            .unwrap_or(Some(visibility::OWNERSHIP_UNAVAILABLE));
+        match refusal {
+            Some(message) => Err(WsFrame::error_response("", message)),
+            None => Ok(()),
+        }
+    }
+
+    /// P1d handler-side check for one raw target (defense in depth, and for
+    /// in-process callers such as `tasks.assign` → `tasks.update`): refuses a
+    /// non-canonical id in every mode and, in protected mode, a Personal
+    /// employee `ctx` does not own. A blank target is left to the handler.
+    pub(super) async fn delegation_check(&self, ctx: &UserContext, raw: &str) -> Result<(), WsFrame> {
+        let agent = visibility::canonical_agent(raw).map_err(|message| WsFrame::error_response("", message))?;
+        if agent.is_empty() || !crate::runtime_readiness::is_protected_linux() {
+            return Ok(());
+        }
+        let (home, session, agent) = (self.home_dir.clone(), ctx.clone(), agent.to_owned());
+        let refusal = tokio::task::spawn_blocking(move || {
+            delegation_refusal(&home, true, &session, &agent).map(|refusal| refusal_text(&session, refusal))
+        })
+        .await
+        .unwrap_or(Some(visibility::OWNERSHIP_UNAVAILABLE));
         match refusal {
             Some(message) => Err(WsFrame::error_response("", message)),
             None => Ok(()),

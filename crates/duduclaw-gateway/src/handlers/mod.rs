@@ -243,6 +243,7 @@ mod isolation_employee_rpc;
 mod personal_data_gate;
 mod personal_decide_gate;
 mod personal_delegation_gate;
+mod personal_p1d_gate;
 mod personal_push;
 mod computer_sessions_rpc;
 mod computer_team_rpc;

@@ -34,6 +34,14 @@
 //!   [`MethodHandler::personal_gates_for_params`]); list totals and flow
 //!   metrics are computed over the hidden-filtered set; push events are
 //!   filtered per subscriber (`personal_push.rs`).
+//! - **P1d.** More `agent_id` reads are in [`agent_scoped`] (profile export,
+//!   playbook, wiki trust, skill content/share); methods naming a plan, plan
+//!   step, mail, pending agent-file change or fork by id resolve its employee
+//!   first (`personal_p1d_gate.rs`); optional-scope lists (`plans.list`,
+//!   `mail.list`, `mail.outbox`, `fork.list`) hide Personal employees the
+//!   caller does not own. `tasks.assign` is delegation (owner only), not a
+//!   read. A non-Admin naming an unknown task gets the same `permission
+//!   denied` as for another person's Personal task.
 use super::*;
 use super::isolation_connectors_rpc::authorize_step_up;
 use crate::personal_visibility::{self as visibility, DataCategory, Reader};
@@ -61,15 +69,23 @@ pub(super) fn agent_scoped(method: &str) -> Option<DataCategory> {
     Some(match method {
         "memory.search" | "memory.browse" | "memory.key_facts" | "memory.decay_overview"
         | "memory.history" | "memory.at" | "memory.get_at" | "memory.graph"
-        | "memory.invalidate_origin" | "memory.forget" => DataCategory::Memory,
+        | "memory.invalidate_origin" | "memory.forget"
+        // P1d: learned playbook entries are distilled from its memory.
+        | "playbook.list" | "playbook.export" | "playbook.retire" => DataCategory::Memory,
         "wiki.pages" | "wiki.read" | "wiki.auto_pages" | "wiki.search" | "wiki.lint" | "wiki.stats"
-        | "wiki.promote" | "wiki.archive" | "wiki.share" => DataCategory::Wiki,
+        | "wiki.promote" | "wiki.archive" | "wiki.share"
+        // P1d: per-page trust state and its citation history.
+        | "wiki.trust_audit" | "wiki.trust_history" | "wiki.trust_override" => DataCategory::Wiki,
         "agent_files.list" | "agent_files.get" | "agent_files.runtime_files" | "agent_files.diff"
         | "agent_files.history" | "agent_files.save" | "agent_files.rollback" | "agents.inspect"
-        | "contract.get" | "contract.update" => DataCategory::AgentFiles,
+        | "contract.get" | "contract.update"
+        // P1d: the full profile export (SOUL, contract, …) and the
+        // employee's own skill files (read, or copied to the shared pool).
+        | "agents.export_profile" | "skills.content" | "skills.share" => DataCategory::AgentFiles,
         "chat.sessions.list" | "search.query" | "runs.list" => DataCategory::Sessions,
+        // `tasks.assign` is delegation (personal_delegation_gate.rs), not a read.
         "activity.list" | "timeline.list" | "decisions.list" | "decisions.dismiss" | "canvas.get"
-        | "tasks.list" | "tasks.list_page" | "tasks.flow_metrics" | "tasks.assign" => DataCategory::Work,
+        | "tasks.list" | "tasks.list_page" | "tasks.flow_metrics" => DataCategory::Work,
         _ => return None,
     })
 }
@@ -98,7 +114,7 @@ pub(super) fn task_employee(home: &Path, task_id: &str) -> Result<Option<String>
 }
 
 /// A non-blank string parameter.
-fn param_text(params: &Value, key: &str) -> Option<String> {
+pub(super) fn param_text(params: &Value, key: &str) -> Option<String> {
     params.get(key).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned)
 }
 
@@ -232,7 +248,8 @@ impl MethodHandler {
         self.personal_delegation_gate(method, params, ctx).await?;
         let category = agent_scoped(method);
         let by_task = task_scoped(method);
-        if (category.is_none() && !by_task) || !crate::runtime_readiness::is_protected_linux() {
+        let by_id = super::personal_p1d_gate::id_scoped(method);
+        if (category.is_none() && !by_task && by_id.is_none()) || !crate::runtime_readiness::is_protected_linux() {
             return Ok(());
         }
         let refuse = |message: &str| WsFrame::error_response("", message);
@@ -241,6 +258,9 @@ impl MethodHandler {
             self.personal_data_gate(ctx, Target { method, category, agent: &agent }, csrf)
                 .await
                 .map_err(refuse)?;
+        }
+        if let Some(scope) = by_id {
+            self.personal_id_gate(ctx, method, scope, params, csrf).await?;
         }
         let Some(task_id) = param_text(params, "task_id").filter(|_| by_task) else {
             return Ok(());
@@ -255,6 +275,9 @@ impl MethodHandler {
                 .personal_data_gate(ctx, Target { method, category: DataCategory::Work, agent: &agent }, csrf)
                 .await
                 .map_err(refuse),
+            // P1d: a non-Admin cannot tell an unknown task from another
+            // person's Personal task (both `permission denied`).
+            None if !ctx.is_admin() => Err(refuse(NOT_ALLOWED)),
             None => Ok(()),
         }
     }

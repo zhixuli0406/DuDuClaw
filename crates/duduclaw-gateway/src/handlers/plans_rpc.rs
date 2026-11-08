@@ -82,7 +82,9 @@ impl MethodHandler {
         }
     }
 
-    pub(crate) async fn handle_plans_list(&self, params: Value) -> WsFrame {
+    /// `hidden`: v1.81 P1d — Personal employees the caller does not own
+    /// (`personal_p1d_gate::p1d_list_hidden`); their plans are left out.
+    pub(crate) async fn handle_plans_list(&self, params: Value, hidden: std::collections::BTreeSet<String>) -> WsFrame {
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,
@@ -95,10 +97,11 @@ impl MethodHandler {
             .get("status")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
-        let plans = match store.list_plans(agent_id, status).await {
+        let mut plans = match store.list_plans(agent_id, status).await {
             Ok(rows) => rows,
             Err(e) => return WsFrame::error_response("", &format!("list plans: {e}")),
         };
+        super::personal_p1d_gate::retain_visible(&mut plans, &hidden, |p| p.agent_id.as_str());
         // Progress counters ride along so the list view renders without N
         // follow-up `plans.get` calls (plans are few; steps are tens).
         let mut out: Vec<Value> = Vec::with_capacity(plans.len());
@@ -159,6 +162,10 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // v1.81 P1d: canonical id; owner-only for a Personal employee.
+        if let Err(frame) = self.delegation_check(ctx, &agent_id).await {
+            return frame;
+        }
         let mut plan = PlanRow::new(
             uuid::Uuid::new_v4().to_string(),
             duduclaw_core::truncate_chars(title_raw.trim(), 200),

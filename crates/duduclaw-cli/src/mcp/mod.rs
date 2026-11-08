@@ -220,6 +220,7 @@ mod odoo_generic_write;
 mod on_behalf_of;
 mod os_tools;
 mod personal_target;
+mod personal_wildcard;
 mod record_authz;
 mod reminders;
 mod responsibilities;

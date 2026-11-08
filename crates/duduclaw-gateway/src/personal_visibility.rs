@@ -35,6 +35,11 @@
 //!   the employee itself or another Personal employee of the same owner
 //!   ([`delegation_refusal`]); tasks and plans named by id resolve their
 //!   employee through [`work_item_employee`].
+//! - **P1d:** an employee id must be canonical ([`canonical_agent`]: no
+//!   surrounding whitespace) before it is compared or used, so the gates and
+//!   the handlers always name the same employee; mail is category
+//!   [`DataCategory::Mail`]; a goal of the goal hierarchy belongs to the
+//!   employee that created it ([`WorkItem::Goal`], [`goal_creators`]).
 //!
 //! Every check here runs only in protected mode (`protected = true`, from
 //! `runtime_readiness::is_protected_linux()`); otherwise nothing is read and
@@ -65,6 +70,9 @@ pub enum DataCategory {
     /// A decision on one of its approval cards (P1c): `approvals.decide`,
     /// `mail.decide`.
     Approval,
+    /// Its received and drafted mail (P1d): `mail.list`, `mail.read`,
+    /// `mail.archive`, `mail.outbox`.
+    Mail,
 }
 
 impl DataCategory {
@@ -76,6 +84,7 @@ impl DataCategory {
             Self::Wiki => "wiki",
             Self::Work => "work",
             Self::Approval => "approval",
+            Self::Mail => "mail",
         }
     }
 }
@@ -87,7 +96,29 @@ pub enum WorkItem {
     Task,
     /// `tasks.db` `plans.id` → `agent_id`.
     Plan,
+    /// `tasks.db` `goals.id` → the employee whose `goal_created` activity
+    /// row records it (P1d). A goal no employee created (dashboard / legacy
+    /// company goal) has none.
+    Goal,
 }
+
+/// Shown when an employee id carries surrounding whitespace (P1d).
+pub const NON_CANONICAL_AGENT: &str = "AI 員工代號前後不能有空白。 / An employee id must not have leading or \
+    trailing whitespace.";
+
+/// P1d: `raw` as a canonical employee id. Every gate and handler compares
+/// and uses this exact value; an id with surrounding whitespace is refused
+/// rather than trimmed, so a gate can never check one string while the
+/// handler acts on another.
+pub fn canonical_agent(raw: &str) -> Result<&str, &'static str> {
+    if raw.trim() == raw { Ok(raw) } else { Err(NON_CANONICAL_AGENT) }
+}
+
+/// The creating employee of every goal, from its `goal_created` activity row
+/// (`metadata.goal_id`; a legacy row without metadata matches by title).
+const GOAL_CREATOR: &str = "(SELECT a.agent_id FROM activity a WHERE a.event_type = 'goal_created' AND \
+    (CASE WHEN json_valid(a.metadata) THEN json_extract(a.metadata, '$.goal_id') END = g.id \
+    OR (a.metadata IS NULL AND a.summary = 'Created goal: ' || g.title)) ORDER BY a.timestamp ASC LIMIT 1)";
 
 /// What a dashboard caller may do with one employee's private data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,14 +327,39 @@ pub fn delegation_refusal_for_user(home: &Path, protected: bool, user_id: &str, 
 /// (the tool answers); `Err` = the store could not be read (callers refuse).
 pub fn work_item_employee(home: &Path, item: WorkItem, id: &str) -> Result<Option<String>, Unavailable> {
     use rusqlite::OptionalExtension;
+    let goal_sql;
     let sql = match item {
         WorkItem::Task => "SELECT assigned_to FROM tasks WHERE id=?1",
         WorkItem::Plan => "SELECT agent_id FROM plans WHERE id=?1",
+        WorkItem::Goal => {
+            goal_sql = format!("SELECT {GOAL_CREATOR} FROM goals g WHERE g.id=?1");
+            goal_sql.as_str()
+        }
     };
     let conn = crate::review_evidence::audience::readonly_db(&home.join("tasks.db")).map_err(|_| Unavailable)?;
-    conn.query_row(sql, [id], |row| row.get::<_, String>(0))
+    conn.query_row(sql, [id], |row| row.get::<_, Option<String>>(0))
         .optional()
+        .map(Option::flatten)
         .map_err(|_| Unavailable)
+}
+
+/// P1d: goal id → creating employee, for every goal that has one
+/// ([`WorkItem::Goal`]). `Err` = `tasks.db` could not be read.
+pub fn goal_creators(home: &Path) -> Result<std::collections::BTreeMap<String, String>, Unavailable> {
+    let conn = crate::review_evidence::audience::readonly_db(&home.join("tasks.db")).map_err(|_| Unavailable)?;
+    let mut statement = conn
+        .prepare(&format!("SELECT g.id, {GOAL_CREATOR} FROM goals g"))
+        .map_err(|_| Unavailable)?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))
+        .map_err(|_| Unavailable)?;
+    let mut creators = std::collections::BTreeMap::new();
+    for row in rows {
+        if let (goal, Some(agent)) = row.map_err(|_| Unavailable)? {
+            creators.insert(goal, agent);
+        }
+    }
+    Ok(creators)
 }
 
 /// Shared with the dashboard gate tests (`handlers/personal_data_gate_tests.rs`).

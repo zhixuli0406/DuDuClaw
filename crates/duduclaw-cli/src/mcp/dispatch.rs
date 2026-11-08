@@ -44,14 +44,20 @@ pub(crate) async fn handle_tools_call(
     // store and a memory `namespace` of another employee refuse when it is a
     // Personal employee (self-targets never read users.db). Runs before any
     // handler or isolation route, for every principal kind.
-    let acting_for_target = acting_agent_id(caller_client_id, default_agent);
-    if let Some(refusal) = super::personal_target::pre_dispatch_refusal(
-        home_dir, duduclaw_gateway::runtime_readiness::is_protected_linux(), tool_name, &arguments,
-        acting_for_target, default_agent, &ns_ctx.write_namespace,
-    ) {
+    // P1d: an external key is judged as `external:<client id>`, never as the
+    // employee its client id may spell (`personal_wildcard.rs`).
+    let personal_protected = duduclaw_gateway::runtime_readiness::is_protected_linux();
+    let personal_acting = super::personal_wildcard::personal_acting_id(principal, default_agent);
+    let acting_for_target = personal_acting.as_str();
+    if let Some(refusal) = super::personal_wildcard::external_identity_refusal(home_dir, personal_protected, principal)
+        .or_else(|| super::personal_target::pre_dispatch_refusal(
+            home_dir, personal_protected, tool_name, &arguments,
+            acting_for_target, default_agent, &ns_ctx.write_namespace,
+        ))
+    {
         duduclaw_security::audit::append_tool_call_denied(
             home_dir,
-            acting_for_target,
+            acting_agent_id(caller_client_id, default_agent),
             tool_name,
             "personal_employee_target",
             refusal,
@@ -550,7 +556,7 @@ impl GatewayHandler<'_> {
             .await
         }
         "list_agents" => super::personal_target::list_agents_hiding(&arguments, home_dir, default_agent,
-            acting_agent_id(caller_client_id, default_agent), duduclaw_gateway::runtime_readiness::is_protected_linux()).await,
+            acting_for_target, personal_protected).await,
         "create_task" => handle_create_task(&arguments, home_dir, record_actor.id()).await,
         "check_responses" => handle_check_responses(&arguments, home_dir).await,
         "task_status" => handle_task_status(&arguments, home_dir, default_agent).await,
@@ -719,7 +725,9 @@ impl GatewayHandler<'_> {
         // Session tools
         "session_restore_context" => handle_session_restore_context(&arguments).await,
         // Task Board tools
-        "tasks_list" => handle_tasks_list(&arguments, home_dir, default_agent, record_actor).await,
+        // v1.81 P1d: wildcard listings leave out other Personal employees.
+        "tasks_list" => super::personal_wildcard::tasks_list(&arguments, home_dir, default_agent, record_actor,
+            acting_for_target, personal_protected).await,
         "tasks_create" => handle_tasks_create(&arguments, home_dir, record_actor).await,
         "discovery_catalog" | "discovery_list" | "discovery_tree" | "discovery_artifact"
         | "discovery_cancel" => {
@@ -739,14 +747,16 @@ impl GatewayHandler<'_> {
         "responsibility_ask" => handle_responsibility_ask(&arguments, home_dir, record_actor).await,
         // Goal chain tools (G8)
         "goals_create" => handle_goals_create(&arguments, home_dir, record_actor.id()).await,
-        "goals_list" => handle_goals_list(&arguments, home_dir).await,
+        "goals_list" => super::personal_wildcard::goals_list(&arguments, home_dir, acting_for_target,
+            personal_protected).await,
         // Co-edited plan tools (U4)
         "plan_get" => handle_plan_get(&arguments, home_dir, default_agent).await,
         "plan_update_step" => handle_plan_update_step(&arguments, home_dir, default_agent).await,
         // Activity Feed tools
         "activity_post" => handle_activity_post(&arguments, home_dir, record_actor).await,
         "activity_list" => {
-            handle_activity_list(&arguments, home_dir, default_agent, record_actor).await
+            super::personal_wildcard::activity_list(&arguments, home_dir, default_agent, record_actor,
+                acting_for_target, personal_protected).await
         }
         // Autopilot tools
         "autopilot_list" => handle_autopilot_list(&arguments, home_dir).await,

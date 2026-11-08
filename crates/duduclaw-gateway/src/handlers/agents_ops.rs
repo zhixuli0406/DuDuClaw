@@ -12,6 +12,11 @@ impl MethodHandler {
             .get("agent_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        // v1.81 P1d: delegation (its answer runs under the employee's SOUL):
+        // canonical id, owner-only for a Personal employee, no break-glass.
+        if let Err(frame) = self.delegation_check(ctx, agent_id).await {
+            return frame;
+        }
         let prompt = params.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
         let wait = params
             .get("wait_for_response")
