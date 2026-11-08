@@ -77,7 +77,11 @@ impl RootPolicy {
         self.launchers.get(&(parent.profile.0).0).map(|launcher| launcher.helper_tmpfs_bytes)
     }
     /// Per call (§2.3): re-derive the helper for the run's own employee and map it
-    /// to its index in that run's table; absent means refused.
+    /// to its index in that run's table; absent means refused. An index is a
+    /// position in the *current* signed list, so after a reload it may name a
+    /// different binding: `HelperEngine::start` also requires the entry's kind,
+    /// profile and `helper_policy::binding_digest` to equal the run's table
+    /// (security fix round, finding 1).
     pub fn derive_helper(&self, employee: EmployeeId, parent: &PublishedRuntime, helper: &RuntimeKind) -> Result<HelperEntry<'_>> {
         let mut matching = self.helper_table(employee, parent).into_iter().filter(|entry| entry.runtime.runtime == *helper);
         let entry = matching.next().ok_or(ErrorCode::RuntimeDenied)?;

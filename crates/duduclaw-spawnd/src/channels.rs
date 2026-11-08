@@ -16,6 +16,9 @@ impl RevocablePair {
 }
 pub struct ConnectionRevoker(OwnedFd);
 impl ConnectionRevoker {
+    /// Test-only: a revoker over an arbitrary fd (a non-socket makes `revoke` fail).
+    #[cfg(test)]
+    pub(crate) fn from_fd_for_test(fd: OwnedFd) -> Self { Self(fd) }
     pub fn revoke(&self) -> io::Result<()> {
         match socket::shutdown(self.0.as_raw_fd(), Shutdown::Both) {
             Ok(()) | Err(Errno::ENOTCONN) => Ok(()),

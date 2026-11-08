@@ -21,6 +21,8 @@ struct Fake {
     signals: Vec<(RunHandle, HelperCallId, HelperSignal)>,
     events: Vec<HelperEvent>,
     not_ready: Option<ErrorCode>,
+    /// The worker mailbox is full: every `helper_signal` is refused (finding 6).
+    refuse_signals: bool,
 }
 const CLEAN: CleanupReadback = CleanupReadback { unit_inactive: true, cgroup_empty: true, employee_uid_absent: true };
 impl Host for Fake {
@@ -59,6 +61,7 @@ impl Host for Fake {
         Ok(Some(HelperStarted { effective_timeout_ms: job.timeout_ms.min(30_000), pipes: () }))
     }
     fn helper_signal(&mut self, run: RunHandle, call: HelperCallId, signal: HelperSignal) -> Result<()> {
+        if self.refuse_signals { return Err(ErrorCode::HelperUnavailable); }
         self.signals.push((run, call, signal)); Ok(())
     }
     fn helper_events(&mut self) -> Vec<HelperEvent> { std::mem::take(&mut self.events) }
@@ -128,11 +131,11 @@ fn helper_call_never_occupies_d8_slot() {
     c.tick(105).unwrap();
     assert_eq!(c.status(run(3), conn()).unwrap(), RunStatus::Running);
     // The job is keyed (run, call), separate from run handles.
-    assert_eq!(c.helper_wait(run(1), call, conn()), Err(ErrorCode::NotReady));
+    assert_eq!(c.helper_wait(run(1), employee(1),call, conn()), Err(ErrorCode::NotReady));
     end(&mut c, call, HelperOutcome::Exited(0), 106);
-    assert_eq!(c.helper_wait(run(1), call, conn()).unwrap(),
+    assert_eq!(c.helper_wait(run(1), employee(1),call, conn()).unwrap(),
         SpawnResponse::HelperEnded { run: run(1), call, outcome: HelperOutcome::Exited(0) });
-    assert_eq!(c.helper_wait(run(1), call, conn()), Err(ErrorCode::NotFound), "the outcome is answered once");
+    assert_eq!(c.helper_wait(run(1), employee(1),call, conn()), Err(ErrorCode::NotFound), "the outcome is answered once");
     assert_eq!(c.status(run(1), conn()).unwrap(), RunStatus::Running);
 }
 
@@ -143,13 +146,13 @@ fn helper_call_other_connection_refused() {
     assert_eq!(c.helper_call(other, helper(1, 1, HelperSlot::Foreground, 10), Rc::new(()), [7; 16], 102).unwrap_err(),
         ErrorCode::NotFound);
     let call = started(&mut c, HelperSlot::Foreground, 7, 102);
-    assert_eq!(c.helper_wait(run(1), call, other), Err(ErrorCode::NotFound));
-    assert_eq!(c.helper_cancel(run(1), call, other, 103), Err(ErrorCode::NotFound));
-    assert_eq!(c.helper_stop(run(1), call, other, 103), Err(ErrorCode::NotFound));
+    assert_eq!(c.helper_wait(run(1), employee(1),call, other), Err(ErrorCode::NotFound));
+    assert_eq!(c.helper_cancel(run(1), employee(1),call, other, 103), Err(ErrorCode::NotFound));
+    assert_eq!(c.helper_stop(run(1), employee(1),call, other, 103), Err(ErrorCode::NotFound));
     // Unknown run, unknown call.
     assert_eq!(c.helper_call(conn(), helper(5, 1, HelperSlot::Foreground, 10), Rc::new(()), [8; 16], 103).unwrap_err(),
         ErrorCode::NotFound);
-    assert_eq!(c.helper_wait(run(1), id(99), conn()), Err(ErrorCode::NotFound));
+    assert_eq!(c.helper_wait(run(1), employee(1),id(99), conn()), Err(ErrorCode::NotFound));
     assert!(c.host.signals.is_empty());
 }
 
@@ -183,15 +186,15 @@ fn helper_call_on_draining_run_refused() {
     c.host.events.push(HelperEvent::Draining { run: run(1) });
     c.tick(103).unwrap();
     assert_eq!(submit(&mut c, HelperSlot::Foreground, 7, 104).unwrap_err(), ErrorCode::NotReady);
-    assert_eq!(c.helper_wait(run(1), live, conn()), Err(ErrorCode::NotReady));
-    c.helper_stop(run(1), live, conn(), 104).unwrap();
+    assert_eq!(c.helper_wait(run(1), employee(1),live, conn()), Err(ErrorCode::NotReady));
+    c.helper_stop(run(1), employee(1),live, conn(), 104).unwrap();
     assert_eq!(c.host.signals, vec![(run(1), live, HelperSignal::Stop)]);
     // Admission Draining (cancel): refused, and the live call ends RunEnded.
     let mut c = running(Limits::default());
     let live = started(&mut c, HelperSlot::Foreground, 6, 102);
     c.cancel(run(1), conn(), 103).unwrap();
     assert_eq!(submit(&mut c, HelperSlot::Foreground, 7, 104).unwrap_err(), ErrorCode::NotReady);
-    assert_eq!(c.helper_wait(run(1), live, conn()).unwrap(),
+    assert_eq!(c.helper_wait(run(1), employee(1),live, conn()).unwrap(),
         SpawnResponse::HelperEnded { run: run(1), call: live, outcome: HelperOutcome::RunEnded });
     // An employee stop in progress also refuses.
     let mut c = running(Limits::default());
@@ -270,7 +273,7 @@ fn queue_dropped_on_run_end_revocation_cancel() {
         let queued = submit(&mut c, HelperSlot::Foreground, 2, 102).unwrap();
         if run_end { c.host.end = true; c.tick(103).unwrap(); } else { c.cancel(run(1), conn(), 103).unwrap(); }
         assert_eq!(reply(&mut c, queued, 103), error(ErrorCode::NotReady));
-        assert_eq!(c.helper_wait(run(1), live, conn()).unwrap(),
+        assert_eq!(c.helper_wait(run(1), employee(1),live, conn()).unwrap(),
             SpawnResponse::HelperEnded { run: run(1), call: live, outcome: HelperOutcome::RunEnded });
         assert_eq!(c.helper_held(), (0, 0));
     }
@@ -286,7 +289,7 @@ fn queue_dropped_on_run_end_revocation_cancel() {
     let mut c = running(Limits::default());
     started(&mut c, HelperSlot::Foreground, 1, 102);
     let cancelled = submit(&mut c, HelperSlot::Foreground, 2, 102).unwrap();
-    c.helper_cancel(run(1), id(2), conn(), 102).unwrap();
+    c.helper_cancel(run(1), employee(1),id(2), conn(), 102).unwrap();
     assert_eq!(reply(&mut c, cancelled, 102), error(ErrorCode::NotReady));
     let abandoned = submit(&mut c, HelperSlot::Foreground, 3, 102).unwrap();
     c.abandon_ticket(abandoned);
@@ -319,7 +322,7 @@ fn helper_queue_depth_4_and_drop_rules() {
         assert_eq!(reply(&mut c, *ticket, 104), error(ErrorCode::NotReady), "{index}");
     }
     for (index, input) in inputs.iter().enumerate() { assert_eq!(Rc::strong_count(input), 1, "{index}"); }
-    assert_eq!(c.helper_wait(run(1), fg, conn()).unwrap(),
+    assert_eq!(c.helper_wait(run(1), employee(1),fg, conn()).unwrap(),
         SpawnResponse::HelperEnded { run: run(1), call: fg, outcome: HelperOutcome::RunEnded });
     assert_eq!(c.helper_held(), (0, 0));
 }
@@ -330,11 +333,11 @@ fn in_run_job_cancel_never_kills_run() {
     let fg = started(&mut c, HelperSlot::Foreground, 1, 102);
     let rec = started(&mut c, HelperSlot::Recording, 2, 102);
     // [F8] Cancel reaches only the call's slot; the run is never revoked or killed.
-    c.helper_cancel(run(1), fg, conn(), 103).unwrap();
+    c.helper_cancel(run(1), employee(1),fg, conn(), 103).unwrap();
     assert_eq!(c.host.signals, vec![(run(1), fg, HelperSignal::Cancel)]);
     // Stop is recording-only.
-    assert_eq!(c.helper_stop(run(1), fg, conn(), 103), Err(ErrorCode::InvalidRequest));
-    c.helper_stop(run(1), rec, conn(), 103).unwrap();
+    assert_eq!(c.helper_stop(run(1), employee(1),fg, conn(), 103), Err(ErrorCode::InvalidRequest));
+    c.helper_stop(run(1), employee(1),rec, conn(), 103).unwrap();
     assert_eq!(c.host.signals.last(), Some(&(run(1), rec, HelperSignal::Stop)));
     end(&mut c, fg, HelperOutcome::Signalled(9), 104);
     c.tick(105).unwrap();
@@ -342,7 +345,7 @@ fn in_run_job_cancel_never_kills_run() {
     assert_eq!(c.status(run(1), conn()).unwrap(), RunStatus::Running);
     assert_eq!(c.entries[&run(1).0].state, AdmissionState::Running);
     // Idempotent after the end; the fg slot is free for the next call.
-    c.helper_cancel(run(1), fg, conn(), 105).unwrap();
+    c.helper_cancel(run(1), employee(1),fg, conn(), 105).unwrap();
     assert_eq!(c.host.signals.len(), 2, "no signal for an ended call");
     started(&mut c, HelperSlot::Foreground, 3, 106);
     // A cancel that races the host's start is applied as soon as the start lands.
@@ -350,7 +353,7 @@ fn in_run_job_cancel_never_kills_run() {
     c.host.hold = true;
     let ticket = submit(&mut c, HelperSlot::Recording, 4, 107).unwrap();
     assert_eq!(reply(&mut c, ticket, 107), None);
-    c.helper_cancel(run(1), id(4), conn(), 107).unwrap();
+    c.helper_cancel(run(1), employee(1),id(4), conn(), 107).unwrap();
     c.host.hold = false;
     assert_eq!(reply(&mut c, ticket, 108), error(ErrorCode::NotReady));
     assert_eq!(c.host.signals.last(), Some(&(run(1), id(4), HelperSignal::Cancel)));
@@ -411,4 +414,60 @@ fn hx4_call_ids_and_feature_bit() {
     assert_eq!(reply(&mut c, ticket, 105), error(ErrorCode::HelperUnavailable));
     c.host.fail_start = None;
     assert_eq!(submit(&mut c, HelperSlot::Foreground, 10, 106).unwrap_err(), ErrorCode::HelperUnavailable);
+}
+
+#[test]
+fn hxfix_wait_stop_cancel_wrong_employee_refused() {
+    // Finding 8: same owning connection, another employee's id ⇒ Unauthorized, nothing signalled.
+    let mut c = running(Limits::default());
+    let rec = started(&mut c, HelperSlot::Recording, 1, 102);
+    assert_eq!(c.helper_wait(run(1), employee(2), rec, conn()), Err(ErrorCode::Unauthorized));
+    assert_eq!(c.helper_stop(run(1), employee(2), rec, conn(), 103), Err(ErrorCode::Unauthorized));
+    assert_eq!(c.helper_cancel(run(1), employee(2), rec, conn(), 103), Err(ErrorCode::Unauthorized));
+    assert!(c.host.signals.is_empty());
+    // Ownership is still checked first (another connection: NotFound, as before).
+    assert_eq!(c.helper_cancel(run(1), employee(1), rec, ControlConnectionId([9; 16]), 103), Err(ErrorCode::NotFound));
+    // The run's own employee is accepted.
+    c.helper_stop(run(1), employee(1), rec, conn(), 103).unwrap();
+    assert_eq!(c.host.signals, vec![(run(1), rec, HelperSignal::Stop)]);
+    assert_eq!(c.run_employee(run(1)), Some(employee(1)));
+    assert_eq!(c.run_employee(run(9)), None);
+}
+
+#[test]
+fn hxfix_dropped_cancel_is_retried_until_delivered() {
+    // Finding 6: a full worker mailbox never silently drops a Cancel.
+    let mut c = running(Limits::default());
+    let fg = started(&mut c, HelperSlot::Foreground, 1, 102);
+    c.host.refuse_signals = true;
+    c.helper_cancel(run(1), employee(1), fg, conn(), 103).unwrap();
+    c.tick(104).unwrap();
+    assert!(c.host.signals.is_empty(), "still refused");
+    c.host.refuse_signals = false;
+    c.tick(105).unwrap();
+    assert_eq!(c.host.signals, vec![(run(1), fg, HelperSignal::Cancel)]);
+    c.tick(106).unwrap();
+    assert_eq!(c.host.signals.len(), 1, "delivered exactly once");
+    // A cancel that raced the start, applied when the start lands into a full mailbox.
+    end(&mut c, fg, HelperOutcome::Signalled(9), 107);
+    c.host.hold = true;
+    let ticket = submit(&mut c, HelperSlot::Foreground, 2, 107).unwrap();
+    c.helper_cancel(run(1), employee(1), id(2), conn(), 107).unwrap();
+    c.host.hold = false;
+    c.host.refuse_signals = true;
+    assert_eq!(reply(&mut c, ticket, 108), error(ErrorCode::NotReady));
+    assert_eq!(c.host.signals.len(), 1);
+    c.host.refuse_signals = false;
+    c.tick(109).unwrap();
+    assert_eq!(c.host.signals.last(), Some(&(run(1), id(2), HelperSignal::Cancel)));
+    // A held signal is dropped once the host ended the call root-side (slot drained).
+    end(&mut c, id(2), HelperOutcome::Signalled(9), 110);
+    let rec = started(&mut c, HelperSlot::Recording, 3, 110);
+    c.host.refuse_signals = true;
+    c.helper_stop(run(1), employee(1), rec, conn(), 110).unwrap();
+    end(&mut c, rec, HelperOutcome::Exited(0), 111);
+    c.host.refuse_signals = false;
+    c.tick(112).unwrap();
+    assert!(!c.host.signals.iter().any(|(_, call, _)| *call == rec), "nothing left to signal");
+    assert!(c.host.killed.is_empty() && c.host.revoked.is_empty(), "never the run");
 }

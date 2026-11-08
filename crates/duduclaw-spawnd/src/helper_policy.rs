@@ -160,6 +160,13 @@ pub fn validate_launcher(arch: Architecture, parent: &PublishedRuntime, parent_s
             _ => return Err(Invalid),
         }
         if recording && !binding.egress { return Err(Invalid); }
+        // Security fix round (findings 2–4): an offline helper holds no
+        // socket-family call; no helper holds a path-based metadata write
+        // Landlock does not mediate, or SysV/POSIX-mq IPC (runtime↔helper
+        // channels outside Landlock). The trampoline also denies these in F_H.
+        if duduclaw_run::helper_policy::first_refused_helper_call(arch, &binding.seccomp, binding.egress).is_some() {
+            return Err(NotNarrowing);
+        }
         // Check 6 [F15]: fixed grants inside the runtime list; recordings only for the recording parent.
         let mut grants = binding.filesystem.clone();
         grants.sort_unstable(); grants.dedup();
@@ -175,6 +182,21 @@ pub fn validate_launcher(arch: Architecture, parent: &PublishedRuntime, parent_s
     // Check 5: descriptor budget with helper mounts deduplicated.
     if launcher_fd_cost(&resolved) > HELPER_FD_BUDGET { return Err(FdBudget); }
     Ok(())
+}
+
+/// Security fix round (finding 1): identity of one signed binding. A run's
+/// launcher table records it at start; every call re-derives the entry from
+/// the current policy and is refused unless the digests are equal, so a
+/// reload that reorders, edits or withdraws bindings cannot make a reused
+/// index run a different helper. `None` (encoding failure) fails closed.
+#[cfg(target_os = "linux")]
+pub fn binding_digest(binding: &HelperBinding) -> Option<Sha256Digest> {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(binding).ok()?;
+    let mut hash = Sha256::new();
+    hash.update(b"duduclaw-helper-binding-v1\0");
+    hash.update(&bytes);
+    Some(Sha256Digest(hash.finalize().into()))
 }
 
 #[cfg(test)]
@@ -381,6 +403,56 @@ mod tests {
                 Err(HelperPolicyError::ParentLacksLauncherCalls), "{missing}");
         }
         assert_eq!(HelperPolicyError::ParentLacksLauncherCalls.as_reason(), "helper_launcher_unavailable");
+    }
+    fn with_calls(slot: HelperSlot, extra: &[u32]) -> HelperBinding {
+        let mut helper = binding(if slot == HelperSlot::Recording { 3 } else { 2 }, slot);
+        let mut calls = vec![0, 1, 3, 231, 322];
+        calls.extend_from_slice(extra);
+        (helper.seccomp, helper.seccomp_digest) = profile(&calls);
+        helper
+    }
+    #[test]
+    fn hxfix_offline_helper_socket_and_uncovered_calls_refused() {
+        let f = fixture(egress());
+        // A parent wide enough that only the new checks can refuse these bindings.
+        let mut parent = parent_profile();
+        for nr in [41, 42, 49, 53, 288, 76, 77, 90, 91, 268, 280, 188, 197, 29, 64, 68, 220, 240] {
+            if !parent.allowed_syscalls.contains(&nr) { parent.allowed_syscalls.push(nr); }
+        }
+        let check = |helper: HelperBinding| validate_launcher(ARCH, &f.parent, &parent, &launcher(vec![helper]), &f.runtimes);
+        check(with_calls(HelperSlot::Foreground, &[])).unwrap();
+        check(with_calls(HelperSlot::Foreground, &[77, 91] /* ftruncate, fchmod: fd forms stay */)).unwrap();
+        // Finding 2: socket, connect, bind, socketpair, accept4 in an offline helper.
+        for nr in [41, 42, 49, 53, 288] {
+            assert_eq!(check(with_calls(HelperSlot::Foreground, &[nr])), Err(HelperPolicyError::NotNarrowing), "offline {nr}");
+        }
+        // The egress (recording) helper keeps socket/connect for the parent's forwarder.
+        check(with_calls(HelperSlot::Recording, &[41, 42])).unwrap();
+        // Findings 3 and 4: path-based truncate/chmod/utimensat/xattr writes and SysV/mq IPC, for every helper.
+        for nr in [76, 90, 268, 280, 188, 197, 29, 64, 68, 220, 240] {
+            for slot in [HelperSlot::Foreground, HelperSlot::Recording] {
+                assert_eq!(check(with_calls(slot, &[nr])), Err(HelperPolicyError::NotNarrowing), "{slot:?} {nr}");
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hxfix_binding_digest_binds_the_whole_binding() {
+        let base = binding(2, HelperSlot::Foreground);
+        let digest = binding_digest(&base).unwrap();
+        assert_eq!(binding_digest(&base.clone()), Some(digest), "deterministic");
+        let edits: [fn(&mut HelperBinding); 6] = [
+            |b| b.profile = ProfileId(Sha256Digest([9; 32])),
+            |b| b.timeout_ms -= 1,
+            |b| b.memory_bytes += 1,
+            |b| b.filesystem.reverse(),
+            |b| b.self_only = vec![SelfOnlyCall::Prlimit64SelfOnly],
+            |b| (b.seccomp, b.seccomp_digest) = profile(&[0, 1, 231, 322]),
+        ];
+        for edit in edits {
+            let mut other = base.clone(); edit(&mut other);
+            assert_ne!(binding_digest(&other), Some(digest), "{other:?}");
+        }
     }
     #[test]
     fn helper_records_must_be_signed_non_mcp_helpers() {

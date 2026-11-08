@@ -4,7 +4,11 @@
 //!
 //! Authority is root state only:
 //! - the helper is the run-table position of the helper `Core` re-derived
-//!   from the run's own employee; the slot must equal the signed binding's;
+//!   from the run's own employee; the slot must equal the signed binding's,
+//!   and (security fix round, finding 1) the freshly derived runtime kind,
+//!   profile and binding digest must equal the ones the run's table was built
+//!   from, so a policy reload that reorders or withdraws helpers can never
+//!   make a call run a different helper at a reused index;
 //! - the gateway's input memfd is revalidated (tmpfs, seals
 //!   `SEAL|SHRINK|GROW|WRITE`, exact size, CLOEXEC) right before it is sent;
 //! - before `Start` the slot must be empty (`cgroup.events populated 0`) and
@@ -14,18 +18,28 @@
 //!   outside the run (a SIGSTOPped launcher cannot extend a helper); OOM comes
 //!   from the slot's `memory.events oom_kill` delta; after EVERY call, whatever
 //!   the outcome, the slot is killed and drained (`populated 0`) and closed
-//!   again before the end is reported. Launcher frames are hints: only the exit
-//!   status itself (which only the launcher can observe) is taken from them;
+//!   again before the end is reported. A slot that is not confirmed drained
+//!   (or whose OOM counter is unreadable) never reports the launcher's
+//!   outcome: the call ends `StartFailed` and the run's helpers close with
+//!   `helper_cgroup_unavailable` (finding 5). Launcher frames are hints: only
+//!   the exit status itself (which only the launcher can observe) is taken;
 //! - [F14] launcher frames are received with `MSG_CMSG_CLOEXEC` and a
 //!   minimal control buffer; any fd/cmsg, `MSG_TRUNC`/`MSG_CTRUNC`, unknown
 //!   call, illegal frame, more than 64 frames/s or EOF closes the channel, both
 //!   slots are killed and every later call is `helper_unavailable`;
 //! - [F4] `rt-runtime` `populated 0` after it was populated (or the launcher's
-//!   `Draining`) reports `Draining`; `Start` is refused from then on.
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use duduclaw_isolation::{execution::RunHandle, ipc::{ErrorCode, HelperCallId, HelperOutcome, HelperSlot}};
-use duduclaw_run::helper_wire::{self, End, SpawndChannel, SpawndEvent, Start};
+//!   `Draining`) reports `Draining`; `Start` is refused from then on, and the
+//!   run's MCP connection is revoked (finding 4: no runtime descendant or
+//!   helper-reachable channel keeps MCP after the runtime exited). Round 3:
+//!   an unreadable/malformed `rt-runtime/cgroup.events` counts as draining
+//!   (fail closed), and MCP is also revoked on every channel close and slot
+//!   cgroup failure, so revocation never depends on detecting the drain.
+use std::{os::fd::{AsFd, AsRawFd, OwnedFd}, sync::Arc};
+use duduclaw_isolation::{egress::ProfileId, execution::{RunHandle, RuntimeKind}, ids::Sha256Digest,
+    ipc::{ErrorCode, HelperCallId, HelperOutcome, HelperSlot}};
+use duduclaw_run::helper_wire::{self, End, LauncherError, SpawndChannel, SpawndEvent, Start, WireError};
 use crate::{Result, admission::{effective_timeout_ms, HelperEvent, HelperSignal, WATCHDOG_GRACE_MS},
+    audit::{HelperCloseReason, HelperEndReason}, channels::ConnectionRevoker,
     helper_cgroup::{self, CgroupTree, Slot, SlotLimits, RT_RUNTIME}};
 
 /// Launcher frames read per service turn; the channel's own sliding window
@@ -35,21 +49,35 @@ const FRAMES_PER_TURN: usize = 16;
 const DRAIN_ATTEMPTS: u32 = 100;
 const SIGKILL: u32 = 9;
 
-/// One helper of the run's launcher table, in table (position) order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LinkedHelper { pub index: u8, pub slot: HelperSlot, pub limits: SlotLimits, pub timeout_ms: u64 }
+/// One helper of the run's launcher table, in table (position) order, with
+/// the identity it was built from (finding 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedHelper {
+    pub index: u8,
+    pub slot: HelperSlot,
+    pub limits: SlotLimits,
+    pub timeout_ms: u64,
+    pub runtime: RuntimeKind,
+    pub profile: ProfileId,
+    /// `helper_policy::binding_digest` of the signed binding at run start.
+    pub binding_digest: Sha256Digest,
+}
 /// Moved out of the trampoline once the run is Running: spawnd's end of the
 /// per-run control socketpair, the root-held unit cgroup tree, and the table.
 pub struct HelperLink<T> { pub control: OwnedFd, pub tree: T, pub helpers: Vec<LinkedHelper> }
 
 /// What `Core` derived for one call (never copied from the request except the
 /// tool's own timeout bound and the size the memfd must have).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CallPlan {
     pub call: HelperCallId,
     /// Signed index in the parent's helper list (`RootPolicy::derive_helper`).
     pub index: u8,
     pub slot: HelperSlot,
+    /// Identity of the freshly derived entry; must equal the run's table entry.
+    pub runtime: RuntimeKind,
+    pub profile: ProfileId,
+    pub binding_digest: Sha256Digest,
     pub requested_ms: u64,
     pub input_bytes: u64,
     pub run_remaining_ms: u64,
@@ -61,8 +89,12 @@ pub struct Started { pub effective_timeout_ms: u64, pub stdout: OwnedFd, pub std
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelperAudit {
     Started { call: HelperCallId, index: u8, slot: HelperSlot, input_bytes: u64, effective_timeout_ms: u64 },
-    Ended { call: HelperCallId, index: u8, slot: HelperSlot, input_bytes: u64, outcome: HelperOutcome },
-    Closed { code: ErrorCode },
+    /// `reason`: watchdog vs launcher timeout, start-failure cause (7c/d);
+    /// `drained`: the slot was confirmed empty after the kill.
+    Ended { call: HelperCallId, index: u8, slot: HelperSlot, input_bytes: u64, outcome: HelperOutcome,
+        reason: HelperEndReason, drained: bool },
+    /// The channel closed: the code later calls get and why (7e).
+    Closed { code: ErrorCode, reason: HelperCloseReason },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +105,39 @@ struct Live { call: HelperCallId, index: u8, input_bytes: u64, watchdog_at: u64,
 fn position(slot: HelperSlot) -> usize { match slot { HelperSlot::Foreground => 0, HelperSlot::Recording => 1 } }
 fn cgroup_slot(slot: HelperSlot) -> Slot { match slot { HelperSlot::Foreground => Slot::Foreground, HelperSlot::Recording => Slot::Recording } }
 const SLOTS: [HelperSlot; 2] = [HelperSlot::Foreground, HelperSlot::Recording];
+
+fn end_reason(reason: Reason) -> HelperEndReason {
+    match reason {
+        Reason::Launcher(End::Exited(_) | End::Signalled(_)) => HelperEndReason::LauncherExit,
+        Reason::Launcher(End::TimedOut) => HelperEndReason::LauncherTimeout,
+        Reason::Launcher(End::StartFailed(cause)) => match cause {
+            LauncherError::SlotBusy => HelperEndReason::StartFailedSlotBusy,
+            LauncherError::Draining => HelperEndReason::StartFailedDraining,
+            LauncherError::Descriptors => HelperEndReason::StartFailedDescriptors,
+            LauncherError::Sandbox => HelperEndReason::StartFailedSandbox,
+            LauncherError::Exec => HelperEndReason::StartFailedExec,
+            LauncherError::Protocol | LauncherError::Internal => HelperEndReason::StartFailedInternal,
+        },
+        Reason::Watchdog => HelperEndReason::WatchdogKill,
+        Reason::Cancelled => HelperEndReason::Cancelled,
+        Reason::ChannelLost => HelperEndReason::ChannelLost,
+        Reason::RunEnded => HelperEndReason::RunEnded,
+    }
+}
+fn close_reason(error: WireError) -> HelperCloseReason {
+    match error {
+        WireError::Truncated => HelperCloseReason::Truncated,
+        WireError::ControlTruncated => HelperCloseReason::ControlTruncated,
+        WireError::Ancillary => HelperCloseReason::Ancillary,
+        WireError::Descriptors => HelperCloseReason::Descriptors,
+        WireError::Length | WireError::Magic | WireError::Kind | WireError::Field(_) => HelperCloseReason::Malformed,
+        WireError::UnknownCall => HelperCloseReason::UnknownCall,
+        WireError::IllegalState => HelperCloseReason::IllegalState,
+        WireError::Rate => HelperCloseReason::Rate,
+        WireError::Launcher(_) => HelperCloseReason::LauncherFatal,
+        WireError::Closed => HelperCloseReason::Closed,
+    }
+}
 
 pub struct HelperEngine<T: CgroupTree> {
     run: RunHandle,
@@ -85,6 +150,9 @@ pub struct HelperEngine<T: CgroupTree> {
     draining: bool,
     closed: bool,
     shutting_down: bool,
+    /// The run's MCP connection, revoked when the runtime exits (finding 4).
+    mcp_revoker: Option<Arc<ConnectionRevoker>>,
+    mcp_revoke_failed: bool,
     settle: fn(),
 }
 fn settle_10ms() { std::thread::sleep(std::time::Duration::from_millis(10)); }
@@ -94,18 +162,23 @@ impl<T: CgroupTree> HelperEngine<T> {
         let table = link.helpers.iter().map(|helper| helper.slot).collect();
         let channel = SpawndChannel::new(table).map_err(|_| ErrorCode::HelperUnavailable)?;
         Ok(Self { run, link, channel, live: [None, None], events: Vec::new(), audit: Vec::new(),
-            runtime_seen: false, draining: false, closed: false, shutting_down: false, settle: settle_10ms })
+            runtime_seen: false, draining: false, closed: false, shutting_down: false,
+            mcp_revoker: None, mcp_revoke_failed: false, settle: settle_10ms })
     }
+    /// The run's MCP revoker (a clone of the one `Core::revoke` uses).
+    pub fn with_mcp_revoker(mut self, revoker: Option<Arc<ConnectionRevoker>>) -> Self { self.mcp_revoker = revoker; self }
     #[cfg(test)]
     fn with_settle(mut self, settle: fn()) -> Self { self.settle = settle; self }
     pub fn is_closed(&self) -> bool { self.closed }
     pub fn is_draining(&self) -> bool { self.draining }
+    /// The MCP revocation on drain failed: `Core` fences the whole run.
+    pub fn mcp_revoke_failed(&self) -> bool { self.mcp_revoke_failed }
     pub fn take_events(&mut self) -> Vec<HelperEvent> { std::mem::take(&mut self.events) }
     pub fn take_audit(&mut self) -> Vec<HelperAudit> { std::mem::take(&mut self.audit) }
     /// Run-table position and binding of a signed index; `None` = not in this run's table.
     fn table(&self, index: u8) -> Option<(u8, LinkedHelper)> {
-        self.link.helpers.iter().position(|helper| helper.index == index)
-            .and_then(|at| Some((u8::try_from(at).ok()?, self.link.helpers[at])))
+        let at = self.link.helpers.iter().position(|helper| helper.index == index)?;
+        Some((u8::try_from(at).ok()?, self.link.helpers.get(at)?.clone()))
     }
 
     /// Validate and send one `Start` with `[input memfd, stdout w, stderr w]`.
@@ -114,6 +187,11 @@ impl<T: CgroupTree> HelperEngine<T> {
         if self.closed { return Err(ErrorCode::HelperUnavailable); }
         if self.draining { return Err(ErrorCode::NotReady); }
         let (at, helper) = self.table(plan.index).ok_or(ErrorCode::HelperUnavailable)?;
+        // Finding 1: the current policy's entry must be the one this run's
+        // launcher table (and its exec fds) were built from.
+        if helper.runtime != plan.runtime || helper.profile != plan.profile || helper.binding_digest != plan.binding_digest {
+            return Err(ErrorCode::RuntimeDenied);
+        }
         if helper.slot != plan.slot { return Err(ErrorCode::InvalidRequest); }
         // The gateway checked its own memfd; root checks it again right before use.
         crate::fds::validate_sealed(input.as_fd(), plan.input_bytes).map_err(|_| ErrorCode::InvalidFds)?;
@@ -134,13 +212,13 @@ impl<T: CgroupTree> HelperEngine<T> {
         let (stdout, stdout_w) = pipe()?;
         let (stderr, stderr_w) = pipe()?;
         let frame = self.channel.start(Start { call: plan.call, helper: at, slot: plan.slot, timeout_ms: effective })
-            .map_err(|error| if error == helper_wire::WireError::Closed { ErrorCode::HelperUnavailable } else { ErrorCode::Internal })?;
+            .map_err(|error| if error == WireError::Closed { ErrorCode::HelperUnavailable } else { ErrorCode::Internal })?;
         let bytes = frame.encode().map_err(|_| ErrorCode::Internal)?;
         if helper_wire::linux::send(self.link.control.as_fd(), &bytes, &[input.as_fd(), stdout_w.as_fd(), stderr_w.as_fd()]).is_err() {
             // The call is recorded in the table; closing the channel ends it.
             self.live[position(plan.slot)] = Some(Live { call: plan.call, index: plan.index, input_bytes: plan.input_bytes,
                 watchdog_at: now_ms, oom_before, started: false });
-            self.close_channel();
+            self.close_channel(HelperCloseReason::Send);
             return Err(ErrorCode::HelperUnavailable);
         }
         // spawnd's copies close here; only the launcher (and the helper) hold them now.
@@ -167,7 +245,7 @@ impl<T: CgroupTree> HelperEngine<T> {
                 match self.channel.stop(call) {
                     Ok(Some(frame)) => self.send(frame),
                     Ok(None) => Ok(()),
-                    Err(helper_wire::WireError::IllegalState) => Err(ErrorCode::InvalidRequest),
+                    Err(WireError::IllegalState) => Err(ErrorCode::InvalidRequest),
                     Err(_) => Err(ErrorCode::HelperUnavailable),
                 }
             }
@@ -183,7 +261,7 @@ impl<T: CgroupTree> HelperEngine<T> {
     fn send(&mut self, frame: helper_wire::ToLauncher) -> Result<()> {
         let bytes = frame.encode().map_err(|_| ErrorCode::Internal)?;
         if helper_wire::linux::send(self.link.control.as_fd(), &bytes, &[]).is_err() {
-            self.close_channel();
+            self.close_channel(HelperCloseReason::Send);
             return Err(ErrorCode::HelperUnavailable);
         }
         Ok(())
@@ -206,7 +284,11 @@ impl<T: CgroupTree> HelperEngine<T> {
                 .and_then(|events| crate::systemd::cgroup_empty(&events).ok()) {
                 Some(false) => self.runtime_seen = true,
                 Some(true) if self.runtime_seen => self.begin_draining(),
-                _ => {}
+                Some(true) => {}
+                // Round 3: an unreadable or malformed `cgroup.events` means
+                // root can no longer see whether the runtime is alive: treat
+                // it as draining (fail closed), which also revokes MCP.
+                None => self.begin_draining(),
             }
         }
     }
@@ -214,7 +296,7 @@ impl<T: CgroupTree> HelperEngine<T> {
         for _ in 0..FRAMES_PER_TURN {
             match helper_wire::linux::recv(self.link.control.as_fd(), 0, true) {
                 // EOF: the launcher died (not fatal to the run, §2.5).
-                Ok(None) => { self.close_channel(); return; }
+                Ok(None) => { self.close_channel(HelperCloseReason::Eof); return; }
                 Ok(Some((bytes, fds, receipt))) => {
                     // [F14] any delivered fd is closed at once, whatever the frame.
                     drop(fds);
@@ -227,18 +309,29 @@ impl<T: CgroupTree> HelperEngine<T> {
                         }
                         Ok(SpawndEvent::Draining) => self.begin_draining(),
                         Ok(SpawndEvent::Late { .. }) => {}
-                        Err(_) => { self.close_channel(); return; }
+                        Err(error) => { self.close_channel(close_reason(error)); return; }
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
-                Err(_) => { self.close_channel(); return; }
+                Err(_) => { self.close_channel(HelperCloseReason::Receive); return; }
             }
         }
     }
     fn begin_draining(&mut self) {
         if self.draining { return; }
         self.draining = true;
+        // Finding 4: channels outside Landlock (abstract unix sockets, SysV
+        // IPC) cannot relay MCP once the runtime is gone.
+        self.revoke_mcp();
         self.events.push(HelperEvent::Draining { run: self.run });
+    }
+    /// Revoke the run's MCP connection (idempotent: `shutdown` of an already
+    /// revoked socket is `ENOTCONN` = Ok). A failure is sticky and makes
+    /// `Core` fence the whole run. Round 3: called on drain, on every channel
+    /// close and on every cgroup failure, so revocation never depends on the
+    /// drain alone being detected.
+    fn revoke_mcp(&mut self) {
+        if let Some(revoker) = &self.mcp_revoker { self.mcp_revoke_failed |= revoker.revoke().is_err(); }
     }
 
     /// End one call root-side: kill + drain the slot, OOM from `memory.events`,
@@ -248,49 +341,62 @@ impl<T: CgroupTree> HelperEngine<T> {
         let cgroup = cgroup_slot(slot);
         let drained = helper_cgroup::kill_and_wait(&mut self.link.tree, cgroup.path(), DRAIN_ATTEMPTS, self.settle).is_ok();
         let oom = self.oom_kills(cgroup).ok();
-        let outcome = if oom.is_some_and(|after| after > live.oom_before) { HelperOutcome::OomKilled } else {
-            match reason {
-                Reason::Launcher(End::Exited(code)) => HelperOutcome::Exited(i32::from(code)),
-                Reason::Launcher(End::Signalled(signal)) => HelperOutcome::Signalled(u32::from(signal)),
-                Reason::Launcher(End::TimedOut) | Reason::Watchdog => HelperOutcome::TimedOut,
-                Reason::Launcher(End::StartFailed(_)) => HelperOutcome::StartFailed,
-                Reason::Cancelled | Reason::ChannelLost if live.started => HelperOutcome::Signalled(SIGKILL),
-                Reason::Cancelled | Reason::ChannelLost => HelperOutcome::StartFailed,
-                Reason::RunEnded => HelperOutcome::RunEnded,
-            }
-        };
+        let outcome = if reason == Reason::RunEnded { HelperOutcome::RunEnded }
+            // Finding 5: never report the launcher's outcome for a slot that may
+            // still hold helper processes, or whose OOM counter is unknown.
+            else if !drained || oom.is_none() { HelperOutcome::StartFailed }
+            else if oom.is_some_and(|after| after > live.oom_before) { HelperOutcome::OomKilled } else {
+                match reason {
+                    Reason::Launcher(End::Exited(code)) => HelperOutcome::Exited(i32::from(code)),
+                    Reason::Launcher(End::Signalled(signal)) => HelperOutcome::Signalled(u32::from(signal)),
+                    Reason::Launcher(End::TimedOut) | Reason::Watchdog => HelperOutcome::TimedOut,
+                    Reason::Launcher(End::StartFailed(_)) => HelperOutcome::StartFailed,
+                    Reason::Cancelled | Reason::ChannelLost if live.started => HelperOutcome::Signalled(SIGKILL),
+                    Reason::Cancelled | Reason::ChannelLost | Reason::RunEnded => HelperOutcome::StartFailed,
+                }
+            };
         // Ended root-side before the launcher said so: free its table slot and
         // accept its late frames in order (too many ⇒ unresponsive ⇒ closed).
-        let abandoned = matches!(reason, Reason::Launcher(_)) || self.closed || self.channel.abandon(live.call).is_ok();
+        let abandoned = if matches!(reason, Reason::Launcher(_)) || self.closed { Ok(()) }
+            else { self.channel.abandon(live.call).map(|_| ()) };
         let closed_again = helper_cgroup::write_slot_limits(&mut self.link.tree, cgroup, SlotLimits::CLOSED).is_ok();
         self.events.push(HelperEvent::Ended { run: self.run, call: live.call, outcome });
-        self.audit.push(HelperAudit::Ended { call: live.call, index: live.index, slot, input_bytes: live.input_bytes, outcome });
-        if !abandoned { self.close_channel(); }
+        self.audit.push(HelperAudit::Ended { call: live.call, index: live.index, slot, input_bytes: live.input_bytes, outcome,
+            reason: end_reason(reason), drained });
+        if let Err(error) = abandoned {
+            self.close_channel(if error == WireError::Rate { HelperCloseReason::LateFrames } else { close_reason(error) });
+        }
         if !(drained && closed_again && oom.is_some()) && !self.shutting_down { self.fail_cgroups(ErrorCode::HelperCgroupUnavailable); }
     }
     /// The launcher is gone or misbehaved: close, kill both slots, refuse later calls.
-    fn close_channel(&mut self) {
+    fn close_channel(&mut self, reason: HelperCloseReason) {
         if self.closed { return; }
         self.closed = true;
         self.channel.close();
+        // Round 3: the launcher (and anything it forked) may outlive our view
+        // of it; no helper-reachable channel keeps MCP after a close.
+        self.revoke_mcp();
         // The launcher sees EOF and exits once idle (HX3b).
         unsafe { libc::shutdown(self.link.control.as_raw_fd(), libc::SHUT_RDWR) };
         self.kill_both_slots();
         if !self.shutting_down {
             self.events.push(HelperEvent::Closed { run: self.run, code: ErrorCode::HelperUnavailable });
-            self.audit.push(HelperAudit::Closed { code: ErrorCode::HelperUnavailable });
+            self.audit.push(HelperAudit::Closed { code: ErrorCode::HelperUnavailable, reason });
         }
     }
     /// Slot cgroups failed a write/readback: no more helpers in this run.
     fn fail_cgroups(&mut self, code: ErrorCode) -> ErrorCode {
         let code = if code == ErrorCode::HelperBusy { code } else { ErrorCode::HelperCgroupUnavailable };
+        // Round 3: a slot root cannot confirm empty may hold a helper; revoke
+        // MCP whether or not the channel was already closed.
+        if code == ErrorCode::HelperCgroupUnavailable { self.revoke_mcp(); }
         if code == ErrorCode::HelperCgroupUnavailable && !self.closed {
             self.closed = true;
             self.channel.close();
             unsafe { libc::shutdown(self.link.control.as_raw_fd(), libc::SHUT_RDWR) };
             self.kill_both_slots();
             self.events.push(HelperEvent::Closed { run: self.run, code });
-            self.audit.push(HelperAudit::Closed { code });
+            self.audit.push(HelperAudit::Closed { code, reason: HelperCloseReason::Cgroup });
         }
         code
     }

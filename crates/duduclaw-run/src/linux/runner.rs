@@ -121,7 +121,7 @@ impl LauncherPlan {
                 name(format!("/helpers/{}", path.to_str().map_err(|_| Error::Executable)?).as_bytes(), *identity)?;
             }
             seccomp::helper(arch, &parent.seccomp, parent.seccomp_digest, &helper.program.seccomp,
-                helper.program.seccomp_digest, &helper.self_only).map_err(|_| Error::Seccomp)?;
+                helper.program.seccomp_digest, &helper.self_only, helper.egress).map_err(|_| Error::Seccomp)?;
         }
         for helper in &self.helpers {
             let mut grants = helper.filesystem.clone();

@@ -200,7 +200,7 @@ pub fn check_helper_reply(request: &SpawnRequest, response: &SpawnResponse, rece
         (Q::HelperCall { .. } | Q::HelperWait { .. } | Q::HelperStop { .. } | Q::HelperCancel { .. }, R::Error { .. }) => true,
         (Q::HelperCall { run, timeout_ms, .. }, R::HelperStarted { run: actual, effective_timeout_ms, .. }) =>
             run == actual && effective_timeout_ms <= timeout_ms,
-        (Q::HelperWait { run, call }, R::HelperEnded { run: actual, call: actual_call, .. }) =>
+        (Q::HelperWait { run, call, .. }, R::HelperEnded { run: actual, call: actual_call, .. }) =>
             run == actual && call == actual_call,
         (Q::HelperStop { .. } | Q::HelperCancel { .. }, R::Ack) => true,
         (Q::HelperCall { .. } | Q::HelperWait { .. } | Q::HelperStop { .. } | Q::HelperCancel { .. }, _) => false,
@@ -563,11 +563,15 @@ pub enum SpawnRequest {
     HelperCall { run: RunHandle, employee_id: EmployeeId, helper: RuntimeKind, slot: HelperSlot,
         timeout_ms: u64, input_bytes: u64 },
     /// HX (0x0202). Wait for a started call. Reply: `HelperEnded`, or `Error`.
-    HelperWait { run: RunHandle, call: HelperCallId },
-    /// HX (0x0203). Recording: ask the helper to flush and exit (`stop\n`). Reply: `Ack`.
-    HelperStop { run: RunHandle, call: HelperCallId },
-    /// HX (0x0204). Kill the call's slot cgroup, queued or running. Reply: `Ack`.
-    HelperCancel { run: RunHandle, call: HelperCallId },
+    /// `employee_id` must equal the run's admitted employee (as for
+    /// `HelperCall` [F7]); otherwise `Unauthorized`.
+    HelperWait { run: RunHandle, employee_id: EmployeeId, call: HelperCallId },
+    /// HX (0x0203). Recording: ask the helper to flush and exit (`stop\n`).
+    /// Employee-scoped like `HelperWait`. Reply: `Ack`.
+    HelperStop { run: RunHandle, employee_id: EmployeeId, call: HelperCallId },
+    /// HX (0x0204). Kill the call's slot cgroup, queued or running.
+    /// Employee-scoped like `HelperWait`. Reply: `Ack`.
+    HelperCancel { run: RunHandle, employee_id: EmployeeId, call: HelperCallId },
 }
 
 /// Ordered ancillary roles, never OS descriptor numbers (§4 fd matrix).
@@ -774,6 +778,10 @@ impl AdmissionState {
 }
 
 #[cfg(test)]
+#[path = "ipc_hxfix_tests.rs"]
+mod hxfix_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn start() -> SpawnRequest {
@@ -883,9 +891,9 @@ mod tests {
             SpawnRequest::WorkAnchor { employee_id: EmployeeId([1; 16]) },
             SpawnRequest::StopEmployeeRuns { employee_id: EmployeeId([1; 16]) },
             SpawnRequest::EmployeeIdle { employee_id: EmployeeId([1; 16]) },
-            helper_call(), SpawnRequest::HelperWait { run: run3(), call: call7() },
-            SpawnRequest::HelperStop { run: run3(), call: call7() },
-            SpawnRequest::HelperCancel { run: run3(), call: call7() }]
+            helper_call(), SpawnRequest::HelperWait { run: run3(), employee_id: EmployeeId([1; 16]), call: call7() },
+            SpawnRequest::HelperStop { run: run3(), employee_id: EmployeeId([1; 16]), call: call7() },
+            SpawnRequest::HelperCancel { run: run3(), employee_id: EmployeeId([1; 16]), call: call7() }]
     }
     fn call7() -> HelperCallId { HelperCallId::new([7; 16]).unwrap() }
     fn helper_call() -> SpawnRequest {
@@ -931,8 +939,8 @@ mod tests {
         }
         let call = helper_call();
         assert_eq!(call.fd_plan().unwrap(), vec![FdRole::PromptSealed], "exactly the sealed input memfd");
-        for other in [SpawnRequest::HelperWait { run: run3(), call: call7() },
-            SpawnRequest::HelperStop { run: run3(), call: call7() }, SpawnRequest::HelperCancel { run: run3(), call: call7() }] {
+        for other in [SpawnRequest::HelperWait { run: run3(), employee_id: EmployeeId([1; 16]), call: call7() },
+            SpawnRequest::HelperStop { run: run3(), employee_id: EmployeeId([1; 16]), call: call7() }, SpawnRequest::HelperCancel { run: run3(), employee_id: EmployeeId([1; 16]), call: call7() }] {
             assert!(other.fd_plan().unwrap().is_empty());
         }
         // No names, paths, argv, env, index, uid or caller-chosen call id on the wire.
@@ -964,7 +972,7 @@ mod tests {
         }
         // Call ids: the all-zero id is unrepresentable, also on the wire.
         assert!(HelperCallId::new([0; 16]).is_err());
-        let mut value = serde_json::to_value(SpawnRequest::HelperWait { run: run3(), call: call7() }).unwrap();
+        let mut value = serde_json::to_value(SpawnRequest::HelperWait { run: run3(), employee_id: EmployeeId([1; 16]), call: call7() }).unwrap();
         value["call"] = serde_json::to_value([0u8; 16]).unwrap();
         assert!(serde_json::from_value::<SpawnRequest>(value).is_err());
         assert_eq!(call7().hex(), "07".repeat(16));
@@ -993,13 +1001,13 @@ mod tests {
         let other_run = SpawnResponse::HelperStarted { run: RunHandle(crate::ids::RunId([4; 16])), call: call7(),
             effective_timeout_ms: 1 };
         assert!(check_helper_reply(&call, &other_run, 2).is_err());
-        let wait = SpawnRequest::HelperWait { run: run3(), call: call7() };
+        let wait = SpawnRequest::HelperWait { run: run3(), employee_id: EmployeeId([1; 16]), call: call7() };
         assert_eq!(check_helper_reply(&wait, &helper_ended(HelperOutcome::RunEnded), 0), Ok(()));
         assert!(check_helper_reply(&wait, &helper_ended(HelperOutcome::RunEnded), 1).is_err());
         let other_call = SpawnResponse::HelperEnded { run: run3(), call: HelperCallId::new([8; 16]).unwrap(),
             outcome: HelperOutcome::Exited(0) };
         assert!(check_helper_reply(&wait, &other_call, 0).is_err());
-        for request in [SpawnRequest::HelperStop { run: run3(), call: call7() }, SpawnRequest::HelperCancel { run: run3(), call: call7() }] {
+        for request in [SpawnRequest::HelperStop { run: run3(), employee_id: EmployeeId([1; 16]), call: call7() }, SpawnRequest::HelperCancel { run: run3(), employee_id: EmployeeId([1; 16]), call: call7() }] {
             assert_eq!(check_helper_reply(&request, &SpawnResponse::Ack, 0), Ok(()));
             assert!(check_helper_reply(&request, &helper_started(), 2).is_err());
         }

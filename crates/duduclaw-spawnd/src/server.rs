@@ -1,7 +1,7 @@
 //! Bounded single-owner event loop; no employee program runs in this process.
 use std::{io, os::fd::{AsFd, FromRawFd, OwnedFd}, sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use duduclaw_isolation::{execution::{RunHandle, RuntimeKind, PtySize}, ids::{EmployeeId, RequestId, RunId},
-    ipc::{self, CleanupReadback, ControlConnectionId, Envelope, ErrorCode, Opcode, SpawnRequest, SpawnResponse}};
+    ipc::{self, CleanupReadback, ControlConnectionId, Envelope, ErrorCode, HelperCallId, Opcode, SpawnRequest, SpawnResponse}};
 use crate::{admission::{Coordinator, Host, HostProgress, LaunchPolicy, Limits, Ticket, BROKER_REPLY_MS},
     audit::{Detail, Event, Record}, fds::{self, SnapshotAuthority},
     readiness::Readiness, transport::{Listener, Seqpacket}, Result};
@@ -65,23 +65,34 @@ pub fn listener(gateway_gid: u32) -> io::Result<Listener> {
 }
 
 /// Audit subject of one request, taken before the message is consumed.
+/// Helper ops are attributed to the run's admitted employee (`resolve`); the
+/// request's own `employee_id` is kept separately as `claimed`.
 #[derive(Clone, Copy)]
-struct Subject { op: Opcode, employee: Option<EmployeeId>, run: Option<RunId> }
+struct Subject { op: Opcode, employee: Option<EmployeeId>, run: Option<RunId>,
+    claimed: Option<EmployeeId>, call: Option<HelperCallId> }
 impl Subject {
     fn of(message: &SpawnRequest) -> Self {
-        let (employee, run) = match message {
-            SpawnRequest::OpenWorkFile { run, employee_id, .. } => (Some(*employee_id), Some(run.0)),
+        let (employee, run, call) = match message {
+            SpawnRequest::OpenWorkFile { run, employee_id, .. } => (Some(*employee_id), Some(run.0), None),
             SpawnRequest::WorkAnchor { employee_id } | SpawnRequest::StopEmployeeRuns { employee_id }
-                | SpawnRequest::EmployeeIdle { employee_id } => (Some(*employee_id), None),
-            SpawnRequest::HelperCall { run, employee_id, .. } => (Some(*employee_id), Some(run.0)),
-            SpawnRequest::HelperWait { run, .. } | SpawnRequest::HelperStop { run, .. }
-                | SpawnRequest::HelperCancel { run, .. } => (None, Some(run.0)),
-            _ => (None, None),
+                | SpawnRequest::EmployeeIdle { employee_id } => (Some(*employee_id), None, None),
+            SpawnRequest::HelperCall { run, employee_id, .. } => (Some(*employee_id), Some(run.0), None),
+            SpawnRequest::HelperWait { run, employee_id, call } | SpawnRequest::HelperStop { run, employee_id, call }
+                | SpawnRequest::HelperCancel { run, employee_id, call } => (Some(*employee_id), Some(run.0), Some(*call)),
+            _ => (None, None, None),
         };
-        Self { op: message.opcode(), employee, run }
+        Self { op: message.opcode(), employee, run, claimed: None, call }
+    }
+    /// HX security fix round (finding 7a/b): for helper ops, `employee` becomes
+    /// root's record of the run's employee (`None` for an unknown run) and the
+    /// request's value moves to `claimed`.
+    fn resolve(mut self, owner: Option<EmployeeId>) -> Self {
+        if self.helper() { self.claimed = self.employee; self.employee = owner; }
+        self
     }
     fn work(self) -> bool { Opcode::WORK.contains(&self.op) }
     fn helper(self) -> bool { Opcode::HELPER.contains(&self.op) }
+    fn refusal(self, code: ErrorCode) -> Detail { Detail::HelperRefusal { code, claimed_employee: self.claimed } }
 }
 /// H4/HX4: a Package H request (lease check, snapshot copy, stop
 /// confirmation) or a `HelperCall` (slot wait, root start) whose reply waits
@@ -214,12 +225,18 @@ fn audit_record(now: u64, message: &SpawnResponse, subject: Subject, detail: Opt
             record(Event::Refused, subject.employee, subject.run, Some(Detail::Code { code: *code })),
         // HX4: a refused HelperCall is audited; a HelperWait poll that is
         // simply not finished yet is not (the host audits every start and end).
+        // Attribution is the run's employee; the request's claim is detail.
         SpawnResponse::Error { code } if subject.op == Opcode::HelperCall =>
-            record(Event::HelperRefused, subject.employee, subject.run, Some(Detail::Code { code: *code })),
+            record(Event::HelperRefused, subject.employee, subject.run, Some(subject.refusal(*code))),
         SpawnResponse::Error { code: ErrorCode::NotReady } if subject.op == Opcode::HelperWait => None,
         SpawnResponse::Error { code } if subject.helper() =>
-            record(Event::Refused, None, subject.run, Some(Detail::Code { code: *code })),
+            record(Event::Refused, subject.employee, subject.run, Some(subject.refusal(*code))),
         SpawnResponse::Error { .. } => record(Event::Refused, None, None, None),
+        // Finding 7f: accepted per-call stop/cancel requests are audited too.
+        SpawnResponse::Ack if subject.op == Opcode::HelperStop =>
+            record(Event::HelperStopRequested, subject.employee, subject.run, subject.call.map(|call| Detail::HelperCall { call })),
+        SpawnResponse::Ack if subject.op == Opcode::HelperCancel =>
+            record(Event::HelperCancelRequested, subject.employee, subject.run, subject.call.map(|call| Detail::HelperCall { call })),
         _ => None,
     }
 }
@@ -271,6 +288,7 @@ fn dispatch<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut
     let frame = ipc::decode::<SpawnRequest>(&packet.bytes).map_err(|_| unavailable())?;
     let request_id = frame.request_id;
     let subject = Subject::of(&frame.message);
+    let subject = subject.resolve(subject.run.and_then(|run| coordinator.run_employee(RunHandle(run))));
     let result = (|| -> Result<Dispatched> {
         fds::validate_start(&frame.message, &packet.fds, snapshots).map_err(|_| ErrorCode::InvalidFds)?;
         let response = match frame.message {
@@ -313,10 +331,15 @@ fn dispatch<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut
                 let call = random_id().map_err(|_| ErrorCode::Internal)?;
                 return Ok(Dispatched::Later(coordinator.helper_call(connection, request, packet.fds, call, now)?));
             }
-            SpawnRequest::HelperWait { run, call } => coordinator.helper_wait(run, call, connection)?,
+            // Employee-scoped like HelperCall (finding 8): owning connection AND `entry.employee == employee_id`.
+            SpawnRequest::HelperWait { run, employee_id, call } => coordinator.helper_wait(run, employee_id, call, connection)?,
             // [F8] per-call only: never Cancel/revoke/kill of the run.
-            SpawnRequest::HelperStop { run, call } => { coordinator.helper_stop(run, call, connection, now)?; SpawnResponse::Ack }
-            SpawnRequest::HelperCancel { run, call } => { coordinator.helper_cancel(run, call, connection, now)?; SpawnResponse::Ack }
+            SpawnRequest::HelperStop { run, employee_id, call } => {
+                coordinator.helper_stop(run, employee_id, call, connection, now)?; SpawnResponse::Ack
+            }
+            SpawnRequest::HelperCancel { run, employee_id, call } => {
+                coordinator.helper_cancel(run, employee_id, call, connection, now)?; SpawnResponse::Ack
+            }
         };
         Ok(Dispatched::Now(response, vec![]))
     })();
@@ -380,5 +403,42 @@ mod tests {
         let recovered = Listener::bind_fixed(gid).unwrap();
         drop(recovered);
         std::fs::remove_file(duduclaw_isolation::ids::SPAWND_SOCKET).unwrap();
+    }
+    #[test]
+    fn hxfix_helper_audit_attributes_run_employee_and_records_claim() {
+        use duduclaw_isolation::ipc::HelperSlot;
+        let (owner, claim) = (EmployeeId([1; 16]), EmployeeId([2; 16]));
+        let run = RunHandle(RunId([3; 16]));
+        let call = HelperCallId::new([7; 16]).unwrap();
+        let helper = RuntimeKind::Registered(duduclaw_isolation::bounded::Text::new("duduclaw-program-v1".into()).unwrap());
+        // (a) A refused HelperCall naming another employee is logged under the run's employee.
+        let request = SpawnRequest::HelperCall { run, employee_id: claim, helper, slot: HelperSlot::Foreground,
+            timeout_ms: 1_000, input_bytes: 1 };
+        let subject = Subject::of(&request).resolve(Some(owner));
+        let refused = audit_record(5, &SpawnResponse::Error { code: ErrorCode::Unauthorized }, subject, None).unwrap();
+        assert_eq!((refused.event, refused.employee, refused.run), (Event::HelperRefused, Some(owner), Some(run.0)));
+        assert_eq!(refused.detail, Some(Detail::HelperRefusal { code: ErrorCode::Unauthorized, claimed_employee: Some(claim) }));
+        // An unknown run has no owner: no employee is invented from the claim.
+        let unknown = audit_record(5, &SpawnResponse::Error { code: ErrorCode::NotFound }, Subject::of(&request).resolve(None), None).unwrap();
+        assert_eq!(unknown.employee, None);
+        // (b) Wait/Stop/Cancel refusals carry the run's employee too (a pending Wait is not logged).
+        for request in [SpawnRequest::HelperWait { run, employee_id: claim, call },
+            SpawnRequest::HelperStop { run, employee_id: claim, call }, SpawnRequest::HelperCancel { run, employee_id: claim, call }] {
+            let subject = Subject::of(&request).resolve(Some(owner));
+            let record = audit_record(5, &SpawnResponse::Error { code: ErrorCode::Unauthorized }, subject, None).unwrap();
+            assert_eq!((record.event, record.employee), (Event::Refused, Some(owner)));
+            assert_eq!(record.detail, Some(Detail::HelperRefusal { code: ErrorCode::Unauthorized, claimed_employee: Some(claim) }));
+        }
+        let wait = Subject::of(&SpawnRequest::HelperWait { run, employee_id: owner, call }).resolve(Some(owner));
+        assert!(audit_record(5, &SpawnResponse::Error { code: ErrorCode::NotReady }, wait, None).is_none());
+        // (f) Accepted Stop/Cancel are audited with the call id.
+        for (request, event) in [(SpawnRequest::HelperStop { run, employee_id: owner, call }, Event::HelperStopRequested),
+            (SpawnRequest::HelperCancel { run, employee_id: owner, call }, Event::HelperCancelRequested)] {
+            let record = audit_record(5, &SpawnResponse::Ack, Subject::of(&request).resolve(Some(owner)), None).unwrap();
+            assert_eq!((record.event, record.employee, record.detail), (event, Some(owner), Some(Detail::HelperCall { call })));
+        }
+        // Work ops keep their own attribution (resolve is a no-op there).
+        let anchor = Subject::of(&SpawnRequest::WorkAnchor { employee_id: claim }).resolve(Some(owner));
+        assert_eq!(anchor.employee, Some(claim));
     }
 }

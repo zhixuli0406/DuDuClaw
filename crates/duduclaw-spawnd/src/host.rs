@@ -106,154 +106,15 @@ impl Components {
         components
     }
 }
-#[derive(Clone)]
-struct ScanEntry { account: EmployeeAccount, run: Option<RunId>, cgroup: Option<String>, revokers: Vec<Arc<ConnectionRevoker>>, cancelled: Arc<AtomicBool>, deadline: Option<Instant> }
-struct ScanState { at: Instant, result: Result<Vec<EmployeeId>> }
-struct Monitor { entries: Arc<Mutex<Vec<ScanEntry>>>, state: Arc<Mutex<ScanState>>, stop: Arc<AtomicBool> }
-impl Monitor {
-    fn start(accounts: &[EmployeeAccount], audit: AuditWorker) -> io::Result<Self> {
-        let entries = Arc::new(Mutex::new(accounts.iter().cloned().map(|account|
-            ScanEntry { account, run: None, cgroup: None, revokers: vec![], cancelled: Arc::new(AtomicBool::new(false)), deadline: None }).collect::<Vec<_>>()));
-        let state = Arc::new(Mutex::new(ScanState { at: Instant::now(), result: Err(unavailable()) }));
-        let stop = Arc::new(AtomicBool::new(false));
-        let (worker_entries, worker_state, worker_stop) = (entries.clone(), state.clone(), stop.clone());
-        let (kill_sender, kill_receiver) = std::sync::mpsc::sync_channel::<RunId>(128);
-        std::thread::Builder::new().name("spawnd-emergency-stop".into()).spawn(move || {
-            while let Ok(run) = kill_receiver.recv() {
-                if let Ok(systemd) = Systemd::connect() { let _ = systemd.kill_run(run); }
-            }
-        })?;
-        std::thread::Builder::new().name("spawnd-uid-monitor".into()).spawn(move || {
-            while !worker_stop.load(Ordering::Relaxed) {
-                let started = Instant::now();
-                let snapshot = match worker_entries.lock() { Ok(entries) => entries.clone(), Err(_) => break };
-                let result = (|| -> Result<Vec<EmployeeId>> {
-                    let mut affected = Vec::new();
-                    let mut scan_failed = false;
-                    for entry in snapshot {
-                        let intruders = os(accounts::unexpected_processes(entry.account.uid, entry.cgroup.as_deref()));
-                        // Capture cancellation candidates before validating the
-                        // generation. Never rescan this UID after dropping the
-                        // map lock: a later admission may already own it.
-                        let all_processes = accounts::unexpected_processes(entry.account.uid, None);
-                        // Re-read the admission generation after the /proc scan.
-                        // Compare before acting, then release the map lock. The
-                        // process list is already fixed; pidfd/start-time checks
-                        // below reject reuse. Unit kills name this immutable run,
-                        // so they cannot terminate a later admission generation.
-                        let current = worker_entries.lock().map_err(|_| unavailable())?;
-                        let live = current.iter().find(|v| v.account.employee == entry.account.employee).ok_or_else(unavailable)?;
-                        if live.run != entry.run || live.cgroup != entry.cgroup { continue; }
-                        let entry = live.clone();
-                        if entry.deadline.is_some_and(|until| Instant::now() >= until)
-                            || all_processes.is_err() || intruders.as_ref().is_err() || intruders.as_ref().is_ok_and(|p| !p.is_empty()) {
-                            entry.cancelled.store(true, Ordering::Release);
-                        }
-                        let cancelled = entry.cancelled.load(Ordering::Acquire);
-                        drop(current);
-                        if cancelled {
-                            for revoker in &entry.revokers { let _ = revoker.revoke(); }
-                            // PID 1 operations never delay the scanner. Independently
-                            // kill every employee process with pidfds immediately;
-                            // the queued unit stop also kills root/runsup helpers.
-                            if let Some(run) = entry.run { let _ = kill_sender.try_send(run); }
-                            match all_processes {
-                                Ok(processes) => for process in processes {
-                                    scan_failed |= accounts::terminate_intruder(&process, entry.account.uid, None).is_err();
-                                },
-                                Err(_) => scan_failed = true,
-                            }
-                        }
-                        let intruders = match intruders { Ok(value) => value, Err(_) => { scan_failed = true; continue; } };
-                        if !intruders.is_empty() {
-                            affected.push(entry.account.employee);
-                            emit(&audit, Event::Intruder, Some(entry.account.employee), entry.run);
-                            for process in intruders { scan_failed |= accounts::terminate_intruder(&process, entry.account.uid, entry.cgroup.as_deref()).is_err(); }
-                        }
-                    }
-                    if scan_failed { Err(unavailable()) } else { Ok(affected) }
-                })();
-                if result.is_err() {
-                    // Fence every run on an unreadable host scan, including runs
-                    // whose UID was after the failed entry in the inventory.
-                    if let Ok(entries) = worker_entries.lock() {
-                        for entry in entries.iter() {
-                            entry.cancelled.store(true, Ordering::Release);
-                            for revoker in &entry.revokers { let _ = revoker.revoke(); }
-                            if let Some(run) = entry.run { let _ = kill_sender.try_send(run); }
-                        }
-                    }
-                }
-                if let Ok(mut state) = worker_state.lock() {
-                    // Sticky affected identities until the control loop observes them.
-                    let result = match (&state.result, result) {
-                        (Ok(old), Ok(mut new)) => { new.extend(old); new.sort(); new.dedup(); Ok(new) },
-                        (_, other) => other,
-                    };
-                    *state = ScanState { at: started, result };
-                }
-                // Schedule at <=1 second, leave margin for the two-second fence.
-                while started.elapsed() < Duration::from_secs(1) && !worker_stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-            }
-        })?;
-        Ok(Self { entries, state, stop })
-    }
-    fn cancellation(&self, run: RunHandle) -> Result<Arc<AtomicBool>> {
-        let entries = self.entries.lock().map_err(|_| unavailable())?;
-        Ok(entries.iter().find(|e| e.run == Some(run.0)).ok_or_else(unavailable)?.cancelled.clone())
-    }
-    fn check_run(&self, run: RunHandle) -> Result<()> {
-        if self.cancellation(run)?.load(Ordering::Acquire) { Err(unavailable()) } else { Ok(()) }
-    }
-    fn running(&self, run: RunHandle, deadline: Instant) -> Result<()> {
-        let mut entries = self.entries.lock().map_err(|_| unavailable())?;
-        entries.iter_mut().find(|e| e.run == Some(run.0)).ok_or_else(unavailable)?.deadline = Some(deadline);
-        Ok(())
-    }
-    fn set_run(&self, employee: EmployeeId, run: Option<RunId>, cgroup: Option<String>, revokers: Vec<Arc<ConnectionRevoker>>) -> Result<()> {
-        let mut entries = self.entries.lock().map_err(|_| unavailable())?;
-        let entry = entries.iter_mut().find(|entry| entry.account.employee == employee).ok_or_else(unavailable)?;
-        if run.is_some() && entry.run != run { return Err(unavailable()); }
-        entry.run = run; entry.cgroup = cgroup; entry.revokers = revokers;
-        if run.is_none() { entry.deadline = None; }
-        Ok(())
-    }
-}
-struct ScanReader { state: Arc<Mutex<ScanState>>, entries: Arc<Mutex<Vec<ScanEntry>>> }
-impl Scan for ScanReader {
-    fn health(&mut self, employee: EmployeeId) -> Result<()> {
-        let state = self.state.try_lock().map_err(|_| unavailable())?;
-        if state.at.elapsed() >= Duration::from_secs(2) { return Err(unavailable()); }
-        if state.result.as_ref().map_err(|e| *e)?.contains(&employee) { return Err(unavailable()); }
-        Ok(())
-    }
-    fn register(&mut self, run: RunHandle, employee: EmployeeId, startup_ms: u64) -> Result<()> {
-        let mut entries = self.entries.try_lock().map_err(|_| unavailable())?;
-        let entry = entries.iter_mut().find(|v| v.account.employee == employee).ok_or_else(unavailable)?;
-        if entry.run.is_some() { return Err(unavailable()); }
-        entry.run = Some(run.0); entry.cancelled = Arc::new(AtomicBool::new(false));
-        entry.deadline = Some(Instant::now() + Duration::from_millis(startup_ms));
-        Ok(())
-    }
-    fn cancel(&mut self, run: RunHandle) -> Result<()> {
-        let entries = self.entries.try_lock().map_err(|_| unavailable())?;
-        if let Some(entry) = entries.iter().find(|v| v.run == Some(run.0)) {
-            entry.cancelled.store(true, Ordering::Release);
-            for revoker in &entry.revokers { os(revoker.revoke())?; }
-        }
-        Ok(())
-    }
-    fn scan(&mut self) -> Result<Vec<EmployeeId>> {
-        let mut state = self.state.try_lock().map_err(|_| unavailable())?;
-        if state.at.elapsed() >= Duration::from_secs(2) { return Err(unavailable()); }
-        let result = state.result.clone();
-        if result.is_ok() { state.result = Ok(vec![]); }
-        result
-    }
-}
-impl Drop for Monitor { fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); } }
+#[path = "host_monitor.rs"]
+mod monitor;
+use monitor::{Monitor, ScanEntry, ScanReader};
+#[cfg(test)]
+use monitor::ScanState;
+/// HX4 helper glue of `Core` (engine link, per-call start/signal, audit).
+#[path = "host_helpers.rs"]
+mod helpers;
+use helpers::emit_helper;
 fn proc_cgroup(path: &std::path::Path) -> Result<String> {
     let relative = path.strip_prefix("/sys/fs/cgroup").map_err(|_| unavailable())?;
     let text = relative.to_str().ok_or_else(unavailable)?;
@@ -302,20 +163,12 @@ struct LiveRun {
     /// trampoline once Running; shut down before the trampoline is closed.
     helper_parent: Option<crate::policy::PublishedRuntime>,
     helper: Option<RunHelper>,
+    /// The run's MCP revoker (also in `revokers`): revoked when the helper
+    /// engine reports the runtime exited (security fix round, finding 4).
+    mcp_revoker: Option<Arc<ConnectionRevoker>>,
 }
 /// HX4 per-run helper state on the lifecycle thread.
 enum RunHelper { Engine(Box<HelperEngine<crate::helper_cgroup::linux::UnitTree>>), Unavailable(ErrorCode) }
-/// Content-free helper audit (helper index, slot, sizes, outcome).
-fn emit_helper(audit: &AuditWorker, employee: EmployeeId, run: RunId, fact: HelperAudit) {
-    let (event, detail) = match fact {
-        HelperAudit::Started { call, index, slot, input_bytes, effective_timeout_ms } => (Event::HelperStarted,
-            Detail::Helper { call, helper: index, slot, input_bytes, effective_timeout_ms: Some(effective_timeout_ms), outcome: None }),
-        HelperAudit::Ended { call, index, slot, input_bytes, outcome } => (Event::HelperEnded,
-            Detail::Helper { call, helper: index, slot, input_bytes, effective_timeout_ms: None, outcome: Some(outcome) }),
-        HelperAudit::Closed { code } => (Event::HelperChannelClosed, Detail::Code { code }),
-    };
-    emit_detail(audit, event, Some(employee), Some(run), Some(detail));
-}
 /// The core owns every privileged side effect. WorkerHost supplies bounded
 /// mailboxes and the independent UID monitor supplies live fail-closed fencing.
 struct PublishedView { report: EvidenceReport, policy: Option<RootPolicy>, employees: BTreeSet<EmployeeId> }
@@ -626,51 +479,11 @@ impl Host for Core {
         let features = crate::host_state::DECODED_FEATURES;
         if self.helpers_ready().is_ok() { features.with(Features::HELPER_CALLS) } else { features }
     }
-    fn helper_run(&mut self, job: HelperStart<Vec<OwnedFd>>) -> Result<HelperStarted<Vec<OwnedFd>>> {
-        if self.poisoned { return Err(ErrorCode::HelperUnavailable); }
-        let HelperStart { run, employee, call, helper, slot, timeout_ms, input_bytes, mut input, run_remaining_ms } = job;
-        let input = match (input.pop(), input.is_empty()) { (Some(fd), true) => fd, _ => return Err(ErrorCode::InvalidFds) };
-        let cancelled = self.monitor.cancellation(run).map_err(|_| ErrorCode::NotReady)?;
-        let entry = self.runs.get(&run.0).ok_or(ErrorCode::NotFound)?;
-        // [F7] root's own record of the run's employee must be the coordinator's.
-        if entry.employee != employee { return Err(ErrorCode::Unauthorized); }
-        if entry.closed || !entry.started_event || cancelled.load(Ordering::Acquire) { return Err(ErrorCode::NotReady); }
-        let parent = entry.helper_parent.as_ref().ok_or(ErrorCode::HelperUnavailable)?;
-        let policy = self.policy.as_ref().ok_or(ErrorCode::HelperUnavailable)?;
-        // §2.3: re-derived per call from the run's employee (entitlement may
-        // have been withdrawn since start), never from the request.
-        let derived = policy.derive_helper(entry.employee, parent, &helper).map_err(|_| ErrorCode::RuntimeDenied)?;
-        if derived.binding.slot != slot { return Err(ErrorCode::InvalidRequest); }
-        // Root's own deadline bounds the coordinator's view.
-        let own = u64::try_from(entry.runtime_deadline.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(u64::MAX);
-        let plan = CallPlan { call, index: derived.index, slot, requested_ms: timeout_ms, input_bytes,
-            run_remaining_ms: run_remaining_ms.min(own), termination_grace_ms: parent.timeouts.termination_grace_ms };
-        let now = os(crate::server::coordination_time_ms())?;
-        let entry = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
-        let engine = match entry.helper.as_mut() {
-            Some(RunHelper::Engine(engine)) => engine,
-            Some(RunHelper::Unavailable(code)) => return Err(*code),
-            None => return Err(ErrorCode::NotReady),
-        };
-        let started = engine.start(now, plan, input);
-        for fact in engine.take_audit() { emit_helper(&self.audit, employee, run.0, fact); }
-        let started = started?;
-        Ok(HelperStarted { effective_timeout_ms: started.effective_timeout_ms, pipes: vec![started.stdout, started.stderr] })
-    }
+    fn helper_run(&mut self, job: HelperStart<Vec<OwnedFd>>) -> Result<HelperStarted<Vec<OwnedFd>>> { self.run_helper(job) }
     fn helper_signal(&mut self, run: RunHandle, call: HelperCallId, signal: HelperSignal) -> Result<()> {
-        let entry = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
-        let Some(RunHelper::Engine(engine)) = entry.helper.as_mut() else { return Ok(()) };
-        let result = engine.signal(call, signal);
-        for fact in engine.take_audit() { emit_helper(&self.audit, entry.employee, run.0, fact); }
-        result
+        self.signal_helper(run, call, signal)
     }
-    fn helper_events(&mut self) -> Vec<HelperEvent> {
-        let mut events = std::mem::take(&mut self.helper_events);
-        for entry in self.runs.values_mut() {
-            if let Some(RunHelper::Engine(engine)) = entry.helper.as_mut() { events.extend(engine.take_events()); }
-        }
-        events
-    }
+    fn helper_events(&mut self) -> Vec<HelperEvent> { self.collect_helper_events() }
     type Inputs = Vec<OwnedFd>; type Io = Vec<OwnedFd>;
     fn ready(&mut self, employee: EmployeeId) -> Result<()> {
         if self.poisoned { return Err(unavailable()); }
@@ -701,7 +514,8 @@ impl Host for Core {
         self.runs.insert(run.0, LiveRun { employee, unit: None, attachment: None, revokers: vec![], gateway_io: Some(vec![]),
             relays: vec![], egress: false, pty: *pty, pty_taken: false, closed: false, started_event: false, truncated_event: false,
             runtime_deadline: Instant::now() + Duration::from_millis(runtime.timeouts.runtime_ms), bootstrap_attempted: false, projection: None,
-            broker: crate::work_broker::BrokerRoot::new(None), helper_parent: Some(runtime.clone()), helper: None });
+            broker: crate::work_broker::BrokerRoot::new(None), helper_parent: Some(runtime.clone()), helper: None,
+            mcp_revoker: None });
         let mut storage = self.components.storage.attach(employee, account.uid, run, &runtime.resources.disk)?;
         storage.receipt.check(employee, run)?;
         self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.attachment = Some(storage.receipt.clone());
@@ -718,8 +532,11 @@ impl Host for Core {
         }
         let mut gateway_io = Vec::new();
         let mut revokers = Vec::new();
+        let mut mcp_revoker = None;
         let mcp = if runtime.mcp {
-            let pair = os(RevocablePair::new())?; revokers.push(Arc::new(os(pair.revoker())?));
+            let pair = os(RevocablePair::new())?;
+            let revoker = Arc::new(os(pair.revoker())?);
+            revokers.push(revoker.clone()); mcp_revoker = Some(revoker);
             gateway_io.push(pair.gateway); Some(pair.runtime)
         } else { None };
         let egress = match runtime.network {
@@ -747,6 +564,7 @@ impl Host for Core {
         plan.validate()?;
         let entry = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
         entry.gateway_io = Some(gateway_io); entry.relays = vec![out, err]; entry.revokers = revokers.clone();
+        entry.mcp_revoker = mcp_revoker;
         self.monitor.set_run(employee, Some(run.0), None, revokers.clone())?;
         self.components.publication.prepare_mcp_projection(&plan, &runtime)?;
         let anchors = self.components.publication.anchors()?;
@@ -802,15 +620,7 @@ impl Host for Core {
                 self.monitor.running(run, entry.runtime_deadline)?;
                 emit(&self.audit, Event::Started, Some(entry.employee), Some(run.0)); entry.started_event = true; }
             // HX4: the launcher link moves out of the trampoline once, when Running.
-            if matches!(progress, HostProgress::Running { .. }) && entry.helper.is_none() {
-                entry.helper = Some(match self.components.trampoline.take_helper_link(run) {
-                    Ok(link) => match HelperEngine::new(run, link) {
-                        Ok(engine) => RunHelper::Engine(Box::new(engine)),
-                        Err(code) => RunHelper::Unavailable(code),
-                    },
-                    Err(code) => RunHelper::Unavailable(code),
-                });
-            }
+            if matches!(progress, HostProgress::Running { .. }) && entry.helper.is_none() { self.link_helpers(run)?; }
         }
         Ok(progress)
     }
@@ -841,15 +651,7 @@ impl Host for Core {
     }
     fn maintenance(&mut self) -> Result<()> {
         // HX4: launcher frames, spawnd's watchdog and the runtime cgroup, every turn.
-        if let Ok(now) = crate::server::coordination_time_ms() {
-            for (run, entry) in &mut self.runs {
-                if entry.closed { continue; }
-                if let Some(RunHelper::Engine(engine)) = entry.helper.as_mut() {
-                    engine.service(now);
-                    for fact in engine.take_audit() { emit_helper(&self.audit, entry.employee, *run, fact); }
-                }
-            }
-        }
+        self.service_helpers();
         for (run, entry) in &mut self.runs {
             for relay in &mut entry.relays {
                 if relay.pump().is_err() {
@@ -913,84 +715,5 @@ impl Host for LinuxHost {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    fn entry() -> ScanEntry {
-        ScanEntry { account: EmployeeAccount { employee: EmployeeId([1; 16]), uid: 70000, gid: 70000,
-            state: crate::registry::AccountState::Ready }, run: None, cgroup: None, revokers: vec![],
-            cancelled: Arc::new(AtomicBool::new(false)), deadline: None }
-    }
-    #[test]
-    fn employee_idle_reports_processes_and_attachments() {
-        let (me, other) = (EmployeeId([1; 16]), EmployeeId([2; 16]));
-        let uid = 70_000;
-        let lease = |employee, byte| Attachment { employee, run: RunHandle(RunId([byte; 16])), token: RequestId([byte; 16]),
-            device_major: 7, device_minor: 1 };
-        // Nothing anywhere: idle.
-        let quiet = idle_report(me, uid, &[], &[], &[], 0, &[]);
-        assert!(quiet.idle());
-        // Another employee's run, lease and unit never count against `me`.
-        let known = [KnownRun { run: RunId([9; 16]), employee: other, open: true }];
-        let foreign = idle_report(me, uid, &known, &[], &[lease(other, 9)], 0, &[RunId([9; 16])]);
-        assert!(foreign.idle(), "{foreign:?}");
-        // A process with the employee's uid or gid (counted by the scanner).
-        let busy = idle_report(me, uid, &[], &[], &[], 2, &[]);
-        assert_eq!((busy.processes, busy.idle()), (2, false));
-        // A durable lease left behind (no run) is not idle.
-        let leased = idle_report(me, uid, &[], &[], &[lease(me, 3), lease(other, 4)], 0, &[]);
-        assert_eq!((leased.attachments, leased.idle()), (1, false));
-        // Open root runs and crash-journal records (by id or by uid), deduplicated.
-        let known = [KnownRun { run: RunId([5; 16]), employee: me, open: true },
-            KnownRun { run: RunId([6; 16]), employee: me, open: false }];
-        let journal = [RunRecord { run: RunId([5; 16]), employee: me, uid },
-            RunRecord { run: RunId([7; 16]), employee: EmployeeId([3; 16]), uid }];
-        let running = idle_report(me, uid, &known, &journal, &[], 0, &[]);
-        assert_eq!(running.runs, 2, "run 5 once, plus the journal record carrying this uid");
-        // A closed run is not live; its leftover unit still is.
-        let known = [KnownRun { run: RunId([6; 16]), employee: me, open: false }];
-        let unit = idle_report(me, uid, &known, &[], &[], 0, &[RunId([6; 16])]);
-        assert_eq!((unit.runs, unit.units, unit.idle()), (0, 1, false));
-        // A unit root cannot attribute to anyone counts against every employee.
-        let orphan = idle_report(me, uid, &[], &[], &[], 0, &[RunId([8; 16])]);
-        assert_eq!((orphan.units, orphan.idle()), (1, false));
-        // Counts saturate instead of wrapping.
-        assert_eq!(idle_report(me, uid, &[], &[], &[], usize::MAX, &[]).processes, u16::MAX);
-    }
-    #[test]
-    fn cgroup_receipt_is_converted_to_absolute_proc_membership() {
-        assert_eq!(proc_cgroup(std::path::Path::new("/sys/fs/cgroup/duduclaw.slice/run.service")).unwrap(), "/duduclaw.slice/run.service");
-        assert!(proc_cgroup(std::path::Path::new("/sys/fs/cgroup")).is_err());
-        assert!(proc_cgroup(std::path::Path::new("/other/run.service")).is_err());
-    }
-    #[test]
-    fn readiness_does_not_consume_intrusion_events_and_stale_scan_denies() {
-        let employee = EmployeeId([1; 16]);
-        let state = Arc::new(Mutex::new(ScanState { at: Instant::now(), result: Ok(vec![employee]) }));
-        let mut reader = ScanReader { state: state.clone(), entries: Arc::new(Mutex::new(vec![entry()])) };
-        assert!(reader.health(employee).is_err());
-        assert!(reader.health(employee).is_err());
-        assert_eq!(reader.scan().unwrap(), vec![employee]);
-        assert!(reader.health(employee).is_ok());
-        state.lock().unwrap().at = Instant::now() - Duration::from_secs(3);
-        assert!(reader.health(employee).is_err());
-        assert!(reader.scan().is_err());
-    }
-    #[test]
-    fn cancelling_a_queued_start_sets_the_same_fence_given_to_trampoline() {
-        let employee = EmployeeId([1; 16]); let run = RunHandle(RunId([2; 16]));
-        let entries = Arc::new(Mutex::new(vec![entry()]));
-        let state = Arc::new(Mutex::new(ScanState { at: Instant::now(), result: Ok(vec![]) }));
-        let mut reader = ScanReader { state: state.clone(), entries: entries.clone() };
-        let monitor = Monitor { entries, state, stop: Arc::new(AtomicBool::new(false)) };
-        reader.register(run, employee, 1000).unwrap();
-        let b2_fence = monitor.cancellation(run).unwrap();
-        assert!(monitor.check_run(run).is_ok());
-        reader.cancel(run).unwrap();
-        assert!(b2_fence.load(Ordering::Acquire));
-        assert!(monitor.check_run(run).is_err());
-        assert!(reader.register(RunHandle(RunId([3; 16])), employee, 1000).is_err());
-        monitor.set_run(employee, None, None, vec![]).unwrap();
-        reader.register(RunHandle(RunId([3; 16])), employee, 1000).unwrap();
-        assert!(b2_fence.load(Ordering::Acquire));
-    }
-}
+#[path = "host_tests.rs"]
+mod tests;
