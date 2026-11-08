@@ -59,13 +59,12 @@ npx duduclaw mcp init --client cursor
 
 ## 使えるツール
 
-キーのスコープは `memory:read`、`memory:write`、`wiki:read`、`wiki:write` の 4 つです。`tools/list` には、これらのスコープで呼べる 24 ツールがちょうど表示されます。
+キーのスコープは `memory:read`、`memory:write`、`wiki:read`、`wiki:write` の 4 つです。`tools/list` には、これらのスコープで呼べる 23 ツールがちょうど表示されます。
 
 | 分類 | ツール |
 |---|---|
 | メモリ | `memory_store`、`memory_search`、`memory_read`、`memory_fetch_batch`、`memory_get_history`、`memory_get_at`、`memory_alias_add`、`memory_alias_list`、`memory_improve` |
 | ユーザープロファイル | `user_profile_record`、`user_profile_get`、`user_code_profile` |
-| コードマップ | `code_map`（`root` で指定したディレクトリ、省略時はサーバーの作業ディレクトリ） |
 | Wiki | `wiki_write`、`wiki_read`、`wiki_ls`、`wiki_search`、`wiki_stats`、`wiki_lint`、`wiki_graph`、`wiki_export`、`wiki_dedup`、`wiki_rebuild_fts`、`wiki_share` |
 
 データの保存先：
@@ -87,6 +86,7 @@ npx duduclaw mcp init --client cursor
 | `working_state_get`／`_set`／`_clear`／`_handoff` | 拒否（`-32003`）。サーバーを動かす AI 社員として動く（社員がいなければ `unknown agent: dudu`） |
 | `memory_search_by_layer`、`memory_successful_conversations`、`memory_episodic_pressure`、`memory_consolidation_status` | 拒否（`-32003`）。読むのはクライアントではなく既定の社員のメモリ |
 | `shared_wiki_delete`、`wiki_namespace_status`、`canvas_push`、`canvas_clear` | 拒否（`-32003`）。既定の社員として判定・動作する |
+| `code_map` | v1.81 から拒否（`-32003`）。呼び出した AI 社員自身のディレクトリ（または管理者が `[files] allowed_roots` で宣言したディレクトリ）だけを走査する。社員でないキーには走査できるディレクトリがない |
 | `messaging:send`（`send_message`、`send_photo`、`send_sticker`、`synthesize_speech`、`transcribe_audio`） | `config.toml` のチャネル設定（`Unknown channel`）または外部の音声サービスが必要 |
 | `mail:read`／`mail:send` | 外部キーには付与できない。`mail_*` は上の行と同じく拒否される。メール処理は gateway 内で動く |
 | `team:handoff` | 外部キーには付与できない。gateway の goal loop が出したタスクが必要 |

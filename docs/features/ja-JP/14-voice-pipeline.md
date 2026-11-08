@@ -78,12 +78,6 @@ v1.67.1 から、「語音」タブには「語音回覆模式」（音声返信
 
 ---
 
-## Discord 音声
-
-`discord_voice.rs` は**既定ではない `discord-voice` Cargo feature** の後ろで **Songbird** をラップします。gateway の `default` は `["dashboard", "desktop"]` なので、素のビルドには含まれません。その背後に VAD も ASR の配線も今日は存在せず、このモジュールが扱うのはチャンネル参加と音声再生です。
-
----
-
 ## ONNX 埋め込み
 
 `duduclaw-inference` の `onnx` feature は `OnnxEmbeddingProvider`（ONNX Runtime ＋ WordPiece トークナイザ）を有効にし、`bge-small-zh` のようなモデルに使います。これは音声コンポーネントではなく、メモリシステムのセマンティック検索が使う共有インフラです（[10-cognitive-memory.md](10-cognitive-memory.md) 参照）。そしてこれも crate の default features には**含まれません**。

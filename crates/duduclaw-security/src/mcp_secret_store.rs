@@ -323,11 +323,53 @@ pub fn remove_server(home: &Path, agent: &str, server: &str) -> io::Result<()> {
 pub fn remove_agent(home: &Path, agent: &str) -> io::Result<()> {
     let path = store_path(home, agent)?;
     if !path.exists() { return Ok(()) }
-    duduclaw_core::with_file_lock(&path, || match fs::remove_file(&path) {
-        Ok(()) => sync_parent(&path),
+    duduclaw_core::with_file_lock(&path, || remove_store_file(&path))
+}
+
+fn remove_store_file(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_parent(path),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
-    })
+    }
+}
+
+/// The employee's store lock, taken up front with a bounded wait and held
+/// until [`AgentStoreRemoval::remove`] — for a caller that holds the global
+/// org lock (RM-027 round 6: MCP `agent_remove`), so it can learn *before*
+/// it moves the employee anywhere that the store is not free, instead of
+/// waiting unboundedly afterwards.
+#[derive(Debug)]
+pub struct AgentStoreRemoval {
+    path: PathBuf,
+    lock: Option<duduclaw_core::fs_lock::FileLockGuard>,
+    wait: std::time::Duration,
+}
+
+/// Take the employee's store lock within `wait` (a missing store needs no
+/// lock). `Err` with [`io::ErrorKind::TimedOut`] (`lock_wait_timeout`) when
+/// another writer still holds it: nothing was changed.
+pub fn lock_agent_store_within(home: &Path, agent: &str, wait: std::time::Duration) -> io::Result<AgentStoreRemoval> {
+    let path = store_path(home, agent)?;
+    let lock = if path.exists() {
+        Some(duduclaw_core::fs_lock::lock_exclusive_within(&path, wait)?)
+    } else {
+        None
+    };
+    Ok(AgentStoreRemoval { path, lock, wait })
+}
+
+impl AgentStoreRemoval {
+    /// Remove the live store under the lock already held. A store created
+    /// after [`lock_agent_store_within`] found none is removed under its
+    /// lock, again with the bounded wait.
+    pub fn remove(self) -> io::Result<()> {
+        match &self.lock {
+            Some(_) => remove_store_file(&self.path),
+            None if !self.path.exists() => Ok(()),
+            None => duduclaw_core::with_file_lock_timeout(&self.path, self.wait, || remove_store_file(&self.path)),
+        }
+    }
 }
 
 mod migration;

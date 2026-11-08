@@ -728,6 +728,9 @@ fn resign_license_preserving(
         // NFR marker survives refresh/upgrade — a re-signed test license must
         // never come back clean.
         nfr: prev.as_ref().is_some_and(|l| l.nfr),
+        // The owner-gateway issuer has no installation-key approval flow; keep
+        // its OEM output byte-identical to pre-key licenses.
+        installation_pubkey: None,
     };
     sign_and_self_verify(signing_seed, verify_registry, "v2", license)
 }

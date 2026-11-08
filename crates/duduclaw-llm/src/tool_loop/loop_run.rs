@@ -579,6 +579,18 @@ pub async fn run_tool_loop_with_provenance_and_ccr(
                                 false,
                             ));
                         }
+                        // RM-130: last step, after redaction and CCR handling —
+                        // an error left with no text gets a fixed reason so the
+                        // employee never has to guess. Non-empty errors and
+                        // successes are untouched.
+                        if result_is_error && content.trim().is_empty() {
+                            content = duduclaw_core::missing_error_reason(
+                                &name,
+                                tools.server_of(&name).as_deref(),
+                                None,
+                                None,
+                            );
+                        }
                         (content, result_is_error, true)
                     }
                     // Dispatch failure → feed back as an error result, not a

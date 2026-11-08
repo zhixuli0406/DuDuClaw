@@ -395,3 +395,95 @@ fn scaffold_cap_is_configurable_and_zero_is_clamped_to_one() {
     );
     assert!(err.contains("(1 live scaffolds)"), "got: {err}");
 }
+
+/// RM-027 round 4, finding 1: a scaffold takes the org lock before it
+/// creates anything (nothing is visible while it waits), and an authority
+/// refusal fails the scaffold with no directory left — never an ephemeral
+/// governed by the `agent.toml` inside its own workspace.
+#[test]
+fn scaffold_waits_for_the_org_lock_and_fails_closed_on_an_unusable_authority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().to_path_buf();
+    write_parent(&home, "boss", "[capabilities]\nallowed_tools = [\"Read\"]\n");
+    duduclaw_core::org_store::seed_if_absent(&home).unwrap();
+    let spec = EphemeralSpawnSpec {
+        parent: "boss".into(),
+        instruction: "x".into(),
+        tools: strs(&["Read"]),
+        tier: "standard".into(),
+    };
+
+    // Waits for a held org lock; nothing appears meanwhile.
+    let held = duduclaw_core::org_store::lock_org_mutations(&home).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = {
+        let home = home.clone();
+        let spec = spec.clone();
+        std::thread::spawn(move || tx.send(scaffold(&home, &spec)).unwrap())
+    };
+    assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "scaffold must wait for the org lock");
+    assert_no_scaffold(&home);
+    drop(held);
+    let result = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap().unwrap();
+    worker.join().unwrap();
+    assert!(result.dir.join("agent.toml").is_file());
+    assert_eq!(
+        duduclaw_core::org_store::load(&home).get(&result.agent_id).unwrap().reports_to,
+        "boss"
+    );
+    std::fs::remove_dir_all(&result.dir).unwrap();
+
+    // Corrupt authority: refused, no scaffold (and no staging dir) remains.
+    let store = duduclaw_core::org_store::org_store_path(&home);
+    std::fs::write(&store, "schema = \"x\"\n").unwrap();
+    let err = scaffold(&home, &spec).unwrap_err();
+    assert!(err.contains("org authority refused"), "got: {err}");
+    assert_no_scaffold(&home);
+    assert_eq!(std::fs::read_to_string(&store).unwrap(), "schema = \"x\"\n");
+}
+
+/// RM-027 round 5: the `.mcp.json` is written inside the staging directory
+/// before the publish. A failure there leaves no visible scaffold (and no
+/// staging dir), no authority row, and the org lock free — never a published
+/// `agent.toml` that the mirror fallback could read after its row was gone.
+#[test]
+fn ephemeral_mcp_config_failure_leaves_no_visible_scaffold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().to_path_buf();
+    write_parent(&home, "boss", "[capabilities]\nallowed_tools = [\"Read\"]\n");
+    duduclaw_core::org_store::seed_if_absent(&home).unwrap();
+    let rows_before: Vec<String> = duduclaw_core::org_store::load(&home).iter().map(|(id, _)| id.clone()).collect();
+    let spec = EphemeralSpawnSpec {
+        parent: "boss".into(),
+        instruction: "x".into(),
+        tools: strs(&["Read"]),
+        tier: "standard".into(),
+    };
+
+    super::super::scaffold::mcp_failpoint::arm();
+    let err = scaffold(&home, &spec).unwrap_err();
+    super::super::scaffold::mcp_failpoint::disarm();
+    assert!(err.contains("MCP config"), "got: {err}");
+
+    // Nothing in the ephemeral root — neither a published scaffold nor a
+    // dot-prefixed staging directory.
+    let root = ephemeral_root(&home);
+    let leftovers: Vec<String> = std::fs::read_dir(&root)
+        .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    assert!(leftovers.is_empty(), "no scaffold may remain: {leftovers:?}");
+    // The authority gained no row for the aborted scaffold.
+    let rows_after: Vec<String> = duduclaw_core::org_store::load(&home).iter().map(|(id, _)| id.clone()).collect();
+    assert_eq!(rows_after, rows_before, "no authority row for an aborted scaffold");
+    // The org lock was released.
+    drop(duduclaw_core::org_store::lock_org_mutations(&home).unwrap());
+
+    // The next scaffold works and carries its MCP config at the final path.
+    let ok = scaffold(&home, &spec).unwrap();
+    assert!(ok.dir.join(".mcp.json").is_file());
+    assert_eq!(
+        member_mcp_json(&ok.dir)["mcpServers"]["duduclaw"]["env"]["DUDUCLAW_AGENT_ID"].as_str(),
+        Some(ok.agent_id.as_str()),
+        "the identity is the final id, not the staging directory's name"
+    );
+}

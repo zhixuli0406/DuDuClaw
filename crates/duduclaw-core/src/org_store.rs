@@ -48,10 +48,14 @@
 //! # Concurrency
 //!
 //! Reads are lock-free (writes commit by `rename`, so a reader sees either the
-//! old or the new file, never a torn one). Every write takes the cross-process
-//! advisory lock ([`crate::with_file_lock`]) around a full read-modify-write,
-//! so the MCP server process and the gateway process cannot lose each other's
-//! entries.
+//! old or the new file, never a torn one). Every write first needs the global
+//! org mutation lock ([`OrgMutationGuard`] — [`upsert`], [`upsert_many`] and
+//! [`remove`] take it as an argument), then takes the `org.toml` sidecar lock
+//! ([`crate::with_file_lock`]) around a full, strictly parsed
+//! read-modify-write, so no two writers — in any process — can interleave a
+//! validate-then-commit or lose each other's entries. Lock order: the org
+//! lock first, then any `agent.toml` lock / the autonomy barrier; the
+//! `org.toml` lock is only taken under the org lock.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -233,7 +237,97 @@ fn ensure_seeded_marker(home: &Path) {
     }
 }
 
-/// Read the store, **never failing**.
+/// Why the authority cannot be used for a **write** (RM-027 review): the
+/// strict counterpart of [`load`]'s fail-safe fallback. `Display` is
+/// end-user zh-TW copy that tells the operator what to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrgStoreError {
+    /// The home was bootstrapped ([`ORG_SEEDED_FILE`]) but `org.toml` is gone.
+    Lost,
+    /// `org.toml` exists but cannot be read.
+    Unreadable(String),
+    /// `org.toml` is not valid TOML.
+    Corrupt(String),
+    /// `org.toml` was written by a newer build (its `schema` number).
+    UnsupportedSchema(i64),
+    /// Writing the store (or taking its lock) failed.
+    Io(String),
+    /// The write would make `agent_id` its own ancestor (RM-027 round 3:
+    /// every edge-adding authority write walks the whole chain, rollbacks
+    /// included). Nothing was written.
+    Cycle { agent_id: String, reports_to: String },
+    /// The agent id is not a valid agent directory name; it is never
+    /// written (a strict reader would refuse the whole file afterwards).
+    InvalidAgentId(String),
+}
+
+impl OrgStoreError {
+    /// Stable machine-readable code.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "org_authority_write_failed",
+            Self::Cycle { .. } => "cycle",
+            Self::InvalidAgentId(_) => "agent_not_found",
+            _ => "org_authority_unavailable",
+        }
+    }
+}
+
+impl std::fmt::Display for OrgStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lost => write!(
+                f,
+                "組織權威資料（org.toml）不見了，但這個環境先前已經建立過它。為了不把各 agent.toml \
+                 的內容誤當成權威，組織調整已暫停；請管理員在自己的終端機執行 `duduclaw org sync` 重建後再試。"
+            ),
+            Self::Unreadable(e) => write!(
+                f,
+                "無法讀取組織權威資料（org.toml）：{e}。組織調整已暫停，請管理員檢查檔案權限後再試。"
+            ),
+            Self::Corrupt(reason) => write!(
+                f,
+                "組織權威資料（org.toml）的內容無法解析（{reason}）。為了不覆蓋其他 AI 員工的紀錄，\
+                 組織調整已暫停；請管理員修正這個檔案，或在終端機執行 `duduclaw org sync` \
+                 從各 agent.toml 完整重建（原檔會保留為 org.toml.corrupt）。"
+            ),
+            Self::UnsupportedSchema(n) => write!(
+                f,
+                "組織權威資料（org.toml）是較新版本的 DuDuClaw 寫入的（schema {n}），\
+                 這個版本無法安全地修改它；請升級 DuDuClaw 後再調整組織圖。"
+            ),
+            Self::Io(e) => write!(f, "寫入組織權威資料（org.toml）失敗：{e}"),
+            Self::Cycle { agent_id, reports_to } => write!(
+                f,
+                "不能讓「{a}」向「{r}」回報：「{r}」目前在「{a}」的團隊之下，這樣會形成循環。組織權威資料沒有變更。",
+                a = crate::truncate_chars(agent_id, 64),
+                r = crate::truncate_chars(reports_to, 64),
+            ),
+            Self::InvalidAgentId(id) => write!(
+                f,
+                "「{}」不是有效的 AI 員工代號，組織權威資料沒有變更。",
+                crate::truncate_chars(id, 64)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OrgStoreError {}
+
+impl From<OrgStoreError> for io::Error {
+    fn from(e: OrgStoreError) -> Self {
+        let kind = match &e {
+            OrgStoreError::Lost => io::ErrorKind::NotFound,
+            OrgStoreError::Corrupt(_) | OrgStoreError::UnsupportedSchema(_) => io::ErrorKind::InvalidData,
+            OrgStoreError::Cycle { .. } | OrgStoreError::InvalidAgentId(_) => io::ErrorKind::InvalidInput,
+            OrgStoreError::Unreadable(_) | OrgStoreError::Io(_) => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, e.to_string())
+    }
+}
+
+/// Read the store, **never failing** — for read-only / display / delegation
+/// paths. Writers that must not act on a degraded view use [`load_for_write`].
 ///
 /// A missing file, an unreadable file, invalid TOML, or a schema this build
 /// does not understand all resolve to an empty store: every reader then falls
@@ -269,20 +363,123 @@ pub fn load(home: &Path) -> OrgStore {
     }
 }
 
-/// Parse store content. `Err(reason)` is a human-readable zh-agnostic reason
-/// (logged, not shown to end users).
-fn parse(content: &str) -> Result<OrgStore, String> {
+/// Read the store **strictly**, for a caller about to change the org chart.
+///
+/// - `org.toml` present and exactly in the documented shape → the store
+///   ([`parse_strict`]);
+/// - absent on a home that was never bootstrapped → an empty store (the
+///   genuine first run: readers fall back to `agent.toml`, and the first
+///   write bootstraps from the mirrors);
+/// - absent on a bootstrapped home, unreadable, invalid TOML, a newer schema
+///   or any shape [`parse_strict`] refuses → `Err`. Validating against the
+///   mirror fallback, or writing on top of a half-understood store, would let
+///   a write adopt mirrors or silently drop rows; only `duduclaw org sync`
+///   may rebuild from that state.
+pub fn load_for_write(home: &Path) -> Result<OrgStore, OrgStoreError> {
+    match std::fs::read_to_string(org_store_path(home)) {
+        Ok(content) => parse_strict(&content),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if seeded_marker_exists(home) {
+                Err(OrgStoreError::Lost)
+            } else {
+                Ok(OrgStore::new())
+            }
+        }
+        Err(e) => Err(OrgStoreError::Unreadable(e.to_string())),
+    }
+}
+
+/// The **write-path** parser (RM-027 round 3): anything but exactly the
+/// shape [`serialize`] produces is [`OrgStoreError::Corrupt`] (or
+/// [`OrgStoreError::UnsupportedSchema`]) — fail closed. The tolerant
+/// [`parse`] used for display would otherwise treat `schema = "x"` as v1,
+/// skip non-table rows, default missing or non-string fields, and the next
+/// serialize would silently drop whatever it skipped.
+///
+/// - top-level keys: only `schema` (required, an integer `1..=`
+///   [`ORG_STORE_SCHEMA`]) and `agents` (optional, a table);
+/// - every `agents` key a valid agent id ([`crate::is_valid_agent_id`]),
+///   unique after canonicalisation;
+/// - every row a table with exactly `reports_to` and `department`, both
+///   strings (`""` = none).
+fn parse_strict(content: &str) -> Result<OrgStore, OrgStoreError> {
+    let corrupt = |reason: String| OrgStoreError::Corrupt(reason);
     let table = content
         .parse::<toml::Table>()
-        .map_err(|e| format!("invalid TOML: {}", first_line(&e.to_string())))?;
+        .map_err(|e| corrupt(format!("invalid TOML: {}", first_line(&e.to_string()))))?;
+    for key in table.keys() {
+        if key != "schema" && key != "agents" {
+            return Err(corrupt(format!("unknown top-level key `{}`", crate::truncate_chars(key, 64))));
+        }
+    }
+    let schema = match table.get("schema") {
+        Some(toml::Value::Integer(n)) => *n,
+        Some(_) => return Err(corrupt("`schema` is not an integer".into())),
+        None => return Err(corrupt("`schema` is missing".into())),
+    };
+    if schema > ORG_STORE_SCHEMA {
+        return Err(OrgStoreError::UnsupportedSchema(schema));
+    }
+    if schema < 1 {
+        return Err(corrupt(format!("unsupported `schema = {schema}`")));
+    }
+
+    let mut store = OrgStore::new();
+    let agents = match table.get("agents") {
+        None => return Ok(store),
+        Some(toml::Value::Table(t)) => t,
+        Some(_) => return Err(corrupt("`agents` is not a table".into())),
+    };
+    for (raw_id, value) in agents {
+        let agent_id = raw_id.trim();
+        if agent_id != raw_id.as_str() || !crate::is_valid_agent_id(agent_id) {
+            return Err(corrupt(format!("invalid agent id `{}`", crate::truncate_chars(raw_id, 64))));
+        }
+        let Some(row) = value.as_table() else {
+            return Err(corrupt(format!("row `{agent_id}` is not a table")));
+        };
+        for key in row.keys() {
+            if key != "reports_to" && key != "department" {
+                return Err(corrupt(format!(
+                    "row `{agent_id}` has an unknown key `{}`",
+                    crate::truncate_chars(key, 64)
+                )));
+            }
+        }
+        let entry = OrgEntry::new(
+            strict_field(row, agent_id, "reports_to")?,
+            strict_field(row, agent_id, "department")?,
+        );
+        if store.entries.contains_key(agent_id) {
+            return Err(corrupt(format!("duplicate agent id `{agent_id}`")));
+        }
+        store.entries.insert(agent_id.to_string(), entry);
+    }
+    Ok(store)
+}
+
+/// One required string field of a strict row.
+fn strict_field<'a>(row: &'a toml::Table, agent_id: &str, key: &str) -> Result<&'a str, OrgStoreError> {
+    match row.get(key) {
+        Some(toml::Value::String(s)) => Ok(s.as_str()),
+        Some(_) => Err(OrgStoreError::Corrupt(format!("row `{agent_id}`: `{key}` is not a string"))),
+        None => Err(OrgStoreError::Corrupt(format!("row `{agent_id}`: `{key}` is missing"))),
+    }
+}
+
+/// Parse store content **tolerantly** (display / delegation reads through
+/// [`load`]). The error's reason text is logged, and shown to operators
+/// through [`OrgStoreError`]'s `Display`.
+fn parse(content: &str) -> Result<OrgStore, OrgStoreError> {
+    let table = content
+        .parse::<toml::Table>()
+        .map_err(|e| OrgStoreError::Corrupt(format!("invalid TOML: {}", first_line(&e.to_string()))))?;
 
     // A missing `schema` key is treated as v1 (hand-written files, and the
     // very first release). A *higher* number is refused — see the constant.
     let schema = table.get("schema").and_then(|v| v.as_integer()).unwrap_or(ORG_STORE_SCHEMA);
     if schema > ORG_STORE_SCHEMA {
-        return Err(format!(
-            "schema {schema} is newer than this build understands ({ORG_STORE_SCHEMA})"
-        ));
+        return Err(OrgStoreError::UnsupportedSchema(schema));
     }
 
     let mut store = OrgStore::new();
@@ -374,23 +571,46 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or_default().to_string()
 }
 
-/// Read-modify-write the store under the cross-process lock.
+/// How [`mutate`] treats an authority it cannot use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    /// Ordinary gated writers (agent creation, removal, …): an unreadable,
+    /// corrupt or newer-schema file is refused (never rebuilt from an empty
+    /// store — that would wipe every other entry); a lost store on a
+    /// bootstrapped home records only the caller's entry (WP22 T5).
+    Lenient,
+    /// Org-chart changes under [`OrgMutationGuard`]: everything
+    /// [`load_for_write`] refuses is refused, including a lost store.
+    Strict,
+    /// `duduclaw org sync`, the explicit rebuild: a corrupt file is kept as
+    /// `org.toml.corrupt` and rebuilt; a newer schema is still refused.
+    Rebuild,
+}
+
+/// Read-modify-write the store under the `org.toml` sidecar lock.
 ///
-/// The closure sees the entries as they are on disk *right now* (re-read
-/// inside the lock, so a concurrent writer in another process is never lost)
-/// and returns whatever the caller wants back; the file is rewritten
-/// atomically (temp + rename) only when the closure reports a change.
+/// Only reachable through an [`OrgMutationGuard`] (the global org lock), so
+/// this sidecar lock is only ever taken under the org lock. The closure sees the entries as they are on disk
+/// *right now*, parsed strictly ([`parse_strict`]), and returns whatever the
+/// caller wants back — or an error, in which case nothing is written; the
+/// file is rewritten atomically (temp + rename) only when the content
+/// changed.
 fn mutate<T>(
     home: &Path,
-    f: impl FnOnce(&mut OrgStore) -> T,
-) -> io::Result<T> {
+    mode: WriteMode,
+    f: impl FnOnce(&mut OrgStore) -> Result<T, OrgStoreError>,
+) -> Result<T, OrgStoreError> {
     let path = org_store_path(home);
-    crate::config::create_home_dir(home)?;
-    with_file_lock(&path, || {
+    crate::config::create_home_dir(home).map_err(|e| OrgStoreError::Io(e.to_string()))?;
+    let locked = with_file_lock(&path, || {
+        // Set when this write adopts the mirrors wholesale (first-run
+        // bootstrap, `org sync` rebuild): the result is a batch write and
+        // gets the whole-graph cycle walk below.
+        let mut batch_import = mode == WriteMode::Rebuild;
         let mut store = match std::fs::read_to_string(&path) {
-            Ok(content) => match parse(&content) {
+            Ok(content) => match parse_strict(&content) {
                 Ok(s) => s,
-                Err(reason) => {
+                Err(OrgStoreError::Corrupt(reason)) if mode == WriteMode::Rebuild => {
                     // Do not silently discard an operator's file: keep a copy
                     // before this write replaces it, and say so loudly.
                     let backup = path.with_extension("toml.corrupt");
@@ -399,10 +619,21 @@ fn mutate<T>(
                         path = %path.display(),
                         backup = %backup.display(),
                         reason = %reason,
-                        "org.toml was not interpretable and is being rebuilt — the \
-                         previous file was kept as a .corrupt copy"
+                        "org.toml was not interpretable and is being rebuilt by `org sync` — \
+                         the previous file was kept as a .corrupt copy"
                     );
                     OrgStore::new()
+                }
+                Err(e) => {
+                    // Rebuilding from an empty store would wipe every other
+                    // agent's entry: refuse and leave the bytes alone.
+                    tracing::warn!(
+                        path = %path.display(),
+                        reason = %e,
+                        "org.toml is not usable — refusing to write the org authority \
+                         (run `duduclaw org sync` to rebuild)"
+                    );
+                    return Ok(Err(e));
                 }
             },
             // First write of *any* kind bootstraps the whole store from the
@@ -427,6 +658,9 @@ fn mutate<T>(
             // `duduclaw doctor` tells the operator to rebuild with
             // `duduclaw org sync`.
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if seeded_marker_exists(home) && mode == WriteMode::Strict {
+                    return Ok(Err(OrgStoreError::Lost));
+                }
                 if seeded_marker_exists(home) {
                     tracing::warn!(
                         path = %path.display(),
@@ -437,18 +671,40 @@ fn mutate<T>(
                     );
                     OrgStore::new()
                 } else {
+                    // Bootstrap trusts the mirrors as they are (there is no
+                    // prior authority to protect); the caller's own edge is
+                    // still cycle-checked against the result below.
                     let mut seeded = OrgStore::new();
                     for (agent_id, entry) in scan_mirrors(home) {
                         seeded.set(agent_id, entry);
                     }
+                    batch_import = true;
                     seeded
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Ok(Err(OrgStoreError::Unreadable(e.to_string()))),
         };
 
         let before = store.clone();
-        let out = f(&mut store);
+        let out = match f(&mut store) {
+            Ok(out) => out,
+            // Refused (a cycle, an invalid id, …): leave the bytes alone.
+            Err(e) => return Ok(Err(e)),
+        };
+        // RM-027 round 4: a wholesale import is a batch write — the mirrors
+        // it adopted are never trusted to be acyclic. Refuse the whole write
+        // (nothing is written) when the resulting stored graph has a loop.
+        if batch_import {
+            if let Err(e) = check_store_graph(&store) {
+                tracing::warn!(
+                    path = %path.display(),
+                    reason = %e,
+                    "the agent.toml mirrors form a reporting cycle — refusing to adopt them \
+                     as the org authority (fix the agent.toml files, then run `duduclaw org sync`)"
+                );
+                return Ok(Err(e));
+            }
+        }
         // Rewrite when the content changed, and always on first creation — the
         // file's *existence* is the "already bootstrapped" flag that stops the
         // gateway re-seeding (and re-adopting tampered mirrors) every boot.
@@ -460,8 +716,260 @@ fn mutate<T>(
         // upgraded from a build that predates it acquires one on the next
         // write rather than staying re-bootstrappable forever.
         ensure_seeded_marker(home);
-        Ok(out)
-    })
+        Ok(Ok(out))
+    });
+    match locked {
+        Ok(inner) => inner,
+        Err(e) => Err(OrgStoreError::Io(e.to_string())),
+    }
+}
+
+// ── The global org mutation lock (RM-027 review) ────────────────────────────
+
+/// Basename (under `<home>/locks/`) of the one lock every org-chart change
+/// holds: the dashboard `org.*` RPCs and the `org_change` approval, the
+/// `agents.update` org fields, the MCP `agent_update` org path and
+/// `duduclaw org sync`. The lock file itself is `<name>.lock`.
+pub const ORG_MUTATION_LOCK: &str = "org-mutation";
+
+/// Directory (under `<home>`) of the `org_change` approval journal
+/// (`org_change_journal/<id>.json`). AI-unwritable like `org.toml`.
+pub const ORG_CHANGE_JOURNAL_DIR: &str = "org_change_journal";
+
+/// RM-027 round 5 (moved to core in round 6 so the CLI shares it): the
+/// longest a writer holding the global org lock ([`OrgMutationGuard`]) waits
+/// for an `agent.toml` — or any other per-agent file — lock (in-process
+/// mutex + advisory lock, one budget). An ordinary write holds such a lock
+/// for milliseconds; 30 s absorbs a slow disk or a lifecycle-barrier drain
+/// (the admission wait is also 30 s). Past it the waiter gives up with a
+/// `lock_wait_timeout` error and writes nothing.
+pub const MIRROR_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `<home>/locks/org-mutation` (the advisory lock lives on `<that>.lock`).
+pub fn org_mutation_lock_path(home: &Path) -> PathBuf {
+    home.join("locks").join(ORG_MUTATION_LOCK)
+}
+
+/// Proof that the caller holds the global org mutation lock.
+///
+/// The per-file lock [`mutate`] takes only keeps two writers from losing
+/// each other's entries; it does not make "read the tree, validate, write"
+/// atomic. Two moves validated against the same tree (A→B and B→A) would
+/// both pass the cycle check and together form a cycle. Every org-chart
+/// change therefore runs inside this one cross-process lock: re-read the
+/// authority ([`Self::load`]), compare the base, validate the **whole** tree,
+/// commit ([`Self::upsert`]) — then release.
+///
+/// RM-027 round 3: the guard is also the only way to write the authority at
+/// all. [`upsert`], [`upsert_many`] and [`remove`] take it as their first
+/// argument, so agent creation / removal, ephemeral scaffolding, templates,
+/// premium kits, expert install and rollback, migration, seeding and sync
+/// are all serialised with org-chart changes (an expert rollback can no
+/// longer restore B→A while an `org.apply_change` commits A→B). Every
+/// edge-adding write — rollbacks included — re-walks the whole supervisor
+/// chain and refuses a cycle ([`OrgStoreError::Cycle`]).
+///
+/// Lock order, everywhere: this lock is taken **first** — before any
+/// `agent.toml` lock and before the autonomy lifecycle barrier. The
+/// `org.toml` sidecar lock (inside [`mutate`]) is only ever taken while this
+/// lock is held, so it can never be part of a lock cycle. Never take this
+/// lock while holding an `agent.toml` lock or the barrier.
+///
+/// Not re-entrant: never take it twice in one call chain.
+///
+/// RM-027 round 5/6: while this lock is held, every wait on an `agent.toml`
+/// (or other per-agent file) lock is bounded by [`MIRROR_LOCK_WAIT`] — a
+/// stuck writer fails the org mutation (nothing written) instead of pinning
+/// this lock for every other org writer.
+#[derive(Debug)]
+pub struct OrgMutationGuard {
+    home: PathBuf,
+    _lock: crate::fs_lock::FileLockGuard,
+}
+
+/// Take the global org mutation lock (blocking). Async callers acquire it on
+/// a blocking thread and keep the guard across their `.await`s.
+pub fn lock_org_mutations(home: &Path) -> io::Result<OrgMutationGuard> {
+    let lock = crate::fs_lock::lock_exclusive(&org_mutation_lock_path(home))?;
+    Ok(OrgMutationGuard { home: home.to_path_buf(), _lock: lock })
+}
+
+/// Run `f` while holding the global org lock (blocking) — the one-liner for
+/// a synchronous gated writer: `with_org_lock(home, |org| upsert(org, id, e))`.
+pub fn with_org_lock<T>(home: &Path, f: impl FnOnce(&OrgMutationGuard) -> io::Result<T>) -> io::Result<T> {
+    let guard = lock_org_mutations(home)?;
+    f(&guard)
+}
+
+impl OrgMutationGuard {
+    /// The home this guard locks.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// The authority as it is now, strictly ([`load_for_write`]).
+    pub fn load(&self) -> Result<OrgStore, OrgStoreError> {
+        load_for_write(&self.home)
+    }
+
+    /// Record one agent's placement, refusing a lost / unreadable / corrupt /
+    /// newer-schema store and a cycle. Returns whether the stored value
+    /// changed.
+    pub fn upsert(&self, agent_id: &str, entry: OrgEntry) -> Result<bool, OrgStoreError> {
+        let agent_id = agent_id.trim().to_string();
+        if agent_id.is_empty() {
+            return Ok(false);
+        }
+        let home = self.home.clone();
+        mutate(&self.home, WriteMode::Strict, move |store| set_checked(store, &home, &agent_id, entry))
+    }
+
+    /// Put back what the agent had before a failed change (`None` = it had no
+    /// entry, so remove it). Restoring an edge is an edge-adding write: it is
+    /// cycle-checked against the tree as it is now.
+    pub fn restore(&self, agent_id: &str, prior: Option<OrgEntry>) -> Result<(), OrgStoreError> {
+        let agent_id = agent_id.trim().to_string();
+        if agent_id.is_empty() {
+            return Ok(());
+        }
+        let home = self.home.clone();
+        mutate(&self.home, WriteMode::Strict, move |store| match prior {
+            Some(entry) => set_checked(store, &home, &agent_id, entry).map(|_| ()),
+            None => {
+                store.entries.remove(&agent_id);
+                Ok(())
+            }
+        })
+    }
+}
+
+/// Safety bound on the supervisor walk (operator-sized trees; a longer chain
+/// is treated as a cycle — fail closed). Same bound as `org_change`.
+const MAX_CHAIN_DEPTH: usize = 64;
+
+/// `agent_id`'s supervisor under the authority rule: the store entry when
+/// there is one, the `agent.toml` mirror otherwise (empty = root / unknown).
+fn effective_parent(store: &OrgStore, home: &Path, agent_id: &str) -> String {
+    if let Some(entry) = store.get(agent_id) {
+        return entry.reports_to.clone();
+    }
+    if !crate::is_valid_agent_id(agent_id) || crate::is_internal_agent_dir(agent_id) {
+        return String::new();
+    }
+    read_mirror(&home.join("agents").join(agent_id).join("agent.toml"))
+        .map(|e| e.reports_to)
+        .unwrap_or_default()
+}
+
+/// Walk up from `agent_id`'s (new) supervisor through the whole effective
+/// tree; reaching `agent_id`, revisiting a node or running past the bound is
+/// a cycle.
+fn check_no_cycle(store: &OrgStore, home: &Path, agent_id: &str) -> Result<(), OrgStoreError> {
+    let target = effective_parent(store, home, agent_id);
+    if target.is_empty() {
+        return Ok(());
+    }
+    let cycle = || OrgStoreError::Cycle { agent_id: agent_id.to_string(), reports_to: target.clone() };
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut current = target.clone();
+    for _ in 0..MAX_CHAIN_DEPTH {
+        if current == agent_id || !visited.insert(current.clone()) {
+            return Err(cycle());
+        }
+        let next = effective_parent(store, home, &current);
+        if next.is_empty() {
+            return Ok(());
+        }
+        current = next;
+    }
+    Err(cycle())
+}
+
+/// Does writing `entry` for `agent_id` add a supervisor edge the effective
+/// tree does not already have? (Department-only writes, and re-recording the
+/// edge the mirror fallback already implies, do not.)
+fn adds_edge(store: &OrgStore, home: &Path, agent_id: &str, entry: &OrgEntry) -> bool {
+    !entry.reports_to.is_empty()
+        && (entry.reports_to == agent_id || effective_parent(store, home, agent_id) != entry.reports_to)
+}
+
+/// Set one entry: the id must be a valid agent id, and an edge-adding write
+/// must not close a loop anywhere up the chain. Returns whether the stored
+/// value changed. On `Err` the caller ([`mutate`]) writes nothing.
+fn set_checked(store: &mut OrgStore, home: &Path, agent_id: &str, entry: OrgEntry) -> Result<bool, OrgStoreError> {
+    if !crate::is_valid_agent_id(agent_id) {
+        return Err(OrgStoreError::InvalidAgentId(agent_id.to_string()));
+    }
+    let new_edge = adds_edge(store, home, agent_id, &entry);
+    let changed = store.get(agent_id) != Some(&entry);
+    store.set(agent_id.to_string(), entry);
+    if new_edge {
+        check_no_cycle(store, home, agent_id)?;
+    }
+    Ok(changed)
+}
+
+/// RM-027 round 4: walk the **whole** stored graph — every row with a
+/// non-empty `reports_to` — using the store's own rows only (no mirror
+/// fallback). A batch write (`org sync`, a corrupt / lost rebuild, the
+/// first-write bootstrap, [`upsert_many`]) cannot rely on [`adds_edge`]: when
+/// the store started empty, the mirror fallback makes every adopted edge
+/// look pre-existing, so a mirror cycle `A→B, B→A` would be promoted to
+/// authority unchecked. The walk stops at a parent the store has no row for.
+fn check_store_graph(store: &OrgStore) -> Result<(), OrgStoreError> {
+    for (agent_id, entry) in store.iter() {
+        if entry.reports_to.is_empty() {
+            continue;
+        }
+        let cycle = || OrgStoreError::Cycle { agent_id: agent_id.clone(), reports_to: entry.reports_to.clone() };
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut current: &str = entry.reports_to.as_str();
+        let mut closed = true;
+        for _ in 0..MAX_CHAIN_DEPTH {
+            if current == agent_id.as_str() || !visited.insert(current) {
+                return Err(cycle());
+            }
+            match store.get(current) {
+                Some(next) if !next.reports_to.is_empty() => current = next.reports_to.as_str(),
+                _ => {
+                    closed = false;
+                    break;
+                }
+            }
+        }
+        if closed {
+            return Err(cycle());
+        }
+    }
+    Ok(())
+}
+
+/// [`set_checked`] for a batch: every row is applied first, then every row
+/// that added an edge is walked (a batch can close a loop across several of
+/// its own rows), and finally the whole resulting stored graph is walked
+/// without mirror fallback ([`check_store_graph`]) — any cycle refuses the
+/// whole batch. Returns the number of rows whose value changed.
+fn set_all_checked(store: &mut OrgStore, home: &Path, entries: &[(String, OrgEntry)]) -> Result<usize, OrgStoreError> {
+    let mut changed = 0usize;
+    let mut new_edges: Vec<&str> = Vec::new();
+    for (agent_id, entry) in entries {
+        let agent_id = agent_id.trim();
+        if !crate::is_valid_agent_id(agent_id) {
+            return Err(OrgStoreError::InvalidAgentId(agent_id.to_string()));
+        }
+        if adds_edge(store, home, agent_id, entry) {
+            new_edges.push(agent_id);
+        }
+        if store.get(agent_id) != Some(entry) {
+            changed += 1;
+        }
+        store.set(agent_id.to_string(), entry.clone());
+    }
+    for agent_id in new_edges {
+        check_no_cycle(store, home, agent_id)?;
+    }
+    check_store_graph(store)?;
+    Ok(changed)
 }
 
 /// Atomic commit: write a sibling temp file, then rename over the target.
@@ -475,56 +983,169 @@ fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Record (or replace) one agent's authoritative placement.
+/// Record (or replace) one agent's authoritative placement, holding the
+/// global org lock (`org` — see [`OrgMutationGuard`] for the lock order).
 ///
 /// Returns `true` when the stored value actually changed. Callers are the
-/// *gated* writers only — MCP `create_agent` / `agent_update` / ephemeral
-/// spawn, the dashboard agent RPCs, template staging and pack install —
-/// each of which has already run its WP21 C4 authorization check.
-pub fn upsert(home: &Path, agent_id: &str, entry: OrgEntry) -> io::Result<bool> {
+/// *gated* writers only — MCP `create_agent` / ephemeral spawn, the
+/// dashboard agent RPCs, template staging, pack / kit / expert install and
+/// rollback — each of which has already run its WP21 C4 authorization
+/// check. Refuses an invalid id and an edge that would close a cycle.
+pub fn upsert(org: &OrgMutationGuard, agent_id: &str, entry: OrgEntry) -> io::Result<bool> {
     let agent_id = agent_id.trim().to_string();
     if agent_id.is_empty() {
         return Ok(false);
     }
-    mutate(home, move |store| {
-        let changed = store.get(&agent_id) != Some(&entry);
-        store.set(agent_id, entry);
-        changed
-    })
+    let home = org.home.clone();
+    Ok(mutate(&org.home, WriteMode::Lenient, move |store| set_checked(store, &home, &agent_id, entry))?)
 }
 
-/// Replace many entries in one locked write (seeding, `org sync`).
+/// Replace many entries in one locked write (seeding, migration). Every row
+/// that adds an edge is cycle-checked against the resulting tree, and the
+/// whole resulting stored graph is walked without mirror fallback (RM-027
+/// round 4) — a loop anywhere refuses the whole batch.
 ///
 /// Returns the number of entries whose value changed.
-pub fn upsert_many(home: &Path, entries: &[(String, OrgEntry)]) -> io::Result<usize> {
+pub fn upsert_many(org: &OrgMutationGuard, entries: &[(String, OrgEntry)]) -> io::Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
-    mutate(home, |store| {
-        let mut changed = 0usize;
-        for (agent_id, entry) in entries {
-            if store.get(agent_id) != Some(entry) {
-                changed += 1;
-            }
-            store.set(agent_id.clone(), entry.clone());
-        }
-        changed
-    })
+    let home = org.home.clone();
+    Ok(mutate(&org.home, WriteMode::Lenient, |store| set_all_checked(store, &home, entries))?)
 }
 
-/// Drop one agent's entry (removal / offboarding / ephemeral GC).
+/// Drop one agent's entry (removal / offboarding / ephemeral GC / rollback
+/// of a creation), holding the global org lock.
 ///
 /// Returns `true` when an entry was actually present. A no-op on a missing
 /// store — removing what was never recorded is success, not an error.
-pub fn remove(home: &Path, agent_id: &str) -> io::Result<bool> {
+pub fn remove(org: &OrgMutationGuard, agent_id: &str) -> io::Result<bool> {
     let agent_id = agent_id.trim().to_string();
     if agent_id.is_empty() {
         return Ok(false);
     }
-    if !store_exists(home) {
+    if !store_exists(&org.home) {
         return Ok(false);
     }
-    mutate(home, move |store| store.entries.remove(&agent_id).is_some())
+    Ok(mutate(&org.home, WriteMode::Lenient, move |store| Ok(store.entries.remove(&agent_id).is_some()))?)
+}
+
+// ── Staged agent creation (RM-027 round 4) ──────────────────────────────────
+
+/// Basename prefix of a creation's staging directory. Dot-prefixed, so the
+/// registry scan, [`scan_mirrors`] and every `is_internal_agent_dir` filter
+/// skip it: a half-built employee is never visible, and its `agent.toml`
+/// can never be read as a mirror.
+pub const AGENT_STAGING_PREFIX: &str = ".creating-";
+
+/// An agent directory being built **off to the side** of its final path.
+///
+/// # Why (RM-027 round 4)
+///
+/// Creation flows used to publish `agents/<id>/agent.toml` first and only
+/// then wait for the org lock to record the authority row — and when that
+/// wait or the write failed (a corrupt store, a cycle) they only warned and
+/// reported success. The employee was then governed by its own mirror
+/// forever (fail-open), and the cycle check never ran.
+///
+/// Now a creation takes the org lock at its start, builds the directory here
+/// (same parent as the target, so the publish is a same-filesystem
+/// `rename`), and calls [`Self::publish`] while still holding the lock: the
+/// authority row is validated and committed first, the directory renamed
+/// into place second. Any failure on the way — including an authority
+/// refusal — drops the staging directory (see `Drop`) and fails the whole
+/// creation; there is no mirror fallback.
+#[derive(Debug)]
+pub struct StagedAgentDir {
+    staging: PathBuf,
+    target: PathBuf,
+    agent_id: String,
+    published: bool,
+}
+
+impl StagedAgentDir {
+    /// Create an empty staging directory next to `target`, holding the org
+    /// lock (`org` — proof only). Refuses with `AlreadyExists` when `target`
+    /// is already taken.
+    pub fn create(org: &OrgMutationGuard, target: &Path, agent_id: &str) -> io::Result<Self> {
+        let _ = org;
+        let agent_id = agent_id.trim();
+        if !crate::is_valid_agent_id(agent_id) {
+            return Err(OrgStoreError::InvalidAgentId(agent_id.to_string()).into());
+        }
+        let parent = target
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "agent directory has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        if std::fs::symlink_metadata(target).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("agent '{agent_id}' already exists"),
+            ));
+        }
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let staging = parent.join(format!(
+            "{AGENT_STAGING_PREFIX}{agent_id}-{}-{nanos:x}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&staging)?;
+        Ok(Self { staging, target: target.to_path_buf(), agent_id: agent_id.to_string(), published: false })
+    }
+
+    /// Where to build the directory's contents.
+    pub fn path(&self) -> &Path {
+        &self.staging
+    }
+
+    /// The final directory [`Self::publish`] renames the staging dir to.
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    /// Inside the org lock: validate and commit the authority row (a lost
+    /// store records only this row, a corrupt / newer store and a cycle are
+    /// refused — [`upsert`]), then publish the directory by `rename`. On any
+    /// failure the row is put back as it was, the staging directory removed,
+    /// and the error returned — the employee never appears.
+    pub fn publish(mut self, org: &OrgMutationGuard, entry: OrgEntry) -> io::Result<PathBuf> {
+        if std::fs::symlink_metadata(&self.target).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("agent '{}' already exists", self.agent_id),
+            ));
+        }
+        let prior = load(org.home()).get(&self.agent_id).cloned();
+        upsert(org, &self.agent_id, entry)?;
+        if let Err(e) = std::fs::rename(&self.staging, &self.target) {
+            let rollback = match prior {
+                Some(p) => upsert(org, &self.agent_id, p).map(|_| ()),
+                None => remove(org, &self.agent_id).map(|_| ()),
+            };
+            if let Err(re) = rollback {
+                tracing::warn!(
+                    agent = %self.agent_id,
+                    error = %re,
+                    "could not roll back the org authority row after a failed agent publish"
+                );
+            }
+            return Err(e);
+        }
+        self.published = true;
+        Ok(self.target.clone())
+    }
+}
+
+impl Drop for StagedAgentDir {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.staging);
+        }
+    }
 }
 
 // ── Mirror scanning (seeding / sync / drift) ────────────────────────────────
@@ -561,6 +1182,11 @@ pub fn scan_mirrors(home: &Path) -> Vec<(String, OrgEntry)> {
             continue;
         };
         if dir_name.starts_with('_') || dir_name.starts_with('.') {
+            continue;
+        }
+        // Only directories that are valid agent ids can carry an authority
+        // row (the strict write-path parser refuses any other key).
+        if !crate::is_valid_agent_id(&dir_name) {
             continue;
         }
         if let Some(mirror) = read_mirror(&entry.path().join("agent.toml")) {
@@ -625,7 +1251,14 @@ pub fn seed_if_absent(home: &Path) -> io::Result<Option<usize>> {
         ensure_seeded_marker(home);
         return Ok(None);
     }
-    let imported = mutate(home, |store| store.len())?;
+    // Seeding is an authority write like any other: under the global org
+    // lock, re-checked once held (another process may have seeded first).
+    let _org = lock_org_mutations(home)?;
+    if store_exists(home) {
+        ensure_seeded_marker(home);
+        return Ok(None);
+    }
+    let imported = mutate(home, WriteMode::Lenient, |store| Ok(store.len()))?;
     Ok(Some(imported))
 }
 
@@ -644,12 +1277,29 @@ pub struct OrgSyncChange {
 ///
 /// `only` restricts the sync to a single agent id. `dry_run` computes the diff
 /// without writing. Returns the changes (empty ⇒ already in sync).
+///
+/// Runs inside the global org mutation lock ([`lock_org_mutations`]), so it
+/// cannot interleave with a dashboard / MCP org change. This is the one
+/// writer allowed to rebuild a lost or corrupt store from the mirrors — and
+/// only as a full rebuild (`only` is refused then: a one-agent rebuild would
+/// leave everyone else without an entry). A newer schema is never rebuilt.
 pub fn sync_from_mirrors(
     home: &Path,
     only: Option<&str>,
     dry_run: bool,
 ) -> io::Result<Vec<OrgSyncChange>> {
-    let store = load(home);
+    let _org_lock = lock_org_mutations(home)?;
+    let (store, rebuilding) = match load_for_write(home) {
+        Ok(store) => (store, false),
+        Err(OrgStoreError::Lost) | Err(OrgStoreError::Corrupt(_)) => (OrgStore::new(), true),
+        Err(e) => return Err(e.into()),
+    };
+    if rebuilding && only.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "org.toml 遺失或損壞，只能完整重建：請不要指定單一 AI 員工，直接執行 `duduclaw org sync`。",
+        ));
+    }
     let mirrors: Vec<(String, OrgEntry)> = scan_mirrors(home)
         .into_iter()
         .filter(|(id, _)| only.is_none_or(|want| want.trim() == id))
@@ -670,7 +1320,9 @@ pub fn sync_from_mirrors(
             .iter()
             .map(|c| (c.agent_id.clone(), c.after.clone()))
             .collect();
-        upsert_many(home, &to_write)?;
+        // Adopted mirrors are edge-adding writes too: a set of mirrors that
+        // forms a loop is refused as a whole (fix the agent.toml, re-run).
+        mutate(home, WriteMode::Rebuild, |store| set_all_checked(store, home, &to_write))?;
     }
     Ok(changes)
 }
@@ -681,6 +1333,16 @@ mod tests {
 
     fn home() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// A gated writer's single upsert: global org lock, then the write.
+    fn put(home: &Path, id: &str, entry: OrgEntry) -> io::Result<bool> {
+        with_org_lock(home, |org| upsert(org, id, entry))
+    }
+
+    /// A gated writer's single removal.
+    fn drop_entry(home: &Path, id: &str) -> io::Result<bool> {
+        with_org_lock(home, |org| remove(org, id))
     }
 
     fn write_agent(home: &Path, dir: &str, reports_to: &str, department: &str) {
@@ -709,9 +1371,9 @@ mod tests {
     #[test]
     fn upsert_then_load_round_trips_and_normalises() {
         let h = home();
-        assert!(upsert(h.path(), "sales-lead", OrgEntry::new("boss", "業務")).unwrap());
+        assert!(put(h.path(), "sales-lead", OrgEntry::new("boss", "業務")).unwrap());
         // "none" is the historical spelling for root — canonicalised to "".
-        assert!(upsert(h.path(), "boss", OrgEntry::new(" none ", "  ")).unwrap());
+        assert!(put(h.path(), "boss", OrgEntry::new(" none ", "  ")).unwrap());
 
         let store = load(h.path());
         assert_eq!(store.len(), 2);
@@ -730,7 +1392,9 @@ mod tests {
             })
         );
         // Idempotent: re-writing the same value reports "no change".
-        assert!(!upsert(h.path(), "sales-lead", OrgEntry::new("boss", "業務")).unwrap());
+        assert!(!put(h.path(), "sales-lead", OrgEntry::new("boss", "業務")).unwrap());
+        // What this module writes, the strict write-path parser accepts.
+        assert_eq!(load_for_write(h.path()).unwrap(), load(h.path()));
         // The file really is TOML with the documented shape.
         let raw = std::fs::read_to_string(org_store_path(h.path())).unwrap();
         assert!(raw.contains("schema = 1"));
@@ -740,65 +1404,382 @@ mod tests {
     #[test]
     fn remove_drops_the_entry_and_is_a_noop_when_absent() {
         let h = home();
-        upsert(h.path(), "eph-1", OrgEntry::new("boss", "")).unwrap();
-        assert!(remove(h.path(), "eph-1").unwrap());
-        assert!(!remove(h.path(), "eph-1").unwrap());
+        put(h.path(), "eph-1", OrgEntry::new("boss", "")).unwrap();
+        assert!(drop_entry(h.path(), "eph-1").unwrap());
+        assert!(!drop_entry(h.path(), "eph-1").unwrap());
         assert!(load(h.path()).get("eph-1").is_none());
         // Removing from a store that was never created must not create one.
         let fresh = home();
-        assert!(!remove(fresh.path(), "nobody").unwrap());
+        assert!(!drop_entry(fresh.path(), "nobody").unwrap());
         assert!(!store_exists(fresh.path()));
     }
 
     #[test]
     fn writes_commit_atomically_and_leave_no_temp_file() {
         let h = home();
-        upsert(h.path(), "a", OrgEntry::new("", "")).unwrap();
-        upsert(h.path(), "b", OrgEntry::new("a", "")).unwrap();
+        put(h.path(), "a", OrgEntry::new("", "")).unwrap();
+        put(h.path(), "b", OrgEntry::new("a", "")).unwrap();
         let tmp = org_store_path(h.path()).with_extension("toml.tmp");
         assert!(!tmp.exists(), "temp file must be renamed away");
         assert!(org_store_path(h.path()).is_file());
         assert_eq!(load(h.path()).len(), 2);
     }
 
+    /// RM-027 review: a corrupt file used to be "rebuilt" by the next upsert
+    /// from an empty store — wiping every other agent's entry. Reads stay
+    /// fail-safe; ordinary writes are refused with the bytes untouched; only
+    /// `org sync` rebuilds (keeping a `.corrupt` copy).
     #[test]
-    fn corrupt_file_is_fail_safe_on_read_and_backed_up_on_write() {
+    fn corrupt_file_is_fail_safe_on_read_refused_on_write_and_rebuilt_only_by_sync() {
         let h = home();
-        std::fs::create_dir_all(h.path()).unwrap();
-        std::fs::write(org_store_path(h.path()), "this is [not( toml").unwrap();
+        write_agent(h.path(), "boss", "", "經營");
+        write_agent(h.path(), "a", "boss", "業務");
+        seed_if_absent(h.path()).unwrap();
+        let corrupt = "this is [not( toml";
+        std::fs::write(org_store_path(h.path()), corrupt).unwrap();
         // Read: empty store, no panic — callers fall back to agent.toml.
         assert!(load(h.path()).is_empty());
-        // Write: rebuilds, but keeps the operator's bytes.
-        upsert(h.path(), "a", OrgEntry::new("boss", "")).unwrap();
-        assert_eq!(load(h.path()).len(), 1);
+        assert!(matches!(load_for_write(h.path()), Err(OrgStoreError::Corrupt(_))));
+        // Write: refused, nothing replaced.
+        assert!(put(h.path(), "a", OrgEntry::new("", "")).is_err());
+        assert!(drop_entry(h.path(), "a").is_err());
+        let guard = lock_org_mutations(h.path()).unwrap();
+        assert!(matches!(guard.upsert("a", OrgEntry::new("", "")), Err(OrgStoreError::Corrupt(_))));
+        drop(guard);
+        assert_eq!(std::fs::read_to_string(org_store_path(h.path())).unwrap(), corrupt);
+        // A one-agent sync cannot rebuild it (it would strand everyone else)…
+        assert!(sync_from_mirrors(h.path(), Some("a"), false).is_err());
+        assert_eq!(std::fs::read_to_string(org_store_path(h.path())).unwrap(), corrupt);
+        // …a full `org sync` does, and keeps the operator's bytes.
+        assert_eq!(sync_from_mirrors(h.path(), None, false).unwrap().len(), 2);
+        assert_eq!(load(h.path()).len(), 2);
         let backup = org_store_path(h.path()).with_extension("toml.corrupt");
-        assert!(backup.exists(), "corrupt original must be preserved");
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), corrupt, "corrupt original must be preserved");
     }
 
     #[test]
     fn future_schema_is_refused_rather_than_half_interpreted() {
         let h = home();
-        std::fs::write(
-            org_store_path(h.path()),
-            "schema = 99\n[agents.a]\nreports_to = \"boss\"\n",
-        )
-        .unwrap();
+        let newer = "schema = 99\n[agents.a]\nreports_to = \"boss\"\n";
+        std::fs::write(org_store_path(h.path()), newer).unwrap();
         assert!(load(h.path()).is_empty());
+        assert_eq!(load_for_write(h.path()), Err(OrgStoreError::UnsupportedSchema(99)));
+        // No writer — not even `org sync` — downgrades a newer file.
+        write_agent(h.path(), "a", "", "");
+        assert!(put(h.path(), "a", OrgEntry::new("", "")).is_err());
+        assert!(sync_from_mirrors(h.path(), None, false).is_err());
+        assert_eq!(std::fs::read_to_string(org_store_path(h.path())).unwrap(), newer);
+    }
+
+    #[test]
+    fn strict_load_tells_a_first_run_from_a_lost_store() {
+        let h = home();
+        write_agent(h.path(), "ceo", "", "");
+        // Never bootstrapped: an empty view (mirror fallback), not an error.
+        assert_eq!(load_for_write(h.path()), Ok(OrgStore::new()));
+        seed_if_absent(h.path()).unwrap();
+        assert_eq!(load_for_write(h.path()).unwrap().len(), 1);
+        // Bootstrapped, then deleted: refused for writers under the lock.
+        std::fs::remove_file(org_store_path(h.path())).unwrap();
+        assert_eq!(load_for_write(h.path()), Err(OrgStoreError::Lost));
+        let guard = lock_org_mutations(h.path()).unwrap();
+        assert_eq!(guard.upsert("ceo", OrgEntry::new("", "x")), Err(OrgStoreError::Lost));
+        assert!(!store_exists(h.path()), "a strict write must not recreate a lost store");
+        drop(guard);
+        // An unreadable path (a directory where the file should be).
+        let u = home();
+        std::fs::create_dir_all(org_store_path(u.path())).unwrap();
+        assert!(matches!(load_for_write(u.path()), Err(OrgStoreError::Unreadable(_))));
+    }
+
+    #[test]
+    fn the_org_mutation_lock_is_exclusive_and_sync_waits_for_it() {
+        let h = home();
+        write_agent(h.path(), "boss", "", "");
+        seed_if_absent(h.path()).unwrap();
+        write_agent(h.path(), "boss", "", "經營");
+        let guard = lock_org_mutations(h.path()).unwrap();
+        assert!(org_mutation_lock_path(h.path()).starts_with(h.path().join("locks")));
+        let path = h.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let syncer = std::thread::spawn(move || {
+            let changes = sync_from_mirrors(&path, None, false).unwrap();
+            tx.send(changes.len()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            "`org sync` must wait for the org mutation lock"
+        );
+        assert_eq!(load(h.path()).get("boss").unwrap().department, "");
+        // Committing inside the lock, then a rollback, both work.
+        assert!(guard.upsert("boss", OrgEntry::new("", "業務")).unwrap());
+        guard.restore("boss", Some(OrgEntry::new("", ""))).unwrap();
+        guard.upsert("tmp", OrgEntry::new("boss", "")).unwrap();
+        guard.restore("tmp", None).unwrap();
+        assert!(load(h.path()).get("tmp").is_none());
+        drop(guard);
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), 1);
+        syncer.join().unwrap();
+        assert_eq!(load(h.path()).get("boss").unwrap().department, "經營");
     }
 
     #[test]
     fn hostile_agent_ids_cannot_inject_toml_structure() {
         let h = home();
-        upsert(
-            h.path(),
-            "weird id\"]\n[agents.ceo",
-            OrgEntry::new("x\"\n[agents.root]\nreports_to = \"y", ""),
-        )
-        .unwrap();
-        let store = load(h.path());
+        // An id that is not an agent directory name is never written…
+        let e = put(h.path(), "weird id\"]\n[agents.ceo", OrgEntry::new("", "")).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        assert!(!store_exists(h.path()));
+        // …and a hostile *value* is escaped, never structure.
+        put(h.path(), "weird", OrgEntry::new("x\"\n[agents.root]\nreports_to = \"y", "")).unwrap();
+        let store = load_for_write(h.path()).unwrap();
         assert_eq!(store.len(), 1, "no extra table may appear: {store:?}");
         assert!(store.get("ceo").is_none());
         assert!(store.get("root").is_none());
+    }
+
+    /// RM-027 round 3, finding 3: the write path accepts exactly the shape
+    /// `serialize` produces. Every other shape is Corrupt (writes refused,
+    /// bytes untouched) — the tolerant reader would have defaulted or
+    /// skipped it and the next serialize would have dropped it silently.
+    #[test]
+    fn the_write_path_parser_is_strict_and_fails_closed() {
+        let cases: &[(&str, &str)] = &[
+            ("schema = \"x\"\n[agents.rep]\nreports_to = \"\"\ndepartment = \"\"\n", "string schema"),
+            ("[agents.rep]\nreports_to = \"\"\ndepartment = \"\"\n", "missing schema"),
+            ("schema = 0\n", "schema below 1"),
+            ("schema = 1\nother = 1\n", "unknown top-level key"),
+            ("schema = 1\nagents = 5\n", "agents not a table"),
+            ("schema = 1\n[agents]\nrep = \"boss\"\n", "row not a table"),
+            ("schema = 1\n[agents.rep]\nreports_to = \"boss\"\n", "missing department"),
+            ("schema = 1\n[agents.rep]\ndepartment = \"業務\"\n", "missing reports_to"),
+            ("schema = 1\n[agents.rep]\nreports_to = 7\ndepartment = \"\"\n", "non-string reports_to"),
+            ("schema = 1\n[agents.rep]\nreports_to = \"\"\ndepartment = [\"a\"]\n", "non-string department"),
+            ("schema = 1\n[agents.rep]\nreports_to = \"\"\ndepartment = \"\"\nrole = \"x\"\n", "unknown row key"),
+            ("schema = 1\n[agents.\"bad id\"]\nreports_to = \"\"\ndepartment = \"\"\n", "invalid agent id"),
+            ("schema = 1\n[agents.\" rep\"]\nreports_to = \"\"\ndepartment = \"\"\n", "untrimmed agent id"),
+        ];
+        for (content, why) in cases {
+            let h = home();
+            write_agent(h.path(), "rep", "", "");
+            std::fs::write(org_store_path(h.path()), content).unwrap();
+            assert!(
+                matches!(load_for_write(h.path()), Err(OrgStoreError::Corrupt(_))),
+                "{why}: {:?}",
+                load_for_write(h.path())
+            );
+            assert!(put(h.path(), "rep", OrgEntry::new("", "x")).is_err(), "{why}");
+            assert!(drop_entry(h.path(), "rep").is_err(), "{why}");
+            let guard = lock_org_mutations(h.path()).unwrap();
+            assert!(guard.upsert("rep", OrgEntry::new("", "x")).is_err(), "{why}");
+            drop(guard);
+            assert_eq!(std::fs::read_to_string(org_store_path(h.path())).unwrap(), *content, "{why}: bytes untouched");
+            // Display stays tolerant (never panics, never errors).
+            let _ = load(h.path());
+        }
+        // Explicit empty strings are the documented "none" and are accepted.
+        let h = home();
+        std::fs::write(
+            org_store_path(h.path()),
+            "schema = 1\n[agents.rep]\nreports_to = \"\"\ndepartment = \"\"\n",
+        )
+        .unwrap();
+        assert_eq!(load_for_write(h.path()).unwrap().get("rep"), Some(&OrgEntry::new("", "")));
+        // A strictly refused file is still rebuilt by `org sync` (with a copy).
+        let h = home();
+        write_agent(h.path(), "rep", "", "業務");
+        std::fs::write(org_store_path(h.path()), "schema = \"x\"\n").unwrap();
+        assert_eq!(sync_from_mirrors(h.path(), None, false).unwrap().len(), 1);
+        assert_eq!(load_for_write(h.path()).unwrap().get("rep").unwrap().department, "業務");
+        assert!(org_store_path(h.path()).with_extension("toml.corrupt").is_file());
+    }
+
+    /// RM-027 round 3, finding 1: every authority writer needs the global
+    /// org lock (a lenient `upsert` / `remove` waits for it like an org
+    /// change does), and every edge-adding write — a rollback restoring an
+    /// old edge included — walks the whole tree and refuses a cycle.
+    #[test]
+    fn every_writer_takes_the_org_lock_and_no_write_can_close_a_cycle() {
+        let h = home();
+        write_agent(h.path(), "ceo", "", "");
+        write_agent(h.path(), "a", "ceo", "");
+        write_agent(h.path(), "b", "ceo", "");
+        seed_if_absent(h.path()).unwrap();
+
+        // A lenient writer waits for a held org lock.
+        let held = lock_org_mutations(h.path()).unwrap();
+        let path = h.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            tx.send(put(&path, "newcomer", OrgEntry::new("ceo", "")).unwrap()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            "a gated upsert must wait for the org mutation lock"
+        );
+        assert!(load(h.path()).get("newcomer").is_none());
+
+        // Under the lock: A→B is applied; a "rollback" that restores B→A
+        // (expert replace, a creation rollback, …) is refused — by the
+        // lenient writer and by the guard's own restore alike.
+        assert!(held.upsert("a", OrgEntry::new("b", "")).unwrap());
+        let e = upsert(&held, "b", OrgEntry::new("a", "")).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        assert!(matches!(
+            held.restore("b", Some(OrgEntry::new("a", ""))),
+            Err(OrgStoreError::Cycle { .. })
+        ));
+        assert!(matches!(held.upsert("ceo", OrgEntry::new("b", "")), Err(OrgStoreError::Cycle { .. })));
+        assert!(matches!(held.upsert("ceo", OrgEntry::new("ceo", "")), Err(OrgStoreError::Cycle { .. })));
+        // A batch closing a loop across its own rows is refused as a whole.
+        let batch = vec![
+            ("ceo".to_string(), OrgEntry::new("x1", "")),
+            ("x1".to_string(), OrgEntry::new("ceo", "")),
+        ];
+        assert!(upsert_many(&held, &batch).is_err());
+        assert_eq!(load(h.path()).get("b"), Some(&OrgEntry::new("ceo", "")));
+        assert_eq!(load(h.path()).get("ceo"), Some(&OrgEntry::new("", "")));
+        assert!(load(h.path()).get("x1").is_none());
+        // A department-only write on an agent in the chain is not an edge.
+        assert!(held.upsert("b", OrgEntry::new("ceo", "業務")).unwrap());
+        drop(held);
+        writer.join().unwrap();
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+        assert_eq!(load(h.path()).get("newcomer").unwrap().reports_to, "ceo");
+
+        // `org sync` refuses to adopt mirrors that form a loop.
+        write_agent(h.path(), "ceo", "b", "");
+        let before = std::fs::read_to_string(org_store_path(h.path())).unwrap();
+        assert!(sync_from_mirrors(h.path(), None, false).is_err());
+        assert_eq!(std::fs::read_to_string(org_store_path(h.path())).unwrap(), before);
+    }
+
+    /// RM-027 round 4, finding 2: a rebuild from an empty store used to skip
+    /// the cycle check — `adds_edge` read the same mirror the batch adopted,
+    /// so every edge looked pre-existing. The whole resulting graph is now
+    /// walked without mirror fallback and a loop refuses the whole batch.
+    #[test]
+    fn a_rebuild_or_sync_of_cyclic_mirrors_is_refused_as_a_whole() {
+        // Corrupt store, mirrors A→B, B→A.
+        let h = home();
+        write_agent(h.path(), "ceo", "", "");
+        write_agent(h.path(), "a", "b", "");
+        write_agent(h.path(), "b", "a", "");
+        let corrupt = "this is [not( toml";
+        std::fs::write(org_store_path(h.path()), corrupt).unwrap();
+        std::fs::write(org_seeded_path(h.path()), "").unwrap();
+        let e = sync_from_mirrors(h.path(), None, false).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        assert_eq!(std::fs::read_to_string(org_store_path(h.path())).unwrap(), corrupt);
+
+        // Lost store (marker present, file gone), same cyclic mirrors.
+        let h = home();
+        write_agent(h.path(), "ceo", "", "");
+        write_agent(h.path(), "a", "b", "");
+        write_agent(h.path(), "b", "a", "");
+        std::fs::write(org_seeded_path(h.path()), "").unwrap();
+        assert!(store_lost(h.path()));
+        assert!(sync_from_mirrors(h.path(), None, false).is_err());
+        assert!(!store_exists(h.path()), "a refused rebuild must not create the store");
+
+        // Healthy store; a brand-new, never-registered pair of mirrors
+        // forms a loop among themselves — `org sync` refuses the batch.
+        let h = home();
+        write_agent(h.path(), "ceo", "", "");
+        seed_if_absent(h.path()).unwrap();
+        write_agent(h.path(), "x", "y", "");
+        write_agent(h.path(), "y", "x", "");
+        write_agent(h.path(), "z", "ceo", "業務");
+        let before = std::fs::read_to_string(org_store_path(h.path())).unwrap();
+        assert!(sync_from_mirrors(h.path(), None, false).is_err());
+        assert_eq!(std::fs::read_to_string(org_store_path(h.path())).unwrap(), before);
+        assert!(load(h.path()).get("z").is_none(), "the whole batch is refused");
+        // A longer loop (x→y→w→x) is refused too.
+        write_agent(h.path(), "y", "w", "");
+        write_agent(h.path(), "w", "x", "");
+        assert!(sync_from_mirrors(h.path(), None, false).is_err());
+        // Once the loop is broken, the sync adopts everything.
+        write_agent(h.path(), "x", "ceo", "");
+        assert_eq!(sync_from_mirrors(h.path(), None, false).unwrap().len(), 4);
+
+        // `upsert_many` gets the same whole-graph walk.
+        let guard = lock_org_mutations(h.path()).unwrap();
+        let batch = vec![
+            ("p".to_string(), OrgEntry::new("q", "")),
+            ("q".to_string(), OrgEntry::new("p", "")),
+        ];
+        assert!(upsert_many(&guard, &batch).is_err());
+        assert!(load(h.path()).get("p").is_none());
+    }
+
+    /// RM-027 round 4, finding 1: a staged creation is invisible until it
+    /// publishes, and an authority refusal removes it instead of leaving an
+    /// employee governed by its own mirror.
+    #[test]
+    fn a_staged_agent_publishes_only_after_its_authority_row_commits() {
+        let h = home();
+        write_agent(h.path(), "ceo", "", "");
+        seed_if_absent(h.path()).unwrap();
+        let target = h.path().join("agents").join("newbie");
+
+        // Success: invisible while staged, published with its row.
+        let org = lock_org_mutations(h.path()).unwrap();
+        let staged = StagedAgentDir::create(&org, &target, "newbie").unwrap();
+        std::fs::write(staged.path().join("agent.toml"), "[agent]\nname = \"newbie\"\nreports_to = \"ceo\"\n").unwrap();
+        assert!(!target.exists());
+        assert!(scan_mirrors(h.path()).iter().all(|(id, _)| id != "newbie"));
+        assert!(staged.path().file_name().unwrap().to_str().unwrap().starts_with(AGENT_STAGING_PREFIX));
+        assert_eq!(staged.publish(&org, OrgEntry::new("ceo", "")).unwrap(), target);
+        assert!(target.join("agent.toml").is_file());
+        assert_eq!(load(h.path()).get("newbie").unwrap().reports_to, "ceo");
+        // A taken name is refused up front.
+        assert_eq!(
+            StagedAgentDir::create(&org, &target, "newbie").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+
+        // Cycle: a stale row says `ceo` reports to `loop`; creating `loop`
+        // under `ceo` would close it — refused, no directory, no row.
+        org.upsert("ceo", OrgEntry::new("loop", "")).unwrap();
+        let looped = h.path().join("agents").join("loop");
+        let staged = StagedAgentDir::create(&org, &looped, "loop").unwrap();
+        let staging = staged.path().to_path_buf();
+        let e = staged.publish(&org, OrgEntry::new("ceo", "")).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        assert!(!looped.exists() && !staging.exists());
+        assert!(load(h.path()).get("loop").is_none());
+        org.upsert("ceo", OrgEntry::new("", "")).unwrap();
+
+        // Corrupt authority: refused, nothing published, bytes untouched.
+        std::fs::write(org_store_path(h.path()), "schema = \"x\"\n").unwrap();
+        let other = h.path().join("agents").join("other");
+        let staged = StagedAgentDir::create(&org, &other, "other").unwrap();
+        let staging = staged.path().to_path_buf();
+        assert!(staged.publish(&org, OrgEntry::new("ceo", "")).is_err());
+        assert!(!other.exists() && !staging.exists());
+        assert_eq!(std::fs::read_to_string(org_store_path(h.path())).unwrap(), "schema = \"x\"\n");
+
+        // Dropped without publishing (an aborted build): no trace left.
+        let staged = StagedAgentDir::create(&org, &other, "other").unwrap();
+        let staging = staged.path().to_path_buf();
+        drop(staged);
+        assert!(!staging.exists() && !other.exists());
+    }
+
+    /// RM-027 round 4, finding 2: the first-write bootstrap adopts every
+    /// mirror wholesale — a mirror cycle is refused, not promoted.
+    #[test]
+    fn bootstrap_refuses_mirrors_that_form_a_cycle() {
+        let h = home();
+        write_agent(h.path(), "a", "b", "");
+        write_agent(h.path(), "b", "a", "");
+        assert!(seed_if_absent(h.path()).is_err());
+        assert!(put(h.path(), "newcomer", OrgEntry::new("", "")).is_err());
+        assert!(!store_exists(h.path()));
+        assert!(!seeded_marker_exists(h.path()));
+        // The ordinary acyclic bootstrap is unaffected.
+        write_agent(h.path(), "b", "", "");
+        assert_eq!(seed_if_absent(h.path()).unwrap(), Some(2));
     }
 
     #[test]
@@ -831,7 +1812,7 @@ mod tests {
         write_agent(h.path(), "mkt-lead", "boss", "行銷");
         assert!(!store_exists(h.path()));
 
-        upsert(h.path(), "newcomer", OrgEntry::new("boss", "客服")).unwrap();
+        put(h.path(), "newcomer", OrgEntry::new("boss", "客服")).unwrap();
 
         let store = load(h.path());
         assert_eq!(store.len(), 4, "{store:?}");
@@ -965,7 +1946,7 @@ mod tests {
         std::fs::remove_file(org_store_path(h.path())).unwrap();
         assert!(store_lost(h.path()));
 
-        upsert(h.path(), "helper", OrgEntry::new("sales-rep", "")).unwrap();
+        put(h.path(), "helper", OrgEntry::new("sales-rep", "")).unwrap();
 
         let store = load(h.path());
         assert_eq!(
@@ -987,7 +1968,7 @@ mod tests {
         assert!(!seeded_marker_exists(h.path()));
 
         // No marker ⇒ genuine first run ⇒ full import (unchanged behaviour).
-        upsert(h.path(), "helper", OrgEntry::new("ceo", "")).unwrap();
+        put(h.path(), "helper", OrgEntry::new("ceo", "")).unwrap();
         assert_eq!(load(h.path()).len(), 3);
 
         // Now simulate the loss, then the operator's explicit rebuild.
@@ -1042,7 +2023,7 @@ mod tests {
             .map(|i| {
                 let p = path.clone();
                 std::thread::spawn(move || {
-                    upsert(&p, &format!("agent-{i}"), OrgEntry::new("boss", "業務")).unwrap()
+                    put(&p, &format!("agent-{i}"), OrgEntry::new("boss", "業務")).unwrap()
                 })
             })
             .collect();

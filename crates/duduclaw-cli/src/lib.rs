@@ -3720,6 +3720,10 @@ enum ServiceCommands {
     /// Show service status
     Status,
 
+    /// macOS: move this install into the signed `DuDuClaw Gateway.app`
+    /// (verified like an update), then point the CLI path and LaunchAgent at it
+    MigrateBundle,
+
     /// Show service logs
     Logs {
         /// Number of lines to show
@@ -5656,6 +5660,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             ServiceCommands::Status => {
                 service::handle_service(service::ServiceAction::Status).await
             }
+            ServiceCommands::MigrateBundle => {
+                service::handle_service(service::ServiceAction::MigrateBundle).await
+            }
             ServiceCommands::Logs { lines } => {
                 service::handle_service(service::ServiceAction::Logs { lines }).await
             }
@@ -6577,14 +6584,17 @@ async fn cmd_hook_agent_file_guard(
     };
 
     // Claude Code PreToolUse envelope shapes:
-    //   Write / Edit / MultiEdit → tool_input.file_path
-    //   Bash                     → tool_input.command
+    //   Write / Edit / MultiEdit / Read → tool_input.file_path
+    //   Bash                            → tool_input.command
     let tool_name = envelope
         .get("tool_name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    if !matches!(tool_name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "Bash") {
+    // `Read` is in the installed matcher and judged by the credential /
+    // private-state read rule in `agent_file_guard_decision`; it must not be
+    // dropped here.
+    if !matches!(tool_name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "Read" | "Bash") {
         return Ok(());
     }
     let cwd = envelope
@@ -8858,7 +8868,9 @@ max_active_skills = 5
     // directory reusing a previously-removed agent's name would otherwise
     // inherit that agent's stale store entry and quietly acquire a supervisor.
     if let Some(entry) = duduclaw_core::org_store::read_mirror(&agent_toml_path) {
-        if let Err(e) = duduclaw_core::org_store::upsert(&home, &agent_name, entry) {
+        if let Err(e) = duduclaw_core::org_store::with_org_lock(&home, |org| {
+            duduclaw_core::org_store::upsert(org, &agent_name, entry)
+        }) {
             tracing::warn!(agent = %agent_name, error = %e, "org.toml upsert failed during onboard");
         }
     }
@@ -11271,8 +11283,10 @@ pub(crate) async fn scaffold_planned_agent_dir(
             .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
         file.write_all(bytes).map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     }
-    duduclaw_core::org_store::upsert(home, &s.name, duduclaw_core::OrgEntry::new(&s.reports_to, ""))
-        .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+    duduclaw_core::org_store::with_org_lock(home, |org| {
+        duduclaw_core::org_store::upsert(org, &s.name, duduclaw_core::OrgEntry::new(&s.reports_to, ""))
+    })
+    .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     Ok(agent_dir)
 }
 
@@ -11391,11 +11405,10 @@ pub(crate) async fn scaffold_agent_dir(
     // Scaffolds are department-less; `pack install` records its department
     // right after it patches it in. Best-effort: on failure the agent simply
     // has no record, and the fallback rule keeps its `agent.toml` governing it.
-    if let Err(e) = duduclaw_core::org_store::upsert(
-        home,
-        agent_name,
-        duduclaw_core::OrgEntry::new(reports_to, ""),
-    ) {
+    // Under the global org lock like every authority write (RM-027 round 3).
+    if let Err(e) = duduclaw_core::org_store::with_org_lock(home, |org| {
+        duduclaw_core::org_store::upsert(org, agent_name, duduclaw_core::OrgEntry::new(reports_to, ""))
+    }) {
         tracing::warn!(agent = %agent_name, error = %e, "org.toml upsert failed while scaffolding agent");
     }
 
@@ -13723,8 +13736,10 @@ mod org_authority_tests {
         // And the follow-on state: a gated write recreates the file holding
         // only its own entry (it must NOT re-import the mirrors), which is
         // still a degradation and must still be reported.
-        duduclaw_core::org_store::upsert(home, "helper", duduclaw_core::OrgEntry::new("boss", ""))
-            .unwrap();
+        duduclaw_core::org_store::with_org_lock(home, |org| {
+            duduclaw_core::org_store::upsert(org, "helper", duduclaw_core::OrgEntry::new("boss", ""))
+        })
+        .unwrap();
         let store = duduclaw_core::org_store::load(home);
         assert_eq!(store.len(), 1, "mirrors must not be re-imported: {store:?}");
         let (_, status, detail) = org_authority_check(home);
@@ -15357,6 +15372,21 @@ mod credential_read_lane_tests {
             &duduclaw_core::HookCaller::Agent("tester".into())).unwrap();
         assert!(!decision.is_allowed());
     }
+
+    #[test]
+    fn native_read_cannot_read_installation_key_or_relay_state() {
+        let home = std::path::Path::new("/tmp/credential-read-lane-test");
+        for rel in ["state/installation.key", "state/mfa-relay.json"] {
+            let envelope = serde_json::json!({"tool_input":{"file_path":home.join(rel)}});
+            let decision = agent_file_guard_decision("Read", &envelope, home,
+                &duduclaw_core::HookCaller::Agent("tester".into())).unwrap();
+            assert!(!decision.is_allowed(), "{rel}");
+        }
+        let relative = serde_json::json!({"cwd": home.join("agents/tester"),
+            "tool_input":{"file_path":"../../state/installation.key"}});
+        assert!(!agent_file_guard_decision("Read", &relative, home,
+            &duduclaw_core::HookCaller::Agent("tester".into())).unwrap().is_allowed());
+    }
 }
 
 fn scaffold_agent_toml(s: &AgentScaffold) -> String {
@@ -15372,6 +15402,8 @@ fn scaffold_agent_toml(s: &AgentScaffold) -> String {
     };
 
     let preferred = model_preferred.as_deref().unwrap_or("claude-sonnet-4-6");
+    // v1.81 (S2): only `main` may create employees by default.
+    let can_create_agents = duduclaw_core::agent_toml::default_can_create_agents(Some(role_str));
 
     // agent.toml
     format!(
@@ -15408,7 +15440,7 @@ warn_threshold_percent = 80
 hard_stop = true
 
 [permissions]
-can_create_agents = true
+can_create_agents = {can_create_agents}
 can_send_cross_agent = true
 can_modify_own_skills = true
 can_modify_own_soul = false

@@ -389,6 +389,176 @@ async fn approval_sinks_mask_display_and_refuse_nested_credentials() {
     assert_eq!(b.get(&id).await.unwrap().unwrap().payload, rec.payload);
 }
 
+/// Move a row's `created_at` `secs` into the past (TTL tests).
+async fn backdate(b: &ApprovalBroker, id: &ApprovalId, secs: i64) {
+    let at = (Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339();
+    b.store
+        .conn
+        .lock()
+        .await
+        .execute("UPDATE approvals SET created_at=?1 WHERE id=?2", rusqlite::params![at, id.as_str()])
+        .unwrap();
+}
+
+/// RM-027 round 3, finding 5: the decision lease is exclusive, keeps the TTL
+/// sweep / plain deciders / `withdraw` off the row, cannot be taken or
+/// renewed past the TTL, and records a decision whose effect landed inside
+/// it even when the TTL passed meanwhile.
+#[tokio::test(flavor = "current_thread")]
+async fn a_decision_lease_holds_off_the_ttl_sweep_and_other_deciders() {
+    let b = broker();
+    let id = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
+    let lease = b.take_decision_lease(&id, 30).await.unwrap().expect("a live pending row can be leased");
+    assert!(b.take_decision_lease(&id, 30).await.unwrap().is_none(), "the lease is exclusive");
+    assert!(b.decide(&id, false, "someone").await.is_err(), "a plain decider must not race the holder");
+    assert!(!b.withdraw(&id, "system:withdraw").await.unwrap());
+
+    // The TTL passes while the lease holds the row: the sweep leaves it alone…
+    backdate(&b, &id, 600).await;
+    assert_eq!(b.expire_stale().await.unwrap(), 0);
+    assert_eq!(b.poll(&id).await.unwrap(), ApprovalStatus::Pending);
+    // …the holder may not start applying past the TTL (renew refuses)…
+    assert!(!b.renew_decision_lease(&id, &lease, 30).await.unwrap());
+    // …but an outcome that landed inside the lease is recorded.
+    b.decide_with_lease(&id, &lease, true, "dashboard:admin").await.unwrap();
+    assert_eq!(b.get(&id).await.unwrap().unwrap().status, ApprovalStatus::Approved);
+    assert!(b.take_decision_lease(&id, 30).await.unwrap().is_none(), "a decided row cannot be leased");
+
+    // An expired row cannot be leased at all.
+    let late = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
+    backdate(&b, &late, 600).await;
+    assert!(b.take_decision_lease(&late, 30).await.unwrap().is_none());
+
+    // A released lease frees the row (the sweep expires it) and cannot decide.
+    let freed = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
+    let held = b.take_decision_lease(&freed, 30).await.unwrap().unwrap();
+    assert!(b.renew_decision_lease(&freed, &held, 30).await.unwrap(), "a live lease inside the TTL renews");
+    b.release_decision_lease(&freed, &held).await;
+    backdate(&b, &freed, 600).await;
+    assert_eq!(b.expire_stale().await.unwrap(), 2);
+    assert_eq!(b.get(&freed).await.unwrap().unwrap().status, ApprovalStatus::Expired);
+    assert!(b.decide_with_lease(&freed, &held, true, "x").await.is_err());
+}
+
+/// RM-027 round 4, finding 3: a lease renewed once lapses during a long
+/// internal wait (an `agent.toml` lock) and the sweep expires the card under
+/// a commit that is still landing. The keeper renews it for the whole
+/// decision — after `mark_committed` even past the TTL — so the terminal
+/// decision is recorded under it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_kept_lease_outlives_its_length_and_the_ttl_once_committed() {
+    let b = broker();
+    // Control: a 1 s lease left alone lapses and the sweep takes the row.
+    let bare = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
+    let bare_lease = b.take_decision_lease(&bare, 1).await.unwrap().unwrap();
+    backdate(&b, &bare, 600).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert_eq!(b.expire_stale().await.unwrap(), 1);
+    assert!(b.decide_with_lease(&bare, &bare_lease, true, "x").await.is_err());
+
+    // Kept and committed: alive well past its 1 s length and past the TTL.
+    let id = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
+    let lease = b.take_decision_lease(&id, 1).await.unwrap().unwrap();
+    let keeper = b.keep_decision_lease(&id, &lease, 1, std::time::Duration::from_secs(60));
+    keeper.mark_committed();
+    backdate(&b, &id, 600).await;
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    assert!(!keeper.lost());
+    assert_eq!(b.expire_stale().await.unwrap(), 0, "the sweep must stay off a kept lease");
+    assert_eq!(b.poll(&id).await.unwrap(), ApprovalStatus::Pending);
+    b.decide_with_lease(&id, &lease, true, "dashboard:admin").await.unwrap();
+    drop(keeper);
+    assert_eq!(b.get(&id).await.unwrap().unwrap().status, ApprovalStatus::Approved);
+
+    // Kept but NOT committed: the in-TTL renewal refuses once the TTL
+    // passed — the keeper reports the loss, the lease lapses, the sweep
+    // expires the row (nothing may be committed under it any more).
+    let early = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
+    let early_lease = b.take_decision_lease(&early, 1).await.unwrap().unwrap();
+    let keeper = b.keep_decision_lease(&early, &early_lease, 1, std::time::Duration::from_secs(60));
+    backdate(&b, &early, 600).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+    assert!(keeper.lost());
+    assert!(!b.renew_decision_lease(&early, &early_lease, 1).await.unwrap());
+    assert_eq!(b.expire_stale().await.unwrap(), 1);
+    drop(keeper);
+}
+
+/// RM-027 round 5, finding 1: after `mark_committed` the keeper used to
+/// extend the lease forever, so a holder stuck after its commit kept the
+/// card pending (and `await_decision` waiting) indefinitely. A committed
+/// lease now lives at most `committed_max`: it is held up to the cap, then
+/// the keeper stops (`expired`), the lease lapses, the TTL sweep can expire
+/// the row and a recovery can take a lease of its own.
+#[tokio::test(flavor = "current_thread")]
+async fn committed_lease_has_max_lifetime() {
+    let b = broker();
+    let id = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
+    let lease = b.take_decision_lease(&id, 1).await.unwrap().unwrap();
+    let keeper = b.keep_decision_lease(&id, &lease, 1, std::time::Duration::from_millis(1500));
+    keeper.mark_committed();
+    // Past the TTL, so only the lease keeps the row pending.
+    backdate(&b, &id, 600).await;
+
+    // Inside the cap: still held (past its 1 s length).
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(!keeper.expired());
+    assert_eq!(b.expire_stale().await.unwrap(), 0, "held inside the committed lifetime");
+
+    // Past the cap (+ the last ≤ 1 s grant + a tick): stopped and lapsed.
+    tokio::time::sleep(std::time::Duration::from_millis(2600)).await;
+    assert!(keeper.expired(), "the keeper must stop at the committed cap");
+    assert!(!b.extend_decision_lease(&id, &lease, 1).await.unwrap(), "the lease lapsed");
+    assert!(b.decide_with_lease(&id, &lease, true, "x").await.is_err());
+    // The row is free again: the sweep records the honest TTL outcome.
+    assert_eq!(b.expire_stale().await.unwrap(), 1);
+    assert_eq!(b.get(&id).await.unwrap().unwrap().status, ApprovalStatus::Expired);
+    drop(keeper);
+
+    // Inside the TTL, a recovery can take its own lease once the cap ran out.
+    let live = b.request("a", "org_change", "s", json!({}), 3600).await.unwrap();
+    let first = b.take_decision_lease(&live, 1).await.unwrap().unwrap();
+    let keeper = b.keep_decision_lease(&live, &first, 1, std::time::Duration::from_millis(500));
+    keeper.mark_committed();
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(b.take_decision_lease(&live, 1).await.unwrap().is_none(), "still held right at the cap");
+    tokio::time::sleep(std::time::Duration::from_millis(2400)).await;
+    assert!(keeper.expired());
+    let recovery = b.take_decision_lease(&live, 30).await.unwrap().expect("a recovery takes its own lease after the cap");
+    b.decide_with_lease(&live, &recovery, true, "dashboard:admin").await.unwrap();
+    drop(keeper);
+}
+
+/// RM-027 round 4, finding 3: `await_decision` past the deadline used to
+/// return `Expired` even when its expiry UPDATE affected no row (a live
+/// lease held it — its holder was committing an approval). It now re-reads
+/// the authoritative status and keeps waiting for the holder.
+#[tokio::test(flavor = "current_thread")]
+async fn await_decision_does_not_report_expired_under_a_live_lease() {
+    let b = broker();
+    let id = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
+    let lease = b.take_decision_lease(&id, 30).await.unwrap().unwrap();
+    backdate(&b, &id, 600).await;
+    let waiter = {
+        let b = b.clone();
+        let id = id.clone();
+        tokio::spawn(async move { b.await_decision(&id, std::time::Duration::from_millis(50)).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(!waiter.is_finished(), "a row held by a live lease is not expired");
+    b.decide_with_lease(&id, &lease, true, "dashboard:admin").await.unwrap();
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), waiter).await.unwrap().unwrap().unwrap();
+    assert_eq!(status, ApprovalStatus::Approved);
+
+    // Without a lease the expiry lands and is reported.
+    let lone = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
+    backdate(&b, &lone, 600).await;
+    assert_eq!(
+        b.await_decision(&lone, std::time::Duration::from_millis(50)).await.unwrap(),
+        ApprovalStatus::Expired
+    );
+}
+
 #[tokio::test]
 async fn structural_payload_fields_and_context_only_values_keep_exact_authority() {
     let b = broker();

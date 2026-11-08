@@ -51,6 +51,7 @@ import { parseDiscoveryApproval, type DiscoveryApprovalSummary } from './discove
 import { parseKnowledgeQuarantine, type KnowledgeQuarantineView } from './knowledge-quarantine';
 import { WorkflowActivationFacts } from './WorkflowActivationFacts';
 import { AgentFileChangeFacts } from './AgentFileChangeFacts';
+import { OrgChangeFacts } from './OrgChangeFacts';
 
 // ── Local mds-token property primitives (replace the Calm Glass PropertyRow) ──
 
@@ -99,6 +100,7 @@ const DESCRIBED_KINDS = new Set([
   'responsibility_operator_change',
   'computer_workspace_admin',
   'agent_file_change',
+  'org_change',
 ]);
 
 /** D1/D2: `true` when there is an actual narrative or risk point to show —
@@ -570,6 +572,9 @@ function GenericApprovalView({
 
   const [spotCheck, setSpotCheck] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  // org_change: a request made against an org position that has since moved
+  // can only be rejected.
+  const [orgStale, setOrgStale] = useState(false);
 
   const risk = approvalRisk(approval.kind, approval.payload);
   const facts = extractPlanFacts(approval.payload);
@@ -659,6 +664,8 @@ function GenericApprovalView({
       {approval.kind === 'workflow_activation' && <WorkflowActivationFacts approval={approval} />}
 
       {approval.kind === 'agent_file_change' && <AgentFileChangeFacts approval={approval} agentName={agentName} />}
+
+      {approval.kind === 'org_change' && <OrgChangeFacts approval={approval} agentName={agentName} onStale={setOrgStale} />}
 
       {reviewLink && <div className="space-y-1 rounded-lg border p-3">
         {isAdminReviewer ? (
@@ -781,7 +788,7 @@ function GenericApprovalView({
       </div>
       {/* Keep decisions visible while the evidence scrolls. */}
       <div data-testid="approval-actions" className="z-10 flex shrink-0 items-center gap-2 border-t border-surface-border bg-surface py-3">
-        <Button variant="brand" onClick={requestApprove} className="flex-1">
+        <Button variant="brand" onClick={requestApprove} disabled={approval.kind === 'org_change' && orgStale} className="flex-1">
           {t('inbox.approval.approve')}
         </Button>
         <Button variant="destructive" onClick={onReject} className="flex-1">

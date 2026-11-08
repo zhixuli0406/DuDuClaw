@@ -56,7 +56,10 @@ class ReleaseProGateTests(unittest.TestCase):
         path.chmod(0o755)
 
     def run_bash(self, script: str, **env):
-        merged = dict(os.environ, HOME=str(self.home), PATH=f"{self.bin}:/usr/bin:/bin", **env)
+        # Manuals preflight is covered in test_release_manuals.py.
+        merged = dict(os.environ, HOME=str(self.home), PATH=f"{self.bin}:/usr/bin:/bin",
+                      DUDUCLAW_SKIP_MANUALS="1")
+        merged.update(env)
         return subprocess.run(
             ["bash", "-euo", "pipefail", "-c", script + '\nprintf "REACHED_NEXT_STAGE PRO_RELEASE=%s\\n" "$PRO_RELEASE"\n'],
             cwd=self.root, env=merged, capture_output=True, text=True,

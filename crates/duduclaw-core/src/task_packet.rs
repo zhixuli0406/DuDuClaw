@@ -370,19 +370,24 @@ impl<'de> Deserialize<'de> for OutputFormat {
 
 /// Tool guidance (Anthropic's third element).
 ///
-/// **NOT WIRED — human-readable only (as of the 2026-09 review).** Both lists
-/// are carried, validated and stored, and nothing reads them: they reach no
-/// spawn, no `--allowedTools` / `--disallowedTools`, and
-/// `render_packet_for_prompt` does not even render them, so a planner writing
-/// `tool_scope.denied = ["mail_send"]` gets **no effect at all**. A role
-/// member's real tool envelope comes from the employee's `[capabilities]` via
-/// `ephemeral::check_tool_subset`, which this field does not participate in.
+/// **Narrow-only (RM-103 S3).** When the planner hands a packet to an
+/// executor, the gateway composer (`team_composer::narrow_tools`) applies it
+/// to the executor's tool subset — which is itself derived from the
+/// employee's `[capabilities]`, so this field can only ever take tools away:
 ///
-/// This doc previously claimed "the composer turns them into the runtime's
-/// `--allowedTools` / `--disallowedTools`, so a denial here is a real denial,
-/// not a request". That was false in every build that has shipped, and an
-/// operator reading it would have believed a boundary existed where none did —
-/// the one documentation failure mode worse than silence.
+/// * non-empty `allowed` ⇒ the executor gets only those tools (plus the
+///   `team_handoff` channel unless `denied` names it). Any entry the employee
+///   does not hold refuses that delegation outright and writes a
+///   `team_tool_scope_escalation` audit row — it is never silently dropped;
+/// * `denied` is removed from the subset **and** appended to the member
+///   scaffold's `[capabilities] denied_tools`, so it also blocks tools a
+///   wildcard allowlist entry (`mcp__duduclaw__*`) would otherwise cover.
+///
+/// The member's envelope is then still checked by
+/// `ephemeral::check_tool_subset_with_intrinsics` against the employee — a
+/// packet cannot widen anything.
+///
+/// Before RM-103 this field was carried and validated but read by nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolScope {

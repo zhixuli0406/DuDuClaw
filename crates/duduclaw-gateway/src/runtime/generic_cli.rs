@@ -577,6 +577,8 @@ impl GenericCliRuntime {
             cmd.env_remove(duduclaw_core::ENV_UPSTREAM_UNKNOWN);
             cmd.env_remove(duduclaw_core::ENV_ON_BEHALF_OF);
             cmd.env_remove(crate::on_behalf_of::context::ENV_CONTEXT);
+            // RM-124: only the scoped WebChat origin counts (re-added below).
+            cmd.env_remove(duduclaw_core::ENV_ORIGIN_SESSION);
             for (k, v) in crate::memory_provenance::turn_source_env_pairs() {
                 cmd.env(k, v);
             }
@@ -606,6 +608,18 @@ impl GenericCliRuntime {
                 error: "utility calls refused: no verified tool-free mode".into(),
             });
         }
+        // RM-103 S3 (Daybreak #2): these CLIs have no confinement flag at all,
+        // so a native write restriction is enforceable only by the opt-in
+        // native OS sandbox (forced read-only) and a native shell restriction
+        // never is — refused, not warned about.
+        let sandbox_view = super::coarse_native_caps(
+            context.capabilities.as_ref(),
+            id,
+            &context.agent_id,
+            context.capabilities.as_ref().is_some_and(|c| c.native_sandbox),
+        )
+        .map_err(|error| GenericCliError::Spawn { runtime: id, error })?;
+        let sandbox_caps = sandbox_view.as_ref().or(context.capabilities.as_ref());
         if duduclaw_core::egress_guard::effective_mode(&context.home_dir, context.agent_dir.as_deref())
             >= duduclaw_core::egress_guard::Mode::Ask
         {
@@ -663,7 +677,7 @@ impl GenericCliRuntime {
         // before spawn, and its Err must abort the spawn.
         super::apply_native_sandbox(
             &mut cmd,
-            context.capabilities.as_ref(),
+            sandbox_caps,
             context.agent_dir.as_deref(),
             id,
         )
@@ -1147,7 +1161,8 @@ mod tests {
                 .env_remove(duduclaw_core::ENV_TRUST_TURN_ID)
                 .env_remove(duduclaw_core::ENV_UPSTREAM_UNKNOWN)
                 .env_remove(duduclaw_core::ENV_ON_BEHALF_OF)
-                .env_remove(crate::on_behalf_of::context::ENV_CONTEXT);
+                .env_remove(crate::on_behalf_of::context::ENV_CONTEXT)
+                .env_remove(duduclaw_core::ENV_ORIGIN_SESSION);
             for (name, _) in std::env::vars_os() {
                 if name.to_string_lossy().to_ascii_uppercase().starts_with("DUDUCLAW_DELEGATION_") {
                     expected.env_remove(name);
@@ -1156,6 +1171,36 @@ mod tests {
             assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected), "{id}");
             assert_eq!(duduclaw_core::execution_gate::local_command_roundtrip(command).await.unwrap(), before);
         }
+    }
+
+    /// RM-103 S3 (Daybreak #2): a native write or shell restriction these
+    /// CLIs cannot enforce refuses the spawn (the vendor binary never runs);
+    /// an unconstrained config spawns exactly as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unenforceable_native_tool_constraints_refuse_the_spawn() {
+        use duduclaw_core::types::CapabilitiesConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let bin = fake_bin(dir.path(), "copilot", &format!("touch '{}'\necho ok", marker.display()));
+        let rt = GenericCliRuntime::with_program(spec_for("copilot").unwrap(), bin.to_string_lossy());
+        let modify_ask: CapabilitiesConfig =
+            toml::from_str("action_rules = [{ effect = \"modify\", verdict = \"ask\" }]\n").unwrap();
+        let git_only = CapabilitiesConfig {
+            allowed_tools: vec!["Read".into(), "Write".into(), "Bash(git:*)".into()],
+            ..Default::default()
+        };
+        for caps in [modify_ask, git_only] {
+            let mut c = ctx(dir.path());
+            c.capabilities = Some(caps.clone());
+            let error = rt.execute("hi", &c).await.unwrap_err();
+            assert!(error.contains("cannot enforce"), "{error}");
+            assert!(!marker.exists(), "the CLI must not run: {caps:?}");
+        }
+        let mut c = ctx(dir.path());
+        c.capabilities = Some(CapabilitiesConfig::default());
+        assert_eq!(rt.execute("hi", &c).await.unwrap().content, "ok");
+        assert!(marker.exists(), "unconstrained spawns are unchanged");
     }
 
     /// P2-B N4: the turn and run in scope reach the CLI's env, which its

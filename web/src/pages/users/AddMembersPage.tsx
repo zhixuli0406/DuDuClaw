@@ -4,6 +4,7 @@ import { Plus, Trash2, UserPlus } from 'lucide-react';
 import { api, type UserInfo, type UserInviteResult } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
 import { formatError } from '@/lib/toast';
+import { dashboardBaseUrl } from '@/lib/dashboard-base';
 import {
   ActorAvatar, Badge, BreadcrumbHeader, Button, Card, CardContent, CardDescription,
   CardHeader, CardTitle, Checkbox, Dialog, DialogContent, DialogHeader, DialogTitle,
@@ -104,7 +105,7 @@ export function AddMembersPage({ onBack, onCreated }: { onBack: () => void; onCr
     setError('');
     try {
       const { results } = await api.users.createMembers({
-        public_url: window.location.origin,
+        public_url: dashboardBaseUrl(),
         locale: intl.locale,
         members: pending.map(member => ({
           display_name: member.display_name.trim(), email: member.email.trim(), role: member.role,

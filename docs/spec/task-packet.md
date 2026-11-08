@@ -28,7 +28,7 @@ So a packet carries decisions and *references*. Large content stays where it alr
 | `to_role` | same enum | ✔ | Recipient. Must differ from `from_role`. |
 | `objective` | string | ✔ | One sentence: what to do. Non-blank, ≤ 1000 chars. |
 | `output_format` | object, see below | ✔ | Expected shape of the product. |
-| `tool_scope` | `{allowed: string[], denied: string[]}` | — | **Not wired — human-readable only.** Carried and validated, read by nothing: it reaches no spawn and is not even rendered into a prompt, so a denial here has no effect. A role member's real tool envelope comes from the employee's `[capabilities]`. |
+| `tool_scope` | `{allowed: string[], denied: string[]}` | — | **Narrow-only (v1.81).** On a planner → executor packet the composer narrows the executor's tool subset (itself derived from the employee's `[capabilities]`): non-empty `allowed` keeps only those tools plus `team_handoff`, and naming a tool the employee does not hold refuses the delegation (`team_tool_scope_escalation` audit row); `denied` is removed and added to the member's `denied_tools`. It can never widen the envelope. |
 | `boundaries` | string[] | — | Explicitly what NOT to do. |
 | `constraints` | `{id, text}[]` | — | Enumerated constraints. ≤ 12 items, each `text` ≤ 200 chars, ids unique (case-insensitive). **Incompressible.** |
 | `audience` | string[] | — | Allowlist of role / channel ids this content may reach. ≤ 16 entries, each ≤ 64 chars. **Incompressible.** Empty means "no declared audience", which the composer reads as the enclosing task's audience — never "everyone". |

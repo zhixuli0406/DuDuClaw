@@ -105,7 +105,10 @@ async fn remove_preserves_org_store_entry() {
     write_offboardable_agent_toml(&home.path().join("agents").join(agent_id), agent_id);
 
     let entry = duduclaw_core::org_store::OrgEntry::new("root-lead", "銷售部");
-    duduclaw_core::org_store::upsert(home.path(), agent_id, entry.clone()).unwrap();
+    duduclaw_core::org_store::with_org_lock(home.path(), |org| {
+        duduclaw_core::org_store::upsert(org, agent_id, entry.clone())
+    })
+    .unwrap();
     assert!(
         duduclaw_core::org_store::load(home.path()).contains(agent_id),
         "fixture sanity: entry must exist before the call"
@@ -153,7 +156,10 @@ async fn archive_preserves_org_store_entry() {
     write_offboardable_agent_toml(&home.path().join("agents").join(agent_id), agent_id);
 
     let entry = duduclaw_core::org_store::OrgEntry::new("root-lead", "銷售部");
-    duduclaw_core::org_store::upsert(home.path(), agent_id, entry.clone()).unwrap();
+    duduclaw_core::org_store::with_org_lock(home.path(), |org| {
+        duduclaw_core::org_store::upsert(org, agent_id, entry.clone())
+    })
+    .unwrap();
 
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     let frame = handler

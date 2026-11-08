@@ -27,6 +27,15 @@
 //! fence already answers "whose data is this?". `tools/list` therefore always
 //! advertises all three.
 //!
+//! ## Directory trees (`code_map`, v1.81)
+//!
+//! [`vet_dir`] is the same fence for a directory (default: the employee's own
+//! directory, [`employee_dir`] — a role member's is its `.ephemeral/<id>`
+//! scaffold), and [`ContainedTree`] opens it descriptor-relatively from the
+//! trusted allowed root, then reads files under it, through a per-component
+//! no-follow descriptor walk that refuses symlinks, mount crossings (Linux:
+//! mount id, not just `st_dev`), non-regular and multiply-linked files.
+//!
 //! ## Audit
 //!
 //! Every call appends to `tool_calls.jsonl` with `path` / `table` /
@@ -137,6 +146,88 @@ fn configured_roots(home_dir: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+// ── Guarded filesystem calls (RM-155) ───────────────────────────────────────
+
+/// Whether `path` is in a macOS-protected (TCC) location on this Mac. Always
+/// `false` off macOS, where `EPERM` means something else entirely.
+fn tcc_protected(path: &Path) -> bool {
+    use duduclaw_gateway::macos_folder_access as folder_access;
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let Some(home) = folder_access::user_home() else {
+        return false;
+    };
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return false,
+        }
+    };
+    folder_access::is_tcc_protected(&absolute, &home)
+}
+
+/// Run one filesystem call for a data-file tool on a dedicated thread with a
+/// bounded wait.
+///
+/// After an update macOS asks again for folder access; until someone clicks
+/// Allow, a read in `~/Documents` (or iCloud, `/Volumes/*`…) fails with
+/// `EPERM` — or, while the consent prompt is on screen, blocks. Without this
+/// the tool call hung until the whole reply timed out. Now a protected-path
+/// `EPERM` names the macOS permission and the steps, a timeout says macOS is
+/// waiting for a click, and every other error keeps the caller's `generic`
+/// wording.
+fn guarded_fs<T, F>(
+    raw: &str,
+    path: &Path,
+    generic: impl FnOnce(&std::io::Error) -> String,
+    op: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(PathBuf) -> std::io::Result<T> + Send + 'static,
+{
+    guarded_fs_with(
+        raw,
+        path,
+        tcc_protected(path),
+        duduclaw_gateway::macos_folder_access::FILE_OP_TIMEOUT,
+        generic,
+        op,
+    )
+}
+
+/// [`guarded_fs`] with the protection verdict and the wait injected (tests).
+fn guarded_fs_with<T, F, G>(
+    raw: &str,
+    path: &Path,
+    protected: bool,
+    timeout: std::time::Duration,
+    generic: G,
+    op: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(PathBuf) -> std::io::Result<T> + Send + 'static,
+    G: FnOnce(&std::io::Error) -> String,
+{
+    use duduclaw_gateway::macos_folder_access::{self as folder_access, ProbeOutcome};
+    let owned = path.to_path_buf();
+    // Shared, bounded runner: one call in flight per path and a global cap,
+    // so repeated calls into a stuck consent prompt never pile up threads.
+    match folder_access::run_guarded(path, timeout, move || op(owned)) {
+        ProbeOutcome::Completed(Ok(value)) => Ok(value),
+        ProbeOutcome::Completed(Err(e)) => {
+            let fallback = generic(&e);
+            Err(folder_access::file_error_text(raw, &e, protected, &fallback))
+        }
+        ProbeOutcome::TimedOut => Err(folder_access::file_timeout_text(raw, protected, timeout)),
+        ProbeOutcome::Pending => Err(folder_access::file_pending_text(raw, protected)),
+    }
+}
+
 fn render_roots(roots: &[PathBuf]) -> String {
     roots
         .iter()
@@ -169,15 +260,27 @@ pub fn vet_path(raw: &str, home_dir: &Path, agent_id: &str) -> Result<PathBuf, S
     let roots = allowed_roots(home_dir, agent_id);
     // Canonicalize resolves symlinks (so a symlink pointing outside a root is
     // caught by the containment test below) and proves the file exists.
-    let real = candidate
-        .canonicalize()
-        .map_err(|e| format!("路徑「{raw}」無法讀取：{e}"))?;
+    let real = guarded_fs(
+        raw,
+        candidate,
+        |e| format!("路徑「{raw}」無法讀取：{e}"),
+        |p| p.canonicalize(),
+    )?;
 
     let contained = roots.iter().any(|root| {
+        // `real` is canonical, so a root that is already a lexical prefix of
+        // it is itself symlink-free there — no need to touch the root (which
+        // may be a protected folder still waiting on a macOS prompt).
+        if real.starts_with(root) {
+            return true;
+        }
         // Canonicalize the roots too — on macOS `/var` and `/tmp` are
         // themselves symlinks, so an uncanonicalized prefix test would reject
-        // legitimate paths on a developer machine.
-        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        // legitimate paths on a developer machine. Guarded: an unanswered
+        // prompt on one root must not hang the read of another.
+        let display = root.display().to_string();
+        let root = guarded_fs(&display, root, |e| e.to_string(), |p| p.canonicalize())
+            .unwrap_or_else(|_| root.clone());
         real.starts_with(&root)
     });
     if !contained {
@@ -187,11 +290,606 @@ pub fn vet_path(raw: &str, home_dir: &Path, agent_id: &str) -> Result<PathBuf, S
         ));
     }
 
-    let meta = std::fs::metadata(&real).map_err(|e| format!("路徑「{raw}」無法讀取：{e}"))?;
+    let meta = guarded_fs(
+        raw,
+        &real,
+        |e| format!("路徑「{raw}」無法讀取：{e}"),
+        |p| std::fs::metadata(p),
+    )?;
     if !meta.is_file() {
         return Err(format!("路徑「{raw}」不是一般檔案。"));
     }
     Ok(real)
+}
+
+// ── Directory fence + contained tree (v1.81, S1: `code_map`) ────────────────
+
+/// The own directory of the AI employee `agent_id`, or `None` when the id
+/// does not resolve to one (v1.81, S2).
+///
+/// - a role member / ephemeral (`eph-…`) resolves through
+///   `duduclaw_gateway::ephemeral::resolve_agent_dir` to its
+///   `<home>/agents/.ephemeral/<id>` scaffold (canonical, contained in the
+///   ephemeral namespace, with an `agent.toml`);
+/// - any other id must be a valid agent id with `<home>/agents/<id>/agent.toml`
+///   (`mcp_namespace::client_is_agent`).
+///
+/// `code_map`'s identity gate, its default root and its `tools/list` entry all
+/// read this one resolver, so "listed ⇒ callable".
+pub fn employee_dir(home_dir: &Path, agent_id: &str) -> Option<PathBuf> {
+    if duduclaw_gateway::ephemeral::is_ephemeral_id(agent_id) {
+        return duduclaw_gateway::ephemeral::resolve_agent_dir(home_dir, agent_id);
+    }
+    crate::mcp_namespace::client_is_agent(home_dir, agent_id)
+        .then(|| home_dir.join("agents").join(agent_id))
+}
+
+/// A directory [`vet_dir`] accepted, plus how [`ContainedTree::open`] must
+/// reach it: from the trusted allowed root `anchor`, one no-follow component
+/// at a time (`rel`), never leaving `anchor`'s mount.
+#[derive(Debug, Clone)]
+pub struct VettedDir {
+    /// Canonical directory to scan.
+    path: PathBuf,
+    /// Canonical allowed root the descriptor walk starts from: the trusted
+    /// `<home>/agents/` directory whenever the target is the employee's own
+    /// directory or below it (`rel` then starts with `<id>`, or with
+    /// `.ephemeral`, `<id>` for a role member), else the operator-declared
+    /// root that contains it.
+    anchor: PathBuf,
+    /// Normal components from `anchor` to `path`.
+    rel: Vec<String>,
+    /// Unix `(st_dev, st_ino)` of `path` as vetted: a directory replaced
+    /// between vetting and opening is refused.
+    identity: Option<(u64, u64)>,
+}
+
+impl VettedDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Resolve the directory `code_map` may scan for `agent_id`.
+///
+/// - an id that does not resolve to an employee directory ([`employee_dir`])
+///   is refused (fail closed);
+/// - an empty `raw` is the employee's own directory (`<home>/agents/<id>`, or
+///   a role member's `<home>/agents/.ephemeral/<id>`);
+/// - a relative `raw` resolves under that own directory (never the MCP
+///   server's working directory);
+/// - `..` is refused before canonicalization, like [`vet_path`];
+/// - the canonical directory must sit inside the own directory,
+///   `<home>/attachments` or an operator `[files] allowed_roots` entry.
+///
+/// The result names the trusted root [`ContainedTree::open`] walks from and
+/// the identity of the directory as vetted.
+pub fn vet_dir(raw: &str, home_dir: &Path, agent_id: &str) -> Result<VettedDir, String> {
+    let Some(own) = employee_dir(home_dir, agent_id) else {
+        return Err("無法辨識呼叫者是哪一位 AI 員工，沒有可掃描的目錄。".to_string());
+    };
+    let raw = raw.trim();
+    let candidate = if raw.is_empty() {
+        own.clone()
+    } else {
+        let p = Path::new(raw);
+        if p
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "目錄「{raw}」含有 `..`，不接受相對上層路徑，請改用完整路徑。"
+            ));
+        }
+        if p.is_absolute() { p.to_path_buf() } else { own.join(p) }
+    };
+    // Operator-trusted roots besides the own directory. The own directory's
+    // `attachments` is deliberately not one of them: it is reached through
+    // the own directory (and so through its mount check), never on its own.
+    let mut operator_roots = vec![home_dir.join("attachments")];
+    operator_roots.extend(configured_roots(home_dir));
+    let shown_roots = {
+        let mut r = vec![own.join("attachments"), own.clone()];
+        r.extend(operator_roots.iter().cloned());
+        r
+    };
+    let shown = if raw.is_empty() { candidate.display().to_string() } else { raw.to_string() };
+    let outside = || {
+        format!(
+            "目錄「{shown}」不在允許的目錄範圍內。允許的根目錄：{}。如需掃描其他位置，請在 config.toml 的 [files] allowed_roots 加入該目錄。",
+            render_roots(&shown_roots)
+        )
+    };
+    let real = candidate
+        .canonicalize()
+        .map_err(|e| format!("目錄「{shown}」無法讀取：{e}"))?;
+    let own_real = own
+        .canonicalize()
+        .map_err(|e| format!("目錄「{}」無法讀取：{e}", own.display()))?;
+    let anchor = if real.starts_with(&own_real) {
+        // The own directory or anything below it — for an employee
+        // `agents/<id>/…`, for a role member `agents/.ephemeral/<id>/…` — is
+        // always walked from the trusted `agents/` directory itself, so every
+        // component on the way (`.ephemeral`, `<id>`, then the sub-root) is
+        // opened no-follow and compared with the `agents/` mount. Anchoring
+        // at the own directory (or at `.ephemeral`) would make a bind-mounted
+        // own directory (or `.ephemeral`) the mount baseline (Daybreak Low).
+        let agents_real = home_dir
+            .join("agents")
+            .canonicalize()
+            .map_err(|e| format!("目錄「{}」無法讀取：{e}", home_dir.join("agents").display()))?;
+        if own_real == agents_real || !own_real.starts_with(&agents_real) {
+            return Err(outside());
+        }
+        agents_real
+    } else {
+        operator_roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .filter(|root| real.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .ok_or_else(outside)?
+    };
+    let meta = std::fs::metadata(&real).map_err(|e| format!("目錄「{shown}」無法讀取：{e}"))?;
+    if !meta.is_dir() {
+        return Err(format!("「{shown}」不是目錄。"));
+    }
+    let rel = real
+        .strip_prefix(&anchor)
+        .map_err(|_| outside())?
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(part) => part
+                .to_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("目錄「{shown}」的路徑不是 UTF-8。")),
+            _ => Err(outside()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    };
+    #[cfg(not(unix))]
+    let identity = None;
+    Ok(VettedDir { path: real, anchor, rel, identity })
+}
+
+/// Identity of the mount a descriptor lives on, for "did this walk cross a
+/// mount?" (v1.81, S1 review Low).
+///
+/// `st_dev` alone is not enough: a bind mount of another directory **on the
+/// same filesystem** has the same `st_dev` as the tree it is mounted into.
+/// On Linux the per-mount id (`statx` `STATX_MNT_ID`, or `mnt_id:` in
+/// `/proc/self/fdinfo/<fd>` on kernels before 5.8) tells them apart. Other
+/// Unixes have no such id; there the walk relies on `st_dev` plus the
+/// per-component `O_NOFOLLOW` open.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountId {
+    /// The platform has no per-mount id (macOS / BSD): `st_dev` only.
+    NotTracked,
+    /// Linux: the kernel's mount id for the descriptor.
+    Known(u64),
+    /// Linux, but neither `statx` nor `/proc` reported a mount id.
+    Unknown,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MountKey {
+    dev: u64,
+    mnt: MountId,
+}
+
+/// `true` when `child` is not on the same mount as `root` — the walk must
+/// refuse it. Fail closed: a different device, a different mount id, or any
+/// mount id the kernel would not report all count as crossing.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn crosses_mount(root: MountKey, child: MountKey) -> bool {
+    if root.dev != child.dev {
+        return true;
+    }
+    match (root.mnt, child.mnt) {
+        (MountId::NotTracked, MountId::NotTracked) => false,
+        (MountId::Known(a), MountId::Known(b)) => a != b,
+        _ => true,
+    }
+}
+
+fn contained_refusal(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, message)
+}
+
+/// A directory tree opened once for descriptor-relative, contained reads
+/// (v1.81, S1). Built from a [`vet_dir`] result.
+///
+/// [`Self::read_to_string`] walks `rel` one component at a time from the
+/// root's descriptor, so nothing reachable through a path swap after vetting
+/// is ever opened. Refused, on every component:
+///
+/// - a symlink (Unix: `O_NOFOLLOW`, plus `openat2` `RESOLVE_NO_SYMLINKS` on
+///   Linux; Windows: reparse points, through `duduclaw_agent`'s `SafeDir`);
+/// - a mount crossing: a different `st_dev`, and on Linux a different mount
+///   id, including a same-filesystem bind mount (`openat2`
+///   `RESOLVE_NO_XDEV` where the kernel has it, else the `statx` /
+///   `/proc/self/fdinfo` mount id comparison — both run when both exist);
+///
+/// and on the final file: not a regular file, more than one hard link, or
+/// larger than the cap. The content is read from the same descriptor.
+pub struct ContainedTree {
+    root: PathBuf,
+    inner: contained_imp::Root,
+}
+
+impl ContainedTree {
+    /// Open a [`vet_dir`] result. The trusted allowed root (`anchor` —
+    /// `<home>/agents/` for anything in the employee's own directory) is
+    /// opened from `/` with `O_NOFOLLOW` on every component (the path to it
+    /// may cross mounts); the scan root is then opened **descriptor-relative
+    /// from it**, component by component (`<id>`, or `.ephemeral` and `<id>`,
+    /// included), under the same rules the reads use — no symlink, no mount
+    /// crossing — and must be the very directory [`vet_dir`] saw (Unix
+    /// `st_dev` / `st_ino`). So a scan root, own directory or `.ephemeral`
+    /// that is itself a (same-filesystem) bind mount, or that is swapped for
+    /// a symlink, a bind mount or another directory between vetting and
+    /// opening, is refused.
+    pub fn open(vetted: &VettedDir) -> std::io::Result<Self> {
+        Ok(Self {
+            root: vetted.path.clone(),
+            inner: contained_imp::open_root(&vetted.anchor, &vetted.rel, vetted.identity)?,
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Read `rel` (relative to the root, only normal components) as UTF-8,
+    /// at most `max_bytes`.
+    pub fn read_to_string(&self, rel: &Path, max_bytes: u64) -> std::io::Result<String> {
+        let mut parts: Vec<&str> = Vec::new();
+        for component in rel.components() {
+            match component {
+                std::path::Component::Normal(part) => parts
+                    .push(part.to_str().ok_or_else(|| contained_refusal("non-UTF8 path"))?),
+                std::path::Component::CurDir => {}
+                _ => return Err(contained_refusal("only relative, normal path components")),
+            }
+        }
+        if parts.is_empty() {
+            return Err(contained_refusal("empty path"));
+        }
+        let bytes = contained_imp::read(&self.inner, &parts, max_bytes)?;
+        String::from_utf8(bytes)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not UTF-8"))
+    }
+}
+
+#[cfg(unix)]
+mod contained_imp {
+    use super::{MountId, MountKey, contained_refusal as refused, crosses_mount};
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io::{self, Read};
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Component, Path};
+
+    pub(super) struct Root {
+        dir: File,
+        key: MountKey,
+    }
+
+    fn cname(part: &str) -> io::Result<CString> {
+        if part.is_empty() || part == "." || part == ".." || part.contains('/') {
+            return Err(refused("invalid path component"));
+        }
+        CString::new(part).map_err(|_| refused("NUL in path"))
+    }
+
+    /// Open one component below `dirfd`, never following a symlink. Below
+    /// the root (`contained`), Linux first tries `openat2` with
+    /// `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`.
+    fn open_component(dirfd: RawFd, name: &CString, flags: libc::c_int, contained: bool) -> io::Result<File> {
+        #[cfg(target_os = "linux")]
+        {
+            if contained && let Some(result) = linux::openat2_contained(dirfd, name, flags) {
+                return result;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = contained;
+        // SAFETY: a valid directory fd and a NUL-terminated single component.
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                0 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new, uniquely owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn mount_key(file: &File) -> io::Result<MountKey> {
+        let dev = file.metadata()?.dev();
+        #[cfg(target_os = "linux")]
+        let mnt = linux::mount_id(file.as_raw_fd());
+        #[cfg(not(target_os = "linux"))]
+        let mnt = MountId::NotTracked;
+        Ok(MountKey { dev, mnt })
+    }
+
+    pub(super) fn open_root(anchor: &Path, rel: &[String], identity: Option<(u64, u64)>) -> io::Result<Root> {
+        if !anchor.is_absolute() {
+            return Err(refused("absolute root required"));
+        }
+        let mut dir = File::open("/")?;
+        for component in anchor.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(part) => {
+                    let name = cname(part.to_str().ok_or_else(|| refused("non-UTF8 path"))?)?;
+                    // The path to the trusted allowed root may legitimately
+                    // cross mounts.
+                    dir = open_component(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY, false)?;
+                }
+                _ => return Err(refused("non-normal root component")),
+            }
+        }
+        if !dir.metadata()?.is_dir() {
+            return Err(refused("root is not a directory"));
+        }
+        let key = mount_key(&dir)?;
+        if matches!(key.mnt, MountId::Unknown) {
+            return Err(refused("the kernel reports no mount id; refusing to scan"));
+        }
+        // From the allowed root to the scan root: contained, no-follow, and on
+        // the allowed root's own mount (a bind-mounted scan root is refused).
+        for part in rel {
+            let child = open_component(dir.as_raw_fd(), &cname(part)?, libc::O_RDONLY | libc::O_DIRECTORY, true)?;
+            if !child.metadata()?.is_dir() {
+                return Err(refused("not a directory"));
+            }
+            if crosses_mount(key, mount_key(&child)?) {
+                return Err(refused("scan root is on another mount than its allowed root"));
+            }
+            dir = child;
+        }
+        if let Some((dev, ino)) = identity {
+            let meta = dir.metadata()?;
+            if meta.dev() != dev || meta.ino() != ino {
+                return Err(refused("scan root was replaced after it was vetted"));
+            }
+        }
+        Ok(Root { dir, key })
+    }
+
+    pub(super) fn read(root: &Root, parts: &[&str], max_bytes: u64) -> io::Result<Vec<u8>> {
+        let (file_name, dirs) = parts.split_last().ok_or_else(|| refused("empty path"))?;
+        let mut held: Option<File> = None;
+        for part in dirs {
+            let parent = held.as_ref().map_or(root.dir.as_raw_fd(), |f| f.as_raw_fd());
+            let child = open_component(parent, &cname(part)?, libc::O_RDONLY | libc::O_DIRECTORY, true)?;
+            if !child.metadata()?.is_dir() {
+                return Err(refused("not a directory"));
+            }
+            if crosses_mount(root.key, mount_key(&child)?) {
+                return Err(refused("path crosses a mount point"));
+            }
+            held = Some(child);
+        }
+        let parent = held.as_ref().map_or(root.dir.as_raw_fd(), |f| f.as_raw_fd());
+        let file = open_component(parent, &cname(file_name)?, libc::O_RDONLY, true)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.nlink() != 1 {
+            return Err(refused("regular single-link file required"));
+        }
+        if crosses_mount(root.key, mount_key(&file)?) {
+            return Err(refused("file is on another mount"));
+        }
+        if meta.len() > max_bytes {
+            return Err(refused("file is over the size cap"));
+        }
+        let mut buf = Vec::new();
+        file.take(max_bytes.saturating_add(1)).read_to_end(&mut buf)?;
+        if buf.len() as u64 > max_bytes {
+            return Err(refused("file grew past the size cap"));
+        }
+        Ok(buf)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) mod linux {
+        use super::{MountId, refused};
+        use std::ffi::CString;
+        use std::fs::File;
+        use std::io;
+        use std::os::fd::{FromRawFd, RawFd};
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        /// `openat2(2)`: 437 on every architecture (unified syscall table,
+        /// Linux 5.6+).
+        const SYS_OPENAT2: libc::c_long = 437;
+        const RESOLVE_NO_XDEV: u64 = 0x01;
+        const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+        const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+        const RESOLVE_BENEATH: u64 = 0x08;
+        /// `statx(2)` mask bit for `stx_mnt_id` (Linux 5.8+).
+        const STATX_MNT_ID: u32 = 0x1000;
+
+        #[repr(C)]
+        struct OpenHow {
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        }
+
+        /// 0 = not probed yet, 1 = works, 2 = unavailable (ENOSYS / seccomp).
+        static OPENAT2: AtomicU8 = AtomicU8::new(0);
+
+        /// `None` when `openat2` is unavailable — the caller falls back to
+        /// `openat` + the mount-id comparison. `EXDEV` (a mount crossing,
+        /// bind mounts included) is a refusal, not a fallback.
+        pub(in super::super) fn openat2_contained(
+            dirfd: RawFd,
+            name: &CString,
+            flags: libc::c_int,
+        ) -> Option<io::Result<File>> {
+            if OPENAT2.load(Ordering::Relaxed) == 2 {
+                return None;
+            }
+            let how = OpenHow {
+                flags: (flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK) as u32 as u64,
+                mode: 0,
+                resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS,
+            };
+            // SAFETY: valid dirfd, NUL-terminated name, a live `open_how`
+            // whose size is passed alongside it.
+            let fd = unsafe {
+                libc::syscall(
+                    SYS_OPENAT2,
+                    dirfd as libc::c_long,
+                    name.as_ptr(),
+                    &how as *const OpenHow,
+                    std::mem::size_of::<OpenHow>(),
+                )
+            };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                return match error.raw_os_error() {
+                    Some(libc::ENOSYS) | Some(libc::EPERM) | Some(libc::E2BIG)
+                        if OPENAT2.load(Ordering::Relaxed) != 1 =>
+                    {
+                        OPENAT2.store(2, Ordering::Relaxed);
+                        None
+                    }
+                    Some(libc::EXDEV) => Some(Err(refused("path crosses a mount point"))),
+                    Some(libc::ELOOP) => Some(Err(refused("path component is a symlink"))),
+                    _ => Some(Err(error)),
+                };
+            }
+            OPENAT2.store(1, Ordering::Relaxed);
+            // SAFETY: openat2 returned a new, uniquely owned descriptor.
+            Some(Ok(unsafe { File::from_raw_fd(fd as RawFd) }))
+        }
+
+        /// The kernel mount id of `fd`: `statx(fd, "", AT_EMPTY_PATH,
+        /// STATX_MNT_ID)`, else `mnt_id:` from `/proc/self/fdinfo/<fd>`
+        /// (Linux 3.15+), else [`MountId::Unknown`].
+        pub(in super::super) fn mount_id(fd: RawFd) -> MountId {
+            // `struct statx` is 256 bytes; u64 storage keeps it aligned.
+            let mut buf = [0u64; 32];
+            let empty = c"";
+            // SAFETY: valid fd, an empty NUL-terminated path with
+            // AT_EMPTY_PATH, and a 256-byte writable buffer.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_statx,
+                    fd as libc::c_long,
+                    empty.as_ptr(),
+                    (libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW) as libc::c_long,
+                    STATX_MNT_ID as libc::c_long,
+                    buf.as_mut_ptr(),
+                )
+            };
+            if rc == 0 {
+                // SAFETY: reinterpreting the initialised u64 buffer as bytes.
+                let bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), 256) };
+                let mask = u32::from_ne_bytes(bytes[0..4].try_into().unwrap_or([0; 4]));
+                if mask & STATX_MNT_ID != 0 {
+                    // `stx_mnt_id` is at byte offset 144.
+                    return MountId::Known(u64::from_ne_bytes(
+                        bytes[144..152].try_into().unwrap_or([0; 8]),
+                    ));
+                }
+            }
+            std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+                .ok()
+                .and_then(|text| parse_fdinfo_mnt_id(&text))
+                .map_or(MountId::Unknown, MountId::Known)
+        }
+
+        pub(in super::super) fn parse_fdinfo_mnt_id(text: &str) -> Option<u64> {
+            text.lines()
+                .find_map(|line| line.strip_prefix("mnt_id:"))
+                .and_then(|v| v.trim().parse().ok())
+        }
+    }
+}
+
+#[cfg(windows)]
+mod contained_imp {
+    //! Windows: `duduclaw_agent`'s `SafeDir` opens every component relative
+    //! to its parent handle (`NtCreateFile`, `OBJ_DONT_REPARSE`,
+    //! `FILE_OPEN_REPARSE_POINT`) and refuses reparse points — which includes
+    //! symlinks, junctions and volume mount points — and multiply-linked
+    //! files.
+    use duduclaw_agent::skill_loader::safe_dir::SafeDir;
+    use std::io::{self, Read};
+    use std::path::Path;
+
+    use super::contained_refusal as refused;
+
+    pub(super) struct Root {
+        dir: SafeDir,
+    }
+
+    /// The allowed root is opened by path; the scan root below it one
+    /// reparse-refusing handle-relative component at a time.
+    pub(super) fn open_root(anchor: &Path, rel: &[String], _identity: Option<(u64, u64)>) -> io::Result<Root> {
+        let mut dir = SafeDir::open(anchor)?;
+        for part in rel {
+            dir = dir.child(part)?;
+        }
+        Ok(Root { dir })
+    }
+
+    pub(super) fn read(root: &Root, parts: &[&str], max_bytes: u64) -> io::Result<Vec<u8>> {
+        let (file_name, dirs) = parts.split_last().ok_or_else(|| refused("empty path"))?;
+        let mut held: Option<SafeDir> = None;
+        for part in dirs {
+            let next = held.as_ref().unwrap_or(&root.dir).child(part)?;
+            held = Some(next);
+        }
+        let file = held.as_ref().unwrap_or(&root.dir).read_file(file_name)?;
+        if file.metadata()?.len() > max_bytes {
+            return Err(refused("file is over the size cap"));
+        }
+        let mut buf = Vec::new();
+        file.take(max_bytes.saturating_add(1)).read_to_end(&mut buf)?;
+        if buf.len() as u64 > max_bytes {
+            return Err(refused("file grew past the size cap"));
+        }
+        Ok(buf)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod contained_imp {
+    use std::io;
+    use std::path::Path;
+
+    pub(super) struct Root;
+
+    fn unsupported<T>() -> io::Result<T> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "contained tree reads are unavailable on this platform"))
+    }
+
+    pub(super) fn open_root(_: &Path, _: &[String], _: Option<(u64, u64)>) -> io::Result<Root> {
+        unsupported()
+    }
+
+    pub(super) fn read(_: &Root, _: &[&str], _: u64) -> io::Result<Vec<u8>> {
+        unsupported()
+    }
 }
 
 /// `table` for a result: the file's basename **with** its extension, because
@@ -360,9 +1058,14 @@ pub fn handle_file_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> V
         .max(1);
 
     let total = file_len(&path);
-    let buf = match read_prefix(&path, max_bytes) {
+    let buf = match guarded_fs(
+        raw_path,
+        &path,
+        |e| format!("讀取「{raw_path}」失敗：{e}"),
+        move |p| read_prefix(&p, max_bytes),
+    ) {
         Ok(b) => b,
-        Err(e) => return files_error(&format!("讀取「{raw_path}」失敗：{e}")),
+        Err(msg) => return files_error(&msg),
     };
     let truncated = total > buf.len() as u64;
     // Decode only the valid UTF-8 prefix: a byte-capped read lands mid-char on
@@ -519,9 +1222,14 @@ pub fn handle_csv_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> Va
     let limit = resolve_limit(arguments);
     let offset = resolve_offset(arguments);
 
-    let file = match std::fs::File::open(&path) {
+    let file = match guarded_fs(
+        raw_path,
+        &path,
+        |e| format!("讀取「{raw_path}」失敗：{e}"),
+        |p| std::fs::File::open(p),
+    ) {
         Ok(f) => f,
-        Err(e) => return files_error(&format!("讀取「{raw_path}」失敗：{e}")),
+        Err(msg) => return files_error(&msg),
     };
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(delimiter)
@@ -946,9 +1654,12 @@ mod tests {
         tempfile::tempdir().expect("tempdir")
     }
 
+    /// An identified employee: `agents/<id>/agent.toml` exists (what
+    /// [`employee_dir`] requires for a non-ephemeral id).
     fn agent_dir(home: &Path, id: &str) -> PathBuf {
         let dir = home.join("agents").join(id);
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), format!("[agent]\nname = \"{id}\"\n")).unwrap();
         dir
     }
 
@@ -1073,6 +1784,630 @@ mod tests {
         let roots = allowed_roots(home.path(), "../evil");
         assert_eq!(roots.len(), 1, "only <home>/attachments: {roots:?}");
         assert!(roots[0].ends_with("attachments"));
+    }
+
+    // ── Guarded filesystem calls (RM-155) ───────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn a_protected_eperm_names_the_macos_permission_and_steps() {
+        let err = guarded_fs_with::<(), _, _>(
+            "~/Documents/客戶.csv",
+            Path::new("/Users/amy/Documents/客戶.csv"),
+            true,
+            std::time::Duration::from_secs(2),
+            |e| format!("讀取失敗：{e}"),
+            |_| Err(std::io::Error::from_raw_os_error(1)),
+        )
+        .unwrap_err();
+        assert!(err.contains("macOS"), "{err}");
+        assert!(err.contains("系統設定 › 隱私權與安全性 › 檔案和資料夾"), "{err}");
+        assert!(err.contains("System Settings › Privacy & Security › Files and Folders"), "{err}");
+        assert!(err.contains("~/Documents/客戶.csv"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unprotected_or_posix_failure_keeps_the_generic_text() {
+        let eperm_elsewhere = guarded_fs_with::<(), _, _>(
+            "/srv/a.csv",
+            Path::new("/srv/a.csv"),
+            false,
+            std::time::Duration::from_secs(2),
+            |e| format!("讀取失敗：{e}"),
+            |_| Err(std::io::Error::from_raw_os_error(1)),
+        )
+        .unwrap_err();
+        assert!(eperm_elsewhere.starts_with("讀取失敗："), "{eperm_elsewhere}");
+        let eacces = guarded_fs_with::<(), _, _>(
+            "~/Documents/a.csv",
+            Path::new("/Users/amy/Documents/a.csv"),
+            true,
+            std::time::Duration::from_secs(2),
+            |e| format!("讀取失敗：{e}"),
+            |_| Err(std::io::Error::from_raw_os_error(13)),
+        )
+        .unwrap_err();
+        assert!(eacces.starts_with("讀取失敗：") && !eacces.contains("檔案和資料夾"), "{eacces}");
+    }
+
+    #[test]
+    fn a_blocked_protected_read_says_macos_is_waiting_for_allow() {
+        let err = guarded_fs_with::<(), _, _>(
+            "~/Documents/a.csv",
+            // Own path: the shared limiter de-duplicates per path, and this
+            // op stays in flight after the test returns.
+            Path::new("/Users/amy/Documents/blocked-protected.csv"),
+            true,
+            std::time::Duration::from_millis(50),
+            |e| e.to_string(),
+            |_| {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("macOS is waiting for someone on this Mac to click Allow"), "{err}");
+        assert!(err.contains("按「允許」"), "{err}");
+    }
+
+    #[test]
+    fn a_blocked_unprotected_read_is_a_plain_timeout() {
+        let err = guarded_fs_with::<(), _, _>(
+            "/srv/a.csv",
+            Path::new("/srv/blocked-unprotected.csv"),
+            false,
+            std::time::Duration::from_millis(50),
+            |e| e.to_string(),
+            |_| {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("逾時") && !err.contains("macOS"), "{err}");
+    }
+
+    #[test]
+    fn a_retry_into_a_stuck_read_is_pending_without_a_new_thread() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let path = Path::new("/Users/amy/Documents/stuck-retry.csv");
+        let stuck = |calls: &std::sync::Arc<std::sync::atomic::AtomicUsize>| {
+            let calls = std::sync::Arc::clone(calls);
+            move |_: PathBuf| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                Ok::<(), std::io::Error>(())
+            }
+        };
+        let short = std::time::Duration::from_millis(50);
+        let first = guarded_fs_with("~/Documents/stuck-retry.csv", path, true, short,
+            |e| e.to_string(), stuck(&calls)).unwrap_err();
+        assert!(first.contains("click Allow"), "{first}");
+        let retry = guarded_fs_with("~/Documents/stuck-retry.csv", path, true, short,
+            |e| e.to_string(), stuck(&calls)).unwrap_err();
+        assert!(retry.contains("still waiting for macOS permission"), "{retry}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "no second thread");
+        let plain = duduclaw_gateway::macos_folder_access::file_pending_text("/srv/a.csv", false);
+        assert!(!plain.contains("macOS") && plain.contains("not read"), "{plain}");
+    }
+
+    #[test]
+    fn guarded_calls_pass_results_through() {
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "sales");
+        let file = dir.join("ok.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let got = guarded_fs("ok.txt", &file, |e| e.to_string(), |p| read_prefix(&p, 3)).unwrap();
+        assert_eq!(got, b"hel");
+        let missing = guarded_fs("nope", &dir.join("nope"), |_| "generic".to_string(), |p| {
+            std::fs::metadata(p)
+        })
+        .unwrap_err();
+        assert_eq!(missing, "generic");
+    }
+
+    // ── Directory fence + contained tree (v1.81, S1) ────────────────────────
+
+    #[test]
+    fn vet_dir_defaults_to_the_own_directory_and_resolves_relative_under_it() {
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "coder");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let own = dir.canonicalize().unwrap();
+        let vetted = vet_dir("", home.path(), "coder").unwrap();
+        assert_eq!(vetted.path(), own.as_path());
+        // The implicit own root is walked from the trusted `agents/`.
+        assert_eq!(vetted.anchor, own.parent().unwrap());
+        assert_eq!(vetted.rel, vec!["coder".to_string()]);
+        assert_eq!(vet_dir("  ", home.path(), "coder").unwrap().path(), own.as_path());
+        let src = vet_dir("src", home.path(), "coder").unwrap();
+        assert_eq!(src.path(), own.join("src").as_path());
+        assert_eq!(src.anchor, own.parent().unwrap(), "a sub-root is walked from `agents/` too");
+        assert_eq!(src.rel, vec!["coder".to_string(), "src".to_string()]);
+        assert_eq!(
+            vet_dir(own.join("src").to_str().unwrap(), home.path(), "coder").unwrap().path(),
+            own.join("src").as_path()
+        );
+        // A valid id with no `agent.toml` is not an employee.
+        std::fs::create_dir_all(home.path().join("agents/ghost")).unwrap();
+        assert!(vet_dir("", home.path(), "ghost").is_err());
+    }
+
+    /// A role member's own directory is its `.ephemeral/<id>` scaffold, not
+    /// `agents/<id>`; other employees' directories stay outside the fence.
+    #[test]
+    fn vet_dir_resolves_a_role_member_to_its_ephemeral_directory() {
+        let home = tmp_home();
+        let parent = agent_dir(home.path(), "boss");
+        let id = "eph-boss-r1-exec-abc123";
+        let member = home.path().join("agents/.ephemeral").join(id);
+        std::fs::create_dir_all(member.join("src")).unwrap();
+        std::fs::write(member.join("agent.toml"), "[agent]\nname = \"m\"\n").unwrap();
+        let member_real = member.canonicalize().unwrap();
+        assert_eq!(employee_dir(home.path(), id).unwrap(), member_real);
+        let vetted = vet_dir("", home.path(), id).unwrap();
+        assert_eq!(vetted.path(), member_real.as_path());
+        // Walked from `agents/`, through `.ephemeral` — never anchored at it.
+        let agents_real = home.path().join("agents").canonicalize().unwrap();
+        assert_eq!(vetted.anchor, agents_real);
+        assert_eq!(vetted.rel, vec![".ephemeral".to_string(), id.to_string()]);
+        let src = vet_dir("src", home.path(), id).unwrap();
+        assert_eq!(src.path(), member_real.join("src").as_path());
+        assert_eq!(src.anchor, agents_real);
+        assert_eq!(src.rel, vec![".ephemeral".to_string(), id.to_string(), "src".to_string()]);
+        let tree = ContainedTree::open(&vetted).expect("an ordinary role member root opens");
+        assert_eq!(tree.read_to_string(Path::new("agent.toml"), 1024).unwrap(), "[agent]\nname = \"m\"\n");
+        let err = vet_dir(parent.to_str().unwrap(), home.path(), id).unwrap_err();
+        assert!(err.contains("不在允許的目錄範圍內"), "{err}");
+        // An `eph-` id with no scaffold resolves to nothing — even when an
+        // `agents/<id>/agent.toml` exists.
+        let fake = "eph-boss-r1-exec-ffffff";
+        agent_dir(home.path(), fake);
+        assert!(employee_dir(home.path(), fake).is_none());
+        assert!(vet_dir("", home.path(), fake).is_err());
+    }
+
+    #[test]
+    fn vet_dir_refuses_everything_outside_the_fence() {
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "coder");
+        let other = agent_dir(home.path(), "other");
+        std::fs::write(dir.join("file.rs"), "fn x() {}\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        for raw in [
+            other.to_str().unwrap(),
+            "/",
+            outside.path().to_str().unwrap(),
+            home.path().to_str().unwrap(),
+        ] {
+            let err = vet_dir(raw, home.path(), "coder").unwrap_err();
+            assert!(err.contains("不在允許的目錄範圍內"), "{raw}: {err}");
+        }
+        assert!(vet_dir("../other", home.path(), "coder").unwrap_err().contains(".."));
+        assert!(vet_dir("file.rs", home.path(), "coder").unwrap_err().contains("不是目錄"));
+        // No identity ⇒ no own directory.
+        for bad in ["", "../coder", "a/b"] {
+            assert!(vet_dir("", home.path(), bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vet_dir_refuses_a_symlinked_directory_escaping_the_fence() {
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "coder");
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.join("escape")).unwrap();
+        let err = vet_dir("escape", home.path(), "coder").unwrap_err();
+        assert!(err.contains("不在允許的目錄範圍內"), "{err}");
+    }
+
+    #[test]
+    fn contained_tree_reads_regular_files_and_rejects_bad_paths() {
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "coder");
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/b/c.rs"), "fn c() {}\n").unwrap();
+        std::fs::write(dir.join("big.rs"), vec![b'x'; 64]).unwrap();
+        let root = vet_dir("", home.path(), "coder").unwrap();
+        let tree = ContainedTree::open(&root).unwrap();
+        assert_eq!(tree.root(), root.path());
+        assert_eq!(tree.read_to_string(Path::new("a/b/c.rs"), 1024).unwrap(), "fn c() {}\n");
+        assert!(tree.read_to_string(Path::new("big.rs"), 16).is_err(), "over the cap");
+        assert!(tree.read_to_string(Path::new("a"), 1024).is_err(), "a directory");
+        assert!(tree.read_to_string(Path::new("a/../agent.toml"), 1024).is_err());
+        assert!(tree.read_to_string(Path::new("missing.rs"), 1024).is_err());
+        assert!(tree.read_to_string(Path::new(""), 1024).is_err());
+        assert!(tree.read_to_string(&root.path().join("a/b/c.rs"), 1024).is_err(), "absolute");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_tree_refuses_symlinks_hard_links_and_fifos() {
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "coder");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("pkg")).unwrap();
+        std::fs::write(outside.path().join("secret.rs"), "secret\n").unwrap();
+        std::fs::write(outside.path().join("pkg/mod.rs"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.rs"), dir.join("file_link.rs")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("pkg"), dir.join("dir_link")).unwrap();
+        let root = vet_dir("", home.path(), "coder").unwrap();
+        let tree = ContainedTree::open(&root).unwrap();
+        assert!(tree.read_to_string(Path::new("file_link.rs"), 1024).is_err());
+        assert!(tree.read_to_string(Path::new("dir_link/mod.rs"), 1024).is_err());
+        if std::fs::hard_link(outside.path().join("secret.rs"), dir.join("hard.rs")).is_ok() {
+            assert!(tree.read_to_string(Path::new("hard.rs"), 1024).is_err(), "nlink == 2");
+        }
+        let fifo = std::ffi::CString::new(dir.join("pipe.rs").to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path; mkfifo creates nothing else.
+        if unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) } == 0 {
+            assert!(tree.read_to_string(Path::new("pipe.rs"), 1024).is_err(), "must not hang");
+        }
+    }
+
+    /// A directory swapped for a symlink after `ContainedTree::open` cannot
+    /// redirect a later read: the walk re-opens every component no-follow.
+    #[cfg(unix)]
+    #[test]
+    fn contained_tree_is_not_redirected_by_a_later_swap() {
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "coder");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn inside() {}\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("a.rs"), "fn outside() {}\n").unwrap();
+        let tree = ContainedTree::open(&vet_dir("", home.path(), "coder").unwrap()).unwrap();
+        std::fs::rename(dir.join("src"), dir.join("old")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.join("src")).unwrap();
+        assert!(tree.read_to_string(Path::new("src/a.rs"), 1024).is_err());
+        assert_eq!(tree.read_to_string(Path::new("old/a.rs"), 1024).unwrap(), "fn inside() {}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_tree_root_must_be_symlink_free() {
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "coder");
+        let real = dir.canonicalize().unwrap();
+        std::os::unix::fs::symlink(&real, home.path().join("alias")).unwrap();
+        let alias = home.path().canonicalize().unwrap().join("alias");
+        let raw = |anchor: PathBuf, rel: &[&str]| VettedDir {
+            path: anchor.clone(),
+            anchor,
+            rel: rel.iter().map(|s| s.to_string()).collect(),
+            identity: None,
+        };
+        // A symlink on the way to the allowed root, or below it.
+        assert!(ContainedTree::open(&raw(alias.clone(), &[])).is_err());
+        assert!(ContainedTree::open(&raw(home.path().canonicalize().unwrap(), &["alias"])).is_err());
+        assert!(ContainedTree::open(&raw(PathBuf::from("relative"), &[])).is_err());
+        assert!(ContainedTree::open(&raw(real.clone(), &[".."])).is_err());
+    }
+
+    /// The Daybreak Low: a scan root replaced between [`vet_dir`] and
+    /// [`ContainedTree::open`] — by a symlink to outside, or by another
+    /// directory — is refused (the root is reached from the allowed root
+    /// no-follow and must be the vetted inode).
+    #[cfg(unix)]
+    #[test]
+    fn contained_tree_refuses_a_root_swapped_between_vet_and_open() {
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "coder");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn inside() {}\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("a.rs"), "fn outside() {}\n").unwrap();
+
+        // Specified sub-root swapped for a symlink to outside.
+        let vetted = vet_dir("src", home.path(), "coder").unwrap();
+        std::fs::rename(dir.join("src"), dir.join("src.old")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.join("src")).unwrap();
+        assert!(ContainedTree::open(&vetted).is_err(), "symlink swap");
+
+        // Specified sub-root swapped for another (fresh) directory.
+        std::fs::remove_file(dir.join("src")).unwrap();
+        std::fs::create_dir(dir.join("src")).unwrap();
+        let err = ContainedTree::open(&vetted).err().expect("directory swap must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+
+        // The implicit own root swapped for another directory.
+        let vetted = vet_dir("", home.path(), "coder").unwrap();
+        let agents = home.path().join("agents");
+        std::fs::rename(agents.join("coder"), agents.join("coder.old")).unwrap();
+        std::fs::create_dir(agents.join("coder")).unwrap();
+        assert!(ContainedTree::open(&vetted).is_err(), "own-root swap");
+
+        // Unswapped, the same vetting opens fine.
+        std::fs::remove_dir(agents.join("coder")).unwrap();
+        std::fs::rename(agents.join("coder.old"), agents.join("coder")).unwrap();
+        let tree = ContainedTree::open(&vet_dir("src.old", home.path(), "coder").unwrap()).unwrap();
+        assert_eq!(tree.read_to_string(Path::new("a.rs"), 1024).unwrap(), "fn inside() {}\n");
+    }
+
+    /// The comparison the walk applies to every component (all platforms).
+    #[test]
+    fn mount_crossing_comparison_fails_closed() {
+        let key = |dev, mnt| MountKey { dev, mnt };
+        // Same device, platform without mount ids: same mount.
+        assert!(!crosses_mount(key(1, MountId::NotTracked), key(1, MountId::NotTracked)));
+        // Same device, same mount id: same mount.
+        assert!(!crosses_mount(key(1, MountId::Known(7)), key(1, MountId::Known(7))));
+        // A same-filesystem bind mount: same st_dev, different mount id.
+        assert!(crosses_mount(key(1, MountId::Known(7)), key(1, MountId::Known(8))));
+        // A different device is always a crossing.
+        assert!(crosses_mount(key(1, MountId::NotTracked), key(2, MountId::NotTracked)));
+        assert!(crosses_mount(key(1, MountId::Known(7)), key(2, MountId::Known(7))));
+        // Unknown or mixed mount ids fail closed.
+        assert!(crosses_mount(key(1, MountId::Known(7)), key(1, MountId::Unknown)));
+        assert!(crosses_mount(key(1, MountId::Unknown), key(1, MountId::Unknown)));
+        assert!(crosses_mount(key(1, MountId::NotTracked), key(1, MountId::Known(7))));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fdinfo_mount_id_parses_and_the_kernel_reports_one() {
+        use super::contained_imp::linux::{mount_id, parse_fdinfo_mnt_id};
+        use std::os::fd::AsRawFd;
+        assert_eq!(parse_fdinfo_mnt_id("pos:\t0\nflags:\t02100000\nmnt_id:\t29\nino:\t5\n"), Some(29));
+        assert_eq!(parse_fdinfo_mnt_id("pos:\t0\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id("mnt_id:\tx\n"), None);
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::open(dir.path()).unwrap();
+        assert!(matches!(mount_id(file.as_raw_fd()), MountId::Known(_)));
+    }
+
+    /// The S1 review Low: a same-filesystem bind mount inside the tree has the
+    /// root's `st_dev`, and must still be refused. Needs root to mount; skips
+    /// (passes) otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn contained_tree_refuses_a_same_filesystem_bind_mount() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: creating a bind mount needs root");
+            return;
+        }
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "coder");
+        std::fs::create_dir_all(dir.join("mnt")).unwrap();
+        std::fs::write(dir.join("ok.rs"), "fn ok() {}\n").unwrap();
+        let outside = tempfile::tempdir_in(home.path()).unwrap();
+        std::fs::write(outside.path().join("secret.rs"), "fn secret() {}\n").unwrap();
+        let src = std::ffi::CString::new(outside.path().to_str().unwrap()).unwrap();
+        let dst = std::ffi::CString::new(dir.join("mnt").to_str().unwrap()).unwrap();
+        // SAFETY: NUL-terminated paths; a bind mount with no data argument.
+        let rc = unsafe {
+            libc::mount(src.as_ptr(), dst.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null())
+        };
+        if rc != 0 {
+            eprintln!("skipped: bind mount failed: {}", std::io::Error::last_os_error());
+            return;
+        }
+        struct Unmount(std::ffi::CString);
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                // SAFETY: NUL-terminated path of the mount made above.
+                unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) };
+            }
+        }
+        let _guard = Unmount(dst.clone());
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(dir.join("mnt")).unwrap().dev(),
+            std::fs::metadata(&dir).unwrap().dev(),
+            "fixture: the bind mount shares the tree's st_dev"
+        );
+        let tree = ContainedTree::open(&vet_dir("", home.path(), "coder").unwrap()).unwrap();
+        assert_eq!(tree.read_to_string(Path::new("ok.rs"), 1024).unwrap(), "fn ok() {}\n");
+        let err = tree.read_to_string(Path::new("mnt/secret.rs"), 1024).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// The Daybreak Low: the scan root ITSELF is a same-filesystem bind mount
+    /// — a specified sub-root, and the implicit own directory. `vet_dir`
+    /// accepts both paths (a bind mount is not a symlink); opening refuses
+    /// them because the root's mount differs from its allowed root's. Needs
+    /// root to mount; skips (passes) otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn contained_tree_refuses_a_scan_root_that_is_a_bind_mount() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: creating a bind mount needs root");
+            return;
+        }
+        struct Unmount(std::ffi::CString);
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                // SAFETY: NUL-terminated path of a mount made below.
+                unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) };
+            }
+        }
+        fn bind(src: &Path, dst: &Path) -> Option<Unmount> {
+            let s = std::ffi::CString::new(src.to_str().unwrap()).unwrap();
+            let d = std::ffi::CString::new(dst.to_str().unwrap()).unwrap();
+            // SAFETY: NUL-terminated paths; a bind mount with no data argument.
+            let rc = unsafe {
+                libc::mount(s.as_ptr(), d.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null())
+            };
+            if rc != 0 {
+                eprintln!("skipped: bind mount failed: {}", std::io::Error::last_os_error());
+                return None;
+            }
+            Some(Unmount(d))
+        }
+
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "coder");
+        std::fs::create_dir_all(dir.join("mnt")).unwrap();
+        let outside = tempfile::tempdir_in(home.path()).unwrap();
+        std::fs::write(outside.path().join("agent.toml"), "[agent]\nname = \"x\"\n").unwrap();
+        std::fs::write(outside.path().join("secret.rs"), "fn secret() {}\n").unwrap();
+
+        // 1. A specified root that is itself a bind mount.
+        let Some(_m1) = bind(outside.path(), &dir.join("mnt")) else { return };
+        let vetted = vet_dir("mnt", home.path(), "coder").expect("a bind mount is not a symlink");
+        let err = ContainedTree::open(&vetted).err().expect("bind-mounted root must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+
+        // 2. The implicit own directory is itself a bind mount: compared with
+        // its parent `agents/`.
+        let own = home.path().join("agents").join("mounted");
+        std::fs::create_dir_all(&own).unwrap();
+        let Some(_m2) = bind(outside.path(), &own) else { return };
+        let vetted = vet_dir("", home.path(), "mounted").expect("agent.toml is visible through the mount");
+        let err = ContainedTree::open(&vetted).err().expect("bind-mounted own root must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// Bind-mount helpers for the round-2 tests below (same mount call,
+    /// unmount guard and skip message as the tests above).
+    #[cfg(target_os = "linux")]
+    struct Unmount(std::ffi::CString);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            // SAFETY: NUL-terminated path of a mount made by `bind_mount`.
+            unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) };
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bind_mount(src: &Path, dst: &Path) -> Option<Unmount> {
+        let s = std::ffi::CString::new(src.to_str().unwrap()).unwrap();
+        let d = std::ffi::CString::new(dst.to_str().unwrap()).unwrap();
+        // SAFETY: NUL-terminated paths; a bind mount with no data argument.
+        let rc = unsafe {
+            libc::mount(s.as_ptr(), d.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null())
+        };
+        if rc != 0 {
+            eprintln!("skipped: bind mount failed: {}", std::io::Error::last_os_error());
+            return None;
+        }
+        Some(Unmount(d))
+    }
+
+    /// Daybreak round 2 Low (a): the own directory `agents/<id>` is itself a
+    /// same-filesystem bind mount and the caller names a sub-root
+    /// (`root = "src"`). The walk starts at `agents/`, so `<id>` is compared
+    /// with the `agents/` mount and refused — the bind mount is never the
+    /// baseline. Needs root to mount; skips (passes) otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn contained_tree_refuses_a_sub_root_of_a_bind_mounted_own_root() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: creating a bind mount needs root");
+            return;
+        }
+        let home = tmp_home();
+        let outside = tempfile::tempdir_in(home.path()).unwrap();
+        std::fs::write(outside.path().join("agent.toml"), "[agent]\nname = \"x\"\n").unwrap();
+        std::fs::create_dir_all(outside.path().join("src")).unwrap();
+        std::fs::write(outside.path().join("src/secret.rs"), "fn secret() {}\n").unwrap();
+        let own = home.path().join("agents").join("mounted");
+        std::fs::create_dir_all(&own).unwrap();
+        let Some(_m) = bind_mount(outside.path(), &own) else { return };
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&own).unwrap().dev(),
+            std::fs::metadata(home.path().join("agents")).unwrap().dev(),
+            "fixture: the bind mount shares the agents/ st_dev"
+        );
+
+        let vetted = vet_dir("src", home.path(), "mounted").expect("a bind mount is not a symlink");
+        assert_eq!(vetted.rel, vec!["mounted".to_string(), "src".to_string()]);
+        let err = ContainedTree::open(&vetted).err().expect("sub-root of a bind-mounted own root must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        // The absolute spelling of the same directory is refused too.
+        let abs = own.join("src");
+        let vetted = vet_dir(abs.to_str().unwrap(), home.path(), "mounted").unwrap();
+        let err = ContainedTree::open(&vetted).err().expect("absolute sub-root must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// Daybreak round 2 Low (b): `agents/.ephemeral` is itself a
+    /// same-filesystem bind mount. A role member's default root is walked
+    /// from `agents/` through `.ephemeral`, which is compared with the
+    /// `agents/` mount and refused. Needs root to mount; skips (passes)
+    /// otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn contained_tree_refuses_a_role_member_under_a_bind_mounted_ephemeral_dir() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: creating a bind mount needs root");
+            return;
+        }
+        let home = tmp_home();
+        agent_dir(home.path(), "boss");
+        let id = "eph-boss-r1-exec-abc123";
+        let outside = tempfile::tempdir_in(home.path()).unwrap();
+        std::fs::create_dir_all(outside.path().join(id)).unwrap();
+        std::fs::write(outside.path().join(id).join("agent.toml"), "[agent]\nname = \"m\"\n").unwrap();
+        std::fs::write(outside.path().join(id).join("secret.rs"), "fn secret() {}\n").unwrap();
+        let ephemeral = home.path().join("agents/.ephemeral");
+        std::fs::create_dir_all(&ephemeral).unwrap();
+        let Some(_m) = bind_mount(outside.path(), &ephemeral) else { return };
+
+        let vetted = vet_dir("", home.path(), id).expect("the scaffold is visible through the mount");
+        assert_eq!(vetted.rel, vec![".ephemeral".to_string(), id.to_string()]);
+        let err = ContainedTree::open(&vetted).err().expect("role member under a bind-mounted .ephemeral must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    }
+
+    /// Daybreak round 2 Low (c): the own directory is swapped for a bind
+    /// mount between [`vet_dir`] and [`ContainedTree::open`] — of an outside
+    /// tree, and of the original directory itself (so the vetted inode
+    /// identity still matches and only the mount comparison at `<id>` can
+    /// refuse it). Needs root to mount; skips (passes) otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn contained_tree_refuses_an_own_root_swapped_for_a_bind_mount_between_vet_and_open() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: creating a bind mount needs root");
+            return;
+        }
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "coder");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn inside() {}\n").unwrap();
+        let outside = tempfile::tempdir_in(home.path()).unwrap();
+        std::fs::create_dir_all(outside.path().join("src")).unwrap();
+        std::fs::write(outside.path().join("src/a.rs"), "fn outside() {}\n").unwrap();
+        let agents = home.path().join("agents");
+
+        let vetted = vet_dir("src", home.path(), "coder").unwrap();
+        std::fs::rename(agents.join("coder"), agents.join("coder.old")).unwrap();
+        std::fs::create_dir(agents.join("coder")).unwrap();
+
+        // 1. Swapped for a bind mount of an outside tree.
+        {
+            let Some(_m) = bind_mount(outside.path(), &agents.join("coder")) else { return };
+            let err = ContainedTree::open(&vetted).err().expect("outside bind-mount swap must be refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        }
+
+        // 2. Swapped for a bind mount of the original directory: `src` keeps
+        // its vetted (st_dev, st_ino), so the refusal is the mount check.
+        {
+            let Some(_m) = bind_mount(&agents.join("coder.old"), &agents.join("coder")) else { return };
+            use std::os::unix::fs::MetadataExt;
+            let through = std::fs::metadata(agents.join("coder/src")).unwrap();
+            assert_eq!(vetted.identity, Some((through.dev(), through.ino())), "fixture: identity still matches");
+            let err = ContainedTree::open(&vetted).err().expect("self bind-mount swap must be refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        }
+
+        // Unswapped, the same vetting opens and reads the inside file.
+        std::fs::remove_dir(agents.join("coder")).unwrap();
+        std::fs::rename(agents.join("coder.old"), agents.join("coder")).unwrap();
+        let tree = ContainedTree::open(&vetted).expect("the vetted directory is back");
+        assert_eq!(tree.read_to_string(Path::new("a.rs"), 1024).unwrap(), "fn inside() {}\n");
     }
 
     // ── csv_read ────────────────────────────────────────────────────────────

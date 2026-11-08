@@ -9,7 +9,8 @@
 //! Unknown sections and unknown keys stay allowed (forward compatibility,
 //! operator notes); sections with a strict typed struct (`[container.sandbox]`,
 //! `[computer_use]`, `[[tick.sources]]`, `[team]`, `[takeover]`,
-//! `[redaction]`, `[db_sources]`, `[secret_manager]`, `[odoo_livechat]`) are additionally
+//! `[redaction]`, `[db_sources]`, `[secret_manager]`, `[odoo_livechat]`,
+//! `[memory_privacy]`) are additionally
 //! deserialized by `config_raw_rpc::validate_config_table`.
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -100,11 +101,17 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("memory", "recent_actions_count", UInt),
     ("memory", "working_state_enabled", Bool),
     ("memory", "working_state_handoff_max_bytes", UInt),
+    // RM-039 — value rules (known categories, keyword limits) live in
+    // `memory_privacy::MemoryPrivacyConfig::validate`, run by
+    // `config_raw_rpc::validate_config_table`.
+    ("memory_privacy", "excluded_categories", StrArray),
+    ("memory_privacy", "custom_keywords", Table),
     ("notify", "daily_digest", Bool),
     ("notify", "daily_digest_at", Str),
     ("notify", "quiet_hours", Str),
     ("skills", "gap_digest_enabled", Bool),
     ("miniapp", "enabled", Bool),
+    ("external_status", "enabled", Bool),
     ("knowledge", "enabled", Bool),
     ("knowledge", "max_source_bytes", UInt),
     ("knowledge", "max_source_chars", UInt),
@@ -317,6 +324,9 @@ mod tests {
         assert!(check("[night]\nllm_enabled = \"nah\"\n").is_err());
         assert!(check("[gateway]\nport = 70000\n").is_err());
         assert!(check("[dispatch.team_budget]\nmax_spawns_per_task = -1\n").is_err());
+        // RM-064: a quoted "true" would silently read as off — refuse it.
+        assert!(check("[external_status]\nenabled = \"true\"\n").is_err());
+        check("[external_status]\nenabled = true\n").unwrap();
     }
 
     #[test]

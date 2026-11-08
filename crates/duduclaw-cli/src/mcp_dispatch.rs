@@ -26,8 +26,10 @@ use duduclaw_core::types::ToolPolicy;
 use duduclaw_memory::SqliteMemoryEngine;
 
 fn scope_denial_message(tool: &str, required: Scope) -> String {
-    if tool.starts_with("odoo_") {
-        format!("Insufficient scope: MCP scope gate requires '{required}' for '{tool}'. Ask an admin to check the MCP key scopes and the agent's tool permissions; allowed_models/unblock_models do not grant MCP scopes.")
+    if tool.starts_with("odoo_") && matches!(required, Scope::Admin) {
+        format!("Odoo capability is not available: '{tool}' is not offered. This is a policy decision; retrying the same call will not succeed. 這項功能不提供；這是政策限制，重試相同呼叫不會成功。")
+    } else if tool.starts_with("odoo_") {
+        format!("Insufficient scope: MCP scope gate requires '{required}' for '{tool}'. Ask an admin to check the MCP key scopes and the agent's tool permissions; allowed_models/unblock_models do not grant MCP scopes. This is a policy decision; retrying the same call will not succeed. 這是政策限制，重試相同呼叫不會成功。")
     } else {
         format!("Insufficient scope: {required:?} required for '{tool}'")
     }
@@ -404,21 +406,37 @@ pub(crate) fn permission_explicitly_denied(
     flag == Some(false)
 }
 
+/// `[permissions]` with nothing written: every flag absent except
+/// `can_create_agents`, which v1.81 (S2) resolves by role — with no
+/// identifiable role it is `false`.
+fn unwritten_permissions() -> duduclaw_core::agent_toml::PermissionsSectionView {
+    duduclaw_core::agent_toml::PermissionsSectionView {
+        can_create_agents: Some(duduclaw_core::agent_toml::effective_can_create_agents(None, None)),
+        ..Default::default()
+    }
+}
+
 /// The acting agent's `[permissions]`. Fails closed (`Err`) when the agent
 /// id is not a valid id or its `agent.toml` exists but cannot be read as
 /// TOML / has a non-table `[permissions]` / a non-boolean flag — the gated
 /// tools are then refused. A missing file reads as "nothing written".
+///
+/// v1.81 (S2): `can_create_agents` is returned as its **effective** value
+/// (`agent_toml::effective_can_create_agents`) — a missing key resolves by
+/// the employee's `[agent] role` (only `main` defaults to `true`), so the
+/// "explicit false refuses" check below also refuses a non-main employee that
+/// never wrote the key.
 async fn load_agent_permissions(
     home_dir: &Path,
     agent_id: &str,
 ) -> Result<duduclaw_core::agent_toml::PermissionsSectionView, String> {
     if agent_id.is_empty() {
-        return Ok(Default::default());
+        return Ok(unwritten_permissions());
     }
     let dir = if duduclaw_gateway::ephemeral::is_ephemeral_id(agent_id) {
         match duduclaw_gateway::ephemeral::resolve_agent_dir(home_dir, agent_id) {
             Some(d) => d,
-            None => return Ok(Default::default()),
+            None => return Ok(unwritten_permissions()),
         }
     } else {
         if !duduclaw_core::is_valid_agent_id(agent_id) {
@@ -430,7 +448,7 @@ async fn load_agent_permissions(
         let path = dir.join("agent.toml");
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(unwritten_permissions()),
             Err(e) => return Err(format!("agent.toml unreadable: {e}")),
         };
         let table: toml::Table = text
@@ -449,7 +467,13 @@ async fn load_agent_permissions(
                 }
             }
         }
-        Ok(duduclaw_core::agent_toml::load(&dir).permissions)
+        let sections = duduclaw_core::agent_toml::load(&dir);
+        let mut perms = sections.permissions;
+        perms.can_create_agents = Some(duduclaw_core::agent_toml::effective_can_create_agents(
+            perms.can_create_agents,
+            sections.agent.as_ref().and_then(|a| a.role.as_deref()),
+        ));
+        Ok(perms)
     })
     .await
     .map_err(|e| format!("permission check failed: {e}"))?
@@ -468,14 +492,43 @@ pub type OdooState = Arc<crate::odoo_pool::OdooConnectorPool>;
 // need to depend on the internal `mcp` module.
 
 pub fn jsonrpc_error(id: &Value, code: i64, message: &str) -> Value {
-    serde_json::json!({
+    let mut frame = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": {
             "code": code,
             "message": message
         }
-    })
+    });
+    // RM-130: never an empty message. No `data` is added, so the egress
+    // gate's payload accounting for this frame is unchanged.
+    duduclaw_core::ensure_error_reason_with("", None, &mut frame, duduclaw_core::ToolErrorDetail::CodeOnly);
+    frame
+}
+
+/// RM-130: the last step of a `tools/call` reply — fill a reason into an
+/// error that carries none. Must run after egress / private-read accounting
+/// and after redaction (it is called on the value about to be returned).
+/// `structuredContent` is summarised only when redaction either is off or
+/// actually ran over `result` (string values only); JSON-RPC `error.data` is never redacted, so
+/// with redaction on only its code is named.
+pub(crate) fn finalize_tool_reply(tool_name: &str, redaction_active: bool, mut reply: Value) -> Value {
+    let detail = if !redaction_active {
+        duduclaw_core::ToolErrorDetail::Full
+    } else if reply.get("result").is_some_and(Value::is_object) {
+        duduclaw_core::ToolErrorDetail::StringValues
+    } else {
+        duduclaw_core::ToolErrorDetail::CodeOnly
+    };
+    duduclaw_core::ensure_error_reason_with(tool_name, Some("duduclaw"), &mut reply, detail);
+    reply
+}
+
+/// Finalize the model-visible workflow operation result after accounting/redaction.
+fn finalize_workflow_operation_reply(tool_name: &str, redaction_active: bool, result: Value, mut reply: Value) -> Value {
+    let result = finalize_tool_reply(tool_name, redaction_active, result);
+    reply["result"] = result;
+    reply
 }
 
 pub fn jsonrpc_response(id: &Value, result: Value) -> Value {
@@ -770,6 +823,19 @@ impl McpDispatcher {
         } else {
             load_agent_gate_config(&self.home_dir, gate_agent).await
         };
+        // RM-103 S3 (v1.81): a team role member's intrinsic tool
+        // (`team_handoff`) is exempt from the approval layers the scaffold
+        // inherits from the employee — `action_rules` (§3.455 and the approval
+        // gate's `ask`), the PolicyKernel `policy` (§3.5) and the
+        // approval/irreversible lists (§3.7). `allowed_tools` / `denied_tools`
+        // (§3.45: an explicit deny still wins), `[permissions]` and every other
+        // gate still apply. See `ephemeral::is_role_member_intrinsic_call`.
+        let intrinsic_exempt = employee_policy_applies
+            && duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(
+                &self.home_dir,
+                gate_agent,
+                tool_name,
+            );
 
         // Evaluate scope/list/permission refusals without writing audit records.
         // Their specific response still wins, but background admission must run
@@ -935,6 +1001,7 @@ impl McpDispatcher {
             // layer". The `computer_*` tools apply the same resolution in the
             // gateway (`computer_use_sessions::gates`), which owns their session.
             if employee_policy_applies
+                && !intrinsic_exempt
                 && action_rule_verdict_for_call(
                     &agent_gate.action_rules,
                     tool_name,
@@ -955,7 +1022,9 @@ impl McpDispatcher {
             // dashboard (as "danger" toggles) but read by nothing. They are now
             // enforced here, in addition to the delegation policy and every other
             // gate. Only an EXPLICIT `false` refuses; an absent or wrong-typed
-            // key keeps the pre-1.68 behaviour. Read through `AgentTomlSections`
+            // key keeps the pre-1.68 behaviour — except `can_create_agents`,
+            // which since v1.81 (S2) resolves an absent key by role (only
+            // `main` defaults to allowed). Read through `AgentTomlSections`
             // (preset-resolved file when the agent has one).
             if employee_policy_applies {
                 let needed = permissions_for_call(
@@ -969,10 +1038,18 @@ impl McpDispatcher {
                             .iter()
                             .find(|p| permission_explicitly_denied(&perms, p))
                             .map(|p| {
+                                // v1.81 (S2): `can_create_agents` is the
+                                // effective value — an unwritten key on a
+                                // non-main employee refuses too.
+                                let why = if *p == "can_create_agents" {
+                                    "未開啟（未設定時只有 main 角色預設開啟）"
+                                } else {
+                                    "= false"
+                                };
                                 (
                                     p.to_string(),
                                     format!(
-                                        "此 AI 員工的 [permissions] {p} = false，不能使用工具「{tool_name}」。請在儀表板「工具與權限」開啟後再試。"
+                                        "此 AI 員工的 [permissions] {p} {why}，不能使用工具「{tool_name}」。請在儀表板「工具與權限」開啟後再試。"
                                     ),
                                 )
                             }),
@@ -1143,7 +1220,7 @@ impl McpDispatcher {
         // policy → the kernel abstains (Allow). External clients aren't agents,
         // so they carry no per-agent policy. High-risk `Ask` decisions block on
         // the ApprovalBroker (fail-closed: TTL-expiry counts as denial).
-        if employee_policy_applies && !agent_gate.policy.is_empty() {
+        if employee_policy_applies && !intrinsic_exempt && !agent_gate.policy.is_empty() {
             let args_val = params_owned
                 .get("arguments")
                 .cloned()
@@ -1428,8 +1505,9 @@ impl McpDispatcher {
         {
             duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
             self.audit_dispatch_denial(principal, tool_name, &params_owned, "system_operation_human_denied", "A live administrator or proven background context is required");
-            let language = duduclaw_gateway::prompt_identity::read_default_language(&self.home_dir).await;
+            let language = duduclaw_gateway::prompt_identity::resolve_fixed_message_language_for_id(&self.home_dir, gate_agent).await;
             let message = match language.as_deref() {
+                Some("zh-CN" | "zh_CN") => "只有系统管理员可以操作机器。",
                 Some("en") => "Only an administrator can operate the machine.",
                 Some("ja" | "ja-JP") => "機器を操作できるのは管理者だけです。",
                 _ => "只有系統管理員可以操作機器。",
@@ -1534,7 +1612,12 @@ impl McpDispatcher {
         // opened/queried is denied (`has_active_grant` returns false on error).
         // Zero-overhead for the vast majority of agents: an empty `scoped_tools`
         // set short-circuits before any DB work.
-        if employee_policy_applies {
+        //
+        // RM-103 S3 (Daybreak round 2): a role member inherits the employee's
+        // `scoped_tools` complete (wildcards included), so only the exact
+        // intrinsic call by a verified role member (`intrinsic_exempt`) skips
+        // this gate; every other tool a wildcard covers still needs a grant.
+        if employee_policy_applies && !intrinsic_exempt {
             // W3-3b: use the SAME acting-agent resolution as §3.4's capability
             // gate. `principal.client_id` is `gateway-internal` for every
             // MCP child the gateway spawns, so reading
@@ -1734,7 +1817,11 @@ impl McpDispatcher {
         } else {
             params_owned.clone()
         };
-        if employee_policy_applies || params_owned.get("egress_guard").is_some() {
+        // RM-103 S3: a role member's intrinsic skips this gate's inherited
+        // approval lists / action-rule `ask`; an egress-guard ask still runs.
+        if (employee_policy_applies && !intrinsic_exempt)
+            || params_owned.get("egress_guard").is_some()
+        {
             // Keyed by the ACTING agent: with the internal key the client_id
             // is `gateway-internal`, whose `agents/gateway-internal/agent.toml`
             // does not exist, so approval_required_tools / irreversible_tools /
@@ -1967,7 +2054,7 @@ impl McpDispatcher {
         );
         if let Some(mut reply) = workflow_response {
             if operation_claim.is_some() {
-                reply["result"] = result.clone();
+                reply = finalize_workflow_operation_reply(tool_name, self.redaction.is_some(), result, reply);
             } else if let Some(layer) = &self.redaction {
                 if let Some(output) = reply.get_mut("result") {
                     crate::mcp_redaction::redact_tool_result_with(
@@ -1984,7 +2071,9 @@ impl McpDispatcher {
             }
             return jsonrpc_response(id, reply);
         }
-        result
+        // RM-130: after the egress / private-read accounting above (which
+        // counted a content-less error as payload-free) and after redaction.
+        finalize_tool_reply(tool_name, self.redaction.is_some(), result)
     }
 }
 
@@ -1994,6 +2083,10 @@ impl McpDispatcher {
 mod tests {
     #[test]
     fn odoo_scope_denial_names_gate_and_operator_scopes() {
+        let unavailable = super::scope_denial_message("odoo_unoffered", super::Scope::Admin);
+        assert!(unavailable.contains("not available"));
+        assert!(!unavailable.contains("Ask an admin"));
+        assert!(unavailable.contains("retrying the same call will not succeed"));
         for (tool, scope) in [("odoo_search", super::Scope::OdooRead), ("odoo_execute", super::Scope::OdooExecute), ("odoo_schema_overview", super::Scope::OdooRead)] {
             let message = super::scope_denial_message(tool, scope.clone());
             assert!(message.contains("MCP scope gate"));
@@ -2182,6 +2275,74 @@ mod tests {
         }
         assert!(crate::mcp::egress_gate::confirmed_sink_completion("send_message",
             &serde_json::json!({"id":1,"result":{"isError":false,"content":[]}})));
+    }
+
+    fn reply_text(reply: &serde_json::Value) -> String {
+        reply["result"]["content"].as_array().unwrap().iter()
+            .filter_map(|b| b["text"].as_str()).collect()
+    }
+
+    #[test]
+    fn rm130_empty_tool_error_gets_reason_after_accounting() {
+        let raw = serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"isError":true}});
+        // Accounting runs on the raw reply: a content-less error is payload-free…
+        assert!(!crate::mcp::egress_gate::model_visible_payload(&raw));
+        let finished = super::finalize_tool_reply("db_query", false, raw.clone());
+        // …and the reason is only added afterwards (it would otherwise count).
+        assert!(reply_text(&finished).contains("Tool call failed and returned no error message. Tool: db_query."));
+        assert_eq!(finished["result"]["isError"], true);
+        assert!(!crate::mcp::egress_gate::model_visible_payload(&raw), "accounting input untouched");
+    }
+
+    #[test]
+    fn rm130_active_redaction_summary_excludes_keys_and_numbers() {
+        let raw = serde_json::json!({"result":{"isError":true,"structuredContent":{"王小明":{"phone":912345678,"status":"safe"}}}});
+        let finished = super::finalize_tool_reply("db_query", true, raw);
+        let text = reply_text(&finished);
+        assert!(text.contains("safe"), "{text}");
+        assert!(!text.contains("王小明") && !text.contains("912345678") && !text.contains("status"), "{text}");
+    }
+
+    #[test]
+    fn rm130_workflow_operation_result_is_finalized_after_accounting() {
+        // Even an empty `content` field counts as payload; accounting must
+        // observe an error without that field before the reason is injected.
+        let raw = serde_json::json!({"id":1,"result":{"isError":true}});
+        assert!(!crate::mcp::egress_gate::model_visible_payload(&raw));
+        let reply = serde_json::json!({"state":"failed","result":raw.clone()});
+        let finished = super::finalize_workflow_operation_reply("db_query", true, raw.clone(), reply);
+        assert!(reply_text(&finished["result"]).contains("Tool: db_query."));
+        assert!(crate::mcp::egress_gate::model_visible_payload(&finished["result"]));
+        assert_eq!(finished["state"], "failed");
+        assert!(!crate::mcp::egress_gate::model_visible_payload(&raw));
+    }
+
+    #[test]
+    fn rm130_non_empty_error_withheld_and_success_unchanged() {
+        for reply in [
+            serde_json::json!({"id":1,"result":{"isError":true,"content":[{"type":"text","text":"boom"}]}}),
+            serde_json::json!({"id":1,"result":{"isError":true,"content":[{"type":"text","text":"Wiki page is quarantined; content withheld"}]}}),
+            serde_json::json!({"id":1,"result":{"content":[]}}),
+            serde_json::json!({"id":1,"error":{"code":-32602,"message":"Unknown tool: x"}}),
+        ] {
+            assert_eq!(super::finalize_tool_reply("t", true, reply.clone()), reply);
+        }
+    }
+
+    #[test]
+    fn rm130_jsonrpc_error_with_empty_message_gets_reason() {
+        let err = super::jsonrpc_error(&serde_json::json!(3), -32003, "");
+        let msg = err["error"]["message"].as_str().unwrap();
+        assert!(msg.starts_with("Tool call failed and returned no error message."), "{msg}");
+        assert!(msg.contains("-32003"), "{msg}");
+        assert!(err["error"].get("data").is_none());
+        assert!(!crate::mcp::egress_gate::model_visible_payload(&err), "still payload-free");
+        assert_eq!(super::jsonrpc_error(&serde_json::json!(3), -1, "kept")["error"]["message"], "kept");
+        // With redaction on, an unredacted `error.data` is never summarised.
+        let raw = serde_json::json!({"id":1,"error":{"code":-1,"data":{"secret":"s3cr3t"}}});
+        let finished = super::finalize_tool_reply("t", true, raw);
+        let msg = finished["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("-1") && !msg.contains("s3cr3t"), "{msg}");
     }
 
     #[tokio::test]
@@ -2594,6 +2755,207 @@ mod tests {
             Some(-32003),
             "the scaffold's scoped_tools must be honoured: {result}"
         );
+    }
+
+    // ── RM-103 S3 (v1.81): inherited approvals vs. the team intrinsic ────────
+
+    const S3_MEMBER: &str = "eph-boss-r1-executor-ab12cd";
+
+    /// Write a team role member scaffold (`[team_member]` + `ephemeral.toml`,
+    /// the two records `is_role_member_intrinsic_call` requires) carrying
+    /// `caps` — standing in for what the scaffold copies from the employee.
+    fn write_s3_member(tmp: &tempfile::TempDir, caps: &str) {
+        let dir = tmp
+            .path()
+            .join("agents")
+            .join(duduclaw_gateway::ephemeral::EPHEMERAL_DIR_NAME)
+            .join(S3_MEMBER);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agent.toml"),
+            format!(
+                "[agent]\nname = \"{S3_MEMBER}\"\nrole = \"worker\"\nstatus = \"active\"\n\
+                 reports_to = \"boss\"\n\
+                 [permissions]\ncan_send_cross_agent = true\ncan_create_agents = false\n\
+                 [team_member]\nrole = \"executor\"\ntask_id = \"task-1\"\nround = 1\nparent = \"boss\"\n\
+                 {caps}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ephemeral.toml"),
+            "parent = \"boss\"\ntier = \"standard\"\n\
+             created_at = \"2026-11-08T00:00:00Z\"\nexpires_at = \"2099-01-01T00:00:00Z\"\n",
+        )
+        .unwrap();
+    }
+
+    fn s3_member_principal() -> Principal {
+        Principal {
+            client_id: S3_MEMBER.to_string(),
+            scopes: [Scope::Admin].into_iter().collect(),
+            is_external: false,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A parent `policy` with no allow for `team_handoff`, an effect rule
+    /// blocking every `send` and approval lists naming it: the member can still
+    /// call `team_handoff` (no policy / action-rule refusal, no approval held),
+    /// while any other tool keeps the inherited policy.
+    #[tokio::test]
+    async fn inherited_policy_never_blocks_a_role_members_team_handoff() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_s3_member(
+            &tmp,
+            "[capabilities]\n\
+             action_rules = [{ effect = \"send\", verdict = \"block\" }]\n\
+             approval_required_tools = [\"team_handoff\"]\n\
+             irreversible_tools = [\"team_handoff\"]\n\
+             [[capabilities.policy]]\ntool = \"memory_search\"\neffect = \"allow\"\n",
+        );
+        assert!(duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(
+            tmp.path(),
+            S3_MEMBER,
+            "team_handoff"
+        ));
+        let dispatcher = make_dispatcher(&tmp).await;
+        for tool in ["team_handoff", "mcp__duduclaw__team_handoff"] {
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                dispatcher.dispatch_tool_call(
+                    &s3_member_principal(),
+                    &make_ns_ctx(false),
+                    &make_params(tool, serde_json::json!({})),
+                    &serde_json::json!(1),
+                ),
+            )
+            .await
+            .expect("an intrinsic must never be held for an inherited approval");
+            let msg = result["error"]["message"].as_str().unwrap_or("");
+            assert!(
+                !msg.contains("Denied by policy") && !msg.contains("action_rules"),
+                "{tool}: inherited policy must not block the intrinsic: {result}"
+            );
+        }
+        let broker = duduclaw_gateway::approval::ApprovalBroker::open(tmp.path()).unwrap();
+        assert!(broker.list_pending(None).await.unwrap_or_default().is_empty());
+
+        // Any other tool keeps the inherited strict-allowlist policy.
+        let other = dispatcher
+            .dispatch_tool_call(
+                &s3_member_principal(),
+                &make_ns_ctx(false),
+                &make_params("memory_store", serde_json::json!({"content": "x"})),
+                &serde_json::json!(2),
+            )
+            .await;
+        assert!(
+            other["error"]["message"].as_str().unwrap_or("").contains("Denied by policy"),
+            "{other}"
+        );
+
+        // An ordinary ephemeral (no `[team_member]` record) gets no exemption.
+        let dir = tmp
+            .path()
+            .join("agents")
+            .join(duduclaw_gateway::ephemeral::EPHEMERAL_DIR_NAME)
+            .join(S3_MEMBER);
+        let raw = std::fs::read_to_string(dir.join("agent.toml")).unwrap();
+        std::fs::write(dir.join("agent.toml"), raw.replace("[team_member]", "[not_a_member]"))
+            .unwrap();
+        assert!(!duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(
+            tmp.path(),
+            S3_MEMBER,
+            "team_handoff"
+        ));
+        let plain = dispatcher
+            .dispatch_tool_call(
+                &s3_member_principal(),
+                &make_ns_ctx(false),
+                &make_params("team_handoff", serde_json::json!({})),
+                &serde_json::json!(3),
+            )
+            .await;
+        assert_eq!(plain["error"]["code"], -32003, "{plain}");
+    }
+
+    /// A parent requiring approval for X: the member requires approval for X.
+    #[tokio::test]
+    async fn inherited_approval_still_holds_a_role_members_other_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_s3_member(&tmp, "[capabilities]\napproval_required_tools = [\"memory_search\"]\n");
+        let (rec, result) = dispatch_held_then_decide(
+            &tmp,
+            s3_member_principal(),
+            "memory_search",
+            serde_json::json!({ "query": "x" }),
+            false,
+        )
+        .await;
+        assert_eq!(rec.agent_id, S3_MEMBER);
+        assert_eq!(result["error"]["code"], -32003, "{result}");
+    }
+
+    /// Daybreak round 2 #1: the member inherits a wildcard `scoped_tools`
+    /// entry complete. Only the exact intrinsic call is carved out of the
+    /// grant gate; every other tool the wildcard covers still needs a grant,
+    /// and a non-member keeps the gate for `team_handoff` too.
+    #[tokio::test]
+    async fn inherited_wildcard_scoped_tools_exempt_only_the_exact_intrinsic() {
+        for entry in ["*", "mcp__duduclaw__*", "team_*", "team_handoff"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            write_s3_member(
+                &tmp,
+                &format!("[capabilities]\nscoped_tools = [\"{entry}\", \"memory_search\"]\n"),
+            );
+            let dispatcher = make_dispatcher(&tmp).await;
+            for tool in ["team_handoff", "mcp__duduclaw__team_handoff"] {
+                let result = s3_call(&dispatcher, tool, serde_json::json!({})).await;
+                let msg = result["error"]["message"].as_str().unwrap_or("");
+                assert!(
+                    !msg.contains("階段性授權"),
+                    "{entry}/{tool}: the intrinsic must not need a grant: {result}"
+                );
+            }
+            let other = s3_call(&dispatcher, "memory_search", serde_json::json!({ "query": "x" })).await;
+            assert!(
+                other["error"]["message"].as_str().unwrap_or("").contains("階段性授權"),
+                "{entry}: other scoped tools keep the grant requirement: {other}"
+            );
+            if matches!(entry, "*" | "mcp__duduclaw__*") {
+                // Covered only by the wildcard entry, which is never dropped.
+                let other =
+                    s3_call(&dispatcher, "memory_store", serde_json::json!({ "content": "x" })).await;
+                assert!(
+                    other["error"]["message"].as_str().unwrap_or("").contains("階段性授權"),
+                    "{entry}: a wildcard-covered tool keeps the grant requirement: {other}"
+                );
+            }
+
+            // Not a verified role member: the intrinsic is gated like any tool.
+            let dir = tmp
+                .path()
+                .join("agents")
+                .join(duduclaw_gateway::ephemeral::EPHEMERAL_DIR_NAME)
+                .join(S3_MEMBER);
+            let raw = std::fs::read_to_string(dir.join("agent.toml")).unwrap();
+            std::fs::write(dir.join("agent.toml"), raw.replace("[team_member]", "[not_a_member]"))
+                .unwrap();
+            let plain = s3_call(&dispatcher, "team_handoff", serde_json::json!({})).await;
+            assert_eq!(plain["error"]["code"], -32003, "{entry}: {plain}");
+        }
+    }
+
+    async fn s3_call(dispatcher: &McpDispatcher, tool: &str, args: Value) -> Value {
+        dispatcher
+            .dispatch_tool_call(
+                &s3_member_principal(),
+                &make_ns_ctx(false),
+                &make_params(tool, args),
+                &serde_json::json!(1),
+            )
+            .await
     }
 
     // ── Test: rate-limit exceeded returns JSON-RPC -32029 ────────────────────
@@ -4716,6 +5078,7 @@ effect = "forbid"
         "notion_search",
         "notion_status",
         "odoo_connect",
+        "odoo_create",
         "odoo_crm_create_lead",
         "odoo_crm_leads",
         "odoo_crm_update_stage",
@@ -4733,6 +5096,7 @@ effect = "forbid"
         "odoo_schema_overview",
         "odoo_search",
         "odoo_status",
+        "odoo_write",
         "office_script",
         "os_apply_update",
         "os_audio_get",
@@ -4855,7 +5219,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            261,
+            263,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
@@ -5269,11 +5633,56 @@ effect = "forbid"
         assert_eq!(rows(&tmp), 1, "a rate-limited call writes no audit row");
     }
 
+    /// v1.81 (S2): an unwritten `can_create_agents` resolves by role — a
+    /// non-main (or role-less) employee is refused by the permission gate,
+    /// an explicit `false` on `main` is refused too.
+    #[tokio::test]
+    async fn unwritten_can_create_agents_refuses_non_main_employees() {
+        for body in [
+            "[agent]\nname = \"test-client\"\n",
+            "[agent]\nname = \"test-client\"\nrole = \"specialist\"\n",
+            "[agent]\nname = \"test-client\"\nrole = \"main\"\n[permissions]\ncan_create_agents = false\n",
+        ] {
+            for tool in ["create_agent", "spawn_ephemeral"] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let dispatcher = make_dispatcher(&tmp).await;
+                write_scoped_toml(&tmp, body);
+                let result = dispatcher
+                    .dispatch_tool_call(
+                        &make_principal(vec![Scope::Admin], false),
+                        &make_ns_ctx(false),
+                        &make_params(tool, serde_json::json!({"name": "x"})),
+                        &serde_json::json!(2),
+                    )
+                    .await;
+                assert_eq!(result["error"]["code"], -32003, "{body} {tool}: {result}");
+                let msg = result["error"]["message"].as_str().unwrap_or("");
+                assert!(msg.contains("[permissions] can_create_agents"), "{body}: {result}");
+            }
+        }
+        // No agent.toml at all: no role to resolve ⇒ refused.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        let result = dispatcher
+            .dispatch_tool_call(
+                &make_principal(vec![Scope::Admin], false),
+                &make_ns_ctx(false),
+                &make_params("create_agent", serde_json::json!({"name": "x"})),
+                &serde_json::json!(3),
+            )
+            .await;
+        assert!(
+            result["error"]["message"].as_str().unwrap_or("").contains("can_create_agents"),
+            "{result}"
+        );
+    }
+
     #[tokio::test]
     async fn absent_or_true_permission_keeps_todays_behaviour() {
         for body in [
             "[permissions]\ncan_create_agents = true\n",
-            "[agent]\nname = \"test-client\"\n",
+            // v1.81 (S2): unwritten only passes for the `main` role.
+            "[agent]\nname = \"test-client\"\nrole = \"main\"\n",
         ] {
             let tmp = tempfile::TempDir::new().unwrap();
             let dispatcher = make_dispatcher(&tmp).await;

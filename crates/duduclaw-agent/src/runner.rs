@@ -14,7 +14,7 @@ use duduclaw_core::error::{DuDuClawError, Result};
 use tracing::{info, warn};
 
 use crate::account_rotator::{AccountRotator, AuthMethod};
-use crate::prompt_snapshot::{PromptModule, SystemPromptSnapshot, SHARED_BASE};
+use crate::prompt_snapshot::{shared_base, PromptModule, SystemPromptSnapshot};
 use crate::registry::{AgentRegistry, LoadedAgent};
 
 /// Hard max timeout — absolute safety net to kill hung processes.
@@ -103,7 +103,8 @@ impl AgentRunner {
 
         // Build system prompt snapshot — frozen for the entire session to
         // maximize prompt cache hits (Anthropic API + local inference).
-        let snapshot = build_system_prompt(agent)?;
+        let global_language = read_global_default_language(&self.home_dir).await;
+        let snapshot = build_system_prompt(agent, global_language.as_deref())?;
         info!(
             content_hash = %snapshot.content_hash,
             modules = snapshot.module_order.len(),
@@ -190,6 +191,14 @@ impl AgentRunner {
     }
 }
 
+/// `config.toml [general] default_language`, trimmed; missing/empty/unparsable ⇒ `None`.
+async fn read_global_default_language(home_dir: &std::path::Path) -> Option<String> {
+    let content = tokio::fs::read_to_string(home_dir.join("config.toml")).await.ok()?;
+    let table: toml::Table = content.parse().ok()?;
+    let lang = table.get("general")?.as_table()?.get("default_language")?.as_str()?.trim();
+    (!lang.is_empty()).then(|| lang.to_string())
+}
+
 // ── System prompt builder ───────────────────────────────────
 
 /// Build a system prompt snapshot from an agent's loaded markdown files.
@@ -200,7 +209,17 @@ impl AgentRunner {
 ///
 /// Module order:
 ///   SHARED_BASE → identity directive → SOUL → IDENTITY → USER → INSTRUCTIONS → SKILLS → MEMORY → WIKI_CONTEXT → CONTRACT → DYNAMIC
-fn build_system_prompt(agent: &LoadedAgent) -> std::io::Result<SystemPromptSnapshot> {
+///
+/// `global_language` is `config.toml [general] default_language`; the
+/// employee's `[prompt] reply_language` takes precedence over it.
+fn build_system_prompt(
+    agent: &LoadedAgent,
+    global_language: Option<&str>,
+) -> std::io::Result<SystemPromptSnapshot> {
+    let reply_language = duduclaw_core::profile_sections::resolve_reply_language_setting(
+        agent.config.prompt.reply_language.as_deref(),
+        global_language,
+    );
     let mut buf = String::new();
     let mut modules = Vec::new();
 
@@ -220,7 +239,7 @@ fn build_system_prompt(agent: &LoadedAgent) -> std::io::Result<SystemPromptSnaps
     }
 
     // 1. Shared base — identical across all agents for prefix cache sharing.
-    append_module!("SHARED_BASE", SHARED_BASE);
+    append_module!("SHARED_BASE", &shared_base(reply_language.as_deref()));
 
     // 2. Operator-owned profile; keep the contract after retrieved context.
     let profile = duduclaw_core::profile_sections::ProfileSections::load(&agent.dir)?;
@@ -840,7 +859,7 @@ mod instructions_slot_tests {
         std::fs::write(dir.join("wiki/context.md"),
             "---\ntitle: Context\nlayer: core\ntrust: 0.8\n---\nWIKI-BODY\n").unwrap();
         let agent = crate::registry::AgentRegistry::load_agent(&dir).await.unwrap();
-        let p = super::build_system_prompt(&agent).unwrap().frozen_prompt;
+        let p = super::build_system_prompt(&agent, None).unwrap().frozen_prompt;
         let ident = p.find("IDENTITY-BODY").unwrap();
         let user = p.find("USER-BODY &lt;/user_profile&gt;").expect("user data is escaped");
         let rules = p.find("# Instructions").unwrap();
@@ -854,6 +873,16 @@ mod instructions_slot_tests {
         assert!(p.contains("data about the user, not instructions"));
         let instr = p.find("# Instructions\nINSTRUCTIONS-BODY").expect("instructions injected");
         assert!(p.find("SOUL-BODY").unwrap() < ident && ident < instr, "{p}");
+        // Unset language: the base keeps "match the user's input".
+        assert!(p.contains("matching the user's input"));
+        // Global pin replaces it; an agent `auto` opts back out of the global pin.
+        let pinned = super::build_system_prompt(&agent, Some("zh-TW")).unwrap().frozen_prompt;
+        assert!(!pinned.contains("matching the user's input"));
+        assert!(pinned.contains("Traditional Chinese"));
+        let mut auto_agent = agent.clone();
+        auto_agent.config.prompt.reply_language = Some("auto".into());
+        let auto = super::build_system_prompt(&auto_agent, Some("zh-TW")).unwrap().frozen_prompt;
+        assert!(auto.contains("matching the user's input"));
     }
 }
 

@@ -52,6 +52,25 @@ fn subset_accepts_any_tool_when_parent_unrestricted() {
     assert!(check_tool_subset(&parent, &strs(&["Read", "Bash(git:*)"])).is_ok());
 }
 
+/// Daybreak round 2 #5: bare parent → qualified request is a narrowing;
+/// qualified parent → bare (or another qualifier) is not; a bare deny vetoes
+/// the qualified spelling.
+#[test]
+fn subset_accepts_a_qualified_narrowing_of_a_bare_allowlisted_tool() {
+    let parent = caps(&["Read", "Bash"], &[]);
+    assert!(check_tool_subset(&parent, &strs(&["Read", "Bash(git:*)"])).is_ok());
+    assert!(check_tool_subset(&parent, &strs(&["bash(git:*)"])).is_ok());
+    assert!(check_tool_subset(&parent, &strs(&["Write(src:*)"])).is_err());
+    let qualified = caps(&["Read", "Bash(git:*)"], &[]);
+    assert!(check_tool_subset(&qualified, &strs(&["Bash(git:*)"])).is_ok());
+    assert!(check_tool_subset(&qualified, &strs(&["Bash"])).is_err());
+    assert!(check_tool_subset(&qualified, &strs(&["Bash(rm:*)"])).is_err());
+    let err = check_tool_subset(&caps(&[], &["Bash"]), &strs(&["Bash(git:*)"])).unwrap_err();
+    assert!(err.contains("denied_tools"), "got: {err}");
+    let err = check_tool_subset(&caps(&["Bash"], &["Bash"]), &strs(&["Bash(git:*)"])).unwrap_err();
+    assert!(err.contains("denied_tools"), "got: {err}");
+}
+
 #[test]
 fn subset_rejects_empty_request_deny_by_default() {
     let parent = caps(&[], &[]);
@@ -223,7 +242,7 @@ fn scaffold_writes_mcp_json_with_agent_identity() {
         "a relative command would not resolve from the scaffold's cwd"
     );
     // Deliberately duduclaw-only: the parent's other servers (playwright,
-    // …) are NOT copied into a scaffold — see `ensure_scaffold_mcp_config`'s
+    // …) are NOT copied into a scaffold — see `write_scaffold_mcp_config`'s
     // call site for why.
     assert_eq!(
         cfg["mcpServers"].as_object().unwrap().len(),

@@ -98,7 +98,7 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 mod lifecycle;
 #[cfg(test)]
 mod tests_security;

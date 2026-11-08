@@ -449,9 +449,9 @@ async fn role_member_tools_list_uses_ephemeral_capabilities() {
     std::fs::write(parent_dir.join("agent.toml"), "[agent]\nstatus = 'active'\n").unwrap();
     let metadata = "parent = 'parent'\ntier = 'standard'\ncreated_at = '2026-10-29T00:00:00Z'\nexpires_at = '2026-10-30T00:00:00Z'\n";
     std::fs::write(dir.join("ephemeral.toml"), metadata).unwrap();
-    duduclaw_core::org_store::upsert(
-        home.path(), member, duduclaw_core::org_store::OrgEntry::new("parent", ""),
-    ).unwrap();
+    duduclaw_core::org_store::with_org_lock(home.path(), |org| {
+        duduclaw_core::org_store::upsert(org, member, duduclaw_core::org_store::OrgEntry::new("parent", ""))
+    }).unwrap();
     let mut principal =
         internal_principal_named(duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID);
     principal.scopes.insert(crate::mcp_auth::Scope::Admin);
@@ -482,15 +482,49 @@ async fn role_member_tools_list_uses_ephemeral_capabilities() {
         assert!(names_of(&super::handle_tools_list_for_agent(&json!(7), &principal, home.path(), member).await).is_empty());
     }
     std::fs::write(dir.join("ephemeral.toml"), metadata.replace("parent = 'parent'", &format!("parent = '{member}'"))).unwrap();
-    duduclaw_core::org_store::upsert(
-        home.path(), member, duduclaw_core::org_store::OrgEntry::new(member, ""),
-    ).unwrap();
+    // Authority writers refuse a self-report (RM-027 round 3)…
+    assert!(duduclaw_core::org_store::with_org_lock(home.path(), |org| {
+        duduclaw_core::org_store::upsert(org, member, duduclaw_core::org_store::OrgEntry::new(member, ""))
+    }).is_err());
+    // …so plant the legacy / hand-edited self-loop directly: still refused.
+    let org_path = duduclaw_core::org_store::org_store_path(home.path());
+    let row = format!("[agents.{member}]\nreports_to = \"parent\"\n");
+    let raw = std::fs::read_to_string(&org_path).unwrap();
+    assert!(raw.contains(&row), "{raw}");
+    std::fs::write(&org_path, raw.replace(&row, &format!("[agents.{member}]\nreports_to = \"{member}\"\n"))).unwrap();
     assert!(super::check_background_caller(home.path(), actor, "team_handoff").is_err());
     assert!(names_of(&super::handle_tools_list_for_agent(&json!(8), &principal, home.path(), member).await).is_empty());
     std::fs::write(dir.join("ephemeral.toml"), metadata).unwrap();
-    duduclaw_core::org_store::upsert(
-        home.path(), member, duduclaw_core::org_store::OrgEntry::new("parent", ""),
-    ).unwrap();
+    duduclaw_core::org_store::with_org_lock(home.path(), |org| {
+        duduclaw_core::org_store::upsert(org, member, duduclaw_core::org_store::OrgEntry::new("parent", ""))
+    }).unwrap();
+
+    // RM-103 S3 (Daybreak round 2 #1): an inherited wildcard `scoped_tools`
+    // entry is kept whole. Only the verified member's exact intrinsic is
+    // listed without a grant; every other covered tool stays hidden.
+    let member_toml = |scoped: &str| {
+        format!(
+            "[agent]\nstatus = \"active\"\nreports_to = 'parent'\n[team_member]\nrole = 'planner'\ntask_id = 'task-round'\nround = 1\nparent = 'parent'\n[capabilities]\nallowed_tools = [\"team_handoff\", \"memory_search\"]\nscoped_tools = [{scoped}]\n"
+        )
+    };
+    std::fs::write(dir.join("agent.toml"), member_toml("")).unwrap();
+    let unscoped = names_of(&super::handle_tools_list_for_agent(&json!(9), &principal, home.path(), member).await);
+    assert!(unscoped.contains(&"memory_search".to_string()), "{unscoped:?}");
+    assert!(unscoped.contains(&"team_handoff".to_string()), "{unscoped:?}");
+    for scoped in ["\"*\"", "\"mcp__duduclaw__*\"", "\"team_*\", \"memory_search\"", "\"team_handoff\", \"memory_*\""] {
+        std::fs::write(dir.join("agent.toml"), member_toml(scoped)).unwrap();
+        let listed = names_of(&super::handle_tools_list_for_agent(&json!(10), &principal, home.path(), member).await);
+        assert_eq!(listed, vec!["team_handoff"], "{scoped}");
+        // Not a verified role member: the intrinsic is scoped like any tool.
+        std::fs::write(
+            dir.join("agent.toml"),
+            member_toml(scoped).replace("[team_member]", "[not_a_member]"),
+        )
+        .unwrap();
+        let plain = names_of(&super::handle_tools_list_for_agent(&json!(11), &principal, home.path(), member).await);
+        assert!(!plain.contains(&"team_handoff".to_string()), "{scoped}: {plain:?}");
+        assert!(!plain.contains(&"memory_search".to_string()), "{scoped}: {plain:?}");
+    }
 
     // Syntactically valid TOML with a wrong capability type must match
     // the dispatch gate's stricter policy-only parse and expose nothing.

@@ -16,6 +16,8 @@
 //! api_key_enc     = "<encrypted>"      # AES-256-GCM via duduclaw-security
 //! allowed_models  = ["crm.lead", "sale.order"]
 //! allowed_actions = ["read", "search", "write:crm.lead"]
+//! # RM-120 opt-in for the generic odoo_create / odoo_write tools (default off):
+//! # allowed_actions += ["generic_create:crm.lead", "generic_write:crm.lead"]
 //! company_ids     = [1, 2]
 //! ```
 //!
@@ -37,7 +39,7 @@ pub const ODOO_UNREADABLE: &str =
 /// Every field is optional — present fields override the global default;
 /// absent fields inherit. `profile` defaults to `"default"` so deployments
 /// without overrides work unchanged.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentOdooConfig {
     /// Audit-log label for this connection. Falls back to `"default"` so
@@ -67,6 +69,10 @@ pub struct AgentOdooConfig {
     /// Granular forms: `"read"`, `"search"`, `"create"`, `"write"`,
     /// `"unlink"`, `"action"`, `"execute"`. Per-model qualification: `"write:crm.lead"` allows
     /// only `write` on `crm.lead`. Empty / absent ⇒ no action restriction.
+    ///
+    /// RM-120 also stores the per-table generic-write opt-in here as
+    /// `"generic_create:<model>"` / `"generic_write:<model>"` (always
+    /// qualified); see [`Self::generic_opt_in`].
     pub allowed_actions: Vec<String>,
     /// Multi-company scope. When non-empty, queries are narrowed to these
     /// `res.company` ids. Empty ⇒ inherit Odoo user's default companies.
@@ -75,8 +81,31 @@ pub struct AgentOdooConfig {
     /// models named here (e.g. `res.partner`) become reachable via the generic
     /// `odoo_search` / `odoo_execute` tools — still subject to `allowed_models`
     /// / `allowed_actions` and, for system metadata tables, read-only
-    /// enforcement. Empty ⇒ the default block list is fully in force.
-    pub unblock_models: Vec<String>,
+    /// enforcement. None inherits global settings; Some([]) explicitly blocks all defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unblock_models: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod unblock_regression_tests {
+    use super::*;
+
+    #[test]
+    fn toml_preserves_absent_empty_and_explicit_unblocks() {
+        for (raw, expected) in [
+            ("[odoo]\nusername = 'own'", None),
+            ("[odoo]\nunblock_models = []", Some(vec![])),
+            ("[odoo]\nunblock_models = ['hr.employee']", Some(vec!["hr.employee".to_string()])),
+        ] {
+            let cfg = AgentOdooConfig::parse_agent_toml(raw).unwrap().unwrap();
+            assert_eq!(cfg.unblock_models, expected);
+            let roundtrip: AgentOdooConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(roundtrip.unblock_models, expected);
+            let mut global = OdooConfig { unblock_models: vec!["res.partner".into()], ..Default::default() };
+            cfg.apply_to(&mut global).unwrap();
+            assert_eq!(global.unblock_models, expected.unwrap_or_else(|| vec!["res.partner".into()]));
+        }
+    }
 }
 
 impl AgentOdooConfig {
@@ -99,7 +128,7 @@ impl AgentOdooConfig {
             && self.allowed_models.is_empty()
             && self.allowed_actions.is_empty()
             && self.company_ids.is_empty()
-            && self.unblock_models.is_empty()
+            && self.unblock_models.is_none()
     }
 
     /// Parse from raw `agent.toml` text — looks for the `[odoo]` section.
@@ -194,6 +223,9 @@ impl AgentOdooConfig {
         if let Some(p) = &self.password_enc {
             config.password_enc = p.clone();
         }
+        if let Some(models) = &self.unblock_models {
+            config.unblock_models = models.clone();
+        }
         Ok(())
     }
 
@@ -229,6 +261,142 @@ impl AgentOdooConfig {
     /// Check whether `model` is permitted by `allowed_models`.
     pub fn permits_model(&self, model: &str) -> bool {
         self.allowed_models.is_empty() || self.allowed_models.iter().any(|m| m == model)
+    }
+
+    /// RM-120: explicit grant for the generic `odoo_create` / `odoo_write`
+    /// tools. Unlike [`Self::permits`] / [`Self::permits_model`], an empty
+    /// list grants nothing: `allowed_models` must name `model` exactly (no
+    /// wildcard) and `allowed_actions` must hold the bare `verb` or the
+    /// qualified `verb:model` token, compared exactly.
+    pub fn grants_explicitly(&self, verb: &str, model: &str) -> bool {
+        // A name the dispatch gate would refuse as invalid never grants, so
+        // `grants_explicitly_any` cannot list a tool through e.g. `"*"`.
+        crate::schema::valid_model_name(model)
+            && self.allowed_models.iter().any(|m| m == model)
+            && self.allowed_actions.iter().any(|tok| {
+                tok == verb || tok.split_once(':').is_some_and(|(v, m)| v == verb && m == model)
+            })
+    }
+
+    /// Whether [`Self::grants_explicitly`] holds for at least one model in
+    /// `allowed_models`.
+    pub fn grants_explicitly_any(&self, verb: &str) -> bool {
+        self.allowed_models.iter().any(|m| self.grants_explicitly(verb, m))
+    }
+
+    /// RM-120 separate opt-in (owner decision 2026-11-08): the per-table
+    /// `allowed_actions` token `generic_create:<model>` / `generic_write:<model>`
+    /// (dashboard toggle 允許通用新增／修改). Default off: existing settings
+    /// hold no such token, so they never gain the generic tools. Compared
+    /// exactly — there is no bare (all-tables) form and no wildcard. The
+    /// token grants nothing on its own; [`Self::grants_explicitly`] must hold
+    /// as well. Existing tools ignore it ([`Self::permits`] matches the verb
+    /// part, and `generic_create` / `generic_write` are not ORM verbs).
+    pub fn generic_opt_in(&self, verb: &str, model: &str) -> bool {
+        let Some(token) = generic_opt_in_verb(verb) else { return false };
+        crate::schema::valid_model_name(model)
+            && self
+                .allowed_actions
+                .iter()
+                .any(|tok| tok.split_once(':').is_some_and(|(v, m)| v == token && m == model))
+    }
+}
+
+/// The `allowed_actions` verb of the generic-write opt-in for `verb`.
+pub fn generic_opt_in_verb(verb: &str) -> Option<&'static str> {
+    match verb {
+        "create" => Some(GENERIC_CREATE_TOKEN),
+        "write" => Some(GENERIC_WRITE_TOKEN),
+        _ => None,
+    }
+}
+
+/// `allowed_actions` verb of the per-table opt-in for generic `odoo_create`.
+pub const GENERIC_CREATE_TOKEN: &str = "generic_create";
+/// `allowed_actions` verb of the per-table opt-in for generic `odoo_write`.
+pub const GENERIC_WRITE_TOKEN: &str = "generic_write";
+
+#[cfg(test)]
+mod explicit_grant_tests {
+    use super::*;
+
+    #[test]
+    fn empty_lists_grant_nothing() {
+        let cfg = AgentOdooConfig::default();
+        assert!(!cfg.grants_explicitly("create", "crm.lead"));
+        assert!(!cfg.grants_explicitly_any("create"));
+        let models_only = AgentOdooConfig { allowed_models: vec!["crm.lead".into()], ..Default::default() };
+        assert!(!models_only.grants_explicitly("create", "crm.lead"));
+        let actions_only = AgentOdooConfig { allowed_actions: vec!["create".into()], ..Default::default() };
+        assert!(!actions_only.grants_explicitly("create", "crm.lead"));
+        assert!(!actions_only.grants_explicitly_any("create"));
+    }
+
+    #[test]
+    fn exact_model_and_verb_required() {
+        let cfg = AgentOdooConfig {
+            allowed_models: vec!["crm.lead".into(), "*".into()],
+            allowed_actions: vec!["create".into(), "write:sale.order".into(), "write:*".into()],
+            ..Default::default()
+        };
+        assert!(cfg.grants_explicitly("create", "crm.lead"));
+        assert!(!cfg.grants_explicitly("create", "sale.order"), "'*' is not a wildcard");
+        assert!(!cfg.grants_explicitly("write", "crm.lead"), "qualified write names another model");
+        assert!(cfg.grants_explicitly_any("create"));
+        assert!(!cfg.grants_explicitly_any("write"));
+        let qualified = AgentOdooConfig {
+            allowed_models: vec!["sale.order".into()],
+            allowed_actions: vec!["write:sale.order".into()],
+            ..Default::default()
+        };
+        assert!(qualified.grants_explicitly("write", "sale.order"));
+        assert!(!qualified.grants_explicitly("create", "sale.order"));
+    }
+
+    #[test]
+    fn generic_opt_in_is_separate_exact_and_default_off() {
+        // An existing full grant holds no opt-in token: nothing changes.
+        let existing = AgentOdooConfig {
+            allowed_models: vec!["crm.lead".into()],
+            allowed_actions: vec!["read".into(), "create".into(), "write".into()],
+            ..Default::default()
+        };
+        assert!(existing.grants_explicitly("create", "crm.lead"));
+        assert!(!existing.generic_opt_in("create", "crm.lead"));
+        assert!(!existing.generic_opt_in("write", "crm.lead"));
+
+        let opted = AgentOdooConfig {
+            allowed_models: vec!["crm.lead".into()],
+            allowed_actions: vec![
+                "create".into(),
+                "generic_create:crm.lead".into(),
+                "generic_write:sale.order".into(),
+                "generic_write".into(),
+                "generic_write:*".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(opted.generic_opt_in("create", "crm.lead"));
+        assert!(!opted.generic_opt_in("write", "crm.lead"), "bare and '*' tokens are not all-tables forms");
+        assert!(opted.generic_opt_in("write", "sale.order"));
+        assert!(!opted.generic_opt_in("create", "sale.order"));
+        assert!(!opted.generic_opt_in("unlink", "crm.lead"));
+        assert!(!opted.generic_opt_in("write", "*"));
+
+        // The opt-in token is invisible to the existing (permissive) rules.
+        let token_only = AgentOdooConfig {
+            allowed_actions: vec!["generic_write:crm.lead".into()],
+            ..Default::default()
+        };
+        assert!(!token_only.permits("write", "crm.lead"));
+        assert!(!token_only.grants_explicitly("write", "crm.lead"));
+
+        // It survives the agent.toml round trip unchanged.
+        let raw = "[odoo]\nallowed_models = ['crm.lead']\nallowed_actions = ['write', 'generic_write:crm.lead']\n";
+        let cfg = AgentOdooConfig::parse_agent_toml(raw).unwrap().unwrap();
+        assert!(cfg.generic_opt_in("write", "crm.lead"));
+        let back: AgentOdooConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert!(back.generic_opt_in("write", "crm.lead"));
     }
 }
 

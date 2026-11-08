@@ -599,9 +599,12 @@ async fn install_native(
         if !ctx.dry_run {
             ctx.note_agent(id);
             crate::scaffold_planned_agent_dir(&ctx.home, &planned.scaffold, &planned.files).await?;
-            duduclaw_core::org_store::upsert(&ctx.home, id,
-                duduclaw_core::OrgEntry::new(&planned.scaffold.reports_to, &planned.department))
-                .map_err(|e| cfg_err(format!("組織資料寫入失敗：{e}")))?;
+            // Global org lock first (RM-027 round 3); the write is cycle-checked.
+            duduclaw_core::org_store::with_org_lock(&ctx.home, |org| {
+                duduclaw_core::org_store::upsert(org, id,
+                    duduclaw_core::OrgEntry::new(&planned.scaffold.reports_to, &planned.department))
+            })
+            .map_err(|e| cfg_err(format!("組織資料寫入失敗：{e}")))?;
             if !planned.department.is_empty() {
                 std::fs::create_dir_all(ctx.home.join("shared/wiki")
                     .join(duduclaw_core::DEPARTMENTS_NAMESPACE).join(&planned.department))

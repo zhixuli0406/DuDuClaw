@@ -154,6 +154,10 @@ impl ApprovalStore {
             ("on_behalf_of", "on_behalf_of TEXT"),
             ("origin_session_id", "origin_session_id TEXT"),
             ("origin_turn_id", "origin_turn_id TEXT"),
+            // RM-027: short exclusive decision lease (blocks the TTL sweep
+            // and other deciders while a decided effect lands).
+            ("lease_token", "lease_token TEXT"),
+            ("lease_until", "lease_until TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -465,10 +469,12 @@ impl ApprovalStore {
                  SET status = ?1, decided_by = ?2, decided_at = ?3
                  WHERE id = ?4 AND status = 'pending'
                  AND {live_origin}
+                 AND {no_live_lease}
                 AND (?1 NOT IN ('approved','denied','answered') OR
                       (julianday(created_at) IS NOT NULL
                        AND julianday(?3) < julianday(created_at) + ttl_seconds / 86400.0))",
-                    live_origin = super::turn_origin::LIVE_ORIGIN_SQL),
+                    live_origin = super::turn_origin::LIVE_ORIGIN_SQL,
+                    no_live_lease = no_live_lease_sql("?3")),
                 params![status.as_str(), decided_by, decided_at, id.as_str()],
             ).map_err(|e| format!("decide approval: {e}"))?;
             duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
@@ -484,6 +490,113 @@ impl ApprovalStore {
                 };
                 self.emit_lifecycle(event, &rec, status).await;
             }
+        }
+        Ok(n)
+    }
+
+    /// RM-027: take the exclusive decision lease on a row that is pending,
+    /// inside its TTL and not leased by anyone else (one atomic UPDATE).
+    /// While the lease lives, [`Self::decide_if_pending`] — the TTL sweep,
+    /// `poll`, plain deciders and `withdraw` — leaves the row alone.
+    pub(super) async fn take_lease(&self, id: &ApprovalId, token: &str, now: &str, until: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                &format!(
+                    "UPDATE approvals SET lease_token = ?1, lease_until = ?2
+                     WHERE id = ?3 AND status = 'pending'
+                     AND {no_live_lease}
+                     AND julianday(created_at) IS NOT NULL
+                     AND julianday(?4) < julianday(created_at) + ttl_seconds / 86400.0",
+                    no_live_lease = no_live_lease_sql("?4"),
+                ),
+                params![token, until, id.as_str(), now],
+            )
+            .map_err(|e| format!("take decision lease: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// Extend a lease the caller still holds — only while it is live, the row
+    /// is pending and the approval is still inside its TTL.
+    pub(super) async fn renew_lease(&self, id: &ApprovalId, token: &str, now: &str, until: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE approvals SET lease_until = ?1
+                 WHERE id = ?2 AND status = 'pending' AND lease_token = ?3
+                 AND julianday(lease_until) IS NOT NULL AND julianday(lease_until) > julianday(?4)
+                 AND julianday(created_at) IS NOT NULL
+                 AND julianday(?4) < julianday(created_at) + ttl_seconds / 86400.0",
+                params![until, id.as_str(), token, now],
+            )
+            .map_err(|e| format!("renew decision lease: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// RM-027 round 4: extend a lease the caller still holds **without**
+    /// re-judging the TTL — only while the lease is live and the row pending.
+    /// For a holder that already passed its final in-TTL check and is
+    /// committing its side effect: the TTL sweep must stay off the row until
+    /// the terminal decision lands ([`Self::decide_leased`] does not re-judge
+    /// the TTL either).
+    pub(super) async fn extend_lease(&self, id: &ApprovalId, token: &str, now: &str, until: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE approvals SET lease_until = ?1
+                 WHERE id = ?2 AND status = 'pending' AND lease_token = ?3
+                 AND julianday(lease_until) IS NOT NULL AND julianday(lease_until) > julianday(?4)",
+                params![until, id.as_str(), token, now],
+            )
+            .map_err(|e| format!("extend decision lease: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// Drop a lease the caller holds (no-op when it is no longer theirs).
+    pub(super) async fn release_lease(&self, id: &ApprovalId, token: &str) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE approvals SET lease_token = NULL, lease_until = NULL WHERE id = ?1 AND lease_token = ?2",
+            params![id.as_str(), token],
+        )
+        .map_err(|e| format!("release decision lease: {e}"))?;
+        Ok(())
+    }
+
+    /// Record the terminal decision under a lease the caller still holds.
+    /// The TTL is not re-judged here: the lease was taken (and renewed after
+    /// the caller's own wait) inside the TTL, and it kept the sweep away.
+    pub(super) async fn decide_leased(
+        &self,
+        id: &ApprovalId,
+        token: &str,
+        status: ApprovalStatus,
+        decided_by: &str,
+        decided_at: &str,
+    ) -> Result<usize, String> {
+        let (n, rec) = {
+            let mut conn = self.conn.lock().await;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| format!("begin leased approval decision: {e}"))?;
+            let rec = record_in_connection(&tx, id)?;
+            match &rec {
+                Some(r) if r.status == ApprovalStatus::Pending => check_expected_digest(r)?,
+                _ => return Ok(0),
+            }
+            let n = tx.execute(
+                &format!("UPDATE approvals
+                 SET status = ?1, decided_by = ?2, decided_at = ?3, lease_token = NULL, lease_until = NULL
+                 WHERE id = ?4 AND status = 'pending' AND lease_token = ?5
+                 AND julianday(lease_until) IS NOT NULL AND julianday(?3) < julianday(lease_until)
+                 AND {live_origin}",
+                    live_origin = super::turn_origin::LIVE_ORIGIN_SQL),
+                params![status.as_str(), decided_by, decided_at, id.as_str(), token],
+            ).map_err(|e| format!("decide leased approval: {e}"))?;
+            tx.commit().map_err(|e| format!("commit leased approval decision: {e}"))?;
+            (n, rec)
+        };
+        if n > 0 && let Some(rec) = rec {
+            self.emit_lifecycle("approval.decided", &rec, status).await;
         }
         Ok(n)
     }
@@ -627,6 +740,14 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<ApprovalRecord> {
         invalidated_reason: row.get(17)?,
         on_behalf_of: row.get(18)?,
     })
+}
+
+/// RM-027: "nobody holds a live decision lease on this row at `now_param`"
+/// (an unparseable `lease_until` counts as no lease).
+fn no_live_lease_sql(now_param: &str) -> String {
+    format!(
+        "(lease_until IS NULL OR julianday(lease_until) IS NULL OR julianday(lease_until) <= julianday({now_param}))"
+    )
 }
 
 // ── Broker ──────────────────────────────────────────────────

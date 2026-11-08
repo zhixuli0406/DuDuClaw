@@ -1,5 +1,5 @@
-import { passkeyUnavailableReason } from '@/lib/passkey';
 import { client } from '@/lib/ws-client';
+import { passkeyUnavailableReason } from '@/lib/passkey';
 import { ApiError, apiPost, useAuthStore, type FactorAvailability, type SessionTokens } from '@/stores/auth-store';
 
 export interface Enrollment {
@@ -24,7 +24,13 @@ export interface MfaOverview {
     channel: string; channel_user_id: string; verified: boolean; verified_at: number | null;
   }> }>;
 }
-export interface MfaStatus extends FactorAvailability { enabled: boolean; enforced: boolean; email_hint?: string }
+export interface MfaStatus extends FactorAvailability {
+  enabled: boolean;
+  enforced: boolean;
+  email_hint?: string;
+  /** Admin-only SAS of the installation key when the relay awaits console approval. */
+  relay_key_fingerprint?: string | null;
+}
 export async function accountRequest<T>(path: string, body?: Record<string, unknown>): Promise<T> {
   const jwt = useAuthStore.getState().jwt;
   if (!jwt) throw new ApiError(401, 'Session expired');
@@ -53,7 +59,13 @@ export const mfaApi = {
   issueCode: (user_id: string, challenge_ref: string) => client.call('users.mfa_enrollment_code', { user_id, challenge_ref }) as Promise<{ enrollment_code: string; expires_in: number }>,
   verify: (challenge_id: string, code: string, recovery: boolean) =>
     apiPost<SessionTokens>('/api/mfa/verify', { challenge_id, [recovery ? 'recovery_code' : 'code']: code }),
-  emailSend: (input: Record<string, unknown>) => apiPost<{ sent: boolean; expires_in: number }>('/api/mfa/email/send', input),
+  emailSend: async (input: Record<string, unknown>) => {
+    try { return await apiPost<{ sent: boolean; expires_in: number }>('/api/mfa/email/send', input); }
+    catch (error) {
+      if (error instanceof ApiError && error.status === 429) throw new Error('MFA_EMAIL_RATE_LIMITED');
+      throw error;
+    }
+  },
   emailVerify: (input: Record<string, unknown>) => apiPost<SessionTokens & { recovery_codes?: string[] }>('/api/mfa/email/verify', input),
   emailBegin: (password: string) => client.call('mfa.email_begin', { password }) as Promise<{ enrollment_token: string }>,
   emailConfirm: (enrollment_token: string, code: string) => client.call('mfa.email_confirm', { enrollment_token, code }) as Promise<SessionTokens & { recovery_codes?: string[] }>,
@@ -70,6 +82,7 @@ export function mfaErrorId(error: unknown): string {
     if (error.status === 401 || error.status === 403) return 'mfa.error.expired';
   }
   const message = error instanceof Error ? error.message : '';
+  if (message === 'MFA_EMAIL_RATE_LIMITED' || /寄送太頻繁/.test(message)) return 'mfa.email.rateLimited';
   if (message === 'PASSKEY_UNAVAILABLE') return `mfa.passkey.${passkeyUnavailableReason() ?? 'unavailable'}`;
   if (message === 'PASSKEY_CANCELLED' || (error instanceof DOMException && error.name === 'NotAllowedError')) return 'mfa.passkey.cancelled';
   if (/嘗試次數|too many/i.test(message)) return 'mfa.error.attempts';

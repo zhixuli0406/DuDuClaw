@@ -54,18 +54,78 @@ pub fn with_file_lock<T>(path: &Path, f: impl FnOnce() -> io::Result<T>) -> io::
     result
 }
 
-fn acquire(path: &Path) -> io::Result<File> {
+/// An exclusive cross-process advisory lock held for as long as the guard
+/// lives (same sidecar `<path>.lock` scheme as [`with_file_lock`]). For a
+/// critical section that cannot be one closure — e.g. one spanning `.await`
+/// points. Unlocked on drop.
+#[derive(Debug)]
+pub struct FileLockGuard {
+    file: File,
+}
+
+impl Drop for FileLockGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+/// Take the lock [`with_file_lock`] would take, returning a guard instead of
+/// running a closure. Blocks until the lock can be acquired. Two guards for
+/// the same path conflict even inside one process (each holds its own open
+/// file description), so the lock is not re-entrant.
+pub fn lock_exclusive(path: &Path) -> io::Result<FileLockGuard> {
+    Ok(FileLockGuard { file: acquire(path)? })
+}
+
+/// [`lock_exclusive`] with a **hard upper bound** on the wait: when the lock
+/// is not acquired within `wait`, an [`io::ErrorKind::TimedOut`] error
+/// (message starting `lock_wait_timeout`) is returned and nothing is held.
+/// RM-027 round 6: for a holder of the global org lock that must keep a
+/// per-agent file lock across several steps.
+pub fn lock_exclusive_within(path: &Path, wait: std::time::Duration) -> io::Result<FileLockGuard> {
+    Ok(FileLockGuard { file: acquire_within(path, wait)? })
+}
+
+/// [`with_file_lock`] with a **hard upper bound** on the wait: when the lock
+/// is not acquired within `wait`, `f` does not run and an
+/// [`io::ErrorKind::TimedOut`] error is returned. For a caller that must not
+/// wait unboundedly while it holds another lock (RM-027 round 5: the
+/// `agent.toml` mirror write under the global org lock).
+pub fn with_file_lock_timeout<T>(
+    path: &Path,
+    wait: std::time::Duration,
+    f: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let lock = acquire_within(path, wait)?;
+    let result = f();
+    let _ = FileExt::unlock(&lock);
+    result
+}
+
+/// Is `error` the "someone else holds it" answer of a non-blocking lock try?
+fn is_contended(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
+fn open_lock_file(path: &Path) -> io::Result<File> {
     let lock_path = lock_path_for(path);
     if let Some(parent) = lock_path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
-        .open(&lock_path)?;
+        .open(&lock_path)
+}
+
+/// Unbounded acquire, unless the thread is inside [`with_lock_deadline`]: then
+/// the wait is bounded by that caller-owned deadline.
+fn acquire(path: &Path) -> io::Result<File> {
+    let file = open_lock_file(path)?;
     if let Some(deadline) = LOCK_DEADLINE.with(Cell::get) {
         loop {
             if Instant::now() >= deadline {
@@ -73,7 +133,7 @@ fn acquire(path: &Path) -> io::Result<File> {
             }
             match FileExt::try_lock_exclusive(&file) {
                 Ok(()) => break,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(error) if is_contended(&error) => {
                     std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(5)));
                 }
                 Err(error) => return Err(error),
@@ -83,6 +143,32 @@ fn acquire(path: &Path) -> io::Result<File> {
         file.lock_exclusive()?;
     }
     Ok(file)
+}
+
+/// Poll a non-blocking exclusive try every 10 ms until `wait` has passed.
+/// An enclosing [`with_lock_deadline`] can only shorten the bound.
+fn acquire_within(path: &Path, wait: std::time::Duration) -> io::Result<File> {
+    let file = open_lock_file(path)?;
+    let own_deadline = Instant::now() + wait;
+    let scoped = LOCK_DEADLINE.with(Cell::get).filter(|scope| *scope < own_deadline);
+    let deadline = scoped.unwrap_or(own_deadline);
+    loop {
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(file),
+            Err(e) if is_contended(&e) => {}
+            Err(e) => return Err(e),
+        }
+        if Instant::now() >= deadline {
+            if scoped.is_some() {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "file lock deadline exceeded"));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("lock_wait_timeout: {} still held after {} ms", lock_path_for(path).display(), wait.as_millis()),
+            ));
+        }
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+    }
 }
 
 fn lock_path_for(path: &Path) -> std::path::PathBuf {
@@ -121,6 +207,60 @@ mod tests {
         assert_eq!(contents, "{\"a\":1}\n");
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::remove_file(lock_path_for(&target));
+    }
+
+    #[test]
+    fn a_guard_excludes_a_second_holder_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("locks").join("guarded");
+        let guard = lock_exclusive(&target).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t2 = target.clone();
+        let waiter = std::thread::spawn(move || {
+            let _g = lock_exclusive(&t2).unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            "a second holder must wait while the guard lives"
+        );
+        drop(guard);
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn a_bounded_wait_times_out_without_running_the_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bounded");
+        let held = lock_exclusive(&target).unwrap();
+        let started = std::time::Instant::now();
+        let mut ran = false;
+        let err = with_file_lock_timeout(&target, std::time::Duration::from_millis(150), || {
+            ran = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(!ran, "the closure must not run without the lock");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        drop(held);
+        assert_eq!(with_file_lock_timeout(&target, std::time::Duration::from_millis(150), || Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn a_bounded_guard_times_out_then_succeeds_once_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("bounded-guard");
+        let held = lock_exclusive(&target).unwrap();
+        let err = lock_exclusive_within(&target, std::time::Duration::from_millis(100)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("lock_wait_timeout"), "{err}");
+        drop(held);
+        let guard = lock_exclusive_within(&target, std::time::Duration::from_millis(100)).unwrap();
+        // The bounded guard excludes a closure-style holder too.
+        assert!(with_file_lock_timeout(&target, std::time::Duration::from_millis(50), || Ok(())).is_err());
+        drop(guard);
     }
 
     #[test]

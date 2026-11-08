@@ -158,7 +158,7 @@ describe('Odoo permissions editor', () => {
     await user.click(screen.getByRole('button', { name: 'Scan tables' }));
     expect(await screen.findByRole('checkbox', { name: 'Leads (crm.lead)' })).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'x_old.table' })).toBeChecked();
-    expect(mockWsClient.call).toHaveBeenCalledWith('odoo.schema_scan', {}, false, 300000);
+    expect(mockWsClient.call).toHaveBeenCalledWith('odoo.schema_scan', {}, false, 3600000);
   });
 });
 
@@ -194,6 +194,11 @@ describe('Odoo account rights', () => {
     expect(screen.getByText(/Button actions cover confirm, validate and archive/)).toBeInTheDocument();
   });
 
+  it('explains that general create and update need an explicit table grant', () => {
+    renderWithProviders(<Harness />);
+    expect(screen.getByText(/General create and update \(for any table\) need an explicit grant/)).toBeInTheDocument();
+  });
+
   it('reads cached rights on load and refreshes only after explicit rescan', async () => {
     const user = userEvent.setup();
     renderWithProviders(<Harness initial={{ allowed_actions: ['read:crm.lead'] }} />);
@@ -204,6 +209,48 @@ describe('Odoo account rights', () => {
     await user.click(screen.getByRole('button', { name: 'Rescan tables' }));
     await waitFor(() => expect(screen.getByRole('checkbox', { name: 'Create' })).not.toHaveAttribute('aria-disabled', 'true'));
     expect(mockWsClient.call.mock.calls.filter(([method]) => method === 'odoo.schema_scan')).toHaveLength(1);
+  });
+});
+
+describe('General create / update opt-in', () => {
+  const toggleName = 'Allow general create / update';
+
+  it('is off for existing grants, saves per-table tokens and follows Create / Update', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<Harness initial={{ allowed_models: ['crm.lead'], allowed_actions: ['create:crm.lead', 'write:crm.lead'] }} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Add rule' })).toBeEnabled());
+    const toggle = screen.getByRole('checkbox', { name: toggleName });
+    expect(toggle).not.toBeChecked();
+    expect(screen.getByText(/Lets the AI set any writable field of this table/)).toBeInTheDocument();
+    expect(changed).not.toHaveBeenCalled();
+    await user.click(toggle);
+    expect(changed.mock.lastCall?.[0].allowed_actions).toEqual(['create:crm.lead', 'write:crm.lead', 'generic_create:crm.lead', 'generic_write:crm.lead']);
+    await user.click(screen.getByRole('checkbox', { name: 'Create' }));
+    expect(changed.mock.lastCall?.[0].allowed_actions).toEqual(['write:crm.lead', 'generic_write:crm.lead']);
+    await user.click(screen.getByRole('checkbox', { name: 'Update' }));
+    expect(changed.mock.lastCall?.[0].allowed_actions).toEqual([]);
+    expect(screen.queryByRole('checkbox', { name: toggleName })).not.toBeInTheDocument();
+  });
+
+  it('loads a saved opt-in, is never offered for all tables and resets when the table changes', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<Harness initial={{ allowed_actions: ['create', 'write:crm.lead', 'generic_write:crm.lead'] }} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Add rule' })).toBeEnabled());
+    expect(within(screen.getByRole('group', { name: 'Rule 1' })).queryByRole('checkbox', { name: toggleName })).not.toBeInTheDocument();
+    const second = screen.getByRole('group', { name: 'Rule 2' });
+    expect(within(second).getByRole('checkbox', { name: toggleName })).toBeChecked();
+    expect(screen.queryByText('Other settings')).not.toBeInTheDocument();
+    await user.click(within(second).getByRole('combobox', { name: 'Table 2' }));
+    await user.click(await screen.findByRole('option', { name: 'hr.employee · Sensitive' }));
+    await user.click(screen.getByRole('button', { name: 'Allow access' }));
+    expect(changed.mock.lastCall?.[0].allowed_actions).toEqual(['create', 'write:hr.employee']);
+    expect(within(screen.getByRole('group', { name: 'Rule 2' })).getByRole('checkbox', { name: toggleName })).not.toBeChecked();
+  });
+
+  it('is not shown for a table rule without Create or Update', async () => {
+    renderWithProviders(<Harness initial={{ allowed_actions: ['read:crm.lead', 'search:crm.lead', 'unlink:crm.lead'] }} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Add rule' })).toBeEnabled());
+    expect(screen.queryByRole('checkbox', { name: toggleName })).not.toBeInTheDocument();
   });
 });
 

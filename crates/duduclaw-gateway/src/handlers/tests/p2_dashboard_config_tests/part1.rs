@@ -836,3 +836,20 @@ fn odo_actions_roundtrip_runtime_verbs_and_preserve_exact_legacy_entries() {
         &std::env::temp_dir()).unwrap();
     assert!(table["odoo"]["allowed_actions"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn odo_generic_write_opt_in_tokens_are_per_table_only() {
+    // RM-120: the dashboard toggle 允許通用新增／修改 saves these tokens.
+    assert!(odo_valid_action("generic_create:crm.lead"));
+    assert!(odo_valid_action("generic_write:crm.lead"));
+    for invalid in ["generic_create", "generic_write", "generic_write:", "generic_write:*", "generic_write:Bad Model", "generic_unlink:crm.lead"] {
+        assert!(!odo_valid_action(invalid), "{invalid}");
+    }
+    let mut table = toml::Table::new();
+    apply_odoo_to_table(&mut table,
+        &json!({ "odoo": { "allowed_models": ["crm.lead"], "allowed_actions": ["create", "write", "generic_create:crm.lead", "generic_write:crm.lead"] } }),
+        &std::env::temp_dir()).unwrap();
+    let config = duduclaw_odoo::AgentOdooConfig::from_table(&table).unwrap().unwrap();
+    assert!(config.generic_opt_in("create", "crm.lead") && config.generic_opt_in("write", "crm.lead"));
+    assert!(config.permits("write", "crm.lead"), "existing verbs are unaffected");
+}

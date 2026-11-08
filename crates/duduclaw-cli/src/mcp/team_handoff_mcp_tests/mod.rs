@@ -68,7 +68,10 @@ fn mk_ephemeral_member(
         dir.join("ephemeral.toml"),
         "parent = \"agnes\"\ntier = \"standard\"\ncreated_at = \"2026-10-29T00:00:00Z\"\nexpires_at = \"2026-10-30T00:00:00Z\"\n",
     ).unwrap();
-    duduclaw_core::org_store::upsert(home, id, duduclaw_core::OrgEntry::new("agnes", "")).unwrap();
+    duduclaw_core::org_store::with_org_lock(home, |org| {
+        duduclaw_core::org_store::upsert(org, id, duduclaw_core::OrgEntry::new("agnes", ""))
+    })
+    .unwrap();
 }
 
 fn mk_member_in(dir: &std::path::Path, role: &str, task: Option<&str>, round: Option<u32>) {

@@ -24,6 +24,16 @@ fn sweep_blocking(home_dir: &Path) -> usize {
     let Ok(canonical_root) = root.canonicalize() else {
         return 0; // no ephemeral namespace yet — nothing to do
     };
+    // The sweep removes authority records, so it holds the global org lock —
+    // taken before the barrier (RM-027 round 3 lock order, as in
+    // `agents.update`).
+    let org = match duduclaw_core::org_store::lock_org_mutations(home_dir) {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::warn!(%error, "ephemeral GC deferred (org lock unavailable); no scaffold removed");
+            return 0;
+        }
+    };
     // Hold the home-wide barrier across the sweep, including containment checks.
     let _barrier = match duduclaw_core::autonomy_gate::exclusive_barrier(home_dir) {
         Ok(guard) => guard,
@@ -104,7 +114,7 @@ fn sweep_blocking(home_dir: &Path) -> usize {
                 // WP22 T1 — the scaffold's authoritative record dies with it,
                 // after the directory is really gone (same ordering rationale
                 // as MCP `agent_remove`).
-                if let Err(e) = duduclaw_core::org_store::remove(home_dir, &name) {
+                if let Err(e) = duduclaw_core::org_store::remove(&org, &name) {
                     tracing::warn!(
                         ephemeral = %name,
                         error = %e,

@@ -863,6 +863,15 @@ impl SessionManager {
             .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
 
         info!(session_id, "Session purged (hard delete)");
+        drop(conn);
+        // RM-124: schedules / reminders that report into this WebChat
+        // conversation die with it (delivery is independently refused for a
+        // recreated conversation with the same id).
+        if session_id.starts_with("webchat:") {
+            if let Some(home) = self.db_path.parent() {
+                crate::scheduled_webchat::cancel_for_session(home, session_id).await;
+            }
+        }
         Ok(())
     }
 
@@ -939,6 +948,12 @@ impl SessionManager {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| DuDuClawError::Gateway(format!("begin transaction: {e}")))?;
+        // RM-124: exact WebChat ids, captured inside the tx before the delete.
+        let webchat_ids = Self::webchat_ids(
+            &tx,
+            "SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'",
+            params![contact, like],
+        )?;
         tx.execute(
             "DELETE FROM webchat_turn_cancellations WHERE session_id IN (
                  SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ESCAPE '\\'
@@ -972,6 +987,8 @@ impl SessionManager {
         if sessions > 0 {
             info!(contact, sessions, messages, "GDPR: erased contact sessions");
         }
+        drop(conn);
+        self.cancel_webchat_schedules(&webchat_ids).await;
         Ok((sessions as u64, messages as u64))
     }
 
@@ -1015,6 +1032,12 @@ impl SessionManager {
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
         // Step 2: purge sessions archived beyond the retention window.
+        // RM-124: remember the exact WebChat ids before they disappear.
+        let purge_webchat_ids = Self::webchat_ids(
+            &conn,
+            "SELECT id FROM sessions WHERE archived_at IS NOT NULL AND archived_at < ?1",
+            params![purge_cutoff],
+        )?;
         conn.execute(
             "DELETE FROM webchat_turn_cancellations WHERE session_id IN (
                 SELECT id FROM sessions WHERE archived_at IS NOT NULL AND archived_at < ?1
@@ -1049,7 +1072,44 @@ impl SessionManager {
                 purged, max_age_hours, purge_after_days, "Session cleanup: archived + purged"
             );
         }
+        drop(conn);
+        self.cancel_webchat_schedules(&purge_webchat_ids).await;
         Ok(archived as u64)
+    }
+
+    /// Ids (only `webchat:` ones) returned by `sql`, captured before a hard delete.
+    fn webchat_ids(
+        conn: &Connection,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<String>> {
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let rows = stmt
+            .query_map(params, |r| r.get::<_, String>(0))
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let id = r.map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            if id.starts_with("webchat:") {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// RM-124: after a batch hard delete has committed (and the sessions.db
+    /// connection is released), cancel schedules / reminders aimed at each id.
+    async fn cancel_webchat_schedules(&self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        if let Some(home) = self.db_path.parent() {
+            for id in ids {
+                crate::scheduled_webchat::cancel_for_session(home, id).await;
+            }
+        }
     }
 
     // ── Instruction Pinning ────────────────────────────────────

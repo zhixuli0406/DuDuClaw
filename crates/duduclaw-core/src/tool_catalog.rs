@@ -606,6 +606,18 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "odoo:write",
         "odoo",
     ),
+    (
+        "odoo_create",
+        "Create a record in an explicitly granted Odoo model",
+        "odoo:write",
+        "odoo",
+    ),
+    (
+        "odoo_write",
+        "Update records in an explicitly granted Odoo model",
+        "odoo:write",
+        "odoo",
+    ),
     // ── Odoo: execute (odoo:execute) ─────────────────────────────────────
     (
         "odoo_sale_confirm",

@@ -6,6 +6,18 @@ Official Linux CLI binaries require **glibc ≥ 2.31**: Ubuntu 20.04+, Debian 11
 
 ---
 
+## macOS installation
+
+On macOS, we recommend `install.sh` over npm so the signed gateway app has a stable location. The installer uses built-in macOS tools plus [minisign](https://jedisct1.github.io/minisign/), which it needs to check the release signature (`brew install minisign`; on Debian/Ubuntu `sudo apt install minisign`). Without minisign the installer stops instead of skipping the check:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | bash
+```
+
+The installer downloads the signed and notarized `.app.zip`, verifies its minisign signature against the pinned release key and its SHA-256 checksum, checks the archive listing before extracting anything, verifies the app's Developer ID signature, identifier, version and edition, and installs `~/Applications/DuDuClaw Gateway.app`. The CLI at `~/.duduclaw/bin/duduclaw` is a symlink to `DuDuClaw Gateway.app/Contents/MacOS/duduclaw`; add `~/.duduclaw/bin` to your `PATH`.
+
+Set `DUDUCLAW_APP_DIR` to change the app directory and `DUDUCLAW_HOME` to change the CLI home. Older releases without an `.app.zip` use the legacy tarball. npm remains available and includes the app inside its macOS platform package.
+
 ## 1. Local development
 
 ```bash
@@ -347,6 +359,13 @@ replaced at the next update. If automatic relaunch fails, use
 exit code 78, run that command to re-register the job with the updated binary.
 The first upgrade from a version without this fix can still need a manual
 restart: the new behavior starts once the fixed gateway is running.
+
+**Folder access after an update.** macOS may ask again whether DuDuClaw may
+read `~/Documents`, `~/Desktop`, `~/Downloads`, iCloud Drive or external
+volumes. Until someone clicks **Allow** on that Mac, AI employees cannot read
+files there; the dashboard shows a banner and admins get one channel notice.
+See [macOS folder access](macos-folder-access.md) for how to re-grant it, where
+to keep work files so it never matters, and the enterprise PPPC profile.
 
 ### Linux (systemd)
 

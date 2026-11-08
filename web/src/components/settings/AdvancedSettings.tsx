@@ -13,6 +13,7 @@ import { RedactionTab } from './sections/RedactionTab';
 import { EmbeddingSettingsCard } from '@/components/knowledge/EmbeddingSettingsCard';
 import { DoctorTab } from './sections/DoctorTab';
 import { BrowserTab } from './sections/BrowserTab';
+import { ExternalStatusSettings } from './sections/ExternalStatusSettings';
 import { AutomationTab } from './sections/AutomationTab';
 import { DelegationTab } from './sections/DelegationTab';
 import { CalibrationTab } from './sections/CalibrationTab';
@@ -36,6 +37,7 @@ function SettingPanel({ id }: { id: string }) {
     case 'knowledgeSearch': return <EmbeddingSettingsCard />;
     case 'doctor': return <DoctorTab />;
     case 'browser': return <BrowserTab />;
+    case 'externalStatus': return <ExternalStatusSettings />;
     case 'automation': return <AutomationTab />;
     case 'delegation': return <DelegationTab />;
     case 'calibration': return <CalibrationTab />;

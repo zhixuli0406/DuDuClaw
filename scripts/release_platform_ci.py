@@ -11,7 +11,11 @@ import subprocess
 REPO = "zhixuli0406/DuDuClaw"
 MAX_COMMITS_BEHIND = 3
 MAX_AGE = dt.timedelta(hours=36)
-PLATFORM_JOBS = ("Rust macos-latest", "Rust windows-latest")
+PLATFORM_JOBS = tuple(
+    f"Rust {os_name} (shard {shard}/3)"
+    for os_name in ("macos-latest", "windows-latest")
+    for shard in range(1, 4)
+)
 
 
 def command(*args):

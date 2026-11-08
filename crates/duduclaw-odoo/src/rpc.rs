@@ -38,6 +38,19 @@ pub async fn jsonrpc_call(
     method: &str,
     args: Vec<Value>,
 ) -> Result<Value, String> {
+    jsonrpc_call_classified(http, url, service, method, args).await.map_err(|e| e.message)
+}
+
+/// Retry classification comes from transport/status, never remote exception text.
+#[derive(Debug)]
+pub struct RpcFailure {
+    pub message: String,
+    pub retryable: bool,
+}
+
+async fn jsonrpc_call_classified(
+    http: &reqwest::Client, url: &str, service: &str, method: &str, args: Vec<Value>,
+) -> Result<Value, RpcFailure> {
     let payload = json!({
         "jsonrpc": "2.0",
         "method": "call",
@@ -56,26 +69,27 @@ pub async fn jsonrpc_call(
         .json(&payload)
         .send()
         .await
-        .map_err(|e| format!("HTTP error: {e}"))?;
+        .map_err(|error| RpcFailure { message: "Odoo HTTP transport error".into(),
+            retryable: error.is_timeout() || error.is_connect() || (error.is_request() && !error.is_builder()) })?;
 
     if !resp.status().is_success() {
-        return Err(render_http_error(resp.status()));
+        return Err(RpcFailure { message: render_http_error(resp.status()), retryable: resp.status().is_server_error() || resp.status() == reqwest::StatusCode::REQUEST_TIMEOUT });
     }
 
     // Read incrementally, including unknown-length/chunked responses. Do not
     // trust Content-Length, and reject excess bytes before serde allocation.
     let mut bytes = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("HTTP body error: {e}"))? {
+    while let Some(chunk) = resp.chunk().await.map_err(|_| RpcFailure { message: "Odoo HTTP body transport error".into(), retryable: true })? {
         if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
-            return Err("Odoo RPC response exceeds the 32 MiB size limit".into());
+            return Err(RpcFailure { message: "Odoo RPC response exceeds the 32 MiB size limit".into(), retryable: false });
         }
         bytes.extend_from_slice(&chunk);
     }
-    let body: Value = serde_json::from_slice(&bytes).map_err(|e| format!("JSON parse: {e}"))?;
+    let body: Value = serde_json::from_slice(&bytes).map_err(|_| RpcFailure { message: "Odoo JSON parse error".into(), retryable: false })?;
 
     if let Some(error) = body.get("error") {
         warn!(summary = %rpc_error_log_summary(error, resp.status().as_u16()), "Odoo server RPC error");
-        return Err(render_rpc_error(error));
+        return Err(RpcFailure { message: render_rpc_error(error), retryable: false });
     }
 
     Ok(body.get("result").cloned().unwrap_or(Value::Null))
@@ -87,7 +101,7 @@ fn render_http_error(status: reqwest::StatusCode) -> String {
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
     ) {
         format!(
-            "Odoo HTTP access gate denied this request (HTTP {status}). Ask an administrator to check the saved Odoo connection credentials and server/proxy access rules."
+            "Odoo HTTP access gate denied this request (HTTP {status}). Ask an administrator to check the saved Odoo connection credentials and server/proxy access rules. Retrying the same request will not succeed until those settings change. 設定修正前，重試相同請求不會成功。"
         )
     } else {
         format!("Odoo returned HTTP {status}")
@@ -99,11 +113,14 @@ fn render_http_error(status: reqwest::StatusCode) -> String {
 fn render_rpc_error(error: &Value) -> String {
     let data = error.get("data");
     let class = data.and_then(|d| d.get("name")).and_then(Value::as_str);
+    if matches!(class, Some("builtins.AttributeError" | "AttributeError")) {
+        return "This Odoo capability is not available. This is a policy decision; retrying the same call will not succeed. 這項 Odoo 功能不提供；這是政策限制，重試相同呼叫不會成功。".into();
+    }
     if class == Some("odoo.exceptions.AccessDenied") {
-        return "Odoo server authentication gate denied this request. Ask an administrator to check the database, username and API key/password in the saved Odoo connection settings.".into();
+        return "Odoo server authentication gate denied this request. Ask an administrator to check the database, username and API key/password in the saved Odoo connection settings. Retrying the same credentials will not succeed. 使用相同憑證重試不會成功。".into();
     }
     if class == Some("odoo.exceptions.AccessError") {
-        return "Odoo server ACL gate denied this request. Ask an Odoo administrator to check the Odoo service account's access rights and record rules.".into();
+        return "Odoo server ACL gate denied this request. Ask an Odoo administrator to check the Odoo service account's access rights and record rules. This is a policy decision; retrying the same call will not succeed. 這是政策限制，重試相同呼叫不會成功。".into();
     }
     let msg = data
         .and_then(|d| d.get("message"))
@@ -349,6 +366,10 @@ mod tests {
     }
     #[test]
     fn rpc_acl_denials_name_server_gate_without_remote_tracebacks() {
+        let unavailable = render_rpc_error(&json!({"data":{"name":"builtins.AttributeError"}}));
+        assert!(unavailable.contains("capability is not available"));
+        assert!(!unavailable.contains("administrator"));
+        assert!(unavailable.contains("retrying the same call will not succeed"));
         for (class, gate, knob) in [
             (
                 "odoo.exceptions.AccessError",
@@ -385,19 +406,18 @@ pub async fn authenticate(
     username: &str,
     credential: &str,
 ) -> Result<i64, String> {
-    let result = jsonrpc_call(
-        http,
-        url,
-        "common",
-        "authenticate",
-        vec![json!(db), json!(username), json!(credential), json!({})],
-    )
-    .await?;
+    authenticate_classified(http, url, db, username, credential).await.map_err(|e| e.message)
+}
 
-    result
-        .as_i64()
-        .filter(|uid| *uid > 0)
-        .ok_or_else(|| "Authentication failed: invalid credentials or database".to_string())
+pub async fn authenticate_classified(
+    http: &reqwest::Client, url: &str, db: &str, username: &str, credential: &str,
+) -> Result<i64, RpcFailure> {
+    let result = jsonrpc_call_classified(http, url, "common", "authenticate",
+        vec![json!(db), json!(username), json!(credential), json!({})]).await?;
+    result.as_i64().filter(|uid| *uid > 0).ok_or_else(|| RpcFailure {
+        message: "Authentication failed: invalid credentials or database. Retrying the same credentials will not succeed.".into(),
+        retryable: false,
+    })
 }
 
 /// Get Odoo server version info.

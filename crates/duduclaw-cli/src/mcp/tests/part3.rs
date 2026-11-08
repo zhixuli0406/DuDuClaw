@@ -50,11 +50,9 @@ async fn evolution_toggle_rechecks_revoked_authority_at_locked_write() {
         // Revoke an intermediate reporting link after the front gate. In
         // the store case the mirror deliberately still grants the old link.
         if authoritative_store {
-            duduclaw_core::org_store::upsert(
-                home,
-                "sales-lead",
-                duduclaw_core::org_store::OrgEntry::new("", "業務"),
-            )
+            duduclaw_core::org_store::with_org_lock(home, |org| {
+                duduclaw_core::org_store::upsert(org, "sales-lead", duduclaw_core::org_store::OrgEntry::new("", "業務"))
+            })
             .unwrap();
         } else {
             tamper_agent_toml(home, "sales-lead", "", "業務");

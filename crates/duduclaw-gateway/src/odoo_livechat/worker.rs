@@ -247,7 +247,6 @@ async fn connect(
         let credential = main_credential.clone().ok_or("[odoo] 的連線憑證尚未設定或無法解密")?;
         Arc::new(OdooConnector::connect(odoo_cfg, &credential).await?)
     };
-    duduclaw_odoo::schema::spawn_auto_scan(bot.clone(), home.to_path_buf(), bot.schema_profile("default"));
     let bot_uid = bot.uid.ok_or("Not authenticated")?;
     let dialect = rpc::detect_dialect(&bot).await?;
     let (bot_partner_id, bot_name, _) = rpc::bot_identity(&bot).await?;
@@ -261,9 +260,6 @@ async fn connect(
     } else {
         Some(bot.clone())
     };
-    if let Some(conn) = admin.as_ref() {
-        duduclaw_odoo::schema::spawn_auto_scan(conn.clone(), home.to_path_buf(), conn.schema_profile("default"));
-    }
     info!(bot_uid, bot_partner_id, ?dialect, "odoo livechat: connected as the bot user");
     Ok(Connected {
         conns: Conns {

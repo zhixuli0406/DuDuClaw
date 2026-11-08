@@ -137,6 +137,103 @@ async fn allows_non_colliding_name() {
     assert!(home.path().join("agents").join("brand-new-agent").exists());
 }
 
+/// No `agents/<x>` and no staging leftovers (`.creating-*`) for `name`.
+fn assert_nothing_published(home: &std::path::Path, name: &str) {
+    let agents = home.join("agents");
+    assert!(!agents.join(name).exists(), "agents/{name} must not exist");
+    let leftovers: Vec<String> = std::fs::read_dir(&agents)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|n| n.starts_with(duduclaw_core::org_store::AGENT_STAGING_PREFIX))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
+}
+
+fn error_text(frame: &WsFrame) -> String {
+    match frame {
+        WsFrame::Response { ok: false, error, .. } => {
+            error.as_ref().and_then(|v| v.as_str()).unwrap_or("").to_string()
+        }
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+}
+
+/// RM-027 round 4, finding 1: the org lock is taken at the start of the
+/// creation — while it is held elsewhere, the new employee is not visible
+/// at all (no directory, no staging dir, no row); once released the create
+/// publishes the directory together with its authority row.
+#[tokio::test]
+async fn agents_create_waits_for_the_org_lock_before_anything_is_visible() {
+    let home = tempfile::tempdir().unwrap();
+    write_agent_toml(&home.path().join("agents").join("ceo"), "ceo", "");
+    duduclaw_core::org_store::seed_if_absent(home.path()).unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+    let held = duduclaw_core::org_store::lock_org_mutations(home.path()).unwrap();
+    let path = home.path().to_path_buf();
+    let checker = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_nothing_published(&path, "waiter");
+        assert!(duduclaw_core::org_store::load(&path).get("waiter").is_none());
+        drop(held);
+    };
+    let (frame, ()) = tokio::join!(
+        handler.handle_agents_create(json!({ "name": "waiter", "display_name": "Waiter", "reports_to": "ceo" })),
+        checker
+    );
+    assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+    assert!(home.path().join("agents/waiter/agent.toml").is_file());
+    assert!(home.path().join("agents/waiter/SOUL.md").is_file());
+    assert_eq!(duduclaw_core::org_store::load(home.path()).get("waiter").unwrap().reports_to, "ceo");
+}
+
+/// An unusable authority (strict parser refusal) fails the whole create —
+/// no directory remains and the bytes are untouched. Before, the create
+/// warned, reported success and left the employee governed by its mirror.
+#[tokio::test]
+async fn agents_create_fails_when_the_authority_refuses_and_leaves_no_directory() {
+    let home = tempfile::tempdir().unwrap();
+    write_agent_toml(&home.path().join("agents").join("ceo"), "ceo", "");
+    duduclaw_core::org_store::seed_if_absent(home.path()).unwrap();
+    let store = duduclaw_core::org_store::org_store_path(home.path());
+    std::fs::write(&store, "schema = 1\n[agents.ceo]\nreports_to = \"\"\n").unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+    let frame = handler
+        .handle_agents_create(json!({ "name": "orphan", "display_name": "Orphan", "reports_to": "ceo" }))
+        .await;
+    let msg = error_text(&frame);
+    assert!(msg.contains("AI 員工沒有建立"), "{msg}");
+    assert_nothing_published(home.path(), "orphan");
+    assert_eq!(std::fs::read_to_string(&store).unwrap(), "schema = 1\n[agents.ceo]\nreports_to = \"\"\n");
+}
+
+/// A create whose placement would close a loop in the authority (a stale
+/// row says the supervisor reports to the new id) is refused by the cycle
+/// check, with nothing published.
+#[tokio::test]
+async fn agents_create_refuses_a_placement_that_closes_a_cycle() {
+    let home = tempfile::tempdir().unwrap();
+    write_agent_toml(&home.path().join("agents").join("ceo"), "ceo", "");
+    duduclaw_core::org_store::seed_if_absent(home.path()).unwrap();
+    duduclaw_core::org_store::with_org_lock(home.path(), |org| {
+        duduclaw_core::org_store::upsert(org, "ceo", duduclaw_core::OrgEntry::new("ghost", ""))
+    })
+    .unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+    let frame = handler
+        .handle_agents_create(json!({ "name": "ghost", "display_name": "Ghost", "reports_to": "ceo" }))
+        .await;
+    let msg = error_text(&frame);
+    assert!(msg.contains("循環"), "{msg}");
+    assert_nothing_published(home.path(), "ghost");
+    assert!(duduclaw_core::org_store::load(home.path()).get("ghost").is_none());
+}
+
 #[tokio::test]
 async fn agents_create_evolution_is_explicitly_enabled() {
     let home = tempfile::tempdir().unwrap();

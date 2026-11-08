@@ -400,6 +400,17 @@ impl AgentRuntime for GrokRuntime {
         }
         // P5: this runtime cannot carry the read-only explore lane.
         crate::explore_lane::refuse_unsupported_runtime("grok")?;
+        // RM-103 S3 (Daybreak #2): Grok's native tools bypass the MCP gate and
+        // its `duduclaw-ro` profile keeps the whole DuDuClaw home (where the
+        // employee workspaces live) writable, so a native write restriction is
+        // enforceable only by the opt-in native OS sandbox; a native shell
+        // restriction never is. Checked before anything is written.
+        let sandbox_view = super::coarse_native_caps(
+            context.capabilities.as_ref(),
+            "grok",
+            &context.agent_id,
+            context.capabilities.as_ref().is_some_and(|c| c.native_sandbox),
+        )?;
         info!(agent = %context.agent_id, "GrokRuntime: executing via grok -p");
 
         // Working directory: `agent_dir`, unless a caller overrode it (see the
@@ -484,6 +495,10 @@ impl AgentRuntime for GrokRuntime {
         // Build the argument vector ONCE so the tokio spawn and the PTY retry run
         // a byte-identical command.
         let caps = context.capabilities.as_ref();
+        // The sandbox choice (profile + native OS sandbox) reads the
+        // read-only view when `coarse_native_caps` narrowed it; the tool-list
+        // flags below keep the config as written.
+        let sandbox_caps = sandbox_view.as_ref().or(caps);
         let mut args = egress_args;
 
         // Model — verified `-m, --model <MODEL>`.
@@ -539,7 +554,7 @@ impl AgentRuntime for GrokRuntime {
         // by `ensure_sandbox_profiles` extend the built-ins with the duduclaw
         // state dir writable (its own MCP scope gates + [capabilities] policy
         // remain the access control there). Live-verified working end-to-end.
-        if let Some(profile) = sandbox_profile(caps) {
+        if let Some(profile) = sandbox_profile(sandbox_caps) {
             args.push("--sandbox".to_string());
             args.push(profile.to_string());
         }
@@ -656,7 +671,7 @@ impl AgentRuntime for GrokRuntime {
         let native_sandbox_active = caps.map(|c| c.native_sandbox).unwrap_or(false);
         // Scoped to the working root so an overridden cwd is the directory that
         // gets write access — same rule as `runtime/codex.rs`.
-        super::apply_native_sandbox(&mut cmd, caps, work_root.as_deref(), "grok")?;
+        super::apply_native_sandbox(&mut cmd, sandbox_caps, work_root.as_deref(), "grok")?;
         duduclaw_core::ns_guard::guard_command(&mut cmd);
 
         let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
@@ -871,6 +886,8 @@ impl GrokRuntime {
         // value (in the pairs) may reach the MCP child.
         cmd.env_remove(duduclaw_core::ENV_ON_BEHALF_OF);
         cmd.env_remove(crate::on_behalf_of::context::ENV_CONTEXT);
+        // RM-124: only the scoped WebChat origin counts (in the pairs).
+        cmd.env_remove(duduclaw_core::ENV_ORIGIN_SESSION);
         for (k, v) in crate::memory_provenance::turn_source_env_pairs() {
             cmd.env(k, v);
         }
@@ -1295,6 +1312,7 @@ mod tests {
                 crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref())))
             .env_remove(duduclaw_core::ENV_ON_BEHALF_OF)
             .env_remove(crate::on_behalf_of::context::ENV_CONTEXT)
+            .env_remove(duduclaw_core::ENV_ORIGIN_SESSION)
             .env("DUDUCLAW_HOME", home.path())
             .env_remove(duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_DIR_VAR);
         assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected));
@@ -1341,6 +1359,64 @@ mod tests {
                 }
             })
             .await;
+    }
+
+    /// RM-103 S3 (Daybreak #2): the sandbox Grok spawns with, chosen exactly
+    /// as `execute` chooses it.
+    fn grok_spawn_profile(c: &duduclaw_core::types::CapabilitiesConfig) -> Result<Option<&'static str>, String> {
+        let view = super::super::coarse_native_caps(Some(c), "grok", "eph-test", c.native_sandbox)?;
+        Ok(sandbox_profile(view.as_ref().or(Some(c))))
+    }
+
+    /// Inherited `modify = ask`: the `duduclaw-ro` profile keeps the whole
+    /// home writable, so without the native OS sandbox the spawn is refused;
+    /// with it the profile and the native sandbox are forced read-only.
+    #[test]
+    fn inherited_modify_ask_needs_the_native_sandbox_and_forces_read_only() {
+        use duduclaw_core::types::CapabilitiesConfig;
+        let mut executor = CapabilitiesConfig {
+            allowed_tools: vec!["team_handoff".into(), "Read".into(), "Write".into(), "Edit".into()],
+            ..Default::default()
+        };
+        assert_eq!(sandbox_profile(Some(&executor)), Some(SANDBOX_PROFILE_WW));
+        executor.action_rules =
+            duduclaw_core::ActionRules::from_value(serde_json::json!([{ "effect": "modify", "verdict": "ask" }]));
+        let error = grok_spawn_profile(&executor).unwrap_err();
+        assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{error}");
+        executor.native_sandbox = true;
+        assert_eq!(grok_spawn_profile(&executor).unwrap(), Some(SANDBOX_PROFILE_RO));
+        let view = super::super::coarse_native_caps(Some(&executor), "grok", "eph-test", true).unwrap().unwrap();
+        assert_eq!(view.sandbox_level(), duduclaw_core::types::SandboxLevel::ReadOnly);
+        assert!(view.native_sandbox, "the native OS sandbox stays on, now read-only");
+    }
+
+    /// A qualified Bash narrowing has no shell-free Grok mode: refused, with
+    /// or without the native OS sandbox.
+    #[test]
+    fn qualified_bash_narrowing_refuses_grok() {
+        use duduclaw_core::types::CapabilitiesConfig;
+        for native_sandbox in [false, true] {
+            let c = CapabilitiesConfig {
+                allowed_tools: vec!["Read".into(), "Write".into(), "Bash(git:*)".into()],
+                native_sandbox,
+                ..Default::default()
+            };
+            let error = grok_spawn_profile(&c).unwrap_err();
+            assert!(error.contains("grok") && error.contains("Bash(git:*)"), "{error}");
+        }
+    }
+
+    /// Unconstrained configs keep their profile.
+    #[test]
+    fn unconstrained_caps_keep_their_grok_profile() {
+        use duduclaw_core::types::CapabilitiesConfig;
+        for c in [
+            CapabilitiesConfig::default(),
+            CapabilitiesConfig { allowed_tools: vec!["Read".into()], ..Default::default() },
+            CapabilitiesConfig { computer_use: true, ..Default::default() },
+        ] {
+            assert_eq!(grok_spawn_profile(&c).unwrap(), sandbox_profile(Some(&c)), "{c:?}");
+        }
     }
 
     #[tokio::test]

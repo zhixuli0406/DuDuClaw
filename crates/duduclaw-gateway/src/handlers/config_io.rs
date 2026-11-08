@@ -153,6 +153,14 @@ impl MethodHandler {
         if let Some(message) = crate::doctor_probes::launchd_restart_warning().await {
             checks.push(json!({"name": "launchd_restart", "status": "warn", "message": message, "can_repair": false}));
         }
+        // RM-155: last background probe of the protected folders this
+        // gateway uses (DUDUCLAW_HOME, `[files] allowed_roots`, dispatch work
+        // dirs). Read from the probe registry — the doctor never touches a
+        // protected path itself, which could raise (or hang on) a prompt.
+        #[cfg(target_os = "macos")]
+        if let Some(card) = crate::macos_folder_access::doctor_check(&self.home_dir) {
+            checks.push(card);
+        }
 
         // Live dashboard permissions (`live_context.rs`): shown only after a
         // read of the account store failed, which refused that call. Silence

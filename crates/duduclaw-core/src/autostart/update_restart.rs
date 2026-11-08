@@ -82,9 +82,12 @@ async fn managed_label(c: &impl Commands, uid: u32, current_pid: u32, desktop: b
     Ok(None)
 }
 
-async fn validate_gateway(c: &impl Commands, home: &Path, label: &str, exe: &Path)
+/// `installed_exe` is the path the update installed (canonical), which after a
+/// bare → bundle migration differs from the running process's own path.
+async fn validate_gateway(c: &impl Commands, home: &Path, label: &str, installed_exe: &Path)
     -> Result<(), String>
 {
+    let exe = installed_exe;
     let path = launchd_plist_path_in(home, label);
     let path = path.to_str().ok_or("Non-UTF-8 plist path")?;
     let reply = checked(c.run("/usr/bin/plutil", &[
@@ -101,11 +104,11 @@ async fn validate_gateway(c: &impl Commands, home: &Path, label: &str, exe: &Pat
 }
 
 /// No shell, no downloaded path, no remote arguments. The label is allowlisted.
-fn helper_plist(exe: &Path, home: &Path, state: &Path, label: &str, gateway_pid: u32) -> Result<String, String> {
-    if !allowed_label(label) || !exe.is_absolute() || !home.is_absolute() || !state.is_absolute() || gateway_pid == 0 {
+fn helper_plist(installed_exe: &Path, home: &Path, state: &Path, label: &str, gateway_pid: u32) -> Result<String, String> {
+    if !allowed_label(label) || !installed_exe.is_absolute() || !home.is_absolute() || !state.is_absolute() || gateway_pid == 0 {
         return Err("Invalid update helper inputs".into());
     }
-    let exe = xml_escape(exe.to_str().ok_or("Non-UTF-8 installed executable path")?);
+    let exe = xml_escape(installed_exe.to_str().ok_or("Non-UTF-8 installed executable path")?);
     let home_s = xml_escape(home.to_str().ok_or("Non-UTF-8 home path")?);
     let log = xml_escape(private_dir(home).join("relaunch.log").to_str().ok_or("Non-UTF-8 log path")?);
     let state_s = xml_escape(state.to_str().ok_or("Non-UTF-8 state path")?);
@@ -187,6 +190,15 @@ fn claim_schedule(state: &std::sync::atomic::AtomicU8) -> Result<bool, String> {
 /// foreground/systemd/desktop restart. Failure MUST NOT fall back to exec.
 #[cfg(target_os = "macos")]
 pub async fn schedule_if_managed(desktop: bool) -> Result<bool, String> {
+    schedule_if_managed_for(desktop, &crate::platform::executable_path()).await
+}
+
+/// [`schedule_if_managed`] for an update that installed the gateway at a
+/// different path than this process runs from (bare → `DuDuClaw Gateway.app`
+/// migration). The LaunchAgent must already name `installed_exe`; the helper
+/// job runs `installed_exe`, never the old binary.
+#[cfg(target_os = "macos")]
+pub async fn schedule_if_managed_for(desktop: bool, installed_exe: &Path) -> Result<bool, String> {
     static SCHEDULED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     let c = SystemCommands;
     let uid = unsafe { libc::getuid() };
@@ -194,7 +206,7 @@ pub async fn schedule_if_managed(desktop: bool) -> Result<bool, String> {
     if claim_schedule(&SCHEDULED)? { return Ok(true); }
     // One attempt per gateway lifetime, including failures, prevents restart storms.
     let home = dirs_home()?;
-    let exe = crate::platform::executable_path();
+    let exe = installed_exe.to_path_buf();
     validate_gateway(&c, &home, label, &exe).await?;
     let helper = target(uid, &helper_label(label));
     let old = ctl(&c, &["print".into(), helper.clone()]).await?;
@@ -399,6 +411,18 @@ mod tests {
         assert_eq!(pid("\tenvironment = {\n\t\tpid = 99\n\t}\n\tpid = 42"), Some(42));
         assert_eq!(pid("\tenvironment = {\n\t\tpid = 99\n\t}"), None);
     }
+    #[tokio::test]
+    async fn migrated_bundle_exe_is_validated_and_launched_by_the_helper() {
+        let installed = Path::new("/Users/k/Applications/DuDuClaw Gateway.app/Contents/MacOS/duduclaw");
+        let c = Fake::new(vec![ok(r#"{"Label":"com.duduclaw.gateway","ProgramArguments":["/Users/k/Applications/DuDuClaw Gateway.app/Contents/MacOS/duduclaw","run"]}"#)]);
+        validate_gateway(&c, Path::new("/tmp/home"), LAUNCHD_LABEL, installed).await.unwrap();
+        // A plist still naming the old bare binary does not authorize the helper.
+        let c = Fake::new(vec![ok(r#"{"Label":"com.duduclaw.gateway","ProgramArguments":["/Users/k/.duduclaw/bin/duduclaw","run"]}"#)]);
+        assert!(validate_gateway(&c, Path::new("/tmp/home"), LAUNCHD_LABEL, installed).await.is_err());
+        let p = helper_plist(installed, Path::new("/Users/k"), Path::new("/Users/k/.duduclaw"), LAUNCHD_LABEL, 42).unwrap();
+        assert!(p.contains("<string>/Users/k/Applications/DuDuClaw Gateway.app/Contents/MacOS/duduclaw</string><string>service</string>"));
+    }
+
     #[tokio::test]
     async fn program_override_cannot_replace_installed_executable() {
         let c = Fake::new(vec![ok(r#"{"Label":"com.duduclaw.gateway","Program":"/tmp/other","ProgramArguments":["/installed/duduclaw","run"]}"#)]);

@@ -1,27 +1,109 @@
-//! System SMTP delivery for account security, separate from employee mail approval.
+//! System security mail. SMTP takes precedence over the licensed code-only relay.
 use std::path::Path;
 use duduclaw_auth::UserDb;
 
-pub(crate) const UNAVAILABLE: &str = "Email 驗證碼目前無法使用，請管理員設定系統寄件伺服器與寄件地址。";
+pub(crate) const UNAVAILABLE: &str = "伺服器未設定寄信，且此安裝沒有可用的授權代寄。請管理員設定 SMTP 寄件伺服器與寄件地址。";
+const DELIVERY_FAILED: &str = "驗證碼無法寄出，請稍後再試或聯絡管理員。";
+pub(crate) const RATE_LIMITED: &str = "寄送太頻繁，請稍後再試。";
 
-pub(crate) fn available(home: &Path) -> bool {
-    crate::mail_worker::resolve_smtp_config(home).is_some()
+fn relay_enabled(home: &Path) -> bool {
+    let text = match std::fs::read_to_string(home.join("config.toml")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    relay_config_enabled(&text)
 }
 
-/// Explain availability without exposing configuration or delivery details.
+fn relay_config_enabled(text: &str) -> bool {
+    let Ok(config) = text.parse::<toml::Value>() else { return false; };
+    match config.get("mfa") {
+        None => true,
+        Some(mfa) if mfa.is_table() => match mfa.get("email_relay") {
+            None => true,
+            Some(value) => value.as_bool() == Some(true),
+        },
+        _ => false,
+    }
+}
+
+fn availability_reason(smtp: bool, relay_on: bool, eligibility: Result<(), &'static str>) -> Option<&'static str> {
+    if smtp { None }
+    else if !relay_on { Some("relay_disabled") }
+    else { eligibility.err() }
+}
+
 pub(crate) fn unavailable_reason(home: &Path) -> Option<&'static str> {
-    if available(home) { None } else { Some("no_smtp") }
+    let smtp = crate::mail_worker::resolve_smtp_config(home).is_some();
+    let enabled = relay_enabled(home);
+    let eligibility = if smtp || !enabled { Ok(()) }
+        else if !cfg!(any(unix, windows)) { Err("no_smtp") }
+        else { crate::license_runtime::mfa_relay_license(home).map(|_| ()) };
+    availability_reason(smtp, enabled, eligibility)
 }
 
-pub(crate) async fn send_code(home: &Path, db: &UserDb, token: &str, email: &str, code: &str) -> Result<(),String> {
-    let config=crate::mail_worker::resolve_smtp_config(home).ok_or(UNAVAILABLE)?;
-    if crate::email::send_email(&config,email,"DuDuClaw Email 驗證碼",
-        &format!("您的兩步驟驗證碼為：{code}\n\n此驗證碼於 10 分鐘後失效，且只能使用一次。若您未要求此驗證碼，請忽略這封信。"))
-        .await.is_err() {
-        db.mfa_email_delivery_failed(token,code)?;
-        return Err("驗證碼無法寄出，請稍後再試或聯絡管理員。".into());
+pub(crate) fn available(home: &Path) -> bool { unavailable_reason(home).is_none() }
+
+mod transport;
+mod store;
+mod relay;
+
+/// Resolve an eligible, key-bound relay license BEFORE touching the relay
+/// store. Unbound or mismatched installation keys never reach the network
+/// and never consume the enrollment budget.
+fn prepare_relay(home: &Path,
+    resolve: impl FnOnce(&Path) -> Result<crate::license_runtime::RelayLicense, &'static str>)
+    -> Result<(store::Store, crate::license_runtime::RelayLicense), &'static str> {
+    let relay = resolve(home).map_err(|_| DELIVERY_FAILED)?;
+    let store = store::open_wait(home, transport::TIMEOUT).map_err(|_| DELIVERY_FAILED)?;
+    Ok((store, relay))
+}
+
+async fn send_relay(home: &Path, email: &str, code: &str) -> Result<(), &'static str> {
+    if !relay_enabled(home) { return Err(DELIVERY_FAILED); }
+    let home = home.to_path_buf();
+    tokio::time::timeout(transport::TIMEOUT, async {
+        let (store, relay) = tokio::task::spawn_blocking(move ||
+            prepare_relay(&home, crate::license_runtime::mfa_relay_license))
+            .await.map_err(|_| DELIVERY_FAILED)??;
+        relay::deliver(&store, &relay, email, code,
+            chrono::Utc::now().timestamp(), transport::exchange).await
+    }).await.map_err(|_| DELIVERY_FAILED)?
+}
+
+/// Inline (no blocking pool) variant so tests can inject the license resolver
+/// and a recording exchange.
+#[cfg(test)]
+pub(crate) async fn relay_send_for_test<R, F, Fut>(home: &Path, email: &str, code: &str, now: i64,
+    resolve: R, exchange: F) -> Result<(), &'static str>
+where R: FnOnce(&Path) -> Result<crate::license_runtime::RelayLicense, &'static str>,
+      F: FnMut(transport::Call) -> Fut, Fut: std::future::Future<Output = Result<transport::Reply, &'static str>> {
+    let (store, relay) = prepare_relay(home, resolve)?;
+    relay::deliver(&store, &relay, email, code, now, exchange).await
+}
+
+fn recipient_digest(home: &Path, email: &str) -> String {
+    crate::trigger_route::access::keyed_digest_full(home, "mfa-relay-recipient", &email.trim().to_lowercase())
+}
+
+fn finish_delivery(home: &Path, db: &UserDb, token: &str, email: &str, code: &str, result: Result<(), &'static str>) -> Result<(), String> {
+    if let Err(message) = result {
+        // Keyed, domain-separated recipient digest; no unkeyed fallback.
+        tracing::warn!(recipient_hash = %recipient_digest(home, email),
+            outcome = if message == RATE_LIMITED { "rate_limited" } else { "delivery_failed" }, "MFA email delivery failed");
+        db.mfa_email_delivery_failed(token, code)?;
+        return Err(message.into());
     }
     Ok(())
+}
+
+pub(crate) async fn send_code(home: &Path, db: &UserDb, token: &str, email: &str, code: &str) -> Result<(), String> {
+    let result = if let Some(config) = crate::mail_worker::resolve_smtp_config(home) {
+        crate::email::send_email(&config, email, "DuDuClaw Email 驗證碼",
+            &format!("您的兩步驟驗證碼為：{code}\n\n此驗證碼於 10 分鐘後失效，且只能使用一次。若您未要求此驗證碼，請忽略這封信。"))
+            .await.map_err(|_| DELIVERY_FAILED)
+    } else { send_relay(home, email, code).await };
+    finish_delivery(home, db, token, email, code, result)
 }
 
 /// A notification failure does not undo an already committed security change.
@@ -45,18 +127,5 @@ pub(crate) fn notify_change(home: &Path, db: &std::sync::Arc<UserDb>, user: &str
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn smtp_availability_has_only_a_safe_reason_code() {
-        let home=tempfile::tempdir().unwrap();
-        assert_eq!(unavailable_reason(home.path()),Some("no_smtp"));
-        std::fs::write(home.path().join("config.toml"),"[channels.email]\nsmtp_host='127.0.0.1'\n").unwrap();
-        assert_eq!(unavailable_reason(home.path()),Some("no_smtp"));
-        std::fs::write(home.path().join("config.toml"),"[channels.email]\nsmtp_host='127.0.0.1'\nfrom_addr='sender@example.test'\n").unwrap();
-        assert_eq!(unavailable_reason(home.path()),None);
-        std::fs::write(home.path().join("config.toml"),"invalid toml").unwrap();
-        assert_eq!(unavailable_reason(home.path()),Some("no_smtp"));
-    }
-}
+#[path = "mfa_email/tests.rs"]
+mod tests;

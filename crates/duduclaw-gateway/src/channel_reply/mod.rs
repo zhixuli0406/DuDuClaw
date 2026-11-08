@@ -118,6 +118,38 @@ where
     F: FnOnce(&mut toml::Table) -> Result<(), String>,
     G: FnOnce() -> Result<(), String>,
 {
+    update_agent_toml_edit_within(registry, agent_id, edit, None, mutate).await
+}
+
+/// [`update_agent_toml_edit`] whose `agent.toml` lock waits are bounded by
+/// `lock_wait` (RM-027 round 5): past it nothing is written and the error
+/// carries [`crate::agent_files::writer::LOCK_WAIT_TIMEOUT`]. Every
+/// `agent.toml` write made while the global org lock is held uses this.
+pub async fn update_agent_toml_edit_bounded<F, G>(
+    registry: &Arc<RwLock<AgentRegistry>>,
+    agent_id: &str,
+    edit: AgentTomlEdit<'_, G>,
+    lock_wait: std::time::Duration,
+    mutate: F,
+) -> Result<bool, String>
+where
+    F: FnOnce(&mut toml::Table) -> Result<(), String>,
+    G: FnOnce() -> Result<(), String>,
+{
+    update_agent_toml_edit_within(registry, agent_id, edit, Some(lock_wait), mutate).await
+}
+
+async fn update_agent_toml_edit_within<F, G>(
+    registry: &Arc<RwLock<AgentRegistry>>,
+    agent_id: &str,
+    edit: AgentTomlEdit<'_, G>,
+    lock_wait: Option<std::time::Duration>,
+    mutate: F,
+) -> Result<bool, String>
+where
+    F: FnOnce(&mut toml::Table) -> Result<(), String>,
+    G: FnOnce() -> Result<(), String>,
+{
     if !duduclaw_core::is_valid_agent_id(agent_id) {
         return Err(format!("Invalid agent_id: {agent_id}"));
     }
@@ -148,21 +180,17 @@ where
         );
         crate::handlers::config_commit::render_preserving(current, &table)
     };
-    let outcome = crate::agent_files::writer::commit(
-        registry,
-        crate::agent_files::writer::Commit {
-            home: &home_dir,
-            agent_id,
-            key: crate::agent_files::FileKey::AgentToml,
-            expected_hash: None,
-            meta: crate::agent_files::writer::CommitMeta::new(edit.user_id, edit.source),
-            baseline: crate::agent_files::writer::Baseline::Accept,
-        },
-        render,
-        edit.guard,
-    )
-    .await
-    .map_err(|e| e.message())?;
+    let commit = crate::agent_files::writer::Commit {
+        home: &home_dir,
+        agent_id,
+        key: crate::agent_files::FileKey::AgentToml,
+        expected_hash: None,
+        meta: crate::agent_files::writer::CommitMeta::new(edit.user_id, edit.source),
+        baseline: crate::agent_files::writer::Baseline::Accept,
+    };
+    let outcome = crate::agent_files::writer::commit_within(registry, commit, render, edit.guard, lock_wait)
+        .await
+        .map_err(|e| e.message())?;
 
     if outcome.unchanged {
         return Ok(true);

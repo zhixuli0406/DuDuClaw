@@ -45,10 +45,12 @@ import {
   canProceedFromGenerate,
   canProceedFromForm,
   generationPhase,
+  isGenerationSlow,
+  generationErrorMessageId,
+  isInProgressError,
   type WizardStep,
 } from './wizard-machine';
-
-const POLL_MS = 3000;
+import { useBackoffPoll } from './use-backoff-poll';
 
 /** Local field wrapper (label + optional help), MDS-styled. */
 function Field({
@@ -126,34 +128,48 @@ export function SkillWizard() {
   }, [agents, builderAgent]);
 
   // ── Poll the record's status while on the generate step ──
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const stopPoll = useCallback(() => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-  }, []);
+  // The id lives in a ref so the refresh callback (and the effects that use it)
+  // never change identity when `record` is replaced by a poll result (RM-088).
+  const recordId = record?.id;
+  const recordIdRef = useRef<string | undefined>(recordId);
+  recordIdRef.current = recordId;
 
   const refreshRecord = useCallback(async () => {
-    if (!record) return;
+    const id = recordIdRef.current;
+    if (!id) return;
     try {
       const res = await listCustomSkills();
-      const found = res.custom_skills.find((s) => s.id === record.id);
-      if (found) setRecord(found);
+      const found = res.custom_skills.find((s) => s.id === id);
+      if (!found || recordIdRef.current !== id) return;
+      // Only replace the record when something observable changed.
+      setRecord((prev) =>
+        prev &&
+        prev.id === found.id &&
+        prev.status === found.status &&
+        prev.updated_at === found.updated_at &&
+        (prev.generation_error ?? null) === (found.generation_error ?? null) &&
+        (prev.can_regenerate ?? null) === (found.can_regenerate ?? null)
+          ? prev
+          : found,
+      );
     } catch (e) {
       console.warn('[api]', e);
     }
-  }, [record]);
+  }, []);
 
+  // One immediate refresh on entering the generate step (or a new record).
   useEffect(() => {
-    if (step !== 'generate' || !record) {
-      stopPoll();
-      return;
-    }
-    refreshRecord();
-    pollRef.current = setInterval(refreshRecord, POLL_MS);
-    return stopPoll;
-  }, [step, record, refreshRecord, stopPoll]);
+    if (step !== 'generate' || !recordId) return;
+    void refreshRecord();
+  }, [step, recordId, refreshRecord]);
+
+  // Then backoff-poll only while the backend is still generating. The hook
+  // clears its timer on unmount and pauses while the tab is hidden.
+  useBackoffPoll(
+    step === 'generate' && !!recordId && record?.status === 'generating',
+    refreshRecord,
+    recordId,
+  );
 
   // ── Step 1 → 2: create the record + kick off generation ──
   const handleStart = useCallback(async () => {
@@ -172,6 +188,7 @@ export function SkillWizard() {
       setDisplayName(created.display_name);
       setDescriptionHuman(created.description_human);
       const gen = await generateCustomSkill({ id: created.id });
+      setRecord({ ...created, status: 'generating', generation_error: null, can_regenerate: false });
       setDraftPath(gen.draft_path);
       setDraftConfirmed(false);
       setStep('generate');
@@ -189,12 +206,21 @@ export function SkillWizard() {
     try {
       const gen = await generateCustomSkill({ id: record.id, instruction: instruction.trim() || undefined });
       setDraftPath(gen.draft_path);
+      setRecord((r) =>
+        r
+          ? { ...r, status: 'generating', generation_error: null, can_regenerate: false, generation_age_secs: 0 }
+          : r,
+      );
       setInstruction('');
       setDraftConfirmed(false);
       await refreshRecord();
       toast.success(t('skills.new.regenerated'));
     } catch (e) {
-      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+      const message = isInProgressError(e)
+        ? intl.formatMessage({ id: generationErrorMessageId('in_progress') })
+        : formatError(e);
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message }));
+      void refreshRecord();
     } finally {
       setRegenerating(false);
     }
@@ -445,20 +471,38 @@ function StepGenerate({
 }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
-  const phase = generationPhase(record.status);
-  const canNext = canProceedFromGenerate(record.status, draftConfirmed);
+  const phase = generationPhase(record.status, record.generation_error);
+  const canNext = canProceedFromGenerate(record.status, draftConfirmed, record.generation_error);
+  // Slow hint + retry gating come from the server (`can_regenerate`), not the browser clock.
+  const slow = phase === 'working' && isGenerationSlow(record.status, record.can_regenerate);
+  const failed = phase === 'failed';
 
   return (
     <Card>
       <CardContent className="space-y-5">
         <div className="flex flex-col items-center gap-3 py-4 text-center">
-          <DuDu face={phase === 'ready' ? 'proud' : 'writing'} size="md" animated={phase !== 'ready'} />
+          <DuDu
+            face={failed ? 'idle' : phase === 'ready' ? 'proud' : 'writing'}
+            size="md"
+            animated={phase === 'working'}
+          />
           <p className="text-sm font-medium text-foreground">
-            {phase === 'ready' ? t('skills.new.generate.ready') : t('skills.new.generate.working')}
+            {failed
+              ? t('skills.new.generate.failed')
+              : phase === 'ready'
+                ? t('skills.new.generate.ready')
+                : t('skills.new.generate.working')}
           </p>
-          <p className="max-w-md text-xs text-muted-foreground">
-            {phase === 'ready' ? t('skills.new.generate.readyHint') : t('skills.new.generate.workingHint')}
-          </p>
+          {failed ? (
+            <p role="alert" className="max-w-md break-words text-xs text-destructive">
+              {t(generationErrorMessageId(record.generation_error))}
+            </p>
+          ) : (
+            <p className="max-w-md text-xs text-muted-foreground">
+              {phase === 'ready' ? t('skills.new.generate.readyHint') : t('skills.new.generate.workingHint')}
+            </p>
+          )}
+          {slow && <p className="max-w-md text-xs text-warning">{t('skills.new.generate.slow')}</p>}
         </div>
 
         <Field label={t('skills.new.generate.draftPath')}>
@@ -477,11 +521,19 @@ function StepGenerate({
         </Field>
 
         <div className="flex items-center gap-2">
-          <Button variant="outline" onClick={onRegenerate} disabled={regenerating}>
+          <Button
+            variant="outline"
+            onClick={onRegenerate}
+            disabled={regenerating || (phase === 'working' && !slow)}
+          >
             {regenerating ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-            {regenerating ? t('skills.new.generate.regenerating') : t('skills.new.generate.regenerate')}
+            {regenerating
+              ? t('skills.new.generate.regenerating')
+              : failed || slow
+                ? t('skills.new.generate.retry')
+                : t('skills.new.generate.regenerate')}
           </Button>
-          {!canNext && !draftConfirmed && (
+          {!canNext && !draftConfirmed && !failed && (
             <Button variant="ghost" size="sm" onClick={onConfirmDraft}>
               {t('skills.new.generate.confirmDone')}
             </Button>

@@ -224,7 +224,10 @@ mod tests {
     #[test]
     fn dangling_org_record_is_reserved() {
         let h = tempfile::tempdir().unwrap();
-        crate::org_store::upsert(h.path(), "ghost", crate::OrgEntry::new("ceo", "")).unwrap();
+        crate::org_store::with_org_lock(h.path(), |org| {
+            crate::org_store::upsert(org, "ghost", crate::OrgEntry::new("ceo", ""))
+        })
+        .unwrap();
         assert_eq!(
             check_name_reserved_for_ai(h.path(), "ghost"),
             NameReservation::DanglingOrgRecord

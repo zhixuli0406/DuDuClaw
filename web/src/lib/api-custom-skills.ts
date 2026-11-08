@@ -77,6 +77,18 @@ export interface CustomSkillRecord {
    * A real figure — the detail page shows it, still labeled as your estimate.
    */
   saved_hours_estimate: number;
+  /** When the current generation attempt was queued (RFC-3339). */
+  generation_started_at?: string | null;
+  /**
+   * Reason CODE for the last failed/timed-out generation (`timeout`, `no_draft`,
+   * `dispatch:<label>`) — localize it, don't display it. A `draft` with this set
+   * means "generation failed" (no separate backend status). Cleared on retry.
+   */
+  generation_error?: string | null;
+  /** Server-computed seconds since the current attempt was queued; null unless generating. */
+  generation_age_secs?: number | null;
+  /** Server-decided: a (re)generate request would be accepted right now. */
+  can_regenerate?: boolean;
 }
 
 /** One safety-scan finding inside `safety_report.findings`. */

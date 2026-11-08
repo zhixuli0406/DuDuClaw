@@ -352,9 +352,14 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         "odoo_connect" => Some(Scope::OdooRead),
         // Write class: create / write that mutate records but don't fire
         // workflow side-effects.
+        // RM-120: generic create / write share the write class; they
+        // additionally need an explicit per-model grant in the employee's
+        // Odoo settings (`mcp::odoo_generic_write::generic_write_grant`).
         "odoo_crm_create_lead"
         | "odoo_crm_update_stage"
-        | "odoo_sale_create_quotation" => Some(Scope::OdooWrite),
+        | "odoo_sale_create_quotation"
+        | "odoo_create"
+        | "odoo_write" => Some(Scope::OdooWrite),
         // Execute class: workflow buttons + generic execute_kw + report
         // generation. These can fire arbitrary Odoo-side actions.
         "odoo_sale_confirm" | "odoo_execute" | "odoo_report" => Some(Scope::OdooExecute),
