@@ -209,6 +209,22 @@ optional output cannot satisfy either mandatory full-manual item.
 
 After the tag is created, the Pro image and offline tar, the darwin and linux-x64 Pro binaries, the control-plane allowlist and delivery manifest (checked on the serving revision in every configured region) must all succeed. The script commits the re-resolved enterprise `Cargo.lock` and (minor/major only) the distributor brief on the enterprise checkout's branch and prints the push command; only a failed commit is a gap. The darwin binary is taken from cargo's actual target directory, so a shared `CARGO_TARGET_DIR` works. Any failure, or any `DUDUCLAW_SKIP_PRO_*` opt-out, is listed at the end and the script exits non-zero without the success banner. `release.sh verify VERSION` also checks each region's serving control-plane revision for the offered version (`pro-offer`) and delivery manifest (`delivery-manifest`) and fails, instead of staying silent, when it runs without the enterprise checkout.
 
+### Distributor console manuals
+
+The distributor console lists each version's summary and both manuals from a
+private bucket. `scripts/release.sh` now publishes that entry itself (v1.80.0
+shipped without it while publishing was a separate step). Before changing
+anything, the enterprise preflight requires the private publisher, a merged
+release summary for the new version whose `version` matches and whose `kind`
+is `hotfix` for the hotfix lane or `minor` otherwise, and, for minor/major,
+the reviewed manuals directory. A hotfix without its own manuals inherits the
+nearest published release of the same minor. After the control-plane sync the
+script runs the publisher as a dry run, then for real, against this checkout's
+`CHANGELOG.md` and git tags; `DUDUCLAW_MANUALS_BUCKET` overrides the bucket.
+A failure, or `DUDUCLAW_SKIP_MANUALS=1`, is listed as an enterprise gap with
+the re-run command. CE-only releases print the command instead. Like the
+control-plane allowlist, the entry goes live before the bump PR merges.
+
 
 ### Control-plane regions (RM-161)
 

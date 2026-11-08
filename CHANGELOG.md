@@ -15,6 +15,7 @@
 ### Changed
 
 - macOS／Windows 自動測試分成三片平行執行，三片都要通過，縮短測試等待時間。
+- 發版流程（`scripts/release.sh`）會自動把新版本的摘要與手冊上架到總經銷 console，修正 v1.80.0 手冊沒有上架的問題。發版前先檢查企業版 checkout 已合併該版本摘要（minor／major 另需手冊目錄），缺少就不開始；上架失敗或設定 `DUDUCLAW_SKIP_MANUALS=1` 會列為企業版缺項並判定發版未完成。
 - 分叉（Live Forking）的 AI 評審現在採盲評：候選結果以隨機順序與匿名代號（A、B、C…）呈現，不再顯示分支名稱或編號，避免順序與名稱影響評審結果。
 
 ### Removed
