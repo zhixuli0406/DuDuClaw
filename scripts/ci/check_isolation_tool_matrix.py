@@ -36,13 +36,17 @@ def check(matrix, policy, disposition, fork):
     host = set()
     for arm in re.finditer(r'((?:"[a-z0-9_]+"\s*\|?\s*)+)\s*=>\s*HostAuthority', disposition):
         host.update(re.findall(r'"([a-z0-9_]+)"', arm[1]))
+    proposal = set()
+    for arm in re.finditer(r'((?:"[a-z0-9_]+"\s*\|?\s*)+)\s*=>\s*ProposalRequired', disposition):
+        proposal.update(re.findall(r'"([a-z0-9_]+)"', arm[1]))
     deferred = re.search(r'DEFERRED_TOOLS[^=]*=\s*\[(.*?)\];', fork, re.S)
     if not host or deferred is None:
         errors.append("refusal policy is empty or cannot be parsed")
         return errors
     deferred = set(re.findall(r'"([a-z0-9_]+)"', deferred[1]))
     for name, description in rows.items():
-        expected = "HostAuthority" if name in host else "ForkNextRelease" if name in deferred else None
+        expected = ("HostAuthority" if name in host else "ProposalRequired" if name in proposal
+                    else "ForkNextRelease" if name in deferred else None)
         actual = re.findall(r"Refused:\s*([A-Za-z]+)", description)
         if actual != ([expected] if expected else []):
             errors.append(f"{name}: refusal contradicts code: expected={expected}, actual={actual}")
