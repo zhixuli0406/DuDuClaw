@@ -41,18 +41,34 @@ impl MethodHandler {
             Ok(t) => t,
             Err(e) => return WsFrame::error_response("", &e),
         };
-        let section = match table.get("odoo").and_then(|v| v.as_table()) {
-            Some(s) => s,
-            None => {
-                return WsFrame::ok_response(
-                    "",
-                    json!({
-                        "agent_id": agent_id,
-                        "configured": false,
-                    }),
-                );
-            }
+        let override_cfg = match duduclaw_odoo::AgentOdooConfig::from_table(&table) {
+            Ok(cfg) => cfg,
+            Err(error) => return WsFrame::error_response("", &error),
         };
+        let global = match tokio::fs::read_to_string(self.home_dir.join("config.toml")).await {
+            Ok(raw) => {
+                let parsed: toml::Table = match raw.parse() {
+                    Ok(table) => table,
+                    Err(_) => return WsFrame::error_response("", "Cannot read saved Odoo settings"),
+                };
+                match parsed.get("odoo") {
+                    Some(section) => match section.clone().try_into::<duduclaw_odoo::OdooConfig>() {
+                        Ok(config) => config,
+                        Err(_) => return WsFrame::error_response("", "Cannot read saved Odoo settings"),
+                    },
+                    None => duduclaw_odoo::OdooConfig::default(),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => duduclaw_odoo::OdooConfig::default(),
+            Err(_) => return WsFrame::error_response("", "Cannot read saved Odoo settings"),
+        };
+        let unblock_inherited = override_cfg.as_ref().and_then(|cfg| cfg.unblock_models.as_ref()).is_none();
+        let effective_unblock_models = override_cfg.as_ref().and_then(|cfg| cfg.unblock_models.clone())
+            .unwrap_or(global.unblock_models);
+        let effective_blocked_models: Vec<&str> = duduclaw_odoo::connector::BLOCKED_MODELS.iter().copied()
+            .filter(|model| !effective_unblock_models.iter().any(|allowed| allowed.as_str() == *model)).collect();
+        let empty = toml::Table::new();
+        let section = table.get("odoo").and_then(|v| v.as_table()).unwrap_or(&empty);
 
         let get_str = |k: &str| {
             section
@@ -100,13 +116,16 @@ impl MethodHandler {
             "",
             json!({
                 "agent_id": agent_id,
-                "configured": true,
+                "configured": override_cfg.is_some(),
+                "effective_unblock_models": effective_unblock_models,
+                "unblock_inherited": unblock_inherited,
+                "effective_blocked_models": effective_blocked_models,
                 "profile": get_str("profile"),
                 "url": get_str("url"),
                 "db": get_str("db"),
                 "username": get_str("username"),
                 "allowed_models": get_arr("allowed_models"),
-                "unblock_models": get_arr("unblock_models"),
+                "unblock_models": override_cfg.as_ref().and_then(|cfg| cfg.unblock_models.clone()),
                 "allowed_actions": get_arr("allowed_actions"),
                 "company_ids": company_ids,
                 "api_key_set": api_key_set,
@@ -276,8 +295,7 @@ impl MethodHandler {
                     conn = conn.with_company_ids(over.company_ids.iter().map(|&id| id as i64).collect());
                 }
                 let st = conn.status();
-                let profile = conn.schema_profile(over.as_ref().map(|o| o.profile_or_default()).unwrap_or("default"));
-                duduclaw_odoo::schema::spawn_auto_scan(Arc::new(conn), self.home_dir.clone(), profile);
+                // Schema preparation belongs to the gateway periodic worker.
                 WsFrame::ok_response(
                     "",
                     json!({

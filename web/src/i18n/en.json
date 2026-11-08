@@ -1,4 +1,7 @@
 {
+  "odoo.permissions.effectiveBlockedModels": "Currently blocked tables",
+  "odoo.permissions.unblockInherited": "Inherited from global settings",
+  "odoo.permissions.noBlockedModels": "No blocked tables",
   "agent.selection.revoked": "This AI employee is no longer available. Please select again.",
   "settings.update.failure.download": "Unable to download the update. Check your connection and check for updates again.",
   "settings.update.failure.verify": "Update verification failed; installation was stopped. Download the official release again.",
@@ -10215,5 +10218,9 @@
   "google.chatRead.title": "Read Google Chat",
   "google.chatRead.hint": "After enabling, users reconnect Google in My Connections and select the Chat permissions. AI employees can read spaces and recent messages available to that account. They cannot send messages or download attachments.",
   "google.chatRead.setup": "Enable the Google Chat API and configure a Chat app in the OAuth client’s Google Cloud project. A Workspace administrator may also need to allow the app.",
-  "myConnections.service.chat": "Google Chat"
+  "myConnections.service.chat": "Google Chat",
+  "odoo.scan.employeeResults": "Results by employee",
+  "odoo.scan.globalConnection": "Global connection",
+  "odoo.scan.employeeOk": "Ready",
+  "odoo.scan.employeeFailed": "Failed"
 }

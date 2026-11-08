@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Odoo connection configuration from `config.toml [odoo]`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OdooConfig {
     pub url: String,
@@ -100,15 +100,13 @@ pub fn feature_module_for_model(model: &str) -> Option<&'static str> {
     }
 }
 
+/// The six switchable feature modules returned by [`feature_module_for_model`].
+pub const FEATURE_MODULES: &[&str] = &["crm", "sale", "inventory", "accounting", "project", "hr"];
+
 impl OdooConfig {
-    /// Whether the dashboard's 功能模組 switches allow a call on `model`.
-    /// Models outside the six modules are always allowed here (the security
-    /// block list and per-agent `allowed_models` still apply).
-    pub fn feature_allows_model(&self, model: &str) -> Result<(), &'static str> {
-        let Some(module) = feature_module_for_model(model) else {
-            return Ok(());
-        };
-        let on = match module {
+    /// Whether the 功能模組 switch for `module` (one of [`FEATURE_MODULES`]) is on.
+    pub fn feature_enabled(&self, module: &str) -> bool {
+        match module {
             "crm" => self.features_crm,
             "sale" => self.features_sale,
             "inventory" => self.features_inventory,
@@ -116,8 +114,17 @@ impl OdooConfig {
             "project" => self.features_project,
             "hr" => self.features_hr,
             _ => true,
+        }
+    }
+
+    /// Whether the dashboard's 功能模組 switches allow a call on `model`.
+    /// Models outside the six modules are always allowed here (the security
+    /// block list and per-agent `allowed_models` still apply).
+    pub fn feature_allows_model(&self, model: &str) -> Result<(), &'static str> {
+        let Some(module) = feature_module_for_model(model) else {
+            return Ok(());
         };
-        if on { Ok(()) } else { Err(module) }
+        if self.feature_enabled(module) { Ok(()) } else { Err(module) }
     }
 
     /// Check if Odoo integration is configured (URL and DB are set).

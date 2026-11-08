@@ -35,6 +35,7 @@ pub(crate) fn is_ee_module(name: &str) -> bool {
 }
 
 /// Feature gate based on edition and installed modules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditionGate {
     pub edition: Edition,
     pub installed_modules: HashSet<String>,

@@ -2615,6 +2615,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         otp_delivery,
         home_dir: home_dir.clone(),
     });
+    if duduclaw_core::gateway_instance::held(&home_dir) {
+        let schema_state = state.clone();
+        tokio::spawn(async move { schema_state.handler.run_odoo_schema_background().await; });
+    }
+
 
     // M1/M60: open the shared audit index once and refresh it on a background
     // interval, so audit/reliability requests reuse one connection instead of

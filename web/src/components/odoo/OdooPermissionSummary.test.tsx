@@ -12,6 +12,23 @@ describe('Odoo permission summary', () => {
     { locale: 'en', messages: en },
     { locale: 'zh-TW', messages: zhTW },
     { locale: 'ja-JP', messages: jaJP },
+  ])('shows effective blocks and inheritance with unrestricted actions in $locale', ({ locale, messages }) => {
+    const { rerender } = render(<IntlProvider locale={locale} messages={messages}>
+      <OdooPermissionSummary actions={[]} effectiveBlockedModels={['hr.employee']} unblockInherited />
+    </IntlProvider>);
+    expect(screen.getByText(messages['odoo.permissions.effectiveBlockedModels'])).toBeInTheDocument();
+    expect(screen.getByText(messages['odoo.permissions.unblockInherited'])).toBeInTheDocument();
+    expect(screen.getByText('hr.employee')).toBeInTheDocument();
+    rerender(<IntlProvider locale={locale} messages={messages}>
+      <OdooPermissionSummary actions={[]} effectiveBlockedModels={[]} unblockInherited={false} />
+    </IntlProvider>);
+    expect(screen.queryByText(messages['odoo.permissions.unblockInherited'])).not.toBeInTheDocument();
+    expect(screen.getByText(messages['odoo.permissions.noBlockedModels'])).toBeInTheDocument();
+  });
+  it.each([
+    { locale: 'en', messages: en },
+    { locale: 'zh-TW', messages: zhTW },
+    { locale: 'ja-JP', messages: jaJP },
   ])('shows button actions separately from other methods in $locale', ({ locale, messages }) => {
     render(<IntlProvider locale={locale} messages={messages}>
       <OdooPermissionSummary actions={['action', 'action:sale.order', 'execute:sale.order']} />

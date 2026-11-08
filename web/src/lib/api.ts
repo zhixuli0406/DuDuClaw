@@ -2572,6 +2572,7 @@ export interface OdooStatus {
   uid?: number;
   error?: string;
   schema?: OdooSchemaScanStatus;
+  results?: { employee: string; status: 'ok' | 'failed'; message?: string; schema?: OdooSchemaScanStatus }[];
 }
 
 export interface OdooSchemaScanStatus {
@@ -2591,8 +2592,16 @@ export interface OdooSchemaDiff {
 
 export interface OdooSchemaScanResult {
   success: boolean;
+  message?: string | null;
+  diff?: OdooSchemaDiff | null;
+  schema?: OdooSchemaScanStatus | null;
+  results?: OdooSchemaEmployeeScanResult[];
+}
+
+export interface OdooSchemaEmployeeScanResult {
+  employee: string;
+  status: 'ok' | 'failed';
   message?: string;
-  diff?: OdooSchemaDiff;
   schema?: OdooSchemaScanStatus;
 }
 
@@ -5538,6 +5547,9 @@ export interface MemoryGraphResult {
  *  agent inherits the global config. `api_key`/`password` are never returned in
  *  cleartext — only the `*_set` booleans plus a masked placeholder. */
 export interface OdooAgentConfig {
+  effective_unblock_models: string[];
+  unblock_inherited: boolean;
+  effective_blocked_models: string[];
   agent_id: string;
   configured: boolean;
   profile?: string;
@@ -5545,8 +5557,8 @@ export interface OdooAgentConfig {
   db?: string;
   username?: string;
   allowed_models: string[];
-  /** Models opted out of the built-in security block list. */
-  unblock_models?: string[];
+  /** Absent/null inherits the global list; [] explicitly unblocks nothing. */
+  unblock_models?: string[] | null;
   allowed_actions: string[];
   company_ids: number[];
   api_key_set: boolean;
@@ -7950,8 +7962,8 @@ export const api = {
   },
   odoo: {
     permissionOptions: () => client.call('odoo.permission_options') as Promise<OdooPermissionOptions>,
-    // Gateway bounds connect + scan at 240s; leave time for the final response.
-    scanSchema: () => client.call('odoo.schema_scan', {}, false, 300000) as Promise<OdooSchemaScanResult>,
+    // The gateway scans each effective identity in bounded batches.
+    scanSchema: () => client.call('odoo.schema_scan', {}, false, 3600000) as Promise<OdooSchemaScanResult>,
     status: () =>
       client.call('odoo.status') as Promise<OdooStatus>,
     config: () =>

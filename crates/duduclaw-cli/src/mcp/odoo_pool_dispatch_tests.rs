@@ -75,6 +75,7 @@ fn odoo_denial_messages_name_gate_and_operator_setting() {
                 assert!(text.contains("writing or deleting is always refused"));
             }
         }
+        assert!(text.contains("retrying the same call will not succeed"));
         assert!(!text.contains("agent.toml"));
     }
     let text = super::odoo::method_denial_message("unlink");
@@ -109,10 +110,8 @@ fn odoo_snapshot_overview_filters_before_search_and_redacts_relations() {
     let permitted = std::collections::HashSet::from(["crm.lead".to_string()]);
     let overview = super::odoo::schema_overview(&snapshot, &permitted, "", "");
     assert_eq!(overview["models"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        overview["models"][0]["custom_fields"],
-        serde_json::json!(["x_customer"])
-    );
+    assert!(overview["models"][0].get("custom_fields").is_none());
+    assert!(overview["models"][0].get("fields").is_none());
     assert!(!overview.to_string().contains("hr.employee"));
     let fields = super::odoo::schema_overview(&snapshot, &permitted, "crm.lead", "客戶");
     assert_eq!(fields["models"][0]["fields"][0]["custom"], true);
@@ -543,4 +542,249 @@ fn odoo_method_to_verb_distinguishes_buttons_from_other_methods() {
         ("unlink", "unlink"), ("custom_method", "execute")] {
         assert_eq!(super::odoo::odoo_method_to_verb(method), verb, "{method}");
     }
+}
+
+#[tokio::test]
+async fn fresh_pool_reads_project_switch_from_disk_without_network() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "[odoo]\nfeatures_project = true\nurl = 'http://localhost:1'\ndb = 'test'\n").unwrap();
+    let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+    let result = handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &pool, "agnes").await;
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("switched off"), "{text}");
+    assert!(text.contains("not connected"), "{text}");
+    assert!(!pool.is_connected("agnes").await);
+}
+
+#[tokio::test]
+async fn real_config_gates_run_before_auto_connect_or_secret_resolution() {
+    for (tool, params, agent_config, global_config, expected) in [
+        ("odoo_search", serde_json::json!({"model":"project.project"}), "", "features_project = false", "feature_gate"),
+        ("odoo_search", serde_json::json!({"model":"project.project"}), "allowed_models = ['crm.lead']", "features_project = true", "allowed_models gate"),
+        ("odoo_search", serde_json::json!({"model":"res.partner"}), "", "", "block list gate"),
+        ("odoo_execute", serde_json::json!({"model":"ir.model","method":"write"}), "unblock_models = ['ir.model']", "", "system read-only"),
+        ("odoo_execute", serde_json::json!({"model":"crm.lead","method":"unlink"}), "", "", "method safety gate"),
+        ("odoo_inventory_check", serde_json::json!({"product_id":1}), "allowed_models = ['stock.quant']", "", "allowed_models gate"),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("agents/agnes")).unwrap();
+        std::fs::write(home.path().join("config.toml"), format!("[odoo]\nurl = 'http://localhost:1'\ndb = 'test'\napi_key_enc = 'secret://missing/never-resolve'\n{global_config}\n")).unwrap();
+        std::fs::write(home.path().join("agents/agnes/agent.toml"), format!("[odoo]\n{agent_config}\n")).unwrap();
+        let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+        let result = handle_odoo_tool(tool, &params, home.path(), &pool, "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(expected), "{tool}: {text}");
+        assert!(text.contains("retrying the same call will not succeed"), "{text}");
+        assert!(pool.slots().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn data_tool_auto_connects_and_explicit_connect_reuses_identity_across_processes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let authentications = Arc::new(AtomicUsize::new(0));
+    let auth = authentications.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let request = loop {
+                let mut buffer = [0u8; 4096];
+                let size = socket.read(&mut buffer).await.unwrap();
+                assert!(size > 0);
+                bytes.extend_from_slice(&buffer[..size]);
+                let text = String::from_utf8_lossy(&bytes);
+                if let Some((header, body)) = text.split_once("\r\n\r\n") {
+                    let length: usize = header.lines().find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                    }).unwrap();
+                    if body.len() >= length { break serde_json::from_str::<Value>(body).unwrap(); }
+                }
+            };
+            let result = match request["params"]["method"].as_str().unwrap() {
+                "authenticate" => { auth.fetch_add(1, Ordering::SeqCst); serde_json::json!(7) }
+                "version" => serde_json::json!({"server_version":"19.0"}),
+                _ if request["params"]["args"][4] == "fields_get" => serde_json::json!({"id":{"type":"integer"},"name":{"type":"char"}}),
+                _ => serde_json::json!([]),
+            };
+            let body = serde_json::json!({"result":result}).to_string();
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), format!("[odoo]\nurl = '{url}'\ndb = 'test'\nusername = 'tester'\napi_key_enc = 'literal-test-key'\nfeatures_project = true\n")).unwrap();
+    let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+    let result = handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &pool, "agnes").await;
+    assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+    assert!(pool.is_connected("agnes").await);
+    assert_eq!(authentications.load(Ordering::SeqCst), 1);
+    let result = handle_odoo_tool("odoo_connect", &serde_json::json!({}), home.path(), &pool, "agnes").await;
+    assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+    assert_eq!(authentications.load(Ordering::SeqCst), 1);
+    let next_process: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+    let result = handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &next_process, "agnes").await;
+    assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
+    assert_eq!(authentications.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+fn policy_snapshot() -> duduclaw_odoo::schema::SchemaSnapshot {
+    let field = |name: &str, relation: Option<&str>| serde_json::json!({
+        "name":name,"ttype":if relation.is_some() { "many2one" } else { "char" },"label":name,
+        "relation":relation,"required":false,"readonly":false,"store":true,"custom":false,
+    });
+    let model = |name: &str, fields: Vec<Value>| serde_json::json!({
+        "model":name,"name":format!("{name} label"),"custom":false,"transient":false,
+        "modules":null,"info":null,"total_fields":fields.len(),"fields":fields,
+        "truncated":false,"error":null,
+    });
+    serde_json::from_value(serde_json::json!({
+        "schema_version":1,"scanned_at":"2026-11-08T00:00:00Z","server_version":"19",
+        "connection_identity":"test","modules":[],"total_models":5,"truncated":false,"truncation_reasons":[],
+        "models":[
+            model("res.partner", vec![field("vat", None)]),
+            model("project.task", vec![field("name", None)]),
+            model("x_secret", vec![field("name", None)]),
+            model("crm.lead", vec![field("name", None), field("partner_id", Some("res.partner")), field("task_id", Some("project.task"))]),
+            model("x_ok", vec![field("lead_id", Some("crm.lead"))]),
+        ],
+    })).unwrap()
+}
+
+#[test]
+fn schema_overview_never_returns_blocked_disabled_or_disallowed_models() {
+    let snapshot = policy_snapshot();
+    // Default switches (project off), default block list, allowed_models
+    // listing a blocked model does not unblock it.
+    let agent = duduclaw_odoo::AgentOdooConfig {
+        allowed_models: vec!["crm.lead".into(), "x_ok".into(), "res.partner".into(), "project.task".into()],
+        ..Default::default()
+    };
+    let visibility = crate::odoo_pool::SchemaVisibility::new(&duduclaw_odoo::OdooConfig::default(), Some(agent));
+    let permitted = super::odoo::permitted_schema_models(&snapshot, &visibility);
+    assert_eq!(permitted, ["crm.lead", "x_ok"].into_iter().map(String::from).collect::<std::collections::HashSet<String>>());
+    for (model, query) in [("", ""), ("", "partner"), ("", "task"), ("crm.lead", ""), ("res.partner", ""), ("", "vat"), ("", "secret")] {
+        let text = super::odoo::schema_overview(&snapshot, &permitted, model, query).to_string();
+        for hidden in ["res.partner", "project.task", "x_secret", "vat"] {
+            assert!(!text.contains(hidden), "{model}/{query} leaked {hidden}: {text}");
+        }
+    }
+    let lead = super::odoo::schema_overview(&snapshot, &permitted, "crm.lead", "");
+    assert_eq!(lead["models"][0]["fields"].as_array().unwrap().len(), 3);
+    let x_ok = super::odoo::schema_overview(&snapshot, &permitted, "x_ok", "");
+    assert_eq!(x_ok["models"][0]["fields"][0]["relation"], "crm.lead");
+}
+
+#[test]
+fn schema_visibility_uses_effective_unblocks_and_switches() {
+    let global = duduclaw_odoo::OdooConfig {
+        unblock_models: vec!["res.partner".into()],
+        features_project: true,
+        ..Default::default()
+    };
+    // No per-agent list inherits the global unblocks.
+    let inherit = crate::odoo_pool::SchemaVisibility::new(&global, None);
+    assert!(inherit.allows("res.partner") && inherit.allows("project.task"));
+    let inherit_override = crate::odoo_pool::SchemaVisibility::new(&global, Some(Default::default()));
+    assert!(inherit_override.allows("res.partner"));
+    // An explicit empty list unblocks nothing.
+    let explicit_empty = crate::odoo_pool::SchemaVisibility::new(&global, Some(duduclaw_odoo::AgentOdooConfig {
+        unblock_models: Some(Vec::new()), ..Default::default()
+    }));
+    assert!(!explicit_empty.allows("res.partner"));
+    let snapshot = policy_snapshot();
+    let permitted = super::odoo::permitted_schema_models(&snapshot, &explicit_empty);
+    assert!(!permitted.contains("res.partner") && permitted.contains("project.task") && permitted.contains("x_secret"));
+    // Switched-off module hides its models even when unblocked elsewhere.
+    let off = duduclaw_odoo::OdooConfig { features_crm: false, ..global };
+    assert!(!crate::odoo_pool::SchemaVisibility::new(&off, None).allows("crm.lead"));
+}
+
+#[test]
+fn schema_fields_relations_never_name_invisible_models() {
+    let mut report = duduclaw_odoo::connector::SchemaFieldsReport {
+        fields: ["res.partner", "project.task", "crm.lead"].iter().map(|relation| duduclaw_odoo::SchemaField {
+            name: format!("{}_id", relation.replace('.', "_")), ttype: "many2one".into(), label: "Rel".into(),
+            label_flagged: false, required: false, relation: Some(relation.to_string()),
+        }).collect(),
+        invalid_fields_dropped: 0, total_fields: 3, truncated: false,
+    };
+    let visibility = crate::odoo_pool::SchemaVisibility::new(&duduclaw_odoo::OdooConfig::default(), None);
+    super::odoo::hide_invisible_relations(&mut report, &visibility);
+    let text = super::odoo::schema_fields_metadata(&report).to_string();
+    assert!(!text.contains("\"res.partner\"") && !text.contains("\"project.task\""), "{text}");
+    assert_eq!(report.fields[2].relation.as_deref(), Some("crm.lead"));
+}
+
+#[tokio::test]
+async fn schema_tools_refuse_blocked_models_before_connecting() {
+    for (tool, agent_config) in [
+        ("odoo_schema_fields", ""),
+        ("odoo_schema_overview", ""),
+        // An explicit empty per-agent list does not inherit the global unblock.
+        ("odoo_schema_fields", "unblock_models = []"),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("agents/agnes")).unwrap();
+        let global_unblock = if agent_config.is_empty() { "" } else { "unblock_models = ['res.partner']" };
+        std::fs::write(home.path().join("config.toml"), format!("[odoo]\nurl = 'http://localhost:1'\ndb = 'test'\napi_key_enc = 'secret://missing/never-resolve'\n{global_unblock}\n")).unwrap();
+        std::fs::write(home.path().join("agents/agnes/agent.toml"), format!("[odoo]\n{agent_config}\n")).unwrap();
+        let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+        let result = handle_odoo_tool(tool, &serde_json::json!({"model":"res.partner"}), home.path(), &pool, "agnes").await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(result["isError"].as_bool().unwrap_or(false), "{tool}: {text}");
+        assert!(text.contains("block list gate"), "{tool}: {text}");
+        assert!(pool.slots().await.is_empty());
+    }
+}
+
+#[test]
+fn odoo_overview_caps_broad_and_narrow_utf8_output() {
+    let fields: Vec<_> = (0..500).map(|i| serde_json::json!({
+        "name":format!("field_{i}"),"ttype":"char","label":"客戶欄位".repeat(30),
+        "relation":null,"required":false,"readonly":false,"store":true,"custom":false,
+    })).collect();
+    let models: Vec<_> = (0..400).map(|i| serde_json::json!({
+        "model":format!("x_model_{i}"),"name":"專案資料表".repeat(30),"custom":true,
+        "transient":false,"modules":null,"info":null,"fields":if i == 0 { fields.clone() } else { Vec::new() },
+        "total_fields":500,"truncated":false,"error":null,
+    })).collect();
+    let snapshot = serde_json::from_value(serde_json::json!({
+        "schema_version":1,"scanned_at":"2026-11-08T00:00:00Z","server_version":"19",
+        "connection_identity":"test","modules":[],"models":models,
+        "total_models":400,"truncated":false,"truncation_reasons":[],
+    })).unwrap();
+    let permitted = (0..400).map(|i| format!("x_model_{i}")).collect();
+    let broad = super::odoo::schema_overview(&snapshot, &permitted, "", "");
+    assert!(serde_json::to_vec(&broad).unwrap().len() <= 16 * 1024);
+    assert_eq!(broad["total_count"], 400);
+    assert_eq!(broad["truncated"], true);
+    assert!(broad["models"].as_array().unwrap().iter().all(|m| m.get("fields").is_none()));
+    let narrow = super::odoo::schema_overview(&snapshot, &permitted, "x_model_0", "");
+    assert!(serde_json::to_vec(&narrow).unwrap().len() <= 32 * 1024);
+    assert_eq!(narrow["total_count"], 1);
+    assert_eq!(narrow["truncated"], true);
+    assert!(!narrow["models"][0]["fields"].as_array().unwrap().is_empty());
+    // A query matching more than five authorized models stays an index.
+    let broad_query = super::odoo::schema_overview(&snapshot, &permitted, "", "x_model");
+    assert_eq!(broad_query["total_count"], 400);
+    assert_eq!(broad_query["fields_included"], false);
+    assert_eq!(broad_query["truncated"], true);
+    assert!(serde_json::to_vec(&broad_query).unwrap().len() <= 16 * 1024);
+    // A query matching one authorized model includes fields under the 32 KiB cap.
+    let narrow_query = super::odoo::schema_overview(&snapshot, &permitted, "", "field");
+    assert_eq!(narrow_query["total_count"], 1);
+    assert_eq!(narrow_query["fields_included"], true);
+    assert_eq!(narrow_query["truncated"], true);
+    assert!(serde_json::to_vec(&narrow_query).unwrap().len() <= 32 * 1024);
+    // The cap and counts apply after filtering: unpermitted matches never count.
+    let only_first = std::collections::HashSet::from(["x_model_0".to_string()]);
+    let filtered = super::odoo::schema_overview(&snapshot, &only_first, "", "x_model");
+    assert_eq!(filtered["total_count"], 1);
+    assert_eq!(filtered["fields_included"], true);
 }

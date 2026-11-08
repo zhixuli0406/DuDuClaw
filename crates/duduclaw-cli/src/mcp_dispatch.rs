@@ -26,8 +26,10 @@ use duduclaw_core::types::ToolPolicy;
 use duduclaw_memory::SqliteMemoryEngine;
 
 fn scope_denial_message(tool: &str, required: Scope) -> String {
-    if tool.starts_with("odoo_") {
-        format!("Insufficient scope: MCP scope gate requires '{required}' for '{tool}'. Ask an admin to check the MCP key scopes and the agent's tool permissions; allowed_models/unblock_models do not grant MCP scopes.")
+    if tool.starts_with("odoo_") && matches!(required, Scope::Admin) {
+        format!("Odoo capability is not available: '{tool}' is not offered. This is a policy decision; retrying the same call will not succeed. 這項功能不提供；這是政策限制，重試相同呼叫不會成功。")
+    } else if tool.starts_with("odoo_") {
+        format!("Insufficient scope: MCP scope gate requires '{required}' for '{tool}'. Ask an admin to check the MCP key scopes and the agent's tool permissions; allowed_models/unblock_models do not grant MCP scopes. This is a policy decision; retrying the same call will not succeed. 這是政策限制，重試相同呼叫不會成功。")
     } else {
         format!("Insufficient scope: {required:?} required for '{tool}'")
     }
@@ -1982,6 +1984,10 @@ impl McpDispatcher {
 mod tests {
     #[test]
     fn odoo_scope_denial_names_gate_and_operator_scopes() {
+        let unavailable = super::scope_denial_message("odoo_unoffered", super::Scope::Admin);
+        assert!(unavailable.contains("not available"));
+        assert!(!unavailable.contains("Ask an admin"));
+        assert!(unavailable.contains("retrying the same call will not succeed"));
         for (tool, scope) in [("odoo_search", super::Scope::OdooRead), ("odoo_execute", super::Scope::OdooExecute), ("odoo_schema_overview", super::Scope::OdooRead)] {
             let message = super::scope_denial_message(tool, scope.clone());
             assert!(message.contains("MCP scope gate"));
