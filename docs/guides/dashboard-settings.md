@@ -57,6 +57,20 @@ no_success_hours = 6    # 1..168
 
 An absent configuration file or omitted section uses these defaults. Read errors other than a missing file, or invalid settings, disable health reminders. Turning reminders off does not grant employee permissions or change task execution. The health page remains read-only.
 
+## Employee edit page → Tools & permissions → Tool permissions (v1.81.0)
+
+The **Tools & permissions** tab of the employee edit page has two sub-tabs: **Tool permissions** and **Permission history**. The table lists every catalog tool by category, with a **Can use** and a **Needs approval** column, a per-category select-all (`N/M can use`) and a search box. Edits stay in a draft: changed rows are marked, a sticky bar offers **Discard changes** / **Save**, and Save opens a confirmation that counts newly allowed, no-longer-allowed and needs-approval tools with a per-tool before → after line. Confirming writes through the normal `agents.update` `capabilities` payload. Only an Admin can change anything; other accounts get the same table read-only, with every checkbox disabled and no select-all or save bar.
+
+How the table maps to `agent.toml [capabilities]`:
+
+- **Can use** = not matched by `denied_tools`, and either `allowed_tools` is empty or matches the tool (the gateway's own rule: denied always wins, a non-empty allow list is allowlist mode). Matching is anchored and wildcard-aware, e.g. `mcp__duduclaw__*`.
+- Unticking a tool always **appends it to `denied_tools`**; `allowed_tools` is never shrunk or rewritten, so a wildcard allow list stays exactly as written and every tool it covers shows as allowed. Re-ticking removes that deny entry. A tool covered by a *wildcard* deny entry cannot be turned on here (the row is locked); edit the entry in Advanced settings.
+- **Needs approval** = `approval_required_tools` (bare tool names), the list the MCP dispatch gate enforces for every tool. A tool already asked by a wildcard approval entry or an `action_rules` `ask` rule shows as needs-approval but is locked. The checkbox is disabled while **Can use** is off.
+
+The previous Allow list, Block list, Action rules and Approval list blocks now sit in a collapsed **Advanced settings** at the bottom of the tab and stay in sync with the table.
+
+**Permission history** (Admin only) lists changes to this employee's permissions from the `agent_authority_changed` audit rows: time, who, and each tool's old state struck through → new state. Changes not saved from the table are marked **Changed in Advanced settings** (this also covers older changes made before the table existed). The tab is backed by the Admin-only `agents.permission_history` RPC (`agent_id`, `limit` up to 100, `cursor`), which reads the same audit log as `security.audit_log`.
+
 ## Employee sidebar
 
 On non-Personal editions, Employee accounts see Dashboard, Inbox, Automations, Skills, Memory, Virtual office and a read-only organization chart, followed by bound AI staff and conversation history. Search opens the existing command palette. The primary AI employee appears first; the rest are ordered Owner, Operator, Viewer, up to eight entries. Inbox appears once. The user menu shows the bound email, My connections, Settings, Appearance, Language, Get help and Sign out. Language opens the account settings selector. Get help opens the distributor information entry when the server provides one; otherwise it opens the product guides. The employee layout shows the version only on About. Admin, Manager and Personal navigation keep their existing layout.

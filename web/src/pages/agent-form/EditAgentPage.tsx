@@ -75,6 +75,10 @@ import {
   SettingsRow,
   SettingsSaveState,
   Checkbox,
+  Tabs,
+  TabsList,
+  TabsTab,
+  TabsPanel,
   type SettingsNavGroup,
   type SettingsSaveStatus,
 } from '@/components/mds';
@@ -109,6 +113,8 @@ import {
 } from './editPayload';
 import { ToolNameListField, TypedKvTable } from './v168-controls';
 import { ActionRulesEditor } from './ActionRulesEditor';
+import { ToolPermissionMatrix } from './ToolPermissionMatrix';
+import { PermissionHistory } from './PermissionHistory';
 import { RowText, RowNumber, RowSwitch, RowSelect, FieldBlock } from './form-rows';
 import { isRemovedRuntime } from '@/lib/deprecated-runtimes';
 import { buildDbSourceCapabilityRows, toggleDbSourceCapability } from './dbSourceCapability';
@@ -392,6 +398,13 @@ function EditAgentPageContent() {
   // CapabilityToggles are the primary surface; auto-opened by the prefill when
   // the agent already has an allowlist or Progent policy.
   const [showAdvancedTools, setShowAdvancedTools] = useState(false);
+  // RM-026 — the four raw permission blocks (allow list, deny list, action
+  // rules, approval list) live in a collapsed 進階設定 under the 工具權限 table.
+  // They read/write the same `caps`, so the table and these stay in sync.
+  const [showPermAdvanced, setShowPermAdvanced] = useState(false);
+  const [permTab, setPermTab] = useState<'matrix' | 'history'>('matrix');
+  // Bumped when the table's change was sent, so the history tab reloads.
+  const [permHistoryKey, setPermHistoryKey] = useState(0);
 
   // DB — configured read-only SQL data sources, for the "可使用的資料庫來源"
   // checkbox list. `null` means either "not loaded yet" or "the operator
@@ -1040,6 +1053,12 @@ function EditAgentPageContent() {
     performSaveRef.current = performSave;
   }, [performSave]);
 
+  // RM-026 — a finished save may have written a permission change: reload the
+  // 權限變更紀錄 tab so it shows up without a manual refresh.
+  useEffect(() => {
+    if (saveStatus === 'saved') setPermHistoryKey((k) => k + 1);
+  }, [saveStatus]);
+
   // Single-flight save loop. Never two saves at once; if edits land while a save
   // is in flight (trailing flag) or the change counter advanced mid-save, run
   // one more pass. Consumes the trailing flag before each attempt.
@@ -1291,6 +1310,37 @@ function EditAgentPageContent() {
             </SettingsCard>
           </SettingsSection>
 
+          {/* RM-026 — 工具權限 table + 權限變更紀錄. Sits outside the
+              admin-only fieldset on purpose: a non-admin gets the read-only
+              table (the component disables everything itself), and the
+              history tab explains it is admin-only. */}
+          <SettingsSection title={t('agents.perm.section.title')} description={t('agents.perm.section.desc')}>
+            <Tabs value={permTab} onValueChange={(v) => setPermTab(v as 'matrix' | 'history')} variant="line">
+              <TabsList>
+                <TabsTab value="matrix">{t('agents.perm.tab.matrix')}</TabsTab>
+                <TabsTab value="history">{t('agents.perm.tab.history')}</TabsTab>
+              </TabsList>
+              <TabsPanel value="matrix" className="pt-3">
+                <ToolPermissionMatrix
+                  agentName={agent.display_name || agent.name}
+                  allowedTools={caps.allowed_tools}
+                  deniedTools={caps.denied_tools}
+                  approvalRequiredTools={caps.approval_required_tools}
+                  actionRules={caps.action_rules}
+                  isAdmin={isAdmin}
+                  onApply={(next) => {
+                    if (next.allowed_tools) updateCap('allowed_tools', next.allowed_tools);
+                    if (next.denied_tools) updateCap('denied_tools', next.denied_tools);
+                    if (next.approval_required_tools) updateCap('approval_required_tools', next.approval_required_tools);
+                  }}
+                />
+              </TabsPanel>
+              <TabsPanel value="history" className="pt-3">
+                <PermissionHistory agentId={agent.name} isAdmin={isAdmin} refreshKey={permHistoryKey} />
+              </TabsPanel>
+            </Tabs>
+          </SettingsSection>
+
           {/* 自主等級 — how much the autonomous goal loop may drive this agent
               on its own (`agent.toml [capabilities] autonomy_level`, read by
               `goal_loop::AutonomyLevel`). A single-select radio group (not a
@@ -1398,18 +1448,6 @@ function EditAgentPageContent() {
             </button>
             {showAdvancedTools && (
               <>
-                <FieldBlock label={t('agents.cap.allowedTools')} description={t('agents.cap.allowedTools.hint')}>
-                  <div className="space-y-2">
-                    <ChipEditor values={caps.allowed_tools} onChange={(v) => updateCap('allowed_tools', v)} placeholder="Read" addLabel={t('common.add')} />
-                    <ToolCatalogPicker triggerLabel={t('agents.cap.toolPicker.add')} selected={caps.allowed_tools} onChange={(v) => updateCap('allowed_tools', v)} />
-                  </div>
-                </FieldBlock>
-                <FieldBlock label={t('agents.cap.deniedTools')} description={t('agents.cap.deniedTools.hint')}>
-                  <div className="space-y-2">
-                    <ChipEditor values={caps.denied_tools} onChange={(v) => updateCap('denied_tools', v)} placeholder="Bash" addLabel={t('common.add')} />
-                    <ToolCatalogPicker triggerLabel={t('agents.cap.toolPicker.add')} selected={caps.denied_tools} onChange={(v) => updateCap('denied_tools', v)} />
-                  </div>
-                </FieldBlock>
                 <FieldBlock label={t('agents.cap.wikiVisibleTo')} description={t('agents.cap.wikiVisibleTo.hint')}>
                   <ChipEditor values={caps.wiki_visible_to} onChange={(v) => updateCap('wiki_visible_to', v)} placeholder="coder" addLabel={t('common.add')} />
                 </FieldBlock>
@@ -1442,17 +1480,11 @@ function EditAgentPageContent() {
             </FieldBlock>
           </SettingsSection>
 
-          {/* 2026-10 — [capabilities] action_rules: allow / ask / block per
-              kind of action, plus per-tool overrides. */}
-          <SettingsSection title={t('agents.actionRules.title')} description={t('agents.actionRules.desc')}>
-            <ActionRulesEditor rules={caps.action_rules} onChange={(v) => updateCap('action_rules', v)} disabled={!isAdmin} />
-          </SettingsSection>
-
           {/* v1.68 W1 — tools that need a checkpoint before they run
-              ([capabilities] approval_required_tools / irreversible_tools /
-              maybe_irreversible_tools / scoped_tools; bare tool names). */}
+              ([capabilities] irreversible_tools / maybe_irreversible_tools /
+              scoped_tools; bare tool names). The plain approval list moved
+              into 進階設定 below the 工具權限 table (RM-026). */}
           <SettingsSection title={t('agents.v168.toolGates.title')} description={t('agents.v168.toolGates.desc')}>
-            <ToolNameListField label={t('agents.v168.toolGates.approval')} description={t('agents.v168.toolGates.approval.help')} values={caps.approval_required_tools} onChange={(v) => updateCap('approval_required_tools', v)} disabled={!isAdmin} />
             <ToolNameListField label={t('agents.v168.toolGates.irreversible')} description={t('agents.v168.toolGates.irreversible.help')} values={caps.irreversible_tools} onChange={(v) => updateCap('irreversible_tools', v)} disabled={!isAdmin} />
             <ToolNameListField label={t('agents.v168.toolGates.maybe')} description={t('agents.v168.toolGates.maybe.help')} values={caps.maybe_irreversible_tools} onChange={(v) => updateCap('maybe_irreversible_tools', v)} disabled={!isAdmin} />
             <ToolNameListField label={t('agents.v168.toolGates.scoped')} description={t('agents.v168.toolGates.scoped.help')} values={caps.scoped_tools} onChange={(v) => updateCap('scoped_tools', v)} disabled={!isAdmin} />
@@ -1614,6 +1646,43 @@ function EditAgentPageContent() {
                   <RowNumber label={t('agents.osWatch.maxEventsPerMin')} description={t('agents.osWatch.maxEventsPerMin.help')} value={osWatch.max_events_per_min} min={1} max={1000000} onChange={(v) => updateOsWatch('max_events_per_min', v)} />
                 </SettingsCard>
                 <p className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">{t('agents.osWatch.hotReloadHint')}</p>
+              </fieldset>
+            )}
+          </SettingsSection>
+
+          {/* RM-026 — 進階設定: the four raw permission blocks (允許清單、封鎖清單、
+              動作規則、審批清單), collapsed. Same `caps` as the 工具權限 table, so
+              an edit here shows in the table at once and vice versa. */}
+          <SettingsSection title={t('agents.perm.advanced.title')} description={t('agents.perm.advanced.desc')}>
+            <button
+              type="button"
+              aria-expanded={showPermAdvanced}
+              onClick={() => setShowPermAdvanced((v) => !v)}
+              className="inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <ChevronRight className={cn('size-3.5 transition-transform', showPermAdvanced && 'rotate-90')} />
+              {showPermAdvanced ? t('agents.perm.advanced.hide') : t('agents.perm.advanced.show')}
+            </button>
+            {showPermAdvanced && (
+              <fieldset disabled={!isAdmin} className="contents">
+                <FieldBlock label={t('agents.cap.allowedTools')} description={t('agents.cap.allowedTools.hint')}>
+                  <div className="space-y-2">
+                    <ChipEditor values={caps.allowed_tools} onChange={(v) => updateCap('allowed_tools', v)} placeholder="Read" addLabel={t('common.add')} />
+                    <ToolCatalogPicker triggerLabel={t('agents.cap.toolPicker.add')} selected={caps.allowed_tools} onChange={(v) => updateCap('allowed_tools', v)} />
+                  </div>
+                </FieldBlock>
+                <FieldBlock label={t('agents.cap.deniedTools')} description={t('agents.cap.deniedTools.hint')}>
+                  <div className="space-y-2">
+                    <ChipEditor values={caps.denied_tools} onChange={(v) => updateCap('denied_tools', v)} placeholder="Bash" addLabel={t('common.add')} />
+                    <ToolCatalogPicker triggerLabel={t('agents.cap.toolPicker.add')} selected={caps.denied_tools} onChange={(v) => updateCap('denied_tools', v)} />
+                  </div>
+                </FieldBlock>
+                {/* 2026-10 — [capabilities] action_rules: allow / ask / block per
+                    kind of action, plus per-tool overrides. */}
+                <FieldBlock label={t('agents.actionRules.title')} description={t('agents.actionRules.desc')}>
+                  <ActionRulesEditor rules={caps.action_rules} onChange={(v) => updateCap('action_rules', v)} disabled={!isAdmin} />
+                </FieldBlock>
+                <ToolNameListField label={t('agents.v168.toolGates.approval')} description={t('agents.v168.toolGates.approval.help')} values={caps.approval_required_tools} onChange={(v) => updateCap('approval_required_tools', v)} disabled={!isAdmin} />
               </fieldset>
             )}
           </SettingsSection>

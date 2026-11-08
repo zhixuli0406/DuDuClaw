@@ -127,6 +127,7 @@ fn personal_surfaces_are_untouched() {
         "agents.list",
         "agents.create",
         "agents.update",
+        "agents.permission_history",
         "tasks.list",
         "plans.list",
         "evolution.status",
