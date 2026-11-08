@@ -742,6 +742,10 @@ async fn dispatch_effective_cron_task(
         let _ = store.record_autonomy_skip(&task.id, "背景工作正在等候管理員核准。").await;
         return;
     }
+    if let Some(reason) = crate::isolation_background::refusal_reason() {
+        let _ = store.record_autonomy_skip(&task.id, reason).await;
+        return;
+    }
     if !cron_principal_allowed(home_dir, store, registry, task).await {
         return;
     }

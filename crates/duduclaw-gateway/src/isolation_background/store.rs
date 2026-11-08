@@ -3,6 +3,7 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use duduclaw_isolation::capability::EmployeeBinding;
 use super::{RecordAuthority, VerificationError, APPROVAL_KIND, unavailable};
 
 const MAX_BYTES: usize = 64 * 1024;
@@ -45,6 +46,23 @@ pub(super) fn validate(value: &RecordAuthority) -> Result<(), VerificationError>
         return Err(VerificationError::Invalid);
     }
     if value.detached_bus && value.kind != "delegation" { return Err(VerificationError::Invalid); }
+    // v1.81 binding/allocation. Both absent: a receipt stored before v1.81,
+    // readable only so a new request can replace it (recheck refuses it).
+    // Only one present, or a Personal binding, is never a valid receipt.
+    match &value.binding {
+        None if value.allocation.is_none() => {}
+        Some(binding @ EmployeeBinding::Shared(_)) if value.allocation.is_some() =>
+            duduclaw_migration::allocation::validate_principal_binding(binding).map_err(|_| VerificationError::Invalid)?,
+        _ => return Err(VerificationError::Invalid),
+    }
+    Ok(())
+}
+
+/// A receipt that may be written or filed for approval: structurally valid
+/// and carrying the v1.81 binding and allocation.
+pub(super) fn validate_current(value: &RecordAuthority) -> Result<(), VerificationError> {
+    validate(value)?;
+    if value.is_legacy() { return Err(VerificationError::Invalid); }
     Ok(())
 }
 
@@ -65,7 +83,8 @@ pub(super) fn load(home: &Path, kind: &str, id: &str) -> Result<Option<RecordAut
 }
 
 pub(super) fn save(value: &RecordAuthority) -> Result<(), VerificationError> {
-    validate(value)?;
+    // Never persist the pre-v1.81 form; it can only be replaced.
+    validate_current(value)?;
     let text = serde_json::to_string(value).map_err(|_| unavailable())?;
     if text.len() > MAX_BYTES { return Err(VerificationError::Invalid); }
     let mut conn = Connection::open(value.home.join("isolation_background.db")).map_err(|_| unavailable())?;

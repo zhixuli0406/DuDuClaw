@@ -1212,7 +1212,8 @@ impl MethodHandler {
                         let material = crate::isolation_background::material::heartbeat(&self.home_dir, &agent_id)?;
                         crate::isolation_background::request_record_from_settings(&self.home_dir, "heartbeat", &agent_id,
                             &agent_id, &owner, &material).await
-                            .map_err(|_| "背景工作設定已儲存，但執行授權尚未送審；請重新儲存設定。".to_string())
+                            .map_err(|error| error.user_message()
+                                .unwrap_or("背景工作設定已儲存，但執行授權尚未送審；請重新儲存設定。").to_string())
                     }.await;
                     if let Err(error) = requested { return WsFrame::error_response("", &error); }
                 }

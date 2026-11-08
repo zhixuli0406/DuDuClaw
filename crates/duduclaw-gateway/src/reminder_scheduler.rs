@@ -1019,6 +1019,11 @@ where
                     if crate::isolation_background::approval_pending() {
                         return (Err("背景工作正在等候管理員核准。".into()), true);
                     }
+                    // A receipt awaiting re-approval stays Pending; a Personal
+                    // employee never runs it, so the reminder fails with the reason.
+                    if let Some(reason) = crate::isolation_background::refusal_reason() {
+                        return (Err(reason.into()), reason == crate::isolation_background::LEGACY_REFUSAL);
+                    }
                     let result = match duduclaw_mcp_boundary::io_authority::verify_before_io() {
                         Ok(()) => invoke(reminder.agent_id.clone(), full_prompt).await,
                         Err(error) => Err(error.to_string()),
