@@ -335,7 +335,7 @@ document treats it as "no launcher" (helper tools report `helper_launcher_unavai
 | T13 | Helper inherits the control socket or other launcher fds [F1] | Exact helper `FdPlan`, fd 3 = `/dev/null`, readback; launcher fd allowlist [F12]. | None. |
 | T14 | OOM-unkillable runtime via inherited `oom_score_adj` [F2] | Only the supervisor is protected; init resets to 0 before forking; readback. | None. |
 | T15 | Runtime descendants act after the runtime exits [F4] | Init kills `rt-runtime` at once; spawnd `Draining` from `rt-runtime` `populated 0`; launcher refuses `Start` after SIGTERM; bounded init wait. | None. |
-| T16 | Signals between runtime and helpers/launcher/init/forwarder [F13, F5] | Timeout, OOM and exit decided root-side by spawnd; launcher death non-fatal. Landlock signal and abstract-socket scoping used where ABI ≥ 6. | A compromised helper can `SIGTERM` init, `SIGKILL` the forwarder (run exits 125) or `SIGSTOP` the runtime: run availability only. **Needs owner acknowledgement at HX1 sign-off.** Low-Med. |
+| T16 | Signals between runtime and helpers/launcher/init/forwarder [F13, F5] | Timeout, OOM and exit decided root-side by spawnd; launcher death non-fatal. Landlock signal and abstract-socket scoping used where ABI ≥ 6. | A compromised helper can `SIGTERM` init, `SIGKILL` the forwarder (run exits 125) or `SIGSTOP` the runtime: run availability only. **Accepted by the owner 2026-11-08** (availability only; signal scoping enabled automatically where Landlock ABI ≥ 6, documented in the security doc elsewhere). Low-Med. |
 | T17 | Stopped launcher defeats the timeout [F5] | spawnd watchdog + root `cgroup.kill`; OOM from `memory.events`. | None. |
 | T18 | Cancel of an in-run job kills the whole run [F8] | Jobs keyed `(run, call)`; only `HelperStop`/`HelperCancel`; legacy `kill_authorized(run)`/`backend.kill(run)` unreachable by type. | None. |
 | T19 | Runtime pre-creates or swaps helper scratch in `/tmp` [F9] | All scratch, `TMPDIR`, `HOME` under `/helper-tmp/<call>`, which the runtime cannot reach; no-follow cleanup. | None. |
@@ -347,7 +347,7 @@ Waves: HX1 → HX2 ∥ HX3a → HX3b → HX4 → HX5 → HX6. [SEC] = Daybreak r
 tests are `#[ignore]` `iso_root_helper_*`, run on the H15 hosts.
 
 - **HX1** design + contract amendment (this doc; D8 text in the files listed in §5), threat-model review folded in
-  (F1–F17), owner decisions Q1–Q5 (§8). Open: owner acknowledgement of T16 residual.
+  (F1–F17), owner decisions Q1–Q5 (§8). T16 residual accepted by the owner 2026-11-08; HX1 signed off.
 - **HX2** [SEC] signed policy and plumbing: `installed.rs` (`LauncherRecord`, `HelperFs` enum, policy v2 with
   signed version, v1 → no launcher, checks 1–7), `policy.rs` (derive from `entry.employee`),
   `native_trampoline.rs` (helper exec/mount fds, control socketpair; cgroup leaves `rt-init`/`rt-runtime`/`hx/fg`/
