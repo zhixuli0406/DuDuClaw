@@ -24,15 +24,27 @@ pub fn needs_execution_workspace(name: &str, employee_scope: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::needs_execution_workspace;
+    use crate::tool_policy::{policy, ResourceKind, SPAWN_TOOLS};
 
     #[test]
     fn file_workspace_never_signs_execution_or_workspace_services() {
+        // H13: spawn_agent / spawn_ephemeral are routed in protected mode and
+        // need only the run's own Employee grant. This rule neither drops them
+        // nor does any Workspace grant get involved for them.
+        assert_eq!(SPAWN_TOOLS, ["spawn_agent", "spawn_ephemeral"]);
+        for tool in SPAWN_TOOLS {
+            let required = policy(tool).expect(tool).required;
+            assert!(required.contains(&ResourceKind::Employee) && !required.contains(&ResourceKind::Workspace), "{tool}");
+            assert!(!needs_execution_workspace(tool, true), "{tool}");
+            assert!(!needs_execution_workspace(tool, false), "{tool}");
+        }
         for tool in ["file_read", "csv_read", "xlsx_read", "tasks_update", "computer_session_start",
             "computer_login", "skill_curator_status", "unknown_tool"] {
             assert!(!needs_execution_workspace(tool, true), "{tool}");
         }
+        // Still pending a production selector: dropped from the signed set.
         for tool in ["browser_record_start", "browser_record_stop", "execute_program", "code_map", "office_script",
-            "spawn_agent", "spawn_ephemeral", "inspect_branches", "diff_branches", "fork_cost",
+            "inspect_branches", "diff_branches", "fork_cost",
             "discovery_catalog", "discovery_list", "discovery_tree", "discovery_artifact", "discovery_cancel",
             "skill_from_recording", "skill_synthesis_run", "skill_hub_install"] {
             assert!(needs_execution_workspace(tool, true), "{tool}");
