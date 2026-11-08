@@ -195,6 +195,8 @@ fn provision_with(home: &Path, provider: &str, kind: ConnectorKind, binding: &Em
 /// Audit marker for where a provision came from; never the operation id.
 fn origin_name(origin: Option<&MigrationOrigin>) -> Value {
     Value::String(if origin.is_some() { "migration" } else { "admin" }.to_owned())
+}
+
 /// v1.81 E4: a Google SharedTenant route stands for a tenant credential
 /// source (sealed delegation key or `[integrations.google_service_account]`).
 /// Refuse to register one while no such source is installed, so a tenant
