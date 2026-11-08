@@ -134,7 +134,25 @@ Enterprise setting (v1.76.0, User Management → Organisation settings): `users.
 - When `config.toml` does not parse, `system.update_config`, the live data feed editor and the Advanced config editor refuse to write; fix the syntax in the Advanced config editor first. The other settings pages that write `config.toml` (channels, accounts, Odoo and so on) refuse in the same way.
 - A save edits the file in place: only the keys you changed are rewritten. Comments, blank lines, key order and the formatting of every untouched key stay exactly as you wrote them, and a changed value keeps the comment at the end of its line. A new key goes at the end of its section and a new section at the end of the file. This holds for every settings page that writes `config.toml` or `inference.toml`, not only the Advanced config editor.
 - Keys that only take effect after a restart come back in `restart_required`. The Settings and Channels pages show "These settings take effect after the gateway restarts" until the gateway has restarted (you can also dismiss it). The Inference page and the employee edit page do not show this banner.
-- Each change to one of these keys also writes the audit event `config_protected_key_changed` with the old and new value: `acp.trusted`, `tick.allow_command_sources`, `container.sandbox.when_unavailable`, `container.sandbox.script_when_unavailable`, `memory.supersession_trust_guard`.
+- Each change to one of these keys also writes the audit event `config_protected_key_changed` with the old and new value: `acp.trusted`, `tick.allow_command_sources`, `container.sandbox.when_unavailable`, `container.sandbox.script_when_unavailable`, `memory.supersession_trust_guard`, `dashboard.public_url`.
+
+## Settings → General → Dashboard public URL
+
+Admins set `[dashboard] public_url` here: the full address people use to reach the dashboard, including any reverse proxy sub-path, for example `https://example.com/agents/`. It must use HTTPS; HTTP is allowed only for `localhost`, `127.0.0.0/8` or `::1`. The URL must have no user name or password, query (`?`), fragment (`#`), `..` or encoded `/` / `\`. The gateway refuses anything else on save; a value that was hand-edited into `config.toml` and is invalid makes OAuth sign-ins refuse to start until it is fixed (they never fall back silently to an address without the sub-path). Leave the field empty to clear the key. The change applies immediately and writes `config_protected_key_changed`.
+
+When public_url is set, it is used for every OAuth callback and return link, with the sub-path kept:
+
+| Flow | Callback URL the provider redirects to | Where the browser lands afterwards |
+|---|---|---|
+| Remote MCP server (Integrations → MCP → Remote servers) | `<public_url>/oauth/mcp/callback` (registered automatically by dynamic client registration) | `<public_url>/manage/integrations?tab=mcp&mcp_tab=remote` |
+| Personal Google account (My connections) | `<public_url>/api/me/google/callback` | `<public_url>/me/connections` |
+| Built-in Google Workspace, GitHub, Notion and Slack OAuth | `<public_url>/api/mcp/oauth/callback` | The result page links to `<public_url>/manage/integrations?tab=google` (Google) or `?tab=mcp` |
+
+- **Register the new callback URL.** After you set or change public_url, add the new callback URL to each OAuth app you use: Google Cloud Console → Credentials → your OAuth client → Authorized redirect URIs, and the GitHub OAuth App's Authorization callback URL (a GitHub OAuth App has one callback URL, so replace it). Do the same for Notion and Slack apps. The Integrations page shows the exact URL to register. A sign-in that was already in progress finishes with the URL it started with.
+- The browser's own origin is still checked first: a direct redirect is only used when the dashboard is opened on a loopback address or on an https origin listed in `[gateway] allowed_origins`. Otherwise the paste-back flow at `http://127.0.0.1:<port>/…` is used as before (that loopback address never has a prefix). If the dashboard is opened on an allowed origin other than public_url, the redirect still goes to public_url, and the gateway logs a warning once.
+- Without public_url nothing changes: remote MCP and personal Google sign-ins return to the browser's origin with no path, and the built-in providers use `http://localhost:<port>/api/mcp/oauth/callback`.
+- Reverse proxy: forward `<prefix>/oauth/mcp/callback` and `<prefix>/api/…` to the gateway with the prefix removed.
+- Limitation: the dashboard app itself is built for the root path. It loads `/assets/…`, calls `/api/…` and `/ws`, and its page routes have no base path. Serving it under a sub-path therefore also needs the proxy to send those root paths to the gateway, or the dashboard needs its own host name. public_url fixes the OAuth callback and return addresses; it does not make the dashboard app prefix-aware. When the page has a same-origin `<base href>` (for example injected by the proxy), the dashboard sends that sub-path with OAuth starts and member invitations; the gateway still validates it.
 
 ## Settings → Advanced → Automation
 

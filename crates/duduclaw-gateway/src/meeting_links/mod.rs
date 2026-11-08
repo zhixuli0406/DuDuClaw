@@ -18,7 +18,7 @@ pub fn issue(manager:&Manager,agent:&str,turn:Option<&str>)->Result<Value,String
         .and_then(crate::deep_link::valid_oauth_public_base).ok_or("請管理員設定控制台公開網址，或使用控制台的「會議逐字稿」頁面。")?;
     let url=url::Url::parse(&public.1).map_err(|_|"控制台公開網址格式錯誤。")?;
     if url.scheme()!="https" && !matches!(url.host_str(),Some("localhost"|"127.0.0.1"|"[::1]")) {return Err("請管理員將控制台公開網址設為 HTTPS，或使用控制台的「會議逐字稿」頁面。".into());}
-    let base=crate::deep_link::oauth_dashboard_base(&manager.home,&public.0);
+    let base=public.1;
     let cfg=duduclaw_inference::transcription::config::TranscriptionConfig::load(&manager.home)?;
     let store=Store::open(&manager.home)?;
     let token=store.issue(agent,binding,cfg.max_bytes,manager.policy_digest(agent)?,chrono::Utc::now().timestamp())?;

@@ -15,10 +15,44 @@ vi.mock('@/lib/api', () => ({
 }));
 
 import { GeneralTab } from './GeneralTab';
+import { useAuthStore } from '@/stores/auth-store';
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useAuthStore.setState({ user: null } as never);
   updateConfigMock.mockResolvedValue({ success: true, changes: [], restart_required: [] });
+});
+
+describe('<GeneralTab> dashboard public URL (RM-129)', () => {
+  it('loads, validates and saves [dashboard] public_url for admins', async () => {
+    useAuthStore.setState({ user: { id: 'admin', role: 'admin' } } as never);
+    configMock.mockResolvedValue({ config: '[dashboard]\npublic_url = "https://example.com/"\n' });
+    renderWithProviders(<GeneralTab />);
+    const input = await screen.findByPlaceholderText('https://example.com/agents/');
+    await waitFor(() => expect(input).toHaveValue('https://example.com/'));
+
+    fireEvent.change(input, { target: { value: 'https://example.com/agents?x=1' } });
+    expect(await screen.findByRole('alert')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(updateConfigMock).not.toHaveBeenCalled();
+
+    fireEvent.change(input, { target: { value: 'http://dashboard.example/agents' } });
+    expect(await screen.findByRole('alert')).toHaveTextContent('HTTPS');
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(updateConfigMock).not.toHaveBeenCalled();
+
+    fireEvent.change(input, { target: { value: ' https://example.com/agents/ ' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalledWith({ dashboard: { public_url: 'https://example.com/agents/' } }));
+  });
+
+  it('hides the field from non-admins', async () => {
+    configMock.mockResolvedValue({ config: '[dashboard]\npublic_url = "https://example.com/"\n' });
+    renderWithProviders(<GeneralTab />);
+    await waitFor(() => expect(configMock).toHaveBeenCalled());
+    expect(screen.queryByPlaceholderText('https://example.com/agents/')).not.toBeInTheDocument();
+  });
 });
 
 describe('<GeneralTab> v1.68', () => {

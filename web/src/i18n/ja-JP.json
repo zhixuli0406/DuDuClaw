@@ -10222,5 +10222,8 @@
   "google.chatRead.title": "Google Chat の読み取り",
   "google.chatRead.hint": "有効にした後、ユーザーは「自分の接続」で Google に再接続し、Chat の権限を選択してください。AI 従業員はそのアカウントのスペースと最近のメッセージを読み取れます。メッセージ送信や添付ファイルのダウンロードは行いません。",
   "google.chatRead.setup": "OAuth クライアントの Google Cloud プロジェクトで Google Chat API を有効にして、Chat アプリを設定してください。Workspace 管理者によるアプリの許可が必要な場合もあります。",
-  "myConnections.service.chat": "Google Chat"
+  "myConnections.service.chat": "Google Chat",
+  "settings.general.publicUrl": "ダッシュボード公開 URL",
+  "settings.general.publicUrl.help": "外部からダッシュボードにアクセスする完全な URL です。リバースプロキシのサブパスも含めます（例: https://example.com/agents/）。OAuth のコールバックと戻りリンクにこの URL を使います。設定後は Google や GitHub などの OAuth アプリに新しいコールバック URL を登録してください。空欄の場合はダッシュボードを開いている URL を使います。",
+  "settings.general.publicUrl.invalid": "HTTPS の URL を入力してください（HTTP は localhost、127.0.0.0/8、::1 のみ）。ユーザー名・パスワード、クエリ（?）、フラグメント（#）、「..」は使えません。"
 }

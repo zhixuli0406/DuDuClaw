@@ -10222,5 +10222,8 @@
   "google.chatRead.title": "Google Chat 讀取",
   "google.chatRead.hint": "開啟後，請使用者到「我的連線」重新連結 Google，並勾選 Chat 權限。AI 員工可讀取該帳號加入的聊天室與最近訊息；不會傳送訊息或下載附件。",
   "google.chatRead.setup": "OAuth 用戶端所屬的 Google Cloud 專案須啟用 Google Chat API 並完成 Chat 應用程式設定；Workspace 管理員可能還須允許此應用程式。",
-  "myConnections.service.chat": "Google Chat"
+  "myConnections.service.chat": "Google Chat",
+  "settings.general.publicUrl": "控制台公開網址",
+  "settings.general.publicUrl.help": "外部連到控制台的完整網址，含反向代理子路徑，例如 https://example.com/agents/。OAuth 回呼與返回連結都會用這個網址；設定後請到 Google、GitHub 等 OAuth 應用程式註冊新的回呼網址。留空則沿用目前開啟控制台的網址。",
+  "settings.general.publicUrl.invalid": "請輸入 HTTPS 網址（僅 localhost、127.0.0.0/8 或 ::1 可用 HTTP），不可含帳號密碼、查詢字串（?）、片段（#）或「..」。"
 }

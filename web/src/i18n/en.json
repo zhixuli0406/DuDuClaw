@@ -10222,5 +10222,8 @@
   "google.chatRead.title": "Read Google Chat",
   "google.chatRead.hint": "After enabling, users reconnect Google in My Connections and select the Chat permissions. AI employees can read spaces and recent messages available to that account. They cannot send messages or download attachments.",
   "google.chatRead.setup": "Enable the Google Chat API and configure a Chat app in the OAuth client’s Google Cloud project. A Workspace administrator may also need to allow the app.",
-  "myConnections.service.chat": "Google Chat"
+  "myConnections.service.chat": "Google Chat",
+  "settings.general.publicUrl": "Dashboard public URL",
+  "settings.general.publicUrl.help": "The full address people use to reach the dashboard, including any reverse proxy sub-path, for example https://example.com/agents/. OAuth callbacks and return links use it; after setting it, register the new callback URL in your Google, GitHub and other OAuth apps. Leave empty to use the address the dashboard was opened on.",
+  "settings.general.publicUrl.invalid": "Enter an HTTPS URL (HTTP only for localhost, 127.0.0.0/8 or ::1), without a user name or password, query (?), fragment (#) or \"..\"."
 }
