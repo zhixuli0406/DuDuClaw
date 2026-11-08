@@ -6,6 +6,9 @@ use duduclaw_mcp_boundary::server::Dispatcher;
 #[path = "mcp_file_isolation_tests.rs"]
 mod file_tests;
 
+#[path = "mcp_files_h11_tests.rs"]
+mod h11_file_tests;
+
 #[path = "mcp_isolation_parity_tests.rs"]
 mod parity_tests;
 

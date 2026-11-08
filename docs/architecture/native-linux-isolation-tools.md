@@ -264,9 +264,9 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `db_tables` | Resource → bound DB provider; live source/table policy and post-pool I/O checks; production boot pending |
 | `db_select` | Resource → bound DB provider; live source/table policy and post-pool I/O checks; production boot pending |
 | `db_query` | Resource → selected DB; finite strict single-table SQL lowers to parameterized SelectRequest; EmployeeScope retains product SQL policy |
-| `file_read` | AuthorizedFile; live authority on each read |
-| `csv_read` | AuthorizedFile → checked E table parser |
-| `xlsx_read` | AuthorizedFile → checked E table parser |
+| `file_read` | AuthorizedFile (workspace dirfd, or `employee-work` root broker sealed read-only snapshot, never reopened by path); 512 KiB cap; live authority on each read; root refusals show fixed zh-TW reasons without paths; production issuer selector pending (H9/H10) |
+| `csv_read` | AuthorizedFile (dirfd or `employee-work` root broker sealed snapshot) → checked E table parser, ReadTable op; root refusals show fixed zh-TW reasons without paths; production issuer selector pending (H9/H10) |
+| `xlsx_read` | AuthorizedFile (dirfd or `employee-work` root broker sealed snapshot) → checked E table parser, ReadTable op; root refusals show fixed zh-TW reasons without paths; production issuer selector pending (H9/H10) |
 | `group_history_read` | Resource → selected exact channel/group → original live retained-history gates |
 | `send_message` | Resource → selected exact bot/channel/chat → checked sender; late failure is uncertain |
 | `send_photo` | Resource → selected exact channel/chat → checked media send; unsupported subtype/input refuses |
