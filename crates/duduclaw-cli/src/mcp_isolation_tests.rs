@@ -310,7 +310,8 @@ async fn isolated_record_route_reuses_original_dispatch_and_handler() {
 fn isolated_round4_inventory_has_no_implicit_resource_fallback() {
     use crate::mcp_isolation_disposition::intentional_refusal;
     let tools: Vec<_> = crate::mcp::tools().collect();
-    assert_eq!(tools.len(), 259, "review every new tool's isolation disposition");
+    // v1.80 merge: +google_chat_spaces/google_chat_messages, Google connector route.
+    assert_eq!(tools.len(), 261, "review every new tool's isolation disposition");
     for tool in tools {
         let route = boundary_route(tool.name).expect("exact route");
         if intentional_refusal(tool.name).is_some() { continue; }
@@ -348,7 +349,7 @@ fn isolated_round4_boot_manifest_distinguishes_refusal_from_missing_factory() {
     let home = tempfile::tempdir().unwrap();
     let dispatcher = adapter(home.path());
     let manifest = dispatcher.service_manifest();
-    assert_eq!(manifest.len(), 259);
+    assert_eq!(manifest.len(), 261);
     assert_eq!(manifest.iter().find(|(name, _)| *name == "file_read").unwrap().1, ServiceState::Ready);
     assert_eq!(manifest.iter().find(|(name, _)| *name == "execute_program").unwrap().1, ServiceState::MissingFactory);
     assert_eq!(manifest.iter().find(|(name, _)| *name == "transcribe_audio").unwrap().1, ServiceState::MissingFactory);

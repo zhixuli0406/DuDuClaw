@@ -37,7 +37,12 @@ impl Prepared {
             if current.as_deref()==Some(after) && self.owns(path) {return Ok(());}
             if current.as_deref()!=before {return Err(std::io::Error::other("artifact changed"));}
             if !self.owns(&source) || read_optional(&source).map_err(|_|std::io::Error::other("prepared artifact unavailable"))?!=after {return Err(std::io::Error::other("prepared artifact changed"));}
-            crate::product_policy::validate_write(home,path,before.unwrap_or(""),after).map_err(std::io::Error::other)?;
+            // Product policy validates TOML configuration selectors. Artifact
+            // targets are skill Markdown / CLI settings JSON, which it would
+            // reject as unparsable TOML; any TOML target still goes through it.
+            if path.extension().and_then(|e|e.to_str())==Some("toml") {
+                crate::product_policy::validate_write(home,path,before.unwrap_or(""),after).map_err(std::io::Error::other)?;
+            }
             // Rename preserves the pre-recorded inode and leaves a single link,
             // as required by the normal skill-file editor's anti-hardlink gate.
             std::fs::rename(&source,path)?;

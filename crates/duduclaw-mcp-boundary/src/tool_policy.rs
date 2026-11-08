@@ -43,6 +43,10 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "gmail_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },
     ToolPolicy { name: "gmail_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },
     ToolPolicy { name: "gmail_create_draft", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox, ResourceKind::Recipient] },
+    // Google Chat reads return private conversation content: same exact
+    // account-bound mailbox authority as gmail_read, never a shared fallback.
+    ToolPolicy { name: "google_chat_spaces", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },
+    ToolPolicy { name: "google_chat_messages", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },
     ToolPolicy { name: "calendar_list_events", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "calendar_create_event", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "sheets_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },

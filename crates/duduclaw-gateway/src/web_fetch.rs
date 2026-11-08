@@ -488,7 +488,11 @@ async fn web_fetch_inner(
     }
 
     // 3. Live fetch.
-    let (status, content_type, bytes) = fetch_live(url, validated, workflow || protected).await?;
+    // Isolated/protected fetches never use an ambient proxy. An ordinary
+    // workflow read keeps the product's staging-proxy contract (the workflow
+    // executor only injects an explicit 127.0.0.1 proxy for a staging home).
+    let direct = protected || duduclaw_mcp_boundary::io_authority::is_scoped();
+    let (status, content_type, bytes) = fetch_live(url, validated, workflow || protected, direct).await?;
 
     let body = if workflow {
         String::from_utf8(bytes)
@@ -529,6 +533,7 @@ async fn fetch_live(
     url: &str,
     validated: reqwest::Url,
     workflow: bool,
+    direct: bool,
 ) -> Result<(u16, String, Vec<u8>), FetchError> {
     info!(url, "web_fetch cache miss — fetching");
 
@@ -597,8 +602,8 @@ async fn fetch_live(
 
     let mut client_builder = reqwest::Client::builder();
     // Proxy environment variables must not bypass the pinned destination of a
-    // protected/no-redirect request (including workflow public reads).
-    if workflow { client_builder = client_builder.no_proxy(); }
+    // protected or isolation-scoped request.
+    if direct { client_builder = client_builder.no_proxy(); }
     let pinned_client = client_builder
         .timeout(std::time::Duration::from_secs(CLIENT_TIMEOUT_SECONDS))
         .redirect(redirect_policy)
@@ -685,7 +690,7 @@ async fn fetch_live(
 /// redirects, no cache, internal addresses refused, DNS pinned, 5 MB.
 pub async fn web_fetch_public_bytes(url: &str) -> Result<(String, Vec<u8>), FetchError> {
     let validated = validate_workflow_public_url(url)?;
-    let (_, content_type, bytes) = fetch_live(url, validated, true).await?;
+    let (_, content_type, bytes) = fetch_live(url, validated, true, true).await?;
     Ok((content_type, bytes))
 }
 
