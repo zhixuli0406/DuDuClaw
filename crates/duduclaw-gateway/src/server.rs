@@ -3138,6 +3138,14 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             "/api/voice/config",
             get(handle_voice_config_get).post(handle_voice_config_set),
         )
+        // RM-064: read-only AI-employee work status for an external business
+        // system (`ddc_status_…` bearer). Always mounted; the handler 404s
+        // every request while `[external_status] enabled` is off, and answers
+        // non-GET methods itself so the method set is decided in one place.
+        .route(
+            crate::external_status::STATUS_PATH,
+            axum::routing::any(handle_external_status),
+        )
         .route("/a2a", post(a2a_http::rpc))
         .route("/.well-known/agent-card.json", get(a2a_http::card))
         .route("/.well-known/agent.json", get(a2a_http::card))
@@ -5024,6 +5032,14 @@ pub(crate) fn origin_is_allowed_with(headers: &axum::http::HeaderMap, extra: &[S
             duduclaw_core::origin_host_matches(origin, &allowed)
         }
     }
+}
+
+/// `GET /api/v1/status/employees` (RM-064) — see `crate::external_status`.
+async fn handle_external_status(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    crate::external_status::serve(&state.handler, &state.user_db, &state.home_dir, request).await
 }
 
 /// Extract Bearer token from Authorization header.
@@ -16954,6 +16970,12 @@ fn jwt_account_gate(
 /// Verify a JWT access token and build a UserContext.
 /// Single DB lookup, fail-closed on error (R2 fix for double-lookup + fail-open).
 fn authenticate_jwt(state: &AppState, jwt_str: &str) -> Result<UserContext, String> {
+    // RM-064: a status credential may only call `/api/v1/status/employees`.
+    // Refuse it by type before any verification, so no dashboard surface
+    // (WebSocket handshake, `/api/*` bearer routes) can ever accept one.
+    if duduclaw_auth::status_tokens::is_status_token(jwt_str) {
+        return Err("authentication failed".to_string());
+    }
     let claims = state.jwt_config.verify_access_token(jwt_str)?;
     if !state.user_db.remember_session_valid(claims.jti.as_deref(), &claims.sub, chrono::Utc::now().timestamp())? {
         return Err("登入裝置已登出，請重新登入。".into());

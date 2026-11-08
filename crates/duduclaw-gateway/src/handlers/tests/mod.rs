@@ -110,3 +110,4 @@ mod mcp_oauth_grants_rpc_tests;
 mod templates_library_tests;
 mod cron_scoped_rpc_tests;
 mod dashboard_scope_tests;
+mod status_tokens_rpc_tests;

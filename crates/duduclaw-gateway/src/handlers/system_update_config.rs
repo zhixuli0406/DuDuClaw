@@ -436,6 +436,24 @@ impl MethodHandler {
             }
         }
 
+        // ── RM-064 [external_status] enabled (external work-status query) ──
+        // Read by the credential RPCs per request; the HTTP endpoint's short
+        // cache is dropped once the write below commits, so persisting takes
+        // effect on the next request. Turning it off keeps every issued
+        // credential but refuses all of them.
+        if let Some(v) = params.get("external_status_enabled").and_then(|v| v.as_bool()) {
+            let section = table
+                .entry("external_status")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut();
+            if let Some(section) = section {
+                section.insert("enabled".into(), toml::Value::Boolean(v));
+                changes.push(format!("external_status.enabled = {v}"));
+            } else {
+                return WsFrame::error_response("", "Invalid [external_status] section in config.toml");
+            }
+        }
+
         // ── W2-8 [notify] daily_digest / daily_digest_at (dashboard toggle) ──
         // Re-read from config.toml on every `DailyDigestScheduler` tick
         // (`notify_digest.rs::DigestConfig::from_home`), so persisting is
@@ -1032,6 +1050,9 @@ impl MethodHandler {
         if let Err(e) = result {
             return WsFrame::error_response("", &e);
         }
+        // RM-064: the status endpoint caches `[external_status] enabled` for
+        // a few seconds; a committed write applies to the next request.
+        crate::external_status::invalidate_enabled_cache();
 
         // v1.68: security-relevant keys get their own audit row with the
         // before/after value (on top of the generic `config_changed` below).

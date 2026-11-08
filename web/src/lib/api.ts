@@ -5289,6 +5289,72 @@ export interface McpKeyCreateResult {
   message: string;
 }
 
+// ── RM-064: read-only status credentials (external work-status query) ──
+
+/** One `ddc_status_…` credential as listed. Never carries the secret. */
+export interface StatusTokenInfo {
+  id: string;
+  name: string;
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  active: boolean;
+}
+
+/** `status_tokens.admin_list` row: the credential plus its owner. */
+export interface StatusTokenAdminEntry extends StatusTokenInfo {
+  user_id: string;
+  /** `null` when the owner account no longer exists. */
+  user_email: string | null;
+  user_display_name: string | null;
+}
+
+export interface StatusTokenListResult {
+  /** `[external_status] enabled`; while false, creation is refused and every
+   *  credential is refused by the endpoint (existing ones are kept). */
+  enabled: boolean;
+  max_active: number;
+  /** Path of the only endpoint the credential can call. */
+  endpoint_path: string;
+  tokens: StatusTokenInfo[];
+}
+
+export interface StatusTokenCreateResult {
+  /** `ddc_status_…` — shown exactly once, never recoverable afterward. */
+  secret: string;
+  token: StatusTokenInfo;
+  endpoint_path: string;
+}
+
+/** Stable `error.code` values of the status-credential RPCs. */
+export type StatusTokenErrorCode =
+  | 'external_status_disabled'
+  | 'status_token_invalid_name'
+  | 'status_token_limit_reached'
+  | 'status_token_account_inactive'
+  | 'status_token_not_found'
+  | 'status_token_unavailable';
+
+/** Body of `GET /api/v1/status/employees` (called by the external system,
+ *  not by the dashboard — typed here for the account-page design). */
+export interface ExternalEmployeeStatus {
+  agent_id: string;
+  display_name: string;
+  /** todo + pending + in_progress + revising tasks. */
+  in_progress: number;
+  /** review + needs_human + pending_approval tasks, plus pending approvals. */
+  awaiting_confirmation: number;
+  done_today: number;
+  done_7d: number;
+  /** Title is masked and at most 60 characters. */
+  latest_done: { title: string; completed_at: string } | null;
+}
+
+export interface ExternalStatusResponse {
+  generated_at: string;
+  employees: ExternalEmployeeStatus[];
+}
+
 export type McpScope =
   | 'memory:read'
   | 'memory:write'
@@ -7540,6 +7606,9 @@ export const api = {
         // Structured [miniapp] enabled for the Telegram Mini App toggle (S20;
         // absent ⇒ false, matching `miniapp::enabled`'s opt-in default).
         miniapp_enabled?: boolean;
+        // Structured [external_status] enabled (RM-064; absent ⇒ false).
+        // Written back through `updateConfig({ external_status_enabled })`.
+        external_status_enabled?: boolean;
         // Structured [notify] daily_digest for the daily-digest toggle
         // (W2-8; absent ⇒ false/"09:00", matching `DigestConfig::default()`).
         daily_digest_enabled?: boolean;
@@ -8837,6 +8906,24 @@ export const api = {
       client.call('mcp_keys.create', { ...params }) as Promise<McpKeyCreateResult>,
     revoke: (key: string) =>
       client.call('mcp_keys.revoke', { key }) as Promise<{ success: boolean; revoked: string }>,
+  },
+  /** RM-064: the caller's own read-only status credentials. */
+  statusTokens: {
+    list: () => client.call('me.status_tokens.list') as Promise<StatusTokenListResult>,
+    create: (name: string) =>
+      client.call('me.status_tokens.create', { name }) as Promise<StatusTokenCreateResult>,
+    revoke: (id: string) =>
+      client.call('me.status_tokens.revoke', { id }) as Promise<{ id: string; revoked: boolean }>,
+    /** Admin only. */
+    adminList: () =>
+      client.call('status_tokens.admin_list') as Promise<{
+        enabled: boolean;
+        endpoint_path: string;
+        tokens: StatusTokenAdminEntry[];
+      }>,
+    /** Admin only. */
+    adminRevoke: (id: string) =>
+      client.call('status_tokens.admin_revoke', { id }) as Promise<{ id: string; revoked: boolean }>,
   },
   killswitch: {
     get: () => client.call('killswitch.get') as Promise<KillswitchConfig>,
