@@ -16,7 +16,7 @@ use duduclaw_core::traits::MemoryEngine;
 use duduclaw_core::types::MemoryEntry;
 use duduclaw_memory::{CodeMap, CodeMapConfig, SqliteMemoryEngine};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::Path;
 
 use crate::mcp_memory_quota::DailyQuota;
 use crate::mcp_namespace::NamespaceContext;
@@ -1070,12 +1070,40 @@ pub async fn handle_memory_improve(
 
 // ── code_map: Aider-style repo symbol graph ────────────────────────────────────
 
+/// v1.81 (S1): the refusal a caller that is not an identified AI employee gets
+/// from `code_map`.
+pub const CODE_MAP_UNIDENTIFIED: &str = "code_map 只掃描呼叫它的 AI 員工自己的目錄（或管理者在 \
+     config.toml [files] allowed_roots 宣告的目錄）。這個呼叫者無法辨識為 AI 員工 \
+     （外部金鑰、管理者金鑰，或沒有 DUDUCLAW_AGENT_ID 的內部金鑰），沒有可掃描的目錄，已拒絕。\
+     code_map scans only the calling AI employee's own directory; this caller is not an \
+     identified employee, so it was refused.";
+
+/// One `tool_calls.jsonl` row per refused `code_map`: the REQUESTED root and
+/// the refusal reason only — nothing was read.
+fn audit_code_map_refusal(home_dir: &Path, agent_id: &str, requested_root: &str, reason: &str) {
+    duduclaw_security::audit::append_tool_call_with_extras(
+        home_dir,
+        agent_id,
+        "code_map",
+        "refused",
+        false,
+        &[
+            ("root", serde_json::json!(requested_root)),
+            ("refused", serde_json::json!(true)),
+            ("reason", serde_json::json!(reason)),
+        ],
+    );
+}
+
 /// Rank a repository's source files by relevance to `query` using the
 /// Personalized-PageRank code symbol graph (tree-sitter + `graph_rank` PPR).
 ///
 /// # Parameters (from `params`)
 /// - `query`       : `string` — required; natural-language / identifier query.
-/// - `root`        : `string` — optional; repo root to scan (default: cwd).
+/// - `root`        : `string` — optional; directory to scan. Default: the
+///   acting employee's own directory (`<home>/agents/<id>`); a relative value
+///   resolves under it. Must be contained in the employee's file roots
+///   (`mcp_files::vet_dir`).
 /// - `max_files`   : `integer` — optional (default 15, cap 100).
 /// - `chat_files`  : `array<string>` — optional; repo-relative paths already in
 ///   context; their defined symbols seed the walk (Aider personalization).
@@ -1086,9 +1114,40 @@ pub async fn handle_memory_improve(
 ///   "indexed_files": N, "indexed_symbols": M }
 /// ```
 ///
-/// Note: the map is rebuilt per call (no cache yet); the scan is gitignore-aware
-/// and bounded by per-file size. Runs the CPU-bound parse on a blocking thread.
-pub async fn handle_code_map(params: &Value) -> Value {
+/// # Containment (v1.81, S1)
+///
+/// Before v1.81 `root` was any directory the MCP server could read (default:
+/// its working directory), so a caller could map — and read signatures out
+/// of — source anywhere on the host. Now:
+///
+/// - `acting` must be an identified AI employee (`ai_employee_caller` mapped
+///   to an id with an `agents/<id>/agent.toml`); anyone else is refused with
+///   [`CODE_MAP_UNIDENTIFIED`];
+/// - `root` is vetted by [`crate::mcp_files::vet_dir`];
+/// - every file is read through [`crate::mcp_files::ContainedTree`]: a
+///   per-component no-follow descriptor walk from the vetted root that refuses
+///   symlinks, mount crossings, non-regular and multiply-linked files.
+///
+/// Every refusal is audited (`tool_calls.jsonl`, `refused = true`) with the
+/// requested root only. The map is rebuilt per call (no cache yet); the scan
+/// is gitignore-aware and bounded by per-file size. Runs the CPU-bound parse
+/// on a blocking thread.
+pub async fn handle_code_map(params: &Value, home_dir: &Path, acting: Option<&str>) -> Value {
+    let requested_root = params
+        .get("root")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Fail closed on identity before anything else touches the filesystem.
+    let agent_id = match acting {
+        Some(id) if crate::mcp_namespace::client_is_agent(home_dir, id) => id,
+        _ => {
+            audit_code_map_refusal(home_dir, acting.unwrap_or(""), &requested_root, "unidentified_caller");
+            return mcp_error(CODE_MAP_UNIDENTIFIED);
+        }
+    };
+
     let query = params
         .get("query")
         .and_then(|v| v.as_str())
@@ -1101,11 +1160,13 @@ pub async fn handle_code_map(params: &Value) -> Value {
         return mcp_error("code_map requires a non-empty 'query' or 'chat_files'");
     }
 
-    let root = params
-        .get("root")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let root = match crate::mcp_files::vet_dir(&requested_root, home_dir, agent_id) {
+        Ok(root) => root,
+        Err(msg) => {
+            audit_code_map_refusal(home_dir, agent_id, &requested_root, "root_outside_fence");
+            return mcp_error(&msg);
+        }
+    };
 
     let max_files = crate::mcp_args::arg_u64(params, "max_files")
         .unwrap_or(15)
@@ -1113,11 +1174,22 @@ pub async fn handle_code_map(params: &Value) -> Value {
 
     let cfg = CodeMapConfig::new(root);
     // CPU-bound directory walk + parse: keep it off the async reactor.
-    let built = tokio::task::spawn_blocking(move || CodeMap::build(&cfg)).await;
+    let built = tokio::task::spawn_blocking(move || -> Result<CodeMap, String> {
+        let tree = crate::mcp_files::ContainedTree::open(&cfg.root)
+            .map_err(|e| format!("code_map root could not be opened safely: {e}"))?;
+        CodeMap::build_with_reader(&cfg, |_walked, rel, max_bytes| {
+            tree.read_to_string(rel, max_bytes as u64).ok()
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await;
 
     let map = match built {
         Ok(Ok(m)) => m,
-        Ok(Err(e)) => return mcp_error(&format!("code_map build failed: {e}")),
+        Ok(Err(e)) => {
+            audit_code_map_refusal(home_dir, agent_id, &requested_root, "root_unsafe");
+            return mcp_error(&format!("code_map build failed: {e}"));
+        }
         Err(e) => return mcp_error(&format!("code_map task join failed: {e}")),
     };
 
@@ -1437,16 +1509,54 @@ mod tests {
         v.get("error_code").and_then(|x| x.as_u64())
     }
 
-    // ── code_map handler: live end-to-end over real crate source ──────────────
+    // ── code_map handler (v1.81, S1: contained to the employee's roots) ───────
+
+    /// A home with one identified employee `coder`.
+    fn code_map_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents").join("coder");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname = \"coder\"\n").unwrap();
+        home
+    }
+
+    fn code_map_audit(home: &Path) -> Vec<Value> {
+        std::fs::read_to_string(home.join("tool_calls.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|r| r["tool_name"] == "code_map")
+            .collect()
+    }
+
+    /// Live end-to-end over real crate source, reached through an
+    /// operator-declared `[files] allowed_roots` entry.
     #[tokio::test]
     async fn code_map_handler_ranks_real_source() {
-        // Point at this crate's sibling memory crate src (stable real Rust).
-        let root = format!("{}/../duduclaw-memory/src", env!("CARGO_MANIFEST_DIR"));
-        let resp = handle_code_map(&params(serde_json::json!({
-            "query": "TripleGraph personalized_pagerank",
-            "root": root,
-            "max_files": 5
-        })))
+        let home = code_map_home();
+        let root = std::path::PathBuf::from(format!(
+            "{}/../duduclaw-memory/src",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .canonicalize()
+        .unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!(
+                "[files]\nallowed_roots = [\"{}\"]\n",
+                root.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        let resp = handle_code_map(
+            &params(serde_json::json!({
+                "query": "TripleGraph personalized_pagerank",
+                "root": root.to_str().unwrap(),
+                "max_files": 5
+            })),
+            home.path(),
+            Some("coder"),
+        )
         .await;
         let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
         assert!(payload["indexed_symbols"].as_u64().unwrap() >= 50);
@@ -1458,8 +1568,124 @@ mod tests {
 
     #[tokio::test]
     async fn code_map_handler_requires_query_or_chat_files() {
-        let resp = handle_code_map(&params(serde_json::json!({}))).await;
-        assert!(text_of(&resp).contains("requires") || is_error(&resp));
+        let home = code_map_home();
+        let resp = handle_code_map(&params(serde_json::json!({})), home.path(), Some("coder")).await;
+        assert!(text_of(&resp).contains("requires") && is_error(&resp), "{resp}");
+    }
+
+    /// No `root` ⇒ the employee's own directory.
+    #[tokio::test]
+    async fn code_map_defaults_to_the_employees_own_directory() {
+        let home = code_map_home();
+        let own = home.path().join("agents/coder/src");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("lib.rs"), "pub fn own_symbol_xyz() {}\n").unwrap();
+        let resp = handle_code_map(
+            &params(serde_json::json!({ "query": "own_symbol_xyz" })),
+            home.path(),
+            Some("coder"),
+        )
+        .await;
+        assert!(!is_error(&resp), "{resp}");
+        let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
+        assert_eq!(payload["files"][0]["path"], "src/lib.rs", "{payload}");
+        // A relative root resolves under the own directory too.
+        let resp = handle_code_map(
+            &params(serde_json::json!({ "query": "own_symbol_xyz", "root": "src" })),
+            home.path(),
+            Some("coder"),
+        )
+        .await;
+        let payload: Value = serde_json::from_str(&text_of(&resp)).unwrap();
+        assert_eq!(payload["files"][0]["path"], "lib.rs", "{payload}");
+    }
+
+    /// Unidentified callers (operator key ⇒ `None`, the bare internal id,
+    /// an id with no `agent.toml`) are refused with the explanation, audited.
+    #[tokio::test]
+    async fn code_map_refuses_unidentified_callers_and_audits() {
+        let home = code_map_home();
+        let internal = duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID;
+        for acting in [None, Some(internal), Some("standalone-claude-code"), Some("../coder")] {
+            let resp = handle_code_map(
+                &params(serde_json::json!({ "query": "x", "root": "/" })),
+                home.path(),
+                acting,
+            )
+            .await;
+            assert!(is_error(&resp), "{acting:?}: {resp}");
+            assert_eq!(text_of(&resp), CODE_MAP_UNIDENTIFIED, "{acting:?}");
+        }
+        let rows = code_map_audit(home.path());
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows.iter().all(|r| r["refused"] == true && r["success"] == false));
+        assert!(rows.iter().all(|r| r["reason"] == "unidentified_caller"));
+    }
+
+    /// A root outside the fence — another employee's directory, `/`, `..` —
+    /// is refused and audited; nothing is scanned.
+    #[tokio::test]
+    async fn code_map_refuses_roots_outside_the_fence_and_audits() {
+        let home = code_map_home();
+        let other = home.path().join("agents/other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("agent.toml"), "[agent]\nname = \"other\"\n").unwrap();
+        std::fs::write(other.join("secret.rs"), "pub fn other_secret() {}\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        for root in [
+            other.to_str().unwrap().to_string(),
+            "/".to_string(),
+            "../other".to_string(),
+            outside.path().to_str().unwrap().to_string(),
+        ] {
+            let resp = handle_code_map(
+                &params(serde_json::json!({ "query": "other_secret", "root": root })),
+                home.path(),
+                Some("coder"),
+            )
+            .await;
+            assert!(is_error(&resp), "{root}: {resp}");
+            assert!(!text_of(&resp).contains("other_secret("), "{root}: {resp}");
+        }
+        let rows = code_map_audit(home.path());
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows.iter().all(|r| r["reason"] == "root_outside_fence"), "{rows:?}");
+    }
+
+    /// Inside the own directory, a symlink (file or directory) and a
+    /// multiply-linked file are never read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn code_map_never_reads_through_links() {
+        let home = code_map_home();
+        let own = home.path().join("agents/coder");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("pkg")).unwrap();
+        std::fs::write(outside.path().join("leak_file.rs"), "pub fn leaked_by_file_link() {}\n").unwrap();
+        std::fs::write(outside.path().join("pkg/mod.rs"), "pub fn leaked_by_dir_link() {}\n").unwrap();
+        std::fs::write(outside.path().join("hard.rs"), "pub fn leaked_by_hard_link() {}\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("leak_file.rs"), own.join("a.rs")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("pkg"), own.join("pkg")).unwrap();
+        // A hard link only works on the same filesystem; skip that leg if not.
+        let hard = std::fs::hard_link(outside.path().join("hard.rs"), own.join("hard.rs")).is_ok();
+        std::fs::write(own.join("ok.rs"), "pub fn fine_symbol() {}\n").unwrap();
+
+        let resp = handle_code_map(
+            &params(serde_json::json!({
+                "query": "leaked_by_file_link leaked_by_dir_link leaked_by_hard_link fine_symbol"
+            })),
+            home.path(),
+            Some("coder"),
+        )
+        .await;
+        assert!(!is_error(&resp), "{resp}");
+        let text = text_of(&resp);
+        assert!(text.contains("fine_symbol"), "{text}");
+        assert!(!text.contains("leaked_by_file_link"), "{text}");
+        assert!(!text.contains("leaked_by_dir_link"), "{text}");
+        if hard {
+            assert!(!text.contains("leaked_by_hard_link"), "{text}");
+        }
     }
 
     // ── M1-T1: Namespace injected as "external/{client_id}" ───────────────────

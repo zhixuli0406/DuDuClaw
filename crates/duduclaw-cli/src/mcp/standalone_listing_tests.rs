@@ -349,6 +349,8 @@ mod dispatch_gate {
             ("wiki_namespace_status", json!({})),
             ("canvas_push", json!({"html": "<p>x</p>"})),
             ("shared_wiki_delete", json!({"page_path": "public.md"})),
+            // v1.81 (S1): `code_map` scans an employee's own directory.
+            ("code_map", json!({"query": "x", "root": "/"})),
         ] {
             let resp = call(&d, &ext, tool, args).await;
             assert_eq!(resp["error"]["code"], -32003, "{tool}: {resp}");

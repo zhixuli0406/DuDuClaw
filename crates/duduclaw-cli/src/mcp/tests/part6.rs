@@ -136,6 +136,78 @@ fn ai_removal_text_has_no_path_and_no_eraser() {
     assert!(!m.contains("rm") && !m.contains('/') && !m.contains("_trash"), "{m}");
 }
 
+// ── v1.81 (S2): can_create_agents defaults ─────────────────────────
+
+fn created_flag(home: &std::path::Path, name: &str) -> Option<bool> {
+    let text = fs::read_to_string(home.join("agents").join(name).join("agent.toml")).ok()?;
+    let doc: toml::Table = text.parse().ok()?;
+    doc.get("permissions")?.get("can_create_agents")?.as_bool()
+}
+
+/// Make `ceo` the main employee (optionally with `can_create_agents` on).
+fn promote_ceo(home: &std::path::Path, can_create: bool) {
+    let path = home.join("agents/ceo/agent.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("role = \"specialist\"", "role = \"main\"")
+        .replace(
+            "can_create_agents = false",
+            if can_create { "can_create_agents = true" } else { "can_create_agents = false" },
+        );
+    fs::write(&path, text).unwrap();
+}
+
+/// A child created through MCP never creates employees itself — for every
+/// role, including `main` made by a privileged main caller.
+#[tokio::test]
+async fn mcp_created_child_always_has_can_create_agents_false() {
+    let tmp = delegation_home();
+    let home = tmp.path();
+    promote_ceo(home, true);
+    for (name, role) in [("child-spec", None), ("child-lead", Some("team-leader")), ("child-main", Some("main"))] {
+        let mut params = serde_json::json!({ "name": name, "display_name": name });
+        if let Some(role) = role {
+            params["role"] = serde_json::json!(role);
+        }
+        let res = handle_create_agent(&params, home, "ceo").await;
+        assert_ne!(res["isError"], true, "{name}: {res}");
+        assert_eq!(created_flag(home, name), Some(false), "{name}");
+    }
+}
+
+/// `role = main` only from the main employee with creation on: a non-main
+/// employee, a main with an explicit `false`, and a system sender are refused
+/// and nothing is scaffolded. Case / spelling variants of `main` count too.
+#[tokio::test]
+async fn mcp_role_main_requires_a_privileged_main_caller() {
+    let tmp = delegation_home();
+    let home = tmp.path();
+    for (caller, role) in [("sales-lead", "main"), ("ceo", "Main"), ("ceo", " main "), ("dashboard", "main")] {
+        let res = handle_create_agent(
+            &serde_json::json!({ "name": "new-main", "display_name": "x", "role": role, "reports_to": "ceo" }),
+            home,
+            caller,
+        )
+        .await;
+        assert_eq!(res["isError"], true, "{caller}/{role:?}: {res}");
+        assert!(text(&res).contains("role = main"), "{res}");
+        assert!(!home.join("agents/new-main").exists(), "{caller}");
+    }
+    promote_ceo(home, false);
+    let res = handle_create_agent(
+        &serde_json::json!({ "name": "new-main", "display_name": "x", "role": "main" }),
+        home,
+        "ceo",
+    )
+    .await;
+    assert_eq!(res["isError"], true, "explicit false on main withdraws it: {res}");
+    assert!(!crate::mcp::agents::caller_is_privileged_main(home, "ceo"));
+    promote_ceo(home, true);
+    assert!(crate::mcp::agents::caller_is_privileged_main(home, "ceo"));
+    assert!(!crate::mcp::agents::caller_is_privileged_main(home, "sales-lead"));
+    assert!(!crate::mcp::agents::caller_is_privileged_main(home, "no-such-agent"));
+}
+
 #[tokio::test]
 async fn removal_result_has_no_path_and_no_eraser() {
     let tmp = delegation_home();

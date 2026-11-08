@@ -279,7 +279,19 @@ pub(crate) async fn handle_tools_call(
         "memory_search_by_layer" => {
             handle_memory_search_by_layer(&arguments, memory, default_agent).await
         }
-        "code_map" => crate::mcp_memory_handlers::handle_code_map(&arguments).await,
+        // v1.81 (S1): contained to the acting employee's own roots. Identity
+        // follows `ai_employee_caller` (fail closed): the shared internal key
+        // without `DUDUCLAW_AGENT_ID` and operator keys are not an employee.
+        "code_map" => {
+            let env_agent = std::env::var(duduclaw_core::ENV_AGENT_ID).ok();
+            let acting = crate::mcp_memory_handlers::ai_employee_caller(
+                caller_client_id,
+                env_agent.as_deref(),
+                crate::mcp_namespace::client_is_agent(home_dir, caller_client_id),
+            );
+            crate::mcp_memory_handlers::handle_code_map(&arguments, home_dir, acting.as_deref())
+                .await
+        }
         "memory_successful_conversations" => {
             handle_memory_successful_conversations(&arguments, memory, default_agent).await
         }

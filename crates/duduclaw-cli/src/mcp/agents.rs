@@ -1,5 +1,26 @@
 use super::*;
 
+/// v1.81 (S2): may `caller` create a `role = main` employee through MCP?
+/// Only an existing employee whose own `[agent] role` is `main` and whose
+/// effective `can_create_agents` is on (an explicit `false` withdraws it).
+/// System senders and unidentified callers never qualify (fail closed).
+pub(crate) fn caller_is_privileged_main(home_dir: &Path, caller: &str) -> bool {
+    if !is_valid_agent_id(caller) || duduclaw_core::is_system_sender(caller) {
+        return false;
+    }
+    let dir = home_dir.join("agents").join(caller);
+    if !dir.join("agent.toml").is_file() {
+        return false;
+    }
+    let sections = duduclaw_core::agent_toml::load(&dir);
+    let role = sections.agent.as_ref().and_then(|a| a.role.as_deref());
+    duduclaw_core::agent_toml::default_can_create_agents(role)
+        && duduclaw_core::agent_toml::effective_can_create_agents(
+            sections.permissions.can_create_agents,
+            role,
+        )
+}
+
 /// Create a persistent sub-agent directory with agent.toml, SOUL.md, etc.
 pub(crate) async fn handle_create_agent(
     params: &Value,
@@ -113,6 +134,19 @@ pub(crate) async fn handle_create_agent(
         .get("role")
         .and_then(|v| v.as_str())
         .unwrap_or("specialist");
+    // v1.81 (S2): a `main` employee is the one role that creates employees by
+    // default, so only the current, privileged main employee may hand that
+    // role out through MCP. Everyone else (any other employee, a system
+    // sender, an unidentified caller) is refused before anything is written.
+    if duduclaw_core::agent_toml::default_can_create_agents(Some(role))
+        && !caller_is_privileged_main(home_dir, caller_agent)
+    {
+        tracing::warn!(caller = %caller_agent, requested = %name, "create_agent: role=main refused");
+        return tool_error(
+            "Error: 只有主要 AI 員工（role = main，且 can_create_agents 開啟）可以透過 create_agent 建立 role = main 的員工。\
+             請改用其他角色，或由管理者在儀表板建立。",
+        );
+    }
     let reports_to = params
         .get("reports_to")
         .and_then(|v| v.as_str())
@@ -209,8 +243,11 @@ pub(crate) async fn handle_create_agent(
         warn_threshold_percent = 80
         hard_stop = true
 
+        // v1.81 (S2): an employee created by another employee never
+        // creates employees itself, whatever its role; only the owner can
+        // turn this on (dashboard 「工具與權限」).
         [permissions]
-        can_create_agents = true
+        can_create_agents = false
         can_send_cross_agent = true
         can_modify_own_skills = true
         can_modify_own_soul = false

@@ -63,10 +63,15 @@ pub(crate) const GITHUB_WORKSPACE_TOOLS: &[&str] = &[
 /// reports the process agent's department). Measured 2026-10-07 on an
 /// isolated home with the 1.70.1 binary; see `docs/guides/mcp-standalone.md`.
 ///
+/// `code_map` (v1.81, S1) scans a directory tree contained in the acting
+/// employee's own directory (`mcp_files::vet_dir`); a caller that is not an
+/// employee has no such directory, so it is listed here too.
+///
 /// Hidden from such callers by [`visible_tools`] and refused to them by the
 /// dispatch gate (`mcp_dispatch.rs`, error class `process_agent_tool`), both
 /// through [`process_agent_tool_refused`], so discoverable ⇔ callable.
 pub(crate) const PROCESS_AGENT_TOOLS: &[&str] = &[
+    "code_map",
     "meeting_upload_link",
     "meeting_transcribe",
     "meeting_transcribe_status",

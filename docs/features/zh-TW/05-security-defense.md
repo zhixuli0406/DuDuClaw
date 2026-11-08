@@ -2,6 +2,26 @@
 
 非管理員成員（Employee、Manager）在側欄、對話篩選、指令面板、WebChat 的 `@` 建議與其他員工選擇器，只會看到 `agents.callable` 明確標示可選取的員工。主 AI 員工預設不顯示，除非該回應明確允許選取。只有 `agents.callable` 依即時 Admin 身分確認 `unrestricted: true` 後，才顯示完整名單，包含個人版的本機管理員。所有帳號在初次載入或讀取失敗時都不顯示員工。頁面可見時每 60 秒、恢復可見及開啟選單時會刷新權限；刷新期間保留同一身分已確認的名單，失敗則清空。檔案與設定選擇器另須直接存取權，團隊呼叫權不會增加檔案或設定權限。新對話仍由伺服器決定指派對象。這次 dashboard 過濾不變更 RPC 授權。
 
+## `code_map` 只掃描員工自己的目錄（v1.81）
+
+v1.81 以前，`code_map` 可以掃描 MCP server 讀得到的任何目錄（預設是它的工作目錄），呼叫者因此能替主機上任何位置的原始碼建地圖、讀到其中的函式簽章。現在：
+
+- 只有辨識得出的 AI 員工可以呼叫：共用的內部金鑰需要 `DUDUCLAW_AGENT_ID`，員工專屬金鑰需要對應的 `agents/<id>/agent.toml`。外部金鑰、管理者金鑰與只帶 scope 的單獨模式金鑰會被拒絕並附上說明；`code_map` 也列入「替員工動作的工具」，這些呼叫者的 `tools/list` 不再列出它（單獨模式的清單從 24 個變成 23 個）。
+- `root` 預設是員工自己的目錄，相對路徑也從那裡解析；含 `..` 會被拒絕；解析後的目錄必須落在資料檔工具同一組根目錄內（`<home>/agents/<id>`、其 `attachments`、`<home>/attachments`、`config.toml [files] allowed_roots`）。
+- 每個檔案都從審核過的根目錄用檔案描述子逐層開啟（每一層 `O_NOFOLLOW`）。符號連結、非一般檔案、硬連結數超過 1 的檔案、超過大小上限的檔案一律略過；內容從檢查過的那個描述子讀出。走訪不會跨越掛載點：每一層的 `st_dev` 必須相同，Linux 另外比對核心的掛載 id，所以把同一個檔案系統上的其他目錄 bind mount 進來（`st_dev` 相同）也會被拒絕。Linux 在核心支援時使用 `openat2`（`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`），並一律比對 `statx` 的 `STATX_MNT_ID`（或 `/proc/self/fdinfo` 的 `mnt_id`）；兩者都拿不到掛載 id 時拒絕掃描。macOS 依靠 `st_dev` 與逐層不跟隨連結的開檔；Windows 拒絕所有 reparse point（符號連結、junction、磁碟區掛載點）與多重連結的檔案。
+- 每次拒絕都會在 `tool_calls.jsonl` 寫一列（`refused: true`、要求的根目錄與原因），不記錄其他內容。
+
+## 誰可以建立員工（v1.81）
+
+`[permissions] can_create_agents` 現在只有 `main` 員工預設為 `true`。其他角色、以及角色無法辨識的員工，沒寫這個鍵就是 `false`。MCP 權限閘門對 `create_agent` 與 `spawn_ephemeral` 套用這個實際值，所以從沒寫過這個鍵的非 main 員工不能再建立員工。明確寫出的設定不論 `true` 或 `false` 仍然優先。
+
+- 新員工：儀表板與 `duduclaw agent create` 只對 `role = "main"` 寫 `true`；evaluator 範本與付費團隊套件對所有非 main 角色寫 `false`。
+- 員工透過 MCP `create_agent` 建立的員工一律 `can_create_agents = false`。只有目前的 main 員工、且它的 `can_create_agents` 開啟時，才能在那裡建立 `role = "main"` 的員工；其他呼叫者在寫入任何東西前就會被拒絕。
+- v1.68 的開機遷移不再把非 main 員工的 `can_create_agents = false` 改成 `true`。
+- `agents.update` 的管理員限定欄位檢查也比對同一個實際值，非管理員的 Owner 不能再靠在缺少的鍵上寫 `true`，替非 main 員工開啟建立權限。
+
+**行為變更：** `agent.toml` 沒有 `can_create_agents` 鍵的非 main 員工，v1.81 以前可以建立員工，現在會被拒絕。若要保留，請由管理員在儀表板「工具與權限」開啟。
+
 ## 客戶公司識別（v1.80.0）
 
 公司名稱與標誌獨立於經簽章驗證的經銷商品牌。`company.get`、`company.update` 明確要求管理員；`company.update` 只接受名稱與選填的移除標誌操作，拒絕舊的 `logo_base64` 欄位。公司名稱拒絕控制字元、換行分隔字元與 Unicode 格式字元（`Cf`，包含雙向覆寫與隔離控制字元）。更新時在既有設定寫入鎖內再次查核目前身分。`company_info` 稽核記錄操作者、方法與結果，不記錄圖片或名稱。進階設定的導覽與路由也限管理員，搬動控制項不會放寬原有 RPC 權限。
