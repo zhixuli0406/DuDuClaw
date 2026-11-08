@@ -512,16 +512,16 @@ fn adopt_crash_rolls_back_or_forward() {
     // Forward: crash after the confirmed row, proposal then Applied.
     let f = fixture();
     tombstoned_full(&f, "soul");
-    let ax = ax();
-    let request = file_personal(&f, &ax, None).unwrap();
-    let (_, item) = propose(&f, &ax, &request);
+    let ax0 = ax();
+    let request = file_personal(&f, &ax0, None).unwrap();
+    let (_, item) = propose(&f, &ax0, &request);
     ADOPT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(|point| point == AdoptHook::AfterSave)));
-    let (crashed, _) = apply(&f, &ax, &item);
+    let (crashed, _) = apply(&f, &ax0, &item);
     ADOPT_HOOK.with(|h| *h.borrow_mut() = None);
     assert_eq!(crashed.err(), Some(AdoptError::Unavailable));
     assert_eq!(seal_of(f.home()), "adopting");
     mark_applied(f.home(), &item);
-    let done = recover_adoptions(f.home(), &env(&ax), LABEL).unwrap();
+    let done = recover_adoptions(f.home(), &env(&ax0), LABEL).unwrap();
     assert_eq!(done, vec![(request.request_id.clone(), "rolled_forward")]);
     assert_eq!((seal_of(f.home()).as_str(), root_state(f.home()).as_str()), ("adopted", "root_absent"));
     assert_eq!(stored(f.home(), &request.request_id).state, "done");
