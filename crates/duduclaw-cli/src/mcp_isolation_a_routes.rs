@@ -1,7 +1,9 @@
 //! Package A operations whose immediate effect is gateway-owned queue admission.
 //! The original handlers retain target/delegation ACLs and background leases.
 //! Queue acceptance is not a protected run: target ingress must independently
-//! derive fresh launch authority, and ephemeral targets still need provisioning.
+//! derive fresh launch authority. H13: each spawn call is first authorized
+//! against the capability (`tool_policy::spawn`); a protected ephemeral child
+//! is a pending job under the parent's own identity, never a new scaffold.
 
 pub(crate) fn is_target_dispatch(name: &str) -> bool {
     matches!(name, "create_task" | "spawn_agent" | "spawn_ephemeral")
@@ -33,6 +35,35 @@ mod tests {
                 issued_at: 1, not_before: 1, expires_at: 2, nonce: [5; 32], jti: [6; 16],
             }),
         })
+    }
+
+    struct Live;
+    impl duduclaw_isolation::capability::LiveRequestVerifier for Live {
+        fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> { Ok(()) }
+    }
+
+    /// Stands in for the gateway resolver: it vouches for the own employee
+    /// only. Its live H13 rules (delegation policy, target binding, task
+    /// ownership) are tested in `duduclaw-gateway` (`isolation_spawn_selectors`).
+    struct OwnEmployee;
+    impl duduclaw_mcp_boundary::tool_policy::ResourceResolver for OwnEmployee {
+        fn resolve(&self, context: &RequestContext, _: &duduclaw_mcp_boundary::tool_policy::ToolPolicy, _: &Value)
+            -> Result<Vec<duduclaw_isolation::capability::ResourceGrant>, VerificationError> {
+            Ok(vec![duduclaw_isolation::capability::ResourceGrant::Employee { id: context.record().employee }])
+        }
+    }
+
+    /// `call` with the own Employee grant, a live verifier and a resolver, as
+    /// the H13 spawn selectors require.
+    fn authorized_call(home: &Path) -> Arc<IsolatedCall> {
+        let mut owned = Arc::try_unwrap(call(home)).ok().unwrap();
+        let mut record = owned.context.record().clone();
+        record.resources = List::new(vec![duduclaw_isolation::capability::ResourceGrant::Employee {
+            id: record.employee }]).unwrap();
+        record.expires_at = u64::MAX;
+        owned.context = RequestContext::with_live_verifier(record, Arc::new(Live));
+        owned.record_resolver = Some(Arc::new(OwnEmployee));
+        Arc::new(owned)
     }
 
     #[derive(Clone)]
@@ -85,13 +116,19 @@ mod tests {
         write_agent(home.path(), "caller");
         write_agent(home.path(), "target");
         std::fs::write(home.path().join("config.toml"), "[delegation]\npolicy = 'open'\n").unwrap();
-        let call = call(home.path());
+        let call = authorized_call(home.path());
         let context = call.context.clone();
         duduclaw_gateway::isolation_egress::scope(home.path(), "caller", &context, Some(Arc::new(Metadata)),
             ISOLATED_CALL.scope(call, async {
-                let arguments = json!({"agent_id":"target", "task":"work", "session_key":"requested-session",
+                // H13: forged delegation metadata is refused by the exact
+                // protected schema, before any queue side effect.
+                let forged = json!({"agent_id":"target", "task":"work", "session_key":"requested-session",
                     "sender_agent":"forged", "origin_agent":"forged", "delegation_depth":0,
                     "hop_depth":0, "turn_id":"forged", "on_behalf_of":"user:forged"});
+                let refused = crate::mcp::handle_spawn_agent(&forged, home.path(), "caller").await;
+                assert_eq!(refused["isError"], true, "{refused}");
+                assert!(!home.path().join("bus_queue.jsonl").exists());
+                let arguments = json!({"agent_id":"target", "task":"work", "session_key":"requested-session"});
                 // This route only enters the existing handler; no A backend is installed.
                 assert!(crate::mcp_isolation::dispatch_resource_tool(home.path(), "spawn_agent", &arguments).await.is_none());
                 assert_eq!(crate::mcp::get_default_agent(home.path()).await, "caller");
@@ -109,6 +146,45 @@ mod tests {
                 assert_eq!(entry["session_key"], "requested-session");
                 assert!(entry.get("on_behalf_of").is_none());
                 assert!(!text(&result).is_empty());
+            })).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_without_resolver_or_grant_refuses() {
+        let home = tempfile::tempdir().unwrap();
+        write_agent(home.path(), "caller");
+        write_agent(home.path(), "target");
+        std::fs::write(home.path().join("config.toml"), "[delegation]\npolicy = 'open'\n").unwrap();
+        let call = call(home.path());
+        let context = call.context.clone();
+        duduclaw_gateway::isolation_egress::scope(home.path(), "caller", &context, Some(Arc::new(Metadata)),
+            ISOLATED_CALL.scope(call, async {
+                // No record resolver and no own Employee grant: fail closed.
+                let result = crate::mcp::handle_spawn_agent(&json!({"agent_id":"target", "task":"work"}),
+                    home.path(), "caller").await;
+                assert_eq!(result["isError"], true, "{result}");
+                assert!(!home.path().join("bus_queue.jsonl").exists());
+            })).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_ephemeral_protected_never_scaffolds() {
+        let home = tempfile::tempdir().unwrap();
+        write_agent(home.path(), "caller");
+        let call = authorized_call(home.path());
+        let context = call.context.clone();
+        duduclaw_gateway::isolation_egress::scope(home.path(), "caller", &context, Some(Arc::new(Metadata)),
+            ISOLATED_CALL.scope(call, async {
+                for tools in [json!(["mcp__duduclaw__spawn_agent"]), json!(["Read", "Bash"])] {
+                    let result = crate::mcp::handle_spawn_ephemeral(&json!({"instruction":"You review invoices.",
+                        "context":"Check the March batch.", "tools": tools}), home.path(), "caller").await;
+                    // Without a live protected parent run (no spawnd here) the
+                    // job cannot be filed, and an empty intersection never is;
+                    // either way no ephemeral agent is scaffolded or queued.
+                    assert_eq!(result["isError"], true, "{result}");
+                    assert!(!home.path().join("agents").join(".ephemeral").exists());
+                    assert!(!home.path().join("bus_queue.jsonl").exists());
+                }
             })).await.unwrap();
     }
 

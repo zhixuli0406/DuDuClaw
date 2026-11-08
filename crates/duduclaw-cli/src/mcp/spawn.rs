@@ -105,6 +105,16 @@ pub(crate) async fn spawn_agent_with_ctx_and_upstream(
         });
     }
 
+    // H13: protected mode — the signed capability and the live host resolver
+    // decide per call, before any queue side effect: exact schema, own live
+    // record task, target allowed by the delegation policy AND the isolation
+    // bindings. The gates above keep their messages; `persist_spawn_authority`
+    // below still files the owner approval card for a Personal source.
+    if crate::mcp_isolation::current().is_some() && authorize_isolated_spawn("spawn_agent", params).await.is_err() {
+        duduclaw_gateway::egress_client::builtin_not_dispatched();
+        return tool_error(ISOLATED_SPAWN_REFUSAL);
+    }
+
     let origin = ctx.origin.as_deref().unwrap_or(caller);
 
     // ── P3 runaway guard (cascade hop-depth + dispatch circuit breaker) ──
@@ -330,6 +340,11 @@ pub(crate) async fn spawn_ephemeral_with_ctx_and_upstream(
             )}],
             "isError": true
         });
+    }
+    // H13 (D-H3, D8): protected mode never scaffolds a new agent; the child is
+    // a pending job under this run's own employee identity.
+    if crate::mcp_isolation::current().is_some() {
+        return spawn_ephemeral_isolated(params, home_dir, caller, instruction, context, tier).await;
     }
     let origin = ctx.origin.as_deref().unwrap_or(caller).to_string();
 
@@ -594,6 +609,50 @@ pub(crate) async fn spawn_ephemeral_with_ctx_and_upstream(
                 "isError": true
             })
         }
+    }
+}
+
+/// Shown for every protected spawn refusal (no oracle on which check failed).
+const ISOLATED_SPAWN_REFUSAL: &str = "無法確認這次操作的資源授權，已拒絕執行。";
+
+/// Protected mode: authorize this spawn call against the verified capability
+/// through the gateway resolver (H13 selectors), then recheck the run is live.
+async fn authorize_isolated_spawn(name: &str, params: &Value)
+    -> std::result::Result<duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall, duduclaw_mcp_boundary::VerificationError> {
+    use duduclaw_mcp_boundary::{VerificationError, authority, tool_policy};
+    let call = crate::mcp_isolation::current().ok_or(VerificationError::Invalid)?;
+    let resolver = call.record_resolver.clone().ok_or(VerificationError::Unavailable)?;
+    let authorized = tool_policy::authorize_async(&call.context, name, params, resolver).await?;
+    let live = authorized.context().clone();
+    authority::verify_blocking(move || live.verify_live(authority::now_seconds()?)).await?;
+    Ok(authorized)
+}
+
+/// H13 protected `spawn_ephemeral` (D-H3, D8): no scaffold, no new agent. The
+/// child is filed as a pending job under the calling run's own employee id,
+/// incarnation and binding, with the tools it requested that this run also
+/// holds (`tool_policy::ephemeral_tools`). It never runs while this run holds
+/// the employee's capability, so the caller must not wait for it.
+async fn spawn_ephemeral_isolated(params: &Value, home_dir: &Path, caller: &str,
+    instruction: &str, context: &str, tier: &str) -> Value {
+    let Ok(authorized) = authorize_isolated_spawn("spawn_ephemeral", params).await else {
+        return tool_error(ISOLATED_SPAWN_REFUSAL);
+    };
+    let Ok(tools) = duduclaw_mcp_boundary::tool_policy::ephemeral_tools(authorized.context(), params) else {
+        return tool_error(ISOLATED_SPAWN_REFUSAL);
+    };
+    let request = duduclaw_gateway::isolation_ephemeral::EphemeralRequest {
+        instruction: instruction.to_owned(), context: context.to_owned(), tier: tier.to_owned(), tools };
+    match duduclaw_gateway::isolation_ephemeral::queue_for_parent(home_dir, caller, authorized.context(), request).await {
+        Ok(job) => serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "臨時助手的工作已受理並排入等待。\n工作編號：{}\n\
+                 它會以你的員工身分執行，只能使用你這次執行也有的工具：{}。\n\
+                 它要等你目前這次執行結束後才會開始，所以請不要在這次對話中等待它的回覆，\
+                 也不要代替它編造結果。",
+                job.id, job.tools.join("、"))}]
+        }),
+        Err(_) => tool_error(ISOLATED_SPAWN_REFUSAL),
     }
 }
 

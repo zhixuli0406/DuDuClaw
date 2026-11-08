@@ -133,10 +133,15 @@ fn pending_production_selectors() -> BTreeSet<String> {
     // Employee (+ own Confined wiki) under EmployeeScope, not a workspace.
     // HX5 removed execute_program, office_script and code_map: they are routed
     // in-run (`Route::InRunHelper`) on the run's own `Workspace{employee-work}`.
+    // H13 removed spawn_agent and spawn_ephemeral: host-queue work of the own
+    // Employee grant (live delegation/binding/task checks per call).
     let pending: BTreeSet<String> = duduclaw_mcp_boundary::workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS
         .iter().map(|tool| (*tool).to_owned()).collect();
     for tool in duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS {
         assert!(!pending.contains(tool), "{tool}: HX5 in-run helpers have their selector");
+    }
+    for tool in duduclaw_mcp_boundary::tool_policy::SPAWN_TOOLS {
+        assert!(!pending.contains(tool), "{tool}: H13 spawn tools have their selector");
     }
     for tool in ["browser_record_start", "browser_record_stop"] {
         assert!(pending.contains(tool), "{tool}: no protected route before HX6");
@@ -406,6 +411,11 @@ async fn employee_tool_parity(home: &std::path::Path) {
     // HX5: the in-run helper tools ride the same Workspace{employee-work} grant.
     for tool in ["execute_program", "code_map"] {
         assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: HX5 in-run route not eligible");
+        assert!(!pending.contains(tool), "{tool}");
+    }
+    // H13: the issuer's own Employee grant suffices (Shared employee, no task).
+    for tool in duduclaw_mcp_boundary::tool_policy::SPAWN_TOOLS {
+        assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: H13 spawn selector missing");
         assert!(!pending.contains(tool), "{tool}");
     }
     assert!(context.record().resources.as_slice().iter().any(|grant| matches!(grant,

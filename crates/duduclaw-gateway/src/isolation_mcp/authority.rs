@@ -504,6 +504,8 @@ impl GatewayAuthority {
         self.check_epoch(&prepared)?;
         let mut runs = self.runs.lock().map_err(|_| VerificationError::Unavailable)?;
         if runs.len() >= MAX_ASSOCIATIONS || runs.contains_key(&run.0) { return Err(VerificationError::Unavailable); }
+        // H13b: the ephemeral-job start reads this as "the parent holds its capability".
+        crate::isolation_ephemeral_runs::record_bound(run, prepared.employee);
         runs.insert(run.0, prepared);
         Ok(())
     }
@@ -511,6 +513,7 @@ impl GatewayAuthority {
     pub fn revoke_run(&self, run: RunHandle) {
         // Recover ownership on poison so cleanup cannot retain an association.
         self.runs.lock().unwrap_or_else(|error| error.into_inner()).remove(&run.0);
+        crate::isolation_ephemeral_runs::record_exited(run);
     }
 
     fn prepared(&self, run: RunHandle) -> Result<PreparedAuthority, VerificationError> {

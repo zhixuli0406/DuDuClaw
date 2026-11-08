@@ -247,6 +247,10 @@ impl ResourceResolver for GatewayResourceResolver {
     fn resolve(&self, context: &RequestContext, policy: &ToolPolicy, args: &Value)
         -> Result<Vec<ResourceGrant>, VerificationError> {
         self.identity(context)?;
+        // H13: host-queue spawns resolve exactly the boundary selection.
+        if duduclaw_mcp_boundary::tool_policy::SPAWN_TOOLS.contains(&policy.name) {
+            return self.spawn_selection(context, policy, args);
+        }
         let object = args.as_object().ok_or(VerificationError::Invalid)?;
         if context.record().employee_scope() && policy.route == duduclaw_mcp_boundary::tool_policy::Route::Connector {
             let selected = self.connector(context, policy.name, args)?;
@@ -342,6 +346,9 @@ impl ResourceResolver for GatewayResourceResolver {
         Ok(resources)
     }
 }
+
+#[path = "isolation_spawn_selectors.rs"]
+mod spawn;
 
 #[cfg(test)]
 #[path = "isolation_resources_tests.rs"]

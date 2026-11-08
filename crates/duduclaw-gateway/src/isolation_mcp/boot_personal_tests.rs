@@ -153,23 +153,25 @@ fn issuer_personal_background_refused() {
     let root = Root(vec![receipt.clone()]);
     let lifecycle = lifecycle::read_lifecycle_with(f.home(), LABEL, &root).unwrap();
     let current = f.users.isolation_authority_snapshot(Some(&f.alice), LABEL).unwrap();
-    // Exercise the exact gate both issuer entry points call before resource I/O.
-    // A record claiming Human(owner) is refused as well as Principal::Background.
-    assert_eq!(issuance_facts(LABEL, &lifecycle, &f.background(), &current, false), Err(VerificationError::Revoked));
-    assert_eq!(issuance_facts(LABEL, &lifecycle, &f.human(&f.alice), &current, true), Err(VerificationError::Revoked));
-    assert_eq!(issuance_facts(LABEL, &lifecycle, &f.human(&f.alice), &current, false), Ok(()));
-    // A record-backed HostTurn reaches the constructor with a Human snapshot;
-    // that representation must not bypass the record gate.
     let epoch = current.human.as_ref().unwrap().credential_epoch;
-    let mut record_turn = turn();
-    record_turn.background = Some(serde_json::from_value(serde_json::json!({
+    let record: crate::isolation_background::RecordAuthority = serde_json::from_value(serde_json::json!({
         "home": f.home(), "kind": "task", "id": "task-a", "agent": LABEL,
         "employee": receipt.employee, "owner": f.alice, "epoch": epoch,
         "acl_generation": current.acl_generation, "policy_epoch": current.policy_epoch,
         "policy": "policy", "material": "material", "approval": null, "expires_at": u64::MAX,
         "lane": Lane::Standard, "caller": null, "parent_run": null, "parent_agent": null,
         "parent_policy": null, "parent": null, "detached_bus": false,
-    })).unwrap());
+    })).unwrap();
+    // Exercise the exact gate both issuer entry points call before resource I/O.
+    // A record claiming Human(owner) is refused as well as Principal::Background
+    // (H13b admits only the same-owner delegation shape, see `same_owner`).
+    assert_eq!(issuance_facts(LABEL, &lifecycle, &f.background(), &current, None), Err(VerificationError::Revoked));
+    assert_eq!(issuance_facts(LABEL, &lifecycle, &f.human(&f.alice), &current, Some(&record)), Err(VerificationError::Revoked));
+    assert_eq!(issuance_facts(LABEL, &lifecycle, &f.human(&f.alice), &current, None), Ok(()));
+    // A record-backed HostTurn reaches the constructor with a Human snapshot;
+    // that representation must not bypass the record gate.
+    let mut record_turn = turn();
+    record_turn.background = Some(record);
     assert_eq!(human_authorization_with(f.home().to_owned(), LABEL.into(), receipt.employee,
         f.alice.clone(), epoch, Lane::Standard, &current, duduclaw_isolation::bounded::List::new(vec![]).unwrap(),
         record_turn, None, &lifecycle, &root, &SelectorSources::default(), None).err(), Some(VerificationError::Revoked));
@@ -232,7 +234,13 @@ fn issuer_shared_unchanged() {
             ResourceGrant::Employee { .. } | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Confined { .. })));
         let lifecycle = lifecycle::read_lifecycle_with(f.home(), LABEL, &root).unwrap();
         let current = f.users.isolation_authority_snapshot(Some(&f.bob), LABEL).unwrap();
-        assert_eq!(issuance_facts(LABEL, &lifecycle, &f.human(&f.bob), &current, true), Ok(()));
+        let record: crate::isolation_background::RecordAuthority = serde_json::from_value(serde_json::json!({
+            "home": f.home(), "kind": "task", "id": "task-a", "agent": LABEL, "employee": receipt.employee,
+            "owner": f.bob, "epoch": 1, "acl_generation": 1, "policy_epoch": 1, "policy": "policy",
+            "material": "material", "approval": null, "expires_at": u64::MAX, "lane": Lane::Standard,
+            "caller": null, "parent_run": null, "parent_agent": null, "parent_policy": null, "parent": null,
+            "detached_bus": false })).unwrap();
+        assert_eq!(issuance_facts(LABEL, &lifecycle, &f.human(&f.bob), &current, Some(&record)), Ok(()));
     }
 }
 

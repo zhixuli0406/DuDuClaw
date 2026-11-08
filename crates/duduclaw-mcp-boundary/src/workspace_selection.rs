@@ -6,7 +6,8 @@
 //! broker is installed. The same handle is also the A execution workspace, so
 //! the grant alone would make every listed tool that needs a Workspace
 //! eligible: other execution tools (browser recording — HX6, discovery,
-//! spawn, forks) and the workspace-scoped E services. No selector chose a
+//! forks) and the workspace-scoped E services. (H13 `spawn_agent` /
+//! `spawn_ephemeral` need only the Employee grant and are not affected.) No selector chose a
 //! workspace for them, so the issuer must not sign them: they stay hidden and
 //! refused (fail closed) until their own selector exists. This only narrows
 //! the snapshot.
@@ -17,9 +18,10 @@ use crate::tool_policy::{employee_service_scope, policy, ResourceKind, Route, IN
 /// signs them (`drops_from_signed`), and the CLI parity test
 /// (`mcp_isolation_parity_tests::pending_production_selectors`) uses this very
 /// list as its tracked gap. HX5 removed `execute_program`, `code_map` and
-/// `office_script`; they must never be added back here.
-pub const PENDING_WORKSPACE_SELECTOR_TOOLS: &[&str] = &["spawn_agent", "spawn_ephemeral", "inspect_branches",
-    "diff_branches", "fork_cost", "discovery_catalog", "discovery_list", "discovery_tree", "discovery_artifact",
+/// `office_script`; H13 removed `spawn_agent` and `spawn_ephemeral` (routed
+/// on the run's own Employee grant, no Workspace). None of them may be added
+/// back here.
+pub const PENDING_WORKSPACE_SELECTOR_TOOLS: &[&str] = &["inspect_branches", "diff_branches", "fork_cost", "discovery_catalog", "discovery_list", "discovery_tree", "discovery_artifact",
     "discovery_cancel", "browser_record_start", "browser_record_stop", "skill_from_recording",
     "skill_synthesis_run", "skill_hub_install"];
 
@@ -49,9 +51,24 @@ pub fn drops_from_signed(name: &str, employee_scope: bool, helpers: bool) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_policy::SPAWN_TOOLS;
 
     #[test]
     fn file_workspace_never_signs_execution_or_workspace_services() {
+        // H13: spawn_agent / spawn_ephemeral are routed in protected mode and
+        // need only the run's own Employee grant. This rule neither drops them
+        // nor does any Workspace grant get involved for them.
+        assert_eq!(SPAWN_TOOLS, ["spawn_agent", "spawn_ephemeral"]);
+        for tool in SPAWN_TOOLS {
+            let required = policy(tool).expect(tool).required;
+            assert!(required.contains(&ResourceKind::Employee) && !required.contains(&ResourceKind::Workspace), "{tool}");
+            assert!(!needs_execution_workspace(tool, true), "{tool}");
+            assert!(!needs_execution_workspace(tool, false), "{tool}");
+            assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&tool), "{tool}");
+            for (scoped, helpers) in [(true, false), (true, true), (false, false), (false, true)] {
+                assert!(!drops_from_signed(tool, scoped, helpers), "{tool}");
+            }
+        }
         for tool in ["file_read", "csv_read", "xlsx_read", "tasks_update", "computer_session_start",
             "computer_login", "skill_curator_status", "unknown_tool"] {
             assert!(!needs_execution_workspace(tool, true), "{tool}");

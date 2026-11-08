@@ -48,10 +48,14 @@ pub(super) fn validate(value: &RecordAuthority) -> Result<(), VerificationError>
     if value.detached_bus && value.kind != "delegation" { return Err(VerificationError::Invalid); }
     // v1.81 binding/allocation. Both absent: a receipt stored before v1.81,
     // readable only so a new request can replace it (recheck refuses it).
-    // Only one present, or a Personal binding, is never a valid receipt.
+    // Only one present, or a Personal binding, is never a valid receipt —
+    // except H13b's same-owner delegation shape (`same_owner`).
     match &value.binding {
         None if value.allocation.is_none() => {}
         Some(binding @ EmployeeBinding::Shared(_)) if value.allocation.is_some() =>
+            duduclaw_migration::allocation::validate_principal_binding(binding).map_err(|_| VerificationError::Invalid)?,
+        Some(binding @ EmployeeBinding::Personal(_)) if value.allocation.is_some()
+            && super::same_owner::personal_receipt_allowed(value) =>
             duduclaw_migration::allocation::validate_principal_binding(binding).map_err(|_| VerificationError::Invalid)?,
         _ => return Err(VerificationError::Invalid),
     }

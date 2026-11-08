@@ -417,7 +417,7 @@ pub(crate) fn record_authorization(home: PathBuf, agent: String, user: String, e
     let current = authority.ingress_snapshot(&user, &agent)?;
     super::ingress::require_epoch(epoch, current.human.as_ref().map(|human| human.credential_epoch))?;
     let principal = issuance_principal(&user, &current)?;
-    issuance_facts(&agent, &lifecycle, &principal, &current, turn.background.is_some())?;
+    issuance_facts(&agent, &lifecycle, &principal, &current, turn.background.as_ref())?;
     let policy = crate::approval::strict_policy_revision(&home, &agent)
         .map_err(|_| VerificationError::Unavailable)?;
     let tools = DISPATCHER.get().ok_or(VerificationError::Unavailable)?.ingress_tools(&home, &agent, lane)?;
@@ -432,7 +432,7 @@ pub(crate) fn record_authorization(home: PathBuf, agent: String, user: String, e
     lifecycle::recheck_with(&home, &lifecycle, &RootAllocator).map_err(lifecycle_refusal)?;
     let after = authority.ingress_snapshot(&user, &agent)?;
     recheck_issuance_facts(&agent, &lifecycle, &principal, epoch, &current, &after,
-        authorization.turn.as_ref().is_some_and(|turn| turn.background.is_some()))?;
+        authorization.turn.as_ref().and_then(|turn| turn.background.as_ref()))?;
     Ok(authorization)
 }
 
@@ -444,15 +444,15 @@ fn issuance_principal(user: &str, current: &duduclaw_auth::IsolationAuthoritySna
     })
 }
 
-/// Record-backed work must not impersonate a Personal owner's live ingress.
-/// All Personal identity comparisons stay in B1's shared gate.
-fn issuance_facts(agent: &str, lifecycle: &EmployeeLifecycle,
-    principal: &duduclaw_isolation::capability::Principal,
-    current: &duduclaw_auth::IsolationAuthoritySnapshot, record: bool) -> Result<(), VerificationError> {
+/// Record-backed work must not impersonate a Personal owner's live ingress, except H13b's same-owner
+/// delegation receipt (`personal_record_allowed`). All Personal identity comparisons stay in B1's shared gate.
+fn issuance_facts(agent: &str, lifecycle: &EmployeeLifecycle, principal: &duduclaw_isolation::capability::Principal,
+    current: &duduclaw_auth::IsolationAuthoritySnapshot, record: Option<&crate::isolation_background::RecordAuthority>)
+    -> Result<(), VerificationError> {
     use duduclaw_isolation::capability::EmployeeBinding;
     match &lifecycle.binding {
         EmployeeBinding::Personal(owner) => {
-            if record { return Err(VerificationError::Revoked); }
+            if record.is_some_and(|receipt| !crate::isolation_background::personal_record_allowed(receipt, owner.as_str())) { return Err(VerificationError::Revoked); }
             personal_facts(agent, owner.as_str(), principal, current)
         }
         EmployeeBinding::Shared(tenant) => {
@@ -467,7 +467,7 @@ fn issuance_facts(agent: &str, lifecycle: &EmployeeLifecycle,
 fn recheck_issuance_facts(agent: &str, lifecycle: &EmployeeLifecycle,
     principal: &duduclaw_isolation::capability::Principal, epoch: u64,
     before: &duduclaw_auth::IsolationAuthoritySnapshot, after: &duduclaw_auth::IsolationAuthoritySnapshot,
-    record: bool) -> Result<(), VerificationError> {
+    record: Option<&crate::isolation_background::RecordAuthority>) -> Result<(), VerificationError> {
     if before.acl_generation != after.acl_generation || before.policy_epoch != after.policy_epoch
         || before.tenant_id != after.tenant_id
         || after.human.as_ref().is_none_or(|human| human.credential_epoch != epoch
@@ -511,7 +511,7 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
         return Err(VerificationError::Revoked);
     }
     let principal = issuance_principal(&user, current)?;
-    issuance_facts(&agent, lifecycle, &principal, current, turn.background.is_some())?;
+    issuance_facts(&agent, lifecycle, &principal, current, turn.background.as_ref())?;
     // H10: the H9 selectors run after the identity/binding gates and before the
     // lifecycle/users.db rechecks below, so those rechecks cover their I/O. A
     // failed read may be a tombstone moving `agents/<label>` away: the durable
@@ -562,7 +562,7 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
     users.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| VerificationError::Unavailable)?;
     let after = duduclaw_auth::read_isolation_authority(&mut users, Some(&user), &agent)
         .map_err(|_| VerificationError::Revoked)?;
-    recheck_issuance_facts(&agent, lifecycle, &principal, epoch, current, &after, turn.background.is_some())?;
+    recheck_issuance_facts(&agent, lifecycle, &principal, epoch, current, &after, turn.background.as_ref())?;
     // H10: re-read every selector input after all issuance I/O; a profile,
     // public-web switch or task ownership that changed meanwhile refuses the run.
     if select()? != selection { return Err(VerificationError::Revoked); }

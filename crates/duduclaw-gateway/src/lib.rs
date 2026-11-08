@@ -32,6 +32,12 @@
 
 pub mod isolation_mcp;
 pub mod isolation_background;
+/// H13: protected `spawn_ephemeral` children as pending jobs (D-H3, D8).
+pub mod isolation_ephemeral;
+/// H13b: "parent run has exited" for ephemeral jobs (this epoch's run ledger).
+pub mod isolation_ephemeral_runs;
+/// H13b: start released ephemeral children; the dispatcher's self-delegation exception.
+pub mod isolation_ephemeral_start;
 mod isolation_http;
 #[cfg(test)]
 pub(crate) mod isolation_io_test_support;
