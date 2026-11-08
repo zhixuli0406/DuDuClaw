@@ -264,3 +264,42 @@ fn create_task_interactive_assignee_and_creator_fixed() {
     assert!(authorize(&other_person, "create_task", &plan(), &resolver).is_err());
     assert!(resolver.resolve(&other_person, policy, &plan()).is_err());
 }
+
+// HX6: the recording's URL authority is the signed PublicOrigins grant.
+fn recording_context(context: &RequestContext, public_web: bool) -> RequestContext {
+    use duduclaw_isolation::capability::PublicOrigin;
+    let mut record = context.record().clone();
+    record.task = None;
+    record.tools = List::new(vec![text("browser_record_start".into()).unwrap(), text("browser_record_stop".into()).unwrap()]).unwrap();
+    let mut resources = vec![ResourceGrant::EmployeeScope { id: record.employee }, ResourceGrant::Employee { id: record.employee },
+        ResourceGrant::Workspace { handle: text("employee-work".into()).unwrap() }];
+    if public_web { resources.push(ResourceGrant::PublicOrigins { origins: List::new(vec![PublicOrigin::any()]).unwrap() }); }
+    record.resources = List::new(resources).unwrap();
+    RequestContext::from_verified_record(record)
+}
+
+#[test]
+fn hx6url_gateway_resolver_adds_no_url_origin_for_recording_start() {
+    let (_home, resolver, context, _bindings) = fixture();
+    let ctx = recording_context(&context, true);
+    ctx.record().canonical_bytes().unwrap();
+    let args = json!({"url":"https://news.example.org/article?id=1","headless":true});
+    let policy = duduclaw_mcp_boundary::tool_policy::policy("browser_record_start").unwrap();
+    let resolved = resolver.resolve(&ctx, policy, &args).unwrap();
+    assert!(!resolved.iter().any(|r| matches!(r, ResourceGrant::UrlOrigin { .. } | ResourceGrant::PublicOrigins { .. })), "{resolved:?}");
+    let call = authorize(&ctx, "browser_record_start", &args, &resolver).unwrap();
+    assert!(call.resources().iter().any(|r| matches!(r, ResourceGrant::PublicOrigins { .. })));
+    assert!(call.resources().contains(&ResourceGrant::EmployeeScope { id: ctx.record().employee }));
+    assert!(!call.resources().iter().any(|r| matches!(r, ResourceGrant::UrlOrigin { .. })));
+    // public_web off ⇒ no PublicOrigins signed ⇒ the start is refused.
+    assert!(authorize(&recording_context(&context, false), "browser_record_start", &args, &resolver).is_err());
+    // Private, loopback and credentialed URLs are refused at the boundary.
+    for url in ["https://127.0.0.1/", "https://10.0.0.1/", "https://[::1]/", "https://localhost/",
+        "https://user:pw@news.example.org/", "http://news.example.org/"] {
+        assert!(authorize(&ctx, "browser_record_start", &json!({"url":url}), &resolver).is_err(), "{url}");
+    }
+    // Every other tool keeps its per-URL UrlOrigin from the resolver.
+    let web = duduclaw_mcp_boundary::tool_policy::policy("web_extract").unwrap();
+    let resolved = resolver.resolve(&ctx, web, &json!({"url":"https://news.example.org/a"})).unwrap();
+    assert!(resolved.contains(&ResourceGrant::UrlOrigin { origin: text("https://news.example.org".into()).unwrap() }));
+}

@@ -5,7 +5,7 @@
 use super::*;
 use std::{collections::HashMap, sync::{Mutex, atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering}}};
 use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord, EmployeeBinding, Lane,
-    LiveRequestVerifier, Principal, ResourceGrant}, execution::{BackendError, BackendFuture, HelperFuture, PtySize,
+    LiveRequestVerifier, Principal, PublicOrigin, ResourceGrant}, execution::{BackendError, BackendFuture, HelperFuture, PtySize,
     RunOutcome, RunPty, RunStdio, RuntimeKind, SpawnPolicy, WaitOrigin}, ids::{EmployeeId, RunId, Sha256Digest},
     ipc::HelperCallId};
 use sha2::Digest;
@@ -15,28 +15,40 @@ use crate::{execution::{AuthorizedHelperPlan, PolicyFuture}, recording_jobs::{Re
 const CALLER: RunId = RunId([3; 16]);
 const LATER: RunId = RunId([4; 16]);
 const EMPLOYEE: EmployeeId = EmployeeId([2; 16]);
-
 struct Live(Arc<AtomicBool>);
 impl LiveRequestVerifier for Live {
     fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> {
         if self.0.load(Ordering::SeqCst) { Ok(()) } else { Err(VerificationError::Revoked) }
     }
 }
-fn context(run: RunId, live: Arc<AtomicBool>) -> RequestContext {
+/// The record the HX6 selector signs for an interactive recording run:
+/// EmployeeScope, the own Employee, `Workspace { employee-work }` and — the
+/// authority for the start's navigation `url` — `PublicOrigins { * }` (signed
+/// only with `[isolation] public_web`; `tool_policy::RECORDING_URL_TOOLS`).
+fn context(run: RunId, live: Arc<AtomicBool>) -> RequestContext { context_with(run, live, true) }
+/// `public_web = false`: no PublicOrigins grant is signed.
+fn context_with(run: RunId, live: Arc<AtomicBool>, public_web: bool) -> RequestContext {
+    let mut resources = vec![ResourceGrant::EmployeeScope { id: EMPLOYEE }, ResourceGrant::Employee { id: EMPLOYEE },
+        ResourceGrant::Workspace { handle: Text::new("employee-work".into()).unwrap() }];
+    if public_web {
+        resources.push(ResourceGrant::PublicOrigins { origins: List::new(vec![PublicOrigin::any()]).unwrap() });
+    }
     let record = CapabilityRecord {
         id: CapabilityId(Sha256Digest([1; 32])), employee: EMPLOYEE, run, task: None,
         principal: Principal::Human { user_id: Text::new("owner".into()).unwrap(), generation: 1 },
         employee_binding: EmployeeBinding::Personal(Text::new("owner".into()).unwrap()), lane: Lane::Standard,
         tools: List::new(vec![Text::new(START.into()).unwrap(), Text::new(STOP.into()).unwrap()]).unwrap(),
-        resources: List::new(vec![ResourceGrant::Employee { id: EMPLOYEE },
-            ResourceGrant::Workspace { handle: Text::new("employee-work".into()).unwrap() }]).unwrap(),
+        resources: List::new(resources).unwrap(),
         policy_revision: 1, gateway_epoch: [4; 16], issued_at: 1, not_before: 1, expires_at: u64::MAX - 1,
         nonce: [5; 32], jti: [6; 16],
     };
+    record.canonical_bytes().expect("the fixture record is signable");
     RequestContext::with_transport(record, Arc::new(Live(live)), run)
 }
 fn live() -> Arc<AtomicBool> { Arc::new(AtomicBool::new(true)) }
 
+/// Mirrors the gateway resolver: Employee + Workspace, and no URL authority —
+/// the boundary itself selects the record's signed PublicOrigins for the url.
 struct Resolver;
 impl ResourceResolver for Resolver {
     fn resolve(&self, context: &RequestContext, _: &tool_policy::ToolPolicy, _: &Value)
@@ -309,6 +321,38 @@ async fn recording_refused_in_offline_parent() {
     let result = gated.bridge.execute(&context(CALLER, live()), START, &json!({"url":"https://example.com","headless":true})).await;
     assert_eq!(result["helper_status"], "helper_recording_unsupported");
     assert_eq!(Backend::count(&gated.backend.started), 0);
+}
+
+/// The start `url` needs the record's signed `PublicOrigins` grant
+/// (`[isolation] public_web`): without it — even for a public URL — and for a
+/// URL that grant never permits (private, loopback, credentialed, non-https),
+/// the boundary refuses before any helper start or row.
+#[tokio::test]
+async fn recording_start_unsigned_origin_is_refused() {
+    let fixture = setup(Backend::new());
+    let args = json!({"url":"https://example.com","headless":true});
+    let result = fixture.bridge.execute(&context_with(CALLER, live(), false), START, &args).await;
+    assert_eq!(result, refused());
+    for url in ["https://127.0.0.1/", "https://localhost/", "https://user:pw@example.com/", "http://example.com/"] {
+        let result = fixture.bridge.execute(&context(CALLER, live()), START, &json!({"url":url,"headless":true})).await;
+        assert_eq!(result, refused(), "{url}");
+    }
+    assert_eq!(Backend::count(&fixture.backend.started), 0);
+    assert!(fixture.store.admin_read(HelperCallId::new([1; 16]).unwrap()).is_err(), "no job row");
+}
+
+/// HX6 url authority end to end: the same public start with the signed
+/// PublicOrigins grant is authorized and starts the recording.
+#[tokio::test]
+async fn hx6url_recording_start_with_public_origins_starts_and_without_is_refused() {
+    let fixture = setup(Backend::new());
+    let call = start(&fixture, &context(CALLER, live())).await;
+    assert_eq!(Backend::count(&fixture.backend.started), 1);
+    assert!(fixture.store.admin_read(call).is_ok(), "job row for the authorized start");
+    let off = fixture.bridge.execute(&context_with(CALLER, live(), false), START,
+        &json!({"url":"https://example.com","headless":true})).await;
+    assert_eq!(off, refused());
+    assert_eq!(Backend::count(&fixture.backend.started), 1, "nothing started without public_web");
 }
 
 #[tokio::test]

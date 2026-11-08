@@ -319,6 +319,67 @@ fn hx6_recording_selector_requires_host_gate_and_public_web() {
     assert_eq!(signed(&auth), ["execute_program"]);
 }
 
+/// HX6: the boundary-side resolver answer for a recording call (Employee +
+/// Workspace; the URL authority is the record's own PublicOrigins).
+struct RecordingResolver;
+impl duduclaw_mcp_boundary::tool_policy::ResourceResolver for RecordingResolver {
+    fn resolve(&self, context: &RequestContext, _: &duduclaw_mcp_boundary::tool_policy::ToolPolicy, _: &serde_json::Value)
+        -> Result<Vec<ResourceGrant>, VerificationError> {
+        Ok(vec![ResourceGrant::Employee { id: context.record().employee }, workspace()])
+    }
+}
+
+/// HX6 url authority: a selected recording signs `PublicOrigins { * }` (never
+/// a UrlOrigin), so a public start is authorized; without `[isolation]
+/// public_web` nothing is signed and the start is refused. A grant signed for
+/// the recording alone never makes the web tools eligible.
+#[test]
+fn hx6url_recording_signs_public_origins_only_with_public_web() {
+    use duduclaw_mcp_boundary::tool_policy::authorize;
+    let names = ["browser_record_start", "browser_record_stop", "tasks_update"];
+    let start = serde_json::json!({"url":"https://news.example.org/a","headless":true});
+    let recording = SpawndFeatures::HELPER_CALLS.with(SpawndFeatures::HELPER_RECORDING);
+    let (f, view) = helper_fixture(recording);
+    // public_web off: no PublicOrigins, and the start is refused.
+    let auth = f.issue(&names).unwrap();
+    assert!(!any_public(&auth));
+    assert!(authorize(&context(&auth), "browser_record_start", &start, &RecordingResolver).is_err());
+
+    f.profile(true, "");
+    let auth = f.issue(&names).unwrap();
+    assert!(has(&auth, &public_any()) && has(&auth, &ResourceGrant::EmployeeScope { id: EMPLOYEE }));
+    assert!(!auth.grant.resources.as_slice().iter().any(|grant| matches!(grant, ResourceGrant::UrlOrigin { .. })));
+    capability(&auth).canonical_bytes().expect("recording record stays signable");
+    let ctx = context(&auth);
+    let call = authorize(&ctx, "browser_record_start", &start, &RecordingResolver).unwrap();
+    assert!(call.resources().contains(&public_any()));
+    assert!(!call.resources().iter().any(|grant| matches!(grant, ResourceGrant::UrlOrigin { .. })));
+    for url in ["https://127.0.0.1/", "https://localhost/", "https://user:pw@news.example.org/"] {
+        let args = serde_json::json!({"url":url,"headless":true});
+        assert!(authorize(&ctx, "browser_record_start", &args, &RecordingResolver).is_err(), "{url}");
+    }
+
+    // Recording selected, web tools denied by the profile: the grant is signed
+    // for the recording only and the web tools leave the snapshot.
+    let with_web = ["browser_record_start", "browser_record_stop", "web_fetch_cached", "web_extract"];
+    f.profile(true, r#"denied_tools = ["web_fetch_cached", "web_extract"]"#);
+    let auth = f.issue(&with_web).unwrap();
+    assert!(has(&auth, &public_any()));
+    assert_eq!(signed(&auth), ["browser_record_start", "browser_record_stop"]);
+    for tool in ["web_fetch_cached", "web_extract"] { assert!(!eligible(&context(&auth), tool), "{tool}"); }
+    // Both selected: one grant, the web tools stay signed.
+    f.profile(true, "");
+    let auth = f.issue(&with_web).unwrap();
+    assert_eq!(auth.grant.resources.as_slice().iter().filter(|grant| matches!(grant, ResourceGrant::PublicOrigins { .. })).count(), 1);
+    assert_eq!(signed(&auth), with_web);
+
+    // The recording gate closed: no recording, so no PublicOrigins for it.
+    view.store(SpawndFeatures::HELPER_CALLS.0, Ordering::SeqCst);
+    let auth = f.issue(&names).unwrap();
+    assert!(!any_public(&auth));
+    assert!(authorize(&context(&auth), "browser_record_start", &start, &RecordingResolver).is_err());
+}
+
 #[test]
 fn h9_public_origins_only_when_admin_enabled() {
     let f = fixture(false);

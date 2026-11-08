@@ -24,7 +24,9 @@
 //!   from `[container] network_access`, which keeps controlling only the task
 //!   sandbox's network. `[isolation]` is admin-only (`org_field_guard` freezes
 //!   it against the employee's own writes) and defaults to `false`, so the
-//!   default is no web authority. Never from tool arguments.
+//!   default is no web authority. Never from tool arguments. HX6: the same
+//!   grant is also signed for a run whose recording is selected (`recording`,
+//!   below), as the authority for `browser_record_start`'s navigation URL.
 //! * `NewTask { requester }` (H9 decision 3) — only for an interactive run (not
 //!   record-backed, no task) that lists `create_task` while the profile still
 //!   allows it. The requester is the run's authenticated human (B1 has already
@@ -223,7 +225,13 @@ impl Selection {
             resources.push(ResourceGrant::Workspace {
                 handle: Text::new(EMPLOYEE_WORK_ROOT.to_owned()).map_err(|_| VerificationError::Invalid)? });
         }
-        if self.public_web {
+        // HX6: the recording's navigation URL is authorized by this same grant
+        // (`tool_policy::RECORDING_URL_TOOLS`), never a per-URL UrlOrigin. It
+        // is signed only when `recording` holds (helper_calls +
+        // helper_recording, `[isolation] public_web`, interactive run, profile
+        // allows); it does not make the recording a web tool
+        // (`PUBLIC_ORIGIN_TOOLS` is unchanged). At most one grant either way.
+        if self.public_web || self.recording {
             resources.push(ResourceGrant::PublicOrigins {
                 origins: List::new(vec![PublicOrigin::any()]).map_err(|_| VerificationError::Invalid)? });
         }
@@ -242,12 +250,17 @@ impl Selection {
     /// hidden and refused. Only ever narrows.
     pub(super) fn signed_tools(&self, tools: &List<Text<128>, 256>)
         -> Result<List<Text<128>, 256>, VerificationError> {
-        if !self.workspace { return Ok(tools.clone()); }
+        // HX6: a PublicOrigins grant signed only for the recording is never
+        // authority for the web tools, so they leave the snapshot unless
+        // their own `public_web` selection holds.
+        let recording_only_web = self.recording && !self.public_web;
+        if !self.workspace && !recording_only_web { return Ok(tools.clone()); }
         // A task run is limited to its task and loses EmployeeScope.
         let scoped = self.task.is_none();
         List::new(tools.as_slice().iter().filter(|tool|
-            !duduclaw_mcp_boundary::workspace_selection::drops_from_signed_with(tool.as_str(), scoped, self.helpers,
-                self.recording))
+            !(recording_only_web && PUBLIC_ORIGIN_TOOLS.contains(&tool.as_str()))
+            && !(self.workspace && duduclaw_mcp_boundary::workspace_selection::drops_from_signed_with(tool.as_str(),
+                scoped, self.helpers, self.recording)))
             .cloned().collect()).map_err(|_| VerificationError::Invalid)
     }
 }

@@ -55,6 +55,14 @@ pub const IN_RUN_HELPER_TOOLS: [&str; 3] = ["execute_program", "office_script", 
 /// Same route and workspace grant as the foreground helpers, but a separate
 /// selector condition (`public_web`) and the `(run, call)` job store.
 pub const IN_RUN_RECORDING_TOOLS: [&str; 2] = ["browser_record_start", "browser_record_stop"];
+/// HX6 (D-H2, owner decision Q3 = A): the recording tool whose navigation
+/// `url` is authorized by the record's signed `PublicOrigins` grant (with its
+/// EmployeeScope), never by a per-URL `UrlOrigin`: the URL is unknown at
+/// issuance. The URL must pass [`crate::resources::permitted_public_origin`]
+/// (https, default port, no userinfo, a public DNS name, never an IP literal),
+/// and the run's egress forwarder still allows public addresses only. This
+/// does not add the tool to [`PUBLIC_ORIGIN_TOOLS`]: it is not a web fetch.
+pub const RECORDING_URL_TOOLS: &[&str] = &["browser_record_start"];
 #[derive(Debug)]
 pub struct ToolPolicy {
     pub name: &'static str,
@@ -582,7 +590,14 @@ fn required_for_call(policy: &ToolPolicy, arguments: &Value) -> Result<Vec<Resou
                 if value.is_empty() || value.len() > 8192 || value.chars().any(char::is_control) {
                     return Err(VerificationError::Invalid);
                 }
-                add(ResourceKind::UrlOrigin);
+                // HX6: the recording's URL authority is the signed public-web
+                // grant; every other tool keeps its exact UrlOrigin.
+                if RECORDING_URL_TOOLS.contains(&policy.name) {
+                    add(ResourceKind::EmployeeScope);
+                    add(ResourceKind::PublicOrigins);
+                } else {
+                    add(ResourceKind::UrlOrigin);
+                }
             }
         }
     }
@@ -695,6 +710,14 @@ fn check_selected_resources(policy: &ToolPolicy, arguments: &Value, resources: &
     for key in ["url", "url_or_path"] {
         if let Some(value) = string(key)? {
             if key == "url_or_path" && !matches!(value.split_once("://"), Some(("https" | "http", _))) { continue; }
+            if RECORDING_URL_TOOLS.contains(&policy.name) {
+                // HX6: the same public-URL checks as the D-H2 web tools.
+                if !resources.iter().any(|resource| matches!(resource, ResourceGrant::PublicOrigins { .. })
+                    && crate::resources::permitted_public_origin(resource, value).is_ok()) {
+                    return Err(VerificationError::Invalid);
+                }
+                continue;
+            }
             let origin = url_origin(value)?;
             if !resources.iter().any(|resource| matches!(resource, ResourceGrant::UrlOrigin { origin: allowed } if allowed.as_str() == origin)) {
                 return Err(VerificationError::Invalid);
@@ -773,6 +796,26 @@ fn authorize_public_origin(context: &RequestContext, policy: &'static ToolPolicy
         resources: vec![scope, grant.clone()] })
 }
 
+/// HX6: the grants that authorize a [`RECORDING_URL_TOOLS`] call's URL — the
+/// record's own signed EmployeeScope and `PublicOrigins` grants, taken from the
+/// verified record (never from the resolver, which can neither widen nor
+/// substitute them). Empty when the call names no URL or for any other tool;
+/// refused when a URL is named but the record carries no public-web grant
+/// (`[isolation] public_web` off ⇒ none is signed).
+fn recording_url_grants(context: &RequestContext, policy: &ToolPolicy, arguments: &Value)
+    -> Result<Vec<ResourceGrant>, VerificationError> {
+    if !RECORDING_URL_TOOLS.contains(&policy.name) { return Ok(Vec::new()); }
+    let object = arguments.as_object().ok_or(VerificationError::Invalid)?;
+    let named = |key: &str| object.get(key).and_then(Value::as_str)
+        .is_some_and(|value| key == "url" || matches!(value.split_once("://"), Some(("https" | "http", _))));
+    if !(named("url") || named("url_or_path")) { return Ok(Vec::new()); }
+    let grant = public_origins_grant(context).ok_or(VerificationError::Invalid)?.clone();
+    let scope = ResourceGrant::EmployeeScope { id: context.record().employee };
+    crate::resources::require_resource(context, &scope)?;
+    crate::resources::require_resource(context, &grant)?;
+    Ok(vec![scope, grant])
+}
+
 /// H9 owner decision 3: `create_task` in an interactive run. Only a new
 /// top-level plan: the arguments are exactly the plan (`goal`, `steps`), so no
 /// parent task, goal, dependency, assignee or creator can be selected; every
@@ -842,7 +885,17 @@ pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolv
     let employee_connector = context.record().employee_scope() && policy.route == Route::Connector;
     let required = if employee_connector { vec![ResourceKind::Employee, ResourceKind::Connector] }
         else { required_for_call(policy, arguments)? };
-    let resources = resolver.resolve(context, policy, arguments)?;
+    let recording_url = recording_url_grants(context, policy, arguments)?;
+    let mut resources = resolver.resolve(context, policy, arguments)?;
+    if RECORDING_URL_TOOLS.contains(&name) {
+        // HX6: the URL authority is exactly the record's own public-web
+        // grants; a resolver-supplied origin or scope is refused, not merged.
+        if resources.iter().any(|resource| matches!(ResourceKind::of(resource),
+            ResourceKind::UrlOrigin | ResourceKind::PublicOrigins | ResourceKind::EmployeeScope)) {
+            return Err(VerificationError::Invalid);
+        }
+        resources.extend(recording_url);
+    }
     if resources.is_empty() || resources.len() > 128
         || resources.iter().enumerate().any(|(index, resource)| resources[..index].contains(resource)) {
         return Err(VerificationError::Invalid);

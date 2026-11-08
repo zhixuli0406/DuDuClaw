@@ -73,7 +73,12 @@ and `helper_recording` (Chromium proven to start under the helper sandbox on
 this host; until then readiness names `helper_recording_unsupported`), the
 employee's admin-only `[isolation] public_web` switch is on (enabling recording
 grants that employee's runtime public-web egress, owner decision Q3) and the run
-is interactive (`workspace_selection::drops_from_signed_with`). An offline parent
+is interactive (`workspace_selection::drops_from_signed_with`). With the same
+conditions it signs the D-H2 `PublicOrigins { * }` grant, the authority for
+`browser_record_start`'s navigation URL (the URL is unknown at issuance, so no
+`UrlOrigin` can be signed); a grant signed only for the recording never makes
+`web_fetch_cached`/`web_extract` eligible (`Selection::signed_tools` drops them
+unless their own `public_web` selection holds). An offline parent
 answers `helper_parent_offline`. Results are stored per `(run, call)` with each
 artifact's sha256 (`recording_jobs`); a later read must match them
 (`artifact_modified`).
@@ -269,8 +274,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `shared_skill_adopt` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee; shared skill scanned and prepared by E as data; scanned body copied only into the caller's own SKILLS (no clobber, read back); no target argument (H12a) |
 | `plan_start` | Resource → AuthorizedToolCall → original live employee handler |
 | `memory_improve` | Resource → AuthorizedToolCall → original live employee handler |
-| `browser_record_start` | HX6 `Route::InRunHelper`, recording slot of the caller's own run (`ExecutionToolBridge::execute_recording`, `prepare_in_run` → `AuthorizedHelperPlan::recording`, spawnd `HelperCall{slot: recording}`); returns `{status: recording, id}` (spawnd call id); gateway collector stores the decoded result + artifact sha256 per `(run, call)` (`recording_jobs`); flushed at run end (`ended_by: run_end`), hard kill ⇒ `uncertain/run_killed`; offline parent ⇒ `helper_parent_offline`; needs `Workspace{employee-work}`, spawnd `helper_calls` + `helper_recording` and `[isolation] public_web` |
-| `browser_record_stop` | HX6 `Route::InRunHelper`: same run ⇒ `HelperStop` for that `(run, call)` and the stored result (the old `:180` refusal inverted, never `parse_handle`); later run or terminal row ⇒ stored result, no helper interaction; revocation ⇒ `HelperStop`, `ended_by: revoked`; same selector as `browser_record_start` |
+| `browser_record_start` | HX6 `Route::InRunHelper`, recording slot of the caller's own run (`ExecutionToolBridge::execute_recording`, `prepare_in_run` → `AuthorizedHelperPlan::recording`, spawnd `HelperCall{slot: recording}`); returns `{status: recording, id}` (spawnd call id); gateway collector stores the decoded result + artifact sha256 per `(run, call)` (`recording_jobs`); flushed at run end (`ended_by: run_end`), hard kill ⇒ `uncertain/run_killed`; offline parent ⇒ `helper_parent_offline`; needs `Workspace{employee-work}`, spawnd `helper_calls` + `helper_recording` and `[isolation] public_web`; the navigation `url` is authorized by the record's signed EmployeeScope + `PublicOrigins` grant (D-H2, tag 11; signed with the recording selection), never a per-URL `UrlOrigin` (`tool_policy::RECORDING_URL_TOOLS`): it must pass `resources::permitted_public_origin` (https, default port, no userinfo, public DNS name, no IP literal or private name; http refused), no grant ⇒ refused, and egress stays public-address-only through the run's forwarder |
+| `browser_record_stop` | HX6 `Route::InRunHelper`: same run ⇒ `HelperStop` for that `(run, call)` and the stored result (the old `:180` refusal inverted, never `parse_handle`); later run or terminal row ⇒ stored result, no helper interaction; revocation ⇒ `HelperStop`, `ended_by: revoked`; same selector as `browser_record_start`; names no URL, so needs no `PublicOrigins`/`UrlOrigin` |
 | `desktop_record_start` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `desktop_record_stop` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `skill_from_recording` | Resource → original authenticated host orchestration; checked E parser required |
