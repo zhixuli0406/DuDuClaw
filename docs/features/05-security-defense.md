@@ -2,6 +2,26 @@
 
 Non-admin members (Employee and Manager) see only employees explicitly marked selectable by `agents.callable` in the sidebar, conversation filters, command palette, WebChat `@` suggestions and other employee pickers. The main AI employee stays hidden unless that response explicitly makes it selectable. The full roster is shown only after `agents.callable` confirms `unrestricted: true` from the live Admin identity, including the local Personal principal. Initial loading and failed permission reads show no employees for any account. Grants refresh every 60 seconds while the page is visible, when it becomes visible again, and when selection menus open. Refreshing preserves the same identity’s confirmed grants; a failed refresh clears them. File and settings pickers additionally require direct access; team calling rights do not grant file or configuration access. New conversations continue to use the server assignment resolver. This dashboard filtering does not change RPC authorization.
 
+## `code_map` stays inside the employee's own directory (v1.81)
+
+Before v1.81 `code_map` scanned any directory the MCP server could read (default: its working directory), so a caller could map source anywhere on the host and read its signatures. Now:
+
+- Only an identified AI employee may call it: the shared internal key needs `DUDUCLAW_AGENT_ID`, a per-employee key needs an `agents/<id>/agent.toml`. External keys, operator keys and scoped standalone keys are refused with an explanation; `code_map` joins the tools that act for an employee, so it is also hidden from their `tools/list` (the standalone listing drops from 24 to 23 tools).
+- `root` defaults to the employee's own directory, a relative `root` resolves under it, `..` is refused, and the resolved directory must sit inside the same roots as the data-file tools (`<home>/agents/<id>`, its `attachments`, `<home>/attachments`, `config.toml [files] allowed_roots`).
+- Every file is read through a descriptor walk from the vetted root, one component at a time with `O_NOFOLLOW`. Symlinks, non-regular files, files with more than one hard link and files over the size cap are skipped; the content comes from the descriptor that was checked. The walk refuses to cross a mount: `st_dev` must match on every component, and on Linux the kernel mount id must match too, so a bind mount of another directory on the same filesystem (same `st_dev`) is refused. Linux uses `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV` when the kernel has it, and compares the `statx` `STATX_MNT_ID` (or `/proc/self/fdinfo` `mnt_id`) in every case; when neither reports a mount id the scan is refused. macOS relies on `st_dev` plus the per-component no-follow open; Windows refuses reparse points (symlinks, junctions, volume mount points) and multiply linked files.
+- Each refusal writes a `tool_calls.jsonl` row (`refused: true`, the requested root and the reason) and nothing else.
+
+## Who may create employees (v1.81)
+
+`[permissions] can_create_agents` is now `true` by default only for the `main` employee. For every other role, and for an employee with no recognisable role, a missing key means `false`. The MCP permission gate enforces this effective value for `create_agent` and `spawn_ephemeral`, so a non-main employee that never wrote the key can no longer create employees. An explicit setting still wins in both directions.
+
+- New employees: the dashboard and `duduclaw agent create` write `true` only for `role = "main"`; the evaluator template and premium team kits write `false` for every non-main role.
+- An employee created by another employee through MCP `create_agent` always gets `can_create_agents = false`. Only the current main employee, with `can_create_agents` on, may create a `role = "main"` employee there; anyone else is refused before anything is written.
+- The v1.68 boot migration no longer turns `can_create_agents = false` into `true` on a non-main employee.
+- The admin-only check on `agents.update` compares the same effective value, so a non-admin Owner can no longer switch creation on for a non-main employee by writing `true` over a missing key.
+
+**Behaviour change:** a non-main employee whose `agent.toml` has no `can_create_agents` key could create employees before v1.81 and is refused now. To keep that, turn it on in the dashboard (「工具與權限」, admin only).
+
 ## Customer company identity (v1.80.0)
 
 Customer company name and logo are separate from signed distributor branding. `company.get` and `company.update` are explicit Admin RPCs; `company.update` accepts only the name and optional logo removal, and rejects the former `logo_base64` field. Company names reject control, line-separator and Unicode format (`Cf`, including bidi override/isolate) characters. Updates repeat the live identity check under the existing configuration write lock. The `company_info` audit records actor, method and outcome without the image or name. Advanced settings navigation and routes are Admin-only; moving controls there does not relax their existing RPC permissions.

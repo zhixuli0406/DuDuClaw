@@ -84,6 +84,12 @@ fn personal_surfaces_are_untouched() {
         "users.me",
         "users.change_password",
         "users.change_email",
+        // RM-064 外部查詢憑證 — 個人版擁有者也要能讓 Odoo 查自己的員工
+        "me.status_tokens.list",
+        "me.status_tokens.create",
+        "me.status_tokens.revoke",
+        "status_tokens.admin_list",
+        "status_tokens.admin_revoke",
         // 委派權限 — 跨 agent 不是跨人 (§1.6)
         "delegation.get",
         "delegation.set",
@@ -127,6 +133,7 @@ fn personal_surfaces_are_untouched() {
         "agents.list",
         "agents.create",
         "agents.update",
+        "agents.permission_history",
         "tasks.list",
         "plans.list",
         "evolution.status",

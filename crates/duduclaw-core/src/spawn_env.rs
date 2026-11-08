@@ -120,6 +120,14 @@ pub const AGENT_CLI_ENV_ALLOWLIST: &[&str] = &[
     // gateway process itself and have it reach a spawn the gateway did not
     // decorate. Absent ⇒ the hook is inert, which is the pre-§14.4 behavior.
     "DUDUCLAW_DATA_FILE_GUARD",
+    // RM-124: the WebChat conversation a turn answers (a session id, not a
+    // credential). The gateway's own spawn sites always clear it and set it
+    // explicitly from the turn's task-local (only for `webchat:` turns), so
+    // an ambient gateway value never reaches a non-WebChat turn; the entry
+    // lets it survive one more allowlisted hop from a process that already
+    // runs inside such a turn. Consumers re-verify it against the session
+    // store and the acting employee before trusting it.
+    "DUDUCLAW_ORIGIN_SESSION",
 ];
 
 /// macOS only: Cocoa `NSString`/Keychain Services initialization reads this
@@ -428,6 +436,20 @@ mod tests {
         for suffix in ["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_KEY"] {
             assert!(!"DUDUCLAW_DATA_FILE_GUARD".ends_with(suffix));
         }
+    }
+
+    /// RM-124: the WebChat origin session survives the scrub and is pinned
+    /// to the shared constant so writer and reader cannot drift apart.
+    #[test]
+    fn origin_session_is_allowlisted_and_is_not_secret_shaped() {
+        assert_eq!(crate::ENV_ORIGIN_SESSION, "DUDUCLAW_ORIGIN_SESSION");
+        assert!(AGENT_CLI_ENV_ALLOWLIST.contains(&crate::ENV_ORIGIN_SESSION));
+        for suffix in ["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_KEY"] {
+            assert!(!crate::ENV_ORIGIN_SESSION.ends_with(suffix));
+        }
+        // The reply channel stays explicit-only: an ambient value must never
+        // turn a turn into a push target.
+        assert!(!AGENT_CLI_ENV_ALLOWLIST.contains(&crate::ENV_REPLY_CHANNEL));
     }
 
     #[test]

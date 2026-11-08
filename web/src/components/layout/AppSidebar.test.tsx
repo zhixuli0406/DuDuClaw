@@ -303,6 +303,26 @@ describe('AppSidebar (Multica shell)', () => {
     expect(screen.getByText('Lv —')).toBeInTheDocument();
   });
 
+  it('lists 我的記憶 in 設定 for every role, with the 新功能 chip while on 1.81', () => {
+    for (const role of ['admin', 'manager', 'employee'] as const) {
+      useAuthStore.setState({ user: { display_name: 'U', role } as never });
+      useSystemStore.setState({ status: { edition_profile: 'enterprise', version: '1.81.0' } as never });
+      const { unmount } = renderSidebar();
+      // Employees reach it through the account menu instead of the rail.
+      if (role !== 'employee') {
+        const link = screen.getByRole('link', { name: /^My memory/ });
+        expect(link).toHaveAttribute('href', '/me/memory');
+        expect(link).toHaveTextContent('New');
+      }
+      unmount();
+    }
+    // The chip self-expires on the next minor.
+    useAuthStore.setState({ user: { display_name: 'Boss', role: 'admin' } as never });
+    useSystemStore.setState({ status: { edition_profile: 'enterprise', version: '1.82.0' } as never });
+    renderSidebar();
+    expect(screen.getByRole('link', { name: /^My memory/ })).not.toHaveTextContent('New');
+  });
+
   it('opens the command palette from the search trigger', async () => {
     const user = userEvent.setup();
     renderSidebar();

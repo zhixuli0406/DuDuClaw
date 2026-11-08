@@ -26,6 +26,13 @@ impl AuthManager {
     ///
     /// Uses constant-time comparison to prevent timing attacks.
     pub fn validate(&self, provided_token: &str) -> Result<()> {
+        // RM-064: a read-only status credential is never an admin token, even
+        // if an operator happened to configure one with the same prefix.
+        if duduclaw_auth::status_tokens::is_status_token(provided_token) {
+            return Err(DuDuClawError::Security(
+                "invalid authentication token".to_owned(),
+            ));
+        }
         match &self.token {
             Some(expected) => {
                 if constant_time_eq(expected.as_bytes(), provided_token.as_bytes()) {
@@ -75,5 +82,15 @@ mod tests {
     fn test_invalid_token() {
         let mgr = AuthManager::new(Some("secret".to_owned()));
         assert!(mgr.validate("wrong").is_err());
+    }
+
+    /// RM-064: the status credential type never authenticates the dashboard,
+    /// not even when the configured admin token carries the same bytes.
+    #[test]
+    fn status_credentials_are_refused_by_type() {
+        let raw = "ddc_status_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(AuthManager::new(Some(raw.to_owned())).validate(raw).is_err());
+        assert!(AuthManager::new(Some("secret".to_owned())).validate(raw).is_err());
+        assert!(AuthManager::new(None).validate(raw).is_err());
     }
 }

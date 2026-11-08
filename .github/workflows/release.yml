@@ -33,7 +33,6 @@ jobs:
       CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ startsWith(matrix.os, 'windows') && 's' || '3' }}
     permissions:
       contents: write
-      id-token: write   # cosign keyless (Sigstore OIDC) signing
     strategy:
       fail-fast: false
       matrix:
@@ -79,9 +78,6 @@ jobs:
           shared-key: release-cross-glibc231-${{ matrix.target }}
           workspaces: . -> target
           save-if: false
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3
 
       - name: Install cross (Linux)
         if: runner.os == 'Linux'
@@ -181,14 +177,6 @@ jobs:
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
           rm -rf _pkg
 
-      - name: Sign archive with cosign (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          cosign sign-blob --yes \
-            --output-signature ${{ matrix.artifact }}.tar.gz.sig \
-            --output-certificate ${{ matrix.artifact }}.tar.gz.pem \
-            ${{ matrix.artifact }}.tar.gz
-
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
@@ -205,17 +193,90 @@ jobs:
           "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii ${{ matrix.artifact }}.zip.sha256
           Remove-Item -Recurse -Force _pkg
 
-      - name: Sign archive with cosign (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cosign sign-blob --yes `
-            --output-signature ${{ matrix.artifact }}.zip.sig `
-            --output-certificate ${{ matrix.artifact }}.zip.pem `
-            ${{ matrix.artifact }}.zip
+      - name: Preserve unsigned archives and checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
+        with:
+          name: unsigned-${{ matrix.artifact }}
+          if-no-files-found: error
+          path: |
+            duduclaw-*.tar.gz
+            duduclaw-*.zip
+            duduclaw-*.sha256
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
+  # Rekor/Fulcio failures must not discard hours of compilation. Unsigned build
+  # artifacts remain available after failure; rerun only the failed signing job
+  # with `gh run rerun RUN_ID --job SIGN_JOB_ID` (and its downstream dependents).
+  sign:
+    needs: build
+    name: Sign ${{ matrix.artifact }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # cosign keyless (Sigstore OIDC); builds need no OIDC token
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: duduclaw-darwin-arm64
+            extension: tar.gz
+          - artifact: duduclaw-darwin-x64
+            extension: tar.gz
+          - artifact: duduclaw-linux-x64
+            extension: tar.gz
+          - artifact: duduclaw-linux-arm64
+            extension: tar.gz
+          - artifact: duduclaw-windows-x64
+            extension: zip
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          name: unsigned-${{ matrix.artifact }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3
+
+      - name: Sign and verify archive with retry
+        shell: bash
+        env:
+          ARCHIVE: ${{ matrix.artifact }}.${{ matrix.extension }}
+          CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          # Six attempts, with five exponential delays: 30, 60, 120, 240, 480s.
+          # Retry verification independently so a transient lookup does not re-sign.
+          retry() {
+            local attempt delay=30
+            for attempt in 1 2 3 4 5 6; do
+              if "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -eq 6 ]; then
+                echo "::error::cosign failed after $attempt attempts"
+                return 1
+              fi
+              echo "::warning::cosign attempt $attempt failed; retrying in ${delay}s"
+              sleep "$delay"
+              delay=$((delay * 2))
+            done
+          }
+          sha256sum --check "$ARCHIVE.sha256"
+          retry cosign sign-blob --yes \
+            --output-signature "$ARCHIVE.sig" \
+            --output-certificate "$ARCHIVE.pem" \
+            "$ARCHIVE"
+          retry cosign verify-blob \
+            --signature "$ARCHIVE.sig" \
+            --certificate "$ARCHIVE.pem" \
+            --certificate-identity "$CERTIFICATE_IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$ARCHIVE"
+
+      - name: Upload verified signed archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: ${{ matrix.artifact }}
+          overwrite: true  # A signing-only rerun replaces this target's bundle.
+          if-no-files-found: error
           path: |
             duduclaw-*.tar.gz
             duduclaw-*.zip
@@ -224,7 +285,7 @@ jobs:
             duduclaw-*.pem
 
   release:
-    needs: [build, delivery-gate]
+    needs: [sign, delivery-gate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -232,6 +293,7 @@ jobs:
           ref: ${{ needs.delivery-gate.outputs.commit }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
         with:
+          pattern: duduclaw-*
           merge-multiple: true
 
       # The in-app updater (crates/duduclaw-gateway/src/updater.rs) REQUIRES a
@@ -329,6 +391,7 @@ jobs:
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
         with:
+          pattern: duduclaw-*
           merge-multiple: true
           path: artifacts
 

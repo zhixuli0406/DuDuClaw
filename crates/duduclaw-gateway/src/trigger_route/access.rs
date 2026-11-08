@@ -211,7 +211,7 @@ fn lookup_cache() -> std::sync::MutexGuard<'static, LookupCache> {
 /// `auth_meta.acl_generation` through a read-only connection (kept per
 /// home and reopened after any error), or `None` when the identity store is
 /// absent or unreadable (the cache is then bypassed, never trusted).
-fn read_generation(home: &Path) -> Option<u64> {
+pub(crate) fn read_generation(home: &Path) -> Option<u64> {
     type Conns = HashMap<PathBuf, rusqlite::Connection>;
     static CONNS: OnceLock<Mutex<Conns>> = OnceLock::new();
     let mut conns = CONNS
@@ -401,6 +401,12 @@ fn create_audit_key(path: &Path) -> Option<Vec<u8>> {
 /// HMAC-SHA256(key, channel ‖ 0 ‖ id), 16 hex characters. Without a usable
 /// key the identifier is withheld (`"unavailable"`), never logged raw.
 pub(crate) fn keyed_digest(home: &Path, channel: &str, id: &str) -> String {
+    let digest = keyed_digest_full(home, channel, id);
+    duduclaw_core::truncate_bytes(&digest, 16).to_string()
+}
+
+/// Full HMAC for security audit identifiers; shares the existing per-home key.
+pub(crate) fn keyed_digest_full(home: &Path, channel: &str, id: &str) -> String {
     use hmac::{Hmac, Mac};
     let Some(key) = audit_key(home) else {
         return "unavailable".to_string();
@@ -411,8 +417,7 @@ pub(crate) fn keyed_digest(home: &Path, channel: &str, id: &str) -> String {
     mac.update(channel.as_bytes());
     mac.update(&[0]);
     mac.update(id.as_bytes());
-    let hex = hex::encode(mac.finalize().into_bytes());
-    duduclaw_core::truncate_bytes(&hex, 16).to_string()
+    hex::encode(mac.finalize().into_bytes())
 }
 
 /// Domain-separated key for private history routing names. It is never a

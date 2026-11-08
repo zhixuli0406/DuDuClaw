@@ -49,13 +49,14 @@ describe('<VoiceTab>', () => {
     });
   });
 
-  it('normalizes deprecated settings to automatic routing', async () => {
+  it('loads removed legacy providers with speech turned off', async () => {
     configMock.mockResolvedValue({ voice: { tts_provider: 'edge-tts', tts_voice: '' } });
     renderWithProviders(<VoiceTab />);
     await waitFor(() => expect(configMock).toHaveBeenCalled());
-    await screen.findByRole('button', { name: 'Download model' });
+    expect(await screen.findByText('Text-to-Speech')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Download model' })).toBeNull();
     fireEvent.click(screen.getAllByRole('button', { name: 'Save' })[0]);
-    await waitFor(() => expect(updateMock).toHaveBeenCalledWith({ voice: { tts_provider: 'auto', tts_voice: '', tts_command: '' } }));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith({ voice: { tts_provider: 'off', tts_voice: '', tts_command: '' } }));
   });
 
   it('does not show a download card when speech is off', async () => {

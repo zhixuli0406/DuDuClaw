@@ -419,7 +419,7 @@ impl GuardDecision {
                     _ => "這項操作請由管理者處理。",
                 }
             )),
-            Self::BlockedCredentialRead { .. } => Some("憑證稽核資料僅供管理員查閱，AI 員工不可直接讀取。".into()),
+            Self::BlockedCredentialRead { .. } => Some("憑證稽核資料與安裝金鑰僅供管理員查閱，AI 員工不可直接讀取。".into()),
             Self::BlockedUnresolvablePath { attempted_path, reason } => Some(format!(
                 "已封鎖：無法確認這次寫入實際會落在哪裡，為避免繞過資料夾保護一律拒絕。\n\
                  檔案：{}\n\
@@ -929,14 +929,24 @@ mod tests {
     }
 }
 
+/// Home directories whose contents the native Read lane never exposes:
+/// credential audit state, encrypted secrets, and the private `state/` store
+/// (MFA relay `installation.key` signing seed and relay credential).
+pub const CREDENTIAL_READ_DIRS: [&str; 3] = ["credentials", "secrets", "state"];
+
+/// The installation signing key inside `<home>/state/`; listed for callers
+/// that name it explicitly. Covered by the `state` directory rule.
+pub const INSTALLATION_KEY_PATH: &str = "state/installation.key";
+
 /// Credential audit state is never exposed through the native Read lane.
 /// Compare components on both literal and resolved paths, never substrings.
 pub fn check_credential_read(path: &Path, home: &Path) -> GuardDecision {
     let blocked = |path: &Path, home: &Path| {
         let path = lexical_normalize(path);
         let home = lexical_normalize(home);
-        ["credentials", "secrets"].iter()
+        CREDENTIAL_READ_DIRS.iter()
             .any(|dir| strip_prefix_ci(&path, &home.join(dir)).is_some())
+            || strip_prefix_ci(&path, &home.join(INSTALLATION_KEY_PATH)).is_some()
     };
     let denied = || GuardDecision::BlockedCredentialRead { attempted_path: path.to_path_buf() };
     if blocked(path, home) { return denied(); }
@@ -962,6 +972,29 @@ mod credential_read_tests {
         assert!(!check_credential_read(&home.join("Secrets/mcp/alice.enc"), home).is_allowed());
         assert!(check_credential_read(&home.join("secrets-notes/a.md"), home).is_allowed());
         assert!(check_credential_read(&home.join("credentials-notes/a.md"), home).is_allowed());
+    }
+
+    #[test]
+    fn read_guard_blocks_private_state_and_installation_key() {
+        let home = Path::new("/tmp/duduclaw-credential-guard-test");
+        for rel in ["state/installation.key", "State/Installation.KEY", "state/mfa-relay.json",
+            "state/mfa-relay-state.json", "state", "agents/x/../../state/installation.key"] {
+            assert!(!check_credential_read(&home.join(rel), home).is_allowed(), "{rel}");
+        }
+        assert!(check_credential_read(&home.join("statements/a.md"), home).is_allowed());
+        assert!(check_credential_read(&home.join("agents/x/state/notes.md"), home).is_allowed());
+        assert!(check_credential_read(Path::new("/tmp/elsewhere/state/installation.key"), home).is_allowed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_guard_follows_symlink_into_state() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("state")).unwrap();
+        std::fs::write(home.path().join("state/installation.key"), [0u8; 32]).unwrap();
+        let alias = home.path().join("notes.bin");
+        std::os::unix::fs::symlink(home.path().join("state/installation.key"), &alias).unwrap();
+        assert!(!check_credential_read(&alias, home.path()).is_allowed());
     }
     #[cfg(unix)]
     #[test]

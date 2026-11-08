@@ -69,15 +69,22 @@ export function canStartGeneration(description: string, builderAgent: string): b
 }
 
 /** Coarse generation phase derived from the record status while on step 2. */
-export type GenerationPhase = 'working' | 'ready' | 'unexpected';
+export type GenerationPhase = 'working' | 'ready' | 'failed' | 'unexpected';
 
-export function generationPhase(status: CustomSkillStatus | undefined): GenerationPhase {
+/**
+ * `generationError` is the record's `generation_error`: a `draft` carrying one
+ * means the last attempt failed (the backend has no separate failed status).
+ */
+export function generationPhase(
+  status: CustomSkillStatus | undefined,
+  generationError?: string | null,
+): GenerationPhase {
   switch (status) {
     case 'generating':
       return 'working';
-    // A draft exists (agent finished / re-drafted) or a prior rejection sent it
-    // back to draft — either way the human can proceed to fill the form.
     case 'draft':
+      return generationError ? 'failed' : 'ready';
+    // A prior rejection sent it back — the human can proceed to fill the form.
     case 'rejected':
       return 'ready';
     case undefined:
@@ -96,8 +103,80 @@ export function generationPhase(status: CustomSkillStatus | undefined): Generati
 export function canProceedFromGenerate(
   status: CustomSkillStatus | undefined,
   draftConfirmed: boolean,
+  generationError?: string | null,
 ): boolean {
-  return generationPhase(status) === 'ready' || draftConfirmed;
+  const phase = generationPhase(status, generationError);
+  // A failed generation has no draft: never allow proceeding (or confirming).
+  if (phase === 'failed') return false;
+  return phase === 'ready' || draftConfirmed;
+}
+
+/** Poll backoff: 4s → 8s → 16s … capped at 60s. `attempt` is 0-based. */
+export const POLL_BASE_MS = 4000;
+export const POLL_MAX_MS = 60000;
+export function pollDelay(attempt: number): number {
+  return Math.min(POLL_BASE_MS * 2 ** Math.max(0, attempt), POLL_MAX_MS);
+}
+
+/** Statuses worth polling for (an in-flight backend operation). */
+export function isPollableStatus(status: CustomSkillStatus | undefined): boolean {
+  return status === 'generating' || status === 'pending_approval';
+}
+
+/**
+ * "Taking longer than usual": a generating record the SERVER says may be
+ * regenerated (`can_regenerate`, computed against the server's stale window and
+ * clock — never the browser clock).
+ */
+export function isGenerationSlow(
+  status: CustomSkillStatus | undefined,
+  canRegenerate: boolean | null | undefined,
+): boolean {
+  return status === 'generating' && canRegenerate === true;
+}
+
+const DISPATCH_ERROR_LABELS = new Set([
+  'enqueue',
+  'stopped',
+  'budget',
+  'autonomy_paused',
+  'sandbox',
+  'binary_missing',
+  'auth_failed',
+  'rate_limited',
+  'billing',
+  'timeout',
+  'spawn_error',
+  'empty_response',
+  'no_accounts',
+  'cooling_down',
+  'unknown',
+]);
+
+/**
+ * Map a backend `generation_error` reason code (`timeout`, `no_draft`,
+ * `in_progress`, `dispatch:<label>`) to an i18n message id. Anything
+ * unrecognised (including legacy free-text errors stored by older builds) maps
+ * to a generic message — raw backend text is never shown.
+ */
+export function generationErrorMessageId(code: string | null | undefined): string {
+  const c = (code ?? '').trim();
+  if (c === 'timeout' || c === 'no_draft' || c === 'in_progress') {
+    return `skills.generationError.${c}`;
+  }
+  if (c.startsWith('dispatch:')) {
+    const label = c.slice('dispatch:'.length);
+    return DISPATCH_ERROR_LABELS.has(label)
+      ? `skills.generationError.dispatch.${label}`
+      : 'skills.generationError.dispatch.unknown';
+  }
+  return 'skills.generationError.unknown';
+}
+
+/** True when an RPC rejection is the backend's "generation already running" code. */
+export function isInProgressError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : '';
+  return /(^|[^a-z_])in_progress($|[^a-z_])/.test(msg);
 }
 
 /** The form step requires a non-empty display name (defaulted from the draft). */

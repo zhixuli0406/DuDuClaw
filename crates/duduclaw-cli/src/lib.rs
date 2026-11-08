@@ -6545,14 +6545,17 @@ async fn cmd_hook_agent_file_guard(
     };
 
     // Claude Code PreToolUse envelope shapes:
-    //   Write / Edit / MultiEdit → tool_input.file_path
-    //   Bash                     → tool_input.command
+    //   Write / Edit / MultiEdit / Read → tool_input.file_path
+    //   Bash                            → tool_input.command
     let tool_name = envelope
         .get("tool_name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    if !matches!(tool_name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "Bash") {
+    // `Read` is in the installed matcher and judged by the credential /
+    // private-state read rule in `agent_file_guard_decision`; it must not be
+    // dropped here.
+    if !matches!(tool_name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "Read" | "Bash") {
         return Ok(());
     }
     let cwd = envelope
@@ -15317,6 +15320,21 @@ mod credential_read_lane_tests {
             &duduclaw_core::HookCaller::Agent("tester".into())).unwrap();
         assert!(!decision.is_allowed());
     }
+
+    #[test]
+    fn native_read_cannot_read_installation_key_or_relay_state() {
+        let home = std::path::Path::new("/tmp/credential-read-lane-test");
+        for rel in ["state/installation.key", "state/mfa-relay.json"] {
+            let envelope = serde_json::json!({"tool_input":{"file_path":home.join(rel)}});
+            let decision = agent_file_guard_decision("Read", &envelope, home,
+                &duduclaw_core::HookCaller::Agent("tester".into())).unwrap();
+            assert!(!decision.is_allowed(), "{rel}");
+        }
+        let relative = serde_json::json!({"cwd": home.join("agents/tester"),
+            "tool_input":{"file_path":"../../state/installation.key"}});
+        assert!(!agent_file_guard_decision("Read", &relative, home,
+            &duduclaw_core::HookCaller::Agent("tester".into())).unwrap().is_allowed());
+    }
 }
 
 fn scaffold_agent_toml(s: &AgentScaffold) -> String {
@@ -15332,6 +15350,8 @@ fn scaffold_agent_toml(s: &AgentScaffold) -> String {
     };
 
     let preferred = model_preferred.as_deref().unwrap_or("claude-sonnet-4-6");
+    // v1.81 (S2): only `main` may create employees by default.
+    let can_create_agents = duduclaw_core::agent_toml::default_can_create_agents(Some(role_str));
 
     // agent.toml
     format!(
@@ -15368,7 +15388,7 @@ warn_threshold_percent = 80
 hard_stop = true
 
 [permissions]
-can_create_agents = true
+can_create_agents = {can_create_agents}
 can_send_cross_agent = true
 can_modify_own_skills = true
 can_modify_own_soul = false

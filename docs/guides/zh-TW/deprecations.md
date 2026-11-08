@@ -213,11 +213,11 @@ gateway 的舊版互動工作階段。棄用期間兩種寫法仍可使用，並
 
 MFA 第一階段為 `/api/login` 與 `/api/otp/verify` 新增條件式回應。未註冊且未強制時仍維持 `access_token`、`refresh_token`、`user` 原格式；已註冊者只回 `mfa_required`、`challenge_id`；強制期間未註冊者只回 `mfa_enrollment_required`、`enrollment_token`。客戶端必須先完成 `/api/mfa/verify` 或 `/api/mfa/enroll/*`，才能視為登入成功。沒有移除原端點，Dashboard 支援留待下一階段。
 
-## 語音供應商設定棄用
+## v1.81.0 已移除
 
-| 棄用值 | 起始版本 | 移除版本 | 行為與替代方式 |
-|---|---|---|---|
-| `edge-tts`、`edge` | v1.79.0 | v1.81.0 | 仍接受設定值，但改採 `auto`，每個行程警告一次；舊實作已移除。請選用本機 Kokoro 或官方 Azure AI Speech REST。 |
+### 語音供應商設定
+
+`edge-tts` 與 `edge` 相容值不再接受。舊設定若仍包含其中一個值，TTS 會停用，且每個行程只警告一次；請改用 `kokoro`。`system.update_config` 也會拒絕這兩個已移除的值。
 
 ## 第三方 MCP 環境變數憑證
 

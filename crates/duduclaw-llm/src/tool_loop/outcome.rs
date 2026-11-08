@@ -101,4 +101,14 @@ impl ToolOutcome {
         self.ccr_revoke_call = true;
         self
     }
+
+    /// RM-130: an error with no text gets a fixed host reason naming the tool
+    /// (and server). Call only after accounting and redaction; a non-empty
+    /// error (e.g. a "result withheld" notice) and a success are untouched.
+    pub fn with_error_reason(mut self, tool_name: &str, server_label: Option<&str>) -> Self {
+        if self.is_error && self.content.trim().is_empty() {
+            self.content = duduclaw_core::missing_error_reason(tool_name, server_label, None, None);
+        }
+        self
+    }
 }

@@ -71,6 +71,9 @@ impl MethodHandler {
         // saved value. Reuses `miniapp::enabled`'s own parser rather than
         // re-implementing the "absent / malformed ⇒ false" posture.
         let miniapp_enabled: bool = crate::miniapp::enabled(&self.home_dir);
+        // RM-064: `[external_status] enabled`, same "absent / malformed ⇒
+        // false" parser the status endpoint itself reads per request.
+        let external_status_enabled: bool = crate::external_status::enabled(&self.home_dir);
 
         // Structured [notify] daily_digest so the dashboard Settings toggle +
         // time field show the saved values (W2-8). Reuses `DigestConfig`'s
@@ -78,6 +81,24 @@ impl MethodHandler {
         // "absent/malformed ⇒ default (off, 09:00)" posture every other
         // structured field on this response follows.
         let digest_cfg = crate::notify_digest::DigestConfig::from_home(&self.home_dir);
+
+        // RM-039: structured `[memory_privacy]` — the effective config (an
+        // invalid / unreadable one shows as the defaults it falls back to,
+        // with `load_state = "failed_closed"` so the UI can say so).
+        let memory_privacy = {
+            let (cfg, state) =
+                crate::memory_privacy::MemoryPrivacyConfig::load_with_state(&self.home_dir);
+            json!({
+                "excluded_categories": cfg.excluded_categories,
+                "custom_keywords": cfg.custom_keywords,
+                "builtin_categories": crate::memory_privacy::BUILTIN_CATEGORIES,
+                "load_state": match state {
+                    crate::memory_privacy::LoadState::Defaults => "defaults",
+                    crate::memory_privacy::LoadState::Configured => "configured",
+                    crate::memory_privacy::LoadState::FailedClosed => "failed_closed",
+                },
+            })
+        };
 
         match tokio::fs::read_to_string(&config_path).await {
             Ok(content) => {
@@ -113,7 +134,9 @@ impl MethodHandler {
                                 "allowed_origins": allowed_origins,
                                 "gap_digest_enabled": gap_digest_enabled,
                                 "novelty_gate_enabled": novelty_gate_enabled,
+                                "memory_privacy": memory_privacy,
                                 "miniapp_enabled": miniapp_enabled,
+                                "external_status_enabled": external_status_enabled,
                                 "daily_digest_enabled": digest_cfg.enabled,
                                 "daily_digest_at": digest_cfg.at.format("%H:%M").to_string(),
                                 "webchat_widget_key_set": webchat_widget_key_set,

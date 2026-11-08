@@ -251,6 +251,12 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_security_audit_log(params)).await
             }
+            // RM-026: one employee's permission-change history (reads the
+            // global audit log, so it is Admin-only like `security.audit_log`).
+            "agents.permission_history" => {
+                require_admin!();
+                boxed_frame(|| self.handle_agents_permission_history(params)).await
+            }
             "audit.unified_log" => {
                 require_admin!();
                 boxed_frame(|| self.handle_audit_unified_log(params)).await

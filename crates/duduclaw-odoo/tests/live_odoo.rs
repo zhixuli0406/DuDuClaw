@@ -30,6 +30,9 @@ async fn connect() -> OdooConnector {
         url,
         db,
         username: user,
+        // res.partner is security-blocked by default; the schema sweep only
+        // reports models visible under the effective policy.
+        unblock_models: vec!["res.partner".into()],
         ..Default::default()
     };
 
@@ -50,8 +53,12 @@ async fn live_connect_and_authenticate() {
 #[ignore]
 async fn live_introspect_schema() {
     let conn = connect().await;
+    let policy = duduclaw_odoo::schema::ScanPolicy::from_config(&OdooConfig {
+        unblock_models: vec!["res.partner".into()],
+        ..Default::default()
+    });
     let report = conn
-        .introspect_schema(50)
+        .introspect_schema(50, &policy)
         .await
         .expect("introspect_schema RPC failed");
 

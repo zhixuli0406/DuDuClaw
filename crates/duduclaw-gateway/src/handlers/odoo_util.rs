@@ -37,7 +37,6 @@ impl MethodHandler {
                 let st = conn.status();
                 let profile = conn.schema_profile("default");
                 let schema = duduclaw_odoo::schema::load_scan_status(&self.home_dir, &profile);
-                duduclaw_odoo::schema::spawn_auto_scan(Arc::new(conn), self.home_dir.clone(), profile);
                 WsFrame::ok_response(
                     "",
                     json!({
@@ -79,8 +78,7 @@ impl MethodHandler {
                     snapshot = duduclaw_odoo::schema::load_snapshot(&self.home_dir, &profile)
                         .ok().flatten()
                         .filter(|s| s.connection_identity == conn.connection_identity());
-                    duduclaw_odoo::schema::spawn_auto_scan(Arc::new(conn), self.home_dir.clone(), profile);
-                }
+                    }
             }
         }
         WsFrame::ok_response("", odoo_permission_options(snapshot.as_ref()))

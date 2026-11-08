@@ -294,6 +294,8 @@ pub(super) async fn spawn_claude_cli_with_env(
     if let Some(sender) = crate::claude_runner::reply_sender() {
         cmd.env(duduclaw_core::ENV_REPLY_SENDER, &sender);
     }
+    // RM-124: the WebChat conversation this turn answers (webchat turns only).
+    crate::scheduled_webchat::inject_env(&mut cmd);
 
     // v1.10: Inject wiki RL trust feedback context so the MCP server can
     // forward turn_id / session_id into BusMessage when enqueueing
