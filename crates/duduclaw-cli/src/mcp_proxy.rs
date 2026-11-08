@@ -61,7 +61,7 @@
 //! proxy itself) plus that map — i.e. exactly the environment the upstream
 //! would have received had the Claude CLI launched it directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -208,6 +208,29 @@ const MAX_PENDING_CALLS: usize = 512;
 const PENDING_CALL_TTL: Duration = Duration::from_secs(300);
 const MAX_ACTIVE_CALLS: usize = 512;
 const CORRELATION_PREFIX: &str = "duduclaw-proxy:";
+
+/// Presentation-only correlation, independent of redaction and authorization.
+/// Bound both the number of entries and the stored labels; discard oldest first.
+#[derive(Default)]
+struct ToolNames(VecDeque<(String, String)>);
+
+impl ToolNames {
+    fn record(&mut self, server: &str, frame: &Value) {
+        if frame.get("method").and_then(Value::as_str) != Some("tools/call") { return; }
+        let Some(key) = frame.get("id").and_then(id_key).filter(|k| k.len() <= 258) else { return; };
+        let Some(tool) = frame.pointer("/params/name").and_then(Value::as_str) else { return; };
+        self.0.retain(|(id, _)| id != &key);
+        if self.0.len() >= MAX_PENDING_CALLS { self.0.pop_front(); }
+        self.0.push_back((key, duduclaw_core::truncate_chars(&namespaced_tool(server, tool), 200)));
+    }
+
+    fn take(&mut self, frame: &Value) -> Option<String> {
+        if !is_response(frame) { return None; }
+        let key = frame.get("id").and_then(id_key)?;
+        let index = self.0.iter().position(|(id, _)| id == &key)?;
+        self.0.remove(index).map(|(_, tool)| tool)
+    }
+}
 
 #[derive(Debug)]
 struct PendingContext {
@@ -476,6 +499,9 @@ async fn run_proxy_io_with_identity(
     // forwarded later, from its own task.
     let pending = Arc::new(Mutex::new(PendingCalls::new()));
     let (up_tx, mut up_rx) = mpsc::unbounded_channel::<QueuedFrame>();
+    let tool_names = Arc::new(Mutex::new(ToolNames::default()));
+    let writer_tool_names = tool_names.clone();
+    let writer_server = server.to_string();
     let writer_gate = gate.clone();
     let writer_pending = pending.clone();
     let writer_home = identity_home.clone();
@@ -494,6 +520,9 @@ async fn run_proxy_io_with_identity(
                 if let Some(gate) = &writer_gate { gate.close_pending(); }
                 continue;
             }
+            if let Some(request) = parse_frame(&frame.line) {
+                if let Ok(mut names) = writer_tool_names.lock() { names.record(&writer_server, &request); }
+            }
             if write_queued_frame(&mut upstream_in, &mut frame).await.is_err() {
                 if let Ok(mut pending) = writer_pending.lock() { pending.inner.clear(); }
                 if let Some(gate) = &writer_gate { gate.close_pending(); }
@@ -511,7 +540,9 @@ async fn run_proxy_io_with_identity(
         let layer = layer.clone();
         let gate = gate.clone();
         let list_ids = list_ids.clone();
+        let tool_names = tool_names.clone();
         let tx = tx.clone();
+        let server_label = server.to_string();
         tokio::spawn(async move {
             let mut lines = BufReader::new(upstream_out).lines();
             // `lines()` grows its buffer as needed — no fixed cap, so a large
@@ -526,6 +557,7 @@ async fn run_proxy_io_with_identity(
                     Some(mut frame) => {
                         let mut line = line;
                         let upstream_id = frame.get("id").cloned();
+                        let tool = tool_names.lock().ok().and_then(|mut names| names.take(&frame));
                         let context = if layer.is_some() {
                             match response_context(&pending, &mut frame) {
                                 Ok(context) => context,
@@ -549,7 +581,7 @@ async fn run_proxy_io_with_identity(
                             line = frame.to_string();
                         }
                         let (frame, line) = filter_listing(gate.as_deref(), &list_ids, frame, line);
-                        rewrite_upstream_frame(layer.as_deref(), frame, line, context)
+                        rewrite_upstream_frame(layer.as_deref(), &server_label, frame, line, context, tool.as_deref())
                     }
                 };
                 if tx.send(out).is_err() {
@@ -806,25 +838,64 @@ fn response_context(
     })
 }
 
-/// Redact using the context claimed before observing terminal completion.
+/// Redact using the context claimed before observing terminal completion,
+/// then (RM-130) give an error that carries no text a concrete reason.
+///
+/// Ordering: the caller has already run the gate's accounting
+/// (`observe_response`) on `frame`, and redaction runs here first, so the
+/// injected sentence never changes what either one saw. Its summary of
+/// `structuredContent` uses only redacted string values (never keys or numbers); when redaction is
+/// configured but did not run over the summarised field (no claimed context,
+/// or a JSON-RPC `error`, whose `data` is never redacted) only the error code
+/// is named.
 fn rewrite_upstream_frame(
     layer: Option<&McpRedactionLayer>,
+    server: &str,
     mut frame: Value,
     original: String,
     context: Option<PendingContext>,
+    tool_name: Option<&str>,
 ) -> String {
-    let (Some(layer), Some(entry)) = (layer, context) else { return original; };
-    let Some(result) = frame.get_mut("result") else {
-        return frame.to_string();
+    // A frame with both `result` and `error` is a protocol violation: redaction
+    // covers only `result`, so forwarding either part could leak the other.
+    if duduclaw_core::is_malformed_frame(&frame) {
+        let id = frame.get("id").cloned().unwrap_or(Value::Null);
+        return duduclaw_gateway::third_party_tools::refusal_frame(
+            &id, "上游 MCP 回應格式錯誤（同時含 result 與 error），內容已扣留。",
+        );
+    }
+    let tool = context.as_ref().map(|entry| entry.tool.as_str()).or(tool_name).unwrap_or_default().to_string();
+    let redacted_result = match (layer, context) {
+        (Some(layer), Some(entry)) => match frame.get_mut("result") {
+            Some(result) => {
+                redact_tool_result_with(
+                    &layer.manager,
+                    &entry.tool,
+                    result,
+                    &layer.agent_id,
+                    &layer.session_id,
+                    Some(&entry.args),
+                );
+                true
+            }
+            None => false,
+        },
+        _ => {
+            // Nothing redacted: forward verbatim unless an error lacks a reason.
+            if !duduclaw_core::lacks_error_reason(&frame) {
+                return original;
+            }
+            false
+        }
     };
-    redact_tool_result_with(
-        &layer.manager,
-        &entry.tool,
-        result,
-        &layer.agent_id,
-        &layer.session_id,
-        Some(&entry.args),
-    );
+    let detail = if layer.is_none() {
+        duduclaw_core::ToolErrorDetail::Full
+    } else if redacted_result {
+        duduclaw_core::ToolErrorDetail::StringValues
+    } else {
+        duduclaw_core::ToolErrorDetail::CodeOnly
+    };
+    duduclaw_core::ensure_error_reason_with(&tool, Some(server), &mut frame, detail);
     frame.to_string()
 }
 
@@ -1237,10 +1308,162 @@ mod tests {
         let sent: Value = serde_json::from_str(&first.line).unwrap();
         let mut response = json!({"id":sent["id"], "result":{"rows":[{"name":"王小明"}]}});
         let context = response_context(&pending, &mut response).unwrap();
-        let out = rewrite_upstream_frame(Some(&layer), response, String::new(), context);
+        let out = rewrite_upstream_frame(Some(&layer), "fakepg", response, String::new(), context, None);
         assert!(!out.contains("王小明"), "{out}");
         assert!(out.contains("<REDACT:DB_FIELD:"), "{out}");
         assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["id"], 1);
+    }
+
+    fn reason_text(out: &str) -> String {
+        let v: Value = serde_json::from_str(out).unwrap();
+        v["result"]["content"].as_array().unwrap().iter()
+            .filter_map(|b| b["text"].as_str()).collect()
+    }
+
+    #[test]
+    fn rm130_tool_names_are_bounded_and_evict_oldest() {
+        let mut names = ToolNames::default();
+        for id in 0..=MAX_PENDING_CALLS {
+            names.record("fakepg", &json!({"id":id,"method":"tools/call","params":{"name":"x".repeat(1000)}}));
+        }
+        assert_eq!(names.0.len(), MAX_PENDING_CALLS);
+        assert!(names.take(&json!({"id":0,"result":{}})).is_none());
+        assert_eq!(names.take(&json!({"id":1,"result":{}})).unwrap().chars().count(), 200);
+        assert!(names.take(&json!({"id":1,"result":{}})).is_none());
+        names.record("fakepg", &json!({"id":900,"method":"initialize"}));
+        assert!(names.take(&json!({"id":900,"error":{}})).is_none());
+    }
+
+    #[tokio::test]
+    async fn rm130_without_redaction_names_tool_and_generic_requests() {
+        for method in ["tools/call", "initialize", "resources/read"] {
+            let call = json!({"id":2,"method":method,"params":{"name":"pg_select","arguments":{}}}).to_string();
+            let canned = json!({"error":{"code":-1,"message":""}});
+            let (_, replies) = drive("fakepg", None, vec![call], Some(canned)).await;
+            let reply: Value = serde_json::from_str(&replies[0]).unwrap();
+            let text = reply["error"]["message"].as_str().unwrap();
+            assert!(text.starts_with("Tool call failed and returned no error message."), "{text}");
+            assert_eq!(text.contains("Tool: fakepg.pg_select."), method == "tools/call", "{text}");
+        }
+    }
+
+    #[test]
+    fn rm130_active_layer_summary_excludes_keys_and_numbers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = layer_for(tmp.path());
+        let frame = json!({"id":1,"result":{"isError":true,"content":[],"structuredContent":{"王小明":{"phone":912345678}}}});
+        let context = PendingContext { tool:"fakepg.pg_select".into(), args:json!({}), generation:String::new(), deadline:Instant::now() };
+        let out = rewrite_upstream_frame(Some(&layer), "fakepg", frame, String::new(), Some(context), None);
+        let text = reason_text(&out);
+        assert!(!text.contains("王小明") && !text.contains("912345678"), "{text}");
+    }
+
+    #[test]
+    fn rm130_frame_with_result_and_error_is_replaced_never_forwarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = layer_for(tmp.path());
+        let frame = json!({"jsonrpc":"2.0","id":9,
+            "result":{"content":[{"type":"text","text":"ok"}]},
+            "error":{"code":-1,"message":"","data":"LEAKED-SECRET"}});
+        for layer in [Some(&layer), None] {
+            let context = layer.map(|_| PendingContext { tool:"fakepg.pg_select".into(), args:json!({}), generation:String::new(), deadline:Instant::now() });
+            let out = rewrite_upstream_frame(layer.map(|l| &**l), "fakepg", frame.clone(), frame.to_string(), context, None);
+            assert!(!out.contains("LEAKED-SECRET") && !out.contains("\"ok\""), "{out}");
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["id"], 9);
+            assert!(v.get("error").is_some() && v.get("result").is_none(), "{out}");
+        }
+    }
+
+    #[test]
+    fn rm130_empty_is_error_without_layer_gets_reason_others_verbatim() {
+        let empty = json!({"jsonrpc":"2.0","id":4,"result":{"isError":true,"content":[],"structuredContent":{"status":503}}});
+        let out = rewrite_upstream_frame(None, "fakepg", empty.clone(), empty.to_string(), None, None);
+        let text = reason_text(&out);
+        assert!(text.contains("failed and returned no error message. Server: fakepg."), "{text}");
+        assert!(text.contains("\"status\":503"), "{text}");
+        // A non-empty error and a success are forwarded byte-for-byte.
+        for frame in [
+            json!({"id":5,"result":{"isError":true,"content":[{"type":"text","text":"boom"}]}}),
+            json!({"id":6,"result":{"content":[]}}),
+            json!({"id":7,"error":{"code":-1,"message":"kept"}}),
+        ] {
+            let original = format!("{frame} ");
+            assert_eq!(rewrite_upstream_frame(None, "fakepg", frame, original.clone(), None, None), original);
+        }
+    }
+
+    #[test]
+    fn rm130_jsonrpc_error_with_empty_message_gets_reason() {
+        let frame = json!({"jsonrpc":"2.0","id":8,"error":{"code":-32000,"message":"","data":"quota exceeded"}});
+        let out: Value = serde_json::from_str(
+            &rewrite_upstream_frame(None, "fakepg", frame.clone(), frame.to_string(), None, None),
+        ).unwrap();
+        let msg = out["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("Server: fakepg.") && msg.contains("-32000") && msg.contains("quota exceeded"), "{msg}");
+        assert!(msg.contains("<untrusted_error_detail>"), "{msg}");
+
+        // With a redaction layer configured, `error.data` is never redacted,
+        // so it is never summarised — only the code is named.
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = layer_for(tmp.path());
+        let frame = json!({"jsonrpc":"2.0","id":8,"error":{"code":-32000,"data":{"name":"王小明"}}});
+        let out: Value = serde_json::from_str(
+            &rewrite_upstream_frame(Some(&layer), "fakepg", frame.clone(), frame.to_string(), None, None),
+        ).unwrap();
+        let msg = out["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("-32000") && !msg.contains("王小明"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn rm130_reason_summary_passes_through_redaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = RedactionConfig::default();
+        cfg.enabled = true;
+        cfg.profiles = vec!["general".to_string()];
+        cfg.rules.insert(
+            "pg_structured".to_string(),
+            RuleSpec {
+                id: "pg_structured".into(),
+                category: "DB_FIELD".into(),
+                restore_scope: RestoreScope::Owner,
+                priority: 70,
+                cross_session_stable: false,
+                apply_to_system_prompt: false,
+                enabled: true,
+                kind: RuleKind::JsonPath {
+                    paths: vec!["$.structuredContent.rows[*].name".into()],
+                    match_tool: Some("fakepg.pg_select".into()),
+                    match_args: Default::default(),
+                    match_result: Default::default(),
+                    exclude_keys: Vec::new(),
+                },
+            },
+        );
+        let layer = Arc::new(McpRedactionLayer {
+            manager: Arc::new(RedactionManager::open(cfg, ManagerPaths::under_home(tmp.path())).unwrap()),
+            agent_id: "agnes".to_string(),
+            session_id: "s1".to_string(),
+        });
+        let pending = Arc::new(Mutex::new(PendingCalls::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let call = json!({"id":1, "method":"tools/call", "params":{"name":"pg_select", "arguments":{}}});
+        let prepared = prepare_upstream("fakepg", Some(&layer), &pending, &tx, &call, &call.to_string()).await.unwrap();
+        let sent: Value = serde_json::from_str(&prepared.line).unwrap();
+        let mut response = json!({"id":sent["id"], "result":{
+            "isError":true, "content":[], "structuredContent":{"rows":[{"name":"王小明"}]}}});
+        let context = response_context(&pending, &mut response).unwrap();
+        let out = rewrite_upstream_frame(Some(&layer), "fakepg", response, String::new(), context, None);
+        let text = reason_text(&out);
+        assert!(text.contains("Tool call failed and returned no error message. Tool: fakepg.pg_select."), "{text}");
+        assert!(!out.contains("王小明"), "{out}");
+        // The redacted value appears only inside the untrusted block, with
+        // angle brackets escaped so the placeholder cannot forge markup.
+        let (prose, rest) = text.split_once("<untrusted_error_detail>").expect("untrusted block");
+        let (detail, _) = rest.split_once("</untrusted_error_detail>").expect("closed block");
+        assert!(!prose.contains("REDACT"), "detail must not leak into host prose: {text}");
+        assert!(detail.contains("&lt;REDACT:DB_FIELD:"), "summary is the escaped redacted value: {text}");
+        assert!(!detail.contains("<REDACT"), "{text}");
     }
 
     #[test]

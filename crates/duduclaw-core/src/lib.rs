@@ -73,6 +73,8 @@ pub mod team_gate;
 pub mod text_utils;
 pub mod tool_catalog;
 pub mod tool_effect;
+// RM-130: a tool failure always carries a concrete reason.
+pub mod tool_error_reason;
 pub mod mcp_proxy_rewrite;
 pub mod toml_merge;
 pub mod traits;
@@ -177,6 +179,11 @@ pub use takeover_state::{
 };
 pub use text_utils::{truncate_bytes, truncate_chars};
 pub use tool_catalog::{builtin_tool_catalog, ToolCatalogEntry};
+pub use tool_error_reason::{
+    ensure_error_reason, ensure_error_reason_with, is_malformed_frame, lacks_error_reason,
+    missing_error_reason,
+    ErrorDetail as ToolErrorDetail,
+};
 pub use tool_effect::{
     effect_from_annotations, effect_of, effect_of_builtin, effect_of_cli_builtin,
     third_party_tool_ref, ActionRule, CLAUDE_CLI_BUILTIN_TOOLS,
