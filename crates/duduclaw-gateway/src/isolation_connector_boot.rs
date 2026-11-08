@@ -9,7 +9,7 @@
 //! exist. A provider with no route for the employee is installed as an
 //! explicit refusing adapter, so the registry stays complete while every call
 //! for that provider refuses before any credential is touched.
-use std::{collections::{BTreeMap, BTreeSet}, future::Future, path::{Path, PathBuf}, pin::Pin, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, future::Future, path::{Path, PathBuf}, pin::Pin, sync::{Arc, OnceLock}};
 use duduclaw_isolation::{capability::EmployeeBinding, ids::EmployeeId};
 use duduclaw_mcp_boundary::{bindings::BindingAuthority, tool_policy::{AuthorizedToolCall, POLICIES, Route as ToolRoute},
     RequestContext, VerificationError};
@@ -129,8 +129,9 @@ impl InstalledConnectorProviders {
 
 /// Builds one employee's immutable connector providers.
 pub trait ConnectorProviderFactory: Send + Sync {
-    /// Static readiness: every connector tool has a builder and every injected
-    /// executor covers its provider's tools. `build` repeats this first.
+    /// Static readiness: every connector tool has a builder or an explicit
+    /// refusing adapter, and each available executor covers its provider.
+    /// `build` repeats this first.
     fn inventory(&self) -> Result<(), VerificationError>;
     /// `binding` must be the employee's lifecycle binding (never an argument
     /// or capability field). Account lists come only from `catalog`'s active
@@ -310,14 +311,55 @@ impl SearchProviderSource for crate::isolation_execution::InstalledWorkerService
 /// CLI-owned Odoo business executor (D3). It is bound to the per-employee
 /// gateway provider it is given and must use only that provider.
 pub trait OdooExecutorFactory: Send + Sync {
+    /// Missing host integration leaves this provider as a refusing adapter.
+    fn available(&self) -> bool { true }
     /// Declared coverage, checked by `inventory` before any build.
     fn supports(&self, tool: &str) -> bool;
     fn executor(&self, provider: Arc<OdooConnectorProvider>) -> Result<Arc<dyn BoundConnectorExecutor>, VerificationError>;
 }
 /// CLI-owned channel executor (D3), bound to the given per-employee provider.
 pub trait ChannelExecutorFactory: Send + Sync {
+    fn available(&self) -> bool { true }
     fn supports(&self, tool: &str) -> bool;
     fn executor(&self, provider: Arc<ChannelConnectorProvider>) -> Result<Arc<dyn BoundConnectorExecutor>, VerificationError>;
+}
+
+/// CLI-owned factories only; account and employee selection stays in the gateway.
+#[derive(Clone)]
+pub struct ConnectorExecutorFactories {
+    pub odoo: Arc<dyn OdooExecutorFactory>,
+    pub channel: Arc<dyn ChannelExecutorFactory>,
+}
+static EXECUTOR_FACTORIES: OnceLock<ConnectorExecutorFactories> = OnceLock::new();
+
+/// Install once before gateway startup. Never replace factories of a live epoch.
+pub fn install_connector_executor_factories(factories: ConnectorExecutorFactories) -> Result<(), VerificationError> {
+    EXECUTOR_FACTORIES.set(factories).map_err(|_| VerificationError::Unavailable)
+}
+/// F1 supplies these factories to `GatewayConnectorFactoryParts`. Missing CLI
+/// integration preserves a complete registry with refusing Odoo/channel adapters.
+pub fn connector_executor_factories() -> ConnectorExecutorFactories {
+    executor_factories_from(&EXECUTOR_FACTORIES)
+}
+fn executor_factories_from(slot: &OnceLock<ConnectorExecutorFactories>) -> ConnectorExecutorFactories {
+    slot.get().cloned().unwrap_or_else(|| ConnectorExecutorFactories {
+        odoo: Arc::new(MissingExecutorFactory), channel: Arc::new(MissingExecutorFactory),
+    })
+}
+struct MissingExecutorFactory;
+impl OdooExecutorFactory for MissingExecutorFactory {
+    fn available(&self) -> bool { false }
+    fn supports(&self, _: &str) -> bool { false }
+    fn executor(&self, _: Arc<OdooConnectorProvider>) -> Result<Arc<dyn BoundConnectorExecutor>, VerificationError> {
+        Err(VerificationError::Unavailable)
+    }
+}
+impl ChannelExecutorFactory for MissingExecutorFactory {
+    fn available(&self) -> bool { false }
+    fn supports(&self, _: &str) -> bool { false }
+    fn executor(&self, _: Arc<ChannelConnectorProvider>) -> Result<Arc<dyn BoundConnectorExecutor>, VerificationError> {
+        Err(VerificationError::Unavailable)
+    }
 }
 
 /// Everything the gateway factory needs that is not an account. All fields
@@ -362,9 +404,11 @@ impl ConnectorProviderFactory for GatewayConnectorFactory {
             return Err(VerificationError::Unavailable);
         }
         for tool in connector_tools() {
+            // Absent CLI integration builds only the refusing adapter below.
+            // An available but incomplete factory must still fail inventory.
             let covered = match provider_for_tool(tool) {
-                Some("odoo") => self.parts.odoo_executors.supports(tool),
-                Some("channel") => self.parts.channel_executors.supports(tool),
+                Some("odoo") => !self.parts.odoo_executors.available() || self.parts.odoo_executors.supports(tool),
+                Some("channel") => !self.parts.channel_executors.available() || self.parts.channel_executors.supports(tool),
                 _ => true,
             };
             if !covered { return Err(VerificationError::Unavailable); }
@@ -428,7 +472,7 @@ impl ConnectorProviderFactory for GatewayConnectorFactory {
         };
 
         let mut channels = Vec::new();
-        for account in plan.accounts("channel") {
+        for account in plan.accounts("channel").iter().filter(|_| parts.channel_executors.available()) {
             let ConnectorAccountDetail::Channel { channel, scope, status_label, token, extra_id } = self.detail(account)?
                 else { return Err(VerificationError::Invalid) };
             channels.push(ChannelAccount::new(account.product(), channel, scope, status_label, token, extra_id)?);
@@ -439,7 +483,7 @@ impl ConnectorProviderFactory for GatewayConnectorFactory {
             Some((provider, executor))
         };
 
-        let odoo = match plan.single("odoo")? {
+        let odoo = match if parts.odoo_executors.available() { plan.single("odoo")? } else { None } {
             Some(account) => {
                 let provider = Arc::new(OdooConnectorProvider::new(home_dir.clone(), name.clone(), employee, account.product())?);
                 let executor = parts.odoo_executors.executor(provider.clone())?;
@@ -714,6 +758,30 @@ mod tests {
         assert_eq!(routes.offered(installed.registry().candidates(&ctx, "db_sources", "database").unwrap()),
             vec!["company_db", "home_db"]);
         assert_eq!(installed.registry().candidates(&ctx, "model_search", "model").err(), Some(VerificationError::Unavailable));
+    }
+
+    #[test]
+    fn missing_factory_refuses() {
+        // Use a local empty slot so this test cannot depend on process-global boot order.
+        let missing = executor_factories_from(&OnceLock::new());
+        assert!(!missing.odoo.available() && !missing.channel.available());
+        let routes = Routes::new(&[
+            ("alice_odoo", "odoo", ConnectorKind::Personal, alice()),
+            ("alice_channel", "channel", ConnectorKind::Personal, alice()),
+        ]);
+        let mut s = setup(Details::new(vec![(routes.ids["alice_db"].clone(), db("demo")),
+            (routes.ids["home_db"].clone(), db("demo2"))]),
+            Executors::new("odoo", None), Executors::new("channel", None));
+        s.factory.parts.odoo_executors = missing.odoo;
+        s.factory.parts.channel_executors = missing.channel;
+        let installed = s.factory.build(s.home.path(), AGENT, EMPLOYEE, &alice(), routes.catalog,
+            empty_bindings()).unwrap();
+        let ctx = context(alice(), Principal::Human { user_id: text("alice"), generation: 1 });
+        for (tool, provider) in [("odoo_status", "odoo"), ("channel_status", "channel")] {
+            assert_eq!(installed.registry().candidates(&ctx, tool, provider).err(), Some(VerificationError::Unavailable));
+        }
+        assert_eq!(installed.verify_identity(s.home.path(), AGENT, EMPLOYEE), Ok(()));
+        assert_eq!(s.details.asked.lock().unwrap().len(), 2, "missing channel factory never reads channel credentials");
     }
 
     #[test]

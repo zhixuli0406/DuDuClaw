@@ -6,12 +6,15 @@ use duduclaw_mcp_boundary::{tool_policy::AuthorizedToolCall,VerificationError};
 use serde_json::Value;
 
 pub struct ChannelBoundExecutor { provider: Arc<ChannelConnectorProvider> }
-impl ChannelBoundExecutor { pub fn new(provider: Arc<ChannelConnectorProvider>) -> Self { Self { provider } } }
+impl ChannelBoundExecutor {
+    pub fn new(provider: Arc<ChannelConnectorProvider>) -> Self { Self { provider } }
+}
 impl BoundConnectorExecutor for ChannelBoundExecutor {
     fn supports(&self, tool: &str) -> bool { CHANNEL_TOOLS.contains(&tool) }
     fn execute<'a>(&'a self, selected: SelectedConnector, call: AuthorizedToolCall)
         -> Pin<Box<dyn Future<Output=Result<Value,VerificationError>>+Send+'a>> {
         Box::pin(async move {
+            if !self.supports(call.name()) { return Err(VerificationError::Unavailable); }
             self.provider.prepare(&selected,&call)?;
             if call.name() != "group_history_read" { return self.provider.execute(selected,call).await; }
             let selected = Arc::new(selected);
