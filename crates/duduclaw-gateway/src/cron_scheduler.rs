@@ -1919,7 +1919,7 @@ mod tests {
     #[tokio::test]
     async fn cron_webchat_delivery_appends_to_the_origin_conversation() {
         let f = crate::scheduled_webchat::tests::fixture("agnes").await;
-        let task = webchat_task("agnes", &f.session);
+        let task = webchat_task("agnes", &f.target);
         deliver_cron_result(f.home.path(), &task, "今天沒有待辦").await.unwrap();
         assert_eq!(
             crate::scheduled_webchat::tests::messages(&f).await,
@@ -1941,17 +1941,17 @@ mod tests {
         let h = f.home.path();
         let db = duduclaw_auth::UserDb::new(&h.join("users.db")).unwrap();
         db.unbind_agent(&f.user, "agnes").unwrap();
-        assert!(deliver_cron_result(h, &webchat_task("agnes", &f.session), "secret").await.is_err());
+        assert!(deliver_cron_result(h, &webchat_task("agnes", &f.target), "secret").await.is_err());
         db.bind_agent(&f.user, "agnes", duduclaw_auth::AccessLevel::Operator).unwrap();
         db.set_user_status(&f.user, duduclaw_auth::UserStatus::Suspended).unwrap();
-        assert!(deliver_cron_result(h, &webchat_task("agnes", &f.session), "secret").await.is_err());
+        assert!(deliver_cron_result(h, &webchat_task("agnes", &f.target), "secret").await.is_err());
         db.set_user_status(&f.user, duduclaw_auth::UserStatus::Active).unwrap();
         // A row re-pointed at another employee's schedule is dropped too.
-        assert!(deliver_cron_result(h, &webchat_task("bob", &f.session), "secret").await.is_err());
+        assert!(deliver_cron_result(h, &webchat_task("bob", &f.target), "secret").await.is_err());
         // Permanently deleted conversation; delete_session only archives.
         let manager = crate::session::SessionManager::new(&h.join("sessions.db")).unwrap();
         manager.purge_session(&f.session).await.unwrap();
-        assert!(deliver_cron_result(h, &webchat_task("agnes", &f.session), "secret").await.is_err());
+        assert!(deliver_cron_result(h, &webchat_task("agnes", &f.target), "secret").await.is_err());
         assert!(crate::scheduled_webchat::tests::messages(&f).await.is_empty());
         let audit = std::fs::read_to_string(h.join("tool_calls.jsonl")).unwrap();
         assert!(audit.contains("webchat_owner_check_failed"));
@@ -1962,7 +1962,7 @@ mod tests {
         let f = crate::scheduled_webchat::tests::fixture("agnes").await;
         let manager = crate::session::SessionManager::new(&f.home.path().join("sessions.db")).unwrap();
         manager.delete_session(&f.session).await.unwrap();
-        deliver_cron_result(f.home.path(), &webchat_task("agnes", &f.session), "今天沒有待辦")
+        deliver_cron_result(f.home.path(), &webchat_task("agnes", &f.target), "今天沒有待辦")
             .await.unwrap();
         assert_eq!(
             crate::scheduled_webchat::tests::messages(&f).await,

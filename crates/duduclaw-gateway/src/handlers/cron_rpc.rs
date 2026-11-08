@@ -87,6 +87,9 @@ impl MethodHandler {
             Some(n) if !n.is_empty() => n.to_string(),
             _ => return WsFrame::error_response("", "Missing 'name' parameter"),
         };
+        if let Err(message) = crate::scheduled_webchat::check_name(&name) {
+            return WsFrame::error_response("", &message);
+        }
         // Accept both `cron` (new) and `schedule` (legacy) from the dashboard.
         let cron_expr = params
             .get("cron")
@@ -279,6 +282,14 @@ impl MethodHandler {
             Err(e) => return WsFrame::error_response("", &format!("lookup: {e}")),
         };
 
+        // A rename must respect the name cap; echoing a legacy name unchanged passes.
+        if let Some(n) = params.get("name").and_then(|v| v.as_str()) {
+            if n != existing.name {
+                if let Err(message) = crate::scheduled_webchat::check_name(n) {
+                    return WsFrame::error_response("", &message);
+                }
+            }
+        }
         let name = params
             .get("name")
             .and_then(|v| v.as_str())

@@ -41,6 +41,9 @@ pub(crate) async fn handle_schedule_task_for_actor(
             "isError": true
         });
     }
+    if let Err(message) = duduclaw_gateway::scheduled_webchat::check_name(name) {
+        return tool_error(&message);
+    }
 
     // Validate cron expression before persisting — through the shared
     // normaliser so validation reads day-of-week exactly like the scheduler.
@@ -606,6 +609,13 @@ pub(crate) async fn handle_update_cron_task(
         .and_then(|v| v.as_str())
         .unwrap_or(&existing.task);
 
+    // A rename must respect the name cap; an unchanged (legacy) name passes.
+    if new_name != existing.name {
+        if let Err(message) = duduclaw_gateway::scheduled_webchat::check_name(new_name) {
+            return tool_error(&message);
+        }
+    }
+
     // Validate cron expression if changed — same shared normaliser as the
     // scheduler and creation path.
     if new_cron.len() > duduclaw_gateway::cron_store::MAX_CRON_BYTES {
@@ -730,7 +740,9 @@ mod origin_target_tests {
         let target = resolve_notify_target(&serde_json::json!({}), home.path(), Some("sales"), "sales", Some(&session))
             .unwrap();
         assert_eq!(target.channel.as_deref(), Some("webchat"));
-        assert_eq!(target.chat.as_deref(), Some(session.as_str()));
+        // The stored target is the session id stamped with its creation time.
+        let chat = target.chat.as_deref().unwrap();
+        assert!(chat.starts_with(session.as_str()) && chat.len() > session.len());
         assert_eq!(target.thread, None);
         assert_eq!(target.delivery(), Delivery::OriginWebchat);
         assert!(delivery_receipt_suffix(Delivery::OriginWebchat).contains("WebChat 對話"));
@@ -741,6 +753,17 @@ mod origin_target_tests {
         ).unwrap();
         assert_eq!((named.channel.as_deref(), named.chat.as_deref()), (Some("line"), Some("U1")));
         assert_eq!(named.delivery(), Delivery::Channel);
+    }
+
+    #[tokio::test]
+    async fn schedule_names_over_the_cap_are_rejected_on_create_and_rename() {
+        let home = tempfile::tempdir().unwrap();
+        let long = "n".repeat(duduclaw_gateway::scheduled_webchat::MAX_NAME_CHARS + 1);
+        let created = handle_schedule_task(
+            &serde_json::json!({"cron":"0 9 * * *","task":"t","name":long}), home.path(), "sales",
+        ).await;
+        assert_eq!(created["isError"], true);
+        assert!(created["content"][0]["text"].as_str().unwrap().contains("too long"));
     }
 
     #[tokio::test]

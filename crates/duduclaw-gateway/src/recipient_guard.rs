@@ -348,16 +348,16 @@ recipient_guard = "ask"
         std::fs::create_dir_all(h.join("agents/sales")).unwrap();
         std::fs::write(h.join("config.toml"), "[security]\nrecipient_guard='ask'\n").unwrap();
         std::fs::write(h.join("agents/sales/agent.toml"), "[capabilities]\nrecipients=[]\n").unwrap();
-        admit_scheduled_session(h, "sales", &f.session).await.unwrap();
+        admit_scheduled_session(h, "sales", &f.target).await.unwrap();
         assert!(!h.join("approvals.db").exists(), "no approval card for the user's own conversation");
-        assert!(admit_scheduled_session(h, "hr", &f.session).await.is_err());
+        assert!(admit_scheduled_session(h, "hr", &f.target).await.is_err());
         assert!(admit_scheduled_session(h, "sales", "webchat:webchat:000000000000:x").await.is_err());
         let db = UserDb::new(&h.join("users.db")).unwrap();
         db.unbind_agent(&f.user, "sales").unwrap();
-        assert!(admit_scheduled_session(h, "sales", &f.session).await.is_err());
+        assert!(admit_scheduled_session(h, "sales", &f.target).await.is_err());
         db.bind_agent(&f.user, "sales", AccessLevel::Operator).unwrap();
         db.set_user_status(&f.user, UserStatus::Suspended).unwrap();
-        assert!(admit_scheduled_session(h, "sales", &f.session).await.is_err());
+        assert!(admit_scheduled_session(h, "sales", &f.target).await.is_err());
         // The external-recipient path still never accepts a webchat address.
         assert_eq!(duduclaw_core::recipient_policy::channel_recipient("webchat", &f.session), None);
     }

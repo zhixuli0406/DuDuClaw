@@ -1097,6 +1097,22 @@ pub async fn cancel_reminder(
     .map_err(|e| format!("spawn_blocking: {e}"))?
 }
 
+/// Cancel every Pending reminder matching `pred` (RM-124: reminders aimed at
+/// a purged WebChat conversation).
+pub(crate) async fn cancel_pending_where(
+    home_dir: &Path,
+    pred: impl Fn(&Reminder) -> bool + Send + 'static,
+) -> Result<(), String> {
+    mutate_reminders(home_dir, move |reminders| {
+        for r in reminders.iter_mut() {
+            if r.status == ReminderStatus::Pending && pred(r) {
+                r.status = ReminderStatus::Cancelled;
+            }
+        }
+    })
+    .await
+}
+
 /// Dashboard reads fail closed on corrupt or unreadable persistence.
 pub(crate) async fn dashboard_reminders(home: &Path, ctx: &duduclaw_auth::UserContext, cancel: Option<&str>) -> Result<Vec<Reminder>, String> {
     let home = home.to_path_buf();

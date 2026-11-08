@@ -863,6 +863,15 @@ impl SessionManager {
             .map_err(|e| DuDuClawError::Gateway(format!("commit transaction: {e}")))?;
 
         info!(session_id, "Session purged (hard delete)");
+        drop(conn);
+        // RM-124: schedules / reminders that report into this WebChat
+        // conversation die with it (delivery is independently refused for a
+        // recreated conversation with the same id).
+        if session_id.starts_with("webchat:") {
+            if let Some(home) = self.db_path.parent() {
+                crate::scheduled_webchat::cancel_for_session(home, session_id).await;
+            }
+        }
         Ok(())
     }
 
