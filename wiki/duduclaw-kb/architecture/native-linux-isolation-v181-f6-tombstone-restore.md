@@ -583,3 +583,5 @@ in v1.81). Open:
   (A) keep never-recycle; (B) recycle after 30 days behind the existing `no_existing_file_owner` scan.
   Recommendation: A. 30 000 UIDs and 4 096 journal entries are a lifetime budget per host either way
   (the journal limit binds first); pruning `Retired` entries is a later item if a host ever nears it.
+
+**Owner decision 2026-11-08 (N4):** UIDs are never recycled after retire (option A). Retire frees storage, units and the label; the UID number stays burned. The 4096-entry allocation journal remains the per-host lifetime cap (track as a follow-up: journal compaction for retired entries).
