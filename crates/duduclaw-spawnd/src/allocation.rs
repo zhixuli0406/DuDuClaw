@@ -47,6 +47,11 @@ impl Allocator {
         })();
         if result.is_err(){self.poisoned=true;}result.map_err(|_|unavailable())
     }
+    /// H4: employees whose journal entry is `Ready` and not disabled (the
+    /// allocations an anchor backfill and the `WorkAnchor` op may serve).
+    pub fn ready_employees(&self)->Vec<EmployeeId>{
+        self.journal.entries.iter().filter(|e|e.phase==Phase::Ready && !e.receipt.disabled).map(|e|e.receipt.employee).collect()
+    }
     pub fn handle(&mut self,request:&Request,registry:&mut RegistryStore,accounts:&mut dyn AccountHost,storage:&mut dyn Storage)->Result<Receipt>{
         if self.poisoned{return Err(unavailable())}
         let spec=request.validate().map_err(|_|ErrorCode::InvalidRequest)?;

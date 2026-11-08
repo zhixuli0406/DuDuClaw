@@ -2,13 +2,14 @@
 //! an alternate executor. All slow operations run off the control socket thread.
 use std::{collections::{BTreeMap, BTreeSet}, io, os::fd::{AsFd, OwnedFd}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use duduclaw_isolation::{execution::{RunHandle, RuntimeKind, PtySize, NetworkPolicy}, ids::{EmployeeId, RunId, RequestId}, ipc::{CleanupReadback, ErrorCode, SpawnRequest}};
-use crate::{Result, admission::{Host, HostProgress, LaunchPolicy}, accounts::{self, InstallationEvidence, LinuxAccounts},
-    audit::{Event, Record, disk::AuditWorker}, bootstrap::{BootstrapPlan, Trampoline},
+use crate::{Result, admission::{BrokerJob, BrokerReply, BrokerStep, Host, HostProgress, LaunchPolicy, Ticket},
+    accounts::{self, InstallationEvidence, LinuxAccounts},
+    audit::{Detail, Event, Record, disk::AuditWorker}, bootstrap::{BootstrapPlan, Trampoline},
     channels::{OutputRelay, RevocablePair, ConnectionRevoker}, fds::SnapshotAuthority,
     host_state::{RunJournal, RunRecord}, host_worker::{WorkerHost, Scan}, policy::RootPolicy,
     readiness::Readiness, registry::{AccountHost, RegistryStore, EmployeeAccount},
     storage::{Storage, Attachment, UnavailableStorage}, systemd::{UnitPolicy, linux::{Systemd, StartedUnit}}};
-pub use crate::host_state::{EvidenceReport, READINESS_PATH};
+pub use crate::host_state::{EvidenceReport, SpawndFeatures, READINESS_PATH};
 fn unavailable() -> ErrorCode { ErrorCode::IsolationUnavailable }
 fn os<T>(r: io::Result<T>) -> Result<T> { r.map_err(|_| unavailable()) }
 
@@ -257,8 +258,31 @@ fn proc_cgroup(path: &std::path::Path) -> Result<String> {
     Ok(format!("/{text}"))
 }
 fn emit(audit: &AuditWorker, event: Event, employee: Option<EmployeeId>, run: Option<RunId>) {
+    emit_detail(audit, event, employee, run, None);
+}
+fn emit_detail(audit: &AuditWorker, event: Event, employee: Option<EmployeeId>, run: Option<RunId>, detail: Option<Detail>) {
     let at_unix_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-    let _ = audit.emit(1, Record { at_unix_ms, event, employee, run, suppressed: 0 });
+    let _ = audit.emit(1, Record { at_unix_ms, event, employee, run, suppressed: 0, detail });
+}
+/// A root run record as `idle_report` sees it.
+struct KnownRun { run: RunId, employee: EmployeeId, open: bool }
+/// H4 `EmployeeIdle` counts from already-read root sources (pure, so the
+/// rules are testable without root): open root runs and crash-journal records
+/// of the employee (by id or uid), its durable leases, the uid/gid process
+/// count, and every `duduclaw-run-*` unit that maps to it or to nobody.
+fn idle_report(employee: EmployeeId, uid: u32, known: &[KnownRun], journal: &[RunRecord], attachments: &[Attachment],
+    processes: usize, units: &[RunId]) -> duduclaw_isolation::ipc::EmployeeIdleReport {
+    let count = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+    let mut runs: BTreeSet<RunId> = known.iter().filter(|r| r.employee == employee && r.open).map(|r| r.run).collect();
+    runs.extend(journal.iter().filter(|r| r.employee == employee || r.uid == uid).map(|r| r.run));
+    let leases = attachments.iter().filter(|a| a.employee == employee).count();
+    let units = units.iter().filter(|unit| {
+        let owner = known.iter().find(|r| r.run == **unit).map(|r| r.employee)
+            .or_else(|| journal.iter().find(|r| r.run == **unit).map(|r| r.employee));
+        owner.is_none_or(|owner| owner == employee)
+    }).count();
+    duduclaw_isolation::ipc::EmployeeIdleReport { runs: count(runs.len()), attachments: count(leases),
+        processes: count(processes), units: count(units) }
 }
 struct LiveRun {
     employee: EmployeeId, unit: Option<StartedUnit>, attachment: Option<Attachment>,
@@ -266,6 +290,10 @@ struct LiveRun {
     relays: Vec<OutputRelay>, egress: bool, pty: bool, pty_taken: bool, closed: bool, started_event: bool, truncated_event: bool,
     runtime_deadline: Instant, bootstrap_attempted: bool,
     projection: Option<crate::bootstrap_mounts::RootPublicationAnchors>,
+    /// H4: root-held RO detached clone of the whole work tree (taken before
+    /// `select_workspace`) and the pins of in-flight snapshot copies; released
+    /// (and drained) before any `Storage::detach` of this run.
+    broker: crate::work_broker::BrokerRoot,
 }
 /// The core owns every privileged side effect. WorkerHost supplies bounded
 /// mailboxes and the independent UID monitor supplies live fail-closed fencing.
@@ -297,6 +325,8 @@ impl LinuxHost {
         // Cleanup is attempted even when C/H/F/G are absent. Failure is evidence,
         // never permission to skip an orphan or reinterpret a stale reservation.
         core.report.checks.startup_reconciled = core.reconcile().is_ok();
+        // H4: anchors for allocations made before H3 (idempotent, audited).
+        core.backfill_anchors();
         let snapshots = core.components.publication.snapshot_authority(gateway.0)
             .unwrap_or(SnapshotAuthority { gateway_uid: gateway.0, mount_id: 0 });
         let host_ptys = crate::systemd::linux::host_pty_budget().unwrap_or(0);
@@ -388,6 +418,69 @@ impl Core {
         self.last_refresh = Instant::now();
     }
     fn account(&self, employee: EmployeeId) -> Result<EmployeeAccount> { os(self.registry.registry().lookup(employee)).cloned() }
+    /// H4 upgrade step (H3 open item 1): employees allocated before H3 have
+    /// no anchor. Create the missing ones for every allocation Ready in both
+    /// the journal and the registry; idempotent, never repairs; audited.
+    fn backfill_anchors(&mut self) {
+        let ready: BTreeSet<EmployeeId> = self.allocator.ready_employees().into_iter().collect();
+        let employees: Vec<EmployeeId> = self.registry.registry().employees.iter()
+            .filter(|a| a.state == crate::registry::AccountState::Ready && ready.contains(&a.employee))
+            .map(|a| a.employee).collect();
+        for (employee, outcome) in crate::work_anchor::backfill(self.components.storage.as_mut(), &employees) {
+            match outcome {
+                crate::work_anchor::Backfilled::Present => {}
+                crate::work_anchor::Backfilled::Created => emit(&self.audit, Event::WorkAnchorBackfilled, Some(employee), None),
+                crate::work_anchor::Backfilled::Failed(code) => emit_detail(&self.audit, Event::WorkAnchorBackfillFailed,
+                    Some(employee), None, Some(Detail::Code { code })),
+            }
+        }
+    }
+    /// H4 OpenWorkFile, lifecycle-thread half: path, liveness and lease in
+    /// this worker turn, from root state only; the copy is deferred.
+    fn broker_open(&mut self, run: RunHandle, employee: EmployeeId, path: duduclaw_isolation::ipc::WorkPath) -> Result<BrokerStep> {
+        use crate::work_broker::{check_work_path, copy_snapshot, verify_lease, LiveRunView};
+        check_work_path(path.as_str()).map_err(|refusal| refusal.code())?;
+        let account = self.account(employee).map_err(|_| ErrorCode::WorkspaceBrokerUnavailable)?;
+        let entry = self.runs.get(&run.0).ok_or(ErrorCode::NotFound)?;
+        // The same fence the trampoline and the UID monitor use; raised on
+        // revoke/kill/cancel/intrusion, so a draining run is never Running here.
+        let cancelled = self.monitor.cancellation(run).map_err(|_| ErrorCode::NotReady)?;
+        let running = !entry.closed && entry.started_event && entry.unit.is_some() && !cancelled.load(Ordering::Acquire);
+        let view = LiveRunView { run, employee: entry.employee, uid: account.uid, running,
+            receipt: entry.attachment.as_ref(), work_root: entry.broker.root() };
+        let expected = verify_lease(&view, self.components.storage.as_mut(), run, employee).map_err(|refusal| refusal.code())?;
+        let lease = entry.broker.lease().map_err(|refusal| refusal.code())?;
+        Ok(BrokerStep::Deferred(Box::new(move || {
+            let live = || !cancelled.load(Ordering::Acquire);
+            let snapshot = copy_snapshot(lease, &path, &expected, &live).map_err(|refusal| refusal.code())?;
+            let source = Detail::WorkSource { device_major: snapshot.source.device_major,
+                device_minor: snapshot.source.device_minor, inode: snapshot.source.inode, size: snapshot.source.size };
+            Ok(BrokerReply::WorkFile { metadata: snapshot.metadata, file: snapshot.file, source: Some(source) })
+        })))
+    }
+    /// H4 WorkAnchor: allocated employees only (registry Ready and journal
+    /// Ready); a missing or wrong anchor is `WorkspaceBrokerUnavailable`.
+    fn broker_anchor(&mut self, employee: EmployeeId) -> Result<duduclaw_isolation::ipc::WorkAnchorIdentity> {
+        let account = self.registry.registry().employees.iter().find(|a| a.employee == employee).cloned().ok_or(ErrorCode::NotFound)?;
+        match account.state {
+            crate::registry::AccountState::Ready => {}
+            crate::registry::AccountState::Tombstone => return Err(ErrorCode::NotFound),
+            crate::registry::AccountState::Reserved => return Err(ErrorCode::NotReady),
+        }
+        if !self.allocator.ready_employees().contains(&employee) { return Err(ErrorCode::NotReady); }
+        self.components.storage.work_anchor(employee).map_err(|_| ErrorCode::WorkspaceBrokerUnavailable)
+    }
+    /// H4 EmployeeIdle (F6 §3.12 step 4, M8, S14): every source is read or
+    /// the whole answer is an error. Any registry account state (a tombstoned
+    /// employee is exactly what restore/retire ask about); no account ⇒ NotFound.
+    fn employee_idle(&mut self, employee: EmployeeId) -> Result<duduclaw_isolation::ipc::EmployeeIdleReport> {
+        let account = self.registry.registry().employees.iter().find(|a| a.employee == employee).cloned().ok_or(ErrorCode::NotFound)?;
+        let known: Vec<KnownRun> = self.runs.iter().map(|(id, r)| KnownRun { run: *id, employee: r.employee, open: !r.closed }).collect();
+        let attachments = self.components.storage.attachments()?;
+        let processes = os(accounts::employee_process_count(account.uid, account.gid))?;
+        let units = os(self.systemd.list_runs())?;
+        Ok(idle_report(employee, account.uid, &known, &self.journal.records, &attachments, processes, &units))
+    }
     fn cleanup_run(&mut self, employee: EmployeeId, previous: Option<RunHandle>) -> Result<CleanupReadback> {
         let account = self.account(employee)?;
         let uid_absent = os(accounts::unexpected_processes(account.uid, None))?.is_empty();
@@ -420,6 +513,11 @@ impl Core {
             if let Some(run) = previous {
                 let entry = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
                 if !entry.closed {
+                    // H4: the broker clone pins the employee filesystem. Drop it
+                    // first, and wait for in-flight snapshot copies (each holds a
+                    // dup and a pin; bounded by the 10 s copy deadline) before
+                    // anything is detached.
+                    entry.broker.release()?;
                     if entry.bootstrap_attempted { self.components.trampoline.close(run)?; }
                     // An attach reply can be lost after H persisted the mount.
                     // Its durable inventory, not our optional receipt, is authority.
@@ -470,6 +568,16 @@ impl Host for Core {
         self.last_refresh = Instant::now() - Duration::from_secs(10);
         result
     }
+    fn broker(&mut self, job: BrokerJob) -> Result<BrokerStep> {
+        if self.poisoned {
+            return Err(if matches!(job, BrokerJob::EmployeeIdle { .. }) { unavailable() } else { ErrorCode::WorkspaceBrokerUnavailable });
+        }
+        match job {
+            BrokerJob::OpenWorkFile { run, employee, path } => self.broker_open(run, employee, path),
+            BrokerJob::WorkAnchor { employee } => self.broker_anchor(employee).map(|anchor| BrokerStep::Done(BrokerReply::WorkAnchor(anchor))),
+            BrokerJob::EmployeeIdle { employee } => self.employee_idle(employee).map(|report| BrokerStep::Done(BrokerReply::Idle(report))),
+        }
+    }
     type Inputs = Vec<OwnedFd>; type Io = Vec<OwnedFd>;
     fn ready(&mut self, employee: EmployeeId) -> Result<()> {
         if self.poisoned { return Err(unavailable()); }
@@ -499,10 +607,15 @@ impl Host for Core {
         os(self.journal.add(RunRecord { run: run.0, employee, uid: account.uid })).inspect_err(|_| self.poisoned = true)?;
         self.runs.insert(run.0, LiveRun { employee, unit: None, attachment: None, revokers: vec![], gateway_io: Some(vec![]),
             relays: vec![], egress: false, pty: *pty, pty_taken: false, closed: false, started_event: false, truncated_event: false,
-            runtime_deadline: Instant::now() + Duration::from_millis(runtime.timeouts.runtime_ms), bootstrap_attempted: false, projection: None });
+            runtime_deadline: Instant::now() + Duration::from_millis(runtime.timeouts.runtime_ms), bootstrap_attempted: false, projection: None,
+            broker: crate::work_broker::BrokerRoot::new(None) });
         let mut storage = self.components.storage.attach(employee, account.uid, run, &runtime.resources.disk)?;
         storage.receipt.check(employee, run)?;
         self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.attachment = Some(storage.receipt.clone());
+        // H4: the broker's root, before `select_workspace` narrows `storage.work`.
+        // A failed clone fails the broker for this run (refusals), not the run.
+        let work_root = crate::bootstrap_mounts::work_broker_root(&storage).ok();
+        self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.broker = crate::work_broker::BrokerRoot::new(work_root);
         if let Some(selection) = workspace {
             let pin = inputs.pop().ok_or(ErrorCode::InvalidFds)?;
             os(crate::fds::validate_workspace_directory(pin.as_fd(), selection))?;
@@ -667,6 +780,9 @@ impl Host for LinuxHost {
     fn resize(&mut self, r: RunHandle, s: PtySize) -> Result<()> { self.worker.resize(r, s) }
     fn detect_intruders(&mut self) -> Result<Vec<EmployeeId>> { self.worker.detect_intruders() }
     fn forget(&mut self, r: RunHandle) -> Result<()> { self.worker.forget(r) }
+    fn broker_submit(&mut self, t: Ticket, j: BrokerJob) -> Result<()> { self.worker.broker_submit(t, j) }
+    fn broker_poll(&mut self, t: Ticket) -> Result<Option<BrokerReply>> { self.worker.broker_poll(t) }
+    fn broker_abandon(&mut self, t: Ticket) { self.worker.broker_abandon(t) }
 }
 
 #[cfg(test)]
@@ -676,6 +792,42 @@ mod tests {
         ScanEntry { account: EmployeeAccount { employee: EmployeeId([1; 16]), uid: 70000, gid: 70000,
             state: crate::registry::AccountState::Ready }, run: None, cgroup: None, revokers: vec![],
             cancelled: Arc::new(AtomicBool::new(false)), deadline: None }
+    }
+    #[test]
+    fn employee_idle_reports_processes_and_attachments() {
+        let (me, other) = (EmployeeId([1; 16]), EmployeeId([2; 16]));
+        let uid = 70_000;
+        let lease = |employee, byte| Attachment { employee, run: RunHandle(RunId([byte; 16])), token: RequestId([byte; 16]),
+            device_major: 7, device_minor: 1 };
+        // Nothing anywhere: idle.
+        let quiet = idle_report(me, uid, &[], &[], &[], 0, &[]);
+        assert!(quiet.idle());
+        // Another employee's run, lease and unit never count against `me`.
+        let known = [KnownRun { run: RunId([9; 16]), employee: other, open: true }];
+        let foreign = idle_report(me, uid, &known, &[], &[lease(other, 9)], 0, &[RunId([9; 16])]);
+        assert!(foreign.idle(), "{foreign:?}");
+        // A process with the employee's uid or gid (counted by the scanner).
+        let busy = idle_report(me, uid, &[], &[], &[], 2, &[]);
+        assert_eq!((busy.processes, busy.idle()), (2, false));
+        // A durable lease left behind (no run) is not idle.
+        let leased = idle_report(me, uid, &[], &[], &[lease(me, 3), lease(other, 4)], 0, &[]);
+        assert_eq!((leased.attachments, leased.idle()), (1, false));
+        // Open root runs and crash-journal records (by id or by uid), deduplicated.
+        let known = [KnownRun { run: RunId([5; 16]), employee: me, open: true },
+            KnownRun { run: RunId([6; 16]), employee: me, open: false }];
+        let journal = [RunRecord { run: RunId([5; 16]), employee: me, uid },
+            RunRecord { run: RunId([7; 16]), employee: EmployeeId([3; 16]), uid }];
+        let running = idle_report(me, uid, &known, &journal, &[], 0, &[]);
+        assert_eq!(running.runs, 2, "run 5 once, plus the journal record carrying this uid");
+        // A closed run is not live; its leftover unit still is.
+        let known = [KnownRun { run: RunId([6; 16]), employee: me, open: false }];
+        let unit = idle_report(me, uid, &known, &[], &[], 0, &[RunId([6; 16])]);
+        assert_eq!((unit.runs, unit.units, unit.idle()), (0, 1, false));
+        // A unit root cannot attribute to anyone counts against every employee.
+        let orphan = idle_report(me, uid, &[], &[], &[], 0, &[RunId([8; 16])]);
+        assert_eq!((orphan.units, orphan.idle()), (1, false));
+        // Counts saturate instead of wrapping.
+        assert_eq!(idle_report(me, uid, &[], &[], &[], usize::MAX, &[]).processes, u16::MAX);
     }
     #[test]
     fn cgroup_receipt_is_converted_to_absolute_proc_membership() {

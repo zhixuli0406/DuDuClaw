@@ -171,6 +171,33 @@ impl Storage for AnchoredStorage {
     fn usage(&mut self, employee: EmployeeId) -> Result<StorageUsage> { self.inner.usage(employee) }
     fn attachments(&mut self) -> Result<Vec<Attachment>> { self.inner.attachments() }
     fn work_anchor(&mut self, employee: EmployeeId) -> Result<WorkAnchorIdentity> { self.anchors.read(employee) }
+    fn backfill_work_anchor(&mut self, employee: EmployeeId) -> Result<bool> {
+        match self.anchors.read(employee) {
+            Ok(_) => Ok(false),
+            // Only an absent anchor is created; a present-but-wrong one stays
+            // refused (no repair), exactly like the allocation replay path.
+            Err(ErrorCode::NotFound) => self.anchors.ensure(employee).map(|_| true),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Per-employee result of `backfill`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backfilled { Present, Created, Failed(ErrorCode) }
+
+/// H4 upgrade step (H3 open item 1), run once at spawnd start for every
+/// allocation that is Ready in both the allocation journal and the registry:
+/// create each missing anchor. Idempotent (a second pass reports `Present`
+/// with the same identities) and never repairs: a tampered anchor stays
+/// `Failed`, so `WorkAnchor` keeps answering unavailable for it. The caller
+/// audits `Created` and `Failed`.
+pub fn backfill(storage: &mut dyn Storage, employees: &[EmployeeId]) -> Vec<(EmployeeId, Backfilled)> {
+    employees.iter().map(|employee| (*employee, match storage.backfill_work_anchor(*employee) {
+        Ok(true) => Backfilled::Created,
+        Ok(false) => Backfilled::Present,
+        Err(code) => Backfilled::Failed(code),
+    })).collect()
 }
 
 /// Lowercase hex of the never-recycled 128-bit EmployeeId; the all-zero id is
@@ -400,6 +427,46 @@ mod tests {
         assert!(failing.work_anchor(third).is_ok());
         // Destroy of a never-allocated employee is a no-op success.
         storage.destroy(EmployeeId([0x48; 16]), operation, digest).unwrap();
+    }
+
+    #[test]
+    fn anchor_backfill_idempotent() {
+        let (_dir, base, owner) = fixture();
+        let legacy = EmployeeId([0x50; 16]);
+        let current = EmployeeId([0x51; 16]);
+        // `legacy` was allocated before H3: its image exists, its anchor does not.
+        let mut inner = Fake::default();
+        inner.provision(&request(legacy)).unwrap();
+        let mut storage = storage(&base, owner, inner);
+        storage.provision(&request(current)).unwrap();
+        let current_identity = storage.work_anchor(current).unwrap();
+        assert_eq!(storage.work_anchor(legacy), Err(ErrorCode::NotFound));
+        assert_eq!(backfill(&mut storage, &[legacy, current]),
+            vec![(legacy, Backfilled::Created), (current, Backfilled::Present)]);
+        let legacy_identity = storage.work_anchor(legacy).unwrap();
+        let meta = fs::symlink_metadata(anchor_path(&base, legacy)).unwrap();
+        assert_eq!((meta.uid(), meta.gid(), meta.mode() & 0o7777), (owner.uid, owner.gid, ANCHOR_MODE));
+        // Second pass and a restart: nothing created, identities unchanged.
+        assert_eq!(backfill(&mut storage, &[legacy, current]),
+            vec![(legacy, Backfilled::Present), (current, Backfilled::Present)]);
+        assert_eq!(storage.work_anchor(legacy).unwrap(), legacy_identity);
+        assert_eq!(storage.work_anchor(current).unwrap(), current_identity);
+        drop(storage);
+        let mut reopened = self::storage(&base, owner, Fake::default());
+        assert_eq!(backfill(&mut reopened, &[legacy]), vec![(legacy, Backfilled::Present)]);
+        assert_eq!(reopened.work_anchor(legacy).unwrap(), legacy_identity);
+        // Never a repair: a tampered (writable) anchor stays refused.
+        fs::set_permissions(anchor_path(&base, legacy), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(backfill(&mut reopened, &[legacy]), vec![(legacy, Backfilled::Failed(ErrorCode::IsolationUnavailable))]);
+        assert_eq!(fs::symlink_metadata(anchor_path(&base, legacy)).unwrap().mode() & 0o7777, 0o700);
+        // A planted symlink is never followed or replaced.
+        let victim = EmployeeId([0x52; 16]);
+        std::os::unix::fs::symlink(base.parent().unwrap(), anchor_path(&base, victim)).unwrap();
+        assert_eq!(backfill(&mut reopened, &[victim]), vec![(victim, Backfilled::Failed(ErrorCode::IsolationUnavailable))]);
+        assert!(fs::symlink_metadata(anchor_path(&base, victim)).unwrap().file_type().is_symlink());
+        // Storage without the anchor hook cannot backfill: fail closed.
+        assert_eq!(backfill(&mut Fake::default(), &[legacy]),
+            vec![(legacy, Backfilled::Failed(ErrorCode::WorkspaceBrokerUnavailable))]);
     }
 
     #[test]

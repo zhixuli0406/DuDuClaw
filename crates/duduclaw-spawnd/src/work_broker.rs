@@ -39,7 +39,7 @@
 //! device/inode; the boundary must accept "sealed memfd" in place of nlink 1.
 use std::{ffi::CString, fs::File, io::{self, Write}, mem,
     os::{fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd}, unix::fs::{FileExt, MetadataExt}},
-    time::{Duration, Instant}};
+    sync::Arc, time::{Duration, Instant}};
 use duduclaw_isolation::{execution::RunHandle, ids::EmployeeId,
     ipc::{ErrorCode, WorkFileMetadata, WorkPath, MAX_WORK_FILE_BYTES, WORK_RESERVED_FIRST_COMPONENT}};
 use duduclaw_mcp_boundary::resources::{WorkRelativePath, BROKERED_FILE_MAX_BYTES};
@@ -293,6 +293,48 @@ fn seal_read_only(writable: File, size: u64) -> Result<(File, WorkFileMetadata),
     let metadata = WorkFileMetadata { size: reopened.len(), inode: reopened.ino(), device: reopened.dev() };
     metadata.validate().map_err(|_| U)?;
     Ok((file, metadata))
+}
+
+/// H4: the root-held work tree clone of one live run (`bootstrap_mounts::
+/// work_broker_root`, taken before `select_workspace`) and the pins of the
+/// snapshot copies still running against it. The clone keeps the employee
+/// filesystem mounted, so the host must `release` it — and see no copy in
+/// flight — before `Storage::detach`.
+#[derive(Debug)]
+pub struct BrokerRoot { root: Option<OwnedFd>, pin: Arc<()> }
+impl BrokerRoot {
+    pub fn new(root: Option<OwnedFd>) -> Self { Self { root, pin: Arc::new(()) } }
+    /// The clone, for `LiveRunView::work_root` (`None` once released).
+    pub fn root(&self) -> Option<BorrowedFd<'_>> { self.root.as_ref().map(AsFd::as_fd) }
+    /// One deferred copy's hold: a dup of the clone plus a pin.
+    pub fn lease(&self) -> Result<CopyLease, WorkRefusal> {
+        let root = self.root.as_ref().ok_or(WorkRefusal::Unavailable)?.try_clone().map_err(|_| WorkRefusal::Unavailable)?;
+        Ok(CopyLease { root, _pin: self.pin.clone() })
+    }
+    pub fn in_flight(&self) -> usize { Arc::strong_count(&self.pin).saturating_sub(1) }
+    /// Close the clone (idempotent); `NotReady` while any copy still holds a
+    /// dup. The cleanup retries until it is `Ok`, then detaches.
+    pub fn release(&mut self) -> crate::Result<()> {
+        self.root = None;
+        if self.in_flight() > 0 { Err(ErrorCode::NotReady) } else { Ok(()) }
+    }
+}
+/// Field order is drop order: the root dup is closed before the pin goes.
+#[derive(Debug)]
+pub struct CopyLease { root: OwnedFd, _pin: Arc<()> }
+
+/// H4: the copy half of `open_work_file`, run on the host's copy worker after
+/// `check_work_path` and `verify_lease` passed on the lifecycle thread (same
+/// turn as the `LiveRunView`). `live` (the run's fence not raised) is re-read
+/// before and after the copy; a snapshot finished after the run stopped is
+/// dropped, never returned. The lease is released before returning.
+pub fn copy_snapshot(lease: CopyLease, path: &WorkPath, expected: &WorkExpectation, live: &dyn Fn() -> bool)
+    -> Result<WorkFileSnapshot, WorkRefusal> {
+    if !live() { return Err(WorkRefusal::NotLive); }
+    let result = snapshot(lease.root.as_fd(), path.as_str(), expected);
+    drop(lease);
+    if !live() { return Err(WorkRefusal::NotLive); }
+    result
 }
 
 #[cfg(test)]
@@ -588,6 +630,55 @@ mod tests {
         for (path, _) in WORK_PATH_CONFORMANCE.iter().filter(|(_, ok)| !*ok) {
             assert_eq!(f.open(path).unwrap_err(), WorkRefusal::InvalidPath, "{path:?}");
         }
+    }
+
+    /// Descriptors of this process that refer to `dir` (unique tempdir, so no
+    /// other test thread opens it).
+    fn descriptors_on(dir: &Path) -> usize {
+        let target = fs::canonicalize(dir).unwrap();
+        fs::read_dir("/proc/self/fd").unwrap().filter_map(Result::ok)
+            .filter(|entry| fs::read_link(entry.path()).is_ok_and(|link| link == target)).count()
+    }
+
+    #[test]
+    fn h4_clone_dropped_before_detach() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"in flight").unwrap();
+        let meta = fs::metadata(dir.path()).unwrap();
+        let expected = WorkExpectation { uid: meta.uid(), device_major: libc::major(meta.dev()), device_minor: libc::minor(meta.dev()) };
+        let mut root = BrokerRoot::new(Some(File::open(dir.path()).unwrap().into()));
+        assert_eq!(descriptors_on(dir.path()), 1);
+        assert!(root.root().is_some());
+        // A deferred copy holds its own dup and a pin.
+        let lease = root.lease().unwrap();
+        assert_eq!((root.in_flight(), descriptors_on(dir.path())), (1, 2));
+        // Cleanup: the clone itself closes at once, but detach must wait.
+        assert_eq!(root.release(), Err(ErrorCode::NotReady));
+        assert!(root.root().is_none());
+        assert_eq!(descriptors_on(dir.path()), 1, "only the in-flight copy still holds the tree");
+        assert_eq!(root.lease().unwrap_err(), WorkRefusal::Unavailable, "no new copy after release");
+        // The copy finishes; its dup is closed before it returns.
+        let path = WorkPath::new("a.txt".into()).unwrap();
+        let snapshot = copy_snapshot(lease, &path, &expected, &|| true).unwrap();
+        assert_eq!(descriptors_on(dir.path()), 0, "the sealed snapshot references nothing of the tree");
+        assert_eq!(root.in_flight(), 0);
+        assert_eq!(root.release(), Ok(()), "now the storage may be detached");
+        assert_eq!(root.release(), Ok(()), "idempotent on cleanup retries");
+        assert_eq!(contents(snapshot), b"in flight");
+        // A copy that ends after the run's fence went up is discarded, and
+        // still gives its hold back.
+        let mut root = BrokerRoot::new(Some(File::open(dir.path()).unwrap().into()));
+        let lease = root.lease().unwrap();
+        let checks = std::cell::Cell::new(0);
+        let live = || { checks.set(checks.get() + 1); checks.get() == 1 };
+        assert_eq!(copy_snapshot(lease, &path, &expected, &live).unwrap_err(), WorkRefusal::NotLive);
+        assert_eq!(root.release(), Ok(()));
+        assert_eq!(descriptors_on(dir.path()), 0);
+        let root = BrokerRoot::new(Some(File::open(dir.path()).unwrap().into()));
+        assert_eq!(copy_snapshot(root.lease().unwrap(), &path, &expected, &|| false).unwrap_err(), WorkRefusal::NotLive);
+        assert_eq!(root.in_flight(), 0);
+        // A run whose clone could not be taken never opens anything.
+        assert_eq!(BrokerRoot::new(None).lease().unwrap_err(), WorkRefusal::Unavailable);
     }
 
     /// Root, private mount namespace of this test thread, backing directory on

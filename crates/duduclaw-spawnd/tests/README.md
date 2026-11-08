@@ -122,6 +122,23 @@ Exactly two outer tests should be selected and each must report `1 passed`.
 The internal helpers intentionally lack the `iso_root_` prefix and must never be
 run independently. Missing signed prerequisites cause failures, not skips.
 
+## H4 work broker chain
+
+`work_broker_chain::iso_root_work_broker_chain_backfill_snapshot_and_detach` uses
+real H loop storage (no systemd unit, no trampoline): a pre-H3 allocation gets
+its anchor from the start-up backfill exactly once; a lease is attached, the
+root-held RO broker clone is taken, an employee-owned file is read through the
+real `verify_lease` and a sealed snapshot; while a copy still holds the clone H
+cannot finish the detach, and after `BrokerRoot::release` the same detach
+succeeds; the snapshot outlives the detach; retire removes the anchor. Needs a
+root disposable VM with `ISO_STORAGE_TEST_ROOT` on ext4/XFS (loop devices) and
+runs in a private mount namespace of its thread.
+
+```sh
+CARGO_BUILD_JOBS=12 CARGO_INCREMENTAL=0 cargo test -p duduclaw-spawnd --test work_broker_chain --no-run
+DUDUCLAW_ISO_DISPOSABLE=1 ISO_STORAGE_TEST_ROOT=/srv/iso-storage cargo test -p duduclaw-spawnd --test work_broker_chain -- --ignored --test-threads=1 --nocapture
+```
+
 ## I1e installed PTY chain
 
 `pty_chain.rs` adds three `iso_root_pty_` tests using the real A backend, original

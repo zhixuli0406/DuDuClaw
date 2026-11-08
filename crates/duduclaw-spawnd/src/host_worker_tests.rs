@@ -41,11 +41,11 @@ fn barrier() -> (Barrier, Receiver<()>, SyncSender<()>) {
 }
 struct FakeHost {
     counters: Arc<Counters>, start_barrier: Option<Barrier>, poll_barrier: Option<Barrier>,
-    start_error: Option<ErrorCode>, io_taken: bool,
+    start_error: Option<ErrorCode>, io_taken: bool, copy_barrier: Option<Barrier>,
 }
 impl FakeHost {
     fn new(counters: Arc<Counters>) -> Self {
-        Self { counters, start_barrier: None, poll_barrier: None, start_error: None, io_taken: false }
+        Self { counters, start_barrier: None, poll_barrier: None, start_error: None, io_taken: false, copy_barrier: None }
     }
 }
 impl Host for FakeHost {
@@ -78,6 +78,55 @@ impl Host for FakeHost {
         self.counters.forgotten.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+    fn broker(&mut self, job: BrokerJob) -> Result<BrokerStep> {
+        match job {
+            BrokerJob::OpenWorkFile { .. } => {
+                let barrier = self.copy_barrier.take();
+                Ok(BrokerStep::Deferred(Box::new(move || {
+                    if let Some(barrier) = barrier { barrier.block(); }
+                    Ok(BrokerReply::WorkFile { metadata: duduclaw_isolation::ipc::WorkFileMetadata { size: 0, inode: 1, device: 1 },
+                        file: std::fs::File::open("/dev/null").unwrap(), source: None })
+                })))
+            }
+            BrokerJob::WorkAnchor { .. } => Ok(BrokerStep::Done(BrokerReply::WorkAnchor(
+                duduclaw_isolation::ipc::WorkAnchorIdentity { device: 1, inode: 2 }))),
+            BrokerJob::EmployeeIdle { .. } => Err(ErrorCode::NotFound),
+        }
+    }
+}
+
+fn poll_broker(worker: &mut WorkerHost, ticket: Ticket) -> Result<BrokerReply> {
+    until(|| match worker.broker_poll(ticket) { Ok(None) => Err(ErrorCode::NotReady), Ok(Some(reply)) => Ok(reply), Err(e) => Err(e) })
+}
+
+#[test]
+fn h4_snapshot_copy_never_blocks_lifecycle_worker() {
+    let counters = Arc::new(Counters::default());
+    let (barrier, entered, release) = barrier();
+    let mut fake = FakeHost::new(counters.clone());
+    fake.copy_barrier = Some(barrier);
+    let mut worker = host(fake, counters);
+    let path = duduclaw_isolation::ipc::WorkPath::new("a.txt".into()).unwrap();
+    worker.broker_submit(Ticket(1), BrokerJob::OpenWorkFile { run: run(1), employee: employee(), path: path.clone() }).unwrap();
+    assert_eq!(worker.broker_submit(Ticket(1), BrokerJob::WorkAnchor { employee: employee() }), Err(ErrorCode::Internal),
+        "a ticket is never reused");
+    entered.recv_timeout(Duration::from_secs(3)).unwrap();
+    // The copy is blocked; the lifecycle worker still answers other jobs.
+    worker.broker_submit(Ticket(2), BrokerJob::WorkAnchor { employee: employee() }).unwrap();
+    assert!(matches!(poll_broker(&mut worker, Ticket(2)).unwrap(), BrokerReply::WorkAnchor(_)));
+    assert_eq!(until(|| worker.ready(employee())), Ok(()));
+    worker.broker_submit(Ticket(3), BrokerJob::EmployeeIdle { employee: employee() }).unwrap();
+    assert_eq!(poll_broker(&mut worker, Ticket(3)).unwrap_err(), ErrorCode::NotFound);
+    assert!(worker.broker_poll(Ticket(1)).unwrap().is_none());
+    release.send(()).unwrap();
+    assert!(matches!(poll_broker(&mut worker, Ticket(1)).unwrap(), BrokerReply::WorkFile { .. }));
+    // An abandoned ticket's late result is dropped, never re-delivered.
+    worker.broker_submit(Ticket(4), BrokerJob::OpenWorkFile { run: run(1), employee: employee(), path }).unwrap();
+    worker.broker_abandon(Ticket(4));
+    std::thread::sleep(Duration::from_millis(100));
+    worker.receive();
+    assert!(!worker.slots.contains_key(&Key::Broker(4)));
+    assert_eq!(worker.broker_poll(Ticket(4)).unwrap_err(), ErrorCode::Internal);
 }
 fn run(byte: u8) -> RunHandle { RunHandle(RunId([byte; 16])) }
 fn employee() -> EmployeeId { EmployeeId([3; 16]) }
@@ -190,4 +239,119 @@ fn one_shot_io_is_not_cloned_and_forget_removes_only_its_run_cache() {
     assert!(!worker.slots.contains_key(&Key::Io(run(1).0)));
     assert!(worker.slots.contains_key(&Key::Kill(run(2).0)));
     assert_eq!(counters.forgotten.load(Ordering::SeqCst), 1);
+}
+
+/// H4 end to end below the socket: coordinator authority → worker mailbox →
+/// lifecycle-thread step → copy worker → H2 sealed snapshot of a real
+/// fixture tree. Stands in for `Core::broker_open` with the same pieces
+/// (`BrokerRoot` lease, `copy_snapshot`, the run's fence as `live`); the
+/// root-only lease/mount half is `tests/work_broker_chain.rs`.
+#[cfg(target_os = "linux")]
+mod h4_fixture {
+    use super::*;
+    use std::{io::Read, os::unix::fs::MetadataExt, sync::{Mutex, atomic::AtomicBool}};
+    use duduclaw_isolation::ipc::{ControlConnectionId, RunStatus, SpawnResponse, WorkPath};
+    use crate::{admission::{Coordinator, Limits}, work_broker::{check_work_path, copy_snapshot, BrokerRoot, WorkExpectation}};
+
+    struct FixtureHost { inner: FakeHost, root: Arc<Mutex<BrokerRoot>>, expected: WorkExpectation, fence: Arc<AtomicBool> }
+    impl Host for FixtureHost {
+        type Inputs = Vec<OwnedFd>; type Io = Vec<OwnedFd>;
+        fn ready(&mut self, e: EmployeeId) -> Result<()> { self.inner.ready(e) }
+        fn policy(&mut self, e: EmployeeId, r: &RuntimeKind, p: bool) -> Result<LaunchPolicy> { self.inner.policy(e, r, p) }
+        fn cleanup(&mut self, e: EmployeeId, r: Option<RunHandle>) -> Result<CleanupReadback> { self.inner.cleanup(e, r) }
+        fn start(&mut self, r: RunHandle, e: EmployeeId, q: &SpawnRequest, p: &LaunchPolicy, i: Self::Inputs) -> Result<()> { self.inner.start(r, e, q, p, i) }
+        fn poll(&mut self, r: RunHandle) -> Result<HostProgress> { self.inner.poll(r) }
+        fn revoke(&mut self, r: RunHandle) -> Result<()> { self.inner.revoke(r) }
+        fn kill(&mut self, r: RunHandle) -> Result<()> { self.inner.kill(r) }
+        fn take_io(&mut self, r: RunHandle) -> Result<Self::Io> { self.inner.take_io(r) }
+        fn resize(&mut self, r: RunHandle, s: PtySize) -> Result<()> { self.inner.resize(r, s) }
+        fn detect_intruders(&mut self) -> Result<Vec<EmployeeId>> { self.inner.detect_intruders() }
+        fn forget(&mut self, r: RunHandle) -> Result<()> { self.inner.forget(r) }
+        fn broker(&mut self, job: BrokerJob) -> Result<BrokerStep> {
+            let BrokerJob::OpenWorkFile { path, .. } = job else { return Err(ErrorCode::WorkspaceBrokerUnavailable) };
+            check_work_path(path.as_str()).map_err(|refusal| refusal.code())?;
+            let lease = self.root.lock().map_err(|_| ErrorCode::Internal)?.lease().map_err(|refusal| refusal.code())?;
+            let (expected, fence) = (self.expected, self.fence.clone());
+            Ok(BrokerStep::Deferred(Box::new(move || {
+                let live = || !fence.load(Ordering::Acquire);
+                let snapshot = copy_snapshot(lease, &path, &expected, &live).map_err(|refusal| refusal.code())?;
+                Ok(BrokerReply::WorkFile { metadata: snapshot.metadata, file: snapshot.file, source: None })
+            })))
+        }
+    }
+
+    fn answer(c: &mut Coordinator<WorkerHost>, ticket: Ticket, now: u64) -> crate::admission::BrokerOutcome {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(outcome) = c.poll_ticket(ticket, now).unwrap() { return outcome; }
+            assert!(Instant::now() < deadline, "no broker answer");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn h4_open_work_file_end_to_end_with_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("notes")).unwrap();
+        std::fs::write(dir.path().join("notes/report.csv"), b"a,b\n1,2\n").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", dir.path().join("notes/escape")).unwrap();
+        let meta = std::fs::metadata(dir.path()).unwrap();
+        let expected = WorkExpectation { uid: meta.uid(), device_major: libc::major(meta.dev()), device_minor: libc::minor(meta.dev()) };
+        let root = Arc::new(Mutex::new(BrokerRoot::new(Some(std::fs::File::open(dir.path()).unwrap().into()))));
+        let fence = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(Counters::default());
+        let fixture = FixtureHost { inner: FakeHost::new(counters.clone()), root: root.clone(), expected, fence: fence.clone() };
+        let mut c = Coordinator::new(host_any(fixture, counters), Limits::default()).unwrap();
+        let connection = ControlConnectionId([1; 16]);
+        let now = 1_000;
+        until(|| c.reserve(connection, employee(), run(1), now)).unwrap();
+        until(|| c.start(connection, request(), vec![], now)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while c.status(run(1), connection) != Ok(RunStatus::Running) {
+            assert!(Instant::now() < deadline, "fixture run never reached Running");
+            let _ = c.tick(now);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let path = |p: &str| WorkPath::new(p.into()).unwrap();
+        // Happy path: one sealed, read-only snapshot fd with honest metadata.
+        let ticket = c.open_work_file(connection, run(1), employee(), path("notes/report.csv"), now).unwrap();
+        let outcome = answer(&mut c, ticket, now);
+        let response = outcome.response;
+        let SpawnResponse::WorkFile { run: delivered, file: metadata } = response else { panic!("not a WorkFile reply") };
+        assert_eq!(delivered, run(1));
+        let mut file = outcome.file.expect("exactly one WorkFileRead fd");
+        let actual = file.metadata().unwrap();
+        assert_eq!((metadata.size, metadata.inode, metadata.device), (actual.len(), actual.ino(), actual.dev()));
+        assert_ne!(actual.ino(), std::fs::metadata(dir.path().join("notes/report.csv")).unwrap().ino(), "a copy, not the employee inode");
+        let seals = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&file), libc::F_GET_SEALS) };
+        let required = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        assert_eq!(seals & required, required);
+        // The employee rewrites the file afterwards; the snapshot is pinned.
+        std::fs::write(dir.path().join("notes/report.csv"), b"changed later").unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"a,b\n1,2\n");
+        // Refusals keep their H1 wire codes and never carry an fd.
+        for (relative, code) in [("notes/missing.csv", ErrorCode::WorkFileNotFound), ("notes/escape", ErrorCode::WorkFileRefused),
+            ("notes", ErrorCode::WorkFileRefused)] {
+            let ticket = c.open_work_file(connection, run(1), employee(), path(relative), now).unwrap();
+            let outcome = answer(&mut c, ticket, now);
+            assert_eq!(outcome.response, SpawnResponse::Error { code }, "{relative}");
+            assert!(outcome.file.is_none());
+        }
+        assert_eq!(root.lock().unwrap().in_flight(), 0, "every copy gave its hold back");
+        // The run's fence goes up (revoke/kill/intrusion): nothing more is delivered.
+        fence.store(true, Ordering::Release);
+        let ticket = c.open_work_file(connection, run(1), employee(), path("notes/report.csv"), now).unwrap();
+        assert_eq!(answer(&mut c, ticket, now).response, SpawnResponse::Error { code: ErrorCode::NotReady });
+        fence.store(false, Ordering::Release);
+        // Cleanup released the clone: the broker fails closed for this run.
+        root.lock().unwrap().release().unwrap();
+        let ticket = c.open_work_file(connection, run(1), employee(), path("notes/report.csv"), now).unwrap();
+        assert_eq!(answer(&mut c, ticket, now).response, SpawnResponse::Error { code: ErrorCode::WorkspaceBrokerUnavailable });
+    }
+
+    fn host_any<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>> + Send + 'static>(fake: H, counters: Arc<Counters>) -> WorkerHost {
+        WorkerHost::spawn(fake, Box::new(FakeScan(counters))).unwrap()
+    }
 }

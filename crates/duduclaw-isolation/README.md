@@ -146,7 +146,8 @@ wire still carries only the `op` name; the number is for audit/telemetry and
 collision checks, and `SpawnRequest::opcode` is exhaustive so an unregistered
 variant does not compile. Ranges, never reused: `0x0001–0x00FF` core run
 lifecycle (`reserve_run` 0x01 … `take_io` 0x08), `0x0100–0x01FF` Package H
-(`open_work_file` 0x0101, `work_anchor` 0x0102), `0x0200–0x02FF` HX in-run
+(`open_work_file` 0x0101, `work_anchor` 0x0102, `stop_employee_runs` 0x0103,
+`employee_idle` 0x0104; `Opcode::WORK`), `0x0200–0x02FF` HX in-run
 helpers, reserved in `HX_RESERVED_OPS` (`helper_call` 0x0201, `helper_wait`
 0x0202, `helper_stop` 0x0203, `helper_cancel` 0x0204). HX also owns the result
 tags `helper_started`/`helper_ended` and the error codes `helper_busy`,
@@ -163,13 +164,31 @@ tags `helper_started`/`helper_ended` and the error codes `helper_busy`,
   `inode`/`device` non-zero.
 - `WorkAnchor { employee_id }` → `WorkAnchor { employee_id, anchor: { device, inode } }`,
   no fds.
+- `StopEmployeeRuns { employee_id }` (H4, for F6 tombstone S13), no fds →
+  `EmployeeRunsStopped { employee_id, runs: [run], confirmed }`. Root cancels
+  every non-terminal run of the employee through the per-run Cancel path
+  (whichever gateway connection owns it), refuses new reservations for that
+  employee while the stop is pending, and replies after every listed run is
+  terminal and `EmployeeIdle` reads idle (`confirmed = true`) or after a bounded
+  wait (≈ 4 s, below `CONTROL_TIMEOUT_MS`; `confirmed = false`, retry). Unknown
+  employee ⇒ `not_found`. `runs` ≤ `MAX_STOPPED_RUNS` (64).
+- `EmployeeIdle { employee_id }` (H4, for F6c/F6l), no fds →
+  `EmployeeIdle { employee_id, report: { runs, attachments, processes, units } }`
+  (counts; `report.idle()` only when all are zero). Any unreadable source is an
+  `isolation_unavailable` error, never a zero report.
 - New `ErrorCode`s: `work_file_not_found`, `work_file_refused`,
-  `work_file_too_large`, `workspace_broker_unavailable`.
+  `work_file_too_large`, `workspace_broker_unavailable`. H4 adds none (the
+  snapshot caps answer `resource_limit`), because clients match `ErrorCode`
+  exhaustively.
 - `check_work_reply(request, response, received_fds)` pairs a reply with its
-  request (run/employee) and checks the fd count. Callers still `fstat` the fd.
+  request (run/employee) and checks the fd count for all four ops. Callers
+  still `fstat` the fd.
 
-Protocol stays v1 (additive variants); gateway and spawnd ship together. Until
-H2–H4 land, spawnd answers both ops with `workspace_broker_unavailable`.
+Protocol stays v1 (additive variants); gateway and spawnd ship together. A
+gateway sends these ops only when spawnd's readiness report (`readiness.json`)
+carries `features.work_broker = true` (H4); without it it must report
+`workspace_broker_unavailable` instead, because an older spawnd closes the
+control connection on an unknown `op`.
 
 ## License
 
