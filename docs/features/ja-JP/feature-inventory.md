@@ -340,7 +340,7 @@
 
 | 機能 | 説明 |
 |------|------|
-| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永続化（v1.8.12）。スケジュールは `tasks_create` + `schedule` で作成（旧 `schedule_task` ツールは v1.69.0 で削除） |
+| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永続化（v1.8.12）。スケジュールは `tasks_create` + `schedule` で作成（旧 `schedule_task` ツールは v1.69.0 で削除）。WebChat の会話で通知先なしに作成したものは、実行時に所有者を確認したうえで結果をその会話に返す。通知先のないスケジュールは、結果がどこにも届かないことを作成時の返答で伝える（[69-egress-guard.md](69-egress-guard.md)） |
 | ReminderScheduler | 一度限りのリマインダー（相対 `5m`/`2h`/`1d` または ISO 8601）、`direct` / `agent_callback` モード |
 | HeartbeatScheduler | エージェント毎統一スケジューリング — バスポーリング + GVU サイレンスブレイカー + cron |
 | スケジューラレベルのタスクボードプル（v1.9.3）| `poll_assigned_tasks` を `HeartbeatScheduler::run` tick へ移動 — 30s 毎に全エージェントレジストリを走査（`enabled=false` をスキップしない）；1 時間 LIKE-marker クールダウンでスタンピード防止 |

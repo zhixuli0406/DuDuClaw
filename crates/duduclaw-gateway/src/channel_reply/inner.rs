@@ -1888,6 +1888,13 @@ pub(super) async fn build_reply_with_session_inner(
     // spend per employee. Empty user_id ⇒ recorded as unattributed.
     let cli_future =
         crate::claude_runner::CHANNEL_REPLY_USER_ID.scope(user_id.to_string(), cli_future);
+    // RM-124: a signed-in WebChat turn names its own conversation as the
+    // origin for schedule / reminder results (empty ⇒ none). Separate from
+    // REPLY_CHANNEL on purpose: WebChat must never become a push target.
+    let cli_future = crate::scheduled_webchat::ORIGIN_SESSION.scope(
+        crate::scheduled_webchat::turn_origin(session_id, &agent_id),
+        cli_future,
+    );
     // WP5: scope the compression outcome computed above so the eventual
     // `cost_telemetry` record call (several async frames away, inside
     // `spawn_claude_cli_with_env` / the PTY variant) can persist whether
