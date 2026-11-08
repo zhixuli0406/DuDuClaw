@@ -36,6 +36,11 @@ mod departments;
 mod config_receipt;
 #[path = "migration_authority_employee.rs"]
 pub(crate) mod employee;
+// F6l: `EmployeeRetire` proposals (F6 design r5 §3.12); wired into the
+// confirmation RPC by F6d.
+#[path = "migration_authority_retire.rs"]
+#[allow(dead_code)]
+pub(crate) mod retire;
 // v1.81 C5: legacy connector accounts → catalog routes via C3 provisioning.
 #[path = "migration_authority_connectors.rs"]
 pub(crate) mod connectors;

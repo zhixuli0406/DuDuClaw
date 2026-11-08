@@ -117,7 +117,7 @@ impl RootAllocation for RootAllocator {
         {
             use duduclaw_migration::allocation::{Action, Request};
             let nonce = duduclaw_migration::ids::RequestId(*uuid::Uuid::new_v4().as_bytes());
-            allocation::transport::request(&Request { schema: 1, nonce, action: Action::ReadBack, item: item.clone() })
+            allocation::transport::request(&Request { schema: 1, nonce, action: Action::ReadBack, item: item.clone(), approver: None })
                 .map_err(|_| LifecycleError::Unavailable)
         }
         #[cfg(not(target_os = "linux"))]

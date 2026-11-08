@@ -341,7 +341,11 @@ impl LinuxHost {
             report: EvidenceReport::current(Readiness::default(), 0)?, policy: None,
             employees: registry.registry().employees.iter().filter(|a| a.state == crate::registry::AccountState::Ready).map(|a| a.employee).collect(),
         }));
-        let mut core = Core { allocator: crate::allocation::Allocator::open()?, registry, systemd: Systemd::connect()?, journal: RunJournal::open()?,
+        // F6l S5a: a missing allocation journal is refused while the registry
+        // or storage still shows an employee (no silent empty journal).
+        let mut components = components;
+        let allocator = crate::allocation::Allocator::open(registry.registry(), components.storage.as_mut())?;
+        let mut core = Core { allocator, registry, systemd: Systemd::connect()?, journal: RunJournal::open()?,
             components, policy: None, report: EvidenceReport::current(Readiness::default(), 0)?, gateway,
             monitor, runs: BTreeMap::new(), audit, last_refresh: Instant::now(), poisoned: false, view: view.clone(),
             helper_events: Vec::new() };
@@ -580,13 +584,28 @@ impl Core {
     }
 }
 impl Host for Core {
-    fn allocation(&mut self, request: &duduclaw_migration::allocation::Request) -> Result<duduclaw_migration::allocation::Receipt> {
-        if self.poisoned { return Err(unavailable()); }
-        // Allocation never races an active run or the lifecycle's H journal.
-        if request.action != duduclaw_migration::allocation::Action::ReadBack && !self.runs.is_empty() { return Err(ErrorCode::NotReady); }
+    fn allocation(&mut self, request: &duduclaw_migration::allocation::Request)
+        -> std::result::Result<duduclaw_migration::allocation::Reply, duduclaw_migration::allocation::ErrorCode> {
+        use duduclaw_migration::allocation::ErrorCode as Wire;
+        if self.poisoned { return Err(Wire::IsolationUnavailable); }
+        // F6l: the idle readback (S14/S17) of a Ready subject, read in this
+        // worker turn; every source readable or an error (never zero).
+        let idle = self.allocator.subject(request).map(|employee| self.employee_idle(employee));
+        // The gate itself is applied by the allocator: a Retired replay is
+        // answered before it (S15), ReadBack never waits for it.
+        let host_busy = !self.runs.is_empty();
+        let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let mut accounts = LinuxAccounts { evidence: self.components.installation.as_ref() };
-        let result = self.allocator.handle(request, &mut self.registry, &mut accounts, self.components.storage.as_mut());
-        let mut entries = self.monitor.entries.lock().map_err(|_| unavailable())?;
+        let result = self.allocator.handle(request, crate::allocation::Env { registry: &mut self.registry, accounts: &mut accounts,
+            storage: self.components.storage.as_mut(), host_busy, idle, now_unix });
+        for event in self.allocator.take_events() {
+            match event {
+                crate::allocation::AllocationEvent::Retired { employee, detail } =>
+                    emit_detail(&self.audit, Event::Retired, Some(employee), None, Some(detail)),
+                crate::allocation::AllocationEvent::Intruder { employee } => emit(&self.audit, Event::Intruder, Some(employee), None),
+            }
+        }
+        let mut entries = self.monitor.entries.lock().map_err(|_| Wire::IsolationUnavailable)?;
         // Even a failed allocation may have created a durable UID reservation.
         // Monitor every such identity before returning its failure to the gateway.
         for account in &self.registry.registry().employees {

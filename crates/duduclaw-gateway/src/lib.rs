@@ -62,6 +62,9 @@ pub mod isolation_readiness;
 #[allow(dead_code)]
 pub(crate) mod isolation_lifecycle;
 pub(crate) mod isolation_quarantine;
+// F6l root retire (F6 design r5 §3.12); the RPC/UI wiring is F6d/F6e.
+#[allow(dead_code)]
+pub(crate) mod isolation_retire;
 pub mod migration_import;
 pub mod migration_startup;
 

@@ -24,6 +24,9 @@ pub enum Event { Refused, Reserved, Queued, Started, Ended, Revoked, Intruder, O
     HelperRefused,
     /// HX4: the run's launcher channel or slot cgroups were lost (detail: code).
     HelperChannelClosed,
+    /// F6l (§3.12 step 8): an employee's root allocation was retired
+    /// (detail: `retired`).
+    Retired,
 }
 /// Bounded, content-free detail. Never a path, file name, file content or
 /// free-form text: identities and counts only.
@@ -40,6 +43,13 @@ pub enum Detail {
     /// root-determined outcome. No argv, path, input or output content.
     Helper { call: duduclaw_isolation::ipc::HelperCallId, helper: u8, slot: duduclaw_isolation::ipc::HelperSlot,
         input_bytes: u64, effective_timeout_ms: Option<u64>, outcome: Option<duduclaw_isolation::ipc::HelperOutcome> },
+    /// F6l retire (S12): the burned UID, the label (validated agent id), the
+    /// last observed usage (`None` when it could not be read, e.g. a resumed
+    /// retire), the quota, the 16-hex quarantine digest prefix, the requester
+    /// and approver user ids (validated opaque ids) and the early-purge flag.
+    /// Every text value was validated by `allocation::retire_specification`.
+    Retired { uid: u32, label: String, used_bytes: Option<u64>, used_inodes: Option<u64>, quota_bytes: u64, quota_inodes: u64,
+        quarantine_digest_prefix: String, requested_by: String, approved_by: String, early: bool },
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
