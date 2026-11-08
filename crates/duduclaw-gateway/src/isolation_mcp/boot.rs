@@ -409,7 +409,13 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
     let mut roots = ResourceRoots::default();
     // These directories live in gateway-private state, never the writable
     // employee mount. Walk from a trusted home fd without following symlinks.
-    if let Some(wiki) = super::ingress::own_wiki_root(&home, &agent)? {
+    // A tombstone moves `agents/<label>` into quarantine before disabling the
+    // apply.db row, so a failed walk may be a lifecycle change rather than an
+    // unreadable store: the durable lifecycle decides first (Tombstoned/Stale
+    // ⇒ Revoked); only a still-live employee keeps the walk's own error.
+    let wiki = super::ingress::own_wiki_root(&home, &agent).map_err(|error|
+        lifecycle::recheck_with(&home, lifecycle, root).err().map_or(error, lifecycle_refusal))?;
+    if let Some(wiki) = wiki {
         roots.insert_wiki(namespace.clone(), employee, wiki)?;
         resources.push(confined(ResourceGrant::Wiki { namespace: text(namespace)? }));
     }
