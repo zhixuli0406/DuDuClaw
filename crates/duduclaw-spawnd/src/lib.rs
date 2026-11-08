@@ -28,6 +28,9 @@ pub mod server;
 pub mod channels;
 #[cfg(target_os = "linux")]
 pub mod egress;
+/// H2 root work broker core (D-H1); H4 wires it into `server.rs` dispatch.
+#[cfg(target_os = "linux")]
+pub mod work_broker;
 
 pub type Result<T> = std::result::Result<T, duduclaw_isolation::ipc::ErrorCode>;
 
