@@ -1,15 +1,158 @@
 //! Production authority composed from existing product registries. The maps here
 //! are bounded, epoch-local run associations, never an alternative durable ACL.
-use std::{collections::BTreeMap, path::PathBuf, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
-use duduclaw_auth::UserDb;
+//!
+//! The employee principal comes only from the A2 lifecycle read model
+//! (`crate::isolation_lifecycle`). A Personal employee is authorized only for
+//! a Human principal that is its lifecycle owner, while users.db mirrors that
+//! owner and binds exactly one member (the owner); it is never authorized for
+//! a Background principal. Shared employees keep the tenant rules.
+use std::{collections::BTreeMap, path::{Path, PathBuf}, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
+use duduclaw_auth::{IsolationAuthoritySnapshot, UserDb};
 use duduclaw_execution::SpawndBackend;
 use duduclaw_isolation::{capability::{EmployeeBinding, Principal}, execution::RunHandle,
     ids::{EmployeeId, RunId}, ipc::RunStatus};
 use duduclaw_mcp_boundary::{bindings::{BindingAuthority, BindingError}, GrantPolicy, LiveAuthority,
     LiveSnapshot, RequestContext, VerificationError};
 use crate::isolation_egress::{RunMetadata, RunTurnIdentity, RunTurnResolver, ResolvedRunTurn};
+use crate::isolation_lifecycle::{self as lifecycle, EmployeeLifecycle, LifecycleError};
 
 const MAX_ASSOCIATIONS: usize = 4096;
+
+/// Root allocator ReadBack used by the lifecycle read model (tests inject a fixture).
+type RootSource = dyn lifecycle::RootAllocation + Send + Sync;
+
+/// The stores one identity check reads, in this order: lifecycle (apply.db,
+/// confirmations, root ReadBack, users.db), then users.db again.
+struct Stores<'a> {
+    home: &'a Path,
+    users: &'a UserDb,
+    root: &'a RootSource,
+}
+
+/// Facts established by one successful identity check.
+struct Identity {
+    credential_epoch: Option<u64>,
+    policy_epoch: u64,
+    tenant_id: String,
+    lifecycle: EmployeeLifecycle,
+}
+
+/// Every lifecycle refusal fails closed; only an unreadable store is reported
+/// as unavailable rather than revoked.
+fn lifecycle_refusal(error: LifecycleError) -> VerificationError {
+    match error {
+        LifecycleError::Unavailable => VerificationError::Unavailable,
+        LifecycleError::Denied | LifecycleError::Stale | LifecycleError::Tombstoned => VerificationError::Revoked,
+    }
+}
+
+fn snapshot_user(principal: &Principal) -> Option<&str> {
+    match principal {
+        Principal::Human { user_id, .. } => Some(user_id.as_str()),
+        Principal::Background { .. } => None,
+    }
+}
+
+/// Personal contract on one users.db snapshot (all exact comparisons): the
+/// principal is the Human owner, the snapshot's human is that owner, the
+/// mirror records that owner, and the owner is the agent's only member.
+/// Also for the B2 issuer, which must apply exactly these checks.
+pub(super) fn personal_facts(agent: &str, owner: &str, principal: &Principal, current: &IsolationAuthoritySnapshot)
+    -> Result<(), VerificationError> {
+    // Never a Background principal, whatever its tenant or generation.
+    let Principal::Human { user_id, .. } = principal else { return Err(VerificationError::Revoked); };
+    let human = current.human.as_ref().ok_or(VerificationError::Revoked)?;
+    if user_id.as_str() != owner || human.user_id != owner
+        || current.personal_owner.as_deref() != Some(owner)
+        || current.agent_member_count != 1
+        || !human.agent_access.contains_key(agent) {
+        return Err(VerificationError::Revoked);
+    }
+    Ok(())
+}
+
+/// Lifecycle first (fresh read, or a recheck against the lifecycle pinned at
+/// prepare), then users.db, so the users.db facts are no older than the root
+/// readback. The capability binding must equal the lifecycle principal.
+fn identity_with(stores: &Stores<'_>, agent: &str, employee: EmployeeId, binding: &EmployeeBinding,
+    principal: &Principal, expected: Option<&EmployeeLifecycle>) -> Result<Identity, VerificationError> {
+    // No store state can authorize this; refuse before any I/O.
+    if matches!((binding, principal), (EmployeeBinding::Personal(_), Principal::Background { .. })) {
+        return Err(VerificationError::Revoked);
+    }
+    let lifecycle = match expected {
+        Some(expected) => {
+            if expected.label != agent || expected.employee != employee { return Err(VerificationError::Revoked); }
+            lifecycle::recheck_with(stores.home, expected, stores.root)
+        }
+        None => lifecycle::read_lifecycle_with(stores.home, agent, stores.root),
+    }.map_err(lifecycle_refusal)?;
+    if lifecycle.employee != employee || lifecycle.label != agent { return Err(VerificationError::Revoked); }
+    // The binding is the immutable root principal, never a caller claim.
+    if lifecycle.binding != *binding { return Err(VerificationError::BindingMismatch); }
+    let current = stores.users.isolation_authority_snapshot(snapshot_user(principal), agent)
+        .map_err(|_| VerificationError::Unavailable)?;
+    match binding {
+        EmployeeBinding::Shared(tenant) => {
+            if current.tenant_id != tenant.as_str() { return Err(VerificationError::BindingMismatch); }
+        }
+        EmployeeBinding::Personal(owner) => personal_facts(agent, owner.as_str(), principal, &current)?,
+    }
+    let credential_epoch = match principal {
+        Principal::Human { user_id, generation } => {
+            let human = current.human.as_ref().ok_or(VerificationError::Revoked)?;
+            if human.user_id != user_id.as_str() || *generation != current.acl_generation {
+                return Err(VerificationError::Revoked);
+            }
+            Some(human.credential_epoch)
+        }
+        Principal::Background { tenant_id, generation } => {
+            if tenant_id.as_str() != current.tenant_id || *generation != current.acl_generation {
+                return Err(VerificationError::Revoked);
+            }
+            None
+        }
+    };
+    Ok(Identity { credential_epoch, policy_epoch: current.policy_epoch, tenant_id: current.tenant_id, lifecycle })
+}
+
+/// Recheck of a prepared run: the lifecycle must be the very same employee
+/// and principal, and the users.db facts must still be the prepared ones.
+fn recheck_identity(stores: &Stores<'_>, prepared: &PreparedAuthority) -> Result<Identity, VerificationError> {
+    let identity = identity_with(stores, &prepared.agent, prepared.employee, &prepared.binding,
+        &prepared.principal, Some(&prepared.lifecycle))?;
+    if identity.tenant_id != prepared.tenant_id || identity.credential_epoch != prepared.credential_epoch
+        || identity.policy_epoch != prepared.policy_epoch {
+        return Err(VerificationError::Revoked);
+    }
+    Ok(identity)
+}
+
+/// users.db-only re-read after file/root/backend I/O. Catches a member
+/// removal, a second member, a mirror owner change or removal (tombstone),
+/// a tenant replacement and any ACL/policy/credential epoch change.
+fn check_current(users: &UserDb, prepared: &PreparedAuthority) -> Result<(), VerificationError> {
+    let current = users.isolation_authority_snapshot(snapshot_user(&prepared.principal), &prepared.agent)
+        .map_err(|_| VerificationError::Revoked)?;
+    let generation = match &prepared.principal {
+        Principal::Human { generation, .. } | Principal::Background { generation, .. } => *generation,
+    };
+    if prepared.binding != prepared.lifecycle.binding || current.policy_epoch != prepared.policy_epoch
+        || current.acl_generation != generation || current.tenant_id != prepared.tenant_id
+        || current.human.as_ref().map(|human| human.credential_epoch) != prepared.credential_epoch {
+        return Err(VerificationError::Revoked);
+    }
+    match &prepared.binding {
+        EmployeeBinding::Shared(tenant) => {
+            // A Personal mirror never appears under a live Shared employee.
+            if current.tenant_id != tenant.as_str() || current.personal_owner.is_some() {
+                return Err(VerificationError::Revoked);
+            }
+        }
+        EmployeeBinding::Personal(owner) => personal_facts(&prepared.agent, owner.as_str(), &prepared.principal, &current)?,
+    }
+    Ok(())
+}
 
 /// Captured by the authenticated gateway turn/dispatch path. Missing values stay
 /// missing; employee payloads and process environment never reconstruct them.
@@ -39,6 +182,10 @@ pub struct PreparedAuthority {
     policy: String,
     credential_epoch: Option<u64>,
     policy_epoch: u64,
+    /// users.db installation tenant observed at prepare.
+    tenant_id: String,
+    /// Lifecycle at prepare; every recheck requires the very same one.
+    lifecycle: EmployeeLifecycle,
     expires_at: u64,
     turn: Option<CapturedTurn>,
 }
@@ -59,6 +206,7 @@ pub struct GatewayAuthority {
     users: Arc<UserDb>,
     backend: Arc<SpawndBackend>,
     agents: Arc<super::AgentAdmission>,
+    root: Arc<RootSource>,
     next_revision: AtomicU64,
     employees: Mutex<BTreeMap<EmployeeId, String>>,
     runs: Mutex<BTreeMap<RunId, PreparedAuthority>>,
@@ -72,40 +220,19 @@ impl GatewayAuthority {
     pub fn new(home: PathBuf, users: Arc<UserDb>, backend: Arc<SpawndBackend>, agents: Arc<super::AgentAdmission>)
         -> Result<Self, VerificationError> {
         if !home.is_absolute() { return Err(VerificationError::Invalid); }
-        Ok(Self { home, users, backend, agents, next_revision: AtomicU64::new(1),
+        Ok(Self { home, users, backend, agents, root: Arc::new(lifecycle::RootAllocator),
+            next_revision: AtomicU64::new(1),
             employees: Mutex::new(BTreeMap::new()), runs: Mutex::new(BTreeMap::new()) })
     }
 
+    fn stores(&self) -> Stores<'_> {
+        Stores { home: &self.home, users: self.users.as_ref(), root: self.root.as_ref() }
+    }
+
     fn identity(&self, agent: &str, employee: EmployeeId, binding: &EmployeeBinding,
-        principal: &Principal) -> Result<(Option<u64>, u64), VerificationError> {
+        principal: &Principal, expected: Option<&EmployeeLifecycle>) -> Result<Identity, VerificationError> {
         (self.agents)(agent)?;
-        let EmployeeBinding::Shared(tenant) = binding else { return Err(VerificationError::BindingMismatch); };
-        let user = match principal { Principal::Human { user_id, .. } => Some(user_id.as_str()),
-            Principal::Background { .. } => None };
-        let current = self.users.isolation_authority_snapshot(user, agent)
-            .map_err(|_| VerificationError::Unavailable)?;
-        if current.tenant_id != tenant.as_str() { return Err(VerificationError::BindingMismatch); }
-        let credential_epoch = match principal {
-            Principal::Human { user_id, generation } => {
-                let human = current.human.ok_or(VerificationError::Revoked)?;
-                if human.user_id != user_id.as_str() || *generation != current.acl_generation {
-                    return Err(VerificationError::Revoked);
-                }
-                Some(human.credential_epoch)
-            }
-            Principal::Background { tenant_id, generation } => {
-                if tenant_id.as_str() != current.tenant_id || *generation != current.acl_generation {
-                    return Err(VerificationError::Revoked);
-                }
-                None
-            }
-        };
-        let receipt = crate::handlers::resolve_confirmed_employee(&self.home, agent)
-            .map_err(|_| VerificationError::Unavailable)?;
-        if receipt.disabled || receipt.employee != employee || receipt.label != agent {
-            return Err(VerificationError::Revoked);
-        }
-        Ok((credential_epoch, current.policy_epoch))
+        identity_with(&self.stores(), agent, employee, binding, principal, expected)
     }
 
     pub fn prepare(&self, agent: &str, grant: &mut GrantPolicy, authenticated_epoch: Option<u64>)
@@ -116,9 +243,10 @@ impl GatewayAuthority {
         }
         let now = duduclaw_mcp_boundary::authority::now_seconds()?;
         if grant.not_before > now || grant.expires_at <= now { return Err(VerificationError::InvalidTime); }
-        let receipt = crate::handlers::resolve_confirmed_employee(&self.home, agent)
-            .map_err(|_| VerificationError::Unavailable)?;
-        let (credential_epoch, policy_epoch) = self.identity(agent, receipt.employee, &grant.binding, &grant.principal)?;
+        let current = lifecycle::read_lifecycle_with(&self.home, agent, self.root.as_ref())
+            .map_err(lifecycle_refusal)?;
+        let Identity { credential_epoch, policy_epoch, tenant_id, lifecycle } =
+            self.identity(agent, current.employee, &grant.binding, &grant.principal, Some(&current))?;
         // Preserve the epoch authenticated at ingress; taking the current one
         // here would revive a session revoked before execution admission.
         if credential_epoch != authenticated_epoch { return Err(VerificationError::Revoked); }
@@ -132,16 +260,16 @@ impl GatewayAuthority {
         let revision = self.next_revision.fetch_update(Ordering::AcqRel, Ordering::Acquire,
             |value| value.checked_add(1)).map_err(|_| VerificationError::Unavailable)?;
         let mut employees = self.employees.lock().map_err(|_| VerificationError::Unavailable)?;
-        if let Some(prior) = employees.get(&receipt.employee) {
+        if let Some(prior) = employees.get(&lifecycle.employee) {
             if prior != agent { return Err(VerificationError::BindingMismatch); }
         } else {
             if employees.len() >= MAX_ASSOCIATIONS { return Err(VerificationError::Unavailable); }
-            employees.insert(receipt.employee, agent.to_owned());
+            employees.insert(lifecycle.employee, agent.to_owned());
         }
         grant.policy_revision = revision;
-        Ok(PreparedAuthority { agent: agent.to_owned(), employee: receipt.employee,
+        Ok(PreparedAuthority { agent: agent.to_owned(), employee: lifecycle.employee,
             principal: grant.principal.clone(), binding: grant.binding.clone(), revision,
-            policy, credential_epoch, policy_epoch, expires_at: grant.expires_at, turn: None })
+            policy, credential_epoch, policy_epoch, tenant_id, lifecycle, expires_at: grant.expires_at, turn: None })
     }
 
     fn recheck(&self, prepared: &PreparedAuthority) -> Result<(), VerificationError> {
@@ -151,31 +279,20 @@ impl GatewayAuthority {
         if duduclaw_mcp_boundary::authority::now_seconds()? >= prepared.expires_at {
             return Err(VerificationError::InvalidTime);
         }
-        let (epoch, policy_epoch) = self.identity(&prepared.agent, prepared.employee, &prepared.binding, &prepared.principal)?;
+        (self.agents)(&prepared.agent)?;
+        let identity = recheck_identity(&self.stores(), prepared)?;
         let policy = crate::approval::strict_policy_revision(&self.home, &prepared.agent)
             .map_err(|_| VerificationError::Unavailable)?;
-        compare_revision(prepared, epoch, policy_epoch, &policy)?;
+        compare_revision(prepared, identity.credential_epoch, identity.policy_epoch, &policy)?;
         self.check_epoch(prepared)
     }
 
     // Re-read after file/root I/O: a policy writer may have fenced and restored
-    // identical bytes while the preceding digest or Status RPC was in flight.
+    // identical bytes while the preceding digest or Status RPC was in flight,
+    // and a Personal owner may have lost membership or the mirror meanwhile.
     fn check_epoch(&self, prepared: &PreparedAuthority) -> Result<(), VerificationError> {
         (self.agents)(&prepared.agent)?;
-        let user = match &prepared.principal { Principal::Human { user_id, .. } => Some(user_id.as_str()),
-            Principal::Background { .. } => None };
-        let current = self.users.isolation_authority_snapshot(user, &prepared.agent)
-            .map_err(|_| VerificationError::Revoked)?;
-        let generation = match &prepared.principal {
-            Principal::Human { generation, .. } | Principal::Background { generation, .. } => *generation,
-        };
-        let EmployeeBinding::Shared(tenant) = &prepared.binding else { return Err(VerificationError::Revoked); };
-        if current.policy_epoch != prepared.policy_epoch || current.acl_generation != generation
-            || current.tenant_id != tenant.as_str()
-            || current.human.map(|human| human.credential_epoch) != prepared.credential_epoch {
-            return Err(VerificationError::Revoked);
-        }
-        Ok(())
+        check_current(&self.users, prepared)
     }
 
     /// Called after A reserves the run and before D issues its capability.
@@ -244,7 +361,9 @@ impl BindingAuthority for GatewayAuthority {
         -> Result<(), BindingError> {
         let agent = self.employees.lock().map_err(|_| BindingError::Unavailable)?.get(&employee)
             .cloned().ok_or(BindingError::Denied)?;
-        self.identity(&agent, employee, binding, principal).map(|_|()).map_err(|_| BindingError::Denied)
+        // A fresh lifecycle read: a recreated employee (new id), another
+        // principal or a lost Personal owner/membership is refused.
+        self.identity(&agent, employee, binding, principal, None).map(|_|()).map_err(|_| BindingError::Denied)
     }
     fn authorize_connector(&self, _employee: EmployeeId, _binding: &EmployeeBinding,
         _principal: &Principal, _account: &str) -> Result<(), BindingError> {
@@ -293,16 +412,28 @@ impl RunTurnResolver for GatewayAuthority {
 }
 
 #[cfg(test)]
+#[path = "authority_personal_tests.rs"]
+mod personal_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use duduclaw_isolation::bounded::Text;
     #[test]
     fn isolation_authority_compares_full_policy_and_credential_epoch() {
+        let binding = EmployeeBinding::Shared(Text::new("tenant".into()).unwrap());
+        let lifecycle = EmployeeLifecycle { employee: EmployeeId([1; 16]), label: "employee".into(),
+            allocation: duduclaw_migration::contract::ProposalBinding {
+                operation_id: duduclaw_migration::contract::ProposalOperationId {
+                    proposal_id: duduclaw_migration::ids::RequestId([1; 16]), revision: 1 },
+                proposal_digest: duduclaw_isolation::ids::Sha256Digest([2; 32]) },
+            uid: 70_001, binding: binding.clone() };
         let prepared = PreparedAuthority { agent: "employee".into(), employee: EmployeeId([1; 16]),
             principal: Principal::Human { user_id: Text::new("user".into()).unwrap(), generation: 5 },
-            binding: EmployeeBinding::Shared(Text::new("tenant".into()).unwrap()), revision: 1,
+            binding, revision: 1,
             policy: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123".into(),
-            credential_epoch: Some(9), policy_epoch: 12, expires_at: u64::MAX, turn: None };
+            credential_epoch: Some(9), policy_epoch: 12, tenant_id: "tenant".into(), lifecycle,
+            expires_at: u64::MAX, turn: None };
         assert!(compare_revision(&prepared, Some(9), 12, &prepared.policy).is_ok());
         // Restoring identical policy bytes cannot revive a pre-change run.
         assert!(compare_revision(&prepared, Some(9), 13, &prepared.policy).is_err());
