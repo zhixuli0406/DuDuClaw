@@ -518,7 +518,7 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
         tools: &tools, task, record })
         .map_err(|error| lifecycle::recheck_with(&home, lifecycle, root).err().map_or(error, lifecycle_refusal));
     let selection = select()?;
-    let signed_tools = selection.signed_tools(&tools)?; // file Workspace never signs A/E tools
+    let signed_tools = selection.signed_tools(&tools)?; // Workspace signs File (+ HX5 helpers), never pending A/E
     let text = |value| Text::new(value).map_err(|_| VerificationError::Invalid);
     let namespace = format!("agent:{agent}");
     let confined = |resource| ResourceGrant::Confined { resource: Box::new(resource) };
@@ -617,13 +617,13 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
             backend: backend.clone(),
         }),
     };
-    Ok(BootOwner { generation: sources.installed_generation.ok_or(VerificationError::Unavailable)?, fork_tools, execution_jobs, product_authority: sources.product_authority, home: home.to_owned(), backend, boundary, bindings, worker,
+    Ok(BootOwner { generation: sources.installed_generation.ok_or(VerificationError::Unavailable)?, fork_tools, execution_jobs, product_authority: sources.product_authority, home: home.to_owned(), backend: backend.clone(), boundary, bindings, worker,
         registry: sources.runtime_registry.take().ok_or(VerificationError::Unavailable)?,
         main_plans: sources.main_plans.take().ok_or(VerificationError::Unavailable)?,
         execution_plans: sources.execution_plans.take().ok_or(VerificationError::Unavailable)?,
         worker_plans: sources.worker_plans.take().ok_or(VerificationError::Unavailable)?,
         turns: sources.turns.take().ok_or(VerificationError::Unavailable)?,
-        selectors: SelectorSources { work_broker: sources.work_broker.take() },
+        selectors: SelectorSources::installed(sources.work_broker.take(), backend), // HX5: + spawnd feature view
         catalog: sources.connector_catalog, connectors: sources.connectors,
         connector_selection: sources.connector_selection, connector_stack: sources.connector_stack })
 }

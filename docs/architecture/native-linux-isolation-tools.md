@@ -20,6 +20,14 @@ rechecks (a change refuses the run):
   `csv_read` and `xlsx_read`: only when boot installed a root work broker
   (`BootSources.work_broker`, H5), the run's tool snapshot lists a file tool and
   the employee's current `agent.toml` allowed/denied tools still allow it.
+  HX5: the same grant is also selected for the in-run helper tools
+  `execute_program`, `code_map` and `office_script` (an employee without file
+  tools still sees and can call them): only when a root work broker is
+  installed, spawnd's readiness view advertises `helper_calls` at issuance
+  (`SpawndBackend::features`), the snapshot lists a helper tool and the profile
+  still allows it. No broker, no `helper_calls` bit or an unreadable view
+  withholds it (fail closed); losing the bit during issuance refuses the run.
+  Each call still requires the run's own `Reserved.features` bit.
 - `PublicOrigins { * }` (H7) for `web_fetch_cached` and `web_extract`: only for
   an employee-scope run and only when the admin set `agent.toml [isolation]
   public_web = true` for that employee (owner decision 2026-11-08: its own
@@ -51,15 +59,18 @@ rechecks (a change refuses the run):
   (`reason: task_not_owned`, `stage: schedule` or `issuance`).
 
 Workspace and URL-origin selection for the other File/A/E tools is still
-missing, including `execute_program` and browser recording
-(`browser_record_start` / `browser_record_stop`, task HX6). `employee-work` is
-also the A execution workspace handle, so when the issuer selects it for the
-file tools it leaves every other listed tool whose eligibility would rest on
-that grant out of the signed tool snapshot (`Selection::signed_tools`,
-`mcp-boundary` `workspace_selection::needs_execution_workspace`); those tools
-stay hidden and refused. The parity test tracks this gap
-explicitly; it is unfinished wiring, not another intentional isolation refusal
-or evidence of full employee parity. Until H5 installs the production work
+missing, including browser recording (`browser_record_start` /
+`browser_record_stop`, task HX6). `employee-work` is also the A execution
+workspace handle, so when the issuer selects it (for the file tools or the HX5
+helpers) it leaves every other listed tool whose eligibility would rest on that
+grant out of the signed tool snapshot (`Selection::signed_tools`, `mcp-boundary`
+`workspace_selection::drops_from_signed`): every tool in
+`workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS`, plus any other
+non-File tool that needs a Workspace. The in-run helpers are signed only when
+the grant was selected for them. Those dropped tools stay hidden and refused.
+The parity test tracks this gap explicitly, using that same list; it is
+unfinished wiring, not another intentional isolation refusal or evidence of
+full employee parity. Until H5 installs the production work
 broker, the file tools stay hidden in production even though the selector
 exists. The own-skill tools below (H12a) never receive a Workspace (or
 Recipient) grant from these selectors.
@@ -184,8 +195,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `odoo_create` | Resource → bound Odoo provider; RM-120 gates on the bound connector (explicit grant + per-table generic opt-in, never-writable list, module/block list, x2many commands, related-model authorization, account ACL and field checks); live RPC checks; production boot pending |
 | `odoo_write` | Resource → bound Odoo provider; RM-120 gates on the bound connector (explicit grant + per-table generic opt-in, never-writable list, module/block list, x2many commands, related-model authorization, account ACL and field checks); live RPC checks; production boot pending |
 | `skill_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee + exactly one own Wiki output grant (Confined Wiki), rechecked at publication; own SKILLS bytes parsed by E as data; publishes only into the caller's own wiki, body pages read back before the completion marker (H12a) |
-| `execute_program` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` and spawnd `helper_calls` |
-| `office_script` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` and spawnd `helper_calls` |
+| `execute_program` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` (H9 selects it for the helpers, no file tool needed) and spawnd `helper_calls`; signed only when that selection ran |
+| `office_script` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` (H9 selects it for the helpers, no file tool needed) and spawnd `helper_calls`; signed only when that selection ran |
 | `skill_bank_feedback` | Resource → AuthorizedToolCall → original live employee handler |
 | `computer_screenshot` | Resource → AuthorizedToolCall → original live employee handler |
 | `computer_click` | Resource → AuthorizedToolCall → original live employee handler |
@@ -235,8 +246,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `shared_skill_adopt` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee; shared skill scanned and prepared by E as data; scanned body copied only into the caller's own SKILLS (no clobber, read back); no target argument (H12a) |
 | `plan_start` | Resource → AuthorizedToolCall → original live employee handler |
 | `memory_improve` | Resource → AuthorizedToolCall → original live employee handler |
-| `browser_record_start` | A ExecutionBackend + ExecutionPlanFactory |
-| `browser_record_stop` | A ExecutionBackend + ExecutionPlanFactory |
+| `browser_record_start` | A ExecutionBackend + ExecutionPlanFactory; protected route pending (HX6): never signed with `employee-work` (`PENDING_WORKSPACE_SELECTOR_TOOLS`) |
+| `browser_record_stop` | A ExecutionBackend + ExecutionPlanFactory; protected route pending (HX6): never signed with `employee-work` (`PENDING_WORKSPACE_SELECTOR_TOOLS`) |
 | `desktop_record_start` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `desktop_record_stop` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `skill_from_recording` | Resource → original authenticated host orchestration; checked E parser required |
@@ -263,7 +274,7 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `memory_get_at` | Resource → AuthorizedToolCall → original live employee handler |
 | `memory_invalidate_by_origin` | Resource → AuthorizedToolCall → original live employee handler |
 | `memory_search_by_layer` | Resource → AuthorizedToolCall → original live employee handler |
-| `code_map` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` and spawnd `helper_calls` |
+| `code_map` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` (H9 selects it for the helpers, no file tool needed) and spawnd `helper_calls`; signed only when that selection ran |
 | `user_profile_record` | Resource → AuthorizedToolCall → original live employee handler |
 | `user_profile_get` | Resource → AuthorizedToolCall → original live employee handler |
 | `user_code_profile` | Resource → AuthorizedToolCall → original live employee handler |

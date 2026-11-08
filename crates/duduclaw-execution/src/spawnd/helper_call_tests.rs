@@ -142,11 +142,32 @@ async fn hx5_helper_client_start_wait_cancel_on_the_run_connection() {
     assert_eq!(backend.helper_wait(RUN, call_id()).await.unwrap(), HelperOutcome::Exited(0));
     backend.helper_control(Control::Cancel, RUN, call_id()).await.unwrap();
     let seen = worker.join().unwrap();
-    assert!(matches!(seen[1].0, SpawnRequest::HelperWait { run, call } if run == RUN && call == call_id()));
-    assert!(matches!(seen[2].0, SpawnRequest::HelperWait { .. }));
-    assert!(matches!(seen[3].0, SpawnRequest::HelperCancel { run, call } if run == RUN && call == call_id()));
+    assert!(matches!(seen[1].0, SpawnRequest::HelperWait { run, employee_id, call }
+        if run == RUN && employee_id == EMPLOYEE && call == call_id()));
+    assert!(matches!(seen[2].0, SpawnRequest::HelperWait { employee_id, .. } if employee_id == EMPLOYEE));
+    assert!(matches!(seen[3].0, SpawnRequest::HelperCancel { run, employee_id, call }
+        if run == RUN && employee_id == EMPLOYEE && call == call_id()));
     assert!(seen.iter().all(|(request, _)| !matches!(request, SpawnRequest::Cancel { .. })));
     assert!(!entry.connection.is_closed(), "per-call ops never fence the run");
+}
+
+/// HX4 fix round: `Stop`/`Cancel` may be `Ack`ed while delivery is still
+/// pending. `Ack` is acceptance only; the call ends at `HelperEnded`, which
+/// the client still polls for with `HelperWait`.
+#[tokio::test]
+async fn hx5_control_ack_is_acceptance_not_end() {
+    let (backend, entry, peer) = fixture(SpawndFeatures::HELPER_CALLS);
+    let ack: Reply = Box::new(|_, _| (SpawnResponse::Ack, vec![]));
+    let pending: Reply = Box::new(|_, _| (SpawnResponse::Error { code: ErrorCode::NotReady }, vec![]));
+    let ended: Reply = Box::new(|_, _| (SpawnResponse::HelperEnded { run: RUN, call: call_id(),
+        outcome: HelperOutcome::Signalled(9) }, vec![]));
+    let worker = root(peer, vec![ack, pending, ended]);
+    backend.helper_control(Control::Cancel, RUN, call_id()).await.unwrap();
+    assert_eq!(backend.helper_wait(RUN, call_id()).await.unwrap(), HelperOutcome::Signalled(9));
+    let seen = worker.join().unwrap();
+    assert!(matches!(seen[0].0, SpawnRequest::HelperCancel { .. }));
+    assert!(seen[1..].iter().all(|(request, _)| matches!(request, SpawnRequest::HelperWait { .. })));
+    assert!(!entry.connection.is_closed());
 }
 
 /// Root refusals are typed per-call results and keep the run's connection.
@@ -165,13 +186,17 @@ async fn hx5_helper_client_typed_refusals_keep_control() {
     }
 }
 
-/// The single constructor of the per-call control requests (the HX4 security
-/// round adds `employee_id` there only).
+/// The single constructor of the per-call control requests; it carries the
+/// run's admitted employee (HX4 security round, finding 8).
 #[test]
 fn hx5_control_requests_have_one_constructor() {
-    assert_eq!(control_request(Control::Wait, RUN, call_id(), EMPLOYEE), SpawnRequest::HelperWait { run: RUN, call: call_id() });
-    assert_eq!(control_request(Control::Stop, RUN, call_id(), EMPLOYEE), SpawnRequest::HelperStop { run: RUN, call: call_id() });
-    assert_eq!(control_request(Control::Cancel, RUN, call_id(), EMPLOYEE), SpawnRequest::HelperCancel { run: RUN, call: call_id() });
+    let (run, employee_id, call) = (RUN, EMPLOYEE, call_id());
+    assert_eq!(control_request(Control::Wait, RUN, call, EMPLOYEE), SpawnRequest::HelperWait { run, employee_id, call });
+    assert_eq!(control_request(Control::Stop, RUN, call, EMPLOYEE), SpawnRequest::HelperStop { run, employee_id, call });
+    assert_eq!(control_request(Control::Cancel, RUN, call, EMPLOYEE), SpawnRequest::HelperCancel { run, employee_id, call });
+    for request in [Control::Wait, Control::Stop, Control::Cancel].map(|control| control_request(control, RUN, call, EMPLOYEE)) {
+        request.validate().unwrap();
+    }
     let memfd = sealed_input(b"abc").unwrap();
     assert!(nix::unistd::write(&memfd, b"x").is_err(), "sealed input is immutable");
 }

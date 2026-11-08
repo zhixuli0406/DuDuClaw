@@ -20,6 +20,8 @@ const RESULT_SLACK_MS: u64 = 4_000;
 /// Revocation / principal-generation changes are observed at this cadence.
 const LIVE_POLL: Duration = Duration::from_millis(250);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on collecting `HelperEnded` after an accepted cancel (background).
+const END_AFTER_CANCEL: Duration = Duration::from_secs(30);
 
 pub(super) fn is_in_run(name: &str) -> bool {
     tool_policy::policy(name).is_some_and(|policy| policy.route == Route::InRunHelper)
@@ -62,9 +64,26 @@ impl InRunJob {
     pub fn call(&self) -> HelperCallId { self.call }
     /// `<run hex>:<call hex>`, for logs and audit; not a bearer selector.
     pub fn key(&self) -> String { format!("{}:{}", crate::execution_jobs::handle_text(self.run), self.call.hex()) }
-    async fn cancel(&self, backend: &dyn ExecutionBackend) -> Result<(), HelperError> {
-        backend.cancel_helper(self.run, self.call).await
+    /// Send `HelperCancel`. Its `Ack` only means root ACCEPTED the cancel:
+    /// delivery to the helper may still be pending (spawnd retries each tick),
+    /// so it is never treated as the call's end. The end is `HelperEnded`
+    /// alone; it is collected in the background (bounded) so the request that
+    /// cancelled answers refused/uncertain — never "ended" — without waiting
+    /// past its own deadline.
+    async fn cancel(self, backend: Arc<dyn ExecutionBackend>) {
+        let accepted = matches!(tokio::time::timeout(CANCEL_TIMEOUT, backend.cancel_helper(self.run, self.call)).await,
+            Ok(Ok(())));
+        if !accepted { return; }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(collect_end(backend, self.run, self.call));
+        }
     }
+}
+
+/// After an accepted cancel: poll `HelperWait` until root reports `HelperEnded`
+/// (consuming root's ended record), the run is gone, or the bound expires.
+async fn collect_end(backend: Arc<dyn ExecutionBackend>, run: RunHandle, call: HelperCallId) -> Option<HelperOutcome> {
+    tokio::time::timeout(END_AFTER_CANCEL, backend.wait_helper(run, call)).await.ok()?.ok()
 }
 
 /// Armed from `HelperStarted` until `HelperEnded`. Dropping the call future —
@@ -74,9 +93,7 @@ struct CallGuard { backend: Arc<dyn ExecutionBackend>, job: Option<InRunJob> }
 impl CallGuard {
     fn disarm(&mut self) { self.job = None; }
     async fn cancel(&mut self) {
-        if let Some(job) = self.job.take() {
-            let _ = tokio::time::timeout(CANCEL_TIMEOUT, job.cancel(self.backend.as_ref())).await;
-        }
+        if let Some(job) = self.job.take() { job.cancel(self.backend.clone()).await; }
     }
 }
 impl Drop for CallGuard {
@@ -84,9 +101,7 @@ impl Drop for CallGuard {
         let Some(job) = self.job.take() else { return };
         let backend = self.backend.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = tokio::time::timeout(CANCEL_TIMEOUT, job.cancel(backend.as_ref())).await;
-            });
+            runtime.spawn(job.cancel(backend));
         }
     }
 }

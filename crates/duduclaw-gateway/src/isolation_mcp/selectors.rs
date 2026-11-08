@@ -6,7 +6,13 @@
 //!   broker is installed at boot, the run's tool snapshot lists a file tool and
 //!   the employee's current profile (`agent.toml [capabilities]`
 //!   `allowed_tools`/`denied_tools`, the same `tool_list_verdict` the ingress
-//!   catalog uses) still allows it.
+//!   catalog uses) still allows it. HX5: the same grant is also selected when
+//!   the snapshot lists an in-run helper tool (`execute_program`, `code_map`,
+//!   `office_script`) that the profile allows, a work broker is installed and
+//!   spawnd's readiness view advertises `helper_calls` right now; any of
+//!   those missing (or an unreadable view) withholds it (fail closed). Only
+//!   then are the helper tools signed (`workspace_selection`); each call still
+//!   checks the run's own `Reserved.features`.
 //! * `PublicOrigins { * }` (H7, D-H2) — only for an employee-scope run (no
 //!   task) that lists `web_fetch_cached`/`web_extract`, and only when the admin
 //!   enabled protected public web for this employee: `agent.toml [isolation]
@@ -36,13 +42,17 @@
 //! re-runs `select` after its post-I/O lifecycle and users.db rechecks and
 //! refuses (`Revoked`) if anything changed (B2 pattern).
 use std::{io::Read, path::Path, sync::Arc};
-use duduclaw_isolation::{bounded::{List, Text}, capability::{PublicOrigin, ResourceGrant}, ids::EmployeeId};
+use duduclaw_isolation::{bounded::{List, Text}, capability::{PublicOrigin, ResourceGrant}, ids::EmployeeId,
+    ipc::SpawndFeatures};
 use duduclaw_mcp_boundary::{resources::{ResourceRoots, WorkBroker, EMPLOYEE_WORK_ROOT},
-    tool_policy::PUBLIC_ORIGIN_TOOLS};
+    tool_policy::{IN_RUN_HELPER_TOOLS, PUBLIC_ORIGIN_TOOLS}};
 use super::VerificationError;
 
 /// File tools served from the brokered `employee-work` root (H6/H11).
 pub(crate) const FILE_TOOLS: &[&str] = &["file_read", "csv_read", "xlsx_read"];
+/// spawnd's current readiness feature view (`SpawndBackend::features`). Read
+/// at issuance only; no view or an error must read as `SpawndFeatures::NONE`.
+pub(crate) type SpawndFeatureView = Arc<dyn Fn() -> SpawndFeatures + Send + Sync>;
 /// The tool the interactive `NewTask` grant authorizes.
 pub(crate) const NEW_TASK_TOOLS: &[&str] = &["create_task"];
 /// Upper bound for `agent.toml`; a larger file is not a profile we trust.
@@ -53,6 +63,25 @@ const PROFILE_MAX_BYTES: u64 = 1024 * 1024;
 #[derive(Clone, Default)]
 pub(crate) struct SelectorSources {
     pub(crate) work_broker: Option<Arc<dyn WorkBroker>>,
+    /// HX5: spawnd's advertised features; absent ⇒ no helper workspace.
+    pub(crate) spawnd_features: Option<SpawndFeatureView>,
+}
+
+impl SelectorSources {
+    /// Boot's producers: the optional work broker and the protected backend's
+    /// readiness feature view (`SpawndBackend::features`; a backend without a
+    /// feature source reads as no features, so no helper workspace).
+    #[cfg_attr(not(feature = "isolation-worker-integration"), allow(dead_code))]
+    pub(crate) fn installed(work_broker: Option<Arc<dyn WorkBroker>>, backend: Arc<duduclaw_execution::SpawndBackend>)
+        -> Self {
+        Self { work_broker, spawnd_features: Some(Arc::new(move || backend.features())) }
+    }
+    /// HX5 precondition of the helper workspace: a work broker is installed
+    /// and spawnd advertises `helper_calls` now. Anything else ⇒ false.
+    fn helper_calls(&self) -> bool {
+        self.work_broker.is_some()
+            && self.spawnd_features.as_ref().is_some_and(|view| view().contains(SpawndFeatures::HELPER_CALLS))
+    }
 }
 
 /// Facts the issuer passes in; all host-pinned, none from the employee.
@@ -78,6 +107,9 @@ pub(super) struct SelectedTask {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Selection {
     pub workspace: bool,
+    /// HX5: `workspace` was (also) selected for the in-run helper tools, so
+    /// exactly those are signed alongside it (`workspace_selection`).
+    pub helpers: bool,
     pub public_web: bool,
     /// The requester of an interactive run's `NewTask` grant.
     pub new_task: Option<String>,
@@ -88,19 +120,24 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
     if input.task.is_some() && !input.record { return Err(VerificationError::Invalid); }
     let listed = |name: &str| input.tools.as_slice().iter().any(|tool| tool.as_str() == name);
     let wants_files = sources.work_broker.is_some() && FILE_TOOLS.iter().any(|name| listed(*name));
+    // HX5: checked only when a helper tool is listed (no view read otherwise).
+    let wants_helpers = IN_RUN_HELPER_TOOLS.iter().any(|name| listed(*name)) && sources.helper_calls();
     // D-H2: PublicOrigins exists only alongside EmployeeScope; a task-limited
     // run never carries it, so it is not even considered there.
     let wants_web = input.task.is_none() && PUBLIC_ORIGIN_TOOLS.iter().any(|name| listed(*name));
     // NewTask: interactive runs only (a record-backed run plans under its own
     // record task, H8, and has no human requester of its own).
     let wants_new_task = !input.record && input.task.is_none() && NEW_TASK_TOOLS.iter().any(|name| listed(*name));
-    let profile = if wants_files || wants_web || wants_new_task { Some(read_profile(input.home, input.agent)?) } else { None };
+    let profile = if wants_files || wants_helpers || wants_web || wants_new_task {
+        Some(read_profile(input.home, input.agent)?)
+    } else { None };
     let allows = |names: &[&str]| profile.as_ref().is_some_and(|profile| {
         let caps = &profile.capabilities;
         names.iter().any(|name| listed(*name) && duduclaw_core::tool_catalog::tool_list_verdict(
             *name, &caps.denied_tools, &caps.allowed_tools) == duduclaw_core::tool_catalog::ToolListVerdict::Allowed)
     });
-    let workspace = wants_files && allows(FILE_TOOLS);
+    let helpers = wants_helpers && allows(&IN_RUN_HELPER_TOOLS[..]);
+    let workspace = (wants_files && allows(FILE_TOOLS)) || helpers;
     // Owner decision 2026-11-08: its own admin-only switch, independent of
     // `[container] network_access` (task sandbox only).
     let public_web = wants_web && profile.as_ref().is_some_and(|profile| profile.isolation.public_web)
@@ -121,7 +158,7 @@ pub(super) fn select(sources: &SelectorSources, input: &SelectorInput<'_>) -> Re
             Some(SelectedTask { id: id.to_owned() })
         }
     };
-    Ok(Selection { workspace, public_web, new_task, task })
+    Ok(Selection { workspace, helpers, public_web, new_task, task })
 }
 
 impl Selection {
@@ -148,17 +185,18 @@ impl Selection {
     }
 
     /// The tool snapshot to sign. The `Workspace { employee-work }` grant is
-    /// selected for the file tools only; no selector has chosen an execution
-    /// workspace yet. Every other listed tool whose eligibility would rest on
-    /// that grant (A/E tools such as browser recording, HX6) is left out of
-    /// the capability, so it stays hidden and refused. Only ever narrows.
+    /// selected for the file tools and — only with `helpers` — the HX5 in-run
+    /// helper tools. Every other listed tool whose eligibility would rest on
+    /// that grant (the shared pending list, e.g. browser recording until HX6,
+    /// and any other A/E tool) is left out of the capability, so it stays
+    /// hidden and refused. Only ever narrows.
     pub(super) fn signed_tools(&self, tools: &List<Text<128>, 256>)
         -> Result<List<Text<128>, 256>, VerificationError> {
         if !self.workspace { return Ok(tools.clone()); }
         // A task run is limited to its task and loses EmployeeScope.
         let scoped = self.task.is_none();
         List::new(tools.as_slice().iter().filter(|tool|
-            !duduclaw_mcp_boundary::workspace_selection::needs_execution_workspace(tool.as_str(), scoped))
+            !duduclaw_mcp_boundary::workspace_selection::drops_from_signed(tool.as_str(), scoped, self.helpers))
             .cloned().collect()).map_err(|_| VerificationError::Invalid)
     }
 }

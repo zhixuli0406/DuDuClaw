@@ -134,6 +134,14 @@ impl SharedEmployee {
         self
     }
 
+    /// Install spawnd's readiness feature view, as boot does with the
+    /// protected backend's `features()` (HX5 helper workspace selector).
+    pub fn with_spawnd_features(mut self, view: Arc<dyn Fn() -> duduclaw_isolation::ipc::SpawndFeatures + Send + Sync>)
+        -> Self {
+        self.sources.spawnd_features = Some(view);
+        self
+    }
+
     pub fn employee(&self) -> EmployeeId { self.root.0.employee }
     pub fn user(&self) -> &str { &self.user }
     pub fn epoch(&self) -> u64 { self.epoch }

@@ -120,21 +120,28 @@ fn documented_refusals() -> BTreeSet<String> {
 // issuer selects both. create_task is no longer task-run only: this interactive
 // run carries the issuer's NewTask grant (H9 owner decision 3).
 // `employee-work` is also the A workspace handle: when the issuer selects it for
-// the file tools it leaves out of the signed snapshot every tool below whose
-// eligibility would rest on that grant (`Selection::signed_tools`). Browser
-// recording is not routed in protected mode yet (HX6), so browser_record_start/
-// stop stay hidden and refused here.
+// the file tools (or the HX5 helpers) it leaves out of the signed snapshot every
+// tool below whose eligibility would rest on that grant (`Selection::signed_tools`).
+// The list is the one the issuer uses (`PENDING_WORKSPACE_SELECTOR_TOOLS`); the
+// issuer additionally drops any unreviewed workspace tool by policy, which this
+// inventory would report as an untracked gap. Browser recording is not routed
+// in protected mode yet (HX6), so browser_record_start/stop stay hidden and
+// refused here.
 fn pending_production_selectors() -> BTreeSet<String> {
     // H12a removed skill_extract, shared_skill_adopt, skill_security_scan,
     // skill_graduate and skill_curator_status: they select the issuer's own
     // Employee (+ own Confined wiki) under EmployeeScope, not a workspace.
     // HX5 removed execute_program, office_script and code_map: they are routed
     // in-run (`Route::InRunHelper`) on the run's own `Workspace{employee-work}`.
-    ["spawn_agent", "spawn_ephemeral", "inspect_branches", "diff_branches", "fork_cost", "discovery_catalog",
-        "discovery_list", "discovery_tree", "discovery_artifact", "discovery_cancel",
-        "browser_record_start", "browser_record_stop", "skill_from_recording",
-        "skill_synthesis_run", "skill_hub_install"]
-        .into_iter().map(str::to_owned).collect()
+    let pending: BTreeSet<String> = duduclaw_mcp_boundary::workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS
+        .iter().map(|tool| (*tool).to_owned()).collect();
+    for tool in duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS {
+        assert!(!pending.contains(tool), "{tool}: HX5 in-run helpers have their selector");
+    }
+    for tool in ["browser_record_start", "browser_record_stop"] {
+        assert!(pending.contains(tool), "{tool}: no protected route before HX6");
+    }
+    pending
 }
 
 /// H12a tools the production issuer must make eligible without new selectors.
@@ -266,7 +273,11 @@ enabled = true
     // H9: the admin enabled protected public web (`[isolation] public_web`)
     // in agent.toml above; the broker double stands in for H5's work broker.
     assert!(typed.isolation.public_web);
-    let shared = SharedEmployee::new(home, "main", employee).with_work_broker(Arc::new(ListingBroker));
+    // HX5: spawnd advertises `helper_calls` (and the work broker), so the
+    // issuer selects the helper workspace too.
+    let shared = SharedEmployee::new(home, "main", employee).with_work_broker(Arc::new(ListingBroker))
+        .with_spawnd_features(Arc::new(|| duduclaw_isolation::ipc::SpawndFeatures::HELPER_CALLS
+            .with(duduclaw_isolation::ipc::SpawndFeatures::WORK_BROKER)));
     let snapshot = shared.snapshot();
     let authorization = shared.authorize(&snapshot, Lane::Standard,
         crate::mcp_isolation_boot::CliDispatcherFactory.ingress_tools(home, "main", Lane::Standard).unwrap(),

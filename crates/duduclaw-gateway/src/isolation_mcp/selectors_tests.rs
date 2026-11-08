@@ -2,11 +2,12 @@
 //! (`tasks.db`) and authority stores; only the root ReadBack and the root work
 //! broker are fixtures (the broker is never called while issuing).
 use super::*;
-use std::{cell::Cell, os::unix::fs::PermissionsExt};
+use std::{cell::Cell, os::unix::fs::PermissionsExt, sync::atomic::{AtomicU32, Ordering}};
 use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord, Lane, PublicOrigin,
-    ResourceGrant}, ids::{RunId, Sha256Digest}};
+    ResourceGrant}, ids::{RunId, Sha256Digest}, ipc::SpawndFeatures};
 use duduclaw_mcp_boundary::{resources::{BrokeredWorkFile, WorkBroker, WorkBrokerError, WorkFileRequest,
-    EMPLOYEE_WORK_ROOT}, tool_policy::eligible, RequestContext};
+    EMPLOYEE_WORK_ROOT}, tool_policy::{eligible, IN_RUN_HELPER_TOOLS},
+    workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS, RequestContext};
 use duduclaw_migration::{allocation::Receipt, contract::ConfirmationItem};
 use crate::isolation_lifecycle::LifecycleError;
 
@@ -78,11 +79,27 @@ impl Fixture {
     }
 }
 
-fn fixture(broker: bool) -> Fixture {
+fn fixture(broker: bool) -> Fixture { fixture_with(broker, None) }
+
+/// spawnd's readiness view as the selector reads it; the bits can change
+/// between reads (spawnd restarted as another build).
+fn feature_view(bits: &Arc<AtomicU32>) -> selectors::SpawndFeatureView {
+    let bits = bits.clone();
+    Arc::new(move || SpawndFeatures(bits.load(Ordering::SeqCst)))
+}
+fn bits(features: SpawndFeatures) -> Arc<AtomicU32> { Arc::new(AtomicU32::new(features.0)) }
+/// Broker installed and spawnd advertising `features`.
+fn helper_fixture(features: SpawndFeatures) -> (Fixture, Arc<AtomicU32>) {
+    let bits = bits(features);
+    (fixture_with(true, Some(feature_view(&bits))), bits)
+}
+
+fn fixture_with(broker: bool, features: Option<selectors::SpawndFeatureView>) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("agents").join(LABEL)).unwrap();
     let mut employee = test_support::SharedEmployee::new(dir.path(), LABEL, EMPLOYEE);
     if broker { employee = employee.with_work_broker(Arc::new(NoBroker)); }
+    if let Some(view) = features { employee = employee.with_spawnd_features(view); }
     let fixture = Fixture { dir, employee };
     fixture.profile(false, "");
     fixture
@@ -157,23 +174,112 @@ fn h9_workspace_grant_only_when_profile_allows() {
     assert!(!eligible(&context(&auth), "file_read"));
 }
 
+fn signed(auth: &Authorization) -> Vec<&str> { auth.grant.tools.as_slice().iter().map(|tool| tool.as_str()).collect() }
+
 #[test]
 fn h10_file_workspace_never_signs_execution_tools() {
-    // `employee-work` is also the A workspace handle. Without an execution
-    // selector the issuer must not sign the A/E tools that grant would enable
-    // (browser recording stays hidden and refused until HX6).
+    // `employee-work` is also the A workspace handle. A grant selected for
+    // the file tools alone never signs the A/E tools it would enable: the
+    // pending ones (browser recording until HX6, hub install) and — without
+    // spawnd's `helper_calls` — the HX5 in-run helpers too.
     let names = ["file_read", "browser_record_start", "browser_record_stop", "execute_program", "code_map",
         "skill_hub_install", "tasks_update"];
-    let auth = fixture(true).issue(&names).unwrap();
-    assert!(has(&auth, &workspace()));
-    let signed: Vec<_> = auth.grant.tools.as_slice().iter().map(|tool| tool.as_str()).collect();
-    assert_eq!(signed, ["file_read", "tasks_update"]);
+    for features in [None, Some(SpawndFeatures::NONE), Some(SpawndFeatures::WORK_BROKER)] {
+        let f = fixture_with(true, features.map(|features| feature_view(&bits(features))));
+        let auth = f.issue(&names).unwrap();
+        assert!(has(&auth, &workspace()));
+        assert_eq!(signed(&auth), ["file_read", "tasks_update"], "{features:?}");
+        let ctx = context(&auth);
+        assert!(eligible(&ctx, "file_read"));
+        for tool in &names[1..6] { assert!(!eligible(&ctx, tool), "{features:?}: {tool}"); }
+    }
+    // HX5 truth: with `helper_calls` advertised the same grant also signs the
+    // in-run helpers, and still never the pending tools.
+    let (f, _) = helper_fixture(SpawndFeatures::HELPER_CALLS.with(SpawndFeatures::WORK_BROKER));
+    let auth = f.issue(&names).unwrap();
+    assert_eq!(signed(&auth), ["file_read", "execute_program", "code_map", "tasks_update"]);
     let ctx = context(&auth);
-    assert!(eligible(&ctx, "file_read"));
-    for tool in &names[1..6] { assert!(!eligible(&ctx, tool), "{tool}"); }
+    for tool in ["file_read", "execute_program", "code_map"] { assert!(eligible(&ctx, tool), "{tool}"); }
+    for tool in ["browser_record_start", "browser_record_stop", "skill_hub_install"] { assert!(!eligible(&ctx, tool), "{tool}"); }
     // No Workspace selected: the snapshot is signed unchanged.
     let auth = fixture(false).issue(&names).unwrap();
     assert_eq!(auth.grant.tools.as_slice().len(), names.len());
+}
+
+#[test]
+fn hx5_helper_tools_get_workspace_without_file_tools() {
+    let names = ["execute_program", "code_map", "office_script", "tasks_update"];
+    let (f, view) = helper_fixture(SpawndFeatures::HELPER_CALLS);
+    let auth = f.issue(&names).unwrap();
+    assert!(has(&auth, &workspace()), "an employee without file tools still gets the helper workspace");
+    assert!(auth.roots.is_brokered(EMPLOYEE_WORK_ROOT), "the brokered root, never a dirfd");
+    assert_eq!(signed(&auth), names);
+    let ctx = context(&auth);
+    for tool in IN_RUN_HELPER_TOOLS { assert!(eligible(&ctx, tool), "{tool}"); }
+    for tool in ["file_read", "csv_read"] { assert!(!eligible(&ctx, tool), "{tool}: not in the run's snapshot"); }
+    // A task-limited run keeps the helper workspace and the helpers.
+    f.tasks(&[("task-a", LABEL)]);
+    let auth = f.issue_task(&names, "task-a").unwrap();
+    assert!(has(&auth, &workspace()) && has(&auth, &task_grant("task-a")));
+    assert_eq!(signed(&auth), names);
+    capability(&auth).canonical_bytes().unwrap();
+
+    // Fail closed: no `helper_calls` bit, no view, or no broker ⇒ no grant,
+    // no root and the helpers stay hidden (signed unchanged, never eligible).
+    let without = |f: &Fixture| {
+        let auth = f.issue(&names).unwrap();
+        assert!(!auth.grant.resources.as_slice().iter().any(|grant| matches!(grant, ResourceGrant::Workspace { .. })));
+        assert!(!auth.roots.is_brokered(EMPLOYEE_WORK_ROOT));
+        for tool in IN_RUN_HELPER_TOOLS { assert!(!eligible(&context(&auth), tool), "{tool}"); }
+    };
+    view.store(SpawndFeatures::WORK_BROKER.0, Ordering::SeqCst);
+    without(&f);
+    view.store(SpawndFeatures::NONE.0, Ordering::SeqCst);
+    without(&f);
+    without(&fixture(true));
+    without(&fixture_with(false, Some(feature_view(&bits(SpawndFeatures::HELPER_CALLS)))));
+    // The profile is re-read: denying every listed helper withholds the grant.
+    view.store(SpawndFeatures::HELPER_CALLS.0, Ordering::SeqCst);
+    f.profile(false, r#"denied_tools = ["execute_program", "code_map", "office_script"]"#);
+    without(&f);
+    f.profile(false, r#"allowed_tools = ["code_map"]"#);
+    assert!(has(&f.issue(&["code_map"]).unwrap(), &workspace()));
+    f.profile(false, "");
+    // An unreadable profile fails the issuance closed, as for the file tools.
+    std::fs::remove_file(f.profile_path()).unwrap();
+    assert_eq!(f.issue(&["execute_program"]).err(), Some(VerificationError::Unavailable));
+    f.profile(false, "");
+    // spawnd losing `helper_calls` while the issuer does its I/O is a changed
+    // selector input: the post-I/O re-read refuses the run.
+    let lost = during(&f, Box::new(|| view.store(SpawndFeatures::WORK_BROKER.0, Ordering::SeqCst)));
+    assert_eq!(f.issue_with(&lost, &names, None).err(), Some(VerificationError::Revoked));
+}
+
+#[test]
+fn hx5_pending_tools_still_never_signed() {
+    let (f, _) = helper_fixture(SpawndFeatures::HELPER_CALLS.with(SpawndFeatures::WORK_BROKER));
+    f.tasks(&[("task-a", LABEL)]);
+    for with_files in [false, true] {
+        let mut names: Vec<&str> = PENDING_WORKSPACE_SELECTOR_TOOLS.to_vec();
+        names.extend(IN_RUN_HELPER_TOOLS);
+        if with_files { names.push("file_read"); }
+        for task in [None, Some("task-a")] {
+            let auth = match task { None => f.issue(&names), Some(task) => f.issue_task(&names, task) }.unwrap();
+            assert!(has(&auth, &workspace()), "{with_files} {task:?}");
+            let ctx = context(&auth);
+            for tool in PENDING_WORKSPACE_SELECTOR_TOOLS {
+                assert!(!signed(&auth).contains(tool), "{tool} signed ({with_files} {task:?})");
+                assert!(!eligible(&ctx, tool), "{tool} ({with_files} {task:?})");
+            }
+            for tool in ["browser_record_start", "browser_record_stop"] {
+                assert!(PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&tool), "{tool} stays pending until HX6");
+            }
+            for tool in IN_RUN_HELPER_TOOLS {
+                assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&tool), "{tool}");
+                assert!(eligible(&ctx, tool), "{tool} ({with_files} {task:?})");
+            }
+        }
+    }
 }
 
 #[test]

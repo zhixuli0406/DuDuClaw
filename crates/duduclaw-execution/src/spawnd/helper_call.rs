@@ -18,15 +18,15 @@ pub(super) enum Control { Wait, Stop, Cancel }
 
 /// The ONLY place the gateway builds `HelperWait`/`HelperStop`/`HelperCancel`.
 /// `employee` is the run's admitted employee (`Entry.employee`, from the
-/// reservation), never caller data. The HX4 security round adds
-/// `employee_id` to these requests: set it here, from `employee`, and nowhere else.
+/// reservation), never caller data. Root refuses a request whose
+/// `employee_id` is not the run's owner (HX4 security round, finding 8).
 pub(super) fn control_request(control: Control, run: RunHandle, call: HelperCallId, employee: EmployeeId)
     -> SpawnRequest {
-    let _ = employee;
+    let employee_id = employee;
     match control {
-        Control::Wait => SpawnRequest::HelperWait { run, call },
-        Control::Stop => SpawnRequest::HelperStop { run, call },
-        Control::Cancel => SpawnRequest::HelperCancel { run, call },
+        Control::Wait => SpawnRequest::HelperWait { run, employee_id, call },
+        Control::Stop => SpawnRequest::HelperStop { run, employee_id, call },
+        Control::Cancel => SpawnRequest::HelperCancel { run, employee_id, call },
     }
 }
 
@@ -109,6 +109,9 @@ impl SpawndBackend {
     }
 
     /// Kill the call's slot cgroup (queued or running), never the run.
+    /// `Ok(())` is root's `Ack`: the stop/cancel was ACCEPTED, possibly while
+    /// delivery is still pending (spawnd retries each tick, HX4 fix round). It
+    /// never means the call ended; only `helper_wait`'s `HelperEnded` does.
     pub(super) async fn helper_control(&self, control: Control, run: RunHandle, call: HelperCallId)
         -> Result<(), HelperError> {
         if control == Control::Wait { return Err(HelperError::Denied); }
@@ -121,7 +124,8 @@ impl SpawndBackend {
         }
     }
 
-    /// HX6: ask a recording helper to flush and exit (`HelperStop`).
+    /// HX6: ask a recording helper to flush and exit (`HelperStop`). `Ok` is
+    /// acceptance only; poll `helper_wait` for the recording's end.
     pub async fn stop_helper(&self, run: RunHandle, call: HelperCallId) -> Result<(), HelperError> {
         self.helper_control(Control::Stop, run, call).await
     }

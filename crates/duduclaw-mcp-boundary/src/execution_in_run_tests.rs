@@ -125,7 +125,11 @@ impl ExecutionBackend for Backend {
                 Wait::RunEnded => Ok(HelperOutcome::RunEnded),
                 Wait::NotLive => Err(HelperError::NotLive),
                 Wait::Uncertain => Err(HelperError::Uncertain),
-                Wait::Pending => std::future::pending().await,
+                // Root kills the slot only after a cancel; then `HelperEnded`.
+                Wait::Pending => {
+                    while self.cancelled.load(Ordering::SeqCst) == 0 { tokio::time::sleep(Duration::from_millis(5)).await; }
+                    Ok(HelperOutcome::Signalled(9))
+                }
             }
         })
     }
@@ -256,6 +260,24 @@ async fn revocation_mid_call_kills_helper() {
     assert_eq!(result["isError"], true);
     assert_eq!(Backend::count(&backend.cancelled), 1, "revocation sends HelperCancel");
     assert_eq!(Backend::count(&backend.killed), 0);
+    // The cancel's `Ack` is acceptance only: `HelperEnded` is still collected.
+    until(&backend.waited, 1).await;
+}
+
+/// HX4 fix round: `HelperCancel` may be answered `Ack` while delivery is still
+/// pending. The request never reports the call ended on that `Ack`; the end
+/// is only `HelperEnded`, polled afterwards with `HelperWait`.
+#[tokio::test]
+async fn hx5_cancel_ack_is_acceptance_not_end() {
+    let backend = Arc::new(Backend::new(Wait::Uncertain));
+    let result = bridge(&backend, Factory::default()).execute(&transport_context("execute_program", live()),
+        "execute_program", &json!({})).await;
+    assert_eq!(result["execution_status"], "uncertain", "{result}");
+    assert!(result.get("helper_status").is_none(), "no end status on an Ack: {result}");
+    assert_eq!(Backend::count(&backend.cancelled), 1);
+    // One wait before the cancel, one more after its Ack.
+    until(&backend.waited, 2).await;
+    assert_eq!(Backend::count(&backend.killed), 0);
 }
 
 #[tokio::test]
@@ -272,6 +294,7 @@ async fn mcp_cancelled_maps_to_helper_cancel() {
     task.abort();
     let _ = task.await;
     until(&backend.cancelled, 1).await;
+    until(&backend.waited, 1).await;
     assert_eq!(Backend::count(&backend.killed), 0);
     assert_eq!(Backend::count(&backend.reserved), 0);
     assert!(crate::server::cancels_request(
