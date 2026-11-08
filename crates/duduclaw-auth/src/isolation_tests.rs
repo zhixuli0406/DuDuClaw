@@ -169,7 +169,10 @@ fn isolation_authority_legacy_initialization_enables_standalone_policy_fence() {
     assert!(duduclaw_core::isolation_policy::fence_change(home.path()).is_err());
     let initialized = UserDb::new(&home.path().join("users.db")).unwrap();
     let before = initialized.isolation_authority_snapshot(None, "sales").unwrap();
-    duduclaw_core::org_store::upsert(home.path(), "sales", duduclaw_core::OrgEntry::new("boss", "sales")).unwrap();
+    {
+        let org = duduclaw_core::org_store::lock_org_mutations(home.path()).unwrap();
+        duduclaw_core::org_store::upsert(&org, "sales", duduclaw_core::OrgEntry::new("boss", "sales")).unwrap();
+    }
     let after = initialized.isolation_authority_snapshot(None, "sales").unwrap();
     assert_eq!(after.tenant_id, before.tenant_id);
     assert_eq!(after.policy_epoch, before.policy_epoch + 1);
