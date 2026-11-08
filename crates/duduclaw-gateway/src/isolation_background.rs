@@ -413,12 +413,13 @@ pub(crate) async fn authorize_current(agent_dir: &Path, principal_context: Optio
     let lane = if crate::explore_lane::in_explore() || receipt.lane == Lane::Explore { Lane::Explore } else { Lane::Standard };
     duduclaw_mcp_boundary::authority::verify_blocking(move || {
         recheck(&receipt)?;
+        // H10: the issuer limits the run to `task` and adds the record Task
+        // grant only after its H9 selector read live task ownership.
         let mut auth = crate::isolation_mcp::record_authorization(receipt.home.clone(), receipt.agent.clone(),
             user_id(&receipt.owner)?, receipt.epoch, lane,
             crate::isolation_mcp::HostTurn { identity: crate::isolation_egress::RunTurnIdentity {
                 turn, approval_session: session }, metadata: Some(metadata), principal_context,
-                egress_turn, background: Some(receipt.clone()) }, Some(receipt.expires_at))?;
-        if let Some(task) = task { auth.limit_to_task(task)?; }
+                egress_turn, background: Some(receipt.clone()) }, Some(receipt.expires_at), task)?;
         // Queue consumers are detached host waiters. The initiating employee
         // and run remain in the receipt; treating them as a synchronous waiter
         // would deadlock/refuse a valid self-delegation after its parent exits.

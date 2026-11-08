@@ -1,0 +1,340 @@
+//! H9 selector / H10 issuer tests. Real profile (`agent.toml`), task store
+//! (`tasks.db`) and authority stores; only the root ReadBack and the root work
+//! broker are fixtures (the broker is never called while issuing).
+use super::*;
+use std::{cell::Cell, os::unix::fs::PermissionsExt};
+use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord, Lane, PublicOrigin,
+    ResourceGrant}, ids::{RunId, Sha256Digest}};
+use duduclaw_mcp_boundary::{resources::{BrokeredWorkFile, WorkBroker, WorkBrokerError, WorkFileRequest,
+    EMPLOYEE_WORK_ROOT}, tool_policy::eligible, RequestContext};
+use duduclaw_migration::{allocation::Receipt, contract::ConfirmationItem};
+use crate::isolation_lifecycle::LifecycleError;
+
+const LABEL: &str = "alice";
+const EMPLOYEE: EmployeeId = EmployeeId([2; 16]);
+type Authorization = super::super::RuntimeAuthorization;
+
+/// Stands in for H5's spawnd bridge. Issuance must never open a file.
+struct NoBroker;
+impl WorkBroker for NoBroker {
+    fn open_work_file(&self, _: &WorkFileRequest<'_>) -> Result<BrokeredWorkFile, WorkBrokerError> {
+        Err(WorkBrokerError::Unavailable)
+    }
+}
+
+struct Fixture { dir: tempfile::TempDir, employee: test_support::SharedEmployee }
+impl Fixture {
+    fn home(&self) -> &Path { self.dir.path() }
+    fn profile_path(&self) -> std::path::PathBuf { self.home().join("agents").join(LABEL).join("agent.toml") }
+    fn profile(&self, network_access: bool, capabilities: &str) {
+        let path = self.profile_path();
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(path, test_support::agent_toml(LABEL, network_access, capabilities)).unwrap();
+    }
+    fn tasks(&self, rows: &[(&str, &str)]) {
+        let path = self.home().join("tasks.db");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, assigned_to TEXT NOT NULL)").unwrap();
+        for (id, agent) in rows {
+            db.execute("INSERT OR REPLACE INTO tasks(id, assigned_to) VALUES(?1, ?2)", rusqlite::params![id, agent]).unwrap();
+        }
+        drop(db);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fn background(&self, task: &str) -> crate::isolation_background::RecordAuthority {
+        let current = self.employee.snapshot();
+        serde_json::from_value(serde_json::json!({
+            "home": self.home(), "kind": "task", "id": task, "agent": LABEL,
+            "employee": EMPLOYEE, "owner": self.employee.user(), "epoch": self.employee.epoch(),
+            "acl_generation": current.acl_generation, "policy_epoch": current.policy_epoch,
+            "policy": "policy", "material": "material", "approval": null, "expires_at": u64::MAX,
+            "lane": Lane::Standard, "caller": null, "parent_run": null, "parent_agent": null,
+            "parent_policy": null, "parent": null, "detached_bus": false,
+        })).unwrap()
+    }
+    fn issue(&self, names: &[&str]) -> Result<Authorization, VerificationError> {
+        self.employee.authorize(&self.employee.snapshot(), Lane::Standard, tools(names), turn(None), None)
+    }
+    fn issue_task(&self, names: &[&str], task: &str) -> Result<Authorization, VerificationError> {
+        self.employee.authorize_record(&self.employee.snapshot(), Lane::Standard, tools(names),
+            turn(Some(self.background(task))), None, Some(task))
+    }
+    /// The production constructor with a wrapped root ReadBack.
+    fn issue_with(&self, root: &dyn RootAllocation, names: &[&str], task: Option<&str>)
+        -> Result<Authorization, VerificationError> {
+        let lifecycle = lifecycle::read_lifecycle_with(self.home(), LABEL, root).map_err(lifecycle_refusal)?;
+        human_authorization_with(self.home().to_owned(), LABEL.into(), EMPLOYEE, self.employee.user().into(),
+            self.employee.epoch(), Lane::Standard, &self.employee.snapshot(), tools(names),
+            turn(task.map(|task| self.background(task))), None, &lifecycle, root, self.employee.sources(), task)
+    }
+}
+
+fn fixture(broker: bool) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("agents").join(LABEL)).unwrap();
+    let mut employee = test_support::SharedEmployee::new(dir.path(), LABEL, EMPLOYEE);
+    if broker { employee = employee.with_work_broker(Arc::new(NoBroker)); }
+    let fixture = Fixture { dir, employee };
+    fixture.profile(false, "");
+    fixture
+}
+
+fn tools(names: &[&str]) -> List<Text<128>, 256> {
+    List::new(names.iter().map(|name| Text::new((*name).to_owned()).unwrap()).collect()).unwrap()
+}
+
+fn turn(background: Option<crate::isolation_background::RecordAuthority>) -> super::super::HostTurn {
+    super::super::HostTurn { identity: crate::isolation_egress::RunTurnIdentity {
+        turn: "h9-turn".into(), approval_session: None }, egress_turn: None,
+        metadata: None, principal_context: None, background }
+}
+
+fn capability(auth: &Authorization) -> CapabilityRecord {
+    CapabilityRecord { id: CapabilityId(Sha256Digest([1; 32])), employee: EMPLOYEE, run: RunId([3; 16]),
+        task: auth.grant.task.clone(), principal: auth.grant.principal.clone(),
+        employee_binding: auth.grant.binding.clone(), lane: auth.grant.lane, tools: auth.grant.tools.clone(),
+        resources: auth.grant.resources.clone(), policy_revision: auth.grant.policy_revision,
+        gateway_epoch: [4; 16], issued_at: auth.grant.not_before, not_before: auth.grant.not_before,
+        expires_at: auth.grant.expires_at, nonce: [5; 32], jti: [6; 16] }
+}
+
+fn context(auth: &Authorization) -> RequestContext { RequestContext::from_verified_record(capability(auth)) }
+
+fn has(auth: &Authorization, grant: &ResourceGrant) -> bool { auth.grant.resources.as_slice().contains(grant) }
+
+fn workspace() -> ResourceGrant { ResourceGrant::Workspace { handle: Text::new(EMPLOYEE_WORK_ROOT.into()).unwrap() } }
+fn public_any() -> ResourceGrant { ResourceGrant::PublicOrigins { origins: List::new(vec![PublicOrigin::any()]).unwrap() } }
+fn task_grant(id: &str) -> ResourceGrant { ResourceGrant::Task { id: Text::new(id.into()).unwrap() } }
+fn any_public(auth: &Authorization) -> bool {
+    auth.grant.resources.as_slice().iter().any(|grant| matches!(grant, ResourceGrant::PublicOrigins { .. }))
+}
+fn any_task(auth: &Authorization) -> bool {
+    auth.grant.resources.as_slice().iter().any(|grant| matches!(grant, ResourceGrant::Task { .. }))
+}
+
+#[test]
+fn h9_workspace_grant_only_when_profile_allows() {
+    let f = fixture(true);
+    let auth = f.issue(&["file_read", "csv_read"]).unwrap();
+    assert!(has(&auth, &workspace()));
+    assert!(auth.roots.is_brokered(EMPLOYEE_WORK_ROOT), "the grant comes with the brokered root, never a dirfd");
+    let ctx = context(&auth);
+    for tool in ["file_read", "csv_read"] { assert!(eligible(&ctx, tool), "{tool}"); }
+    assert!(!eligible(&ctx, "xlsx_read"), "a tool outside the run's snapshot stays hidden");
+
+    // The profile is re-read at issuance: a denial or an allowlist without
+    // any listed file tool withholds the grant and the root.
+    for capabilities in [r#"denied_tools = ["file_read", "csv_read", "xlsx_read"]"#, r#"allowed_tools = ["tasks_update"]"#] {
+        f.profile(false, capabilities);
+        let auth = f.issue(&["file_read", "csv_read"]).unwrap();
+        assert!(!has(&auth, &workspace()), "{capabilities}");
+        assert!(!auth.roots.is_brokered(EMPLOYEE_WORK_ROOT));
+        assert!(!eligible(&context(&auth), "file_read"));
+    }
+    f.profile(false, r#"allowed_tools = ["file_read"]"#);
+    assert!(has(&f.issue(&["file_read"]).unwrap(), &workspace()));
+    // No file tool in the run's snapshot: nothing to select.
+    assert!(!has(&f.issue(&["tasks_update"]).unwrap(), &workspace()));
+
+    // Without an installed root work broker there is no Workspace grant at all.
+    let g = fixture(false);
+    let auth = g.issue(&["file_read", "csv_read", "xlsx_read"]).unwrap();
+    assert!(!auth.grant.resources.as_slice().iter().any(|grant| matches!(grant, ResourceGrant::Workspace { .. })));
+    assert!(!auth.roots.is_brokered(EMPLOYEE_WORK_ROOT));
+    assert!(!eligible(&context(&auth), "file_read"));
+}
+
+#[test]
+fn h9_public_origins_only_when_admin_enabled() {
+    let f = fixture(false);
+    let web = ["web_fetch_cached", "web_extract"];
+    // Default (network_access = false): no web authority.
+    let auth = f.issue(&web).unwrap();
+    assert!(!any_public(&auth));
+    for tool in web { assert!(!eligible(&context(&auth), tool), "{tool}"); }
+
+    f.profile(true, "");
+    let auth = f.issue(&web).unwrap();
+    assert!(has(&auth, &public_any()));
+    assert!(auth.grant.resources.as_slice().contains(&ResourceGrant::EmployeeScope { id: EMPLOYEE }));
+    let ctx = context(&auth);
+    for tool in web { assert!(eligible(&ctx, tool), "{tool}"); }
+
+    // The employee's own denial still wins over the admin switch.
+    f.profile(true, r#"denied_tools = ["web_fetch_cached", "web_extract"]"#);
+    assert!(!any_public(&f.issue(&web).unwrap()));
+    // No web tool in the run's snapshot.
+    f.profile(true, "");
+    assert!(!any_public(&f.issue(&["tasks_update"]).unwrap()));
+    // A task-limited run has no EmployeeScope, so never PublicOrigins (D-H2).
+    f.tasks(&[("task-a", LABEL)]);
+    let auth = f.issue_task(&web, "task-a").unwrap();
+    assert!(!any_public(&auth));
+    capability(&auth).canonical_bytes().expect("task-limited record stays signable");
+}
+
+#[test]
+fn h9_task_grant_only_for_owned_record_task() {
+    let f = fixture(false);
+    f.tasks(&[("task-own", LABEL), ("task-other", "bob")]);
+    let auth = f.issue_task(&["create_task", "task_status"], "task-own").unwrap();
+    assert_eq!(auth.grant.task.as_ref().map(|task| task.as_str()), Some("task-own"));
+    assert!(has(&auth, &task_grant("task-own")));
+    assert!(!auth.grant.resources.as_slice().contains(&ResourceGrant::EmployeeScope { id: EMPLOYEE }));
+    capability(&auth).canonical_bytes().unwrap();
+    assert!(eligible(&context(&auth), "create_task"));
+
+    // Another employee's task, or one that does not exist: the run is still
+    // limited to it, but carries no Task grant, so create_task stays hidden.
+    for task in ["task-other", "task-missing"] {
+        let auth = f.issue_task(&["create_task"], task).unwrap();
+        assert_eq!(auth.grant.task.as_ref().map(|current| current.as_str()), Some(task));
+        assert!(!any_task(&auth), "{task}");
+        assert!(!eligible(&context(&auth), "create_task"), "{task}");
+    }
+    // A reassignment before issuance is read live.
+    f.tasks(&[("task-own", "bob")]);
+    assert!(!any_task(&f.issue_task(&["create_task"], "task-own").unwrap()));
+
+    // Interactive ingress cannot name a record task.
+    assert_eq!(f.employee.authorize_record(&f.employee.snapshot(), Lane::Standard, tools(&["create_task"]),
+        turn(None), None, Some("task-own")).err(), Some(VerificationError::Invalid));
+    // An interactive run has no task: no Task grant and no task-store read.
+    std::fs::remove_file(f.home().join("tasks.db")).unwrap();
+    let auth = f.issue(&["create_task"]).unwrap();
+    assert!(auth.grant.task.is_none() && !any_task(&auth));
+    assert!(!eligible(&context(&auth), "create_task"));
+}
+
+#[test]
+fn h9_selector_store_unreadable_fails_closed() {
+    let f = fixture(true);
+    let unavailable = Some(VerificationError::Unavailable);
+    let elsewhere = f.home().join("elsewhere.toml");
+    std::fs::write(&elsewhere, test_support::agent_toml(LABEL, true, "")).unwrap();
+    for case in ["malformed", "symlink", "hard link", "missing"] {
+        let path = f.profile_path();
+        std::fs::remove_file(&path).unwrap();
+        match case {
+            "malformed" => std::fs::write(&path, "[agent\nname = ").unwrap(),
+            "symlink" => std::os::unix::fs::symlink(&elsewhere, &path).unwrap(),
+            "hard link" => std::fs::hard_link(&elsewhere, &path).unwrap(),
+            _ => {}
+        }
+        for names in [&["web_fetch_cached"][..], &["file_read"][..]] {
+            assert_eq!(f.issue(names).err(), unavailable, "{case}: {names:?}");
+        }
+        // A run that needs no selector input reads nothing and is unaffected.
+        assert!(f.issue(&["tasks_update"]).is_ok(), "{case}");
+        let _ = std::fs::remove_file(&path);
+        f.profile(false, "");
+    }
+
+    // Task store: missing, writable by others, or without the tasks table.
+    assert_eq!(f.issue_task(&["create_task"], "task-a").err(), unavailable, "missing tasks.db");
+    f.tasks(&[("task-a", LABEL)]);
+    let store = f.home().join("tasks.db");
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert_eq!(f.issue_task(&["create_task"], "task-a").err(), unavailable, "unsafe tasks.db");
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(f.issue_task(&["create_task"], "task-a").is_ok());
+    rusqlite::Connection::open(&store).unwrap().execute_batch("DROP TABLE tasks").unwrap();
+    assert_eq!(f.issue_task(&["create_task"], "task-a").err(), unavailable, "tasks table missing");
+}
+
+#[test]
+fn h10_issuer_mac_covers_selected_grants() {
+    let f = fixture(true);
+    f.profile(true, "");
+    let auth = f.issue(&["file_read", "web_fetch_cached"]).unwrap();
+    let record = capability(&auth);
+    let signed = record.canonical_bytes().unwrap();
+    let with = |resources: Vec<ResourceGrant>| {
+        let mut changed = record.clone();
+        changed.resources = List::new(resources).unwrap();
+        changed.canonical_bytes().unwrap()
+    };
+    for grant in [workspace(), public_any()] {
+        // A plain member of the signed resource set, not a Confined wrapper.
+        assert!(record.resources.as_slice().contains(&grant), "{grant:?}");
+        duduclaw_mcp_boundary::tool_policy::validate_resource(&grant).unwrap();
+        let without: Vec<_> = record.resources.as_slice().iter().filter(|other| *other != &grant).cloned().collect();
+        assert_ne!(with(without), signed, "{grant:?} must be MAC-covered");
+    }
+    // Neither another workspace handle nor a different origin set verifies
+    // under the MAC of the issued bytes.
+    let swap = |from: &ResourceGrant, to: ResourceGrant| record.resources.as_slice().iter()
+        .map(|grant| if grant == from { to.clone() } else { grant.clone() }).collect::<Vec<_>>();
+    assert_ne!(with(swap(&workspace(), ResourceGrant::Workspace { handle: Text::new("other-root".into()).unwrap() })), signed);
+    assert_ne!(with(swap(&public_any(), ResourceGrant::PublicOrigins {
+        origins: List::new(vec![PublicOrigin::parse("https://example.org").unwrap()]).unwrap() })), signed);
+
+    f.tasks(&[("task-a", LABEL)]);
+    let auth = f.issue_task(&["create_task", "file_read"], "task-a").unwrap();
+    let record = capability(&auth);
+    let signed = record.canonical_bytes().unwrap();
+    assert!(record.resources.as_slice().contains(&task_grant("task-a")));
+    assert!(record.resources.as_slice().contains(&workspace()), "Workspace survives task narrowing");
+    let mut without = record.clone();
+    without.resources = List::new(record.resources.as_slice().iter()
+        .filter(|grant| **grant != task_grant("task-a")).cloned().collect()).unwrap();
+    assert_ne!(without.canonical_bytes().unwrap(), signed, "the record Task grant must be MAC-covered");
+    let mut other = record.clone();
+    other.task = Some(Text::new("task-b".into()).unwrap());
+    assert_ne!(other.canonical_bytes().unwrap(), signed);
+}
+
+/// Deterministically change selector inputs at the post-I/O lifecycle recheck
+/// (the issuer's second root ReadBack).
+struct DuringIssue<'a> {
+    root: &'a dyn RootAllocation,
+    reads: Cell<usize>,
+    change: Box<dyn Fn() + 'a>,
+}
+impl RootAllocation for DuringIssue<'_> {
+    fn read_back(&self, item: &ConfirmationItem) -> Result<Receipt, LifecycleError> {
+        self.reads.set(self.reads.get() + 1);
+        if self.reads.get() == 2 { (self.change)(); }
+        self.root.read_back(item)
+    }
+}
+fn during<'a>(f: &'a Fixture, change: Box<dyn Fn() + 'a>) -> DuringIssue<'a> {
+    DuringIssue { root: f.employee.root(), reads: Cell::new(0), change }
+}
+
+#[test]
+fn h10_reread_after_io() {
+    let f = fixture(true);
+    f.profile(true, "");
+    f.tasks(&[("task-a", LABEL)]);
+    let web = ["web_fetch_cached"];
+
+    // Unchanged inputs: issued, and the recheck really ran in between.
+    let quiet = during(&f, Box::new(|| {}));
+    assert!(has(&f.issue_with(&quiet, &web, None).unwrap(), &public_any()));
+    assert_eq!(quiet.reads.get(), 2);
+
+    // The admin turns public web off while the issuer is doing its I/O.
+    let off = during(&f, Box::new(|| f.profile(false, "")));
+    assert_eq!(f.issue_with(&off, &web, None).err(), Some(VerificationError::Revoked));
+    assert_eq!(off.reads.get(), 2);
+    // ...or turns it on: a grant that was not selected is not silently added.
+    let on = during(&f, Box::new(|| f.profile(true, "")));
+    assert_eq!(f.issue_with(&on, &web, None).err(), Some(VerificationError::Revoked));
+
+    // The profile stops allowing the file tools.
+    f.profile(true, "");
+    let denied = during(&f, Box::new(|| f.profile(true, r#"denied_tools = ["file_read"]"#)));
+    assert_eq!(f.issue_with(&denied, &["file_read"], None).err(), Some(VerificationError::Revoked));
+
+    // The task is reassigned to another agent mid-issuance.
+    f.profile(true, "");
+    let reassigned = during(&f, Box::new(|| f.tasks(&[("task-a", "bob")])));
+    assert_eq!(f.issue_with(&reassigned, &["create_task"], Some("task-a")).err(), Some(VerificationError::Revoked));
+    f.tasks(&[("task-a", LABEL)]);
+
+    // The profile becomes unreadable mid-issuance: fail closed, not Revoked
+    // (the lifecycle itself is still live).
+    let removed = during(&f, Box::new(|| std::fs::remove_file(f.profile_path()).unwrap()));
+    assert_eq!(f.issue_with(&removed, &web, None).err(), Some(VerificationError::Unavailable));
+}

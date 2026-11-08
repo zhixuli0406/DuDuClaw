@@ -118,6 +118,10 @@ mod boot;
 #[cfg(target_os = "linux")]
 #[path = "isolation_mcp/ingress.rs"]
 pub(crate) mod ingress;
+/// H9 issuer selectors (Workspace / PublicOrigins / record Task grants).
+#[cfg(target_os = "linux")]
+#[path = "isolation_mcp/selectors.rs"]
+mod selectors;
 #[cfg(target_os = "linux")]
 pub(crate) use boot::a_producers_ready;
 #[cfg(target_os = "linux")]

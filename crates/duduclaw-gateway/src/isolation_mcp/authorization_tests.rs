@@ -30,6 +30,8 @@ fn record(auth: &super::super::RuntimeAuthorization) -> CapabilityRecord {
 fn home() -> Fixture {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("agents/alice/wiki")).unwrap();
+    // H9 reads the profile because the tool snapshot lists web tools.
+    std::fs::write(home.path().join("agents/alice/agent.toml"), test_support::agent_toml("alice", false, "")).unwrap();
     let employee = test_support::SharedEmployee::new(home.path(), "alice", EmployeeId([2;16]));
     Fixture { dir: home, employee }
 }
@@ -47,8 +49,9 @@ fn isolation_issuer_real_output_preserves_service_and_connector_scope() {
     for tool in ["tasks_update", "computer_workspace_write", "gmail_create_draft", "send_message"] {
         assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}");
     }
-    // There is no production workspace/URL selector. Do not fabricate these
-    // grants to make full File/A/E inventory parity appear to pass.
+    // H9 selects Workspace only with an installed work broker and PublicOrigins
+    // only when the admin enabled network access (neither here); skill_extract
+    // has no selector yet. Do not fabricate these grants.
     for tool in ["file_read", "web_extract", "skill_extract"] {
         assert!(!duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}");
     }
@@ -79,6 +82,7 @@ fn isolation_issuer_task_background_is_finite_and_canonical() {
 fn isolation_issuer_no_wiki_root_means_no_confined_wiki_grant() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("agents/alice")).unwrap();
+    std::fs::write(home.path().join("agents/alice/agent.toml"), test_support::agent_toml("alice", false, "")).unwrap();
     let employee = test_support::SharedEmployee::new(home.path(), "alice", EmployeeId([2;16]));
     let home = Fixture { dir: home, employee };
     let auth = issue(&home, &home.snapshot(), None).unwrap();

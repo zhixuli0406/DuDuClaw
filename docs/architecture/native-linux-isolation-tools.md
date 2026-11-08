@@ -7,12 +7,33 @@
 
 The production human/background issuer now emits canonical EmployeeScope and
 Confined mailbox/table/wiki grants from its own host roots. Task-limited
-background work removes EmployeeScope and unwraps those exact grants. Inventory
-tests consume this issuer output. Trusted workspace and URL-origin selection is
-still missing at ingress: File/A/E tools needing those grants remain unavailable,
-including `file_read`, `skill_extract`, `execute_program` and `web_extract`.
-The parity test tracks this gap explicitly; it is unfinished wiring, not another
-intentional isolation refusal or evidence of full employee parity.
+background work removes EmployeeScope (and any PublicOrigins grant) and unwraps
+those exact grants. Inventory tests consume this issuer output.
+
+v1.81 Package H (H9 selectors in `isolation_mcp/selectors.rs`, H10 issuer hook in
+`isolation_mcp/boot.rs`) adds three issuer-selected, MAC-covered grants, each read
+at issuance from its authoritative store and fail-closed when that store is
+unsafe or unreadable, then re-read after the issuer's lifecycle/users.db
+rechecks (a change refuses the run):
+
+- `Workspace { employee-work }` with the brokered root (H6) for `file_read`,
+  `csv_read` and `xlsx_read`: only when boot installed a root work broker
+  (`BootSources.work_broker`, H5), the run's tool snapshot lists a file tool and
+  the employee's current `agent.toml` allowed/denied tools still allow it.
+- `PublicOrigins { * }` (H7) for `web_fetch_cached` and `web_extract`: only for
+  an employee-scope run and only when the admin set `agent.toml [container]
+  network_access = true` for that employee (an admin-only section; default
+  `false` = no web authority). Never derived from tool arguments.
+- the record `Task` grant (H8) for `create_task`: only for a task/schedule run
+  whose record task is assigned to the employee in `tasks.db` at issuance; a
+  run for another employee's task stays task-limited without the grant.
+
+Workspace and URL-origin selection for the other File/A/E tools is still
+missing, including `skill_extract` and `execute_program`. The parity test tracks
+this gap explicitly; it is unfinished wiring, not another intentional isolation
+refusal or evidence of full employee parity. Until H5 installs the production
+work broker, the file tools stay hidden in production even though the selector
+exists.
 
 Service/Connector tools enter `BoundaryRoute::Resource` unless an explicit host handler is selected by `boundary_route` (including the Linux bundled model catalog). Exact grants are resolved and checked before the legacy handler. A capability for task-a refuses task-b. Employee-scope calls retain the original live employee gates. Explicit `tasks_list`, `activity_list`, `list_cron_tasks`, `goals_list`, `list_reminders` and `responsibility_get` use finite queries/readers with immutable IDs and employee ownership. Finite `db_query` accepts a strict single-table SELECT subset lowered into the parameterized SelectRequest builder; joins, functions, subqueries and other unsupported grammar refuse. EmployeeScope retains its existing product SQL policy.
 
@@ -92,7 +113,7 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `os_audio_set` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `create_agent` | Refused: ProposalRequired — protected employees are created only through an approved Employee proposal. |
 | `list_agents` | Resource → AuthorizedToolCall → original live employee handler |
-| `create_task` | Host authenticated target queue admission; fresh target run authority required |
+| `create_task` | Host authenticated target queue admission; fresh target run authority required; H10 issues the record Task grant (H8 selector) only to a task/schedule run whose record task the employee owns in tasks.db at issuance, so interactive runs never list it |
 | `check_responses` | Resource → AuthorizedToolCall → original live employee handler |
 | `task_status` | Resource → AuthorizedToolCall → original live employee handler |
 | `agent_status` | Resource → AuthorizedToolCall → original live employee handler |
@@ -264,9 +285,9 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `db_tables` | Resource → bound DB provider; live source/table policy and post-pool I/O checks; production boot pending |
 | `db_select` | Resource → bound DB provider; live source/table policy and post-pool I/O checks; production boot pending |
 | `db_query` | Resource → selected DB; finite strict single-table SQL lowers to parameterized SelectRequest; EmployeeScope retains product SQL policy |
-| `file_read` | AuthorizedFile; live authority on each read |
-| `csv_read` | AuthorizedFile → checked E table parser |
-| `xlsx_read` | AuthorizedFile → checked E table parser |
+| `file_read` | AuthorizedFile; live authority on each read; H10 issues Workspace employee-work (brokered root, H6) when a root work broker is installed and the employee profile allows the tool |
+| `csv_read` | AuthorizedFile → checked E table parser; same H10 brokered Workspace grant as file_read |
+| `xlsx_read` | AuthorizedFile → checked E table parser; same H10 brokered Workspace grant as file_read |
 | `group_history_read` | Resource → selected exact channel/group → original live retained-history gates |
 | `send_message` | Resource → selected exact bot/channel/chat → checked sender; late failure is uncertain |
 | `send_photo` | Resource → selected exact channel/chat → checked media send; unsupported subtype/input refuses |
@@ -281,8 +302,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `create_reminder` | Resource → AuthorizedToolCall → original live employee handler |
 | `list_reminders` | Resource → EmployeeScope original handler / finite immutable reminder IDs + bounded reader |
 | `cancel_reminder` | Resource → AuthorizedToolCall → original live employee handler |
-| `web_fetch_cached` | Resource → original authenticated cache/fetch handler; existing egress and cache policy |
-| `web_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
+| `web_fetch_cached` | Resource → original authenticated cache/fetch handler; existing egress and cache policy; H10 issues PublicOrigins * (H7) only to an employee-scope run of an employee whose admin set agent.toml container network_access = true (default none) |
+| `web_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; same H10 PublicOrigins grant as web_fetch_cached |
 | `inference_status` | Resource → AuthorizedToolCall → original live employee handler |
 | `model_list` | Resource → AuthorizedToolCall → original live employee handler |
 | `model_load` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
