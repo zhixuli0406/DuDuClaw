@@ -54,13 +54,18 @@ const NOW: &str = "CAST(strftime('%s','now') AS INTEGER)";
 
 /// SQL expression: 1 when the account `id` (an SQL expression) is an
 /// eligible Admin now, else 0 (also for a missing account).
+///
+/// The inner aliases are private (`ae_*`) so they never shadow a caller's
+/// alias: with `id = "u.id"` from `... FROM users u WHERE {eligible_sql}`, an
+/// inner `users u` would turn `u.id={id}` into the always-true `u.id=u.id`
+/// and evaluate an arbitrary row's eligibility for every account.
 fn eligible_sql(id: &str) -> String {
     format!(
-        "COALESCE((SELECT (u.role='admin' AND u.status='active' AND u.must_change_password=0 AND (\
-         EXISTS(SELECT 1 FROM mfa_credentials m WHERE m.user_id=u.id) OR \
-         EXISTS(SELECT 1 FROM mfa_passkeys p WHERE p.user_id=u.id) OR \
-         EXISTS(SELECT 1 FROM mfa_email_credentials e WHERE e.user_id=u.id AND e.email=u.email))) \
-         FROM users u WHERE u.id={id}),0)"
+        "COALESCE((SELECT (ae_u.role='admin' AND ae_u.status='active' AND ae_u.must_change_password=0 AND (\
+         EXISTS(SELECT 1 FROM mfa_credentials ae_m WHERE ae_m.user_id=ae_u.id) OR \
+         EXISTS(SELECT 1 FROM mfa_passkeys ae_p WHERE ae_p.user_id=ae_u.id) OR \
+         EXISTS(SELECT 1 FROM mfa_email_credentials ae_e WHERE ae_e.user_id=ae_u.id AND ae_e.email=ae_u.email))) \
+         FROM users ae_u WHERE ae_u.id={id}),0)"
     )
 }
 

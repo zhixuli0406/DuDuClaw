@@ -164,3 +164,34 @@ fn admin_eligibility_log_seeded_once_and_future_schema_refused() {
     drop(db);
     assert!(UserDb::new(&dir.path().join("users.db")).is_err(), "a newer log schema is refused");
 }
+
+/// The set-valued readers (`eligible_user_ids`, the migration seed) apply the
+/// rule per account, not one arbitrary row's verdict to every account.
+#[test]
+fn eligible_user_ids_and_seed_are_per_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let (eligible, others) = {
+        let db = open(&dir);
+        let eligible = db.create_user("a@example.test", "A", "password1", UserRole::Admin).unwrap().id;
+        enroll_totp(&db, &eligible);
+        let no_mfa = db.create_user("nomfa@example.test", "N", "password1", UserRole::Admin).unwrap().id;
+        let employee = db.create_user("emp@example.test", "E", "password1", UserRole::Employee).unwrap().id;
+        enroll_totp(&db, &employee);
+        let suspended = db.create_user("s@example.test", "S", "password1", UserRole::Admin).unwrap().id;
+        enroll_totp(&db, &suspended);
+        db.set_user_status(&suspended, UserStatus::Suspended).unwrap();
+        let forced = db.create_user("f@example.test", "F", "password1", UserRole::Admin).unwrap().id;
+        enroll_totp(&db, &forced);
+        exec(&db, "UPDATE users SET must_change_password=1 WHERE id=?1", &forced);
+        let expected: std::collections::BTreeSet<String> = [eligible.clone()].into_iter().collect();
+        assert_eq!(eligible_user_ids(&db.conn()).unwrap(), expected);
+        db.conn().execute_batch("DROP TABLE admin_eligibility_log;
+            DELETE FROM auth_meta WHERE key IN ('admin_eligibility_log_schema','admin_eligibility_log_since');").unwrap();
+        (eligible, [no_mfa, employee, suspended, forced])
+    };
+    let db = open(&dir);
+    assert_eq!(rows_for(&db, &eligible).len(), 1, "the eligible Admin is seeded");
+    for other in &others {
+        assert!(rows_for(&db, other).is_empty(), "an ineligible account is not seeded");
+    }
+}
