@@ -1,0 +1,348 @@
+//! RM-027 `org_change`: a Manager's proposal to move an AI employee in the
+//! org chart (`reports_to` / `department`), waiting for an Admin.
+//!
+//! Dashboard-only (`approval_notify::is_dashboard_only_kind`): channels get a
+//! plain notice without buttons, and a channel decision is always refused.
+//! The payload carries everything the decision needs — no sidecar:
+//!
+//! ```json
+//! { "agent_id": "…",
+//!   "before": { "reports_to": "…", "department": "…" },
+//!   "after":  { "reports_to": "…", "department": "…" },
+//!   "base": "<sha256 of the effective org entry when proposed>",
+//!   "proposer": "<user id>", "proposer_email": "…", "reason": "…" }
+//! ```
+//!
+//! On approve the gateway takes the global org mutation lock, re-validates
+//! the move against the tree as it is *now*, refuses (and denies) a request
+//! whose `base` no longer matches, then applies — authority first, mirror
+//! second — writes an [`journal`] entry, and records the decision only after
+//! the write succeeded. If recording the decision fails, the journal lets a
+//! retry complete the original approval instead of judging the (now moved)
+//! base as stale. Expiry counts as a denial. At most one request per AI
+//! employee waits at a time.
+
+use serde_json::{Value, json};
+
+use crate::approval::{ApprovalRecord, ApprovalStatus};
+use duduclaw_core::org_store::OrgEntry;
+
+pub(crate) const ACTION_KIND: &str = "org_change";
+/// Three days; expiry counts as a denial.
+pub(crate) const TTL_SECS: i64 = 3 * 24 * 3600;
+/// Shown when an expired request is decided.
+pub(crate) const EXPIRED_TEXT: &str =
+    "這個組織調整的審核已逾期，調整沒有套用；需要的話請重新提出。";
+/// Longest `reason` kept in the payload.
+pub(crate) const MAX_REASON_CHARS: usize = 1000;
+
+/// `{reports_to, department}` as stored in the payload and returned by RPCs.
+pub(crate) fn entry_json(e: &OrgEntry) -> Value {
+    json!({ "reports_to": e.reports_to, "department": e.department })
+}
+
+fn entry_from(v: Option<&Value>) -> Option<OrgEntry> {
+    let v = v?;
+    Some(OrgEntry::new(
+        v.get("reports_to")?.as_str()?,
+        v.get("department")?.as_str()?,
+    ))
+}
+
+/// The parsed payload of one `org_change` request.
+#[derive(Debug, Clone)]
+pub(crate) struct Proposal {
+    pub agent_id: String,
+    pub before: OrgEntry,
+    pub after: OrgEntry,
+    pub base: String,
+    pub proposer: String,
+    pub proposer_email: String,
+    pub reason: String,
+}
+
+impl Proposal {
+    pub(crate) fn to_payload(&self) -> Value {
+        json!({
+            "agent_id": self.agent_id,
+            "before": entry_json(&self.before),
+            "after": entry_json(&self.after),
+            "base": self.base,
+            "proposer": self.proposer,
+            "proposer_email": self.proposer_email,
+            "reason": self.reason,
+        })
+    }
+
+    /// `None` when `rec` is not a well-formed `org_change` request (a
+    /// malformed payload is never applied).
+    pub(crate) fn from_record(rec: &ApprovalRecord) -> Option<Self> {
+        if rec.action_kind != ACTION_KIND {
+            return None;
+        }
+        let p = &rec.payload;
+        let s = |k: &str| p.get(k).and_then(Value::as_str).map(str::to_string);
+        let agent_id = s("agent_id")?;
+        // The broker's own agent column must agree with the payload: the
+        // decide gate authorises against the column.
+        if agent_id != rec.agent_id || !duduclaw_core::is_valid_agent_id(&agent_id) {
+            return None;
+        }
+        Some(Self {
+            agent_id,
+            before: entry_from(p.get("before"))?,
+            after: entry_from(p.get("after"))?,
+            base: s("base")?,
+            proposer: s("proposer").unwrap_or_default(),
+            proposer_email: s("proposer_email").unwrap_or_default(),
+            reason: s("reason").unwrap_or_default(),
+        })
+    }
+}
+
+/// Still waiting and not past its deadline.
+pub(crate) fn live_pending(rec: &ApprovalRecord) -> bool {
+    rec.status == ApprovalStatus::Pending && !rec.is_stale(chrono::Utc::now())
+}
+
+/// RFC 3339 deadline of `rec` (`null` when `created_at` does not parse).
+pub(crate) fn expires_at(rec: &ApprovalRecord) -> Value {
+    chrono::DateTime::parse_from_rfc3339(&rec.created_at)
+        .ok()
+        .map(|t| (t + chrono::Duration::seconds(rec.ttl_seconds)).to_rfc3339())
+        .map_or(Value::Null, Value::String)
+}
+
+/// zh-TW one-line summary for the approval card.
+pub(crate) fn summary(p: &Proposal) -> String {
+    let label = |e: &OrgEntry| {
+        let boss = if e.reports_to.is_empty() { "最上層".to_string() } else { format!("向「{}」回報", e.reports_to) };
+        let dept = if e.department.is_empty() { "無部門".to_string() } else { format!("部門「{}」", e.department) };
+        format!("{boss}、{dept}")
+    };
+    format!(
+        "{who} 提議調整 AI 員工「{agent}」的組織位置：{before} → {after}。",
+        who = duduclaw_core::truncate_chars(
+            if p.proposer_email.is_empty() { p.proposer.as_str() } else { p.proposer_email.as_str() },
+            80,
+        ),
+        agent = p.agent_id,
+        before = label(&p.before),
+        after = label(&p.after),
+    )
+}
+
+/// Applied-but-not-yet-recorded `org_change` approvals, keyed by approval id
+/// (`<home>/org_change_journal/<id>.json`).
+///
+/// The approval path applies first and records the decision second. When the
+/// second step fails, the card is still pending while the org chart has
+/// already moved — a plain retry would then see a moved `base` and deny the
+/// card as stale ("applied but recorded as denied"). The entry written right
+/// after the apply lets the retry finish the *original* decision instead; it
+/// is removed once the decision is recorded.
+pub(crate) mod journal {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    const DIR: &str = "org_change_journal";
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Applied {
+        pub approval_id: String,
+        pub agent_id: String,
+        pub before: OrgEntry,
+        pub after: OrgEntry,
+        /// User id of the Admin whose approval was applied.
+        pub approved_by: String,
+        pub applied_at: String,
+        pub registry_reloaded: bool,
+        pub mirror_synced: bool,
+    }
+
+    impl Applied {
+        fn to_json(&self) -> Value {
+            json!({
+                "approval_id": self.approval_id,
+                "agent_id": self.agent_id,
+                "before": entry_json(&self.before),
+                "after": entry_json(&self.after),
+                "approved_by": self.approved_by,
+                "applied_at": self.applied_at,
+                "registry_reloaded": self.registry_reloaded,
+                "mirror_synced": self.mirror_synced,
+            })
+        }
+
+        fn from_json(v: &Value) -> Option<Self> {
+            let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+            Some(Self {
+                approval_id: s("approval_id")?,
+                agent_id: s("agent_id")?,
+                before: entry_from(v.get("before"))?,
+                after: entry_from(v.get("after"))?,
+                approved_by: s("approved_by")?,
+                applied_at: s("applied_at").unwrap_or_default(),
+                registry_reloaded: v.get("registry_reloaded").and_then(Value::as_bool).unwrap_or(false),
+                mirror_synced: v.get("mirror_synced").and_then(Value::as_bool).unwrap_or(false),
+            })
+        }
+    }
+
+    /// Approval ids are UUIDs; anything else never becomes a path.
+    fn path_for(home: &Path, approval_id: &str) -> Option<PathBuf> {
+        let safe = !approval_id.is_empty()
+            && approval_id.len() <= 64
+            && approval_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        safe.then(|| home.join(DIR).join(format!("{approval_id}.json")))
+    }
+
+    /// Record that `a` was applied (atomic temp + rename).
+    pub(crate) fn record(home: &Path, a: &Applied) -> Result<(), String> {
+        let path = path_for(home, &a.approval_id).ok_or_else(|| "invalid approval id".to_string())?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let body = serde_json::to_vec_pretty(&a.to_json()).map_err(|e| e.to_string())?;
+        std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e.to_string()
+        })
+    }
+
+    /// `Ok(None)` when nothing was journaled for this id; `Err` when an entry
+    /// exists but cannot be read (the caller fails closed).
+    pub(crate) fn read(home: &Path, approval_id: &str) -> Result<Option<Applied>, String> {
+        let Some(path) = path_for(home, approval_id) else {
+            return Ok(None);
+        };
+        let raw = match std::fs::read(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+        let v: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+        match Applied::from_json(&v) {
+            Some(a) if a.approval_id == approval_id => Ok(Some(a)),
+            _ => Err("malformed org_change journal entry".into()),
+        }
+    }
+
+    /// Drop the entry once the decision is recorded.
+    pub(crate) fn clear(home: &Path, approval_id: &str) {
+        if let Some(path) = path_for(home, approval_id) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Is something journaled (or unreadable) for this id?
+    pub(crate) fn exists(home: &Path, approval_id: &str) -> bool {
+        path_for(home, approval_id).is_some_and(|p| p.exists())
+    }
+}
+
+/// The plain channel notice (no decision verb, no buttons).
+pub(crate) fn notice_body(rec: &ApprovalRecord, reminder: bool, deadline: &str) -> String {
+    let head = if reminder {
+        "⏰ 有一則組織調整的審核快到期了，逾時會自動拒絕"
+    } else {
+        "📥 有一則組織調整等待審核"
+    };
+    format!(
+        "{head}\n\
+         AI 員工：{agent}\n\
+         這類調整只能由管理員在儀表板的待辦清單決定，請開啟儀表板處理。\n\
+         期限：{deadline}未審核將自動拒絕\n\
+         編號：{id}",
+        agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),
+        id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(payload: Value, agent: &str) -> ApprovalRecord {
+        ApprovalRecord {
+            id: crate::approval::ApprovalId::new(),
+            agent_id: agent.into(),
+            action_kind: ACTION_KIND.into(),
+            summary: String::new(),
+            payload,
+            status: ApprovalStatus::Pending,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            decided_at: None,
+            decided_by: None,
+            ttl_seconds: TTL_SECS,
+            notify_channel: None,
+            notify_chat_id: None,
+            reminded_at: None,
+            simulation: None,
+            request_kind: Default::default(),
+            binding: None,
+            answer: None,
+            invalidated_reason: None,
+            on_behalf_of: None,
+        }
+    }
+
+    #[test]
+    fn payload_round_trips_and_a_mismatched_agent_column_is_refused() {
+        let p = Proposal {
+            agent_id: "rep".into(),
+            before: OrgEntry::new("lead", "業務"),
+            after: OrgEntry::new("ceo", ""),
+            base: "b".repeat(64),
+            proposer: "mgr".into(),
+            proposer_email: "mgr@example.invalid".into(),
+            reason: "調整".into(),
+        };
+        let back = Proposal::from_record(&rec(p.to_payload(), "rep")).unwrap();
+        assert_eq!((back.before, back.after), (p.before.clone(), p.after.clone()));
+        assert!(Proposal::from_record(&rec(p.to_payload(), "someone-else")).is_none());
+        assert!(Proposal::from_record(&rec(json!({"agent_id": "rep"}), "rep")).is_none());
+        assert!(summary(&p).contains("rep"));
+        assert!(expires_at(&rec(p.to_payload(), "rep")).is_string());
+    }
+
+    #[test]
+    fn the_journal_round_trips_and_never_builds_a_path_from_a_bad_id() {
+        let h = tempfile::tempdir().unwrap();
+        let id = crate::approval::ApprovalId::new();
+        let a = journal::Applied {
+            approval_id: id.as_str().into(),
+            agent_id: "rep".into(),
+            before: OrgEntry::new("lead", "業務"),
+            after: OrgEntry::new("ceo", ""),
+            approved_by: "admin-1".into(),
+            applied_at: chrono::Utc::now().to_rfc3339(),
+            registry_reloaded: true,
+            mirror_synced: false,
+        };
+        assert_eq!(journal::read(h.path(), id.as_str()), Ok(None));
+        journal::record(h.path(), &a).unwrap();
+        assert!(journal::exists(h.path(), id.as_str()));
+        assert_eq!(journal::read(h.path(), id.as_str()), Ok(Some(a.clone())));
+        journal::clear(h.path(), id.as_str());
+        assert_eq!(journal::read(h.path(), id.as_str()), Ok(None));
+        let bad = journal::Applied { approval_id: "../escape".into(), ..a.clone() };
+        assert!(journal::record(h.path(), &bad).is_err());
+        assert!(!h.path().join("escape.json").exists());
+        // An entry that exists but does not parse fails closed.
+        std::fs::create_dir_all(h.path().join("org_change_journal")).unwrap();
+        std::fs::write(h.path().join("org_change_journal").join(format!("{}.json", id.as_str())), "{").unwrap();
+        assert!(journal::read(h.path(), id.as_str()).is_err());
+    }
+
+    #[test]
+    fn the_kind_is_dashboard_only_with_its_own_texts() {
+        assert!(crate::approval_notify::is_dashboard_only_kind(ACTION_KIND));
+        assert_eq!(crate::approval_notify::dashboard_only_expired_text(ACTION_KIND), EXPIRED_TEXT);
+        let body = crate::approval_notify::dashboard_only_notice_body(&rec(json!({}), "rep"), false);
+        assert!(body.contains("組織調整") && body.contains("rep"), "{body}");
+        assert!(!body.contains("知識"), "must not be worded as a knowledge review: {body}");
+    }
+}

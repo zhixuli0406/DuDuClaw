@@ -84,6 +84,9 @@ pub const ENTERPRISE_ONLY_ERROR_CODE: &str = "enterprise_edition_required";
 ///   cards are hidden by conditional rendering, not by RPC.
 /// - `topology.*` (組織架構) — D6 turned it into progressive disclosure
 ///   (`requiresData`), visible in **both** editions once ≥3 agents exist.
+/// - `org.*` (RM-027 組織圖編輯：調整 reports_to / 部門) — the org chart is
+///   cross-*agent*; a Personal owner (always the Admin) re-parents their own
+///   employees with `org.apply_change`. Role floors live in `dashboard_scope`.
 pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
     // Account-rights metadata follows schema scanning in both editions.
     // dispatch_system separately requires Admin for both RPCs.

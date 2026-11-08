@@ -28,6 +28,29 @@ pub fn with_file_lock<T>(path: &Path, f: impl FnOnce() -> io::Result<T>) -> io::
     result
 }
 
+/// An exclusive cross-process advisory lock held for as long as the guard
+/// lives (same sidecar `<path>.lock` scheme as [`with_file_lock`]). For a
+/// critical section that cannot be one closure — e.g. one spanning `.await`
+/// points. Unlocked on drop.
+#[derive(Debug)]
+pub struct FileLockGuard {
+    file: File,
+}
+
+impl Drop for FileLockGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+/// Take the lock [`with_file_lock`] would take, returning a guard instead of
+/// running a closure. Blocks until the lock can be acquired. Two guards for
+/// the same path conflict even inside one process (each holds its own open
+/// file description), so the lock is not re-entrant.
+pub fn lock_exclusive(path: &Path) -> io::Result<FileLockGuard> {
+    Ok(FileLockGuard { file: acquire(path)? })
+}
+
 fn acquire(path: &Path) -> io::Result<File> {
     let lock_path = lock_path_for(path);
     if let Some(parent) = lock_path.parent() {
@@ -80,6 +103,26 @@ mod tests {
         assert_eq!(contents, "{\"a\":1}\n");
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::remove_file(lock_path_for(&target));
+    }
+
+    #[test]
+    fn a_guard_excludes_a_second_holder_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("locks").join("guarded");
+        let guard = lock_exclusive(&target).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t2 = target.clone();
+        let waiter = std::thread::spawn(move || {
+            let _g = lock_exclusive(&t2).unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            "a second holder must wait while the guard lives"
+        );
+        drop(guard);
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        waiter.join().unwrap();
     }
 
     #[test]

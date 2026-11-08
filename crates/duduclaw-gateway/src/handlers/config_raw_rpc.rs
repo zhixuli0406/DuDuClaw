@@ -986,12 +986,48 @@ impl MethodHandler {
             }
         }
 
+        // RM-027: a raw edit that moves `[agent] reports_to` / `department`
+        // is an org change like `agents.update`'s — same global org lock,
+        // same whole-tree rule (existence, self, cycle) against the
+        // authority re-read inside the lock, authority committed BEFORE the
+        // agent.toml mirror, and a refused/failed write puts it back. A
+        // validation failure refuses the raw save. An edit that leaves the
+        // pair as it was is not an org write and never touches the authority.
+        let org_pair = |t: &toml::Table| {
+            let get = |p: &str| {
+                super::config_commit::toml_at(t, p).and_then(|v| v.as_str()).unwrap_or("").to_string()
+            };
+            duduclaw_core::OrgEntry::new(get("agent.reports_to"), get("agent.department"))
+        };
+        let mut org_lock = None;
+        let mut org_prewrite: Option<(Option<duduclaw_core::OrgEntry>, duduclaw_core::OrgEntry)> = None;
+        if let RawFile::Agent(id) = &kind {
+            let (org_before, org_after) = (org_pair(&before), org_pair(&after));
+            if org_before != org_after {
+                let lock = super::org_change_rpc::lock_org(&self.home_dir).await?;
+                let store = lock.load().map_err(|e| e.to_string())?;
+                let reports_to_changed = org_before.reports_to != org_after.reports_to;
+                duduclaw_core::org_change::validate_org_change_in(
+                    &store,
+                    &self.home_dir,
+                    id,
+                    reports_to_changed.then_some(org_after.reports_to.as_str()),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+                let prior = store.get(id).cloned();
+                lock.upsert(id, org_after.clone()).map_err(|e| e.to_string())?;
+                org_prewrite = Some((prior, org_after));
+                org_lock = Some(lock);
+            }
+        }
+
         let mut backup = None;
         if let RawFile::Agent(id) = &kind {
             // agent.toml goes through the profile file writer (version kept
             // outside the employee directory, `agent_file_changed` audit).
             let text = new_text.clone();
-            crate::agent_files::writer::commit(
+            let committed = crate::agent_files::writer::commit(
                 &self.registry,
                 crate::agent_files::writer::Commit {
                     home: &self.home_dir,
@@ -1013,7 +1049,19 @@ impl MethodHandler {
                 },
             )
             .await
-            .map_err(|e| rctx.scrub(&e.message()))?;
+            .map_err(|e| rctx.scrub(&e.message()));
+            if let Err(e) = committed {
+                // The mirror was not written: put the authority back.
+                if let (Some(lock), Some((prior, _))) = (&org_lock, &org_prewrite)
+                    && let Err(re) = lock.restore(id, prior.clone())
+                {
+                    return Err(format!(
+                        "{e}（另外，組織權威資料沒有還原成功：{re}；請管理員在組織圖確認這位 AI 員工的位置）"
+                    )
+                    .into());
+                }
+                return Err(e.into());
+            }
         } else {
             let backup_text = if stored.is_empty() {
                 None
@@ -1041,6 +1089,8 @@ impl MethodHandler {
                 .map_err(|e| format!("write task failed: {e}"))??;
         }
 
+        // Committed (authority first, then mirror): release the org lock.
+        drop(org_lock);
         let backup_name = backup
             .as_ref()
             .and_then(|b| b.file_name())
@@ -1176,9 +1226,8 @@ impl MethodHandler {
                 hot.push("inference".into());
             }
             RawFile::Agent(id) => {
-                if has("agent") {
-                    self.sync_org_after_raw_edit(id, before, after);
-                }
+                // The org pair was committed to the authority inside the org
+                // lock before the mirror (see `config_raw_set_inner`).
                 let rescanned = self.registry.write().await.scan().await.is_ok();
                 if rescanned {
                     hot.push("registry".into());
@@ -1208,23 +1257,6 @@ impl MethodHandler {
         (hot, restart)
     }
 
-    /// A raw edit of `[agent] reports_to` / `department` moves the employee in
-    /// the org authority too (same rule as `agents.update`: only when changed).
-    fn sync_org_after_raw_edit(&self, id: &str, before: &toml::Table, after: &toml::Table) {
-        if !key_changed(before, after, "agent.reports_to") && !key_changed(before, after, "agent.department") {
-            return;
-        }
-        let get = |p: &str| {
-            super::config_commit::toml_at(after, p)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
-        let entry = duduclaw_core::OrgEntry::new(get("agent.reports_to"), get("agent.department"));
-        if let Err(e) = duduclaw_core::org_store::upsert(&self.home_dir, id, entry) {
-            warn!(agent = %id, error = %e, "org.toml upsert failed after config.raw.set");
-        }
-    }
 }
 
 #[cfg(test)]

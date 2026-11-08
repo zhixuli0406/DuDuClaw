@@ -43,6 +43,7 @@ pub mod match_utils;
 pub mod net_addr;
 pub mod mcp_scopes;
 pub mod org;
+pub mod org_change;
 pub mod org_field_guard;
 pub mod org_store;
 pub mod pack;

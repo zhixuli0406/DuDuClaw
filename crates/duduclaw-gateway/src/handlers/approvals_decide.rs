@@ -243,6 +243,11 @@ impl MethodHandler {
             if rec.action_kind == crate::agent_files::approval::ACTION_KIND {
                 return Box::pin(self.decide_agent_file_change(&broker, &approval_id, approve, ctx)).await;
             }
+            // RM-027: an org chart change applies first (re-validated, base
+            // re-checked) and records the decision only after the write.
+            if rec.action_kind == crate::org_change_approval::ACTION_KIND {
+                return Box::pin(self.decide_org_change(&broker, &approval_id, approve, &reason, ctx)).await;
+            }
         }
         if let Some(rec) = &record {
             if rec.action_kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE {

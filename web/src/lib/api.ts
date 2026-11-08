@@ -6155,6 +6155,88 @@ export interface DepartmentInfo {
   skills: number;
 }
 
+// ── Org chart editing (RM-027) ──────────────────────────────────────────────
+
+/** One employee's org placement. `reports_to` empty = top level; `department` empty = none. */
+export interface OrgPlacement {
+  reports_to: string;
+  department: string;
+}
+
+/**
+ * Fields to change. Omit a field to keep its current value; `''` clears it
+ * (top level / no department). At least one field is required.
+ */
+export interface OrgChangeFields {
+  reports_to?: string;
+  department?: string;
+}
+
+/** `org.propose_change` — a Manager's (or Admin's) proposal, waiting for an Admin. */
+export interface OrgProposeResult {
+  status: 'pending_approval';
+  approval_id: string;
+  agent_id: string;
+  before: OrgPlacement;
+  after: OrgPlacement;
+  /** Fingerprint of the placement the proposal was made against. */
+  base: string;
+  /** RFC 3339, or null when unknown. */
+  expires_at: string | null;
+}
+
+/** `org.apply_change` — an Admin's change, applied immediately. */
+export interface OrgApplyResult {
+  /** `mirror_synced`: nothing changed in the org data; only the employee-settings copy was re-synced. */
+  status: 'applied' | 'mirror_synced';
+  agent_id: string;
+  /** Only for `applied`. */
+  before?: OrgPlacement;
+  /** Only for `applied`. */
+  after?: OrgPlacement;
+  /** Only for `mirror_synced`: the placement that was re-synced. */
+  placement?: OrgPlacement;
+  /** The new fingerprint (use it as `expected_base` for a follow-up change). */
+  base: string;
+  registry_reloaded: boolean;
+  /** Waiting proposals for this employee that the change superseded (`applied` only). */
+  withdrawn_pending?: string[];
+}
+
+/** One row of `org.pending_changes`. */
+export interface OrgPendingChange {
+  approval_id: string;
+  agent_id: string;
+  before: OrgPlacement;
+  after: OrgPlacement;
+  base: string;
+  /** The placement moved since it was proposed — approving it will be refused. */
+  stale: boolean;
+  proposer: string;
+  proposer_email: string;
+  reason: string;
+  created_at: string;
+  expires_at: string | null;
+}
+
+/**
+ * `error.code` values the org RPCs return as `{ code, message }` (other
+ * refusals, e.g. permission, are plain strings). `stale_base` also carries
+ * `current: OrgPlacement` and `current_base: string`; `pending_exists`
+ * carries `approval_id`.
+ */
+export type OrgChangeErrorCode =
+  | 'agent_not_found'
+  | 'self_report'
+  | 'target_not_found'
+  | 'cycle'
+  | 'invalid_department'
+  | 'unknown_department'
+  | 'no_change'
+  | 'root_requires_admin'
+  | 'pending_exists'
+  | 'stale_base';
+
 export interface TemplateCreateAgentResult {
   success: boolean;
   warning: string | null;
@@ -6571,6 +6653,43 @@ export const api = {
       client.call('departments.create', { name }) as Promise<{ success: boolean; name: string }>,
     remove: (name: string, force?: boolean) =>
       client.call('departments.remove', { name, ...(force ? { force } : {}) }) as Promise<{ success: boolean }>,
+  },
+  // Org chart editing (RM-027). Manager+: propose / pending; Admin: apply.
+  org: {
+    /** File a change for an Admin to approve (Manager or above). */
+    proposeChange: (agentId: string, fields: OrgChangeFields, reason?: string) =>
+      client.call('org.propose_change', {
+        agent_id: agentId,
+        ...fields,
+        ...(reason ? { reason } : {}),
+      }) as Promise<OrgProposeResult>,
+    /** Apply now (Admin only). `expectedBase` is the `base` the confirmation dialog showed. */
+    applyChange: (agentId: string, fields: OrgChangeFields, expectedBase: string) =>
+      client.call('org.apply_change', {
+        agent_id: agentId,
+        ...fields,
+        expected_base: expectedBase,
+      }) as Promise<OrgApplyResult>,
+    /**
+     * The employee's authoritative placement and its `base` (Manager or
+     * above) — the "before" side of the confirmation dialog and the
+     * `expectedBase` for applyChange. `agents.org_chart` shows the display
+     * mirror, which can drift (`mirror_drift`).
+     */
+    placement: (agentId: string) =>
+      client.call('org.placement', { agent_id: agentId }) as Promise<{
+        agent_id: string;
+        placement: OrgPlacement;
+        source: 'authority' | 'mirror';
+        mirror_drift: boolean;
+        base: string;
+      }>,
+    /** Waiting org changes the caller may see (Manager or above). */
+    pendingChanges: (agentId?: string) =>
+      client.call('org.pending_changes', agentId ? { agent_id: agentId } : {}) as Promise<{
+        count: number;
+        pending: OrgPendingChange[];
+      }>,
   },
   runtime: {
     /** Detect installed AI runtime CLIs + Claude OAuth — drives the onboarding

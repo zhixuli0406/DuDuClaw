@@ -113,6 +113,33 @@ impl MethodHandler {
             }
         }
 
+        // RM-027: a new supervisor must exist, must not be the agent itself and
+        // must not close a loop in the authoritative org tree — the same rule
+        // the MCP path and the `org.*` RPCs apply (`validate_org_change`).
+        // Checked before any side effect, and only for an actual move: an
+        // autosave re-sending the current value is not an org write (and must
+        // keep working while the authority is unusable). A move is refused
+        // when the seeded authority is lost / unreadable / corrupt / newer.
+        // The decisive check is repeated inside the org lock below. The
+        // department keeps its existing agents.update semantics (a valid new
+        // name creates it implicitly); only the reporting line is validated.
+        let org_params = params.get("reports_to").and_then(Value::as_str).is_some()
+            || params.get("department").and_then(Value::as_str).is_some();
+        let mirror_path = self.home_dir.join("agents").join(&agent_id).join("agent.toml");
+        if org_params {
+            let mirror_now = duduclaw_core::org_store::read_mirror(&mirror_path).unwrap_or_default();
+            if requested_org_mirror(&mirror_now, &params) != mirror_now
+                && let Err(e) = duduclaw_core::org_change::validate_org_change(
+                    &self.home_dir,
+                    &agent_id,
+                    params.get("reports_to").and_then(Value::as_str),
+                    None,
+                )
+            {
+                return WsFrame::error_response("", &e.to_string());
+            }
+        }
+
         // `role = "main"` is an authority change (`agent_authority`): refuse a
         // non-admin BEFORE the current main is demoted below.
         let caller_is_admin = caller.is_some_and(|c| c.is_admin());
@@ -314,6 +341,49 @@ impl MethodHandler {
         let align_skipped: std::sync::Arc<std::sync::Mutex<Option<&'static str>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let align_skipped_for_closure = align_skipped.clone();
+
+        // RM-027 review — an org move holds the global org mutation lock
+        // (shared with the `org.*` RPCs, the approval, MCP `agent_update` and
+        // `duduclaw org sync`) from validation to commit, and commits the
+        // authority BEFORE the mirror: re-read the authority strictly,
+        // validate the whole tree, upsert, then write agent.toml. A failed
+        // mirror write puts the previous authority entry back (still inside
+        // the lock), so a refused request never moves the employee. A
+        // non-admin's move is never pre-written: the closure refuses it.
+        let mut org_lock = if org_params {
+            match super::org_change_rpc::lock_org(&self.home_dir).await {
+                Ok(g) => Some(g),
+                Err(e) => return WsFrame::error_response("", &e),
+            }
+        } else {
+            None
+        };
+        // `(previous authority entry, entry written)` when pre-written.
+        let mut org_prewrite: Option<(Option<duduclaw_core::OrgEntry>, duduclaw_core::OrgEntry)> = None;
+        if let Some(lock) = &org_lock {
+            let mirror_before = duduclaw_core::org_store::read_mirror(&mirror_path).unwrap_or_default();
+            let mirror_after = requested_org_mirror(&mirror_before, &params);
+            if mirror_after != mirror_before && caller_is_admin {
+                let store = match lock.load() {
+                    Ok(s) => s,
+                    Err(e) => return WsFrame::error_response("", &e.to_string()),
+                };
+                if let Err(e) = duduclaw_core::org_change::validate_org_change_in(
+                    &store,
+                    &self.home_dir,
+                    &agent_id,
+                    params.get("reports_to").and_then(Value::as_str),
+                    None,
+                ) {
+                    return WsFrame::error_response("", &e.to_string());
+                }
+                let prior = store.get(&agent_id).cloned();
+                if let Err(e) = lock.upsert(&agent_id, mirror_after.clone()) {
+                    return WsFrame::error_response("", &e.to_string());
+                }
+                org_prewrite = Some((prior, mirror_after));
+            }
+        }
 
         let result = self.update_agent_toml_as(&agent_id, "agents.update", caller, session, move |table| {
             // v1.68: snapshot for the authority diff and the final typed
@@ -1085,27 +1155,36 @@ impl MethodHandler {
                     self.broadcast_event("agent.status_changed",
                         json!({ "agent_id": agent_id, "status": status })).await;
                 }
-                // WP22 T5 — the mirror write committed, so the authority may
-                // now follow, and only when the org pair actually changed
-                // (see the comment above `caller_is_admin`). A failed write
-                // never reaches here, so a rejected request cannot move the
-                // agent in the authority.
+                // WP22 T5 + RM-027 review — the authority reflects the org
+                // pair only when this write actually changed it (see the
+                // comment above `caller_is_admin`). Normally it was already
+                // committed above, before the mirror; reconcile the rare case
+                // where the mirror ended up elsewhere than predicted, still
+                // inside the org lock.
                 let authority = authority_changes.lock().map(|g| g.clone()).unwrap_or_default();
                 let org_moved = authority
                     .iter()
                     .any(|c| c.key == "agent.reports_to" || c.key == "agent.department");
-                if org_moved {
-                    // Carry the new mirror pair into the authority store.
-                    let mirror = duduclaw_core::org_store::read_mirror(
-                        &self.home_dir.join("agents").join(&agent_id).join("agent.toml"),
-                    )
-                    .unwrap_or_default();
-                    if let Err(e) =
-                        duduclaw_core::org_store::upsert(&self.home_dir, &agent_id, mirror)
-                    {
-                        warn!(agent = %agent_id, error = %e, "org.toml upsert failed on agents.update");
+                let org_lock = match org_lock.take() {
+                    Some(g) => Some(g),
+                    None if org_moved => super::org_change_rpc::lock_org(&self.home_dir).await.ok(),
+                    None => None,
+                };
+                if let Some(lock) = &org_lock {
+                    let mirror = duduclaw_core::org_store::read_mirror(&mirror_path).unwrap_or_default();
+                    let reconcile = match (&org_prewrite, org_moved) {
+                        (Some((_, written)), true) if *written == mirror => Ok(()),
+                        (_, true) => lock.upsert(&agent_id, mirror).map(|_| ()),
+                        (Some((prior, _)), false) => lock.restore(&agent_id, prior.clone()),
+                        (None, false) => Ok(()),
+                    };
+                    if let Err(e) = reconcile {
+                        warn!(agent = %agent_id, error = %e, "org.toml reconcile failed on agents.update");
                     }
+                } else if org_moved {
+                    warn!(agent = %agent_id, "org lock unavailable — org.toml not updated on agents.update");
                 }
+                drop(org_lock);
                 if !authority.is_empty() {
                     crate::security_autopilot::audit_and_emit(
                         &self.home_dir,
@@ -1227,7 +1306,33 @@ impl MethodHandler {
                     }),
                 )
             }
-            Err(e) => WsFrame::error_response("", &e),
+            Err(e) => {
+                // The mirror was not written: put the authority back so a
+                // refused request never moves the employee.
+                if let (Some(lock), Some((prior, written))) = (org_lock.take(), &org_prewrite)
+                    && let Err(re) = lock.restore(&agent_id, prior.clone())
+                {
+                    crate::security_autopilot::audit_and_emit(
+                        &self.home_dir,
+                        &duduclaw_security::audit::AuditEvent::new(
+                            "org_change_mirror_drift",
+                            agent_id.as_str(),
+                            duduclaw_security::audit::Severity::Warning,
+                            json!({
+                                "agent_id": agent_id,
+                                "authority": { "reports_to": written.reports_to, "department": written.department },
+                                "source": "agents.update",
+                                "error": duduclaw_core::truncate_chars(&format!("{e}; rollback: {re}"), 300),
+                            }),
+                        ),
+                    );
+                    return WsFrame::error_response(
+                        "",
+                        &format!("{e}（另外，組織權威資料沒有還原成功：{re}；請管理員在組織圖確認這位 AI 員工的位置）"),
+                    );
+                }
+                WsFrame::error_response("", &e)
+            }
         }
     }
 }
@@ -1274,4 +1379,14 @@ impl MethodHandler {
         .map_err(|e| e.message())?;
         Ok(!outcome.unchanged)
     }
+}
+
+/// The `agent.toml` org pair this `agents.update` request would leave
+/// (`reports_to` / `department` params on top of `before`, canonicalised the
+/// way the authority stores them).
+fn requested_org_mirror(before: &duduclaw_core::OrgEntry, params: &Value) -> duduclaw_core::OrgEntry {
+    duduclaw_core::OrgEntry::new(
+        params.get("reports_to").and_then(Value::as_str).unwrap_or(before.reports_to.as_str()),
+        params.get("department").and_then(Value::as_str).unwrap_or(before.department.as_str()),
+    )
 }

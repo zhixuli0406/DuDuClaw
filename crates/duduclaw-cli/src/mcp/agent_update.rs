@@ -610,6 +610,25 @@ pub(crate) async fn handle_agent_update(
             return serde_json::json!({ "content": [{"type": "text", "text": e}], "isError": true });
         }
     };
+    // RM-027 review: a re-parenting holds the global org mutation lock
+    // (shared with the dashboard `org.*` RPCs, `agents.update` and
+    // `duduclaw org sync`), taken BEFORE the agent.toml lock — the order every
+    // org writer uses — so validation and commit see one tree.
+    let reports_to_param = params.get("reports_to").and_then(Value::as_str);
+    let org_lock = match reports_to_param {
+        Some(_) => match duduclaw_core::org_store::lock_org_mutations(home_dir) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                return serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Error: 暫時無法取得組織資料的寫入鎖，沒有做任何變更：{e}")}],
+                    "isError": true
+                });
+            }
+        },
+        None => None,
+    };
+    // The authority entry before this write, once it was replaced.
+    let mut org_prior: Option<Option<duduclaw_core::OrgEntry>> = None;
     let written = duduclaw_gateway::agent_files::external::edit_agent_toml_guarded(home_dir, agent_id, "mcp", caller, |raw| {
         duduclaw_gateway::agent_files::external::apply_typed_changes(raw, &before_t, &after_t);
         // A requested stop must reach the fresh artifact even if the initial
@@ -634,22 +653,36 @@ pub(crate) async fn handle_agent_update(
         }
         // Keep the authoritative org write after the lifecycle barrier and
         // before its TOML mirror. A drain timeout must have no side effects.
-        if let Some(v) = params.get("reports_to").and_then(Value::as_str)
-            && let Err(e) = duduclaw_core::org_store::upsert(
-                home_dir, agent_id, duduclaw_core::OrgEntry::new(v, &config.agent.department),
-            )
-        {
-            tracing::warn!(agent = %agent_id, error = %e, "org.toml upsert failed on agent_update");
+        // Inside the org lock: re-read the authority strictly (a seeded but
+        // lost / corrupt / newer `org.toml` refuses), re-validate the whole
+        // tree, commit. Any failure aborts the write — the mirror never moves
+        // without the authority.
+        if let (Some(v), Some(lock)) = (reports_to_param, org_lock.as_ref()) {
+            let store = lock.load().map_err(|e| e.to_string())?;
+            duduclaw_core::org_change::validate_org_change_in(&store, home_dir, agent_id, Some(v), None)
+                .map_err(|e| e.to_string())?;
+            let current = duduclaw_core::org_change::effective_in(&store, home_dir, agent_id).unwrap_or_default();
+            lock.upsert(agent_id, duduclaw_core::OrgEntry::new(v, &current.department))
+                .map_err(|e| e.to_string())?;
+            org_prior = Some(store.get(agent_id).cloned());
         }
         Ok(())
     }, stopping);
     drop(admission);
     if let Err(e) = written {
+        // The mirror was not written: put the authority back (still inside
+        // the org lock) so a failed request moves nobody.
+        if let (Some(lock), Some(prior)) = (org_lock.as_ref(), org_prior.take())
+            && let Err(re) = lock.restore(agent_id, prior)
+        {
+            tracing::warn!(agent = %agent_id, error = %re, "org.toml rollback failed on agent_update");
+        }
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error writing agent.toml: {e}")}],
             "isError": true
         });
     }
+    drop(org_lock);
 
     if config_before.agent.status != config.agent.status {
         duduclaw_gateway::dashboard_feedback::emit(home_dir, "agent.status_changed",

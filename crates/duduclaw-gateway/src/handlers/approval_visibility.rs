@@ -99,6 +99,9 @@ pub(crate) fn dashboard_only_reader(record: &ApprovalRecord) -> DashboardOnlyRea
         return DashboardOnlyReader::CollectionEditor;
     }
     if record.action_kind == crate::agent_files::approval::ACTION_KIND
+        // RM-027: Managers follow their own proposals through
+        // `org.pending_changes`; the approval centre card is the Admin's.
+        || record.action_kind == crate::org_change_approval::ACTION_KIND
         || record.action_kind == "support_pilot_review"
         || crate::approval::operator_cli_gate::spec_for(&record.action_kind).is_some()
         || crate::governance::ApprovalKind::parse(&record.action_kind).requires_board()

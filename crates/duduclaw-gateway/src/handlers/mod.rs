@@ -146,6 +146,7 @@ mod agents_list_rpc;
 mod dashboard_layout;
 mod widgets_custom;
 mod departments_rpc;
+mod org_change_rpc;
 mod users_rpc;
 mod user_invites_rpc;
 pub(crate) mod company_rpc;
