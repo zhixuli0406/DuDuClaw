@@ -32,7 +32,7 @@ impl MethodHandler {
 
     async fn handle_approvals_decide_inner(
         &self,
-        params: Value,
+        mut params: Value,
         ctx: &UserContext,
     ) -> WsFrame {
         let id = match params.get("id").and_then(|v| v.as_str()) {
@@ -65,6 +65,8 @@ impl MethodHandler {
         if record.as_ref().is_some_and(|r| r.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND) {
             return WsFrame::error_response("", crate::isolation_background::PERSONAL_DELEGATION_DECIDE_ELSEWHERE);
         }
+        // v1.81 P1c: a Personal employee's card — its owner, or an audited Admin step-up (personal_decide_gate.rs).
+        if let Some(r) = &record && let Err(frame) = Box::pin(self.personal_decide_gate(ctx, r, super::personal_data_gate::take_step_up(&mut params), "approvals.decide")).await { return frame; }
         if let Some(r) = &record {
             // Both approval and denial can wake work. Gate every kind before
             // specialized paths, expiry polling, or any broker decision.

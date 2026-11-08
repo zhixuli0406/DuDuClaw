@@ -417,6 +417,13 @@ pub(crate) async fn handle_create_agent(
 
 /// List all registered agents with role, status, and hierarchy.
 pub(crate) async fn handle_list_agents(params: &Value, home_dir: &Path, caller: &str) -> Value {
+    list_agents_filtered(params, home_dir, caller, &std::collections::BTreeSet::new()).await
+}
+
+/// [`handle_list_agents`] without the agents in `hidden` (v1.81 P1b: other
+/// people's Personal employees, `personal_target::list_agents_hiding`).
+pub(crate) async fn list_agents_filtered(params: &Value, home_dir: &Path, caller: &str,
+    hidden: &std::collections::BTreeSet<String>) -> Value {
     // F2: accept both a bool and the string "true" (MCP args often arrive as
     // strings); default false so soft-deleted stay hidden and archived only
     // surface on explicit request.
@@ -513,7 +520,7 @@ pub(crate) async fn handle_list_agents(params: &Value, home_dir: &Path, caller: 
     // keyed by directory name, which is the agent id `org_visible` expects.
     let agents: Vec<Value> = candidates
         .into_iter()
-        .filter(|(name, _)| unrestricted || org_visible(&rules, &org, caller, name))
+        .filter(|(name, _)| !hidden.contains(name) && (unrestricted || org_visible(&rules, &org, caller, name)))
         .map(|(_, v)| v)
         .collect();
 

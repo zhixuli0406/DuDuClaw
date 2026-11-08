@@ -1144,11 +1144,9 @@ fn authorize_goal_press(
             channel_user_id,
         ),
     );
-    if auth == PressAuth::Allow {
-        Ok(())
-    } else {
-        Err(refusal_text(auth, subject))
-    }
+    // v1.81 P1c: a Personal employee's kickoff / needs-human card: its owner only.
+    if let Some(refusal) = crate::personal_decision::channel_agent_refusal(home_dir, agent_id, channel, channel_user_id) { return Err(refusal.into()); }
+    if auth == PressAuth::Allow { Ok(()) } else { Err(refusal_text(auth, subject)) }
 }
 
 /// Handle a goal-loop button action from a channel.

@@ -3,6 +3,11 @@
 
 use super::*;
 
+/// v1.81 P1c: page queries that exclude hidden Personal employees.
+#[path = "personal_hiding.rs"]
+mod personal_hiding;
+use personal_hiding::hidden_json;
+
 enum ActivityAccess<'a> {
     All,
     Principal(&'a str),
@@ -46,7 +51,19 @@ impl TaskStore {
         offset: i64, principal: Option<&str>,
     ) -> Result<(Vec<ActivityRow>, i64), String> {
         let access = principal.map(ActivityAccess::Principal).unwrap_or(ActivityAccess::All);
-        self.list_activity_with_access(agent_id, event_type, limit, offset, access).await
+        self.list_activity_with_access(agent_id, event_type, limit, offset, access, None).await
+    }
+
+    /// v1.81 P1c: [`Self::list_activity_for_principal`] without the rows of
+    /// `hidden` employees — by the row's employee and by the employee of the
+    /// task it names — applied before LIMIT and COUNT, so `total` counts only
+    /// what the caller can list. An empty set reads exactly as before.
+    pub(crate) async fn list_activity_hiding(
+        &self, agent_id: Option<&str>, event_type: Option<&str>, limit: i64,
+        offset: i64, principal: &str, hidden: &std::collections::BTreeSet<String>,
+    ) -> Result<(Vec<ActivityRow>, i64), String> {
+        self.list_activity_with_access(agent_id, event_type, limit, offset,
+            ActivityAccess::Principal(principal), hidden_json(hidden)).await
     }
 
     /// `worker` must be the caller's verified executor identity. No worker
@@ -56,12 +73,12 @@ impl TaskStore {
         offset: i64, worker: Option<&str>,
     ) -> Result<(Vec<ActivityRow>, i64), String> {
         self.list_activity_with_access(agent_id, event_type, limit, offset,
-            ActivityAccess::Worker(worker)).await
+            ActivityAccess::Worker(worker), None).await
     }
 
     async fn list_activity_with_access(
         &self, agent_id: Option<&str>, event_type: Option<&str>, limit: i64,
-        offset: i64, access: ActivityAccess<'_>,
+        offset: i64, access: ActivityAccess<'_>, hidden: Option<String>,
     ) -> Result<(Vec<ActivityRow>, i64), String> {
         let conn = self.conn.lock().await;
 
@@ -99,6 +116,16 @@ impl TaskStore {
         };
         count_sql.push_str(&access_clause);
         query_sql.push_str(&access_clause);
+        if let Some(hidden) = hidden {
+            binds.push(hidden);
+            let n = binds.len();
+            let clause = format!(
+                " AND activity.agent_id NOT IN (SELECT value FROM json_each(?{n})) AND NOT EXISTS \
+                 (SELECT 1 FROM tasks h WHERE h.id = activity.task_id AND h.assigned_to IN (SELECT value FROM json_each(?{n})))"
+            );
+            count_sql.push_str(&clause);
+            query_sql.push_str(&clause);
+        }
         query_sql.push_str(&format!(
             " ORDER BY timestamp DESC LIMIT {} OFFSET {}",
             limit, offset

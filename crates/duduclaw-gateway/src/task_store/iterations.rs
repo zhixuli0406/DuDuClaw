@@ -224,6 +224,18 @@ impl TaskStore {
     /// A2A ownership is filtered before every per-agent and board aggregate.
     /// `principal` must come from the authenticated caller, including Admin.
     pub async fn flow_metrics(&self, now: &str, principal: &str) -> Result<FlowMetrics, String> {
+        self.flow_metrics_hiding(now, principal, &std::collections::BTreeSet::new()).await
+    }
+
+    /// v1.81 P1c: [`Self::flow_metrics`] over the tasks whose employee is not
+    /// in `hidden` — neither a per-employee row nor the board totals
+    /// (`review_queue_depth`, `accepts_last_7d`) count them.
+    pub async fn flow_metrics_hiding(
+        &self,
+        now: &str,
+        principal: &str,
+        hidden: &std::collections::BTreeSet<String>,
+    ) -> Result<FlowMetrics, String> {
         let tasks = self.list_tasks(None, None, None).await?;
         let cutoff = DateTime::parse_from_rfc3339(now)
             .map(|n| n.with_timezone(&Utc) - chrono::Duration::days(7));
@@ -234,7 +246,8 @@ impl TaskStore {
         let mut accepts_7d = 0i64;
 
         for t in &tasks {
-            if !t.goal_mode || t.a2a_owner.as_deref().is_some_and(|owner| owner != principal) {
+            if !t.goal_mode || t.a2a_owner.as_deref().is_some_and(|owner| owner != principal)
+                || hidden.contains(&t.assigned_to) {
                 continue;
             }
             let e = per.entry(t.assigned_to.clone()).or_default();

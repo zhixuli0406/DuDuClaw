@@ -167,6 +167,11 @@ pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: 
             {
                 return mcp_error(&format!("step {i}: {reason}"));
             }
+            // v1.81 P1b: a step is work handed to that employee, like spawn_agent.
+            if let Some(refusal) = duduclaw_gateway::personal_visibility::management_refusal(home_dir,
+                duduclaw_gateway::runtime_readiness::is_protected_linux(), caller, &agent) {
+                return mcp_error(&format!("step {i}: {refusal}"));
+            }
         }
 
         let target = if agent.is_empty() { caller } else { &agent };
@@ -328,13 +333,20 @@ pub(crate) async fn handle_task_status(params: &Value, home_dir: &Path, caller: 
                 pending
             );
 
+            // v1.81 P1b: a step run by another person's Personal employee
+            // keeps its status; its output is not shown.
+            let hidden = super::personal_target::hidden_step_agents(home_dir,
+                duduclaw_gateway::runtime_readiness::is_protected_linux(), caller,
+                spec.steps.iter().map(|s| s.agent.as_str()));
             for step in &spec.steps {
                 report.push_str(&format!(
                     "\n  [{}] {:?} — {}{}",
                     step.id,
                     step.status,
                     step.description,
-                    if let Some(ref result) = step.result {
+                    if hidden.contains(step.agent.trim()) {
+                        "\n      Output: [hidden: another person's Personal employee]".to_string()
+                    } else if let Some(ref result) = step.result {
                         // HC3: byte-slice would panic on a multi-byte UTF-8
                         // boundary (CJK). truncate_bytes walks back to a char
                         // boundary ≤ 200 bytes.

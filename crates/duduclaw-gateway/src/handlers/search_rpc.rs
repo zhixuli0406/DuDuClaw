@@ -186,6 +186,16 @@ impl MethodHandler {
             }
         }
 
+        // v1.81 P1: an unscoped (Admin) search hides Personal employees the
+        // caller does not own; a scoped one was gated at dispatch.
+        if agent_id.is_none() {
+            match self.personal_hidden_agents(&live).await {
+                Ok(hidden) if !hidden.is_empty() => hits
+                    .retain(|hit| hit.agent_id.as_ref().is_none_or(|agent| !hidden.contains(agent))),
+                Ok(_) => {}
+                Err(e) => return WsFrame::error_response("", e),
+            }
+        }
         let still_allowed=if let Some(a)=agent_id { self.bound_history_recheck(&live,a,mode).is_ok() } else {self.bound_history_live(&live).is_ok_and(|c|c.is_admin())};
         if !still_allowed { return WsFrame::error_response("","history authority changed; refresh"); }
         if shared_reader.as_ref().is_some_and(|reader| reader.recheck(&self.home_dir, &live).is_err()) {

@@ -8,7 +8,8 @@ impl MethodHandler {
 
     /// WP14-T14.7: list pending approvals for the approval center. Optional
     /// `agent_id` filter. Read-only; opens approvals.db per call.
-    pub(crate) async fn handle_approvals_list(&self, params: Value, ctx:&UserContext) -> WsFrame {
+    pub(crate) async fn handle_approvals_list(&self, mut params: Value, ctx:&UserContext) -> WsFrame {
+        let step_up = super::personal_data_gate::take_step_up(&mut params);
         let agent_filter = params.get("agent_id").and_then(|v| v.as_str());
         // Optional exact `action_kind` filter (e.g. "knowledge_quarantine" for the
         // D6 curation queue). Matches the raw stored action_kind string.
@@ -48,6 +49,13 @@ impl MethodHandler {
         };
         match rows {
             Ok(rows) => {
+                // v1.81 P1b: another person's Personal employee → metadata-only
+                // card; its payload needs the owner or an audited step-up.
+                let by_id = params.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty());
+                let personal = match self.personal_approval_hidden(ctx, step_up, by_id, &rows).await {
+                    Ok(hidden) => hidden,
+                    Err(frame) => return frame,
+                };
                 let mut items: Vec<Value> = Vec::with_capacity(rows.len());
                 for r in rows
                     .iter()
@@ -62,6 +70,10 @@ impl MethodHandler {
                         Err(_) => continue,
                     };
                     if !visibility.may_read(r, &fresh, department.as_deref()) { continue; }
+                    if personal.contains(&r.agent_id) {
+                        items.push(super::personal_data_gate::personal_metadata_card(r));
+                        continue;
+                    }
                     // Binding data and question answers go only to a viewer
                     // who may decide this card.
                     let may_decide = self.authorize_egress_decider(r, &fresh).is_ok()

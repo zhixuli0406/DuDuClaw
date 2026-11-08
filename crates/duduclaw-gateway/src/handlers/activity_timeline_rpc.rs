@@ -45,13 +45,18 @@ impl MethodHandler {
             Err(f) => return f,
         };
         match store
-            .list_activity_for_principal(agent_id, event_type, limit, offset, Some(&format!("user:{}", reader.live().user_id)))
+            // v1.81 P1c: hidden employees are excluded before LIMIT and COUNT.
+            .list_activity_hiding(agent_id, event_type, limit, offset, &format!("user:{}", reader.live().user_id), reader.hidden())
             .await
         {
             Ok((rows, total)) => {
                 let owners = activity_task_owners(&store, &rows).await;
+                // v1.81 P1b: another person's Personal employee is hidden,
+                // by the row's employee and by its task's employee.
                 let events: Vec<Value> = rows
                     .iter()
+                    .filter(|r| !reader.hides(&r.agent_id) && r.task_id.as_deref()
+                        .and_then(|t| owners.get(t)).is_none_or(|owner| !reader.hides(owner)))
                     .map(|r| {
                         let owner = r.task_id.as_deref().and_then(|t| owners.get(t));
                         reader.activity_json(r, owner.map(String::as_str))
@@ -104,13 +109,14 @@ impl MethodHandler {
             Err(e) => return WsFrame::error_response("", &format!("timeline tasks: {e}")),
         };
         let tasks: Vec<_> = tasks.into_iter().filter(|t| {
-            task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), &t.id)
+            !reader.hides(&t.assigned_to)
+                && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), &t.id)
         }).collect();
         // Most-recent TIMELINE_ROW_CAP activity events; events older than the
         // newest cap-full may be missing from wide windows — the `truncated`
         // flag + `cap` in the response make that visible to the client.
         let (activities, _total) = match store
-            .list_activity_for_principal(agent_id, None, TIMELINE_ROW_CAP as i64, 0, Some(&format!("user:{}", reader.live().user_id)))
+            .list_activity_hiding(agent_id, None, TIMELINE_ROW_CAP as i64, 0, &format!("user:{}", reader.live().user_id), reader.hidden())
             .await
         {
             Ok(r) => r,
@@ -123,6 +129,8 @@ impl MethodHandler {
         let owners = activity_task_owners(&store, &activities).await;
         let activities: Vec<ActivityRow> = activities
             .into_iter()
+            .filter(|a| !reader.hides(&a.agent_id) && a.task_id.as_deref()
+                .and_then(|t| owners.get(t)).is_none_or(|owner| !reader.hides(owner)))
             .map(|mut a| {
                 if !reader.live().has_agent_access(&a.agent_id, AccessLevel::Viewer) {
                     a.summary.clear();
@@ -145,7 +153,7 @@ impl MethodHandler {
                     .status()
                     .await
                     .into_iter()
-                    .filter(|h| agent_id.is_none_or(|a| a == h.agent_id))
+                    .filter(|h| agent_id.is_none_or(|a| a == h.agent_id) && !reader.hides(&h.agent_id))
                     .map(|h| (h.agent_id, h.last_run))
                     .collect(),
                 None => Vec::new(),

@@ -60,7 +60,7 @@ impl MethodHandler {
         {
             return Err(WsFrame::error_response("", PERMISSION_DENIED));
         }
-        Ok(reader)
+        Ok(reader.admit_scope(agent_id))
     }
 
     /// [`Self::task_list_reader`] for the task board (`tasks.list`,
@@ -82,7 +82,7 @@ impl MethodHandler {
         if !allowed {
             return Err(WsFrame::error_response("", PERMISSION_DENIED));
         }
-        Ok(reader)
+        Ok(reader.admit_scope(agent_id))
     }
 
     /// The "在 <通道> 中開啟" fields of a listed task: `channel` and a
@@ -190,9 +190,9 @@ impl MethodHandler {
             .await
         {
             Ok(rows) => {
-                let rows: Vec<_> = rows.into_iter().filter(|r| {
-                    task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), &r.id)
-                }).collect();
+                let rows: Vec<_> = rows.into_iter().filter(|r| !reader.hides(&r.assigned_to)
+                    && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), &r.id)
+                ).collect();
                 // E8 reverse handoff: "在 <通道> 中開啟" — resolve from the
                 // `/goal` entry point's stamped source conversation
                 // (`source_channel`/`source_chat_id`, P5 write-back). No
@@ -731,13 +731,13 @@ impl MethodHandler {
         let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
         let offset = params.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
         match store
-            .list_tasks_page_for_principal(
+            .list_tasks_page_hiding(
                 status, agent_id, priority, goal_mode, archived, limit, offset,
-                Some(&format!("user:{}", reader.live().user_id)),
+                Some(&format!("user:{}", reader.live().user_id)), reader.hidden(),
             )
             .await
         {
-            Ok((rows, total)) => {
+            Ok((mut rows, total)) => { rows.retain(|r| !reader.hides(&r.assigned_to));
                 let mut tasks: Vec<Value> = Vec::with_capacity(rows.len());
                 for r in &rows {
                     let mut v = reader.task_json(r);
@@ -772,7 +772,7 @@ impl MethodHandler {
     /// [`TaskReader::can_read_row`].
     async fn handle_tasks_list_mine(&self, store: &TaskStore, params: Value, ctx: &UserContext) -> WsFrame {
         let reader = match TaskReader::new(&self.home_dir, ctx) {
-            Ok(r) => r,
+            Ok(r) => r.admit_scope(params.get("agent_id").and_then(Value::as_str).filter(|a| !a.is_empty())),
             Err(f) => return f,
         };
         let Some(principal) = crate::trigger_route::assign::principal_for_user(&reader.live().user_id) else {
@@ -785,10 +785,10 @@ impl MethodHandler {
         let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
         let offset = params.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
         match store
-            .list_principal_page(&principal, status, agent_id, goal_mode, archived, limit, offset)
+            .list_principal_page_hiding(&principal, status, agent_id, goal_mode, archived, limit, offset, reader.hidden())
             .await
         {
-            Ok((rows, total)) => {
+            Ok((mut rows, total)) => { rows.retain(|r| !reader.hides(&r.assigned_to));
                 let mut tasks: Vec<Value> = Vec::with_capacity(rows.len());
                 for r in &rows {
                     let mut v = reader.task_json(r);
