@@ -259,6 +259,16 @@ impl Connection {
         self.io.transact(request, vec![], std::time::Instant::now() + timeout, &|| Ok(()), None)
     }
 
+    /// HX5 helper op on this run's own control connection. A root `Error` is
+    /// returned as a packet (typed per-call results, not `map_error`). Callers
+    /// must run this in a detached task: dropping it mid-flight closes the
+    /// run's control connection, which root treats as the gateway leaving.
+    pub(super) async fn helper_request(&self, request: SpawnRequest, input_fds: Vec<OwnedFd>)
+        -> Result<Packet, BackendError> {
+        if !is_helper_request(&request) { return Err(BackendError::Denied); }
+        self.request_packet(request, &input_fds, Arc::new(|| Ok(()))).await
+    }
+
     /// Synchronous fence for a reply that passed the transport checks but
     /// contradicts itself (e.g. fd identity differs from the reply metadata).
     pub(super) fn close_now(&self) { self.io.close(); }
@@ -369,11 +379,26 @@ fn map_error(code: ErrorCode) -> BackendError {
     }
 }
 
+fn is_helper_request(request: &SpawnRequest) -> bool {
+    matches!(request, SpawnRequest::HelperCall { .. } | SpawnRequest::HelperWait { .. }
+        | SpawnRequest::HelperStop { .. } | SpawnRequest::HelperCancel { .. })
+}
+
 fn validate_response(request: &SpawnRequest, response: &SpawnResponse, received_fds: usize) -> Result<(), BackendError> {
     // Package H (H1/H5): the contract's own pairing, incl. the exact fd count
     // (`WorkFile` = one `WorkFileRead`, `Error`/`WorkAnchor` = none).
     if matches!(request, SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }) {
         return ipc::check_work_reply(request, response, received_fds).map_err(|_| BackendError::Protocol);
+    }
+    // HX5: helper ops pair through the contract (`HelperStarted` = exactly
+    // `[StdoutRead, StderrRead]`, effective timeout ≤ requested; `HelperEnded`
+    // names the same run and call; stop/cancel answer `Ack`).
+    if is_helper_request(request) {
+        return ipc::check_helper_reply(request, response, received_fds).map_err(|_| BackendError::Protocol);
+    }
+    // A helper reply to any other request is a protocol violation.
+    if matches!(response, SpawnResponse::HelperStarted { .. } | SpawnResponse::HelperEnded { .. }) {
+        return Err(BackendError::Protocol);
     }
     let valid = match (request, response) {
         (_, SpawnResponse::Error { .. }) => true,

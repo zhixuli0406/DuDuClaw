@@ -7,6 +7,7 @@ pub mod local;
 pub mod selection;
 pub mod workspace;
 pub mod program_helper;
+pub mod helper_layout;
 pub mod code_map_helper;
 pub mod office_helper;
 pub mod recording_helper;

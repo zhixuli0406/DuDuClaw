@@ -5,7 +5,9 @@ use std::sync::Arc;
 use duduclaw_execution::{program_helper::{ProgramRequest, PROGRAM_ARGUMENT, PROGRAM_RUNTIME},
     code_map_helper, office_helper, recording_helper};
 use duduclaw_isolation::{bounded::Text, capability::ResourceGrant, execution::*, ids::Sha256Digest};
-use duduclaw_mcp_boundary::{RequestContext, VerificationError, execution::{AuthorizedExecutionPlan, ExecutionPlanFactory, PolicyFuture}, tool_policy::AuthorizedToolCall, resources::ResourceRoots};
+use duduclaw_isolation::ipc::HelperOutcome;
+use duduclaw_mcp_boundary::{RequestContext, VerificationError, execution::{AuthorizedExecutionPlan, AuthorizedHelperPlan,
+    ExecutionPlanFactory, PolicyFuture}, tool_policy::AuthorizedToolCall, resources::ResourceRoots};
 use duduclaw_spawnd::{installed::GatewayPublication, policy::PublishedRuntime};
 use serde_json::Value;
 
@@ -124,6 +126,21 @@ fn helper_request(context: &RequestContext, name: &str, arguments: &Value) -> Re
     Ok(HelperRequest { kind: RuntimeKind::Registered(Text::new(runtime).map_err(|_| VerificationError::Invalid)?), bytes, timeout })
 }
 
+/// The tool's own bound for an in-run call (spawnd lowers it to the signed
+/// binding and the run's remaining time and reports the effective value).
+fn in_run_timeout_ms(seconds: u64) -> u64 {
+    seconds.saturating_mul(1000).clamp(1, duduclaw_isolation::ipc::MAX_HELPER_TIMEOUT_MS)
+}
+
+/// Strict decoders shared by the child-run and in-run paths.
+fn decode_output(name: &str, stdout: &[u8]) -> Result<Value, VerificationError> {
+    if name == "code_map" { return code_map_helper::decode_result(stdout).map_err(|_| VerificationError::Invalid); }
+    if name == "browser_record_start" { return recording_helper::decode_result(stdout).map_err(|_| VerificationError::Invalid); }
+    if !matches!(name, "execute_program" | "office_script") { return Err(VerificationError::Invalid); }
+    let result = duduclaw_execution::program_helper::ProgramResult::decode(stdout).map_err(|_| VerificationError::Invalid)?;
+    serde_json::from_slice(&result.encode().map_err(|_| VerificationError::Invalid)?).map_err(|_| VerificationError::Invalid)
+}
+
 fn timeout_fits(seconds: u64, runtime_ms: u64) -> bool {
     seconds.checked_mul(1000).and_then(|milliseconds| milliseconds.checked_add(RESULT_GRACE_MS))
         .is_some_and(|needed| needed <= runtime_ms)
@@ -160,15 +177,44 @@ impl ExecutionPlanFactory for InstalledProgramPlans {
             }
         }))
     }
-    fn collects_results(&self, name: &str) -> bool { matches!(name, "execute_program" | "office_script" | "code_map" | "browser_record_start" | "browser_record_stop") }
+    // HX5: execute_program / office_script / code_map run in the caller's own
+    // run and answer synchronously; no job row exists for them.
+    fn collects_results(&self, name: &str) -> bool { matches!(name, "browser_record_start" | "browser_record_stop") }
     fn cooperative_stop(&self, name: &str) -> bool { name == "browser_record_start" }
     fn decode_result(&self, name: &str, stdout: &[u8], stderr: &[u8], outcome: &RunOutcome) -> Result<Value, VerificationError> {
         if !stderr.is_empty() || *outcome != RunOutcome::Exited(0) { return Err(VerificationError::Invalid); }
-        if name == "code_map" { return code_map_helper::decode_result(stdout).map_err(|_| VerificationError::Invalid); }
-        if name == "browser_record_start" { return recording_helper::decode_result(stdout).map_err(|_| VerificationError::Invalid); }
-        if !matches!(name, "execute_program" | "office_script") { return Err(VerificationError::Invalid); }
-        let result = duduclaw_execution::program_helper::ProgramResult::decode(stdout).map_err(|_| VerificationError::Invalid)?;
-        serde_json::from_slice(&result.encode().map_err(|_| VerificationError::Invalid)?).map_err(|_| VerificationError::Invalid)
+        // In-run tools never have a child-run result to decode.
+        if duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS.contains(&name) { return Err(VerificationError::Invalid); }
+        decode_output(name, stdout)
+    }
+    fn decode_helper_result(&self, name: &str, stdout: &[u8], stderr: &[u8], outcome: &HelperOutcome)
+        -> Result<Value, VerificationError> {
+        // Same strict decoders: stderr must be empty, outcome `Exited(0)`.
+        if !stderr.is_empty() || *outcome != HelperOutcome::Exited(0)
+            || !duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS.contains(&name) {
+            return Err(VerificationError::Invalid);
+        }
+        decode_output(name, stdout)
+    }
+    /// HX5 (§3 step 2): same-run plan. Target = the caller's capability run,
+    /// employee = the record's; the helper is re-derived from the signed
+    /// publication for that employee and must still pass `valid_helper`.
+    fn prepare_in_run<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, AuthorizedHelperPlan> {
+        Box::pin(async move {
+            let (context, name, arguments) = (call.context(), call.name(), call.arguments());
+            if !duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS.contains(&name) { return Err(VerificationError::Invalid); }
+            self.authorize_handler(call).await?;
+            let request = helper_request(context, name, arguments)?;
+            let publication = self.publication()?;
+            let policy = publication.policy().map_err(|_| VerificationError::Invalid)?;
+            let (runtime, _) = policy.derive(context.record().employee, &request.kind, false)
+                .map_err(|_| VerificationError::Invalid)?;
+            if !valid_helper(runtime) || request.bytes.len() as u64 > runtime.resources.memfd_total_bytes {
+                return Err(VerificationError::Invalid);
+            }
+            AuthorizedHelperPlan::new(RunHandle(context.record().run), context.record().employee, request.kind,
+                in_run_timeout_ms(request.timeout), request.bytes, runtime.resources.output_total_bytes)
+        })
     }
     fn authorize_handler<'a>(&'a self, call: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
         Box::pin(async move {
@@ -189,6 +235,10 @@ impl ExecutionPlanFactory for InstalledProgramPlans {
     fn prepare_with_roots<'a>(&'a self, call: &'a AuthorizedToolCall, run: RunHandle,
         roots: Arc<ResourceRoots>) -> PolicyFuture<'a, AuthorizedExecutionPlan> {
         Box::pin(async move {
+            // [F8] In-run tools never become a child-run SpawnPolicy.
+            if duduclaw_mcp_boundary::tool_policy::IN_RUN_HELPER_TOOLS.contains(&call.name()) {
+                return Err(VerificationError::Invalid);
+            }
             self.authorize_handler(call).await?;
             let (context, name, arguments) = (call.context(), call.name(), call.arguments());
             let workspace = roots.authorize_workspace(call, "employee-work")?;
@@ -260,12 +310,25 @@ mod tests {
             status: duduclaw_execution::program_helper::ProgramStatus::Exited,
             exit_code: Some(0), signal: None, stdout: "hello".into(), stderr: String::new(), truncated: false,
         }.encode().unwrap();
-        assert!(factory.decode_result("execute_program", &result, &[], &RunOutcome::Exited(0)).is_ok());
-        assert!(factory.decode_result("execute_program", &result, b"unexpected", &RunOutcome::Exited(0)).is_err());
-        assert!(factory.decode_result("execute_program", &result, &[], &RunOutcome::Cancelled).is_err());
-        assert!(factory.decode_result("execute_program", br#"{"status":"exited","exit_code":0}"#, &[], &RunOutcome::Exited(0)).is_err());
-        assert!(factory.decode_result("code_map", &result, &[], &RunOutcome::Exited(0)).is_err());
+        // HX5: in-run helper results use the same strict decoders.
+        let exited = HelperOutcome::Exited(0);
+        assert!(factory.decode_helper_result("execute_program", &result, &[], &exited).is_ok());
+        assert!(factory.decode_helper_result("execute_program", &result, b"unexpected", &exited).is_err());
+        assert!(factory.decode_helper_result("execute_program", &result, &[], &HelperOutcome::Exited(1)).is_err());
+        assert!(factory.decode_helper_result("execute_program", &result, &[], &HelperOutcome::TimedOut).is_err());
+        assert!(factory.decode_helper_result("execute_program", br#"{"status":"exited","exit_code":0}"#, &[], &exited).is_err());
+        assert!(factory.decode_helper_result("code_map", &result, &[], &exited).is_err());
+        assert!(factory.decode_helper_result("fork_run", &result, &[], &exited).is_err());
+        assert!(factory.decode_helper_result("browser_record_start", &result, &[], &exited).is_err());
+        // The child-run decoder never accepts an in-run tool, and the three
+        // tools have no job row (only the recording collects results).
+        assert!(factory.decode_result("execute_program", &result, &[], &RunOutcome::Exited(0)).is_err());
         assert!(factory.decode_result("fork_run", &result, &[], &RunOutcome::Exited(0)).is_err());
+        for name in ["execute_program", "office_script", "code_map"] { assert!(!factory.collects_results(name)); }
+        assert!(factory.collects_results("browser_record_start"));
+        assert_eq!(in_run_timeout_ms(60), 60_000);
+        assert_eq!(in_run_timeout_ms(10_000), duduclaw_isolation::ipc::MAX_HELPER_TIMEOUT_MS);
+        assert_eq!(in_run_timeout_ms(0), 1);
         assert!(InstalledProgramPlans::new(Sha256Digest([0; 32]), 1).is_err());
         assert!(InstalledProgramPlans::new(Sha256Digest([1; 32]), 0).is_err());
     }

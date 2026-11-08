@@ -48,7 +48,7 @@ async fn fixture(bridge: Option<Arc<dyn RootWorkspaceBridge>>) -> (SpawndBackend
     let slots = Arc::new(Semaphore::new(2));
     let permit = slots.clone().acquire_owned().await.unwrap();
     let p = policy();
-    let entry = Entry { employee: p.employee, reservation_expiry: 0, connection: Arc::new(Connection::test_connection(left)), _permit: permit,
+    let entry = Entry { employee: p.employee, reservation_expiry: 0, features: ipc::SpawndFeatures::NONE, connection: Arc::new(Connection::test_connection(left)), _permit: permit,
         state: Mutex::new(State { expires: Instant::now() + Duration::from_secs(5), started: false,
             task_ref: None, pty: false, mcp: false, output_bytes: 0, output_buffer: 0, io_received: false,
             stdio: None, terminal: None, mcp_fd: None, io_receipt: None, outcome: None, terminal_at: None, workspace: None }) };

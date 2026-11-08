@@ -6,6 +6,25 @@ use crate::VerificationError;
 
 pub const MCP_FD: i32 = 3;
 
+/// HX5 (Q5 = A): every runtime's MCP tool-call timeout in the signed projection.
+/// In-run helpers may run 300 s (`ipc::MAX_HELPER_TIMEOUT_MS`); the boundary
+/// answers within 300 s + 4 s, so a 305 s client timeout sees every result.
+/// Part of the projection digest: changing it re-runs MCP acceptance per runtime.
+pub const CLI_TOOL_TIMEOUT_MS: u64 = 305_000;
+const _: () = assert!(CLI_TOOL_TIMEOUT_MS >= duduclaw_isolation::ipc::MAX_HELPER_TIMEOUT_MS + 5_000);
+
+/// The tool timeout each runtime's projection expresses, or `None` where the
+/// runtime has no projected config key (DuDuClaw's own API worker bounds a
+/// tool call only by its whole-request `timeout_secs`; registered generic-CLI
+/// adapters read the bridge from `mcp.json` and keep their adapter default,
+/// which MCP acceptance must prove ≥ 305 s or the helper tools stay hidden).
+pub fn projected_tool_timeout_ms(runtime: &RuntimeKind) -> Option<u64> {
+    match runtime {
+        RuntimeKind::Claude | RuntimeKind::Codex | RuntimeKind::Grok => Some(CLI_TOOL_TIMEOUT_MS),
+        RuntimeKind::OpenAiCompat | RuntimeKind::Registered(_) => None,
+    }
+}
+
 pub fn api_worker_arguments() -> Vec<String> {
     ["--duduclaw-protocol", "openai-compat-v1", "--mcp-config", "/config/mcp.json"]
         .into_iter().map(str::to_owned).collect()
@@ -95,6 +114,8 @@ pub struct RuntimeProjection {
     /// tokens, identity, host directories or caller-provided args.
     pub arguments: Vec<String>,
     pub inherited_mcp_fd: i32,
+    /// HX5: the MCP tool timeout rendered into `files` (`projected_tool_timeout_ms`).
+    pub tool_timeout_ms: Option<u64>,
 }
 impl RuntimeProjection {
     /// Digest covers exact bytes, targets, argv, versions and both binaries.
@@ -112,6 +133,7 @@ impl RuntimeProjection {
                 "target": file.relative_target, "contents": file.contents,
             })).collect::<Vec<_>>(),
             "arguments": self.arguments, "mcp_fd": self.inherited_mcp_fd,
+            "tool_timeout_ms": self.tool_timeout_ms,
         })).expect("projection has only JSON-compatible fields");
         Sha256Digest(Sha256::digest(bytes).into())
     }
@@ -200,18 +222,25 @@ pub fn runtime_projection(registration: RuntimeRegistration) -> Result<RuntimePr
     let server = bridge_server_config(&registration.bridge_executable)?;
     let command = serde_json::to_string(server["command"].as_str().ok_or(VerificationError::Invalid)?)
         .map_err(|_| VerificationError::Invalid)?;
+    let tool_timeout_ms = projected_tool_timeout_ms(&registration.runtime);
+    let timeout_sec = tool_timeout_ms.map_or(0, |ms| ms.div_ceil(1000));
     let (files, arguments) = match registration.runtime {
+        // Per-server `timeout` (ms) next to the bridge entry (inferred, verify
+        // in MCP acceptance; Claude Code also honours `MCP_TOOL_TIMEOUT`).
         RuntimeKind::Claude => (vec![ProjectionFile {
             destination: ConfigDestination::RunConfig, relative_target: "mcp.json",
-            contents: serde_json::json!({"mcpServers": {"duduclaw": server}}).to_string(),
+            contents: serde_json::json!({"mcpServers": {"duduclaw": {"command": server["command"],
+                "args": server["args"], "timeout": tool_timeout_ms}}}).to_string(),
         }], vec!["--strict-mcp-config".into(), "--mcp-config".into(),
             "/config/mcp.json".into()]),
+        // Codex default is 60 s (`tool_timeout_sec`).
         RuntimeKind::Codex => (vec![ProjectionFile {
             destination: ConfigDestination::RuntimeHome, relative_target: ".codex/config.toml",
-            contents: format!("[mcp_servers.duduclaw]\ncommand = {command}\nargs = []\nenv_vars = []\ndefault_tools_approval_mode = \"auto\"\n"),
+            contents: format!("[mcp_servers.duduclaw]\ncommand = {command}\nargs = []\nenv_vars = []\ndefault_tools_approval_mode = \"auto\"\ntool_timeout_sec = {timeout_sec}\n"),
         }], native_cli_arguments(&RuntimeKind::Codex)?),
         RuntimeKind::Grok => {
-            let contents = format!("[mcp_servers.duduclaw]\ncommand = {command}\nargs = []\nenabled = true\nenv = {{}}\n");
+            // Same key as Codex (inferred, verify in MCP acceptance).
+            let contents = format!("[mcp_servers.duduclaw]\ncommand = {command}\nargs = []\nenabled = true\nenv = {{}}\ntool_timeout_sec = {timeout_sec}\n");
             (vec![ProjectionFile {
                 destination: ConfigDestination::RuntimeHome, relative_target: ".grok/config.toml", contents: contents.clone(),
             }, ProjectionFile {
@@ -233,7 +262,7 @@ pub fn runtime_projection(registration: RuntimeRegistration) -> Result<RuntimePr
             }], arguments)
         },
     };
-    Ok(RuntimeProjection { registration, files, arguments, inherited_mcp_fd: MCP_FD })
+    Ok(RuntimeProjection { registration, files, arguments, inherited_mcp_fd: MCP_FD, tool_timeout_ms })
 }
 
 #[cfg(test)]

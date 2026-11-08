@@ -68,6 +68,14 @@ impl ExecutionPlanFactory for RootedPlans {
         -> PolicyFuture<'a, crate::execution::AuthorizedExecutionPlan> {
         self.plans.prepare_with_roots(call, run, self.roots.clone())
     }
+    // HX5: the in-run helper path needs no roots (the helper uses the run's
+    // own /work); forward it unchanged so the wrapper never hides it.
+    fn prepare_in_run<'a>(&'a self, call: &'a AuthorizedToolCall)
+        -> PolicyFuture<'a, crate::execution::AuthorizedHelperPlan> { self.plans.prepare_in_run(call) }
+    fn decode_helper_result(&self, name: &str, stdout: &[u8], stderr: &[u8],
+        outcome: &duduclaw_isolation::ipc::HelperOutcome) -> Result<Value, VerificationError> {
+        self.plans.decode_helper_result(name, stdout, stderr, outcome)
+    }
 }
 
 /// E's blocking client retains its admission/session lease through snapshot,

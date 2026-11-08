@@ -34,6 +34,26 @@ pub(super) fn make_io(pty: bool, fds: Vec<OwnedFd>, max_bytes: u64, buffer_bytes
     }
 }
 
+/// HX5: an in-run helper call's `[StdoutRead, StderrRead]` pipes (no stdin;
+/// the input is a sealed memfd), sharing one output budget like `make_io`.
+pub(super) fn make_helper_io(fds: Vec<OwnedFd>, max_bytes: u64)
+    -> Result<(Box<dyn RunReader>, Box<dyn RunReader>), BackendError> {
+    if fds.len() != 2 || max_bytes == 0 { return Err(BackendError::Protocol); }
+    let mut converted = Vec::with_capacity(2);
+    for fd in fds {
+        let flags = fcntl(fd.as_raw_fd(), FcntlArg::F_GETFL).map_err(|_| BackendError::Io)?;
+        fcntl(fd.as_raw_fd(), FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK))
+            .map_err(|_| BackendError::Io)?;
+        converted.push(Arc::new(AsyncFd::new(fd).map_err(|_| BackendError::Io)?));
+    }
+    let mut fds = converted.into_iter();
+    let budget = Arc::new(OutputBudget { remaining: AtomicU64::new(max_bytes), exceeded: AtomicBool::new(false) });
+    let buffer_bytes = 64 * 1024;
+    let stdout = Reader { fd: fds.next().ok_or(BackendError::Protocol)?, budget: budget.clone(), buffer_bytes, pty: false };
+    let stderr = Reader { fd: fds.next().ok_or(BackendError::Protocol)?, budget, buffer_bytes, pty: false };
+    Ok((Box::new(stdout), Box::new(stderr)))
+}
+
 struct OutputBudget { remaining: AtomicU64, exceeded: AtomicBool }
 
 struct Reader {

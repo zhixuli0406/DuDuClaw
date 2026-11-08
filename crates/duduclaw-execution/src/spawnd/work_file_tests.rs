@@ -11,9 +11,15 @@ const RUN: RunHandle = RunHandle(RunId([31; 16]));
 const EMPLOYEE: EmployeeId = EmployeeId([37; 16]);
 
 fn fixture(features: Option<FeatureSource>) -> (SpawndBackend, std::sync::Arc<Entry>, OwnedFd) {
+    fixture_with(features, SpawndFeatures::WORK_BROKER)
+}
+
+/// `reserved` = the bits root sent in this connection's `Reserved.features`.
+fn fixture_with(features: Option<FeatureSource>, reserved: SpawndFeatures)
+    -> (SpawndBackend, std::sync::Arc<Entry>, OwnedFd) {
     let slots = std::sync::Arc::new(Semaphore::new(1));
     let (connection, peer) = super::super::transport::Connection::test_pair();
-    let entry = std::sync::Arc::new(Entry { employee: EMPLOYEE, reservation_expiry: 1,
+    let entry = std::sync::Arc::new(Entry { employee: EMPLOYEE, reservation_expiry: 1, features: reserved,
         connection: std::sync::Arc::new(connection), _permit: slots.clone().try_acquire_owned().unwrap(),
         state: Mutex::new(State {
             expires: tokio::time::Instant::now() + Duration::from_secs(30), started: true, task_ref: None,
@@ -26,7 +32,7 @@ fn fixture(features: Option<FeatureSource>) -> (SpawndBackend, std::sync::Arc<En
 }
 
 fn advertised(names: &'static [&'static str]) -> Option<FeatureSource> {
-    Some(std::sync::Arc::new(move || Ok(SpawndFeatures::from_advertised(names.iter().copied()))))
+    Some(std::sync::Arc::new(move || Ok(features_from_advertised(names.iter().copied()))))
 }
 
 /// Answer exactly one request with `reply(request)` and the given rights.
@@ -72,9 +78,10 @@ fn nothing_sent(peer: &OwnedFd) -> bool {
 
 #[test]
 fn h5_bridge_requires_feature_bit() {
-    assert!(SpawndFeatures::from_advertised(["work_broker"]).work_broker());
-    assert!(!SpawndFeatures::from_advertised(["helper_calls", "work_broker_v2", "WORK_BROKER"]).work_broker());
-    assert!(!SpawndFeatures::default().work_broker());
+    let work = SpawndFeatures::WORK_BROKER;
+    assert_eq!(features_from_advertised(["work_broker"]), work);
+    assert!(!features_from_advertised(["helper_calls", "work_broker_v2", "WORK_BROKER"]).contains(work));
+    assert!(!SpawndFeatures::default().contains(work));
     let failing: FeatureSource = std::sync::Arc::new(|| Err(BackendError::Unavailable));
     // No source (today's default), an older spawnd without the bit, and an
     // unreadable advertisement: nothing crosses the root boundary.
@@ -85,6 +92,12 @@ fn h5_bridge_requires_feature_bit() {
         assert!(nothing_sent(&peer));
         assert!(!entry.connection.is_closed(), "refusing locally must not fence the run");
     }
+    // HX4/HX5: the source only narrows; a connection whose `Reserved.features`
+    // lacked the bit never sends the op, whatever the readiness view says.
+    let (backend, entry, peer) = fixture_with(advertised(&["work_broker", "helper_calls"]), SpawndFeatures::HELPER_CALLS);
+    assert_eq!(backend.open_work_file(RUN, EMPLOYEE, "a.txt", u64::MAX).unwrap_err(), WorkFileError::BrokerUnavailable);
+    assert!(nothing_sent(&peer));
+    assert!(!entry.connection.is_closed());
     // With the bit, identity mismatches and invalid paths are still refused locally.
     let (backend, entry, peer) = fixture(advertised(&["work_broker"]));
     assert_eq!(backend.open_work_file(RUN, EmployeeId([1; 16]), "a.txt", u64::MAX).unwrap_err(), WorkFileError::NotLive);

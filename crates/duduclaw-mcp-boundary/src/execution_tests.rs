@@ -30,7 +30,7 @@ impl ResourceResolver for Resolver {
     }
 }
 fn authorized_call(context: &RequestContext) -> AuthorizedToolCall {
-    tool_policy::authorize(context, "execute_program", &json!({}), &Resolver).unwrap()
+    tool_policy::authorize(context, "codrive_run", &json!({}), &Resolver).unwrap()
 }
 fn bind_plan(call: &AuthorizedToolCall, policy: SpawnPolicy) -> AuthorizedExecutionPlan {
     let directory = test_workspace();
@@ -138,7 +138,7 @@ impl RunWriter for EmptyWriter {
 #[derive(Default)]
 struct Factory { refuse: bool, bad_employee: bool, collects: bool }
 impl ExecutionPlanFactory for Factory {
-    fn supports(&self, name: &str) -> bool { matches!(name, "execute_program" | "skill_extract") }
+    fn supports(&self, name: &str) -> bool { matches!(name, "codrive_run" | "skill_extract") }
     fn collects_results(&self, _: &str) -> bool { self.collects }
     fn decode_result(&self, _: &str, stdout: &[u8], stderr: &[u8], outcome: &RunOutcome) -> Result<Value, VerificationError> {
         if !stdout.is_empty() || !stderr.is_empty() || *outcome != RunOutcome::Exited(0) { return Err(VerificationError::Invalid); }
@@ -178,7 +178,7 @@ pub(crate) fn plan(context: &RequestContext, name: &str, run: RunHandle) -> Spaw
 async fn isolated_execution_handler_refusal_precedes_reservation() {
     let backend = Arc::new(Backend::default());
     let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory { refuse: true, ..Default::default() }), Arc::new(Resolver));
-    let result = bridge.execute(&context("execute_program"), "execute_program", &json!({})).await;
+    let result = bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await;
     assert_eq!(result["isError"], true);
     assert_eq!(backend.reserved.load(Ordering::SeqCst), 0);
     assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
@@ -188,7 +188,7 @@ async fn isolated_execution_handler_refusal_precedes_reservation() {
 async fn isolated_execution_bad_plan_cancels_without_spawn() {
     let backend = Arc::new(Backend::default());
     let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory { bad_employee: true, ..Default::default() }), Arc::new(Resolver));
-    assert_eq!(bridge.execute(&context("execute_program"), "execute_program", &json!({})).await["isError"], true);
+    assert_eq!(bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await["isError"], true);
     assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
     assert_eq!(backend.killed.load(Ordering::SeqCst), 1);
 }
@@ -197,14 +197,14 @@ async fn isolated_execution_bad_plan_cancels_without_spawn() {
 async fn isolated_execution_spawn_failure_is_uncertain_and_cancelled() {
     let backend = Arc::new(Backend { fail_spawn: true, ..Default::default() });
     let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()), Arc::new(Resolver));
-    let result = bridge.execute(&context("execute_program"), "execute_program", &json!({})).await;
+    let result = bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await;
     assert_eq!(result["execution_status"], "uncertain");
     assert_eq!(backend.killed.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn isolated_execution_returns_queued_handle_without_waiting() {
-    for tool in ["execute_program"] {
+    for tool in ["codrive_run"] {
         let backend = Arc::new(Backend::default());
         let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()), Arc::new(Resolver));
         let result = bridge.execute(&context(tool), tool, &json!({})).await;
@@ -222,45 +222,45 @@ async fn isolated_execution_returns_queued_handle_without_waiting() {
 async fn isolated_execution_never_cancels_a_forged_caller_reservation() {
     let backend = Arc::new(Backend { return_caller: true, ..Default::default() });
     let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()), Arc::new(Resolver));
-    assert_eq!(bridge.execute(&context("execute_program"), "execute_program", &json!({})).await["isError"], true);
+    assert_eq!(bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await["isError"], true);
     assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
     assert_eq!(backend.killed.load(Ordering::SeqCst), 0);
 }
 
 #[test]
 fn isolated_execution_plan_requires_registered_runtime_workspace_and_class() {
-    let context = context("execute_program");
+    let context = context("codrive_run");
     let call = authorized_call(&context);
     let run = RunHandle(RunId([9; 16]));
-    let mut authorized = bind_plan(&call, plan(&context, "execute_program", run));
+    let mut authorized = bind_plan(&call, plan(&context, "codrive_run", run));
     assert!(valid_plan(&call, Route::Execution, run, &authorized));
     authorized.policy.runtime = RuntimeKind::Claude;
     assert!(!valid_plan(&call, Route::Execution, run, &authorized));
-    authorized.policy = plan(&context, "execute_program", run);
+    authorized.policy = plan(&context, "codrive_run", run);
     // Both workspaces are capability grants: only THIS call's work is valid.
     authorized.policy.workspace.workspace = Text::new("other".into()).unwrap();
     assert!(!valid_plan(&call, Route::Execution, run, &authorized));
-    authorized.policy = plan(&context, "execute_program", run);
+    authorized.policy = plan(&context, "codrive_run", run);
     authorized.policy.workspace.relative_cwd = Text::new("../other".into()).unwrap();
     assert!(!valid_plan(&call, Route::Execution, run, &authorized));
-    authorized.policy = plan(&context, "execute_program", run);
+    authorized.policy = plan(&context, "codrive_run", run);
     assert!(!valid_plan(&call, Route::Worker, run, &authorized));
     authorized.policy = plan(&context, "skill_extract", run);
     authorized.policy.network = NetworkPolicy::Egress(duduclaw_isolation::egress::ProfileId(Sha256Digest([0; 32])));
     assert!(!valid_plan(&call, Route::Worker, run, &authorized));
     let bridge = ExecutionToolBridge::new(Arc::new(Backend::default()), Arc::new(Factory::default()), Arc::new(Resolver));
-    for name in ["memory_search", "unknown", "execute_program_extra", "skill_extract"] { assert!(!bridge.supports(name)); }
+    for name in ["memory_search", "unknown", "codrive_run_extra", "skill_extract"] { assert!(!bridge.supports(name)); }
 }
 
 #[test]
 fn isolated_execution_plan_cannot_be_built_from_another_selected_workspace() {
-    let context = context("execute_program");
+    let context = context("codrive_run");
     let call = authorized_call(&context);
     let directory = tempfile::tempdir().unwrap();
     let mut roots = crate::resources::ResourceRoots::default();
     roots.insert("other".into(), context.record().employee, std::fs::File::open(directory.path()).unwrap()).unwrap();
     assert!(roots.authorize_workspace(&call, "other").is_err());
-    let mut policy = plan(&context, "execute_program", RunHandle(RunId([9; 16])));
+    let mut policy = plan(&context, "codrive_run", RunHandle(RunId([9; 16])));
     policy.workspace.workspace = Text::new("other".into()).unwrap();
     roots.insert("work".into(), context.record().employee, std::fs::File::open(directory.path()).unwrap()).unwrap();
     assert!(AuthorizedExecutionPlan::new(roots.authorize_workspace(&call, "work").unwrap(), policy).is_err());
@@ -268,7 +268,7 @@ fn isolated_execution_plan_cannot_be_built_from_another_selected_workspace() {
 
 struct PendingFactory { preparing: tokio::sync::Notify }
 impl ExecutionPlanFactory for PendingFactory {
-    fn supports(&self, name: &str) -> bool { name == "execute_program" }
+    fn supports(&self, name: &str) -> bool { name == "codrive_run" }
     fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -283,7 +283,7 @@ async fn isolated_execution_aborted_preparation_cancels_reserved_run() {
     let backend = Arc::new(Backend::default());
     let factory = Arc::new(PendingFactory { preparing: tokio::sync::Notify::new() });
     let bridge = ExecutionToolBridge::new(backend.clone(), factory.clone(), Arc::new(Resolver));
-    let task = tokio::spawn(async move { bridge.execute(&context("execute_program"), "execute_program", &json!({})).await });
+    let task = tokio::spawn(async move { bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await });
     factory.preparing.notified().await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
@@ -309,7 +309,7 @@ async fn isolated_execution_resource_refusal_precedes_reservation() {
     let backend = Arc::new(Backend::default());
     let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()),
         Arc::new(ChangingResolver { calls: AtomicUsize::new(0), refuse: true }));
-    assert_eq!(bridge.execute(&context("execute_program"), "execute_program", &json!({})).await["isError"], true);
+    assert_eq!(bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await["isError"], true);
     assert_eq!(backend.reserved.load(Ordering::SeqCst), 0);
     assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
 }
@@ -319,7 +319,7 @@ async fn isolated_execution_resource_change_after_prepare_cancels_before_spawn()
     let backend = Arc::new(Backend::default());
     let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()),
         Arc::new(ChangingResolver { calls: AtomicUsize::new(0), refuse: false }));
-    assert_eq!(bridge.execute(&context("execute_program"), "execute_program", &json!({})).await["isError"], true);
+    assert_eq!(bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await["isError"], true);
     assert_eq!(backend.reserved.load(Ordering::SeqCst), 1);
     assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
     assert_eq!(backend.killed.load(Ordering::SeqCst), 1);
@@ -329,8 +329,8 @@ async fn isolated_execution_resource_change_after_prepare_cancels_before_spawn()
 async fn legacy_backend_is_not_ready_and_never_receives_a_protected_spawn() {
     let backend = Arc::new(Backend { legacy_only: true, ..Default::default() });
     let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()), Arc::new(Resolver));
-    assert!(!bridge.supports("execute_program"));
-    assert_eq!(bridge.execute(&context("execute_program"), "execute_program", &json!({})).await["isError"], true);
+    assert!(!bridge.supports("codrive_run"));
+    assert_eq!(bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await["isError"], true);
     assert_eq!(backend.reserved.load(Ordering::SeqCst), 0);
     assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
 }
@@ -339,7 +339,7 @@ async fn legacy_backend_is_not_ready_and_never_receives_a_protected_spawn() {
 async fn backend_cannot_substitute_a_same_named_different_workspace_root() {
     let backend = Arc::new(Backend { wrong_workspace: true, ..Default::default() });
     let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()), Arc::new(Resolver));
-    assert_eq!(bridge.execute(&context("execute_program"), "execute_program", &json!({})).await["isError"], true);
+    assert_eq!(bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await["isError"], true);
     assert_eq!(backend.spawned.load(Ordering::SeqCst), 0);
     assert_eq!(backend.killed.load(Ordering::SeqCst), 1);
 }
@@ -365,7 +365,7 @@ async fn execution_resource_rechecks_run_off_reactor_and_refuse_revocation() {
         let resolver = Arc::new(ThreadCheckedResolver { reactor: std::thread::current().id(),
             calls: AtomicUsize::new(0), revoke_on_recheck });
         let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory::default()), resolver.clone());
-        let result = bridge.execute(&context("execute_program"), "execute_program", &json!({})).await;
+        let result = bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await;
         assert_eq!(resolver.calls.load(Ordering::SeqCst), if revoke_on_recheck { 2 } else { 3 });
         assert_eq!(result["isError"], revoke_on_recheck);
         assert_eq!(backend.spawned.load(Ordering::SeqCst), usize::from(!revoke_on_recheck));
@@ -378,7 +378,7 @@ async fn execution_resource_change_during_final_handler_check_cancels_before_spa
     use std::sync::atomic::AtomicBool;
     struct FinalCheckFactory { checks: AtomicUsize, changed: Arc<AtomicBool> }
     impl ExecutionPlanFactory for FinalCheckFactory {
-        fn supports(&self, name: &str) -> bool { name == "execute_program" }
+        fn supports(&self, name: &str) -> bool { name == "codrive_run" }
         fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
             Box::pin(async move {
                 if self.checks.fetch_add(1, Ordering::SeqCst) == 1 {
@@ -412,7 +412,7 @@ async fn execution_resource_change_during_final_handler_check_cancels_before_spa
     let factory = Arc::new(FinalCheckFactory { checks: AtomicUsize::new(0), changed: changed.clone() });
     let resolver = Arc::new(FinalCheckResolver { changed, calls: AtomicUsize::new(0) });
     let bridge = ExecutionToolBridge::new(backend.clone(), factory.clone(), resolver.clone());
-    let result = bridge.execute(&context("execute_program"), "execute_program", &json!({})).await;
+    let result = bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await;
     assert_eq!(result["isError"], true);
     assert_eq!(factory.checks.load(Ordering::SeqCst), 2);
     assert_eq!(resolver.calls.load(Ordering::SeqCst), 3);
@@ -430,12 +430,12 @@ async fn isolated_execution_collector_retries_queued_io_without_cancelling() {
     let backend = Arc::new(Backend { collecting: true, ..Default::default() });
     let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory { collects: true, ..Default::default() }), Arc::new(Resolver))
         .with_jobs(jobs.clone());
-    let owner = context("execute_program");
-    let result = bridge.execute(&owner, "execute_program", &json!({})).await;
+    let owner = context("codrive_run");
+    let result = bridge.execute(&owner, "codrive_run", &json!({})).await;
     assert_eq!(result["isError"], false);
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let state = jobs.read(&owner, "execute_program", RunHandle(RunId([9; 16]))).unwrap();
+            let state = jobs.read(&owner, "codrive_run", RunHandle(RunId([9; 16]))).unwrap();
             if state["status"] == "complete" { assert_eq!(state["result"]["status"], "finished"); break; }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -453,11 +453,11 @@ async fn isolated_execution_failed_spawn_persists_uncertainty_and_job_selector()
     let backend = Arc::new(Backend { fail_spawn: true, ..Default::default() });
     let bridge = ExecutionToolBridge::new(backend, Arc::new(Factory { collects: true, ..Default::default() }), Arc::new(Resolver))
         .with_jobs(jobs.clone());
-    let owner = context("execute_program");
-    let result = bridge.execute(&owner, "execute_program", &json!({})).await;
+    let owner = context("codrive_run");
+    let result = bridge.execute(&owner, "codrive_run", &json!({})).await;
     assert_eq!(result["execution_status"], "uncertain");
     assert!(result["content"][0]["text"].as_str().unwrap().contains("09090909"));
-    assert_eq!(jobs.read(&owner, "execute_program", RunHandle(RunId([9; 16]))).unwrap()["status"], "uncertain");
+    assert_eq!(jobs.read(&owner, "codrive_run", RunHandle(RunId([9; 16]))).unwrap()["status"], "uncertain");
 }
 
 #[cfg(feature = "binding-store")]
@@ -490,7 +490,7 @@ async fn isolated_execution_aborted_insert_cannot_leave_a_pending_record() {
     let backend = Arc::new(Backend::default());
     let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory { collects: true, ..Default::default() }), Arc::new(Resolver))
         .with_jobs(jobs.clone());
-    let request = tokio::spawn(async move { bridge.execute(&context("execute_program"), "execute_program", &json!({})).await });
+    let request = tokio::spawn(async move { bridge.execute(&context("codrive_run"), "codrive_run", &json!({})).await });
     jobs.started.notified().await;
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
@@ -498,7 +498,7 @@ async fn isolated_execution_aborted_insert_cannot_leave_a_pending_record() {
     jobs.release.1.notify_all();
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if jobs.read(&context("execute_program"), "execute_program", RunHandle(RunId([9; 16])))
+            if jobs.read(&context("codrive_run"), "codrive_run", RunHandle(RunId([9; 16])))
                 .is_ok_and(|result| result["status"] == "uncertain") { break; }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -560,7 +560,7 @@ async fn isolated_recording_stop_cannot_target_program_job_or_use_start_capabili
     let home = tempfile::tempdir().unwrap();
     let jobs = SqliteExecutionJobs::open(&home.path().join("jobs.db")).unwrap();
     let run = RunHandle(RunId([9; 16]));
-    jobs.insert(&context("execute_program"), "execute_program", run).unwrap();
+    jobs.insert(&context("codrive_run"), "codrive_run", run).unwrap();
     let backend = Arc::new(Backend::default());
     let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(RecordingFactory), Arc::new(Resolver)).with_jobs(jobs);
     let args = json!({"id":"09".repeat(16)});
@@ -638,25 +638,25 @@ async fn isolated_execution_cancel_rechecks_live_authority_after_backend_wait() 
     let bridge = Arc::new(ExecutionToolBridge::new(backend.clone(),
         Arc::new(Factory { collects: true, ..Default::default() }), Arc::new(Resolver)).with_jobs(jobs.clone()));
     let live = Arc::new(AtomicBool::new(true));
-    let owner = RequestContext::with_live_verifier(context("execute_program").record().clone(), Arc::new(Live(live.clone())));
+    let owner = RequestContext::with_live_verifier(context("codrive_run").record().clone(), Arc::new(Live(live.clone())));
     let run = RunHandle(RunId([9; 16]));
-    jobs.insert(&owner, "execute_program", run).unwrap();
+    jobs.insert(&owner, "codrive_run", run).unwrap();
     let caller = owner.clone();
     let request = tokio::spawn(async move {
-        bridge.execute(&caller, "execute_program", &json!({"action":"cancel", "job":"09".repeat(16)})).await
+        bridge.execute(&caller, "codrive_run", &json!({"action":"cancel", "job":"09".repeat(16)})).await
     });
     tokio::time::timeout(Duration::from_secs(2), started.notified()).await.unwrap();
     live.store(false, Ordering::SeqCst);
     release.notify_one();
     assert_eq!(request.await.unwrap()["isError"], true);
     assert_eq!(backend.killed.load(Ordering::SeqCst), 0);
-    assert_eq!(jobs.read(&owner, "execute_program", run).unwrap()["status"], "pending");
+    assert_eq!(jobs.read(&owner, "codrive_run", run).unwrap()["status"], "pending");
 }
 
 #[test]
 fn isolated_execution_cancel_authority_binds_target_and_employee() {
     let run = RunHandle(RunId([9; 16]));
-    let authority = JobCancelAuthority { context: context("execute_program"), run };
+    let authority = JobCancelAuthority { context: context("codrive_run"), run };
     assert!(authority.verify_cancel(EmployeeId([2; 16]), run).is_ok());
     assert!(authority.verify_cancel(EmployeeId([8; 16]), run).is_err());
     assert!(authority.verify_cancel(EmployeeId([2; 16]), RunHandle(RunId([8; 16]))).is_err());

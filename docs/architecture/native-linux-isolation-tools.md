@@ -174,8 +174,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `odoo_schema_overview` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
 | `odoo_schema_fields` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
 | `skill_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee + exactly one own Wiki output grant (Confined Wiki), rechecked at publication; own SKILLS bytes parsed by E as data; publishes only into the caller's own wiki, body pages read back before the completion marker (H12a) |
-| `execute_program` | A ExecutionBackend + ExecutionPlanFactory |
-| `office_script` | A ExecutionBackend + ExecutionPlanFactory |
+| `execute_program` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` and spawnd `helper_calls` |
+| `office_script` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` and spawnd `helper_calls` |
 | `skill_bank_feedback` | Resource → AuthorizedToolCall → original live employee handler |
 | `computer_screenshot` | Resource → AuthorizedToolCall → original live employee handler |
 | `computer_click` | Resource → AuthorizedToolCall → original live employee handler |
@@ -253,7 +253,7 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `memory_get_at` | Resource → AuthorizedToolCall → original live employee handler |
 | `memory_invalidate_by_origin` | Resource → AuthorizedToolCall → original live employee handler |
 | `memory_search_by_layer` | Resource → AuthorizedToolCall → original live employee handler |
-| `code_map` | A ExecutionBackend + ExecutionPlanFactory |
+| `code_map` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` and spawnd `helper_calls` |
 | `user_profile_record` | Resource → AuthorizedToolCall → original live employee handler |
 | `user_profile_get` | Resource → AuthorizedToolCall → original live employee handler |
 | `user_code_profile` | Resource → AuthorizedToolCall → original live employee handler |

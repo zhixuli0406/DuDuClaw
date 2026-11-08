@@ -24,9 +24,9 @@ fn isolated_schema_preserves_original_record_target_selectors() {
     let mut code = json!({"name":"code_map", "inputSchema":{"properties":{
         "query":{"type":"string"},"root":{"type":"string"}},"required":["query"]}});
     project_tool_schema(&mut code);
-    assert_eq!(code["inputSchema"]["required"], json!(["workspace"]));
-    assert_eq!(code["inputSchema"]["anyOf"][0]["required"], json!(["query"]));
-    assert_eq!(code["inputSchema"]["anyOf"][1]["required"], json!(["action","job"]));
+    // HX5: synchronous in-run helper, no job selector.
+    assert_eq!(code["inputSchema"]["required"], json!(["query", "workspace"]));
+    assert!(code["inputSchema"].get("anyOf").is_none());
     assert!(code["inputSchema"]["properties"].get("root").is_none());
 }
 
@@ -625,18 +625,18 @@ fn isolated_i1b_helper_control_schema_preserves_start_fields_and_host_controls()
         "required":["code","language"], "properties":{"code":{"type":"string"},"language":{"type":"string"}}
     }});
     project_tool_schema(&mut tool);
-    assert_eq!(tool["inputSchema"]["required"], json!([]));
-    assert_eq!(tool["inputSchema"]["anyOf"][0]["required"], json!(["code","language"]));
-    assert_eq!(tool["inputSchema"]["anyOf"][0]["not"]["required"], json!(["action"]));
-    assert_eq!(tool["inputSchema"]["anyOf"][1]["required"], json!(["action","job"]));
-    assert_eq!(tool["inputSchema"]["properties"]["action"]["enum"], json!(["status","cancel"]));
-    assert_eq!(tool["inputSchema"]["properties"]["job"]["pattern"], "^[0-9a-f]{32}$");
+    // HX5: the in-run helper tools return their result synchronously; the
+    // pending-job controls (`action`/`job`) are gone from their schema.
+    assert_eq!(tool["inputSchema"]["required"], json!(["code","language"]));
+    assert!(tool["inputSchema"].get("anyOf").is_none());
+    assert!(tool["inputSchema"]["properties"].get("action").is_none());
+    assert!(tool["inputSchema"]["properties"].get("job").is_none());
 
     let mut tool = json!({"name":"code_map", "inputSchema":{"properties":{"root":{"type":"string"}, "query":{"type":"string"}}}});
     project_tool_schema(&mut tool);
     assert!(tool["inputSchema"]["properties"].get("root").is_none());
     assert_eq!(tool["inputSchema"]["required"], json!(["workspace"]));
-    assert!(tool["inputSchema"]["properties"].get("action").is_some());
+    assert!(tool["inputSchema"]["properties"].get("action").is_none());
 }
 
 #[test]

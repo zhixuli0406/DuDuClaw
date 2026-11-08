@@ -27,12 +27,14 @@ impl Language {
         }
     }
 
+    /// Signed interpreter file name (under the helper root, `helper_layout`)
+    /// and its fixed arguments.
     #[cfg(target_os = "linux")]
     fn command(self) -> (&'static str, &'static [&'static str]) {
         match self {
-            Self::Python => ("/runtime/python3", &["-I", "-"]),
-            Self::Bash => ("/runtime/bash", &["--noprofile", "--norc", "-s", "--"]),
-            Self::JavaScript => ("/runtime/node", &["--input-type=commonjs", "-"]),
+            Self::Python => ("python3", &["-I", "-"]),
+            Self::Bash => ("bash", &["--noprofile", "--norc", "-s", "--"]),
+            Self::JavaScript => ("node", &["--input-type=commonjs", "-"]),
         }
     }
 }
@@ -185,20 +187,31 @@ impl Capture {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(not(test), allow(dead_code))]
 async fn execute(request: &ProgramRequest, cwd: &std::path::Path) -> ProgramResult {
-    let (_program, arguments) = request.language.command();
-    #[cfg(not(test))]
-    let program = _program;
-    // Explicit test seam: fixtures exercise bounded I/O using system tools,
-    // never the production sealed-fd/signature entry.
-    #[cfg(test)]
-    let program = match request.language { Language::Python => "/usr/bin/python3", Language::Bash => "/usr/bin/bash", Language::JavaScript => "/usr/bin/node" };
-    execute_command(program, arguments, request.code.as_bytes(), request.timeout_seconds, cwd).await
+    execute_in(request, cwd, &crate::helper_layout::HelperLayout::legacy()).await
 }
 
 #[cfg(target_os = "linux")]
+async fn execute_in(request: &ProgramRequest, cwd: &std::path::Path, layout: &crate::helper_layout::HelperLayout)
+    -> ProgramResult {
+    let (name, arguments) = request.language.command();
+    #[cfg(not(test))]
+    let Ok(program) = layout.file(name) else {
+        return Capture::default().finish(ProgramStatus::StartFailed, None, None);
+    };
+    // Explicit test seam: fixtures exercise bounded I/O using system tools,
+    // never the production sealed-fd/signature entry.
+    #[cfg(test)]
+    let program = { let _ = name; match request.language { Language::Python => "/usr/bin/python3", Language::Bash => "/usr/bin/bash", Language::JavaScript => "/usr/bin/node" }.to_owned() };
+    execute_command(&program, arguments, request.code.as_bytes(), request.timeout_seconds, cwd, layout).await
+}
+
+/// `HOME`/`TMPDIR` of the started interpreter come from the helper layout:
+/// `/helper-tmp/<call>` in-run [F9], `/home/employee` + `/tmp` for legacy runs.
+#[cfg(target_os = "linux")]
 pub(crate) async fn execute_command(program: &str, arguments: &[&str], input: &[u8], timeout_seconds: u64,
-    cwd: &std::path::Path) -> ProgramResult {
+    cwd: &std::path::Path, layout: &crate::helper_layout::HelperLayout) -> ProgramResult {
     use std::{io, process::Stdio, sync::{Arc, Mutex}, time::Duration};
     use std::os::unix::process::ExitStatusExt;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -218,8 +231,8 @@ pub(crate) async fn execute_command(program: &str, arguments: &[&str], input: &[
     // This is an employee-side helper, never called from the gateway process.
     // B2 owns the namespace and tears down all descendants when the helper exits.
     let mut command = tokio::process::Command::new(program);
-    command.args(arguments).env_clear().env("HOME", "/home/employee").env("PATH", "/usr/bin:/bin")
-        .env("TMPDIR", "/tmp").current_dir(cwd).stdin(Stdio::piped())
+    command.args(arguments).env_clear().env("HOME", &layout.home).env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", &layout.scratch).current_dir(cwd).stdin(Stdio::piped())
         .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     let mut child = match command.spawn() {
         Ok(child) => child, Err(_) => return failure(ProgramStatus::StartFailed),
@@ -268,10 +281,13 @@ fn linux_main() -> i32 {
     let Ok(bytes) = helper_input_args(&fixed, MAX_REQUEST_BYTES) else { return 77; };
     let Ok(request) = ProgramRequest::decode(&bytes) else { return 64; };
     let index = match request.language { Language::Python => 1, Language::Bash => 2, Language::JavaScript => 3 };
-    if verify_runtime_file(request.language.command().0, &arguments[index]).is_err() { return 77; };
+    // HX5: `/helpers` + `/helper-tmp/<call>` in-run, `/runtime` + `/tmp` legacy.
+    let Ok(layout) = crate::helper_layout::current() else { return 77; };
+    let Ok(interpreter) = layout.file(request.language.command().0) else { return 77; };
+    if verify_runtime_file(&interpreter, &arguments[index]).is_err() { return 77; };
 
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return 70; };
-    let result = runtime.block_on(execute(&request, std::path::Path::new(WORKSPACE)));
+    let result = runtime.block_on(execute_in(&request, std::path::Path::new(WORKSPACE), &layout));
     let Ok(bytes) = result.encode() else { return 70; };
     if std::io::stdout().lock().write_all(&bytes).is_err() { return 74; }
     0
@@ -321,8 +337,9 @@ pub(crate) fn helper_input_args(arguments: &[&str], limit: usize) -> Result<Vec<
     let (uid, effective_uid, nnp) = unsafe {
         (libc::getuid(), libc::geteuid(), libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0))
     };
-    if uid == 0 || effective_uid != uid || nnp != 1
-        || std::env::current_dir().ok().as_deref() != Some(std::path::Path::new(WORKSPACE)) { return Err(()); }
+    // HX5: cwd is `/work` for a legacy child run and `/helper-tmp/<call>` for
+    // an in-run helper; `helper_layout::current` refuses any other mix.
+    if uid == 0 || effective_uid != uid || nnp != 1 || crate::helper_layout::current().is_err() { return Err(()); }
     // SAFETY: query only; reject a missing fd before taking sole ownership.
     if unsafe { libc::fcntl(4, libc::F_GETFD) } < 0 { return Err(()); }
     // SAFETY: fixed B2 input fd, binary entry takes sole ownership.

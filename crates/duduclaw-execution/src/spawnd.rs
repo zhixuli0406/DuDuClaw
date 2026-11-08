@@ -5,7 +5,9 @@
 mod transport;
 mod fd_io;
 mod work_file;
-pub use work_file::{FeatureSource, SpawndFeatures, WorkFileError, WorkFileSnapshot, WORK_BROKER_FEATURE};
+mod helper_call;
+pub use work_file::{features_from_advertised, FeatureSource, SpawndFeatures, WorkFileError, WorkFileSnapshot,
+    WORK_BROKER_FEATURE};
 
 use std::{collections::BTreeMap, os::fd::OwnedFd, sync::{Arc, Mutex as StdMutex}, time::Duration};
 use duduclaw_isolation::{bounded::{List, Text}, execution::*, ids::{EmployeeId, RunId}, ipc::{self, SpawnRequest, SpawnResponse, RunStatus}};
@@ -56,6 +58,9 @@ pub struct McpReceipt {
 struct Entry {
     employee: EmployeeId,
     reservation_expiry: u64,
+    /// [F17] `Reserved.features` of this run's control connection: the bits
+    /// root itself advertised to the connection every later op travels on.
+    features: ipc::SpawndFeatures,
     connection: Arc<Connection>,
     state: Mutex<State>,
     _permit: OwnedSemaphorePermit,
@@ -334,14 +339,16 @@ impl ExecutionBackend for SpawndBackend {
                 connection.close().await;
                 return Err(error);
             }
-            // `features` [F17] is read by HX5 before any helper op is sent.
-            let SpawnResponse::Reserved { run, expires_at_unix_ms, .. } = packet.response else { return Err(BackendError::Protocol); };
+            // `features` [F17] is read (`connection_features`) before any
+            // work or helper op is sent on this connection.
+            let SpawnResponse::Reserved { run, expires_at_unix_ms, features } = packet.response else { return Err(BackendError::Protocol); };
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| BackendError::Unavailable)?.as_millis();
             let remaining = (expires_at_unix_ms as u128).checked_sub(now_ms)
                 .filter(|ms| *ms > 0 && *ms <= ipc::RESERVATION_TIMEOUT_MS as u128)
                 .ok_or(BackendError::Protocol)?;
-            let entry = Arc::new(Entry { employee, reservation_expiry: expires_at_unix_ms, connection: Arc::new(connection), _permit: permit, state: Mutex::new(State {
+            let entry = Arc::new(Entry { employee, reservation_expiry: expires_at_unix_ms, features,
+                connection: Arc::new(connection), _permit: permit, state: Mutex::new(State {
                 expires: Instant::now() + Duration::from_millis(remaining as u64), started: false, task_ref: None,
                 pty: false, mcp: false, output_bytes: 0, output_buffer: 0,
                 io_received: false, stdio: None, terminal: None, mcp_fd: None, io_receipt: None, outcome: None, terminal_at: None, workspace: None,
@@ -478,6 +485,20 @@ impl ExecutionBackend for SpawndBackend {
                 }
             }).await.map_err(|_| BackendError::Timeout)?
         })
+    }
+
+    // HX5 (`helper_call.rs`): in-run helper calls on the run's own control
+    // connection, gated per connection by `Reserved.features` [F17].
+    fn supports_helper_calls(&self) -> bool { true }
+    fn helper_features(&self, run: RunHandle) -> ipc::SpawndFeatures { self.connection_features(run) }
+    fn start_helper(&self, plan: HelperPlan) -> HelperFuture<'_, HelperStart> {
+        Box::pin(self.helper_start(plan))
+    }
+    fn wait_helper(&self, run: RunHandle, call: ipc::HelperCallId) -> HelperFuture<'_, ipc::HelperOutcome> {
+        Box::pin(self.helper_wait(run, call))
+    }
+    fn cancel_helper(&self, run: RunHandle, call: ipc::HelperCallId) -> HelperFuture<'_, ()> {
+        Box::pin(self.helper_control(helper_call::Control::Cancel, run, call))
     }
 }
 
@@ -638,6 +659,7 @@ mod tests {
         let (connection, peer) = Connection::test_pair();
         let run = RunHandle(RunId([19; 16]));
         let entry = Arc::new(Entry { employee: EmployeeId([23; 16]), reservation_expiry: 123456,
+            features: ipc::SpawndFeatures::NONE,
             connection: Arc::new(connection), _permit: slots.clone().acquire_owned().await.unwrap(),
             state: Mutex::new(State {
                 expires: Instant::now() + Duration::from_secs(30), started: false, task_ref: None,

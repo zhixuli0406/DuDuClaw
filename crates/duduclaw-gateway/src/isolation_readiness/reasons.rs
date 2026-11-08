@@ -57,6 +57,38 @@ pub enum Reason {
     Revoked,
     /// A store or service needed to decide could not be read.
     ServiceUnavailable,
+    /// HX5 (D8 revision §5, [F17]): in-run helper tools are refused because
+    /// spawnd cannot start helpers; `reason` is a fixed code
+    /// (`spawnd_feature_missing` = no `helper_calls` bit).
+    HelperLauncherUnavailable { reason: &'static str },
+    /// HX5 (H16): a helper runtime of an in-run tool is not in the signed
+    /// publication; that tool stays hidden. `runtime` is a fixed runtime id.
+    HelperRuntimeMissing { runtime: &'static str },
+}
+
+/// Fixed ids reported by `helper_runtime_missing` (office scripts are one
+/// family of `duduclaw-office-<skill>-<script>-v1` runtimes).
+pub const HELPER_RUNTIMES: [&str; 3] = [duduclaw_execution::program_helper::PROGRAM_RUNTIME,
+    duduclaw_execution::code_map_helper::RUNTIME, "duduclaw-office-*-v1"];
+
+/// HX5: helper readiness of the three in-run tools from spawnd's advertised
+/// `helper_calls` bit and the published runtime ids. Pure; the caller reads
+/// both from the same sources the gates use (readiness report, publication).
+pub fn helper_reasons<'a>(helper_calls: bool, published: impl IntoIterator<Item = &'a str>) -> Vec<Reason> {
+    let mut reasons = Vec::new();
+    if !helper_calls {
+        reasons.push(Reason::HelperLauncherUnavailable {
+            reason: duduclaw_isolation::ipc::HELPER_FEATURE_MISSING_REASON });
+    }
+    let published: Vec<&str> = published.into_iter().collect();
+    for runtime in HELPER_RUNTIMES {
+        let present = match runtime.strip_suffix("*-v1") {
+            Some(prefix) => published.iter().any(|id| id.starts_with(prefix) && id.ends_with("-v1") && id.len() > prefix.len() + 3),
+            None => published.contains(&runtime),
+        };
+        if !present { reasons.push(Reason::HelperRuntimeMissing { runtime }); }
+    }
+    reasons
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -244,5 +276,29 @@ fn catalog_reasons(home: &Path, catalog: &ConnectorCatalog, lifecycle: &Employee
         }
         Err(GoogleRoutesError::Unavailable) => { reasons.insert(Reason::ServiceUnavailable); }
         Err(GoogleRoutesError::BindingMismatch) => { reasons.insert(Reason::BindingEvidenceMissing); }
+    }
+}
+
+#[cfg(test)]
+mod hx5_tests {
+    use super::*;
+
+    /// [F17] No `helper_calls` bit ⇒ a named launcher reason; each missing
+    /// helper runtime is reported by its fixed id, never a path.
+    #[test]
+    fn gateway_helper_readiness_names_missing_feature_and_runtimes() {
+        let all = ["duduclaw-program-v1", "duduclaw-code-map-v1", "duduclaw-office-docx-render-v1"];
+        assert!(helper_reasons(true, all).is_empty());
+        let missing = helper_reasons(false, ["duduclaw-program-v1"]);
+        assert_eq!(missing, vec![Reason::HelperLauncherUnavailable { reason: "spawnd_feature_missing" },
+            Reason::HelperRuntimeMissing { runtime: "duduclaw-code-map-v1" },
+            Reason::HelperRuntimeMissing { runtime: "duduclaw-office-*-v1" }]);
+        assert_eq!(serde_json::to_value(missing[0]).unwrap(),
+            serde_json::json!({"code":"helper_launcher_unavailable","reason":"spawnd_feature_missing"}));
+        assert_eq!(serde_json::to_value(missing[1]).unwrap(),
+            serde_json::json!({"code":"helper_runtime_missing","runtime":"duduclaw-code-map-v1"}));
+        // A bare prefix is not an office runtime.
+        assert!(helper_reasons(true, ["duduclaw-program-v1", "duduclaw-code-map-v1", "duduclaw-office--v1"])
+            .contains(&Reason::HelperRuntimeMissing { runtime: "duduclaw-office-*-v1" }));
     }
 }

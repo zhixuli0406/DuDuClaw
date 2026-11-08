@@ -22,20 +22,24 @@ pub const WORK_BROKER_FEATURE: &str = "work_broker";
 /// than `CONTROL_TIMEOUT_MS`; a timeout still closes the run's control socket.
 const WORK_FILE_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// Features spawnd advertised. Only explicitly named features are enabled;
-/// unknown names (a newer spawnd) never enable anything here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SpawndFeatures { work_broker: bool }
-impl SpawndFeatures {
-    pub const NONE: Self = Self { work_broker: false };
-    pub fn from_advertised<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
-        Self { work_broker: names.into_iter().any(|name| name == WORK_BROKER_FEATURE) }
-    }
-    pub fn work_broker(self) -> bool { self.work_broker }
+/// HX4/HX5: the one feature set is the `ipc::SpawndFeatures` bitset
+/// (`helper_calls` bit 0, `work_broker` bit 1), as in `readiness.json` and
+/// every `SpawnResponse::Reserved`.
+pub use duduclaw_isolation::ipc::SpawndFeatures;
+
+/// Bits for advertised wire names (`SpawndFeatures::NAMES`). Unknown names (a
+/// newer spawnd) enable nothing; names are exact (`WORK_BROKER` is not one).
+pub fn features_from_advertised<'a>(names: impl IntoIterator<Item = &'a str>) -> SpawndFeatures {
+    names.into_iter().fold(SpawndFeatures::NONE, |features, name| {
+        SpawndFeatures::NAMES.into_iter().find(|(_, known)| *known == name)
+            .map_or(features, |(bit, _)| features.with(bit))
+    })
 }
 
-/// Read on every call (spawnd may restart as an older build). An error reads
-/// as "no features". Must reflect root's own advertisement, never config.
+/// The gateway's readiness view (`EvidenceReport.features`), read on every
+/// call (spawnd may restart as an older build). An error reads as "no
+/// features". It can only narrow what the run's own control connection was
+/// told in `Reserved.features`; it never enables a bit root did not send.
 pub type FeatureSource = Arc<dyn Fn() -> Result<SpawndFeatures, BackendError> + Send + Sync>;
 
 /// Typed refusal of one brokered open. Carries no path or root diagnostic.
@@ -75,8 +79,21 @@ impl SpawndBackend {
         self
     }
 
+    /// The installed readiness view; no source reads as no features.
     pub fn features(&self) -> SpawndFeatures {
         self.features.as_ref().and_then(|source| source().ok()).unwrap_or(SpawndFeatures::NONE)
+    }
+
+    /// Bits usable on `run`'s own control connection: what root sent in that
+    /// connection's `Reserved.features`, narrowed by the readiness source when
+    /// one is installed. Unknown run: none.
+    pub(super) fn connection_features(&self, run: RunHandle) -> SpawndFeatures {
+        let Ok(entry) = self.entry(run) else { return SpawndFeatures::NONE };
+        if entry.connection.is_closed() { return SpawndFeatures::NONE; }
+        match &self.features {
+            None => entry.features,
+            Some(source) => source().map_or(SpawndFeatures::NONE, |view| SpawndFeatures(view.0 & entry.features.0)),
+        }
     }
 
     /// One brokered open of `path` under `run`'s attached work mount. `run`
@@ -85,14 +102,17 @@ impl SpawndBackend {
     /// decides liveness and ownership. Blocking (≤ 12 s): blocking pool only.
     pub fn open_work_file(&self, run: RunHandle, employee: EmployeeId, path: &str, max_bytes: u64)
         -> Result<WorkFileSnapshot, WorkFileError> {
-        // Never send an op an older spawnd cannot decode (it would drop the
-        // run's whole control connection).
-        if !self.features().work_broker() { return Err(WorkFileError::BrokerUnavailable); }
-        let path = WorkPath::new(path.to_owned()).map_err(|_| WorkFileError::Refused)?;
         let entry = self.entry(run).map_err(|error| match error {
             BackendError::NotFound => WorkFileError::NotLive,
             _ => WorkFileError::Unavailable,
         })?;
+        // Never send an op an older spawnd cannot decode (it would drop the
+        // run's whole control connection). H5 keeps its default: without an
+        // installed readiness source no work op is sent.
+        if self.features.is_none() || !self.connection_features(run).allows(ipc::Opcode::OpenWorkFile) {
+            return Err(WorkFileError::BrokerUnavailable);
+        }
+        let path = WorkPath::new(path.to_owned()).map_err(|_| WorkFileError::Refused)?;
         // This gateway reserved `run` for `entry.employee`; another employee's
         // capability never reaches root on this run's connection.
         if entry.employee != employee || entry.connection.is_closed() { return Err(WorkFileError::NotLive); }

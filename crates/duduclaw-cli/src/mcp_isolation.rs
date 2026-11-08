@@ -45,6 +45,9 @@ pub(crate) fn boundary_route(name: &str) -> Option<BoundaryRoute> {
             "computer_session_start" | "computer_navigate" | "computer_session_stop") =>
             BoundaryRoute::Resource,
         Route::Execution => BoundaryRoute::Execution,
+        // HX5: same execution bridge; `ExecutionToolBridge::execute` sends these
+        // to `execute_in_run` (the caller's own run), never reserve/spawn.
+        Route::InRunHelper => BoundaryRoute::Execution,
         Route::Service if name == "hardware_info" => BoundaryRoute::Execution,
         Route::Service | Route::Connector => BoundaryRoute::Resource,
     })
@@ -551,7 +554,9 @@ fn project_tool_schema(tool: &mut Value) {
             properties.insert("path".into(), json!({"type":"string", "description":"工作區內的相對目錄路徑；省略表示整個工作區"}));
         }
     }
-    if matches!(name.as_str(), "execute_program" | "office_script" | "code_map" | "browser_record_start") {
+    // HX5: execute_program / office_script / code_map answer synchronously
+    // inside the caller's run; they have no job to query or cancel.
+    if name == "browser_record_start" {
         schema["properties"]["action"] = json!({"type":"string","enum":["status","cancel"],"description":"查詢或取消先前交付的工作；省略即建立新工作"});
         schema["properties"]["job"] = json!({"type":"string","pattern":"^[0-9a-f]{32}$","description":"先前回傳的工作識別碼"});
         let required = schema.get("required").cloned().unwrap_or(json!([]));

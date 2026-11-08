@@ -73,8 +73,12 @@ pub fn main_entry() -> i32 {
         let fixed: Vec<_> = args.iter().map(String::as_str).collect();
         let Ok(bytes) = crate::program_helper::helper_input_args(&fixed, MAX_REQUEST) else { return 77; };
         let Ok(request) = Request::decode(&bytes) else { return 64; };
-        if crate::program_helper::verify_runtime_file("/runtime/python3", &args[4]).is_err() { return 77; }
-        let path = format!("/runtime/office-{}-{}.py", args[1], args[2]);
+        // HX5: signed files under `/helpers` and staging under
+        // `/helper-tmp/<call>` in-run; `/runtime` + `/tmp/office` legacy.
+        let Ok(layout) = crate::helper_layout::current() else { return 77; };
+        let (Ok(python), Ok(path)) = (layout.file("python3"), layout.file(&format!("office-{}-{}.py", args[1], args[2])))
+            else { return 77; };
+        if crate::program_helper::verify_runtime_file(&python, &args[4]).is_err() { return 77; }
         let Ok(file) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK).open(&path) else { return 77; };
         let Ok(metadata) = file.metadata() else { return 77; };
         if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 || metadata.len() > 1024 * 1024 { return 77; }
@@ -84,11 +88,13 @@ pub fn main_entry() -> i32 {
         if digest != args[3] { return 77; }
         // The script is on B2's immutable root-owned runtime mount; the signed
         // argv pins its digest. Dependencies must ship there, never auto-install.
-        let Ok(prepared) = crate::office_io::Prepared::prepare(&request, &args[1], &args[2], std::path::Path::new("/work"), std::path::Path::new("/tmp/office")) else { return 77; };
+        let staging = layout.staging("office");
+        let Ok(prepared) = crate::office_io::Prepared::prepare(&request, &args[1], &args[2], std::path::Path::new("/work"), &staging) else { return 77; };
         let mut arguments = vec!["-I", path.as_str()];
         arguments.extend(prepared.arguments.iter().map(String::as_str));
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return 70; };
-        let mut result = runtime.block_on(crate::program_helper::execute_command("/runtime/python3", &arguments, &[], 180, std::path::Path::new("/work")));
+        let mut result = runtime.block_on(crate::program_helper::execute_command(&python, &arguments, &[], 180,
+            std::path::Path::new("/work"), &layout));
         if result.status == crate::program_helper::ProgramStatus::Exited && result.exit_code == Some(0) {
             match prepared.publish() {
                 Ok(Some(name)) => result.stdout = format!("Office output published: {name}"),

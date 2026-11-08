@@ -101,6 +101,38 @@ fn every_native_projection_is_fresh_secret_free_and_bound_to_binary_bytes() {
     assert!(runtime_projection(missing).is_err());
 }
 
+/// HX5 (Q5 = A): every runtime whose config can express it gets a ≥ 305 s
+/// tool timeout in its projected file; the value is covered by the digest.
+#[test]
+fn cli_tool_timeout_projection_at_least_305s() {
+    assert!(CLI_TOOL_TIMEOUT_MS >= 305_000);
+    assert!(CLI_TOOL_TIMEOUT_MS >= duduclaw_isolation::ipc::MAX_HELPER_TIMEOUT_MS + 5_000);
+    for runtime in [RuntimeKind::Claude, RuntimeKind::Codex, RuntimeKind::Grok] {
+        let projection = runtime_projection(registration(runtime.clone())).unwrap();
+        assert!(projection.tool_timeout_ms.is_some_and(|ms| ms >= 305_000), "{runtime:?}");
+        let primary = &projection.files[0].contents;
+        match runtime {
+            RuntimeKind::Claude => {
+                let config: serde_json::Value = serde_json::from_str(primary).unwrap();
+                assert!(config["mcpServers"]["duduclaw"]["timeout"].as_u64().is_some_and(|ms| ms >= 305_000));
+                assert_eq!(config["mcpServers"]["duduclaw"]["args"], serde_json::json!([]));
+            }
+            _ => {
+                let line = primary.lines().find(|line| line.starts_with("tool_timeout_sec = ")).unwrap();
+                let seconds: u64 = line.trim_start_matches("tool_timeout_sec = ").parse().unwrap();
+                assert!(seconds >= 305, "{runtime:?}");
+            }
+        }
+        let mut changed = projection.clone();
+        changed.tool_timeout_ms = Some(60_000);
+        assert_ne!(projection.digest(), changed.digest(), "the timeout is part of the accepted projection");
+    }
+    // The API worker's exact projection is unchanged (no tool-timeout key).
+    let api = runtime_projection(registration(RuntimeKind::OpenAiCompat)).unwrap();
+    assert_eq!(api.tool_timeout_ms, None);
+    assert!(!api.files[0].contents.contains("timeout"));
+}
+
 struct Registry { fault: u8 }
 impl RuntimeBridgeRegistry for Registry {
     fn registration(&self, runtime: &RuntimeKind) -> Result<RuntimeRegistration, VerificationError> {

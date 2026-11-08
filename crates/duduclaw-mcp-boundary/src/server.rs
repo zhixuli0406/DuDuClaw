@@ -63,7 +63,20 @@ pub async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R)
 #[cfg(target_os = "linux")]
 pub async fn serve(mut connection: crate::Connection, dispatcher: &dyn Dispatcher)
     -> Result<(), VerificationError> {
-    serve_with_deadline(&mut connection, dispatcher, std::time::Duration::from_secs(300)).await
+    serve_with_deadline(&mut connection, dispatcher,
+        std::time::Duration::from_millis(crate::config::CLI_TOOL_TIMEOUT_MS)).await
+}
+
+/// HX5 (Q5): whether `frame`, read while request `id` is in flight, is the
+/// MCP `notifications/cancelled` for exactly that request. Dropping the call
+/// future then runs its cancel path (in-run helpers send `HelperCancel`); MCP
+/// sends no response for a cancelled request. Any other frame stays a
+/// protocol violation (one request in flight per connection).
+pub fn cancels_request(frame: &Value, id: &Value) -> bool {
+    frame.get("id").is_none()
+        && frame.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+        && frame.get("params").and_then(|params| params.get("requestId"))
+            .is_some_and(|request| !id.is_null() && request == id)
 }
 
 #[cfg(target_os = "linux")]
@@ -133,6 +146,7 @@ pub(crate) async fn serve_with_deadline(connection: &mut crate::Connection, disp
             result = peer_eof(&mut reader) => return result,
             _ = &mut deadline => return Err(VerificationError::Unavailable),
         };
+        let request_id = request.get("id").cloned().unwrap_or(Value::Null);
         let call = dispatcher.dispatch(context, &agent_slug, request);
         tokio::pin!(call);
         // Immediately ready protocol messages may share a read. Only a call
@@ -146,17 +160,35 @@ pub(crate) async fn serve_with_deadline(connection: &mut crate::Connection, disp
             }) => result,
         };
         let response = if let Some(result) = immediate { result? } else {
-            tokio::select! {
+            let in_flight = tokio::select! {
                 biased;
                 _ = wait_revoked(&mut revoked) => return Err(VerificationError::Revoked),
                 result = &mut watch => return result,
-                result = &mut call => result?,
+                result = &mut call => Some(result?),
                 next = reader.fill_buf() => {
-                    return if next.map_err(|_| VerificationError::Unavailable)?.is_empty() {
-                        Ok(())
-                    } else { Err(VerificationError::Invalid) };
+                    // EOF = connection closed mid-call: dropping the call
+                    // future cancels it (in-run helpers: `HelperCancel`).
+                    if next.map_err(|_| VerificationError::Unavailable)?.is_empty() { return Ok(()); }
+                    None
                 }
                 _ = &mut deadline => return Err(VerificationError::Unavailable),
+            };
+            match in_flight {
+                Some(response) => response,
+                None => {
+                    let next = tokio::select! {
+                        biased;
+                        _ = wait_revoked(&mut revoked) => return Err(VerificationError::Revoked),
+                        result = read_frame(&mut reader) => result?,
+                        _ = &mut deadline => return Err(VerificationError::Unavailable),
+                    };
+                    let Some(next) = next else { return Ok(()); };
+                    // HX5 (Q5): `notifications/cancelled` for this request
+                    // drops the call (its cancel path runs) and keeps the
+                    // connection; MCP answers no cancelled request.
+                    if cancels_request(&decode(&next)?, &request_id) { continue; }
+                    return Err(VerificationError::Invalid);
+                }
             }
         };
         tokio::select! {
@@ -243,6 +275,25 @@ mod tests {
             nonce: [5; 32], jti: [6; 16],
         })
     }
+    /// HX5 (Q5): only the cancel notification for the in-flight request id
+    /// drops the call; anything else stays a second-request violation.
+    #[test]
+    fn mcp_cancelled_frame_matches_only_the_in_flight_request() {
+        use serde_json::json;
+        let cancel = |id: Value| json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}});
+        assert!(cancels_request(&cancel(json!(7)), &json!(7)));
+        assert!(cancels_request(&cancel(json!("call")), &json!("call")));
+        assert!(!cancels_request(&cancel(json!(8)), &json!(7)));
+        assert!(!cancels_request(&cancel(json!("7")), &json!(7)));
+        assert!(!cancels_request(&cancel(Value::Null), &Value::Null));
+        let mut with_id = cancel(json!(7));
+        with_id["id"] = json!(9);
+        assert!(!cancels_request(&with_id, &json!(7)));
+        assert!(!cancels_request(&json!({"jsonrpc":"2.0","method":"notifications/progress",
+            "params":{"requestId":7}}), &json!(7)));
+        assert!(!cancels_request(&json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{}}), &json!(7)));
+    }
+
     #[test]
     fn missing_readiness_implementation_refuses_startup() {
         assert_eq!(Incomplete.require_complete_services(), Err(VerificationError::Unavailable));

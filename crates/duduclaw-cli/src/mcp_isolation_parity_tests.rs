@@ -23,6 +23,12 @@ impl ExecutionBackend for ListingBackend {
     fn take_stdio(&self, _: RunHandle) -> BackendFuture<'_, RunStdio> { panic!("listing opened stdio") }
     fn take_pty(&self, _: RunHandle) -> BackendFuture<'_, RunPty> { panic!("listing opened a pty") }
     fn resize(&self, _: RunHandle, _: PtySize) -> BackendFuture<'_, ()> { panic!("listing resized a pty") }
+    // HX5: the in-run helper route is installed; listing never starts one.
+    fn supports_helper_calls(&self) -> bool { true }
+    fn start_helper(&self, _: HelperPlan) -> HelperFuture<'_, HelperStart> { panic!("listing started a helper") }
+    fn cancel_helper(&self, _: RunHandle, _: duduclaw_isolation::ipc::HelperCallId) -> HelperFuture<'_, ()> {
+        panic!("listing cancelled a helper")
+    }
 }
 
 // Discovery-only double: parity is an inventory assertion, not provider acceptance.
@@ -51,7 +57,7 @@ impl duduclaw_gateway::isolation_connectors::LiveConnectorSelectionPolicy for Li
 struct ListingPlans;
 impl ExecutionPlanFactory for ListingPlans {
     fn supports(&self, tool: &str) -> bool {
-        duduclaw_mcp_boundary::tool_policy::policy(tool).is_some_and(|p| p.route == Route::Execution)
+        duduclaw_mcp_boundary::tool_policy::policy(tool).is_some_and(|p| matches!(p.route, Route::Execution | Route::InRunHelper))
             || matches!(tool, "hardware_info" | "model_search" | "model_recommend")
     }
     fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
@@ -117,11 +123,12 @@ fn pending_production_selectors() -> BTreeSet<String> {
     // H12a removed skill_extract, shared_skill_adopt, skill_security_scan,
     // skill_graduate and skill_curator_status: they select the issuer's own
     // Employee (+ own Confined wiki) under EmployeeScope, not a workspace.
-    ["spawn_agent", "spawn_ephemeral", "execute_program",
-        "office_script", "inspect_branches", "diff_branches", "fork_cost", "discovery_catalog",
+    // HX5 removed execute_program, office_script and code_map: they are routed
+    // in-run (`Route::InRunHelper`) on the run's own `Workspace{employee-work}`.
+    ["spawn_agent", "spawn_ephemeral", "inspect_branches", "diff_branches", "fork_cost", "discovery_catalog",
         "discovery_list", "discovery_tree", "discovery_artifact", "discovery_cancel",
         "browser_record_start", "browser_record_stop", "skill_from_recording",
-        "code_map", "skill_synthesis_run", "skill_hub_install"]
+        "skill_synthesis_run", "skill_hub_install"]
         .into_iter().map(str::to_owned).collect()
 }
 
@@ -379,6 +386,11 @@ async fn employee_tool_parity(home: &std::path::Path) {
     // nothing was appended by the test.
     for tool in ["file_read", "csv_read", "xlsx_read", "web_fetch_cached", "web_extract", "create_task"] {
         assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: H10 issuer selector missing");
+    }
+    // HX5: the in-run helper tools ride the same Workspace{employee-work} grant.
+    for tool in ["execute_program", "code_map"] {
+        assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: HX5 in-run route not eligible");
+        assert!(!pending.contains(tool), "{tool}");
     }
     assert!(context.record().resources.as_slice().iter().any(|grant| matches!(grant,
         ResourceGrant::NewTask { requester } if matches!(&context.record().principal,
