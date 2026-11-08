@@ -621,3 +621,8 @@ pub(crate) fn control_recording(home: &Path, ctx: &duduclaw_auth::UserContext, i
     }
     Ok(result)
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[path = "test_support.rs"]
+pub mod test_support;

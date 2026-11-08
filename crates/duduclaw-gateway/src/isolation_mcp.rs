@@ -127,6 +127,11 @@ pub use runtime::{RuntimeAuthorization, with_runtime_authorization};
 #[cfg(target_os = "linux")]
 pub(crate) use boot::{record_authorization, delegation_source};
 #[cfg(target_os = "linux")]
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use boot::test_support;
+
+#[cfg(target_os = "linux")]
 pub use boot::{human_authorization, BootSources, BootStatus, MissingProducer, DispatcherFactory, DispatcherInput, LaunchInput,
     install_boot_sources, install_dispatcher_factory, boot_protected, boot_status, prepare_launch};
 #[cfg(not(target_os = "linux"))]
