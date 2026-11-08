@@ -69,6 +69,7 @@ export function EmployeeAccountMenu({ collapsed }: { collapsed: boolean }) {
           {missing && <span role="img" aria-label={t('sidebar.connectionsMissing')} className="size-1.5 rounded-full bg-warning" />}
         </DropdownMenuItem>
         <DropdownMenuItem onClick={() => navigate('/me/account')}>{t('sidebar.employeeSettings')}</DropdownMenuItem>
+        <DropdownMenuItem onClick={() => navigate('/me/external-access')}>{t('nav.externalAccess')}</DropdownMenuItem>
         <DropdownMenuItem onClick={cycleTheme} aria-label={intl.formatMessage({ id: 'header.theme' }, { theme })}>
           <ThemeIcon />{t('sidebar.employeeTheme')}
         </DropdownMenuItem>

@@ -105,6 +105,7 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("notify", "quiet_hours", Str),
     ("skills", "gap_digest_enabled", Bool),
     ("miniapp", "enabled", Bool),
+    ("external_status", "enabled", Bool),
     ("knowledge", "enabled", Bool),
     ("knowledge", "max_source_bytes", UInt),
     ("knowledge", "max_source_chars", UInt),
@@ -317,6 +318,9 @@ mod tests {
         assert!(check("[night]\nllm_enabled = \"nah\"\n").is_err());
         assert!(check("[gateway]\nport = 70000\n").is_err());
         assert!(check("[dispatch.team_budget]\nmax_spawns_per_task = -1\n").is_err());
+        // RM-064: a quoted "true" would silently read as off — refuse it.
+        assert!(check("[external_status]\nenabled = \"true\"\n").is_err());
+        check("[external_status]\nenabled = true\n").unwrap();
     }
 
     #[test]

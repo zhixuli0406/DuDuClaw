@@ -125,6 +125,7 @@ mod security_rpc;
 mod credential_audit_rpc;
 pub(crate) mod credential_protection_rpc;
 mod website_credentials_rpc;
+mod status_tokens_rpc;
 mod transcription_credentials_rpc;
 mod analytics_rpc;
 mod evolution_rpc;
@@ -611,6 +612,15 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return boxed_frame(|| self.handle_website_credentials(method, params, ctx)).await;
+        }
+
+        // RM-064 status credentials are gateway-owned bearer secrets. Route
+        // before extension dispatch so no plugin sees a freshly issued one.
+        if let Some(role) = status_tokens_rpc::minimum_role(method) {
+            if let Err(e) = acl::require_role(ctx, role) {
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.handle_status_tokens_rpc(method, params, ctx)).await;
         }
 
         // Compliance exports are gateway-owned. An extension must never

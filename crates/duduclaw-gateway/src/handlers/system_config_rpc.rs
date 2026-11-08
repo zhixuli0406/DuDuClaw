@@ -71,6 +71,9 @@ impl MethodHandler {
         // saved value. Reuses `miniapp::enabled`'s own parser rather than
         // re-implementing the "absent / malformed ⇒ false" posture.
         let miniapp_enabled: bool = crate::miniapp::enabled(&self.home_dir);
+        // RM-064: `[external_status] enabled`, same "absent / malformed ⇒
+        // false" parser the status endpoint itself reads per request.
+        let external_status_enabled: bool = crate::external_status::enabled(&self.home_dir);
 
         // Structured [notify] daily_digest so the dashboard Settings toggle +
         // time field show the saved values (W2-8). Reuses `DigestConfig`'s
@@ -114,6 +117,7 @@ impl MethodHandler {
                                 "gap_digest_enabled": gap_digest_enabled,
                                 "novelty_gate_enabled": novelty_gate_enabled,
                                 "miniapp_enabled": miniapp_enabled,
+                                "external_status_enabled": external_status_enabled,
                                 "daily_digest_enabled": digest_cfg.enabled,
                                 "daily_digest_at": digest_cfg.at.format("%H:%M").to_string(),
                                 "webchat_widget_key_set": webchat_widget_key_set,

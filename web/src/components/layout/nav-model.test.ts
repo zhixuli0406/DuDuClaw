@@ -373,6 +373,7 @@ const previousNavigation = {
       ],
       [
         "/me/account",
+        "/me/external-access",
         "/my/history-views",
         "/manage",
         "/app/system/settings/company",
@@ -407,6 +408,7 @@ const previousNavigation = {
     "groups": [
       [
         "/me/account",
+        "/me/external-access",
         "/manage",
         "/app/system/settings/company",
         "/app/system/settings/advanced",
@@ -466,6 +468,7 @@ const previousNavigation = {
       ],
       [
         "/me/account",
+        "/me/external-access",
         "/my/history-views",
         "/manage",
         "/about"
@@ -494,6 +497,7 @@ const previousNavigation = {
     "groups": [
       [
         "/me/account",
+        "/me/external-access",
         "/manage",
         "/about"
       ],
@@ -530,6 +534,7 @@ const previousNavigation = {
     "groups": [
       [
         "/me/account",
+        "/me/external-access",
         "/about"
       ],
       [

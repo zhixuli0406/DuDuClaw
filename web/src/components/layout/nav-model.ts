@@ -56,6 +56,7 @@ import {
   Library,
   UsersRound,
   Eye,
+  Share2,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import { filterVisible, type Gated } from '@/lib/nav-visibility';
@@ -421,6 +422,9 @@ export const navGroups: NavGroup[] = [
     label: 'navGroup.settings',
     items: [
       { to: '/me/account', icon: KeyRound, label: 'nav.account', desc: 'nav.account.desc', ownScope: true, newIn: '1.78.0' },
+      // RM-064: own read-only status credentials. Both editions (the Personal
+      // owner connects their own Odoo card too); the admin switch gates use.
+      { to: '/me/external-access', icon: Share2, label: 'nav.externalAccess', desc: 'nav.externalAccess.desc', ownScope: true, newIn: '1.81.0' },
       { to: '/my/history-views', icon: Eye, label: 'nav.myHistoryViews', desc: 'nav.myHistoryViews.desc', ownScope: true, enterprise: true, newIn: '1.76.0' },
       manageEntry,
       { to: '/app/system/settings/company', icon: Building2, label: 'companyInfo.title', desc: 'companyInfo.description', minRole: 'admin', newIn: '1.80.0' },

@@ -238,6 +238,22 @@ async fn mfa_enforcement_off_preserves_login_response_for_every_edition() {
         assert!(serde_json::to_value(claims).unwrap().get("credential_epoch").is_none());
     }
 }
+/// RM-064: a live `ddc_status_` credential is refused by the WS connect
+/// verifier (JWT and legacy-token branches) and by a bearer `/api/*` route.
+#[tokio::test]
+async fn status_credentials_never_authenticate_the_dashboard() {
+    let (_dir, state, user) = fixture(false, false).await;
+    let raw = state.user_db.status_token_create(&user.id, "odoo").unwrap().secret;
+    assert!(authenticate_jwt(&state, &raw).is_err());
+    assert!(state.auth.validate(&raw).is_err());
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("authorization", format!("Bearer {raw}").parse().unwrap());
+    assert_eq!(
+        handle_me(State(state.clone()), headers).await.into_response().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
 #[tokio::test]
 async fn mfa_enrollment_capability_cannot_authenticate_ws_me_or_refresh() {
     let (_dir, state, user) = fixture(false, true).await;

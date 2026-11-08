@@ -126,6 +126,7 @@ pub mod decision_notify;
 pub mod dingtalk;
 pub mod doctor_probes;
 pub mod extension;
+pub mod external_status;
 pub mod github_workspace;
 pub mod google_apps_script;
 pub(crate) mod google_data_consent;
