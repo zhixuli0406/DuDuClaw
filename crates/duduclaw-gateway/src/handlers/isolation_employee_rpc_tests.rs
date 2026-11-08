@@ -360,6 +360,49 @@ fn apply_binds_owner_member_count_one() {
     assert!(!listed.to_string().contains(&tenant));
 }
 
+/// F6d (§3.9): the tombstone RPC accepts a Shared row (no `NOT_PERSONAL`);
+/// the lifecycle tombstone snapshots the tenant pin and members and removes
+/// the bindings. Refused `RESTORE_IN_PROGRESS` while a restore is applying.
+#[test]
+fn tombstone_accepts_shared() {
+    const SHARED: &str = "team-helper";
+    let f = fixture();
+    let tenant = f.users.isolation_authority_snapshot(None, SHARED).unwrap().tenant_id;
+    open_requests(f.home()).unwrap();
+    let mut store = open_confirmations(f.home()).unwrap();
+    let fields = vec![text_field("employee_id", SHARED), text_field("disk_bytes", "67108864"),
+        text_field("binding_kind", "shared"), text_field("tenant_id", &tenant)];
+    let operation = ProposalOperationId { proposal_id: RequestId([5; 16]), revision: 1 };
+    let staged = store.stage_proposal(operation, ConfirmationCategory::Employee, fields, &Accept).unwrap();
+    store.approve(&[staged.binding], &decision_session(), [2; 32], 100, &Accept).unwrap();
+    for _ in 0..3 { store.apply_next(&staged.binding, &mut Accept).unwrap(); }
+    let item = items(f.home()).into_iter().find(|i| i.binding == staged.binding).unwrap();
+    let spec = allocation::specification(&item).unwrap();
+    let receipt = Receipt { binding: item.binding, label: spec.label, employee: EmployeeId([5; 16]), uid: 70_005,
+        bytes: spec.bytes, inodes: spec.inodes, disabled: false, principal_binding: spec.binding };
+    crate::handlers::save_confirmed_receipt(f.home(), &item, &receipt).unwrap();
+    f.users.bind_agent(&f.alice, SHARED, AccessLevel::Operator).unwrap();
+    let input = || -> TombstoneRequest {
+        serde_json::from_value(json!({"label": SHARED, "employee_id": hex::encode([5u8; 16]), "csrf_token": CSRF})).unwrap()
+    };
+    let now = 10_000;
+    // A restore applying on the label blocks the tombstone (§3.5).
+    let apply = open_apply(f.home(), Access::ReadWrite).unwrap();
+    crate::isolation_restore::ensure_restore_schema(&apply).unwrap();
+    apply.execute("INSERT INTO employee_restores(request_id,kind,employee_hex,incarnation,label,tenant_id,requester_user_id,
+        digest,route_digest,created_at,expires_at,state) VALUES(?1,'shared_restore',?2,0,?3,?4,?5,'d','r',1,2,'applying')",
+        params!["a".repeat(32), hex::encode([6u8; 16]), SHARED, tenant, f.bob]).unwrap();
+    assert_eq!(tombstone(f.home(), Some(&proof(now)), &f.bob, input(), now).err(),
+        Some(crate::isolation_restore_rpc::RpcError::Restore(crate::isolation_restore::Refusal::RestoreInProgress).message()));
+    apply.execute("UPDATE employee_restores SET state='failed'", []).unwrap();
+    drop(apply);
+    let done = tombstone(f.home(), Some(&proof(now)), &f.bob, input(), now).unwrap();
+    assert_eq!(done["tombstoned"], true, "{done}");
+    assert_eq!(f.users.check_agent_access(&f.alice, SHARED).unwrap(), None, "Shared bindings removed");
+    assert_eq!(admin_list(f.home()).unwrap()["employees"].as_array().unwrap().iter()
+        .find(|e| e["label"] == SHARED).unwrap()["disabled"], true);
+}
+
 #[tokio::test]
 async fn tombstone_requires_admin_step_up() {
     let f = fixture();
@@ -395,7 +438,7 @@ async fn tombstone_requires_admin_step_up() {
     // Idempotent for the same identity; a Shared or unknown label is refused.
     assert!(tombstone(f.home(), Some(&proof(now)), &f.bob, input(&employee, CSRF), now).is_ok());
     let unknown: TombstoneRequest = serde_json::from_value(json!({"label": "nobody", "employee_id": employee, "csrf_token": CSRF})).unwrap();
-    assert_eq!(tombstone(f.home(), Some(&proof(now)), &f.bob, unknown, now).err(), Some(NOT_PERSONAL));
+    assert_eq!(tombstone(f.home(), Some(&proof(now)), &f.bob, unknown, now).err(), Some(EMPLOYEE_NOT_FOUND));
 }
 
 #[test]

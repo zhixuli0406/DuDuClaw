@@ -5,6 +5,8 @@
 mod transport;
 mod fd_io;
 mod work_file;
+/// F6d: `StopEmployeeRuns` / `EmployeeIdle` (employee-level H4 ops).
+pub mod employee_control;
 pub use work_file::{FeatureSource, SpawndFeatures, WorkFileError, WorkFileSnapshot, WORK_BROKER_FEATURE};
 
 use std::{collections::BTreeMap, os::fd::OwnedFd, sync::{Arc, Mutex as StdMutex}, time::Duration};

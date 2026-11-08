@@ -72,7 +72,9 @@ impl MethodHandler {
             if method == "migration.confirmations.list" {
                 let store = ConfirmationStore::open_read_only(&path).map_err(|_| "無法讀取遷移狀態。")?;
                 let items = store.list().map_err(|_| "無法讀取遷移狀態。")?;
-                let employee_backend = EmployeeAuthority::new(home.clone(), live.clone());
+                // F6d: Employee and EmployeeRetire items behind one backend.
+                let employee_backend = super::migration_authority::retire::production_backend(home.clone(),
+                    Arc::new(EmployeeAuthority::new(home.clone(), live.clone())), &user);
                 let items: Vec<Value> = items.into_iter().map(|item| {
                     let supported = employee_backend.validate(&item).is_ok() || GatewayAuthority::built_in_item_supported(&item)
                         || GatewayAccountReadback::available(&home, &item)
@@ -145,7 +147,9 @@ impl MethodHandler {
             // Separate handles share the durable binding ledger. No cloned payload
             // can bypass the normal fresh-input validator at approval or staging.
             let readback = Arc::new(GatewayAccountReadback::new(home.clone(), runtime));
-            let employee_backend = Arc::new(EmployeeAuthority::new(home.clone(), live.clone()));
+            // F6d: one slot, two backends (Employee + EmployeeRetire).
+            let employee_backend = super::migration_authority::retire::production_backend(home.clone(),
+                Arc::new(EmployeeAuthority::new(home.clone(), live.clone())), &user);
             let validator = GatewayAuthority::new(home.clone()).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback.clone()).with_live(live.clone()).with_backend(employee_backend.clone());
             let mut applier = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
             let error = "項目已變更、尚未支援或套用失敗，請重新載入確認目前狀態。";

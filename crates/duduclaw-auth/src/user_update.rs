@@ -149,6 +149,26 @@ impl UserDb {
         tx.commit().map_err(other)
     }
 
+    /// Self-service password change by the account holder in their own
+    /// authenticated session (`users.change_password`, `ctx.user_id ==
+    /// user_id`; the caller verified the current password). Same write as
+    /// [`Self::update_user`] with only the password, plus the F6 Q3 stamp:
+    /// the `credential_changes` row is marked owner-authenticated in the
+    /// same transaction (F6d), so a later Personal restore accepts it.
+    pub fn change_own_password(&self, user_id: &str, new_password: &str) -> Result<(), String> {
+        let password_hash = hash_password(new_password)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| format!("update error: {e}"))?;
+        let since = crate::credential_changes::high_water(&tx)?;
+        let update = UserUpdate { password: Some(new_password), ..UserUpdate::default() };
+        apply_update(&tx, user_id, &update, Some(&password_hash)).map_err(|e| match e {
+            UserWriteError::Org(OrgError::UserNotFound) => "user not found".to_string(),
+            other => format!("update error: {other}"),
+        })?;
+        crate::credential_changes::stamp_owner(&tx, since, user_id)?;
+        tx.commit().map_err(|e| format!("update error: {e}"))
+    }
+
     /// Create an account with its department and manager in one
     /// transaction: a manager that fails the [`Self::set_manager`] checks
     /// means no account is created at all.

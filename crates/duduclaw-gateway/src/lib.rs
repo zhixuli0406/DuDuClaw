@@ -77,6 +77,9 @@ pub(crate) mod isolation_label_restore;
 // F6l root retire (F6 design r5 §3.12); the RPC/UI wiring is F6d/F6e.
 #[allow(dead_code)]
 pub(crate) mod isolation_retire;
+// F6d: production seams of the restore/retire engines and the RPC bodies.
+pub(crate) mod isolation_restore_wiring;
+pub(crate) mod isolation_restore_rpc;
 pub mod migration_import;
 pub mod migration_startup;
 

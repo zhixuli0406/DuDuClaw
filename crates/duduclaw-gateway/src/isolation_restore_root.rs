@@ -81,10 +81,9 @@ impl RootProbe for SpawndRootProbe {
         #[cfg(not(target_os = "linux"))]
         { let _ = item; Err(RootError::Transport) }
     }
+    /// F6d: the spawnd `EmployeeIdle` request (transport error ⇒ unavailable).
     fn employee_idle(&self, employee: EmployeeId) -> Result<bool, RootError> {
-        tracing::warn!(employee = %hex::encode(employee.0),
-            "restore precheck: no gateway client for spawnd EmployeeIdle yet; refusing as unavailable");
-        Err(RootError::IsolationUnavailable)
+        crate::isolation_restore_wiring::spawnd_employee_idle(employee)
     }
 }
 

@@ -108,7 +108,9 @@ pub(super) fn tombstone_with(f: &Fixture, runs: &dyn RunStopper) -> (Confirmatio
     write_tree(home, LABEL);
     let outcome = tombstone_employee(home, LABEL, root.employee, &TombstoneEnv { actor: "admin-user", runs, now: now() }).unwrap();
     assert_eq!(outcome.seal, "sealed");
-    sql(home, APPLY_DB, "UPDATE employee_quarantine SET store_marks=?1 WHERE store_marks IS NULL", &[&marks().to_string()]);
+    // F6h's tombstone_effects records the real marks now; the fake store
+    // marks of these tests replace them (F6d: unconditional).
+    sql(home, APPLY_DB, "UPDATE employee_quarantine SET store_marks=?1", &[&marks().to_string()]);
     (item, root)
 }
 
@@ -547,7 +549,8 @@ fn restore_readback_requires_idle() {
         fx.probe.idle_answer = answer;
         assert_eq!(restore_precheck(home, LABEL, EMP, &fx.probe), Ok(class), "{answer:?}");
     }
-    // The production probe has no EmployeeIdle client yet: unavailable.
+    // The production probe (F6d spawnd EmployeeIdle client) with no spawnd
+    // socket in the test environment: a transport error, unavailable.
     assert_eq!(SpawndRootProbe.employee_idle(EMP), Err(RootError::IsolationUnavailable));
     fx.probe.idle = Some(true);
     file(&f, &fx).unwrap();

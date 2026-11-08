@@ -447,11 +447,24 @@ impl UserDb {
     /// [`validate_account_email`]. An address another account already uses
     /// returns [`EMAIL_IN_USE`] and changes nothing.
     pub fn change_email(&self, user_id: &str, email: &str) -> Result<(), String> {
+        self.change_email_stamped(user_id, email, false)
+    }
+
+    /// [`Self::change_email`] by the account holder in their own
+    /// authenticated session (`users.change_email` with `ctx.user_id ==
+    /// user_id`): the `credential_changes` row is stamped owner-authenticated
+    /// in the same transaction (F6 Q3, F6d).
+    pub fn change_own_email(&self, user_id: &str, email: &str) -> Result<(), String> {
+        self.change_email_stamped(user_id, email, true)
+    }
+
+    fn change_email_stamped(&self, user_id: &str, email: &str, by_owner: bool) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("update error: {e}"))?;
+        let since = crate::credential_changes::high_water(&tx)?;
         let affected = tx
             .execute(
                 "UPDATE users SET email = ?1, updated_at = ?2 WHERE id = ?3",
@@ -468,6 +481,7 @@ impl UserDb {
         if affected == 0 {
             return Err("user not found".to_string());
         }
+        if by_owner { crate::credential_changes::stamp_owner(&tx, since, user_id)?; }
         // The email is part of the live context.
         bump_acl_generation(&tx).map_err(|e| format!("update error: {e}"))?;
         tx.commit().map_err(|e| format!("update error: {e}"))

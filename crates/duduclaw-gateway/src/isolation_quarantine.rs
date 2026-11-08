@@ -359,19 +359,20 @@ pub(crate) trait RunStopper {
 /// Pending fence recorded while the run stop is unconfirmed.
 pub(crate) const RUN_STOP_FENCE: &str = "runs:stop_unconfirmed";
 
-/// Production stopper. spawnd has no cancel-by-employee (or list-runs-of-
-/// employee) request yet — only `SpawnRequest::Cancel { run }` for a run
-/// handle the caller already holds — so this fails closed: the tombstone
-/// completes (row disabled, nothing new may start) and records
-/// [`RUN_STOP_FENCE`], which blocks every restore until a later retry
-/// confirms the stop. F6l/F6c add the spawnd request (stop-and-confirm by
-/// employee) and replace this body.
+/// Production stopper (F6d): spawnd `StopEmployeeRuns` (H4). Only a
+/// **confirmed** stop is `Ok`; an unconfirmed stop, a refusal or a transport
+/// error fails closed: the tombstone completes (row disabled, nothing new
+/// may start) and records [`RUN_STOP_FENCE`], which blocks every restore
+/// until a later retry confirms the stop.
 pub(crate) struct SpawndRunStopper;
 impl RunStopper for SpawndRunStopper {
     fn stop_employee_runs(&self, employee: EmployeeId) -> Result<Vec<String>, ()> {
-        tracing::warn!(employee = %hex::encode(employee.0),
-            "employee tombstone: spawnd has no stop-by-employee request yet; live runs recorded as a pending fence");
-        Err(())
+        let stopped = crate::isolation_restore_wiring::spawnd_stop_runs(employee);
+        if stopped.is_err() {
+            tracing::warn!(employee = %hex::encode(employee.0),
+                "employee tombstone: run stop not confirmed by spawnd; recorded as a pending fence");
+        }
+        stopped
     }
 }
 

@@ -479,12 +479,13 @@ fn tombstone_keeps_website_credentials_for_restore() {
     assert_eq!(web::list(home).unwrap(), after);
 }
 
-/// Same-id restore entry point (F6c): held website grants are re-granted;
-/// `reports_to` edges are re-applied only where the child still exists and
-/// still reports to the root; channel routes and paused work stay listed.
+/// Same-id restore (F6d, §3.3/§3.7): the restore only LISTS — held website
+/// grants stay held and edges stay re-rooted — and an Admin re-applies one
+/// listed item at a time (`regrant_item`); an edge only where the child still
+/// exists and still reports to the root; channel routes stay listed only.
 #[test]
-fn restore_label_stores_regrants_credentials_and_edges() {
-    use crate::isolation_label_restore::restore_label_stores;
+fn restore_lists_label_state_for_admin_regrant_never_auto() {
+    use crate::isolation_label_restore::{regrant_item, restore_label_stores, Regranted};
     use crate::website_credentials as web;
     use duduclaw_core::org_store::{self as org, OrgEntry};
     let dir = private_home();
@@ -507,34 +508,42 @@ fn restore_label_stores_regrants_credentials_and_edges() {
         org::remove(guard, "dave-desk")?;
         Ok(())
     }).unwrap();
-    // Exact label only: another label's restore applies nothing.
+    // Exact label only: another label's listing has nothing to re-grant.
     let wrong = restore_label_stores(home, OTHER, &row.stripped).unwrap();
-    assert!(wrong.regranted.is_empty() && wrong.reapplied.is_empty(), "{wrong:?}");
+    assert!(wrong.regrant.is_empty(), "{wrong:?}");
     assert!(wrong.skipped.iter().all(|s| s.ends_with(":label_mismatch")), "{wrong:?}");
-    assert!(web::for_agent(home, LABEL, "erp").unwrap().is_none());
+    let held_before = web::list(home).unwrap();
+    let org_before = org::load_for_write(home).unwrap();
+    // The restore lists only: nothing is re-granted, re-parented or deleted.
     let report = restore_label_stores(home, LABEL, &row.stripped).unwrap();
-    assert_eq!(report.regranted.len(), 2, "{report:?}");
-    let list = web::list(home).unwrap();
-    assert_eq!(credential(&list, "erp").unwrap().allowed_agents, vec![LABEL.to_owned()]);
-    let mut crm = vec![LABEL.to_owned(), OTHER.to_owned()];
-    crm.sort();
-    assert_eq!(credential(&list, "crm").unwrap().allowed_agents, crm);
-    assert!(list.iter().all(|m| m.held_grants.is_empty()), "no grant left held");
+    assert_eq!(report.regrant.iter().filter(|r| r.starts_with("website_credentials:")).count(), 2, "{report:?}");
+    for child in [OTHER, "carol-desk", "dave-desk"] {
+        assert!(report.regrant.contains(&format!("reports_to:{child}")), "{report:?}");
+    }
+    assert!(report.listed.contains(&"channel_routes:binding:telegram:u1".to_owned()), "{report:?}");
+    assert_eq!(web::list(home).unwrap(), held_before, "held grants preserved, never re-applied automatically");
+    assert!(web::for_agent(home, LABEL, "erp").unwrap().is_none());
+    assert_eq!(org::load_for_write(home).unwrap().get(OTHER), org_before.get(OTHER));
+    // Admin re-grant, one listed item at a time.
+    let erp = credential(&held_before, "erp").unwrap().id.clone();
+    assert_eq!(regrant_item(home, LABEL, &row.stripped, &format!("website_credentials:{erp}")), Ok(Regranted::Done));
     assert!(web::for_agent(home, LABEL, "erp").unwrap().is_some());
+    assert!(web::for_agent(home, LABEL, "crm").unwrap().is_none(), "the other credential stays held");
+    assert_eq!(regrant_item(home, LABEL, &row.stripped, &format!("website_credentials:{erp}")), Ok(Regranted::Done),
+        "idempotent");
+    assert_eq!(regrant_item(home, LABEL, &row.stripped, &format!("reports_to:{OTHER}")), Ok(Regranted::Done));
+    assert_eq!(regrant_item(home, LABEL, &row.stripped, "reports_to:carol-desk"), Ok(Regranted::Skipped("reparented")));
+    assert_eq!(regrant_item(home, LABEL, &row.stripped, "reports_to:dave-desk"), Ok(Regranted::Skipped("child_missing")));
     let current = org::load_for_write(home).unwrap();
     assert_eq!(current.get(OTHER), Some(&OrgEntry::new(LABEL, "sales")), "edge re-applied, department kept");
     assert_eq!(current.get("carol-desk"), Some(&OrgEntry::new(OTHER, "ops")), "an admin re-parent is kept");
     assert!(!current.contains("dave-desk"), "a removed child is not re-created");
-    assert_eq!(report.reapplied, vec![format!("reports_to:{OTHER}")]);
-    assert!(report.skipped.contains(&"reports_to:carol-desk:reparented".to_owned()), "{report:?}");
-    assert!(report.skipped.contains(&"reports_to:dave-desk:child_missing".to_owned()), "{report:?}");
-    // Channel routes are re-approved by the admin, never re-applied here.
-    assert!(report.listed.contains(&"channel_routes:binding:telegram:u1".to_owned()), "{report:?}");
+    // Exact match against the listing only; channel routes have no re-grant.
+    for forged in ["reports_to:mallory", "channel_routes:binding:telegram:u1", "website_credentials:", &format!("website_credentials:{erp} ")] {
+        assert_eq!(regrant_item(home, LABEL, &row.stripped, forged), Ok(Regranted::NotListed), "{forged}");
+    }
+    assert_eq!(regrant_item(home, OTHER, &row.stripped, &format!("website_credentials:{erp}")), Ok(Regranted::NotListed));
     assert_eq!(store("channel_routes").count_under(home, LABEL), Ok(0));
-    // Idempotent: a retry reports the same, changes nothing.
-    let again = restore_label_stores(home, LABEL, &row.stripped).unwrap();
-    assert_eq!((again.regranted.len(), again.reapplied.clone()), (2, report.reapplied.clone()));
-    assert_eq!(web::list(home).unwrap(), list);
     // A malformed row is refused, not guessed.
     assert_eq!(restore_label_stores(home, LABEL, &json!("not an object")), Err(StoreError::Unavailable));
 }

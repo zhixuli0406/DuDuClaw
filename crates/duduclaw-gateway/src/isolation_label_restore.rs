@@ -12,12 +12,16 @@
 //! - `delegation_targets`: each employee reporting to the label is moved to
 //!   the root, department kept. Entry: `{agent, parent: <label>, department}`.
 //!
-//! [`restore_label_stores`] (F6c calls it after the restore commit, §3.5
-//! step 4) re-grants each held credential and re-applies each edge whose
-//! child still exists and still reports to the root; anything else is
-//! skipped and reported. Channel routes, unmodelled global routes, in-tree
-//! grants and paused work are only listed (§3.3 "listed for admin re-enable
-//! (never automatic)", §3.7 work items stay paused).
+//! [`restore_label_stores`] (the F6d decide RPC calls it after the restore
+//! commit, §3.5 step 4) **only lists** (§3.3 "listed for admin re-grant /
+//! re-enable, never automatic"): held credential grants and `reports_to`
+//! edges become `regrant` entries — the held grants stay held, nothing is
+//! deleted — and channel routes, unmodelled global routes, in-tree grants
+//! and paused work are `listed` (§3.7 work items stay paused). An Admin
+//! re-applies one `regrant` entry at a time with [`regrant_item`]
+//! (`isolation.employee_restore_regrant`, Admin + step-up, audited): a held
+//! grant is moved back, an edge is re-applied only if the child still exists
+//! and still reports to the root.
 //!
 //! Purge (F6i): [`purge_row_stores`] = `purge_all` under the row key, which
 //! deletes the held grants (and a credential left with no grant) for good.
@@ -98,21 +102,34 @@ pub(crate) fn delegation_hold(home: &Path, label: &str, _key: &str) -> Result<He
 
 // ── Restore (F6c) ───────────────────────────────────────────────────────
 
-/// What [`restore_label_stores`] did. Entries are `<store>:<id>` names;
-/// `skipped` entries end in `:<reason>`.
+/// What [`restore_label_stores`] lists. Entries are `<store>:<id>` names;
+/// `skipped` entries end in `:<reason>`. Nothing here was applied.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RestoreReport {
-    pub(crate) regranted: Vec<String>,
-    pub(crate) reapplied: Vec<String>,
+    /// Re-grantable by an Admin, one at a time ([`regrant_item`]):
+    /// `website_credentials:<id>` and `reports_to:<child>`.
+    pub(crate) regrant: Vec<String>,
     pub(crate) skipped: Vec<String>,
-    /// Never re-applied here: listed for the admin (§3.3, §3.7).
+    /// For the admin to re-enable by hand (§3.3, §3.7); no RPC re-applies them.
     pub(crate) listed: Vec<String>,
 }
 
 impl RestoreReport {
     pub(crate) fn to_value(&self) -> Value {
-        json!({"regranted": self.regranted, "reapplied": self.reapplied, "skipped": self.skipped, "listed": self.listed})
+        json!({"regrant": self.regrant, "skipped": self.skipped, "listed": self.listed})
     }
+}
+
+/// One admin re-grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Regranted {
+    /// Applied now (or already in place: idempotent).
+    Done,
+    /// Not applied; the reason (`not_held`, `parent_missing`, `child_missing`,
+    /// `reparented`, `refused`).
+    Skipped(&'static str),
+    /// `item` is not one of the row's `regrant` entries (exact match).
+    NotListed,
 }
 
 fn text<'a>(entry: &'a Value, field: &str) -> Option<&'a str> { entry.get(field).and_then(Value::as_str) }
@@ -124,32 +141,44 @@ fn entries<'a>(stripped: &'a Value, section: &str, store: &str) -> Vec<&'a Value
     }
 }
 
-/// Re-apply the restorable label-keyed state of `stripped` (the quarantine
-/// row's JSON) for `label` (exact). Website grants held under the row key are
-/// re-granted; `reports_to` edges are re-applied only where the child still
-/// exists, still reports to the root and the label is in the org. Everything
-/// else is listed. An unreadable store is `Err` (nothing is guessed); the
-/// call is idempotent, so the caller retries.
-pub(crate) fn restore_label_stores(home: &Path, label: &str, stripped: &Value) -> Result<RestoreReport, StoreError> {
-    use crate::website_credentials::{regrant_held, Regrant};
+/// A well-formed held website grant of `label`: `(id, key)`.
+fn website_entry<'a>(entry: &'a Value, label: &str) -> Result<(&'a str, &'a str), String> {
+    let (Some(id), Some(agent), Some(key)) = (text(entry, "id"), text(entry, "agent"), text(entry, "key")) else {
+        return Err("website_credentials:?:malformed".into());
+    };
+    if uuid::Uuid::parse_str(id).is_err() || !key.starts_with("quarantine:") { return Err("website_credentials:?:malformed".into()); }
+    if agent != label { return Err(format!("website_credentials:{id}:label_mismatch")); }
+    Ok((id, key))
+}
+
+/// A well-formed `reports_to` edge to `label`: the child.
+fn edge_entry<'a>(entry: &'a Value, label: &str) -> Result<&'a str, String> {
+    let (Some(child), Some(parent)) = (text(entry, "agent"), text(entry, "parent")) else {
+        return Err("reports_to:?:malformed".into());
+    };
+    if parent != label || child == label { return Err(format!("reports_to:{child}:label_mismatch")); }
+    Ok(child)
+}
+
+/// List the restorable label-keyed state of `stripped` (the quarantine row's
+/// JSON) for `label` (exact). Reads nothing outside `stripped` and writes
+/// nothing (§3.3: never automatic); a malformed row is `Err`.
+pub(crate) fn restore_label_stores(_home: &Path, label: &str, stripped: &Value) -> Result<RestoreReport, StoreError> {
     if label.is_empty() || !stripped.is_object() { return Err(StoreError::Unavailable); }
     let mut report = RestoreReport::default();
     for entry in entries(stripped, "restore", "website_credentials") {
-        let (Some(id), Some(agent), Some(key)) = (text(entry, "id"), text(entry, "agent"), text(entry, "key")) else {
-            report.skipped.push("website_credentials:?:malformed".into());
-            continue;
-        };
-        if uuid::Uuid::parse_str(id).is_err() || !key.starts_with("quarantine:") {
-            report.skipped.push("website_credentials:?:malformed".into());
-            continue;
-        }
-        if agent != label { report.skipped.push(format!("website_credentials:{id}:label_mismatch")); continue; }
-        match regrant_held(home, label, key, id).map_err(|_| StoreError::Unavailable)? {
-            Regrant::Regranted | Regrant::AlreadyGranted => report.regranted.push(format!("website_credentials:{id}")),
-            Regrant::Missing => report.skipped.push(format!("website_credentials:{id}:not_held")),
+        match website_entry(entry, label) {
+            Ok((id, _)) => report.regrant.push(format!("website_credentials:{id}")),
+            Err(skipped) => report.skipped.push(skipped),
         }
     }
-    restore_edges(home, label, stripped, &mut report)?;
+    for entry in entries(stripped, "restore", "delegation_targets") {
+        match edge_entry(entry, label) {
+            Ok(child) => report.regrant.push(format!("reports_to:{child}")),
+            Err(skipped) => report.skipped.push(skipped),
+        }
+    }
+    report.regrant.dedup();
     for name in entries(stripped, "global_routes", "channel_routes").into_iter().filter_map(Value::as_str) {
         report.listed.push(format!("channel_routes:{name}"));
     }
@@ -168,43 +197,45 @@ pub(crate) fn restore_label_stores(home: &Path, label: &str, stripped: &Value) -
     Ok(report)
 }
 
-fn restore_edges(home: &Path, label: &str, stripped: &Value, report: &mut RestoreReport) -> Result<(), StoreError> {
-    use duduclaw_core::org_store::{self as org, OrgEntry};
-    let edges = entries(stripped, "restore", "delegation_targets");
-    if edges.is_empty() { return Ok(()); }
-    let outcome = org::with_org_lock(home, |guard| {
-        let mut done = Vec::new();
-        for entry in &edges {
-            let (Some(child), Some(parent)) = (text(entry, "agent"), text(entry, "parent")) else {
-                done.push(Err("reports_to:?:malformed".to_owned()));
-                continue;
-            };
-            if parent != label || child == label {
-                done.push(Err(format!("reports_to:{child}:label_mismatch")));
-                continue;
-            }
-            // Re-read under the lock for every edge (an applied edge is visible).
-            let current = org::load_for_write(home).map_err(|_| std::io::Error::other("org store unreadable"))?;
-            if !current.contains(label) { done.push(Err(format!("reports_to:{child}:parent_missing"))); continue; }
-            let Some(entry_now) = current.get(child) else {
-                done.push(Err(format!("reports_to:{child}:child_missing")));
-                continue;
-            };
-            if entry_now.reports_to == label { done.push(Ok(format!("reports_to:{child}"))); continue; }
-            if !entry_now.reports_to.is_empty() { done.push(Err(format!("reports_to:{child}:reparented"))); continue; }
-            // The edge only: an admin's later department edit is kept.
-            match org::upsert(guard, child, OrgEntry::new(label, &entry_now.department)) {
-                Ok(_) => done.push(Ok(format!("reports_to:{child}"))),
-                // A cycle (or another refusal) is not forced.
-                Err(_) => done.push(Err(format!("reports_to:{child}:refused"))),
-            }
-        }
-        Ok(done)
-    }).map_err(|_| StoreError::Unavailable)?;
-    for result in outcome {
-        match result { Ok(name) => report.reapplied.push(name), Err(name) => report.skipped.push(name) }
+/// Re-apply exactly one `regrant` entry of the row (`item` must equal one of
+/// [`restore_label_stores`]' `regrant` names; exact string equality). A held
+/// website grant under the recorded row key is moved back to `label`; a
+/// `reports_to` edge is re-applied only if `label` is in the org, the child
+/// exists and still reports to the root (department: the current one is
+/// kept). Idempotent; an unreadable store is `Err`.
+pub(crate) fn regrant_item(home: &Path, label: &str, stripped: &Value, item: &str) -> Result<Regranted, StoreError> {
+    use crate::website_credentials::{regrant_held, Regrant};
+    let listed = restore_label_stores(home, label, stripped)?;
+    if !listed.regrant.iter().any(|name| name == item) { return Ok(Regranted::NotListed); }
+    if let Some(id) = item.strip_prefix("website_credentials:") {
+        let entry = entries(stripped, "restore", "website_credentials").into_iter()
+            .filter_map(|entry| website_entry(entry, label).ok()).find(|(entry_id, _)| *entry_id == id);
+        let Some((id, key)) = entry else { return Ok(Regranted::NotListed) };
+        return Ok(match regrant_held(home, label, key, id).map_err(|_| StoreError::Unavailable)? {
+            Regrant::Regranted | Regrant::AlreadyGranted => Regranted::Done,
+            Regrant::Missing => Regranted::Skipped("not_held"),
+        });
     }
-    Ok(())
+    let Some(child) = item.strip_prefix("reports_to:") else { return Ok(Regranted::NotListed) };
+    regrant_edge(home, label, child)
+}
+
+fn regrant_edge(home: &Path, label: &str, child: &str) -> Result<Regranted, StoreError> {
+    use duduclaw_core::org_store::{self as org, OrgEntry};
+    org::with_org_lock(home, |guard| {
+        // Re-read under the lock (an applied edge is visible).
+        let current = org::load_for_write(home).map_err(|_| std::io::Error::other("org store unreadable"))?;
+        if !current.contains(label) { return Ok(Regranted::Skipped("parent_missing")); }
+        let Some(entry_now) = current.get(child) else { return Ok(Regranted::Skipped("child_missing")) };
+        if entry_now.reports_to == label { return Ok(Regranted::Done); }
+        if !entry_now.reports_to.is_empty() { return Ok(Regranted::Skipped("reparented")); }
+        // The edge only: an admin's later department edit is kept.
+        Ok(match org::upsert(guard, child, OrgEntry::new(label, &entry_now.department)) {
+            Ok(_) => Regranted::Done,
+            // A cycle (or another refusal) is not forced.
+            Err(_) => Regranted::Skipped("refused"),
+        })
+    }).map_err(|_| StoreError::Unavailable)
 }
 
 // ── Purge (F6i) ─────────────────────────────────────────────────────────

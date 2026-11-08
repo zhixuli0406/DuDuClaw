@@ -136,6 +136,10 @@ pub(crate) fn is_enterprise_only_method(method: &str) -> bool {
         | "isolation.employee_purge_requests"
         | "me.isolation.request_personal_employee" | "me.isolation.list_personal_employee_requests"
         | "me.isolation.list_personal_delegations" | "me.isolation.decide_personal_delegation"
+        // F6d 已註銷員工的還原、核准、重新授權與主機資源釋放
+        | "me.isolation.list_restorable" | "me.isolation.request_restore" | "me.isolation.cancel_restore"
+        | "isolation.employee_restore_decide" | "isolation.employee_restore_cancel"
+        | "isolation.employee_restore_regrant" | "isolation.employee_retire_propose"
     )
 }
 

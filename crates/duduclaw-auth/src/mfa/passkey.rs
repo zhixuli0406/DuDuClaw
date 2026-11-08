@@ -129,6 +129,7 @@ impl UserDb {
         let rp = relying_party(origin)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let since = crate::credential_changes::high_water(&tx)?;
         let ceremony = take_ceremony(&tx,id,"register",token,session,origin,now)?;
         let verified = (|| {
             authorize_registration(&tx,&ceremony.user,token,session,now,exempt)?;
@@ -158,6 +159,7 @@ impl UserDb {
         tx.execute("DELETE FROM mfa_passkey_ceremonies WHERE user_id=?1", [&ceremony.user]).map_err(|e|e.to_string())?;
         bump_epoch(&tx,&ceremony.user)?;
         audit(&tx,&ceremony.user,"mfa.passkey_added",None)?;
+        stamp_self(&tx,since,&ceremony.user)?;
         let result = issue_mfa_result(&tx,&ceremony.user,codes,issue)?;
         tx.commit().map_err(|e|e.to_string())?;
         Ok(result)
@@ -217,6 +219,7 @@ impl UserDb {
         issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>) -> Result<T> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let since = crate::credential_changes::high_water(&tx)?;
         active_user(&tx,user)?;
         check_reauth(&tx,user,reauth,session,now)?;
         let count: i64 = tx.query_row("SELECT count(*) FROM mfa_passkeys WHERE user_id=?1 AND id=?2",params![user,id],|r|r.get(0)).map_err(|e|e.to_string())?;
@@ -228,6 +231,7 @@ impl UserDb {
         if !any_factor(&tx,user)? { tx.execute("DELETE FROM mfa_recovery_codes WHERE user_id=?1",[user]).map_err(|e|e.to_string())?; }
         bump_epoch(&tx,user)?;
         audit(&tx,user,"mfa.passkey_removed",None)?;
+        stamp_self(&tx,since,user)?;
         let result = issue_mfa_result(&tx,user,Vec::new(),issue)?;
         tx.commit().map_err(|e|e.to_string())?;
         Ok(result)

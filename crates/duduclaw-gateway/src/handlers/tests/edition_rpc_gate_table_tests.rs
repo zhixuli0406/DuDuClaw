@@ -70,6 +70,14 @@ fn enterprise_surfaces_are_listed() {
         // SR2: Personal → Shared delegation owner cards
         "me.isolation.list_personal_delegations",
         "me.isolation.decide_personal_delegation",
+        // F6d restore RPCs
+        "me.isolation.list_restorable",
+        "me.isolation.request_restore",
+        "me.isolation.cancel_restore",
+        "isolation.employee_restore_decide",
+        "isolation.employee_restore_cancel",
+        "isolation.employee_restore_regrant",
+        "isolation.employee_retire_propose",
     ] {
         assert!(
             is_enterprise_only_method(method),

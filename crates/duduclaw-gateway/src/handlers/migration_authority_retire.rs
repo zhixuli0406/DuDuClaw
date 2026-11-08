@@ -41,6 +41,45 @@ impl MigrationAuthorityBackend for EmployeeRetireAuthority {
     fn disable(&self, item: &ConfirmationItem) -> Result<()> { self.backend.compensate(item).map_err(error) }
 }
 
+/// F6d: the confirmation RPC has one backend slot; this serves Employee
+/// items through `EmployeeAuthority` and `EmployeeRetire` items through
+/// [`EmployeeRetireAuthority`]. Each item goes to the single backend whose
+/// `supports` names its category; none (or more than one) is `Denied`.
+pub(crate) struct CompositeBackend { backends: Vec<Arc<dyn MigrationAuthorityBackend>> }
+impl CompositeBackend {
+    pub(crate) fn new(backends: Vec<Arc<dyn MigrationAuthorityBackend>>) -> Self { Self { backends } }
+    fn for_item(&self, category: ConfirmationCategory) -> Result<&Arc<dyn MigrationAuthorityBackend>> {
+        let mut found = self.backends.iter().filter(|backend| backend.supports(category));
+        match (found.next(), found.next()) {
+            (Some(backend), None) => Ok(backend),
+            _ => Err(Error::Denied),
+        }
+    }
+}
+impl MigrationAuthorityBackend for CompositeBackend {
+    /// The Shared-employee readback belongs to the Employee backend only.
+    fn readback_shared_employee(&self, agent: &str) -> Result<()> {
+        self.for_item(ConfirmationCategory::Employee)?.readback_shared_employee(agent)
+    }
+    fn supports(&self, category: ConfirmationCategory) -> bool { self.for_item(category).is_ok() }
+    fn validate(&self, item: &ConfirmationItem) -> Result<()> { self.for_item(item.category)?.validate(item) }
+    fn stage(&self, item: &ConfirmationItem) -> Result<()> { self.for_item(item.category)?.stage(item) }
+    fn publish(&self, item: &ConfirmationItem) -> Result<()> { self.for_item(item.category)?.publish(item) }
+    fn read_back(&self, item: &ConfirmationItem) -> Result<()> { self.for_item(item.category)?.read_back(item) }
+    fn disable(&self, item: &ConfirmationItem) -> Result<()> { self.for_item(item.category)?.disable(item) }
+}
+
+/// The production pair for the confirmation RPC: `EmployeeAuthority` and the
+/// retire backend over spawnd, F6c2's rule and the notice outbox; `actor` is
+/// the live dashboard Admin of the call.
+pub(crate) fn production_backend(home: PathBuf, employee: Arc<dyn MigrationAuthorityBackend>, actor: &str)
+    -> Arc<dyn MigrationAuthorityBackend> {
+    use crate::isolation_restore_wiring::{unix_now, OutboxNotifier, RetireLogRule};
+    let retire = EmployeeRetireAuthority::new(home, Arc::new(crate::isolation_retire::SpawndRetireRoot),
+        Arc::new(RetireLogRule { now: unix_now }), Arc::new(OutboxNotifier), Some(actor.to_owned()));
+    Arc::new(CompositeBackend::new(vec![employee, Arc::new(retire)]))
+}
+
 #[cfg(test)]
 #[path = "migration_authority_retire_tests.rs"]
 mod tests;

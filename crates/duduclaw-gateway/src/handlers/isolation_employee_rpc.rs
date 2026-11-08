@@ -20,8 +20,11 @@
 //!   product configuration through the normal create path (inert until
 //!   allocated) and stages the approvable proposal, either as the next
 //!   revision of a staff request or as a new Personal/Shared proposal.
-//! - `isolation.employee_tombstone` (Admin + step-up): admin handover of a
-//!   Personal employee (`isolation_lifecycle::tombstone_personal_employee`).
+//! - `isolation.employee_tombstone` (Admin + step-up): tombstone of a
+//!   Personal or Shared employee (`isolation_lifecycle::tombstone_employee`, F6d).
+//! - F6d restore RPCs (`isolation_employee_restore.rs`): `me.isolation.list_restorable`,
+//!   `request_restore`, `cancel_restore`; `isolation.employee_restore_decide`,
+//!   `employee_restore_cancel`, `employee_restore_regrant`, `employee_retire_propose`.
 //! - `isolation.employee_list` (Admin): confirmed employees and requests,
 //!   plus the step-up state for the dashboard.
 //! - `isolation.employee_purge_requests` (Admin + step-up, SR2): removes
@@ -67,6 +70,9 @@ pub(super) const METHODS: [&str; 8] = [REQUEST, MY_REQUESTS, LIST, PROPOSE, TOMB
 mod employee_dirs;
 #[path = "isolation_employee_delegation.rs"]
 mod delegation;
+/// F6d: restore, decide, cancel, regrant and retire RPCs (`restore::METHODS`).
+#[path = "isolation_employee_restore.rs"]
+mod restore;
 
 /// `agents.create` in protected mode points here.
 pub(super) const DIRECT_CREATE_REFUSED: &str = "受保護模式下不能直接建立 AI 員工。請改用員工配置提案：\
@@ -120,7 +126,6 @@ const REQUEST_MISMATCH: &str = "這筆申請已處理，或內容與提案不一
 const CREATE_FAILED: &str = "無法建立員工設定，請確認名稱後重試。";
 const SETTINGS_INVALID: &str = "員工設定無法放入提案，已拒絕操作。";
 const EMPLOYEE_NOT_FOUND: &str = "找不到這位員工，請重新載入。";
-const NOT_PERSONAL: &str = "這不是個人專屬員工，或找不到這位員工。";
 
 /// Namespace owned by this handler; unknown members are refused here.
 pub(super) fn owns(method: &str) -> bool {
@@ -173,6 +178,7 @@ struct Prepared {
 
 impl MethodHandler {
     pub(crate) async fn handle_isolation_employee(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
+        if restore::METHODS.contains(&method) { return self.handle_isolation_restore(method, params, ctx).await; }
         match self.isolation_employee(method, params, ctx).await {
             Ok(value) => WsFrame::ok_response("", value),
             Err(message) => WsFrame::error_response("", message),
@@ -213,6 +219,8 @@ impl MethodHandler {
                     let now = now()?;
                     let proof = db.migration_confirmation_session(&user, &session, epoch, now).map_err(|_| SESSION_EXPIRED)?;
                     let mut value = admin_list(&home)?;
+                    // F6d: tombstoned rows, open requests, root state (已註銷).
+                    value["restores"] = admin_restores(&home, now);
                     value["step_up_valid"] = json!(proof.is_some());
                     value["csrf_token"] = json!(proof.as_ref().map(|proof| proof.csrf));
                     value["mfa_enrolled"] = json!(db.mfa_active(&user).map_err(|_| USERS_UNAVAILABLE)?);
@@ -737,6 +745,7 @@ fn prepare_propose(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmatio
     if label_pending(&items, &input.label, request) { return Err(LABEL_PENDING); }
     crate::isolation_label_stores::proposal_refusal(home, &input.label)?; // F6h R7: LABEL_QUARANTINED
     lifecycle::validate_proposed_binding(home, &input.label, Some(&binding)).map_err(binding_error)?;
+    crate::isolation_restore_rpc::refuse_while_restoring(&lock, &input.label)?; // F6d §3.5: RESTORE_IN_PROGRESS
     let display_name = match (input.display_name.as_deref(), request) {
         (Some(name), _) => checked_display(name)?,
         (None, Some(op)) => request_display_name(home, op.proposal_id)?.unwrap_or_else(|| input.label.clone()),
@@ -786,6 +795,7 @@ fn stage_prepared(home: &Path, proof: Option<&MigrationConfirmationSession>, use
     let items = store.list().map_err(|_| STORE_UNAVAILABLE)?;
     if label_pending(&items, &prepared.label, prepared.request) { return Err(LABEL_PENDING); }
     crate::isolation_label_stores::proposal_refusal(home, &prepared.label)?; // F6h R7: LABEL_QUARANTINED
+    crate::isolation_restore_rpc::refuse_while_restoring(&lock, &prepared.label)?; // F6d §3.5: RESTORE_IN_PROGRESS
     // SR2 finding 1b: the adopted directory still carries this flow's marker,
     // holds nothing outside the allowlist, and the staged settings are
     // exactly those parsed from the agent.toml bytes inside that digest.
@@ -850,13 +860,23 @@ fn purge_requests(home: &Path, proof: Option<&MigrationConfirmationSession>, use
     Ok(json!({ "purged": purged, "index_rows_removed": removed }))
 }
 
-/// `isolation.employee_tombstone`: admin handover of a Personal employee.
+/// F6d: the admin `已註銷` view inside `isolation.employee_list`; an
+/// unreadable or absent store is reported, never an empty "nothing tombstoned".
+fn admin_restores(home: &Path, now: i64) -> Value {
+    if matches!(std::fs::symlink_metadata(home.join(APPLY_DB)), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+        return json!({"quarantine": [], "requests": []});
+    }
+    crate::isolation_restore_rpc::admin_view(home, now)
+        .unwrap_or_else(|error| json!({"unavailable": true, "code": error.code()}))
+}
+
+/// `isolation.employee_tombstone`: tombstone of a Personal or Shared employee.
 ///
 /// F6a: runs the sealing tombstone (`lifecycle::tombstone_employee`, §3.2)
 /// and returns the seal state (Q6), the revoked detail routes and the
-/// pending fences. Still Personal-only at this RPC: accepting a Shared row
-/// (and dropping `NOT_PERSONAL`) is F6d (`tombstone_accepts_shared`); the
-/// lifecycle function itself handles both kinds.
+/// pending fences. F6d (§3.9): Shared rows are accepted too (the lifecycle
+/// function snapshots the tenant pin and members and removes the bindings);
+/// refused `RESTORE_IN_PROGRESS` while a restore of the label is applying.
 fn tombstone(home: &Path, proof: Option<&MigrationConfirmationSession>, user: &str, input: TombstoneRequest, now: i64)
     -> Result<Value, &'static str> {
     authorize_step_up(proof, user, &input.csrf_token, now)?;
@@ -864,15 +884,14 @@ fn tombstone(home: &Path, proof: Option<&MigrationConfirmationSession>, user: &s
     let employee = EmployeeId(parse_hex16(&input.employee_id).ok_or(EMPLOYEE_NOT_FOUND)?);
     let refusal = |error| match error {
         LifecycleError::Unavailable => STORE_UNAVAILABLE,
-        LifecycleError::Denied | LifecycleError::Tombstoned => NOT_PERSONAL,
+        LifecycleError::Denied | LifecycleError::Tombstoned => EMPLOYEE_NOT_FOUND,
         LifecycleError::Stale => STALE,
     };
-    // Personal only here (F6d widens the RPC); the principal is read from
-    // the stored receipt, never from the request.
-    let personal = lifecycle::confirmed_receipt(home, &input.label).map_err(refusal)?
-        .is_some_and(|receipt| receipt.employee != employee
-            || matches!(receipt.principal_binding, Some(duduclaw_isolation::capability::EmployeeBinding::Personal(_))));
-    if !personal { return Err(NOT_PERSONAL); }
+    // Personal or Shared; the principal is read from the stored receipt,
+    // never from the request. An unknown label is not found.
+    if lifecycle::confirmed_receipt(home, &input.label).map_err(refusal)?.is_none() { return Err(EMPLOYEE_NOT_FOUND); }
+    // §3.5 mutual exclusion, read on the private apply.db (exists: a receipt was read).
+    crate::isolation_restore_rpc::refuse_while_restoring(&open_apply(home, Access::ReadOnly)?, &input.label)?;
     let env = lifecycle::TombstoneEnv { actor: user, runs: &crate::isolation_quarantine::SpawndRunStopper, now };
     let outcome = lifecycle::tombstone_employee(home, &input.label, employee, &env).map_err(refusal)?;
     Ok(json!({ "label": input.label, "tombstoned": true, "readback_required": true,

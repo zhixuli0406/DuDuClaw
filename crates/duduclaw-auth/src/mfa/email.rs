@@ -150,6 +150,7 @@ impl UserDb {
         issue: impl FnOnce(&crate::User,&[(String,crate::AccessLevel)],Vec<String>)->Result<T>) -> Result<T> {
         let mut conn=self.conn();
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let since=crate::credential_changes::high_water(&tx)?;
         let user=challenge_user(&tx,token,if enrollment {"enroll"} else {"login"},now)?;
         active_user(&tx,&user)?;
         tx.execute("UPDATE mfa_challenges SET attempts=attempts+1 WHERE token_hash=?1",[token_hash(token)]).map_err(|e|e.to_string())?;
@@ -170,6 +171,7 @@ impl UserDb {
                 ON CONFLICT(user_id) DO UPDATE SET email=excluded.email,verified_at=excluded.verified_at",params![user,email,now]).map_err(|e|e.to_string())?;
             bump_epoch(&tx,&user)?;
             audit(&tx,&user,"mfa.email_added",None)?;
+            stamp_self(&tx,since,&user)?;
             if had_factor {Vec::new()} else {replace_recovery(&tx,&user)?}
         } else {
             let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM mfa_email_credentials WHERE user_id=?1 AND email=?2)",params![user,email],|r|r.get(0)).map_err(|e|e.to_string())?;
@@ -190,6 +192,7 @@ impl UserDb {
         issue:impl FnOnce(&crate::User,&[(String,crate::AccessLevel)],Vec<String>)->Result<T>)->Result<T> {
         let mut conn=self.conn();
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let since=crate::credential_changes::high_water(&tx)?;
         check_reauth(&tx,user,token,session,now)?;
         if policy_enforced(&tx)? && factor_count(&tx,user)?<=1 { return Err("管理員已要求兩步驟驗證，請先新增其他驗證方式。".into()); }
         if tx.execute("DELETE FROM mfa_email_credentials WHERE user_id=?1",[user]).map_err(|e|e.to_string())?!=1 { return Err(DENIED.into()); }
@@ -198,6 +201,7 @@ impl UserDb {
         if !any_factor(&tx,user)? {tx.execute("DELETE FROM mfa_recovery_codes WHERE user_id=?1",[user]).map_err(|e|e.to_string())?;}
         bump_epoch(&tx,user)?;
         audit(&tx,user,"mfa.email_removed",None)?;
+        stamp_self(&tx,since,user)?;
         let result=issue_mfa_result(&tx,user,Vec::new(),issue)?;
         tx.commit().map_err(|e|e.to_string())?;
         Ok(result)
