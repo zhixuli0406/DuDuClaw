@@ -114,6 +114,23 @@ pub struct License {
     /// pre-NFR license and old signatures still verify.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub nfr: bool,
+
+    /// Owner-approved Ed25519 installation public key (64 lowercase hex
+    /// characters) that the MFA email relay requires before enrollment.
+    ///
+    /// **Part of [`Self::canonical_payload`]** and added at the END with
+    /// `skip_serializing_if`, so a license without the key keeps byte-identical
+    /// canonical bytes and existing signatures still verify. No schema bump: an
+    /// older binary deserializes the field away and its canonical payload then
+    /// lacks it, so the signature fails there. The issuer therefore includes it
+    /// only when the refresh/rebind request itself carried `installation_pubkey`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_pubkey: Option<String>,
+}
+
+/// `true` for exactly 64 lowercase hexadecimal ASCII characters (32 bytes).
+pub fn is_valid_installation_pubkey(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl License {
@@ -169,6 +186,12 @@ impl License {
     ) -> Result<(), LicenseError> {
         if self.version > CURRENT_SCHEMA_VERSION {
             return Err(LicenseError::UnsupportedVersion(self.version));
+        }
+
+        if self.installation_pubkey.as_deref().is_some_and(|key| !is_valid_installation_pubkey(key)) {
+            return Err(LicenseError::ParseError(
+                "installation_pubkey must be 64 lowercase hex characters".into(),
+            ));
         }
 
         if Utc::now() < self.issued_at {
@@ -321,6 +344,7 @@ impl License {
             public_key_id: &self.public_key_id,
             max_agents: self.max_agents,
             nfr: self.nfr,
+            installation_pubkey: self.installation_pubkey.as_deref(),
         };
         serde_json::to_vec(&payload)
             .map_err(|e| LicenseError::ParseError(format!("canonical payload: {e}")))
@@ -354,6 +378,7 @@ impl License {
             control_url: None,
             max_agents: None,
             nfr: false,
+            installation_pubkey: None,
         }
     }
 }
@@ -383,6 +408,10 @@ struct CanonicalPayload<'a> {
     /// (old signatures keep verifying).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     nfr: bool,
+    /// MFA relay installation key. Added last with `skip_serializing_if` so
+    /// `None` yields byte-identical canonical bytes to a pre-key license.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installation_pubkey: Option<&'a str>,
 }
 
 /// Serde helper for encoding `Vec<u8>` as base64 strings in JSON.
@@ -422,7 +451,60 @@ mod tests {
             control_url: None,
             max_agents: None,
             nfr: false,
+            installation_pubkey: None,
         }
+    }
+
+    fn fixed_license() -> License {
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        let mut license = make_license(LicenseTier::SelfHostPro, 30, 0);
+        license.issued_at = at("2026-01-01T00:00:00Z");
+        license.expires_at = at("2027-01-01T00:00:00Z");
+        license.last_phone_home = at("2026-01-02T03:04:05Z");
+        license
+    }
+
+    const KNOWN_CANONICAL_WITHOUT_PUBKEY: &str = concat!(
+        r#"{"version":2,"subscription_id":"sub_test_001","customer_id":"cus_test_001","#,
+        r#""tier":"self_host_pro","machine_fingerprint":"abc123","#,
+        r#""issued_at":"2026-01-01T00:00:00Z","expires_at":"2027-01-01T00:00:00Z","#,
+        r#""last_phone_home":"2026-01-02T03:04:05Z","public_key_id":"v1"}"#);
+
+    #[test]
+    fn installation_pubkey_none_keeps_known_canonical_bytes() {
+        let license = fixed_license();
+        assert_eq!(String::from_utf8(license.canonical_payload().unwrap()).unwrap(),
+            KNOWN_CANONICAL_WITHOUT_PUBKEY);
+        // A pre-field license file parses to None and keeps the same bytes.
+        let legacy: License = serde_json::from_str(&serde_json::to_string(&license).unwrap()).unwrap();
+        assert!(legacy.installation_pubkey.is_none());
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("installation_pubkey"));
+        assert_eq!(legacy.canonical_payload().unwrap(), KNOWN_CANONICAL_WITHOUT_PUBKEY.as_bytes());
+    }
+
+    #[test]
+    fn installation_pubkey_is_signed_last_and_round_trips() {
+        let mut license = fixed_license();
+        license.installation_pubkey = Some("ab".repeat(32));
+        let text = String::from_utf8(license.canonical_payload().unwrap()).unwrap();
+        let expected = format!("{},\"installation_pubkey\":\"{}\"}}",
+            KNOWN_CANONICAL_WITHOUT_PUBKEY.strip_suffix('}').unwrap(), "ab".repeat(32));
+        assert_eq!(text, expected);
+        let back: License = serde_json::from_str(&serde_json::to_string(&license).unwrap()).unwrap();
+        assert_eq!(back.installation_pubkey.as_deref(), Some("ab".repeat(32).as_str()));
+    }
+
+    #[test]
+    fn validate_rejects_malformed_installation_pubkey() {
+        let mut license = make_license(LicenseTier::SelfHostPro, 30, 0);
+        license.installation_pubkey = Some("0123456789abcdef".repeat(4));
+        assert!(license.validate("abc123", 7, 30).is_ok());
+        for bad in [String::new(), "AB".repeat(32), "ab".repeat(31), "ab".repeat(33),
+            "zz".repeat(32), format!("{}é", "a".repeat(62))] {
+            license.installation_pubkey = Some(bad.clone());
+            assert!(matches!(license.validate("abc123", 7, 30), Err(LicenseError::ParseError(_))), "{bad}");
+        }
+        assert!(!is_valid_installation_pubkey(&" ".repeat(64)));
     }
 
     #[test]
