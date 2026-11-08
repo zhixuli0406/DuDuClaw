@@ -70,6 +70,9 @@ pub enum HelperPolicyError {
     ShortGrace,
     /// Malformed record (duplicates, slot/egress mismatch, zero limits).
     Invalid,
+    /// The parent profile lacks a call the in-trampoline launcher needs (HX3b:
+    /// F_L = parent ∪ L_restrict adds no kill/dup3/file/socket calls).
+    ParentLacksLauncherCalls,
 }
 impl HelperPolicyError {
     pub fn as_reason(self) -> &'static str {
@@ -77,7 +80,7 @@ impl HelperPolicyError {
             Self::RuntimeMissing => "helper_runtime_missing",
             Self::NotNarrowing | Self::ShortGrace => "helper_not_narrowing",
             Self::ParentOffline => "helper_parent_offline",
-            Self::FdBudget | Self::Invalid => "helper_launcher_unavailable",
+            Self::FdBudget | Self::Invalid | Self::ParentLacksLauncherCalls => "helper_launcher_unavailable",
         }
     }
 }
@@ -111,6 +114,9 @@ pub fn validate_launcher(arch: Architecture, parent: &PublishedRuntime, parent_s
     if helper_id(&parent.runtime).is_some() { return Err(Invalid); }
     // Check 5: binding count first, so an oversized table never reaches later work.
     if launcher.helpers.is_empty() || launcher.helpers.len() > MAX_HELPER_BINDINGS { return Err(FdBudget); }
+    // HX3b: the launcher runs under F_L = parent ∪ L_restrict; the trampoline
+    // refuses the same plan (`LauncherPlan::validate`), so fail at publication.
+    if !seccomp::parent_supports_launcher(arch, parent_seccomp) { return Err(ParentLacksLauncherCalls); }
     let reserve = launcher.reserve;
     let limits = &parent.resources;
     if reserve.memory_bytes == 0 || reserve.tasks == 0 || reserve.cpu_quota_percent == 0
@@ -190,7 +196,12 @@ mod tests {
     }
     fn registered(name: &str) -> RuntimeKind { RuntimeKind::Registered(Text::new(name.into()).unwrap()) }
     fn egress() -> NetworkPolicy { NetworkPolicy::Egress(ProfileId(Sha256Digest([7; 32]))) }
-    fn parent_profile() -> RuntimeProfile { RuntimeProfile { allowed_syscalls: vec![0, 1, 3, 41, 42, 59, 231, 322] } }
+    /// A parent that can host the launcher (HX3b) plus socket/connect/execve.
+    fn parent_profile() -> RuntimeProfile {
+        let mut calls = ARCH.launcher_parent_calls().to_vec();
+        for nr in [41, 42, 59] { if !calls.contains(&nr) { calls.push(nr); } }
+        RuntimeProfile { allowed_syscalls: calls }
+    }
     fn profile(calls: &[u32]) -> (RuntimeProfile, Sha256Digest) {
         let profile = RuntimeProfile { allowed_syscalls: calls.to_vec() };
         let digest = profile.digest(ARCH).unwrap();
@@ -357,6 +368,19 @@ mod tests {
         // Duplicate bindings of one helper are refused rather than double-counted.
         helpers.truncate(1); helpers.push(helpers[0].clone());
         assert_eq!(check(&f, &launcher(helpers)), Err(HelperPolicyError::Invalid));
+    }
+    #[test]
+    fn publication_rejects_parent_without_launcher_calls() {
+        let f = fixture(NetworkPolicy::Offline);
+        let table = launcher(vec![binding(2, HelperSlot::Foreground)]);
+        check(&f, &table).unwrap();
+        for missing in [62 /* kill */, 292 /* dup3 */, 257 /* openat */, 46 /* sendmsg */, 47 /* recvmsg */] {
+            let parent = RuntimeProfile { allowed_syscalls: parent_profile().allowed_syscalls.into_iter()
+                .filter(|nr| *nr != missing).collect() };
+            assert_eq!(validate_launcher(ARCH, &f.parent, &parent, &table, &f.runtimes),
+                Err(HelperPolicyError::ParentLacksLauncherCalls), "{missing}");
+        }
+        assert_eq!(HelperPolicyError::ParentLacksLauncherCalls.as_reason(), "helper_launcher_unavailable");
     }
     #[test]
     fn helper_records_must_be_signed_non_mcp_helpers() {

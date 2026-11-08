@@ -125,6 +125,63 @@ pub fn helper_fs_within_runtime(grant: HelperFs) -> bool {
     grant.paths().iter().all(|(path, class)| path_within_runtime(path, *class))
 }
 
+/// `/helpers`: one read-only bind per signed helper file (HX3b). Never in the runtime's list.
+pub const HELPERS_ROOT: &str = "/helpers";
+/// `/helper-tmp`: per-run scratch tmpfs; `/helper-tmp/<call>` per call [F9]. Never in the runtime's list.
+pub const HELPER_TMP_ROOT: &str = "/helper-tmp";
+/// The launcher's own Landlock rules besides the helper union [F12]. `/dev/null`
+/// backs its fds 0/1/2 and each helper's fd 3.
+pub const LAUNCHER_FIXED: [(&str, PathClass); 3] = [(HELPERS_ROOT, PathClass::ReadExecute),
+    (HELPER_TMP_ROOT, PathClass::Ephemeral), ("/dev/null", PathClass::Devices)];
+
+/// `path` is inside or above a path no helper (and so no launcher) may reach.
+pub fn overlaps_forbidden(path: &str) -> bool {
+    let Some(parts) = components(path) else { return true; };
+    HELPER_FORBIDDEN.iter().any(|forbidden| match components(forbidden) {
+        Some(forbidden) => beneath(&parts, &forbidden) || beneath(&forbidden, &parts),
+        None => true,
+    })
+}
+
+/// Launcher Landlock [F12]: `LAUNCHER_FIXED` plus the union of the bound
+/// helpers' `HelperFs` paths, deduplicated. `WorkRecordings` contributes `/work`
+/// here (still an upper bound of every helper layer, which stacks underneath
+/// with the exact `/work/recordings`), so a runtime that leaves something odd at
+/// `/work/recordings` can fail one recording call but never the launcher's setup.
+/// Never `/home/employee`, `/config`, `/run`, `/tmp`, `/dev/shm`, `/runtime`.
+pub fn launcher_landlock(bindings: &[&[HelperFs]]) -> Vec<(&'static str, PathClass)> {
+    let mut rules: Vec<(&'static str, PathClass)> = LAUNCHER_FIXED.to_vec();
+    for grant in bindings.iter().flat_map(|grants| grants.iter()) {
+        let paths: &[(&'static str, PathClass)] = match grant {
+            HelperFs::WorkRecordings => HelperFs::Work.paths(),
+            other => other.paths(),
+        };
+        for rule in paths {
+            if !rules.iter().any(|(path, _)| path == &rule.0) { rules.push(*rule); }
+        }
+    }
+    rules
+}
+
+/// One helper's own Landlock rules from its grants (the per-call
+/// `/helpers/<file>` and `/helper-tmp/<call>` rules are added by the launcher).
+pub fn helper_landlock(grants: &[HelperFs]) -> Vec<(&'static str, PathClass)> {
+    let mut rules: Vec<(&'static str, PathClass)> = Vec::new();
+    for rule in grants.iter().flat_map(|grant| grant.paths()) {
+        if !rules.iter().any(|(path, _)| path == &rule.0) { rules.push(*rule); }
+    }
+    rules
+}
+
+/// The flat registry name of a signed helper file path `/helpers/<name>`. The
+/// generation registry is flat (spawnd `open_verified`), and `/helpers` holds
+/// exactly one bind per name, so nested paths are refused.
+pub fn helper_file_name(path: &[u8]) -> Option<&str> {
+    let name = std::str::from_utf8(path.strip_prefix(b"/helpers/")?).ok()?;
+    (!name.is_empty() && name != "." && name != ".." && name.len() <= 255
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))).then_some(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +207,59 @@ mod tests {
     fn helper_fs_rejects_unknown_variants() {
         assert!(serde_json::from_str::<HelperFs>("\"home\"").is_err());
         assert_eq!(serde_json::from_str::<HelperFs>("\"work_recordings\"").unwrap(), HelperFs::WorkRecordings);
+    }
+    /// Every subset of the closed `HelperFs` set, as the launcher would see it.
+    fn every_grant_set() -> Vec<Vec<HelperFs>> {
+        (0..(1u8 << HelperFs::ALL.len())).map(|mask| HelperFs::ALL.iter().enumerate()
+            .filter(|(i, _)| mask & (1 << i) != 0).map(|(_, grant)| *grant).collect()).collect()
+    }
+    #[test]
+    fn launcher_landlock_excludes_home_config_run_tmp_shm() {
+        let policy = Policy::for_abi(MAX_KNOWN_ABI).unwrap();
+        for grants in every_grant_set() {
+            let rules = launcher_landlock(&[grants.as_slice()]);
+            for (path, _) in &rules {
+                assert!(!overlaps_forbidden(path), "launcher rule {path} touches a forbidden path");
+                for forbidden in ["/home/employee", "/config", "/run", "/tmp", "/dev/shm", "/runtime", "/"] {
+                    assert_ne!(*path, forbidden);
+                }
+            }
+            for fixed in LAUNCHER_FIXED { assert!(rules.contains(&fixed), "{fixed:?}"); }
+            let mut paths: Vec<_> = rules.iter().map(|(path, _)| *path).collect();
+            paths.sort_unstable(); paths.dedup();
+            assert_eq!(paths.len(), rules.len(), "duplicate launcher rule");
+            // Union is an upper bound of every helper layer stacked underneath.
+            for (path, class) in helper_landlock(&grants) {
+                let wanted = policy.rights(class);
+                let granted = rules.iter().filter(|(root, _)| path == *root || path.starts_with(&format!("{root}/")))
+                    .fold(0, |rights, (_, class)| rights | policy.rights(*class));
+                assert_eq!(wanted & !granted, 0, "{path} not covered by the launcher layer");
+            }
+        }
+        assert_eq!(launcher_landlock(&[]), LAUNCHER_FIXED.to_vec());
+        // Lookalikes are not forbidden; real forbidden subtrees and parents are.
+        for path in [HELPER_TMP_ROOT, HELPERS_ROOT, "/dev/null", "/work", "/tmpfoo"] { assert!(!overlaps_forbidden(path), "{path}"); }
+        for path in ["/tmp/x", "/run", "/home", "/dev/shm/a", "/", "/config", "relative", "/work/../tmp"] {
+            assert!(overlaps_forbidden(path), "{path}");
+        }
+    }
+    #[test]
+    fn helper_layer_rules_stay_inside_runtime_list() {
+        for grants in every_grant_set() {
+            for (path, class) in helper_landlock(&grants) {
+                assert!(path_within_runtime(path, class), "{path}");
+                assert!(!overlaps_forbidden(path));
+            }
+        }
+    }
+    #[test]
+    fn helper_file_names_are_flat_registry_names() {
+        assert_eq!(helper_file_name(b"/helpers/node"), Some("node"));
+        assert_eq!(helper_file_name(b"/helpers/driver.cjs"), Some("driver.cjs"));
+        for bad in [&b"/helpers/"[..], b"/helpers/..", b"/helpers/.", b"/helpers/a/b", b"/runtime/node", b"helpers/x",
+            b"/helpers/a b", b"/helpers/\xff", b"/helpers//x"] {
+            assert_eq!(helper_file_name(bad), None, "{bad:?}");
+        }
     }
     #[test]
     fn self_only_exceptions_are_closed_and_not_duplicated() {

@@ -212,7 +212,9 @@ mod tests {
         let policy = RootPolicy::from_verified_publication(vec![parent.clone(), helper.clone()], vec![
             EmployeeEntitlement { employee: entitled, profiles: vec![parent.profile, helper.profile] },
             EmployeeEntitlement { employee: other, profiles: vec![parent.profile] }]).unwrap()
-            .with_launchers(arch, vec![(parent.profile, RuntimeProfile { allowed_syscalls: vec![0, 1, 231, 322] }, launcher.clone())]).unwrap();
+            // HX3b: the parent must hold every call the launcher issues under F_L.
+            .with_launchers(arch, vec![(parent.profile, RuntimeProfile { allowed_syscalls: arch.launcher_parent_calls().to_vec() },
+                launcher.clone())]).unwrap();
         assert_eq!(policy.helper_table(entitled, &parent).len(), 1);
         assert_eq!(policy.derive_helper(entitled, &parent, &helper.runtime).unwrap().index, 0);
         // Not entitled to the helper: absent, never another helper.

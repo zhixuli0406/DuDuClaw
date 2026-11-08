@@ -29,6 +29,12 @@ pub struct LauncherProfile {
     /// Read-only helper registry clone (`bootstrap_mounts::prepare_helpers`).
     pub mount: OwnedFd,
     pub tmpfs_bytes: u64,
+    /// Launcher drain window F (§2.5 (b)); see `launcher_drain_ms`.
+    pub drain_ms: u64,
+}
+/// F = parent `termination_grace_ms` − 2 s, at least 1 s, at most the trampoline bound.
+pub fn launcher_drain_ms(termination_grace_ms: u64) -> u64 {
+    termination_grace_ms.saturating_sub(2_000).clamp(1_000, duduclaw_run::linux::runner::MAX_LAUNCHER_DRAIN_MS)
 }
 pub struct HelperRun {
     /// Position in the parent's signed helper list.
@@ -148,7 +154,7 @@ fn launcher_plan(profile: LauncherProfile, control: OwnedFd) -> Result<(duduclaw
         if let Some(script) = helper.script { rights.push(script.fd); }
         indices.push(helper.index);
     }
-    Ok((LauncherPlan { helpers, mounts, tmpfs_bytes: profile.tmpfs_bytes }, rights, indices))
+    Ok((LauncherPlan { helpers, mounts, tmpfs_bytes: profile.tmpfs_bytes, drain_ms: profile.drain_ms }, rights, indices))
 }
 pub struct NativeTrampoline { installation: Box<dyn Installation>, runs: BTreeMap<RunId, Pending> }
 impl NativeTrampoline {
@@ -324,6 +330,14 @@ mod tests {
         assert!(stages.ready());
         assert!(stages.record(StatusRecord::ChildrenForked).is_err());
         assert!(stages.record(StatusRecord::Error(1)).is_err());
+    }
+    #[test]
+    fn launcher_drain_window_is_grace_minus_two_seconds_bounded() {
+        assert_eq!(launcher_drain_ms(15_000), 13_000);
+        assert_eq!(launcher_drain_ms(crate::helper_policy::RECORDING_MIN_GRACE_MS), 10_000);
+        for short in [0, 100, 2_000, 2_999] { assert_eq!(launcher_drain_ms(short), 1_000); }
+        assert_eq!(launcher_drain_ms(u64::MAX), duduclaw_run::linux::runner::MAX_LAUNCHER_DRAIN_MS);
+        assert!(duduclaw_run::linux::runner::LAUNCHER_SUPPORTED, "HX3b: the trampoline forks the launcher");
     }
     #[test]
     fn production_default_never_invents_installation_evidence() {

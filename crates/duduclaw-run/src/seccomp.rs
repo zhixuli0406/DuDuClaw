@@ -45,6 +45,28 @@ impl Architecture {
         [444, 445, 446, self.nr(112, 157), self.nr(61, 260), self.nr(247, 95),
             self.nr(283, 85), self.nr(286, 86), self.nr(287, 87), 436]
     }
+    /// Calls the in-trampoline launcher and its pre-exec helper children make
+    /// that F_L does NOT add (HX3a: F_L = parent ∪ L_restrict). They must come
+    /// from the parent runtime profile; `parent_supports_launcher` refuses a
+    /// launcher for a parent that lacks any of them (HX3b, checked at plan and
+    /// publication time). read, write, close, lseek, mmap, munmap,
+    /// rt_sigaction, rt_sigprocmask, rt_sigreturn, kill, fcntl, chdir, getppid,
+    /// fstatfs, getdents64, openat, mkdirat, unlinkat, ppoll, dup3, pipe2,
+    /// sendmsg, recvmsg, clone, statx, openat2, pread64, execveat, exit_group.
+    pub fn launcher_parent_calls(self) -> [u32; 29] {
+        [self.nr(0, 63), self.nr(1, 64), self.nr(3, 57), self.nr(8, 62), self.nr(9, 222), self.nr(11, 215),
+            self.nr(13, 134), self.nr(14, 135), self.nr(15, 139), self.nr(62, 129), self.nr(72, 25),
+            self.nr(80, 49), self.nr(110, 173), self.nr(138, 44), self.nr(217, 61), self.nr(257, 56),
+            self.nr(258, 34), self.nr(263, 35), self.nr(271, 73), self.nr(292, 24), self.nr(293, 59),
+            self.nr(46, 211), self.nr(47, 212), self.nr(56, 220), self.nr(332, 291), 437, self.nr(17, 67),
+            self.execveat(), self.exit_group()]
+    }
+}
+
+/// HX3b: the launcher runs under F_L, whose only additions to the parent are
+/// L_restrict; everything else it needs must already be in the parent profile.
+pub fn parent_supports_launcher(arch: Architecture, parent: &RuntimeProfile) -> bool {
+    arch.launcher_parent_calls().iter().all(|nr| parent.allows(*nr))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -185,10 +207,15 @@ pub fn supervisor(arch: Architecture, status_fd: i32, pidfd: i32) -> Result<Filt
 /// PID 1 may reap/forward signals only inside its already-created PID namespace.
 /// `alarm`/`setitimer` bound init's wait for a draining launcher (HX §2.5 (c)):
 /// they only arm a timer that signals init itself.
-pub fn init(arch: Architecture, status_fd: i32) -> Result<Filter, FilterError> {
-    if status_fd <= 2 { return Err(FilterError::Policy); }
+pub fn init(arch: Architecture, status_fd: i32) -> Result<Filter, FilterError> { init_with_kill(arch, status_fd, None) }
+
+/// `init` plus, when a launcher is planned, `write` to the root-opened
+/// `rt-runtime/cgroup.kill` descriptor (HX §2.5 (a) [F4]): init kills the
+/// runtime's daemonized descendants the moment it reaps the runtime.
+pub fn init_with_kill(arch: Architecture, status_fd: i32, kill_fd: Option<i32>) -> Result<Filter, FilterError> {
+    if status_fd <= 2 || kill_fd.is_some_and(|fd| fd <= 2 || fd == status_fd) { return Err(FilterError::Policy); }
     let mut filter = Filter::new(arch);
-    filter.block(arch.nr(1,64), &fd_rule(status_fd as u32, None, ALLOW, KILL));
+    filter.block(arch.nr(1,64), &fd_rule(status_fd as u32, kill_fd.map(|fd| fd as u32), ALLOW, KILL));
     for nr in [arch.nr(61,260), arch.nr(247,95), arch.nr(62,129), arch.nr(13,134),
         arch.nr(3,57), arch.nr(15,139), arch.nr(14,135), arch.exit_group(), arch.setitimer()]
         .into_iter().chain(arch.alarm()) {
@@ -614,6 +641,54 @@ mod tests {
                 assert_eq!(evaluate(&filter, arch.audit(), arch.nr(41, 198), [family, 1, 0, 0, 0, 0]), DENY);
             }
         }
+    }
+
+    #[test]
+    fn init_filter_allows_cgroup_kill_write_only() {
+        for arch in ARCHES {
+            let filter = init_with_kill(arch, 10, Some(12)).unwrap();
+            for fd in 0..=13 {
+                let expected = if fd == 10 || fd == 12 { ALLOW } else { KILL };
+                assert_eq!(evaluate(&filter, arch.audit(), arch.nr(1, 64), [fd, 0, 0, 0, 0, 0]), expected, "{arch:?} {fd}");
+            }
+            assert_eq!(evaluate(&filter, arch.audit(), arch.execveat(), [0; 6]), KILL);
+            assert_eq!(evaluate(&filter, arch.audit(), arch.nr(0, 63), [12, 0, 0, 0, 0, 0]), KILL);
+            assert_eq!(init(arch, 10).unwrap().instructions(), init_with_kill(arch, 10, None).unwrap().instructions());
+            for bad in [Some(2), Some(10)] { assert!(init_with_kill(arch, 10, bad).is_err()); }
+        }
+    }
+
+    #[test]
+    fn launcher_refused_for_parent_without_launcher_calls() {
+        for arch in ARCHES {
+            let calls = arch.launcher_parent_calls();
+            let mut sorted = calls.to_vec(); sorted.sort_unstable(); sorted.dedup();
+            assert_eq!(sorted.len(), calls.len(), "{arch:?} duplicate launcher call");
+            // None of them is an L_restrict call or a common refusal: they really come from the parent.
+            for nr in calls {
+                assert!(!arch.launcher_restrict_calls().contains(&nr) && !denied_syscalls(arch).contains(&nr), "{nr}");
+            }
+            let full = RuntimeProfile { allowed_syscalls: calls.to_vec() };
+            assert!(parent_supports_launcher(arch, &full));
+            for missing in calls {
+                let parent = RuntimeProfile { allowed_syscalls: calls.iter().copied().filter(|nr| *nr != missing).collect() };
+                assert!(!parent_supports_launcher(arch, &parent), "{arch:?} without {missing}");
+            }
+            assert!(!parent_supports_launcher(arch, &parent_profile(arch)));
+        }
+    }
+
+    #[cfg(target_os="linux")]
+    #[test]
+    fn seccomp_native_uapi_numbers_for_launcher_parent_calls() {
+        let arch = Architecture::native().unwrap();
+        let expected = [libc::SYS_read, libc::SYS_write, libc::SYS_close, libc::SYS_lseek, libc::SYS_mmap,
+            libc::SYS_munmap, libc::SYS_rt_sigaction, libc::SYS_rt_sigprocmask, libc::SYS_rt_sigreturn, libc::SYS_kill,
+            libc::SYS_fcntl, libc::SYS_chdir, libc::SYS_getppid, libc::SYS_fstatfs, libc::SYS_getdents64,
+            libc::SYS_openat, libc::SYS_mkdirat, libc::SYS_unlinkat, libc::SYS_ppoll, libc::SYS_dup3, libc::SYS_pipe2,
+            libc::SYS_sendmsg, libc::SYS_recvmsg, libc::SYS_clone, libc::SYS_statx, libc::SYS_openat2,
+            libc::SYS_pread64, libc::SYS_execveat, libc::SYS_exit_group];
+        assert_eq!(arch.launcher_parent_calls(), expected.map(|nr| nr as u32));
     }
 
     #[cfg(target_os="linux")]

@@ -559,7 +559,8 @@ impl Host for Core {
                     crate::native_trampoline::HelperRun { index: entry.index, binding: entry.binding.clone(),
                         runtime: entry.runtime.clone(), executable, script }).collect();
                 native_profile.launcher = Some(crate::native_trampoline::LauncherProfile { helpers, mount: prepared.mount,
-                    tmpfs_bytes: policy.helper_tmpfs_bytes(&runtime).ok_or_else(unavailable)? });
+                    tmpfs_bytes: policy.helper_tmpfs_bytes(&runtime).ok_or_else(unavailable)?,
+                    drain_ms: crate::native_trampoline::launcher_drain_ms(runtime.timeouts.termination_grace_ms) });
             }
         }
         let sealed_plan = plan.seal()?;

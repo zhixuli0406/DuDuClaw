@@ -8,7 +8,7 @@ compile_error!("root-test-fixture is forbidden in release builds");
 fn main() { panic!("root fixture requires native Linux"); }
 
 #[cfg(target_os = "linux")]
-fn main() { linux::runtime_mode(); linux::run(); }
+fn main() { linux::runtime_mode(); linux::helper_mode(); linux::run(); }
 
 #[cfg(target_os = "linux")]
 #[path = "root-fixture/propagation.rs"]
@@ -17,6 +17,7 @@ mod propagation;
 #[cfg(target_os = "linux")]
 mod linux {
     mod launch { include!("root-fixture/launch.rs"); }
+    mod helpers { include!("root-fixture/helpers.rs"); }
     use std::ffi::{CStr, CString};
     use std::fs::{File, Permissions};
     use std::io::{Read, Write};
@@ -425,6 +426,7 @@ mod linux {
         child.success();
     }
     pub fn runtime_mode() { launch::runtime_mode(); }
+    pub fn helper_mode() { helpers::helper_mode(); }
     pub fn run() {
         assert_eq!(unsafe {libc::geteuid()},0,"run iso_root_ tests as root");
         privileges::require_root_capabilities().expect("required root capabilities");
@@ -490,6 +492,7 @@ mod linux {
             "launch-elf"|"launch-script"|"launch-pty"|"launch-exec-failure"|
             "launch-forwarder-failure"|"launch-cancel"|"launch-cancel-startup"|"launch-teardown"|
             "launch-supervisor-failure"|"launch-fast-exit"=>launch::run(root,&scenario),
+            helper if helper.starts_with("helper-")=>helpers::run(root,helper),
             _=>panic!("unknown test scenario"),
         }
     }

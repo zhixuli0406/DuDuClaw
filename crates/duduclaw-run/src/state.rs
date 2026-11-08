@@ -7,7 +7,10 @@ pub enum Stage {
     Namespaces, PrivatePropagation, RootBuilt, Pivoted, Loopback, PidNamespace,
     SupervisorClosed, SupervisorDropped, SupervisorFiltered,
     ProcMounted, Securebits, BoundingDropped, IdentityDropped, CapsCleared,
-    DumpableVerified, NoNewPrivileges, PrivilegesVerified, Landlocked,
+    DumpableVerified, NoNewPrivileges, PrivilegesVerified,
+    /// HX launcher forked: only between privilege readback and init's runtime
+    /// Landlock, so the launcher's domain is a sibling of the runtime's (§2.1).
+    LauncherForked, Landlocked,
     CommonFiltered, Forked, InitClosed, InitFiltered, RuntimeSession,
     RuntimeFds, RuntimeFiltered, Executed, Failed,
 }
@@ -30,7 +33,8 @@ impl Machine {
             | (Securebits, BoundingDropped) | (BoundingDropped, IdentityDropped)
             | (IdentityDropped, CapsCleared) | (CapsCleared, DumpableVerified)
             | (DumpableVerified, NoNewPrivileges) | (NoNewPrivileges, PrivilegesVerified)
-            | (PrivilegesVerified, Landlocked) | (Landlocked, CommonFiltered)
+            | (PrivilegesVerified, Landlocked) | (PrivilegesVerified, LauncherForked)
+            | (LauncherForked, Landlocked) | (Landlocked, CommonFiltered)
             | (CommonFiltered, Forked) | (Forked, InitClosed) | (InitClosed, InitFiltered)
             | (Forked, RuntimeSession) | (RuntimeSession, RuntimeFds)
             | (RuntimeFds, RuntimeFiltered) | (RuntimeFiltered, Executed));
@@ -65,5 +69,21 @@ mod tests {
         let mut m = Machine { stage: Forked };
         m.advance(InitClosed).unwrap(); m.advance(InitFiltered).unwrap();
         assert!(m.advance(Executed).is_err());
+    }
+    #[test]
+    fn launcher_fork_stage_precedes_runtime_landlock() {
+        use Stage::*;
+        // Allowed only between privilege readback and init's runtime Landlock.
+        let mut m = Machine { stage: PrivilegesVerified };
+        m.advance(LauncherForked).unwrap();
+        m.advance(Landlocked).unwrap();
+        m.advance(CommonFiltered).unwrap();
+        // After Landlock (the launcher would be nested in the runtime's domain) or
+        // before privilege readback, a launcher fork is a state violation.
+        for stage in [NoNewPrivileges, Landlocked, CommonFiltered, Forked, InitClosed, InitFiltered, LauncherForked] {
+            let mut m = Machine { stage };
+            assert_eq!(m.advance(LauncherForked), Err(Error::State), "{stage:?}");
+            assert_eq!(m.stage(), Failed);
+        }
     }
 }

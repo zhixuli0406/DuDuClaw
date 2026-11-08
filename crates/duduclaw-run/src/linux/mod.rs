@@ -4,6 +4,7 @@
 pub mod bootstrap;
 pub mod sealed_registry;
 pub mod fd;
+pub(crate) mod launcher;
 pub mod mounts;
 pub mod privileges;
 pub mod probe;
