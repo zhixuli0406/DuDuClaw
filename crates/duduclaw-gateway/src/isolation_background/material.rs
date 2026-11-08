@@ -208,7 +208,11 @@ pub fn delegation(sender: &str, target: &str, payload: &str, turn: Option<&str>,
 /// approval binds and that the resend after the approval ("delegate the same
 /// work again") must repeat exactly. Turn and session ids (and the hop
 /// bookkeeping) change on every resend, so they are not part of it.
-pub const DELEGATION_RESEND_FIELDS: [&str; 6] = ["target", "payload", "reply_channel", "lane", "on_behalf_of", "spawned"];
+/// SR2 round 4: `upstream_unknown` is bound too — an approval given for a
+/// delegation with known provenance does not cover one whose upstream is
+/// unknown (and the reverse).
+pub const DELEGATION_RESEND_FIELDS: [&str; 7] = ["target", "payload", "reply_channel", "lane", "on_behalf_of", "spawned",
+    "upstream_unknown"];
 
 /// The [`DELEGATION_RESEND_FIELDS`] of a delegation material. `None` when
 /// any of them is missing (a material not built by [`delegation`]).
@@ -281,6 +285,9 @@ mod tests {
             bound("turn", "session", "line:room", None, "user:owner", false, "other work")] {
             assert_ne!(original, changed);
         }
+        // SR2 round 4: the upstream-unknown marker is bound as well.
+        assert_ne!(original, delegation_resend_binding(&delegation("alice", "bob", "work", Some("turn"), Some("session"),
+            None, 1, Some("alice"), Some("line:room"), Some("alice"), true, 0, false, Some("user:owner"))).unwrap());
         assert!(delegation_resend_binding(&json!({"target": "bob"})).is_none());
     }
 

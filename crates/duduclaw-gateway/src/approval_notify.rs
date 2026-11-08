@@ -459,6 +459,10 @@ async fn push_dashboard_only(
 }
 
 async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(String, String)> {
+    // SR2 round 4 (N4): the owner-only Personal delegation card is never
+    // pushed or reminded through the generic chain (defence in depth behind
+    // `SELF_NOTIFYING_KINDS` and `approval::no_reminder`).
+    if rec.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND { return None; }
     if is_dashboard_only_record(Some(home_dir), rec) {
         return push_dashboard_only(home_dir, rec, reminder).await;
     }

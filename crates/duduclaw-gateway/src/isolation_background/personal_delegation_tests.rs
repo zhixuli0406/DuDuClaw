@@ -239,8 +239,9 @@ async fn personal_delegation_oversized_task_refused() {
     }
     assert_eq!(cards(home).await.len(), 1, "no card for any refused task");
     assert_eq!(DelegationError::TaskNotShowable.user_message(), Some(NOT_SHOWABLE_TEXT));
-    // Line breaks, tabs and emoji joiners are shown as they are.
-    let plain = "第一步：整理\r\n第二步：\t寄出 👩\u{200d}💻";
+    // Line breaks, tabs and emoji joiners are shown as they are (a carriage
+    // return is not: SR2 round 4 allows only `\n` and `\t`).
+    let plain = "第一步：整理\n第二步：\t寄出 👩\u{200d}💻";
     assert_eq!(admit(home, &gate_for(plain, TARGET_ID), &receipt(home, "plain", plain, TARGET_ID)).await,
         Err(DelegationError::OwnerApprovalPending));
 
@@ -253,6 +254,93 @@ async fn personal_delegation_oversized_task_refused() {
     assert_eq!(shown_task(&card), None, "over the cap");
 }
 
+/// SR2 round 4 (N1): `true` when the task is refused as not showable.
+fn hidden(task: &str) -> bool { showable(task) == Err(DelegationError::TaskNotShowable) }
+
+fn assert_hidden(tasks: &[String]) {
+    for task in tasks { assert!(hidden(task), "must be refused: {task:?} {:x?}", task.chars().map(u32::from).collect::<Vec<_>>()); }
+}
+
+fn assert_shown(tasks: &[&str]) {
+    for task in tasks { assert_eq!(showable(task), Ok(()), "must be shown: {task:?}"); }
+}
+
+#[test]
+fn tag_characters_refused() {
+    let tags: Vec<String> = ['\u{e0000}', '\u{e0001}', '\u{e0020}', '\u{e0041}', '\u{e0067}', '\u{e007f}', '\u{e0080}']
+        .iter().map(|c| format!("核准{c}這次交辦")).collect();
+    assert_hidden(&tags);
+    // Hidden ASCII spelled in tags after a visible word.
+    let smuggled: String = "approve".chars().map(|c| char::from_u32(0xe0000 + u32::from(c)).unwrap()).collect();
+    // An emoji tag sequence (subdivision flag) carries tags too: refused.
+    assert_hidden(&[format!("整理{smuggled}"), "🏴\u{e0067}\u{e0062}\u{e0065}\u{e006e}\u{e0067}\u{e007f}".into()]);
+    assert_shown(&["整理報表 🏴"]);
+}
+
+#[test]
+fn variation_selectors_refused_except_after_emoji() {
+    let refused: Vec<String> = ["a\u{fe0f}", "字\u{fe0e}", "\u{fe0f}開頭", "核\u{e0100}", "核\u{e01ef}", "a\u{fe00}",
+        "a\u{fe0d}", "ᠠ\u{180b}", "ᠠ\u{180f}", "😀\u{fe0f}\u{fe0f}", "😀\u{fe0e}\u{fe0f}", "1\u{fe0f}", "1\u{fe0f}2",
+        "a\u{fe0f}\u{20e3}", "😀\u{fe0f}\u{e0100}"].iter().map(|s| (*s).to_owned()).collect();
+    assert_hidden(&refused);
+    assert_shown(&["❤\u{fe0f}", "☺\u{fe0e}", "😀\u{fe0f}", "1\u{fe0f}\u{20e3} 第一項", "#\u{fe0f}\u{20e3}", "©\u{fe0f} 2026"]);
+}
+
+#[test]
+fn arabic_letter_mark_refused() {
+    let mut refused: Vec<String> = ["مرحبا\u{061c}", "\u{061c}abc", "a\u{061c}b"].iter().map(|s| (*s).to_owned()).collect();
+    // Every bidi control, between letters of either direction.
+    for c in ['\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+        '\u{2068}', '\u{2069}'] {
+        refused.push(format!("invoice{c}exe"));
+        refused.push(format!("مر{c}حبا"));
+    }
+    // Joiners only between letters of a script that needs them, one at a time.
+    refused.extend(["ab\u{200c}cd", "می\u{200c}", "\u{200c}می", "می\u{200c}\u{200c}خواهم", "می\u{200c}a", "字\u{200d}字",
+        "ab\u{200d}cd"].iter().map(|s| (*s).to_owned()));
+    assert_hidden(&refused);
+    assert_shown(&["می\u{200c}خواهم", "क्\u{200d}ष", "ক্\u{200c}ষ", "مرحبا بالعالم", "नमस्ते"]);
+}
+
+#[test]
+fn soft_hyphen_and_fillers_refused() {
+    let refused: Vec<String> = ['\u{00ad}', '\u{034f}', '\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}', '\u{180e}',
+        '\u{fff9}', '\u{fffa}', '\u{fffb}', '\u{17b4}', '\u{17b5}', '\u{2028}', '\u{2029}', '\u{200b}', '\u{2060}',
+        '\u{2061}', '\u{2064}', '\u{feff}', '\u{1bca0}', '\u{1d173}', '\r', '\u{0}', '\u{1b}', '\u{85}', '\u{9f}']
+        .iter().map(|c| format!("整理{c}報表")).collect();
+    assert_hidden(&refused);
+    // A Hangul filler alone (a "blank" name or task) is refused too.
+    assert_hidden(&["\u{3164}".into(), "\u{115f}\u{1160}".into()]);
+    assert_shown(&["第一行\n\t第二行", "한글 정리", "整理\u{3000}報表"]);
+}
+
+#[test]
+fn zwj_emoji_sequence_allowed() {
+    assert_shown(&["👩\u{200d}💻 寫程式", "👨\u{200d}👩\u{200d}👧", "🧑🏽\u{200d}💻", "🏳\u{fe0f}\u{200d}🌈",
+        "❤\u{fe0f}\u{200d}🔥", "🕵\u{fe0f}\u{200d}♀\u{fe0f}"]);
+    let refused: Vec<String> = ["👩\u{200d}\u{200d}💻", "👩\u{200d}", "\u{200d}💻", "👩\u{200d}a", "a\u{200d}💻",
+        "👩\u{fe0f}\u{fe0f}\u{200d}💻", "👩\u{200d}\u{fe0f}💻", "👩\u{fe0e}\u{200d}💻", "👩\u{200c}💻",
+        "a\u{fe0f}\u{200d}💻"].iter().map(|s| (*s).to_owned()).collect();
+    assert_hidden(&refused);
+}
+
+#[tokio::test]
+async fn private_use_refused() {
+    let refused: Vec<String> = ['\u{e000}', '\u{f8ff}', '\u{f0000}', '\u{ffffd}', '\u{100000}', '\u{10fffd}',
+        // Unassigned (Cn), including noncharacters.
+        '\u{0378}', '\u{fdd0}', '\u{fffe}', '\u{ffff}', '\u{2fffe}', '\u{e0fff}']
+        .iter().map(|c| format!("整理{c}報表")).collect();
+    assert_hidden(&refused);
+    // Through the real path: no card filed, nothing queued.
+    let dir = crate::fs_safe::private_test_home().unwrap();
+    let home = dir.path();
+    let task = "請把\u{e000}報表寄出";
+    assert_eq!(admit(home, &gate_for(task, TARGET_ID), &receipt(home, "pua", task, TARGET_ID)).await,
+        Err(DelegationError::TaskNotShowable));
+    assert!(cards(home).await.is_empty());
+    assert!(!queued(home, "pua"));
+}
+
 /// N2: the approval binds the stable delivery fields; the resend after the
 /// approval may differ only in its turn/session ids.
 #[tokio::test]
@@ -261,7 +349,7 @@ async fn personal_delegation_resend_must_match_bound_fields() {
     let home = dir.path();
     let original = FIRST.gate();
     assert_eq!(original.payload()["delivery"], json!({"target": TARGET, "reply_channel": "line:room",
-        "lane": null, "on_behalf_of": "user:alice-user-id", "spawned": false}));
+        "lane": null, "on_behalf_of": "user:alice-user-id", "spawned": false, "upstream_unknown": false}));
     assert_eq!(admit(home, &original, &receipt(home, "first", FIRST.task, TARGET_ID)).await,
         Err(DelegationError::OwnerApprovalPending));
     approve(home, &original).await;

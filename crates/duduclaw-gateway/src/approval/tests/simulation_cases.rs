@@ -212,6 +212,34 @@ async fn reminder_retry_leaves_no_stale_target_when_nothing_is_reachable() {
     );
 }
 
+/// SR2 round 4 (N4): the owner-only Personal delegation card never consumes
+/// a reminder slot or gains a channel destination, on the `poll` path and
+/// directly; an ordinary kind in the same state is reminded (control).
+#[tokio::test(flavor = "current_thread")]
+async fn personal_delegation_card_never_reminded() {
+    let kind = crate::isolation_background::PERSONAL_DELEGATION_KIND;
+    assert!(no_reminder(kind));
+    assert!(SELF_NOTIFYING_KINDS.contains(&kind));
+    let dir = tempfile::tempdir().unwrap();
+    let b = ApprovalBroker::open(dir.path()).unwrap();
+    let mut rec = aged(210, 300, false);
+    rec.action_kind = kind.into();
+    let id = rec.id.clone();
+    b.store.insert(&rec).await.unwrap();
+    assert!(rec.reminder_due(Utc::now()), "fixture is past ⅔ of its TTL");
+
+    b.maybe_remind(&rec, Utc::now()).await;
+    assert_eq!(b.poll(&id).await.unwrap(), ApprovalStatus::Pending);
+    let after = b.get(&id).await.unwrap().unwrap();
+    assert_eq!(after.reminded_at, None, "no reminder slot consumed");
+    assert_eq!((after.notify_channel, after.notify_chat_id), (None, None));
+
+    let control = aged(210, 300, false);
+    b.store.insert(&control).await.unwrap();
+    b.maybe_remind(&control, Utc::now()).await;
+    assert!(b.get(&control.id).await.unwrap().unwrap().reminded_at.is_some(), "other kinds are reminded");
+}
+
 #[test]
 fn reminder_never_fires_for_terminal_or_unparseable_rows() {
     let now = Utc::now();

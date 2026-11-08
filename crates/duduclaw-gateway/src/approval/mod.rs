@@ -71,8 +71,13 @@ pub const REMIND_MIN_TTL_SECONDS: i64 = 120;
 /// responsibility change (per-target hourly cap). They still expire.
 /// Operator-CLI kinds come from `operator_cli_gate::OPERATOR_CLI_KINDS`
 /// (`KindSpec::reminders`).
+/// SR2 round 4 (N4): a Personal employee's delegation card is never
+/// reminded either — the reminder would push the owner-only card through
+/// the generic channel chain that [`SELF_NOTIFYING_KINDS`] keeps it out of.
 pub(crate) fn no_reminder(kind: &str) -> bool {
-    kind == crate::responsibility::DECISION_KIND || operator_cli_gate::no_reminder(kind)
+    kind == crate::responsibility::DECISION_KIND
+        || kind == crate::isolation_background::PERSONAL_DELEGATION_KIND
+        || operator_cli_gate::no_reminder(kind)
 }
 
 const SELF_NOTIFYING_KINDS: &[&str] = &[

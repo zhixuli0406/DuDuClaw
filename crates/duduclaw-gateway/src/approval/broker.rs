@@ -430,7 +430,7 @@ impl ApprovalBroker {
                     )
                     .await?;
                 expired += n as u64;
-            } else if rec.reminder_due(now) && self.home_dir().is_some() {
+            } else if rec.reminder_due(now) && self.home_dir().is_some() && !super::no_reminder(&rec.action_kind) {
                 // WP20: piggyback the ⅔-TTL reminder on the sweep that already
                 // walks every pending row — covers approvals nobody is polling.
                 //

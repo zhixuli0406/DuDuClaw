@@ -117,18 +117,93 @@ pub fn task_digest(task: &str) -> String {
 
 /// The task text is shown to the owner exactly as bound: within
 /// [`MAX_TASK_CHARS`], unchanged by the credential masking every approval
-/// surface applies, and free of control or bidirectional-formatting
-/// characters that would make the rendered text differ from the bytes.
+/// surface applies, and free of characters that would make the rendered
+/// text differ from the bytes ([`hidden_at`]).
 fn showable(task: &str) -> Result<(), DelegationError> {
-    if task.chars().count() > MAX_TASK_CHARS { return Err(DelegationError::TaskTooLong); }
-    // Zero-width joiners (U+200C/U+200D) stay allowed: scripts and emoji use them.
-    let invisible = |c: char| (c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
-        || matches!(c, '\u{200b}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}' | '\u{feff}');
-    if task.chars().any(invisible) || duduclaw_security::credential_detect::mask(task) != task {
+    let chars: Vec<char> = task.chars().collect();
+    if chars.len() > MAX_TASK_CHARS { return Err(DelegationError::TaskTooLong); }
+    if (0..chars.len()).any(|i| hidden_at(&chars, i)) || duduclaw_security::credential_detect::mask(task) != task {
         return Err(DelegationError::TaskNotShowable);
     }
     Ok(())
+}
+
+/// SR2 round 4 (N1): allowlist-style rule for one character of a task text.
+/// Refused: every control except `\n` and `\t` (so `\r` too); every
+/// character of general category Cf (format: bidi controls U+200E/U+200F,
+/// U+202A–U+202E, U+2066–U+2069, U+061C, soft hyphen, tags, U+180E,
+/// U+FFF9–U+FFFB, …), Co (private use) or Cn (unassigned, as of the `regex`
+/// crate's Unicode tables); Cs cannot occur in a Rust `char`. Also refused
+/// explicitly, though not Cf: the variation selectors U+180B–U+180F,
+/// U+FE00–U+FE0F and U+E0100–U+E01EF, U+034F, the Hangul fillers U+115F,
+/// U+1160, U+3164, U+FFA0, the Khmer inherent vowels U+17B4/U+17B5 and the
+/// line/paragraph separators U+2028/U+2029.
+///
+/// The only exceptions, each one character and anchored on both sides:
+/// - ZWNJ U+200C / ZWJ U+200D between two letters of a script that needs
+///   them (Arabic, Syriac, Indic: [`joining_script`]);
+/// - ZWJ U+200D between two emoji ([`emoji`]), where the emoji before it
+///   may carry one VS16 (`🏳️‍🌈`, `❤️‍🔥`): that is the only place two such
+///   characters stand next to each other;
+/// - VS15/VS16 (U+FE0E/U+FE0F) directly after an emoji, or after a keycap
+///   base (`0-9 # *`) directly followed by U+20E3.
+fn hidden_at(chars: &[char], i: usize) -> bool {
+    let c = chars[i];
+    let prev = i.checked_sub(1).map(|p| chars[p]);
+    let next = chars.get(i + 1).copied();
+    match c {
+        '\n' | '\t' => false,
+        '\u{200d}' => {
+            let after_emoji = match prev {
+                Some('\u{fe0f}') => i >= 2 && emoji(chars[i - 2]),
+                Some(p) => emoji(p),
+                None => false,
+            };
+            !((after_emoji && next.is_some_and(emoji))
+                || (prev.is_some_and(joining_script) && next.is_some_and(joining_script)))
+        }
+        '\u{200c}' => !(prev.is_some_and(joining_script) && next.is_some_and(joining_script)),
+        '\u{fe0e}' | '\u{fe0f}' => !(prev.is_some_and(emoji)
+            || (prev.is_some_and(|p| matches!(p, '0'..='9' | '#' | '*')) && next == Some('\u{20e3}'))),
+        _ => c.is_control() || always_hidden(c) || format_private_or_unassigned(c),
+    }
+}
+
+/// Explicit ranges, refused whatever the category table says (belt and
+/// braces for the Cf/Co/Cn ones, the only rule for the others).
+fn always_hidden(c: char) -> bool {
+    matches!(c, '\u{00ad}' | '\u{034f}' | '\u{061c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}'
+        | '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}'
+        | '\u{3164}' | '\u{e000}'..='\u{f8ff}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{ffa0}'
+        | '\u{fff0}'..='\u{fffb}' | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}'
+        | '\u{e0000}'..='\u{e0fff}' | '\u{f0000}'..='\u{10ffff}')
+}
+
+/// General category Cf, Co or Cn. Fails closed (refuses) if the table
+/// cannot be built.
+fn format_private_or_unassigned(c: char) -> bool {
+    static CATEGORY: std::sync::LazyLock<Option<regex::Regex>> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"^[\p{Cf}\p{Co}\p{Cn}]$").ok());
+    let Some(category) = CATEGORY.as_ref() else { return true };
+    category.is_match(c.encode_utf8(&mut [0; 4]))
+}
+
+/// Characters that start or continue an emoji (pictographs, symbols with
+/// emoji presentation, regional indicators, skin-tone modifiers).
+fn emoji(c: char) -> bool {
+    matches!(c, '\u{00a9}' | '\u{00ae}' | '\u{203c}' | '\u{2049}' | '\u{2122}' | '\u{2139}' | '\u{2194}'..='\u{21aa}'
+        | '\u{231a}'..='\u{23ff}' | '\u{24c2}' | '\u{25aa}'..='\u{25fe}' | '\u{2600}'..='\u{27bf}' | '\u{2934}'
+        | '\u{2935}' | '\u{2b05}'..='\u{2b55}' | '\u{3030}' | '\u{303d}' | '\u{3297}' | '\u{3299}'
+        | '\u{1f000}'..='\u{1faff}')
+}
+
+/// Letters and marks of the scripts whose shaping uses ZWNJ/ZWJ: Arabic
+/// (with Supplement and Extended-A/B), Syriac, and Devanagari through
+/// Sinhala. Format characters inside these blocks (U+0600–U+0605, U+061C,
+/// U+06DD, U+08E2, …) are refused before this is consulted.
+fn joining_script(c: char) -> bool {
+    matches!(c, '\u{0600}'..='\u{077f}' | '\u{0870}'..='\u{08ff}' | '\u{0900}'..='\u{0dff}')
+        && !always_hidden(c) && !format_private_or_unassigned(c)
 }
 
 /// The exact task text bound by `card`, for the owner's list. `None` unless
