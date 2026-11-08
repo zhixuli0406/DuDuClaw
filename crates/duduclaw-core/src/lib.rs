@@ -1,3 +1,4 @@
+pub mod module_lease;
 pub mod autonomy_gate;
 pub mod autonomy_handoff;
 pub mod agent_guard;
@@ -35,6 +36,8 @@ pub mod fs_lock;
 pub mod owner_lock;
 pub mod grounding;
 pub mod identity_token;
+#[cfg(windows)]
+pub mod windows_private_state;
 pub mod keychain;
 pub mod knowledge_agent;
 pub mod lenient;
@@ -72,6 +75,8 @@ pub mod team_gate;
 pub mod text_utils;
 pub mod tool_catalog;
 pub mod tool_effect;
+// RM-130: a tool failure always carries a concrete reason.
+pub mod tool_error_reason;
 pub mod mcp_proxy_rewrite;
 pub mod toml_merge;
 pub mod traits;
@@ -176,6 +181,11 @@ pub use takeover_state::{
 };
 pub use text_utils::{truncate_bytes, truncate_chars};
 pub use tool_catalog::{builtin_tool_catalog, ToolCatalogEntry};
+pub use tool_error_reason::{
+    ensure_error_reason, ensure_error_reason_with, is_malformed_frame, lacks_error_reason,
+    missing_error_reason,
+    ErrorDetail as ToolErrorDetail,
+};
 pub use tool_effect::{
     effect_from_annotations, effect_of, effect_of_builtin, effect_of_cli_builtin,
     third_party_tool_ref, ActionRule, CLAUDE_CLI_BUILTIN_TOOLS,
@@ -320,6 +330,16 @@ pub const ENV_REPLY_CHANNEL: &str = "DUDUCLAW_REPLY_CHANNEL";
 /// conversation go out through the same bot / app; the chat id itself never
 /// carries it (B11).
 pub const ENV_REPLY_SENDER: &str = "DUDUCLAW_REPLY_SENDER";
+
+/// RM-124: the full composed WebChat session id
+/// (`webchat:webchat:<owner tag>:<conn>[#agent:<id>][#conv:<nonce>]`) of the
+/// dashboard-chat turn this CLI answers. Set by the gateway ONLY for
+/// `webchat:` turns. The MCP schedule / reminder tools use it as the default
+/// result destination when the model names none, after binding it to the
+/// verified acting employee; a `webchat` target the model supplies is
+/// refused. Deliberately separate from [`ENV_REPLY_CHANNEL`], which drives
+/// outbound pushes WebChat cannot receive.
+pub const ENV_ORIGIN_SESSION: &str = "DUDUCLAW_ORIGIN_SESSION";
 
 /// Wiki RL Trust Feedback context for sub-agent dispatch (v1.10).
 ///

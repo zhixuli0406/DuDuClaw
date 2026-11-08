@@ -966,6 +966,16 @@ impl MethodHandler {
             // v1.68: `[ptc]` / `[cultural_context]` had no reader and are no
             // longer accepted; prefer the typed `advanced_kv` rows. The whole
             // result is checked against `AgentConfig` below either way.
+            // Top-level `reply_language` (dashboard form / MCP parity) writes
+            // `[prompt] reply_language`; same validation as the `prompt` object.
+            if let Some(v) = params_clone.get("reply_language") {
+                let st = table
+                    .entry("prompt")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .ok_or_else(|| "Invalid [prompt] section".to_string())?;
+                apply_reply_language(st, v, &mut changes)?;
+            }
             for sect in &["prompt"] {
                 if let Some(obj) = params_clone.get(*sect).and_then(|v| v.as_object()) {
                     if obj.is_empty() {
@@ -979,6 +989,12 @@ impl MethodHandler {
                     for (k, v) in obj {
                         if !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                             return Err(format!("Invalid {sect} key '{k}' (alphanumeric + underscore only)"));
+                        }
+                        // `[prompt] reply_language`: fixed list; empty clears
+                        // (inherit the global default_language).
+                        if *sect == "prompt" && k == "reply_language" {
+                            apply_reply_language(st, v, &mut changes)?;
+                            continue;
                         }
                         let tv = match v {
                             Value::String(s) => toml::Value::String(s.clone()),
@@ -1230,6 +1246,35 @@ impl MethodHandler {
             Err(e) => WsFrame::error_response("", &e),
         }
     }
+}
+
+/// Write (or clear) `[prompt] reply_language` into the `[prompt]` table.
+///
+/// Accepts only the fixed list (`auto` / `zh-TW` / `zh-CN` / `en` / `ja-JP`);
+/// an empty string removes the key so the employee inherits the global
+/// `[general] default_language`. Anything else is refused before any write.
+fn apply_reply_language(
+    prompt: &mut toml::map::Map<String, toml::Value>,
+    value: &Value,
+    changes: &mut Vec<String>,
+) -> Result<(), String> {
+    let s = value
+        .as_str()
+        .map(str::trim)
+        .ok_or_else(|| "reply_language must be a string".to_string())?;
+    if s.is_empty() {
+        prompt.remove("reply_language");
+        changes.push("prompt.reply_language cleared".into());
+    } else if duduclaw_core::profile_sections::is_valid_reply_language(s) {
+        prompt.insert("reply_language".into(), toml::Value::String(s.into()));
+        changes.push(format!("prompt.reply_language = \"{s}\""));
+    } else {
+        return Err(format!(
+            "Invalid reply_language '{s}'. Valid: {} (empty = inherit the global setting)",
+            duduclaw_core::profile_sections::REPLY_LANGUAGE_CHOICES.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 impl MethodHandler {

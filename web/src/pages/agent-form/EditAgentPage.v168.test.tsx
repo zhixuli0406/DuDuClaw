@@ -295,9 +295,17 @@ describe('new controls round-trip from inspect to payload', () => {
   it('adds a valid tool name to an approval list and refuses an invalid one', async () => {
     const user = userEvent.setup();
     renderAt('/agents/my-bot/edit?tab=tools');
-    await screen.findByText('send_message');
+    // RM-026: the raw approval list now lives in the collapsed 進階設定.
+    await user.click(await screen.findByRole('button', { name: 'Show advanced settings' }));
+    // The prefilled chip is unique (its remove button); the bare text
+    // 'send_message' can also appear as a row in the permission table.
+    await screen.findByRole('button', { name: 'remove send_message' });
 
-    const [approvalInput] = screen.getAllByPlaceholderText('send_message');
+    // Three other ToolNameListFields (irreversible / maybe / scoped) share the
+    // same placeholder and sit earlier in the DOM; the approval list lives in
+    // the advanced section at the bottom, so it is the last one.
+    const approvalInputs = screen.getAllByPlaceholderText('send_message');
+    const approvalInput = approvalInputs[approvalInputs.length - 1];
     await user.type(approvalInput, 'Bad-Name{Enter}');
     expect(await screen.findByText(/"Bad-Name" is not a valid tool name/)).toBeInTheDocument();
 

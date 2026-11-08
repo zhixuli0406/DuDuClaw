@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen, fireEvent, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '@/test/render';
 import { useAgentsStore } from '@/stores/agents-store';
 
@@ -8,11 +9,13 @@ import { useAgentsStore } from '@/stores/agents-store';
 // remote-access allowlist (allowed_origins) round-trips correctly.
 const configMock = vi.fn();
 const updateConfigMock = vi.fn();
+const updateMemoryPrivacyMock = vi.fn();
 vi.mock('@/lib/api', () => ({
   api: {
     system: {
       config: () => configMock(),
       updateConfig: (fields: Record<string, unknown>) => updateConfigMock(fields),
+      updateMemoryPrivacy: (settings: Record<string, unknown>) => updateMemoryPrivacyMock(settings),
     },
   },
 }));
@@ -25,7 +28,12 @@ beforeEach(() => {
     config: 'bind = "127.0.0.1"\nport = 3100\n',
     allowed_origins: ['dash.example.com', 'box.tailnet.ts.net'],
   });
+  // Clear recorded calls so earlier tests' saves don't leak into later
+  // `not.toHaveBeenCalled()` assertions (vitest doesn't clear them for us).
+  updateConfigMock.mockReset();
   updateConfigMock.mockResolvedValue({ success: true, changes: [], applied: true });
+  updateMemoryPrivacyMock.mockReset();
+  updateMemoryPrivacyMock.mockResolvedValue({ success: true, changes: [] });
   // fetchAgents is called on mount; stub it out and keep the roster empty.
   useAgentsStore.setState({ fetchAgents: vi.fn() as never, agents: [] as never });
 });
@@ -77,6 +85,72 @@ describe('<SystemTab> remote-access allowlist', () => {
     await waitFor(() => expect(updateConfigMock).toHaveBeenCalled());
     const payload = updateConfigMock.mock.calls[0][0] as { allowed_origins: string[] };
     expect(payload.allowed_origins).toEqual(['dash.example.com', 'added.example.com']);
+  });
+});
+
+describe('<SystemTab> automatic-memory privacy card (RM-039)', () => {
+  it('shows all four categories on by default when system.config has no memory_privacy', async () => {
+    renderWithProviders(<SystemTab />);
+    for (const name of ['Health', 'Family', 'Personal finances', 'Salary']) {
+      await waitFor(() => expect(screen.getByRole('switch', { name: `Do not record ${name} content` })).toBeChecked());
+    }
+    expect(screen.getByText('What automatic memory does not record')).toBeInTheDocument();
+  });
+
+  it('saves a toggled category straight away with excluded_categories, without touching the form Save payload', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<SystemTab />);
+    const health = await screen.findByRole('switch', { name: 'Do not record Health content' });
+    await waitFor(() => expect(health).toBeEnabled());
+    await user.click(health);
+    await waitFor(() => expect(updateMemoryPrivacyMock).toHaveBeenCalledWith({
+      excluded_categories: ['family', 'personal_finance', 'salary'],
+    }));
+    expect(health).not.toBeChecked();
+    expect(await screen.findByText('Saved')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /^Save$/i }));
+    expect(updateConfigMock).not.toHaveBeenCalled(); // nothing else changed
+  });
+
+  it('rolls the switch back when the gateway refuses the change', async () => {
+    updateMemoryPrivacyMock.mockRejectedValue(new Error('refused'));
+    const user = userEvent.setup();
+    renderWithProviders(<SystemTab />);
+    const salary = await screen.findByRole('switch', { name: 'Do not record Salary content' });
+    await waitFor(() => expect(salary).toBeEnabled());
+    await user.click(salary);
+    await waitFor(() => expect(updateMemoryPrivacyMock).toHaveBeenCalled());
+    await waitFor(() => expect(salary).toBeChecked());
+  });
+
+  it('adds and removes a custom keyword chip, sending custom_keywords', async () => {
+    configMock.mockResolvedValue({
+      config: '',
+      allowed_origins: [],
+      memory_privacy: {
+        excluded_categories: ['health', 'family', 'personal_finance', 'salary'],
+        custom_keywords: { health: ['rehab'] },
+        builtin_categories: ['health', 'family', 'personal_finance', 'salary'],
+        load_state: 'configured',
+      },
+    });
+    const user = userEvent.setup();
+    renderWithProviders(<SystemTab />);
+    await user.click(await screen.findByRole('button', { name: /1 custom keyword/ }));
+    expect(screen.getByText('rehab')).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText('Add a keyword for Health'), 'clinic{Enter}');
+    await waitFor(() => expect(updateMemoryPrivacyMock).toHaveBeenCalledWith({
+      custom_keywords: { health: ['rehab', 'clinic'] },
+    }));
+    expect(await screen.findByText('clinic')).toBeInTheDocument();
+
+    await user.click(screen.getByLabelText('Remove keyword rehab'));
+    await waitFor(() => expect(updateMemoryPrivacyMock).toHaveBeenLastCalledWith({
+      custom_keywords: { health: ['clinic'] },
+    }));
+    expect(screen.queryByText('rehab')).not.toBeInTheDocument();
   });
 });
 

@@ -24,7 +24,7 @@ class PlatformCiTests(unittest.TestCase):
     def check(self):
         return ci.check(ROOT, now=dt.datetime(2026, 10, 28, 12, tzinfo=dt.timezone.utc))
 
-    def query(self, runs, conclusions=("success", "success"), behind=0, unrelated=()):
+    def query(self, runs, conclusions=("success",) * 6, behind=0, unrelated=(), jobs=None):
         def fake(*args):
             if args[:3] == ("gh", "run", "list"):
                 self.assertNotIn("--status", args)
@@ -32,8 +32,9 @@ class PlatformCiTests(unittest.TestCase):
                 self.assertIn("conclusion", args[args.index("--json") + 1].split(","))
                 return json.dumps(runs)
             if args[:3] == ("gh", "run", "view"):
-                return json.dumps({"jobs": [dict(name=name, conclusion=result)
-                                           for name, result in zip(ci.PLATFORM_JOBS, conclusions)]})
+                return json.dumps({"jobs": jobs if jobs is not None else [
+                    dict(name=name, conclusion=result)
+                    for name, result in zip(ci.PLATFORM_JOBS, conclusions)]})
             if "ls-remote" in args:
                 return "a" * 40 + "\trefs/heads/main\n"
             if "merge-base" in args:
@@ -44,6 +45,28 @@ class PlatformCiTests(unittest.TestCase):
                 return str(behind)
             self.fail(str(args))
         return patch.object(ci, "command", side_effect=fake)
+
+    def test_all_six_shard_names_are_required(self):
+        self.assertEqual(ci.PLATFORM_JOBS, tuple(
+            f"Rust {os_name} (shard {shard}/3)"
+            for os_name in ("macos-latest", "windows-latest")
+            for shard in range(1, 4)
+        ))
+        for index, name in enumerate(ci.PLATFORM_JOBS):
+            for conclusion in ("failure", "cancelled", "skipped", None):
+                results = ["success"] * 6
+                results[index] = conclusion
+                with self.subTest(name=name, conclusion=conclusion), \
+                        self.query([self.run_info()], conclusions=results):
+                    with self.assertRaises(ValueError) as error:
+                        self.check()
+                    self.assertIn(name + "=" + str(conclusion), str(error.exception))
+            jobs = [dict(name=other, conclusion="success")
+                    for other in ci.PLATFORM_JOBS if other != name]
+            with self.subTest(missing=name), self.query([self.run_info()], jobs=jobs):
+                with self.assertRaises(ValueError) as error:
+                    self.check()
+                self.assertIn(name + "=missing", str(error.exception))
 
     def test_success_and_boundary(self):
         with self.query([self.run_info()], behind=3):
@@ -101,13 +124,13 @@ class PlatformCiTests(unittest.TestCase):
 
     def test_latest_red_never_falls_back_to_green(self):
         runs = [self.run_info(date="2026-10-27T12:00:00Z", ident=2), self.run_info(ident=3)]
-        with self.query(runs, conclusions=("success", "failure")):
-            with self.assertRaisesRegex(ValueError, "run 3.*windows-latest=failure"):
+        with self.query(runs, conclusions=("success",) * 3 + ("failure", "success", "success")):
+            with self.assertRaisesRegex(ValueError, r"run 3.*windows-latest \(shard 1/3\)=failure"):
                 self.check()
 
     def test_stale_local_main_cannot_hide_newer_failed_main_run(self):
         runs = [self.run_info(date="2026-10-27T12:00:00Z", ident=2), self.run_info(sha="b", ident=3)]
-        with self.query(runs, conclusions=("success", "failure")) as query:
+        with self.query(runs, conclusions=("success",) * 3 + ("failure", "success", "success")) as query:
             with self.assertRaisesRegex(ValueError, "run 3.*failure"):
                 self.check()
             # GitHub's --branch main supplies branch identity. An outdated

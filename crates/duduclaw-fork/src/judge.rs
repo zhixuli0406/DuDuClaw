@@ -157,10 +157,46 @@ fn judgeable(results: &[BranchResult]) -> Result<Vec<&BranchResult>> {
     Ok(v)
 }
 
-/// Build the multi-candidate judge prompt. Candidate outputs are XML-delimited and
-/// labelled as DATA so a branch's text can't inject instructions into the judge
-/// (same hardening as `gvu::verifier::build_judge_prompt`).
-pub fn build_judge_prompt(task: &str, candidates: &[&BranchResult]) -> String {
+/// Anonymous candidate label for a display position: `A`..`Z`, then `AA`, `AB`, …
+/// (bijective base-26, so every position has a unique label).
+pub fn candidate_label(pos: usize) -> String {
+    let mut n = pos + 1;
+    let mut out = Vec::new();
+    while n > 0 {
+        n -= 1;
+        out.push(b'A' + (n % 26) as u8);
+        n /= 26;
+    }
+    out.reverse();
+    String::from_utf8(out).expect("ascii")
+}
+
+/// Inverse of [`candidate_label`] (case-insensitive). `None` if not a letter label.
+fn label_to_position(label: &str) -> Option<usize> {
+    let t = label.trim();
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut n: usize = 0;
+    for b in t.bytes() {
+        n = n.checked_mul(26)?.checked_add((b.to_ascii_uppercase() - b'A') as usize + 1)?;
+    }
+    Some(n - 1)
+}
+
+/// Resolve a judge-supplied candidate reference to a display position. Accepts a
+/// letter label (`"B"`, preferred) or a bare 0-based number (legacy / lenient).
+fn candidate_ref(v: &serde_json::Value) -> Option<usize> {
+    if let Some(n) = v.as_u64() {
+        return Some(n as usize);
+    }
+    let s = v.as_str()?;
+    label_to_position(s).or_else(|| s.trim().parse::<usize>().ok())
+}
+
+/// Render the anonymous, DATA-delimited candidate blocks. Only the output text and
+/// test status are shown — never id / name / model / timestamp / spend.
+fn render_candidate_blocks(candidates: &[&BranchResult]) -> String {
     let mut blocks = String::new();
     for (i, c) in candidates.iter().enumerate() {
         let test_line = match c.test_passed() {
@@ -169,13 +205,62 @@ pub fn build_judge_prompt(task: &str, candidates: &[&BranchResult]) -> String {
             None => "test: (none)",
         };
         blocks.push_str(&format!(
-            "### Candidate {idx} (id={id})\n{test_line}\n<candidate_{idx}>\n{body}\n</candidate_{idx}>\n\n",
+            "### Candidate {label}\n{test_line}\n<candidate_{idx}>\n{body}\n</candidate_{idx}>\n\n",
+            label = candidate_label(i),
             idx = i,
-            id = c.id,
             test_line = test_line,
             body = escape_xml_tag(&c.output, &format!("candidate_{i}")),
         ));
     }
+    blocks
+}
+
+/// Random permutation of `0..n` (Fisher–Yates, randomness from `Uuid::new_v4`).
+fn random_permutation(n: usize) -> Vec<usize> {
+    let mut perm: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        let bytes = uuid::Uuid::new_v4().into_bytes();
+        let r = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
+        let j = (r % (i as u64 + 1)) as usize;
+        perm.swap(i, j);
+    }
+    perm
+}
+
+fn is_permutation(perm: &[usize], n: usize) -> bool {
+    if perm.len() != n {
+        return false;
+    }
+    let mut seen = vec![false; n];
+    for &p in perm {
+        if p >= n || seen[p] {
+            return false;
+        }
+        seen[p] = true;
+    }
+    true
+}
+
+/// Build a human-auditable trace of the blind-judge ordering: `A=<id>, B=<id>, …`.
+fn permutation_trace(shuffled: &[&BranchResult]) -> String {
+    shuffled
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{}={}", candidate_label(i), c.id))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Build the multi-candidate judge prompt. Candidate outputs are XML-delimited and
+/// labelled as DATA so a branch's text can't inject instructions into the judge
+/// (same hardening as `gvu::verifier::build_judge_prompt`).
+///
+/// Blind judging (RM-104): `candidates` is expected to already be in the
+/// (shuffled) display order. Candidates are labelled `A`, `B`, … with no branch id,
+/// name, model, timestamp or spend — only the output text and test status are
+/// rendered, so neither position nor identity can bias the pick.
+pub fn build_judge_prompt(task: &str, candidates: &[&BranchResult]) -> String {
+    let blocks = render_candidate_blocks(candidates);
     format!(
         "You are a branch-selection judge for a forked agent run. Pick the single best \
          candidate answer to the task.\n\n\
@@ -187,8 +272,8 @@ pub fn build_judge_prompt(task: &str, candidates: &[&BranchResult]) -> String {
          2. Internal consistency (no contradictions, not truncated).\n\
          3. If a candidate's test PASSED, weight it higher.\n\n\
          Respond ONLY with valid JSON (no other text):\n\
-         {{\"winner_index\": 0, \"quality\": 0.85, \"rationale\": \"why\"}}\n\
-         winner_index is the 0-based Candidate number; quality is your 0..1 confidence in the winner.",
+         {{\"winner\": \"A\", \"quality\": 0.85, \"rationale\": \"why\"}}\n\
+         winner is the Candidate letter; quality is your 0..1 confidence in the winner.",
         task = escape_xml_tag(task, "task"),
         blocks = blocks,
     )
@@ -208,10 +293,10 @@ pub fn parse_judge_verdict(
         .map_err(|e| ForkError::Executor(format!("judge response not valid JSON: {e}")))?;
 
     let idx = parsed
-        .get("winner_index")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| ForkError::Executor("judge response missing winner_index".into()))?
-        as usize;
+        .get("winner")
+        .or_else(|| parsed.get("winner_index"))
+        .and_then(candidate_ref)
+        .ok_or_else(|| ForkError::Executor("judge response missing winner".into()))?;
     let winner = candidates
         .get(idx)
         .ok_or_else(|| ForkError::Executor(format!("winner_index {idx} out of range")))?;
@@ -249,21 +334,7 @@ pub const MAX_FINE_GRAINED_CHECKS: usize = 6;
 /// criteria into concrete checks, then verdict each check per candidate.
 /// Same DATA-only XML hardening as [`build_judge_prompt`].
 pub fn build_fine_grained_judge_prompt(task: &str, candidates: &[&BranchResult]) -> String {
-    let mut blocks = String::new();
-    for (i, c) in candidates.iter().enumerate() {
-        let test_line = match c.test_passed() {
-            Some(true) => "test: PASS",
-            Some(false) => "test: FAIL",
-            None => "test: (none)",
-        };
-        blocks.push_str(&format!(
-            "### Candidate {idx} (id={id})\n{test_line}\n<candidate_{idx}>\n{body}\n</candidate_{idx}>\n\n",
-            idx = i,
-            id = c.id,
-            test_line = test_line,
-            body = escape_xml_tag(&c.output, &format!("candidate_{i}")),
-        ));
-    }
+    let blocks = render_candidate_blocks(candidates);
     format!(
         "You are a fine-grained branch-selection judge for a forked agent run. \
          Verify each candidate against decomposed acceptance checks instead of a \
@@ -279,10 +350,10 @@ pub fn build_fine_grained_judge_prompt(task: &str, candidates: &[&BranchResult])
          3. Do not compute an overall score — the caller aggregates deterministically.\n\n\
          Respond ONLY with valid JSON (no other text):\n\
          {{\"checks\": [\"check 1\", \"check 2\"],\n\
-         \"candidates\": [{{\"index\": 0, \"verdicts\": [{{\"check\": 0, \"pass\": true, \"evidence\": \"one line\"}}]}}],\n\
-         \"winner_index\": 0, \"rationale\": \"why\"}}\n\
-         `check` is the 0-based index into `checks`; `index` is the 0-based Candidate number; \
-         `winner_index` is your overall preference (used only to break exact ties).",
+         \"candidates\": [{{\"candidate\": \"A\", \"verdicts\": [{{\"check\": 0, \"pass\": true, \"evidence\": \"one line\"}}]}}],\n\
+         \"winner\": \"A\", \"rationale\": \"why\"}}\n\
+         `check` is the 0-based index into `checks`; `candidate` is the Candidate letter; \
+         `winner` is your overall preference (used only to break exact ties).",
         task = escape_xml_tag(task, "task"),
         blocks = blocks,
         max_checks = MAX_FINE_GRAINED_CHECKS,
@@ -351,7 +422,11 @@ pub fn parse_fine_grained(response: &str, n_candidates: usize) -> Option<FineGra
 
     let mut passes = vec![0usize; n_candidates];
     for entry in cand_entries {
-        let Some(idx) = entry.get("index").and_then(|v| v.as_u64()).map(|v| v as usize) else {
+        let Some(idx) = entry
+            .get("candidate")
+            .or_else(|| entry.get("index"))
+            .and_then(candidate_ref)
+        else {
             continue; // malformed entry — skip, don't crash
         };
         if idx >= n_candidates {
@@ -377,9 +452,9 @@ pub fn parse_fine_grained(response: &str, n_candidates: usize) -> Option<FineGra
     }
 
     let model_winner = parsed
-        .get("winner_index")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
+        .get("winner")
+        .or_else(|| parsed.get("winner_index"))
+        .and_then(candidate_ref)
         .filter(|w| *w < n_candidates);
     let rationale = parsed
         .get("rationale")
@@ -432,11 +507,34 @@ fn fine_grained_verdict(fg: &FineGrainedOutcome, candidates: &[&BranchResult]) -
 pub struct LlmJudge<C: LlmCaller> {
     caller: C,
     fine_grained: bool,
+    /// Test hook: fixed display order (`perm[k]` = index into the judgeable list
+    /// shown at position `k`). `None` ⇒ fresh random shuffle per call.
+    fixed_permutation: Option<Vec<usize>>,
 }
 
 impl<C: LlmCaller> LlmJudge<C> {
     pub fn new(caller: C) -> Self {
-        LlmJudge { caller, fine_grained: false }
+        LlmJudge { caller, fine_grained: false, fixed_permutation: None }
+    }
+
+    /// Inject a fixed candidate display order (deterministic tests). `perm[k]` is
+    /// the index (into the judgeable candidates, in branch order) displayed at
+    /// position `k`. A permutation of the wrong length / with duplicates is ignored
+    /// with a warning and the judge falls back to a random shuffle.
+    pub fn with_permutation(mut self, perm: Vec<usize>) -> Self {
+        self.fixed_permutation = Some(perm);
+        self
+    }
+
+    /// Display order for `n` judgeable candidates.
+    fn permutation_for(&self, n: usize) -> Vec<usize> {
+        if let Some(p) = &self.fixed_permutation {
+            if is_permutation(p, n) {
+                return p.clone();
+            }
+            tracing::warn!("injected judge permutation invalid for {n} candidates; shuffling randomly");
+        }
+        random_permutation(n)
     }
 
     /// Enable FineVerify fine-grained judging (arXiv:2606.00660). Malformed
@@ -481,23 +579,40 @@ impl<C: LlmCaller> JudgeAgent for LlmJudge<C> {
     async fn judge(&self, task: &str, results: &[BranchResult]) -> Result<JudgeVerdict> {
         let candidates = judgeable(results)?;
 
-        if self.fine_grained {
-            let prompt = build_fine_grained_judge_prompt(task, &candidates);
-            let response = self.caller.complete(&prompt).await?;
-            if let Some(fg) = parse_fine_grained(&response, candidates.len()) {
-                return Ok(fine_grained_verdict(&fg, &candidates));
-            }
-            tracing::warn!("fine-grained judge output malformed; falling back to holistic");
-            // The same response may still parse as a holistic verdict
-            // (winner_index + quality) — try before paying for a second call.
-            if let Ok(v) = Self::holistic_from_response(&response, &candidates) {
-                return Ok(v);
-            }
-            // Last resort: a fresh holistic call (fail-closed Err if that
-            // also fails — caller defers to manual merge, same as before).
-        }
+        // Blind judging (RM-104): show candidates in a random order under
+        // anonymous letter labels. All parsing below is against `shuffled`, so
+        // winner / score ids map back to the real branch ids.
+        let perm = self.permutation_for(candidates.len());
+        let shuffled: Vec<&BranchResult> = perm.iter().map(|&i| candidates[i]).collect();
+        let trace = permutation_trace(&shuffled);
+        tracing::debug!("blind judge candidate order: {trace}");
 
-        self.holistic_judge(task, &candidates).await
+        let verdict = 'v: {
+            if self.fine_grained {
+                let prompt = build_fine_grained_judge_prompt(task, &shuffled);
+                let response = self.caller.complete(&prompt).await?;
+                if let Some(fg) = parse_fine_grained(&response, shuffled.len()) {
+                    break 'v fine_grained_verdict(&fg, &shuffled);
+                }
+                tracing::warn!("fine-grained judge output malformed; falling back to holistic");
+                // The same response may still parse as a holistic verdict
+                // (winner + quality) — try before paying for a second call.
+                if let Ok(v) = Self::holistic_from_response(&response, &shuffled) {
+                    break 'v v;
+                }
+                // Last resort: a fresh holistic call (fail-closed Err if that
+                // also fails — caller defers to manual merge, same as before).
+            }
+            self.holistic_judge(task, &shuffled).await?
+        };
+
+        let mut verdict = verdict;
+        // Restore branch order for per-branch scores (stable output).
+        verdict.per_branch_scores.sort_by_key(|(id, _)| {
+            candidates.iter().position(|c| c.id == *id).unwrap_or(usize::MAX)
+        });
+        verdict.rationale = format!("{} [blind-judge order: {trace}]", verdict.rationale);
+        Ok(verdict)
     }
 }
 
@@ -700,7 +815,10 @@ mod tests {
         let caller = StubCaller(
             "{\"winner_index\": 1, \"quality\": 0.9, \"rationale\": \"b wins\"}".into(),
         );
-        let judge = FallbackJudge::new(LlmJudge::new(caller), HeuristicJudge);
+        let judge = FallbackJudge::new(
+            LlmJudge::new(caller).with_permutation(vec![0, 1]),
+            HeuristicJudge,
+        );
         let v = judge.judge("task", &[a, b]).await.unwrap();
         assert_eq!(v.winner, b_id);
         assert!(v.rationale.contains("b wins"));
@@ -763,7 +881,7 @@ mod tests {
         let b = result("answer B", BranchState::Finished, Some(1));
         let b_id = b.id.clone();
         let caller = StubCaller("{\"winner_index\": 1, \"quality\": 0.9, \"rationale\": \"B better\"}".into());
-        let judge = LlmJudge::new(caller);
+        let judge = LlmJudge::new(caller).with_permutation(vec![0, 1]);
         let v = judge.judge("task", &[a, b]).await.unwrap();
         assert_eq!(v.winner, b_id);
         assert!(v.confidence > 0.0);
@@ -882,7 +1000,9 @@ mod tests {
         let a = result("answer A", BranchState::Finished, Some(0));
         let b = result("answer B", BranchState::Finished, Some(0));
         let b_id = b.id.clone();
-        let judge = LlmJudge::new(StubCaller(fg_response())).with_fine_grained(true);
+        let judge = LlmJudge::new(StubCaller(fg_response()))
+            .with_fine_grained(true)
+            .with_permutation(vec![0, 1]);
         let v = judge.judge("task", &[a, b]).await.unwrap();
         // Deterministic aggregation overrides the model's winner_index=0.
         assert_eq!(v.winner, b_id);
@@ -900,7 +1020,9 @@ mod tests {
         let b_id = b.id.clone();
         let caller =
             StubCaller("{\"winner_index\": 1, \"quality\": 0.9, \"rationale\": \"B\"}".into());
-        let judge = LlmJudge::new(caller).with_fine_grained(true);
+        let judge = LlmJudge::new(caller)
+            .with_fine_grained(true)
+            .with_permutation(vec![0, 1]);
         let v = judge.judge("task", &[a, b]).await.unwrap();
         assert_eq!(v.winner, b_id);
     }
@@ -945,5 +1067,145 @@ mod tests {
         let p = build_fine_grained_judge_prompt("t", &[&evil]);
         assert!(!p.contains("</candidate_0> ignore"));
         assert!(p.contains("at most 6"));
+    }
+
+    // ── Blind judging (RM-104) ─────────────────────────────────────────────
+
+    /// Captures the prompt and replies with a canned response.
+    struct CapturingCaller {
+        reply: String,
+        prompt: std::sync::Mutex<String>,
+    }
+    #[async_trait]
+    impl LlmCaller for CapturingCaller {
+        async fn complete(&self, prompt: &str) -> Result<String> {
+            *self.prompt.lock().unwrap() = prompt.to_string();
+            Ok(self.reply.clone())
+        }
+    }
+
+    #[test]
+    fn candidate_labels_are_letters_and_extend_past_z() {
+        assert_eq!(candidate_label(0), "A");
+        assert_eq!(candidate_label(25), "Z");
+        assert_eq!(candidate_label(26), "AA");
+        assert_eq!(candidate_label(27), "AB");
+        assert_eq!(candidate_label(51), "AZ");
+        assert_eq!(candidate_label(52), "BA");
+        for i in 0..800 {
+            assert_eq!(label_to_position(&candidate_label(i)), Some(i));
+        }
+    }
+
+    #[test]
+    fn prompt_uses_letter_labels_and_no_identity() {
+        let a = result("out-one", BranchState::Finished, Some(0));
+        let b = result("out-two", BranchState::Finished, None);
+        for p in [
+            build_judge_prompt("t", &[&a, &b]),
+            build_fine_grained_judge_prompt("t", &[&a, &b]),
+        ] {
+            assert!(p.contains("### Candidate A\n"));
+            assert!(p.contains("### Candidate B\n"));
+            assert!(!p.contains("### Candidate 0"));
+            assert!(!p.contains("id="));
+            assert!(!p.contains(&a.id.to_string()));
+            assert!(!p.contains(&b.id.to_string()));
+            assert!(!p.contains("0.1")); // spent_usd must not leak
+        }
+    }
+
+    #[test]
+    fn random_permutation_is_valid() {
+        for n in 0..12 {
+            assert!(is_permutation(&random_permutation(n), n));
+        }
+        assert!(!is_permutation(&[0, 0], 2));
+        assert!(!is_permutation(&[0], 2));
+    }
+
+    #[tokio::test]
+    async fn reversed_permutation_maps_winner_back_to_real_id() {
+        let a = result("answer A-real", BranchState::Finished, Some(0));
+        let b = result("answer B-real", BranchState::Finished, Some(0));
+        let (a_id, b_id) = (a.id.clone(), b.id.clone());
+        // Reversed: shown order is [b, a]; judge picks "A" ⇒ real branch b.
+        let caller = CapturingCaller {
+            reply: "{\"winner\": \"A\", \"quality\": 0.9, \"rationale\": \"first shown\"}".into(),
+            prompt: Default::default(),
+        };
+        let judge = LlmJudge::new(caller).with_permutation(vec![1, 0]);
+        let v = judge.judge("task", &[a, b]).await.unwrap();
+        assert_eq!(v.winner, b_id);
+        // Scores keyed by real ids, in branch order; only the winner is non-zero.
+        assert_eq!(v.per_branch_scores[0].0, a_id);
+        assert_eq!(v.per_branch_scores[0].1, 0.0);
+        assert_eq!(v.per_branch_scores[1].0, b_id);
+        assert!(v.per_branch_scores[1].1 > 0.0);
+        // Audit trail: permutation recorded, A=<b id>.
+        assert!(v.rationale.contains("blind-judge order"));
+        assert!(v.rationale.contains(&format!("A={b_id}")));
+        assert!(v.rationale.contains(&format!("B={a_id}")));
+        // The prompt shows b's text first.
+        let prompt = judge.caller.prompt.lock().unwrap().clone();
+        let pa = prompt.find("answer B-real").unwrap();
+        let pb = prompt.find("answer A-real").unwrap();
+        assert!(pa < pb);
+        assert!(!prompt.contains(&a_id.to_string()));
+        assert!(!prompt.contains(&b_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn legacy_numeric_winner_index_is_positional() {
+        let a = result("a", BranchState::Finished, Some(0));
+        let b = result("b", BranchState::Finished, Some(0));
+        let a_id = a.id.clone();
+        // Reversed order, numeric 1 ⇒ shown position 1 ⇒ real a.
+        let caller =
+            StubCaller("{\"winner_index\": 1, \"quality\": 0.5, \"rationale\": \"x\"}".into());
+        let v = LlmJudge::new(caller)
+            .with_permutation(vec![1, 0])
+            .judge("task", &[a, b])
+            .await
+            .unwrap();
+        assert_eq!(v.winner, a_id);
+    }
+
+    #[tokio::test]
+    async fn fine_grained_scores_map_back_under_permutation() {
+        let a = result("answer A", BranchState::Finished, Some(0));
+        let b = result("answer B", BranchState::Finished, Some(0));
+        let (a_id, b_id) = (a.id.clone(), b.id.clone());
+        // Reversed: shown [b, a]. Displayed "B" (= real a) passes 3/3, "A" (= real b) 1/3.
+        let resp = r#"{
+            "checks": ["c1", "c2", "c3"],
+            "candidates": [
+                {"candidate": "A", "verdicts": [
+                    {"check": 0, "pass": true}, {"check": 1, "pass": false}, {"check": 2, "pass": false}]},
+                {"candidate": "B", "verdicts": [
+                    {"check": 0, "pass": true}, {"check": 1, "pass": true}, {"check": 2, "pass": true}]}
+            ],
+            "winner": "A", "rationale": "gut"
+        }"#;
+        let judge = LlmJudge::new(StubCaller(resp.into()))
+            .with_fine_grained(true)
+            .with_permutation(vec![1, 0]);
+        let v = judge.judge("task", &[a, b]).await.unwrap();
+        assert_eq!(v.winner, a_id);
+        let score = |id: &BranchId| v.per_branch_scores.iter().find(|(i, _)| i == id).unwrap().1;
+        assert!(score(&a_id) > score(&b_id));
+        assert!(v.rationale.contains("3/3 checks"));
+    }
+
+    #[tokio::test]
+    async fn invalid_injected_permutation_falls_back_to_random() {
+        let a = result("a", BranchState::Finished, Some(0));
+        let caller =
+            StubCaller("{\"winner\": \"A\", \"quality\": 0.5, \"rationale\": \"x\"}".into());
+        let v = LlmJudge::new(caller)
+            .with_permutation(vec![5, 5])
+            .judge("task", &[a])
+            .await;
+        assert!(v.is_ok());
     }
 }

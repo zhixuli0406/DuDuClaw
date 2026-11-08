@@ -164,7 +164,7 @@
 |----------|------------|
 | Telegram | ロングポーリング、ファイル/写真/スタンプ/音声、forums/topics、mention-only、音声転記 |
 | LINE | Webhook + HMAC-SHA256 署名、スタンプ、per-chat 設定 |
-| Discord | Gateway WebSocket、スラッシュコマンド（`/ask /status /config /session /agent`）、ボイスチャンネルはデフォルト外の `discord-voice` feature 付きビルドのみ（リリースバイナリには含まれない）、auto-thread（v1.8.14 以降、スレッドの存続期間中 session id は不変）、embed 返信 |
+| Discord | Gateway WebSocket、スラッシュコマンド（`/ask /status /config /session /agent`）、auto-thread（v1.8.14 以降、スレッドの存続期間中 session id は不変）、embed 返信 |
 | Slack | Socket Mode、mention-only、thread 返信 |
 | WhatsApp | Cloud API webhook、署名検証は fail-closed |
 | Feishu | Open Platform v2 |
@@ -257,7 +257,6 @@
 | HTTP エンドポイント | `POST /api/stt`（OpenAI 互換の文字起こし API またはローカルコマンドテンプレート。`[voice]` に STT プロバイダーがないと 501 を返す）、`POST /api/tts`、`GET`/`POST /api/voice/config` |
 | TTS プロバイダー | Piper（ローカル ONNX 音声）/ Kokoro / Azure / MiniMax T2A（CJK かラテン文字の音声を選択）/ OpenAI TTS を 1 つのルーターの背後に配置 |
 | Telegram 音声 | 設定済み STT プロバイダーで文字起こし（未設定時は Whisper）。`/voice` は共通設定の TTS ルーターで返信し、失敗時はテキストに戻る |
-| リリースバイナリに含まれないもの | プロセス内 Whisper（`duduclaw-inference` の `whisper` feature）、ONNX embedding（`onnx` feature）、Discord ボイスチャンネル（`discord-voice` feature）は、それらの feature を指定してビルドしたときだけコンパイルされる |
 | 未実装 | 以前ここに載っていた SenseVoice、Deepgram、Silero VAD、`symphonia` デコード、LiveKit 音声ルームはいずれもコードが存在しない |
 
 ローカル Kokoro-82M v1.1-zh（Apache-2.0、設定 → 音声から約 134 MB をダウンロード）が従来の任意 CLI に代わります。自動選択順はインストール済み Piper → インストール済み Kokoro → MiniMax → OpenAI → Azure。Kokoro の中国語は中国大陸のアクセントで、多音字を誤読する場合があります。公式 Azure AI Speech REST は台湾の中国語音声を提供し、テキストを Microsoft に送信します。`AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION` が必要です。Telegram はローカル Kokoro 音声を WAV として受信します（`sendAudio`）。
@@ -341,7 +340,7 @@
 
 | 機能 | 説明 |
 |------|------|
-| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永続化（v1.8.12）。スケジュールは `tasks_create` + `schedule` で作成（旧 `schedule_task` ツールは v1.69.0 で削除） |
+| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` 永続化（v1.8.12）。スケジュールは `tasks_create` + `schedule` で作成（旧 `schedule_task` ツールは v1.69.0 で削除）。WebChat の会話で通知先なしに作成したものは、実行時に所有者を確認したうえで結果をその会話に返す。通知先のないスケジュールは、結果がどこにも届かないことを作成時の返答で伝える（[69-egress-guard.md](69-egress-guard.md)） |
 | ReminderScheduler | 一度限りのリマインダー（相対 `5m`/`2h`/`1d` または ISO 8601）、`direct` / `agent_callback` モード |
 | HeartbeatScheduler | エージェント毎統一スケジューリング — バスポーリング + GVU サイレンスブレイカー + cron |
 | スケジューラレベルのタスクボードプル（v1.9.3）| `poll_assigned_tasks` を `HeartbeatScheduler::run` tick へ移動 — 30s 毎に全エージェントレジストリを走査（`enabled=false` をスキップしない）；1 時間 LIKE-marker クールダウンでスタンピード防止 |

@@ -206,6 +206,51 @@ mod tests {
         assert!(matches!(err, LicenseError::InvalidSignature));
     }
 
+    fn shared_vector() -> (serde_json::Value, License, Vec<u8>) {
+        let fixture: serde_json::Value = serde_json::from_str(
+            include_str!("../../../tests/fixtures/license_response_v2.json")).unwrap();
+        let license: License = serde_json::from_value(fixture["license"].clone()).unwrap();
+        let public = hex::decode(fixture["public_key_hex"].as_str().unwrap()).unwrap();
+        (fixture, license, public)
+    }
+
+    #[test]
+    fn issued_vector_without_installation_pubkey_keeps_bytes_and_signature() {
+        let (fixture, license, public) = shared_vector();
+        assert!(license.installation_pubkey.is_none());
+        assert_eq!(String::from_utf8(license.canonical_payload().unwrap()).unwrap(), concat!(
+            r#"{"version":2,"subscription_id":"sub_rebind_vector","customer_id":"cus_vector","#,
+            r#""tier":"self_host_pro","machine_fingerprint":"macos-uuid-v2:00112233445566778899aabbccddeeff","#,
+            r#""issued_at":"2026-11-05T00:00:00Z","expires_at":"2026-12-05T00:00:00Z","#,
+            r#""last_phone_home":"2026-11-06T00:00:00Z","public_key_id":"test-vector","max_agents":7}"#));
+        verify_license(&license, &public).unwrap();
+        // The full serialized artifact (and its response digest) is unchanged too.
+        assert_eq!(crate::refresh::license_digest(&license).unwrap(), fixture["license_digest"]);
+    }
+
+    #[test]
+    fn installation_pubkey_tamper_and_ignoring_the_field_both_fail_verification() {
+        let (fixture, mut license, public) = shared_vector();
+        license.installation_pubkey = Some("ab".repeat(32));
+        assert!(matches!(verify_license(&license, &public), Err(LicenseError::InvalidSignature)));
+
+        // Sign with the vector's test-only seed, including a key.
+        let seed: [u8; 32] = hex::decode(fixture["test_only_seed_hex"].as_str().unwrap()).unwrap()
+            .try_into().unwrap();
+        let issuer = SigningKey::from_bytes(&seed);
+        assert_eq!(issuer.verifying_key().to_bytes().to_vec(), public);
+        license.signature = sign_for_test(&license, &issuer);
+        verify_license(&license, &public).unwrap();
+        for replacement in [Some("cd".repeat(32)), None] {
+            // `None` models an older binary that deserializes the field away: its
+            // canonical payload lacks the key, so the issuer must only add the key
+            // for requests that themselves carried installation_pubkey.
+            let mut altered = license.clone();
+            altered.installation_pubkey = replacement;
+            assert!(matches!(verify_license(&altered, &public), Err(LicenseError::InvalidSignature)));
+        }
+    }
+
     #[test]
     fn verify_rejects_wrong_key() {
         let signing_key = SigningKey::generate(&mut OsRng);

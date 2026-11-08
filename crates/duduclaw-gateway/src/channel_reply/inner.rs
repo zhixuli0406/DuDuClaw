@@ -374,7 +374,10 @@ pub(super) async fn build_reply_with_session_inner(
     if capabilities.as_ref().is_some_and(|c| c.system_operator)
         && !operator_machine_access_allowed(&ctx.home_dir, session_id)
     {
-        let language = crate::prompt_identity::read_default_language(&ctx.home_dir).await;
+        let language = match agent {
+            Some(a) => crate::prompt_identity::resolve_fixed_message_language(&ctx.home_dir, &a.config).await,
+            None => crate::prompt_identity::read_default_language(&ctx.home_dir).await,
+        };
         return operator_access_refusal(language.as_deref()).to_string();
     }
 
@@ -512,10 +515,14 @@ pub(super) async fn build_reply_with_session_inner(
     // below and the sensitivity-aware wiki injection inside build_system_prompt.
     let is_private = duduclaw_core::is_private_session(session_id, user_id);
 
-    // WP: global default reply language (config.toml [general]
-    // default_language), read once per turn — same cost/consistency
+    // Effective reply language: the employee's `[prompt] reply_language`,
+    // else the global config.toml [general] default_language; `None` ⇒ follow
+    // the user's language. Read once per turn — same cost/consistency
     // tradeoff as `get_default_agent` above. See `crate::prompt_identity`.
-    let default_language = crate::prompt_identity::read_default_language(&ctx.home_dir).await;
+    let default_language = match agent {
+        Some(a) => crate::prompt_identity::resolve_reply_language(&ctx.home_dir, &a.config).await,
+        None => crate::prompt_identity::read_default_language(&ctx.home_dir).await,
+    };
 
     // Build progressive system prompt
     let system_prompt = {
@@ -1562,6 +1569,13 @@ pub(super) async fn build_reply_with_session_inner(
     } else {
         format!("<task_recap>\n{pinned}\n</task_recap>\n\n{user_part}")
     };
+    // End-of-turn language reminder (only when a non-auto language is pinned):
+    // long English tool/wiki output must not drag the reply out of the
+    // chosen language. Same user-side tail as the recap; one short line.
+    let effective_message = crate::prompt_identity::with_reply_language_reminder(
+        effective_message,
+        default_language.as_deref(),
+    );
 
     // #12 glue (2026-05-12) — request-boundary budget enforcement.
     //
@@ -1874,6 +1888,13 @@ pub(super) async fn build_reply_with_session_inner(
     // spend per employee. Empty user_id ⇒ recorded as unattributed.
     let cli_future =
         crate::claude_runner::CHANNEL_REPLY_USER_ID.scope(user_id.to_string(), cli_future);
+    // RM-124: a signed-in WebChat turn names its own conversation as the
+    // origin for schedule / reminder results (empty ⇒ none). Separate from
+    // REPLY_CHANNEL on purpose: WebChat must never become a push target.
+    let cli_future = crate::scheduled_webchat::ORIGIN_SESSION.scope(
+        crate::scheduled_webchat::turn_origin(session_id, &agent_id),
+        cli_future,
+    );
     // WP5: scope the compression outcome computed above so the eventual
     // `cost_telemetry` record call (several async frames away, inside
     // `spawn_claude_cli_with_env` / the PTY variant) can persist whether
@@ -3985,7 +4006,10 @@ pub(super) async fn build_reply_with_session_inner(
         return crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.to_string();
     }
     if !operator_diagnostics_allowed(&ctx.home_dir, session_id) {
-        return end_user_failure_message(&name, reason, default_language.as_deref());
+        let language = crate::prompt_identity::resolve_fixed_message_language_for_id(
+            &ctx.home_dir, &agent_id,
+        ).await;
+        return end_user_failure_message(&name, reason, language.as_deref());
     }
     // The spawn gate already wrote its own audit event; the person sees the
     // gate's sentence (which names the employee and asks the operator to

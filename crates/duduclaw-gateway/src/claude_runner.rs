@@ -853,10 +853,16 @@ async fn call_claude_for_agent_impl(
     let citation_ref = turn_owned
         .as_deref()
         .map(|tid| (agent_id, tid, session_owned.as_deref()));
-    let default_language = crate::prompt_identity::read_default_language(home_dir).await;
+    let default_language =
+        crate::prompt_identity::resolve_reply_language(home_dir, &agent.config).await;
     crate::machine_employee::check_loaded(
         home_dir, agent, crate::on_behalf_of::current().as_deref(),
     )?;
+    // Only the per-call user message changes; cached system prefixes stay stable.
+    let prompt_with_language = crate::prompt_identity::with_reply_language_reminder(
+        prompt.to_string(), default_language.as_deref(),
+    );
+    let prompt = prompt_with_language.as_str();
     let system_prompt = build_system_prompt(agent, citation_ref, default_language.as_deref())
         .map_err(|error| format!("Agent profile unavailable: {error}"))?;
     let agent_name = agent.config.agent.name.clone();
@@ -4725,6 +4731,8 @@ fn prepare_claude_cmd(
     if let Some(sender) = reply_sender() {
         cmd.env(duduclaw_core::ENV_REPLY_SENDER, &sender);
     }
+    // RM-124: the WebChat conversation this turn answers (webchat turns only).
+    crate::scheduled_webchat::inject_env(&mut cmd);
 
     // v1.10: Inject wiki RL trust feedback context so the MCP server can
     // attach turn_id / session_id to sub-agent dispatch BusMessages.
@@ -6182,7 +6190,7 @@ mod inference_shadow_flush_tests {
 #[cfg(test)]
 mod instructions_slot_tests {
     #[tokio::test]
-    async fn dispatch_profile_keeps_contract_after_skills_memory_and_wiki() {
+    async fn prompt_identity_dispatch_keeps_cached_prefix_and_profile_order() {
         // The skill loader refuses symlinked ancestors, including macOS /var.
         let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let dir = tmp.path().join("agents").join("advisor");
@@ -6207,6 +6215,15 @@ mod instructions_slot_tests {
             .await
             .unwrap();
         let p = super::build_system_prompt(&agent, None, None).unwrap();
+        let pinned_system = super::build_system_prompt(&agent, None, Some("en")).unwrap();
+        for message in ["First dispatch", "Next cron turn"] {
+            let user = crate::prompt_identity::with_reply_language_reminder(message.into(), Some("en"));
+            assert!(user.starts_with(message));
+            assert!(user.ends_with("</reply_language>"));
+            assert_eq!(super::build_system_prompt(&agent, None, Some("en")).unwrap(), pinned_system);
+            assert!(!pinned_system.contains("<reply_language>"));
+        }
+
         let ident = p.find("IDENTITY-BODY").unwrap();
         let user = p.find("USER-BODY &lt;/user_profile&gt;").expect("user data is escaped");
         let rules = p.find("# Instructions").unwrap();

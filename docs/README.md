@@ -115,7 +115,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | Document | Description | Status |
 |----------|-------------|--------|
 | [architecture/overview.md](architecture/overview.md) | System architecture overview | Current |
-| [architecture/extension-gates.md](architecture/extension-gates.md) | Extension RPC/HTTP and third-party MCP boundaries; Odoo Live Chat and voice entry-point inventory | Current (v1.80.0) |
+| [architecture/extension-gates.md](architecture/extension-gates.md) | Extension RPC/HTTP and third-party MCP boundaries; pilot entry-point inventory and unwired ModuleLease core spike | Current (v1.81.0 spike) |
 | [architecture/evolution-engine.md](architecture/evolution-engine.md) | Evolution Engine — Prediction + AEE/Playbook (the only evolution path; the legacy SOUL.md rewrite path was removed) + Cognitive Memory | Current |
 
 ## Design Proposals (RFC / ADR)
@@ -197,6 +197,7 @@ New: [Add teammates and first login](guides/user-management-and-first-login.md) 
 | [guides/professional-software.md](guides/professional-software.md) | 專業軟體整合（Photoshop / AutoCAD 社群 MCP）：支援矩陣、per-agent `.mcp.json` 安裝、capability 治理、ezdxf 降級、RCE 風險聲明 | Current |
 | [guides/google-workspace.md](guides/google-workspace.md) · [繁中](guides/zh-TW/google-workspace.md) · [日本語](guides/ja-JP/google-workspace.md) | Google 八服務、十九工具的參考與安全模型，含公司委派與 OS 原生信件實測 | Current |
 | [guides/google-personal-connections.md](guides/google-personal-connections.md) · [繁中](guides/zh-TW/google-personal-connections.md) · [日本語](guides/ja-JP/google-personal-connections.md) | Enterprise personal Google connections, self-consent, primary Owner, protected storage, exact-session completion and safe disconnect | Current (v1.76.0) |
+| [guides/external-status.md](guides/external-status.md) · [繁中](guides/zh-TW/external-status.md) · [日本語](guides/ja-JP/external-status.md) | 外部系統查詢 AI 員工狀態：`[external_status]` 開關、每人自建的唯讀 `ddc_status_` 憑證、`GET /api/v1/status/employees`（curl 範例、欄位、錯誤碼、頻率限制）、Odoo 注意事項 | Current |
 | [guides/notion.md](guides/notion.md) | Native Notion integration (search / page read / page append, four MCP tools, OAuth setup, external-knowledge-source boundary) | Current |
 | [guides/github.md](guides/github.md) | Native GitHub integration (issue/PR search + read + comment, five MCP tools, OAuth App setup, public-comment safety) | Current |
 | [guides/evals.md](guides/evals.md) | Agent behavior evals / regression suite (`duduclaw eval`), CI gate, GVU/AEE yardstick (`--case`/`--exclude-dir`/`--report`) | Current |

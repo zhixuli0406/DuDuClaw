@@ -69,6 +69,31 @@ async fn non_reserved_name_still_succeeds() {
     assert!(home.path().join("agents").join("sales-lead").exists());
 }
 
+/// v1.81 (S2): a dashboard-created employee gets `can_create_agents = true`
+/// only when its role is `main`; every other role (and the default
+/// `specialist`) is scaffolded `false`.
+#[tokio::test]
+async fn create_scaffolds_can_create_agents_by_role() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    for (name, role, expected) in [
+        ("boss", Some("main"), true),
+        ("helper", None, false),
+        ("lead", Some("team-leader"), false),
+        ("dev", Some("developer"), false),
+    ] {
+        let mut params = json!({ "name": name, "display_name": name });
+        if let Some(role) = role {
+            params["role"] = json!(role);
+        }
+        let frame = handler.handle_agents_create(params).await;
+        assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{name}: {frame:?}");
+        let text = std::fs::read_to_string(home.path().join("agents").join(name).join("agent.toml")).unwrap();
+        let doc: toml::Table = text.parse().unwrap();
+        assert_eq!(doc["permissions"]["can_create_agents"].as_bool(), Some(expected), "{name}: {text}");
+    }
+}
+
 /// The operator's `model_preferred` choice is written verbatim — a created
 /// employee no longer silently inherits `claude-sonnet-4-6`. Absent/blank
 /// falls back to the default (kept for programmatic MCP/API callers).

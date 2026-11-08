@@ -3,6 +3,57 @@
 #[allow(unused_imports)]
 use super::*;
 
+const PERMISSION_HISTORY_DEFAULT_LIMIT: usize = 50;
+const PERMISSION_HISTORY_MAX_LIMIT: usize = 100;
+
+/// Pure core of `agents.permission_history`: filter + page. `events` may be in
+/// any order. Only `agent_authority_changed` rows of `agent_id` are kept, and
+/// each keeps only its `capabilities.*` / `permissions.*` changes (a row that
+/// moved nothing else of interest — e.g. only `agent.reports_to` — is dropped).
+pub(crate) fn permission_history_page(
+    events: &[duduclaw_security::audit::AuditEvent],
+    agent_id: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> (Vec<Value>, Option<String>) {
+    let mut rows: Vec<(&str, Value)> = events
+        .iter()
+        .filter(|e| e.event_type == "agent_authority_changed" && e.agent_id == agent_id)
+        .filter(|e| cursor.is_none_or(|c| e.timestamp.as_str() < c))
+        .filter_map(|e| {
+            let changes: Vec<Value> = e.details["changes"]
+                .as_array()?
+                .iter()
+                .filter(|c| {
+                    c["key"].as_str().is_some_and(|k| {
+                        k.starts_with("capabilities.") || k.starts_with("permissions.")
+                    })
+                })
+                .cloned()
+                .collect();
+            if changes.is_empty() {
+                return None;
+            }
+            // Change content only: any client-claimed origin in older rows is
+            // not authoritative and is never echoed.
+            Some((
+                e.timestamp.as_str(),
+                json!({
+                    "timestamp": e.timestamp,
+                    "agent_id": e.agent_id,
+                    "actor": e.details["user_id"].as_str().unwrap_or("unknown"),
+                    "changes": changes,
+                }),
+            ))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(a.0));
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    let next = if more { rows.last().map(|(ts, _)| ts.to_string()) } else { None };
+    (rows.into_iter().map(|(_, v)| v).collect(), next)
+}
+
 impl MethodHandler {
     // ── Security ────────────────────────────────────────────
 
@@ -24,6 +75,54 @@ impl MethodHandler {
             })
             .collect();
         WsFrame::ok_response("", json!({ "events": events_json }))
+    }
+
+    /// `agents.permission_history` (Admin only, gated in dispatch): the
+    /// permission changes of ONE employee, newest first.
+    ///
+    /// Reads the same source as `security.audit_log` (`dashboard_events`) and
+    /// keeps `agent_authority_changed` rows for `agent_id` whose per-key diff
+    /// touches `capabilities.*` / `permissions.*`. Paged by a timestamp cursor
+    /// (the `next_cursor` of the previous page; rows strictly older come next)
+    /// so rows appended between page loads never shift a page.
+    pub(crate) async fn handle_agents_permission_history(&self, params: Value) -> WsFrame {
+        let agent_id = match params.get("agent_id").and_then(Value::as_str) {
+            Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+            _ => return WsFrame::error_response("", "agent_id is required"),
+        };
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| n.clamp(1, PERMISSION_HISTORY_MAX_LIMIT as u64) as usize)
+            .unwrap_or(PERMISSION_HISTORY_DEFAULT_LIMIT);
+        let cursor = params
+            .get("cursor")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string);
+
+        let home = self.home_dir.clone();
+        let events = tokio::task::spawn_blocking(move || {
+            crate::protected_policy_audit::dashboard_events(&home, usize::MAX)
+        })
+        .await
+        .unwrap_or_default();
+
+        let (mut rows, next_cursor) =
+            permission_history_page(&events, &agent_id, limit, cursor.as_deref());
+
+        // Show a name, not just an id, for the person who made the change.
+        let db = self.user_db.read().await.clone();
+        for row in &mut rows {
+            let actor = row["actor"].as_str().unwrap_or("").to_string();
+            let name = db
+                .as_deref()
+                .and_then(|db| db.get_user(&actor).ok().flatten())
+                .map(|u| u.display_name)
+                .filter(|n| !n.is_empty());
+            row["actor_name"] = name.map(Value::from).unwrap_or(Value::Null);
+        }
+        WsFrame::ok_response("", json!({ "events": rows, "next_cursor": next_cursor }))
     }
 
     /// Unified audit log that merges events from four JSONL sources:

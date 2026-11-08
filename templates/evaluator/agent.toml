@@ -59,7 +59,7 @@ warn_threshold_percent = 80
 hard_stop = false
 
 [permissions]
-can_create_agents = true
+can_create_agents = false     # v1.81: only the main employee creates employees
 can_send_cross_agent = true   # Must reply to delegating agent
 can_modify_own_skills = true
 can_modify_own_soul = false

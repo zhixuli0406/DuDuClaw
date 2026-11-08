@@ -81,12 +81,12 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "notify_channel",
-                description: "With schedule: channel to deliver the run's result to. Required for a one-shot schedule.",
+                description: "Result channel for schedule; required for one-shot runs. Optional with notify_chat_id in WebChat: omit both to return results to this conversation. Never 'webchat'.",
                 required: false,
             },
             ParamDef {
                 name: "notify_chat_id",
-                description: "With schedule: chat / channel / room id on notify_channel.",
+                description: "With schedule: chat/channel/room ID. Optional with notify_channel in WebChat: omit both to return results to this conversation.",
                 required: false,
             },
             ParamDef {

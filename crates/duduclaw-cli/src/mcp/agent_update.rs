@@ -146,6 +146,7 @@ pub(crate) const SELF_AUTHORITY_PARAMS: &[&str] = &[
     "db_sources_add",
     "db_sources_remove",
     "budget_cents",
+    "reply_language",
     "role",
 ];
 
@@ -396,6 +397,28 @@ pub(crate) async fn handle_agent_update(
         }
     }
 
+    // -- Reply language ([prompt] reply_language) --
+    // Fixed list (auto / zh-TW / zh-CN / en / ja-JP); empty string clears the
+    // override so the employee inherits `[general] default_language`.
+    if let Some(v) = params.get("reply_language").and_then(|v| v.as_str()) {
+        let v = v.trim();
+        if v.is_empty() {
+            config.prompt.reply_language = None;
+            changes.push("prompt.reply_language cleared".to_string());
+        } else if duduclaw_core::profile_sections::is_valid_reply_language(v) {
+            config.prompt.reply_language = Some(v.to_string());
+            changes.push(format!("prompt.reply_language = \"{v}\""));
+        } else {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!(
+                    "Error: invalid reply_language '{v}'. Valid: {} (empty string = inherit the global setting)",
+                    duduclaw_core::profile_sections::REPLY_LANGUAGE_CHOICES.join(", ")
+                )}],
+                "isError": true
+            });
+        }
+    }
+
     // -- Budget fields --
     if let Some(v) = params.get("budget_cents").and_then(|v| v.as_u64()) {
         config.budget.monthly_limit_cents = v;
@@ -583,7 +606,7 @@ pub(crate) async fn handle_agent_update(
 
     if changes.is_empty() {
         return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: no valid fields to update. Supported fields: display_name, role, status, trigger, icon, reports_to, model, fallback_model, api_mode, budget_cents, max_concurrent, heartbeat_enabled, heartbeat_cron, db_sources, db_sources_add, db_sources_remove"}],
+            "content": [{"type": "text", "text": "Error: no valid fields to update. Supported fields: display_name, role, status, trigger, icon, reports_to, model, fallback_model, api_mode, reply_language, budget_cents, max_concurrent, heartbeat_enabled, heartbeat_cron, db_sources, db_sources_add, db_sources_remove"}],
             "isError": true
         });
     }
