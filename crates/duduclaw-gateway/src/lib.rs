@@ -62,6 +62,9 @@ pub mod isolation_readiness;
 #[allow(dead_code)]
 pub(crate) mod isolation_lifecycle;
 pub(crate) mod isolation_quarantine;
+// F6c same-id restore engine; the F6d RPCs are its production callers.
+#[allow(dead_code)]
+pub(crate) mod isolation_restore;
 pub mod migration_import;
 pub mod migration_startup;
 
