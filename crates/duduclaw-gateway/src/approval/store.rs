@@ -89,7 +89,7 @@ impl ApprovalStore {
 
     fn init_schema(connection: &Connection) -> Result<(), String> {
         verify_live_io()?;
-        connection.execute_batch("PRAGMA secure_delete=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+        connection.execute_batch("PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON; PRAGMA journal_mode=WAL;")
             .map_err(|e| e.to_string())?;
         verify_live_io()?;
         // Take the write lock before inspecting schema versions/columns. All

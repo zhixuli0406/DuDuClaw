@@ -54,7 +54,7 @@ impl VersionStore {
     /// Create with optional encryption for rollback_diff.
     pub fn with_crypto(db_path: &Path, key_bytes: Option<&[u8; 32]>) -> Self {
         if let Ok(conn) = Connection::open(db_path) {
-            let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+            let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
             if let Err(e) = Self::init_tables(&conn) {
                 warn!("Failed to init version store tables: {e}");
             }
@@ -93,7 +93,7 @@ impl VersionStore {
 
     fn open(&self) -> Result<Connection, String> {
         let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+        conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;")
             .map_err(|e| e.to_string())?;
         Ok(conn)
     }

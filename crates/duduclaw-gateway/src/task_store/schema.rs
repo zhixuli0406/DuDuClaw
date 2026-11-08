@@ -20,7 +20,7 @@ impl TaskStore {
 
     fn init_schema(connection: &Connection) -> Result<(), String> {
         verify_live_io()?;
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+        connection.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;")
             .map_err(|e| format!("configure task store: {e}"))?;
         verify_live_io()?;
         let tx = connection.unchecked_transaction().map_err(|e| format!("begin task schema: {e}"))?;

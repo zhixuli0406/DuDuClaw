@@ -107,7 +107,7 @@ impl SessionManager {
                 Connection::open(db_path).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
             // Enable WAL mode for better concurrent read performance
             conn.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+                "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;",
             )
             .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
             pool.push(Mutex::new(conn));
@@ -153,8 +153,8 @@ impl SessionManager {
 
     fn init_tables(conn: &Connection) -> Result<()> {
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-            PRAGMA busy_timeout=5000;
+            "PRAGMA busy_timeout=5000;
+            PRAGMA journal_mode=WAL;
             PRAGMA foreign_keys=ON;
 
             CREATE TABLE IF NOT EXISTS sessions (

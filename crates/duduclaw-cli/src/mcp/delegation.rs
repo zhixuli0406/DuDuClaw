@@ -162,7 +162,7 @@ pub(crate) async fn send_to_agent_with_ctx(
             let Ok(mut conn) = rusqlite::Connection::open(&db_path) else {
                 return false;
             };
-            let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+            let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
             with_live_delegation_write(&mut conn, |conn| {
             if lane.is_some() {
                 // Same column the gateway adds; ignore "duplicate column".
@@ -295,7 +295,7 @@ pub(crate) async fn send_to_agent_with_ctx(
             let _admission = writer_admission;
             if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return; }
             if let Ok(mut conn) = rusqlite::Connection::open(&db_path) {
-                let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+                let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
                 with_live_delegation_write(&mut conn, |conn| {
                 // Ensure table exists (MCP process may open DB before gateway).
                 // Schema must match message_queue.rs init_schema — keep in sync.

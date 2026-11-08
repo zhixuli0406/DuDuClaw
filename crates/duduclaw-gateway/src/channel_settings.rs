@@ -207,7 +207,7 @@ impl ChannelSettingsManager {
         verify_live_io()?;
         let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
         if db_path.to_str() != Some(":memory:") {
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;")
                 .map_err(|e| e.to_string())?;
         }
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -225,7 +225,7 @@ impl ChannelSettingsManager {
     pub fn from_session_db(db_path: &Path) -> Result<Self, String> {
         verify_live_io()?;
         let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+        conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;")
             .map_err(|e| e.to_string())?;
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         Self::init_tables(&tx)?;

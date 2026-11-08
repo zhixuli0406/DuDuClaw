@@ -60,7 +60,7 @@ impl UserDb {
         for _ in 0..POOL_SIZE {
             let conn = Connection::open(db_path)
                 .map_err(|e| format!("failed to open user db: {e}"))?;
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;")
                 .map_err(|e| format!("failed to set pragmas: {e}"))?;
             pool.push(Mutex::new(conn));
         }

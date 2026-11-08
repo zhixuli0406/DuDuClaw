@@ -2606,7 +2606,7 @@ async fn cleanup_stale_delegation_callbacks(home_dir: &Path) {
     let cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
     let result = tokio::task::spawn_blocking(move || {
         let conn = rusqlite::Connection::open(&db_path).ok()?;
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
         conn.execute(
             "DELETE FROM delegation_callbacks WHERE created_at < ?1",
             rusqlite::params![cutoff],
@@ -2989,7 +2989,7 @@ pub(crate) async fn forward_delegation_response(
             Ok(c) => c,
             Err(_) => return None,
         };
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
         // B11 column; a table created by an older writer may lack it, and a
         // RETURNING over a missing column would drop the forward. "Duplicate
         // column" is the expected error once it exists.
@@ -3130,7 +3130,7 @@ pub(crate) async fn forward_delegation_response(
                 let now = chrono::Utc::now().to_rfc3339();
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+                        let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
                         let _ = conn.execute(
                             "INSERT OR IGNORE INTO delegation_callbacks \
                              (message_id, agent_id, channel_type, channel_id, thread_id, retry_count, created_at, sender_agent) \
@@ -3349,7 +3349,7 @@ async fn append_subagent_reply_to_parent_session_with(
     let result = tokio::task::spawn_blocking(move || -> Result<Option<(String, bool)>, String> {
         let conn =
             rusqlite::Connection::open(&db_path).map_err(|e| format!("open sessions.db: {e}"))?;
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
         let now = chrono::Utc::now().to_rfc3339();
 
         // Try each candidate session_id in order. Accept a session whose

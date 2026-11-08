@@ -573,12 +573,70 @@ fn map_temporal_record(r: &rusqlite::Row) -> rusqlite::Result<TemporalRecord> {
     })
 }
 
+/// Busy handler installed on every file-backed memory connection before any
+/// other statement runs.
+const OPEN_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Extra attempts for the WAL switch and the schema transaction when SQLite
+/// still reports BUSY (the journal-mode switch never waits; a transaction can
+/// outlast the busy handler on a loaded host).
+const OPEN_BUSY_RETRIES: u32 = 8;
+
+/// SQLITE_BUSY / SQLITE_LOCKED (any extended code).
+fn is_sqlite_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Same check for an error already turned into text by a schema helper.
+fn is_busy_message(msg: &str) -> bool {
+    msg.contains("database is locked") || msg.contains("database is busy")
+        || msg.contains("database table is locked")
+}
+
+/// 20 ms doubling to 640 ms, plus up to 30 ms of jitter so racing openers do
+/// not retry in lockstep.
+fn busy_backoff(attempt: u32) {
+    let base = 20u64 << attempt.min(5);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos() ^ std::process::id()) % 30)
+        .unwrap_or(0);
+    std::thread::sleep(std::time::Duration::from_millis(base + jitter));
+}
+
+/// A failed schema-init attempt, and whether it is worth retrying.
+struct InitError {
+    error: DuDuClawError,
+    busy: bool,
+}
+
+impl InitError {
+    fn sqlite(e: rusqlite::Error) -> Self {
+        Self { busy: is_sqlite_busy(&e), error: DuDuClawError::Memory(e.to_string()) }
+    }
+
+    fn memory(e: DuDuClawError) -> Self {
+        Self { busy: is_busy_message(&e.to_string()), error: e }
+    }
+}
+
 impl SqliteMemoryEngine {
     /// Open (or create) a database at `db_path` and initialise tables.
     pub fn new(db_path: &Path) -> Result<Self> {
         let conn =
             Connection::open(db_path).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
+        // The busy handler goes on FIRST, as its own call: several processes
+        // (two `duduclaw mcp-server` children, the gateway) open this file at
+        // once. The old `"PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"`
+        // batch stopped at a BUSY journal-mode switch, so the timeout was never
+        // set and every schema statement after it failed at once with
+        // "database is locked".
+        conn.busy_timeout(OPEN_BUSY_TIMEOUT)
+            .map_err(|e| DuDuClawError::Memory(format!("busy_timeout: {e}")))?;
+        Self::enable_wal(&conn, db_path);
         Self::init_tables(&conn)?;
         info!(?db_path, "SQLite memory engine initialised");
         Ok(Self {
@@ -4228,7 +4286,66 @@ impl SqliteMemoryEngine {
         }
     }
 
+    /// Switch the file to WAL, retrying while another connection holds a
+    /// lock. SQLite's journal-mode change takes its lock without calling the
+    /// busy handler, so `busy_timeout` alone does not cover it. A file that
+    /// stays in rollback mode still works (with a busy handler set), so a
+    /// final failure is logged and opening continues.
+    fn enable_wal(conn: &Connection, db_path: &Path) {
+        for attempt in 0..=OPEN_BUSY_RETRIES {
+            match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
+                Ok(mode) => {
+                    if !mode.eq_ignore_ascii_case("wal") {
+                        warn!(?db_path, %mode, "memory DB did not switch to WAL");
+                    }
+                    return;
+                }
+                Err(e) if is_sqlite_busy(&e) && attempt < OPEN_BUSY_RETRIES => {
+                    busy_backoff(attempt);
+                }
+                Err(e) => {
+                    warn!(?db_path, error = %e, "memory DB: could not enable WAL");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Create / migrate the schema. Runs as one `BEGIN IMMEDIATE`
+    /// transaction so processes opening the same file at once take turns:
+    /// the write lock is taken up front (waiting via the busy handler), the
+    /// "already migrated?" checks inside are read under that lock, and no
+    /// opener sees half a migration. A BUSY result is retried a bounded
+    /// number of times with backoff; any other error fails the open.
     fn init_tables(conn: &Connection) -> Result<()> {
+        let mut attempt = 0;
+        loop {
+            match Self::init_tables_once(conn) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.busy && attempt < OPEN_BUSY_RETRIES => {
+                    warn!(attempt, error = %e.error, "memory schema init busy — retrying");
+                    busy_backoff(attempt);
+                    attempt += 1;
+                }
+                Err(e) => return Err(e.error),
+            }
+        }
+    }
+
+    fn init_tables_once(conn: &Connection) -> std::result::Result<(), InitError> {
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(InitError::sqlite)?;
+        if let Err(e) = Self::create_schema(conn) {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(InitError::memory(e));
+        }
+        if let Err(e) = conn.execute_batch("COMMIT") {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(InitError::sqlite(e));
+        }
+        Ok(())
+    }
+
+    fn create_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS memories (
@@ -5151,6 +5268,41 @@ pub use subject_listing::{SubjectFact, SubjectTripleForgetReport};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: two `duduclaw mcp-server` children opening one fresh
+    /// `memory.db` at once — one died with "database is locked" because the
+    /// WAL switch failed BUSY before `busy_timeout` was set. Every concurrent
+    /// opener of a fresh file must now succeed and see one consistent schema.
+    #[test]
+    fn concurrent_open_of_fresh_db_all_succeed() {
+        const OPENERS: usize = 8;
+        for round in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = std::sync::Arc::new(dir.path().join(format!("memory-{round}.db")));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+            let handles: Vec<_> = (0..OPENERS)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        SqliteMemoryEngine::new(&path).map(|_| ()).map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            for (i, h) in handles.into_iter().enumerate() {
+                let res = h.join().expect("opener thread panicked");
+                assert!(res.is_ok(), "round {round} opener {i} failed: {res:?}");
+            }
+            let conn = Connection::open(path.as_path()).unwrap();
+            let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+            assert_eq!(mode.to_ascii_lowercase(), "wal");
+            let ids: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memory_meta WHERE key = 'db_instance_id'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(ids, 1, "exactly one instance id across racing openers");
+        }
+    }
 
     // Security regression; not run (owner forbids builds).
     #[tokio::test]

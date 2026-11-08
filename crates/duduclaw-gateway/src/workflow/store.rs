@@ -67,7 +67,7 @@ impl WorkflowStore {
     }
     fn initialize(connection: &mut Connection) -> Result<(), String> {
         connection
-            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON;" ,)
+            .execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA secure_delete=ON;" ,)
             .map_err(|e| e.to_string())?;
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
