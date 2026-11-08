@@ -353,6 +353,11 @@ pub fn helper(arch: Architecture, parent: &RuntimeProfile, parent_digest: Sha256
         match call {
             SelfOnlyCall::Prlimit64SelfOnly => filter.block(arch.prlimit64(), &pid_zero_body()),
             SelfOnlyCall::Prctl { options } => filter.block(arch.prctl(), &prctl_body(options)?),
+            // HX6 security fix round: Landlock (self-restricting) and a stacked filter only.
+            SelfOnlyCall::NestedSandbox => {
+                filter.block(arch.seccomp(), &seccomp_filter_body());
+                for nr in crate::helper_policy::LANDLOCK_CALLS { filter.action(nr, ALLOW); }
+            }
         }
     }
     for nr in &profile.allowed_syscalls { filter.action(*nr, ALLOW); }
@@ -362,6 +367,9 @@ pub fn helper(arch: Architecture, parent: &RuntimeProfile, parent_digest: Sha256
 #[cfg(test)]
 #[path = "seccomp_hxfix_tests.rs"]
 mod hxfix_tests;
+#[cfg(test)]
+#[path = "seccomp_hx6fix_tests.rs"]
+mod hx6fix_tests;
 
 #[cfg(test)]
 mod tests {
@@ -537,8 +545,10 @@ mod tests {
                 assert_eq!(evaluate(&filter, arch.audit(), nr, [PR_SET_DUMPABLE as u64, value, 0, 0, 0, 0]), expected);
             }
             // Options that change other processes, capabilities or the memory map stay denied.
+            // (SET_CHILD_SUBREAPER = 36 is self-only since the HX6 security fix round: it only
+            // re-parents the caller's own orphaned descendants to it.)
             for option in [8u64 /* SET_KEEPCAPS */, 15 /* SET_NAME */, 22 /* SET_SECCOMP */, 28 /* SET_SECUREBITS */,
-                35 /* SET_MM */, 36 /* SET_CHILD_SUBREAPER */, 47 /* CAP_AMBIENT */, 0x5961_6d61 /* SET_PTRACER */] {
+                35 /* SET_MM */, 47 /* CAP_AMBIENT */, 0x5961_6d61 /* SET_PTRACER */] {
                 assert_eq!(evaluate(&filter, arch.audit(), nr, [option, 0, 0, 0, 0, 0]), DENY, "{option}");
             }
             // F_H holds only the options its binding lists.

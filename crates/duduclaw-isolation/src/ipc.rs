@@ -85,8 +85,18 @@ pub const HX_RESERVED_OPS: [ReservedOp; 4] = [
 /// HX §5 `SpawnResponse` result tags (`HelperStarted`, `HelperEnded`), owner HX4.
 pub const HX_RESERVED_RESULTS: [&str; 2] = ["helper_started", "helper_ended"];
 /// HX §5 `ErrorCode` names, owner HX4. Package H error codes must differ.
-pub const HX_RESERVED_ERROR_CODES: [&str; 4] =
-    ["helper_busy", "helper_unavailable", "run_time_exhausted", "helper_cgroup_unavailable"];
+pub const HX_RESERVED_ERROR_CODES: [&str; 5] =
+    ["helper_busy", "helper_unavailable", "run_time_exhausted", "helper_cgroup_unavailable", "helper_recording_unsupported"];
+
+/// HX6 security fix round (finding 4): the fixed sealed input of spawnd's
+/// per-host recording probe call. The recording helper answers it with
+/// [`recording_probe_reply`] only after Chromium started under F_L ∩ F_H and
+/// the nested browser sandbox, rendered a fixed local page and exited; it
+/// publishes nothing. A gateway can never make a probe pass: the reply is
+/// read by root only, and the gateway's recording decoder refuses it.
+pub const RECORDING_PROBE_REQUEST: &[u8] = br#"{"probe":"duduclaw-recording-probe-v1"}"#;
+/// The only passing probe output (helper stdout, exit 0, empty stderr).
+pub fn recording_probe_reply(call_hex: &str) -> String { format!(r#"{{"probe":"rendered","id":"{call_hex}"}}"#) }
 
 /// HX §2.2/§2.5 bounds. A helper never runs longer than this (check 3), and
 /// spawnd refuses a call whose remaining run time leaves less than
@@ -671,11 +681,15 @@ impl SpawnRequest {
 /// - `HelperUnavailable`: no launcher, launcher dead, or control channel closed (F14).
 /// - `RunTimeExhausted`: less than `MIN_HELPER_RUN_REMAINDER_MS` of run time remains.
 /// - `HelperCgroupUnavailable`: slot cgroups or open-time credentials unavailable (Q2).
+/// - `HelperRecordingUnsupported` (HX6 security fix round, finding 4): a
+///   recording-slot `HelperCall` while this host's recording probe has not
+///   passed (or the build kill switch is closed). spawnd refuses it itself;
+///   the gateway's feature check is no longer the only gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode { UnsupportedVersion, InvalidRequest, Unauthorized, InvalidFds, QueueFull, QueueExpired, NotFound, NotReady, AlreadyTaken, WouldDeadlock, RuntimeDenied, ResourceLimit, IsolationUnavailable, Internal,
     WorkFileNotFound, WorkFileRefused, WorkFileTooLarge, WorkspaceBrokerUnavailable,
-    HelperBusy, HelperUnavailable, RunTimeExhausted, HelperCgroupUnavailable }
+    HelperBusy, HelperUnavailable, RunTimeExhausted, HelperCgroupUnavailable, HelperRecordingUnsupported }
 
 /// Queue priority is host-derived from verified task context (§4.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -930,7 +944,7 @@ mod tests {
             .map(|r| serde_json::to_value(r).unwrap()["result"].as_str().unwrap().to_owned()).collect();
         assert_eq!(tags, HX_RESERVED_RESULTS);
         let codes: Vec<_> = [ErrorCode::HelperBusy, ErrorCode::HelperUnavailable, ErrorCode::RunTimeExhausted,
-            ErrorCode::HelperCgroupUnavailable].iter()
+            ErrorCode::HelperCgroupUnavailable, ErrorCode::HelperRecordingUnsupported].iter()
             .map(|c| serde_json::to_value(c).unwrap().as_str().unwrap().to_owned()).collect();
         assert_eq!(codes, HX_RESERVED_ERROR_CODES);
     }

@@ -88,10 +88,20 @@ pub struct HelperProgram {
     pub file_size_bytes: u64,
     pub timeout_ms: u64,
     pub egress: bool,
+    /// HX6 security fix round (finding 5): further signed read-only files of
+    /// this binding, bound at `/helpers/<name>` and granted (RX) to this
+    /// helper only. Exactly `helper_policy::RECORDING_BROWSER_FILES`, in that
+    /// order, for the recording slot; empty for every other helper. One root-
+    /// verified descriptor each follows the helper's executable/script.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<(Identity, CString)>,
+}
+impl HelperProgram {
+    fn descriptors(&self) -> usize { 1 + usize::from(self.program.script.is_some()) + self.files.len() }
 }
 impl LauncherPlan {
     pub fn fd_count(&self) -> usize {
-        1 + self.mounts.len() + self.helpers.iter().map(|h| 1 + usize::from(h.program.script.is_some())).sum::<usize>()
+        1 + self.mounts.len() + self.helpers.iter().map(HelperProgram::descriptors).sum::<usize>()
             + crate::helper_policy::HELPER_CGROUP_FDS
     }
     /// `parent` is the run's runtime program: F_L and every F_H are derived from
@@ -120,6 +130,17 @@ impl LauncherPlan {
             if let Some((identity, path)) = &helper.program.script {
                 name(format!("/helpers/{}", path.to_str().map_err(|_| Error::Executable)?).as_bytes(), *identity)?;
             }
+            // Finding 5: a recording-slot binding has exactly the fixed browser
+            // list (spawnd always attaches it to `duduclaw-browser-record-v1`)
+            // or none (its helper then fails closed); nobody else has any.
+            let expected: &[&str] = if helper.slot == HelperSlot::Recording && !helper.files.is_empty() {
+                &RECORDING_BROWSER_FILES
+            } else { &[] };
+            if helper.files.len() != expected.len() { return Err(Error::Executable); }
+            for ((identity, file), wanted) in helper.files.iter().zip(expected) {
+                if file.as_bytes() != wanted.as_bytes() { return Err(Error::Executable); }
+                name(format!("/helpers/{wanted}").as_bytes(), *identity)?;
+            }
             seccomp::helper(arch, &parent.seccomp, parent.seccomp_digest, &helper.program.seccomp,
                 helper.program.seccomp_digest, &helper.self_only, helper.egress).map_err(|_| Error::Seccomp)?;
         }
@@ -146,7 +167,10 @@ impl LauncherPlan {
             }
             let arch = Architecture::native().map_err(|_| Error::Seccomp)?;
             seccomp::runtime(arch, &program.seccomp, program.seccomp_digest).map_err(|_| Error::Seccomp)?;
-            if helper.self_only.len() > 2 { return Err(Error::Seccomp); }
+            if helper.self_only.len() > MAX_SELF_ONLY
+                || (helper.self_only.contains(&SelfOnlyCall::NestedSandbox) && helper.slot != HelperSlot::Recording) {
+                return Err(Error::Seccomp);
+            }
         }
         Ok(())
     }
@@ -215,6 +239,9 @@ struct Inputs {
 /// `cgroups` order is `helper_policy::HELPER_CGROUP_FDS`.
 struct LauncherInputs {
     control: OwnedFd, registry: mounts::DetachedMount, helpers: Vec<(OwnedFd, Option<OwnedFd>)>,
+    /// Finding 5: `(flat name, fd)` of the bindings' further signed files;
+    /// bound under `/helpers` and closed again before the launcher forks.
+    files: Vec<(CString, OwnedFd)>,
     cgroups: [OwnedFd; crate::helper_policy::HELPER_CGROUP_FDS],
 }
 /// Root-opened `rt-runtime` files: the runtime child moves itself with `procs`
@@ -246,6 +273,7 @@ fn take_launcher(plan: &LauncherPlan, fds: &mut impl Iterator<Item = OwnedFd>, m
     }
     let registry = registry.ok_or(Error::Descriptors)?;
     let mut helpers = Vec::new();
+    let mut files = Vec::new();
     for helper in &plan.helpers {
         let registry = plan.mounts.get(usize::from(helper.mount)).ok_or(Error::Descriptors)?.mount;
         let exec = fds.next().ok_or(Error::Descriptors)?;
@@ -256,6 +284,12 @@ fn take_launcher(plan: &LauncherPlan, fds: &mut impl Iterator<Item = OwnedFd>, m
             Some(script)
         } else { None };
         helpers.push((exec, script));
+        // Finding 5: the binding's signed browser files (root-verified on the registry).
+        for (identity, name) in &helper.files {
+            let file = fds.next().ok_or(Error::Descriptors)?;
+            validation::validate(fd::observe(file.as_raw_fd())?, Expected::Script { identity: *identity, registry_mount: registry })?;
+            files.push((name.clone(), file));
+        }
     }
     let mut cgroup = || -> Result<OwnedFd> {
         let fd = fds.next().ok_or(Error::Descriptors)?; verify_cgroup_file(fd.as_raw_fd())?; Ok(fd)
@@ -263,7 +297,7 @@ fn take_launcher(plan: &LauncherPlan, fds: &mut impl Iterator<Item = OwnedFd>, m
     let cgroups = [cgroup()?, cgroup()?, cgroup()?, cgroup()?];
     let identities: Vec<_> = cgroups.iter().map(|fd| fd::observe(fd.as_raw_fd()).map(|o| o.identity)).collect::<Result<_>>()?;
     if identities.iter().enumerate().any(|(i, a)| identities[..i].contains(a)) { return Err(Error::Descriptors); }
-    Ok(LauncherInputs { control, registry, helpers, cgroups })
+    Ok(LauncherInputs { control, registry, helpers, files, cgroups })
 }
 
 fn take_inputs(plan: &TrustedRun, descriptors: Vec<OwnedFd>) -> Result<Inputs> {
@@ -384,10 +418,11 @@ fn launch(plan: TrustedRun, fds: Vec<OwnedFd>, ready: probe::Readiness, mut mach
     // HX: `/helpers`, `/helper-tmp` and the `/runtime` masks (mounts::HelperView).
     let launcher = match (launcher, &plan.launcher) {
         (Some(inputs), Some(launcher_plan)) => {
-            let LauncherInputs { control, registry, helpers, cgroups } = inputs;
+            let LauncherInputs { control, registry, helpers, files: extra, cgroups } = inputs;
             let mut files = Vec::new();
             for (helper, (helper_exec, helper_script)) in launcher_plan.helpers.iter().zip(&helpers) {
-                let name = crate::helper_policy::helper_file_name(helper.program.argv[0].as_bytes()).ok_or(Error::Executable)?;
+                let name = crate::helper_policy::helper_file_name(helper.program.argv.first().ok_or(Error::Executable)?.as_bytes())
+                    .ok_or(Error::Executable)?;
                 files.push((CString::new(name).map_err(|_| Error::Executable)?, helper_exec.as_raw_fd()));
                 match (&helper.program.script, helper_script) {
                     (Some((_, path)), Some(fd)) => files.push((path.clone(), fd.as_raw_fd())),
@@ -395,11 +430,14 @@ fn launch(plan: TrustedRun, fds: Vec<OwnedFd>, ready: probe::Readiness, mut mach
                     _ => return Err(Error::Executable),
                 }
             }
+            files.extend(extra.iter().map(|(name, fd)| (name.clone(), fd.as_raw_fd())));
             let mut keep = vec![exec.as_raw_fd()];
             keep.extend(script.as_ref().map(AsRawFd::as_raw_fd));
             keep.extend(forwarder.as_ref().map(|(_, forward_exec)| forward_exec.as_raw_fd()));
             let readback = root.attach_helpers(mounts::HelperView { registry, files, keep,
                 tmpfs_bytes: launcher_plan.tmpfs_bytes }, &plan.root).map_err(|_| Error::Mount)?;
+            // The binds are made; the launcher re-verifies them by path at every start.
+            drop(extra);
             let [procs, kill, foreground, recording] = cgroups;
             Some((super::launcher::Prepared { control, helpers, slots: [foreground, recording], binds: readback.binds },
                 RuntimeCgroup { procs, kill }))
@@ -938,6 +976,9 @@ pub(super) fn write_status(fd: RawFd, bytes: [u8;12]) {
 pub(super) fn exit_now(code: i32) -> ! { unsafe { libc::_exit(code) } }
 
 #[cfg(test)]
+#[path = "runner_hx6fix_tests.rs"]
+mod hx6fix_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -1007,7 +1048,7 @@ mod tests {
         let helper = |argv: &[&str], script: Option<&str>| HelperProgram { program: program(argv, &helper_calls, script),
             self_only: vec![], mount: 0, slot: crate::helper_policy::HelperSlot::Foreground,
             filesystem: vec![crate::helper_policy::HelperFs::SystemRo, crate::helper_policy::HelperFs::Work],
-            open_files: 64, file_size_bytes: 1 << 20, timeout_ms: 30_000, egress: false };
+            open_files: 64, file_size_bytes: 1 << 20, timeout_ms: 30_000, egress: false, files: vec![] };
         let plan = |helpers: Vec<HelperProgram>| LauncherPlan { helpers, mounts: vec![MountIdentity { mount: 9, fs_type: 1 }],
             tmpfs_bytes: 1 << 20, drain_ms: 10_000 };
         assert!(plan(vec![helper(&["/helpers/program"], None)]).validate(&parent).is_ok());

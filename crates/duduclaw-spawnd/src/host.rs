@@ -115,6 +115,9 @@ use monitor::ScanState;
 #[path = "host_helpers.rs"]
 mod helpers;
 use helpers::emit_helper;
+/// HX6 security fix round (finding 4): the per-host recording probe.
+#[path = "host_probe.rs"]
+mod probe;
 fn proc_cgroup(path: &std::path::Path) -> Result<String> {
     let relative = path.strip_prefix("/sys/fs/cgroup").map_err(|_| unavailable())?;
     let text = relative.to_str().ok_or_else(unavailable)?;
@@ -181,6 +184,9 @@ struct Core {
     view: Arc<Mutex<PublishedView>>,
     /// HX4 events of engines already shut down (run cleanup).
     helper_events: Vec<HelperEvent>,
+    /// HX6 finding 4: this host's recording probe and the runs it was tried in.
+    recording_probe: probe::RecordingProbe,
+    probe_tried: BTreeSet<RunId>,
 }
 impl LinuxHost {
     pub fn open(gateway: (u32, u32), components: Components, audit: AuditWorker) -> io::Result<Self> {
@@ -197,7 +203,7 @@ impl LinuxHost {
         let mut core = Core { allocator: crate::allocation::Allocator::open()?, registry, systemd: Systemd::connect()?, journal: RunJournal::open()?,
             components, policy: None, report: EvidenceReport::current(Readiness::default(), 0)?, gateway,
             monitor, runs: BTreeMap::new(), audit, last_refresh: Instant::now(), poisoned: false, view: view.clone(),
-            helper_events: Vec::new() };
+            helper_events: Vec::new(), recording_probe: probe::RecordingProbe::default(), probe_tried: BTreeSet::new() };
         core.report.publish(gateway.1)?;
         // Cleanup is attempted even when C/H/F/G are absent. Failure is evidence,
         // never permission to skip an orphan or reinterpret a stale reservation.
@@ -284,8 +290,13 @@ impl Core {
             Ok(mut report) => {
                 report.checked_boottime_ms = probe_started;
                 report.landlock = landlock;
+                // HX6 finding 4: this host's probe, bound to this boot and ABI.
+                report.recording_probe = self.recording_probe.evidence();
                 // [F17, H4] the same set every `Reserved` carries (LinuxHost::features).
-                report.features = self.features();
+                let features = self.features().without(Features::HELPER_RECORDING);
+                report.features = if features.contains(Features::HELPER_CALLS) && report.recording_probe_passed() {
+                    features.with(Features::HELPER_RECORDING)
+                } else { features };
                 self.report = report;
                 if self.report.publish(self.gateway.1).is_err() { self.poisoned = true; self.report.checks.startup_reconciled = false; }
             },
@@ -481,12 +492,12 @@ impl Host for Core {
         let features = features.with(Features::HELPER_CALLS);
         if self.recording_ready() { features.with(Features::HELPER_RECORDING) } else { features }
     }
-    /// HX6 gate: `helper_recording` is advertised only after a root probe
-    /// launched Chromium under F_L ∩ F_H and the nested recording Landlock on
-    /// this host. No in-process probe exists yet (the H15 root test
-    /// `iso_root_helper_chromium_launches_under_helper_sandbox` is the proof),
-    /// so this host fails closed: recording reads `helper_recording_unsupported`.
-    fn recording_ready(&mut self) -> bool { crate::host_state::RECORDING_PROBE_PASSED }
+    /// HX6 gate (security fix round, finding 4): `helper_recording` only after
+    /// THIS host's probe (`host_probe.rs`) launched the signed recording helper
+    /// through a run's real launcher (F_L ∩ F_H, nested browser sandbox) and
+    /// Chromium rendered and exited cleanly, for this boot and Landlock ABI,
+    /// AND the build kill switch is open. Otherwise `helper_recording_unsupported`.
+    fn recording_ready(&mut self) -> bool { self.report.recording_probe_passed() }
     fn helper_run(&mut self, job: HelperStart<Vec<OwnedFd>>) -> Result<HelperStarted<Vec<OwnedFd>>> { self.run_helper(job) }
     fn helper_signal(&mut self, run: RunHandle, call: HelperCallId, signal: HelperSignal) -> Result<()> {
         self.signal_helper(run, call, signal)
@@ -591,10 +602,14 @@ impl Host for Core {
             if !table.is_empty() {
                 let anchors = self.runs.get(&run.0).and_then(|entry| entry.projection.as_ref()).ok_or_else(unavailable)?;
                 let executables: Vec<_> = table.iter().map(|entry| &entry.runtime.executable).collect();
-                let prepared = os(crate::bootstrap_mounts::prepare_helpers(anchors, &executables))?;
-                let helpers = table.iter().zip(prepared.executables).map(|(entry, (executable, script))|
+                // HX6 security fix round (finding 5): the recording's signed browser files.
+                let files: Vec<_> = table.iter().map(|entry|
+                    crate::helper_policy::recording_files(&entry.runtime).unwrap_or_default()).collect();
+                let prepared = os(crate::bootstrap_mounts::prepare_helpers(anchors, &executables, &files))?;
+                let helpers = table.iter().zip(prepared.executables).zip(prepared.files)
+                    .map(|((entry, (executable, script)), files)|
                     crate::native_trampoline::HelperRun { index: entry.index, binding: entry.binding.clone(),
-                        runtime: entry.runtime.clone(), executable, script }).collect();
+                        runtime: entry.runtime.clone(), executable, script, files }).collect();
                 native_profile.launcher = Some(crate::native_trampoline::LauncherProfile { helpers, mount: prepared.mount,
                     tmpfs_bytes: policy.helper_tmpfs_bytes(&runtime).ok_or_else(unavailable)?,
                     drain_ms: crate::native_trampoline::launcher_drain_ms(runtime.timeouts.termination_grace_ms) });
@@ -715,6 +730,11 @@ impl Host for LinuxHost {
         if self.features().contains(Features::HELPER_CALLS) { return Ok(()); }
         Err(if crate::helper_cgroup::linux::open_time_credentials_observed() == Some(false) { ErrorCode::HelperCgroupUnavailable }
             else { ErrorCode::HelperUnavailable })
+    }
+    /// HX6 finding 4: the coordinator's recording gate reads the published
+    /// report: the bit AND this host's matching probe AND the kill switch.
+    fn recording_ready(&mut self) -> bool {
+        self.view.try_lock().map(|view| view.report.helper_recording()).unwrap_or(false)
     }
     fn helper_start(&mut self, t: Ticket, job: HelperStart<Vec<OwnedFd>>) -> Result<()> { self.worker.helper_start(t, job) }
     fn helper_poll(&mut self, t: Ticket) -> Result<Option<HelperStarted<Vec<OwnedFd>>>> { self.worker.helper_poll(t) }

@@ -25,5 +25,10 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 [dev-dependencies]
 tempfile = "3"
 
+# HX6 security fix round (finding 5): the recording root tests stack the real
+# launcher / helper Landlock and F_L ∩ F_H (duduclaw-run) under the browser layer.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+duduclaw-run = { path = "../duduclaw-run" }
+
 [lints]
 workspace = true

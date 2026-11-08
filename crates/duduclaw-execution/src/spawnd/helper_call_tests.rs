@@ -177,6 +177,8 @@ async fn hx5_helper_client_typed_refusals_keep_control() {
         (ErrorCode::RunTimeExhausted, HelperError::RunTimeExhausted),
         (ErrorCode::HelperUnavailable, HelperError::Unavailable),
         (ErrorCode::HelperCgroupUnavailable, HelperError::CgroupUnavailable),
+        // HX6 security fix round (finding 4): spawnd's own recording gate.
+        (ErrorCode::HelperRecordingUnsupported, HelperError::RecordingUnsupported),
         (ErrorCode::NotReady, HelperError::NotLive), (ErrorCode::Unauthorized, HelperError::Denied)] {
         let (backend, entry, peer) = fixture(SpawndFeatures::HELPER_CALLS);
         let worker = root(peer, vec![Box::new(move |_, _| (SpawnResponse::Error { code }, vec![]))]);

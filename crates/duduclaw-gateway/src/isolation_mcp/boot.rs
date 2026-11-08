@@ -716,6 +716,7 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
             resolver.clone(), Some(owner.worker.parser.clone()), input.roots.clone())?
             .with_execution_jobs(owner.execution_jobs.clone())
             .with_recording_jobs(owner.recording_jobs.clone())
+            .with_recording_audit(Arc::new(recording::GatewayRecordingAudit::new(owner.home.clone())))
             .with_forks(owner.fork_tools.clone())
             .with_worker(owner.worker.tools(worker_plans, resolver.clone()));
         let dispatcher_input = DispatcherInput {
@@ -785,26 +786,11 @@ mod tests {
     }
 }
 
-/// Dashboard control of an in-run recording (HX6, D8 revision §4). Live run:
-/// `HelperStop` for exactly that `(run, call)` through spawnd; ended: the
-/// stored result. It never issues `HelperCall`, never mints an employee
-/// context and never stops the run. Called on a blocking thread.
-pub(crate) fn control_recording(home: &Path, ctx: &duduclaw_auth::UserContext, id: &str, stop: bool)
-    -> Result<serde_json::Value, VerificationError> {
-    crate::approval::require_current_dashboard_role_in_home(home, ctx, duduclaw_auth::UserRole::Admin)
-        .map_err(|_| VerificationError::Invalid)?;
-    duduclaw_mcp_boundary::recording_jobs::parse_id(id)?;
-    let owner = OWNER.get().filter(|owner| owner.home == home).ok_or(VerificationError::Unavailable)?;
-    let runtime = tokio::runtime::Handle::try_current().map_err(|_| VerificationError::Unavailable)?;
-    let result = runtime.block_on(duduclaw_mcp_boundary::execution::control_recording(
-        owner.recording_jobs.clone(), owner.backend.clone(), id, stop))?;
-    if stop {
-        duduclaw_security::audit::append_audit_event(home, &duduclaw_security::audit::AuditEvent::new(
-            "isolation_recording_stop_requested", "gateway", duduclaw_security::audit::Severity::Info,
-            serde_json::json!({"actor":ctx.user_id,"job":id,"status":result["status"]})));
-    }
-    Ok(result)
-}
+/// HX6 Admin recording control and the recording audit sink (security fix
+/// round, finding 6); split out to keep this file below 800 lines.
+#[path = "boot_recording.rs"]
+mod recording;
+pub(crate) use recording::control_recording;
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]

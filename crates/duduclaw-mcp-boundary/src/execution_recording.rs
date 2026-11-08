@@ -23,6 +23,7 @@ use duduclaw_isolation::{execution::{ExecutionBackend, HelperError, HelperStart,
     ipc::{HelperOutcome, HelperSlot, SpawndFeatures}};
 use serde_json::{Value, json};
 use crate::{RequestContext, VerificationError, tool_policy,
+    recording_audit::{RecordingAudit, RecordingAuditEvent, RecordingAuditKind},
     recording_jobs::{parse_id, RecordingJobs, RecordingKey, RecordingRow, StopBy}};
 use super::{ExecutionPlanFactory, ExecutionToolBridge, in_run, read_result, refused, result_envelope, uncertain};
 
@@ -89,20 +90,31 @@ impl ExecutionToolBridge {
                 // No recording binding in this run's signed table: by
                 // publication check 4 its parent is not an Egress profile.
                 Err(HelperError::Absent) => return in_run::typed("helper_parent_offline"),
+                // spawnd's own gate (finding 4): this host's recording probe has not passed.
+                Err(HelperError::RecordingUnsupported) => return in_run::typed("helper_recording_unsupported"),
                 Err(error) => return in_run::helper_refusal(error),
             };
         let key = RecordingKey { run, call: id };
         // Armed until the collector owns the call: a dropped request (MCP
         // cancel, connection close) must not leave an unowned recording.
-        let mut guard = StartGuard { backend: self.backend.clone(), store: store.clone(), key: Some(key) };
+        let mut guard = StartGuard { backend: self.backend.clone(), store: store.clone(), key: Some(key),
+            insert: Insert::Done(false) };
         let (insert_store, owner) = (store.clone(), checked.context().clone());
-        if crate::authority::verify_blocking(move || insert_store.insert(&owner, key)).await.is_err() {
+        // HX6 security fix round (finding 8): the insert runs in its own task
+        // whose handle the guard holds, so an abandon (request dropped while
+        // the insert is in flight) finishes the row only after the insert's
+        // transaction ended, never before it (which left a `recording` row).
+        guard.insert = Insert::Pending(tokio::spawn(crate::authority::verify_blocking(move || insert_store.insert(&owner, key))));
+        if !guard.inserted().await {
             guard.abandon();
             return refused();
         }
         guard.key = None;
+        let employee = context.record().employee;
+        self.audit(RecordingAuditEvent::new(RecordingAuditKind::Started, employee, run, id)
+            .with("effective_timeout_ms", json!(effective_timeout_ms)));
         let collector = Collector { backend: self.backend.clone(), factory: self.factory.clone(), store, key,
-            context: checked.context().clone(),
+            context: checked.context().clone(), audit: self.recording_audit.clone(),
             bound: Duration::from_millis(effective_timeout_ms).saturating_add(COLLECT_SLACK) };
         tokio::spawn(collector.run(stdout, stderr, limit));
         result_envelope(json!({"status":"recording", "id":key.id(), "effective_timeout_ms":effective_timeout_ms}))
@@ -133,12 +145,17 @@ impl ExecutionToolBridge {
         if context.transport_run() != Some(context.record().run) { return refused(); }
         let (writer, owner, key) = (store.clone(), context.clone(), row.key);
         if crate::authority::verify_blocking(move || writer.request_stop(&owner, key)).await.is_err() { return refused(); }
-        match tokio::time::timeout(CONTROL_TIMEOUT, self.backend.stop_helper(key.run, key.call)).await {
-            // NotLive: the run ended meanwhile; the collector stores its flush.
-            Ok(Ok(())) | Ok(Err(HelperError::NotLive)) => {}
-            _ => return uncertain(),
-        }
+        let sent = tokio::time::timeout(CONTROL_TIMEOUT, self.backend.stop_helper(key.run, key.call)).await;
+        // NotLive: the run ended meanwhile; the collector stores its flush.
+        let outcome = match sent { Ok(Ok(())) => "sent", Ok(Err(HelperError::NotLive)) => "run_ended", _ => "uncertain" };
+        self.audit(RecordingAuditEvent::new(RecordingAuditKind::StopRequested, context.record().employee, key.run, key.call)
+            .with("stop_by", json!("stop")).with("outcome", json!(outcome)));
+        if outcome == "uncertain" { return uncertain(); }
         match await_terminal(store, row).await { Some(row) => result_envelope(row.view()), None => uncertain() }
+    }
+
+    fn audit(&self, event: RecordingAuditEvent) {
+        if let Some(audit) = &self.recording_audit { audit.record(event); }
     }
 }
 
@@ -172,18 +189,38 @@ async fn await_terminal(store: Arc<dyn RecordingJobs>, mut row: RecordingRow) ->
     Some(row)
 }
 
+/// The row insert of a started call: not attempted / ended (`Done(committed)`)
+/// or still in flight (its task handle).
+enum Insert { Done(bool), Pending(tokio::task::JoinHandle<Result<(), VerificationError>>) }
+
 /// Before the collector owns a started call: on drop (or `abandon`) cancel the
 /// slot and publish uncertainty (if the row exists). Never touches the run.
-struct StartGuard { backend: Arc<dyn ExecutionBackend>, store: Arc<dyn RecordingJobs>, key: Option<RecordingKey> }
+struct StartGuard { backend: Arc<dyn ExecutionBackend>, store: Arc<dyn RecordingJobs>, key: Option<RecordingKey>, insert: Insert }
 impl StartGuard {
+    /// Await the in-flight insert; the guard keeps the handle while waiting,
+    /// so dropping this future hands it to `abandon`.
+    async fn inserted(&mut self) -> bool {
+        let committed = match &mut self.insert {
+            Insert::Done(committed) => return *committed,
+            Insert::Pending(task) => matches!(task.await, Ok(Ok(()))),
+        };
+        self.insert = Insert::Done(committed);
+        committed
+    }
     fn abandon(&mut self) {
         let Some(key) = self.key.take() else { return };
+        let insert = std::mem::replace(&mut self.insert, Insert::Done(false));
         let (backend, store) = (self.backend.clone(), self.store.clone());
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let _ = tokio::time::timeout(CONTROL_TIMEOUT, backend.cancel_helper(key.run, key.call)).await;
-                let _ = crate::authority::verify_blocking(move ||
-                    store.finish(key, json!({"status":"uncertain","reason":"start_abandoned"}))).await;
+                // Finding 8: `finish` only after the insert committed (no row ⇒ nothing to finish).
+                let committed = match insert { Insert::Done(committed) => committed,
+                    Insert::Pending(task) => matches!(task.await, Ok(Ok(()))) };
+                if committed {
+                    let _ = crate::authority::verify_blocking(move ||
+                        store.finish(key, json!({"status":"uncertain","reason":"start_abandoned"}))).await;
+                }
             });
         }
     }
@@ -197,6 +234,7 @@ struct Collector {
     key: RecordingKey,
     /// The start request's verified context: its live check is the revocation signal.
     context: RequestContext,
+    audit: Option<Arc<dyn RecordingAudit>>,
     bound: Duration,
 }
 
@@ -230,22 +268,34 @@ impl Collector {
             Some(ended) => self.result(ended).await,
             None => {
                 // A broken transport or a stuck root: kill only the slot.
-                let _ = tokio::time::timeout(CONTROL_TIMEOUT, self.backend.cancel_helper(key.run, key.call)).await;
+                let cancelled = matches!(tokio::time::timeout(CONTROL_TIMEOUT, self.backend.cancel_helper(key.run, key.call)).await, Ok(Ok(())));
+                self.audit(RecordingAuditKind::CollectorTimeout, |event| event.with("slot_cancelled", json!(cancelled)));
                 json!({"status":"uncertain", "reason":"collector_timeout"})
             }
         };
+        if result["status"] == "invalid_result" { self.audit(RecordingAuditKind::InvalidResult, |event| event); }
         let store = self.store.clone();
         let _ = crate::authority::verify_blocking(move || store.finish(key, result)).await;
+    }
+
+    /// Finding 6: content-free audit of this call (employee, run, call, codes).
+    fn audit(&self, kind: RecordingAuditKind, extra: impl FnOnce(RecordingAuditEvent) -> RecordingAuditEvent) {
+        let Some(audit) = &self.audit else { return };
+        audit.record(extra(RecordingAuditEvent::new(kind, self.context.record().employee, self.key.run, self.key.call)));
     }
 
     /// [F16] Live authority failed. A run that already ended answers
     /// `NotLive`: that is run end, not revocation (the outcome says so).
     async fn revoke(&self) {
         let key = self.key;
-        if let Ok(Ok(())) = tokio::time::timeout(CONTROL_TIMEOUT, self.backend.stop_helper(key.run, key.call)).await {
+        let sent = tokio::time::timeout(CONTROL_TIMEOUT, self.backend.stop_helper(key.run, key.call)).await;
+        let accepted = matches!(sent, Ok(Ok(())));
+        if accepted {
             let store = self.store.clone();
             let _ = crate::authority::verify_blocking(move || store.mark_stop(key, StopBy::Revoked)).await;
         }
+        let outcome = match sent { Ok(Ok(())) => "sent", Ok(Err(HelperError::NotLive)) => "run_ended", _ => "uncertain" };
+        self.audit(RecordingAuditKind::RevokedStop, |event| event.with("stop_by", json!("revoked")).with("outcome", json!(outcome)));
     }
 
     async fn result(&self, (output, outcome): Ended) -> Value {
@@ -265,6 +315,9 @@ impl Collector {
                 // EX_CONFIG: the helper could not install the browser's nested
                 // sandbox on this host (Landlock); it never starts Chromium unconfined.
                 HelperOutcome::Exited(78) => json!({"status":"uncertain", "reason":"helper_recording_unsupported"}),
+                // EX_TEMPFAIL (finding 2): a browser process outlived the kill
+                // (not every descendant reaped); nothing was published.
+                HelperOutcome::Exited(75) => json!({"status":"uncertain", "reason":"browser_tree_survived"}),
                 HelperOutcome::Exited(code) => json!({"status":"uncertain", "reason":"helper_failed", "exit_code":code}),
                 HelperOutcome::TimedOut => json!({"status":"uncertain", "reason":"helper_timed_out"}),
                 HelperOutcome::OomKilled => json!({"status":"uncertain", "reason":"helper_oom_killed"}),

@@ -45,6 +45,14 @@ impl GatewayFactories {
         self
     }
 
+    /// HX6 security fix round (finding 6): the gateway's recording audit sink.
+    pub fn with_recording_audit(mut self, audit: Arc<dyn crate::recording_audit::RecordingAudit>) -> Self {
+        if let Some(bridge) = self.execution.take() {
+            self.execution = Some(Arc::new(bridge.with_recording_audit(audit)));
+        }
+        self
+    }
+
     #[cfg(feature = "binding-store")]
     pub fn with_forks(mut self, forks: Arc<dyn crate::forks::ForkToolService>) -> Self {
         self.forks = Some(forks); self

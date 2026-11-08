@@ -137,10 +137,20 @@ pub fn prepare(plan: &BootstrapPlan, storage: &AttachedStorage, anchors: &RootPu
 /// launcher gets ONE separate read-only, nosuid, nodev, nosymfollow clone of it
 /// (deduplicated by registry mount, check 5) plus per-helper verified executables.
 /// HX3b attaches this clone at `/helpers`, outside the runtime's Landlock list.
-pub struct PreparedHelpers { pub mount: OwnedFd, pub executables: Vec<(VerifiedExecutable, Option<VerifiedExecutable>)> }
-pub fn prepare_helpers(anchors: &RootPublicationAnchors, helpers: &[&crate::policy::Executable]) -> io::Result<PreparedHelpers> {
+/// `files`: per helper, the further signed files (HX6 security fix round,
+/// finding 5: the recording's node / Playwright bundle / Chromium), verified
+/// on the same registry clone by sha256 like the executables.
+pub struct PreparedHelpers {
+    pub mount: OwnedFd,
+    pub executables: Vec<(VerifiedExecutable, Option<VerifiedExecutable>)>,
+    pub files: Vec<Vec<(&'static str, VerifiedExecutable)>>,
+}
+pub fn prepare_helpers(anchors: &RootPublicationAnchors, helpers: &[&crate::policy::Executable],
+    files: &[Vec<(&'static str, Sha256Digest)>]) -> io::Result<PreparedHelpers> {
     if unsafe { libc::geteuid() } != 0 { return Err(io::ErrorKind::PermissionDenied.into()); }
-    if helpers.is_empty() || helpers.len() > crate::helper_policy::MAX_HELPER_BINDINGS { return Err(invalid()); }
+    if helpers.is_empty() || helpers.len() > crate::helper_policy::MAX_HELPER_BINDINGS || files.len() != helpers.len() {
+        return Err(invalid());
+    }
     let anchor = trusted_directory(&anchors.runtime)?;
     let mount = detached_clone(anchor.as_fd(), MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOSYMFOLLOW)?;
     // Same per-file bound as the runtime; a helper table hashes at most 32 files.
@@ -155,7 +165,14 @@ pub fn prepare_helpers(anchors: &RootPublicationAnchors, helpers: &[&crate::poli
                     Some(open_verified(mount.as_fd(), script.as_str(), *script_digest, false, deadline)?)),
         });
     }
-    Ok(PreparedHelpers { mount, executables })
+    let mut verified = Vec::with_capacity(files.len());
+    for list in files {
+        let mut opened = Vec::with_capacity(list.len());
+        // node and Chromium are ELF executables; the Playwright bundle is a script.
+        for (name, digest) in list { opened.push((*name, open_verified(mount.as_fd(), name, *digest, *name != "playwright.cjs", deadline)?)); }
+        verified.push(opened);
+    }
+    Ok(PreparedHelpers { mount, executables, files: verified })
 }
 
 /// Resolve only a reviewed workspace selector under the just-attached H work

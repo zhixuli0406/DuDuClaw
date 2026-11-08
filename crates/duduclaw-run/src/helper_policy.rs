@@ -60,14 +60,33 @@ pub enum SelfOnlyCall {
     Prlimit64SelfOnly,
     /// `prctl(option, …)` with each option in [`PRCTL_SELF_ONLY`]; `PR_SET_DUMPABLE` with arg 0 only.
     Prctl { options: Vec<u32> },
+    /// HX6 security fix round (findings 1, 2): the recording helper's nested
+    /// browser sandbox. `landlock_create_ruleset`/`landlock_add_rule`/
+    /// `landlock_restrict_self` (they only restrict the caller) and
+    /// `seccomp(SECCOMP_SET_MODE_FILTER, 0, …)` (stacking a further filter;
+    /// no TSYNC, listener or other operation). Recording bindings only
+    /// (publication check); the same calls F_L holds as L_restrict.
+    NestedSandbox,
 }
 pub const PR_SET_PDEATHSIG: u32 = 1;
 pub const PR_SET_DUMPABLE: u32 = 4;
+/// HX6 security fix round (finding 2): the caller adopts its own orphaned
+/// descendants (so it can reap them); affects no process outside its subtree.
+pub const PR_SET_CHILD_SUBREAPER: u32 = 36;
 pub const PR_SET_NO_NEW_PRIVS: u32 = 38;
-/// Set options that only restrict the caller, plus read-only `PR_GET_*` queries
-/// (PDEATHSIG, DUMPABLE, KEEPCAPS, NAME, SECCOMP, SECUREBITS, TIMERSLACK, NO_NEW_PRIVS, THP_DISABLE).
-pub const PRCTL_SELF_ONLY: [u32; 12] = [PR_SET_PDEATHSIG, 2, 3, PR_SET_DUMPABLE, 7, 16, 21, 27, 30,
-    PR_SET_NO_NEW_PRIVS, 39, 42];
+/// Set options that only restrict the caller or supervise its own children,
+/// plus read-only `PR_GET_*` queries (PDEATHSIG, DUMPABLE, KEEPCAPS, NAME,
+/// SECCOMP, SECUREBITS, TIMERSLACK, CHILD_SUBREAPER, NO_NEW_PRIVS, THP_DISABLE).
+pub const PRCTL_SELF_ONLY: [u32; 14] = [PR_SET_PDEATHSIG, 2, 3, PR_SET_DUMPABLE, 7, 16, 21, 27, 30,
+    PR_SET_CHILD_SUBREAPER, 37, PR_SET_NO_NEW_PRIVS, 39, 42];
+/// `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self`
+/// (the same numbers on x86_64 and asm-generic).
+pub const LANDLOCK_CALLS: [u32; 3] = [444, 445, 446];
+/// HX6 security fix round (finding 5): the signed browser files of the
+/// recording binding, flat names under `/helpers` (fixed-argv digest order of
+/// `duduclaw-browser-record-v1`). The launcher binds and grants them (RX) to
+/// the recording helper only.
+pub const RECORDING_BROWSER_FILES: [&str; 3] = ["node", "playwright.cjs", "chromium"];
 pub fn prlimit64(arch: Architecture) -> u32 { match arch { Architecture::X86_64 => 302, Architecture::Aarch64 => 261 } }
 pub fn prctl(arch: Architecture) -> u32 { match arch { Architecture::X86_64 => 157, Architecture::Aarch64 => 167 } }
 
@@ -130,23 +149,33 @@ pub fn first_refused_helper_call(arch: Architecture, helper: &RuntimeProfile, eg
 /// self-only exception is well formed and not also granted unconstrained.
 pub fn seccomp_within_parent(arch: Architecture, parent: &RuntimeProfile, helper: &RuntimeProfile,
     self_only: &[SelfOnlyCall]) -> bool {
-    if !helper.allowed_syscalls.iter().all(|nr| parent.allowed_syscalls.contains(nr)) || self_only.len() > 2 { return false; }
+    if !helper.allowed_syscalls.iter().all(|nr| parent.allowed_syscalls.contains(nr)) || self_only.len() > MAX_SELF_ONLY { return false; }
     let mut seen = Vec::new();
     for call in self_only {
-        let nr = match call {
-            SelfOnlyCall::Prlimit64SelfOnly => prlimit64(arch),
+        let calls = match call {
+            SelfOnlyCall::Prlimit64SelfOnly => vec![prlimit64(arch)],
             SelfOnlyCall::Prctl { options } => {
                 let mut sorted = options.clone();
                 sorted.sort_unstable();
                 if options.is_empty() || sorted.windows(2).any(|pair| pair[0] == pair[1])
                     || !options.iter().all(|option| PRCTL_SELF_ONLY.contains(option)) { return false; }
-                prctl(arch)
+                vec![prctl(arch)]
             }
+            SelfOnlyCall::NestedSandbox => nested_sandbox_calls(arch).to_vec(),
         };
-        if seen.contains(&nr) || helper.allowed_syscalls.contains(&nr) { return false; }
-        seen.push(nr);
+        for nr in calls {
+            if seen.contains(&nr) || helper.allowed_syscalls.contains(&nr) { return false; }
+            seen.push(nr);
+        }
     }
     true
+}
+/// At most one of each [`SelfOnlyCall`] kind.
+pub const MAX_SELF_ONLY: usize = 3;
+/// The syscalls [`SelfOnlyCall::NestedSandbox`] names: Landlock and `seccomp`.
+pub fn nested_sandbox_calls(arch: Architecture) -> [u32; 4] {
+    let [create, add, restrict] = LANDLOCK_CALLS;
+    [create, add, restrict, match arch { Architecture::X86_64 => 317, Architecture::Aarch64 => 277 }]
 }
 
 fn components(path: &str) -> Option<Vec<&str>> {

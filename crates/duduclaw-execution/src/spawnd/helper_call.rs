@@ -44,6 +44,8 @@ pub(super) fn refusal(code: ErrorCode) -> HelperError {
         // HX6: no such helper in the run's signed table (for the recording:
         // an offline parent, whose launcher carries no egress binding).
         ErrorCode::RuntimeDenied => HelperError::Absent,
+        // HX6 security fix round (finding 4): spawnd's own recording gate.
+        ErrorCode::HelperRecordingUnsupported => HelperError::RecordingUnsupported,
         _ => HelperError::Unavailable,
     }
 }

@@ -150,8 +150,10 @@ pub trait Host {
         if self.recording_ready() { features.with(SpawndFeatures::HELPER_RECORDING) } else { features }
     }
     /// HX6 gate (D8 revision §4): Chromium was proven to launch under the
-    /// helper sandbox on this host. Default `false`: the recording stays
-    /// refused (`helper_recording_unsupported`) until a root probe says so.
+    /// helper sandbox on this host (security fix round, finding 4: this
+    /// host's own probe AND the build kill switch). Default `false`: the
+    /// recording bit is not advertised and `helper_call` refuses every
+    /// recording-slot call (`helper_recording_unsupported`).
     fn recording_ready(&mut self) -> bool { false }
     /// HX4 synchronous start, on an adapter's lifecycle thread only: re-derive
     /// the helper from the run's own employee, revalidate the memfd, write the

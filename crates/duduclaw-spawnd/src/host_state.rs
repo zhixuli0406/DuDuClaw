@@ -79,12 +79,24 @@ pub use duduclaw_isolation::ipc::SpawndFeatures;
 /// What this binary always decodes; `Core::refresh` adds `helper_calls` when
 /// helpers can run on this host (launcher plans active, slot cgroups usable).
 pub const DECODED_FEATURES: SpawndFeatures = SpawndFeatures::WORK_BROKER;
-/// HX6 gate (D8 revision §4): whether this binary has proven that Chromium
-/// launches under F_L ∩ F_H and the recording's nested Landlock on this host.
-/// There is no in-process probe yet; the proof is the H15 root test
-/// `iso_root_helper_chromium_launches_under_helper_sandbox` on each host. Until
-/// a probe sets it, `helper_recording` is never advertised (fail closed).
-pub const RECORDING_PROBE_PASSED: bool = false;
+/// HX6 gate (D8 revision §4), security fix round finding 4: compile-time kill
+/// switch, ANDed with this host's recording probe ([`RecordingProbeEvidence`]).
+/// While `false` the probe never runs, `helper_recording` is never advertised
+/// and spawnd refuses every recording-slot `HelperCall`
+/// (`helper_recording_unsupported`). Flip only after the H15 acceptance of
+/// `iso_root_helper_chromium_*` on Ubuntu 22.04/24.04 and Debian 12; even then
+/// a host advertises recording only once its own probe passed.
+pub const RECORDING_BUILD_ENABLED: bool = false;
+/// Finding 4: the per-host recording probe (`host::probe`): spawnd ran the
+/// signed recording helper in the rec slot of a real run, through that run's
+/// launcher (F_L ∩ F_H, launcher + helper Landlock, slot cgroup) and the
+/// helper's nested browser sandbox, against a fixed local page; `passed` only
+/// if Chromium started, rendered and exited cleanly (exit 0, exact reply,
+/// empty stderr). Bound to the boot and the Landlock ABI it ran under: a
+/// report whose boot or ABI differs does not carry the bit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingProbeEvidence { pub boot_id: String, pub landlock_abi: u32, pub passed: bool }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceReport {
@@ -98,22 +110,38 @@ pub struct EvidenceReport {
     /// [F17, H4] feature bits; absent in reports of an older spawnd ⇒ none.
     #[serde(default)]
     pub features: SpawndFeatures,
+    /// HX6 finding 4: this host's recording probe; absent ⇒ not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_probe: Option<RecordingProbeEvidence>,
     pub checks: Readiness,
 }
 impl EvidenceReport {
     pub fn current(checks: Readiness, host_pty_budget: u32) -> io::Result<Self> {
         Ok(Self { version: 1, boot_id: fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_owned(),
             checked_boottime_ms: boottime_ms()?, valid_for_ms: 1_000, host_pty_budget, landlock: None,
-            features: DECODED_FEATURES, checks })
+            features: DECODED_FEATURES, recording_probe: None, checks })
+    }
+    /// Finding 4: a passed probe of THIS boot under THIS Landlock ABI, and the
+    /// build kill switch open. The only source of the `helper_recording` bit.
+    pub fn recording_probe_passed(&self) -> bool {
+        RECORDING_BUILD_ENABLED && self.recording_probe_matches()
+    }
+    fn recording_probe_matches(&self) -> bool {
+        match (&self.recording_probe, &self.landlock) {
+            (Some(probe), Some(landlock)) => probe.passed && probe.boot_id == self.boot_id
+                && probe.landlock_abi == landlock.selected_abi,
+            _ => false,
+        }
     }
     /// Gateway gate for every `ipc::Opcode::WORK` op (H4/H5/H16).
     pub fn work_broker(&self) -> bool { self.features.contains(SpawndFeatures::WORK_BROKER) }
     /// Gateway gate for every `ipc::Opcode::HELPER` op (HX5); without it the
     /// gateway reports `helper_launcher_unavailable{spawnd_feature_missing}`.
     pub fn helper_calls(&self) -> bool { self.features.contains(SpawndFeatures::HELPER_CALLS) }
-    /// HX6: Chromium proven to launch under the helper sandbox (recording gate).
+    /// HX6: Chromium proven to launch under the helper sandbox (recording gate):
+    /// the bit AND the matching probe evidence (finding 4) AND the kill switch.
     pub fn helper_recording(&self) -> bool {
-        self.helper_calls() && self.features.contains(SpawndFeatures::HELPER_RECORDING)
+        self.helper_calls() && self.features.contains(SpawndFeatures::HELPER_RECORDING) && self.recording_probe_passed()
     }
     pub fn check_at(&self, boot_id: &str, now: u64) -> crate::Result<()> {
         if self.version != 1 || self.boot_id != boot_id || self.valid_for_ms == 0 || self.valid_for_ms > 1_000
@@ -142,7 +170,7 @@ mod tests {
     fn evidence_rejects_stale_future_different_boot_and_missing_components() {
         let report = EvidenceReport { version: 1, boot_id: "boot".into(), checked_boottime_ms: 100,
             valid_for_ms: 1000, host_pty_budget: 100, landlock: Some(LandlockEvidence { detected_abi: 8, selected_abi: 7 }),
-            features: DECODED_FEATURES, checks: Readiness {
+            features: DECODED_FEATURES, recording_probe: None, checks: Readiness {
                 protocol: 1, registry_verified: true, accounts_locked: true, ssh_live_negative_checks: true,
                 cron_at_acl_and_jobs_verified: true, external_iam_reservation_verified: true,
                 trampoline_verified: true, landlock_self_test: true, namespace_self_test: true,
@@ -188,6 +216,37 @@ mod tests {
         assert!(serde_json::from_value::<EvidenceReport>(extra).is_err());
         assert_eq!(duduclaw_isolation::ipc::Opcode::WORK.len(), 4);
         assert_eq!(duduclaw_isolation::ipc::Opcode::HELPER.len(), 4);
+    }
+    /// HX6 security fix round (finding 4): the recording bit is the result of
+    /// THIS host's probe (this boot, this Landlock ABI) AND the build kill
+    /// switch; a report without matching evidence never carries it, and the
+    /// wire form is unchanged while no probe ran.
+    #[test]
+    fn hx6fix_recording_bit_requires_this_hosts_probe_and_the_kill_switch() {
+        let mut report = EvidenceReport::current(Readiness::default(), 1).unwrap();
+        report.landlock = Some(LandlockEvidence { detected_abi: 6, selected_abi: 6 });
+        report.features = SpawndFeatures::WORK_BROKER.with(SpawndFeatures::HELPER_CALLS).with(SpawndFeatures::HELPER_RECORDING);
+        assert!(!report.helper_recording(), "a bit without probe evidence is not advertised");
+        let value = serde_json::to_value(&report).unwrap();
+        assert!(value.get("recording_probe").is_none(), "wire form unchanged while no probe ran");
+        let passed = RecordingProbeEvidence { boot_id: report.boot_id.clone(), landlock_abi: 6, passed: true };
+        report.recording_probe = Some(passed.clone());
+        assert_eq!(report.recording_probe_passed(), RECORDING_BUILD_ENABLED);
+        assert_eq!(report.helper_recording(), RECORDING_BUILD_ENABLED);
+        assert!(!RECORDING_BUILD_ENABLED, "the production gate stays closed until H15 acceptance");
+        for evidence in [RecordingProbeEvidence { passed: false, ..passed.clone() },
+            RecordingProbeEvidence { boot_id: "other-boot".into(), ..passed.clone() },
+            RecordingProbeEvidence { landlock_abi: 4, ..passed.clone() }] {
+            report.recording_probe = Some(evidence.clone());
+            assert!(!report.recording_probe_matches(), "{evidence:?}");
+            assert!(!report.helper_recording());
+        }
+        report.recording_probe = Some(passed);
+        assert!(report.recording_probe_matches());
+        report.landlock = None;
+        assert!(!report.recording_probe_matches(), "no Landlock evidence, no recording");
+        let back: EvidenceReport = serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
+        assert_eq!(back.recording_probe, report.recording_probe);
     }
 }
 

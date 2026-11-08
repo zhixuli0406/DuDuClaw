@@ -9,7 +9,13 @@ const fs = require('node:fs');
 const dir = process.env.DUDUCLAW_RECORD_DIR || '/tmp/recording';
 const root = process.env.DUDUCLAW_RECORD_ROOT || '/runtime';
 const contained = process.env.DUDUCLAW_RECORD_CONTAINED === '1';
-const cfg = JSON.parse(fs.readFileSync(`${dir}/request.json`, 'utf8'));
+// HX6 security fix round (finding 4): spawnd's per-host probe. Same launch
+// path and flags, but a fixed local page (no request, no network, no
+// artifacts); passes only if Chromium starts, renders and closes cleanly.
+const probe = process.env.DUDUCLAW_RECORD_PROBE === '1';
+const PROBE_PAGE = '<!doctype html><title>duduclaw-probe</title>'
+  + '<div id="p" style="width:64px;height:64px;background:#08f"></div>';
+const cfg = probe ? { max_seconds: 60 } : JSON.parse(fs.readFileSync(`${dir}/request.json`, 'utf8'));
 const actions = [];
 const network = [];
 let finish;
@@ -43,11 +49,28 @@ async function main() {
   // TCP port is ever opened. Shared memory goes to TMPDIR (the call scratch),
   // never /dev/shm. Contained mode also runs V8 without JIT (less exploit
   // surface for page script; cost: slower page JavaScript, acceptable here).
+  // WebRTC may not use UDP outside the proxy (loopback/LAN UDP is not covered
+  // by the TCP pin; the nested seccomp filter refuses UDP sockets as well).
   const args = ['--proxy-bypass-list=<-loopback>', '--disable-quic', '--disable-background-networking',
-    '--disable-dev-shm-usage'];
+    '--disable-dev-shm-usage', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp', '--disable-breakpad'];
   if (contained) args.push('--js-flags=--jitless');
   const browser = await chromium.launch({ headless: true, chromiumSandbox: !contained,
     executablePath: `${root}/chromium`, proxy: { server: process.env.DUDUCLAW_RECORD_PROXY, bypass: '' }, args });
+  if (probe) {
+    const context = await browser.newContext({ serviceWorkers: 'block', acceptDownloads: false });
+    const page = await context.newPage();
+    await page.setContent(PROBE_PAGE, { waitUntil: 'load', timeout: 30000 });
+    const seen = await page.evaluate(() => ({ title: document.title,
+      width: document.getElementById('p').getBoundingClientRect().width }));
+    const shot = await page.screenshot({ type: 'png' });
+    await context.close();
+    await browser.close();
+    clearTimeout(deadline);
+    const rendered = seen.title === 'duduclaw-probe' && seen.width === 64 && shot.length > 0;
+    if (!rendered) { process.exit(70); return; }
+    process.stdout.write(JSON.stringify({ probe: 'rendered' }), () => process.exit(0));
+    return;
+  }
   const context = await browser.newContext({ serviceWorkers: 'block', acceptDownloads: false });
   await context.tracing.start({ screenshots: true, snapshots: true, sources: false });
   await context.exposeBinding('__ddcRecord', (_source, action) => {

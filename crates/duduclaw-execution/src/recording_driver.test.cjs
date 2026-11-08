@@ -19,8 +19,12 @@ async function fixture(when, env = {}) {
   const context = {
     tracing: { start: async () => {}, stop: async () => {} },
     exposeBinding: async () => {}, addInitScript: async () => {}, on: () => {}, close: async () => {},
-    newPage: async () => ({ goto: async () => { navigated++; input.emit('data', 'stop\n'); } })
+    newPage: async () => ({ goto: async () => { navigated++; input.emit('data', 'stop\n'); },
+      setContent: async (html) => { probed = html; },
+      evaluate: async () => ({ title: 'duduclaw-probe', width: env.PROBE_WIDTH ?? 64 }),
+      screenshot: async () => ({ length: 1 }) })
   };
+  let probed;
   const browser = { newContext: async () => context, close: async () => {} };
   const root = env.DUDUCLAW_RECORD_ROOT || '/runtime';
   const contained = env.DUDUCLAW_RECORD_CONTAINED === '1';
@@ -52,8 +56,26 @@ async function fixture(when, env = {}) {
   vm.runInNewContext(source, sandbox);
   if (when === 'queued') input.emit('data', 'stop\n');
   const code = await done;
-  return { code, loaded, launched, navigated, result, writes, launchArgs };
+  return { code, loaded, launched, navigated, result, writes, launchArgs, probed };
 }
+
+test('hx6fix WebRTC never uses non-proxied UDP', async () => {
+  for (const env of [{}, { DUDUCLAW_RECORD_ROOT: '/helpers', DUDUCLAW_RECORD_CONTAINED: '1' }]) {
+    const observed = await fixture('navigation', env);
+    assert.ok(observed.launchArgs.includes('--force-webrtc-ip-handling-policy=disable_non_proxied_udp'));
+    assert.ok(observed.launchArgs.includes('--disable-quic'));
+  }
+});
+test('hx6fix probe renders a fixed local page and writes no artifacts', async () => {
+  const env = { DUDUCLAW_RECORD_ROOT: '/helpers', DUDUCLAW_RECORD_CONTAINED: '1', DUDUCLAW_RECORD_PROBE: '1' };
+  const observed = await fixture('probe', env);
+  assert.equal(observed.code, 0); assert.equal(observed.launched, 1); assert.equal(observed.navigated, 0);
+  assert.deepEqual(observed.result, { probe: 'rendered' });
+  assert.ok(observed.probed.includes('<title>duduclaw-probe</title>'));
+  assert.equal(observed.writes.size, 0);
+  const broken = await fixture('probe', { ...env, PROBE_WIDTH: 0 });
+  assert.equal(broken.code, 70); assert.equal(broken.result, undefined);
+});
 
 test('stop buffered before launch does not load a browser or fabricate artifacts', async () => {
   const observed = await fixture('queued');

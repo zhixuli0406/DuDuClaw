@@ -144,6 +144,27 @@ fn pending_production_selectors() -> BTreeSet<String> {
     pending
 }
 
+/// HX6 security fix round (finding 7): `skill_from_recording` may leave the
+/// pending selector list only together with H12d's verification seam — its
+/// production handler must compare every artifact it reads with the stored
+/// sha256 (`recording_jobs::verify_artifact` ⇒ `artifact_modified`), because
+/// the runtime can rewrite `/work/recordings/<id>/*` at any time [F11]. This
+/// tripwire fails as soon as the tool leaves the list while the handler's
+/// production code (outside its `#[cfg(test)]` module) never calls it.
+#[test]
+fn hx6fix_skill_from_recording_leaves_pending_only_with_verify_artifact() {
+    let pending = duduclaw_mcp_boundary::workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&"skill_from_recording");
+    let source = include_str!("mcp_recording_distill.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+    assert!(production.contains("fn handle_skill_from_recording"), "the scanned file holds the production handler");
+    let verifies = production.contains("recording_jobs::verify_artifact(");
+    assert!(pending || verifies,
+        "skill_from_recording was signed (left PENDING_WORKSPACE_SELECTOR_TOOLS) but its production handler never calls \
+         duduclaw_mcp_boundary::recording_jobs::verify_artifact on the artifacts it reads");
+    // The protected listing agrees with the list: pending ⇒ never eligible in the fixture.
+    assert_eq!(pending, pending_production_selectors().contains("skill_from_recording"));
+}
+
 /// H12a tools the production issuer must make eligible without new selectors.
 const H12A_OWN_SKILL_TOOLS: [&str; 5] = ["skill_extract", "shared_skill_adopt", "skill_security_scan",
     "skill_graduate", "skill_curator_status"];

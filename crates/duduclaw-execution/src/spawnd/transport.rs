@@ -374,7 +374,8 @@ fn map_error(code: ErrorCode) -> BackendError {
         ErrorCode::WorkspaceBrokerUnavailable => BackendError::Unavailable,
         // HX codes. HX5's `run_helper` maps them to typed per-call results
         // (`helper_busy`, `run_time_exhausted`, …) before this generic mapping.
-        ErrorCode::HelperBusy | ErrorCode::HelperUnavailable | ErrorCode::HelperCgroupUnavailable => BackendError::Unavailable,
+        ErrorCode::HelperBusy | ErrorCode::HelperUnavailable | ErrorCode::HelperCgroupUnavailable
+            | ErrorCode::HelperRecordingUnsupported => BackendError::Unavailable,
         ErrorCode::RunTimeExhausted => BackendError::Timeout,
     }
 }

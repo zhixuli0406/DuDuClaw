@@ -59,6 +59,12 @@ type End = (Vec<u8>, HelperOutcome);
 struct Backend {
     features: SpawndFeatures,
     absent: bool,
+    /// spawnd's own recording gate refuses the call (finding 4).
+    root_gate_closed: bool,
+    /// The helper finds a browser process alive after the kill (finding 2): exit 75.
+    surviving: AtomicBool,
+    /// The helper exits 0 with bytes that do not decode (finding 6 audit).
+    invalid: AtomicBool,
     next: AtomicU8,
     ended_run: AtomicBool,
     started: AtomicUsize, stopped: AtomicUsize, cancelled: AtomicUsize, killed: AtomicUsize, reserved: AtomicUsize,
@@ -67,7 +73,7 @@ struct Backend {
 impl Backend {
     fn new() -> Self {
         Self { features: SpawndFeatures::HELPER_CALLS.with(SpawndFeatures::HELPER_RECORDING), absent: false,
-            next: AtomicU8::new(1), ended_run: AtomicBool::new(false), started: AtomicUsize::new(0),
+            root_gate_closed: false, surviving: AtomicBool::new(false), invalid: AtomicBool::new(false), next: AtomicU8::new(1), ended_run: AtomicBool::new(false), started: AtomicUsize::new(0),
             stopped: AtomicUsize::new(0), cancelled: AtomicUsize::new(0), killed: AtomicUsize::new(0),
             reserved: AtomicUsize::new(0), calls: Mutex::new(HashMap::new()) }
     }
@@ -130,6 +136,7 @@ impl ExecutionBackend for Backend {
             self.started.fetch_add(1, Ordering::SeqCst);
             assert_eq!((plan.run.0, plan.employee, plan.slot), (CALLER, EMPLOYEE, HelperSlot::Recording));
             if self.absent { return Err(HelperError::Absent); }
+            if self.root_gate_closed { return Err(HelperError::RecordingUnsupported); }
             let call = HelperCallId::new([self.next.fetch_add(1, Ordering::SeqCst); 16]).unwrap();
             let (sender, rx) = tokio::sync::watch::channel(None);
             self.calls.lock().unwrap().insert(call, sender);
@@ -151,8 +158,11 @@ impl ExecutionBackend for Backend {
             assert_eq!(run.0, CALLER, "only the recording's own run is ever stopped");
             if self.ended_run.load(Ordering::SeqCst) { return Err(HelperError::NotLive); }
             self.stopped.fetch_add(1, Ordering::SeqCst);
-            // The launcher writes `stop\n`; the driver flushes and exits 0.
-            self.end(call, (flushed(call), HelperOutcome::Exited(0)));
+            // The launcher writes `stop\n`; the driver flushes and exits 0
+            // (or, finding 2, the helper refuses to publish: exit 75, no output).
+            if self.surviving.load(Ordering::SeqCst) { self.end(call, (vec![], HelperOutcome::Exited(75))); }
+            else if self.invalid.load(Ordering::SeqCst) { self.end(call, (b"not a result".to_vec(), HelperOutcome::Exited(0))); }
+            else { self.end(call, (flushed(call), HelperOutcome::Exited(0))); }
             Ok(())
         })
     }
@@ -339,4 +349,123 @@ async fn admin_recording_control_stops_live_and_reads_ended() {
     control_recording(fixture.store.clone(), fixture.backend.clone(), &call.hex(), true).await.unwrap();
     assert_eq!((Backend::count(&fixture.backend.stopped), Backend::count(&fixture.backend.started)), (1, 1));
     assert!(control_recording(fixture.store.clone(), fixture.backend.clone(), "../x", true).await.is_err());
+}
+
+/// A store whose insert is slow, to drop the start request mid-insert.
+struct SlowInsert { inner: Arc<SqliteRecordingJobs>, entered: Arc<tokio::sync::Notify> }
+impl RecordingJobs for SlowInsert {
+    fn insert(&self, context: &RequestContext, key: RecordingKey) -> Result<(), VerificationError> {
+        self.entered.notify_one();
+        std::thread::sleep(Duration::from_millis(300));
+        self.inner.insert(context, key)
+    }
+    fn read(&self, context: &RequestContext, call: HelperCallId) -> Result<RecordingRow, VerificationError> { self.inner.read(context, call) }
+    fn request_stop(&self, context: &RequestContext, key: RecordingKey) -> Result<(), VerificationError> { self.inner.request_stop(context, key) }
+    fn mark_stop(&self, key: RecordingKey, by: StopBy) -> Result<(), VerificationError> { self.inner.mark_stop(key, by) }
+    fn stop_by(&self, key: RecordingKey) -> Result<Option<StopBy>, VerificationError> { self.inner.stop_by(key) }
+    fn finish(&self, key: RecordingKey, result: Value) -> Result<(), VerificationError> { self.inner.finish(key, result) }
+    fn admin_read(&self, call: HelperCallId) -> Result<RecordingRow, VerificationError> { self.inner.admin_read(call) }
+}
+
+/// Finding 8: a start request dropped while its row insert is in flight
+/// cancels the slot and finishes the row only after the insert committed,
+/// so no row stays `recording` until the next gateway restart.
+#[tokio::test]
+async fn hx6fix_start_guard_finishes_only_after_insert_commits() {
+    let home = tempfile::tempdir().unwrap();
+    let inner = SqliteRecordingJobs::open(&home.path().join("jobs.db")).unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let store = Arc::new(SlowInsert { inner: inner.clone(), entered: entered.clone() });
+    let backend = Arc::new(Backend::new());
+    let bridge = ExecutionToolBridge::new(backend.clone(), Arc::new(Factory), Arc::new(Resolver)).with_recordings(store);
+    let caller = context(CALLER, live());
+    let arguments = json!({"url":"https://example.com","headless":true});
+    // Drop the request (MCP cancel) once its insert is running.
+    tokio::select! {
+        _ = bridge.execute(&caller, START, &arguments) => panic!("the insert is still blocked"),
+        () = entered.notified() => {}
+    }
+    let call = HelperCallId::new([1; 16]).unwrap();
+    let mut row = None;
+    for _ in 0..300 {
+        if let Ok(read) = inner.admin_read(call) { if read.state.terminal() { row = Some(read); break; } }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let row = row.expect("the abandoned row must become terminal, not stay `recording`");
+    assert_eq!(row.state, RecordingState::Uncertain);
+    assert_eq!(row.result.unwrap(), json!({"status":"uncertain","reason":"start_abandoned"}));
+    assert_eq!(Backend::count(&backend.cancelled), 1, "the slot is cancelled, never the run");
+    assert_eq!(Backend::count(&backend.killed), 0);
+}
+
+/// Finding 2: a browser process that outlived the kill (no `ECHILD`) makes
+/// the helper refuse publication (exit 75); the row is uncertain, never a recording.
+#[tokio::test]
+async fn hx6fix_surviving_browser_tree_is_uncertain_without_artifacts() {
+    let fixture = setup(Backend::new());
+    fixture.backend.surviving.store(true, Ordering::SeqCst);
+    let caller = context(CALLER, live());
+    let call = start(&fixture, &caller).await;
+    let stopped = body(&fixture.bridge.execute(&caller, STOP, &json!({"id":call.hex()})).await);
+    assert_eq!(stopped["status"], "uncertain");
+    assert_eq!(stopped["result"], json!({"status":"uncertain","reason":"browser_tree_survived"}));
+    assert!(fixture.store.artifacts(EMPLOYEE, call).is_err());
+}
+
+struct Sink(Mutex<Vec<RecordingAuditEvent>>);
+impl RecordingAudit for Sink { fn record(&self, event: RecordingAuditEvent) { self.0.lock().unwrap().push(event); } }
+
+/// Finding 6: the gateway sees content-free facts for the employee's start
+/// and stop, a revocation-triggered stop and an invalid result, each with
+/// employee, run and call.
+#[tokio::test]
+async fn hx6fix_recording_audit_covers_start_stop_revocation_and_invalid_result() {
+    let fixture = setup(Backend::new());
+    let sink = Arc::new(Sink(Mutex::new(Vec::new())));
+    let bridge = fixture.bridge.with_recording_audit(sink.clone());
+    let arguments = json!({"url":"https://example.com","headless":true});
+    let begin = |context: RequestContext| { let bridge = &bridge; let arguments = &arguments; async move {
+        let started = body(&bridge.execute(&context, START, arguments).await);
+        crate::recording_jobs::parse_id(started["id"].as_str().unwrap()).unwrap()
+    } };
+    let caller = context(CALLER, live());
+    let first = begin(caller.clone()).await;
+    assert_eq!(body(&bridge.execute(&caller, STOP, &json!({"id":first.hex()})).await)["status"], "complete");
+    // Revocation: the collector's live check fails and it sends HelperStop.
+    let flag = live();
+    let second = begin(context(CALLER, flag.clone())).await;
+    flag.store(false, Ordering::SeqCst);
+    terminal(&fixture.store, second).await;
+    // Exit 0 with bytes that do not decode: never stored as a recording.
+    fixture.backend.invalid.store(true, Ordering::SeqCst);
+    let third = begin(caller.clone()).await;
+    assert_eq!(body(&bridge.execute(&caller, STOP, &json!({"id":third.hex()})).await)["result"]["status"], "invalid_result");
+    let events = sink.0.lock().unwrap().clone();
+    let kinds: Vec<_> = events.iter().map(|event| (event.kind, event.call)).collect();
+    for expected in [(RecordingAuditKind::Started, first), (RecordingAuditKind::StopRequested, first),
+        (RecordingAuditKind::Started, second), (RecordingAuditKind::RevokedStop, second),
+        (RecordingAuditKind::Started, third), (RecordingAuditKind::StopRequested, third), (RecordingAuditKind::InvalidResult, third)] {
+        assert!(kinds.contains(&expected), "{expected:?} in {kinds:?}");
+    }
+    for event in &events {
+        assert_eq!((event.employee, event.run.0), (EMPLOYEE, CALLER));
+        let fields = event.fields();
+        assert!(fields.get("url").is_none() && fields.get("result").is_none(), "content-free: {fields}");
+    }
+    let stop = events.iter().find(|event| event.kind == RecordingAuditKind::StopRequested).unwrap();
+    assert_eq!((stop.detail["stop_by"].as_str(), stop.detail["outcome"].as_str()), (Some("stop"), Some("sent")));
+    let revoked = events.iter().find(|event| event.kind == RecordingAuditKind::RevokedStop).unwrap();
+    assert_eq!(revoked.detail["stop_by"], "revoked");
+}
+
+/// Finding 4: spawnd refuses a recording-slot call itself (probe not passed),
+/// even when the gateway's view still advertised the bit; no row is written.
+#[tokio::test]
+async fn hx6fix_root_recording_gate_refusal_is_named() {
+    let mut backend = Backend::new();
+    backend.root_gate_closed = true;
+    let fixture = setup(backend);
+    let result = fixture.bridge.execute(&context(CALLER, live()), START, &json!({"url":"https://example.com","headless":true})).await;
+    assert_eq!((result["isError"].as_bool(), result["helper_status"].as_str()), (Some(true), Some("helper_recording_unsupported")));
+    assert!(fixture.store.admin_read(HelperCallId::new([1; 16]).unwrap()).is_err(), "no job row");
 }

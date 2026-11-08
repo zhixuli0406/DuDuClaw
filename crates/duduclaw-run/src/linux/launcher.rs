@@ -162,7 +162,10 @@ fn isolate<'a>(run: &'a TrustedRun, prepared: Prepared, filters: &Filters, ready
     filters.launcher.install().map_err(|_| Error::Seccomp)?;
     let channel = LauncherChannel::new(plan.helpers.iter().map(|helper| helper.slot).collect())
         .map_err(|_| Error::Executable)?;
-    Ok(Launcher { plan, control: Some(control), helpers, slots, binds, channel, live: [None, None], pid, drain: None, abi })
+    // HX6 security fix round (finding 5): the parent's forwarder for egress
+    // helpers; `None` makes every egress helper start fail closed.
+    let proxy = run.program.environment.iter().find(|entry| entry.as_bytes().starts_with(b"HTTPS_PROXY=")).cloned();
+    Ok(Launcher { plan, control: Some(control), helpers, slots, binds, channel, live: [None, None], pid, drain: None, abi, proxy })
 }
 
 /// Install one Landlock layer. System paths are root-built and may be
@@ -221,6 +224,8 @@ struct Launcher<'a> {
     pid: i32,
     drain: Option<OwnedFd>,
     abi: u32,
+    /// `HTTPS_PROXY=http://127.0.0.1:<port>` of the parent runtime, if any.
+    proxy: Option<CString>,
 }
 
 #[derive(Clone, Copy)]
@@ -430,14 +435,22 @@ impl Launcher<'_> {
             (None, None) => None,
             _ => return Err(Internal),
         };
+        // Finding 5: each further signed file must be bound at `/helpers/<name>`.
+        let files = helper.files.iter().map(|(identity, name)| {
+            let name = name.to_str().map_err(|_| Internal)?;
+            Ok((CString::new(format!("/helpers/{name}")).map_err(|_| Internal)?, *identity, self.bind(name)?))
+        }).collect::<std::result::Result<Vec<_>, LauncherError>>()?;
         let hex = start.call.hex();
         let scratch = CString::new(hex.as_str()).map_err(|_| Internal)?;
         make_scratch(&scratch)?;
         let spawned = (|| -> std::result::Result<Live, LauncherError> {
             let scratch_path = CString::new(format!("{HELPER_TMP_ROOT}/{hex}")).map_err(|_| Internal)?;
             // [F9] every scratch path, TMPDIR and HOME live in the private call directory.
-            let environment = vec![CString::new(format!("HOME={HELPER_TMP_ROOT}/{hex}")).map_err(|_| Internal)?,
+            let mut environment = vec![CString::new(format!("HOME={HELPER_TMP_ROOT}/{hex}")).map_err(|_| Internal)?,
                 CString::new(format!("TMPDIR={HELPER_TMP_ROOT}/{hex}")).map_err(|_| Internal)?];
+            // Finding 5: an egress helper reaches only the parent's forwarder,
+            // named exactly as root put it in the runtime's environment.
+            if helper.egress { environment.push(self.proxy.clone().ok_or(Internal)?); }
             let (stdin_read, stdin_write) = if start.slot == HelperSlot::Recording {
                 let (read, write) = pipe()?;
                 set_nonblocking(write.as_raw_fd())?;
@@ -445,7 +458,7 @@ impl Launcher<'_> {
             } else { (None, None) };
             let (status_read, status_write) = pipe()?;
             let timer = timer(start.timeout_ms.min(helper.timeout_ms))?;
-            let child = Child { helper, filter, entry, script, scratch: scratch_path, environment,
+            let child = Child { helper, filter, entry, script, files, scratch: scratch_path, environment,
                 slot: self.slots[slot_index(start.slot)].as_raw_fd(), launcher: self.pid, abi: self.abi };
             let mut pidfd: RawFd = -1;
             // Raw clone (no clone3: common returns ENOSYS); CLONE_PIDFD carries no namespace flag.
@@ -579,6 +592,9 @@ struct Child<'a> {
     /// `/helpers/<entry>` and its bind mount id.
     entry: (CString, u64),
     script: Option<(CString, Identity, u64)>,
+    /// HX6 security fix round (finding 5): the binding's further signed files
+    /// (`/helpers/<name>`, identity, bind mount), e.g. the recording's browser.
+    files: Vec<(CString, Identity, u64)>,
     /// `/helper-tmp/<call>`.
     scratch: CString,
     environment: Vec<CString>,
@@ -617,11 +633,14 @@ impl Child<'_> {
         // the registry device) on its recorded bind mount.
         let exec = open_helper_file(&self.entry.0, self.helper.program.identity, self.entry.1, true)?;
         if let Some((path, identity, mount)) = &self.script { drop(open_helper_file(path, *identity, *mount, false)?); }
+        for (path, identity, mount) in &self.files { drop(open_helper_file(path, *identity, *mount, false)?); }
         if unsafe { libc::chdir(self.scratch.as_ptr()) } != 0 { return Err(Sandbox); }
         // Stacked Landlock under the launcher's: own code, private scratch and
         // the binding's fixed grants. No /home/employee, /config, /run, /runtime, /tmp, /dev/shm.
         let mut rules = vec![(self.entry.0.clone(), PathClass::ReadExecute), (self.scratch.clone(), PathClass::Ephemeral)];
         if let Some((path, ..)) = &self.script { rules.push((path.clone(), PathClass::ReadExecute)); }
+        // Finding 5: the signed browser files (node, Playwright bundle, Chromium), RX, this helper only.
+        for (path, ..) in &self.files { rules.push((path.clone(), PathClass::ReadExecute)); }
         if self.helper.filesystem.contains(&HelperFs::WorkRecordings) {
             unsafe { libc::mkdirat(libc::AT_FDCWD, c"/work/recordings".as_ptr(), 0o700); }
         }
@@ -724,51 +743,5 @@ fn limit(resource: u32, wanted: u64) -> std::result::Result<(), LauncherError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn scratch_listing_parses_getdents_and_cleanup_is_no_follow() {
-        // Host-side check of the no-follow removal on a private temporary tree.
-        let base = std::env::temp_dir().join(format!("duduclaw-hx3b-scratch-{}", std::process::id()));
-        std::fs::create_dir(&base).unwrap();
-        let call = base.join("call");
-        std::fs::create_dir_all(call.join("a/b/c")).unwrap();
-        std::fs::write(call.join("a/b/c/file"), b"x").unwrap();
-        std::fs::write(call.join("top"), b"y").unwrap();
-        let outside = base.join("outside");
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::write(outside.join("keep"), b"z").unwrap();
-        std::os::unix::fs::symlink(&outside, call.join("link")).unwrap();
-        let parent = std::fs::File::open(&base).unwrap();
-        let mut names = list_directory(AsRawFd::as_raw_fd(&std::fs::File::open(&call).unwrap()));
-        names.sort();
-        assert_eq!(names, vec![CString::new("a").unwrap(), CString::new("link").unwrap(), CString::new("top").unwrap()]);
-        let mut budget = SCRATCH_BUDGET;
-        remove_entry(parent.as_raw_fd(), c"call", 0, &mut budget);
-        assert!(!call.exists(), "scratch tree removed");
-        assert!(outside.join("keep").exists(), "a symlink inside scratch is unlinked, never followed");
-        std::fs::remove_dir_all(&base).unwrap();
-    }
-    #[test]
-    fn helper_child_rlimits_are_hard_equal_soft() {
-        // Runs in a forked child: lowering limits is irreversible for that process.
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0);
-        if child == 0 {
-            let ok = limit(libc::RLIMIT_CORE as u32, 0).is_ok() && limit(libc::RLIMIT_FSIZE as u32, 1 << 20).is_ok()
-                && limit(libc::RLIMIT_NOFILE as u32, 64).is_ok();
-            let mut nofile: libc::rlimit64 = unsafe { std::mem::zeroed() };
-            unsafe { libc::syscall(libc::SYS_prlimit64, 0, libc::RLIMIT_NOFILE as u32, std::ptr::null::<libc::rlimit64>(), &mut nofile); }
-            let raise = libc::rlimit64 { rlim_cur: 65, rlim_max: 65 };
-            let raised = unsafe { libc::syscall(libc::SYS_prlimit64, 0, libc::RLIMIT_NOFILE as u32, &raise,
-                std::ptr::null_mut::<libc::rlimit64>()) } == 0;
-            let exact = nofile.rlim_cur == 64 && nofile.rlim_max == 64;
-            // Root (CAP_SYS_RESOURCE) may raise; an unprivileged child may not.
-            let expect_raise = unsafe { libc::geteuid() } == 0;
-            unsafe { libc::_exit(if ok && exact && raised == expect_raise { 0 } else { 1 }); }
-        }
-        let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "{status}");
-    }
-}
+#[path = "launcher_tests.rs"]
+mod tests;

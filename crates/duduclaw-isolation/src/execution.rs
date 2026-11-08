@@ -311,6 +311,9 @@ pub enum HelperError {
     /// `runtime_denied`). For the recording this is the offline parent: an
     /// egress binding exists only under an Egress parent (publication check 4).
     #[error("helper absent from the run")] Absent,
+    /// HX6 security fix round (finding 4): spawnd refused a recording-slot
+    /// call because this host's recording probe has not passed.
+    #[error("helper recording unsupported")] RecordingUnsupported,
     /// A request may have reached root; the outcome is unknown.
     #[error("helper call uncertain")] Uncertain,
 }
@@ -326,6 +329,7 @@ impl HelperError {
             Self::NotLive => "run_ended",
             Self::Denied => "refused",
             Self::Absent => "helper_runtime_missing",
+            Self::RecordingUnsupported => "helper_recording_unsupported",
             Self::Uncertain => "uncertain",
         }
     }

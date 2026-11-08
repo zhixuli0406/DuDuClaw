@@ -80,24 +80,32 @@ pub struct ExecutionToolBridge {
     jobs: Option<Arc<dyn crate::execution_jobs::ExecutionJobs>>,
     /// HX6: the `(run, call)` store of in-run recordings (never run handles).
     recordings: Option<Arc<dyn crate::recording_jobs::RecordingJobs>>,
+    /// HX6 security fix round (finding 6): the gateway's recording audit sink.
+    recording_audit: Option<Arc<dyn crate::recording_audit::RecordingAudit>>,
     resolver: Arc<dyn ResourceResolver>,
 }
 
 impl ExecutionToolBridge {
     pub fn new(backend: Arc<dyn ExecutionBackend>, factory: Arc<dyn ExecutionPlanFactory>,
         resolver: Arc<dyn ResourceResolver>) -> Self {
-        Self { backend, factory, resolver, jobs: None, recordings: None }
+        Self { backend, factory, resolver, jobs: None, recordings: None, recording_audit: None }
     }
 
     pub fn with_jobs(&self, jobs: Arc<dyn crate::execution_jobs::ExecutionJobs>) -> Self {
         Self { backend: self.backend.clone(), factory: self.factory.clone(), resolver: self.resolver.clone(),
-            jobs: Some(jobs), recordings: self.recordings.clone() }
+            jobs: Some(jobs), recordings: self.recordings.clone(), recording_audit: self.recording_audit.clone() }
     }
 
     /// HX6: install the gateway's in-run recording store.
     pub fn with_recordings(&self, recordings: Arc<dyn crate::recording_jobs::RecordingJobs>) -> Self {
         Self { backend: self.backend.clone(), factory: self.factory.clone(), resolver: self.resolver.clone(),
-            jobs: self.jobs.clone(), recordings: Some(recordings) }
+            jobs: self.jobs.clone(), recordings: Some(recordings), recording_audit: self.recording_audit.clone() }
+    }
+
+    /// HX6 security fix round (finding 6): install the recording audit sink.
+    pub fn with_recording_audit(&self, audit: Arc<dyn crate::recording_audit::RecordingAudit>) -> Self {
+        Self { backend: self.backend.clone(), factory: self.factory.clone(), resolver: self.resolver.clone(),
+            jobs: self.jobs.clone(), recordings: self.recordings.clone(), recording_audit: Some(audit) }
     }
 
     /// Use this same predicate for tools/list and tools/call. In-run helper

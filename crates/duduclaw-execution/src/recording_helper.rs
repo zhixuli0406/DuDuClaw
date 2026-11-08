@@ -89,17 +89,37 @@ pub const BROWSER_FILES: [&str; 3] = ["node", "playwright.cjs", "chromium"];
 /// EX_CONFIG: the browser's nested sandbox could not be installed here.
 pub const EXIT_SANDBOX_UNSUPPORTED: i32 = 78;
 
+/// EX_TEMPFAIL (security fix round, finding 2): after the kill a browser
+/// process was still alive or not every descendant was reaped (`waitpid(-1)`
+/// never reached `ECHILD`); nothing is published, the gateway stores
+/// `uncertain/browser_tree_survived`.
+pub const EXIT_BROWSER_SURVIVED: i32 = 75;
+/// The driver's only probe output; the helper answers spawnd with
+/// `ipc::recording_probe_reply(<call>)`.
+#[cfg(target_os = "linux")]
+const DRIVER_PROBE_OK: &[u8] = br#"{"probe":"rendered"}"#;
+
+/// spawnd's call id from the in-run scratch `/helper-tmp/<call>`.
+pub fn scratch_id(scratch: &std::path::Path) -> Result<&str, String> {
+    let id = scratch.file_name().and_then(|name| name.to_str()).filter(|id| valid_id(id))
+        .ok_or("invalid recording scratch")?;
+    if id == PLACEHOLDER_ID { return Err("invalid recording scratch".into()); }
+    Ok(id)
+}
+
 /// The in-run request with spawnd's call id. `scratch` must be the in-run
 /// layout's `/helper-tmp/<call>`; the gateway never chooses the id.
 pub fn in_run_request(request: Request, scratch: &std::path::Path) -> Result<Request, String> {
     if request.id != PLACEHOLDER_ID { return Err("in-run recording ids come from spawnd".into()); }
-    let id = scratch.file_name().and_then(|name| name.to_str()).filter(|id| valid_id(id))
-        .ok_or("invalid recording scratch")?;
-    if id == PLACEHOLDER_ID { return Err("invalid recording scratch".into()); }
+    let id = scratch_id(scratch)?;
     let request = Request { id: id.to_owned(), ..request };
     request.validate()?;
     Ok(request)
 }
+
+/// Security fix round, finding 4: the sealed input is spawnd's fixed probe
+/// request (never a recording request: `Request::decode` refuses it).
+pub fn is_probe(input: &[u8]) -> bool { input == duduclaw_isolation::ipc::RECORDING_PROBE_REQUEST }
 
 /// `HTTPS_PROXY` must be the parent's forwarder: `http://127.0.0.1:<port>/`.
 pub fn forwarder_port(proxy: &str) -> Option<u16> {
@@ -123,8 +143,15 @@ pub fn main_entry() -> i32 {
     let Ok(layout) = crate::helper_layout::current() else { return 77; };
     if !layout.in_run() { return 77; }
     let Ok(bytes) = crate::program_helper::helper_input_args(&args, MAX_REQUEST) else { return 77; };
-    let Ok(request) = Request::decode(&bytes) else { return 64; };
-    let Ok(request) = in_run_request(request, &layout.scratch) else { return 64; };
+    // Finding 4: spawnd's per-host probe runs this same path (layout, signed
+    // files, forwarder, nested sandbox) on a fixed local page and publishes nothing.
+    let probe = is_probe(&bytes);
+    let request = if probe { None } else {
+        let Ok(request) = Request::decode(&bytes) else { return 64; };
+        let Ok(request) = in_run_request(request, &layout.scratch) else { return 64; };
+        Some(request)
+    };
+    let Ok(call) = scratch_id(&layout.scratch).map(str::to_owned) else { return 64; };
     let mut files = Vec::with_capacity(BROWSER_FILES.len());
     for (name, digest) in BROWSER_FILES.into_iter().zip(arguments.iter().skip(1)) {
         let Ok(path) = layout.file(name) else { return 77; };
@@ -135,23 +162,43 @@ pub fn main_entry() -> i32 {
     let Some(port) = forwarder_port(&proxy) else { return 77; };
     let staging = layout.staging("recording");
     if std::fs::DirBuilder::new().mode(0o700).create(&staging).is_err() { return 74; }
-    let Ok(encoded) = request.encode() else { return 70; };
-    for (name, bytes) in [("driver.cjs", DRIVER.as_bytes()), ("request.json", encoded.as_slice())] {
+    let encoded = match &request { Some(request) => match request.encode() { Ok(bytes) => Some(bytes), Err(_) => return 70 }, None => None };
+    let mut written: Vec<(&str, &[u8])> = vec![("driver.cjs", DRIVER.as_bytes())];
+    if let Some(encoded) = &encoded { written.push(("request.json", encoded.as_slice())); }
+    for (name, bytes) in written {
         let Ok(mut file) = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(staging.join(name)) else { return 74; };
         if file.write_all(bytes).is_err() { return 74; }
     }
-    // [F10] Prepared before any fork; the browser never starts without it.
+    // [F10] Prepared before any fork; the browser never starts without them:
+    // the nested Landlock, the nested seccomp filter (finding 1) and, so that
+    // every orphaned browser process is re-parented to us and can be reaped
+    // before publication, the child-subreaper attribute (finding 2).
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
     let Ok(layer) = crate::recording_sandbox::BrowserLayer::prepare(&layout.scratch, &file_refs, port) else {
         return EXIT_SANDBOX_UNSUPPORTED;
     };
+    let Ok(filter) = crate::recording_seccomp::BrowserFilter::prepare() else { return EXIT_SANDBOX_UNSUPPORTED; };
+    if become_subreaper().is_err() { return EXIT_SANDBOX_UNSUPPORTED; }
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return 70; };
-    let browser = Browser { node: &files[0], staging: &staging, proxy: &proxy, layer: &layer };
-    let Ok(result) = runtime.block_on(run_driver(&request, &browser)) else { return 74; };
-    // `run_driver` returns only after the whole browser process group is gone,
-    // so nothing the browser runs can race the publication into `/work`.
+    let Some(node) = files.first() else { return 77; };
+    let browser = Browser { node, staging: &staging, proxy: &proxy, layer: &layer, filter: &filter, probe };
+    let max_seconds = request.as_ref().map_or(PROBE_SECONDS, |request| request.max_seconds);
+    let result = match runtime.block_on(run_driver(max_seconds, &browser)) {
+        Ok(result) => result,
+        Err(DriverError::Sandbox) => return EXIT_SANDBOX_UNSUPPORTED,
+        Err(DriverError::Survived) => return EXIT_BROWSER_SURVIVED,
+        Err(DriverError::Failed) => return 74,
+    };
+    let Some(request) = request else {
+        // Probe: root reads exactly this line; nothing was published.
+        let reply = duduclaw_isolation::ipc::recording_probe_reply(&call);
+        return if std::io::stdout().lock().write_all(reply.as_bytes()).is_err() { 74 } else { 0 };
+    };
+    // `run_driver` returns only after every browser process is dead and
+    // reaped (no group member left AND `waitpid(-1)` = ECHILD), so nothing
+    // the browser runs can race the publication into `/work/recordings`.
     let (status, artifacts) = if result["started"] == false { ("not_recorded", vec![]) } else {
-        let Ok(artifacts) = crate::recording_io::publish(std::path::Path::new(crate::helper_layout::WORKSPACE), &staging, &request.id) else { return 74; };
+        let Ok(artifacts) = crate::recording_io::publish(std::path::Path::new(crate::helper_layout::RECORDINGS), &staging, &request.id) else { return 74; };
         ("recorded", artifacts)
     };
     let result = json!({"id":request.id,"status":status,"reason":result["reason"],"actions":result["actions"],"artifacts":artifacts,"navigation":result["navigation"]});
@@ -162,35 +209,114 @@ pub fn main_entry() -> i32 {
 #[cfg(not(target_os = "linux"))]
 pub fn main_entry() -> i32 { 64 }
 
+/// Probe deadline (seconds) inside the helper; root's watchdog bounds it too.
+#[cfg(target_os = "linux")]
+const PROBE_SECONDS: u64 = 60;
+
 #[cfg(target_os = "linux")]
 struct Browser<'a> {
     node: &'a str,
     staging: &'a std::path::Path,
     proxy: &'a str,
     layer: &'a crate::recording_sandbox::BrowserLayer,
+    filter: &'a crate::recording_seccomp::BrowserFilter,
+    probe: bool,
 }
 
-/// SIGKILL the browser's process group and wait (bounded) until no member is
-/// left. `Err` keeps the artifacts unpublished.
+/// Why the browser run produced nothing publishable.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverError {
+    /// The nested sandbox could not be entered (Landlock, seccomp, group).
+    Sandbox,
+    /// A browser process outlived the kill, or a descendant was not reaped.
+    Survived,
+    /// The driver failed or its output was invalid.
+    Failed,
+}
+
+/// Finding 2: every orphaned descendant (Chromium's zygote, renderers,
+/// crash handler) is re-parented to this helper, not to the run's init, so
+/// `waitpid(-1)` can prove the whole browser tree is gone. Needs the signed
+/// F_H `prctl` option `PR_SET_CHILD_SUBREAPER` (a self-only option).
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-async fn kill_group(pgid: i32) -> Result<(), ()> {
+fn become_subreaper() -> Result<(), ()> {
+    // SAFETY: sets an attribute of this process only.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 { return Err(()); }
+    let mut value: libc::c_int = 0;
+    // SAFETY: the kernel writes one int into `value`.
+    if unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut value as *mut libc::c_int, 0, 0, 0) } != 0 || value != 1 {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// What `waitpid(-1, WNOHANG)` says about our remaining children.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Children { None, Alive, Unknown }
+
+/// Reap every exited child (bounded); `None` only on `ECHILD`.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn reap_children() -> Children {
+    for _ in 0..4096 {
+        // SAFETY: non-blocking reap of any child of this process.
+        let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+        if pid > 0 { continue; }
+        if pid == 0 { return Children::Alive; }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ECHILD) => return Children::None,
+            Some(libc::EINTR) => continue,
+            _ => return Children::Unknown,
+        }
+    }
+    Children::Unknown
+}
+
+/// SIGKILL the browser's process group, reap, and wait (bounded) until no
+/// group member is left AND this subreaper has no child at all. The nested
+/// filter refuses `setsid`/`setpgid`, so no browser process can leave the
+/// group; a process that survives anyway (or an unreapable child) makes this
+/// `Err`, which keeps the artifacts unpublished.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+async fn kill_and_reap(pgid: i32) -> Result<(), ()> {
     if pgid <= 1 { return Err(()); }
     for _ in 0..100 {
         // SAFETY: signals only our own child's process group.
         unsafe { libc::kill(-pgid, libc::SIGKILL); }
+        // Zombies still count as group members until they are reaped.
+        let children = reap_children();
+        if children == Children::Unknown { return Err(()); }
         // SAFETY: existence probe of the same group.
-        if unsafe { libc::kill(-pgid, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
-        }
+        let group_gone = unsafe { libc::kill(-pgid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if group_gone && children == Children::None { return Ok(()); }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     Err(())
 }
 
+/// The driver's result line: the probe's fixed reply, or the recording summary.
+#[cfg(target_os = "linux")]
+fn driver_result(bytes: &[u8], probe: bool) -> Result<Value, ()> {
+    if probe { return if bytes == DRIVER_PROBE_OK { Ok(json!({"probe":"rendered"})) } else { Err(()) }; }
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| ())?;
+    let fields = value.as_object().ok_or(())?;
+    if fields.len() != 4 || fields.keys().any(|key| !matches!(key.as_str(), "reason" | "actions" | "started" | "navigation"))
+        || !matches!(value["navigation"].as_str(), Some("not_attempted" | "completed" | "failed" | "interrupted"))
+        || value["started"].as_bool().is_none()
+        || (value["started"] == false && (value["reason"] != "stop" || value["actions"] != 0 || value["navigation"] != "not_attempted"))
+        || !matches!(value["reason"].as_str(), Some("stop" | "deadline"))
+        || value["actions"].as_u64().is_none_or(|n| n > 1000) { return Err(()); }
+    Ok(value)
+}
+
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-async fn run_driver(request: &Request, browser: &Browser<'_>) -> Result<Value, ()> {
+async fn run_driver(max_seconds: u64, browser: &Browser<'_>) -> Result<Value, DriverError> {
     use std::{process::Stdio, time::Duration};
     use tokio::io::AsyncReadExt;
     let driver = browser.staging.join("driver.cjs");
@@ -201,37 +327,49 @@ async fn run_driver(request: &Request, browser: &Browser<'_>) -> Result<Value, (
         .env("DUDUCLAW_RECORD_ROOT", crate::helper_layout::IN_RUN_ROOT).env("DUDUCLAW_RECORD_CONTAINED", "1")
         .current_dir(browser.staging)
         .stdin(Stdio::inherit()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    if browser.probe { command.env("DUDUCLAW_RECORD_PROBE", "1"); }
     let ruleset = browser.layer.raw();
-    // SAFETY: runs in the forked child before exec; it issues setpgid and the
-    // two Landlock syscalls only, allocating nothing.
+    let filter = browser.filter.raw();
+    // Runs in the forked child before exec: setpgid, the two Landlock calls
+    // and one seccomp call, allocating nothing (an OS-error `io::Error` is a
+    // plain code). Every failure reports ENOTSUP so the parent can tell a
+    // sandbox failure (exit 78) from an exec failure.
     let in_child = move || -> std::io::Result<()> {
+        let sandbox = || std::io::Error::from_raw_os_error(libc::ENOTSUP);
         // SAFETY: own process; a new process group so the whole browser tree can be killed.
-        if unsafe { libc::setpgid(0, 0) } != 0 { return Err(std::io::Error::last_os_error()); }
-        crate::recording_sandbox::enforce_raw(ruleset)
+        if unsafe { libc::setpgid(0, 0) } != 0 { return Err(sandbox()); }
+        crate::recording_sandbox::enforce_raw(ruleset).map_err(|_| sandbox())?;
+        // Last: from here on `setsid`/`setpgid` are EPERM for the browser tree.
+        crate::recording_seccomp::install_raw(filter).map_err(|_| sandbox())
     };
+    // SAFETY: the closure is async-signal-safe (see above); `filter` and
+    // `ruleset` stay valid until `spawn` returned (`browser` outlives it).
     unsafe { command.pre_exec(in_child); }
-    let mut child = command.spawn().map_err(|_| ())?;
-    let pgid = child.id().and_then(|pid| i32::try_from(pid).ok()).ok_or(())?;
-    let output = child.stdout.take().ok_or(())?;
-    let mut output = output.take(MAX_RESULT as u64 + 1);
+    let mut child = command.spawn().map_err(|error|
+        if error.raw_os_error() == Some(libc::ENOTSUP) { DriverError::Sandbox } else { DriverError::Failed })?;
+    let pgid = child.id().and_then(|pid| i32::try_from(pid).ok()).ok_or(DriverError::Failed)?;
     let mut bytes = vec![];
-    let result = tokio::time::timeout(Duration::from_secs(request.max_seconds + 15), async {
-        let (read, exit) = tokio::join!(output.read_to_end(&mut bytes), child.wait());
-        if read.is_err() || !exit.map_err(|_| ())?.success() || bytes.len() > MAX_RESULT { return Err(()); }
-        let value: Value = serde_json::from_slice(&bytes).map_err(|_| ())?;
-        let fields = value.as_object().ok_or(())?;
-        if fields.len() != 4 || fields.keys().any(|key| !matches!(key.as_str(), "reason" | "actions" | "started" | "navigation"))
-            || !matches!(value["navigation"].as_str(), Some("not_attempted" | "completed" | "failed" | "interrupted"))
-            || value["started"].as_bool().is_none()
-            || (value["started"] == false && (value["reason"] != "stop" || value["actions"] != 0 || value["navigation"] != "not_attempted"))
-            || !matches!(value["reason"].as_str(), Some("stop" | "deadline"))
-            || value["actions"].as_u64().is_none_or(|n| n > 1000) { return Err(()); }
-        Ok(value)
-    }).await;
-    let result = match result { Ok(result) => result, Err(_) => { let _ = child.kill().await; let _ = child.wait().await; Err(()) } };
-    // Chromium's renderers/zygote outlive node unless the whole group dies.
-    kill_group(pgid).await?;
-    result
+    let limit = u64::try_from(MAX_RESULT).map_err(|_| DriverError::Failed)?.saturating_add(1);
+    let result = match child.stdout.take() {
+        None => Err(()),
+        Some(output) => {
+            let mut output = output.take(limit);
+            let deadline = Duration::from_secs(max_seconds.saturating_add(15));
+            match tokio::time::timeout(deadline, async {
+                let (read, exit) = tokio::join!(output.read_to_end(&mut bytes), child.wait());
+                if read.is_err() || !exit.map_err(|_| ())?.success() || bytes.len() > MAX_RESULT { return Err(()); }
+                driver_result(&bytes, browser.probe)
+            }).await {
+                Ok(result) => result,
+                Err(_) => Err(()),
+            }
+        }
+    };
+    if result.is_err() { let _ = child.kill().await; let _ = child.wait().await; }
+    // Chromium's renderers/zygote outlive node unless the whole group dies;
+    // finding 2: and none may be left unreaped (subreaper + ECHILD).
+    kill_and_reap(pgid).await.map_err(|()| DriverError::Survived)?;
+    result.map_err(|()| DriverError::Failed)
 }
 
 #[cfg(test)]
@@ -283,6 +421,66 @@ mod tests {
         // Chromium flags of the contained driver (pipe transport, no /dev/shm).
         assert!(DRIVER.contains("--disable-dev-shm-usage") && DRIVER.contains("--js-flags=--jitless"));
         assert!(!DRIVER.contains("--remote-debugging-port"));
+    }
+    /// Finding 4: spawnd's probe input is never a recording request, and the
+    /// probe reply is never a recording result the gateway would store.
+    #[test]
+    fn hx6fix_probe_input_and_reply_never_cross_the_recording_protocol() {
+        let probe = duduclaw_isolation::ipc::RECORDING_PROBE_REQUEST;
+        assert!(is_probe(probe));
+        assert!(Request::decode(probe).is_err());
+        let request = Request::from_arguments(&json!({"url":"https://example.com","headless":true}), PLACEHOLDER_ID).unwrap();
+        assert!(!is_probe(&request.encode().unwrap()));
+        let id = "0123456789abcdef0123456789abcdef";
+        let reply = duduclaw_isolation::ipc::recording_probe_reply(id);
+        assert!(decode_result(reply.as_bytes()).is_err());
+        assert_eq!(scratch_id(std::path::Path::new(&format!("/helper-tmp/{id}"))), Ok(id));
+        assert!(scratch_id(std::path::Path::new(&format!("/helper-tmp/{PLACEHOLDER_ID}"))).is_err());
+        assert_eq!(EXIT_BROWSER_SURVIVED, 75);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hx6fix_probe_driver_output_is_exact() {
+        assert_eq!(driver_result(br#"{"probe":"rendered"}"#, true), Ok(json!({"probe":"rendered"})));
+        let bad_outputs: [&[u8]; 4] = [br#"{"probe":"rendered","x":1}"#, br#"{"probe":"failed"}"#, b"",
+            br#"{"reason":"stop","actions":0,"started":false,"navigation":"not_attempted"}"#];
+        for bad in bad_outputs {
+            assert!(driver_result(bad, true).is_err());
+        }
+        assert!(driver_result(br#"{"probe":"rendered"}"#, false).is_err());
+        assert!(driver_result(br#"{"reason":"stop","actions":0,"started":false,"navigation":"not_attempted"}"#, false).is_ok());
+    }
+    /// Finding 2: as child subreaper, an orphaned grandchild becomes our child,
+    /// and `reap_children` reports `None` (ECHILD) only once it is gone.
+    /// Runs in a forked child: the subreaper attribute is process-wide.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn hx6fix_subreaper_reaps_orphans_before_echild() {
+        // SAFETY: the child only issues syscalls and `_exit`s.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            let ok = (|| {
+                become_subreaper().ok()?;
+                // SAFETY: as above; the middle process exits at once, the grandchild after 300 ms.
+                let middle = unsafe { libc::fork() };
+                if middle == 0 {
+                    if unsafe { libc::fork() } == 0 { std::thread::sleep(std::time::Duration::from_millis(300)); }
+                    unsafe { libc::_exit(0) }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                // The orphaned grandchild is re-parented to us: still a child.
+                if reap_children() != Children::Alive { return None; }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                (reap_children() == Children::None).then_some(())
+            })().is_some();
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) }
+        }
+        let mut status = 0;
+        // SAFETY: waits for the forked child above.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "{status}");
     }
     #[test]
     fn recording_helper_result_rejects_incomplete_or_forged_artifacts() {

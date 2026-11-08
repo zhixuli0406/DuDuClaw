@@ -9,15 +9,18 @@
 //!   `/usr` `/lib*` RX, `/etc` `/proc` RO, `/dev/null` `/dev/urandom`. Never
 //!   `/work`, `/home/employee`, `/config`, `/run`, `/tmp`, `/dev/shm`;
 //! - network (ABI ≥ 4): TCP connect only to the parent's forwarder port, no
-//!   TCP bind at all. Below ABI 4 the residual is loopback / abstract-UNIX
-//!   reach to the runtime's local listeners (threat row T5);
+//!   TCP bind at all. Landlock does not mediate pathname UNIX sockets, UDP or
+//!   raw sockets on any ABI: those are refused by the nested seccomp filter
+//!   (`recording_seccomp`, HX6 security fix round), which allows only TCP
+//!   `socket()`s. Below ABI 4 the residual is loopback TCP reach to the
+//!   runtime's local listeners (threat row T5);
 //! - scoping (ABI ≥ 6): abstract-UNIX sockets and signals outside the
 //!   browser's own domain are refused (T16 mitigation where available).
 //!
 //! Everything here is prepared before `fork`; the child's `pre_exec` only
-//! issues `landlock_restrict_self`. Any failure fails the recording closed
-//! (exit 78, `helper_recording_unsupported`): the browser never starts with a
-//! wider authority.
+//! issues `landlock_restrict_self` (then the nested filter). Any failure fails
+//! the recording closed (exit 78, `helper_recording_unsupported`): the
+//! browser never starts with a wider authority.
 use std::{ffi::CString, os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd}, path::Path};
 
 const EXECUTE: u64 = 1 << 0;
