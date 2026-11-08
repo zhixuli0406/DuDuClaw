@@ -141,12 +141,16 @@ fn isolated_native_connector_support_is_exact_and_has_no_other_provider_fallback
 #[tokio::test]
 async fn isolated_native_connector_vault_is_exact_and_expires_closed() {
     let vault = AccountCredentialVault::default();
-    assert!(vault.acquire("missing", "google").await.is_err());
-    vault.install(AccountCredential::new(ALICE_GOOGLE.into(), "google".into(), "token".into(), 1).unwrap()).unwrap();
+    assert!(vault.acquire_at("missing", "google", 1).await.is_err());
     let (_, selected, _) = fixture();
+    vault.install(AccountCredential::new(ALICE_GOOGLE.into(), "google".into(), "token".into(), 1).unwrap(),
+        selected.generation()).unwrap();
     assert!(credential(&selected, &vault).await.is_err());
-    assert!(vault.acquire(ALICE_GOOGLE, "github").await.is_err());
-    assert!(vault.install(AccountCredential::new(ALICE_GOOGLE.into(), "github".into(), "token".into(), u64::MAX).unwrap()).is_err());
+    assert!(vault.acquire_at(ALICE_GOOGLE, "github", selected.generation()).await.is_err());
+    // Without the pinned generation the vault serves nothing.
+    assert!(vault.acquire(ALICE_GOOGLE, "google").await.is_err());
+    assert!(vault.install(AccountCredential::new(ALICE_GOOGLE.into(), "github".into(), "token".into(), u64::MAX).unwrap(),
+        selected.generation()).is_err());
 }
 
 #[test]

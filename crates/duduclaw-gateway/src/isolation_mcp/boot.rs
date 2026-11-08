@@ -9,6 +9,8 @@ use super::{Dispatcher, GrantPolicy, LiveAuthority, McpBoundaryService, Protecte
     RuntimeBridgeRegistry, VerificationError};
 use crate::{isolation_connectors::{BoundConnectorExecutor, ConnectorCatalog, LiveConnectorSelectionPolicy},
     isolation_egress::RunTurnResolver, isolation_resources::GatewayResourceResolver};
+use crate::isolation_connector_boot::ConnectorProviderFactory;
+use crate::isolation_connector_stack::EmployeeConnectorProviders;
 use crate::isolation_lifecycle::{self as lifecycle, EmployeeLifecycle, RootAllocation, RootAllocator};
 use super::authority::{lifecycle_refusal, personal_facts};
 
@@ -58,6 +60,23 @@ pub struct BootSources {
     pub connector_catalog: Option<Arc<ConnectorCatalog>>,
     pub connectors: Option<Arc<dyn BoundConnectorExecutor>>,
     pub connector_selection: Option<Arc<dyn LiveConnectorSelectionPolicy>>,
+    /// F1: per-employee connector stack over `connector_catalog`. When boot
+    /// creates it, `connectors`/`connector_selection` are this same object
+    /// (inventory only) and each launch gets an employee-bound handle.
+    connector_stack: Option<Arc<EmployeeConnectorProviders>>,
+    #[cfg_attr(not(feature = "isolation-worker-integration"), allow(dead_code))]
+    connector_inputs: Option<ConnectorBootInputs>,
+}
+
+/// Gateway-side inputs of the production connector factory, collected in
+/// `boot_protected` and consumed by `assemble` (after the worker exists).
+#[cfg_attr(not(feature = "isolation-worker-integration"), allow(dead_code))]
+struct ConnectorBootInputs {
+    users: Arc<duduclaw_auth::UserDb>,
+    turns: Arc<dyn RunTurnResolver>,
+    home_binding: Option<duduclaw_isolation::capability::EmployeeBinding>,
+    hardware: duduclaw_inference::types::HardwareInfo,
+    vault: Arc<crate::isolation_connector_clients::AccountCredentialVault>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,10 +96,19 @@ static SOURCES: Mutex<Option<BootSources>> = Mutex::new(None);
 static DISPATCHER: OnceLock<Arc<dyn DispatcherFactory>> = OnceLock::new();
 static OWNER: OnceLock<Arc<BootOwner>> = OnceLock::new();
 static STATUS: OnceLock<BootStatus> = OnceLock::new();
+static CONNECTOR_FACTORY: OnceLock<Arc<dyn ConnectorProviderFactory>> = OnceLock::new();
 
 pub fn install_dispatcher_factory(factory: Arc<dyn DispatcherFactory>) -> Result<(), VerificationError> {
     if ATTEMPTED.load(Ordering::Acquire) { return Err(VerificationError::Unavailable); }
     DISPATCHER.set(factory).map_err(|_| VerificationError::Unavailable)
+}
+/// F1: optional host override of the per-employee connector factory, before
+/// `start_gateway`. Without it boot assembles `GatewayConnectorFactory` with
+/// the CLI executor factories (`connector_executor_factories()`). Either way
+/// its inventory must pass, or every connector tool stays a refusing adapter.
+pub fn install_connector_factory(factory: Arc<dyn ConnectorProviderFactory>) -> Result<(), VerificationError> {
+    if ATTEMPTED.load(Ordering::Acquire) { return Err(VerificationError::Unavailable); }
+    CONNECTOR_FACTORY.set(factory).map_err(|_| VerificationError::Unavailable)
 }
 pub fn install_boot_sources(sources: BootSources) -> Result<(), VerificationError> {
     let mut slot = SOURCES.lock().map_err(|_| VerificationError::Unavailable)?;
@@ -171,7 +199,7 @@ pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agen
             if sources.connector_catalog.is_none() {
                 sources.connector_catalog = ConnectorCatalog::open(home).ok().map(Arc::new);
             }
-            if let Ok(authority) = super::authority::GatewayAuthority::new(home.to_owned(), users, backend.clone(), agents,
+            if let Ok(authority) = super::authority::GatewayAuthority::new(home.to_owned(), users.clone(), backend.clone(), agents,
                 sources.connector_catalog.clone()) {
                 let authority = Arc::new(authority);
                 sources.authority = Some(authority.clone());
@@ -180,6 +208,13 @@ pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agen
                 sources.product_authority = Some(authority);
             }
         }
+    }
+    // F1: the per-employee connector stack, over the very catalog handle the
+    // authority above checks connector uses against. Only when the host did
+    // not supply its own singletons; a missing catalog leaves the producer
+    // missing (boot stays paused, every connector use Unavailable).
+    if sources.connectors.is_none() && sources.connector_selection.is_none() {
+        install_connector_stack(&mut sources, home, users).await;
     }
     let absent = missing(&sources, DISPATCHER.get().is_some(), backend.is_ok(), cfg!(feature = "isolation-worker-integration"));
     if !absent.is_empty() {
@@ -205,6 +240,67 @@ pub async fn boot_protected(home: &Path, users: Arc<duduclaw_auth::UserDb>, agen
                 let _ = STATUS.set(BootStatus { constructed: false, missing: vec![MissingProducer::Initialization] });
             }
         }
+    }
+}
+
+/// F1 step 1 (before the producer check): the per-employee stack over the
+/// boot catalog and the process credential vault, installed into the
+/// connector lifecycle so C3 revoke / C4 events drop exactly the material the
+/// executors read. Any failure leaves the connector producer missing.
+async fn install_connector_stack(sources: &mut BootSources, home: &Path, users: Arc<duduclaw_auth::UserDb>) {
+    use crate::isolation_connector_stack::{LifecycleBindings, installed_home_binding, readiness_report};
+    let (Some(catalog), Some(bindings), Some(turns)) =
+        (sources.connector_catalog.clone(), sources.bindings.clone(), sources.turns.clone()) else { return };
+    if sources.product_authority.is_none() { return; }
+    // Unreadable users.db: no home routes are listed (narrower, never wider);
+    // every lifecycle read refuses as well.
+    let home_binding = installed_home_binding(home).ok();
+    let Ok(lifecycle) = LifecycleBindings::new(home.to_owned()) else { return };
+    let Ok(stack) = EmployeeConnectorProviders::new(home.to_owned(), catalog, bindings, home_binding.clone(),
+        Arc::new(lifecycle), readiness_report()) else { return };
+    let stack = Arc::new(stack);
+    let vault = Arc::new(crate::isolation_connector_clients::AccountCredentialVault::default());
+    // The vault the executors use must be the one revoke drops from.
+    if crate::isolation_connector_lifecycle::install_credential_material(vault.clone()).is_err() {
+        tracing::error!("隔離連接器的憑證保管區已被其他元件註冊，連接器維持停用。");
+        return;
+    }
+    let weak = Arc::downgrade(&stack);
+    if crate::isolation_connector_lifecycle::install_route_change_hook(Arc::new(move ||
+        if let Some(stack) = weak.upgrade() { stack.schedule_refresh(); })).is_err() {
+        tracing::warn!("隔離連接器的路由變更通知無法註冊；連接器仍會在每次使用時重新檢查。");
+    }
+    let hardware = duduclaw_inference::hardware::detect_hardware().await;
+    sources.connectors = Some(stack.clone());
+    sources.connector_selection = Some(stack.clone());
+    sources.connector_stack = Some(stack);
+    sources.connector_inputs = Some(ConnectorBootInputs { users, turns, home_binding, hardware, vault });
+}
+
+/// F1 step 2 (in `assemble`, after the worker exists): install the factory —
+/// the host override or `GatewayConnectorFactory` with D3's CLI executor
+/// factories, D2 native home providers, the E2/E4 Google bridge and the boot
+/// vault — then build every confirmed employee once (reported to F3). A
+/// factory that cannot be assembled leaves every connector tool refusing and
+/// every employee `connector_setup_required`; boot itself continues.
+#[cfg(feature = "isolation-worker-integration")]
+fn install_stack_factory(home: &Path, stack: &Arc<EmployeeConnectorProviders>, inputs: ConnectorBootInputs,
+    worker: &crate::isolation_execution::InstalledWorkerServices) {
+    use crate::isolation_connector_stack::{ConnectorStackInputs, EmployeeKeyGoogleBridges, gateway_factory};
+    let factory = match CONNECTOR_FACTORY.get() {
+        Some(factory) => Ok(factory.clone()),
+        None => gateway_factory(home, stack.catalog(), inputs.home_binding, ConnectorStackInputs {
+            google: Arc::new(EmployeeKeyGoogleBridges { users: Some(inputs.users), turns: inputs.turns }),
+            search: Arc::new(worker.clone()),
+            hardware: inputs.hardware,
+            computer_sessions: crate::computer_use_sessions::workspace_admin::admin_sessions(home),
+            executors: crate::isolation_connector_boot::connector_executor_factories(),
+            vault: inputs.vault,
+        }).map(|assembled| assembled.factory as Arc<dyn ConnectorProviderFactory>),
+    };
+    match factory.and_then(|factory| stack.install_factory(factory)) {
+        Ok(()) => stack.schedule_refresh(),
+        Err(_) => tracing::error!("隔離連接器工廠無法建立，所有連接器工具維持拒絕；請檢查連接器設定後重新啟動服務。"),
     }
 }
 
@@ -257,6 +353,9 @@ struct BootOwner {
     catalog: Option<Arc<ConnectorCatalog>>,
     connectors: Option<Arc<dyn BoundConnectorExecutor>>,
     connector_selection: Option<Arc<dyn LiveConnectorSelectionPolicy>>,
+    /// F1: when present, each launch selects/executes through an
+    /// employee-bound handle of this stack instead of the singletons above.
+    connector_stack: Option<Arc<EmployeeConnectorProviders>>,
 }
 
 /// D proves its live owner and the binary's actual complete routing inventory.
@@ -466,6 +565,13 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
     let boundary = McpBoundaryService::start(live)?;
     let worker = crate::isolation_execution::install_worker_services(
         sources.worker_launcher.take().ok_or(VerificationError::Unavailable)?)?;
+    // F1: the stack must read the very catalog handle the authority reads.
+    if let Some(stack) = &sources.connector_stack {
+        if sources.connector_catalog.as_ref().is_none_or(|catalog| !Arc::ptr_eq(catalog, stack.catalog())) {
+            return Err(VerificationError::Unavailable);
+        }
+        if let Some(inputs) = sources.connector_inputs.take() { install_stack_factory(home, stack, inputs, &worker); }
+    }
     let execution_jobs = duduclaw_mcp_boundary::execution_jobs::SqliteExecutionJobs::open(&home.join("isolation-execution-jobs.db"))?;
     let fork_tools = match sources.fork_tools.take() {
         Some(service) => service,
@@ -481,7 +587,7 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
         worker_plans: sources.worker_plans.take().ok_or(VerificationError::Unavailable)?,
         turns: sources.turns.take().ok_or(VerificationError::Unavailable)?,
         catalog: sources.connector_catalog, connectors: sources.connectors,
-        connector_selection: sources.connector_selection })
+        connector_selection: sources.connector_selection, connector_stack: sources.connector_stack })
 }
 
 pub(super) async fn claude_plan(home: PathBuf, agent: String, class: duduclaw_isolation::execution::ExecutionClass,
@@ -530,6 +636,8 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
         let mapping = crate::handlers::resolve_confirmed_employee(&checking_owner.home, &input.agent)
             .map_err(|_| VerificationError::Unavailable)?;
         if mapping.employee != input.plan.employee { return Err(VerificationError::BindingMismatch); }
+        // F1: a changed binding/employee forgets the connector build (rebuilt at first use).
+        if let Some(stack) = &checking_owner.connector_stack { stack.observe_lifecycle(&input.agent); }
         let prepared = match &checking_owner.product_authority {
             Some(authority) => {
                 let prepared = authority.prepare(&input.agent, &mut input.grant, input.authenticated_epoch)?;
@@ -544,7 +652,16 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
     }).await?;
     let mut resolver = GatewayResourceResolver::new(owner.home.clone(), input.plan.employee, input.agent.clone(), owner.bindings.clone())?;
     if let Some(catalog) = &owner.catalog { resolver = resolver.with_connector_catalog(catalog.clone()); }
-    if let Some(selection) = &owner.connector_selection { resolver = resolver.with_connector_selection_policy(selection.clone()); }
+    // F1: this employee's providers (rebuilt on route/binding change); the
+    // boot singletons are inventory objects and never serve a call.
+    let (selection, connectors) = match &owner.connector_stack {
+        Some(stack) => {
+            let handle = Arc::new(stack.for_employee(&input.agent, input.plan.employee)?);
+            (Some(handle.clone() as Arc<dyn LiveConnectorSelectionPolicy>), Some(handle as Arc<dyn BoundConnectorExecutor>))
+        }
+        None => (owner.connector_selection.clone(), owner.connectors.clone()),
+    };
+    if let Some(selection) = selection { resolver = resolver.with_connector_selection_policy(selection); }
     let resolver = Arc::new(resolver);
     #[cfg(feature = "isolation-worker-integration")]
     {
@@ -559,7 +676,7 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
             .with_worker(owner.worker.tools(worker_plans, resolver.clone()));
         let dispatcher_input = DispatcherInput {
             home: owner.home.clone(), employee: input.plan.employee, agent: input.agent,
-            roots: input.roots, resolver, factories, turns: owner.turns.clone(), connectors: owner.connectors.clone(),
+            roots: input.roots, resolver, factories, turns: owner.turns.clone(), connectors,
         };
         let dispatcher = duduclaw_mcp_boundary::authority::verify_blocking(move ||
             DISPATCHER.get().ok_or(VerificationError::Unavailable)?.create(dispatcher_input)).await?;
@@ -574,7 +691,7 @@ pub async fn prepare_launch(mut input: LaunchInput) -> Result<Arc<dyn duduclaw_e
         };
     }
     #[cfg(not(feature = "isolation-worker-integration"))]
-    Err(VerificationError::Unavailable)
+    { let _ = connectors; Err(VerificationError::Unavailable) }
 }
 
 #[cfg(test)]

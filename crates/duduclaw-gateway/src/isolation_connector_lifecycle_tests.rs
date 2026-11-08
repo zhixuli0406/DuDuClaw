@@ -19,9 +19,9 @@ impl LiveConnectorSelectionPolicy for Policy {
     }
 }
 fn text<const N: usize>(value: &str) -> Text<N> { Text::new(value.into()).unwrap() }
-fn acquired(vault: &AccountCredentialVault, account: &AccountId) -> bool {
+fn acquired(vault: &AccountCredentialVault, account: &AccountId, generation: u64) -> bool {
     tokio::runtime::Builder::new_current_thread().build().unwrap()
-        .block_on(vault.acquire(account.as_str(), "google")).is_ok()
+        .block_on(vault.acquire_at(account.as_str(), "google", generation)).is_ok()
 }
 fn alice() -> EmployeeBinding { EmployeeBinding::Personal(text("alice")) }
 fn actor() -> AdminActor { AdminActor::verified("0b6f2f8e-8c1d-4a51-9b40-2f1d4f6c9a10").unwrap() }
@@ -63,7 +63,7 @@ impl CredentialMaterial for Probe {
     fn drop_material(&self, account: &AccountId) -> Result<(), VerificationError> {
         self.observed.lock().unwrap().push(self.selected.recheck());
         // Material is still present here: only the route fence is refusing.
-        assert!(acquired(&self.vault, account));
+        assert!(acquired(&self.vault, account, self.selected.generation()));
         self.vault.drop_material(account)
     }
 }
@@ -75,8 +75,8 @@ fn revoke_fences_selected_connector_before_effect() {
     let account = provision(home.path(), "google", ConnectorKind::Personal, &alice(), "alice work", None, &actor()).unwrap();
     let selected = selection(home.path(), &account);
     let vault = AccountCredentialVault::default();
-    vault.install(AccountCredential::new(account.to_string(), "google".into(), "fixture-token".into(), u64::MAX).unwrap())
-        .unwrap();
+    vault.install(AccountCredential::new(account.to_string(), "google".into(), "fixture-token".into(), u64::MAX).unwrap(),
+        selected.generation()).unwrap();
     let probe = Probe { selected: selected.clone(), vault, observed: Mutex::new(Vec::new()) };
 
     let route = revoke_with(home.path(), &account, &actor(), Some(&probe)).unwrap();
@@ -87,7 +87,7 @@ fn revoke_fences_selected_connector_before_effect() {
     let mut effects = 0;
     for _ in 0..3 { if selected.recheck().is_ok() { effects += 1; } }
     assert_eq!(effects, 0);
-    assert!(!acquired(&probe.vault, &account));
+    assert!(!acquired(&probe.vault, &account, selected.generation()));
     // Revocation is final and idempotent; it never revives the route.
     revoke_with(home.path(), &account, &actor(), None).unwrap();
     assert!(!ConnectorCatalog::open(home.path()).unwrap().route(&account).unwrap().unwrap().active);

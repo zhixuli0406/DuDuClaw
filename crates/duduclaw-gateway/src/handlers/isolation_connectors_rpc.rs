@@ -408,7 +408,7 @@ mod tests {
         // Material exists in the process vault; the listing never consults it.
         let vault = AccountCredentialVault::default();
         vault.install(AccountCredential::new(personal.to_string(), "google".into(), "ya29.secret-material".into(), u64::MAX)
-            .unwrap()).unwrap();
+            .unwrap(), 1).unwrap();
         let catalog = ConnectorCatalog::open(home.path()).unwrap();
         catalog.revoke(&team).unwrap();
 

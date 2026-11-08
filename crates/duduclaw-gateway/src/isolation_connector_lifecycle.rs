@@ -81,11 +81,28 @@ impl CredentialMaterial for AccountCredentialVault {
 }
 
 static MATERIAL: OnceLock<Arc<dyn CredentialMaterial>> = OnceLock::new();
+static ROUTES_CHANGED: OnceLock<Arc<dyn Fn() + Send + Sync>> = OnceLock::new();
 
 /// Boot installs the process vault once (F1). Without it, revoke still fences
-/// the route; there is then no in-process material to drop.
+/// the route; there is then no in-process material to drop. The vault is
+/// keyed by (account, generation), so material of an advanced generation is
+/// never served even before it is dropped.
 pub fn install_credential_material(material: Arc<dyn CredentialMaterial>) -> Result<(), CatalogError> {
     MATERIAL.set(material).map_err(|_| CatalogError::Unavailable)
+}
+
+/// F1: boot installs one hook that schedules a rebuild of the per-employee
+/// connector providers (and their readiness report). It must not block: it
+/// is called on the RPC/event path right after a catalog change committed.
+/// Correctness never depends on it — every provider use re-reads the catalog
+/// and rebuilds on a changed route set; the hook only refreshes readiness.
+pub fn install_route_change_hook(hook: Arc<dyn Fn() + Send + Sync>) -> Result<(), CatalogError> {
+    ROUTES_CHANGED.set(hook).map_err(|_| CatalogError::Unavailable)
+}
+
+/// A catalog route was provisioned, revoked, advanced or relinked.
+pub(crate) fn routes_changed() {
+    if let Some(hook) = ROUTES_CHANGED.get() { hook(); }
 }
 
 /// The process vault installed by boot, if any. C4 credential events drop
@@ -179,6 +196,7 @@ fn provision_with(home: &Path, provider: &str, kind: ConnectorKind, binding: &Em
             audited["details_employee"] = json!(record.as_ref().map(|record: &AccountDetailRecord| hex::encode(record.employee.0)));
             audited["origin"] = origin_name(origin);
             audit(home, "isolation.connector_provisioned", actor, audited);
+            routes_changed();
             Ok(route.account)
         }
         Ok(None) => {
@@ -241,6 +259,7 @@ pub(crate) fn revoke_with(home: &Path, account: &AccountId, actor: &AdminActor,
         }
     };
     audit(home, "isolation.connector_revoked", actor, route_details(&route, "fenced"));
+    routes_changed();
     let Some(material) = material else { return Ok(route) };
     if material.drop_material(account).is_err() {
         audit(home, "isolation.connector_material_removal_failed", actor,

@@ -277,6 +277,12 @@ impl ComputerUseSessions {
 /// The registry operator actions run against: the live gateway's (so the
 /// barrier reaches its sessions), else a session-less one over `home` (a
 /// process with no live sessions has nothing to wait for).
+/// The live gateway registry for exactly `home`, if one exists (F1).
+pub fn live_sessions(home: &std::path::Path) -> Option<std::sync::Arc<ComputerUseSessions>> {
+    super::active_registry().lock().unwrap_or_else(|p| p.into_inner()).upgrade()
+        .filter(|sessions| sessions.home() == home)
+}
+
 pub fn admin_sessions(home: &std::path::Path) -> std::sync::Arc<ComputerUseSessions> {
     let live = super::active_registry()
         .lock()

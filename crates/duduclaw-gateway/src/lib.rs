@@ -42,6 +42,7 @@ pub mod isolation_connector_clients;
 pub mod isolation_connector_lifecycle;
 pub(crate) mod isolation_connector_events;
 pub mod isolation_connector_boot;
+pub mod isolation_connector_stack;
 pub mod isolation_connector_details;
 pub mod isolation_connector_channel;
 pub mod isolation_connector_model;
