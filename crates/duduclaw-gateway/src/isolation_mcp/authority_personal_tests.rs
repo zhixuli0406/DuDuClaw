@@ -14,6 +14,10 @@ use rusqlite::Connection;
 const LABEL: &str = "alice-personal";
 const USERS_DB: &str = "users.db";
 
+/// C2 connector-account tests reuse this module's real-store fixture.
+#[path = "authority_connector_tests.rs"]
+mod connector_tests;
+
 struct Accept;
 impl ProposalValidator for Accept {
     fn validate_fresh(&self, _: &ConfirmationItem) -> Result<(), ConfirmationError> { Ok(()) }
