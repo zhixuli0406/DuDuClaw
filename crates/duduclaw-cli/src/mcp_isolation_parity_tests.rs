@@ -99,14 +99,21 @@ fn documented_refusals() -> BTreeSet<String> {
 // intentional product refusals. Keep this list independent of eligible() so
 // a policy regression cannot silently expand the accepted gap.
 fn pending_production_selectors() -> BTreeSet<String> {
-    ["create_task", "spawn_agent", "spawn_ephemeral", "skill_extract", "execute_program",
+    // H12a removed skill_extract, shared_skill_adopt, skill_security_scan,
+    // skill_graduate and skill_curator_status: they select the issuer's own
+    // Employee (+ own Confined wiki) under EmployeeScope, not a workspace.
+    ["create_task", "spawn_agent", "spawn_ephemeral", "execute_program",
         "office_script", "inspect_branches", "diff_branches", "fork_cost", "discovery_catalog",
         "discovery_list", "discovery_tree", "discovery_artifact", "discovery_cancel",
-        "shared_skill_adopt", "browser_record_start", "browser_record_stop", "skill_from_recording",
-        "code_map", "skill_security_scan", "skill_graduate", "skill_synthesis_run", "skill_hub_install",
-        "skill_curator_status", "file_read", "csv_read", "xlsx_read", "web_fetch_cached", "web_extract"]
+        "browser_record_start", "browser_record_stop", "skill_from_recording",
+        "code_map", "skill_synthesis_run", "skill_hub_install",
+        "file_read", "csv_read", "xlsx_read", "web_fetch_cached", "web_extract"]
         .into_iter().map(str::to_owned).collect()
 }
+
+/// H12a tools the production issuer must make eligible without new selectors.
+const H12A_OWN_SKILL_TOOLS: [&str; 5] = ["skill_extract", "shared_skill_adopt", "skill_security_scan",
+    "skill_graduate", "skill_curator_status"];
 
 fn employee_config(extra_capabilities: &str) -> String {
     format!(r#"[agent]
@@ -337,6 +344,12 @@ async fn employee_tool_parity(home: &std::path::Path) {
             "{tool}: production selector gap changed; review this inventory");
     }
     assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, "knowledge_add_source"));
+    assert_eq!(duduclaw_mcp_boundary::tool_policy::OWN_SKILL_TOOLS, &H12A_OWN_SKILL_TOOLS[..]);
+    for tool in H12A_OWN_SKILL_TOOLS {
+        assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool),
+            "{tool}: the production issuer's EmployeeScope + own Employee (+ own wiki) must suffice");
+        assert!(!pending.contains(tool), "{tool}");
+    }
     // Missing producer authority must narrow discovery, not become a transport exception.
     let mut without_wiki = context.record().clone();
     without_wiki.resources = List::new(without_wiki.resources.as_slice().iter()
@@ -374,7 +387,8 @@ async fn employee_tool_parity(home: &std::path::Path) {
                 "cost_summary", "list_agents", "computer_session_start", "computer_workspace_list", "computer_workspace_write",
                 "group_history_read", "knowledge_search", "knowledge_get_passage", "knowledge_list_collections", "knowledge_add_source",
                 "meeting_transcribe", "meeting_upload_link", "file_read", "csv_read", "xlsx_read", "code_map", "execute_program",
-                "skill_extract", "web_fetch_cached", "web_extract", "model_search", "model_recommend"] {
+                "skill_extract", "web_fetch_cached", "web_extract", "model_search", "model_recommend",
+                "shared_skill_adopt", "skill_security_scan", "skill_graduate", "skill_curator_status"] {
                 assert!(ordinary.contains(tool), "production fixture did not enable {tool}");
                 assert_eq!(isolated.contains(tool), !pending.contains(tool),
                     "production inventory disagrees with tracked selector gap: {tool}");

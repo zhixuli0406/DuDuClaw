@@ -570,6 +570,26 @@ pub async fn run_pass(
     Ok(report)
 }
 
+/// H12a / D-H4: a protected employee's own curator pass. Discovery, the
+/// approval binding, every mutation and the totals are limited to
+/// `agent:<agent>`; the report is returned, not published to the shared wiki.
+/// `agent` must come from the capability-bound caller, never tool arguments.
+/// Always the isolated implementation (fails closed off Linux).
+pub async fn run_owned_pass(
+    home_dir: &Path,
+    store: &CustomSkillStore,
+    cfg: &CuratorConfig,
+    now: DateTime<Utc>,
+    agent: &str,
+) -> Result<CuratorReport, String> {
+    protected::run_owned(home_dir, store, cfg, now, agent).await
+}
+
+/// `agent:<id>` curation scope of a valid employee id (refuses anything else).
+pub fn owned_scope(agent: &str) -> Result<String, String> {
+    protected::owned_scope(agent)
+}
+
 /// Scheduler entry point: run at most once per [`RUN_INTERVAL_SECS`], only
 /// when `[skill_curator] enabled` (default true). Errors are logged, never
 /// propagated into the scheduler loop.

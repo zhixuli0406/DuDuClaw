@@ -4,6 +4,10 @@ use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, Capab
     EmployeeBinding, Lane, Principal, ResourceGrant}, ids::{EmployeeId, RunId, Sha256Digest}};
 use crate::{parsing::{TableKind, TableOptions, table_request}, tool_policy::ToolPolicy};
 
+// The generic bridge fixture is a Worker route that still selects a workspace
+// (`model_load`); H12a own-skill tools pin an exact own-employee selection and
+// have their own tests in `tool_policy_tests.rs`.
+
 struct TestLive;
 impl duduclaw_isolation::capability::LiveRequestVerifier for TestLive {
     fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> { Ok(()) }
@@ -13,7 +17,7 @@ fn context() -> RequestContext {
         id: CapabilityId(Sha256Digest([1; 32])), employee: EmployeeId([2; 16]), run: RunId([3; 16]),
         task: None, principal: Principal::Human { user_id: Text::new("owner".into()).unwrap(), generation: 1 },
         employee_binding: EmployeeBinding::Personal(Text::new("owner".into()).unwrap()), lane: Lane::Standard,
-        tools: List::new(vec![Text::new("skill_security_scan".into()).unwrap()]).unwrap(),
+        tools: List::new(vec![Text::new("model_load".into()).unwrap()]).unwrap(),
         resources: List::new(vec![ResourceGrant::Employee { id: EmployeeId([2; 16]) },
             ResourceGrant::Workspace { handle: Text::new("work".into()).unwrap() },
             ResourceGrant::Workspace { handle: Text::new("other".into()).unwrap() }]).unwrap(),
@@ -32,7 +36,7 @@ impl ResourceResolver for Resolver {
 }
 struct Factory { refused: bool, finishes: AtomicUsize }
 impl WorkerPlanFactory for Factory {
-    fn supports(&self, tool: &str) -> bool { matches!(tool, "skill_security_scan" | "execute_program") }
+    fn supports(&self, tool: &str) -> bool { matches!(tool, "model_load" | "execute_program") }
     fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
         Box::pin(async move { if self.refused { Err(VerificationError::Invalid) } else { Ok(()) } })
     }
@@ -47,7 +51,7 @@ impl WorkerPlanFactory for Factory {
     }
 }
 fn call() -> AuthorizedToolCall {
-    tool_policy::authorize(&context(), "skill_security_scan", &json!({}),
+    tool_policy::authorize(&context(), "model_load", &json!({}),
         &Resolver { calls: AtomicUsize::new(0), changes: false }).unwrap()
 }
 fn plan() -> WorkerPlan { plan_for(&call()) }
@@ -79,10 +83,10 @@ fn bridge(refused: bool, changes: bool, forged: bool) -> (WorkerToolBridge, Arc<
 #[tokio::test]
 async fn isolated_worker_factory_serves_only_registered_worker_routes() {
     let (bridge, factory, invocations) = bridge(false, false, false);
-    assert!(bridge.supports("skill_security_scan"));
+    assert!(bridge.supports("model_load"));
     assert!(!bridge.supports("execute_program"));
-    assert!(!bridge.supports("skill_security_scan_extra"));
-    assert_eq!(bridge.execute(&context(), "skill_security_scan", &json!({})).await["isError"], false);
+    assert!(!bridge.supports("model_load_extra"));
+    assert_eq!(bridge.execute(&context(), "model_load", &json!({})).await["isError"], false);
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
     assert_eq!(factory.finishes.load(Ordering::SeqCst), 1);
 }
@@ -90,7 +94,7 @@ async fn isolated_worker_factory_serves_only_registered_worker_routes() {
 #[tokio::test]
 async fn isolated_worker_factory_policy_refusal_never_launches() {
     let (bridge, factory, invocations) = bridge(true, false, false);
-    assert_eq!(bridge.execute(&context(), "skill_security_scan", &json!({})).await["isError"], true);
+    assert_eq!(bridge.execute(&context(), "model_load", &json!({})).await["isError"], true);
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
     assert_eq!(factory.finishes.load(Ordering::SeqCst), 0);
 }
@@ -98,7 +102,7 @@ async fn isolated_worker_factory_policy_refusal_never_launches() {
 #[tokio::test]
 async fn isolated_worker_factory_rechecks_resource_after_parse() {
     let (bridge, factory, invocations) = bridge(false, true, false);
-    assert_eq!(bridge.execute(&context(), "skill_security_scan", &json!({})).await["isError"], true);
+    assert_eq!(bridge.execute(&context(), "model_load", &json!({})).await["isError"], true);
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
     assert_eq!(factory.finishes.load(Ordering::SeqCst), 0);
 }
@@ -106,7 +110,7 @@ async fn isolated_worker_factory_rechecks_resource_after_parse() {
 #[tokio::test]
 async fn isolated_worker_factory_rejects_forged_result_before_finish() {
     let (bridge, factory, invocations) = bridge(false, false, true);
-    assert_eq!(bridge.execute(&context(), "skill_security_scan", &json!({})).await["isError"], true);
+    assert_eq!(bridge.execute(&context(), "model_load", &json!({})).await["isError"], true);
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
     assert_eq!(factory.finishes.load(Ordering::SeqCst), 0);
 }
@@ -155,7 +159,7 @@ async fn isolated_worker_rejects_other_calls_regular_file_before_invoke() {
         }
         fn prepare<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, WorkerPlan> {
             Box::pin(async {
-                let other = tool_policy::authorize(&context(), "skill_security_scan", &json!({}),
+                let other = tool_policy::authorize(&context(), "model_load", &json!({}),
                     &Resolver { calls: AtomicUsize::new(2), changes: true })?;
                 Ok(plan_for(&other))
             })
@@ -167,12 +171,12 @@ async fn isolated_worker_rejects_other_calls_regular_file_before_invoke() {
     let bridge = WorkerToolBridge::new(Arc::new(WrongInput),
         Arc::new(Resolver { calls: AtomicUsize::new(0), changes: false }),
         Arc::new(|_| panic!("another call's input reached worker")));
-    assert_eq!(bridge.execute(&context(), "skill_security_scan", &json!({})).await["isError"], true);
+    assert_eq!(bridge.execute(&context(), "model_load", &json!({})).await["isError"], true);
 }
 
 struct StatefulFactory;
 impl WorkerPlanFactory for StatefulFactory {
-    fn supports(&self, name: &str) -> bool { name == "skill_security_scan" }
+    fn supports(&self, name: &str) -> bool { name == "model_load" }
     fn authorize_handler<'a>(&'a self, _: &'a AuthorizedToolCall) -> PolicyFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -198,8 +202,8 @@ async fn isolated_worker_host_metadata_stays_request_local_across_concurrent_cal
     let context = context();
     let first = json!({"marker":"first"});
     let second = json!({"marker":"second"});
-    let (a, b) = tokio::join!(bridge.execute(&context, "skill_security_scan", &first),
-        bridge.execute(&context, "skill_security_scan", &second));
+    let (a, b) = tokio::join!(bridge.execute(&context, "model_load", &first),
+        bridge.execute(&context, "model_load", &second));
     assert_eq!(a["marker"], "first");
     assert_eq!(b["marker"], "second");
 }
@@ -209,12 +213,12 @@ async fn i1c_composite_keeps_primary_refusal_and_never_falls_through_after_selec
     let primary = Arc::new(Factory { refused: true, finishes: AtomicUsize::new(0) });
     let fallback = Arc::new(Factory { refused: false, finishes: AtomicUsize::new(0) });
     let composite = Arc::new(CompositeWorkerPlans::new(vec![primary.clone(), fallback.clone()]).unwrap());
-    assert!(composite.supports("skill_security_scan"));
+    assert!(composite.supports("model_load"));
     assert!(!composite.supports("missing"));
     assert!(CompositeWorkerPlans::new(vec![]).is_err());
     let bridge = WorkerToolBridge::new(composite, Arc::new(Resolver { calls: AtomicUsize::new(0), changes: false }),
         Arc::new(|_| panic!("primary refusal must stop before E")));
-    assert_eq!(bridge.execute(&context(), "skill_security_scan", &json!({})).await["isError"], true);
+    assert_eq!(bridge.execute(&context(), "model_load", &json!({})).await["isError"], true);
     assert_eq!(primary.finishes.load(Ordering::SeqCst), 0);
     assert_eq!(fallback.finishes.load(Ordering::SeqCst), 0);
 }
@@ -248,7 +252,7 @@ async fn isolated_worker_revoked_before_prepare_has_no_host_effect() {
         Arc::new(Resolver { calls: AtomicUsize::new(0), changes: false }),
         Arc::new(|_| panic!("revoked request reached E")));
     let context = RequestContext::with_live_verifier(context().record().clone(), Arc::new(Revoked));
-    assert_eq!(bridge.execute(&context, "skill_security_scan", &json!({})).await["isError"], true);
+    assert_eq!(bridge.execute(&context, "model_load", &json!({})).await["isError"], true);
     assert_eq!(effects.load(Ordering::SeqCst), 0);
 }
 
@@ -286,7 +290,7 @@ async fn isolated_worker_prepare_carries_live_authority_across_await() {
         Arc::new(Resolver { calls: AtomicUsize::new(0), changes: false }),
         Arc::new(|_| panic!("revoked request reached E")));
     let context = RequestContext::with_live_verifier(context().record().clone(), Arc::new(Changing(live)));
-    assert_eq!(bridge.execute(&context, "skill_security_scan", &json!({})).await["isError"], true);
+    assert_eq!(bridge.execute(&context, "model_load", &json!({})).await["isError"], true);
     assert_eq!(effects.load(Ordering::SeqCst), 0);
     assert!(!crate::io_authority::is_scoped());
 }
