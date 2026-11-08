@@ -233,6 +233,11 @@ impl MethodHandler {
                 if let Err(error) = self.registry.write().await.scan().await {
                     warn!(error = %error, "employee tombstone: registry rescan failed");
                 }
+                // F6h (H5): the tombstone aborted the employee's running bots;
+                // drop their handles and status here (exact `<channel>:<label>`).
+                for channel in crate::isolation_label_bots::BOT_CHANNELS {
+                    self.hot_stop_channel(&format!("{channel}:{label}")).await;
+                }
                 // F6a (A8): approvals naming the employee die with it.
                 if let Some(employee) = employee {
                     invalidate_employee_approvals(&approvals_home, &label, employee).await;

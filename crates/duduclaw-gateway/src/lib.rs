@@ -66,6 +66,11 @@ pub(crate) mod isolation_quarantine;
 // Purge / re-key entry points are consumed by F6i / F6g (not yet merged).
 #[allow(dead_code)]
 pub(crate) mod isolation_label_stores;
+// F6h: running per-employee channel bots (tombstone stop hook).
+pub(crate) mod isolation_label_bots;
+// F6h: restore / purge of the label-keyed state the tombstone held (F6c, F6i).
+#[allow(dead_code)]
+pub(crate) mod isolation_label_restore;
 pub mod migration_import;
 pub mod migration_startup;
 

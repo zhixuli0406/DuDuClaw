@@ -409,6 +409,7 @@ async fn spawn_telegram_bot(
     if let Some(agent) = &agent_name {
         if !crate::isolation_label_stores::channel_bot_allowed(_home_dir, agent, "telegram").await {
             warn!(agent = %agent, "per-agent Telegram bot not started: no live protected lifecycle or channel route");
+            crate::isolation_label_bots::refused(_home_dir, "telegram", agent);
             return None;
         }
     }
@@ -504,9 +505,17 @@ async fn spawn_telegram_bot(
     // every polling cycle instead of holding it fixed for the task's entire
     // lifetime, so a token change lands within one `getUpdates` cycle instead
     // of requiring this task (or the gateway) to be restarted.
+    let agent = agent_name.clone();
     let handle = tokio::spawn(async move {
         poll_loop(client, token, ctx, label, agent_name).await;
     });
+    // F6h (H5): a per-agent bot is registered so a tombstone can stop it.
+    if let Some(agent) = agent {
+        if !crate::isolation_label_bots::admit(_home_dir, "telegram", &agent, handle.abort_handle()).await {
+            warn!(agent = %agent, "per-agent Telegram bot stopped: the employee is no longer live");
+            return None;
+        }
+    }
 
     Some(handle)
 }

@@ -185,11 +185,13 @@ async fn spawn_slack_bot(
     if let Some(agent) = &agent_name {
         if !crate::isolation_label_stores::channel_bot_allowed(&ctx.home_dir, agent, "slack").await {
             warn!(agent = %agent, "per-agent Slack bot not started: no live protected lifecycle or channel route");
+            crate::isolation_label_bots::refused(&ctx.home_dir, "slack", agent);
             return None;
         }
     }
     info!("Slack Socket Mode starting (label: {label})...");
 
+    let (home, agent) = (ctx.home_dir.clone(), agent_name.clone());
     let handle = tokio::spawn(async move {
         loop {
             match run_socket_mode(&app_token, &bot_token, &ctx, &label, agent_name.as_deref()).await
@@ -201,6 +203,13 @@ async fn spawn_slack_bot(
             info!("Slack Socket Mode reconnecting ({label})...");
         }
     });
+    // F6h (H5): a per-agent bot is registered so a tombstone can stop it.
+    if let Some(agent) = agent {
+        if !crate::isolation_label_bots::admit(&home, "slack", &agent, handle.abort_handle()).await {
+            warn!(agent = %agent, "per-agent Slack bot stopped: the employee is no longer live");
+            return None;
+        }
+    }
 
     Some(handle)
 }

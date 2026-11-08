@@ -303,7 +303,11 @@ async fn session_writer_refused_for_quarantined_label() {
     let _mode = Mode::protected(true);
     let refused = sessions.append_message("webchat:old", "user", "planted", 1).await.unwrap_err();
     assert!(refused.to_string().contains(LABEL_QUARANTINED), "{refused}");
-    let refused = sessions.get_or_create("webchat:new", LABEL).await.unwrap_err();
+    // `Session` has no `Debug` (it may hold secrets): no `unwrap_err`.
+    let refused = match sessions.get_or_create("webchat:new", LABEL).await {
+        Ok(_) => panic!("expected the writer gate to refuse a new session"),
+        Err(error) => error,
+    };
     assert!(refused.to_string().contains(LABEL_QUARANTINED), "{refused}");
     sessions.get_or_create("webchat:bob", OTHER).await.unwrap();
     sessions.append_message("webchat:bob", "user", "hello", 1).await.unwrap();
@@ -422,6 +426,141 @@ fn delegation_target_to_label_paused() {
     assert!(current.contains(LABEL), "the label's own entry is in the seal digest, not stripped");
     let row = quarantine::read_quarantine(&apply_db(home), EmployeeId([1; 16]), 0).unwrap().unwrap();
     assert_eq!(row.stripped["global_routes"]["delegation_targets"], json!([format!("reports_to:{OTHER}")]));
+}
+
+fn credential<'a>(list: &'a [crate::website_credentials::Metadata], label: &str) -> Option<&'a crate::website_credentials::Metadata> {
+    list.iter().find(|m| m.label == label)
+}
+
+/// §3.3 restore fidelity: the tombstone holds the label's website grants
+/// under the row key instead of deleting anything; the held grant is not
+/// usable, the record cannot be deleted while held, and the exact entries
+/// (credential id + grant) are in `stripped.restore`.
+#[test]
+fn tombstone_keeps_website_credentials_for_restore() {
+    use crate::website_credentials as web;
+    let dir = private_home();
+    let home = dir.path();
+    seed_config(home, LABEL, OTHER);
+    quarantine_row(home, LABEL, 1, "sealed");
+    let key = quarantine_key(EmployeeId([1; 16]), 0);
+    let before = web::list(home).unwrap();
+    let summary = tombstone_effects(home, LABEL, EmployeeId([1; 16]), 0);
+    assert_eq!(summary["fences"], json!([]), "{summary}");
+    let after = web::list(home).unwrap();
+    assert_eq!(after.len(), 2, "no credential is deleted at tombstone");
+    let held = vec![web::HeldGrant { agent: LABEL.to_owned(), key: key.clone() }];
+    let erp = credential(&after, "erp").unwrap();
+    assert!(erp.allowed_agents.is_empty(), "the only grant is held, not usable");
+    assert_eq!(erp.held_grants, held);
+    let crm = credential(&after, "crm").unwrap();
+    assert_eq!((crm.allowed_agents.clone(), crm.held_grants.clone()), (vec![OTHER.to_owned()], held.clone()));
+    assert!(web::for_agent(home, LABEL, "erp").unwrap().is_none());
+    assert!(web::for_agent(home, LABEL, "crm").unwrap().is_none());
+    assert!(web::for_agent(home, OTHER, "crm").unwrap().is_some(), "the other employee keeps its grant");
+    assert!(web::delete(home, &erp.id).is_err(), "a held record is not deleted");
+    assert_eq!(web::list(home).unwrap().len(), 2);
+    assert_eq!(store("website_credentials").count_under(home, LABEL), Ok(0), "nothing under the label");
+    assert_eq!(store("website_credentials").count_under(home, &key), Ok(2), "held under the row key");
+    let row = quarantine::read_quarantine(&apply_db(home), EmployeeId([1; 16]), 0).unwrap().unwrap();
+    let entries = row.stripped["restore"]["website_credentials"].as_array().unwrap().clone();
+    let mut ids: Vec<&str> = entries.iter().map(|e| e["id"].as_str().unwrap()).collect();
+    ids.sort();
+    let mut expected: Vec<&str> = before.iter().map(|m| m.id.as_str()).collect();
+    expected.sort();
+    assert_eq!(ids, expected, "credential ids recorded");
+    assert!(entries.iter().all(|e| e["agent"] == LABEL && e["key"] == key.as_str()), "{entries:?}");
+    assert!(!entries.iter().any(|e| e.to_string().contains("secret-password") || e.to_string().contains("svc")),
+        "no secret or username in the row");
+    // A retry records nothing twice and changes nothing.
+    tombstone_effects(home, LABEL, EmployeeId([1; 16]), 0);
+    let row = quarantine::read_quarantine(&apply_db(home), EmployeeId([1; 16]), 0).unwrap().unwrap();
+    assert_eq!(row.stripped["restore"]["website_credentials"].as_array().unwrap(), &entries);
+    assert_eq!(web::list(home).unwrap(), after);
+}
+
+/// Same-id restore entry point (F6c): held website grants are re-granted;
+/// `reports_to` edges are re-applied only where the child still exists and
+/// still reports to the root; channel routes and paused work stay listed.
+#[test]
+fn restore_label_stores_regrants_credentials_and_edges() {
+    use crate::isolation_label_restore::restore_label_stores;
+    use crate::website_credentials as web;
+    use duduclaw_core::org_store::{self as org, OrgEntry};
+    let dir = private_home();
+    let home = dir.path();
+    seed_config(home, LABEL, OTHER);
+    org::with_org_lock(home, |guard| {
+        org::upsert(guard, "carol-desk", OrgEntry::new(LABEL, "ops"))?;
+        org::upsert(guard, "dave-desk", OrgEntry::new(LABEL, "ops"))?;
+        Ok(())
+    }).unwrap();
+    quarantine_row(home, LABEL, 1, "sealed");
+    tombstone_effects(home, LABEL, EmployeeId([1; 16]), 0);
+    let row = quarantine::read_quarantine(&apply_db(home), EmployeeId([1; 16]), 0).unwrap().unwrap();
+    let edges = row.stripped["restore"]["delegation_targets"].as_array().unwrap();
+    assert!(edges.contains(&json!({"agent": OTHER, "parent": LABEL, "department": "sales"})), "{edges:?}");
+    assert_eq!(org::load_for_write(home).unwrap().get(OTHER), Some(&OrgEntry::new("", "sales")));
+    // While quarantined the admin re-parents carol and removes dave.
+    org::with_org_lock(home, |guard| {
+        org::upsert(guard, "carol-desk", OrgEntry::new(OTHER, "ops"))?;
+        org::remove(guard, "dave-desk")?;
+        Ok(())
+    }).unwrap();
+    // Exact label only: another label's restore applies nothing.
+    let wrong = restore_label_stores(home, OTHER, &row.stripped).unwrap();
+    assert!(wrong.regranted.is_empty() && wrong.reapplied.is_empty(), "{wrong:?}");
+    assert!(wrong.skipped.iter().all(|s| s.ends_with(":label_mismatch")), "{wrong:?}");
+    assert!(web::for_agent(home, LABEL, "erp").unwrap().is_none());
+    let report = restore_label_stores(home, LABEL, &row.stripped).unwrap();
+    assert_eq!(report.regranted.len(), 2, "{report:?}");
+    let list = web::list(home).unwrap();
+    assert_eq!(credential(&list, "erp").unwrap().allowed_agents, vec![LABEL.to_owned()]);
+    let mut crm = vec![LABEL.to_owned(), OTHER.to_owned()];
+    crm.sort();
+    assert_eq!(credential(&list, "crm").unwrap().allowed_agents, crm);
+    assert!(list.iter().all(|m| m.held_grants.is_empty()), "no grant left held");
+    assert!(web::for_agent(home, LABEL, "erp").unwrap().is_some());
+    let current = org::load_for_write(home).unwrap();
+    assert_eq!(current.get(OTHER), Some(&OrgEntry::new(LABEL, "sales")), "edge re-applied, department kept");
+    assert_eq!(current.get("carol-desk"), Some(&OrgEntry::new(OTHER, "ops")), "an admin re-parent is kept");
+    assert!(!current.contains("dave-desk"), "a removed child is not re-created");
+    assert_eq!(report.reapplied, vec![format!("reports_to:{OTHER}")]);
+    assert!(report.skipped.contains(&"reports_to:carol-desk:reparented".to_owned()), "{report:?}");
+    assert!(report.skipped.contains(&"reports_to:dave-desk:child_missing".to_owned()), "{report:?}");
+    // Channel routes are re-approved by the admin, never re-applied here.
+    assert!(report.listed.contains(&"channel_routes:binding:telegram:u1".to_owned()), "{report:?}");
+    assert_eq!(store("channel_routes").count_under(home, LABEL), Ok(0));
+    // Idempotent: a retry reports the same, changes nothing.
+    let again = restore_label_stores(home, LABEL, &row.stripped).unwrap();
+    assert_eq!((again.regranted.len(), again.reapplied.clone()), (2, report.reapplied.clone()));
+    assert_eq!(web::list(home).unwrap(), list);
+    // A malformed row is refused, not guessed.
+    assert_eq!(restore_label_stores(home, LABEL, &json!("not an object")), Err(StoreError::Unavailable));
+}
+
+/// F6i: purging the quarantine row deletes the website grants held for it
+/// for good (a credential left with no grant goes too); a purge of the bare
+/// label never touches what a row holds.
+#[test]
+fn purge_deletes_quarantined_website_credentials() {
+    use crate::website_credentials as web;
+    let dir = private_home();
+    let home = dir.path();
+    seed_config(home, LABEL, OTHER);
+    quarantine_row(home, LABEL, 1, "sealed");
+    tombstone_effects(home, LABEL, EmployeeId([1; 16]), 0);
+    let key = quarantine_key(EmployeeId([1; 16]), 0);
+    assert!(store("website_credentials").purge(home, LABEL).is_ok());
+    assert_eq!(web::list(home).unwrap().len(), 2, "a label purge keeps the row's held grants");
+    let purged = crate::isolation_label_restore::purge_row_stores(home, EmployeeId([1; 16]), 0).unwrap();
+    assert!(purged.iter().any(|(name, removed)| *name == "website_credentials" && *removed == 2), "{purged:?}");
+    let left = web::list(home).unwrap();
+    assert_eq!(left.iter().map(|m| (m.label.as_str(), m.allowed_agents.clone(), m.held_grants.len())).collect::<Vec<_>>(),
+        vec![("crm", vec![OTHER.to_owned()], 0)], "erp deleted, crm keeps the other grant");
+    assert_eq!(store("website_credentials").count_under(home, &key), Ok(0));
+    assert!(crate::isolation_label_restore::purge_row_stores(home, EmployeeId([1; 16]), 0).unwrap()
+        .iter().all(|(_, removed)| *removed == 0), "idempotent");
 }
 
 /// R7: an open quarantine row refuses every proposal for the label except

@@ -48,6 +48,42 @@ fn channel_bot_needs_live_lifecycle_and_route() {
     assert!(!stores::bot_gate(home, LABEL, "telegram", &roots));
 }
 
+/// H5 / A11: a per-employee bot already running when its employee is
+/// tombstoned is stopped by the tombstone itself (exact label only), and a
+/// start racing the tombstone is refused and stopped at admission.
+#[test]
+fn tombstone_stops_running_label_bot() {
+    use crate::isolation_label_bots as bots;
+    let f = fixture();
+    let home = f.home();
+    let (_, held) = personal_employee(&f);
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let neighbour = format!("{LABEL}-2");
+    let bot = runtime.spawn(std::future::pending::<()>());
+    let slack = runtime.spawn(std::future::pending::<()>());
+    let other = runtime.spawn(std::future::pending::<()>());
+    bots::register(home, "telegram", LABEL, bot.abort_handle());
+    bots::register(home, "slack", LABEL, slack.abort_handle());
+    bots::register(home, "telegram", &neighbour, other.abort_handle());
+    assert!(bots::is_running(home, "telegram", LABEL));
+    tombstone_personal_employee(home, LABEL, held.employee).unwrap();
+    assert!(runtime.block_on(bot).unwrap_err().is_cancelled(), "the running bot is stopped");
+    assert!(runtime.block_on(slack).unwrap_err().is_cancelled(), "on every channel");
+    assert!(!bots::is_running(home, "telegram", LABEL));
+    assert!(bots::is_running(home, "telegram", &neighbour), "exact label only, never a prefix");
+    // A start whose first gate check passed before the tombstone: admission
+    // re-runs the gate (protected mode) and stops it.
+    let late = runtime.spawn(std::future::pending::<()>());
+    stores::TEST_PROTECTED.with(|cell| cell.set(Some(true)));
+    let admitted = runtime.block_on(bots::admit(home, "discord", LABEL, late.abort_handle()));
+    stores::TEST_PROTECTED.with(|cell| cell.set(None));
+    assert!(!admitted);
+    assert!(runtime.block_on(late).unwrap_err().is_cancelled());
+    assert!(!bots::is_running(home, "discord", LABEL));
+    bots::stop(home, "telegram", &neighbour);
+    assert!(runtime.block_on(other).unwrap_err().is_cancelled());
+}
+
 /// §3.2 step 4 (S9) through the real tombstone: routes to the label are
 /// stripped into the quarantine row, other labels keep theirs, and every
 /// writer of the label is refused afterwards (protected mode).

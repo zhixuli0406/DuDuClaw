@@ -13,9 +13,12 @@
 //!   adapter returns `Ok` before any I/O.
 //! - [`tombstone_effects`]: §3.2 step 4 (S9): global routes to the label are
 //!   stripped into `stripped`, label-keyed work is paused, store marks are
-//!   recorded in the quarantine row.
+//!   recorded in the quarantine row. Website grants and `reports_to` edges
+//!   are held for a same-id restore (`stripped.restore`, never deleted);
+//!   `isolation_label_restore` re-applies them (F6c) or purges them (F6i).
 //! - [`channel_bot_allowed`]: a protected employee's own bot starts only with
-//!   a live lifecycle and an active catalog channel route (H5, A11).
+//!   a live lifecycle and an active catalog channel route (H5, A11); a bot
+//!   already running is stopped by the tombstone (`isolation_label_bots`).
 //! - [`check_label_not_quarantined`]: `LABEL_QUARANTINED` (R7) for staging,
 //!   approving or applying an Employee proposal on a held label.
 //!
@@ -226,7 +229,8 @@ pub(crate) enum TombstoneAction {
     Gate,
     /// Writer gate, marks recorded, and the label's work paused (`enabled = 0`).
     Pause,
-    /// Stripped, names kept in `stripped` (S9).
+    /// Stripped, names kept in `stripped` (S9); a store with a `hold` keeps
+    /// its exact entries for a restore (`stripped.restore`).
     Strip,
 }
 
@@ -243,9 +247,15 @@ pub(crate) enum Backend {
     /// A home SQLite database; the label columns are discovered by name
     /// ([`AGENT_COLUMNS`]) in every table.
     Sqlite { parent: Option<Parent> },
-    /// A config map: `count` and `detach` (strip / remove / re-root). A config
-    /// entry cannot be sealed under the row, so re-key and purge both detach.
-    Config { count: fn(&Path, &str) -> Result<u64, StoreError>, detach: fn(&Path, &str) -> Result<Vec<String>, StoreError> },
+    /// A config map: `count` and `detach` (strip / remove / re-root), used by
+    /// purge. `hold` (when present) is the tombstone and re-key form: it
+    /// detaches the label but keeps what a restore needs under the row key
+    /// (`isolation_label_restore`); without it re-key also detaches.
+    Config {
+        count: fn(&Path, &str) -> Result<u64, StoreError>,
+        detach: fn(&Path, &str) -> Result<Vec<String>, StoreError>,
+        hold: Option<crate::isolation_label_restore::HoldFn>,
+    },
 }
 
 pub(crate) struct LabelStore {
@@ -259,7 +269,7 @@ pub(crate) struct LabelStore {
 /// Every store keyed by an agent label outside the employee tree (§3.3).
 pub(crate) static LABEL_KEYED_STORES: &[LabelStore] = &[
     LabelStore { name: "org_entry", source: "org.toml", action: TombstoneAction::Digest,
-        backend: Backend::Config { count: org_entry_count, detach: org_entry_remove } },
+        backend: Backend::Config { count: org_entry_count, detach: org_entry_remove, hold: None } },
     LabelStore { name: "memory", source: "memory.db", action: TombstoneAction::Gate,
         backend: Backend::Sqlite { parent: None } },
     LabelStore { name: "sessions", source: "sessions.db", action: TombstoneAction::Gate,
@@ -269,11 +279,13 @@ pub(crate) static LABEL_KEYED_STORES: &[LabelStore] = &[
     LabelStore { name: "cron", source: "cron_tasks.db", action: TombstoneAction::Pause,
         backend: Backend::Sqlite { parent: Some(Parent { table: "cron_tasks", id: "id", label: "agent_id", child: "cron_id" }) } },
     LabelStore { name: "website_credentials", source: "secrets/website_credentials.enc", action: TombstoneAction::Strip,
-        backend: Backend::Config { count: website_count, detach: website_strip } },
+        backend: Backend::Config { count: website_count, detach: crate::isolation_label_restore::website_purge,
+            hold: Some(crate::isolation_label_restore::website_hold) } },
     LabelStore { name: "channel_routes", source: "agent_bindings.json", action: TombstoneAction::Strip,
-        backend: Backend::Config { count: channel_route_count, detach: channel_route_strip } },
+        backend: Backend::Config { count: channel_route_count, detach: channel_route_strip, hold: None } },
     LabelStore { name: "delegation_targets", source: "org.toml", action: TombstoneAction::Strip,
-        backend: Backend::Config { count: delegation_count, detach: delegation_reroot } },
+        backend: Backend::Config { count: delegation_count, detach: delegation_reroot,
+            hold: Some(crate::isolation_label_restore::delegation_hold) } },
 ];
 
 impl LabelStore {
@@ -288,29 +300,40 @@ impl LabelStore {
 
     /// Move everything under `old` to `new` (adoption, §3.10 step 5).
     /// Idempotent: a store already moved is a no-op (`Ok(0)`). Config maps
-    /// detach `old` (pointing them at a new id is an explicit admin edit).
+    /// with a `hold` keep `old`'s entries under `new` (website grants held
+    /// for the row, purged with it); others detach `old` (pointing them at a
+    /// new id is an explicit admin edit).
     pub(crate) fn rekey(&self, home: &Path, old: &str, new: &str) -> Result<u64, StoreError> {
         if old == new || old.is_empty() || new.is_empty() { return Err(StoreError::Unavailable); }
         match &self.backend {
             Backend::Sqlite { .. } => sqlite::rekey(home, self.source, old, new),
+            Backend::Config { hold: Some(hold), .. } => {
+                let held = hold(home, old, new)?;
+                if !held.complete { return Err(StoreError::Unavailable); }
+                Ok(held.names.len() as u64)
+            }
             Backend::Config { detach, .. } => detach(home, old).map(|names| names.len() as u64),
         }
     }
 
-    /// Remove everything under `label` (F6i purge, §3.8). Idempotent.
+    /// The tombstone form of a `Strip` store: `hold` under the row key when
+    /// the store has one, else `detach` (names only).
+    pub(crate) fn hold(&self, home: &Path, label: &str, key: &str) -> Result<crate::isolation_label_restore::Held, StoreError> {
+        match &self.backend {
+            Backend::Config { hold: Some(hold), .. } => hold(home, label, key),
+            Backend::Config { detach, .. } => detach(home, label).map(crate::isolation_label_restore::Held::names_only),
+            Backend::Sqlite { .. } => Err(StoreError::Unavailable),
+        }
+    }
+
+    /// Remove everything under `label` (F6i purge, §3.8). Idempotent. Under a
+    /// row key this also deletes the website grants held for that row (and
+    /// a credential left with no grant) for good.
     pub(crate) fn purge(&self, home: &Path, label: &str) -> Result<u64, StoreError> {
         if label.is_empty() { return Err(StoreError::Unavailable); }
         match &self.backend {
             Backend::Sqlite { parent } => sqlite::purge(home, self.source, parent.as_ref(), label),
             Backend::Config { detach, .. } => detach(home, label).map(|names| names.len() as u64),
-        }
-    }
-
-    /// The tombstone strip of a `Strip` store (names recorded).
-    pub(crate) fn detach(&self, home: &Path, label: &str) -> Result<Vec<String>, StoreError> {
-        match &self.backend {
-            Backend::Config { detach, .. } => detach(home, label),
-            Backend::Sqlite { .. } => Err(StoreError::Unavailable),
         }
     }
 }
@@ -371,35 +394,17 @@ fn delegation_count(home: &Path, label: &str) -> Result<u64, StoreError> {
     Ok(store.iter().filter(|(id, entry)| id.as_str() != label && entry.reports_to == label).count() as u64)
 }
 
-/// Re-root every employee reporting to the label (names recorded); the admin
-/// re-parents them explicitly (never automatic).
+/// Re-root every employee reporting to the label (purge form: names only;
+/// the tombstone uses `delegation_hold`, which also records the edges).
 fn delegation_reroot(home: &Path, label: &str) -> Result<Vec<String>, StoreError> {
-    use duduclaw_core::org_store::{self as org, OrgEntry};
-    let store = org::load_for_write(home).map_err(|_| StoreError::Unavailable)?;
-    let reports: Vec<(String, String)> = store.iter()
-        .filter(|(id, entry)| id.as_str() != label && entry.reports_to == label)
-        .map(|(id, entry)| (id.clone(), entry.department.clone())).collect();
-    if reports.is_empty() { return Ok(Vec::new()); }
-    org::with_org_lock(home, |guard| {
-        let mut names = Vec::new();
-        for (id, department) in &reports {
-            // Re-read under the lock: only an edge that still points at the label moves.
-            let current = org::load_for_write(home).map_err(|_| std::io::Error::other("org store unreadable"))?;
-            if current.get(id).is_some_and(|entry| entry.reports_to == label) {
-                org::upsert(guard, id, OrgEntry::new("", department))?;
-                names.push(format!("reports_to:{id}"));
-            }
-        }
-        Ok(names)
-    }).map_err(|_| StoreError::Unavailable)
+    let held = crate::isolation_label_restore::delegation_hold(home, label, "")?;
+    if !held.complete { return Err(StoreError::Unavailable); }
+    Ok(held.names)
 }
 
+/// Grants of the label, or grants held under a row key.
 fn website_count(home: &Path, label: &str) -> Result<u64, StoreError> {
     crate::website_credentials::agent_grant_count(home, label).map_err(|_| StoreError::Unavailable)
-}
-
-fn website_strip(home: &Path, label: &str) -> Result<Vec<String>, StoreError> {
-    crate::website_credentials::strip_agent(home, label).map_err(|_| StoreError::Unavailable)
 }
 
 fn channel_route_count(home: &Path, label: &str) -> Result<u64, StoreError> {
@@ -547,18 +552,26 @@ pub(crate) mod sqlite {
 
 /// Run every store's tombstone action for `label` and record the result in
 /// the quarantine row `(employee, incarnation)`: `Strip` stores are detached
-/// (names merged into `stripped.global_routes`), `Pause` stores paused,
+/// (names merged into `stripped.global_routes`; stores with a hold keep
+/// their exact entries in `stripped.restore` and, for website grants, held
+/// under the row key — nothing is deleted), `Pause` stores paused,
 /// `Gate`/`Pause` stores counted into `store_marks`. A store that fails
 /// becomes a `stores:` pending fence (blocks every restore until a retry
-/// clears it). Idempotent: a retry merges names and keeps the first marks.
-/// Returns the audit summary.
+/// clears it). Idempotent: a retry merges names and entries and keeps the
+/// first marks. Returns the audit summary.
 pub(crate) fn tombstone_effects(home: &Path, label: &str, employee: EmployeeId, incarnation: u32) -> Value {
     let (mut marks, mut routes, mut paused, mut fences) = (Map::new(), Map::new(), Map::new(), Vec::new());
+    let mut restore = Map::new();
+    let key = quarantine_key(employee, incarnation);
     for store in LABEL_KEYED_STORES {
         match store.action {
             TombstoneAction::Digest => {}
-            TombstoneAction::Strip => match store.detach(home, label) {
-                Ok(names) => { routes.insert(store.name.into(), json!(names)); }
+            TombstoneAction::Strip => match store.hold(home, label, &key) {
+                Ok(held) => {
+                    if !held.complete { fences.push(format!("{STORE_FENCE_GROUP}{}:strip_unavailable", store.name)); }
+                    routes.insert(store.name.into(), json!(held.names));
+                    if !held.restore.is_empty() { restore.insert(store.name.into(), Value::Array(held.restore)); }
+                }
                 Err(_) => fences.push(format!("{STORE_FENCE_GROUP}{}:strip_unavailable", store.name)),
             },
             TombstoneAction::Gate | TombstoneAction::Pause => {
@@ -576,9 +589,15 @@ pub(crate) fn tombstone_effects(home: &Path, label: &str, employee: EmployeeId, 
         }
     }
     fences.sort();
-    let recorded = record_effects(home, employee, incarnation, &marks, &routes, &paused, &fences).is_ok();
+    fences.dedup();
+    let effects = Effects { marks: &marks, routes: &routes, paused: &paused, restore: &restore, fences: &fences };
+    let recorded = record_effects(home, employee, incarnation, &effects).is_ok();
     if !recorded { tracing::warn!(agent = label, "tombstone: label store effects not recorded on the quarantine row"); }
-    json!({"store_marks": marks, "global_routes": routes, "paused": paused, "fences": fences, "recorded": recorded})
+    // Restore entries carry credential ids only; the audit gets the counts.
+    let restorable: Map<String, Value> = restore.iter()
+        .map(|(store, items)| (store.clone(), json!(items.as_array().map_or(0, Vec::len)))).collect();
+    json!({"store_marks": marks, "global_routes": routes, "paused": paused, "restorable": restorable,
+        "fences": fences, "recorded": recorded})
 }
 
 fn merge_names(existing: Option<&Value>, new: &Value) -> Value {
@@ -589,8 +608,26 @@ fn merge_names(existing: Option<&Value>, new: &Value) -> Value {
     json!(all)
 }
 
-fn record_effects(home: &Path, employee: EmployeeId, incarnation: u32, marks: &Map<String, Value>,
-    routes: &Map<String, Value>, paused: &Map<String, Value>, fences: &[String]) -> Result<(), StoreError> {
+/// Restore entries (objects): the recorded ones first, new ones appended
+/// unless already present (a retry records nothing twice).
+fn merge_entries(existing: Option<&Value>, new: &Value) -> Value {
+    let mut all: Vec<Value> = existing.and_then(Value::as_array).cloned().unwrap_or_default();
+    for entry in new.as_array().into_iter().flatten() {
+        if !all.contains(entry) { all.push(entry.clone()); }
+    }
+    Value::Array(all)
+}
+
+struct Effects<'a> {
+    marks: &'a Map<String, Value>,
+    routes: &'a Map<String, Value>,
+    paused: &'a Map<String, Value>,
+    restore: &'a Map<String, Value>,
+    fences: &'a [String],
+}
+
+fn record_effects(home: &Path, employee: EmployeeId, incarnation: u32, effects: &Effects<'_>) -> Result<(), StoreError> {
+    let Effects { marks, routes, paused, restore, fences } = *effects;
     let mut db = open_apply(home, Access::ReadWrite)?;
     {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| StoreError::Unavailable)?;
@@ -610,6 +647,10 @@ fn record_effects(home: &Path, employee: EmployeeId, incarnation: u32, marks: &M
             for (store, new) in names { let value = merge_names(merged.get(store), new); merged.insert(store.clone(), value); }
             object.insert(key.into(), Value::Object(merged));
         }
+        // Exact entries a same-id restore re-applies (`isolation_label_restore`).
+        let mut merged = object.get("restore").and_then(Value::as_object).cloned().unwrap_or_default();
+        for (store, new) in restore { let value = merge_entries(merged.get(store), new); merged.insert(store.clone(), value); }
+        object.insert("restore".into(), Value::Object(merged));
         object.insert("deferred".into(), json!(DEFERRED_ROUTES));
         object.insert("in_tree".into(), json!(IN_TREE_STRIPPED));
         // The first readable mark of each store is kept (writes are gated since).

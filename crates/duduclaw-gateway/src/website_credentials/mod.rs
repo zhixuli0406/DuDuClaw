@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const UNAVAILABLE: &str = "網站登入資料目前無法讀取或保存，請管理員檢查。";
+const HELD: &str = "這筆網站登入資料保留給已註銷員工的復原使用；清除該員工的保留資料之前不能刪除。";
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RECORDS: usize = 1000;
 
@@ -32,6 +33,29 @@ pub struct Metadata {
     pub allowed_agents: Vec<String>,
     pub created_by: Owner,
     pub updated_at: String,
+    /// F6h (§3.3): grants of tombstoned employees, held for a same-id
+    /// restore. Never usable (only `allowed_agents` is), never deleted while
+    /// held; the purge of the quarantine row removes them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_grants: Vec<HeldGrant>,
+}
+
+/// One held grant: the tombstoned label and its quarantine row key
+/// (`quarantine:<employee_hex>-<incarnation>`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HeldGrant {
+    pub agent: String,
+    pub key: String,
+}
+
+const HELD_KEY_PREFIX: &str = "quarantine:";
+
+fn valid_held(grant: &HeldGrant) -> bool {
+    duduclaw_core::is_valid_agent_id(&grant.agent)
+        && grant.key.len() <= 128 && grant.key.len() > HELD_KEY_PREFIX.len()
+        && grant.key.starts_with(HELD_KEY_PREFIX)
+        && grant.key.chars().all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '-')
 }
 
 /// Never Debug: the only consumer of the password is the stdin login helper.
@@ -137,8 +161,12 @@ fn valid_metadata(m: &Metadata) -> bool {
         })
         && m.allowed_paths.len() <= 100
         && m.allowed_paths.iter().all(|path| valid_login_path(&m.origin, path))
-        && !m.allowed_agents.is_empty() && m.allowed_agents.len() <= 1000
+        // A record whose only grants are held (F6h) is valid but unusable.
+        && (!m.allowed_agents.is_empty() || !m.held_grants.is_empty())
+        && m.allowed_agents.len() <= 1000
         && m.allowed_agents.iter().all(|agent| duduclaw_core::is_valid_agent_id(agent))
+        && m.held_grants.len() <= 1000 && m.held_grants.iter().all(valid_held)
+        && m.held_grants.iter().enumerate().all(|(i, grant)| !m.held_grants.iter().take(i).any(|g| g == grant))
         && m.created_by.owner_kind == "user"
         && short_text(&m.created_by.owner_id, 128)
         && chrono::DateTime::parse_from_rfc3339(&m.updated_at).is_ok()
@@ -318,6 +346,8 @@ pub fn upsert(home: &Path, request: Upsert, actor: &str) -> Result<Metadata, Str
             created_by: previous.map(|(_, r)| r.metadata.created_by.clone())
                 .unwrap_or_else(|| Owner { owner_kind: "user".into(), owner_id: actor.into() }),
             updated_at: chrono::Utc::now().to_rfc3339(),
+            // An admin edit never drops grants held for a restore (F6h).
+            held_grants: previous.map(|(_, r)| r.metadata.held_grants.clone()).unwrap_or_default(),
         };
         let envelope = SealedRecord { purpose: "website_credentials/v1".into(),
             record: SecretRecord { metadata: metadata.clone(), password: request.password.clone() } };
@@ -339,6 +369,9 @@ pub fn delete(home: &Path, id: &str) -> Result<bool, String> {
         let Some(index) = records.iter().position(|record| record.metadata.id == id) else {
             return Ok(false);
         };
+        // F6h: a record a quarantine row still references stays until that
+        // row is purged (or the grant is restored).
+        if !records[index].metadata.held_grants.is_empty() { return Err(HELD.into()); }
         store.records.remove(index);
         Ok(true)
     })
@@ -346,53 +379,120 @@ pub fn delete(home: &Path, id: &str) -> Result<bool, String> {
 
 // ── F6h (isolation_label_stores, §3.3): grants keyed by one label ──
 
-/// Records granting `agent` (exact label). A missing store is 0; an
-/// unreadable one is `Err`, never zero.
-pub(crate) fn agent_grant_count(home: &Path, agent: &str) -> Result<u64, String> {
-    Ok(list(home)?.iter().filter(|m| m.allowed_agents.iter().any(|a| a == agent)).count() as u64)
+/// Records granting `key` (exact label), or holding a grant under `key`
+/// (a quarantine row key). A missing store is 0; an unreadable one is `Err`,
+/// never zero.
+pub(crate) fn agent_grant_count(home: &Path, key: &str) -> Result<u64, String> {
+    Ok(list(home)?.iter().filter(|m| m.allowed_agents.iter().any(|a| a == key)
+        || m.held_grants.iter().any(|held| held.key == key)).count() as u64)
 }
 
-/// Remove `agent` from every grant list under the store lock, re-sealing the
-/// changed records. A record granted to nobody else is deleted (an empty
-/// grant list is not a valid record); the admin re-creates it. Returns the
-/// credential labels (never a username or password).
-pub(crate) fn strip_agent(home: &Path, agent: &str) -> Result<Vec<String>, String> {
+enum Change { Keep, Update(Metadata), Remove }
+
+/// Re-seal every record `decide` changes, under the store lock (all records
+/// validated first). A missing store is not created. Returns the metadata of
+/// the changed records as they were before the change (never a secret).
+fn rewrite(home: &Path, mut decide: impl FnMut(&Metadata) -> Change) -> Result<Vec<Metadata>, String> {
     if matches!(std::fs::symlink_metadata(path(home)), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound) {
         return Ok(Vec::new());
     }
     modify(home, |store, records| {
-        if !records.iter().any(|r| r.metadata.allowed_agents.iter().any(|a| a == agent)) { return Ok(Vec::new()); }
+        let changes: Vec<Change> = records.iter().map(|record| decide(&record.metadata)).collect();
+        if changes.iter().all(|change| matches!(change, Change::Keep)) { return Ok(Vec::new()); }
         let engine = read_engine(home).ok_or(UNAVAILABLE)?;
-        let mut kept = Vec::with_capacity(records.len());
-        let mut labels = Vec::new();
-        for record in &records {
-            if !record.metadata.allowed_agents.iter().any(|a| a == agent) {
-                kept.push(None);
-                continue;
-            }
-            labels.push(record.metadata.label.clone());
-            let mut metadata = record.metadata.clone();
-            metadata.allowed_agents.retain(|a| a != agent);
-            if metadata.allowed_agents.is_empty() { kept.push(Some(None)); continue; }
-            metadata.updated_at = chrono::Utc::now().to_rfc3339();
-            let envelope = SealedRecord { purpose: "website_credentials/v1".into(),
-                record: SecretRecord { metadata, password: record.password.clone() } };
-            let plain = Zeroizing::new(serde_json::to_string(&envelope).map_err(|_| UNAVAILABLE)?);
-            kept.push(Some(Some(engine.encrypt_string(&plain).map_err(|_| UNAVAILABLE)?)));
-        }
-        // `None` keeps the stored ciphertext; `Some(None)` drops the record.
         let mut next = Vec::with_capacity(store.records.len());
-        for (sealed, change) in store.records.drain(..).zip(kept) {
+        let mut touched = Vec::new();
+        for ((sealed, record), change) in store.records.drain(..).zip(&records).zip(changes) {
             match change {
-                None => next.push(sealed),
-                Some(Some(resealed)) => next.push(resealed),
-                Some(None) => {}
+                Change::Keep => next.push(sealed),
+                Change::Remove => touched.push(record.metadata.clone()),
+                Change::Update(mut metadata) => {
+                    metadata.updated_at = chrono::Utc::now().to_rfc3339();
+                    if !valid_metadata(&metadata) { return Err(UNAVAILABLE.into()); }
+                    let envelope = SealedRecord { purpose: "website_credentials/v1".into(),
+                        record: SecretRecord { metadata, password: record.password.clone() } };
+                    let plain = Zeroizing::new(serde_json::to_string(&envelope).map_err(|_| UNAVAILABLE)?);
+                    next.push(engine.encrypt_string(&plain).map_err(|_| UNAVAILABLE)?);
+                    touched.push(record.metadata.clone());
+                }
             }
         }
         store.records = next;
-        labels.sort();
-        Ok(labels)
+        Ok(touched)
     })
+}
+
+/// Tombstone (F6h, §3.3): move `agent`'s grant on every record into a held
+/// grant under `key` (the quarantine row key). Nothing is deleted, so a
+/// same-id restore can re-grant it; a record granted only to `agent` stays
+/// as a held-only (unusable) record. Idempotent. Returns `(moved, held)`:
+/// `(id, label)` of the records changed now, and of every record that holds
+/// the grant under `key` afterwards (so a retry can record them again).
+pub(crate) fn hold_agent(home: &Path, agent: &str, key: &str)
+    -> Result<(Vec<(String, String)>, Vec<(String, String)>), String> {
+    let grant = HeldGrant { agent: agent.to_owned(), key: key.to_owned() };
+    if !valid_held(&grant) { return Err(UNAVAILABLE.into()); }
+    let touched = rewrite(home, |m| {
+        if !m.allowed_agents.iter().any(|a| a == agent) { return Change::Keep; }
+        let mut next = m.clone();
+        next.allowed_agents.retain(|a| a != agent);
+        if !next.held_grants.contains(&grant) { next.held_grants.push(grant.clone()); }
+        Change::Update(next)
+    })?;
+    let moved: Vec<(String, String)> = touched.into_iter().map(|m| (m.id, m.label)).collect();
+    let held: Vec<(String, String)> = list(home)?.into_iter()
+        .filter(|m| m.held_grants.contains(&grant)).map(|m| (m.id, m.label)).collect();
+    Ok((moved, held))
+}
+
+/// Outcome of [`regrant_held`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Regrant {
+    /// The held grant was moved back to `allowed_agents`.
+    Regranted,
+    /// Nothing held, but the record already grants the agent (a retry).
+    AlreadyGranted,
+    /// The record is gone, or the grant is no longer held under that key.
+    Missing,
+}
+
+/// Same-id restore (F6c): move the grant of `agent` held under `key` on the
+/// record `id` back into `allowed_agents`. Exact id, agent and key.
+pub(crate) fn regrant_held(home: &Path, agent: &str, key: &str, id: &str) -> Result<Regrant, String> {
+    let grant = HeldGrant { agent: agent.to_owned(), key: key.to_owned() };
+    if !valid_held(&grant) || uuid::Uuid::parse_str(id).is_err() { return Err(UNAVAILABLE.into()); }
+    let touched = rewrite(home, |m| {
+        if m.id != id || !m.held_grants.contains(&grant) { return Change::Keep; }
+        let mut next = m.clone();
+        next.held_grants.retain(|held| held != &grant);
+        next.allowed_agents.push(agent.to_owned());
+        next.allowed_agents.sort();
+        next.allowed_agents.dedup();
+        Change::Update(next)
+    })?;
+    if !touched.is_empty() { return Ok(Regrant::Regranted); }
+    let granted = list(home)?.iter().any(|m| m.id == id && m.allowed_agents.iter().any(|a| a == agent));
+    Ok(if granted { Regrant::AlreadyGranted } else { Regrant::Missing })
+}
+
+/// Purge (F6i) and adoption-time detach: remove `key` from every grant list
+/// and every grant held under `key` (a quarantine row key), re-sealing the
+/// changed records; a record left with no grant and no held grant is deleted
+/// for good. Grants held under other keys are untouched. Returns the
+/// credential labels (never a username or password).
+pub(crate) fn purge_agent(home: &Path, key: &str) -> Result<Vec<String>, String> {
+    let touched = rewrite(home, |m| {
+        let granted = m.allowed_agents.iter().any(|a| a == key);
+        let held = m.held_grants.iter().any(|grant| grant.key == key);
+        if !granted && !held { return Change::Keep; }
+        let mut next = m.clone();
+        next.allowed_agents.retain(|a| a != key);
+        next.held_grants.retain(|grant| grant.key != key);
+        if next.allowed_agents.is_empty() && next.held_grants.is_empty() { Change::Remove } else { Change::Update(next) }
+    })?;
+    let mut labels: Vec<String> = touched.into_iter().map(|m| m.label.clone()).collect();
+    labels.sort();
+    Ok(labels)
 }
 
 #[cfg(test)]
