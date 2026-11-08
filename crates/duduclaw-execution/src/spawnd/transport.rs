@@ -340,6 +340,11 @@ fn map_error(code: ErrorCode) -> BackendError {
         ErrorCode::IsolationUnavailable | ErrorCode::NotReady | ErrorCode::QueueFull | ErrorCode::ResourceLimit => BackendError::Unavailable,
         ErrorCode::Unauthorized | ErrorCode::RuntimeDenied | ErrorCode::AlreadyTaken => BackendError::Denied,
         ErrorCode::UnsupportedVersion | ErrorCode::InvalidRequest | ErrorCode::InvalidFds | ErrorCode::Internal => BackendError::Protocol,
+        // Package H (H1) work-broker codes. H5's workspace bridge maps them to
+        // typed file-tool refusals before they reach this generic mapping.
+        ErrorCode::WorkFileNotFound => BackendError::NotFound,
+        ErrorCode::WorkFileRefused | ErrorCode::WorkFileTooLarge => BackendError::Denied,
+        ErrorCode::WorkspaceBrokerUnavailable => BackendError::Unavailable,
     }
 }
 
