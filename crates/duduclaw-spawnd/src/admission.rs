@@ -178,7 +178,9 @@ impl<H: Host> Coordinator<H> {
         self.entries.insert(random_run.0, Entry { employee, connection, reservation, state: AdmissionState::Reserved,
             request: None, policy: None, inputs: None, input_bytes: 0, input_descriptors: 0, sequence: self.sequence,
             deadline: expires, started: 0, terminal_at: 0, outcome: None, io_taken: false, pty_activity_ms: 0, initial_pty_size: None });
-        Ok(SpawnResponse::Reserved { run: random_run, expires_at_unix_ms: expires })
+        // HX4 advertises `SpawndFeatures::HELPER_CALLS` once it dispatches the helper ops.
+        Ok(SpawnResponse::Reserved { run: random_run, expires_at_unix_ms: expires,
+            features: duduclaw_isolation::ipc::SpawndFeatures::NONE })
     }
     pub fn start(&mut self, connection: ControlConnectionId, request: SpawnRequest, inputs: H::Inputs,
         now: u64) -> Result<SpawnResponse> {

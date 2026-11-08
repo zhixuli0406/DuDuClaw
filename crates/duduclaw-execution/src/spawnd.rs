@@ -327,7 +327,8 @@ impl ExecutionBackend for SpawndBackend {
                 connection.close().await;
                 return Err(error);
             }
-            let SpawnResponse::Reserved { run, expires_at_unix_ms } = packet.response else { return Err(BackendError::Protocol); };
+            // `features` [F17] is read by HX5 before any helper op is sent.
+            let SpawnResponse::Reserved { run, expires_at_unix_ms, .. } = packet.response else { return Err(BackendError::Protocol); };
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| BackendError::Unavailable)?.as_millis();
             let remaining = (expires_at_unix_ms as u128).checked_sub(now_ms)

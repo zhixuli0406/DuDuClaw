@@ -30,6 +30,21 @@ impl Architecture {
     }
     pub fn execveat(self) -> u32 { self.nr(322, 281) }
     pub fn exit_group(self) -> u32 { self.nr(231, 94) }
+    /// asm-generic (aarch64) has no `alarm`; init uses `setitimer` there.
+    pub fn alarm(self) -> Option<u32> { match self { Self::X86_64 => Some(37), Self::Aarch64 => None } }
+    pub fn setitimer(self) -> u32 { self.nr(38, 103) }
+    pub fn prlimit64(self) -> u32 { self.nr(302, 261) }
+    pub fn prctl(self) -> u32 { self.nr(157, 167) }
+    pub fn seccomp(self) -> u32 { self.nr(317, 277) }
+    pub fn setpgid(self) -> u32 { self.nr(109, 154) }
+    /// HX §2.4 L_restrict calls without argument constraints: Landlock
+    /// (create_ruleset, add_rule, restrict_self), `setsid`, `wait4`, `waitid`,
+    /// `timerfd_create/settime/gettime`, `close_range`. Each only restricts the
+    /// caller or supervises its own children [F3].
+    pub fn launcher_restrict_calls(self) -> [u32; 10] {
+        [444, 445, 446, self.nr(112, 157), self.nr(61, 260), self.nr(247, 95),
+            self.nr(283, 85), self.nr(286, 86), self.nr(287, 87), 436]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -168,12 +183,15 @@ pub fn supervisor(arch: Architecture, status_fd: i32, pidfd: i32) -> Result<Filt
 }
 
 /// PID 1 may reap/forward signals only inside its already-created PID namespace.
+/// `alarm`/`setitimer` bound init's wait for a draining launcher (HX §2.5 (c)):
+/// they only arm a timer that signals init itself.
 pub fn init(arch: Architecture, status_fd: i32) -> Result<Filter, FilterError> {
     if status_fd <= 2 { return Err(FilterError::Policy); }
     let mut filter = Filter::new(arch);
     filter.block(arch.nr(1,64), &fd_rule(status_fd as u32, None, ALLOW, KILL));
     for nr in [arch.nr(61,260), arch.nr(247,95), arch.nr(62,129), arch.nr(13,134),
-        arch.nr(3,57), arch.nr(15,139), arch.nr(14,135), arch.exit_group()] {
+        arch.nr(3,57), arch.nr(15,139), arch.nr(14,135), arch.exit_group(), arch.setitimer()]
+        .into_iter().chain(arch.alarm()) {
         filter.action(nr, ALLOW);
     }
     Ok(filter.finish(KILL))
@@ -211,15 +229,100 @@ impl RuntimeProfile {
 /// Install on top of common after fd reordering, immediately before execveat.
 pub fn runtime(arch: Architecture, profile: &RuntimeProfile,
     expected_digest: Sha256Digest) -> Result<Filter, FilterError> {
-    if profile.digest(arch)? != expected_digest { return Err(FilterError::Digest); }
-    if !profile.allowed_syscalls.iter().any(|nr| *nr == arch.execveat())
-        || !profile.allowed_syscalls.iter().any(|nr| *nr == arch.exit_group()) {
+    checked_profile(arch, profile, expected_digest)?;
+    let mut filter = Filter::new(arch);
+    common_rules(&mut filter, arch, |nr| if profile.allows(nr) { ALLOW } else { DENY });
+    for nr in &profile.allowed_syscalls { filter.action(*nr, ALLOW); }
+    Ok(filter.finish(DENY))
+}
+
+impl RuntimeProfile {
+    pub fn allows(&self, nr: u32) -> bool { self.allowed_syscalls.contains(&nr) }
+}
+fn checked_profile(arch: Architecture, profile: &RuntimeProfile, expected: Sha256Digest) -> Result<(), FilterError> {
+    if profile.digest(arch)? != expected { return Err(FilterError::Digest); }
+    if !profile.allows(arch.execveat()) || !profile.allows(arch.exit_group()) { return Err(FilterError::Policy); }
+    Ok(())
+}
+
+// Argument-constrained bodies (HX §2.4 [F3]). `int`/`pid_t`/`unsigned int`
+// arguments are compared on their low 32 bits, which is all the kernel reads;
+// `unsigned long` arguments on both halves. Every body ends in RET.
+/// `prlimit64(0, …)`: the caller's own limits only.
+fn pid_zero_body() -> Vec<Instruction> { vec![ld(arg(0)), eq(0, 0, 1), ret(ALLOW), ret(DENY)] }
+/// `setpgid(0, 0)`: the caller becomes its own group leader.
+fn setpgid_self_body() -> Vec<Instruction> {
+    vec![ld(arg(0)), eq(0, 0, 3), ld(arg(1)), eq(0, 0, 1), ret(ALLOW), ret(DENY)]
+}
+/// `seccomp(SECCOMP_SET_MODE_FILTER, 0, …)`: stacking a further filter only; no
+/// TSYNC, listener or log flags, no other operation.
+fn seccomp_filter_body() -> Vec<Instruction> {
+    vec![ld(arg(0)), eq(1, 0, 3), ld(arg(1)), eq(0, 0, 1), ret(ALLOW), ret(DENY)]
+}
+/// `prctl(option, …)` with `option` in `options` (⊆ `PRCTL_SELF_ONLY`);
+/// `PR_SET_DUMPABLE` only with arg2 == 0 (`SUID_DUMP_DISABLE`).
+fn prctl_body(options: &[u32]) -> Result<Vec<Instruction>, FilterError> {
+    use crate::helper_policy::{PRCTL_SELF_ONLY, PR_SET_DUMPABLE};
+    if options.is_empty() || !options.iter().all(|option| PRCTL_SELF_ONLY.contains(option)) {
         return Err(FilterError::Policy);
     }
+    let mut simple: Vec<u32> = options.iter().copied().filter(|option| *option != PR_SET_DUMPABLE).collect();
+    simple.sort_unstable();
+    simple.dedup();
+    let mut body = vec![ld(arg(0))];
+    for option in simple { body.extend([eq(option, 0, 1), ret(ALLOW)]); }
+    if options.contains(&PR_SET_DUMPABLE) {
+        body.extend([eq(PR_SET_DUMPABLE, 0, 5), ld(arg(1) + 4), eq(0, 0, 3), ld(arg(1)), eq(0, 0, 1), ret(ALLOW)]);
+    }
+    body.push(ret(DENY));
+    Ok(body)
+}
+
+/// Launcher self-filter F_L = parent runtime profile ∪ L_restrict (HX §2.4).
+/// L_restrict: `Architecture::launcher_restrict_calls` unconstrained, plus
+/// `prctl` (all of `PRCTL_SELF_ONLY`), `prlimit64` (pid 0), `setpgid(0, 0)` and
+/// `seccomp(SET_MODE_FILTER, 0)` argument-constrained unless the parent already
+/// allows them outright (a union never narrows the parent). The common
+/// refusals are embedded first, so no parent entry or L_restrict call can
+/// reopen namespaces, mount, ptrace, bpf, io_uring or `pidfd_getfd`.
+/// Install on top of common in the launcher child, after its Landlock.
+pub fn launcher(arch: Architecture, parent: &RuntimeProfile, parent_digest: Sha256Digest) -> Result<Filter, FilterError> {
+    use crate::helper_policy::PRCTL_SELF_ONLY;
+    checked_profile(arch, parent, parent_digest)?;
     let mut filter = Filter::new(arch);
-    common_rules(&mut filter, arch, |nr| {
-        if profile.allowed_syscalls.iter().any(|allowed| *allowed == nr) { ALLOW } else { DENY }
-    });
+    common_rules(&mut filter, arch, |nr| if parent.allows(nr) { ALLOW } else { DENY });
+    let constrained = [(arch.prctl(), prctl_body(&PRCTL_SELF_ONLY)?), (arch.prlimit64(), pid_zero_body()),
+        (arch.setpgid(), setpgid_self_body()), (arch.seccomp(), seccomp_filter_body())];
+    for (nr, body) in &constrained {
+        if !parent.allows(*nr) { filter.block(*nr, body); }
+    }
+    for nr in arch.launcher_restrict_calls() {
+        if !parent.allows(nr) { filter.action(nr, ALLOW); }
+    }
+    for nr in &parent.allowed_syscalls { filter.action(*nr, ALLOW); }
+    Ok(filter.finish(DENY))
+}
+
+/// Signed helper filter F_H (HX §2.3 check 2, §2.4). Refuses unless the flat
+/// helper allowlist ⊆ the parent's and every self-only exception is in the
+/// closed set (`helper_policy::seccomp_within_parent`), so the only calls F_H
+/// allows beyond the parent are `prlimit64(0, …)` and the listed `prctl`
+/// options, compiled as argument checks. Installed by the helper child under
+/// F_L immediately before `execveat`; the kernel then enforces F_L ∩ F_H.
+pub fn helper(arch: Architecture, parent: &RuntimeProfile, parent_digest: Sha256Digest, profile: &RuntimeProfile,
+    expected_digest: Sha256Digest, self_only: &[crate::helper_policy::SelfOnlyCall]) -> Result<Filter, FilterError> {
+    use crate::helper_policy::{seccomp_within_parent, SelfOnlyCall};
+    checked_profile(arch, parent, parent_digest)?;
+    checked_profile(arch, profile, expected_digest)?;
+    if !seccomp_within_parent(arch, parent, profile, self_only) { return Err(FilterError::Policy); }
+    let mut filter = Filter::new(arch);
+    common_rules(&mut filter, arch, |nr| if profile.allows(nr) { ALLOW } else { DENY });
+    for call in self_only {
+        match call {
+            SelfOnlyCall::Prlimit64SelfOnly => filter.block(arch.prlimit64(), &pid_zero_body()),
+            SelfOnlyCall::Prctl { options } => filter.block(arch.prctl(), &prctl_body(options)?),
+        }
+    }
     for nr in &profile.allowed_syscalls { filter.action(*nr, ALLOW); }
     Ok(filter.finish(DENY))
 }
@@ -345,6 +448,196 @@ mod tests {
             assert!(reordered.digest(arch).is_err());
         }
     }
+    use crate::helper_policy::{SelfOnlyCall, PRCTL_SELF_ONLY, PR_SET_DUMPABLE, PR_SET_NO_NEW_PRIVS, PR_SET_PDEATHSIG};
+    const ARCHES: [Architecture; 2] = [Architecture::X86_64, Architecture::Aarch64];
+    /// A runtime profile without prctl/prlimit64/setpgid/seccomp/L_restrict calls.
+    fn parent_profile(arch: Architecture) -> RuntimeProfile {
+        RuntimeProfile { allowed_syscalls: vec![arch.nr(0,63), arch.nr(1,64), arch.nr(3,57), arch.nr(62,129),
+            arch.nr(56,220), arch.nr(41,198), arch.nr(9,222), arch.nr(257,56), arch.execveat(), arch.exit_group()] }
+    }
+    fn helper_profile(arch: Architecture) -> RuntimeProfile {
+        RuntimeProfile { allowed_syscalls: vec![arch.nr(0,63), arch.nr(1,64), arch.nr(9,222), arch.execveat(), arch.exit_group()] }
+    }
+    fn f_l(arch: Architecture, parent: &RuntimeProfile) -> Filter { launcher(arch, parent, parent.digest(arch).unwrap()).unwrap() }
+    fn f_h(arch: Architecture, profile: &RuntimeProfile, self_only: &[SelfOnlyCall]) -> Result<Filter, FilterError> {
+        let parent = parent_profile(arch);
+        helper(arch, &parent, parent.digest(arch).unwrap(), profile, profile.digest(arch).unwrap(), self_only)
+    }
+
+    #[test]
+    fn f_l_prlimit64_other_pid_denied() {
+        for arch in ARCHES {
+            let nr = arch.prlimit64();
+            let fh = f_h(arch, &helper_profile(arch), &[SelfOnlyCall::Prlimit64SelfOnly]).unwrap();
+            for filter in [f_l(arch, &parent_profile(arch)), fh] {
+                assert_eq!(evaluate(&filter, arch.audit(), nr, [0, 7, 0, 0, 0, 0]), ALLOW, "{arch:?} own limits");
+                for pid in [1u64, 2, 4242, 0xffff_ffff /* -1 */, 0xffff_fffe, 0x7fff_ffff] {
+                    assert_eq!(evaluate(&filter, arch.audit(), nr, [pid, 7, 0, 0, 0, 0]), DENY, "{arch:?} pid {pid}");
+                }
+                // pid_t is the low 32 bits for the kernel; high garbage over 0 still names the caller.
+                assert_eq!(evaluate(&filter, arch.audit(), nr, [1 << 32, 7, 0, 0, 0, 0]), ALLOW);
+                assert_eq!(evaluate(&filter, arch.audit(), nr, [(1 << 32) | 1, 7, 0, 0, 0, 0]), DENY);
+            }
+            // Without the signed exception F_H has no prlimit64 at all.
+            let plain = f_h(arch, &helper_profile(arch), &[]).unwrap();
+            assert_eq!(evaluate(&plain, arch.audit(), nr, [0, 7, 0, 0, 0, 0]), DENY);
+            // F_L is a union: a parent that already allows prlimit64 outright keeps it.
+            let mut wide = parent_profile(arch); wide.allowed_syscalls.push(nr);
+            assert_eq!(evaluate(&f_l(arch, &wide), arch.audit(), nr, [1, 7, 0, 0, 0, 0]), ALLOW);
+        }
+    }
+
+    #[test]
+    fn f_l_prctl_option_allowlist() {
+        for arch in ARCHES {
+            let nr = arch.prctl();
+            let filter = f_l(arch, &parent_profile(arch));
+            for option in 0..=80u32 {
+                let expected = if PRCTL_SELF_ONLY.contains(&option) { ALLOW } else { DENY };
+                assert_eq!(evaluate(&filter, arch.audit(), nr, [option as u64, 0, 0, 0, 0, 0]), expected, "{arch:?} {option}");
+            }
+            // PR_SET_DUMPABLE only to 0; never back to dumpable or "suid safe".
+            for (value, expected) in [(0u64, ALLOW), (1, DENY), (2, DENY), (1 << 32, DENY)] {
+                assert_eq!(evaluate(&filter, arch.audit(), nr, [PR_SET_DUMPABLE as u64, value, 0, 0, 0, 0]), expected);
+            }
+            // Options that change other processes, capabilities or the memory map stay denied.
+            for option in [8u64 /* SET_KEEPCAPS */, 15 /* SET_NAME */, 22 /* SET_SECCOMP */, 28 /* SET_SECUREBITS */,
+                35 /* SET_MM */, 36 /* SET_CHILD_SUBREAPER */, 47 /* CAP_AMBIENT */, 0x5961_6d61 /* SET_PTRACER */] {
+                assert_eq!(evaluate(&filter, arch.audit(), nr, [option, 0, 0, 0, 0, 0]), DENY, "{option}");
+            }
+            // F_H holds only the options its binding lists.
+            let fh = f_h(arch, &helper_profile(arch),
+                &[SelfOnlyCall::Prctl { options: vec![PR_SET_NO_NEW_PRIVS, PR_SET_DUMPABLE] }]).unwrap();
+            assert_eq!(evaluate(&fh, arch.audit(), nr, [PR_SET_NO_NEW_PRIVS as u64, 1, 0, 0, 0, 0]), ALLOW);
+            assert_eq!(evaluate(&fh, arch.audit(), nr, [PR_SET_DUMPABLE as u64, 0, 0, 0, 0, 0]), ALLOW);
+            assert_eq!(evaluate(&fh, arch.audit(), nr, [PR_SET_DUMPABLE as u64, 1, 0, 0, 0, 0]), DENY);
+            assert_eq!(evaluate(&fh, arch.audit(), nr, [PR_SET_PDEATHSIG as u64, 9, 0, 0, 0, 0]), DENY);
+            for options in [vec![], vec![22], vec![PR_SET_DUMPABLE, 35], vec![38, 38]] {
+                assert_eq!(f_h(arch, &helper_profile(arch), &[SelfOnlyCall::Prctl { options }]).err(), Some(FilterError::Policy));
+            }
+            let fh = f_h(arch, &helper_profile(arch), &[SelfOnlyCall::Prctl { options: vec![PR_SET_PDEATHSIG] }]).unwrap();
+            assert_eq!(evaluate(&fh, arch.audit(), nr, [PR_SET_PDEATHSIG as u64, 9, 0, 0, 0, 0]), ALLOW);
+            assert_eq!(evaluate(&fh, arch.audit(), nr, [PR_SET_DUMPABLE as u64, 0, 0, 0, 0, 0]), DENY);
+        }
+    }
+
+    #[test]
+    fn init_filter_allows_alarm() {
+        for arch in ARCHES {
+            let filter = init(arch, 10).unwrap();
+            assert_eq!(evaluate(&filter, arch.audit(), arch.setitimer(), [0; 6]), ALLOW, "{arch:?}");
+            match arch {
+                Architecture::X86_64 => {
+                    assert_eq!(arch.alarm(), Some(37));
+                    assert_eq!(evaluate(&filter, arch.audit(), 37, [5, 0, 0, 0, 0, 0]), ALLOW);
+                }
+                Architecture::Aarch64 => assert_eq!(arch.alarm(), None, "asm-generic has no alarm"),
+            }
+            // Still no exec, no reads, no writes beyond the status fd.
+            assert_eq!(evaluate(&filter, arch.audit(), arch.execveat(), [0; 6]), KILL);
+            assert_eq!(evaluate(&filter, arch.audit(), arch.nr(0, 63), [0; 6]), KILL);
+            assert_eq!(evaluate(&filter, arch.audit(), arch.nr(1, 64), [3, 0, 0, 0, 0, 0]), KILL);
+            assert_eq!(evaluate(&filter, arch.audit(), arch.prlimit64(), [0; 6]), KILL);
+        }
+    }
+
+    #[test]
+    fn f_l_is_parent_union_restrict_and_keeps_common_refusals() {
+        for arch in ARCHES {
+            let mut parent = parent_profile(arch);
+            parent.allowed_syscalls.extend(denied_syscalls(arch));
+            let filter = f_l(arch, &parent);
+            let parent_filter = runtime(arch, &parent, parent.digest(arch).unwrap()).unwrap();
+            for nr in denied_syscalls(arch) { assert_eq!(evaluate(&filter, arch.audit(), nr, [0; 6]), DENY, "{nr}"); }
+            for nr in &parent.allowed_syscalls {
+                for args in [[0; 6], [1, 0, 0, 0, 0, 0], [0x10000000, 0, 0, 0, 0, 0]] {
+                    assert_eq!(evaluate(&filter, arch.audit(), *nr, args), evaluate(&parent_filter, arch.audit(), *nr, args));
+                }
+            }
+            for nr in arch.launcher_restrict_calls() { assert_eq!(evaluate(&filter, arch.audit(), nr, [3, 9, 0, 0, 0, 0]), ALLOW); }
+            assert_eq!(evaluate(&filter, arch.audit(), arch.setpgid(), [0; 6]), ALLOW);
+            for args in [[0, 5, 0, 0, 0, 0], [3, 0, 0, 0, 0, 0], [7, 7, 0, 0, 0, 0]] {
+                assert_eq!(evaluate(&filter, arch.audit(), arch.setpgid(), args), DENY, "setpgid {args:?}");
+            }
+            assert_eq!(evaluate(&filter, arch.audit(), arch.seccomp(), [1, 0, 0x1000, 0, 0, 0]), ALLOW);
+            // STRICT, TSYNC/listener flags and GET_ACTION_AVAIL/NOTIF_SIZES are refused.
+            for args in [[0, 0, 0, 0, 0, 0], [1, 1, 0, 0, 0, 0], [1, 8, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0], [3, 0, 0, 0, 0, 0]] {
+                assert_eq!(evaluate(&filter, arch.audit(), arch.seccomp(), args), DENY, "seccomp {args:?}");
+            }
+            // Calls in neither set stay denied; the filter still kills foreign arches.
+            for nr in [arch.nr(59, 221) /* execve */, arch.nr(105, 146) /* setuid */, arch.nr(90, 52) /* chmod / fchmod */] {
+                assert_eq!(evaluate(&filter, arch.audit(), nr, [0; 6]), DENY, "{nr}");
+            }
+            assert_eq!(evaluate(&filter, 0x40000003, 0, [0; 6]), KILL);
+            assert!(launcher(arch, &parent, Sha256Digest([0; 32])).is_err());
+        }
+    }
+
+    #[test]
+    fn f_h_is_within_parent_decoded() {
+        for arch in ARCHES {
+            let parent = parent_profile(arch);
+            let parent_filter = runtime(arch, &parent, parent.digest(arch).unwrap()).unwrap();
+            let self_only = [SelfOnlyCall::Prlimit64SelfOnly,
+                SelfOnlyCall::Prctl { options: vec![PR_SET_NO_NEW_PRIVS, PR_SET_DUMPABLE, PR_SET_PDEATHSIG] }];
+            let filter = f_h(arch, &helper_profile(arch), &self_only).unwrap();
+            let samples = [[0; 6], [1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0], [4, 0, 0, 0, 0, 0], [4, 1, 0, 0, 0, 0],
+                [38, 1, 0, 0, 0, 0], [1, 9, 0, 0, 0, 0], [17, 0, 0, 0, 0, 0], [2, 1, 0, 0, 0, 0], [16, 3, 0, 0, 0, 0]];
+            let exception = |nr: u32, args: [u64; 6]| (nr == arch.prlimit64() && args[0] as u32 == 0)
+                || (nr == arch.prctl() && matches!((args[0] as u32, args[1]), (38, _) | (1, _) | (4, 0)));
+            for nr in 0..480 {
+                for args in samples {
+                    if evaluate(&filter, arch.audit(), nr, args) == ALLOW {
+                        assert!(evaluate(&parent_filter, arch.audit(), nr, args) == ALLOW || exception(nr, args),
+                            "{arch:?} F_H allows {nr} {args:?} beyond the parent");
+                    }
+                }
+            }
+            // Policy-level refusals: a call outside the parent, an unconstrained
+            // prctl/prlimit64 the parent lacks, or a profile digest mismatch.
+            let mut outside = helper_profile(arch); outside.allowed_syscalls.push(arch.nr(105, 146));
+            assert_eq!(f_h(arch, &outside, &[]).err(), Some(FilterError::Policy));
+            for nr in [arch.prctl(), arch.prlimit64()] {
+                let mut flat = helper_profile(arch); flat.allowed_syscalls.push(nr);
+                assert_eq!(f_h(arch, &flat, &[]).err(), Some(FilterError::Policy));
+            }
+            let parent_digest = parent.digest(arch).unwrap();
+            let profile = helper_profile(arch);
+            assert_eq!(helper(arch, &parent, parent_digest, &profile, Sha256Digest([0; 32]), &[]).err(), Some(FilterError::Digest));
+            assert_eq!(helper(arch, &parent, Sha256Digest([0; 32]), &profile, profile.digest(arch).unwrap(), &[]).err(),
+                Some(FilterError::Digest));
+            // F_H embeds the common refusals and execs nothing but via execveat.
+            for nr in denied_syscalls(arch) { assert_eq!(evaluate(&filter, arch.audit(), nr, [0; 6]), DENY); }
+            assert_eq!(evaluate(&filter, arch.audit(), arch.execveat(), [0; 6]), ALLOW);
+            // Offline helper: no socket in F_H, so every family is EPERM.
+            for family in [1u64, 2, 10, 16] {
+                assert_eq!(evaluate(&filter, arch.audit(), arch.nr(41, 198), [family, 1, 0, 0, 0, 0]), DENY);
+            }
+        }
+    }
+
+    #[cfg(target_os="linux")]
+    #[test]
+    fn seccomp_native_uapi_numbers_for_launcher_and_helpers() {
+        let arch = Architecture::native().unwrap();
+        assert_eq!(arch.prlimit64(), libc::SYS_prlimit64 as u32);
+        assert_eq!(arch.prctl(), libc::SYS_prctl as u32);
+        assert_eq!(arch.seccomp(), libc::SYS_seccomp as u32);
+        assert_eq!(arch.setpgid(), libc::SYS_setpgid as u32);
+        assert_eq!(arch.setitimer(), libc::SYS_setitimer as u32);
+        #[cfg(target_arch = "x86_64")]
+        let alarm = Some(libc::SYS_alarm as u32);
+        #[cfg(not(target_arch = "x86_64"))]
+        let alarm = None;
+        assert_eq!(arch.alarm(), alarm);
+        let expected = [libc::SYS_landlock_create_ruleset, libc::SYS_landlock_add_rule, libc::SYS_landlock_restrict_self,
+            libc::SYS_setsid, libc::SYS_wait4, libc::SYS_waitid, libc::SYS_timerfd_create, libc::SYS_timerfd_settime,
+            libc::SYS_timerfd_gettime, libc::SYS_close_range];
+        assert_eq!(arch.launcher_restrict_calls(), expected.map(|nr| nr as u32));
+        assert_eq!(crate::helper_policy::prlimit64(arch), arch.prlimit64());
+        assert_eq!(crate::helper_policy::prctl(arch), arch.prctl());
+    }
+
     #[cfg(target_os="linux")]
     #[test]
     fn seccomp_native_uapi_numbers_and_instruction_layout() {

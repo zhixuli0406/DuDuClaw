@@ -189,6 +189,12 @@ fn dispatch<H: Host<Inputs = Vec<OwnedFd>, Io = Vec<OwnedFd>>>(coordinator: &mut
             // anchor land in H2/H3 and are wired in H4; until then fail closed.
             SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. } =>
                 return Err(ErrorCode::WorkspaceBrokerUnavailable),
+            // HX ops: protocol only (HX3a). HX4 adds dispatch (employee check,
+            // slots, FIFO, memfd revalidation) and the `helper_calls` feature bit;
+            // until then fail closed. The input memfd is dropped (closed) here.
+            SpawnRequest::HelperCall { .. } | SpawnRequest::HelperWait { .. }
+            | SpawnRequest::HelperStop { .. } | SpawnRequest::HelperCancel { .. } =>
+                return Err(ErrorCode::HelperUnavailable),
         };
         Ok((response, vec![]))
     })();

@@ -8,6 +8,7 @@ pub mod seccomp;
 pub mod landlock;
 pub mod status;
 pub mod helper_policy;
+pub mod helper_wire;
 pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 pub mod linux;

@@ -8,7 +8,7 @@ use crate::{landlock::{PathClass, Policy, MAX_KNOWN_ABI}, seccomp::{Architecture
 /// Check 5: at most this many helper bindings per parent profile.
 pub const MAX_HELPER_BINDINGS: usize = 16;
 /// Check 3: absolute helper timeout ceiling.
-pub const HELPER_TIMEOUT_MAX_MS: u64 = 300_000;
+pub const HELPER_TIMEOUT_MAX_MS: u64 = duduclaw_isolation::ipc::MAX_HELPER_TIMEOUT_MS;
 /// Check 7 [F16]: proposed flush window for a recording; HX6 sizes it from measurement.
 pub const RECORDING_MIN_GRACE_MS: u64 = 12_000;
 /// Root-opened cgroup descriptors in a launcher bootstrap, in this order:
@@ -46,10 +46,9 @@ impl HelperFs {
     }
 }
 
-/// `hx/fg` or `hx/rec` (Q4 = A: one of each per run).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HelperSlot { Foreground, Recording }
+/// `hx/fg` or `hx/rec` (Q4 = A: one of each per run). One type for the signed
+/// policy, the spawnd IPC (`HelperCall.slot`) and the launcher wire (HX3a).
+pub use duduclaw_isolation::ipc::HelperSlot;
 
 /// The closed set of argument-constrained, self-only calls F_H may hold without
 /// the parent profile holding them [F3]. HX3a compiles these into BPF argument
