@@ -698,11 +698,26 @@ pub fn extract_local_facts(user_text: &str, _assistant_reply: &str) -> Vec<Disti
 /// Used when `IngestTier::Cloud` — the caller sends this through the utility
 /// dispatch and parses the response with [`parse_cloud_ingest_response`].
 pub fn build_cloud_ingest_prompt(user_text: &str, assistant_reply: &str) -> String {
+    build_cloud_ingest_prompt_with_privacy(user_text, assistant_reply, None)
+}
+
+/// [`build_cloud_ingest_prompt`] plus the RM-039 privacy instruction
+/// (`crate::memory_privacy::prompt_line`). `None` yields exactly the plain
+/// prompt. The instruction is defence in depth only — `persist_facts` filters
+/// deterministically whatever the model returns.
+pub fn build_cloud_ingest_prompt_with_privacy(
+    user_text: &str,
+    assistant_reply: &str,
+    privacy_line: Option<&str>,
+) -> String {
     // Case-insensitive XML tag escape to prevent prompt injection
     // Handles Unicode case folding; see `crate::xml_fence`.
     use crate::xml_fence::escape_xml_tag;
     let safe_user = escape_xml_tag(user_text, "user");
     let safe_assistant = escape_xml_tag(assistant_reply, "assistant");
+    let privacy = privacy_line
+        .map(|l| format!("{l}\n\n"))
+        .unwrap_or_default();
 
     format!(
         "You are a fact extraction engine. Analyze this conversation and extract \
@@ -713,7 +728,7 @@ pub fn build_cloud_ingest_prompt(user_text: &str, assistant_reply: &str) -> Stri
          Extract only knowledge that stays true beyond this conversation \
          (preferences, decisions, domain rules, entity attributes). Skip \
          small talk, one-off details, and anything already restated verbatim.\n\n\
-         For each fact:\n\
+         {privacy}For each fact:\n\
          - content (required): one standalone sentence stating the fact.\n\
          - subject / predicate / object (optional): include ALL THREE only when \
          the fact decomposes cleanly into a triple, e.g. subject \"user:alice\", \
@@ -880,9 +895,22 @@ impl KnowledgeFields {
 /// [`build_cloud_ingest_prompt`]: the plain prompt stays byte-identical for
 /// the ordinary tier so its prompt cache and its tests are untouched.
 pub fn build_cloud_ingest_prompt_with_knowledge(user_text: &str, assistant_reply: &str) -> String {
+    build_cloud_ingest_prompt_with_knowledge_and_privacy(user_text, assistant_reply, None)
+}
+
+/// [`build_cloud_ingest_prompt_with_knowledge`] plus the RM-039 privacy
+/// instruction in Job 1; `None` yields exactly the plain prompt.
+pub fn build_cloud_ingest_prompt_with_knowledge_and_privacy(
+    user_text: &str,
+    assistant_reply: &str,
+    privacy_line: Option<&str>,
+) -> String {
     use crate::xml_fence::escape_xml_tag;
     let safe_user = escape_xml_tag(user_text, "user");
     let safe_assistant = escape_xml_tag(assistant_reply, "assistant");
+    let privacy = privacy_line
+        .map(|l| format!("{l}\n"))
+        .unwrap_or_default();
 
     format!(
         "You are a fact extraction and document classification engine. \
@@ -894,7 +922,7 @@ pub fn build_cloud_ingest_prompt_with_knowledge(user_text: &str, assistant_reply
          Extract only knowledge that stays true beyond this conversation \
          (preferences, decisions, domain rules, entity attributes). Skip \
          small talk, one-off details, and anything already restated verbatim.\n\
-         For each fact:\n\
+         {privacy}For each fact:\n\
          - content (required): one standalone sentence stating the fact.\n\
          - subject / predicate / object (optional): include ALL THREE only when \
          the fact decomposes cleanly into a triple. Reuse stable subject and \
@@ -1062,7 +1090,12 @@ async fn run_knowledge_branch(
     let response = match utility_override {
         Some(r) => r,
         None => {
-            let prompt = build_cloud_ingest_prompt_with_knowledge(user_text, assistant_reply);
+            let privacy = crate::memory_privacy::prompt_line(home_dir);
+            let prompt = build_cloud_ingest_prompt_with_knowledge_and_privacy(
+                user_text,
+                assistant_reply,
+                privacy.as_deref(),
+            );
             let agent_dir = home_dir.join("agents").join(agent_id);
             crate::runtime_dispatch::run_utility_prompt(
                 home_dir,
@@ -1166,6 +1199,27 @@ async fn run_knowledge_branch(
         source_label: source_label_from_session(session_id).to_string(),
         source_id,
     };
+
+    // RM-039: the page keeps the user's text verbatim and the pointer row
+    // carries the summary, and a filed page ends the turn (`persist_facts`,
+    // where the privacy gate runs, never sees it). So the page's own text is
+    // classified first: a hit files nothing and the extracted facts take the
+    // memory path, each through the gate there.
+    {
+        let gate = crate::memory_privacy::PrivacyGate::from_config(
+            &crate::memory_privacy::MemoryPrivacyConfig::load(home_dir),
+        );
+        let hit = [req.original.as_str(), req.summary.as_str(), req.title.as_str()]
+            .into_iter()
+            .find_map(|t| gate.classify(t))
+            .map(str::to_string);
+        if let Some(category) = hit {
+            let mut report = crate::memory_privacy::FilterReport::default();
+            report.record(crate::memory_privacy::Verdict::Excluded(&category));
+            report.log(agent_id, "knowledge_page");
+            return KnowledgeBranch::Fallback(facts);
+        }
+    }
 
     let wiki_dir = home_dir.join("agents").join(agent_id).join("wiki");
     if let Err(e) = std::fs::create_dir_all(&wiki_dir) {
@@ -1686,7 +1740,12 @@ async fn run_ingest_inner(
         }
         IngestTier::Cloud => {
             info!(agent = agent_id, "Conversation distill: cloud extraction");
-            let prompt = build_cloud_ingest_prompt(user_text, assistant_reply);
+            let privacy = crate::memory_privacy::prompt_line(home_dir);
+            let prompt = build_cloud_ingest_prompt_with_privacy(
+                user_text,
+                assistant_reply,
+                privacy.as_deref(),
+            );
 
             // Utility dispatch (RFC-25 N2): this agent's `[runtime] provider` +
             // `[model] utility`, falling back to global config then Claude.
@@ -1788,6 +1847,39 @@ pub(crate) async fn existing_fact_content(
     }
 }
 
+/// RM-039: drop distilled facts that fall in an excluded privacy category or
+/// repeat a fact its subject deleted (`crate::memory_privacy`). Only counts
+/// and category names are logged.
+fn filter_private_facts(
+    home_dir: &Path,
+    agent_id: &str,
+    facts: Vec<DistilledFact>,
+) -> Vec<DistilledFact> {
+    let gate = crate::memory_privacy::PrivacyGate::for_home(home_dir);
+    let mut report = crate::memory_privacy::FilterReport::default();
+    let kept: Vec<DistilledFact> = facts
+        .into_iter()
+        .filter(|f| {
+            let (subject, predicate, object) = match f.triple() {
+                Some((s, p, o)) => (Some(s), Some(p), Some(o)),
+                None => (
+                    f.subject.as_deref(),
+                    f.predicate.as_deref(),
+                    f.object.as_deref(),
+                ),
+            };
+            report.record(gate.check(&crate::memory_privacy::FactParts {
+                content: &f.content,
+                subject,
+                predicate,
+                object,
+            }))
+        })
+        .collect();
+    report.log(agent_id, "conversation_distill");
+    kept
+}
+
 /// Persist facts into the agent's memory database on a blocking thread.
 ///
 /// `SqliteMemoryEngine` is `!Send` (rusqlite), so the engine is opened and
@@ -1811,6 +1903,16 @@ async fn persist_facts(
         );
         return;
     };
+    // RM-039: facts about an excluded personal topic (health, family, …) or
+    // a fact its subject deleted from "my memory" never reach the store.
+    let facts = filter_private_facts(home_dir, agent_id, facts);
+    if facts.is_empty() {
+        info!(
+            agent = agent_id,
+            "Conversation distill: nothing to store (memory privacy)"
+        );
+        return;
+    }
     let agent = agent_id.to_string();
     let home = home_dir.to_path_buf();
     let db = memory_db.to_path_buf();
@@ -2670,6 +2772,11 @@ pub struct QuarantineDecisionReport {
     /// Burst rows the supersession guard refused at release (H2): now held
     /// claims, each needing its own conflict card.
     pub(crate) held: Vec<QuarantineOutcome>,
+    /// RM-039: rows an approval did NOT activate because the memory privacy
+    /// gate refuses them now — `(memory id, reason)`, reason
+    /// `privacy_excluded:<category>` or `privacy_forgotten`. Each was
+    /// rejected with that reason as its `invalidated_by_event`.
+    pub privacy_blocked: Vec<(String, String)>,
 }
 
 impl QuarantineDecisionReport {
@@ -2677,8 +2784,10 @@ impl QuarantineDecisionReport {
     /// non-negative JSON integer and is always present for its branch:
     /// promote → `quarantine_promoted` + `quarantine_stale`; release →
     /// `quarantine_released` + `quarantine_held`; deny → `quarantine_rejected`.
+    /// An approval that withheld rows for privacy adds
+    /// `quarantine_privacy_blocked` (only when non-zero).
     pub fn side_effect(&self, approve: bool, promote: bool) -> serde_json::Value {
-        if approve && promote {
+        let mut v = if approve && promote {
             serde_json::json!({
                 "quarantine_promoted": self.promoted,
                 "quarantine_stale": self.stale,
@@ -2690,8 +2799,77 @@ impl QuarantineDecisionReport {
             })
         } else {
             serde_json::json!({ "quarantine_rejected": self.rejected })
+        };
+        if approve && !self.privacy_blocked.is_empty() {
+            v["quarantine_privacy_blocked"] = serde_json::json!(self.privacy_blocked.len());
+        }
+        v
+    }
+}
+
+/// `invalidated_by_event` / report reason for a pending row the privacy gate
+/// refuses at approval time.
+pub(crate) fn privacy_block_reason(verdict: crate::memory_privacy::Verdict<'_>) -> Option<String> {
+    match verdict {
+        crate::memory_privacy::Verdict::Allow => None,
+        crate::memory_privacy::Verdict::Excluded(cat) => Some(format!("privacy_excluded:{cat}")),
+        crate::memory_privacy::Verdict::Forgotten => Some("privacy_forgotten".to_string()),
+    }
+}
+
+/// RM-039: the pending rows among `ids` (owned by `agent_id`) that the memory
+/// privacy gate — excluded categories **and** facts their subject deleted via
+/// 「我的記憶」 — refuses today. A row was gated (or not yet forgotten) when it
+/// was quarantined; an approval days later must not activate what the gate
+/// now blocks. Held claims are checked on the triple in `metadata.held_claim`.
+/// Rows a staff member explicitly asked to remember (MCP `memory_store`) are
+/// exempt, exactly as on the write path.
+async fn privacy_blocked_pending(
+    engine: &SqliteMemoryEngine,
+    home_dir: &Path,
+    agent_id: &str,
+    ids: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let gate = crate::memory_privacy::PrivacyGate::for_home(home_dir);
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(row) = engine
+            .subject_fact_by_id(id)
+            .await
+            .map_err(|e| format!("read pending row: {e}"))?
+        else {
+            continue;
+        };
+        if row.agent_id != agent_id {
+            continue;
+        }
+        let explicit = row.metadata.get("explicit").and_then(|v| v.as_bool()) == Some(true)
+            || matches!(row.source_event.as_str(), "mcp_internal" | "mcp_external");
+        if explicit {
+            continue;
+        }
+        let held = row.metadata.get("held_claim");
+        let held_str = |k: &str| {
+            held.and_then(|h| h.get(k))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        let subject = Some(row.subject.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| held_str("subject"));
+        let predicate = row.predicate.clone().or_else(|| held_str("predicate"));
+        let object = row.object.clone().or_else(|| held_str("object"));
+        let verdict = gate.check(&crate::memory_privacy::FactParts {
+            content: &row.content,
+            subject: subject.as_deref(),
+            predicate: predicate.as_deref(),
+            object: object.as_deref(),
+        });
+        if let Some(reason) = privacy_block_reason(verdict) {
+            out.push((id.clone(), reason));
         }
     }
+    Ok(out)
 }
 
 /// Plain label for the subject of a held claim on a review card: a profile
@@ -2766,6 +2944,50 @@ pub async fn apply_quarantine_decision(
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
             let mut report = QuarantineDecisionReport::default();
+            // RM-039: an approval never activates a row the privacy gate
+            // refuses now. Those rows are rejected with the reason recorded
+            // as their `invalidated_by_event`; the rest proceed as decided.
+            let mut ids = ids;
+            if approve {
+                let blocked = privacy_blocked_pending(&engine, &home_dir, &agent_id, &ids).await?;
+                if !blocked.is_empty() {
+                    let mut by_reason: std::collections::BTreeMap<&str, Vec<String>> =
+                        std::collections::BTreeMap::new();
+                    for (id, reason) in &blocked {
+                        by_reason.entry(reason.as_str()).or_default().push(id.clone());
+                    }
+                    for (reason, rows) in &by_reason {
+                        engine
+                            .reject_quarantine(&agent_id, rows, reason)
+                            .await
+                            .map_err(|e| format!("reject privacy-blocked rows: {e}"))?;
+                    }
+                    ids.retain(|i| !blocked.iter().any(|(b, _)| b == i));
+                    let reasons: std::collections::BTreeMap<&str, usize> =
+                        by_reason.iter().map(|(r, v)| (*r, v.len())).collect();
+                    warn!(
+                        agent = %agent_id,
+                        blocked = blocked.len(),
+                        "memory privacy: approval withheld rows the privacy gate refuses"
+                    );
+                    duduclaw_security::audit::append_audit_event(
+                        &home_dir,
+                        &duduclaw_security::audit::AuditEvent::new(
+                            "memory_privacy_approval_blocked",
+                            agent_id.clone(),
+                            duduclaw_security::audit::Severity::Info,
+                            serde_json::json!({
+                                "memory_ids": blocked.iter().map(|(i, _)| i).collect::<Vec<_>>(),
+                                "reasons": reasons,
+                            }),
+                        ),
+                    );
+                    report.privacy_blocked = blocked;
+                }
+                if ids.is_empty() {
+                    return Ok(report);
+                }
+            }
             if approve && promote {
                 // R-H1: bound to the digest the card recorded. A card without
                 // one (or with a different one) promotes nothing: stale.
@@ -2840,6 +3062,39 @@ pub async fn scrub_review_store_for_forgotten(
         home_dir,
         DECIDED_BY_FORGET_SOURCE,
         FORGOTTEN_CARD_TEXT,
+        |rec| card_quarantined_ids(rec).iter().any(|i| ids.contains(i)),
+    )
+    .await?;
+    let events = crate::events_store::EventBusStore::open(home_dir)
+        .map_err(|e| format!("events store (cards were scrubbed): {e}"))?;
+    out.events_deleted += events
+        .delete_by_quarantined_ids("knowledge.quarantined", &ids)
+        .await?;
+    Ok(out)
+}
+
+/// `decided_by` of a review card withdrawn because its subject deleted the
+/// fact in 「我的記憶」 (RM-039).
+pub const DECIDED_BY_SELF_FORGET: &str = "system:memory_self_forget";
+const SELF_FORGOTTEN_CARD_TEXT: &str = "（內容已由當事人刪除）";
+
+/// RM-039 `me.memory.forget` follow-up: review cards covering one of the
+/// hard-deleted rows (a quarantined or held version of the forgotten fact)
+/// are withdrawn when pending and have their text replaced, and matching
+/// `knowledge.quarantined` events are deleted — the card must not keep the
+/// text the person just removed. Idempotent.
+pub async fn scrub_review_store_for_self_forgotten(
+    home_dir: &Path,
+    deleted_ids: &[String],
+) -> Result<ErasedReviewScrub, String> {
+    if deleted_ids.is_empty() {
+        return Ok(ErasedReviewScrub::default());
+    }
+    let ids: HashSet<String> = deleted_ids.iter().cloned().collect();
+    let mut out = scrub_cards(
+        home_dir,
+        DECIDED_BY_SELF_FORGET,
+        SELF_FORGOTTEN_CARD_TEXT,
         |rec| card_quarantined_ids(rec).iter().any(|i| ids.contains(i)),
     )
     .await?;
@@ -3095,6 +3350,10 @@ pub async fn file_migration_held_claims(
 #[cfg(test)]
 #[path = "wiki_ingest_p2b_tests.rs"]
 mod p2b_tests;
+
+#[cfg(test)]
+#[path = "wiki_ingest_privacy_tests.rs"]
+mod privacy_tests;
 
 #[cfg(test)]
 mod tests {

@@ -41,7 +41,7 @@ pub use code_map::{CodeMap, CodeMapConfig, RankedFile, SymbolInfo, SymbolKind};
 pub use vector::{EmbeddingProvider, NgramHashEmbedder};
 pub use engine::{
     is_system_signal, DecisionResolveOutcome, DecisionView, KeyFact, MigrationDisposition,
-    NamespaceRow, OnRefused, SqliteMemoryEngine,
+    NamespaceRow, OnRefused, SqliteMemoryEngine, SubjectFact, SubjectTripleForgetReport,
     TemporalMeta, TemporalRecord, word_jaccard, PREDICTION_CONTENT_PREFIX,
     SYSTEM_SIGNAL_SOURCE_EVENTS,
 };

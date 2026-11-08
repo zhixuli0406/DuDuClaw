@@ -71,6 +71,7 @@ beforeEach(() => {
     user: { id: 'u-admin', email: 'a@b.c', display_name: 'Admin', role: 'admin', status: 'active' },
   } as never);
   mockWsClient.call.mockImplementation((method: string) => {
+    if (method === 'odoo.agent_config_get') return Promise.resolve({ agent_id: 'my-bot', configured: false, effective_unblock_models: ['res.partner'], unblock_inherited: true, effective_blocked_models: ['hr.employee'] });
     if (method === 'odoo.permission_options' || method === 'odoo.config') return Promise.resolve({ models: [], blocked_models: ['res.partner'], read_only_models: [], scan_available: false });
     return Promise.resolve({ ...DETAIL });
   });
@@ -251,6 +252,10 @@ describe('EditAgentPage', () => {
 
       expect(await screen.findByRole('checkbox', { name: 'res.partner · Sensitive' })).toBeInTheDocument();
       expect(screen.queryByPlaceholderText('res.partner')).not.toBeInTheDocument();
+
+      expect(await screen.findByText(en['odoo.permissions.effectiveBlockedModels'])).toBeInTheDocument();
+      expect(screen.getByText(en['odoo.permissions.unblockInherited'])).toBeInTheDocument();
+      expect(screen.getByText('hr.employee')).toBeInTheDocument();
 
       // One "Clear stored secret" switch under API Key, one under Password.
       const clearSwitches = screen.getAllByRole('switch', { name: 'Clear stored secret' });

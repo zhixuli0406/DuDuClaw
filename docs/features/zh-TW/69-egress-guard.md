@@ -155,6 +155,8 @@ recipients = ["line:U123", "telegram:456", "mail:ops@example.com"]
 
 涵蓋 `send_message`、`send_photo`、`send_sticker`、`create_reminder`、`mail_send`，以及 `tasks_create`／`update_cron_task` 的 `notify_channel`、`notify_chat_id`、`notify_thread_id`。`calendar_create_event` 的 attendees 以郵件收件人檢查。排程通知在建立時及實際觸發時依當下設定重新檢查；觸發時來源集合為空，只有已驗證擁有者與設定清單能直接放行。
 
+WebChat（dashboard 對話）不是外部收件人。在 WebChat 對話中建立、未指定通知對象的排程或提醒，結果會回到該對話；對話 id 只來自 gateway（`DUDUCLAW_ORIGIN_SESSION`，只在 WebChat 回合設定），且必須屬於建立它的 AI 員工。員工或 dashboard 排程表單自行填入的 `webchat` 對象一律拒絕。觸發時，只有在對話仍存在、仍屬於同一位員工與同一個已登入帳號，且該帳號仍為啟用狀態並可與這位員工對話時，結果才會寫入對話紀錄；否則捨棄，並在 `tool_calls.jsonl` 留下 `webchat_owner_check_failed`。已封存的對話仍會收到結果，並解除封存、更新活動時間；已永久刪除的對話無法接收。這條路徑不會產生審批卡。訊息在重新整理或重新開啟對話後出現，已開啟的分頁不會即時更新。
+
 `responsibility_ask` 的核准對象由伺服器路由，不讓模型指定收件人；`os_notify` 只顯示本機通知。`github_issue_comment` 指定的是議題資源，仍受外送與動作政策約束。`send_to_agent`、`spawn_agent`、`team_handoff` 維持委派政策；第三方 MCP 若沒有收件者 adapter，Send、Publish 與其他可能向外傳送資料的效果，在 `ask` 模式下都需要 Admin 核准，不以讀過私人資料為前提。第三方閘門保守涵蓋 Modify、Delete、Purchase、Admin；可信的 Read 與 Draft 除外。未知工具無可信的收件者解析，採 fail closed。`shadow` 記錄 `recipient_would_ask`（`recipient_guard: "would_ask"`）；`off` 不增加收件者核准。名為 `to` 的參數本身不算可信 adapter。
 
 實際傳送地址不能用對話後綴冒充清單中的收件人；Discord 通知 thread 會連同父頻道一起檢查。`update_cron_task` 修改通知目的地時，必須同時提供 `notify_channel` 與 `notify_chat_id`，空值配對可清除通知；任務與路由欄位一併原子寫入。等待其他核准後會再檢查收件權限。臨時助手繼承父員工的收件防護模式與設定清單，已驗證 owner 綁定仍以各員工為準。

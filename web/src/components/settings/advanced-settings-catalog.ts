@@ -23,6 +23,7 @@ export const ADVANCED_SETTINGS: AdvancedSetting[] = [
   { id: 'container', group: 'security', title: 'settings.container', description: 'settings.container.desc', searchPrefixes: ['container'] },
   { id: 'delegation', group: 'security', title: 'settings.delegation', description: 'settings.delegation.desc', searchPrefixes: ['delegation'] },
   { id: 'redaction', group: 'security', title: 'settings.redaction', description: 'advancedSettings.redaction.desc', searchPrefixes: ['redaction'] },
+  { id: 'externalStatus', group: 'security', title: 'externalStatus.settings.title', description: 'externalStatus.settings.desc', searchPrefixes: ['externalStatus.settings'] },
   { id: 'browser', group: 'security', title: 'settings.browser', description: 'settings.browser.desc', searchPrefixes: ['browser'] },
   { id: 'utility', group: 'models', title: 'settings.utility.title', description: 'settings.utility.provider.help', searchPrefixes: ['settings.utility'] },
   { id: 'knowledgeSearch', group: 'models', title: 'settings.knowledgeSearch', description: 'settings.knowledgeSearch.desc', searchPrefixes: ['embedding'] },

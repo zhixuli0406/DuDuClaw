@@ -73,6 +73,27 @@ mod tests {
             assert!(!model_visible_payload(&response));
         }
     }
+
+    /// RM-130: the empty-error reason must be filled in only after this gate
+    /// has counted the reply. Filling it into a content-less error would make
+    /// it look payload-bearing, which is exactly why it runs last.
+    #[test]
+    fn egress_accounting_unchanged_for_empty_errors() {
+        let raw = json!({"id":1,"result":{"isError":true}});
+        let counted = model_visible_payload(&raw);
+        assert!(!counted);
+        let finished = crate::mcp_dispatch::finalize_tool_reply("db_query", false, raw.clone());
+        assert_ne!(finished, raw, "the employee sees a reason");
+        assert!(model_visible_payload(&finished), "so it must never be fed back into the gate");
+        // The host-built helpers keep their accounting: an empty JSON-RPC
+        // error stays payload-free, an empty tool_error already had `content`.
+        assert!(!model_visible_payload(&crate::mcp_dispatch::jsonrpc_error(&json!(1), -1, "")));
+        assert!(!model_visible_payload(&super::super::jsonrpc_error(&json!(1), -1, "")));
+        let empty_tool_error = super::super::tool_error("");
+        assert!(empty_tool_error["content"][0]["text"].as_str().unwrap().contains("no error message"));
+        assert!(model_visible_payload(&json!({"result": super::super::tool_error("")})));
+        assert!(model_visible_payload(&json!({"result": {"isError":true,"content":[{"type":"text","text":""}]}})));
+    }
 }
 
 /// A host-owned immediate return before network or durable queue admission.

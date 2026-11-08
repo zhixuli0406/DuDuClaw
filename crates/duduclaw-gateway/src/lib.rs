@@ -126,6 +126,7 @@ pub mod decision_notify;
 pub mod dingtalk;
 pub mod doctor_probes;
 pub mod extension;
+pub mod external_status;
 pub mod github_workspace;
 pub mod google_apps_script;
 pub(crate) mod google_data_consent;
@@ -276,6 +277,7 @@ pub mod memory_forget_apply;
 pub mod disconnect_forget;
 pub mod memory_forget_steps;
 pub mod memory_migrate;
+pub mod memory_privacy;
 pub mod memory_provenance;
 pub mod message_queue;
 pub mod miniapp;
@@ -403,6 +405,9 @@ pub mod ranked_wiki_injection;
 pub mod reflexion;
 pub mod relevance_ranker;
 pub mod reminder_scheduler;
+/// RM-124: schedule / reminder results delivered back into the WebChat
+/// conversation that created them (origin binding + fire-time ownership).
+pub mod scheduled_webchat;
 pub mod risk_detector;
 pub mod run_steps;
 pub(crate) mod autonomous_runtime;

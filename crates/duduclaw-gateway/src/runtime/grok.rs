@@ -671,6 +671,8 @@ impl AgentRuntime for GrokRuntime {
         // value (in the pairs) may reach the MCP child.
         cmd.env_remove(duduclaw_core::ENV_ON_BEHALF_OF);
         cmd.env_remove(crate::on_behalf_of::context::ENV_CONTEXT);
+        // RM-124: only the scoped WebChat origin counts (in the pairs).
+        cmd.env_remove(duduclaw_core::ENV_ORIGIN_SESSION);
         for (k, v) in crate::memory_provenance::turn_source_env_pairs() {
             cmd.env(k, v);
         }

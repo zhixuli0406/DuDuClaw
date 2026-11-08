@@ -211,7 +211,7 @@ fn lookup_cache() -> std::sync::MutexGuard<'static, LookupCache> {
 /// `auth_meta.acl_generation` through a read-only connection (kept per
 /// home and reopened after any error), or `None` when the identity store is
 /// absent or unreadable (the cache is then bypassed, never trusted).
-fn read_generation(home: &Path) -> Option<u64> {
+pub(crate) fn read_generation(home: &Path) -> Option<u64> {
     type Conns = HashMap<PathBuf, rusqlite::Connection>;
     static CONNS: OnceLock<Mutex<Conns>> = OnceLock::new();
     let mut conns = CONNS

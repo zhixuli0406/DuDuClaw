@@ -57,6 +57,20 @@ no_success_hours = 6    # 1..168
 
 An absent configuration file or omitted section uses these defaults. Read errors other than a missing file, or invalid settings, disable health reminders. Turning reminders off does not grant employee permissions or change task execution. The health page remains read-only.
 
+## Employee edit page → Tools & permissions → Tool permissions (v1.81.0)
+
+The **Tools & permissions** tab of the employee edit page has two sub-tabs: **Tool permissions** and **Permission history**. The table lists every catalog tool by category, with a **Can use** and a **Needs approval** column, a per-category select-all (`N/M can use`) and a search box. Edits stay in a draft: changed rows are marked, a sticky bar offers **Discard changes** / **Save**, and Save opens a confirmation that counts newly allowed, no-longer-allowed and needs-approval tools with a per-tool before → after line. Confirming writes through the normal `agents.update` `capabilities` payload. Only an Admin can change anything; other accounts get the same table read-only, with every checkbox disabled and no select-all or save bar.
+
+How the table maps to `agent.toml [capabilities]`:
+
+- **Can use** = not matched by `denied_tools`, and either `allowed_tools` is empty or matches the tool (the gateway's own rule: denied always wins, a non-empty allow list is allowlist mode). Matching is anchored and wildcard-aware, e.g. `mcp__duduclaw__*`.
+- Unticking a tool always **appends it to `denied_tools`**; `allowed_tools` is never shrunk or rewritten, so a wildcard allow list stays exactly as written and every tool it covers shows as allowed. Re-ticking removes that deny entry. A tool covered by a *wildcard* deny entry cannot be turned on here (the row is locked); edit the entry in Advanced settings.
+- **Needs approval** = `approval_required_tools` (bare tool names), the list the MCP dispatch gate enforces for every tool. A tool already asked by a wildcard approval entry or an `action_rules` `ask` rule shows as needs-approval but is locked. The checkbox is disabled while **Can use** is off.
+
+The previous Allow list, Block list, Action rules and Approval list blocks now sit in a collapsed **Advanced settings** at the bottom of the tab and stay in sync with the table.
+
+**Permission history** (Admin only) lists changes to this employee's permissions from the `agent_authority_changed` audit rows: time, who, and each tool's old state struck through → new state. Changes not saved from the table are marked **Changed in Advanced settings** (this also covers older changes made before the table existed). The tab is backed by the Admin-only `agents.permission_history` RPC (`agent_id`, `limit` up to 100, `cursor`), which reads the same audit log as `security.audit_log`.
+
 ## Employee sidebar
 
 On non-Personal editions, Employee accounts see Dashboard, Inbox, Automations, Skills, Memory, Virtual office and a read-only organization chart, followed by bound AI staff and conversation history. Search opens the existing command palette. The primary AI employee appears first; the rest are ordered Owner, Operator, Viewer, up to eight entries. Inbox appears once. The user menu shows the bound email, My connections, Settings, Appearance, Language, Get help and Sign out. Language opens the account settings selector. Get help opens the distributor information entry when the server provides one; otherwise it opens the product guides. The employee layout shows the version only on About. Admin, Manager and Personal navigation keep their existing layout.
@@ -197,6 +211,21 @@ Global background tasks without an assigned employee (such as employee selection
 
 `[general] log_level` (Settings → Advanced → Security and records → Log Level) applies as soon as it is saved, unless the environment variable `RUST_LOG` is set, in which case the save reports a restart. Saving the account rotation strategy or the rate-limit cooldown clears the rotation cache, so the next call uses the new value (before, the change could lag by up to 30 minutes).
 
+## Settings → Advanced → Security and records → Memory: personal topics
+
+| Control | Key | Takes effect |
+|---|---|---|
+| What automatic memory does not record (New in 1.81) → Health / Family / Personal finances / Salary | `[memory_privacy] excluded_categories` (`health`, `family`, `personal_finance`, `salary`) | Immediately (read per write; the next message uses it) |
+| What automatic memory does not record → Custom keywords (per category) | `[memory_privacy.custom_keywords]` | Immediately |
+
+All four switches are on by default, including on existing installs whose `config.toml` has no `[memory_privacy]` section. A switched-on topic is never stored by automatic memory: conversation distillation, profile traits, footprint distillation, Reflexion rules and the persona-induction bridge. When a colleague explicitly asks an AI employee to remember something, it is stored anyway. Matching is keyword-based, so work content that names a topic can be skipped too (for example a "health check report template"). Saving requires admin access. Every change on this card saves immediately (you see "Saved"; if the gateway refuses it, the card goes back to the previous state and shows a message); it is not part of the page's Save button. To add your own wording, open "Custom keywords" under a category, type a keyword and press Add; remove one with its × button. Custom categories set in `config.toml` are kept untouched.
+
+### My memory (every signed-in user)
+
+**My memory** (Settings group in the sidebar, `/me/memory`; employees reach it from the account menu) lists what AI employees have remembered about the signed-in person. Each row shows the content, the AI employee, the time and a source tag (Conversation, Asked to remember, Other). Filter by source or AI employee, use **Load more** to see older items, and delete anything that should not be remembered: after you confirm, AI employees will not automatically learn it again, but if you explicitly ask one to remember it later it is recorded again. Filters apply to the items loaded so far; "Showing N memories" counts what is loaded.
+
+Custom categories and extra keywords are set in the advanced config editor under `[memory_privacy.custom_keywords]` (for example `legal_dispute = ["訴訟", "lawsuit"]`), then listed in `excluded_categories`. An unknown category name is refused on save. If `config.toml` cannot be read or the section is invalid, the gateway applies the four defaults and logs a warning; `system.config` then reports `memory_privacy.load_state = "failed_closed"`. Details and the "my memory" RPCs: [Memory Intelligence](../features/20-memory-intelligence.md#personal-topics-automatic-memory-never-keeps-rm-039).
+
 ## Channels
 
 - Group "mention only" (`mention_only`, per group): since v1.76 a LINE group with it on answers only messages that call an AI employee by `@` (or ask for the `@` list) and the one message a called employee is waiting for; before, it silenced the group entirely. The shared Telegram bot also accepts employee mentions. See [Calling AI staff with `@`](../features/62-calling-ai-staff.md).
@@ -269,9 +298,13 @@ Closing the socket does **not** cancel accepted turns, including queued messages
 
 ## Integrations → Odoo → Schema snapshot
 
-**Re-scan Odoo structure** calls `odoo.schema_scan` and is available only to an administrator; the RPC enforces the same role. Save the connection settings first: this action scans the saved global connection, not unsaved form values. The page shows the last scan time, scan-time server version, model / field counts, truncation, latest failure and the latest diff summary. A server-version mismatch recommends another scan. It does not change Odoo data, permissions or the shared wiki. Manual attempts, including failures, share a persisted 60-second cooldown for the saved profile; an early retry reports how many seconds to wait. Both dashboard actions (`odoo.schema_scan` and `odoo.discover_schema`) share this cooldown and scan lock. The wiki workflow sanitizes identifiers and labels before writing, marks external metadata as data rather than instructions, and retains technical field types and relations.
+**Re-scan Odoo structure** calls `odoo.schema_scan` and is available only to an administrator; the RPC enforces the same role. Save the connection settings first: this action scans the saved global connection and every employee’s effective overrides. Unsaved form values are not scanned. The page shows the last scan time, scan-time server version, model / field counts, truncation, latest failure and the latest diff summary. A server-version mismatch recommends another scan. It does not change Odoo data, permissions or the shared wiki. Manual attempts, including failures, share a persisted 60-second cooldown for the saved profile; an early retry reports how many seconds to wait. Both dashboard actions (`odoo.schema_scan` and `odoo.discover_schema`) share this cooldown and scan lock. The wiki workflow sanitizes identifiers and labels before writing, marks external metadata as data rather than instructions, and retains technical field types and relations.
 
-The first successful connection without a snapshot, or after a server-version change, schedules a background scan without delaying the connection. Automatic attempts are capped at once per hour per effective profile, including failures. To refresh same-version customizations, use the button. The existing **Scan database** action remains a separate shared-wiki workflow. See [schema scans](../features/12-industry-templates.md#schema-scans-and-field-compatibility) for bounds and storage.
+Rescan covers the saved global connection and every employee’s effective `[odoo]` settings, including company scope. Authenticated identities are deduplicated, at most two connections scan concurrently, and results show Ready or Failed for each employee. Metadata stays isolated by connection identity; one Odoo user never reuses another user’s snapshot. The dashboard actions share their persisted 60-second manual cooldown. After successful preparation, obsolete profile data is removed only if all effective identities are known. Cleanup holds a catalog lock while deleting idle lock files; an in-progress scan and its lock are preserved.
+
+The long-lived gateway holding the instance lock checks every effective identity every 30 minutes, starting at gateway startup. It scans missing or truncated snapshots, changed server versions, changed installed-module names/versions, or missing access metadata. Completed scans and definitive failures consume the one-hour automatic slot; cancellation does not. MCP turns never launch scans. While preparation is pending, use `odoo_schema_fields` for a specific model. Same-version field-only changes still require a manual scan; reconnect active sessions with `odoo_connect` to refresh live field caches.
+
+The overview without filters returns model names and short labels only, capped at 16 KiB. Fields are included only for a specific `model` or a query matching at most five authorized models, capped at 32 KiB. Responses include total matching model count and truncation. The shared-wiki summary is capped at 16 KiB; `odoo/schema-fields` remains a search-only `deep` reference page capped at 32 KiB and is not automatically injected into context.
 
 ## Integrations → Odoo → Employee permissions
 

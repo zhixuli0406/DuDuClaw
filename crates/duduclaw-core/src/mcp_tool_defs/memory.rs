@@ -413,7 +413,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "root",
-                description: "Repository root to scan (default: current working directory)",
+                description: "Directory to scan, inside your own employee directory or a [files] allowed_roots entry (default: your own directory; relative paths resolve under it)",
                 required: false,
             },
             ParamDef {

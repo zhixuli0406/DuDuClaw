@@ -279,7 +279,22 @@ pub(crate) async fn handle_tools_call(
         "memory_search_by_layer" => {
             handle_memory_search_by_layer(&arguments, memory, default_agent).await
         }
-        "code_map" => crate::mcp_memory_handlers::handle_code_map(&arguments).await,
+        // v1.81 (S1): contained to the acting employee's own roots. Identity
+        // follows `ai_employee_caller` (fail closed): the shared internal key
+        // without `DUDUCLAW_AGENT_ID` and operator keys are not an employee.
+        // The handler then requires `mcp_files::employee_dir` to resolve it
+        // (role members → `.ephemeral/<id>`) — the `tools/list` predicate
+        // `code_map_caller` is these two steps.
+        "code_map" => {
+            let env_agent = std::env::var(duduclaw_core::ENV_AGENT_ID).ok();
+            let acting = crate::mcp_memory_handlers::ai_employee_caller(
+                caller_client_id,
+                env_agent.as_deref(),
+                crate::mcp_namespace::client_is_agent(home_dir, caller_client_id),
+            );
+            crate::mcp_memory_handlers::handle_code_map(&arguments, home_dir, acting.as_deref())
+                .await
+        }
         "memory_successful_conversations" => {
             handle_memory_successful_conversations(&arguments, memory, default_agent).await
         }
@@ -920,5 +935,10 @@ pub(crate) async fn handle_tools_call(
     )
     .await;
 
+    // RM-130: an empty error is deliberately NOT filled in here. This reply
+    // feeds `McpDispatcher`'s egress / private-read accounting, which treats a
+    // content-less error as payload-free; the reason is added by
+    // `crate::mcp_dispatch::finalize_tool_reply` after that accounting and
+    // after redaction.
     jsonrpc_response(id, result)
 }

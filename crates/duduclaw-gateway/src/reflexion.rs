@@ -459,30 +459,50 @@ async fn consolidate_group(
         ..Default::default()
     };
 
+    // RM-039: a rule synthesised from mistakes that quote a personal topic
+    // (a colleague's illness, salary, …) is not stored. Like a guard refusal
+    // below, the sources are still resolved so the group does not retry.
+    let mut privacy_report = crate::memory_privacy::FilterReport::default();
+    let privacy_allowed = privacy_report.record(
+        crate::memory_privacy::PrivacyGate::for_home(home_dir).check(
+            &crate::memory_privacy::FactParts {
+                content: &rule,
+                subject: meta.subject.as_deref(),
+                predicate: meta.predicate.as_deref(),
+                object: None,
+            },
+        ),
+    );
+    privacy_report.log(agent_id, "reflexion");
+
     // L5: a supersession-guard refusal means a more trusted (operator-
     // approved) value already governs this category key. The rule is not
     // stored, but the sources are still resolved below — otherwise every
     // later settle would rebuild and re-refuse the same rule (a retry loop).
     // System content (G13): consolidated from MistakeNotebook entries, not
     // from a memory row or a conversation turn the engine can trace.
-    let semantic_id = match engine
-        .store_temporal_outcome(
-            agent_id,
-            entry,
-            meta,
-            duduclaw_memory::lineage::Provenance::System { producer: "reflexion" },
-        )
-        .await
-        .map_err(|e| format!("store semantic rule: {e}"))?
-    {
-        duduclaw_memory::TemporalWriteOutcome::Stored(id) => Some(id),
-        duduclaw_memory::TemporalWriteOutcome::Refused(r) => {
-            tracing::info!(agent = agent_id, "reflexion rule not stored: {r}");
-            None
-        }
-        duduclaw_memory::TemporalWriteOutcome::Fenced(r) => {
-            tracing::info!(agent = agent_id, "reflexion rule not stored: {r}");
-            None
+    let semantic_id = if !privacy_allowed {
+        None
+    } else {
+        match engine
+            .store_temporal_outcome(
+                agent_id,
+                entry,
+                meta,
+                duduclaw_memory::lineage::Provenance::System { producer: "reflexion" },
+            )
+            .await
+            .map_err(|e| format!("store semantic rule: {e}"))?
+        {
+            duduclaw_memory::TemporalWriteOutcome::Stored(id) => Some(id),
+            duduclaw_memory::TemporalWriteOutcome::Refused(r) => {
+                tracing::info!(agent = agent_id, "reflexion rule not stored: {r}");
+                None
+            }
+            duduclaw_memory::TemporalWriteOutcome::Fenced(r) => {
+                tracing::info!(agent = agent_id, "reflexion rule not stored: {r}");
+                None
+            }
         }
     };
 

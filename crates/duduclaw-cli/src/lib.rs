@@ -15348,6 +15348,8 @@ fn scaffold_agent_toml(s: &AgentScaffold) -> String {
     };
 
     let preferred = model_preferred.as_deref().unwrap_or("claude-sonnet-4-6");
+    // v1.81 (S2): only `main` may create employees by default.
+    let can_create_agents = duduclaw_core::agent_toml::default_can_create_agents(Some(role_str));
 
     // agent.toml
     format!(
@@ -15384,7 +15386,7 @@ warn_threshold_percent = 80
 hard_stop = true
 
 [permissions]
-can_create_agents = true
+can_create_agents = {can_create_agents}
 can_send_cross_agent = true
 can_modify_own_skills = true
 can_modify_own_soul = false

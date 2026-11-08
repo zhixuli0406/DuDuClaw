@@ -346,7 +346,7 @@ Two separate code paths share the name.
 
 | Feature | Description |
 |---------|-------------|
-| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` persistent (v1.8.12); schedules are created with `tasks_create` + `schedule` (the older `schedule_task` tool was removed in v1.69.0) |
+| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` persistent (v1.8.12); schedules are created with `tasks_create` + `schedule` (the older `schedule_task` tool was removed in v1.69.0); one created in a WebChat conversation without a target reports back to that conversation after a fire-time ownership check, and a schedule with no target says in its receipt that results go nowhere ([69-egress-guard.md](69-egress-guard.md)) |
 | ReminderScheduler | One-shot reminders (relative `5m`/`2h`/`1d` or ISO 8601), `direct` or `agent_callback` mode |
 | HeartbeatScheduler | Per-agent unified scheduling — bus polling + GVU silence breaker + cron |
 | Scheduler-Level Task-Board Pull (v1.9.3) | `poll_assigned_tasks` moved into `HeartbeatScheduler::run` tick — scans entire agent registry every 30s (no longer skips `enabled=false` agents); 1-hour LIKE-marker cooldown prevents stampedes |

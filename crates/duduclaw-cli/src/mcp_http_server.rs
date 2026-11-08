@@ -391,6 +391,19 @@ async fn authenticate_http_stream(
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
 
+/// Generic 401 for an RM-064 status credential presented to the MCP server.
+fn status_credential_refused() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(crate::mcp_dispatch::jsonrpc_error(
+            &Value::Null,
+            -32003,
+            "Authentication failed: this credential cannot be used here",
+        )),
+    )
+        .into_response()
+}
+
 /// Extract and validate a Bearer API key from headers.
 /// Returns (Principal, NamespaceContext) or an error Response.
 pub(crate) fn authenticate_bearer(
@@ -452,6 +465,12 @@ pub(crate) fn authenticate_bearer_call(
         return Err((StatusCode::UNAUTHORIZED, Json(crate::mcp_dispatch::jsonrpc_error(
             &Value::Null, -32003, crate::mcp_refresh::STDIO_ONLY_NOTICE,
         ))).into_response());
+    }
+    // RM-064: a `ddc_status_` credential belongs to the gateway's status
+    // endpoint only. Refuse the type outright — it must never reach the
+    // `[mcp_keys]` / OAuth lookups or any scope table.
+    if duduclaw_auth::status_tokens::is_status_token(raw_key) {
+        return Err(status_credential_refused());
     }
 
     // WP3.1-T2: OAuth-issued access tokens share the Bearer surface but live
@@ -519,6 +538,9 @@ fn authenticate_bearer_or_query(
             return Err((StatusCode::UNAUTHORIZED, Json(crate::mcp_dispatch::jsonrpc_error(
                 &Value::Null, -32003, crate::mcp_refresh::STDIO_ONLY_NOTICE,
             ))).into_response());
+        }
+        if duduclaw_auth::status_tokens::is_status_token(raw_key) {
+            return Err(status_credential_refused());
         }
         let principal = authenticate_with_key(raw_key, home_dir).map_err(|e| {
             (
@@ -1116,6 +1138,39 @@ pub mod tests {
         }
         crate::mcp_refresh::revoke_token(home.path(), &meta.jti).unwrap();
         assert!(crate::mcp_refresh::authenticate_with_refresh_token(&raw, home.path()).is_err());
+    }
+
+    /// RM-064: a real, live `ddc_status_` credential is refused by type on
+    /// the bearer path, the SSE query path and the routed `/mcp` endpoint.
+    #[tokio::test]
+    async fn status_credentials_are_refused_on_every_mcp_surface() {
+        let home = tempfile::tempdir().unwrap();
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let user = db
+            .create_user("alice@test.invalid", "Alice", "isolated-password", duduclaw_auth::UserRole::Admin)
+            .unwrap();
+        let raw = db.status_token_create(&user.id, "odoo").unwrap().secret;
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {raw}").parse().unwrap());
+        let resource = "http://127.0.0.1:8765/mcp";
+        for response in [
+            authenticate_bearer(&headers, home.path(), resource).unwrap_err(),
+            authenticate_bearer_or_query(&HeaderMap::new(), Some(&raw), home.path(), resource).unwrap_err(),
+        ] {
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let cfg = HttpServerConfig::new("127.0.0.1:0".parse().unwrap(), home.path().to_path_buf());
+        let router = build_router(&cfg, make_test_dispatcher());
+        let request = Request::builder().method("POST").uri("/mcp")
+            .header("authorization", format!("Bearer {raw}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)).unwrap();
+        let status = router.oneshot(request).await.unwrap().status();
+        assert!(
+            status == StatusCode::UNAUTHORIZED || status == StatusCode::TOO_MANY_REQUESTS,
+            "a status credential must never be served by /mcp: {status}"
+        );
     }
 
     #[tokio::test]

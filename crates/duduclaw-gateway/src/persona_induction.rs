@@ -564,6 +564,7 @@ async fn induce_rule(
     agent_id: &str,
     key: &GroupKey,
     now: DateTime<Utc>,
+    privacy: &crate::memory_privacy::PrivacyGate,
 ) -> Result<InducedRuleState, String> {
     let fingerprint = key.fingerprint();
     let content = suppression_content(key);
@@ -617,18 +618,32 @@ async fn induce_rule(
         .map_err(|e| e.to_string())?;
 
     // Bridge into key_facts (module doc "Where this sits") — best-effort,
-    // never fails the induction itself.
-    let key_fact_id = engine
-        .store_fact(
-            agent_id,
-            &content,
-            KEY_FACT_CHANNEL,
-            KEY_FACT_CHAT_ID,
-            &fingerprint,
-            duduclaw_memory::lineage::Provenance::System { producer: "persona_induction" },
-        )
-        .await
-        .ok();
+    // never fails the induction itself. RM-039: the bridge is the copy that
+    // reaches retrieval, so a rendering that names an excluded personal topic
+    // (the event label is upstream-supplied) is not bridged.
+    let mut privacy_report = crate::memory_privacy::FilterReport::default();
+    let bridge_allowed = privacy_report.record(privacy.check(&crate::memory_privacy::FactParts {
+        content: &content,
+        subject: None,
+        predicate: None,
+        object: Some(&key.event),
+    }));
+    privacy_report.log(agent_id, "persona_induction");
+    let key_fact_id = if !bridge_allowed {
+        None
+    } else {
+        engine
+            .store_fact(
+                agent_id,
+                &content,
+                KEY_FACT_CHANNEL,
+                KEY_FACT_CHAT_ID,
+                &fingerprint,
+                duduclaw_memory::lineage::Provenance::System { producer: "persona_induction" },
+            )
+            .await
+            .ok()
+    };
 
     Ok(InducedRuleState {
         fingerprint,
@@ -794,8 +809,9 @@ pub async fn run_induction_for_agent(
                 ),
             }
         }
+        let privacy = crate::memory_privacy::PrivacyGate::for_home(home_dir);
         for key in &plan.inducts {
-            match induce_rule(&engine, agent_id, key, now).await {
+            match induce_rule(&engine, agent_id, key, now, &privacy).await {
                 Ok(state_entry) => {
                     report.induced.push(state_entry.fingerprint.clone());
                     agent_state.rules.push(state_entry);
@@ -893,6 +909,7 @@ pub fn spawn_induction_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_privacy::PrivacyGate;
     use std::io::Write;
 
     fn temp_home() -> PathBuf {
@@ -1316,7 +1333,9 @@ mod tests {
         let key = sample_key();
         let now = Utc::now();
 
-        let state = induce_rule(&engine, "agent-x", &key, now).await.unwrap();
+        let state = induce_rule(&engine, "agent-x", &key, now, &PrivacyGate::defaults())
+            .await
+            .unwrap();
 
         let ceiling = duduclaw_memory::trust_ceiling("agent_derived");
         let origin = engine
@@ -1371,7 +1390,7 @@ mod tests {
             event: "os_file".into(),
             interrupt_bucket: InterruptBucket::Low,
         };
-        let state = induce_rule(&engine, "agent-y", &key, Utc::now())
+        let state = induce_rule(&engine, "agent-y", &key, Utc::now(), &PrivacyGate::defaults())
             .await
             .unwrap();
         assert!(state.key_fact_id.is_some());
@@ -1394,7 +1413,7 @@ mod tests {
     async fn revoke_rule_supersedes_temporal_memory_row() {
         let engine = SqliteMemoryEngine::in_memory().unwrap();
         let key = sample_key();
-        let induced = induce_rule(&engine, "agent-z", &key, Utc::now())
+        let induced = induce_rule(&engine, "agent-z", &key, Utc::now(), &PrivacyGate::defaults())
             .await
             .unwrap();
 

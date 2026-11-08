@@ -177,6 +177,8 @@ impl MethodHandler {
         // WP22 T1 — kept for the authority commit in `publish` below; the
         // `toml!` macro consumes these by value.
         let org_entry = duduclaw_core::OrgEntry::new(&reports_to, &department);
+        // v1.81 (S2): only `main` may create employees by default.
+        let can_create_agents = duduclaw_core::agent_toml::default_can_create_agents(Some(role));
 
         let mut agent_config = toml::toml! {
             [agent]
@@ -211,8 +213,9 @@ impl MethodHandler {
             // v1.68: the four flags are enforced at the MCP gate; scaffold
             // them on (the marker tells the boot migration to leave this
             // file alone, so a later `false` from the dashboard sticks).
+            // v1.81 (S2): `can_create_agents` by role — `true` only for main.
             [permissions]
-            can_create_agents = true
+            can_create_agents = can_create_agents
             can_send_cross_agent = true
             can_modify_own_skills = true
             can_modify_own_soul = false
