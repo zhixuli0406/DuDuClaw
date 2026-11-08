@@ -1213,10 +1213,7 @@ impl LicenseRuntime {
                 self.apply_refresh(&request, new_license, &accepted.matched).await?;
                 info!("phone-home succeeded; license refreshed");
                 if let Some(reason) = accepted.relay_key_reason {
-                    // The SAS is a public-key digest, not a secret.
-                    let fingerprint = request.installation_pubkey.as_deref()
-                        .and_then(crate::installation_identity::sas_for_hex).unwrap_or_default();
-                    info!(reason, installation_key_fingerprint = %fingerprint,
+                    info!(reason,
                         "MFA email relay unavailable until the account owner approves this installation key in the license console");
                 }
                 Ok(())

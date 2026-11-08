@@ -150,7 +150,7 @@ pub fn load_or_create(home: &Path) -> io::Result<(InstallationKey, bool)> {
 pub fn ensure_public_key_hex(home: &Path) -> Option<String> {
     match load_or_create(home) {
         Ok((key, created)) => {
-            if created { tracing::info!(fingerprint = %key.fingerprint(), "generated MFA relay installation key"); }
+            if created { tracing::info!("generated MFA relay installation key"); }
             Some(key.public_key_hex())
         }
         Err(error) => {
