@@ -63,8 +63,12 @@ impl ComputerConnectorProvider {
         let session=call.arguments().get("session_id").map(|v|v.as_str().ok_or(VerificationError::Invalid)).transpose()?;
         let request=crate::computer_use_sessions::actions::ActionRequest::Login {credential:metadata.label.clone()};
         selected.recheck()?;
+        // F1: providers may be built at boot before the gateway's live session
+        // registry exists; employee sessions live in that registry, so prefer it.
+        let sessions=crate::computer_use_sessions::workspace_admin::live_sessions(&self.home)
+            .unwrap_or_else(||self.sessions.clone());
         let result=duduclaw_mcp_boundary::io_authority::scope(selected.io_context(),
-            self.sessions.action(&self.agent,session,None,&request)).await;
+            sessions.action(&self.agent,session,None,&request)).await;
         let result=match result {
             Ok(result) if selected.recheck().is_ok()=>result,
             _=>return Ok(json!({"isError":true,"content":[{"type":"text","text":

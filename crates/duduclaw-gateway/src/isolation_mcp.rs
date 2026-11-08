@@ -136,7 +136,7 @@ pub use boot::test_support;
 
 #[cfg(target_os = "linux")]
 pub use boot::{BootSources, BootStatus, MissingProducer, DispatcherFactory, DispatcherInput, LaunchInput,
-    install_boot_sources, install_dispatcher_factory, boot_protected, boot_status, prepare_launch};
+    install_boot_sources, install_connector_factory, install_dispatcher_factory, boot_protected, boot_status, prepare_launch};
 /// SR2 finding 8: the direct human capability constructor is not a public
 /// API; production issues capabilities through `record_authorization` and
 /// the boot issuer. Only tests and the test-support fixtures may name it.

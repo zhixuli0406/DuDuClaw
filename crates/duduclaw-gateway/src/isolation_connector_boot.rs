@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::{google_identity::isolation_bridge::GoogleIsolationBridge,
     isolation_connectors::{AccountId, BoundConnectorExecutor, ConnectorCatalog, ConnectorKind,
         LiveConnectorSelectionPolicy, ProductConnectorAccount, Route, SelectedConnector, provider_for_tool},
-    isolation_connector_clients::{AccountCredentialProvider, NativeConnectorExecutor},
+    isolation_connector_clients::{AccountCredentialProvider, NativeConnectorExecutor, VaultedCredentials},
     isolation_connector_details::{DetailReference, needs_details},
     isolation_connector_database::DatabaseConnectorProvider,
     isolation_connector_channel::{ChannelAccount, ChannelConnectorProvider},
@@ -35,7 +35,9 @@ use crate::{google_identity::isolation_bridge::GoogleIsolationBridge,
 /// every tool of that provider (`Unavailable`), because the employee has no
 /// active catalog route for it.
 pub struct ConnectorBootProviders {
-    pub google: Arc<GoogleIsolationBridge>,
+    /// `None` (F1): no bridge input for this employee (see
+    /// [`GoogleBridgeFactory::bridge_for`]); Google is a refusing adapter.
+    pub google: Option<Arc<GoogleIsolationBridge>>,
     pub notion_policy: Option<Arc<dyn LiveConnectorSelectionPolicy>>,
     pub github_policy: Option<Arc<dyn LiveConnectorSelectionPolicy>>,
     pub native_credentials: Arc<dyn AccountCredentialProvider>,
@@ -53,10 +55,15 @@ pub struct ConnectorBootProviders {
     /// ones; a detail provider installed without a fence refuses assembly.
     pub detail_fences: BTreeMap<&'static str, DetailFence>,
     /// Providers with a route whose details are not provisioned for its
-    /// current generation. Installed as refusing adapters and reported as
+    /// current generation (or, for `google`, routes but no bridge input).
+    /// Installed as refusing adapters and reported as
     /// [`ProviderRefusal::SetupRequired`].
     pub setup_required: BTreeSet<&'static str>,
 }
+
+/// Providers that may be reported setup-required: C6 detail providers, and
+/// Google when the employee has routes but no bridge input (F1).
+fn may_need_setup(provider: &str) -> bool { needs_details(provider) || provider == "google" }
 
 /// Why a provider was installed as a refusing adapter. F3 maps
 /// `SetupRequired` to the readiness reason `connector_setup_required{provider}`.
@@ -67,6 +74,8 @@ pub enum ProviderRefusal {
     /// A route needs per-account details (database source, website
     /// credential, channel route/token reference) that are not provisioned
     /// for its current generation, or whose token reference no longer resolves.
+    /// F1: also Google when the employee has a Google route but no bridge
+    /// input (no unique employee MCP key reference).
     SetupRequired,
 }
 impl ProviderRefusal {
@@ -155,7 +164,8 @@ impl InstalledConnectorProviders {
         providers: ConnectorBootProviders) -> Result<Self, VerificationError> {
         let ConnectorBootProviders { google, notion_policy, github_policy, native_credentials, database, odoo, channel,
             model, computer, search, detail_fences, setup_required } = providers;
-        if setup_required.iter().chain(detail_fences.keys()).any(|provider| !needs_details(provider)) {
+        if setup_required.iter().any(|provider| !may_need_setup(provider))
+            || detail_fences.keys().any(|provider| !needs_details(provider)) {
             return Err(VerificationError::Invalid);
         }
         let native = Arc::new(NativeConnectorExecutor::new(home.clone(), agent.clone(), native_credentials)?);
@@ -165,7 +175,7 @@ impl InstalledConnectorProviders {
         let mut registry = ConnectorProviderRegistry::default();
         let mut refusals = BTreeMap::new();
         for (provider, adapter) in [
-            ("google", Some(both(google))),
+            ("google", google.map(both)),
             ("notion", native_with(notion_policy)),
             ("github", native_with(github_policy)),
             ("database", database.map(both)),
@@ -428,6 +438,14 @@ pub trait ConnectorAccountDetails: Send + Sync {
 pub trait GoogleBridgeFactory: Send + Sync {
     fn bridge(&self, home: &Path, agent: &str, employee: EmployeeId, catalog: Arc<ConnectorCatalog>)
         -> Result<Arc<GoogleIsolationBridge>, VerificationError>;
+    /// F1: `Ok(None)` when this employee has no bridge input (e.g. no MCP key
+    /// reference of its own); Google is then a refusing adapter, reported as
+    /// setup-required while the employee has a Google route. `Err` refuses
+    /// the whole build.
+    fn bridge_for(&self, home: &Path, agent: &str, employee: EmployeeId, catalog: Arc<ConnectorCatalog>)
+        -> Result<Option<Arc<GoogleIsolationBridge>>, VerificationError> {
+        self.bridge(home, agent, employee, catalog).map(Some)
+    }
 }
 pub struct GoogleBridgeInputs {
     pub users: Option<Arc<duduclaw_auth::UserDb>>,
@@ -523,6 +541,10 @@ pub struct GatewayConnectorFactoryParts {
     pub computer_sessions: Arc<crate::computer_use_sessions::ComputerUseSessions>,
     pub odoo_executors: Arc<dyn OdooExecutorFactory>,
     pub channel_executors: Arc<dyn ChannelExecutorFactory>,
+    /// F1: the process vault, the same instance boot installs into the
+    /// connector lifecycle (`install_credential_material`). Native
+    /// Notion/GitHub credentials are held in it keyed by (account, generation).
+    pub credential_vault: Arc<crate::isolation_connector_clients::AccountCredentialVault>,
 }
 
 /// Gateway-side [`ConnectorProviderFactory`]: builds every provider except the
@@ -620,7 +642,12 @@ impl ConnectorProviderFactory for GatewayConnectorFactory {
         let plan = plan_connector_accounts(&catalog, binding, parts.home_binding.as_ref())?;
         let (home_dir, name) = (home.to_path_buf(), agent.to_owned());
 
-        let google = parts.google.bridge(home, agent, employee, catalog.clone())?;
+        let google = parts.google.bridge_for(home, agent, employee, catalog.clone())?;
+        // Without a bridge, Google is a refusing adapter; it is a setup gap
+        // only while the employee actually has a Google route (own, home, or
+        // its own SharedTenant route served by an E4 tenant source).
+        let google_setup = google.is_none() && (!plan.accounts("google").is_empty()
+            || catalog.active_routes_for(binding)?.iter().any(|route| route.provider == "google"));
 
         let notion_policy = match plan.single("notion")? {
             Some(account) => Some(Arc::new(NotionPolicy::new(home_dir.clone(), name.clone(), employee,
@@ -632,12 +659,18 @@ impl ConnectorProviderFactory for GatewayConnectorFactory {
                 account.product(), catalog.clone())?) as Arc<dyn LiveConnectorSelectionPolicy>),
             None => None,
         };
-        let native_credentials: Arc<dyn AccountCredentialProvider> =
-            Arc::new(HomeOAuthCredentialProvider::new(home_dir.clone(), catalog.clone())?);
+        // F1: the executors read native home credentials through the process
+        // vault (keyed by account + pinned generation), which C3 revoke and C4
+        // events drop after their catalog fence.
+        let native_credentials: Arc<dyn AccountCredentialProvider> = Arc::new(VaultedCredentials::new(
+            parts.credential_vault.clone(),
+            Arc::new(HomeOAuthCredentialProvider::new(home_dir.clone(), catalog.clone())?),
+            catalog.clone()));
 
         // C6: database/computer/channel accounts need provisioned details.
         // Every provider's details are read before any of them is built.
         let mut outcomes = DetailOutcomes::default();
+        if google_setup { outcomes.setup_required.insert("google"); }
         let database = self.provisioned(plan.accounts("database"), employee, agent)?;
         let computer = self.provisioned(plan.accounts("computer"), employee, agent)?;
         // D3 gate first: without the CLI channel executor factory nothing
@@ -942,6 +975,7 @@ mod tests {
             computer_sessions: crate::computer_use_sessions::workspace_admin::admin_sessions(home),
             odoo_executors: Executors::new("odoo", None),
             channel_executors: Executors::new("channel", None),
+            credential_vault: Arc::default(),
         }).unwrap()
     }
     fn db_record(employee: EmployeeId, source: &str) -> crate::isolation_connector_details::AccountDetailRecord {
@@ -1081,6 +1115,7 @@ mod tests {
             computer_sessions: crate::computer_use_sessions::workspace_admin::admin_sessions(home.path()),
             odoo_executors: odoo.clone(),
             channel_executors: channel.clone(),
+            credential_vault: Arc::default(),
         }).unwrap();
         Setup { home, factory, details, odoo, channel, google, search }
     }

@@ -17,6 +17,8 @@ pub fn install_worker(launcher: Box<dyn WorkerLauncher>)
     Ok(install_worker_services(launcher)?.parser)
 }
 
+/// Cloning shares the one installed launcher (F1: search connector source).
+#[derive(Clone)]
 pub struct InstalledWorkerServices {
     pub parser: Arc<dyn FileParser>,
     invoke: Arc<WorkerInvoke>,
