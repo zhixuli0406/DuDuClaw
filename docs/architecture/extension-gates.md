@@ -111,3 +111,52 @@ No dedicated inbound Live Chat HTTP route was found: visitor messages arrive thr
 The inventory is based on source inspection, not live Odoo, voice-provider or third-party-server acceptance. Regression tests cover routing collisions, unauthenticated extension requests and MCP transport gate coverage. A passing source inspection or test does not establish compatibility with an out-of-tree extension.
 
 A later family-wide enable/disable design must choose a shared admission point for each row, define how active work is stopped, and preserve required cleanup. The v1.80.0 gates intentionally leave those existing product paths and their independent authorization policies in place.
+
+## ModuleLease core spike (v1.81.0, RM-102)
+
+`duduclaw-core::module_lease` provides a sealed four-module registry, typed
+`ModuleLease<M>` admission proofs, and a transactional `ModuleStore` contract.
+The pilots are `odoo_livechat`, `voice`, `discovery`, and `computer_use`.
+Live Chat defaults to Disabled; config-dependent voice and Discovery start
+Disabled until future gateway initialization resolves their configuration.
+Computer use defaults to Active, matching its existing lack of a master switch;
+its employee permissions remain a separate gate.
+
+The state machine is `Active → Draining → Disabled → Active`, with
+`Disabled → Purging → Purged` for removal. Only drain reconciliation can enter
+Disabled from Draining. New execution is denied outside Active. Existing Work
+can resume before the drain deadline while a matching inflight row exists.
+`Cleanup` remains available in every state; Q5's explicit `ReadAccess` kind keeps
+status/list/history reads available even while disabled. These exceptional
+proofs authorize only their own kind, so future service boundaries must check
+`kind()` as well as the module type. Leases have private fields and no public
+constructor, Clone, or Default; Drop releases their slot.
+
+Core has no rusqlite dependency. To preserve that boundary, it contains the
+in-memory transactional store; `duduclaw-memory::module_lease::SqliteModuleStore`
+implements the same contract using its existing rusqlite dependency. Explicit
+`initialize(home)` creates `modules.db` in WAL mode with `modules` and `inflight`
+tables. `open(home)` never creates a missing database. Existing missing rows,
+corrupt states, I/O errors and locks that exceed the busy timeout deny even
+read/cleanup admission. Each operation rereads the database under an immediate
+transaction, so independent handles/processes share admission and drain state.
+State transitions increment generation; the transition primitive itself does
+not perform Admin authorization and must remain behind future gateway checks.
+
+Only Work leases are persisted. Each guard (including a resumed guard) owns a
+unique slot, so dropping one guard cannot release another guard's work. Short
+calls use the design's 420-second grace after entering Draining; drain completes
+on a successful state/acquire/release operation once that grace passes and the
+Work slots are empty. There is no background timer in this spike. Unix rows
+whose PID is definitely dead (ESRCH) are reclaimed; permission errors, PID reuse,
+and non-Unix uncertainty retain the rows. Heartbeats are recorded at admission;
+no age-based eviction or renewal worker is implemented. Live overdue Work is
+retained conservatively until Drop: a deadline refuses resume but does not prove
+execution stopped. Future lifecycle wiring must apply `needs_human`/approval
+expiry before reclaiming such work. Failed Drop writes are logged and retain the
+slot, keeping drain closed.
+
+This is internal groundwork only: no gateway RPC, HTTP, MCP, worker, CLI, or
+channel entry point uses these proofs yet. Runtime integration and its live
+cross-process consistency measurement belong to v1.82.0. Purge transitions do
+not delete module data or binaries in this spike.
