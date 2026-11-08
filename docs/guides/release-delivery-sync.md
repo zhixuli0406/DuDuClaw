@@ -62,6 +62,37 @@ OEM tar, Pro binaries and control-plane allowlist. Pro images default to
 `CLOUD_BUILD=1`; set `CLOUD_BUILD=0` to deliberately build locally. The pushed amd64
 image is pulled before tar creation and linux-x64 binary extraction.
 
+## Re-run archive signing only
+
+The `release.yml` build matrix uploads `unsigned-duduclaw-*` artifacts (archives
+and SHA-256 checksums) immediately after packaging. A separate `sign` matrix
+checks each checksum, signs the archive with keyless cosign and verifies the
+signature against the exact workflow ref (`https://github.com/${github.workflow_ref}`)
+and the GitHub OIDC issuer (`https://token.actions.githubusercontent.com`). Windows
+keeps its existing ZIP/cosign path. Each sign or verify command gets six attempts
+with delays of 30, 60, 120, 240 and 480 seconds; exhausted retries fail that sign
+job while preserving the unsigned build artifacts.
+
+After a transient Rekor/Fulcio outage, find the failed signing job's database ID:
+
+```bash
+gh run view RUN_ID --json jobs --jq '.jobs[] | select(.name | startswith("Sign ")) | {name, databaseId, conclusion}'
+gh run rerun RUN_ID --job SIGN_JOB_ID
+```
+
+Repeat for each failed signing matrix entry. This reruns the selected signing
+job and its downstream dependents; it does not rerun successful build jobs. Use
+the numeric `databaseId`, not a matrix label or job URL suffix. Unsigned artifacts
+must still be within their Actions retention period. An expired artifact requires
+a rebuild. Re-running an old run uses that run's workflow revision, so this recovery
+path applies only to runs containing the separate `sign` job.
+
+Verified bundles retain the original `duduclaw-*` artifact names and archive,
+`.sha256`, `.sig` and `.pem` paths. A signing rerun overwrites only its signed
+bundle. GitHub Release and npm download only these bundles, excluding `unsigned-*`;
+PyPI builds its own package and waits for the release job. Minisign remains in the
+release job, and PyPI retains its separate Trusted Publisher OIDC permission.
+
 ## Main platform CI preflight
 
 PR Rust CI runs only on Ubuntu. Main pushes, the daily 18:00 UTC schedule and
