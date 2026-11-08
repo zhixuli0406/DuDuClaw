@@ -777,6 +777,43 @@ pub(crate) fn refuse_disclosure_ack_edit(before: &toml::Table, after: &toml::Tab
     Ok(())
 }
 
+/// RM-027 round 3: a raw `agent.toml` save that changes the org pair must
+/// not carry along a field the admin left alone while that field differs
+/// from the authority (the mirror drifted — possibly tampered by the
+/// employee). Returns the zh-TW refusal, or `None` when every unchanged
+/// field already equals the authority.
+pub(crate) fn raw_org_drift(
+    before: &duduclaw_core::OrgEntry,
+    after: &duduclaw_core::OrgEntry,
+    authority: &duduclaw_core::OrgEntry,
+) -> Option<String> {
+    let shown = |v: &str| if v.is_empty() { "（無）".to_string() } else { format!("「{}」", duduclaw_core::truncate_chars(v, 64)) };
+    let mut drifted: Vec<String> = Vec::new();
+    if before.reports_to == after.reports_to && after.reports_to != authority.reports_to {
+        drifted.push(format!(
+            "主管 reports_to：agent.toml 是{}，組織權威資料是{}",
+            shown(&after.reports_to),
+            shown(&authority.reports_to)
+        ));
+    }
+    if before.department == after.department && after.department != authority.department {
+        drifted.push(format!(
+            "部門 department：agent.toml 是{}，組織權威資料是{}",
+            shown(&after.department),
+            shown(&authority.department)
+        ));
+    }
+    if drifted.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "這位 AI 員工的 agent.toml 和組織權威資料（org.toml）不一致（{}），而這次的修改沒有要變更它。\
+         為了不把未經確認的值寫進權威資料，這次沒有儲存。請先處理不一致：在這次編輯中把它改成權威資料的值、\
+         在組織圖重新套用這位 AI 員工的位置，或由管理員在終端機執行 `duduclaw org sync` 採用 agent.toml 的值，然後再試。",
+        drifted.join("；")
+    ))
+}
+
 fn key_changed(before: &toml::Table, after: &toml::Table, path: &str) -> bool {
     super::config_commit::toml_at(before, path) != super::config_commit::toml_at(after, path)
 }
@@ -1007,6 +1044,15 @@ impl MethodHandler {
                 let lock = super::org_change_rpc::lock_org(&self.home_dir).await?;
                 let store = lock.load().map_err(|e| e.to_string())?;
                 let reports_to_changed = org_before.reports_to != org_after.reports_to;
+                // RM-027 round 3: the file being edited is the (tamperable)
+                // mirror. A field the admin did not change must already
+                // equal the authority, or saving would promote the mirror's
+                // value into the authority: refuse and ask for an explicit
+                // drift resolution instead.
+                let authority = duduclaw_core::org_change::effective_in(&store, &self.home_dir, id).unwrap_or_default();
+                if let Some(drift) = raw_org_drift(&org_before, &org_after, &authority) {
+                    return Err(drift.into());
+                }
                 duduclaw_core::org_change::validate_org_change_in(
                     &store,
                     &self.home_dir,

@@ -149,6 +149,15 @@ pub struct ApprovalBroker {
     store: std::sync::Arc<ApprovalStore>,
 }
 
+/// RM-027: proof of a short exclusive decision lease on one pending
+/// approval ([`ApprovalBroker::take_decision_lease`]). While it is live the
+/// TTL sweep, `poll`, plain deciders and `withdraw` leave the row alone, so
+/// a decided effect and its terminal state land together.
+#[derive(Debug)]
+pub struct DecisionLease {
+    token: String,
+}
+
 #[cfg(test)]
 mod tests;
 

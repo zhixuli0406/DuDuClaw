@@ -353,6 +353,61 @@ impl ApprovalBroker {
         Ok(())
     }
 
+    /// RM-027: take a short exclusive decision lease (`secs`, at least 1).
+    /// One atomic UPDATE: `Ok(None)` when the approval is not pending, is
+    /// already past its TTL, or someone else holds a live lease. Callers that
+    /// apply a side effect re-check with [`Self::renew_decision_lease`] after
+    /// any wait and record the outcome with [`Self::decide_with_lease`].
+    pub async fn take_decision_lease(&self, id: &ApprovalId, secs: i64) -> Result<Option<DecisionLease>, String> {
+        let token = ApprovalId::new().as_str().to_string();
+        let now = Utc::now();
+        let until = now + chrono::Duration::seconds(secs.max(1));
+        let taken = self
+            .store
+            .take_lease(id, &token, &now.to_rfc3339(), &until.to_rfc3339())
+            .await?;
+        Ok(taken.then_some(DecisionLease { token }))
+    }
+
+    /// Re-confirm and extend a held lease: `false` once it lapsed, the row
+    /// left `pending`, or the approval's TTL passed (the caller must then not
+    /// apply anything).
+    pub async fn renew_decision_lease(&self, id: &ApprovalId, lease: &DecisionLease, secs: i64) -> Result<bool, String> {
+        let now = Utc::now();
+        let until = now + chrono::Duration::seconds(secs.max(1));
+        self.store
+            .renew_lease(id, &lease.token, &now.to_rfc3339(), &until.to_rfc3339())
+            .await
+    }
+
+    /// Give a lease back without deciding (best-effort; it lapses anyway).
+    pub async fn release_decision_lease(&self, id: &ApprovalId, lease: &DecisionLease) {
+        if let Err(e) = self.store.release_lease(id, &lease.token).await {
+            warn!(approval_id = %id, error = %e, "decision lease release failed (it lapses on its own)");
+        }
+    }
+
+    /// Record the terminal decision under a live lease (clears the lease).
+    /// Not refused for a TTL that passed while the lease held the row.
+    pub async fn decide_with_lease(
+        &self,
+        id: &ApprovalId,
+        lease: &DecisionLease,
+        approve: bool,
+        decided_by: &str,
+    ) -> Result<(), String> {
+        let status = if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied };
+        let n = self
+            .store
+            .decide_leased(id, &lease.token, status, decided_by, &Utc::now().to_rfc3339())
+            .await?;
+        if n == 0 {
+            return Err(format!("approval {id}: the decision lease lapsed or the row is no longer pending"));
+        }
+        info!(approval_id = %id, decision = status.as_str(), decided_by, "approval decided (leased)");
+        Ok(())
+    }
+
     /// Test-only seam: stamp the delivered notification destination without
     /// going through a real channel send, so `approval_notify`'s inbound tests
     /// can exercise the destination-match authorization path.

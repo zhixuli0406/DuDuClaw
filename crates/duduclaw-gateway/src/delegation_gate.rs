@@ -597,7 +597,7 @@ mod tests {
         // never got a record) — the realistic shape of the fallback case.
         duduclaw_core::org_store::seed_if_absent(home).unwrap();
         for stray in ["mkt_lead", "mkt_rep"] {
-            duduclaw_core::org_store::remove(home, stray).unwrap();
+            duduclaw_core::org_store::with_org_lock(home, |org| duduclaw_core::org_store::remove(org, stray)).unwrap();
         }
         assert!(allows_dispatch(
             &gate(home, Some("mkt_lead"), "mkt_rep").await

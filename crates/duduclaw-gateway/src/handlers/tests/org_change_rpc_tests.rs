@@ -108,6 +108,31 @@ impl Fx {
         org_store::read_mirror(&self.home.join("agents").join(id).join("agent.toml")).unwrap_or_default()
     }
 
+    /// An authority write made elsewhere (e.g. `duduclaw org sync`), under
+    /// the global org lock like every authority writer.
+    fn set_authority(&self, id: &str, entry: OrgEntry) {
+        org_store::with_org_lock(&self.home, |org| org_store::upsert(org, id, entry)).unwrap();
+    }
+
+    /// The employee tampers with its own `agent.toml` (the display mirror).
+    fn tamper_mirror(&self, id: &str, from: &str, to: &str) {
+        let path = self.home.join("agents").join(id).join("agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(from), "fixture must contain {from}: {raw}");
+        std::fs::write(&path, raw.replace(from, to)).unwrap();
+    }
+
+    /// Move a card's `created_at` so that `secs_left` remain of its TTL.
+    fn expire_in(&self, id: &str, secs_left: i64) {
+        let created = (chrono::Utc::now()
+            - chrono::Duration::seconds(crate::org_change_approval::TTL_SECS - secs_left))
+        .to_rfc3339();
+        rusqlite::Connection::open(self.home.join("approvals.db"))
+            .unwrap()
+            .execute("UPDATE approvals SET created_at=?1 WHERE id=?2", rusqlite::params![created, id])
+            .unwrap();
+    }
+
     async fn status(&self, id: &str) -> ApprovalStatus {
         ApprovalBroker::open(&self.home).unwrap().get(&ApprovalId::from(id.to_string())).await.unwrap().unwrap().status
     }
@@ -378,7 +403,7 @@ async fn a_request_whose_base_moved_while_waiting_is_denied_not_applied() {
     let f = fixture().await;
     let id = f.propose().await;
     // The authority moves under the request (e.g. `duduclaw org sync`).
-    org_store::upsert(&f.home, "rep", OrgEntry::new("lead", "經營")).unwrap();
+    f.set_authority("rep", OrgEntry::new("lead", "經營"));
     let card = ok(&f.call("org.pending_changes", json!({}), &f.admin).await);
     assert_eq!(card["pending"][0]["stale"], true);
     let (_, e) = refusal(&f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin).await);
@@ -599,7 +624,7 @@ async fn a_denial_that_fails_to_record_is_not_audited_as_rejected() {
     use crate::handlers::org_change_rpc::decide_failpoint;
     let f = fixture().await;
     let id = f.propose().await;
-    org_store::upsert(&f.home, "rep", OrgEntry::new("lead", "經營")).unwrap();
+    f.set_authority("rep", OrgEntry::new("lead", "經營"));
     decide_failpoint::arm(&id);
     let (_, e) = refusal(&f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin).await);
     assert!(e.contains("仍待決定"), "{e}");
@@ -666,4 +691,211 @@ async fn forbid_self_approval_covers_org_change_proposals() {
     assert_eq!(ok(&f.call("approvals.decide", json!({ "id": own, "approve": false }), &f.admin).await)["decided"], "denied");
     // Someone else's proposal is approved normally.
     assert_eq!(ok(&f.call("approvals.decide", json!({ "id": mgr_card, "approve": true }), &f.admin).await)["decided"], "approved");
+}
+
+// ── Daybreak review round 3 regressions ─────────────────────────────────────
+
+/// Round 3, finding 1: agent creation (a gated authority writer outside the
+/// `org.*` RPCs) waits for the shared org lock too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_creation_waits_for_the_shared_org_lock() {
+    let f = fixture().await;
+    let held = org_store::lock_org_mutations(&f.home).unwrap();
+    let create = f.h.handle_agents_create_as(json!({ "name": "late", "reports_to": "ceo", "department": "經營" }), Some(&f.admin));
+    tokio::pin!(create);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut create).await.is_err(),
+        "agents.create must wait for the org mutation lock before recording the authority"
+    );
+    assert!(org_store::load(&f.home).get("late").is_none());
+    drop(held);
+    ok(&create.await);
+    assert_eq!(f.authority("late"), OrgEntry::new("ceo", "經營"));
+}
+
+/// Round 3, finding 2: an employee tampers with its mirror's `reports_to`;
+/// an Admin then changes only the department. The tampered value must not
+/// be promoted into the authority — not when the field is left out, and not
+/// when the form echoes the (tampered) prefilled value back.
+#[tokio::test]
+async fn agents_update_never_promotes_a_tampered_mirror_field() {
+    let f = fixture().await;
+    f.tamper_mirror("rep", "reports_to = \"lead\"", "reports_to = \"ceo\"");
+    assert_eq!(f.mirror("rep").reports_to, "ceo");
+    assert_eq!(f.authority("rep").reports_to, "lead");
+
+    ok(&f.call("agents.update", json!({ "agent_id": "rep", "department": "經營" }), &f.admin).await);
+    assert_eq!(f.authority("rep"), OrgEntry::new("lead", "經營"), "the tampered reports_to must not reach the authority");
+    assert_eq!(f.mirror("rep"), OrgEntry::new("lead", "經營"), "the mirror follows the authority");
+
+    f.tamper_mirror("rep", "reports_to = \"lead\"", "reports_to = \"ceo\"");
+    ok(&f
+        .call("agents.update", json!({ "agent_id": "rep", "reports_to": "ceo", "department": "業務" }), &f.admin)
+        .await);
+    assert_eq!(f.authority("rep"), OrgEntry::new("lead", "業務"), "an echoed prefilled value is not a request");
+    assert_eq!(f.mirror("rep"), OrgEntry::new("lead", "業務"));
+    // An explicit move is still a move.
+    ok(&f.call("agents.update", json!({ "agent_id": "rep", "reports_to": "other" }), &f.admin).await);
+    assert_eq!(f.authority("rep"), OrgEntry::new("other", "業務"));
+}
+
+/// Round 3, finding 2: the raw editor compares both org fields with the
+/// authority; a drifted field the admin did not change refuses the save
+/// (explicit drift resolution), and nothing moves.
+#[tokio::test]
+async fn raw_editor_refuses_to_carry_a_drifted_org_field_into_the_authority() {
+    let f = fixture().await;
+    f.tamper_mirror("rep", "reports_to = \"lead\"", "reports_to = \"ceo\"");
+    let org_before = std::fs::read_to_string(f.home.join("org.toml")).unwrap();
+    let raw = ok(&f.call("config.raw.get", json!({ "file": "agent:rep" }), &f.admin).await);
+    let content = raw["content"].as_str().unwrap().to_string();
+    assert!(content.contains("department = \"業務\""), "{content}");
+    let edited = content.replace("department = \"業務\"", "department = \"經營\"");
+    let (_, e) = refusal(&f
+        .call("config.raw.set", json!({ "file": "agent:rep", "content": edited, "base_hash": raw["hash"] }), &f.admin)
+        .await);
+    assert!(e.contains("不一致") && e.contains("org sync") && e.contains("reports_to"), "{e}");
+    assert_eq!(std::fs::read_to_string(f.home.join("org.toml")).unwrap(), org_before);
+    assert_eq!(f.mirror("rep"), OrgEntry::new("ceo", "業務"), "the refused raw save wrote nothing");
+
+    // Resolving the drift in the same edit is an explicit choice: saved.
+    let fixed = edited.replace("reports_to = \"ceo\"", "reports_to = \"lead\"");
+    ok(&f
+        .call("config.raw.set", json!({ "file": "agent:rep", "content": fixed, "base_hash": raw["hash"] }), &f.admin)
+        .await);
+    assert_eq!(f.authority("rep"), OrgEntry::new("lead", "經營"));
+    assert_eq!(f.mirror("rep"), OrgEntry::new("lead", "經營"));
+}
+
+/// Round 3, finding 4: the prepared journal entry is written BEFORE the
+/// authority commit — if it cannot be written, nothing is applied and the
+/// card stays pending.
+#[tokio::test]
+async fn no_prepared_journal_means_no_apply() {
+    use crate::org_change_approval::journal::{self, record_failpoint, State};
+    let f = fixture().await;
+    let id = f.propose().await;
+    record_failpoint::arm(&id, State::Prepared);
+    let (code, msg) = refusal(&f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin).await);
+    record_failpoint::disarm(&id, State::Prepared);
+    assert_eq!(code, "journal_unavailable", "{msg}");
+    assert_eq!(f.authority("rep"), OrgEntry::new("lead", "業務"));
+    assert_eq!(f.mirror("rep"), OrgEntry::new("lead", "業務"));
+    assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+    assert!(!journal::exists(&f.home, &id));
+    assert!(audit_rows(&f.home, "org_change_applied").is_empty());
+    // The lease was given back: the retry applies normally.
+    let d = ok(&f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin).await);
+    assert_eq!(d["decided"], "approved", "{d}");
+    assert_eq!(f.authority("rep"), OrgEntry::new("other", "業務"));
+    assert!(!journal::exists(&f.home, &id));
+}
+
+/// Round 3, finding 4: a prepared entry left by an attempt that stopped
+/// around the commit is settled against the authority under the org lock —
+/// committed ⇒ the original approval completes without re-applying; not
+/// committed ⇒ the request is judged (and applied) normally.
+#[tokio::test]
+async fn a_prepared_journal_entry_is_settled_against_the_authority() {
+    use crate::handlers::org_change_rpc::decide_failpoint;
+    use crate::org_change_approval::journal::{self, record_failpoint, State};
+
+    // (a) The commit landed, but neither "applied" nor the decision did.
+    let f = fixture().await;
+    let id = f.propose().await;
+    record_failpoint::arm(&id, State::Applied);
+    decide_failpoint::arm(&id);
+    let (code, _) = refusal(&f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin).await);
+    record_failpoint::disarm(&id, State::Applied);
+    decide_failpoint::disarm(&id);
+    assert_eq!(code, "decision_unrecorded");
+    assert_eq!(f.authority("rep"), OrgEntry::new("other", "業務"));
+    assert_eq!(journal::read(&f.home, &id).unwrap().unwrap().state, State::Prepared);
+    // A denial would lie about a live change.
+    let (code, _) = refusal(&f.call("approvals.decide", json!({ "id": id, "approve": false }), &f.admin).await);
+    assert_eq!(code, "already_applied");
+    let d = ok(&f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin).await);
+    assert_eq!(d["decided"], "approved", "{d}");
+    assert_eq!(f.status(&id).await, ApprovalStatus::Approved);
+    assert_eq!(audit_rows(&f.home, "org_change_applied").len(), 1);
+    assert!(!journal::exists(&f.home, &id));
+
+    // (b) A prepared entry whose commit never happened (crash before it).
+    let g = fixture().await;
+    let id = g.propose().await;
+    let rec = ApprovalBroker::open(&g.home).unwrap().get(&ApprovalId::from(id.clone())).await.unwrap().unwrap();
+    let prepared = journal::Applied::prepared(
+        &rec,
+        "rep",
+        &OrgEntry::new("lead", "業務"),
+        &OrgEntry::new("other", "業務"),
+        "admin-1",
+    );
+    journal::record(&g.home, &prepared).unwrap();
+    let d = ok(&g.call("approvals.decide", json!({ "id": id, "approve": true }), &g.admin).await);
+    assert_eq!(d["decided"], "approved", "{d}");
+    assert_eq!(g.authority("rep"), OrgEntry::new("other", "業務"));
+    assert!(!journal::exists(&g.home, &id));
+
+    // (c) An entry written for a different payload is refused, nothing moves.
+    let h = fixture().await;
+    let id = h.propose().await;
+    let mut rec = ApprovalBroker::open(&h.home).unwrap().get(&ApprovalId::from(id.clone())).await.unwrap().unwrap();
+    rec.payload["reason"] = json!("something else");
+    let foreign = journal::Applied::prepared(&rec, "rep", &OrgEntry::new("lead", "業務"), &OrgEntry::new("ceo", ""), "admin-1");
+    journal::record(&h.home, &foreign).unwrap();
+    let (code, _) = refusal(&h.call("approvals.decide", json!({ "id": id, "approve": true }), &h.admin).await);
+    assert_eq!(code, "journal_mismatch");
+    assert_eq!(h.authority("rep"), OrgEntry::new("lead", "業務"));
+    assert_eq!(h.status(&id).await, ApprovalStatus::Pending);
+}
+
+/// Round 3, finding 5: a near-expiry approval that waits for the org lock
+/// holds a decision lease (the TTL sweep cannot expire it underneath), is
+/// re-read once the lock is held, and — having expired meanwhile — is NOT
+/// applied; it is recorded as expired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_approval_that_expires_while_waiting_for_the_org_lock_is_not_applied() {
+    let f = fixture().await;
+    let id = f.propose().await;
+    f.expire_in(&id, 2);
+    let held = org_store::lock_org_mutations(&f.home).unwrap();
+    let decide = f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin);
+    tokio::pin!(decide);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut decide).await.is_err(),
+        "the decision must wait for the org lock"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    // Past the TTL now — but the lease keeps the sweep (and other deciders) off.
+    let broker = ApprovalBroker::open(&f.home).unwrap();
+    assert_eq!(broker.expire_stale().await.unwrap(), 0);
+    assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+    assert!(!broker.withdraw(&ApprovalId::from(id.clone()), "test").await.unwrap(), "withdraw must not race the lease");
+    drop(held);
+    let (_, e) = refusal(&decide.await);
+    assert_eq!(e, crate::org_change_approval::EXPIRED_TEXT);
+    assert_eq!(f.status(&id).await, ApprovalStatus::Expired);
+    assert_eq!(f.authority("rep"), OrgEntry::new("lead", "業務"));
+    assert_eq!(f.mirror("rep"), OrgEntry::new("lead", "業務"));
+    assert!(audit_rows(&f.home, "org_change_applied").is_empty());
+    assert_eq!(audit_rows(&f.home, "org_change_rejected")[0]["details"]["why"], "expired");
+    assert!(!crate::org_change_approval::journal::exists(&f.home, &id));
+}
+
+/// Round 3, finding 5: an approval decided inside its TTL completes its
+/// effect and terminal state under the lease (no lease left behind).
+#[tokio::test]
+async fn an_approval_in_time_applies_under_the_lease_and_releases_it() {
+    let f = fixture().await;
+    let id = f.propose().await;
+    f.expire_in(&id, 60);
+    let d = ok(&f.call("approvals.decide", json!({ "id": id, "approve": true }), &f.admin).await);
+    assert_eq!(d["decided"], "approved", "{d}");
+    assert_eq!(f.authority("rep"), OrgEntry::new("other", "業務"));
+    let lease: Option<String> = rusqlite::Connection::open(f.home.join("approvals.db"))
+        .unwrap()
+        .query_row("SELECT lease_token FROM approvals WHERE id=?1", [id.as_str()], |r| r.get(0))
+        .unwrap();
+    assert!(lease.is_none(), "the lease is cleared with the decision");
 }

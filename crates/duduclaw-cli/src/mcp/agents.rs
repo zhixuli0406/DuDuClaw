@@ -253,22 +253,6 @@ pub(crate) async fn handle_create_agent(
         });
     }
 
-    // WP22 T1 — the agent now exists, so record its authoritative placement in
-    // `<home>/org.toml`; `[agent] reports_to` above is a display mirror from
-    // here on. Written *after* the commit, not before: a create that aborts
-    // must not leave an entry behind for the id, or a later hand-created agent
-    // of the same name would silently inherit this (stale) authority. If the
-    // store write itself fails, the agent simply has no record and the
-    // fallback rule keeps its `agent.toml` governing it — `duduclaw doctor`
-    // stays quiet (no record ⇒ no drift) and the next gated edit records it.
-    if let Err(e) = duduclaw_core::org_store::upsert(
-        home_dir,
-        name,
-        duduclaw_core::OrgEntry::new(&reports_to_display, ""),
-    ) {
-        tracing::warn!(agent = %name, error = %e, "org.toml upsert failed on create_agent");
-    }
-
     // Write SOUL.md if provided
     if !soul.is_empty() {
         let _ = std::fs::write(agent_dir.join("SOUL.md"), soul);
@@ -278,6 +262,24 @@ pub(crate) async fn handle_create_agent(
     let _ = std::fs::write(agent_dir.join("MEMORY.md"), "");
 
     drop(admission);
+
+    // WP22 T1 — the agent now exists, so record its authoritative placement in
+    // `<home>/org.toml`; `[agent] reports_to` above is a display mirror from
+    // here on. Written *after* the commit, not before: a create that aborts
+    // must not leave an entry behind for the id, or a later hand-created agent
+    // of the same name would silently inherit this (stale) authority. If the
+    // store write itself fails, the agent simply has no record and the
+    // fallback rule keeps its `agent.toml` governing it — `duduclaw doctor`
+    // stays quiet (no record ⇒ no drift) and the next gated edit records it.
+    // Under the global org lock like every authority write (RM-027 round 3),
+    // taken only after the admission lease is gone (the org lock always comes
+    // before the lifecycle barrier, never after a lease it drains). No await
+    // separates this from the commit above.
+    if let Err(e) = duduclaw_core::org_store::with_org_lock(home_dir, |org| {
+        duduclaw_core::org_store::upsert(org, name, duduclaw_core::OrgEntry::new(&reports_to_display, ""))
+    }) {
+        tracing::warn!(agent = %name, error = %e, "org.toml upsert failed on create_agent");
+    }
 
     // Install agent-file-guard PreToolUse hook so the newly-created agent
     // immediately gets protected against out-of-tree Write/Edit.

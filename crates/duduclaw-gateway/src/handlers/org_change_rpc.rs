@@ -134,6 +134,15 @@ fn lock_failed(message: &str) -> WsFrame {
     coded("org_lock_unavailable", message)
 }
 
+/// A journal entry exists for the card but was written for a different
+/// payload (or id): fail closed, change nothing.
+fn journal_mismatch() -> WsFrame {
+    coded(
+        "journal_mismatch",
+        "這筆組織調整的套用紀錄和目前的審核內容不一致，沒有做任何變更；請管理員檢查 org_change_journal 目錄。",
+    )
+}
+
 /// `<home>/agents/<id>/agent.toml`'s org pair (display mirror).
 fn mirror_of(home: &Path, agent_id: &str) -> Option<OrgEntry> {
     org_store::read_mirror(&home.join("agents").join(agent_id).join("agent.toml"))
@@ -190,12 +199,15 @@ fn audit_rejected(
 }
 
 /// Record a decision in the broker (the one call every `org_change`
-/// decision goes through, so a test can make it fail).
+/// decision goes through, so a test can make it fail). Under a decision
+/// lease the decision is recorded through it (the lease keeps everyone
+/// else, the TTL sweep included, off the row).
 async fn record_decision(
     broker: &crate::approval::ApprovalBroker,
     id: &crate::approval::ApprovalId,
     approve: bool,
     decided_by: &str,
+    lease: Option<&crate::approval::DecisionLease>,
 ) -> Result<(), String> {
     #[cfg(test)]
     {
@@ -203,7 +215,10 @@ async fn record_decision(
             return Err("injected decide failure".into());
         }
     }
-    broker.decide(id, approve, decided_by).await
+    match lease {
+        Some(lease) => broker.decide_with_lease(id, lease, approve, decided_by).await,
+        None => broker.decide(id, approve, decided_by).await,
+    }
 }
 
 /// Test seam: make `record_decision` fail for one approval id.
@@ -597,11 +612,15 @@ impl MethodHandler {
     }
 
     /// `approvals.decide` for `org_change` (dashboard only, current Admin
-    /// only). Inside the org lock: re-validates and re-checks the base,
-    /// applies FIRST (authority, then mirror), journals the apply, and records
-    /// the decision only after the write succeeded. A stale or no longer
-    /// valid request is denied; an expired one counts as a denial. A card
-    /// whose apply is journaled completes that original decision on retry.
+    /// only). An approval takes a short **decision lease** on the card first
+    /// (the TTL sweep and other deciders cannot touch it while it lives),
+    /// then the org lock; it re-reads the card (an approval that expired
+    /// while waiting is not applied), re-validates and re-checks the base,
+    /// writes a *prepared* journal entry (none ⇒ no apply), applies
+    /// (authority, then mirror), marks the entry applied in the same lock and
+    /// records the decision under the lease. A stale or no longer valid
+    /// request is denied; an expired one counts as a denial. A card whose
+    /// apply is journaled completes that original decision on retry.
     pub(crate) async fn decide_org_change(
         &self,
         broker: &crate::approval::ApprovalBroker,
@@ -621,9 +640,18 @@ impl MethodHandler {
             Err(e) => return WsFrame::error_response("", &format!("讀取審核失敗：{e}")),
         };
         // An earlier attempt already applied this approval but could not
-        // record it: finish that decision, never re-judge it as stale.
+        // record it: finish that decision, never re-judge it as stale. One
+        // that stopped around the commit (prepared) is settled first.
         match journal::read(&self.home_dir, rec.id.as_str()) {
-            Ok(Some(applied)) => return self.finish_journaled(broker, &rec, applied, approve, ctx).await,
+            Ok(Some(entry)) if !entry.matches(&rec) => return journal_mismatch(),
+            Ok(Some(entry)) if entry.state == journal::State::Applied => {
+                return self.finish_journaled(broker, &rec, entry, approve, ctx).await;
+            }
+            Ok(Some(_prepared)) => match self.settle_prepared(&rec).await {
+                Ok(Some(applied)) => return self.finish_journaled(broker, &rec, applied, approve, ctx).await,
+                Ok(None) => {}
+                Err(frame) => return frame,
+            },
             Ok(None) => {}
             Err(e) => {
                 return WsFrame::error_response("", &format!("讀取這筆組織調整的套用紀錄失敗，沒有做任何變更：{e}"));
@@ -634,16 +662,7 @@ impl MethodHandler {
         }
         let decided_by = format!("dashboard:{}", ctx.user_id);
         if rec.is_stale(chrono::Utc::now()) {
-            // Expiry = deny: nothing is applied. Audit only once the expiry
-            // is actually recorded.
-            return match broker.poll(approval_id).await {
-                Ok(status) if status != crate::approval::ApprovalStatus::Pending => {
-                    audit_rejected(&self.home_dir, &rec, ctx, Proposal::from_record(&rec).as_ref(), "expired", decision_reason);
-                    WsFrame::error_response("", oc::EXPIRED_TEXT)
-                }
-                Ok(_) => WsFrame::error_response("", oc::EXPIRED_TEXT),
-                Err(e) => WsFrame::error_response("", &format!("{}（逾期狀態沒有記錄成功：{e}）", oc::EXPIRED_TEXT)),
-            };
+            return self.expire_org_card(broker, &rec, ctx, decision_reason).await;
         }
         if let Err(error) = crate::approval::check_expected_digest(&rec) {
             return WsFrame::error_response("", &error);
@@ -652,7 +671,7 @@ impl MethodHandler {
             // A malformed card is never applied; deny it so it stops waiting.
             return self
                 .deny_org_card(broker, &rec, ctx, None, "malformed", decision_reason,
-                    "這筆組織調整的內容不完整，已拒絕；請重新提出。")
+                    "這筆組織調整的內容不完整，已拒絕；請重新提出。", None)
                 .await;
         };
         // `[approval] forbid_self_approval`: also judged on the payload's
@@ -666,7 +685,7 @@ impl MethodHandler {
         }
 
         if !approve {
-            if let Err(e) = record_decision(broker, approval_id, false, &decided_by).await {
+            if let Err(e) = record_decision(broker, approval_id, false, &decided_by, None).await {
                 return WsFrame::error_response("", &format!("decide: {e}"));
             }
             audit_rejected(&self.home_dir, &rec, ctx, Some(&proposal), "rejected", decision_reason);
@@ -674,9 +693,85 @@ impl MethodHandler {
             return WsFrame::ok_response("", json!({ "id": rec.id.as_str(), "decided": "denied", "side_effect": Value::Null }));
         }
 
+        // The lease is taken atomically, inside the TTL, before any wait.
+        let lease = match broker.take_decision_lease(approval_id, oc::DECISION_LEASE_SECS).await {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                return match broker.get(approval_id).await {
+                    Ok(Some(now)) if now.is_stale(chrono::Utc::now()) => {
+                        self.expire_org_card(broker, &now, ctx, decision_reason).await
+                    }
+                    Ok(Some(now)) if now.status != crate::approval::ApprovalStatus::Pending => {
+                        WsFrame::error_response("", &format!("approval {} already {}", now.id, now.status.as_str()))
+                    }
+                    _ => coded(
+                        "decision_in_progress",
+                        "另一位管理員正在處理這筆組織調整的審核，這次沒有做任何變更；請稍後重新整理再看結果。",
+                    ),
+                };
+            }
+            Err(e) => return WsFrame::error_response("", &format!("沒有套用，無法鎖定這筆審核：{e}")),
+        };
+        let frame = self.apply_leased(broker, &lease, approval_id, ctx, decision_reason).await;
+        // A lease the decision did not consume is given back (no-op otherwise).
+        broker.release_decision_lease(approval_id, &lease).await;
+        frame
+    }
+
+    /// The approve path once the decision lease is held: everything from the
+    /// org lock to the recorded decision.
+    async fn apply_leased(
+        &self,
+        broker: &crate::approval::ApprovalBroker,
+        lease: &crate::approval::DecisionLease,
+        approval_id: &crate::approval::ApprovalId,
+        ctx: &UserContext,
+        decision_reason: &str,
+    ) -> WsFrame {
         let org_lock = match lock_org(&self.home_dir).await {
             Ok(g) => g,
             Err(e) => return lock_failed(&e),
+        };
+        // Re-read the card now that the org lock is held: the wait may have
+        // outlived the approval's TTL (or the lease).
+        let rec = match broker.get(approval_id).await {
+            Ok(Some(r)) if r.action_kind == oc::ACTION_KIND => r,
+            Ok(_) => return WsFrame::error_response("", "找不到這筆審核"),
+            Err(e) => return WsFrame::error_response("", &format!("讀取審核失敗，沒有套用：{e}")),
+        };
+        if rec.status != crate::approval::ApprovalStatus::Pending {
+            return WsFrame::error_response("", &format!("approval {} already {}", rec.id, rec.status.as_str()));
+        }
+        if rec.is_stale(chrono::Utc::now()) {
+            drop(org_lock);
+            broker.release_decision_lease(approval_id, lease).await;
+            return self.expire_org_card(broker, &rec, ctx, decision_reason).await;
+        }
+        match broker.renew_decision_lease(approval_id, lease, oc::DECISION_LEASE_SECS).await {
+            Ok(true) => {}
+            Ok(false) => {
+                drop(org_lock);
+                broker.release_decision_lease(approval_id, lease).await;
+                return match broker.get(approval_id).await {
+                    Ok(Some(now)) if now.is_stale(chrono::Utc::now()) => {
+                        self.expire_org_card(broker, &now, ctx, decision_reason).await
+                    }
+                    _ => coded(
+                        "decision_lease_lost",
+                        "等待組織資料寫入鎖的時間太久，這次沒有套用；這筆審核仍待決定，請再按一次「同意」。",
+                    ),
+                };
+            }
+            Err(e) => return WsFrame::error_response("", &format!("沒有套用，無法確認這筆審核的鎖定：{e}")),
+        }
+        if let Err(error) = crate::approval::check_expected_digest(&rec) {
+            return WsFrame::error_response("", &error);
+        }
+        let Some(proposal) = Proposal::from_record(&rec) else {
+            return self
+                .deny_org_card(broker, &rec, ctx, None, "malformed", decision_reason,
+                    "這筆組織調整的內容不完整，已拒絕；請重新提出。", Some(lease))
+                .await;
         };
         let store = match org_lock.load() {
             // Not the request's fault: it stays pending until the authority
@@ -687,7 +782,7 @@ impl MethodHandler {
         if org_change::entry_hash_in(&store, &self.home_dir, &proposal.agent_id) != proposal.base {
             return self
                 .deny_org_card(broker, &rec, ctx, Some(&proposal), "stale", decision_reason,
-                    "審核期間這位 AI 員工的組織位置已被調整，這份申請已拒絕；需要的話請重新提出。")
+                    "審核期間這位 AI 員工的組織位置已被調整，這份申請已拒絕；需要的話請重新提出。", Some(lease))
                 .await;
         }
         let rt = proposal.after.reports_to != proposal.before.reports_to;
@@ -695,8 +790,20 @@ impl MethodHandler {
         if let Err(e) = validate(&store, &self.home_dir, &proposal.agent_id, &proposal.after, rt, dept) {
             let message = format!("這份申請已不再適用，已拒絕：{e}");
             return self
-                .deny_org_card(broker, &rec, ctx, Some(&proposal), "invalid", decision_reason, &message)
+                .deny_org_card(broker, &rec, ctx, Some(&proposal), "invalid", decision_reason, &message, Some(lease))
                 .await;
+        }
+        // No prepared journal entry ⇒ no apply: a crash after the commit must
+        // always leave a trace a retry can complete from.
+        let prepared = journal::Applied::prepared(&rec, &proposal.agent_id, &proposal.before, &proposal.after, &ctx.user_id);
+        if let Err(e) = journal::record(&self.home_dir, &prepared) {
+            return coded(
+                "journal_unavailable",
+                &format!(
+                    "無法寫入這筆組織調整的套用紀錄，為了避免套用後無從追蹤，這次沒有套用；這筆審核仍待決定，請管理員檢查 org_change_journal 目錄後再試：{}",
+                    duduclaw_core::truncate_chars(&e, 300)
+                ),
+            );
         }
         let commit = match self
             .commit_org_entry(&org_lock, &proposal.agent_id, &proposal.after, "org.change_approved", ctx)
@@ -704,30 +811,103 @@ impl MethodHandler {
         {
             Ok(c) => c,
             Err(e) => {
+                // Nothing was committed: the prepared entry has no meaning.
+                journal::clear(&self.home_dir, rec.id.as_str());
                 return WsFrame::error_response("", &format!("沒有套用，這筆審核仍待決定，可以再試一次：{e}"));
             }
         };
-        let applied = journal::Applied {
-            approval_id: rec.id.as_str().to_string(),
-            agent_id: proposal.agent_id.clone(),
-            before: proposal.before.clone(),
-            after: proposal.after.clone(),
-            approved_by: ctx.user_id.clone(),
-            applied_at: chrono::Utc::now().to_rfc3339(),
-            registry_reloaded: commit.registry_reloaded,
-            mirror_synced: commit.mirror_error.is_none(),
-        };
+        let applied = prepared.into_applied(commit.registry_reloaded, commit.mirror_error.is_none());
         if let Err(e) = journal::record(&self.home_dir, &applied) {
-            // Still try to record the decision; if that fails too, the
-            // unrecorded-decision audit row below is the only trace.
-            warn!(approval_id = %rec.id, error = %e, "org_change apply journal could not be written");
+            // The prepared entry stays: a retry settles it against the
+            // authority (which now holds `after`) under the org lock.
+            warn!(approval_id = %rec.id, error = %e, "org_change journal could not be marked applied (prepared entry kept)");
         }
         drop(org_lock);
-        self.complete_applied(broker, &rec, &applied, Some(&proposal), ctx, commit.mirror_error).await
+        self.complete_applied(broker, &rec, &applied, Some(&proposal), ctx, commit.mirror_error, Some(lease)).await
+    }
+
+    /// Expiry = deny: nothing is applied. Audit only once the expiry is
+    /// actually recorded.
+    async fn expire_org_card(
+        &self,
+        broker: &crate::approval::ApprovalBroker,
+        rec: &crate::approval::ApprovalRecord,
+        ctx: &UserContext,
+        decision_reason: &str,
+    ) -> WsFrame {
+        match broker.poll(&rec.id).await {
+            Ok(status) if status != crate::approval::ApprovalStatus::Pending => {
+                audit_rejected(&self.home_dir, rec, ctx, Proposal::from_record(rec).as_ref(), "expired", decision_reason);
+                WsFrame::error_response("", oc::EXPIRED_TEXT)
+            }
+            Ok(_) => WsFrame::error_response("", oc::EXPIRED_TEXT),
+            Err(e) => WsFrame::error_response("", &format!("{}（逾期狀態沒有記錄成功：{e}）", oc::EXPIRED_TEXT)),
+        }
+    }
+
+    /// A *prepared* journal entry: an earlier attempt stopped around the
+    /// authority commit. Settled under the org lock (so no attempt is
+    /// mid-commit), against the authority: `Ok(Some(applied))` — the commit
+    /// landed (the entry is upgraded and the original decision completes);
+    /// `Ok(None)` — it did not (the entry is dropped and the request is
+    /// judged normally). When the authority holds neither the base nor the
+    /// approved placement, nothing is guessed: the entry is dropped with an
+    /// audit row and the request is judged normally (a moved base denies it).
+    async fn settle_prepared(
+        &self,
+        rec: &crate::approval::ApprovalRecord,
+    ) -> Result<Option<journal::Applied>, WsFrame> {
+        let org_lock = lock_org(&self.home_dir).await.map_err(|e| lock_failed(&e))?;
+        // Re-read under the lock: a concurrent attempt may have finished it.
+        let entry = match journal::read(&self.home_dir, rec.id.as_str()) {
+            Ok(Some(e)) if !e.matches(rec) => return Err(journal_mismatch()),
+            Ok(Some(e)) => e,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                return Err(WsFrame::error_response("", &format!("讀取這筆組織調整的套用紀錄失敗，沒有做任何變更：{e}")));
+            }
+        };
+        if entry.state == journal::State::Applied {
+            return Ok(Some(entry));
+        }
+        let store = org_lock.load().map_err(|e| authority_error(&e))?;
+        let base_unchanged = Proposal::from_record(rec)
+            .is_some_and(|p| org_change::entry_hash_in(&store, &self.home_dir, &p.agent_id) == p.base);
+        if base_unchanged {
+            journal::clear(&self.home_dir, rec.id.as_str());
+            return Ok(None);
+        }
+        if store.get(&entry.agent_id) == Some(&entry.after) {
+            let mirror_synced = mirror_of(&self.home_dir, &entry.agent_id).as_ref() == Some(&entry.after);
+            let applied = entry.into_applied(false, mirror_synced);
+            if let Err(e) = journal::record(&self.home_dir, &applied) {
+                return Err(WsFrame::error_response(
+                    "",
+                    &format!("這筆組織調整上次已經套用，但套用紀錄無法更新，這次沒有做任何變更；請再試一次：{e}"),
+                ));
+            }
+            return Ok(Some(applied));
+        }
+        audit(
+            &self.home_dir,
+            "org_change_journal_ambiguous",
+            &entry.agent_id,
+            duduclaw_security::audit::Severity::Warning,
+            json!({
+                "approval_id": rec.id.as_str(),
+                "agent_id": entry.agent_id,
+                "before": oc::entry_json(&entry.before),
+                "after": oc::entry_json(&entry.after),
+                "authority": store.get(&entry.agent_id).map(oc::entry_json),
+            }),
+        );
+        journal::clear(&self.home_dir, rec.id.as_str());
+        Ok(None)
     }
 
     /// Record the approval of an already-applied change; terminal audit and
     /// the card collapse happen only once the decision is recorded.
+    #[allow(clippy::too_many_arguments)]
     async fn complete_applied(
         &self,
         broker: &crate::approval::ApprovalBroker,
@@ -736,6 +916,7 @@ impl MethodHandler {
         proposal: Option<&Proposal>,
         ctx: &UserContext,
         mirror_error: Option<String>,
+        lease: Option<&crate::approval::DecisionLease>,
     ) -> WsFrame {
         let side_effect = json!({
             "applied": true,
@@ -746,7 +927,7 @@ impl MethodHandler {
             "mirror_synced": applied.mirror_synced,
         });
         let decided_by = format!("dashboard:{}", applied.approved_by);
-        if let Err(e) = record_decision(broker, &rec.id, true, &decided_by).await {
+        if let Err(e) = record_decision(broker, &rec.id, true, &decided_by, lease).await {
             audit(
                 &self.home_dir,
                 "org_change_decision_unrecorded",
@@ -832,7 +1013,7 @@ impl MethodHandler {
                 {
                     return WsFrame::error_response("", SELF_APPROVAL_REFUSAL);
                 }
-                self.complete_applied(broker, rec, &applied, proposal.as_ref(), ctx, None).await
+                self.complete_applied(broker, rec, &applied, proposal.as_ref(), ctx, None, None).await
             }
             crate::approval::ApprovalStatus::Approved => {
                 // The decision did land; only the bookkeeping was missing.
@@ -886,9 +1067,10 @@ impl MethodHandler {
         why: &str,
         decision_reason: &str,
         message: &str,
+        lease: Option<&crate::approval::DecisionLease>,
     ) -> WsFrame {
         let decided_by = format!("dashboard:{}", ctx.user_id);
-        if let Err(e) = record_decision(broker, &rec.id, false, &decided_by).await {
+        if let Err(e) = record_decision(broker, &rec.id, false, &decided_by, lease).await {
             return WsFrame::error_response(
                 "",
                 &format!(

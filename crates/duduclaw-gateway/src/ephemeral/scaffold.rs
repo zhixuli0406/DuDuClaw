@@ -459,12 +459,11 @@ pub(super) fn scaffold_with(
     // ephemeral with no record would fall back to the `agent.toml` written
     // above, i.e. to a file inside its own workspace. Department-less by
     // design (an ephemeral inherits isolation, not org membership).
-    // Symmetric teardown lives in `sweep`.
-    if let Err(e) = duduclaw_core::org_store::upsert(
-        home_dir,
-        &agent_id,
-        duduclaw_core::OrgEntry::new(&spec.parent, ""),
-    ) {
+    // Symmetric teardown lives in `sweep`. Like every authority write it runs
+    // under the global org lock (RM-027 round 3), which also cycle-checks it.
+    if let Err(e) = duduclaw_core::org_store::with_org_lock(home_dir, |org| {
+        duduclaw_core::org_store::upsert(org, &agent_id, duduclaw_core::OrgEntry::new(&spec.parent, ""))
+    }) {
         tracing::warn!(
             ephemeral = %agent_id,
             error = %e,

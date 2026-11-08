@@ -310,19 +310,26 @@ impl MethodHandler {
         // supplied no override. After the commit, so a rolled-back create
         // never leaves a record behind for the id.
         {
-            let agent_tbl = parsed_agent.get("agent").and_then(|v| v.as_table());
-            let field = |k: &str| {
-                agent_tbl
-                    .and_then(|t| t.get(k))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
+            let org_entry = {
+                let agent_tbl = parsed_agent.get("agent").and_then(|v| v.as_table());
+                let field = |k: &str| {
+                    agent_tbl
+                        .and_then(|t| t.get(k))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                duduclaw_core::OrgEntry::new(field("reports_to"), field("department"))
             };
-            if let Err(e) = duduclaw_core::org_store::upsert(
-                &self.home_dir,
-                &name,
-                duduclaw_core::OrgEntry::new(field("reports_to"), field("department")),
-            ) {
-                warn!(agent = %name, error = %e, "org.toml upsert failed on templates.create_agent");
+            // Under the global org lock like every authority write (RM-027
+            // round 3); the write is cycle-checked.
+            match super::org_change_rpc::lock_org(&self.home_dir).await {
+                Ok(org) => {
+                    if let Err(e) = duduclaw_core::org_store::upsert(&org, &name, org_entry) {
+                        warn!(agent = %name, error = %e, "org.toml upsert failed on templates.create_agent");
+                    }
+                }
+                Err(e) => warn!(agent = %name, error = %e, "org lock unavailable on templates.create_agent"),
             }
         }
 

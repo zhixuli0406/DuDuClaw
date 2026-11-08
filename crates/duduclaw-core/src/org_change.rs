@@ -459,7 +459,8 @@ mod tests {
         write_agent(h.path(), "rep", "ceo", "業務");
         assert_eq!(before, entry_hash(h.path(), "rep"));
         // …an authority write does.
-        org_store::upsert(h.path(), "rep", OrgEntry::new("ceo", "業務")).unwrap();
+        org_store::with_org_lock(h.path(), |org| org_store::upsert(org, "rep", OrgEntry::new("ceo", "業務")))
+            .unwrap();
         assert_ne!(before, entry_hash(h.path(), "rep"));
         assert_eq!(before.len(), 64);
     }

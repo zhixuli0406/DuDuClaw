@@ -13,11 +13,14 @@
 //!   "proposer": "<user id>", "proposer_email": "…", "reason": "…" }
 //! ```
 //!
-//! On approve the gateway takes the global org mutation lock, re-validates
-//! the move against the tree as it is *now*, refuses (and denies) a request
-//! whose `base` no longer matches, then applies — authority first, mirror
-//! second — writes an [`journal`] entry, and records the decision only after
-//! the write succeeded. If recording the decision fails, the journal lets a
+//! On approve the gateway takes a short decision lease on the card (the TTL
+//! sweep cannot expire it underneath), then the global org mutation lock,
+//! re-reads the card (an approval that expired while waiting is not applied),
+//! re-validates the move against the tree as it is *now*, refuses (and
+//! denies) a request whose `base` no longer matches, writes a *prepared*
+//! [`journal`] entry, applies — authority first, mirror second — marks the
+//! entry *applied*, and records the decision under the lease only after the
+//! write succeeded. If recording the decision fails, the journal lets a
 //! retry complete the original approval instead of judging the (now moved)
 //! base as stale. Expiry counts as a denial. At most one request per AI
 //! employee waits at a time.
@@ -33,6 +36,10 @@ pub(crate) const TTL_SECS: i64 = 3 * 24 * 3600;
 /// Shown when an expired request is decided.
 pub(crate) const EXPIRED_TEXT: &str =
     "這個組織調整的審核已逾期，調整沒有套用；需要的話請重新提出。";
+/// Decision lease (seconds) an approving Admin holds on the card while the
+/// change lands: long enough for the org lock + authority + mirror write,
+/// short enough that a crashed attempt frees the card quickly.
+pub(crate) const DECISION_LEASE_SECS: i64 = 120;
 /// Longest `reason` kept in the payload.
 pub(crate) const MAX_REASON_CHARS: usize = 1000;
 
@@ -132,42 +139,131 @@ pub(crate) fn summary(p: &Proposal) -> String {
     )
 }
 
-/// Applied-but-not-yet-recorded `org_change` approvals, keyed by approval id
+/// The `org_change` approval journal, keyed by approval id
 /// (`<home>/org_change_journal/<id>.json`).
 ///
-/// The approval path applies first and records the decision second. When the
-/// second step fails, the card is still pending while the org chart has
-/// already moved — a plain retry would then see a moved `base` and deny the
-/// card as stale ("applied but recorded as denied"). The entry written right
-/// after the apply lets the retry finish the *original* decision instead; it
-/// is removed once the decision is recorded.
+/// The approval path applies first and records the decision second, so the
+/// journal brackets the authority commit (RM-027 round 3):
+///
+/// 1. **prepared** — written *before* the `org.toml` commit, inside the org
+///    lock and the decision lease, carrying the approval id and the digest of
+///    the payload being applied. If it cannot be written, nothing is applied.
+/// 2. **applied** — rewritten in the same org lock right after the commit.
+///
+/// A retry that finds an *applied* entry finishes the *original* decision
+/// instead of re-judging the (now moved) base as stale. A *prepared* entry
+/// means a previous attempt stopped somewhere around the commit; the retry
+/// reconciles it against the authority under the org lock (see
+/// `decide_org_change`). The entry is removed once the decision is recorded,
+/// or when the commit itself failed.
 pub(crate) mod journal {
     use super::*;
     use std::path::{Path, PathBuf};
 
     const DIR: &str = "org_change_journal";
 
+    /// Where the bracketed commit got to.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum State {
+        /// Written before the authority commit; the commit may or may not
+        /// have happened.
+        Prepared,
+        /// The authority commit happened.
+        Applied,
+    }
+
+    impl State {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Prepared => "prepared",
+                Self::Applied => "applied",
+            }
+        }
+
+        fn parse(s: &str) -> Option<Self> {
+            match s {
+                "prepared" => Some(Self::Prepared),
+                "applied" => Some(Self::Applied),
+                _ => None,
+            }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct Applied {
         pub approval_id: String,
+        /// [`crate::approval::payload_hash`] of the approval's payload at
+        /// prepare time; a retry refuses an entry whose digest no longer
+        /// matches the card.
+        pub payload_digest: String,
+        pub state: State,
         pub agent_id: String,
         pub before: OrgEntry,
         pub after: OrgEntry,
         /// User id of the Admin whose approval was applied.
         pub approved_by: String,
+        pub prepared_at: String,
+        /// Empty while [`State::Prepared`].
         pub applied_at: String,
         pub registry_reloaded: bool,
         pub mirror_synced: bool,
     }
 
+    /// Digest of an approval's payload, as journaled.
+    pub(crate) fn payload_digest(rec: &ApprovalRecord) -> String {
+        crate::approval::payload_hash(&rec.payload)
+    }
+
     impl Applied {
+        /// A prepared entry for applying `after` to `agent_id` under `rec`.
+        pub(crate) fn prepared(
+            rec: &ApprovalRecord,
+            agent_id: &str,
+            before: &OrgEntry,
+            after: &OrgEntry,
+            approved_by: &str,
+        ) -> Self {
+            Self {
+                approval_id: rec.id.as_str().to_string(),
+                payload_digest: payload_digest(rec),
+                state: State::Prepared,
+                agent_id: agent_id.to_string(),
+                before: before.clone(),
+                after: after.clone(),
+                approved_by: approved_by.to_string(),
+                prepared_at: chrono::Utc::now().to_rfc3339(),
+                applied_at: String::new(),
+                registry_reloaded: false,
+                mirror_synced: false,
+            }
+        }
+
+        /// The same entry, marked applied.
+        pub(crate) fn into_applied(self, registry_reloaded: bool, mirror_synced: bool) -> Self {
+            Self {
+                state: State::Applied,
+                applied_at: chrono::Utc::now().to_rfc3339(),
+                registry_reloaded,
+                mirror_synced,
+                ..self
+            }
+        }
+
+        /// Does this entry belong to `rec` exactly as it reads now?
+        pub(crate) fn matches(&self, rec: &ApprovalRecord) -> bool {
+            self.approval_id == rec.id.as_str() && self.payload_digest == payload_digest(rec)
+        }
+
         fn to_json(&self) -> Value {
             json!({
                 "approval_id": self.approval_id,
+                "payload_digest": self.payload_digest,
+                "state": self.state.as_str(),
                 "agent_id": self.agent_id,
                 "before": entry_json(&self.before),
                 "after": entry_json(&self.after),
                 "approved_by": self.approved_by,
+                "prepared_at": self.prepared_at,
                 "applied_at": self.applied_at,
                 "registry_reloaded": self.registry_reloaded,
                 "mirror_synced": self.mirror_synced,
@@ -178,10 +274,13 @@ pub(crate) mod journal {
             let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
             Some(Self {
                 approval_id: s("approval_id")?,
+                payload_digest: s("payload_digest").filter(|d| !d.is_empty())?,
+                state: State::parse(&s("state")?)?,
                 agent_id: s("agent_id")?,
                 before: entry_from(v.get("before"))?,
                 after: entry_from(v.get("after"))?,
                 approved_by: s("approved_by")?,
+                prepared_at: s("prepared_at").unwrap_or_default(),
                 applied_at: s("applied_at").unwrap_or_default(),
                 registry_reloaded: v.get("registry_reloaded").and_then(Value::as_bool).unwrap_or(false),
                 mirror_synced: v.get("mirror_synced").and_then(Value::as_bool).unwrap_or(false),
@@ -197,8 +296,35 @@ pub(crate) mod journal {
         safe.then(|| home.join(DIR).join(format!("{approval_id}.json")))
     }
 
-    /// Record that `a` was applied (atomic temp + rename).
+    /// Test seam: make [`record`] fail for one approval id in one state.
+    #[cfg(test)]
+    pub(crate) mod record_failpoint {
+        use std::collections::BTreeSet;
+        use std::sync::Mutex;
+
+        static ARMED: Mutex<BTreeSet<(String, &'static str)>> = Mutex::new(BTreeSet::new());
+
+        pub(crate) fn arm(id: &str, state: super::State) {
+            ARMED.lock().unwrap().insert((id.to_string(), state.as_str()));
+        }
+
+        pub(crate) fn disarm(id: &str, state: super::State) {
+            ARMED.lock().unwrap().remove(&(id.to_string(), state.as_str()));
+        }
+
+        pub(super) fn armed(id: &str, state: super::State) -> bool {
+            ARMED.lock().map(|s| s.contains(&(id.to_string(), state.as_str()))).unwrap_or(false)
+        }
+    }
+
+    /// Persist `a` in its current [`State`] (atomic temp + rename).
     pub(crate) fn record(home: &Path, a: &Applied) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            if record_failpoint::armed(&a.approval_id, a.state) {
+                return Err("injected journal write failure".into());
+            }
+        }
         let path = path_for(home, &a.approval_id).ok_or_else(|| "invalid approval id".to_string())?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -311,21 +437,30 @@ mod tests {
     #[test]
     fn the_journal_round_trips_and_never_builds_a_path_from_a_bad_id() {
         let h = tempfile::tempdir().unwrap();
-        let id = crate::approval::ApprovalId::new();
-        let a = journal::Applied {
-            approval_id: id.as_str().into(),
-            agent_id: "rep".into(),
-            before: OrgEntry::new("lead", "業務"),
-            after: OrgEntry::new("ceo", ""),
-            approved_by: "admin-1".into(),
-            applied_at: chrono::Utc::now().to_rfc3339(),
-            registry_reloaded: true,
-            mirror_synced: false,
-        };
+        let card = rec(json!({ "agent_id": "rep", "base": "b" }), "rep");
+        let id = card.id.clone();
+        let prepared = journal::Applied::prepared(
+            &card,
+            "rep",
+            &OrgEntry::new("lead", "業務"),
+            &OrgEntry::new("ceo", ""),
+            "admin-1",
+        );
+        assert_eq!(prepared.state, journal::State::Prepared);
+        assert!(prepared.applied_at.is_empty());
+        assert!(prepared.matches(&card));
         assert_eq!(journal::read(h.path(), id.as_str()), Ok(None));
-        journal::record(h.path(), &a).unwrap();
+        journal::record(h.path(), &prepared).unwrap();
         assert!(journal::exists(h.path(), id.as_str()));
+        assert_eq!(journal::read(h.path(), id.as_str()), Ok(Some(prepared.clone())));
+        let a = prepared.into_applied(true, false);
+        assert_eq!(a.state, journal::State::Applied);
+        journal::record(h.path(), &a).unwrap();
         assert_eq!(journal::read(h.path(), id.as_str()), Ok(Some(a.clone())));
+        // The digest pins the payload: a changed card no longer matches.
+        let mut changed = card.clone();
+        changed.payload = json!({ "agent_id": "rep", "base": "other" });
+        assert!(!a.matches(&changed));
         journal::clear(h.path(), id.as_str());
         assert_eq!(journal::read(h.path(), id.as_str()), Ok(None));
         let bad = journal::Applied { approval_id: "../escape".into(), ..a.clone() };

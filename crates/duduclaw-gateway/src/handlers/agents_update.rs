@@ -128,13 +128,12 @@ impl MethodHandler {
         let mirror_path = self.home_dir.join("agents").join(&agent_id).join("agent.toml");
         if org_params {
             let mirror_now = duduclaw_core::org_store::read_mirror(&mirror_path).unwrap_or_default();
-            if requested_org_mirror(&mirror_now, &params) != mirror_now
-                && let Err(e) = duduclaw_core::org_change::validate_org_change(
-                    &self.home_dir,
-                    &agent_id,
-                    params.get("reports_to").and_then(Value::as_str),
-                    None,
-                )
+            let requested = requested_org_mirror(&mirror_now, &params);
+            // Only a field the caller actually edited is judged (an echoed,
+            // possibly drifted, prefilled value is not a request).
+            let edited_rt = (requested.reports_to != mirror_now.reports_to).then_some(requested.reports_to.as_str());
+            if requested != mirror_now
+                && let Err(e) = duduclaw_core::org_change::validate_org_change(&self.home_dir, &agent_id, edited_rt, None)
             {
                 return WsFrame::error_response("", &e.to_string());
             }
@@ -322,7 +321,7 @@ impl MethodHandler {
         let audit_agent_id = agent_id.clone();
         let audit_user_id = caller.map(|c| c.user_id.clone()).unwrap_or_else(|| "unknown".into());
 
-        let params_clone = params.clone();
+        let mut params_clone = params.clone();
         let mut changes: Vec<String> = Vec::new();
         let home_for_update = self.home_dir.clone();
 
@@ -368,20 +367,53 @@ impl MethodHandler {
                     Ok(s) => s,
                     Err(e) => return WsFrame::error_response("", &e.to_string()),
                 };
+                // RM-027 round 3: the baseline is the STRICT AUTHORITY entry,
+                // never the agent.toml mirror (which the employee can
+                // tamper with). Only the fields this request actually edited
+                // (differ from what the mirror showed) override it; an
+                // unsubmitted or merely echoed field keeps the authority's
+                // value — a tampered mirror value is never promoted.
+                let authority_before = duduclaw_core::org_change::effective_in(&store, &self.home_dir, &agent_id)
+                    .unwrap_or_default();
+                let edited_rt =
+                    (mirror_after.reports_to != mirror_before.reports_to).then(|| mirror_after.reports_to.clone());
+                let edited_dept =
+                    (mirror_after.department != mirror_before.department).then(|| mirror_after.department.clone());
+                if let Some(d) = edited_dept.as_deref()
+                    && !d.is_empty()
+                    && !duduclaw_core::is_valid_department(d)
+                {
+                    return WsFrame::error_response(
+                        "",
+                        &format!("Invalid department '{d}' (1..=64 bytes, no path separators / whitespace / control chars)"),
+                    );
+                }
                 if let Err(e) = duduclaw_core::org_change::validate_org_change_in(
                     &store,
                     &self.home_dir,
                     &agent_id,
-                    params.get("reports_to").and_then(Value::as_str),
+                    edited_rt.as_deref(),
                     None,
                 ) {
                     return WsFrame::error_response("", &e.to_string());
                 }
-                let prior = store.get(&agent_id).cloned();
-                if let Err(e) = lock.upsert(&agent_id, mirror_after.clone()) {
-                    return WsFrame::error_response("", &e.to_string());
+                let authority_after = duduclaw_core::OrgEntry::new(
+                    edited_rt.as_deref().unwrap_or(&authority_before.reports_to),
+                    edited_dept.as_deref().unwrap_or(&authority_before.department),
+                );
+                if authority_after != authority_before || !store.contains(&agent_id) {
+                    let prior = store.get(&agent_id).cloned();
+                    if let Err(e) = lock.upsert(&agent_id, authority_after.clone()) {
+                        return WsFrame::error_response("", &e.to_string());
+                    }
+                    org_prewrite = Some((prior, authority_after.clone()));
                 }
-                org_prewrite = Some((prior, mirror_after));
+                // The mirror follows the authority on both fields: a drifted
+                // field the caller did not edit is repaired, not promoted.
+                if let Some(p) = params_clone.as_object_mut() {
+                    p.insert("reports_to".into(), Value::String(authority_after.reports_to.clone()));
+                    p.insert("department".into(), Value::String(authority_after.department.clone()));
+                }
             }
         }
 
@@ -1155,36 +1187,41 @@ impl MethodHandler {
                     self.broadcast_event("agent.status_changed",
                         json!({ "agent_id": agent_id, "status": status })).await;
                 }
-                // WP22 T5 + RM-027 review — the authority reflects the org
-                // pair only when this write actually changed it (see the
-                // comment above `caller_is_admin`). Normally it was already
-                // committed above, before the mirror; reconcile the rare case
-                // where the mirror ended up elsewhere than predicted, still
-                // inside the org lock.
+                // WP22 T5 + RM-027 — the authority was committed above, before
+                // the mirror, from the strict authority baseline. The mirror
+                // is NEVER promoted into the authority afterwards (round 3):
+                // if it ended up elsewhere than the authority, that is drift,
+                // recorded and left for an explicit resolution.
                 let authority = authority_changes.lock().map(|g| g.clone()).unwrap_or_default();
                 let org_moved = authority
                     .iter()
                     .any(|c| c.key == "agent.reports_to" || c.key == "agent.department");
-                let org_lock = match org_lock.take() {
-                    Some(g) => Some(g),
-                    None if org_moved => super::org_change_rpc::lock_org(&self.home_dir).await.ok(),
-                    None => None,
-                };
-                if let Some(lock) = &org_lock {
+                if org_moved || org_prewrite.is_some() {
                     let mirror = duduclaw_core::org_store::read_mirror(&mirror_path).unwrap_or_default();
-                    let reconcile = match (&org_prewrite, org_moved) {
-                        (Some((_, written)), true) if *written == mirror => Ok(()),
-                        (_, true) => lock.upsert(&agent_id, mirror).map(|_| ()),
-                        (Some((prior, _)), false) => lock.restore(&agent_id, prior.clone()),
-                        (None, false) => Ok(()),
-                    };
-                    if let Err(e) = reconcile {
-                        warn!(agent = %agent_id, error = %e, "org.toml reconcile failed on agents.update");
+                    let committed = org_prewrite.as_ref().map(|(_, written)| written.clone()).or_else(|| {
+                        org_lock.as_ref().and_then(|lock| lock.load().ok()).and_then(|store| {
+                            duduclaw_core::org_change::effective_in(&store, &self.home_dir, &agent_id)
+                        })
+                    });
+                    if committed.as_ref() != Some(&mirror) {
+                        warn!(agent = %agent_id, "agent.toml org fields differ from the authority after agents.update (not promoted)");
+                        crate::security_autopilot::audit_and_emit(
+                            &self.home_dir,
+                            &duduclaw_security::audit::AuditEvent::new(
+                                "org_change_mirror_drift",
+                                agent_id.as_str(),
+                                duduclaw_security::audit::Severity::Warning,
+                                json!({
+                                    "agent_id": agent_id,
+                                    "authority": committed.as_ref().map(|c| json!({ "reports_to": c.reports_to, "department": c.department })),
+                                    "mirror": { "reports_to": mirror.reports_to, "department": mirror.department },
+                                    "source": "agents.update",
+                                }),
+                            ),
+                        );
                     }
-                } else if org_moved {
-                    warn!(agent = %agent_id, "org lock unavailable — org.toml not updated on agents.update");
                 }
-                drop(org_lock);
+                drop(org_lock.take());
                 if !authority.is_empty() {
                     crate::security_autopilot::audit_and_emit(
                         &self.home_dir,

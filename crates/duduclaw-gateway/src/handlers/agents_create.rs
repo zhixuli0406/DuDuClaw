@@ -273,8 +273,15 @@ impl MethodHandler {
         // `department` keys written above are a display mirror from here on;
         // delegation reads the store. Recorded *after* the commit so an
         // aborted create never leaves a record behind for the id.
-        if let Err(e) = duduclaw_core::org_store::upsert(&self.home_dir, name, org_entry) {
-            warn!(agent = %name, error = %e, "org.toml upsert failed on agents.create");
+        // RM-027 round 3: under the global org lock like every authority
+        // write (so it cannot interleave with an org change), cycle-checked.
+        match super::org_change_rpc::lock_org(&self.home_dir).await {
+            Ok(org) => {
+                if let Err(e) = duduclaw_core::org_store::upsert(&org, name, org_entry) {
+                    warn!(agent = %name, error = %e, "org.toml upsert failed on agents.create");
+                }
+            }
+            Err(e) => warn!(agent = %name, error = %e, "org lock unavailable on agents.create"),
         }
 
         // R1 (2026-10): a deprecated runtime is still written, but the write

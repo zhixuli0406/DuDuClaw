@@ -148,7 +148,7 @@ async fn agents_without_a_store_entry_still_resolve_from_agent_toml() {
     // exists for.
     duduclaw_core::org_store::seed_if_absent(home).unwrap();
     for stray in ["mkt-lead", "mkt-rep"] {
-        duduclaw_core::org_store::remove(home, stray).unwrap();
+        duduclaw_core::org_store::with_org_lock(home, |org| duduclaw_core::org_store::remove(org, stray)).unwrap();
     }
 
     // mkt-lead / mkt-rep have no records — the marketing branch must still

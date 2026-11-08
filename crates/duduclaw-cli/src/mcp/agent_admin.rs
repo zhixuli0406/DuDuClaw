@@ -42,6 +42,12 @@ pub(crate) async fn handle_agent_remove(params: &Value, home_dir: &Path, caller:
 }
 
 fn remove_agent_locked(home_dir: &Path, agent_id: &str, caller: &str) -> Value {
+    // The removal drops an authority record: the global org lock first,
+    // then the lifecycle barrier (RM-027 round 3 lock order).
+    let org = match duduclaw_core::org_store::lock_org_mutations(home_dir) {
+        Ok(guard) => guard,
+        Err(error) => return tool_error(&format!("org lock unavailable: {error}")),
+    };
     let _lifecycle = match duduclaw_core::autonomy_gate::exclusive_barrier(home_dir) {
         Ok(guard) => guard,
         Err(error) => return tool_error(&error.to_string()),
@@ -89,7 +95,7 @@ fn remove_agent_locked(home_dir: &Path, agent_id: &str, caller: &str) -> Value {
     // gone. This is the one write that must not go store-first: had the trash
     // move failed, an already-cleared entry would leave a still-live agent
     // governed by its own (writable) `agent.toml` mirror again.
-    if let Err(e) = duduclaw_core::org_store::remove(home_dir, agent_id) {
+    if let Err(e) = duduclaw_core::org_store::remove(&org, agent_id) {
         tracing::warn!(agent = %agent_id, error = %e, "org.toml removal failed on agent_remove");
     }
 

@@ -389,6 +389,57 @@ async fn approval_sinks_mask_display_and_refuse_nested_credentials() {
     assert_eq!(b.get(&id).await.unwrap().unwrap().payload, rec.payload);
 }
 
+/// Move a row's `created_at` `secs` into the past (TTL tests).
+async fn backdate(b: &ApprovalBroker, id: &ApprovalId, secs: i64) {
+    let at = (Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339();
+    b.store
+        .conn
+        .lock()
+        .await
+        .execute("UPDATE approvals SET created_at=?1 WHERE id=?2", rusqlite::params![at, id.as_str()])
+        .unwrap();
+}
+
+/// RM-027 round 3, finding 5: the decision lease is exclusive, keeps the TTL
+/// sweep / plain deciders / `withdraw` off the row, cannot be taken or
+/// renewed past the TTL, and records a decision whose effect landed inside
+/// it even when the TTL passed meanwhile.
+#[tokio::test(flavor = "current_thread")]
+async fn a_decision_lease_holds_off_the_ttl_sweep_and_other_deciders() {
+    let b = broker();
+    let id = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
+    let lease = b.take_decision_lease(&id, 30).await.unwrap().expect("a live pending row can be leased");
+    assert!(b.take_decision_lease(&id, 30).await.unwrap().is_none(), "the lease is exclusive");
+    assert!(b.decide(&id, false, "someone").await.is_err(), "a plain decider must not race the holder");
+    assert!(!b.withdraw(&id, "system:withdraw").await.unwrap());
+
+    // The TTL passes while the lease holds the row: the sweep leaves it alone…
+    backdate(&b, &id, 600).await;
+    assert_eq!(b.expire_stale().await.unwrap(), 0);
+    assert_eq!(b.poll(&id).await.unwrap(), ApprovalStatus::Pending);
+    // …the holder may not start applying past the TTL (renew refuses)…
+    assert!(!b.renew_decision_lease(&id, &lease, 30).await.unwrap());
+    // …but an outcome that landed inside the lease is recorded.
+    b.decide_with_lease(&id, &lease, true, "dashboard:admin").await.unwrap();
+    assert_eq!(b.get(&id).await.unwrap().unwrap().status, ApprovalStatus::Approved);
+    assert!(b.take_decision_lease(&id, 30).await.unwrap().is_none(), "a decided row cannot be leased");
+
+    // An expired row cannot be leased at all.
+    let late = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
+    backdate(&b, &late, 600).await;
+    assert!(b.take_decision_lease(&late, 30).await.unwrap().is_none());
+
+    // A released lease frees the row (the sweep expires it) and cannot decide.
+    let freed = b.request("a", "org_change", "s", json!({}), 60).await.unwrap();
+    let held = b.take_decision_lease(&freed, 30).await.unwrap().unwrap();
+    assert!(b.renew_decision_lease(&freed, &held, 30).await.unwrap(), "a live lease inside the TTL renews");
+    b.release_decision_lease(&freed, &held).await;
+    backdate(&b, &freed, 600).await;
+    assert_eq!(b.expire_stale().await.unwrap(), 2);
+    assert_eq!(b.get(&freed).await.unwrap().unwrap().status, ApprovalStatus::Expired);
+    assert!(b.decide_with_lease(&freed, &held, true, "x").await.is_err());
+}
+
 #[tokio::test]
 async fn structural_payload_fields_and_context_only_values_keep_exact_authority() {
     let b = broker();
