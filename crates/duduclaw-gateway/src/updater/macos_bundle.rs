@@ -111,13 +111,53 @@ fn entry_kind(unix_mode: Option<u32>, dir_marker: bool, is_symlink: bool) -> Res
     Ok(kind)
 }
 
+/// Raw unix modes straight from the central directory (one per entry, in
+/// central-directory order, `None` when the entry was not made on a unix host).
+/// This does not depend on how the zip crate post-processes `unix_mode()`, so
+/// setuid/setgid/sticky bits can never be lost before validation.
+fn raw_central_modes(bytes: &[u8]) -> Result<Vec<Option<u32>>, String> {
+    const BAD: &str = "Bundle archive has a malformed central directory";
+    let u16_at = |o: usize| bytes.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
+    let u32_at = |o: usize| bytes.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let min = bytes.len().saturating_sub(22 + 65_535);
+    let eocd = (min..=bytes.len().saturating_sub(22))
+        .rev()
+        .find(|&i| bytes.get(i..i + 4) == Some(&[0x50, 0x4b, 0x05, 0x06]))
+        .ok_or(BAD)?;
+    let count = u16_at(eocd + 10).ok_or(BAD)?;
+    let cd_size = u32_at(eocd + 12).ok_or(BAD)? as usize;
+    let cd_offset = u32_at(eocd + 16).ok_or(BAD)? as usize;
+    if count == 0xFFFF || cd_size == 0xFFFF_FFFF || cd_offset == 0xFFFF_FFFF {
+        return Err("Zip64 bundle archives are not supported".into());
+    }
+    // Tolerate prepended data: the central directory ends where the EOCD starts.
+    let mut pos = eocd.checked_sub(cd_size).ok_or(BAD)?;
+    let _ = cd_offset;
+    let mut modes = Vec::with_capacity(count);
+    for _ in 0..count {
+        if u32_at(pos) != Some(0x0201_4b50) {
+            return Err(BAD.into());
+        }
+        let host = bytes.get(pos + 5).copied().ok_or(BAD)?;
+        let attrs = u32_at(pos + 38).ok_or(BAD)?;
+        modes.push(if host == 3 { Some(attrs >> 16) } else { None });
+        let (n, x, c) = (u16_at(pos + 28).ok_or(BAD)?, u16_at(pos + 30).ok_or(BAD)?, u16_at(pos + 32).ok_or(BAD)?);
+        pos = pos.checked_add(46 + n + x + c).ok_or(BAD)?;
+    }
+    Ok(modes)
+}
+
 /// Header-only validation of the whole archive before anything is written.
 fn plan_bundle_zip<R: io::Read + io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     exe_name: &str,
+    raw_modes: &[Option<u32>],
 ) -> Result<Vec<PlannedEntry>, String> {
     if archive.len() > MAX_BUNDLE_ENTRIES {
         return Err(format!("Bundle archive has too many entries ({})", archive.len()));
+    }
+    if raw_modes.len() != archive.len() {
+        return Err("Bundle archive central directory is inconsistent".into());
     }
     let mut planned = Vec::with_capacity(archive.len());
     let mut seen = std::collections::BTreeSet::new();
@@ -125,7 +165,12 @@ fn plan_bundle_zip<R: io::Read + io::Seek>(
     for index in 0..archive.len() {
         let entry = archive.by_index(index).map_err(|e| format!("Bundle archive entry error: {e}"))?;
         let (rel, dir_marker) = parse_entry_name(entry.name_raw())?;
-        let kind = entry_kind(entry.unix_mode(), dir_marker || entry.is_dir(), entry.is_symlink())?;
+        // Refuse setuid/setgid/sticky on files AND directories, using both the
+        // crate's view and the raw central-directory attributes.
+        if raw_modes[index].is_some_and(|m| m & 0o7000 != 0) {
+            return Err("Bundle archive entry has setuid/setgid/sticky bits".into());
+        }
+        let kind = entry_kind(entry.unix_mode().or(raw_modes[index]), dir_marker || entry.is_dir(), entry.is_symlink())?;
         if rel.is_empty() && kind != EntryKind::Dir {
             return Err(format!("{BUNDLE_DIR_NAME} must be a directory"));
         }
@@ -217,7 +262,8 @@ pub(super) fn extract_bundle_zip(archive_bytes: &[u8], staging_dir: &Path, exe_n
     check_size(archive_bytes.len() as u64, MAX_DOWNLOAD_BYTES, "Compressed bundle archive")?;
     let mut archive = zip::ZipArchive::new(io::Cursor::new(archive_bytes))
         .map_err(|e| format!("Invalid bundle zip: {e}"))?;
-    let planned = plan_bundle_zip(&mut archive, exe_name)?;
+    let raw_modes = raw_central_modes(archive_bytes)?;
+    let planned = plan_bundle_zip(&mut archive, exe_name, &raw_modes)?;
     let root = staging_dir.join(BUNDLE_DIR_NAME);
     create_dir_private(&root, 0o755).map_err(|e| format!("Cannot create staged bundle: {e}"))?;
     let mut remaining = MAX_ARCHIVE_BYTES;
