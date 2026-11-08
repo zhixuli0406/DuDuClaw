@@ -158,16 +158,16 @@ Agent: "Sales order SO-2024-0042 created for ABC.
         10 units of Widget X, total: $1,500."
 ```
 
-### Available Operations (18 MCP Tools)
+### Available Operations (20 MCP Tools)
 
-The bridge exposes these tools (`crates/duduclaw-cli/src/mcp/tools_def/odoo.rs`):
+The bridge exposes these tools (`crates/duduclaw-core/src/mcp_tool_defs/odoo.rs`):
 
 - **Connection**: `odoo_connect`, `odoo_status`
 - **CRM**: `odoo_crm_leads` (list leads), `odoo_crm_create_lead`, `odoo_crm_update_stage`
 - **Sales**: `odoo_sale_orders` (list orders), `odoo_sale_create_quotation`, `odoo_sale_confirm`
 - **Inventory**: `odoo_inventory_products` (search products), `odoo_inventory_check` (stock level)
 - **Accounting**: `odoo_invoice_list`, `odoo_payment_status`
-- **Generic**: `odoo_search` (search any model), `odoo_execute` (call a model method), `odoo_report`, `odoo_partner_search`, `odoo_schema_fields`, `odoo_schema_overview`
+- **Generic**: `odoo_search` (search any model), `odoo_execute` (call a model method), `odoo_report`, `odoo_partner_search`, `odoo_schema_fields`, `odoo_schema_overview`, `odoo_create` / `odoo_write` (create or update records in an explicitly granted model, v1.81.0)
 
 ### Schema scans and field compatibility
 
@@ -194,6 +194,12 @@ Built-in reads resolve each model's live field names once per connection with `f
 An empty `allowed_models` or `allowed_actions` list adds no employee restriction. It does not disable other gates: a disabled **功能模組 / Feature modules** switch, the generic-tool block list, MCP scopes / tool allowlists, and Odoo's own ACLs can still refuse the query. For a blocked model such as `res.partner`, generic record access needs an administrator to confirm the sensitive-table selection in the dashboard, which adds `unblock_models` automatically. Editing `allowed_models` alone in a configuration file does not unblock it. Removing the last table selection or action rule removes the dashboard-managed exception. **Query and read** saves both `read` and `search`; older single-verb rules are shown as partial and normalized on save. An absent employee `unblock_models` inherits the global list, including when only a username and credential are overridden. An explicit empty list unblocks nothing; an explicit list replaces the global list. The employee edit page shows the currently blocked tables and whether the list is inherited. The dedicated `odoo_partner_search` keeps its fixed safe projection.
 
 The action editor offers `read`/`search` (Search and read), `create`, `write`, `unlink`, `action` (Button actions) and `execute` (Other methods). For generic `odoo_execute` calls, `action` covers `action_*`, `button_*` and `toggle_*` methods such as confirm, validate and archive; `execute` covers other methods. Use `action` for all tables or `action:sale.order` for one table. Both method categories use write access as a hint; Odoo still checks each operation.
+
+### Generic create and update: explicit grant plus a separate opt-in (v1.81.0)
+
+`odoo_create` and `odoo_write` create or update records in any model, but unlike every other Odoo tool they follow an **explicit-grant rule**: the employee must have its own Odoo settings, the table must be ticked under **Tables** (`allowed_models` names it exactly), a rule must give that table **Create** or **Update** (`allowed_actions` holds `create` / `write`, or `create:<model>` / `write:<model>`), and the rule's **Allow general create / update** (允許通用新增／修改) switch must be on for that table (stored as `generic_create:<model>` / `generic_write:<model>` in `allowed_actions`). The switch is off by default and is per table only, so **existing settings are unchanged**: an employee that already had Create / Update does not gain the generic tools until it is switched on. Switching it on lets the AI set any writable field of that table. No own settings, an empty list or a `*` grants nothing, and the tools are not even listed to the employee until some table is granted and opted in. Users, groups, companies, `ir.*` system tables and mail / discuss records (followers, messages, templates, channels) are never generically writable, also not through x2many commands; the tools never delete, unlink, clear, replace or archive. The empty-means-unrestricted rule above still applies to all other Odoo tools, so `odoo_crm_create_lead`, `odoo_sale_create_quotation` and the rest work exactly as before.
+
+A granted call still passes the feature switch, the block list (system metadata tables such as `ir.model` can never be written: "This capability is not available"), the Odoo account's own create / write right from the schema snapshot (unknown counts as not allowed) and a field check: every key must be a stored, non-readonly field of the scanned model, `values` is capped at 64 KiB, and x2many lists may only create (0), update (1), link (4) or set (6) — deleting, unlinking or clearing (2, 3, 5) is refused. Record deletion is not offered by any tool. Until the background schema preparation has produced a snapshot for the connection, the calls ask the employee to wait.
 
 DuDuClaw denial messages identify the relevant gate and setting. The separate read-only SQL connector has different semantics: `allowed_tables` must be non-empty, and its save RPC rejects an empty list. It is not the Odoo model allowlist.
 

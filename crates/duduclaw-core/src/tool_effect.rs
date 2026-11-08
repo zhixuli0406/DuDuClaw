@@ -219,6 +219,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "docs_append" | "fork_run" | "goals_create" | "gtasks_complete" | "gtasks_create"
         | "memory_alias_add" | "memory_store" | "merge_or_select" | "notion_page_append"
         | "odoo_crm_create_lead" | "odoo_crm_update_stage" | "odoo_sale_create_quotation"
+        | "odoo_create" | "odoo_write"
         | "office_script" | "os_audio_set" | "os_backup_create" | "os_display_set" | "os_open"
         | "pause_cron_task" | "plan_update_step" | "responsibility_followup" | "run_cron_task"
         | "sheets_append" | "skill_bank_feedback" | "skill_curator_status" | "skill_extract"
@@ -306,6 +307,7 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "memory_alias_add" | "memory_invalidate_by_origin" | "memory_store" | "model_download"
         | "model_load" | "model_search" | "model_unload" | "notion_page_append"
         | "odoo_crm_create_lead" | "odoo_crm_update_stage" | "odoo_sale_create_quotation"
+        | "odoo_create" | "odoo_write"
         | "os_apply_update" | "os_audio_set" | "os_backup_create" | "os_display_set"
         | "os_factory_reset" | "os_notify" | "os_open" | "os_power" | "os_update_rollback"
         | "os_wifi_connect" | "pause_cron_task" | "plan_start" | "responsibility_ask"
@@ -361,6 +363,7 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
     "notion_page_append",
     "notion_page_read",
     "notion_search",
+    "odoo_create",
     "odoo_crm_create_lead",
     "odoo_crm_leads",
     "odoo_crm_update_stage",
@@ -376,6 +379,7 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
     "odoo_sale_orders",
     "odoo_schema_fields",
     "odoo_search",
+    "odoo_write",
     "os_open",
     "sheets_append",
     "sheets_read",

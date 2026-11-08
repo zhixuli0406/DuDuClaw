@@ -125,12 +125,23 @@ pub(crate) fn render_odoo_schema_details(
 /// (`read`/`search`/`write`/`create`/`unlink`/`action`/`execute`) or a qualified `verb:model`
 /// form (e.g. `write:crm.lead`). The model part is validated like an Odoo model
 /// name (alphanumeric + `.` + `_`).
+///
+/// RM-120: the generic-write opt-in tokens `generic_create:<model>` /
+/// `generic_write:<model>` are accepted only in the qualified form — the
+/// opt-in is per table, with no all-tables variant.
 pub(crate) fn odo_valid_action(action: &str) -> bool {
     const VERBS: &[&str] = &["read", "search", "write", "create", "unlink", "action", "execute"];
+    const QUALIFIED_ONLY: &[&str] = &[
+        duduclaw_odoo::agent_config::GENERIC_CREATE_TOKEN,
+        duduclaw_odoo::agent_config::GENERIC_WRITE_TOKEN,
+    ];
     let (verb, model) = match action.split_once(':') {
         Some((v, m)) => (v, Some(m)),
         None => (action, None),
     };
+    if QUALIFIED_ONLY.contains(&verb) {
+        return model.is_some_and(duduclaw_odoo::schema::valid_model_name);
+    }
     if !VERBS.contains(&verb) {
         return false;
     }

@@ -58,6 +58,12 @@ pub struct ScannedField {
     pub readonly: bool,
     pub store: bool,
     pub custom: bool,
+    /// RM-120: whether `fields_get` reported a `related` path (a related or
+    /// `_inherits` field, which writes through to another record). `None` in
+    /// a snapshot scanned before this attribute was requested — unknown, so
+    /// generic write refuses the field until the schema is re-scanned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related: Option<bool>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScannedModel {
@@ -423,6 +429,14 @@ fn fields_from_raw(raw: &Value, cap: usize) -> Result<(Vec<ScannedField>, usize,
                 readonly: meta["readonly"].as_bool().unwrap_or(false),
                 store: meta["store"].as_bool().unwrap_or(false),
                 custom: name.starts_with("x_"),
+                // Odoo omits `related` for a plain field and sends the dotted
+                // path (or a list) for a related / `_inherits` field.
+                related: Some(match &meta["related"] {
+                    Value::Null | Value::Bool(false) => false,
+                    Value::String(path) => !path.is_empty(),
+                    Value::Array(path) => !path.is_empty(),
+                    _ => true,
+                }),
             }
         })
         .collect();
@@ -560,7 +574,7 @@ impl OdooConnector {
                 let model = text(row, "model");
                 let remaining = SCAN_BUDGET.saturating_sub(started.elapsed());
                 Some(tokio::time::timeout(remaining, self.raw_execute_kw(&model, "fields_get",
-                    vec![json!([])], json!({"attributes":["type","string","relation","required","readonly","store"]}))).await)
+                    vec![json!([])], json!({"attributes":["type","string","relation","required","readonly","store","related"]}))).await)
             };
             let (a, b, c, d) = tokio::join!(fetch(chunk.first()), fetch(chunk.get(1)), fetch(chunk.get(2)), fetch(chunk.get(3)));
             for (row, raw) in chunk.iter().zip([a, b, c, d].into_iter().flatten()) {
@@ -1533,6 +1547,25 @@ mod tests {
         assert_eq!(fields[0].name, "name");
     }
     #[test]
+    fn related_attribute_is_recorded_and_legacy_snapshots_stay_unknown() {
+        let (fields, _, _) = fields_from_raw(&json!({
+            "name": {"type": "char"},
+            "email": {"type": "char", "related": "partner_id.email"},
+            "list": {"type": "char", "related": ["partner_id", "email"]},
+            "plain": {"type": "char", "related": false},
+        }), 10).unwrap();
+        let related = |name: &str| fields.iter().find(|f| f.name == name).unwrap().related;
+        assert_eq!(related("name"), Some(false));
+        assert_eq!(related("plain"), Some(false));
+        assert_eq!(related("email"), Some(true));
+        assert_eq!(related("list"), Some(true));
+        let legacy: ScannedField = serde_json::from_value(json!({
+            "name": "name", "ttype": "char", "label": "Name", "relation": null,
+            "required": false, "readonly": false, "store": true, "custom": false,
+        })).unwrap();
+        assert_eq!(legacy.related, None, "a snapshot from before the attribute is unknown, not 'plain'");
+    }
+    #[test]
     fn automatic_scan_rate_limit_is_persistent_and_failure_closed() {
         let home = test_home();
         assert!(claim_auto_scan(&home, "default", 10000).unwrap());
@@ -1589,6 +1622,7 @@ mod tests {
                     readonly: false,
                     store: true,
                     custom: f.starts_with("x_"),
+                    related: Some(false),
                 })
                 .collect(),
             total_fields: field_names.len(),

@@ -1,5 +1,5 @@
 import { useIntl } from 'react-intl';
-import { ACTION_GROUPS, parseActions, partialRead } from './permissions';
+import { ACTION_GROUPS, genericOn, parseActions, partialRead } from './permissions';
 
 export function OdooPermissionSummary({ actions, effectiveBlockedModels, unblockInherited = false }: {
   actions: string[];
@@ -14,7 +14,8 @@ export function OdooPermissionSummary({ actions, effectiveBlockedModels, unblock
     {!actions.length && <span>{t('actionsUnrestricted')}</span>}
     {rules.map((rule) => <p key={rule.model}>
       {rule.model || t('allTables')}：{ACTION_GROUPS.filter((action) => rule.verbs.includes(action) || (action === 'read' && rule.verbs.includes('search')))
-        .map((action) => `${t(action)}${action === 'read' && partialRead(rule) ? ` (${t('partial')})` : ''}`).join('、')}
+        .map((action) => `${t(action)}${action === 'read' && partialRead(rule) ? ` (${t('partial')})` : ''}`)
+        .concat(genericOn(rule) ? [t('genericWrite')] : []).join('、')}
     </p>)}
     {other.length > 0 && <p>{t('other')}：{other.join('、')}</p>}
     {effectiveBlockedModels !== undefined && <div className="mt-3 space-y-1 text-sm">

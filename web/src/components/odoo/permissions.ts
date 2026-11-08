@@ -17,11 +17,32 @@ export interface OdooPermissions {
 const VERBS = new Set(['read', 'search', 'create', 'write', 'unlink', 'action', 'execute']);
 export const validModel = (model: string) => /^[a-zA-Z0-9_.]{1,128}$/.test(model);
 
+/**
+ * RM-120 opt-in for the generic odoo_create / odoo_write tools, stored per table
+ * as `generic_create:<model>` / `generic_write:<model>` (never bare). Default off.
+ */
+export const GENERIC_VERBS: Record<'create' | 'write', string> = { create: 'generic_create', write: 'generic_write' };
+const GENERIC = new Set(Object.values(GENERIC_VERBS));
+export const genericOn = (rule: OdooRule) => rule.verbs.some((verb) => GENERIC.has(verb));
+/** The rule's verbs with the opt-in tokens matching its Create / Update, or none when `on` is false. */
+export function syncGeneric(verbs: string[], on: boolean) {
+  const base = verbs.filter((verb) => !GENERIC.has(verb));
+  if (!on) return base;
+  return [...base, ...(['create', 'write'] as const).filter((verb) => base.includes(verb)).map((verb) => GENERIC_VERBS[verb])];
+}
+
 export function parseActions(entries: string[]) {
   const rules: OdooRule[] = [];
   const other: string[] = [];
   for (const entry of entries) {
     const [verb, model = '', ...extra] = entry.split(':');
+    // Opt-in tokens are only meaningful for one named table.
+    if (GENERIC.has(verb) && !extra.length && validModel(model)) {
+      let rule = rules.find((r) => r.model === model);
+      if (!rule) { rule = { model, verbs: [] }; rules.push(rule); }
+      if (!rule.verbs.includes(verb)) rule.verbs.push(verb);
+      continue;
+    }
     if (!VERBS.has(verb) || extra.length || (entry.includes(':') && !validModel(model))) {
       other.push(entry);
       continue;

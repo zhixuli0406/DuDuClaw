@@ -31,7 +31,7 @@ pub(crate) fn confirmed_sink_completion(tool: &str, response: &Value) -> bool {
         | "odoo_execute" | "odoo_inventory_check" | "odoo_inventory_products"
         | "odoo_invoice_list" | "odoo_partner_search" | "odoo_payment_status" | "odoo_report"
         | "odoo_sale_confirm" | "odoo_sale_create_quotation" | "odoo_sale_orders"
-        | "odoo_schema_fields" | "odoo_search"
+        | "odoo_schema_fields" | "odoo_search" | "odoo_create" | "odoo_write"
         | "transcribe_audio" | "meeting_transcribe" | "synthesize_speech" | "db_query" | "db_select" | "db_tables"
         | "calendar_create_event" | "calendar_list_events" | "docs_append" | "docs_read"
         | "drive_read" | "drive_search" | "forms_get" | "forms_list_responses"
