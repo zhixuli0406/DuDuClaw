@@ -207,3 +207,60 @@ fn create_task_refuses_foreign_task() {
         }
     }
 }
+
+// H9 owner decision 3: interactive create_task (NewTask grant).
+fn interactive_context(context: &RequestContext, requester: &str) -> RequestContext {
+    let mut record = context.record().clone();
+    record.task = None;
+    record.tools = List::new(vec![text("create_task".into()).unwrap()]).unwrap();
+    record.resources = List::new(vec![ResourceGrant::EmployeeScope { id: record.employee },
+        ResourceGrant::Employee { id: record.employee },
+        ResourceGrant::NewTask { requester: text(requester.into()).unwrap() }]).unwrap();
+    RequestContext::from_verified_record(record)
+}
+
+#[test]
+fn create_task_interactive_assignee_and_creator_fixed() {
+    use duduclaw_mcp_boundary::tool_policy::eligible;
+    let (home, resolver, context, _bindings) = fixture();
+    let ctx = interactive_context(&context, "alice");
+    ctx.record().canonical_bytes().unwrap();
+    assert!(eligible(&ctx, "create_task"));
+    let new_task = ResourceGrant::NewTask { requester: text("alice".into()).unwrap() };
+    // Steps for this employee (named or defaulted) are a new plan of its own,
+    // filed for the signed requester; tasks.db is never consulted.
+    std::fs::remove_file(home.path().join("tasks.db")).unwrap();
+    for steps in [json!([{"description":"draft"}]), json!([{"description":"draft", "agent":"employee-a"}, {"description":"send", "agent":""}])] {
+        let call = authorize(&ctx, "create_task", &json!({"goal":"ship", "steps":steps}), &resolver).unwrap();
+        assert_eq!(call.resources(), &[ResourceGrant::Employee { id: ctx.record().employee }, new_task.clone()]);
+        assert!(task_grants(&call).is_empty(), "no existing task is selected");
+    }
+    assert!(!home.path().join("tasks.db").exists());
+    // The assignee is fixed: no step may target another employee.
+    let policy = duduclaw_mcp_boundary::tool_policy::policy("create_task").unwrap();
+    for step in [json!({"description":"draft", "agent":"employee-b"}), json!({"description":"draft", "agent":"*"}),
+        json!({"description":"draft", "agent":7})] {
+        let args = json!({"goal":"ship", "steps":[step.clone()]});
+        assert!(authorize(&ctx, "create_task", &args, &resolver).is_err(), "{step}");
+        assert_eq!(resolver.resolve(&ctx, policy, &args).err(), Some(VerificationError::BindingMismatch), "{step}");
+    }
+    for key in ["agent_id", "assigned_to", "assignee"] {
+        let mut step = json!({"description":"draft"});
+        step[key] = json!("employee-b");
+        let args = json!({"goal":"ship", "steps":[step]});
+        assert!(resolver.resolve(&ctx, policy, &args).is_err(), "{key}");
+    }
+    // The creator is fixed: the grant must be the signed human principal's own,
+    // so a grant naming someone else is no authority…
+    let forged = interactive_context(&context, "mallory");
+    assert!(!eligible(&forged, "create_task"));
+    assert!(authorize(&forged, "create_task", &plan(), &resolver).is_err());
+    assert!(resolver.resolve(&forged, policy, &plan()).is_err());
+    // …and a Personal employee's requester must be its owner (B1), even with a
+    // matching principal/grant pair for another person.
+    let mut record = interactive_context(&context, "bob").record().clone();
+    record.principal = Principal::Human { user_id: text("bob".into()).unwrap(), generation: 1 };
+    let other_person = RequestContext::from_verified_record(record);
+    assert!(authorize(&other_person, "create_task", &plan(), &resolver).is_err());
+    assert!(resolver.resolve(&other_person, policy, &plan()).is_err());
+}

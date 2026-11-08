@@ -4,52 +4,178 @@
 use super::*;
 
 impl MethodHandler {
-    /// Explicit operator scan. Persists isolated metadata only, never business rows.
-    pub(crate) async fn handle_odoo_schema_scan(&self) -> WsFrame {
-        // Authentication retries and edition detection precede the scanner's
-        // own budget. Bound the whole RPC below the dashboard response timeout.
-        match tokio::time::timeout(std::time::Duration::from_secs(240), self.run_odoo_schema_scan()).await {
-            Ok(frame) => frame,
-            Err(_) => WsFrame::ok_response("", json!({
-                "success": false,
-                "message": "Odoo schema scan timed out after 240 seconds. Check Odoo connectivity and metadata permissions, then re-scan.",
-            })),
+    /// The owner gateway alone performs periodic, identity-isolated scans.
+    pub(crate) async fn run_odoo_schema_background(&self) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1800));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if !duduclaw_core::gateway_instance::held(&self.home_dir) { continue; }
+            let _ = self.scan_effective_odoo_connections(true).await;
         }
     }
 
-    async fn run_odoo_schema_scan(&self) -> WsFrame {
-        let table = self.read_config_table(&self.home_dir.join("config.toml")).await;
-        let cfg = duduclaw_odoo::OdooConfig::from_toml(&table);
-        if !cfg.is_configured() {
-            return WsFrame::ok_response("", json!({ "success": false, "message": "Odoo not configured — save the connection settings first" }));
-        }
-        let Some(credential) = self.resolve_odoo_credential(&table).filter(|s| !s.is_empty()) else {
-            return WsFrame::ok_response("", json!({ "success": false, "message": "No API key or password configured" }));
-        };
-        // The dashboard operates on the saved default profile. Reserve before
-        // network access; changing credentials must not bypass its cooldown.
-        let _manual_scan = match duduclaw_odoo::schema::claim_manual_scan(
+    pub(crate) async fn handle_odoo_schema_scan(&self) -> WsFrame {
+        let _manual = match duduclaw_odoo::schema::claim_manual_scan(
             &self.home_dir, "default", chrono::Utc::now().timestamp(),
         ) {
             Ok(lock) => lock,
-            Err(e) => return WsFrame::ok_response("", json!({ "success": false, "message": e })),
+            Err(e) => return WsFrame::ok_response("", json!({"success":false,"message":e})),
         };
-        let conn = match duduclaw_odoo::OdooConnector::connect(&cfg, &credential).await {
-            Ok(conn) => conn,
-            Err(e) => return WsFrame::ok_response("", json!({ "success": false, "message": Self::scrub_odoo_error(&e) })),
+        WsFrame::ok_response("", self.scan_effective_odoo_connections(false).await)
+    }
+
+    /// Enumerate every employee, including inherited connections. A bad override
+    /// produces an explicit failure and never falls back to another identity.
+    pub(crate) async fn effective_odoo_scan_targets(&self) -> (Vec<OdooScanTarget>, Vec<Value>) {
+        let global = match tokio::fs::read_to_string(self.home_dir.join("config.toml")).await
+            .ok().and_then(|s| s.parse::<toml::Table>().ok()) {
+            Some(table) => table,
+            None => return (Vec::new(), vec![scan_failure("default", "Odoo not configured or configuration unavailable")]),
         };
-        let profile = conn.schema_profile("default");
-        match duduclaw_odoo::schema::scan_and_save(&conn, &self.home_dir, &profile).await {
-            Ok(diff) => WsFrame::ok_response("", json!({
-                "success": true,
-                "diff": diff,
-                "schema": duduclaw_odoo::schema::load_scan_status(&self.home_dir, &profile),
-            })),
-            Err(e) => {
-                warn!("Odoo schema scan failed");
-                WsFrame::ok_response("", json!({ "success": false, "message": Self::scrub_odoo_error(&e) }))
+        let ids: Vec<String> = self.registry.read().await.list().iter()
+            .map(|a| a.config.agent.name.clone()).collect();
+        let mut targets = Vec::new();
+        let mut failures = Vec::new();
+        for id in std::iter::once("default".to_string()).chain(ids) {
+            let agent = if id == "default" { Ok(toml::Table::new()) }
+                else { self.read_agent_toml_table(&id).await };
+            let result: Result<OdooScanTarget, String> = async {
+                let agent = agent?;
+                let mut cfg = duduclaw_odoo::OdooConfig::from_toml(&global);
+                let over = duduclaw_odoo::AgentOdooConfig::from_table(&agent)?;
+                if let Some(over) = &over { over.apply_to(&mut cfg)?; }
+                if !cfg.is_configured() { return Err("Odoo not configured — save the connection settings first".into()); }
+                // Resolve the effective encrypted value or secret reference in
+                // the same way as the runtime pool. A broken override denies.
+                let (enc_key, plain_key, encrypted) = if cfg.auth_method == "password" {
+                    ("password_enc", "password", &cfg.password_enc)
+                } else { ("api_key_enc", "api_key", &cfg.api_key_enc) };
+                let plain = |table: &toml::Table| table.get("odoo").and_then(|v| v.get(plain_key))
+                    .and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
+                let agent_has_credential = agent.get("odoo").and_then(|v| v.as_table())
+                    .is_some_and(|s| s.contains_key(enc_key) || s.contains_key(plain_key));
+                let credential = if !encrypted.is_empty() {
+                    use duduclaw_security::secret_ref::{Secret, SecretRef};
+                    let config = duduclaw_security::secret_manager::SecretManagerConfig::load_from_home(&self.home_dir).await;
+                    SecretRef::from_single(encrypted).resolve(&config, &self.home_dir).await
+                        .map(Secret::expose_owned)
+                } else if agent_has_credential { plain(&agent) } else { plain(&global) }
+                    .filter(|s| !s.is_empty()).ok_or("Odoo credential unavailable")?;
+                Ok(OdooScanTarget {
+                    employee: id.clone(), cfg, credential,
+                    profile: over.as_ref().map(|o| o.profile_or_default()).unwrap_or("default").to_string(),
+                    company_ids: over.as_ref().map(|o| o.company_ids.iter().map(|&id| id as i64).collect()).unwrap_or_default(),
+                })
+            }.await;
+            match result {
+                Ok(target) => targets.push(target),
+                Err(e) => failures.push(scan_failure(&id, &Self::scrub_odoo_error(&e))),
             }
         }
+        (targets, failures)
+    }
+
+    async fn scan_effective_odoo_connections(&self, automatic: bool) -> Value {
+        let (targets, mut results) = self.effective_odoo_scan_targets().await;
+        // The semaphore is shared by manual and periodic jobs in this process.
+        // Connect in bounded batches, then deduplicate authenticated identities.
+        // Each group also carries the visibility policy its scan is filtered
+        // with (Daybreak (a)): blocked / switched-off models are never probed.
+        let mut groups: std::collections::BTreeMap<String, (duduclaw_odoo::OdooConnector, duduclaw_odoo::schema::ScanPolicy, Vec<(String, String)>)> = Default::default();
+        for chunk in targets.chunks(2) {
+            let connect = async |target: Option<&OdooScanTarget>| {
+                let target = target?;
+                let _permit = duduclaw_odoo::schema::scan_semaphore().acquire().await.ok()?;
+                let result = tokio::time::timeout(std::time::Duration::from_secs(60),
+                    duduclaw_odoo::OdooConnector::connect(&target.cfg, &target.credential)).await
+                    .map_err(|_| "Odoo connection timed out".to_string())
+                    .and_then(|r| r).map(|conn| conn.with_company_ids(target.company_ids.clone()));
+                let policy = duduclaw_odoo::schema::ScanPolicy::from_config(&target.cfg);
+                Some((target.employee.clone(), target.profile.clone(), policy, result))
+            };
+            let (a, b) = tokio::join!(connect(chunk.first()), connect(chunk.get(1)));
+            for (employee, label, policy, result) in [a, b].into_iter().flatten() {
+                match result {
+                    Ok(conn) => {
+                        let identity = conn.connection_identity();
+                        let profile = conn.schema_profile(&label);
+                        match groups.entry(identity) {
+                            std::collections::btree_map::Entry::Vacant(slot) => {
+                                slot.insert((conn, policy, vec![(employee.clone(), profile)]));
+                            }
+                            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                                // Members of one identity share a snapshot: keep the
+                                // strictest policy so no member widens another's view.
+                                let group = slot.get_mut();
+                                group.1 = group.1.intersect(&policy);
+                                group.2.push((employee.clone(), profile));
+                            }
+                        }
+                    }
+                    Err(e) => results.push(scan_failure(&employee, &Self::scrub_odoo_error(&e))),
+                }
+            }
+        }
+        let effective: std::collections::BTreeSet<String> = groups.values()
+            .flat_map(|(conn, _, users)| std::iter::once(conn.schema_profile("default"))
+                .chain(users.iter().map(|(_, p)| p.clone()))).collect();
+        // If any identity is unknowable, keep old snapshots rather than deleting
+        // a still-effective employee's metadata after a transient login failure.
+        let can_cleanup = results.is_empty();
+        let groups: Vec<_> = groups.into_values().collect();
+        let mut saved = false;
+        for chunk in groups.chunks(2) {
+            let scan = async |group: Option<&(duduclaw_odoo::OdooConnector, duduclaw_odoo::schema::ScanPolicy, Vec<(String, String)>)>| {
+                let (conn, policy, users) = group?;
+                let _permit = duduclaw_odoo::schema::scan_semaphore().acquire().await.ok()?;
+                let profile_key = conn.schema_profile("default");
+                let profile = &profile_key;
+                let outcome = if automatic {
+                    duduclaw_odoo::schema::auto_scan(conn, &self.home_dir, profile, policy).await
+                } else {
+                    duduclaw_odoo::schema::scan_and_save(conn, &self.home_dir, profile, policy).await.map(|_| true)
+                };
+                let did_save = outcome.as_ref().is_ok_and(|saved| *saved);
+                let mut rows = Vec::new();
+                for (employee, alias) in users {
+                    let result = outcome.clone().and_then(|_| {
+                        if alias != profile {
+                            let _lock = duduclaw_odoo::schema::acquire_scan_lock(&self.home_dir, alias)?;
+                            let snapshot = duduclaw_odoo::schema::load_snapshot(&self.home_dir, profile)?
+                                .ok_or("Odoo schema snapshot unavailable")?;
+                            duduclaw_odoo::schema::save_snapshot(&self.home_dir, alias, &snapshot)?;
+                        }
+                        Ok(())
+                    });
+                    match result {
+                        Ok(()) => rows.push(json!({"employee":employee,"status":"ok",
+                            "schema":duduclaw_odoo::schema::load_scan_status(&self.home_dir, alias)})),
+                        Err(e) => rows.push(scan_failure(employee, &Self::scrub_odoo_error(&e))),
+                    }
+                }
+                Some((rows, did_save))
+            };
+            let (a, b) = tokio::join!(scan(chunk.first()), scan(chunk.get(1)));
+            for (rows, did_save) in [a, b].into_iter().flatten() {
+                saved |= did_save;
+                results.extend(rows);
+            }
+        }
+        if saved && can_cleanup {
+            if let Err(e) = duduclaw_odoo::schema::cleanup_stale_profiles(&self.home_dir, &effective) {
+                warn!(error=%e, "Odoo stale schema cleanup failed");
+            }
+        }
+        let success = !results.is_empty() && results.iter().all(|r| r["status"] == "ok");
+        let default = results.iter().find(|r| r["employee"] == "default");
+        json!({"success":success,
+            "message": if success { Value::Null } else {
+                results.iter().find_map(|r| r.get("message").cloned()).unwrap_or(json!("Odoo schema scan failed"))
+            },
+            "schema":default.and_then(|r| r.get("schema")),
+            "diff":default.and_then(|r| r.get("schema")).and_then(|s| s.get("diff")),
+            "results":results})
     }
 
     /// Test the Odoo connection.
@@ -72,8 +198,6 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
-
-        let stored_connection = inline_url.is_none();
 
         // Always read config.toml once — needed for stored-credential fallback in inline mode.
         let config_path = self.home_dir.join("config.toml");
@@ -140,10 +264,6 @@ impl MethodHandler {
         match duduclaw_odoo::OdooConnector::connect(&odoo_cfg, &credential).await {
             Ok(conn) => {
                 let st = conn.status();
-                if stored_connection {
-                    let profile = conn.schema_profile("default");
-                    duduclaw_odoo::schema::spawn_auto_scan(Arc::new(conn), self.home_dir.clone(), profile);
-                }
                 WsFrame::ok_response(
                     "",
                     json!({
@@ -235,7 +355,10 @@ impl MethodHandler {
             Err(e) => return WsFrame::ok_response("", json!({ "success": false, "message": e })),
         };
 
-        let report = match conn.introspect_schema(max_models).await {
+        // Same visibility rules as the snapshot scan: blocked / switched-off
+        // models are never queried, returned or written to the wiki.
+        let policy = conn.effective_scan_policy(&duduclaw_odoo::schema::ScanPolicy::from_config(&odoo_cfg));
+        let mut report = match conn.introspect_schema(max_models, &policy).await {
             Ok(r) => r,
             Err(e) => {
                 warn!("Odoo introspect_schema failed");
@@ -248,6 +371,9 @@ impl MethodHandler {
                 );
             }
         };
+
+        // Defence in depth: filter again at the dashboard boundary.
+        policy.retain_report(&mut report);
 
         // Lightweight model list for the UI (no field payload — that lives in
         // the wiki / odoo_schema_fields).
@@ -265,7 +391,7 @@ impl MethodHandler {
             .collect();
 
         // Write schema to the shared wiki, honouring the .scope.toml policy.
-        let (wiki_written, wiki_note) = self.write_odoo_schema_wiki(&report).await;
+        let (wiki_written, wiki_note) = self.write_odoo_schema_wiki(&report, &policy).await;
 
         WsFrame::ok_response(
             "",
@@ -282,12 +408,16 @@ impl MethodHandler {
         )
     }
 
-    /// Persist an introspected schema to the shared wiki as two pages:
-    /// `odoo/schema` (context layer — compact summary) and
-    /// `odoo/schema-fields` (deep layer — full field tables for search).
+    /// Persist an introspected schema to the shared wiki as two pages, both
+    /// in the `deep` (search/reference-only) layer so nothing is auto-injected
+    /// into an employee's context: `odoo/schema` (compact summary) and
+    /// `odoo/schema-fields` (full field tables). Both renderers re-apply
+    /// `policy`, so blocked / switched-off models never reach the wiki.
     /// Returns `(written, note)`. Skips the write (fail-safe) when the `odoo`
     /// namespace is locked by `.scope.toml`.
-    pub(crate) async fn write_odoo_schema_wiki(&self, report: &duduclaw_odoo::SchemaReport) -> (bool, String) {
+    pub(crate) async fn write_odoo_schema_wiki(
+        &self, report: &duduclaw_odoo::SchemaReport, policy: &duduclaw_odoo::schema::ScanPolicy,
+    ) -> (bool, String) {
         // .scope.toml policy for the `odoo` namespace.
         let scope_path = self
             .home_dir
@@ -309,8 +439,10 @@ impl MethodHandler {
             return (false, format!("wiki scaffold failed: {e}"));
         }
 
-        let summary = render_odoo_schema_summary(report);
-        let details = render_odoo_schema_details(report);
+        // Both pages are reference-only; never auto-inject Odoo metadata into
+        // an employee's context.
+        let summary = render_odoo_schema_summary(report, policy);
+        let details = render_odoo_schema_details(report, policy);
 
         if let Err(e) = store.write_page("odoo/schema.md", &summary) {
             return (false, format!("wiki write failed: {e}"));
@@ -321,7 +453,7 @@ impl MethodHandler {
         }
         (
             true,
-            "schema written to wiki (odoo/schema, odoo/schema-fields)".into(),
+            "schema pages written; odoo/schema and odoo/schema-fields are deep/reference-only".into(),
         )
     }
 
@@ -483,4 +615,16 @@ impl MethodHandler {
         }
         plain
     }
+}
+
+/// Never serialize this target: it contains a resolved credential.
+pub(crate) struct OdooScanTarget {
+    pub(crate) employee: String,
+    pub(crate) cfg: duduclaw_odoo::OdooConfig,
+    credential: String,
+    profile: String,
+    company_ids: Vec<i64>,
+}
+fn scan_failure(employee: &str, message: &str) -> Value {
+    json!({"employee":employee,"status":"failed","message":message})
 }

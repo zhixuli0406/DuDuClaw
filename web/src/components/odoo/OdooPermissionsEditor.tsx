@@ -3,7 +3,7 @@ import { useIntl } from 'react-intl';
 import { Badge, Button, Checkbox, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/mds';
 import { ConfirmDialog } from '@/components/settings/controls';
 import { useOdooPermissionOptions } from './useOdooPermissionOptions';
-import { actionAccess, ACTION_GROUPS, normalizeActions, parseActions, partialRead, reconcileUnblocks, serializeRules, usedModels, type OdooPermissions, type OdooRule } from './permissions';
+import { actionAccess, ACTION_GROUPS, genericOn, normalizeActions, parseActions, partialRead, reconcileUnblocks, serializeRules, syncGeneric, usedModels, type OdooPermissions, type OdooRule } from './permissions';
 
 export function OdooPermissionsEditor({ value, onChange, disabled = false, defaultAccount = true }: {
   value: OdooPermissions; onChange: (value: OdooPermissions) => void; disabled?: boolean; defaultAccount?: boolean;
@@ -93,12 +93,14 @@ export function OdooPermissionsEditor({ value, onChange, disabled = false, defau
       <legend className="text-sm font-medium">{t('rules')}</legend>
       <p className="text-xs text-muted-foreground">{t('actionsUnrestricted')}</p>
       <p className="text-xs text-muted-foreground">{t('intersection')}</p>
+      <p className="text-xs text-muted-foreground">{t('genericWriteRule')}</p>
       {rules.map((rule, index) => <fieldset key={index} className="space-y-3 rounded-lg border border-border p-3">
         <legend className="px-1 text-xs">{t('rule')} {index + 1}</legend>
         <div className="flex items-center gap-2">
           <Select value={rule.model} disabled={locked} onValueChange={(model) => {
             if (model === null) return;
-            changeRules(rules.map((r, i) => i === index ? { ...r, model } : r), model);
+            // The general create / update opt-in belongs to one table: a new table starts with it off.
+            changeRules(rules.map((r, i) => i === index ? { ...r, model, verbs: syncGeneric(r.verbs, false) } : r), model);
           }}>
             <SelectTrigger className="min-w-0 flex-1" aria-label={`${t('table')} ${index + 1}`}><SelectValue>{rule.model ? tableLabel(rule.model) : t('allTables')}</SelectValue></SelectTrigger>
             <SelectContent><SelectItem value="">{t('allTables')}</SelectItem>
@@ -115,13 +117,22 @@ export function OdooPermissionsEditor({ value, onChange, disabled = false, defau
             return <div key={action} className="space-y-1"><label className="flex items-center gap-2 text-sm">
             <Checkbox disabled={locked || (access === false && !checked)} checked={checked} onCheckedChange={(checked) => {
               const group = action === 'read' ? ['read', 'search'] : [action];
-              const verbs = checked ? [...new Set([...rule.verbs, ...group])] : rule.verbs.filter((verb) => !group.includes(verb));
+              // Keep the opt-in tokens in step with Create / Update.
+              const verbs = syncGeneric(checked ? [...new Set([...rule.verbs, ...group])] : rule.verbs.filter((verb) => !group.includes(verb)), genericOn(rule));
               changeRules(rules.map((r, i) => i === index ? { ...r, verbs } : r), checked ? rule.model : undefined);
             }} />
             {t(action)}{action === 'read' && partialRead(rule) && <Badge variant="secondary">{t('partial')}</Badge>}
           </label>
             {hint && <span className={access === false ? 'text-xs text-destructive' : 'text-xs text-muted-foreground'}>{hint}{access === false && checked ? ` · ${t('savedUnavailable')}` : ''}</span>}
           </div>; })}
+          {rule.model && (genericOn(rule) || rule.verbs.includes('create') || rule.verbs.includes('write')) && <div className="space-y-1">
+            <label className="flex items-center gap-2 text-sm">
+              <Checkbox disabled={locked} checked={genericOn(rule)} onCheckedChange={(checked) =>
+                changeRules(rules.map((r, i) => i === index ? { ...r, verbs: syncGeneric(r.verbs, Boolean(checked)) } : r))} />
+              {t('genericWrite')}
+            </label>
+            <span className="block text-xs text-muted-foreground">{t('genericWriteHint')}</span>
+          </div>}
         </div>
         {!rule.model && <p className="text-xs text-muted-foreground">{t('allTablesRights')}</p>}
         <p className="text-xs text-muted-foreground">{t('executeRights')}</p>

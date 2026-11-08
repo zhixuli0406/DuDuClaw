@@ -1,13 +1,17 @@
 import { canSelectAgent, useAgentGrantPresent } from '@/stores/callable-agents-store';
 import { useVisibleAgents, useAgentVisibilityUnrestricted } from '@/lib/data-scope';
 import { Link } from 'react-router';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { useAgentsStore } from '@/stores/agents-store';
 import { OrgChart } from '@/components/OrgChart';
 import { OrgNodePanel } from '@/components/agent';
-import { api, type AgentDetail, type OrgChartAgent } from '@/lib/api';
+import { OrgPlacementPanel, type PlacementDraft } from '@/components/org/OrgPlacementPanel';
+import { OrgPendingTable } from '@/components/org/OrgPendingTable';
+import { hasMinRole } from '@/lib/roles';
+import { normPlacement, pendingStatus, type OrgChangeRow } from '@/lib/org-change';
+import { api, type AgentDetail, type OrgChartAgent, type OrgPendingChange } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { Users } from 'lucide-react';
@@ -92,6 +96,71 @@ function ManagedOrgChart() {
     fetchAgents();
   }, [fetchAgents]);
 
+  // ── RM-027: org editing ──────────────────────────────────────
+  const user = useAuthStore((s) => s.user);
+  const isAdmin = hasMinRole(user?.role, 'admin');
+  const canPropose = hasMinRole(user?.role, 'manager');
+  const [waiting, setWaiting] = useState<OrgPendingChange[]>([]);
+  const [settled, setSettled] = useState<OrgChangeRow[]>([]);
+  const [draft, setDraft] = useState<PlacementDraft | null>(null);
+  const draftNonce = useRef(0);
+  const seenWaiting = useRef<OrgPendingChange[]>([]);
+
+  const loadPending = useCallback(async () => {
+    if (!canPropose) return;
+    try {
+      const r = await api.org.pendingChanges();
+      const next = Array.isArray(r?.pending) ? r.pending : [];
+      // A request that left the waiting list was decided: it counts as 已同意
+      // when the employee now sits where it asked, otherwise 已拒絕.
+      const gone = seenWaiting.current.filter((p) => !next.some((n) => n.approval_id === p.approval_id));
+      if (gone.length > 0) {
+        const roster = useAgentsStore.getState().agents;
+        setSettled((prev) => [
+          ...gone.map((change): OrgChangeRow => {
+            const now = roster.find((a) => a.name === change.agent_id);
+            const after = normPlacement(change.after);
+            const applied = !!now && (now.reports_to ?? '') === after.reports_to && (now.department ?? '') === after.department;
+            return { change, status: applied ? 'approved' : 'rejected' };
+          }),
+          ...prev,
+        ].slice(0, 5));
+      }
+      seenWaiting.current = next;
+      setWaiting(next);
+    } catch {
+      // Waiting requests are an extra; the chart itself still works without them.
+    }
+  }, [canPropose]);
+
+  useEffect(() => {
+    void loadPending();
+  }, [loadPending]);
+
+  const refreshAll = useCallback(async () => {
+    await fetchAgents();
+    await loadPending();
+  }, [fetchAgents, loadPending]);
+
+  const pendingByAgent = useMemo(() => {
+    const m = new Map<string, OrgPendingChange>();
+    for (const p of waiting) if (!p.stale && !m.has(p.agent_id)) m.set(p.agent_id, p);
+    for (const p of waiting) if (!m.has(p.agent_id)) m.set(p.agent_id, p);
+    return m;
+  }, [waiting]);
+  const pendingNames = useMemo(() => new Set(waiting.map((p) => p.agent_id)), [waiting]);
+  const tableRows = useMemo<OrgChangeRow[]>(() => {
+    const mine = (c: OrgPendingChange) => isAdmin || c.proposer === user?.id;
+    return [
+      ...waiting.filter(mine).map((change): OrgChangeRow => ({ change, status: pendingStatus(change) })),
+      ...settled.filter((r) => mine(r.change)),
+    ];
+  }, [waiting, settled, isAdmin, user?.id]);
+  const labelOf = useCallback(
+    (id: string) => agents.find((a) => a.name === id)?.display_name ?? id,
+    [agents],
+  );
+
   const selectedAllowed = useAgentGrantPresent(selectedAgent?.name);
   useEffect(() => {
     if (selectedAgent && !selectedAllowed) {
@@ -108,8 +177,30 @@ function ManagedOrgChart() {
     if (!canSelectAgent(agentName)) return;
     const agent = agents.find((a) => a.name === agentName) ?? null;
     setSelectedAgent(agent);
+    setDraft(null);
     if (agent) setSheetOpen(true); // mobile: open the bottom sheet
   };
+
+  // Dropping a node onto a manager opens that employee's 「調整位置」 with the
+  // manager pre-selected; nothing is sent until the user confirms there.
+  const handleReparent = useCallback((agentName: string, managerName: string) => {
+    if (!canSelectAgent(agentName)) return;
+    const agent = agents.find((a) => a.name === agentName) ?? null;
+    if (!agent) return;
+    setSelectedAgent(agent);
+    setSheetOpen(true);
+    draftNonce.current += 1;
+    setDraft({ agent: agentName, manager: managerName, nonce: draftNonce.current });
+  }, [agents, setSheetOpen]);
+
+  // Keep the open card in step with the roster after a change is applied.
+  useEffect(() => {
+    if (!selectedAgent) return;
+    const fresh = agents.find((a) => a.name === selectedAgent.name);
+    if (fresh && ((fresh.reports_to ?? '') !== (selectedAgent.reports_to ?? '') || (fresh.department ?? '') !== (selectedAgent.department ?? ''))) {
+      setSelectedAgent(fresh);
+    }
+  }, [agents, selectedAgent]);
 
   // Push the selected staff card into the shared right PropertiesPanel (§5.4 T6.3).
   useEffect(() => {
@@ -119,6 +210,18 @@ function ManagedOrgChart() {
       content: (
         <OrgNodePanel
           agent={selectedAgent}
+          placement={canPropose ? (
+            <OrgPlacementPanel
+              key={selectedAgent.name}
+              agent={selectedAgent}
+              agents={agents}
+              isAdmin={isAdmin}
+              pending={pendingByAgent.get(selectedAgent.name)}
+              draft={draft}
+              onChanged={() => void refreshAll()}
+              onRefresh={() => { clearError(); void fetchAgents(); }}
+            />
+          ) : undefined}
           onOpenDetail={() => {
             clearPanel();
             navigate(`/agents/${encodeURIComponent(selectedAgent.name)}`);
@@ -154,7 +257,8 @@ function ManagedOrgChart() {
         />
       ),
     });
-  }, [selectedAgent, selectedAllowed, setPanel, clearPanel, navigate, pauseAgent, resumeAgent, intl, errorText]);
+  }, [selectedAgent, selectedAllowed, setPanel, clearPanel, navigate, pauseAgent, resumeAgent, intl, errorText,
+    canPropose, agents, isAdmin, pendingByAgent, draft, refreshAll, clearError, fetchAgents]);
 
   return (
     <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
@@ -183,18 +287,33 @@ function ManagedOrgChart() {
         ) : visibleAgents.length === 0 ? (
           <CollectionPageState state="empty" icon={Users} title={intl.formatMessage({ id: 'agents.empty' })} />
         ) : agents.length > 0 ? (
-          <Card className="gap-0 p-2">
-            <OrgChart
-              agents={agents}
-              onNodeClick={handleNodeClick}
-              labels={{
-                main: intl.formatMessage({ id: 'orgchart.legend.main' }),
-                specialist: intl.formatMessage({ id: 'orgchart.legend.specialist' }),
-                worker: intl.formatMessage({ id: 'orgchart.legend.worker' }),
-                zoom: intl.formatMessage({ id: 'orgchart.zoom' }),
-              }}
-            />
-          </Card>
+          <>
+            <Card className="gap-0 p-2">
+              <OrgChart
+                agents={agents}
+                onNodeClick={handleNodeClick}
+                pendingNames={canPropose ? pendingNames : undefined}
+                selectedName={selectedAgent?.name}
+                onReparent={canPropose ? handleReparent : undefined}
+                labels={{
+                  main: intl.formatMessage({ id: 'orgchart.legend.main' }),
+                  specialist: intl.formatMessage({ id: 'orgchart.legend.specialist' }),
+                  worker: intl.formatMessage({ id: 'orgchart.legend.worker' }),
+                  zoom: intl.formatMessage({ id: 'orgchart.zoom' }),
+                  pending: intl.formatMessage({ id: 'orgEdit.status.pending' }),
+                  dropHint: (manager: string) => intl.formatMessage({ id: 'orgEdit.dropHint' }, { manager }),
+                }}
+              />
+            </Card>
+            {canPropose && (
+              <p className="mt-2 text-xs text-muted-foreground">{intl.formatMessage({ id: 'orgEdit.hint' })}</p>
+            )}
+            {canPropose && tableRows.length > 0 && (
+              <div className="mt-5">
+                <OrgPendingTable rows={tableRows} labelOf={labelOf} currentUserId={user?.id} />
+              </div>
+            )}
+          </>
         ) : null}
       </div>
     </div>

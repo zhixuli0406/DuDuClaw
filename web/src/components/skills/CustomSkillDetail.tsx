@@ -7,6 +7,7 @@ import {
   Archive,
   Save,
   Loader2,
+  RefreshCw,
   ShieldAlert,
   Clock,
   CheckCircle2,
@@ -40,13 +41,20 @@ import {
   updateCustomSkill,
   submitCustomSkill,
   retireCustomSkill,
+  generateCustomSkill,
   type CustomSkillRecord,
   type TimeSavedUnit,
 } from '@/lib/api-custom-skills';
 import { statusMeta, statusToneBadge, formatTimeSaved } from './status-meta';
+import {
+  isPollableStatus,
+  isGenerationSlow,
+  generationErrorMessageId,
+  isInProgressError,
+} from './wizard-machine';
+import { useBackoffPoll } from './use-backoff-poll';
 
 const TIME_UNITS: TimeSavedUnit[] = ['minutes_per_use', 'hours_per_month'];
-const POLL_MS = 4000;
 
 function splitTags(tags: string): string[] {
   return tags.split(',').map((s) => s.trim()).filter(Boolean);
@@ -100,7 +108,11 @@ function SectionTitle({ children }: { children: ReactNode }) {
  */
 export function CustomSkillDetail({ id }: { id: string }) {
   const intl = useIntl();
-  const t = (msgId: string) => intl.formatMessage({ id: msgId });
+  // Stable accessor: a fresh `t` per render would re-trigger every effect that
+  // lists it (RM-088). The ref keeps it current across locale changes.
+  const intlRef = useRef(intl);
+  intlRef.current = intl;
+  const t = useCallback((msgId: string) => intlRef.current.formatMessage({ id: msgId }), []);
   const navigate = useNavigate();
 
   const [record, setRecord] = useState<CustomSkillRecord | null>(null);
@@ -117,6 +129,7 @@ export function CustomSkillDetail({ id }: { id: string }) {
   const [saving, setSaving] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [retiring, setRetiring] = useState(false);
+  const [regenerating, setRegenerating] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
   const prevStatusRef = useRef<string | null>(null);
@@ -129,11 +142,22 @@ export function CustomSkillDetail({ id }: { id: string }) {
     setTags(splitTags(rec.tags));
   }, []);
 
+  const idRef = useRef(id);
+  idRef.current = id;
+
+  /**
+   * Fetch the record. `hydrate` (first load / id change only) also fills the
+   * editable form; every other call only refreshes the status-bearing record, so
+   * a poll can never wipe what the user is typing. `quiet` suppresses the error
+   * toast (background polls).
+   */
   const load = useCallback(
-    async (opts?: { hydrate?: boolean }) => {
+    async (opts?: { hydrate?: boolean; quiet?: boolean }) => {
+      const reqId = id;
       try {
         const res = await listCustomSkills();
-        const found = res.custom_skills.find((s) => s.id === id) ?? null;
+        if (idRef.current !== reqId) return; // navigated away mid-request
+        const found = res.custom_skills.find((s) => s.id === reqId) ?? null;
         if (!found) {
           setNotFound(true);
           setRecord(null);
@@ -145,31 +169,66 @@ export function CustomSkillDetail({ id }: { id: string }) {
           toast.success(t('skills.custom.celebrate'));
         }
         prevStatusRef.current = found.status;
-        setRecord(found);
+        // Keep the previous object when nothing observable changed (no re-render).
+        setRecord((prev) =>
+          prev &&
+          prev.id === found.id &&
+          prev.status === found.status &&
+          prev.updated_at === found.updated_at &&
+          (prev.generation_error ?? null) === (found.generation_error ?? null) &&
+          (prev.can_regenerate ?? null) === (found.can_regenerate ?? null)
+            ? prev
+            : found,
+        );
         setNotFound(false);
         if (opts?.hydrate) hydrateForm(found);
       } catch (e) {
         console.warn('[api]', e);
-        toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
-      } finally {
-        setLoading(false);
+        if (!opts?.quiet) {
+          toast.error(intlRef.current.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+        }
       }
     },
-    [id, intl, t, hydrateForm],
+    [id, t, hydrateForm],
   );
 
+  // First load / id change: full-page loader + form hydration, once.
   useEffect(() => {
+    let cancelled = false;
+    prevStatusRef.current = null;
     setLoading(true);
-    load({ hydrate: true });
+    void load({ hydrate: true }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // `load` is stable per id (t / hydrateForm are stable).
   }, [load]);
 
-  // Poll while pending/generating so an approval reflects (and celebrates) live.
-  useEffect(() => {
-    const status = record?.status;
-    if (status !== 'pending_approval' && status !== 'generating') return;
-    const timer = setInterval(() => load(), POLL_MS);
-    return () => clearInterval(timer);
-  }, [record?.status, load]);
+  // Poll (backoff, paused while the tab is hidden) only while an operation is in flight.
+  useBackoffPoll(isPollableStatus(record?.status), () => load({ quiet: true }), record?.status);
+
+  const handleRegenerate = useCallback(async () => {
+    if (!record || regenerating) return;
+    setRegenerating(true);
+    try {
+      await generateCustomSkill({ id: record.id });
+      await load();
+    } catch (e) {
+      const message = isInProgressError(e)
+        ? intlRef.current.formatMessage({ id: generationErrorMessageId('in_progress') })
+        : formatError(e);
+      toast.error(intlRef.current.formatMessage({ id: 'toast.error.actionFailed' }, { message }));
+      void load({ quiet: true });
+    } finally {
+      setRegenerating(false);
+    }
+  }, [record, regenerating, load]);
+
+  const generationFailed = record?.status === 'draft' && !!record.generation_error;
+  // Server-decided (stale window + clock live on the backend), not the browser clock.
+  const generationSlow = isGenerationSlow(record?.status, record?.can_regenerate);
 
   const editable = record?.status === 'draft' || record?.status === 'rejected';
   const canSubmit = editable;
@@ -311,9 +370,35 @@ export function CustomSkillDetail({ id }: { id: string }) {
 
         {/* Generating */}
         {record.status === 'generating' && (
-          <div className="flex items-center gap-3 rounded-xl bg-info/10 p-4 text-sm text-info">
-            <Loader2 className="size-4 shrink-0 animate-spin" />
-            {t('skills.custom.generatingHint')}
+          <div className="space-y-2 rounded-xl bg-info/10 p-4 text-sm text-info">
+            <div className="flex items-center gap-3">
+              <Loader2 className="size-4 shrink-0 animate-spin" />
+              {t('skills.custom.generatingHint')}
+            </div>
+            {generationSlow && (
+              <div className="flex flex-wrap items-center gap-3 text-xs">
+                <span>{t('skills.custom.generationSlow')}</span>
+                <Button variant="outline" size="sm" onClick={handleRegenerate} disabled={regenerating}>
+                  {regenerating ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                  {t('skills.custom.generationRetry')}
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Generation failed (draft + reason) */}
+        {generationFailed && (
+          <div className="flex items-start gap-2 rounded-xl bg-destructive/10 p-4 text-sm text-destructive">
+            <XCircle className="mt-0.5 size-4 shrink-0" />
+            <div className="min-w-0 flex-1 space-y-2">
+              <p className="font-medium">{t('skills.custom.generationFailedTitle')}</p>
+              <p className="break-words text-xs">{t(generationErrorMessageId(record.generation_error))}</p>
+              <Button variant="outline" size="sm" onClick={handleRegenerate} disabled={regenerating}>
+                {regenerating ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                {t('skills.custom.generationRetry')}
+              </Button>
+            </div>
           </div>
         )}
 

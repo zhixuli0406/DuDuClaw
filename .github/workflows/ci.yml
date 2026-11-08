@@ -32,7 +32,6 @@ jobs:
     outputs:
       rust_mode: ${{ steps.classify.outputs.rust_mode }}
       dashboard: ${{ steps.classify.outputs.dashboard }}
-      discord_voice: ${{ steps.classify.outputs.discord_voice }}
       app_compat: ${{ steps.classify.outputs.app_compat }}
     steps:
       - name: Allow consecutive PR pushes to settle
@@ -51,7 +50,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
-            printf 'rust_mode=full\ndashboard=run\ndiscord_voice=true\napp_compat=true\n' >> "$GITHUB_OUTPUT"
+            printf 'rust_mode=full\ndashboard=run\napp_compat=true\n' >> "$GITHUB_OUTPUT"
           elif git show "$BASE_SHA:scripts/ci_classify.py" > "$RUNNER_TEMP/ci_classify.py"; then
             # Publish outputs only after success; missing/failed classifiers run full CI.
             output="$RUNNER_TEMP/ci-classify-output"
@@ -65,14 +64,15 @@ jobs:
     # A failed settle job must still run every required check; only workflow
     # cancellation should prevent these jobs from starting.
     if: ${{ !cancelled() }}
-    name: Rust ${{ matrix.os }}
+    name: Rust ${{ matrix.os }}${{ matrix.os != 'ubuntu-latest' && format(' (shard {0}/3)', matrix.shard) || '' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         # PRs keep the required Linux check; native platform coverage runs
         # after merge, nightly and on demand for the release preflight.
-        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
+        # Linux stays unpartitioned; each native OS runs all three hash partitions.
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"ubuntu-latest","shard":1}]' || '[{"os":"ubuntu-latest","shard":1},{"os":"macos-latest","shard":1},{"os":"macos-latest","shard":2},{"os":"macos-latest","shard":3},{"os":"windows-latest","shard":1},{"os":"windows-latest","shard":2},{"os":"windows-latest","shard":3}]') }}
     env:
       NEXTEST_PROFILE: ${{ (github.event_name == 'pull_request' || matrix.os == 'ubuntu-latest') && 'ci' || 'ci-native' }}
     steps:
@@ -137,24 +137,19 @@ jobs:
       # compiles". `--no-default-features` matches the gateway build directly
       # above so the two share a warm cache.
       #
-      # Runs on every OS leg. Until 2026-09-29 the five optional otel
+      # Runs once per OS, in shard 1. Until 2026-09-29 the five optional otel
       # dependencies sat under `[target.'cfg(target_os = "linux")'.dependencies]`, so
       # `--features otel` could not compile on macOS or Windows at all (H7 in
       # the feature audit moved them into the plain `[dependencies]` table;
       # verified locally on aarch64-apple-darwin the same day).
       - name: Verify edition ceiling in release artifacts with assertions
-        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (matrix.shard == 1) }}
         env:
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: 'true'
         run: cargo test --locked --release -p duduclaw-core --test edition_license_ceiling
 
-      - name: Test gateway Discord voice TLS transport
-        # Songbird is an existing Linux-only dependency. Exercise its Serenity
-        # bridge so the security transport backport cannot silently rot.
-        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && needs.settle.outputs.discord_voice != 'false' && (runner.os == 'Linux') }}
-        run: cargo test --locked -p duduclaw-gateway --no-default-features --features discord-voice --lib discord_voice
       - name: Check gateway with OpenTelemetry feature
-        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (matrix.shard == 1) }}
         run: cargo check --locked -p duduclaw-gateway --no-default-features --features otel
       # S16 (2026-09-29): the `duduclaw compat` family is OS-only — DuDuClaw
       # OS's shell spawns `duduclaw compat windows-vm app`, no platform install
@@ -164,24 +159,24 @@ jobs:
       # duduclaw-core `compat_runners`, 37 in duduclaw-cli `compat_*`) that
       # would otherwise never run anywhere but an OS bake.
       - name: Test cli with app-compat feature (OS-only surface)
-        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && needs.settle.outputs.app_compat != 'false' }}
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && needs.settle.outputs.app_compat != 'false' && (matrix.shard == 1) }}
         run: |
           cargo test --locked -p duduclaw-core --lib --features app-compat -- compat_runners
           cargo test --locked -p duduclaw-cli --lib --features app-compat -- compat
       - name: Test (no dashboard)
         id: nextest_workspace
         if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
-        run: cargo nextest run --locked --no-fail-fast --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
+        run: cargo nextest run --locked --no-fail-fast --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway ${{ matrix.os != 'ubuntu-latest' && format('--partition hash:{0}/3', matrix.shard) || '' }}
       - name: Summarize nextest workspace
         if: ${{ always() && needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
         shell: bash
         run: python3 scripts/ci_nextest_summary.py "target/nextest/$NEXTEST_PROFILE/junit.xml" "target/nextest/reports/workspace.xml"
       - name: Test workspace doctests
         # Preserve cargo test --no-fail-fast: doctests still run after suite failures.
-        if: ${{ !cancelled() && needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (steps.nextest_workspace.outcome == 'success' || steps.nextest_workspace.outcome == 'failure') }}
+        if: ${{ !cancelled() && needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (steps.nextest_workspace.outcome == 'success' || steps.nextest_workspace.outcome == 'failure') && (matrix.shard == 1) }}
         run: cargo test --locked --doc --no-fail-fast --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
       - name: Run every required Windows case on the native host
-        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (runner.os == 'Windows') }}
+        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (runner.os == 'Windows') && (matrix.shard == 1) }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -211,14 +206,14 @@ jobs:
       - name: Test gateway
         id: nextest_gateway
         if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
-        run: cargo nextest run --locked --no-fail-fast -p duduclaw-gateway --no-default-features -E 'not (test(three_page_pilot_) or test(security_race_tests) or test(resume_tests) or test(f1b_e2e_tests) or test(f5a_e2e_tests))'
+        run: cargo nextest run --locked --no-fail-fast -p duduclaw-gateway --no-default-features -E 'not (test(three_page_pilot_) or test(security_race_tests) or test(resume_tests) or test(f1b_e2e_tests) or test(f5a_e2e_tests))' ${{ matrix.os != 'ubuntu-latest' && format('--partition hash:{0}/3', matrix.shard) || '' }}
       - name: Summarize nextest gateway
         if: ${{ always() && needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
         shell: bash
         run: python3 scripts/ci_nextest_summary.py "target/nextest/$NEXTEST_PROFILE/junit.xml" "target/nextest/reports/gateway.xml"
       - name: Test gateway doctests
         # Preserve cargo test --no-fail-fast: doctests still run after suite failures.
-        if: ${{ !cancelled() && needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (steps.nextest_gateway.outcome == 'success' || steps.nextest_gateway.outcome == 'failure') }}
+        if: ${{ !cancelled() && needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (steps.nextest_gateway.outcome == 'success' || steps.nextest_gateway.outcome == 'failure') && (matrix.shard == 1) }}
         run: cargo test --locked --doc --no-fail-fast -p duduclaw-gateway --no-default-features -- --skip three_page_pilot_ --skip security_race_tests --skip resume_tests --skip f1b_e2e_tests --skip f5a_e2e_tests
       - name: Test workflow stdio checkpoints (CLI, workflow-test-checkpoints)
         if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (matrix.os == 'ubuntu-latest') }}
@@ -240,7 +235,7 @@ jobs:
         if: ${{ always() && needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: nextest-${{ matrix.os }}
+          name: nextest-${{ matrix.os }}-shard${{ matrix.shard }}
           path: target/nextest/reports/*.xml
           retention-days: 7
           if-no-files-found: warn

@@ -443,30 +443,44 @@ pub(crate) async fn handle_tasks_create(
             }
             crate::mcp_alias::ScheduleSpec::Once(at) => {
                 // The one-shot rail needs somewhere to deliver the result —
-                // it runs detached, long after this call returned, so there is
-                // no ambient conversation to answer into. Say so instead of
-                // creating a reminder that can never be delivered.
-                if args
-                    .get("notify_channel")
-                    .and_then(|v| v.as_str())
-                    .is_none()
-                    || args
-                        .get("notify_chat_id")
-                        .and_then(|v| v.as_str())
-                        .is_none()
-                {
+                // it runs detached, long after this call returned. RM-124: in
+                // a WebChat turn with no target named, that is the origin
+                // conversation (gateway-attested, bound to the acting
+                // employee); a model-supplied `webchat` target is refused.
+                let scheduled_target = if assigned_to == "default" {
+                    resolve_main_agent_name(home_dir).await
+                } else {
+                    assigned_to.clone()
+                };
+                let origin_env = std::env::var(duduclaw_core::ENV_ORIGIN_SESSION).ok();
+                let target = match resolve_notify_target(
+                    args, home_dir, actor.agent(), &scheduled_target, origin_env.as_deref(),
+                ) {
+                    Ok(target) => target,
+                    Err(message) => return tool_error(&message),
+                };
+                if target.delivery() == Delivery::Nowhere {
                     return tool_error(
                         "a one-shot schedule (RFC3339 instant) also needs notify_channel and \
-                         notify_chat_id — the wake-up runs detached and has nowhere to reply",
+                         notify_chat_id — the wake-up runs detached and has nowhere to reply. \
+                         一次性排程需要通知管道（notify_channel 與 notify_chat_id），否則結果無處可送；\
+                         在 WebChat 對話中建立時會自動回到該對話。",
                     );
                 }
+                // The origin conversation is never passed as an argument: the
+                // reminder rail re-derives it from the same attested env and
+                // refuses a supplied `webchat` target.
+                let (channel, chat) = match target.delivery() {
+                    Delivery::OriginWebchat => (None, None),
+                    _ => (target.channel, target.chat),
+                };
                 let synth = serde_json::json!({
                     "time": at,
                     "mode": "agent_callback",
                     "prompt": prompt,
                     "agent_id": assigned_to,
-                    "channel": args.get("notify_channel"),
-                    "chat_id": args.get("notify_chat_id"),
+                    "channel": channel,
+                    "chat_id": chat,
                 });
                 handle_create_reminder(&synth, home_dir, actor).await
             }

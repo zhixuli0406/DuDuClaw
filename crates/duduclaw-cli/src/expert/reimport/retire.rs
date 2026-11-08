@@ -203,10 +203,20 @@ fn move_path(from: &Path, to: &Path) -> std::io::Result<()> {
 /// employees that the new version did not bring back (their directories
 /// are in the trash; a dangling record would otherwise linger).
 pub fn finish(home: &Path, log: &RetireLog, new_agents: &[String]) {
-    for id in &log.agents {
-        if !new_agents.contains(id)
-            && let Err(e) = org_store::remove(home, id)
-        {
+    let stale: Vec<&String> = log.agents.iter().filter(|id| !new_agents.contains(id)).collect();
+    if stale.is_empty() {
+        return;
+    }
+    // Every authority write holds the global org lock (RM-027 round 3).
+    let org = match org_store::lock_org_mutations(home) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("  ⚠ 組織資料寫入鎖無法取得，舊員工的組織資料沒有移除：{e}");
+            return;
+        }
+    };
+    for id in stale {
+        if let Err(e) = org_store::remove(&org, id) {
             eprintln!("  ⚠ 組織資料移除失敗（{id}）：{e}");
         }
     }

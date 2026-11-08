@@ -13,6 +13,7 @@ use crate::isolation_connector_boot::ConnectorProviderFactory;
 use crate::isolation_connector_stack::EmployeeConnectorProviders;
 use crate::isolation_lifecycle::{self as lifecycle, EmployeeLifecycle, RootAllocation, RootAllocator};
 use super::authority::{lifecycle_refusal, personal_facts};
+use super::selectors::{self, SelectorInput, SelectorSources};
 
 /// CLI supplies its adapter before start_gateway. The gateway owns every input;
 /// the adapter must authenticate its original dispatcher and check completeness.
@@ -60,6 +61,11 @@ pub struct BootSources {
     pub connector_catalog: Option<Arc<ConnectorCatalog>>,
     pub connectors: Option<Arc<dyn BoundConnectorExecutor>>,
     pub connector_selection: Option<Arc<dyn LiveConnectorSelectionPolicy>>,
+    /// H9/H10: root work broker (H5 `SpawndWorkspaceBridge` over spawnd
+    /// `OpenWorkFile`) for the brokered `employee-work` root. Optional: without
+    /// it the issuer never selects a Workspace grant, so the file tools stay
+    /// hidden and refused (fail closed); it is not a boot-completeness producer.
+    pub work_broker: Option<Arc<dyn duduclaw_mcp_boundary::resources::WorkBroker>>,
     /// F1: per-employee connector stack over `connector_catalog`. When boot
     /// creates it, `connectors`/`connector_selection` are this same object
     /// (inventory only) and each launch gets an employee-bound handle.
@@ -356,6 +362,8 @@ struct BootOwner {
     /// F1: when present, each launch selects/executes through an
     /// employee-bound handle of this stack instead of the singletons above.
     connector_stack: Option<Arc<EmployeeConnectorProviders>>,
+    /// H9 selector producers, read by the issuer on every authorization.
+    selectors: SelectorSources,
 }
 
 /// D proves its live owner and the binary's actual complete routing inventory.
@@ -392,10 +400,13 @@ impl crate::isolation_readiness::IntegrationProbe for BoundaryReadiness {
 }
 
 /// Authenticated ingress and approved background records share this issuer.
-/// The wrapper owns live store reads; construction below never invents IO selectors.
+/// The wrapper owns live store reads. Additional IO grants come only from the
+/// H9 selectors (`selectors.rs`), which read their inputs at issuance from the
+/// authoritative stores; `task` is the host-pinned record task of a
+/// task/schedule run (`None` for interactive ingress), never a tool argument.
 pub(crate) fn record_authorization(home: PathBuf, agent: String, user: String, epoch: u64,
-    lane: duduclaw_isolation::capability::Lane, turn: super::HostTurn, credential_expiry: Option<u64>)
-    -> Result<super::RuntimeAuthorization, VerificationError> {
+    lane: duduclaw_isolation::capability::Lane, turn: super::HostTurn, credential_expiry: Option<u64>,
+    task: Option<String>) -> Result<super::RuntimeAuthorization, VerificationError> {
     let owner = OWNER.get().ok_or(VerificationError::Unavailable)?;
     if owner.home != home || !owner.boundary.healthy() { return Err(VerificationError::Unavailable); }
     let authority = owner.product_authority.as_ref().ok_or(VerificationError::Unavailable)?;
@@ -410,7 +421,8 @@ pub(crate) fn record_authorization(home: PathBuf, agent: String, user: String, e
     // Keep the lifecycle pinned before the policy/catalog I/O; never repin to
     // a replacement employee in the constructor.
     let authorization = human_authorization_with(home.clone(), agent.clone(), lifecycle.employee,
-        user.clone(), epoch, lane, &current, tools, turn, credential_expiry, &lifecycle, &RootAllocator)?;
+        user.clone(), epoch, lane, &current, tools, turn, credential_expiry, &lifecycle, &RootAllocator,
+        &owner.selectors, task.as_deref())?;
     if crate::approval::strict_policy_revision(&home, &agent).ok().as_deref() != Some(policy.as_str()) {
         return Err(VerificationError::Revoked);
     }
@@ -477,14 +489,16 @@ pub fn human_authorization(home: PathBuf, agent: String, employee: EmployeeId,
     -> Result<super::RuntimeAuthorization, VerificationError> {
     let lifecycle = lifecycle::read_lifecycle(&home, &agent).map_err(lifecycle_refusal)?;
     human_authorization_with(home, agent, employee, user, epoch, lane, current, tools, turn,
-        credential_expiry, &lifecycle, &RootAllocator)
+        credential_expiry, &lifecycle, &RootAllocator, &SelectorSources::default(), None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
     user: String, epoch: u64, lane: duduclaw_isolation::capability::Lane,
     current: &duduclaw_auth::IsolationAuthoritySnapshot,
     tools: duduclaw_isolation::bounded::List<duduclaw_isolation::bounded::Text<128>, 256>,
-    turn: super::HostTurn, credential_expiry: Option<u64>, lifecycle: &EmployeeLifecycle, root: &dyn RootAllocation)
+    turn: super::HostTurn, credential_expiry: Option<u64>, lifecycle: &EmployeeLifecycle, root: &dyn RootAllocation,
+    sources: &SelectorSources, task: Option<&str>)
     -> Result<super::RuntimeAuthorization, VerificationError> {
     use duduclaw_isolation::{bounded::{List, Text}, capability::ResourceGrant};
     if lifecycle.employee != employee || lifecycle.label != agent { return Err(VerificationError::Revoked); }
@@ -495,6 +509,15 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
     }
     let principal = issuance_principal(&user, current)?;
     issuance_facts(&agent, lifecycle, &principal, current, turn.background.is_some())?;
+    // H10: the H9 selectors run after the identity/binding gates and before the
+    // lifecycle/users.db rechecks below, so those rechecks cover their I/O. A
+    // failed read may be a tombstone moving `agents/<label>` away: the durable
+    // lifecycle decides first (as for the wiki walk below).
+    let record = turn.background.is_some();
+    let select = || selectors::select(sources, &SelectorInput { home: &home, agent: &agent, user: &user,
+        tools: &tools, task, record })
+        .map_err(|error| lifecycle::recheck_with(&home, lifecycle, root).err().map_or(error, lifecycle_refusal));
+    let selection = select()?;
     let text = |value| Text::new(value).map_err(|_| VerificationError::Invalid);
     let namespace = format!("agent:{agent}");
     let confined = |resource| ResourceGrant::Confined { resource: Box::new(resource) };
@@ -518,6 +541,9 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
         roots.insert_wiki(namespace.clone(), employee, wiki)?;
         resources.push(confined(ResourceGrant::Wiki { namespace: text(namespace)? }));
     }
+    // Workspace{employee-work} + brokered root, PublicOrigins, NewTask: plain
+    // grants in the signed resource set, so the capability MAC covers them.
+    selection.apply(sources, employee, &mut resources, &mut roots)?;
     let now = duduclaw_mcp_boundary::authority::now_seconds()?;
     let expires_at = now.checked_add(30 * 60).ok_or(VerificationError::InvalidTime)?
         .min(credential_expiry.unwrap_or(u64::MAX));
@@ -533,11 +559,21 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
     let after = duduclaw_auth::read_isolation_authority(&mut users, Some(&user), &agent)
         .map_err(|_| VerificationError::Revoked)?;
     recheck_issuance_facts(&agent, lifecycle, &principal, epoch, current, &after, turn.background.is_some())?;
-    Ok(super::RuntimeAuthorization { home, agent, grant: GrantPolicy {
+    // H10: re-read every selector input after all issuance I/O; a profile,
+    // public-web switch or task ownership that changed meanwhile refuses the run.
+    if select()? != selection { return Err(VerificationError::Revoked); }
+    let mut authorization = super::RuntimeAuthorization { home, agent, grant: GrantPolicy {
         task: None, principal, binding: lifecycle.binding.clone(), lane, tools,
         resources: List::new(resources).map_err(|_| VerificationError::Invalid)?,
         policy_revision: current.policy_epoch, not_before: now, expires_at }, roots: Arc::new(roots),
-        origin: WaitOrigin::Gateway, caller: None, turn: Some(turn), authenticated_epoch: Some(epoch) })
+        origin: WaitOrigin::Gateway, caller: None, turn: Some(turn), authenticated_epoch: Some(epoch) };
+    // Task/schedule runs are task-limited (no EmployeeScope, PublicOrigins or
+    // NewTask) with the record Task grant (H8); `select` has already refused a
+    // task the employee no longer owns.
+    if let Some(task) = &selection.task {
+        authorization.limit_to_task(task.id.clone())?;
+    }
+    Ok(authorization)
 }
 
 pub(crate) fn delegation_source(home: &Path, sender: &str, context: &duduclaw_mcp_boundary::RequestContext)
@@ -586,6 +622,7 @@ fn assemble(home: &Path, backend: Arc<duduclaw_execution::SpawndBackend>, mut so
         execution_plans: sources.execution_plans.take().ok_or(VerificationError::Unavailable)?,
         worker_plans: sources.worker_plans.take().ok_or(VerificationError::Unavailable)?,
         turns: sources.turns.take().ok_or(VerificationError::Unavailable)?,
+        selectors: SelectorSources { work_broker: sources.work_broker.take() },
         catalog: sources.connector_catalog, connectors: sources.connectors,
         connector_selection: sources.connector_selection, connector_stack: sources.connector_stack })
 }
@@ -701,6 +738,10 @@ mod authorization_tests;
 #[cfg(test)]
 #[path = "boot_personal_tests.rs"]
 mod boot_personal_tests;
+
+#[cfg(test)]
+#[path = "selectors_tests.rs"]
+mod selectors_tests;
 
 #[cfg(test)]
 mod tests {

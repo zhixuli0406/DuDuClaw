@@ -64,6 +64,9 @@ pub fn notify_level(source: DecisionSource) -> NotifyLevel {
             NotifyLevel::Act
         }
         DecisionSource::Kickoff | DecisionSource::Autopilot => NotifyLevel::Confirm,
+        // RM-155: someone has to walk to the Mac — worth knowing, not worth
+        // waking anyone for. Deferred through quiet hours.
+        DecisionSource::FolderAccess => NotifyLevel::Confirm,
         // A digest is a report: nothing waits on it.
         DecisionSource::Digest => NotifyLevel::Fyi,
     }
@@ -81,6 +84,7 @@ pub fn notify_type(source: DecisionSource) -> &'static str {
         DecisionSource::Install => "decision.install",
         DecisionSource::Autopilot => "decision.autopilot",
         DecisionSource::Digest => "digest.feedback",
+        DecisionSource::FolderAccess => "system.macos_folder_access",
     }
 }
 
@@ -673,6 +677,8 @@ async fn dispatch_inner(
             )
             .await
         }
+        // Unreachable in practice: `parse` refuses every act for this source.
+        DecisionSource::FolderAccess => Err("這則通知沒有可以按的決定。".to_string()),
     }
 }
 
@@ -716,6 +722,7 @@ pub fn reason_prefix(source: DecisionSource) -> &'static str {
         DecisionSource::Install => "📦 安裝申請",
         DecisionSource::Autopilot => "🔁 自動規則已暫停",
         DecisionSource::Digest => "📬 你不在的時候",
+        DecisionSource::FolderAccess => "🔒 macOS 資料夾權限",
     }
 }
 

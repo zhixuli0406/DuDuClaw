@@ -6,6 +6,7 @@ import type { AgentDetail, OrgChartAgent } from '@/lib/api';
 import { characterFor } from '@/lib/character-gen';
 import { glyphText } from '@/lib/agent-glyph';
 import { useEffectiveName } from '@/lib/product-identity';
+import { pickDropTarget, type NodeRect } from '@/lib/org-change';
 import {
   MARK_ACCENT_PATH,
   MARK_INK_BODY_PATH,
@@ -33,6 +34,10 @@ interface OrgChartLabels {
   specialist?: string;
   worker?: string;
   zoom?: string;
+  /** RM-027 — badge on a node whose org change waits for an Admin. */
+  pending?: string;
+  /** RM-027 — hint shown while dragging over a valid manager. */
+  dropHint?: (managerName: string) => string;
 }
 
 type ChartAgent = OrgChartAgent & { model?: AgentDetail['model'] };
@@ -41,6 +46,12 @@ interface OrgChartProps {
   agents: ReadonlyArray<ChartAgent>;
   onNodeClick?: (agentName: string) => void;
   labels?: OrgChartLabels;
+  /** RM-027 — agents (by name) with an org change waiting for approval. */
+  pendingNames?: ReadonlySet<string>;
+  /** RM-027 — the agent whose right panel is open. */
+  selectedName?: string;
+  /** RM-027 — enables dragging a node onto a new manager. */
+  onReparent?: (agentName: string, managerName: string) => void;
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -148,8 +159,11 @@ const NODE_RX = 10;
 
 // ── Component ─────────────────────────────────────────────────
 
-export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
+export function OrgChart({ agents, onNodeClick, labels, pendingNames, selectedName, onReparent }: OrgChartProps) {
   const svgRef = useRef<SVGSVGElement>(null);
+  // `labels` is usually an inline object; read the latest without re-rendering the SVG for it.
+  const labelsRef = useRef(labels);
+  labelsRef.current = labels;
   const containerRef = useRef<HTMLDivElement>(null);
   // Use the effective product identity for the synthetic root.
   const brandName = useEffectiveName();
@@ -169,7 +183,7 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
     const svg = d3.select(svgRef.current);
     svg.selectAll('*').remove();
 
-    const root = d3.hierarchy(buildTree(agents, brandName));
+    const hierarchyRoot = d3.hierarchy(buildTree(agents, brandName));
     const containerWidth = containerRef.current.clientWidth;
     const containerHeight = containerRef.current.clientHeight;
 
@@ -179,7 +193,9 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
       .nodeSize([NODE_W + 24, NODE_H + 40])
       .separation((a, b) => (a.parent === b.parent ? 1 : 1.1));
 
-    treeLayout(root);
+    // The layout returns the same tree typed as HierarchyPointNode (x/y set),
+    // so selections and the drag behaviour share one datum type.
+    const root: d3.HierarchyPointNode<OrgNode> = treeLayout(hierarchyRoot);
 
     // Calculate bounds
     let minX = Infinity,
@@ -270,6 +286,7 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
     // Card background
     nodeGroups
       .append('rect')
+      .attr('class', 'org-card')
       .attr('width', NODE_W)
       .attr('height', NODE_H)
       .attr('rx', NODE_RX)
@@ -400,7 +417,97 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
       .attr('cy', 16)
       .attr('r', 4)
       .attr('fill', (d) => statusColors[d.data.status]?.stroke ?? '#a8a29e');
-  }, [agents, onNodeClick, brandName, brand, dark]);
+
+    // ── RM-027: 待核准 badge ──────────────────────────────────
+    if (pendingNames && pendingNames.size > 0) {
+      const waiting = nodeGroups.filter((d) => pendingNames.has(d.data.name));
+      const pendingLabel = labelsRef.current?.pending ?? 'Pending';
+      waiting.select('rect.org-card').attr('stroke', '#e0a54f');
+      waiting.attr('aria-label', (d) => `${d.data.displayName}, ${pendingLabel}`);
+      const badge = waiting.append('g').attr('class', 'org-pending-badge');
+      badge
+        .append('rect')
+        .attr('x', NODE_W - 60)
+        .attr('y', -9)
+        .attr('width', 60)
+        .attr('height', 18)
+        .attr('rx', 9)
+        .attr('fill', '#fbf1df')
+        .attr('stroke', '#e0a54f');
+      badge
+        .append('text')
+        .attr('x', NODE_W - 30)
+        .attr('y', 4)
+        .attr('text-anchor', 'middle')
+        .attr('font-size', '11px')
+        .attr('font-weight', '500')
+        .attr('fill', '#6b4a12')
+        .text(pendingLabel);
+    }
+
+    // ── RM-027: drag a node onto its new manager ──────────────
+    if (onReparent) {
+      const real = root.descendants().filter((d) => d.data.name !== '__root__');
+      const rects: NodeRect[] = real.map((d) => ({
+        name: d.data.name,
+        x: d.x! - NODE_W / 2,
+        y: d.y! - NODE_H / 2,
+        w: NODE_W,
+        h: NODE_H,
+      }));
+      const hint = inner
+        .append('text')
+        .attr('class', 'org-drop-hint')
+        .attr('font-size', '12px')
+        .attr('fill', textColor)
+        .style('pointer-events', 'none')
+        .style('display', 'none');
+      let target: string | null = null;
+      const mark = (name: string | null) => {
+        if (name === target) return;
+        target = name;
+        nodeGroups
+          .select<SVGRectElement>('rect.org-card')
+          .attr('stroke-dasharray', (d) => (d.data.name === name ? '6 4' : null))
+          .attr('stroke', (d) =>
+            d.data.name === name ? '#102b48' : (statusColors[d.data.status]?.stroke ?? '#a8a29e'),
+          )
+          .attr('stroke-width', (d) => (d.data.name === name ? 3 : 2));
+      };
+      const drag = d3
+        .drag<SVGGElement, d3.HierarchyPointNode<OrgNode>>()
+        .on('start', function () {
+          d3.select(this).raise().attr('opacity', 0.7);
+        })
+        .on('drag', function (event: d3.D3DragEvent<SVGGElement, d3.HierarchyPointNode<OrgNode>, d3.HierarchyPointNode<OrgNode>>, d) {
+          d3.select(this).attr('transform', `translate(${event.x - NODE_W / 2},${event.y - NODE_H / 2})`);
+          const [px, py] = d3.pointer(event.sourceEvent as MouseEvent, inner.node());
+          const hit = pickDropTarget(rects, { x: px, y: py }, d.data.name, agents);
+          mark(hit);
+          const hitRect = hit ? rects.find((r) => r.name === hit) : undefined;
+          const hitAgent = hit ? real.find((n) => n.data.name === hit) : undefined;
+          if (hitRect && hitAgent) {
+            hint
+              .style('display', null)
+              .attr('x', hitRect.x)
+              .attr('y', hitRect.y + NODE_H + 16)
+              .text(labelsRef.current?.dropHint?.(hitAgent.data.displayName) ?? hitAgent.data.displayName);
+          } else {
+            hint.style('display', 'none');
+          }
+        })
+        .on('end', function (_event, d) {
+          const dropped = target;
+          mark(null);
+          hint.style('display', 'none');
+          d3.select(this)
+            .attr('opacity', null)
+            .attr('transform', `translate(${d.x! - NODE_W / 2},${d.y! - NODE_H / 2})`);
+          if (dropped) onReparent(d.data.name, dropped);
+        });
+      nodeGroups.filter((d) => d.data.name !== '__root__').call(drag);
+    }
+  }, [agents, onNodeClick, onReparent, pendingNames, brandName, brand, dark]);
 
   // Render on mount and when agents change
   useEffect(() => {
@@ -411,6 +518,15 @@ export function OrgChart({ agents, onNodeClick, labels }: OrgChartProps) {
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, [render]);
+
+  // Thicker frame on the selected node — restyled in place so selecting a node
+  // does not rebuild the SVG and reset the user's pan/zoom.
+  useEffect(() => {
+    if (!svgRef.current) return;
+    d3.select(svgRef.current)
+      .selectAll<SVGRectElement, d3.HierarchyPointNode<OrgNode>>('g.node rect.org-card')
+      .attr('stroke-width', (d) => (selectedName && d.data.name === selectedName ? 3 : 2));
+  }, [selectedName, render]);
 
   // Re-render when theme changes
   useEffect(() => {

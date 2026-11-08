@@ -9,14 +9,18 @@ pub(crate) fn jsonrpc_response(id: &Value, result: Value) -> Value {
 }
 
 pub(crate) fn jsonrpc_error(id: &Value, code: i64, message: &str) -> Value {
-    serde_json::json!({
+    let mut frame = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": {
             "code": code,
             "message": message
         }
-    })
+    });
+    // RM-130: never an empty message. No `data` is added, so the egress
+    // gate's payload accounting for this frame is unchanged.
+    duduclaw_core::ensure_error_reason_with("", None, &mut frame, duduclaw_core::ToolErrorDetail::CodeOnly);
+    frame
 }
 
 // ── Tool schema builder ──────────────────────────────────────
@@ -105,6 +109,15 @@ pub(crate) fn tool_text(text: &str) -> Value {
 }
 
 pub(crate) fn tool_error(msg: &str) -> Value {
+    // RM-130: an empty message would leave the employee guessing. Accounting
+    // is unaffected: the `content` key is present either way.
+    let fallback;
+    let msg = if msg.trim().is_empty() {
+        fallback = duduclaw_core::missing_error_reason("", None, None, None);
+        fallback.as_str()
+    } else {
+        msg
+    };
     serde_json::json!({
         "content": [{ "type": "text", "text": msg }],
         "isError": true

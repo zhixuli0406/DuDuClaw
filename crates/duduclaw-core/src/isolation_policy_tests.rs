@@ -23,15 +23,24 @@ fn isolation_policy_absent_database_is_not_created() {
 fn isolation_policy_org_aba_advances_epoch_and_rejects_broken_epoch_before_write() {
     let (home, db) = fixture();
     let original = crate::org_store::OrgEntry::new("boss", "sales");
-    crate::org_store::upsert(home.path(), "alice", original.clone()).unwrap();
+    {
+        let org = crate::org_store::lock_org_mutations(home.path()).unwrap();
+        crate::org_store::upsert(&org, "alice", original.clone()).unwrap();
+    }
     let first_epoch = epoch(&db);
     let original_bytes = std::fs::read(crate::org_store::org_store_path(home.path())).unwrap();
-    crate::org_store::upsert(home.path(), "alice", crate::org_store::OrgEntry::new("boss", "support")).unwrap();
-    crate::org_store::upsert(home.path(), "alice", original).unwrap();
+    {
+        let org = crate::org_store::lock_org_mutations(home.path()).unwrap();
+        crate::org_store::upsert(&org, "alice", crate::org_store::OrgEntry::new("boss", "support")).unwrap();
+        crate::org_store::upsert(&org, "alice", original).unwrap();
+    }
     assert_eq!(std::fs::read(crate::org_store::org_store_path(home.path())).unwrap(), original_bytes);
     assert_eq!(epoch(&db), first_epoch + 2, "restoring bytes cannot restore run authority");
     db.execute("DELETE FROM auth_meta WHERE key=?1", [POLICY_EPOCH_KEY]).unwrap();
-    assert!(crate::org_store::remove(home.path(), "alice").is_err());
+    {
+        let org = crate::org_store::lock_org_mutations(home.path()).unwrap();
+        assert!(crate::org_store::remove(&org, "alice").is_err());
+    }
     assert_eq!(std::fs::read(crate::org_store::org_store_path(home.path())).unwrap(), original_bytes);
 }
 

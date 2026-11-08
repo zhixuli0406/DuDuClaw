@@ -291,6 +291,13 @@ fn classify_origin_reason(origin: ReplyOrigin, error: &str) -> FailureReason {
     classify_cli_failure(error)
 }
 fn origin_message(agent: &str, origin: ReplyOrigin, reason: FailureReason, home: &Path) -> String {
+    // RM-155: a timeout while macOS folder access is pending/denied is the
+    // consent prompt nobody answered, not a slow model — say so.
+    if reason == FailureReason::Timeout {
+        if let Some(text) = crate::macos_folder_access::channel_timeout_explanation(home, agent, None) {
+            return text;
+        }
+    }
     if origin.is_claude_cli() {
         return format_fallback_message(agent, reason, home);
     }
@@ -415,6 +422,27 @@ mod timeout_tests {
                 assert!(message.contains("員工設定"), "{runtime:?}");
             }
         }
+    }
+
+    /// RM-155: while macOS folder access is pending, a timeout names the
+    /// consent prompt instead of the generic 30-minute text; other failures
+    /// and other homes are untouched.
+    #[test]
+    fn timeout_names_the_pending_macos_prompt() {
+        use crate::macos_folder_access::{AccessState, registry_for};
+        let home = tempfile::tempdir().unwrap();
+        registry_for(home.path()).set_states_for_test(std::collections::BTreeMap::from([(
+            std::path::PathBuf::from("/Volumes/NAS"),
+            AccessState::PendingPrompt,
+        )]));
+        let claude = ReplyOrigin::Runtime(RuntimeType::Claude);
+        let message = origin_message("worker", claude, FailureReason::Timeout, home.path());
+        assert!(message.contains("macOS") && message.contains("允許"), "{message}");
+        assert!(!message.contains("30 分鐘安全上限"));
+        let other = origin_message("worker", claude, FailureReason::EmptyResponse, home.path());
+        assert!(!other.contains("macOS"), "{other}");
+        let elsewhere = origin_message("worker", claude, FailureReason::Timeout, Path::new("/nonexistent"));
+        assert!(elsewhere.contains("30 分鐘安全上限"));
     }
 }
 

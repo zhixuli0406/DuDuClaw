@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type UserDetail, type UserInviteState } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
+import { dashboardBaseUrl } from '@/lib/dashboard-base';
 import { InviteEmailPreview, InviteLinkDialog, InviteStatusChip } from './users/InviteControls';
 import { useAuthStore } from '@/stores/auth-store';
 import { AddMembersPage } from './users/AddMembersPage';
@@ -122,7 +123,7 @@ export function UsersPage() {
     if (!inviteUser || inviting) return;
     setInviting(true);
     try {
-      const result = await api.users.invite(inviteUser.id, window.location.origin);
+      const result = await api.users.invite(inviteUser.id, dashboardBaseUrl());
       toast[result.sent ? 'success' : 'info'](intl.formatMessage({ id: result.sent ? 'users.invite.sent' : 'users.invite.notSent' }));
       setInviteUser(null);
       if (!result.sent && result.link) setInviteLink(result.link);

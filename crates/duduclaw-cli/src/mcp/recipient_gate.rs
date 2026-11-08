@@ -12,6 +12,13 @@ fn channel_target(args: &Value, channel: &str, chat: &str) -> String {
 /// set: the policy must ask rather than silently dropping an unparsed address.
 pub(crate) fn targets(tool: &str, args: &Value) -> Option<Vec<String>> {
     match tool {
+        // RM-124: a reminder with no target names no recipient — the handler
+        // can then only use the gateway-attested WebChat origin (the caller's
+        // own conversation, ownership-checked at fire time) or refuse.
+        "create_reminder"
+            if ["channel", "chat_id"].iter().all(|key| {
+                args.get(key).is_none_or(|v| v.is_null() || v.as_str() == Some(""))
+            }) => None,
         "send_message" | "send_photo" | "send_sticker" | "create_reminder" => {
             Some(vec![channel_target(args, "channel", "chat_id")])
         }
@@ -193,6 +200,11 @@ mod tests {
         assert_eq!(targets("calendar_create_event", &json!({"attendees":"a@example.com, b@example.com"})),
             Some(vec!["mail:a@example.com".into(), "mail:b@example.com".into()]));
         assert_eq!(targets("calendar_create_event", &json!({})), None);
+        // RM-124: an omitted reminder target names no recipient; a webchat
+        // one is never a valid external address (the handler refuses it).
+        assert_eq!(targets("create_reminder", &json!({"time":"5m","prompt":"x"})), None);
+        assert_eq!(targets("create_reminder", &json!({"channel":"webchat","chat_id":"webchat:webchat:x"})),
+            Some(vec![String::new()]));
         assert_eq!(targets("calendar_create_event", &json!({"attendees":42})), Some(vec![String::new()]));
         for tool in ["github_issue_comment", "responsibility_ask", "os_notify", "send_to_agent", "spawn_agent", "team_handoff"] {
             assert_eq!(targets(tool, &json!({"to":"other@example.com"})), None);

@@ -69,6 +69,8 @@ mod stop;
 mod tasks;
 mod team_counts;
 pub(crate) use team_counts::MAX_COUNTED_AGENTS;
+mod status_counts;
+pub use status_counts::{AgentStatusCounts, StatusBucket, StatusTaskRow};
 
 #[cfg(test)]
 mod tests;

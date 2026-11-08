@@ -6,6 +6,18 @@
 
 ---
 
+## macOS 安裝
+
+macOS 建議使用 `install.sh`，讓已簽署的 Gateway App 安裝在固定位置。安裝程式使用 macOS 內建工具，另需 [minisign](https://jedisct1.github.io/minisign/) 核對發行簽章（`brew install minisign`；Debian/Ubuntu 為 `sudo apt install minisign`）。找不到 minisign 時安裝會停止，不會略過驗證：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | bash
+```
+
+安裝程式會下載已簽署及公證的 `.app.zip`，以內建的發行公鑰核對 minisign 簽章與 SHA-256 校驗碼，解壓前先檢查壓縮檔內容，再核對 App 的開發者簽章、識別碼、版本與版別，通過後安裝至 `~/Applications/DuDuClaw Gateway.app`。CLI `~/.duduclaw/bin/duduclaw` 是指向 `DuDuClaw Gateway.app/Contents/MacOS/duduclaw` 的符號連結；請將 `~/.duduclaw/bin` 加入 `PATH`。
+
+可用 `DUDUCLAW_APP_DIR` 指定 App 目錄、`DUDUCLAW_HOME` 指定 CLI 的安裝家目錄。沒有 `.app.zip` 的舊版仍會使用 tarball。npm 仍可使用，macOS 平台套件內也包含 App；macOS 安裝優先建議使用 `install.sh`。
+
 ## 1. 本機開發
 
 ```bash

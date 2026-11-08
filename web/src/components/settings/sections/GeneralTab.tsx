@@ -15,9 +15,10 @@ import {
   SettingsSaveState,
 } from '@/components/mds';
 import { type SelectOption } from '@/components/settings/controls';
-import { RowSelect, RowSwitch } from '@/pages/agent-form/form-rows';
+import { RowSelect, RowSwitch, RowText } from '@/pages/agent-form/form-rows';
 import { SettingRow } from './shared';
 import { changedPayload, parseTomlSubset, tomlStr, type FlatValues } from '@/lib/config-toml';
+import { isValidPublicUrl } from '@/lib/dashboard-base';
 import { useRestartRequiredStore } from '@/stores/restart-required-store';
 
 export function GeneralTab() {
@@ -26,6 +27,10 @@ export function GeneralTab() {
   const startTour = useTourStore((s) => s.start);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [defaultLanguage, setDefaultLanguage] = useState('');
+  // RM-129: `[dashboard] public_url` — the externally reachable dashboard
+  // address (sub-path included) used for OAuth callbacks and return links.
+  const [publicUrl, setPublicUrl] = useState('');
+  const publicUrlValid = isValidPublicUrl(publicUrl);
   // Login/boot autostart — applied immediately via system.autostart.set (it is
   // an OS-level registration, not a config.toml field, so it bypasses Save).
   // null = unsupported platform or status not loaded yet → row hidden.
@@ -53,8 +58,10 @@ export function GeneralTab() {
         // regexes could pick up `level` / `strategy` from another table).
         const tables = parseTomlSubset(raw);
         const language = tomlStr(tables, 'general', 'default_language', '');
+        const publicUrlValue = tomlStr(tables, 'dashboard', 'public_url', '');
         setDefaultLanguage(language);
-        initialRef.current = { default_language: language };
+        setPublicUrl(publicUrlValue);
+        initialRef.current = { default_language: language, 'dashboard.public_url': publicUrlValue };
       }
     }).catch((e) => {
       console.warn("[api]", e);
@@ -92,7 +99,12 @@ export function GeneralTab() {
   const handleSave = async () => {
     const current: FlatValues = {
       default_language: defaultLanguage,
+      ...(isAdmin ? { 'dashboard.public_url': publicUrl.trim() } : {}),
     };
+    if (isAdmin && !publicUrlValid) {
+      toast.error(intl.formatMessage({ id: 'settings.general.publicUrl.invalid' }));
+      return;
+    }
     const payload = changedPayload(initialRef.current, current);
     if (Object.keys(payload).length === 0) {
       toast.info(intl.formatMessage({ id: 'settings.noChanges' }));
@@ -119,7 +131,7 @@ export function GeneralTab() {
 
   // Empty string = "follow the user's input language" (pre-existing
   // behaviour, unchanged). Non-empty pins a global default reply language.
-  const languageOptions: SelectOption[] = ['', 'zh-TW', 'en', 'ja-JP'].map((code) => ({
+  const languageOptions: SelectOption[] = ['', 'zh-TW', 'zh-CN', 'en', 'ja-JP'].map((code) => ({
     value: code,
     label: intl.formatMessage({
       id: code === '' ? 'settings.general.defaultLanguage.followInput' : `settings.general.defaultLanguage.${code}`,
@@ -162,6 +174,26 @@ export function GeneralTab() {
             onChange={setDefaultLanguage}
             options={languageOptions}
           />
+          {/* RM-129: dashboard public URL (admin only; validated again by the gateway) */}
+          {isAdmin && (
+            <RowText
+              label={intl.formatMessage({ id: 'settings.general.publicUrl' })}
+              description={
+                <>
+                  {intl.formatMessage({ id: 'settings.general.publicUrl.help' })}
+                  {!publicUrlValid && (
+                    <span role="alert" className="mt-1 block text-red-600 dark:text-red-400">
+                      {intl.formatMessage({ id: 'settings.general.publicUrl.invalid' })}
+                    </span>
+                  )}
+                </>
+              }
+              value={publicUrl}
+              onChange={setPublicUrl}
+              placeholder="https://example.com/agents/"
+              autoComplete="off"
+            />
+          )}
           {/* Login/boot autostart — hidden when unsupported or not admin */}
           {autostart !== null && (
             <RowSwitch

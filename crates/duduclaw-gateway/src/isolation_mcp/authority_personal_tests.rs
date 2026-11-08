@@ -126,6 +126,32 @@ fn recheck(f: &Fixture, root: &Root, prepared: &PreparedAuthority) -> Result<(),
     check_current(&f.users, prepared)
 }
 
+/// F6b A2: a prepared authority (grant policy pinned at `prepare`) belongs to
+/// one incarnation; after a restore bumps it, every recheck refuses and only
+/// a fresh prepare (new identity read) authorizes the new incarnation.
+#[test]
+fn prior_incarnation_grant_policy_refused() {
+    let f = fixture();
+    let receipt = personal_employee(&f, 1, &f.alice);
+    let root = Root(vec![receipt.clone()]);
+    let binding = personal(&f.alice);
+    let principal = f.human(&f.alice);
+    let identity = identify(&f, &root, LABEL, receipt.employee, &binding, &principal).unwrap();
+    assert_eq!(identity.lifecycle.incarnation, 0);
+    let held = prepared(LABEL, identity, binding.clone(), principal.clone());
+    assert_eq!(held.incarnation(), 0);
+    assert_eq!(recheck(&f, &root, &held), Ok(()));
+    Connection::open(f.home().join("migration-authority/apply.db")).unwrap()
+        .execute("UPDATE confirmed_employees SET incarnation=1 WHERE label=?1", [LABEL]).unwrap();
+    assert_eq!(recheck(&f, &root, &held), Err(VerificationError::Revoked));
+    // The pinned lifecycle is never upgraded in place.
+    assert_eq!(held.incarnation(), 0);
+    let fresh = identify(&f, &root, LABEL, receipt.employee, &binding, &principal).unwrap();
+    assert_eq!(fresh.lifecycle.incarnation, 1);
+    let renewed = prepared(LABEL, fresh, binding, principal);
+    assert_eq!(recheck(&f, &root, &renewed), Ok(()));
+}
+
 #[test]
 fn personal_authority_owner_human_is_allowed() {
     let f = fixture();

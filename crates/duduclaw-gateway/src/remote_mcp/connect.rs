@@ -196,18 +196,43 @@ pub fn plan_redirect(raw: &str, allowed: &[String]) -> Result<RedirectPlan, Stri
     })
 }
 
-/// Resolve callback and landing base together at start. The origin remains the
-/// validated browser origin; only Direct plans may use the configured prefix.
+/// The dashboard sends `window.location.origin` plus the dashboard's own base
+/// path (RM-129). Only the origin part takes part in the redirect decision;
+/// the path is checked for shape (no user info, query, fragment, dot
+/// segments or encoded separators) and then dropped — the configured
+/// `[dashboard] public_url` decides the path, never the browser.
+fn dashboard_location_origin(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let Ok(url) = Url::parse(trimmed) else { return Ok(trimmed.to_string()) };
+    if url.path() == "/" || url.path().is_empty() {
+        return Ok(trimmed.to_string());
+    }
+    crate::deep_link::valid_oauth_public_base(trimmed)
+        .map(|(origin, _)| origin)
+        .ok_or_else(|| "redirect_origin must be the dashboard origin, optionally followed by its base path".into())
+}
+
+/// Resolve callback and landing base together at start (RM-129).
+///
+/// The browser origin must still pass [`plan_redirect`] (loopback, or an
+/// allowlisted https origin) — that check is unchanged. Afterwards the base is
+/// [`crate::deep_link::dashboard_public_base`]: the configured public_url
+/// (with its sub-path) when set, else the validated browser origin. Direct
+/// plans redirect to `<base><callback_path>`; Paste plans keep their loopback
+/// redirect (no prefix, by design) but land back on the same base.
 pub(crate) fn dashboard_redirect_plan(
     home: &Path,
     raw: &str,
     allowed: &[String],
     callback_path: &str,
 ) -> Result<(RedirectPlan, String), String> {
-    let mut plan = plan_redirect(raw, allowed)?;
+    let raw = dashboard_location_origin(raw)?;
+    let mut plan = plan_redirect(&raw, allowed)?;
     let base = match &mut plan {
         RedirectPlan::Direct { origin, redirect_uri } => {
-            let base = crate::deep_link::oauth_dashboard_base(home, origin);
+            let base = crate::deep_link::dashboard_public_base(home, origin)
+                .map(|u| crate::deep_link::base_prefix(&u))
+                .map_err(|e| e.to_string())?;
             *redirect_uri = format!("{base}{callback_path}");
             base
         }
@@ -217,7 +242,9 @@ pub(crate) fn dashboard_redirect_plan(
                 redirect.set_path(callback_path);
                 *redirect_uri = redirect.to_string();
             }
-            origin.clone()
+            crate::deep_link::dashboard_public_base(home, origin)
+                .map(|u| crate::deep_link::base_prefix(&u))
+                .map_err(|e| e.to_string())?
         }
     };
     Ok((plan, base))
@@ -1456,13 +1483,10 @@ mod tests {
             for (configured, expected) in [
                 (None, origin),
                 (Some("https://dash.example.com/agents/"), "https://dash.example.com/agents"),
-                (Some("https://other.example.com/agents"), origin),
-                (Some("https://dash.example.com/agents/../escape"), origin),
-                (Some("https://dash.example.com/agents/%2e%2e/escape"), origin),
-                (Some("https://dash.example.com/agents?q=1"), origin),
-                (Some("https://dash.example.com/agents#fragment"), origin),
-                (Some("https://user@dash.example.com/agents"), origin),
-                (Some("/agents"), origin),
+                (Some("https://dash.example.com/agents"), "https://dash.example.com/agents"),
+                // RM-129: the configured address is authoritative even when
+                // the dashboard was opened on another (allowlisted) origin.
+                (Some("https://other.example.com/agents"), "https://other.example.com/agents"),
             ] {
                 let config = configured.map(|url| format!("[dashboard]\npublic_url = {url:?}\n"))
                     .unwrap_or_default();
@@ -1472,13 +1496,77 @@ mod tests {
                 assert_eq!(plan.redirect_uri(), format!("{expected}{callback}"));
                 assert!(matches!(plan, RedirectPlan::Direct { origin: stored, .. } if stored == origin));
             }
+            // A configured but malformed public_url fails closed instead of
+            // silently dropping the sub-path.
+            for bad in [
+                "https://dash.example.com/agents/../escape",
+                "https://dash.example.com/agents/%2e%2e/escape",
+                "https://dash.example.com/agents?q=1",
+                "https://dash.example.com/agents#fragment",
+                "https://user@dash.example.com/agents",
+                "/agents",
+            ] {
+                std::fs::write(dir.path().join("config.toml"), format!("[dashboard]\npublic_url = {bad:?}\n")).unwrap();
+                let err = dashboard_redirect_plan(dir.path(), origin, &allowed, callback).unwrap_err();
+                assert!(err.contains("public_url"), "{bad}: {err}");
+            }
+            // Non-loopback HTTP public_url is refused even for Paste plans.
             std::fs::write(dir.path().join("config.toml"),
                 "[dashboard]\npublic_url = \"http://192.168.1.20:18889/agents\"\n").unwrap();
+            let err = dashboard_redirect_plan(dir.path(), "http://192.168.1.20:18889", &[], callback).unwrap_err();
+            assert!(err.contains("public_url") && err.contains("HTTPS"), "{err}");
+            // Paste keeps its loopback redirect without a prefix, but lands
+            // back on the configured HTTPS base.
+            std::fs::write(dir.path().join("config.toml"),
+                "[dashboard]\npublic_url = \"https://192.168.1.20:18889/agents\"\n").unwrap();
             let (plan, base) = dashboard_redirect_plan(dir.path(), "http://192.168.1.20:18889", &[], callback).unwrap();
-            assert_eq!(base, "http://192.168.1.20:18889");
+            assert_eq!(base, "https://192.168.1.20:18889/agents");
             assert_eq!(plan.redirect_uri(), format!("http://127.0.0.1:18889{callback}"));
             assert!(matches!(plan, RedirectPlan::Paste { .. }));
         }
+    }
+
+    #[test]
+    fn sub_path_public_url_never_bypasses_the_redirect_origin_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"),
+            "[dashboard]\npublic_url = \"https://example.com/agents/\"\n").unwrap();
+        let allowed = vec!["example.com".to_string()];
+        // The browser may send its base path; only the origin is checked.
+        let (plan, base) = dashboard_redirect_plan(dir.path(), "https://example.com/agents/", &allowed, CALLBACK_PATH).unwrap();
+        assert_eq!(base, "https://example.com/agents");
+        assert_eq!(plan, RedirectPlan::Direct {
+            origin: "https://example.com".into(),
+            redirect_uri: "https://example.com/agents/oauth/mcp/callback".into(),
+        });
+        // An unlisted https origin is still not trusted to receive a redirect:
+        // it falls back to paste exactly as before, public_url or not.
+        for raw in ["https://evil.example.org", "https://evil.example.org/agents/", "https://example.com.evil.org/agents"] {
+            let (plan, _) = dashboard_redirect_plan(dir.path(), raw, &allowed, CALLBACK_PATH).unwrap();
+            assert!(matches!(plan, RedirectPlan::Paste { .. }), "{raw}: {plan:?}");
+        }
+        // Malformed browser locations are refused, never stripped into an origin.
+        for raw in [
+            "https://example.com/agents/?x=1", "https://example.com/agents#f",
+            "https://u:p@example.com/agents", "https://example.com/a/../b",
+            "https://example.com/a%2fb", "javascript:alert(1)", "",
+        ] {
+            assert!(dashboard_redirect_plan(dir.path(), raw, &allowed, CALLBACK_PATH).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn unset_public_url_keeps_the_prefixless_origin_redirect() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = vec!["dash.example.com".to_string()];
+        for raw in ["https://dash.example.com", "https://dash.example.com/agents/"] {
+            let (plan, base) = dashboard_redirect_plan(dir.path(), raw, &allowed, CALLBACK_PATH).unwrap();
+            assert_eq!(base, "https://dash.example.com", "{raw}");
+            assert_eq!(plan.redirect_uri(), "https://dash.example.com/oauth/mcp/callback");
+        }
+        let (plan, base) = dashboard_redirect_plan(dir.path(), "http://localhost:18889", &allowed, CALLBACK_PATH).unwrap();
+        assert_eq!(base, "http://localhost:18889");
+        assert_eq!(plan.redirect_uri(), "http://localhost:18889/oauth/mcp/callback");
     }
 
     #[test]

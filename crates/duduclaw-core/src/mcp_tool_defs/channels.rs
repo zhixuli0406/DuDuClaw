@@ -233,13 +233,13 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "channel",
-                description: "Channel type (telegram, line, discord, slack, whatsapp, feishu, googlechat, teams, wecom, dingtalk)",
-                required: true,
+                description: "Channel type (e.g. telegram, line). Optional with chat_id in WebChat: omit both to return results to this conversation. Never 'webchat'.",
+                required: false,
             },
             ParamDef {
                 name: "chat_id",
-                description: "Chat/group/channel ID to send the reminder to",
-                required: true,
+                description: "Chat/group/channel ID. Optional with channel in WebChat: omit both to return results to this conversation.",
+                required: false,
             },
             ParamDef {
                 name: "mode",

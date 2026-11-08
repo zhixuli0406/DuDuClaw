@@ -246,7 +246,32 @@ impl CodeMap {
 
     /// Build the symbol map by walking `config.root` (gitignore-aware,
     /// skipping `.git`, `target`, `node_modules`, etc. via the `ignore` crate).
+    ///
+    /// Files are read by [`read_source_nofollow`]: opened without following a
+    /// final symlink (`O_NOFOLLOW` on Unix, the reparse point itself on
+    /// Windows) and kept only when the opened descriptor is a regular,
+    /// single-link file within the size cap. Callers that need a stronger
+    /// containment guarantee (every directory component, mount crossings)
+    /// pass their own reader to [`Self::build_with_reader`].
     pub fn build(config: &CodeMapConfig) -> Result<CodeMap> {
+        crate::isolation_io::verify()?;
+        Self::build_with_reader(config, |walked, _rel, max_bytes| {
+            read_source_nofollow(walked, max_bytes)
+        })
+    }
+
+    /// [`Self::build`] with the file reads delegated to `read`.
+    ///
+    /// `read(walked_path, path_relative_to_root, max_bytes)` returns the UTF-8
+    /// source, or `None` to skip the file. The walk itself never follows a
+    /// link and stays on the root's filesystem; it only proposes candidate
+    /// paths — a file is indexed only if `read` returned its content, so the
+    /// reader is the containment boundary. Content longer than
+    /// `config.max_file_bytes` is dropped even if the reader returned it.
+    pub fn build_with_reader<F>(config: &CodeMapConfig, mut read: F) -> Result<CodeMap>
+    where
+        F: FnMut(&Path, &Path, usize) -> Option<String>,
+    {
         crate::isolation_io::verify()?;
         if !config.root.exists() {
             return Err(DuDuClawError::Memory(format!(
@@ -261,14 +286,18 @@ impl CodeMap {
             .git_ignore(true)
             .git_global(false)
             .parents(true)
+            .follow_links(false)
+            .same_file_system(true)
             .build();
 
         for entry in walker.flatten() {
             crate::isolation_io::verify()?;
-            let path = entry.path();
-            if !path.is_file() {
+            // The entry's own type: with `follow_links(false)` a symlink
+            // reports as a symlink, never as the file it points to.
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
+            let path = entry.path();
             let ext = match path.extension().and_then(|e| e.to_str()) {
                 Some(e) => e.to_lowercase(),
                 None => continue,
@@ -280,17 +309,14 @@ impl CodeMap {
                 Some(l) => l,
                 None => continue,
             };
-            let meta = match path.metadata() {
-                Ok(m) => m,
+            let rel = match path.strip_prefix(&config.root) {
+                Ok(r) => r,
                 Err(_) => continue,
             };
-            if meta.len() as usize > config.max_file_bytes {
-                continue;
-            }
             crate::isolation_io::verify()?;
-            let source = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(_) => continue, // binary / non-UTF8: skip
+            let source = match read(path, rel, config.max_file_bytes) {
+                Some(s) if s.len() <= config.max_file_bytes => s,
+                _ => continue, // refused / binary / non-UTF8 / too large: skip
             };
             if let Some(fs) = extract_file(&config.root, path, lang, &source) {
                 if !fs.defs.is_empty() || !fs.idents.is_empty() {
@@ -449,6 +475,58 @@ impl CodeMap {
         }
         out
     }
+}
+
+/// The default reader for [`CodeMap::build`] (v1.81, S1).
+///
+/// Opens `path` without following a final symlink and decides from the
+/// **opened descriptor**, not a second path lookup: it must be a regular file,
+/// single-link on Unix (a hard link can alias a file outside the tree), not a
+/// reparse point on Windows, and no larger than `max_bytes`. The content is
+/// read from that same descriptor. `None` on any refusal or non-UTF-8 data.
+fn read_source_nofollow(path: &Path, max_bytes: usize) -> Option<String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK: a FIFO planted under the root must not hang the open;
+        // it is then refused as a non-regular file.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: open the link itself, never its target.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > max_bytes as u64 {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() != 1 {
+            return None;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT
+        if meta.file_attributes() & 0x400 != 0 {
+            return None;
+        }
+    }
+    let mut buf = Vec::new();
+    file.take(max_bytes as u64 + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() > max_bytes {
+        return None;
+    }
+    String::from_utf8(buf).ok()
 }
 
 /// Ordering key so structs/traits/classes surface above free functions when we
@@ -627,6 +705,50 @@ mod tests {
             ranked[0].path, "graph_rank.rs",
             "graph_rank.rs defines TripleGraph, must rank first"
         );
+    }
+
+    /// v1.81 (S1): `build()` never reads through a symlink (file or
+    /// directory) or a multiply-linked file.
+    #[cfg(unix)]
+    #[test]
+    fn build_skips_symlinks_and_hard_links() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        write(outside.path(), "leak.rs", "pub fn leaked_by_link() {}\n");
+        write(outside.path(), "pkg/mod.rs", "pub fn leaked_by_dir() {}\n");
+        write(outside.path(), "hard.rs", "pub fn leaked_by_hard() {}\n");
+        write(dir.path(), "ok.rs", "pub fn fine() {}\n");
+        std::os::unix::fs::symlink(outside.path().join("leak.rs"), dir.path().join("a.rs")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("pkg"), dir.path().join("pkg")).unwrap();
+        let hard = fs::hard_link(outside.path().join("hard.rs"), dir.path().join("hard.rs")).is_ok();
+        let map = CodeMap::build(&CodeMapConfig::new(dir.path())).unwrap();
+        assert_eq!(map.symbol_count(), 1, "only ok.rs: hard link made = {hard}");
+        assert!(map.rank("leaked_by_link leaked_by_dir leaked_by_hard", &[], 5).is_empty());
+    }
+
+    /// `build_with_reader` indexes exactly what the reader returns, hands it
+    /// root-relative paths, and drops over-cap content.
+    #[test]
+    fn build_with_reader_is_the_read_boundary() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a.rs", "pub fn alpha() {}\n");
+        write(dir.path(), "sub/b.rs", "pub fn beta() {}\n");
+        let mut seen: Vec<String> = Vec::new();
+        let map = CodeMap::build_with_reader(&CodeMapConfig::new(dir.path()), |_walked, rel, _max| {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            seen.push(rel.clone());
+            (rel == "sub/b.rs").then(|| "pub fn beta() {}\n".to_string())
+        })
+        .unwrap();
+        seen.sort();
+        assert_eq!(seen, vec!["a.rs".to_string(), "sub/b.rs".to_string()]);
+        assert_eq!(map.symbol_count(), 1);
+        assert!(map.rank("alpha", &[], 5).is_empty());
+
+        let mut cfg = CodeMapConfig::new(dir.path());
+        cfg.max_file_bytes = 4;
+        let map = CodeMap::build_with_reader(&cfg, |_, _, _| Some("pub fn too_long() {}".into())).unwrap();
+        assert_eq!(map.symbol_count(), 0, "over-cap content is dropped");
     }
 
     #[test]

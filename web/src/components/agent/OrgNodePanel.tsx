@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { ArrowRight, Pause, Play } from 'lucide-react';
 import type { AgentDetail } from '@/lib/api';
@@ -27,12 +28,15 @@ export function OrgNodePanel({
   onEdit,
   onPause,
   onResume,
+  placement,
 }: {
   agent: AgentDetail;
   onOpenDetail: () => void;
   onEdit: () => void;
   onPause: () => void;
   onResume: () => void;
+  /** RM-027 — the 「調整位置」 editor, shown between the facts and the actions. */
+  placement?: ReactNode;
 }) {
   const intl = useIntl();
   const active = agent.status === 'active';
@@ -88,6 +92,8 @@ export function OrgNodePanel({
           />
         )}
       </div>
+
+      {placement}
 
       <div className="space-y-2">
         <Button variant="brand" size="sm" onClick={onOpenDetail} className="w-full">

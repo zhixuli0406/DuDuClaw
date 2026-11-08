@@ -190,6 +190,24 @@ impl MethodHandler {
     where
         F: FnOnce(&mut toml::Table) -> Result<(), String>,
     {
+        self.update_agent_toml_as_within(agent_id, source, caller, session, None, mutate).await
+    }
+
+    /// [`Self::update_agent_toml_as`] with an optional bound on the
+    /// `agent.toml` lock wait (RM-027 round 5: `Some` while the caller holds
+    /// the global org lock — past it nothing is written).
+    pub(crate) async fn update_agent_toml_as_within<F>(
+        &self,
+        agent_id: &str,
+        source: &'static str,
+        caller: Option<&UserContext>,
+        session: Option<&UserContext>,
+        lock_wait: Option<std::time::Duration>,
+        mutate: F,
+    ) -> Result<bool, String>
+    where
+        F: FnOnce(&mut toml::Table) -> Result<(), String>,
+    {
         let home = self.home_dir.clone();
         let agent = agent_id.to_string();
         let session = session.cloned();
@@ -217,7 +235,12 @@ impl MethodHandler {
         };
         #[cfg(test)]
         main_commit_test_seam::reached(&self.home_dir);
-        crate::channel_reply::update_agent_toml_edit(&self.registry, agent_id, edit, mutate).await
+        match lock_wait {
+            None => crate::channel_reply::update_agent_toml_edit(&self.registry, agent_id, edit, mutate).await,
+            Some(wait) => {
+                crate::channel_reply::update_agent_toml_edit_bounded(&self.registry, agent_id, edit, wait, mutate).await
+            }
+        }
     }
 
     /// Update status with the caller's role and binding re-checked inside the file lock.
@@ -263,30 +286,115 @@ impl MethodHandler {
 
     /// Demote the current main agent to "specialist", skipping `except_id`.
     /// This ensures at most one agent has the "main" role at any time.
-    pub(crate) async fn demote_current_main(&self, except_id: &str) -> Result<(), String> {
+    ///
+    /// Returns the [`MainDemotion`] it made (`None` when there was no other
+    /// main). RM-027 round 5: a caller that demotes *before* a step that can
+    /// still fail (agent creation: the authority commit, the cycle check, the
+    /// directory publish) must hand it to [`Self::restore_demoted_main`] on
+    /// every failure, so the old main never stays `specialist` for a create
+    /// that did not happen. The `agent.toml` lock wait is bounded by
+    /// [`crate::org_change_approval::MIRROR_LOCK_WAIT`] (creation and, since
+    /// round 6, an `agents.update` promotion call this under the global org
+    /// lock, and restore on failure).
+    pub(crate) async fn demote_current_main(&self, except_id: &str) -> Result<Option<MainDemotion>, String> {
         let current_main = {
             let reg = self.registry.read().await;
             reg.main_agent()
                 .filter(|a| a.config.agent.name != except_id)
                 .map(|a| a.config.agent.name.clone())
         };
-        if let Some(old_main) = current_main {
-            info!(
-                old_main = old_main.as_str(),
-                "Demoting current main agent to specialist"
-            );
-            self.update_agent_toml(&old_main, |table| {
-                let agent_section = table
-                    .get_mut("agent")
-                    .and_then(|v| v.as_table_mut())
-                    .ok_or_else(|| "agent.toml missing [agent] section".to_string())?;
-                agent_section.insert("role".into(), toml::Value::String("specialist".into()));
-                Ok(())
-            })
-            .await?;
-        }
-        Ok(())
+        let Some(old_main) = current_main else { return Ok(None) };
+        info!(
+            old_main = old_main.as_str(),
+            "Demoting current main agent to specialist"
+        );
+        let prior_role = std::sync::Arc::new(std::sync::Mutex::new(None::<toml::Value>));
+        let seen = prior_role.clone();
+        self.set_main_role_bounded(&old_main, move |agent_section| {
+            if let Ok(mut s) = seen.lock() {
+                *s = agent_section.get("role").cloned();
+            }
+            agent_section.insert("role".into(), toml::Value::String("specialist".into()));
+        })
+        .await?;
+        let prior_role = prior_role.lock().ok().and_then(|mut s| s.take());
+        Ok(Some(MainDemotion { old_main, prior_role }))
     }
+
+    /// Undo a [`MainDemotion`] after the step it preceded failed. Only our own
+    /// demotion is undone: the role is put back only while it still reads
+    /// `specialist` (a role somebody changed since is left alone). Retried
+    /// (transient lock / IO); a restore that still fails is audited
+    /// (`agent_main_demotion_restore_failed`) and returned.
+    pub(crate) async fn restore_demoted_main(&self, demotion: MainDemotion) -> Result<(), String> {
+        let MainDemotion { old_main, prior_role } = demotion;
+        let prior = prior_role.unwrap_or_else(|| toml::Value::String("main".into()));
+        let mut last = String::new();
+        for attempt in 1..=3u32 {
+            let prior = prior.clone();
+            let result = self
+                .set_main_role_bounded(&old_main, move |agent_section| {
+                    if agent_section.get("role").and_then(|v| v.as_str()) == Some("specialist") {
+                        agent_section.insert("role".into(), prior);
+                    }
+                })
+                .await;
+            match result {
+                Ok(()) => {
+                    info!(old_main = old_main.as_str(), "Restored the previous main agent after a failed create / promotion");
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(old_main = old_main.as_str(), attempt, error = %e, "restoring the previous main agent failed");
+                    last = e;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+        crate::security_autopilot::audit_and_emit(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "agent_main_demotion_restore_failed",
+                &old_main,
+                duduclaw_security::audit::Severity::Warning,
+                json!({ "agent_id": old_main, "error": duduclaw_core::truncate_chars(&last, 300) }),
+            ),
+        );
+        Err(last)
+    }
+
+    /// One `[agent] role` edit of `agent_id` through the profile writer (the
+    /// same system source `update_agent_toml` records), with the
+    /// `agent.toml` lock wait bounded.
+    async fn set_main_role_bounded(
+        &self,
+        agent_id: &str,
+        edit_role: impl FnOnce(&mut toml::Table),
+    ) -> Result<(), String> {
+        let edit = crate::channel_reply::AgentTomlEdit { source: "agents.update", user_id: "system", guard: || Ok(()) };
+        let wait = crate::org_change_approval::mirror_lock_wait(&self.home_dir);
+        crate::channel_reply::update_agent_toml_edit_bounded(&self.registry, agent_id, edit, wait, move |table| {
+            let agent_section = table
+                .get_mut("agent")
+                .and_then(|v| v.as_table_mut())
+                .ok_or_else(|| "agent.toml missing [agent] section".to_string())?;
+            edit_role(agent_section);
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+    }
+}
+
+/// RM-027 round 5: a demotion [`MethodHandler::demote_current_main`] made,
+/// kept so a failed create can put the old main back
+/// ([`MethodHandler::restore_demoted_main`]).
+#[derive(Debug)]
+#[must_use = "a demotion made before a failing step must be restored"]
+pub(crate) struct MainDemotion {
+    old_main: String,
+    /// The `[agent] role` value before the demotion (`None` = absent).
+    prior_role: Option<toml::Value>,
 }
 
 /// Called only by the writer's commit guard while agent.toml is locked, after

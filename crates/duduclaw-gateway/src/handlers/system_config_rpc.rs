@@ -71,6 +71,9 @@ impl MethodHandler {
         // saved value. Reuses `miniapp::enabled`'s own parser rather than
         // re-implementing the "absent / malformed ⇒ false" posture.
         let miniapp_enabled: bool = crate::miniapp::enabled(&self.home_dir);
+        // RM-064: `[external_status] enabled`, same "absent / malformed ⇒
+        // false" parser the status endpoint itself reads per request.
+        let external_status_enabled: bool = crate::external_status::enabled(&self.home_dir);
 
         // Structured [notify] daily_digest so the dashboard Settings toggle +
         // time field show the saved values (W2-8). Reuses `DigestConfig`'s
@@ -78,6 +81,24 @@ impl MethodHandler {
         // "absent/malformed ⇒ default (off, 09:00)" posture every other
         // structured field on this response follows.
         let digest_cfg = crate::notify_digest::DigestConfig::from_home(&self.home_dir);
+
+        // RM-039: structured `[memory_privacy]` — the effective config (an
+        // invalid / unreadable one shows as the defaults it falls back to,
+        // with `load_state = "failed_closed"` so the UI can say so).
+        let memory_privacy = {
+            let (cfg, state) =
+                crate::memory_privacy::MemoryPrivacyConfig::load_with_state(&self.home_dir);
+            json!({
+                "excluded_categories": cfg.excluded_categories,
+                "custom_keywords": cfg.custom_keywords,
+                "builtin_categories": crate::memory_privacy::BUILTIN_CATEGORIES,
+                "load_state": match state {
+                    crate::memory_privacy::LoadState::Defaults => "defaults",
+                    crate::memory_privacy::LoadState::Configured => "configured",
+                    crate::memory_privacy::LoadState::FailedClosed => "failed_closed",
+                },
+            })
+        };
 
         match tokio::fs::read_to_string(&config_path).await {
             Ok(content) => {
@@ -113,7 +134,9 @@ impl MethodHandler {
                                 "allowed_origins": allowed_origins,
                                 "gap_digest_enabled": gap_digest_enabled,
                                 "novelty_gate_enabled": novelty_gate_enabled,
+                                "memory_privacy": memory_privacy,
                                 "miniapp_enabled": miniapp_enabled,
+                                "external_status_enabled": external_status_enabled,
                                 "daily_digest_enabled": digest_cfg.enabled,
                                 "daily_digest_at": digest_cfg.at.format("%H:%M").to_string(),
                                 "webchat_widget_key_set": webchat_widget_key_set,
@@ -277,10 +300,75 @@ impl MethodHandler {
                         // uses this to show an `update.sh`/image-rebuild
                         // guidance card instead of an install button.
                         "containerized": crate::updater::is_containerized(),
+                        // RM-155 (macOS): running from DuDuClaw Gateway.app?
+                        // When false on a standalone/npm install the update
+                        // page offers `system.migrate_bundle`.
+                        "macos_bundle": duduclaw_core::macos_bundle::running_gateway_bundle().is_some(),
+                        "macos_bundle_migratable": crate::updater::bundle_migration_offered(),
+                        // One-time notice after a migration: macOS asks once
+                        // for folder access for the new app identity.
+                        "macos_bundle_notice": crate::updater::take_folder_access_notice(),
                     }),
                 )
             }
             Err(e) => WsFrame::error_response("", &format!("Update check failed: {e}")),
+        }
+    }
+
+    /// `system.migrate_bundle` — RM-155: install the signed
+    /// `DuDuClaw Gateway.app` for a bare macOS install, point the old binary
+    /// path and the LaunchAgent at it, then relaunch like an update. Same
+    /// verification chain as `system.apply_update`; refused off macOS.
+    pub(crate) async fn handle_system_migrate_bundle(&self) -> WsFrame {
+        crate::security_autopilot::audit_and_emit(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "system_update",
+                "system",
+                duduclaw_security::audit::Severity::Info,
+                json!({ "action": "migrate_bundle" }),
+            ),
+        );
+        match crate::updater::migrate_to_bundle().await {
+            Ok(result) if result.success => {
+                let version = crate::updater::current_version().to_string();
+                if result.needs_restart {
+                    self.schedule_update_restart(&version, &result.message).await;
+                }
+                crate::security_autopilot::audit_and_emit(
+                    &self.home_dir,
+                    &duduclaw_security::audit::AuditEvent::new(
+                        "system_update_success",
+                        "system",
+                        duduclaw_security::audit::Severity::Info,
+                        json!({ "action": "migrate_bundle", "needs_restart": result.needs_restart }),
+                    ),
+                );
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "success": true,
+                        "message": result.message,
+                        "needs_restart": result.needs_restart,
+                        "restart_hint": result.restart_hint,
+                    }),
+                )
+            }
+            Ok(result) => crate::updater::failure_response(&result.message),
+            Err(e) => {
+                let sanitized = crate::updater::sanitize_failure_detail(&e);
+                crate::security_autopilot::audit_and_emit(
+                    &self.home_dir,
+                    &duduclaw_security::audit::AuditEvent::new(
+                        "system_update_failed",
+                        "system",
+                        duduclaw_security::audit::Severity::Warning,
+                        json!({ "action": "migrate_bundle", "error": sanitized }),
+                    ),
+                );
+                tracing::warn!(error = %sanitized, "DuDuClaw Gateway.app migration failed");
+                crate::updater::failure_response(&e)
+            }
         }
     }
 

@@ -8,16 +8,38 @@
 use chrono::{DateTime, Utc};
 use ring::digest;
 
-/// Shared base system prompt, identical across all agents for prefix cache sharing.
-///
-/// This block appears first in every agent's system prompt, ensuring a common
-/// prefix that maximizes KV-cache reuse across different agent sessions.
-pub const SHARED_BASE: &str = "\
+/// The language-independent lines of [`SHARED_BASE`] (a macro so it can feed
+/// `concat!` in the const below).
+macro_rules! shared_base_head {
+    () => {
+        "\
 You are a DuDuClaw AI agent running within the Claude Code SDK.\n\
 Follow your SOUL.md identity and behavioral directives.\n\
-Use MCP tools to interact with channels, memory, and other agents.\n\
-Always respond in the language matching the user's input.\n\
-";
+Use MCP tools to interact with channels, memory, and other agents.\n"
+    };
+}
+
+/// Default base system prompt for agents that follow the input language.
+///
+/// Agents with the same resolved language share a base prefix for cache reuse.
+///
+/// This constant is the language-neutral ("auto") form. When a reply language
+/// is pinned (employee `[prompt] reply_language` or global default), use
+/// [`shared_base`] instead so the base does not contradict the setting.
+pub const SHARED_BASE: &str = concat!(
+    shared_base_head!(),
+    "Always respond in the language matching the user's input.\n"
+);
+
+/// SHARED_BASE with the language sentence resolved: `None`/`auto` keeps
+/// "match the user's language"; a pinned code states that language instead.
+/// Byte-identical to [`SHARED_BASE`] when nothing is pinned.
+pub fn shared_base(reply_language: Option<&str>) -> String {
+    match duduclaw_core::profile_sections::language_instruction(reply_language) {
+        Some(line) => format!("{}{line}\n", shared_base_head!()),
+        None => SHARED_BASE.to_string(),
+    }
+}
 
 /// A frozen system prompt, built once at session creation.
 ///
@@ -142,6 +164,19 @@ mod tests {
     fn shared_base_is_not_empty() {
         assert!(!SHARED_BASE.is_empty());
         assert!(SHARED_BASE.contains("DuDuClaw"));
+    }
+
+    #[test]
+    fn shared_base_language_sentence_is_conditional() {
+        // unset / auto: unchanged "match the user's input" form.
+        assert_eq!(shared_base(None), SHARED_BASE);
+        assert_eq!(shared_base(Some("auto")), SHARED_BASE);
+        assert!(shared_base(Some("")).contains("matching the user's input"));
+        // pinned: states the language, no contradicting sentence.
+        let pinned = shared_base(Some("zh-TW"));
+        assert!(pinned.contains("Traditional Chinese"));
+        assert!(!pinned.contains("matching the user's input"));
+        assert!(pinned.starts_with("You are a DuDuClaw AI agent"));
     }
 
     #[test]

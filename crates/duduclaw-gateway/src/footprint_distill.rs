@@ -395,13 +395,41 @@ fn render_triples(stats: &AgentDayStats) -> Vec<FootprintTriple> {
 /// directly by tests (calling `SqliteMemoryEngine` methods `.await` from a
 /// `#[tokio::test]` body needs no `spawn_blocking` — the engine's own test
 /// suite does the same).
+#[cfg(test)]
 async fn write_footprint_triples(
     engine: &SqliteMemoryEngine,
     agent_id: &str,
     stats: &AgentDayStats,
 ) -> duduclaw_core::error::Result<Vec<String>> {
+    write_footprint_triples_gated(
+        engine,
+        agent_id,
+        stats,
+        &crate::memory_privacy::PrivacyGate::defaults(),
+    )
+    .await
+}
+
+/// The production writer, behind the RM-039 privacy gate: a triple whose
+/// rendering names an excluded topic (an app or directory called e.g.
+/// `medical-records`, `薪資`) is not written.
+async fn write_footprint_triples_gated(
+    engine: &SqliteMemoryEngine,
+    agent_id: &str,
+    stats: &AgentDayStats,
+    privacy: &crate::memory_privacy::PrivacyGate,
+) -> duduclaw_core::error::Result<Vec<String>> {
     let mut ids = Vec::new();
+    let mut report = crate::memory_privacy::FilterReport::default();
     for (predicate, content, object, sensitivity) in render_triples(stats) {
+        if !report.record(privacy.check(&crate::memory_privacy::FactParts {
+            content: &content,
+            subject: Some(FOOTPRINT_SUBJECT),
+            predicate: Some(predicate),
+            object: Some(&object),
+        })) {
+            continue;
+        }
         let entry = MemoryEntry {
             id: uuid::Uuid::new_v4().to_string(),
             agent_id: agent_id.to_string(),
@@ -454,6 +482,7 @@ async fn write_footprint_triples(
             }
         }
     }
+    report.log(agent_id, "footprint_distill");
     Ok(ids)
 }
 
@@ -604,8 +633,14 @@ impl FootprintTracker {
             // either way; routing through the factory keeps construction
             // policy in one place).
             let engine = crate::memory_factory::build_memory_engine(&db_path, &home_dir)?;
+            let privacy = crate::memory_privacy::PrivacyGate::for_home(&home_dir);
             let rt = tokio::runtime::Handle::current();
-            rt.block_on(write_footprint_triples(&engine, &agent_owned, &finalized))
+            rt.block_on(write_footprint_triples_gated(
+                &engine,
+                &agent_owned,
+                &finalized,
+                &privacy,
+            ))
         })
         .await;
         match res {

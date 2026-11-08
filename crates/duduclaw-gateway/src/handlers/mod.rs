@@ -96,6 +96,7 @@ mod channels_hot;
 mod accounts_basic;
 mod memory_rpc;
 mod memory_history_rpc;
+pub(crate) mod my_memory_rpc;
 mod wiki_rpc;
 mod shared_wiki_rpc;
 pub(crate) use shared_wiki_rpc::SharedWikiReader;
@@ -126,6 +127,7 @@ mod security_rpc;
 mod credential_audit_rpc;
 pub(crate) mod credential_protection_rpc;
 mod website_credentials_rpc;
+mod status_tokens_rpc;
 mod transcription_credentials_rpc;
 mod analytics_rpc;
 mod evolution_rpc;
@@ -147,6 +149,7 @@ mod agents_list_rpc;
 mod dashboard_layout;
 mod widgets_custom;
 mod departments_rpc;
+mod org_change_rpc;
 mod users_rpc;
 mod user_invites_rpc;
 pub(crate) mod company_rpc;
@@ -628,6 +631,19 @@ impl MethodHandler {
             return boxed_frame(|| self.handle_company(method, params, ctx)).await;
         }
 
+        // RM-039 "my memory" is gateway-owned self-service: an extension must
+        // never answer it, and every method has an explicit role entry. The
+        // handler scopes every read and delete to the caller's own subjects.
+        if method.starts_with("me.memory.") {
+            let Some(role) = my_memory_rpc::minimum_role(method) else {
+                return WsFrame::error_response("", "不支援此操作。");
+            };
+            if let Err(e) = acl::require_role(ctx, role) {
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.handle_my_memory_rpc(method, params, ctx)).await;
+        }
+
         // Invitations are gateway-owned authentication methods. An extension
         // must never replace their Admin checks or inspect a returned link.
         // Reserved namespace fallbacks are Admin-only and stay in core dispatch,
@@ -653,6 +669,15 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return boxed_frame(|| self.handle_website_credentials(method, params, ctx)).await;
+        }
+
+        // RM-064 status credentials are gateway-owned bearer secrets. Route
+        // before extension dispatch so no plugin sees a freshly issued one.
+        if let Some(role) = status_tokens_rpc::minimum_role(method) {
+            if let Err(e) = acl::require_role(ctx, role) {
+                return WsFrame::error_response("", &e);
+            }
+            return boxed_frame(|| self.handle_status_tokens_rpc(method, params, ctx)).await;
         }
 
         // Compliance exports are gateway-owned. An extension must never

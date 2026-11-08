@@ -129,6 +129,7 @@ impl MethodHandler {
             let (email, display_name, password) =
                 (email.to_string(), display_name.to_string(), password.to_string());
             let (department, manager) = (department.map(str::to_string), manager.clone());
+            let actor = ctx.user_id.clone();
             tokio::task::spawn_blocking(move || {
                 let new = duduclaw_auth::NewUser {
                     email: &email,
@@ -138,8 +139,8 @@ impl MethodHandler {
                     department: department.as_deref(),
                     manager: manager.as_deref(),
                 };
-                if invite { db.create_invited_user_with(&new) }
-                else { db.create_user_with(&new) }
+                // F6 S2: the admin eligibility log records the creator.
+                db.create_user_as(Some(actor.as_str()), &new, invite)
             })
             .await
         };
@@ -240,13 +241,15 @@ impl MethodHandler {
             let display_name = display_name.map(str::to_string);
             let password = password.map(str::to_string);
             let manager_change = manager_change.clone();
+            let actor = ctx.user_id.clone();
             tokio::task::spawn_blocking(move || {
                 let manager = match &manager_change {
                     ManagerChange::Unchanged => None,
                     ManagerChange::Clear => Some(None),
                     ManagerChange::Set(m) => Some(Some(m.as_str())),
                 };
-                db.apply_user_update(
+                db.apply_user_update_as(
+                    Some(actor.as_str()),
                     &user_id,
                     &duduclaw_auth::UserUpdate {
                         display_name: display_name.as_deref(),
@@ -293,7 +296,7 @@ impl MethodHandler {
         };
 
         let google_affected_agents = crate::google_personal::lifecycle::affected_agents(&self.home_dir, &db, user_id);
-        match db.set_user_status(user_id, duduclaw_auth::UserStatus::Suspended) {
+        match db.set_user_status_as(Some(ctx.user_id.as_str()), user_id, duduclaw_auth::UserStatus::Suspended) {
             Ok(()) => {
                 let cleanup_error = crate::google_personal::lifecycle::disconnect(&self.home_dir, &db, user_id, &ctx.user_id, true).await.err();
                 if let Ok(agents) = &google_affected_agents { crate::google_personal::lifecycle::notify_affected(&self.home_dir, &ctx.user_id, agents); }

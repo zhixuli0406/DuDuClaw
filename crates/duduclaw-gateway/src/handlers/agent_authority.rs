@@ -104,6 +104,7 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     key("runtime.timeout_secs", &["runtime.timeout_secs"], Loosen),
     // `--bare` skips the hooks, the employee file guard included.
     key("prompt.cli_bare_mode", &[], Change),
+    key("prompt.reply_language", &["form.reply_language"], Change),
     // Widens what the employee watches on the machine.
     key("os_watch", &["osWatch."], Change),
     // Which accounts' quota the employee spends.
@@ -114,6 +115,9 @@ pub(crate) const AUTHORITY: &[AuthorityKey] = &[
     key("budget.hard_stop", &["form.hard_stop"], Loosen),
     // Whose Google account the employee acts as (a colleague's mailbox).
     key("google", &["form.google."], GoogleNarrow),
+    // Protected mode: whether the issuer grants the public-web tools (owner
+    // decision 2026-11-08, separate from `container.network_access`).
+    key("isolation.public_web", &[], Change),
 ];
 
 /// The effective value of an authority key: an absent key reads as the value
@@ -134,11 +138,22 @@ fn effective(table: &toml::Table, key: &str) -> Value {
         | "guardrails.enabled"
         | "channels.public_trigger"
         | "prompt.cli_bare_mode"
+        | "isolation.public_web"
         | "budget.hard_stop" => or(Value::Bool(false)),
+        // v1.81 (S2): what the MCP gate enforces — an absent (or
+        // wrong-typed) key resolves by role, `true` only for `main`. Reading
+        // it as `true` let a non-admin Owner write an explicit `true` on a
+        // non-main employee as "no change", past this check.
+        "permissions.can_create_agents" => {
+            let role = toml_at_json(table, "agent.role");
+            Value::Bool(duduclaw_core::agent_toml::effective_can_create_agents(
+                raw.as_bool(),
+                role.as_str(),
+            ))
+        }
         // Absent ⇒ allowed (the gate refuses only an explicit `false`);
         // `block_secrets` defaults on.
-        "permissions.can_create_agents"
-        | "permissions.can_send_cross_agent"
+        "permissions.can_send_cross_agent"
         | "permissions.can_schedule_tasks"
         | "permissions.can_modify_own_skills"
         | "guardrails.block_secrets" => or(Value::Bool(true)),
@@ -274,17 +289,19 @@ mod tests {
             ("[runtime]\nprovider='codex'\n", "runtime.provider"),
             ("[runtime]\nfallback='claude'\n", "runtime.fallback"),
             ("[prompt]\ncli_bare_mode=true\n", "prompt.cli_bare_mode"),
+            ("[prompt]\nreply_language='en'\n", "prompt.reply_language"),
             ("[container]\nreadonly_project=false\n", "container.readonly_project"),
             ("[os_watch]\npaths=['/']\n", "os_watch"),
             ("[model]\naccount_pool=['acct']\n", "model.account_pool"),
             ("[permissions]\nallowed_channels=['line']\n", "permissions.allowed_channels"),
+            ("[isolation]\npublic_web=true\n", "isolation.public_web"),
         ] {
             let after = t(&format!("[agent]\nname='a'\nrole='specialist'\n[budget]\nmonthly_limit_cents=1000\nhard_stop=true\n{frag}"));
             let diff = authority_diff(&before, &after);
             assert!(diff.iter().any(|c| c.key == k), "{k}: {diff:?}");
         }
         // Explicit defaults over absent keys are not changes.
-        let same = t("[agent]\nname='a'\nrole='specialist'\n[budget]\nmonthly_limit_cents=1000\nhard_stop=true\n[runtime]\nprovider='claude'\n[prompt]\ncli_bare_mode=false\n[model]\naccount_pool=[]\n[os_watch]\n");
+        let same = t("[agent]\nname='a'\nrole='specialist'\n[budget]\nmonthly_limit_cents=1000\nhard_stop=true\n[runtime]\nprovider='claude'\n[prompt]\ncli_bare_mode=false\n[model]\naccount_pool=[]\n[os_watch]\n[isolation]\npublic_web=false\n");
         assert!(authority_diff(&before, &same).is_empty(), "{:?}", authority_diff(&before, &same));
     }
 
@@ -335,14 +352,43 @@ mod tests {
         }
     }
 
+    /// v1.81 (S2): `can_create_agents` is compared by its effective value, so
+    /// an Owner cannot switch it on for a non-main employee by writing `true`
+    /// over an absent key; on `main` the same write is no change.
+    #[test]
+    fn can_create_agents_effective_value_follows_role() {
+        let keys = |b: &str, a: &str| authority_diff(&t(b), &t(a)).into_iter().map(|c| c.key).collect::<Vec<_>>();
+        for role in ["specialist", "worker", "team-leader"] {
+            let absent = format!("[agent]\nrole='{role}'\n");
+            let on = format!("{absent}[permissions]\ncan_create_agents=true\n");
+            let off = format!("{absent}[permissions]\ncan_create_agents=false\n");
+            assert_eq!(keys(&absent, &on), vec!["permissions.can_create_agents"], "{role}");
+            assert!(keys(&absent, &off).is_empty(), "{role}: explicit default");
+            assert_eq!(keys(&on, &absent), vec!["permissions.can_create_agents"], "{role}: removing an explicit true");
+        }
+        // No role: fails closed like a non-main employee.
+        assert_eq!(keys("", "[permissions]\ncan_create_agents=true\n"), vec!["permissions.can_create_agents"]);
+        let main = "[agent]\nrole='main'\n";
+        assert!(keys(main, &format!("{main}[permissions]\ncan_create_agents=true\n")).is_empty());
+        assert_eq!(
+            keys(main, &format!("{main}[permissions]\ncan_create_agents=false\n")),
+            vec!["permissions.can_create_agents"]
+        );
+    }
+
     #[test]
     fn role_main_both_ways() {
         let s = t("[agent]\nrole='specialist'\n");
         let m = t("[agent]\nrole='main'\n");
         let w = t("[agent]\nrole='worker'\n");
-        assert_eq!(authority_diff(&s, &m).len(), 1);
-        assert_eq!(authority_diff(&m, &s).len(), 1);
+        // v1.81 (S2): becoming / ceasing to be main also flips the effective
+        // `can_create_agents` of an employee that never wrote the key.
+        let keys = |b: &toml::Table, a: &toml::Table| authority_diff(b, a).into_iter().map(|c| c.key).collect::<Vec<_>>();
+        assert_eq!(keys(&s, &m), vec!["agent.role", "permissions.can_create_agents"]);
+        assert_eq!(keys(&m, &s), vec!["agent.role", "permissions.can_create_agents"]);
         assert!(authority_diff(&s, &w).is_empty());
+        let pinned = |role: &str| t(&format!("[agent]\nrole='{role}'\n[permissions]\ncan_create_agents=false\n"));
+        assert_eq!(keys(&pinned("specialist"), &pinned("main")), vec!["agent.role"]);
     }
 
     #[test]

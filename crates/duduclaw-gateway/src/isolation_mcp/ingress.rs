@@ -110,7 +110,7 @@ pub(super) async fn authorize_current(agent_dir: &Path, principal_context: Optio
         super::boot::record_authorization(human.home, agent, human.user, human.epoch, lane,
             super::HostTurn { identity: crate::isolation_egress::RunTurnIdentity {
                 turn, approval_session: Some(session) }, metadata: Some(metadata), principal_context,
-                egress_turn, background: None }, expiry)
+                egress_turn, background: None }, expiry, None)
     }).await
 }
 
@@ -135,6 +135,22 @@ pub(super) fn require_epoch(original: u64, current: Option<u64>) -> Result<(), V
 }
 
 pub(super) fn own_wiki_root(home: &Path, agent: &str) -> Result<Option<std::fs::File>, VerificationError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use nix::fcntl::{openat, OFlag};
+    use nix::sys::stat::Mode;
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let directory = own_agent_dir(home, agent)?;
+    match openat(Some(directory.as_raw_fd()), "wiki", flags, Mode::empty()) {
+        Ok(fd) => Ok(Some(unsafe { std::fs::File::from_raw_fd(fd) })),
+        Err(nix::errno::Errno::ENOENT) => Ok(None),
+        Err(_) => Err(VerificationError::Unavailable),
+    }
+}
+
+/// `<home>/agents/<agent>` (gateway-private state, never the employee mount),
+/// walked from `/` without following a symlink at any component. Shared by
+/// the wiki root and the H9 issuer selectors' profile read.
+pub(super) fn own_agent_dir(home: &Path, agent: &str) -> Result<std::fs::File, VerificationError> {
     use std::os::fd::FromRawFd;
     use nix::fcntl::{open, openat, OFlag};
     use nix::sys::stat::Mode;
@@ -153,11 +169,7 @@ pub(super) fn own_wiki_root(home: &Path, agent: &str) -> Result<Option<std::fs::
             .map_err(|_| VerificationError::Unavailable)?;
         directory = unsafe { std::fs::File::from_raw_fd(fd) };
     }
-    match openat(Some(directory.as_raw_fd()), "wiki", flags, Mode::empty()) {
-        Ok(fd) => Ok(Some(unsafe { std::fs::File::from_raw_fd(fd) })),
-        Err(nix::errno::Errno::ENOENT) => Ok(None),
-        Err(_) => Err(VerificationError::Unavailable),
-    }
+    Ok(directory)
 }
 
 #[cfg(test)]

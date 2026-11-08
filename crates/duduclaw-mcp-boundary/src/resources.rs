@@ -511,9 +511,15 @@ impl AuthorizedFile {
                         .any(|value| value.as_str() != Some(agent)) {
                     return Err(VerificationError::BindingMismatch);
                 }
-                let workspaces = call.resources().iter().filter(|r| matches!(r, ResourceGrant::Workspace { .. })).collect::<Vec<_>>();
-                let [grant] = workspaces.as_slice() else { return Err(VerificationError::BindingMismatch); };
-                ((*grant).clone(), operation, 64 * 1024)
+                // H12a: skill bytes are the employee's own host-owned files (read
+                // by the trusted producer, parsed as data by E), not a workspace
+                // input. The snapshot is bound to the call's own Employee grant,
+                // and only an exact own-skill selection reaches this point.
+                crate::tool_policy::own_skill_selector(call.context(), call.name())?;
+                if call.resources().iter().any(|r| !matches!(r, ResourceGrant::Employee { .. } | ResourceGrant::Wiki { .. })) {
+                    return Err(VerificationError::BindingMismatch);
+                }
+                (own, operation, 64 * 1024)
             }
         };
         if bytes.len() > cap { return Err(VerificationError::Invalid); }

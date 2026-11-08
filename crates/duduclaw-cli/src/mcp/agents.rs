@@ -6,6 +6,27 @@ pub(crate) fn protected_create_refusal(protected: bool) -> Option<Value> {
     protected.then(|| tool_error(crate::mcp_isolation_disposition::PROPOSAL_REQUIRED))
 }
 
+/// v1.81 (S2): may `caller` create a `role = main` employee through MCP?
+/// Only an existing employee whose own `[agent] role` is `main` and whose
+/// effective `can_create_agents` is on (an explicit `false` withdraws it).
+/// System senders and unidentified callers never qualify (fail closed).
+pub(crate) fn caller_is_privileged_main(home_dir: &Path, caller: &str) -> bool {
+    if !is_valid_agent_id(caller) || duduclaw_core::is_system_sender(caller) {
+        return false;
+    }
+    let dir = home_dir.join("agents").join(caller);
+    if !dir.join("agent.toml").is_file() {
+        return false;
+    }
+    let sections = duduclaw_core::agent_toml::load(&dir);
+    let role = sections.agent.as_ref().and_then(|a| a.role.as_deref());
+    duduclaw_core::agent_toml::default_can_create_agents(role)
+        && duduclaw_core::agent_toml::effective_can_create_agents(
+            sections.permissions.can_create_agents,
+            role,
+        )
+}
+
 /// Create a persistent sub-agent directory with agent.toml, SOUL.md, etc.
 pub(crate) async fn handle_create_agent(
     params: &Value,
@@ -131,6 +152,19 @@ pub(crate) async fn handle_create_agent(
         .get("role")
         .and_then(|v| v.as_str())
         .unwrap_or("specialist");
+    // v1.81 (S2): a `main` employee is the one role that creates employees by
+    // default, so only the current, privileged main employee may hand that
+    // role out through MCP. Everyone else (any other employee, a system
+    // sender, an unidentified caller) is refused before anything is written.
+    if duduclaw_core::agent_toml::default_can_create_agents(Some(role))
+        && !caller_is_privileged_main(home_dir, caller_agent)
+    {
+        tracing::warn!(caller = %caller_agent, requested = %name, "create_agent: role=main refused");
+        return tool_error(
+            "Error: 只有主要 AI 員工（role = main，且 can_create_agents 開啟）可以透過 create_agent 建立 role = main 的員工。\
+             請改用其他角色，或由管理者在儀表板建立。",
+        );
+    }
     let reports_to = params
         .get("reports_to")
         .and_then(|v| v.as_str())
@@ -227,8 +261,11 @@ pub(crate) async fn handle_create_agent(
         warn_threshold_percent = 80
         hard_stop = true
 
+        // v1.81 (S2): an employee created by another employee never
+        // creates employees itself, whatever its role; only the owner can
+        // turn this on (dashboard 「工具與權限」).
         [permissions]
-        can_create_agents = true
+        can_create_agents = false
         can_send_cross_agent = true
         can_modify_own_skills = true
         can_modify_own_soul = false
@@ -248,54 +285,75 @@ pub(crate) async fn handle_create_agent(
     }
     let agent_toml = toml::to_string_pretty(&agent_config).unwrap_or_default();
 
+    // RM-027 round 4: the global org lock is taken at the START of the
+    // creation — before the admission lease (lock order: the org lock always
+    // comes before the lifecycle barrier) — and held to the publish. The
+    // directory is built in an invisible staging sibling and renamed into
+    // place only after its authority row committed; an authority refusal
+    // (lock, corrupt / newer store, a cycle) fails the whole create. There is
+    // no "warn and fall back to agent.toml": that left the new employee
+    // governed by its own mirror forever.
+    let org = {
+        let home = home_dir.to_path_buf();
+        match tokio::task::spawn_blocking(move || duduclaw_core::org_store::lock_org_mutations(&home)).await {
+            Ok(Ok(guard)) => guard,
+            Ok(Err(e)) => return tool_error(&format!("Error: 暫時無法取得組織資料的寫入鎖，AI 員工沒有建立：{e}")),
+            Err(e) => return tool_error(&format!("Error: 暫時無法取得組織資料的寫入鎖，AI 員工沒有建立：{e}")),
+        }
+    };
+
     let admission = match admit_background_identity(home_dir, caller_agent, "create_agent").await {
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
     // These short synchronous writes cannot outlive the admission on cancellation.
-    // Create directory structure
-    if let Err(e) = std::fs::create_dir_all(&agent_dir) {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": format!("Error creating agent directory: {e}")}],
-            "isError": true
-        });
-    }
-    let _ = std::fs::create_dir_all(agent_dir.join("SKILLS"));
+    // Create directory structure (off to the side; dropping `staged` on any
+    // early return removes it).
+    let staged = match duduclaw_core::org_store::StagedAgentDir::create(&org, &agent_dir, name) {
+        Ok(staged) => staged,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return tool_error(&format!("Error: agent '{name}' already exists at {}", agent_dir.display()));
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "content": [{"type": "text", "text": format!("Error creating agent directory: {e}")}],
+                "isError": true
+            });
+        }
+    };
+    let stage_dir = staged.path().to_path_buf();
+    let _ = std::fs::create_dir_all(stage_dir.join("SKILLS"));
     // Shared defaults are installed once; employee SKILLS stays personal.
     duduclaw_gateway::builtin_skills_seed_migration::run(home_dir);
 
-    if let Err(e) = std::fs::write(agent_dir.join("agent.toml"), &agent_toml) {
+    if let Err(e) = std::fs::write(stage_dir.join("agent.toml"), &agent_toml) {
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error writing agent.toml: {e}")}],
             "isError": true
         });
     }
 
-    // WP22 T1 — the agent now exists, so record its authoritative placement in
-    // `<home>/org.toml`; `[agent] reports_to` above is a display mirror from
-    // here on. Written *after* the commit, not before: a create that aborts
-    // must not leave an entry behind for the id, or a later hand-created agent
-    // of the same name would silently inherit this (stale) authority. If the
-    // store write itself fails, the agent simply has no record and the
-    // fallback rule keeps its `agent.toml` governing it — `duduclaw doctor`
-    // stays quiet (no record ⇒ no drift) and the next gated edit records it.
-    if let Err(e) = duduclaw_core::org_store::upsert(
-        home_dir,
-        name,
-        duduclaw_core::OrgEntry::new(&reports_to_display, ""),
-    ) {
-        tracing::warn!(agent = %name, error = %e, "org.toml upsert failed on create_agent");
-    }
-
     // Write SOUL.md if provided
     if !soul.is_empty() {
-        let _ = std::fs::write(agent_dir.join("SOUL.md"), soul);
+        let _ = std::fs::write(stage_dir.join("SOUL.md"), soul);
     }
 
     // Write empty MEMORY.md
-    let _ = std::fs::write(agent_dir.join("MEMORY.md"), "");
+    let _ = std::fs::write(stage_dir.join("MEMORY.md"), "");
 
     drop(admission);
+
+    // WP22 T1 / RM-027 round 4 — still inside the org lock: validate and
+    // commit the authoritative placement in `<home>/org.toml`, then publish
+    // the directory. `[agent] reports_to` above is a display mirror. A
+    // refused row removes the staging directory and fails the tool, so a
+    // create that aborts never leaves a directory or a row behind. No await
+    // separates the commit from the publish.
+    if let Err(e) = staged.publish(&org, duduclaw_core::OrgEntry::new(&reports_to_display, "")) {
+        tracing::warn!(agent = %name, error = %e, "create_agent refused: org authority not committed");
+        return tool_error(&format!("Error: AI 員工沒有建立：{e}"));
+    }
+    drop(org);
 
     // Install agent-file-guard PreToolUse hook so the newly-created agent
     // immediately gets protected against out-of-tree Write/Edit.

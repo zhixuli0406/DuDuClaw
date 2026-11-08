@@ -1,4 +1,5 @@
 mod isolation_io;
+pub mod module_lease;
 pub mod bench;
 pub mod code_map;
 pub mod causal;
@@ -41,7 +42,7 @@ pub use code_map::{CodeMap, CodeMapConfig, RankedFile, SymbolInfo, SymbolKind};
 pub use vector::{EmbeddingProvider, NgramHashEmbedder};
 pub use engine::{
     is_system_signal, DecisionResolveOutcome, DecisionView, KeyFact, MigrationDisposition,
-    NamespaceRow, OnRefused, SqliteMemoryEngine,
+    NamespaceRow, OnRefused, SqliteMemoryEngine, SubjectFact, SubjectTripleForgetReport,
     TemporalMeta, TemporalRecord, word_jaccard, PREDICTION_CONTENT_PREFIX,
     SYSTEM_SIGNAL_SOURCE_EVENTS,
 };

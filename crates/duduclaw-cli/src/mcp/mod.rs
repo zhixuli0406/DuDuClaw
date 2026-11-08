@@ -216,6 +216,7 @@ mod memory_tools;
 mod messaging;
 mod notion_github;
 mod odoo;
+mod odoo_generic_write;
 mod on_behalf_of;
 mod os_tools;
 mod personal_target;
@@ -274,6 +275,7 @@ pub(crate) use memory_tools::*;
 pub(crate) use messaging::*;
 pub(crate) use notion_github::*;
 pub(crate) use odoo::*;
+pub(crate) use odoo_generic_write::*;
 pub(crate) use on_behalf_of::*;
 pub(crate) use os_tools::*;
 pub(crate) use record_authz::*;
@@ -329,6 +331,9 @@ mod mail_tool_tests;
 mod mcp_scope_dispatch_tests;
 #[cfg(test)]
 mod odoo_pool_dispatch_tests;
+/// RM-120: explicit-grant generic `odoo_create` / `odoo_write`.
+#[cfg(test)]
+mod odoo_generic_write_tests;
 #[cfg(test)]
 mod office_script_tests;
 #[cfg(test)]

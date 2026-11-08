@@ -52,7 +52,9 @@ impl UserDb {
         let admin:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND role='admin' AND status='active')",[actor],|r|r.get(0)).map_err(|e|e.to_string())?;
         if !admin {return Err(DENIED.into());}
         active_user(&tx,user)?;
+        let since=crate::admin_eligibility::high_water(&tx)?;
         clear(&tx,user)?;
+        crate::admin_eligibility::stamp_actor(&tx,since,actor)?;
         tx.execute("UPDATE mfa_challenges SET consumed=1 WHERE token_hash=?1",[token_hash(token)]).map_err(|e|e.to_string())?;
         audit(&tx,user,"mfa.reset",Some(actor))?;
         tx.commit().map_err(|e|e.to_string())

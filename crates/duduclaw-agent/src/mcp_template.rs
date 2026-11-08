@@ -328,6 +328,41 @@ pub fn ensure_duduclaw_absolute_path(agent_dir: &Path) -> Result<bool, String> {
     ensure_duduclaw_absolute_path_checked(agent_dir, false)
 }
 
+/// Write a **fresh** `.mcp.json` into `build_dir` for the employee that will
+/// live at `final_dir` once `build_dir` is renamed there (RM-027 round 5:
+/// a staged creation writes its MCP config *before* the publish, so a
+/// failure can never leave a published directory behind).
+///
+/// The entry is exactly what [`ensure_duduclaw_absolute_path`] writes for a
+/// missing file: the `duduclaw` server only, identity (agent id = the final
+/// directory's name, home derived from the final path — so a staging
+/// directory's own name never leaks into the token) and the forward set.
+/// Refuses when the duduclaw binary does not resolve to an absolute path or
+/// when `build_dir` already holds a `.mcp.json`.
+pub fn write_fresh_duduclaw_config(build_dir: &Path, final_dir: &Path) -> Result<(), String> {
+    let abs_bin = duduclaw_core::resolve_duduclaw_bin();
+    if !abs_bin.is_absolute() {
+        return Err(format!(
+            "the duduclaw binary path could not be resolved to an absolute path ({})",
+            abs_bin.display()
+        ));
+    }
+    let agent_id = final_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("agent dir has no file_name: {}", final_dir.display()))?
+        .to_string();
+    let home_dir = derive_home_from_agent_dir(final_dir);
+    let desired = duduclaw_core::mcp_proxy_rewrite::canonical_duduclaw_server(&home_dir, &agent_id, &abs_bin);
+    let path = build_dir.join(".mcp.json");
+    if std::fs::symlink_metadata(&path).is_ok() {
+        return Err(format!("{} already exists", path.display()));
+    }
+    let doc = serde_json::json!({ "mcpServers": { "duduclaw": desired } });
+    let json = serde_json::to_string_pretty(&doc).map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
+    write_owner_only_atomic(&path, json.as_bytes())
+}
+
 fn ensure_duduclaw_absolute_path_checked(agent_dir: &Path, raw_spawn: bool) -> Result<bool, String> {
     let path = agent_dir.join(".mcp.json");
 

@@ -92,13 +92,47 @@ fn shared(f: &Fixture, id: u8, label: &str) -> (ConfirmationItem, Receipt) {
 
 /// A cron receipt for `agent` built from exactly what capture records.
 fn captured(home: &Path, agent: &str, root: &Root) -> RecordAuthority {
-    let (employee, binding, allocation) = capture_binding(home, agent, root).unwrap().expect("a Shared employee");
+    let (employee, binding, allocation, incarnation) = capture_binding(home, agent, root).unwrap().expect("a Shared employee");
     let mut value = super::tests::receipt(home);
     value.agent = agent.into();
     value.employee = employee;
     value.binding = Some(binding);
     value.allocation = Some(allocation);
+    value.incarnation = incarnation;
     value
+}
+
+/// F6b A3: a receipt captured for one incarnation never authorizes another
+/// incarnation of the same employee id (a restore bumps it, §3.5 d).
+#[test]
+fn prior_incarnation_record_authority_refused() {
+    let f = fixture();
+    let home = f.home();
+    let (_, root) = shared(&f, 1, "team");
+    let roots = Root(vec![root]);
+    let value = captured(home, "team", &roots);
+    assert_eq!(value.incarnation, 0);
+    // Incarnation 0 is omitted from the stored form (and approval payload),
+    // so receipts approved before F6 keep matching byte for byte.
+    let encoded = serde_json::to_value(&value).unwrap();
+    assert!(encoded.get("incarnation").is_none() && encoded.get("caller_incarnation").is_none());
+    assert_eq!(check_receipt_lifecycle(&value, &roots), Ok(()));
+    sql(home, APPLY_DB, "UPDATE confirmed_employees SET incarnation=1 WHERE label='team'", &[]);
+    assert_eq!(check_receipt_lifecycle(&value, &roots), Err(VerificationError::Revoked));
+    let fresh = captured(home, "team", &roots);
+    assert_eq!((fresh.employee, fresh.incarnation), (value.employee, 1));
+    assert_eq!(check_receipt_lifecycle(&fresh, &roots), Ok(()));
+    assert_eq!(serde_json::to_value(&fresh).unwrap()["incarnation"], json!(1));
+    store::save(&fresh).unwrap();
+    assert_eq!(store::load(home, "cron", &fresh.id).unwrap(), Some(fresh.clone()));
+    // A forged receipt naming the new incarnation is refused once it moves on.
+    sql(home, APPLY_DB, "UPDATE confirmed_employees SET incarnation=2 WHERE label='team'", &[]);
+    assert_eq!(check_receipt_lifecycle(&fresh, &roots), Err(VerificationError::Revoked));
+    // The caller (delegating source) incarnation is part of the receipt.
+    let mut delegated = fresh.clone();
+    delegated.caller = Some(fresh.employee);
+    delegated.caller_incarnation = 2;
+    assert_eq!(serde_json::to_value(&delegated).unwrap()["caller_incarnation"], json!(2));
 }
 
 #[test]

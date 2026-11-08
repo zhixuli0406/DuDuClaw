@@ -1046,6 +1046,27 @@ where
         }
     };
 
+    // RM-124: a reminder created from a WebChat conversation (only ever via
+    // the gateway-attested origin — see `mcp/reminders.rs`) is appended to
+    // that conversation after the fire-time ownership re-check.
+    if reminder.channel == crate::scheduled_webchat::CHANNEL {
+        let body = format!("⏰ {}", crate::scheduled_webchat::bound(&text));
+        let delivered = match crate::recipient_guard::admit_scheduled_session(
+            home_dir, &reminder.agent_id, &reminder.chat_id,
+        ).await {
+            Ok(()) => crate::scheduled_webchat::deliver(
+                home_dir, &reminder.agent_id, &reminder.chat_id, &body,
+            ).await,
+            Err(reason) => Err(reason),
+        };
+        if let Err(reason) = &delivered {
+            crate::scheduled_webchat::audit_drop(home_dir, &reminder.agent_id, "reminder", &reminder.id, reason);
+        }
+        delivered?;
+        info!(id = %reminder.id, channel = "webchat", mode = ?reminder.mode, "Reminder delivered");
+        return Ok(());
+    }
+
     let recipients = vec![duduclaw_core::recipient_policy::channel_recipient(&reminder.channel, &reminder.chat_id)
         .unwrap_or_default()];
     let recipient_args = serde_json::json!({"reminder_id": reminder.id, "channel": reminder.channel,
@@ -1187,6 +1208,22 @@ pub async fn cancel_reminder(
     }))
     .await
     .map_err(|e| format!("spawn_blocking: {e}"))?
+}
+
+/// Cancel every Pending reminder matching `pred` (RM-124: reminders aimed at
+/// a purged WebChat conversation).
+pub(crate) async fn cancel_pending_where(
+    home_dir: &Path,
+    pred: impl Fn(&Reminder) -> bool + Send + 'static,
+) -> Result<(), String> {
+    mutate_reminders(home_dir, move |reminders| {
+        for r in reminders.iter_mut() {
+            if r.status == ReminderStatus::Pending && pred(r) {
+                r.status = ReminderStatus::Cancelled;
+            }
+        }
+    })
+    .await
 }
 
 /// Dashboard reads fail closed on corrupt or unreadable persistence.

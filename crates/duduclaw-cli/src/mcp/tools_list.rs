@@ -63,10 +63,15 @@ pub(crate) const GITHUB_WORKSPACE_TOOLS: &[&str] = &[
 /// reports the process agent's department). Measured 2026-10-07 on an
 /// isolated home with the 1.70.1 binary; see `docs/guides/mcp-standalone.md`.
 ///
+/// `code_map` (v1.81, S1) scans a directory tree contained in the acting
+/// employee's own directory (`mcp_files::vet_dir`); a caller that is not an
+/// employee has no such directory, so it is listed here too.
+///
 /// Hidden from such callers by [`visible_tools`] and refused to them by the
 /// dispatch gate (`mcp_dispatch.rs`, error class `process_agent_tool`), both
 /// through [`process_agent_tool_refused`], so discoverable ⇔ callable.
 pub(crate) const PROCESS_AGENT_TOOLS: &[&str] = &[
+    "code_map",
     "meeting_upload_link",
     "meeting_transcribe",
     "meeting_transcribe_status",
@@ -431,6 +436,16 @@ pub(crate) async fn visible_tools_in_lane(
     let allow_responsibilities = gated_caller
         && !member_invalid
         && duduclaw_gateway::responsibility::ResponsibilityConfig::from_home(home_dir).enabled;
+    // RM-120: generic `odoo_create` / `odoo_write` need an explicit grant and
+    // the separate per-table opt-in in the employee's own Odoo settings, and
+    // the table must clear the never-writable list, the 功能模組 switch and
+    // the block list. The Odoo handler acts for `default_agent`, so the same
+    // agent and the same predicate (`generic_write_model_gate` over
+    // `allowed_models`) decide the listing.
+    let allow_odoo_create =
+        !member_invalid && super::generic_write_listed(home_dir, default_agent, "odoo_create");
+    let allow_odoo_write =
+        !member_invalid && super::generic_write_listed(home_dir, default_agent, "odoo_write");
 
     // RFC-26: `[fork] enabled` is opt-in per agent and `mcp_fork`'s handlers
     // refuse every fork tool without it. Read through the same shared typed
@@ -463,6 +478,18 @@ pub(crate) async fn visible_tools_in_lane(
                 duduclaw_gateway::capability_grants::CapabilityGrantStore::open(home_dir).ok();
             for tool in tools() {
                 if !duduclaw_gateway::capability_grants::set_contains_tool(&scoped, tool.name) {
+                    continue;
+                }
+                // RM-103 S3: mirror of the dispatch §3.65 exemption — only the
+                // exact intrinsic (`team_handoff`) of a verified role member;
+                // every other tool a wildcard entry covers stays hidden.
+                if gated_caller
+                    && duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(
+                        home_dir,
+                        effective_agent,
+                        tool.name,
+                    )
+                {
                     continue;
                 }
                 let granted = match store.as_ref() {
@@ -522,6 +549,17 @@ pub(crate) async fn visible_tools_in_lane(
     };
     let scoped = duduclaw_gateway::capability_grants::scoped_tools(&agent_dir);
 
+    // v1.81 (S2): `code_map` refuses every caller whose identity does not
+    // resolve to an employee directory (role members included). Listed by
+    // the handler's own predicate — `DUDUCLAW_AGENT_ID` being set is not
+    // enough — so listed ⇒ callable.
+    let code_map_listed = crate::mcp_memory_handlers::code_map_caller(
+        home_dir,
+        &principal.client_id,
+        std::env::var(duduclaw_core::ENV_AGENT_ID).ok().as_deref(),
+    )
+    .is_some();
+
     tools()
         .filter(|t| crate::mcp_isolation::tool_allowed(t.name, principal))
         // SR2 1a: refused on every transport in native Linux protected mode,
@@ -561,6 +599,8 @@ pub(crate) async fn visible_tools_in_lane(
         .filter(|t| allow_knowledge || !super::KNOWLEDGE_TOOLS.contains(&t.name))
         .filter(|t| t.name != "credential_declare" || (gated_caller && !member_invalid))
         .filter(|t| allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name))
+        .filter(|t| t.name != "odoo_create" || allow_odoo_create)
+        .filter(|t| t.name != "odoo_write" || allow_odoo_write)
         // O7: PORTICO scoped tools without an active grant.
         .filter(|t| {
             (principal.is_external && !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
@@ -573,6 +613,14 @@ pub(crate) async fn visible_tools_in_lane(
             (principal.is_external && !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
                 || crate::mcp_dispatch::action_rule_verdict(&action_rules, t.name)
                     != Some(duduclaw_core::ActionVerdict::Block)
+                // RM-103 S3: mirror of the dispatch exemption for a team role
+                // member's intrinsic (`team_handoff`).
+                || (gated_caller
+                    && duduclaw_gateway::ephemeral::is_role_member_intrinsic_call(
+                        home_dir,
+                        effective_agent,
+                        t.name,
+                    ))
         })
         // 2026-10: read-only explore lane (mirror of dispatch §0b).
         .filter(|t| lane_refusal(lane, t.name).is_none())
@@ -581,6 +629,7 @@ pub(crate) async fn visible_tools_in_lane(
         .filter(|t| {
             !process_agent_tool_refused(t.name, principal, client_is_agent, employee_process)
         })
+        .filter(|t| t.name != "code_map" || code_map_listed)
         // Discovery only, LAST: neither grants nor authorization are changed.
         // An active scoped task grant always remains discoverable.
         .filter(|t| pruning_mode != duduclaw_core::tool_pruning::Mode::On

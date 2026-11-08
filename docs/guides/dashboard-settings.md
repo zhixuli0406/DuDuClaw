@@ -27,6 +27,8 @@ This page lists what can be set from the dashboard as of v1.68.0: which page, wh
 
 Other languages: [繁體中文](zh-TW/dashboard-settings.md) · [日本語](ja-JP/dashboard-settings.md)
 
+**Protected-mode public web (native Linux protected mode, config only for now):** whether an AI employee's protected runs may use `web_fetch_cached` and `web_extract` is set per employee in `agents/<id>/agent.toml` with `[isolation] public_web = true` (default `false`, no web access). There is no dashboard control yet: edit the file, or use the Admin configuration editor (`agent:<id>`), which reports the key as a protected change. The employee form's key/value editor refuses the `[isolation]` section, a non-Admin `agents.update` cannot change it, and the employee's own file edits of the section are refused. This switch is separate from the employee form's **network access** (`[container] network_access`), which still only controls the task sandbox's network. Even when enabled, protected fetches reach only public HTTPS sites (no IP addresses, internal names or redirects). Installations that are not in protected mode ignore the key.
+
 Goal cost and loop guards currently use the **Advanced config editor**, without dedicated Automation controls. In `config.toml [goal_loop]`, `default_cost_cap_cents = 0` sets the fallback goal ceiling in US cents (`0` = no cap), and `tool_streak_pause = 8` pauses after that many identical consecutive tool calls within one finished round (`0` = disabled). Saving in the Advanced config editor reloads the goal loop; direct edits to `config.toml` require a gateway restart. `tool_streak_advisory` independently controls the existing hints. Per-goal ceilings are set when assigning a goal; `/goals` shows spend and lets an authorized operator raise a paused goal's ceiling and retry.
 
 
@@ -56,6 +58,20 @@ no_success_hours = 6    # 1..168
 ```
 
 An absent configuration file or omitted section uses these defaults. Read errors other than a missing file, or invalid settings, disable health reminders. Turning reminders off does not grant employee permissions or change task execution. The health page remains read-only.
+
+## Employee edit page → Tools & permissions → Tool permissions (v1.81.0)
+
+The **Tools & permissions** tab of the employee edit page has two sub-tabs: **Tool permissions** and **Permission history**. The table lists every catalog tool by category, with a **Can use** and a **Needs approval** column, a per-category select-all (`N/M can use`) and a search box. Edits stay in a draft: changed rows are marked, a sticky bar offers **Discard changes** / **Save**, and Save opens a confirmation that counts newly allowed, no-longer-allowed and needs-approval tools with a per-tool before → after line. Confirming writes through the normal `agents.update` `capabilities` payload. Only an Admin can change anything; other accounts get the same table read-only, with every checkbox disabled and no select-all or save bar.
+
+How the table maps to `agent.toml [capabilities]`:
+
+- **Can use** = not matched by `denied_tools`, and either `allowed_tools` is empty or matches the tool (the gateway's own rule: denied always wins, a non-empty allow list is allowlist mode). Matching is anchored and wildcard-aware, e.g. `mcp__duduclaw__*`.
+- Unticking a tool always **appends it to `denied_tools`**; `allowed_tools` is never shrunk or rewritten, so a wildcard allow list stays exactly as written and every tool it covers shows as allowed. Re-ticking removes that deny entry. A tool covered by a *wildcard* deny entry cannot be turned on here (the row is locked); edit the entry in Advanced settings.
+- **Needs approval** = `approval_required_tools` (bare tool names), the list the MCP dispatch gate enforces for every tool. A tool already asked by a wildcard approval entry or an `action_rules` `ask` rule shows as needs-approval but is locked. The checkbox is disabled while **Can use** is off.
+
+The previous Allow list, Block list, Action rules and Approval list blocks now sit in a collapsed **Advanced settings** at the bottom of the tab and stay in sync with the table.
+
+**Permission history** (Admin only) lists changes to this employee's permissions from the `agent_authority_changed` audit rows: time, who, and each tool's old state struck through → new state. Changes not saved from the table are marked **Changed in Advanced settings** (this also covers older changes made before the table existed). The tab is backed by the Admin-only `agents.permission_history` RPC (`agent_id`, `limit` up to 100, `cursor`), which reads the same audit log as `security.audit_log`.
 
 ## Employee sidebar
 
@@ -134,7 +150,25 @@ Enterprise setting (v1.76.0, User Management → Organisation settings): `users.
 - When `config.toml` does not parse, `system.update_config`, the live data feed editor and the Advanced config editor refuse to write; fix the syntax in the Advanced config editor first. The other settings pages that write `config.toml` (channels, accounts, Odoo and so on) refuse in the same way.
 - A save edits the file in place: only the keys you changed are rewritten. Comments, blank lines, key order and the formatting of every untouched key stay exactly as you wrote them, and a changed value keeps the comment at the end of its line. A new key goes at the end of its section and a new section at the end of the file. This holds for every settings page that writes `config.toml` or `inference.toml`, not only the Advanced config editor.
 - Keys that only take effect after a restart come back in `restart_required`. The Settings and Channels pages show "These settings take effect after the gateway restarts" until the gateway has restarted (you can also dismiss it). The Inference page and the employee edit page do not show this banner.
-- Each change to one of these keys also writes the audit event `config_protected_key_changed` with the old and new value: `acp.trusted`, `tick.allow_command_sources`, `container.sandbox.when_unavailable`, `container.sandbox.script_when_unavailable`, `memory.supersession_trust_guard`.
+- Each change to one of these keys also writes the audit event `config_protected_key_changed` with the old and new value: `acp.trusted`, `tick.allow_command_sources`, `container.sandbox.when_unavailable`, `container.sandbox.script_when_unavailable`, `memory.supersession_trust_guard`, `dashboard.public_url`.
+
+## Settings → General → Dashboard public URL
+
+Admins set `[dashboard] public_url` here: the full address people use to reach the dashboard, including any reverse proxy sub-path, for example `https://example.com/agents/`. It must use HTTPS; HTTP is allowed only for `localhost`, `127.0.0.0/8` or `::1`. The URL must have no user name or password, query (`?`), fragment (`#`), `..` or encoded `/` / `\`. The gateway refuses anything else on save; a value that was hand-edited into `config.toml` and is invalid makes OAuth sign-ins refuse to start until it is fixed (they never fall back silently to an address without the sub-path). Leave the field empty to clear the key. The change applies immediately and writes `config_protected_key_changed`.
+
+When public_url is set, it is used for every OAuth callback and return link, with the sub-path kept:
+
+| Flow | Callback URL the provider redirects to | Where the browser lands afterwards |
+|---|---|---|
+| Remote MCP server (Integrations → MCP → Remote servers) | `<public_url>/oauth/mcp/callback` (registered automatically by dynamic client registration) | `<public_url>/manage/integrations?tab=mcp&mcp_tab=remote` |
+| Personal Google account (My connections) | `<public_url>/api/me/google/callback` | `<public_url>/me/connections` |
+| Built-in Google Workspace, GitHub, Notion and Slack OAuth | `<public_url>/api/mcp/oauth/callback` | The result page links to `<public_url>/manage/integrations?tab=google` (Google) or `?tab=mcp` |
+
+- **Register the new callback URL.** After you set or change public_url, add the new callback URL to each OAuth app you use: Google Cloud Console → Credentials → your OAuth client → Authorized redirect URIs, and the GitHub OAuth App's Authorization callback URL (a GitHub OAuth App has one callback URL, so replace it). Do the same for Notion and Slack apps. The Integrations page shows the exact URL to register. A sign-in that was already in progress finishes with the URL it started with.
+- The browser's own origin is still checked first: a direct redirect is only used when the dashboard is opened on a loopback address or on an https origin listed in `[gateway] allowed_origins`. Otherwise the paste-back flow at `http://127.0.0.1:<port>/…` is used as before (that loopback address never has a prefix). If the dashboard is opened on an allowed origin other than public_url, the redirect still goes to public_url, and the gateway logs a warning once.
+- Without public_url nothing changes: remote MCP and personal Google sign-ins return to the browser's origin with no path, and the built-in providers use `http://localhost:<port>/api/mcp/oauth/callback`.
+- Reverse proxy: forward `<prefix>/oauth/mcp/callback` and `<prefix>/api/…` to the gateway with the prefix removed.
+- Limitation: the dashboard app itself is built for the root path. It loads `/assets/…`, calls `/api/…` and `/ws`, and its page routes have no base path. Serving it under a sub-path therefore also needs the proxy to send those root paths to the gateway, or the dashboard needs its own host name. public_url fixes the OAuth callback and return addresses; it does not make the dashboard app prefix-aware. When the page has a same-origin `<base href>` (for example injected by the proxy), the dashboard sends that sub-path with OAuth starts and member invitations; the gateway still validates it.
 
 ## Settings → Advanced → Automation
 
@@ -156,6 +190,13 @@ Enterprise setting (v1.76.0, User Management → Organisation settings): `users.
 |---|---|---|
 | Global background tasks → Global utility provider / model | `[runtime] utility_provider` / `utility_model` | Immediately (read per call) |
 | General → Log format | `[logging] format` (`json`; any other value is plain text) | After restart |
+| General → AI employee reply language (default) | `[general] default_language` (`zh-TW`, `zh-CN`, `en`, `ja-JP`; empty or "Follow input language" = reply in the user's language). Pins the reply language for every AI employee, and a one-line reminder is added to the end of each turn so long content in other languages does not pull the reply away | Next message |
+| Edit AI employee → Basics → Reply language | `[prompt] reply_language` in the employee's `agent.toml` (`auto`, `zh-TW`, `zh-CN`, `en`, `ja-JP`; also settable through `agents.update` `reply_language` and the MCP `agent_update` tool). "Use global setting" removes the key and falls back to `[general] default_language`; `auto` follows the user's language for this employee even when a global language is pinned. Any other value is refused | Next message |
+
+Reply language applies to channel replies, dispatched tasks, cron jobs, goal loops, sub-agents and task sandbox system prompts. A user's explicit request for another language takes priority. Only administrators can change an employee's `reply_language`; employees cannot edit that key themselves. RPC/MCP writes reject values outside the employee choices. Invalid values already on disk are ignored with a warning and fall back to the global setting. Global codes must match `^[A-Za-z]{2,3}([-_][A-Za-z0-9]{2,8}){0,2}$`; only recognised Chinese, English and Japanese codes produce prompt instructions or reminders.
+
+Fixed failure and machine-operation refusal messages support zh-TW, zh-CN, en and ja-JP. With employee `auto`, these messages use the global language because no user-language detection is available; an unset or unsupported global language falls back to zh-TW. Other system notices, including channel `@` routing notices, currently support zh-TW/en/ja only and fall back to zh-TW for zh-CN.
+
 | Display name | `[general] name` | After restart (the local-network announcement is built at boot) |
 | Account health check interval | `[rotation] health_check_interval_seconds` | After restart |
 | Task sandbox → sandbox image, when the sandbox is unavailable (tasks), when the sandbox is unavailable (scripts) | `[container.sandbox] image`, `when_unavailable`, `script_when_unavailable` | Immediately (read per task) |
@@ -171,6 +212,21 @@ Enterprise setting (v1.76.0, User Management → Organisation settings): `users.
 Global background tasks without an assigned employee (such as employee selection and redaction-rule creation) default to Claude / `claude-haiku-4-5`. Select a supported provider and enter a compatible model; removed `gemini` and unknown provider values are refused by the server. Clearing the model removes the key: Claude uses `claude-haiku-4-5`; OpenAI-compatible endpoints require an explicit model. Codex is also supported in its restricted utility profile and uses the CLI default when the model is blank. Grok and generic CLI providers are refused at execution even when their settings can be saved. A model from a known different vendor family shows an inline warning for non-Claude providers. Saves require admin access and use the standard config commit path. An inline alert appears when the selected global provider is Claude and no employee uses the Claude runtime; it does not check whether Claude is logged in.
 
 `[general] log_level` (Settings → Advanced → Security and records → Log Level) applies as soon as it is saved, unless the environment variable `RUST_LOG` is set, in which case the save reports a restart. Saving the account rotation strategy or the rate-limit cooldown clears the rotation cache, so the next call uses the new value (before, the change could lag by up to 30 minutes).
+
+## Settings → Advanced → Security and records → Memory: personal topics
+
+| Control | Key | Takes effect |
+|---|---|---|
+| What automatic memory does not record (New in 1.81) → Health / Family / Personal finances / Salary | `[memory_privacy] excluded_categories` (`health`, `family`, `personal_finance`, `salary`) | Immediately (read per write; the next message uses it) |
+| What automatic memory does not record → Custom keywords (per category) | `[memory_privacy.custom_keywords]` | Immediately |
+
+All four switches are on by default, including on existing installs whose `config.toml` has no `[memory_privacy]` section. A switched-on topic is never stored by automatic memory: conversation distillation, profile traits, footprint distillation, Reflexion rules and the persona-induction bridge. When a colleague explicitly asks an AI employee to remember something, it is stored anyway. Matching is keyword-based, so work content that names a topic can be skipped too (for example a "health check report template"). Saving requires admin access. Every change on this card saves immediately (you see "Saved"; if the gateway refuses it, the card goes back to the previous state and shows a message); it is not part of the page's Save button. To add your own wording, open "Custom keywords" under a category, type a keyword and press Add; remove one with its × button. Custom categories set in `config.toml` are kept untouched.
+
+### My memory (every signed-in user)
+
+**My memory** (Settings group in the sidebar, `/me/memory`; employees reach it from the account menu) lists what AI employees have remembered about the signed-in person. Each row shows the content, the AI employee, the time and a source tag (Conversation, Asked to remember, Other). Filter by source or AI employee, use **Load more** to see older items, and delete anything that should not be remembered: after you confirm, AI employees will not automatically learn it again, but if you explicitly ask one to remember it later it is recorded again. Filters apply to the items loaded so far; "Showing N memories" counts what is loaded.
+
+Custom categories and extra keywords are set in the advanced config editor under `[memory_privacy.custom_keywords]` (for example `legal_dispute = ["訴訟", "lawsuit"]`), then listed in `excluded_categories`. An unknown category name is refused on save. If `config.toml` cannot be read or the section is invalid, the gateway applies the four defaults and logs a warning; `system.config` then reports `memory_privacy.load_state = "failed_closed"`. Details and the "my memory" RPCs: [Memory Intelligence](../features/20-memory-intelligence.md#personal-topics-automatic-memory-never-keeps-rm-039).
 
 ## Channels
 
@@ -244,9 +300,13 @@ Closing the socket does **not** cancel accepted turns, including queued messages
 
 ## Integrations → Odoo → Schema snapshot
 
-**Re-scan Odoo structure** calls `odoo.schema_scan` and is available only to an administrator; the RPC enforces the same role. Save the connection settings first: this action scans the saved global connection, not unsaved form values. The page shows the last scan time, scan-time server version, model / field counts, truncation, latest failure and the latest diff summary. A server-version mismatch recommends another scan. It does not change Odoo data, permissions or the shared wiki. Manual attempts, including failures, share a persisted 60-second cooldown for the saved profile; an early retry reports how many seconds to wait. Both dashboard actions (`odoo.schema_scan` and `odoo.discover_schema`) share this cooldown and scan lock. The wiki workflow sanitizes identifiers and labels before writing, marks external metadata as data rather than instructions, and retains technical field types and relations.
+**Re-scan Odoo structure** calls `odoo.schema_scan` and is available only to an administrator; the RPC enforces the same role. Save the connection settings first: this action scans the saved global connection and every employee’s effective overrides. Unsaved form values are not scanned. The page shows the last scan time, scan-time server version, model / field counts, truncation, latest failure and the latest diff summary. A server-version mismatch recommends another scan. It does not change Odoo data, permissions or the shared wiki. Manual attempts, including failures, share a persisted 60-second cooldown for the saved profile; an early retry reports how many seconds to wait. Both dashboard actions (`odoo.schema_scan` and `odoo.discover_schema`) share this cooldown and scan lock. The wiki workflow sanitizes identifiers and labels before writing, marks external metadata as data rather than instructions, and retains technical field types and relations.
 
-The first successful connection without a snapshot, or after a server-version change, schedules a background scan without delaying the connection. Automatic attempts are capped at once per hour per effective profile, including failures. To refresh same-version customizations, use the button. The existing **Scan database** action remains a separate shared-wiki workflow. See [schema scans](../features/12-industry-templates.md#schema-scans-and-field-compatibility) for bounds and storage.
+Rescan covers the saved global connection and every employee’s effective `[odoo]` settings, including company scope. Authenticated identities are deduplicated, at most two connections scan concurrently, and results show Ready or Failed for each employee. Metadata stays isolated by connection identity; one Odoo user never reuses another user’s snapshot. The dashboard actions share their persisted 60-second manual cooldown. After successful preparation, obsolete profile data is removed only if all effective identities are known. Cleanup holds a catalog lock while deleting idle lock files; an in-progress scan and its lock are preserved.
+
+The long-lived gateway holding the instance lock checks every effective identity every 30 minutes, starting at gateway startup. It scans missing or truncated snapshots, changed server versions, changed installed-module names/versions, or missing access metadata. Completed scans and definitive failures consume the one-hour automatic slot; cancellation does not. MCP turns never launch scans. While preparation is pending, use `odoo_schema_fields` for a specific model. Same-version field-only changes still require a manual scan; reconnect active sessions with `odoo_connect` to refresh live field caches.
+
+The overview without filters returns model names and short labels only, capped at 16 KiB. Fields are included only for a specific `model` or a query matching at most five authorized models, capped at 32 KiB. Responses include total matching model count and truncation. The shared-wiki summary is capped at 16 KiB; `odoo/schema-fields` remains a search-only `deep` reference page capped at 32 KiB and is not automatically injected into context.
 
 ## Integrations → Odoo → Employee permissions
 
@@ -436,6 +496,18 @@ The page shows one update order for the whole install. When the desktop app is a
 
 When a newer gateway binary is already on disk but not running (an npm install, a manual swap, an update whose restart never happened), the button reads "Restart the gateway to apply v…" and calls `system.restart_pending_update` (admin). The gateway refuses it unless the on-disk version really differs from the running one, and refuses it inside a container or for the desktop sidecar, which restart through their owner. Restarting the desktop app does not restart an external gateway.
 
+### macOS: DuDuClaw Gateway.app (v1.81.0)
+
+On macOS the gateway now ships as a signed app, `DuDuClaw Gateway.app` (identifier `ai.duduclaw.gateway`, the same for CE and Pro). macOS keeps folder, automation and Full Disk Access grants for an app across updates, so you grant them once instead of after every release. A bundle install updates only from the release's signed `duduclaw-darwin-<arch>.app.zip`. Before the app is replaced, the gateway checks its signature against the pinned DuDuClaw developer identity and against the installed app's own signature, and checks that the app's identifier, version and edition match the signed release. The new app is swapped in atomically and run once (`version`). If any check fails, the update is refused and the installed app is left untouched or put back.
+
+A gateway still running as a bare binary (standalone or npm) moves into the app in one of three ways:
+
+- Automatically, once, on the first v1.81 start under the login service (launchd) when auto-update is on.
+- **Move to DuDuClaw Gateway.app** on this page (`system.migrate_bundle`, admin).
+- `duduclaw service migrate-bundle` in a terminal. Then run `duduclaw service restart`.
+
+The move installs the app to `~/Applications/` (npm: inside the npm platform package) and replaces the old binary with a link to the app, so existing commands keep working. It also points the login service at the app and restarts the gateway from it. Afterwards macOS asks once for folder access for the new app. The page shows this notice once after the move.
+
 ## Thinking display
 
 No dedicated control yet; set these in the Advanced config editor (below). Both are read on every turn, so a change applies from the next reply.
@@ -591,7 +663,7 @@ The work timeline answers who finished what, who is stuck, and what needs your d
 mfa_enforced = true
 ```
 
-New team installs enforce MFA by default. Existing installs keep their current policy, including legacy stores without MFA policy records. An Admin enables or disables enforcement with the dashboard toggle under **Users → Two-factor login management**. On a new team install, the first Admin must use a host-issued enrollment code (`duduclaw ops users mfa-enrollment-code <email> <challenge_ref>`) after password login, then complete authenticator enrollment; without a configured Email factor, the dashboard alone cannot finish this first enrollment. For existing installs with enforcement off, check `mfa.overview`, channel delivery and host recovery before enabling. Both dashboard config writers require a current active Admin. Enrollment and later credential changes invalidate older JWTs through a per-user epoch; enforcement alone lets existing access tokens expire naturally and refuses unenrolled refresh. Legacy shared-token WebSocket login is refused when enforced.
+New team installs enforce MFA by default. Existing installs keep their current policy, including legacy stores without MFA policy records. An Admin enables or disables enforcement with the dashboard toggle under **Users → Two-factor login management**. On a new team install, after password login, the first Admin can complete first enrollment through mailbox verification when SMTP or licensed relay is available. Otherwise, a host operator must issue an enrollment code with `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>`, and the Admin must use it to complete authenticator enrollment; the dashboard alone cannot finish that enrollment. For existing installs with enforcement off, check `mfa.overview`, channel delivery and host recovery before enabling. Both dashboard config writers require a current active Admin. Enrollment and later credential changes invalidate older JWTs through a per-user epoch; enforcement alone lets existing access tokens expire naturally and refuses unenrolled refresh. Legacy shared-token WebSocket login is refused when enforced.
 
 Configuration is an in-memory snapshot, loaded at boot and after dashboard writes; external file changes reload every 30 seconds. A failed reload warns and preserves the last good value; every edition with no valid snapshot fails closed; an existing unreadable or corrupt policy store also refuses boot. A missing `[auth]` table or key retains the durable policy; new team provisioning explicitly records true in both config and the identity store. Enforcement follows the stored policy in every edition, including license expiry, license fallback and an explicit Personal override; only an Admin deliberately turning it off disables it. Fresh Personal installs without a policy store stay unenforced. Local auto-login cannot bypass enforced MFA. Host recovery works under Personal too. See [Security defense](../features/05-security-defense.md) for proof fields, session binding and `duduclaw ops users mfa-reset` / `mfa-enrollment-code` host recovery. Key rotation is out of scope.
 
@@ -605,7 +677,42 @@ Every boot attempts singleton ownership exactly once, early, even without a pend
 
 ### Email codes, passkeys and keep me signed in (since v1.80.0)
 
-In **Settings → Account**, you can keep the existing authenticator app and add **Email verification code** or one or more named **Passkeys**. Enter your current password before adding or removing a method. Email setup sends a six-digit code to the account email; the factor is activated only after successful verification. Administrators must configure the existing `[channels.email]` SMTP sender (`smtp_host`, `from_addr` and, when required, SMTP credentials). Without a usable sender, the option is unavailable. Factor changes are audited and trigger an email notice when system email is configured.
+In **Settings → Account**, you can keep the existing authenticator app and add **Email verification code** or one or more named **Passkeys**. Enter your current password before adding or removing a method. Email setup sends a six-digit code to the account email; the factor is activated only after successful verification. The system prefers the existing `[channels.email]` SMTP sender (`smtp_host`, `from_addr` and, when required, SMTP credentials). Without SMTP, DuDuClaw can relay verification codes for a valid paid license bound to this machine, excluding NFR licenses, when relay is enabled below. Factor changes are audited; security-change notices still use configured SMTP only.
+
+#### Email verification relay configuration
+
+Set this in the gateway's `config.toml`:
+
+```toml
+[mfa]
+email_relay = true
+```
+
+`email_relay` defaults to `true`. Setting it to `false` disables licensed relay only; it does not disable your SMTP sender or MFA enforcement. OpenSource, Hobby trial, Partner, NFR, unbound OEM, invalid and expired licenses cannot use relay. Partner licenses remain excluded even when a legacy license records `nfr = false`. Configure SMTP for these installations. Relay uses the official host compiled into the gateway, independently of license-refresh settings. `DUDUCLAW_CONTROL_URL`, the license's `control_url`, configuration and environment overrides cannot change the relay destination. Its dedicated transport uses HTTPS on port 443, pins public DNS results, refuses proxies and redirects, times out after 10 seconds and caps responses at 4 KiB.
+
+The first eligible send enrolls the installation with a challenge–response exchange: the gateway requests a single-use challenge for its subscription, then sends the signed license, machine fingerprint, challenge and issue time with an Ed25519 signature from the installation key (see below). The server derives the installation ID from the approved public key. When enrollment replaces an existing relay credential, the request also proves possession of that credential with an HMAC over the same signed message. Response bodies are held in fixed-capacity buffers that are cleared on release; copies made inside the HTTP and TLS libraries cannot be cleared. The returned relay credential is saved in `<home>/state/mfa-relay.json` with owner-only access: Unix uses mode 0600, and macOS also rejects extended ACLs; Windows uses a private DACL and pinned handles. Writes use pinned directory handles, refuse symbolic links and publish by atomic rename. Subsequent sends contain only the recipient, code and locale; HMAC request signatures bind the method, path, timestamp, nonce and exact body. They do not send the license again. All enrollment attempts, including failed first enrollments, share a persisted limit of one attempt per hour; restarting the gateway does not reset it. On `403 relay_not_allowed`, a send can re-enroll and retry at most once, if that hourly limit permits it. Each subscription keeps one active relay credential, and only the installation whose key the account owner approved can enroll.
+
+#### Installation key and license-console approval
+
+Each installation has its own Ed25519 key in `<home>/state/installation.key` (a 32-byte seed with the same owner-only protections as the relay credential). It is separate from `identity.key`. The key is created only when the file does not exist: on `duduclaw license activate`, on a license refresh (gateway or `duduclaw license refresh`), or by `duduclaw license installation-key`. An unreadable, malformed or unsafe file (wrong owner or permissions, symbolic link, extra hard link, extended ACL) is reported and never replaced; the relay stays unavailable until you fix or restore it. AI employees cannot read anything under `state/` through the file guard. Include the key in home-directory backups.
+
+License refresh and rebind requests send the public key as `installation_pubkey`. The relay is available only after the license carries the same signed public key. A key the license service has not seen creates a pending request in the license console and the account owner is notified. Paid features keep working while the request is pending, and SMTP can still deliver codes; only the relay waits. Every existing installation must be approved once.
+
+Before approving, compare fingerprints. On the gateway host, run:
+
+```bash
+duduclaw license installation-key
+```
+
+Line 1 is the 16-character fingerprint, for example `1a2b-3c4d-5e6f-7a8b`: the first 16 hexadecimal characters of SHA-256 over the raw 32-byte public key, in groups of four. Details (public key, approval state) go to stderr. While approval is pending, administrators also see the fingerprint under the Email explanation in **Settings → Account**. Approve only when the console shows the same fingerprint. A request you do not recognize means someone else has a copy of the license file; reject it.
+
+If the key is lost (for example after moving to a new machine without the home directory), the next refresh generates a new key and requests approval again. The signed in account owner can pre-authorize one fingerprint in the console for 24 hours so that refresh is approved automatically. If only the relay credential is lost, use **Reset relay credential** in the console; the next enrollment counts as the first one.
+
+When the relay is waiting, the Email explanation says either that the installation awaits approval (no key in the license yet) or that this installation's key differs from the approved key (for example after a restore to another machine).
+
+Relay uses a fixed verification-code template, without custom subjects or body text. Codes and relay secrets are never logged. Gateway recipient logs use a domain-separated HMAC with the existing per-home audit key, or the fixed value `unavailable` when that key cannot be loaded. The control plane applies additional delivery limits. If delivery is too frequent, wait before retrying; for other delivery failures, retry later or contact an administrator. A code already issued locally can still be verified if delivery later becomes unavailable. Local eligibility does not establish delivery; real relay delivery still needs acceptance testing.
+
+When Email is disabled, the dashboard explains that neither a configured sender nor eligible licensed relay is available, that relay is disabled, that the license type does not include relay (NFR or unbound OEM), or that the installation key awaits approval in the license console, and tells an administrator to configure SMTP in the meantime. Disabled passkeys distinguish an insecure connection from an unsupported browser. For an `http://` LAN address, use the configured HTTPS dashboard URL or localhost on the gateway host; for an unsupported browser, switch to one that supports passkeys.
 
 Each option needs the following:
 
@@ -635,7 +742,7 @@ Refresh uses an authenticated family generation, with one current token hash per
 
 The persistent credential is not available to JavaScript or stored in localStorage: the cookie is HttpOnly, SameSite=Strict, scoped to `/api/session` and Secure on HTTPS. The server stores only hashes, rotates on use and revokes a family on reuse of an older credential. Cookie endpoints check Origin; dashboard WebSocket upgrades also validate Origin.
 
-Acceptance remains pending for real SMTP delivery, browser/platform passkey registration and login, cross-platform Rust builds, dependency audit and full gateway integration tests. UI code and written tests alone do not establish those results.
+Acceptance remains pending for real SMTP and licensed-relay delivery, browser/platform passkey registration and login, cross-platform Rust builds, dependency audit and full gateway integration tests. UI code and written tests alone do not establish those results.
 
 ### Dashboard two-factor login
 

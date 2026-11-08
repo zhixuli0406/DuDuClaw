@@ -15,12 +15,16 @@ fn odoo_wiki_label(label: &str) -> String {
     out
 }
 
-/// Render the compact Odoo schema summary (wiki `context`
-/// layer). Lists custom (`x_`) models in full and caps the business-model roll
-/// so the context page stays small.
-pub(crate) fn render_odoo_schema_summary(report: &duduclaw_odoo::SchemaReport) -> String {
+/// Render the compact Odoo schema summary (wiki `deep` layer — reference-only,
+/// never auto-injected into context). Lists custom (`x_`) models in full and
+/// caps the business-model roll so the page stays small. Models invisible
+/// under `policy` (blocked / switched off) and relations to them are removed.
+pub(crate) fn render_odoo_schema_summary(
+    report: &duduclaw_odoo::SchemaReport, policy: &duduclaw_odoo::schema::ScanPolicy,
+) -> String {
     let mut safe = report.clone();
     duduclaw_odoo::schema::sanitize_report(&mut safe);
+    policy.retain_report(&mut safe);
     let report = &safe;
     const MAX_BUSINESS_ROWS: usize = 60;
     let custom: Vec<&duduclaw_odoo::SchemaModel> =
@@ -29,7 +33,7 @@ pub(crate) fn render_odoo_schema_summary(report: &duduclaw_odoo::SchemaReport) -
         report.models.iter().filter(|m| !m.custom).collect();
 
     let mut s = String::new();
-    s.push_str("---\ntitle: Odoo 資料表結構摘要\nlayer: context\ntags: [odoo, schema]\n---\n\n");
+    s.push_str("---\ntitle: Odoo 資料表結構摘要\nlayer: deep\ntags: [odoo, schema]\n---\n\n");
     s.push_str("# Odoo 資料表結構摘要\n\n");
     s.push_str(ODOO_METADATA_NOTICE);
     s.push_str(&format!(
@@ -63,23 +67,31 @@ pub(crate) fn render_odoo_schema_summary(report: &duduclaw_odoo::SchemaReport) -
             business.len() - MAX_BUSINESS_ROWS
         ));
     }
+    if s.len() > 16 * 1024 {
+        s = duduclaw_core::truncate_bytes(&s, 16 * 1024 - 160).to_string();
+        s.push_str("\n\n_摘要已截斷；請用 odoo_schema_fields 查單一資料表。_\n");
+    }
     s
 }
 
 /// Render the full per-model field tables (wiki `deep` layer, search-only).
 /// Pre-truncated so it comfortably fits under `WikiStore`'s page-size cap.
-pub(crate) fn render_odoo_schema_details(report: &duduclaw_odoo::SchemaReport) -> String {
+/// Models invisible under `policy` and relations to them are removed.
+pub(crate) fn render_odoo_schema_details(
+    report: &duduclaw_odoo::SchemaReport, policy: &duduclaw_odoo::schema::ScanPolicy,
+) -> String {
     let mut safe = report.clone();
     duduclaw_odoo::schema::sanitize_report(&mut safe);
+    policy.retain_report(&mut safe);
     let report = &safe;
-    const MAX_BYTES: usize = 200_000;
+    const MAX_BYTES: usize = 32 * 1024;
     let mut s = String::new();
     s.push_str(
         "---\ntitle: Odoo 資料表欄位明細\nlayer: deep\ntags: [odoo, schema, fields]\n---\n\n",
     );
     s.push_str("# Odoo 資料表欄位明細\n\n");
     s.push_str(ODOO_METADATA_NOTICE);
-    for m in &report.models {
+    'models: for m in &report.models {
         let custom_tag = if m.custom { " (自訂)" } else { "" };
         s.push_str(&format!("## `{}` — {}{}\n\n", m.model, odoo_wiki_label(&m.name), custom_tag));
         for f in &m.fields {
@@ -89,14 +101,18 @@ pub(crate) fn render_odoo_schema_details(report: &duduclaw_odoo::SchemaReport) -
                 .as_deref()
                 .map(|r| format!(" → {r}"))
                 .unwrap_or_default();
-            s.push_str(&format!(
-                "- `{}`: {}{}{} — {}\n",
-                f.name, f.ttype, rel, req, odoo_wiki_label(&f.label)
-            ));
+            let row = format!("- `{}`: {}{}{} — {}\n", f.name, f.ttype, rel, req, odoo_wiki_label(&f.label));
+            if s.len() + row.len() > MAX_BYTES - 160 {
+                s = duduclaw_core::truncate_bytes(&s, MAX_BYTES - 160).to_string();
+                s.push_str("\n_…輸出過長已截斷，請用 odoo_schema_fields 查詢個別資料表。_\n");
+                break 'models;
+            }
+            s.push_str(&row);
         }
         s.push('\n');
-        if s.len() > MAX_BYTES {
-            s.push_str("\n_…輸出過長已截斷，請用 `odoo_schema_fields` 查詢個別資料表。_\n");
+        if s.len() > MAX_BYTES - 160 {
+            s = duduclaw_core::truncate_bytes(&s, MAX_BYTES - 160).to_string();
+            s.push_str("\n_…輸出過長已截斷，請用 odoo_schema_fields 查詢個別資料表。_\n");
             break;
         }
     }
@@ -109,12 +125,23 @@ pub(crate) fn render_odoo_schema_details(report: &duduclaw_odoo::SchemaReport) -
 /// (`read`/`search`/`write`/`create`/`unlink`/`action`/`execute`) or a qualified `verb:model`
 /// form (e.g. `write:crm.lead`). The model part is validated like an Odoo model
 /// name (alphanumeric + `.` + `_`).
+///
+/// RM-120: the generic-write opt-in tokens `generic_create:<model>` /
+/// `generic_write:<model>` are accepted only in the qualified form — the
+/// opt-in is per table, with no all-tables variant.
 pub(crate) fn odo_valid_action(action: &str) -> bool {
     const VERBS: &[&str] = &["read", "search", "write", "create", "unlink", "action", "execute"];
+    const QUALIFIED_ONLY: &[&str] = &[
+        duduclaw_odoo::agent_config::GENERIC_CREATE_TOKEN,
+        duduclaw_odoo::agent_config::GENERIC_WRITE_TOKEN,
+    ];
     let (verb, model) = match action.split_once(':') {
         Some((v, m)) => (v, Some(m)),
         None => (action, None),
     };
+    if QUALIFIED_ONLY.contains(&verb) {
+        return model.is_some_and(duduclaw_odoo::schema::valid_model_name);
+    }
     if !VERBS.contains(&verb) {
         return false;
     }

@@ -221,6 +221,19 @@ fn move_into(from: &Path, to: &Path) -> std::io::Result<()> {
 /// skipped. Best effort: failed steps are listed.
 pub fn undo(home: &Path, j: &ReplaceJournal) -> UndoOutcome {
     crate::agent_files::writer::run_blocking(|| {
+        // RM-027 round 3: the rollback restores org entries, so it holds the
+        // global org lock (taken before the barrier, the order every org
+        // writer uses) — it can no longer put back B→A while an
+        // `org.apply_change` commits A→B, and every restored edge is
+        // cycle-checked against the tree as it is now.
+        let org = match org_store::lock_org_mutations(home) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let mut out = UndoOutcome::default();
+                out.failures.push(format!("組織資料寫入鎖無法取得，沒有還原任何東西：{error}"));
+                return out;
+            }
+        };
         let _barrier = match duduclaw_core::autonomy_gate::exclusive_barrier(home) {
             Ok(guard) => guard,
             Err(error) => {
@@ -229,11 +242,11 @@ pub fn undo(home: &Path, j: &ReplaceJournal) -> UndoOutcome {
                 return out;
             }
         };
-        undo_locked(home, j)
+        undo_locked(home, j, &org)
     })
 }
 
-fn undo_locked(home: &Path, j: &ReplaceJournal) -> UndoOutcome {
+fn undo_locked(home: &Path, j: &ReplaceJournal, org: &org_store::OrgMutationGuard) -> UndoOutcome {
     let mut out = UndoOutcome::default();
     if let Err(e) = j.checked() {
         out.failures.push(e);
@@ -291,7 +304,7 @@ fn undo_locked(home: &Path, j: &ReplaceJournal) -> UndoOutcome {
             Err(e) => out.failures.push(format!("{} → {}：{e}（請手動搬回）", to.display(), from.display())),
         }
     }
-    restore_org(home, j, &mut out);
+    restore_org(org, j, &mut out);
     // Only removes the backup folder when nothing is left in it.
     for sub in ["skills", "wiki", ""] {
         let _ = std::fs::remove_dir(backup.join(sub));
@@ -313,21 +326,25 @@ fn prune_empty_parents(home: &Path, moved: &Path) {
     }
 }
 
-fn restore_org(home: &Path, j: &ReplaceJournal, out: &mut UndoOutcome) {
-    for (id, before) in &j.org_before {
-        let res = match before {
-            Some(e) => org_store::upsert(home, id, OrgEntry::new(&e.reports_to, &e.department)).map(|_| ()),
-            None => org_store::remove(home, id).map(|_| ()),
-        };
-        if let Err(e) = res {
-            out.failures.push(format!("組織資料還原失敗（{id}）：{e}"));
-        }
-    }
+/// Put the journaled org entries back. Removals first (they never add an
+/// edge), then the restored entries — each one cycle-checked against the
+/// tree as it is now; a restore that would close a loop is reported as a
+/// failure instead of written.
+fn restore_org(org: &org_store::OrgMutationGuard, j: &ReplaceJournal, out: &mut UndoOutcome) {
     for id in &j.written_agents {
         if j.org_before.iter().any(|(old, _)| old == id) {
             continue;
         }
-        if let Err(e) = org_store::remove(home, id) {
+        if let Err(e) = org_store::remove(org, id) {
+            out.failures.push(format!("組織資料還原失敗（{id}）：{e}"));
+        }
+    }
+    for (id, before) in &j.org_before {
+        let res = match before {
+            Some(e) => org_store::upsert(org, id, OrgEntry::new(&e.reports_to, &e.department)).map(|_| ()),
+            None => org_store::remove(org, id).map(|_| ()),
+        };
+        if let Err(e) = res {
             out.failures.push(format!("組織資料還原失敗（{id}）：{e}"));
         }
     }
@@ -511,7 +528,7 @@ mod tests {
         for id in ["lead", "helper"] {
             std::fs::create_dir_all(home.join("agents").join(id)).unwrap();
             std::fs::write(home.join("agents").join(id).join("SOUL.md"), "new").unwrap();
-            org_store::upsert(home, id, OrgEntry::new("", "客服")).unwrap();
+            org_store::with_org_lock(home, |org| org_store::upsert(org, id, OrgEntry::new("", "客服"))).unwrap();
         }
         std::fs::create_dir_all(experts_dir(home).join("team")).unwrap();
         let page = home.join("shared/wiki/new/deep/p.md");
@@ -556,6 +573,38 @@ mod tests {
         // The installer itself, told to stop, puts it back.
         assert_eq!(recover_interrupted(h, RecoverScope::IncludingOwn).await.len(), 1);
         assert_eq!(std::fs::read_to_string(h.join("agents/lead/SOUL.md")).unwrap(), "old");
+    }
+
+    /// RM-027 round 3, finding 1: the rollback takes the global org lock
+    /// (it waits while an org change holds it) and cannot restore an edge
+    /// that — after an org change made in the meantime — closes a cycle
+    /// (journal says boss → lead; meanwhile lead → boss was applied).
+    #[test]
+    fn a_rollback_waits_for_the_org_lock_and_cannot_restore_a_cycle() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        org_store::with_org_lock(h, |org| {
+            org_store::upsert(org, "boss", OrgEntry::new("", ""))?;
+            org_store::upsert(org, "lead", OrgEntry::new("boss", ""))
+        })
+        .unwrap();
+        let backup = experts_dir(h).join(REPLACED_DIR).join("cyc_1");
+        let mut j = ReplaceJournal::new(h, "cyc", &backup);
+        j.pid = dead_pid();
+        j.keep_org("boss", Some(&OrgEntry::new("lead", "")));
+        j.save(h).unwrap();
+
+        let held = org_store::lock_org_mutations(h).unwrap();
+        let (hh, jj) = (h.to_path_buf(), j.clone());
+        let rollback = std::thread::spawn(move || undo(&hh, &jj));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!rollback.is_finished(), "the rollback must wait for the org mutation lock");
+        drop(held);
+        let out = rollback.join().unwrap();
+        assert!(out.failures.iter().any(|f| f.contains("boss")), "{out:?}");
+        let org = org_store::load(h);
+        assert_eq!(org.get("boss").unwrap().reports_to, "", "the cycle-closing edge was not restored");
+        assert_eq!(org.get("lead").unwrap().reports_to, "boss");
     }
 
     #[tokio::test]
