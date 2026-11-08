@@ -41,15 +41,17 @@ impl GatewayWorkerPlans {
     pub fn with_roots(mut self, roots: Arc<duduclaw_mcp_boundary::resources::ResourceRoots>) -> Self {
         self.roots = Some(roots); self
     }
+    /// H12a: the subject employee is the boot-bound `(agent, employee)` of this
+    /// producer, checked against the verified capability record — never an
+    /// argument. The legacy `agent_id` self-reference must equal it; any other
+    /// selector (`target_agent`, scope, path, identity keys) refuses.
     fn skill_subject<'a>(&'a self, call: &AuthorizedToolCall) -> Result<(&'a str, String), VerificationError> {
         let (agent, employee) = self.employee.as_ref().ok_or(VerificationError::Unavailable)?;
         if call.context().record().employee != *employee { return Err(VerificationError::BindingMismatch); }
+        duduclaw_mcp_boundary::tool_policy::check_own_skill_arguments(call.name(), call.arguments())?;
+        duduclaw_mcp_boundary::tool_policy::own_skill_selector(call.context(), call.name())?;
         let args = call.arguments().as_object().ok_or(VerificationError::Invalid)?;
-        if args.keys().any(|k| !matches!(k.as_str(), "agent_id" | "skill_name" | "target_agent"))
-            || (call.name() != "shared_skill_adopt" && args.contains_key("target_agent"))
-            || (call.name() == "shared_skill_adopt" && args.contains_key("agent_id"))
-            || args.get("target_agent").is_some_and(|v| v.as_str() != Some(agent.as_str()))
-            || args.get("agent_id").is_some_and(|v| v.as_str() != Some(agent.as_str())) {
+        if args.get("agent_id").is_some_and(|v| v.as_str() != Some(agent.as_str())) {
             return Err(VerificationError::BindingMismatch);
         }
         let name = args.get("skill_name").and_then(Value::as_str).filter(|name| !name.is_empty() && name.len() <= 64
@@ -163,6 +165,18 @@ impl GatewayWorkerPlans {
                 if !*passed { return Err(VerificationError::Invalid); }
                 let [_, ParsedItem::PreparedSkill { input_slot: 0, content }] = items.as_slice()
                     else { return Err(VerificationError::Invalid); };
+                if call.name() == "skill_graduate" {
+                    // H12a: global scope is loaded by every employee, so this is
+                    // not an own-namespace publication. Like synthesis, it needs
+                    // the dashboard admin card, bound to the scanned source.
+                    call.context().verify_live(duduclaw_mcp_boundary::authority::now_seconds()?)?;
+                    let binding = json!({"agent":agent,"skill":name,"source":state["source"],"source_sha256":state["sha256"]});
+                    if let Err(message) = crate::skill_lifecycle::isolated::approve(&self.home, agent, "graduate",
+                        &format!("{agent}:{name}"), &binding,
+                        json!({"skill":name,"from":agent,"scope":"global","markdown":content.as_str()})).await {
+                        return Ok(json!({"isError":true,"content":[{"type":"text","text":message}]}));
+                    }
+                }
                 let (home, agent, name, tool, content) = (self.home.clone(), agent.to_owned(), name,
                     call.name(), content.as_str().to_owned());
                 let authority = duduclaw_mcp_boundary::io_authority::capture();
@@ -173,8 +187,7 @@ impl GatewayWorkerPlans {
             duduclaw_mcp_boundary::io_authority::verify_before_io()?;
             crate::evolution_events::emitter::EvolutionEventEmitter::global().emit_security_scan(agent, &name, *passed,
                 json!({"risk_level":risk.as_str(),"findings_count":findings.as_slice().len()}));
-            return Ok(json!({"content":[{"type":"text","text":format!("**Security scan: {name}**\nRisk level: {}\nPassed: {}\nFindings ({}):\n{}",
-                risk.as_str(), passed, findings.as_slice().len(), findings.as_slice().iter().map(|s| format!("- {}", s.as_str())).collect::<Vec<_>>().join("\n"))}]}));
+            return Ok(scan_report(&name, *passed, risk.as_str(), findings.as_slice()));
         }
         media_arguments(call.name(), call.arguments())?;
         audio_result(&reply)?;
@@ -258,6 +271,19 @@ impl WorkerPlanFactory for GatewayWorkerPlans {
         state: Value) -> PolicyFuture<'a, Value> {
         Box::pin(async move { self.finish_product(call, reply, state).await })
     }
+}
+
+/// H12a: render a worker scan verdict as inert data. Findings are worker text
+/// derived from untrusted skill bytes: each is one bounded line (controls,
+/// including newlines, become spaces) so a finding cannot forge report lines
+/// such as `Passed: true`. The verdict itself is the contract-validated bool.
+fn scan_report(name: &str, passed: bool, risk: &str, findings: &[Text<2048>]) -> Value {
+    let lines = findings.iter().map(|finding| {
+        let line: String = finding.as_str().chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        format!("- {}", line.trim())
+    }).collect::<Vec<_>>();
+    json!({"content":[{"type":"text","text":format!("**Security scan: {name}**\nRisk level: {risk}\nPassed: {passed}\nFindings ({}):\n{}",
+        lines.len(), lines.join("\n"))}]})
 }
 
 fn web_query(args: &Value) -> Result<HtmlQuery, VerificationError> {

@@ -10,9 +10,19 @@ Confined mailbox/table/wiki grants from its own host roots. Task-limited
 background work removes EmployeeScope and unwraps those exact grants. Inventory
 tests consume this issuer output. Trusted workspace and URL-origin selection is
 still missing at ingress: File/A/E tools needing those grants remain unavailable,
-including `file_read`, `skill_extract`, `execute_program` and `web_extract`.
+including `file_read`, `execute_program` and `web_extract`.
 The parity test tracks this gap explicitly; it is unfinished wiring, not another
 intentional isolation refusal or evidence of full employee parity.
+
+H12a (v1.81): the own-skill tools `skill_extract`, `shared_skill_adopt`,
+`skill_security_scan`, `skill_graduate` and `skill_curator_status` no longer
+require a workspace grant. They are eligible only under EmployeeScope with the
+record's own `Employee` grant (plus exactly one own `agent:` Confined wiki for
+`skill_extract`), take no subject selector (a legacy `agent_id` must equal the
+bound employee; `target_agent` refuses), parse skill bytes only in the E worker,
+and publish only into the caller's own wiki or own `SKILLS/`. Global graduation
+needs the dashboard admin card; the curator (D-H4) reports and runs only over the
+caller's own skills.
 
 Service/Connector tools enter `BoundaryRoute::Resource` unless an explicit host handler is selected by `boundary_route` (including the Linux bundled model catalog). Exact grants are resolved and checked before the legacy handler. A capability for task-a refuses task-b. Employee-scope calls retain the original live employee gates. Explicit `tasks_list`, `activity_list`, `list_cron_tasks`, `goals_list`, `list_reminders` and `responsibility_get` use finite queries/readers with immutable IDs and employee ownership. Finite `db_query` accepts a strict single-table SELECT subset lowered into the parameterized SelectRequest builder; joins, functions, subqueries and other unsupported grammar refuse. EmployeeScope retains its existing product SQL policy.
 
@@ -119,7 +129,7 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `odoo_partner_search` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
 | `odoo_schema_overview` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
 | `odoo_schema_fields` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
-| `skill_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; own Wiki output grant required (Confined Wiki under EmployeeScope), rechecked at publication |
+| `skill_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee + exactly one own Wiki output grant (Confined Wiki), rechecked at publication; own SKILLS bytes parsed by E as data; publishes only into the caller's own wiki, body pages read back before the completion marker (H12a) |
 | `execute_program` | A ExecutionBackend + ExecutionPlanFactory |
 | `office_script` | A ExecutionBackend + ExecutionPlanFactory |
 | `skill_bank_feedback` | Resource → AuthorizedToolCall → original live employee handler |
@@ -168,7 +178,7 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `autopilot_list` | Resource → AuthorizedToolCall → original live employee handler |
 | `shared_skill_list` | Resource → AuthorizedToolCall → original live employee handler |
 | `shared_skill_share` | Resource → AuthorizedToolCall → original live employee handler |
-| `shared_skill_adopt` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
+| `shared_skill_adopt` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee; shared skill scanned and prepared by E as data; scanned body copied only into the caller's own SKILLS (no clobber, read back); no target argument (H12a) |
 | `plan_start` | Resource → AuthorizedToolCall → original live employee handler |
 | `memory_improve` | Resource → AuthorizedToolCall → original live employee handler |
 | `browser_record_start` | A ExecutionBackend + ExecutionPlanFactory |
@@ -211,12 +221,12 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `skill_search` | Resource → AuthorizedToolCall → original live employee handler |
 | `skill_list` | Resource → AuthorizedToolCall → original live employee handler |
 | `skill_gaps` | Resource → AuthorizedToolCall → original live employee handler |
-| `skill_security_scan` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
-| `skill_graduate` | E WorkerPlanFactory + WorkerLauncher/WorkerSession |
+| `skill_security_scan` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee; own (else global) skill bytes scanned by E as data with own CONTRACT patterns; report only, findings rendered as one-line data (H12a) |
+| `skill_graduate` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee; own skill scanned and prepared by E; global publication needs the dashboard admin card bound to the scanned source, then the journaled atomic publication (H12a) |
 | `skill_synthesis_status` | Resource → AuthorizedToolCall → original live employee handler |
 | `skill_synthesis_run` | Resource → original authenticated host orchestration; checked E parser required |
 | `skill_hub_install` | Resource → original authenticated host orchestration; checked E parser required |
-| `skill_curator_status` | Resource → original authenticated host orchestration; checked E parser required |
+| `skill_curator_status` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee; status and `run=true` limited to the caller's own skills (D-H4), run admin-approved, report returned and not published to the shared wiki (H12a) |
 | `skill_pin` | Resource → AuthorizedToolCall → original live employee handler |
 | `notion_status` | Resource → Native account-bound executor; product-policy/boot adapter pending |
 | `notion_search` | Resource → Native account-bound executor; product-policy/boot adapter pending |

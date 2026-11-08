@@ -58,18 +58,12 @@ fn host_e_control(name: &str) -> bool {
 /// Preserve them for the existing record/delegation/scope policy. Other routes
 /// still prohibit host path and execution identity overrides.
 pub(crate) fn check_tool_arguments(name: &str, arguments: &Value) -> Result<(), VerificationError> {
-    if name == "skill_curator_status" {
-        let fields = arguments.as_object().ok_or(VerificationError::Invalid)?;
-        if fields.keys().any(|key| key != "run") || fields.get("run").is_some_and(|v| v.as_bool().is_none()) {
-            return Err(VerificationError::Invalid);
-        }
+    // H12a: own-skill tools (incl. the curator's typed `run` flag) accept only
+    // their exact protected schema; the subject is the capability-bound employee.
+    if duduclaw_mcp_boundary::tool_policy::OWN_SKILL_TOOLS.contains(&name) {
+        return duduclaw_mcp_boundary::tool_policy::check_own_skill_arguments(name, arguments);
     }
     if !matches!(boundary_route(name), Some(BoundaryRoute::Resource | BoundaryRoute::GatewayHandler(_))) {
-        if matches!(name, "skill_security_scan" | "skill_graduate" | "skill_extract") {
-            let mut data = arguments.clone();
-            data.as_object_mut().ok_or(VerificationError::Invalid)?.remove("agent_id");
-            return duduclaw_mcp_boundary::check_arguments(&data);
-        }
         return duduclaw_mcp_boundary::check_arguments(arguments);
     }
     let fields = arguments.as_object().ok_or(VerificationError::Invalid)?;
@@ -517,9 +511,20 @@ fn project_tool_schema(tool: &mut Value) {
     }
     let name = tool["name"].as_str().unwrap_or("").to_owned();
     if matches!(boundary_route(&name), Some(BoundaryRoute::GatewayHandler(_))) { return; }
-    // Skill producers validate this schema's agent selector against the bound
-    // employee; it is data and must not be rewritten into another field.
-    if matches!(name.as_str(), "skill_security_scan" | "skill_graduate" | "skill_extract") { return; }
+    // H12a: own-skill tools act only on the capability-bound employee, so the
+    // protected schema offers no subject selector. A legacy `agent_id` is still
+    // accepted as a self-reference and checked by the producer; it is never
+    // rewritten into another field (no `target_employee`).
+    if duduclaw_mcp_boundary::tool_policy::OWN_SKILL_TOOLS.contains(&name.as_str()) {
+        if let Some(required) = tool["inputSchema"]["required"].as_array_mut() {
+            required.retain(|value| !matches!(value.as_str(), Some("agent_id" | "target_agent")));
+        }
+        if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {
+            properties.remove("agent_id");
+            properties.remove("target_agent");
+        }
+        return;
+    }
     if matches!(boundary_route(&name), Some(BoundaryRoute::Resource)) {
         if duduclaw_gateway::isolation_connectors::provider_for_tool(&name).is_some() {
             if let Some(properties) = tool["inputSchema"]["properties"].as_object_mut() {

@@ -557,7 +557,12 @@ impl GatewayHandler<'_> {
         "skill_hub_install" => {
             handle_skill_hub_install(&arguments, home_dir, default_agent, caller_is_admin).await
         }
-        "skill_curator_status" => handle_skill_curator_status(&arguments, home_dir).await,
+        // H12a / D-H4: in isolation the curator acts only on the
+        // capability-bound employee's own skills (never an argument).
+        "skill_curator_status" => match crate::mcp_isolation::current() {
+            Some(current) => handle_skill_curator_status_owned(&arguments, home_dir, &current.agent).await,
+            None => handle_skill_curator_status(&arguments, home_dir).await,
+        },
         "skill_pin" => handle_skill_pin(&arguments, home_dir).await,
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
         "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir, record_actor).await,

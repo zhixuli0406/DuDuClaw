@@ -44,12 +44,14 @@ fn isolation_issuer_real_output_preserves_service_and_connector_scope() {
     assert!(record.resources.as_slice().iter().all(|grant| matches!(grant,
         ResourceGrant::Employee { .. } | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Confined { .. })));
     let context = duduclaw_mcp_boundary::RequestContext::from_verified_record(record);
-    for tool in ["tasks_update", "computer_workspace_write", "gmail_create_draft", "send_message"] {
+    // H12a: skill_extract needs only the issuer's own Employee + own Confined
+    // wiki under EmployeeScope; no workspace selector is involved.
+    for tool in ["tasks_update", "computer_workspace_write", "gmail_create_draft", "send_message", "skill_extract"] {
         assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}");
     }
     // There is no production workspace/URL selector. Do not fabricate these
     // grants to make full File/A/E inventory parity appear to pass.
-    for tool in ["file_read", "web_extract", "skill_extract"] {
+    for tool in ["file_read", "web_extract"] {
         assert!(!duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}");
     }
 }
