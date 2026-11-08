@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 發版工具會同步並驗證亞洲與美東兩個控制平面區域的版本清單和交付 manifest，避免 console 與 gateway 取得不同版本；任一區域不符就判定發版失敗。
+
 ## [1.80.1] - 2026-11-07 — macOS／Windows 下載版修正
 
 ### Fixed
