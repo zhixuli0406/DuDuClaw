@@ -32,7 +32,9 @@
 #   6. cargo check workspace + commercial; re-resolve desktop Cargo.lock
 #   7. Generate distributor brief (minor/major only)
 #   8. Commit, validate the actual bump, prepare core + desktop tags
-#   9. Build all enterprise assets and sync the control-plane allowlist
+#   9. Build all enterprise assets, sync the control-plane allowlist and publish
+#      the distributor console manuals (publish-manuals.py; skip with
+#      DUDUCLAW_SKIP_MANUALS=1, which leaves a gap that fails the release gate)
 #  10. Print branch/PR/check/merge/tag/verify commands for the owner
 #
 # Runtime note (2026-09-08 incident): a full bump run takes roughly 20-45
@@ -482,7 +484,8 @@ if $DRY_RUN; then
         echo "[DRY RUN] Distributor output: commercial/marketing/distributor/releases/duduclaw-technology-brief-v$NEW_VERSION.html"
     fi
     echo "[DRY RUN] ALL channels: 5 GitHub targets + minisign/cosign, npm, PyPI, KB, GHCR,"
-    echo "          computer-use image, desktop, Pro image/OEM tar/pro-bin/control-plane allowlist."
+    echo "          computer-use image, desktop, Pro image/OEM tar/pro-bin/control-plane allowlist,"
+    echo "          distributor console manuals (publish-manuals.py, dry run first)."
     echo "[DRY RUN] Pro image CLOUD_BUILD=$CLOUD_BUILD; no signing/build/install/commit/tag/publish performed."
     echo "[DRY RUN] Confirm after publishing: $0 verify $NEW_VERSION"
 fi
@@ -549,6 +552,32 @@ else
         PRO_COMMERCIAL_BRANCH="$(git -C commercial symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
         if [[ -z "$PRO_COMMERCIAL_BRANCH" || "$PRO_COMMERCIAL_BRANCH" == "main" ]]; then
             PRO_MISSING+=("the commercial checkout on its own branch, not main or a detached HEAD (the release commits duduclaw-pro-gateway/Cargo.lock there)")
+        fi
+    fi
+    # Console manuals are published by this script (v1.80.0 shipped without
+    # them because publishing was a separate manual step nobody ran). The
+    # private summary and handbooks must already be merged in commercial/.
+    if [[ "${DUDUCLAW_SKIP_MANUALS:-0}" != "1" ]]; then
+        MANUALS_SUMMARY="commercial/docs/releases/manual-summaries/v$NEW_VERSION.json"
+        MANUALS_HINT="write and merge it in the private repository, or set DUDUCLAW_SKIP_MANUALS=1"
+        if [[ "$BUMP_TYPE" == "hotfix" ]]; then
+            MANUALS_KIND="hotfix"
+        else
+            MANUALS_KIND="minor"
+        fi
+        [[ -f "commercial/scripts/publish-manuals.py" ]] \
+            || PRO_MISSING+=("commercial/scripts/publish-manuals.py (private repository checkout)")
+        if [[ ! -f "$MANUALS_SUMMARY" ]]; then
+            PRO_MISSING+=("console manual summary $MANUALS_SUMMARY — $MANUALS_HINT")
+        elif ! python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if d.get("version") == sys.argv[2] and d.get("kind") == sys.argv[3] else 1)
+' "$MANUALS_SUMMARY" "$NEW_VERSION" "$MANUALS_KIND" >/dev/null 2>&1; then
+            PRO_MISSING+=("valid console manual summary $MANUALS_SUMMARY (JSON with version=$NEW_VERSION, kind=$MANUALS_KIND) — $MANUALS_HINT")
+        fi
+        if [[ "$BUMP_TYPE" != "hotfix" && ! -d "commercial/docs/releases/v$NEW_VERSION/manuals" ]]; then
+            PRO_MISSING+=("commercial/docs/releases/v$NEW_VERSION/manuals/ (handbooks + PDFs) — $MANUALS_HINT")
         fi
     fi
     if [[ ${#PRO_MISSING[@]} -gt 0 ]]; then
@@ -1251,6 +1280,39 @@ print(next((e.get("value", "") for e in env if e["name"] == "DUDUCLAW_GENERAL_DE
     # --- End control-plane env sync ---
 fi
 
+# --- Console manuals publish ---
+# Runs after the bump renamed [Unreleased] and after the local tag exists: the
+# publisher reads CHANGELOG.md and builds cadence from the public git tags.
+if [[ "$PRO_RELEASE" == "1" ]]; then
+    MANUALS_CMD=(python3 commercial/scripts/publish-manuals.py --version "$NEW_VERSION" --public-repo "$PWD")
+    MANUALS_RERUN="python3 commercial/scripts/publish-manuals.py --version $NEW_VERSION"
+    if [[ -n "${DUDUCLAW_MANUALS_BUCKET:-}" ]]; then
+        MANUALS_CMD+=(--bucket "$DUDUCLAW_MANUALS_BUCKET")
+        MANUALS_RERUN="$MANUALS_RERUN --bucket $DUDUCLAW_MANUALS_BUCKET"
+    fi
+    MANUALS_RERUN="$MANUALS_RERUN --public-repo $PWD"
+    if [[ "${DUDUCLAW_SKIP_MANUALS:-0}" == "1" ]]; then
+        echo ""
+        echo "Skipping console manuals (DUDUCLAW_SKIP_MANUALS=1)."
+        PRO_GAPS+=("console manuals not published (DUDUCLAW_SKIP_MANUALS=1) — re-run: python3 commercial/scripts/publish-manuals.py --version $NEW_VERSION")
+    else
+        echo ""
+        echo "Publishing console manuals for v$NEW_VERSION (dry run first)..."
+        if ! "${MANUALS_CMD[@]}" --dry-run; then
+            PRO_GAPS+=("console manuals dry-run failed — fix, then re-run: $MANUALS_RERUN")
+        elif ! "${MANUALS_CMD[@]}"; then
+            PRO_GAPS+=("console manuals publish failed — re-run: $MANUALS_RERUN")
+        else
+            echo "  Console manuals published for v$NEW_VERSION."
+        fi
+    fi
+else
+    echo ""
+    echo "NOTE: CE-only release — console manuals were not published. Publish manually:"
+    echo "      python3 commercial/scripts/publish-manuals.py --version $NEW_VERSION"
+fi
+# --- End console manuals publish ---
+
 rm -f "${PRO_TAR_SHA_FILE:-}"
 
 # --- Enterprise release gate ---
@@ -1329,7 +1391,8 @@ echo "  git push origin v$NEW_VERSION desktop-v$NEW_VERSION"
 echo "  Watch release, desktop-release, docker-image and computer-use-image workflows."
 echo "  ./scripts/release.sh verify $NEW_VERSION"
 if [[ "$BUMP_TYPE" == "hotfix" ]]; then
-    echo "  Websites and manuals retain the preceding artifacts."
+    echo "  Websites retain the preceding artifacts; the console manual entry was published"
+    echo "  by this script (it inherits the previous handbooks)."
 else
-    echo "  Deploy the reviewed website builds and deliver private manuals."
+    echo "  Deploy the reviewed website builds (console manuals were published by this script)."
 fi
