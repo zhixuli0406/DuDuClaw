@@ -155,8 +155,9 @@ impl WorkRelativePath {
     pub fn as_str(&self) -> &str { &self.0 }
 }
 
-/// What root reports about the descriptor it opened. The boundary re-checks
-/// every field it can against `fstat` of the received fd and never trusts it.
+/// What root reports about the descriptor it handed out: since H2 a sealed
+/// memfd snapshot (tmpfs dev/inode, `nlink` 0). The boundary re-checks every
+/// field it can against `fstat` of the received fd and never trusts it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkFileMetadata {
     pub regular: bool,
@@ -166,8 +167,8 @@ pub struct WorkFileMetadata {
     pub nlink: u64,
 }
 
-/// An owned read-only descriptor opened by root under the live run's attached
-/// work mount, plus its metadata.
+/// An owned read-only, sealed memfd snapshot of a file root opened under the
+/// live run's attached work mount, plus its metadata.
 pub struct BrokeredWorkFile {
     pub file: File,
     pub metadata: WorkFileMetadata,
@@ -184,6 +185,52 @@ pub enum WorkBrokerError {
     TooLarge,
     /// Root IPC or the broker itself failed.
     Unavailable,
+}
+impl WorkBrokerError {
+    /// Stable reason code for audit/telemetry (never carries the path).
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NotLive => "work_run_not_live",
+            Self::NotFound => "work_file_not_found",
+            Self::Refused => "work_file_refused",
+            Self::TooLarge => "work_file_too_large",
+            Self::Unavailable => "workspace_broker_unavailable",
+        }
+    }
+    /// File-tool message (zh-TW). Fixed text: never the path, a file name,
+    /// a host location or root's diagnostic.
+    pub fn user_message(self) -> &'static str {
+        match self {
+            Self::NotLive => "目前沒有進行中的工作階段可以讀取工作區檔案，已拒絕讀取。",
+            Self::NotFound => "工作區內找不到這個檔案，請確認相對路徑後重試。",
+            Self::Refused => "這個檔案不能透過受保護的工作區讀取（例如符號連結、硬連結、非一般檔案或其他掛載點），已拒絕讀取。",
+            Self::TooLarge => "檔案超過 16 MiB 上限，已拒絕讀取。",
+            Self::Unavailable => "工作區檔案服務目前無法使用，已拒絕讀取；請稍後重試或聯絡管理員。",
+        }
+    }
+}
+
+/// Why a file-tool open was refused: a boundary verification failure, or the
+/// root broker's typed refusal (H5). Lets file tools (H11) show a precise
+/// message while the boundary contract (`authorize_file`) stays
+/// `VerificationError::Unavailable` for every broker error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileRefusal {
+    Verification(VerificationError),
+    Broker(WorkBrokerError),
+}
+impl From<VerificationError> for FileRefusal {
+    fn from(error: VerificationError) -> Self { Self::Verification(error) }
+}
+impl FileRefusal {
+    /// The boundary error: every broker refusal is `Unavailable`.
+    pub fn verification(self) -> VerificationError {
+        match self { Self::Verification(error) => error, Self::Broker(_) => VerificationError::Unavailable }
+    }
+    /// The root broker's refusal, if this came from root.
+    pub fn broker(self) -> Option<WorkBrokerError> {
+        match self { Self::Broker(error) => Some(error), Self::Verification(_) => None }
+    }
 }
 
 /// One brokered open. Only this crate constructs it, and only from the verified
@@ -211,42 +258,73 @@ impl<'a> WorkFileRequest<'a> {
 /// opens `path` with openat2 BENEATH|NO_SYMLINKS|NO_MAGICLINKS|NO_XDEV under the
 /// work mount of `run`, only while that run is live, owned by `employee` and
 /// holds its storage lease; regular file, nlink 1, employee uid, at most
-/// `max_bytes`; O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NONBLOCK. Blocking: call it from
-/// the blocking pool. An implementation must never fall back to a host path.
+/// `max_bytes`; O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NONBLOCK. Root then copies it
+/// into a memfd sealed SEAL|SHRINK|GROW|WRITE and hands out that snapshot
+/// reopened O_RDONLY (H2), so the claim reports the memfd honestly: tmpfs
+/// device/inode, `nlink` 0. Blocking: call it from the blocking pool. An
+/// implementation must never fall back to a host path.
 pub trait WorkBroker: Send + Sync {
     fn open_work_file(&self, request: &WorkFileRequest<'_>) -> Result<BrokeredWorkFile, WorkBrokerError>;
 }
 
-/// Check the received descriptor itself: regular, single link, within the size
-/// limit, read-only, and the inode root said it opened.
+/// Check the received descriptor itself. Only a sealed, read-only memfd
+/// snapshot is accepted: regular, nlink 0, within the size limit, all four
+/// seals (F_SEAL_WRITE|GROW|SHRINK|SEAL, so its bytes can never change), on
+/// tmpfs, opened O_RDONLY, and the dev/inode/size root said it handed out.
+/// Any live (unsealed) regular file — including the employee's own inode — is
+/// refused: the same-run employee could rewrite or grow it after the check.
 fn verify_brokered(opened: BrokeredWorkFile) -> Result<File, VerificationError> {
     let BrokeredWorkFile { file, metadata: claimed } = opened;
-    if !claimed.regular || claimed.nlink != 1 || claimed.size > BROKERED_FILE_MAX_BYTES {
+    if !claimed.regular || claimed.nlink != 0 || claimed.size > BROKERED_FILE_MAX_BYTES {
         return Err(VerificationError::Invalid);
     }
     let actual = file.metadata().map_err(|_| VerificationError::Unavailable)?;
     if !actual.is_file() || actual.len() > BROKERED_FILE_MAX_BYTES {
         return Err(VerificationError::Invalid);
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
-        if actual.nlink() != 1 { return Err(VerificationError::Invalid); }
-        if (actual.dev(), actual.ino()) != (claimed.device, claimed.inode) {
-            return Err(VerificationError::Unavailable);
+        use rustix::fs::{fcntl_getfl, OFlags};
+        if actual.nlink() != 0 { return Err(VerificationError::Invalid); }
+        let flags = fcntl_getfl(&file).map_err(|_| VerificationError::Unavailable)?;
+        if flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::PATH) {
+            return Err(VerificationError::Invalid);
         }
-        #[cfg(target_os = "linux")]
-        {
-            use rustix::fs::{fcntl_getfl, OFlags};
-            let flags = fcntl_getfl(&file).map_err(|_| VerificationError::Unavailable)?;
-            if flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::PATH) {
-                return Err(VerificationError::Invalid);
-            }
+        sealed_memfd(&file)?;
+        if (actual.dev(), actual.ino(), actual.len()) != (claimed.device, claimed.inode, claimed.size) {
+            return Err(VerificationError::Unavailable);
         }
         Ok(file)
     }
-    #[cfg(not(unix))]
-    { let _ = file; Err(VerificationError::Unavailable) }
+    // Sealed memfds are Linux-only; there is no brokered root elsewhere.
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (file, actual); Err(VerificationError::Unavailable) }
+}
+
+/// The seals and filesystem of a memfd. `F_GET_SEALS` fails on non-shmem
+/// files; an ordinary (or O_TMPFILE) tmpfs file starts with F_SEAL_SEAL only
+/// and can never gain the others, so all four together mean a sealing memfd.
+#[cfg(target_os = "linux")]
+fn sealed_memfd(file: &File) -> Result<(), VerificationError> {
+    use std::os::fd::AsRawFd;
+    let raw = file.as_raw_fd();
+    let required = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    // SAFETY: F_GET_SEALS only reads the borrowed live descriptor.
+    #[allow(unsafe_code)]
+    let seals = unsafe { libc::fcntl(raw, libc::F_GET_SEALS) };
+    if seals < 0 || seals & required != required { return Err(VerificationError::Invalid); }
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fstatfs writes one statfs into the provided storage, which is
+    // read only after it reports success.
+    #[allow(unsafe_code)]
+    let filesystem = unsafe {
+        if libc::fstatfs(raw, filesystem.as_mut_ptr()) != 0 { return Err(VerificationError::Unavailable); }
+        filesystem.assume_init()
+    };
+    // f_type's width differs by libc/arch; the magic number fits 32 bits.
+    if filesystem.f_type as u32 != libc::TMPFS_MAGIC as u32 { return Err(VerificationError::Invalid); }
+    Ok(())
 }
 
 /// The workspace grant this call selected for `handle`: explicit selectors must
@@ -567,6 +645,14 @@ impl ResourceRoots {
     /// so the table adapter cannot manufacture an unrelated regular-file input.
     pub fn authorize_file(&self, context: &RequestContext, tool: &str, arguments: &serde_json::Value)
         -> Result<(crate::tool_policy::AuthorizedToolCall, AuthorizedFile), VerificationError> {
+        self.authorize_file_with_refusal(context, tool, arguments).map_err(FileRefusal::verification)
+    }
+
+    /// [`Self::authorize_file`], keeping root's typed refusal so a file tool
+    /// can answer with [`WorkBrokerError::user_message`] (H5/H11). Identical
+    /// checks; only the error carries more detail.
+    pub fn authorize_file_with_refusal(&self, context: &RequestContext, tool: &str, arguments: &serde_json::Value)
+        -> Result<(crate::tool_policy::AuthorizedToolCall, AuthorizedFile), FileRefusal> {
         use crate::tool_policy::{self, ResourceResolver, Route, ToolPolicy};
         struct FileSelection;
         impl ResourceResolver for FileSelection {
@@ -584,7 +670,7 @@ impl ResourceRoots {
         let handle = arguments.get("workspace").and_then(serde_json::Value::as_str).ok_or(VerificationError::Invalid)?;
         let path = arguments.get("path").and_then(serde_json::Value::as_str).ok_or(VerificationError::Invalid)?;
         // The brokered root has no gateway dirfd; it never reaches open_resource.
-        let input = if self.is_brokered(handle) { self.authorize_brokered_file(&call, handle, path)? }
+        let input = if self.is_brokered(handle) { self.open_brokered_file(&call, handle, path)? }
             else { self.authorize_workspace(&call, handle)?.open_file(path)? };
         Ok((call, input))
     }
@@ -610,6 +696,11 @@ impl ResourceRoots {
     /// is `Unavailable`; there is no fallback to opening a host path.
     pub fn authorize_brokered_file(&self, call: &crate::tool_policy::AuthorizedToolCall, handle: &str,
         relative: &str) -> Result<AuthorizedFile, VerificationError> {
+        self.open_brokered_file(call, handle, relative).map_err(FileRefusal::verification)
+    }
+
+    fn open_brokered_file(&self, call: &crate::tool_policy::AuthorizedToolCall, handle: &str,
+        relative: &str) -> Result<AuthorizedFile, FileRefusal> {
         let path = WorkRelativePath::parse(relative)?;
         let grant = selected_workspace_grant(call, handle)?.clone();
         let broker = self.brokered_root(call.context(), handle)?;
@@ -619,11 +710,11 @@ impl ResourceRoots {
         let record = context.record();
         let request = WorkFileRequest { run: record.run, employee: record.employee, path: &path,
             max_bytes: BROKERED_FILE_MAX_BYTES };
-        let opened = broker.open_work_file(&request).map_err(|_| VerificationError::Unavailable)?;
+        let opened = broker.open_work_file(&request).map_err(FileRefusal::Broker)?;
         let file = verify_brokered(opened)?;
         // The run may have ended while root was opening the file.
         context.verify_live(crate::authority::now_seconds()?)?;
-        AuthorizedFile::from_opened(CallBinding::new(call), grant, file)
+        Ok(AuthorizedFile::from_opened(CallBinding::new(call), grant, file)?)
     }
 
     fn brokered_root(&self, context: &RequestContext, handle: &str) -> Result<&dyn WorkBroker, VerificationError> {
@@ -733,13 +824,37 @@ impl ResourceRoots {
 }
 
 /// Test double for root's work broker. It emulates H2's checks on an ordinary
-/// directory standing in for the live run's attached work mount. Production
-/// brokers are H5's spawnd client; this double must never be wired at boot.
-#[cfg(all(unix, any(test, feature = "test-support")))]
+/// directory standing in for the live run's attached work mount, and H2's
+/// sealed memfd snapshot. Production brokers are H5's
+/// `work_bridge::SpawndWorkspaceBridge`; this double must never be wired at boot.
+/// Linux only (sealed memfds), like the brokered root itself.
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 pub mod test_broker {
     use super::{BrokeredWorkFile, WorkBroker, WorkBrokerError, WorkFileMetadata, WorkFileRequest};
     use duduclaw_isolation::ids::{EmployeeId, RunId};
-    use std::{os::unix::fs::MetadataExt, path::PathBuf, sync::Mutex};
+    use std::{fs::File, io::{Read, Write}, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::fs::MetadataExt},
+        path::PathBuf, sync::Mutex};
+
+    /// H2's snapshot: copy into a memfd, add SEAL|SHRINK|GROW|WRITE, reopen
+    /// O_RDONLY through procfs (new description), drop the writable fd.
+    pub fn sealed_snapshot(source: &mut File) -> std::io::Result<File> {
+        // SAFETY: a NUL-terminated name; on success the kernel returns a new
+        // descriptor that is owned exactly once below.
+        #[allow(unsafe_code)]
+        let raw = unsafe { libc::memfd_create(c"duduclaw-test-work".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+        if raw < 0 { return Err(std::io::Error::last_os_error()); }
+        #[allow(unsafe_code)]
+        let mut writable = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes)?;
+        writable.write_all(&bytes)?;
+        let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        // SAFETY: F_ADD_SEALS takes an int argument and touches no memory.
+        #[allow(unsafe_code)]
+        let sealed = unsafe { libc::fcntl(writable.as_raw_fd(), libc::F_ADD_SEALS, seals) };
+        if sealed != 0 { return Err(std::io::Error::last_os_error()); }
+        File::open(format!("/proc/self/fd/{}", writable.as_raw_fd()))
+    }
 
     type Misreport = Box<dyn Fn(&mut WorkFileMetadata) + Send + Sync>;
     pub struct TestWorkBroker {
@@ -751,13 +866,15 @@ pub mod test_broker {
         checked: bool,
     }
     impl TestWorkBroker {
-        /// A broker that applies H2's refusals (symlink, non-regular, nlink, size).
+        /// A broker that applies H2's refusals (symlink, non-regular, nlink,
+        /// size) and hands out H2's sealed read-only memfd snapshot.
         pub fn new(root: PathBuf, run: RunId, employee: EmployeeId) -> Self {
             Self { root, live: Mutex::new(Some((run, employee))), fail: Mutex::new(None),
                 misreport: Mutex::new(None), calls: Mutex::new(Vec::new()), checked: true }
         }
-        /// A faulty broker that returns whatever it opened, so tests can prove
-        /// the boundary's own checks on the received descriptor.
+        /// A faulty broker that returns whatever it opened (the live inode, no
+        /// snapshot), so tests can prove the boundary's own checks on the
+        /// received descriptor.
         pub fn unchecked(root: PathBuf, run: RunId, employee: EmployeeId) -> Self {
             Self { checked: false, ..Self::new(root, run, employee) }
         }
@@ -782,7 +899,8 @@ pub mod test_broker {
                 if !link.file_type().is_file() || link.nlink() != 1 { return Err(WorkBrokerError::Refused); }
                 if link.len() > request.max_bytes() { return Err(WorkBrokerError::TooLarge); }
             }
-            let file = std::fs::File::open(&path).map_err(|_| WorkBrokerError::NotFound)?;
+            let mut file = std::fs::File::open(&path).map_err(|_| WorkBrokerError::NotFound)?;
+            if self.checked { file = sealed_snapshot(&mut file).map_err(|_| WorkBrokerError::Unavailable)?; }
             let stat = file.metadata().map_err(|_| WorkBrokerError::Unavailable)?;
             let mut metadata = WorkFileMetadata { regular: stat.is_file(), size: stat.len(),
                 device: stat.dev(), inode: stat.ino(), nlink: stat.nlink() };

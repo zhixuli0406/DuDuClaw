@@ -52,7 +52,8 @@ async fn fixture(bridge: Option<Arc<dyn RootWorkspaceBridge>>) -> (SpawndBackend
         state: Mutex::new(State { expires: Instant::now() + Duration::from_secs(5), started: false,
             task_ref: None, pty: false, mcp: false, output_bytes: 0, output_buffer: 0, io_received: false,
             stdio: None, terminal: None, mcp_fd: None, io_receipt: None, outcome: None, terminal_at: None, workspace: None }) };
-    (SpawndBackend { runs: StdMutex::new(BTreeMap::from([(p.run.0, Arc::new(entry))])), slots, admission: None, workspace_bridge: bridge }, right)
+    (SpawndBackend { runs: StdMutex::new(BTreeMap::from([(p.run.0, Arc::new(entry))])), slots, admission: None, workspace_bridge: bridge,
+        features: None }, right)
 }
 async fn receive(fd: &OwnedFd) -> Envelope<SpawnRequest> {
     let mut bytes = vec![0; ipc::MAX_FRAME_BYTES + 4];
