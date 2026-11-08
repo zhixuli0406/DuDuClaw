@@ -57,6 +57,7 @@ impl ConnectorCatalog {
 pub fn provider_for_tool(tool: &str) -> Option<&'static str> {
     Some(match tool {
         "google_status" | "gmail_search" | "gmail_read" | "gmail_create_draft" |
+        "google_chat_spaces" | "google_chat_messages" |
         "calendar_list_events" | "calendar_create_event" | "sheets_read" | "sheets_append" |
         "forms_get" | "forms_list_responses" | "gtasks_lists" | "gtasks_list" | "gtasks_create" |
         "gtasks_complete" | "drive_search" | "drive_read" | "docs_read" | "docs_append" | "slides_read" => "google",

@@ -110,7 +110,7 @@ pub(crate) fn before_request(provider: &str, url: &str) -> Result<(), &'static s
         let allowed = match provider {
             "google" => matches!(url.host_str(), Some("gmail.googleapis.com" | "www.googleapis.com" |
                 "sheets.googleapis.com" | "forms.googleapis.com" | "tasks.googleapis.com" |
-                "docs.googleapis.com" | "slides.googleapis.com")),
+                "docs.googleapis.com" | "slides.googleapis.com" | "chat.googleapis.com")),
             "notion" => url.host_str() == Some("api.notion.com"),
             "github" => url.host_str() == Some("api.github.com"),
             _ => false,
@@ -193,6 +193,9 @@ impl NativeConnectorExecutor {
             "google_status" | "notion_status" | "github_status" => tool_text(json!({"account":selected.account(),
                 "provider":selected.provider(),"configured":true,"provider_verified":false})),
             "gmail_search" | "gmail_read" | "gmail_create_draft" | "calendar_list_events" | "calendar_create_event" |
+            // Google Chat reads keep native_legacy's admin opt-in gate, the
+            // Direct-OAuth-only backend rule and its content-free audit.
+            "google_chat_spaces" | "google_chat_messages" |
             "sheets_read" | "sheets_append" | "forms_get" | "forms_list_responses" | "gtasks_lists" | "gtasks_list" |
             "gtasks_create" | "gtasks_complete" | "drive_search" | "drive_read" | "docs_read" | "docs_append" | "slides_read" => {
                 let access = FixedGoogleAccess { selected, credential: &token, tool };

@@ -612,7 +612,10 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             "message_queue",
         );
         let dispatch_fut = crate::on_behalf_of::scope_first(principal, dispatch_fut);
-        let dispatch_fut = isolated_queue_scope(home_dir, &msg, dispatch_fut);
+        // Boxed: the isolation record scope holds the task-store lookup, the
+        // task row and the record verification frames beside the inner
+        // dispatch future; inline they dominate this poll frame.
+        let dispatch_fut = Box::pin(isolated_queue_scope(home_dir, &msg, dispatch_fut));
 
         // WP-A4/A5/T10: only goal-loop dispatches get a native-tool
         // collector scoped — the design's A3 forward model only observes

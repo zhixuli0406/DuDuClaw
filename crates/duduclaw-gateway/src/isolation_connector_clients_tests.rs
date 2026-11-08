@@ -131,7 +131,7 @@ async fn isolated_native_connector_every_http_hop_rechecks_binding_origin_and_ex
 fn isolated_native_connector_support_is_exact_and_has_no_other_provider_fallback() {
     let client = executor(Arc::new(AccountCredentialVault::default()));
     let supported: Vec<_> = duduclaw_mcp_boundary::tool_policy::POLICIES.iter().filter(|p| client.supports(p.name)).collect();
-    assert_eq!(supported.len(), 28);
+    assert_eq!(supported.len(), 30);
     for tool in ["google_status_extra", "gmail_search_extra", "github_status_extra", "notion_status_extra", "odoo_search", "db_query", "send_message", "web_search"] {
         assert!(!client.supports(tool));
     }
