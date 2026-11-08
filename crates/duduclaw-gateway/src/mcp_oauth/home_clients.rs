@@ -103,6 +103,39 @@ pub(super) fn load(home: &Path, provider: Option<&str>) -> Result<Vec<McpOAuthCl
         Ok(decoded)
     })
 }
+/// v1.81 (D2 follow-up, C4): one provider's config, distinguishing absence
+/// (`Ok(None)`: no row stored for `provider`) from every read failure
+/// (`Err`): unreadable/invalid file, duplicate rows, a stored secret that
+/// does not decode, a Google row hidden by unresolved publication state, or
+/// a file that changed during the read.
+pub(super) fn load_one(home: &Path, provider: &str) -> Result<Option<McpOAuthClientConfig>> {
+    let captured = capture(home, Some(provider))?;
+    if captured.selected.len() > 1 {
+        return Err(Error::Invalid);
+    }
+    if provider == "google" && captured.selected.is_empty() && captured.original.element("google").is_some() {
+        return Err(Error::NotReady);
+    }
+    let decoded = match captured.selected.first() {
+        None => None,
+        Some(stored) => {
+            let mut config = stored.clone();
+            config.client_secret = super::decode_secret(home, &stored.provider_id, &stored.client_secret)
+                .ok_or(Error::Invalid)?;
+            Some(config)
+        }
+    };
+    with_file(home, |g| {
+        let actual = RawArray::read(&g.home().join(CLIENT_CONFIG_FILE))?;
+        if !actual.same_bytes(&captured.original) {
+            return Err(Error::Stale);
+        }
+        if decoded.as_ref().is_some_and(|c| c.provider_id == "google") {
+            home_store::google_client_readable(g)?;
+        }
+        Ok(decoded)
+    })
+}
 pub(super) fn has(home: &Path, provider: &str) -> bool {
     capture(home, Some(provider)).is_ok_and(|s| s.selected.iter().any(|c| !c.client_id.is_empty()))
 }

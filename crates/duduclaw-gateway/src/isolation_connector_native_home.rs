@@ -93,7 +93,9 @@ impl HomeTokenSource for OAuthVaultHomeTokens {
                     // stored client config's token_url. Refuse before any I/O
                     // unless that endpoint is the pinned GitHub host.
                     {
-                        let mut config = crate::mcp_oauth::get_client_config(&self.home, crate::github_workspace::GITHUB_PROVIDER);
+                        // Absence permits (no refresh possible); a read error refuses.
+                        let mut config = crate::mcp_oauth::read_client_config(&self.home, crate::github_workspace::GITHUB_PROVIDER)
+                            .map_err(|_| VerificationError::Unavailable)?;
                         if let Some(config) = config.as_mut() { config.client_secret.zeroize(); }
                         github_refresh_config_allowed(config.as_ref())?;
                     }

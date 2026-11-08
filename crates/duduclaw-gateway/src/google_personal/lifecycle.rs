@@ -42,8 +42,109 @@ pub fn notify_affected(home: &Path, admin: &str, agents: &[String]) {
         crate::notify_push::push_person_notice(&home, &admin, &text).await;
     });
 }
+use crate::isolation_connector_events::{self as catalog_events, EventFailure, Hint, Reconnect, Target};
+use crate::isolation_connectors::RelinkSubject;
 use crate::person_credentials::{self as vault, Metadata, Secret};
 use std::path::Path;
+
+// ── v1.81 C4: credential events → isolated connector catalog ───────────
+//
+// Personal Google routes are `Personal(owner)` catalog rows of provider
+// `google`; the protected Google bridge (E2) maps such a route to the
+// owner's current connection in this vault. Every event below fences the
+// catalog BEFORE the sealed credential is removed or replaced.
+
+const CATALOG_REFUSED: &str =
+    "受保護模式的連線路由暫時無法更新，這次沒有變更 Google 連線；請稍後重試或聯絡管理員。";
+
+pub(crate) fn event_message(failure: EventFailure<String>) -> String {
+    match failure {
+        EventFailure::Catalog(_) => CATALOG_REFUSED.into(),
+        EventFailure::Product(error) => error,
+    }
+}
+
+/// Catalog relink subject of one Google account (digest of its `sub`).
+pub(crate) fn google_subject(google_sub: &str) -> Option<RelinkSubject> {
+    RelinkSubject::of("google", google_sub).ok()
+}
+
+/// Fence the owner's Personal Google routes, then remove the sealed
+/// credential, then fence again. Only the owner's OWN disconnect leaves a
+/// relink hint (reconnecting the same Google account recreates the route
+/// under a new id); an admin-initiated disconnect does not, and offboarding
+/// revokes every Personal route of the owner (`owner_change`).
+pub(crate) fn disconnect_material(
+    home: &Path,
+    user: &str,
+    actor: &str,
+    offboard: bool,
+) -> Result<Option<vault::Record>, String> {
+    let remove = || vault::disconnect(home, user);
+    if offboard {
+        return super::owner_change::revoke_owner_routes_then(home, user, remove);
+    }
+    let Some(target) = Target::personal(user, "google") else {
+        return remove();
+    };
+    let subject = (actor == user)
+        .then(|| vault::get(home, user).ok().flatten())
+        .flatten()
+        .and_then(|record| google_subject(&record.metadata.google_sub));
+    let hint = match (&subject, actor == user) {
+        (Some(subject), _) => Hint::Record(subject),
+        // A repeated own disconnect (nothing connected) keeps earlier hints.
+        (None, true) => Hint::Leave,
+        (None, false) => Hint::Cancel,
+    };
+    catalog_events::revoke_then(home, &target, hint, "personal_google_disconnect", remove)
+        .map_err(event_message)
+}
+
+/// Google reported the grant revoked (`invalid_grant`). Fence the routes
+/// before the credential is marked; a fence failure is audited and never
+/// blocks marking the credential unusable.
+pub(crate) fn consent_revoked(home: &Path, metadata: &Metadata) {
+    if let Some(target) = Target::personal(&metadata.owner_id, "google") {
+        let subject = google_subject(&metadata.google_sub);
+        let hint = subject.as_ref().map_or(Hint::Leave, Hint::Record);
+        let _ = catalog_events::fence(home, &target, hint, "personal_google_consent_revoked");
+    }
+}
+
+/// Publish a (re)connection with the catalog fenced around it. Same Google
+/// account (or first connect): routes advance to a new generation and routes
+/// this account lost to its own disconnect/consent revoke are recreated under
+/// NEW ids. Another account (switch): old routes are revoked first and the
+/// new account stays `connector_setup_required` until an Admin provisions it.
+pub(crate) fn publish_connection(
+    home: &Path,
+    user: &str,
+    metadata: &Metadata,
+    publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(target) = Target::personal(user, "google") else {
+        return publish();
+    };
+    let subject = google_subject(&metadata.google_sub).ok_or(CATALOG_REFUSED)?;
+    let (reconnect, reason) = match vault::get(home, user)? {
+        Some(old) if old.metadata.google_sub != metadata.google_sub => {
+            (Reconnect::Switch, "personal_google_account_switch")
+        }
+        _ => (Reconnect::Same(subject.clone()), "personal_google_connect"),
+    };
+    catalog_events::rotate(home, target.clone(), reconnect, reason, publish).map_err(event_message)?;
+    // A disconnect racing this publication may already have removed it;
+    // then no route of this owner may stay active.
+    if vault::get(home, user)
+        .ok()
+        .flatten()
+        .is_none_or(|record| record.metadata.credential_id != metadata.credential_id)
+    {
+        let _ = catalog_events::fence(home, &target, Hint::Record(&subject), "personal_google_connect_superseded");
+    }
+    Ok(())
+}
 
 fn shared_account(account: &Metadata, other: &Metadata) -> bool {
     account.google_sub == other.google_sub
@@ -168,7 +269,8 @@ pub async fn disconnect(
     offboard: bool,
 ) -> Result<bool, String> {
     pending::cancel_user(home, user);
-    let record = vault::disconnect(home, user)?;
+    // v1.81 C4: catalog fence first; a fence failure keeps the credential.
+    let record = disconnect_material(home, user, actor, offboard)?;
     let _ = db.log_action(
         Some(actor),
         if offboard {

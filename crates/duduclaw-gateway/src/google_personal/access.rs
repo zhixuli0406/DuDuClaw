@@ -311,6 +311,8 @@ pub async fn resolve(
                 check_record(home, &record, tool)?;
             }
             Err(oauth::Error::InvalidGrant) => {
+                // v1.81 C4: consent revoked at Google; fence catalog routes first.
+                super::lifecycle::consent_revoked(home, &record.metadata);
                 if vault::mark_needs_reconnect(home, &record.metadata).map_err(store_error)? {
                     let _ = db.log_action(
                         Some(&user.id),
