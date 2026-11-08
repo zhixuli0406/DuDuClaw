@@ -47,7 +47,8 @@ async fn restore_rpcs_not_listed_to_ai() {
 async fn decide_requires_admin_step_up() {
     let dir = crate::fs_safe::private_test_home().unwrap();
     let handler = MethodHandler::new(dir.path().to_path_buf()).await;
-    let params = json!({"request_id": "0".repeat(32), "decision": "approve", "csrf_token": [7u8; 32]});
+    let csrf = vec![7u8; 32];
+    let params = json!({"request_id": "0".repeat(32), "decision": "approve", "csrf_token": csrf});
     // An Admin without a current MFA enrolment is refused at the gate.
     assert_eq!(refusal(&handler.handle_isolation_employee(DECIDE, params.clone(), &ctx("admin-1", UserRole::Admin)).await),
         ADMIN_REQUIRED);
@@ -79,7 +80,8 @@ async fn decide_requires_admin_step_up() {
 async fn regrant_requires_admin_step_up_and_audits_gate() {
     let dir = crate::fs_safe::private_test_home().unwrap();
     let handler = MethodHandler::new(dir.path().to_path_buf()).await;
-    let params = json!({"employee_id": "0".repeat(32), "incarnation": 0, "item": "reports_to:x", "csrf_token": [7u8; 32]});
+    let csrf = vec![7u8; 32];
+    let params = json!({"employee_id": "0".repeat(32), "incarnation": 0, "item": "reports_to:x", "csrf_token": csrf});
     assert_eq!(refusal(&handler.handle_isolation_employee(REGRANT, params.clone(), &ctx("staff", UserRole::Employee)).await),
         ADMIN_REQUIRED);
     for extra in ["items", "all", "label"] {
@@ -96,7 +98,8 @@ async fn regrant_requires_admin_step_up_and_audits_gate() {
 async fn shared_adoption_request_admin_step_up() {
     let dir = crate::fs_safe::private_test_home().unwrap();
     let handler = MethodHandler::new(dir.path().to_path_buf()).await;
-    let params = json!({"employee_id": "0".repeat(32), "incarnation": 0, "members": [], "csrf_token": [7u8; 32]});
+    let csrf = vec![7u8; 32];
+    let params = json!({"employee_id": "0".repeat(32), "incarnation": 0, "members": [], "csrf_token": csrf});
     assert!(super::super::owns(SHARED_ADOPTION_REQUEST));
     for role in [UserRole::Employee, UserRole::Manager] {
         assert_eq!(refusal(&handler.handle_isolation_employee(SHARED_ADOPTION_REQUEST, params.clone(), &ctx("staff", role)).await),
