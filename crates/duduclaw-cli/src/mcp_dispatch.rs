@@ -406,21 +406,37 @@ pub(crate) fn permission_explicitly_denied(
     flag == Some(false)
 }
 
+/// `[permissions]` with nothing written: every flag absent except
+/// `can_create_agents`, which v1.81 (S2) resolves by role — with no
+/// identifiable role it is `false`.
+fn unwritten_permissions() -> duduclaw_core::agent_toml::PermissionsSectionView {
+    duduclaw_core::agent_toml::PermissionsSectionView {
+        can_create_agents: Some(duduclaw_core::agent_toml::effective_can_create_agents(None, None)),
+        ..Default::default()
+    }
+}
+
 /// The acting agent's `[permissions]`. Fails closed (`Err`) when the agent
 /// id is not a valid id or its `agent.toml` exists but cannot be read as
 /// TOML / has a non-table `[permissions]` / a non-boolean flag — the gated
 /// tools are then refused. A missing file reads as "nothing written".
+///
+/// v1.81 (S2): `can_create_agents` is returned as its **effective** value
+/// (`agent_toml::effective_can_create_agents`) — a missing key resolves by
+/// the employee's `[agent] role` (only `main` defaults to `true`), so the
+/// "explicit false refuses" check below also refuses a non-main employee that
+/// never wrote the key.
 async fn load_agent_permissions(
     home_dir: &Path,
     agent_id: &str,
 ) -> Result<duduclaw_core::agent_toml::PermissionsSectionView, String> {
     if agent_id.is_empty() {
-        return Ok(Default::default());
+        return Ok(unwritten_permissions());
     }
     let dir = if duduclaw_gateway::ephemeral::is_ephemeral_id(agent_id) {
         match duduclaw_gateway::ephemeral::resolve_agent_dir(home_dir, agent_id) {
             Some(d) => d,
-            None => return Ok(Default::default()),
+            None => return Ok(unwritten_permissions()),
         }
     } else {
         if !duduclaw_core::is_valid_agent_id(agent_id) {
@@ -432,7 +448,7 @@ async fn load_agent_permissions(
         let path = dir.join("agent.toml");
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(unwritten_permissions()),
             Err(e) => return Err(format!("agent.toml unreadable: {e}")),
         };
         let table: toml::Table = text
@@ -451,7 +467,13 @@ async fn load_agent_permissions(
                 }
             }
         }
-        Ok(duduclaw_core::agent_toml::load(&dir).permissions)
+        let sections = duduclaw_core::agent_toml::load(&dir);
+        let mut perms = sections.permissions;
+        perms.can_create_agents = Some(duduclaw_core::agent_toml::effective_can_create_agents(
+            perms.can_create_agents,
+            sections.agent.as_ref().and_then(|a| a.role.as_deref()),
+        ));
+        Ok(perms)
     })
     .await
     .map_err(|e| format!("permission check failed: {e}"))?
@@ -975,7 +997,9 @@ impl McpDispatcher {
             // dashboard (as "danger" toggles) but read by nothing. They are now
             // enforced here, in addition to the delegation policy and every other
             // gate. Only an EXPLICIT `false` refuses; an absent or wrong-typed
-            // key keeps the pre-1.68 behaviour. Read through `AgentTomlSections`
+            // key keeps the pre-1.68 behaviour — except `can_create_agents`,
+            // which since v1.81 (S2) resolves an absent key by role (only
+            // `main` defaults to allowed). Read through `AgentTomlSections`
             // (preset-resolved file when the agent has one).
             if employee_policy_applies {
                 let needed = permissions_for_call(
@@ -989,10 +1013,18 @@ impl McpDispatcher {
                             .iter()
                             .find(|p| permission_explicitly_denied(&perms, p))
                             .map(|p| {
+                                // v1.81 (S2): `can_create_agents` is the
+                                // effective value — an unwritten key on a
+                                // non-main employee refuses too.
+                                let why = if *p == "can_create_agents" {
+                                    "未開啟（未設定時只有 main 角色預設開啟）"
+                                } else {
+                                    "= false"
+                                };
                                 (
                                     p.to_string(),
                                     format!(
-                                        "此 AI 員工的 [permissions] {p} = false，不能使用工具「{tool_name}」。請在儀表板「工具與權限」開啟後再試。"
+                                        "此 AI 員工的 [permissions] {p} {why}，不能使用工具「{tool_name}」。請在儀表板「工具與權限」開啟後再試。"
                                     ),
                                 )
                             }),
@@ -5362,11 +5394,56 @@ effect = "forbid"
         assert_eq!(rows(&tmp), 1, "a rate-limited call writes no audit row");
     }
 
+    /// v1.81 (S2): an unwritten `can_create_agents` resolves by role — a
+    /// non-main (or role-less) employee is refused by the permission gate,
+    /// an explicit `false` on `main` is refused too.
+    #[tokio::test]
+    async fn unwritten_can_create_agents_refuses_non_main_employees() {
+        for body in [
+            "[agent]\nname = \"test-client\"\n",
+            "[agent]\nname = \"test-client\"\nrole = \"specialist\"\n",
+            "[agent]\nname = \"test-client\"\nrole = \"main\"\n[permissions]\ncan_create_agents = false\n",
+        ] {
+            for tool in ["create_agent", "spawn_ephemeral"] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let dispatcher = make_dispatcher(&tmp).await;
+                write_scoped_toml(&tmp, body);
+                let result = dispatcher
+                    .dispatch_tool_call(
+                        &make_principal(vec![Scope::Admin], false),
+                        &make_ns_ctx(false),
+                        &make_params(tool, serde_json::json!({"name": "x"})),
+                        &serde_json::json!(2),
+                    )
+                    .await;
+                assert_eq!(result["error"]["code"], -32003, "{body} {tool}: {result}");
+                let msg = result["error"]["message"].as_str().unwrap_or("");
+                assert!(msg.contains("[permissions] can_create_agents"), "{body}: {result}");
+            }
+        }
+        // No agent.toml at all: no role to resolve ⇒ refused.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        let result = dispatcher
+            .dispatch_tool_call(
+                &make_principal(vec![Scope::Admin], false),
+                &make_ns_ctx(false),
+                &make_params("create_agent", serde_json::json!({"name": "x"})),
+                &serde_json::json!(3),
+            )
+            .await;
+        assert!(
+            result["error"]["message"].as_str().unwrap_or("").contains("can_create_agents"),
+            "{result}"
+        );
+    }
+
     #[tokio::test]
     async fn absent_or_true_permission_keeps_todays_behaviour() {
         for body in [
             "[permissions]\ncan_create_agents = true\n",
-            "[agent]\nname = \"test-client\"\n",
+            // v1.81 (S2): unwritten only passes for the `main` role.
+            "[agent]\nname = \"test-client\"\nrole = \"main\"\n",
         ] {
             let tmp = tempfile::TempDir::new().unwrap();
             let dispatcher = make_dispatcher(&tmp).await;

@@ -498,6 +498,18 @@ fn patch_agent_toml(
         }
         agent["department"] = toml_edit::value(dept);
     }
+    // v1.81 (S2): only the `main` role may create employees. A kit that
+    // ships `can_create_agents = true` (or leaves it out) on any other role
+    // is scaffolded with an explicit `false`.
+    let role = agent.get("role").and_then(|v| v.as_str()).map(str::to_string);
+    if !duduclaw_core::agent_toml::default_can_create_agents(role.as_deref()) {
+        let perms = doc
+            .entry("permissions")
+            .or_insert(toml_edit::table())
+            .as_table_mut()
+            .ok_or_else(|| "template agent.toml [permissions] is not a table".to_string())?;
+        perms["can_create_agents"] = toml_edit::value(false);
+    }
     if enable_cross_agent {
         // Team lead must be able to delegate to its workers over the bus.
         let perms = doc
@@ -1078,6 +1090,34 @@ summary = "留真人"
         // SOUL got the overlay block appended.
         assert!(role.soul_md.contains("- overlay rule two"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// v1.81 (S2): a non-main role is always scaffolded with an explicit
+    /// `can_create_agents = false`, even when the kit says `true`; `main`
+    /// keeps whatever the kit wrote.
+    #[test]
+    fn patch_forces_can_create_agents_false_for_non_main_roles() {
+        let flag = |out: &str| {
+            let doc: toml::Table = out.parse().unwrap();
+            doc.get("permissions")
+                .and_then(|p| p.get("can_create_agents"))
+                .and_then(|v| v.as_bool())
+        };
+        for role in ["worker", "specialist", "team-leader"] {
+            for perms in ["", "[permissions]\ncan_create_agents = true\n"] {
+                let src = format!("[agent]\nname = \"x\"\nrole = \"{role}\"\n{perms}");
+                let out = patch_agent_toml(&src, "y", "", "", None, None, false).unwrap();
+                assert_eq!(flag(&out), Some(false), "{role} {perms:?}: {out}");
+            }
+        }
+        // No role at all fails closed too.
+        let out = patch_agent_toml("[agent]\nname = \"x\"\n", "y", "", "", None, None, false).unwrap();
+        assert_eq!(flag(&out), Some(false), "{out}");
+        let main = "[agent]\nname = \"x\"\nrole = \"main\"\n[permissions]\ncan_create_agents = true\n";
+        let out = patch_agent_toml(main, "y", "", "", None, None, true).unwrap();
+        assert_eq!(flag(&out), Some(true), "{out}");
+        let out = patch_agent_toml("[agent]\nname = \"x\"\nrole = \"main\"\n", "y", "", "", None, None, false).unwrap();
+        assert_eq!(flag(&out), None, "main without the key keeps it unwritten: {out}");
     }
 
     #[test]

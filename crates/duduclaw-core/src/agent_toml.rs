@@ -126,6 +126,23 @@ pub struct PermissionsSectionView {
     pub can_modify_own_skills: Option<bool>,
 }
 
+/// v1.81 (S2): what `[permissions] can_create_agents` means when the key is
+/// not written. Only the `main` employee may create employees by default;
+/// every other role — and a missing, empty or unrecognised role — defaults to
+/// `false` (fail closed).
+pub fn default_can_create_agents(role: Option<&str>) -> bool {
+    role.and_then(|r| r.parse::<crate::types::AgentRole>().ok())
+        == Some(crate::types::AgentRole::Main)
+}
+
+/// v1.81 (S2): the `can_create_agents` value every gate enforces. An explicit
+/// setting always wins (including an explicit `true` on a non-main employee
+/// the owner turned on); an absent key resolves by role through
+/// [`default_can_create_agents`].
+pub fn effective_can_create_agents(explicit: Option<bool>, role: Option<&str>) -> bool {
+    explicit.unwrap_or_else(|| default_can_create_agents(role))
+}
+
 /// The `[agent]` identity keys the former shadow readers consumed.
 ///
 /// A narrow projection rather than [`crate::types::AgentInfo`] for the same
@@ -890,6 +907,28 @@ model = \"gpt-5.5\"
         let loose = parse(&text);
         assert!(strict.capabilities.git_credentials);
         assert!(loose.capabilities.git_credentials);
+    }
+
+    /// v1.81 (S2): a missing `can_create_agents` resolves by role, an explicit
+    /// value always wins, and an unknown / absent role fails closed.
+    #[test]
+    fn can_create_agents_defaults_by_role_and_explicit_wins() {
+        assert!(default_can_create_agents(Some("main")));
+        assert!(default_can_create_agents(Some(" Main ")));
+        for role in [None, Some(""), Some("specialist"), Some("worker"), Some("team-leader"), Some("bogus")] {
+            assert!(!default_can_create_agents(role), "{role:?}");
+        }
+        assert!(effective_can_create_agents(None, Some("main")));
+        assert!(!effective_can_create_agents(None, Some("specialist")));
+        assert!(!effective_can_create_agents(None, None));
+        assert!(!effective_can_create_agents(Some(false), Some("main")));
+        assert!(effective_can_create_agents(Some(true), Some("worker")));
+        // Through the tolerant parse: a wrong-typed key is "not written".
+        let s = parse("[agent]\nrole = \"qa\"\n[permissions]\ncan_create_agents = \"yes\"\n");
+        assert!(!effective_can_create_agents(
+            s.permissions.can_create_agents,
+            s.agent.as_ref().and_then(|a| a.role.as_deref()),
+        ));
     }
 
     #[test]
