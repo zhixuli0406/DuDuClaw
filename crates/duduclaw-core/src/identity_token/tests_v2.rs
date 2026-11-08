@@ -58,7 +58,10 @@ fn receipt(label: &str, employee: [u8; 16], disabled: bool) -> String {
 }
 
 /// Upsert the confirmed row for `label` (a new id on the label replaces the
-/// row, exactly as `save_confirmed_receipt` does on conflict).
+/// receipt, as `save_confirmed_receipt` does on conflict). The `incarnation`
+/// column is never touched here: design §3.1 has the F6a
+/// `save_confirmed_receipt` write 0 for a new id, so a test that reuses a
+/// label after `set_incarnation` must reset it with `set_incarnation(.., 0)`.
 fn confirm(home: &Path, label: &str, employee: [u8; 16], disabled: bool) {
     let db = Connection::open(db_path(home)).unwrap();
     db.execute("INSERT INTO confirmed_employees(label,operation,digest,receipt) VALUES(?1,?2,x'00',?3)
@@ -274,7 +277,10 @@ fn delegation_context_bound_to_employee_id() {
     assert!(verify(&token).is_none(), "context of the old incarnation");
     let restored = mint();
     assert_eq!(verify(&restored).unwrap().worker_binding(), Some(alice(1)));
+    // Adoption (F6g) / label reuse: a new employee id on the label starts at
+    // incarnation 0 (design §3.1; `confirm` leaves the column untouched).
     confirm(home.path(), "alice", LATER_ID, false);
+    set_incarnation(home.path(), "alice", 0);
     assert!(verify(&restored).is_none(), "context of the old employee id");
     let latest = mint();
     let later = AgentIncarnation { employee: LATER_ID, incarnation: 0 };
