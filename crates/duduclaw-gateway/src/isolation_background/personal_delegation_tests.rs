@@ -182,6 +182,37 @@ async fn personal_to_shared_delegation_needs_owner_approval() {
     assert_eq!(DelegationError::OwnerDenied.user_message(), Some(DENIED_TEXT));
 }
 
+/// F6b A4: the card binds the source incarnation; an owner approval of a
+/// card filed for a prior incarnation never queues a delegation of the
+/// restored employee (same employee id, incarnation + 1), and a receipt whose
+/// caller incarnation differs from the gate is refused outright.
+#[tokio::test]
+async fn delegation_card_from_prior_incarnation_never_binds() {
+    let dir = crate::fs_safe::private_test_home().unwrap();
+    let home = dir.path();
+    let task = "整理上週的工單";
+    let before = gate_for(task, TARGET_ID);
+    assert_eq!(before.source_incarnation, 0);
+    let first = receipt(home, "inc-1", task, TARGET_ID);
+    assert_eq!(admit(home, &before, &first).await, Err(DelegationError::OwnerApprovalPending));
+    let card = cards(home).await.into_iter().next().unwrap();
+    assert_eq!(card.payload["source_incarnation"], json!(0));
+    approve(home, &before).await;
+    // Restored: same source id, next incarnation.
+    let after = gate_for(task, TARGET_ID).with_source_incarnation(1);
+    assert_ne!(after.payload(), before.payload());
+    let mut restored = receipt(home, "inc-2", task, TARGET_ID);
+    restored.caller_incarnation = 1;
+    assert_eq!(admit(home, &after, &restored).await, Err(DelegationError::OwnerApprovalPending),
+        "the old approval does not bind; a new card is filed");
+    assert!(!queued(home, "inc-2"));
+    assert_eq!(cards(home).await.len(), 2);
+    // Gate and receipt must agree on the source incarnation.
+    assert_eq!(admit(home, &before, &restored).await, Err(DelegationError::Failed(VerificationError::BindingMismatch)));
+    assert_eq!(admit(home, &after, &first).await, Err(DelegationError::Failed(VerificationError::BindingMismatch)));
+    assert!(!queued(home, "inc-1"));
+}
+
 #[tokio::test]
 async fn shared_delegation_unchanged() {
     let dir = crate::fs_safe::private_test_home().unwrap();

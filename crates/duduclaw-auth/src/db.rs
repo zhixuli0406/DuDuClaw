@@ -234,6 +234,8 @@ impl UserDb {
         .map_err(|e| format!("failed to migrate auth_meta: {e}"))?;
         migrate_isolation_personal_agents(&conn)?;
         crate::isolation::initialize_tenant(&conn)?;
+        // Last: its triggers read users and every MFA table (F6 S1/S16).
+        crate::admin_eligibility::migrate(&conn)?;
         Ok(())
     }
 
@@ -473,11 +475,18 @@ impl UserDb {
     /// Reporting lines are kept as they are; `users.offboard` goes through
     /// [`Self::offboard_user`], which also moves the leaver's reports.
     pub fn set_user_status(&self, user_id: &str, status: UserStatus) -> Result<(), String> {
+        self.set_user_status_as(None, user_id, status)
+    }
+
+    /// [`Self::set_user_status`] attributed to the acting Admin in the
+    /// admin eligibility log (same transaction, F6 S1/S2).
+    pub fn set_user_status_as(&self, actor: Option<&str>, user_id: &str, status: UserStatus) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("update error: {e}"))?;
+        let since = crate::admin_eligibility::high_water(&tx)?;
         let affected = tx
             .execute(
                 "UPDATE users SET status = ?1, updated_at = ?2 WHERE id = ?3",
@@ -488,6 +497,7 @@ impl UserDb {
         if affected == 0 {
             return Err("user not found".to_string());
         }
+        if let Some(actor) = actor { crate::admin_eligibility::stamp_actor(&tx, since, actor)?; }
         bump_acl_generation(&tx).map_err(|e| format!("update error: {e}"))?;
         tx.commit().map_err(|e| format!("update error: {e}"))
     }
@@ -1823,4 +1833,32 @@ pub fn remove_personal_agent_in_transaction(
     ).map_err(PersonalAgentError::store)?;
     bump_acl_generation(tx).map_err(PersonalAgentError::store)?;
     Ok(true)
+}
+
+/// Remove every member binding of a tombstoned **Shared** employee (native
+/// Linux isolation v1.81, F6 §3.2 step 5).
+///
+/// **Only the gateway employee lifecycle tombstone (and its F6 recovery) may
+/// call this**, in a caller-owned IMMEDIATE users.db transaction; nothing
+/// here commits. Refuses `OwnerConflict` while a Personal mirror exists for
+/// the agent (a Personal employee is removed through
+/// [`remove_personal_agent_in_transaction`]). Deletes all
+/// `user_agent_bindings` rows of the agent, audits the count, and bumps the
+/// ACL generation even when no binding was left (a retry of a half-finished
+/// tombstone still invalidates every cached live ACL). Returns the number of
+/// bindings removed.
+pub fn remove_shared_bindings_in_transaction(
+    tx: &rusqlite::Transaction<'_>, agent: &str,
+) -> Result<usize, PersonalAgentError> {
+    if !is_personal_agent_id(agent) { return Err(PersonalAgentError::InvalidAgent); }
+    if personal_agent_owner(tx, agent)?.is_some() { return Err(PersonalAgentError::OwnerConflict); }
+    let removed = tx.execute("DELETE FROM user_agent_bindings WHERE agent_name = ?1", [agent])
+        .map_err(PersonalAgentError::store)?;
+    tx.execute(
+        "INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp)
+         VALUES(NULL, 'isolation.shared_agent_bindings_removed', ?1, ?2, ?3)",
+        params![agent, serde_json::json!({"removed": removed}).to_string(), Utc::now().to_rfc3339()],
+    ).map_err(PersonalAgentError::store)?;
+    bump_acl_generation(tx).map_err(PersonalAgentError::store)?;
+    Ok(removed)
 }

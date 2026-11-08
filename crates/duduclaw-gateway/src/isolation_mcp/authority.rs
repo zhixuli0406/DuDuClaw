@@ -367,6 +367,9 @@ pub struct PreparedAuthority {
 }
 impl PreparedAuthority {
     pub fn employee(&self) -> EmployeeId { self.employee }
+    /// F6b (A2): the incarnation pinned at prepare; every recheck of this
+    /// run (`recheck_with`) refuses another one.
+    pub fn incarnation(&self) -> u32 { self.lifecycle.incarnation }
     pub fn revision(&self) -> u64 { self.revision }
     pub fn with_turn(mut self, turn: HostTurn) -> Self {
         self.turn = Some(CapturedTurn { turn: turn.identity.turn,
@@ -542,6 +545,8 @@ impl GatewayAuthority {
             // binding, B1). A Personal source needs its owner's approval
             // card before the delegation is queued (SR2, owner decision).
             binding: prepared.lifecycle.binding.clone(),
+            // F6b (A3/A4): the source incarnation pinned at prepare.
+            incarnation: prepared.lifecycle.incarnation,
         })
     }
 }
@@ -633,7 +638,7 @@ mod tests {
                 operation_id: duduclaw_migration::contract::ProposalOperationId {
                     proposal_id: duduclaw_migration::ids::RequestId([1; 16]), revision: 1 },
                 proposal_digest: duduclaw_isolation::ids::Sha256Digest([2; 32]) },
-            uid: 70_001, binding: binding.clone() };
+            uid: 70_001, binding: binding.clone(), incarnation: 0 };
         let prepared = PreparedAuthority { agent: "employee".into(), employee: EmployeeId([1; 16]),
             principal: Principal::Human { user_id: Text::new("user".into()).unwrap(), generation: 5 },
             binding, revision: 1,

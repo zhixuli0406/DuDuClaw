@@ -16,7 +16,31 @@ pub(crate) fn catalog() -> Arc<ConnectorCatalog> {
 pub(crate) fn lifecycle(binding: EmployeeBinding) -> EmployeeLifecycle {
     EmployeeLifecycle { employee: EmployeeId([1; 16]), label: "bot".into(), uid: 70_001, binding,
         allocation: ProposalBinding { operation_id: ProposalOperationId { proposal_id: RequestId([2; 16]), revision: 1 },
-            proposal_digest: Sha256Digest([3; 32]) } }
+            proposal_digest: Sha256Digest([3; 32]) }, incarnation: 0 }
+}
+
+/// F6b A5: a selection binds `(employee, incarnation)`. A read whose second
+/// lifecycle read sees the next incarnation (restore in between) refuses,
+/// and routes read for one incarnation are not pinned to another.
+#[test]
+fn prior_incarnation_selection_refused() {
+    let catalog = catalog();
+    catalog.register("alice", "google", ConnectorKind::Personal, &personal("alice")).unwrap();
+    let before = lifecycle(personal("alice"));
+    let routes = routes_for(&catalog, &before).unwrap();
+    assert!(routes.pinned_to(&before));
+    let mut after = before.clone();
+    after.incarnation = 1;
+    assert!(!routes.pinned_to(&after), "a selection of incarnation 0 never serves incarnation 1");
+    // Restored between the two lifecycle reads of one selection.
+    let reads = std::cell::Cell::new(0);
+    let raced = GoogleAccountRoutes::read_with(&before.label, before.employee, &before.binding, &catalog, None, || {
+        reads.set(reads.get() + 1);
+        Ok(if reads.get() == 1 { before.clone() } else { after.clone() })
+    });
+    assert_eq!(raced.err(), Some(GoogleRoutesError::BindingMismatch));
+    // A fresh read for the new incarnation is pinned to it.
+    assert!(routes_for(&catalog, &after).unwrap().pinned_to(&after));
 }
 pub(crate) fn routes_for(catalog: &ConnectorCatalog, lifecycle: &EmployeeLifecycle)
     -> Result<GoogleAccountRoutes, GoogleRoutesError> {

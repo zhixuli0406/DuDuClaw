@@ -83,7 +83,21 @@ pub struct RecordAuthority {
     parent_policy: Option<String>,
     parent: Option<Box<RecordAuthority>>,
     detached_bus: bool,
+    /// F6b (A3): the incarnation of `employee` at capture. Every recheck
+    /// requires the live lifecycle's incarnation to equal it, so a receipt
+    /// captured before a restore never authorizes the restored employee.
+    /// Omitted when 0, so receipts (and the approval payloads that embed
+    /// them) stored before F6 — when every employee was incarnation 0 —
+    /// serialize byte-identically and stay valid.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    incarnation: u32,
+    /// F6b (A3): the incarnation of `caller` (the delegating source
+    /// employee) at capture; compared with the source's live lifecycle.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    caller_incarnation: u32,
 }
+
+fn is_zero(value: &u32) -> bool { *value == 0 }
 
 impl RecordAuthority {
     /// Stored before v1.81: approved without the employee binding and
@@ -174,7 +188,7 @@ async fn request_record_inner(home: &Path, kind: &str, id: &str, agent: &str,
         let root = &lifecycle::RootAllocator;
         // Up front, before any stored receipt is reused or a card is filed: a
         // Personal employee is never authorized for background work (B1).
-        let Some((employee, binding, allocation)) = capture_binding(home, agent, root)? else {
+        let Some((employee, binding, allocation, incarnation)) = capture_binding(home, agent, root)? else {
             return Ok(Capture::Personal);
         };
         let mut legacy = false;
@@ -204,7 +218,8 @@ async fn request_record_inner(home: &Path, kind: &str, id: &str, agent: &str,
             policy: crate::approval::strict_policy_revision(home, agent).map_err(|_| unavailable())?,
             material: digest, approval: None, expires_at: now()?.checked_add(MAX_AUTHORITY_SECONDS)
                 .ok_or(VerificationError::InvalidTime)?, lane: Lane::Standard,
-            caller: None, parent_run: None, parent_agent: None, parent_policy: None, parent: None, detached_bus: false };
+            caller: None, parent_run: None, parent_agent: None, parent_policy: None, parent: None, detached_bus: false,
+            incarnation, caller_incarnation: 0 };
         store::validate_current(&captured)?;
         Ok(Capture::New { receipt: captured, legacy })
     }).await?;
@@ -236,10 +251,11 @@ async fn request_record_inner(home: &Path, kind: &str, id: &str, agent: &str,
 /// from the A2 lifecycle. `None` for a Personal employee: background runs
 /// are refused entirely, so no receipt or approval card is ever created.
 fn capture_binding(home: &Path, agent: &str, root: &dyn RootAllocation)
-    -> Result<Option<(EmployeeId, EmployeeBinding, ProposalBinding)>, VerificationError> {
+    -> Result<Option<(EmployeeId, EmployeeBinding, ProposalBinding, u32)>, VerificationError> {
     let current = current_lifecycle(home, agent, root)?;
     match &current.binding {
-        EmployeeBinding::Shared(_) => Ok(Some((current.employee, current.binding.clone(), current.allocation))),
+        EmployeeBinding::Shared(_) => Ok(Some((current.employee, current.binding.clone(), current.allocation,
+            current.incarnation))),
         EmployeeBinding::Personal(_) => Ok(None),
     }
 }
@@ -312,8 +328,10 @@ fn check_lifecycle(receipt: &RecordAuthority, current: &EmployeeLifecycle) -> Re
     let (Some(binding), Some(allocation)) = (&receipt.binding, &receipt.allocation) else {
         return Err(VerificationError::Revoked);
     };
+    // F6b (A3): a receipt of a prior incarnation never matches.
     if current.employee != receipt.employee || current.label != receipt.agent
-        || current.allocation != *allocation || current.binding != *binding {
+        || current.allocation != *allocation || current.binding != *binding
+        || current.incarnation != receipt.incarnation {
         return Err(VerificationError::Revoked);
     }
     // B1: a Personal employee is never authorized for background work.
@@ -375,7 +393,10 @@ fn recheck_receipt(receipt: &RecordAuthority, ancestor: bool, check_decision: bo
     else if receipt.kind != "delegation" { return Err(VerificationError::Invalid); }
     if let Some(parent) = &receipt.parent { recheck_receipt(parent, true, true, root)?; }
     if let (Some(agent), Some(policy)) = (&receipt.parent_agent, &receipt.parent_policy) {
-        if Some(current_lifecycle(&receipt.home, agent, root)?.employee) != receipt.caller {
+        // F6b (A3): the delegating source must still be the same employee id
+        // and the same incarnation it was when the delegation was captured.
+        let caller = current_lifecycle(&receipt.home, agent, root)?;
+        if Some(caller.employee) != receipt.caller || caller.incarnation != receipt.caller_incarnation {
             return Err(VerificationError::Revoked);
         }
         let origin = snapshot(&receipt.home, &receipt.owner, agent)?;
@@ -457,6 +478,8 @@ pub(crate) struct DelegationSource {
     /// The source employee's lifecycle principal pinned for this run (SR2:
     /// a Personal source needs its owner's approval card).
     pub binding: EmployeeBinding,
+    /// F6b (A3/A4): the source employee's incarnation pinned for this run.
+    pub incarnation: u32,
 }
 
 /// Called by the original product send handler after its delegation/action
@@ -494,7 +517,7 @@ async fn record_delegation_inner(home: &Path, sender: &str,
             let current = snapshot(&home, &source.owner, &target)?;
             // A queued delegation runs as background work of the target: a
             // Personal target is refused before any receipt is stored.
-            let Some((employee, binding, allocation)) = capture_binding(&home, &target, &lifecycle::RootAllocator)? else {
+            let Some((employee, binding, allocation, incarnation)) = capture_binding(&home, &target, &lifecycle::RootAllocator)? else {
                 tracing::warn!(agent = target.as_str(), "delegation refused: personal employees never run background work");
                 return Err(VerificationError::Invalid);
             };
@@ -506,14 +529,16 @@ async fn record_delegation_inner(home: &Path, sender: &str,
             let policy = crate::approval::strict_policy_revision(&home, &target).map_err(|_| unavailable())?;
             // SR2: Personal source → owner approval card first; Shared → None.
             let gate = personal_delegation::gate(&source.binding, &user_id(&source.owner)?, &source.agent,
-                source.employee, &target, employee, &material)?;
+                source.employee, &target, employee, &material)?
+                .map(|gate| gate.with_source_incarnation(source.incarnation));
             let value = RecordAuthority { home, kind: "delegation".into(), id, agent: target.clone(), employee,
                 binding: Some(binding), allocation: Some(allocation), owner: source.owner, epoch: source.epoch, acl_generation: source.acl_generation,
                 policy_epoch: source.policy_epoch,
                 policy,
                 material: store::material_digest(&material)?, approval: None, expires_at: source.expires_at,
                 lane: source.lane, caller: Some(source.employee), parent_run: Some(source.run),
-                parent_agent: Some(source.agent), parent_policy: Some(source.policy), parent: source.parent.map(Box::new), detached_bus };
+                parent_agent: Some(source.agent), parent_policy: Some(source.policy), parent: source.parent.map(Box::new), detached_bus,
+                incarnation, caller_incarnation: source.incarnation };
             if let Some(gate) = gate { return Ok(Some((value, gate))); }
             if store::load(&value.home, "delegation", &value.id)?.is_some() { return Err(VerificationError::Revoked); }
             store::save(&value).map(|()| None)
@@ -544,7 +569,7 @@ mod tests {
             material: store::material_digest(&json!({"task":"original"})).unwrap(),
             approval: Some("approval-id".into()), expires_at: now().unwrap() + 3600,
             lane: Lane::Standard, caller: None, parent_run: None, parent_agent: None,
-            parent_policy: None, parent: None, detached_bus: false }
+            parent_policy: None, parent: None, detached_bus: false, incarnation: 0, caller_incarnation: 0 }
     }
 
     #[test]

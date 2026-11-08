@@ -60,6 +60,7 @@ pub mod isolation_readiness;
 // not yet called from production code.
 #[allow(dead_code)]
 pub(crate) mod isolation_lifecycle;
+pub(crate) mod isolation_quarantine;
 pub mod migration_import;
 pub mod migration_startup;
 

@@ -205,6 +205,7 @@ impl UserDb {
                 return Err(OrgError::TransferTargetInvalid);
             }
         }
+        let since = crate::admin_eligibility::high_water(&tx).map_err(OrgError::Db)?;
         tx.execute(
             "UPDATE users SET status = 'offboarded', manager_user_id = NULL, updated_at = ?1
               WHERE id = ?2",
@@ -224,6 +225,7 @@ impl UserDb {
         if let Some(t) = transfer_to {
             outcome.transferred_agents = move_bindings(&tx, user_id, t)?;
         }
+        if let Some(actor) = actor { crate::admin_eligibility::stamp_actor(&tx, since, actor).map_err(OrgError::Db)?; }
         bump_acl_generation(&tx).map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         Ok(outcome)
