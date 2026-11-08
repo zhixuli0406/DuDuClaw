@@ -204,6 +204,23 @@ pub fn delegation(sender: &str, target: &str, payload: &str, turn: Option<&str>,
         "upstream_unknown": upstream_unknown, "hop_depth": hop_depth, "spawned": spawned, "on_behalf_of": owner})
 }
 
+/// SR2 round 3 (N2): the fields of a [`delegation`] that a Personal owner's
+/// approval binds and that the resend after the approval ("delegate the same
+/// work again") must repeat exactly. Turn and session ids (and the hop
+/// bookkeeping) change on every resend, so they are not part of it.
+pub const DELEGATION_RESEND_FIELDS: [&str; 6] = ["target", "payload", "reply_channel", "lane", "on_behalf_of", "spawned"];
+
+/// The [`DELEGATION_RESEND_FIELDS`] of a delegation material. `None` when
+/// any of them is missing (a material not built by [`delegation`]).
+pub fn delegation_resend_binding(material: &Value) -> Option<Value> {
+    let object = material.as_object()?;
+    let mut bound = serde_json::Map::new();
+    for name in DELEGATION_RESEND_FIELDS {
+        bound.insert(name.to_owned(), object.get(name)?.clone());
+    }
+    Some(Value::Object(bound))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +264,24 @@ mod tests {
         assert_ne!(original, delegation("mallory", "bob", "work", Some("turn"), Some("session"), None, 1, Some("alice"), Some("line:room"), Some("alice"), false, 0, false, Some("user:owner")));
         assert_ne!(original, delegation("alice", "bob", "work", Some("other"), Some("session"), None, 1, Some("alice"), Some("line:room"), Some("alice"), false, 0, false, Some("user:owner")));
         assert_ne!(original, delegation("alice", "bob", "work", Some("turn"), Some("session"), Some("explore"), 1, Some("alice"), Some("line:room"), Some("alice"), false, 0, false, Some("user:owner")));
+    }
+
+    #[test]
+    fn delegation_resend_binding_ignores_turn_and_session_only() {
+        let bound = |turn: &str, session: &str, reply: &str, lane: Option<&str>, owner: &str, spawned: bool, payload: &str|
+            delegation_resend_binding(&delegation("alice", "bob", payload, Some(turn), Some(session), lane, 1,
+                Some("alice"), Some(reply), Some("alice"), false, 0, spawned, Some(owner))).unwrap();
+        let original = bound("turn", "session", "line:room", None, "user:owner", false, "work");
+        assert_eq!(original.as_object().unwrap().len(), DELEGATION_RESEND_FIELDS.len());
+        assert_eq!(original, bound("turn-2", "session-2", "line:room", None, "user:owner", false, "work"));
+        for changed in [bound("turn", "session", "line:other", None, "user:owner", false, "work"),
+            bound("turn", "session", "line:room", Some("explore"), "user:owner", false, "work"),
+            bound("turn", "session", "line:room", None, "user:other", false, "work"),
+            bound("turn", "session", "line:room", None, "user:owner", true, "work"),
+            bound("turn", "session", "line:room", None, "user:owner", false, "other work")] {
+            assert_ne!(original, changed);
+        }
+        assert!(delegation_resend_binding(&json!({"target": "bob"})).is_none());
     }
 
     #[test]

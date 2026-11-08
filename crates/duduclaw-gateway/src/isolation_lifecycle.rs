@@ -308,56 +308,55 @@ pub(crate) fn tombstone_personal_employee(home: &Path, label: &str, employee: Em
 pub(crate) const QUARANTINE_DIR: &str = "isolation-quarantine";
 
 /// Where the tombstone of `employee` puts its `agents/<label>` directory.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn quarantine_path(home: &Path, label: &str, employee: EmployeeId) -> std::path::PathBuf {
-    home.join(QUARANTINE_DIR).join(format!("{}-{label}", hex::encode(employee.0)))
+    home.join(QUARANTINE_DIR).join(quarantine_name(label, employee))
 }
 
-/// SR2 finding 4: move `agents/<label>` (whatever it is; `rename` never
-/// follows a symlink) to [`quarantine_path`] with one `rename(2)`. Absent
+#[cfg_attr(not(unix), allow(dead_code))]
+fn quarantine_name(label: &str, employee: EmployeeId) -> String {
+    format!("{}-{label}", hex::encode(employee.0))
+}
+
+/// SR2 finding 4 (round 3, N5: descriptor-relative, no check-then-rename):
+/// move `agents/<label>` (whatever it is; the rename never follows a
+/// symlink) to [`quarantine_path`] with one
+/// [`crate::fs_safe::SafeDir::rename_noreplace`] (`renameat2(RENAME_NOREPLACE)`)
+/// between pinned descriptors of `agents/` and the quarantine root, both
+/// opened without following any symlink from `/`. Absent `agents/` or
 /// source: nothing to move (never created, or moved by an earlier attempt).
 /// The quarantine root must be a real directory owned by this uid with no
-/// group/other access; an existing target is never overwritten; a cross-
-/// filesystem or any other rename failure is `Unavailable` (fail closed).
+/// group/other access (checked on its descriptor); an existing target is
+/// refused by the kernel, never overwritten (not even an empty directory);
+/// a cross-filesystem or any other failure is `Unavailable` (fail closed).
 fn quarantine_agent_dir(home: &Path, label: &str, employee: EmployeeId) -> Result<(), LifecycleError> {
     use LifecycleError::Unavailable;
-    let source = home.join("agents").join(label);
-    match std::fs::symlink_metadata(&source) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(Unavailable),
-        Ok(_) => {}
-    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-        let root = home.join(QUARANTINE_DIR);
-        match std::fs::DirBuilder::new().mode(0o700).create(&root) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return Err(Unavailable),
-        }
-        let metadata = std::fs::symlink_metadata(&root).map_err(|_| Unavailable)?;
-        if !metadata.file_type().is_dir() || metadata.uid() != nix::unistd::geteuid().as_raw()
-            || metadata.mode() & 0o077 != 0 {
+        use std::os::unix::fs::MetadataExt;
+        use crate::fs_safe::{EntryKind, SafeDir};
+        let home_dir = SafeDir::open_nofollow(home, false).map_err(|_| Unavailable)?;
+        let Some(agents) = home_dir.child_dir("agents", false).map_err(|_| Unavailable)? else { return Ok(()) };
+        if agents.entry(label).map_err(|_| Unavailable)?.is_none() { return Ok(()); }
+        let root = home_dir.child_dir(QUARANTINE_DIR, true).map_err(|_| Unavailable)?.ok_or(Unavailable)?;
+        let metadata = root.metadata().map_err(|_| Unavailable)?;
+        if !metadata.is_dir() || metadata.uid() != nix::unistd::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
             return Err(Unavailable);
         }
-        let target = quarantine_path(home, label, employee);
-        match std::fs::symlink_metadata(&target) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            _ => return Err(Unavailable),
-        }
-        std::fs::rename(&source, &target).map_err(|_| Unavailable)?;
-        // The moved entry itself: never chmod through a symlink.
-        if std::fs::symlink_metadata(&target).map_err(|_| Unavailable)?.file_type().is_dir() {
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).map_err(|_| Unavailable)?;
-        }
-        for directory in [root, home.join("agents")] {
-            if let Ok(handle) = std::fs::File::open(&directory) { let _ = handle.sync_all(); }
+        let target = quarantine_name(label, employee);
+        // The kernel refuses an existing target atomically; there is no
+        // separate existence check to race.
+        agents.rename_noreplace(label, &root, &target).map_err(|_| Unavailable)?;
+        // The moved entry itself, by descriptor: never chmod through a symlink.
+        if root.entry(&target).map_err(|_| Unavailable)?.is_some_and(|entry| entry.kind == EntryKind::Dir) {
+            root.child_dir(&target, false).map_err(|_| Unavailable)?.ok_or(Unavailable)?
+                .set_mode(0o700).map_err(|_| Unavailable)?;
         }
         tracing::info!(agent = label, "tombstoned personal employee directory moved to quarantine");
         Ok(())
     }
     #[cfg(not(unix))]
-    { let _ = employee; Err(Unavailable) }
+    { let _ = (home, label, employee); Err(Unavailable) }
 }
 
 fn valid_label(label: &str) -> bool {

@@ -2,15 +2,21 @@
 //! decides the approval card for a delegation from its live run to a Shared
 //! employee (`crate::isolation_background::personal_delegation`).
 //!
-//! - `me.isolation.list_personal_delegations`: the caller's own pending cards.
+//! - `me.isolation.list_personal_delegations`: the caller's own pending
+//!   cards, each with the FULL task text exactly as the card binds it
+//!   (`task`, at most `MAX_TASK_CHARS`, digest-checked; SR2 round 3 N1) and
+//!   the bound delivery fields. This is the only reader of this kind: the
+//!   generic approval centre never lists or returns it (N4).
 //! - `me.isolation.decide_personal_delegation {id, approve}`: only the owner
-//!   named on the card; approving also requires a fresh lifecycle read that
+//!   named on the card; approving also requires that the card's bound text
+//!   is showable (the same check as the list) and a fresh lifecycle read that
 //!   the caller still owns exactly the source employee id on the card. The
 //!   decision is recorded as `dashboard:<owner>` (the only decider the send
 //!   path accepts). `approvals.decide` refuses this kind for everyone.
 use super::*;
 use crate::approval::{ApprovalBroker, ApprovalId, ApprovalStatus};
 use crate::isolation_background::PERSONAL_DELEGATION_KIND as KIND;
+use crate::isolation_background::personal_delegation_shown_task as shown_task;
 
 pub(super) const DELEGATIONS: &str = "me.isolation.list_personal_delegations";
 pub(super) const DECIDE_DELEGATION: &str = "me.isolation.decide_personal_delegation";
@@ -39,14 +45,18 @@ pub(super) async fn list(home: &Path, user: &str) -> Result<Value, &'static str>
     let _ = broker.expire_stale().await;
     let now = chrono::Utc::now();
     let cards = broker.list_by_kind(KIND).await.map_err(|_| SERVICE_UNAVAILABLE)?;
+    // A card whose bound text cannot be shown exactly is never listed (and
+    // `decide` refuses to approve it).
     let mine: Vec<Value> = cards.iter()
         .filter(|card| owned_by(card, user) && card.status == ApprovalStatus::Pending && !card.is_stale(now))
-        .map(|card| json!({
+        .filter_map(|card| Some(json!({
             "id": card.id.as_str(), "summary": card.summary,
+            "task": shown_task(card)?,
             "source_agent": card.payload["source_agent"], "target_agent": card.payload["target_agent"],
+            "delivery": card.payload["delivery"],
             "created_at": card.created_at,
             "expires_at": card.expires_at_epoch(),
-        })).collect();
+        }))).collect();
     Ok(json!({ "delegations": mine }))
 }
 
@@ -60,6 +70,8 @@ pub(super) async fn decide(home: &Path, user: &str, input: Decision) -> Result<V
         return Err(NOT_PENDING);
     }
     if input.approve {
+        // Only what the owner could be shown exactly is approvable.
+        if shown_task(&card).is_none() { return Err(NOT_FOUND); }
         // Fresh: the caller still owns exactly the source employee on the card.
         let source = card.payload["source_agent"].as_str().ok_or(NOT_FOUND)?.to_owned();
         let employee = card.payload["source_employee"].as_str().ok_or(NOT_FOUND)?.to_owned();

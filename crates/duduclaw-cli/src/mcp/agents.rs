@@ -15,6 +15,12 @@ pub(crate) async fn handle_create_agent(
     // Native Linux protected mode (v1.81, SR2): refused before any parsing
     // or filesystem effect, on every MCP transport (the isolated adapter
     // also hides and refuses it through `mcp_isolation_disposition`).
+    // SR2 1a-i: this env-based check (`DUDUCLAW_PROTECTED_KEY_MODE`) is
+    // defence in depth only — an employee process could run without that
+    // variable. The real gate is the isolated adapter's disposition table
+    // (`crate::mcp_isolation_disposition::intentional_refusal`:
+    // `create_agent` => `ProposalRequired`), which refuses the tool for an
+    // employee whatever its environment says.
     if let Some(refused) = protected_create_refusal(duduclaw_gateway::runtime_readiness::is_protected_linux()) {
         return refused;
     }

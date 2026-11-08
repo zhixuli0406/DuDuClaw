@@ -49,7 +49,8 @@ use duduclaw_migration::confirmation::{ConfirmationError, ConfirmationStore, Pro
 use duduclaw_migration::contract::{ConfirmationCategory, ConfirmationItem, ConfirmationStatus, ProposalField,
     ProposalOperationId, ProposalValue, MAX_PROPOSAL_VALUE_BYTES};
 use duduclaw_migration::ids::RequestId;
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{Connection, TransactionBehavior};
+use crate::fs_safe::sqlite::Access;
 use super::isolation_connectors_rpc::authorize_step_up;
 use crate::isolation_lifecycle::{self as lifecycle, LifecycleError};
 
@@ -295,7 +296,7 @@ impl MethodHandler {
         let created = match (&owner, present) {
             (Some(owner), true) => {
                 let (home, agents_dir, label, owner) = (home.clone(), agents_dir.clone(), prepared.label.clone(), owner.clone());
-                blocking(move || employee_dirs::adopt_existing(&home, &agents_dir, &label, &owner)).await?;
+                blocking(move || employee_dirs::adopt_existing(&home, &agents_dir, &label, &owner).map(|_| ())).await?;
                 false
             }
             (None, true) if exists => false,
@@ -322,11 +323,26 @@ impl MethodHandler {
                 true
             }
         };
-        if owner.is_some() { prepared.adopt = Some(agents_dir); }
-        let settings = {
+        let settings = if owner.is_some() {
+            // SR2 1b (round 3): a Personal proposal's settings are parsed from
+            // exactly the agent.toml bytes inside the adopted digest, never
+            // from the registry entry looked up by name. The live registry
+            // entry (what the approval validator compares) must be this very
+            // directory with the same settings, or nothing is staged.
+            let (home, dir, label) = (home.clone(), agents_dir.clone(), prepared.label.clone());
+            let settings = blocking(move || employee_dirs::snapshot(&home, &dir, &label)?.settings()).await?;
+            let registry = self.registry.read().await;
+            let live = registry.get(&prepared.label).ok_or(CREATE_FAILED)?;
+            if live.dir.file_name().and_then(|name| name.to_str()) != Some(prepared.label.as_str())
+                || settings_for(&live.config)? != settings {
+                return Err(employee_dirs::FOREIGN_DIR);
+            }
+            settings
+        } else {
             let registry = self.registry.read().await;
             settings_for(&registry.get(&prepared.label).ok_or(CREATE_FAILED)?.config)?
         };
+        if owner.is_some() { prepared.adopt = Some(agents_dir); }
         let mut staged = blocking(move || {
             let now = now()?;
             let proof = db.migration_confirmation_session(&user, &session, epoch, now).map_err(|_| SESSION_EXPIRED)?;
@@ -385,8 +401,9 @@ fn resolve_binding(home: &Path, db: &UserDb, kind: &str, owner: Option<&str>) ->
             Text::new(owner.to_owned()).map(EmployeeBinding::Personal).map_err(|_| BINDING_INVALID)
         }
         ("shared", None) => {
-            let users = Connection::open_with_flags(home.join("users.db"),
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|_| USERS_UNAVAILABLE)?;
+            // SR2 7: the no-follow, never-create authority-store open.
+            let users = crate::fs_safe::sqlite::open_existing(home, "users.db", Access::ReadOnly)
+                .map_err(|_| USERS_UNAVAILABLE)?;
             let tenant = duduclaw_auth::isolation::read_isolation_tenant(&users).map_err(|_| TENANT_UNAVAILABLE)?;
             Text::new(tenant).map(EmployeeBinding::Shared).map_err(|_| BINDING_INVALID)
         }
@@ -514,7 +531,9 @@ fn read_items(home: &Path) -> Result<Vec<ConfirmationItem>, &'static str> {
 fn open_requests(home: &Path) -> Result<Connection, &'static str> {
     // Creates or validates the private migration-authority directory and apply.db.
     super::migration_authority::GatewayAuthority::new(home.to_path_buf()).map_err(|_| STORE_UNAVAILABLE)?;
-    let db = Connection::open_with_flags(home.join(APPLY_DB), OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(|_| STORE_UNAVAILABLE)?;
+    // SR2 7: then opened like every other authority store (no-follow walk,
+    // owner/mode/link checks, never created by SQLite).
+    let db = open_apply(home, Access::ReadWrite)?;
     db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| STORE_UNAVAILABLE)?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS personal_employee_requests (
             request_id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, label TEXT NOT NULL,
@@ -529,6 +548,17 @@ fn open_requests(home: &Path) -> Result<Connection, &'static str> {
     Ok(db)
 }
 
+/// `migration-authority/apply.db` through
+/// [`crate::fs_safe::sqlite::open_existing`] (SR2 7): no-follow descriptor
+/// walk to the directory, owner/mode/single-link and dev+inode checks on the
+/// store and its sidecars, `SQLITE_OPEN_NOFOLLOW`, never created.
+fn open_apply(home: &Path, access: Access) -> Result<Connection, &'static str> {
+    let (directory, name) = APPLY_DB.rsplit_once('/').ok_or(STORE_UNAVAILABLE)?;
+    let db = crate::fs_safe::sqlite::open_existing(&home.join(directory), name, access).map_err(|_| STORE_UNAVAILABLE)?;
+    db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| STORE_UNAVAILABLE)?;
+    Ok(db)
+}
+
 struct RequestRow { request_id: String, owner: String, label: String, display_name: String, created_at: String }
 
 /// Index rows, newest first; `owner` filters by exact user id.
@@ -539,8 +569,7 @@ fn request_rows(home: &Path, owner: Option<&str>) -> Result<Vec<RequestRow>, &'s
         Ok(metadata) if metadata.file_type().is_file() => {}
         _ => return Err(STORE_UNAVAILABLE),
     }
-    let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_| STORE_UNAVAILABLE)?;
-    db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| STORE_UNAVAILABLE)?;
+    let db = open_apply(home, Access::ReadOnly)?;
     let table: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='personal_employee_requests')",
         [], |r| r.get(0)).map_err(|_| STORE_UNAVAILABLE)?;
@@ -647,8 +676,7 @@ fn confirmed_employees(home: &Path) -> Result<Vec<Value>, &'static str> {
         Ok(metadata) if metadata.file_type().is_file() => {}
         _ => return Err(STORE_UNAVAILABLE),
     }
-    let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_| STORE_UNAVAILABLE)?;
-    db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| STORE_UNAVAILABLE)?;
+    let db = open_apply(home, Access::ReadOnly)?;
     let table: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='confirmed_employees')",
         [], |r| r.get(0)).map_err(|_| STORE_UNAVAILABLE)?;
@@ -745,9 +773,12 @@ fn stage_prepared(home: &Path, proof: Option<&MigrationConfirmationSession>, use
     let mut store = open_confirmations(home)?;
     let items = store.list().map_err(|_| STORE_UNAVAILABLE)?;
     if label_pending(&items, &prepared.label, prepared.request) { return Err(LABEL_PENDING); }
-    // SR2 finding 1b: the adopted directory still carries this flow's marker.
+    // SR2 finding 1b: the adopted directory still carries this flow's marker,
+    // holds nothing outside the allowlist, and the staged settings are
+    // exactly those parsed from the agent.toml bytes inside that digest.
     if let (Some(agents_dir), EmployeeBinding::Personal(owner)) = (&prepared.adopt, &prepared.binding) {
-        employee_dirs::check_marker(&lock, home, agents_dir, &prepared.label, owner.as_str())?;
+        let adopted = employee_dirs::check_marker(&lock, home, agents_dir, &prepared.label, owner.as_str())?;
+        if adopted.settings()? != settings { return Err(STALE); }
     }
     let item = store.stage_proposal(operation, ConfirmationCategory::Employee, fields, &StagingCheck { home })
         .map_err(stage_error)?;

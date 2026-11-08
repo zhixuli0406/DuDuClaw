@@ -501,6 +501,35 @@ fn path_occupied(path: &Path) -> std::io::Result<bool> {
 /// The request's private temp directory is removed on every pre-publication
 /// failure; a published directory is retained if marker publication fails.
 pub fn stage_restore(home: &Path, source: &Path) -> Result<RestoreStageReport, String> {
+    stage_restore_with_protection(home, source, protected_mode())
+}
+
+/// Native Linux protected mode (v1.81, SR2 1c-u2): a whole-home restore is
+/// refused outright, before any lock, read, temp directory or marker.
+///
+/// Why: the archive replaces every authority store and tree at once
+/// (`users.db`, `migration-authority/apply.db`, `migration-confirmations.db`,
+/// `approvals.db`, `agents/`). Restoring a backup taken before an Admin
+/// tombstoned a Personal employee would undo that tombstone — the confirmed
+/// row comes back live, the users.db mirror and owner binding return and the
+/// directory reappears under `agents/<label>` (outside
+/// `isolation-quarantine/`) — and it could equally revive proposals, approvals
+/// or credentials that were since revoked. Protected installations use the
+/// bounded migration import instead, whose every item is an Admin-approved
+/// proposal.
+pub const PROTECTED_RESTORE_REFUSED: &str = "受保護模式下不能整包還原資料目錄：整包還原會一次覆寫 AI 員工的隔離配置、\
+    核准紀錄與帳號資料，可能讓已交接（停用並移入隔離區）的個人專屬員工或已撤銷的授權復原。請改用受保護的資料匯入流程，\
+    由管理員逐項核准。";
+
+/// Protected mode for restore purposes: the native Linux protected key mode
+/// (`DUDUCLAW_PROTECTED_KEY_MODE=native-systemd`, the same switch the boot
+/// path uses to require isolation).
+fn protected_mode() -> bool {
+    crate::runtime_readiness::is_protected_linux()
+}
+
+fn stage_restore_with_protection(home: &Path, source: &Path, protected: bool) -> Result<RestoreStageReport, String> {
+    if protected { return Err(PROTECTED_RESTORE_REFUSED.into()); }
     with_restore_lock(home, || stage_restore_locked(home, source))
         .map_err(|e| format!("無法鎖定還原作業：{e}"))?
 }
@@ -664,6 +693,10 @@ pub enum RestoreSwapError {
     /// touched — fail-closed, no data movement on an already-suspect state.
     StagingMissingOrEmpty,
     GatewayRunning(String),
+    /// Native Linux protected mode: a marker staged before protection was
+    /// enabled is never swapped in ([`PROTECTED_RESTORE_REFUSED`]). Nothing
+    /// is moved; the staging tree and marker stay for an Admin to inspect.
+    ProtectedMode(&'static str),
     Io(String),
 }
 
@@ -707,8 +740,20 @@ pub fn perform_pending_restore_swap(
     home_dir: &Path,
     now_tag: &str,
 ) -> Result<Option<RestoreSwapReport>, RestoreSwapError> {
+    perform_pending_restore_swap_with_protection(home_dir, now_tag, protected_mode())
+}
+
+fn perform_pending_restore_swap_with_protection(
+    home_dir: &Path,
+    now_tag: &str,
+    protected: bool,
+) -> Result<Option<RestoreSwapReport>, RestoreSwapError> {
     if read_marker(home_dir).is_none() {
         return Ok(None);
+    }
+    // SR2 1c-u2: see `PROTECTED_RESTORE_REFUSED` (a restore could undo tombstones).
+    if protected {
+        return Err(RestoreSwapError::ProtectedMode(PROTECTED_RESTORE_REFUSED));
     }
 
     // Hold through policy reads, staging rewrites, the entire swap and boot.
@@ -1836,5 +1881,34 @@ mod isolation_tests {
             &dir.path().join("missing"), &dest, &super::RestoreLimits::default(), true,
         ), Err(super::RestoreViolation::IsolationUnavailable));
         assert!(!dest.exists());
+    }
+
+    /// SR2 1c-u2: in native Linux protected mode a whole-home restore is
+    /// refused with a plain-language reason (it could undo tombstones),
+    /// both when staging and at the boot swap of an older staged restore.
+    #[test]
+    fn backup_restore_refused_in_protected_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        // Staging: refused before any lock, read, temp directory or marker.
+        let error = super::stage_restore_with_protection(home, &home.join("missing.tar.gz"), true).unwrap_err();
+        assert_eq!(error, super::PROTECTED_RESTORE_REFUSED);
+        assert!(error.contains("受保護模式") && error.contains("個人專屬員工"), "{error}");
+        assert!(std::fs::read_dir(home).unwrap().next().is_none(), "nothing was written");
+        // Boot: a restore staged before protection was enabled never swaps
+        // in; nothing moves and the staged data and marker stay for review.
+        let staging = super::staging_dir(home);
+        std::fs::create_dir_all(staging.join("agents/alice-helper")).unwrap();
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+        std::fs::write(home.join("users.db"), b"current").unwrap();
+        super::write_marker(home, &super::RestoreMarker {
+            staged_at: chrono::Utc::now(), source_filename: "before-tombstone.tar.gz".into() }).unwrap();
+        assert_eq!(super::perform_pending_restore_swap_with_protection(home, "ts", true),
+            Err(super::RestoreSwapError::ProtectedMode(super::PROTECTED_RESTORE_REFUSED)));
+        assert!(super::read_marker(home).is_some());
+        assert!(staging.join("agents/alice-helper").is_dir());
+        assert!(!home.join("agents/alice-helper").exists());
+        assert_eq!(std::fs::read(home.join("users.db")).unwrap(), b"current");
+        assert!(!home.join("restore-backup-ts").exists());
     }
 }

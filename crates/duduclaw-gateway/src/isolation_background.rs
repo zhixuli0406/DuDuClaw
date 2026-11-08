@@ -15,6 +15,9 @@ mod store;
 mod personal_delegation;
 pub use personal_delegation::{DelegationError,
     DECIDE_ELSEWHERE as PERSONAL_DELEGATION_DECIDE_ELSEWHERE, KIND as PERSONAL_DELEGATION_KIND};
+pub(crate) use personal_delegation::shown_task as personal_delegation_shown_task;
+#[cfg(test)]
+pub(crate) use personal_delegation::test_support as personal_delegation_test_support;
 #[cfg(test)]
 mod lifecycle_tests;
 /// Shown when background work is asked of a Personal employee. Such an
