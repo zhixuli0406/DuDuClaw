@@ -167,8 +167,8 @@ impl LauncherPlan {
             }
             let arch = Architecture::native().map_err(|_| Error::Seccomp)?;
             seccomp::runtime(arch, &program.seccomp, program.seccomp_digest).map_err(|_| Error::Seccomp)?;
-            if helper.self_only.len() > MAX_SELF_ONLY
-                || (helper.self_only.contains(&SelfOnlyCall::NestedSandbox) && helper.slot != HelperSlot::Recording) {
+            // HX6 round 3 (N3): NestedSandbox and the subreaper prctl options are recording-only.
+            if helper.self_only.len() > MAX_SELF_ONLY || recording_only_violation(helper.slot, &helper.self_only) {
                 return Err(Error::Seccomp);
             }
         }

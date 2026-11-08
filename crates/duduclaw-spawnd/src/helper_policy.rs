@@ -174,7 +174,9 @@ pub fn validate_launcher(arch: Architecture, parent: &PublishedRuntime, parent_s
         // names exactly its three signed browser files, and only the recording
         // may hold the nested-sandbox exception.
         if recording && recording_files(helper).is_none() { return Err(Invalid); }
-        if !recording && binding.self_only.contains(&SelfOnlyCall::NestedSandbox) { return Err(NotNarrowing); }
+        // Round 3 (N3): so may the subreaper prctl options (in the global
+        // `PRCTL_SELF_ONLY`); `recording` equals the recording slot (above).
+        if duduclaw_run::helper_policy::recording_only_violation(binding.slot, &binding.self_only) { return Err(NotNarrowing); }
         // Check 2 [F3].
         if seccomp::runtime(arch, &binding.seccomp, binding.seccomp_digest).is_err()
             || !seccomp_within_parent(arch, parent_seccomp, &binding.seccomp, &binding.self_only) { return Err(NotNarrowing); }
@@ -535,5 +537,24 @@ mod tests {
         check(&f, &launcher(vec![record])).unwrap();
         let mut foreground = binding(2, HelperSlot::Foreground); foreground.self_only = vec![SelfOnlyCall::NestedSandbox];
         assert_eq!(check(&f, &launcher(vec![foreground])), Err(HelperPolicyError::NotNarrowing));
+    }
+    /// HX6 security round 3 (N3): PR_SET/GET_CHILD_SUBREAPER sit in the
+    /// global `PRCTL_SELF_ONLY`, but publication grants them to the recording
+    /// binding only; a slot-neutral prctl option stays publishable anywhere.
+    #[test]
+    fn hx6r3_subreaper_prctl_refused_for_non_recording_bindings() {
+        use duduclaw_run::helper_policy::{PR_GET_CHILD_SUBREAPER, PR_SET_CHILD_SUBREAPER, PR_SET_NO_NEW_PRIVS};
+        let f = fixture(egress());
+        let mut neutral = binding(2, HelperSlot::Foreground);
+        neutral.self_only = vec![SelfOnlyCall::Prctl { options: vec![PR_SET_NO_NEW_PRIVS] }];
+        check(&f, &launcher(vec![neutral])).unwrap();
+        for options in [vec![PR_SET_CHILD_SUBREAPER], vec![PR_GET_CHILD_SUBREAPER], vec![PR_SET_NO_NEW_PRIVS, PR_SET_CHILD_SUBREAPER]] {
+            let mut foreground = binding(2, HelperSlot::Foreground);
+            foreground.self_only = vec![SelfOnlyCall::Prctl { options: options.clone() }];
+            assert_eq!(check(&f, &launcher(vec![foreground])), Err(HelperPolicyError::NotNarrowing), "{options:?}");
+            let mut record = binding(3, HelperSlot::Recording);
+            record.self_only = vec![SelfOnlyCall::NestedSandbox, SelfOnlyCall::Prctl { options: options.clone() }];
+            check(&f, &launcher(vec![record])).unwrap();
+        }
     }
 }

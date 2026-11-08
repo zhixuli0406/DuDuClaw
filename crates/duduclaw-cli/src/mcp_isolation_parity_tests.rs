@@ -151,18 +151,117 @@ fn pending_production_selectors() -> BTreeSet<String> {
 /// the runtime can rewrite `/work/recordings/<id>/*` at any time [F11]. This
 /// tripwire fails as soon as the tool leaves the list while the handler's
 /// production code (outside its `#[cfg(test)]` module) never calls it.
+///
+/// Round 3: the scan runs on the code with every comment and string literal
+/// removed (a comment or message mentioning the call no longer satisfies
+/// it), and the call itself is a type seam: `verify_artifact` takes the bytes
+/// by value and returns them only inside a `VerifiedArtifact`, which nothing
+/// else can construct, so the distill step's input can only be verified bytes.
 #[test]
 fn hx6fix_skill_from_recording_leaves_pending_only_with_verify_artifact() {
     let pending = duduclaw_mcp_boundary::workspace_selection::PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&"skill_from_recording");
-    let source = include_str!("mcp_recording_distill.rs");
-    let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+    let code = strip_comments_and_strings(include_str!("mcp_recording_distill.rs"));
+    let production = code.split("#[cfg(test)]").next().unwrap_or_default();
     assert!(production.contains("fn handle_skill_from_recording"), "the scanned file holds the production handler");
     let verifies = production.contains("recording_jobs::verify_artifact(");
+    // The seam's shape is checked by the compiler: bytes in by value, verified bytes out.
+    let _seam: fn(&[duduclaw_mcp_boundary::recording_jobs::ArtifactDigest], &str, Vec<u8>)
+        -> Result<duduclaw_mcp_boundary::recording_jobs::VerifiedArtifact, duduclaw_mcp_boundary::recording_jobs::ArtifactError>
+        = duduclaw_mcp_boundary::recording_jobs::verify_artifact;
     assert!(pending || verifies,
         "skill_from_recording was signed (left PENDING_WORKSPACE_SELECTOR_TOOLS) but its production handler never calls \
          duduclaw_mcp_boundary::recording_jobs::verify_artifact on the artifacts it reads");
     // The protected listing agrees with the list: pending ⇒ never eligible in the fixture.
     assert_eq!(pending, pending_production_selectors().contains("skill_from_recording"));
+}
+
+/// Rust source with comments (line, doc, nested block) and string/char
+/// literals (incl. raw and byte strings) replaced by nothing / `""`, for
+/// tripwires that must only see code. Lifetimes are kept.
+fn strip_comments_and_strings(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    // `r"`, `r#"`, `br##"` … at `at`: (index after the opening quote, hash count).
+    let raw_start = |at: usize| -> Option<(usize, usize)> {
+        if at > 0 && ident(chars[at - 1]) { return None; }
+        let mut j = match (chars.get(at), chars.get(at + 1)) {
+            (Some('r'), _) => at + 1,
+            (Some('b'), Some('r')) => at + 2,
+            _ => return None,
+        };
+        let mut hashes = 0;
+        while chars.get(j) == Some(&'#') { hashes += 1; j += 1; }
+        (chars.get(j) == Some(&'"')).then_some((j + 1, hashes))
+    };
+    while i < chars.len() {
+        let (c, next) = (chars[i], chars.get(i + 1).copied());
+        if let Some((start, hashes)) = raw_start(i) {
+            let mut j = start;
+            while j < chars.len() && !(chars[j] == '"' && (1..=hashes).all(|k| chars.get(j + k) == Some(&'#'))) { j += 1; }
+            i = j + 1 + hashes;
+            out.push_str("\"\"");
+        } else if c == '/' && next == Some('/') {
+            while i < chars.len() && chars[i] != '\n' { i += 1; }
+        } else if c == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while i < chars.len() {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') { depth += 1; i += 2; }
+                else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') { depth -= 1; i += 2; if depth == 0 { break; } }
+                else { i += 1; }
+            }
+            out.push(' ');
+        } else if c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != '"' { if chars[i] == '\\' { i += 1; } i += 1; }
+            i += 1;
+            out.push_str("\"\"");
+        } else if c == '\'' && next == Some('\\') {
+            // Escaped char literal: '\n', '\'', '\u{..}' (skip the quote, backslash and escaped char).
+            i += 3;
+            while i < chars.len() && chars[i] != '\'' { i += 1; }
+            i += 1;
+            out.push_str("' '");
+        } else if c == '\'' && chars.get(i + 2) == Some(&'\'') {
+            i += 3;
+            out.push_str("' '");
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// HX6 round 3: the tripwire's scanner sees code only — a mention of the
+/// call in a comment, doc comment, block comment or string does not count,
+/// a real call does, and test modules stay excluded.
+#[test]
+fn hx6r3_tripwire_scan_ignores_comments_and_strings() {
+    let call = "recording_jobs::verify_artifact(";
+    let fake = r####"
+        // recording_jobs::verify_artifact(&digests, name, bytes)
+        /// recording_jobs::verify_artifact(
+        /* outer /* recording_jobs::verify_artifact( */ still comment */
+        fn handle_skill_from_recording() {
+            let message = "recording_jobs::verify_artifact(";
+            let raw = r#"recording_jobs::verify_artifact("#;
+            let quote = '"'; let escaped = '\''; let s = "a \" recording_jobs::verify_artifact(";
+            fn lifetime<'a>(x: &'a str) -> &'a str { x }
+        }
+    "####;
+    let stripped = strip_comments_and_strings(fake);
+    assert!(!stripped.contains(call), "{stripped}");
+    assert!(stripped.contains("fn handle_skill_from_recording") && stripped.contains("fn lifetime<'a>(x: &'a str)"), "{stripped}");
+    let real = "fn handle_skill_from_recording() { let ok = duduclaw_mcp_boundary::recording_jobs::verify_artifact(&d, \"trace.zip\", b); }";
+    assert!(strip_comments_and_strings(real).contains(call));
+    let in_test = "fn handle_skill_from_recording() {}\n#[cfg(test)]\nmod tests { fn t() { recording_jobs::verify_artifact(&d, n, b); } }";
+    let production = strip_comments_and_strings(in_test);
+    assert!(!production.split("#[cfg(test)]").next().unwrap().contains(call));
+    // A `#[cfg(test)]` inside a comment does not cut the scan short.
+    let commented = "// #[cfg(test)]\nfn handle_skill_from_recording() { recording_jobs::verify_artifact(&d, n, b); }";
+    assert!(strip_comments_and_strings(commented).split("#[cfg(test)]").next().unwrap().contains(call));
 }
 
 /// H12a tools the production issuer must make eligible without new selectors.

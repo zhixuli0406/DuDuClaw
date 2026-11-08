@@ -97,6 +97,20 @@ pub const RECORDING_BUILD_ENABLED: bool = false;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordingProbeEvidence { pub boot_id: String, pub landlock_abi: u32, pub passed: bool }
+/// HX6 security round 3 (N4): the published report's
+/// [`EvidenceReport::helper_recording`] value, stored by `Core::refresh` right
+/// after it publishes the report and read by `LinuxHost::recording_ready`
+/// without the view lock, so lock contention can no longer make a ready host
+/// answer `helper_recording_unsupported`. Starts closed; closed on a poisoned
+/// core (and on drop of the core), i.e. only on a real "not ready".
+#[derive(Clone, Default)]
+pub struct RecordingGate(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl RecordingGate {
+    pub fn publish(&self, report: &EvidenceReport, poisoned: bool) {
+        self.0.store(!poisoned && report.helper_recording(), std::sync::atomic::Ordering::Release);
+    }
+    pub fn ready(&self) -> bool { self.0.load(std::sync::atomic::Ordering::Acquire) }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceReport {
@@ -247,6 +261,30 @@ mod tests {
         assert!(!report.recording_probe_matches(), "no Landlock evidence, no recording");
         let back: EvidenceReport = serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
         assert_eq!(back.recording_probe, report.recording_probe);
+    }
+    /// HX6 security round 3 (N4): the gate is the published report's value,
+    /// shared by clones (Core writes, LinuxHost reads) and readable while
+    /// another thread holds any lock; closed on poison and by default.
+    #[test]
+    fn hx6r3_recording_gate_follows_published_report_without_lock() {
+        let gate = RecordingGate::default();
+        let reader = gate.clone();
+        assert!(!reader.ready(), "closed until a report is published");
+        let mut report = EvidenceReport::current(Readiness::default(), 1).unwrap();
+        report.landlock = Some(LandlockEvidence { detected_abi: 6, selected_abi: 6 });
+        report.features = SpawndFeatures::WORK_BROKER.with(SpawndFeatures::HELPER_CALLS).with(SpawndFeatures::HELPER_RECORDING);
+        report.recording_probe = Some(RecordingProbeEvidence { boot_id: report.boot_id.clone(), landlock_abi: 6, passed: true });
+        // A held view lock (the old `try_lock` contention) does not change the answer.
+        let view = std::sync::Mutex::new(());
+        let _held = view.lock().unwrap();
+        gate.publish(&report, false);
+        assert_eq!(reader.ready(), report.helper_recording());
+        assert_eq!(reader.ready(), RECORDING_BUILD_ENABLED);
+        gate.publish(&report, true);
+        assert!(!reader.ready(), "a poisoned core closes the gate");
+        report.recording_probe = None;
+        gate.publish(&report, false);
+        assert!(!reader.ready(), "no probe evidence, no recording");
     }
 }
 

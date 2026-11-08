@@ -5,7 +5,10 @@
 //! failure, with the actor, the recording's employee, run and call, who asked
 //! it to stop (`stop_by`) and the outcome/reason code. The boundary's own
 //! recording facts (employee start/stop, revocation-triggered stop, invalid
-//! result, collector timeout) reach `security_audit.jsonl` through
+//! result, collector timeout and, HX6 round 3, helper-level start refusals
+//! incl. spawnd's `helper_recording_unsupported` gate (`call: null`) and
+//! terminal outcomes stored only as an `uncertain` reason: browser tree
+//! survived, exit 78, timeout, OOM) reach `security_audit.jsonl` through
 //! [`GatewayRecordingAudit`]. No URL, page content or artifact is logged.
 use super::*;
 use duduclaw_mcp_boundary::{recording_audit::{RecordingAudit, RecordingAuditEvent},

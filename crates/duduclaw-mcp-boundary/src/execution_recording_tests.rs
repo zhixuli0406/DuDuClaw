@@ -262,8 +262,8 @@ async fn recording_stop_same_run_returns_artifacts() {
     let digests = fixture.store.artifacts(EMPLOYEE, call).unwrap();
     assert_eq!(digests.len(), 3);
     // [F11] Stored digests catch a runtime rewrite of the published files.
-    assert!(crate::recording_jobs::verify_artifact(&digests, "trace.zip", b"trace.zip").is_ok());
-    assert_eq!(crate::recording_jobs::verify_artifact(&digests, "trace.zip", b"forged!!!").unwrap_err().code(), "artifact_modified");
+    assert!(crate::recording_jobs::verify_artifact(&digests, "trace.zip", b"trace.zip".to_vec()).is_ok());
+    assert_eq!(crate::recording_jobs::verify_artifact(&digests, "trace.zip", b"forged!!!".to_vec()).unwrap_err().code(), "artifact_modified");
 }
 
 #[tokio::test]
@@ -444,7 +444,8 @@ async fn hx6fix_recording_audit_covers_start_stop_revocation_and_invalid_result(
     let kinds: Vec<_> = events.iter().map(|event| (event.kind, event.call)).collect();
     for expected in [(RecordingAuditKind::Started, first), (RecordingAuditKind::StopRequested, first),
         (RecordingAuditKind::Started, second), (RecordingAuditKind::RevokedStop, second),
-        (RecordingAuditKind::Started, third), (RecordingAuditKind::StopRequested, third), (RecordingAuditKind::InvalidResult, third)] {
+        (RecordingAuditKind::Started, third), (RecordingAuditKind::StopRequested, third), (RecordingAuditKind::InvalidResult, third)]
+        .map(|(kind, call)| (kind, Some(call))) {
         assert!(kinds.contains(&expected), "{expected:?} in {kinds:?}");
     }
     for event in &events {
@@ -468,4 +469,66 @@ async fn hx6fix_root_recording_gate_refusal_is_named() {
     let result = fixture.bridge.execute(&context(CALLER, live()), START, &json!({"url":"https://example.com","headless":true})).await;
     assert_eq!((result["isError"].as_bool(), result["helper_status"].as_str()), (Some(true), Some("helper_recording_unsupported")));
     assert!(fixture.store.admin_read(HelperCallId::new([1; 16]).unwrap()).is_err(), "no job row");
+}
+
+/// HX6 round 3 (audit gap 6): terminal outcomes stored only as an
+/// `uncertain` reason (browser tree survived, exit 78, timeout, OOM) reach
+/// the recording audit sink with the reason, outcome, employee, run and call.
+#[tokio::test]
+async fn hx6r3_recording_terminal_failures_are_audited() {
+    let fixture = setup(Backend::new());
+    let sink = Arc::new(Sink(Mutex::new(Vec::new())));
+    let bridge = fixture.bridge.with_recording_audit(sink.clone());
+    let caller = context(CALLER, live());
+    let arguments = json!({"url":"https://example.com","headless":true});
+    let mut expected = Vec::new();
+    for (outcome, reason) in [(HelperOutcome::Exited(75), "browser_tree_survived"), (HelperOutcome::Exited(78), "helper_recording_unsupported"),
+        (HelperOutcome::TimedOut, "helper_timed_out"), (HelperOutcome::OomKilled, "helper_oom_killed")] {
+        let started = body(&bridge.execute(&caller, START, &arguments).await);
+        let call = crate::recording_jobs::parse_id(started["id"].as_str().unwrap()).unwrap();
+        fixture.backend.end(call, (vec![], outcome));
+        let row = terminal(&fixture.store, call).await;
+        assert_eq!(row.result.unwrap()["reason"], reason);
+        expected.push((call, outcome, reason));
+    }
+    let events = sink.0.lock().unwrap().clone();
+    for (call, outcome, reason) in expected {
+        let event = events.iter().find(|event| event.kind == RecordingAuditKind::Failed && event.call == Some(call))
+            .unwrap_or_else(|| panic!("{reason} not audited: {events:?}"));
+        assert_eq!((event.employee, event.run.0), (EMPLOYEE, CALLER));
+        assert_eq!(event.detail["reason"], reason);
+        assert_eq!(event.detail["outcome"], serde_json::to_value(outcome).unwrap());
+        let fields = event.fields();
+        assert!(fields.get("url").is_none() && fields.get("result").is_none(), "content-free: {fields}");
+    }
+    assert!(RecordingAuditKind::Failed.warning());
+}
+
+/// HX6 round 3 (audit gap 6): start refusals (spawnd's own
+/// `HelperRecordingUnsupported`, the gateway's gate, an offline parent) are
+/// audited with employee and run, the code, and which gate refused.
+#[tokio::test]
+async fn hx6r3_recording_start_refusals_are_audited() {
+    let arguments = json!({"url":"https://example.com","headless":true});
+    let cases: [(fn(&mut Backend), &str, Option<&str>); 3] = [
+        (|backend| backend.root_gate_closed = true, "helper_recording_unsupported", Some("spawnd")),
+        (|backend| backend.features = SpawndFeatures::HELPER_CALLS, "helper_recording_unsupported", Some("gateway")),
+        (|backend| backend.absent = true, "helper_parent_offline", None),
+    ];
+    for (configure, reason, gate) in cases {
+        let mut backend = Backend::new();
+        configure(&mut backend);
+        let fixture = setup(backend);
+        let sink = Arc::new(Sink(Mutex::new(Vec::new())));
+        let bridge = fixture.bridge.with_recording_audit(sink.clone());
+        let result = bridge.execute(&context(CALLER, live()), START, &arguments).await;
+        assert_eq!(result["helper_status"], reason);
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!((event.kind, event.call, event.employee, event.run.0), (RecordingAuditKind::StartRefused, None, EMPLOYEE, CALLER));
+        assert_eq!(event.detail["reason"], reason);
+        assert_eq!(event.detail.get("gate").and_then(Value::as_str), gate);
+        assert_eq!(event.fields()["call"], Value::Null);
+    }
 }

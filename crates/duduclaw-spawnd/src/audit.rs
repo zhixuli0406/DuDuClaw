@@ -29,6 +29,27 @@ pub enum Event { Refused, Reserved, Queued, Started, Ended, Revoked, Intruder, O
     HelperStopRequested,
     /// HX security fix round: an accepted `HelperCancel` (detail: `helper_call`).
     HelperCancelRequested,
+    /// HX6 round 3 (N2): spawnd started its recording probe in an employee's
+    /// run (record's `employee`/`run`; detail: `recording_probe`).
+    RecordingProbeStarted,
+    /// HX6 round 3 (N2): the probe call ended (detail: `recording_probe` with
+    /// the root outcome and the verdict).
+    RecordingProbeVerdict,
+}
+/// HX6 round 3: what one probe call decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeVerdict {
+    /// Exit 0, exact reply, empty stderr: the host may carry `helper_recording`.
+    Passed,
+    /// Exit 78/other exit, wrong output, stderr or start failure: final for this spawnd.
+    Failed,
+    /// Timeout, OOM or signal: retried later in another employee's run.
+    Inconclusive,
+    /// The last allowed inconclusive attempt: final failure for this spawnd.
+    Exhausted,
+    /// The run ended under the probe: not counted, another run may try.
+    RunEnded,
 }
 /// Why a helper call ended root-side (HX security fix round, finding 7c/d).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -110,6 +131,14 @@ pub enum Detail {
     HelperCall { call: duduclaw_isolation::ipc::HelperCallId },
     /// The launcher channel closed: the code later calls get, and why.
     HelperClosed { code: duduclaw_isolation::ipc::ErrorCode, reason: HelperCloseReason },
+    /// HX6 round 3 (N2): the recording probe's call id, its attempt number
+    /// (counted inconclusive attempts so far + 1) and the Landlock ABI; on the
+    /// verdict record also the root outcome and the verdict. No output content.
+    RecordingProbe { call: duduclaw_isolation::ipc::HelperCallId, attempt: u8, landlock_abi: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<duduclaw_isolation::ipc::HelperOutcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verdict: Option<ProbeVerdict> },
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -513,6 +542,31 @@ mod tests {
             assert_eq!(serde_json::from_slice::<Record>(&line).unwrap().detail, Some(detail));
         }
         assert_eq!(serde_json::to_value(Event::HelperStopRequested).unwrap(), "helper_stop_requested");
+    }
+    /// HX6 round 3 (N2): the probe's start and verdict are bounded,
+    /// content-free records with the employee and run whose slot it used.
+    #[test]
+    fn hx6r3_recording_probe_audit_records_are_bounded() {
+        use duduclaw_isolation::ipc::{HelperCallId, HelperOutcome};
+        let call = HelperCallId::new([7; 16]).unwrap();
+        let started = Detail::RecordingProbe { call, attempt: 1, landlock_abi: 6, outcome: None, verdict: None };
+        let keys = serde_json::to_value(&started).unwrap().as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert!(!keys.iter().any(|key| key == "outcome" || key == "verdict"), "{keys:?}");
+        for (outcome, verdict) in [(HelperOutcome::Exited(0), ProbeVerdict::Passed), (HelperOutcome::Exited(78), ProbeVerdict::Failed),
+            (HelperOutcome::TimedOut, ProbeVerdict::Inconclusive), (HelperOutcome::OomKilled, ProbeVerdict::Exhausted),
+            (HelperOutcome::RunEnded, ProbeVerdict::RunEnded)] {
+            for (event, detail) in [(Event::RecordingProbeStarted, started.clone()), (Event::RecordingProbeVerdict,
+                Detail::RecordingProbe { call, attempt: 3, landlock_abi: 6, outcome: Some(outcome), verdict: Some(verdict) })] {
+                let record = Record { at_unix_ms: 1, event, employee: Some(EmployeeId([1; 16])), run: Some(RunId([2; 16])),
+                    suppressed: 0, detail: Some(detail.clone()) };
+                let line = serde_json::to_vec(&record).unwrap();
+                assert!(line.len() < LINE_BYTES);
+                let back = serde_json::from_slice::<Record>(&line).unwrap();
+                assert_eq!((back.detail, back.employee, back.run), (Some(detail), Some(EmployeeId([1; 16])), Some(RunId([2; 16]))));
+            }
+        }
+        assert_eq!(serde_json::to_value(Event::RecordingProbeVerdict).unwrap(), "recording_probe_verdict");
+        assert_eq!(serde_json::to_value(ProbeVerdict::Exhausted).unwrap(), "exhausted");
     }
     #[test]
     fn hxfix_helper_stop_cancel_requests_share_audit_rate_limit() {

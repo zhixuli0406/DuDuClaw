@@ -121,14 +121,34 @@ pub fn artifacts_from_result(result: &Value) -> Result<Vec<ArtifactDigest>, Arti
     }).collect()
 }
 
+/// HX6 security round 3 (tripwire): the bytes of one recording artifact that
+/// matched its stored digest. [`verify_artifact`] is the only constructor
+/// (private fields; no `Clone`, `Default`, `Deserialize` or `From`), and it
+/// takes the bytes by value, so a consumer whose input is `VerifiedArtifact`
+/// (H12d's `skill_from_recording` distill step) cannot be fed bytes that
+/// skipped the check, and a failed check leaves the caller nothing to use.
+#[must_use = "the verified bytes are only reachable through this value"]
+pub struct VerifiedArtifact { name: &'static str, bytes: Vec<u8> }
+impl VerifiedArtifact {
+    pub fn name(&self) -> &'static str { self.name }
+    pub fn bytes(&self) -> &[u8] { &self.bytes }
+    pub fn into_bytes(self) -> Vec<u8> { self.bytes }
+}
+impl std::fmt::Debug for VerifiedArtifact {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("VerifiedArtifact").field("name", &self.name).field("bytes", &self.bytes.len()).finish()
+    }
+}
+
 /// [F11] Check bytes read back from `recordings/<id>/<name>` against the
 /// stored digest. Size and sha256 must both match; anything else is
 /// `artifact_modified` (the runtime can destroy, never forge, its artifacts).
-pub fn verify_artifact(digests: &[ArtifactDigest], name: &str, bytes: &[u8]) -> Result<(), ArtifactError> {
+/// The bytes come back only inside the [`VerifiedArtifact`].
+pub fn verify_artifact(digests: &[ArtifactDigest], name: &str, bytes: Vec<u8>) -> Result<VerifiedArtifact, ArtifactError> {
     let digest = digests.iter().find(|digest| digest.name == name).ok_or(ArtifactError::Unknown)?;
-    let actual: String = Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
+    let actual: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
     if bytes.len() as u64 != digest.bytes || actual != digest.sha256 { return Err(ArtifactError::Modified); }
-    Ok(())
+    Ok(VerifiedArtifact { name: digest.name, bytes })
 }
 
 /// The gateway-owned recording store. Every actor-facing method re-checks

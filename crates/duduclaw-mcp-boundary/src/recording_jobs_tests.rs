@@ -14,13 +14,15 @@ fn artifact_hash_mismatch_refused() {
     let result = recorded(&"07".repeat(16), [b"trace", b"{\"actions\":[]}", b"{\"responses\":[]}"]);
     let digests = artifacts_from_result(&result).unwrap();
     assert_eq!(digests.iter().map(|d| d.name).collect::<Vec<_>>(), ARTIFACT_NAMES);
-    assert_eq!(verify_artifact(&digests, "trace.zip", b"trace"), Ok(()));
+    let verified = verify_artifact(&digests, "trace.zip", b"trace".to_vec()).unwrap();
+    assert_eq!((verified.name(), verified.bytes()), ("trace.zip", &b"trace"[..]));
+    assert_eq!(verified.into_bytes(), b"trace");
     // Rewritten by the runtime (same size or not), truncated, or replaced.
     for forged in [&b"TRACE"[..], b"trac", b"", b"trace\n"] {
-        let error = verify_artifact(&digests, "trace.zip", forged).unwrap_err();
+        let error = verify_artifact(&digests, "trace.zip", forged.to_vec()).unwrap_err();
         assert_eq!((error, error.code()), (ArtifactError::Modified, "artifact_modified"));
     }
-    assert_eq!(verify_artifact(&digests, "../trace.zip", b"trace"), Err(ArtifactError::Unknown));
+    assert_eq!(verify_artifact(&digests, "../trace.zip", b"trace".to_vec()).err(), Some(ArtifactError::Unknown));
     // Only a strictly shaped `recorded` result has digests.
     for bad in [json!({"status":"uncertain","reason":"run_killed"}),
         json!({"status":"not_recorded","artifacts":[]}),

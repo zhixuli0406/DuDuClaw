@@ -65,8 +65,20 @@ impl ExecutionToolBridge {
         let call = match tool_policy::authorize_async(context, START, arguments, self.resolver.clone()).await {
             Ok(call) => call, Err(_) => return refused(),
         };
-        if !self.helper_calls(run) { return in_run::helper_refusal(HelperError::FeatureMissing); }
-        if !self.recording_supported(run) { return in_run::typed("helper_recording_unsupported"); }
+        let employee = context.record().employee;
+        // HX6 round 3: every helper-level start refusal is audited (no call exists yet).
+        let refuse = |reason: &'static str, gate: Option<&'static str>| {
+            let event = RecordingAuditEvent::refused(employee, run, reason);
+            self.audit(match gate { Some(gate) => event.with("gate", json!(gate)), None => event });
+        };
+        if !self.helper_calls(run) {
+            refuse(HelperError::FeatureMissing.code(), None);
+            return in_run::helper_refusal(HelperError::FeatureMissing);
+        }
+        if !self.recording_supported(run) {
+            refuse("helper_recording_unsupported", Some("gateway"));
+            return in_run::typed("helper_recording_unsupported");
+        }
         if self.factory.authorize_handler(&call).await.is_err() { return refused(); }
         let plan = match self.factory.prepare_in_run(&call).await {
             Ok(plan) if plan.run() == run && plan.employee() == context.record().employee
@@ -82,17 +94,29 @@ impl ExecutionToolBridge {
         if crate::authority::verify_blocking(move || live.verify_live(crate::authority::now_seconds()?)).await.is_err() {
             return refused();
         }
-        if !self.recording_supported(run) { return in_run::typed("helper_recording_unsupported"); }
+        if !self.recording_supported(run) {
+            refuse("helper_recording_unsupported", Some("gateway"));
+            return in_run::typed("helper_recording_unsupported");
+        }
         let limit = usize::try_from(plan.output_limit()).unwrap_or(usize::MAX).min(RESULT_LIMIT + 1);
         let HelperStart { call: id, effective_timeout_ms, stdout, stderr } =
             match self.backend.start_helper(plan.into_plan()).await {
                 Ok(started) => started,
                 // No recording binding in this run's signed table: by
                 // publication check 4 its parent is not an Egress profile.
-                Err(HelperError::Absent) => return in_run::typed("helper_parent_offline"),
+                Err(HelperError::Absent) => {
+                    refuse("helper_parent_offline", None);
+                    return in_run::typed("helper_parent_offline");
+                }
                 // spawnd's own gate (finding 4): this host's recording probe has not passed.
-                Err(HelperError::RecordingUnsupported) => return in_run::typed("helper_recording_unsupported"),
-                Err(error) => return in_run::helper_refusal(error),
+                Err(HelperError::RecordingUnsupported) => {
+                    refuse("helper_recording_unsupported", Some("spawnd"));
+                    return in_run::typed("helper_recording_unsupported");
+                }
+                Err(error) => {
+                    refuse(error.code(), None);
+                    return in_run::helper_refusal(error);
+                }
             };
         let key = RecordingKey { run, call: id };
         // Armed until the collector owns the call: a dropped request (MCP
@@ -110,7 +134,6 @@ impl ExecutionToolBridge {
             return refused();
         }
         guard.key = None;
-        let employee = context.record().employee;
         self.audit(RecordingAuditEvent::new(RecordingAuditKind::Started, employee, run, id)
             .with("effective_timeout_ms", json!(effective_timeout_ms)));
         let collector = Collector { backend: self.backend.clone(), factory: self.factory.clone(), store, key,
@@ -284,6 +307,21 @@ impl Collector {
         audit.record(extra(RecordingAuditEvent::new(kind, self.context.record().employee, self.key.run, self.key.call)));
     }
 
+    /// HX6 round 3: a terminal outcome stored only as an `uncertain` reason
+    /// is audited (`isolation_recording_failed`) with that fixed reason, the
+    /// root outcome and the exit code; `invalid_result` has its own fact.
+    fn failed(&self, stored: Value, outcome: Option<HelperOutcome>) -> Value {
+        if let Some(reason) = stored["reason"].as_str() {
+            let (reason, exit_code) = (reason.to_owned(), stored.get("exit_code").cloned());
+            self.audit(RecordingAuditKind::Failed, |event| {
+                let event = event.with("reason", json!(reason))
+                    .with("outcome", outcome.and_then(|outcome| serde_json::to_value(outcome).ok()).unwrap_or(Value::Null));
+                match exit_code { Some(code) => event.with("exit_code", code), None => event }
+            });
+        }
+        stored
+    }
+
     /// [F16] Live authority failed. A run that already ended answers
     /// `NotLive`: that is run end, not revocation (the outcome says so).
     async fn revoke(&self) {
@@ -303,13 +341,13 @@ impl Collector {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(HelperError::NotLive) => HelperOutcome::RunEnded,
-            Err(_) => return json!({"status":"uncertain", "reason":"helper_unavailable"}),
+            Err(_) => return self.failed(json!({"status":"uncertain", "reason":"helper_unavailable"}), None),
         };
         let decoded = output.as_ref().and_then(|(stdout, stderr)|
             self.factory.decode_helper_result(START, stdout, stderr, &outcome).ok())
             .filter(|value| value["id"] == self.key.id());
         let Some(mut value) = decoded else {
-            return match outcome {
+            let stored = match outcome {
                 // Exited cleanly but the bytes do not decode: never stored as a recording.
                 HelperOutcome::Exited(0) => json!({"status":"invalid_result"}),
                 // EX_CONFIG: the helper could not install the browser's nested
@@ -325,6 +363,7 @@ impl Collector {
                 // Killed before the flush: artifacts are never fabricated.
                 _ => json!({"status":"uncertain", "reason":"run_killed"}),
             };
+            return self.failed(stored, Some(outcome));
         };
         let (store, key) = (self.store.clone(), self.key);
         let requested = crate::authority::verify_blocking(move || store.stop_by(key)).await.ok().flatten();

@@ -62,3 +62,32 @@ fn hx6fix_launcher_plan_carries_recording_browser_files_only() {
     let mut old = value; old.as_object_mut().unwrap().remove("files");
     assert!(serde_json::from_value::<HelperProgram>(old).unwrap().files.is_empty());
 }
+
+/// HX6 security round 3 (N3): PR_SET/GET_CHILD_SUBREAPER are in the global
+/// `PRCTL_SELF_ONLY`, but the launcher plan grants them to the recording slot
+/// only (like NestedSandbox); the same F_H passes in the recording slot.
+#[test]
+fn hx6r3_launcher_plan_refuses_subreaper_outside_the_recording_slot() {
+    use crate::helper_policy::{PR_GET_CHILD_SUBREAPER, PR_SET_CHILD_SUBREAPER, PR_SET_NO_NEW_PRIVS};
+    let arch = Architecture::native().unwrap();
+    let socket = match arch { Architecture::X86_64 => 41, Architecture::Aarch64 => 198 };
+    let mut parent_calls = arch.launcher_parent_calls().to_vec();
+    parent_calls.push(socket);
+    let parent = program(&["/runtime/claude"], &parent_calls);
+    let plan = |slot: HelperSlot, options: Vec<u32>| {
+        let recording = slot == HelperSlot::Recording;
+        let helper = HelperProgram {
+            program: if recording { program(&["/helpers/record", "--browser-record-fd-v1"], &[arch.execveat(), arch.exit_group(), socket]) }
+                else { program(&["/helpers/program"], &[arch.execveat(), arch.exit_group()]) },
+            self_only: vec![SelfOnlyCall::Prctl { options }], mount: 0, slot,
+            filesystem: if recording { vec![HelperFs::SystemRo, HelperFs::WorkRecordings] } else { vec![HelperFs::SystemRo, HelperFs::Work] },
+            open_files: 64, file_size_bytes: 1 << 20, timeout_ms: 30_000, egress: recording, files: vec![] };
+        LauncherPlan { helpers: vec![helper], mounts: vec![MountIdentity { mount: 9, fs_type: 1 }], tmpfs_bytes: 1 << 20, drain_ms: 10_000 }
+    };
+    // A slot-neutral prctl exception is fine in both slots.
+    assert!(plan(HelperSlot::Foreground, vec![PR_SET_NO_NEW_PRIVS]).validate(&parent).is_ok());
+    for options in [vec![PR_SET_CHILD_SUBREAPER], vec![PR_GET_CHILD_SUBREAPER], vec![PR_SET_NO_NEW_PRIVS, PR_SET_CHILD_SUBREAPER]] {
+        assert!(plan(HelperSlot::Recording, options.clone()).validate(&parent).is_ok(), "{options:?}");
+        assert_eq!(plan(HelperSlot::Foreground, options.clone()).validate(&parent), Err(Error::Seccomp), "{options:?}");
+    }
+}
