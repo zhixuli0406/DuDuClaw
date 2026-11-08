@@ -71,7 +71,12 @@ impl UnitPolicy {
             "CPUAccounting", "TasksAccounting", "IOAccounting"] {
             properties.insert(key, Property::Bool(true));
         }
-        for (key, value) in [("Type", "exec"), ("ProtectSystem", "strict"),
+        // HX (D8 revision §2.4 F6, §2.5): spawnd creates rt-init/rt-runtime/hx
+        // leaves from outside the unit; ProtectControlGroups stays set above, so
+        // nothing inside the run reaches cgroupfs by path. A helper OOM kill must
+        // not stop the run (OOMPolicy=continue). All three are read back at start.
+        properties.insert("Delegate", Property::Bool(true));
+        for (key, value) in [("Type", "exec"), ("ProtectSystem", "strict"), ("OOMPolicy", "continue"),
             ("ProtectHome", "tmpfs"), ("KillMode", "control-group"),
             ("DevicePolicy", "closed"), ("User", "root"), ("Group", "root"),
             ("StandardInput", "null"), ("StandardOutput", "null"), ("StandardError", "null")] {
@@ -110,6 +115,11 @@ impl UnitPolicy {
             properties.insert(key, Property::DeviceLimits(vec![(device.clone(), ceiling)]));
         }
         Ok(Self { name: run_unit(run), properties })
+    }
+    /// Every property `Systemd::start` reads back after StartTransientUnit. No
+    /// property is set without being compared against PID 1's actual value.
+    pub fn readback(&self) -> impl Iterator<Item = (&'static str, &Property)> {
+        self.properties.iter().map(|(key, value)| (*key, value))
     }
 }
 
@@ -280,6 +290,76 @@ pub mod linux {
         }
         /// Cancellation remains available even when no launch receipt was returned.
         pub fn kill_run(&self, run: RunId) -> io::Result<()> { self.kill_name(&run_unit(run)) }
+        /// Root tests only: a run-named, delegated unit whose single process
+        /// (`/usr/bin/cat` on `input`) waits like a trampoline before bootstrap.
+        #[cfg(test)]
+        pub(crate) fn start_test_delegated(&self, run: RunId, input: BorrowedFd<'_>, output: BorrowedFd<'_>) -> io::Result<PathBuf> {
+            let name = run_unit(run);
+            let properties: Vec<(&str, Value<'_>)> = vec![
+                ("Type", Value::from("exec")), ("Delegate", Value::from(true)), ("ProtectControlGroups", Value::from(true)),
+                ("KillMode", Value::from("control-group")), ("RuntimeMaxUSec", Value::from(30_000_000u64)),
+                ("StandardInput", Value::from("null")), ("StandardOutput", Value::from("null")), ("StandardError", Value::from("null")),
+                ("ExecStart", Value::from(vec![("/usr/bin/cat", vec!["/usr/bin/cat"], false)])),
+                ("StandardInputFileDescriptor", Value::from(Fd::from(input))),
+                ("StandardOutputFileDescriptor", Value::from(Fd::from(output))),
+            ];
+            self.start_referenced(&name, properties)?;
+            let path: OwnedObjectPath = self.manager()?.call("GetUnit", &(name.as_str(),)).map_err(bus_error)?;
+            let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let text: String = service.get_property("ControlGroup").map_err(bus_error)?;
+                if let Ok(path) = checked_cgroup(&text) { return Ok(path); }
+                if Instant::now() >= until { return Err(bus_error("cgroup timeout")); }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        /// HX open-time-credentials probe (CVE-2021-4197 fix, see helper_cgroup).
+        /// PID 1 runs `/usr/bin/printf 0` as an unprivileged dynamic user with
+        /// no capabilities and `stdout` = a root-opened `cgroup.procs` fd. The write
+        /// moves the probe itself; printf exits 1 when the kernel refuses it.
+        /// Returns the probe's exit status; any other outcome is an error.
+        pub fn run_cgroup_probe(&self, nonce: [u8; 16], stdout: BorrowedFd<'_>) -> io::Result<i32> {
+            let hex: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+            let name = format!("duduclaw-cgprobe-{hex}.service");
+            let properties: Vec<(&str, Value<'_>)> = vec![
+                ("Type", Value::from("exec")), ("DynamicUser", Value::from(true)),
+                ("NoNewPrivileges", Value::from(true)), ("CapabilityBoundingSet", Value::from(0u64)),
+                ("AmbientCapabilities", Value::from(0u64)), ("PrivateNetwork", Value::from(true)),
+                ("KillMode", Value::from("control-group")), ("RuntimeMaxUSec", Value::from(2_000_000u64)),
+                ("StandardInput", Value::from("null")), ("StandardError", Value::from("null")),
+                ("Environment", Value::from(Vec::<&str>::new())),
+                ("ExecStart", Value::from(vec![("/usr/bin/printf", vec!["/usr/bin/printf", "0"], false)])),
+                ("StandardOutputFileDescriptor", Value::from(Fd::from(stdout))),
+            ];
+            self.start_referenced(&name, properties)?;
+            let manager = self.manager()?;
+            let result = (|| {
+                let path: OwnedObjectPath = manager.call("GetUnit", &(name.as_str(),)).map_err(bus_error)?;
+                let unit = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").map_err(bus_error)?;
+                let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
+                let until = Instant::now() + Duration::from_secs(3);
+                loop {
+                    let state: String = unit.get_property("ActiveState").map_err(bus_error)?;
+                    if state == "inactive" || state == "failed" { break; }
+                    if Instant::now() >= until { return Err(bus_error("probe timeout")); }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let code: i32 = service.get_property("ExecMainCode").map_err(bus_error)?;
+                let status: i32 = service.get_property("ExecMainStatus").map_err(bus_error)?;
+                // CLD_EXITED; a signal or a missing exec is never a probe answer.
+                if code != 1 { return Err(invalid()); }
+                Ok(status)
+            })();
+            let _ = self.kill_name(&name);
+            let _: zbus::Result<()> = manager.call("ResetFailedUnit", &(name.as_str(),));
+            let released = self.references.lock().map_err(|_| invalid())?.release(&name, || {
+                manager.call::<_, _, ()>("UnrefUnit", &(name.as_str(),)).map_err(bus_error)
+            });
+            let status = result?;
+            released?;
+            Ok(status)
+        }
         /// Descriptors must be validated by B1 before this call. Runtime release
         /// remains blocked on the bootstrap handshake and B2 status readback.
         pub fn start(&self, policy: &UnitPolicy, bootstrap: BorrowedFd<'_>,
@@ -298,8 +378,8 @@ pub mod linux {
                 let path: OwnedObjectPath = manager.call("GetUnit", &(policy.name.as_str(),)).map_err(bus_error)?;
                 let service = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Service").map_err(bus_error)?;
                 let unit_proxy = Proxy::new(&self.connection, BUS, path.as_str(), "org.freedesktop.systemd1.Unit").map_err(bus_error)?;
-                for (key, expected) in &policy.properties {
-                    let actual: OwnedValue = if matches!(*key, "BindsTo" | "After") {
+                for (key, expected) in policy.readback() {
+                    let actual: OwnedValue = if matches!(key, "BindsTo" | "After") {
                         let actual: Vec<String> = unit_proxy.get_property(key).map_err(bus_error)?;
                         // systemd adds implicit ordering dependencies as well.
                         if !actual.iter().any(|name| name == "duduclaw-spawnd.service") { return Err(invalid()); }
@@ -738,6 +818,19 @@ mod tests {
         assert_eq!(policy.properties["KillMode"], Property::Text("control-group".into()));
         assert_eq!(policy.properties["Environment"], Property::Strings(vec![]));
         assert_eq!(policy.properties["StandardOutput"], Property::Text("null".into()));
+    }
+    #[test]
+    fn unit_policy_sets_oom_continue_delegate_protect_cgroups_and_reads_back() {
+        let policy = UnitPolicy::new(RunId([1; 16]), EmployeeId([2; 16]), &limits(), &timeouts(), 8, 1).unwrap();
+        assert_eq!(policy.properties["OOMPolicy"], Property::Text("continue".into()));
+        assert_eq!(policy.properties["Delegate"], Property::Bool(true));
+        // Delegation never opens cgroupfs to the run: spawnd writes leaves from outside.
+        assert_eq!(policy.properties["ProtectControlGroups"], Property::Bool(true));
+        let readback: Vec<_> = policy.readback().collect();
+        for key in ["OOMPolicy", "Delegate", "ProtectControlGroups"] {
+            assert_eq!(readback.iter().filter(|(name, _)| *name == key).count(), 1, "{key}");
+        }
+        assert_eq!(readback.len(), policy.properties.len());
     }
     #[test]
     fn invalid_resources_never_become_unlimited() {

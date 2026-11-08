@@ -6,6 +6,8 @@ pub mod registry;
 pub mod accounts;
 pub mod systemd;
 pub mod policy;
+pub mod helper_policy;
+pub mod helper_cgroup;
 pub mod storage;
 pub mod bootstrap;
 #[cfg(target_os = "linux")]

@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use duduclaw_isolation::{ids::Sha256Digest, ipc::InputFd};
-use crate::{Error, Result, fd_plan::{Destination, FdPlan, Source}, landlock::{PathClass, Policy},
+use crate::{Error, Result, fd_plan::{Destination, FdPlan, Source}, landlock::Policy,
     seccomp::{self, Architecture, Filter, RuntimeProfile}, state::{Machine, Stage}, validation::{self, Expected, Identity}};
 use super::{bootstrap, fd, mounts, privileges, probe};
 
@@ -44,11 +44,84 @@ pub struct TrustedRun {
     pub stdin: bool,
     #[serde(default)]
     pub pty_size: Option<duduclaw_isolation::execution::PtySize>,
+    /// HX in-run helper launcher (D8 revision §2.1, §5). Its descriptors follow
+    /// the forwarder: control socket, helper mounts, per helper executable and
+    /// optional script, then the `HELPER_CGROUP_FDS` root-opened cgroup files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher: Option<LauncherPlan>,
+}
+
+/// Flip only together with HX3b's launcher fork in `child_init`. Until then
+/// spawnd never plans a launcher and `launch` refuses one that arrives anyway.
+pub const LAUNCHER_SUPPORTED: bool = false;
+pub const MAX_HELPER_MOUNTS: usize = 4;
+
+/// Root-signed helper table for one run. The index of a `HelperProgram` is the
+/// `helper` byte of a launcher `Start` frame; nothing here comes from IPC.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LauncherPlan {
+    pub helpers: Vec<HelperProgram>,
+    pub mounts: Vec<MountIdentity>,
+    pub tmpfs_bytes: u64,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperProgram {
+    /// `seccomp` is the signed flat F_H allowlist; `self_only` its argument-constrained exceptions.
+    pub program: Program,
+    pub self_only: Vec<crate::helper_policy::SelfOnlyCall>,
+    /// Index into `LauncherPlan::mounts`.
+    pub mount: u8,
+    pub slot: crate::helper_policy::HelperSlot,
+    pub filesystem: Vec<crate::helper_policy::HelperFs>,
+    pub open_files: u32,
+    pub file_size_bytes: u64,
+    pub timeout_ms: u64,
+    pub egress: bool,
+}
+impl LauncherPlan {
+    pub fn fd_count(&self) -> usize {
+        1 + self.mounts.len() + self.helpers.iter().map(|h| 1 + usize::from(h.program.script.is_some())).sum::<usize>()
+            + crate::helper_policy::HELPER_CGROUP_FDS
+    }
+    fn validate(&self) -> Result<()> {
+        use crate::helper_policy::*;
+        if self.helpers.is_empty() || self.helpers.len() > MAX_HELPER_BINDINGS || self.mounts.is_empty()
+            || self.mounts.len() > MAX_HELPER_MOUNTS || self.tmpfs_bytes == 0 { return Err(Error::Executable); }
+        for helper in &self.helpers {
+            let mut grants = helper.filesystem.clone();
+            grants.sort_unstable(); grants.dedup();
+            if usize::from(helper.mount) >= self.mounts.len() || grants.len() != helper.filesystem.len()
+                || grants.is_empty() || !grants.iter().all(|grant| helper_fs_within_runtime(*grant))
+                || helper.timeout_ms == 0 || helper.timeout_ms > HELPER_TIMEOUT_MAX_MS || helper.open_files == 0
+                || helper.file_size_bytes == 0 || (helper.slot == HelperSlot::Recording) != helper.egress {
+                return Err(Error::Executable);
+            }
+            // Helper paths live under /helpers (HX3b), never the runtime's /runtime.
+            let program = &helper.program;
+            if program.argv.is_empty() || program.argv.len() > 128 || !program.environment.is_empty()
+                || !program.argv[0].as_bytes().starts_with(b"/helpers/")
+                || program.argv.iter().any(|s| s.as_bytes().len() > 4096) { return Err(Error::Executable); }
+            if let Some((_, path)) = &program.script {
+                let relative = path.to_str().map_err(|_| Error::Executable)?;
+                if relative.is_empty() || relative.split('/').any(|p| p.is_empty() || p == "." || p == "..")
+                    || program.argv.get(1).map(|v| v.as_bytes()) != Some(format!("/helpers/{relative}").as_bytes()) {
+                    return Err(Error::Executable);
+                }
+            }
+            let arch = Architecture::native().map_err(|_| Error::Seccomp)?;
+            seccomp::runtime(arch, &program.seccomp, program.seccomp_digest).map_err(|_| Error::Seccomp)?;
+            if helper.self_only.len() > 2 { return Err(Error::Seccomp); }
+        }
+        Ok(())
+    }
 }
 impl TrustedRun {
     pub fn expected_fd_count(&self) -> usize {
         5 + 1 + usize::from(self.program.script.is_some()) + 1 + self.attachments.len()
             + usize::from(self.stdin) + usize::from(self.mcp) + if self.forwarder.is_some() { 2 } else { 0 }
+            + self.launcher.as_ref().map_or(0, LauncherPlan::fd_count)
     }
     pub fn validate(&self) -> Result<()> {
         self.root.validate().map_err(|_| Error::Mount)?;
@@ -75,6 +148,7 @@ impl TrustedRun {
             if program.script.is_some() { return Err(Error::Executable); }
             validate_program(program)?;
         }
+        if let Some(launcher) = &self.launcher { launcher.validate()?; }
         Ok(())
     }
 }
@@ -102,6 +176,56 @@ struct Inputs {
     mounts: mounts::MountInputs,
     exec: OwnedFd, script: Option<OwnedFd>, prompt: OwnedFd,
     attachments: Vec<OwnedFd>, stdin: Option<OwnedFd>, mcp: Option<OwnedFd>, forwarder: Option<(OwnedFd, OwnedFd)>,
+    launcher: Option<LauncherInputs>,
+}
+/// Consumed by HX3b's launcher. `cgroups` order is `helper_policy::HELPER_CGROUP_FDS`.
+#[allow(dead_code)]
+struct LauncherInputs {
+    control: OwnedFd, mounts: Vec<OwnedFd>, helpers: Vec<(OwnedFd, Option<OwnedFd>)>,
+    cgroups: [OwnedFd; crate::helper_policy::HELPER_CGROUP_FDS],
+}
+const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+/// A root-opened, write-only cgroup v2 interface file. Moves through it rely on
+/// open-time credentials (CVE-2021-4197 fix); spawnd probes that before planning.
+fn verify_cgroup_file(fd: RawFd) -> Result<()> {
+    let o = fd::observe(fd)?;
+    if o.kind != validation::FileKind::Regular || o.access != validation::Access::Write || !o.cloexec
+        || o.fs_type != CGROUP2_SUPER_MAGIC || o.uid != 0 { return Err(Error::Descriptors); }
+    Ok(())
+}
+fn take_launcher(plan: &LauncherPlan, fds: &mut impl Iterator<Item = OwnedFd>, mcp: Option<&OwnedFd>) -> Result<LauncherInputs> {
+    let control = fds.next().ok_or(Error::Descriptors)?;
+    if fd::socket_option(control.as_raw_fd(), libc::SO_DOMAIN)? != libc::AF_UNIX
+        || fd::socket_option(control.as_raw_fd(), libc::SO_TYPE)? != libc::SOCK_SEQPACKET { return Err(Error::Descriptors); }
+    if let Some(mcp) = mcp {
+        if fd::observe(control.as_raw_fd())?.identity == fd::observe(mcp.as_raw_fd())?.identity { return Err(Error::Descriptors); }
+    }
+    let mut mounts = Vec::new();
+    for expected in &plan.mounts {
+        let fd = fds.next().ok_or(Error::Descriptors)?;
+        validation::validate(fd::observe(fd.as_raw_fd())?, Expected::Mount {
+            mount: expected.mount, fs_type: expected.fs_type, required_flags: 1 | 2 | 4 })?;
+        mounts.push(fd);
+    }
+    let mut helpers = Vec::new();
+    for helper in &plan.helpers {
+        let registry = plan.mounts.get(usize::from(helper.mount)).ok_or(Error::Descriptors)?.mount;
+        let exec = fds.next().ok_or(Error::Descriptors)?;
+        verify_executable(exec.as_raw_fd(), helper.program.identity, registry)?;
+        let script = if let Some((identity, _)) = &helper.program.script {
+            let script = fds.next().ok_or(Error::Descriptors)?;
+            validation::validate(fd::observe(script.as_raw_fd())?, Expected::Script { identity: *identity, registry_mount: registry })?;
+            Some(script)
+        } else { None };
+        helpers.push((exec, script));
+    }
+    let mut cgroup = || -> Result<OwnedFd> {
+        let fd = fds.next().ok_or(Error::Descriptors)?; verify_cgroup_file(fd.as_raw_fd())?; Ok(fd)
+    };
+    let cgroups = [cgroup()?, cgroup()?, cgroup()?, cgroup()?];
+    let identities: Vec<_> = cgroups.iter().map(|fd| fd::observe(fd.as_raw_fd()).map(|o| o.identity)).collect::<Result<_>>()?;
+    if identities.iter().enumerate().any(|(i, a)| identities[..i].contains(a)) { return Err(Error::Descriptors); }
+    Ok(LauncherInputs { control, mounts, helpers, cgroups })
 }
 
 fn take_inputs(plan: &TrustedRun, descriptors: Vec<OwnedFd>) -> Result<Inputs> {
@@ -161,7 +285,12 @@ fn take_inputs(plan: &TrustedRun, descriptors: Vec<OwnedFd>) -> Result<Inputs> {
         verify_executable(exec.as_raw_fd(), program.identity, plan.mounts[3].mount)?;
         Some((socket, exec))
     } else { None };
-    Ok(Inputs { mounts, exec, script, prompt, attachments, stdin, mcp, forwarder })
+    let launcher = match &plan.launcher {
+        Some(launcher) => Some(take_launcher(launcher, &mut fds, mcp.as_ref())?),
+        None => None,
+    };
+    if fds.next().is_some() { return Err(Error::Descriptors); }
+    Ok(Inputs { mounts, exec, script, prompt, attachments, stdin, mcp, forwarder, launcher })
 }
 
 fn verify_executable(fd: RawFd, identity: Identity, registry_mount: u64) -> Result<()> {
@@ -205,10 +334,14 @@ fn launch(plan: TrustedRun, fds: Vec<OwnedFd>, ready: probe::Readiness, mut mach
     let n = 3 + 1 + 1 + 1 + plan.attachments.len() + 1 + usize::from(plan.program.script.is_some());
     if fd::soft_limit()? < FdPlan::required_limit(n)? { return Err(Error::DescriptorLimit); }
     let input = take_inputs(&plan, fds)?;
+    // HX3b forks the launcher (D8 revision §2.1). Until it lands, a planned
+    // launcher fails closed instead of leaving root-opened cgroup fds unused.
+    // HX3b replaces this refusal and sets LAUNCHER_SUPPORTED in the same change.
+    if input.launcher.is_some() { return Err(Error::Bootstrap); }
     machine.advance(Stage::DescriptorsVerified)?;
     mounts::enter_namespaces().map_err(|_| Error::Namespace)?;
     machine.advance(Stage::Namespaces)?; machine.advance(Stage::PrivatePropagation)?;
-    let Inputs { mounts: mount_inputs, exec, script, prompt, attachments, stdin, mcp, forwarder } = input;
+    let Inputs { mounts: mount_inputs, exec, script, prompt, attachments, stdin, mcp, forwarder, launcher: _ } = input;
     let mut root = mounts::build_root(mount_inputs, &plan.root).map_err(|_| Error::Mount)?;
     let pty = root.take_pty();
     let slave = if let Some(pty) = pty {
@@ -462,12 +595,8 @@ fn child_init(plan: TrustedRun, exec: OwnedFd, script: Option<OwnedFd>, prompt: 
 fn restrict_filesystem(abi: u32) -> Result<()> {
     let policy = Policy::for_abi(abi).map_err(|_| Error::Landlock)?;
     let mut roots = Vec::new();
-    for (path, class) in [(c"/usr",PathClass::ReadExecute),(c"/bin",PathClass::ReadExecute),
-        (c"/sbin",PathClass::ReadExecute),(c"/lib",PathClass::ReadExecute),(c"/lib64",PathClass::ReadExecute),
-        (c"/runtime",PathClass::ReadExecute),(c"/etc",PathClass::ReadOnly),(c"/config",PathClass::ReadOnly),
-        (c"/proc",PathClass::ReadOnly),(c"/home/employee",PathClass::Persistent),(c"/work",PathClass::Persistent),
-        (c"/tmp",PathClass::Ephemeral),(c"/run",PathClass::Ephemeral),(c"/dev/shm",PathClass::Ephemeral),
-        (c"/dev",PathClass::Devices)] {
+    // One table: HX publication check 6 is computed against exactly this list.
+    for (path, class) in crate::helper_policy::RUNTIME_LANDLOCK {
         let raw = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
         if raw < 0 {
             if path == c"/lib64" && super::errno() == libc::ENOENT { continue; }

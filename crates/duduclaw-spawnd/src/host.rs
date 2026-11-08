@@ -545,7 +545,23 @@ impl Host for Core {
         self.components.publication.record_mcp_projection(&plan, &runtime, &mounts)?;
         self.monitor.check_run(run)?;
         self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?.bootstrap_attempted = true;
-        let native_profile = self.components.publication.native_profile(&runtime)?;
+        let mut native_profile = self.components.publication.native_profile(&runtime)?;
+        // HX: the helper table is derived from this run's employee, never from
+        // the request (D8 revision §2.3). Planned only once the trampoline has a launcher.
+        if duduclaw_run::linux::runner::LAUNCHER_SUPPORTED {
+            let policy = self.policy.as_ref().ok_or_else(unavailable)?;
+            let table = policy.helper_table(employee, &runtime);
+            if !table.is_empty() {
+                let anchors = self.runs.get(&run.0).and_then(|entry| entry.projection.as_ref()).ok_or_else(unavailable)?;
+                let executables: Vec<_> = table.iter().map(|entry| &entry.runtime.executable).collect();
+                let prepared = os(crate::bootstrap_mounts::prepare_helpers(anchors, &executables))?;
+                let helpers = table.iter().zip(prepared.executables).map(|(entry, (executable, script))|
+                    crate::native_trampoline::HelperRun { index: entry.index, binding: entry.binding.clone(),
+                        runtime: entry.runtime.clone(), executable, script }).collect();
+                native_profile.launcher = Some(crate::native_trampoline::LauncherProfile { helpers, mount: prepared.mount,
+                    tmpfs_bytes: policy.helper_tmpfs_bytes(&runtime).ok_or_else(unavailable)? });
+            }
+        }
         let sealed_plan = plan.seal()?;
         let prepared = self.components.trampoline.prepare(plan, sealed_plan, mounts, inputs, stdin, mcp, egress, native_profile)?;
         os(crate::fds::validate_bootstrap(prepared.bootstrap_for_unit.as_fd()))?;

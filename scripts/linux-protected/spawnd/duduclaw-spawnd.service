@@ -25,6 +25,9 @@ ProtectSystem=strict
 ReadWritePaths=/var/lib/duduclaw-spawnd /var/log/duduclaw-spawnd /run/duduclaw-spawnd /etc -/var/lib/systemd/linger
 # /etc is writable only for root account/ACL quarantine after interrupted provisioning.
 # Normal provisioning still requires G's approved installation operation.
+# HX helper slots: spawnd creates rt-init/rt-runtime/hx leaves inside delegated run
+# units only. The rest of /sys/fs/cgroup stays read-only (ProtectControlGroups=yes).
+ReadWritePaths=-/sys/fs/cgroup/duduclaw.slice/duduclaw-employees.slice
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes

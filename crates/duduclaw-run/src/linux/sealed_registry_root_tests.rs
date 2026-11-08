@@ -26,6 +26,7 @@ fn plan() -> TrustedRun {
         program: Program { identity: Identity { dev_major: 0, dev_minor: 1, inode: 2, mount: 17 }, script: None,
             argv: vec![CString::new("fixture").unwrap()], environment: vec![], seccomp, seccomp_digest },
         forwarder: None, prompt_bytes: 0, attachments: vec![], mcp: false, proc_subset_pid: true, stdin: false,
+        launcher: None,
     }
 }
 #[test]

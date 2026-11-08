@@ -189,14 +189,65 @@ struct NativeRecord {
     vendor_digest: Option<Sha256Digest>,
     profile: ProfileId, runtime: duduclaw_run::seccomp::RuntimeProfile, runtime_digest: Sha256Digest,
     forwarder: Option<ForwarderRecord>, tmpfs_bytes: u64, tmpfs_inodes: u64, proc_subset_pid: bool,
+    /// HX helper allowlist of this parent profile (policy v2 only). Omitted when
+    /// absent, so v1-shaped records keep their MCP launch-policy digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launcher: Option<crate::helper_policy::LauncherRecord>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ForwarderRecord { entry: String, executable_digest: Sha256Digest, argv: Vec<String>,
     seccomp: duduclaw_run::seccomp::RuntimeProfile, seccomp_digest: Sha256Digest }
+/// Verified in-memory policy; `version` records which signed schema produced it.
+struct SignedPolicy { version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord> }
+/// Exact v1 document. A v2 document always carries `domain`, so this strict
+/// reader (and every deployed v1 reader) refuses it instead of reinterpreting it.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SignedPolicy { version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord> }
+struct SignedPolicyV1 { version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord> }
+/// v2: `domain` and `version` are inside the artifact bytes that the signed
+/// release manifest binds by sha256 [F17].
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedPolicyV2 { domain: String, version: u16, runtimes: Vec<RuntimeRecord>, native: Vec<NativeRecord> }
+const POLICY_DOMAIN_V2: &str = "duduclaw-isolation-policy-v2";
+#[derive(Deserialize)]
+struct PolicyVersion { version: u16 }
+/// v2 reader. A v1 document is accepted as "no launcher" (helper tools then
+/// report `helper_launcher_unavailable`); a v1 document naming a launcher, a v2
+/// document without its domain, or any other version is refused.
+fn parse_policy(bytes: &[u8]) -> io::Result<SignedPolicy> {
+    let probe: PolicyVersion = serde_json::from_slice(bytes).map_err(|_| denied())?;
+    match probe.version {
+        1 => {
+            let v1: SignedPolicyV1 = serde_json::from_slice(bytes).map_err(|_| denied())?;
+            if v1.version != 1 || v1.native.iter().any(|n| n.launcher.is_some()) { return Err(denied()); }
+            Ok(SignedPolicy { version: 1, runtimes: v1.runtimes, native: v1.native })
+        }
+        2 => {
+            let v2: SignedPolicyV2 = serde_json::from_slice(bytes).map_err(|_| denied())?;
+            if v2.version != 2 || v2.domain != POLICY_DOMAIN_V2 { return Err(denied()); }
+            Ok(SignedPolicy { version: 2, runtimes: v2.runtimes, native: v2.native })
+        }
+        _ => Err(denied()),
+    }
+}
+/// HX publication checks 1–7 against the verified runtime set (§2.3), plus the
+/// `/helper-tmp` budget, which must fit inside the parent's tmpfs budget.
+fn validate_launchers(policy: &SignedPolicy) -> io::Result<()> {
+    let arch = io(duduclaw_run::seccomp::Architecture::native())?;
+    let runtimes: Vec<_> = policy.runtimes.iter().map(RuntimeRecord::to_runtime).collect();
+    for native in &policy.native {
+        let Some(launcher) = &native.launcher else { continue };
+        if policy.version < 2 || launcher.helper_tmpfs_bytes == 0 || launcher.helper_tmpfs_bytes > native.tmpfs_bytes { return Err(denied()); }
+        let parent = runtimes.iter().find(|r| r.profile == native.profile).ok_or_else(denied)?;
+        io(crate::helper_policy::validate_launcher(arch, parent, &native.runtime, launcher, &runtimes))?;
+    }
+    Ok(())
+}
+fn launchers(policy: &SignedPolicy) -> Vec<(ProfileId, duduclaw_run::seccomp::RuntimeProfile, crate::helper_policy::LauncherRecord)> {
+    policy.native.iter().filter_map(|n| n.launcher.as_ref().map(|l| (n.profile, n.runtime.clone(), l.clone()))).collect()
+}
 
 /// Root publishes this only after F verification. The consumer also requires the
 /// same boot and a fresh monotonic timestamp; a stale report cannot authorize.
@@ -239,8 +290,8 @@ fn bundle() -> io::Result<Bundle> {
     let directory = Path::new(INSTALL_ROOT).join("generations").join(hex);
     let bytes = io(io(Directory::open(&directory))?.bytes(&io(artifact_name(&target))?, 1024 * 1024))?;
     if bytes.len() as u64 != artifact.size_bytes || Sha256Digest(Sha256::digest(&bytes).into()) != artifact.sha256 { return Err(denied()); }
-    let policy: SignedPolicy = serde_json::from_slice(&bytes).map_err(|_| denied())?;
-    if policy.version != 1 || policy.native.len() != policy.runtimes.len() { return Err(denied()); }
+    let policy = parse_policy(&bytes)?;
+    if policy.native.len() != policy.runtimes.len() { return Err(denied()); }
     validate_runtime_artifacts(&policy, &manifest)?;
     let mut ids = std::collections::BTreeSet::new();
     for profile in &policy.native {
@@ -248,6 +299,7 @@ fn bundle() -> io::Result<Bundle> {
         let arch = io(duduclaw_run::seccomp::Architecture::native())?;
         io(duduclaw_run::seccomp::runtime(arch, &profile.runtime, profile.runtime_digest))?;
     }
+    validate_launchers(&policy)?;
     Ok(Bundle { generation, manifest, directory, host, policy })
 }
 /// A native acceptance binds the exact vendor ELF as part of its launch-policy
@@ -310,10 +362,11 @@ impl crate::host::Publication for InstalledPublication {
     fn load(&mut self) -> Result<RootPolicy> {
         let started = os(crate::host_state::boottime_ms())?;
         let b = self.checked_bundle()?;
+        let launchers = launchers(&b.policy);
         let report = GatewayPublication { version: 1, generation: b.generation,
             boot_id: os(fs::read_to_string("/proc/sys/kernel/random/boot_id"))?.trim().into(), checked_boottime_ms: started, valid_for_ms: 1000,
             runtimes: b.policy.runtimes, entitlements: b.host.entitlements };
-        let policy = report.policy()?;
+        let policy = report.policy()?.with_launchers(os(duduclaw_run::seccomp::Architecture::native())?, launchers)?;
         let (_, gid) = os(crate::server::gateway_identity())?;
         os(crate::host_state::atomic_json(Path::new(GATEWAY_PUBLICATION), &report, gid, 0o640))?;
         Ok(policy)
@@ -452,7 +505,9 @@ impl crate::host::Publication for InstalledPublication {
                 argv, seccomp: f.seccomp, seccomp_digest: f.seccomp_digest })
         }).transpose()?;
         Ok(crate::native_trampoline::NativeProfile { runtime: native.runtime, runtime_digest: native.runtime_digest,
-            forwarder, snapshot, tmpfs_bytes: native.tmpfs_bytes, tmpfs_inodes: native.tmpfs_inodes, proc_subset_pid: native.proc_subset_pid })
+            forwarder, snapshot, tmpfs_bytes: native.tmpfs_bytes, tmpfs_inodes: native.tmpfs_inodes, proc_subset_pid: native.proc_subset_pid,
+            // The host attaches the per-employee helper table (RootPolicy::helper_table).
+            launcher: None })
     }
 }
 
@@ -582,7 +637,7 @@ mod tests {
                 vendor_digest: Some(Sha256Digest([3;32])), profile: record.profile,
                 runtime: duduclaw_run::seccomp::RuntimeProfile { allowed_syscalls: vec![0] },
                 runtime_digest: Sha256Digest([4;32]), forwarder: None, tmpfs_bytes: 4096,
-                tmpfs_inodes: 32, proc_subset_pid: true }] };
+                tmpfs_inodes: 32, proc_subset_pid: true, launcher: None }] };
             let mut manifest = ReleaseManifest { schema_version: 1, product: Product::Duduclaw, version,
                 channel: ReleaseChannel::Stable, os: OperatingSystem::Linux, arch: Architecture::X86_64,
                 minimum_version: version, serial: 1, created_at_unix: 1, expires_at_unix: 2,
@@ -718,6 +773,79 @@ mod tests {
         symlink("/etc/passwd", &path).unwrap();
         assert!(crate::host_state::read_json::<GatewayPublication>(&path, 0, 0o640).is_err());
         fs::remove_file(path).unwrap(); fs::remove_dir(directory).unwrap();
+    }
+
+    fn native_record(record: &RuntimeRecord) -> NativeRecord {
+        NativeRecord { vendor_digest: None, profile: record.profile,
+            runtime: duduclaw_run::seccomp::RuntimeProfile { allowed_syscalls: vec![0] }, runtime_digest: Sha256Digest([4; 32]),
+            forwarder: None, tmpfs_bytes: 4096, tmpfs_inodes: 32, proc_subset_pid: true, launcher: None }
+    }
+    fn v1_document() -> serde_json::Value {
+        let record = runtime_record();
+        serde_json::json!({ "version": 1, "runtimes": [record.clone()], "native": [native_record(&record)] })
+    }
+    fn launcher_value() -> serde_json::Value {
+        serde_json::json!({ "reserve": { "memory_bytes": 1, "tasks": 1, "cpu_quota_percent": 1 }, "helpers": [],
+            "helper_tmpfs_bytes": 1 })
+    }
+    #[test]
+    fn policy_v1_reads_as_no_launcher() {
+        let policy = parse_policy(&serde_json::to_vec(&v1_document()).unwrap()).unwrap();
+        assert_eq!(policy.version, 1);
+        assert!(policy.native.iter().all(|native| native.launcher.is_none()));
+        assert!(launchers(&policy).is_empty());
+        // A v1 document cannot carry a launcher or the v2 domain.
+        let mut smuggled = v1_document(); smuggled["native"][0]["launcher"] = launcher_value();
+        assert!(parse_policy(&serde_json::to_vec(&smuggled).unwrap()).is_err());
+        let mut relabelled = v1_document(); relabelled["domain"] = POLICY_DOMAIN_V2.into();
+        assert!(parse_policy(&serde_json::to_vec(&relabelled).unwrap()).is_err());
+        for version in [0, 3, 65535] {
+            let mut other = v1_document(); other["version"] = version.into();
+            assert!(parse_policy(&serde_json::to_vec(&other).unwrap()).is_err());
+        }
+    }
+    #[test]
+    fn v2_reader_v1_policy_means_no_launcher() {
+        let policy = parse_policy(&serde_json::to_vec(&v1_document()).unwrap()).unwrap();
+        validate_launchers(&policy).unwrap();
+        let record = runtime_record();
+        let employee = EmployeeId([5; 16]);
+        let root = RootPolicy::from_verified_publication(vec![record.to_runtime()],
+            vec![EmployeeEntitlement { employee, profiles: vec![record.profile] }]).unwrap()
+            .with_launchers(duduclaw_run::seccomp::Architecture::native().unwrap(), launchers(&policy)).unwrap();
+        // No launcher: the helper table is empty, so every helper call is refused.
+        assert!(root.helper_table(employee, &record.to_runtime()).is_empty());
+        assert!(root.helper_tmpfs_bytes(&record.to_runtime()).is_none());
+        assert!(root.derive_helper(employee, &record.to_runtime(), &RuntimeKind::Registered(
+            Text::new("duduclaw-program-v1".into()).unwrap())).is_err());
+        // The MCP launch-policy digest input of a launcher-less record is unchanged.
+        let value = serde_json::to_value(native_record(&record)).unwrap();
+        assert!(value.get("launcher").is_none());
+    }
+    #[test]
+    fn v2_bytes_not_valid_as_v1() {
+        let record = runtime_record();
+        let v2 = SignedPolicyV2 { domain: POLICY_DOMAIN_V2.into(), version: 2, runtimes: vec![record.clone()],
+            native: vec![native_record(&record)] };
+        let bytes = serde_json::to_vec(&v2).unwrap();
+        // The deployed v1 reader (deny_unknown_fields) refuses v2 bytes outright.
+        assert!(serde_json::from_slice::<SignedPolicyV1>(&bytes).is_err());
+        assert_eq!(parse_policy(&bytes).unwrap().version, 2);
+        // Relabelling the version keeps the domain, so it is still not a v1 document.
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["version"] = 1.into();
+        assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err());
+        // v2 requires its exact domain.
+        for domain in [serde_json::Value::Null, "duduclaw-isolation-policy-v1".into(), "".into()] {
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if domain.is_null() { value.as_object_mut().unwrap().remove("domain"); } else { value["domain"] = domain; }
+            assert!(parse_policy(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        // A v2 launcher must still pass checks 1–7: an empty table fails closed.
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["native"][0]["launcher"] = launcher_value();
+        let policy = parse_policy(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(validate_launchers(&policy).is_err());
     }
 
 }

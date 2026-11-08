@@ -284,7 +284,8 @@ class LinuxReleaseTests(unittest.TestCase):
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
         runtime_dir = self.root / "runtime"
         runtime_dir.mkdir()
-        (runtime_dir / "runtime-isolation-policy-v1").write_text('{"fixture_only":true}')
+        (runtime_dir / "runtime-isolation-policy-v1").write_text(
+            '{"domain":"duduclaw-isolation-policy-v2","version":2,"runtimes":[],"native":[]}')
         (runtime_dir / "runtime-vendor-codex").write_bytes(b"\x7fELF-test-only-vendor")
         (runtime_dir / "runtime-vendor-codex").chmod(0o755)
         document = self.manifest()

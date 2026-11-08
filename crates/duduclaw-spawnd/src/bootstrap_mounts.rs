@@ -132,6 +132,32 @@ pub fn prepare(plan: &BootstrapPlan, storage: &AttachedStorage, anchors: &RootPu
     Ok(PreparedMounts { home, work, projection, etc, runtime, executable, script, projection_run: plan.run })
 }
 
+/// HX helper runtimes (D8 revision §2.4 "Helper runtimes"). Every helper is
+/// published in the same signed generation registry as the runtime, so the
+/// launcher gets ONE separate read-only, nosuid, nodev, nosymfollow clone of it
+/// (deduplicated by registry mount, check 5) plus per-helper verified executables.
+/// HX3b attaches this clone at `/helpers`, outside the runtime's Landlock list.
+pub struct PreparedHelpers { pub mount: OwnedFd, pub executables: Vec<(VerifiedExecutable, Option<VerifiedExecutable>)> }
+pub fn prepare_helpers(anchors: &RootPublicationAnchors, helpers: &[&crate::policy::Executable]) -> io::Result<PreparedHelpers> {
+    if unsafe { libc::geteuid() } != 0 { return Err(io::ErrorKind::PermissionDenied.into()); }
+    if helpers.is_empty() || helpers.len() > crate::helper_policy::MAX_HELPER_BINDINGS { return Err(invalid()); }
+    let anchor = trusted_directory(&anchors.runtime)?;
+    let mount = detached_clone(anchor.as_fd(), MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOSYMFOLLOW)?;
+    // Same per-file bound as the runtime; a helper table hashes at most 32 files.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut executables = Vec::with_capacity(helpers.len());
+    for executable in helpers {
+        executables.push(match executable {
+            crate::policy::Executable::Elf { entry, digest } =>
+                (open_verified(mount.as_fd(), entry.as_str(), *digest, true, deadline)?, None),
+            crate::policy::Executable::Script { interpreter, interpreter_digest, script, script_digest } =>
+                (open_verified(mount.as_fd(), interpreter.as_str(), *interpreter_digest, true, deadline)?,
+                    Some(open_verified(mount.as_fd(), script.as_str(), *script_digest, false, deadline)?)),
+        });
+    }
+    Ok(PreparedHelpers { mount, executables })
+}
+
 /// Resolve only a reviewed workspace selector under the just-attached H work
 /// filesystem. The fd remains pinned across open_tree; no gateway host path or
 /// supplied mount descriptor is trusted. The selected cwd becomes /work.
