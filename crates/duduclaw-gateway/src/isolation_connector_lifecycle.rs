@@ -1,5 +1,9 @@
 //! Admin provision/revoke of isolated connector routes (C3).
 //!
+//! Migration (C5) uses [`provision_migrated`]: the same validation,
+//! transaction and readback, plus a provenance row naming the applied
+//! confirmation proposal, so a re-apply never mints a second id.
+//!
 //! Provision registers exactly the one route an authenticated Admin asked for.
 //! It never reads, scans or imports existing credentials, product OAuth files
 //! or the legacy home account to create routes; product credential events
@@ -29,7 +33,7 @@ use duduclaw_mcp_boundary::VerificationError;
 use serde_json::{Value, json};
 use crate::isolation_connector_clients::AccountCredentialVault;
 use crate::isolation_connector_details::{self as detail_store, AccountDetailRecord, DetailEmployee, DetailError, DetailReference};
-use crate::isolation_connectors::{AccountId, CatalogError, ConnectorCatalog, ConnectorKind, Route};
+use crate::isolation_connectors::{AccountId, CatalogError, ConnectorCatalog, ConnectorKind, MigratedRoute, MigrationOrigin, Route};
 
 /// Non-sensitive lifecycle failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -44,6 +48,10 @@ pub enum LifecycleError {
     /// could not be dropped. Repeating revoke retries only the removal.
     #[error("connector route revoked; credential removal pending")]
     MaterialPending,
+    /// C5 migration only: another route already covers this account
+    /// ([`MigratedRoute::Conflict`]). Nothing was registered.
+    #[error("connector account already has a route")]
+    Conflict,
 }
 
 /// The administrator performing a lifecycle change. Construct only after the
@@ -98,8 +106,31 @@ pub(crate) fn installed_material() -> Option<&'static dyn CredentialMaterial> {
 /// and written with the route in one transaction.
 pub fn provision(home: &Path, provider: &str, kind: ConnectorKind, binding: &EmployeeBinding, label: &str,
     details: Option<(&DetailEmployee, &DetailReference)>, actor: &AdminActor) -> Result<AccountId, LifecycleError> {
+    provision_with(home, provider, kind, binding, label, details, actor, None)
+}
+
+/// C5: [`provision`] for an applied migration Connector proposal. Exactly
+/// the same detail validation, catalog transaction and readback, with the
+/// proposal's [`MigrationOrigin`] recorded in that same transaction. A
+/// re-apply of the same origin returns (and reads back) the route it already
+/// created instead of minting another id; if that route was revoked the
+/// readback refuses with `Revoked` and nothing new is registered. Another
+/// route already covering the account refuses with [`LifecycleError::Conflict`].
+/// The caller has already re-validated the proposal (legacy evidence,
+/// binding, employee) against the live product state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn provision_migrated(home: &Path, provider: &str, kind: ConnectorKind, binding: &EmployeeBinding,
+    label: &str, details: Option<(&DetailEmployee, &DetailReference)>, origin: &MigrationOrigin, actor: &AdminActor)
+    -> Result<AccountId, LifecycleError> {
+    provision_with(home, provider, kind, binding, label, details, actor, Some(origin))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provision_with(home: &Path, provider: &str, kind: ConnectorKind, binding: &EmployeeBinding, label: &str,
+    details: Option<(&DetailEmployee, &DetailReference)>, actor: &AdminActor, origin: Option<&MigrationOrigin>)
+    -> Result<AccountId, LifecycleError> {
     let refused = |status: &str| json!({"provider": provider_name(provider), "kind": kind.as_str(),
-        "binding_type": binding_type(binding), "status": status});
+        "binding_type": binding_type(binding), "status": status, "origin": origin_name(origin)});
     let record = match (detail_store::needs_details(provider), details) {
         (true, Some((employee, reference))) =>
             detail_store::validate_request(home, provider, kind, binding, employee, reference).map(Some),
@@ -115,32 +146,54 @@ pub fn provision(home: &Path, provider: &str, kind: ConnectorKind, binding: &Emp
         }
     };
     let result = ConnectorCatalog::open(home)
-        .and_then(|catalog| match &record {
-            Some(record) => catalog.register_with_details(label, provider, kind, binding, record),
-            None => catalog.register(label, provider, kind, binding),
-        }.map(|account| (catalog, account)))
-        .and_then(|(catalog, account)| {
+        .and_then(|catalog| {
+            let registered = match (origin, &record) {
+                (None, Some(record)) => catalog.register_with_details(label, provider, kind, binding, record)
+                    .map(|account| Some((account, false))),
+                (None, None) => catalog.register(label, provider, kind, binding).map(|account| Some((account, false))),
+                (Some(origin), record) => match catalog.register_migrated(origin, label, provider, kind, binding, record.as_ref())? {
+                    MigratedRoute::Created(account) => Ok(Some((account, false))),
+                    MigratedRoute::Existing(account) => Ok(Some((account, true))),
+                    MigratedRoute::Conflict => Ok(None),
+                },
+            }?;
+            Ok(registered.map(|(account, replayed)| (catalog, account, replayed)))
+        })
+        .and_then(|registered| {
+            let Some((catalog, account, replayed)) = registered else { return Ok(None) };
             // Read back what selection and the details reader will read.
             let (route, stored) = catalog.route_details(&account)?.ok_or(CatalogError::Unavailable)?;
-            if !route.active || route.provider != provider || route.kind != kind || &route.binding != binding
-                || stored != record {
+            // A replayed migration route that was revoked stays revoked.
+            if !route.active { return Err(if replayed { CatalogError::Revoked } else { CatalogError::Unavailable }); }
+            if route.provider != provider || route.kind != kind || &route.binding != binding
+                || (origin.is_some() && route.label != label) || stored != record {
                 return Err(CatalogError::Unavailable);
             }
-            Ok(route)
+            Ok(Some((route, replayed)))
         });
     match result {
-        Ok(route) => {
-            let mut audited = route_details(&route, "provisioned");
+        Ok(Some((route, replayed))) => {
+            let mut audited = route_details(&route, if replayed { "provisioned_replay" } else { "provisioned" });
             audited["details"] = json!(record.is_some());
             audited["details_employee"] = json!(record.as_ref().map(|record: &AccountDetailRecord| hex::encode(record.employee.0)));
+            audited["origin"] = origin_name(origin);
             audit(home, "isolation.connector_provisioned", actor, audited);
             Ok(route.account)
+        }
+        Ok(None) => {
+            audit(home, "isolation.connector_provision_refused", actor, refused("conflict"));
+            Err(LifecycleError::Conflict)
         }
         Err(error) => {
             audit(home, "isolation.connector_provision_refused", actor, refused(refusal(error)));
             Err(error.into())
         }
     }
+}
+
+/// Audit marker for where a provision came from; never the operation id.
+fn origin_name(origin: Option<&MigrationOrigin>) -> Value {
+    Value::String(if origin.is_some() { "migration" } else { "admin" }.to_owned())
 }
 
 /// Only a known provider name is ever written to the audit log.

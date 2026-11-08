@@ -36,6 +36,9 @@ mod departments;
 mod config_receipt;
 #[path = "migration_authority_employee.rs"]
 pub(crate) mod employee;
+// v1.81 C5: legacy connector accounts → catalog routes via C3 provisioning.
+#[path = "migration_authority_connectors.rs"]
+pub(crate) mod connectors;
 pub(crate) use accounts::GatewayAccountReadback;
 pub(crate) use categories::LiveAuthority;
 
@@ -69,6 +72,7 @@ pub(crate) struct GatewayAuthority {
     backend: Option<std::sync::Arc<dyn MigrationAuthorityBackend>>,
     runtime: Option<std::sync::Arc<dyn MigrationConfigReadback>>,
     live: Option<std::sync::Arc<LiveAuthority>>,
+    connector_env: connectors::ConnectorEnv,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag="kind", deny_unknown_fields)]
@@ -83,6 +87,7 @@ enum Plan {
     DataGrant(data_grants::GrantPlan),
     User { email: String, display: String, role: duduclaw_auth::UserRole },
     Config { relative: String, before: String, after: String },
+    Connector(connectors::ConnectorPlan),
 }
 
 impl GatewayAuthority {
@@ -103,9 +108,16 @@ impl GatewayAuthority {
             CREATE TABLE IF NOT EXISTS secrets (operation TEXT PRIMARY KEY, digest BLOB NOT NULL, value BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS config_publications (operation TEXT NOT NULL, digest BLOB NOT NULL,
                 phase TEXT NOT NULL, identity BLOB NOT NULL, PRIMARY KEY(operation,phase));").map_err(|_| Error::Storage)?;
-        Ok(Self { home, db, key, backend: None, runtime: None, live: None })
+        Ok(Self { home, db, key, backend: None, runtime: None, live: None, connector_env: connectors::ConnectorEnv::default() })
     }
     pub(crate) fn with_live(mut self,live:std::sync::Arc<LiveAuthority>)->Self {self.live=Some(live);self}
+    /// Root allocator / audit actor used by the Connector category (tests inject fixtures).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_connector_env(mut self, env: connectors::ConnectorEnv) -> Self { self.connector_env = env; self }
+    /// The live dashboard Admin (or the injected actor) for C3 audit attribution.
+    fn connector_actor(&self) -> Result<crate::isolation_connector_lifecycle::AdminActor> {
+        self.connector_env.actor(self.live.as_ref().map(|live| live.context.user_id.as_str()))
+    }
     pub(crate) fn with_backend(mut self, backend: std::sync::Arc<dyn MigrationAuthorityBackend>) -> Self {
         self.backend = Some(backend); self
     }
@@ -123,6 +135,7 @@ impl GatewayAuthority {
             ConfirmationCategory::McpServer => !item.fields.iter().any(|f|matches!(f.name.as_str(),"credential"|"requires_reentry")) && text(item,"transport").ok()==Some("stdio"),
             ConfirmationCategory::Policy => text(item, "name").ok() == Some("delegation"),
             ConfirmationCategory::ConfigurationSection => text(item, "section").ok() == Some("delegation"),
+            ConfirmationCategory::Connector => connectors::item_supported(item),
             _ => false,
         }
     }
@@ -142,7 +155,8 @@ impl GatewayAuthority {
     }
     pub(crate) fn built_in_supports(category: ConfirmationCategory) -> bool {
         matches!(category, ConfirmationCategory::DataSourceAuthorization | ConfirmationCategory::Schedule | ConfirmationCategory::ChannelBinding | ConfirmationCategory::Skill | ConfirmationCategory::Hook | ConfirmationCategory::UserAgentBinding | ConfirmationCategory::EmployeeInstructions | ConfirmationCategory::McpServer | ConfirmationCategory::Department | ConfirmationCategory::User
-            | ConfirmationCategory::ConfigurationSection | ConfirmationCategory::Policy | ConfirmationCategory::Budget)
+            | ConfirmationCategory::ConfigurationSection | ConfirmationCategory::Policy | ConfirmationCategory::Budget
+            | ConfirmationCategory::Connector)
     }
     fn plan(&self, item: &ConfirmationItem) -> Result<Option<Plan>> {
         let row: Option<(Vec<u8>,Vec<u8>)> = self.db.query_row("SELECT digest,plan FROM plans WHERE operation=?1",
@@ -340,6 +354,7 @@ impl ProposalValidator for GatewayAuthority {
             ConfirmationCategory::Hook => {self.live.as_ref().ok_or(Error::Denied)?;artifacts::hook_plan(&self.home,item).map(|_|())},
             ConfirmationCategory::EmployeeInstructions => {self.live.as_ref().ok_or(Error::Denied)?;categories::profile_plan(&self.home,item).map(|_|())},
             ConfirmationCategory::McpServer => categories::mcp_plan(&self.home,item).map(|_|()),
+            ConfirmationCategory::Connector => connectors::validate(&self.home,item,&self.connector_env).map(|_|()),
             ConfirmationCategory::LegacyApproval => Err(Error::Denied),
             _ => self.backend.as_ref().ok_or(Error::Denied)?.validate(item),
         }
@@ -368,6 +383,8 @@ impl ProposalApplier for GatewayAuthority {
             ConfirmationCategory::McpServer => {let plan=categories::mcp_plan(&self.home,item)?;plan.check_absent(&self.home)?;Plan::Mcp(plan)},
             ConfirmationCategory::User => Plan::User { email:text(item,"name")?.into(),display:text(item,"display_name")?.into(),role:text(item,"role")?.parse().map_err(|_| Error::Invalid)? },
             ConfirmationCategory::ConfigurationSection | ConfirmationCategory::Policy | ConfirmationCategory::Budget => self.config_plan(item, true)?,
+            // validate_fresh above already re-proved it; staging writes no route.
+            ConfirmationCategory::Connector => Plan::Connector(connectors::parse(item)?),
             _ => return self.backend.as_ref().ok_or(Error::Denied)?.stage(item),
         };
         self.save_plan(item,&plan)
@@ -393,6 +410,7 @@ impl ProposalApplier for GatewayAuthority {
             }
             Plan::User {email,display,role} => self.user_db()?.migration_invite_user(&operation(&item.binding),&item.binding.proposal_digest.0,&email,&display,role).map(|_|()).map_err(|_| Error::Apply),
             Plan::Config {relative,before,after} => self.publish_config(item,&relative,&before,&after),
+            Plan::Connector(plan) => plan.publish(&self.home,item,&self.connector_env,&self.connector_actor()?),
         }
         })
     }
@@ -414,6 +432,7 @@ impl ProposalApplier for GatewayAuthority {
                 Ok(())
             }
             Plan::Config {relative,before,after} => self.read_back_config(item,&relative,&before,&after),
+            Plan::Connector(plan) => plan.read_back(&self.home,item,&self.connector_env),
         }
         })
     }
@@ -433,6 +452,7 @@ impl ProposalApplier for GatewayAuthority {
             Plan::Department(plan) => plan.disable(&self.home),
             Plan::User {..} => self.user_db()?.migration_user_disable(&operation(&item.binding),&item.binding.proposal_digest.0).map_err(|_| Error::Compensation),
             Plan::Config {relative,before,after} => self.disable_config(item,&relative,&before,&after),
+            Plan::Connector(plan) => plan.disable(&self.home,item,&self.connector_actor().map_err(|_|Error::Compensation)?),
         }
         })
     }
@@ -638,10 +658,17 @@ mod tests {
     fn migration_authority_missing_external_backend_cannot_claim_compensation() {
         let home=tempfile::tempdir().unwrap();
         let mut a=GatewayAuthority::new(home.path().into()).unwrap();
-        let p=item(ConfirmationCategory::Connector,&[("name","planted"),("binding_kind","shared"),("owner_id","tenant")]);
+        // v1.81 C5 made Connector a built-in category; Role still has no adapter.
+        let p=item(ConfirmationCategory::Role,&[("name","planted"),("permissions","[]")]);
         assert!(!a.supports(p.category));assert!(a.validate_fresh(&p).is_err());
         assert!(a.stage(&p).is_err());assert!(a.publish(&p).is_err());
         assert!(a.read_back(&p).is_err());assert!(a.disable_and_read_back(&p).is_err());
+        // A planted Connector item (not derived from this home's legacy stores,
+        // wrong proposal id, no settings) is refused and creates nothing.
+        let p=item(ConfirmationCategory::Connector,&[("name","planted"),("binding_kind","shared"),("owner_id","tenant")]);
+        assert!(a.validate_fresh(&p).is_err());assert!(a.stage(&p).is_err());
+        assert!(a.publish(&p).is_err());assert!(a.read_back(&p).is_err());
+        assert!(!home.path().join(crate::isolation_connectors::CATALOG_FILE).exists());
     }
 }
 

@@ -94,7 +94,10 @@ impl MethodHandler {
                             _ => None,
                         }
                     } else { None };
+                    // v1.81 C5: provider, label, proposed binding/owner, detail references.
+                    let connector = super::migration_authority::connectors::card(&item);
                     let mut value = serde_json::to_value(item).expect("bounded confirmation schema");
+                    value["connector"] = json!(connector);
                     value["content_status"] = json!(content_status);
                     value["apply_available"] = json!(supported);
                     value["rotation_pending"] = json!(rotation_pending);

@@ -59,6 +59,7 @@ fn enterprise_surfaces_are_listed() {
         "isolation.connector_step_up",
         "isolation.connector_provision",
         "isolation.connector_revoke",
+        "isolation.connector_import_legacy",
         // 受保護員工配置提案（A4）
         "isolation.employee_list",
         "isolation.employee_propose",

@@ -20,7 +20,11 @@ const LIST: &str = "isolation.connector_list";
 const STEP_UP: &str = "isolation.connector_step_up";
 const PROVISION: &str = "isolation.connector_provision";
 const REVOKE: &str = "isolation.connector_revoke";
-pub(super) const METHODS: [&str; 4] = [LIST, STEP_UP, PROVISION, REVOKE];
+/// v1.81 C5: stage migration Connector proposals from this home's legacy
+/// connector accounts. Creates no route: each proposal still needs approval
+/// on the migration card (`migration.confirmations.approve`).
+const IMPORT: &str = "isolation.connector_import_legacy";
+pub(super) const METHODS: [&str; 5] = [LIST, STEP_UP, PROVISION, REVOKE, IMPORT];
 
 /// Namespace owned by this handler; unknown members are refused here.
 pub(super) fn owns(method: &str) -> bool {
@@ -94,6 +98,9 @@ impl DetailParams {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RevokeRequest { account: String, csrf_token: [u8; 32] }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportRequest { csrf_token: [u8; 32] }
 
 impl MethodHandler {
     pub(crate) async fn handle_isolation_connectors(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
@@ -174,6 +181,16 @@ fn serve(home: &Path, db: &UserDb, user: &str, session: &str, epoch: u64, method
             let route = lifecycle::revoke(home, &account, &actor).map_err(lifecycle_message)?;
             Ok(json!({ "account": route.account.as_str(), "active": route.active,
                 "generation": route.generation, "readback_required": true }))
+        }
+        IMPORT => {
+            let input: ImportRequest = serde_json::from_value(params).map_err(|_| "匯入要求不正確。")?;
+            authorize_step_up(proof.as_ref(), user, &input.csrf_token, now)?;
+            // Every legacy store is read before anything is staged; any
+            // unreadable store refuses the whole import.
+            let summary = super::migration_authority::connectors::import_legacy(home)
+                .map_err(|_| "無法完整讀取舊的連線帳號資料，已停止匯入；未建立任何連線帳號路由。")?;
+            Ok(json!({ "staged": summary.staged, "unchanged": summary.unchanged, "closed": summary.closed,
+                "unproven_personal": summary.unproven_personal, "approval_required": true }))
         }
         _ => Err("不允許此連線帳號操作。"),
     }
@@ -274,6 +291,7 @@ fn lifecycle_message(error: LifecycleError) -> &'static str {
             DetailError::Unavailable => "無法讀取設定資料的來源，已拒絕操作。",
         },
         LifecycleError::MaterialPending => "已停用這個連線帳號，但憑證尚未清除完成，請再執行一次撤銷。",
+        LifecycleError::Conflict => "這個帳號已有連線帳號路由，未建立新的路由。",
     }
 }
 
