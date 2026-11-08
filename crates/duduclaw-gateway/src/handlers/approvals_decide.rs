@@ -59,6 +59,12 @@ impl MethodHandler {
             Ok(rec) => Some(rec),
             Err(response) => return response,
         };
+        // SR2: a Personal → Shared delegation card is decided only by the
+        // Personal employee's owner (`me.isolation.decide_personal_delegation`),
+        // never here — not even by an Admin.
+        if record.as_ref().is_some_and(|r| r.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND) {
+            return WsFrame::error_response("", crate::isolation_background::PERSONAL_DELEGATION_DECIDE_ELSEWHERE);
+        }
         if let Some(r) = &record {
             // Both approval and denial can wake work. Gate every kind before
             // specialized paths, expiry polling, or any broker decision.

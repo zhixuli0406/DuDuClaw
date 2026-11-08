@@ -344,6 +344,10 @@ impl GatewayAuthority {
             policy: prepared.policy, agent: prepared.agent, employee: prepared.employee,
             run: RunHandle(context.record().run), expires_at: prepared.expires_at,
             lane: context.record().lane, parent: turn.background,
+            // The lifecycle principal pinned at prepare (equal to the grant
+            // binding, B1). A Personal source needs its owner's approval
+            // card before the delegation is queued (SR2, owner decision).
+            binding: prepared.lifecycle.binding.clone(),
         })
     }
 }

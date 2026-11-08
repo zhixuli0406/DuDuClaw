@@ -24,6 +24,19 @@
 //!   Personal employee (`isolation_lifecycle::tombstone_personal_employee`).
 //! - `isolation.employee_list` (Admin): confirmed employees and requests,
 //!   plus the step-up state for the dashboard.
+//! - `isolation.employee_purge_requests` (Admin + step-up, SR2): removes
+//!   rejected/expired staff requests that never reached an apply step.
+//! - `me.isolation.list_personal_delegations` /
+//!   `me.isolation.decide_personal_delegation` (SR2, owner decision
+//!   2026-11-08): the Personal owner's approval cards for delegations from
+//!   the employee's live run to a Shared employee.
+//!
+//! SR2 hardening: only open Employee proposals count toward the store quota;
+//! staff requests are rate limited per user ([`MAX_REQUESTS_PER_DAY`]); a
+//! Personal proposal adopts an existing `agents/<label>` only with this
+//! flow's creation marker (`isolation_employee_dirs.rs`); the propose steps
+//! hold the same apply.db writer lock as the request path, so two open
+//! proposals for one label cannot coexist.
 //!
 //! Step-up is the migration dashboard proof (`UserDb::migration_step_up`,
 //! written by `migration.confirmations.step_up` or
@@ -45,11 +58,25 @@ const MY_REQUESTS: &str = "me.isolation.list_personal_employee_requests";
 const LIST: &str = "isolation.employee_list";
 const PROPOSE: &str = "isolation.employee_propose";
 const TOMBSTONE: &str = "isolation.employee_tombstone";
-pub(super) const METHODS: [&str; 5] = [REQUEST, MY_REQUESTS, LIST, PROPOSE, TOMBSTONE];
+const PURGE: &str = "isolation.employee_purge_requests";
+pub(super) const METHODS: [&str; 8] = [REQUEST, MY_REQUESTS, LIST, PROPOSE, TOMBSTONE, PURGE,
+    delegation::DELEGATIONS, delegation::DECIDE_DELEGATION];
+
+#[path = "isolation_employee_dirs.rs"]
+mod employee_dirs;
+#[path = "isolation_employee_delegation.rs"]
+mod delegation;
 
 /// `agents.create` in protected mode points here.
 pub(super) const DIRECT_CREATE_REFUSED: &str = "受保護模式下不能直接建立 AI 員工。請改用員工配置提案：\
     管理員提出提案並通過密碼與雙因素驗證後，在核准卡片上確認；同仁可在自己的帳號頁申請個人專屬員工，由管理員核准。";
+
+/// SR2 finding 1c: every other writer of a new `agents/<id>` (role and
+/// company templates, pack installs) refuses in native Linux protected mode
+/// and points to the proposal path. `None` outside protected mode.
+pub(super) fn protected_create_refusal(protected: bool) -> Option<WsFrame> {
+    protected.then(|| WsFrame::error_response("", DIRECT_CREATE_REFUSED))
+}
 
 const CONFIRMATIONS_DB: &str = "migration-confirmations.db";
 const APPLY_DB: &str = "migration-authority/apply.db";
@@ -57,6 +84,10 @@ const APPLY_DB: &str = "migration-authority/apply.db";
 const DISK_BYTES: u64 = 1024 * 1024 * 1024;
 /// Open Personal requests one user may have at a time.
 const MAX_OPEN_REQUESTS: usize = 3;
+/// Personal requests one user may file in any 24 hours, whatever happened
+/// to them (SR2): a reject/re-request loop cannot flood the store.
+const MAX_REQUESTS_PER_DAY: u32 = 10;
+const RATE_LIMITED: &str = "你在 24 小時內已送出太多個人專屬員工申請，請稍後再申請。";
 const MAX_DISPLAY_CHARS: usize = 64;
 const MAX_LISTED: u32 = 500;
 
@@ -121,6 +152,9 @@ struct ProposeRequest {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TombstoneRequest { label: String, employee_id: String, csrf_token: [u8; 32] }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PurgeRequest { csrf_token: [u8; 32] }
 
 /// A checked admin proposal, carried from the first blocking step through the
 /// product create to the staging step (which re-checks the step-up).
@@ -131,6 +165,9 @@ struct Prepared {
     /// The staff request this proposal supersedes.
     request: Option<ProposalOperationId>,
     csrf: [u8; 32],
+    /// Personal proposals (SR2 1b): the agents directory whose `<label>`
+    /// entry must still carry this flow's creation marker at staging.
+    adopt: Option<std::path::PathBuf>,
 }
 
 impl MethodHandler {
@@ -184,15 +221,37 @@ impl MethodHandler {
             TOMBSTONE => {
                 let input: TombstoneRequest = serde_json::from_value(params).map_err(|_| PROPOSAL_INVALID)?;
                 let session = session.ok_or(ADMIN_REQUIRED)?;
-                blocking(move || {
+                let done = blocking(move || {
                     let now = now()?;
                     let proof = db.migration_confirmation_session(&user, &session, epoch, now).map_err(|_| SESSION_EXPIRED)?;
                     tombstone(&home, proof.as_ref(), &user, input, now)
-                }).await
+                }).await?;
+                // The directory is now in quarantine (SR2 finding 4).
+                if let Err(error) = self.registry.write().await.scan().await {
+                    warn!(error = %error, "employee tombstone: registry rescan failed");
+                }
+                Ok(done)
             }
             PROPOSE => {
                 let input: ProposeRequest = serde_json::from_value(params).map_err(|_| PROPOSAL_INVALID)?;
                 self.employee_propose(input, ctx, db, session.ok_or(ADMIN_REQUIRED)?).await
+            }
+            PURGE => {
+                let input: PurgeRequest = serde_json::from_value(params).map_err(|_| PROPOSAL_INVALID)?;
+                let session = session.ok_or(ADMIN_REQUIRED)?;
+                blocking(move || {
+                    let now = now()?;
+                    let proof = db.migration_confirmation_session(&user, &session, epoch, now).map_err(|_| SESSION_EXPIRED)?;
+                    purge_requests(&home, proof.as_ref(), &user, input, now)
+                }).await
+            }
+            delegation::DELEGATIONS => {
+                let _: NoParams = serde_json::from_value(params).map_err(|_| REQUEST_INVALID)?;
+                delegation::list(&home, &user).await
+            }
+            delegation::DECIDE_DELEGATION => {
+                let input = delegation::parse_decision(params)?;
+                delegation::decide(&home, &user, input).await
             }
             _ => Err(NOT_ALLOWED),
         }
@@ -211,7 +270,7 @@ impl MethodHandler {
     async fn employee_propose(&self, input: ProposeRequest, ctx: &UserContext, db: Arc<UserDb>, session: String)
         -> Result<Value, &'static str> {
         let (home, user, epoch) = (self.home_dir.clone(), ctx.user_id.clone(), ctx.credential_epoch);
-        let prepared = {
+        let mut prepared = {
             let (home, db, user, session) = (home.clone(), db.clone(), user.clone(), session.clone());
             blocking(move || {
                 let now = now()?;
@@ -221,19 +280,49 @@ impl MethodHandler {
         };
         // The product configuration comes from the normal writer and stays
         // inert until the approved proposal is allocated by the root. An
-        // existing, unallocated configuration (a retry, or an imported one)
-        // is proposed as it is.
-        let exists = self.registry.read().await.get(&prepared.label).is_some();
-        let created = if exists { false } else {
-            if self.employee_label_taken(&prepared.label).await { return Err(LABEL_TAKEN); }
-            let frame = self.create_agent_files(
-                json!({ "name": prepared.label, "display_name": prepared.display_name }), Some(ctx)).await;
-            if !matches!(frame, WsFrame::Response { ok: true, .. }) {
-                warn!(agent = %prepared.label, "employee proposal: product create refused");
-                return Err(CREATE_FAILED);
-            }
-            true
+        // existing, unallocated Shared configuration (a retry, or an imported
+        // one) is proposed as it is. A Personal proposal (SR2 1b) adopts an
+        // existing directory only with this flow's marker for the same
+        // owner and an unchanged digest; it never adopts a foreign one.
+        let agents_dir = self.registry.read().await.agents_dir().to_path_buf();
+        let owner = match &prepared.binding {
+            EmployeeBinding::Personal(owner) => Some(owner.as_str().to_owned()),
+            EmployeeBinding::Shared(_) => None,
         };
+        let exists = self.registry.read().await.get(&prepared.label).is_some();
+        let present = exists || !matches!(std::fs::symlink_metadata(agents_dir.join(&prepared.label)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+        let created = match (&owner, present) {
+            (Some(owner), true) => {
+                let (home, agents_dir, label, owner) = (home.clone(), agents_dir.clone(), prepared.label.clone(), owner.clone());
+                blocking(move || employee_dirs::adopt_existing(&home, &agents_dir, &label, &owner)).await?;
+                false
+            }
+            (None, true) if exists => false,
+            (None, true) => return Err(LABEL_TAKEN),
+            (_, false) => {
+                if self.employee_label_taken(&prepared.label).await { return Err(LABEL_TAKEN); }
+                let frame = self.create_agent_files(
+                    json!({ "name": prepared.label, "display_name": prepared.display_name }), Some(ctx)).await;
+                if !matches!(frame, WsFrame::Response { ok: true, .. }) {
+                    warn!(agent = %prepared.label, "employee proposal: product create refused");
+                    return Err(CREATE_FAILED);
+                }
+                if let Some(owner) = &owner {
+                    let (home, dir, label, owner) = (home.clone(), agents_dir.clone(), prepared.label.clone(), owner.clone());
+                    if let Err(error) = blocking(move || employee_dirs::record_marker(&home, &dir, &label, &owner)).await {
+                        // Without a marker the directory could never be
+                        // proposed; remove what this call just created.
+                        warn!(agent = %prepared.label, "employee proposal: creation marker not recorded");
+                        let _ = tokio::fs::remove_dir_all(agents_dir.join(&prepared.label)).await;
+                        let _ = self.registry.write().await.scan().await;
+                        return Err(error);
+                    }
+                }
+                true
+            }
+        };
+        if owner.is_some() { prepared.adopt = Some(agents_dir); }
         let settings = {
             let registry = self.registry.read().await;
             settings_for(&registry.get(&prepared.label).ok_or(CREATE_FAILED)?.config)?
@@ -430,8 +519,13 @@ fn open_requests(home: &Path) -> Result<Connection, &'static str> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS personal_employee_requests (
             request_id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, label TEXT NOT NULL,
             display_name TEXT NOT NULL, created_at TEXT NOT NULL);
-        CREATE INDEX IF NOT EXISTS idx_personal_employee_requests_owner ON personal_employee_requests(owner_user_id);")
+        CREATE INDEX IF NOT EXISTS idx_personal_employee_requests_owner ON personal_employee_requests(owner_user_id);
+        CREATE TABLE IF NOT EXISTS personal_employee_request_log (
+            owner_user_id TEXT NOT NULL, created_at INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_personal_employee_request_log_owner
+            ON personal_employee_request_log(owner_user_id, created_at);")
         .map_err(|_| STORE_UNAVAILABLE)?;
+    db.execute_batch(employee_dirs::MARKER_SCHEMA).map_err(|_| STORE_UNAVAILABLE)?;
     Ok(db)
 }
 
@@ -502,6 +596,14 @@ fn request_personal(home: &Path, db: &UserDb, caller: &str, label: &str, display
     if mine.iter().any(|item| field(item, "employee_id") == Some(label)) { return Err(DUPLICATE); }
     if items.iter().any(|item| is_open_employee(item) && field(item, "employee_id") == Some(label)) { return Err(LABEL_PENDING); }
     if mine.len() >= MAX_OPEN_REQUESTS { return Err(TOO_MANY); }
+    // SR2: at most MAX_REQUESTS_PER_DAY filed in any 24 hours. The log is
+    // separate from the request index, so a purge never resets it.
+    tx.execute("DELETE FROM personal_employee_request_log WHERE created_at <= CAST(strftime('%s','now') AS INTEGER) - 86400",
+        []).map_err(|_| STORE_UNAVAILABLE)?;
+    let recent: u32 = tx.query_row("SELECT COUNT(*) FROM personal_employee_request_log WHERE owner_user_id=?1
+        AND created_at > CAST(strftime('%s','now') AS INTEGER) - 86400", [caller], |r| r.get(0))
+        .map_err(|_| STORE_UNAVAILABLE)?;
+    if recent >= MAX_REQUESTS_PER_DAY { return Err(RATE_LIMITED); }
     let operation = ProposalOperationId { proposal_id: new_proposal_id(), revision: 1 };
     let mut fields = vec![text_field("employee_id", label), text_field("disk_bytes", &DISK_BYTES.to_string())];
     fields.extend(principal_fields(&owner));
@@ -511,6 +613,8 @@ fn request_personal(home: &Path, db: &UserDb, caller: &str, label: &str, display
     let created_at = chrono::Utc::now().to_rfc3339();
     tx.execute("INSERT INTO personal_employee_requests(request_id,owner_user_id,label,display_name,created_at) VALUES(?1,?2,?3,?4,?5)",
         params![request_id, caller, label, display, created_at]).map_err(|_| STORE_UNAVAILABLE)?;
+    tx.execute("INSERT INTO personal_employee_request_log(owner_user_id,created_at) VALUES(?1,CAST(strftime('%s','now') AS INTEGER))",
+        [caller]).map_err(|_| STORE_UNAVAILABLE)?;
     tx.commit().map_err(|_| STORE_UNAVAILABLE)?;
     Ok(json!({ "request_id": request_id, "label": label, "display_name": display, "created_at": created_at,
         "status": "pending", "stage": "requested", "approval_required": true }))
@@ -570,6 +674,10 @@ fn prepare_propose(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmatio
     input: ProposeRequest, now: i64) -> Result<Prepared, &'static str> {
     authorize_step_up(proof, user, &input.csrf_token, now)?;
     if !valid_label(&input.label) { return Err(LABEL_INVALID); }
+    // SR2 finding 6: the request path's apply.db writer lock, held across
+    // the open-label check (and taken again by `stage_prepared`).
+    let mut requests = open_requests(home)?;
+    let lock = requests.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORE_UNAVAILABLE)?;
     let items = read_items(home)?;
     let (binding, request) = match input.request_id.as_deref() {
         Some(id) => {
@@ -587,18 +695,22 @@ fn prepare_propose(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmatio
         None => (resolve_binding(home, db, &input.binding_kind, input.owner_id.as_deref())?, None),
     };
     // One open Employee proposal per label; the request itself is superseded.
-    if items.iter().any(|item| is_open_employee(item) && field(item, "employee_id") == Some(input.label.as_str())
-        && request.is_none_or(|op| item.binding.operation_id.proposal_id != op.proposal_id)) {
-        return Err(LABEL_PENDING);
-    }
-    open_requests(home)?;
+    if label_pending(&items, &input.label, request) { return Err(LABEL_PENDING); }
     lifecycle::validate_proposed_binding(home, &input.label, Some(&binding)).map_err(binding_error)?;
     let display_name = match (input.display_name.as_deref(), request) {
         (Some(name), _) => checked_display(name)?,
         (None, Some(op)) => request_display_name(home, op.proposal_id)?.unwrap_or_else(|| input.label.clone()),
         (None, None) => input.label.clone(),
     };
-    Ok(Prepared { label: input.label, display_name, binding, request, csrf: input.csrf_token })
+    lock.finish().map_err(|_| STORE_UNAVAILABLE)?;
+    Ok(Prepared { label: input.label, display_name, binding, request, csrf: input.csrf_token, adopt: None })
+}
+
+/// Another open Employee proposal holds `label` (the staff request that
+/// `request` supersedes does not count).
+fn label_pending(items: &[ConfirmationItem], label: &str, request: Option<ProposalOperationId>) -> bool {
+    items.iter().any(|item| is_open_employee(item) && field(item, "employee_id") == Some(label)
+        && request.is_none_or(|op| item.binding.operation_id.proposal_id != op.proposal_id))
 }
 
 /// The live configuration as the approval validator compares it: the text
@@ -625,9 +737,21 @@ fn stage_prepared(home: &Path, proof: Option<&MigrationConfirmationSession>, use
     let mut fields = vec![text_field("employee_id", &prepared.label), text_field("disk_bytes", &DISK_BYTES.to_string()),
         text_field("settings", settings)];
     fields.extend(principal_fields(&prepared.binding));
+    // SR2 finding 6: the same apply.db writer lock as the request path,
+    // across the open-label recheck and the staging, so a concurrent request
+    // or proposal for this label cannot slip in between.
+    let mut requests = open_requests(home)?;
+    let lock = requests.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORE_UNAVAILABLE)?;
     let mut store = open_confirmations(home)?;
+    let items = store.list().map_err(|_| STORE_UNAVAILABLE)?;
+    if label_pending(&items, &prepared.label, prepared.request) { return Err(LABEL_PENDING); }
+    // SR2 finding 1b: the adopted directory still carries this flow's marker.
+    if let (Some(agents_dir), EmployeeBinding::Personal(owner)) = (&prepared.adopt, &prepared.binding) {
+        employee_dirs::check_marker(&lock, home, agents_dir, &prepared.label, owner.as_str())?;
+    }
     let item = store.stage_proposal(operation, ConfirmationCategory::Employee, fields, &StagingCheck { home })
         .map_err(stage_error)?;
+    lock.commit().map_err(|_| STORE_UNAVAILABLE)?;
     Ok(json!({
         "request_id": hex::encode(item.binding.operation_id.proposal_id.0),
         "revision": item.binding.operation_id.revision,
@@ -635,6 +759,51 @@ fn stage_prepared(home: &Path, proof: Option<&MigrationConfirmationSession>, use
         "status": status_name(item.status),
         "approval_required": true,
     }))
+}
+
+/// `isolation.employee_purge_requests` (Admin + step-up, SR2 finding 3):
+/// staff requests whose proposal is closed (latest revision Rejected or
+/// ExpiredRejected) and never reached an apply step are removed from the
+/// confirmation store and the request index. Open, applied or compensated
+/// proposals and import-staged proposals are never touched; the per-user
+/// rate-limit log is kept.
+fn purge_requests(home: &Path, proof: Option<&MigrationConfirmationSession>, user: &str, input: PurgeRequest, now: i64)
+    -> Result<Value, &'static str> {
+    authorize_step_up(proof, user, &input.csrf_token, now)?;
+    let proof = proof.ok_or(ADMIN_REQUIRED)?;
+    let actor = uuid::Uuid::parse_str(user).map_err(|_| ADMIN_REQUIRED)?;
+    let session = duduclaw_migration::confirmation::ApprovalSession::from_verified_session(true, true,
+        Some(proof.verified_at), proof.csrf, RequestId(*actor.as_bytes()));
+    let mut requests = open_requests(home)?;
+    let tx = requests.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORE_UNAVAILABLE)?;
+    let indexed: Vec<String> = {
+        let mut query = tx.prepare("SELECT request_id FROM personal_employee_requests LIMIT 10000").map_err(|_| STORE_UNAVAILABLE)?;
+        let rows = query.query_map([], |r| r.get::<_, String>(0)).map_err(|_| STORE_UNAVAILABLE)?;
+        rows.collect::<Result<_, _>>().map_err(|_| STORE_UNAVAILABLE)?
+    };
+    let mut store = open_confirmations(home)?;
+    let items = store.list().map_err(|_| STORE_UNAVAILABLE)?;
+    let closed: Vec<RequestId> = indexed.iter().filter_map(|id| parse_hex16(id).map(RequestId))
+        .filter(|id| latest(&items, *id).is_some_and(|item| item.category == ConfirmationCategory::Employee
+            && matches!(item.status, ConfirmationStatus::Rejected | ConfirmationStatus::ExpiredRejected)))
+        .collect();
+    let mut purged = 0;
+    for batch in closed.chunks(200) {
+        purged += store.purge_closed_employee(batch, &session, input.csrf_token, u64::try_from(now).map_err(|_| CLOCK_UNAVAILABLE)?)
+            .map_err(stage_error)?;
+    }
+    // Drop index rows whose proposal is gone (purged now, or never staged).
+    let remaining = store.list().map_err(|_| STORE_UNAVAILABLE)?;
+    let mut removed = 0;
+    for id in &indexed {
+        let present = parse_hex16(id).is_some_and(|bytes| latest(&remaining, RequestId(bytes)).is_some());
+        if !present {
+            removed += tx.execute("DELETE FROM personal_employee_requests WHERE request_id=?1", [id])
+                .map_err(|_| STORE_UNAVAILABLE)?;
+        }
+    }
+    tx.commit().map_err(|_| STORE_UNAVAILABLE)?;
+    Ok(json!({ "purged": purged, "index_rows_removed": removed }))
 }
 
 /// `isolation.employee_tombstone`: admin handover of a Personal employee.

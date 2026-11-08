@@ -270,8 +270,15 @@ impl ConfirmationStore {
             return Err(ConfirmationError::Limit);
         }
         if category == ConfirmationCategory::Employee && !is_revision {
+            // SR2: only open Employee proposals (latest revision still awaiting
+            // a decision or being applied/compensated) hold a slot. Closed ones
+            // (applied, failed, rejected, expired) no longer exhaust the quota;
+            // the store-wide row/byte bound above still applies to them.
             let count: u32 = tx.query_row(
-                "SELECT COUNT(DISTINCT id) FROM migration_proposals WHERE json_extract(item,'$.category')='employee'",
+                "SELECT COUNT(*) FROM migration_proposals p
+                 WHERE json_extract(p.item,'$.category')='employee'
+                   AND p.revision=(SELECT MAX(q.revision) FROM migration_proposals q WHERE q.id=p.id)
+                   AND json_extract(p.item,'$.status') IN ('pending','approved','applying','rejecting')",
                 [], |r| r.get(0))?;
             if count >= DEFAULT_EMPLOYEE_PROPOSAL_LIMIT { return Err(ConfirmationError::Limit); }
         }
@@ -432,6 +439,47 @@ impl ConfirmationStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Admin purge (Admin + MFA + fresh step-up + CSRF) of closed Employee
+    /// proposals that never reached an apply step: every revision is an
+    /// Employee proposal, the latest is Rejected or ExpiredRejected, and no
+    /// apply journal, effect intent or rotation row exists for the id. Such a
+    /// proposal had no external effect, so deleting its rows frees store
+    /// capacity without losing compensation state; the audit trail keeps one
+    /// `purged` event. Anything else (open, applied, failed, compensated
+    /// after an apply step, or another category) is left untouched.
+    /// Returns the number of proposals purged.
+    pub fn purge_closed_employee(&mut self, ids: &[RequestId], session: &ApprovalSession,
+        csrf: [u8; 32], now: u64) -> Result<usize> {
+        session.check(&csrf, now)?;
+        if ids.len() > 200 { return Err(ConfirmationError::Limit); }
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut purged = 0;
+        for id in ids {
+            let mut query = tx.prepare("SELECT item FROM migration_proposals WHERE id=?1 ORDER BY revision")?;
+            let revisions = query.query_map([id.0.as_slice()], |r| r.get::<_, String>(0))?
+                .map(|row| -> Result<ConfirmationItem> { Ok(serde_json::from_str(&row?)?) })
+                .collect::<Result<Vec<_>>>()?;
+            drop(query);
+            let Some(latest) = revisions.last() else { continue };
+            if revisions.iter().any(|item| item.category != ConfirmationCategory::Employee
+                || item.binding.operation_id.proposal_id != *id)
+                || !matches!(latest.status, ConfirmationStatus::Rejected | ConfirmationStatus::ExpiredRejected) {
+                continue;
+            }
+            let touched: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM migration_apply WHERE id=?1)
+                    OR EXISTS(SELECT 1 FROM migration_effect_intents WHERE id=?1)
+                    OR EXISTS(SELECT 1 FROM migration_rotations WHERE id=?1)",
+                [id.0.as_slice()], |r| r.get(0))?;
+            if touched { continue; }
+            audit(&tx, latest, "purged", Some(session.actor))?;
+            tx.execute("DELETE FROM migration_proposals WHERE id=?1", [id.0.as_slice()])?;
+            purged += 1;
+        }
+        tx.commit()?;
+        Ok(purged)
     }
 
     /// Rotation evidence comes from a fresh protected secret write and readback,

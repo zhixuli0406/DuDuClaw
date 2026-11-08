@@ -44,8 +44,9 @@ pub(crate) fn save_confirmed_receipt(home:&Path,item:&ConfirmationItem,receipt:&
         let spec=allocation::specification(item).map_err(|_|Error::Invalid)?;
         // The root copies the principal from this confirmed proposal only.
         if receipt.binding!=item.binding || receipt.label!=spec.label || receipt.principal_binding!=spec.binding {return Err(Error::Stale);}
-        let path=home.join("migration-authority/apply.db");
-        let mut db=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(|_|Error::Storage)?;
+        // SR2 finding 7: the hardened private-SQLite opener (never created).
+        let mut db=crate::fs_safe::sqlite::open_existing(&home.join("migration-authority"),"apply.db",
+            crate::fs_safe::sqlite::Access::ReadWrite).map_err(|_|Error::Storage)?;
         db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_|Error::Storage)?;
         ensure_employee_schema(&db)?;
         let tenant = current_tenant(home, &receipt.label)?;
@@ -131,7 +132,9 @@ fn ensure_employee_schema(db:&Connection)->Result<()> {
     Ok(())
 }
 fn current_tenant(home:&Path,agent:&str)->Result<String> {
-    let mut users=Connection::open_with_flags(home.join("users.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_|Error::Storage)?;
+    // SR2 finding 7: the hardened private-SQLite opener, read-only.
+    let mut users=crate::fs_safe::sqlite::open_existing(home,"users.db",crate::fs_safe::sqlite::Access::ReadOnly).map_err(|_|Error::Storage)?;
+    users.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_|Error::Storage)?;
     duduclaw_auth::read_isolation_authority(&mut users,None,agent)
         .map(|snapshot|snapshot.tenant_id).map_err(|_|Error::Denied)
 }

@@ -10,6 +10,11 @@ use crate::isolation_lifecycle::{self as lifecycle, EmployeeLifecycle, Lifecycle
 
 pub mod material;
 mod store;
+// Reached from `record_delegation_inner` on Linux only; tests run everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod personal_delegation;
+pub use personal_delegation::{DelegationError,
+    DECIDE_ELSEWHERE as PERSONAL_DELEGATION_DECIDE_ELSEWHERE, KIND as PERSONAL_DELEGATION_KIND};
 #[cfg(test)]
 mod lifecycle_tests;
 /// Shown when background work is asked of a Personal employee. Such an
@@ -446,14 +451,19 @@ pub(crate) struct DelegationSource {
     pub owner: String, pub epoch: u64, pub acl_generation: u64, pub policy_epoch: u64,
     pub policy: String, pub agent: String, pub employee: EmployeeId, pub run: RunHandle,
     pub expires_at: u64, pub lane: Lane, pub parent: Option<RecordAuthority>,
+    /// The source employee's lifecycle principal pinned for this run (SR2:
+    /// a Personal source needs its owner's approval card).
+    pub binding: EmployeeBinding,
 }
 
 /// Called by the original product send handler after its delegation/action
 /// gates, before inserting the exact queue row. Authority is read back from D's
 /// live run association, never from queue fields or a freshly read user epoch.
+/// A Personal source (owner decision 2026-11-08) is not queued until its
+/// owner approves the card: `Err(OwnerApprovalPending)` until then.
 pub async fn record_delegation(home: &Path, sender: &str,
     context: &duduclaw_mcp_boundary::RequestContext, target: &str, id: &str, material: &Value)
-    -> Result<(), VerificationError> {
+    -> Result<(), DelegationError> {
     record_delegation_inner(home, sender, context, target, id, material, false).await
 }
 
@@ -463,19 +473,20 @@ pub async fn record_delegation(home: &Path, sender: &str,
 /// turn and parent approval; a drained pathname is never an authority source.
 pub async fn record_bus_delegation(home: &Path, sender: &str,
     context: &duduclaw_mcp_boundary::RequestContext, target: &str, id: &str, material: &Value)
-    -> Result<(), VerificationError> {
+    -> Result<(), DelegationError> {
     record_delegation_inner(home, sender, context, target, id, material, true).await
 }
 
 async fn record_delegation_inner(home: &Path, sender: &str,
     context: &duduclaw_mcp_boundary::RequestContext, target: &str, id: &str, material: &Value, detached_bus: bool)
-    -> Result<(), VerificationError> {
+    -> Result<(), DelegationError> {
     if !duduclaw_core::execution_gate::isolation_required() { return Ok(()); }
     #[cfg(target_os = "linux")]
     {
+        let outer_home = home.to_owned();
         let (home, sender, context, target, id, material) =
             (home.to_owned(), sender.to_owned(), context.clone(), target.to_owned(), id.to_owned(), material.clone());
-        return duduclaw_mcp_boundary::authority::verify_blocking(move || {
+        let held = duduclaw_mcp_boundary::authority::verify_blocking(move || {
             let source = crate::isolation_mcp::delegation_source(&home, &sender, &context)?;
             let current = snapshot(&home, &source.owner, &target)?;
             // A queued delegation runs as background work of the target: a
@@ -490,6 +501,9 @@ async fn record_delegation_inner(home: &Path, sender: &str,
                 return Err(VerificationError::Revoked);
             }
             let policy = crate::approval::strict_policy_revision(&home, &target).map_err(|_| unavailable())?;
+            // SR2: Personal source → owner approval card first; Shared → None.
+            let gate = personal_delegation::gate(&source.binding, &user_id(&source.owner)?, &source.agent,
+                source.employee, &target, employee, &material)?;
             let value = RecordAuthority { home, kind: "delegation".into(), id, agent: target.clone(), employee,
                 binding: Some(binding), allocation: Some(allocation), owner: source.owner, epoch: source.epoch, acl_generation: source.acl_generation,
                 policy_epoch: source.policy_epoch,
@@ -497,12 +511,17 @@ async fn record_delegation_inner(home: &Path, sender: &str,
                 material: store::material_digest(&material)?, approval: None, expires_at: source.expires_at,
                 lane: source.lane, caller: Some(source.employee), parent_run: Some(source.run),
                 parent_agent: Some(source.agent), parent_policy: Some(source.policy), parent: source.parent.map(Box::new), detached_bus };
+            if let Some(gate) = gate { return Ok(Some((value, gate))); }
             if store::load(&value.home, "delegation", &value.id)?.is_some() { return Err(VerificationError::Revoked); }
-            store::save(&value)
-        }).await;
+            store::save(&value).map(|()| None)
+        }).await?;
+        return match held {
+            None => Ok(()),
+            Some((value, gate)) => personal_delegation::admit(&outer_home, &gate, &value).await,
+        };
     }
     #[cfg(not(target_os = "linux"))]
-    { let _ = (home, sender, context, target, id, material, detached_bus); Err(unavailable()) }
+    { let _ = (home, sender, context, target, id, material, detached_bus); Err(unavailable().into()) }
 }
 
 #[cfg(test)]

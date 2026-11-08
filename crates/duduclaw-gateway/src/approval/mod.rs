@@ -80,6 +80,10 @@ const SELF_NOTIFYING_KINDS: &[&str] = &[
     // P2-A S-M7: pushed as a responsibility notice (policy, proactive gate,
     // durable per-window cap), never by the generic approval push.
     crate::responsibility::DECISION_KIND,
+    // SR2: a Personal employee's delegation card shows its owner's task text
+    // and is decided by that owner only (own account page); never pushed to
+    // the deciders of the generic approval push.
+    crate::isolation_background::PERSONAL_DELEGATION_KIND,
 ];
 
 /// Hard cap on the generic push so a hung channel API can never stall the

@@ -442,3 +442,235 @@ fn offboarding_personal_owner_with_transfer_refused_clearly() {
 fn direct_create_refusal_points_to_the_proposal_path() {
     assert!(DIRECT_CREATE_REFUSED.contains("員工配置提案") && DIRECT_CREATE_REFUSED.contains("核准"));
 }
+
+const SOUL: &str = "# Alice 的助理\n\n只為 Alice 工作。\n";
+
+/// An `agents/<label>` directory shaped like `create_agent_files` output.
+fn write_agent_dir(agents: &Path, label: &str) {
+    let dir = agents.join(label);
+    std::fs::create_dir_all(dir.join("SKILLS/notes")).unwrap();
+    std::fs::write(dir.join("SOUL.md"), SOUL).unwrap();
+    std::fs::write(dir.join("agent.toml"), format!("[agent]\nname = \"{label}\"\n")).unwrap();
+    std::fs::write(dir.join("SKILLS/notes/SKILL.md"), "# notes\n").unwrap();
+}
+
+fn personal_prepared(f: &Fixture, label: &str, now: i64) -> Prepared {
+    prepare_propose(f.home(), &f.users, Some(&proof(now)), &f.bob, propose_input(json!({
+        "label": label, "binding_kind": "personal", "owner_id": f.alice, "csrf_token": CSRF})), now).unwrap()
+}
+
+/// SR2 1b: a Personal proposal never adopts a directory this flow did not
+/// create for that owner.
+#[test]
+fn propose_refuses_foreign_existing_dir_for_personal() {
+    let f = fixture();
+    let agents = f.home().join("agents");
+    write_agent_dir(&agents, LABEL);
+    // Hand-made, imported or a former owner's directory: no marker.
+    assert_eq!(employee_dirs::adopt_existing(f.home(), &agents, LABEL, &f.alice), Err(employee_dirs::FOREIGN_DIR));
+    // A marker of this flow for another owner is not this owner's.
+    employee_dirs::record_marker(f.home(), &agents, LABEL, &f.bob).unwrap();
+    assert_eq!(employee_dirs::adopt_existing(f.home(), &agents, LABEL, &f.alice), Err(employee_dirs::FOREIGN_DIR));
+    // The staging step re-checks under the apply.db lock and stages nothing.
+    let now = 10_000;
+    let mut prepared = personal_prepared(&f, LABEL, now);
+    prepared.adopt = Some(agents.clone());
+    assert_eq!(stage_prepared(f.home(), Some(&proof(now)), &f.bob, &prepared, "{}", now).err(), Some(employee_dirs::FOREIGN_DIR));
+    assert!(employee_items(f.home(), LABEL).is_empty());
+    // A symlinked agent directory or adopted file is refused, never followed.
+    #[cfg(unix)]
+    {
+        write_agent_dir(&f.home().join("elsewhere"), "real");
+        std::os::unix::fs::symlink(f.home().join("elsewhere/real"), agents.join("linked")).unwrap();
+        assert_eq!(employee_dirs::record_marker(f.home(), &agents, "linked", &f.alice), Err(employee_dirs::FOREIGN_DIR));
+        write_agent_dir(&agents, "file-link");
+        std::fs::remove_file(agents.join("file-link/SOUL.md")).unwrap();
+        std::os::unix::fs::symlink(f.home().join("elsewhere/real/SOUL.md"), agents.join("file-link/SOUL.md")).unwrap();
+        assert_eq!(employee_dirs::record_marker(f.home(), &agents, "file-link", &f.alice), Err(employee_dirs::FOREIGN_DIR));
+    }
+    // A live confirmed employee's directory is never re-proposed into.
+    let (_, _) = applied_personal(&f, 7, "alice-live", &f.alice);
+    write_agent_dir(&agents, "alice-live");
+    employee_dirs::record_marker(f.home(), &agents, "alice-live", &f.alice).unwrap();
+    assert_eq!(employee_dirs::adopt_existing(f.home(), &agents, "alice-live", &f.alice), Err(LABEL_TAKEN));
+}
+
+/// SR2 1b: a retry of this flow for the same owner adopts its own
+/// directory while marker and digest match; any later change refuses.
+#[test]
+fn propose_retry_accepts_own_marker() {
+    let f = fixture();
+    let home = f.home();
+    let agents = home.join("agents");
+    write_agent_dir(&agents, LABEL);
+    employee_dirs::record_marker(home, &agents, LABEL, &f.alice).unwrap();
+    assert_eq!(employee_dirs::adopt_existing(home, &agents, LABEL, &f.alice), Ok(()));
+    let dir = agents.join(LABEL);
+    let changes: [(&str, &dyn Fn(), &dyn Fn()); 5] = [
+        ("SOUL.md", &|| std::fs::write(dir.join("SOUL.md"), "# someone else\n").unwrap(),
+            &|| std::fs::write(dir.join("SOUL.md"), SOUL).unwrap()),
+        ("CONTRACT.toml", &|| std::fs::write(dir.join("CONTRACT.toml"), "[boundaries]\n").unwrap(),
+            &|| std::fs::remove_file(dir.join("CONTRACT.toml")).unwrap()),
+        ("skill contents", &|| std::fs::write(dir.join("SKILLS/notes/SKILL.md"), "# changed\n").unwrap(),
+            &|| std::fs::write(dir.join("SKILLS/notes/SKILL.md"), "# notes\n").unwrap()),
+        ("skill listing", &|| std::fs::write(dir.join("SKILLS/extra.md"), "").unwrap(),
+            &|| std::fs::remove_file(dir.join("SKILLS/extra.md")).unwrap()),
+        ("org entry", &|| { duduclaw_core::org_store::upsert(home, LABEL,
+            duduclaw_core::org_store::OrgEntry::new("ceo", "")).unwrap(); },
+            &|| { duduclaw_core::org_store::remove(home, LABEL).unwrap(); }),
+    ];
+    for (what, change, revert) in changes {
+        change();
+        assert_eq!(employee_dirs::adopt_existing(home, &agents, LABEL, &f.alice), Err(employee_dirs::FOREIGN_DIR), "{what}");
+        revert();
+        assert_eq!(employee_dirs::adopt_existing(home, &agents, LABEL, &f.alice), Ok(()), "{what}");
+    }
+    // Staging with the matching marker succeeds (Pending, never approved).
+    let now = 10_000;
+    let mut prepared = personal_prepared(&f, LABEL, now);
+    prepared.adopt = Some(agents.clone());
+    let staged = stage_prepared(home, Some(&proof(now)), &f.bob, &prepared, "{}", now).unwrap();
+    assert_eq!(staged["status"], "pending");
+    assert_eq!(employee_items(home, LABEL).len(), 1);
+}
+
+/// SR2 1c: template (and pack-install) creation is refused in protected
+/// mode before any write, pointing to the proposal path.
+#[tokio::test]
+async fn templates_create_refused_in_protected_mode() {
+    let refused = protected_create_refusal(true).expect("refused in protected mode");
+    assert_eq!(error_of(&refused), DIRECT_CREATE_REFUSED);
+    assert!(protected_create_refusal(false).is_none());
+    if crate::runtime_readiness::is_protected_linux() {
+        let f = fixture();
+        let handler = MethodHandler::new(f.home().to_path_buf()).await;
+        let admin = caller(&f.bob, UserRole::Admin);
+        let frame = handler.handle_templates_create_agent(json!({"role_id": "sales-rep", "name": "tpl-agent"}), &admin).await;
+        assert_eq!(error_of(&frame), DIRECT_CREATE_REFUSED);
+        assert!(!f.home().join("agents/tpl-agent").exists());
+    }
+}
+
+/// SR2 3: at most MAX_REQUESTS_PER_DAY staff requests per user in 24 h,
+/// whatever happened to them; a purge does not reset the window.
+#[test]
+fn staff_request_rate_limited() {
+    let f = fixture();
+    let reject = |value: &Value| {
+        let mut store = open_confirmations(f.home()).unwrap();
+        let pending = latest(&items(f.home()), request_id(value)).unwrap().binding;
+        store.reject_pending(&[pending], &decision_session(), [2; 32], 100).unwrap();
+    };
+    for i in 0..MAX_REQUESTS_PER_DAY {
+        let value = request(&f, &f.alice, &format!("alice-r{i}")).unwrap();
+        reject(&value);
+    }
+    // Nothing is open, yet the eleventh request in 24 hours is refused.
+    assert_eq!(request(&f, &f.alice, "alice-next"), Err(RATE_LIMITED));
+    assert!(employee_items(f.home(), "alice-next").is_empty());
+    // The limit is per user.
+    request(&f, &f.bob, "bob-r0").unwrap();
+
+    // Admin purge (step-up) removes the closed requests and their index rows
+    // only; the open one stays. It does not reset the rate limit.
+    let now = 10_000;
+    let purge = |user: &str, csrf: [u8; 32], at: i64| purge_requests(f.home(), Some(&proof(now)), user,
+        PurgeRequest { csrf_token: csrf }, at);
+    assert!(purge(&f.bob, [8; 32], now).is_err());
+    assert!(purge(&f.bob, CSRF, now + 301).is_err());
+    let purged = purge(&f.bob, CSRF, now).unwrap();
+    assert_eq!((purged["purged"].as_u64(), purged["index_rows_removed"].as_u64()),
+        (Some(u64::from(MAX_REQUESTS_PER_DAY)), Some(u64::from(MAX_REQUESTS_PER_DAY))));
+    assert_eq!(list_own_requests(f.home(), &f.alice).unwrap()["requests"], json!([]));
+    assert_eq!(list_own_requests(f.home(), &f.bob).unwrap()["requests"].as_array().unwrap().len(), 1);
+    assert_eq!(purge(&f.bob, CSRF, now).unwrap()["purged"], 0);
+    assert_eq!(request(&f, &f.alice, "alice-next"), Err(RATE_LIMITED));
+    // Once those requests are older than 24 hours they no longer count.
+    sql(f.home(), APPLY_DB, "UPDATE personal_employee_request_log SET created_at=created_at-86400 WHERE owner_user_id=?1",
+        &[&f.alice]);
+    assert!(request(&f, &f.alice, "alice-next").is_ok());
+}
+
+/// SR2 4: the tombstone moves the employee's directory into a private
+/// quarantine (atomic rename) and drops its creation marker, so a former
+/// owner's data never passes to a new owner; a failed move refuses.
+#[test]
+fn tombstone_quarantines_directory() {
+    let f = fixture();
+    let (_, receipt) = applied_personal(&f, 0xab, LABEL, &f.alice);
+    let agents = f.home().join("agents");
+    write_agent_dir(&agents, LABEL);
+    employee_dirs::record_marker(f.home(), &agents, LABEL, &f.alice).unwrap();
+    let employee = hex::encode(receipt.employee.0);
+    let input = || -> TombstoneRequest {
+        serde_json::from_value(json!({"label": LABEL, "employee_id": employee, "csrf_token": CSRF})).unwrap()
+    };
+    let now = 10_000;
+    tombstone(f.home(), Some(&proof(now)), &f.bob, input(), now).unwrap();
+    assert!(!agents.join(LABEL).exists());
+    let quarantined = lifecycle::quarantine_path(f.home(), LABEL, receipt.employee);
+    assert_eq!(quarantined, f.home().join("isolation-quarantine").join(format!("{employee}-{LABEL}")));
+    assert_eq!(std::fs::read_to_string(quarantined.join("SOUL.md")).unwrap(), SOUL);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [f.home().join("isolation-quarantine"), quarantined.clone()] {
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700, "{}", path.display());
+        }
+    }
+    assert_eq!((mirror(f.home(), LABEL), members(&f, LABEL)), (None, 0));
+    // The marker is gone: a directory appearing under the label later is
+    // never adopted by a new Personal proposal ...
+    write_agent_dir(&agents, LABEL);
+    assert_eq!(employee_dirs::adopt_existing(f.home(), &agents, LABEL, &f.alice), Err(employee_dirs::FOREIGN_DIR));
+    // ... and a replayed tombstone never moves it.
+    tombstone(f.home(), Some(&proof(now)), &f.bob, input(), now).unwrap();
+    assert!(agents.join(LABEL).exists());
+
+    // Fail closed: the quarantine target already exists, so nothing moves
+    // and the employee stays live (row, mirror and owner binding intact).
+    let f = fixture();
+    let (_, receipt) = applied_personal(&f, 0xcd, LABEL, &f.alice);
+    let agents = f.home().join("agents");
+    write_agent_dir(&agents, LABEL);
+    let blocked = lifecycle::quarantine_path(f.home(), LABEL, receipt.employee);
+    std::fs::create_dir_all(&blocked).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(f.home().join("isolation-quarantine"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let input: TombstoneRequest = serde_json::from_value(json!({"label": LABEL,
+        "employee_id": hex::encode(receipt.employee.0), "csrf_token": CSRF})).unwrap();
+    assert_eq!(tombstone(f.home(), Some(&proof(now)), &f.bob, input, now).err(), Some(STORE_UNAVAILABLE));
+    assert!(agents.join(LABEL).join("SOUL.md").exists());
+    assert_eq!((mirror(f.home(), LABEL).as_deref(), members(&f, LABEL)), (Some(f.alice.as_str()), 1));
+    assert_eq!(admin_list(f.home()).unwrap()["employees"][0]["disabled"], false);
+}
+
+/// SR2 6: the propose steps take the request path's apply.db lock and
+/// recheck the label, so two open proposals for one label cannot coexist.
+#[test]
+fn propose_label_lock_prevents_duplicates() {
+    let f = fixture();
+    let now = 10_000;
+    let shared = || propose_input(json!({"label": "team-desk", "binding_kind": "shared", "csrf_token": CSRF}));
+    // Both prepared before either is staged (two admins, or a double submit).
+    let first = prepare_propose(f.home(), &f.users, Some(&proof(now)), &f.bob, shared(), now).unwrap();
+    let second = prepare_propose(f.home(), &f.users, Some(&proof(now)), &f.bob, shared(), now).unwrap();
+    stage_prepared(f.home(), Some(&proof(now)), &f.bob, &first, "{}", now).unwrap();
+    assert_eq!(stage_prepared(f.home(), Some(&proof(now)), &f.bob, &second, "{}", now).err(), Some(LABEL_PENDING));
+    assert_eq!(employee_items(f.home(), "team-desk").len(), 1);
+    // A staff request staged in between wins over the earlier preparation.
+    let prepared = personal_prepared(&f, LABEL, now);
+    request(&f, &f.alice, LABEL).unwrap();
+    assert_eq!(stage_prepared(f.home(), Some(&proof(now)), &f.bob, &prepared, "{}", now).err(), Some(LABEL_PENDING));
+    assert_eq!(employee_items(f.home(), LABEL).iter().filter(|item| is_open_employee(item)).count(), 1);
+    // Preparing the request itself still supersedes it (revision 2).
+    let value = list_own_requests(f.home(), &f.alice).unwrap()["requests"][0].clone();
+    let from_request = prepare_propose(f.home(), &f.users, Some(&proof(now)), &f.bob, propose_input(json!({
+        "label": LABEL, "binding_kind": "personal", "request_id": value["request_id"], "csrf_token": CSRF})), now).unwrap();
+    let staged = stage_prepared(f.home(), Some(&proof(now)), &f.bob, &from_request, "{}", now).unwrap();
+    assert_eq!(staged["revision"], 2);
+    assert_eq!(employee_items(f.home(), LABEL).iter().filter(|item| is_open_employee(item)).count(), 1);
+}

@@ -147,9 +147,10 @@ pub(crate) async fn send_to_agent_with_ctx(
                 caller, target, prompt, trust_turn_id.as_deref(), trust_session_id.as_deref(),
                 lane.as_deref(), outgoing_depth, Some(origin), reply_channel.as_deref(),
                 Some(caller), upstream_dropped, 0, false, on_behalf_of.as_deref());
-            if duduclaw_gateway::isolation_background::record_delegation(home_dir, caller,
-                &call.context, target, &msg_id, &material).await.is_err() {
-                return tool_error("這次委派的授權已失效，請由原交辦人重新交辦。");
+            if let Err(error) = duduclaw_gateway::isolation_background::record_delegation(home_dir, caller,
+                &call.context, target, &msg_id, &material).await {
+                // A Personal source waits for its owner's approval card (SR2).
+                return tool_error(error.user_message().unwrap_or("這次委派的授權已失效，請由原交辦人重新交辦。"));
             }
         }
         let writer_admission = admission.clone();

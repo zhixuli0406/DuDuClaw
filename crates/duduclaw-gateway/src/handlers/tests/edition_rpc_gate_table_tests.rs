@@ -63,8 +63,12 @@ fn enterprise_surfaces_are_listed() {
         "isolation.employee_list",
         "isolation.employee_propose",
         "isolation.employee_tombstone",
+        "isolation.employee_purge_requests",
         "me.isolation.request_personal_employee",
         "me.isolation.list_personal_employee_requests",
+        // SR2: Personal → Shared delegation owner cards
+        "me.isolation.list_personal_delegations",
+        "me.isolation.decide_personal_delegation",
     ] {
         assert!(
             is_enterprise_only_method(method),

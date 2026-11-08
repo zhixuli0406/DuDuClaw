@@ -249,14 +249,24 @@ pub(crate) fn remove_personal_mirror(home: &Path, label: &str, owner: &str) -> R
 /// owner with a transfer). The caller must already have verified a live
 /// Admin with step-up; this function performs no authorization.
 ///
-/// 1. In one apply.db transaction, the confirmed row of exactly `employee`
-///    is marked disabled. From then on every lifecycle read is `Tombstoned`
-///    and no later apply step can revive it (`checked_tenant` refuses).
+/// 1. In one apply.db transaction (writer lock held throughout), the
+///    employee's `agents/<label>` directory is first moved into
+///    [`QUARANTINE_DIR`]`/<employee id>-<label>` (0700) by an atomic
+///    same-filesystem rename (SR2 finding 4); a failed move refuses the
+///    whole tombstone and the row stays live. Then the confirmed row of
+///    exactly `employee` is marked disabled and the proposal flow's creation
+///    marker for the label is deleted. From then on every lifecycle read is
+///    `Tombstoned`, no later apply step can revive it (`checked_tenant`
+///    refuses), and a later Personal proposal for the label never adopts a
+///    directory: the former owner's data never passes to a new owner and no
+///    directory is reused across employee ids.
 /// 2. The users.db mirror and all bindings of the agent are removed.
 ///
 /// The two stores cannot share a transaction; the order fails closed: if
 /// step 2 fails the employee is already unusable and the lingering mirror
-/// still blocks every other binding. Retrying is idempotent.
+/// still blocks every other binding. Retrying is idempotent (an already
+/// quarantined directory is not moved again; an already disabled row never
+/// moves a directory that appeared under the label afterwards).
 ///
 /// Not done here: root-side disable of an Applied allocation (UID, storage)
 /// has no allocator action yet; the root resources stay reserved.
@@ -274,16 +284,80 @@ pub(crate) fn tombstone_personal_employee(home: &Path, label: &str, employee: Em
         if prior.employee != employee { return Err(Stale); }
         let Some(EmployeeBinding::Personal(owner)) = prior.principal_binding.clone() else { return Err(Denied) };
         if !prior.disabled {
+            quarantine_agent_dir(home, label, employee)?;
             let mut dead = prior;
             dead.disabled = true;
             let changed = tx.execute("UPDATE confirmed_employees SET receipt=?1 WHERE label=?2 AND receipt=?3",
                 params![serde_json::to_string(&dead).map_err(|_| Unavailable)?, label, encoded]).map_err(|_| Unavailable)?;
             if changed != 1 { return Err(Stale); }
         }
+        let markers: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='employee_dir_markers')",
+            [], |r| r.get(0)).map_err(|_| Unavailable)?;
+        if markers {
+            tx.execute("DELETE FROM employee_dir_markers WHERE label=?1", [label]).map_err(|_| Unavailable)?;
+        }
         tx.commit().map_err(|_| Unavailable)?;
         owner
     };
     remove_personal_mirror(home, label, owner.as_str()).map(|_| ())
+}
+
+/// Private quarantine for tombstoned Personal employees' directories,
+/// directly in the DuDuClaw home (same filesystem as `agents/`).
+pub(crate) const QUARANTINE_DIR: &str = "isolation-quarantine";
+
+/// Where the tombstone of `employee` puts its `agents/<label>` directory.
+pub(crate) fn quarantine_path(home: &Path, label: &str, employee: EmployeeId) -> std::path::PathBuf {
+    home.join(QUARANTINE_DIR).join(format!("{}-{label}", hex::encode(employee.0)))
+}
+
+/// SR2 finding 4: move `agents/<label>` (whatever it is; `rename` never
+/// follows a symlink) to [`quarantine_path`] with one `rename(2)`. Absent
+/// source: nothing to move (never created, or moved by an earlier attempt).
+/// The quarantine root must be a real directory owned by this uid with no
+/// group/other access; an existing target is never overwritten; a cross-
+/// filesystem or any other rename failure is `Unavailable` (fail closed).
+fn quarantine_agent_dir(home: &Path, label: &str, employee: EmployeeId) -> Result<(), LifecycleError> {
+    use LifecycleError::Unavailable;
+    let source = home.join("agents").join(label);
+    match std::fs::symlink_metadata(&source) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(Unavailable),
+        Ok(_) => {}
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let root = home.join(QUARANTINE_DIR);
+        match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(Unavailable),
+        }
+        let metadata = std::fs::symlink_metadata(&root).map_err(|_| Unavailable)?;
+        if !metadata.file_type().is_dir() || metadata.uid() != nix::unistd::geteuid().as_raw()
+            || metadata.mode() & 0o077 != 0 {
+            return Err(Unavailable);
+        }
+        let target = quarantine_path(home, label, employee);
+        match std::fs::symlink_metadata(&target) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(Unavailable),
+        }
+        std::fs::rename(&source, &target).map_err(|_| Unavailable)?;
+        // The moved entry itself: never chmod through a symlink.
+        if std::fs::symlink_metadata(&target).map_err(|_| Unavailable)?.file_type().is_dir() {
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).map_err(|_| Unavailable)?;
+        }
+        for directory in [root, home.join("agents")] {
+            if let Ok(handle) = std::fs::File::open(&directory) { let _ = handle.sync_all(); }
+        }
+        tracing::info!(agent = label, "tombstoned personal employee directory moved to quarantine");
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    { let _ = employee; Err(Unavailable) }
 }
 
 fn valid_label(label: &str) -> bool {

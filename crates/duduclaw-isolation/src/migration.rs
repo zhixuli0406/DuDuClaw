@@ -11,6 +11,9 @@ pub const MAX_IMPORT_STREAM_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_IMPORT_RECORDS: u64 = 100_000;
 pub const MAX_PROPOSAL_VALUE_BYTES: usize = 64 * 1024;
 pub const MAX_PROPOSAL_FIELDS: usize = 128;
+/// Employee proposals in one migration import, and (SR2) open Employee
+/// proposals in the confirmation store at once: closed (applied, failed,
+/// rejected, expired) proposals no longer count toward it.
 pub const DEFAULT_EMPLOYEE_PROPOSAL_LIMIT: u32 = 200;
 pub const CONFIRMATION_STEP_UP_SECONDS: u64 = 5 * 60;
 pub const SETUP_TOKEN_TTL_SECONDS: u64 = 30 * 60;

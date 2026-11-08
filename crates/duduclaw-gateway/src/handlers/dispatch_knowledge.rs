@@ -401,6 +401,14 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_experts_list()).await
             }
+            // SR2 1c: pack installs write new `agents/<id>` directories (or
+            // replace one); in native Linux protected mode employees exist
+            // only through the Employee proposal path.
+            "experts.install" | "experts.install_builtin" | "experts.install_draft"
+                if crate::runtime_readiness::is_protected_linux() => {
+                require_admin!();
+                WsFrame::error_response("", super::isolation_employee_rpc::DIRECT_CREATE_REFUSED)
+            }
             "experts.install" => {
                 require_admin!();
                 boxed_frame(|| self.handle_experts_install(params)).await

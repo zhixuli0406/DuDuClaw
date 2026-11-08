@@ -524,6 +524,9 @@ pub(crate) async fn visible_tools_in_lane(
 
     tools()
         .filter(|t| crate::mcp_isolation::tool_allowed(t.name, principal))
+        // SR2 1a: refused on every transport in native Linux protected mode,
+        // so it is not listed there either (discoverable ⇔ callable).
+        .filter(|t| t.name != "create_agent" || !duduclaw_gateway::runtime_readiness::is_protected_linux())
         .filter(|t| !matches!(t.name, "meeting_transcribe" | "meeting_transcribe_status" | "meeting_transcribe_cancel" | "meeting_upload_link") || meeting_listed(home_dir, principal))
         .filter(|t| background_allowed || !super::creates_background_work(t.name))
         .filter(|t| {

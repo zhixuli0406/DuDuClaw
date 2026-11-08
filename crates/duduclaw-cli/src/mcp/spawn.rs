@@ -597,7 +597,8 @@ async fn persist_spawn_authority(home: &Path, caller: &str, entry: &Value)
     let (id, target, material) = spawn_authority_material(caller, entry)?;
     duduclaw_gateway::isolation_background::record_bus_delegation(home, caller,
         &call.context, &target, &id, &material).await
-        .map_err(|_| "這次委派的授權已失效，或目標員工尚未完成隔離確認。".into())
+        // A Personal source waits for its owner's approval card (SR2).
+        .map_err(|error| error.user_message().unwrap_or("這次委派的授權已失效，或目標員工尚未完成隔離確認。").into())
 }
 
 /// Keep this shape identical to the legacy dispatcher's BusMessage projection.

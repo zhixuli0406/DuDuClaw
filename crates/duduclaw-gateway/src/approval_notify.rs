@@ -216,6 +216,8 @@ pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
         || kind == crate::approval::WORKFLOW_ACTIVATION_KIND
         || kind == crate::expert_skills::SKILLS_ACTION_KIND
         || kind == crate::agent_files::approval::ACTION_KIND
+        // SR2: decided only by the Personal employee's owner on the dashboard.
+        || kind == crate::isolation_background::PERSONAL_DELEGATION_KIND
         || crate::approval::operator_cli_gate::spec_for(kind).is_some()
 }
 

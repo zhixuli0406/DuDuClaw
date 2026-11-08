@@ -118,6 +118,60 @@ fn bulk_rejection_is_atomic_and_never_publishes_high_risk_authority() {
     assert!(!store.incomplete().unwrap());
 }
 
+/// SR2 finding 3: rejected/expired Employee proposals stop holding a quota
+/// slot; open ones (pending, approved, applying, rejecting) still do.
+#[test]
+fn employee_quota_counts_open_only() {
+    let mut store = store();
+    let limit = DEFAULT_EMPLOYEE_PROPOSAL_LIMIT as u16;
+    let staged: Vec<_> = (0..limit).map(|id| stage(&mut store, id, ConfirmationCategory::Employee)).collect();
+    let fields = || vec![text("employee_id", "employee"), text("runtime", "codex")];
+    assert!(matches!(store.stage_proposal(operation(limit), ConfirmationCategory::Employee, fields(), &Valid),
+        Err(ConfirmationError::Limit)));
+    // An approved (still open) proposal keeps its slot.
+    approve(&mut store, &staged[0]);
+    assert!(matches!(store.stage_proposal(operation(limit), ConfirmationCategory::Employee, fields(), &Valid),
+        Err(ConfirmationError::Limit)));
+    // A rejected one frees it, exactly once.
+    store.reject_pending(&[staged[1].binding], &session(), [7; 32], 101).unwrap();
+    store.stage_proposal(operation(limit), ConfirmationCategory::Employee, fields(), &Valid).unwrap();
+    assert!(matches!(store.stage_proposal(operation(limit + 1), ConfirmationCategory::Employee, fields(), &Valid),
+        Err(ConfirmationError::Limit)));
+    // A revision of an open proposal is never refused by the quota.
+    let next = ProposalOperationId { proposal_id: staged[2].binding.operation_id.proposal_id, revision: 2 };
+    store.stage_proposal(next, ConfirmationCategory::Employee, vec![text("employee_id", "employee"),
+        text("runtime", "claude")], &Valid).unwrap();
+    // Other categories are not counted against it.
+    stage(&mut store, limit + 2, ConfirmationCategory::Department);
+}
+
+/// SR2 finding 3: only never-applied, closed Employee proposals are purged,
+/// and only with the Admin step-up session.
+#[test]
+fn purge_closed_employee_removes_only_untouched_rejected_proposals() {
+    let mut store = store();
+    let rejected = stage(&mut store, 1, ConfirmationCategory::Employee);
+    let pending = stage(&mut store, 2, ConfirmationCategory::Employee);
+    let department = stage(&mut store, 3, ConfirmationCategory::Department);
+    let applied = stage(&mut store, 4, ConfirmationCategory::Employee);
+    store.reject_pending(&[rejected.binding, department.binding], &session(), [7; 32], 101).unwrap();
+    approve(&mut store, &applied);
+    let mut adapter = Adapter::default();
+    for _ in 0..3 { store.apply_next(&applied.binding, &mut adapter).unwrap(); }
+    let ids: Vec<_> = [&rejected, &pending, &department, &applied].iter()
+        .map(|item| item.binding.operation_id.proposal_id).collect();
+    // No step-up, wrong CSRF: refused, nothing removed.
+    let stale = ApprovalSession::from_verified_session(true, true, Some(100), [7; 32], RequestId([1; 16]));
+    assert!(store.purge_closed_employee(&ids, &stale, [7; 32], 401).is_err());
+    assert!(store.purge_closed_employee(&ids, &session(), [8; 32], 101).is_err());
+    assert_eq!(store.list().unwrap().len(), 4);
+    assert_eq!(store.purge_closed_employee(&ids, &session(), [7; 32], 101).unwrap(), 1);
+    let left: Vec<_> = store.list().unwrap().into_iter().map(|item| item.binding.operation_id.proposal_id).collect();
+    assert_eq!(left, vec![ids[1], ids[2], ids[3]]);
+    // Idempotent.
+    assert_eq!(store.purge_closed_employee(&ids, &session(), [7; 32], 101).unwrap(), 0);
+}
+
 #[test]
 fn existing_store_open_never_creates_a_missing_database() {
     let dir = tempfile::tempdir().unwrap();

@@ -132,8 +132,15 @@ pub(crate) use boot::{record_authorization, delegation_source};
 pub use boot::test_support;
 
 #[cfg(target_os = "linux")]
-pub use boot::{human_authorization, BootSources, BootStatus, MissingProducer, DispatcherFactory, DispatcherInput, LaunchInput,
+pub use boot::{BootSources, BootStatus, MissingProducer, DispatcherFactory, DispatcherInput, LaunchInput,
     install_boot_sources, install_dispatcher_factory, boot_protected, boot_status, prepare_launch};
+/// SR2 finding 8: the direct human capability constructor is not a public
+/// API; production issues capabilities through `record_authorization` and
+/// the boot issuer. Only tests and the test-support fixtures may name it.
+#[cfg(target_os = "linux")]
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use boot::human_authorization;
 #[cfg(not(target_os = "linux"))]
 pub async fn boot_protected(_: &std::path::Path, _: std::sync::Arc<duduclaw_auth::UserDb>,
     _: std::sync::Arc<AgentAdmission>) {}

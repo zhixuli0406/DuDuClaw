@@ -209,7 +209,7 @@ pub(crate) fn current() -> Option<Arc<IsolatedCall>> {
 
 pub(crate) async fn refusal_message(home: &std::path::Path,
     reason: crate::mcp_isolation_disposition::Refusal) -> &'static str {
-    if reason == crate::mcp_isolation_disposition::Refusal::HostAuthority { return reason.message(); }
+    if reason != crate::mcp_isolation_disposition::Refusal::ForkNextRelease { return reason.message(); }
     let language = duduclaw_gateway::prompt_identity::read_default_language(home).await;
     reason.message_for_language(language.as_deref())
 }

@@ -360,6 +360,9 @@ fn recheck_issuance_facts(agent: &str, lifecycle: &EmployeeLifecycle,
 /// must authenticate these facts. Lifecycle and users.db are rechecked after
 /// resource I/O. No MCP, environment or deserialization entry point.
 /// Inventory tests call this exact constructor, never append resource grants.
+/// SR2 finding 8: tests and `test-support` only; production goes through
+/// `record_authorization` / the boot issuer (`human_authorization_with`).
+#[cfg(any(test, feature = "test-support"))]
 pub fn human_authorization(home: PathBuf, agent: String, employee: EmployeeId,
     user: String, epoch: u64, lane: duduclaw_isolation::capability::Lane,
     current: &duduclaw_auth::IsolationAuthoritySnapshot,
@@ -410,12 +413,11 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
     // Root/store reads and resource resolution may race with handover or
     // revocation. Re-read the pinned lifecycle, then the latest users.db facts.
     lifecycle::recheck_with(&home, lifecycle, root).map_err(lifecycle_refusal)?;
-    let path = home.join("users.db");
-    if !std::fs::symlink_metadata(&path).map_err(|_| VerificationError::Unavailable)?.file_type().is_file() {
-        return Err(VerificationError::Unavailable);
-    }
-    let mut users = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    // SR2 finding 7: the hardened private-SQLite opener, as on every
+    // lifecycle path (no-follow walk, owner/mode/link/inode checks).
+    let mut users = crate::fs_safe::sqlite::open_existing(&home, "users.db", crate::fs_safe::sqlite::Access::ReadOnly)
         .map_err(|_| VerificationError::Unavailable)?;
+    users.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| VerificationError::Unavailable)?;
     let after = duduclaw_auth::read_isolation_authority(&mut users, Some(&user), &agent)
         .map_err(|_| VerificationError::Revoked)?;
     recheck_issuance_facts(&agent, lifecycle, &principal, epoch, current, &after, turn.background.is_some())?;

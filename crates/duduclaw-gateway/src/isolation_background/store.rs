@@ -1,6 +1,6 @@
 //! Gateway-private receipt storage. Records contain no bearer credential.
 use std::path::Path;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use duduclaw_isolation::capability::EmployeeBinding;
@@ -66,11 +66,39 @@ pub(super) fn validate_current(value: &RecordAuthority) -> Result<(), Verificati
     Ok(())
 }
 
-pub(super) fn load(home: &Path, kind: &str, id: &str) -> Result<Option<RecordAuthority>, VerificationError> {
-    let path = home.join("isolation_background.db");
-    if !path.try_exists().map_err(|_| unavailable())? { return Ok(None); }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_| unavailable())?;
+const STORE: &str = "isolation_background.db";
+const APPROVALS: &str = "approvals.db";
+
+/// SR2 finding 7: the receipt store and approvals.db are opened only through
+/// the private-SQLite openers (no-follow walk, owner/mode/link/inode checks
+/// on the database and its sidecars, `SQLITE_OPEN_NOFOLLOW`). `None` when the
+/// database does not exist; any other refusal is `Unavailable`.
+fn open_read_only(home: &Path, name: &str) -> Result<Option<Connection>, VerificationError> {
+    match std::fs::symlink_metadata(home.join(name)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(unavailable()),
+        Ok(_) => {}
+    }
+    let conn = crate::fs_safe::sqlite::open_existing(home, name, crate::fs_safe::sqlite::Access::ReadOnly)
+        .map_err(|_| unavailable())?;
     conn.busy_timeout(std::time::Duration::from_millis(500)).map_err(|_| unavailable())?;
+    Ok(Some(conn))
+}
+
+/// Writable receipt store, created private (0600) when absent.
+fn open_writable(home: &Path) -> Result<Connection, VerificationError> {
+    #[cfg(unix)]
+    {
+        let conn = crate::fs_safe::sqlite::open(home, STORE).map_err(|_| unavailable())?;
+        conn.busy_timeout(std::time::Duration::from_millis(500)).map_err(|_| unavailable())?;
+        Ok(conn)
+    }
+    #[cfg(not(unix))]
+    { let _ = home; Err(unavailable()) }
+}
+
+pub(super) fn load(home: &Path, kind: &str, id: &str) -> Result<Option<RecordAuthority>, VerificationError> {
+    let Some(conn) = open_read_only(home, STORE)? else { return Ok(None) };
     let text: Option<String> = conn.query_row(
         "SELECT receipt FROM authorities WHERE kind=?1 AND record_id=?2 AND length(receipt)<=65536",
         params![kind, id], |row| row.get(0)).optional().map_err(|_| unavailable())?;
@@ -83,17 +111,44 @@ pub(super) fn load(home: &Path, kind: &str, id: &str) -> Result<Option<RecordAut
 }
 
 pub(super) fn save(value: &RecordAuthority) -> Result<(), VerificationError> {
+    save_with(value, None)
+}
+
+/// SR2 finding 2: store a new delegation receipt and consume the owner's
+/// single-use approval `approval` in the same transaction. An approval that
+/// was already consumed, or a delegation id that already has a receipt, is
+/// `Revoked` and nothing is written.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn save_consuming(value: &RecordAuthority, approval: &str) -> Result<(), VerificationError> {
+    if value.kind != "delegation" || approval.is_empty() || approval.len() > 128 {
+        return Err(VerificationError::Invalid);
+    }
+    save_with(value, Some(approval))
+}
+
+fn save_with(value: &RecordAuthority, consume: Option<&str>) -> Result<(), VerificationError> {
     // Never persist the pre-v1.81 form; it can only be replaced.
     validate_current(value)?;
     let text = serde_json::to_string(value).map_err(|_| unavailable())?;
     if text.len() > MAX_BYTES { return Err(VerificationError::Invalid); }
-    let mut conn = Connection::open(value.home.join("isolation_background.db")).map_err(|_| unavailable())?;
-    conn.busy_timeout(std::time::Duration::from_millis(500)).map_err(|_| unavailable())?;
+    let mut conn = open_writable(&value.home)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
         CREATE TABLE IF NOT EXISTS authorities(kind TEXT NOT NULL, record_id TEXT NOT NULL,
-          receipt TEXT NOT NULL CHECK(length(receipt)<=65536), PRIMARY KEY(kind,record_id));")
+          receipt TEXT NOT NULL CHECK(length(receipt)<=65536), PRIMARY KEY(kind,record_id));
+        CREATE TABLE IF NOT EXISTS personal_delegation_consumed(approval_id TEXT PRIMARY KEY,
+          record_id TEXT NOT NULL, consumed_at INTEGER NOT NULL);")
         .map_err(|_| unavailable())?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|_| unavailable())?;
+    if let Some(approval) = consume {
+        let used: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM personal_delegation_consumed WHERE approval_id=?1)
+                OR EXISTS(SELECT 1 FROM authorities WHERE kind=?2 AND record_id=?3)",
+            params![approval, value.kind, value.id], |row| row.get(0)).map_err(|_| unavailable())?;
+        if used { return Err(VerificationError::Revoked); }
+        tx.execute("INSERT INTO personal_delegation_consumed(approval_id,record_id,consumed_at) VALUES(?1,?2,?3)",
+            params![approval, value.id, i64::try_from(super::now()?).map_err(|_| VerificationError::InvalidTime)?])
+            .map_err(|_| unavailable())?;
+    }
     // An expired authority cannot authorize a live run or a descendant. Remove
     // it before counting so cancelled enqueue attempts cannot exhaust the store
     // permanently. The bounded capacity still applies to unexpired receipts.
@@ -110,9 +165,7 @@ pub(super) fn save(value: &RecordAuthority) -> Result<(), VerificationError> {
 }
 
 pub(super) fn check_approval(value: &RecordAuthority, approval: &str) -> Result<(), VerificationError> {
-    let conn = Connection::open_with_flags(value.home.join("approvals.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|_| unavailable())?;
-    conn.busy_timeout(std::time::Duration::from_millis(500)).map_err(|_| unavailable())?;
+    let conn = open_read_only(&value.home, APPROVALS)?.ok_or_else(unavailable)?;
     let (kind, agent, status, payload, decider, invalidated): (String, String, String, String, Option<String>, Option<String>) =
         conn.query_row("SELECT action_kind,agent_id,status,payload,decided_by,invalidated_reason
             FROM approvals WHERE id=?1 AND length(payload)<=131072
@@ -136,9 +189,7 @@ pub(super) fn check_approval(value: &RecordAuthority, approval: &str) -> Result<
 
 pub(super) fn approval_pending(value: &RecordAuthority) -> Result<bool, VerificationError> {
     let Some(approval) = &value.approval else { return Ok(false); };
-    let conn = Connection::open_with_flags(value.home.join("approvals.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|_| unavailable())?;
-    conn.busy_timeout(std::time::Duration::from_millis(500)).map_err(|_| unavailable())?;
+    let conn = open_read_only(&value.home, APPROVALS)?.ok_or_else(unavailable)?;
     conn.query_row("SELECT EXISTS(SELECT 1 FROM approvals WHERE id=?1 AND action_kind=?2
         AND status='pending' AND invalidated_reason IS NULL
         AND julianday('now') < julianday(created_at) + ttl_seconds / 86400.0)",
@@ -159,14 +210,14 @@ mod tests {
     }
     #[test]
     fn background_missing_receipt_does_not_create_store() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_safe::private_test_home().unwrap();
         assert!(load(home.path(), "cron", "missing").unwrap().is_none());
         assert!(!home.path().join("isolation_background.db").exists());
     }
 
     #[test]
     fn background_receipt_roundtrip_replacement_and_expired_reclamation() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_safe::private_test_home().unwrap();
         let mut first = super::super::tests::receipt(home.path());
         save(&first).unwrap();
         assert_eq!(load(home.path(), "cron", &first.id).unwrap(), Some(first.clone()));
@@ -185,7 +236,7 @@ mod tests {
 
     #[test]
     fn background_approval_requires_exact_payload_admin_decision_and_decision_window() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_safe::private_test_home().unwrap();
         let receipt = super::super::tests::receipt(home.path());
         let conn = Connection::open(home.path().join("approvals.db")).unwrap();
         conn.execute_batch("CREATE TABLE approvals(id TEXT,action_kind TEXT,agent_id TEXT,status TEXT,
