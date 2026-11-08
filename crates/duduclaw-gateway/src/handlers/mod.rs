@@ -240,6 +240,8 @@ mod computer_workspaces_rpc;
 mod isolation_recording_rpc;
 mod isolation_connectors_rpc;
 mod isolation_employee_rpc;
+// F6g: the v2 employee-dir digest and marker rules for the adoption engine.
+pub(crate) use isolation_employee_rpc::employee_dirs;
 mod computer_sessions_rpc;
 mod computer_team_rpc;
 mod computer_watch_links_rpc;

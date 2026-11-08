@@ -77,6 +77,9 @@ pub(crate) mod isolation_label_restore;
 // F6l root retire (F6 design r5 §3.12); the RPC/UI wiring is F6d/F6e.
 #[allow(dead_code)]
 pub(crate) mod isolation_retire;
+// F6g adoption under a new employee id (§3.10); the request RPCs are F6d's.
+#[allow(dead_code)]
+pub(crate) mod isolation_adopt;
 pub mod migration_import;
 pub mod migration_startup;
 

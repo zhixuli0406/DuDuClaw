@@ -13,12 +13,22 @@ impl EmployeeAuthority {
     fn validate_current(&self,item:&ConfirmationItem)->Result<()> {
         if item.status==ConfirmationStatus::Failed { return Err(Error::Denied); }
         let spec=allocation::specification(item).map_err(|_|Error::Invalid)?;
-        if item.fields.iter().any(|f| !matches!(f.name.as_str(),"employee_id"|"disk_bytes"|"settings"|"binding_kind"|"owner_id"|"tenant_id"))
+        if item.fields.iter().any(|f| !matches!(f.name.as_str(),"employee_id"|"disk_bytes"|"settings"|"binding_kind"|"owner_id"|"tenant_id"|"adopt_quarantine"))
             || !duduclaw_core::is_valid_agent_id(&spec.label) || duduclaw_core::is_reserved_agent_id(&spec.label) {return Err(Error::Denied);}
-        // F6h R7: approval and apply refuse a label held by a quarantine row (LABEL_QUARANTINED).
-        crate::isolation_label_stores::check_label_not_quarantined(&self.home,&spec.label,None).map_err(label_hold_error)?;
+        // F6g: an adoption proposal names its quarantine row (digest-covered).
+        let adopting=crate::isolation_adopt::proposal_ref(item).map_err(|_|Error::Invalid)?;
+        // F6h R7: approval and apply refuse a label held by a quarantine row
+        // (LABEL_QUARANTINED), except the row this adoption proposal names.
+        crate::isolation_label_stores::check_label_not_quarantined(&self.home,&spec.label,
+            adopting.as_ref().map(|adopt|(adopt.employee,adopt.incarnation))).map_err(label_hold_error)?;
         // Personal owner eligibility / Shared tenant pin, against users.db and apply.db.
         lifecycle::validate_proposed_binding(&self.home,&spec.label,spec.binding.as_ref()).map_err(lifecycle_error)?;
+        if let Some(adopt)=&adopting {
+            // The tree comes from the sealed row (or, once adopted, its marker), never the registry.
+            let approver=self.approver(item)?;
+            return self.with_adopt_env(&approver,|env| crate::isolation_adopt::validate_item(&self.home,env,item,adopt,&approver))
+                .map(|_|()).map_err(adopt_error);
+        }
         let expected:serde_json::Value=serde_json::from_str(text(item,"settings")?).map_err(|_|Error::Invalid)?;
         bounded(&self.live.handle,async {
             let registry=self.live.registry.read().await;
@@ -34,6 +44,38 @@ impl EmployeeAuthority {
     }
     fn exchange(&self,item:&ConfirmationItem,action:Action)->Result<Receipt>{exchange(item,action)}
     fn save(&self,item:&ConfirmationItem,receipt:&Receipt)->Result<()> {save_confirmed_receipt(&self.home,item,receipt)}
+    /// F6g: the live Admin while the card is Pending, else the actor of the
+    /// approval record (same rule as the retire card).
+    fn approver(&self,item:&ConfirmationItem)->Result<String> {
+        if item.status==ConfirmationStatus::Pending { return Ok(self.live.context.user_id.clone()); }
+        let store=duduclaw_migration::confirmation::ConfirmationStore::from_read_only_connection(
+            crate::fs_safe::sqlite::open_existing(&self.home,"migration-confirmations.db",crate::fs_safe::sqlite::Access::ReadOnly)
+                .map_err(|_|Error::Storage)?).map_err(|_|Error::Storage)?;
+        let actor=store.approver(&item.binding).map_err(|_|Error::Storage)?.ok_or(Error::Denied)?;
+        Ok(uuid::Uuid::from_bytes(actor.0).to_string())
+    }
+    /// F6g collaborators: schema-2 root, catalog routes, run stopper, the
+    /// F6c2 rule, and `agent_hook_installer` on the live runtime.
+    fn with_adopt_env<T>(&self,actor:&str,run:impl FnOnce(&crate::isolation_adopt::AdoptEnv<'_>)->T)->T {
+        let routes=crate::isolation_restore::CatalogRoutes(&self.home);
+        let handle=self.live.handle.clone();
+        let hooks=move |dir:&Path|->std::result::Result<(),()> {
+            let bin=crate::agent_hook_installer::resolve_duduclaw_bin();
+            bounded(&handle,crate::agent_hook_installer::ensure_agent_hook_settings(dir,&bin)).map_err(|_|())?.map(|_|()).map_err(|_|())
+        };
+        let env=crate::isolation_adopt::AdoptEnv { root:&crate::isolation_retire::SpawndRetireRoot, routes:&routes,
+            runs:&crate::isolation_quarantine::SpawndRunStopper, rule:&duduclaw_auth::admin_approval_rule::EligibilityLogRule,
+            hooks:&hooks, agent_cap:0, actor, now:chrono::Utc::now().timestamp() };
+        run(&env)
+    }
+}
+fn adopt_error(e:crate::isolation_adopt::AdoptError)->Error {
+    use crate::isolation_adopt::AdoptError as A;
+    match e {
+        A::Unavailable | A::Restore(crate::isolation_restore::Refusal::Unavailable) => Error::Storage,
+        A::SettingsChanged | A::DigestMismatch => Error::Stale,
+        _ => Error::Denied,
+    }
 }
 
 /// Apply bookkeeping for one root receipt. A Personal allocation also writes
@@ -108,11 +150,27 @@ impl MigrationAuthorityBackend for EmployeeAuthority {
     fn validate(&self,item:&ConfirmationItem)->Result<()>{if !self.supports(item.category){return Err(Error::Denied)}self.validate_current(item)}
     fn stage(&self,item:&ConfirmationItem)->Result<()>{
         self.validate(item)?;
-        let receipt=self.exchange(item,Action::Allocate)?;self.save(item,&receipt)
+        let receipt=self.exchange(item,Action::Allocate)?;
+        if crate::isolation_adopt::proposal_ref(item).map_err(|_|Error::Invalid)?.is_some() {
+            // F6g §3.10 steps 4–5: transform, re-key, marker, confirmed row, commit.
+            let approver=self.approver(item)?;
+            let mut save=||self.save(item,&receipt).map_err(|_|());
+            return self.with_adopt_env(&approver,|env| crate::isolation_adopt::apply_item(&self.home,env,item,&receipt,&approver,&mut save))
+                .map(|_|()).map_err(adopt_error);
+        }
+        self.save(item,&receipt)
     }
     fn publish(&self,item:&ConfirmationItem)->Result<()>{self.validate(item)?;let receipt=self.exchange(item,Action::ReadBack)?;self.save(item,&receipt)}
     fn read_back(&self,item:&ConfirmationItem)->Result<()>{self.publish(item)}
-    fn disable(&self,item:&ConfirmationItem)->Result<()>{let receipt=self.exchange(item,Action::Disable)?;self.save(item,&receipt)}
+    fn disable(&self,item:&ConfirmationItem)->Result<()>{
+        let receipt=self.exchange(item,Action::Disable)?;self.save(item,&receipt)?;
+        // F6g §3.10 step 6: the moved entries go back, the row needs a reseal.
+        if crate::isolation_adopt::proposal_ref(item).map_err(|_|Error::Compensation)?.is_some() {
+            let actor=self.live.context.user_id.clone();
+            self.with_adopt_env(&actor,|env| crate::isolation_adopt::compensate_item(&self.home,env,item)).map_err(|_|Error::Compensation)?;
+        }
+        Ok(())
+    }
     fn readback_shared_employee(&self,agent:&str)->Result<()>{
         let (_,employee)=lifecycle::resolve(&self.home,agent,&lifecycle::RootAllocator).map_err(lifecycle_error)?;
         // Shared ACL/grant restoration never targets a Personal employee.

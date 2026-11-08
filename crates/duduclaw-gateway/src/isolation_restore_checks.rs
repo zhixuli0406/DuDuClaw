@@ -138,7 +138,7 @@ fn check_credentials(home: &Path, users: &Connection, q: &Quarantined, owner: &s
 }
 
 /// The owner side (Personal) and tenant, in one users.db read transaction.
-fn check_users(home: &Path, q: &Quarantined) -> Result<(), Refusal> {
+pub(crate) fn check_users(home: &Path, q: &Quarantined) -> Result<(), Refusal> {
     let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadOnly).map_err(from_lifecycle)?;
     let tx = users.transaction().map_err(unavailable)?;
     let tenant = duduclaw_auth::isolation::read_isolation_tenant(&tx).map_err(unavailable)?;
@@ -158,7 +158,7 @@ fn proposal_text<'a>(item: &'a ConfirmationItem, name: &str) -> Option<&'a str> 
 }
 
 /// No open Employee proposal names the label (`label_pending`).
-fn check_no_open_proposal(home: &Path, label: &str) -> Result<(), Refusal> {
+pub(crate) fn check_no_open_proposal(home: &Path, label: &str) -> Result<(), Refusal> {
     let store = duduclaw_migration::confirmation::ConfirmationStore::from_read_only_connection(
         lifecycle::open_store(home, CONFIRMATIONS_DB, Access::ReadOnly).map_err(from_lifecycle)?).map_err(unavailable)?;
     let items = store.list().map_err(unavailable)?;
@@ -184,7 +184,7 @@ pub(crate) fn check_target_absent(home: &Path, label: &str) -> Result<(), Refusa
 
 /// L2: the agent cap counts live confirmed employees; the restored one
 /// would be one more.
-fn check_quota(home: &Path, cap: usize) -> Result<(), Refusal> {
+pub(crate) fn check_quota(home: &Path, cap: usize) -> Result<(), Refusal> {
     if cap == 0 { return Ok(()); }
     let live = lifecycle::confirmed_entries(home, MAX_CONFIRMED).map_err(from_lifecycle)?.iter().filter(|e| !e.disabled).count();
     if live >= cap { Err(Refusal::QuotaExceeded) } else { Ok(()) }

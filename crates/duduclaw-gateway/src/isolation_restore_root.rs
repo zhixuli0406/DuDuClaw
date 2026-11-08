@@ -72,7 +72,7 @@ impl RootProbe for SpawndRootProbe {
         {
             use duduclaw_migration::allocation::{Action, Request};
             let nonce = duduclaw_migration::ids::RequestId(*uuid::Uuid::new_v4().as_bytes());
-            match allocation::transport::request(&Request { schema: 1, nonce, action: Action::ReadBack, item: item.clone() }) {
+            match allocation::transport::request(&Request { schema: 1, nonce, action: Action::ReadBack, item: item.clone(), approver: None }) {
                 Ok(receipt) => Ok(RootReadBack { receipt, phase: RootPhase::Ready, idle: None }),
                 Err(duduclaw_migration::Error::Authentication) => Err(RootError::Inconsistent),
                 Err(_) => Err(RootError::Transport),

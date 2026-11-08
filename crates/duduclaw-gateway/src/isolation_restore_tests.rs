@@ -598,3 +598,6 @@ fn restore_then_tombstone_purge_retire_frees_label() {
 
 #[path = "isolation_restore_recovery_tests.rs"]
 mod recovery;
+/// F6g adoption under a new employee id (same fixture and fakes).
+#[path = "isolation_adopt_tests.rs"]
+mod adopt;

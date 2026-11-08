@@ -64,7 +64,7 @@ pub(super) const METHODS: [&str; 8] = [REQUEST, MY_REQUESTS, LIST, PROPOSE, TOMB
     delegation::DELEGATIONS, delegation::DECIDE_DELEGATION];
 
 #[path = "isolation_employee_dirs.rs"]
-mod employee_dirs;
+pub(crate) mod employee_dirs;
 #[path = "isolation_employee_delegation.rs"]
 mod delegation;
 
@@ -148,6 +148,10 @@ struct ProposeRequest {
     /// A staff request to prepare instead of a new proposal.
     #[serde(default)]
     request_id: Option<String>,
+    /// F6g (§3.10 step 2): an adoption request (`employee_restores`) to turn
+    /// into the adoption proposal; its row names the principal.
+    #[serde(default)]
+    adoption_request_id: Option<String>,
     csrf_token: [u8; 32],
 }
 #[derive(serde::Deserialize)]
@@ -169,6 +173,8 @@ struct Prepared {
     /// Personal proposals (SR2 1b): the agents directory whose `<label>`
     /// entry must still carry this flow's creation marker at staging.
     adopt: Option<std::path::PathBuf>,
+    /// F6g: the adoption this proposal stages (no directory is created).
+    adoption: Option<crate::isolation_adopt::AdoptionPlan>,
 }
 
 impl MethodHandler {
@@ -290,6 +296,17 @@ impl MethodHandler {
                 prepare_propose(&home, &db, proof.as_ref(), &user, input, now)
             }).await?
         };
+        // F6g: the tree comes from the sealed quarantine row at apply; the
+        // settings were parsed from its transformed agent.toml.
+        if let Some(settings) = prepared.adoption.as_ref().map(|plan| plan.settings.clone()) {
+            let mut staged = blocking(move || {
+                let now = now()?;
+                let proof = db.migration_confirmation_session(&user, &session, epoch, now).map_err(|_| SESSION_EXPIRED)?;
+                stage_prepared(&home, proof.as_ref(), &user, &prepared, &settings, now)
+            }).await?;
+            staged["agent_created"] = json!(false);
+            return Ok(staged);
+        }
         // The product configuration comes from the normal writer and stays
         // inert until the approved proposal is allocated by the root. An
         // existing, unallocated Shared configuration (a retry, or an imported
@@ -447,7 +464,7 @@ impl ProposalValidator for StagingCheck<'_> {
         item.validate().map_err(|_| ConfirmationError::Invalid)?;
         let spec = allocation::specification(item).map_err(|_| ConfirmationError::Invalid)?;
         if item.fields.iter().any(|f| !matches!(f.name.as_str(),
-            "employee_id" | "disk_bytes" | "settings" | "binding_kind" | "owner_id" | "tenant_id")) {
+            "employee_id" | "disk_bytes" | "settings" | "binding_kind" | "owner_id" | "tenant_id" | "adopt_quarantine")) {
             return Err(ConfirmationError::Denied);
         }
         // A fresh product proposal always names its principal.
@@ -555,7 +572,7 @@ fn open_requests(home: &Path) -> Result<Connection, &'static str> {
         CREATE INDEX IF NOT EXISTS idx_personal_employee_request_log_owner
             ON personal_employee_request_log(owner_user_id, created_at);")
         .map_err(|_| STORE_UNAVAILABLE)?;
-    db.execute_batch(employee_dirs::MARKER_SCHEMA).map_err(|_| STORE_UNAVAILABLE)?;
+    crate::isolation_adopt::ensure_marker_schema(&db).map_err(|_| STORE_UNAVAILABLE)?;
     Ok(db)
 }
 
@@ -713,6 +730,7 @@ fn prepare_propose(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmatio
     input: ProposeRequest, now: i64) -> Result<Prepared, &'static str> {
     authorize_step_up(proof, user, &input.csrf_token, now)?;
     if !valid_label(&input.label) { return Err(LABEL_INVALID); }
+    if input.adoption_request_id.is_some() { return prepare_adoption(home, user, input, now); }
     // SR2 finding 6: the request path's apply.db writer lock, held across
     // the open-label check (and taken again by `stage_prepared`).
     let mut requests = open_requests(home)?;
@@ -743,7 +761,32 @@ fn prepare_propose(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmatio
         (None, None) => input.label.clone(),
     };
     lock.finish().map_err(|_| STORE_UNAVAILABLE)?;
-    Ok(Prepared { label: input.label, display_name, binding, request, csrf: input.csrf_token, adopt: None })
+    Ok(Prepared { label: input.label, display_name, binding, request, csrf: input.csrf_token, adopt: None, adoption: None })
+}
+
+/// F6g: an adoption request → proposal. The engine re-runs every check
+/// (before this step takes the apply.db writer lock); the principal is the
+/// quarantine row's, never a request field.
+fn prepare_adoption(home: &Path, user: &str, input: ProposeRequest, now: i64) -> Result<Prepared, &'static str> {
+    use crate::isolation_adopt::{prepare_proposal, with_production_env, AdoptError};
+    let id = input.adoption_request_id.as_deref().ok_or(PROPOSAL_INVALID)?;
+    if input.request_id.is_some() { return Err(PROPOSAL_INVALID); }
+    let plan = with_production_env(home, user, now, |env| prepare_proposal(home, env, id)).map_err(AdoptError::message)?;
+    let principal = match &plan.binding {
+        EmployeeBinding::Personal(owner) => input.binding_kind == "personal" && input.owner_id.as_deref().is_none_or(|o| o == owner.as_str()),
+        EmployeeBinding::Shared(_) => input.binding_kind == "shared" && input.owner_id.is_none(),
+    };
+    if !principal || plan.target != input.label { return Err(REQUEST_MISMATCH); }
+    let mut requests = open_requests(home)?;
+    let lock = requests.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORE_UNAVAILABLE)?;
+    if label_pending(&read_items(home)?, &input.label, None) { return Err(LABEL_PENDING); }
+    crate::isolation_label_stores::check_label_not_quarantined(home, &input.label, Some((plan.adopt.employee, plan.adopt.incarnation)))
+        .map_err(crate::isolation_label_stores::GateRefusal::message)?;
+    lifecycle::validate_proposed_binding(home, &input.label, Some(&plan.binding)).map_err(binding_error)?;
+    let display_name = match input.display_name.as_deref() { Some(name) => checked_display(name)?, None => input.label.clone() };
+    lock.finish().map_err(|_| STORE_UNAVAILABLE)?;
+    Ok(Prepared { label: input.label, display_name, binding: plan.binding.clone(), request: None, csrf: input.csrf_token,
+        adopt: None, adoption: Some(plan) })
 }
 
 /// Another open Employee proposal holds `label` (the staff request that
@@ -777,6 +820,7 @@ fn stage_prepared(home: &Path, proof: Option<&MigrationConfirmationSession>, use
     let mut fields = vec![text_field("employee_id", &prepared.label), text_field("disk_bytes", &DISK_BYTES.to_string()),
         text_field("settings", settings)];
     fields.extend(principal_fields(&prepared.binding));
+    if let Some(plan) = &prepared.adoption { fields.push(text_field(crate::isolation_adopt::ADOPT_FIELD, &plan.adopt.encode())); }
     // SR2 finding 6: the same apply.db writer lock as the request path,
     // across the open-label recheck and the staging, so a concurrent request
     // or proposal for this label cannot slip in between.
@@ -785,7 +829,10 @@ fn stage_prepared(home: &Path, proof: Option<&MigrationConfirmationSession>, use
     let mut store = open_confirmations(home)?;
     let items = store.list().map_err(|_| STORE_UNAVAILABLE)?;
     if label_pending(&items, &prepared.label, prepared.request) { return Err(LABEL_PENDING); }
-    crate::isolation_label_stores::proposal_refusal(home, &prepared.label)?; // F6h R7: LABEL_QUARANTINED
+    // F6h R7: LABEL_QUARANTINED, except the row an adoption proposal names (F6g).
+    let adopting = prepared.adoption.as_ref().map(|plan| (plan.adopt.employee, plan.adopt.incarnation));
+    crate::isolation_label_stores::check_label_not_quarantined(home, &prepared.label, adopting)
+        .map_err(crate::isolation_label_stores::GateRefusal::message)?;
     // SR2 finding 1b: the adopted directory still carries this flow's marker,
     // holds nothing outside the allowlist, and the staged settings are
     // exactly those parsed from the agent.toml bytes inside that digest.
@@ -795,7 +842,13 @@ fn stage_prepared(home: &Path, proof: Option<&MigrationConfirmationSession>, use
     }
     let item = store.stage_proposal(operation, ConfirmationCategory::Employee, fields, &StagingCheck { home })
         .map_err(stage_error)?;
+    let proposal = hex::encode(item.binding.operation_id.proposal_id.0);
+    // F6g: in this same apply.db transaction, the row goes `adopting` bound to the proposal.
+    if let Some(plan) = &prepared.adoption {
+        crate::isolation_adopt::bind_proposal(&lock, plan, &proposal, now).map_err(crate::isolation_adopt::AdoptError::message)?;
+    }
     lock.commit().map_err(|_| STORE_UNAVAILABLE)?;
+    if let Some(plan) = &prepared.adoption { crate::isolation_adopt::audit_proposed(home, plan, &proposal, user); }
     Ok(json!({
         "request_id": hex::encode(item.binding.operation_id.proposal_id.0),
         "revision": item.binding.operation_id.revision,
