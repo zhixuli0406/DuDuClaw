@@ -2317,6 +2317,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Pro edition: auto-download + install + graceful restart (unless disabled).
     // CE edition: notify dashboard only.
     let auto_update = crate::updater::auto_update_enabled(&home_dir);
+    // RM-155 (macOS; no-op elsewhere): LaunchAgent path migration, stale
+    // bundle-staging cleanup, and the one-time bare → DuDuClaw Gateway.app
+    // migration under launchd with auto-update enabled.
+    tokio::spawn(crate::updater::macos_boot_maintenance(home_dir.clone(), auto_update));
     {
         let etx = event_tx.clone();
         let home_for_update = home_dir.clone();

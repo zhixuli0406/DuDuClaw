@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- macOS：gateway 可以改用已簽章的「DuDuClaw Gateway.app」執行。macOS 會在更新後保留資料夾、自動化與完整磁碟取用權限，不必每次更新都重新授權。
+- macOS：原本以單一執行檔執行的 gateway 可以移到 App。三種方式：開啟自動更新並由登入服務啟動時，第一次啟動會自動移轉；也可以按系統更新頁的「移到 DuDuClaw Gateway.app」，或執行 `duduclaw service migrate-bundle`。移轉後原本的指令照常可用，macOS 會再詢問一次資料夾存取權限。
+
+### Changed
+
+- macOS：App 安裝只會從發行版中已簽章的 App 更新。換上新版前會核對簽章、識別碼、版本與版別，任何一項不符就不更新，已安裝的 App 維持原樣。
+- macOS：登入服務改記錄 gateway 的實際檔案位置，不再記錄捷徑路徑；舊的設定會在 gateway 啟動時自動更正。
+
 ## [1.80.1] - 2026-11-07 — macOS／Windows 下載版修正
 
 ### Fixed

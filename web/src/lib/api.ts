@@ -7580,6 +7580,24 @@ export const api = {
          * older gateways ⇒ treated as `false`.
          */
         containerized?: boolean;
+        /** macOS: running from the signed DuDuClaw Gateway.app (RM-155). */
+        macos_bundle?: boolean;
+        /** macOS bare standalone/npm install: offer `system.migrate_bundle`. */
+        macos_bundle_migratable?: boolean;
+        /** One-time notice after a migration (macOS asks for folder access once). */
+        macos_bundle_notice?: string | null;
+      }>,
+    /**
+     * macOS: move a bare install into DuDuClaw Gateway.app (same verification
+     * as an update) and relaunch. Long timeout for the same reason as
+     * `applyUpdate`.
+     */
+    migrateBundle: () =>
+      client.call('system.migrate_bundle', {}, false, 600000) as Promise<{
+        success: boolean;
+        message: string;
+        needs_restart: boolean;
+        restart_hint?: string | null;
       }>,
     /**
      * Installing an update = download + checksum + signature + extract + swap,

@@ -436,6 +436,18 @@ The page shows one update order for the whole install. When the desktop app is a
 
 When a newer gateway binary is already on disk but not running (an npm install, a manual swap, an update whose restart never happened), the button reads "Restart the gateway to apply v…" and calls `system.restart_pending_update` (admin). The gateway refuses it unless the on-disk version really differs from the running one, and refuses it inside a container or for the desktop sidecar, which restart through their owner. Restarting the desktop app does not restart an external gateway.
 
+### macOS: DuDuClaw Gateway.app (v1.81.0)
+
+On macOS the gateway now ships as a signed app, `DuDuClaw Gateway.app` (identifier `ai.duduclaw.gateway`, the same for CE and Pro). macOS keeps folder, automation and Full Disk Access grants for an app across updates, so you grant them once instead of after every release. A bundle install updates only from the release's signed `duduclaw-darwin-<arch>.app.zip`. Before the app is replaced, the gateway checks its signature against the pinned DuDuClaw developer identity and against the installed app's own signature, and checks that the app's identifier, version and edition match the signed release. The new app is swapped in atomically and run once (`version`). If any check fails, the update is refused and the installed app is left untouched or put back.
+
+A gateway still running as a bare binary (standalone or npm) moves into the app in one of three ways:
+
+- Automatically, once, on the first v1.81 start under the login service (launchd) when auto-update is on.
+- **Move to DuDuClaw Gateway.app** on this page (`system.migrate_bundle`, admin).
+- `duduclaw service migrate-bundle` in a terminal. Then run `duduclaw service restart`.
+
+The move installs the app to `~/Applications/` (npm: inside the npm platform package) and replaces the old binary with a link to the app, so existing commands keep working. It also points the login service at the app and restarts the gateway from it. Afterwards macOS asks once for folder access for the new app. The page shows this notice once after the move.
+
 ## Thinking display
 
 No dedicated control yet; set these in the Advanced config editor (below). Both are read on every turn, so a change applies from the next reply.
