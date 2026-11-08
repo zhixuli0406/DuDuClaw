@@ -178,6 +178,7 @@ async fn computer_login_scoped_to_employee_credentials() {
     let own = store("alice-login", "alice");
     let other = store("bob-login", "bob");
     let sessions = crate::computer_use_sessions::ComputerUseSessions::new(f.home.path().into());
+    let account_id = account.account().to_string();
     // Even trusted boot input cannot attach Bob's credential to Alice.
     assert!(matches!(ComputerConnectorProvider::new(f.home.path().into(), "alice".into(),
         f.context.record().employee, vec![(account.clone(), other.id.clone())], sessions.clone()),
@@ -185,11 +186,11 @@ async fn computer_login_scoped_to_employee_credentials() {
     let provider = Arc::new(ComputerConnectorProvider::new(f.home.path().into(), "alice".into(),
         f.context.record().employee, vec![(account, own.id.clone())], sessions).unwrap());
     let (selected, call) = f.call(provider.clone(), "computer_login", json!({"credential":"alice-login"}));
-    assert_eq!(selected.account(), "computer");
+    assert_eq!(selected.account(), account_id);
     assert!(!call.arguments().to_string().contains("PASSWORD-CANARY"));
     for credential in ["bob-login", other.id.as_str(), "alice-login/bob-login"] {
         assert!(SelectedConnector::select_with_policy(&f.context, "computer_login",
-            &json!({"credential":credential,"connector_account":"computer"}),
+            &json!({"credential":credential,"connector_account":account_id.as_str()}),
             f.bindings.clone(), f.catalog.clone(), Some(provider.clone())).is_err());
     }
     // Removing the employee grant after selection fences the use-time path
