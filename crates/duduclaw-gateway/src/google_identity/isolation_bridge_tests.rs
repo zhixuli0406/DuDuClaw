@@ -4,9 +4,13 @@ use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, Capab
     ids::{RunId, Sha256Digest}};
 use crate::isolation_egress::{ResolvedRunTurn, RunMetadata, RunTurnIdentity};
 
+use crate::google_identity::isolation_routes::tests::{catalog, lifecycle, routes_for};
+use crate::isolation_connectors::ConnectorKind;
+
 fn reference() -> CredentialRef { CredentialRef { kind: CredentialKind::Legacy, sha256: "a".repeat(64) } }
-fn personal(owner: &str) -> ProductConnectorAccount {
-    ProductConnectorAccount::Personal { account: "personal-google".into(), owner: owner.into() }
+
+fn personal_routes(catalog: &ConnectorCatalog) -> GoogleAccountRoutes {
+    routes_for(catalog, &lifecycle(EmployeeBinding::Personal(Text::new("alice".into()).unwrap()))).unwrap()
 }
 
 /// Host run association double: one live observation, or a lookup failure.
@@ -34,39 +38,27 @@ fn context(principal: Principal) -> RequestContext {
 }
 fn bridge(home: &std::path::Path, turns: Arc<dyn RunTurnResolver>) -> GoogleIsolationBridge {
     GoogleIsolationBridge::new(home.into(), "bot".into(), EmployeeId([1;16]), None, reference(),
-        GoogleAccountRoutes { personal: BTreeMap::from([("alice".into(), personal("alice")),
-            ("bob".into(), personal("bob"))]), home: None }, turns).unwrap()
+        catalog(), turns).unwrap()
 }
 
-#[test]
-fn bridge_refuses_invalid_owner_routes_and_personal_home_substitution() {
-    let home = tempfile::tempdir().unwrap();
-    for routes in [
-        GoogleAccountRoutes { personal: BTreeMap::from([("alice".into(), personal("bob"))]), home: None },
-        GoogleAccountRoutes { personal: BTreeMap::new(), home: Some(personal("alice")) },
-    ] {
-        assert!(GoogleIsolationBridge::new(home.path().into(), "bot".into(), EmployeeId([1;16]), None,
-            reference(), routes, turns(dashboard())).is_err());
-    }
-}
 #[test]
 fn bridge_requires_gateway_home_valid_employee_and_authentication_reference() {
     let home = tempfile::tempdir().unwrap();
     for agent in ["../bot", "heartbeat-scheduler", duduclaw_core::UNTRUSTED_AGENT_ID] {
         assert!(GoogleIsolationBridge::new(home.path().into(), agent.into(), EmployeeId([1;16]), None,
-            reference(), GoogleAccountRoutes::default(), turns(dashboard())).is_err());
+            reference(), catalog(), turns(dashboard())).is_err());
     }
     let mut invalid = reference(); invalid.sha256 = "not-a-digest".into();
     assert!(GoogleIsolationBridge::new(home.path().into(), "bot".into(), EmployeeId([1;16]), None,
-        invalid, GoogleAccountRoutes::default(), turns(dashboard())).is_err());
+        invalid, catalog(), turns(dashboard())).is_err());
     assert!(GoogleIsolationBridge::new(PathBuf::from("relative"), "bot".into(), EmployeeId([1;16]), None,
-        reference(), GoogleAccountRoutes::default(), turns(dashboard())).is_err());
+        reference(), catalog(), turns(dashboard())).is_err());
 }
 #[test]
 fn missing_live_google_metadata_refuses_without_creating_a_credential() {
     let home = tempfile::tempdir().unwrap();
     let bridge = GoogleIsolationBridge::new(home.path().into(), "bot".into(), EmployeeId([1;16]), None,
-        reference(), GoogleAccountRoutes::default(), turns(dashboard())).unwrap();
+        reference(), catalog(), turns(dashboard())).unwrap();
     assert!(bridge.source(&context(human("alice")), "gmail_read").is_err());
     assert!(!home.path().join(".keyfile").exists());
     assert!(!home.path().join("mcp-oauth-tokens.json").exists());
@@ -77,24 +69,33 @@ fn missing_live_google_metadata_refuses_without_creating_a_credential() {
 fn bridge_dashboard_requester_selects_own_personal() {
     let home = tempfile::tempdir().unwrap();
     let bridge = bridge(home.path(), turns(dashboard()));
+    let owner = EmployeeBinding::Personal(Text::new("alice".into()).unwrap());
+    let account = bridge.catalog.register("alice", "google", ConnectorKind::Personal, &owner).unwrap();
+    let routes = personal_routes(&bridge.catalog);
     let requester = bridge.requester(&context(human("alice"))).unwrap();
     assert_eq!(requester, Requester::Human { user_id: "alice".into(),
         identity: RequesterIdentity::DashboardUser { user_id: "alice".into() } });
-    assert!(matches!(bridge.personal_route(&requester, Some("alice")), Ok(route) if route == personal("alice")));
+    assert!(matches!(GoogleIsolationBridge::personal_route(&routes, &requester, Some("alice")),
+        Ok(route) if route.product.account() == account.as_str()));
 }
 
 #[test]
 fn bridge_other_requester_refused() {
     let home = tempfile::tempdir().unwrap();
     let bridge = bridge(home.path(), turns(dashboard()));
+    for owner in ["alice", "bob"] {
+        bridge.catalog.register(owner, "google", ConnectorKind::Personal,
+            &EmployeeBinding::Personal(Text::new(owner.into()).unwrap())).unwrap();
+    }
+    let routes = personal_routes(&bridge.catalog);
     // bob is authenticated and even has his own route; alice's source stays hers.
     let bob = bridge.requester(&context(human("bob"))).unwrap();
-    assert_eq!(bridge.personal_route(&bob, Some("alice")).err(), Some(VerificationError::BindingMismatch));
-    assert_eq!(bridge.personal_route(&bob, None).err(), Some(VerificationError::BindingMismatch));
-    assert_eq!(bridge.personal_route(&bob, Some("")).err(), Some(VerificationError::BindingMismatch));
+    assert_eq!(GoogleIsolationBridge::personal_route(&routes, &bob, Some("alice")).err(), Some(VerificationError::BindingMismatch));
+    assert_eq!(GoogleIsolationBridge::personal_route(&routes, &bob, None).err(), Some(VerificationError::BindingMismatch));
+    assert_eq!(GoogleIsolationBridge::personal_route(&routes, &bob, Some("")).err(), Some(VerificationError::BindingMismatch));
     // An owner without an installed route is not substituted by another route.
     let carol = bridge.requester(&context(human("carol"))).unwrap();
-    assert_eq!(bridge.personal_route(&carol, Some("carol")).err(), Some(VerificationError::BindingMismatch));
+    assert_eq!(GoogleIsolationBridge::personal_route(&routes, &carol, Some("carol")).err(), Some(VerificationError::BindingMismatch));
     // A channel turn is a person only through the verified channel→user
     // mapping. A sender id spelled like the user id is not a dashboard user.
     let channel = bridge_with(home.path(), RunMetadata { ingress: Some(IngressRequester::Channel {
@@ -129,12 +130,15 @@ fn bridge_background_never_personal_without_record_authority() {
     // Background records carry the owner as a Human principal but no ingress
     // marker: System work, never the owner in person.
     let record = bridge_with(home.path(), RunMetadata::root());
+    record.catalog.register("alice", "google", ConnectorKind::Personal,
+        &EmployeeBinding::Personal(Text::new("alice".into()).unwrap())).unwrap();
+    let routes = personal_routes(&record.catalog);
     let system = record.requester(&context(human("alice"))).unwrap();
     assert!(matches!(&system, Requester::System(RequesterIdentity::System { on_behalf_of: None, .. })));
-    assert_eq!(record.personal_route(&system, Some("alice")).err(), Some(VerificationError::BindingMismatch));
+    assert_eq!(GoogleIsolationBridge::personal_route(&routes, &system, Some("alice")).err(), Some(VerificationError::BindingMismatch));
     let tenant = record.requester(&context(Principal::Background {
         tenant_id: Text::new("tenant".into()).unwrap(), generation: 1 })).unwrap();
-    assert_eq!(record.personal_route(&tenant, Some("alice")).err(), Some(VerificationError::BindingMismatch));
+    assert_eq!(GoogleIsolationBridge::personal_route(&routes, &tenant, Some("alice")).err(), Some(VerificationError::BindingMismatch));
     // An interactive marker on a background principal or a nested/dispatched
     // run is inconsistent host state and refuses outright.
     let marked = bridge_with(home.path(), dashboard());
@@ -167,4 +171,24 @@ fn bridge_resolver_failure_refuses() {
         // returned, not a later registry/home result.
         assert!(matches!(bridge.source(&context(human("alice")), "gmail_read"), Err(error) if error == expected));
     }
+}
+
+#[test]
+fn bridge_pins_catalog_generation_before_c1_selection() {
+    let home = tempfile::tempdir().unwrap();
+    let bridge = bridge(home.path(), turns(dashboard()));
+    let binding = EmployeeBinding::Personal(Text::new("alice".into()).unwrap());
+    let account = bridge.catalog.register("alice", "google", ConnectorKind::Personal, &binding).unwrap();
+    let route = personal_routes(&bridge.catalog).personal.remove("alice").unwrap();
+    assert!(bridge.pin_source("gmail_read", route.clone(), "source-proof".into()).is_ok());
+    bridge.catalog.advance(&account).unwrap();
+    let newer = personal_routes(&bridge.catalog).personal.remove("alice").unwrap();
+    assert_eq!(bridge.pin_source("gmail_read", newer, "source-proof".into()).err(),
+        Some(VerificationError::BindingMismatch));
+    // Relinking produces a new id, never a replacement for the pinned source.
+    bridge.catalog.revoke(&account).unwrap();
+    bridge.catalog.register("alice", "google", ConnectorKind::Personal, &binding).unwrap();
+    let relinked = personal_routes(&bridge.catalog).personal.remove("alice").unwrap();
+    assert_eq!(bridge.pin_source("gmail_read", relinked, "source-proof".into()).err(),
+        Some(VerificationError::BindingMismatch));
 }
