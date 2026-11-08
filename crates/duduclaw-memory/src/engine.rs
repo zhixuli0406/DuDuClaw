@@ -580,6 +580,8 @@ impl SqliteMemoryEngine {
             Connection::open(db_path).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
         Self::init_tables(&conn)?;
+        // F6fb item 2: every write carrying a label goes through the gate.
+        crate::label_gate::install_on_engine(&conn).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         info!(?db_path, "SQLite memory engine initialised");
         Ok(Self {
             conn: Mutex::new(conn),
@@ -604,6 +606,7 @@ impl SqliteMemoryEngine {
         let conn =
             Connection::open_in_memory().map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         Self::init_tables(&conn)?;
+        crate::label_gate::install_on_engine(&conn).map_err(|e| DuDuClawError::Memory(e.to_string()))?;
         info!("SQLite in-memory memory engine initialised");
         Ok(Self {
             conn: Mutex::new(conn),

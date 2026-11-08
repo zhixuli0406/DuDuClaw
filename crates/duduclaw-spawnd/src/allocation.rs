@@ -71,22 +71,37 @@ pub enum AllocationEvent {
     /// A process of the employee with no run behind it (S14).
     Intruder{employee:EmployeeId},
 }
-pub struct Allocator{directory:PathBuf,journal:Journal,poisoned:bool,events:Vec<AllocationEvent>}
+/// `traces_verified` (F6fb item 7, S5a): `false` only after a missing journal
+/// was opened empty while storage could not be read; no entry is created
+/// until a later `storage.traces()` read succeeds and shows no image the
+/// journal does not know.
+pub struct Allocator{directory:PathBuf,journal:Journal,poisoned:bool,events:Vec<AllocationEvent>,traces_verified:bool}
 impl Allocator {
     pub fn open(registry:&Registry,storage:&mut dyn Storage)->io::Result<Self>{Self::open_at(Path::new(REGISTRY_DIRECTORY),registry,storage)}
     fn open_at(directory:&Path,registry:&Registry,storage:&mut dyn Storage)->io::Result<Self>{
         root_path(directory,true)?;let path=directory.join("allocations.json");
-        let journal=match fs::symlink_metadata(&path){
+        let (journal,traces_verified)=match fs::symlink_metadata(&path){
             Ok(m)=>{
                 root_path(&path,false)?;if m.mode()&0o077!=0{return Err(io::Error::other("allocation journal unavailable"))}
                 let mut bytes=vec![];File::open(&path)?.take(4*1024*1024+1).read_to_end(&mut bytes)?;
                 if bytes.len()>4*1024*1024{return Err(io::Error::other("allocation journal unavailable"))}
-                decode_journal(&bytes)?
+                (decode_journal(&bytes)?,true)
             },
-            Err(e) if e.kind()==io::ErrorKind::NotFound=>{missing_journal(registry,storage)?;Journal{schema:JOURNAL_SCHEMA,entries:vec![]}},
+            Err(e) if e.kind()==io::ErrorKind::NotFound=>{let verified=missing_journal(registry,storage)?;(Journal{schema:JOURNAL_SCHEMA,entries:vec![]},verified)},
             Err(e)=>return Err(e),
         };
-        Ok(Self{directory:directory.into(),journal,poisoned:false,events:vec![]})
+        Ok(Self{directory:directory.into(),journal,poisoned:false,events:vec![],traces_verified})
+    }
+    /// F6fb item 7: before the first entry after an empty open with
+    /// unreadable storage, storage must be read once and show nothing the
+    /// journal does not know (an old image whose label a new entry could
+    /// take). Unreadable or unknown traces: `IsolationUnavailable`, and the
+    /// check runs again on the next request.
+    fn require_traces_read(&mut self,storage:&mut dyn Storage)->Answer<()>{
+        if self.traces_verified{return Ok(())}
+        let traces=storage.traces().map_err(|_|wire::ErrorCode::IsolationUnavailable)?;
+        if traces.iter().any(|e|!self.journal.entries.iter().any(|x|x.receipt.employee==*e)){return Err(wire::ErrorCode::IsolationUnavailable)}
+        self.traces_verified=true;Ok(())
     }
     fn save(&mut self)->Result<()>{
         if self.poisoned{return Err(unavailable())}
@@ -125,6 +140,13 @@ impl Allocator {
         let spec=request.validate().map_err(|_|wire::ErrorCode::InvalidRequest)?;
         let v2=request.schema==wire::SCHEMA_V2;
         // Allocation never races an active run or the lifecycle's H journal.
+        // F6fb item 10 (deliberately fail closed): `Disable` (compensation of a
+        // failed apply) is gated too, so while *any* run is live on the host the
+        // gateway gets `NotReady`: the item stays Failed (`compensation_failed`)
+        // and the operator's retry compensates once the host is idle; the entry
+        // stays Ready meanwhile (a gateway-side failed item never goes live).
+        // Scoping the gate to the entry's UID needs a per-employee busy readback
+        // from the host (`host_busy` is a host-wide bool); not done here.
         if request.action!=Action::ReadBack && env.host_busy{return Err(wire::ErrorCode::NotReady)}
         let binding=request.item.binding;
         let index=match replay_index(&self.journal,&binding,&spec){
@@ -135,6 +157,7 @@ impl Allocator {
                 if request.action==Action::ReadBack{
                     return Err(if v2{absence(&self.journal,env.registry.registry(),env.storage.traces(),None)}else{wire::ErrorCode::InvalidRequest});
                 }
+                self.require_traces_read(env.storage)?;
                 if self.journal.entries.len()>=MAX_ENTRIES || self.journal.entries.iter().any(|e|e.receipt.label==spec.label && e.phase.holds_label()){return Err(wire::ErrorCode::InvalidRequest)}
                 let employee=EmployeeId(crate::server::random_id().map_err(|_|wire::ErrorCode::IsolationUnavailable)?);
                 if employee.0==[0;16] || self.journal.entries.iter().any(|e|e.receipt.employee==employee){return Err(wire::ErrorCode::IsolationUnavailable)}
@@ -296,14 +319,16 @@ fn absence(journal:&Journal,registry:&Registry,traces:Result<Vec<EmployeeId>>,ex
 }
 /// S5a: a missing journal is opened (empty) only while the registry holds no
 /// non-Tombstone account and storage reports no image or live ledger entry.
-/// Unreadable storage does not block the open: no allocation, ReadBack or
-/// Retire can succeed without it, and [`absence`] re-checks the traces before
-/// any `NotFound`.
-fn missing_journal(registry:&Registry,storage:&mut dyn Storage)->io::Result<()>{
+/// Unreadable storage does not block the open: `Ok(false)`, and no entry is
+/// created until a traces read succeeds ([`Allocator::require_traces_read`],
+/// F6fb item 7); ReadBack and Retire re-check the traces in [`absence`]
+/// before any `NotFound`. `Ok(true)`: storage was read and holds nothing.
+fn missing_journal(registry:&Registry,storage:&mut dyn Storage)->io::Result<bool>{
     if registry.employees.iter().any(|a|a.state!=AccountState::Tombstone){return Err(io::Error::other("allocation journal missing while employee accounts exist"))}
     match storage.traces(){
         Ok(traces) if !traces.is_empty()=>Err(io::Error::other("allocation journal missing while employee storage exists")),
-        _=>Ok(()),
+        Ok(_)=>Ok(true),
+        Err(_)=>Ok(false),
     }
 }
 

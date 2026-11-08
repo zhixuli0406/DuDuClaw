@@ -140,24 +140,114 @@ pub(crate) fn rename_agent(bytes: &[u8], label: &str) -> Result<Vec<u8>, AdoptEr
     Ok(out.into_bytes())
 }
 
-/// The absolute old-label directory as kept files could name it.
-fn needles(home: &Path, label: &str) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    for base in [Some(home.to_path_buf()), std::fs::canonicalize(home).ok()].into_iter().flatten() {
-        if let Some(text) = base.join("agents").join(label).to_str() {
-            if !out.iter().any(|known: &Vec<u8>| known == text.as_bytes()) { out.push(text.as_bytes().to_vec()); }
+/// spawnd's loop images and their mount points (`duduclaw-spawnd`
+/// `host.rs` `STORAGE_IMAGES`; names `<hex>.img` / `<hex>.mnt` from
+/// `duduclaw-isolation-storage` `linux.rs`): the old root workspace.
+const ROOT_IMAGES: &str = "/var/lib/duduclaw-spawnd/images";
+
+/// Where the old employee's data lived, as a kept file could name it
+/// (F6fb item 6): `<home>/agents/<old label>`, the row's quarantine
+/// directory and the old root workspace, each for the given and the
+/// canonical home, normalised like the content they are matched against.
+pub(crate) struct Needles { paths: Vec<Vec<u8>>, home_env: Option<Vec<u8>> }
+
+/// A byte that continues a path component or a variable name.
+fn path_char(byte: u8) -> bool { byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'~' | b'$') }
+
+fn replace_where(bytes: &[u8], token: &[u8], with: &[u8], at: impl Fn(&[u8], usize) -> bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(token) && at(bytes, i) {
+            out.extend_from_slice(with);
+            i += token.len();
+        } else {
+            out.push(bytes[i]);
+            i += 1;
         }
     }
     out
 }
 
-fn check_paths(bytes: &[u8], needles: &[Vec<u8>]) -> Result<(), AdoptError> {
-    for needle in needles {
-        if !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle.as_slice()) {
-            return Err(AdoptError::PathRejected);
-        }
+/// JSON-escaped `\/` → `/`; `${HOME}`, `$HOME` and a leading `~/` → the
+/// process home; runs of `/` → one; `/./` → `/`.
+fn normalize_paths(bytes: &[u8], home_env: Option<&[u8]>) -> Vec<u8> {
+    let mut out = replace_where(bytes, b"\\/", b"/", |_, _| true);
+    if let Some(home) = home_env {
+        out = replace_where(&out, b"${HOME}", home, |_, _| true);
+        out = replace_where(&out, b"$HOME", home,
+            |text, i| text.get(i + 5).is_none_or(|next| !(next.is_ascii_alphanumeric() || *next == b'_')));
+        let mut tilde = home.to_vec();
+        tilde.push(b'/');
+        out = replace_where(&out, b"~/", &tilde, |text, i| i == 0 || !path_char(text[i - 1]));
     }
-    Ok(())
+    let mut collapsed = Vec::with_capacity(out.len());
+    for byte in out {
+        if byte == b'/' && collapsed.last() == Some(&b'/') { continue; }
+        collapsed.push(byte);
+    }
+    for _ in 0..64 {
+        let next = replace_where(&collapsed, b"/./", b"/", |_, _| true);
+        if next == collapsed { break; }
+        collapsed = next;
+    }
+    collapsed
+}
+
+fn needles(home: &Path, q: &Quarantined) -> Needles {
+    let home_env = std::env::var_os("HOME").and_then(|value| value.into_string().ok())
+        .map(|value| value.trim_end_matches('/').as_bytes().to_vec()).filter(|value| !value.is_empty());
+    let mut raw: Vec<std::path::PathBuf> = Vec::new();
+    for base in [Some(home.to_path_buf()), std::fs::canonicalize(home).ok()].into_iter().flatten() {
+        raw.push(base.join("agents").join(&q.label));
+        raw.push(base.join(lifecycle::QUARANTINE_DIR).join(q.name()));
+    }
+    let key = hex::encode(q.employee.0);
+    for suffix in ["img", "mnt"] { raw.push(std::path::PathBuf::from(format!("{ROOT_IMAGES}/{key}.{suffix}"))); }
+    let mut paths: Vec<Vec<u8>> = Vec::new();
+    for path in raw {
+        let Some(text) = path.to_str() else { continue };
+        let mut normal = normalize_paths(text.as_bytes(), home_env.as_deref());
+        while normal.len() > 1 && normal.last() == Some(&b'/') { normal.pop(); }
+        if !normal.is_empty() && !paths.contains(&normal) { paths.push(normal); }
+    }
+    Needles { paths, home_env }
+}
+
+impl Needles {
+    /// `ADOPT_PATH_REJECTED` when the normalised bytes name any needle as a
+    /// whole path: the match must start after a non-path byte and end at a
+    /// separator, quote, whitespace or the end (so `…/ali` never matches
+    /// `…/alice-x`, `…/alice.md` is a sibling, `…/alice.` at the end is not).
+    fn check(&self, bytes: &[u8]) -> Result<(), AdoptError> {
+        let text = normalize_paths(bytes, self.home_env.as_deref());
+        for needle in &self.paths {
+            let mut from = 0;
+            while let Some(offset) = text.get(from..).and_then(|rest| rest.windows(needle.len()).position(|window| window == needle.as_slice())) {
+                let (at, end) = (from + offset, from + offset + needle.len());
+                let before = at == 0 || !path_char(text[at - 1]);
+                let after = match text.get(end) {
+                    None => true,
+                    Some(b'.') => text.get(end + 1).is_none_or(|next| !path_char(*next) && *next != b'/'),
+                    Some(next) => !path_char(*next),
+                };
+                if before && after { return Err(AdoptError::PathRejected); }
+                from = at + 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn check_paths(bytes: &[u8], needles: &Needles) -> Result<(), AdoptError> { needles.check(bytes) }
+
+/// Test probe: whether `bytes` name an old path of `q` (with `home_env` as
+/// the process home for `~/` and `$HOME`).
+#[cfg(test)]
+pub(crate) fn names_old_path(home: &Path, q: &Quarantined, home_env: Option<&str>, bytes: &[u8]) -> bool {
+    let mut needles = needles(home, q);
+    needles.home_env = home_env.map(|value| value.trim_end_matches('/').as_bytes().to_vec());
+    needles.check(bytes).is_err()
 }
 
 // ── Descriptor operations ───────────────────────────────────────────────
@@ -227,7 +317,7 @@ mod fsops {
         Ok(fresh)
     }
 
-    fn walk_skills(dir: &SafeDir, needles: &[Vec<u8>], depth: usize, count: &mut usize, bytes: &mut u64) -> Result<(), AdoptError> {
+    fn walk_skills(dir: &SafeDir, needles: &Needles, depth: usize, count: &mut usize, bytes: &mut u64) -> Result<(), AdoptError> {
         if depth > MAX_SKILL_DEPTH { return Err(AdoptError::ForeignDir); }
         for entry in dir.list().map_err(unavailable)? {
             *count += 1;
@@ -252,7 +342,7 @@ mod fsops {
     pub(super) fn sealed_inputs(home: &Path, q: &Quarantined, target: &str) -> Result<SealedInputs, AdoptError> {
         let dir = lifecycle::reopen_quarantined(home, &q.label, q.employee, q.incarnation).map_err(unavailable)?
             .ok_or(AdoptError::DigestMismatch)?;
-        let needles = needles(home, &q.label);
+        let needles = needles(home, q);
         let (mut kept, mut sealed, mut bytes) = (Vec::new(), Vec::new(), 0u64);
         for entry in dir.list().map_err(unavailable)? {
             if entry.name.is_empty() { sealed.push("?".to_owned()); continue; }
@@ -363,17 +453,31 @@ pub(crate) fn rekey_row(home: &Path, q: &Quarantined, adopt: &AdoptRef) -> Resul
 /// and the request `applying` for recovery to finish the re-key (S10).
 fn rekey_stores(home: &Path, q: &Quarantined, adopt: &AdoptRef, crash_point: bool) -> Result<bool, AdoptError> {
     use crate::isolation_label_stores::{TombstoneAction, LABEL_KEYED_STORES};
-    for store in LABEL_KEYED_STORES.iter().filter(|store| store.action != TombstoneAction::Digest) {
+    // The principal side (users.db bindings) is never re-keyed: only counted.
+    for store in LABEL_KEYED_STORES.iter().filter(|store| !matches!(store.action, TombstoneAction::Digest | TombstoneAction::Principal)) {
         store.rekey(home, &q.label, &adopt.store_key()).map_err(unavailable)?;
         if crash_point && crash_at(AdoptHook::MidRekey) { return Ok(true); }
     }
     Ok(false)
 }
 
+/// Which stores [`require_zero`] counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Zero {
+    /// Before `save()`: every non-digest store, incl. the users.db bindings
+    /// (a binding left on the label would be inherited by the new id).
+    BeforeSave,
+    /// After `save()` (resume, roll forward): the new id's own mirror and
+    /// bindings are on the target by then; every other store still counts
+    /// (writes stay gated while the row is `adopting`).
+    AfterSave,
+}
+
 /// A positive zero count under every label (an unreadable store is not zero).
-fn require_zero(home: &Path, labels: &[&str]) -> Result<(), AdoptError> {
+fn require_zero(home: &Path, labels: &[&str], zero: Zero) -> Result<(), AdoptError> {
     use crate::isolation_label_stores::{TombstoneAction, LABEL_KEYED_STORES};
     for store in LABEL_KEYED_STORES.iter().filter(|store| store.action != TombstoneAction::Digest) {
+        if zero == Zero::AfterSave && store.action == TombstoneAction::Principal { continue; }
         for label in labels {
             if store.count_under(home, label).map_err(unavailable)? != 0 { return Err(AdoptError::StoresNotEmpty); }
         }
@@ -402,6 +506,8 @@ fn delete_marker(home: &Path, target: &str, adopt: &AdoptRef) -> Result<(), Adop
 }
 
 /// Shared: exactly the selected bindings (users.db, after apply.db, M6).
+/// Idempotent for a resumed apply (F6fb item 1): bindings already equal to
+/// the selection are left as they are; any other binding refuses.
 fn bind_members(home: &Path, q: &Quarantined, target: &str, members: &Value) -> Result<(), AdoptError> {
     let selection = members.as_array().ok_or(AdoptError::MembersInvalid)?.iter().map(|member| Ok(duduclaw_auth::db::RestoredMember {
         user_id: member["user_id"].as_str().ok_or(AdoptError::MembersInvalid)?.to_owned(),
@@ -411,8 +517,63 @@ fn bind_members(home: &Path, q: &Quarantined, target: &str, members: &Value) -> 
     let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadWrite).map_err(unavailable)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
     if duduclaw_auth::isolation::read_isolation_tenant(&tx).map_err(unavailable)? != q.tenant { return Err(AdoptError::NotSameTenant); }
+    let existing: Vec<(String, String)> = {
+        let mut query = tx.prepare("SELECT user_id,access_level FROM user_agent_bindings WHERE agent_name=?1 ORDER BY user_id")
+            .map_err(unavailable)?;
+        let rows = query.query_map([target], |r| Ok((r.get(0)?, r.get(1)?))).map_err(unavailable)?
+            .collect::<Result<Vec<_>, _>>().map_err(unavailable)?;
+        rows
+    };
+    if !existing.is_empty() {
+        let mut wanted: Vec<(String, duduclaw_auth::AccessLevel)> =
+            selection.iter().map(|member| (member.user_id.clone(), member.access_level)).collect();
+        wanted.sort_by(|a, b| a.0.cmp(&b.0));
+        let have: Vec<(String, Option<duduclaw_auth::AccessLevel>)> =
+            existing.into_iter().map(|(user, level)| (user, level.parse().ok())).collect();
+        let same = have.len() == wanted.len()
+            && have.iter().zip(&wanted).all(|((user, level), (want, wanted))| user == want && *level == Some(*wanted));
+        return if same { tx.finish().map_err(unavailable) } else { Err(AdoptError::MembersInvalid) };
+    }
     duduclaw_auth::db::restore_shared_bindings_in_transaction(&tx, target, &selection).map_err(|_| AdoptError::MembersInvalid)?;
     tx.commit().map_err(unavailable)
+}
+
+/// Shared rollback (F6fb item 1): remove every member binding the adoption
+/// wrote on `target` (one users.db transaction, ACL bump). Refuses
+/// (`Inconsistent`) when a live row on the target is not this adoption's.
+fn unbind_members(home: &Path, target: &str, adopt: &AdoptRef) -> Result<(), AdoptError> {
+    if let Some((receipt, _, _)) = lifecycle::confirmed_row(home, target).map_err(unavailable)? {
+        if !receipt.disabled {
+            let db = restore::open_apply(home)?;
+            let ours = marker(&db, target)?
+                .is_some_and(|(_, _, origin, reference)| origin == "adopted" && reference.as_deref() == Some(adopt.encode().as_str()));
+            if !ours || receipt.employee == adopt.employee { return Err(AdoptError::Inconsistent); }
+        }
+    }
+    let bound: i64 = lifecycle::open_store(home, USERS_DB, Access::ReadOnly).map_err(unavailable)?
+        .query_row("SELECT count(*) FROM user_agent_bindings WHERE agent_name=?1", [target], |r| r.get(0)).map_err(unavailable)?;
+    if bound == 0 { return Ok(()); }
+    match lifecycle::remove_shared_bindings(home, target) {
+        Ok(_) => Ok(()),
+        Err(lifecycle::LifecycleError::Stale) => Err(AdoptError::Inconsistent),
+        Err(_) => Err(AdoptError::Unavailable),
+    }
+}
+
+/// F6fb item 5: after the commit, compensation moves the tree back only while
+/// it is still exactly what the adoption wrote (its `adopted` marker digest).
+/// Anything the new employee changed since is never moved into the old row.
+fn committed_tree_unchanged(home: &Path, target: Option<&str>, adopt: &AdoptRef) -> Result<(), AdoptError> {
+    let target = target.ok_or(AdoptError::Inconsistent)?;
+    let digest = {
+        let db = restore::open_apply(home)?;
+        let (_, digest, origin, reference) = marker(&db, target)?.ok_or(AdoptError::Inconsistent)?;
+        if origin != "adopted" || reference.as_deref() != Some(adopt.encode().as_str()) { return Err(AdoptError::Inconsistent); }
+        digest
+    };
+    let snapshot = crate::handlers::employee_dirs::snapshot(home, &home.join("agents"), target).map_err(|_| AdoptError::Inconsistent)?;
+    if snapshot.digest != digest { return Err(AdoptError::Inconsistent); }
+    Ok(())
 }
 
 /// The adoption commit (§3.10 step 5, R12): row `adopted` by the new id,
@@ -445,6 +606,19 @@ fn finish(home: &Path, q: &Quarantined, request: &RestoreRequest, employee: Empl
 pub(crate) fn roll_back(home: &Path, env: &AdoptEnv<'_>, q: &Quarantined, request: Option<&RestoreRequest>, target: Option<&str>,
     (state, failure): (&str, Option<&str>)) -> Result<(), AdoptError> {
     let adopt = AdoptRef { employee: q.employee, incarnation: q.incarnation, digest: q.digest.clone().unwrap_or_default() };
+    // F6fb item 5: past the commit, never move what the new employee changed.
+    if q.seal == "adopted" {
+        if let Err(error) = committed_tree_unchanged(home, target, &adopt) {
+            restore::audit(home, "isolation.employee_adoption_compensation_refused", &q.label, Severity::Critical, json!({
+                "request_id": request.map(|r| r.request_id.clone()), "employee": hex::encode(q.employee.0),
+                "incarnation": q.incarnation, "target_label": target, "reason": "tree_changed_after_commit",
+                "failure": failure}));
+            return Err(error);
+        }
+    }
+    // F6fb item 1: a Shared adoption's member bindings go with it (before the
+    // row changes, so a users.db failure leaves the row for a retry).
+    if let (Some(target), EmployeeKind::Shared) = (target, q.kind) { unbind_members(home, target, &adopt)?; }
     let moved = match target { Some(target) => fsops::undo(home, q, target)?, None => false };
     if let Some(target) = target { delete_marker(home, target, &adopt)?; }
     {
@@ -476,7 +650,9 @@ pub(crate) fn roll_forward(home: &Path, env: &AdoptEnv<'_>, q: &Quarantined, ado
     let (_, _, origin, reference) = marker(&db, target)?.ok_or(AdoptError::Inconsistent)?;
     if origin != "adopted" || reference.as_deref() != Some(adopt.encode().as_str()) { return Err(AdoptError::Inconsistent); }
     drop(db);
-    require_zero(home, &[&q.label, target])?;
+    require_zero(home, &[&q.label, target], Zero::AfterSave)?;
+    // The crash may have come between `save()` and the member bindings.
+    if let Some(members) = &request.member_selection { bind_members(home, q, target, members)?; }
     let _ = env;
     finish(home, q, request, receipt.employee, target)
 }
@@ -503,10 +679,16 @@ pub(crate) fn apply_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationIte
     let adopt = proposal_ref(item).map_err(|_| AdoptError::Inconsistent)?.ok_or(AdoptError::Inconsistent)?;
     let settings = text_field(item, "settings").ok_or(AdoptError::SettingsInvalid)?.to_owned();
     let (request, q, target, self_approved) = match validate_item(home, env, item, &adopt, approver)? {
-        Phase::Adopted => {
+        Phase::Adopted { employee } => {
+            // F6fb item 4: a replay is bound to this allocation.
+            if receipt.employee != employee || receipt.binding != item.binding || receipt.disabled {
+                return Err(AdoptError::Inconsistent);
+            }
             let spec = allocation::specification(item).map_err(|_| AdoptError::Inconsistent)?;
             return Ok(Adopted { request_id: String::new(), employee: receipt.employee, target: spec.label, self_approved: false });
         }
+        Phase::Saved { request, row, target, employee, self_approved } =>
+            return resume_after_save(home, env, item, receipt, &adopt, (request, row, target, employee, self_approved)),
         Phase::Pending { request, row, target, self_approved } => (request, row, target, self_approved),
     };
     // A new employee id only: old-id authorities stay dead (A1–A13).
@@ -556,7 +738,7 @@ pub(crate) fn apply_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationIte
     // 4. Nothing label-keyed is carried (N1, S10).
     // A crash point ends the call without `fail` (no cleanup, as on process death).
     if rekey_stores(home, &q, &adopt, true).map_err(fail)? { return Err(AdoptError::Unavailable); }
-    require_zero(home, &[&q.label, &target]).map_err(fail)?;
+    require_zero(home, &[&q.label, &target], Zero::BeforeSave).map_err(fail)?;
     // 5. Marker (R8), confirmed row + mirror, Shared bindings, commit.
     write_marker(home, &target, q.owner.as_deref().unwrap_or(""), &snapshot.digest, &adopt).map_err(fail)?;
     save().map_err(|()| fail(AdoptError::Unavailable))?;
@@ -566,9 +748,34 @@ pub(crate) fn apply_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationIte
     Ok(Adopted { request_id: request.request_id, employee: receipt.employee, target, self_approved })
 }
 
+/// F6fb item 1: the stage step again after an interrupted apply got past
+/// `save()` (store status `Applying`, process death or a lost reply). The
+/// live tree and the confirmed row stay; the re-key is finished (idempotent),
+/// the zero count re-read, the member bindings written unless already exact,
+/// then the commit. Never the transform again.
+fn resume_after_save(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationItem, receipt: &allocation::Receipt, adopt: &AdoptRef,
+    (request, q, target, employee, self_approved): (RestoreRequest, Quarantined, String, EmployeeId, bool)) -> Result<Adopted, AdoptError> {
+    // The root's answer for this allocation must be the id that was saved.
+    if receipt.employee != employee || receipt.binding != item.binding || receipt.label != target || receipt.disabled {
+        return Err(AdoptError::Inconsistent);
+    }
+    restore::audit(home, "isolation.employee_adoption_resumed", &q.label, Severity::Info,
+        restore::audit_details(&request, json!({"target_label": target, "new_employee": hex::encode(employee.0)})));
+    let fail = |error: AdoptError| failed(home, env, &q, &request, &target, error);
+    rekey_stores(home, &q, adopt, false).map_err(fail)?;
+    require_zero(home, &[&q.label, &target], Zero::AfterSave).map_err(fail)?;
+    if let Some(members) = &request.member_selection { bind_members(home, &q, &target, members).map_err(fail)?; }
+    if crash_at(AdoptHook::AfterSave) { return Err(AdoptError::Unavailable); }
+    finish(home, &q, &request, employee, &target).map_err(fail)?;
+    Ok(Adopted { request_id: request.request_id, employee, target, self_approved })
+}
+
 /// `EmployeeAuthority::disable` for an adoption item, after the new
 /// allocation was disabled: moved entries go back, the new directory is
-/// removed, the row `needs_reseal` (§3.10 step 6). Idempotent.
+/// removed, the row `needs_reseal` (§3.10 step 6); a Shared adoption's
+/// member bindings are removed. Idempotent. After the commit (row `adopted`)
+/// it refuses (`Inconsistent`, Critical audit) unless the new tree is still
+/// exactly the marker's (F6fb item 5).
 pub(crate) fn compensate_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationItem) -> Result<(), AdoptError> {
     let adopt = proposal_ref(item).map_err(|_| AdoptError::Inconsistent)?.ok_or(AdoptError::Inconsistent)?;
     let target = allocation::specification(item).map_err(|_| AdoptError::Inconsistent)?.label;

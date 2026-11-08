@@ -44,6 +44,8 @@ impl MethodHandler {
         let method = method.to_owned();
         let runtime = tokio::runtime::Handle::current();
         let live=Arc::new(LiveAuthority {registry:self.registry.clone(),context:ctx.clone(),handle:runtime.clone(),scheduler:self.cron_scheduler.read().await.clone()});
+        // F6fb item 8: an adoption card enforces the licence cap at approval and apply.
+        let agent_cap = self.effective_agent_cap().await;
         // F6g: set when an apply committed an adoption (its tree is now under agents/).
         let adopted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let adopted_flag = adopted.clone();
@@ -77,7 +79,7 @@ impl MethodHandler {
                 let items = store.list().map_err(|_| "無法讀取遷移狀態。")?;
                 // F6d: Employee and EmployeeRetire items behind one backend.
                 let employee_backend = super::migration_authority::retire::production_backend(home.clone(),
-                    Arc::new(EmployeeAuthority::new(home.clone(), live.clone())), &user);
+                    Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)), &user);
                 let items: Vec<Value> = items.into_iter().map(|item| {
                     let supported = employee_backend.validate(&item).is_ok() || GatewayAuthority::built_in_item_supported(&item)
                         || GatewayAccountReadback::available(&home, &item)
@@ -132,7 +134,7 @@ impl MethodHandler {
                     .find(|item| item.binding == input.binding && item.status == ConfirmationStatus::Applied)
                     .ok_or("請先完成此項目的核准與套用。")?;
                 let readback = Arc::new(GatewayAccountReadback::new(home.clone(), runtime));
-                let employee_backend = Arc::new(EmployeeAuthority::new(home.clone(), live.clone()));
+                let employee_backend = Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap));
                 let authority = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
                 let fingerprint = authority.rotate_secret(&item, &input.new_value).map_err(|_| "憑證更新尚未確認，請重新載入後用相同新值重試。")?;
                 store.record_rotation(&input.binding, "credential", fingerprint, &authority)
@@ -152,7 +154,7 @@ impl MethodHandler {
             let readback = Arc::new(GatewayAccountReadback::new(home.clone(), runtime));
             // F6d: one slot, two backends (Employee + EmployeeRetire).
             let employee_backend = super::migration_authority::retire::production_backend(home.clone(),
-                Arc::new(EmployeeAuthority::new(home.clone(), live.clone())), &user);
+                Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)), &user);
             let validator = GatewayAuthority::new(home.clone()).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback.clone()).with_live(live.clone()).with_backend(employee_backend.clone());
             let adopt_home = home.clone();
             let mut applier = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);

@@ -52,7 +52,7 @@ mod apply;
 pub(crate) use apply::{apply_item, compensate_item, filter_settings, rename_agent, sealed_inputs, settings_from_toml, Adopted,
     AdoptHook, SealedInputs};
 #[cfg(test)]
-pub(crate) use apply::ADOPT_HOOK;
+pub(crate) use apply::{names_old_path, ADOPT_HOOK};
 
 /// Proposal field naming the adopted quarantine row (§3.10 step 2).
 pub(crate) const ADOPT_FIELD: &str = "adopt_quarantine";
@@ -130,6 +130,7 @@ impl AdoptError {
             Self::SettingsChanged | Self::DigestMismatch | Self::Inconsistent => "申請內容已變更，請重新載入後再試。",
             Self::AlreadyUsed => "這筆隔離區資料已由新員工接手，或申請已處理。",
             Self::NotSameOwner | Self::NotSameTenant | Self::MembersInvalid => "員工的歸屬不正確，無法由新員工接手。",
+            Self::Restore(Refusal::QuotaExceeded) => "已達授權的 AI 員工數量上限，無法由新員工接手。",
             _ => "目前無法處理接手申請，已拒絕操作。",
         }
     }
@@ -207,12 +208,21 @@ impl AdoptEnv<'_> {
 /// Hooks for steps that never transform (request, proposal): refuses.
 pub(crate) fn no_hooks(_: &Path) -> Result<(), ()> { Err(()) }
 
-/// Production collaborators for the request and proposal steps (the RPC
-/// verified the caller). `agent_cap` 0: the license cap is read by F6d.
+/// Production collaborators without a licence cap: boot recovery only
+/// (recovery never adds a live employee; it finishes or rolls back an apply
+/// whose request and proposal steps were capped).
 pub(crate) fn with_production_env<T>(home: &Path, actor: &str, now: i64, run: impl FnOnce(&AdoptEnv<'_>) -> T) -> T {
+    with_production_env_capped(home, actor, 0, now, run)
+}
+
+/// Production collaborators for the request and proposal steps (the RPC
+/// verified the caller). `agent_cap` is the licence cap the RPC read with
+/// `MethodHandler::effective_agent_cap` (0 = unlimited), as for restore.
+pub(crate) fn with_production_env_capped<T>(home: &Path, actor: &str, agent_cap: usize, now: i64,
+    run: impl FnOnce(&AdoptEnv<'_>) -> T) -> T {
     let routes = restore::CatalogRoutes(home);
     let env = AdoptEnv { root: &retire::SpawndRetireRoot, routes: &routes, runs: &quarantine::SpawndRunStopper,
-        rule: &duduclaw_auth::admin_approval_rule::EligibilityLogRule, hooks: &no_hooks, agent_cap: 0, actor, now };
+        rule: &duduclaw_auth::admin_approval_rule::EligibilityLogRule, hooks: &no_hooks, agent_cap, actor, now };
     run(&env)
 }
 
@@ -303,6 +313,14 @@ pub(crate) enum AdoptStage<'a> {
 /// allocation may already be `root_absent` and the label's confirmed row may
 /// be any disabled row (R6).
 pub(crate) fn check_apply_db(db: &Connection, q: &Quarantined, stage: AdoptStage<'_>, now: i64) -> Result<(), AdoptError> {
+    check_apply_db_with(db, q, stage, now, None)
+}
+
+/// [`check_apply_db`]; `saved`: the new id an interrupted apply of this very
+/// proposal already saved live on the row's own label (resume, F6fb item 1).
+/// That live row is accepted; any other live row is `Inconsistent`.
+fn check_apply_db_with(db: &Connection, q: &Quarantined, stage: AdoptStage<'_>, now: i64, saved: Option<EmployeeId>)
+    -> Result<(), AdoptError> {
     let (seal, own) = match stage {
         AdoptStage::Request => ("sealed", None),
         AdoptStage::Proposal(id) => ("sealed", Some(id)),
@@ -340,7 +358,12 @@ pub(crate) fn check_apply_db(db: &Connection, q: &Quarantined, stage: AdoptStage
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().map_err(unavailable)?;
     if let Some((encoded, pinned, incarnation)) = row {
         let receipt: allocation::Receipt = serde_json::from_str(&encoded).map_err(unavailable)?;
-        if receipt.label != q.label || !receipt.disabled { return Err(AdoptError::Inconsistent); }
+        if receipt.label != q.label { return Err(AdoptError::Inconsistent); }
+        if !receipt.disabled {
+            // Only the new id this proposal already saved (never the old one).
+            if saved.is_some_and(|new| new == receipt.employee && new != q.employee) { return Ok(()); }
+            return Err(AdoptError::Inconsistent);
+        }
         if receipt.employee == q.employee {
             if incarnation != i64::from(q.incarnation) { return Err(AdoptError::Inconsistent); }
             if pinned.as_deref() != Some(q.tenant.as_str()) { return Err(Refusal::TenantMismatch.into()); }
@@ -570,8 +593,43 @@ pub(crate) fn audit_proposed(home: &Path, plan: &AdoptionPlan, proposal: &str, a
 pub(crate) enum Phase {
     /// Row `adopting`, request open: the card may be approved / applied.
     Pending { request: RestoreRequest, row: Quarantined, target: String, self_approved: bool },
-    /// Row `adopted` by this proposal; the tree passes its marker.
-    Adopted,
+    /// F6fb item 1: an interrupted apply of this proposal got past `save()`:
+    /// the target's confirmed row is the new id `employee`, live, under this
+    /// item's binding, its `adopted` marker names this row and the tree still
+    /// passes it. The apply resumes at the bindings and the commit; it never
+    /// redoes the transform (that would delete the live tree).
+    Saved { request: RestoreRequest, row: Quarantined, target: String, employee: EmployeeId, self_approved: bool },
+    /// Row `adopted` by this proposal (`adopted_by_employee` = `employee`, the
+    /// target's live row under this item's binding); the tree passes its marker.
+    Adopted { employee: EmployeeId },
+}
+
+/// The target's live confirmed row, when this very item saved it: a new id
+/// (not the adopted one), on `target`, under the item's binding, with an
+/// `adopted` marker naming `adopt` (F6fb items 1 and 4). `Ok(None)`: the
+/// target holds no live row. A live row that is not this item's: `Inconsistent`.
+fn saved_by_item(db: &Connection, item: &ConfirmationItem, adopt: &AdoptRef, target: &str)
+    -> Result<Option<(EmployeeId, String)>, AdoptError> {
+    let encoded: Option<String> = db.query_row("SELECT receipt FROM confirmed_employees WHERE label=?1", [target], |r| r.get(0))
+        .optional().map_err(unavailable)?;
+    let Some(encoded) = encoded else { return Ok(None) };
+    let receipt: allocation::Receipt = serde_json::from_str(&encoded).map_err(unavailable)?;
+    if receipt.disabled { return Ok(None); }
+    if receipt.employee == adopt.employee || receipt.label != target || receipt.binding != item.binding {
+        return Err(AdoptError::Inconsistent);
+    }
+    let (_, digest, origin, reference) = marker(db, target)?.ok_or(AdoptError::Inconsistent)?;
+    if origin != "adopted" || reference.as_deref() != Some(adopt.encode().as_str()) { return Err(AdoptError::Inconsistent); }
+    Ok(Some((receipt.employee, digest)))
+}
+
+/// The tree on `target` still passes the marker digest and its settings are
+/// the proposal's.
+fn tree_matches(home: &Path, target: &str, digest: &str, settings: &str) -> Result<(), AdoptError> {
+    let snapshot = crate::handlers::employee_dirs::snapshot(home, &home.join("agents"), target).map_err(|_| AdoptError::ForeignDir)?;
+    if snapshot.digest != digest { return Err(AdoptError::ForeignDir); }
+    if snapshot.settings().map_err(|_| AdoptError::SettingsInvalid)? != settings { return Err(AdoptError::SettingsChanged); }
+    Ok(())
 }
 
 pub(crate) fn proposal_key(item: &ConfirmationItem) -> String { hex::encode(item.binding.operation_id.proposal_id.0) }
@@ -632,26 +690,35 @@ pub(crate) fn validate_item(home: &Path, env: &AdoptEnv<'_>, item: &Confirmation
         let adopted_by: Option<String> = db.query_row("SELECT adopted_by_employee FROM employee_quarantine
             WHERE employee_hex=?1 AND incarnation=?2", params![hex::encode(q.employee.0), q.incarnation], |r| r.get(0))
             .map_err(unavailable)?;
-        let (_, digest, origin, reference) = marker(&db, &target)?.ok_or(AdoptError::Inconsistent)?;
-        if adopted_by.is_none() || origin != "adopted" || reference.as_deref() != Some(adopt.encode().as_str()) {
-            return Err(AdoptError::Inconsistent);
-        }
+        // F6fb item 4: bound to this allocation — the live row on the target is
+        // this item's (binding), and it is the id the commit recorded.
+        let (employee, digest) = saved_by_item(&db, item, adopt, &target)?.ok_or(AdoptError::Inconsistent)?;
+        if adopted_by.as_deref() != Some(hex::encode(employee.0).as_str()) { return Err(AdoptError::Inconsistent); }
         drop(db);
-        let snapshot = crate::handlers::employee_dirs::snapshot(home, &home.join("agents"), &target).map_err(|_| AdoptError::ForeignDir)?;
-        if snapshot.digest != digest { return Err(AdoptError::ForeignDir); }
-        if snapshot.settings().map_err(|_| AdoptError::SettingsInvalid)? != settings { return Err(AdoptError::SettingsChanged); }
-        return Ok(Phase::Adopted);
+        tree_matches(home, &target, &digest, settings)?;
+        return Ok(Phase::Adopted { employee });
     }
     if !matches!(request.state.as_str(), "requested" | "applying") { return Err(AdoptError::AlreadyUsed); }
     if env.now > request.expires_at && request.state == "requested" { return Err(Refusal::Expired.into()); }
-    check_apply_db(&db, &q, AdoptStage::Adopting(&request.request_id), env.now)?;
+    // F6fb item 1: a live target row is only ever this item's own save (an
+    // interrupted apply); any other live row refuses before anything moves.
+    let saved = saved_by_item(&db, item, adopt, &target)?;
+    if saved.is_some() && (request.state != "applying" || q.seal != "adopting") { return Err(AdoptError::Inconsistent); }
+    check_apply_db_with(&db, &q, AdoptStage::Adopting(&request.request_id), env.now, saved.as_ref().map(|(employee, _)| *employee))?;
     if request.member_selection.is_some() != (request.kind == RequestKind::SharedAdopt) { return Err(AdoptError::Inconsistent); }
     if let Some(members) = &request.member_selection { check_members(&q, members)?; }
     let sealed = q.digest.clone().ok_or(Refusal::NotSealed)?;
     if adopt_request_digest(&request, &sealed, &target) != request.digest { return Err(AdoptError::DigestMismatch); }
     drop(db);
+    if let Some((employee, digest)) = saved {
+        tree_matches(home, &target, &digest, settings)?;
+        let self_approved = decide(home, env, &request, approver)?;
+        return Ok(Phase::Saved { request, row: q, target, employee, self_approved });
+    }
     if request.state == "requested" {
         restore::check_users(home, &q)?;
+        // F6fb item 8: the new id is one more live employee (licence cap).
+        restore::check_quota(home, env.agent_cap)?;
         require_root_gone(home, env, &q)?;
         let inputs = sealed_inputs(home, &q, &target)?;
         if apply::settings_from_toml(&inputs.agent_toml)? != settings { return Err(AdoptError::SettingsChanged); }

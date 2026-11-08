@@ -115,6 +115,9 @@ pub(crate) struct LabelHold {
     pub(crate) open_rows: Vec<(String, u32, String)>,
     /// Quarantine rows on the label in state `purged`.
     pub(crate) purged: usize,
+    /// Quarantine rows on the label in any closed state (S7: `purged`,
+    /// `adopted`, `restored`).
+    pub(crate) closed: usize,
 }
 
 fn open_apply(home: &Path, access: Access) -> Result<Connection, StoreError> {
@@ -160,7 +163,7 @@ pub(crate) fn label_hold(home: &Path, label: &str) -> Result<LabelHold, StoreErr
         for (hex, incarnation, seal) in rows {
             let incarnation = u32::try_from(incarnation).map_err(|_| StoreError::Unavailable)?;
             if seal == "purged" { hold.purged += 1; }
-            if !CLOSED_STATES.contains(&seal.as_str()) { hold.open_rows.push((hex, incarnation, seal)); }
+            if CLOSED_STATES.contains(&seal.as_str()) { hold.closed += 1; } else { hold.open_rows.push((hex, incarnation, seal)); }
         }
     }
     Ok(hold)
@@ -181,10 +184,26 @@ fn subject_label(key: &str) -> &str { key.strip_prefix("agent:").unwrap_or(key) 
 /// cannot be read. Outside protected mode: `Ok` without I/O.
 pub(crate) fn check_label_writable(home: &Path, label: &str) -> Result<(), GateRefusal> {
     if !protected_active() { return Ok(()); }
+    hold_allows_write(home, label)
+}
+
+/// The writer gate's decision, without the protected-mode switch.
+fn hold_allows_write(home: &Path, label: &str) -> Result<(), GateRefusal> {
     let hold = label_hold(home, subject_label(label)).map_err(|_| GateRefusal::Unavailable)?;
     if !hold.open_rows.is_empty() { return Err(GateRefusal::Quarantined); }
     if hold.confirmed == Some(true) { return Err(GateRefusal::NotLive); }
     Ok(())
+}
+
+/// F6fb item 2: the memory gate of the isolated MCP server process
+/// (`duduclaw-cli` `mcp_isolation.rs`), which opens the home's memory.db
+/// itself. That process exists only in protected mode (and need not inherit
+/// the protected-mode environment), so the gate is always active there. An
+/// in-memory database is no home store (nothing label-keyed persists): `Ok`.
+pub(crate) fn isolated_process_write_gate(file: Option<&Path>, namespace: &str) -> Result<(), String> {
+    let Some(file) = file else { return Ok(()) };
+    let home = file.parent().ok_or_else(|| GateRefusal::Unavailable.message().to_owned())?;
+    hold_allows_write(home, namespace).map_err(|refusal| refusal.message().to_owned())
 }
 
 /// The writer gate on a store connection: the home is the directory of the
@@ -218,6 +237,24 @@ pub(crate) fn install_memory_gate() {
     let _ = duduclaw_memory::install_label_write_gate(memory_write_gate);
 }
 
+/// F6fb item 2: the writer gate on every write of one store connection
+/// (`duduclaw_memory::label_gate::install_write_triggers`): INSERT carrying a
+/// refused label aborts, a widening UPDATE of a refused label's row is
+/// skipped (clearing to NULL still runs; DELETE is not gated). The
+/// label columns are the registry's ([`AGENT_COLUMNS`]); child rows are gated
+/// through the registered parent (sessions: `session_id → sessions.agent_id`).
+/// The decision is [`memory_write_gate`] (home = the database file's
+/// directory; `Ok` outside protected mode). Call once the schema exists.
+pub(crate) fn install_store_gate(db: &Connection, store: &str) -> rusqlite::Result<usize> {
+    use duduclaw_memory::label_gate::{install_write_triggers, GateRules, ParentKey};
+    let parent = LABEL_KEYED_STORES.iter().find(|entry| entry.name == store).and_then(|entry| match &entry.backend {
+        Backend::Sqlite { parent: Some(parent) } =>
+            Some(ParentKey { table: parent.table, id: parent.id, label: parent.label, child: parent.child }),
+        _ => None,
+    });
+    install_write_triggers(db, memory_write_gate, &AGENT_COLUMNS, parent, GateRules::default())
+}
+
 // ── Registry (S9) ───────────────────────────────────────────────────────
 
 /// What the tombstone does with a store (§3.3).
@@ -232,6 +269,11 @@ pub(crate) enum TombstoneAction {
     /// Stripped, names kept in `stripped` (S9); a store with a `hold` keeps
     /// its exact entries for a restore (`stripped.restore`).
     Strip,
+    /// The users.db principal side (member bindings, Personal mirror): removed
+    /// by the tombstone's own users.db step (§3.2 step 5, members kept in the
+    /// principal snapshot), never re-keyed or carried (a new id writes its
+    /// own at apply). Registered so the S10 positive zero count covers it.
+    Principal,
 }
 
 /// Purge removes these child rows first: rows of `parent` whose `label`
@@ -286,6 +328,12 @@ pub(crate) static LABEL_KEYED_STORES: &[LabelStore] = &[
     LabelStore { name: "delegation_targets", source: "org.toml", action: TombstoneAction::Strip,
         backend: Backend::Config { count: delegation_count, detach: delegation_reroot,
             hold: Some(crate::isolation_label_restore::delegation_hold) } },
+    // F6fb: users.db `user_agent_bindings` (and the Personal mirror) of the
+    // label. A binding left by a failed tombstone step 5 or a half-rolled-back
+    // Shared adoption would otherwise be inherited by the next employee on
+    // the label (or make its `bind_members` fail).
+    LabelStore { name: "member_bindings", source: "users.db", action: TombstoneAction::Principal,
+        backend: Backend::Config { count: member_binding_count, detach: member_binding_purge, hold: None } },
 ];
 
 impl LabelStore {
@@ -305,6 +353,10 @@ impl LabelStore {
     /// new id is an explicit admin edit).
     pub(crate) fn rekey(&self, home: &Path, old: &str, new: &str) -> Result<u64, StoreError> {
         if old == new || old.is_empty() || new.is_empty() { return Err(StoreError::Unavailable); }
+        // The principal side is never moved (the new id's own bindings may
+        // already be on the label during an adoption's recovery); its count
+        // gates the commit instead (S10).
+        if self.action == TombstoneAction::Principal { return Ok(0); }
         match &self.backend {
             Backend::Sqlite { .. } => sqlite::rekey(home, self.source, old, new),
             Backend::Config { hold: Some(hold), .. } => {
@@ -415,6 +467,41 @@ fn channel_route_strip(home: &Path, label: &str) -> Result<Vec<String>, StoreErr
     crate::agent_binding::strip_label_routes(&home.join("agent_bindings.json"), label).map_err(|_| StoreError::Unavailable)
 }
 
+/// users.db member bindings plus the Personal mirror row of `label`. A
+/// missing users.db is a positive 0; an unreadable one is `Err`.
+fn member_binding_count(home: &Path, label: &str) -> Result<u64, StoreError> {
+    let Some(db) = sqlite::open(home, "users.db", Access::ReadOnly)? else { return Ok(0) };
+    let mut total = 0u64;
+    for (table, column) in [("user_agent_bindings", "agent_name"), ("isolation_personal_agents", "agent_name")] {
+        if !table_exists(&db, table)? { continue; }
+        let rows: i64 = db.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"), [label], |r| r.get(0))
+            .map_err(|_| StoreError::Unavailable)?;
+        total = total.saturating_add(u64::try_from(rows).map_err(|_| StoreError::Unavailable)?);
+    }
+    Ok(total)
+}
+
+/// Purge form (F6i, no live row holds the label): every Shared member
+/// binding goes in one users.db transaction with an ACL bump
+/// (`remove_shared_bindings_in_transaction`). A Personal mirror is never
+/// removed here (only the lifecycle's own paths may, `db.rs` contract):
+/// `Err`, so the label stays held until the tombstone's step 5 retry.
+fn member_binding_purge(home: &Path, label: &str) -> Result<Vec<String>, StoreError> {
+    if member_binding_count(home, label)? == 0 { return Ok(Vec::new()); }
+    let Some(mut db) = sqlite::open(home, "users.db", Access::ReadWrite)? else { return Ok(Vec::new()) };
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| StoreError::Unavailable)?;
+    let users: Vec<String> = {
+        let mut query = tx.prepare("SELECT user_id FROM user_agent_bindings WHERE agent_name = ?1 ORDER BY user_id")
+            .map_err(|_| StoreError::Unavailable)?;
+        let users = query.query_map([label], |r| r.get::<_, String>(0)).map_err(|_| StoreError::Unavailable)?
+            .collect::<Result<Vec<_>, _>>().map_err(|_| StoreError::Unavailable)?;
+        users
+    };
+    duduclaw_auth::db::remove_shared_bindings_in_transaction(&tx, label).map_err(|_| StoreError::Unavailable)?;
+    tx.commit().map_err(|_| StoreError::Unavailable)?;
+    Ok(users.into_iter().map(|user| format!("binding:{user}")).collect())
+}
+
 // ── SQLite stores ───────────────────────────────────────────────────────
 
 pub(crate) mod sqlite {
@@ -427,7 +514,7 @@ pub(crate) mod sqlite {
     fn quoted(name: &str) -> String { format!("\"{}\"", name.replace('"', "\"\"")) }
 
     /// `None` when the store file does not exist (positive zero).
-    fn open(home: &Path, file: &str, access: Access) -> Result<Option<Connection>, StoreError> {
+    pub(super) fn open(home: &Path, file: &str, access: Access) -> Result<Option<Connection>, StoreError> {
         match std::fs::symlink_metadata(home.join(file)) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(_) => return Err(StoreError::Unavailable),
@@ -565,7 +652,8 @@ pub(crate) fn tombstone_effects(home: &Path, label: &str, employee: EmployeeId, 
     let key = quarantine_key(employee, incarnation);
     for store in LABEL_KEYED_STORES {
         match store.action {
-            TombstoneAction::Digest => {}
+            // Principal: the tombstone's users.db step (§3.2 step 5) removes it.
+            TombstoneAction::Digest | TombstoneAction::Principal => {}
             TombstoneAction::Strip => match store.hold(home, label, &key) {
                 Ok(held) => {
                     if !held.complete { fences.push(format!("{STORE_FENCE_GROUP}{}:strip_unavailable", store.name)); }
@@ -669,10 +757,11 @@ fn record_effects(home: &Path, employee: EmployeeId, incarnation: u32, effects: 
 /// Staging, approving or applying an Employee proposal for `label` refuses
 /// `Quarantined` while a quarantine row on it is not closed (S7), unless it
 /// is the row `adopting` names (the adoption proposal of that row, F6g). A
-/// label whose rows were purged and that no live row holds frees only with a
-/// positive zero count from every store (S10, §3.6 "finish the purge first"),
-/// except the `Digest` store: the org entry is the one the proposal itself
-/// states (the propose flow writes it before staging).
+/// label that has **any** closed row (purged, adopted, or restored and since
+/// closed — S7) and that no live confirmed row holds frees only with a
+/// positive zero count from every store (S10, §3.6 "finish the purge
+/// first"), except the `Digest` store: the org entry is the one the proposal
+/// itself states (the propose flow writes it before staging).
 pub(crate) fn check_label_not_quarantined(home: &Path, label: &str, adopting: Option<(EmployeeId, u32)>)
     -> Result<(), GateRefusal> {
     let hold = label_hold(home, label).map_err(|_| GateRefusal::Unavailable)?;
@@ -680,7 +769,7 @@ pub(crate) fn check_label_not_quarantined(home: &Path, label: &str, adopting: Op
     if hold.open_rows.iter().any(|(hex, incarnation, _)| adopted.as_ref() != Some(&(hex.clone(), *incarnation))) {
         return Err(GateRefusal::Quarantined);
     }
-    if hold.purged > 0 && hold.confirmed != Some(false) {
+    if hold.closed > 0 && hold.confirmed != Some(false) {
         match label_free_where(home, label, |store| store.action != TombstoneAction::Digest) {
             Ok(true) => {}
             Ok(false) => return Err(GateRefusal::Quarantined),

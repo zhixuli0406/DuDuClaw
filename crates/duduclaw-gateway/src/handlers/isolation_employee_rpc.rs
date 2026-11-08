@@ -300,12 +300,15 @@ impl MethodHandler {
     async fn employee_propose(&self, input: ProposeRequest, ctx: &UserContext, db: Arc<UserDb>, session: String)
         -> Result<Value, &'static str> {
         let (home, user, epoch) = (self.home_dir.clone(), ctx.user_id.clone(), ctx.credential_epoch);
+        // F6fb item 8: an adoption adds a live employee, so the licence cap
+        // (read as `agents.create` and the restore RPCs read it) applies.
+        let cap = self.effective_agent_cap().await;
         let mut prepared = {
             let (home, db, user, session) = (home.clone(), db.clone(), user.clone(), session.clone());
             blocking(move || {
                 let now = now()?;
                 let proof = db.migration_confirmation_session(&user, &session, epoch, now).map_err(|_| SESSION_EXPIRED)?;
-                prepare_propose(&home, &db, proof.as_ref(), &user, input, now)
+                prepare_propose_capped(&home, &db, proof.as_ref(), &user, input, now, cap)
             }).await?
         };
         // F6g: the tree comes from the sealed quarantine row at apply; the
@@ -737,12 +740,20 @@ fn confirmed_employees(home: &Path) -> Result<Vec<Value>, &'static str> {
     }).collect()
 }
 
-/// First admin step: step-up, principal, request match, label checks.
+/// [`prepare_propose_capped`] without a licence cap (tests only).
+#[cfg(test)]
 fn prepare_propose(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmationSession>, user: &str,
     input: ProposeRequest, now: i64) -> Result<Prepared, &'static str> {
+    prepare_propose_capped(home, db, proof, user, input, now, 0)
+}
+
+/// First admin step: step-up, principal, request match, label checks.
+/// `agent_cap` (0 = unlimited) is the licence cap; an adoption enforces it.
+fn prepare_propose_capped(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmationSession>, user: &str,
+    input: ProposeRequest, now: i64, agent_cap: usize) -> Result<Prepared, &'static str> {
     authorize_step_up(proof, user, &input.csrf_token, now)?;
     if !valid_label(&input.label) { return Err(LABEL_INVALID); }
-    if input.adoption_request_id.is_some() { return prepare_adoption(home, user, input, now); }
+    if input.adoption_request_id.is_some() { return prepare_adoption(home, user, input, now, agent_cap); }
     // SR2 finding 6: the request path's apply.db writer lock, held across
     // the open-label check (and taken again by `stage_prepared`).
     let mut requests = open_requests(home)?;
@@ -780,11 +791,12 @@ fn prepare_propose(home: &Path, db: &UserDb, proof: Option<&MigrationConfirmatio
 /// F6g: an adoption request → proposal. The engine re-runs every check
 /// (before this step takes the apply.db writer lock); the principal is the
 /// quarantine row's, never a request field.
-fn prepare_adoption(home: &Path, user: &str, input: ProposeRequest, now: i64) -> Result<Prepared, &'static str> {
-    use crate::isolation_adopt::{prepare_proposal, with_production_env, AdoptError};
+fn prepare_adoption(home: &Path, user: &str, input: ProposeRequest, now: i64, agent_cap: usize) -> Result<Prepared, &'static str> {
+    use crate::isolation_adopt::{prepare_proposal, with_production_env_capped, AdoptError};
     let id = input.adoption_request_id.as_deref().ok_or(PROPOSAL_INVALID)?;
     if input.request_id.is_some() { return Err(PROPOSAL_INVALID); }
-    let plan = with_production_env(home, user, now, |env| prepare_proposal(home, env, id)).map_err(AdoptError::message)?;
+    let plan = with_production_env_capped(home, user, agent_cap, now, |env| prepare_proposal(home, env, id))
+        .map_err(AdoptError::message)?;
     let principal = match &plan.binding {
         EmployeeBinding::Personal(owner) => input.binding_kind == "personal" && input.owner_id.as_deref().is_none_or(|o| o == owner.as_str()),
         EmployeeBinding::Shared(_) => input.binding_kind == "shared" && input.owner_id.is_none(),

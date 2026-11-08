@@ -251,6 +251,8 @@ impl crate::session::SessionManager {
     pub(crate) async fn import_legacy_message(&self, session_id: &str, agent: &str,
         record_id: &str, source: &str, text: &str) -> Result<(), Error> {
         let conn = self.acquire().await;
+        // F6fb item 2: an import never writes into a tombstoned or quarantined label.
+        crate::isolation_label_stores::check_label_writable_at(&conn, agent).map_err(|_| Error::Conflict)?;
         conn.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS legacy_import_messages (
             record_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, payload TEXT NOT NULL);")?;
         let tx = conn.unchecked_transaction()?;
