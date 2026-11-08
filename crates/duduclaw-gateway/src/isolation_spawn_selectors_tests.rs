@@ -57,13 +57,11 @@ fn ephemeral() -> Value {
 fn spawn_agent_refuses_foreign_personal_target() {
     let tenant = EmployeeBinding::Shared(t("tenant-a"));
     let personal_source = EmployeeBinding::Personal(t("alice"));
-    // A Personal target is refused whoever owns it (another owner here); it
-    // never runs delegated background work.
-    for source in [&tenant, &personal_source] {
-        for owner in ["bob", "alice"] {
-            let target = receipt(Some(EmployeeBinding::Personal(t(owner))), false);
-            assert_eq!(target_binding_allowed(source, Some(&target)), Err(VerificationError::BindingMismatch));
-        }
+    // A Personal target of another owner is refused, and every Personal
+    // target of a Shared source (H13b keeps only alice → alice).
+    for (source, owner) in [(&tenant, "bob"), (&tenant, "alice"), (&personal_source, "bob")] {
+        let target = receipt(Some(EmployeeBinding::Personal(t(owner))), false);
+        assert_eq!(target_binding_allowed(source, Some(&target)), Err(VerificationError::BindingMismatch));
     }
     // Not a confirmed protected employee, or disabled: refused.
     assert_eq!(target_binding_allowed(&tenant, None), Err(VerificationError::Invalid));
@@ -78,6 +76,77 @@ fn spawn_agent_refuses_foreign_personal_target() {
     policy(home.path(), "open");
     let args = json!({"agent_id":"target", "task":"Prepare the report."});
     assert!(authorize(&context, "spawn_agent", &args, &resolver).is_err());
+}
+
+/// One users.db snapshot for `(human, agent)` (the facts `same_owner` reads).
+fn snapshot(tenant: &str, human: &str, owner: Option<&str>, agent: &str, members: u32)
+    -> duduclaw_auth::IsolationAuthoritySnapshot {
+    let mut user = duduclaw_auth::UserContext::admin_fallback();
+    user.user_id = human.into();
+    user.agent_access.insert(agent.into(), duduclaw_auth::AccessLevel::Owner);
+    duduclaw_auth::IsolationAuthoritySnapshot { tenant_id: tenant.into(), acl_generation: 1, policy_epoch: 1,
+        human: Some(user), personal_owner: owner.map(Into::into), agent_member_count: members }
+}
+
+#[test]
+fn h13b_same_owner_personal_delegation_allowed() {
+    use crate::isolation_background::same_owner;
+    let alice = EmployeeBinding::Personal(t("alice"));
+    // Selector: a Personal source may target another Personal employee of the
+    // very same owner (no owner card: the owner started this run).
+    assert_eq!(target_binding_allowed(&alice, Some(&receipt(Some(alice.clone()), false))), Ok(()));
+    // Capture/recheck (the receipt path) apply the same rule, with the run's
+    // verified requester required to be exactly that owner …
+    assert_eq!(same_owner::personal_target_allowed(&alice, &alice, "alice"), Ok(()));
+    // … and the fresh users.db facts of the target showing that owner as its
+    // human, mirror owner and only member.
+    assert_eq!(same_owner::check_binding_facts(&alice, "target", &snapshot("tenant-a", "alice", Some("alice"), "target", 1)),
+        Ok(()));
+    // The record side: the source run must be owner-initiated.
+    let (_home, _resolver, context) = fixture(None);
+    assert_eq!(tool_policy::spawn::ephemeral_parent_allowed(&context), Ok(()));
+    // A disabled same-owner target is still refused.
+    assert_eq!(target_binding_allowed(&alice, Some(&receipt(Some(alice.clone()), true))), Err(VerificationError::Revoked));
+}
+
+#[test]
+fn h13b_cross_owner_personal_delegation_refused() {
+    use crate::isolation_background::same_owner;
+    let (alice, bob) = (EmployeeBinding::Personal(t("alice")), EmployeeBinding::Personal(t("bob")));
+    let tenant = EmployeeBinding::Shared(t("tenant-a"));
+    // Another owner's Personal employee: refused at the selector and at capture,
+    // never turned into an owner card.
+    assert_eq!(target_binding_allowed(&alice, Some(&receipt(Some(bob.clone()), false))), Err(VerificationError::BindingMismatch));
+    assert_eq!(same_owner::personal_target_allowed(&alice, &bob, "alice"), Err(VerificationError::BindingMismatch));
+    // Same owner, but the run was not started by that owner.
+    assert_eq!(same_owner::personal_target_allowed(&alice, &alice, "bob"), Err(VerificationError::BindingMismatch));
+    // A Shared source never reaches a Personal employee.
+    assert_eq!(same_owner::personal_target_allowed(&tenant, &alice, "alice"), Err(VerificationError::BindingMismatch));
+    // Fresh users.db facts that no longer show the owner refuse at recheck.
+    for current in [snapshot("tenant-a", "alice", Some("bob"), "target", 1), snapshot("tenant-a", "bob", Some("alice"), "target", 1),
+        snapshot("tenant-a", "alice", Some("alice"), "target", 2), snapshot("tenant-a", "alice", None, "target", 1),
+        snapshot("tenant-a", "alice", Some("alice"), "other", 1)] {
+        assert_eq!(same_owner::check_binding_facts(&alice, "target", &current), Err(VerificationError::Revoked));
+    }
+}
+
+#[test]
+fn h13b_shared_unchanged() {
+    use crate::isolation_background::same_owner;
+    let (tenant, other) = (EmployeeBinding::Shared(t("tenant-a")), EmployeeBinding::Shared(t("tenant-b")));
+    assert_eq!(target_binding_allowed(&tenant, Some(&receipt(Some(tenant.clone()), false))), Ok(()));
+    assert_eq!(target_binding_allowed(&tenant, Some(&receipt(Some(other.clone()), false))), Err(VerificationError::BindingMismatch));
+    assert_eq!(target_binding_allowed(&tenant, Some(&receipt(None, false))), Ok(()));
+    // Personal → Shared keeps the owner card path (not refused here).
+    assert_eq!(target_binding_allowed(&EmployeeBinding::Personal(t("alice")), Some(&receipt(Some(tenant.clone()), false))), Ok(()));
+    // Capture: a Shared target is never subject to the same-owner rule …
+    for source in [&tenant, &EmployeeBinding::Personal(t("alice"))] {
+        assert_eq!(same_owner::personal_target_allowed(source, &tenant, "anyone"), Ok(()));
+    }
+    // … and its users.db check is still exactly the tenant comparison.
+    assert_eq!(same_owner::check_binding_facts(&tenant, "target", &snapshot("tenant-a", "bob", None, "target", 3)), Ok(()));
+    assert_eq!(same_owner::check_binding_facts(&tenant, "target", &snapshot("tenant-b", "bob", None, "target", 3)),
+        Err(VerificationError::Revoked));
 }
 
 #[test]

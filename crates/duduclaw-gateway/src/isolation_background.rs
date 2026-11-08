@@ -10,6 +10,14 @@ use crate::isolation_lifecycle::{self as lifecycle, EmployeeLifecycle, Lifecycle
 
 pub mod material;
 mod store;
+// H13b: the one Personal background shape (same-owner delegation) and the
+// protected `spawn_ephemeral` child built on it. The capture rule is reached
+// from `record_delegation_inner` on Linux only; tests run everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) mod same_owner;
+pub use same_owner::personal_record_allowed;
+pub mod ephemeral_child;
+pub use ephemeral_child::is_ephemeral_child;
 // Reached from `record_delegation_inner` on Linux only; tests run everywhere.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod personal_delegation;
@@ -22,7 +30,10 @@ pub(crate) use personal_delegation::test_support as personal_delegation_test_sup
 mod lifecycle_tests;
 /// Shown when background work is asked of a Personal employee. Such an
 /// employee only acts for its owner in a live session (never a Background
-/// principal), so no approval card is filed.
+/// principal), so no approval card is filed. H13b exception (owner decision
+/// 2026-11-09, `same_owner`): work delegated from a live run of a Personal
+/// employee of the same owner, started by that owner — including the
+/// employee's own `spawn_ephemeral` child — runs as its background work.
 pub const PERSONAL_REFUSAL: &str =
     "個人專屬員工不能執行背景工作（排程、提醒、定期檢查或自動交辦）；請由擁有者直接在對話中交辦。";
 /// Shown when a receipt approved before v1.81 (without the employee binding
@@ -66,8 +77,8 @@ pub struct RecordAuthority {
     agent: String,
     employee: EmployeeId,
     /// v1.81: the principal the employee was allocated for (A1 root receipt
-    /// `principal_binding`, read through the A2 lifecycle). Always Shared:
-    /// a Personal employee never runs background work. `None` only in a
+    /// `principal_binding`, read through the A2 lifecycle). Shared, except a
+    /// same-owner Personal delegation (H13b, `same_owner`). `None` only in a
     /// receipt stored before v1.81; such a receipt never authorizes a run.
     #[serde(default)]
     binding: Option<EmployeeBinding>,
@@ -260,12 +271,17 @@ async fn request_record_inner(home: &Path, kind: &str, id: &str, agent: &str,
 /// are refused entirely, so no receipt or approval card is ever created.
 fn capture_binding(home: &Path, agent: &str, root: &dyn RootAllocation)
     -> Result<Option<(EmployeeId, EmployeeBinding, ProposalBinding, u32)>, VerificationError> {
+    let captured = capture_lifecycle(home, agent, root)?;
+    Ok(matches!(captured.1, EmployeeBinding::Shared(_)).then_some(captured))
+}
+
+/// Identity, binding (Shared or Personal), allocation and incarnation of the
+/// live employee holding `agent`. Only the delegation capture uses the
+/// Personal case, and only under `same_owner::personal_target_allowed`.
+fn capture_lifecycle(home: &Path, agent: &str, root: &dyn RootAllocation)
+    -> Result<(EmployeeId, EmployeeBinding, ProposalBinding, u32), VerificationError> {
     let current = current_lifecycle(home, agent, root)?;
-    match &current.binding {
-        EmployeeBinding::Shared(_) => Ok(Some((current.employee, current.binding.clone(), current.allocation,
-            current.incarnation))),
-        EmployeeBinding::Personal(_) => Ok(None),
-    }
+    Ok((current.employee, current.binding.clone(), current.allocation, current.incarnation))
 }
 
 /// The owning scheduler reads the record again on each fire and supplies its
@@ -397,8 +413,12 @@ fn check_lifecycle(receipt: &RecordAuthority, current: &EmployeeLifecycle) -> Re
         || current.incarnation != receipt.incarnation {
         return Err(VerificationError::Revoked);
     }
-    // B1: a Personal employee is never authorized for background work.
-    if !matches!(current.binding, EmployeeBinding::Shared(_)) { return Err(VerificationError::Revoked); }
+    // B1: a Personal employee is never authorized for background work, except
+    // the H13b same-owner delegation shape (its source's live binding is
+    // compared in `recheck_receipt`).
+    if !matches!(current.binding, EmployeeBinding::Shared(_)) && !same_owner::personal_receipt_allowed(receipt) {
+        return Err(VerificationError::Revoked);
+    }
     Ok(())
 }
 
@@ -448,7 +468,9 @@ fn recheck_receipt(receipt: &RecordAuthority, ancestor: bool, check_decision: bo
         if store::material_digest(&material)? != receipt.material { return Err(VerificationError::Revoked); }
     }
     let current = snapshot(&receipt.home, &receipt.owner, &receipt.agent)?;
-    check_tenant(receipt.binding.as_ref().ok_or(VerificationError::Revoked)?, &current.tenant_id)?;
+    // Shared: the tenant (unchanged). H13b Personal: the owner facts.
+    same_owner::check_binding_facts(receipt.binding.as_ref().ok_or(VerificationError::Revoked)?,
+        &receipt.agent, &current)?;
     let policy = crate::approval::strict_policy_revision(&receipt.home, &receipt.agent).map_err(|_| unavailable())?;
     check_identity(receipt, current.human.as_ref().map(|h| h.credential_epoch),
         current.acl_generation, current.policy_epoch, &policy)?;
@@ -462,6 +484,8 @@ fn recheck_receipt(receipt: &RecordAuthority, ancestor: bool, check_decision: bo
         if Some(caller.employee) != receipt.caller || caller.incarnation != receipt.caller_incarnation {
             return Err(VerificationError::Revoked);
         }
+        // H13b: a Personal target's source is still the same owner's Personal employee.
+        same_owner::check_source_binding(receipt, &caller.binding)?;
         let origin = snapshot(&receipt.home, &receipt.owner, agent)?;
         if origin.human.as_ref().map(|h| h.credential_epoch) != Some(receipt.epoch)
             || origin.acl_generation != receipt.acl_generation || origin.policy_epoch != receipt.policy_epoch
@@ -506,6 +530,13 @@ pub(crate) async fn authorize_current(agent_dir: &Path, principal_context: Optio
             crate::isolation_mcp::HostTurn { identity: crate::isolation_egress::RunTurnIdentity {
                 turn, approval_session: session }, metadata: Some(metadata), principal_context,
                 egress_turn, background: Some(receipt.clone()) }, Some(receipt.expires_at), task)?;
+        // H13b: an ephemeral child (self-delegation) holds only its job's
+        // tools; any other self-delegation, or a job that is not released or
+        // does not match this receipt exactly, refuses the run.
+        if let Some(tools) = ephemeral_child::child_tools(&receipt, auth.grant.tools.as_slice(),
+            |id| crate::isolation_ephemeral::EphemeralJobs::open(&receipt.home)?.released(id))? {
+            auth.grant.tools = tools;
+        }
         // Queue consumers are detached host waiters. The initiating employee
         // and run remain in the receipt; treating them as a synchronous waiter
         // would deadlock/refuse a valid self-delegation after its parent exits.
@@ -582,21 +613,31 @@ async fn record_delegation_inner(home: &Path, sender: &str,
             let source = crate::isolation_mcp::delegation_source(&home, &sender, &context)?;
             let current = snapshot(&home, &source.owner, &target)?;
             // A queued delegation runs as background work of the target: a
-            // Personal target is refused before any receipt is stored.
-            let Some((employee, binding, allocation, incarnation)) = capture_binding(&home, &target, &lifecycle::RootAllocator)? else {
-                tracing::warn!(agent = target.as_str(), "delegation refused: personal employees never run background work");
+            // Personal target is refused before any receipt is stored, unless
+            // (H13b, owner decision B) the source is a Personal employee of the
+            // very same owner and that owner started this run. The target may be
+            // the source itself (a `spawn_ephemeral` child, decision A).
+            let principal = user_id(&source.owner)?;
+            let (employee, binding, allocation, incarnation) = capture_lifecycle(&home, &target, &lifecycle::RootAllocator)?;
+            let personal_target = matches!(binding, EmployeeBinding::Personal(_));
+            if same_owner::personal_target_allowed(&source.binding, &binding, &principal).is_err() {
+                tracing::warn!(agent = target.as_str(), "delegation refused: a personal employee runs background work only for its own owner's personal employees");
                 return Err(VerificationError::Invalid);
-            };
-            check_tenant(&binding, &current.tenant_id)?;
+            }
+            same_owner::check_binding_facts(&binding, &target, &current)?;
             if current.human.as_ref().map(|h| h.credential_epoch) != Some(source.epoch)
                 || current.acl_generation != source.acl_generation || current.policy_epoch != source.policy_epoch {
                 return Err(VerificationError::Revoked);
             }
             let policy = crate::approval::strict_policy_revision(&home, &target).map_err(|_| unavailable())?;
-            // SR2: Personal source → owner approval card first; Shared → None.
-            let gate = personal_delegation::gate(&source.binding, &user_id(&source.owner)?, &source.agent,
-                source.employee, &target, employee, &material)?
-                .map(|gate| gate.with_source_incarnation(source.incarnation));
+            // SR2: Personal source → Shared target: owner approval card first;
+            // Shared source → None. H13b: a same-owner Personal target needs no
+            // card (its owner started this very run; checked just above).
+            let gate = if personal_target { None } else {
+                personal_delegation::gate(&source.binding, &principal, &source.agent,
+                    source.employee, &target, employee, &material)?
+                    .map(|gate| gate.with_source_incarnation(source.incarnation))
+            };
             let value = RecordAuthority { home, kind: "delegation".into(), id, agent: target.clone(), employee,
                 binding: Some(binding), allocation: Some(allocation), owner: source.owner, epoch: source.epoch, acl_generation: source.acl_generation,
                 policy_epoch: source.policy_epoch,

@@ -19,8 +19,11 @@
 //! run no longer holds the capability ([`ParentRuns`]) and the employee is
 //! still the same id and incarnation ([`ParentIdentity`]); anything else
 //! keeps it pending (unreadable) or drops it (expired, tombstoned, restored).
-//! Release is one-shot. Starting a released job as a run is the consumer's
-//! job (see the H13 follow-up in the work breakdown).
+//! Release is one-shot. H13b: the dispatcher tick releases jobs with the
+//! production liveness (`isolation_ephemeral_runs::LiveRuns`) and starts each
+//! as a background self-delegation of the parent employee
+//! (`isolation_ephemeral_start`, `isolation_background::ephemeral_child`),
+//! whose receipt is captured here while the parent run is still live.
 use std::path::Path;
 use duduclaw_isolation::{capability::{EmployeeBinding, Lane}, execution::RunHandle, ids::EmployeeId};
 use duduclaw_mcp_boundary::{RequestContext, VerificationError};
@@ -186,6 +189,21 @@ impl EphemeralJobs {
         }).transpose()
     }
 
+    /// H13b: the job `id` if it was released (the only state a child may run
+    /// from). A row whose stored job disagrees with its keys is `Revoked`.
+    pub fn released(&self, id: &str) -> Result<Option<EphemeralJob>, VerificationError> {
+        use rusqlite::OptionalExtension;
+        let row: Option<(String, String, String)> = self.db.query_row(
+            "SELECT employee,run,job FROM ephemeral_jobs WHERE id=?1 AND state='released'", [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional().map_err(store_error)?;
+        let Some((employee, run, encoded)) = row else { return Ok(None) };
+        let job: EphemeralJob = serde_json::from_str(&encoded).map_err(|_| VerificationError::Revoked)?;
+        if job.id != id || hex(&job.parent.employee.0) != employee || hex(&(job.parent.run.0).0) != run {
+            return Err(VerificationError::Revoked);
+        }
+        Ok(Some(job))
+    }
+
     /// Release (once) every pending job whose parent run no longer holds the
     /// capability and whose employee is still the same id and incarnation.
     /// Expired, corrupt or re-identified jobs are dropped; unreadable
@@ -235,25 +253,39 @@ impl EphemeralJobs {
 /// run association of `context` (`delegation_source`: running, same
 /// employee, binding and incarnation as prepared); the sender must be its
 /// agent. Never awaits the child (D8).
+///
+/// H13b: while the parent is live, the child's background authority is
+/// captured as a self-delegation receipt (`ephemeral_child::record_child`:
+/// fresh lifecycle + users.db reads; a Personal parent only when its
+/// lifecycle owner personally started this run). A child never files a child.
 pub async fn queue_for_parent(home: &Path, sender: &str, context: &RequestContext, request: EphemeralRequest)
     -> Result<EphemeralJob, VerificationError> {
     if !duduclaw_core::execution_gate::isolation_required() { return Err(VerificationError::Invalid); }
     #[cfg(target_os = "linux")]
     {
-        let (home, sender, context) = (home.to_owned(), sender.to_owned(), context.clone());
-        duduclaw_mcp_boundary::authority::verify_blocking(move || {
+        let (blocking_home, blocking_sender, blocking_context) = (home.to_owned(), sender.to_owned(), context.clone());
+        let job = duduclaw_mcp_boundary::authority::verify_blocking(move || {
             use duduclaw_isolation::capability::Principal;
+            let (home, sender, context) = (blocking_home, blocking_sender, blocking_context);
             let source = crate::isolation_mcp::delegation_source(&home, &sender, &context)?;
             let record = context.record();
             if source.employee != record.employee || source.run != RunHandle(record.run)
                 || source.binding != record.employee_binding {
                 return Err(VerificationError::BindingMismatch);
             }
+            // Depth 1: the run of an ephemeral child never files another child.
+            if source.parent.as_ref().is_some_and(crate::isolation_background::is_ephemeral_child) {
+                return Err(VerificationError::Invalid);
+            }
             let Principal::Human { user_id, .. } = &record.principal else { return Err(VerificationError::Invalid); };
             let parent = ParentRun { agent: source.agent, employee: source.employee, incarnation: source.incarnation,
                 binding: source.binding, run: source.run, lane: source.lane, requester: user_id.as_str().to_owned(),
                 task: record.task.as_ref().map(|task| task.as_str().to_owned()) };
-            let job = EphemeralJob::new(parent, request, duduclaw_mcp_boundary::authority::now_seconds()?)?;
+            EphemeralJob::new(parent, request, duduclaw_mcp_boundary::authority::now_seconds()?)
+        }).await?;
+        crate::isolation_background::ephemeral_child::record_child(home, sender, context, &job).await?;
+        let home = home.to_owned();
+        duduclaw_mcp_boundary::authority::verify_blocking(move || {
             EphemeralJobs::open(&home)?.queue(&job)?;
             duduclaw_security::audit::append_audit_event(&home, &duduclaw_security::audit::AuditEvent::new(
                 QUEUED_EVENT, &job.parent.agent, duduclaw_security::audit::Severity::Info,

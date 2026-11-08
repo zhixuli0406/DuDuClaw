@@ -159,6 +159,9 @@ pub fn start_agent_dispatcher_with_crypto(
 
             // Poll SQLite message queue (new path)
             if let Some(ref mq) = message_queue {
+                // H13b: protected `spawn_ephemeral` children whose parent run
+                // has exited are enqueued first, so this poll starts them.
+                crate::isolation_ephemeral_start::start_released(&home_dir, mq).await;
                 if let Err(e) = poll_and_dispatch_sqlite(
                     mq,
                     &home_dir,

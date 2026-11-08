@@ -10,12 +10,16 @@
 //! - `spawn_agent`: the target is allowed by the live delegation policy
 //!   (`config.toml [delegation]` + org view, the same predicate the dispatcher
 //!   gate applies at dequeue) AND by the isolation bindings: the target must be
-//!   a confirmed, enabled protected employee; a Personal target is refused (it
-//!   never runs delegated background work, B1 — another owner's in
-//!   particular); a Shared target must be in the source's own tenant. A
-//!   Personal source delegating to a Shared target is allowed here: the
-//!   handler's `record_bus_delegation` then files the existing owner approval
-//!   card (`personal_delegation`) and queues nothing until the owner approves;
+//!   a confirmed, enabled protected employee; a Personal target is allowed
+//!   only from a Personal source of exactly the same owner whose run that
+//!   owner started (H13b, owner decision B 2026-11-09 — the same rule
+//!   `isolation_background::same_owner` applies when the receipt is captured
+//!   and rechecked); another owner's Personal target, or any Personal target
+//!   of a Shared source, is refused; a Shared target must be in the source's
+//!   own tenant. A Personal source delegating to a Shared target is allowed
+//!   here: the handler's `record_bus_delegation` then files the existing owner
+//!   approval card (`personal_delegation`) and queues nothing until the owner
+//!   approves;
 //! - `spawn_ephemeral`: the tool intersection must be non-empty and the
 //!   Personal-parent owner rule hold (`spawn_selector`).
 //!
@@ -62,20 +66,30 @@ impl GatewayResourceResolver {
             crate::isolation_lifecycle::LifecycleError::Unavailable => VerificationError::Unavailable,
             _ => VerificationError::Revoked,
         })?;
-        target_binding_allowed(&context.record().employee_binding, receipt.as_ref())
+        target_binding_allowed(&context.record().employee_binding, receipt.as_ref())?;
+        // H13b: a same-owner Personal target also needs the owner to have
+        // started this run (the record principal is the Human owner).
+        if matches!(receipt.as_ref().and_then(|receipt| receipt.principal_binding.as_ref()),
+            Some(EmployeeBinding::Personal(_))) {
+            tool_policy::spawn::ephemeral_parent_allowed(context)?;
+        }
+        Ok(())
     }
 }
 
 /// Binding rule for a `spawn_agent` target's confirmed receipt: absent ⇒
 /// `Invalid` (not a protected employee), disabled ⇒ `Revoked`, Personal ⇒
-/// `BindingMismatch` (whoever owns it), Shared in another tenant than a Shared
-/// source ⇒ `BindingMismatch`. A legacy receipt without a principal binding is
-/// Shared in the pinned tenant; the handler's full lifecycle read decides it.
+/// `BindingMismatch` unless the source is a Personal employee of exactly the
+/// same owner (H13b), Shared in another tenant than a Shared source ⇒
+/// `BindingMismatch`. A legacy receipt without a principal binding is Shared
+/// in the pinned tenant; the handler's full lifecycle read decides it.
 pub(super) fn target_binding_allowed(source: &EmployeeBinding, target: Option<&Receipt>)
     -> Result<(), VerificationError> {
     let receipt = target.ok_or(VerificationError::Invalid)?;
     if receipt.disabled { return Err(VerificationError::Revoked); }
     match (&receipt.principal_binding, source) {
+        (Some(EmployeeBinding::Personal(target_owner)), EmployeeBinding::Personal(own))
+            if !own.as_str().is_empty() && target_owner.as_str() == own.as_str() => Ok(()),
         (Some(EmployeeBinding::Personal(_)), _) => Err(VerificationError::BindingMismatch),
         (Some(EmployeeBinding::Shared(tenant)), EmployeeBinding::Shared(own)) if tenant != own =>
             Err(VerificationError::BindingMismatch),

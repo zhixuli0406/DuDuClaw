@@ -75,18 +75,27 @@ accept only their exact schemas (`agent_id`/`task`/`session_key`;
 `instruction`/`context`/`tools`/`tier`); delegation metadata and identity keys
 refuse. Every call re-reads the record task's live ownership (a reassigned or
 deleted task refuses and writes `isolation_task_run_refused`). `spawn_agent`:
-the target must pass the live delegation policy and be a confirmed, enabled,
-Shared protected employee in the source's tenant; Personal targets are refused
-(whoever owns them); a Personal source's delegation to a Shared target still
-waits for its owner's approval card (`isolation_personal_delegation`).
+the target must pass the live delegation policy and be a confirmed, enabled
+protected employee: a Shared target in the source's tenant, or (H13b, owner
+decision 2026-11-09) a Personal target whose lifecycle owner is exactly the
+owner of a Personal source whose run that owner started — it then runs as the
+target's background work without a card. Another owner's Personal employee,
+and any Personal target of a Shared source, is refused; a Personal source's
+delegation to a Shared target still waits for its owner's approval card
+(`isolation_personal_delegation`).
 `spawn_ephemeral` (D-H3): never scaffolds a new agent in protected mode; the
 child is a pending job (`isolation-ephemeral-jobs.db`) under the parent run's
 own employee id, incarnation and binding, with the requested tools intersected
-with the parent run's signed tool snapshot; a Personal parent spawns only on
-its owner's request. D8: the job is never awaited and is released only after
-the parent run no longer holds the employee's capability (and the employee is
-still the same id and incarnation); starting a released job is not wired yet
-(see the H13 follow-up), so queued jobs expire after 24 hours.
+with the parent run's signed tool snapshot; a Personal parent spawns only when
+its lifecycle owner personally started the parent run (fresh lifecycle and
+users.db read when the child's receipt is captured). D8: the job is never
+awaited. H13b: the dispatcher tick releases it once the parent run's
+capability was revoked in this gateway epoch and no other run of the employee
+holds one (an unknown run waits and expires after 24 hours) and the employee is
+still the same id and incarnation, then starts it as a self-delegation of the
+parent employee (the dispatcher's only self-delegation exception); the child
+holds only the job's tools, uses the parent's model routing (`tier` is
+recorded only) and cannot spawn another child.
 
 Service/Connector tools enter `BoundaryRoute::Resource` unless an explicit host handler is selected by `boundary_route` (including the Linux bundled model catalog). Exact grants are resolved and checked before the legacy handler. A capability for task-a refuses task-b. Employee-scope calls retain the original live employee gates. Explicit `tasks_list`, `activity_list`, `list_cron_tasks`, `goals_list`, `list_reminders` and `responsibility_get` use finite queries/readers with immutable IDs and employee ownership. Finite `db_query` accepts a strict single-table SELECT subset lowered into the parameterized SelectRequest builder; joins, functions, subqueries and other unsupported grammar refuse. EmployeeScope retains its existing product SQL policy.
 
@@ -172,8 +181,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `check_responses` | Resource → AuthorizedToolCall → original live employee handler |
 | `task_status` | Resource → AuthorizedToolCall → original live employee handler |
 | `agent_status` | Resource → AuthorizedToolCall → original live employee handler |
-| `spawn_agent` | Host authenticated target queue admission; fresh target run authority required; H13: each call is authorized against the own Employee grant (and the live record task) before any queue write; the target must pass the live delegation policy and be a confirmed Shared employee of the same tenant (Personal targets refused); a Personal source waits for its owner's delegation card |
-| `spawn_ephemeral` | Host pending job under the parent run's own employee id, incarnation and binding (D-H3), never a new scaffold; tools = requested ∩ parent run snapshot; Personal parent owner-only; refused for a foreign record task; released only after the parent run exits (D8); job start not wired yet |
+| `spawn_agent` | Host authenticated target queue admission; fresh target run authority required; H13: each call is authorized against the own Employee grant (and the live record task) before any queue write; the target must pass the live delegation policy and be a confirmed Shared employee of the same tenant, or (H13b) a Personal employee of the same owner as a Personal source started by that owner (other owners' Personal targets refused); a Personal source waits for its owner's delegation card for a Shared target |
+| `spawn_ephemeral` | Host pending job under the parent run's own employee id, incarnation and binding (D-H3), never a new scaffold; tools = requested ∩ parent run snapshot; Personal parent only when its owner started the run; refused for a foreign record task; released only after the parent run exits (D8), then started by the dispatcher as a self-delegation of the same employee id + incarnation with only the job's tools (H13b) |
 | `agent_update` | Resource → AuthorizedToolCall → original live employee handler |
 | `agent_remove` | Resource → AuthorizedToolCall → original live employee handler |
 | `agent_update_soul` | Resource → AuthorizedToolCall → original live employee handler |
