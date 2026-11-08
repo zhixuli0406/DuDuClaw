@@ -44,6 +44,9 @@ pub(crate) struct V168Outcome {
     /// `[redaction] purge_after_expire_days` changed: the handler rebuilds
     /// the redaction pipeline (which restarts the vault GC with it).
     pub reload_redaction: bool,
+    /// RM-155: `[files] allowed_roots` changed — the handler asks the macOS
+    /// folder-access watcher to probe the new roots.
+    pub reprobe_folder_access: bool,
     pub protected: Vec<ProtectedChange>,
 }
 
@@ -366,6 +369,7 @@ fn apply_files(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -
     );
     out.changes.push(format!("files.allowed_roots = [{n} entries]"));
     out.applied_immediate = true;
+    out.reprobe_folder_access = true;
     Ok(())
 }
 
@@ -700,8 +704,11 @@ mod tests {
         assert!(apply(json!({"files": {"allowed_roots": ["/./"]}})).is_err());
         // `/srv/a` has no drive letter, so it is not absolute on Windows.
         let abs = if cfg!(windows) { r"C:\srv\a" } else { "/srv/a" };
-        let (t, _) = apply(json!({"files": {"allowed_roots": [abs, abs, ""]}})).unwrap();
+        let (t, out) = apply(json!({"files": {"allowed_roots": [abs, abs, ""]}})).unwrap();
         assert_eq!(toml_at(&t, "files.allowed_roots").unwrap().as_array().unwrap().len(), 1);
+        assert!(out.reprobe_folder_access, "saving roots must re-probe macOS folder access");
+        let (_, untouched) = apply(json!({"takeover": {"enabled": true}})).unwrap();
+        assert!(!untouched.reprobe_folder_access);
         if cfg!(windows) {
             assert!(apply(json!({"files": {"allowed_roots": [r"C:\"]}})).is_err(), "drive root");
         }

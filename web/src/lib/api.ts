@@ -381,6 +381,20 @@ export interface SystemStatus {
   /** v1.68 W2: whether this build was compiled with OpenTelemetry tracing
    *  (`otel` cargo feature). Absent on older gateways → treat as `false`. */
   otel_compiled?: boolean;
+  /**
+   * RM-155: macOS folder access (privacy consent) for the protected folders
+   * this gateway uses. Present only while it is pending or denied; absent
+   * means healthy (or not macOS). Drives `FolderAccessBanner`.
+   */
+  folder_access?: FolderAccessStatus;
+}
+
+export type FolderAccessState = 'granted' | 'denied' | 'posix_denied' | 'pending_prompt' | 'unavailable';
+
+export interface FolderAccessStatus {
+  state: FolderAccessState;
+  paths: { path_label: string; state: FolderAccessState }[];
+  docs_url?: string;
 }
 
 /** Response of `system.autostart.status` / `system.autostart.set` — the

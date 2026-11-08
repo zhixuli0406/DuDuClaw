@@ -131,6 +131,85 @@ fn configured_roots(home_dir: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+// ── Guarded filesystem calls (RM-155) ───────────────────────────────────────
+
+/// Whether `path` is in a macOS-protected (TCC) location on this Mac. Always
+/// `false` off macOS, where `EPERM` means something else entirely.
+fn tcc_protected(path: &Path) -> bool {
+    use duduclaw_gateway::macos_folder_access as folder_access;
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let Some(home) = folder_access::user_home() else {
+        return false;
+    };
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return false,
+        }
+    };
+    folder_access::is_tcc_protected(&absolute, &home)
+}
+
+/// Run one filesystem call for a data-file tool on a dedicated thread with a
+/// bounded wait.
+///
+/// After an update macOS asks again for folder access; until someone clicks
+/// Allow, a read in `~/Documents` (or iCloud, `/Volumes/*`…) fails with
+/// `EPERM` — or, while the consent prompt is on screen, blocks. Without this
+/// the tool call hung until the whole reply timed out. Now a protected-path
+/// `EPERM` names the macOS permission and the steps, a timeout says macOS is
+/// waiting for a click, and every other error keeps the caller's `generic`
+/// wording.
+fn guarded_fs<T, F>(
+    raw: &str,
+    path: &Path,
+    generic: impl FnOnce(&std::io::Error) -> String,
+    op: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(PathBuf) -> std::io::Result<T> + Send + 'static,
+{
+    guarded_fs_with(
+        raw,
+        path,
+        tcc_protected(path),
+        duduclaw_gateway::macos_folder_access::FILE_OP_TIMEOUT,
+        generic,
+        op,
+    )
+}
+
+/// [`guarded_fs`] with the protection verdict and the wait injected (tests).
+fn guarded_fs_with<T, F, G>(
+    raw: &str,
+    path: &Path,
+    protected: bool,
+    timeout: std::time::Duration,
+    generic: G,
+    op: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(PathBuf) -> std::io::Result<T> + Send + 'static,
+    G: FnOnce(&std::io::Error) -> String,
+{
+    use duduclaw_gateway::macos_folder_access::{self as folder_access, ProbeOutcome};
+    let owned = path.to_path_buf();
+    match folder_access::run_with_timeout(timeout, move || op(owned)) {
+        ProbeOutcome::Completed(Ok(value)) => Ok(value),
+        ProbeOutcome::Completed(Err(e)) => {
+            let fallback = generic(&e);
+            Err(folder_access::file_error_text(raw, &e, protected, &fallback))
+        }
+        ProbeOutcome::TimedOut => Err(folder_access::file_timeout_text(raw, protected, timeout)),
+    }
+}
+
 fn render_roots(roots: &[PathBuf]) -> String {
     roots
         .iter()
@@ -163,15 +242,27 @@ pub fn vet_path(raw: &str, home_dir: &Path, agent_id: &str) -> Result<PathBuf, S
     let roots = allowed_roots(home_dir, agent_id);
     // Canonicalize resolves symlinks (so a symlink pointing outside a root is
     // caught by the containment test below) and proves the file exists.
-    let real = candidate
-        .canonicalize()
-        .map_err(|e| format!("路徑「{raw}」無法讀取：{e}"))?;
+    let real = guarded_fs(
+        raw,
+        candidate,
+        |e| format!("路徑「{raw}」無法讀取：{e}"),
+        |p| p.canonicalize(),
+    )?;
 
     let contained = roots.iter().any(|root| {
+        // `real` is canonical, so a root that is already a lexical prefix of
+        // it is itself symlink-free there — no need to touch the root (which
+        // may be a protected folder still waiting on a macOS prompt).
+        if real.starts_with(root) {
+            return true;
+        }
         // Canonicalize the roots too — on macOS `/var` and `/tmp` are
         // themselves symlinks, so an uncanonicalized prefix test would reject
-        // legitimate paths on a developer machine.
-        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        // legitimate paths on a developer machine. Guarded: an unanswered
+        // prompt on one root must not hang the read of another.
+        let display = root.display().to_string();
+        let root = guarded_fs(&display, root, |e| e.to_string(), |p| p.canonicalize())
+            .unwrap_or_else(|_| root.clone());
         real.starts_with(&root)
     });
     if !contained {
@@ -181,7 +272,12 @@ pub fn vet_path(raw: &str, home_dir: &Path, agent_id: &str) -> Result<PathBuf, S
         ));
     }
 
-    let meta = std::fs::metadata(&real).map_err(|e| format!("路徑「{raw}」無法讀取：{e}"))?;
+    let meta = guarded_fs(
+        raw,
+        &real,
+        |e| format!("路徑「{raw}」無法讀取：{e}"),
+        |p| std::fs::metadata(p),
+    )?;
     if !meta.is_file() {
         return Err(format!("路徑「{raw}」不是一般檔案。"));
     }
@@ -351,9 +447,14 @@ pub fn handle_file_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> V
         .max(1);
 
     let total = file_len(&path);
-    let buf = match read_prefix(&path, max_bytes) {
+    let buf = match guarded_fs(
+        raw_path,
+        &path,
+        |e| format!("讀取「{raw_path}」失敗：{e}"),
+        move |p| read_prefix(&p, max_bytes),
+    ) {
         Ok(b) => b,
-        Err(e) => return files_error(&format!("讀取「{raw_path}」失敗：{e}")),
+        Err(msg) => return files_error(&msg),
     };
     let truncated = total > buf.len() as u64;
     // Decode only the valid UTF-8 prefix: a byte-capped read lands mid-char on
@@ -420,9 +521,14 @@ pub fn handle_csv_read(arguments: &Value, home_dir: &Path, agent_id: &str) -> Va
     let limit = resolve_limit(arguments);
     let offset = resolve_offset(arguments);
 
-    let file = match std::fs::File::open(&path) {
+    let file = match guarded_fs(
+        raw_path,
+        &path,
+        |e| format!("讀取「{raw_path}」失敗：{e}"),
+        |p| std::fs::File::open(p),
+    ) {
         Ok(f) => f,
-        Err(e) => return files_error(&format!("讀取「{raw_path}」失敗：{e}")),
+        Err(msg) => return files_error(&msg),
     };
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(delimiter)
@@ -860,6 +966,101 @@ mod tests {
         let roots = allowed_roots(home.path(), "../evil");
         assert_eq!(roots.len(), 1, "only <home>/attachments: {roots:?}");
         assert!(roots[0].ends_with("attachments"));
+    }
+
+    // ── Guarded filesystem calls (RM-155) ───────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn a_protected_eperm_names_the_macos_permission_and_steps() {
+        let err = guarded_fs_with::<(), _, _>(
+            "~/Documents/客戶.csv",
+            Path::new("/Users/amy/Documents/客戶.csv"),
+            true,
+            std::time::Duration::from_secs(2),
+            |e| format!("讀取失敗：{e}"),
+            |_| Err(std::io::Error::from_raw_os_error(1)),
+        )
+        .unwrap_err();
+        assert!(err.contains("macOS"), "{err}");
+        assert!(err.contains("系統設定 › 隱私權與安全性 › 檔案和資料夾"), "{err}");
+        assert!(err.contains("System Settings › Privacy & Security › Files and Folders"), "{err}");
+        assert!(err.contains("~/Documents/客戶.csv"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unprotected_or_posix_failure_keeps_the_generic_text() {
+        let eperm_elsewhere = guarded_fs_with::<(), _, _>(
+            "/srv/a.csv",
+            Path::new("/srv/a.csv"),
+            false,
+            std::time::Duration::from_secs(2),
+            |e| format!("讀取失敗：{e}"),
+            |_| Err(std::io::Error::from_raw_os_error(1)),
+        )
+        .unwrap_err();
+        assert!(eperm_elsewhere.starts_with("讀取失敗："), "{eperm_elsewhere}");
+        let eacces = guarded_fs_with::<(), _, _>(
+            "~/Documents/a.csv",
+            Path::new("/Users/amy/Documents/a.csv"),
+            true,
+            std::time::Duration::from_secs(2),
+            |e| format!("讀取失敗：{e}"),
+            |_| Err(std::io::Error::from_raw_os_error(13)),
+        )
+        .unwrap_err();
+        assert!(eacces.starts_with("讀取失敗：") && !eacces.contains("檔案和資料夾"), "{eacces}");
+    }
+
+    #[test]
+    fn a_blocked_protected_read_says_macos_is_waiting_for_allow() {
+        let err = guarded_fs_with::<(), _, _>(
+            "~/Documents/a.csv",
+            Path::new("/Users/amy/Documents/a.csv"),
+            true,
+            std::time::Duration::from_millis(50),
+            |e| e.to_string(),
+            |_| {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("macOS is waiting for someone on this Mac to click Allow"), "{err}");
+        assert!(err.contains("按「允許」"), "{err}");
+    }
+
+    #[test]
+    fn a_blocked_unprotected_read_is_a_plain_timeout() {
+        let err = guarded_fs_with::<(), _, _>(
+            "/srv/a.csv",
+            Path::new("/srv/a.csv"),
+            false,
+            std::time::Duration::from_millis(50),
+            |e| e.to_string(),
+            |_| {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("逾時") && !err.contains("macOS"), "{err}");
+    }
+
+    #[test]
+    fn guarded_calls_pass_results_through() {
+        let home = tmp_home();
+        let dir = agent_dir(home.path(), "sales");
+        let file = dir.join("ok.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let got = guarded_fs("ok.txt", &file, |e| e.to_string(), |p| read_prefix(&p, 3)).unwrap();
+        assert_eq!(got, b"hel");
+        let missing = guarded_fs("nope", &dir.join("nope"), |_| "generic".to_string(), |p| {
+            std::fs::metadata(p)
+        })
+        .unwrap_err();
+        assert_eq!(missing, "generic");
     }
 
     // ── csv_read ────────────────────────────────────────────────────────────

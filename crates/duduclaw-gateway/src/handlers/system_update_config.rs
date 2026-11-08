@@ -1125,6 +1125,11 @@ impl MethodHandler {
                 restart_required.push("redaction.purge_after_expire_days".into());
             }
         }
+        // RM-155: new allowed roots may sit in a macOS-protected folder —
+        // probe them now rather than on the next 10-minute tick.
+        if v168.reprobe_folder_access {
+            crate::macos_folder_access::request_reprobe(&self.home_dir);
+        }
         restart_required.sort();
         restart_required.dedup();
 

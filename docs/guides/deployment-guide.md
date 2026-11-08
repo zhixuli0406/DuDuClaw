@@ -348,6 +348,13 @@ exit code 78, run that command to re-register the job with the updated binary.
 The first upgrade from a version without this fix can still need a manual
 restart: the new behavior starts once the fixed gateway is running.
 
+**Folder access after an update.** macOS may ask again whether DuDuClaw may
+read `~/Documents`, `~/Desktop`, `~/Downloads`, iCloud Drive or external
+volumes. Until someone clicks **Allow** on that Mac, AI employees cannot read
+files there; the dashboard shows a banner and admins get one channel notice.
+See [macOS folder access](macos-folder-access.md) for how to re-grant it, where
+to keep work files so it never matters, and the enterprise PPPC profile.
+
 ### Linux (systemd)
 
 Creates `~/.config/systemd/user/duduclaw.service` and enables it via the

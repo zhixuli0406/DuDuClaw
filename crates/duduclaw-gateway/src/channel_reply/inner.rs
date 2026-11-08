@@ -3985,6 +3985,17 @@ pub(super) async fn build_reply_with_session_inner(
         return crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.to_string();
     }
     if !operator_diagnostics_allowed(&ctx.home_dir, session_id) {
+        // RM-155: the TCC explanation carries no path or account detail, so
+        // it is safe for every non-visitor audience.
+        if reason == FailureReason::Timeout {
+            if let Some(text) = crate::macos_folder_access::channel_timeout_explanation(
+                &ctx.home_dir,
+                &name,
+                default_language.as_deref(),
+            ) {
+                return text;
+            }
+        }
         return end_user_failure_message(&name, reason, default_language.as_deref());
     }
     // The spawn gate already wrote its own audit event; the person sees the

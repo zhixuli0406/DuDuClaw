@@ -269,6 +269,7 @@ pub mod knowledge;
 pub mod knowledge_guard;
 pub(crate) mod local_session;
 pub mod maintenance;
+pub mod macos_folder_access;
 pub mod mast;
 pub mod memory_factory;
 pub mod memory_forget_approval;

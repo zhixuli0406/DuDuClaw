@@ -2657,6 +2657,28 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         });
     }
 
+    // RM-155: macOS folder access (TCC). The first pass runs at start-up —
+    // which is exactly the restart after an update, when macOS asks again —
+    // then on demand and every 10 minutes while anything is pending/denied.
+    // A change refreshes open dashboards; a TCC summary change (never the
+    // same state twice) is pushed to admins' linked channels.
+    #[cfg(target_os = "macos")]
+    {
+        let bg_state = state.clone();
+        let home = bg_state.home_dir.clone();
+        tokio::spawn(async move {
+            crate::macos_folder_access::run_watcher(home.clone(), move |report| {
+                let bg_state = bg_state.clone();
+                let home = home.clone();
+                async move {
+                    bg_state.handler.broadcast_system_status().await;
+                    crate::macos_folder_access::notify_admins(&home, &report).await;
+                }
+            })
+            .await;
+        });
+    }
+
     // WebChat endpoint — C5: now requires JWT auth (in-band) + Origin check,
     // mirroring the main /ws gate instead of being unauthenticated.
     let meeting_auth_state = state.clone();
