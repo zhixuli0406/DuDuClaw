@@ -8822,7 +8822,9 @@ max_active_skills = 5
     // directory reusing a previously-removed agent's name would otherwise
     // inherit that agent's stale store entry and quietly acquire a supervisor.
     if let Some(entry) = duduclaw_core::org_store::read_mirror(&agent_toml_path) {
-        if let Err(e) = duduclaw_core::org_store::upsert(&home, &agent_name, entry) {
+        if let Err(e) = duduclaw_core::org_store::with_org_lock(&home, |org| {
+            duduclaw_core::org_store::upsert(org, &agent_name, entry)
+        }) {
             tracing::warn!(agent = %agent_name, error = %e, "org.toml upsert failed during onboard");
         }
     }
@@ -11227,8 +11229,10 @@ pub(crate) async fn scaffold_planned_agent_dir(
             .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
         file.write_all(bytes).map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     }
-    duduclaw_core::org_store::upsert(home, &s.name, duduclaw_core::OrgEntry::new(&s.reports_to, ""))
-        .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+    duduclaw_core::org_store::with_org_lock(home, |org| {
+        duduclaw_core::org_store::upsert(org, &s.name, duduclaw_core::OrgEntry::new(&s.reports_to, ""))
+    })
+    .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     Ok(agent_dir)
 }
 
@@ -11347,11 +11351,10 @@ pub(crate) async fn scaffold_agent_dir(
     // Scaffolds are department-less; `pack install` records its department
     // right after it patches it in. Best-effort: on failure the agent simply
     // has no record, and the fallback rule keeps its `agent.toml` governing it.
-    if let Err(e) = duduclaw_core::org_store::upsert(
-        home,
-        agent_name,
-        duduclaw_core::OrgEntry::new(reports_to, ""),
-    ) {
+    // Under the global org lock like every authority write (RM-027 round 3).
+    if let Err(e) = duduclaw_core::org_store::with_org_lock(home, |org| {
+        duduclaw_core::org_store::upsert(org, agent_name, duduclaw_core::OrgEntry::new(reports_to, ""))
+    }) {
         tracing::warn!(agent = %agent_name, error = %e, "org.toml upsert failed while scaffolding agent");
     }
 
@@ -13679,8 +13682,10 @@ mod org_authority_tests {
         // And the follow-on state: a gated write recreates the file holding
         // only its own entry (it must NOT re-import the mirrors), which is
         // still a degradation and must still be reported.
-        duduclaw_core::org_store::upsert(home, "helper", duduclaw_core::OrgEntry::new("boss", ""))
-            .unwrap();
+        duduclaw_core::org_store::with_org_lock(home, |org| {
+            duduclaw_core::org_store::upsert(org, "helper", duduclaw_core::OrgEntry::new("boss", ""))
+        })
+        .unwrap();
         let store = duduclaw_core::org_store::load(home);
         assert_eq!(store.len(), 1, "mirrors must not be re-imported: {store:?}");
         let (_, status, detail) = org_authority_check(home);

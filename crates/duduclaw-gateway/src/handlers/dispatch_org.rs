@@ -154,6 +154,27 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_departments_remove(params)).await
             }
+            // ── Org chart editing (RM-027) ──
+            // A Manager proposes (an Admin approves in the approval centre);
+            // an Admin applies directly after the before/after confirmation.
+            // Each handler re-reads the role from users.db and applies the
+            // per-employee ACL itself.
+            "org.propose_change" => {
+                require_manager!();
+                boxed_frame(|| self.handle_org_propose_change(params, ctx)).await
+            }
+            "org.pending_changes" => {
+                require_manager!();
+                boxed_frame(|| self.handle_org_pending_changes(params, ctx)).await
+            }
+            "org.placement" => {
+                require_manager!();
+                boxed_frame(|| self.handle_org_placement(params, ctx)).await
+            }
+            "org.apply_change" => {
+                require_admin!();
+                boxed_frame(|| self.handle_org_apply_change(params, ctx)).await
+            }
             "users.list" => {
                 require_admin!();
                 boxed_frame(|| self.handle_users_list()).await

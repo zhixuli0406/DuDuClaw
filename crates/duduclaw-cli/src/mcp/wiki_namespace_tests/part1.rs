@@ -449,9 +449,9 @@ async fn role_member_tools_list_uses_ephemeral_capabilities() {
     std::fs::write(parent_dir.join("agent.toml"), "[agent]\nstatus = 'active'\n").unwrap();
     let metadata = "parent = 'parent'\ntier = 'standard'\ncreated_at = '2026-10-29T00:00:00Z'\nexpires_at = '2026-10-30T00:00:00Z'\n";
     std::fs::write(dir.join("ephemeral.toml"), metadata).unwrap();
-    duduclaw_core::org_store::upsert(
-        home.path(), member, duduclaw_core::org_store::OrgEntry::new("parent", ""),
-    ).unwrap();
+    duduclaw_core::org_store::with_org_lock(home.path(), |org| {
+        duduclaw_core::org_store::upsert(org, member, duduclaw_core::org_store::OrgEntry::new("parent", ""))
+    }).unwrap();
     let mut principal =
         internal_principal_named(duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID);
     principal.scopes.insert(crate::mcp_auth::Scope::Admin);
@@ -482,15 +482,22 @@ async fn role_member_tools_list_uses_ephemeral_capabilities() {
         assert!(names_of(&super::handle_tools_list_for_agent(&json!(7), &principal, home.path(), member).await).is_empty());
     }
     std::fs::write(dir.join("ephemeral.toml"), metadata.replace("parent = 'parent'", &format!("parent = '{member}'"))).unwrap();
-    duduclaw_core::org_store::upsert(
-        home.path(), member, duduclaw_core::org_store::OrgEntry::new(member, ""),
-    ).unwrap();
+    // Authority writers refuse a self-report (RM-027 round 3)…
+    assert!(duduclaw_core::org_store::with_org_lock(home.path(), |org| {
+        duduclaw_core::org_store::upsert(org, member, duduclaw_core::org_store::OrgEntry::new(member, ""))
+    }).is_err());
+    // …so plant the legacy / hand-edited self-loop directly: still refused.
+    let org_path = duduclaw_core::org_store::org_store_path(home.path());
+    let row = format!("[agents.{member}]\nreports_to = \"parent\"\n");
+    let raw = std::fs::read_to_string(&org_path).unwrap();
+    assert!(raw.contains(&row), "{raw}");
+    std::fs::write(&org_path, raw.replace(&row, &format!("[agents.{member}]\nreports_to = \"{member}\"\n"))).unwrap();
     assert!(super::check_background_caller(home.path(), actor, "team_handoff").is_err());
     assert!(names_of(&super::handle_tools_list_for_agent(&json!(8), &principal, home.path(), member).await).is_empty());
     std::fs::write(dir.join("ephemeral.toml"), metadata).unwrap();
-    duduclaw_core::org_store::upsert(
-        home.path(), member, duduclaw_core::org_store::OrgEntry::new("parent", ""),
-    ).unwrap();
+    duduclaw_core::org_store::with_org_lock(home.path(), |org| {
+        duduclaw_core::org_store::upsert(org, member, duduclaw_core::org_store::OrgEntry::new("parent", ""))
+    }).unwrap();
 
     // Syntactically valid TOML with a wrong capability type must match
     // the dispatch gate's stricter policy-only parse and expose nothing.

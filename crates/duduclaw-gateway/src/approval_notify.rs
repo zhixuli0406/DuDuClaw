@@ -216,6 +216,9 @@ pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
         || kind == crate::approval::WORKFLOW_ACTIVATION_KIND
         || kind == crate::expert_skills::SKILLS_ACTION_KIND
         || kind == crate::agent_files::approval::ACTION_KIND
+        // RM-027: moving an employee in the org chart is decided by a current
+        // Admin, which a channel press cannot establish.
+        || kind == crate::org_change_approval::ACTION_KIND
         || crate::approval::operator_cli_gate::spec_for(kind).is_some()
 }
 
@@ -241,6 +244,8 @@ pub(crate) fn dashboard_only_expired_text(kind: &str) -> &'static str {
         crate::knowledge::add_source_approval::EXPIRED_TEXT
     } else if kind == crate::agent_files::approval::ACTION_KIND {
         "這份設定檔修改的審核已逾期，修改沒有套用；需要的話請重新送出。"
+    } else if kind == crate::org_change_approval::ACTION_KIND {
+        crate::org_change_approval::EXPIRED_TEXT
     } else if let Some(spec) = crate::approval::operator_cli_gate::spec_for(kind) {
         spec.expired_text
     } else {
@@ -280,6 +285,9 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
     }
     if rec.action_kind == crate::agent_files::approval::ACTION_KIND {
         return agent_file_notice_body(rec, reminder);
+    }
+    if rec.action_kind == crate::org_change_approval::ACTION_KIND {
+        return crate::org_change_approval::notice_body(rec, reminder, &deadline_phrase(rec));
     }
     let head = if reminder {
         "⏰ 有一則知識審核快到期了，逾時會自動捨棄"

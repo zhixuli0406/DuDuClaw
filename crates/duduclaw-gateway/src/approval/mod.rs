@@ -149,6 +149,39 @@ pub struct ApprovalBroker {
     store: std::sync::Arc<ApprovalStore>,
 }
 
+/// RM-027: proof of a short exclusive decision lease on one pending
+/// approval ([`ApprovalBroker::take_decision_lease`]). While it is live the
+/// TTL sweep, `poll`, plain deciders and `withdraw` leave the row alone, so
+/// a decided effect and its terminal state land together.
+#[derive(Debug)]
+pub struct DecisionLease {
+    token: String,
+}
+
+/// RM-027 round 4: keeps a [`DecisionLease`] alive in the background for as
+/// long as the decision is in flight ([`ApprovalBroker::keep_decision_lease`]).
+///
+/// A lease renewed once and then left alone lapses during any long internal
+/// wait (an `agent.toml` advisory lock, say); the TTL sweep could then
+/// expire the card while the side effect still commits. The keeper renews
+/// it every quarter of its length: inside the TTL until
+/// [`Self::mark_committed`], then without the TTL (the holder already passed
+/// its final in-TTL check) until the terminal decision. Stops on drop.
+///
+/// RM-027 round 5: a committed lease has a **maximum lifetime**
+/// (`committed_max`, counted from [`Self::mark_committed`]). Extensions
+/// never reach past it, and once it is spent the keeper stops
+/// ([`Self::expired`]) and the lease lapses: a holder stuck after its commit
+/// can no longer keep the card pending forever — the journal of the
+/// committed side effect takes over (its recovery takes a lease of its own).
+#[derive(Debug)]
+pub struct LeaseKeeper {
+    committed: std::sync::Arc<std::sync::OnceLock<std::time::Instant>>,
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    expired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 #[cfg(test)]
 mod tests;
 

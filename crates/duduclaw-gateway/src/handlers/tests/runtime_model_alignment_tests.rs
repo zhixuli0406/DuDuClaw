@@ -289,3 +289,101 @@ enabled=false
             .contains("# retained")
     );
 }
+
+/// RM-027 round 4, finding 1: the template writer takes the org lock first
+/// and publishes the directory only after the authority row committed — an
+/// unusable authority (or a cycle) fails the create with nothing left on
+/// disk, instead of warning and leaving a mirror-governed employee.
+#[tokio::test(flavor = "current_thread")]
+async fn template_writer_fails_closed_when_the_org_authority_refuses() {
+    let home = tempfile::tempdir().unwrap();
+    let assets = tempfile::tempdir().unwrap();
+    let h = MethodHandler::new(home.path().to_owned()).await;
+    let assembled = crate::premium_templates::AssembledRole {
+        role_id: "owned-role".into(), kind: crate::premium_templates::RoleKind::Worker,
+        name: "tmpl".into(), display_name: "Tmpl".into(), trigger: "@Tmpl".into(), reports_to: String::new(),
+        summary: "Owned fixture".into(), soul_md: "# Owned fixture".into(), contract_toml: String::new(),
+        agent_toml: r#"[agent]
+name='tmpl'
+display_name='Tmpl'
+role='specialist'
+status='active'
+trigger='@Tmpl'
+reports_to=''
+icon='🤖'
+[model]
+preferred='claude-sonnet-4-6'
+fallback=''
+account_pool=[]
+[runtime]
+provider='claude'
+[container]
+timeout_ms=1800000
+[heartbeat]
+enabled=false
+interval_seconds=3600
+max_concurrent_runs=1
+cron=''
+[budget]
+monthly_limit_cents=5000
+warn_threshold_percent=80
+hard_stop=true
+[permissions]
+can_create_agents=false
+can_send_cross_agent=false
+can_modify_own_skills=false
+can_modify_own_soul=false
+can_schedule_tasks=false
+allowed_channels=['*']
+"#.into(), extras_dir: None,
+    };
+    let admin = UserContext::admin_fallback();
+    let no_leftovers = |name: &str| {
+        let agents = home.path().join("agents");
+        assert!(!agents.join(name).exists(), "agents/{name} must not exist");
+        if let Ok(rd) = std::fs::read_dir(&agents) {
+            for e in rd.filter_map(|e| e.ok()) {
+                assert!(
+                    !e.file_name().to_string_lossy().starts_with(duduclaw_core::org_store::AGENT_STAGING_PREFIX),
+                    "staging leftover {:?}", e.file_name()
+                );
+            }
+        }
+    };
+
+    // Corrupt authority.
+    let store = duduclaw_core::org_store::org_store_path(home.path());
+    std::fs::write(&store, "schema = \"x\"\n").unwrap();
+    let frame = h
+        .create_assembled_template_agent(&json!({"name":"tmpl"}), &admin, assets.path(), "owned-role", &assembled)
+        .await;
+    assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{frame:?}");
+    no_leftovers("tmpl");
+    assert_eq!(std::fs::read_to_string(&store).unwrap(), "schema = \"x\"\n");
+
+    // A healthy store with a stale row `loopy → tmpl`: creating `tmpl`
+    // under `loopy` would close the loop `tmpl → loopy → tmpl` — refused.
+    std::fs::remove_file(&store).unwrap();
+    let _ = std::fs::remove_file(duduclaw_core::org_store::org_seeded_path(home.path()));
+    duduclaw_core::org_store::seed_if_absent(home.path()).unwrap();
+    duduclaw_core::org_store::with_org_lock(home.path(), |org| {
+        duduclaw_core::org_store::upsert(org, "loopy", duduclaw_core::OrgEntry::new("tmpl", ""))
+    })
+    .unwrap();
+    let mut cyclic = assembled.clone();
+    cyclic.agent_toml = cyclic.agent_toml.replace("reports_to=''", "reports_to='loopy'");
+    let frame = h
+        .create_assembled_template_agent(&json!({"name":"tmpl"}), &admin, assets.path(), "owned-role", &cyclic)
+        .await;
+    assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{frame:?}");
+    no_leftovers("tmpl");
+    assert!(duduclaw_core::org_store::load(home.path()).get("tmpl").is_none());
+
+    // Control: with a usable authority the same template is created.
+    let frame = h
+        .create_assembled_template_agent(&json!({"name":"tmpl"}), &admin, assets.path(), "owned-role", &assembled)
+        .await;
+    assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+    assert!(home.path().join("agents/tmpl/agent.toml").is_file());
+    assert_eq!(duduclaw_core::org_store::load(home.path()).get("tmpl").unwrap().reports_to, "");
+}

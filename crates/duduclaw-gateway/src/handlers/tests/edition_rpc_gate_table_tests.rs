@@ -129,6 +129,11 @@ fn personal_surfaces_are_untouched() {
         "wiki_scope.update",
         // 組織架構 — D6 改為漸進揭露，兩版皆可讀
         "topology.list",
+        // 組織圖編輯 (RM-027) — 跨 agent，不是跨人
+        "org.propose_change",
+        "org.apply_change",
+        "org.pending_changes",
+        "org.placement",
         // 日常主軌
         "agents.list",
         "agents.create",

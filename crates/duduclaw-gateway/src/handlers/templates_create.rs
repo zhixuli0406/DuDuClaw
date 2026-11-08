@@ -213,34 +213,35 @@ impl MethodHandler {
         let agents_dir = self.registry.read().await.agents_dir().to_path_buf();
         let agent_dir = agents_dir.join(&name);
 
-        // Atomic directory claim: `create_dir` (not `create_dir_all`) fails on
-        // AlreadyExists, so two concurrent creates can't both win the name.
+        // RM-027 round 4: take the global org lock at the START and hold it
+        // to the publish. The team member is built in an invisible staging
+        // directory next to its final path and renamed into place only after
+        // its authority row committed; an authority refusal (corrupt store,
+        // a cycle) fails the whole create — no mirror-governed employee.
+        let org = match super::org_change_rpc::lock_org(&self.home_dir).await {
+            Ok(org) => org,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
         if let Err(e) = tokio::fs::create_dir_all(&agents_dir).await {
             return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
         }
-        if let Err(e) = tokio::fs::create_dir(&agent_dir).await {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
+        let staged = match duduclaw_core::org_store::StagedAgentDir::create(&org, &agent_dir, &name) {
+            Ok(staged) => staged,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return WsFrame::error_response("", &format!("Agent '{name}' already exists"));
             }
-            return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
-        }
+            Err(e) => return WsFrame::error_response("", &format!("Failed to create directory: {e}")),
+        };
+        // Dropping `staged` on any early return removes the staging dir.
+        let stage_dir = staged.path().to_path_buf();
 
-        // Creating a new main (CEO / front desk) demotes the current one —
-        // only AFTER the name claim succeeded, so a doomed create can no
-        // longer demote the live main as a side effect.
-        if final_role == "main" {
-            if let Err(e) = self.demote_current_main(&name).await {
-                let _ = tokio::fs::remove_dir_all(&agent_dir).await;
-                return WsFrame::error_response("", &e);
-            }
-        }
-
-        // Write SOUL.md / CONTRACT.toml / extras first; the atomic agent.toml
-        // rename comes LAST as the registry-visible commit point. Any failure
-        // before that point removes the whole directory — no half-created
-        // agent (one missing its reviewed CONTRACT) can ever be scanned in.
+        // Write SOUL.md / CONTRACT.toml / extras / agent.toml into the
+        // staging directory; the directory rename after the authority commit
+        // is the single registry-visible commit point. Any failure before it
+        // removes the whole staging directory — no half-created agent (one
+        // missing its reviewed CONTRACT) can ever be scanned in.
         let write_result: Result<Option<String>, String> = async {
-            tokio::fs::create_dir_all(agent_dir.join("SKILLS"))
+            tokio::fs::create_dir_all(stage_dir.join("SKILLS"))
                 .await
                 .map_err(|e| format!("Failed to create directory: {e}"))?;
             Self::seed_builtin_skills(&self.home_dir);
@@ -253,18 +254,18 @@ impl MethodHandler {
                         || duduclaw_agent::builtin_skills::BUILTIN_SKILL_FILES.iter()
                             .any(|(builtin, _)| name == builtin);
                     if company_default && bundled.get(name) == Some(content) { continue; }
-                    let dir = agent_dir.join("SKILLS").join(name);
+                    let dir = stage_dir.join("SKILLS").join(name);
                     tokio::fs::create_dir(&dir).await.map_err(|_| "Unable to create template skill")?;
                     tokio::fs::write(dir.join("SKILL.md"), content).await.map_err(|_| "Unable to write template skill")?;
                 }
             }
-            tokio::fs::write(agent_dir.join(".template-origin.json"),
+            tokio::fs::write(stage_dir.join(".template-origin.json"),
                 serde_json::to_vec(&json!({"premium":premium})).map_err(|_| "Invalid template origin")?)
                 .await.map_err(|_| "Unable to write template origin")?;
-            tokio::fs::write(agent_dir.join("SOUL.md"), &soul_md)
+            tokio::fs::write(stage_dir.join("SOUL.md"), &soul_md)
                 .await
                 .map_err(|e| format!("Failed to write SOUL.md: {e}"))?;
-            tokio::fs::write(agent_dir.join("CONTRACT.toml"), &contract_toml)
+            tokio::fs::write(stage_dir.join("CONTRACT.toml"), &contract_toml)
                 .await
                 .map_err(|e| format!("Failed to write CONTRACT.toml: {e}"))?;
 
@@ -273,7 +274,7 @@ impl MethodHandler {
             // warning but doesn't abort the create.
             let mut extras_warning: Option<String> = None;
             if let Some(src) = &assembled.extras_dir {
-                if let Err(e) = copy_template_extras(src, &agent_dir).await {
+                if let Err(e) = copy_template_extras(src, &stage_dir).await {
                     warn!(agent = %name, error = %e, "template extras copy failed");
                     extras_warning = Some("知識檔（FAQ/wiki）複製失敗，可稍後手動補上".to_string());
                 }
@@ -284,47 +285,67 @@ impl MethodHandler {
                     .map_err(|_| "Unable to preserve disabled template skills")?;
             }
 
-            let agent_toml_path = agent_dir.join("agent.toml");
-            let agent_toml_tmp = agent_toml_path.with_extension("toml.tmp");
-            tokio::fs::write(&agent_toml_tmp, &agent_toml)
+            tokio::fs::write(stage_dir.join("agent.toml"), &agent_toml)
                 .await
-                .map_err(|e| format!("Failed to write agent.toml.tmp: {e}"))?;
-            tokio::fs::rename(&agent_toml_tmp, &agent_toml_path)
-                .await
-                .map_err(|e| format!("Failed to commit agent.toml: {e}"))?;
+                .map_err(|e| format!("Failed to write agent.toml: {e}"))?;
             Ok(extras_warning)
         }
         .await;
         let extras_warning = match write_result {
             Ok(w) => w,
-            Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&agent_dir).await;
-                return WsFrame::error_response("", &e);
-            }
+            Err(e) => return WsFrame::error_response("", &e),
         };
 
-        // WP22 T1 — the staged team member is committed; record its
-        // authoritative org placement. Values are read back out of the patched
-        // document rather than from the override params, so the pack's own
-        // wiring (workers → the pack's front desk) is captured when the admin
-        // supplied no override. After the commit, so a rolled-back create
-        // never leaves a record behind for the id.
+        // Creating a new main (CEO / front desk) demotes the current one —
+        // only after every write succeeded and right before the publish, so
+        // a doomed create can no longer demote the live main as a side
+        // effect (org lock first, then the agent.toml lock).
+        let demotion = if final_role == "main" {
+            match self.demote_current_main(&name).await {
+                Ok(d) => d,
+                Err(e) => return WsFrame::error_response("", &e),
+            }
+        } else {
+            None
+        };
+
+        // WP22 T1 / RM-027 round 4 — inside the org lock: validate and commit
+        // the authoritative org placement, then publish the directory. Values
+        // are read back out of the patched document rather than from the
+        // override params, so the pack's own wiring (workers → the pack's
+        // front desk) is captured when the admin supplied no override. An
+        // authority refusal fails the create and leaves nothing behind.
         {
-            let agent_tbl = parsed_agent.get("agent").and_then(|v| v.as_table());
-            let field = |k: &str| {
-                agent_tbl
-                    .and_then(|t| t.get(k))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
+            let org_entry = {
+                let agent_tbl = parsed_agent.get("agent").and_then(|v| v.as_table());
+                let field = |k: &str| {
+                    agent_tbl
+                        .and_then(|t| t.get(k))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                duduclaw_core::OrgEntry::new(field("reports_to"), field("department"))
             };
-            if let Err(e) = duduclaw_core::org_store::upsert(
-                &self.home_dir,
-                &name,
-                duduclaw_core::OrgEntry::new(field("reports_to"), field("department")),
-            ) {
-                warn!(agent = %name, error = %e, "org.toml upsert failed on templates.create_agent");
+            if let Err(e) = staged.publish(&org, org_entry) {
+                warn!(agent = %name, error = %e, "templates.create_agent refused: org authority not committed");
+                if !disabled_skills.is_empty() {
+                    let _ = duduclaw_agent::skill_state::set_disabled(&self.home_dir, &name, disabled_skills, false);
+                }
+                // RM-027 round 5: the create did not happen — put back the
+                // main it demoted (still under the org lock).
+                let restore = match demotion {
+                    Some(d) => self.restore_demoted_main(d).await.err(),
+                    None => None,
+                };
+                drop(org);
+                return WsFrame::error_response(
+                    "",
+                    &super::agents_create::create_failed_text(&e.to_string(), restore.as_deref()),
+                );
             }
         }
+        drop(org);
 
         // Same protections as agents.create: file-guard hook + registry rescan.
         alignment.audit(&self.home_dir, &name, "templates.create_agent", &caller.user_id);

@@ -1,5 +1,54 @@
 use super::*;
 
+/// RM-027 round 6: how long a CLI writer that holds the global org lock waits
+/// for an `agent.toml` (or other per-agent file) lock —
+/// [`duduclaw_core::org_store::MIRROR_LOCK_WAIT`], the bound the gateway's
+/// org-lock holders use. Tests shorten it per home.
+pub(crate) fn org_locked_file_wait(home: &Path) -> std::time::Duration {
+    #[cfg(test)]
+    {
+        if let Some(d) = org_locked_wait_override::get(home) {
+            return d;
+        }
+    }
+    let _ = home;
+    duduclaw_core::org_store::MIRROR_LOCK_WAIT
+}
+
+/// Test seam: a shorter [`org_locked_file_wait`] for one home.
+#[cfg(test)]
+pub(crate) mod org_locked_wait_override {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    static WAITS: Mutex<BTreeMap<PathBuf, Duration>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) fn set(home: &Path, wait: Duration) {
+        WAITS.lock().unwrap().insert(home.to_path_buf(), wait);
+    }
+
+    pub(crate) fn clear(home: &Path) {
+        WAITS.lock().unwrap().remove(home);
+    }
+
+    pub(super) fn get(home: &Path) -> Option<Duration> {
+        WAITS.lock().unwrap().get(home).copied()
+    }
+}
+
+/// The tool error for a per-agent file lock that was not acquired within
+/// [`org_locked_file_wait`] while the org lock was held: nothing was written.
+pub(crate) fn org_locked_wait_timeout_error(what: &str, detail: &str) -> Value {
+    serde_json::json!({
+        "content": [{"type": "text", "text": format!(
+            "Error: lock_wait_timeout — {what} 正被其他寫入佔用，等待後仍無法取得寫入鎖，沒有做任何變更（組織資料也沒有改動）；請稍後再試。（{detail}）"
+        )}],
+        "isError": true
+    })
+}
+
 // Update one or more fields in an existing agent's agent.toml.
 //
 // Reads the current config, applies the requested changes, and writes back.
@@ -633,7 +682,31 @@ pub(crate) async fn handle_agent_update(
             return serde_json::json!({ "content": [{"type": "text", "text": e}], "isError": true });
         }
     };
-    let written = duduclaw_gateway::agent_files::external::edit_agent_toml_guarded(home_dir, agent_id, "mcp", caller, |raw| {
+    // RM-027 review: a re-parenting holds the global org mutation lock
+    // (shared with the dashboard `org.*` RPCs, `agents.update` and
+    // `duduclaw org sync`), taken BEFORE the agent.toml lock — the order every
+    // org writer uses — so validation and commit see one tree.
+    let reports_to_param = params.get("reports_to").and_then(Value::as_str);
+    let org_lock = match reports_to_param {
+        Some(_) => match duduclaw_core::org_store::lock_org_mutations(home_dir) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                return serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Error: 暫時無法取得組織資料的寫入鎖，沒有做任何變更：{e}")}],
+                    "isError": true
+                });
+            }
+        },
+        None => None,
+    };
+    // The authority entry before this write, once it was replaced.
+    let mut org_prior: Option<Option<duduclaw_core::OrgEntry>> = None;
+    // RM-027 round 6: while the org lock is held the agent.toml lock wait is
+    // bounded — a stuck writer fails this update (nothing written, the
+    // authority untouched: the guard below never ran) instead of pinning the
+    // org lock for every other org writer.
+    let lock_wait = org_lock.as_ref().map(|_| org_locked_file_wait(home_dir));
+    let written = duduclaw_gateway::agent_files::external::edit_agent_toml_guarded_within(home_dir, agent_id, "mcp", caller, |raw| {
         duduclaw_gateway::agent_files::external::apply_typed_changes(raw, &before_t, &after_t);
         // A requested stop must reach the fresh artifact even if the initial
         // snapshot had that status already and another writer resumed it.
@@ -657,22 +730,41 @@ pub(crate) async fn handle_agent_update(
         }
         // Keep the authoritative org write after the lifecycle barrier and
         // before its TOML mirror. A drain timeout must have no side effects.
-        if let Some(v) = params.get("reports_to").and_then(Value::as_str)
-            && let Err(e) = duduclaw_core::org_store::upsert(
-                home_dir, agent_id, duduclaw_core::OrgEntry::new(v, &config.agent.department),
-            )
-        {
-            tracing::warn!(agent = %agent_id, error = %e, "org.toml upsert failed on agent_update");
+        // Inside the org lock: re-read the authority strictly (a seeded but
+        // lost / corrupt / newer `org.toml` refuses), re-validate the whole
+        // tree, commit. Any failure aborts the write — the mirror never moves
+        // without the authority.
+        if let (Some(v), Some(lock)) = (reports_to_param, org_lock.as_ref()) {
+            let store = lock.load().map_err(|e| e.to_string())?;
+            duduclaw_core::org_change::validate_org_change_in(&store, home_dir, agent_id, Some(v), None)
+                .map_err(|e| e.to_string())?;
+            let current = duduclaw_core::org_change::effective_in(&store, home_dir, agent_id).unwrap_or_default();
+            lock.upsert(agent_id, duduclaw_core::OrgEntry::new(v, &current.department))
+                .map_err(|e| e.to_string())?;
+            org_prior = Some(store.get(agent_id).cloned());
         }
         Ok(())
-    }, stopping);
+    }, stopping, lock_wait);
     drop(admission);
     if let Err(e) = written {
+        // The mirror was not written: put the authority back (still inside
+        // the org lock) so a failed request moves nobody. (On a lock-wait
+        // timeout the guard never ran, so there is nothing to put back.)
+        if let (Some(lock), Some(prior)) = (org_lock.as_ref(), org_prior.take())
+            && let Err(re) = lock.restore(agent_id, prior)
+        {
+            tracing::warn!(agent = %agent_id, error = %re, "org.toml rollback failed on agent_update");
+        }
+        drop(org_lock);
+        if duduclaw_gateway::agent_files::external::is_lock_wait_timeout(&e) {
+            return org_locked_wait_timeout_error("agent.toml", &e);
+        }
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error writing agent.toml: {e}")}],
             "isError": true
         });
     }
+    drop(org_lock);
 
     if config_before.agent.status != config.agent.status {
         duduclaw_gateway::dashboard_feedback::emit(home_dir, "agent.status_changed",

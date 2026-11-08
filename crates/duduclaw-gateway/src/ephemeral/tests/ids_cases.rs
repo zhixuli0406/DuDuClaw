@@ -223,7 +223,7 @@ fn scaffold_writes_mcp_json_with_agent_identity() {
         "a relative command would not resolve from the scaffold's cwd"
     );
     // Deliberately duduclaw-only: the parent's other servers (playwright,
-    // …) are NOT copied into a scaffold — see `ensure_scaffold_mcp_config`'s
+    // …) are NOT copied into a scaffold — see `write_scaffold_mcp_config`'s
     // call site for why.
     assert_eq!(
         cfg["mcpServers"].as_object().unwrap().len(),

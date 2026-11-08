@@ -272,6 +272,7 @@ pub mod maintenance;
 pub mod mast;
 pub mod memory_factory;
 pub mod memory_forget_approval;
+pub(crate) mod org_change_approval;
 pub mod memory_forget_apply;
 pub mod disconnect_forget;
 pub mod memory_forget_steps;

@@ -71,6 +71,7 @@ pub fn scaffold_role_member(
         ScaffoldPlan {
             agent_id: Some(agent_id),
             role: Some(&normalized),
+            org: None,
         },
     )
 }
@@ -161,9 +162,14 @@ pub fn finish_role_member(
         return Err(format!("not an ephemeral agent id: {member_id:?}"));
     }
     crate::agent_files::writer::run_blocking(|| {
+        // Lock order (RM-027 round 3): the global org lock before the
+        // autonomy barrier, as `agents.update` takes them — the teardown
+        // removes the member's authority record below.
+        let org = duduclaw_core::org_store::lock_org_mutations(home_dir)
+            .map_err(|error| format!("org lock unavailable: {error}"))?;
         let _barrier = duduclaw_core::autonomy_gate::exclusive_barrier(home_dir)
             .map_err(|error| error.to_string())?;
-        finish_role_member_locked(home_dir, member_id, outcome)
+        finish_role_member_locked(home_dir, member_id, outcome, &org)
     })
 }
 
@@ -171,6 +177,7 @@ fn finish_role_member_locked(
     home_dir: &Path,
     member_id: &str,
     outcome: RoleMemberOutcome,
+    org: &duduclaw_core::org_store::OrgMutationGuard,
 ) -> Result<(), String> {
     let Some(dir) = resolve_agent_dir(home_dir, member_id) else {
         // Already swept, never existed, or escapes the namespace —
@@ -223,7 +230,7 @@ fn finish_role_member_locked(
 
     // The authoritative org record dies with the directory (same ordering as
     // `sweep` and MCP `agent_remove`).
-    if let Err(e) = duduclaw_core::org_store::remove(home_dir, member_id) {
+    if let Err(e) = duduclaw_core::org_store::remove(org, member_id) {
         tracing::warn!(
             member = %member_id,
             error = %e,

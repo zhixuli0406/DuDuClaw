@@ -572,6 +572,75 @@ fn bash_write_or_delete_of_the_org_store_is_blocked() {
     );
 }
 
+// ── RM-027: the org mutation lock and the org-change journal ──────
+
+#[test]
+fn org_lock_and_journal_are_protected_on_the_write_lane() {
+    let h = home();
+    for p in [
+        h.join("locks/org-mutation.lock"),
+        h.join("locks/org-mutation"),
+        h.join("org_change_journal"),
+        h.join("org_change_journal/abc.json"),
+    ] {
+        assert_eq!(classify_identity_surface(&p, &h), Some(ProtectedSurface::OrgStore), "{}", p.display());
+        for caller in [HookCaller::Absent, agent("sales-rep")] {
+            assert!(
+                matches!(
+                    check_identity_surface_write_as(&p, &h, &caller, None, Some("x")),
+                    GuardDecision::BlockedIdentitySurface { .. }
+                ),
+                "{}",
+                p.display()
+            );
+        }
+    }
+    // Other locks and unrelated paths stay out of scope.
+    for p in [
+        h.join("locks/gateway.lock"),
+        PathBuf::from("/Users/alice/Project/app/locks/org-mutation.lock"),
+        PathBuf::from("/Users/alice/Project/app/org_change_journal/x.json"),
+    ] {
+        assert_eq!(classify_identity_surface(&p, &h), None, "{}", p.display());
+    }
+}
+
+#[test]
+fn bash_cannot_hold_or_tamper_the_org_lock_or_journal() {
+    // Holding the lock needs no write verb (`flock … sleep`), so any
+    // command naming it is refused.
+    for cmd in [
+        "flock /Users/alice/.duduclaw/locks/org-mutation.lock sleep 3600",
+        "exec 9>~/.duduclaw/locks/org-mutation.lock && flock 9",
+        "rm ~/.duduclaw/locks/org-mutation.lock",
+        "cat ~/.duduclaw/locks/org-mutation.lock",
+    ] {
+        assert!(
+            matches!(
+                check_bash_protected_write(cmd, &home(), &HookCaller::Absent),
+                GuardDecision::BlockedBashProtectedWrite { .. }
+            ),
+            "not blocked: {cmd}"
+        );
+    }
+    for cmd in [
+        "rm -rf /Users/alice/.duduclaw/org_change_journal",
+        "echo '{}' > ~/.duduclaw/org_change_journal/x.json",
+    ] {
+        assert!(
+            matches!(
+                check_bash_protected_write(cmd, &home(), &agent("sales-rep")),
+                GuardDecision::BlockedBashProtectedWrite { .. }
+            ),
+            "not blocked: {cmd}"
+        );
+    }
+    assert_eq!(
+        check_bash_protected_write("ls ~/.duduclaw/org_change_journal", &home(), &HookCaller::Absent),
+        GuardDecision::NotAgentFile
+    );
+}
+
 #[test]
 fn bash_mentions_other_agent_dir_does_not_false_positive_on_similar_words() {
     // `myagents/` must not match the `agents/` boundary check.

@@ -42,6 +42,12 @@ pub(crate) async fn handle_agent_remove(params: &Value, home_dir: &Path, caller:
 }
 
 fn remove_agent_locked(home_dir: &Path, agent_id: &str, caller: &str) -> Value {
+    // The removal drops an authority record: the global org lock first,
+    // then the lifecycle barrier (RM-027 round 3 lock order).
+    let org = match duduclaw_core::org_store::lock_org_mutations(home_dir) {
+        Ok(guard) => guard,
+        Err(error) => return tool_error(&format!("org lock unavailable: {error}")),
+    };
     let _lifecycle = match duduclaw_core::autonomy_gate::exclusive_barrier(home_dir) {
         Ok(guard) => guard,
         Err(error) => return tool_error(&error.to_string()),
@@ -71,6 +77,23 @@ fn remove_agent_locked(home_dir: &Path, agent_id: &str, caller: &str) -> Value {
         });
     }
 
+    // RM-027 round 6: the employee's MCP credential store is a per-agent
+    // file lock taken while the org lock is held — bounded, and taken BEFORE
+    // anything moves, so a stuck writer fails the removal with nothing
+    // changed instead of pinning the org lock (or leaving a trashed employee
+    // whose credentials could not be cleaned up).
+    let store = match duduclaw_security::mcp_secret_store::lock_agent_store_within(
+        home_dir,
+        agent_id,
+        org_locked_file_wait(home_dir),
+    ) {
+        Ok(store) => store,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            return org_locked_wait_timeout_error("MCP 憑證儲存", &e.to_string());
+        }
+        Err(e) => return tool_error(&format!("Error: MCP 憑證儲存無法鎖定，AI 員工沒有移除：{e}")),
+    };
+
     // Move to trash instead of hard delete
     let trash_dir = home_dir.join("agents").join("_trash");
     let _ = std::fs::create_dir_all(&trash_dir);
@@ -89,11 +112,11 @@ fn remove_agent_locked(home_dir: &Path, agent_id: &str, caller: &str) -> Value {
     // gone. This is the one write that must not go store-first: had the trash
     // move failed, an already-cleared entry would leave a still-live agent
     // governed by its own (writable) `agent.toml` mirror again.
-    if let Err(e) = duduclaw_core::org_store::remove(home_dir, agent_id) {
+    if let Err(e) = duduclaw_core::org_store::remove(&org, agent_id) {
         tracing::warn!(agent = %agent_id, error = %e, "org.toml removal failed on agent_remove");
     }
 
-    if let Err(e) = duduclaw_security::mcp_secret_store::remove_agent(home_dir, agent_id) {
+    if let Err(e) = store.remove() {
         tracing::warn!(agent = %agent_id, error = %e, "MCP credential cleanup failed after agent removal");
         return tool_error("Employee removed, but encrypted MCP credential cleanup failed");
     }
