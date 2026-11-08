@@ -18,6 +18,7 @@ use crate::{google_identity::isolation_bridge::GoogleIsolationBridge,
     isolation_connectors::{AccountId, BoundConnectorExecutor, ConnectorCatalog, ConnectorKind,
         LiveConnectorSelectionPolicy, ProductConnectorAccount, Route, SelectedConnector, provider_for_tool},
     isolation_connector_clients::{AccountCredentialProvider, NativeConnectorExecutor},
+    isolation_connector_details::{DetailReference, needs_details},
     isolation_connector_database::DatabaseConnectorProvider,
     isolation_connector_channel::{ChannelAccount, ChannelConnectorProvider},
     isolation_connector_model::ModelConnectorProvider,
@@ -46,6 +47,66 @@ pub struct ConnectorBootProviders {
     pub model: Option<Arc<ModelConnectorProvider>>,
     pub computer: Option<Arc<ComputerConnectorProvider>>,
     pub search: Option<Arc<SearchConnectorProvider>>,
+    /// Use-time detail pins (C6), one per installed database/computer/channel
+    /// provider. Each such provider's selection is wrapped so an account is
+    /// offered only while its provisioned details are still exactly the pinned
+    /// ones; a detail provider installed without a fence refuses assembly.
+    pub detail_fences: BTreeMap<&'static str, DetailFence>,
+    /// Providers with a route whose details are not provisioned for its
+    /// current generation. Installed as refusing adapters and reported as
+    /// [`ProviderRefusal::SetupRequired`].
+    pub setup_required: BTreeSet<&'static str>,
+}
+
+/// Why a provider was installed as a refusing adapter. F3 maps
+/// `SetupRequired` to the readiness reason `connector_setup_required{provider}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderRefusal {
+    /// The employee has no active catalog route for the provider.
+    NoRoute,
+    /// A route needs per-account details (database source, website
+    /// credential, channel route/token reference) that are not provisioned
+    /// for its current generation, or whose token reference no longer resolves.
+    SetupRequired,
+}
+impl ProviderRefusal {
+    pub fn reason(self) -> &'static str {
+        match self { Self::NoRoute => "no_route", Self::SetupRequired => "connector_setup_required" }
+    }
+}
+
+/// The pinned details of one installed account, for the use-time fence.
+#[derive(Clone)]
+pub struct DetailFence {
+    details: Arc<dyn ConnectorAccountDetails>,
+    pins: BTreeMap<String, DetailPin>,
+}
+impl DetailFence {
+    /// Narrow candidates to accounts whose current provisioned details are
+    /// exactly the pinned ones (same route generation, binding, employee and
+    /// references). A store error refuses the selection.
+    fn admit(&self, candidates: Vec<ProductConnectorAccount>) -> Result<Vec<ProductConnectorAccount>, VerificationError> {
+        let mut admitted = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let Some(pin) = self.pins.get(candidate.account()) else { continue };
+            if self.details.current_pin(&pin.account)?.as_ref() == Some(pin) { admitted.push(candidate); }
+        }
+        Ok(admitted)
+    }
+}
+/// Selection wrapper installed around every detail provider. Selection
+/// rechecks run through it before credential acquisition and each effect.
+struct DetailFenced { inner: Arc<dyn LiveConnectorSelectionPolicy>, fence: DetailFence }
+impl LiveConnectorSelectionPolicy for DetailFenced {
+    fn supports(&self, tool: &str) -> bool { self.inner.supports(tool) }
+    fn candidates(&self, context: &RequestContext, tool: &str, provider: &str)
+        -> Result<Vec<ProductConnectorAccount>, VerificationError> {
+        self.fence.admit(self.inner.candidates(context, tool, provider)?)
+    }
+    fn candidates_for_call(&self, context: &RequestContext, tool: &str, provider: &str, arguments: &Value)
+        -> Result<Vec<ProductConnectorAccount>, VerificationError> {
+        self.fence.admit(self.inner.candidates_for_call(context, tool, provider, arguments)?)
+    }
 }
 
 type Adapter = (Arc<dyn LiveConnectorSelectionPolicy>, Arc<dyn BoundConnectorExecutor>);
@@ -86,40 +147,67 @@ pub struct InstalledConnectorProviders {
     home: PathBuf,
     agent: String,
     employee: EmployeeId,
+    refusals: BTreeMap<&'static str, ProviderRefusal>,
 }
 impl InstalledConnectorProviders {
     pub fn assemble(home: PathBuf, agent: String, employee: EmployeeId,
         bindings: Arc<dyn BindingAuthority>, catalog: Arc<ConnectorCatalog>,
         providers: ConnectorBootProviders) -> Result<Self, VerificationError> {
-        let native = Arc::new(NativeConnectorExecutor::new(home.clone(), agent.clone(), providers.native_credentials)?);
+        let ConnectorBootProviders { google, notion_policy, github_policy, native_credentials, database, odoo, channel,
+            model, computer, search, detail_fences, setup_required } = providers;
+        if setup_required.iter().chain(detail_fences.keys()).any(|provider| !needs_details(provider)) {
+            return Err(VerificationError::Invalid);
+        }
+        let native = Arc::new(NativeConnectorExecutor::new(home.clone(), agent.clone(), native_credentials)?);
         let native_with = |policy: Option<Arc<dyn LiveConnectorSelectionPolicy>>| -> Option<Adapter> {
             policy.map(|policy| (policy, native.clone() as Arc<dyn BoundConnectorExecutor>))
         };
         let mut registry = ConnectorProviderRegistry::default();
+        let mut refusals = BTreeMap::new();
         for (provider, adapter) in [
-            ("google", Some(both(providers.google))),
-            ("notion", native_with(providers.notion_policy)),
-            ("github", native_with(providers.github_policy)),
-            ("database", providers.database.map(both)),
-            ("odoo", providers.odoo.map(|(policy, executor)|
+            ("google", Some(both(google))),
+            ("notion", native_with(notion_policy)),
+            ("github", native_with(github_policy)),
+            ("database", database.map(both)),
+            ("odoo", odoo.map(|(policy, executor)|
                 (policy as Arc<dyn LiveConnectorSelectionPolicy>, executor))),
-            ("channel", providers.channel.map(|(policy, executor)|
+            ("channel", channel.map(|(policy, executor)|
                 (policy as Arc<dyn LiveConnectorSelectionPolicy>, executor))),
-            ("model", providers.model.map(both)),
-            ("computer", providers.computer.map(both)),
-            ("search", providers.search.map(both)),
+            ("model", model.map(both)),
+            ("computer", computer.map(both)),
+            ("search", search.map(both)),
         ] {
-            let (policy, executor) = adapter.unwrap_or_else(|| unprovisioned(provider));
+            let setup = setup_required.contains(provider);
+            let (policy, executor) = match adapter {
+                // A setup-required provider never serves, even if built.
+                Some(adapter) if !setup => adapter,
+                _ => {
+                    refusals.insert(provider, if setup { ProviderRefusal::SetupRequired } else { ProviderRefusal::NoRoute });
+                    unprovisioned(provider)
+                }
+            };
+            let policy = match (refusals.contains_key(provider), detail_fences.get(provider)) {
+                (true, _) => policy,
+                (false, Some(fence)) => Arc::new(DetailFenced { inner: policy, fence: fence.clone() }) as Arc<dyn LiveConnectorSelectionPolicy>,
+                (false, None) if needs_details(provider) => return Err(VerificationError::Unavailable),
+                (false, None) => policy,
+            };
             registry.register_provider(provider, policy, executor)?;
         }
         registry.require_complete()?;
         let registry = Arc::new(registry);
         let resolver = Arc::new(GatewayResourceResolver::new(home.clone(), employee, agent.clone(), bindings)?
             .with_connector_catalog(catalog).with_connector_selection_policy(registry.clone()));
-        Ok(Self { registry, resolver, home, agent, employee })
+        Ok(Self { registry, resolver, home, agent, employee, refusals })
     }
     pub fn resolver(&self) -> Arc<GatewayResourceResolver> { self.resolver.clone() }
     pub fn registry(&self) -> Arc<ConnectorProviderRegistry> { self.registry.clone() }
+    /// Providers installed as refusing adapters, with the reason (for F3).
+    pub fn refusals(&self) -> &BTreeMap<&'static str, ProviderRefusal> { &self.refusals }
+    /// Providers F3 must report as `connector_setup_required{provider}`.
+    pub fn setup_required(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.refusals.iter().filter(|(_, refusal)| **refusal == ProviderRefusal::SetupRequired).map(|(provider, _)| *provider)
+    }
     pub fn verify_identity(&self, home: &std::path::Path, agent: &str, employee: EmployeeId)
         -> Result<(), VerificationError> {
         if self.home != home || self.agent != agent || self.employee != employee { return Err(VerificationError::BindingMismatch); }
@@ -269,12 +357,50 @@ impl ConnectorAccountDetail {
     }
 }
 
+/// Secret-free identity of one provisioned detail: the route generation and
+/// binding it is pinned to, the employee it was validated for, and its
+/// references. Compared at every selection recheck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailPin {
+    account: AccountId,
+    generation: u64,
+    binding: EmployeeBinding,
+    employee: EmployeeId,
+    agent: String,
+    reference: DetailReference,
+}
+impl DetailPin {
+    pub fn new(route: &Route, employee: EmployeeId, agent: String, reference: DetailReference) -> Self {
+        Self { account: route.account.clone(), generation: route.generation, binding: route.binding.clone(),
+            employee, agent, reference }
+    }
+    pub fn account(&self) -> &AccountId { &self.account }
+    pub fn generation(&self) -> u64 { self.generation }
+    pub fn employee(&self) -> EmployeeId { self.employee }
+    pub fn agent(&self) -> &str { &self.agent }
+}
+
+/// A resolved detail (may hold an in-memory bot token) plus its pin.
+pub struct ProvisionedDetail {
+    pub detail: ConnectorAccountDetail,
+    pub pin: DetailPin,
+}
+
 /// Gateway-owned store of per-account provisioning details, written by the
-/// connector lifecycle when an account is provisioned. It is only ever asked
-/// about a route the catalog just returned, so it can narrow but never add an
-/// account. `Ok(None)` (not provisioned) and `Err` both refuse the build.
+/// connector lifecycle when an account is provisioned (production:
+/// [`crate::isolation_connector_details::CatalogAccountDetails`]). It is only
+/// ever asked about a route the catalog just returned, so it can narrow but
+/// never add an account.
+/// - `detail`: `Ok(None)` = not provisioned for the route's current
+///   generation (or a token reference no longer resolves) ⇒ the provider is a
+///   refusing adapter, [`ProviderRefusal::SetupRequired`]. `Err` (unreadable
+///   or damaged store) refuses the whole build.
+/// - `current_pin`: the pin of the account's current details, read live at
+///   each selection recheck; `None` (revoked / generation moved / removed)
+///   or a different pin refuses that account, `Err` refuses the selection.
 pub trait ConnectorAccountDetails: Send + Sync {
-    fn detail(&self, route: &Route) -> Result<Option<ConnectorAccountDetail>, VerificationError>;
+    fn detail(&self, route: &Route) -> Result<Option<ProvisionedDetail>, VerificationError>;
+    fn current_pin(&self, account: &AccountId) -> Result<Option<DetailPin>, VerificationError>;
 }
 
 /// Non-account Google bridge inputs. The bridge reads its live lifecycle and catalog.
@@ -388,11 +514,47 @@ impl GatewayConnectorFactory {
         }
         Ok(Self { parts })
     }
-    fn detail(&self, account: &PlannedAccount) -> Result<ConnectorAccountDetail, VerificationError> {
-        match self.parts.details.detail(&account.route) {
-            Ok(Some(detail)) if detail.provider() == account.route.provider => Ok(detail),
-            Ok(Some(_)) => Err(VerificationError::Invalid),
-            Ok(None) | Err(_) => Err(VerificationError::Unavailable),
+    /// Details for every planned route of one detail provider.
+    /// - `Ok(None)`: some route has no current details ⇒ setup required.
+    /// - Routes whose details were provisioned for another employee (or a
+    ///   recreated one under the same agent id) are not this employee's
+    ///   accounts and are skipped (narrowing only).
+    /// - A detail for another provider or another route pin is `Invalid`;
+    ///   a store error is `Unavailable`. Both refuse the build.
+    fn provisioned<'a>(&self, accounts: &'a [PlannedAccount], employee: EmployeeId, agent: &str)
+        -> Result<Option<(Vec<(&'a PlannedAccount, ConnectorAccountDetail)>, DetailFence)>, VerificationError> {
+        let mut ready = Vec::new();
+        let mut pins = BTreeMap::new();
+        for account in accounts {
+            let Some(ProvisionedDetail { detail, pin }) = self.parts.details.detail(&account.route)
+                .map_err(|error| if error == VerificationError::Invalid { error } else { VerificationError::Unavailable })?
+                else { return Ok(None) };
+            let route = &account.route;
+            if detail.provider() != route.provider || pin.reference.provider() != route.provider
+                || pin.account != route.account || pin.generation != route.generation || pin.binding != route.binding {
+                return Err(VerificationError::Invalid);
+            }
+            if pin.employee != employee || pin.agent != agent { continue; }
+            if pins.insert(route.account.as_str().to_owned(), pin).is_some() { return Err(VerificationError::Invalid); }
+            ready.push((account, detail));
+        }
+        Ok(Some((ready, DetailFence { details: self.parts.details.clone(), pins })))
+    }
+}
+
+/// Collects the C6 outcome of each detail provider during one build.
+#[derive(Default)]
+struct DetailOutcomes { fences: BTreeMap<&'static str, DetailFence>, setup_required: BTreeSet<&'static str> }
+impl DetailOutcomes {
+    /// `Some(accounts)` to build the provider from (never empty); `None` when
+    /// there is nothing to build (no usable route, or setup required).
+    fn take<'a>(&mut self, provider: &'static str,
+        outcome: Option<(Vec<(&'a PlannedAccount, ConnectorAccountDetail)>, DetailFence)>)
+        -> Option<Vec<(&'a PlannedAccount, ConnectorAccountDetail)>> {
+        match outcome {
+            None => { self.setup_required.insert(provider); None }
+            Some((ready, _)) if ready.is_empty() => None,
+            Some((ready, fence)) => { self.fences.insert(provider, fence); Some(ready) }
         }
     }
 }
@@ -443,35 +605,58 @@ impl ConnectorProviderFactory for GatewayConnectorFactory {
         let native_credentials: Arc<dyn AccountCredentialProvider> =
             Arc::new(HomeOAuthCredentialProvider::new(home_dir.clone(), catalog.clone())?);
 
-        let mut sources = Vec::new();
-        for account in plan.accounts("database") {
-            let ConnectorAccountDetail::Database { source } = self.detail(account)? else { return Err(VerificationError::Invalid) };
-            sources.push((account.product(), source));
-        }
-        let database = if sources.is_empty() { None } else {
-            Some(Arc::new(DatabaseConnectorProvider::new(home_dir.clone(), name.clone(), employee, sources)?))
+        // C6: database/computer/channel accounts need provisioned details.
+        // Every provider's details are read before any of them is built.
+        let mut outcomes = DetailOutcomes::default();
+        let database = self.provisioned(plan.accounts("database"), employee, agent)?;
+        let computer = self.provisioned(plan.accounts("computer"), employee, agent)?;
+        // D3 gate first: without the CLI channel executor factory nothing
+        // could run, so channel details (which may resolve bot tokens) are
+        // never read, no provider is built, and the provider is reported as
+        // `NoRoute` rather than `SetupRequired` — provisioning details would
+        // not make it usable. It stays a refusing adapter (fail closed).
+        let channel = if parts.channel_executors.available() {
+            Some(self.provisioned(plan.accounts("channel"), employee, agent)?)
+        } else { None };
+
+        let database = match outcomes.take("database", database) {
+            Some(ready) => {
+                let mut sources = Vec::new();
+                for (account, detail) in ready {
+                    let ConnectorAccountDetail::Database { source } = detail else { return Err(VerificationError::Invalid) };
+                    sources.push((account.product(), source));
+                }
+                Some(Arc::new(DatabaseConnectorProvider::new(home_dir.clone(), name.clone(), employee, sources)?))
+            }
+            None => None,
         };
 
-        let mut credentials = Vec::new();
-        for account in plan.accounts("computer") {
-            let ConnectorAccountDetail::Computer { credential } = self.detail(account)? else { return Err(VerificationError::Invalid) };
-            credentials.push((account.product(), credential));
-        }
-        let computer = if credentials.is_empty() { None } else {
-            Some(Arc::new(ComputerConnectorProvider::new(home_dir.clone(), name.clone(), employee, credentials,
-                parts.computer_sessions.clone())?))
+        let computer = match outcomes.take("computer", computer) {
+            Some(ready) => {
+                let mut credentials = Vec::new();
+                for (account, detail) in ready {
+                    let ConnectorAccountDetail::Computer { credential } = detail else { return Err(VerificationError::Invalid) };
+                    credentials.push((account.product(), credential));
+                }
+                Some(Arc::new(ComputerConnectorProvider::new(home_dir.clone(), name.clone(), employee, credentials,
+                    parts.computer_sessions.clone())?))
+            }
+            None => None,
         };
 
-        let mut channels = Vec::new();
-        for account in plan.accounts("channel").iter().filter(|_| parts.channel_executors.available()) {
-            let ConnectorAccountDetail::Channel { channel, scope, status_label, token, extra_id } = self.detail(account)?
-                else { return Err(VerificationError::Invalid) };
-            channels.push(ChannelAccount::new(account.product(), channel, scope, status_label, token, extra_id)?);
-        }
-        let channel = if channels.is_empty() { None } else {
-            let provider = Arc::new(ChannelConnectorProvider::new(home_dir.clone(), name.clone(), employee, channels)?);
-            let executor = parts.channel_executors.executor(provider.clone())?;
-            Some((provider, executor))
+        let channel = match channel.and_then(|outcome| outcomes.take("channel", outcome)) {
+            Some(ready) => {
+                let mut channels = Vec::new();
+                for (account, detail) in ready {
+                    let ConnectorAccountDetail::Channel { channel, scope, status_label, token, extra_id } = detail
+                        else { return Err(VerificationError::Invalid) };
+                    channels.push(ChannelAccount::new(account.product(), channel, scope, status_label, token, extra_id)?);
+                }
+                let provider = Arc::new(ChannelConnectorProvider::new(home_dir.clone(), name.clone(), employee, channels)?);
+                let executor = parts.channel_executors.executor(provider.clone())?;
+                Some((provider, executor))
+            }
+            None => None,
         };
 
         let odoo = match if parts.odoo_executors.available() { plan.single("odoo")? } else { None } {
@@ -498,8 +683,10 @@ impl ConnectorProviderFactory for GatewayConnectorFactory {
         if plan_connector_accounts(&catalog, binding, parts.home_binding.as_ref())? != plan {
             return Err(VerificationError::Unavailable);
         }
+        let DetailOutcomes { fences: detail_fences, setup_required } = outcomes;
         InstalledConnectorProviders::assemble(home_dir, name, employee, bindings, catalog, ConnectorBootProviders {
             google, notion_policy, github_policy, native_credentials, database, odoo, channel, model, computer, search,
+            detail_fences, setup_required,
         })
     }
 }
@@ -526,7 +713,8 @@ mod tests {
         let registry = Arc::new(ConnectorProviderRegistry::default());
         let bindings = Arc::new(Mutex::new(BindingStore::new(rusqlite::Connection::open_in_memory().unwrap()).unwrap()));
         let resolver = Arc::new(GatewayResourceResolver::new(home.clone(), EmployeeId([1;16]), "bot".into(), bindings).unwrap());
-        let installed = InstalledConnectorProviders { home:home.clone(), agent:"bot".into(), employee:EmployeeId([1;16]), registry, resolver };
+        let installed = InstalledConnectorProviders { home:home.clone(), agent:"bot".into(), employee:EmployeeId([1;16]), registry, resolver,
+            refusals: BTreeMap::new() };
         for (path, name, employee) in [
             (home.as_path(), "other", EmployeeId([1;16])),
             (home.as_path(), "bot", EmployeeId([2;16])),
@@ -604,10 +792,25 @@ mod tests {
         }
     }
 
-    struct Details { map: BTreeMap<AccountId, ConnectorAccountDetail>, asked: Mutex<Vec<AccountId>>, fail: bool }
+    /// Test double: details provisioned for EMPLOYEE/AGENT, pinned when first
+    /// resolved; `current_pin` returns that pin (never records `asked`).
+    struct Details {
+        map: BTreeMap<AccountId, ConnectorAccountDetail>, asked: Mutex<Vec<AccountId>>, fail: bool,
+        pins: Mutex<BTreeMap<AccountId, DetailPin>>,
+    }
+    fn reference_of(detail: &ConnectorAccountDetail) -> DetailReference {
+        match detail {
+            ConnectorAccountDetail::Database { source } => DetailReference::Database { source: source.clone() },
+            ConnectorAccountDetail::Computer { credential } => DetailReference::Computer { credential: credential.clone() },
+            ConnectorAccountDetail::Channel { channel, scope, status_label, extra_id, .. } => DetailReference::Channel {
+                channel: channel.clone(), scope: scope.clone(), status_label: status_label.clone(),
+                token: crate::isolation_connector_details::ChannelTokenRef::Agent, extra_id: extra_id.clone() },
+        }
+    }
     impl Details {
         fn new(map: Vec<(AccountId, ConnectorAccountDetail)>) -> Arc<Self> {
-            Arc::new(Self { map: map.into_iter().collect(), asked: Mutex::new(Vec::new()), fail: false })
+            Arc::new(Self { map: map.into_iter().collect(), asked: Mutex::new(Vec::new()), fail: false,
+                pins: Mutex::new(BTreeMap::new()) })
         }
         fn asked(&self, routes: &Routes) -> Vec<&'static str> {
             let mut names: Vec<_> = self.asked.lock().unwrap().iter().map(|id| routes.name(id.as_str())).collect();
@@ -616,10 +819,17 @@ mod tests {
         }
     }
     impl ConnectorAccountDetails for Details {
-        fn detail(&self, route: &Route) -> Result<Option<ConnectorAccountDetail>, VerificationError> {
+        fn detail(&self, route: &Route) -> Result<Option<ProvisionedDetail>, VerificationError> {
             self.asked.lock().unwrap().push(route.account.clone());
             if self.fail { return Err(VerificationError::Unavailable); }
-            Ok(self.map.get(&route.account).cloned())
+            let Some(detail) = self.map.get(&route.account).cloned() else { return Ok(None) };
+            let pin = DetailPin::new(route, EMPLOYEE, AGENT.into(), reference_of(&detail));
+            self.pins.lock().unwrap().insert(route.account.clone(), pin.clone());
+            Ok(Some(ProvisionedDetail { detail, pin }))
+        }
+        fn current_pin(&self, account: &AccountId) -> Result<Option<DetailPin>, VerificationError> {
+            if self.fail { return Err(VerificationError::Unavailable); }
+            Ok(self.pins.lock().unwrap().get(account).cloned())
         }
     }
     fn db(source: &str) -> ConnectorAccountDetail { ConnectorAccountDetail::Database { source: source.into() } }
@@ -667,16 +877,119 @@ mod tests {
         }
     }
 
-    fn home_fixture() -> tempfile::TempDir {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(home.path().join("agents").join(AGENT)).unwrap();
-        std::fs::write(home.path().join("agents").join(AGENT).join("agent.toml"),
+    fn write_fixture(home: &Path) {
+        std::fs::create_dir_all(home.join("agents").join(AGENT)).unwrap();
+        std::fs::write(home.join("agents").join(AGENT).join("agent.toml"),
             "[capabilities]\ndb_sources=['demo','demo2']\n").unwrap();
-        let url = |name: &str| format!("{:?}", home.path().join(name).to_str().unwrap());
-        std::fs::write(home.path().join("config.toml"), format!(
+        let url = |name: &str| format!("{:?}", home.join(name).to_str().unwrap());
+        std::fs::write(home.join("config.toml"), format!(
             "[db_sources.demo]\ndriver='sqlite'\nurl={}\nallowed_tables=['*']\n\n[db_sources.demo2]\ndriver='sqlite'\nurl={}\nallowed_tables=['*']\n",
             url("demo.sqlite"), url("demo2.sqlite"))).unwrap();
+    }
+    fn home_fixture() -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        write_fixture(home.path());
         home
+    }
+    /// A factory over any details store (C6 tests use the production one).
+    fn factory_for(home: &Path, details: Arc<dyn ConnectorAccountDetails>) -> GatewayConnectorFactory {
+        GatewayConnectorFactory::new(GatewayConnectorFactoryParts {
+            home_binding: Some(company()),
+            details,
+            google: Arc::new(GoogleBridgeInputs {
+                users: None,
+                reference: duduclaw_core::google_identity::CredentialRef {
+                    kind: duduclaw_core::google_identity::CredentialKind::Legacy, sha256: "a".repeat(64) },
+                turns: Arc::new(NoTurns),
+            }),
+            search: Arc::new(NoSearch(AtomicUsize::new(0))),
+            hardware: duduclaw_inference::types::HardwareInfo {
+                gpu_type: duduclaw_inference::types::GpuType::None, gpu_name: String::new(),
+                vram_total_mb: 0, vram_available_mb: 0, ram_total_mb: 4096, ram_available_mb: 4096, cpu_cores: 1,
+                recommended_backend: duduclaw_inference::types::BackendType::OpenAiCompat, recommended_max_model_gb: 0.0,
+            },
+            computer_sessions: crate::computer_use_sessions::workspace_admin::admin_sessions(home),
+            odoo_executors: Executors::new("odoo", None),
+            channel_executors: Executors::new("channel", None),
+        }).unwrap()
+    }
+    fn db_record(employee: EmployeeId, source: &str) -> crate::isolation_connector_details::AccountDetailRecord {
+        crate::isolation_connector_details::AccountDetailRecord { employee, agent: AGENT.into(),
+            reference: DetailReference::Database { source: source.into() } }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c6_missing_details_setup_required() {
+        use crate::isolation_connector_details::CatalogAccountDetails;
+        let home = crate::fs_safe::private_test_home().unwrap();
+        write_fixture(home.path());
+        let catalog = Arc::new(ConnectorCatalog::open(home.path()).unwrap());
+        let details = Arc::new(CatalogAccountDetails::new(home.path().to_path_buf(), catalog.clone()).unwrap());
+        let factory = factory_for(home.path(), details);
+        let ready = catalog.register_with_details("alice demo", "database", ConnectorKind::Personal, &alice(),
+            &db_record(EMPLOYEE, "demo")).unwrap();
+        // Provisioned for another protected employee of the same owner: never
+        // this employee's account, and not a setup gap either.
+        let foreign = catalog.register_with_details("alice demo2", "database", ConnectorKind::Personal, &alice(),
+            &db_record(EmployeeId([9; 16]), "demo2")).unwrap();
+        // Routes that need details but have none (e.g. a non-C3 writer).
+        let bare_db = catalog.register("alice bare", "database", ConnectorKind::Personal, &alice()).unwrap();
+        catalog.register("alice login", "computer", ConnectorKind::Personal, &alice()).unwrap();
+        let build = || factory.build(home.path(), AGENT, EMPLOYEE, &alice(), catalog.clone(), empty_bindings()).unwrap();
+        let ctx = context(alice(), Principal::Human { user_id: text("alice"), generation: 1 });
+
+        let installed = build();
+        assert_eq!(installed.setup_required().collect::<Vec<_>>(), vec!["computer", "database"]);
+        assert_eq!(installed.refusals().get("database").map(|r| r.reason()), Some("connector_setup_required"));
+        assert_eq!(installed.registry().candidates(&ctx, "db_sources", "database").err(), Some(VerificationError::Unavailable));
+        assert_eq!(installed.verify_identity(home.path(), AGENT, EMPLOYEE), Ok(()), "the registry stays complete");
+
+        // Retiring the bare route leaves only provisioned accounts.
+        catalog.revoke(&bare_db).unwrap();
+        let installed = build();
+        assert_eq!(installed.setup_required().collect::<Vec<_>>(), vec!["computer"]);
+        let offered: Vec<_> = installed.registry().candidates(&ctx, "db_sources", "database").unwrap()
+            .iter().map(|a| a.account().to_owned()).collect();
+        assert_eq!(offered, vec![ready.as_str().to_owned()], "never the other employee's {foreign}");
+
+        // Use time: a generation move deletes the pinned details; the already
+        // installed provider stops offering the account at its next check.
+        catalog.advance(&ready).unwrap();
+        assert_eq!(installed.registry().candidates(&ctx, "db_sources", "database").unwrap().len(), 0);
+        assert_eq!(build().setup_required().collect::<Vec<_>>(), vec!["computer", "database"],
+            "details of the old generation never resolve for the new one");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c6_unreadable_store_unavailable() {
+        use crate::isolation_connector_details::CatalogAccountDetails;
+        let home = crate::fs_safe::private_test_home().unwrap();
+        write_fixture(home.path());
+        let catalog = Arc::new(ConnectorCatalog::open(home.path()).unwrap());
+        let details = Arc::new(CatalogAccountDetails::new(home.path().to_path_buf(), catalog.clone()).unwrap());
+        let factory = factory_for(home.path(), details);
+        catalog.register_with_details("alice demo", "database", ConnectorKind::Personal, &alice(),
+            &db_record(EMPLOYEE, "demo")).unwrap();
+        let installed = factory.build(home.path(), AGENT, EMPLOYEE, &alice(), catalog.clone(), empty_bindings()).unwrap();
+        let ctx = context(alice(), Principal::Human { user_id: text("alice"), generation: 1 });
+        assert_eq!(installed.registry().candidates(&ctx, "db_sources", "database").unwrap().len(), 1);
+
+        // The details table becomes unreadable (routes still readable).
+        Connection::open(home.path().join(crate::isolation_connectors::CATALOG_FILE)).unwrap()
+            .execute_batch("DROP TABLE isolation_connector_details").unwrap();
+        assert_eq!(factory.build(home.path(), AGENT, EMPLOYEE, &alice(), catalog.clone(), empty_bindings()).err(),
+            Some(VerificationError::Unavailable), "an unreadable store refuses the whole build, never setup_required");
+        assert_eq!(installed.registry().candidates(&ctx, "db_sources", "database").err(),
+            Some(VerificationError::Unavailable), "and every use-time recheck refuses");
+        // A reopen recreates an empty details table (the pre-C6 upgrade path);
+        // lost details never come back, the route just needs setup again.
+        let reopened = Arc::new(ConnectorCatalog::open(home.path()).unwrap());
+        let details = Arc::new(CatalogAccountDetails::new(home.path().to_path_buf(), reopened.clone()).unwrap());
+        let installed = factory_for(home.path(), details)
+            .build(home.path(), AGENT, EMPLOYEE, &alice(), reopened, empty_bindings()).unwrap();
+        assert_eq!(installed.setup_required().collect::<Vec<_>>(), vec!["database"]);
     }
 
     struct Setup {
@@ -865,10 +1178,21 @@ mod tests {
             let s = setup(details, Executors::new("odoo", None), Executors::new("channel", None));
             s.factory.build(s.home.path(), AGENT, EMPLOYEE, &alice(), routes.catalog.clone(), empty_bindings()).err()
         };
-        let failing = Arc::new(Details { map: BTreeMap::new(), asked: Mutex::new(Vec::new()), fail: true });
+        let failing = Arc::new(Details { map: BTreeMap::new(), asked: Mutex::new(Vec::new()), fail: true,
+            pins: Mutex::new(BTreeMap::new()) });
         assert_eq!(build(failing), Some(VerificationError::Unavailable));
-        assert_eq!(build(Details::new(vec![(id("alice_db"), db("demo"))])), Some(VerificationError::Unavailable),
-            "the home database route has no provisioned detail");
+        // C6: a route without provisioned details no longer refuses the whole
+        // build; the provider is a refusing adapter marked setup-required.
+        {
+            let s = setup(Details::new(vec![(id("alice_db"), db("demo"))]), Executors::new("odoo", None), Executors::new("channel", None));
+            let installed = s.factory.build(s.home.path(), AGENT, EMPLOYEE, &alice(), routes.catalog.clone(), empty_bindings()).unwrap();
+            assert_eq!(installed.setup_required().collect::<Vec<_>>(), vec!["database"],
+                "the home database route has no provisioned detail");
+            assert_eq!(installed.refusals().get("computer"), Some(&ProviderRefusal::NoRoute));
+            let ctx = context(alice(), Principal::Human { user_id: text("alice"), generation: 1 });
+            assert_eq!(installed.registry().candidates(&ctx, "db_sources", "database").err(), Some(VerificationError::Unavailable),
+                "not even the provisioned alice_db route is served while the provider needs setup");
+        }
         assert_eq!(build(Details::new(vec![(id("alice_db"), db("demo")),
             (id("home_db"), ConnectorAccountDetail::Computer { credential: "x".into() })])), Some(VerificationError::Invalid));
         assert_eq!(build(Details::new(vec![(id("alice_db"), db("demo")), (id("home_db"), db("demo2"))])), None);

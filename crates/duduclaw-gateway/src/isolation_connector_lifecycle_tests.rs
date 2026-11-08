@@ -72,7 +72,7 @@ impl CredentialMaterial for Probe {
 #[test]
 fn revoke_fences_selected_connector_before_effect() {
     let home = crate::fs_safe::private_test_home().unwrap();
-    let account = provision(home.path(), "google", ConnectorKind::Personal, &alice(), "alice work", &actor()).unwrap();
+    let account = provision(home.path(), "google", ConnectorKind::Personal, &alice(), "alice work", None, &actor()).unwrap();
     let selected = selection(home.path(), &account);
     let vault = AccountCredentialVault::default();
     vault.install(AccountCredential::new(account.to_string(), "google".into(), "fixture-token".into(), u64::MAX).unwrap())
@@ -104,7 +104,7 @@ fn revoke_keeps_fence_when_material_removal_fails() {
         fn drop_material(&self, _: &AccountId) -> Result<(), VerificationError> { Err(VerificationError::Unavailable) }
     }
     let home = crate::fs_safe::private_test_home().unwrap();
-    let account = provision(home.path(), "google", ConnectorKind::Personal, &alice(), "alice", &actor()).unwrap();
+    let account = provision(home.path(), "google", ConnectorKind::Personal, &alice(), "alice", None, &actor()).unwrap();
     let selected = selection(home.path(), &account);
     assert_eq!(revoke_with(home.path(), &account, &actor(), Some(&Broken)), Err(LifecycleError::MaterialPending));
     assert!(selected.recheck().is_err());
@@ -129,10 +129,13 @@ fn provision_never_scans_credentials() {
     std::fs::write(home.path().join("secrets/odoo.json"), "{\"password\":\"legacy-odoo\"}").unwrap();
 
     let company = EmployeeBinding::Shared(text("company"));
-    let first = provision(home.path(), "github", ConnectorKind::SharedTenant, &company, "org bot", &actor()).unwrap();
+    let first = provision(home.path(), "github", ConnectorKind::SharedTenant, &company, "org bot", None, &actor()).unwrap();
     // A refused provision creates nothing and still scans nothing.
-    assert!(provision(home.path(), "google", ConnectorKind::SharedHome, &alice(), "x", &actor()).is_err());
-    assert!(provision(home.path(), "dropbox", ConnectorKind::Personal, &alice(), "x", &actor()).is_err());
+    assert!(provision(home.path(), "google", ConnectorKind::SharedHome, &alice(), "x", None, &actor()).is_err());
+    assert!(provision(home.path(), "dropbox", ConnectorKind::Personal, &alice(), "x", None, &actor()).is_err());
+    // C6: a detail provider without details is refused before the catalog.
+    assert_eq!(provision(home.path(), "database", ConnectorKind::SharedTenant, &company, "x", None, &actor()),
+        Err(LifecycleError::Detail(DetailError::Required)));
 
     let catalog = ConnectorCatalog::open(home.path()).unwrap();
     let routes = catalog.list(None, 200).unwrap();
@@ -142,7 +145,7 @@ fn provision_never_scans_credentials() {
     for (name, body) in artifacts { assert_eq!(std::fs::read_to_string(home.path().join(name)).unwrap(), body); }
 
     // The same label again is a new account, never the old id.
-    let second = provision(home.path(), "github", ConnectorKind::SharedTenant, &company, "org bot", &actor()).unwrap();
+    let second = provision(home.path(), "github", ConnectorKind::SharedTenant, &company, "org bot", None, &actor()).unwrap();
     assert_ne!(first, second);
     assert_eq!(catalog.list(None, 200).unwrap().len(), 2);
     let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap_or_default();

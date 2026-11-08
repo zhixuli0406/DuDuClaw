@@ -12,6 +12,7 @@ use super::*;
 use duduclaw_auth::mfa::MigrationConfirmationSession;
 use duduclaw_isolation::{bounded::Text, capability::EmployeeBinding};
 use duduclaw_migration::confirmation::ApprovalSession;
+use crate::isolation_connector_details::{ChannelTokenRef, DetailEmployee, DetailError, DetailReference};
 use crate::isolation_connector_lifecycle::{self as lifecycle, AdminActor, LifecycleError};
 use crate::isolation_connectors::{AccountId, CatalogError, ConnectorCatalog, ConnectorKind, Route, MAX_LIST_PAGE};
 
@@ -43,7 +44,52 @@ struct ProvisionRequest {
     #[serde(default)]
     owner_user_id: Option<String>,
     label: String,
+    /// C6: required for `database`, `computer` and `channel`, refused for
+    /// every other provider.
+    #[serde(default)]
+    details: Option<DetailParams>,
     csrf_token: [u8; 32],
+}
+/// Per-provider account details. Exactly the fields of the provider are
+/// accepted; there is no field for a raw token, password or URL.
+/// - database: `source` (a registered `[db_sources.<name>]` the employee is granted)
+/// - computer: `credential` (a website credential id whose allowed agents include the employee)
+/// - channel: `channel`, `scope` (exact chat / settings scope / pairing subject),
+///   `token_ref` (`none` | `home` | `agent`), optional `status_label`, `extra_id`
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DetailParams {
+    /// Agent id of the confirmed protected employee that will use the
+    /// account. Resolved through the employee lifecycle, never trusted as-is.
+    employee: String,
+    #[serde(default)] source: Option<String>,
+    #[serde(default)] credential: Option<String>,
+    #[serde(default)] channel: Option<String>,
+    #[serde(default)] scope: Option<String>,
+    #[serde(default)] status_label: Option<String>,
+    #[serde(default)] token_ref: Option<String>,
+    #[serde(default)] extra_id: Option<String>,
+}
+impl DetailParams {
+    /// Exactly the provider's fields; anything else (including an unknown
+    /// token reference form) is refused.
+    fn reference(&self, provider: &str) -> Option<DetailReference> {
+        let Self { employee: _, source, credential, channel, scope, status_label, token_ref, extra_id } = self;
+        let channel_fields = channel.is_some() || scope.is_some() || status_label.is_some() || token_ref.is_some() || extra_id.is_some();
+        match provider {
+            "database" if credential.is_none() && !channel_fields =>
+                source.clone().map(|source| DetailReference::Database { source }),
+            "computer" if source.is_none() && !channel_fields =>
+                credential.clone().map(|credential| DetailReference::Computer { credential }),
+            "channel" if source.is_none() && credential.is_none() => {
+                let (channel, scope) = (channel.clone()?, scope.clone()?);
+                let token = ChannelTokenRef::parse(token_ref.as_deref()?)?;
+                Some(DetailReference::Channel { status_label: status_label.clone().unwrap_or_else(|| channel.clone()),
+                    channel, scope, token, extra_id: extra_id.clone() })
+            }
+            _ => None,
+        }
+    }
 }
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,9 +154,17 @@ fn serve(home: &Path, db: &UserDb, user: &str, session: &str, epoch: u64, method
             let kind = parse_kind(&input.kind).ok_or("連線帳號資料不正確。")?;
             let binding = resolve_binding(home, db, &input.binding, input.owner_user_id.as_deref())?;
             let actor = AdminActor::verified(user).map_err(|_| "無法確認管理員帳號。")?;
-            let account = lifecycle::provision(home, &input.provider, kind, &binding, &input.label, &actor)
+            let target = match &input.details {
+                Some(params) => {
+                    let reference = params.reference(&input.provider).ok_or("連線帳號的設定資料不正確。")?;
+                    Some((resolve_employee(home, &params.employee)?, reference))
+                }
+                None => None,
+            };
+            let account = lifecycle::provision(home, &input.provider, kind, &binding, &input.label,
+                target.as_ref().map(|(employee, reference)| (employee, reference)), &actor)
                 .map_err(lifecycle_message)?;
-            Ok(json!({ "account": account.as_str(), "readback_required": true }))
+            Ok(json!({ "account": account.as_str(), "details": target.is_some(), "readback_required": true }))
         }
         REVOKE => {
             let input: RevokeRequest = serde_json::from_value(params).map_err(|_| "連線帳號識別碼無效。")?;
@@ -173,6 +227,16 @@ fn resolve_binding(home: &Path, db: &UserDb, binding: &str, owner: Option<&str>)
     }
 }
 
+/// The confirmed protected employee currently holding `agent`, from the
+/// employee lifecycle (apply.db + confirmation + root readback + users.db).
+/// Its immutable `EmployeeId` and binding are what the details are pinned to.
+fn resolve_employee(home: &Path, agent: &str) -> Result<DetailEmployee, &'static str> {
+    let lifecycle = crate::isolation_lifecycle::read_lifecycle(home, agent)
+        .map_err(|_| "找不到這位受保護員工，或其狀態目前無法使用。")?;
+    if lifecycle.label != agent { return Err("找不到這位受保護員工，或其狀態目前無法使用。"); }
+    Ok(DetailEmployee { employee: lifecycle.employee, agent: lifecycle.label, binding: lifecycle.binding })
+}
+
 /// One page for the admin list. Contains no secret (the catalog holds none),
 /// no tenant id and no email: a Personal route names only its owner's user id.
 fn list_value(catalog: &ConnectorCatalog, after: Option<&AccountId>) -> Result<Value, CatalogError> {
@@ -200,6 +264,15 @@ fn catalog_message(error: CatalogError) -> &'static str {
 fn lifecycle_message(error: LifecycleError) -> &'static str {
     match error {
         LifecycleError::Catalog(error) => catalog_message(error),
+        LifecycleError::Detail(error) => match error {
+            DetailError::Required => "這類連線帳號需要填寫設定資料（資料來源、網站登入資料或頻道）。",
+            DetailError::NotApplicable => "這類連線帳號不需要額外設定資料。",
+            DetailError::Invalid => "連線帳號的設定資料不正確。",
+            DetailError::Employee => "這位員工的歸屬不能使用這個連線帳號。",
+            DetailError::Unknown => "找不到指定的資料來源、網站登入資料或頻道憑證。",
+            DetailError::Foreign => "這位員工沒有使用指定資料來源、網站登入資料或頻道憑證的權限。",
+            DetailError::Unavailable => "無法讀取設定資料的來源，已拒絕操作。",
+        },
         LifecycleError::MaterialPending => "已停用這個連線帳號，但憑證尚未清除完成，請再執行一次撤銷。",
     }
 }
@@ -255,6 +328,37 @@ mod tests {
     }
 
     #[test]
+    fn c6_detail_params_are_exact_and_reference_only() {
+        let parse = |value: Value| serde_json::from_value::<DetailParams>(value);
+        let channel = || json!({"employee":"employee-a","channel":"telegram","scope":"1","token_ref":"agent"});
+        // There is no field that could carry a raw token, password or URL,
+        // nor one that could name an employee id or binding directly.
+        for forbidden in ["token", "bot_token", "password", "url", "employee_id", "binding", "tenant_id"] {
+            let mut value = channel();
+            value[forbidden] = json!("123456:AAHraw");
+            assert!(parse(value).is_err(), "{forbidden}");
+        }
+        let parsed = parse(channel()).unwrap();
+        assert!(matches!(parsed.reference("channel"), Some(DetailReference::Channel { token: ChannelTokenRef::Agent,
+            status_label, .. }) if status_label == "telegram"));
+        assert!(parsed.reference("database").is_none(), "channel fields never describe another provider");
+        let mut raw = channel();
+        raw["token_ref"] = json!("123456:AAHraw");
+        assert!(parse(raw).unwrap().reference("channel").is_none(), "a token value is not a reference form");
+        let db = parse(json!({"employee":"employee-a","source":"demo"})).unwrap();
+        assert!(matches!(db.reference("database"), Some(DetailReference::Database { source }) if source == "demo"));
+        assert!(db.reference("computer").is_none() && db.reference("google").is_none());
+        let mixed = parse(json!({"employee":"employee-a","source":"demo","credential":"x"})).unwrap();
+        assert!(mixed.reference("database").is_none() && mixed.reference("computer").is_none());
+
+        let mut request = json!({"provider":"database","kind":"personal","binding":"personal","owner_user_id":ADMIN,
+            "label":"x","csrf_token":vec![7u8; 32],"details":{"employee":"employee-a","source":"demo"}});
+        assert!(serde_json::from_value::<ProvisionRequest>(request.clone()).is_ok());
+        request["details"]["employee_binding"] = json!("personal");
+        assert!(serde_json::from_value::<ProvisionRequest>(request).is_err());
+    }
+
+    #[test]
     fn rpc_namespace_and_binding_shape_are_exact() {
         for method in METHODS { assert!(owns(method), "{method}"); }
         for method in ["isolation.connector_purge", "isolation.connector_list.extra"] { assert!(owns(method), "{method}"); }
@@ -281,8 +385,8 @@ mod tests {
         let owner = EmployeeBinding::Personal(Text::new(ADMIN.into()).unwrap());
         let shared = EmployeeBinding::Shared(Text::new(tenant.into()).unwrap());
         let actor = AdminActor::verified(ADMIN).unwrap();
-        let personal = lifecycle::provision(home.path(), "google", ConnectorKind::Personal, &owner, "Alice mail", &actor).unwrap();
-        let team = lifecycle::provision(home.path(), "notion", ConnectorKind::SharedHome, &shared, "Team wiki", &actor).unwrap();
+        let personal = lifecycle::provision(home.path(), "google", ConnectorKind::Personal, &owner, "Alice mail", None, &actor).unwrap();
+        let team = lifecycle::provision(home.path(), "notion", ConnectorKind::SharedHome, &shared, "Team wiki", None, &actor).unwrap();
         // Material exists in the process vault; the listing never consults it.
         let vault = AccountCredentialVault::default();
         vault.install(AccountCredential::new(personal.to_string(), "google".into(), "ya29.secret-material".into(), u64::MAX)
