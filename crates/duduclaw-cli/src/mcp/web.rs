@@ -28,6 +28,11 @@ pub(crate) async fn fetch_for_tool(
             use duduclaw_mcp_boundary::{VerificationError, tool_policy};
             let resolver = call.record_resolver.clone().ok_or(VerificationError::Unavailable)?;
             let before = tool_policy::authorize_async(&call.context, "web_fetch_cached", args, resolver.clone()).await?;
+            // D-H2: a PublicOrigins call re-resolves its URL through the signed grant.
+            if before.resources().iter().any(|grant| matches!(grant,
+                duduclaw_isolation::capability::ResourceGrant::PublicOrigins { .. })) {
+                duduclaw_mcp_boundary::resources::authorize_public_url(&before)?;
+            }
             if !duduclaw_gateway::web_fetch::admit_protected_tool_fetch() {
                 return Err(VerificationError::Unavailable);
             }

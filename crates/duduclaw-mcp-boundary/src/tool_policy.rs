@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::{RequestContext, VerificationError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceKind { EmployeeScope, Employee, Workspace, Mailbox, Task, DatabaseTable, Wiki, Connector, Recipient, UrlOrigin }
+pub enum ResourceKind { EmployeeScope, Employee, Workspace, Mailbox, Task, DatabaseTable, Wiki, Connector, Recipient, UrlOrigin, PublicOrigins }
 impl ResourceKind {
     pub fn of(resource: &ResourceGrant) -> Self {
         match resource {
@@ -22,8 +22,22 @@ impl ResourceKind {
             ResourceGrant::Connector { .. } => Self::Connector,
             ResourceGrant::Recipient { .. } => Self::Recipient,
             ResourceGrant::UrlOrigin { .. } => Self::UrlOrigin,
+            ResourceGrant::PublicOrigins { .. } => Self::PublicOrigins,
         }
     }
+}
+
+/// The only tools a `PublicOrigins` grant (D-H2) can authorize. Their URL
+/// argument must resolve to a granted public HTTPS origin; the host fetch
+/// (`web_fetch_protected_cached`) pins DNS, refuses non-public addresses and
+/// follows no redirect, so the grant never reaches a second origin.
+pub const PUBLIC_ORIGIN_TOOLS: &[&str] = &["web_fetch_cached", "web_extract"];
+
+/// The record's signed `PublicOrigins` grant, only for an employee-scope record.
+fn public_origins_grant(context: &RequestContext) -> Option<&ResourceGrant> {
+    let record = context.record();
+    if !record.employee_scope() { return None; }
+    record.resources.as_slice().iter().find(|grant| matches!(grant, ResourceGrant::PublicOrigins { .. }))
 }
 
 /// Execution and Worker MUST use packages A/E; neither may spawn under the
@@ -91,7 +105,9 @@ pub const POLICIES: &[ToolPolicy] = &[
     // agents
     ToolPolicy { name: "create_agent", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "list_agents", route: Route::Service, required: &[ResourceKind::Employee] },
-    ToolPolicy { name: "create_task", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Workspace] },
+    // H8: a TaskSpec plan is host-queue work under the run's own live task
+    // (`create_task_selector`), not a workspace operation.
+    ToolPolicy { name: "create_task", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Task] },
     ToolPolicy { name: "check_responses", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "task_status", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Task] },
     ToolPolicy { name: "agent_status", route: Route::Service, required: &[ResourceKind::Employee] },
@@ -382,6 +398,24 @@ fn own_employee(context: &RequestContext) -> ResourceGrant {
     ResourceGrant::Employee { id: context.record().employee }
 }
 
+/// Top-level task selector argument keys. `create_task` never accepts them.
+pub const TASK_SELECTOR_KEYS: [&str; 5] = ["task_id", "parent_task_id", "goal_id", "parent_goal_id", "depends_on"];
+
+/// H8 live task selector for `create_task`: the task is the run's own task
+/// from the verified capability record (`record.task`), never an argument, and
+/// the record must also carry the exact signed `Task` grant for it. Live
+/// ownership (the task store says the calling employee owns it now) is the
+/// resolver's job at use time; this is only the record-side half, shared by
+/// discovery (`eligible`) and `authorize`.
+pub fn create_task_selector(context: &RequestContext) -> Result<ResourceGrant, VerificationError> {
+    let record = context.record();
+    let task = record.task.as_ref().ok_or(VerificationError::Invalid)?;
+    let selector = ResourceGrant::Task { id: task.clone() };
+    validate_resource(&selector)?;
+    if !record.io_resources().any(|grant| grant == &selector) { return Err(VerificationError::Invalid); }
+    Ok(selector)
+}
+
 /// Discovery shares the exact tool and mandatory resource policy with calls.
 /// The transport additionally checks that the corresponding host service exists.
 /// Optional argument-dependent resources are checked by `authorize`, not guessed
@@ -391,9 +425,12 @@ pub fn eligible(context: &RequestContext, name: &str) -> bool {
     let record = context.record();
     record.validate_resource_mode().is_ok()
         && record.tools.as_slice().iter().any(|tool| tool.as_str() == name)
-        && ((record.employee_scope() && (employee_service_scope(policy) || policy.route == Route::Connector)) || policy.required.iter().all(|kind| record.io_resources()
+        // D-H2: the URL itself is matched against the grant by `authorize`.
+        && ((PUBLIC_ORIGIN_TOOLS.contains(&name) && public_origins_grant(context).is_some())
+        || (record.employee_scope() && (employee_service_scope(policy) || policy.route == Route::Connector)) || policy.required.iter().all(|kind| record.io_resources()
             .any(|grant| ResourceKind::of(grant) == *kind && validate_resource(grant).is_ok()
                 && (*kind != ResourceKind::Employee || grant == &own_employee(context)))))
+        && (name != "create_task" || create_task_selector(context).is_ok())
 }
 
 fn required_for_call(policy: &ToolPolicy, arguments: &Value) -> Result<Vec<ResourceKind>, VerificationError> {
@@ -434,8 +471,12 @@ fn required_for_call(policy: &ToolPolicy, arguments: &Value) -> Result<Vec<Resou
     }
     if object.contains_key("drive_file_id") { add(ResourceKind::Connector); }
     if object.get("write_wiki").and_then(Value::as_bool) == Some(true) { add(ResourceKind::Wiki); }
-    if matches!(policy.name, "tasks_create" | "tasks_update" | "goals_create" | "activity_post" | "create_task") {
-        for key in ["task_id", "parent_task_id", "goal_id", "parent_goal_id", "depends_on"] {
+    if policy.name == "create_task" {
+        // H8: the task comes only from the verified record; an argument that
+        // names one (even null) is refused instead of being interpreted.
+        if TASK_SELECTOR_KEYS.iter().any(|key| object.contains_key(*key)) { return Err(VerificationError::Invalid); }
+    } else if matches!(policy.name, "tasks_create" | "tasks_update" | "goals_create" | "activity_post") {
+        for key in TASK_SELECTOR_KEYS {
             if object.get(key).is_some_and(|value| !value.is_null()) { add(ResourceKind::Task); }
         }
     }
@@ -461,7 +502,12 @@ pub fn validate_resource(resource: &ResourceGrant) -> Result<(), VerificationErr
     let exact = |value: &str| !value.is_empty() && value != "*" && !value.chars().any(char::is_control);
     let valid = match resource {
         ResourceGrant::Confined { resource } => !matches!(resource.as_ref(), ResourceGrant::Confined { .. }
-            | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. }) && validate_resource(resource).is_ok(),
+            | ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. } | ResourceGrant::PublicOrigins { .. })
+            && validate_resource(resource).is_ok(),
+        // Entries are validated by construction/decode (`PublicOrigin::parse`);
+        // the set and employee-scope rules by `validate_resource_mode`. `*` here
+        // is the reviewed D-H2 public-origin authority, not a collection grant.
+        ResourceGrant::PublicOrigins { origins } => !origins.as_slice().is_empty(),
         ResourceGrant::EmployeeScope { .. } | ResourceGrant::Employee { .. } => true,
         ResourceGrant::Workspace { handle } => exact(handle.as_str()),
         ResourceGrant::Mailbox { id } | ResourceGrant::Task { id } => exact(id.as_str()),
@@ -575,6 +621,26 @@ fn check_selected_resources(policy: &ToolPolicy, arguments: &Value, resources: &
     Ok(())
 }
 
+/// D-H2 call path for [`PUBLIC_ORIGIN_TOOLS`]. The selected resources are
+/// exactly the record's own signed EmployeeScope and PublicOrigins grants: no
+/// resolver is consulted, so host resolution can neither widen nor substitute
+/// the origin. Only the declared tool arguments are accepted, and the URL must
+/// resolve (same WHATWG parser as the fetcher) to an origin the grant permits.
+fn authorize_public_origin(context: &RequestContext, policy: &'static ToolPolicy, arguments: &Value,
+    grant: &ResourceGrant) -> Result<AuthorizedToolCall, VerificationError> {
+    let object = arguments.as_object().ok_or(VerificationError::Invalid)?;
+    let allowed: &[&str] = if policy.name == "web_extract" { &["url", "ttl_seconds", "selector", "format"] }
+        else { &["url", "ttl_seconds"] };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) { return Err(VerificationError::Invalid); }
+    let url = object.get("url").and_then(Value::as_str).ok_or(VerificationError::Invalid)?;
+    crate::resources::permitted_public_origin(grant, url)?;
+    let scope = ResourceGrant::EmployeeScope { id: context.record().employee };
+    crate::resources::require_resource(context, &scope)?;
+    crate::resources::require_resource(context, grant)?;
+    Ok(AuthorizedToolCall { context: context.clone(), policy, arguments: arguments.clone(),
+        resources: vec![scope, grant.clone()] })
+}
+
 /// Async callers resolve live resources on the bounded authority worker pool.
 /// The returned call owns its context, arguments and exact finite resources.
 pub async fn authorize_async(context: &RequestContext, name: &str, arguments: &Value,
@@ -605,6 +671,11 @@ pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolv
         crate::check_arguments(&data)?;
     } else { crate::check_arguments(arguments)?; }
     if !eligible(context, name) { return Err(VerificationError::Invalid); }
+    if PUBLIC_ORIGIN_TOOLS.contains(&name) {
+        if let Some(grant) = public_origins_grant(context) {
+            return authorize_public_origin(context, policy, arguments, grant);
+        }
+    }
     if context.record().employee_scope() && employee_service_scope(policy) {
         return Ok(AuthorizedToolCall { context: context.clone(), policy, arguments: arguments.clone(),
             resources: vec![ResourceGrant::EmployeeScope { id: context.record().employee }] });
@@ -646,6 +717,14 @@ pub fn authorize(context: &RequestContext, name: &str, arguments: &Value, resolv
             }
         }
     } else { check_selected_resources(policy, arguments, &resources)?; }
+    if name == "create_task" {
+        // Exactly the record's own task, once; the resolver vouched for live
+        // ownership and cannot substitute or add another task.
+        let selector = create_task_selector(context)?;
+        if !resources.iter().filter(|resource| ResourceKind::of(resource) == ResourceKind::Task).eq([&selector]) {
+            return Err(VerificationError::Invalid);
+        }
+    }
     Ok(AuthorizedToolCall { context: context.clone(), policy, arguments: arguments.clone(), resources })
 }
 

@@ -132,3 +132,78 @@ fn isolated_resolver_assignment_cannot_escape_own_employee() {
     let policy = duduclaw_mcp_boundary::tool_policy::policy("tasks_list").unwrap();
     assert!(resolver.resolve(&context, policy, &json!({"assigned_to":"*"})).is_ok());
 }
+
+// H8: create_task live task selector.
+fn create_task_context(context: &RequestContext, task: Option<&str>) -> RequestContext {
+    let mut record = context.record().clone();
+    record.task = task.map(|task| text(task.into()).unwrap());
+    record.tools = List::new(vec![text("create_task".into()).unwrap()]).unwrap();
+    RequestContext::from_verified_record(record)
+}
+fn plan() -> Value { json!({"goal":"ship the report", "steps":[{"description":"draft", "depends_on":[]}]}) }
+fn task_grants(call: &duduclaw_mcp_boundary::tool_policy::AuthorizedToolCall) -> Vec<&str> {
+    call.resources().iter().filter_map(|r| match r { ResourceGrant::Task { id } => Some(id.as_str()), _ => None }).collect()
+}
+
+#[test]
+fn create_task_selector_requires_live_ownership() {
+    use duduclaw_mcp_boundary::tool_policy::eligible;
+    let (home, resolver, context, _bindings) = fixture();
+    let owned = create_task_context(&context, Some("allowed"));
+    assert!(eligible(&owned, "create_task"));
+    let call = authorize(&owned, "create_task", &plan(), &resolver).unwrap();
+    assert_eq!(task_grants(&call), vec!["allowed"], "exactly the run's own task, nothing else");
+    assert!(call.resources().contains(&ResourceGrant::Employee { id: owned.record().employee }));
+    // No run task: hidden and refused (the caller cannot supply one).
+    let taskless = create_task_context(&context, None);
+    assert!(!eligible(&taskless, "create_task"));
+    assert!(authorize(&taskless, "create_task", &plan(), &resolver).is_err());
+    // A run task without the exact signed grant is not a selector.
+    let mut record = owned.record().clone();
+    record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee },
+        ResourceGrant::Task { id: text("other".into()).unwrap() }]).unwrap();
+    let unsigned = RequestContext::from_verified_record(record);
+    assert!(!eligible(&unsigned, "create_task"));
+    assert!(authorize(&unsigned, "create_task", &plan(), &resolver).is_err());
+    // Ownership is read from the task store at use time, on every call.
+    let tasks = Connection::open(home.path().join("tasks.db")).unwrap();
+    tasks.execute("UPDATE tasks SET assigned_to='employee-b' WHERE id='allowed'", []).unwrap();
+    assert!(authorize(&owned, "create_task", &plan(), &resolver).is_err(), "reassigned mid-run");
+    tasks.execute("UPDATE tasks SET assigned_to='employee-a' WHERE id='allowed'", []).unwrap();
+    assert!(authorize(&owned, "create_task", &plan(), &resolver).is_ok(), "no cached refusal or grant");
+    tasks.execute("DELETE FROM tasks WHERE id='allowed'", []).unwrap();
+    assert!(authorize(&owned, "create_task", &plan(), &resolver).is_err(), "deleted task");
+    drop(tasks);
+    // An unreadable store fails closed and is never created.
+    std::fs::remove_file(home.path().join("tasks.db")).unwrap();
+    assert!(authorize(&owned, "create_task", &plan(), &resolver).is_err());
+    assert!(!home.path().join("tasks.db").exists());
+}
+
+#[test]
+fn create_task_refuses_foreign_task() {
+    let (_home, resolver, context, _bindings) = fixture();
+    // The run's task is signed but assigned to another employee's agent.
+    let foreign = create_task_context(&context, Some("other"));
+    assert!(duduclaw_mcp_boundary::tool_policy::eligible(&foreign, "create_task"), "record-side half only");
+    assert!(authorize(&foreign, "create_task", &plan(), &resolver).is_err());
+    let policy = duduclaw_mcp_boundary::tool_policy::policy("create_task").unwrap();
+    assert!(resolver.resolve(&foreign, policy, &plan()).is_err());
+    // A signed grant for a task that does not exist is not ownership.
+    let mut record = context.record().clone();
+    record.task = Some(text("missing".into()).unwrap());
+    record.tools = List::new(vec![text("create_task".into()).unwrap()]).unwrap();
+    record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee },
+        ResourceGrant::Task { id: text("missing".into()).unwrap() }]).unwrap();
+    assert!(authorize(&RequestContext::from_verified_record(record), "create_task", &plan(), &resolver).is_err());
+    // Arguments can never redirect the plan to another task, even an owned one.
+    let owned = create_task_context(&context, Some("allowed"));
+    for key in ["task_id", "parent_task_id", "goal_id", "parent_goal_id", "depends_on"] {
+        for value in [json!("other"), json!("allowed"), json!(["other"]), Value::Null] {
+            let mut args = plan();
+            args[key] = value.clone();
+            assert!(authorize(&owned, "create_task", &args, &resolver).is_err(), "{key}={value}");
+            assert!(resolver.resolve(&owned, policy, &args).is_err(), "{key}={value}");
+        }
+    }
+}

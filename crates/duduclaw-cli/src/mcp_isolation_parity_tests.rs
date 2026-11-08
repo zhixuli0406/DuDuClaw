@@ -313,7 +313,10 @@ fn isolated_round6_production_inventory_tracks_selector_gaps() {
         .arg("--test-threads=1").arg("--nocapture")
         .env("DUDUCLAW_PARITY_CHILD_HOME", home.path())
         .env(duduclaw_core::ENV_AGENT_ID, "main")
-        .env(duduclaw_core::ENV_AGENT_TOKEN, duduclaw_core::mint_identity_token(&key, "main"))
+        // The child's fixture confirms "main" as a protected employee (the
+        // context's employee id, incarnation 0), so only a v2 token verifies (F6m).
+        .env(duduclaw_core::ENV_AGENT_TOKEN, duduclaw_core::identity_token::mint_token_v2(&key, "main",
+            &duduclaw_core::identity_token::AgentIncarnation { employee: context().record().employee.0, incarnation: 0 }))
         .env_remove(duduclaw_core::ENV_LANE)
         .output().unwrap();
     assert!(output.status.success(), "parity subprocess failed:\n{}\n{}",

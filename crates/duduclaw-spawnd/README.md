@@ -137,6 +137,113 @@ binding. It needs the same `ISO_STORAGE_TEST_ROOT`, private mount tree, ext4/XFS
 backing and host capacity reserve as package H's root tests. It has not been run
 in this worktree; it is not an end-to-end employee launch test.
 
+### Package H work broker wiring (H4)
+
+The control socket now answers the four `ipc::Opcode::WORK` ops; spawnd
+advertises `SpawndFeatures::WORK_BROKER` (readiness report and every
+`Reserved`, the one feature set shared with HX4's `helper_calls`) so a gateway
+never sends them to an older spawnd (which closes the connection on an unknown
+`op`).
+
+- **Asynchronous replies.** `OpenWorkFile`, `WorkAnchor`, `StopEmployeeRuns`
+  and `EmployeeIdle` are queued as coordinator tickets; the event loop never
+  blocks. The connection gets no other reply until the deferred one is sent,
+  always within `BROKER_REPLY_MS` (4 s, below the client's 5 s); a late host
+  result (and its fd) is dropped and the caller sees
+  `workspace_broker_unavailable`.
+- **OpenWorkFile.** Coordinator: owning connection (`NotFound`), the run's own
+  employee (`Unauthorized`), admission `Running` and no pending stop
+  (`NotReady`), caps of 4 outstanding snapshots per run and 16 overall
+  (`resource_limit`). Lifecycle thread, same worker turn: H2 `check_work_path`,
+  `LiveRunView` from the core's own `LiveRun` (not closed, trampoline Running,
+  unit present, the run fence not raised) and `verify_lease` against the
+  durable lease inventory. Copy: on a separate `spawnd-work-broker` thread
+  (bounded FIFO, one copy at a time, so a 10 s H2 copy never stalls polls,
+  fences or cleanup); the fence is re-read before and after the copy, and the
+  coordinator re-checks Running before the single `WorkFileRead` fd is sent.
+- **Broker root.** `Core::start` takes `bootstrap_mounts::work_broker_root`
+  (detached RO/nosuid/nodev/noexec clone of the whole H work tree) BEFORE
+  `select_workspace` narrows `/work`. `cleanup_run` releases it first and
+  waits (`NotReady`) while any copy still holds a dup, before the trampoline
+  close and any `Storage::detach`. A failed clone disables the broker for that
+  run only.
+- **WorkAnchor.** Registry account Ready and allocation journal Ready, then
+  H3's `Storage::work_anchor`; a missing/invalid anchor is
+  `workspace_broker_unavailable`, an unknown/retired employee `not_found`.
+- **StopEmployeeRuns (F6 S13).** Cancels every non-terminal run of the
+  employee through the per-run cancel path (any connection), refuses new
+  reservations and opens for it while pending, and confirms only after every
+  run is terminal (Finished = complete cleanup readback) and a fresh root
+  `EmployeeIdle` readback is all zero; otherwise `confirmed = false` after
+  `STOP_WAIT_MS` (3.5 s). Unknown employee ⇒ `not_found`.
+- **EmployeeIdle.** Counts open root runs + `runs.json` records (by employee
+  or uid) + non-terminal admission entries, durable leases, processes whose
+  uid OR gid fields match (S14), and `duduclaw-run-*` units mapped to the
+  employee or to nobody. Any unreadable source is an error, never zero.
+- **Anchor backfill.** On start, after reconcile, every allocation Ready in both
+  the journal and the registry gets its missing anchor (`work_anchor::backfill`,
+  idempotent, never repairs); `work_anchor_backfilled` /
+  `work_anchor_backfill_failed` audit events.
+- **Audit.** `work_file_opened` (employee, run, source device/inode/size),
+  `work_file_refused` (wire code), `employee_runs_stopped` (count, confirmed);
+  never a path, file name or content (`audit::Detail`).
+
+Root acceptance: `tests/work_broker_chain.rs`
+(`iso_root_work_broker_chain_backfill_snapshot_and_detach`, ignored; root VM,
+`ISO_STORAGE_TEST_ROOT`, `DUDUCLAW_ISO_DISPOSABLE=1`). Not run in this worktree.
+
+### In-run helper calls (HX4, D8 revision option A)
+
+The four `ipc::Opcode::HELPER` ops are answered when `helper_calls` is
+advertised (trampoline launcher support, a publication with launcher plans,
+slot cgroups not known to lack open-time credentials); otherwise `HelperCall`
+answers `helper_unavailable` / `helper_cgroup_unavailable`.
+
+- **Coordinator** (`admission_helpers.rs`, pure): `HelperCall` only from the
+  run's owning connection (`not_found`), for the run's own employee
+  (`unauthorized`, F7), while admission is `Running`, no employee stop is
+  pending and the runtime has not exited (`not_ready`, F4), with ≥ 5 s of run
+  time left (`run_time_exhausted`). Call ids are 16 CSPRNG bytes drawn by the
+  server, never zero or reused within the run. One foreground and one
+  recording slot; a busy slot queues the call in a per-run FIFO (≤ 4 calls for
+  both slots, ≤ 3 s each, then `helper_busy`), and queued/starting input
+  memfds count against `pending_input_bytes`/`input_descriptors` together with
+  StartRun inputs. The queue is dropped (memfds closed) on run end, drain
+  (cancel, revocation, intrusion, timeouts), runtime exit, launcher loss, an
+  abandoned ticket (disconnect) and `HelperCancel`. A helper call never creates
+  an admission entry, so it never occupies the D8 slot or the host run budget.
+  `HelperCall` is a deferred reply (`HelperStarted` + `[StdoutRead,
+  StderrRead]`); `HelperWait` is a bounded poll (`not_ready`, then
+  `HelperEnded` once; `run_ended` for calls live when the run left Running);
+  `HelperStop`/`HelperCancel` reach only the call (F8) — no path to the run's
+  revoke/kill.
+- **Root engine** (`helper_host.rs`, lifecycle thread, one per Running run):
+  the launcher link (control socket end, slot cgroups, run helper table) moves
+  out of the trampoline once (`Trampoline::take_helper_link`). Per call: the
+  helper is re-derived from the run's own employee (`RootPolicy::derive_helper`,
+  `runtime_denied` if no longer entitled), slot must match the binding, the
+  memfd is revalidated (tmpfs, seals, size, CLOEXEC; `invalid_fds`), effective
+  timeout = min(tool, binding, run deadline − termination grace − 5 s), slot
+  must be empty, the signed binding's `memory.max`/`pids.max`/`cpu.max` are
+  written and read back, then `Start` with `[memfd, stdout w, stderr w]`.
+  Outcome is root-side (F5): own watchdog at effective + 2 s writes the slot's
+  `cgroup.kill`; OOM from the `memory.events oom_kill` delta; after every call
+  the slot is killed, drained (`populated 0`) and closed again before the end
+  is reported. Launcher frames are recvmsg'd with `MSG_CMSG_CLOEXEC` and a
+  one-fd control buffer (F14): any fd/cmsg, truncation, illegal frame, > 64
+  frames/s or EOF closes the channel, kills both slots and makes later calls
+  `helper_unavailable`. `rt-runtime` `populated 0` (after populated) or the
+  launcher's `Draining` reports Draining (F4). Run cleanup shuts the engine
+  down (live calls `run_ended`) before the trampoline is closed.
+- **Audit**: `helper_started` / `helper_ended` (call id, signed helper index,
+  slot, input bytes, effective timeout / outcome), `helper_refused` (code),
+  `helper_channel_closed` (code). No argv, path, input or output content.
+
+Root tests (`iso_root_helper_watchdog_kills_slot_with_stopped_launcher`,
+`_oom_reported_from_memory_events_not_frame`, `_fg_kill_leaves_rec_running`,
+`_escaped_daemon_killed_after_call`) are not written yet: they need a real
+launcher run (follow-up); the unprivileged halves are in `helper_host_tests.rs`.
+
 ## Landlock evidence and logging
 
 B2's probe returns the detected kernel ABI and the selected ruleset ABI without

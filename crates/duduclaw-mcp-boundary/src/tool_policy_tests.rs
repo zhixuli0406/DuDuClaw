@@ -96,6 +96,37 @@ fn selected_task_and_dependency_ids_cannot_be_replaced_by_resolver() {
 }
 
 #[test]
+fn create_task_boundary_pins_the_record_task() {
+    let own = ResourceGrant::Task { id: text("run-task") };
+    let other = ResourceGrant::Task { id: text("other-task") };
+    let with_task = |task: Option<&str>, resources: Vec<ResourceGrant>| {
+        let mut record = context("create_task", resources).record().clone();
+        record.task = task.map(|task| text::<128>(task));
+        RequestContext::from_verified_record(record)
+    };
+    let args = json!({"goal":"g", "steps":[{"description":"s"}]});
+    let ctx = with_task(Some("run-task"), vec![employee(), own.clone(), other.clone()]);
+    assert!(eligible(&ctx, "create_task"));
+    assert_eq!(create_task_selector(&ctx).unwrap(), own);
+    assert!(authorize(&ctx, "create_task", &args, &Fixed(vec![employee(), own.clone()])).is_ok());
+    // A resolver may not substitute, add or omit the task.
+    for resources in [vec![employee(), other.clone()], vec![employee(), own.clone(), other.clone()], vec![employee()]] {
+        assert!(authorize(&ctx, "create_task", &args, &Fixed(resources)).is_err());
+    }
+    // Workspace is no longer the gate: a workspace-only record stays ineligible.
+    let workspace = ResourceGrant::Workspace { handle: text("employee-work") };
+    assert!(!eligible(&with_task(None, vec![employee(), workspace.clone()]), "create_task"));
+    assert!(!eligible(&with_task(Some("run-task"), vec![employee(), workspace, other.clone()]), "create_task"));
+    assert!(!eligible(&with_task(None, vec![employee(), own.clone()]), "create_task"));
+    // Selector-shaped arguments are refused before resolution.
+    for key in TASK_SELECTOR_KEYS {
+        let mut forged = args.clone();
+        forged[key] = json!("run-task");
+        assert!(authorize(&ctx, "create_task", &forged, &Fixed(vec![employee(), own.clone()])).is_err(), "{key}");
+    }
+}
+
+#[test]
 fn file_resources_preserve_workspace_only_and_reject_escape() {
     let resources = vec![ResourceGrant::Workspace { handle: text("work") }];
     let ctx = context("file_read", resources.clone());
@@ -406,6 +437,60 @@ fn i1c_host_control_routes_cannot_widen_employee_scope() {
         let ctx = context(name, vec![ResourceGrant::EmployeeScope { id: EmployeeId([2;16]) }]);
         assert!(!eligible(&ctx, name), "{name}");
         assert!(authorize(&ctx, name, &json!({}), &UnusedResolver).is_err(), "{name}");
+    }
+}
+
+// ── H7 PublicOrigins (D-H2) ────────────────────────────────────────────────
+fn public_origins(entries: &[&str]) -> ResourceGrant {
+    use duduclaw_isolation::capability::PublicOrigin;
+    ResourceGrant::PublicOrigins { origins: List::new(entries.iter().map(|e| PublicOrigin::parse(e).unwrap()).collect()).unwrap() }
+}
+fn scope() -> ResourceGrant { ResourceGrant::EmployeeScope { id: EmployeeId([2; 16]) } }
+
+#[test]
+fn web_fetch_refuses_origin_not_granted() {
+    let grant = public_origins(&["https://example.com", "https://docs.example.org"]);
+    for tool in PUBLIC_ORIGIN_TOOLS {
+        let ctx = context(tool, vec![scope(), grant.clone()]);
+        ctx.record().canonical_bytes().unwrap();
+        assert!(eligible(&ctx, tool), "{tool}");
+        let args = |url: &str| if *tool == "web_extract" { json!({"url":url,"selector":"p"}) } else { json!({"url":url}) };
+        // No resolver is consulted: the selection is exactly the signed grants.
+        for url in ["https://example.com/page?q=1", "https://docs.example.org/a#b", "https://EXAMPLE.com/x"] {
+            let call = authorize(&ctx, tool, &args(url), &UnusedResolver).unwrap_or_else(|_| panic!("{tool} {url}"));
+            assert_eq!(call.resources(), &[scope(), grant.clone()]);
+        }
+        for url in ["https://other.example.net/page", "https://sub.example.com/", "https://example.com.evil.net/",
+            "https://evil.net/?https://example.com/", "http://example.com/", "https://example.com:8443/",
+            "ftp://example.com/", "https://example.org/"] {
+            assert!(authorize(&ctx, tool, &args(url), &UnusedResolver).is_err(), "{tool} {url}");
+        }
+        // The grant is not authority for any other tool or selector.
+        for extra in [json!({"url":"https://example.com/","workspace":"work"}), json!({"url":"https://example.com/","to":"a@b.c"}),
+            json!({"url_or_path":"https://example.com/"}), json!({"url":"https://example.com/","agent_id":"other"}), json!({})] {
+            assert!(authorize(&ctx, tool, &extra, &UnusedResolver).is_err(), "{tool} {extra}");
+        }
+    }
+    let ctx = context("web_fetch_cached", vec![scope(), grant.clone()]);
+    assert!(authorize(&ctx, "web_fetch_cached", &json!({"url":"https://example.com/","selector":"p"}), &UnusedResolver).is_err());
+    for tool in ["agent_status", "file_read", "skill_hub_install"] {
+        assert!(!eligible(&context(tool, vec![grant.clone()]), tool), "{tool}");
+    }
+    // Without employee scope the record itself is invalid; no web authority.
+    let ctx = context("web_extract", vec![employee(), grant]);
+    assert!(!eligible(&ctx, "web_extract"));
+    assert!(authorize(&ctx, "web_extract", &json!({"url":"https://example.com/","selector":"p"}), &UnusedResolver).is_err());
+}
+
+#[test]
+fn public_origins_wildcard_still_refuses_ip_literal_userinfo_and_private_names() {
+    let ctx = context("web_fetch_cached", vec![scope(), public_origins(&["*"])]);
+    assert!(authorize(&ctx, "web_fetch_cached", &json!({"url":"https://news.example.org/a"}), &UnusedResolver).is_ok());
+    for url in ["https://127.0.0.1/", "https://[::1]/", "https://8.8.8.8/", "https://0x7f.1/", "https://2130706433/",
+        "https://user@example.org/", "https://user:pw@example.org/", "https://:pw@example.org/",
+        "https://localhost/", "https://metadata.google.internal/", "https://printer.local/", "https://com/",
+        "http://example.org/", "https://example.org:444/", " https://example.org/", "https://example.org/\n"] {
+        assert!(authorize(&ctx, "web_fetch_cached", &json!({"url":url}), &UnusedResolver).is_err(), "{url:?}");
     }
 }
 

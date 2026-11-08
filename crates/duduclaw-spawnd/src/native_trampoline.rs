@@ -98,8 +98,9 @@ struct Pending {
     master: Option<crate::native_pty::ReturnedPty>,
     /// spawnd's end of the per-run launcher control socketpair (§2.2).
     control: Option<OwnedFd>,
-    /// Signed indices in run-table order: `Start.helper` is a position in this list.
-    helper_indices: Vec<u8>,
+    /// The run's helper table in position order (`Start.helper` is a position
+    /// in this list): signed index, slot and the binding's limits/timeout.
+    helper_table: Vec<crate::helper_host::LinkedHelper>,
     /// Launcher rights already in `manifest` (cgroup fds are added at bind).
     launcher_rights: usize,
     cgroups: Option<crate::helper_cgroup::linux::RunCgroups>,
@@ -111,19 +112,14 @@ impl NativeTrampoline {
     pub fn helper_position(&self, run: RunHandle, signed_index: u8) -> Option<u8> {
         let pending = self.runs.get(&run.0)?;
         if pending.helpers != HelperState::Available { return None; }
-        pending.helper_indices.iter().position(|index| *index == signed_index).and_then(|p| u8::try_from(p).ok())
-    }
-    /// HX4: spawnd's control socket end and root-held slot cgroups of a run.
-    pub fn helper_channel(&mut self, run: RunHandle) -> Option<(&OwnedFd, &mut crate::helper_cgroup::linux::RunCgroups)> {
-        let pending = self.runs.get_mut(&run.0)?;
-        if pending.helpers != HelperState::Available { return None; }
-        Some((pending.control.as_ref()?, pending.cgroups.as_mut()?))
+        pending.helper_table.iter().position(|helper| helper.index == signed_index).and_then(|p| u8::try_from(p).ok())
     }
 }
 const HELPER_CGROUP_FDS: usize = duduclaw_run::helper_policy::HELPER_CGROUP_FDS;
 /// Build the trampoline's helper table and its descriptors (control socket end,
 /// helper registry mount, per helper executable and optional script).
-fn launcher_plan(profile: LauncherProfile, control: OwnedFd) -> Result<(duduclaw_run::linux::runner::LauncherPlan, Vec<OwnedFd>, Vec<u8>)> {
+fn launcher_plan(profile: LauncherProfile, control: OwnedFd)
+    -> Result<(duduclaw_run::linux::runner::LauncherPlan, Vec<OwnedFd>, Vec<crate::helper_host::LinkedHelper>)> {
     use duduclaw_run::linux::runner::{HelperProgram, LauncherPlan};
     let observed = checked(fd::observe(profile.mount.as_raw_fd()))?;
     let mounts = vec![MountIdentity { mount: observed.identity.mount, fs_type: observed.fs_type }];
@@ -143,6 +139,9 @@ fn launcher_plan(profile: LauncherProfile, control: OwnedFd) -> Result<(duduclaw
             _ => return Err(unavailable()),
         };
         let binding = helper.binding;
+        // HX4 writes these signed limits into the slot before every Start.
+        indices.push(crate::helper_host::LinkedHelper { index: helper.index, slot: binding.slot,
+            limits: crate::helper_cgroup::SlotLimits::from_binding(&binding), timeout_ms: binding.timeout_ms });
         helpers.push(HelperProgram {
             program: Program { identity: checked(fd::observe(helper.executable.fd.as_raw_fd()))?.identity, script,
                 argv: argv.into_iter().map(|arg| checked(CString::new(arg))).collect::<Result<_>>()?,
@@ -152,7 +151,6 @@ fn launcher_plan(profile: LauncherProfile, control: OwnedFd) -> Result<(duduclaw
             egress: binding.egress });
         rights.push(helper.executable.fd);
         if let Some(script) = helper.script { rights.push(script.fd); }
-        indices.push(helper.index);
     }
     Ok((LauncherPlan { helpers, mounts, tmpfs_bytes: profile.tmpfs_bytes, drain_ms: profile.drain_ms }, rights, indices))
 }
@@ -212,7 +210,7 @@ impl Trampoline for NativeTrampoline {
         rights.extend(inputs); rights.extend(stdin); rights.extend(mcp);
         let forwarder = forwarder.map(|(program, executable)| { rights.extend(egress); rights.push(executable); program });
         // HX launcher descriptors follow the forwarder; cgroup fds come at bind.
-        let (launcher, control, helper_indices, launcher_rights) = match profile.launcher {
+        let (launcher, control, helper_table, launcher_rights) = match profile.launcher {
             Some(launcher) if duduclaw_run::linux::runner::LAUNCHER_SUPPORTED && !launcher.helpers.is_empty() => {
                 let (spawnd_end, launcher_end) = checked(nix::sys::socket::socketpair(nix::sys::socket::AddressFamily::Unix,
                     nix::sys::socket::SockType::SeqPacket, None, nix::sys::socket::SockFlag::SOCK_CLOEXEC))?;
@@ -239,7 +237,7 @@ impl Trampoline for NativeTrampoline {
             nix::sys::socket::SockType::SeqPacket, None, nix::sys::socket::SockFlag::SOCK_CLOEXEC))?;
         self.runs.insert(plan.run.0, Pending { socket, manifest: Some((trusted,rights)), cancelled: None,
             stages: Stages::default(), prepared_at_ms: checked(crate::server::coordination_time_ms())?, terminal: None, pty: plan.pty, uid: plan.uid, master: None,
-            control, helper_indices, launcher_rights, cgroups: None, helpers });
+            control, helper_table, launcher_rights, cgroups: None, helpers });
         Ok(PreparedBootstrap { bootstrap_for_unit })
     }
     fn bind_unit(&mut self, run: RunHandle, unit: &crate::systemd::linux::StartedUnit, cancelled: Arc<AtomicBool>) -> Result<()> {
@@ -261,7 +259,7 @@ impl Trampoline for NativeTrampoline {
                     let keep = rights.len().checked_sub(pending.launcher_rights).ok_or_else(unavailable)?;
                     rights.truncate(keep);
                     plan.launcher = None;
-                    pending.control = None; pending.helper_indices.clear();
+                    pending.control = None; pending.helper_table.clear();
                     pending.helpers = HelperState::Unavailable(reason.as_reason());
                 }
             }
@@ -315,6 +313,22 @@ impl Trampoline for NativeTrampoline {
         pending.master.as_mut().ok_or(ErrorCode::NotReady)?.take()
     }
     fn close(&mut self, run: RunHandle) -> Result<()> { self.runs.remove(&run.0); Ok(()) }
+    fn take_helper_link(&mut self, run: RunHandle)
+        -> Result<crate::helper_host::HelperLink<crate::helper_cgroup::linux::UnitTree>> {
+        let pending = self.runs.get_mut(&run.0).ok_or(ErrorCode::NotFound)?;
+        if pending.terminal.is_some() || !pending.stages.ready() { return Err(ErrorCode::NotReady); }
+        match pending.helpers {
+            HelperState::NotPlanned => return Err(ErrorCode::HelperUnavailable),
+            HelperState::Unavailable(_) => return Err(ErrorCode::HelperCgroupUnavailable),
+            HelperState::Available => {}
+        }
+        let (Some(control), Some(cgroups)) = (pending.control.take(), pending.cgroups.take()) else {
+            return Err(ErrorCode::HelperUnavailable);
+        };
+        // Exactly once: the trampoline keeps no helper authority afterwards.
+        pending.helpers = HelperState::Unavailable("helper_link_taken");
+        Ok(crate::helper_host::HelperLink { control, tree: cgroups.tree, helpers: std::mem::take(&mut pending.helper_table) })
+    }
 }
 
 #[cfg(test)]

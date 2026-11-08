@@ -14,10 +14,17 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// has one collision-checked identity for audit/telemetry and so that parallel
 /// packages coordinate explicitly. Ranges, never reused once assigned:
 /// - `OPCODES_CORE` 0x0001–0x00FF: v1 run lifecycle.
-/// - `OPCODES_WORK` 0x0100–0x01FF: Package H root work broker (D-H1).
+/// - `OPCODES_WORK` 0x0100–0x01FF: Package H root work broker (D-H1) and the
+///   employee-scoped root reads/stops Package H4 added for F6 (tombstone S13,
+///   restore/retire idle check): `stop_employee_runs` 0x0103, `employee_idle` 0x0104.
 /// - `OPCODES_HELPER` 0x0200–0x02FF: HX in-run helpers (D8 revision, option A).
 ///   Numbers and names are reserved in `HX_RESERVED_OPS`; HX4 adds the
 ///   variants with exactly those values. Package H must not use this range.
+///
+/// A gateway sends a Package H op only when spawnd advertises
+/// `SpawndFeatures::WORK_BROKER`, and an HX op only with
+/// `SpawndFeatures::HELPER_CALLS` (`Opcode::feature`); an older spawnd decodes an
+/// unknown `op` as a malformed frame and closes the control connection.
 /// `SpawnRequest::opcode` is an exhaustive match, so a new variant without a
 /// registry entry does not compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -25,7 +32,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub enum Opcode {
     ReserveRun = 0x0001, StartRun = 0x0002, Resize = 0x0003, PtyActivity = 0x0004,
     Cancel = 0x0005, Wait = 0x0006, Status = 0x0007, TakeIo = 0x0008,
-    OpenWorkFile = 0x0101, WorkAnchor = 0x0102,
+    OpenWorkFile = 0x0101, WorkAnchor = 0x0102, StopEmployeeRuns = 0x0103, EmployeeIdle = 0x0104,
     /// HX (HX3a), numbers and names exactly as reserved in `HX_RESERVED_OPS`.
     HelperCall = 0x0201, HelperWait = 0x0202, HelperStop = 0x0203, HelperCancel = 0x0204,
 }
@@ -33,9 +40,22 @@ pub const OPCODES_CORE: RangeInclusive<u16> = 0x0001..=0x00ff;
 pub const OPCODES_WORK: RangeInclusive<u16> = 0x0100..=0x01ff;
 pub const OPCODES_HELPER: RangeInclusive<u16> = 0x0200..=0x02ff;
 impl Opcode {
-    pub const ALL: [Self; 14] = [Self::ReserveRun, Self::StartRun, Self::Resize, Self::PtyActivity,
+    pub const ALL: [Self; 16] = [Self::ReserveRun, Self::StartRun, Self::Resize, Self::PtyActivity,
         Self::Cancel, Self::Wait, Self::Status, Self::TakeIo, Self::OpenWorkFile, Self::WorkAnchor,
+        Self::StopEmployeeRuns, Self::EmployeeIdle,
         Self::HelperCall, Self::HelperWait, Self::HelperStop, Self::HelperCancel];
+    /// Package H ops (`OPCODES_WORK`), gated by `SpawndFeatures::WORK_BROKER`.
+    pub const WORK: [Self; 4] = [Self::OpenWorkFile, Self::WorkAnchor, Self::StopEmployeeRuns, Self::EmployeeIdle];
+    /// HX ops (`OPCODES_HELPER`), gated by `SpawndFeatures::HELPER_CALLS`.
+    pub const HELPER: [Self; 4] = [Self::HelperCall, Self::HelperWait, Self::HelperStop, Self::HelperCancel];
+    /// The feature bit a gateway must see before it sends this op; core ops need none.
+    pub const fn feature(self) -> SpawndFeatures {
+        match self {
+            Self::OpenWorkFile | Self::WorkAnchor | Self::StopEmployeeRuns | Self::EmployeeIdle => SpawndFeatures::WORK_BROKER,
+            Self::HelperCall | Self::HelperWait | Self::HelperStop | Self::HelperCancel => SpawndFeatures::HELPER_CALLS,
+            _ => SpawndFeatures::NONE,
+        }
+    }
     pub const fn code(self) -> u16 { self as u16 }
     /// The serde `op` tag of the matching `SpawnRequest` variant.
     pub const fn wire_name(self) -> &'static str {
@@ -44,6 +64,7 @@ impl Opcode {
             Self::PtyActivity => "pty_activity", Self::Cancel => "cancel", Self::Wait => "wait",
             Self::Status => "status", Self::TakeIo => "take_io",
             Self::OpenWorkFile => "open_work_file", Self::WorkAnchor => "work_anchor",
+            Self::StopEmployeeRuns => "stop_employee_runs", Self::EmployeeIdle => "employee_idle",
             Self::HelperCall => "helper_call", Self::HelperWait => "helper_wait",
             Self::HelperStop => "helper_stop", Self::HelperCancel => "helper_cancel",
         }
@@ -78,22 +99,42 @@ pub const MAX_HELPER_INPUT_BYTES: u64 = MAX_PROMPT_BYTES;
 /// `SpawndFeatures::HELPER_CALLS` [F17]: `helper_launcher_unavailable{reason}`.
 pub const HELPER_FEATURE_MISSING_REASON: &str = "spawnd_feature_missing";
 
-/// [F17] Capability bits spawnd advertises in `SpawnResponse::Reserved`. The
-/// field is omitted when empty, so an old spawnd reads as "no features" and a
-/// gateway that does not see `HELPER_CALLS` never sends a helper op (an old
-/// spawnd would close the connection on the unknown `op`). Unknown bits from a
-/// newer spawnd are carried but never tested, so they cannot fail a reservation.
+/// [F17, H4] The one set of protocol feature bits spawnd advertises. The same
+/// value, computed in one place (`Host::features`), is sent the same way on
+/// both channels a gateway reads: the root readiness report
+/// (`EvidenceReport.features`, host-wide, read before any connection) and every
+/// `SpawnResponse::Reserved` (authoritative for that control connection, so a
+/// spawnd restarted with other bits between readiness and reservation is
+/// noticed). Omitted when empty, so an old spawnd reads as "no features"; a
+/// gateway that does not see a bit never sends that bit's ops (`Opcode::feature`;
+/// an old spawnd would close the connection on the unknown `op`). Unknown bits
+/// from a newer spawnd are carried but never tested, so they cannot fail a
+/// reservation or a readiness read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SpawndFeatures(pub u32);
 impl SpawndFeatures {
     pub const NONE: Self = Self(0);
-    /// `helper_calls`: spawnd dispatches `HelperCall`/`HelperWait`/`HelperStop`/`HelperCancel`.
+    /// `helper_calls` (HX4): spawnd dispatches `HelperCall`/`HelperWait`/
+    /// `HelperStop`/`HelperCancel` AND can run helpers on this host (launcher
+    /// plans active, slot cgroups available). Without it every helper op is
+    /// refused (`helper_unavailable` / `helper_cgroup_unavailable`).
     pub const HELPER_CALLS: Self = Self(1 << 0);
+    /// `work_broker` (H4): spawnd decodes and answers the four Package H ops
+    /// (`Opcode::WORK`). A decode bit, not availability: each op still fails
+    /// closed (`workspace_broker_unavailable`, …) on a host without the broker.
+    pub const WORK_BROKER: Self = Self(1 << 1);
     /// Bit → wire name, for readiness and audit output.
-    pub const NAMES: [(Self, &'static str); 1] = [(Self::HELPER_CALLS, "helper_calls")];
+    pub const NAMES: [(Self, &'static str); 2] =
+        [(Self::HELPER_CALLS, "helper_calls"), (Self::WORK_BROKER, "work_broker")];
     pub const fn contains(self, feature: Self) -> bool { feature.0 != 0 && self.0 & feature.0 == feature.0 }
     pub const fn with(self, feature: Self) -> Self { Self(self.0 | feature.0) }
+    pub const fn without(self, feature: Self) -> Self { Self(self.0 & !feature.0) }
+    /// Whether a gateway may send `op` to a spawnd advertising `self`.
+    pub const fn allows(self, op: Opcode) -> bool {
+        let needed = op.feature();
+        needed.0 == 0 || self.contains(needed)
+    }
     pub fn is_empty(&self) -> bool { self.0 == 0 }
     pub fn names(self) -> impl Iterator<Item = &'static str> {
         Self::NAMES.into_iter().filter(move |(bit, _)| self.contains(*bit)).map(|(_, name)| name)
@@ -185,8 +226,10 @@ pub const WORK_RESERVED_FIRST_COMPONENT: &str = ".forks";
 /// `employee-work` mount. Validated on construction and on deserialization,
 /// so an unsafe path is unrepresentable on the sender and fails frame decode
 /// on the receiver. Rules: non-empty, ≤ 4096 bytes, ≤ 64 components, each
-/// component non-empty, ≤ 255 bytes, not `.`/`..`, no NUL, `\` or ASCII
-/// control byte; no leading `/` (absolute), no trailing or doubled `/`; first
+/// component non-empty, ≤ 255 bytes, not `.`/`..`, no `\` and no
+/// `char::is_control` character (C0 incl. NUL, DEL, C1 incl. U+0085 — the
+/// same rule as mcp-boundary's `WorkRelativePath`); no leading `/`
+/// (absolute), no trailing or doubled `/`; first
 /// component not `.forks`. Syntax only: the H2 broker still resolves it with
 /// `openat2(RESOLVE_BENEATH|NO_SYMLINKS|NO_MAGICLINKS|NO_XDEV)` and checks the
 /// opened inode, so symlinks, hard links and mounts are not decided here.
@@ -223,7 +266,7 @@ fn validate_work_path(path: &str) -> Result<(), ContractError> {
         if part.len() > MAX_WORK_COMPONENT_BYTES { return Err(ContractError::LimitExceeded("work path component")); }
         if part.is_empty() || part == "." || part == ".."
             || (index == 0 && part == WORK_RESERVED_FIRST_COMPONENT)
-            || part.bytes().any(|b| b == b'\\' || b.is_ascii_control()) {
+            || part.chars().any(|c| c == '\\' || c.is_control()) {
             return Err(INVALID);
         }
     }
@@ -261,6 +304,33 @@ impl WorkAnchorIdentity {
     }
 }
 
+/// Largest `EmployeeRunsStopped` list. While a stop is pending root refuses new
+/// reservations for that employee, so the set is the employee's non-terminal
+/// entries when the stop began (≤ `DEFAULT_QUEUE_LENGTH`); 64 leaves headroom.
+pub const MAX_STOPPED_RUNS: usize = 64;
+
+/// Root liveness readback of one employee (F6 §3.12 step 4, M8). Counts, not
+/// identities; `idle()` only when every count is zero. Root answers an
+/// `Error` instead of a report whenever any source cannot be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmployeeIdleReport {
+    /// Admission entries that are not terminal, open root run records and
+    /// `runs.json` crash-journal records of this employee.
+    pub runs: u16,
+    /// Durable storage leases (attachments) of this employee.
+    pub attachments: u16,
+    /// Processes whose uid or gid fields equal the employee's (any of real,
+    /// effective, saved, filesystem).
+    pub processes: u16,
+    /// `duduclaw-run-*` units mapped to this employee, plus every unit root
+    /// cannot map to any employee (fail closed).
+    pub units: u16,
+}
+impl EmployeeIdleReport {
+    pub fn idle(&self) -> bool { self.runs == 0 && self.attachments == 0 && self.processes == 0 && self.units == 0 }
+}
+
 /// Pair a Package H reply with its request and the number of received fds.
 /// The caller still checks each fd against `FdRole` and the metadata.
 pub fn check_work_reply(request: &SpawnRequest, response: &SpawnResponse, received_fds: usize)
@@ -269,11 +339,17 @@ pub fn check_work_reply(request: &SpawnRequest, response: &SpawnResponse, receiv
     response.validate()?;
     if received_fds != response.fd_plan().len() { return Err(ContractError::InvalidFrame); }
     let paired = match (request, response) {
-        (SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }, SpawnResponse::Error { .. }) => true,
+        (SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }
+            | SpawnRequest::StopEmployeeRuns { .. } | SpawnRequest::EmployeeIdle { .. }, SpawnResponse::Error { .. }) => true,
         (SpawnRequest::OpenWorkFile { run, .. }, SpawnResponse::WorkFile { run: actual, .. }) => run == actual,
         (SpawnRequest::WorkAnchor { employee_id }, SpawnResponse::WorkAnchor { employee_id: actual, .. }) =>
             employee_id == actual,
-        (SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }, _) => false,
+        (SpawnRequest::StopEmployeeRuns { employee_id }, SpawnResponse::EmployeeRunsStopped { employee_id: actual, .. }) =>
+            employee_id == actual,
+        (SpawnRequest::EmployeeIdle { employee_id }, SpawnResponse::EmployeeIdle { employee_id: actual, .. }) =>
+            employee_id == actual,
+        (SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }
+            | SpawnRequest::StopEmployeeRuns { .. } | SpawnRequest::EmployeeIdle { .. }, _) => false,
         _ => return Err(ContractError::InvalidValue("not a work request")),
     };
     if paired { Ok(()) } else { Err(ContractError::InvalidFrame) }
@@ -460,6 +536,20 @@ pub enum SpawnRequest {
     /// work anchor directory (the `employee-work` resource identity). No fds in
     /// either direction. Reply: `WorkAnchor`, or `Error`.
     WorkAnchor { employee_id: EmployeeId },
+    /// Package H4 for F6 (opcode 0x0103; tombstone S13). Root cancels every
+    /// non-terminal run of the employee, whichever gateway connection owns it
+    /// (the same per-run Cancel path), refuses new reservations for it while
+    /// the stop is pending, and waits (bounded, below `CONTROL_TIMEOUT_MS`)
+    /// until each reached a terminal state and the employee reads idle. Reply:
+    /// `EmployeeRunsStopped` (`confirmed = false` after the bounded wait: the
+    /// caller records a pending fence and retries; a retry is idempotent), or
+    /// `Error` (`NotFound` for an employee root never allocated).
+    StopEmployeeRuns { employee_id: EmployeeId },
+    /// Package H4 for F6 (opcode 0x0104; F6c restore precheck, F6l retire):
+    /// root liveness readback, no side effect. Reply: `EmployeeIdle`, or
+    /// `Error` (`NotFound` unknown employee, `IsolationUnavailable` when any
+    /// source is unreadable — never a zero report on uncertainty).
+    EmployeeIdle { employee_id: EmployeeId },
     /// HX (opcode 0x0201). Run one root-signed helper inside the live run.
     /// Carries exactly one `PromptSealed` fd: the sealed input memfd of
     /// `input_bytes` (spawnd revalidates seals and size). `run` must be Running
@@ -494,6 +584,7 @@ impl SpawnRequest {
             Self::Cancel { .. } => Opcode::Cancel, Self::Wait { .. } => Opcode::Wait,
             Self::Status { .. } => Opcode::Status, Self::TakeIo { .. } => Opcode::TakeIo,
             Self::OpenWorkFile { .. } => Opcode::OpenWorkFile, Self::WorkAnchor { .. } => Opcode::WorkAnchor,
+            Self::StopEmployeeRuns { .. } => Opcode::StopEmployeeRuns, Self::EmployeeIdle { .. } => Opcode::EmployeeIdle,
             Self::HelperCall { .. } => Opcode::HelperCall, Self::HelperWait { .. } => Opcode::HelperWait,
             Self::HelperStop { .. } => Opcode::HelperStop, Self::HelperCancel { .. } => Opcode::HelperCancel,
         }
@@ -625,6 +716,11 @@ pub enum SpawnResponse {
     WorkFile { run: RunHandle, file: WorkFileMetadata },
     /// Reply to `WorkAnchor`: no fd.
     WorkAnchor { employee_id: EmployeeId, anchor: WorkAnchorIdentity },
+    /// Reply to `StopEmployeeRuns`: the runs root cancelled (or found already
+    /// stopping) and whether every one is terminal and the employee is idle.
+    EmployeeRunsStopped { employee_id: EmployeeId, runs: List<RunHandle, MAX_STOPPED_RUNS>, confirmed: bool },
+    /// Reply to `EmployeeIdle`: no fd.
+    EmployeeIdle { employee_id: EmployeeId, report: EmployeeIdleReport },
     /// Reply to `HelperCall`: exactly `[StdoutRead, StderrRead]` (the call's
     /// pipe read ends). `call` is spawnd-generated; `effective_timeout_ms` ≤
     /// the request's `timeout_ms` (min with the binding and the run deadline).
@@ -785,6 +881,8 @@ mod tests {
             SpawnRequest::Wait { run: run3(), caller_run: None }, SpawnRequest::Status { run: run3() },
             SpawnRequest::TakeIo { run: run3() }, open("a.csv"),
             SpawnRequest::WorkAnchor { employee_id: EmployeeId([1; 16]) },
+            SpawnRequest::StopEmployeeRuns { employee_id: EmployeeId([1; 16]) },
+            SpawnRequest::EmployeeIdle { employee_id: EmployeeId([1; 16]) },
             helper_call(), SpawnRequest::HelperWait { run: run3(), call: call7() },
             SpawnRequest::HelperStop { run: run3(), call: call7() },
             SpawnRequest::HelperCancel { run: run3(), call: call7() }]
@@ -936,6 +1034,81 @@ mod tests {
     }
 
     #[test]
+    fn hx4_one_feature_set_gates_work_and_helper_ops() {
+        // One bitset carries both bits; names are stable and distinct.
+        let both = SpawndFeatures::NONE.with(SpawndFeatures::WORK_BROKER).with(SpawndFeatures::HELPER_CALLS);
+        assert_eq!(both.names().collect::<Vec<_>>(), ["helper_calls", "work_broker"]);
+        assert_eq!(serde_json::to_value(both).unwrap(), 3);
+        assert_eq!(both.without(SpawndFeatures::HELPER_CALLS), SpawndFeatures::WORK_BROKER);
+        // Every op maps to exactly the bit of its range; core ops need none.
+        for op in Opcode::ALL {
+            let expected = if OPCODES_WORK.contains(&op.code()) { SpawndFeatures::WORK_BROKER }
+                else if OPCODES_HELPER.contains(&op.code()) { SpawndFeatures::HELPER_CALLS }
+                else { SpawndFeatures::NONE };
+            assert_eq!(op.feature(), expected, "{op:?}");
+            assert!(both.allows(op));
+            assert_eq!(SpawndFeatures::NONE.allows(op), expected == SpawndFeatures::NONE, "{op:?}");
+        }
+        for op in Opcode::WORK {
+            assert!(SpawndFeatures::WORK_BROKER.allows(op) && !SpawndFeatures::HELPER_CALLS.allows(op));
+        }
+        for op in Opcode::HELPER {
+            assert!(SpawndFeatures::HELPER_CALLS.allows(op) && !SpawndFeatures::WORK_BROKER.allows(op));
+        }
+        // Reserved carries the same value the readiness report carries.
+        let reserved = SpawnResponse::Reserved { run: run3(), expires_at_unix_ms: 9, features: both };
+        assert_eq!(serde_json::to_value(&reserved).unwrap()["features"], 3);
+    }
+
+    #[test]
+    fn h4_employee_ops_codec_and_pairing() {
+        let employee = EmployeeId([1; 16]);
+        let stop = SpawnRequest::StopEmployeeRuns { employee_id: employee };
+        let idle = SpawnRequest::EmployeeIdle { employee_id: employee };
+        assert_eq!(stop.opcode().code(), 0x0103);
+        assert_eq!(idle.opcode().code(), 0x0104);
+        for request in [stop.clone(), idle.clone()] {
+            assert!(request.fd_plan().unwrap().is_empty());
+            let envelope = Envelope { version: 1, request_id: RequestId([2; 16]), message: request.clone() };
+            assert_eq!(decode::<SpawnRequest>(&encode(&envelope).unwrap()).unwrap(), envelope);
+            // No caller-chosen run list, uid, deadline or force flag.
+            for forbidden in ["runs", "uid", "deadline_ms", "force", "connection"] {
+                let mut value = serde_json::to_value(&request).unwrap();
+                value[forbidden] = 1.into();
+                assert!(serde_json::from_value::<SpawnRequest>(value).is_err(), "{forbidden}");
+            }
+        }
+        let stopped = SpawnResponse::EmployeeRunsStopped { employee_id: employee,
+            runs: List::new(vec![run3()]).unwrap(), confirmed: true };
+        let report = EmployeeIdleReport { runs: 0, attachments: 0, processes: 0, units: 0 };
+        assert!(report.idle());
+        for busy in [EmployeeIdleReport { runs: 1, ..report }, EmployeeIdleReport { attachments: 1, ..report },
+            EmployeeIdleReport { processes: 1, ..report }, EmployeeIdleReport { units: 1, ..report }] {
+            assert!(!busy.idle());
+        }
+        let idle_reply = SpawnResponse::EmployeeIdle { employee_id: employee, report };
+        for reply in [stopped.clone(), idle_reply.clone()] {
+            assert!(reply.fd_plan().is_empty());
+            let envelope = Envelope { version: 1, request_id: RequestId([2; 16]), message: reply };
+            assert_eq!(decode::<SpawnResponse>(&encode(&envelope).unwrap()).unwrap(), envelope);
+        }
+        assert_eq!(serde_json::to_value(&stopped).unwrap()["result"], "employee_runs_stopped");
+        assert_eq!(check_work_reply(&stop, &stopped, 0), Ok(()));
+        assert_eq!(check_work_reply(&idle, &idle_reply, 0), Ok(()));
+        assert!(check_work_reply(&stop, &idle_reply, 0).is_err());
+        assert!(check_work_reply(&idle, &stopped, 0).is_err());
+        assert!(check_work_reply(&SpawnRequest::StopEmployeeRuns { employee_id: EmployeeId([2; 16]) }, &stopped, 0).is_err());
+        assert_eq!(check_work_reply(&stop, &SpawnResponse::Error { code: ErrorCode::NotFound }, 0), Ok(()));
+        // The run list is bounded on decode.
+        let mut value = serde_json::to_value(&stopped).unwrap();
+        value["runs"] = serde_json::Value::Array(vec![serde_json::to_value(run3()).unwrap(); MAX_STOPPED_RUNS + 1]);
+        assert!(serde_json::from_value::<SpawnResponse>(value).is_err());
+        let mut value = serde_json::to_value(&idle_reply).unwrap();
+        value["report"]["pids"] = 1.into();
+        assert!(serde_json::from_value::<SpawnResponse>(value).is_err());
+    }
+
+    #[test]
     fn h1_open_work_file_codec_roundtrip() {
         let request = open("報告/2026/q1.xlsx");
         let envelope = Envelope { version: 1, request_id: RequestId([2; 16]), message: request.clone() };
@@ -1004,6 +1177,47 @@ mod tests {
         assert_eq!(WorkPath::new("a/b/c".into()).unwrap().components().collect::<Vec<_>>(), ["a", "b", "c"]);
     }
 
+    /// Copy of `duduclaw_mcp_boundary::resources::WORK_PATH_CONFORMANCE` (H6).
+    /// duduclaw-isolation cannot depend on mcp-boundary, so the vectors are
+    /// duplicated; keep both lists identical.
+    const H6_WORK_PATH_CONFORMANCE: &[(&str, bool)] = &[
+        ("a", true), ("notes/員工.md", true), ("a/b/c.csv", true), (".hidden", true), ("..a/b..", true),
+        ("a b/c-d_e.txt", true),
+        ("", false), (".", false), ("..", false), ("/", false), ("/etc/passwd", false), ("../x", false),
+        ("a/../b", false), ("a/./b", false), ("./a", false), ("a/.", false), ("a//b", false), ("a/", false),
+        ("a\\b", false), ("a\0b", false), ("a\nb", false), ("a\tb", false), ("a\u{7f}b", false), ("a\u{85}b", false),
+    ];
+
+    #[test]
+    fn work_path_refuses_unicode_controls() {
+        // Every `char::is_control` scalar (C0, DEL, C1 incl. U+0085 NEL) is
+        // refused, in any component, both at construction and at decode.
+        let controls = (0u32..=0x1f).chain(0x7f..=0x9f).filter_map(char::from_u32);
+        for control in controls {
+            assert!(control.is_control());
+            for path in [format!("a{control}b"), format!("dir/{control}"), format!("{control}/x")] {
+                assert!(WorkPath::new(path.clone()).is_err(), "{:?}", path);
+                let mut value = serde_json::to_value(open("a")).unwrap();
+                value["path"] = path.clone().into();
+                assert!(serde_json::from_value::<SpawnRequest>(value).is_err(), "{:?}", path);
+            }
+        }
+        // Not controls: format characters are outside this rule (H6 agrees).
+        for path in ["a\u{a0}b", "a\u{200b}b", "名\u{3000}稱"] {
+            assert!(WorkPath::new(path.into()).is_ok(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn work_path_conformance_vectors_match_h6() {
+        for (path, ok) in H6_WORK_PATH_CONFORMANCE {
+            assert_eq!(WorkPath::new((*path).into()).is_ok(), *ok, "{path:?}");
+            let mut value = serde_json::to_value(open("a")).unwrap();
+            value["path"] = (*path).into();
+            assert_eq!(serde_json::from_value::<SpawnRequest>(value).is_ok(), *ok, "{path:?}");
+        }
+    }
+
     #[test]
     fn h1_response_carries_exactly_one_fd() {
         let request = open("a.csv");
@@ -1048,8 +1262,8 @@ mod tests {
             assert!(OPCODES_CORE.contains(&op.code()) || OPCODES_WORK.contains(&op.code())
                 || OPCODES_HELPER.contains(&op.code()), "{op:?} outside every range");
         }
-        assert!(OPCODES_WORK.contains(&Opcode::OpenWorkFile.code()) && OPCODES_WORK.contains(&Opcode::WorkAnchor.code()));
-        for op in Opcode::ALL.into_iter().filter(|op| !matches!(op, Opcode::OpenWorkFile | Opcode::WorkAnchor)) {
+        for op in Opcode::WORK { assert!(OPCODES_WORK.contains(&op.code()), "{op:?}"); }
+        for op in Opcode::ALL.into_iter().filter(|op| !Opcode::WORK.contains(op)) {
             assert!(OPCODES_CORE.contains(&op.code()) || OPCODES_HELPER.contains(&op.code()), "{op:?}");
         }
         // Every request maps to its registry entry, and the registry name is the wire tag.
@@ -1073,7 +1287,7 @@ mod tests {
             assert!(HX_RESERVED_OPS.iter().any(|r| r.code == op.code()), "unreserved helper opcode {op:?}");
         }
         // Package H claims none of HX's result tags or error-code names.
-        for tag in ["work_file", "work_anchor"] { assert!(!HX_RESERVED_RESULTS.contains(&tag)); }
+        for tag in ["work_file", "work_anchor", "employee_runs_stopped", "employee_idle"] { assert!(!HX_RESERVED_RESULTS.contains(&tag)); }
         for code in [ErrorCode::WorkFileNotFound, ErrorCode::WorkFileRefused, ErrorCode::WorkFileTooLarge,
             ErrorCode::WorkspaceBrokerUnavailable] {
             let name = serde_json::to_value(code).unwrap();

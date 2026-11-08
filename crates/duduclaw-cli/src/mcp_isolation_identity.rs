@@ -35,8 +35,10 @@ pub(crate) fn var(key: impl AsRef<OsStr>) -> Result<String, VarError> {
     let Some(call) = crate::mcp_isolation::current() else { return std::env::var(key); };
     let value = match key.to_str() {
         Some(duduclaw_core::ENV_AGENT_ID | duduclaw_core::ENV_DELEGATION_SENDER) => Some(call.agent.clone()),
+        // F6m: the lifecycle-bound token (v2 for a live protected employee);
+        // a tombstoned employee or unreadable index projects no token.
         Some(duduclaw_core::ENV_AGENT_TOKEN) => duduclaw_core::identity_token::load_key(&call.home)
-            .map(|key| duduclaw_core::mint_identity_token(&key, &call.agent)),
+            .and_then(|key| duduclaw_core::current_agent_token(&call.home, &key, &call.agent)),
         Some(duduclaw_core::ENV_MCP_API_KEY) => internal_key(&call.home),
         Some("DUDUCLAW_PRINCIPAL_CONTEXT") => duduclaw_gateway::isolation_egress::principal_context(),
         // An absent mapping is not evidence of a root run. Existing depth

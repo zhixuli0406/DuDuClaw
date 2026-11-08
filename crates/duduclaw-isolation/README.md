@@ -77,6 +77,19 @@ not authorize ambient Service/Connector access. Both full-record and resource-ta
 golden bytes are versioned.
 Old v1 capability MACs fail verification; IPC wire v1 is unchanged.
 
+**CONTRACT CHANGE (2026-11-08, D-H2): resource tag 11, `PublicOrigins { origins }`.**
+Additive to v2 (existing records encode identically, so the version stays 2).
+Encoding: tag `0x0b`, then the entries as a set (u32 count, u32-length texts in
+encoded-byte order). Each entry is `*` (any public HTTPS origin) or exactly
+`https://<hostname>`: https only, default port, no userinfo/path/query/fragment,
+canonical lowercase ASCII hostname with at least two labels, never an IP literal
+or a non-public name (`localhost`, `.local`, `.internal`, `.arpa`, …). The set
+has 1..=16 entries, no duplicates, and `*` only alone. The grant is valid only
+alongside `EmployeeScope` for the record's own employee, at most once, never
+inside `Confined`; decoding a `CapabilityRecord` refuses anything else, and
+signing re-checks it. It authorizes only `web_fetch_cached`/`web_extract`; the
+host fetch still pins DNS, refuses non-public addresses and follows no redirect.
+
 `RequestContext::verify_live` requires the original connection's host verifier;
 plain `from_verified_record` contexts are suitable for policy fixtures but
 cannot perform I/O. The verifier is in-memory only and is not serialized into
@@ -133,7 +146,8 @@ wire still carries only the `op` name; the number is for audit/telemetry and
 collision checks, and `SpawnRequest::opcode` is exhaustive so an unregistered
 variant does not compile. Ranges, never reused: `0x0001–0x00FF` core run
 lifecycle (`reserve_run` 0x01 … `take_io` 0x08), `0x0100–0x01FF` Package H
-(`open_work_file` 0x0101, `work_anchor` 0x0102), `0x0200–0x02FF` HX in-run
+(`open_work_file` 0x0101, `work_anchor` 0x0102, `stop_employee_runs` 0x0103,
+`employee_idle` 0x0104; `Opcode::WORK`), `0x0200–0x02FF` HX in-run
 helpers, reserved in `HX_RESERVED_OPS` (`helper_call` 0x0201, `helper_wait`
 0x0202, `helper_stop` 0x0203, `helper_cancel` 0x0204). HX also owns the result
 tags `helper_started`/`helper_ended` and the error codes `helper_busy`,
@@ -143,18 +157,54 @@ tags `helper_started`/`helper_ended` and the error codes `helper_busy`,
   `WorkFile { run, file: { size, inode, device } }` + exactly one `WorkFileRead`
   fd (regular file, O_RDONLY, FD_CLOEXEC). `WorkPath` is relative to the live
   run's attached `employee-work` mount: non-empty, ≤ 4096 bytes, ≤ 64 components
-  of ≤ 255 bytes, no `.`/`..`/empty component, no leading `/`, NUL, `\` or ASCII
-  control byte, first component not `.forks`; checked on construction and on
-  decode. `size` ≤ 16 MiB, `inode`/`device` non-zero.
+  of ≤ 255 bytes, no `.`/`..`/empty component, no leading `/`, no `\` and no
+  `char::is_control` character (C0 incl. NUL, DEL, C1 incl. U+0085; same rule
+  and conformance vectors as mcp-boundary `WorkRelativePath`), first component
+  not `.forks`; checked on construction and on decode. `size` ≤ 16 MiB,
+  `inode`/`device` non-zero.
 - `WorkAnchor { employee_id }` → `WorkAnchor { employee_id, anchor: { device, inode } }`,
   no fds.
+- `StopEmployeeRuns { employee_id }` (H4, for F6 tombstone S13), no fds →
+  `EmployeeRunsStopped { employee_id, runs: [run], confirmed }`. Root cancels
+  every non-terminal run of the employee through the per-run Cancel path
+  (whichever gateway connection owns it), refuses new reservations for that
+  employee while the stop is pending, and replies after every listed run is
+  terminal and `EmployeeIdle` reads idle (`confirmed = true`) or after a bounded
+  wait (≈ 4 s, below `CONTROL_TIMEOUT_MS`; `confirmed = false`, retry). Unknown
+  employee ⇒ `not_found`. `runs` ≤ `MAX_STOPPED_RUNS` (64).
+- `EmployeeIdle { employee_id }` (H4, for F6c/F6l), no fds →
+  `EmployeeIdle { employee_id, report: { runs, attachments, processes, units } }`
+  (counts; `report.idle()` only when all are zero). Any unreadable source is an
+  `isolation_unavailable` error, never a zero report.
 - New `ErrorCode`s: `work_file_not_found`, `work_file_refused`,
-  `work_file_too_large`, `workspace_broker_unavailable`.
+  `work_file_too_large`, `workspace_broker_unavailable`. H4 adds none (the
+  snapshot caps answer `resource_limit`), because clients match `ErrorCode`
+  exhaustively.
 - `check_work_reply(request, response, received_fds)` pairs a reply with its
-  request (run/employee) and checks the fd count. Callers still `fstat` the fd.
+  request (run/employee) and checks the fd count for all four ops. Callers
+  still `fstat` the fd.
 
-Protocol stays v1 (additive variants); gateway and spawnd ship together. Until
-H2–H4 land, spawnd answers both ops with `workspace_broker_unavailable`.
+Protocol stays v1 (additive variants); gateway and spawnd ship together. A
+gateway sends these ops only when spawnd advertises `SpawndFeatures::WORK_BROKER`
+(see "Feature bits" below); without it it must report
+`workspace_broker_unavailable` instead, because an older spawnd closes the
+control connection on an unknown `op`.
+
+## Feature bits (H4 + HX4, one set)
+
+`ipc::SpawndFeatures` is the single feature set: a u32 bitset, serialized as a
+JSON number, omitted when empty, unknown bits carried but never tested.
+`helper_calls` = bit 0 (`HELPER_CALLS`), `work_broker` = bit 1 (`WORK_BROKER`).
+spawnd computes it in one place (`Host::features`) and advertises the same
+value the same way on both channels: the root readiness report
+(`readiness.json` → `EvidenceReport.features`, read before connecting) and every
+`SpawnResponse::Reserved.features` (authoritative for that connection).
+`Opcode::feature()` names the bit an op needs (`Opcode::WORK` → `work_broker`,
+`Opcode::HELPER` → `helper_calls`, core ops none) and `SpawndFeatures::allows(op)`
+is the gateway gate. `work_broker` is a decode bit (always set by this
+spawnd; each op still fails closed per host); `helper_calls` is set only when
+the trampoline forks launchers, the publication has launcher plans and the
+slot cgroups are not known to lack open-time credentials.
 
 ## HX in-run helper ops (HX3a)
 
@@ -171,12 +221,16 @@ Assigned exactly as reserved: `helper_call` 0x0201, `helper_wait` 0x0202,
 - `HelperStop { run, call }`, `HelperCancel { run, call }` → `Ack`.
 - New `ErrorCode`s: `helper_busy`, `helper_unavailable`, `run_time_exhausted`,
   `helper_cgroup_unavailable`. `check_helper_reply` pairs replies and fd counts.
-- Feature bit [F17]: `SpawnResponse::Reserved.features` (`SpawndFeatures`,
-  omitted when empty); bit 0 = `helper_calls`. A gateway that does not see it
-  sends no helper op and reports `helper_launcher_unavailable{reason: spawnd_feature_missing}`.
+- Feature bit [F17]: `helper_calls` (bit 0) of the one `SpawndFeatures` set
+  above. A gateway that does not see it sends no helper op and reports
+  `helper_launcher_unavailable{reason: spawnd_feature_missing}`.
 
-Until HX4 lands, spawnd advertises no features and answers every helper op with
-`helper_unavailable`.
+HX4 (spawnd) semantics: `HelperCall` is answered asynchronously (≤ 4 s); a call
+whose slot is busy waits in a per-run FIFO (≤ 4 calls, ≤ 3 s each) and is then
+`helper_busy`. `HelperWait` is a bounded poll like `Wait`: `not_ready` until the
+call ended root-side, then `HelperEnded` exactly once. `HelperStop` (recording
+only) and `HelperCancel` affect only that call, never the run. See
+`duduclaw-spawnd/README.md`.
 
 ## License
 

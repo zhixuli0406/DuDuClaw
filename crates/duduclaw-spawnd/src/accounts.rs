@@ -170,6 +170,22 @@ pub fn process_uids(status: &str) -> io::Result<[u32; 4]> {
     values.try_into().map_err(|_| denied())
 }
 
+/// `Gid:` row of /proc/<pid>/status (real, effective, saved, filesystem).
+pub fn process_gids(status: &str) -> io::Result<[u32; 4]> {
+    let rows: Vec<_> = status.lines().filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| *name == "Gid").collect();
+    if rows.len() != 1 { return Err(denied()); }
+    let values = rows[0].1.split_whitespace().map(|value| value.parse().map_err(|_| denied()))
+        .collect::<io::Result<Vec<u32>>>()?;
+    values.try_into().map_err(|_| denied())
+}
+
+/// H4 / F6 S14: a process belongs to the employee when ANY uid or gid field
+/// equals the employee's. Unparseable status is an error, never "not ours".
+pub fn employee_owned_status(status: &str, uid: u32, gid: u32) -> io::Result<bool> {
+    Ok(process_uids(status)?.contains(&uid) || process_gids(status)?.contains(&gid))
+}
+
 pub fn unified_cgroup(text: &str) -> io::Result<&str> {
     let mut rows = text.lines();
     let row = rows.next().ok_or_else(denied)?;
@@ -439,6 +455,24 @@ mod linux {
         }
     }
 
+    /// H4 `EmployeeIdle` (F6 §3.12 step 4, S14): number of processes whose uid
+    /// OR gid fields equal the employee's. Read-only, no signal; a process that
+    /// vanishes mid-scan is skipped, any other read error fails the scan.
+    pub fn employee_process_count(uid: u32, gid: u32) -> io::Result<usize> {
+        let mut count = 0usize;
+        for entry in fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+            if name.parse::<u32>().is_err() { continue; }
+            match fs::read_to_string(entry.path().join("status")) {
+                Ok(status) => if employee_owned_status(&status, uid, gid)? { count = count.saturating_add(1); },
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(count)
+    }
+
     /// Run before admission and every two seconds while the lease is held.
     /// None means this uid must have no processes anywhere on the host.
     pub fn unexpected_processes(uid: u32, allowed_cgroup: Option<&str>) -> io::Result<Vec<UnexpectedProcess>> {
@@ -634,7 +668,7 @@ mod linux {
     }
 }
 #[cfg(target_os = "linux")]
-pub use linux::{LinuxAccounts, unexpected_processes, terminate_intruder};
+pub use linux::{LinuxAccounts, unexpected_processes, terminate_intruder, employee_process_count};
 
 #[cfg(test)]
 mod tests {
@@ -695,6 +729,18 @@ mod tests {
         assert!(!cgroup_member("/a/b-evil/c", "/a/b"));
         assert!(!cgroup_member("/a/b/../c", "/a/b"));
         assert!(!cgroup_member("/a", "/"));
+    }
+    #[test]
+    fn employee_owned_status_matches_any_uid_or_gid_field() {
+        let status = |uid: &str, gid: &str| format!("Name:\tx\nUid:\t{uid}\nGid:\t{gid}\n");
+        assert!(!employee_owned_status(&status("1 1 1 1", "1 1 1 1"), 70000, 70000).unwrap());
+        assert!(employee_owned_status(&status("1 1 70000 1", "1 1 1 1"), 70000, 70000).unwrap());
+        // S14: a gid match counts even when every uid field differs.
+        assert!(employee_owned_status(&status("1 1 1 1", "1 1 1 70000"), 70000, 70000).unwrap());
+        assert!(employee_owned_status(&status("1 1 1 1", "1 1 1 1"), 70000, 70000).is_ok_and(|v| !v));
+        assert!(employee_owned_status("Uid:\t1 1 1 1\n", 70000, 70000).is_err());
+        assert!(process_gids("Gid: 1 2 3\n").is_err());
+        assert_eq!(process_gids("Gid:\t5 6 7 8\n").unwrap(), [5, 6, 7, 8]);
     }
     #[test]
     fn proc_stat_starttime_handles_parentheses_and_spaces() {

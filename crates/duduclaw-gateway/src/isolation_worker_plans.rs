@@ -209,6 +209,10 @@ impl GatewayWorkerPlans {
         };
         // No redirects/proxies: an origin capability cannot authorize a second
         // origin. This cache cannot contain legacy redirect-following results.
+        // A D-H2 PublicOrigins call re-resolves its URL through the signed grant.
+        if call.resources().iter().any(|grant| matches!(grant, duduclaw_isolation::capability::ResourceGrant::PublicOrigins { .. })) {
+            duduclaw_mcp_boundary::resources::authorize_public_url(call)?;
+        }
         call.context().verify_live(duduclaw_mcp_boundary::authority::now_seconds()?)?;
         let fetched = crate::web_fetch::web_fetch_protected_cached(url, ttl, &self.home.join("web_cache"))
             .await.map_err(|_| VerificationError::Unavailable)?;

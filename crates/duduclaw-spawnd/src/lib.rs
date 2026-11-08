@@ -8,7 +8,12 @@ pub mod systemd;
 pub mod policy;
 pub mod helper_policy;
 pub mod helper_cgroup;
+/// HX4 root side of in-run helper calls (per-run engine on the lifecycle thread).
+#[cfg(target_os = "linux")]
+pub mod helper_host;
 pub mod storage;
+#[cfg(unix)]
+pub mod work_anchor;
 pub mod bootstrap;
 #[cfg(target_os = "linux")]
 pub mod bootstrap_mounts;
@@ -28,6 +33,9 @@ pub mod server;
 pub mod channels;
 #[cfg(target_os = "linux")]
 pub mod egress;
+/// H2 root work broker core (D-H1); H4 wires it into `server.rs` dispatch.
+#[cfg(target_os = "linux")]
+pub mod work_broker;
 
 pub type Result<T> = std::result::Result<T, duduclaw_isolation::ipc::ErrorCode>;
 

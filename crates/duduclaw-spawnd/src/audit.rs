@@ -3,9 +3,44 @@ use std::collections::BTreeMap;
 use duduclaw_isolation::ids::{EmployeeId, RunId};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Event { Refused, Reserved, Queued, Started, Ended, Revoked, Intruder, OutputTruncated, Suppressed }
+pub enum Event { Refused, Reserved, Queued, Started, Ended, Revoked, Intruder, OutputTruncated, Suppressed,
+    /// H4: a sealed work-file snapshot was handed to the gateway.
+    WorkFileOpened,
+    /// H4: an `OpenWorkFile` was refused (detail: the wire code).
+    WorkFileRefused,
+    /// H4: `StopEmployeeRuns` replied (detail: runs + confirmed).
+    EmployeeRunsStopped,
+    /// H4: start-up anchor backfill created a missing work anchor.
+    WorkAnchorBackfilled,
+    /// H4: start-up anchor backfill could not create/verify an anchor.
+    WorkAnchorBackfillFailed,
+    /// HX4: spawnd sent `Start` for a helper call (detail: `helper`).
+    HelperStarted,
+    /// HX4: a helper call ended root-side (detail: `helper` with the outcome).
+    HelperEnded,
+    /// HX4: a `HelperCall` was refused (detail: the wire code).
+    HelperRefused,
+    /// HX4: the run's launcher channel or slot cgroups were lost (detail: code).
+    HelperChannelClosed,
+}
+/// Bounded, content-free detail. Never a path, file name, file content or
+/// free-form text: identities and counts only.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Detail {
+    /// Identity of the employee file the snapshot was copied from (root-side
+    /// statx), and the snapshot size. Never sent to the gateway.
+    WorkSource { device_major: u32, device_minor: u32, inode: u64, size: u64 },
+    Code { code: duduclaw_isolation::ipc::ErrorCode },
+    Stopped { runs: u16, confirmed: bool },
+    /// HX4 helper call: spawnd's call id, the signed helper index in the
+    /// parent's list, the slot, the input memfd size and, once ended, the
+    /// root-determined outcome. No argv, path, input or output content.
+    Helper { call: duduclaw_isolation::ipc::HelperCallId, helper: u8, slot: duduclaw_isolation::ipc::HelperSlot,
+        input_bytes: u64, effective_timeout_ms: Option<u64>, outcome: Option<duduclaw_isolation::ipc::HelperOutcome> },
+}
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Record {
@@ -14,6 +49,9 @@ pub struct Record {
     pub employee: Option<EmployeeId>,
     pub run: Option<RunId>,
     pub suppressed: u64,
+    /// Omitted when `None`, so records without detail keep their exact shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Detail>,
 }
 /// Fixed-source rate limiting prevents caller-chosen labels from growing state.
 pub struct AuditBudget {
@@ -289,7 +327,7 @@ mod tests {
     }
     #[test]
     fn retention_reads_only_one_bounded_complete_record() {
-        let record = Record { at_unix_ms: 7, event: Event::Reserved, employee: None, run: None, suppressed: 0 };
+        let record = Record { at_unix_ms: 7, event: Event::Reserved, employee: None, run: None, suppressed: 0, detail: None };
         let mut line = serde_json::to_vec(&record).unwrap();
         line.push(b'\n');
         line.extend_from_slice(&vec![b'x'; LINE_BYTES * 2]);
@@ -301,7 +339,7 @@ mod tests {
     #[test]
     fn full_audit_queue_never_waits_for_disk_worker() {
         fn record() -> Record {
-            Record { at_unix_ms: 0, event: Event::Refused, employee: None, run: None, suppressed: 0 }
+            Record { at_unix_ms: 0, event: Event::Refused, employee: None, run: None, suppressed: 0, detail: None }
         }
         let (queue, receiver) = audit_channel();
         for _ in 0..QUEUE_LENGTH { assert!(queue.emit(1, record())); }
@@ -326,8 +364,54 @@ mod tests {
         assert_eq!(audit.admit(1, 0), Some(0));
         assert_eq!(audit.admit(1, 1), None);
         assert_eq!(audit.admit(1, 60_000), Some(1));
-        let record = Record { at_unix_ms: 0, event: Event::Refused, employee: None, run: None, suppressed: 0 };
+        let record = Record { at_unix_ms: 0, event: Event::Refused, employee: None, run: None, suppressed: 0, detail: None };
         let value = serde_json::to_value(record).unwrap();
         assert_eq!(value.as_object().unwrap().len(), 5);
+    }
+    #[test]
+    fn h4_work_events_carry_identity_never_paths() {
+        let source = Detail::WorkSource { device_major: 7, device_minor: 4, inode: 99, size: 12 };
+        let record = Record { at_unix_ms: 1, event: Event::WorkFileOpened, employee: Some(EmployeeId([1; 16])),
+            run: Some(RunId([2; 16])), suppressed: 0, detail: Some(source.clone()) };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["event"], "work_file_opened");
+        assert_eq!(value["detail"]["kind"], "work_source");
+        let keys: Vec<_> = value["detail"].as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys.len(), 5, "{keys:?}");
+        assert!(keys.iter().all(|key| !matches!(key.as_str(), "path" | "name" | "bytes" | "content")));
+        let line = serde_json::to_vec(&record).unwrap();
+        assert!(line.len() < LINE_BYTES);
+        let back: Record = serde_json::from_slice(&line).unwrap();
+        assert_eq!(back.detail, Some(source));
+        // A detail with an unknown field (e.g. a smuggled path) never parses.
+        let mut forged = value.clone();
+        forged["detail"]["path"] = "secret.txt".into();
+        assert!(serde_json::from_value::<Record>(forged).is_err());
+        let stopped = Record { at_unix_ms: 1, event: Event::EmployeeRunsStopped, employee: None, run: None, suppressed: 0,
+            detail: Some(Detail::Stopped { runs: 3, confirmed: false }) };
+        assert_eq!(serde_json::to_value(stopped).unwrap()["detail"]["confirmed"], false);
+    }
+    #[test]
+    fn hx4_helper_events_carry_ids_sizes_and_outcome_never_content() {
+        use duduclaw_isolation::ipc::{HelperCallId, HelperOutcome, HelperSlot};
+        let detail = Detail::Helper { call: HelperCallId::new([7; 16]).unwrap(), helper: 2, slot: HelperSlot::Recording,
+            input_bytes: 12, effective_timeout_ms: None, outcome: Some(HelperOutcome::OomKilled) };
+        let record = Record { at_unix_ms: 1, event: Event::HelperEnded, employee: Some(EmployeeId([1; 16])),
+            run: Some(RunId([2; 16])), suppressed: 0, detail: Some(detail.clone()) };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["event"], "helper_ended");
+        assert_eq!(value["detail"]["kind"], "helper");
+        assert_eq!(value["detail"]["outcome"]["kind"], "oom_killed");
+        let keys: Vec<_> = value["detail"].as_object().unwrap().keys().cloned().collect();
+        assert!(keys.iter().all(|key| !matches!(key.as_str(), "path" | "argv" | "env" | "name" | "content" | "output")), "{keys:?}");
+        let line = serde_json::to_vec(&record).unwrap();
+        assert!(line.len() < LINE_BYTES);
+        assert_eq!(serde_json::from_slice::<Record>(&line).unwrap().detail, Some(detail));
+        let mut forged = value;
+        forged["detail"]["argv"] = "rm -rf".into();
+        assert!(serde_json::from_value::<Record>(forged).is_err());
+        for event in [Event::HelperStarted, Event::HelperRefused, Event::HelperChannelClosed] {
+            assert!(serde_json::to_value(event).unwrap().as_str().unwrap().starts_with("helper_"));
+        }
     }
 }

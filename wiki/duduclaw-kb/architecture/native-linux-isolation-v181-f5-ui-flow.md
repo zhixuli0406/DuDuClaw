@@ -46,7 +46,7 @@
 - 若已有個人員工：顯示名稱、狀態、可用的個人連接（Google 等）與「重新連結」入口（沿用既有個人 Google 連線流程）。
 - 若沒有：「申請個人 AI 員工」→ 填想要的名稱與顯示名稱 → 送出 → `me.isolation.request_personal_employee`。說明「需要管理員核准」。每人同時最多 3 筆、24 小時內最多 10 筆，超過時顯示原因。
 - 申請紀錄：`me.isolation.list_personal_employee_requests`（待處理／已核准／已拒絕／已過期）。
-- **委派請求**：個人員工想把工作交給共用員工時出現卡片，顯示「哪位個人員工 → 哪位共用員工、任務內容（截 200 字）」，按「同意／拒絕」→ `me.isolation.decide_personal_delegation`；清單 `me.isolation.list_personal_delegations`。說明「同意後，任務內容可能被其他能使用該共用員工的同仁看到」。卡片 24 小時過期。
+- **委派請求**：個人員工想把工作交給共用員工時出現卡片，顯示「哪位個人員工 → 哪位共用員工、任務內容（**完整顯示、不截斷不收合**；以純文字呈現，`white-space: pre-wrap`、`dir="auto"`＋`unicode-bidi: isolate`；內容過長時要先展開到底才能按同意。SR2 審查規定：主人看到的必須與實際送出的一字不差）」，按「同意／拒絕」→ `me.isolation.decide_personal_delegation`；清單 `me.isolation.list_personal_delegations`。說明「同意後，任務內容可能被其他能使用該共用員工的同仁看到」。卡片 24 小時過期。
 
 ## 共通規則
 - 所有會改變狀態的管理動作都要 step-up（5 分鐘內有效），沿用遷移頁已有的再驗證對話框。

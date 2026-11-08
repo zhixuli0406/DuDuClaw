@@ -359,6 +359,54 @@ fn host_snapshots_bind_selected_origin_call_and_operation() {
         HostSnapshotSource::WebFetch { url: "https://example.com/a" }, &vec![0; 5 * 1024 * 1024 + 1]).is_err());
 }
 
+// ── H7 PublicOrigins (D-H2) ────────────────────────────────────────────────
+#[test]
+fn public_origin_url_resolves_to_the_exact_authorized_origin() {
+    use crate::tool_policy::{authorize, ResourceResolver, ToolPolicy};
+    use duduclaw_isolation::worker::ParseOperation;
+    use serde_json::{Value, json};
+    struct Live;
+    impl LiveRequestVerifier for Live {
+        fn verify_live(&self, _: &CapabilityRecord, _: u64) -> Result<(), VerificationError> { Ok(()) }
+    }
+    struct Unused;
+    impl ResourceResolver for Unused {
+        fn resolve(&self, _: &RequestContext, _: &ToolPolicy, _: &Value) -> Result<Vec<ResourceGrant>, VerificationError> {
+            panic!("PublicOrigins calls select only signed grants")
+        }
+    }
+    assert_eq!(public_url_origin("https://Docs.Example.org/a?b#c").unwrap().as_str(), "https://docs.example.org");
+    assert_eq!(public_url_origin("https://docs.example.org:443/").unwrap().as_str(), "https://docs.example.org");
+    for url in ["http://docs.example.org/", "https://docs.example.org:8443/", "https://u@docs.example.org/",
+        "https://10.0.0.1/", "https://[fd00::1]/", "https://0177.0.0.1/", "https://localhost/", "",
+        "https://docs.example.org/\t", "file:///etc/passwd"] {
+        assert!(public_url_origin(url).is_err(), "{url:?}");
+    }
+    let grant = ResourceGrant::PublicOrigins { origins: List::new(vec![PublicOrigin::parse("https://example.com").unwrap()]).unwrap() };
+    let mut record = context().record().clone();
+    record.expires_at = u64::MAX - 1;
+    record.tools = List::new(vec![Text::new("web_extract".into()).unwrap()]).unwrap();
+    record.resources = List::new(vec![ResourceGrant::EmployeeScope { id: record.employee }, grant.clone()]).unwrap();
+    validate_grants(&record).unwrap();
+    let context = RequestContext::with_live_verifier(record, std::sync::Arc::new(Live));
+    let call = authorize(&context, "web_extract", &json!({"url":"https://example.com/a","selector":"p"}), &Unused).unwrap();
+    let authorized = authorize_public_url(&call).unwrap();
+    assert_eq!((authorized.url(), authorized.origin().as_str(), authorized.host()),
+        ("https://example.com/a", "https://example.com", "example.com"));
+    assert!(authorized.verify(&call).is_ok());
+    let token = AuthorizedFile::from_host_snapshot(&call, HostSnapshotSource::WebFetch { url: "https://example.com/a" }, b"body").unwrap();
+    assert!(token.verify(&call).is_ok());
+    assert!(token.verify_operation(ParseOperation::ExtractHtml).is_ok());
+    // Another URL of the same origin is a different call; another origin is refused.
+    let next = authorize(&context, "web_extract", &json!({"url":"https://example.com/b","selector":"p"}), &Unused).unwrap();
+    assert!(authorized.verify(&next).is_err() && token.verify(&next).is_err());
+    assert!(AuthorizedFile::from_host_snapshot(&call, HostSnapshotSource::WebFetch { url: "https://example.com/b" }, b"x").is_err());
+    assert!(authorize(&context, "web_extract", &json!({"url":"https://other.example/a","selector":"p"}), &Unused).is_err());
+    // The PublicOrigins path does not extend to non-web snapshots.
+    assert!(AuthorizedFile::from_host_snapshot(&call, HostSnapshotSource::InlineAudio, b"x").is_err());
+    assert!(PublicOrigin::parse("https://example.com").unwrap().permits(&public_url_origin("https://example.com/").unwrap()));
+}
+
 // ── H6 brokered employee-work root ─────────────────────────────────────────
 #[cfg(unix)]
 mod h6 {

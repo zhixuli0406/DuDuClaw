@@ -70,6 +70,9 @@ impl RootPolicy {
             Some(HelperEntry { index: u8::try_from(index).ok()?, binding, runtime })
         }).collect()
     }
+    /// HX4: whether any parent profile has a signed launcher (the "launcher
+    /// plan active" half of the `helper_calls` feature bit).
+    pub fn launchers_active(&self) -> bool { self.launchers.values().any(|launcher| !launcher.helpers.is_empty()) }
     pub fn helper_tmpfs_bytes(&self, parent: &PublishedRuntime) -> Option<u64> {
         self.launchers.get(&(parent.profile.0).0).map(|launcher| launcher.helper_tmpfs_bytes)
     }

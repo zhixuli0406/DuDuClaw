@@ -1,5 +1,5 @@
 use std::{collections::BTreeMap, fs::File, path::{Component, Path}};
-use duduclaw_isolation::{capability::{CapabilityRecord, EmployeeBinding, ResourceGrant, RequestContext,
+use duduclaw_isolation::{capability::{CapabilityRecord, EmployeeBinding, PublicOrigin, ResourceGrant, RequestContext,
     VerificationError}, ids::EmployeeId};
 
 /// Reject malformed resource policy before it can be signed.
@@ -24,6 +24,78 @@ pub(crate) fn validate_grants(record: &CapabilityRecord) -> Result<(), Verificat
 pub fn require_resource(context: &RequestContext, resource: &ResourceGrant) -> Result<(), VerificationError> {
     if context.record().io_resources().any(|grant| grant == resource) { Ok(()) }
     else { Err(VerificationError::Invalid) }
+}
+
+/// D-H2: the exact public HTTPS origin a tool URL argument would contact, or a
+/// refusal. Uses the same WHATWG parser as the fetcher, so the origin checked
+/// is the origin dialled: https only, default port, no userinfo, a DNS name
+/// (never an IP literal, including WHATWG numeric hosts) that passes
+/// [`PublicOrigin::parse`]. Whether its addresses are public is decided by the
+/// host fetch after DNS, per resolved address, and the answer is pinned.
+pub fn public_url_origin(url: &str) -> Result<PublicOrigin, VerificationError> {
+    if url.is_empty() || url.len() > 8192 || url.trim() != url || url.chars().any(char::is_control) {
+        return Err(VerificationError::Invalid);
+    }
+    let parsed = url::Url::parse(url).map_err(|_| VerificationError::Invalid)?;
+    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some()
+        || parsed.port().is_some() {
+        return Err(VerificationError::Invalid);
+    }
+    let Some(url::Host::Domain(host)) = parsed.host() else { return Err(VerificationError::Invalid); };
+    let origin = PublicOrigin::parse(&format!("https://{host}")).map_err(|_| VerificationError::Invalid)?;
+    if parsed.origin().ascii_serialization() != origin.as_str() { return Err(VerificationError::Invalid); }
+    Ok(origin)
+}
+
+/// The origin of `url` if the `PublicOrigins` grant permits it.
+pub fn permitted_public_origin(grant: &ResourceGrant, url: &str) -> Result<PublicOrigin, VerificationError> {
+    let ResourceGrant::PublicOrigins { origins } = grant else { return Err(VerificationError::Invalid); };
+    let origin = public_url_origin(url)?;
+    if origins.as_slice().iter().any(|allowed| allowed.permits(&origin)) { Ok(origin) }
+    else { Err(VerificationError::Invalid) }
+}
+
+/// A URL argument resolved into an origin authorized by this call's signed
+/// `PublicOrigins` grant. Fetch only [`AuthorizedPublicUrl::url`], through the
+/// gateway's protected fetch (DNS pin, public addresses only, no redirects).
+#[derive(Clone)]
+pub struct AuthorizedPublicUrl {
+    binding: CallBinding,
+    grant: ResourceGrant,
+    url: String,
+    origin: PublicOrigin,
+}
+impl AuthorizedPublicUrl {
+    pub fn url(&self) -> &str { &self.url }
+    pub fn origin(&self) -> &PublicOrigin { &self.origin }
+    /// The exact hostname to resolve; never `*`.
+    pub fn host(&self) -> &str { self.origin.host().unwrap_or_default() }
+    pub fn verify(&self, call: &crate::tool_policy::AuthorizedToolCall) -> Result<(), VerificationError> {
+        if !self.binding.matches(call) || !call.resources().contains(&self.grant) {
+            return Err(VerificationError::BindingMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Resolve the `url` argument of an authorized web call through its signed
+/// `PublicOrigins` grant. Refuses calls that were not authorized on that path.
+pub fn authorize_public_url(call: &crate::tool_policy::AuthorizedToolCall)
+    -> Result<AuthorizedPublicUrl, VerificationError> {
+    if !crate::tool_policy::PUBLIC_ORIGIN_TOOLS.contains(&call.name()) {
+        return Err(VerificationError::BindingMismatch);
+    }
+    let context = call.context();
+    let scope = ResourceGrant::EmployeeScope { id: context.record().employee };
+    let grant = call.resources().iter().find(|grant| matches!(grant, ResourceGrant::PublicOrigins { .. }))
+        .ok_or(VerificationError::BindingMismatch)?;
+    if !call.resources().contains(&scope) { return Err(VerificationError::BindingMismatch); }
+    require_resource(context, &scope)?;
+    require_resource(context, grant)?;
+    let url = call.arguments().get("url").and_then(serde_json::Value::as_str).ok_or(VerificationError::Invalid)?;
+    let origin = permitted_public_origin(grant, url)?;
+    context.verify_live(crate::authority::now_seconds()?)?;
+    Ok(AuthorizedPublicUrl { binding: CallBinding::new(call), grant: grant.clone(), url: url.to_owned(), origin })
 }
 
 pub fn relative_path(path: &str) -> Result<&Path, VerificationError> {
@@ -309,22 +381,31 @@ impl AuthorizedFile {
         use std::io::{Seek, SeekFrom, Write};
         call.context().verify_live(crate::authority::now_seconds()?)?;
         let own = ResourceGrant::Employee { id: call.context().record().employee };
-        if !call.resources().contains(&own) { return Err(VerificationError::BindingMismatch); }
+        // A D-H2 web call selects EmployeeScope + PublicOrigins, not Employee.
+        let public = matches!(source, HostSnapshotSource::WebFetch { .. })
+            && call.resources().iter().any(|grant| matches!(grant, ResourceGrant::PublicOrigins { .. }));
+        if !public && !call.resources().contains(&own) { return Err(VerificationError::BindingMismatch); }
         let (grant, operation, cap) = match source {
             HostSnapshotSource::WebFetch { url } => {
                 if call.name() != "web_extract" || call.arguments().get("url").and_then(serde_json::Value::as_str) != Some(url) {
                     return Err(VerificationError::BindingMismatch);
                 }
-                let parsed = url::Url::parse(url).map_err(|_| VerificationError::Invalid)?;
-                if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none()
-                    || !parsed.username().is_empty() || parsed.password().is_some() {
-                    return Err(VerificationError::Invalid);
+                if public {
+                    let authorized = authorize_public_url(call)?;
+                    if authorized.url() != url { return Err(VerificationError::BindingMismatch); }
+                    (authorized.grant, ParseOperation::ExtractHtml, 5 * 1024 * 1024)
+                } else {
+                    let parsed = url::Url::parse(url).map_err(|_| VerificationError::Invalid)?;
+                    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none()
+                        || !parsed.username().is_empty() || parsed.password().is_some() {
+                        return Err(VerificationError::Invalid);
+                    }
+                    let origin = parsed.origin().ascii_serialization();
+                    let grant = call.resources().iter().find(|r| matches!(r,
+                        ResourceGrant::UrlOrigin { origin: selected } if selected.as_str() == origin))
+                        .ok_or(VerificationError::BindingMismatch)?.clone();
+                    (grant, ParseOperation::ExtractHtml, 5 * 1024 * 1024)
                 }
-                let origin = parsed.origin().ascii_serialization();
-                let grant = call.resources().iter().find(|r| matches!(r,
-                    ResourceGrant::UrlOrigin { origin: selected } if selected.as_str() == origin))
-                    .ok_or(VerificationError::BindingMismatch)?.clone();
-                (grant, ParseOperation::ExtractHtml, 5 * 1024 * 1024)
             }
             HostSnapshotSource::InlineAudio => {
                 if call.name() != "transcribe_audio"

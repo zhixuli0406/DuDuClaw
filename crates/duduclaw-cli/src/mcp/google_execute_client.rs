@@ -46,7 +46,8 @@ pub(crate) async fn execute(
         .ok_or("無法確認 DuDuClaw 主程式，Google 請求尚未送出。")?;
     let identity = duduclaw_core::load_identity_key(home)
         .ok_or("無法確認 DuDuClaw 的員工身分，Google 請求尚未送出。")?;
-    let token = duduclaw_core::mint_identity_token(&identity, agent);
+    let token = duduclaw_core::current_agent_token(home, &identity, agent)
+        .ok_or("無法確認 DuDuClaw 的員工身分，Google 請求尚未送出。")?;
     let timestamp = now;
     let nonce: [u8; 16] = rand::random();
     let headers =

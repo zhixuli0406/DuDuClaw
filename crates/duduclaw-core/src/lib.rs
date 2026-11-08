@@ -126,7 +126,8 @@ pub use grounding::{
     SELF_ECHO_TOOL_NAMES, ToolEvidence,
 };
 pub use identity_token::{
-    agent_identity_env_vars, agent_identity_env_vars_default, ensure_key as ensure_identity_key,
+    agent_identity_env_vars, agent_identity_env_vars_default, current_agent_token,
+    ensure_key as ensure_identity_key, verify_agent_token,
     identity_key_path, internal_request_signature, load_key as load_identity_key,
     mint_token as mint_identity_token, verify_internal_request_signature,
     verify_claim as verify_identity_claim, verify_env_identity, verify_token as verify_identity_token,
