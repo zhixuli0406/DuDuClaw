@@ -920,5 +920,10 @@ pub(crate) async fn handle_tools_call(
     )
     .await;
 
+    // RM-130: an empty error is deliberately NOT filled in here. This reply
+    // feeds `McpDispatcher`'s egress / private-read accounting, which treats a
+    // content-less error as payload-free; the reason is added by
+    // `crate::mcp_dispatch::finalize_tool_reply` after that accounting and
+    // after redaction.
     jsonrpc_response(id, result)
 }
