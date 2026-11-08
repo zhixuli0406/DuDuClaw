@@ -157,6 +157,8 @@ confidence = quality_spread       · 0.4
 - **`LlmJudge<C: LlmCaller>`**：建構一個多候選、XML 分隔的 prompt（`build_judge_prompt`），對候選標籤做跳脫以抵抗注入；以 JSON 優先（含 fence 剝除）解析回應。後端是注入式的，因此 gateway 可以接上 Confidence Router（local 優先，信心低時升級到 Claude）。無法解析的裁定或越界索引會回傳錯誤（fail-closed）。
 - **`HeuristicJudge`**：確定性、零 LLM 的後備評審，在沒有 LLM 可用時使用。
 
+`LlmJudge` 採盲評：候選以隨機順序、匿名標籤（`Candidate A`、`B`…）呈現，不含分支 id、名稱或模型，且打亂後的順序會記錄在裁定的 rationale 中以供稽核。
+
 `test_pass_ratio` 由各分支的 `test_exit_code` 在可評審分支間計算而得，當沒有分支被測試時取中性值（0.5）。
 
 ---

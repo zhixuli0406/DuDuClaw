@@ -548,6 +548,9 @@ function EditAgentPageContent() {
       local_model: localModel,
       prefer_local: preferLocal,
       use_router: agent.model?.local?.use_router ?? false,
+      // '' = no per-employee override (inherit the global reply language).
+      reply_language:
+        typeof agent.prompt?.reply_language === 'string' ? agent.prompt.reply_language : '',
       monthly_limit_cents: agent.budget?.monthly_limit_cents ?? 5000,
       warn_threshold_percent: agent.budget?.warn_threshold_percent ?? 80,
       hard_stop: agent.budget?.hard_stop ?? true,
@@ -1124,6 +1127,17 @@ function EditAgentPageContent() {
     { value: 'direct', label: intl.formatMessage({ id: 'agents.apiMode.direct' }), raw: 'direct' },
     { value: 'auto', label: intl.formatMessage({ id: 'agents.apiMode.auto' }), raw: 'auto' },
   ];
+  // Per-employee reply language: '' inherits the global setting; `auto` follows
+  // the user's input language even when a global language is pinned.
+  const replyLanguageOptions: SelectOption[] = ['', 'auto', 'zh-TW', 'zh-CN', 'en', 'ja-JP'].map((code) => ({
+    value: code,
+    label: intl.formatMessage({
+      id: code === '' ? 'agents.edit.replyLanguage.inherit'
+        : code === 'auto' ? 'settings.general.defaultLanguage.followInput'
+        : `settings.general.defaultLanguage.${code}`,
+    }),
+    raw: code,
+  }));
   const providerOptions: SelectOption[] = RUNTIME_PROVIDERS.filter(p => policy.allows('runtimes', p)).map((p) => ({ value: p, label: intl.formatMessage({ id: `agents.runtime.provider.${p}` }), raw: p }));
   const usesGenericCli = GENERIC_CLI_RUNTIMES.has(runtime.provider) || GENERIC_CLI_RUNTIMES.has(runtime.fallback);
   // Show an old saved runtime for migration without offering it as a new choice.
@@ -1773,6 +1787,7 @@ function EditAgentPageContent() {
                   </datalist>
                 </SettingsRow>
               )}
+              <RowSelect disabled={!isAdmin} label={t('agents.edit.replyLanguage')} description={t('agents.edit.replyLanguage.help')} value={form.reply_language ?? ''} onChange={(v) => updateField('reply_language', v)} options={replyLanguageOptions} />
               <RowSelect label={t('agents.adv.statusField')} value={form.status ?? 'active'} onChange={(v) => updateField('status', v)} options={statusOptions} />
             </SettingsCard>
             {adminHint}

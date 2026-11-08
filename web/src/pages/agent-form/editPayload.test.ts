@@ -85,6 +85,24 @@ describe('buildUpdatePayload — only dirty fields are sent', () => {
     }
   });
 
+  it('sends the per-employee reply language only when edited ("" clears = inherit global)', () => {
+    const s = state({ form: { reply_language: 'zh-TW' } });
+    expect(buildUpdatePayload(s, new Set(), CTX).payload).toEqual({});
+    expect(buildUpdatePayload(s, new Set(['form.reply_language']), CTX).payload).toEqual({ reply_language: 'zh-TW' });
+    const inherit = state({ form: { reply_language: '' } });
+    expect(buildUpdatePayload(inherit, new Set(['form.reply_language']), CTX).payload).toEqual({ reply_language: '' });
+    for (const locale of [en, zhTW, jaJP]) {
+      for (const key of [
+        'agents.edit.replyLanguage',
+        'agents.edit.replyLanguage.help',
+        'agents.edit.replyLanguage.inherit',
+        'settings.general.defaultLanguage.zh-CN',
+      ]) {
+        expect((locale as Record<string, string>)[key]).toBeTruthy();
+      }
+    }
+  });
+
   it('a display-name edit sends only display_name (no cron, no org fields, no local table)', () => {
     const r = buildUpdatePayload(state(), new Set(['form.display_name']), CTX);
     expect(r.payload).toEqual({ display_name: 'Bot' });
@@ -275,6 +293,16 @@ describe('admin-only paths and the team vendor rule', () => {
     for (const p of ['form.display_name', 'v.fork_enabled', 'kv', 'runtime.minimal_context', 'v.minimal_context']) {
       expect(isAdminOnlyPath(p)).toBe(false);
     }
+  });
+
+  it('drops reply language from non-admin saves while preserving ordinary edits', () => {
+    const s = state({ form: { reply_language: 'en', display_name: 'Renamed' } });
+    const consumed = new Set(['form.reply_language', 'form.display_name']);
+    for (const serverList of [undefined, authorityFields.fields.filter((f) => f.kind === 'change').flatMap((f) => f.form_paths)]) {
+      const dirty = new Set([...consumed].filter((p) => !isAdminOnlyPath(p, serverList)));
+      expect(buildUpdatePayload(s, dirty, CTX).payload).toEqual({ display_name: 'Renamed' });
+    }
+    expect(buildUpdatePayload(s, consumed, CTX).payload).toEqual({ reply_language: 'en', display_name: 'Renamed' });
   });
 
   it('keeps the fallback list equal to the shared authority table', () => {

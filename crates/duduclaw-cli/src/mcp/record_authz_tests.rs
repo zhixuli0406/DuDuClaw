@@ -1021,6 +1021,7 @@ async fn agent_update_refuses_self_authority_changes() {
     let h = home.path();
     for (key, value) in [
         ("budget_cents", serde_json::json!(999_999)),
+        ("reply_language", serde_json::json!("en")),
         ("db_sources_add", serde_json::json!("crm")),
         ("role", serde_json::json!("main")),
         ("reports_to", serde_json::json!("ceo")),
@@ -1034,10 +1035,14 @@ async fn agent_update_refuses_self_authority_changes() {
         assert!(is_error(&out), "{key}: {out}");
     }
     assert_eq!(budget_of(h, "sales-rep"), 1000);
+    let config: duduclaw_core::types::AgentConfig = toml::from_str(
+        &fs::read_to_string(h.join("agents/sales-rep/agent.toml")).unwrap(),
+    ).unwrap();
+    assert_eq!(config.prompt.reply_language, None);
     let rows = audit_rows(h, "agent_authority_refused");
     // `reports_to` to a non-subtree parent may be refused by the placement
-    // gate first; the other three always reach the self-authority guard.
-    assert!(rows.len() >= 3, "{rows:?}");
+    // gate first; the other four always reach the self-authority guard.
+    assert!(rows.len() >= 4, "{rows:?}");
     assert_eq!(rows[0]["reason"], "self_authority_change");
 
     // Ordinary self-edits are unchanged.

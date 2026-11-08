@@ -18,6 +18,7 @@ import {
   DialogFooter,
 } from '@/components/mds';
 import { toast } from '@/lib/toast';
+import { dashboardBaseUrl } from '@/lib/dashboard-base';
 import type { UserInviteResult } from '@/lib/api';
 import { InviteEmailPreview } from './InviteControls';
 import { ManagerSelect } from './ManagerSelect';
@@ -63,7 +64,7 @@ export function CreateUserDialog({
     setSubmitting(true);
     try {
       const result = await api.users.create({
-        email, display_name: displayName, ...(invite ? { invite: true, public_url: window.location.origin } : { password }), role: userRole,
+        email, display_name: displayName, ...(invite ? { invite: true, public_url: dashboardBaseUrl() } : { password }), role: userRole,
         ...(department.trim() ? { department: department.trim() } : {}),
         ...(managerId ? { manager_user_id: managerId } : {}),
       });

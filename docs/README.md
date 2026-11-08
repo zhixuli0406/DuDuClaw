@@ -115,7 +115,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | Document | Description | Status |
 |----------|-------------|--------|
 | [architecture/overview.md](architecture/overview.md) | System architecture overview | Current |
-| [architecture/extension-gates.md](architecture/extension-gates.md) | Extension RPC/HTTP and third-party MCP boundaries; Odoo Live Chat and voice entry-point inventory | Current (v1.80.0) |
+| [architecture/extension-gates.md](architecture/extension-gates.md) | Extension RPC/HTTP and third-party MCP boundaries; pilot entry-point inventory and unwired ModuleLease core spike | Current (v1.81.0 spike) |
 | [architecture/evolution-engine.md](architecture/evolution-engine.md) | Evolution Engine — Prediction + AEE/Playbook (the only evolution path; the legacy SOUL.md rewrite path was removed) + Cognitive Memory | Current |
 
 ## Design Proposals (RFC / ADR)

@@ -68,6 +68,13 @@ impl MethodHandler {
                     value["email_available"]=json!(reason.is_none());
                     value["email_unavailable_reason"]=json!(reason);
                     value["email_hint"]=json!(reason.map(|_|crate::mfa_email::UNAVAILABLE));
+                    // Admin-only: the SAS the owner compares in the license console.
+                    // A public-key digest, never key material; not sent to login screens.
+                    if user.role==UserRole::Admin && matches!(reason,Some("relay_key_unbound"|"relay_key_mismatch")) {
+                        if let Some(sas)=crate::installation_identity::fingerprint(&home) {
+                            value["relay_key_fingerprint"]=json!(sas);
+                        }
+                    }
                     Ok(value)
                 },
                 "mfa.email_begin"=> {

@@ -914,7 +914,7 @@ impl MethodHandler {
         // them); speech-to-text lives in `config.toml [voice] stt_*`.
         let config_toml_changes = changes.len();
         if let Some(voice) = params.get("voice").and_then(|v| v.as_object()) {
-            const VALID_TTS: &[&str] = &["auto", "kokoro", "azure", "minimax", "openai-tts", "openai", "piper", "command", "off", "none", "disabled", "edge-tts", "edge"];
+            const VALID_TTS: &[&str] = &["auto", "kokoro", "azure", "minimax", "openai-tts", "openai", "piper", "command", "off", "none", "disabled"];
 
             let inference_path = self.home_dir.join("inference.toml");
             let mut inf_table = self.read_config_table(&inference_path).await;

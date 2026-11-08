@@ -72,7 +72,7 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 #[cfg(test)]
 mod tests_security;
 

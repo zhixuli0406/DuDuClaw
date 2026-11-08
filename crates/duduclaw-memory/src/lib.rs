@@ -1,3 +1,4 @@
+pub mod module_lease;
 pub mod bench;
 pub mod code_map;
 pub mod causal;

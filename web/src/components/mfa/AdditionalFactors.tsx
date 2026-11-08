@@ -60,7 +60,7 @@ export function AdditionalFactors({ status, onChange }: { status: MfaStatus; onC
     <label className="block space-y-2">{t('mfa.factorPassword')}<Input type="password" autoComplete="current-password" maxLength={4096} value={password} onChange={e => setPassword(e.target.value)} /></label>
     <div className="space-y-3">
       <h4>{t('mfa.factor.email')}</h4>
-      {!status.email_available && <DisabledFactorExplanation factor="email" reason={status.email_unavailable_reason} />}
+      {!status.email_available && <DisabledFactorExplanation factor="email" reason={status.email_unavailable_reason} fingerprint={status.relay_key_fingerprint} />}
       {status.factors?.email ? <Button variant="outline" disabled={busy || !password || removeDisabled} onClick={() => void run(async () => replace(await mfaApi.emailRemove(password)))}>{t('mfa.email.remove')}</Button> : <>
         <p className="text-sm">{t('mfa.email.enrollHint')}</p>
         {enrollment && <label className="block space-y-2">{t('mfa.factor.email')}<Input autoComplete="one-time-code" inputMode="numeric" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} /></label>}

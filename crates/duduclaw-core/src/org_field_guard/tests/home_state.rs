@@ -55,6 +55,10 @@ const PROTECTED_HOME_PATHS: &[&str] = &[
     ".org-seeded",
     "preset_bindings.toml",
     "license.json",
+    // MFA relay installation signing key and relay credential (private state/)
+    "state/installation.key",
+    "state/installation.lock",
+    "state/mfa-relay.json",
     "jwt_secret",
     ".keyfile",
     "inference.toml",
