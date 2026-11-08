@@ -194,6 +194,12 @@ impl OdooConnectorPool {
         self.resolver.read().await.global().feature_allows_model(model)
     }
 
+    /// Clone of the global `[odoo]` block the gates use (after
+    /// [`Self::load_global_for_gate`]).
+    pub async fn global_config(&self) -> OdooConfig {
+        self.resolver.read().await.global().clone()
+    }
+
     /// An absent unblock list inherits global settings; an explicit empty list unblocks nothing.
     pub async fn unblock_models(&self, agent_id: &str) -> Vec<String> {
         let resolver = self.resolver.read().await;

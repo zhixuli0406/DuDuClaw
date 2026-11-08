@@ -299,7 +299,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "values",
-                description: "Field values object, max 64 KiB. x2many lists may use commands 0, 1, 4, 6 only",
+                description: "Field values object, max 64 KiB. x2many fields take command lists [0,0,{..}] / [1,id,{..}] / [4,id] only (no 2/3/5/6, false or plain id lists); active cannot be set false",
                 required: true,
             },
         ],
@@ -320,7 +320,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "values",
-                description: "Field values object, max 64 KiB. x2many lists may use commands 0, 1, 4, 6 only",
+                description: "Field values object, max 64 KiB. x2many fields take command lists [0,0,{..}] / [1,id,{..}] / [4,id] only (no 2/3/5/6, false or plain id lists); active cannot be set false",
                 required: true,
             },
         ],

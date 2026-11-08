@@ -430,10 +430,12 @@ pub(crate) async fn visible_tools_in_lane(
     let allow_responsibilities = gated_caller
         && !member_invalid
         && duduclaw_gateway::responsibility::ResponsibilityConfig::from_home(home_dir).enabled;
-    // RM-120: generic `odoo_create` / `odoo_write` need an explicit grant in
-    // the employee's own Odoo settings. The Odoo handler acts for
-    // `default_agent`, so the same agent and the same predicate
-    // (`generic_write_grant` over `allowed_models`) decide the listing.
+    // RM-120: generic `odoo_create` / `odoo_write` need an explicit grant and
+    // the separate per-table opt-in in the employee's own Odoo settings, and
+    // the table must clear the never-writable list, the 功能模組 switch and
+    // the block list. The Odoo handler acts for `default_agent`, so the same
+    // agent and the same predicate (`generic_write_model_gate` over
+    // `allowed_models`) decide the listing.
     let allow_odoo_create =
         !member_invalid && super::generic_write_listed(home_dir, default_agent, "odoo_create");
     let allow_odoo_write =
