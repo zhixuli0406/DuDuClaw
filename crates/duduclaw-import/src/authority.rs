@@ -413,5 +413,10 @@ fn check_sqlite(conn:&rusqlite::Connection)->Result<()> {
     let version:u32=conn.query_row("PRAGMA user_version",[],|r|r.get(0))?;
     if version!=0 {return Err(Error::Schema);}
     let check:String=conn.query_row("PRAGMA quick_check",[],|r|r.get(0))?;
-    if check!="ok" {return Err(Error::Content);}Ok(())
+    if check!="ok" {
+        // Test builds only: the first quick_check finding behind `Content`.
+        #[cfg(test)] eprintln!("legacy quick_check: {check}");
+        return Err(Error::Content);
+    }
+    Ok(())
 }

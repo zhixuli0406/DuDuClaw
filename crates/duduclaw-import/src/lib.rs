@@ -43,7 +43,13 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 impl From<std::io::Error> for Error { fn from(_: std::io::Error) -> Self { Self::Io } }
-impl From<rusqlite::Error> for Error { fn from(_: rusqlite::Error) -> Self { Self::Content } }
+impl From<rusqlite::Error> for Error {
+    fn from(_error: rusqlite::Error) -> Self {
+        // Test builds only: name the SQLite cause that `Content` otherwise hides.
+        #[cfg(test)] eprintln!("legacy sqlite error: {_error}");
+        Self::Content
+    }
+}
 
 impl ImportRequest {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
