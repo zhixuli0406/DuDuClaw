@@ -2,6 +2,29 @@
 //! the fallback/requester boundary. Generic agent updates stay narrower;
 //! this dedicated flow records self-consent separately.
 use duduclaw_core::google_identity::{AgentGoogleSection, Fallback, Selector};
+use std::path::Path;
+
+/// v1.81 C4: an owner who is suspended or offboarded can no longer back any
+/// Personal route. Revoke EVERY Personal catalog route of that owner (all
+/// providers, final, no relink hint; pending hints are cancelled) BEFORE the
+/// owner's credential material is removed by `remove`. A restored owner needs
+/// a new Admin provision. A fence failure refuses without calling `remove`.
+///
+/// Reassigning an agent's owner needs no route change here: catalog routes
+/// are keyed by the person (`Personal(owner)`), not by the employee, and a
+/// Personal employee's binding is fixed (handover = tombstone, A2/A4).
+pub(crate) fn revoke_owner_routes_then<T>(
+    home: &Path,
+    owner: &str,
+    remove: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let Some(target) = crate::isolation_connector_events::Target::personal_all(owner) else {
+        return remove();
+    };
+    use crate::isolation_connector_events::{Hint, revoke_then};
+    revoke_then(home, &target, Hint::Cancel, "owner_offboarded", remove)
+        .map_err(super::lifecycle::event_message)
+}
 
 pub fn validate(
     before: &AgentGoogleSection,

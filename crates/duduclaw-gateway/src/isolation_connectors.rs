@@ -3,11 +3,15 @@ use std::{future::Future, path::Path, pin::Pin, sync::{Arc, Mutex}};
 use duduclaw_isolation::{bounded::Text, capability::{EmployeeBinding, ResourceGrant}};
 use duduclaw_mcp_boundary::{bindings::BindingAuthority, tool_policy::AuthorizedToolCall,
     RequestContext, VerificationError};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 #[cfg(test)]
 use duduclaw_mcp_boundary::bindings::BindingStore;
 use crate::isolation_connector_details::{AccountDetailRecord, DETAILS_SCHEMA, DETAILS_TABLE_NAME};
+// v1.81 C4: scoped transitions + relink hints for product credential events.
+#[path = "isolation_connector_relink.rs"]
+mod relink;
+pub(crate) use relink::{RELINK_PROVIDERS, RelinkSubject, RouteScope};
 
 /// Production catalog file. It lives directly in the gateway home, beside the
 /// other isolation stores (`isolation-forks.db`, `isolation-execution-jobs.db`,
@@ -235,6 +239,10 @@ impl ConnectorCatalog {
         if !present(DETAILS_TABLE_NAME)? {
             for (_, _, sql) in DETAILS_SCHEMA { tx.execute_batch(sql).map_err(unavailable)?; }
         }
+        // v1.81 C4: likewise for the relink-hint table.
+        if !present(relink::RELINK_TABLE_NAME)? {
+            for (_, _, sql) in relink::RELINK_SCHEMA { tx.execute_batch(sql).map_err(unavailable)?; }
+        }
         verify_schema(&tx)?;
         tx.commit().map_err(unavailable)?;
         Ok(Self { connection: Mutex::new(connection) })
@@ -277,37 +285,27 @@ impl ConnectorCatalog {
         let now = now_seconds()?;
         let mut connection = self.lock()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
-        let (count, generation): (i64, i64) = tx.query_row(
-            "SELECT count(*), coalesce(max(generation),0) FROM isolation_connector_routes", [],
-            |row| Ok((row.get(0)?, row.get(1)?))).map_err(unavailable)?;
-        if count >= MAX_ROUTES { return Err(CatalogError::Unavailable); }
-        let generation = generation.checked_add(1).ok_or(CatalogError::Unavailable)?;
-        let attempts = if fixed.is_some() { 1 } else { 4 };
-        for _ in 0..attempts {
-            let account = match &fixed { Some(account) => account.clone(), None => AccountId::generate()? };
-            let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM isolation_connector_routes WHERE account=?1)",
-                [account.as_str()], |row| row.get(0)).map_err(unavailable)?;
-            if exists {
-                if fixed.is_some() { return Err(CatalogError::Invalid); }
-                continue;
+        let (account, generation) = match fixed {
+            Some(account) => {
+                let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM isolation_connector_routes WHERE account=?1)",
+                    [account.as_str()], |row| row.get(0)).map_err(unavailable)?;
+                if exists { return Err(CatalogError::Invalid); }
+                insert_route_as(&tx, &account, label, provider, kind, &binding_id, now).map(|generation| (account, generation))?
             }
-            tx.execute("INSERT INTO isolation_connector_routes
-                (account,label,provider,kind,binding_id,generation,active,created_at,revoked_at)
-                VALUES (?1,?2,?3,?4,?5,?6,1,?7,NULL)",
-                params![account.as_str(), label, provider, kind.as_str(), binding_id, generation, now])
-                .map_err(unavailable)?;
-            if let Some(details) = details {
-                crate::isolation_connector_details::insert_row(&tx, &account, generation, &binding_id, provider, details, now)?;
-            }
-            tx.commit().map_err(unavailable)?;
-            return Ok(account);
+            None => insert_route(&tx, label, provider, kind, &binding_id, now)?,
+        };
+        if let Some(details) = details {
+            crate::isolation_connector_details::insert_row(&tx, &account, generation, &binding_id, provider, details, now)?;
         }
-        Err(CatalogError::Unavailable)
+        tx.commit().map_err(unavailable)?;
+        Ok(account)
     }
 
     /// Deactivate a route (final) and move its generation, so every pinned
     /// selection refuses at its next checkpoint. Revoking an already revoked
-    /// route succeeds without change; an unknown id is `NotFound`.
+    /// route succeeds without changing the route (it only cancels a pending
+    /// C4 relink hint, so the owner's reconnect cannot recreate it); an
+    /// unknown id is `NotFound`.
     pub fn revoke(&self, account: &AccountId) -> Result<(), CatalogError> {
         self.transition(account, true).map(|_| ())
     }
@@ -329,7 +327,13 @@ impl ConnectorCatalog {
             [account.as_str()], |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(unavailable)?;
         match state {
             None => return Err(CatalogError::NotFound),
-            Some((0, generation)) if revoke => return u64::try_from(generation).map_err(|_| CatalogError::Unavailable),
+            Some((0, generation)) if revoke => {
+                // C4: an explicit revoke of an already revoked id still
+                // cancels its pending relink hint (admin intent wins).
+                relink::cancel(&tx, account)?;
+                tx.commit().map_err(unavailable)?;
+                return u64::try_from(generation).map_err(|_| CatalogError::Unavailable);
+            }
             Some((0, _)) => return Err(CatalogError::Revoked),
             Some((1, _)) => {}
             Some(_) => return Err(CatalogError::Unavailable),
@@ -450,6 +454,36 @@ impl ConnectorCatalog {
     }
 }
 
+/// Insert one new active route under a freshly minted id, inside the
+/// caller's write transaction (registration and C4 relink). Returns the id
+/// and its generation (above every existing one).
+fn insert_route(tx: &Transaction<'_>, label: &str, provider: &'static str, kind: ConnectorKind, binding_id: &str,
+    now: i64) -> Result<(AccountId, i64), CatalogError> {
+    for _ in 0..4 {
+        let account = AccountId::generate()?;
+        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM isolation_connector_routes WHERE account=?1)",
+            [account.as_str()], |row| row.get(0)).map_err(|_| CatalogError::Unavailable)?;
+        if exists { continue; }
+        return insert_route_as(tx, &account, label, provider, kind, binding_id, now).map(|generation| (account, generation));
+    }
+    Err(CatalogError::Unavailable)
+}
+fn insert_route_as(tx: &Transaction<'_>, account: &AccountId, label: &str, provider: &'static str, kind: ConnectorKind,
+    binding_id: &str, now: i64) -> Result<i64, CatalogError> {
+    let unavailable = |_| CatalogError::Unavailable;
+    let (count, generation): (i64, i64) = tx.query_row(
+        "SELECT count(*), coalesce(max(generation),0) FROM isolation_connector_routes", [],
+        |row| Ok((row.get(0)?, row.get(1)?))).map_err(unavailable)?;
+    if count >= MAX_ROUTES { return Err(CatalogError::Unavailable); }
+    let generation = generation.checked_add(1).ok_or(CatalogError::Unavailable)?;
+    tx.execute("INSERT INTO isolation_connector_routes
+        (account,label,provider,kind,binding_id,generation,active,created_at,revoked_at)
+        VALUES (?1,?2,?3,?4,?5,?6,1,?7,NULL)",
+        params![account.as_str(), label, provider, kind.as_str(), binding_id, generation, now])
+        .map_err(unavailable)?;
+    Ok(generation)
+}
+
 type RawRoute = (String, String, String, String, String, i64, i64);
 fn raw_route(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRoute> {
     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
@@ -480,7 +514,8 @@ fn now_seconds() -> Result<i64, CatalogError> {
 /// normalizes it in `sqlite_master.sql`.
 fn verify_schema(connection: &Connection) -> Result<(), CatalogError> {
     verify_table(connection, "isolation_connector_routes", &SCHEMA)?;
-    verify_table(connection, DETAILS_TABLE_NAME, &DETAILS_SCHEMA)
+    verify_table(connection, DETAILS_TABLE_NAME, &DETAILS_SCHEMA)?;
+    verify_table(connection, relink::RELINK_TABLE_NAME, &relink::RELINK_SCHEMA)
 }
 fn verify_table(connection: &Connection, table: &str, schema: &[(&str, &str, &str)]) -> Result<(), CatalogError> {
     let unavailable = |_| CatalogError::Unavailable;

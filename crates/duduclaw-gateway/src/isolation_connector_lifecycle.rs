@@ -80,6 +80,12 @@ pub fn install_credential_material(material: Arc<dyn CredentialMaterial>) -> Res
     MATERIAL.set(material).map_err(|_| CatalogError::Unavailable)
 }
 
+/// The process vault installed by boot, if any. C4 credential events drop
+/// in-process material through it after their catalog fence.
+pub(crate) fn installed_material() -> Option<&'static dyn CredentialMaterial> {
+    MATERIAL.get().map(|material| material.as_ref())
+}
+
 /// Register one route for an account the admin provisioned. `label` is a
 /// display hint only; the id is always newly minted (a relink never reuses
 /// one). `kind` must agree with `binding`. No credential store is consulted

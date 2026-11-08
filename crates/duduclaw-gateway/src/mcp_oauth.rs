@@ -11,6 +11,9 @@ use tracing::info;
 
 #[cfg(test)]
 pub(crate) mod google_home_test_fixture;
+/// v1.81 C4: refresh redirect + strict client-config read.
+#[cfg(test)]
+mod c4_tests;
 #[path = "mcp_oauth/home_lifecycle.rs"]
 pub(crate) mod home_lifecycle;
 #[path = "mcp_oauth/home_store.rs"]
@@ -237,6 +240,12 @@ pub(crate) async fn complete_callback_query(
             if !actor_is_live_admin(google.consent_actor()) {
                 return Err(CallbackFailure::Unknown);
             }
+            // v1.81 C4: fence SharedHome google routes before the new home
+            // material is published; settle/relink after it is.
+            let rotation = begin_home_rotation(home, "google").map_err(|_| {
+                let _ = record_google_callback(home, Some("other"));
+                CallbackFailure::Google("other")
+            })?;
             home_lifecycle::complete_google_home_authorization_with_admin_check(
                 home,
                 google,
@@ -249,6 +258,9 @@ pub(crate) async fn complete_callback_query(
                 let _ = record_google_callback(home, Some("other"));
                 CallbackFailure::Google("other")
             })?;
+            if let Some(rotation) = rotation {
+                let _ = rotation.finish(home);
+            }
             record_google_callback(home, None).map_err(|_| CallbackFailure::Unknown)?;
             Ok("google".into())
         }
@@ -588,7 +600,54 @@ pub async fn exchange_and_store(
     require_generic_non_google(config)?;
     let _lease = crate::google_personal::grants::acquire(home).await?;
     let token = exchange_code(config, code, verifier).await?;
-    upsert_token(home, token)
+    let provider = config.provider_id.clone();
+    publish_home_credential(home, &provider, || upsert_token(home, token))
+}
+
+// ── v1.81 C4: home OAuth events → isolated connector catalog ──────────
+//
+// Notion/GitHub/Google home OAuth credentials back the SharedHome catalog
+// routes of that provider. Disconnect fences (revokes) those routes BEFORE
+// the stored token is removed; connect advances them before AND after the
+// new token is published and recreates routes revoked by an earlier home
+// disconnect under NEW ids. Other providers have no catalog routes.
+
+const HOME_CATALOG_REFUSED: &str =
+    "Isolated connector routes could not be updated; the home OAuth connection was not changed.";
+
+fn home_event_message(failure: crate::isolation_connector_events::EventFailure<String>) -> String {
+    match failure {
+        crate::isolation_connector_events::EventFailure::Catalog(_) => HOME_CATALOG_REFUSED.into(),
+        crate::isolation_connector_events::EventFailure::Product(error) => error,
+    }
+}
+
+/// Fence the provider's SharedHome routes around a home token publication.
+pub(crate) fn publish_home_credential<T>(
+    home: &Path,
+    provider: &str,
+    publish: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    use crate::isolation_connector_events::{Reconnect, Target, rotate};
+    let Some(target) = Target::home(provider) else {
+        return publish();
+    };
+    let subject = crate::isolation_connectors::RelinkSubject::home(provider)
+        .map_err(|_| HOME_CATALOG_REFUSED.to_string())?;
+    rotate(home, target, Reconnect::Same(subject), "home_oauth_connect", publish).map_err(home_event_message)
+}
+
+/// Step 1 of the Google home connect, which publishes asynchronously.
+fn begin_home_rotation(
+    home: &Path,
+    provider: &str,
+) -> Result<Option<crate::isolation_connector_events::Rotation>, crate::isolation_connectors::CatalogError> {
+    use crate::isolation_connector_events::{Reconnect, Target, begin_rotation};
+    let Some(target) = Target::home(provider) else {
+        return Ok(None);
+    };
+    let subject = crate::isolation_connectors::RelinkSubject::home(provider)?;
+    begin_rotation(home, target, Reconnect::Same(subject), "home_oauth_connect").map(Some)
 }
 
 /// Generic provider transport; Google must consume its bound Home flow.
@@ -664,13 +723,23 @@ pub async fn exchange_code(
     })
 }
 
+/// v1.81 (D2 follow-up, done in C4): the refresh request carries the
+/// refresh token and client secret in its body. A redirect from the token
+/// endpoint is never followed (a 3xx is a failed refresh), so the grant can
+/// never be replayed to another host or downgraded scheme.
+fn refresh_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 /// Refresh an expired token using a refresh_token grant.
 pub async fn refresh_token(
     config: &McpOAuthConfig,
     refresh_tok: &str,
 ) -> Result<McpOAuthToken, String> {
     require_generic_non_google(config).map_err(|_| home_store::Error::PendingWiring.to_string())?;
-    let client = reqwest::Client::new();
+    let client = refresh_client().map_err(|_| "Refresh request failed: client unavailable".to_string())?;
     let params = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_tok),
@@ -687,6 +756,10 @@ pub async fn refresh_token(
         .map_err(|e| format!("Refresh request failed: {e}"))?;
 
     let status = resp.status();
+    if status.is_redirection() {
+        // Never followed and never parsed: a redirecting token endpoint is a failure.
+        return Err(format!("Token refresh failed ({status}): redirect refused"));
+    }
     let body: serde_json::Value = resp
         .json()
         .await
@@ -884,8 +957,30 @@ pub fn mask_secret_tail(secret: &str) -> String {
 }
 
 /// Remove a token for a specific provider.
+///
+/// v1.81 C4: for google/notion/github the provider's SharedHome catalog
+/// routes are revoked (final; relinkable by a later home connect) BEFORE the
+/// token is removed, and again after. A catalog fence failure refuses the
+/// removal and leaves the token in place; repeating it is safe.
 pub fn remove_token(home_dir: &Path, provider_id: &str) -> Result<(), String> {
-    home_store::remove_public(home_dir, provider_id).map_err(|e| e.to_string())
+    remove_home_credential(home_dir, provider_id, || {
+        home_store::remove_public(home_dir, provider_id).map_err(|e| e.to_string())
+    })
+}
+
+/// Fence the provider's SharedHome routes around a home token removal.
+pub(crate) fn remove_home_credential(
+    home: &Path,
+    provider: &str,
+    remove: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(target) = crate::isolation_connector_events::Target::home(provider) else {
+        return remove();
+    };
+    use crate::isolation_connector_events::{Hint, revoke_then};
+    let subject = crate::isolation_connectors::RelinkSubject::home(provider).ok();
+    let hint = subject.as_ref().map_or(Hint::Cancel, Hint::Record);
+    revoke_then(home, &target, hint, "home_oauth_disconnect", remove).map_err(home_event_message)
 }
 
 /// Upsert a token: replace existing for same provider_id, or append.
@@ -929,12 +1024,22 @@ pub struct McpOAuthClientConfig {
 pub fn load_client_configs(home_dir: &Path) -> Vec<McpOAuthClientConfig> {
     home_clients::load(home_dir, None).unwrap_or_default()
 }
+/// Strict read (v1.81 D2 follow-up, C4): `Ok(None)` only when no client
+/// config is stored for `provider_id`; every read failure (unreadable or
+/// invalid file, duplicate rows, undecodable secret, gated Google row, file
+/// changed during the read) is `Err`. Callers for which ABSENCE permits
+/// something (e.g. "no config ⇒ no refresh can be attempted") must use this
+/// and fail closed on `Err`.
+pub fn read_client_config(home_dir: &Path, provider_id: &str) -> Result<Option<McpOAuthClientConfig>, String> {
+    home_clients::load_one(home_dir, provider_id)
+        .map_err(|_| "OAuth client configuration could not be read.".to_string())
+}
 /// Select and capture one provider before decrypting only its secret.
+/// `None` means "not usable": absent OR unreadable (see
+/// [`read_client_config`]). Every caller of this form must treat `None` as
+/// a refusal, never as permission.
 pub fn get_client_config(home_dir: &Path, provider_id: &str) -> Option<McpOAuthClientConfig> {
-    home_clients::load(home_dir, Some(provider_id))
-        .ok()?
-        .into_iter()
-        .next()
+    read_client_config(home_dir, provider_id).ok().flatten()
 }
 /// Target-only raw-preserving update; Google uses the common source fence.
 pub fn upsert_client_config(home_dir: &Path, config: McpOAuthClientConfig) -> Result<(), String> {
