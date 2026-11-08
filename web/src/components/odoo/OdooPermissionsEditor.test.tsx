@@ -158,7 +158,7 @@ describe('Odoo permissions editor', () => {
     await user.click(screen.getByRole('button', { name: 'Scan tables' }));
     expect(await screen.findByRole('checkbox', { name: 'Leads (crm.lead)' })).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'x_old.table' })).toBeChecked();
-    expect(mockWsClient.call).toHaveBeenCalledWith('odoo.schema_scan', {}, false, 300000);
+    expect(mockWsClient.call).toHaveBeenCalledWith('odoo.schema_scan', {}, false, 3600000);
   });
 });
 
