@@ -19,7 +19,7 @@
 //!
 //! ## Classifier
 //!
-//! Deterministic, zh-TW + English keyword/phrase lists per category, matched
+//! Deterministic, zh-TW + zh-CN + English keyword/phrase lists per category, matched
 //! on each of a fact's `content` / `subject` / `predicate` / `object`
 //! separately with [`duduclaw_core::word_contains_ci`] (never an unanchored
 //! substring test). ASCII keywords therefore only match whole words
@@ -47,10 +47,16 @@
 //! ## Forgotten facts are not re-learned
 //!
 //! `me.memory.forget` records a one-way key (SHA-256 of the normalised
-//! subject / predicate / object) in `<home>/memory_privacy_forgotten.jsonl`.
-//! The gate refuses an automatic write whose triple produces the same key, so
-//! the next conversation cannot quietly put a fact the staff member deleted
-//! back. The file holds digests only — never the forgotten text. (The
+//! subject / predicate / object) in `<home>/memory_privacy_forgotten.jsonl`
+//! — one key for **each** of the person's subjects (dashboard id, WebChat,
+//! every verified channel identity), so the same fact arriving through another
+//! of their identities is refused too. The gate refuses an automatic write
+//! whose triple produces a recorded key, so the next conversation cannot
+//! quietly put a fact the staff member deleted back; a quarantine approval
+//! runs the same check before it activates a pending row. Keys are never
+//! evicted (an evicted key would re-enable re-learning); only distinct keys
+//! are appended, so the file grows by ~100 bytes per identity per deleted
+//! fact. The file holds digests only — never the forgotten text. (The
 //! engine's source tombstones are per conversation turn and would also delete
 //! unrelated facts from the same turn, so they are not used here.)
 //!
@@ -82,53 +88,82 @@ const MAX_CATEGORY_NAME_LEN: usize = 32;
 //
 // Kept deliberately focused: every entry is a phrase that, in an employee's
 // chat with an AI colleague, almost always means the personal topic. Broad
-// words with a common business sense ("hospital" — a hospital client, 醫院,
-// 收入 — revenue, "bonus" — bonus points, "separated" — comma-separated) are
-// left out on purpose.
+// words with a common business sense are left out on purpose, or narrowed to
+// a personal phrase:
+//
+// - "hospital" (a hospital client) → only "in hospital"; 醫院 not at all;
+// - 收入 (revenue), "bonus" (bonus points), 獎金 (業績獎金制度) → only
+//   年終獎金 / "annual bonus"; "separated" (comma-separated) not at all;
+// - "debt" (technical debt) → "my debt", "credit card debt", "in debt";
+//   "savings" (cost savings) → "my savings"; 理財 (理財商品) not at all;
+// - 診斷 (系統診斷) / "diagnosis" (diagnosis of the outage) → 診斷出 / 確診 /
+//   "diagnosed with"; 藥物 (藥局 inventory) / 手術 (手術室排程 for a
+//   hospital client) → 服用藥物 / 動手術 …; 孩子 (托幼 forms) / 結婚
+//   (婚紗 quotes) → 我的孩子 / 要結婚 …; "wage" (minimum wage policy) →
+//   "my wage", "hourly wage".
+//
+// Simplified-Chinese equivalents are listed where the characters differ.
 
 const HEALTH: &[&str] = &[
     // zh-TW
-    "生病", "病情", "病歷", "病假", "看醫生", "看病", "就醫", "回診", "診斷", "確診",
-    "住院", "出院", "開刀", "手術", "吃藥", "服藥", "用藥", "藥物", "處方", "懷孕",
-    "孕期", "產檢", "流產", "癌症", "腫瘤", "化療", "憂鬱症", "焦慮症", "精神科",
-    "身心科", "心理諮商", "慢性病", "糖尿病", "高血壓", "身心障礙", "健康檢查", "體檢",
+    "生病", "病情", "病歷", "病假", "看醫生", "看病", "就醫", "回診", "診斷出", "確診",
+    "住院", "出院", "開刀", "動手術", "做手術", "開完刀", "吃藥", "服藥", "用藥",
+    "服用藥物", "藥物過敏", "處方", "懷孕", "孕期", "產檢", "流產", "癌症", "腫瘤",
+    "化療", "憂鬱症", "焦慮症", "精神科", "身心科", "心理諮商", "慢性病", "糖尿病",
+    "高血壓", "身心障礙", "健康檢查", "體檢", "感冒", "發燒",
+    // zh-CN
+    "病历", "看医生", "就医", "诊断出", "确诊", "动手术", "做手术", "吃药", "服药",
+    "怀孕", "孕检", "产检", "流产", "肿瘤", "化疗", "抑郁症", "焦虑症", "心理咨询",
+    "身心障碍", "健康检查", "体检", "发烧",
     // English
-    "diagnosis", "diagnosed", "illness", "sick leave", "medication", "medications",
-    "prescription", "hospitalized", "hospitalised", "surgery", "pregnant", "pregnancy",
-    "miscarriage", "cancer", "chemotherapy", "depression", "anxiety disorder",
-    "mental health", "medical condition", "medical history", "medical record",
-    "medical records", "chronic illness", "diabetes", "disability", "therapist",
-    "see a doctor", "saw a doctor", "doctor's appointment",
+    "diagnosed with", "was diagnosed", "illness", "sick", "sick leave", "medication",
+    "medications", "prescription", "hospitalized", "hospitalised", "in hospital",
+    "in the hospital", "surgery", "pregnant", "pregnancy", "miscarriage", "cancer",
+    "chemotherapy", "depression", "anxiety disorder", "mental health",
+    "medical condition", "medical history", "medical record", "medical records",
+    "chronic illness", "diabetes", "disability", "therapist", "see a doctor",
+    "saw a doctor", "doctor's appointment", "fever",
 ];
 
 const FAMILY: &[&str] = &[
     // zh-TW
-    "離婚", "分居", "婚姻", "外遇", "結婚", "小孩", "孩子", "兒子", "女兒", "老公",
-    "老婆", "丈夫", "妻子", "家人生病", "家暴", "爸媽", "父母", "監護權", "贍養費",
-    "喪禮", "過世",
+    "離婚", "分居", "婚姻", "外遇", "要結婚", "結婚了", "剛結婚", "已婚", "小孩",
+    "我的孩子", "他的孩子", "她的孩子", "我孩子", "兒子", "女兒", "老公", "老婆",
+    "丈夫", "妻子", "太太", "男友", "女友", "男朋友", "女朋友", "媽媽", "爸爸", "我媽",
+    "我爸", "家人生病", "家暴", "爸媽", "父母", "監護權", "贍養費", "喪禮", "過世",
+    // zh-CN
+    "离婚", "婚外情", "儿子", "女儿", "妈妈", "我妈", "爸妈", "监护权",
+    "赡养费", "丧礼", "过世",
     // English
     "divorce", "divorced", "marriage", "married", "wife", "husband", "spouse",
-    "my kids", "my children", "my son", "my daughter", "my parents", "custody",
-    "domestic violence", "family member", "funeral", "passed away",
+    "mom", "dad", "kids", "son", "daughter", "my kids", "my children", "my son",
+    "my daughter", "my parents", "custody", "domestic violence", "family member",
+    "funeral", "passed away",
 ];
 
 const PERSONAL_FINANCE: &[&str] = &[
     // zh-TW
     "負債", "欠債", "債務", "貸款", "房貸", "車貸", "信貸", "卡債", "存款", "積蓄",
-    "投資虧損", "賠錢", "破產", "信用評分", "個人財務", "理財",
+    "投資虧損", "賠錢", "破產", "信用評分", "個人財務",
+    // zh-CN
+    "负债", "债务", "贷款", "房贷", "车贷", "信贷", "卡债", "积蓄", "投资亏损", "赔钱",
+    "破产", "个人财务",
     // English
-    "debt", "debts", "loan", "loans", "mortgage", "savings", "bankrupt", "bankruptcy",
+    "my debt", "my debts", "in debt", "personal debt", "credit card debt", "loan",
+    "loans", "mortgage", "my savings", "life savings", "bankrupt", "bankruptcy",
     "credit score", "personal finance", "personal finances", "net worth",
-    "investment loss", "investment losses", "credit card debt",
+    "investment loss", "investment losses",
 ];
 
 const SALARY: &[&str] = &[
     // zh-TW
     "薪水", "薪資", "月薪", "年薪", "時薪", "底薪", "加薪", "減薪", "調薪", "年終獎金",
-    "薪酬", "獎金",
+    "薪酬",
+    // zh-CN
+    "薪资", "工资", "减薪", "调薪", "年终奖", "年终奖金",
     // English
-    "salary", "salaries", "wage", "wages", "paycheck", "payslip", "pay slip",
-    "pay raise", "pay rise", "pay cut", "annual bonus", "year-end bonus",
+    "salary", "salaries", "my wage", "hourly wage", "wages", "paycheck", "payslip",
+    "pay slip", "pay raise", "pay rise", "pay cut", "annual bonus", "year-end bonus",
     "compensation package",
 ];
 
@@ -575,8 +610,12 @@ pub mod forgotten {
     /// the conversation distiller applies to stored triple parts, so a long
     /// candidate and its stored (capped) form produce the same key.
     pub const PART_CHARS: usize = 120;
-    /// Oldest keys beyond this are ignored on load (bounded memory).
-    pub const MAX_KEYS: usize = 20_000;
+    // No eviction, on purpose: a key that dropped out would quietly let the
+    // forgotten fact be re-learned. The file only grows by *distinct* keys
+    // (`record_all` skips keys already present) — one ~100-byte line per
+    // subject identity of the person per deleted fact — so even 100 000
+    // deletions stay around 10 MB. Deleting the file (operator action) is
+    // the only way to lift the guard.
 
     #[derive(Serialize, Deserialize)]
     struct Line {
@@ -605,24 +644,56 @@ pub mod forgotten {
         hex::encode(h.finalize())
     }
 
-    /// Append one key. Best-effort for the caller, but the error is returned
-    /// so the RPC can report it.
+    /// Append one key (see [`record_all`]).
     pub fn record(home: &Path, key: &str) -> std::io::Result<()> {
+        record_all(home, &[key.to_string()])
+    }
+
+    /// Append every key not already recorded, in one write. The error is
+    /// returned so the RPC can refuse the delete rather than lose the guard.
+    pub fn record_all(home: &Path, keys: &[String]) -> std::io::Result<()> {
         use std::io::Write;
-        let line = serde_json::to_string(&Line {
-            key: key.to_string(),
-            at: chrono::Utc::now().to_rfc3339(),
-        })
-        .map_err(std::io::Error::other)?;
+        let existing = match std::fs::read_to_string(path(home)) {
+            Ok(t) => parse(&t),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+            Err(e) => return Err(e),
+        };
+        let at = chrono::Utc::now().to_rfc3339();
+        let mut buf = String::new();
+        let mut seen = HashSet::new();
+        for key in keys {
+            if existing.contains(key) || !seen.insert(key.as_str()) {
+                continue;
+            }
+            let line = serde_json::to_string(&Line {
+                key: key.clone(),
+                at: at.clone(),
+            })
+            .map_err(std::io::Error::other)?;
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path(home))?;
-        writeln!(f, "{line}")
+        f.write_all(buf.as_bytes())?;
+        f.flush()
     }
 
-    /// Every recorded key (newest [`MAX_KEYS`]). Missing file ⇒ empty; an
-    /// unreadable file is logged and treated as empty.
+    fn parse(text: &str) -> HashSet<String> {
+        text.lines()
+            .filter_map(|l| serde_json::from_str::<Line>(l).ok())
+            .map(|l| l.key)
+            .filter(|k| k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    }
+
+    /// Every recorded key (no eviction). Missing file ⇒ empty; an unreadable
+    /// file is logged and treated as empty.
     pub fn load(home: &Path) -> HashSet<String> {
         let text = match std::fs::read_to_string(path(home)) {
             Ok(t) => t,
@@ -632,14 +703,7 @@ pub mod forgotten {
                 return HashSet::new();
             }
         };
-        let keys: Vec<String> = text
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Line>(l).ok())
-            .map(|l| l.key)
-            .filter(|k| k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit()))
-            .collect();
-        let skip = keys.len().saturating_sub(MAX_KEYS);
-        keys.into_iter().skip(skip).collect()
+        parse(&text)
     }
 }
 
@@ -647,11 +711,42 @@ pub mod forgotten {
 // Self subjects (for `me.memory.*`)
 // ---------------------------------------------------------------------------
 
+/// Whether `cuid` is a user id of `channel` whose shape is globally unique on
+/// its own, so the bare `user:<cuid>` subject the channel reply pipeline
+/// records cannot denote a different person on another channel:
+///
+/// - LINE: `U` + 32 hex digits;
+/// - Discord: a snowflake of 17–20 digits (every Discord user id since 2015;
+///   longer than any Telegram id, which stays below 2^52 ≈ 16 digits).
+///
+/// Telegram, WeCom, DingTalk, Slack, Feishu … ids are short numbers or
+/// tenant-scoped names (`998`, `zhangsan`) that can be someone else's id on
+/// another channel or tenant — for those only the channel-prefixed subject is
+/// the caller's.
+pub fn channel_id_is_globally_unique(channel: &str, cuid: &str) -> bool {
+    match channel.trim().to_ascii_lowercase().as_str() {
+        "line" => {
+            cuid.len() == 33
+                && cuid.starts_with('U')
+                && cuid.bytes().skip(1).all(|b| b.is_ascii_hexdigit())
+        }
+        "discord" => {
+            (17..=20).contains(&cuid.len()) && duduclaw_core::is_valid_discord_snowflake(cuid)
+        }
+        _ => false,
+    }
+}
+
 /// Every memory `subject` that denotes the dashboard user `user_id`:
 /// `user:<id>`, their WebChat identity (`user:webchat:<owner-tag>`, see
 /// `webchat::webchat_owner_tag`), and for each **verified** linked channel
-/// identity both `user:<channel_user_id>` (what the channel reply pipeline
-/// records) and `user:<channel>:<channel_user_id>`.
+/// identity `user:<channel>:<channel_user_id>` — plus the bare
+/// `user:<channel_user_id>` (what the channel reply pipeline records) only
+/// when [`channel_id_is_globally_unique`]. A bare `user:998` could be a
+/// different person's Telegram, WeCom or DingTalk id, and this set is the
+/// authorization boundary of 「我的記憶」 (list *and* delete), so an
+/// ambiguous bare subject is never included: facts recorded under it stay
+/// with the administrator's memory tools instead.
 pub fn self_subjects(user_id: &str, verified_channels: &[(String, String)]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |raw: String| {
@@ -671,10 +766,14 @@ pub fn self_subjects(user_id: &str, verified_channels: &[(String, String)]) -> V
         if cuid.is_empty() || crate::profile_distill::is_anonymous(cuid) {
             continue;
         }
-        push(cuid.to_string());
-        if !channel.is_empty() {
-            push(format!("{channel}:{cuid}"));
+        // Without a channel there is no way to tell whose id this is.
+        if channel.is_empty() {
+            continue;
         }
+        if channel_id_is_globally_unique(channel, cuid) {
+            push(cuid.to_string());
+        }
+        push(format!("{channel}:{cuid}"));
     }
     out
 }
@@ -768,6 +867,93 @@ mod tests {
             "Alice prefers Python for scripting",
         ] {
             assert_eq!(cat(t), None, "{t}");
+        }
+    }
+
+    /// Business facts that merely share a word with a sensitive topic.
+    #[test]
+    fn business_senses_of_ambiguous_words_do_not_match() {
+        for t in [
+            "We need to pay down technical debt in the billing service",
+            "The debt collection client wants a new dashboard",
+            "The migration delivered 20% cost savings",
+            "Savings plans for the cloud account renew in March",
+            "系統診斷報告每週一自動寄出",
+            "The diagnosis of the outage is in the postmortem doc",
+            "業績獎金制度的說明文件放在人資共用槽",
+            "The new minimum wage policy page goes live Monday",
+            // A finance-industry client: products, not the employee's money.
+            "銀行客戶的新理財商品下週上架，文案要先給法遵看",
+            // Template facts for clients in childcare / bridal / pharmacy.
+            "托幼機構客戶要的孩子接送登記表模板已更新",
+            "婚紗業客戶的結婚方案報價單放在共用槽",
+            "藥局客戶的藥物庫存報表每週一寄出",
+            "醫院客戶的手術室排程系統下個月上線",
+            "Sony and Jason confirmed the person count for the demo",
+        ] {
+            assert_eq!(cat(t), None, "{t}");
+        }
+    }
+
+    /// Personal statements the narrower and newly added phrases still catch,
+    /// in zh-TW, zh-CN and English.
+    #[test]
+    fn personal_statements_are_still_caught() {
+        for (t, want) in [
+            ("她感冒了，今天請假", "health"),
+            ("我昨天發燒到三十九度", "health"),
+            ("He is sick today", "health"),
+            ("Her father is in hospital", "health"),
+            ("他上個月被診斷出肝病", "health"),
+            ("他上个月被诊断出肝病", "health"),
+            ("她确诊了", "health"),
+            ("她怀孕三个月了", "health"),
+            ("他下週要動手術", "health"),
+            ("她目前在服用藥物", "health"),
+            ("Bob was diagnosed with a heart condition", "health"),
+            ("我媽下週來台北", "family"),
+            ("我爸退休了", "family"),
+            ("媽媽每天來接她", "family"),
+            ("爸爸生日是三月", "family"),
+            ("他太太是老師", "family"),
+            ("我男友在新竹工作", "family"),
+            ("她女友是設計師", "family"),
+            ("他下個月要結婚", "family"),
+            ("我的孩子在念小學", "family"),
+            ("她闹离婚", "family"),
+            ("他儿子上小学", "family"),
+            ("她女儿五岁", "family"),
+            ("妈妈每天做饭", "family"),
+            ("My mom is visiting next week", "family"),
+            ("Her dad retired", "family"),
+            ("The kids are at school until four", "family"),
+            ("Her son started school", "family"),
+            ("His daughter is five", "family"),
+            ("他申请了贷款", "personal_finance"),
+            ("I finally paid off my debt", "personal_finance"),
+            ("She is deep in debt", "personal_finance"),
+            ("My savings are almost gone", "personal_finance"),
+            ("她的薪资是五万", "salary"),
+            ("他的工资很低", "salary"),
+            ("My wage barely covers rent", "salary"),
+        ] {
+            assert_eq!(cat(t).as_deref(), Some(want), "{t}");
+        }
+    }
+
+    #[test]
+    fn builtin_lists_have_no_duplicates_and_no_bare_ambiguous_words() {
+        for c in BUILTIN_CATEGORIES {
+            let list = builtin_keywords(c);
+            let set: HashSet<&str> = list.iter().copied().collect();
+            assert_eq!(set.len(), list.len(), "duplicate keyword in {c}");
+        }
+        let all: Vec<&str> = BUILTIN_CATEGORIES
+            .iter()
+            .flat_map(|c| builtin_keywords(c).iter().copied())
+            .collect();
+        for removed in ["debt", "debts", "savings", "診斷", "diagnosis", "wage", "理財", "獎金", "孩子", "結婚", "藥物", "手術", "先生"] {
+            assert!(!all.contains(&removed), "{removed} must not be a bare keyword");
         }
     }
 
@@ -910,6 +1096,27 @@ mod tests {
         assert!(!raw.contains("老李"), "only digests are kept");
     }
 
+    /// Keys are never evicted (the old 20 000 cap let the oldest forgotten
+    /// facts be re-learned) and repeats are not appended twice.
+    #[test]
+    fn forgotten_keys_persist_without_eviction_and_dedupe() {
+        let home = tempfile::tempdir().unwrap();
+        let first = forgotten::key("user:u1", "preferred_name", "最早的一筆");
+        forgotten::record(home.path(), &first).unwrap();
+        let many: Vec<String> = (0..20_500)
+            .map(|i| forgotten::key("user:u2", "prefers", &format!("item-{i}")))
+            .collect();
+        forgotten::record_all(home.path(), &many).unwrap();
+        let loaded = forgotten::load(home.path());
+        assert_eq!(loaded.len(), 20_501);
+        assert!(loaded.contains(&first), "the oldest key survives");
+
+        let lines = |h: &Path| std::fs::read_to_string(h.join(forgotten::FILE)).unwrap().lines().count();
+        let before = lines(home.path());
+        forgotten::record_all(home.path(), &[first.clone(), many[7].clone(), many[7].clone()]).unwrap();
+        assert_eq!(lines(home.path()), before, "already-recorded keys are not appended again");
+    }
+
     #[test]
     fn filter_report_counts_without_content() {
         let g = gate();
@@ -920,19 +1127,58 @@ mod tests {
         assert_eq!(r.by_category.get("health"), Some(&1));
     }
 
+    const LINE_ID: &str = "U4af4980629a1b2c3d4e5f60718293a4b";
+    const DISCORD_ID: &str = "123456789012345678";
+
     #[test]
     fn self_subjects_cover_dashboard_webchat_and_verified_channels() {
         let subjects = self_subjects(
             "u-alice",
-            &[("line".into(), "U123".into()), ("telegram".into(), "998".into())],
+            &[
+                ("line".into(), LINE_ID.into()),
+                ("discord".into(), DISCORD_ID.into()),
+                ("telegram".into(), "998".into()),
+            ],
         );
         assert!(subjects.contains(&"user:u-alice".to_string()));
         assert!(subjects.contains(&format!("user:webchat:{}", crate::webchat::webchat_owner_tag("u-alice"))));
-        assert!(subjects.contains(&"user:U123".to_string()));
-        assert!(subjects.contains(&"user:line:U123".to_string()));
-        assert!(subjects.contains(&"user:998".to_string()));
+        // Globally unique id shapes: bare and prefixed.
+        assert!(subjects.contains(&format!("user:{LINE_ID}")));
+        assert!(subjects.contains(&format!("user:line:{LINE_ID}")));
+        assert!(subjects.contains(&format!("user:{DISCORD_ID}")));
+        assert!(subjects.contains(&format!("user:discord:{DISCORD_ID}")));
+        // A short numeric id: prefixed only.
+        assert!(subjects.contains(&"user:telegram:998".to_string()));
+        assert!(!subjects.contains(&"user:998".to_string()));
         assert!(self_subjects("  ", &[]).is_empty());
         let anon = self_subjects("u1", &[("line".into(), "system".into())]);
         assert!(!anon.contains(&"user:system".to_string()));
+        assert!(!anon.contains(&"user:line:system".to_string()));
+        // No channel name ⇒ nothing (the id cannot be attributed).
+        assert_eq!(self_subjects("u1", &[("".into(), LINE_ID.into())]).len(), 2);
+    }
+
+    /// Two people whose ids on different channels are the same number must
+    /// never see (or delete) each other's facts.
+    #[test]
+    fn numeric_channel_ids_do_not_collide_across_channels() {
+        let telegram_user = self_subjects("u-tg", &[("telegram".into(), "10086".into())]);
+        let wecom_user = self_subjects("u-wc", &[("wecom".into(), "10086".into())]);
+        let dingtalk_user = self_subjects("u-dt", &[("dingtalk".into(), "10086".into())]);
+        for set in [&telegram_user, &wecom_user, &dingtalk_user] {
+            assert!(!set.contains(&"user:10086".to_string()), "{set:?}");
+        }
+        let shared: Vec<_> = telegram_user
+            .iter()
+            .filter(|s| wecom_user.contains(s) || dingtalk_user.contains(s))
+            .collect();
+        assert!(shared.is_empty(), "{shared:?}");
+        // A short "snowflake" (Telegram-sized) or a malformed LINE id is not unique.
+        assert!(!channel_id_is_globally_unique("discord", "10086"));
+        assert!(!channel_id_is_globally_unique("line", "U123"));
+        assert!(!channel_id_is_globally_unique("line", "Uzzzz980629a1b2c3d4e5f60718293a4b"));
+        assert!(!channel_id_is_globally_unique("telegram", DISCORD_ID));
+        assert!(channel_id_is_globally_unique("LINE", LINE_ID));
+        assert!(channel_id_is_globally_unique("discord", DISCORD_ID));
     }
 }

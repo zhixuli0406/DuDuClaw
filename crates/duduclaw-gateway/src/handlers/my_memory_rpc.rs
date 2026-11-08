@@ -13,6 +13,13 @@
 //!
 //! Rows without a person subject (plain conversation facts, explicit
 //! `memory_store` notes) are not "about" anyone and are not listed here.
+//!
+//! `me.memory.forget` is a **hard** delete of every version of the fact
+//! (`SqliteMemoryEngine::forget_subject_triple`: current, superseded,
+//! quarantined and held versions, FTS and lineage, no `memories_archive`
+//! copy), after recording a forgotten-fact key for each of the caller's
+//! subjects. Errors are `{ code, message }` with a stable `code` (see
+//! [`code`]); the dashboard localizes by code.
 
 use super::*;
 
@@ -28,7 +35,44 @@ pub(crate) fn minimum_role(method: &str) -> Option<UserRole> {
     }
 }
 
-const NOT_FOUND: &str = "找不到這筆記憶，可能已被刪除。";
+/// Stable error codes of `me.memory.*` (the dashboard maps them to its own
+/// zh-TW / en / ja-JP copy; `message` is a zh-TW fallback for other clients).
+pub(crate) mod code {
+    pub const NOT_FOUND: &str = "memory_not_found";
+    pub const LOGIN_REQUIRED: &str = "memory_login_required";
+    pub const ACCOUNT_UNAVAILABLE: &str = "memory_account_unavailable";
+    pub const INVALID_CURSOR: &str = "memory_invalid_cursor";
+    pub const INVALID_ID: &str = "memory_invalid_id";
+    pub const READ_FAILED: &str = "memory_read_failed";
+    pub const FORGET_FAILED: &str = "memory_forget_failed";
+    pub const RECORD_FAILED: &str = "memory_forget_record_failed";
+    pub const UNSUPPORTED: &str = "memory_unsupported";
+}
+
+/// zh-TW fallback text of an error code.
+fn message_of(c: &str) -> &'static str {
+    match c {
+        code::NOT_FOUND => "找不到這筆記憶，可能已被刪除。",
+        code::LOGIN_REQUIRED => "請使用個人 Dashboard 帳號登入後再查看「我的記憶」。",
+        code::ACCOUNT_UNAVAILABLE => "無法讀取帳號資料。",
+        code::INVALID_CURSOR => "cursor 無效",
+        code::INVALID_ID => "id is required",
+        code::READ_FAILED => "讀取記憶失敗，請稍後再試。",
+        code::FORGET_FAILED => "刪除記憶失敗，請稍後再試。",
+        code::RECORD_FAILED => "無法記錄刪除，請稍後再試。",
+        _ => "不支援此操作。",
+    }
+}
+
+/// `{ code, message }` error frame (the shape `ws-client` already reads).
+fn coded_error(c: &str) -> WsFrame {
+    WsFrame::Response {
+        id: String::new(),
+        ok: false,
+        payload: None,
+        error: Some(json!({ "code": c, "message": message_of(c) })),
+    }
+}
 
 /// `source_kind` shown to the user for a row.
 fn source_kind(f: &duduclaw_memory::SubjectFact) -> &'static str {
@@ -70,13 +114,13 @@ fn decode_cursor(raw: &str) -> Option<(String, String)> {
 }
 
 impl MethodHandler {
-    /// The caller's subjects. `Err` = the identity could not be resolved
-    /// (refuse rather than fall back to a partial set).
-    async fn my_memory_subjects(&self, ctx: &UserContext) -> Result<Vec<String>, String> {
+    /// The caller's subjects. `Err` (an error code) = the identity could not
+    /// be resolved (refuse rather than fall back to a partial set).
+    async fn my_memory_subjects(&self, ctx: &UserContext) -> Result<Vec<String>, &'static str> {
         let uid = ctx.user_id.trim().to_string();
         // The shared bootstrap / legacy-token principal is not a person.
         if uid.is_empty() || crate::profile_distill::is_anonymous(&uid) {
-            return Err("請使用個人 Dashboard 帳號登入後再查看「我的記憶」。".into());
+            return Err(code::LOGIN_REQUIRED);
         }
         let channels: Vec<(String, String)> = match self.user_db.read().await.clone() {
             Some(db) => {
@@ -87,7 +131,7 @@ impl MethodHandler {
                         .into_iter()
                         .map(|c| (c.channel, c.channel_user_id))
                         .collect(),
-                    _ => return Err("無法讀取帳號資料。".into()),
+                    _ => return Err(code::ACCOUNT_UNAVAILABLE),
                 }
             }
             None => Vec::new(),
@@ -103,12 +147,12 @@ impl MethodHandler {
     ) -> WsFrame {
         let subjects = match self.my_memory_subjects(ctx).await {
             Ok(s) => s,
-            Err(e) => return WsFrame::error_response("", &e),
+            Err(c) => return coded_error(c),
         };
         match method {
             "me.memory.list" => self.my_memory_list(&subjects, &params).await,
             "me.memory.forget" => self.my_memory_forget(&subjects, &params, ctx).await,
-            _ => WsFrame::error_response("", "不支援此操作。"),
+            _ => coded_error(code::UNSUPPORTED),
         }
     }
 
@@ -124,19 +168,22 @@ impl MethodHandler {
             Some(Value::String(s)) if s.is_empty() => None,
             Some(Value::String(s)) => match decode_cursor(s) {
                 Some(c) => Some(c),
-                None => return WsFrame::error_response("", "cursor 無效"),
+                None => return coded_error(code::INVALID_CURSOR),
             },
-            Some(_) => return WsFrame::error_response("", "cursor 無效"),
+            Some(_) => return coded_error(code::INVALID_CURSOR),
         };
         let empty = json!({ "items": [], "next_cursor": Value::Null });
         let db_path = self.home_dir.join("memory.db");
         if !db_path.exists() {
             return WsFrame::ok_response("", empty);
         }
+        // Opened per call like every other memory RPC (the gateway keeps no
+        // shared engine handle); the listing itself is an index range scan.
         let engine = match SqliteMemoryEngine::new(&db_path) {
             Ok(e) => e,
             Err(e) => {
-                return WsFrame::error_response("", &format!("Failed to open memory db: {e}"))
+                warn!("me.memory.list: open memory db failed: {e}");
+                return coded_error(code::READ_FAILED);
             }
         };
         let before = cursor.as_ref().map(|(t, i)| (t.as_str(), i.as_str()));
@@ -145,7 +192,10 @@ impl MethodHandler {
             .await
         {
             Ok(r) => r,
-            Err(e) => return WsFrame::error_response("", &format!("讀取記憶失敗：{e}")),
+            Err(e) => {
+                warn!("me.memory.list: read failed: {e}");
+                return coded_error(code::READ_FAILED);
+            }
         };
         let has_more = rows.len() > limit;
         rows.truncate(limit);
@@ -182,41 +232,72 @@ impl MethodHandler {
             .map(str::trim)
             .filter(|s| !s.is_empty() && s.len() <= 128)
         else {
-            return WsFrame::error_response("", "id is required");
+            return coded_error(code::INVALID_ID);
         };
         let db_path = self.home_dir.join("memory.db");
         if !db_path.exists() {
-            return WsFrame::error_response("", NOT_FOUND);
+            return coded_error(code::NOT_FOUND);
         }
         let engine = match SqliteMemoryEngine::new(&db_path) {
             Ok(e) => e,
             Err(e) => {
-                return WsFrame::error_response("", &format!("Failed to open memory db: {e}"))
+                warn!("me.memory.forget: open memory db failed: {e}");
+                return coded_error(code::READ_FAILED);
             }
         };
         let row = match engine.subject_fact_by_id(id).await {
             Ok(Some(r)) if subjects.iter().any(|s| *s == r.subject) => r,
-            Ok(_) => return WsFrame::error_response("", NOT_FOUND),
-            Err(e) => return WsFrame::error_response("", &format!("讀取記憶失敗：{e}")),
+            Ok(_) => return coded_error(code::NOT_FOUND),
+            Err(e) => {
+                warn!("me.memory.forget: read failed: {e}");
+                return coded_error(code::READ_FAILED);
+            }
         };
 
         // Re-learning guard first: if the delete below succeeds but this
-        // failed, the next conversation could quietly put the fact back.
+        // failed, the next conversation could quietly put the fact back. One
+        // key per subject of the caller, so the same fact arriving through
+        // another of their identities (WebChat, a linked LINE / Telegram id)
+        // is refused too.
         if let Some(predicate) = row.predicate.as_deref() {
             let third = row.object.as_deref().unwrap_or(&row.content);
-            let key = crate::memory_privacy::forgotten::key(&row.subject, predicate, third);
-            if let Err(e) = crate::memory_privacy::forgotten::record(&self.home_dir, &key) {
-                warn!("me.memory.forget: could not record forgotten key ({})", e.kind());
-                return WsFrame::error_response("", "無法記錄刪除，請稍後再試。");
+            let keys: Vec<String> = subjects
+                .iter()
+                .map(|s| crate::memory_privacy::forgotten::key(s, predicate, third))
+                .collect();
+            if let Err(e) = crate::memory_privacy::forgotten::record_all(&self.home_dir, &keys) {
+                warn!("me.memory.forget: could not record forgotten keys ({e})");
+                return coded_error(code::RECORD_FAILED);
             }
         }
 
-        let forgotten = match engine.forget(&row.agent_id, &row.id).await {
-            Ok(f) => f,
-            Err(e) => return WsFrame::error_response("", &format!("刪除記憶失敗：{e}")),
+        // Hard delete, no archive copy: every version of the fact (current,
+        // superseded, pending review) so history / point-in-time reads and a
+        // later approval cannot bring it back.
+        let deleted = match row.predicate.as_deref() {
+            Some(p) => engine.forget_subject_triple(&row.agent_id, &row.subject, p).await,
+            None => engine.forget_subject_row(&row.agent_id, &row.subject, &row.id).await,
         };
-        if !forgotten {
-            return WsFrame::error_response("", NOT_FOUND);
+        let deleted = match deleted {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("me.memory.forget: delete failed: {e}");
+                return coded_error(code::FORGET_FAILED);
+            }
+        };
+        if deleted.memories_deleted == 0 {
+            return coded_error(code::NOT_FOUND);
+        }
+        drop(engine);
+        if !deleted.pending_ids.is_empty() {
+            if let Err(e) = crate::wiki_ingest::scrub_review_store_for_self_forgotten(
+                &self.home_dir,
+                &deleted.pending_ids,
+            )
+            .await
+            {
+                warn!("me.memory.forget: review cards not scrubbed: {e}");
+            }
         }
 
         // Audit: who removed which row, never the content.
@@ -231,6 +312,8 @@ impl MethodHandler {
                     "user_id": ctx.user_id,
                     "source_kind": source_kind(&row),
                     "explicit": is_explicit(&row),
+                    "versions_deleted": deleted.memories_deleted,
+                    "archive_copies_deleted": deleted.archive_deleted,
                 }),
             ),
         );
@@ -260,6 +343,13 @@ mod tests {
     fn frame_data(f: &WsFrame) -> Value {
         match f {
             WsFrame::Response { payload, .. } => payload.clone().unwrap_or(Value::Null),
+            _ => Value::Null,
+        }
+    }
+
+    fn frame_error(f: &WsFrame) -> Value {
+        match f {
+            WsFrame::Response { error, .. } => error.clone().unwrap_or(Value::Null),
             _ => Value::Null,
         }
     }
@@ -302,6 +392,8 @@ mod tests {
     async fn list_is_isolated_between_users_and_forget_only_touches_own_rows() {
         let home = tempfile::tempdir().unwrap();
         let db = home.path().join("memory.db");
+        // An older version of the same fact, superseded by the next write.
+        let alice_old = put(&db, "agnes", "user:alice", "prefers", "紅茶").await;
         let alice_row = put(&db, "agnes", "user:alice", "prefers", "烏龍茶").await;
         let alice_other_agent = put(&db, "bert", "user:alice", "reply_style", "簡短").await;
         let bob_row = put(&db, "agnes", "user:bob", "prefers", "咖啡").await;
@@ -360,16 +452,56 @@ mod tests {
             .handle_my_memory_rpc("me.memory.forget", json!({ "id": bob_row }), &user_ctx("alice"))
             .await;
         assert!(!frame_ok(&f));
+        assert_eq!(frame_error(&f)["code"], code::NOT_FOUND, "a coded error, not prose");
         let engine = SqliteMemoryEngine::new(&db).unwrap();
         assert!(engine.get_by_id("agnes", &bob_row).await.unwrap().is_some(), "bob's row intact");
+        assert_eq!(
+            engine.get_history("agnes", "user:alice", "prefers").await.unwrap().len(),
+            2,
+            "fixture: two versions before the forget"
+        );
 
-        // Alice forgets her own row: gone, audited without content, and the
-        // same triple is now refused for automatic re-learning.
+        // Alice forgets her own row: every version is gone (history and
+        // point-in-time reads included), no archive copy is kept, it is
+        // audited without content, and the same triple is now refused for
+        // automatic re-learning.
         let f = handler
             .handle_my_memory_rpc("me.memory.forget", json!({ "id": alice_row }), &user_ctx("alice"))
             .await;
         assert!(frame_ok(&f), "{f:?}");
         assert!(engine.get_by_id("agnes", &alice_row).await.unwrap().is_none());
+        assert!(engine.get_by_id("agnes", &alice_old).await.unwrap().is_none());
+        assert!(engine.get_history("agnes", "user:alice", "prefers").await.unwrap().is_empty());
+        assert!(engine
+            .get_at("agnes", "user:alice", "prefers", Utc::now())
+            .await
+            .unwrap()
+            .is_none());
+        {
+            let conn = engine.conn_for_maintenance().await;
+            let has_archive: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memories_archive'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if has_archive > 0 {
+                let copies: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM memories_archive WHERE content LIKE '%茶%'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(copies, 0, "no archive copy of any version");
+            }
+        }
+        // A second delete of the same id is a coded not-found.
+        let f = handler
+            .handle_my_memory_rpc("me.memory.forget", json!({ "id": alice_row }), &user_ctx("alice"))
+            .await;
+        assert_eq!(frame_error(&f)["code"], code::NOT_FOUND);
         let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap_or_default();
         assert!(audit.contains("memory_self_forgotten"), "{audit}");
         assert!(!audit.contains("烏龍茶"), "audit carries no content");
@@ -383,12 +515,83 @@ mod tests {
             }),
             crate::memory_privacy::Verdict::Forgotten
         );
+        // The same fact via Alice's other identity (WebChat) is blocked too.
+        let webchat = format!("user:webchat:{}", crate::webchat::webchat_owner_tag("alice"));
+        assert_eq!(
+            gate.check(&crate::memory_privacy::FactParts {
+                content: "prefers: 烏龍茶",
+                subject: Some(&webchat),
+                predicate: Some("prefers"),
+                object: Some("烏龍茶"),
+            }),
+            crate::memory_privacy::Verdict::Forgotten
+        );
+        // … but not the same fact about Bob.
+        assert_eq!(
+            gate.check(&crate::memory_privacy::FactParts {
+                content: "prefers: 烏龍茶",
+                subject: Some("user:bob"),
+                predicate: Some("prefers"),
+                object: Some("烏龍茶"),
+            }),
+            crate::memory_privacy::Verdict::Allow
+        );
 
         // A pseudo-user cannot use the page.
         let f = handler
             .handle_my_memory_rpc("me.memory.list", json!({}), &user_ctx("system"))
             .await;
         assert!(!frame_ok(&f));
+        assert_eq!(frame_error(&f)["code"], code::LOGIN_REQUIRED);
+        let f = handler
+            .handle_my_memory_rpc("me.memory.list", json!({ "cursor": "bad" }), &user_ctx("alice"))
+            .await;
+        assert_eq!(frame_error(&f)["code"], code::INVALID_CURSOR);
+    }
+
+    /// A quarantined version of the fact (pending admin review) is deleted
+    /// with it, so a later approval cannot bring it back.
+    #[tokio::test]
+    async fn forget_also_removes_pending_versions_of_the_fact() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("memory.db");
+        let current = put(&db, "agnes", "user:alice", "preferred_name", "老李").await;
+        let pending = {
+            let engine = SqliteMemoryEngine::new(&db).unwrap();
+            let entry = duduclaw_core::types::MemoryEntry {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: "agnes".into(),
+                content: "preferred_name: 小李".into(),
+                timestamp: Utc::now(),
+                tags: vec![],
+                embedding: None,
+                layer: duduclaw_core::types::MemoryLayer::Semantic,
+                importance: 5.0,
+                access_count: 0,
+                last_accessed: None,
+                source_event: "conversation_distill".into(),
+            };
+            let meta = TemporalMeta {
+                subject: Some("user:alice".into()),
+                predicate: Some("preferred_name".into()),
+                object: Some("小李".into()),
+                quarantined: true,
+                ..TemporalMeta::default()
+            };
+            engine
+                .store_temporal("agnes", entry, meta, duduclaw_memory::lineage::Provenance::test_only())
+                .await
+                .unwrap()
+        };
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let f = handler
+            .handle_my_memory_rpc("me.memory.forget", json!({ "id": current }), &user_ctx("alice"))
+            .await;
+        assert!(frame_ok(&f), "{f:?}");
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        assert_eq!(engine.is_quarantined("agnes", &pending).await.unwrap(), None, "pending row gone");
+        let r = engine.release_quarantine("agnes", &[pending]).await.unwrap();
+        assert_eq!(r.released, 0, "nothing left to approve");
     }
 
     #[test]
