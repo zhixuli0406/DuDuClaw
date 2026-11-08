@@ -432,6 +432,52 @@ async fn partial_writes_keep_cron_and_new_keys_round_trip_through_inspect() {
 }
 
 #[tokio::test]
+async fn prompt_reply_language_validates_round_trips_and_clears() {
+    let (home, handler) = handler_with_agent().await;
+    let toml_path = home.path().join("agents/a1/agent.toml");
+    // Both dashboard spellings require an admin, even for the Owner.
+    let before = std::fs::read_to_string(&toml_path).unwrap();
+    for params in [
+        json!({ "agent_id": "a1", "reply_language": "en" }),
+        json!({ "agent_id": "a1", "prompt": { "reply_language": "en" } }),
+    ] {
+        let e = err(&handler.handle("agents.update", params, &owner_of_a1()).await);
+        assert!(e.contains("prompt.reply_language"), "{e}");
+        assert_eq!(std::fs::read_to_string(&toml_path).unwrap(), before);
+    }
+    // Unknown value: refused, nothing written.
+    let e = err(&handler
+        .handle("agents.update", json!({ "agent_id": "a1", "prompt": { "reply_language": "klingon" } }), &admin())
+        .await);
+    assert!(e.contains("reply_language") && e.contains("zh-TW"), "{e}");
+    assert!(!std::fs::read_to_string(&toml_path).unwrap().contains("reply_language"));
+    // Non-string: refused.
+    err(&handler
+        .handle("agents.update", json!({ "agent_id": "a1", "prompt": { "reply_language": 5 } }), &admin())
+        .await);
+    // Top-level param (dashboard form / MCP parity) shares the validation.
+    err(&handler
+        .handle("agents.update", json!({ "agent_id": "a1", "reply_language": "fr" }), &admin())
+        .await);
+    ok(&handler
+        .handle("agents.update", json!({ "agent_id": "a1", "reply_language": "en" }), &admin())
+        .await);
+    assert!(std::fs::read_to_string(&toml_path).unwrap().contains("reply_language = \"en\""));
+    // Valid value persists and survives an unrelated typed round-trip write.
+    ok(&handler
+        .handle("agents.update", json!({ "agent_id": "a1", "prompt": { "reply_language": "zh-TW" } }), &admin())
+        .await);
+    ok(&handler.handle("agents.update", json!({ "agent_id": "a1", "icon": "y" }), &admin()).await);
+    let p = ok(&handler.handle("agents.inspect", json!({ "agent_id": "a1" }), &admin()).await);
+    assert_eq!(p["prompt"]["reply_language"], "zh-TW", "{p}");
+    // Empty string clears (inherit the global setting).
+    ok(&handler
+        .handle("agents.update", json!({ "agent_id": "a1", "prompt": { "reply_language": "" } }), &admin())
+        .await);
+    assert!(!std::fs::read_to_string(&toml_path).unwrap().contains("reply_language"));
+}
+
+#[tokio::test]
 async fn kv_type_mismatch_is_refused_and_the_employee_keeps_loading() {
     let (home, handler) = handler_with_agent().await;
     let e = err(&handler

@@ -8,7 +8,7 @@ import sys
 import tomllib
 
 
-FULL = dict(rust_mode="full", dashboard="run", discord_voice="true", app_compat="true")
+FULL = dict(rust_mode="full", dashboard="run", app_compat="true")
 VERSION_FILES = {
     "Cargo.toml", "Cargo.lock", "pyproject.toml", "python/duduclaw/__init__.py",
     "scripts/install.sh",
@@ -138,19 +138,16 @@ def classify(event: str, base: str, head: str) -> dict[str, str]:
         paths = [path for _, path in changes]
         if all(docs_path(p) or p.startswith("web/") for p in paths):
             return dict(rust_mode="skip", dashboard="run" if any(p.startswith("web/") for p in paths)
-                        else "skip", discord_voice="false", app_compat="false")
+                        else "skip", app_compat="false")
         if bump_only(base, head, changes):
-            return dict(rust_mode="check", dashboard="skip", discord_voice="false", app_compat="false")
+            return dict(rust_mode="check", dashboard="skip", app_compat="false")
         known_roots = ("crates/", ".github/", "scripts/", "vendor/", "src-tauri/", "web/")
         if any(not (p.startswith(known_roots) or docs_path(p) or version_path(p)) for p in paths):
             return FULL.copy()
         shared = any(p in SHARED_FEATURE_FILES or p.startswith("vendor/") for p in paths)
-        voice = shared or any(p.startswith("crates/duduclaw-gateway/")
-                              and ("discord" in p or "voice" in p) for p in paths)
         compat = shared or any(p.startswith(("crates/duduclaw-core/", "crates/duduclaw-cli/"))
                                and "compat" in p for p in paths)
-        return dict(rust_mode="full", dashboard="run", discord_voice=str(voice).lower(),
-                    app_compat=str(compat).lower())
+        return dict(rust_mode="full", dashboard="run", app_compat=str(compat).lower())
     except (OSError, ValueError, IndexError, KeyError, TypeError, subprocess.SubprocessError):
         return FULL.copy()
 

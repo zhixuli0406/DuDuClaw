@@ -27,6 +27,7 @@
     { "key": "runtime.fallback", "form_paths": ["runtime.fallback"], "kind": "change" },
     { "key": "runtime.timeout_secs", "form_paths": ["runtime.timeout_secs"], "kind": "loosen" },
     { "key": "prompt.cli_bare_mode", "form_paths": [], "kind": "change" },
+    { "key": "prompt.reply_language", "form_paths": ["form.reply_language"], "kind": "change" },
     { "key": "os_watch", "form_paths": ["osWatch."], "kind": "change" },
     { "key": "model.account_pool", "form_paths": ["adv.account_pool"], "kind": "change" },
     { "key": "budget.monthly_limit_cents", "form_paths": ["form.monthly_limit_cents"], "kind": "loosen" },

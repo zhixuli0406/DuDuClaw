@@ -193,9 +193,6 @@ zbus = "5"
 # atspi` (absent on the default host target) — see the WP-CD4b report.
 atspi = "0.30"
 
-# Discord voice channel support (Songbird)
-songbird = { version = "0.5", optional = true, features = ["driver", "rustls", "receive"] }
-
 [features]
 default = ["dashboard", "desktop"]
 # Kept as an empty feature so existing `--features duduclaw-gateway/desktop`
@@ -208,7 +205,6 @@ vendored-openssl = ["openssl-sys/vendored"]
 # `metal`/`cuda`/`vulkan`/`mistralrs-*` forwarding removed 2026-09-29 together
 # with the in-process llama.cpp / mistral.rs backends they gated
 # (`wiki/reports/feature-audit-2026-09-29.md` T1-D3 / T3-S5).
-discord-voice = ["dep:songbird"]
 # Isolated live tests only (debug builds; a release build with it does not
 # compile, see `lib.rs`). Credential protection uses an in-memory store
 # instead of the OS keychain, and Google REST calls may be pointed at a local

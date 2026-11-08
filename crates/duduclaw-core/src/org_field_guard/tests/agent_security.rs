@@ -154,6 +154,15 @@ fn single_security_keys_are_frozen_and_their_siblings_are_not() {
         ),
         GuardDecision::AllowedAgentWrite
     );
+    // Administrator-set language cannot be added, replaced or removed by employees.
+    for (before, after) in [
+        ("[prompt]\nmode = 'full'", "[prompt]\nmode = 'full'\nreply_language = 'en'"),
+        ("[prompt]\nreply_language = 'en'", "[prompt]\nreply_language = 'zh-CN'"),
+        ("[prompt]\nreply_language = 'en'", "[prompt]\nmode = 'full'"),
+    ] {
+        let d = as_agent(&with(before), &with(after));
+        assert!(matches!(d, GuardDecision::BlockedAgentSecuritySection { .. }), "{d:?}");
+    }
     // `[model] account_pool` decides whose credentials the agent spends;
     // `[model] preferred` stays editable.
     let before = BASE.replace(

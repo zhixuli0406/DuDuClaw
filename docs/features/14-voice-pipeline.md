@@ -78,12 +78,6 @@ Since v1.67.1 the Voice tab no longer shows 語音回覆模式 (voice reply mode
 
 ---
 
-## Discord voice
-
-`discord_voice.rs` wraps **Songbird** behind the **non-default `discord-voice` Cargo feature**; the gateway's `default` is `["dashboard", "desktop"]`, so a stock build does not include it. There is no VAD and no ASR wiring behind it today — joining a channel and playing audio is what the module covers.
-
----
-
 ## ONNX embedding
 
 The `onnx` feature of `duduclaw-inference` enables `OnnxEmbeddingProvider` (ONNX Runtime + a WordPiece tokenizer) for models such as `bge-small-zh`. It is not a voice component — it is shared infrastructure for the memory system's semantic search (see [10-cognitive-memory.md](10-cognitive-memory.md)) — and it is **not** in the crate's default features either.

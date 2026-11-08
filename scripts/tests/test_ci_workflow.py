@@ -343,7 +343,6 @@ class CiWorkflowTests(unittest.TestCase):
         }
         platform = {
             "Install Linux system deps (xcap screen-capture → wayland/xcb/gbm)": "runner.os == 'Linux'",
-            "Test gateway Discord voice TLS transport": "runner.os == 'Linux'",
             "Run every required Windows case on the native host": "runner.os == 'Windows'",
             "Test workflow stdio checkpoints (CLI, workflow-test-checkpoints)": "matrix.os == 'ubuntu-latest'",
             "Test workflow end to end (pilot, races, resume, F1b, F5-A) against the built CLI": "matrix.os == 'ubuntu-latest'",
@@ -364,8 +363,6 @@ class CiWorkflowTests(unittest.TestCase):
                     elif name == "Check release version bump":
                         gate = "needs.settle.outputs.rust_mode == 'check'"
                         self.assertEqual(step["run"], "cargo check --locked --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard")
-                    elif name == "Test gateway Discord voice TLS transport":
-                        gate += " && needs.settle.outputs.discord_voice != 'false'"
                     elif name == "Test cli with app-compat feature (OS-only surface)":
                         gate += " && needs.settle.outputs.app_compat != 'false'"
                     if name in ("Test workspace doctests", "Test gateway doctests"):
@@ -418,7 +415,6 @@ class CiWorkflowTests(unittest.TestCase):
             ("duduclaw-core", "app-compat", "test"),
             ("duduclaw-cli", "app-compat", "test"),
             ("duduclaw-gateway", "otel", "check"),
-            ("duduclaw-gateway", "discord-voice", "test"),
             ("duduclaw-cli", "workflow-test-checkpoints", "test"),
         ):
             with self.subTest(feature=feature, package=package):
@@ -487,7 +483,7 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertIn('git show "$BASE_SHA:scripts/ci_classify.py"', step["run"])
         self.assertIn('python3 -I "$RUNNER_TEMP/ci_classify.py"', step["run"])
         self.assertEqual(step["continue-on-error"], "true")
-        self.assertEqual(set(settle["outputs"]), {"rust_mode", "dashboard", "discord_voice", "app_compat"})
+        self.assertEqual(set(settle["outputs"]), {"rust_mode", "dashboard", "app_compat"})
         for key in settle["outputs"]:
             self.assertEqual(settle["outputs"][key], "${{ steps.classify.outputs." + key + " }}")
         # Execute the actual workflow shell for non-PR and first-rollout failure cases.
@@ -500,7 +496,7 @@ class CiWorkflowTests(unittest.TestCase):
                 subprocess.run(["bash", "-e", "-c", step["run"]], cwd=ROOT,
                                env=env, check=True, capture_output=True)
                 expected = ("" if event == "pull_request" else
-                            "rust_mode=full\ndashboard=run\ndiscord_voice=true\napp_compat=true\n")
+                            "rust_mode=full\ndashboard=run\napp_compat=true\n")
                 self.assertEqual(output.read_text(), expected)
 
     def test_classifier_failure_cannot_publish_partial_skip_outputs(self):

@@ -259,11 +259,14 @@ a pack format, and was never deprecated. The authoring commands `expert pack`,
 
 MFA phase 1 adds conditional response shapes to `/api/login` and `/api/otp/verify`. Unenrolled accounts with enforcement off retain the exact `access_token`, `refresh_token`, `user` shape. Enrolled accounts receive only `mfa_required`, `challenge_id`; enforced unenrolled accounts receive only `mfa_enrollment_required`, `enrollment_token`. Clients must complete `/api/mfa/verify` or `/api/mfa/enroll/*` before treating login as successful. No legacy endpoint is removed. Dashboard support follows in phase 2.
 
-## Deprecated voice provider settings
+## Removed in v1.81.0
 
-| Deprecated value | Since | Removal | Behaviour / replacement |
-|---|---|---|---|
-| `edge-tts`, `edge` | v1.79.0 | v1.81.0 | Accepted as `auto`, with one warning per process. The old implementation is removed. Choose local Kokoro or official Azure AI Speech REST. |
+### Voice provider settings
+
+The `edge-tts` and `edge` compatibility values are no longer accepted. Existing
+configurations that still contain either value leave TTS unavailable and emit
+one warning per process; choose `kokoro` instead. `system.update_config` rejects
+both removed values.
 
 ## Third-party MCP environment credentials
 

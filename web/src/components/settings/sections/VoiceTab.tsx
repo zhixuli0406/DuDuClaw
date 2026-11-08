@@ -63,7 +63,7 @@ export function VoiceTab() {
     api.system.config().then((res) => {
       if (res?.voice) {
         setConfig((prev) => ({
-          tts_provider: ['edge-tts', 'edge'].includes(res.voice?.tts_provider ?? '') ? 'auto' : res.voice?.tts_provider ?? prev.tts_provider,
+          tts_provider: ['edge-tts', 'edge'].includes(res.voice?.tts_provider ?? '') ? 'off' : res.voice?.tts_provider ?? prev.tts_provider,
           tts_voice: res.voice?.tts_voice ?? prev.tts_voice,
           tts_command: res.voice?.tts_command ?? prev.tts_command,
         }));
