@@ -104,24 +104,107 @@ pub(crate) fn dashboard_base_url(home_dir: &Path) -> Option<String> {
     Some(format!("http://localhost:{port}"))
 }
 
-/// OAuth-only base resolution. `origin` must already have passed the redirect
-/// origin allowlist. Never use the localhost fallback for a browser redirect.
-pub(crate) fn oauth_dashboard_base(home: &Path, origin: &str) -> String {
-    let configured = std::fs::read_to_string(home.join("config.toml"))
-        .ok()
-        .and_then(|text| text.parse::<toml::Table>().ok())
-        .and_then(|table| table.get("dashboard")?.get("public_url").cloned());
-    let Some(configured) = configured else { return origin.into(); };
-    let base = configured.as_str().and_then(valid_oauth_public_base);
-    match base {
-        Some((configured_origin, base)) if configured_origin == origin => base,
-        Some(_) => origin.into(),
-        None => {
-            // Do not log a malformed URL: it may contain credentials or a query.
-            tracing::warn!("invalid [dashboard] public_url; OAuth uses the dashboard origin without a path prefix");
-            origin.into()
-        }
+/// Why [`dashboard_public_base`] refused to produce a base. Both variants fail
+/// closed: an OAuth flow must not start when the operator-declared address
+/// cannot be honoured, because silently dropping it is exactly the RM-129 bug
+/// (the browser lands on another site that shares the dashboard's domain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicBaseError {
+    /// `config.toml` exists but cannot be read or parsed.
+    ConfigUnreadable,
+    /// `[dashboard] public_url` is present but is not a plain http(s) base
+    /// (credentials, query, fragment, dot segments, encoded separators …).
+    InvalidPublicUrl,
+    /// No public_url and the request origin itself is not a valid origin.
+    InvalidRequestOrigin,
+}
+
+impl std::fmt::Display for PublicBaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ConfigUnreadable => "config.toml cannot be read; fix it before signing in",
+            Self::InvalidPublicUrl => {
+                "[dashboard] public_url requires HTTPS (HTTP only for localhost, 127.0.0.0/8 or ::1; no user name, query, fragment or `..`); fix it in Settings → General"
+            }
+            Self::InvalidRequestOrigin => "the dashboard origin is not a valid http(s) origin",
+        })
     }
+}
+
+/// The validated `[dashboard] public_url`, or `Ok(None)` when it is unset or
+/// blank (or there is no `config.toml` at all). The returned URL's path always
+/// ends with exactly one `/`.
+pub(crate) fn configured_public_base(home: &Path) -> Result<Option<url::Url>, PublicBaseError> {
+    let text = match std::fs::read_to_string(home.join("config.toml")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(PublicBaseError::ConfigUnreadable),
+    };
+    let table: toml::Table = text.parse().map_err(|_| PublicBaseError::ConfigUnreadable)?;
+    let Some(value) = table.get("dashboard").and_then(|d| d.get("public_url")) else {
+        return Ok(None);
+    };
+    let raw = value.as_str().ok_or(PublicBaseError::InvalidPublicUrl)?;
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let Some((_, base)) = valid_oauth_public_base(raw) else {
+        // Do not log the value: it may contain credentials or a query.
+        tracing::warn!("invalid [dashboard] public_url; OAuth sign-in refused until it is fixed");
+        return Err(PublicBaseError::InvalidPublicUrl);
+    };
+    normalized_base(&base).map(Some).ok_or(PublicBaseError::InvalidPublicUrl)
+}
+
+/// Parse `base` (no trailing slash required) into a URL whose path ends with
+/// exactly one `/`.
+fn normalized_base(base: &str) -> Option<url::Url> {
+    let mut url = url::Url::parse(base).ok()?;
+    let path = format!("{}/", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    Some(url)
+}
+
+/// `scheme://host[:port][/prefix]` with no trailing slash — the form callers
+/// concatenate absolute routes onto (`{prefix}/oauth/mcp/callback`).
+pub(crate) fn base_prefix(base: &url::Url) -> String {
+    base.as_str().trim_end_matches('/').to_string()
+}
+
+/// The single source of truth for every OAuth callback / return URL built for
+/// a browser (RM-129).
+///
+/// * `[dashboard] public_url` configured and valid → that URL (origin + path,
+///   path normalised to end with `/`). It is authoritative even when its
+///   origin differs from `request_origin`; the mismatch is logged once per
+///   process because it usually means the operator reached the dashboard via
+///   another address than the one they declared.
+/// * public_url unset → `request_origin`, which the caller MUST already have
+///   validated against the redirect-origin allowlist
+///   (`remote_mcp::connect::plan_redirect`). This function never widens that
+///   allowlist; it only decides the path.
+/// * public_url present but invalid, or config unreadable → `Err` (fail
+///   closed — never silently fall back to a prefix-less address).
+pub(crate) fn dashboard_public_base(home: &Path, request_origin: &str) -> Result<url::Url, PublicBaseError> {
+    if let Some(base) = configured_public_base(home)? {
+        let configured_origin = base.origin().ascii_serialization();
+        let request = url::Url::parse(request_origin.trim()).ok().map(|u| u.origin().ascii_serialization());
+        if request.as_deref() != Some(configured_origin.as_str()) {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    configured = %configured_origin,
+                    "dashboard opened on an origin other than [dashboard] public_url; OAuth returns to public_url"
+                );
+            }
+        }
+        return Ok(base);
+    }
+    let url = url::Url::parse(request_origin.trim()).map_err(|_| PublicBaseError::InvalidRequestOrigin)?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        return Err(PublicBaseError::InvalidRequestOrigin);
+    }
+    normalized_base(&url.origin().ascii_serialization()).ok_or(PublicBaseError::InvalidRequestOrigin)
 }
 
 pub(crate) fn valid_oauth_public_base(raw: &str) -> Option<(String, String)> {
@@ -145,6 +228,14 @@ pub(crate) fn valid_oauth_public_base(raw: &str) -> Option<(String, String)> {
         || !url.username().is_empty() || url.password().is_some()
         || url.query().is_some() || url.fragment().is_some()
     {
+        return None;
+    }
+    let loopback = match url.host()? {
+        url::Host::Domain(host) => host == "localhost",
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    };
+    if url.scheme() == "http" && !loopback {
         return None;
     }
     Some((url.origin().ascii_serialization(), url.as_str().trim_end_matches('/').into()))
@@ -184,7 +275,70 @@ mod tests {
     }
 
     #[test]
-    fn invalid_oauth_public_urls_warn_and_keep_the_origin() {
+    fn oauth_public_base_requires_https_except_for_loopback() {
+        for raw in [
+            "http://dashboard.example/agents", "http://192.168.1.20/agents",
+            "http://localhost.evil.example/agents", "http://127.0.0.1.evil.example/agents",
+            "http://[::ffff:127.0.0.1]/agents", "http://[::2]/agents", "http://128.0.0.1/agents",
+        ] {
+            assert!(valid_oauth_public_base(raw).is_none(), "{raw}");
+        }
+        for raw in [
+            "http://localhost:18889/agents", "http://127.0.0.1/agents",
+            "http://127.42.3.4:18889/agents", "http://127.255.255.255/agents",
+            "http://[::1]:18889/agents", "https://dashboard.example/agents",
+            "https://192.168.1.20/agents",
+        ] {
+            assert!(valid_oauth_public_base(raw).is_some(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn public_base_uses_sub_path_public_url_and_normalizes_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        for raw in ["https://example.com/agents", "https://example.com/agents/", "https://example.com/agents//"] {
+            write_config(dir.path(), &format!("[dashboard]\npublic_url = {raw:?}\n"));
+            let base = dashboard_public_base(dir.path(), "https://example.com").unwrap();
+            assert_eq!(base.as_str(), "https://example.com/agents/", "{raw}");
+            assert_eq!(base_prefix(&base), "https://example.com/agents");
+        }
+    }
+
+    #[test]
+    fn public_base_origin_mismatch_still_uses_public_url() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "[dashboard]\npublic_url = \"https://example.com/agents\"\n");
+        for origin in ["http://localhost:18889", "https://other.example.com", "not a url"] {
+            let base = dashboard_public_base(dir.path(), origin).unwrap();
+            assert_eq!(base_prefix(&base), "https://example.com/agents", "{origin}");
+        }
+    }
+
+    #[test]
+    fn public_base_unset_keeps_the_request_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        // No config file, no [dashboard] section, blank public_url.
+        assert_eq!(base_prefix(&dashboard_public_base(dir.path(), "https://dash.example").unwrap()), "https://dash.example");
+        for config in ["[gateway]\nport = 18889\n", "[dashboard]\npublic_url = \"  \"\n"] {
+            write_config(dir.path(), config);
+            let base = dashboard_public_base(dir.path(), "http://localhost:18889/").unwrap();
+            assert_eq!(base_prefix(&base), "http://localhost:18889", "{config}");
+            assert_eq!(configured_public_base(dir.path()).unwrap(), None);
+        }
+        assert_eq!(dashboard_public_base(dir.path(), "javascript:alert(1)"), Err(PublicBaseError::InvalidRequestOrigin));
+    }
+
+    #[test]
+    fn public_base_fails_closed_on_unreadable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "this is not [ valid toml");
+        assert_eq!(dashboard_public_base(dir.path(), "https://dash.example"), Err(PublicBaseError::ConfigUnreadable));
+        write_config(dir.path(), "[dashboard]\npublic_url = 42\n");
+        assert_eq!(dashboard_public_base(dir.path(), "https://dash.example"), Err(PublicBaseError::InvalidPublicUrl));
+    }
+
+    #[test]
+    fn invalid_oauth_public_urls_warn_and_fail_closed() {
         use std::io::Write;
         use std::sync::{Arc, Mutex};
         #[derive(Clone)]
@@ -203,6 +357,7 @@ mod tests {
             "https://dash.example/a?query=private", "https://dash.example/a#fragment",
             "https://user:secret@dash.example/a", "https://@dash.example/a", "/relative",
             "https://dash.example/a%2fb", "https://dash.example/a%5cb",
+            "http://dashboard.example/agents", "http://192.168.1.20/agents",
         ] {
             write_config(dir.path(), &format!("[dashboard]\npublic_url = {raw:?}\n"));
             let output = Arc::new(Mutex::new(Vec::new()));
@@ -210,7 +365,7 @@ mod tests {
             let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
                 .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
             tracing::subscriber::with_default(subscriber, || {
-                assert_eq!(oauth_dashboard_base(dir.path(), origin), origin);
+                assert_eq!(dashboard_public_base(dir.path(), origin), Err(PublicBaseError::InvalidPublicUrl));
             });
             let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
             assert!(log.contains("invalid [dashboard] public_url"), "{raw}: {log}");

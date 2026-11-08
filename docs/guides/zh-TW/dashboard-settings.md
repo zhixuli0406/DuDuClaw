@@ -134,7 +134,25 @@ npm 未安裝或安裝失敗時，提示會提供完整的手動指令與複製�
 - `config.toml` 無法解析時，`system.update_config`、常駐感知資料來源與設定檔進階編輯都會拒絕寫入，請先在設定檔進階編輯修好語法。其他會寫 `config.toml` 的設定頁（通道、帳號、Odoo 等）也一樣拒絕寫入。
 - 存檔是原地修改檔案，只改你動到的鍵。你寫的註解、空行、鍵的順序和沒動到的鍵的排版都原樣保留，改了值的那一行行尾註解也還在。新增的鍵放在所屬區段的最後，新增的區段放在檔案最後。所有會寫 `config.toml` 或 `inference.toml` 的設定頁都是這樣，不只設定檔進階編輯。
 - 需要重啟才生效的鍵會出現在回應的 `restart_required`。系統設定頁與通道管理頁上方會顯示「以下設定要重啟 gateway 才生效」，gateway 重啟後自動消失，也可以手動關閉。推理頁與 AI 員工編輯頁不顯示這條提示。
-- 下列鍵每次改動都會另寫一筆稽核事件 `config_protected_key_changed`（含改動前後的值）：`acp.trusted`、`tick.allow_command_sources`、`container.sandbox.when_unavailable`、`container.sandbox.script_when_unavailable`、`memory.supersession_trust_guard`。
+- 下列鍵每次改動都會另寫一筆稽核事件 `config_protected_key_changed`（含改動前後的值）：`acp.trusted`、`tick.allow_command_sources`、`container.sandbox.when_unavailable`、`container.sandbox.script_when_unavailable`、`memory.supersession_trust_guard`、`dashboard.public_url`。
+
+## 系統設定 → 一般 → 控制台公開網址
+
+管理員在這裡設定 `[dashboard] public_url`：外部連到控制台的完整網址，含反向代理子路徑，例如 `https://example.com/agents/`。必須使用 HTTPS；只有 `localhost`、`127.0.0.0/8` 或 `::1` 可用 HTTP。網址不可含帳號密碼、查詢字串（`?`）、片段（`#`）、`..` 或編碼後的 `/`、`\`。儲存時 gateway 會拒絕其他格式；若 `config.toml` 裡手動寫入了不合格的值，OAuth 連結會拒絕開始，直到修正為止（絕不會默默改用沒有子路徑的網址）。清空欄位即移除這個鍵。立即生效，每次改動都會寫入 `config_protected_key_changed`。
+
+設定 public_url 後，所有 OAuth 回呼與返回連結都會使用它，並保留子路徑：
+
+| 流程 | 服務商導回的回呼網址 | 完成後瀏覽器回到 |
+|---|---|---|
+| 遠端 MCP 伺服器（整合 → MCP → 遠端伺服器） | `<public_url>/oauth/mcp/callback`（動態用戶端註冊會自動登記） | `<public_url>/manage/integrations?tab=mcp&mcp_tab=remote` |
+| 個人 Google 帳號（我的連線） | `<public_url>/api/me/google/callback` | `<public_url>/me/connections` |
+| 內建 Google Workspace、GitHub、Notion、Slack OAuth | `<public_url>/api/mcp/oauth/callback` | 結果頁連回 `<public_url>/manage/integrations?tab=google`（Google）或 `?tab=mcp` |
+
+- **註冊新的回呼網址。** 設定或變更 public_url 後，請到每個使用中的 OAuth 應用程式加入新的回呼網址：Google Cloud Console → 憑證 → 你的 OAuth 用戶端 → 已授權的重新導向 URI；GitHub OAuth App 的 Authorization callback URL（GitHub OAuth App 只有一個回呼網址，請直接替換）。Notion 與 Slack 應用程式也一樣。整合頁會顯示要註冊的確切網址。已經進行中的連結會用開始時的網址完成。
+- 仍會先檢查瀏覽器本身的來源：只有在控制台以本機位址或 `[gateway] allowed_origins` 內的 https 來源開啟時才直接導回；否則照舊改走 `http://127.0.0.1:<port>/…` 的貼上返回網址流程（這個本機位址不加子路徑）。若控制台以 public_url 以外的允許來源開啟，仍會導回 public_url，gateway 只記錄一次警告。
+- 未設定 public_url 時行為不變：遠端 MCP 與個人 Google 回到瀏覽器來源（不含路徑），內建服務商使用 `http://localhost:<port>/api/mcp/oauth/callback`。
+- 反向代理：把 `<子路徑>/oauth/mcp/callback` 與 `<子路徑>/api/…` 去掉子路徑後轉給 gateway。
+- 限制：控制台網頁本身是為根路徑建置的，會載入 `/assets/…`、呼叫 `/api/…` 與 `/ws`，頁面路由也沒有基底路徑。因此放在子路徑下時，代理還必須把這些根路徑轉給 gateway，或改用獨立主機名稱。public_url 修正的是 OAuth 回呼與返回網址，不會讓控制台網頁本身支援子路徑。若頁面有同來源的 `<base href>`（例如由代理插入），控制台會在開始 OAuth 與邀請成員時附上該子路徑，gateway 仍會再次驗證。
 
 ## 系統設定 → 進階設定 → 自動化引擎
 

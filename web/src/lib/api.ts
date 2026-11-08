@@ -2,6 +2,7 @@ import { beginBrandRequest, loadPublicBrand, useBrandStore, type DistributorBran
 import { client } from './ws-client';
 import type { SkillSignatureStatus } from './api-custom-skills';
 import { notifyDisconnectForget } from './forget-receipts';
+import { dashboardBaseUrl } from './dashboard-base';
 import { callTaskRpc, type TaskAttachmentInput } from './task-rpc';
 // v1.68 W2 — dashboard-switches RPC wire types.
 import type {
@@ -8109,7 +8110,7 @@ export const api = {
   },
   personalGoogle: {
     status: () => client.call('me.google.status') as Promise<PersonalGoogleStatus>,
-    start: (acknowledgeGoogleData: boolean, meetingRecordings = false, driveTools = false) => client.call('me.google.connect_start', { redirect_origin: window.location.origin, acknowledge_google_data: acknowledgeGoogleData, ...(meetingRecordings ? { meeting_recordings: true } : {}), ...(driveTools ? { drive_tools: true } : {}) }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
+    start: (acknowledgeGoogleData: boolean, meetingRecordings = false, driveTools = false) => client.call('me.google.connect_start', { redirect_origin: dashboardBaseUrl(), acknowledge_google_data: acknowledgeGoogleData, ...(meetingRecordings ? { meeting_recordings: true } : {}), ...(driveTools ? { drive_tools: true } : {}) }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
     finish: (state: string) => client.call('me.google.connect_finish', { state }),
     paste: (url: string) => client.call('me.google.connect_paste', { url }),
     disconnect: () => client.call('me.google.disconnect', { confirm: true }).then(notifyDisconnectForget) as Promise<{provider_revoked:boolean;provider_note:string|null}>,

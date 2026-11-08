@@ -393,6 +393,97 @@ async fn bearer_connect_probes_and_a_refused_token_is_reported() {
     }
 }
 
+/// RM-129: a dashboard behind a reverse proxy sub-path. The configured
+/// `[dashboard] public_url` (with its path) decides the redirect URI even when
+/// the browser opened the dashboard on another loopback origin, and the
+/// redirect URI captured at authorization time is the one the token exchange
+/// uses — a config change while the sign-in is in flight does not break it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sub_path_public_url_prefixes_the_redirect_and_binds_it_to_the_state() {
+    let (fake, base) = start_fake().await;
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = home_dir.path();
+    std::fs::create_dir_all(home.join("agents").join("a1")).unwrap();
+    std::fs::write(home.join("config.toml"),
+        "[dashboard]\npublic_url = \"http://localhost:18889/agents/\"\n").unwrap();
+
+    let outcome = connect::start_connect(
+        home,
+        connect::ConnectRequest {
+            agent_id: "a1".into(),
+            server: "fake".into(),
+            url: Some(format!("{base}/mcp")),
+            auth: store::AuthKind::Oauth,
+            bearer: None,
+            // Origin mismatch on purpose (127.0.0.1 vs localhost), with the
+            // dashboard's base path appended the way the dashboard sends it.
+            redirect_origin: Some("http://127.0.0.1:18889/agents/".into()),
+            client_id: None,
+            client_secret: None,
+            allowed_origins: vec![],
+            headers: None,
+            server_stream: None,
+        },
+    )
+    .await
+    .expect("start_connect");
+    let connect::ConnectOutcome::Authorize { authorize_url, completion, redirect_uri } = outcome else {
+        panic!("expected an authorize URL")
+    };
+    assert_eq!(completion, connect::Completion::Redirect);
+    assert_eq!(redirect_uri, "http://localhost:18889/agents/oauth/mcp/callback");
+
+    let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let resp = http.get(&authorize_url).send().await.unwrap();
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    assert!(location.starts_with("http://localhost:18889/agents/oauth/mcp/callback?"), "{location}");
+    let q: HashMap<String, String> = url::Url::parse(&location).unwrap().query_pairs().into_owned().collect();
+
+    // The operator edits public_url mid-flight: the stored URI still wins.
+    std::fs::write(home.join("config.toml"),
+        "[dashboard]\npublic_url = \"https://changed.example/elsewhere\"\n").unwrap();
+    let done = connect::complete_callback_with_issuer(home, &q["state"], &q["code"], Some(&q["iss"]))
+        .await.expect("callback");
+    assert_eq!(done.redirect_origin, "http://127.0.0.1:18889");
+    assert_eq!(done.dashboard_base, "http://localhost:18889/agents");
+    // The fake token endpoint asserts the exchange's redirect_uri equals the
+    // authorization request's exactly; reaching here means it matched.
+    assert_eq!(fake.lock().unwrap().grants, vec!["authorization_code"]);
+    assert_eq!(fake.lock().unwrap().redirect_uri.as_deref(), Some("http://localhost:18889/agents/oauth/mcp/callback"));
+}
+
+/// Without public_url the redirect stays prefix-less on the browser origin,
+/// even when the dashboard sends its base path (unchanged behaviour).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unset_public_url_ignores_the_browser_base_path() {
+    let (_fake, base) = start_fake().await;
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = home_dir.path();
+    std::fs::create_dir_all(home.join("agents").join("a1")).unwrap();
+    let outcome = connect::start_connect(
+        home,
+        connect::ConnectRequest {
+            agent_id: "a1".into(),
+            server: "fake".into(),
+            url: Some(format!("{base}/mcp")),
+            auth: store::AuthKind::Oauth,
+            bearer: None,
+            redirect_origin: Some("http://localhost:18889/agents/".into()),
+            client_id: None,
+            client_secret: None,
+            allowed_origins: vec![],
+            headers: None,
+            server_stream: None,
+        },
+    )
+    .await
+    .expect("start_connect");
+    let connect::ConnectOutcome::Authorize { redirect_uri, .. } = outcome else {
+        panic!("expected an authorize URL")
+    };
+    assert_eq!(redirect_uri, "http://localhost:18889/oauth/mcp/callback");
+}
+
 /// A dashboard opened on a LAN address over plain http cannot receive the
 /// OAuth redirect. The provider is sent to the browser machine's loopback
 /// address on the dashboard port instead, and the operator pastes the

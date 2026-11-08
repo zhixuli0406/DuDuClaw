@@ -134,7 +134,25 @@ npm がない場合やインストールに失敗した場合は、手動コマ�
 - `config.toml` が解析できない場合、`system.update_config`、常駐センシングのデータソース編集、設定ファイルの詳細編集は書き込みを拒否します。先に設定ファイルの詳細編集で構文を直してください。`config.toml` に書き込むほかの設定ページ（チャネル、アカウント、Odoo など）も同じく書き込みを拒否します。
 - 保存はファイルをその場で書き換え、変更したキーだけを書き直します。コメント、空行、キーの順序、変更していないキーの書式はそのまま残り、値を変えた行の行末コメントも残ります。新しいキーはそのセクションの末尾に、新しいセクションはファイルの末尾に追加されます。設定ファイルの詳細編集だけでなく、`config.toml` や `inference.toml` に書き込むすべての設定ページで同じです。
 - 再起動後に有効になるキーは応答の `restart_required` に入ります。システム設定ページとチャネル管理ページには、gateway が再起動するまで「再起動後に有効になる設定」の案内が表示されます（手動で閉じることもできます）。推論ページと AI 社員の編集ページには表示されません。
-- 次のキーを変更すると、変更前後の値を含む監査イベント `config_protected_key_changed` も記録されます：`acp.trusted`、`tick.allow_command_sources`、`container.sandbox.when_unavailable`、`container.sandbox.script_when_unavailable`、`memory.supersession_trust_guard`。
+- 次のキーを変更すると、変更前後の値を含む監査イベント `config_protected_key_changed` も記録されます：`acp.trusted`、`tick.allow_command_sources`、`container.sandbox.when_unavailable`、`container.sandbox.script_when_unavailable`、`memory.supersession_trust_guard`、`dashboard.public_url`。
+
+## システム設定 → 一般 → ダッシュボード公開 URL
+
+管理者はここで `[dashboard] public_url` を設定します。外部からダッシュボードにアクセスする完全な URL で、リバースプロキシのサブパスも含めます（例: `https://example.com/agents/`）。HTTPS が必須です。HTTP は `localhost`、`127.0.0.0/8`、`::1` のみ利用できます。ユーザー名・パスワード、クエリ（`?`）、フラグメント（`#`）、`..`、エンコードされた `/`・`\` を含めないでください。それ以外は保存時に gateway が拒否します。`config.toml` に手で書かれた無効な値があると、修正されるまで OAuth の開始を拒否します（サブパスのない URL に黙って切り替えることはありません）。空欄にするとキーを削除します。変更は即時に反映され、`config_protected_key_changed` が記録されます。
+
+public_url を設定すると、すべての OAuth コールバックと戻りリンクにサブパス付きで使われます。
+
+| フロー | プロバイダーが戻すコールバック URL | 完了後にブラウザが戻る先 |
+|---|---|---|
+| リモート MCP サーバー（連携 → MCP → リモートサーバー） | `<public_url>/oauth/mcp/callback`（動的クライアント登録で自動登録） | `<public_url>/manage/integrations?tab=mcp&mcp_tab=remote` |
+| 個人の Google アカウント（自分の接続） | `<public_url>/api/me/google/callback` | `<public_url>/me/connections` |
+| 組み込みの Google Workspace、GitHub、Notion、Slack OAuth | `<public_url>/api/mcp/oauth/callback` | 結果ページから `<public_url>/manage/integrations?tab=google`（Google）または `?tab=mcp` へのリンク |
+
+- **新しいコールバック URL を登録してください。** public_url を設定・変更したら、使っている各 OAuth アプリに新しいコールバック URL を追加します。Google Cloud Console → 認証情報 → OAuth クライアント → 承認済みのリダイレクト URI、GitHub OAuth App の Authorization callback URL（GitHub OAuth App のコールバック URL は 1 つなので置き換えます）。Notion と Slack のアプリも同様です。連携ページに登録すべき URL が表示されます。すでに進行中のサインインは開始時の URL で完了します。
+- ブラウザ自身のオリジンは引き続き先に確認されます。直接リダイレクトはループバックアドレス、または `[gateway] allowed_origins` にある https オリジンで開いた場合だけです。それ以外は従来どおり `http://127.0.0.1:<port>/…` への貼り付けフローになります（このループバックアドレスにはサブパスを付けません）。public_url 以外の許可済みオリジンで開いた場合も public_url に戻り、gateway は警告を 1 回だけ記録します。
+- public_url が未設定なら動作は変わりません。リモート MCP と個人 Google はブラウザのオリジン（パスなし）に戻り、組み込みプロバイダーは `http://localhost:<port>/api/mcp/oauth/callback` を使います。
+- リバースプロキシ: `<サブパス>/oauth/mcp/callback` と `<サブパス>/api/…` をサブパスを外して gateway に転送してください。
+- 制限: ダッシュボードのアプリ自体はルートパス向けにビルドされています。`/assets/…` を読み込み、`/api/…` と `/ws` を呼び出し、ページのルートにもベースパスがありません。そのためサブパスで公開する場合は、プロキシでこれらのルートパスも gateway に転送するか、専用のホスト名を使う必要があります。public_url が直すのは OAuth のコールバックと戻り URL で、アプリ自体をサブパス対応にするものではありません。ページに同一オリジンの `<base href>`（プロキシが挿入したものなど）があれば、ダッシュボードは OAuth 開始とメンバー招待でそのサブパスを送り、gateway が再度検証します。
 
 ## システム設定 → 詳細設定 → 自動化エンジン
 

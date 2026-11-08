@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 控制台放在反向代理子路徑（例如 `https://example.com/agents/`）時，連結遠端 MCP 工具或 Google 帳號後會正確回到控制台，不再掉到同網域的其他網站；請在「系統設定 → 一般」填寫控制台公開網址，並到 Google、GitHub 等 OAuth 應用程式註冊新的回呼網址。
+
 ## [1.80.1] - 2026-11-07 — macOS／Windows 下載版修正
 
 ### Fixed
