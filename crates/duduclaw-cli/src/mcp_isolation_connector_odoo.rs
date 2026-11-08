@@ -11,6 +11,8 @@ pub const ODOO_EXECUTOR_TOOLS: &[&str] = &[
     "odoo_sale_orders", "odoo_sale_create_quotation", "odoo_sale_confirm", "odoo_inventory_products",
     "odoo_inventory_check", "odoo_invoice_list", "odoo_payment_status", "odoo_search", "odoo_execute",
     "odoo_report", "odoo_partner_search", "odoo_schema_overview", "odoo_schema_fields",
+    // RM-120: every gate of `odoo_generic_write` runs on the bound connector.
+    "odoo_create", "odoo_write",
 ];
 
 pub struct OdooBoundExecutor { provider: Arc<OdooConnectorProvider> }
@@ -26,7 +28,22 @@ impl BoundConnectorExecutor for OdooBoundExecutor {
             selected.verify_call(&call)?;
             // Reject disallowed operations before credential resolution or an
             // authentication handshake. The handler repeats these same gates.
-            self.provider.check_operation(crate::mcp::classify_odoo_call(call.name(), call.arguments()))?;
+            let generic_write = crate::mcp::generic_write_verb(call.name()).is_some();
+            let operation = if generic_write {
+                crate::mcp::classify_generic_write_call(call.name(), call.arguments())
+            } else {
+                crate::mcp::classify_odoo_call(call.name(), call.arguments())
+            };
+            self.provider.check_operation(operation)?;
+            // RM-120: explicit grant + per-table opt-in, never-writable list,
+            // module / block list and the local argument checks (x2many
+            // commands, archiving, ids) refuse here, before any credential.
+            if generic_write
+                && let Err(refused) = crate::mcp::generic_write_local_gate(call.name(), call.arguments(),
+                    self.provider.home(), self.provider.agent())
+            {
+                return Ok(refused);
+            }
             let prepared = self.provider.prepare(selected, &call).await?;
             let pool = Arc::new(crate::odoo_pool::OdooConnectorPool::new(prepared.global));
             if let Some(config) = prepared.agent {

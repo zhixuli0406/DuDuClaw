@@ -146,6 +146,21 @@ impl Selection {
         }
         Ok(())
     }
+
+    /// The tool snapshot to sign. The `Workspace { employee-work }` grant is
+    /// selected for the file tools only; no selector has chosen an execution
+    /// workspace yet. Every other listed tool whose eligibility would rest on
+    /// that grant (A/E tools such as browser recording, HX6) is left out of
+    /// the capability, so it stays hidden and refused. Only ever narrows.
+    pub(super) fn signed_tools(&self, tools: &List<Text<128>, 256>)
+        -> Result<List<Text<128>, 256>, VerificationError> {
+        if !self.workspace { return Ok(tools.clone()); }
+        // A task run is limited to its task and loses EmployeeScope.
+        let scoped = self.task.is_none();
+        List::new(tools.as_slice().iter().filter(|tool|
+            !duduclaw_mcp_boundary::workspace_selection::needs_execution_workspace(tool.as_str(), scoped))
+            .cloned().collect()).map_err(|_| VerificationError::Invalid)
+    }
 }
 
 /// The employee's current `agent.toml`, read without following symlinks from

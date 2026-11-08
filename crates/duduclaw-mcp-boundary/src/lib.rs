@@ -16,6 +16,7 @@ pub mod resources;
 pub mod forks;
 pub mod parsing;
 pub mod tool_policy;
+pub mod workspace_selection;
 pub mod server;
 #[cfg(feature = "binding-store")]
 pub mod bindings;

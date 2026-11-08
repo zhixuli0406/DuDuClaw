@@ -144,6 +144,10 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "odoo_partner_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "odoo_schema_overview", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "odoo_schema_fields", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    // RM-120 generic create / write: the employee's own Odoo connector; the
+    // explicit-grant gate chain runs in the bound handler (owner decision C).
+    ToolPolicy { name: "odoo_create", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_write", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     // exec
     // H12a: own skill tools read host-owned skill files of the record's own
     // employee and publish only into its own wiki/SKILLS; no workspace input.
@@ -397,7 +401,7 @@ impl AuthorizedToolCall {
 
 /// These service routes orchestrate E stages, but retain the finite resource
 /// authority required when they were direct worker routes.
-fn employee_service_scope(policy: &ToolPolicy) -> bool {
+pub(crate) fn employee_service_scope(policy: &ToolPolicy) -> bool {
     policy.route == Route::Service && !matches!(policy.name,
         "skill_from_recording" | "skill_synthesis_run" | "skill_hub_install" |
         "skill_curator_status" | "meeting_transcribe" | "meeting_transcribe_status" |

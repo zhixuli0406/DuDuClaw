@@ -51,7 +51,13 @@ rechecks (a change refuses the run):
   (`reason: task_not_owned`, `stage: schedule` or `issuance`).
 
 Workspace and URL-origin selection for the other File/A/E tools is still
-missing, including `execute_program`. The parity test tracks this gap
+missing, including `execute_program` and browser recording
+(`browser_record_start` / `browser_record_stop`, task HX6). `employee-work` is
+also the A execution workspace handle, so when the issuer selects it for the
+file tools it leaves every other listed tool whose eligibility would rest on
+that grant out of the signed tool snapshot (`Selection::signed_tools`,
+`mcp-boundary` `workspace_selection::needs_execution_workspace`); those tools
+stay hidden and refused. The parity test tracks this gap
 explicitly; it is unfinished wiring, not another intentional isolation refusal
 or evidence of full employee parity. Until H5 installs the production work
 broker, the file tools stay hidden in production even though the selector
@@ -72,7 +78,9 @@ Service/Connector tools enter `BoundaryRoute::Resource` unless an explicit host 
 
 A/Execution requires a backend that explicitly supports retained workspace authority. `SpawndBackend::with_workspace_bridge` installs the trusted root-receipt hookup and verifies the held directory, exact reservation/runtime/workspace/cwd and live authority. The production B/H receipt producer is still external; default connect refuses workspace plans. Worker/file plans retain authorized tokens through queued work and checked transport. These are implementation readiness requirements, not Linux acceptance.
 
-Calls routed to a connector require an installed per-tool live selection policy, active catalog account, binding verification and bound executor. Executor source coverage is 64/64: native Google/Notion/GitHub (30), Odoo (18), DB (4), channels (8), models (2), computer login (1), search (1). The typed boot registry requires complete selection/execution support before dispatcher construction; the production integration host has not adopted that entry point. Google uses its sealed gateway owner for personal/home OAuth and consent/refresh; actual requester and non-OAuth variants remain pending. Credentials are not copied into the run. Source coverage does not establish complete product/provider parity. See the [round 3 report](native-linux-isolation-security-fixes-2026-11-05.md).
+Calls routed to a connector require an installed per-tool live selection policy, active catalog account, binding verification and bound executor. Executor source coverage is 66/66: native Google/Notion/GitHub (30), Odoo (20, including RM-120 `odoo_create` / `odoo_write`), DB (4), channels (8), models (2), computer login (1), search (1). The typed boot registry requires complete selection/execution support before dispatcher construction; the production integration host has not adopted that entry point. Google uses its sealed gateway owner for personal/home OAuth and consent/refresh; actual requester and non-OAuth variants remain pending. Credentials are not copied into the run. Source coverage does not establish complete product/provider parity. See the [round 3 report](native-linux-isolation-security-fixes-2026-11-05.md).
+
+RM-103 S3 holds in protected mode: Codex, Grok and registered generic CLIs check `CapabilitiesConfig::native_tool_constraints` before the isolated route (`runtime::protected_coarse_native_gate`, repeated in `isolation_mcp::runtime::execute_native` / `execute_registered_cli` before the one-shot authority is consumed). The isolated native profile is root-derived and has no per-run read-only mode, so a native shell **or** write constraint (including the fail-closed config of a malformed `[capabilities]`) refuses the spawn. Protected Claude runs with `--tools ""` (no native tools).
 
 Existing scope, allowed/denied tools, permissions, approvals, record/audience, egress and input guards remain in force. Legacy Service I/O checks after every await are not yet fully instrumented. The typed handler carries authority through awaits; core TaskStore mutations recheck after locks and before writes/commits. Child tasks need explicit scope propagation. The entry check and revocation watch alone do not close that review item. The complete status and verification boundaries are in [the security-fix report](native-linux-isolation-security-fixes-2026-11-05.md).
 
@@ -173,6 +181,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `odoo_partner_search` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
 | `odoo_schema_overview` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
 | `odoo_schema_fields` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; production boot pending |
+| `odoo_create` | Resource → bound Odoo provider; RM-120 gates on the bound connector (explicit grant + per-table generic opt-in, never-writable list, module/block list, x2many commands, related-model authorization, account ACL and field checks); live RPC checks; production boot pending |
+| `odoo_write` | Resource → bound Odoo provider; RM-120 gates on the bound connector (explicit grant + per-table generic opt-in, never-writable list, module/block list, x2many commands, related-model authorization, account ACL and field checks); live RPC checks; production boot pending |
 | `skill_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee + exactly one own Wiki output grant (Confined Wiki), rechecked at publication; own SKILLS bytes parsed by E as data; publishes only into the caller's own wiki, body pages read back before the completion marker (H12a) |
 | `execute_program` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` and spawnd `helper_calls` |
 | `office_script` | HX5 `Route::InRunHelper`: in-run helper in the caller's own run (`ExecutionToolBridge::execute_in_run`, `ExecutionPlanFactory::prepare_in_run`, spawnd `HelperCall`); synchronous result; transport run == target run == `record.run`; needs `Workspace{employee-work}` and spawnd `helper_calls` |

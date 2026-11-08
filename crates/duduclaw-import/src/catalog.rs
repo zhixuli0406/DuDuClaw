@@ -1,5 +1,6 @@
 //! Pinned catalogs for the legacy stores whose schema changed between the
-//! releases a migration may start from (sessions, tasks, cron).
+//! releases a migration may start from (sessions, tasks, cron, memory,
+//! approvals).
 //!
 //! A source is accepted only when its complete `sqlite_schema` is equal to one
 //! pinned catalog; the matching version then selects that version's own column
@@ -18,14 +19,21 @@ pub(crate) const TASKS_V1793: &str = include_str!("tasks-v1793.sql");
 pub(crate) const TASKS_V180: &str = include_str!("tasks-v180.sql");
 pub(crate) const CRON_V1793: &str = include_str!("cron-v1793.sql");
 pub(crate) const CRON_V180: &str = include_str!("cron-v180.sql");
+pub(crate) const MEMORY_V1793: &str = include_str!("memory-v1793.sql");
+pub(crate) const MEMORY_V180: &str = include_str!("memory-v180.sql");
+pub(crate) const APPROVALS_V1793: &str = include_str!("approvals-v1793.sql");
+pub(crate) const APPROVALS_V180: &str = include_str!("approvals-v180.sql");
 const MAX_REPORTED: usize = 16;
 
 /// A legacy store with more than one accepted schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Store { Sessions, Tasks, Cron }
+pub enum Store { Sessions, Tasks, Cron, Memory, Approvals }
 impl Store {
     pub fn file_name(self) -> &'static str {
-        match self { Self::Sessions => "sessions.db", Self::Tasks => "tasks.db", Self::Cron => "cron_tasks.db" }
+        match self {
+            Self::Sessions => "sessions.db", Self::Tasks => "tasks.db", Self::Cron => "cron_tasks.db",
+            Self::Memory => "memory.db", Self::Approvals => "approvals.db",
+        }
     }
 }
 
@@ -43,8 +51,15 @@ struct Catalog { version: SchemaVersion, sql: &'static str }
 static SESSIONS: [Catalog; 2] = [Catalog { version: SchemaVersion::V1793, sql: SESSION_V1793 }, Catalog { version: SchemaVersion::V180, sql: SESSION_V180 }];
 static TASKS: [Catalog; 2] = [Catalog { version: SchemaVersion::V1793, sql: TASKS_V1793 }, Catalog { version: SchemaVersion::V180, sql: TASKS_V180 }];
 static CRON: [Catalog; 2] = [Catalog { version: SchemaVersion::V1793, sql: CRON_V1793 }, Catalog { version: SchemaVersion::V180, sql: CRON_V180 }];
+// Memory and approvals: the newest catalog adds only an index (memory) and two
+// decision-lease columns (approvals) that neither reader is authorized to read.
+static MEMORY: [Catalog; 2] = [Catalog { version: SchemaVersion::V1793, sql: MEMORY_V1793 }, Catalog { version: SchemaVersion::V180, sql: MEMORY_V180 }];
+static APPROVALS: [Catalog; 2] = [Catalog { version: SchemaVersion::V1793, sql: APPROVALS_V1793 }, Catalog { version: SchemaVersion::V180, sql: APPROVALS_V180 }];
 fn catalogs(store: Store) -> &'static [Catalog] {
-    match store { Store::Sessions => &SESSIONS, Store::Tasks => &TASKS, Store::Cron => &CRON }
+    match store {
+        Store::Sessions => &SESSIONS, Store::Tasks => &TASKS, Store::Cron => &CRON,
+        Store::Memory => &MEMORY, Store::Approvals => &APPROVALS,
+    }
 }
 
 /// The exact catalog a source matched.

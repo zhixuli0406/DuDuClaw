@@ -518,6 +518,7 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
         tools: &tools, task, record })
         .map_err(|error| lifecycle::recheck_with(&home, lifecycle, root).err().map_or(error, lifecycle_refusal));
     let selection = select()?;
+    let signed_tools = selection.signed_tools(&tools)?; // file Workspace never signs A/E tools
     let text = |value| Text::new(value).map_err(|_| VerificationError::Invalid);
     let namespace = format!("agent:{agent}");
     let confined = |resource| ResourceGrant::Confined { resource: Box::new(resource) };
@@ -563,7 +564,7 @@ fn human_authorization_with(home: PathBuf, agent: String, employee: EmployeeId,
     // public-web switch or task ownership that changed meanwhile refuses the run.
     if select()? != selection { return Err(VerificationError::Revoked); }
     let mut authorization = super::RuntimeAuthorization { home, agent, grant: GrantPolicy {
-        task: None, principal, binding: lifecycle.binding.clone(), lane, tools,
+        task: None, principal, binding: lifecycle.binding.clone(), lane, tools: signed_tools,
         resources: List::new(resources).map_err(|_| VerificationError::Invalid)?,
         policy_revision: current.policy_epoch, not_before: now, expires_at }, roots: Arc::new(roots),
         origin: WaitOrigin::Gateway, caller: None, turn: Some(turn), authenticated_epoch: Some(epoch) };

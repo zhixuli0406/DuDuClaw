@@ -801,6 +801,9 @@ impl AgentRuntime for GenericCliRuntime {
         crate::explore_lane::refuse_unsupported_runtime("generic CLI")?;
         crate::product_policy::require_runtime(&context.home_dir, self.spec.id)?;
         if duduclaw_core::execution_gate::isolation_required() {
+            // RM-103 S3: the employee's native write/shell restrictions hold in
+            // protected mode too — refused before the isolated route.
+            super::protected_coarse_native_gate(context.capabilities.as_ref(), self.spec.id, &context.agent_id)?;
             #[cfg(target_os = "linux")]
             return crate::isolation_mcp::runtime::execute_registered_cli(
                 self.spec.id, prompt, context, self.spec.headless.output).await;

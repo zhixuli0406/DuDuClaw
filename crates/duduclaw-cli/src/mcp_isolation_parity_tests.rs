@@ -119,6 +119,11 @@ fn documented_refusals() -> BTreeSet<String> {
 // broker and the admin sets `[isolation] public_web = true`, so the production
 // issuer selects both. create_task is no longer task-run only: this interactive
 // run carries the issuer's NewTask grant (H9 owner decision 3).
+// `employee-work` is also the A workspace handle: when the issuer selects it for
+// the file tools it leaves out of the signed snapshot every tool below whose
+// eligibility would rest on that grant (`Selection::signed_tools`). Browser
+// recording is not routed in protected mode yet (HX6), so browser_record_start/
+// stop stay hidden and refused here.
 fn pending_production_selectors() -> BTreeSet<String> {
     // H12a removed skill_extract, shared_skill_adopt, skill_security_scan,
     // skill_graduate and skill_curator_status: they select the issuer's own

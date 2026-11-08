@@ -522,7 +522,8 @@ mod tests {
     async fn migration_import_schema_catalog_matches_fresh_memory_engine() {
         let engine=SqliteMemoryEngine::in_memory().unwrap();let actual=engine.conn_for_maintenance().await;
         let expected=Connection::open_in_memory().unwrap();
-        expected.execute_batch(include_str!("../../duduclaw-import/src/memory-v1793.sql")).unwrap();
+        // A fresh engine is the newest known catalog; memory-v1793.sql pins the older release.
+        expected.execute_batch(include_str!("../../duduclaw-import/src/memory-v180.sql")).unwrap();
         fn schema(conn:&Connection)->Vec<(String,String,String,Option<String>)> {
             conn.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name,tbl_name,sql").unwrap()
                 .query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect()
@@ -540,7 +541,8 @@ mod tests {
         drop(crate::approval::ApprovalStore::open(home.path()).unwrap());
         let actual=Connection::open(home.path().join("approvals.db")).unwrap();
         let expected=Connection::open_in_memory().unwrap();
-        expected.execute_batch(include_str!("../../duduclaw-import/src/approvals-v1793.sql")).unwrap();
+        // Fresh stores are the newest known catalog; approvals-v1793.sql pins the older release.
+        expected.execute_batch(include_str!("../../duduclaw-import/src/approvals-v180.sql")).unwrap();
         assert_eq!(schema(&actual),schema(&expected));
 
         let path=home.path().join("sessions.db");

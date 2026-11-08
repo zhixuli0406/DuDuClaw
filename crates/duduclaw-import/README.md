@@ -43,10 +43,11 @@ and work-product sources emit only a root-bound handle, size and recomputed SHA-
 the root copier publishes bytes after employee allocation is confirmed. SQLite is copied into the
 worker's private temporary directory, with WAL replay only on that copy.
 
-Supported source versions: `sessions.db`, `tasks.db` and `cron_tasks.db` are
-accepted from **v1.79.3** and **v1.80.x** (1.80.0/1.80.1 share one catalog).
-Each version has its own pinned catalog (`session-v1793.sql` / `session-v180.sql`,
-`tasks-v1793.sql` / `tasks-v180.sql`, `cron-v1793.sql` / `cron-v180.sql`) and its
+Supported source versions: `sessions.db`, `tasks.db`, `cron_tasks.db`, `memory.db`
+and `approvals.db` are accepted from **v1.79.3** and **v1.80.x** (1.80.0/1.80.1 share
+one catalog). Each version has its own pinned catalog (`session-v1793.sql` / `session-v180.sql`,
+`tasks-v1793.sql` / `tasks-v180.sql`, `cron-v1793.sql` / `cron-v180.sql`,
+`memory-v1793.sql` / `memory-v180.sql`, `approvals-v1793.sql` / `approvals-v180.sql`) and its
 own column mapping (`src/catalog.rs` detects the version). Detection is exact: the
 source's whole `sqlite_schema` must equal one catalog row for row (sessions also
 with the exact reviewed `channel_settings` extension); the closest catalog is used
@@ -63,16 +64,25 @@ by child tasks); cron actor columns (`on_behalf_of`, and v1.80 `created_by_user_
 tasks and cron catalogs were reconstructed from the v1.80 catalogs and the
 changelog, not captured from a v1.79.3 build; each file header says what was
 removed and why. Verify them against a real v1.79.3 home before release.
-The memory, users, approvals, channel-settings, workflow and autopilot stores still
+The newest memory catalog adds only the RM-039 index `idx_memories_subject_ts`, and
+the newest approvals catalog only the RM-027 decision-lease columns
+`approvals.lease_token` / `lease_until`; both versions use the same column mapping
+(memory reads the same content columns, approvals only ids and the authority schema
+version), so the lease columns are never authorized for reading. These two `-v180`
+catalogs describe the current fresh stores; whether a released v1.80.1 home already
+had these objects has not been verified, so a v1.80.1 home without them must match
+the `-v1793` catalog exactly or it is refused.
+The users, channel-settings, workflow and autopilot stores still
 have a single `*-v1793.sql` catalog each, compared byte-for-byte as before; whether
 their v1.80 stores differ has not been reviewed (for example, the v1.80.0
 `mfa_email_codes`, `mfa_passkeys` and `remembered_*` tables are not in
 `users-v1793.sql`). Extra tables,
 columns, indexes, views or triggers reject the whole source; other historical
 variants are deliberately rejected until exact catalogs are reviewed.
-`memory-v1793.sql` is reproducible from the reviewed fresh engine SQL with
-`scripts/capture_memory_schema.py`; the gateway regression test compares that
-fixture against an actual fresh `SqliteMemoryEngine`. Memory emits only live,
+`memory-v180.sql` is reproducible from the reviewed fresh engine SQL with
+`scripts/capture_memory_schema.py` (and `approvals-v180.sql` with
+`scripts/capture_approval_schema.py`); the gateway regression tests compare these
+fixtures against an actual fresh `SqliteMemoryEngine` / `ApprovalStore`. Memory emits only live,
 non-quarantined memory text and key-fact text, never old trust or provenance. No best-effort schema guessing is performed.
 
 Records are provisional until exit succeeds: a consumer must stage the complete
