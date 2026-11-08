@@ -2,10 +2,6 @@
 
 ## [Unreleased]
 
-### Security
-
-- `code_map` 只掃描呼叫它的 AI 員工自己的目錄（或管理者在 `[files] allowed_roots` 宣告的目錄）：沒指定 `root` 時就是員工目錄，相對路徑也從那裡解析，範圍外的目錄與無法辨識為員工的呼叫者（外部金鑰、管理者金鑰、沒有員工身分的內部金鑰）都會被拒絕並留下稽核紀錄。讀檔時逐層不跟隨符號連結，略過硬連結檔案與非一般檔案，也不跨越掛載點；Linux 另比對掛載 id，同一檔案系統上的 bind mount 也會被擋下。單獨模式（`mcp init`）的金鑰不再列出 `code_map`，工具數從 24 個變成 23 個。
-- 只有 `main` 員工預設可以建立員工（`[permissions] can_create_agents`）。其他角色沒寫這個設定時視為關閉，MCP 的 `create_agent`／`spawn_ephemeral` 會拒絕；儀表板與 `duduclaw agent create` 只替 main 預設開啟，evaluator 範本與付費團隊套件的非 main 角色預設關閉，員工透過 MCP 建立的員工一律關閉，只有開啟權限的 main 員工能建立新的 main 員工；v1.68 的開機遷移不再替非 main 員工打開它，非管理員的 Owner 也不能再在缺少設定的非 main 員工上寫入 `true` 繞過管理員檢查。**行為變更：** `agent.toml` 沒有 `can_create_agents` 設定的非 main 員工，升級後不能再建立員工；需要時請由管理員在儀表板「工具與權限」開啟。
 ### Added
 
 - 新增 ModuleLease 核心 API 與跨程序狀態儲存試作，僅為模組化的內部基礎建設，尚未接入功能入口，沒有使用者可見變更。
@@ -26,6 +22,11 @@
 
 - 修正技能庫頁面在「等待生成」期間不斷閃爍、重複載入並清掉已填內容的問題，現在只會在需要時以較低頻率更新狀態。
 - 修正自建技能「生成」失敗時會一直等待的問題：現在會顯示失敗原因、超過 3 分鐘提示「比平常久」，並可一鍵重試；超過 10 分鐘會自動視為失敗。
+
+### Security
+
+- `code_map` 只掃描呼叫它的 AI 員工自己的目錄（或管理者在 `[files] allowed_roots` 宣告的目錄）：沒指定 `root` 時就是員工目錄，相對路徑也從那裡解析，範圍外的目錄與無法辨識為員工的呼叫者（外部金鑰、管理者金鑰、沒有員工身分的內部金鑰）都會被拒絕並留下稽核紀錄。讀檔時逐層不跟隨符號連結，略過硬連結檔案與非一般檔案，也不跨越掛載點；Linux 另比對掛載 id，同一檔案系統上的 bind mount 也會被擋下。單獨模式（`mcp init`）的金鑰不再列出 `code_map`，工具數從 24 個變成 23 個。
+- 只有 `main` 員工預設可以建立員工（`[permissions] can_create_agents`）。其他角色沒寫這個設定時視為關閉，MCP 的 `create_agent`／`spawn_ephemeral` 會拒絕；儀表板與 `duduclaw agent create` 只替 main 預設開啟，evaluator 範本與付費團隊套件的非 main 角色預設關閉，員工透過 MCP 建立的員工一律關閉，只有開啟權限的 main 員工能建立新的 main 員工；v1.68 的開機遷移不再替非 main 員工打開它，非管理員的 Owner 也不能再在缺少設定的非 main 員工上寫入 `true` 繞過管理員檢查。**行為變更：** `agent.toml` 沒有 `can_create_agents` 設定的非 main 員工，升級後不能再建立員工；需要時請由管理員在儀表板「工具與權限」開啟。
 
 ## [1.80.1] - 2026-11-07 — macOS／Windows 下載版修正
 
