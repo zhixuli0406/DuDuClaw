@@ -140,6 +140,10 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "odoo_partner_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "odoo_schema_overview", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "odoo_schema_fields", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    // RM-120 generic create / write: the employee's own Odoo connector; the
+    // explicit-grant gate chain runs in the bound handler (owner decision C).
+    ToolPolicy { name: "odoo_create", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_write", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     // exec
     // H12a: own skill tools read host-owned skill files of the record's own
     // employee and publish only into its own wiki/SKILLS; no workspace input.

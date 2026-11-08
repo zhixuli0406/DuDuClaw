@@ -385,6 +385,9 @@ impl AgentRuntime for GrokRuntime {
         #[cfg(target_os = "linux")]
         if duduclaw_core::execution_gate::isolation_required() {
             crate::explore_lane::refuse_unsupported_runtime("grok")?;
+            // RM-103 S3: the employee's native write/shell restrictions hold in
+            // protected mode too — refused before the isolated route.
+            super::protected_coarse_native_gate(context.capabilities.as_ref(), "grok", &context.agent_id)?;
             let payload = build_prompt(context, prompt);
             let out = crate::isolation_mcp::runtime::execute_native(
                 duduclaw_isolation::execution::RuntimeKind::Grok, payload.clone(), context).await?;

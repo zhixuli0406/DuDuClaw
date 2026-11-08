@@ -579,7 +579,8 @@ pub fn provider_for_tool(tool: &str) -> Option<&'static str> {
         "odoo_connect" | "odoo_status" | "odoo_crm_leads" | "odoo_crm_create_lead" | "odoo_crm_update_stage" |
         "odoo_sale_orders" | "odoo_sale_create_quotation" | "odoo_sale_confirm" | "odoo_inventory_products" |
         "odoo_inventory_check" | "odoo_invoice_list" | "odoo_payment_status" | "odoo_search" | "odoo_execute" |
-        "odoo_report" | "odoo_partner_search" | "odoo_schema_overview" | "odoo_schema_fields" => "odoo",
+        "odoo_report" | "odoo_partner_search" | "odoo_schema_overview" | "odoo_schema_fields" |
+        "odoo_create" | "odoo_write" => "odoo",
         "db_sources" | "db_tables" | "db_select" | "db_query" => "database",
         "group_history_read" | "send_message" | "send_photo" | "send_sticker" |
         "channel_config" | "channel_config_list" | "channel_status" | "pairing_manage" => "channel",

@@ -104,14 +104,14 @@ async fn handle_odoo_tool_with_connector(
 
     // RM-120: generic create / write carry their own explicit-grant gate
     // chain (`odoo_generic_write.rs`); the permissive per-agent filter below
-    // never authorizes them.
+    // never authorizes them. Protected mode (owner decision C) runs the same
+    // chain on the employee's own isolation connector: no pool lookup.
     if matches!(tool, "odoo_create" | "odoo_write") {
-        // The generic-write gate chain resolves its connection through the
-        // pool, which the isolation-bound path must never reach. Fail closed.
-        if bound.is_some() {
-            return super::egress_gate::pre_dispatch_error("This Odoo capability is not available. This is a policy decision; retrying the same call will not succeed. 這項 Odoo 功能不提供；這是政策限制，重試相同呼叫不會成功。");
-        }
-        return super::odoo_generic_write::handle_odoo_generic_write(tool, params, home_dir, odoo, caller_agent).await;
+        return match bound {
+            Some(connector) => super::odoo_generic_write::handle_bound_odoo_generic_write(
+                tool, params, home_dir, odoo, caller_agent, connector).await,
+            None => super::odoo_generic_write::handle_odoo_generic_write(tool, params, home_dir, odoo, caller_agent).await,
+        };
     }
 
     if !matches!(tool,

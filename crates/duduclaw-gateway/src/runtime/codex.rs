@@ -1474,6 +1474,9 @@ impl AgentRuntime for CodexRuntime {
         super::isolation_gate::require_integrated(super::isolation_gate::PendingRuntime::Codex)?;
         #[cfg(target_os = "linux")]
         if duduclaw_core::execution_gate::isolation_required() {
+            // RM-103 S3: the employee's native write/shell restrictions hold in
+            // protected mode too — refused before the isolated route.
+            super::protected_coarse_native_gate(context.capabilities.as_ref(), "codex", &context.agent_id)?;
             let payload = super::generic_cli::build_prompt(context, prompt, "codex");
             let out = crate::isolation_mcp::runtime::execute_native(
                 duduclaw_isolation::execution::RuntimeKind::Codex, payload, context).await?;
