@@ -258,7 +258,11 @@ impl BoundConnectorExecutor for NativeConnectorExecutor {
                 validate_google_recipients(call.arguments())?;
             }
             let selected = Arc::new(selected);
-            let token = credential(&selected, self.credentials.as_ref()).await?;
+            // v1.81 E3: a provider that refreshes (GitHub home token) checks
+            // `verify_before_io` after the exchange and before storing the new
+            // token; scoping the acquisition makes that the full selection recheck.
+            let token = duduclaw_mcp_boundary::io_authority::scope(selected.io_context(),
+                credential(&selected, self.credentials.as_ref())).await?;
             self.policy.check(selected.provider())?;
             let expires_at = token.expires_at;
             BOUND_CONNECTOR.scope(selected.clone(), CREDENTIAL_EXPIRY.scope(expires_at,

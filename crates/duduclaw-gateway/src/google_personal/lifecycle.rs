@@ -104,7 +104,21 @@ pub(crate) fn disconnect_material(
 /// Google reported the grant revoked (`invalid_grant`). Fence the routes
 /// before the credential is marked; a fence failure is audited and never
 /// blocks marking the credential unusable.
+///
+/// v1.81 E3: every Personal refresh path calls this (legacy resolve, meeting
+/// import, pinned effect/remote MCP resolution). The fence is skipped only
+/// when the vault proves a DIFFERENT credential is current — a reconnect
+/// published while this refresh was in flight, so the dead grant is not the
+/// connection the routes now stand for. An unreadable vault or a missing
+/// record still fences (fail closed; a repeated fence is a no-op).
 pub(crate) fn consent_revoked(home: &Path, metadata: &Metadata) {
+    if vault::get(home, &metadata.owner_id)
+        .ok()
+        .flatten()
+        .is_some_and(|current| current.metadata.credential_id != metadata.credential_id)
+    {
+        return;
+    }
     if let Some(target) = Target::personal(&metadata.owner_id, "google") {
         let subject = google_subject(&metadata.google_sub);
         let hint = subject.as_ref().map_or(Hint::Leave, Hint::Record);

@@ -14,6 +14,9 @@ pub(crate) mod google_home_test_fixture;
 /// v1.81 C4: refresh redirect + strict client-config read.
 #[cfg(test)]
 mod c4_tests;
+/// v1.81 E3: non-redirecting exchange, home invalid-grant fence, refresh recheck.
+#[cfg(test)]
+mod e3_tests;
 #[path = "mcp_oauth/home_lifecycle.rs"]
 pub(crate) mod home_lifecycle;
 #[path = "mcp_oauth/home_store.rs"]
@@ -659,7 +662,9 @@ pub async fn exchange_code(
     require_generic_non_google(config)?;
     #[cfg(test)]
     home_store::test_probe::provider(&config.client_id);
-    let client = reqwest::Client::new();
+    // v1.81 E3 (C4 open question 3): the exchange body carries the code,
+    // PKCE verifier and client secret. A redirect is never followed.
+    let client = token_endpoint_client().map_err(|_| "Token request failed: client unavailable".to_string())?;
     let plan = build_exchange_request(config, code, code_verifier);
 
     let mut req = client.post(&plan.url);
@@ -680,6 +685,10 @@ pub async fn exchange_code(
         .map_err(|e| format!("Token request failed: {e}"))?;
 
     let status = resp.status();
+    if status.is_redirection() {
+        // Never followed and never parsed: a redirecting token endpoint is a failure.
+        return Err(format!("Token exchange failed ({status}): redirect refused"));
+    }
     let body: serde_json::Value = resp
         .json()
         .await
@@ -727,10 +736,35 @@ pub async fn exchange_code(
 /// refresh token and client secret in its body. A redirect from the token
 /// endpoint is never followed (a 3xx is a failed refresh), so the grant can
 /// never be replayed to another host or downgraded scheme.
-fn refresh_client() -> reqwest::Result<reqwest::Client> {
+/// The exchange (`exchange_code`) uses the same non-redirecting client (E3).
+fn token_endpoint_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
+}
+
+/// Why a home OAuth refresh failed (v1.81 E3). `InvalidGrant` means the
+/// provider reported the refresh grant itself dead — consent revoked, app
+/// uninstalled or the refresh token rotated away (RFC 6749 `invalid_grant`;
+/// GitHub answers `bad_refresh_token`, possibly with HTTP 200). Callers fence
+/// the provider's SharedHome catalog routes on it before anything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RefreshFailure {
+    InvalidGrant(String),
+    Failed(String),
+}
+impl RefreshFailure {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::InvalidGrant(message) | Self::Failed(message) => message,
+        }
+    }
+}
+fn dead_refresh_grant(body: &serde_json::Value) -> bool {
+    matches!(
+        body.get("error").and_then(|v| v.as_str()),
+        Some("invalid_grant" | "bad_refresh_token")
+    )
 }
 
 /// Refresh an expired token using a refresh_token grant.
@@ -738,8 +772,20 @@ pub async fn refresh_token(
     config: &McpOAuthConfig,
     refresh_tok: &str,
 ) -> Result<McpOAuthToken, String> {
-    require_generic_non_google(config).map_err(|_| home_store::Error::PendingWiring.to_string())?;
-    let client = refresh_client().map_err(|_| "Refresh request failed: client unavailable".to_string())?;
+    refresh_token_checked(config, refresh_tok)
+        .await
+        .map_err(RefreshFailure::into_message)
+}
+
+/// [`refresh_token`] with the dead-grant case distinguished.
+pub(crate) async fn refresh_token_checked(
+    config: &McpOAuthConfig,
+    refresh_tok: &str,
+) -> Result<McpOAuthToken, RefreshFailure> {
+    require_generic_non_google(config)
+        .map_err(|_| RefreshFailure::Failed(home_store::Error::PendingWiring.to_string()))?;
+    let client = token_endpoint_client()
+        .map_err(|_| RefreshFailure::Failed("Refresh request failed: client unavailable".to_string()))?;
     let params = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_tok),
@@ -753,31 +799,38 @@ pub async fn refresh_token(
         .form(&params)
         .send()
         .await
-        .map_err(|e| format!("Refresh request failed: {e}"))?;
+        .map_err(|e| RefreshFailure::Failed(format!("Refresh request failed: {e}")))?;
 
     let status = resp.status();
     if status.is_redirection() {
         // Never followed and never parsed: a redirecting token endpoint is a failure.
-        return Err(format!("Token refresh failed ({status}): redirect refused"));
+        return Err(RefreshFailure::Failed(format!("Token refresh failed ({status}): redirect refused")));
     }
     let body: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("Failed to parse refresh response: {e}"))?;
+        .map_err(|e| RefreshFailure::Failed(format!("Failed to parse refresh response: {e}")))?;
 
-    if !status.is_success() {
-        let err = body
-            .get("error_description")
+    let described = || {
+        body.get("error_description")
             .or_else(|| body.get("error"))
             .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        return Err(format!("Token refresh failed ({status}): {err}"));
+            .unwrap_or("unknown error")
+            .to_owned()
+    };
+    if !status.is_success() || (dead_refresh_grant(&body) && body.get("access_token").is_none()) {
+        let message = format!("Token refresh failed ({status}): {}", described());
+        return Err(if dead_refresh_grant(&body) {
+            RefreshFailure::InvalidGrant(message)
+        } else {
+            RefreshFailure::Failed(message)
+        });
     }
 
     let access_token = body
         .get("access_token")
         .and_then(|v| v.as_str())
-        .ok_or("Missing access_token in refresh response")?
+        .ok_or_else(|| RefreshFailure::Failed("Missing access_token in refresh response".into()))?
         .to_string();
 
     let new_refresh = body
@@ -981,6 +1034,26 @@ pub(crate) fn remove_home_credential(
     let subject = crate::isolation_connectors::RelinkSubject::home(provider).ok();
     let hint = subject.as_ref().map_or(Hint::Cancel, Hint::Record);
     revoke_then(home, &target, hint, "home_oauth_disconnect", remove).map_err(home_event_message)
+}
+
+/// v1.81 E3: the provider reported the home grant dead (`invalid_grant` /
+/// GitHub `bad_refresh_token`). Fence (revoke) the provider's SharedHome
+/// catalog routes BEFORE the caller marks or drops any material, with a relink
+/// hint so a later home reconnect recreates them under new ids (as for a home
+/// disconnect). The caller's current request fails regardless of the result;
+/// a fence failure is audited by the event helper and returned. Providers
+/// without catalog routes, and homes without a catalog, change nothing.
+pub(crate) fn home_consent_revoked(
+    home: &Path,
+    provider: &str,
+) -> Result<(), crate::isolation_connectors::CatalogError> {
+    use crate::isolation_connector_events::{Hint, Target, fence};
+    let Some(target) = Target::home(provider) else {
+        return Ok(());
+    };
+    let subject = crate::isolation_connectors::RelinkSubject::home(provider).ok();
+    let hint = subject.as_ref().map_or(Hint::Leave, Hint::Record);
+    fence(home, &target, hint, "home_oauth_consent_revoked").map(|_| ())
 }
 
 /// Upsert a token: replace existing for same provider_id, or append.

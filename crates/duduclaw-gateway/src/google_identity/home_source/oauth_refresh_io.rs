@@ -262,6 +262,20 @@ pub(super) async fn refresh_once_budget(
     if !success {
         let body = JsonBody(serde_json::from_slice(&bytes).unwrap_or(Value::Null));
         if body.0["error"].as_str() == Some("invalid_grant") {
+            // v1.81 E3: the home grant is dead. Fence (revoke) the SharedHome
+            // google catalog routes BEFORE the material is marked for
+            // reconnect. The fence is a product event and does not depend on
+            // this request's own isolation scope, but it does require that
+            // the dead grant is still the stored home grant (a reconnect that
+            // published meanwhile must keep its routes). This call fails
+            // either way; a fence failure is audited by the event helper.
+            let still_current = with_metadata(home, |g, source| {
+                require_receipt(g, source, receipt)?;
+                home_store::require_home_oauth_capture(g, source, &capture.original, &capture.identity)
+            });
+            if still_current.is_ok() {
+                let _ = crate::mcp_oauth::home_consent_revoked(home, "google");
+            }
             validate_capture(home, receipt, capture)?;
             crate::mcp_oauth::record_google_invalid_grant(home, &setup_stamp).map_err(|_| Error::Io)?;
         }

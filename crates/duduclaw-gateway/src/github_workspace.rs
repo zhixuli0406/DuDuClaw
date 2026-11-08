@@ -302,15 +302,50 @@ pub async fn get_valid_github_token(home_dir: &Path) -> Result<String, GithubAut
         redirect_uri: client_cfg.redirect_uri,
     };
 
-    let mut refreshed = mcp_oauth::refresh_token(&oauth_config, &refresh_tok)
-        .await
-        .map_err(GithubAuthError::RefreshFailed)?;
+    // v1.81 E3: an isolated acquisition runs inside its selection's I/O
+    // scope; a route revoked before the grant is sent refuses here.
+    duduclaw_mcp_boundary::io_authority::verify_before_io()
+        .map_err(|_| GithubAuthError::RefreshFailed(REFRESH_REVOKED.into()))?;
+    let mut refreshed = match mcp_oauth::refresh_token_checked(&oauth_config, &refresh_tok).await {
+        Ok(refreshed) => refreshed,
+        Err(mcp_oauth::RefreshFailure::InvalidGrant(message)) => {
+            // The home grant is dead (app revoked / token rotated away). Fence
+            // the SharedHome github routes first, unless a reconnect already
+            // replaced the token this refresh started from (then the dead
+            // grant is not the current connection). This call fails either way.
+            if current_refresh_token(home_dir).is_none_or(|current| current == refresh_tok) {
+                let _ = mcp_oauth::home_consent_revoked(home_dir, GITHUB_PROVIDER);
+            }
+            return Err(GithubAuthError::RefreshFailed(message));
+        }
+        Err(failure) => return Err(GithubAuthError::RefreshFailed(failure.into_message())),
+    };
+    // v1.81 E3 (matrix 8): re-check the selection (route active + generation
+    // + binding) after the exchange returned and BEFORE the new token is
+    // stored or used. Revoked ⇒ the new token is discarded and this call fails.
+    if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() {
+        zeroize::Zeroize::zeroize(&mut refreshed.access_token);
+        if let Some(token) = refreshed.refresh_token.as_mut() {
+            zeroize::Zeroize::zeroize(token);
+        }
+        return Err(GithubAuthError::RefreshFailed(REFRESH_REVOKED.into()));
+    }
     if refreshed.scopes.is_empty() {
         refreshed.scopes = existing.scopes.clone();
     }
     let access = refreshed.access_token.clone();
     mcp_oauth::upsert_token(home_dir, refreshed).map_err(GithubAuthError::RefreshFailed)?;
     Ok(access)
+}
+
+const REFRESH_REVOKED: &str = "the connector route changed during the refresh";
+
+/// The stored GitHub refresh token right now, or `None` when unreadable/absent.
+fn current_refresh_token(home_dir: &Path) -> Option<String> {
+    mcp_oauth::load_tokens(home_dir)
+        .into_iter()
+        .find(|t| t.provider_id == GITHUB_PROVIDER)
+        .and_then(|t| t.refresh_token)
 }
 
 // ── HTTP plumbing ───────────────────────────────────────────────────────────

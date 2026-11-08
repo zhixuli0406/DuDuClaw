@@ -164,6 +164,12 @@ pub async fn resolve_person_for_tool(
             crate::google_personal::access::resolve(home, agent, requester, people, &eff, tool)
                 .await;
         return match outcome {
+            // v1.81 E3: inside an isolated request the only home fallback is
+            // the catalog-backed explicit SharedHome route (C2); this legacy
+            // resolver never switches a Personal call to the home account.
+            Err(r) if r.fallback_eligible && duduclaw_mcp_boundary::io_authority::is_scoped() => {
+                Err(Refusal { fallback_eligible: false, ..r })
+            }
             Err(r) if r.fallback_eligible && eff.fallback == Fallback::Home => {
                 Ok(Resolved::UseHome {
                     fallback: true,
