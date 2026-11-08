@@ -259,6 +259,11 @@ fn now() -> Result<i64, &'static str> {
 }
 
 fn valid_label(label: &str) -> bool {
+    duduclaw_core::is_valid_new_agent_id(label) && !duduclaw_core::is_reserved_agent_id(label)
+        && label != duduclaw_core::UNTRUSTED_AGENT_ID
+}
+
+fn valid_existing_label(label: &str) -> bool {
     duduclaw_core::is_valid_agent_id(label) && !duduclaw_core::is_reserved_agent_id(label)
         && label != duduclaw_core::UNTRUSTED_AGENT_ID
 }
@@ -636,7 +641,7 @@ fn stage_prepared(home: &Path, proof: Option<&MigrationConfirmationSession>, use
 fn tombstone(home: &Path, proof: Option<&MigrationConfirmationSession>, user: &str, input: TombstoneRequest, now: i64)
     -> Result<Value, &'static str> {
     authorize_step_up(proof, user, &input.csrf_token, now)?;
-    if !valid_label(&input.label) { return Err(LABEL_INVALID); }
+    if !valid_existing_label(&input.label) { return Err(LABEL_INVALID); }
     let employee = EmployeeId(parse_hex16(&input.employee_id).ok_or(EMPLOYEE_NOT_FOUND)?);
     lifecycle::tombstone_personal_employee(home, &input.label, employee).map_err(|error| match error {
         LifecycleError::Unavailable => STORE_UNAVAILABLE,
