@@ -345,14 +345,23 @@ export interface DoctorCheck {
 export type EditionProfile = 'personal' | 'enterprise';
 
 export type IsolationComponentState = 'ready' | 'unavailable' | 'pending_integration';
+export type IsolationReasonCode = 'binding_evidence_missing' | 'connector_setup_required' |
+  'personal_binding_conflict' | 'revoked' | 'service_unavailable';
+export interface IsolationReason {
+  code: IsolationReasonCode;
+  /** Connector provider family (only for `connector_setup_required`). */
+  provider?: string;
+}
 export interface IsolationReadiness {
   required: boolean;
+  /** Admission truth: every required component verified. */
   ready: boolean;
-  reasons?: Array<{
-    code: 'binding_evidence_missing' | 'connector_setup_required' | 'personal_binding_conflict' |
-      'revoked' | 'service_unavailable';
-    provider?: string;
-  }>;
+  /** Overall status over components and reasons (F3 gateways). */
+  status?: 'ready' | 'action_required' | 'service_unavailable';
+  /** Distinct reasons over all protected employees. */
+  reasons?: IsolationReason[];
+  /** Admins only: per-employee reasons. */
+  employees?: Array<{ label: string; ready: boolean; reasons: IsolationReason[] }>;
   correlation_id?: string;
   components: Record<'launch_service' | 'sandbox' | 'network' | 'storage' |
     'parse_worker' | 'update_service' | 'mcp_boundary' | 'runtime_adapters', IsolationComponentState>;

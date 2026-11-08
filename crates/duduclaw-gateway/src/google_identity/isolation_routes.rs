@@ -94,6 +94,12 @@ impl GoogleAccountRoutes {
         Ok(routes)
     }
 
+    /// Readiness (F3): the same route resolution as [`Self::read`] for a
+    /// lifecycle the caller has just read; only the typed outcome is kept.
+    pub(crate) fn readiness(catalog: &ConnectorCatalog, lifecycle: &EmployeeLifecycle) -> Result<(), GoogleRoutesError> {
+        Self::from_lifecycle(catalog, lifecycle).map(|_| ())
+    }
+
     fn from_lifecycle(catalog: &ConnectorCatalog, lifecycle: &EmployeeLifecycle)
         -> Result<Self, GoogleRoutesError> {
         let routes = catalog.active_routes_for(&lifecycle.binding).map_err(|_| GoogleRoutesError::Unavailable)?;

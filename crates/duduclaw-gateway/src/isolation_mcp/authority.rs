@@ -65,7 +65,7 @@ fn snapshot_user(principal: &Principal) -> Option<&str> {
 /// principal is the Human owner, the snapshot's human is that owner, the
 /// mirror records that owner, and the owner is the agent's only member.
 /// Also for the B2 issuer, which must apply exactly these checks.
-pub(super) fn personal_facts(agent: &str, owner: &str, principal: &Principal, current: &IsolationAuthoritySnapshot)
+pub(crate) fn personal_facts(agent: &str, owner: &str, principal: &Principal, current: &IsolationAuthoritySnapshot)
     -> Result<(), VerificationError> {
     // Never a Background principal, whatever its tenant or generation.
     let Principal::Human { user_id, .. } = principal else { return Err(VerificationError::Revoked); };

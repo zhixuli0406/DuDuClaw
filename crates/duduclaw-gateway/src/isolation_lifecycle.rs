@@ -303,6 +303,60 @@ pub(crate) fn tombstone_personal_employee(home: &Path, label: &str, employee: Em
     remove_personal_mirror(home, label, owner.as_str()).map(|_| ())
 }
 
+/// One confirmed protected employee as listed for readiness (F3): the label
+/// and what the stored receipt says. Never authority; every listed label is
+/// still resolved through [`read_lifecycle_with`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfirmedEntry {
+    pub(crate) label: String,
+    pub(crate) personal: bool,
+    pub(crate) disabled: bool,
+}
+
+/// Readiness (F3): every confirmed label, through the hardened opener. No
+/// `apply.db` (nothing was ever confirmed) is an empty list; an unsafe or
+/// unreadable store, a corrupt row or more than `limit` rows is
+/// `Unavailable` (never a shortened list that hides an employee).
+pub(crate) fn confirmed_entries(home: &Path, limit: usize) -> Result<Vec<ConfirmedEntry>, LifecycleError> {
+    use LifecycleError::Unavailable;
+    match std::fs::symlink_metadata(home.join(APPLY_DB)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(Unavailable),
+        Ok(_) => {}
+    }
+    let db = open_store(home, APPLY_DB, Access::ReadOnly)?;
+    let table: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='confirmed_employees')",
+        [], |r| r.get(0)).map_err(|_| Unavailable)?;
+    if !table { return Ok(Vec::new()); }
+    let bound = i64::try_from(limit.saturating_add(1)).map_err(|_| Unavailable)?;
+    let mut query = db.prepare("SELECT label,receipt FROM confirmed_employees ORDER BY label LIMIT ?1")
+        .map_err(|_| Unavailable)?;
+    let rows = query.query_map([bound], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|_| Unavailable)?.collect::<Result<Vec<_>, _>>().map_err(|_| Unavailable)?;
+    if rows.len() > limit { return Err(Unavailable); }
+    rows.into_iter().map(|(label, encoded)| {
+        let receipt: Receipt = serde_json::from_str(&encoded).map_err(|_| Unavailable)?;
+        if receipt.label != label || !valid_label(&label) { return Err(Unavailable); }
+        Ok(ConfirmedEntry { personal: matches!(receipt.principal_binding, Some(EmployeeBinding::Personal(_))),
+            disabled: receipt.disabled, label })
+    }).collect()
+}
+
+/// Readiness (F3): one users.db read snapshot of `label` with `owner` as the
+/// human, through the hardened opener, for the B1 `personal_facts` rule. The
+/// owner-less read runs first in the same transaction so an unreadable store
+/// is `Unavailable`; `Ok(None)` = the owner is not currently assignable.
+pub(crate) fn personal_snapshot(home: &Path, label: &str, owner: &str)
+    -> Result<Option<duduclaw_auth::IsolationAuthoritySnapshot>, LifecycleError> {
+    let mut users = open_store(home, USERS_DB, Access::ReadOnly)?;
+    let tx = users.transaction().map_err(|_| LifecycleError::Unavailable)?;
+    duduclaw_auth::read_isolation_authority_in(&tx, None, label).map_err(|_| LifecycleError::Unavailable)?;
+    let snapshot = duduclaw_auth::read_isolation_authority_in(&tx, Some(owner), label).ok();
+    tx.finish().map_err(|_| LifecycleError::Unavailable)?;
+    Ok(snapshot)
+}
+
 /// Private quarantine for tombstoned Personal employees' directories,
 /// directly in the DuDuClaw home (same filesystem as `agents/`).
 pub(crate) const QUARANTINE_DIR: &str = "isolation-quarantine";

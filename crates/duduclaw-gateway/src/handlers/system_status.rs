@@ -35,6 +35,19 @@ impl MethodHandler {
     /// `system.status_changed` broadcast so an open dashboard reflects a live
     /// edition change (e.g. license activation) without a manual refresh.
     pub(crate) async fn system_status_payload(&self) -> Value {
+        self.system_status_payload_for(false).await
+    }
+
+    /// `admin` adds per-employee isolation readiness labels (F3). Broadcasts
+    /// go to every role and therefore always use `false`.
+    pub(crate) async fn system_status_payload_for(&self, admin: bool) -> Value {
+        // F3 reasons read SQLite stores and the root ReadBack: blocking pool.
+        let home = self.home_dir.clone();
+        let isolation_readiness = match tokio::task::spawn_blocking(
+            move || crate::isolation_readiness::report(&home, admin)).await {
+            Ok(readiness) => readiness,
+            Err(_) => crate::isolation_readiness::report_failed(),
+        };
         let reg = self.registry.read().await;
         let uptime = self.start_time.elapsed().as_secs();
         let channel_map = self.channel_status.read().await;
@@ -90,15 +103,17 @@ impl MethodHandler {
             // Without it `[telemetry] otlp_endpoint` is accepted and saved but
             // exports nothing, so the settings page says so next to the field.
             "otel_compiled": cfg!(feature = "otel"),
-            "isolation_readiness": crate::isolation_readiness::status(),
+            // F3: components plus fixed reason codes (`reasons`, `status`);
+            // employee labels only for admins. No paths, ids or raw errors.
+            "isolation_readiness": isolation_readiness,
         });
         let policy = crate::mfa::policy_status(&self.home_dir);
         if policy["degraded"] == true { payload["mfa_policy"] = policy; }
         payload
     }
 
-    pub(crate) async fn handle_system_status(&self) -> WsFrame {
-        WsFrame::ok_response("", self.system_status_payload().await)
+    pub(crate) async fn handle_system_status(&self, admin: bool) -> WsFrame {
+        WsFrame::ok_response("", self.system_status_payload_for(admin).await)
     }
 
     /// Push a fresh `system.status` to every connected dashboard so live

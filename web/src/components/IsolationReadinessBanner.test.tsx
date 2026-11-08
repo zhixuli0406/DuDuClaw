@@ -139,6 +139,64 @@ describe('IsolationReadinessBanner', () => {
     expect(screen.queryByText('Service details')).not.toBeInTheDocument();
   });
 
+  it.each([
+    ['binding_evidence_missing', undefined, 'Account binding setup is not complete.',
+      'Finish employee setup in migration confirmations', '/app/system/migration'],
+    ['connector_setup_required', 'database', 'Database connection setup is not complete.',
+      'Go to connector settings', '/manage/integrations'],
+    ['connector_setup_required', undefined, 'External connection service setup is not complete.',
+      'Go to connector settings', '/manage/integrations'],
+    ['personal_binding_conflict', undefined,
+      'This AI employee’s dedicated account binding cannot currently be used in protected mode. Ask an administrator to check isolation readiness.',
+      'Check members in user management', '/manage/users'],
+    ['revoked', undefined, 'Access has been revoked. Ask an administrator to check the account binding.',
+      'Reconnect in connector settings', '/manage/integrations'],
+    ['service_unavailable', undefined, 'The service is temporarily unavailable. Check again later.',
+      'View service status', '/app/system/security'],
+  ] as const)('renders %s (%s) with an admin next step', (code, provider, message, hint, href) => {
+    setReadiness({ ...readiness(), status: code === 'service_unavailable' ? 'service_unavailable' : 'action_required',
+      reasons: [provider ? { code, provider } : { code }] });
+    renderWithProviders(<IsolationReadinessBanner />);
+    const item = screen.getByText(message, { selector: 'li' });
+    expect(item).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: hint })).toHaveAttribute('href', href);
+  });
+
+  it('keeps next-step links away from non-admins', () => {
+    useAuthStore.setState({ user: { ...useAuthStore.getState().user!, role: 'employee' } });
+    setReadiness({ ...readiness(), reasons: [{ code: 'connector_setup_required', provider: 'google' }],
+      employees: [{ label: 'sales-bot', ready: false, reasons: [{ code: 'revoked' }] }] });
+    renderWithProviders(<IsolationReadinessBanner />);
+    expect(screen.getByText('Google connection setup is not complete.')).toBeInTheDocument();
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).not.toHaveTextContent('sales-bot');
+  });
+
+  it('lists each employee that needs attention for admins', () => {
+    setReadiness({ ...readiness(), reasons: [
+      { code: 'connector_setup_required', provider: 'google' }, { code: 'personal_binding_conflict' },
+    ], employees: [
+      { label: 'team', ready: true, reasons: [] },
+      { label: 'alice-personal', ready: false, reasons: [
+        { code: 'connector_setup_required', provider: 'google' }, { code: 'personal_binding_conflict' }] },
+    ] });
+    renderWithProviders(<IsolationReadinessBanner />);
+    expect(screen.getByText('AI employees that need attention')).toBeInTheDocument();
+    expect(screen.getByText(/^alice-personal: Google connection setup is not complete\./)).toBeInTheDocument();
+    expect(screen.queryByText(/^team:/)).not.toBeInTheDocument();
+  });
+
+  it('shows employee attention even when admission is open, and hides when nothing is left', () => {
+    setReadiness({ ...readiness(), ready: true, status: 'action_required', reasons: [{ code: 'revoked' }] });
+    const { unmount } = renderWithProviders(<IsolationReadinessBanner />);
+    expect(screen.getByRole('alert')).toHaveTextContent('Some protected AI employees need attention');
+    expect(screen.getByRole('alert')).not.toHaveTextContent('Protected TEAM work is paused');
+    unmount();
+    setReadiness({ ...readiness(), ready: true, status: 'ready', reasons: [] });
+    const { container } = renderWithProviders(<IsolationReadinessBanner />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
   it('preserves the legacy description when reasons are absent', () => {
     renderWithProviders(<IsolationReadinessBanner />);
     expect(screen.getByRole('alert')).toHaveTextContent('Required isolation services are not ready.');
