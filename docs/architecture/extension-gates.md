@@ -105,7 +105,6 @@ No dedicated inbound Live Chat HTTP route was found: visitor messages arrive thr
 | Operator meeting CLI | `C/lib.rs:4391`; `C/meeting_cmd.rs:28`, `:47` | `meeting transcribe` refuses AI-session markers and calls transcription directly. It is not an extension RPC or third-party MCP call. |
 | Operator diagnostics | `C/lib.rs:9493` (`voice_check`) | `doctor` constructs the TTS router to inspect configured providers without a synthesis/network probe. Distinguish read-only diagnostics from execution when defining family disablement. |
 | Shared provider construction | `G/stt.rs:123`; `G/tts.rs:621`, `:695` | Configuration and credential availability constrain providers; neither constructor is an extension registration point. Native library callers need their own policy admission. |
-| Discord voice library surface | `G/discord_voice.rs:197`, `:257`, `:403` | Manager limits/enabled flag and the non-default `discord-voice` build feature apply. Audio buffering/join APIs exist, but this inventory does not establish a live gateway ASR/TTS pipeline; do not claim that integration is operational. |
 
 ## Validation boundary
 

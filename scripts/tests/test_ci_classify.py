@@ -77,12 +77,12 @@ class CiClassifyTests(unittest.TestCase):
         for path in ("docs/guide.md", "wiki/start.md", "marketing/copy.txt", "team/plan.txt", "NOTES.md"):
             self.write(path, "Documentation\n")
         self.assertEqual(self.classify(), dict(rust_mode="skip", dashboard="skip",
-                                              discord_voice="false", app_compat="false"))
+                                              app_compat="false"))
 
     def test_web_only_runs_dashboard(self):
         self.write("web/src/main.ts", "export {};\n")
         self.assertEqual(self.classify(), dict(rust_mode="skip", dashboard="run",
-                                              discord_voice="false", app_compat="false"))
+                                              app_compat="false"))
 
     def test_mixed_web_and_docs_runs_dashboard(self):
         self.write("web/src/main.ts", "export {};\n")
@@ -132,7 +132,7 @@ class CiClassifyTests(unittest.TestCase):
         self.assertEqual(len(paths), 21)
         self.assertEqual(ci_classify.classify("pull_request", self.base, head),
                          dict(rust_mode="check", dashboard="skip",
-                              discord_voice="false", app_compat="false"))
+                              app_compat="false"))
 
     def test_version_change_without_changelog_forces_full(self):
         self.write("Cargo.toml", '[workspace.package]\nversion = "1.79.1"\n')
@@ -312,25 +312,23 @@ class CiClassifyTests(unittest.TestCase):
         result = ci_classify.classify("pull_request", base, head)
         self.assertEqual((result["rust_mode"], result["dashboard"]), ("skip", "skip"))
 
-    def test_optional_feature_path_filters(self):
-        for path, voice, compat in (
-            ("crates/duduclaw-gateway/src/discord.rs", "true", "false"),
-            ("crates/duduclaw-gateway/src/voice.rs", "true", "false"),
-            ("crates/duduclaw-core/src/compat.rs", "false", "true"),
-            ("crates/duduclaw-cli/src/compat.rs", "false", "true"),
-            ("crates/duduclaw-core/src/normal.rs", "false", "false"),
-            ("Cargo.toml", "true", "true"),
-            ("Cargo.lock", "true", "true"),
-            ("crates/duduclaw-gateway/Cargo.toml", "true", "true"),
-            ("vendor/example/lib.rs", "true", "true"),
-            (".github/workflows/ci.yml", "true", "true"),
+    def test_app_compat_path_filters(self):
+        for path, compat in (
+            ("crates/duduclaw-core/src/compat.rs", "true"),
+            ("crates/duduclaw-cli/src/compat.rs", "true"),
+            ("crates/duduclaw-core/src/normal.rs", "false"),
+            ("Cargo.toml", "true"),
+            ("Cargo.lock", "true"),
+            ("crates/duduclaw-gateway/Cargo.toml", "true"),
+            ("vendor/example/lib.rs", "true"),
+            (".github/workflows/ci.yml", "true"),
         ):
             with self.subTest(path=path):
                 self.git("checkout", "--detach", self.base)
                 self.write(path, "Changed behavior\n")
                 result = self.classify()
-                self.assertEqual((result["rust_mode"], result["discord_voice"], result["app_compat"]),
-                                 ("full", voice, compat))
+                self.assertEqual((result["rust_mode"], result["app_compat"]),
+                                 ("full", compat))
 
     def test_cli_writes_github_output_with_env_shas(self):
         self.write("docs/guide.md", "Documentation\n")
@@ -340,7 +338,7 @@ class CiClassifyTests(unittest.TestCase):
                        env={**os.environ, "GITHUB_EVENT_NAME": "pull_request",
                             "BASE_SHA": self.base, "HEAD_SHA": head, "GITHUB_OUTPUT": str(output)})
         self.assertEqual(dict(line.split("=", 1) for line in output.read_text().splitlines()),
-                         dict(rust_mode="skip", dashboard="skip", discord_voice="false", app_compat="false"))
+                         dict(rust_mode="skip", dashboard="skip", app_compat="false"))
 
     def test_warm_runs_for_manifest_change_without_lock_diff(self):
         self.write("Cargo.toml", '[workspace.package]\nversion = "1.79.0"\n\n[profile.release]\nopt-level = 2\n')

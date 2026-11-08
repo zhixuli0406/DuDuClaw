@@ -32,7 +32,6 @@ jobs:
     outputs:
       rust_mode: ${{ steps.classify.outputs.rust_mode }}
       dashboard: ${{ steps.classify.outputs.dashboard }}
-      discord_voice: ${{ steps.classify.outputs.discord_voice }}
       app_compat: ${{ steps.classify.outputs.app_compat }}
     steps:
       - name: Allow consecutive PR pushes to settle
@@ -51,7 +50,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
-            printf 'rust_mode=full\ndashboard=run\ndiscord_voice=true\napp_compat=true\n' >> "$GITHUB_OUTPUT"
+            printf 'rust_mode=full\ndashboard=run\napp_compat=true\n' >> "$GITHUB_OUTPUT"
           elif git show "$BASE_SHA:scripts/ci_classify.py" > "$RUNNER_TEMP/ci_classify.py"; then
             # Publish outputs only after success; missing/failed classifiers run full CI.
             output="$RUNNER_TEMP/ci-classify-output"
@@ -149,11 +148,6 @@ jobs:
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: 'true'
         run: cargo test --locked --release -p duduclaw-core --test edition_license_ceiling
 
-      - name: Test gateway Discord voice TLS transport
-        # Songbird is an existing Linux-only dependency. Exercise its Serenity
-        # bridge so the security transport backport cannot silently rot.
-        if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && needs.settle.outputs.discord_voice != 'false' && (runner.os == 'Linux') }}
-        run: cargo test --locked -p duduclaw-gateway --no-default-features --features discord-voice --lib discord_voice
       - name: Check gateway with OpenTelemetry feature
         if: ${{ needs.settle.outputs.rust_mode != 'skip' && needs.settle.outputs.rust_mode != 'check' && (matrix.shard == 1) }}
         run: cargo check --locked -p duduclaw-gateway --no-default-features --features otel
