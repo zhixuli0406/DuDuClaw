@@ -414,6 +414,69 @@ pub fn migrate_one_plist(
     result.map(|()| decision)
 }
 
+/// Write a LaunchAgent plist safely: `plist` must sit directly in the real
+/// (canonical, non-symlinked, user-owned) `<home>/Library/LaunchAgents`, an
+/// existing destination must be a regular file (never a symlink — writing
+/// through one would let it redirect the write), and the content goes to an
+/// exclusively created 0600 temp file in the same directory → fsync → rename
+/// → directory fsync. The result is re-checked: a regular file owned by this
+/// user with mode 0600.
+#[cfg(unix)]
+pub fn write_launch_agent_plist(home: &Path, plist: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let refuse = |why: String| Error::new(ErrorKind::PermissionDenied, why);
+    let uid = unsafe { libc::getuid() };
+    let dir = plist.parent().ok_or_else(|| refuse("LaunchAgent plist has no parent directory".into()))?;
+    let name = plist.file_name().and_then(|n| n.to_str())
+        .filter(|n| n.ends_with(".plist") && !n.starts_with('.'))
+        .ok_or_else(|| refuse(format!("{} is not a LaunchAgent plist name", plist.display())))?;
+    let expected = std::fs::canonicalize(home)?.join("Library").join("LaunchAgents");
+    let dir_meta = std::fs::symlink_metadata(dir)?;
+    if !dir_meta.is_dir() || std::fs::canonicalize(dir)? != expected {
+        return Err(refuse(format!("{} is not the user's ~/Library/LaunchAgents", dir.display())));
+    }
+    if dir_meta.uid() != uid || dir_meta.mode() & 0o022 != 0 {
+        return Err(refuse(format!("{} must be owned by this user and not group/world-writable", dir.display())));
+    }
+    match std::fs::symlink_metadata(plist) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(refuse(format!("{} exists and is not a regular file", plist.display())));
+        }
+        Ok(meta) if meta.uid() != uid => {
+            return Err(refuse(format!("{} is owned by another user", plist.display())));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        // Exactly 0600 regardless of the umask.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, plist)?;
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
+    let meta = std::fs::symlink_metadata(plist)?;
+    if !meta.file_type().is_file() || meta.uid() != uid || meta.mode() & 0o7777 != 0o600 {
+        return Err(refuse(format!("{} was not written as a private regular file", plist.display())));
+    }
+    Ok(())
+}
+
 // ── Platform implementations ─────────────────────────────────────────────────
 
 /// Register the gateway to start at login/boot. Never touches a running
@@ -431,7 +494,8 @@ pub fn enable() -> Result<AutostartStatus> {
         }
         let bundle_id = crate::macos_bundle::running_gateway_bundle()
             .map(|_| crate::macos_bundle::BUNDLE_ID);
-        std::fs::write(&plist_path, launchd_plist_for(&exe, &home, &state, bundle_id))?;
+        write_launch_agent_plist(&home, &plist_path,
+            launchd_plist_for(&exe, &home, &state, bundle_id).as_bytes())?;
         // A stale legacy-label plist would register a second copy — remove it.
         let _ = std::fs::remove_file(launchd_plist_path_in(&home, LEGACY_LAUNCHD_LABEL));
         return Ok(AutostartStatus {
@@ -609,6 +673,73 @@ pub fn status() -> AutostartStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── LaunchAgent plist writer ─────────────────────────────────────────
+
+    #[cfg(unix)]
+    fn launch_agents_home() -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("Library/LaunchAgents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (home, dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_agent_plist_is_written_private_and_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        let (home, dir) = launch_agents_home();
+        let plist = dir.join("com.duduclaw.gateway.plist");
+        write_launch_agent_plist(home.path(), &plist, b"first").unwrap();
+        assert_eq!(std::fs::read(&plist).unwrap(), b"first");
+        std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_launch_agent_plist(home.path(), &plist, b"second").unwrap();
+        assert_eq!(std::fs::read(&plist).unwrap(), b"second");
+        assert_eq!(std::fs::metadata(&plist).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temp files left behind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_agent_plist_refuses_symlinks_and_foreign_directories() {
+        let (home, dir) = launch_agents_home();
+        let plist = dir.join("com.duduclaw.gateway.plist");
+        // A symlinked destination is never written through.
+        let victim = home.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, &plist).unwrap();
+        assert!(write_launch_agent_plist(home.path(), &plist, b"evil").is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert!(std::fs::symlink_metadata(&plist).unwrap().file_type().is_symlink());
+        std::fs::remove_file(&plist).unwrap();
+        // A directory at the destination is refused.
+        std::fs::create_dir(&plist).unwrap();
+        assert!(write_launch_agent_plist(home.path(), &plist, b"x").is_err());
+        std::fs::remove_dir(&plist).unwrap();
+        // Any other directory than ~/Library/LaunchAgents is refused.
+        let other = home.path().join("Library/Other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(write_launch_agent_plist(home.path(), &other.join("x.plist"), b"x").is_err());
+        assert!(!other.join("x.plist").exists());
+        // ~/Library/LaunchAgents itself being a symlink elsewhere is refused.
+        std::fs::remove_dir(&dir).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), &dir).unwrap();
+        assert!(write_launch_agent_plist(home.path(), &plist, b"x").is_err());
+        assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_agent_plist_refuses_a_world_writable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let (home, dir) = launch_agents_home();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(write_launch_agent_plist(home.path(), &dir.join("a.plist"), b"x").is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
 
     // ── macOS launchd plist ──────────────────────────────────────────────
 

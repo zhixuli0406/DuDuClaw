@@ -41,9 +41,12 @@
 //!   `[files] allowed_roots`, a protected dispatch `work_dir`, a late probe
 //!   completion) and every [`REPROBE_INTERVAL`] while anything is degraded.
 //!   The watcher is only spawned on macOS (see `server.rs`).
-//! * [`run_with_timeout`] — the same "dedicated thread + bounded wait" shape
-//!   for the employee file tools (`duduclaw-cli/src/mcp_files.rs`), plus the
-//!   zh-TW + English error texts they return.
+//! * [`run_guarded`] — the same "dedicated thread + bounded wait" shape for
+//!   the employee file tools (`duduclaw-cli/src/mcp_files.rs`), through a
+//!   shared [`OpLimiter`]: at most [`MAX_FILE_OP_THREADS`] threads alive and
+//!   one per path, so stuck consent prompts cannot leak threads (over the
+//!   limit the call answers "pending" without spawning), plus the zh-TW +
+//!   English error texts they return.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
@@ -117,12 +120,16 @@ impl AccessState {
 pub enum ProbeOutcome<T> {
     Completed(io::Result<T>),
     TimedOut,
+    /// Not started: an earlier operation on the same path is still blocked,
+    /// or [`MAX_FILE_OP_THREADS`] operations are already outstanding. No
+    /// thread was spawned.
+    Pending,
 }
 
 /// Classify a finished-or-timed-out operation.
 pub fn classify<T>(outcome: &ProbeOutcome<T>) -> AccessState {
     match outcome {
-        ProbeOutcome::TimedOut => AccessState::PendingPrompt,
+        ProbeOutcome::TimedOut | ProbeOutcome::Pending => AccessState::PendingPrompt,
         ProbeOutcome::Completed(Ok(_)) => AccessState::Granted,
         ProbeOutcome::Completed(Err(e)) => classify_error(e),
     }
@@ -240,32 +247,109 @@ pub fn user_home() -> Option<PathBuf> {
 
 // ── Bounded operations ──────────────────────────────────────────────────────
 
-/// Run `op` on a dedicated, detached thread and wait at most `timeout`.
-///
-/// On timeout the thread keeps running (a call blocked on a consent prompt
-/// cannot be cancelled) and its eventual result is dropped. Used by the
-/// employee file tools, which are synchronous.
-pub fn run_with_timeout<T, F>(timeout: Duration, op: F) -> ProbeOutcome<T>
+/// Most file-operation threads alive at once per process — running, or stuck
+/// on a consent prompt nobody answers. A stuck call cannot be cancelled, so
+/// without this cap every retried tool call would leak one more thread.
+pub const MAX_FILE_OP_THREADS: usize = 16;
+/// Most probe threads alive at once (one per distinct path, see
+/// [`Registry::probe_one`]).
+pub const MAX_PROBE_THREADS: usize = 16;
+
+/// Bounded runner for filesystem calls that may block forever: at most `cap`
+/// outstanding threads, at most one per path. Over either limit the call
+/// returns [`ProbeOutcome::Pending`] without spawning anything.
+pub struct OpLimiter {
+    cap: usize,
+    state: Mutex<LimiterState>,
+}
+
+#[derive(Default)]
+struct LimiterState {
+    live: usize,
+    paths: BTreeSet<PathBuf>,
+}
+
+/// Releases a limiter slot when the operation finishes — including by panic,
+/// and also when the thread could not be spawned.
+struct LimiterSlot {
+    limiter: &'static OpLimiter,
+    key: PathBuf,
+}
+
+impl Drop for LimiterSlot {
+    fn drop(&mut self) {
+        let mut s = self.limiter.lock();
+        s.live = s.live.saturating_sub(1);
+        s.paths.remove(&self.key);
+    }
+}
+
+impl OpLimiter {
+    pub const fn new(cap: usize) -> Self {
+        Self { cap, state: Mutex::new(LimiterState { live: 0, paths: BTreeSet::new() }) }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, LimiterState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Threads currently outstanding (running or stuck).
+    pub fn outstanding(&self) -> usize {
+        self.lock().live
+    }
+
+    /// Run `op` on a dedicated thread (de-duplicated by `key`) and wait at
+    /// most `timeout`. On timeout the thread keeps its slot until the call
+    /// returns (someone answered the prompt), and its result is dropped.
+    pub fn run<T, F>(&'static self, key: &Path, timeout: Duration, op: F) -> ProbeOutcome<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> io::Result<T> + Send + 'static,
+    {
+        {
+            let mut s = self.lock();
+            if s.live >= self.cap || s.paths.contains(key) {
+                return ProbeOutcome::Pending;
+            }
+            s.live += 1;
+            s.paths.insert(key.to_path_buf());
+        }
+        let slot = LimiterSlot { limiter: self, key: key.to_path_buf() };
+        let (tx, rx) = mpsc::sync_channel(1);
+        let spawned = std::thread::Builder::new()
+            .name("duduclaw-fs-guard".into())
+            .spawn(move || {
+                let result = op();
+                // Free the slot BEFORE the caller can see the result, so an
+                // immediate follow-up call on the same path is not "pending".
+                drop(slot);
+                let _ = tx.send(result);
+            });
+        if let Err(e) = spawned {
+            return ProbeOutcome::Completed(Err(e));
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(result) => ProbeOutcome::Completed(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => ProbeOutcome::TimedOut,
+            Err(mpsc::RecvTimeoutError::Disconnected) => ProbeOutcome::Completed(Err(io::Error::other(
+                "filesystem operation thread ended without a result",
+            ))),
+        }
+    }
+}
+
+/// The process-wide limiter for the employee file tools.
+static FILE_OPS: OpLimiter = OpLimiter::new(MAX_FILE_OP_THREADS);
+
+/// Run one employee file-tool call through the shared [`OpLimiter`]: bounded
+/// threads, one in flight per `key` path, at most `timeout` of waiting. Used
+/// by the employee file tools, which are synchronous.
+pub fn run_guarded<T, F>(key: &Path, timeout: Duration, op: F) -> ProbeOutcome<T>
 where
     T: Send + 'static,
     F: FnOnce() -> io::Result<T> + Send + 'static,
 {
-    let (tx, rx) = mpsc::sync_channel(1);
-    let spawned = std::thread::Builder::new()
-        .name("duduclaw-fs-guard".into())
-        .spawn(move || {
-            let _ = tx.send(op());
-        });
-    if let Err(e) = spawned {
-        return ProbeOutcome::Completed(Err(e));
-    }
-    match rx.recv_timeout(timeout) {
-        Ok(result) => ProbeOutcome::Completed(result),
-        Err(mpsc::RecvTimeoutError::Timeout) => ProbeOutcome::TimedOut,
-        Err(mpsc::RecvTimeoutError::Disconnected) => ProbeOutcome::Completed(Err(io::Error::other(
-            "filesystem operation thread ended without a result",
-        ))),
-    }
+    FILE_OPS.run(key, timeout, op)
 }
 
 /// The probe operation: open the directory and read its first entry. Opening
@@ -359,8 +443,13 @@ impl Registry {
         op: ProbeOp,
         timeout: Duration,
     ) -> AccessState {
-        // Bound to a statement so the guard is gone before any await.
-        let started = self.lock().in_flight.insert(path.clone());
+        // Bound to a statement so the guard is gone before any await. Over
+        // the global cap nothing is spawned either (stuck probes on many
+        // distinct paths must not grow without bound).
+        let started = {
+            let mut g = self.lock();
+            g.in_flight.len() < MAX_PROBE_THREADS && g.in_flight.insert(path.clone())
+        };
         if !started {
             return AccessState::PendingPrompt;
         }
@@ -810,6 +899,24 @@ pub fn file_timeout_text(raw: &str, protected: bool, timeout: Duration) -> Strin
     )
 }
 
+/// Employee file-tool error when the call was not even started: an earlier
+/// call on the same path is still blocked, or too many calls are.
+pub fn file_pending_text(raw: &str, protected: bool) -> String {
+    if protected {
+        return format!(
+            "尚未讀取「{raw}」：先前對這個位置的讀取仍在等待 macOS 授權（有人需要在這台 Mac 上按「允許」）。\
+             請到這台 Mac 前按「允許」後再試；若沒有看到提示，請到「{SETTINGS_PATH_ZH}」為 duduclaw 開啟對應的資料夾。\n\
+             \"{raw}\" was not read: an earlier read of this location is still waiting for macOS permission (someone needs to click Allow on this Mac). \
+             Click Allow on this Mac and try again; if no prompt is visible, enable duduclaw under {SETTINGS_PATH_EN}.\n\
+             {DOCS_URL}"
+        );
+    }
+    format!(
+        "尚未讀取「{raw}」：先前的檔案讀取仍沒有回應，請稍後再試。\n\
+         \"{raw}\" was not read: earlier file reads are still not responding; try again later."
+    )
+}
+
 /// The channel-reply timeout explanation in `language`, for a TCC summary.
 /// `None` when the state is not a TCC problem.
 pub fn timeout_text_for_state(state: AccessState, agent: &str, language: Option<&str>) -> Option<String> {
@@ -946,20 +1053,102 @@ mod tests {
 
     // ── bounded operations ──
 
-    #[test]
-    fn run_with_timeout_returns_a_fast_result() {
-        let out = run_with_timeout(Duration::from_secs(2), || Ok(7));
-        assert!(matches!(out, ProbeOutcome::Completed(Ok(7))));
+    fn limiter(cap: usize) -> &'static OpLimiter {
+        Box::leak(Box::new(OpLimiter::new(cap)))
     }
 
     #[test]
-    fn run_with_timeout_reports_a_sleeping_op_as_timed_out() {
-        let out = run_with_timeout(Duration::from_millis(50), || {
+    fn run_guarded_returns_a_fast_result() {
+        let out = run_guarded(Path::new("/tmp/fast"), Duration::from_secs(2), || Ok(7));
+        assert!(matches!(out, ProbeOutcome::Completed(Ok(7))));
+        let l = limiter(2);
+        for _ in 0..5 {
+            // Sequential calls on one path never see their own finished slot.
+            let out = l.run(Path::new("/a"), Duration::from_secs(2), || Ok(1));
+            assert!(matches!(out, ProbeOutcome::Completed(Ok(1))));
+        }
+        assert_eq!(l.outstanding(), 0);
+    }
+
+    #[test]
+    fn run_guarded_reports_a_sleeping_op_as_timed_out() {
+        let out = limiter(2).run(Path::new("/a"), Duration::from_millis(50), || {
             std::thread::sleep(Duration::from_millis(600));
             Ok(())
         });
         assert!(matches!(out, ProbeOutcome::TimedOut));
         assert_eq!(classify(&out), AccessState::PendingPrompt);
+    }
+
+    #[test]
+    fn stuck_ops_are_deduplicated_per_path_and_capped_globally() {
+        let l = limiter(2);
+        let started = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let stuck = |started: &Arc<AtomicUsize>, rx: &Arc<Mutex<mpsc::Receiver<()>>>| {
+            let (started, rx) = (Arc::clone(started), Arc::clone(rx));
+            move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
+                Ok::<(), io::Error>(())
+            }
+        };
+        let short = Duration::from_millis(30);
+        assert!(matches!(l.run(Path::new("/a"), short, stuck(&started, &release_rx)), ProbeOutcome::TimedOut));
+        // Same path while the first is stuck: pending, no new thread.
+        assert!(matches!(l.run(Path::new("/a"), short, stuck(&started, &release_rx)), ProbeOutcome::Pending));
+        assert!(matches!(l.run(Path::new("/b"), short, stuck(&started, &release_rx)), ProbeOutcome::TimedOut));
+        // Global cap reached: even a fresh path is pending, nothing spawned.
+        let ran = Arc::new(AtomicUsize::new(0));
+        let r = Arc::clone(&ran);
+        let out = l.run(Path::new("/c"), short, move || { r.fetch_add(1, Ordering::SeqCst); Ok(()) });
+        assert!(matches!(out, ProbeOutcome::Pending));
+        assert_eq!(classify(&out), AccessState::PendingPrompt);
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        assert_eq!(l.outstanding(), 2);
+        // Answering the prompts frees the slots.
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while l.outstanding() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(l.outstanding(), 0);
+        assert!(matches!(l.run(Path::new("/a"), Duration::from_secs(2), || Ok(())), ProbeOutcome::Completed(Ok(()))));
+    }
+
+    #[test]
+    fn a_panicking_op_releases_its_slot() {
+        let l = limiter(1);
+        let out = l.run::<(), _>(Path::new("/p"), Duration::from_secs(2), || panic!("boom"));
+        assert!(matches!(out, ProbeOutcome::Completed(Err(_))));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while l.outstanding() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(l.outstanding(), 0);
+    }
+
+    #[tokio::test]
+    async fn probe_threads_are_capped_across_distinct_paths() {
+        let reg = Arc::new(Registry::default());
+        let sleepy: ProbeOp = Arc::new(|_| {
+            std::thread::sleep(Duration::from_millis(400));
+            Ok(())
+        });
+        for i in 0..MAX_PROBE_THREADS {
+            let state = reg.probe_one(PathBuf::from(format!("/Volumes/p{i}")), Arc::clone(&sleepy), Duration::from_millis(10)).await;
+            assert_eq!(state, AccessState::PendingPrompt);
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let counted: ProbeOp = Arc::new(move |_| { c.fetch_add(1, Ordering::SeqCst); Ok(()) });
+        let over = reg.probe_one(PathBuf::from("/Volumes/over"), counted, Duration::from_secs(1)).await;
+        assert_eq!(over, AccessState::PendingPrompt);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no thread over the cap");
+        assert!(reg.lock().in_flight.len() <= MAX_PROBE_THREADS);
     }
 
     #[tokio::test]

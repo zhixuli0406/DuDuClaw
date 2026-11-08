@@ -200,13 +200,16 @@ where
 {
     use duduclaw_gateway::macos_folder_access::{self as folder_access, ProbeOutcome};
     let owned = path.to_path_buf();
-    match folder_access::run_with_timeout(timeout, move || op(owned)) {
+    // Shared, bounded runner: one call in flight per path and a global cap,
+    // so repeated calls into a stuck consent prompt never pile up threads.
+    match folder_access::run_guarded(path, timeout, move || op(owned)) {
         ProbeOutcome::Completed(Ok(value)) => Ok(value),
         ProbeOutcome::Completed(Err(e)) => {
             let fallback = generic(&e);
             Err(folder_access::file_error_text(raw, &e, protected, &fallback))
         }
         ProbeOutcome::TimedOut => Err(folder_access::file_timeout_text(raw, protected, timeout)),
+        ProbeOutcome::Pending => Err(folder_access::file_pending_text(raw, protected)),
     }
 }
 
@@ -1017,7 +1020,9 @@ mod tests {
     fn a_blocked_protected_read_says_macos_is_waiting_for_allow() {
         let err = guarded_fs_with::<(), _, _>(
             "~/Documents/a.csv",
-            Path::new("/Users/amy/Documents/a.csv"),
+            // Own path: the shared limiter de-duplicates per path, and this
+            // op stays in flight after the test returns.
+            Path::new("/Users/amy/Documents/blocked-protected.csv"),
             true,
             std::time::Duration::from_millis(50),
             |e| e.to_string(),
@@ -1035,7 +1040,7 @@ mod tests {
     fn a_blocked_unprotected_read_is_a_plain_timeout() {
         let err = guarded_fs_with::<(), _, _>(
             "/srv/a.csv",
-            Path::new("/srv/a.csv"),
+            Path::new("/srv/blocked-unprotected.csv"),
             false,
             std::time::Duration::from_millis(50),
             |e| e.to_string(),
@@ -1046,6 +1051,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("逾時") && !err.contains("macOS"), "{err}");
+    }
+
+    #[test]
+    fn a_retry_into_a_stuck_read_is_pending_without_a_new_thread() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let path = Path::new("/Users/amy/Documents/stuck-retry.csv");
+        let stuck = |calls: &std::sync::Arc<std::sync::atomic::AtomicUsize>| {
+            let calls = std::sync::Arc::clone(calls);
+            move |_: PathBuf| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                Ok::<(), std::io::Error>(())
+            }
+        };
+        let short = std::time::Duration::from_millis(50);
+        let first = guarded_fs_with("~/Documents/stuck-retry.csv", path, true, short,
+            |e| e.to_string(), stuck(&calls)).unwrap_err();
+        assert!(first.contains("click Allow"), "{first}");
+        let retry = guarded_fs_with("~/Documents/stuck-retry.csv", path, true, short,
+            |e| e.to_string(), stuck(&calls)).unwrap_err();
+        assert!(retry.contains("still waiting for macOS permission"), "{retry}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "no second thread");
+        let plain = duduclaw_gateway::macos_folder_access::file_pending_text("/srv/a.csv", false);
+        assert!(!plain.contains("macOS") && plain.contains("not read"), "{plain}");
     }
 
     #[test]

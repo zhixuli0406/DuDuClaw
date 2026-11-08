@@ -120,6 +120,12 @@ pub async fn on_disk_version() -> Option<String> {
     if exe.as_os_str().is_empty() {
         return None;
     }
+    probe_version(&exe).await
+}
+
+/// `<exe> version`, parsed — `None` when it cannot run or prints no version.
+async fn probe_version(exe: &std::path::Path) -> Option<String> {
+    let exe = exe.to_path_buf();
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(VERIFY_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
@@ -563,6 +569,45 @@ fn is_newer(current: &str, latest: &str) -> bool {
     parse(latest) > parse(current)
 }
 
+/// Why an archive is being installed — decides whether the version that is
+/// already running may be installed again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallIntent {
+    /// Regular update: strictly newer than the running AND the on-disk version.
+    Update,
+    /// Explicit bare → `DuDuClaw Gateway.app` migration: the same version as
+    /// the running bare binary is allowed (it is what migration installs).
+    MigrateToBundle,
+}
+
+/// Replay/downgrade gate: a validly signed OLD release must never be
+/// installable. `target` must be newer than the running version and the
+/// version on disk (when known); equal only when `allow_equal` (migration).
+/// A running pre-release (`1.81.0-rc.1`) is older than its final release.
+fn check_version_floor(target: &str, running: &str, on_disk: Option<&str>, allow_equal: bool) -> Result<(), String> {
+    let key = |v: &str, what: &str| -> Result<(u32, u32, u32, bool), String> {
+        let (a, b, c) = parse_version_tag(v)
+            .ok_or_else(|| format!("Update verification failed: cannot parse the {what} version {v:?}"))?;
+        Ok((a, b, c, !v.contains('-')))
+    };
+    let wanted = key(target, "release")?;
+    for (what, version) in [("running", Some(running)), ("installed", on_disk)] {
+        let Some(version) = version else { continue };
+        let have = key(version, what)?;
+        if wanted < have {
+            return Err(format!(
+                "Update verification failed: refusing downgrade — release v{target} is older than the {what} v{version}"
+            ));
+        }
+        if wanted == have && !allow_equal {
+            return Err(format!(
+                "Update verification failed: refusing to reinstall v{target} — it is already the {what} version"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Strict parse of a CLI version tag (`v1.46.2`, `1.46.2`, `v2.0.0-rc.1`).
 /// Returns `None` for anything that is not a plain version — notably the
 /// desktop installer tags (`desktop-v1.46.2`) and the fixed `desktop-updater`
@@ -982,7 +1027,8 @@ pub async fn apply_update_with_progress(
 
     info!(url = download_url, "Downloading update...");
     let client = download_client()?;
-    download_verify_install(&client, download_url, checksum_url, &current_exe, exe_dir, on_progress).await
+    download_verify_install(&client, download_url, checksum_url, &current_exe, exe_dir,
+        InstallIntent::Update, on_progress).await
 }
 
 /// [S1][C1] download (retrying only download-class failures) → minisign +
@@ -993,6 +1039,7 @@ async fn download_verify_install(
     checksum_url: &str,
     current_exe: &std::path::Path,
     exe_dir: &std::path::Path,
+    intent: InstallIntent,
     on_progress: ProgressSink<'_>,
 ) -> Result<ApplyResult, String> {
     // [S1] minisign signature URL is derived, not client-supplied — validate
@@ -1018,7 +1065,7 @@ async fn download_verify_install(
     .await
     .map_err(|e| e.message)?;
 
-    install_archive_bytes(&bytes, current_exe, exe_dir, &identity).await
+    install_archive_bytes(&bytes, current_exe, exe_dir, &identity, intent).await
 }
 
 /// RM-155: migrate a bare macOS install (standalone / npm) to
@@ -1087,7 +1134,8 @@ pub async fn migrate_to_bundle() -> Result<ApplyResult, String> {
         }
         info!(url = %download_url, "Migrating to DuDuClaw Gateway.app...");
         let client = download_client()?;
-        download_verify_install(&client, &download_url, &checksum_url, &current_exe, &exe_dir, &|_| {}).await
+        download_verify_install(&client, &download_url, &checksum_url, &current_exe, &exe_dir,
+            InstallIntent::MigrateToBundle, &|_| {}).await
     }
 }
 
@@ -1127,11 +1175,23 @@ pub async fn macos_boot_maintenance(home_dir: PathBuf, auto_update: bool) {
                         .parent().map(std::path::Path::to_path_buf)
                 }),
             };
-            if let Some(parent) = parent {
-                let removed = macos_bundle::cleanup_stale_staging(&parent, &exe,
-                    std::time::Duration::from_secs(3600));
-                if removed > 0 {
-                    info!(removed, dir = %parent.display(), "Removed stale DuDuClaw Gateway.app staging directories");
+            let has_staging = |dir: &std::path::Path| std::fs::read_dir(dir).is_ok_and(|entries| {
+                entries.flatten().any(|e| e.file_name().to_str()
+                    .is_some_and(|n| n.starts_with(duduclaw_core::macos_bundle::STAGING_PREFIX)))
+            });
+            if let Some(parent) = parent.filter(|p| has_staging(p.as_path())) {
+                // Under the cross-process bundle lock: restores a bundle an
+                // interrupted swap left only in staging, then removes stale
+                // staging. Another process mid-update → try next boot.
+                match macos_bundle::lock_bundle_parent(&parent) {
+                    Ok(_lock) => {
+                        let removed = macos_bundle::cleanup_stale_staging(&parent, &exe,
+                            std::time::Duration::from_secs(3600));
+                        if removed > 0 {
+                            info!(removed, dir = %parent.display(), "Removed stale DuDuClaw Gateway.app staging directories");
+                        }
+                    }
+                    Err(e) => info!(error = %e, dir = %parent.display(), "Skipping DuDuClaw Gateway.app staging recovery"),
                 }
             }
         });
@@ -1215,11 +1275,40 @@ fn download_client() -> Result<reqwest::Client, String> {
 /// directory permissions); this is only the swap machine. Shared by the CE
 /// GitHub path and by [`install_verified_binary`] so a provider cannot end up
 /// with a subtly different install sequence.
+///
+/// This is the single choke point every install goes through, so the
+/// replay/downgrade gate lives here: the signed release version must be newer
+/// than both the running version and the version of the binary on disk
+/// ([`check_version_floor`]); the same version only for an explicit
+/// [`InstallIntent::MigrateToBundle`] of a bare install to the `.app.zip`.
 async fn install_archive_bytes(
     archive_bytes: &[u8],
     current_exe: &std::path::Path,
     exe_dir: &std::path::Path,
     identity: &VerifiedReleaseIdentity,
+    intent: InstallIntent,
+) -> Result<ApplyResult, String> {
+    identity.check_archive(archive_bytes)
+        .map_err(|e| format!("Update verification failed: {e}"))?;
+    let migrating = intent == InstallIntent::MigrateToBundle;
+    if migrating && !(release_identity::is_bundle_file(identity.file())
+        && duduclaw_core::macos_bundle::running_gateway_bundle().is_none())
+    {
+        return Err("Update verification failed: bundle migration requires the .app.zip asset and a bare install".into());
+    }
+    let on_disk = probe_version(current_exe).await;
+    check_version_floor(identity.version(), current_version(), on_disk.as_deref(), migrating)?;
+    install_floor_checked(archive_bytes, current_exe, exe_dir, identity, migrating).await
+}
+
+/// [`install_archive_bytes`] after the version floor passed (tests call this
+/// directly to exercise later stages with older signed fixtures).
+async fn install_floor_checked(
+    archive_bytes: &[u8],
+    current_exe: &std::path::Path,
+    exe_dir: &std::path::Path,
+    identity: &VerifiedReleaseIdentity,
+    allow_equal: bool,
 ) -> Result<ApplyResult, String> {
     identity.check_archive(archive_bytes)
         .map_err(|e| format!("Update verification failed: {e}"))?;
@@ -1229,13 +1318,14 @@ async fn install_archive_bytes(
         #[cfg(target_os = "macos")]
         {
             let (result, installed) =
-                macos_bundle::install_bundle_archive(archive_bytes, current_exe, identity).await?;
+                macos_bundle::install_bundle_archive(archive_bytes, current_exe, identity, allow_equal).await?;
             set_installed_exe(installed);
             return Ok(result);
         }
         #[cfg(not(target_os = "macos"))]
         return Err("App bundle updates are macOS-only".into());
     }
+    let _ = allow_equal; // the bundle pipeline re-checks an adopted bundle's version
     // Writing a bare binary into `Contents/MacOS/` would break the bundle's
     // signature seal (and TCC's identity for it).
     if duduclaw_core::macos_bundle::running_gateway_bundle().is_some() {
@@ -1280,7 +1370,26 @@ async fn install_archive_bytes(
 /// 2. **Directory permissions** — the same [`duduclaw_core::platform::is_unsafe_update_dir`]
 ///    gate the CE path applies, so a world-writable install directory cannot be
 ///    used to land a binary.
+///
+/// The signed version must be newer than the running and the on-disk version
+/// (downgrade / replay gate in [`install_archive_bytes`]).
 pub async fn install_verified_binary(archive_bytes: &[u8], identity: &VerifiedReleaseIdentity) -> Result<ApplyResult, String> {
+    install_verified_with_intent(archive_bytes, identity, InstallIntent::Update).await
+}
+
+/// [`install_verified_binary`] for the explicit bare → `DuDuClaw Gateway.app`
+/// migration (a provider's `.app.zip` offer to a bare install). The only
+/// provider path that may install the version that is already running;
+/// anything older is still refused, and the archive must be the bundle asset.
+pub async fn install_verified_bundle_migration(archive_bytes: &[u8], identity: &VerifiedReleaseIdentity) -> Result<ApplyResult, String> {
+    install_verified_with_intent(archive_bytes, identity, InstallIntent::MigrateToBundle).await
+}
+
+async fn install_verified_with_intent(
+    archive_bytes: &[u8],
+    identity: &VerifiedReleaseIdentity,
+    intent: InstallIntent,
+) -> Result<ApplyResult, String> {
     if is_native_protected_install() { return Err(NATIVE_PROTECTED_UPDATE_HINT.into()); }
     if is_containerized() {
         return Err(
@@ -1315,7 +1424,7 @@ pub async fn install_verified_binary(archive_bytes: &[u8], identity: &VerifiedRe
         ));
     }
 
-    install_archive_bytes(archive_bytes, &current_exe, exe_dir, identity).await
+    install_archive_bytes(archive_bytes, &current_exe, exe_dir, identity, intent).await
 }
 
 /// Fetch a release asset body once, classifying every failure. Network errors
@@ -2227,8 +2336,8 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         let (archive, identity) = release_identity::tests::verified_fixture();
         // A mismatched proof must fail before even trying to create a staging file.
         let missing_dir = dir.path().join("missing");
-        let error = install_archive_bytes(b"not a gzip archive", &target, &missing_dir, &identity)
-            .await.unwrap_err();
+        let error = install_archive_bytes(b"not a gzip archive", &target, &missing_dir, &identity,
+            InstallIntent::Update).await.unwrap_err();
         assert_eq!(failure_payload(&error)["kind"], "verify");
         assert!(error.contains("different archive"));
         let payload = failure_payload(&error);
@@ -2244,7 +2353,9 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         // The verified CE archive has no Pro entry: retain the install-path
         // extraction failure and staging cleanup coverage behind the identity gate.
         let pro_target = dir.path().join("duduclaw-pro");
-        let error = install_archive_bytes(archive, &pro_target, dir.path(), &identity)
+        // The fixture is an OLD signed release: past the version floor only
+        // through the inner stage (the floor itself is tested separately).
+        let error = install_floor_checked(archive, &pro_target, dir.path(), &identity, false)
             .await.unwrap_err();
         let payload = failure_payload(&error);
         assert_eq!(payload["kind"], "extract");
@@ -2253,9 +2364,72 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 
         let missing_dir = dir.path().join("missing");
-        let error = install_archive_bytes(archive, &target, &missing_dir, &identity).await.unwrap_err();
+        let error = install_floor_checked(archive, &target, &missing_dir, &identity, false).await.unwrap_err();
         assert_eq!(failure_payload(&error)["kind"], "write");
         assert!(error.starts_with("Failed to stage binary:"));
+    }
+
+    #[test]
+    fn version_floor_refuses_downgrades_and_same_version_reinstalls() {
+        // Newer than both: allowed.
+        assert!(check_version_floor("1.82.0", "1.81.0", Some("1.81.0"), false).is_ok());
+        assert!(check_version_floor("1.82.0", "1.81.0", None, false).is_ok());
+        // Older than the running version (signed-archive replay): refused,
+        // even for migration.
+        for allow_equal in [false, true] {
+            let e = check_version_floor("1.80.0", "1.81.0", None, allow_equal).unwrap_err();
+            assert!(e.contains("refusing downgrade") && e.contains("running"), "{e}");
+        }
+        // Older than what is already on disk (restart pending): refused.
+        let e = check_version_floor("1.81.5", "1.81.0", Some("1.82.0"), false).unwrap_err();
+        assert!(e.contains("refusing downgrade") && e.contains("installed"), "{e}");
+        assert!(check_version_floor("1.81.5", "1.81.0", Some("1.82.0"), true).is_err());
+        // Same version: only the explicit migration may reinstall it.
+        assert!(check_version_floor("1.81.0", "1.81.0", Some("1.81.0"), false).unwrap_err().contains("reinstall"));
+        assert!(check_version_floor("1.81.0", "1.81.0", Some("1.81.0"), true).is_ok());
+        assert!(check_version_floor("1.81.0", "1.80.0", Some("1.81.0"), false).is_err());
+        // A running pre-release is older than its final release.
+        assert!(check_version_floor("1.81.0", "1.81.0-rc.1", None, false).is_ok());
+        assert!(check_version_floor("1.80.9", "1.81.0-rc.1", None, false).is_err());
+        // Numeric, not lexical.
+        assert!(check_version_floor("1.10.0", "1.9.9", None, false).is_ok());
+        // Unparseable versions fail closed.
+        assert!(check_version_floor("1.81.0", "dev", None, false).is_err());
+        assert!(check_version_floor("1.81.0", "1.80.0", Some("garbage"), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn install_refuses_a_validly_signed_old_release_before_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("duduclaw");
+        std::fs::write(&target, b"installed binary").unwrap();
+        // Signed (test key) for v1.80.0 — older than this crate's running version.
+        let (archive, identity) = release_identity::tests::verified_fixture();
+        assert!(is_newer(identity.version(), current_version()), "fixture must predate the running version");
+        for intent in [InstallIntent::Update, InstallIntent::MigrateToBundle] {
+            let error = install_archive_bytes(archive, &target, dir.path(), &identity, intent)
+                .await.unwrap_err();
+            assert!(error.starts_with("Update verification failed:"), "{error}");
+            assert_eq!(failure_payload(&error)["kind"], "verify");
+            assert_eq!(std::fs::read(&target).unwrap(), b"installed binary");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "nothing staged");
+        }
+        // Migration intent is only valid for the bundle asset.
+        let error = install_archive_bytes(archive, &target, dir.path(), &identity,
+            InstallIntent::MigrateToBundle).await.unwrap_err();
+        assert!(error.contains("bundle migration requires"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_version_reads_the_on_disk_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("duduclaw");
+        std::fs::write(&exe, b"#!/bin/sh\necho 'starting'\necho 'duduclaw 9.9.9'\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(probe_version(&exe).await.as_deref(), Some("9.9.9"));
+        assert_eq!(probe_version(&dir.path().join("missing")).await, None);
     }
 
     #[test]

@@ -23,13 +23,21 @@ def bundle_executable(archive, filename):
         parts = name.rstrip('/').split('/')
         mode = entry.external_attr >> 16
         kind = stat.S_IFMT(mode)
+        # APFS/HFS+ are case-insensitive by default, so two spellings collide.
+        key = name.rstrip('/').lower()
         if ('\\' in name or any(p in ('', '.', '..') for p in parts)
-                or PurePosixPath(name).is_absolute() or name in seen
+                or PurePosixPath(name).is_absolute() or key in seen
                 or parts[0] != 'DuDuClaw Gateway.app'):
             raise ValueError('unsafe or duplicate bundle member path')
-        seen.add(name)
+        seen.add(key)
         if kind not in (0, stat.S_IFREG, stat.S_IFDIR) or (entry.is_dir() != (kind == stat.S_IFDIR) and kind != 0):
             raise ValueError('bundle members must be regular files or directories')
+        # Same rule as the runtime extractor and install.sh: no
+        # setuid/setgid/sticky and nothing group- or world-writable.
+        if mode & 0o7000:
+            raise ValueError('bundle members must not be setuid, setgid or sticky')
+        if mode & 0o022:
+            raise ValueError('bundle members must not be group- or world-writable')
         if entry.is_dir():
             continue
         # No other executable or bare gateway can hide among resources.

@@ -31,7 +31,8 @@ class AppArchiveTests(unittest.TestCase):
             z.writestr(binary, payload or marker.HEADER + b'1.81.0' + marker.SUFFIX)
             z.writestr('DuDuClaw Gateway.app/Contents/Info.plist', b'plist')
             for entry in extra:
-                z.writestr(entry, b'x')
+                is_dir = isinstance(entry, zipfile.ZipInfo) and entry.is_dir()
+                z.writestr(entry, b'' if is_dir else b'x')
 
     def test_editions_and_architectures(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -67,6 +68,31 @@ class AppArchiveTests(unittest.TestCase):
             self.fixture(path, 'duduclaw-pro')
             with self.assertRaises(ValueError):
                 marker.verify_archive(path, '1.81.0')
+
+    def test_reject_special_permission_and_writable_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'duduclaw-darwin-arm64.app.zip'
+            for mode in (0o104644, 0o102644, 0o101644, 0o100664, 0o100646, 0o040777, 0o042755):
+                entry = zipfile.ZipInfo('DuDuClaw Gateway.app/Contents/Resources/' +
+                                        ('dir/' if mode & 0o040000 else 'file'))
+                entry.external_attr = mode << 16
+                self.fixture(path, extra=(entry,))
+                for gate in (lambda: size.check_archive(path), lambda: marker.verify_archive(path, '1.81.0')):
+                    with self.subTest(mode=oct(mode)), self.assertRaises(ValueError):
+                        gate()
+            # Case-insensitive duplicate of Info.plist.
+            self.fixture(path, extra=('DuDuClaw Gateway.app/contents/info.plist',))
+            with self.assertRaises(ValueError):
+                size.check_archive(path)
+            # The executable itself may not be setuid or writable by others.
+            for mode in (0o104755, 0o100775):
+                with zipfile.ZipFile(path, 'w') as z:
+                    binary = zipfile.ZipInfo('DuDuClaw Gateway.app/Contents/MacOS/duduclaw')
+                    binary.external_attr = mode << 16
+                    z.writestr(binary, marker.HEADER + b'1.81.0' + marker.SUFFIX)
+                    z.writestr('DuDuClaw Gateway.app/Contents/Info.plist', b'plist')
+                with self.subTest(exe_mode=oct(mode)), self.assertRaises(ValueError):
+                    size.check_archive(path)
 
 
 class SigningContractTests(unittest.TestCase):

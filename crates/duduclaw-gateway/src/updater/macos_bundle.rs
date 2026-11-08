@@ -6,7 +6,8 @@
 //!    staging directory next to the target (`<parent>/.duduclaw-update-<uuid>/`,
 //!    same volume): every entry under `DuDuClaw Gateway.app/`, UTF-8 names
 //!    only, no absolute paths / `..` / backslashes, regular files and
-//!    directories only (no symlinks, no setuid), size budgets, exec bit only on
+//!    directories only (no symlinks, no setuid/setgid/sticky, nothing group-
+//!    or world-writable), size budgets, exec bit only on
 //!    `Contents/MacOS/<exe>`, exactly one executable named after the running
 //!    edition.
 //! 2. **Code-signature gate** ([`verify_staged_bundle`]): pinned designated
@@ -14,11 +15,20 @@
 //!    install is ad-hoc), `Info.plist` identifier + version == the
 //!    minisign-verified release identity, edition guard
 //!    (`CFBundleExecutable`), release marker inside the executable.
-//! 3. **Swap** ([`install_staged_bundle`]): `renamex_np(RENAME_SWAP)` (or
+//! 3. **Swap** ([`install_staged_bundle`]): a swap journal is fsynced into
+//!    the staging directory first, then `renamex_np(RENAME_SWAP)` (or
 //!    `RENAME_EXCL` for a first install), rename-aside fallback when the
-//!    volume does not support it, parents fsynced, rollback on failure.
+//!    volume does not support it, parents fsynced — a sync failure rolls the
+//!    swap back too.
 //! 4. **Post-swap verify** (signature + `version` of the installed path),
-//!    swapping back on failure, then cleanup.
+//!    swapping back on failure, then cleanup ([`dispose_staging`]), which
+//!    first restores `previous.app` if the target is missing and never deletes
+//!    a staging directory holding the only good bundle.
+//!
+//! The whole sequence — including the target re-check — runs under a
+//! cross-process `flock` on `<parent>/.duduclaw-gateway-app.lock`
+//! ([`lock_bundle_parent`]); boot recovery ([`cleanup_stale_staging`]) takes
+//! the same lock.
 //!
 //! The pure parts compile and are tested on every host; only the `codesign`,
 //! `plutil`, `renamex_np` adapters and the orchestration are macOS-only.
@@ -82,17 +92,27 @@ fn parse_entry_name(raw: &[u8]) -> Result<(Vec<String>, bool), String> {
     Ok((parts, dir_marker))
 }
 
+/// Refuse setuid/setgid/sticky bits and group/world-writable permissions.
+fn check_mode_bits(mode: u32) -> Result<(), String> {
+    if mode & 0o7000 != 0 {
+        return Err("Bundle archive entry has setuid/setgid/sticky bits".into());
+    }
+    if mode & 0o022 != 0 {
+        return Err("Bundle archive entry is group- or world-writable".into());
+    }
+    Ok(())
+}
+
 /// Classify an entry from its unix mode / flags. Symlinks, devices, FIFOs,
-/// sockets and setuid/setgid/sticky bits are refused outright.
+/// sockets, setuid/setgid/sticky bits and group/world-writable modes are
+/// refused outright.
 fn entry_kind(unix_mode: Option<u32>, dir_marker: bool, is_symlink: bool) -> Result<EntryKind, String> {
     if is_symlink {
         return Err("Bundle archive contains a symlink".into());
     }
     let kind = match unix_mode {
         Some(mode) => {
-            if mode & 0o7000 != 0 {
-                return Err("Bundle archive entry has setuid/setgid/sticky bits".into());
-            }
+            check_mode_bits(mode)?;
             match mode & S_IFMT {
                 S_IFLNK => return Err("Bundle archive contains a symlink".into()),
                 S_IFDIR => EntryKind::Dir,
@@ -165,10 +185,11 @@ fn plan_bundle_zip<R: io::Read + io::Seek>(
     for index in 0..archive.len() {
         let entry = archive.by_index(index).map_err(|e| format!("Bundle archive entry error: {e}"))?;
         let (rel, dir_marker) = parse_entry_name(entry.name_raw())?;
-        // Refuse setuid/setgid/sticky on files AND directories, using both the
-        // crate's view and the raw central-directory attributes.
-        if raw_modes[index].is_some_and(|m| m & 0o7000 != 0) {
-            return Err("Bundle archive entry has setuid/setgid/sticky bits".into());
+        // Refuse setuid/setgid/sticky and group/world-writable modes on files
+        // AND directories, using both the raw central-directory attributes
+        // and (in entry_kind) the crate's view.
+        if let Some(mode) = raw_modes[index] {
+            check_mode_bits(mode)?;
         }
         let kind = entry_kind(entry.unix_mode().or(raw_modes[index]), dir_marker || entry.is_dir(), entry.is_symlink())?;
         if rel.is_empty() && kind != EntryKind::Dir {
@@ -480,6 +501,10 @@ pub(super) trait SwapOps {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
     }
+    /// fsync a directory (makes the renames above durable).
+    fn sync(&self, dir: &Path) -> io::Result<()> {
+        sync_dir(dir)
+    }
 }
 
 pub(super) struct SystemSwap;
@@ -551,7 +576,70 @@ pub(super) enum Installed {
     Fresh,
 }
 
-/// Put `staged` (inside `staging_dir`) at `target`.
+/// Inside a staging directory: which target the swap touches. Written and
+/// fsynced BEFORE the first rename that touches the target, so a crash at any
+/// point leaves enough on disk for [`recover_staging`] to put the previous
+/// bundle back.
+const SWAP_JOURNAL: &str = "swap-journal";
+const JOURNAL_MAGIC: &str = "duduclaw-bundle-swap v1\n";
+/// Rename-aside fallback: the previous bundle while the new one moves in.
+const PREVIOUS_APP: &str = "previous.app";
+/// A rollback failed while the target still holds the rejected bundle: the
+/// previous bundle in this staging directory must be kept for manual recovery.
+const ROLLBACK_FAILED: &str = "rollback-failed";
+
+pub(super) fn write_swap_journal(staging_dir: &Path, target: &Path) -> Result<(), String> {
+    use std::io::Write;
+    let target_s = target.to_str().ok_or("Bundle target path is not UTF-8")?;
+    let path = staging_dir.join(SWAP_JOURNAL);
+    let write = || -> io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        file.write_all(JOURNAL_MAGIC.as_bytes())?;
+        file.write_all(target_s.as_bytes())?;
+        file.sync_all()?;
+        sync_dir(staging_dir)
+    };
+    write().map_err(|e| format!("Cannot write the bundle swap journal: {e}"))
+}
+
+/// The journaled target: `Ok(None)` without a journal, `Err` when it is
+/// unreadable or names anything but a sibling `.app` of the staging dir.
+fn read_swap_journal(staging_dir: &Path) -> io::Result<Option<PathBuf>> {
+    use std::io::Read;
+    let bad = |why: &str| io::Error::new(io::ErrorKind::InvalidData, why.to_string());
+    let file = match std::fs::File::open(staging_dir.join(SWAP_JOURNAL)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut text = String::new();
+    file.take(4096).read_to_string(&mut text)?;
+    let target = PathBuf::from(text.strip_prefix(JOURNAL_MAGIC).ok_or_else(|| bad("bad swap journal header"))?);
+    let sibling = target.is_absolute() && target.parent() == staging_dir.parent()
+        && target.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.len() > 4 && n.ends_with(".app"));
+    if !sibling {
+        return Err(bad("swap journal names an unexpected target"));
+    }
+    Ok(Some(target))
+}
+
+fn note_failed_rollback(staging_dir: &Path, target: &Path) {
+    if std::fs::symlink_metadata(target).is_ok() {
+        let _ = std::fs::write(staging_dir.join(ROLLBACK_FAILED), b"1");
+        let _ = sync_dir(staging_dir);
+    }
+}
+
+/// Put `staged` (inside `staging_dir`) at `target`. The swap journal is
+/// written first; if the renamed directories cannot be made durable the
+/// install is rolled back instead of being reported as a failure in place.
 pub(super) fn install_staged_bundle(
     ops: &dyn SwapOps,
     staged: &Path,
@@ -559,17 +647,14 @@ pub(super) fn install_staged_bundle(
     target: &Path,
 ) -> Result<Installed, String> {
     let parent = target.parent().ok_or("Bundle target has no parent directory")?;
-    let sync = || {
-        sync_dir(parent).and_then(|()| sync_dir(staging_dir))
-            .map_err(|e| format!("Failed to sync bundle directories: {e}"))
-    };
     let exists = match std::fs::symlink_metadata(target) {
         Ok(meta) if meta.is_dir() => true,
         Ok(_) => return Err(format!("{} exists and is not a directory", target.display())),
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
         Err(e) => return Err(format!("Cannot inspect {}: {e}", target.display())),
     };
-    if !exists {
+    write_swap_journal(staging_dir, target)?;
+    let installed = if !exists {
         match ops.rename_excl(staged, target) {
             Ok(()) => {}
             Err(e) if unsupported(&e) => {
@@ -580,28 +665,36 @@ pub(super) fn install_staged_bundle(
             }
             Err(e) => return Err(format!("Failed to install bundle: {e}")),
         }
-        sync()?;
-        return Ok(Installed::Fresh);
-    }
-    match ops.swap(staged, target) {
-        Ok(()) => {
-            sync()?;
-            Ok(Installed::Swapped { old: staged.to_path_buf() })
-        }
-        Err(e) if unsupported(&e) => {
-            let aside = staging_dir.join("previous.app");
-            ops.rename(target, &aside).map_err(|e| format!("Failed to move the installed bundle aside: {e}"))?;
-            if let Err(e) = ops.rename(staged, target) {
-                return match ops.rename(&aside, target) {
-                    Ok(()) => Err(format!("Failed to install bundle (rolled back): {e}")),
-                    Err(rb) => Err(format!("Failed to install bundle: {e}; rollback failed: {rb}. Previous bundle: {}", aside.display())),
-                };
+        Installed::Fresh
+    } else {
+        match ops.swap(staged, target) {
+            Ok(()) => Installed::Swapped { old: staged.to_path_buf() },
+            Err(e) if unsupported(&e) => {
+                let aside = staging_dir.join(PREVIOUS_APP);
+                ops.rename(target, &aside).map_err(|e| format!("Failed to move the installed bundle aside: {e}"))?;
+                // From here until the next rename the target is missing; the
+                // journal lets boot recovery restore `previous.app`.
+                if let Err(e) = ops.rename(staged, target) {
+                    return match ops.rename(&aside, target) {
+                        Ok(()) => Err(format!("Failed to install bundle (rolled back): {e}")),
+                        Err(rb) => Err(format!("Failed to install bundle: {e}; rollback failed: {rb}. Previous bundle: {}", aside.display())),
+                    };
+                }
+                Installed::MovedAside { old: aside }
             }
-            sync()?;
-            Ok(Installed::MovedAside { old: aside })
+            Err(e) => return Err(format!("Failed to swap bundle: {e}")),
         }
-        Err(e) => Err(format!("Failed to swap bundle: {e}")),
+    };
+    if let Err(e) = ops.sync(parent).and_then(|()| ops.sync(staging_dir)) {
+        return Err(match restore_previous(ops, &installed, staging_dir, target) {
+            Ok(()) => format!("Failed to sync bundle directories (rolled back): {e}"),
+            Err(rb) => {
+                note_failed_rollback(staging_dir, target);
+                format!("Failed to sync bundle directories: {e}; rollback failed: {rb}")
+            }
+        });
     }
+    Ok(installed)
 }
 
 /// Undo [`install_staged_bundle`] after a failed post-swap check. The
@@ -620,17 +713,93 @@ pub(super) fn restore_previous(
     };
     result.map_err(|e| format!("Failed to restore the previous bundle: {e}"))?;
     if let Some(parent) = target.parent() {
-        let _ = sync_dir(parent);
+        let _ = ops.sync(parent);
     }
-    let _ = sync_dir(staging_dir);
+    let _ = ops.sync(staging_dir);
     Ok(())
 }
 
-/// Boot cleanup: remove `<parent>/.duduclaw-update-*` directories left by an
-/// interrupted update — only real directories owned by this user, older than
-/// `min_age` (never a concurrent update's), and not containing `running_exe`.
-/// Bare-binary staging *files* with the same prefix are left alone.
+/// What [`recover_staging`] decided for one staging directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum StagingState {
+    /// Nothing inside is needed any more.
+    Disposable,
+    /// The journaled target was missing; `previous.app` was put back.
+    Restored,
+    /// Holds a bundle that may be the only good copy — never delete it.
+    Keep(String),
+}
+
+/// Finish an interrupted swap: when the journaled target is missing and the
+/// previous bundle survives as `previous.app`, rename it back. A staging
+/// directory is only ever [`StagingState::Disposable`] when the target exists
+/// (or nothing in it could be restored).
+pub(super) fn recover_staging(ops: &dyn SwapOps, staging_dir: &Path) -> StagingState {
+    let previous = staging_dir.join(PREVIOUS_APP);
+    let has_previous = std::fs::symlink_metadata(&previous).is_ok_and(|m| m.is_dir());
+    if std::fs::symlink_metadata(staging_dir.join(ROLLBACK_FAILED)).is_ok() {
+        return StagingState::Keep("a rollback failed; the previous bundle is kept for manual recovery".into());
+    }
+    let target = match read_swap_journal(staging_dir) {
+        Ok(Some(target)) => target,
+        Ok(None) if !has_previous => return StagingState::Disposable,
+        Ok(None) => return StagingState::Keep("previous.app without a swap journal".into()),
+        Err(_) if !has_previous => return StagingState::Disposable,
+        Err(e) => return StagingState::Keep(format!("unreadable swap journal: {e}")),
+    };
+    match std::fs::symlink_metadata(&target) {
+        Ok(_) => StagingState::Disposable,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if !has_previous {
+                return StagingState::Disposable;
+            }
+            match ops.rename(&previous, &target) {
+                Ok(()) => {
+                    if let Some(parent) = target.parent() {
+                        let _ = ops.sync(parent);
+                    }
+                    StagingState::Restored
+                }
+                Err(e) => StagingState::Keep(format!("cannot restore {}: {e}", target.display())),
+            }
+        }
+        Err(e) => StagingState::Keep(format!("cannot inspect {}: {e}", target.display())),
+    }
+}
+
+/// Recover, then delete `staging_dir` unless it must be kept. Returns
+/// whether it was removed.
+pub(super) fn dispose_staging(ops: &dyn SwapOps, staging_dir: &Path) -> bool {
+    match recover_staging(ops, staging_dir) {
+        StagingState::Keep(why) => {
+            warn!(dir = %staging_dir.display(), reason = %why, "Keeping DuDuClaw Gateway.app staging directory");
+            false
+        }
+        StagingState::Restored => {
+            warn!(dir = %staging_dir.display(), "Restored the previous DuDuClaw Gateway.app after an interrupted update");
+            std::fs::remove_dir_all(staging_dir).is_ok()
+        }
+        StagingState::Disposable => std::fs::remove_dir_all(staging_dir).is_ok(),
+    }
+}
+
+/// Boot cleanup: recover and remove `<parent>/.duduclaw-update-*` directories
+/// left by an interrupted update — only real directories owned by this user,
+/// not containing `running_exe`. A missing target is restored from
+/// `previous.app` immediately; otherwise only directories older than
+/// `min_age` are removed, and never one [`recover_staging`] says to keep.
+/// Bare-binary staging *files* with the same prefix are left alone. Callers
+/// hold the [`lock_bundle_parent`] lock.
 pub(super) fn cleanup_stale_staging(parent: &Path, running_exe: &Path, min_age: std::time::Duration) -> usize {
+    cleanup_stale_staging_with(&SystemSwap, parent, running_exe, min_age)
+}
+
+pub(super) fn cleanup_stale_staging_with(
+    ops: &dyn SwapOps,
+    parent: &Path,
+    running_exe: &Path,
+    min_age: std::time::Duration,
+) -> usize {
     let Ok(entries) = std::fs::read_dir(parent) else { return 0 };
     let mut removed = 0;
     for entry in entries.flatten() {
@@ -653,11 +822,67 @@ pub(super) fn cleanup_stale_staging(parent: &Path, running_exe: &Path, min_age: 
         let old_enough = meta.modified().ok()
             .map(|m| m.elapsed().unwrap_or_default())
             .is_some_and(|age| age >= min_age);
-        if old_enough && std::fs::remove_dir_all(&path).is_ok() {
+        let state = recover_staging(ops, &path);
+        let remove = match &state {
+            StagingState::Keep(why) => {
+                warn!(dir = %path.display(), reason = %why, "Keeping DuDuClaw Gateway.app staging directory");
+                false
+            }
+            StagingState::Restored => {
+                warn!(dir = %path.display(), "Restored the previous DuDuClaw Gateway.app after an interrupted update");
+                true
+            }
+            StagingState::Disposable => old_enough,
+        };
+        if remove && std::fs::remove_dir_all(&path).is_ok() {
             removed += 1;
         }
     }
     removed
+}
+
+/// Lock file guarding every `DuDuClaw Gateway.app` install in one directory.
+pub(super) const BUNDLE_LOCK_NAME: &str = ".duduclaw-gateway-app.lock";
+
+/// Held for a whole bundle install (target re-check → verification → swap →
+/// post-check → rollback → cleanup) and for boot recovery. Released on drop.
+#[cfg(unix)]
+pub(super) struct BundleLock {
+    _file: std::fs::File,
+}
+
+/// Cross-process advisory lock (`flock(LOCK_EX | LOCK_NB)`) on
+/// `<parent>/.duduclaw-gateway-app.lock`: CE and Pro, or two gateways of one
+/// user, never touch the shared bundle at once (the per-process
+/// `UPDATE_IN_PROGRESS` flag cannot see other processes). Busy →
+/// [`UPDATE_BUSY`]. The lock file must be a regular file owned by this user.
+#[cfg(unix)]
+pub(super) fn lock_bundle_parent(parent: &Path) -> Result<BundleLock, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
+    let path = parent.join(BUNDLE_LOCK_NAME);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|e| format!("Cannot open the bundle update lock {}: {e}", path.display()))?;
+    let meta = file.metadata().map_err(|e| format!("Cannot inspect {}: {e}", path.display()))?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::getuid() } {
+        return Err(format!("{} is not a regular file owned by this user", path.display()));
+    }
+    // SAFETY: a valid open descriptor for the lifetime of `file`.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = io::Error::last_os_error();
+        return Err(if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            UPDATE_BUSY.to_string()
+        } else {
+            format!("Cannot lock {}: {e}", path.display())
+        });
+    }
+    Ok(BundleLock { _file: file })
 }
 
 // ---------------------------------------------------------------------------
@@ -697,10 +922,34 @@ pub(super) fn replace_with_symlink(bare: &Path, bundle_exe: &Path) -> Result<(),
     sync_dir(dir).map_err(|e| format!("Cannot sync {}: {e}", dir.display()))
 }
 
+/// The directory a bundle install for `current_exe` happens in (and is
+/// locked on): the running bundle's parent, or the migration target's.
+#[cfg(target_os = "macos")]
+fn bundle_parent(current_exe: &Path) -> Result<PathBuf, String> {
+    let root = match duduclaw_core::macos_bundle::running_gateway_bundle() {
+        Some(root) => root,
+        None => {
+            let home = dirs::home_dir().filter(|h| h.is_absolute()).ok_or("Cannot determine home directory")?;
+            duduclaw_core::macos_bundle::migration_target_root(current_exe, &home)
+        }
+    };
+    root.parent().map(Path::to_path_buf).ok_or_else(|| "Bundle target has no parent directory".into())
+}
+
+/// Decide the install mode from the CURRENT state of the target (re-lstat +
+/// re-classify) — called with the bundle lock held, so nothing moves under it.
 #[cfg(target_os = "macos")]
 fn bundle_mode(current_exe: &Path) -> Result<BundleInstallMode, String> {
     use duduclaw_core::macos_bundle::{BundleKind, PlutilReader, classify, migration_target_root};
     if let Some(root) = duduclaw_core::macos_bundle::running_gateway_bundle() {
+        let meta = std::fs::symlink_metadata(&root).map_err(|e| format!("Cannot inspect {}: {e}", root.display()))?;
+        if !meta.is_dir() {
+            return Err(format!("{} is no longer a directory — refusing to update it", root.display()));
+        }
+        let exe = duduclaw_core::macos_bundle::bundle_executable(&root, archive_binary_name(current_exe));
+        if !matches!(classify(&exe, &PlutilReader), BundleKind::Gateway(_)) {
+            return Err(format!("{} is no longer DuDuClaw Gateway.app — refusing to update it", root.display()));
+        }
         return Ok(BundleInstallMode::Update { target: root });
     }
     if duduclaw_core::macos_bundle::bundle_root_of(current_exe).is_some() {
@@ -748,36 +997,63 @@ async fn run_version_check(exe: &Path, expected: &str) -> Result<(), String> {
     release_identity::verify_binary_version_output(&String::from_utf8_lossy(&output.stdout), expected)
 }
 
-/// Install a minisign-verified `.app.zip` (identity already checked against
-/// these bytes by the caller). Returns the result and the installed
-/// executable path (used for the relaunch).
+/// Install a minisign-verified `.app.zip` (identity and version floor already
+/// checked against these bytes by the caller). Returns the result and the
+/// installed executable path (used for the relaunch). `allow_equal`: explicit
+/// migration — an adopted bundle of the same version may be reinstalled.
 #[cfg(target_os = "macos")]
 pub(super) async fn install_bundle_archive(
     archive_bytes: &[u8],
     current_exe: &Path,
     identity: &VerifiedReleaseIdentity,
+    allow_equal: bool,
 ) -> Result<(ApplyResult, PathBuf), String> {
     let exe_name = archive_binary_name(current_exe);
-    let mode = bundle_mode(current_exe)?;
     // The running process is bare: after the install, point the old entry
     // points (CLI path, LaunchAgent) at the bundle — also when adopting a
     // bundle install.sh already placed.
     let migrating = duduclaw_core::macos_bundle::running_gateway_bundle().is_none();
-    let (target, current_bundle) = match &mode {
-        BundleInstallMode::Update { target } => (target.clone(), Some(target.clone())),
-        BundleInstallMode::Migrate { target } => (target.clone(), None),
-    };
-    let parent = target.parent().ok_or("Bundle target has no parent directory")?.to_path_buf();
-    if current_bundle.is_none() && !parent.exists() {
+    let parent = bundle_parent(current_exe)?;
+    if migrating && !parent.exists() {
         std::fs::create_dir_all(&parent).map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
     }
     if duduclaw_core::platform::is_unsafe_update_dir(&parent) {
         return Err(format!("Bundle directory {} is writable by non-admin users — refusing update for safety",
             parent.display()));
     }
+    // Cross-process: held until this function returns, across the target
+    // re-check, verification, swap, post-check, rollback and cleanup.
+    let _lock = lock_bundle_parent(&parent)?;
+    // Finish any interrupted swap before looking at the target.
+    {
+        let (p, exe) = (parent.clone(), current_exe.to_path_buf());
+        let _ = tokio::task::spawn_blocking(move || cleanup_stale_staging(&p, &exe, std::time::Duration::from_secs(3600))).await;
+    }
+    let mode = bundle_mode(current_exe)?;
+    let (target, current_bundle) = match &mode {
+        BundleInstallMode::Update { target } => (target.clone(), Some(target.clone())),
+        BundleInstallMode::Migrate { target } => (target.clone(), None),
+    };
+    if target.parent() != Some(parent.as_path()) {
+        return Err(format!("{} moved during the update — refusing to continue", target.display()));
+    }
+    // Adopting a bundle install.sh placed while the bare binary runs: never
+    // replace it with an older one either (its version is read from
+    // Info.plist — the not-yet-verified bundle is not executed).
+    if let Some(bundle) = &current_bundle {
+        let exe = duduclaw_core::macos_bundle::bundle_executable(bundle, exe_name);
+        if exe != current_exe {
+            let installed = duduclaw_core::macos_bundle::PlutilReader
+                .read_key(bundle, "CFBundleShortVersionString").ok();
+            check_version_floor(identity.version(), current_version(), installed.as_deref(), allow_equal)?;
+        }
+    }
     let staging = create_staging_dir(&parent)?;
     let result = install_into(archive_bytes, &staging, &target, current_bundle, exe_name, identity.version()).await;
-    let _ = std::fs::remove_dir_all(&staging);
+    {
+        let s = staging.clone();
+        let _ = tokio::task::spawn_blocking(move || dispose_staging(&SystemSwap, &s)).await;
+    }
     let installed_exe = result?;
 
     let mut message = String::from("Update installed. The service will restart automatically.");
@@ -834,7 +1110,13 @@ async fn install_into(
     }.await;
     if let Err(e) = post {
         let (staging_dir, target_p) = (staging.to_path_buf(), target.to_path_buf());
-        let restored = tokio::task::spawn_blocking(move || restore_previous(&SystemSwap, &installed, &staging_dir, &target_p))
+        let restored = tokio::task::spawn_blocking(move || {
+            let restored = restore_previous(&SystemSwap, &installed, &staging_dir, &target_p);
+            if restored.is_err() {
+                note_failed_rollback(&staging_dir, &target_p);
+            }
+            restored
+        })
             .await.map_err(|e| format!("Bundle restore task panicked: {e}"))?;
         return Err(match restored {
             Ok(()) => format!("Update verification failed (previous bundle restored): {e}"),
@@ -876,13 +1158,14 @@ mod tests {
 
     const ROOT: &str = "DuDuClaw Gateway.app";
 
-    enum E<'a> { Dir(&'a str), File(&'a str, u32, &'a [u8]), Link(&'a str, &'a str), Raw(&'a str, u32, &'a [u8]) }
+    enum E<'a> { Dir(&'a str), DirMode(&'a str, u32), File(&'a str, u32, &'a [u8]), Link(&'a str, &'a str), Raw(&'a str, u32, &'a [u8]) }
 
     fn zip_of(entries: &[E]) -> Vec<u8> {
         let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
         for e in entries {
             match e {
                 E::Dir(n) => w.add_directory(*n, SimpleFileOptions::default().unix_permissions(0o755)).unwrap(),
+                E::DirMode(n, mode) => w.add_directory(*n, SimpleFileOptions::default().unix_permissions(*mode)).unwrap(),
                 E::File(n, mode, data) => {
                     w.start_file(*n, SimpleFileOptions::default().unix_permissions(*mode)).unwrap();
                     w.write_all(data).unwrap();
@@ -945,6 +1228,11 @@ mod tests {
             ("case duplicate", { let mut g = good(EXE); g.push(E::File("DuDuClaw Gateway.app/contents/info.plist", 0o644, b"x")); g }),
             ("file as dir", { let mut g = good(EXE); g.push(E::File("DuDuClaw Gateway.app/Contents/Info.plist/x", 0o644, b"x")); g }),
             ("root file", vec![E::File("DuDuClaw Gateway.app", 0o644, b"x")]),
+            ("group-writable file", { let mut g = good(EXE); g.push(E::Raw("DuDuClaw Gateway.app/Contents/Resources/g", 0o100664, b"g")); g }),
+            ("world-writable file", { let mut g = good(EXE); g.push(E::Raw("DuDuClaw Gateway.app/Contents/Resources/w", 0o100646, b"w")); g }),
+            ("world-writable dir", { let mut g = good(EXE); g.push(E::DirMode("DuDuClaw Gateway.app/Contents/Resources/", 0o777)); g }),
+            ("group-writable exe", { let mut g = good(EXE); g.retain(|e| !matches!(e, E::File(n, _, _) if *n == EXE)); g.push(E::File(EXE, 0o775, b"b")); g }),
+            ("sticky", { let mut g = good(EXE); g.push(E::Raw("DuDuClaw Gateway.app/Contents/Resources/t", 0o101644, b"t")); g }),
         ];
         for (what, entries) in cases {
             let dir = tempfile::tempdir().unwrap();
@@ -977,6 +1265,10 @@ mod tests {
         assert!(entry_kind(Some(0o102755), false, false).is_err());
         assert!(entry_kind(Some(0o060644), false, false).is_err());
         assert!(entry_kind(Some(0o040755), false, false).is_err(), "dir mode on a file name");
+        for writable in [0o100664, 0o100646, 0o100666, 0o040775, 0o040777] {
+            assert!(entry_kind(Some(writable), writable & 0o040000 != 0, false).is_err(), "{writable:o}");
+        }
+        assert!(check_mode_bits(0o100755).is_ok() && check_mode_bits(0o040700).is_ok());
     }
 
     #[test]
@@ -1188,6 +1480,152 @@ CodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+7 location=embedded
         assert_eq!(cleanup_stale_staging(parent.path(), &running_exe, std::time::Duration::ZERO), 1);
         assert!(!stale.exists());
         assert!(running.exists() && file.exists() && other.exists());
+    }
+
+    /// No `renamex_np`; plain renames whose 1-based call numbers in `fail` error.
+    struct FailRenames { calls: std::cell::Cell<u32>, fail: Vec<u32> }
+    impl FailRenames {
+        fn new(fail: &[u32]) -> Self { Self { calls: Default::default(), fail: fail.to_vec() } }
+    }
+    impl SwapOps for FailRenames {
+        fn swap(&self, _: &Path, _: &Path) -> io::Result<()> { Err(io::Error::from(io::ErrorKind::Unsupported)) }
+        fn rename_excl(&self, _: &Path, _: &Path) -> io::Result<()> { Err(io::Error::from(io::ErrorKind::Unsupported)) }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            if self.fail.contains(&self.calls.get()) { return Err(io::Error::other("injected")); }
+            std::fs::rename(from, to)
+        }
+    }
+
+    /// Target missing, the previous bundle only in `staging/previous.app` —
+    /// the state a crash (or a failed rollback) mid rename-aside leaves.
+    fn interrupted_rename_aside() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join(ROOT);
+        bundle(&target, "old");
+        let staging = create_staging_dir(parent.path()).unwrap();
+        bundle(&staging.join(ROOT), "new");
+        let error = install_staged_bundle(&FailRenames::new(&[2, 3]), &staging.join(ROOT), &staging, &target).unwrap_err();
+        assert!(error.contains("rollback failed"), "{error}");
+        assert!(!target.exists());
+        assert_eq!(tag(&staging.join(PREVIOUS_APP)), "old");
+        assert!(staging.join(SWAP_JOURNAL).exists(), "journal written before the first rename");
+        (parent, target, staging)
+    }
+
+    #[test]
+    fn interrupted_rename_aside_is_restored_at_boot_before_cleanup() {
+        let (parent, target, staging) = interrupted_rename_aside();
+        // Young staging dir: still recovered at once, and removed only after.
+        let removed = cleanup_stale_staging(parent.path(), Path::new("/nonexistent/duduclaw"),
+            std::time::Duration::from_secs(3600));
+        assert_eq!(removed, 1);
+        assert_eq!(tag(&target), "old");
+        assert!(!staging.exists());
+        // The in-process path does the same.
+        let (_parent, target, staging) = interrupted_rename_aside();
+        assert!(dispose_staging(&SystemSwap, &staging));
+        assert_eq!(tag(&target), "old");
+    }
+
+    #[test]
+    fn staging_holding_the_only_bundle_is_never_deleted() {
+        struct NoRename;
+        impl SwapOps for NoRename {
+            fn swap(&self, _: &Path, _: &Path) -> io::Result<()> { Err(io::Error::other("no")) }
+            fn rename_excl(&self, _: &Path, _: &Path) -> io::Result<()> { Err(io::Error::other("no")) }
+            fn rename(&self, _: &Path, _: &Path) -> io::Result<()> { Err(io::Error::other("no")) }
+        }
+        let (parent, target, staging) = interrupted_rename_aside();
+        let exe = Path::new("/nonexistent/duduclaw");
+        // Restore impossible: kept, however old.
+        assert_eq!(cleanup_stale_staging_with(&NoRename, parent.path(), exe, std::time::Duration::ZERO), 0);
+        assert!(!dispose_staging(&NoRename, &staging));
+        assert_eq!(tag(&staging.join(PREVIOUS_APP)), "old");
+        // A journal that cannot be trusted never licenses deleting previous.app.
+        let journal = staging.join(SWAP_JOURNAL);
+        for bad in [b"garbage".to_vec(), format!("{JOURNAL_MAGIC}/etc/evil.app").into_bytes(),
+            format!("{JOURNAL_MAGIC}{}", parent.path().join("x").display()).into_bytes()] {
+            std::fs::write(&journal, bad).unwrap();
+            assert!(matches!(recover_staging(&SystemSwap, &staging), StagingState::Keep(_)));
+            assert_eq!(cleanup_stale_staging(parent.path(), exe, std::time::Duration::ZERO), 0);
+        }
+        std::fs::remove_file(&journal).unwrap();
+        assert!(matches!(recover_staging(&SystemSwap, &staging), StagingState::Keep(_)), "previous.app without a journal");
+        assert_eq!(tag(&staging.join(PREVIOUS_APP)), "old");
+        // A valid journal again: restored.
+        write_swap_journal(&staging, &target).unwrap();
+        assert_eq!(recover_staging(&SystemSwap, &staging), StagingState::Restored);
+        assert_eq!(tag(&target), "old");
+        assert_eq!(recover_staging(&SystemSwap, &staging), StagingState::Disposable);
+    }
+
+    #[test]
+    fn a_failed_rollback_keeps_the_previous_bundle_for_manual_recovery() {
+        struct FailSwap;
+        impl SwapOps for FailSwap {
+            fn swap(&self, _: &Path, _: &Path) -> io::Result<()> { Err(io::Error::other("swap failed")) }
+            fn rename_excl(&self, _: &Path, _: &Path) -> io::Result<()> { Err(io::Error::other("no")) }
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join(ROOT);
+        bundle(&target, "old");
+        let staging = create_staging_dir(parent.path()).unwrap();
+        bundle(&staging.join(ROOT), "new");
+        let installed = install_staged_bundle(&EmulatedSwap, &staging.join(ROOT), &staging, &target).unwrap();
+        assert_eq!(tag(&target), "new");
+        assert!(restore_previous(&FailSwap, &installed, &staging, &target).is_err());
+        note_failed_rollback(&staging, &target);
+        assert!(matches!(recover_staging(&SystemSwap, &staging), StagingState::Keep(_)));
+        assert_eq!(cleanup_stale_staging(parent.path(), Path::new("/nonexistent/duduclaw"), std::time::Duration::ZERO), 0);
+        assert_eq!(tag(&staging.join(ROOT)), "old");
+    }
+
+    #[test]
+    fn post_swap_sync_failure_rolls_back() {
+        struct FailFirstSync<'a> { inner: &'a dyn SwapOps, failed: std::cell::Cell<bool> }
+        impl SwapOps for FailFirstSync<'_> {
+            fn swap(&self, a: &Path, b: &Path) -> io::Result<()> { self.inner.swap(a, b) }
+            fn rename_excl(&self, a: &Path, b: &Path) -> io::Result<()> { self.inner.rename_excl(a, b) }
+            fn rename(&self, a: &Path, b: &Path) -> io::Result<()> { self.inner.rename(a, b) }
+            fn sync(&self, dir: &Path) -> io::Result<()> {
+                if self.failed.replace(true) { sync_dir(dir) } else { Err(io::Error::other("fsync failed")) }
+            }
+        }
+        let inners: [&dyn SwapOps; 2] = [&EmulatedSwap, &NoRenamex];
+        for inner in inners {
+            for existing in [true, false] {
+                let parent = tempfile::tempdir().unwrap();
+                let target = parent.path().join(ROOT);
+                if existing { bundle(&target, "old"); }
+                let staging = create_staging_dir(parent.path()).unwrap();
+                bundle(&staging.join(ROOT), "new");
+                let ops = FailFirstSync { inner, failed: Default::default() };
+                let error = install_staged_bundle(&ops, &staging.join(ROOT), &staging, &target).unwrap_err();
+                assert!(error.contains("rolled back"), "{error}");
+                if existing { assert_eq!(tag(&target), "old"); } else { assert!(!target.exists()); }
+                assert!(dispose_staging(&SystemSwap, &staging));
+                if existing { assert_eq!(tag(&target), "old"); }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_lock_is_exclusive_across_open_files() {
+        let parent = tempfile::tempdir().unwrap();
+        let first = lock_bundle_parent(parent.path()).unwrap();
+        // A second open file description (another process, or CE vs Pro) is refused.
+        assert_eq!(lock_bundle_parent(parent.path()).err().as_deref(), Some(UPDATE_BUSY));
+        drop(first);
+        drop(lock_bundle_parent(parent.path()).unwrap());
+        // The lock file is never followed through a symlink.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let lock = parent.path().join(BUNDLE_LOCK_NAME);
+        std::fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("x"), &lock).unwrap();
+        assert!(lock_bundle_parent(parent.path()).is_err());
+        assert!(!elsewhere.path().join("x").exists());
     }
 
     #[cfg(unix)]

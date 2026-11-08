@@ -371,11 +371,16 @@ pub(super) mod tests {
             assert_eq!(identity.signature(), signature);
             assert_eq!(identity.trusted_comment(), format!("{product} v1.80.0 {file}"));
             // A proof for one archive cannot authorize different bytes.
-            assert!(install_archive_bytes(b"different archive", &installed, dir.path(), &identity).await.is_err());
+            assert!(install_archive_bytes(b"different archive", &installed, dir.path(), &identity,
+                InstallIntent::Update).await.is_err());
+            // A validly signed release older than the running one is a replay.
+            let error = install_archive_bytes(OLD_ARCHIVE, &installed, dir.path(), &identity,
+                InstallIntent::Update).await.unwrap_err();
+            assert!(error.contains("refusing downgrade"), "{error}");
             #[cfg(unix)]
             {
                 // Even a signed comment for the requested version cannot hide an old binary.
-                let error = install_archive_bytes(OLD_ARCHIVE, &installed, dir.path(), &identity)
+                let error = install_floor_checked(OLD_ARCHIVE, &installed, dir.path(), &identity, false)
                     .await.unwrap_err();
                 assert!(error.contains("version mismatch"), "{error}");
             }

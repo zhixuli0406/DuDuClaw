@@ -21,6 +21,8 @@
 
 - macOS：App 安裝只會從發行版中已簽章的 App 更新。換上新版前會核對簽章、識別碼、版本與版別，任何一項不符就不更新，已安裝的 App 維持原樣。
 - macOS：登入服務改記錄 gateway 的實際檔案位置，不再記錄捷徑路徑；舊的設定會在 gateway 啟動時自動更正。
+- 安裝腳本 `install.sh` 現在需要 [minisign](https://jedisct1.github.io/minisign/)（macOS：`brew install minisign`；Debian/Ubuntu：`sudo apt install minisign`），用來在解壓前核對發行檔的官方簽章；找不到 minisign 時會停止並說明安裝方式，不會略過驗證。macOS 上也會在安裝前核對 App 的開發者簽章、識別碼、版本與版別。
+- 自動更新與移轉不會安裝比目前執行中或已安裝版本更舊的發行版，也不會重新安裝相同版本（移到 App 的移轉除外）。
 
 ## [1.80.1] - 2026-11-07 — macOS／Windows 下載版修正
 
