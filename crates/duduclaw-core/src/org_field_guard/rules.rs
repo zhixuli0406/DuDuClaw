@@ -156,11 +156,12 @@ pub const AGENT_EDITABLE_SECTIONS: &[&str] = &[
 ///   shared page.
 /// - `[prompt] cli_bare_mode` — adds `--bare`, which makes the Claude CLI skip
 ///   hooks (this one included).
+/// - `[prompt] reply_language` — administrator-set reply language.
 /// - `[model] account_pool` — which rotator accounts (whose credentials and
 ///   quota) the agent may spend.
 pub const AGENT_SECURITY_KEYS: &[(&str, &[&str])] = &[
     ("agent", &["role"]),
-    ("prompt", &["cli_bare_mode"]),
+    ("prompt", &["cli_bare_mode", "reply_language"]),
     ("model", &["account_pool"]),
 ];
 

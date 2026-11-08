@@ -156,6 +156,13 @@ npm 未安裝或安裝失敗時，提示會提供完整的手動指令與複製�
 |---|---|---|
 | 全域背景工作 → 全域輔助後端／模型 | `[runtime] utility_provider`／`utility_model` | 立即生效（每次呼叫重新讀取） |
 | 一般 → 日誌格式 | `[logging] format`（`json`；其他值都是純文字） | 重啟 |
+| 一般 → AI 員工回覆語言（預設） | `[general] default_language`（`zh-TW`、`zh-CN`、`en`、`ja-JP`；留空或選「跟隨輸入語言」＝依使用者語言回覆）。固定所有 AI 員工的回覆語言，並在每一輪結尾加一行提醒，避免讀了大量其他語言的內容後偏離 | 下一則訊息 |
+| 編輯 AI 員工 → 基本 → 回覆語言 | 員工 `agent.toml` 的 `[prompt] reply_language`（`auto`、`zh-TW`、`zh-CN`、`en`、`ja-JP`；也可用 `agents.update` 的 `reply_language` 或 MCP `agent_update` 工具設定）。「沿用整體設定」會移除這個鍵並回到 `[general] default_language`；`auto` 讓這位員工依使用者語言回覆，即使整體已固定語言。其他值一律拒絕 | 下一則訊息 |
+
+回覆語言適用於通道回覆、交辦任務、排程、目標迴圈、子代理及 task sandbox 的系統提示詞。使用者明確要求其他語言時，以該要求為準。只有管理員能修改員工的 `reply_language`，員工不能自行編輯該鍵。RPC／MCP 拒絕選項以外的值；磁碟中既有的無效值會記錄警告並沿用整體設定。整體語言代碼必須符合 `^[A-Za-z]{2,3}([-_][A-Za-z0-9]{2,8}){0,2}$`；只有已辨識的中文、英文與日文代碼會產生提示詞指令或提醒。
+
+固定失敗訊息與操作機器的拒絕訊息支援繁中、簡中、英文與日文。員工選 `auto` 時，這些訊息因無法偵測使用者語言而沿用整體語言；整體未設定或不支援時使用繁中。其他系統通知（包含通道 `@` 路由通知）目前只支援繁中／英／日，選簡中時仍使用繁中。
+
 | 顯示名稱 | `[general] name` | 重啟（區網廣播在開機時建立） |
 | 帳號健康檢查間隔 | `[rotation] health_check_interval_seconds` | 重啟 |
 | 任務沙箱 → 沙箱映像、沙箱無法使用時（任務）、沙箱無法使用時（程式碼執行） | `[container.sandbox] image`、`when_unavailable`、`script_when_unavailable` | 立即（逐任務讀取） |

@@ -372,6 +372,7 @@ pub(super) fn operator_diagnostics_allowed(home: &Path, session: &str) -> bool {
 
 pub(super) fn operator_access_refusal(language: Option<&str>) -> &'static str {
     match language.unwrap_or("zh-TW") {
+        "zh-CN" | "zh_CN" => "只有系统管理员可以通过这位 AI 员工操作机器。请改用其他 AI 员工处理工作。",
         "en" => "Only an administrator can use this AI employee to operate the machine. Please choose another AI employee for your work.",
         "ja" | "ja-JP" => "この AI スタッフで機器を操作できるのは管理者だけです。業務には別の AI スタッフを選んでください。",
         _ => "只有系統管理員可以透過這位 AI 員工操作機器。請改用其他 AI 員工處理工作。",
@@ -380,6 +381,8 @@ pub(super) fn operator_access_refusal(language: Option<&str>) -> &'static str {
 
 pub(super) fn end_user_failure_message(agent: &str, reason: FailureReason, language: Option<&str>) -> String {
     match (language.unwrap_or("zh-TW"), reason) {
+        ("zh-CN" | "zh_CN", FailureReason::Timeout) => format!("{agent} 这次处理超时，请稍后重试，或将工作拆成较小的步骤。"),
+        ("zh-CN" | "zh_CN", _) => format!("{agent} 暂时无法回应，请稍后再试；若持续发生，请联系管理员。"),
         ("en", FailureReason::Timeout) => format!("{agent} took too long to respond. Please try again later or split the work into smaller steps."),
         ("en", _) => format!("{agent} cannot respond right now. Please try again later; if this continues, contact an administrator."),
         ("ja" | "ja-JP", FailureReason::Timeout) => format!("{agent} の応答が時間切れになりました。時間をおいて再試行するか、作業を小さな手順に分けてください。"),
@@ -392,6 +395,12 @@ pub(super) fn end_user_failure_message(agent: &str, reason: FailureReason, langu
 #[cfg(test)]
 mod audience_tests {
     use super::*;
+
+    #[test]
+    fn prompt_identity_simplified_chinese_fixed_messages() {
+        assert!(operator_access_refusal(Some("zh-CN")).contains("系统管理员"));
+        assert!(end_user_failure_message("A", FailureReason::Timeout, Some("zh-CN")).contains("处理超时"));
+    }
 
     #[tokio::test]
     async fn system_operator_access_requires_live_enterprise_admin_and_rejects_public_origins() {
