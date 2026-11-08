@@ -300,12 +300,16 @@ pub fn refuse_supplied_target(
 /// Is the dashboard account still allowed to talk to `agent`? Admins always;
 /// everyone else needs a binding / team grant (same predicate WebChat uses
 /// for explicit agent selection). Inactive / missing accounts fail closed.
-fn account_may_call(home: &Path, user: &str, agent: &str) -> Result<(), String> {
+fn account_may_call(
+    home: &Path,
+    user: &str,
+    agent: &str,
+) -> Result<crate::team_edition::EditionSnapshot, String> {
     let db = crate::decision_notify::open_user_db(home)?.ok_or("帳號資料庫不存在")?;
-    let (access, _) = crate::trigger_route::access::load_account_with_edition(home, &db, user)?;
+    let (access, edition) = crate::trigger_route::access::load_account_with_edition(home, &db, user)?;
     let access = access.ok_or("對話擁有者的帳號已停用或不存在")?;
     if access.role == duduclaw_auth::UserRole::Admin || access.may_call(agent) {
-        Ok(())
+        Ok(edition)
     } else {
         Err("對話擁有者已無權與此 AI 員工對話".into())
     }
@@ -316,14 +320,24 @@ fn account_may_call(home: &Path, user: &str, agent: &str) -> Result<(), String> 
 /// schedule), same employee, same dashboard account, account still Active and
 /// still allowed to talk to the employee. Returns the owner user id.
 pub fn verify_delivery(home: &Path, agent: &str, target: &str) -> Result<String, String> {
+    verify_delivery_leased(home, agent, target).map(|(owner, _)| owner)
+}
+
+/// [`verify_delivery`] that also returns the edition snapshot the decision was
+/// made under, so the caller can hold it until the write commits.
+fn verify_delivery_leased(
+    home: &Path,
+    agent: &str,
+    target: &str,
+) -> Result<(String, crate::team_edition::EditionSnapshot), String> {
     let (session, origin_at) = split_target(target);
     let origin_at = origin_at.ok_or("排程目標缺少對話世代，已停止傳送")?;
     let (owner, created_at) = check_session(home, session, agent)?;
     if created_at != origin_at {
         return Err("WebChat 對話已被刪除並重建，已停止傳送".into());
     }
-    account_may_call(home, &owner, agent)?;
-    Ok(owner)
+    let edition = account_may_call(home, &owner, agent)?;
+    Ok((owner, edition))
 }
 
 /// `result` clamped to [`MAX_RESULT_CHARS`] chars (CJK-safe), with a
@@ -381,9 +395,11 @@ pub fn audit_drop(home: &Path, agent: &str, source: &str, id: &str, reason: &str
 /// Authorization race: the account/ACL state lives in `users.db`, the write in
 /// `sessions.db`, so they cannot share a transaction. Instead the ACL
 /// generation (`auth_meta.acl_generation`, bumped by every suspension, unbind
-/// and grant change) is read *before* the account check and re-read after the
-/// row is inserted but *before* commit; if it moved, the transaction is rolled
-/// back and the message never lands.
+/// and grant change) is read *before* the account check; the sessions.db commit
+/// then happens inside `UserDb::with_acl_generation` (an IMMEDIATE users.db
+/// lease that blocks authorisation writes) and `EditionSnapshot::with_current`
+/// (edition downgrades do not bump the generation). If either moved, the
+/// transaction is rolled back and the message never lands.
 pub async fn deliver(home: &Path, agent: &str, target: &str, body: &str) -> Result<(), String> {
     deliver_with_hook(home, agent, target, body, || {}).await
 }
@@ -397,7 +413,8 @@ async fn deliver_with_hook(
 ) -> Result<(), String> {
     let generation = crate::trigger_route::access::read_generation(home)
         .ok_or("授權狀態無法讀取，已停止傳送")?;
-    let owner = verify_delivery(home, agent, target)?;
+    let (owner, edition) = verify_delivery_leased(home, agent, target)?;
+    let users = crate::decision_notify::open_user_db(home)?.ok_or("帳號資料庫不存在")?;
     let (session, origin_at) = split_target(target);
     let origin_at = origin_at.ok_or("排程目標缺少對話世代，已停止傳送")?;
     let body = clamp_body(body);
@@ -426,11 +443,15 @@ async fn deliver_with_hook(
     tx.execute("UPDATE sessions SET last_active=?2, archived_at=NULL WHERE id=?1", params![session, now])
         .map_err(|_| "對話紀錄無法寫入".to_string())?;
     after_append();
-    if crate::trigger_route::access::read_generation(home) != Some(generation) {
-        // Dropping `tx` rolls the append back.
-        return Err("對話擁有者的授權剛剛變更，已停止傳送".into());
-    }
-    tx.commit().map_err(|_| "對話紀錄無法寫入".to_string())
+    // Commit while holding the users.db ACL lease (BEGIN IMMEDIATE blocks every
+    // authorisation write until we are done) and the edition snapshot (an
+    // Enterprise→Personal downgrade does not bump the ACL generation). If
+    // either moved, `tx` is dropped un-committed and the append rolls back.
+    users
+        .with_acl_generation(generation, || edition.with_current(|| tx.commit()))
+        .map_err(|_| "對話擁有者的授權剛剛變更，已停止傳送".to_string())?
+        .map_err(|_| "對話擁有者的授權剛剛變更，已停止傳送".to_string())?
+        .map_err(|_| "對話紀錄無法寫入".to_string())
 }
 
 #[cfg(test)]
@@ -564,6 +585,62 @@ pub(crate) mod tests {
         db.set_user_status(&f.user, UserStatus::Active).unwrap();
         deliver(h, "sales", &f.target, "ok").await.unwrap();
         assert_eq!(messages(&f).await, vec!["ok".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn edition_downgrade_between_check_and_commit_rolls_the_append_back() {
+        let f = fixture("sales").await;
+        let h = f.home.path();
+        crate::team_edition::record(h, duduclaw_core::EditionProfile::Enterprise);
+        let result = deliver_with_hook(h, "sales", &f.target, "late", || {
+            // No ACL generation bump: only the edition epoch moves.
+            crate::team_edition::record(h, duduclaw_core::EditionProfile::Personal);
+        })
+        .await;
+        assert!(result.is_err(), "edition changed during the append");
+        assert!(messages(&f).await.is_empty(), "the message must not land");
+        deliver(h, "sales", &f.target, "ok").await.unwrap();
+        assert_eq!(messages(&f).await, vec!["ok".to_string()]);
+    }
+
+    async fn aimed_cron(f: &Fixture) -> crate::cron_store::CronStore {
+        let store = crate::cron_store::CronStore::open(f.home.path()).unwrap();
+        let mut aimed = crate::cron_store::CronTaskRow::new("c1".into(), "aimed".into(), "sales".into(), "0 9 * * *".into(), "t".into());
+        aimed.notify_channel = Some(CHANNEL.into());
+        aimed.notify_chat_id = Some(f.target.clone());
+        let other = crate::cron_store::CronTaskRow::new("c2".into(), "other".into(), "sales".into(), "0 9 * * *".into(), "t".into());
+        store.insert(&aimed).await.unwrap();
+        store.insert(&other).await.unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn gdpr_erase_cancels_schedules_aimed_at_erased_conversations() {
+        let f = fixture("sales").await;
+        let h = f.home.path();
+        let store = aimed_cron(&f).await;
+        let manager = crate::session::SessionManager::new(&h.join("sessions.db")).unwrap();
+        let contact = format!("webchat:webchat:{}", crate::webchat::webchat_owner_tag(&f.user));
+        let (sessions, _) = manager.erase_sessions_for_contact(&contact).await.unwrap();
+        assert_eq!(sessions, 1);
+        let left: Vec<String> = store.list_all().await.unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(left, vec!["c2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn retention_purge_cancels_schedules_aimed_at_purged_conversations() {
+        let f = fixture("sales").await;
+        let h = f.home.path();
+        let store = aimed_cron(&f).await;
+        let manager = crate::session::SessionManager::new(&h.join("sessions.db")).unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::days(100)).to_rfc3339();
+        {
+            let conn = manager.acquire().await;
+            conn.execute("UPDATE sessions SET archived_at=?2 WHERE id=?1", params![f.session, old]).unwrap();
+        }
+        manager.cleanup_inactive_with_retention(24, 90).await.unwrap();
+        let left: Vec<String> = store.list_all().await.unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(left, vec!["c2".to_string()]);
     }
 
     #[tokio::test]
