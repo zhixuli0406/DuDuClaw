@@ -118,6 +118,10 @@ mod boot;
 #[cfg(target_os = "linux")]
 #[path = "isolation_mcp/ingress.rs"]
 pub(crate) mod ingress;
+/// H9 issuer selectors (Workspace / PublicOrigins / record Task grants).
+#[cfg(target_os = "linux")]
+#[path = "isolation_mcp/selectors.rs"]
+mod selectors;
 #[cfg(target_os = "linux")]
 pub(crate) use boot::a_producers_ready;
 #[cfg(target_os = "linux")]
@@ -136,7 +140,7 @@ pub use boot::test_support;
 
 #[cfg(target_os = "linux")]
 pub use boot::{BootSources, BootStatus, MissingProducer, DispatcherFactory, DispatcherInput, LaunchInput,
-    install_boot_sources, install_dispatcher_factory, boot_protected, boot_status, prepare_launch};
+    install_boot_sources, install_connector_factory, install_dispatcher_factory, boot_protected, boot_status, prepare_launch};
 /// SR2 finding 8: the direct human capability constructor is not a public
 /// API; production issues capabilities through `record_authorization` and
 /// the boot issuer. Only tests and the test-support fixtures may name it.

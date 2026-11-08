@@ -44,6 +44,9 @@ pub(crate) struct V168Outcome {
     /// `[redaction] purge_after_expire_days` changed: the handler rebuilds
     /// the redaction pipeline (which restarts the vault GC with it).
     pub reload_redaction: bool,
+    /// RM-155: `[files] allowed_roots` changed — the handler asks the macOS
+    /// folder-access watcher to probe the new roots.
+    pub reprobe_folder_access: bool,
     pub protected: Vec<ProtectedChange>,
 }
 
@@ -62,6 +65,8 @@ const PROTECTED_KEYS: &[&str] = &[
     "security.recipient_guard",
     "security.mail_requester_approval",
     "security.chat_credentials",
+    // RM-129: decides where OAuth providers send authorization codes.
+    "dashboard.public_url",
 ];
 
 /// Team role slots. The dashboard contract says `synthesizer`; the config
@@ -107,6 +112,7 @@ pub(crate) fn normalize_legacy_aliases(params: Value) -> Value {
         ("notify.daily_digest_at", "daily_digest_at"),
         ("memory.novelty_gate", "novelty_gate_enabled"),
         ("miniapp.enabled", "miniapp_enabled"),
+        ("external_status.enabled", "external_status_enabled"),
         ("skills.gap_digest_enabled", "gap_digest_enabled"),
         ("logging.format", "log_format"),
     ];
@@ -163,6 +169,7 @@ pub(crate) fn apply_v168_keys(table: &mut toml::Table, params: &Value) -> Result
     apply_computer_use(table, params, &mut out)?;
     apply_team(table, params, &mut out)?;
     apply_redaction_purge(table, params, &mut out)?;
+    apply_dashboard_public_url(table, params, &mut out)?;
 
     for key in PROTECTED_KEYS {
         let (b, a) = (toml_at_json(&before, key), toml_at_json(table, key));
@@ -366,6 +373,7 @@ fn apply_files(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -
     );
     out.changes.push(format!("files.allowed_roots = [{n} entries]"));
     out.applied_immediate = true;
+    out.reprobe_folder_access = true;
     Ok(())
 }
 
@@ -641,6 +649,22 @@ fn prune_empty_table(table: &mut toml::Table, path: &[&str]) {
     }
 }
 
+/// `[dashboard] public_url` (RM-129): the externally reachable dashboard
+/// address, sub-path included, used for OAuth callback / return URLs and
+/// deep links. Validated with the same rule the OAuth builder applies
+/// (`deep_link::valid_oauth_public_base`) so a value saved here can never
+/// make sign-in fail closed later. `""` clears it. Read per use.
+fn apply_dashboard_public_url(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -> Result<(), String> {
+    let Some(v) = str_param(params, "dashboard.public_url")? else { return Ok(()) };
+    let v = v.trim();
+    if !v.is_empty() && (v.len() > 2048 || crate::deep_link::valid_oauth_public_base(v).is_none()) {
+        return Err("dashboard.public_url must use HTTPS, such as https://example.com/agents/ (HTTP only for localhost, 127.0.0.0/8 or ::1; no user name, query, fragment or `..`)".into());
+    }
+    set_or_clear_str(table, &["dashboard"], "public_url", v, out)?;
+    out.applied_immediate = true;
+    Ok(())
+}
+
 fn apply_redaction_purge(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -> Result<(), String> {
     if let Some(v) = u64_param(params, "redaction.purge_after_expire_days", 0, 3650)? {
         set_int(table, &["redaction"], "purge_after_expire_days", v, out)?;
@@ -700,8 +724,11 @@ mod tests {
         assert!(apply(json!({"files": {"allowed_roots": ["/./"]}})).is_err());
         // `/srv/a` has no drive letter, so it is not absolute on Windows.
         let abs = if cfg!(windows) { r"C:\srv\a" } else { "/srv/a" };
-        let (t, _) = apply(json!({"files": {"allowed_roots": [abs, abs, ""]}})).unwrap();
+        let (t, out) = apply(json!({"files": {"allowed_roots": [abs, abs, ""]}})).unwrap();
         assert_eq!(toml_at(&t, "files.allowed_roots").unwrap().as_array().unwrap().len(), 1);
+        assert!(out.reprobe_folder_access, "saving roots must re-probe macOS folder access");
+        let (_, untouched) = apply(json!({"takeover": {"enabled": true}})).unwrap();
+        assert!(!untouched.reprobe_folder_access);
         if cfg!(windows) {
             assert!(apply(json!({"files": {"allowed_roots": [r"C:\"]}})).is_err(), "drive root");
         }
@@ -787,6 +814,26 @@ mod tests {
         for invalid in [json!("true"), json!(1), json!([])] {
             assert!(apply(json!({"security.mail_requester_approval": invalid})).is_err());
         }
+    }
+
+    #[test]
+    fn dashboard_public_url_is_validated_audited_and_clearable() {
+        let (mut t, o) = apply(json!({"dashboard.public_url": " https://example.com/agents/ "})).unwrap();
+        assert_eq!(toml_at(&t, "dashboard.public_url").unwrap().as_str(), Some("https://example.com/agents/"));
+        assert!(o.applied_immediate);
+        assert_eq!(o.protected.len(), 1);
+        assert_eq!(o.protected[0].key, "dashboard.public_url");
+        for bad in ["/agents", "ftp://example.com", "https://u:p@example.com/a", "https://example.com/a?x=1",
+            "https://example.com/a#f", "https://example.com/a/../b", "not a url",
+            "http://dashboard.example/agents", "http://192.168.1.20/agents"] {
+            assert!(apply(json!({"dashboard": {"public_url": bad}})).is_err(), "{bad}");
+        }
+        for good in ["http://localhost:18889/agents", "http://127.42.3.4/agents", "http://[::1]/agents", "https://dashboard.example/agents"] {
+            assert!(apply(json!({"dashboard": {"public_url": good}})).is_ok(), "{good}");
+        }
+        assert!(apply(json!({"dashboard": {"public_url": 1}})).is_err());
+        apply_v168_keys(&mut t, &json!({"dashboard": {"public_url": ""}})).unwrap();
+        assert!(toml_at(&t, "dashboard.public_url").is_none());
     }
 
     #[test]

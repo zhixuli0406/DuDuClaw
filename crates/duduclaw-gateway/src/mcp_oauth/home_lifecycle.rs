@@ -373,7 +373,9 @@ pub(crate) fn capture_google_home_start(
                 .map(|s| s.to_string())
                 .collect(),
         )?;
-        let redirect = super::redirect_uri(g.home());
+        // RM-129: public_url (with sub-path) when configured; captured in the
+        // client row with this state and replayed verbatim at callback.
+        let redirect = super::try_redirect_uri(g.home()).map_err(|_| Error::Invalid)?;
         let template = super::builtin_providers(&redirect)
             .into_iter()
             .find(|p| p.provider_id == "google")

@@ -151,6 +151,8 @@ recipients = ["line:U123", "telegram:456", "mail:ops@example.com"]
 
 対象は `send_message`、`send_photo`、`send_sticker`、`create_reminder`、`mail_send`、および `tasks_create`／`update_cron_task` の `notify_channel`、`notify_chat_id`、`notify_thread_id` です。`calendar_create_event` の attendees はメール宛先として検査します。スケジュール通知は作成時と実行時に現在の設定で検査し、実行時は元の会話を持たないため、確認済みの所有者と設定済みリストだけが承認なしで許可されます。
 
+WebChat（ダッシュボードのチャット）の会話は外部の宛先ではありません。WebChat の会話で通知先を指定せずに作成したスケジュールやリマインダーは、結果をその会話に返します。会話 id はゲートウェイからのみ渡され（`DUDUCLAW_ORIGIN_SESSION`、WebChat のターンでのみ設定）、作成した AI 社員のものでなければなりません。社員やダッシュボードのスケジュールフォームが指定した `webchat` の宛先は拒否されます。実行時、会話がまだ存在し、同じ社員と同じログイン済みアカウントのもので、そのアカウントが有効かつその社員と会話できる場合に限り、結果を会話履歴に追加します。それ以外は破棄し、`tool_calls.jsonl` に `webchat_owner_check_failed` を記録します。アーカイブ済みの会話にも結果を追加し、アーカイブを解除して最終アクティビティを更新します。完全に削除された会話には配信できません。この経路では承認カードは作成されません。メッセージは会話を再読み込みまたは開き直すと表示され、開いているタブはリアルタイムには更新されません。
+
 `responsibility_ask` の承認先はサーバーが決定し、`os_notify` はローカル通知です。`github_issue_comment` は会話の宛先ではなく issue を指定するため、データ外送とアクションポリシーが引き続き適用されます。`send_to_agent`、`spawn_agent`、`team_handoff` は委任ポリシーを維持します。送信先 adapter のない第三者 MCP は、Send、Publish とその他の外送可能な効果に対して、非公開データの読み取りとは独立して `ask` で Admin の承認を求めます。第三者ゲートは Modify、Delete、Purchase、Admin も保守的に対象とし、信頼できる Read と Draft は除外します。不明なツールには信頼できる宛先解析がないため fail closed とします。`shadow` は `recipient_would_ask`（`recipient_guard: "would_ask"`）を記録し、`off` は送信先承認を追加しません。`to` という引数名だけでは信頼できる adapter になりません。
 
 実際の送信先で会話の接尾辞を使って許可済みの宛先を装うことはできません。Discord の通知スレッドは親チャンネルと併せて確認します。`update_cron_task` の通知先変更では `notify_channel` と `notify_chat_id` を同時に指定し、空の組で通知先を解除できます。タスクと通知先は原子的に保存します。他の承認待ちの後にも宛先権限を再確認します。一時アシスタントは親の宛先モードと設定リストを継承し、検証済み所有者の紐付けは従業員ごとに判定します。

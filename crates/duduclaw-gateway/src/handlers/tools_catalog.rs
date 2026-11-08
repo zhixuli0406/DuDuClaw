@@ -130,6 +130,7 @@ impl MethodHandler {
                     { "name": "system.check_update", "description": "Check for available updates" },
                     { "name": "system.apply_update", "description": "Download and apply update" },
                     { "name": "system.restart_pending_update", "description": "Restart onto a gateway binary already on disk but not yet running (admin)" },
+                    { "name": "system.migrate_bundle", "description": "macOS: move a bare install into the signed DuDuClaw Gateway.app and relaunch (admin)" },
                     { "name": "heartbeat.status", "description": "Per-agent heartbeat status" },
                     { "name": "heartbeat.trigger", "description": "Manually trigger heartbeat for an agent" },
                     { "name": "mcp.list", "description": "List MCP servers for all agents + catalog" },

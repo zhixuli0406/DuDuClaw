@@ -55,20 +55,22 @@ pub struct ToolCallEvent<'a> {
 /// every runtime the non-native tools reach the platform through MCP, so a rule
 /// written for `mcp_call` is a catch-all for MCP-exposed tools while an exact
 /// tool name (`memory_store`) still targets one specific tool.
+///
+/// RM-103 S3: defined once in duduclaw-core
+/// ([`duduclaw_core::types::policy_canonical_tool`]) and shared with the
+/// native-runtime classifier.
 pub fn canonical_tool(name: &str) -> &'static str {
-    match name {
-        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "apply_patch" | "write_file"
-        | "write_to_file" => "fs_write",
-        "Bash" | "shell" | "run_shell_command" | "run_command" => "shell_exec",
-        _ => "mcp_call",
-    }
+    duduclaw_core::types::policy_canonical_tool(name)
 }
 
 /// Does this rule's `tool` selector apply to the event's tool?
 ///
-/// Matches on `"*"` (any), exact name, or canonical family.
+/// Matches on `"*"` (any), exact name, or canonical family — the shared
+/// [`ToolPolicy::selector_matches`], so the native-runtime classifier
+/// (`CapabilitiesConfig::native_tool_constraints`) reads a rule exactly as
+/// this kernel does.
 fn rule_matches_tool(rule: &ToolPolicy, event_tool: &str) -> bool {
-    rule.tool == "*" || rule.tool == event_tool || rule.tool == canonical_tool(event_tool)
+    rule.selector_matches(event_tool)
 }
 
 /// Stringify a JSON argument value for comparison (strings verbatim, others via
@@ -212,6 +214,36 @@ mod tests {
             evaluate(&event("memory_store", &args), &forbid_and_ask),
             Decision::Deny { .. }
         ));
+    }
+
+    /// RM-103 S3 (Daybreak round 2 #3): the kernel's selector matcher IS the
+    /// shared `ToolPolicy::selector_matches` the native-runtime classifier
+    /// uses — a padded `" * "` is not a wildcard (default-deny), exactly as
+    /// `CapabilitiesConfig::native_tool_constraints` reads it.
+    #[test]
+    fn selector_matcher_is_shared_with_the_native_classifier() {
+        let args = json!({});
+        let padded = vec![policy(" * ", PolicyEffect::Allow, vec![])];
+        for t in ["Bash", "Write", "memory_store"] {
+            assert!(matches!(evaluate(&event(t, &args), &padded), Decision::Deny { .. }), "{t}");
+            assert!(!padded[0].selector_matches(t));
+        }
+        let wild = vec![policy("*", PolicyEffect::Allow, vec![])];
+        assert!(wild[0].is_unconditional_wildcard());
+        for t in ["Bash", "Write", "memory_store", "anything"] {
+            assert_eq!(evaluate(&event(t, &args), &wild), Decision::Allow, "{t}");
+        }
+        for (selector, tool) in [("shell_exec", "Bash"), ("fs_write", "apply_patch"), ("mcp_call", "memory_store"), ("Bash", "Bash")] {
+            let r = policy(selector, PolicyEffect::Allow, vec![]);
+            assert!(r.selector_matches(tool));
+            assert_eq!(evaluate(&event(tool, &args), &[r]), Decision::Allow, "{selector}/{tool}");
+        }
+        assert!(
+            !duduclaw_core::types::CapabilitiesConfig { policy: padded, ..Default::default() }
+                .native_tool_constraints()
+                .is_empty(),
+            "a padded wildcard is default-deny in the kernel, so it is not allow-all natively"
+        );
     }
 
     #[test]

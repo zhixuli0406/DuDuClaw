@@ -117,6 +117,10 @@ pub struct RoleMemberSpec {
     /// [`check_tool_subset`] containment as any ephemeral: a role can never
     /// hold a tool its employee does not.
     pub tools: Vec<String>,
+    /// RM-103 S3: extra denies from the delegating packet's
+    /// `tool_scope.denied`, appended to the member's `[capabilities]
+    /// denied_tools` after the employee's own. Can only remove tools.
+    pub extra_denied: Vec<String>,
 }
 
 /// The `[team_member]` section read back off a scaffold.
@@ -264,11 +268,22 @@ pub fn check_tool_subset_with_intrinsics(
             .to_string());
     }
     let eq_ci = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+    // Daybreak round 2 #5: a qualified request (`Bash(git:*)`) narrows its
+    // bare tool (`Bash`). It is inside a parent allowlist holding the bare
+    // name and is vetoed by a bare deny of that name. Never the reverse: a
+    // bare request is not covered by a qualified allowlist entry.
+    let qualified_base = |tool: &str| -> Option<String> {
+        let (base, _) = tool.trim().split_once('(')?;
+        let base = base.trim();
+        (!base.is_empty() && !base.contains('*')).then(|| base.to_string())
+    };
     for tool in requested {
         if !is_valid_tool_name(tool) {
             return Err(format!("invalid tool name: {tool:?}"));
         }
-        if parent.denied_tools.iter().any(|d| eq_ci(d, tool)) {
+        let base = qualified_base(tool);
+        let denied = |d: &String| eq_ci(d, tool) || base.as_deref().is_some_and(|b| eq_ci(d, b));
+        if parent.denied_tools.iter().any(denied) {
             return Err(format!(
                 "privilege escalation rejected: tool '{tool}' is in the \
                  parent agent's denied_tools"
@@ -279,8 +294,13 @@ pub fn check_tool_subset_with_intrinsics(
         if intrinsics.iter().any(|i| eq_ci(i, tool)) {
             continue;
         }
-        if !parent.allowed_tools.is_empty() && !parent.allowed_tools.iter().any(|a| eq_ci(a, tool))
-        {
+        let allowlisted = |a: &String| {
+            eq_ci(a, tool)
+                || base
+                    .as_deref()
+                    .is_some_and(|b| !a.contains('(') && eq_ci(a, b))
+        };
+        if !parent.allowed_tools.is_empty() && !parent.allowed_tools.iter().any(allowlisted) {
             return Err(format!(
                 "privilege escalation rejected: tool '{tool}' is not in the \
                  parent agent's allowed_tools"

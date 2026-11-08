@@ -35,6 +35,65 @@ pub struct SharedEmployee {
     user: String,
     epoch: u64,
     root: Root,
+    /// H9 selector producers the issuer may use (none by default).
+    sources: SelectorSources,
+}
+
+/// A complete `agent.toml` that the typed `AgentConfig` parser accepts, for
+/// fixtures whose issuer selectors (H9) read the employee profile.
+/// `public_web` is the admin-only protected-mode web switch (`[isolation]`);
+/// `capabilities` is appended verbatim to the `[capabilities]` table. The task
+/// sandbox's `[container] network_access` stays `false`.
+pub fn agent_toml(label: &str, public_web: bool, capabilities: &str) -> String {
+    agent_toml_with(label, false, public_web, capabilities)
+}
+
+/// [`agent_toml`] with the task-sandbox network switch set independently.
+pub fn agent_toml_with(label: &str, network_access: bool, public_web: bool, capabilities: &str) -> String {
+    format!(r#"[agent]
+name = "{label}"
+display_name = "Fixture employee"
+role = "main"
+status = "active"
+trigger = "@{label}"
+reports_to = ""
+icon = "robot"
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = ""
+api_mode = "cli"
+account_pool = []
+[budget]
+monthly_limit_cents = 1000
+warn_threshold_percent = 80
+hard_stop = false
+[container]
+sandbox_enabled = false
+network_access = {network_access}
+timeout_ms = 60000
+max_concurrent = 2
+readonly_project = false
+additional_mounts = []
+[heartbeat]
+enabled = false
+interval_seconds = 300
+max_concurrent_runs = 1
+cron = ""
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = true
+can_modify_own_soul = false
+can_schedule_tasks = true
+allowed_channels = []
+[evolution]
+skill_auto_activate = false
+skill_security_scan = false
+[isolation]
+public_web = {public_web}
+[capabilities]
+{capabilities}
+"#)
 }
 impl SharedEmployee {
     pub fn new(home: &Path, label: &str, employee: EmployeeId) -> Self {
@@ -66,8 +125,21 @@ impl SharedEmployee {
             bytes: spec.bytes, inodes: spec.inodes, disabled: false, principal_binding: spec.binding };
         crate::handlers::save_confirmed_receipt(home, &item, &receipt).unwrap();
         Self { home: home.to_owned(), label: label.into(), user,
-            epoch: current.human.unwrap().credential_epoch, root: Root(receipt) }
+            epoch: current.human.unwrap().credential_epoch, root: Root(receipt), sources: SelectorSources::default() }
     }
+
+    /// Install a root work broker double, as boot does with H5's bridge.
+    pub fn with_work_broker(mut self, broker: Arc<dyn duduclaw_mcp_boundary::resources::WorkBroker>) -> Self {
+        self.sources.work_broker = Some(broker);
+        self
+    }
+
+    pub fn employee(&self) -> EmployeeId { self.root.0.employee }
+    pub fn user(&self) -> &str { &self.user }
+    pub fn epoch(&self) -> u64 { self.epoch }
+    /// The fixture root ReadBack, for tests that wrap it.
+    pub(super) fn root(&self) -> &dyn RootAllocation { &self.root }
+    pub(super) fn sources(&self) -> &SelectorSources { &self.sources }
 
     pub fn snapshot(&self) -> IsolationAuthoritySnapshot {
         let mut users = Connection::open_with_flags(self.home.join("users.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
@@ -78,8 +150,17 @@ impl SharedEmployee {
     pub fn authorize(&self, current: &IsolationAuthoritySnapshot, lane: Lane,
         tools: List<Text<128>, 256>, turn: super::super::HostTurn, expiry: Option<u64>)
         -> Result<super::super::RuntimeAuthorization, VerificationError> {
+        self.authorize_record(current, lane, tools, turn, expiry, None)
+    }
+
+    /// Same issuer for a record-backed run; `task` is the host-pinned record
+    /// task (the caller supplies `turn.background`).
+    pub fn authorize_record(&self, current: &IsolationAuthoritySnapshot, lane: Lane,
+        tools: List<Text<128>, 256>, turn: super::super::HostTurn, expiry: Option<u64>, task: Option<&str>)
+        -> Result<super::super::RuntimeAuthorization, VerificationError> {
         let lifecycle = lifecycle::read_lifecycle_with(&self.home, &self.label, &self.root).map_err(lifecycle_refusal)?;
         human_authorization_with(self.home.clone(), self.label.clone(), self.root.0.employee,
-            self.user.clone(), self.epoch, lane, current, tools, turn, expiry, &lifecycle, &self.root)
+            self.user.clone(), self.epoch, lane, current, tools, turn, expiry, &lifecycle, &self.root,
+            &self.sources, task)
     }
 }

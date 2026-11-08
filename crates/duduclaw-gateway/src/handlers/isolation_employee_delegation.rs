@@ -35,6 +35,14 @@ pub(super) fn parse_decision(params: Value) -> Result<Decision, &'static str> {
     Ok(decision)
 }
 
+/// The owner's decide: the card's source employee id and incarnation must
+/// be exactly the live lifecycle's, and the caller its Personal owner.
+pub(super) fn delegation_card_binds_current(current: &lifecycle::EmployeeLifecycle, owner: &str,
+    employee_hex: &str, incarnation: u64) -> bool {
+    current.personal_owner() == Some(owner) && hex::encode(current.employee.0) == employee_hex
+        && u64::from(current.incarnation) == incarnation
+}
+
 fn owned_by(card: &crate::approval::ApprovalRecord, user: &str) -> bool {
     card.action_kind == KIND && card.payload.get("owner_user_id").and_then(Value::as_str) == Some(user)
 }
@@ -75,10 +83,13 @@ pub(super) async fn decide(home: &Path, user: &str, input: Decision) -> Result<V
         // Fresh: the caller still owns exactly the source employee on the card.
         let source = card.payload["source_agent"].as_str().ok_or(NOT_FOUND)?.to_owned();
         let employee = card.payload["source_employee"].as_str().ok_or(NOT_FOUND)?.to_owned();
+        // F6b (A4): a card without the source incarnation (filed before F6)
+        // or for another incarnation is never approvable.
+        let incarnation = card.payload.get("source_incarnation").and_then(Value::as_u64).ok_or(NOT_FOUND)?;
         let (home, owner) = (home.to_path_buf(), user.to_owned());
         blocking(move || {
             let current = lifecycle::read_lifecycle(&home, &source).map_err(|_| OWNER_CHANGED)?;
-            if current.personal_owner() != Some(owner.as_str()) || hex::encode(current.employee.0) != employee {
+            if !delegation_card_binds_current(&current, &owner, &employee, incarnation) {
                 return Err(OWNER_CHANGED);
             }
             Ok(())
@@ -86,4 +97,27 @@ pub(super) async fn decide(home: &Path, user: &str, input: Decision) -> Result<V
     }
     broker.decide(&id, input.approve, &format!("dashboard:{user}")).await.map_err(|_| NOT_PENDING)?;
     Ok(json!({ "id": id.as_str(), "decided": if input.approve { "approved" } else { "denied" } }))
+}
+
+#[cfg(test)]
+mod incarnation_tests {
+    use super::*;
+    use duduclaw_isolation::{bounded::Text, capability::EmployeeBinding, ids::{EmployeeId, Sha256Digest}};
+
+    /// F6b A4 (decide side): the owner can approve a card only for exactly
+    /// the live source employee id and incarnation.
+    #[test]
+    fn delegation_decide_requires_card_incarnation() {
+        let live = lifecycle::EmployeeLifecycle { employee: EmployeeId([1; 16]), label: "alice-personal".into(),
+            allocation: duduclaw_migration::contract::ProposalBinding {
+                operation_id: duduclaw_migration::contract::ProposalOperationId {
+                    proposal_id: duduclaw_migration::ids::RequestId([1; 16]), revision: 1 },
+                proposal_digest: Sha256Digest([2; 32]) },
+            uid: 70_001, binding: EmployeeBinding::Personal(Text::new("alice".into()).unwrap()), incarnation: 1 };
+        let hex_id = hex::encode([1u8; 16]);
+        assert!(delegation_card_binds_current(&live, "alice", &hex_id, 1));
+        assert!(!delegation_card_binds_current(&live, "alice", &hex_id, 0), "card of the prior incarnation");
+        assert!(!delegation_card_binds_current(&live, "alice", &hex::encode([2u8; 16]), 1));
+        assert!(!delegation_card_binds_current(&live, "bob", &hex_id, 1));
+    }
 }

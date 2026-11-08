@@ -535,6 +535,20 @@ async fn autonomy_completion_sync_failure_restores_pending_without_changing_paus
 }
 
 fn ephemeral_agent(home: &Path, id: &str, parent: &str) -> PathBuf {
+    let dir = ephemeral_files(home, id, parent);
+    org_put(home, id, parent);
+    dir
+}
+
+/// A gated authority write (global org lock, then `org_store::upsert`).
+fn org_put(home: &Path, id: &str, parent: &str) {
+    crate::org_store::with_org_lock(home, |org| {
+        crate::org_store::upsert(org, id, crate::org_store::OrgEntry::new(parent, ""))
+    })
+    .unwrap();
+}
+
+fn ephemeral_files(home: &Path, id: &str, parent: &str) -> PathBuf {
     let dir = home.join("agents/.ephemeral").join(id);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -547,7 +561,6 @@ fn ephemeral_agent(home: &Path, id: &str, parent: &str) -> PathBuf {
             "parent = '{parent}'\ntier = 'standard'\ncreated_at = '2026-10-29T00:00:00Z'\nexpires_at = '2026-10-30T00:00:00Z'\n"
         ),
     ).unwrap();
-    crate::org_store::upsert(home, id, crate::org_store::OrgEntry::new(parent, "")).unwrap();
     dir
 }
 
@@ -612,10 +625,19 @@ fn autonomy_ephemeral_requires_host_authority_and_refuses_cycles_and_depth() {
     std::fs::remove_file(&org_path).unwrap();
     assert_eq!(check(home.path(), "eph-child", path).unwrap_err().reason, "ephemeral_parent_invalid");
     std::fs::write(&org_path, org).unwrap();
-    crate::org_store::upsert(home.path(), "eph-child", crate::org_store::OrgEntry::new("another", "")).unwrap();
+    org_put(home.path(), "eph-child", "another");
     assert_eq!(check(home.path(), "eph-child", path).unwrap_err().reason, "ephemeral_parent_invalid");
     ephemeral_agent(home.path(), "eph-child", "eph-other");
-    ephemeral_agent(home.path(), "eph-other", "eph-child");
+    // Every authority writer now refuses to close a loop (RM-027 round 3)…
+    ephemeral_files(home.path(), "eph-other", "eph-child");
+    assert!(crate::org_store::with_org_lock(home.path(), |org| {
+        crate::org_store::upsert(org, "eph-other", crate::org_store::OrgEntry::new("eph-child", ""))
+    })
+    .is_err());
+    // …but a legacy / hand-edited store can still carry one: the gate refuses it.
+    let mut planted = std::fs::read_to_string(&org_path).unwrap();
+    planted.push_str("\n[agents.eph-other]\nreports_to = \"eph-child\"\ndepartment = \"\"\n");
+    std::fs::write(&org_path, planted).unwrap();
     assert_eq!(check(home.path(), "eph-child", path).unwrap_err().reason, "ephemeral_parent_invalid");
     for index in 0..32 {
         let parent = if index == 31 { "parent".to_string() } else { format!("eph-depth-{}", index + 1) };
@@ -630,7 +652,7 @@ fn autonomy_regular_employee_does_not_inherit_org_parent_pause() {
     let home = tempfile::tempdir().unwrap();
     agent(home.path(), "parent", "active");
     agent(home.path(), "employee", "active");
-    crate::org_store::upsert(home.path(), "employee", crate::org_store::OrgEntry::new("parent", "")).unwrap();
+    org_put(home.path(), "employee", "parent");
     set_pause(home.path(), Some("parent"), "test", "operator").unwrap();
     assert_eq!(effective_identities(home.path(), "employee", AutonomyPath::Background).unwrap(), vec!["employee"]);
     assert!(check(home.path(), "employee", AutonomyPath::Background).is_ok());

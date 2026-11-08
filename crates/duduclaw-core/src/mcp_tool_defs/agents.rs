@@ -215,6 +215,11 @@ pub(super) const TOOLS: &[ToolDef] = &[
                 required: false,
             },
             ParamDef {
+                name: "reply_language",
+                description: "Reply language: auto (follow the user), zh-TW, zh-CN, en, ja-JP; \"\" inherits the global setting",
+                required: false,
+            },
+            ParamDef {
                 name: "budget_cents",
                 description: "Monthly budget limit in cents",
                 required: false,

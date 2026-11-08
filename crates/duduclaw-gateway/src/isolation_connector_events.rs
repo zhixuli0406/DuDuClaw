@@ -171,6 +171,7 @@ pub(crate) fn fence_with(home: &Path, catalog: &ConnectorCatalog, target: &Targe
         audit(home, "isolation.connector_event_revoked", reason, target, &revoked, hint.status());
     }
     drop_in_process(home, target, &revoked, reason);
+    if !revoked.is_empty() { crate::isolation_connector_lifecycle::routes_changed(); }
     Ok(revoked)
 }
 
@@ -244,6 +245,8 @@ impl Rotation {
         if let Err(error) = result {
             audit(home, "isolation.connector_event_incomplete", reason, &target, &[], refusal(error));
         }
+        // F1: advanced generations / relinked ids need new providers.
+        crate::isolation_connector_lifecycle::routes_changed();
         result
     }
     /// The publication failed: nothing to recreate. The fence stays.

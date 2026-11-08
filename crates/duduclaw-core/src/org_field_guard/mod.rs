@@ -313,6 +313,26 @@ pub fn classify_identity_surface(file_path: &Path, home: &Path) -> Option<Protec
         }
     }
 
+    // RM-027 — the global org mutation lock (`<home>/locks/org-mutation*`,
+    // the advisory lock file and anything beside it) and everything under
+    // `<home>/org_change_journal/`. Holding the lock would stall every org
+    // change; the journal is what the approval replays. Same surface as
+    // `org.toml`: refused outright for every caller.
+    let locks_dir = lexical_normalize(&home.join("locks"));
+    if let Some(rest) = components_after_ci(&normalized, &locks_dir)
+        && let [name] = rest.as_slice()
+        && name
+            .to_ascii_lowercase()
+            .starts_with(crate::org_store::ORG_MUTATION_LOCK)
+    {
+        return Some(ProtectedSurface::OrgStore);
+    }
+    let journal_dir = lexical_normalize(&home.join(crate::org_store::ORG_CHANGE_JOURNAL_DIR));
+    // `Some(_)` includes the directory itself (rename / delete), not only files.
+    if components_after_ci(&normalized, &journal_dir).is_some() {
+        return Some(ProtectedSurface::OrgStore);
+    }
+
     for basename in [crate::autonomy_gate::STATE_FILE, crate::autonomy_gate::INIT_FILE, crate::autonomy_gate::ADMISSION_LOCK_FILE, "autonomy_pause.json.lock"] {
         if file_name.eq_ignore_ascii_case(basename) {
             let expected = lexical_normalize(&home.join(basename));

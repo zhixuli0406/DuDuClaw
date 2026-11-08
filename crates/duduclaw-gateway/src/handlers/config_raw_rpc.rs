@@ -601,6 +601,12 @@ pub(crate) fn validate_config_table(table: &toml::Table) -> Result<(), String> {
     if let Some(err) = db.errors.first() {
         return Err(format!("[db_sources.{}]: {}", err.name, err.message));
     }
+    // RM-039: the gate falls back to the defaults on an invalid section (fail
+    // closed), so a typo would silently re-enable categories the admin
+    // unticked — refuse it at write time instead.
+    if table.contains_key(crate::memory_privacy::SECTION) {
+        crate::memory_privacy::MemoryPrivacyConfig::from_table(table)?;
+    }
     Ok(())
 }
 
@@ -777,6 +783,43 @@ pub(crate) fn refuse_disclosure_ack_edit(before: &toml::Table, after: &toml::Tab
     Ok(())
 }
 
+/// RM-027 round 3: a raw `agent.toml` save that changes the org pair must
+/// not carry along a field the admin left alone while that field differs
+/// from the authority (the mirror drifted — possibly tampered by the
+/// employee). Returns the zh-TW refusal, or `None` when every unchanged
+/// field already equals the authority.
+pub(crate) fn raw_org_drift(
+    before: &duduclaw_core::OrgEntry,
+    after: &duduclaw_core::OrgEntry,
+    authority: &duduclaw_core::OrgEntry,
+) -> Option<String> {
+    let shown = |v: &str| if v.is_empty() { "（無）".to_string() } else { format!("「{}」", duduclaw_core::truncate_chars(v, 64)) };
+    let mut drifted: Vec<String> = Vec::new();
+    if before.reports_to == after.reports_to && after.reports_to != authority.reports_to {
+        drifted.push(format!(
+            "主管 reports_to：agent.toml 是{}，組織權威資料是{}",
+            shown(&after.reports_to),
+            shown(&authority.reports_to)
+        ));
+    }
+    if before.department == after.department && after.department != authority.department {
+        drifted.push(format!(
+            "部門 department：agent.toml 是{}，組織權威資料是{}",
+            shown(&after.department),
+            shown(&authority.department)
+        ));
+    }
+    if drifted.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "這位 AI 員工的 agent.toml 和組織權威資料（org.toml）不一致（{}），而這次的修改沒有要變更它。\
+         為了不把未經確認的值寫進權威資料，這次沒有儲存。請先處理不一致：在這次編輯中把它改成權威資料的值、\
+         在組織圖重新套用這位 AI 員工的位置，或由管理員在終端機執行 `duduclaw org sync` 採用 agent.toml 的值，然後再試。",
+        drifted.join("；")
+    ))
+}
+
 fn key_changed(before: &toml::Table, after: &toml::Table, path: &str) -> bool {
     super::config_commit::toml_at(before, path) != super::config_commit::toml_at(after, path)
 }
@@ -788,7 +831,8 @@ pub(crate) fn protected_changed(file: &RawFile, before: &toml::Table, after: &to
         RawFile::Inference => false,
         RawFile::Agent(_) => {
             sections.iter().any(|s| s == "agent" || s == "capabilities")
-                || ["container.sandbox_enabled", "container.network_access", "permissions.can_modify_own_soul"]
+                || ["container.sandbox_enabled", "container.network_access", "permissions.can_modify_own_soul",
+                    "isolation.public_web"]
                     .iter()
                     .any(|p| key_changed(before, after, p))
         }
@@ -986,12 +1030,61 @@ impl MethodHandler {
             }
         }
 
+        // RM-027: a raw edit that moves `[agent] reports_to` / `department`
+        // is an org change like `agents.update`'s — same global org lock,
+        // same whole-tree rule (existence, self, cycle) against the
+        // authority re-read inside the lock, authority committed BEFORE the
+        // agent.toml mirror, and a refused/failed write puts it back. A
+        // validation failure refuses the raw save. An edit that leaves the
+        // pair as it was is not an org write and never touches the authority.
+        let org_pair = |t: &toml::Table| {
+            let get = |p: &str| {
+                super::config_commit::toml_at(t, p).and_then(|v| v.as_str()).unwrap_or("").to_string()
+            };
+            duduclaw_core::OrgEntry::new(get("agent.reports_to"), get("agent.department"))
+        };
+        let mut org_lock = None;
+        let mut org_prewrite: Option<(Option<duduclaw_core::OrgEntry>, duduclaw_core::OrgEntry)> = None;
+        if let RawFile::Agent(id) = &kind {
+            let (org_before, org_after) = (org_pair(&before), org_pair(&after));
+            if org_before != org_after {
+                let lock = super::org_change_rpc::lock_org(&self.home_dir).await?;
+                let store = lock.load().map_err(|e| e.to_string())?;
+                let reports_to_changed = org_before.reports_to != org_after.reports_to;
+                // RM-027 round 3: the file being edited is the (tamperable)
+                // mirror. A field the admin did not change must already
+                // equal the authority, or saving would promote the mirror's
+                // value into the authority: refuse and ask for an explicit
+                // drift resolution instead.
+                let authority = duduclaw_core::org_change::effective_in(&store, &self.home_dir, id).unwrap_or_default();
+                if let Some(drift) = raw_org_drift(&org_before, &org_after, &authority) {
+                    return Err(drift.into());
+                }
+                duduclaw_core::org_change::validate_org_change_in(
+                    &store,
+                    &self.home_dir,
+                    id,
+                    reports_to_changed.then_some(org_after.reports_to.as_str()),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+                let prior = store.get(id).cloned();
+                lock.upsert(id, org_after.clone()).map_err(|e| e.to_string())?;
+                org_prewrite = Some((prior, org_after));
+                org_lock = Some(lock);
+            }
+        }
+
         let mut backup = None;
         if let RawFile::Agent(id) = &kind {
             // agent.toml goes through the profile file writer (version kept
             // outside the employee directory, `agent_file_changed` audit).
             let text = new_text.clone();
-            crate::agent_files::writer::commit(
+            // RM-027 round 5: while the global org lock is held, the
+            // agent.toml lock wait is bounded — a stuck writer turns into a
+            // refused save (authority put back below), never a pinned org lock.
+            let lock_wait = org_lock.as_ref().map(|_| crate::org_change_approval::mirror_lock_wait(&self.home_dir));
+            let committed = crate::agent_files::writer::commit_within(
                 &self.registry,
                 crate::agent_files::writer::Commit {
                     home: &self.home_dir,
@@ -1011,9 +1104,22 @@ impl MethodHandler {
                     }
                     Ok(())
                 },
+                lock_wait,
             )
             .await
-            .map_err(|e| rctx.scrub(&e.message()))?;
+            .map_err(|e| rctx.scrub(&e.message()));
+            if let Err(e) = committed {
+                // The mirror was not written: put the authority back.
+                if let (Some(lock), Some((prior, _))) = (&org_lock, &org_prewrite)
+                    && let Err(re) = lock.restore(id, prior.clone())
+                {
+                    return Err(format!(
+                        "{e}（另外，組織權威資料沒有還原成功：{re}；請管理員在組織圖確認這位 AI 員工的位置）"
+                    )
+                    .into());
+                }
+                return Err(e.into());
+            }
         } else {
             let backup_text = if stored.is_empty() {
                 None
@@ -1041,6 +1147,8 @@ impl MethodHandler {
                 .map_err(|e| format!("write task failed: {e}"))??;
         }
 
+        // Committed (authority first, then mirror): release the org lock.
+        drop(org_lock);
         let backup_name = backup
             .as_ref()
             .and_then(|b| b.file_name())
@@ -1176,9 +1284,8 @@ impl MethodHandler {
                 hot.push("inference".into());
             }
             RawFile::Agent(id) => {
-                if has("agent") {
-                    self.sync_org_after_raw_edit(id, before, after);
-                }
+                // The org pair was committed to the authority inside the org
+                // lock before the mirror (see `config_raw_set_inner`).
                 let rescanned = self.registry.write().await.scan().await.is_ok();
                 if rescanned {
                     hot.push("registry".into());
@@ -1208,23 +1315,6 @@ impl MethodHandler {
         (hot, restart)
     }
 
-    /// A raw edit of `[agent] reports_to` / `department` moves the employee in
-    /// the org authority too (same rule as `agents.update`: only when changed).
-    fn sync_org_after_raw_edit(&self, id: &str, before: &toml::Table, after: &toml::Table) {
-        if !key_changed(before, after, "agent.reports_to") && !key_changed(before, after, "agent.department") {
-            return;
-        }
-        let get = |p: &str| {
-            super::config_commit::toml_at(after, p)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
-        let entry = duduclaw_core::OrgEntry::new(get("agent.reports_to"), get("agent.department"));
-        if let Err(e) = duduclaw_core::org_store::upsert(&self.home_dir, id, entry) {
-            warn!(agent = %id, error = %e, "org.toml upsert failed after config.raw.set");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1393,6 +1483,24 @@ mod tests {
         let bad="[people]\nbound_history_privacy='false'".parse::<toml::Table>().unwrap();
         assert!(validate_config_table(&bad).is_err());
         assert!(RAW_CONFIG_SENSITIVE_KEYS.contains(&"people.bound_history_privacy"));
+    }
+
+    #[test]
+    fn memory_privacy_section_is_validated_on_write() {
+        let ok = "[memory_privacy]\nexcluded_categories = [\"health\", \"salary\"]\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        assert!(validate_config_table(&ok).is_ok());
+        let unknown = "[memory_privacy]\nexcluded_categories = [\"religion\"]\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        let e = validate_config_table(&unknown).unwrap_err();
+        assert!(e.contains("memory_privacy") && e.contains("religion"), "{e}");
+        let custom = "[memory_privacy]\nexcluded_categories = [\"religion\"]\n\
+                      [memory_privacy.custom_keywords]\nreligion = [\"宗教\"]\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        assert!(validate_config_table(&custom).is_ok());
     }
 
 

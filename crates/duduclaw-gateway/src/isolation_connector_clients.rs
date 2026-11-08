@@ -27,6 +27,10 @@ impl AccountCredential {
         }
         Ok(Self { account, provider, token: Zeroizing::new(token), expires_at })
     }
+    /// A second zeroizing copy (the token moves into the new wrapper).
+    fn duplicate(&self) -> Result<Self, VerificationError> {
+        Self::new(self.account.clone(), self.provider.clone(), self.token.to_string(), self.expires_at)
+    }
 }
 
 /// Production OAuth refresh adapters may implement this interface, but must
@@ -35,36 +39,130 @@ impl AccountCredential {
 pub trait AccountCredentialProvider: Send + Sync {
     fn acquire<'a>(&'a self, account: &'a str, provider: &'a str)
         -> Pin<Box<dyn Future<Output = Result<AccountCredential, VerificationError>> + Send + 'a>>;
+    /// v1.81 F1: acquisition for the catalog route generation the selection
+    /// pinned. Generation-keyed material ([`AccountCredentialVault`],
+    /// [`VaultedCredentials`]) serves only that generation; live sources that
+    /// keep no in-process material ignore it.
+    fn acquire_at<'a>(&'a self, account: &'a str, provider: &'a str, _generation: u64)
+        -> Pin<Box<dyn Future<Output = Result<AccountCredential, VerificationError>> + Send + 'a>> {
+        self.acquire(account, provider)
+    }
 }
 
-/// Concrete boot-populated credential vault. Missing/expired accounts refuse;
-/// operator refresh replaces only the same account/provider entry.
+/// Process credential vault, keyed by (catalog account, route generation)
+/// (v1.81 F1 / SR3 Info 5). Material of a generation that ended (revoke,
+/// advance, relink) is never served for the new one: a lookup must name the
+/// exact generation the selection pinned. One generation per account is kept;
+/// installing an older generation than the stored one refuses, a newer one
+/// replaces it. Missing/expired material refuses.
 #[derive(Default)]
-pub struct AccountCredentialVault { entries: RwLock<BTreeMap<String, AccountCredential>> }
+pub struct AccountCredentialVault { entries: RwLock<BTreeMap<String, (u64, AccountCredential)>> }
 impl AccountCredentialVault {
-    pub fn install(&self, credential: AccountCredential) -> Result<(), VerificationError> {
+    pub fn install(&self, credential: AccountCredential, generation: u64) -> Result<(), VerificationError> {
+        if generation == 0 { return Err(VerificationError::Invalid); }
         let mut entries = self.entries.write().map_err(|_| VerificationError::Unavailable)?;
-        if entries.get(&credential.account).is_some_and(|old| old.provider != credential.provider) {
+        if entries.get(&credential.account).is_some_and(|(stored, old)|
+            old.provider != credential.provider || *stored > generation) {
             return Err(VerificationError::BindingMismatch);
         }
-        entries.insert(credential.account.clone(), credential);
+        entries.insert(credential.account.clone(), (generation, credential));
         Ok(())
     }
     /// Deactivate the catalog route first to fence in-flight requests, then
     /// remove its material here (`isolation_connector_lifecycle::revoke` does
     /// both, in that order). Removal alone only prevents future acquisition.
+    /// Every generation of the account goes.
     pub fn remove(&self, account: &str) -> Result<(), VerificationError> {
         self.entries.write().map_err(|_| VerificationError::Unavailable)?.remove(account);
         Ok(())
     }
+    /// Drop the account's material unless it is for exactly `generation`.
+    fn retain_generation(&self, account: &str, generation: u64) -> Result<(), VerificationError> {
+        let mut entries = self.entries.write().map_err(|_| VerificationError::Unavailable)?;
+        if entries.get(account).is_some_and(|(stored, _)| *stored != generation) { entries.remove(account); }
+        Ok(())
+    }
+    /// The stored material for exactly (account, provider, generation).
+    fn lookup(&self, account: &str, provider: &str, generation: u64) -> Result<AccountCredential, VerificationError> {
+        let entries = self.entries.read().map_err(|_| VerificationError::Unavailable)?;
+        let (_, entry) = entries.get(account)
+            .filter(|(stored, entry)| *stored == generation && entry.provider == provider)
+            .ok_or(VerificationError::Unavailable)?;
+        entry.duplicate()
+    }
 }
 impl AccountCredentialProvider for AccountCredentialVault {
-    fn acquire<'a>(&'a self, account: &'a str, provider: &'a str)
+    /// Without a pinned generation nothing is served.
+    fn acquire<'a>(&'a self, _account: &'a str, _provider: &'a str)
+        -> Pin<Box<dyn Future<Output = Result<AccountCredential, VerificationError>> + Send + 'a>> {
+        Box::pin(async { Err(VerificationError::Unavailable) })
+    }
+    fn acquire_at<'a>(&'a self, account: &'a str, provider: &'a str, generation: u64)
+        -> Pin<Box<dyn Future<Output = Result<AccountCredential, VerificationError>> + Send + 'a>> {
+        Box::pin(async move { self.lookup(account, provider, generation) })
+    }
+}
+
+/// Current route state for one account (production: the shared boot
+/// [`crate::isolation_connectors::ConnectorCatalog`]). `Ok(None)`: unknown id.
+pub trait RouteGeneration: Send + Sync {
+    fn active_generation(&self, account: &str) -> Result<Option<u64>, VerificationError>;
+}
+impl RouteGeneration for crate::isolation_connectors::ConnectorCatalog {
+    fn active_generation(&self, account: &str) -> Result<Option<u64>, VerificationError> {
+        let Ok(account) = crate::isolation_connectors::AccountId::parse(account) else { return Ok(None) };
+        Ok(self.route(&account)?.filter(|route| route.active).map(|route| route.generation))
+    }
+}
+
+/// The executors' credential path in protected mode (F1): material lives in
+/// the process [`AccountCredentialVault`] that boot also installs into the
+/// connector lifecycle (C3 revoke / C4 events drop it after their fence).
+/// A miss (or expired lease) acquires from the live `source` and stores the
+/// result under the pinned generation. Before serving and after storing, the
+/// catalog route must be active at exactly that generation; otherwise the
+/// account's material is dropped and the acquisition refuses, so a revoke
+/// racing the acquisition never leaves material behind.
+pub struct VaultedCredentials {
+    vault: Arc<AccountCredentialVault>,
+    source: Arc<dyn AccountCredentialProvider>,
+    routes: Arc<dyn RouteGeneration>,
+}
+impl VaultedCredentials {
+    pub fn new(vault: Arc<AccountCredentialVault>, source: Arc<dyn AccountCredentialProvider>,
+        routes: Arc<dyn RouteGeneration>) -> Self {
+        Self { vault, source, routes }
+    }
+    fn route_at(&self, account: &str, generation: u64) -> Result<(), VerificationError> {
+        let current = self.routes.active_generation(account);
+        if matches!(current, Ok(Some(current)) if current == generation) { return Ok(()); }
+        // Revoked/advanced/unknown/unreadable: never keep material for it.
+        let _ = self.vault.remove(account);
+        Err(match current { Err(_) => VerificationError::Unavailable, Ok(_) => VerificationError::BindingMismatch })
+    }
+}
+impl AccountCredentialProvider for VaultedCredentials {
+    fn acquire<'a>(&'a self, _account: &'a str, _provider: &'a str)
+        -> Pin<Box<dyn Future<Output = Result<AccountCredential, VerificationError>> + Send + 'a>> {
+        Box::pin(async { Err(VerificationError::Unavailable) })
+    }
+    fn acquire_at<'a>(&'a self, account: &'a str, provider: &'a str, generation: u64)
         -> Pin<Box<dyn Future<Output = Result<AccountCredential, VerificationError>> + Send + 'a>> {
         Box::pin(async move {
-            let entries = self.entries.read().map_err(|_| VerificationError::Unavailable)?;
-            let entry = entries.get(account).filter(|e| e.provider == provider).ok_or(VerificationError::Unavailable)?;
-            AccountCredential::new(entry.account.clone(), entry.provider.clone(), entry.token.to_string(), entry.expires_at)
+            self.route_at(account, generation)?;
+            let now = duduclaw_mcp_boundary::authority::now_seconds()?;
+            if let Ok(stored) = self.vault.lookup(account, provider, generation) {
+                if now < stored.expires_at { return Ok(stored); }
+            }
+            self.vault.retain_generation(account, generation)?;
+            let fresh = self.source.acquire_at(account, provider, generation).await?;
+            if fresh.account != account || fresh.provider != provider {
+                return Err(VerificationError::BindingMismatch);
+            }
+            self.vault.install(fresh.duplicate()?, generation)?;
+            // A revoke between the source read and the install: drop it again.
+            self.route_at(account, generation)?;
+            Ok(fresh)
         })
     }
 }
@@ -72,7 +170,7 @@ impl AccountCredentialProvider for AccountCredentialVault {
 async fn credential(selected: &SelectedConnector, provider: &dyn AccountCredentialProvider)
     -> Result<AccountCredential, VerificationError> {
     selected.recheck()?;
-    let credential = provider.acquire(selected.account(), selected.provider()).await?;
+    let credential = provider.acquire_at(selected.account(), selected.provider(), selected.generation()).await?;
     selected.recheck()?;
     if credential.account != selected.account() || credential.provider != selected.provider()
         || duduclaw_mcp_boundary::authority::now_seconds()? >= credential.expires_at {

@@ -246,7 +246,7 @@ describe('OdooPage schema snapshot', () => {
     expect(await screen.findByText(/19.0/)).toBeInTheDocument();
     expect(screen.getByText(/re-scan recommended/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Re-scan Odoo structure' }));
-    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('odoo.schema_scan', {}, false, 300000));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('odoo.schema_scan', {}, false, 3600000));
     expect(await screen.findByText(/Added models: 1/)).toBeInTheDocument();
   });
 
@@ -298,5 +298,27 @@ describe('OdooPage permission choices and summary', () => {
     });
     renderWithProviders(<OdooPage />);
     expect(await screen.findByRole('checkbox', { name: /hr\.employee.*Sensitive/ })).toBeInTheDocument();
+  });
+});
+
+
+describe('OdooPage employee scan results', () => {
+  it('shows successful and failed employees from a partially successful scan', async () => {
+    useAuthStore.setState({ user: { id: 'admin', email: 'admin@test', display_name: 'Admin', role: 'admin', status: 'active' } });
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'odoo.schema_scan') return Promise.resolve({ success: false, message: 'One connection failed', results: [
+        { employee: 'default', status: 'ok' },
+        { employee: 'project-agent', status: 'ok' },
+        { employee: 'sales-agent', status: 'failed', message: 'Odoo connection timed out' },
+      ] });
+      if (method === 'odoo.config') return Promise.resolve({ url: 'https://erp.example.com', db: 'prod' });
+      return Promise.resolve({ connected: false, agents: [] });
+    });
+    renderWithProviders(<OdooPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Re-scan Odoo structure' }));
+    expect(await screen.findByText('Results by employee')).toBeInTheDocument();
+    expect(screen.getByText(/project-agent：Ready/)).toBeInTheDocument();
+    expect(screen.getByText(/sales-agent：Failed/)).toBeInTheDocument();
+    expect(screen.getByText(/Odoo connection timed out/)).toBeInTheDocument();
   });
 });

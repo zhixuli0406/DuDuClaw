@@ -77,6 +77,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 70 | [Conversation credential audit](70-credential-audit.md) | credential metadata, routing-based holders, masking and Admin review; [繁體中文](zh-TW/70-credential-audit.md) / [日本語](ja-JP/70-credential-audit.md) |
 | 72 | [Group context](72-group-context.md) | Opt-in retention, explicit employee reads and Discord choices |
 | 73 | [Meeting transcripts](73-meeting-transcripts.md) | Recordings to Taiwan Traditional Chinese with timestamps and optional speaker labels |
+| 76 | [Org chart editing](76-org-chart-editing.md) | Change reporting lines and departments: Admins apply after a before/after check, Managers propose for Admin approval; shared loop/existence/department rules; `org.*` RPCs (UI pending) |
 
 ---
 

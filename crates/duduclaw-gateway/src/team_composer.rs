@@ -94,6 +94,12 @@ pub const AUDIT_TEAM_STAGE_FAILED: &str = "team_stage_failed";
 /// leg loses *every* candidate this way.
 pub const AUDIT_TEAM_PACKET_SKIPPED: &str = "team_packet_skipped";
 
+/// RM-103 S3: a planner packet's `tool_scope` was refused at the executor
+/// delegation point — most importantly an `allowed` entry outside the
+/// employee's envelope (attempted escalation, Warning). The delegation is
+/// skipped; nothing is silently trimmed.
+pub const AUDIT_TEAM_TOOL_SCOPE_ESCALATION: &str = "team_tool_scope_escalation";
+
 /// A packet declared an `artifacts[].path` that resolves outside the
 /// employee's workspace. Rejected with a row rather than silently accepted
 /// (design §4.3 E3 follow-up).
@@ -1952,6 +1958,7 @@ async fn run_team_round_inner(ctx: TeamRoundContext<'_>) -> TeamRoundOutcome {
             &planner_role,
             &instruction,
             plan_tools(Role::Planner, &parent_caps),
+            Vec::new(),
             &parent_workspace,
             &mut artifact_verdicts,
         )
@@ -2038,6 +2045,21 @@ async fn run_team_round_inner(ctx: TeamRoundContext<'_>) -> TeamRoundOutcome {
     };
     let mut executor_ran = 0u32;
     for packet in &assignments {
+        // RM-103 S3: the planner packet's `tool_scope` narrows this
+        // executor's envelope; an attempted widening refuses (and audits)
+        // this one delegation, exactly like a failed replica.
+        let Some(envelope) = delegated_executor_tools(
+            home,
+            &agent_id,
+            task,
+            ctx.round,
+            &ctx.spec.executor.runtime,
+            &parent_caps,
+            *packet,
+            "executor",
+        ) else {
+            continue;
+        };
         let instruction = executor_instruction(home, task, ctx.round, ctx.state_text, *packet);
         match run_member(
             home,
@@ -2048,7 +2070,8 @@ async fn run_team_round_inner(ctx: TeamRoundContext<'_>) -> TeamRoundOutcome {
             Role::Executor,
             &ctx.spec.executor,
             &instruction,
-            plan_tools(Role::Executor, &parent_caps),
+            envelope.tools,
+            envelope.extra_denied,
             &parent_workspace,
             &mut artifact_verdicts,
         )
@@ -2173,7 +2196,18 @@ async fn run_team_round_inner(ctx: TeamRoundContext<'_>) -> TeamRoundOutcome {
             &gap,
             assignments.first().copied().flatten(),
         );
-        if let Err(e) = run_member(
+        // The repair works the first packet's sub-task, so it is bound by
+        // that packet's `tool_scope` exactly as the executor was.
+        if let Some(envelope) = delegated_executor_tools(
+            home,
+            &agent_id,
+            task,
+            ctx.round,
+            &ctx.spec.executor.runtime,
+            &parent_caps,
+            assignments.first().copied().flatten(),
+            "repair",
+        ) && let Err(e) = run_member(
             home,
             &registry,
             &agent_id,
@@ -2182,7 +2216,8 @@ async fn run_team_round_inner(ctx: TeamRoundContext<'_>) -> TeamRoundOutcome {
             Role::Executor,
             &ctx.spec.executor,
             &instruction,
-            plan_tools(Role::Executor, &parent_caps),
+            envelope.tools,
+            envelope.extra_denied,
             &parent_workspace,
             &mut artifact_verdicts,
         )
@@ -2340,6 +2375,281 @@ fn executor_tools(parent: &duduclaw_core::types::CapabilitiesConfig) -> Vec<Stri
     }
 
     tools
+}
+
+// ── RM-103 S3: packet `tool_scope` → executor envelope (narrow-only) ───────
+
+/// A role member's tool envelope after a packet's `tool_scope` was applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NarrowedTools {
+    /// → `RoleMemberSpec::tools` (the member's `allowed_tools`).
+    pub tools: Vec<String>,
+    /// → `RoleMemberSpec::extra_denied` (appended to the member's
+    /// `denied_tools`, on top of the employee's own denies).
+    pub extra_denied: Vec<String>,
+}
+
+/// Why a packet's `tool_scope` was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolScopeRefusal {
+    /// `allowed` named tools the base envelope does not hold — an attempted
+    /// widening. Carries the offending entries (names only).
+    Escalation(Vec<String>),
+    /// An entry is blank or not a tool name.
+    Malformed(String),
+    /// After narrowing nothing is left to run with.
+    Empty,
+}
+
+impl std::fmt::Display for ToolScopeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolScopeRefusal::Escalation(tools) => write!(
+                f,
+                "tool_scope.allowed names tools outside the employee's envelope: {}",
+                tools.join(", ")
+            ),
+            ToolScopeRefusal::Malformed(t) => write!(f, "tool_scope has a malformed entry: {t:?}"),
+            ToolScopeRefusal::Empty => f.write_str("tool_scope leaves the member no tools"),
+        }
+    }
+}
+
+impl ToolScopeRefusal {
+    /// Stable audit token.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            ToolScopeRefusal::Escalation(_) => "escalation",
+            ToolScopeRefusal::Malformed(_) => "malformed",
+            ToolScopeRefusal::Empty => "empty",
+        }
+    }
+}
+
+/// `tool_calls`-style comparisons: trimmed, ASCII case-insensitive, and the
+/// bare and `mcp__duduclaw__`-qualified spellings of a DuDuClaw tool are the
+/// same tool (both spellings occur in real allowlists).
+fn tool_name_eq(a: &str, b: &str) -> bool {
+    // A wildcard is never prefix-stripped: `mcp__duduclaw__*` must not
+    // compare equal to a bare `*` (which would mean every tool).
+    fn bare(s: &str) -> &str {
+        let s = s.trim();
+        match s.get(..DUDUCLAW_MCP_PREFIX.len()) {
+            Some(p) if p.eq_ignore_ascii_case(DUDUCLAW_MCP_PREFIX) => match s
+                .get(DUDUCLAW_MCP_PREFIX.len()..)
+            {
+                Some(rest) if !rest.is_empty() && !rest.contains('*') => rest,
+                _ => s,
+            },
+            _ => s,
+        }
+    }
+    bare(a).eq_ignore_ascii_case(bare(b))
+}
+
+const DUDUCLAW_MCP_PREFIX: &str = "mcp__duduclaw__";
+
+/// Does `base` already grant `tool`? Exact name (see [`tool_name_eq`]), or a
+/// trailing-`*` wildcard entry whose prefix the tool carries. A bare
+/// all-lowercase snake_case name (the spelling planners use for DuDuClaw
+/// tools) is also tested in its qualified form, so `mail_send` is covered by
+/// `mcp__duduclaw__*`. Built-ins (`Bash`, `Read`, …) are CamelCase and never
+/// take that path. The scaffold's `check_tool_subset_with_intrinsics` remains
+/// the authoritative backstop — this can only ever refuse more, not less.
+///
+/// Daybreak round 2 #5: a qualified request (`Bash(git:*)`) is covered by a
+/// bare base entry of the same tool (`Bash`) — bare → qualified is a
+/// narrowing. Never the reverse: a bare request is not covered by a
+/// qualified base entry, and two different qualifiers do not cover each
+/// other (only exact equality does).
+fn base_covers(base: &[String], tool: &str) -> bool {
+    let tool = tool.trim();
+    if let Some((tool_base, _)) = tool.split_once('(') {
+        let tool_base = tool_base.trim();
+        if !tool_base.is_empty()
+            && !tool_base.contains('*')
+            && base
+                .iter()
+                .any(|entry| !entry.contains('(') && tool_name_eq(entry, tool_base))
+        {
+            return true;
+        }
+    }
+    let lower_snake = !tool.is_empty()
+        && tool
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    let qualified = format!("{DUDUCLAW_MCP_PREFIX}{tool}");
+    let prefix_ci = |s: &str, prefix: &str| {
+        s.get(..prefix.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+    };
+    base.iter().any(|entry| {
+        let entry = entry.trim();
+        if tool_name_eq(entry, tool) {
+            return true;
+        }
+        match entry.strip_suffix('*') {
+            Some(prefix) if !prefix.is_empty() => {
+                prefix_ci(tool, prefix) || (lower_snake && prefix_ci(&qualified, prefix))
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Apply a planner packet's `tool_scope` to an executor's `base` subset.
+///
+/// Narrow-only, fail-closed:
+/// 1. empty scope ⇒ `base` unchanged;
+/// 2. non-empty `allowed` ⇒ the result is exactly those entries (plus the
+///    `team_handoff` intrinsic). Every entry must already be covered by
+///    `base` ([`base_covers`]); otherwise the whole delegation is refused as
+///    [`ToolScopeRefusal::Escalation`] — never silently trimmed, so the
+///    attempt is visible in the audit log;
+/// 3. `denied` is subtracted from the result **and** returned as
+///    `extra_denied`, so it also binds tools a wildcard entry covers;
+/// 4. `team_handoff` is kept unless `denied` names it explicitly (then the
+///    member cannot hand off and the round fails visibly).
+pub(crate) fn narrow_tools(
+    base: Vec<String>,
+    scope: &duduclaw_core::task_packet::ToolScope,
+) -> Result<NarrowedTools, ToolScopeRefusal> {
+    if scope.is_empty() {
+        return Ok(NarrowedTools {
+            tools: base,
+            extra_denied: Vec::new(),
+        });
+    }
+    let valid = |t: &str| {
+        let t = t.trim();
+        !t.is_empty()
+            && t.chars().count() <= 128
+            && t.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '_' | '-' | '(' | ')' | ':' | '*' | ',' | '.' | ' ')
+            })
+    };
+    for entry in scope.allowed.iter().chain(scope.denied.iter()) {
+        if !valid(entry) {
+            return Err(ToolScopeRefusal::Malformed(duduclaw_core::truncate_chars(
+                entry, 64,
+            )));
+        }
+    }
+
+    let mut tools: Vec<String> = if scope.allowed.is_empty() {
+        base
+    } else {
+        let escalating: Vec<String> = scope
+            .allowed
+            .iter()
+            .filter(|t| !base_covers(&base, t))
+            .map(|t| t.trim().to_string())
+            .collect();
+        if !escalating.is_empty() {
+            return Err(ToolScopeRefusal::Escalation(escalating));
+        }
+        let mut out: Vec<String> = Vec::new();
+        for t in crate::ephemeral::TEAM_INTRINSIC_TOOLS
+            .iter()
+            .map(|s| s.to_string())
+            .chain(scope.allowed.iter().map(|t| t.trim().to_string()))
+        {
+            if !out.iter().any(|o| tool_name_eq(o, &t)) {
+                out.push(t);
+            }
+        }
+        out
+    };
+
+    let mut extra_denied: Vec<String> = Vec::new();
+    for d in &scope.denied {
+        let d = d.trim();
+        tools.retain(|t| !tool_name_eq(t, d));
+        if !extra_denied.iter().any(|e| tool_name_eq(e, d)) {
+            extra_denied.push(d.to_string());
+        }
+    }
+    if tools.is_empty() {
+        return Err(ToolScopeRefusal::Empty);
+    }
+    Ok(NarrowedTools {
+        tools,
+        extra_denied,
+    })
+}
+
+/// The executor envelope for one delegation: [`plan_tools`] narrowed by the
+/// planner packet's `tool_scope` (when there is a packet). A refusal writes a
+/// `team_tool_scope_escalation` audit row (Warning) and a `role_turns` row,
+/// and returns `None` — the caller skips that delegation.
+#[allow(clippy::too_many_arguments)]
+fn delegated_executor_tools(
+    home: &Path,
+    agent_id: &str,
+    task: &TaskRow,
+    round: u32,
+    runtime: &str,
+    parent_caps: &duduclaw_core::types::CapabilitiesConfig,
+    packet: Option<&TaskPacket>,
+    stage: &str,
+) -> Option<NarrowedTools> {
+    let base = plan_tools(Role::Executor, parent_caps);
+    let Some(packet) = packet else {
+        return Some(NarrowedTools {
+            tools: base,
+            extra_denied: Vec::new(),
+        });
+    };
+    match narrow_tools(base, &packet.tool_scope) {
+        Ok(n) => Some(n),
+        Err(refusal) => {
+            let requested: Vec<String> = match &refusal {
+                ToolScopeRefusal::Escalation(t) => t.clone(),
+                _ => Vec::new(),
+            };
+            warn!(
+                task = %task.id, round, packet = %packet.packet_id, stage,
+                "executor delegation refused: {refusal}"
+            );
+            duduclaw_security::audit::append_audit_event(
+                home,
+                &duduclaw_security::audit::AuditEvent::new(
+                    AUDIT_TEAM_TOOL_SCOPE_ESCALATION,
+                    agent_id,
+                    if matches!(refusal, ToolScopeRefusal::Escalation(_)) {
+                        duduclaw_security::audit::Severity::Warning
+                    } else {
+                        duduclaw_security::audit::Severity::Info
+                    },
+                    serde_json::json!({
+                        "task_id": task.id,
+                        "round": round,
+                        "stage": stage,
+                        "packet_id": packet.packet_id,
+                        "reason": refusal.as_str(),
+                        "requested": requested,
+                        "detail": duduclaw_core::truncate_chars(&refusal.to_string(), 200),
+                    }),
+                ),
+            );
+            crate::role_turns::append_row(
+                home,
+                &RoleTurnRow::refused(
+                    &task.id,
+                    agent_id,
+                    round,
+                    Role::Executor,
+                    runtime,
+                    None,
+                    RoleTurnOutcome::Failed,
+                    "tool_scope_refused",
+                ),
+            );
+            None
+        }
+    }
 }
 
 /// One `team_stage_failed` audit row, with the closed shape the design's §6
@@ -3401,6 +3711,9 @@ async fn run_member(
     frozen: &FrozenRole,
     instruction: &str,
     tools: Vec<String>,
+    // RM-103 S3: denies a planner packet's `tool_scope` adds on top of the
+    // employee's own `denied_tools` (empty for every non-delegated member).
+    extra_denied: Vec<String>,
     // The employee's own workspace — the cwd every member runs in, and the
     // containment root every artifact path must resolve inside (design §4.3
     // E3). Resolved once per round by `resolve_parent_workspace`.
@@ -3498,6 +3811,7 @@ async fn run_member(
         effort: frozen.effort_level(),
         instruction: instruction.to_string(),
         tools,
+        extra_denied,
     };
     let scaffolded = match admit_and_wait_role_member(home_dir, &spec).await {
         Ok(s) => s,
@@ -4932,6 +5246,7 @@ skill_security_scan = false
             effort: None,
             instruction: "do work".into(),
             tools: vec!["team_handoff".into()],
+            extra_denied: Vec::new(),
         };
         let first = crate::ephemeral::scaffold_role_member(home, &spec).unwrap();
         let wait = admit_and_wait_role_member(home, &spec);
@@ -7113,6 +7428,199 @@ skill_security_scan = false
         c.allowed_tools = plan_tools(role, parent);
         c.denied_tools = parent.denied_tools.clone();
         c
+    }
+
+    // ── RM-103 S3: packet tool_scope narrowing ───────────────────────────
+
+    fn scope(allowed: &[&str], denied: &[&str]) -> duduclaw_core::task_packet::ToolScope {
+        duduclaw_core::task_packet::ToolScope {
+            allowed: allowed.iter().map(|s| s.to_string()).collect(),
+            denied: denied.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn narrow_tools_empty_scope_is_identity() {
+        let base = plan_tools(Role::Executor, &parent_caps(&["Read", "Bash"], &[]));
+        let out = narrow_tools(base.clone(), &scope(&[], &[])).unwrap();
+        assert_eq!(out.tools, base);
+        assert!(out.extra_denied.is_empty());
+    }
+
+    #[test]
+    fn narrow_tools_subset_is_accepted_and_keeps_handoff() {
+        // Employee allowlist; the packet narrows to one tool of it.
+        let base = plan_tools(Role::Executor, &parent_caps(&["Read", "Bash", "Write"], &[]));
+        let out = narrow_tools(base, &scope(&["read"], &[])).unwrap();
+        assert_eq!(out.tools, vec!["team_handoff".to_string(), "read".to_string()]);
+        // Unrestricted employee: a bare DuDuClaw tool name is covered by the
+        // `mcp__duduclaw__*` wildcard, a built-in by the default list.
+        let base = plan_tools(Role::Executor, &parent_caps(&[], &[]));
+        let out = narrow_tools(base, &scope(&["mail_send", "Read", "mcp__duduclaw__wiki_read"], &[]))
+            .unwrap();
+        assert!(out.tools.iter().any(|t| t == "team_handoff"));
+        assert!(out.tools.iter().any(|t| t == "mail_send"));
+        assert!(!out.tools.iter().any(|t| t == "Bash"), "narrowed away: {:?}", out.tools);
+        // The narrowed set still passes the scaffold's containment check.
+        let parent = parent_caps(&["Read", "Bash", "Write"], &[]);
+        let out = narrow_tools(plan_tools(Role::Executor, &parent), &scope(&["Read"], &[])).unwrap();
+        crate::ephemeral::check_tool_subset_with_intrinsics(
+            &parent,
+            &out.tools,
+            crate::ephemeral::TEAM_INTRINSIC_TOOLS,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn narrow_tools_refuses_escalation_outright() {
+        let base = plan_tools(Role::Executor, &parent_caps(&["Read"], &[]));
+        let err = narrow_tools(base, &scope(&["Read", "Bash", "mail_send"], &[])).unwrap_err();
+        assert_eq!(
+            err,
+            ToolScopeRefusal::Escalation(vec!["Bash".to_string(), "mail_send".to_string()])
+        );
+        assert_eq!(err.as_str(), "escalation");
+        // A built-in is never "covered" by the MCP wildcard just because the
+        // wildcard is present.
+        let base = plan_tools(Role::Executor, &parent_caps(&["mcp__duduclaw__*"], &[]));
+        assert!(matches!(
+            narrow_tools(base.clone(), &scope(&["Bash"], &[])),
+            Err(ToolScopeRefusal::Escalation(_))
+        ));
+        // Nor is a broader wildcard: `*` / `mcp__*` are wider than the base.
+        for wide in ["*", "mcp__*"] {
+            assert!(
+                matches!(
+                    narrow_tools(base.clone(), &scope(&[wide], &[])),
+                    Err(ToolScopeRefusal::Escalation(_))
+                ),
+                "{wide}"
+            );
+        }
+        // A tool the employee denies is not in the base either.
+        let base = plan_tools(Role::Executor, &parent_caps(&[], &["Bash"]));
+        assert!(matches!(
+            narrow_tools(base, &scope(&["Bash"], &[])),
+            Err(ToolScopeRefusal::Escalation(_))
+        ));
+        // Malformed entries refuse too.
+        let base = plan_tools(Role::Executor, &parent_caps(&[], &[]));
+        assert!(matches!(
+            narrow_tools(base, &scope(&["  "], &[])),
+            Err(ToolScopeRefusal::Malformed(_))
+        ));
+    }
+
+    /// Daybreak round 2 #5: bare → qualified is a narrowing (accepted, and the
+    /// scaffold's subset check agrees); qualified → bare, or a different
+    /// qualifier, is still an escalation; a bare parent deny vetoes the
+    /// qualified spelling at the scaffold.
+    #[test]
+    fn narrow_tools_accepts_a_qualified_narrowing_of_a_bare_base_tool() {
+        use crate::ephemeral::{TEAM_INTRINSIC_TOOLS, check_tool_subset_with_intrinsics};
+        let parent = parent_caps(&["Read", "Bash"], &[]);
+        let out = narrow_tools(plan_tools(Role::Executor, &parent), &scope(&["Read", "Bash(git:*)"], &[]))
+            .unwrap();
+        assert_eq!(
+            out.tools,
+            vec!["team_handoff".to_string(), "Read".to_string(), "Bash(git:*)".to_string()]
+        );
+        check_tool_subset_with_intrinsics(&parent, &out.tools, TEAM_INTRINSIC_TOOLS).unwrap();
+        // Unrestricted employee: the default list holds bare `Bash`.
+        let open = parent_caps(&[], &[]);
+        let out = narrow_tools(plan_tools(Role::Executor, &open), &scope(&["Bash(git:*)"], &[])).unwrap();
+        assert!(out.tools.iter().any(|t| t == "Bash(git:*)"), "{:?}", out.tools);
+        check_tool_subset_with_intrinsics(&open, &out.tools, TEAM_INTRINSIC_TOOLS).unwrap();
+
+        // Never the reverse, never a different qualifier.
+        let narrow_parent = parent_caps(&["Read", "Bash(git:*)"], &[]);
+        let base = plan_tools(Role::Executor, &narrow_parent);
+        for wider in ["Bash", "Bash(rm:*)", "Bash(*)", "Write(src:*)"] {
+            assert!(
+                matches!(narrow_tools(base.clone(), &scope(&[wider], &[])), Err(ToolScopeRefusal::Escalation(_))),
+                "{wider}"
+            );
+        }
+        let exact = narrow_tools(base, &scope(&["Bash(git:*)"], &[])).unwrap();
+        check_tool_subset_with_intrinsics(&narrow_parent, &exact.tools, TEAM_INTRINSIC_TOOLS).unwrap();
+        for wider in [&["Bash"][..], &["Bash(rm:*)"][..]] {
+            let wider: Vec<String> = wider.iter().map(|s| s.to_string()).collect();
+            assert!(check_tool_subset_with_intrinsics(&narrow_parent, &wider, TEAM_INTRINSIC_TOOLS).is_err());
+        }
+        // A wildcard base name is not a bare tool.
+        let base = plan_tools(Role::Executor, &parent_caps(&["mcp__duduclaw__*"], &[]));
+        assert!(matches!(
+            narrow_tools(base, &scope(&["Bash(git:*)"], &[])),
+            Err(ToolScopeRefusal::Escalation(_))
+        ));
+        // A bare parent deny vetoes the qualified spelling at the scaffold.
+        let denying = parent_caps(&["Read", "Bash"], &["Bash"]);
+        let req = vec!["Bash(git:*)".to_string()];
+        assert!(check_tool_subset_with_intrinsics(&denying, &req, TEAM_INTRINSIC_TOOLS).is_err());
+    }
+
+    #[test]
+    fn narrow_tools_denied_is_subtracted_and_propagated() {
+        let base = plan_tools(Role::Executor, &parent_caps(&[], &[]));
+        let out = narrow_tools(base, &scope(&[], &["Bash", "mail_send", "bash"])).unwrap();
+        assert!(!out.tools.iter().any(|t| t.eq_ignore_ascii_case("Bash")));
+        // `mail_send` is only reachable through the wildcard, so the deny
+        // must travel to the scaffold's denied_tools to bind at all.
+        assert!(out.tools.iter().any(|t| t == "mcp__duduclaw__*"));
+        assert_eq!(out.extra_denied, vec!["Bash".to_string(), "mail_send".to_string()]);
+        assert!(out.tools.iter().any(|t| t == "team_handoff"));
+
+        // `team_handoff` goes only when explicitly denied.
+        let base = plan_tools(Role::Executor, &parent_caps(&["Read"], &[]));
+        let out = narrow_tools(base, &scope(&["Read"], &["mcp__duduclaw__team_handoff"])).unwrap();
+        assert_eq!(out.tools, vec!["Read".to_string()]);
+        assert_eq!(out.extra_denied, vec!["mcp__duduclaw__team_handoff".to_string()]);
+        // Denying everything that was allowed leaves nothing → refused.
+        let base = plan_tools(Role::Executor, &parent_caps(&["Read"], &[]));
+        assert_eq!(
+            narrow_tools(base, &scope(&["Read"], &["Read", "team_handoff"])),
+            Err(ToolScopeRefusal::Empty)
+        );
+    }
+
+    /// The delegation point: an escalating packet is refused (no envelope →
+    /// the executor is skipped) and leaves a Warning audit row naming the
+    /// offending tools; a narrowing packet yields its narrowed envelope; no
+    /// packet yields the plain executor subset.
+    #[test]
+    fn delegation_refuses_and_audits_an_escalating_packet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let t = task("t-scope");
+        let caps = parent_caps(&["Read", "Write"], &[]);
+
+        let mut bad = packet("t-scope", 1, Role::Planner, Role::Executor, "p-bad");
+        bad.tool_scope = scope(&["Read", "Bash"], &[]);
+        assert!(
+            delegated_executor_tools(home, "agnes", &t, 1, "claude", &caps, Some(&bad), "executor")
+                .is_none()
+        );
+        let rows = audit_rows(home, AUDIT_TEAM_TOOL_SCOPE_ESCALATION);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["severity"], "warning");
+        assert_eq!(rows[0]["details"]["packet_id"], "p-bad");
+        assert_eq!(rows[0]["details"]["reason"], "escalation");
+        assert_eq!(rows[0]["details"]["requested"], serde_json::json!(["Bash"]));
+
+        let mut good = packet("t-scope", 1, Role::Planner, Role::Executor, "p-good");
+        good.tool_scope = scope(&["Read"], &["Write"]);
+        let env =
+            delegated_executor_tools(home, "agnes", &t, 1, "claude", &caps, Some(&good), "executor")
+                .unwrap();
+        assert_eq!(env.tools, vec!["team_handoff".to_string(), "Read".to_string()]);
+        assert_eq!(env.extra_denied, vec!["Write".to_string()]);
+
+        let plain =
+            delegated_executor_tools(home, "agnes", &t, 1, "claude", &caps, None, "executor").unwrap();
+        assert_eq!(plain.tools, plan_tools(Role::Executor, &caps));
+        assert!(plain.extra_denied.is_empty());
+        assert_eq!(audit_rows(home, AUDIT_TEAM_TOOL_SCOPE_ESCALATION).len(), 1);
     }
 
     #[test]

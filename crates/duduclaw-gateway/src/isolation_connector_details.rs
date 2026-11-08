@@ -403,6 +403,8 @@ impl CatalogAccountDetails {
         if !home.is_absolute() { return Err(VerificationError::Invalid); }
         Ok(Self { home, catalog })
     }
+    /// F1: whether this reader reads exactly `catalog` (the one boot handle).
+    pub fn shares_catalog(&self, catalog: &Arc<ConnectorCatalog>) -> bool { Arc::ptr_eq(&self.catalog, catalog) }
     /// The route and its details for the route's current generation, from one
     /// read snapshot; `None` when the route is revoked or has no current
     /// details. Store damage or an unreadable store is `Err(Unavailable)`.

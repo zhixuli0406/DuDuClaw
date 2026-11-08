@@ -280,7 +280,9 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
     // acquire a supervisor. Read back from the file just written so a template
     // that ships its own `reports_to` / `department` is captured verbatim.
     if let Some(entry) = duduclaw_core::org_store::read_mirror(&agent_toml_path) {
-        if let Err(e) = duduclaw_core::org_store::upsert(&home, &agent_name, entry) {
+        if let Err(e) = duduclaw_core::org_store::with_org_lock(&home, |org| {
+            duduclaw_core::org_store::upsert(org, &agent_name, entry)
+        }) {
             tracing::warn!(agent = %agent_name, error = %e, "org.toml upsert failed in wizard");
         }
     }

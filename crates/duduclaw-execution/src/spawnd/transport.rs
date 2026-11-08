@@ -132,7 +132,7 @@ impl ControlIo {
             };
             let envelope: Envelope<SpawnResponse> = ipc::decode(&bytes).map_err(|_| BackendError::Protocol)?;
             if envelope.request_id != request_id { return Err(BackendError::Protocol); }
-            validate_response(&request, &envelope.message)?;
+            validate_response(&request, &envelope.message, fds.len())?;
             validate_fds(&envelope.message.fd_plan(), &fds)?;
             if self.closed.load(Ordering::Acquire) { return Err(BackendError::Unavailable); }
             check()?;
@@ -246,6 +246,23 @@ impl Connection {
         result
     }
 
+    /// Package H work op (H5) on this run's own authenticated control
+    /// connection; root checks that the run is owned by this connection.
+    /// Blocking: call from the blocking pool. No fds are sent. A root `Error`
+    /// reply is returned as a packet (not mapped) so the caller can give a
+    /// typed file-tool refusal; any transport/protocol failure closes control.
+    pub(super) fn work_request(&self, request: SpawnRequest, timeout: Duration) -> Result<Packet, BackendError> {
+        if !matches!(request, SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }) {
+            return Err(BackendError::Denied);
+        }
+        if !request.fd_plan().map_err(|_| BackendError::Denied)?.is_empty() { return Err(BackendError::Denied); }
+        self.io.transact(request, vec![], std::time::Instant::now() + timeout, &|| Ok(()), None)
+    }
+
+    /// Synchronous fence for a reply that passed the transport checks but
+    /// contradicts itself (e.g. fd identity differs from the reply metadata).
+    pub(super) fn close_now(&self) { self.io.close(); }
+
     pub async fn request(&self, request: SpawnRequest, input_fds: &[OwnedFd]) -> Result<Packet, BackendError> {
         self.request_checked(request, input_fds, Arc::new(|| Ok(()))).await
     }
@@ -352,7 +369,12 @@ fn map_error(code: ErrorCode) -> BackendError {
     }
 }
 
-fn validate_response(request: &SpawnRequest, response: &SpawnResponse) -> Result<(), BackendError> {
+fn validate_response(request: &SpawnRequest, response: &SpawnResponse, received_fds: usize) -> Result<(), BackendError> {
+    // Package H (H1/H5): the contract's own pairing, incl. the exact fd count
+    // (`WorkFile` = one `WorkFileRead`, `Error`/`WorkAnchor` = none).
+    if matches!(request, SpawnRequest::OpenWorkFile { .. } | SpawnRequest::WorkAnchor { .. }) {
+        return ipc::check_work_reply(request, response, received_fds).map_err(|_| BackendError::Protocol);
+    }
     let valid = match (request, response) {
         (_, SpawnResponse::Error { .. }) => true,
         (SpawnRequest::ReserveRun { .. }, SpawnResponse::Reserved { .. }) => true,
@@ -481,6 +503,12 @@ fn validate_fds(roles: &[FdRole], fds: &[OwnedFd]) -> Result<(), BackendError> {
                 let is_master = unsafe { libc::ioctl(raw, libc::TIOCGPTN, &mut number) } == 0;
                 kind == SFlag::S_IFCHR && access == OFlag::O_RDWR && is_master
             }
+            // H2 hands out a sealed read-only memfd snapshot, never the
+            // employee's inode: O_RDONLY (O_PATH has access bits 0, so refuse
+            // it explicitly), regular, nlink 0, all four seals, tmpfs, ≤ 16 MiB.
+            FdRole::WorkFileRead => access == OFlag::O_RDONLY
+                && !OFlag::from_bits_retain(flags).contains(OFlag::O_PATH)
+                && super::work_file::sealed_snapshot(fd).is_ok(),
             _ => false,
         };
         if !valid { return Err(BackendError::Protocol); }
@@ -597,10 +625,22 @@ mod tests {
         let other = RunHandle(RunId([2; 16]));
         let request = SpawnRequest::TakeIo { run };
         let io = |run| SpawnResponse::Io { run, delivery: IoDelivery { mcp: false, pty: false } };
-        assert!(validate_response(&request, &io(run)).is_ok());
-        assert!(validate_response(&request, &io(other)).is_err());
-        assert!(validate_response(&request, &SpawnResponse::Ack).is_err());
-        assert!(validate_response(&request, &SpawnResponse::Error { code: ErrorCode::NotReady }).is_ok());
+        assert!(validate_response(&request, &io(run), 0).is_ok());
+        assert!(validate_response(&request, &io(other), 0).is_err());
+        assert!(validate_response(&request, &SpawnResponse::Ack, 0).is_err());
+        assert!(validate_response(&request, &SpawnResponse::Error { code: ErrorCode::NotReady }, 0).is_ok());
+        // H5: work replies pair only with their own request, with exact fd counts.
+        let work = SpawnRequest::OpenWorkFile { run, employee_id: duduclaw_isolation::ids::EmployeeId([1; 16]),
+            path: ipc::WorkPath::new("a.txt".into()).unwrap(), mode: ipc::WorkOpenMode::ReadOnly };
+        let file = |run| SpawnResponse::WorkFile { run, file: ipc::WorkFileMetadata { size: 1, inode: 2, device: 3 } };
+        assert!(validate_response(&work, &file(run), 1).is_ok());
+        assert!(validate_response(&work, &file(run), 0).is_err());
+        assert!(validate_response(&work, &file(run), 2).is_err());
+        assert!(validate_response(&work, &file(other), 1).is_err());
+        assert!(validate_response(&work, &SpawnResponse::Ack, 0).is_err());
+        assert!(validate_response(&work, &SpawnResponse::Error { code: ErrorCode::WorkFileNotFound }, 0).is_ok());
+        assert!(validate_response(&work, &SpawnResponse::Error { code: ErrorCode::WorkFileNotFound }, 1).is_err());
+        assert!(validate_response(&request, &file(run), 1).is_err());
     }
 
     #[test]

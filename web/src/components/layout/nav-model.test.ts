@@ -281,6 +281,22 @@ describe('self-service account navigation', () => {
 });
 
 
+describe('我的記憶 navigation (RM-039)', () => {
+  it('is in the 設定 group of both editions with a 1.81.0 badge and no role gate', () => {
+    for (const personal of [false, true]) {
+      const entries = navGroupsForEdition(personal).flatMap(g => g.items).filter(i => i.to === '/me/memory');
+      expect(entries).toHaveLength(1);
+      expect(entries[0].newIn).toBe('1.81.0');
+      expect(entries[0].minRole).toBeUndefined();
+      expect(entries[0].enterprise).toBeUndefined();
+      for (const role of ['admin', 'manager', 'employee'] as const) {
+        expect(isVisible(entries[0], role, personal)).toBe(true);
+      }
+    }
+    expect(crumbsFor('/me/memory')).toEqual([{ labelId: 'nav.myMemory' }]);
+  });
+});
+
 describe('enterprise employee navigation', () => {
   it('shows exactly the daily employee destinations in the agreed order', () => {
     expect(employeeNavItems().map((item) => item.to)).toEqual([
@@ -373,6 +389,8 @@ const previousNavigation = {
       ],
       [
         "/me/account",
+        "/me/external-access",
+        "/me/memory",
         "/my/history-views",
         "/manage",
         "/app/system/migration",
@@ -408,6 +426,8 @@ const previousNavigation = {
     "groups": [
       [
         "/me/account",
+        "/me/external-access",
+        "/me/memory",
         "/manage",
         "/app/system/migration",
         "/app/system/settings/company",
@@ -468,6 +488,8 @@ const previousNavigation = {
       ],
       [
         "/me/account",
+        "/me/external-access",
+        "/me/memory",
         "/my/history-views",
         "/manage",
         "/about"
@@ -496,6 +518,8 @@ const previousNavigation = {
     "groups": [
       [
         "/me/account",
+        "/me/external-access",
+        "/me/memory",
         "/manage",
         "/about"
       ],
@@ -532,6 +556,8 @@ const previousNavigation = {
     "groups": [
       [
         "/me/account",
+        "/me/external-access",
+        "/me/memory",
         "/about"
       ],
       [

@@ -71,6 +71,7 @@ pub fn scaffold_role_member(
         ScaffoldPlan {
             agent_id: Some(agent_id),
             role: Some(&normalized),
+            org: None,
         },
     )
 }
@@ -124,6 +125,62 @@ pub fn is_role_member(home_dir: &Path, agent_id: &str) -> bool {
     resolve_agent_dir(home_dir, agent_id).is_some_and(|dir| has_role_member_marker(&dir))
 }
 
+/// RM-103 S3 (v1.81): is this call a team role member using one of the
+/// team's own intrinsic tools ([`TEAM_INTRINSIC_TOOLS`])?
+///
+/// The scaffold copies the employee's `policy` / `action_rules` /
+/// `approval_required_tools` / `irreversible_tools` /
+/// `maybe_irreversible_tools` into every member so it faces the approvals its
+/// employee faces. Those were written for the employee, who never calls
+/// `team_handoff`, and their syntax cannot carve one tool out of a `*` /
+/// effect / canonical-family rule (or out of a malformed list, which fails
+/// every side-effecting call closed) — so rewriting them in the scaffold
+/// cannot make the guarantee. Instead the MCP dispatch gate skips exactly
+/// those inherited layers for a call this predicate accepts; `allowed_tools`,
+/// `denied_tools` (the scaffold-time [`check_tool_subset_with_intrinsics`]
+/// rule: an explicit deny still wins), `[permissions]` and every other gate
+/// still apply.
+///
+/// Fails toward "no exemption": the id must be an ephemeral scaffold whose
+/// `[team_member]` record parses completely ([`read_role_member`]) and names
+/// the same parent as its `ephemeral.toml`. A tool name is compared bare
+/// (`mcp__duduclaw__` stripped), case-insensitively, like the subset check.
+pub fn is_role_member_intrinsic_call(home_dir: &Path, agent_id: &str, tool_name: &str) -> bool {
+    let bare = tool_name.trim();
+    let bare = bare.strip_prefix("mcp__duduclaw__").unwrap_or(bare);
+    if !TEAM_INTRINSIC_TOOLS.iter().any(|t| t.eq_ignore_ascii_case(bare)) {
+        return false;
+    }
+    let Some(dir) = resolve_agent_dir(home_dir, agent_id) else {
+        return false;
+    };
+    is_verified_role_member_dir(&dir)
+}
+
+/// RM-103 S3: is `dir` a team role member scaffold whose `[team_member]`
+/// record parses completely and names the same parent as its
+/// `ephemeral.toml`? The record half of [`is_role_member_intrinsic_call`],
+/// for callers that hold a scaffold directory rather than an id (the Claude
+/// spawn's `--disallowedTools` mirror of `scoped_tools`). The directory must
+/// sit directly under [`EPHEMERAL_DIR_NAME`] and carry an ephemeral id.
+pub fn is_verified_role_member_dir(dir: &Path) -> bool {
+    let in_ephemeral_root = dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == std::ffi::OsStr::new(EPHEMERAL_DIR_NAME));
+    let id_ok = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_ephemeral_id);
+    if !in_ephemeral_root || !id_ok {
+        return false;
+    }
+    match (read_role_member(dir), read_meta(dir)) {
+        (Some(record), Some(meta)) => record.parent == meta.parent,
+        _ => false,
+    }
+}
+
 /// Tear a role member down the moment its round reaches a terminal state:
 /// writes the `.completed` marker **and** removes the scaffold immediately —
 /// no 1 h grace, no waiting for the 24 h TTL.
@@ -161,9 +218,14 @@ pub fn finish_role_member(
         return Err(format!("not an ephemeral agent id: {member_id:?}"));
     }
     crate::agent_files::writer::run_blocking(|| {
+        // Lock order (RM-027 round 3): the global org lock before the
+        // autonomy barrier, as `agents.update` takes them — the teardown
+        // removes the member's authority record below.
+        let org = duduclaw_core::org_store::lock_org_mutations(home_dir)
+            .map_err(|error| format!("org lock unavailable: {error}"))?;
         let _barrier = duduclaw_core::autonomy_gate::exclusive_barrier(home_dir)
             .map_err(|error| error.to_string())?;
-        finish_role_member_locked(home_dir, member_id, outcome)
+        finish_role_member_locked(home_dir, member_id, outcome, &org)
     })
 }
 
@@ -171,6 +233,7 @@ fn finish_role_member_locked(
     home_dir: &Path,
     member_id: &str,
     outcome: RoleMemberOutcome,
+    org: &duduclaw_core::org_store::OrgMutationGuard,
 ) -> Result<(), String> {
     let Some(dir) = resolve_agent_dir(home_dir, member_id) else {
         // Already swept, never existed, or escapes the namespace —
@@ -223,7 +286,7 @@ fn finish_role_member_locked(
 
     // The authoritative org record dies with the directory (same ordering as
     // `sweep` and MCP `agent_remove`).
-    if let Err(e) = duduclaw_core::org_store::remove(home_dir, member_id) {
+    if let Err(e) = duduclaw_core::org_store::remove(org, member_id) {
         tracing::warn!(
             member = %member_id,
             error = %e,
@@ -364,6 +427,7 @@ pub(super) fn role_member_payload(spec: &RoleMemberSpec) -> serde_json::Value {
         "effort": spec.effort.map(|e| e.as_str()),
         "instruction": spec.instruction,
         "tools": spec.tools,
+        "extra_denied": spec.extra_denied,
     })
 }
 
@@ -392,5 +456,16 @@ pub fn role_member_from_payload(payload: &serde_json::Value) -> Option<RoleMembe
             .iter()
             .map(|t| t.as_str().map(str::to_string))
             .collect::<Option<Vec<String>>>()?,
+        // Absent only on a ticket queued before RM-103 (no packet denies
+        // existed then); present-but-malformed drops the ticket like any
+        // other malformed field rather than losing the denies.
+        extra_denied: match payload.get("extra_denied") {
+            None => Vec::new(),
+            Some(v) => v
+                .as_array()?
+                .iter()
+                .map(|t| t.as_str().map(str::to_string))
+                .collect::<Option<Vec<String>>>()?,
+        },
     })
 }

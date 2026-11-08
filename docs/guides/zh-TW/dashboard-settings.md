@@ -29,6 +29,8 @@
 
 英文版：[../dashboard-settings.md](../dashboard-settings.md)　日文版：[../ja-JP/dashboard-settings.md](../ja-JP/dashboard-settings.md)
 
+**保護模式公開網頁（原生 Linux 保護模式，目前僅能透過設定檔）：** AI 員工在保護模式下的執行是否可使用 `web_fetch_cached` 與 `web_extract`，須依員工在 `agents/<id>/agent.toml` 設定 `[isolation] public_web = true`（預設 `false`，不可存取網頁）。目前儀表板沒有對應控制項：請直接編輯該檔案，或使用管理員設定編輯器（`agent:<id>`），該編輯器會將此鍵列為受保護變更。員工表單的鍵值編輯器會拒絕 `[isolation]` 區段，非管理員的 `agents.update` 無法變更它，員工自行編輯檔案中的該區段也會被拒絕。此開關與員工表單的**網路存取**（`[container] network_access`）互相獨立，後者仍只控制任務沙箱的網路。即使啟用，保護模式下的擷取也只能連到公開的 HTTPS 網站（不可使用 IP 位址、內部名稱或重新導向）。未處於保護模式的安裝會忽略此鍵。
+
 目標費用與重複呼叫防護目前在「設定檔進階編輯」設定，沒有獨立的自動化控制項。`config.toml [goal_loop]` 的 `default_cost_cap_cents = 0` 是未設定個別上限的目標所使用的美分上限（`0`＝不限額）；`tool_streak_pause = 8` 表示一輪結束後，相同工具與參數連續呼叫達此次數就暫停（`0`＝關閉）。透過進階編輯器儲存會重新載入目標迴圈；直接修改 `config.toml` 則需重新啟動 gateway。`tool_streak_advisory` 另行控制既有提醒。個別上限可在交辦目標時填寫；`/goals` 顯示費用，並讓有權限的操作者提高暫停目標的上限後重試。
 
 
@@ -58,6 +60,20 @@ no_success_hours = 6    # 1..168
 ```
 
 設定檔不存在或省略這個區段時，使用以上預設值；其他讀取錯誤或設定無效時，關閉健康提醒。關閉提醒不會增加員工權限，也不改變任務執行；健康頁仍為唯讀。
+
+## 員工編輯頁 → 工具與權限 → 工具權限（v1.81.0）
+
+員工編輯頁的「工具與權限」分頁有兩個子分頁：**工具權限**與**權限變更紀錄**。表格依分類列出所有目錄中的工具，欄位為「可使用」與「需審批」，並提供各分類全選（`N/M 可使用`）與搜尋。修改先存在草稿：已修改的列會標示，底部固定列提供「捨棄變更」／「儲存」，按儲存會開啟確認視窗，列出新增可使用、移除可使用、需審批的數量與每個工具的前後差異。確認後透過一般的 `agents.update` `capabilities` 內容寫入。只有管理員能修改；其他帳號看到相同表格但為唯讀，所有勾選框停用，沒有全選與儲存列。
+
+表格與 `agent.toml [capabilities]` 的對應：
+
+- **可使用**＝未被 `denied_tools` 命中，且 `allowed_tools` 為空或命中該工具（與閘道本身的規則相同：封鎖永遠優先，非空允許清單即為允許清單模式）。比對採錨定且支援萬用字元，例如 `mcp__duduclaw__*`。
+- 取消勾選一律是把工具**加入 `denied_tools`**；`allowed_tools` 不會被縮減或改寫，所以萬用字元允許清單維持原樣，它涵蓋的工具都顯示為可使用。重新勾選會移除那筆封鎖項目。被*萬用字元*封鎖項目涵蓋的工具無法在此開啟（該列鎖定），請到「進階設定」修改該項目。
+- **需審批**＝`approval_required_tools`（工具的簡短名稱），也就是 MCP 派送閘門對每個工具實際執行的清單。已被審批清單萬用字元或 `action_rules` 的 `ask` 規則要求審批的工具會顯示為需審批但鎖定。「可使用」關閉時，此勾選框停用。
+
+原本的允許清單、封鎖清單、動作規則、審批清單區塊，現在收在分頁底部收合的「進階設定」，並與表格同步。
+
+**權限變更紀錄**（僅管理員）依 `agent_authority_changed` 稽核紀錄，列出這位員工的權限變更：時間、操作人，以及每個工具的舊狀態（刪除線）→ 新狀態。不是從表格儲存的變更會標示「從進階設定修改」（表格推出前的舊變更也會如此標示）。此分頁由僅限管理員的 `agents.permission_history` RPC（`agent_id`、最多 100 的 `limit`、`cursor`）提供，與 `security.audit_log` 讀取同一份稽核紀錄。
 
 ## 一般員工側欄
 
@@ -134,7 +150,25 @@ npm 未安裝或安裝失敗時，提示會提供完整的手動指令與複製�
 - `config.toml` 無法解析時，`system.update_config`、常駐感知資料來源與設定檔進階編輯都會拒絕寫入，請先在設定檔進階編輯修好語法。其他會寫 `config.toml` 的設定頁（通道、帳號、Odoo 等）也一樣拒絕寫入。
 - 存檔是原地修改檔案，只改你動到的鍵。你寫的註解、空行、鍵的順序和沒動到的鍵的排版都原樣保留，改了值的那一行行尾註解也還在。新增的鍵放在所屬區段的最後，新增的區段放在檔案最後。所有會寫 `config.toml` 或 `inference.toml` 的設定頁都是這樣，不只設定檔進階編輯。
 - 需要重啟才生效的鍵會出現在回應的 `restart_required`。系統設定頁與通道管理頁上方會顯示「以下設定要重啟 gateway 才生效」，gateway 重啟後自動消失，也可以手動關閉。推理頁與 AI 員工編輯頁不顯示這條提示。
-- 下列鍵每次改動都會另寫一筆稽核事件 `config_protected_key_changed`（含改動前後的值）：`acp.trusted`、`tick.allow_command_sources`、`container.sandbox.when_unavailable`、`container.sandbox.script_when_unavailable`、`memory.supersession_trust_guard`。
+- 下列鍵每次改動都會另寫一筆稽核事件 `config_protected_key_changed`（含改動前後的值）：`acp.trusted`、`tick.allow_command_sources`、`container.sandbox.when_unavailable`、`container.sandbox.script_when_unavailable`、`memory.supersession_trust_guard`、`dashboard.public_url`。
+
+## 系統設定 → 一般 → 控制台公開網址
+
+管理員在這裡設定 `[dashboard] public_url`：外部連到控制台的完整網址，含反向代理子路徑，例如 `https://example.com/agents/`。必須使用 HTTPS；只有 `localhost`、`127.0.0.0/8` 或 `::1` 可用 HTTP。網址不可含帳號密碼、查詢字串（`?`）、片段（`#`）、`..` 或編碼後的 `/`、`\`。儲存時 gateway 會拒絕其他格式；若 `config.toml` 裡手動寫入了不合格的值，OAuth 連結會拒絕開始，直到修正為止（絕不會默默改用沒有子路徑的網址）。清空欄位即移除這個鍵。立即生效，每次改動都會寫入 `config_protected_key_changed`。
+
+設定 public_url 後，所有 OAuth 回呼與返回連結都會使用它，並保留子路徑：
+
+| 流程 | 服務商導回的回呼網址 | 完成後瀏覽器回到 |
+|---|---|---|
+| 遠端 MCP 伺服器（整合 → MCP → 遠端伺服器） | `<public_url>/oauth/mcp/callback`（動態用戶端註冊會自動登記） | `<public_url>/manage/integrations?tab=mcp&mcp_tab=remote` |
+| 個人 Google 帳號（我的連線） | `<public_url>/api/me/google/callback` | `<public_url>/me/connections` |
+| 內建 Google Workspace、GitHub、Notion、Slack OAuth | `<public_url>/api/mcp/oauth/callback` | 結果頁連回 `<public_url>/manage/integrations?tab=google`（Google）或 `?tab=mcp` |
+
+- **註冊新的回呼網址。** 設定或變更 public_url 後，請到每個使用中的 OAuth 應用程式加入新的回呼網址：Google Cloud Console → 憑證 → 你的 OAuth 用戶端 → 已授權的重新導向 URI；GitHub OAuth App 的 Authorization callback URL（GitHub OAuth App 只有一個回呼網址，請直接替換）。Notion 與 Slack 應用程式也一樣。整合頁會顯示要註冊的確切網址。已經進行中的連結會用開始時的網址完成。
+- 仍會先檢查瀏覽器本身的來源：只有在控制台以本機位址或 `[gateway] allowed_origins` 內的 https 來源開啟時才直接導回；否則照舊改走 `http://127.0.0.1:<port>/…` 的貼上返回網址流程（這個本機位址不加子路徑）。若控制台以 public_url 以外的允許來源開啟，仍會導回 public_url，gateway 只記錄一次警告。
+- 未設定 public_url 時行為不變：遠端 MCP 與個人 Google 回到瀏覽器來源（不含路徑），內建服務商使用 `http://localhost:<port>/api/mcp/oauth/callback`。
+- 反向代理：把 `<子路徑>/oauth/mcp/callback` 與 `<子路徑>/api/…` 去掉子路徑後轉給 gateway。
+- 限制：控制台網頁本身是為根路徑建置的，會載入 `/assets/…`、呼叫 `/api/…` 與 `/ws`，頁面路由也沒有基底路徑。因此放在子路徑下時，代理還必須把這些根路徑轉給 gateway，或改用獨立主機名稱。public_url 修正的是 OAuth 回呼與返回網址，不會讓控制台網頁本身支援子路徑。若頁面有同來源的 `<base href>`（例如由代理插入），控制台會在開始 OAuth 與邀請成員時附上該子路徑，gateway 仍會再次驗證。
 
 ## 系統設定 → 進階設定 → 自動化引擎
 
@@ -156,6 +190,13 @@ npm 未安裝或安裝失敗時，提示會提供完整的手動指令與複製�
 |---|---|---|
 | 全域背景工作 → 全域輔助後端／模型 | `[runtime] utility_provider`／`utility_model` | 立即生效（每次呼叫重新讀取） |
 | 一般 → 日誌格式 | `[logging] format`（`json`；其他值都是純文字） | 重啟 |
+| 一般 → AI 員工回覆語言（預設） | `[general] default_language`（`zh-TW`、`zh-CN`、`en`、`ja-JP`；留空或選「跟隨輸入語言」＝依使用者語言回覆）。固定所有 AI 員工的回覆語言，並在每一輪結尾加一行提醒，避免讀了大量其他語言的內容後偏離 | 下一則訊息 |
+| 編輯 AI 員工 → 基本 → 回覆語言 | 員工 `agent.toml` 的 `[prompt] reply_language`（`auto`、`zh-TW`、`zh-CN`、`en`、`ja-JP`；也可用 `agents.update` 的 `reply_language` 或 MCP `agent_update` 工具設定）。「沿用整體設定」會移除這個鍵並回到 `[general] default_language`；`auto` 讓這位員工依使用者語言回覆，即使整體已固定語言。其他值一律拒絕 | 下一則訊息 |
+
+回覆語言適用於通道回覆、交辦任務、排程、目標迴圈、子代理及 task sandbox 的系統提示詞。使用者明確要求其他語言時，以該要求為準。只有管理員能修改員工的 `reply_language`，員工不能自行編輯該鍵。RPC／MCP 拒絕選項以外的值；磁碟中既有的無效值會記錄警告並沿用整體設定。整體語言代碼必須符合 `^[A-Za-z]{2,3}([-_][A-Za-z0-9]{2,8}){0,2}$`；只有已辨識的中文、英文與日文代碼會產生提示詞指令或提醒。
+
+固定失敗訊息與操作機器的拒絕訊息支援繁中、簡中、英文與日文。員工選 `auto` 時，這些訊息因無法偵測使用者語言而沿用整體語言；整體未設定或不支援時使用繁中。其他系統通知（包含通道 `@` 路由通知）目前只支援繁中／英／日，選簡中時仍使用繁中。
+
 | 顯示名稱 | `[general] name` | 重啟（區網廣播在開機時建立） |
 | 帳號健康檢查間隔 | `[rotation] health_check_interval_seconds` | 重啟 |
 | 任務沙箱 → 沙箱映像、沙箱無法使用時（任務）、沙箱無法使用時（程式碼執行） | `[container.sandbox] image`、`when_unavailable`、`script_when_unavailable` | 立即（逐任務讀取） |
@@ -171,6 +212,21 @@ npm 未安裝或安裝失敗時，提示會提供完整的手動指令與複製�
 沒有指定員工的全域背景工作（例如選擇執行員工、建立遮罩規則）預設使用 Claude／`claude-haiku-4-5`。選擇支援的後端並填入相容模型；伺服器拒絕已移除的 `gemini` 與未知後端。清空模型會移除設定鍵：Claude 使用 `claude-haiku-4-5`，OpenAI 相容端點必須指定模型。Codex 也可用受限輔助模式執行，模型留白時使用 CLI 預設值。Grok 與通用 CLI 即使可儲存設定，執行時仍拒絕。非 Claude 後端填入已知其他廠商的模型時，頁面會顯示警告。儲存需要管理員權限，沿用既有設定寫入流程。所選全域後端為 Claude、且沒有員工使用 Claude 執行環境時，頁面會顯示警告；這不代表系統已檢查 Claude 登入狀態。
 
 `[general] log_level`（設定 → 進階 → 安全與紀錄 → 日誌等級）存檔後立即套用；只有在環境變數 `RUST_LOG` 已設定時無法套用，這時回報需要重啟。帳號輪替策略與限流冷卻時間存檔後會清掉輪替快取，下一次呼叫就用新設定（之前最多延遲 30 分鐘）。
+
+## 設定 → 進階 → 安全與紀錄 → 記憶：個人話題
+
+| 控制項 | 設定鍵 | 生效時機 |
+|---|---|---|
+| 自動記憶不記錄的內容（1.81 新功能）→ 健康／家庭／個人財務／薪資 | `[memory_privacy] excluded_categories`（`health`、`family`、`personal_finance`、`salary`） | 立即（每次寫入時讀取，下一則訊息就套用） |
+| 自動記憶不記錄的內容 → 自訂關鍵字（每個類別） | `[memory_privacy.custom_keywords]` | 立即 |
+
+四個開關預設全開，`config.toml` 沒有 `[memory_privacy]` 區段的既有安裝也一樣。開啟的類別，自動記憶一律不保存，包括對話蒸餾、個人偏好、數位足跡蒸餾、Reflexion 規則與 persona-induction 橋接。同仁明確要求 AI 員工記住的內容仍會保存。比對依關鍵字進行，所以提到這些話題的工作內容也可能被略過（例如「健康檢查報告模板」）。儲存需要管理員權限。這張卡片上的每個變更都會立即儲存（會顯示「已儲存」；閘道拒絕時，卡片會回到原本的狀態並顯示訊息），不屬於頁面底部「儲存」按鈕的範圍。想補上公司習慣的用語，展開類別下的「自訂關鍵字」，輸入後按「新增」；按關鍵字旁的 × 即可移除。`config.toml` 中設定的自訂類別會原樣保留。
+
+### 我的記憶（所有登入的使用者）
+
+**我的記憶**（側邊欄的「設定」群組，`/me/memory`；員工從帳號選單進入）列出 AI 員工記下、和目前登入者有關的內容。每一筆顯示內容、AI 員工、時間與來源標籤（對話、明確要求記住、其他）。可依來源或 AI 員工篩選，按「載入更多」查看較早的項目，並刪除不想被記住的內容：確認後，AI 員工不會再自動學回這筆內容；之後若你明確要求它記住，還是會重新記錄。篩選只針對已載入的項目，「已顯示 N 筆」是已載入的筆數。
+
+自訂類別與額外關鍵字在進階設定編輯器的 `[memory_privacy.custom_keywords]` 設定（例如 `legal_dispute = ["訴訟", "lawsuit"]`），再列入 `excluded_categories`。未知的類別名稱在儲存時會被拒絕。`config.toml` 讀不到或區段無效時，閘道會套用四個預設類別並記錄警告，`system.config` 會回報 `memory_privacy.load_state = "failed_closed"`。細節與「我的記憶」RPC 見[記憶智慧](../../features/zh-TW/20-memory-intelligence.md)中的「自動記憶不保存的個人話題」一節。
 
 ## 通道管理
 
@@ -241,9 +297,13 @@ WebChat 與儀表板 RPC 連線原本就由伺服器每 30 秒送出 WebSocket p
 
 ## 整合 → Odoo → 結構快照
 
-「**重新掃描 Odoo 結構**」呼叫 `odoo.schema_scan`，只有管理員可用，RPC 也會檢查相同角色。請先儲存連線設定；掃描使用已存的全域連線，不使用表單尚未儲存的值。畫面顯示上次掃描時間、掃描時伺服器版本、模型／欄位數、是否截斷、最近失敗及差異摘要。版本不同時建議重掃。不修改 Odoo 資料、權限或共享 Wiki。 手動掃描（含失敗）每個已存 profile 每 60 秒最多嘗試一次，重啟不重設；提早重試會顯示還要等幾秒。 兩個 dashboard 動作（`odoo.schema_scan`、`odoo.discover_schema`）共用此限速與掃描鎖。Wiki 流程寫入前會驗證名稱、篩查標籤，明示外部中繼資料只能當作資料參考，並保留技術名稱、欄位類型與關聯。
+「**重新掃描 Odoo 結構**」呼叫 `odoo.schema_scan`，只有管理員可用，RPC 也會檢查相同角色。請先儲存連線設定；掃描使用已存的全域連線及每位員工的有效設定，不使用表單尚未儲存的值。畫面顯示上次掃描時間、掃描時伺服器版本、模型／欄位數、是否截斷、最近失敗及差異摘要。版本不同時建議重掃。不修改 Odoo 資料、權限或共享 Wiki。 手動掃描（含失敗）每個已存 profile 每 60 秒最多嘗試一次，重啟不重設；提早重試會顯示還要等幾秒。 兩個 dashboard 動作（`odoo.schema_scan`、`odoo.discover_schema`）共用此限速與掃描鎖。Wiki 流程寫入前會驗證名稱、篩查標籤，明示外部中繼資料只能當作資料參考，並保留技術名稱、欄位類型與關聯。
 
-成功連線後，沒有快照或偵測到版本變更會在背景掃描，不拖延連線。每個有效 profile 每小時最多自動嘗試一次，失敗也計入。同版本的客製變更請用按鈕重新掃描。原本的「解析資料庫」仍是另一個寫入共享 Wiki 的流程。上限及儲存方式詳見[結構掃描](../../features/zh-TW/12-industry-templates.md#結構掃描與欄位相容)。
+重新掃描會涵蓋已儲存的全域連線，以及每位員工合併後的 `[odoo]` 設定與公司範圍。同一連線身分只掃描一次，同時最多掃描兩個連線；畫面逐一顯示各員工「已準備好」或失敗原因。不同 Odoo 使用者的快照各自隔離。兩個儀表板掃描動作共用持久保存的 60 秒手動冷卻時間。成功準備後，只有在所有有效身分都能確認時才清理過期快照資料；清理會持有目錄鎖再刪除閒置鎖檔，執行中的掃描與鎖檔都會保留。
+
+持有執行個體鎖的 gateway 啟動後，每 30 分鐘檢查所有有效連線；快照缺少、不完整、伺服器版本不同、已安裝模組名稱／版本變更或缺少權限中繼資料時，會在背景掃描。掃描成功或明確失敗後才計入每小時一次的自動掃描額度，中途取消不占額度。MCP 對話程序不啟動掃描；準備期間可先用 `odoo_schema_fields` 查詢單一資料表。版本與模組清單都沒變的純欄位客製，仍需手動重新掃描；已連線員工可用 `odoo_connect` 更新即時欄位快取。
+
+總覽不帶篩選時只列模型名稱與短標籤，上限 16 KiB；指定 `model` 或查詢只命中最多五個有權限的模型時才回傳欄位，上限 32 KiB。回應保留符合條件的模型總數及截斷標記。共享 Wiki 摘要上限 16 KiB；`odoo/schema-fields` 僅作為搜尋用的 `deep` 參考頁，上限 32 KiB，不會自動放入員工上下文。
 
 ## 整合 → Odoo → 員工權限
 
@@ -431,6 +491,18 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 
 磁碟上已經有較新的 gateway binary 但還沒執行時（npm 安裝、手動換檔、更新後沒重新啟動），按鈕會顯示「重新啟動 gateway 套用 v…」，呼叫 `system.restart_pending_update`（管理員）。gateway 只有在磁碟版本確實不同於執行中版本時才接受；容器與桌面 sidecar 由各自的擁有者重新啟動，這裡會拒絕。重開桌面 App 不會重啟外部 gateway。
 
+### macOS：DuDuClaw Gateway.app（v1.81.0）
+
+macOS 上的 gateway 改為已簽章的 App「DuDuClaw Gateway.app」（識別碼 `ai.duduclaw.gateway`，社群版與企業版相同）。macOS 會在更新後保留 App 的資料夾、自動化與完整磁碟取用權限，只要授權一次，不必每次發版都重新授權。App 安裝只會從發行版中已簽章的 `duduclaw-darwin-<arch>.app.zip` 更新。換上新版前，gateway 會比對簽章是否來自 DuDuClaw 開發者、是否符合目前已安裝 App 的簽章，並確認 App 的識別碼、版本與版別都和簽章的發行版一致。新版以原子方式換上並先執行一次（`version`）。任何一項檢查沒通過就不更新，已安裝的 App 維持原樣或換回。
+
+還在以單一執行檔（獨立安裝或 npm）執行的 gateway，可用三種方式移到 App：
+
+- 開啟自動更新、由登入服務（launchd）啟動時，v1.81 第一次啟動會自動移轉一次。
+- 這一頁的「移到 DuDuClaw Gateway.app」（`system.migrate_bundle`，管理員）。
+- 在終端機執行 `duduclaw service migrate-bundle`，再執行 `duduclaw service restart`。
+
+移轉會把 App 安裝到 `~/Applications/`（npm 安裝則放在 npm 平台套件內），並把原本的執行檔換成指向 App 的連結，現有指令照常可用。登入服務也會改為啟動 App，並從 App 重新啟動 gateway。之後 macOS 會針對新的 App 詢問一次資料夾存取權限，頁面會在移轉後提示一次。
+
 ## 思考過程顯示
 
 目前沒有專用控制項，請在下方的設定檔進階編輯修改。兩個檔案每輪都重新讀取，改完下一則回覆就生效。
@@ -565,7 +637,7 @@ Admin 可在「系統 → 安全 → 憑證稽核」查看中繼資料、篩選�
 mfa_enforced = true
 ```
 
-新的團隊安裝預設強制 MFA；既有安裝保留目前政策，尚無 MFA 政策紀錄的舊版也不會自動開啟。Admin 可在儀表板「使用者 → 雙因素登入管理」的專用開關啟用或停用強制。新團隊的第一位 Admin 以密碼登入後，需由主機操作員執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發註冊碼，再完成驗證器註冊；未設定 Email 寄信時，首次註冊無法只靠儀表板完成；已設定者可改用信箱驗證。既有未強制的安裝可繼續自願註冊，開啟前請查看 `mfa.overview`、確認通道送達並測試主機救援。兩種 dashboard 設定寫入都要求目前有效的 Admin。註冊及後續憑證變更透過帳號 epoch 作廢舊 JWT；單純切換強制則讓既有 access token 自然到期，拒絕未註冊者 refresh。強制時拒絕舊共用 token WebSocket 登入。
+新的團隊安裝預設強制 MFA；既有安裝保留目前政策，尚無 MFA 政策紀錄的舊版也不會自動開啟。Admin 可在儀表板「使用者 → 雙因素登入管理」的專用開關啟用或停用強制。新團隊的第一位 Admin 以密碼登入後，若 SMTP 或授權代寄可用，可改用信箱驗證完成首次註冊；若兩者皆不可用，須由主機操作員執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發註冊碼，再完成驗證器註冊，無法只靠儀表板完成。既有未強制的安裝可繼續自願註冊，開啟前請查看 `mfa.overview`、確認通道送達並測試主機救援。兩種 dashboard 設定寫入都要求目前有效的 Admin。註冊及後續憑證變更透過帳號 epoch 作廢舊 JWT；單純切換強制則讓既有 access token 自然到期，拒絕未註冊者 refresh。強制時拒絕舊共用 token WebSocket 登入。
 
 設定使用啟動時載入的記憶體快照；dashboard 寫入後更新，外部檔案每 30 秒重載。失敗時警告並保留最後有效值，任何版本從未載入有效值都拒絕；啟動時既有政策資料庫無法讀取或已損壞也會拒絕。缺少 `[auth]` 表格或設定鍵時保留資料庫中的政策；新團隊初始化會在設定檔及帳號資料庫明確記錄 true。所有版本都依儲存的政策強制驗證，授權過期、驗證失敗回退或指定 Personal 啟動都不會停用；只有 Admin 主動關閉才取消強制。沒有政策資料庫的全新 Personal 安裝仍預設不強制；本機自動登入不能略過已啟用的強制驗證。Personal 同樣可使用主機救援。證明欄位、工作階段綁定及 `duduclaw ops users mfa-reset`／`mfa-enrollment-code` 主機救援見[安全防禦](../../features/zh-TW/05-security-defense.md)。金鑰輪替不在本階段範圍。
 
@@ -579,7 +651,42 @@ CLI 家目錄匯入以同一份私有快照檢查並解壓縮，壓縮備份上�
 
 ### Email 驗證碼、通行金鑰與保持登入（v1.80.0 起）
 
-在「設定 → 帳號」可保留原有驗證器 App，再加入 Email 驗證碼或多把具名的通行金鑰（Passkey）。新增或移除前需輸入目前密碼。Email 設定會將六位數代碼寄到帳號信箱，驗證成功才啟用。管理員需先完成既有 `[channels.email]` SMTP 寄信設定（`smtp_host`、`from_addr`，以及寄信服務需要的帳密）；未設定可用的寄信服務時，介面會顯示無法使用。因素變更會留下稽核，已設定寄信時也會通知本人。
+在「設定 → 帳號」可保留原有驗證器 App，再加入 Email 驗證碼或多把具名的通行金鑰（Passkey）。新增或移除前需輸入目前密碼。Email 設定會將六位數代碼寄到帳號信箱，驗證成功才啟用。系統優先使用既有 `[channels.email]` SMTP 寄信設定（`smtp_host`、`from_addr`，以及寄信服務需要的帳密）。未設定 SMTP 時，已綁定本機且有效的付費授權可透過 DuDuClaw 代寄驗證碼；NFR 授權不適用，且須啟用下述代寄設定。因素變更會留下稽核；安全設定變更通知仍只使用已設定的 SMTP。
+
+#### Email 驗證碼代寄設定
+
+在 gateway 的 `config.toml` 設定：
+
+```toml
+[mfa]
+email_relay = true
+```
+
+`email_relay` 預設為 `true`。設為 `false` 只停用授權代寄，不會停用自有 SMTP，也不會關閉兩步驟驗證強制政策。OpenSource、Hobby 試用版、Partner、NFR、未綁定機器的 OEM、無效或過期授權都不能代寄，請設定 SMTP。Partner 即使是標示 `nfr = false` 的舊授權，也不提供代寄。代寄使用編譯時固定的官方主機，與授權更新設定分開；`DUDUCLAW_CONTROL_URL`、授權中的 `control_url`、設定檔及環境變數都不能變更代寄目的地。專用傳輸只使用 HTTPS 443、釘選公開 DNS 解析結果、禁用 proxy 與重新導向，逾時為 10 秒，回應上限為 4 KiB。
+
+第一次符合資格的寄送會以挑戰－回應方式註冊：gateway 先為所屬訂閱取得一次性 challenge，再送出簽章授權、機器指紋、challenge 與簽發時間，並附上安裝金鑰（見下節）的 Ed25519 簽章；安裝識別碼由伺服器依核准的公鑰推導。註冊會取代既有代寄憑證時，請求另以同一份簽章內容的 HMAC 證明持有該憑證。回應內容存放在固定容量、釋放時清零的緩衝區；HTTP 與 TLS 函式庫內部的副本無法清除。憑證存於 `<home>/state/mfa-relay.json`，僅限擁有者存取：Unix 使用 0600 權限，macOS 另拒絕擴充 ACL；Windows 使用私有 DACL 與釘選控制代碼。寫入透過釘選目錄控制代碼、拒絕符號連結，再以原子改名發布。後續寄送只包含收件信箱、驗證碼與語言，HMAC 簽章綁定方法、路徑、時間、nonce 及實際請求內容，不會再次傳送授權。所有註冊嘗試共用持久保存的每小時一次上限，初次註冊失敗也計入，重啟 gateway 不會重設額度。收到 `403 relay_not_allowed` 時，若額度允許，該次寄送最多重新註冊並重送一次。每份訂閱只保留一組有效代寄憑證，且只有帳號擁有者核准其金鑰的安裝能註冊。
+
+#### 安裝金鑰與授權控制台核准
+
+每個安裝都有自己的 Ed25519 金鑰，存於 `<home>/state/installation.key`（32 bytes 種子，與代寄憑證相同的僅限擁有者存取保護），與 `identity.key` 分開。只有檔案不存在時才會建立：執行 `duduclaw license activate`、授權更新（gateway 自動更新或 `duduclaw license refresh`），或執行 `duduclaw license installation-key` 時。無法讀取、格式錯誤或不安全的檔案（擁有者或權限不符、符號連結、多重硬連結、擴充 ACL）只會回報錯誤，絕不覆寫；修正或還原前代寄維持不可用。AI 員工無法透過檔案守門讀取 `state/` 下的任何檔案。備份資料目錄時請一併保留此金鑰。
+
+授權更新與換綁請求會以 `installation_pubkey` 送出公鑰。授權內含相同的已簽章公鑰後才能代寄。授權服務未見過的金鑰會在授權控制台建立待核准申請，並通知帳號擁有者。等待核准期間付費功能照常運作，SMTP 也仍可寄送驗證碼，只有代寄需要等待。每個既有安裝都要核准一次。
+
+核准前請比對金鑰指紋。在 gateway 主機執行：
+
+```bash
+duduclaw license installation-key
+```
+
+第一行是 16 字元指紋，例如 `1a2b-3c4d-5e6f-7a8b`：對 32 bytes 原始公鑰計算 SHA-256 後取前 16 個十六進位字元，每 4 個一組。公鑰與核准狀態等詳細資訊輸出到 stderr。等待核准期間，管理員也會在「設定 → 帳號」的 Email 說明下方看到此指紋。只有控制台顯示的指紋相同時才核准；不認得的申請代表有人持有授權檔副本，請拒絕。
+
+金鑰遺失時（例如換機但沒有帶走資料目錄），下一次授權更新會產生新金鑰並重新申請核准。已登入的帳號擁有者可在控制台預先授權一個指紋，24 小時內相同指紋的更新會自動核准。若只遺失代寄憑證，可在控制台使用「重設代寄憑證」，下一次註冊視為首次註冊。
+
+等待核准時，Email 說明會顯示此安裝正等待核准（授權尚未含金鑰），或此安裝的金鑰與核准的金鑰不同（例如還原到另一台機器）。
+
+代寄僅使用固定驗證碼信件，不能自訂主旨或內文。驗證碼與代寄秘密不寫入日誌；gateway 的收件者紀錄使用既有每個資料目錄專屬的稽核金鑰，以獨立用途標記計算 HMAC，無法取得金鑰時只記錄固定值 `unavailable`。控制平面另有寄送額度；看到「寄送太頻繁，請稍後再試」時請等待，其他寄送失敗可稍後再試或聯絡管理員。已在本機簽發的驗證碼，即使之後寄送服務不可用，仍可驗證。代寄的可用資格不保證信件已送達，實際代寄仍須另行驗收。
+
+Email 選項停用時，介面會說明沒有可用寄信方式、代寄已關閉、此授權類型不提供代寄（NFR 或未綁定的 OEM），或安裝金鑰正等待授權控制台核准，並提示管理員在此之前先設定 SMTP。通行金鑰停用時，介面會區分非安全連線與瀏覽器不支援：以 `http://` 區網位址開啟者，請改用設定好的 HTTPS 網址或在 gateway 主機使用 localhost；瀏覽器不支援者，請改用支援通行金鑰的瀏覽器。
 
 各選項需要的條件：
 
@@ -609,7 +716,7 @@ CLI 家目錄匯入以同一份私有快照檢查並解壓縮，壓縮備份上�
 
 長期憑證不放入 localStorage，JavaScript 也無法讀取：Cookie 使用 HttpOnly、SameSite=Strict，範圍限定 `/api/session`，HTTPS 下加上 Secure。伺服器只保存雜湊，每次使用就輪替；舊憑證重用會撤銷整個憑證家族。Cookie 端點會檢查 Origin，儀表板 WebSocket 升級也會檢查 Origin。
 
-實際 SMTP 送達、各平台瀏覽器的通行金鑰註冊與登入、跨平台 Rust 建置、依賴稽核及完整 gateway 整合測試仍待驗收；介面程式與已撰寫測試不代表上述項目已通過。
+實際 SMTP／授權代寄送達、各平台瀏覽器的通行金鑰註冊與登入、跨平台 Rust 建置、依賴稽核及完整 gateway 整合測試仍待驗收；介面程式與已撰寫測試不代表上述項目已通過。
 
 ### 儀表板雙因素登入
 

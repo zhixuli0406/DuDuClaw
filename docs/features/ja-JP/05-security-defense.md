@@ -32,6 +32,31 @@ I1d の開発実装には、Chat Completions・Responses・Anthropic・Gemini �
 
 管理者以外のメンバー（Employee、Manager）は、サイドバー、会話フィルター、コマンドパレット、WebChat の `@` 候補、その他のスタッフ選択欄で、`agents.callable` が選択可能と明示したスタッフだけを表示します。メイン AI は、その応答が明示的に選択を許可した場合を除き表示しません。全一覧は、`agents.callable` が現在の Admin 権限に基づいて `unrestricted: true` を返した場合のみ表示します。Personal のローカル管理者も含みます。初回読み込み中や取得失敗時は、すべてのアカウントで空になります。ページ表示中は 60 秒ごと、再表示時、および選択メニューを開く際に権限を更新します。更新中は同じユーザーの確認済み一覧を保持し、失敗した場合は消去します。ファイルと設定の選択欄には直接のアクセス権も必要で、チームの呼び出し権はファイルや設定の権限を追加しません。新しい会話は引き続きサーバーが担当を決定します。この dashboard の表示制限は RPC の認可を変更しません。
 
+## `code_map` は社員自身のディレクトリだけを走査（v1.81）
+
+v1.81 より前の `code_map` は、MCP サーバーが読めるあらゆるディレクトリ（既定は作業ディレクトリ）を走査できたため、呼び出し元はホスト上のどこのソースでもマップを作り、シグネチャを読めました。現在は次のとおりです。
+
+- 呼べるのは識別できた AI 社員だけです。共有の内部キーには `DUDUCLAW_AGENT_ID`、社員専用キーには対応する `agents/<id>/agent.toml` が必要です。外部キー、管理者キー、スコープだけを持つ単体モードのキーは説明付きで拒否されます。`code_map` は「社員として動くツール」にも加わり、これらの呼び出し元の `tools/list` には表示されません（単体モードの一覧は 24 から 23 ツールになります）。
+- `root` の既定は社員自身のディレクトリで、相対パスもそこから解決します。`..` は拒否します。解決後のディレクトリは、データファイル系ツールと同じルート（`<home>/agents/<id>`、その `attachments`、`<home>/attachments`、`config.toml [files] allowed_roots`）の内側でなければなりません。
+- 各ファイルは、検査済みのルートからファイルディスクリプタで 1 階層ずつ（各階層 `O_NOFOLLOW`）開いて読みます。シンボリックリンク、通常ファイル以外、ハードリンク数が 2 以上のファイル、サイズ上限を超えるファイルは飛ばし、内容は検査したその記述子から読みます。走査はマウントをまたぎません。各階層の `st_dev` が一致する必要があり、Linux ではカーネルのマウント id も比較するため、同じファイルシステム上の別ディレクトリの bind mount（`st_dev` が同じ）も拒否します。Linux はカーネルが対応していれば `openat2`（`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`）を使い、常に `statx` の `STATX_MNT_ID`（または `/proc/self/fdinfo` の `mnt_id`）を比較します。どちらからもマウント id が得られない場合は走査を拒否します。macOS は `st_dev` と各階層のリンク非追従オープンに依存し、Windows はすべての reparse point（シンボリックリンク、ジャンクション、ボリュームマウントポイント）と多重リンクのファイルを拒否します。
+- 拒否のたびに `tool_calls.jsonl` に 1 行（`refused: true`、要求されたルートと理由）を書き、それ以外は記録しません。
+
+## 社員を作成できるのは誰か（v1.81）
+
+`[permissions] can_create_agents` の既定が `true` になるのは `main` 社員だけになりました。それ以外のロール、およびロールを識別できない社員では、キーがなければ `false` です。MCP の権限ゲートは `create_agent` と `spawn_ephemeral` にこの実効値を適用するため、キーを書いたことのない main 以外の社員はもう社員を作成できません。明示した設定は `true`・`false` のどちらでも優先されます。
+
+- 新しい社員：ダッシュボードと `duduclaw agent create` は `role = "main"` のときだけ `true` を書きます。evaluator テンプレートと有料チームキットは main 以外のすべてのロールに `false` を書きます。
+- 社員が MCP `create_agent` で作成した社員は常に `can_create_agents = false` です。そこで `role = "main"` の社員を作れるのは、`can_create_agents` が有効な現在の main 社員だけで、それ以外の呼び出し元は何も書き込む前に拒否されます。
+- v1.68 の起動時マイグレーションは、main 以外の社員の `can_create_agents = false` を `true` に変えなくなりました。
+- `agents.update` の管理者専用フィールド検査も同じ実効値を比較するため、管理者でない Owner が、キーのない main 以外の社員に `true` を書いて作成権限を有効にすることはできなくなりました。
+
+**動作の変更：** `agent.toml` に `can_create_agents` キーがない main 以外の社員は、v1.81 より前は社員を作成できましたが、現在は拒否されます。維持するには、管理者がダッシュボードの「工具與權限」で有効にしてください。
+
+## チーム委任は社員の制限を引き継ぐ（v1.81）
+
+- **プランナーのパケットの `tool_scope` は実行役のツールを狭めるだけです。** 空でない `allowed` は実行役をそのツール（と `team_handoff`）に限定します。社員が持たないツールを 1 つでも挙げると、その委任は拒否され、Warning レベルの `team_tool_scope_escalation` 監査行が書かれます。`denied` は実行役のツールから除かれ、メンバーの `denied_tools` に追加されます。役割メンバー（と通常の一時ヘルパー）は社員の `approval_required_tools`、`irreversible_tools`、`maybe_irreversible_tools`、`action_rules`、`policy`、`egress_guard`、`scoped_tools` も引き継ぎ、社員と同じ承認を受けます。`grant_ttl_secs` は引き継ぎません。社員の長い期限がメンバーの許可を延ばしてしまうためです。
+- **引き継いだ承認設定がチームの引き継ぎを止めることはありません。** 役割メンバーについて、MCP ゲートは `team_handoff` に限り、引き継いだ `action_rules`、`policy`、承認リスト、`scoped_tools` の許可要件を適用しません（`ephemeral::is_role_member_intrinsic_call`。完全な `[team_member]` レコードが必要で、その parent が `ephemeral.toml` と一致すること）。`scoped_tools` はワイルドカードを含めて完全にコピーするため、ワイルドカードが対象とする他のツールには引き続き許可が必要です。`allowed_tools`、明示的な `denied_tools`、`[permissions]`、外部送信ガードは引き続き適用されます。
+
 ## 顧客の会社情報（v1.80.0）
 
 会社名とロゴは署名検証済みの販売代理店ブランドから分離されています。`company.get` と `company.update` は明示的な管理者 RPC です。`company.update` は名前と任意のロゴ削除だけを受け付け、旧 `logo_base64` フィールドを拒否します。会社名では制御文字、行区切り文字、Unicode 書式文字（`Cf`、双方向上書き・分離制御文字を含む）を拒否します。更新時は既存の設定書き込みロック内でも現在の本人情報を再確認します。`company_info` 監査は実行者、メソッド、結果を記録し、画像と会社名は含みません。詳細設定のナビゲーションとルートも管理者専用で、移動した設定の RPC 権限は緩和しません。

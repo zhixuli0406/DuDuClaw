@@ -140,6 +140,9 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("odoo_search", "limit", "integer"),
     ("odoo_report", "record_id", "integer"),
     ("odoo_partner_search", "limit", "integer"),
+    ("odoo_create", "values", "object"),
+    ("odoo_write", "ids", "array"),
+    ("odoo_write", "values", "object"),
     ("group_history_read", "limit", "integer"),
     ("group_history_read", "before", "integer"),
     ("tasks_create", "cost_cap_cents", "integer"),
@@ -198,7 +201,9 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
         let ty = param_type(tool.name, param.name);
         let mut prop = serde_json::json!({ "type": ty, "description": param.description });
         if ty == "array" {
-            prop["items"] = serde_json::json!({ "type": "string" });
+            // Record-id lists are integers; every other array holds strings.
+            let item = if (tool.name, param.name) == ("odoo_write", "ids") { "integer" } else { "string" };
+            prop["items"] = serde_json::json!({ "type": item });
         }
         properties.insert(param.name.to_string(), prop);
         if param.required {
@@ -292,7 +297,7 @@ mod registration_tests {
                 "{tool}.{param} does not exist"
             );
             assert!(
-                matches!(*ty, "integer" | "boolean" | "number" | "array"),
+                matches!(*ty, "integer" | "boolean" | "number" | "array" | "object"),
                 "{tool}.{param}: {ty}"
             );
         }

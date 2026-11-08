@@ -169,6 +169,8 @@ pub(crate) fn apply_agent_v168_keys(table: &mut toml::Table, params: &Value, is_
 pub(crate) const KV_DENIED_SECTIONS: &[&str] = &[
     "agent", "capabilities", "container", "permissions", "channels", "odoo", "mcp", "runtime", "prompt",
     "os_watch", "budget",
+    // Protected-mode switches (`public_web`): admin-only, config file only.
+    "isolation",
 ];
 
 /// Sections with no reader (v1.68 audit): writing them changes nothing.
@@ -382,8 +384,19 @@ const ENFORCED_PERMISSION_KEYS: &[&str] =
 /// text and the keys reset, or `None` when the file needs nothing (marker
 /// present / no `[permissions]` table). Formatting is preserved. `Err` on a
 /// file that does not parse — the caller leaves it alone.
+///
+/// v1.81 (S2): `can_create_agents = false` is reset only for the `main`
+/// role. On any other role (or no role) `false` is exactly the v1.81 default
+/// (`agent_toml::default_can_create_agents`), so it is left alone — the
+/// migration never turns a non-main employee into one that creates employees.
 pub(crate) fn migrate_permission_flags(text: &str) -> Result<Option<(String, Vec<String>)>, String> {
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
+    let role = doc
+        .get("agent")
+        .and_then(|a| a.get("role"))
+        .and_then(|r| r.as_str())
+        .map(str::to_string);
+    let main_may_create = duduclaw_core::agent_toml::default_can_create_agents(role.as_deref());
     let Some(perms) = doc.get_mut("permissions").and_then(|i| i.as_table_like_mut()) else {
         return Ok(None);
     };
@@ -392,6 +405,9 @@ pub(crate) fn migrate_permission_flags(text: &str) -> Result<Option<(String, Vec
     }
     let mut reset = Vec::new();
     for key in ENFORCED_PERMISSION_KEYS {
+        if *key == "can_create_agents" && !main_may_create {
+            continue;
+        }
         if perms.get(key).and_then(|i| i.as_bool()) == Some(false) {
             if let Some(toml_edit::Item::Value(v)) = perms.get_mut(key) {
                 let decor = v.decor().clone();
@@ -649,9 +665,25 @@ skill_security_scan = true
         assert_eq!(strip_userinfo("https://u:p@erp.example.com/odoo?x=1"), "https://erp.example.com/odoo?x=1");
     }
 
+    /// v1.81 (S2): on a non-main (or role-less) employee the migration keeps
+    /// `can_create_agents = false` and still resets the other three.
+    #[test]
+    fn permission_migration_never_enables_creation_for_non_main() {
+        let body = "[permissions]\ncan_create_agents = false\ncan_send_cross_agent = false\ncan_modify_own_skills = false\ncan_schedule_tasks = false\n";
+        for agent in ["", "[agent]\nrole = \"specialist\"\n", "[agent]\nrole = \"worker\"\n", "[agent]\nrole = \"bogus\"\n"] {
+            let (out, reset) = migrate_permission_flags(&format!("{agent}{body}")).unwrap().unwrap();
+            assert!(!reset.iter().any(|k| k == "can_create_agents"), "{agent:?}: {reset:?}");
+            assert_eq!(reset.len(), 3, "{agent:?}");
+            let t: toml::Table = out.parse().unwrap();
+            assert_eq!(t["permissions"]["can_create_agents"].as_bool(), Some(false), "{agent:?}");
+            assert_eq!(t["permissions"]["can_schedule_tasks"].as_bool(), Some(true), "{agent:?}");
+            assert_eq!(t["permissions"][PERMISSIONS_MARKER_KEY].as_str(), Some("1.68.0"));
+        }
+    }
+
     #[test]
     fn permission_migration_resets_false_once() {
-        let text = "[permissions]\ncan_create_agents = false # note\ncan_send_cross_agent = false\ncan_modify_own_skills = false\ncan_schedule_tasks = false\ncan_modify_own_soul = false\n";
+        let text = "[agent]\nrole = \"main\"\n[permissions]\ncan_create_agents = false # note\ncan_send_cross_agent = false\ncan_modify_own_skills = false\ncan_schedule_tasks = false\ncan_modify_own_soul = false\n";
         let (out, reset) = migrate_permission_flags(text).unwrap().unwrap();
         assert_eq!(reset.len(), 4);
         let t: toml::Table = out.parse().unwrap();

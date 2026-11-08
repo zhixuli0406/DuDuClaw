@@ -126,6 +126,86 @@ fn create_task_boundary_pins_the_record_task() {
     }
 }
 
+// H9 owner decision 3: interactive `create_task` through the signed NewTask grant.
+fn new_task(requester: &str) -> ResourceGrant { ResourceGrant::NewTask { requester: text(requester) } }
+fn interactive(resources: Vec<ResourceGrant>) -> RequestContext { context("create_task", resources) }
+
+#[test]
+fn create_task_interactive_refuses_parent_and_goal_args() {
+    let own = new_task("owner");
+    let ctx = interactive(vec![scope(), employee(), own.clone()]);
+    assert!(ctx.record().canonical_bytes().is_ok(), "an interactive employee-scope record is signable");
+    assert!(eligible(&ctx, "create_task"));
+    assert_eq!(new_task_grant(&ctx).unwrap(), own);
+    let resolver = Fixed(vec![employee(), own.clone()]);
+    let args = json!({"goal":"g", "steps":[{"description":"s", "depends_on":[0]}]});
+    let call = authorize(&ctx, "create_task", &args, &resolver).unwrap();
+    assert_eq!(call.resources(), &[employee(), own.clone()], "exactly the employee and the new-task grant");
+    // A plan in the JSON-string form the handler also accepts.
+    assert!(authorize(&ctx, "create_task", &json!({"goal":"g", "steps":"[{\"description\":\"s\"}]"}), &resolver).is_ok());
+    // Selecting an existing task, goal or dependency is refused, even null.
+    for key in TASK_SELECTOR_KEYS {
+        for value in [json!("task-a"), json!(["task-a"]), Value::Null] {
+            let mut forged = args.clone();
+            forged[key] = value.clone();
+            assert!(authorize(&ctx, "create_task", &forged, &resolver).is_err(), "{key}={value}");
+        }
+    }
+    // Only the plan itself: no assignee, creator or other extra field.
+    for key in ["assigned_to", "assignee", "created_by", "creator", "on_behalf_of", "requester", "audience", "owner",
+        "schedule", "priority"] {
+        let mut forged = args.clone();
+        forged[key] = json!("someone");
+        assert!(authorize(&ctx, "create_task", &forged, &resolver).is_err(), "{key}");
+    }
+    // Steps keep the existing step schema; no hidden parent/assignee per step.
+    for step in [json!({"description":"s", "parent_task_id":"task-a"}), json!({"description":"s", "assigned_to":"other"}),
+        json!({"description":"s", "agent_id":"other"}), json!("not an object")] {
+        assert!(authorize(&ctx, "create_task", &json!({"goal":"g", "steps":[step]}), &resolver).is_err(), "{step}");
+    }
+    for plan in [json!({"goal":"g"}), json!({"goal":"", "steps":[{"description":"s"}]}), json!({"goal":"g", "steps":[]}),
+        json!({"goal":"g", "steps":{"description":"s"}})] {
+        assert!(authorize(&ctx, "create_task", &plan, &resolver).is_err(), "{plan}");
+    }
+    // The resolver can neither add a record task nor drop or swap the grant.
+    for resources in [vec![employee()], vec![own.clone()], vec![employee(), own.clone(), ResourceGrant::Task { id: text("task-a") }],
+        vec![employee(), new_task("other")], vec![employee(), ResourceGrant::Task { id: text("task-a") }]] {
+        assert!(authorize(&ctx, "create_task", &args, &Fixed(resources)).is_err());
+    }
+    // Without the grant (or with one for another person) nothing is listed.
+    for resources in [vec![scope(), employee()], vec![scope(), employee(), new_task("other")]] {
+        let ctx = interactive(resources);
+        assert!(!eligible(&ctx, "create_task"));
+        assert!(authorize(&ctx, "create_task", &args, &resolver).is_err());
+    }
+}
+
+#[test]
+fn create_task_background_principal_refused() {
+    // The record of a Background principal (no human requester) carrying a
+    // NewTask grant is refused by decode and signing alike…
+    let mut record = interactive(vec![scope(), employee(), new_task("owner")]).record().clone();
+    record.principal = Principal::Background { tenant_id: text("owner"), generation: 1 };
+    record.employee_binding = EmployeeBinding::Shared(text("owner"));
+    assert!(record.canonical_bytes().is_err());
+    assert!(serde_json::from_value::<CapabilityRecord>(serde_json::to_value(&record).unwrap()).is_err());
+    // …and the boundary neither lists nor authorizes it.
+    let ctx = RequestContext::from_verified_record(record);
+    assert!(new_task_grant(&ctx).is_err());
+    assert!(!eligible(&ctx, "create_task"));
+    let args = json!({"goal":"g", "steps":[{"description":"s"}]});
+    assert!(authorize(&ctx, "create_task", &args, &Fixed(vec![employee(), new_task("owner")])).is_err());
+    // A confined or task-limited NewTask grant is not authority either.
+    let mut record = interactive(vec![scope(), employee(),
+        ResourceGrant::Confined { resource: Box::new(new_task("owner")) }]).record().clone();
+    assert!(record.canonical_bytes().is_err());
+    assert!(!eligible(&RequestContext::from_verified_record(record.clone()), "create_task"));
+    record.resources = List::new(vec![employee(), new_task("owner")]).unwrap();
+    record.task = Some(text("task-a"));
+    assert!(record.canonical_bytes().is_err());
+    assert!(!eligible(&RequestContext::from_verified_record(record), "create_task"));
+}
+
 #[test]
 fn file_resources_preserve_workspace_only_and_reject_escape() {
     let resources = vec![ResourceGrant::Workspace { handle: text("work") }];
@@ -385,10 +465,15 @@ fn i1c_source_proposals_are_host_control_and_skill_extraction_requires_own_wiki_
     for tool in ["skill_extract"] {
         assert_eq!(policy(tool).unwrap().route, Route::Worker, "{tool}");
     }
-    let without_wiki = vec![employee(), ResourceGrant::Workspace { handle: text("work") }];
+    let wiki = ResourceGrant::Wiki { namespace: text("agent:alice") };
+    let without_wiki = vec![scope(), employee()];
     assert!(!eligible(&context("skill_extract", without_wiki), "skill_extract"));
-    let with_wiki = vec![employee(), ResourceGrant::Workspace { handle: text("work") }, ResourceGrant::Wiki { namespace: text("agent:alice") }];
+    let with_wiki = vec![scope(), employee(), ResourceGrant::Confined { resource: Box::new(wiki.clone()) }];
     assert!(eligible(&context("skill_extract", with_wiki), "skill_extract"));
+    // H12a: a finite (task-limited) record without EmployeeScope never lists it,
+    // and a workspace grant is no longer the authority for skill files.
+    let finite = vec![employee(), ResourceGrant::Workspace { handle: text("work") }, wiki];
+    assert!(!eligible(&context("skill_extract", finite), "skill_extract"));
 }
 
 #[test]
@@ -410,10 +495,14 @@ fn source_and_skill_producers_require_finite_wiki_authority_in_employee_scope() 
         let confined = context(name, confined);
         confined.record().canonical_bytes().unwrap();
         assert!(eligible(&confined, name));
-        let selected = vec![employee(), base[2].clone(), wiki.clone()];
-        assert!(authorize(&confined, name, &json!({}), &Fixed(selected.clone())).is_ok());
-        assert!(authorize(&missing, name, &json!({}), &Fixed(selected)).is_err());
-        assert!(authorize(&confined, name, &json!({}), &Fixed(vec![employee(), base[2].clone(),
+        // H12a: skill_extract selects exactly its own employee + own wiki and
+        // takes its skill name; knowledge_add_source keeps its workspace input.
+        let (selected, args) = if name == "skill_extract" {
+            (vec![employee(), wiki.clone()], json!({"skill_name":"notes"}))
+        } else { (vec![employee(), base[2].clone(), wiki.clone()], json!({})) };
+        assert!(authorize(&confined, name, &args, &Fixed(selected.clone())).is_ok());
+        assert!(authorize(&missing, name, &args, &Fixed(selected)).is_err());
+        assert!(authorize(&confined, name, &args, &Fixed(vec![employee(), base[2].clone(),
             ResourceGrant::Wiki { namespace: text("agent:other") }])).is_err());
     }
 }
@@ -496,12 +585,91 @@ fn public_origins_wildcard_still_refuses_ip_literal_userinfo_and_private_names()
 
 #[test]
 fn i1c_curator_run_flag_is_data_and_keeps_finite_grants() {
-    let resources = vec![employee(), ResourceGrant::Workspace { handle: text("work") }];
-    let ctx = context("skill_curator_status", resources.clone());
+    // H12a: the curator is an own-employee service under EmployeeScope; the
+    // selection is exactly the record's own Employee grant.
+    let ctx = context("skill_curator_status", vec![scope(), employee()]);
     for args in [json!({}), json!({"run":true}), json!({"run":false})] {
-        assert!(authorize(&ctx, "skill_curator_status", &args, &Fixed(resources.clone())).is_ok());
+        let call = authorize(&ctx, "skill_curator_status", &args, &Fixed(vec![employee()])).unwrap();
+        assert_eq!(call.resources(), &[employee()]);
     }
-    for args in [json!({"run":"true"}), json!({"run":null}), json!({"agent_id":"other"})] {
-        assert!(authorize(&ctx, "skill_curator_status", &args, &Fixed(resources.clone())).is_err());
+    for args in [json!({"run":"true"}), json!({"run":null}), json!({"agent_id":"other"}),
+        json!({"scope":"agent:bob"}), json!({"run":true,"employee_id":"x"})] {
+        assert!(authorize(&ctx, "skill_curator_status", &args, &Fixed(vec![employee()])).is_err());
+    }
+    // A resolver cannot widen the selection to a workspace or another employee.
+    for resources in [vec![employee(), ResourceGrant::Workspace { handle: text("work") }],
+        vec![ResourceGrant::Employee { id: EmployeeId([7; 16]) }], vec![]] {
+        assert!(authorize(&ctx, "skill_curator_status", &json!({"run":true}), &Fixed(resources)).is_err());
+    }
+    // Finite grants without EmployeeScope no longer reach the curator.
+    let finite = context("skill_curator_status", vec![employee(), ResourceGrant::Workspace { handle: text("work") }]);
+    assert!(!eligible(&finite, "skill_curator_status"));
+    assert!(authorize(&finite, "skill_curator_status", &json!({}), &Fixed(vec![employee()])).is_err());
+}
+
+// ── H12a own-skill tools ───────────────────────────────────────────────────
+fn own_wiki(namespace: &str) -> ResourceGrant {
+    ResourceGrant::Confined { resource: Box::new(ResourceGrant::Wiki { namespace: text(namespace) }) }
+}
+
+#[test]
+fn h12a_identity_never_from_args() {
+    // The record's own employee is the only identity; arguments are data.
+    for tool in OWN_SKILL_TOOLS {
+        let ctx = context(tool, vec![scope(), employee(), own_wiki("agent:alice")]);
+        ctx.record().canonical_bytes().unwrap();
+        assert!(eligible(&ctx, tool), "{tool}");
+        let selection = if *tool == "skill_extract" {
+            vec![employee(), ResourceGrant::Wiki { namespace: text("agent:alice") }]
+        } else { vec![employee()] };
+        let good = if *tool == "skill_curator_status" { json!({"run":true}) } else { json!({"skill_name":"notes"}) };
+        let call = authorize(&ctx, tool, &good, &Fixed(selection.clone())).unwrap_or_else(|_| panic!("{tool}"));
+        assert!(call.resources().contains(&employee()), "{tool}");
+        let mut forged = Vec::new();
+        for key in ["employee_id", "principal", "run_id", "root", "cwd", "agent", "target_agent",
+            "target_employee", "scope", "namespace", "workspace", "path", "recipient"] {
+            let mut args = good.clone();
+            args[key] = json!("bob");
+            forged.push(args);
+        }
+        // An identity value in the legacy agent_id slot is shape-checked here and
+        // must equal the bound employee in the producer; traversal never passes.
+        let mut traversal = good.clone();
+        traversal["agent_id"] = json!("../bob");
+        forged.push(traversal);
+        forged.push(json!([]));
+        for args in forged {
+            assert!(authorize(&ctx, tool, &args, &Fixed(selection.clone())).is_err(), "{tool} {args}");
+        }
+        // Another employee's grant can never be selected for this record.
+        let other = ResourceGrant::Employee { id: EmployeeId([7; 16]) };
+        assert!(authorize(&ctx, tool, &good, &Fixed(vec![other])).is_err(), "{tool}");
+        // A record of another employee (wrong own grant) is not eligible.
+        let foreign = context(tool, vec![scope(), ResourceGrant::Employee { id: EmployeeId([7; 16]) }, own_wiki("agent:alice")]);
+        assert!(!eligible(&foreign, tool), "{tool}");
+    }
+    for tool in ["skill_security_scan", "skill_graduate", "skill_extract"] {
+        assert!(check_own_skill_arguments(tool, &json!({"skill_name":"notes","agent_id":"alice"})).is_ok());
+    }
+    assert!(check_own_skill_arguments("shared_skill_adopt", &json!({"skill_name":"notes","target_agent":"alice"})).is_err());
+    assert!(check_own_skill_arguments("shared_skill_adopt", &json!({"skill_name":"notes","agent_id":"alice"})).is_err());
+    assert!(check_own_skill_arguments("skill_security_scan", &json!({"skill_name":"../notes"})).is_err());
+    assert!(check_own_skill_arguments("skill_security_scan", &json!({})).is_err());
+}
+
+#[test]
+fn h12a_skill_extract_requires_exactly_one_own_namespace_wiki() {
+    let name = "skill_extract";
+    let ctx = context(name, vec![scope(), employee(), own_wiki("agent:alice")]);
+    let wiki = ResourceGrant::Wiki { namespace: text("agent:alice") };
+    assert!(authorize(&ctx, name, &json!({"skill_name":"notes"}), &Fixed(vec![employee(), wiki.clone()])).is_ok());
+    // Never the shared namespace, never an extra workspace or recipient.
+    for selection in [vec![employee()], vec![employee(), wiki.clone(), ResourceGrant::Workspace { handle: text("work") }],
+        vec![employee(), ResourceGrant::Wiki { namespace: text("shared") }]] {
+        assert!(authorize(&ctx, name, &json!({"skill_name":"notes"}), &Fixed(selection)).is_err());
+    }
+    for resources in [vec![scope(), employee(), own_wiki("shared")],
+        vec![scope(), employee(), own_wiki("agent:alice"), own_wiki("agent:bob")]] {
+        assert!(!eligible(&context(name, resources), name));
     }
 }

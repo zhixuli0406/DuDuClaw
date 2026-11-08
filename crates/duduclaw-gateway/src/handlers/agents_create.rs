@@ -162,43 +162,44 @@ impl MethodHandler {
         let agents_dir = self.registry.read().await.agents_dir().to_path_buf();
         let agent_dir = agents_dir.join(name);
 
-        // Atomic directory claim: `create_dir` (not `create_dir_all`) fails on
-        // AlreadyExists, so two concurrent creates can't both win the name.
+        // RM-027 round 4: the global org lock is taken at the START of the
+        // creation and held to its publish. The directory is built off to
+        // the side (`StagedAgentDir`, a dot-prefixed sibling nobody scans)
+        // and only renamed into place after its authority row committed —
+        // so while this waits for the lock nothing is visible, and an
+        // authority refusal (corrupt store, cycle) fails the whole create
+        // instead of leaving an employee governed by its own mirror.
+        let org = match super::org_change_rpc::lock_org(&self.home_dir).await {
+            Ok(org) => org,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
         if let Err(e) = tokio::fs::create_dir_all(&agents_dir).await {
             return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
         }
-        if let Err(e) = tokio::fs::create_dir(&agent_dir).await {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
+        // The name check runs under the org lock, so two concurrent creates
+        // cannot both pass it; `publish` re-checks right before the rename.
+        let staged = match duduclaw_core::org_store::StagedAgentDir::create(&org, &agent_dir, name) {
+            Ok(staged) => staged,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return WsFrame::error_response("", &format!("Agent '{name}' already exists"));
             }
-            return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
-        }
-        // A previous employee with this id (folder removed by hand) left its
-        // profile file history behind: this new employee must not inherit it.
-        if let Err(e) = crate::agent_files::history::retire(&self.home_dir, name) {
-            warn!(agent = name, error = %e, "old profile file history could not be moved aside");
-        }
+            Err(e) => return WsFrame::error_response("", &format!("Failed to create directory: {e}")),
+        };
+        // Every early return below drops `staged`, which removes the
+        // staging directory: an aborted create leaves no trace.
+        let stage_dir = staged.path().to_path_buf();
 
-        // If creating as main, demote the current main agent — only AFTER the
-        // name claim succeeded, so a doomed create (name collision) can no
-        // longer demote the live main as a side effect.
-        if role == "main" {
-            if let Err(e) = self.demote_current_main(name).await {
-                let _ = tokio::fs::remove_dir_all(&agent_dir).await;
-                return WsFrame::error_response("", &e);
-            }
-        }
-
-        let skills_dir = agent_dir.join("SKILLS");
+        let skills_dir = stage_dir.join("SKILLS");
         if let Err(e) = tokio::fs::create_dir_all(&skills_dir).await {
-            let _ = tokio::fs::remove_dir_all(&agent_dir).await;
             return WsFrame::error_response("", &format!("Failed to create directory: {e}"));
         }
         Self::seed_builtin_skills(&self.home_dir);
 
-        // WP22 T1 — kept for the post-commit `org.toml` write below; the
+        // WP22 T1 — kept for the authority commit in `publish` below; the
         // `toml!` macro consumes these by value.
         let org_entry = duduclaw_core::OrgEntry::new(&reports_to, &department);
+        // v1.81 (S2): only `main` may create employees by default.
+        let can_create_agents = duduclaw_core::agent_toml::default_can_create_agents(Some(role));
 
         let mut agent_config = toml::toml! {
             [agent]
@@ -233,8 +234,9 @@ impl MethodHandler {
             // v1.68: the four flags are enforced at the MCP gate; scaffold
             // them on (the marker tells the boot migration to leave this
             // file alone, so a later `false` from the dashboard sticks).
+            // v1.81 (S2): `can_create_agents` by role — `true` only for main.
             [permissions]
-            can_create_agents = true
+            can_create_agents = can_create_agents
             can_send_cross_agent = true
             can_modify_own_skills = true
             can_modify_own_soul = false
@@ -257,58 +259,25 @@ impl MethodHandler {
         // callers unaffected). Invalid provider ⇒ fail and clean up the dir.
         let runtime_outcome = match apply_runtime_to_table_reporting(&mut agent_config, &params) {
             Ok(o) => o,
-            Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&agent_dir).await;
-                return WsFrame::error_response("", &e);
-            }
+            Err(e) => return WsFrame::error_response("", &e),
         };
 
         let alignment = match crate::runtime_config::align_model_runtime(&mut agent_config) {
             Ok(value) => value,
-            Err(error) => {
-                let _ = tokio::fs::remove_dir_all(&agent_dir).await;
-                return WsFrame::error_response("", &error);
-            }
+            Err(error) => return WsFrame::error_response("", &error),
         };
 
         if let Err(e) = crate::product_policy::load(&self.home_dir)
             .and_then(|policy| crate::product_policy::validate_table(policy, &agent_config)) {
-            let _ = tokio::fs::remove_dir_all(&agent_dir).await;
             return WsFrame::error_response("", &e);
         }
         let agent_toml = toml::to_string_pretty(&agent_config).unwrap_or_default();
 
-        // XC.2: atomic write (temp + rename) — mirror the per-agent update path.
-        let agent_toml_path = agent_dir.join("agent.toml");
-        let agent_toml_tmp = agent_toml_path.with_extension("toml.tmp");
-        if let Err(e) = tokio::fs::write(&agent_toml_tmp, &agent_toml).await {
-            return WsFrame::error_response("", &format!("Failed to write agent.toml.tmp: {e}"));
+        // Built inside the (invisible) staging directory; the directory
+        // rename below is the single commit point.
+        if let Err(e) = tokio::fs::write(stage_dir.join("agent.toml"), &agent_toml).await {
+            return WsFrame::error_response("", &format!("Failed to write agent.toml: {e}"));
         }
-        if let Err(e) = tokio::fs::rename(&agent_toml_tmp, &agent_toml_path).await {
-            let _ = tokio::fs::remove_file(&agent_toml_tmp).await;
-            return WsFrame::error_response("", &format!("Failed to commit agent.toml: {e}"));
-        }
-
-        // WP22 T1 — the agent is committed, so record its authoritative org
-        // placement in `<home>/org.toml`. The `[agent] reports_to` /
-        // `department` keys written above are a display mirror from here on;
-        // delegation reads the store. Recorded *after* the commit so an
-        // aborted create never leaves a record behind for the id.
-        if let Err(e) = duduclaw_core::org_store::upsert(&self.home_dir, name, org_entry) {
-            warn!(agent = %name, error = %e, "org.toml upsert failed on agents.create");
-        }
-
-        // R1 (2026-10): a deprecated runtime is still written, but the write
-        // is audited with the caller so the migration is traceable.
-        audit_deprecated_runtime_writes(
-            &self.home_dir,
-            name,
-            "agents.create",
-            caller.map(|c| c.user_id.as_str()).unwrap_or("unknown"),
-            &runtime_outcome.deprecated,
-        );
-
-        alignment.audit(&self.home_dir, name, "agents.create", caller.map(|c|c.user_id.as_str()).unwrap_or("unknown"));
 
         // Honor an optional `soul` param (the agent's persona / system prompt).
         // Trim + cap defensively; fall back to a stock one-liner when absent.
@@ -327,7 +296,59 @@ impl MethodHandler {
             .unwrap_or_else(|| {
                 format!("# {display_name}\n\nI am {display_name}, a specialist AI agent.\n")
             });
-        let _ = tokio::fs::write(agent_dir.join("SOUL.md"), &soul).await;
+        let _ = tokio::fs::write(stage_dir.join("SOUL.md"), &soul).await;
+
+        // A previous employee with this id (folder removed by hand) left its
+        // profile file history behind: this new employee must not inherit it.
+        if let Err(e) = crate::agent_files::history::retire(&self.home_dir, name) {
+            warn!(agent = name, error = %e, "old profile file history could not be moved aside");
+        }
+
+        // If creating as main, demote the current main agent — only after
+        // every validation passed and right before the publish, so a doomed
+        // create can no longer demote the live main as a side effect. Taken
+        // under the org lock (lock order: org lock, then agent.toml locks;
+        // the agent.toml lock wait is bounded).
+        let demotion = if role == "main" {
+            match self.demote_current_main(name).await {
+                Ok(d) => d,
+                Err(e) => return WsFrame::error_response("", &e),
+            }
+        } else {
+            None
+        };
+
+        // WP22 T1 / RM-027 round 4 — inside the org lock: validate and commit
+        // the authoritative org placement in `<home>/org.toml`, then publish
+        // the directory. The `[agent] reports_to` / `department` keys above
+        // are a display mirror; delegation reads the store. Any authority
+        // failure (corrupt / newer store, a cycle) refuses the whole create:
+        // the staging directory is removed and nothing appears.
+        // Short synchronous file operations (as the upsert always was).
+        if let Err(e) = staged.publish(&org, org_entry) {
+            warn!(agent = %name, error = %e, "agents.create refused: org authority not committed");
+            // RM-027 round 5: the create did not happen, so the main it
+            // demoted is put back (still under the org lock).
+            let restore = match demotion {
+                Some(d) => self.restore_demoted_main(d).await.err(),
+                None => None,
+            };
+            drop(org);
+            return WsFrame::error_response("", &create_failed_text(&e.to_string(), restore.as_deref()));
+        }
+        drop(org);
+
+        // R1 (2026-10): a deprecated runtime is still written, but the write
+        // is audited with the caller so the migration is traceable.
+        audit_deprecated_runtime_writes(
+            &self.home_dir,
+            name,
+            "agents.create",
+            caller.map(|c| c.user_id.as_str()).unwrap_or("unknown"),
+            &runtime_outcome.deprecated,
+        );
+
+        alignment.audit(&self.home_dir, name, "agents.create", caller.map(|c|c.user_id.as_str()).unwrap_or("unknown"));
 
         // Install the agent-file-guard PreToolUse hook so this newly-created
         // agent immediately gets protected against out-of-tree Write/Edit.
@@ -365,5 +386,17 @@ impl MethodHandler {
                 "agent": { "name": name, "display_name": display_name, "role": role, "status": "active" }
             }),
         )
+    }
+}
+
+/// The refusal of a create whose publish failed after the old main was
+/// demoted; says so when putting the old main back failed too.
+pub(crate) fn create_failed_text(error: &str, restore_error: Option<&str>) -> String {
+    match restore_error {
+        None => format!("AI 員工沒有建立：{error}"),
+        Some(re) => format!(
+            "AI 員工沒有建立：{error}（另外，原本的主代理沒有成功恢復為主代理：{}；請管理員在 AI 員工設定把它改回主代理）",
+            duduclaw_core::truncate_chars(re, 300)
+        ),
     }
 }

@@ -168,7 +168,7 @@
 |---------|----------|
 | Telegram | Long polling, file/photo/sticker/voice, forums/topics, mention-only, voice transcription |
 | LINE | Webhook, HMAC-SHA256 signature, sticker support, per-chat settings |
-| Discord | Gateway WebSocket, slash commands (`/ask /status /config /session /agent`), voice channels only in builds with the non-default `discord-voice` feature (release binaries do not include it), auto-thread (session id stable across entire thread lifetime post-v1.8.14), embed replies |
+| Discord | Gateway WebSocket, slash commands (`/ask /status /config /session /agent`), auto-thread (session id stable across entire thread lifetime post-v1.8.14), embed replies |
 | Slack | Socket Mode, mention-only, thread replies |
 | WhatsApp | Cloud API webhook, signature verification fail-closed |
 | Feishu | Open Platform v2 |
@@ -262,7 +262,7 @@ See [14-voice-pipeline.md](14-voice-pipeline.md). HTTP, Telegram and MCP synthes
 | HTTP endpoints | `POST /api/stt` (OpenAI-compatible transcription API or a local command template; returns 501 when `[voice]` has no STT provider), `POST /api/tts`, `GET`/`POST /api/voice/config` |
 | TTS providers | Piper (local ONNX voices) / Kokoro / Azure / MiniMax T2A (picks a CJK or Latin voice) / OpenAI TTS, behind one router |
 | Telegram voice | Voice messages use the configured STT provider (Whisper fallback when unconfigured); `/voice` replies use the shared configured TTS router, with a text fallback |
-| Not in release binaries | In-process Whisper (`whisper` feature of `duduclaw-inference`), ONNX embedding (`onnx` feature) and Discord voice channels (`discord-voice` feature) compile only when you build with those features |
+| Not in release binaries | In-process Whisper (`whisper` feature of `duduclaw-inference`), ONNX embedding (`onnx` feature) |
 | Never implemented | SenseVoice, Deepgram, Silero VAD, `symphonia` decoding and LiveKit voice rooms were listed here before; none of them has code |
 
 Local Kokoro-82M v1.1-zh (Apache-2.0; download about 134 MB from Settings → Voice) replaces the optional CLI. Auto routing: installed Piper → installed Kokoro → MiniMax → OpenAI → Azure. Kokoro Chinese has a mainland accent and can misread polyphonic words. Azure AI Speech REST offers Taiwanese Mandarin voices; it sends text to Microsoft and requires `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION`. Telegram receives local Kokoro audio as WAV (`sendAudio`).
@@ -346,7 +346,7 @@ Two separate code paths share the name.
 
 | Feature | Description |
 |---------|-------------|
-| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` persistent (v1.8.12); schedules are created with `tasks_create` + `schedule` (the older `schedule_task` tool was removed in v1.69.0) |
+| CronScheduler | `cron_tasks.jsonl` + `cron_tasks.db` persistent (v1.8.12); schedules are created with `tasks_create` + `schedule` (the older `schedule_task` tool was removed in v1.69.0); one created in a WebChat conversation without a target reports back to that conversation after a fire-time ownership check, and a schedule with no target says in its receipt that results go nowhere ([69-egress-guard.md](69-egress-guard.md)) |
 | ReminderScheduler | One-shot reminders (relative `5m`/`2h`/`1d` or ISO 8601), `direct` or `agent_callback` mode |
 | HeartbeatScheduler | Per-agent unified scheduling — bus polling + GVU silence breaker + cron |
 | Scheduler-Level Task-Board Pull (v1.9.3) | `poll_assigned_tasks` moved into `HeartbeatScheduler::run` tick — scans entire agent registry every 30s (no longer skips `enabled=false` agents); 1-hour LIKE-marker cooldown prevents stampedes |

@@ -31,7 +31,7 @@ pub(crate) fn confirmed_sink_completion(tool: &str, response: &Value) -> bool {
         | "odoo_execute" | "odoo_inventory_check" | "odoo_inventory_products"
         | "odoo_invoice_list" | "odoo_partner_search" | "odoo_payment_status" | "odoo_report"
         | "odoo_sale_confirm" | "odoo_sale_create_quotation" | "odoo_sale_orders"
-        | "odoo_schema_fields" | "odoo_search"
+        | "odoo_schema_fields" | "odoo_search" | "odoo_create" | "odoo_write"
         | "transcribe_audio" | "meeting_transcribe" | "synthesize_speech" | "db_query" | "db_select" | "db_tables"
         | "calendar_create_event" | "calendar_list_events" | "docs_append" | "docs_read"
         | "drive_read" | "drive_search" | "forms_get" | "forms_list_responses"
@@ -72,6 +72,27 @@ mod tests {
         for response in [json!({"error":{"code":-1}}), json!({"result":{"isError":true}}), json!({"result":null})] {
             assert!(!model_visible_payload(&response));
         }
+    }
+
+    /// RM-130: the empty-error reason must be filled in only after this gate
+    /// has counted the reply. Filling it into a content-less error would make
+    /// it look payload-bearing, which is exactly why it runs last.
+    #[test]
+    fn egress_accounting_unchanged_for_empty_errors() {
+        let raw = json!({"id":1,"result":{"isError":true}});
+        let counted = model_visible_payload(&raw);
+        assert!(!counted);
+        let finished = crate::mcp_dispatch::finalize_tool_reply("db_query", false, raw.clone());
+        assert_ne!(finished, raw, "the employee sees a reason");
+        assert!(model_visible_payload(&finished), "so it must never be fed back into the gate");
+        // The host-built helpers keep their accounting: an empty JSON-RPC
+        // error stays payload-free, an empty tool_error already had `content`.
+        assert!(!model_visible_payload(&crate::mcp_dispatch::jsonrpc_error(&json!(1), -1, "")));
+        assert!(!model_visible_payload(&super::super::jsonrpc_error(&json!(1), -1, "")));
+        let empty_tool_error = super::super::tool_error("");
+        assert!(empty_tool_error["content"][0]["text"].as_str().unwrap().contains("no error message"));
+        assert!(model_visible_payload(&json!({"result": super::super::tool_error("")})));
+        assert!(model_visible_payload(&json!({"result": {"isError":true,"content":[{"type":"text","text":""}]}})));
     }
 }
 

@@ -41,6 +41,9 @@ pub(crate) async fn handle_schedule_task_for_actor(
             "isError": true
         });
     }
+    if let Err(message) = duduclaw_gateway::scheduled_webchat::check_name(name) {
+        return tool_error(&message);
+    }
 
     // Validate cron expression before persisting — through the shared
     // normaliser so validation reads day-of-week exactly like the scheduler.
@@ -93,21 +96,18 @@ pub(crate) async fn handle_schedule_task_for_actor(
         }
     };
 
-    let notify_channel = params
-        .get("notify_channel")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
-    let notify_chat_id = params
-        .get("notify_chat_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
-    let notify_thread_id = params
-        .get("notify_thread_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+    // RM-124: the model's notify target, or — when it names none — the
+    // WebChat conversation this turn answers (gateway-attested, bound to the
+    // acting employee). A model-supplied `webchat` target is refused.
+    let origin_env = std::env::var(duduclaw_core::ENV_ORIGIN_SESSION).ok();
+    let target = match resolve_notify_target(
+        params, home_dir, actor.agent(), &scheduled_target, origin_env.as_deref(),
+    ) {
+        Ok(target) => target,
+        Err(message) => return tool_error(&message),
+    };
+    let delivery = target.delivery();
+    let NotifyTarget { channel: notify_channel, chat: notify_chat_id, thread: notify_thread_id, .. } = target;
     // v1.8.25: auto-detect the host's IANA timezone when the caller doesn't
     // specify one explicitly. Historically the cron rail fell through to UTC
     // if `cron_timezone` was absent — which surprised every Taipei-based
@@ -134,15 +134,6 @@ pub(crate) async fn handle_schedule_task_for_actor(
             }
             detected
         });
-
-    // If one of notify_channel / notify_chat_id is set, the other must also
-    // be set — a partial target would silently fail at delivery time.
-    if notify_channel.is_some() != notify_chat_id.is_some() {
-        return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: notify_channel and notify_chat_id must be set together"}],
-            "isError": true
-        });
-    }
 
     // Validate cron_timezone against the IANA database at call time so a
     // typo is reported to the scheduler caller instead of silently falling
@@ -188,7 +179,11 @@ pub(crate) async fn handle_schedule_task_for_actor(
             // sentence to relay, plus a machine-readable summary line for the
             // model. The dashboard side of the same action is the
             // `cron.changed` event raised by the MCP dispatch tail.
-            let receipt = cron_created_receipt(name, cron, row.cron_timezone.as_deref());
+            let receipt = format!(
+                "{}{}",
+                cron_created_receipt(name, cron, row.cron_timezone.as_deref()),
+                delivery_receipt_suffix(delivery),
+            );
             serde_json::json!({
                 "content": [{"type": "text", "text": format!(
                     "{receipt}\n\n(請把上面這句話原樣轉達給使用者。id: {task_id})"
@@ -285,6 +280,105 @@ pub(crate) fn cron_created_receipt(name: &str, cron: &str, timezone: Option<&str
         None => format!("排程 {cron}"),
     };
     format!("已建立例行工作：「{name}」，{when} 執行。可在 dashboard 的「例行工作」頁查看或修改。")
+}
+
+/// Where a scheduled result will go (RM-124) — decides the receipt wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// A channel target the model named (`notify_channel` + `notify_chat_id`).
+    Channel,
+    /// The WebChat conversation this turn answers (gateway-attested origin).
+    OriginWebchat,
+    /// Nowhere — results stay in the run history only.
+    Nowhere,
+}
+
+/// A resolved notify target for a new schedule / one-shot wake-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NotifyTarget {
+    pub channel: Option<String>,
+    pub chat: Option<String>,
+    pub thread: Option<String>,
+}
+
+impl NotifyTarget {
+    pub(crate) fn delivery(&self) -> Delivery {
+        match self.channel.as_deref() {
+            Some(duduclaw_gateway::scheduled_webchat::CHANNEL) => Delivery::OriginWebchat,
+            Some(_) => Delivery::Channel,
+            None => Delivery::Nowhere,
+        }
+    }
+}
+
+/// RM-124: resolve the notify target of a new schedule.
+///
+/// * A target the model supplies is used as-is — except `webchat`, which is
+///   refused: a WebChat conversation is only ever taken from the
+///   gateway-attested `origin_env` ([`duduclaw_core::ENV_ORIGIN_SESSION`]).
+/// * With no target, the origin WebChat conversation becomes the default,
+///   but only when the schedule runs as the verified acting employee
+///   (`acting_agent == scheduled_target`) and the session id binds to that
+///   employee (`scheduled_webchat::bind_origin`: `#agent:` segment + stored
+///   session row + owner tag). Anything else ⇒ no target (the receipt says
+///   so).
+pub(crate) fn resolve_notify_target(
+    params: &Value,
+    home_dir: &Path,
+    acting_agent: Option<&str>,
+    scheduled_target: &str,
+    origin_env: Option<&str>,
+) -> std::result::Result<NotifyTarget, String> {
+    let field = |key: &str| {
+        params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let (channel, chat, thread) = (field("notify_channel"), field("notify_chat_id"), field("notify_thread_id"));
+    duduclaw_gateway::scheduled_webchat::refuse_supplied_target(channel.as_deref(), chat.as_deref(), None)
+        .map_err(str::to_string)?;
+    // If one of notify_channel / notify_chat_id is set, the other must also
+    // be set — a partial target would silently fail at delivery time.
+    if channel.is_some() != chat.is_some() {
+        return Err("notify_channel and notify_chat_id must be set together".into());
+    }
+    if channel.is_some() {
+        return Ok(NotifyTarget { channel, chat, thread });
+    }
+    let origin = acting_agent
+        .filter(|agent| *agent == scheduled_target)
+        .and_then(|agent| duduclaw_gateway::scheduled_webchat::bind_origin(home_dir, origin_env, agent));
+    Ok(match origin {
+        Some(session) => NotifyTarget {
+            channel: Some(duduclaw_gateway::scheduled_webchat::CHANNEL.to_string()),
+            chat: Some(session),
+            thread: None,
+        },
+        None => NotifyTarget { channel: None, chat: None, thread },
+    })
+}
+
+/// Receipt tail (zh-TW + English) telling the user where results will go.
+pub(crate) fn delivery_receipt_suffix(delivery: Delivery) -> &'static str {
+    match delivery {
+        Delivery::Channel => "",
+        Delivery::OriginWebchat => {
+            "執行結果會回到這個 WebChat 對話，不會即時推播；重新開啟此對話即可查看。\
+             Results will be posted back to this WebChat conversation. There is no live push; reopen this conversation to see them."
+        }
+        Delivery::Nowhere => {
+            "注意：這個例行工作沒有通知管道，執行結果不會傳送到任何地方，只會記錄在 dashboard「例行工作」頁的執行紀錄。\
+             若要收到結果，請在 dashboard 編輯此例行工作並設定通知管道（notify_channel 與 notify_chat_id），\
+             或改在已連接的聊天通道（例如 Telegram、LINE）或 WebChat 對話中建立。\
+             Note: no notification channel is set, so results will not be delivered anywhere — they are only \
+             kept in the run history on the dashboard's Routines page. To receive them, edit this routine on the \
+             dashboard and set a notification channel (notify_channel and notify_chat_id), or create it from a \
+             connected chat channel (e.g. Telegram, LINE) or a WebChat conversation."
+        }
+    }
 }
 
 // ── Cron task management handlers ─────────────────────────────
@@ -494,6 +588,16 @@ pub(crate) async fn handle_update_cron_task(
         Ok(notify) => notify,
         Err(message) => return tool_error(message),
     };
+    // RM-124: a WebChat target is never model-supplied; echoing the stored
+    // one back unchanged is fine.
+    if let Some((channel, chat, _)) = notify {
+        if let Err(message) = duduclaw_gateway::scheduled_webchat::refuse_supplied_target(
+            channel, chat,
+            Some((existing.notify_channel.as_deref(), existing.notify_chat_id.as_deref())),
+        ) {
+            return tool_error(message);
+        }
+    }
 
     // Merge provided fields over existing values.
     let new_name = params
@@ -508,6 +612,13 @@ pub(crate) async fn handle_update_cron_task(
         .get("task")
         .and_then(|v| v.as_str())
         .unwrap_or(&existing.task);
+
+    // A rename must respect the name cap; an unchanged (legacy) name passes.
+    if new_name != existing.name {
+        if let Err(message) = duduclaw_gateway::scheduled_webchat::check_name(new_name) {
+            return tool_error(&message);
+        }
+    }
 
     // Validate cron expression if changed — same shared normaliser as the
     // scheduler and creation path.
@@ -606,6 +717,92 @@ fn recipient_notify_updates_require_a_complete_target() {
     assert_eq!(recipient_notify_update(&serde_json::json!({"notify_channel":"discord","notify_chat_id":"123","notify_thread_id":"456"})).unwrap(),
         Some((Some("discord"), Some("123"), Some("456"))));
     assert_eq!(recipient_notify_update(&serde_json::json!({"notify_channel":null,"notify_chat_id":null})).unwrap(), Some((None, None, None)));
+}
+
+#[cfg(test)]
+mod origin_target_tests {
+    use super::*;
+
+    /// A signed-in dashboard account's WebChat session answered by `agent`.
+    async fn origin_session(home: &Path, agent: &str) -> String {
+        let user = "dashboard-user-1";
+        let tag = duduclaw_gateway::webchat::webchat_owner_tag(user);
+        let session = format!("webchat:webchat:{tag}:c0ffee#agent:{agent}#conv:n1");
+        let manager = duduclaw_gateway::session::SessionManager::new(&home.join("sessions.db")).unwrap();
+        manager
+            .get_or_create_with_origin(&session, agent, &duduclaw_gateway::session_origin::SessionOrigin::webchat_user(user))
+            .await
+            .unwrap();
+        session
+    }
+
+    // Not run here: builds and tests are not executed in this worktree.
+    #[tokio::test]
+    async fn no_target_defaults_to_the_origin_webchat_conversation() {
+        let home = tempfile::tempdir().unwrap();
+        let session = origin_session(home.path(), "sales").await;
+        let target = resolve_notify_target(&serde_json::json!({}), home.path(), Some("sales"), "sales", Some(&session))
+            .unwrap();
+        assert_eq!(target.channel.as_deref(), Some("webchat"));
+        // The stored target is the session id stamped with its creation time.
+        let chat = target.chat.as_deref().unwrap();
+        assert!(chat.starts_with(session.as_str()) && chat.len() > session.len());
+        assert_eq!(target.thread, None);
+        assert_eq!(target.delivery(), Delivery::OriginWebchat);
+        assert!(delivery_receipt_suffix(Delivery::OriginWebchat).contains("WebChat 對話"));
+        // A channel the model names wins over the origin.
+        let named = resolve_notify_target(
+            &serde_json::json!({"notify_channel":"line","notify_chat_id":"U1"}),
+            home.path(), Some("sales"), "sales", Some(&session),
+        ).unwrap();
+        assert_eq!((named.channel.as_deref(), named.chat.as_deref()), (Some("line"), Some("U1")));
+        assert_eq!(named.delivery(), Delivery::Channel);
+    }
+
+    #[tokio::test]
+    async fn schedule_names_over_the_cap_are_rejected_on_create_and_rename() {
+        let home = tempfile::tempdir().unwrap();
+        let long = "n".repeat(duduclaw_gateway::scheduled_webchat::MAX_NAME_CHARS + 1);
+        let created = handle_schedule_task(
+            &serde_json::json!({"cron":"0 9 * * *","task":"t","name":long}), home.path(), "sales",
+        ).await;
+        assert_eq!(created["isError"], true);
+        assert!(created["content"][0]["text"].as_str().unwrap().contains("too long"));
+    }
+
+    #[tokio::test]
+    async fn model_supplied_webchat_target_is_rejected() {
+        let home = tempfile::tempdir().unwrap();
+        let session = origin_session(home.path(), "sales").await;
+        for args in [
+            serde_json::json!({"notify_channel":"webchat","notify_chat_id": session}),
+            serde_json::json!({"notify_channel":"WebChat","notify_chat_id":"webchat:webchat:x"}),
+        ] {
+            assert!(resolve_notify_target(&args, home.path(), Some("sales"), "sales", Some(&session)).is_err(), "{args}");
+        }
+        // Partial targets are still refused.
+        assert!(resolve_notify_target(&serde_json::json!({"notify_channel":"line"}), home.path(), Some("sales"), "sales", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn origin_bound_to_another_employee_is_ignored() {
+        let home = tempfile::tempdir().unwrap();
+        let session = origin_session(home.path(), "sales").await;
+        // Acting employee differs from the session's `#agent:` / stored owner.
+        let other = resolve_notify_target(&serde_json::json!({}), home.path(), Some("hr"), "hr", Some(&session)).unwrap();
+        assert_eq!(other.delivery(), Delivery::Nowhere);
+        // Scheduling for someone else never borrows the caller's conversation.
+        let delegated = resolve_notify_target(&serde_json::json!({}), home.path(), Some("sales"), "hr", Some(&session)).unwrap();
+        assert_eq!(delegated.delivery(), Delivery::Nowhere);
+        // Operator callers (no acting employee) and absent / unknown origins.
+        assert_eq!(resolve_notify_target(&serde_json::json!({}), home.path(), None, "sales", Some(&session)).unwrap().delivery(), Delivery::Nowhere);
+        assert_eq!(resolve_notify_target(&serde_json::json!({}), home.path(), Some("sales"), "sales", None).unwrap().delivery(), Delivery::Nowhere);
+        let unknown = session.replace("c0ffee", "beef");
+        assert_eq!(resolve_notify_target(&serde_json::json!({}), home.path(), Some("sales"), "sales", Some(&unknown)).unwrap().delivery(), Delivery::Nowhere);
+        let receipt = delivery_receipt_suffix(Delivery::Nowhere);
+        assert!(receipt.contains("不會傳送到任何地方") && receipt.contains("will not be delivered anywhere"));
+        assert!(receipt.contains("notify_channel"));
+    }
 }
 
 /// Delete a cron task by ID or name.

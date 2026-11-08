@@ -2005,6 +2005,54 @@ pub struct ToolPolicy {
     pub when: Vec<ArgCondition>,
 }
 
+/// Runtime tool names in the PolicyKernel's `fs_write` family.
+pub const POLICY_FS_WRITE_TOOLS: &[&str] = &[
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "apply_patch",
+    "write_file",
+    "write_to_file",
+];
+
+/// Runtime tool names in the PolicyKernel's `shell_exec` family.
+pub const POLICY_SHELL_EXEC_TOOLS: &[&str] = &["Bash", "shell", "run_shell_command", "run_command"];
+
+/// Map a runtime-specific tool name to its PolicyKernel canonical family
+/// (`fs_write` / `shell_exec` / `mcp_call`).
+///
+/// RM-103 S3 (Daybreak round 2 #3): the single definition behind both
+/// `duduclaw_security::policy_kernel` and
+/// [`CapabilitiesConfig::native_tool_constraints`], so the native-runtime
+/// classifier can never disagree with the kernel on what a rule matches.
+pub fn policy_canonical_tool(name: &str) -> &'static str {
+    if POLICY_FS_WRITE_TOOLS.contains(&name) {
+        "fs_write"
+    } else if POLICY_SHELL_EXEC_TOOLS.contains(&name) {
+        "shell_exec"
+    } else {
+        "mcp_call"
+    }
+}
+
+impl ToolPolicy {
+    /// Does this rule's `tool` selector apply to `tool`? THE PolicyKernel
+    /// selector matcher: exactly `"*"` (any tool), the exact name, or the
+    /// name's canonical family ([`policy_canonical_tool`]). Exact, untrimmed
+    /// and case-sensitive — `" * "` or `"bash"` match nothing but their own
+    /// literal name.
+    pub fn selector_matches(&self, tool: &str) -> bool {
+        self.tool == "*" || self.tool == tool || self.tool == policy_canonical_tool(tool)
+    }
+
+    /// An unconditional wildcard as the PolicyKernel sees it: selector exactly
+    /// `"*"` and no argument conditions (matches every call of every tool).
+    pub fn is_unconditional_wildcard(&self) -> bool {
+        self.tool == "*" && self.when.is_empty()
+    }
+}
+
 /// Computer use execution mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2422,27 +2470,39 @@ impl CapabilitiesConfig {
     ///
     /// - Allowlist mode (`allowed_tools` non-empty): a write tool must appear
     ///   in the allowlist (bare or qualified) and not be bare-denied.
-    /// - Denylist mode: write tools are allowed unless EVERY write tool is
-    ///   bare-denied (a qualified deny such as `Bash(rm:*)` does not count as
-    ///   fully denying Bash).
+    /// - Denylist mode: write tools are allowed unless EVERY Claude write
+    ///   tool is bare-denied (a qualified deny such as `Bash(rm:*)` does not
+    ///   count as fully denying Bash).
+    ///
+    /// RM-103 S3 (round 3 #1): family-aware, on the native classifier's
+    /// family definition. A write tool is any spelling of the write or shell
+    /// family (`apply_patch`, `write_file`, `shell`, `run_shell_command`, …
+    /// and the canonical `fs_write` / `shell_exec`), so an allowlist naming
+    /// another runtime's tool counts; a bare deny of the canonical name
+    /// denies every spelling of its family. In denylist mode a bare deny of a
+    /// non-Claude spelling (`shell`, `apply_patch`) does not make the level
+    /// read-only — it is a constraint the coarse runtime cannot honour, and
+    /// [`Self::native_tool_constraints`] reports it (refusal / read-only).
     pub fn write_tools_allowed(&self) -> bool {
         const WRITE_TOOLS: [&str; 5] = ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"];
-        fn base(entry: &str) -> &str {
-            entry.split('(').next().unwrap_or(entry).trim()
-        }
         let bare_denied = |tool: &str| {
-            self.denied_tools
-                .iter()
-                .any(|d| d.trim().eq_ignore_ascii_case(tool))
+            let canonical = NativeFamily::of(tool).map(NativeFamily::canonical);
+            self.denied_tools.iter().any(|d| {
+                let d = d.trim();
+                d.eq_ignore_ascii_case(tool) || canonical.is_some_and(|c| d.eq_ignore_ascii_case(c))
+            })
         };
         if !self.allowed_tools.is_empty() {
-            WRITE_TOOLS.iter().any(|tool| {
-                !bare_denied(tool)
-                    && self
-                        .allowed_tools
-                        .iter()
-                        .any(|a| base(a).eq_ignore_ascii_case(tool))
-            })
+            NativeFamily::ALL
+                .into_iter()
+                .flat_map(NativeFamily::write_capable_names)
+                .any(|tool| {
+                    !bare_denied(tool)
+                        && self
+                            .allowed_tools
+                            .iter()
+                            .any(|a| entry_base(a).eq_ignore_ascii_case(tool))
+                })
         } else {
             WRITE_TOOLS.iter().any(|tool| !bare_denied(tool))
         }
@@ -2464,6 +2524,374 @@ impl CapabilitiesConfig {
         }
         SandboxLevel::WorkspaceWrite
     }
+
+    /// RM-103 S3 (v1.81, Daybreak #2): the restrictions on the native
+    /// write / shell tools that only a per-tool gate can enforce.
+    ///
+    /// A coarse-grained runtime (Codex, Grok, a generic print-mode CLI) runs
+    /// its own native file-edit and shell tools; they never pass through the
+    /// MCP dispatch gate, the ApprovalBroker or the PolicyKernel, and
+    /// [`Self::sandbox_level`] only looks at *which* tools exist. So an
+    /// inherited `action_rules` `modify = ask`, an approval list naming
+    /// `Write`, a parameter-level `policy`, or a packet narrowing such as
+    /// `Bash(git:*)` used to collapse into `workspace-write` with an
+    /// unrestricted native shell. The spawn sites read this and either force
+    /// [`SandboxLevel::ReadOnly`] ([`NativeToolConstraints::no_write`] only)
+    /// or refuse to run ([`NativeToolConstraints::no_exec`]: none of those
+    /// runtimes has a mode without a native shell).
+    ///
+    /// Write family: `Write` / `Edit` / `MultiEdit` / `NotebookEdit`, the
+    /// PolicyKernel's other spellings ([`POLICY_FS_WRITE_TOOLS`]:
+    /// `apply_patch`, `write_file`, `write_to_file`) and the canonical
+    /// `fs_write`; shell family: `Bash` / `BashOutput` / `KillShell`,
+    /// [`POLICY_SHELL_EXEC_TOOLS`] (`shell`, `run_shell_command`,
+    /// `run_command`) and `shell_exec`. Every list and `action_rules` are
+    /// matched against all of them by one family-aware matcher (round 3 #1).
+    /// What counts:
+    /// - an `action_rules` verdict of `ask` or `block` for any spelling of
+    ///   either family, resolved with the family's effect class (`modify` /
+    ///   `admin`) unless Claude classes the name itself (a malformed list
+    ///   counts: it raises every side-effecting call to `ask`);
+    /// - an `approval_required_tools` / `irreversible_tools` /
+    ///   `maybe_irreversible_tools` entry covering one (wildcards included);
+    /// - (Daybreak round 2 #2) a `scoped_tools` entry covering one, wildcards
+    ///   included: a scoped tool needs an active task grant, and no grant
+    ///   context exists at spawn, so the native family is restricted
+    ///   (conservative). A server-qualified `mcp__<server>__…` entry names
+    ///   MCP tools only and never restricts a native family;
+    /// - (Daybreak round 2 #3/#4) a `policy` that speaks about the native
+    ///   tools — some rule's selector names a native shell / write tool, its
+    ///   canonical family (`shell_exec` / `fs_write`), `*`, or is not a plain
+    ///   tool name at all (`" * "`, `mcp__x__*`: the kernel matches it only
+    ///   literally, so its intent is unknown). Such a policy is then read the
+    ///   way the PolicyKernel would read a native call with unknown arguments,
+    ///   per family: restricted unless no `forbid` / `ask` rule could match it
+    ///   (trimmed, case-insensitive — broader than the kernel, so never
+    ///   weaker) and an unconditional `allow` matches every family member by
+    ///   the kernel's own selector matcher ([`ToolPolicy::selector_matches`]).
+    ///   A policy whose rules all name MCP tools (`allow "*"` +
+    ///   `forbid "mail_send"`, or an allow-only `memory_search`) does not
+    ///   affect the native runtimes — exactly as on Claude, whose native tools
+    ///   never reach the kernel either;
+    /// - a qualified `allowed_tools` / `denied_tools` entry (`Bash(git:*)`,
+    ///   `Write(src/**)`, `shell(git:*)`) — the argument part cannot be
+    ///   enforced natively; an allowlist that also holds the same tool bare
+    ///   is not narrowed by it (a bare grant of another spelling is not the
+    ///   same tool and does not lift it);
+    /// - a bare `denied_tools` entry covering one of them while the level
+    ///   would still be writable (the documented coarse mapping already
+    ///   turns "no write tool at all" into read-only, whose read-only shell
+    ///   is the accepted cost of that mapping).
+    ///
+    /// A server-qualified entry (`mcp__…`) in `scoped_tools`,
+    /// `allowed_tools` or `denied_tools` names MCP tools only and never
+    /// restricts a native family (round 3 #2); the approval lists keep the
+    /// broader, fail-safe reading.
+    ///
+    /// Not counted (unchanged coarse mapping): a tool merely absent from a
+    /// non-empty `allowed_tools`.
+    pub fn native_tool_constraints(&self) -> NativeToolConstraints {
+        use crate::tool_effect::ActionVerdict;
+        fn qualified(entry: &str) -> bool {
+            entry.contains('(')
+        }
+        fn push(list: &mut Vec<String>, reason: String) {
+            if !list.contains(&reason) {
+                list.push(reason);
+            }
+        }
+        let mut out = NativeToolConstraints::default();
+        let add = |out: &mut NativeToolConstraints, family: NativeFamily, reason: String| match family {
+            NativeFamily::Write => push(&mut out.no_write, reason),
+            NativeFamily::Shell => push(&mut out.no_exec, reason),
+        };
+
+        // Round 3 #1: every spelling of the family — Claude's, the
+        // PolicyKernel's (`apply_patch`, `shell`, `run_shell_command`, …) and
+        // the canonical `fs_write` / `shell_exec` — is resolved against the
+        // rules, each with its family's effect class. One reason per family,
+        // naming the spellings that matched.
+        for family in NativeFamily::ALL {
+            let held: Vec<String> = family
+                .names()
+                .filter(|tool| {
+                    self.action_rules
+                        .resolve(tool, family.effect_of(tool))
+                        .is_some_and(|v| v >= ActionVerdict::Ask)
+                })
+                .map(|tool| format!("`{tool}`"))
+                .collect();
+            if !held.is_empty() {
+                add(&mut out, family, format!("action_rules: {} needs approval or is blocked", held.join(", ")));
+            }
+        }
+
+        for (key, list) in [
+            ("approval_required_tools", &self.approval_required_tools),
+            ("irreversible_tools", &self.irreversible_tools),
+            ("maybe_irreversible_tools", &self.maybe_irreversible_tools),
+            // Daybreak round 2 #2: a scoped tool needs an active task grant;
+            // none can be known at spawn, so restrict the family.
+            ("scoped_tools", &self.scoped_tools),
+        ] {
+            for entry in list {
+                // A server-qualified entry (`mcp__duduclaw__*`, `mcp__x__foo`,
+                // `mcp__duduclaw`) names MCP tools, never a native CLI tool
+                // ([`server_qualified_entry`]). (Approval lists keep the
+                // broader, fail-safe reading.)
+                if key == "scoped_tools" && server_qualified_entry(entry) {
+                    continue;
+                }
+                for family in NativeFamily::ALL {
+                    if native_entry_covers(entry, family) {
+                        add(&mut out, family, format!("{key}: `{}`", entry.trim()));
+                    }
+                }
+            }
+        }
+
+        let (policy_shell, policy_write) = policy_restricts_native(&self.policy);
+        if policy_shell {
+            push(&mut out.no_exec, "policy: rule(s) restrict the native shell (`shell_exec`)".to_string());
+        }
+        if policy_write {
+            push(&mut out.no_write, "policy: rule(s) restrict native writes (`fs_write`)".to_string());
+        }
+
+        // Round 3 #1/#2: `allowed_tools` / `denied_tools` go through the same
+        // family-aware matcher as the approval / scoped lists (so `shell(…)`,
+        // `apply_patch`, `fs_write`, `shell_exec` count), and a
+        // server-qualified entry never names a native tool.
+        for entry in self
+            .allowed_tools
+            .iter()
+            .filter(|e| qualified(e) && !server_qualified_entry(e))
+        {
+            // The narrowing is lifted only by a bare grant of the very same
+            // tool (`Bash` + `Bash(git:*)`). A bare grant of another spelling
+            // of the family (`Bash` + `shell(git:*)`) does not lift it: the
+            // operator narrowed that spelling explicitly, and Claude Code
+            // itself would keep `Bash(git:*)` narrowed next to a bare `shell`.
+            let b = entry_base(entry);
+            let bare_too = self
+                .allowed_tools
+                .iter()
+                .any(|a| !qualified(a) && a.trim() == b);
+            if bare_too {
+                continue;
+            }
+            for family in NativeFamily::ALL {
+                if native_entry_covers(entry, family) {
+                    add(&mut out, family, format!("allowed_tools narrows `{}`", entry.trim()));
+                }
+            }
+        }
+        let writable = self.sandbox_level() != SandboxLevel::ReadOnly;
+        for entry in &self.denied_tools {
+            if server_qualified_entry(entry) || (!qualified(entry) && !writable) {
+                continue;
+            }
+            for family in NativeFamily::ALL {
+                if native_entry_covers(entry, family) {
+                    add(&mut out, family, format!("denied_tools: `{}`", entry.trim()));
+                }
+            }
+        }
+        out
+    }
+
+    /// A copy of this config whose [`Self::sandbox_level`] is
+    /// [`SandboxLevel::ReadOnly`]: every write-class native tool bare-denied,
+    /// no `computer_use` / `browser_via_bash` widening. Only for choosing a
+    /// coarse runtime's sandbox; never written back or used for MCP gates.
+    pub fn read_only_native_view(&self) -> Self {
+        let mut view = self.clone();
+        view.computer_use = false;
+        view.browser_via_bash = false;
+        // The canonical names deny every other runtime's spelling too
+        // (`write_tools_allowed` is family-aware).
+        for tool in ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "fs_write", "shell_exec"] {
+            if !view.denied_tools.iter().any(|d| d.trim().eq_ignore_ascii_case(tool)) {
+                view.denied_tools.push(tool.to_string());
+            }
+        }
+        debug_assert_eq!(view.sandbox_level(), SandboxLevel::ReadOnly);
+        view
+    }
+}
+
+/// What [`CapabilitiesConfig::native_tool_constraints`] found. Each list
+/// holds human-readable reasons (config keys and entries, never values).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeToolConstraints {
+    /// Native writes must not run unchecked: the sandbox must be read-only.
+    pub no_write: Vec<String>,
+    /// Native command execution must not run unchecked: the runtime needs a
+    /// mode without a native shell (implies [`Self::no_write`]).
+    pub no_exec: Vec<String>,
+}
+
+impl NativeToolConstraints {
+    /// Nothing the coarse sandbox mapping cannot already express.
+    pub fn is_empty(&self) -> bool {
+        self.no_write.is_empty() && self.no_exec.is_empty()
+    }
+
+    /// The native sandbox must be read-only.
+    pub fn needs_read_only(&self) -> bool {
+        !self.is_empty()
+    }
+
+    /// The runtime must have no native shell at all.
+    pub fn needs_no_shell(&self) -> bool {
+        !self.no_exec.is_empty()
+    }
+
+    /// Every reason, shell ones first, joined for a log line or an error.
+    pub fn reasons(&self) -> String {
+        self.no_exec
+            .iter()
+            .chain(self.no_write.iter())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// Claude Code's native write built-ins.
+const CLAUDE_NATIVE_WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+/// Claude Code's native shell built-ins.
+const CLAUDE_NATIVE_SHELL_TOOLS: &[&str] = &["Bash", "BashOutput", "KillShell"];
+
+/// RM-103 S3 (round 3 #1): a native tool family as the coarse-runtime
+/// classifier ([`CapabilitiesConfig::native_tool_constraints`],
+/// [`CapabilitiesConfig::write_tools_allowed`]) sees it. Its spellings are
+/// Claude Code's built-ins plus the PolicyKernel's own family lists
+/// ([`POLICY_FS_WRITE_TOOLS`] / [`POLICY_SHELL_EXEC_TOOLS`], the ones
+/// [`policy_canonical_tool`] maps) plus the canonical name — one definition,
+/// so every list, `action_rules` and the kernel agree on what is a native
+/// write or shell tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeFamily {
+    Write,
+    Shell,
+}
+
+impl NativeFamily {
+    const ALL: [Self; 2] = [Self::Write, Self::Shell];
+
+    /// The PolicyKernel canonical family name.
+    fn canonical(self) -> &'static str {
+        match self {
+            Self::Write => "fs_write",
+            Self::Shell => "shell_exec",
+        }
+    }
+
+    /// Every spelling: Claude's, the kernel's other runtimes', the canonical.
+    fn names(self) -> impl Iterator<Item = &'static str> {
+        let (claude, policy) = match self {
+            Self::Write => (CLAUDE_NATIVE_WRITE_TOOLS, POLICY_FS_WRITE_TOOLS),
+            Self::Shell => (CLAUDE_NATIVE_SHELL_TOOLS, POLICY_SHELL_EXEC_TOOLS),
+        };
+        claude
+            .iter()
+            .copied()
+            .chain(policy.iter().copied().filter(move |t| !claude.contains(t)))
+            .chain(std::iter::once(self.canonical()))
+    }
+
+    /// The spellings that can mutate the workspace (`BashOutput` /
+    /// `KillShell` only observe or stop a shell).
+    fn write_capable_names(self) -> impl Iterator<Item = &'static str> {
+        self.names().filter(|t| !matches!(*t, "BashOutput" | "KillShell"))
+    }
+
+    /// The family a tool name belongs to (exact spelling).
+    fn of(tool: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.names().any(|t| t == tool))
+    }
+
+    /// The effect class `action_rules` resolve a family member with: the
+    /// Claude built-in class when it has one, otherwise the family's
+    /// (`Write` ⇒ modify, `Bash` ⇒ admin) — so `apply_patch` / `fs_write` are
+    /// judged like `Write`, `shell` / `shell_exec` like `Bash`.
+    fn effect_of(self, tool: &str) -> crate::tool_effect::ToolEffect {
+        use crate::tool_effect::{effect_of_cli_builtin, effect_of_native};
+        effect_of_native(tool).unwrap_or_else(|| {
+            effect_of_cli_builtin(match self {
+                Self::Write => "Write",
+                Self::Shell => "Bash",
+            })
+        })
+    }
+}
+
+/// Base name of a capability list entry: before an optional `(` qualifier,
+/// trimmed (`Bash(git:*)` → `Bash`).
+fn entry_base(entry: &str) -> &str {
+    entry.split('(').next().unwrap_or(entry).trim()
+}
+
+/// A server-qualified entry (`mcp__duduclaw__*`, `mcp__x__foo`,
+/// `mcp__duduclaw`) names MCP tools only, never a native CLI tool. Same
+/// prefix test as `tool_catalog::split_tool_ref`; needed because
+/// `tool_entry_matches` reads a bare native name (`Bash`) as a duduclaw tool.
+fn server_qualified_entry(entry: &str) -> bool {
+    entry_base(entry).starts_with("mcp__")
+}
+
+/// THE family-aware list-entry matcher of the native classifier: does a
+/// capability list entry cover any spelling of `family`? Base name,
+/// ASCII-case-insensitive, or the shared anchored matcher
+/// ([`crate::tool_catalog::tool_entry_matches`]: `*`, `Bash*`, `fs_*`).
+/// Callers decide whether a server-qualified entry is skipped.
+fn native_entry_covers(entry: &str, family: NativeFamily) -> bool {
+    let b = entry_base(entry);
+    family
+        .names()
+        .any(|tool| b.eq_ignore_ascii_case(tool) || crate::tool_catalog::tool_entry_matches(b, tool))
+}
+
+/// RM-103 S3 (Daybreak round 2 #3/#4): does a `policy` restrict the native
+/// shell / native writes of a runtime whose native tools bypass the
+/// PolicyKernel? Returns `(shell, write)`. See
+/// [`CapabilitiesConfig::native_tool_constraints`] for the rule.
+fn policy_restricts_native(policy: &[ToolPolicy]) -> (bool, bool) {
+    const SHELL: (&[&str], &str) = (POLICY_SHELL_EXEC_TOOLS, "shell_exec");
+    const WRITE: (&[&str], &str) = (POLICY_FS_WRITE_TOOLS, "fs_write");
+    // A plain tool name the kernel matches literally (`memory_search`,
+    // `mcp__duduclaw__wiki_read`); anything else has unknown intent.
+    fn plain_name(selector: &str) -> bool {
+        !selector.is_empty()
+            && selector
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+    }
+    // Restricting-side match: trimmed and case-insensitive, so it is never
+    // narrower than the kernel's own (exact) matcher.
+    fn broadly_names(rule: &ToolPolicy, (family, canonical): (&[&str], &str)) -> bool {
+        let s = rule.tool.trim();
+        s == "*" || s.eq_ignore_ascii_case(canonical) || family.iter().any(|t| s.eq_ignore_ascii_case(t))
+    }
+    let speaks_native = policy
+        .iter()
+        .any(|r| !plain_name(&r.tool) || broadly_names(r, SHELL) || broadly_names(r, WRITE));
+    if !speaks_native {
+        return (false, false);
+    }
+    let restricted = |family: (&[&str], &str)| {
+        let held = policy
+            .iter()
+            .any(|r| r.effect != PolicyEffect::Allow && broadly_names(r, family));
+        let unconditionally_allowed = family.0.iter().all(|tool| {
+            policy
+                .iter()
+                .any(|r| r.effect == PolicyEffect::Allow && r.when.is_empty() && r.selector_matches(tool))
+        });
+        held || !unconditionally_allowed
+    };
+    (restricted(SHELL), restricted(WRITE))
 }
 
 /// Coarse sandbox level for CLI runtimes that cannot enforce per-tool
@@ -3030,6 +3458,335 @@ mod sandbox_level_tests {
             caps(false, true, &["Read"], &[]).sandbox_level(),
             SandboxLevel::WorkspaceWrite
         );
+    }
+
+    /// RM-103 S3 (Daybreak #2): what a coarse runtime cannot enforce on its
+    /// native write / shell tools.
+    #[test]
+    fn native_tool_constraints_classify_write_and_shell_restrictions() {
+        let rules = |json: serde_json::Value| {
+            let mut c = caps(false, false, &[], &[]);
+            c.action_rules = crate::tool_effect::ActionRules::from_value(json);
+            c
+        };
+        // Unconstrained / plain coarse mappings: nothing.
+        for c in [
+            caps(false, false, &[], &[]),
+            caps(false, false, &["Read", "Grep"], &[]),
+            caps(true, false, &[], &[]),
+            caps(false, false, &["Read", "Bash", "Bash(git:*)"], &[]),
+            caps(false, false, &[], &["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"]),
+            caps(false, false, &[], &["mail_send"]),
+            rules(serde_json::json!([{ "effect": "send", "verdict": "ask" }])),
+            rules(serde_json::json!([{ "tool": "mail_send", "verdict": "block" }])),
+            CapabilitiesConfig {
+                policy: vec![ToolPolicy { tool: "*".into(), effect: PolicyEffect::Allow, when: vec![] }],
+                ..Default::default()
+            },
+        ] {
+            assert!(c.native_tool_constraints().is_empty(), "{c:?}: {:?}", c.native_tool_constraints());
+        }
+        // Writes only ⇒ read-only.
+        for c in [
+            rules(serde_json::json!([{ "effect": "modify", "verdict": "ask" }])),
+            rules(serde_json::json!([{ "tool": "Write", "verdict": "block" }])),
+            CapabilitiesConfig { approval_required_tools: vec!["Edit".into()], ..Default::default() },
+            CapabilitiesConfig { maybe_irreversible_tools: vec!["fs_write".into()], ..Default::default() },
+            caps(false, false, &["Read", "Write(src/**)"], &[]),
+            caps(false, false, &[], &["Write"]),
+        ] {
+            let n = c.native_tool_constraints();
+            assert!(n.needs_read_only() && !n.needs_no_shell(), "{c:?}: {n:?}");
+        }
+        // The shell ⇒ no native shell at all.
+        for c in [
+            rules(serde_json::json!([{ "effect": "admin", "verdict": "ask" }])),
+            rules(serde_json::json!([{ "tool": "Bash", "verdict": "block" }])),
+            rules(serde_json::json!("not a list")), // malformed ⇒ ask
+            CapabilitiesConfig { approval_required_tools: vec!["*".into()], ..Default::default() },
+            CapabilitiesConfig { irreversible_tools: vec!["shell_exec".into()], ..Default::default() },
+            caps(false, false, &["Read", "Write", "Bash(git:*)"], &[]),
+            caps(false, false, &[], &["Bash(rm:*)"]),
+            caps(false, false, &["Read", "Write", "Bash"], &["Bash"]),
+        ] {
+            let n = c.native_tool_constraints();
+            assert!(n.needs_no_shell() && n.needs_read_only(), "{c:?}: {n:?}");
+            assert!(!n.reasons().is_empty());
+        }
+    }
+
+    fn rule(tool: &str, effect: PolicyEffect) -> ToolPolicy {
+        ToolPolicy { tool: tool.into(), effect, when: vec![] }
+    }
+
+    fn with_policy(policy: Vec<ToolPolicy>) -> CapabilitiesConfig {
+        CapabilitiesConfig { policy, ..Default::default() }
+    }
+
+    /// A bare grant lifts a qualified narrowing only on an exact spelling
+    /// match: `bash` does not lift `Bash(git:*)`.
+    #[test]
+    fn bare_grant_lifts_qualified_narrowing_only_on_exact_case() {
+        let allowed = |entries: &[&str]| CapabilitiesConfig {
+            allowed_tools: entries.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let n = allowed(&["bash", "Bash(git:*)"]).native_tool_constraints();
+        assert!(n.needs_no_shell(), "case-mismatched bare grant must not lift: {n:?}");
+        let n = allowed(&["Bash", "Bash(git:*)"]).native_tool_constraints();
+        assert!(!n.needs_no_shell(), "exact bare grant lifts the narrowing: {n:?}");
+    }
+
+    /// Daybreak round 2 #2: `scoped_tools` copied to a member restricts the
+    /// native families it covers (no grant context exists at spawn).
+    #[test]
+    fn native_tool_constraints_classify_scoped_tools() {
+        let scoped = |entries: &[&str]| CapabilitiesConfig {
+            scoped_tools: entries.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        for c in [scoped(&["Bash"]), scoped(&["Bash(git:*)"]), scoped(&["shell_exec"]), scoped(&["run_command"]), scoped(&["*"])] {
+            let n = c.native_tool_constraints();
+            assert!(n.needs_no_shell(), "{c:?}: {n:?}");
+            assert!(n.reasons().contains("scoped_tools"), "{n:?}");
+        }
+        for c in [scoped(&["Write"]), scoped(&["Edit"]), scoped(&["fs_write"]), scoped(&["apply_patch"])] {
+            let n = c.native_tool_constraints();
+            assert!(n.needs_read_only() && !n.needs_no_shell(), "{c:?}: {n:?}");
+        }
+        // MCP-only scoped entries leave the native tools alone — a
+        // server-qualified entry names MCP tools, never a native CLI tool.
+        for c in [
+            scoped(&["mail_send"]),
+            scoped(&["mcp__duduclaw__*"]),
+            scoped(&["mcp__duduclaw"]),
+            scoped(&["mcp__other__Bash"]),
+            scoped(&["memory_*"]),
+            scoped(&["team_handoff"]),
+        ] {
+            assert!(c.native_tool_constraints().is_empty(), "{c:?}");
+        }
+    }
+
+    /// Round 3 #1: `denied_tools`, qualified `allowed_tools` and
+    /// `action_rules` recognise every spelling of the native families — the
+    /// PolicyKernel's (`apply_patch`, `shell`, `run_shell_command`, …) and
+    /// the canonical `fs_write` / `shell_exec` — exactly as the approval /
+    /// scoped lists do. Each of these used to yield no constraint, so Codex
+    /// spawned workspace-write with its own shell / apply_patch.
+    #[test]
+    fn native_tool_constraints_recognise_every_family_spelling() {
+        let rules = |json: serde_json::Value| CapabilitiesConfig {
+            action_rules: crate::tool_effect::ActionRules::from_value(json),
+            ..Default::default()
+        };
+        let block = |tool: &str| rules(serde_json::json!([{ "tool": tool, "verdict": "block" }]));
+        let ask = |tool: &str| rules(serde_json::json!([{ "tool": tool, "verdict": "ask" }]));
+        // The shell ⇒ refused.
+        for c in [
+            caps(false, false, &[], &["shell"]),
+            caps(false, false, &[], &["shell_exec"]),
+            caps(false, false, &[], &["run_shell_command"]),
+            caps(false, false, &[], &["run_command"]),
+            caps(false, false, &[], &["shell(rm:*)"]),
+            caps(false, false, &[], &["run_*"]),
+            caps(false, false, &["Read", "Write", "shell(git:*)"], &[]),
+            caps(false, false, &["Read", "Write", "run_shell_command(git *)"], &[]),
+            // A bare grant of another spelling does not lift the narrowing.
+            caps(false, false, &["Read", "Write", "Bash", "shell(git:*)"], &[]),
+            block("shell"),
+            block("shell_exec"),
+            ask("run_shell_command"),
+            ask("run_command"),
+        ] {
+            let n = c.native_tool_constraints();
+            assert!(n.needs_no_shell() && n.needs_read_only(), "{c:?}: {n:?}");
+        }
+        // Writes only ⇒ read-only, the shell stays.
+        for c in [
+            caps(false, false, &[], &["apply_patch"]),
+            caps(false, false, &[], &["fs_write"]),
+            caps(false, false, &[], &["write_file"]),
+            caps(false, false, &[], &["write_to_file"]),
+            caps(false, false, &[], &["apply_patch(secrets/**)"]),
+            caps(false, false, &["Read", "Bash", "apply_patch(src/**)"], &[]),
+            caps(false, false, &["Read", "Bash", "fs_write(src/**)"], &[]),
+            block("apply_patch"),
+            block("fs_write"),
+            ask("write_file"),
+            ask("write_to_file"),
+        ] {
+            let n = c.native_tool_constraints();
+            assert!(n.needs_read_only() && !n.needs_no_shell(), "{c:?}: {n:?}");
+        }
+        // Unchanged: the same tool bare and qualified; MCP-only rules / lists.
+        for c in [
+            caps(false, false, &["Read", "shell", "shell(git:*)"], &[]),
+            caps(false, false, &["Read", "apply_patch", "apply_patch(src/**)"], &[]),
+            // Every write spelling denied by canonical name ⇒ read-only by
+            // the coarse mapping, like denying Claude's five write tools.
+            caps(false, false, &[], &["shell_exec", "fs_write"]),
+            block("mail_send"),
+            rules(serde_json::json!([{ "effect": "send", "verdict": "ask" }])),
+        ] {
+            assert!(c.native_tool_constraints().is_empty(), "{c:?}: {:?}", c.native_tool_constraints());
+        }
+        // The family effect class: `modify = ask` reaches `apply_patch` /
+        // `fs_write` (writes only), `admin = ask` the shell spellings.
+        let n = rules(serde_json::json!([{ "effect": "modify", "verdict": "ask" }])).native_tool_constraints();
+        assert!(n.no_exec.is_empty() && n.reasons().contains("`apply_patch`") && n.reasons().contains("`fs_write`"), "{n:?}");
+        let n = rules(serde_json::json!([{ "effect": "admin", "verdict": "ask" }])).native_tool_constraints();
+        assert!(n.reasons().contains("`shell`") && n.reasons().contains("`shell_exec`"), "{n:?}");
+        assert_eq!(n.no_exec.len(), 1, "one action_rules reason per family: {n:?}");
+    }
+
+    /// Round 3 #1: `write_tools_allowed` (the coarse mapping) is family-aware
+    /// on the same family definition.
+    #[test]
+    fn write_tools_allowed_is_family_aware() {
+        let allowlists: [&[&str]; 5] = [
+            &["Read", "apply_patch"],
+            &["Read", "shell"],
+            &["Read", "fs_write"],
+            &["Read", "shell_exec"],
+            &["Read", "write_file(src/**)"],
+        ];
+        for allowed in allowlists {
+            let c = caps(false, false, allowed, &[]);
+            assert!(c.write_tools_allowed(), "{allowed:?}");
+            assert_eq!(c.sandbox_level(), SandboxLevel::WorkspaceWrite, "{allowed:?}");
+            let view = c.read_only_native_view();
+            assert_eq!(view.sandbox_level(), SandboxLevel::ReadOnly, "{allowed:?}");
+        }
+        let not_writable: [(&[&str], &[&str]); 6] = [
+            (&["Read", "BashOutput", "KillShell"], &[]),
+            (&["Read", "apply_patch"], &["fs_write"]),
+            (&["Read", "shell"], &["shell"]),
+            (&["Read", "Bash", "Write"], &["shell_exec", "fs_write"]),
+            (&[], &["shell_exec", "fs_write"]),
+            (&[], &["Bash", "fs_write"]),
+        ];
+        for (allowed, denied) in not_writable {
+            let c = caps(false, false, allowed, denied);
+            assert!(!c.write_tools_allowed(), "{allowed:?} / {denied:?}");
+        }
+        // Denying another runtime's spellings bare keeps the Claude tools, so
+        // the level stays writable — and the constraint refuses the coarse
+        // runtime instead.
+        let c = caps(false, false, &[], &["shell", "apply_patch"]);
+        assert!(c.write_tools_allowed());
+        let n = c.native_tool_constraints();
+        assert!(n.needs_no_shell() && !n.no_write.is_empty(), "{n:?}");
+    }
+
+    /// Round 3 #2: a server-qualified `denied_tools` / `allowed_tools` entry
+    /// names MCP tools only. `denied_tools = ["mcp__duduclaw__*"]` used to
+    /// refuse Codex. The approval lists keep the broader reading.
+    #[test]
+    fn server_qualified_list_entries_never_restrict_native_tools() {
+        for c in [
+            caps(false, false, &[], &["mcp__duduclaw__*"]),
+            caps(false, false, &[], &["mcp__duduclaw"]),
+            caps(false, false, &[], &["mcp__duduclaw__Bash"]),
+            caps(false, false, &[], &["mcp__other__shell", "mcp__other__apply_patch"]),
+            caps(false, false, &["Read", "Write", "Bash", "mcp__duduclaw__*"], &["mcp__duduclaw__*"]),
+            caps(false, false, &["Read", "Write", "Bash", "mcp__duduclaw__memory_search(x)"], &[]),
+        ] {
+            assert!(c.native_tool_constraints().is_empty(), "{c:?}: {:?}", c.native_tool_constraints());
+        }
+        let c = CapabilitiesConfig { approval_required_tools: vec!["mcp__duduclaw__*".into()], ..Default::default() };
+        assert!(c.native_tool_constraints().needs_no_shell(), "approval lists keep the fail-safe reading");
+    }
+
+    /// Daybreak round 2 #3: the classifier and the PolicyKernel share one
+    /// selector matcher. `" * "` is not an unconditional wildcard for the
+    /// kernel (it is default-deny there), so it is not allow-all natively.
+    #[test]
+    fn native_policy_classifier_uses_the_kernels_selector_matcher() {
+        assert!(rule("*", PolicyEffect::Allow).is_unconditional_wildcard());
+        for not_wild in [" * ", "* ", "\t*"] {
+            let r = rule(not_wild, PolicyEffect::Allow);
+            assert!(!r.is_unconditional_wildcard(), "{not_wild:?}");
+            assert!(!r.selector_matches("Bash") && !r.selector_matches("memory_search"), "{not_wild:?}");
+            let n = with_policy(vec![r]).native_tool_constraints();
+            assert!(n.needs_no_shell(), "{not_wild:?} must not count as allow-all: {n:?}");
+            let n = with_policy(vec![rule(not_wild, PolicyEffect::Allow), rule("mail_send", PolicyEffect::Forbid)])
+                .native_tool_constraints();
+            assert!(n.needs_no_shell(), "{not_wild:?}: {n:?}");
+        }
+        // The family mapping is the kernel's.
+        assert_eq!(policy_canonical_tool("Bash"), "shell_exec");
+        assert_eq!(policy_canonical_tool("apply_patch"), "fs_write");
+        assert_eq!(policy_canonical_tool("memory_store"), "mcp_call");
+        assert!(rule("shell_exec", PolicyEffect::Allow).selector_matches("run_shell_command"));
+        assert!(!rule("bash", PolicyEffect::Allow).selector_matches("Bash"));
+        // Conditional `*` allow is not unconditional.
+        let mut conditional = rule("*", PolicyEffect::Allow);
+        conditional.when = vec![ArgCondition { arg: "command".into(), op: ArgOp::StartsWith, value: "git ".into() }];
+        assert!(!conditional.is_unconditional_wildcard());
+        let n = with_policy(vec![conditional]).native_tool_constraints();
+        assert!(n.needs_no_shell() && n.needs_read_only(), "{n:?}");
+    }
+
+    /// Daybreak round 2 #4: a policy restricts a native runtime only when a
+    /// rule can match a native tool or its family; MCP-only rules do not.
+    #[test]
+    fn native_policy_restricts_only_what_reaches_native_tools() {
+        use super::PolicyEffect::{Allow, Ask, Forbid};
+        // Not restricted: every rule names MCP tools, or `*` allows all and
+        // only MCP tools are held.
+        for policy in [
+            vec![rule("*", Allow)],
+            vec![rule("*", Allow), rule("mail_send", Forbid)],
+            vec![rule("*", Allow), rule("mcp_call", Ask), rule("mcp__other__*", Forbid)],
+            vec![rule("memory_search", Allow)],
+            vec![rule("memory_search", Allow), rule("mail_send", Ask)],
+            vec![rule("shell_exec", Allow), rule("fs_write", Allow), rule("mail_send", Forbid)],
+        ] {
+            let c = with_policy(policy);
+            assert!(c.native_tool_constraints().is_empty(), "{:?}: {:?}", c.policy, c.native_tool_constraints());
+        }
+        // The shell only.
+        for policy in [
+            vec![rule("*", Allow), rule("shell_exec", Forbid)],
+            vec![rule("*", Allow), rule("Bash", Ask)],
+            vec![rule("*", Allow), rule(" bash ", Forbid)],
+            vec![rule("*", Allow), rule("run_command", Forbid)],
+            vec![rule("fs_write", Allow)],
+        ] {
+            let n = with_policy(policy.clone()).native_tool_constraints();
+            assert!(n.needs_no_shell(), "{policy:?}: {n:?}");
+            assert!(n.no_write.is_empty(), "{policy:?}: {n:?}");
+        }
+        // Writes only ⇒ read-only, the shell stays.
+        for policy in [
+            vec![rule("*", Allow), rule("fs_write", Forbid)],
+            vec![rule("*", Allow), rule("Write", Ask)],
+            vec![rule("*", Allow), rule("apply_patch", Forbid)],
+            vec![rule("shell_exec", Allow)],
+        ] {
+            let n = with_policy(policy.clone()).native_tool_constraints();
+            assert!(n.needs_read_only() && !n.needs_no_shell(), "{policy:?}: {n:?}");
+        }
+        // Both: `*` held, or a conditional `*` rule.
+        let mut conditional_forbid = rule("*", Forbid);
+        conditional_forbid.when = vec![ArgCondition { arg: "path".into(), op: ArgOp::Contains, value: "secret".into() }];
+        for policy in [vec![rule("*", Ask)], vec![rule("*", Allow), conditional_forbid]] {
+            let n = with_policy(policy.clone()).native_tool_constraints();
+            assert!(n.needs_no_shell() && !n.no_write.is_empty(), "{policy:?}: {n:?}");
+        }
+    }
+
+    #[test]
+    fn read_only_native_view_is_read_only_and_keeps_the_rest() {
+        let mut c = caps(true, true, &["Read", "Write"], &["mail_send"]);
+        c.native_sandbox = true;
+        let view = c.read_only_native_view();
+        assert_eq!(view.sandbox_level(), SandboxLevel::ReadOnly);
+        assert!(view.native_sandbox);
+        assert_eq!(view.allowed_tools, c.allowed_tools);
+        assert!(view.denied_tools.iter().any(|d| d == "mail_send"));
+        assert_eq!(c.sandbox_level(), SandboxLevel::FullAccess, "the original is untouched");
     }
 
     #[test]
@@ -3804,6 +4561,37 @@ pub struct AgentConfig {
     /// uses (narrowing only); see [`crate::knowledge_agent`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge: Option<crate::knowledge_agent::KnowledgeAgentConfig>,
+    /// `[isolation]` — native Linux protected-mode switches; see
+    /// [`IsolationSection`]. Admin-only (frozen against the employee's own
+    /// writes by `org_field_guard`).
+    #[serde(default, skip_serializing_if = "IsolationSection::is_default")]
+    pub isolation: IsolationSection,
+}
+
+/// `agent.toml [isolation]` — per-employee switches that only native Linux
+/// protected mode reads. Every key defaults to "no extra authority".
+///
+/// ```toml
+/// [isolation]
+/// public_web = false
+/// ```
+///
+/// `public_web` (owner decision 2026-11-08): whether this employee's
+/// protected runs may use the public-web tools (`web_fetch_cached`,
+/// `web_extract`) through the signed "any public HTTPS site" grant. It is
+/// separate from `[container] network_access`, which only controls the task
+/// sandbox's network. Only an admin sets it (the employee's own Write/Edit of
+/// `agent.toml` is refused for the whole `[isolation]` section).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct IsolationSection {
+    pub public_web: bool,
+}
+
+impl IsolationSection {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// How the system prompt is assembled.
@@ -3853,6 +4641,12 @@ pub struct PromptConfig {
     ///
     /// See [#15 in commercial/docs/plans/TODO-runtime-health-fixes-202605.md].
     pub cli_bare_mode: bool,
+    /// Per-employee reply language override (`[prompt] reply_language`).
+    /// One of `auto` / `zh-TW` / `zh-CN` / `en` / `ja-JP`; `auto` follows the
+    /// user's input language. Absent ⇒ inherit `config.toml [general]
+    /// default_language`. See `profile_sections::resolve_reply_language_setting`.
+    #[serde(default, deserialize_with = "crate::lenient::opt", skip_serializing_if = "Option::is_none")]
+    pub reply_language: Option<String>,
 }
 
 impl Default for PromptConfig {
@@ -3861,6 +4655,7 @@ impl Default for PromptConfig {
             mode: PromptMode::Full,
             minimal_core_kb: 5,
             cli_bare_mode: false,
+            reply_language: None,
         }
     }
 }

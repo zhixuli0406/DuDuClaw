@@ -97,13 +97,12 @@ servers, copy only the `duduclaw` object into its `mcpServers`.
 ## What you get
 
 The key carries four scopes: `memory:read`, `memory:write`, `wiki:read`,
-`wiki:write`. `tools/list` shows exactly the 24 tools those scopes can call:
+`wiki:write`. `tools/list` shows exactly the 23 tools those scopes can call:
 
 | Area | Tools |
 |---|---|
 | Memory | `memory_store`, `memory_search`, `memory_read`, `memory_fetch_batch`, `memory_get_history`, `memory_get_at`, `memory_alias_add`, `memory_alias_list`, `memory_improve` |
 | User profile | `user_profile_record`, `user_profile_get`, `user_code_profile` |
-| Code map | `code_map` (symbol map of the directory given in `root`, or the server's working directory) |
 | Wiki | `wiki_write`, `wiki_read`, `wiki_ls`, `wiki_search`, `wiki_stats`, `wiki_lint`, `wiki_graph`, `wiki_export`, `wiki_dedup`, `wiki_rebuild_fts`, `wiki_share` |
 
 Where the data lives:
@@ -144,6 +143,7 @@ is not an AI employee:
 | `working_state_get` / `_set` / `_clear` / `_handoff` | Refused (`-32003`). They act for the AI employee that runs the server (`unknown agent: dudu` when there is none) |
 | `memory_search_by_layer`, `memory_successful_conversations`, `memory_episodic_pressure`, `memory_consolidation_status` | Refused (`-32003`). They read the default employee's memories, not the client's |
 | `shared_wiki_delete`, `wiki_namespace_status`, `canvas_push`, `canvas_clear` | Refused (`-32003`). They judge or act as the default employee |
+| `code_map` | Refused (`-32003`) since v1.81. It scans only the calling AI employee's own directory (or an operator-declared `[files] allowed_roots` entry); a key that is not an employee has no directory to scan |
 | `messaging:send` (`send_message`, `send_photo`, `send_sticker`, `synthesize_speech`, `transcribe_audio`) | Need channels configured in `config.toml` (`Unknown channel`) or an external speech service |
 | `mail:read` / `mail:send` | Cannot be granted to an external key; `mail_*` are refused to it like the rows above. The mail worker runs in the gateway |
 | `team:handoff` | Cannot be granted to an external key; needs a task from the gateway's goal loop |

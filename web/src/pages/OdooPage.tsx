@@ -113,6 +113,7 @@ export function OdooPage() {
   const [scanStatus, setScanStatus] = useState<OdooSchemaScanStatus | null>(null);
   const [scanDiff, setScanDiff] = useState<OdooSchemaDiff | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
+  const [scanResults, setScanResults] = useState<{ employee: string; status: 'ok' | 'failed'; message?: string }[]>([]);
 
   // Schema discovery ("解析資料庫")
   const [discovering, setDiscovering] = useState(false);
@@ -269,8 +270,12 @@ export function OdooPage() {
     if (!isAdmin) return;
     setScanning(true);
     setScanError(null);
+    setScanResults([]);
     try {
       const res = await api.odoo.scanSchema();
+      setScanResults(res.results ?? []);
+      setScanStatus(res.schema ?? null);
+      setScanDiff(res.diff ?? null);
       if (!res.success) {
         setScanError(res.message || t('odoo.schema.failed'));
         return;
@@ -475,6 +480,20 @@ export function OdooPage() {
                 )}
               </>
             ) : <p className="text-muted-foreground">{t('odoo.scan.none')}</p>}
+            {scanResults.length > 0 && (
+              <div>
+                <p>{t('odoo.scan.employeeResults')}</p>
+                <ul className="space-y-1">
+                  {scanResults.map((result) => (
+                    <li key={result.employee} className={result.status === 'failed' ? 'text-destructive' : undefined}>
+                      {result.employee === 'default' ? t('odoo.scan.globalConnection') : result.employee}
+                      {'：'}{t(result.status === 'ok' ? 'odoo.scan.employeeOk' : 'odoo.scan.employeeFailed')}
+                      {result.message && <span> — {result.message}</span>}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {scanDiff && <p>{intl.formatMessage({ id: 'odoo.scan.diff' }, {
               addedModels: scanDiff.added_models.length, removedModels: scanDiff.removed_models.length,
               addedFields: scanDiff.added_fields.length, removedFields: scanDiff.removed_fields.length,
@@ -762,7 +781,7 @@ function AgentOdooOverride({ pickedModels }: { pickedModels?: string[] }) {
                 <ReadOnlyRow label={t('agents.odoo.allowedModels')} value={cfg?.allowed_models?.length ? listOrDash(cfg.allowed_models) : t('odoo.permissions.modelsUnrestricted')} />
                 <ReadOnlyRow
                   label={t('agents.odoo.unblockModels')}
-                  value={listOrDash(cfg?.unblock_models)}
+                  value={listOrDash(cfg?.unblock_models ?? undefined)}
                 />
                 <div className="space-y-1 px-4 py-3 text-sm"><p className="text-muted-foreground">{t('agents.odoo.allowedActions')}</p><OdooPermissionSummary actions={cfg?.allowed_actions ?? []} /></div>
                 <ReadOnlyRow

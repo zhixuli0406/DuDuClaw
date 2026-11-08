@@ -90,6 +90,9 @@ pub const AGENT_CAPABILITY_SECTION: &str = "capabilities";
 ///   including the verifier that judges this employee's own output.
 /// - `google` — which Google account the employee acts as (a delegated
 ///   colleague's mailbox is a person's data, so only an admin sets it).
+/// - `isolation` — native Linux protected-mode switches; `public_web` decides
+///   whether the capability issuer grants the public-web tools (owner
+///   decision 2026-11-08, separate from `[container] network_access`).
 ///
 /// Since G1 round 3 the freeze itself is an allow-list
 /// ([`AGENT_EDITABLE_SECTIONS`]): every section not listed editable is frozen,
@@ -116,6 +119,8 @@ pub const AGENT_SECURITY_SECTIONS: &[&str] = &[
     "knowledge",
     // Which Google identity the employee acts as (admin-set).
     "google",
+    // Protected-mode switches (`public_web`), admin-set only.
+    "isolation",
 ];
 
 /// The only `agent.toml` sections the agent may still edit with Write/Edit
@@ -156,11 +161,12 @@ pub const AGENT_EDITABLE_SECTIONS: &[&str] = &[
 ///   shared page.
 /// - `[prompt] cli_bare_mode` — adds `--bare`, which makes the Claude CLI skip
 ///   hooks (this one included).
+/// - `[prompt] reply_language` — administrator-set reply language.
 /// - `[model] account_pool` — which rotator accounts (whose credentials and
 ///   quota) the agent may spend.
 pub const AGENT_SECURITY_KEYS: &[(&str, &[&str])] = &[
     ("agent", &["role"]),
-    ("prompt", &["cli_bare_mode"]),
+    ("prompt", &["cli_bare_mode", "reply_language"]),
     ("model", &["account_pool"]),
 ];
 

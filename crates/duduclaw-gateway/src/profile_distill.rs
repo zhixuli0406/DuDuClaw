@@ -788,6 +788,35 @@ pub(crate) async fn store_profile_traits_capped(
     (written, held, capped)
 }
 
+/// RM-039 privacy gate over distilled traits (see `crate::memory_privacy`).
+/// The subject is the speaker's profile subject, so a trait the user forgot
+/// through `me.memory.forget` is matched by its exact `(subject, predicate,
+/// value)` key.
+fn filter_private_traits(
+    home_dir: &Path,
+    agent_id: &str,
+    user_id: &str,
+    traits: Vec<ProfileTraitCandidate>,
+) -> Vec<ProfileTraitCandidate> {
+    let gate = crate::memory_privacy::PrivacyGate::for_home(home_dir);
+    let subject = duduclaw_memory::user_profile::user_subject(user_id);
+    let mut report = crate::memory_privacy::FilterReport::default();
+    let kept: Vec<ProfileTraitCandidate> = traits
+        .into_iter()
+        .filter(|t| {
+            let content = format!("{}: {}", t.predicate, t.value);
+            report.record(gate.check(&crate::memory_privacy::FactParts {
+                content: &content,
+                subject: Some(&subject),
+                predicate: Some(&t.predicate),
+                object: Some(&t.value),
+            }))
+        })
+        .collect();
+    report.log(agent_id, "profile_distill");
+    kept
+}
+
 /// First stage of the distillation pipeline: capture the user's self-stated
 /// profile traits. Best-effort — every failure is logged and swallowed, the
 /// reply path is never affected.
@@ -809,6 +838,12 @@ pub async fn run_profile_distill(
         return;
     }
     let traits = extract_profile_traits(user_text);
+    if traits.is_empty() {
+        return;
+    }
+    // RM-039: a self-statement about an excluded personal topic ("我喜歡跟老婆
+    // 去爬山") or a trait this user deleted from "my memory" is not recorded.
+    let traits = filter_private_traits(home_dir, agent_id, user_id, traits);
     if traits.is_empty() {
         return;
     }
@@ -1366,6 +1401,36 @@ mod tests {
             .await
             .unwrap()
             .is_some(), "a real speaker still gets a profile");
+    }
+
+    /// RM-039: a self-statement about an excluded topic is not recorded (the
+    /// default categories apply with no config at all); an ordinary
+    /// preference in the same message still is.
+    #[tokio::test]
+    async fn excluded_topics_never_become_profile_traits() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("memory.db");
+        run_profile_distill(
+            "我喜歡跟老婆去爬山。我不喜歡冗長的說明",
+            "a1",
+            "u1",
+            &db,
+            home.path(),
+            &crate::memory_provenance::test_sources(),
+        )
+        .await;
+        let engine = SqliteMemoryEngine::new(&db).unwrap();
+        let traits = duduclaw_memory::user_profile::profile_traits(&engine, "a1", "u1")
+            .await
+            .unwrap();
+        assert!(
+            traits.iter().all(|t| !t.value.contains("老婆")),
+            "family trait must be withheld: {traits:?}"
+        );
+        assert!(
+            traits.iter().any(|t| t.value == "冗長的說明"),
+            "ordinary preference still lands: {traits:?}"
+        );
     }
 
     /// M2 origin binding: distilled self-statements declare the

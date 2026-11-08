@@ -294,6 +294,12 @@ async fn pending_isolation_approval<F: std::future::Future<Output = Result<Strin
     if crate::isolation_background::approval_pending() {
         return Err(DispatchError::AutonomyPaused("背景工作正在等候管理員核准。".into()));
     }
+    // A scope that holds no authority and knows why (a task reassigned to
+    // another employee or deleted, a Personal employee, a pre-v1.81 receipt)
+    // records that reason instead of failing later at the protected launch.
+    if let Some(reason) = crate::isolation_background::refusal_reason() {
+        return Err(DispatchError::Other(reason.into()));
+    }
     future.await
 }
 
@@ -917,6 +923,73 @@ fn dispatch_failure_reply(error: &DispatchError) -> String {
             format!("⚠️ 子任務處理失敗：{label}。請稍後再試或改寫指令。")
         }
     }
+}
+
+/// RM-087: if `message_id` is the generation request of a custom-skill row that
+/// is still `generating`, record a failure (error → reason, status → `draft`,
+/// the existing editable state) when the dispatch errored or left no draft.
+/// Best-effort: store errors are logged at debug and never affect dispatch.
+async fn settle_custom_skill_generation(
+    home_dir: &Path,
+    message_id: &str,
+    agent_id: &str,
+    outcome: Result<(), &str>,
+) {
+    let Ok(store) = crate::custom_skills::CustomSkillStore::open(home_dir) else {
+        return;
+    };
+    let Ok(Some(rec)) = store.get_by_generation_message(message_id).await else {
+        return;
+    };
+    // `rec` was looked up by this message id, so this is the attempt's own path.
+    let draft_nonempty =
+        crate::custom_skills::file_nonempty(&crate::custom_skills::current_draft_path(home_dir, &rec));
+    let Some(reason) = crate::custom_skills::generation_failure_reason(
+        &rec,
+        Some("dashboard"),
+        message_id,
+        outcome,
+        draft_nonempty,
+    ) else {
+        return;
+    };
+    match store.fail_generation(&rec.id, Some(message_id), &reason).await {
+        Ok(true) => warn!(
+            skill_id = %rec.id,
+            agent = %agent_id,
+            reason = %reason,
+            "custom skill generation failed"
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::debug!(skill_id = %rec.id, error = %e, "could not record generation failure"),
+    }
+}
+
+/// Machine-readable reason code (`dispatch:<label>`) stored on a failed
+/// custom-skill generation; the dashboard localizes it. Never raw error text.
+fn dispatch_failure_code(error: &DispatchError) -> String {
+    use crate::channel_reply::FailureReason;
+    let label = match error {
+        DispatchError::OriginStopped => "stopped",
+        DispatchError::Budget(_) => "budget",
+        DispatchError::AutonomyPaused(_) => "autonomy_paused",
+        DispatchError::Sandbox(_) => "sandbox",
+        DispatchError::Other(e) => match crate::channel_reply::classify_cli_failure(e) {
+            FailureReason::BinaryMissing => "binary_missing",
+            FailureReason::AuthFailed => "auth_failed",
+            FailureReason::RateLimited => "rate_limited",
+            FailureReason::Billing => "billing",
+            FailureReason::Timeout => "timeout",
+            FailureReason::SpawnError => "spawn_error",
+            FailureReason::EmptyResponse => "empty_response",
+            FailureReason::NoAccounts => "no_accounts",
+            FailureReason::AccountsCoolingDownLong
+            | FailureReason::AccountsCoolingDownShort
+            | FailureReason::AccountsCoolingDownUnknown => "cooling_down",
+            FailureReason::Unknown => "unknown",
+        },
+    };
+    format!("dispatch:{label}")
 }
 
 /// Short zh-TW category label for a classified dispatch failure, used only in
@@ -1564,6 +1637,22 @@ async fn poll_and_dispatch(
                 permission_blocked,
                 "Agent dispatch completed"
             );
+
+            // RM-087: a dashboard-origin reply may be the outcome of a custom-skill
+            // "generate" request. Nobody else consumes it, so settle the row here.
+            if msg.origin_agent.as_deref() == Some("dashboard") {
+                let failure_code = result.as_ref().err().map(dispatch_failure_code);
+                settle_custom_skill_generation(
+                    &home,
+                    &msg.message_id,
+                    &msg.agent_id,
+                    match &failure_code {
+                        None => Ok(()),
+                        Some(code) => Err(code.as_str()),
+                    },
+                )
+                .await;
+            }
 
             // Clone response text before moving into BusMessage (needed for callback forwarding)
             let response_for_callback = response_text.clone();

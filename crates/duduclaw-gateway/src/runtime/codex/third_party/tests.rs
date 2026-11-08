@@ -567,6 +567,7 @@ skill_security_scan = false
         effort: None,
         instruction: "do work".into(),
         tools: vec!["team_handoff".into()],
+        extra_denied: Vec::new(),
     };
     let member = crate::ephemeral::scaffold_role_member(home, &spec).unwrap();
     let before = file_bytes(&member.dir);

@@ -1516,7 +1516,19 @@ impl AgentRuntime for CodexRuntime {
 
         // W1 (capability enforcement): derive sandbox/approval flags from the
         // agent's capabilities instead of the former blanket `--full-auto`.
-        let caps = context.capabilities.as_ref();
+        //
+        // RM-103 S3 (Daybreak #2): Codex's own `apply_patch` and shell never
+        // reach the MCP gate, so a native write/shell restriction it cannot
+        // express (an inherited `modify = ask`, `Bash(git:*)`, …) forces
+        // `-s read-only` or refuses the spawn — before anything is prepared.
+        // `-s read-only` really blocks writes, so it is enforceable here.
+        let coarse_caps = super::coarse_native_caps(
+            context.capabilities.as_ref(),
+            "codex",
+            &context.agent_id,
+            true,
+        )?;
+        let caps = coarse_caps.as_ref().or(context.capabilities.as_ref());
         let level = sandbox_level_for(caps);
         // Decided 2026-09-28 (option A): ReadOnly buys real write blocking at
         // the price of the MCP tool surface, because `-s read-only` and
@@ -2760,6 +2772,125 @@ mod tests {
             !args.iter().any(|a| a.starts_with("sandbox_mode=")),
             "the advisory config-key form must not linger alongside the real flag: {args:?}"
         );
+    }
+
+    /// RM-103 S3 (Daybreak #2): the sandbox Codex spawns with is chosen from
+    /// the member's effective config through `coarse_native_caps`, exactly as
+    /// `execute` does.
+    fn codex_spawn_sandbox(c: &CapabilitiesConfig) -> Result<Vec<String>, String> {
+        let view = super::super::coarse_native_caps(Some(c), "codex", "eph-test", true)?;
+        Ok(sandbox_args(view.as_ref().or(Some(c))))
+    }
+
+    /// An inherited `modify = ask` (or an approval list naming a write tool)
+    /// used to spawn an executor `workspace-write` because its allowlist holds
+    /// `Write`, so `apply_patch` skipped the approval. It is now `-s read-only`.
+    #[test]
+    fn inherited_modify_ask_forces_read_only() {
+        let mut executor = caps(false, false, &["team_handoff", "Read", "Write", "Edit", "Grep"], &[]);
+        assert_eq!(declared_sandbox(&sandbox_args(Some(&executor))).as_deref(), Some("workspace-write"));
+        executor.action_rules =
+            duduclaw_core::ActionRules::from_value(serde_json::json!([{ "effect": "modify", "verdict": "ask" }]));
+        assert_eq!(
+            codex_spawn_sandbox(&executor).unwrap(),
+            vec!["-s", "read-only", "-c", "approval_policy=never"]
+        );
+        let mut approval = caps(false, false, &[], &[]);
+        approval.approval_required_tools = vec!["Edit".into()];
+        assert_eq!(declared_sandbox(&codex_spawn_sandbox(&approval).unwrap()).as_deref(), Some("read-only"));
+        // A full-access grant is narrowed too (most restrictive wins).
+        let mut full = caps(true, false, &[], &[]);
+        full.irreversible_tools = vec!["Write".into()];
+        assert_eq!(declared_sandbox(&codex_spawn_sandbox(&full).unwrap()).as_deref(), Some("read-only"));
+    }
+
+    /// `Bash(git:*)` (a packet narrowing) used to collapse into
+    /// `workspace-write` with Codex's arbitrary native shell. Codex has no
+    /// mode without a shell, so the spawn is refused with a spawn-gate error.
+    #[test]
+    fn qualified_bash_or_shell_approval_refuses_codex() {
+        let git_only = caps(false, false, &["team_handoff", "Read", "Write", "Bash(git:*)"], &[]);
+        let mut admin_ask = caps(false, false, &[], &[]);
+        admin_ask.action_rules =
+            duduclaw_core::ActionRules::from_value(serde_json::json!([{ "effect": "admin", "verdict": "ask" }]));
+        let mut policy = caps(false, false, &[], &[]);
+        policy.policy = vec![duduclaw_core::types::ToolPolicy {
+            tool: "shell_exec".into(),
+            effect: duduclaw_core::types::PolicyEffect::Forbid,
+            when: vec![],
+        }];
+        let packet_denied = caps(false, false, &["Read", "Write", "Bash"], &["Bash"]);
+        let qualified_deny = caps(false, false, &[], &["Bash(rm:*)"]);
+        for c in [git_only, admin_ask, policy, packet_denied, qualified_deny] {
+            let error = codex_spawn_sandbox(&c).unwrap_err();
+            assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{error}");
+            assert!(error.contains("codex"), "{error}");
+        }
+    }
+
+    /// Daybreak round 2 #2/#3/#4 at the Codex spawn: a scoped native tool or a
+    /// policy that reaches the native tools restricts Codex; a policy whose
+    /// rules only name MCP tools does not (it used to refuse every spawn).
+    #[test]
+    fn scoped_tools_and_native_policy_rules_restrict_codex_mcp_only_policy_does_not() {
+        use duduclaw_core::types::{PolicyEffect, ToolPolicy};
+        let rule = |tool: &str, effect: PolicyEffect| ToolPolicy { tool: tool.into(), effect, when: vec![] };
+        let executor = || caps(false, false, &["team_handoff", "Read", "Write", "Edit", "Bash"], &[]);
+
+        // MCP-only policies: the executor keeps its workspace-write argv.
+        for policy in [
+            vec![rule("*", PolicyEffect::Allow), rule("mail_send", PolicyEffect::Forbid)],
+            vec![rule("memory_search", PolicyEffect::Allow)],
+        ] {
+            let mut c = executor();
+            c.policy = policy;
+            assert_eq!(codex_spawn_sandbox(&c).unwrap(), sandbox_args(Some(&c)), "{:?}", c.policy);
+            assert_eq!(
+                declared_sandbox(&codex_spawn_sandbox(&c).unwrap()).as_deref(),
+                Some("workspace-write"),
+                "{:?}",
+                c.policy
+            );
+        }
+
+        // Shell restricted ⇒ refused: scoped `Bash`, a `" * "` allow (not a
+        // kernel wildcard), a shell forbid.
+        let mut scoped_bash = executor();
+        scoped_bash.scoped_tools = vec!["Bash".into()];
+        let mut spaced = executor();
+        spaced.policy = vec![rule(" * ", PolicyEffect::Allow)];
+        let mut shell_forbid = executor();
+        shell_forbid.policy = vec![rule("*", PolicyEffect::Allow), rule("shell_exec", PolicyEffect::Forbid)];
+        for c in [scoped_bash, spaced, shell_forbid] {
+            let error = codex_spawn_sandbox(&c).unwrap_err();
+            assert!(duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&error), "{error}");
+        }
+
+        // Writes restricted only ⇒ `-s read-only`.
+        let mut scoped_write = executor();
+        scoped_write.scoped_tools = vec!["Write".into()];
+        let mut write_ask = executor();
+        write_ask.policy = vec![rule("*", PolicyEffect::Allow), rule("fs_write", PolicyEffect::Ask)];
+        for c in [scoped_write, write_ask] {
+            assert_eq!(declared_sandbox(&codex_spawn_sandbox(&c).unwrap()).as_deref(), Some("read-only"));
+        }
+    }
+
+    /// Unconstrained configs keep exactly the argv they had.
+    #[test]
+    fn unconstrained_caps_keep_their_codex_sandbox() {
+        for c in [
+            caps(false, false, &[], &[]),
+            caps(false, false, &["Read", "Grep"], &[]),
+            caps(true, false, &[], &[]),
+            caps(false, false, &["Read", "Write", "Bash", "Bash(git:*)"], &[]),
+            // All write tools denied: the documented read-only mapping.
+            caps(false, false, &[], &["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"]),
+        ] {
+            assert!(super::super::coarse_native_caps(Some(&c), "codex", "a", true).unwrap().is_none(), "{c:?}");
+            assert_eq!(codex_spawn_sandbox(&c).unwrap(), sandbox_args(Some(&c)));
+        }
+        assert!(super::super::coarse_native_caps(None, "codex", "a", true).unwrap().is_none());
     }
 
     /// The other two levels are unchanged by the ReadOnly fix — `WorkspaceWrite`

@@ -29,6 +29,14 @@ pub const PERSONAL_REFUSAL: &str =
 /// and allocation) is found. It never authorizes a run.
 pub const LEGACY_REFUSAL: &str =
     "這筆背景工作的執行授權是在目前版本之前核准的，需要由管理員到儀表板重新核准後才會執行。";
+/// Shown when a task run (task/schedule) is asked of an employee that no
+/// longer owns the task: it was reassigned to another employee or deleted.
+/// Owner decision 2026-11-08: such a run is refused outright (no approval card,
+/// no run without the task grant).
+pub const FOREIGN_TASK_REFUSAL: &str =
+    "這項工作已改派給其他員工或已被刪除，不會再以原本的員工執行；請到儀表板確認工作的負責員工。";
+/// Machine-readable reason recorded with a refused foreign task run.
+pub const FOREIGN_TASK_REASON: &str = "task_not_owned";
 const REQUEST_TEXT: &str =
     "請於 24 小時內決定；核准後最多執行 30 天。內容、權限或交辦人憑證變更、取消工作後立即失效。";
 const LEGACY_REQUEST_TEXT: &str = "這筆背景工作的執行授權是在目前版本之前核准的，需要重新核准。\
@@ -83,7 +91,21 @@ pub struct RecordAuthority {
     parent_policy: Option<String>,
     parent: Option<Box<RecordAuthority>>,
     detached_bus: bool,
+    /// F6b (A3): the incarnation of `employee` at capture. Every recheck
+    /// requires the live lifecycle's incarnation to equal it, so a receipt
+    /// captured before a restore never authorizes the restored employee.
+    /// Omitted when 0, so receipts (and the approval payloads that embed
+    /// them) stored before F6 — when every employee was incarnation 0 —
+    /// serialize byte-identically and stay valid.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    incarnation: u32,
+    /// F6b (A3): the incarnation of `caller` (the delegating source
+    /// employee) at capture; compared with the source's live lifecycle.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    caller_incarnation: u32,
 }
+
+fn is_zero(value: &u32) -> bool { *value == 0 }
 
 impl RecordAuthority {
     /// Stored before v1.81: approved without the employee binding and
@@ -174,7 +196,7 @@ async fn request_record_inner(home: &Path, kind: &str, id: &str, agent: &str,
         let root = &lifecycle::RootAllocator;
         // Up front, before any stored receipt is reused or a card is filed: a
         // Personal employee is never authorized for background work (B1).
-        let Some((employee, binding, allocation)) = capture_binding(home, agent, root)? else {
+        let Some((employee, binding, allocation, incarnation)) = capture_binding(home, agent, root)? else {
             return Ok(Capture::Personal);
         };
         let mut legacy = false;
@@ -204,7 +226,8 @@ async fn request_record_inner(home: &Path, kind: &str, id: &str, agent: &str,
             policy: crate::approval::strict_policy_revision(home, agent).map_err(|_| unavailable())?,
             material: digest, approval: None, expires_at: now()?.checked_add(MAX_AUTHORITY_SECONDS)
                 .ok_or(VerificationError::InvalidTime)?, lane: Lane::Standard,
-            caller: None, parent_run: None, parent_agent: None, parent_policy: None, parent: None, detached_bus: false };
+            caller: None, parent_run: None, parent_agent: None, parent_policy: None, parent: None, detached_bus: false,
+            incarnation, caller_incarnation: 0 };
         store::validate_current(&captured)?;
         Ok(Capture::New { receipt: captured, legacy })
     }).await?;
@@ -236,10 +259,11 @@ async fn request_record_inner(home: &Path, kind: &str, id: &str, agent: &str,
 /// from the A2 lifecycle. `None` for a Personal employee: background runs
 /// are refused entirely, so no receipt or approval card is ever created.
 fn capture_binding(home: &Path, agent: &str, root: &dyn RootAllocation)
-    -> Result<Option<(EmployeeId, EmployeeBinding, ProposalBinding)>, VerificationError> {
+    -> Result<Option<(EmployeeId, EmployeeBinding, ProposalBinding, u32)>, VerificationError> {
     let current = current_lifecycle(home, agent, root)?;
     match &current.binding {
-        EmployeeBinding::Shared(_) => Ok(Some((current.employee, current.binding.clone(), current.allocation))),
+        EmployeeBinding::Shared(_) => Ok(Some((current.employee, current.binding.clone(), current.allocation,
+            current.incarnation))),
         EmployeeBinding::Personal(_) => Ok(None),
     }
 }
@@ -251,6 +275,17 @@ pub async fn scope_record<F: Future>(home: &Path, kind: &str, id: &str, agent: &
     let future = Box::pin(future);
     if !duduclaw_core::execution_gate::isolation_required() { return future.await; }
     if RECORD.try_with(|_| ()).is_ok() { return future.await; }
+    // Owner decision 2026-11-08: a task run whose task this employee no longer
+    // owns is refused outright, before any receipt is reused or a card filed.
+    // An unreadable task store also refuses (fail closed), without a reason.
+    if kind == "task" {
+        let (check_home, check_id, check_agent) = (home.to_owned(), id.to_owned(), agent.to_owned());
+        let precheck = duduclaw_mcp_boundary::authority::verify_blocking(move ||
+            Ok(task_run_precheck(&check_home, &check_id, &check_agent))).await.unwrap_or(Err(None));
+        if let Err(reason) = precheck {
+            return REFUSAL.scope(reason, PENDING.scope(false, RECORD.scope(Mutex::new(None), future))).await;
+        }
+    }
     let mut refusal = None;
     if kind != "delegation" {
         refusal = request_record_inner(home, kind, id, agent, owner, material, false).await
@@ -274,6 +309,50 @@ pub async fn scope_record<F: Future>(home: &Path, kind: &str, id: &str, agent: &
     // filed) is refused by recheck; tell the scheduler why.
     if legacy && refusal.is_none() { refusal = Some(LEGACY_REFUSAL); }
     REFUSAL.scope(refusal, PENDING.scope(pending, RECORD.scope(Mutex::new(captured), future))).await
+}
+
+/// Live task ownership, the rule the H8 resolver applies on every `create_task`
+/// call (`isolation_resources` `task_owned` for the task domain) and the H9
+/// issuer applies at issuance: a `tasks.db` row with this id assigned to
+/// `agent`, then the existing audience rule. The store must already exist and
+/// pass the private-SQLite checks; it is never created here. Unreadable ⇒
+/// `Unavailable`; a malformed id ⇒ `Invalid`.
+pub(crate) fn task_owned_now(home: &Path, agent: &str, id: &str) -> Result<bool, VerificationError> {
+    use rusqlite::{params, OptionalExtension};
+    if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) { return Err(VerificationError::Invalid); }
+    let db = crate::fs_safe::sqlite::open_existing(home, "tasks.db", crate::fs_safe::sqlite::Access::ReadOnly)
+        .map_err(|_| unavailable())?;
+    db.busy_timeout(std::time::Duration::from_millis(500)).map_err(|_| unavailable())?;
+    let found = db.query_row("SELECT 1 FROM tasks WHERE id=?1 AND assigned_to=?2", params![id, agent], |_| Ok(()))
+        .optional().map_err(|_| unavailable())?.is_some();
+    if !found { return Ok(false); }
+    let audience = crate::review_evidence::audience::task_audience(home, id);
+    Ok(crate::review_evidence::audience::agent_may_read_task(agent, &[agent], &audience))
+}
+
+/// Record why a task run was refused: one security-audit row
+/// (`isolation_task_run_refused`, reason [`FOREIGN_TASK_REASON`]) scoped to the
+/// employee, naming the task and the stage that refused it (`schedule` before
+/// any approval card, `issuance` in the capability issuer).
+pub(crate) fn record_foreign_task(home: &Path, agent: &str, task: &str, stage: &str) {
+    tracing::warn!(agent, task, stage, "protected task run refused: the task is no longer this employee's");
+    duduclaw_security::audit::append_audit_event(home, &duduclaw_security::audit::AuditEvent::new(
+        "isolation_task_run_refused", agent, duduclaw_security::audit::Severity::Warning,
+        json!({"task": task, "reason": FOREIGN_TASK_REASON, "stage": stage})));
+}
+
+/// The `task` record pre-check of [`scope_record`]: `Ok` when the employee
+/// owns the task now; `Err(Some(FOREIGN_TASK_REFUSAL))` (and an audit row) when
+/// it was reassigned or deleted; `Err(None)` when ownership cannot be read.
+pub(crate) fn task_run_precheck(home: &Path, id: &str, agent: &str) -> Result<(), Option<&'static str>> {
+    match task_owned_now(home, agent, id) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            record_foreign_task(home, agent, id, "schedule");
+            Err(Some(FOREIGN_TASK_REFUSAL))
+        }
+        Err(_) => Err(None),
+    }
 }
 
 fn check_material(receipt: &RecordAuthority, agent: &str, owner: Option<&str>, digest: &str)
@@ -312,8 +391,10 @@ fn check_lifecycle(receipt: &RecordAuthority, current: &EmployeeLifecycle) -> Re
     let (Some(binding), Some(allocation)) = (&receipt.binding, &receipt.allocation) else {
         return Err(VerificationError::Revoked);
     };
+    // F6b (A3): a receipt of a prior incarnation never matches.
     if current.employee != receipt.employee || current.label != receipt.agent
-        || current.allocation != *allocation || current.binding != *binding {
+        || current.allocation != *allocation || current.binding != *binding
+        || current.incarnation != receipt.incarnation {
         return Err(VerificationError::Revoked);
     }
     // B1: a Personal employee is never authorized for background work.
@@ -375,7 +456,10 @@ fn recheck_receipt(receipt: &RecordAuthority, ancestor: bool, check_decision: bo
     else if receipt.kind != "delegation" { return Err(VerificationError::Invalid); }
     if let Some(parent) = &receipt.parent { recheck_receipt(parent, true, true, root)?; }
     if let (Some(agent), Some(policy)) = (&receipt.parent_agent, &receipt.parent_policy) {
-        if Some(current_lifecycle(&receipt.home, agent, root)?.employee) != receipt.caller {
+        // F6b (A3): the delegating source must still be the same employee id
+        // and the same incarnation it was when the delegation was captured.
+        let caller = current_lifecycle(&receipt.home, agent, root)?;
+        if Some(caller.employee) != receipt.caller || caller.incarnation != receipt.caller_incarnation {
             return Err(VerificationError::Revoked);
         }
         let origin = snapshot(&receipt.home, &receipt.owner, agent)?;
@@ -413,12 +497,15 @@ pub(crate) async fn authorize_current(agent_dir: &Path, principal_context: Optio
     let lane = if crate::explore_lane::in_explore() || receipt.lane == Lane::Explore { Lane::Explore } else { Lane::Standard };
     duduclaw_mcp_boundary::authority::verify_blocking(move || {
         recheck(&receipt)?;
+        // H10: the issuer limits the run to `task` and adds the record Task
+        // grant only after its H9 selector read live task ownership; a task
+        // the employee no longer owns refuses the run outright (Revoked,
+        // recorded as `isolation_task_run_refused`, stage `issuance`).
         let mut auth = crate::isolation_mcp::record_authorization(receipt.home.clone(), receipt.agent.clone(),
             user_id(&receipt.owner)?, receipt.epoch, lane,
             crate::isolation_mcp::HostTurn { identity: crate::isolation_egress::RunTurnIdentity {
                 turn, approval_session: session }, metadata: Some(metadata), principal_context,
-                egress_turn, background: Some(receipt.clone()) }, Some(receipt.expires_at))?;
-        if let Some(task) = task { auth.limit_to_task(task)?; }
+                egress_turn, background: Some(receipt.clone()) }, Some(receipt.expires_at), task)?;
         // Queue consumers are detached host waiters. The initiating employee
         // and run remain in the receipt; treating them as a synchronous waiter
         // would deadlock/refuse a valid self-delegation after its parent exits.
@@ -457,6 +544,8 @@ pub(crate) struct DelegationSource {
     /// The source employee's lifecycle principal pinned for this run (SR2:
     /// a Personal source needs its owner's approval card).
     pub binding: EmployeeBinding,
+    /// F6b (A3/A4): the source employee's incarnation pinned for this run.
+    pub incarnation: u32,
 }
 
 /// Called by the original product send handler after its delegation/action
@@ -494,7 +583,7 @@ async fn record_delegation_inner(home: &Path, sender: &str,
             let current = snapshot(&home, &source.owner, &target)?;
             // A queued delegation runs as background work of the target: a
             // Personal target is refused before any receipt is stored.
-            let Some((employee, binding, allocation)) = capture_binding(&home, &target, &lifecycle::RootAllocator)? else {
+            let Some((employee, binding, allocation, incarnation)) = capture_binding(&home, &target, &lifecycle::RootAllocator)? else {
                 tracing::warn!(agent = target.as_str(), "delegation refused: personal employees never run background work");
                 return Err(VerificationError::Invalid);
             };
@@ -506,14 +595,16 @@ async fn record_delegation_inner(home: &Path, sender: &str,
             let policy = crate::approval::strict_policy_revision(&home, &target).map_err(|_| unavailable())?;
             // SR2: Personal source → owner approval card first; Shared → None.
             let gate = personal_delegation::gate(&source.binding, &user_id(&source.owner)?, &source.agent,
-                source.employee, &target, employee, &material)?;
+                source.employee, &target, employee, &material)?
+                .map(|gate| gate.with_source_incarnation(source.incarnation));
             let value = RecordAuthority { home, kind: "delegation".into(), id, agent: target.clone(), employee,
                 binding: Some(binding), allocation: Some(allocation), owner: source.owner, epoch: source.epoch, acl_generation: source.acl_generation,
                 policy_epoch: source.policy_epoch,
                 policy,
                 material: store::material_digest(&material)?, approval: None, expires_at: source.expires_at,
                 lane: source.lane, caller: Some(source.employee), parent_run: Some(source.run),
-                parent_agent: Some(source.agent), parent_policy: Some(source.policy), parent: source.parent.map(Box::new), detached_bus };
+                parent_agent: Some(source.agent), parent_policy: Some(source.policy), parent: source.parent.map(Box::new), detached_bus,
+                incarnation, caller_incarnation: source.incarnation };
             if let Some(gate) = gate { return Ok(Some((value, gate))); }
             if store::load(&value.home, "delegation", &value.id)?.is_some() { return Err(VerificationError::Revoked); }
             store::save(&value).map(|()| None)
@@ -544,7 +635,7 @@ mod tests {
             material: store::material_digest(&json!({"task":"original"})).unwrap(),
             approval: Some("approval-id".into()), expires_at: now().unwrap() + 3600,
             lane: Lane::Standard, caller: None, parent_run: None, parent_agent: None,
-            parent_policy: None, parent: None, detached_bus: false }
+            parent_policy: None, parent: None, detached_bus: false, incarnation: 0, caller_incarnation: 0 }
     }
 
     #[test]

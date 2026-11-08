@@ -112,6 +112,20 @@ pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDe
         normalized.contains(&home_path) || normalized.contains(&format!(".duduclaw/{basename}"))
     });
 
+    // RM-027 — the global org mutation lock and the org-change journal. The
+    // names are DuDuClaw-specific. Any command naming the lock is refused, not
+    // only a "write": `flock … sleep`, `exec 9>…` or `python -c` holds it
+    // without a write verb and would stall every org change. The journal is
+    // refused for write-shaped commands like the store itself.
+    let lock_name = format!("locks/{}", crate::org_store::ORG_MUTATION_LOCK);
+    if normalized.contains(&lock_name) {
+        return GuardDecision::BlockedBashProtectedWrite {
+            file_name: format!("{}.lock", crate::org_store::ORG_MUTATION_LOCK),
+            verb: "lock".to_string(),
+        };
+    }
+    let mentions_org_journal = normalized.contains(crate::org_store::ORG_CHANGE_JOURNAL_DIR);
+
     // Identity / enforcement surface (see `check_identity_surface_write`).
     // `.mcp.json` and `identity.key` are DuDuClaw-specific basenames; the hook
     // settings file is matched only through its `.claude/` parent so a
@@ -126,6 +140,7 @@ pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDe
         && !mentions_agent_toml
         && !mentions_home_config
         && !mentions_org_store
+        && !mentions_org_journal
         && !mentions_mcp_json
         && !mentions_identity_key
         && !mentions_hook_settings
@@ -143,6 +158,8 @@ pub(super) fn bash_protected_basenames(normalized: &str, home: &Path) -> GuardDe
         "agent.toml"
     } else if mentions_org_store {
         crate::org_store::ORG_STORE_FILE
+    } else if mentions_org_journal {
+        crate::org_store::ORG_CHANGE_JOURNAL_DIR
     } else if mentions_home_config {
         "config.toml"
     } else if mentions_identity_key {

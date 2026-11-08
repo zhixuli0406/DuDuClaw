@@ -42,6 +42,7 @@ pub mod isolation_connector_clients;
 pub mod isolation_connector_lifecycle;
 pub(crate) mod isolation_connector_events;
 pub mod isolation_connector_boot;
+pub mod isolation_connector_stack;
 pub mod isolation_connector_details;
 pub mod isolation_connector_channel;
 pub mod isolation_connector_model;
@@ -60,6 +61,7 @@ pub mod isolation_readiness;
 // not yet called from production code.
 #[allow(dead_code)]
 pub(crate) mod isolation_lifecycle;
+pub(crate) mod isolation_quarantine;
 pub mod migration_import;
 pub mod migration_startup;
 
@@ -159,6 +161,7 @@ pub mod decision_notify;
 pub mod dingtalk;
 pub mod doctor_probes;
 pub mod extension;
+pub mod external_status;
 pub mod github_workspace;
 pub mod google_apps_script;
 pub(crate) mod google_data_consent;
@@ -270,7 +273,6 @@ pub mod delegation_gate;
 pub mod delegation_router;
 pub mod direct_api;
 pub mod discord;
-pub mod discord_voice;
 /// B0-1 exploration-tree ledger, replay simulator and policy protocol (offline only).
 pub mod discovery;
 pub mod dispatcher;
@@ -302,13 +304,16 @@ pub mod knowledge;
 pub mod knowledge_guard;
 pub(crate) mod local_session;
 pub mod maintenance;
+pub mod macos_folder_access;
 pub mod mast;
 pub mod memory_factory;
 pub mod memory_forget_approval;
+pub(crate) mod org_change_approval;
 pub mod memory_forget_apply;
 pub mod disconnect_forget;
 pub mod memory_forget_steps;
 pub mod memory_migrate;
+pub mod memory_privacy;
 pub mod memory_provenance;
 pub mod message_queue;
 pub mod miniapp;
@@ -436,6 +441,9 @@ pub mod ranked_wiki_injection;
 pub mod reflexion;
 pub mod relevance_ranker;
 pub mod reminder_scheduler;
+/// RM-124: schedule / reminder results delivered back into the WebChat
+/// conversation that created them (origin binding + fire-time ownership).
+pub mod scheduled_webchat;
 pub mod risk_detector;
 pub mod run_steps;
 pub(crate) mod autonomous_runtime;
@@ -452,6 +460,8 @@ pub mod secret_redact;
 pub mod server;
 mod mfa;
 mod mfa_email;
+/// Installation Ed25519 key and the shared descriptor-pinned `state/` store.
+pub mod installation_identity;
 pub mod session;
 pub mod session_origin;
 pub mod session_portability;

@@ -1,3 +1,4 @@
+pub mod module_lease;
 pub mod autonomy_gate;
 pub mod autonomy_handoff;
 pub mod agent_guard;
@@ -35,14 +36,18 @@ pub mod fs_lock;
 pub mod owner_lock;
 pub mod grounding;
 pub mod identity_token;
+#[cfg(windows)]
+pub mod windows_private_state;
 pub mod keychain;
 pub mod knowledge_agent;
 pub mod lenient;
 pub mod llm_contract;
+pub mod macos_bundle;
 pub mod match_utils;
 pub mod net_addr;
 pub mod mcp_scopes;
 pub mod org;
+pub mod org_change;
 pub mod org_field_guard;
 pub mod org_store;
 pub mod isolation_policy;
@@ -73,6 +78,8 @@ pub mod team_gate;
 pub mod text_utils;
 pub mod tool_catalog;
 pub mod tool_effect;
+// RM-130: a tool failure always carries a concrete reason.
+pub mod tool_error_reason;
 pub mod mcp_proxy_rewrite;
 pub mod toml_merge;
 pub mod traits;
@@ -119,7 +126,7 @@ pub use dispatch_guard::{
     DEFAULT_ROLE_TEAM_MAX_IN_WINDOW, PATH_KIND_ROLE_TEAM,
 };
 pub use error::{DuDuClawError, Result};
-pub use fs_lock::with_file_lock;
+pub use fs_lock::{with_file_lock, with_file_lock_timeout};
 pub use grounding::{
     check_grounded, is_self_echo_tool, matching_result_texts, shares_contiguous_run,
     shares_contiguous_run_excluding_echo, tool_name_matches, GroundingOutcome,
@@ -178,6 +185,11 @@ pub use takeover_state::{
 };
 pub use text_utils::{truncate_bytes, truncate_chars};
 pub use tool_catalog::{builtin_tool_catalog, ToolCatalogEntry};
+pub use tool_error_reason::{
+    ensure_error_reason, ensure_error_reason_with, is_malformed_frame, lacks_error_reason,
+    missing_error_reason,
+    ErrorDetail as ToolErrorDetail,
+};
 pub use tool_effect::{
     effect_from_annotations, effect_of, effect_of_builtin, effect_of_cli_builtin,
     third_party_tool_ref, ActionRule, CLAUDE_CLI_BUILTIN_TOOLS,
@@ -323,6 +335,16 @@ pub const ENV_REPLY_CHANNEL: &str = "DUDUCLAW_REPLY_CHANNEL";
 /// carries it (B11).
 pub const ENV_REPLY_SENDER: &str = "DUDUCLAW_REPLY_SENDER";
 
+/// RM-124: the full composed WebChat session id
+/// (`webchat:webchat:<owner tag>:<conn>[#agent:<id>][#conv:<nonce>]`) of the
+/// dashboard-chat turn this CLI answers. Set by the gateway ONLY for
+/// `webchat:` turns. The MCP schedule / reminder tools use it as the default
+/// result destination when the model names none, after binding it to the
+/// verified acting employee; a `webchat` target the model supplies is
+/// refused. Deliberately separate from [`ENV_REPLY_CHANNEL`], which drives
+/// outbound pushes WebChat cannot receive.
+pub const ENV_ORIGIN_SESSION: &str = "DUDUCLAW_ORIGIN_SESSION";
+
 /// Wiki RL Trust Feedback context for sub-agent dispatch (v1.10).
 ///
 /// `DUDUCLAW_TURN_ID` carries the per-turn ULID used as the
@@ -439,6 +461,17 @@ pub fn resolve_duduclaw_bin() -> std::path::PathBuf {
     {
         return std::path::PathBuf::from(override_path);
     }
+    // macOS: the canonical path (cached), so `.mcp.json` / hooks name the
+    // real file inside `DuDuClaw Gateway.app` rather than a CLI symlink.
+    #[cfg(target_os = "macos")]
+    let exe = {
+        let exe = crate::platform::executable_path();
+        if exe.as_os_str().is_empty() {
+            return std::path::PathBuf::from("duduclaw");
+        }
+        exe
+    };
+    #[cfg(not(target_os = "macos"))]
     let Ok(exe) = std::env::current_exe() else {
         return std::path::PathBuf::from("duduclaw");
     };

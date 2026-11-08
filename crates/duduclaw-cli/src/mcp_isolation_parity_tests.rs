@@ -76,6 +76,16 @@ impl WorkerPlanFactory for ListingPlans {
     }
 }
 
+// H9/H10: stands in for H5's spawnd work broker so the production issuer can
+// select the brokered `employee-work` root. Listing never opens a file.
+struct ListingBroker;
+impl duduclaw_mcp_boundary::resources::WorkBroker for ListingBroker {
+    fn open_work_file(&self, _: &duduclaw_mcp_boundary::resources::WorkFileRequest<'_>)
+        -> Result<duduclaw_mcp_boundary::resources::BrokeredWorkFile, duduclaw_mcp_boundary::resources::WorkBrokerError> {
+        panic!("listing opened a work file")
+    }
+}
+
 fn documented_refusals() -> BTreeSet<String> {
     // Independent of the implementation's refusal predicate: an accidental new
     // refusal must change the reviewed product matrix before it can pass parity.
@@ -98,15 +108,26 @@ fn documented_refusals() -> BTreeSet<String> {
 // Missing trusted File/A/E selectors are unfinished production wiring, not
 // intentional product refusals. Keep this list independent of eligible() so
 // a policy regression cannot silently expand the accepted gap.
+// H9/H10 removed file_read/csv_read/xlsx_read (brokered Workspace grant) and
+// web_fetch_cached/web_extract (PublicOrigins grant): the fixture installs a work
+// broker and the admin sets `[isolation] public_web = true`, so the production
+// issuer selects both. create_task is no longer task-run only: this interactive
+// run carries the issuer's NewTask grant (H9 owner decision 3).
 fn pending_production_selectors() -> BTreeSet<String> {
-    ["create_task", "spawn_agent", "spawn_ephemeral", "skill_extract", "execute_program",
+    // H12a removed skill_extract, shared_skill_adopt, skill_security_scan,
+    // skill_graduate and skill_curator_status: they select the issuer's own
+    // Employee (+ own Confined wiki) under EmployeeScope, not a workspace.
+    ["spawn_agent", "spawn_ephemeral", "execute_program",
         "office_script", "inspect_branches", "diff_branches", "fork_cost", "discovery_catalog",
         "discovery_list", "discovery_tree", "discovery_artifact", "discovery_cancel",
-        "shared_skill_adopt", "browser_record_start", "browser_record_stop", "skill_from_recording",
-        "code_map", "skill_security_scan", "skill_graduate", "skill_synthesis_run", "skill_hub_install",
-        "skill_curator_status", "file_read", "csv_read", "xlsx_read", "web_fetch_cached", "web_extract"]
+        "browser_record_start", "browser_record_stop", "skill_from_recording",
+        "code_map", "skill_synthesis_run", "skill_hub_install"]
         .into_iter().map(str::to_owned).collect()
 }
+
+/// H12a tools the production issuer must make eligible without new selectors.
+const H12A_OWN_SKILL_TOOLS: [&str; 5] = ["skill_extract", "shared_skill_adopt", "skill_security_scan",
+    "skill_graduate", "skill_curator_status"];
 
 fn employee_config(extra_capabilities: &str) -> String {
     format!(r#"[agent]
@@ -128,7 +149,7 @@ warn_threshold_percent = 80
 hard_stop = false
 [container]
 sandbox_enabled = false
-network_access = false
+network_access = true
 timeout_ms = 60000
 max_concurrent = 2
 readonly_project = false
@@ -148,6 +169,8 @@ allowed_channels = []
 [evolution]
 skill_auto_activate = false
 skill_security_scan = false
+[isolation]
+public_web = true
 [capabilities]
 allowed_tools = ["mcp__duduclaw__*"]
 os_native = true
@@ -228,7 +251,10 @@ enabled = true
     // The issuer reads real Shared lifecycle and users.db evidence.
     use duduclaw_gateway::isolation_mcp::{test_support::SharedEmployee, DispatcherFactory, HostTurn};
     let employee = context().record().employee;
-    let shared = SharedEmployee::new(home, "main", employee);
+    // H9: the admin enabled protected public web (`[isolation] public_web`)
+    // in agent.toml above; the broker double stands in for H5's work broker.
+    assert!(typed.isolation.public_web);
+    let shared = SharedEmployee::new(home, "main", employee).with_work_broker(Arc::new(ListingBroker));
     let snapshot = shared.snapshot();
     let authorization = shared.authorize(&snapshot, Lane::Standard,
         crate::mcp_isolation_boot::CliDispatcherFactory.ingress_tools(home, "main", Lane::Standard).unwrap(),
@@ -252,6 +278,10 @@ enabled = true
         // production record-based scheduler currently retains its human owner.
         record.principal = RunPrincipal::Background { tenant_id: Text::new(snapshot.tenant_id.clone()).unwrap(),
             generation: snapshot.acl_generation };
+        // A Background principal has no human requester, so it can never hold
+        // the interactive NewTask grant (the capability would not verify).
+        record.resources = List::new(record.resources.as_slice().iter()
+            .filter(|grant| !matches!(grant, ResourceGrant::NewTask { .. })).cloned().collect()).unwrap();
     }
     record.canonical_bytes().expect("production issuer must produce a signable capability");
     let context = live_context(record);
@@ -331,12 +361,28 @@ async fn employee_tool_parity(home: &std::path::Path) {
     dispatcher.require_complete_services().unwrap();
     dispatcher.require_context_services(&context).unwrap();
     let host = documented_refusals();
+    // Hidden in this interactive run: the tracked selector gaps only.
     let pending = pending_production_selectors();
     for tool in &pending {
         assert!(!duduclaw_mcp_boundary::tool_policy::eligible(&context, tool),
             "{tool}: production selector gap changed; review this inventory");
     }
     assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, "knowledge_add_source"));
+    assert_eq!(duduclaw_mcp_boundary::tool_policy::OWN_SKILL_TOOLS, &H12A_OWN_SKILL_TOOLS[..]);
+    for tool in H12A_OWN_SKILL_TOOLS {
+        assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool),
+            "{tool}: the production issuer's EmployeeScope + own Employee (+ own wiki) must suffice");
+        assert!(!pending.contains(tool), "{tool}");
+    }
+    // H9/H10: the production issuer selected the brokered Workspace, the
+    // PublicOrigins grant and the interactive NewTask grant for this employee;
+    // nothing was appended by the test.
+    for tool in ["file_read", "csv_read", "xlsx_read", "web_fetch_cached", "web_extract", "create_task"] {
+        assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, tool), "{tool}: H10 issuer selector missing");
+    }
+    assert!(context.record().resources.as_slice().iter().any(|grant| matches!(grant,
+        ResourceGrant::NewTask { requester } if matches!(&context.record().principal,
+            RunPrincipal::Human { user_id, .. } if user_id == requester))), "NewTask is the run's own human");
     // Missing producer authority must narrow discovery, not become a transport exception.
     let mut without_wiki = context.record().clone();
     without_wiki.resources = List::new(without_wiki.resources.as_slice().iter()
@@ -374,7 +420,8 @@ async fn employee_tool_parity(home: &std::path::Path) {
                 "cost_summary", "list_agents", "computer_session_start", "computer_workspace_list", "computer_workspace_write",
                 "group_history_read", "knowledge_search", "knowledge_get_passage", "knowledge_list_collections", "knowledge_add_source",
                 "meeting_transcribe", "meeting_upload_link", "file_read", "csv_read", "xlsx_read", "code_map", "execute_program",
-                "skill_extract", "web_fetch_cached", "web_extract", "model_search", "model_recommend"] {
+                "skill_extract", "web_fetch_cached", "web_extract", "model_search", "model_recommend",
+                "shared_skill_adopt", "skill_security_scan", "skill_graduate", "skill_curator_status"] {
                 assert!(ordinary.contains(tool), "production fixture did not enable {tool}");
                 assert_eq!(isolated.contains(tool), !pending.contains(tool),
                     "production inventory disagrees with tracked selector gap: {tool}");
