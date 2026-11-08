@@ -12,6 +12,14 @@ SUFFIX = b"\0DUDUCLAW_RELEASE_END\0"
 MAX_BINARY_BYTES = 768 * 1024 * 1024
 
 
+# Load by path so these standalone scripts also work under importlib-based tests.
+import importlib.util
+_bundle_spec = importlib.util.spec_from_file_location(
+    "macos_bundle_archive", Path(__file__).with_name("macos_bundle_archive.py"))
+_bundle = importlib.util.module_from_spec(_bundle_spec)
+_bundle_spec.loader.exec_module(_bundle)
+
+
 def plain_version(version):
     return (re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version)
             is not None and all(int(part) <= 2**64 - 1 for part in version.split(".")))
@@ -61,7 +69,9 @@ def verify_archive(path, expected):
     names = {"duduclaw", "duduclaw-pro", "duduclaw.exe", "duduclaw-pro.exe"}
     if path.suffix == ".zip":
         with zipfile.ZipFile(path) as archive:
-            entries = [entry for entry in archive.infolist() if entry.filename in names]
+            entries = ([_bundle.bundle_executable(archive, path.name)]
+                       if path.name.endswith(".app.zip") else
+                       [entry for entry in archive.infolist() if entry.filename in names])
             if len(entries) != 1 or entries[0].is_dir():
                 raise ValueError("archive must contain exactly one release binary")
             with archive.open(entries[0]) as binary:

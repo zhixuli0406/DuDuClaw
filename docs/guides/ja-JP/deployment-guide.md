@@ -6,6 +6,18 @@
 
 ---
 
+## macOS へのインストール
+
+macOS では npm よりも `install.sh` を推奨します。署名済み Gateway App を固定の場所に配置できます。インストーラーは macOS 標準のツールを使用します。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | bash
+```
+
+インストーラーは署名・公証済みの `.app.zip` をダウンロードし、SHA-256 を検証して `~/Applications/DuDuClaw Gateway.app` に配置します。CLI の `~/.duduclaw/bin/duduclaw` は `DuDuClaw Gateway.app/Contents/MacOS/duduclaw` へのシンボリックリンクです。`~/.duduclaw/bin` を `PATH` に追加してください。
+
+`DUDUCLAW_APP_DIR` で App の配置先、`DUDUCLAW_HOME` で CLI のホームを変更できます。`.app.zip` のない旧リリースでは従来の tarball を使用します。npm の macOS プラットフォームパッケージにも App が含まれます。
+
 ## 1. ローカル開発
 
 ```bash

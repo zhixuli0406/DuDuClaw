@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- macOS Gateway 改以已簽署及公證的 `DuDuClaw Gateway.app` 發布；建議透過安裝腳本安裝至 `~/Applications`，CLI 以符號連結啟動，並保留舊版更新所需的獨立執行檔。
+
 ## [1.80.1] - 2026-11-07 — macOS／Windows 下載版修正
 
 ### Fixed
